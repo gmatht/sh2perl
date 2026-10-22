@@ -868,16 +868,25 @@ impl Render {
                 }
                 self.sh2_stub("test")
             }
-            IrExpr::Call { func, args } if func == "contains" => {
-                // `echo X | grep LIT >/dev/null` → contains(X, LIT): native
-                // strings.Contains. The strings import is auto-derived from
-                // the generated text.
+            IrExpr::Call { func, args }
+                if matches!(func.as_str(), "contains" | "strHasPrefix" | "strHasSuffix") =>
+            {
+                // `echo X | grep LIT >/dev/null` → contains(X, LIT), and the
+                // test-lowering transform's glob-affix twins: native strings
+                // predicates (the import is auto-derived from the text). In
+                // CONDITION position they are already a Go bool, so no
+                // `truthy` wrapper.
                 if args.len() >= 2 {
                     let needle = self.expr_str(&args[0]);
                     let pattern = self.expr_str(&args[1]);
-                    return format!("strings.Contains({needle}, {pattern})");
+                    let f = match func.as_str() {
+                        "strHasPrefix" => "HasPrefix",
+                        "strHasSuffix" => "HasSuffix",
+                        _ => "Contains",
+                    };
+                    return format!("strings.{f}({needle}, {pattern})");
                 }
-                self.sh2_stub("contains")
+                self.sh2_stub(func)
             }
             IrExpr::Call { func, args } if func == "getVar" => {
                 if let Some(IrExpr::Str(name, _)) = args.first() {
@@ -2471,7 +2480,12 @@ impl Render {
                 Some((Vec::new(), format!("arrLen({m})")))
             }
             MA::StrLen(name) => {
-                let v = self.arith_var(name)?;
+                // `${#name}` is a length over the value's TEXT, so the
+                // operand is the string form — `arith_var` here produced
+                // `runeLen(s2i(flags))` (int64 into a string parameter),
+                // which does not compile. `getvar_str` applies the same
+                // decl/type rules as every other string context.
+                let v = self.getvar_str(name.strip_prefix('$').unwrap_or(name));
                 Some((Vec::new(), format!("runeLen({v})")))
             }
             MA::ArrIdx(name, key) => {
@@ -2888,6 +2902,46 @@ impl Render {
                 Some(v) => v,
                 None => self.sh2_stub("grepMatches"),
             },
+            // The test-lowering transform's glob-affix primitives
+            // (`[[ $s == *.txt ]]` → strHasSuffix): the stdlib strings
+            // predicates, which already agree with bash on the empty affix
+            // (`*""` / `""*` / `*""*` always match).
+            "strHasPrefix" | "strHasSuffix" | "contains" => {
+                let (Some(subject), Some(affix)) = (args.first(), args.get(1)) else {
+                    return self.sh2_stub(func);
+                };
+                let s = self.expr_str(subject);
+                let p = self.expr_str(affix);
+                let f = match func {
+                    "strHasPrefix" => "HasPrefix",
+                    "strHasSuffix" => "HasSuffix",
+                    _ => "Contains",
+                };
+                format!("strings.{f}({s}, {p})")
+            }
+            // `typeset -i` / `-l` / `-u` assignment wrappers: the frontend
+            // hands the attribute's coercion as a Call around the RHS.
+            //   int(x) — the integer value. Under `typeset -i` the RHS text
+            //     is ARITHMETIC (`n=n+1` means `n = n + 1`), which the
+            //     frontend already wrapped in `arith`, so the value is that
+            //     int64.
+            //   lc(x)/uc(x) — bash stores the case-folded string.
+            "int" => match args.first() {
+                Some(IrExpr::Call { func: f, args: a }) if f == "arith" => self.call("arith", a),
+                Some(a) => format!("s2i({})", self.expr_str(a)),
+                None => self.sh2_stub("int"),
+            },
+            "lc" | "uc" => match args.first() {
+                Some(a) => {
+                    let v = self.expr_str(a);
+                    if func == "lc" {
+                        format!("strings.ToLower({v})")
+                    } else {
+                        format!("strings.ToUpper({v})")
+                    }
+                }
+                None => self.sh2_stub(func),
+            },
             _ => self.sh2_stub(func),
         }
     }
@@ -3231,6 +3285,236 @@ impl Render {
         Some(format!("{f}([][]string{{{}}})", parts.join(", ")))
     }
 
+    /// The stage bodies of a grouped command (`( a | b )`, `( while … )`):
+    /// a statement `Pipeline`/`Subshell` node, or an Arrow holding exactly
+    /// one such expression statement. `None` for anything else.
+    fn group_stage_bodies(inner: &[IrStmt]) -> Option<Vec<Vec<String>>> {
+        let stages: Vec<&IrStmt> = match inner {
+            [IrStmt::Pipeline {
+                stages,
+                capture: None,
+                ..
+            }] => stages.iter().flatten().collect(),
+            [IrStmt::Subshell(body)] | [IrStmt::Block(body)] => {
+                return Self::group_stage_bodies(body)
+            }
+            [IrStmt::Expr(IrExpr::Call { func, args })] if func == "pipeline" => {
+                let Some(IrExpr::Array(items)) = args.first() else {
+                    return None;
+                };
+                let mut out = Vec::with_capacity(items.len());
+                for it in items {
+                    let IrExpr::Arrow(body) = it else {
+                        return None;
+                    };
+                    out.extend(Self::group_stage_bodies(body)?);
+                }
+                return Some(out);
+            }
+            [IrStmt::Expr(e)] => {
+                return Self::stage_text_of_expr(e).map(|st| vec![st])
+            }
+            _ => return None,
+        };
+        // Each stage becomes shell text; a construct the argv form cannot
+        // name declines the whole group (REFUSE > GUESS).
+        let mut out = Vec::with_capacity(stages.len());
+        for st in stages {
+            // A loop or any other statement-shaped stage keeps its generic
+            // statement text (the `redirect`-wrapped `exec` the frontend
+            // builds around `while read` comes out as the bare command);
+            // anything the text reconstruction cannot express declines.
+            match st {
+                IrStmt::Expr(e) => out.push(Self::stage_text_of_expr(e)?),
+                other => out.push(Self::stage_text_of_stmt(other)?),
+            }
+        }
+        Some(out)
+    }
+
+    /// A non-command statement → its bare shell text (`while read …; do …;
+    /// done`) for a pipeline stage. Only the generic statement-text forms
+    /// that carry NO redirections of their own are admitted.
+    fn stage_text_of_stmt(st: &IrStmt) -> Option<Vec<String>> {
+        let text = match st {
+            IrStmt::Expr(IrExpr::Call { func, args }) if func == "redirect" => {
+                let (Some(IrExpr::Arrow(inner)), Some(IrExpr::Array(objs))) =
+                    (args.first(), args.get(1))
+                else {
+                    return None;
+                };
+                // One stdin-file feed, and nothing else: that is the group's
+                // own feed, which the chain wires instead.
+                if inner.len() != 1 || objs.len() != 1 {
+                    return None;
+                }
+                let IrExpr::Object(props) = &objs[0] else {
+                    return None;
+                };
+                let mut fd_ok = false;
+                let mut mode = String::new();
+                for (k, v) in props {
+                    match (k.as_str(), v) {
+                        ("fd", IrExpr::Int(0)) => fd_ok = true,
+                        ("mode", IrExpr::Str(m, _)) if m == "r" => mode = m.clone(),
+                        _ => {}
+                    }
+                }
+                if !fd_ok || mode != "r" {
+                    return None;
+                }
+                return Self::stage_text_of_stmt(&inner[0]);
+            }
+            IrStmt::While { cond, body } => {
+                let c = Self::loop_head_text(cond)?;
+                let b = Self::stage_text_list(body)?;
+                format!("{c} do {b}; done")
+            }
+            _ => return None,
+        };
+        Some(vec![quote_sh(&text)])
+    }
+
+    /// A loop condition (`read -r name num`, `[ … ]`) → its bare shell text,
+    /// with a per-command `IFS=:` prefix kept (bash's `IFS=x read`).
+    fn loop_head_text(cond: &IrExpr) -> Option<String> {
+        let IrExpr::Call { func, args } = cond else {
+            return None;
+        };
+        if func == "builtin" || func == "exec" {
+            let cmd = match args.first() {
+                Some(IrExpr::Str(c, _)) => c,
+                _ => return None,
+            };
+            let items: &[IrExpr] = match args.get(1) {
+                Some(IrExpr::Array(items)) => items,
+                _ => return None,
+            };
+            let mut words = vec![quote_sh(cmd)];
+            for it in items {
+                let s = match it {
+                    IrExpr::Str(s, _) | IrExpr::Ident(s) => s,
+                    _ => return None,
+                };
+                words.push(quote_sh(&strip_sh2glob(s)));
+            }
+            // `IFS=… cmd …` — the third argument is the command-scoped env.
+            let mut prefix = String::new();
+            if let Some(IrExpr::Object(props)) = args.get(2) {
+                for (k, v) in props {
+                    let IrExpr::Str(val, _) = v else {
+                        return None;
+                    };
+                    prefix.push_str(&format!("{k}={} ", quote_sh(val)));
+                }
+            }
+            return Some(format!("{prefix}while {}", words.join(" ")));
+        }
+        if func == "testBracket" || func == "test" {
+            let mut words = vec!["[".to_string()];
+            for it in args {
+                match it {
+                    IrExpr::Str(s, _) | IrExpr::Ident(s) => words.push(quote_sh(s)),
+                    _ => return None,
+                }
+            }
+            words.push("]".to_string());
+            return Some(format!("while {}", words.join(" ")));
+        }
+        None
+    }
+
+    /// A loop body → its `; `-joined bare text.
+    fn stage_text_list(body: &[IrStmt]) -> Option<String> {
+        let mut parts = Vec::with_capacity(body.len());
+        for st in body {
+            let one = Self::stage_text_of_stmt(st)?;
+            if one.len() != 1 {
+                return None;
+            }
+            // Quote the whole stage command, not each word.
+            parts.push(unquote_sh(&one[0]));
+        }
+        Some(parts.join("; "))
+    }
+
+    /// One stage expression → the argv token list its bare command renders
+    /// to (`["sort", "-n"]`). Anything that is not a plain word list
+    /// (subshell, nested pipeline, redirect call) declines.
+    fn stage_text_of_expr(e: &IrExpr) -> Option<Vec<String>> {
+        let IrExpr::Call { func, args } = e else {
+            return None;
+        };
+        if func != "builtin" && func != "exec" {
+            return None;
+        }
+        match args.first() {
+            Some(IrExpr::Str(_, _)) => {}
+            _ => return None,
+        }
+        let Some(IrExpr::Array(items)) = args.get(1) else {
+            return None;
+        };
+        let mut out = Vec::with_capacity(items.len() + 1);
+        for it in items {
+            let s = match it {
+                IrExpr::Str(s, _) | IrExpr::Ident(s) => s,
+                _ => return None,
+            };
+            out.push(quote_sh(&strip_sh2glob(s)));
+        }
+        Some(out)
+    }
+
+    /// `( … ) < file` (or `<<< text`, `<<EOF`) as a native chain: every
+    /// stage of the group joined by ` | `, stdin wired to the redirect.
+    /// The stages stay SHELL TEXT for now (the group can hold a `while`
+    /// loop, which has no argv form) but there is no `bash -c` child and no
+    /// environment literal — the parent runs the chain and feeds it.
+    fn group_pipeline_stdin(
+        &mut self,
+        body: &[IrStmt],
+        redirs: &[IrExpr],
+    ) -> Option<String> {
+        if redirs.len() != 1 {
+            return None;
+        }
+        let first_in = self.native_redirect(&redirs[0])?;
+        if !matches!(
+            first_in,
+            NativeRedir::File { fd: 0, .. } | NativeRedir::StdinStr(_)
+        ) {
+            return None;
+        }
+        // A plain `cmd < f` (no group) is the single-command path's job.
+        let stages = Self::group_stage_bodies(body)?;
+        if stages.iter().any(|st| st.is_empty()) {
+            return None;
+        }
+        let script = stages
+            .iter()
+            .map(|st| st.join(" "))
+            .collect::<Vec<_>>()
+            .join(" | ");
+        let id = self.new_tmp();
+        self.need_st = true;
+        let lines = self.emit_native_pipeline_lines_to(
+            &[vec![Self::go_str(&script)]],
+            Some(first_in),
+            None,
+            None,
+            false,
+            &format!("__pg{id}"),
+        );
+        Some(format!(
+            "func() int64 {{ {}; return __pg{id} }}()",
+            // `; ` between the lines: they are separate STATEMENTS, and on a
+            // single line Go inserts no semicolons, so a `}`-terminated
+            // `if … else …` line would swallow the next one.
+            lines.join("; ")
+        ))
+    }
+
     /// `redirect` Call: args[0] = Arrow(body), args[1] = Array of
     /// {fd, mode, target} objects. Value = exit status.
     fn redirect_expr(&mut self, args: &[IrExpr]) -> String {
@@ -3238,6 +3522,42 @@ impl Render {
         else {
             return self.sh2_stub("redirect");
         };
+        // `( … ) < f` — a SUBSHELL group with a stdin-file redirect and no
+        // pipeline inside: the group's own stages are the chain, fed from
+        // the file (`while read … done < f`). Same native chain as
+        // `a | b < f`; without this arm the whole loop went to `redirRun`
+        // and iterated nothing.
+        if let Some(text) = self.group_pipeline_stdin(body, redirs) {
+            return text;
+        }
+        // `cmd < a > b` as a status VALUE: the same welded chain the
+        // statement form lowers to (`stmt_redirect_native`), wrapped so the
+        // status reads out instead of landing in `st`. Expression position
+        // is what `! cmd <a >b` / `x=$? cmd …` produce, and without this
+        // arm the whole thing stubbed even though the statement twin was
+        // already native.
+        {
+            let todo = self.todo;
+            let sides = self.sides.len();
+            let tmp = self.tmp;
+            if let Some((cmd, argv)) = self.body_single_exec(body) {
+                if let Some(lines) = self.native_redirect_lines(&cmd, &argv, redirs) {
+                    if self.todo == todo {
+                        return format!(
+                            "func() int64 {{ {}; return st }}()",
+                            // See `group_pipeline_stdin`: on one line the
+                            // lines need explicit `; ` separators, or a
+                            // `}`-terminated `if … else …` line runs into
+                            // the next statement.
+                            lines.join("; ")
+                        );
+                    }
+                }
+            }
+            self.sides.truncate(sides);
+            self.tmp = tmp;
+            self.todo = todo;
+        }
         // `cmd 2>/dev/null` (and nothing else): discarding stderr is the
         // native helpers' default, so this is one exec with no `bash -c`
         // child and no env literal — the builtin policy is the same one the
@@ -3568,13 +3888,28 @@ impl Render {
         let id = self.new_tmp();
         let cvar = format!("__rd{id}");
         let okvar = format!("__rdok{id}");
+        // `command < a > b` (no operand): bash's `command` is a no-op that
+        // SUCCEEDS, so there is no process to spawn — only the redirects
+        // happen (each one still opens left to right, and an unopenable
+        // input leaves the status at 1 with the output never created).
+        // Exec'ing a `command` binary would invent a failure bash does not
+        // have.
+        let noop = cmd == "command" && argv.is_empty();
+        if noop && plan.iter().any(|r| matches!(r, NativeRedir::DupStdoutToStderr)) {
+            // `2>&1` needs a command's descriptors to duplicate.
+            return vec!["st = 1;".to_string()];
+        }
         // Spread-aware: a mid-list glob folds through `append` (see
         // `exec_cmd_call`) — a raw `join` would not compile.
         let call = Self::exec_cmd_call(cmd, argv);
-        let mut lines = vec![
-            format!("{cvar} := {call};"),
-            format!("{okvar} := true;"),
-        ];
+        let mut lines = if noop {
+            vec![format!("{okvar} := true;")]
+        } else {
+            vec![
+                format!("{cvar} := {call};"),
+                format!("{okvar} := true;"),
+            ]
+        };
         let mut closes: Vec<String> = Vec::new();
         for (i, nr) in plan.iter().enumerate() {
             match nr {
@@ -3604,9 +3939,13 @@ impl Render {
                     // A redirect that cannot be opened is a status-1 failure
                     // in bash and the command does NOT run — the run below is
                     // guarded, not merely best-effort.
-                    lines.push(format!(
-                        "if {ev} == nil {{ {cvar}.{field} = {fv} }} else {{ {okvar} = false }}"
-                    ));
+                    if noop {
+                        lines.push(format!("if {ev} != nil {{ {okvar} = false }}"));
+                    } else {
+                        lines.push(format!(
+                            "if {ev} == nil {{ {cvar}.{field} = {fv} }} else {{ {okvar} = false }}"
+                        ));
+                    }
                     closes.push(format!("if {ev} == nil {{ {fv}.Close() }}"));
                 }
                 NativeRedir::DupStdoutToStderr => {
@@ -3615,14 +3954,20 @@ impl Render {
                 // `<<<`/`<<EOF`: stdin fed from a string — infallible, so
                 // no guard and no close.
                 NativeRedir::StdinStr(text) => {
-                    lines.push(format!("{cvar}.Stdin = strings.NewReader({text});"));
+                    if !noop {
+                        lines.push(format!("{cvar}.Stdin = strings.NewReader({text});"));
+                    }
                 }
             }
         }
-        lines.push(format!("shStdIn({cvar});"));
-        lines.push(format!(
-            "if {okvar} {{ st = runCmd({cvar}) }} else {{ st = 1 }}"
-        ));
+        if !noop {
+            lines.push(format!("shStdIn({cvar});"));
+            lines.push(format!(
+                "if {okvar} {{ st = runCmd({cvar}) }} else {{ st = 1 }}"
+            ));
+        } else {
+            lines.push(format!("if {okvar} {{ st = 0 }} else {{ st = 1 }}"));
+        }
         lines.extend(closes);
         self.need_st = true;
         lines
@@ -3986,6 +4331,28 @@ impl Render {
         inner: &[IrStmt],
         redirects: &[crate::ir::IrRedirect],
     ) -> Option<Vec<String>> {
+        // The `redirect` CALL form (`redirect(arrow, [objs])`) reaches here
+        // as an expression statement once `IrStmt::Redirect` has been
+        // re-shaped — unwrap it so both spellings share one analysis.
+        if let [IrStmt::Expr(IrExpr::Call { func, args })] = inner {
+            if func == "redirect" {
+                let (Some(IrExpr::Arrow(body)), Some(IrExpr::Array(objs))) =
+                    (args.first(), args.get(1))
+                else {
+                    return None;
+                };
+                if !redirects.is_empty() {
+                    return None;
+                }
+                let plan: Vec<NativeRedir> =
+                    objs.iter().map(|o| self.native_redirect(o)).collect::<Option<_>>()?;
+                let bodies = Self::group_stage_bodies(body)?;
+                let (first_in, last_out, last_err, last_dup) = Self::pipeline_plan(plan)?;
+                return Some(self.emit_native_pipeline_lines(
+                    &bodies, first_in, last_out, last_err, last_dup,
+                ));
+            }
+        }
         // The pipeline's stage bodies: a statement `Pipeline` node's
         // stages, or the Arrow bodies of an expression-form `pipeline`
         // call in statement position.
@@ -5042,9 +5409,26 @@ impl Render {
                 }
             }
         }
-        self.need_vars = true;
+        // A plain variable name with a literal word: the expansion is
+        // expressible in Go itself, so `pExp`/`pVal` never enter the picture.
+        if !matches!(args.get(2), Some(IrExpr::Str(a, _)) if a == "@") {
+            if let Some(text) = self.param_native(op, name, &args[2..]) {
+                return text;
+            }
+            // `param_native` names only PLAIN vars; a subscripted
+            // `${arr[<literal>]}` is the same single element read, and
+            // `braced_plain` spells it natively (`arrIdx`).
+            if op.is_empty() && args.len() == 2 {
+                if let Some(text) = self.braced_plain(name) {
+                    return text;
+                }
+            }
+        }
         match op.as_str() {
-            "@" | "*" => "strings.Join(argsList(), \" \")".to_string(),
+            "@" | "*" => {
+                self.need_vars = true;
+                "strings.Join(argsList(), \" \")".to_string()
+            }
             _ => {
                 // `${arr[@]...}` — the `@` arrives as the first extra arg
                 let name = if matches!(args.get(2), Some(IrExpr::Str(a, _)) if a == "@") {
@@ -5052,6 +5436,7 @@ impl Render {
                 } else {
                     name.clone()
                 };
+                self.need_vars = true;
                 let extra = if name.ends_with("[@]") {
                     extra[1..].to_vec()
                 } else {
@@ -5064,6 +5449,76 @@ impl Render {
                     join_args(&extra)
                 )
             }
+        }
+    }
+
+    /// `${name}`, `${name:-word}` and their siblings spelled in Go.
+    ///
+    /// `None` for every shape `pExp` has to answer at run time: a subscripted
+    /// / array / associative name, an indirect (`!`) name, and any word that
+    /// still carries shell syntax — `$`, a backtick, a backslash or a leading
+    /// `~` are text `expand` re-parses, and a Go string literal would freeze
+    /// them. Every arm below mirrors `pExp` byte for byte, so the value is
+    /// unchanged; what disappears is the `pVal` lookup into the runtime store
+    /// and the helper bundle (`pExp` → `pVal` → `expand` → `capRun`) it drags
+    /// into the program.
+    fn param_native(&mut self, op: &str, name: &str, extra: &[IrExpr]) -> Option<String> {
+        let mut chars = name.chars();
+        let plain = matches!(chars.next(), Some(c) if c.is_ascii_alphabetic() || c == '_')
+            && chars.all(|c| c.is_ascii_alphanumeric() || c == '_')
+            && !self.is_arr(name)
+            && !self.is_assoc(name);
+        if !plain {
+            return None;
+        }
+        let word = |extra: &[IrExpr]| -> Option<String> {
+            let [w] = extra else { return None };
+            let IrExpr::Str(s, _) = w else { return None };
+            if s.contains('$') || s.contains('`') || s.contains('\\') || s.starts_with('~') {
+                return None;
+            }
+            Some(Self::go_str(s))
+        };
+        // Decide BEFORE touching the render state: `getvar_str` marks the
+        // variable read (which drops its `_ = x` dead-var guard), so asking
+        // for a value that a declined op throws away leaves the guard gone
+        // and Go rejects the program for an unused variable.
+        let w = match op {
+            ":-" | "-" | "+" => Some(word(extra)?),
+            "" | "^^" | ",," | "^" | "," | "len" | "basename" | "dirname" => None,
+            _ => return None,
+        };
+        let v = self.getvar_str(name);
+        match op {
+            "" => Some(v),
+            // case ops: `pExp` folds one BYTE for `^`/`,`, the whole string
+            // for `^^`/`,,` — mirrored exactly (bytes, not runes).
+            "^^" => Some(format!("strings.ToUpper({v})")),
+            ",," => Some(format!("strings.ToLower({v})")),
+            "^" | "," => {
+                let f = if op == "^" { "ToUpper" } else { "ToLower" };
+                Some(format!(
+                    "func() string {{ v := {v}; if v == \"\" {{ return v }}; return strings.{f}(v[:1]) + v[1:] }}()"
+                ))
+            }
+            // `${#x}` counts RUNES (runeLen), `${x##*/}`-style patterns and
+            // `slice` stay with the runtime's glob matcher.
+            "len" => Some(format!("strconv.FormatInt(runeLen({v}), 10)")),
+            "basename" => Some(format!("filepath.Base({v})")),
+            "dirname" => Some(format!("filepath.Dir({v})")),
+            ":-" | "-" => {
+                let w = w?;
+                Some(format!(
+                    "func() string {{ v := {v}; if v == \"\" {{ return {w} }}; return v }}()"
+                ))
+            }
+            "+" => {
+                let w = w?;
+                Some(format!(
+                    "func() string {{ v := {v}; if v == \"\" {{ return \"\" }}; return {w} }}()"
+                ))
+            }
+            _ => None,
         }
     }
 
@@ -5359,8 +5814,80 @@ impl Render {
                 }
             }
         }
+        if let Some(v) = self.braced_plain(inner) {
+            return v;
+        }
         self.need_vars = true;
         format!("pExp(\"\", {})", Self::go_str(inner))
+    }
+
+    /// `${name}` and `${name[<literal index>]}` — the expansions whose value
+    /// is ONE read of the same store `pVal` consults (`vars`, then the
+    /// environment), so no run-time interpreter has to DECOMPOSE the name.
+    ///
+    /// Everything the interpreter exists for keeps it (REFUSE > GUESS): any
+    /// operator (`${x:-d}`, `${#x}`, `${x%p}`), an indirect `!name`, an
+    /// `[@]`/`[*]` join, and a subscript that is itself an expansion.
+    fn braced_plain(&mut self, inner: &str) -> Option<String> {
+        if inner.is_empty() {
+            return None;
+        }
+        // `${2}` — a positional read, never a vars-map key.
+        if inner.chars().all(|c| c.is_ascii_digit()) {
+            return Some(self.getvar_str(inner));
+        }
+        let mut chars = inner.chars();
+        let plain_ident = matches!(chars.next(), Some(c) if c.is_ascii_alphabetic() || c == '_')
+            && chars.all(|c| c.is_ascii_alphanumeric() || c == '_');
+        // `pVal` decomposes `name[k]` to an element; `getvar_str` on the
+        // bare name would emit the whole slice instead. Only a LITERAL
+        // index on a known array can be spelled natively.
+        if let Some((base, key)) = inner.split_once('[').and_then(|(b, r)| r.strip_suffix(']').map(|k| (b, k))) {
+            let mut bc = base.chars();
+            let base_ident = matches!(bc.next(), Some(c) if c.is_ascii_alphabetic() || c == '_')
+                && bc.all(|c| c.is_ascii_alphanumeric() || c == '_');
+            if !base_ident || key.is_empty() {
+                return None;
+            }
+            // Only a var this render hoists has a Go home. A shell-supplied
+            // array (PIPESTATUS, which the runtime maintains in `vars`) has
+            // none, and naming it would emit an undefined identifier.
+            if !self.declared(base) {
+                return None;
+            }
+            // Same precedence as the `arrayIndex` arm: an assoc write marks
+            // the base in BOTH sets (the pre-pass counts an indexed target
+            // as an array), so `is_assoc` decides first.
+            //
+            // An assoc key is the key's STRING value, never an index; a
+            // numeric one stays with the interpreter, whose decomposition
+            // tries the integer form first.
+            if self.is_assoc(base) {
+                if key.chars().all(|c| c.is_ascii_digit())
+                    || key.contains(['$', '`', '\\', '['])
+                {
+                    return None;
+                }
+                let m = self.ident_of(base);
+                return Some(format!("s2s(assocIdx({m}, {}))", Self::go_str(key)));
+            }
+            if !key.chars().all(|c| c.is_ascii_digit()) {
+                return None;
+            }
+            let m = self.ident_of(base);
+            let k: i64 = key.parse().ok()?;
+            return Some(format!("s2s(arrIdx({m}, {k}))"));
+        }
+        if !plain_ident {
+            return None;
+        }
+        // A whole array read under its bare name is element zero (bash);
+        // `getvar_str` would emit the slice. Leave both array stores to
+        // the interpreter, which owns that rule.
+        if self.is_arr(inner) || self.is_assoc(inner) {
+            return None;
+        }
+        Some(self.getvar_str(inner))
     }
 
     // ── shell-text reconstruction (for bash -c fallbacks) ────────────
@@ -6626,7 +7153,12 @@ impl Render {
                     self.mark_written(&d.name);
                     let m = self.go_ident(&d.name);
                     if let Some(e) = init {
-                        let rhs = if self.is_num(&d.name) {
+                        // Same verdict as `stmt_assign`: an arith-written var
+                        // hoists as int64 whatever A2 said the shell type is,
+                        // so its init must coerce numerically too — else
+                        // `local i=0` + `((i+=2))` emits `i = "0"` against an
+                        // `int64` declaration (063_hard_to_parse).
+                        let rhs = if self.is_num(&d.name) || self.arith_ints.contains(&d.name) {
                             self.expr_num(e)
                         } else if self.is_str(&d.name) {
                             self.expr_str(e)
@@ -7439,6 +7971,31 @@ impl Render {
             self.mark_todo("multi-target assign");
             return;
         };
+        // `x=$(( … ))` / `a[i]=$(( … ))` whose expression bash itself
+        // rejects: the arithmetic error means the assignment NEVER HAPPENS —
+        // the target keeps its previous value (or stays unset) and `$?` is
+        // 1. Reproduce that instead of assigning a guessed value. This runs
+        // BEFORE the element-target arms so a subscripted target gets the
+        // same verdict (063_hard_to_parse's `array[i][j]`: bash rejects the
+        // nested subscript, so `result[i]` is never written).
+        //
+        // `arith_fail` is the side-effect-free question here: it answers
+        // `Invalid` exactly when the tokenizer/parser reject the text, which
+        // is also when `arith_str` below would return None. Probing with
+        // `arith_str` instead would re-render the expression and shift every
+        // later temporary's number.
+        if let IrExpr::Call { func, args } = expr {
+            if matches!(func.as_str(), "arith" | "arithEval") {
+                if let Some(IrExpr::Str(s, _)) = args.first() {
+                    if self.arith_fail(s) == ArithFail::Invalid {
+                        if self.need_st {
+                            self.emit("st = 1;");
+                        }
+                        return;
+                    }
+                }
+            }
+        }
         if !t.indices.is_empty() {
             // array element assign: arr[key] = value
             let m = self.go_ident(&t.var);
@@ -7495,28 +8052,9 @@ impl Render {
                 }
             }
         }
-        // `x=$(( … ))` whose expression bash itself rejects: the arithmetic
-        // error means the assignment NEVER HAPPENS — `x` keeps its previous
-        // value (or stays unset) and `$?` is 1. Reproduce that instead of
-        // assigning a guessed value.
-        //
-        // `arith_fail` is the side-effect-free question here: it answers
-        // `Invalid` exactly when the tokenizer/parser reject the text, which
-        // is also when `arith_str` below would return None. Probing with
-        // `arith_str` instead would re-render the expression and shift every
-        // later temporary's number.
-        if let IrExpr::Call { func, args } = expr {
-            if matches!(func.as_str(), "arith" | "arithEval") {
-                if let Some(IrExpr::Str(s, _)) = args.first() {
-                    if self.arith_fail(s) == ArithFail::Invalid {
-                        if self.need_st {
-                            self.emit("st = 1;");
-                        }
-                        return;
-                    }
-                }
-            }
-        }
+        // `x=$(( … ))` whose expression bash itself rejects was handled at
+        // the top (the store never happens); from here on the assignment is
+        // a real write.
         let m = self.go_ident(&t.var);
         self.mark_written(&t.var);
         // array assignment forms
@@ -8801,6 +9339,11 @@ impl Render {
                 self.declare_builtin(argv);
                 true
             }
+            // `echo`, and the `printf` forms whose format the native
+            // formatter reproduces: the statement writes its words itself
+            // instead of spawning `/bin/echo` (no child, no env literal).
+            // Anything richer keeps the exec path below.
+            "echo" | "printf" if self.stmt_builtin_output(cmd, argv) => true,
             "export" => {
                 for a in argv {
                     if let IrExpr::Str(arg, _) = a {
@@ -9022,6 +9565,14 @@ impl Render {
                 }
             }
             "command" | "type" => {
+                // Bare `command` (no operand): a no-op that SUCCEEDS — bash
+                // has nothing to spawn, and there is no `command` executable
+                // for exec.Command to find.
+                if cmd == "command" && argv.is_empty() {
+                    self.emit("st = 0;");
+                    self.need_st = true;
+                    return true;
+                }
                 // `command -v NAME` prints the resolved path (`exec.LookPath`
                 // reports the same found/missing) — no `bash -c` child.
                 if cmd == "command" {
@@ -9501,6 +10052,36 @@ impl Render {
         }
     }
 
+    /// `echo words…` / `printf fmt args…` in statement position as a direct
+    /// stdout write. Exactly the argv shapes `expr_str`'s own echo/printf
+    /// lowering produces (the capture path uses the same rule), so the
+    /// statement and `$(…)` forms agree byte for byte. `false` keeps the
+    /// exec path (a flag the builtin policy does not model, a `%q` format).
+    fn stmt_builtin_output(&mut self, cmd: &str, argv: &[IrExpr]) -> bool {
+        if cmd == "printf" && !native_stage_builtin("printf", argv) {
+            return false;
+        }
+        if cmd == "echo" && !native_stage_builtin("echo", argv) {
+            return false;
+        }
+        let call = IrExpr::Call {
+            func: "builtin".to_string(),
+            args: std::iter::once(IrExpr::Str(
+                cmd.to_string(),
+                crate::ir::StrStyle::DoubleQuoted,
+            ))
+            .chain(std::iter::once(IrExpr::Array(argv.to_vec())))
+            .collect(),
+        };
+        let text = self.expr_str(&call);
+        self.flush_sides();
+        if self.need_st {
+            self.emit("st = 0;");
+        }
+        self.emit(&format!("fmt.Print({text});"));
+        true
+    }
+
     fn emit_sync(&mut self, var: &str) {
         if self.need_vars {
             let m = self.go_ident(var);
@@ -9581,6 +10162,20 @@ impl Render {
                                     slice: t,
                                 });
                             }
+                        }
+                    }
+                    // An unquoted glob word expands to its MATCHES at run
+                    // time, so a list carrying one is not a static list:
+                    // `for f in *.{txt,log}` iterates files, not the literal
+                    // pattern (measured: the marker text was printed).
+                    if let IrExpr::Str(s, _) = it {
+                        if has_glob(&strip_sh2glob(s)) {
+                            let pat = Self::go_str(&strip_sh2glob(s));
+                            let t = self.new_tmp();
+                            return Some(ForList::Runtime {
+                                pre: format!("{t} := globArgs({pat});"),
+                                slice: t,
+                            });
                         }
                     }
                     out.push(self.expr_any_of(it));
@@ -9828,8 +10423,55 @@ impl Render {
                         }
                     }
                     While { body, .. } | DoWhile { body, .. } | Block(body)
-                    | Subshell(body) | Function { body, .. } => {
+                    | Subshell(body) | Function { body, .. } | For { body, .. } => {
                         for b in body {
+                            stack.push(b);
+                        }
+                    }
+                    // Every OTHER statement that carries a nested body must
+                    // be walked too: a `((i+=2))` inside a `case` arm, a
+                    // `for` body, a redirect group or a pipeline stage was
+                    // invisible to this scan, so the var was NOT hoisted as
+                    // int64 while its first (string) assignment rendered as
+                    // `i = "0"` — `cannot use "0" as int64 value in
+                    // assignment` (063_hard_to_parse). The scan's answer must
+                    // not depend on which container the arith write sits in.
+                    Try {
+                        body,
+                        excepts,
+                        else_body,
+                        finally_body,
+                    } => {
+                        for b in body.iter().chain(else_body).chain(finally_body) {
+                            stack.push(b);
+                        }
+                        for e in excepts {
+                            for b in &e.body {
+                                stack.push(b);
+                            }
+                        }
+                    }
+                    Case { clauses, .. } => {
+                        for c in clauses {
+                            for b in &c.body {
+                                stack.push(b);
+                            }
+                        }
+                    }
+                    Redirect { inner, .. } => {
+                        for b in inner {
+                            stack.push(b);
+                        }
+                    }
+                    Pipeline { stages, .. } => {
+                        for s in stages {
+                            for b in s {
+                                stack.push(b);
+                            }
+                        }
+                    }
+                    Ext(x) => {
+                        for b in x.children() {
                             stack.push(b);
                         }
                     }
@@ -10853,6 +11495,15 @@ fn extglob_not(s: &str) -> Option<(String, String)> {
     let inner = &rest[..close];
     let after = rest[close + 1..].to_string();
     Some((inner.to_string(), after))
+}
+
+/// The inverse of [`quote_sh`] for a single-quoted shell word.
+fn unquote_sh(s: &str) -> String {
+    let inner = s.strip_prefix('\'').and_then(|x| x.strip_suffix('\''));
+    match inner {
+        Some(x) => x.replace("'\\''", "'"),
+        None => s.to_string(),
+    }
 }
 
 fn quote_sh(s: &str) -> String {
@@ -12111,6 +12762,28 @@ fn go_split_helpers() -> Vec<(String, Vec<String>)> {
         }
     }
     if let Some(c) = cur.take() { segs.push(c); }
+    // A helper's source is the line that DEFINES it plus everything up to
+    // the next definition — which means the next helper's doc comment and
+    // the blank spacer currently sit at the END of this segment. They
+    // belong to the next one: emitting them here dangles a comment when
+    // the next helper is dropped, and (worse) the doc prose is then part
+    // of THIS helper's dependency text — `globArgs` documents that bash
+    // can "expand" a word, which kept `expand` → `pExp` → the whole
+    // parameter library in every render that merely touched a glob.
+    for i in 0..segs.len().saturating_sub(1) {
+        let mut moved: Vec<String> = Vec::new();
+        while let Some(last) = segs[i].1.last() {
+            if last.trim().is_empty() || last.trim_start().starts_with("//") {
+                moved.push(segs[i].1.pop().unwrap());
+            } else {
+                break;
+            }
+        }
+        moved.reverse();
+        for l in moved.into_iter().rev() {
+            segs[i + 1].1.insert(0, l);
+        }
+    }
     segs
 }
 fn go_used_helpers(body: &str) -> Vec<String> {
@@ -12123,16 +12796,32 @@ fn go_used_helpers(body: &str) -> Vec<String> {
         }
     }
     let segs = go_split_helpers();
+    // Comments are prose, not code: a helper name mentioned in one is not
+    // a call. Scanning them made the dependency graph depend on wording
+    // (see the note in go_split_helpers).
+    let code_only = |lines: &[String]| -> String {
+        lines
+            .iter()
+            .filter(|l| !l.trim_start().starts_with("//"))
+            .cloned()
+            .collect::<Vec<_>>()
+            .join("\n")
+    };
+    let body_code: String = body
+        .lines()
+        .filter(|l| !l.trim_start().starts_with("//"))
+        .collect::<Vec<_>>()
+        .join("\n");
     let mut needed: BTreeSet<String> = BTreeSet::new();
     for (name, _) in &segs {
-        if !name.is_empty() && go_contains_word(body, name) { needed.insert(name.clone()); }
+        if !name.is_empty() && go_contains_word(&body_code, name) { needed.insert(name.clone()); }
     }
     let mut changed = true;
     while changed {
         changed = false;
         for (name, lines) in &segs {
             if name.is_empty() || !needed.contains(name) { continue; }
-            let text = lines.join("\n");
+            let text = code_only(lines);
             for (n2, _) in &segs {
                 if !n2.is_empty() && !needed.contains(n2) && go_contains_word(&text, n2) {
                     needed.insert(n2.clone());
@@ -12271,10 +12960,15 @@ const RUNTIME_HELPERS: &[&str] = &[
     "    return strings.Join(out, \" \")",
     "}",
     "",
+    // Keys come back SORTED: bash hands out hash order, which no translator
+    // can reproduce, and every corpus consumer of `${!map[@]}` pipes the
+    // loop through `sort` -- hash order would only add a second ordering
+    // step on top of the sorted one.
     "func arrKeys(name string) []string {",
     "    if m, ok := pValRaw(name).(map[string]any); ok {",
     "        out := make([]string, 0, len(m))",
     "        for k := range m { out = append(out, k) }",
+    "        sort.Strings(out)",
     "        return out",
     "    }",
     "    if a, ok := pValRaw(name).([]any); ok {",

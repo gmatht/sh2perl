@@ -50,12 +50,19 @@ one() {
   rc=$?
   if [ $rc -ge 124 ]; then printf "%s\tTIMEOUT\n" "$base"; return; fi
   if [ $rc -ne 0 ]; then printf "%s\tCOMPILE\n" "$base"; return; fi
-  ( cd "$work" && timeout 30 "$work/prog" ) > "$TMP/$base.out" 2>/dev/null
+  # argv[0] is the script path (like bash $0): `exec -a` self-locates the
+  # binary, mirroring the c/rust arms of the workspace gate — without it
+  # every $0 comparison fails on the build path.
+  ( cd "$work" && timeout 30 bash -c 'exec -a "$0" "$1"' "$f" "$work/prog" ) > "$TMP/$base.out" 2>/dev/null
   local go_rc=$?
   ( cd "$work" && timeout 30 bash "$f" ) > "$TMP/$base.ref" 2>/dev/null
   local bash_rc=$?
-  # go is not in the gate's rc-equality group: translation rc==0 && bash rc==0
-  if [ "$go_rc" = 0 ] && [ "$bash_rc" = 0 ] && diff -q "$TMP/$base.out" "$TMP/$base.ref" >/dev/null 2>&1; then
+  # rc-equality (the workspace gate's equality group): stdout must match
+  # AND the exit codes must match. A 124 (timeout) on either side is never
+  # a pass. The renderer is rc-faithful (main exits the last status) and
+  # argv0-matched, so nonzero-by-design scripts (057_case exits 1) pass.
+  if [ "$go_rc" != 124 ] && [ "$bash_rc" != 124 ] && [ "$go_rc" = "$bash_rc" ] \
+     && diff -q "$TMP/$base.out" "$TMP/$base.ref" >/dev/null 2>&1; then
     printf "%s\tPASS\n" "$base"
   else
     printf "%s\tDIFF:%s:%s\n" "$base" "$go_rc" "$bash_rc"
