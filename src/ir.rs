@@ -9634,9 +9634,33 @@ fn emit_exec_call(out: &mut String, call: &IrExpr, indent: usize) {
             // `test` builtin: reconstruct the `[ ... ]` condition and
             // evaluate it as a Perl boolean. The exit status is 0 for
             // true, 1 for false.
-            let cond = render_test_call(&words.iter().map(|w| {
-                IrExpr::Str(render_word(w), StrStyle::DoubleQuoted)
-            }).collect::<Vec<_>>());
+            //
+            // The operand list must be rendered as ONE expression. The old
+            // code mapped every word to a Str and handed the vec to
+            // `render_test_call`, which only reads `args.first()` — so a
+            // multi-word test silently became a test of its FLAG, and a
+            // `param` operand vanished: `test -n "${V+w}"` rendered as
+            // `length('-n')` (bash: taken iff V is set). A rendered operand
+            // can contain SPACES (`(defined($ENV{V}) ? "w" : '')`), which
+            // the test tokenizer would split apart, so non-literal words
+            // ride an opaque placeholder and are substituted back after
+            // parsing.
+            let mut subs: Vec<(String, String)> = Vec::new();
+            let mut parts: Vec<String> = Vec::new();
+            for w in &words {
+                match w {
+                    IrExpr::Str(_, _) => parts.push(render_word(w)),
+                    _ => {
+                        let ph = format!("__SH2TESTOPERAND{}__", subs.len());
+                        subs.push((ph.clone(), render_word(w)));
+                        parts.push(ph);
+                    }
+                }
+            }
+            let mut cond = render_test_expr(&parts.join(" "));
+            for (ph, perl) in subs {
+                cond = cond.replace(&ph, &format!("({})", perl));
+            }
             if rc_unread() {
                 // Evaluate (words may carry side effects), discard value.
                 emit_indent(out, indent);

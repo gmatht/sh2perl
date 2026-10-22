@@ -4599,6 +4599,36 @@ fn parse_parameter_expansion_content_inner(
         }
     } else if let Some((var, op, operand)) = split_colon_operator(content) {
         Ok(colon_operator_expansion(var, op, operand))
+    } else if content.contains('+')
+        && !content.contains('%')
+        && !content.contains('#')
+        && !content.contains('/')
+        && !content.contains('!')
+        && !content.contains(':')
+    {
+        // ${var+word} — the ALTERNATE word when var is SET (bare `+`;
+        // set-but-empty counts, which is strictly weaker than `:+`).
+        // Without this arm the operator stayed GLUED to the name, so the
+        // A1 carried `param("", "E+d")` and every backend read a variable
+        // literally named `E+d`: the Perl renderer emitted `(${E+d})`,
+        // which does not compile under `use strict`, and the ESTree read
+        // an empty store entry. `ast_words` already distinguishes `+`
+        // from `:+` via UseAlternative's `need_nonempty`, so only the
+        // parser was missing.
+        let parts: Vec<&str> = content.splitn(2, '+').collect();
+        if parts.len() == 2 && !parts[0].is_empty() {
+            Ok(ParameterExpansion {
+                variable: parts[0].to_string(),
+                operator: ParameterExpansionOperator::UseAlternative(parts[1].to_string(), false),
+                is_mutable: true,
+            })
+        } else {
+            Ok(ParameterExpansion {
+                variable: content.to_string(),
+                operator: ParameterExpansionOperator::None,
+                is_mutable: true,
+            })
+        }
     } else if content.contains('-')
         && !content.contains('%')
         && !content.contains('#')
@@ -5909,6 +5939,37 @@ mod colon_operator_tests {
         match params("x:-a:b").operator {
             Op::DefaultValue(v) => assert_eq!(v, "a:b"),
             other => panic!("expected DefaultValue, got {other:?}"),
+        }
+    }
+
+    /// `${x+w}` — the bare `+` operator was never split out of the name, so
+    /// the A1 carried `param("", "E+d")` and every backend read a variable
+    /// literally named `E+d` (the Perl renderer emitted `(${E+d})`, which
+    /// does not compile under `use strict`). It is UseAlternative with the
+    /// SET test — `need_nonempty == false`, unlike `:+`.
+    #[test]
+    fn bare_plus_is_the_set_test_not_a_name_suffix() {
+        let pe = params("E+d");
+        assert_eq!(pe.variable, "E", "the operator must not stay in the name");
+        match pe.operator {
+            Op::UseAlternative(w, need_nonempty) => {
+                assert_eq!(w, "d");
+                assert!(
+                    !need_nonempty,
+                    "bare `+` accepts set-but-empty, so no non-empty test"
+                );
+            }
+            other => panic!("expected UseAlternative, got {other:?}"),
+        }
+        // An EMPTY alternate word is still the operator (`${v+}`).
+        match params("v+").operator {
+            Op::UseAlternative(w, false) => assert_eq!(w, ""),
+            other => panic!("expected UseAlternative(\"\", false), got {other:?}"),
+        }
+        // `:+` stays the distinct non-empty form (the control).
+        match params("E:+d").operator {
+            Op::UseAlternative(w, true) => assert_eq!(w, "d"),
+            other => panic!("expected UseAlternative(_, true), got {other:?}"),
         }
     }
 }

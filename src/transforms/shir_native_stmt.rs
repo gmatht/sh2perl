@@ -1343,15 +1343,32 @@ fn render_test_words(words: &[&IrExpr]) -> IrExpr {
             // (variable-plus-operator). `${:PERL}` is the established
             // splice for an already-rendered Perl operand below.
             IrExpr::Call { func, args } if func == "param" => {
-                let [IrExpr::Str(op, _), IrExpr::Str(name, _)] = args.as_slice() else {
+                let lit = |i: usize| match args.get(i) {
+                    Some(IrExpr::Str(s, _)) => Some(s.as_str()),
+                    _ => None,
+                };
+                let (Some(op), Some(name)) = (lit(0), lit(1)) else {
                     return None;
                 };
-                match args.get(2) {
-                    Some(IrExpr::Str(arg, _)) => {
-                        Some(format!("${{{op}{name}{arg}}}"))
-                    }
-                    _ => Some(format!("${{{op}{name}}}")),
+                // Rebuild the EXPANSION TEXT in bash spelling. Two bugs
+                // lived here: the arm required EXACTLY two args, so a
+                // three-arg operator (`${V+d}` → param("+","V","d")) was
+                // dropped from the word list entirely — `test -n "${V+w}"`
+                // collapsed to the single token `-n` and rendered
+                // `length('-n')`, i.e. always TRUE — and the operator was
+                // placed BEFORE the name (`${+Vd}`) instead of after it.
+                // `""`/`len` are the two forms that prefix the name.
+                match op {
+                    "" => return Some(format!("${{{name}}}")),
+                    "len" => return Some(format!("${{#{name}}}")),
+                    // Not a plain expansion text — leave it to the caller.
+                    "slice" => return None,
+                    _ => {}
                 }
+                Some(match lit(2) {
+                    Some(arg) => format!("${{{name}{op}{arg}}}"),
+                    None => format!("${{{name}{op}}}"),
+                })
             }
             // unquoted expansion (split(getVar)): single-element paths
             IrExpr::Call { func, args }
