@@ -882,9 +882,14 @@ fn native_echo_bc_stmt(st: &mut IrStmt) -> bool {
     if cmd != "bc" || !bc_args.is_empty() { return false; }
     let Ok(out) = bc_eval(&expr) else { return false; };
     let out = if out.is_empty() { String::new() } else { out };
+    // The value MUST be a QUOTED string, not a raw literal: bc's output
+    // format is significant (`scale=2; 5/2` is `2.50`, `0.5+0.25` is
+    // `.75`), and a bare Perl number literal numifies — `print(2.50)`
+    // emits `2.5` and `print(.75)` emits `0.75`. Quoting preserves the
+    // exact bytes the evaluator produced.
     *st = IrStmt::Block(vec![
         IrStmt::Output {
-            value: IrExpr::Str(out, StrStyle::Raw),
+            value: IrExpr::Str(out, StrStyle::SingleQuoted),
             newline: true,
             target: None,
         },
@@ -984,6 +989,17 @@ fn native_eval_assign_stmt(st: &mut IrStmt) -> bool {
     let Some((name, value)) = eval_assign_parts(word) else {
         return false;
     };
+    // The value is the TEXT eval will RE-PARSE, so a shell expansion in it
+    // must be evaluated, not copied: `eval "result=\$(( \$var + 1 ))"` sets
+    // result to the ARITHMETIC RESULT, not to the literal `$(( … ))`.
+    // Copying the text was right only for a value with no expansion
+    // (`y=5+1`). Return false so the renderer's parse-the-text lowering
+    // handles it (063_12).
+    if let Some(text) = crate::ir::static_word_text(&value) {
+        if text.contains("$((") || text.contains("${") || text.contains("$(") || text.contains('`') {
+            return false;
+        }
+    }
     *st = IrStmt::Assign {
         targets: vec![crate::ir::AssignTarget {
             var: name,
@@ -3004,6 +3020,18 @@ fn native_sort_file_stmt(st: &mut IrStmt) -> bool {
     // is refused — the real path isn't known at IR time.
     let out = match &r.target {
         IrExpr::Str(s, _) => crate::ir::safe_perl_q_string(s),
+        // A `Var`/`Ident` target: which of the two readings is right depends
+        // on the name. A process-substitution temp (`__ps_tmp0`) is a Perl
+        // SCALAR holding the `mktemp` path — the previous statement assigned
+        // it — so the filename is its VALUE. Anything else is a bash-side
+        // name the shell would resolve itself, so the name is the filename.
+        //
+        // Reading `__ps_tmp*` as a literal filename made `sort` write to
+        // a file actually named `__ps_tmp0` while `comm` read the real temp:
+        // 000__04h's process-substitution result was empty.
+        IrExpr::Var(n, _) | IrExpr::Ident(n) if n.starts_with("__ps_tmp") => {
+            format!("${n}")
+        }
         IrExpr::Var(n, _) | IrExpr::Ident(n) => crate::ir::safe_perl_q_string(n),
         _ => return false,
     };
@@ -3030,12 +3058,14 @@ fn native_sort_file_stmt(st: &mut IrStmt) -> bool {
     let Some(file) = file else { return false; };
     // process-substitution temps arrive as Var/Ident (`sort "$__ps_tmp0"`):
     // the NAME is the literal filename.
-    let fname = match file {
-        IrExpr::Str(fname, _) => fname.clone(),
-        IrExpr::Var(n, _) | IrExpr::Ident(n) => n.clone(),
+    // the INPUT side: `__ps_tmp*` names hold the runtime path, so quote the
+    // scalar READ, not the name (same rule as the output target above).
+    let fq = match file {
+        IrExpr::Str(fname, _) => crate::ir::safe_perl_q_string(fname),
+        IrExpr::Var(n, _) | IrExpr::Ident(n) if n.starts_with("__ps_tmp") => format!("${n}"),
+        IrExpr::Var(n, _) | IrExpr::Ident(n) => crate::ir::safe_perl_q_string(n),
         _ => return false,
     };
-    let fq = crate::ir::safe_perl_q_string(&fname);
     let cmp = if numeric { "{ $a <=> $b }" } else { "{ $a cmp $b }" };
     let reverse = if reverse { " @__sl = reverse @__sl;" } else { "" };
     let code = format!(
@@ -5655,10 +5685,26 @@ fn native_while_multi_cond(st: &mut IrStmt) -> bool {
         cond: rendered,
         then: vec![],
         elsifs: vec![],
-        else_: vec![IrStmt::Expr(IrExpr::Call {
-            func: "break".to_string(),
-            args: vec![],
-        })],
+        // The condition FAILED. bash reports 0 for a `while` whose body
+        // never ran, whatever the condition's own status was, so zero the
+        // status on this exit path:
+        //
+        //     while echo c; test -f /nope; do echo hi; break; done; echo $?
+        //     # c
+        //     # 0        <- not 1, the failing `test`'s status
+        //
+        // `$CHILD_ERROR` still holds that failing status at this point
+        // (the `test` lowering just set it), which is what the old code
+        // leaked (parse-multi-command-while-condition printed 1).
+        // Two statements, not one RawText: `break` must reach the IR's
+        // `last;` mapping, and a raw `break` is a strict-subs bareword.
+        else_: vec![
+            IrStmt::RawText("$main_exit_code = $CHILD_ERROR = 0;".to_string()),
+            IrStmt::Expr(IrExpr::Call {
+                func: "break".to_string(),
+                args: vec![],
+            }),
+        ],
     });
     new_body.extend(body.iter().cloned());
     match st {

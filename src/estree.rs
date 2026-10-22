@@ -1243,6 +1243,16 @@ struct ArrayRefs {
     in_fn: bool,
     /// A computed / non-integer / negative-literal subscript read.
     index_bad: bool,
+    /// A read that CONSULTS THE RUNTIME STORE for this name rather than
+    /// the rewritten native binding — `sh2.max("name")`, the sorted*
+    /// joins, `sh2.getVar("name…")`, the `param` slice. The fold
+    /// rewrites only the reads it knows (arrayIndex / arrayLen /
+    /// arrayItems / arrayValues), so folding such a name would put the
+    /// data in a native `let` that nobody reads while the surviving
+    /// store-reading call sees an empty store (`sh2.max("xs")` → "0",
+    /// t92_max_min_sum). Must veto the fold, exactly like `mark_text_refs`
+    /// does for a `$name` inside runtime-expanded text.
+    store_read: bool,
 }
 
 fn is_sh2_call(callee: &Expr, fn_name: &str) -> bool {
@@ -1270,6 +1280,60 @@ fn lit_str<'a>(e: &'a Expr) -> Option<&'a str> {
         Expr::Literal { value, .. } => value.as_str(),
         _ => None,
     }
+}
+
+/// The `sh2.*` runtime members whose FIRST argument is a variable NAME
+/// spelled as a string literal — `sh2.max("xs")`, `sh2.arrayLen("xs")`,
+/// `sh2.getVar("xs[1]")`. A call to one of these READS the runtime
+/// store entry for that name, so a leading `let xs = […]` that only
+/// feeds such a call is NOT dead: the runtime store is the thing the
+/// call consults, and the native `let` is what the native-array fold
+/// put there INSTEAD of the `sh2.setArray` that would have populated it.
+///
+/// This is the twin of [`mark_text_refs`]: that one finds `$name` inside
+/// runtime-expanded TEXT (so the native fold refuses those names), this
+/// one finds `"name"` inside a store-reading CALL (so the dead-decl drop
+/// refuses to remove the binding the call needs). Both exist because the
+/// read is spelled as DATA, not as an identifier, and a read-set walk
+/// that only follows identifiers cannot see either.
+///
+/// Deliberately an ALLOWLIST, not "any sh2 call with a string arg":
+/// `sh2.exec(["echo", "xs"])` mentions `xs` as data for a child process
+/// and reads no store entry, and marking it would keep a genuinely dead
+/// declaration alive. A name this list misses is a MISS, not a crash —
+/// the worst case is one dropped `let` whose decl was unread, which is
+/// what the pass was already doing for every name.
+fn sh2_var_name_member(fn_name: &str) -> bool {
+    matches!(
+        fn_name,
+        // whole-array reductions and sorted joins (the read is the array
+        // VALUE, and the runtime resolves it against the STORE)
+        "max" | "min" | "sum" | "sortedIntJoin" | "sortedBigintJoin"
+        // element / slice / length / items reads
+        | "arrayIndex" | "arrayLen" | "arrayItems" | "arrayValues"
+        // generic store access (getVar takes "name" or "name[idx]")
+        | "getVar"
+    )
+}
+
+/// The variable name a store-reading `sh2.*` call refers to, or `None`
+/// when the first argument is not a plain name literal (a computed
+/// argument is a runtime value, never a binding this pass can reason
+/// about). `getVar("name[1]")` / `arrayIndex("name", "1")` yield the
+/// BASE name — the binding under examination is the array.
+fn sh2_call_var_name<'a>(fn_name: &str, args: &'a [Expr]) -> Option<&'a str> {
+    if !sh2_var_name_member(fn_name) {
+        return None;
+    }
+    let s = lit_str(args.first()?)?;
+    if fn_name == "getVar" || fn_name == "setVar" {
+        // "name" or "name[idx]" — the store key is the base name
+        return parse_var_arg_str(s).map(|(n, _)| n);
+    }
+    // the array members take the bare name. `#name` is the `param`-style
+    // length spelling for a few call sites; strip it so the base name is
+    // recorded either way.
+    Some(s.trim_start_matches('#'))
 }
 
 /// Does runtime-expanded text `s` reference `name` (`$name` / `${name…}`)?
@@ -1367,6 +1431,15 @@ fn classify_array_call(
             Some(n) => n,
             None => return,
         },
+        // The whole-array reductions and sorted joins: they take the bare
+        // name string and this fold must leave the name alone (the runtime
+        // resolves it against the store) — see the `store_read` arm below.
+        "max" | "min" | "sum" | "sortedIntJoin" | "sortedBigintJoin" => {
+            match lit_str(first) {
+                Some(n) => n.trim_start_matches('#'),
+                None => return,
+            }
+        }
         "getVar" | "setVar" => {
             // Literal "name[idx]" / "name", or template `name[${i}]`
             match first {
@@ -1474,6 +1547,20 @@ fn classify_array_call(
             _ => entry.index_bad = true,
         },
         "arrayLen" | "arrayItems" | "arrayValues" => entry.read_stmt_idxs.push(stmt_idx),
+        // The whole-array reductions and the sorted joins: this fold does
+        // NOT rewrite these call sites (their argument is a bare name
+        // string that the runtime resolves against the STORE), so folding
+        // the name into a native binding strands it — the surviving call
+        // reads a store that was never populated. Refusing is correct even
+        // when the LATER `array_migrate_program` would have migrated the
+        // array: that pass rewrites the call site itself, and it only gets
+        // the chance when the fold left the array alone. Measured on
+        // py-sh-go t93_extent_mixed.py, where `ys` folded while
+        // `sh2.sortedBigintJoin("ys")` survived and printed `[]`.
+        "max" | "min" | "sum" | "sortedIntJoin" | "sortedBigintJoin" => {
+            entry.store_read = true;
+            entry.read_stmt_idxs.push(stmt_idx);
+        }
         "param" => {
             let op = args.first().and_then(lit_str).unwrap_or("");
             let _target = args.get(1).and_then(lit_str).unwrap_or("");
@@ -1755,6 +1842,7 @@ pub(crate) fn lower_native_arrays(prog: Program) -> Program {
                 && !a.whole
                 && !a.writes
                 && !a.index_bad
+                && !a.store_read
                 && !declared.contains(*name)
         })
         .map(|(n, _)| n.clone())
@@ -8677,6 +8765,22 @@ fn expr_read_set<'a>(e: &'a Expr, shadow: &ReadSet<'a>) -> ReadSet<'a> {
             let mut out = expr_read_set(callee, shadow);
             for a in arguments {
                 out.extend(expr_read_set(a, shadow));
+            }
+            // A store-reading `sh2.*` call spells the variable as a STRING
+            // LITERAL (`sh2.max("xs")`), which the identifier walk above
+            // cannot see — the name would look unread and a leading
+            // `let xs = […]` (the native-array fold's replacement for the
+            // `sh2.setArray` that fed the store) would be dropped as dead,
+            // leaving the call to read an empty store. t92_max_min_sum:
+            // `xs = [3,1,…]` + `print(max(xs))` printed `0` six times for
+            // exactly this reason. Count the name as a read; a name under
+            // a SHADOW is the shadowing binding's, not this one's.
+            if let Some(fn_name) = sh2_callee_name(callee) {
+                if let Some(name) = sh2_call_var_name(fn_name, arguments) {
+                    if !shadow.contains(name) {
+                        out.insert(name);
+                    }
+                }
             }
             out
         }

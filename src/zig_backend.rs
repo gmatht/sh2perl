@@ -138,6 +138,8 @@ pub struct Render {
     need_fexist: bool,
     need_writefile: bool,
     need_run: bool,
+    /// glob matching helper needed (case patterns with wildcards)
+    need_glob: bool,
     loop_depth: usize,
     todo: usize,
     /// inside a user-function body (A1 Function): getVar("N") reads the
@@ -2959,17 +2961,33 @@ impl Render {
                         .patterns
                         .iter()
                         .filter(|p| p.as_str() != "*")
-                        .map(|p| format!("std.mem.eql(u8, {d}, {})", Self::zig_str(p)))
+                        .map(|p| {
+                            // a pattern with glob metacharacters is a MATCH, not
+                            // an equality test (`case x in a*)` matched "abc").
+                            if p.contains('*') || p.contains('?') || p.contains('[') {
+                                self.need_glob = true;
+                                format!("matchGlob({d}, {})", Self::zig_str(p))
+                            } else {
+                                format!("std.mem.eql(u8, {d}, {})", Self::zig_str(p))
+                            }
+                        })
                         .collect();
                     let is_default = cl.patterns.iter().any(|p| p.as_str() == "*");
                     if conds.is_empty() && is_default {
-                        self.emit("else {");
+                        // A default-only `case` (or one reached with no earlier
+                        // clause) has no `if` to chain from: `else {` alone is
+                        // not a statement. Close the previous arm when there was
+                        // one; otherwise emit a bare block.
+                        if emitted {
+                            self.emit("} else {");
+                        } else {
+                            self.emit("else {");
+                        }
                         self.depth += 1;
                         for s in &cl.body {
                             self.stmt(s);
                         }
                         self.depth -= 1;
-                        self.emit("}");
                         emitted = true;
                         continue;
                     }
@@ -3349,7 +3367,15 @@ impl Render {
                 }
             }
         }
-        // dead-var guard: Zig rejects declared-but-never-read variables
+        // dead-var guard: Zig rejects declared-but-never-read variables.
+        // `_ = x;` is NOT enough on the 0.16+ target: a variable that was
+        // ASSIGNED (which is what `written` holds) makes the discard itself an
+        // error — "pointless discard of local variable" (verified on 0.16.0 and
+        // 0.17.0). Discarding the ADDRESS (`_ = &x;`) keeps the declaration
+        // live for both cases: it reads the variable AND satisfies
+        // "never mutated" for an unassigned one (taking the address counts as a
+        // potential mutation). This is a compile error the corpus-c zig column
+        // caught in 005/006/013/014 (e.g. `t = sh2ToInt(___t1); ... _ = t;`).
         for v in &written {
             if !self.read.contains(v) && !self.fn_locals.contains(v) {
                 let m = self
@@ -3357,7 +3383,7 @@ impl Render {
                     .get(v)
                     .cloned()
                     .unwrap_or_else(|| self.zig_ident(v));
-                self.emit(&format!("_ = {m};"));
+                self.emit(&format!("_ = &{m};"));
             }
         }
         std::mem::swap(&mut self.out, &mut body_stmts);
@@ -3405,10 +3431,22 @@ impl Render {
             self.emit("    return if (b) \"1\" else \"0\";");
             self.emit("}");
         }
+        if self.need_env || self.need_run {
+            // Process handle for the runtime helpers. `Init` is only available
+            // inside the emitted `main`, and zig has no way to thread it into a
+            // free helper without changing every call site, so the emitted main
+            // publishes it here (see the `sh2_io = init.io;` injection).
+            self.emit("");
+            self.emit("var sh2_io: ?std.Io = null;");
+        }
+        if self.need_env {
+            self.emit("var sh2_environ: ?*std.process.Environ.Map = null;");
+        }
         if self.need_env {
             self.emit("");
             self.emit("fn sh2Env(name: []const u8) []const u8 {");
-            self.emit("    return std.process.getEnvVar(name) catch \"\";");
+            self.emit("    const m = sh2_environ orelse return \"\";");
+            self.emit("    return m.get(name) orelse \"\";");
             self.emit("}");
         }
         if self.need_fexist {
@@ -3650,11 +3688,45 @@ self.emit("fn sh2TrimRightNl(t: []const u8) []const u8 {");
             self.emit("    return total.toString(std.heap.page_allocator, 10, .lower) catch \"\";");
             self.emit("}");
         }
+        if self.need_glob {
+            self.emit("");
+            self.emit("fn matchGlob(s: []const u8, pat: []const u8) bool {");
+            self.emit("    var si: usize = 0;");
+            self.emit("    var pi: usize = 0;");
+            self.emit("    var ssi: usize = 0;");
+            self.emit("    var spi: usize = 0;");
+            self.emit("    var star = false;");
+            self.emit("    while (si < s.len) {");
+            self.emit("        if (pi < pat.len) {");
+            self.emit("            const pc = pat[pi];");
+            self.emit("            if (pc == '*') {");
+            self.emit("                star = true;");
+            self.emit("                ssi = si;");
+            self.emit("                spi = pi;");
+            self.emit("                pi += 1;");
+            self.emit("                continue;");
+            self.emit("            }");
+            self.emit("            if (pc == '?' or s[si] == pc) {");
+            self.emit("                si += 1;");
+            self.emit("                pi += 1;");
+            self.emit("                continue;");
+            self.emit("            }");
+            self.emit("        }");
+            self.emit("        if (star) { si = ssi + 1; ssi = si; pi = spi + 1; } else return false;");
+            self.emit("    }");
+            self.emit("    while (pi < pat.len and pat[pi] == '*') { pi += 1; }");
+            self.emit("    return pi == pat.len;");
+            self.emit("}");
+        }
         if self.need_run {
             self.emit("");
             self.emit("fn sh2Run(argv: []const []const u8) []const u8 {");
-            self.emit("    const result = std.process.Child.run(.{ .allocator = std.heap.page_allocator, .argv = argv }) catch return \"\";");
-            self.emit("    return std.mem.trimRight(u8, result.stdout, \"\\n\");");
+            self.emit("    const io = sh2_io orelse return \"\";");
+            self.emit("    const result = std.process.run(std.heap.page_allocator, io, .{");
+            self.emit("        .argv = argv,");
+            self.emit("        .stdout_limit = .limited(1 << 20),");
+            self.emit("    }) catch return \"\";");
+            self.emit("    return std.mem.trimEnd(u8, result.stdout, \"\\n\");");
             self.emit("}");
         }
         // per-callee stubs: compile-able, exit(2) at runtime
@@ -3741,20 +3813,26 @@ self.emit("fn sh2TrimRightNl(t: []const u8) []const u8 {");
                 self.emit(d);
             }
         }
-        if self.need_stdout {
-            self.emit("");
-            // zig 0.16 removed std.io.getStdOut: stdout writing needs the
-            // process Init's Io. Rewrite the already-emitted main signature
-            // and set up a buffered File.Writer as `stdout` — generated
-            // statements (`try stdout.print(...)`) are unchanged, each one
-            // is followed by an explicit flush (early returns / exit() must
-            // not lose buffered output).
+        // zig 0.16 removed std.io.getStdOut, and 0.14's std.process.getEnvVar /
+        // std.process.Child.run went with it: stdout writing, env reads and
+        // child capture ALL need the process `Init` now. So `main` takes
+        // `init` whenever any of the three is needed, and the ones that cannot
+        // be threaded into a free helper read it back through these globals.
+        let need_init = self.need_stdout || self.need_env || self.need_run;
+        if need_init {
+            // Rewrite the already-emitted main signature. Generated statements
+            // (`try stdout.print(...)`) are unchanged; each print is followed
+            // by an explicit flush (early returns / exit() must not lose
+            // buffered output).
             for line in self.out.iter_mut() {
                 if line == "pub fn main() !void {" {
                     *line = "pub fn main(init: std.process.Init) !void {".to_string();
                     break;
                 }
             }
+        }
+        if self.need_stdout {
+            self.emit("");
             self.out
                 .push("    var stdout_buffer: [4096]u8 = undefined;".to_string());
             self.out.push(
@@ -3763,6 +3841,19 @@ self.emit("fn sh2TrimRightNl(t: []const u8) []const u8 {");
             );
             self.out
                 .push("    const stdout = &stdout_file_writer.interface;".to_string());
+        }
+        if self.need_env || self.need_run {
+            self.out
+                .push("    sh2_io = init.io;".to_string());
+        }
+        if self.need_env {
+            self.out
+                .push("    sh2_environ = init.environ_map;".to_string());
+        }
+        if !self.need_stdout && !self.need_env && !self.need_run {
+            // `main` always takes `init`; if nothing consumed the handle the
+            // parameter is unused and zig rejects it.
+            self.out.push("    _ = init;".to_string());
         }
         if !body_stmts.is_empty() || !decls.is_empty() {
             self.emit("");

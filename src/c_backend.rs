@@ -209,6 +209,13 @@ pub struct Render {
     /// shell function names defined in the program (Function stmts) —
     /// calls to these render as `name();` instead of a sh2.* stub.
     functions: BTreeSet<String>,
+    /// take-field fusion sites (reader fn name → shape): a call to a
+    /// function whose body is exactly `x=${s%%D*}; strip_fn()` — where
+    /// the stripper consumes `s` one char at a time until the same
+    /// probe comes back empty — renders as one inline take-field block
+    /// (strchr + two fresh copies) instead of ~9 allocs, ~9 scans, two
+    /// function calls and a loop per field. See `collect_take_fields`.
+    take_fields: HashMap<String, TakeField>,
     /// fn-local vars whose values are read by FILE-SCOPE site/capture
     /// helpers (their bodies reference the var) — these hoist to file
     /// scope instead of the fn's local block (shadowing would stale the
@@ -1093,7 +1100,7 @@ fn select_vec_arrays(
 /// in i64 ones.
 fn demote_string_loop_vars(prog: &IrProgram, int_set: &mut HashSet<String>) {
     use crate::ir::{IrExpr, IrStmt};
-    let int_arrays = crate::shir::analyze_int_arrays(prog);
+    let int_arrays = crate::c_backend::int_arrays_for_c(prog);
     fn numeric(e: &IrExpr, ints: &HashSet<String>) -> bool {
         match e {
             IrExpr::Int(_) | IrExpr::Arith(_) => true,
@@ -1205,7 +1212,7 @@ fn demote_stringy_ints(prog: &mut IrProgram) {
     if int_set.is_empty() {
         return;
     }
-    let int_arrays = crate::shir::analyze_int_arrays(prog);
+    let int_arrays = crate::c_backend::int_arrays_for_c(prog);
     fn is_numeric(e: &IrExpr, ints: &HashSet<String>, int_arrays: &HashSet<String>) -> bool {
         match e {
             IrExpr::Int(_) => true,
@@ -1238,6 +1245,17 @@ fn demote_stringy_ints(prog: &mut IrProgram) {
             // (`_min_xs = min(xs)`); over a string array it is a string
             // (Python min of strings is lexicographic), so only int-homed.
             IrExpr::Call { func, args } if matches!(func.as_str(), "min" | "max" | "sum") => {
+                match crate::c_backend::Render::str_arg(args, 0) {
+                    Some(n) => int_arrays.contains(&n),
+                    None => false,
+                }
+            }
+            // a single-element read of an INT-homed array computes an
+            // int (the native slot value — see the `expr_as_num`
+            // arrayIndex arm, which renders it without any string
+            // round-trip). Over a string array it is decimal text that
+            // must be re-parsed, so only int-homed.
+            IrExpr::Call { func, args } if func == "arrayIndex" => {
                 match crate::c_backend::Render::str_arg(args, 0) {
                     Some(n) => int_arrays.contains(&n),
                     None => false,
@@ -1488,6 +1506,2062 @@ fn arith_divisors(a: &crate::ir::ArithAst, out: &mut Vec<crate::ir::ArithAst>) {
 }
 
 
+/// Int-element arrays (C-backend-local): arrays whose every store is
+/// int-domain, that are densely initialized, and whose every element
+/// read is in int position. Such arrays home as native `long long[]`
+/// AND their element-readers type as `long long`, so the per-pixel
+/// loop does direct integer loads instead of `_sh_arr_get` + `strdup`
+/// + `atoll` per access.
+///
+/// WHY THIS EXISTS: the shared `analyze_int_arrays` marks EVERY
+/// `arrayIndex` read as a string read ("conservatively"), which vetoes
+/// native homing for any array ever indexed — including polygon/texture
+/// buffers that are only ever read numerically. The readers then stay
+/// `char*` too (no Int verdict can flow through a string copy), so the
+/// hot loop re-parses every coordinate with `atoll` per pixel.
+///
+/// SOUNDNESS (each condition load-bearing):
+/// - int-domain stores: every stored value is an integer expression
+///   (literals, any arith — a div/mod abort stores nothing, so the
+///   stored value is always an integer — canonical-`Str`, or a Var /
+///   `getVar` of an Int-seeded var). The native slot then holds exactly
+///   the value bash would store.
+/// - dense init, two classes. Class D: a literal `setArray` covers
+///   indices 0..N-1 (all literals agree on N), no appends, no
+///   whole-array reassignment, no `unset`. Constant store keys satisfy
+///   0 <= k < N. `$var` store keys sit under an enclosing `[ $k -lt N ]`
+///   / `[ $k -le N-1 ]` guard (per store site) and the key is proven
+///   non-negative (zero-init plus only `+1` increments — the
+///   polygon-buffer cursor shape). Without all three, a store could
+///   land past `len` and leave realloc-garbage holes below it (bash
+///   would read `""` there). Class A: a seed literal plus append-only
+///   growth (appends land exactly at `len`, extending contiguously, so
+///   no holes ever form), no indexed stores at all.
+/// - int-position reads: inside `Arith`, an array key/index, a
+///   `min|max|sum` arg, a pure-numeric `test` operand, or a `v = A[k]`
+///   copy whose target `v` seeds Int (see below). A read anywhere else
+///   (echo, message building, a join) vetoes — joins need `char**`
+///   (`_sh_join_arr` takes the raw store, so a native array would be a
+///   type error there).
+/// - OOB reads stay exact: the backend's len guard (`k < len ? el :
+///   `""`) yields `""`, and `atoll("") == 0` is what every int context
+///   observes — identical to bash. The `expr_as_num` arrayIndex arm
+///   renders exactly this (`... ? arr[k] : 0LL`).
+/// - reader seeding only ADDS `Int` verdicts that `demote_stringy_ints`
+///   (which runs after, with the new `is_numeric` arrayIndex arm)
+///   re-validates: any seed with a stringy assign is removed again.
+///   Seeds additionally require int-use-only (no string-position use
+///   anywhere, with positions propagated through `t = v` copies), so a
+///   runtime `""` (OOB read) can never reach a text observer as `"0"`.
+/// `SH2_NO_INT_ELEM=1` disables the whole pass (validation kill-switch).
+fn analyze_int_element_arrays(prog: &IrProgram) -> HashSet<String> {
+    if std::env::var("SH2_NO_INT_ELEM").as_deref() == Ok("1") {
+        return HashSet::new();
+    }
+    let (homed, _) = int_element_verdict(prog);
+    let shared = crate::shir::analyze_int_arrays(prog);
+    let out: HashSet<String> = homed.difference(&shared).cloned().collect();
+    if std::env::var("SH2_DEBUG_INT_ELEM").is_ok() {
+        let mut v: Vec<_> = out.iter().collect();
+        v.sort();
+        eprintln!("INT_ELEM homed: {:?}", v);
+    }
+    out
+}
+
+/// The full verdict: (newly-homed arrays, Int-seeded scalars). The homing
+/// here is the COMPLETE set (including arrays the shared analysis also
+/// homes); callers subtract as needed.
+/// Int-element arrays (C-backend-local): arrays whose every store is
+/// int-domain, that are densely initialized, and that are never read by
+/// a whole-array string operation. Such arrays home as native `long
+/// long[]` AND their element-readers type as `long long`, so the
+/// per-pixel loop does direct integer loads instead of `_sh_arr_get` +
+/// `strdup` + `atoll` per access.
+///
+/// WHY THIS EXISTS: the shared `analyze_int_arrays` marks EVERY
+/// `arrayIndex` read as a string read ("conservatively"), which vetoes
+/// native homing for any array ever indexed — including polygon/texture
+/// buffers that are only ever read numerically. The readers then stay
+/// `char*` too (no Int verdict can flow through a string copy), so the
+/// hot loop re-parses every coordinate with `atoll` per pixel.
+///
+/// SOUNDNESS (each condition load-bearing):
+/// - int-domain stores: every stored value always evaluates to a
+///   canonical integer whenever the store executes (literals, any arith
+///   — a div/mod abort stores nothing — canonical-`Str`, or a Var /
+///   `getVar` whose own assigns are all int-valued, recursively). The
+///   native slot then holds exactly the value bash would store.
+/// - dense init, two classes. Class D: a literal `setArray` covers
+///   indices 0..N-1 (all literals agree on N), no appends, no
+///   whole-array reassignment, no `unset`, no non-arithmetic keys.
+///   Constant store keys satisfy 0 <= k < N. `$var` store keys sit under
+///   an enclosing `[ $k -lt N ]` / `[ $k -le N-1 ]` guard (per store
+///   site) and the key is proven non-negative (zero-init plus only `+1`
+///   increments — the polygon-buffer cursor shape). Without all three,
+///   a store could land past `len` and leave realloc-garbage holes
+///   below it (bash would read `""` there). Class A: a seed literal
+///   plus append-only growth (appends land exactly at `len`, extending
+///   contiguously, so no holes ever form), no indexed stores at all.
+/// - reads: single-element reads NEVER veto (in any position — the
+///   backend renders them exactly from native storage: decimal text via
+///   `num_temp` for string contexts, the raw slot for numeric ones; an
+///   OOB read yields `""` in a string context and `0` in a numeric one,
+///   identical to bash in both). Only whole-array string operations
+///   veto — joins/slices/iteration need `char**` (`_sh_join_arr` takes
+///   the raw store, so a native array would be a type error there).
+/// - reader seeding only ADDS `Int` verdicts that `demote_stringy_ints`
+///   (which runs after, with the new `is_numeric` arrayIndex arm)
+///   re-validates: any seed with a stringy assign is removed again.
+///   Seeds additionally require int-use-only (no direct string-position
+///   use anywhere — copies are transparent, see below), so a runtime
+///   `""` (OOB read) can never reach a text observer as `"0"`.
+/// - copies are transparent: `t = v` constrains neither side's type.
+///   If `v` always holds a canonical integer (its assigns gate), then
+///   `t` observes the identical text/value whether `t` is `char*` or
+///   `long long` — the copy changes representation, never meaning.
+///   (The old design propagated string-ness through copies; that was
+///   backwards — observation does not dictate representation when all
+///   values are canonical.)
+/// `SH2_NO_INT_ELEM=1` disables the whole pass (validation kill-switch).
+fn json_expr(e: &IrExpr) -> String {
+    let s = format!("{:?}", e);
+    s.chars().take(220).collect()
+}
+fn int_element_verdict(prog: &IrProgram) -> (HashSet<String>, HashSet<String>) {
+    use crate::ir::{IrExpr, IrStmt};
+    // ---- pass 0: array names -------------------------------------------
+    let mut array_names: HashSet<String> = HashSet::new();
+    fn collect_arrays(stmts: &[IrStmt], out: &mut HashSet<String>) {
+        for s in stmts {
+            match s {
+                IrStmt::Assign { targets, .. } => {
+                    for t in targets {
+                        let base = t.var.split('[').next().unwrap_or(&t.var);
+                        if crate::c_backend::is_ident(base) && t.var.contains('[') {
+                            out.insert(base.to_string());
+                        }
+                    }
+                }
+                IrStmt::DeclareArray { var, .. } => {
+                    out.insert(var.clone());
+                }
+                IrStmt::If { then, elsifs, else_, .. } => {
+                    collect_arrays(then, out);
+                    for (_, b) in elsifs {
+                        collect_arrays(b, out);
+                    }
+                    collect_arrays(else_, out);
+                }
+                IrStmt::While { body, .. }
+                | IrStmt::DoWhile { body, .. }
+                | IrStmt::For { body, .. }
+                | IrStmt::Block(body)
+                | IrStmt::Subshell(body)
+                | IrStmt::Background(body) => collect_arrays(body, out),
+                IrStmt::ForInit { init, step, body, .. } => {
+                    collect_arrays(init, out);
+                    collect_arrays(step, out);
+                    collect_arrays(body, out);
+                }
+                IrStmt::Function { body, named_blocks, .. } => {
+                    collect_arrays(body, out);
+                    for (_, b) in named_blocks {
+                        collect_arrays(b, out);
+                    }
+                }
+                IrStmt::Try { body, excepts, else_body, finally_body, .. } => {
+                    collect_arrays(body, out);
+                    for e in excepts {
+                        collect_arrays(&e.body, out);
+                    }
+                    collect_arrays(else_body, out);
+                    collect_arrays(finally_body, out);
+                }
+                IrStmt::Case { clauses, .. } => {
+                    for c in clauses {
+                        collect_arrays(&c.body, out);
+                    }
+                }
+                IrStmt::Select { clauses } => {
+                    for c in clauses {
+                        collect_arrays(&c.body, out);
+                    }
+                }
+                IrStmt::Redirect { inner, .. } => collect_arrays(inner, out),
+                IrStmt::Pipeline { stages, .. } => {
+                    for st in stages {
+                        collect_arrays(st, out);
+                    }
+                }
+                IrStmt::Expr(e) | IrStmt::Output { value: e, .. } => {
+                    collect_arrays_expr(e, out)
+                }
+                _ => {}
+            }
+        }
+    }
+    fn collect_arrays_expr(e: &IrExpr, out: &mut HashSet<String>) {
+        match e {
+            IrExpr::Call { func, args } if func == "setArray" || func == "setArrayAppend" => {
+                if let Some(IrExpr::Str(n, _)) = args.first() {
+                    out.insert(n.clone());
+                }
+                for a in args {
+                    collect_arrays_expr(a, out);
+                }
+            }
+            IrExpr::Call { args, .. } => {
+                for a in args {
+                    collect_arrays_expr(a, out);
+                }
+            }
+            IrExpr::Array(items) => {
+                for a in items {
+                    collect_arrays_expr(a, out);
+                }
+            }
+            IrExpr::Arrow(stmts) => collect_arrays(stmts, out),
+            IrExpr::Interpolate(parts) => {
+                for p in parts {
+                    if let crate::ir::InterpPart::Expr(x) = p {
+                        collect_arrays_expr(x, out);
+                    }
+                }
+            }
+            _ => {}
+        }
+    }
+    collect_arrays(&prog.stmts, &mut array_names);
+    for sub in &prog.subs {
+        collect_arrays(&sub.body, &mut array_names);
+    }
+    // ---- pass 1: writes -------------------------------------------------
+    struct W {
+        lit_lens: Vec<usize>,
+        append: bool,
+        // dynamic store keys: "#N" for validated constants, var names
+        // for `$var` keys, plus an other-key veto flag.
+        dyn_keys: Vec<String>,
+        other_key: bool,
+        non_int_value: bool,
+        whole_reassign: bool,
+        unset_hit: bool,
+    }
+    let mut writes: HashMap<String, W> = HashMap::new();
+    let mut store_vals: HashMap<String, Vec<IrExpr>> = HashMap::new();
+    fn wmut<'a>(writes: &'a mut HashMap<String, W>, a: &str) -> &'a mut W {
+        writes.entry(a.to_string()).or_insert(W {
+            lit_lens: Vec::new(),
+            append: false,
+            dyn_keys: Vec::new(),
+            other_key: false,
+            non_int_value: false,
+            whole_reassign: false,
+            unset_hit: false,
+        })
+    }
+    fn split_baked(t: &str) -> Option<(String, String)> {
+        let (base, rest) = t.split_once('[')?;
+        if !crate::c_backend::is_ident(base) {
+            return None;
+        }
+        let key = rest.strip_suffix(']')?.trim().to_string();
+        Some((base.to_string(), key))
+    }
+    enum Key {
+        Const(i64),
+        Var(String),
+        Other,
+    }
+    fn key_of(e: &IrExpr) -> Key {
+        match e {
+            IrExpr::Int(i) => Key::Const(*i),
+            IrExpr::Str(s, _) => {
+                let t = s.trim();
+                if let Ok(i) = t.parse::<i64>() {
+                    return Key::Const(i);
+                }
+                let v = t
+                    .strip_prefix('$')
+                    .unwrap_or(t)
+                    .trim_start_matches('{')
+                    .trim_end_matches('}');
+                if crate::c_backend::is_ident(v) {
+                    Key::Var(v.to_string())
+                } else {
+                    Key::Other
+                }
+            }
+            IrExpr::Var(n, _) | IrExpr::Ident(n) => Key::Var(n.clone()),
+            _ => Key::Other,
+        }
+    }
+    fn walk_w(
+        stmts: &[IrStmt],
+        writes: &mut HashMap<String, W>,
+        store_vals: &mut HashMap<String, Vec<IrExpr>>,
+    ) {
+        for s in stmts {
+            match s {
+                IrStmt::Assign { targets, expr, .. } => {
+                    // setArray/setArrayAppend hiding in the RHS first
+                    // (`A=(...)` / `A+=(...)` lower to Assign-of-call).
+                    walk_w_expr(expr, writes, store_vals);
+                    for t in targets {
+                        if !t.indices.is_empty() {
+                            let base = t.var.clone();
+                            if !crate::c_backend::is_ident(&base) {
+                                continue;
+                            }
+                            let w = wmut(writes, &base);
+                            store_vals.entry(base).or_default().push(expr.clone());
+                            match key_of(&t.indices[0]) {
+                                Key::Const(i) => {
+                                    if i < 0 {
+                                        w.other_key = true;
+                                    } else {
+                                        w.dyn_keys.push(format!("#{}", i));
+                                    }
+                                }
+                                Key::Var(v) => w.dyn_keys.push(v),
+                                Key::Other => w.other_key = true,
+                            }
+                        } else if let Some((b, k)) = split_baked(&t.var) {
+                            let w = wmut(writes, &b);
+                            store_vals.entry(b).or_default().push(expr.clone());
+                            match key_of(&IrExpr::Str(
+                                k,
+                                crate::ir::StrStyle::DoubleQuoted,
+                            )) {
+                                Key::Const(i) => {
+                                    if i < 0 {
+                                        w.other_key = true;
+                                    } else {
+                                        w.dyn_keys.push(format!("#{}", i));
+                                    }
+                                }
+                                Key::Var(v) => w.dyn_keys.push(v),
+                                Key::Other => w.other_key = true,
+                            }
+                        } else if crate::c_backend::is_ident(&t.var) {
+                            // whole-var assign: an Array literal RHS is
+                            // a cover; a setArray/setArrayAppend call RHS
+                            // was already processed above (never a
+                            // reassignment); anything else destroys it.
+                            if let IrExpr::Array(items) = expr {
+                                let w = wmut(writes, &t.var);
+                                w.lit_lens.push(items.len());
+                                store_vals
+                                    .entry(t.var.clone())
+                                    .or_default()
+                                    .extend(items.iter().cloned());
+                            } else if !matches!(
+                                expr,
+                                IrExpr::Call { func, .. }
+                                    if func == "setArray" || func == "setArrayAppend"
+                            ) {
+                                wmut(writes, &t.var).whole_reassign = true;
+                            }
+                        }
+                    }
+                }
+                IrStmt::DeclareArray { var, elements, .. } => {
+                    let w = wmut(writes, var);
+                    w.lit_lens.push(elements.len());
+                    store_vals
+                        .entry(var.clone())
+                        .or_default()
+                        .extend(elements.iter().cloned());
+                }
+                IrStmt::If { then, elsifs, else_, .. } => {
+                    walk_w(then, writes, store_vals);
+                    for (_, b) in elsifs {
+                        walk_w(b, writes, store_vals);
+                    }
+                    walk_w(else_, writes, store_vals);
+                }
+                IrStmt::While { body, .. }
+                | IrStmt::DoWhile { body, .. }
+                | IrStmt::For { body, .. }
+                | IrStmt::Block(body)
+                | IrStmt::Subshell(body)
+                | IrStmt::Background(body) => walk_w(body, writes, store_vals),
+                IrStmt::ForInit { init, step, body, .. } => {
+                    walk_w(init, writes, store_vals);
+                    walk_w(step, writes, store_vals);
+                    walk_w(body, writes, store_vals);
+                }
+                IrStmt::Function { body, named_blocks, .. } => {
+                    walk_w(body, writes, store_vals);
+                    for (_, b) in named_blocks {
+                        walk_w(b, writes, store_vals);
+                    }
+                }
+                IrStmt::Try { body, excepts, else_body, finally_body, .. } => {
+                    walk_w(body, writes, store_vals);
+                    for e in excepts {
+                        walk_w(&e.body, writes, store_vals);
+                    }
+                    walk_w(else_body, writes, store_vals);
+                    walk_w(finally_body, writes, store_vals);
+                }
+                IrStmt::Case { clauses, .. } => {
+                    for c in clauses {
+                        walk_w(&c.body, writes, store_vals);
+                    }
+                }
+                IrStmt::Select { clauses } => {
+                    for c in clauses {
+                        walk_w(&c.body, writes, store_vals);
+                    }
+                }
+                IrStmt::Redirect { inner, .. } => walk_w(inner, writes, store_vals),
+                IrStmt::Pipeline { stages, .. } => {
+                    for st in stages {
+                        walk_w(st, writes, store_vals);
+                    }
+                }
+                IrStmt::Expr(e) | IrStmt::Output { value: e, .. } => {
+                    walk_w_expr(e, writes, store_vals)
+                }
+                _ => {}
+            }
+        }
+    }
+    fn walk_w_expr(
+        e: &IrExpr,
+        writes: &mut HashMap<String, W>,
+        store_vals: &mut HashMap<String, Vec<IrExpr>>,
+    ) {
+        match e {
+            IrExpr::Call { func, args } => {
+                if func == "setArray" {
+                    if let Some(IrExpr::Str(name, _)) = args.first() {
+                        let w = wmut(writes, name);
+                        if let Some(IrExpr::Array(items)) = args.get(1) {
+                            w.lit_lens.push(items.len());
+                            store_vals
+                                .entry(name.clone())
+                                .or_default()
+                                .extend(items.iter().cloned());
+                        } else {
+                            w.non_int_value = true;
+                        }
+                    }
+                } else if func == "setArrayAppend" {
+                    if let Some(IrExpr::Str(name, _)) = args.first() {
+                        let w = wmut(writes, name);
+                        w.append = true;
+                        if let Some(IrExpr::Array(items)) = args.get(1) {
+                            store_vals
+                                .entry(name.clone())
+                                .or_default()
+                                .extend(items.iter().cloned());
+                        } else {
+                            w.non_int_value = true;
+                        }
+                    }
+                } else if func == "exec" || func == "builtin" {
+                    // `unset A` / `unset A[i]` destroys cover / punches
+                    // holes. Narrow: first word `unset` + second word
+                    // naming a tracked array.
+                    if let Some(IrExpr::Str(c, _)) = args.first() {
+                        if c == "unset" {
+                            if let Some(IrExpr::Array(words)) = args.get(1) {
+                                for wd in words.iter().skip(1) {
+                                    if let IrExpr::Str(t, _) = wd {
+                                        let base = t
+                                            .split('[')
+                                            .next()
+                                            .unwrap_or(t)
+                                            .trim_start_matches("${")
+                                            .trim_start_matches('$');
+                                        let base = base
+                                            .trim_end_matches('}')
+                                            .split([':', '#', '%', '/'])
+                                            .next()
+                                            .unwrap_or(base);
+                                        if crate::c_backend::is_ident(base) {
+                                            wmut(writes, base).unset_hit = true;
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+                for a in args {
+                    walk_w_expr(a, writes, store_vals);
+                }
+            }
+            IrExpr::Array(items) => {
+                for it in items {
+                    walk_w_expr(it, writes, store_vals);
+                }
+            }
+            IrExpr::Arrow(stmts) => walk_w(stmts, writes, store_vals),
+            IrExpr::Interpolate(parts) => {
+                for p in parts {
+                    if let crate::ir::InterpPart::Expr(x) = p {
+                        walk_w_expr(x, writes, store_vals);
+                    }
+                }
+            }
+            _ => {}
+        }
+    }
+    walk_w(&prog.stmts, &mut writes, &mut store_vals);
+    for sub in &prog.subs {
+        walk_w(&sub.body, &mut writes, &mut store_vals);
+    }
+    // ---- pass 2: uses ---------------------------------------------------
+    // Direct scalar uses (int vs string position) + whole-array string
+    // operations (joins/slices/iteration — the ONLY element-read veto).
+    // Single-element reads and scalar copies are position-transparent
+    // (see the module docs): they constrain nothing.
+    struct Uses {
+        int_use: HashSet<String>,
+        str_use: HashSet<String>,
+        str_read: HashSet<String>,
+        iterated: HashSet<String>,
+    }
+    let mut uses = Uses {
+        int_use: HashSet::new(),
+        str_use: HashSet::new(),
+        str_read: HashSet::new(),
+        iterated: HashSet::new(),
+    };
+    // Refs in a `test` text + whether the text reads text: pure numeric
+    // comparisons read numerically; anything else reads text.
+    fn test_refs(t: &str) -> (Vec<String>, bool) {
+        let mut all: Vec<String> = Vec::new();
+        let mut i = 0usize;
+        let b = t.as_bytes();
+        while i < b.len() {
+            if b[i] != b'$' {
+                i += 1;
+                continue;
+            }
+            i += 1;
+            if i >= b.len() {
+                break;
+            }
+            if b[i] == b'{' {
+                i += 1;
+                let st = i;
+                while i < b.len() && b[i] != b'}' {
+                    i += 1;
+                }
+                let inner = &t[st..i.min(b.len())];
+                let nm = inner
+                    .trim_start_matches(['#', '!'])
+                    .split(['[', ':', '-', '+', '#', '%', '/'])
+                    .next()
+                    .unwrap_or("");
+                if crate::c_backend::is_ident(nm) {
+                    all.push(nm.to_string());
+                }
+            } else {
+                let st = i;
+                while i < b.len() && (b[i].is_ascii_alphanumeric() || b[i] == b'_') {
+                    i += 1;
+                }
+                if st != i && crate::c_backend::is_ident(&t[st..i]) {
+                    all.push(t[st..i].to_string());
+                }
+            }
+        }
+        let has_str = [
+            " -z ", "-n ", " = ", " != ", "=~", "-f ", "-d ", "-e ", "-s ", "-r ", "-w ",
+            "-x ", "-L ", "-h ", "-v ", "-R ",
+        ]
+        .iter()
+        .any(|op| t.contains(op))
+            || !(t.contains("-lt")
+                || t.contains("-le ")
+                || t.contains("-gt")
+                || t.contains("-ge ")
+                || t.contains("-eq")
+                || t.contains("-ne "));
+        (all, has_str)
+    }
+    fn walk_u_expr(e: &IrExpr, in_int: bool, u: &mut Uses, arrs: &HashSet<String>) {
+        match e {
+            IrExpr::Arith(a) => walk_u_arith(a, u, arrs),
+            IrExpr::Var(n, _) | IrExpr::Ident(n) => {
+                if in_int {
+                    u.int_use.insert(n.clone());
+                } else {
+                    u.str_use.insert(n.clone());
+                }
+            }
+            IrExpr::Index { key, .. } => {
+                // `${A[i]}` value read: transparent in any position
+                // (exact from either storage). Only the key is
+                // arithmetic.
+                walk_u_expr(key, true, u, arrs);
+            }
+            IrExpr::Call { func, args } => {
+                if func == "arrayIndex" {
+                    // transparent (see module docs); key is arithmetic.
+                    for a in args.iter().skip(1) {
+                        walk_u_expr(a, true, u, arrs);
+                    }
+                    return;
+                }
+                if matches!(func.as_str(), "min" | "max" | "sum") {
+                    for a in args {
+                        walk_u_expr(a, true, u, arrs);
+                    }
+                    return;
+                }
+                if func == "arrayLen" {
+                    return;
+                }
+                if func == "getVar" {
+                    // `getVar(A)` of an array = element read, transparent
+                    // like arrayIndex (no mark either way).
+                    return;
+                }
+                if func == "test" {
+                    if let Some(IrExpr::Str(t, _)) = args.first() {
+                        let (refs, has_str) = test_refs(t);
+                        for r in &refs {
+                            if has_str {
+                                u.str_use.insert(r.clone());
+                            } else {
+                                u.int_use.insert(r.clone());
+                            }
+                        }
+                    }
+                    return;
+                }
+                // default: argv strings. Whole-array readers select here.
+                for a in args {
+                    if let IrExpr::Str(nm, _) = a {
+                        if func == "slice" || func == "arrayItems" || func == "listVar" {
+                            u.str_read.insert(nm.clone());
+                        }
+                        // arbitrary-precision elements CANNOT live in
+                        // long long[] (mirror of the shared
+                        // sortedBigintJoin arm): force char*.
+                        if func == "sortedBigintJoin" {
+                            u.str_read.insert(nm.clone());
+                        }
+                    }
+                    walk_u_expr(a, false, u, arrs);
+                }
+            }
+            IrExpr::Array(items) => {
+                for it in items {
+                    walk_u_expr(it, in_int, u, arrs);
+                }
+            }
+            IrExpr::Interpolate(parts) => {
+                for p in parts {
+                    if let crate::ir::InterpPart::Expr(x) = p {
+                        walk_u_expr(x, false, u, arrs);
+                    }
+                }
+            }
+            IrExpr::BinOp { lhs, rhs, .. } => {
+                walk_u_expr(lhs, in_int, u, arrs);
+                walk_u_expr(rhs, in_int, u, arrs);
+            }
+            IrExpr::Arrow(stmts) => walk_u_list(stmts, u, arrs),
+            IrExpr::Capture { expr, .. } => walk_u_expr(expr, false, u, arrs),
+            _ => {}
+        }
+    }
+    fn walk_u_arith(a: &ArithAst, u: &mut Uses, arrs: &HashSet<String>) {
+        match a {
+            ArithAst::Num(_) | ArithAst::Sizeof(_) => {}
+            ArithAst::Var(n) | ArithAst::Ident(n) => {
+                u.int_use.insert(n.clone());
+            }
+            ArithAst::Index { key, .. } => {
+                // arith subscript: transparent read, arithmetic key.
+                walk_u_arith(key, u, arrs);
+            }
+            ArithAst::Bin { lhs, rhs, .. } => {
+                walk_u_arith(lhs, u, arrs);
+                walk_u_arith(rhs, u, arrs);
+            }
+            ArithAst::Un { arg, .. } => walk_u_arith(arg, u, arrs),
+            ArithAst::Cond { test, then, else_ } => {
+                walk_u_arith(test, u, arrs);
+                walk_u_arith(then, u, arrs);
+                walk_u_arith(else_, u, arrs);
+            }
+            ArithAst::Assign { var, rhs, .. } => {
+                u.int_use.insert(var.clone());
+                walk_u_arith(rhs, u, arrs);
+            }
+            ArithAst::IncDec { var, .. } => {
+                u.int_use.insert(var.clone());
+            }
+            ArithAst::Cast { arg, .. } => walk_u_arith(arg, u, arrs),
+        }
+    }
+    fn walk_u_list(stmts: &[IrStmt], u: &mut Uses, arrs: &HashSet<String>) {
+        for s in stmts {
+            walk_u_stmt(s, u, arrs);
+        }
+    }
+    fn walk_u_stmt(s: &IrStmt, u: &mut Uses, arrs: &HashSet<String>) {
+        match s {
+            IrStmt::Assign { targets, expr, .. } => {
+                for t in targets {
+                    for ix in &t.indices {
+                        walk_u_expr(ix, true, u, arrs);
+                    }
+                    if let Some((_, k)) = split_baked(&t.var) {
+                        let (refs, _) = test_refs(&k);
+                        for r in &refs {
+                            u.int_use.insert(r.clone());
+                        }
+                    }
+                }
+                walk_u_expr(expr, false, u, arrs);
+            }
+            IrStmt::Declare { init, .. } => {
+                if let Some(e) = init {
+                    walk_u_expr(e, false, u, arrs);
+                }
+            }
+            IrStmt::DeclareArray { elements, .. } => {
+                for el in elements {
+                    walk_u_expr(el, false, u, arrs);
+                }
+            }
+            IrStmt::If { cond, then, elsifs, else_, .. } => {
+                walk_u_expr(cond, false, u, arrs);
+                walk_u_list(then, u, arrs);
+                for (c, b) in elsifs {
+                    walk_u_expr(c, false, u, arrs);
+                    walk_u_list(b, u, arrs);
+                }
+                walk_u_list(else_, u, arrs);
+            }
+            IrStmt::While { cond, body, .. } | IrStmt::DoWhile { cond, body, .. } => {
+                walk_u_expr(cond, false, u, arrs);
+                walk_u_list(body, u, arrs);
+            }
+            IrStmt::For { iter, body, .. } => {
+                // by-value iteration records the array when visible.
+                if let IrExpr::Array(items) = iter {
+                    for it in items {
+                        if let IrExpr::Call { func, args } = it {
+                            if func == "param" {
+                                for a in args {
+                                    if let IrExpr::Str(nm, _) = a {
+                                        u.iterated.insert(nm.clone());
+                                    }
+                                    walk_u_expr(a, false, u, arrs);
+                                }
+                                continue;
+                            }
+                        }
+                        walk_u_expr(it, false, u, arrs);
+                    }
+                } else {
+                    walk_u_expr(iter, false, u, arrs);
+                }
+                walk_u_list(body, u, arrs);
+            }
+            IrStmt::ForInit { init, cond, step, body, .. } => {
+                walk_u_list(init, u, arrs);
+                walk_u_expr(cond, false, u, arrs);
+                walk_u_list(step, u, arrs);
+                walk_u_list(body, u, arrs);
+            }
+            IrStmt::Function { body, named_blocks, .. } => {
+                walk_u_list(body, u, arrs);
+                for (_, b) in named_blocks {
+                    walk_u_list(b, u, arrs);
+                }
+            }
+            IrStmt::Subshell(body)
+            | IrStmt::Background(body)
+            | IrStmt::Block(body) => walk_u_list(body, u, arrs),
+            IrStmt::Redirect { inner, .. } => walk_u_list(inner, u, arrs),
+            IrStmt::Pipeline { stages, .. } => {
+                for st in stages {
+                    walk_u_list(st, u, arrs);
+                }
+            }
+            IrStmt::Case { discriminant, clauses } => {
+                walk_u_expr(discriminant, false, u, arrs);
+                for c in clauses {
+                    walk_u_list(&c.body, u, arrs);
+                }
+            }
+            IrStmt::Select { clauses } => {
+                for c in clauses {
+                    walk_u_list(&c.body, u, arrs);
+                }
+            }
+            IrStmt::Try { body, excepts, else_body, finally_body, .. } => {
+                walk_u_list(body, u, arrs);
+                for e in excepts {
+                    walk_u_list(&e.body, u, arrs);
+                }
+                walk_u_list(else_body, u, arrs);
+                walk_u_list(finally_body, u, arrs);
+            }
+            IrStmt::Expr(e) | IrStmt::Output { value: e, .. } => {
+                walk_u_expr(e, false, u, arrs);
+            }
+            _ => {}
+        }
+    }
+    walk_u_list(&prog.stmts, &mut uses, &array_names);
+    for sub in &prog.subs {
+        walk_u_list(&sub.body, &mut uses, &array_names);
+    }
+    // ---- pass 3: scalar assigns -----------------------------------------
+    struct As {
+        rhs: Vec<IrExpr>,
+        in_copy: bool,
+    }
+    let mut assigns: HashMap<String, As> = HashMap::new();
+    fn collect_as(stmts: &[IrStmt], assigns: &mut HashMap<String, As>, in_copy: bool) {
+        for s in stmts {
+            match s {
+                IrStmt::Assign { targets, expr, .. } => {
+                    for t in targets {
+                        if t.indices.is_empty() && !t.var.contains('[') {
+                            let a = assigns.entry(t.var.clone()).or_insert(As {
+                                rhs: Vec::new(),
+                                in_copy: false,
+                            });
+                            a.rhs.push(expr.clone());
+                            a.in_copy |= in_copy;
+                        }
+                    }
+                    collect_as_expr(expr, assigns, in_copy);
+                }
+                IrStmt::Declare { vars, init, .. } => {
+                    for v in vars {
+                        let a = assigns.entry(v.name.clone()).or_insert(As {
+                            rhs: Vec::new(),
+                            in_copy: false,
+                        });
+                        if let Some(e) = init {
+                            a.rhs.push(e.clone());
+                        }
+                        a.in_copy |= in_copy;
+                    }
+                }
+                IrStmt::If { then, elsifs, else_, .. } => {
+                    collect_as(then, assigns, in_copy);
+                    for (_, b) in elsifs {
+                        collect_as(b, assigns, in_copy);
+                    }
+                    collect_as(else_, assigns, in_copy);
+                }
+                IrStmt::While { body, .. }
+                | IrStmt::DoWhile { body, .. }
+                | IrStmt::For { body, .. }
+                | IrStmt::Block(body) => collect_as(body, assigns, in_copy),
+                IrStmt::Subshell(body) | IrStmt::Background(body) => {
+                    collect_as(body, assigns, true)
+                }
+                IrStmt::ForInit { init, step, body, .. } => {
+                    collect_as(init, assigns, in_copy);
+                    collect_as(step, assigns, in_copy);
+                    collect_as(body, assigns, in_copy);
+                }
+                IrStmt::Function { body, named_blocks, .. } => {
+                    collect_as(body, assigns, in_copy);
+                    for (_, b) in named_blocks {
+                        collect_as(b, assigns, in_copy);
+                    }
+                }
+                IrStmt::Try { body, excepts, else_body, finally_body, .. } => {
+                    collect_as(body, assigns, in_copy);
+                    for e in excepts {
+                        collect_as(&e.body, assigns, in_copy);
+                    }
+                    collect_as(else_body, assigns, in_copy);
+                    collect_as(finally_body, assigns, in_copy);
+                }
+                IrStmt::Case { clauses, .. } => {
+                    for c in clauses {
+                        collect_as(&c.body, assigns, in_copy);
+                    }
+                }
+                IrStmt::Select { clauses } => {
+                    for c in clauses {
+                        collect_as(&c.body, assigns, in_copy);
+                    }
+                }
+                IrStmt::Redirect { inner, .. } => collect_as(inner, assigns, in_copy),
+                IrStmt::Pipeline { stages, .. } => {
+                    for st in stages {
+                        collect_as(st, assigns, in_copy);
+                    }
+                }
+                IrStmt::Expr(e) | IrStmt::Output { value: e, .. } => {
+                    collect_as_expr(e, assigns, in_copy)
+                }
+                _ => {}
+            }
+        }
+    }
+    fn collect_as_expr(e: &IrExpr, assigns: &mut HashMap<String, As>, in_copy: bool) {
+        match e {
+            IrExpr::Arrow(stmts) => collect_as(stmts, assigns, in_copy),
+            IrExpr::Call { args, .. } => {
+                for a in args {
+                    collect_as_expr(a, assigns, in_copy);
+                }
+            }
+            IrExpr::Array(items) => {
+                for a in items {
+                    collect_as_expr(a, assigns, in_copy);
+                }
+            }
+            _ => {}
+        }
+    }
+    collect_as(&prog.stmts, &mut assigns, false);
+    for sub in &prog.subs {
+        collect_as(&sub.body, &mut assigns, false);
+    }
+    // ---- pass 4: value-int, soundness, seeds -----------------------------
+    // value int-ness: an expression that always evaluates to a canonical
+    // integer whenever it produces a value. Arith counts WITH div/mod (a
+    // zero divisor aborts the expansion — no value is produced at all).
+    // Var/getVar recurse through assigns_numeric (cycle-guarded).
+    // arrayIndex/min/max/sum count when the array is structurally sound
+    // (its slots hold integers; an OOB read yields "" which every int
+    // context observes as 0 — and seeds additionally require no direct
+    // string use, so "" can never reach a text observer as "0").
+    fn val_int(
+        e: &IrExpr,
+        assigns: &HashMap<String, As>,
+        sound: &HashSet<String>,
+        big: &BTreeSet<String>,
+        visiting: &mut Vec<String>,
+    ) -> bool {
+        // bigint-tainted subtrees never fit long long[] slots: any
+        // bigint var/arith reference refuses (mirror of is_int_expr's
+        // big-gate).
+        if expr_refs_bigint(e, big) {
+            return false;
+        }
+        match e {
+            IrExpr::Int(_) => true,
+            IrExpr::Arith(_) => true,
+            IrExpr::Str(s, _) => {
+                // canonical i64 text (is_int_expr's rule): all digits,
+                // no leading zeros, AND fits i64 (a 100-digit bigint is
+                // all digits but must never land in a long long slot).
+                let t = s.trim();
+                !t.is_empty()
+                    && t.strip_prefix('-').unwrap_or(t).bytes().all(|c| c.is_ascii_digit())
+                    && !(t.len() > 1 && (t.starts_with('0') || t.starts_with("-0")))
+                    && t.parse::<i64>().is_ok()
+            }
+            IrExpr::Var(n, _) | IrExpr::Ident(n) => {
+                if matches!(n.as_str(), "?" | "#" | "!" | "$") {
+                    return true;
+                }
+                assigns_numeric(n, assigns, sound, big, visiting)
+            }
+            IrExpr::Call { func, args } if func == "getVar" => {
+                match Render::str_arg(args, 0).as_deref() {
+                    Some(n) => {
+                        if matches!(n, "?" | "#" | "!" | "$") {
+                            return true;
+                        }
+                        assigns_numeric(n, assigns, sound, big, visiting)
+                    }
+                    None => false,
+                }
+            }
+            IrExpr::Call { func, args } if func == "arrayIndex" => {
+                matches!(Render::str_arg(args, 0).as_deref(), Some(n) if sound.contains(n))
+            }
+            IrExpr::Call { func, args } if matches!(func.as_str(), "min" | "max" | "sum") => {
+                matches!(Render::str_arg(args, 0).as_deref(), Some(n) if sound.contains(n))
+            }
+            _ => false,
+        }
+    }
+    fn assigns_numeric(
+        v: &str,
+        assigns: &HashMap<String, As>,
+        sound: &HashSet<String>,
+        big: &BTreeSet<String>,
+        visiting: &mut Vec<String>,
+    ) -> bool {
+        if big.contains(v) {
+            return false;
+        }
+        if visiting.contains(&v.to_string()) {
+            return false;
+        }
+        let Some(a) = assigns.get(v) else { return false };
+        if a.rhs.is_empty() {
+            return false;
+        }
+        visiting.push(v.to_string());
+        let ok = a.rhs.iter().all(|e| val_int(e, assigns, sound, big, visiting));
+        visiting.pop();
+        ok
+    }
+    fn expr_refs_bigint(e: &IrExpr, big: &BTreeSet<String>) -> bool {
+        match e {
+            IrExpr::Var(n, _) | IrExpr::Ident(n) => big.contains(n),
+            IrExpr::Arith(a) => crate::shir::arith_refs_bigint(a, big),
+            IrExpr::Call { func, args } if func == "getVar" => {
+                matches!(Render::str_arg(args, 0).as_deref(), Some(n) if big.contains(n))
+            }
+            IrExpr::Call { args, .. } => args.iter().any(|a| expr_refs_bigint(a, big)),
+            IrExpr::Array(items) => items.iter().any(|e| expr_refs_bigint(e, big)),
+            IrExpr::Interpolate(parts) => parts.iter().any(|p| {
+                matches!(p, crate::ir::InterpPart::Expr(x) if expr_refs_bigint(x, big))
+            }),
+            IrExpr::BinOp { lhs, rhs, .. } => {
+                expr_refs_bigint(lhs, big) || expr_refs_bigint(rhs, big)
+            }
+            _ => false,
+        }
+    }
+    // non-negativity: zero-init plus only +1 increments (cursor shape),
+    // plus plain copies of proven-nonneg vars (the clip count handoff
+    // `rbf_np = rbf_m`). Cycle-guarded recursion.
+    fn proven_nonneg(var: &str, assigns: &HashMap<String, As>) -> bool {
+        fn go(
+            var: &str,
+            assigns: &HashMap<String, As>,
+            visiting: &mut Vec<String>,
+        ) -> bool {
+            if visiting.contains(&var.to_string()) {
+                return false;
+            }
+            let Some(a) = assigns.get(var) else { return false };
+            if a.rhs.is_empty() {
+                return false;
+            }
+            visiting.push(var.to_string());
+            let ok = a.rhs.iter().all(|e| match e {
+                IrExpr::Int(i) => *i >= 0,
+                IrExpr::Str(s, _) => matches!(s.trim().parse::<i64>(), Ok(n) if n >= 0),
+                IrExpr::Arith(x) => match x.as_ref() {
+                    ArithAst::Bin { op, lhs, rhs }
+                        if op == "+"
+                            && matches!(rhs.as_ref(), ArithAst::Num(1)) =>
+                    {
+                        matches!(lhs.as_ref(), ArithAst::Var(v) | ArithAst::Ident(v) if v == var)
+                    }
+                    ArithAst::Var(v) | ArithAst::Ident(v) => v == var,
+                    _ => false,
+                },
+                IrExpr::Var(w, _) | IrExpr::Ident(w) => {
+                    w == var || go(w, assigns, visiting)
+                }
+                IrExpr::Call { func, args } if func == "getVar" => {
+                    match Render::str_arg(args, 0).as_deref() {
+                        Some(w) => w == var || go(w, assigns, visiting),
+                        None => false,
+                    }
+                }
+                _ => false,
+            });
+            visiting.pop();
+            ok
+        }
+        go(var, assigns, &mut Vec::new())
+    }
+    // per-site guard check: every dynamic indexed store A[$k] sits under
+    // an enclosing If/While guard proving $k < n (upper) — nonneg comes
+    // from `proven_nonneg` separately.
+    fn stores_guarded(prog: &IrProgram, arr: &str, var: &str, n: i64, globals: &HashMap<String, i64>) -> bool {
+        fn stmt_ok(
+            stmts: &[IrStmt],
+            guards: &HashMap<String, (Option<i64>, bool)>,
+            arr: &str,
+            var: &str,
+            n: i64,
+            globals: &HashMap<String, i64>,
+        ) -> bool {
+            for s in stmts {
+                match s {
+                    IrStmt::Assign { targets, .. } => {
+                        for t in targets {
+                            let (base, is_dyn) = if !t.indices.is_empty() {
+                                let dyn_key = !matches!(
+                                    key_of_ir(&t.indices[0]),
+                                    KeyOf::Const(_)
+                                );
+                                (t.var.clone(), dyn_key)
+                            } else if let Some((b, k)) = split_baked(&t.var) {
+                                let kk = k.trim().trim_start_matches('$').trim_start_matches('{').trim_end_matches('}');
+                                (b, kk == var)
+                            } else {
+                                continue;
+                            };
+                            if base != arr || !is_dyn {
+                                continue;
+                            }
+                            let covered = guards
+                                .get(var)
+                                .and_then(|(u, _)| *u)
+                                .map_or(false, |u| u <= n);
+                            if !covered {
+                                return false;
+                            }
+                        }
+                    }
+                    IrStmt::If { cond, then, elsifs, else_, .. } => {
+                        let mut g = guards.clone();
+                        merge_guard(cond, &mut g, globals);
+                        if !stmt_ok(then, &g, arr, var, n, globals) {
+                            return false;
+                        }
+                        for (c, b) in elsifs {
+                            let mut g2 = guards.clone();
+                            merge_guard(c, &mut g2, globals);
+                            if !stmt_ok(b, &g2, arr, var, n, globals) {
+                                return false;
+                            }
+                        }
+                        if !stmt_ok(else_, guards, arr, var, n, globals) {
+                            return false;
+                        }
+                    }
+                    IrStmt::While { cond, body, .. } | IrStmt::DoWhile { cond, body, .. } => {
+                        let mut g = guards.clone();
+                        merge_guard(cond, &mut g, globals);
+                        if !stmt_ok(body, &g, arr, var, n, globals) {
+                            return false;
+                        }
+                    }
+                    IrStmt::Function { body, named_blocks, .. } => {
+                        if !stmt_ok(body, guards, arr, var, n, globals) {
+                            return false;
+                        }
+                        for (_, b) in named_blocks {
+                            if !stmt_ok(b, guards, arr, var, n, globals) {
+                                return false;
+                            }
+                        }
+                    }
+                    IrStmt::For { body, .. }
+                    | IrStmt::Block(body)
+                    | IrStmt::Subshell(body)
+                    | IrStmt::Background(body) => {
+                        if !stmt_ok(body, guards, arr, var, n, globals) {
+                            return false;
+                        }
+                    }
+                    IrStmt::ForInit { init, step, body, .. } => {
+                        if !stmt_ok(init, guards, arr, var, n, globals)
+                            || !stmt_ok(step, guards, arr, var, n, globals)
+                            || !stmt_ok(body, guards, arr, var, n, globals)
+                        {
+                            return false;
+                        }
+                    }
+                    IrStmt::Try { body, excepts, else_body, finally_body, .. } => {
+                        if !stmt_ok(body, guards, arr, var, n, globals) {
+                            return false;
+                        }
+                        for e in excepts {
+                            if !stmt_ok(&e.body, guards, arr, var, n, globals) {
+                                return false;
+                            }
+                        }
+                        if !stmt_ok(else_body, guards, arr, var, n, globals)
+                            || !stmt_ok(finally_body, guards, arr, var, n, globals)
+                        {
+                            return false;
+                        }
+                    }
+                    IrStmt::Case { clauses, .. } => {
+                        for c in clauses {
+                            if !stmt_ok(&c.body, guards, arr, var, n, globals) {
+                                return false;
+                            }
+                        }
+                    }
+                    IrStmt::Select { clauses } => {
+                        for c in clauses {
+                            if !stmt_ok(&c.body, guards, arr, var, n, globals) {
+                                return false;
+                            }
+                        }
+                    }
+                    IrStmt::Redirect { inner, .. } => {
+                        if !stmt_ok(inner, guards, arr, var, n, globals) {
+                            return false;
+                        }
+                    }
+                    IrStmt::Pipeline { stages, .. } => {
+                        for st in stages {
+                            if !stmt_ok(st, guards, arr, var, n, globals) {
+                                return false;
+                            }
+                        }
+                    }
+                    _ => {}
+                }
+            }
+            true
+        }
+        let g0 = HashMap::new();
+        if !stmt_ok(&prog.stmts, &g0, arr, var, n, globals) {
+            return false;
+        }
+        for sub in &prog.subs {
+            if !stmt_ok(&sub.body, &g0, arr, var, n, globals) {
+                return false;
+            }
+        }
+        true
+    }
+    enum KeyOf {
+        Const(i64),
+        Other,
+    }
+    fn key_of_ir(e: &IrExpr) -> KeyOf {
+        match e {
+            IrExpr::Int(i) => KeyOf::Const(*i),
+            IrExpr::Str(s, _) => match s.trim().parse::<i64>() {
+                Ok(i) => KeyOf::Const(i),
+                Err(_) => KeyOf::Other,
+            },
+            _ => KeyOf::Other,
+        }
+    }
+    fn merge_guard(cond: &IrExpr, g: &mut HashMap<String, (Option<i64>, bool)>, globals: &HashMap<String, i64>) {
+        let mut texts = Vec::new();
+        cond_texts(cond, &mut texts);
+        for t in &texts {
+            let mut i = 0usize;
+            let b = t.as_bytes();
+            let mut vars: Vec<String> = Vec::new();
+            while i < b.len() {
+                if b[i] != b'$' {
+                    i += 1;
+                    continue;
+                }
+                i += 1;
+                if i < b.len() && b[i] == b'{' {
+                    i += 1;
+                    let st = i;
+                    while i < b.len() && b[i] != b'}' {
+                        i += 1;
+                    }
+                    let nm = t[st..i.min(b.len())].to_string();
+                    if crate::c_backend::is_ident(&nm) {
+                        vars.push(nm);
+                    }
+                } else {
+                    let st = i;
+                    while i < b.len() && (b[i].is_ascii_alphanumeric() || b[i] == b'_') {
+                        i += 1;
+                    }
+                    if st != i {
+                        vars.push(t[st..i].to_string());
+                    }
+                }
+            }
+            for v in &vars {
+                if let Some((u, nn)) = guard_bound(t, v, globals) {
+                    let e = g.entry(v.clone()).or_insert((None, false));
+                    if let Some(nu) = u {
+                        e.0 = Some(e.0.map_or(nu, |x: i64| x.min(nu)));
+                    }
+                    e.1 |= nn;
+                }
+            }
+        }
+    }
+    fn cond_texts(e: &IrExpr, out: &mut Vec<String>) {
+        match e {
+            IrExpr::Call { func, args } if func == "test" => {
+                for a in args {
+                    if let IrExpr::Str(t, _) = a {
+                        out.push(t.clone());
+                    }
+                }
+            }
+            IrExpr::Arith(a) => cond_arith(a, out),
+            IrExpr::Call { args, .. } => {
+                for a in args {
+                    cond_texts(a, out);
+                }
+            }
+            _ => {}
+        }
+    }
+    fn cond_arith(a: &ArithAst, out: &mut Vec<String>) {
+        match a {
+            ArithAst::Bin { op, lhs, rhs } if matches!(op.as_str(), "<" | "<=" | ">" | ">=") => {
+                out.push(format!("{} {} {}", arith_v(lhs), op, arith_v(rhs)));
+            }
+            ArithAst::Bin { lhs, rhs, .. } => {
+                cond_arith(lhs, out);
+                cond_arith(rhs, out);
+            }
+            ArithAst::Un { arg, .. } => cond_arith(arg, out),
+            ArithAst::Cond { test, then, else_ } => {
+                cond_arith(test, out);
+                cond_arith(then, out);
+                cond_arith(else_, out);
+            }
+            _ => {}
+        }
+    }
+    fn arith_v(a: &ArithAst) -> String {
+        match a {
+            ArithAst::Var(n) | ArithAst::Ident(n) => format!("${}", n),
+            ArithAst::Num(n) => n.to_string(),
+            _ => String::new(),
+        }
+    }
+    // scan "$k" -lt N (and reflected N -gt "$k") in a cond text. Also
+    // resolves transitive var bounds: `$e -lt $np` takes np's global
+    // bound (counters whose every increment sits under a constant
+    // guard — see `global_upper`).
+    fn guard_bound(
+        text: &str,
+        var: &str,
+        globals: &HashMap<String, i64>,
+    ) -> Option<(Option<i64>, bool)> {
+        let mut upper: Option<i64> = None;
+        let mut nonneg = false;
+        let toks: Vec<&str> = text.split_whitespace().collect();
+        let mut i = 0;
+        while i < toks.len() {
+            let tk = toks[i];
+            let is_ref = tk == format!("${}", var)
+                || tk == format!("${{{}}}", var)
+                || tk.trim_matches('"') == &format!("${}", var)
+                || tk.trim_matches('"') == &format!("${{{}}}", var)
+                || tk == var;
+            if is_ref {
+                let op = toks.get(i + 1).copied().unwrap_or("");
+                let rhs = toks.get(i + 2).copied().unwrap_or("");
+                // constant bound...
+                if let Ok(n) = rhs.trim_matches('"').parse::<i64>() {
+                    match op {
+                        "-lt" | "<" => upper = Some(upper.map_or(n, |u: i64| u.min(n))),
+                        "-le" | "<=" => upper = Some(upper.map_or(n + 1, |u: i64| u.min(n + 1))),
+                        "-ge" | ">=" => {
+                            if n <= 0 {
+                                nonneg = true;
+                            }
+                        }
+                        "-gt" | ">" => {
+                            if n < 0 {
+                                nonneg = true;
+                            }
+                        }
+                        _ => {}
+                    }
+                } else {
+                    // ...or a transitively bounded var (`e < np`).
+                    let w = rhs.trim_matches('"').trim_start_matches('$').trim_start_matches('{').trim_end_matches('}');
+                    if (op == "-lt" || op == "<") && crate::c_backend::is_ident(w) {
+                        if let Some(&gn) = globals.get(w) {
+                            upper = Some(upper.map_or(gn, |u: i64| u.min(gn)));
+                        }
+                    }
+                }
+                if i >= 2 {
+                    let lop = toks[i - 1];
+                    let lhs = toks[i - 2];
+                    if let Ok(n) = lhs.trim_matches('"').parse::<i64>() {
+                        match lop {
+                            "-gt" | ">" => upper = Some(upper.map_or(n, |u: i64| u.min(n))),
+                            "-ge" | ">=" => {
+                                upper = Some(upper.map_or(n + 1, |u: i64| u.min(n + 1)))
+                            }
+                            _ => {}
+                        }
+                    }
+                }
+            }
+            i += 1;
+        }
+        if upper.is_none() && !nonneg {
+            return None;
+        }
+        Some((upper, nonneg))
+    }
+    // global upper bounds: var <= N when every init is a const <= N and
+    // every `v = v+1`-shaped increment sits under an enclosing `<N`
+    // guard (the cursor-counter shape: init 0, increment only while
+    // below the cover). Plain copies `v = w` resolve transitively
+    // through w's own bound (the clip count handoff `rbf_np = rbf_m`).
+    fn global_upper(prog: &IrProgram, assigns: &HashMap<String, As>) -> HashMap<String, i64> {
+        fn bound_of(
+            prog: &IrProgram,
+            v: &str,
+            assigns: &HashMap<String, As>,
+            visiting: &mut Vec<String>,
+        ) -> Option<i64> {
+            if visiting.contains(&v.to_string()) {
+                return None;
+            }
+            visiting.push(v.to_string());
+            let result = (|| {
+                let a = assigns.get(v)?;
+                if a.rhs.is_empty() || a.in_copy {
+                    return None;
+                }
+                let mut bound: Option<i64> = None;
+                for e in &a.rhs {
+                    match e {
+                        IrExpr::Int(i) => {
+                            if *i < 0 {
+                                return None;
+                            }
+                            bound = Some(bound.map_or(*i, |m: i64| m.max(*i)));
+                        }
+                        IrExpr::Str(s, _) => match s.trim().parse::<i64>() {
+                            Ok(i) if i >= 0 => {
+                                bound = Some(bound.map_or(i, |m: i64| m.max(i)));
+                            }
+                            _ => return None,
+                        },
+                        IrExpr::Arith(x) => match x.as_ref() {
+                            ArithAst::Bin { op, lhs, rhs }
+                                if op == "+"
+                                    && matches!(rhs.as_ref(), ArithAst::Num(1))
+                                    && matches!(lhs.as_ref(), ArithAst::Var(w) | ArithAst::Ident(w) if w == v) =>
+                            {
+                                match guard_at_increments(prog, v) {
+                                    Some(n) => {
+                                        bound = Some(bound.map_or(n, |m: i64| m.max(n)));
+                                    }
+                                    None => return None,
+                                }
+                            }
+                            _ => return None,
+                        },
+                        IrExpr::Var(w, _) | IrExpr::Ident(w) => {
+                            match bound_of(prog, w, assigns, visiting) {
+                                Some(n) => {
+                                    bound = Some(bound.map_or(n, |m: i64| m.max(n)));
+                                }
+                                None => return None,
+                            }
+                        }
+                        IrExpr::Call { func, args } if func == "getVar" => {
+                            match Render::str_arg(args, 0).as_deref() {
+                                Some(w) => match bound_of(prog, w, assigns, visiting) {
+                                    Some(n) => {
+                                        bound = Some(bound.map_or(n, |m: i64| m.max(n)));
+                                    }
+                                    None => return None,
+                                },
+                                None => return None,
+                            }
+                        }
+                        _ => return None,
+                    }
+                }
+                bound
+            })();
+            visiting.pop();
+            result
+        }
+        let mut out = HashMap::new();
+        for v in assigns.keys() {
+            let mut visiting = Vec::new();
+            if let Some(n) = bound_of(prog, v, assigns, &mut visiting) {
+                out.insert(v.clone(), n);
+            }
+        }
+        if std::env::var("SH2_DEBUG_INT_ELEM").as_deref() == Ok("4") {
+            for v in ["rbf_np", "rbf_e", "rbf_m", "rbf_k", "rbx_k", "rbx_idx", "rbc_tex"] {
+                let mut visiting = Vec::new();
+                eprintln!(
+                    "INT_ELEM bound {v} = {:?} guardsni={:?}",
+                    bound_of(prog, v, assigns, &mut visiting),
+                    guard_at_increments(prog, v)
+                );
+            }
+        }
+        out
+    }
+    // the tightest `<N` guard enclosing any `v = v+1` increment of v
+    // (None when an increment is unguarded or non-+1-shaped).
+    fn guard_at_increments(prog: &IrProgram, var: &str) -> Option<i64> {
+        fn is_inc(s: &IrStmt, var: &str) -> bool {
+            if let IrStmt::Assign { targets, expr, .. } = s {
+                if targets.len() == 1
+                    && targets[0].indices.is_empty()
+                    && !targets[0].var.contains('[')
+                    && targets[0].var == var
+                {
+                    if let IrExpr::Arith(x) = expr {
+                        if let ArithAst::Bin { op, lhs, rhs } = x.as_ref() {
+                            return op == "+"
+                                && matches!(rhs.as_ref(), ArithAst::Num(1))
+                                && matches!(lhs.as_ref(), ArithAst::Var(w) | ArithAst::Ident(w) if w == var);
+                        }
+                    }
+                }
+            }
+            false
+        }
+        fn scan(
+            stmts: &[IrStmt],
+            guards: &HashMap<String, (Option<i64>, bool)>,
+            var: &str,
+            best: &mut Option<i64>,
+            ok: &mut bool,
+        ) {
+            for s in stmts {
+                if is_inc(s, var) {
+                    match guards.get(var).and_then(|(u, _)| *u) {
+                        Some(n) => {
+                            *best = Some(best.map_or(n, |m: i64| m.min(n)));
+                        }
+                        None => {
+                            *ok = false;
+                            return;
+                        }
+                    }
+                }
+                match s {
+                    IrStmt::If { cond, then, elsifs, else_, .. } => {
+                        let mut g = guards.clone();
+                        merge_guard0(cond, &mut g);
+                        scan(then, &g, var, best, ok);
+                        for (c, b) in elsifs {
+                            let mut g2 = guards.clone();
+                            merge_guard0(c, &mut g2);
+                            scan(b, &g2, var, best, ok);
+                        }
+                        scan(else_, guards, var, best, ok);
+                    }
+                    IrStmt::While { cond, body, .. } | IrStmt::DoWhile { cond, body, .. } => {
+                        let mut g = guards.clone();
+                        merge_guard0(cond, &mut g);
+                        scan(body, &g, var, best, ok);
+                    }
+                    IrStmt::Function { body, named_blocks, .. } => {
+                        scan(body, guards, var, best, ok);
+                        for (_, b) in named_blocks {
+                            scan(b, guards, var, best, ok);
+                        }
+                    }
+                    IrStmt::For { body, .. }
+                    | IrStmt::Block(body)
+                    | IrStmt::Subshell(body)
+                    | IrStmt::Background(body) => scan(body, guards, var, best, ok),
+                    IrStmt::ForInit { init, step, body, .. } => {
+                        scan(init, guards, var, best, ok);
+                        scan(step, guards, var, best, ok);
+                        scan(body, guards, var, best, ok);
+                    }
+                    IrStmt::Try { body, excepts, else_body, finally_body, .. } => {
+                        scan(body, guards, var, best, ok);
+                        for e in excepts {
+                            scan(&e.body, guards, var, best, ok);
+                        }
+                        scan(else_body, guards, var, best, ok);
+                        scan(finally_body, guards, var, best, ok);
+                    }
+                    IrStmt::Case { clauses, .. } => {
+                        for c in clauses {
+                            scan(&c.body, guards, var, best, ok);
+                        }
+                    }
+                    IrStmt::Select { clauses } => {
+                        for c in clauses {
+                            scan(&c.body, guards, var, best, ok);
+                        }
+                    }
+                    IrStmt::Redirect { inner, .. } => scan(inner, guards, var, best, ok),
+                    IrStmt::Pipeline { stages, .. } => {
+                        for st in stages {
+                            scan(st, guards, var, best, ok);
+                        }
+                    }
+                    _ => {}
+                }
+                if !*ok {
+                    return;
+                }
+            }
+        }
+        // guard merge without transitive globals (one level: increment
+        // guards name constants in this codebase's cursor loops).
+        fn merge_guard0(cond: &IrExpr, g: &mut HashMap<String, (Option<i64>, bool)>) {
+            let mut texts = Vec::new();
+            cond_texts(cond, &mut texts);
+            for t in &texts {
+                let mut i = 0usize;
+                let b = t.as_bytes();
+                let mut vars: Vec<String> = Vec::new();
+                while i < b.len() {
+                    if b[i] != b'$' {
+                        i += 1;
+                        continue;
+                    }
+                    i += 1;
+                    if i < b.len() && b[i] == b'{' {
+                        i += 1;
+                        let st = i;
+                        while i < b.len() && b[i] != b'}' {
+                            i += 1;
+                        }
+                        let nm = t[st..i.min(b.len())].to_string();
+                        if crate::c_backend::is_ident(&nm) {
+                            vars.push(nm);
+                        }
+                    } else {
+                        let st = i;
+                        while i < b.len() && (b[i].is_ascii_alphanumeric() || b[i] == b'_') {
+                            i += 1;
+                        }
+                        if st != i {
+                            vars.push(t[st..i].to_string());
+                        }
+                    }
+                }
+                for v in &vars {
+                    // constant-only (no transitivity here by design).
+                    let mut upper: Option<i64> = None;
+                    let toks: Vec<&str> = t.split_whitespace().collect();
+                    let mut i = 0;
+                    while i < toks.len() {
+                        let tk = toks[i];
+                        let is_ref = tk == format!("${}", v)
+                            || tk == format!("${{{}}}", v)
+                            || tk.trim_matches('"') == &format!("${}", v)
+                            || tk.trim_matches('"') == &format!("${{{}}}", v)
+                            || tk == *v;
+                        if is_ref {
+                            let op = toks.get(i + 1).copied().unwrap_or("");
+                            let rhs = toks.get(i + 2).copied().unwrap_or("");
+                            if let Ok(n) = rhs.trim_matches('"').parse::<i64>() {
+                                match op {
+                                    "-lt" | "<" => {
+                                        upper = Some(upper.map_or(n, |u: i64| u.min(n)))
+                                    }
+                                    "-le" | "<=" => {
+                                        upper =
+                                            Some(upper.map_or(n + 1, |u: i64| u.min(n + 1)))
+                                    }
+                                    _ => {}
+                                }
+                            }
+                        }
+                        i += 1;
+                    }
+                    if let Some(nu) = upper {
+                        let e = g.entry(v.clone()).or_insert((None, false));
+                        e.0 = Some(e.0.map_or(nu, |x: i64| x.min(nu)));
+                    }
+                }
+            }
+        }
+        let g0 = HashMap::new();
+        let mut best: Option<i64> = None;
+        let mut ok = true;
+        scan(&prog.stmts, &g0, var, &mut best, &mut ok);
+        for sub in &prog.subs {
+            scan(&sub.body, &g0, var, &mut best, &mut ok);
+        }
+        if ok {
+            best
+        } else {
+            None
+        }
+    }
+    let globals = global_upper(prog, &assigns);
+    // ---- pass 5: int-writes (greatest fixpoint), soundness, seeds -------
+    let big = crate::shir::analyze_bigint_vars(prog);
+    // int-writes(A): every store to A is int-valued. arrayIndex(B) leaves
+    // need int-writes(B) — which is mutually recursive for copyback pairs
+    // (`P[e] = Q[e]` + `Q[m] = P[e]`: values originate in int stores and
+    // circulate, so both hold). Least fixpoint deadlocks on the cycle;
+    // greatest fixpoint (assume all, remove violators) converges on the
+    // sound verdict: any remaining violator is genuinely non-int.
+    let mut intwrites: HashSet<String> = writes
+        .keys()
+        .filter(|a| {
+            let w = &writes[*a];
+            !w.non_int_value && !w.whole_reassign && !w.unset_hit && !w.other_key
+        })
+        .cloned()
+        .collect();
+    loop {
+        let mut removed = false;
+        // NOTE: assigns_numeric (the shared helper below) takes sound;
+        // for the intwrites fixpoint we need the intwrites variant.
+        // To avoid duplicating the recursion, run the fixpoint over a
+        // local sound-like set: temporarily reuse `sound` as the
+        // intwrites set (it is empty here and only filled below).
+        let mut todrop: Vec<String> = Vec::new();
+        for arr in intwrites.iter() {
+            let mut visiting = Vec::new();
+            let ok = store_vals.get(arr).map_or(true, |vs| {
+                vs.iter().all(|e| val_int(e, &assigns, &intwrites, &big, &mut visiting))
+            });
+            if !ok {
+                todrop.push(arr.clone());
+            }
+        }
+        for a in todrop {
+            intwrites.remove(&a);
+            removed = true;
+        }
+        // assigns_numeric for scalars (used by seeds below) also needs
+        // the intwrites-aware variant; stash it by seeding a shadow map
+        // — simpler: seeds consult val_int with `sound`, and sound is
+        // set to intwrites + dense AFTER this loop. Scalar Var leaves
+        // recurse via assigns_numeric (sound-based): sound ⊇ intwrites
+        // at that point would be UNSOUND (sound has density, a subset).
+        // Correct order: seeds must use intwrites, not sound, for
+        // arrayIndex leaves. Handled below by passing intwrites.
+        if !removed {
+            break;
+        }
+    }
+    // ---- sound: int-writes + dense --------------------------------------
+    // (single pass — the fixpoint above settled value-int-ness; density
+    // and guards are per-array static).
+    let mut sound: HashSet<String> = HashSet::new();
+    for (arr, w) in &writes {
+        if w.non_int_value || w.whole_reassign || w.unset_hit || w.other_key {
+            continue;
+        }
+        if !intwrites.contains(arr) {
+            continue;
+        }
+        let cover: Option<usize> = if w.lit_lens.is_empty() {
+            None
+        } else if w.lit_lens.iter().all(|&n| n == w.lit_lens[0]) {
+            Some(w.lit_lens[0])
+        } else {
+            None
+        };
+        let Some(n) = cover else { continue };
+        let has_indexed = !w.dyn_keys.is_empty();
+        if w.append && has_indexed {
+            continue;
+        }
+        if w.append {
+            sound.insert(arr.clone());
+            continue;
+        }
+        let mut ok = true;
+        for k in &w.dyn_keys {
+            if let Some(rest) = k.strip_prefix('#') {
+                if let Ok(i) = rest.parse::<i64>() {
+                    if i < 0 || i >= n as i64 {
+                        ok = false;
+                        break;
+                    }
+                    continue;
+                }
+                ok = false;
+                break;
+            }
+            if !stores_guarded(prog, arr, k, n as i64, &globals)
+                || !proven_nonneg(k, &assigns)
+            {
+                if std::env::var("SH2_DEBUG_INT_ELEM").as_deref() == Ok("6") {
+                    eprintln!(
+                        "INT_ELEM guardfail {arr}[{k}] n={n} guarded={} nonneg={}",
+                        stores_guarded(prog, arr, k, n as i64, &globals),
+                        proven_nonneg(k, &assigns)
+                    );
+                }
+                ok = false;
+                break;
+            }
+        }
+        if ok {
+            sound.insert(arr.clone());
+        }
+    }
+    // seeds: every assign value-int, no direct string use, plain ident,
+    // never subshell-written, at least one assign.
+    let mut seed: HashSet<String> = prog
+        .var_types
+        .iter()
+        .filter(|(_, t)| *t == IrType::Int)
+        .map(|(n, _)| n.clone())
+        .collect();
+    // NOTE: seeds start from the existing Int verdicts: a var the core
+    // already types Int stays seeded (demote re-validates afterward).
+    // Otherwise greatest fixpoint over candidates (all ident, non-copy,
+    // non-empty, non-string-observed vars): remove any var with a
+    // non-int-valued assign. This resolves benign swap cycles
+    // (`x1=$x2`, `x2=$t`, `t=$x1` — values originate in int stores and
+    // only permute) that a least fixpoint deadlocks on. Seed values use
+    // direct seed-membership for Var leaves (cycle-safe: removal only
+    // shrinks, and a removal cascade re-checks dependents next round).
+    fn seed_val(
+        e: &IrExpr,
+        sound: &HashSet<String>,
+        seed: &HashSet<String>,
+    ) -> bool {
+        match e {
+            IrExpr::Int(_) => true,
+            IrExpr::Arith(_) => true,
+            IrExpr::Str(st, _) => {
+                let t = st.trim();
+                !t.is_empty()
+                    && t.strip_prefix('-').unwrap_or(t).bytes().all(|c| c.is_ascii_digit())
+                    && !(t.len() > 1 && (t.starts_with('0') || t.starts_with("-0")))
+                    && t.parse::<i64>().is_ok()
+            }
+            IrExpr::Var(n, _) | IrExpr::Ident(n) => {
+                if matches!(n.as_str(), "?" | "#" | "!" | "$") {
+                    return true;
+                }
+                seed.contains(n)
+            }
+            IrExpr::Call { func, args } if func == "getVar" => {
+                match Render::str_arg(args, 0).as_deref() {
+                    Some(n) => {
+                        if matches!(n, "?" | "#" | "!" | "$") {
+                            return true;
+                        }
+                        seed.contains(n)
+                    }
+                    None => false,
+                }
+            }
+            IrExpr::Call { func, args } if func == "arrayIndex" => {
+                matches!(Render::str_arg(args, 0).as_deref(), Some(n) if sound.contains(n))
+            }
+            IrExpr::Call { func, args } if matches!(func.as_str(), "min" | "max" | "sum") => {
+                matches!(Render::str_arg(args, 0).as_deref(), Some(n) if sound.contains(n))
+            }
+            _ => false,
+        }
+    }
+    let mut cand: HashSet<String> = HashSet::new();
+    for (v, a) in &assigns {
+        if a.in_copy || a.rhs.is_empty() {
+            continue;
+        }
+        if !crate::c_backend::is_ident(v) {
+            continue;
+        }
+        if matches!(v.as_str(), "?" | "#" | "!" | "$") {
+            continue;
+        }
+        if uses.str_use.contains(v) {
+            continue;
+        }
+        cand.insert(v.clone());
+    }
+    // existing Int verdicts inside the candidate gate are pinned (never
+    // removed — demote re-validates afterward anyway).
+    let pinned: HashSet<String> = seed.intersection(&cand).cloned().collect();
+    let mut cur: HashSet<String> = cand.clone();
+    loop {
+        let mut todrop: Vec<String> = Vec::new();
+        for v in cur.iter() {
+            if pinned.contains(v) {
+                continue;
+            }
+            let a = &assigns[v];
+            if !a.rhs.iter().all(|e| seed_val(e, &sound, &cur)) {
+                todrop.push(v.clone());
+            }
+        }
+        if todrop.is_empty() {
+            break;
+        }
+        for v in todrop {
+            cur.remove(&v);
+        }
+    }
+    for v in cur {
+        seed.insert(v);
+    }
+    // ---- homing: sound + no whole-array string reads ----------------------
+    let mut homed: HashSet<String> = HashSet::new();
+    for (arr, _) in &writes {
+        if !sound.contains(arr) {
+            continue;
+        }
+        if uses.str_read.contains(arr) || uses.iterated.contains(arr) {
+            continue;
+        }
+        homed.insert(arr.clone());
+    }
+    if std::env::var("SH2_DEBUG_INT_ELEM").is_ok() {
+        let mut v: Vec<_> = homed.iter().collect();
+        v.sort();
+        eprintln!("INT_ELEM homed: {:?}", v);
+        if std::env::var("SH2_DEBUG_INT_ELEM").as_deref() == Ok("2") {
+            for (arr, w) in &writes {
+                if arr.starts_with("RB_") || arr.starts_with("RBTEX") || arr == "RFB_ROWS" || arr.starts_with("CUBE") || arr == "FACE_N" {
+                    eprintln!(
+                        "INT_ELEM w {arr}: lit={:?} append={} dyn={:?} oob-unset=({},{}) keyother={} strread={} iterated={} sound={} homed={}",
+                        w.lit_lens, w.append, w.dyn_keys, w.whole_reassign, w.unset_hit, w.other_key,
+                        uses.str_read.contains(arr), uses.iterated.contains(arr),
+                        sound.contains(arr), homed.contains(arr),
+                    );
+                }
+            }
+            let mut sv: Vec<_> = seed.iter().collect();
+            sv.sort();
+            eprintln!("INT_ELEM seeds: {} {:?}", sv.len(), &sv[..sv.len().min(40)]);
+            for v in [
+                "rbt_x0", "rbt_x1", "rbt_x2", "rbt_y0", "rbt_y1", "rbt_y2", "rbt_s0",
+                "rbt_s1", "rbt_s2", "rbt_u0", "rbt_u1", "rbt_u2", "rbt_v0", "rbt_v1",
+                "rbt_v2", "rbt_w0", "rbt_w1", "rbt_w2", "rbt_t", "rbt_area", "rbt_cx",
+                "rbt_cy", "rbt_sh", "rbt_uu", "rbt_vv", "rbt_bw0", "rbt_bw1", "rbt_x",
+                "rbt_y", "rbt_minx", "rbt_maxx", "rbt_miny", "rbt_maxy", "rbt_texd",
+                "rbt_tsz", "rbt_in", "rbt_uw", "rbt_vw", "rbt_iw", "rbp_sx", "rbp_sy",
+                "rbf_s0", "rbf_e", "rbf_np", "rbf_m", "rbc_tex", "rbx_ti", "rbx_r",
+                "rbp_fu", "rbp_fsh", "rbt_runx", "rbt_runlen",
+            ] {
+                if seed.contains(v) {
+                    eprintln!("INT_ELEM seedhit {v}");
+                }
+            }
+        }
+        if std::env::var("SH2_DEBUG_INT_ELEM").as_deref() == Ok("3") {
+            let mut sv: Vec<_> = uses.str_use.iter().collect();
+            sv.sort();
+            eprintln!("INT_ELEM str_use: {:?}", sv);
+        }
+        if std::env::var("SH2_DEBUG_INT_ELEM").as_deref() == Ok("4") {
+            eprintln!("INT_ELEM globals: {:?}", globals);
+        }
+    }
+    // return homed MINUS shared (caller unions) + the seed set for
+    // reader seeding.
+    let shared = crate::shir::analyze_int_arrays(prog);
+    let out: HashSet<String> = homed.difference(&shared).cloned().collect();
+    (out, seed)
+}
+
+/// Seed `Int` verdicts for element-readers and pure-arith temps (called
+/// before `demote_stringy_ints`, which re-validates every seed: a seed
+/// with any stringy assign is removed again, so seeding is always
+/// safe — it can only ever keep vars demote would keep).
+///
+/// Only two classes are pushed (keep the diff minimal — everything else
+/// is demote's business):
+/// - readers of a homed array (`v = A[k]`): the read renders natively
+///   either way (guarded slot read), so the verdict only drops the
+///   surrounding string round-trip.
+/// - pure-arith temps (every assign an `Arith` node): both store paths
+///   render the identical guarded form for div/mod, so the verdict only
+///   drops the snprintf/strdup/atoll round-trip.
+fn seed_int_element_readers(prog: &mut IrProgram) {
+    use crate::ir::IrExpr;
+    let (homed, seed) = int_element_verdict(prog);
+    if homed.is_empty() {
+        return;
+    }
+    let mut all_homed = crate::shir::analyze_int_arrays(prog);
+    for a in &homed {
+        all_homed.insert(a.clone());
+    }
+    // collects the assigns map for the reader check below
+    let mut assigns: HashMap<String, Vec<IrExpr>> = HashMap::new();
+    fn collect(stmts: &[crate::ir::IrStmt], out: &mut HashMap<String, Vec<IrExpr>>) {
+        for s in stmts {
+            match s {
+                crate::ir::IrStmt::Assign { targets, expr, .. } => {
+                    for t in targets {
+                        if t.indices.is_empty() && !t.var.contains('[') {
+                            out.entry(t.var.clone()).or_default().push(expr.clone());
+                        }
+                    }
+                }
+                crate::ir::IrStmt::If { then, elsifs, else_, .. } => {
+                    collect(then, out);
+                    for (_, b) in elsifs {
+                        collect(b, out);
+                    }
+                    collect(else_, out);
+                }
+                crate::ir::IrStmt::While { body, .. }
+                | crate::ir::IrStmt::DoWhile { body, .. }
+                | crate::ir::IrStmt::For { body, .. }
+                | crate::ir::IrStmt::Block(body)
+                | crate::ir::IrStmt::Subshell(body)
+                | crate::ir::IrStmt::Background(body) => collect(body, out),
+                crate::ir::IrStmt::ForInit { init, step, body, .. } => {
+                    collect(init, out);
+                    collect(step, out);
+                    collect(body, out);
+                }
+                crate::ir::IrStmt::Function { body, named_blocks, .. } => {
+                    collect(body, out);
+                    for (_, b) in named_blocks {
+                        collect(b, out);
+                    }
+                }
+                _ => {}
+            }
+        }
+    }
+    collect(&prog.stmts, &mut assigns);
+    for sub in &prog.subs {
+        collect(&sub.body, &mut assigns);
+    }
+    fn reads_homed(exprs: &[IrExpr], homed: &HashSet<String>) -> bool {
+        exprs.iter().any(|e| match e {
+            IrExpr::Call { func, args } if func == "arrayIndex" => {
+                matches!(Render::str_arg(args, 0).as_deref(), Some(n) if homed.contains(n))
+            }
+            IrExpr::Call { func, args } if func == "getVar" => {
+                matches!(Render::str_arg(args, 0).as_deref(), Some(n) if homed.contains(n))
+            }
+            IrExpr::Index { .. } => true,
+            _ => false,
+        })
+    }
+    let mut pushed = 0;
+    for v in &seed {
+        if prog.var_types.iter().any(|(n, _)| n == v) {
+            continue;
+        }
+        let rhs = assigns.get(v);
+        let ok = match rhs {
+            Some(es) if !es.is_empty() => {
+                reads_homed(es, &all_homed)
+                    || es.iter().all(|e| matches!(e, IrExpr::Arith(_)))
+            }
+            _ => false,
+        };
+        if !ok {
+            continue;
+        }
+        prog.var_types.push((v.clone(), IrType::Int));
+        pushed += 1;
+    }
+    if std::env::var("SH2_DEBUG_INT_ELEM").is_ok() {
+        eprintln!("INT_ELEM seeded {} readers", pushed);
+    }
+}
+
+/// Int-array verdict for the C backend: the shared analysis UNION the
+/// int-element arrays (C-backend-local — other backends keep the shared
+/// verdict exactly).
+fn int_arrays_for_c(prog: &IrProgram) -> HashSet<String> {
+    let mut out = crate::shir::analyze_int_arrays(prog);
+    let (homed, _) = int_element_verdict(prog);
+    for a in homed {
+        out.insert(a);
+    }
+    out
+}
+
 /// Pass 2: mark every array name that is READ as a value (write targets
 /// excluded). Conservative: an unknown call mentioning an array name is a
 /// read. The statement match is exhaustive (mirrors `count_stmt`) so a new
@@ -1584,7 +3658,7 @@ fn fold_hoist_list(
                 _ => None,
             };
             let mut j = i + 1;
-            let mut found: Option<(crate::ir::ArithAst)> = None;
+            let mut found: Option<crate::ir::ArithAst> = None;
             while j < stmts.len() {
                 // the loop itself? check the cond shape first
                 if let Some(lhs) = bound_plus1_cond(&stmts[j], &tmp) {
@@ -2396,7 +4470,7 @@ fn int_array_widths(
     prog: &IrProgram,
     ranges: &HashMap<String, (i128, i128)>,
 ) -> HashMap<String, Width> {
-    let int_arrays = crate::shir::analyze_int_arrays(prog);
+    let int_arrays = crate::c_backend::int_arrays_for_c(prog);
     let state: HashMap<String, Option<(i128, i128)>> = ranges
         .iter()
         .map(|(k, v)| (k.clone(), Some(*v)))
@@ -3814,16 +5888,11 @@ fn ver_threshold(
             _ => true,
         }
     }
-    // Recurse nested first (their thresholds join the min).
-    let mut inner: Vec<(A, i64)> = Vec::new();
-    // Top-level node itself is the mod under test, not "nested".
-    let probe = match dividend {
-        A::Bin { lhs, .. } => lhs.as_ref(),
-        _ => dividend,
-    };
-    let _ = probe;
-    // (Nested collection happens on the dividend subtree below via
-    // ver_nested_thresholds; the top call handles the outer shape.)
+    // Nested collection happens on the dividend subtree below via
+    // ver_nested_mods; the top call handles the outer shape. (An earlier
+    // design collected them into a local `inner` Vec here and probed the
+    // top node with a `probe` binding — both were superseded by the loop
+    // below and nothing read them.)
     let mut t_min: i128 = VER_INF;
     for (mod_node, m) in ver_nested_mods(dividend) {
         // Recurse on the nested mod's own dividend (structurally smaller;
@@ -3883,7 +5952,9 @@ fn ver_nested_mods(dividend: &crate::ir::ArithAst) -> Vec<(crate::ir::ArithAst, 
 /// from the bound; anything else needs a static [0, fits] range.
 fn ver_skel_threshold(
     dividend: &crate::ir::ArithAst,
-    divisor: i64,
+    // `_divisor` keeps the call contract; this predicate decides from the
+    // dividend alone.
+    _divisor: i64,
     ctx: &VerCtx,
     state: &HashMap<String, Option<(i128, i128)>>,
 ) -> Option<i128> {
@@ -4239,7 +6310,6 @@ fn ver_collect(
 ) -> Option<VerPlan> {
     use crate::ir::{ArithAst as A, IrExpr, IrStmt};
     let ctx = VerCtx { counter: counter.to_string(), lt, boundvar: boundvar.to_string(), accums: accums.clone() };
-    let mut thresh: Vec<i128> = Vec::new();
     fn varith(a: &A, ctx: &VerCtx, state: &HashMap<String, Option<(i128, i128)>>, out: &mut Vec<i128>) {
         match a {
             A::Bin { op, lhs, rhs } if op == "%" || op == "/" => {
@@ -4532,7 +6602,19 @@ fn array_fixed_caps(
             } else {
                 0
             }),
-            IrExpr::Array(items) => Some(items.len() as u64),
+            // Same soundness rule as shir.rs `for_iter_trip`: a dynamic
+            // element (`Array[split($x)]`) expands at runtime — len is
+            // not a trip bound. Under-counting appends miscounts the
+            // capacity proof (the exit-127 guard would fire loudly at
+            // runtime, but the proof itself must not be wrong).
+            IrExpr::Array(items)
+                if items
+                    .iter()
+                    .all(|it| matches!(it, IrExpr::Str(..) | IrExpr::Int(..))) =>
+            {
+                Some(items.len() as u64)
+            }
+            IrExpr::Array(_) => None,
             _ => None,
         }
     }
@@ -6142,11 +8224,599 @@ fn expr_width(e: &IrExpr, state: &HashMap<String, Option<(i128, i128)>>) -> Widt
     }
 }
 
+/// A fused TSV-field take, in two spellings that lower to the same
+/// inline block (strchr + two fresh copies) instead of a grab plus a
+/// consume (~9 allocs, ~9 scans per field in the worst spelling):
+///
+/// FUNCTION form: a call (no args) to reader fn `F` whose body is
+/// exactly `x=${s%%D*}; G()`, where `G`'s body is exactly `done=0` +
+/// one loop that probes `${s%%D*}` and strips `s` one char (`${s#?}`)
+/// per iteration until the probe comes back empty. Matched at render
+/// time via the `take_fields` map (`take_field_opt`).
+///
+/// INLINE form: an adjacent pair `[x=${s%%D*}, s=${s#*D}]` in one
+/// statement list (the cache-replay loop's shape). A pre-pass rewrites
+/// the pair into a `TakeFieldNode` (below); the render arm emits it.
+/// `done`/`probe` are `None` here — there is no loop state to reproduce.
+///
+/// In both forms the old buffers leak exactly as today (never freed,
+/// never mutated in place) — strictly fewer dead buffers, and no
+/// heap-ownership proof is needed.
+///
+/// Soundness notes (all enforced by the matchers below, REFUSE > GUESS):
+/// - exact statement counts everywhere: anything else in either body
+///   (output, early exit, extra calls) refuses the fusion.
+/// - the while condition must read `$done` with `-eq 0`, and `done` is
+///   set to 0 on entry: the loop always runs ≥1 iteration and exits
+///   exactly when the probe is empty, so the fused code sets status 0,
+///   matching the original (whose last executed statement is always an
+///   assign).
+/// - the delimiter is one non-special byte + `*`: `strchr` finds the
+///   same first delimiter the `${s%%D*}` grab names.
+/// - the fused code allocates only fresh buffers and never frees or
+///   mutates in place: leak behavior is identical to today (strictly
+///   fewer dead buffers), and no heap-ownership proof is needed.
+#[derive(Debug, Clone)]
+struct TakeField {
+    /// var receiving the field
+    x: String,
+    /// cursor var being consumed
+    s: String,
+    /// single-byte delimiter
+    delim: u8,
+    /// loop-done flag (set "1" at exit, as the loop leaves it)
+    done: String,
+    /// probe var (set "" at exit, as the loop leaves it)
+    probe: String,
+}
+
+fn tf_str(e: &IrExpr) -> Option<&str> {
+    if let IrExpr::Str(s, _) = e {
+        Some(s)
+    } else {
+        None
+    }
+}
+
+fn tf_scalar_target(t: &crate::ir::AssignTarget) -> Option<&str> {
+    if t.indices.is_empty() {
+        Some(&t.var)
+    } else {
+        None
+    }
+}
+
+/// `Assign` with exactly one plain-scalar target → (var, rhs).
+fn tf_assign(st: &IrStmt) -> Option<(&str, &IrExpr)> {
+    if let IrStmt::Assign { targets, expr, .. } = st {
+        let [t] = targets.as_slice() else {
+            return None;
+        };
+        Some((tf_scalar_target(t)?, expr))
+    } else {
+        None
+    }
+}
+
+/// `Call{func:"param", args:[Str(op), Str(var), Str(pat)]}`.
+fn tf_param(e: &IrExpr) -> Option<(&str, &str, &str)> {
+    if let IrExpr::Call { func, args } = e {
+        if func != "param" {
+            return None;
+        }
+        let [op, var, pat] = args.as_slice() else {
+            return None;
+        };
+        Some((tf_str(op)?, tf_str(var)?, tf_str(pat)?))
+    } else {
+        None
+    }
+}
+
+/// `${s%%D*}` grab → (s, delim byte). `D` must be exactly one
+/// non-special byte + `*`, so `strchr` names the same delimiter.
+fn tf_grab(e: &IrExpr) -> Option<(&str, u8)> {
+    let (op, var, pat) = tf_param(e)?;
+    if op != "%%" {
+        return None;
+    }
+    let b = pat.as_bytes();
+    if b.len() != 2 || b[1] != b'*' {
+        return None;
+    }
+    match b[0] {
+        b'*' | b'?' | b'[' | b'\\' => None,
+        d => Some((var, d)),
+    }
+}
+
+/// `${s#?}` single-char strip → s.
+fn tf_strip1(e: &IrExpr) -> Option<&str> {
+    let (op, var, pat) = tf_param(e)?;
+    if op == "#" && pat == "?" {
+        Some(var)
+    } else {
+        None
+    }
+}
+
+/// `Call{func:"test", args:[Str(text)]}` → raw text. Matched against
+/// exact spellings by the callers (no quote/space normalization).
+fn tf_test_text(e: &IrExpr) -> Option<&str> {
+    if let IrExpr::Call { func, args } = e {
+        if func != "test" {
+            return None;
+        }
+        let [t] = args.as_slice() else {
+            return None;
+        };
+        tf_str(t)
+    } else {
+        None
+    }
+}
+
+/// The stripper body: exactly `[done=0, While]` where the loop probes
+/// and strips one char per iteration until the probe is empty.
+/// Returns (done, s, probe, delim).
+fn tf_match_stripper(body: &[IrStmt]) -> Option<(String, String, String, u8)> {
+    let [init, loop_] = body else {
+        return None;
+    };
+    let (done, zero) = tf_assign(init)?;
+    if !matches!(zero, IrExpr::Str(t, _) if t == "0") {
+        return None;
+    }
+    let IrStmt::While { cond, body: lb } = loop_ else {
+        return None;
+    };
+    // Must read $done with -eq 0 (exact spellings): anything else risks
+    // entering zero times or never exiting, which the fused code — that
+    // always consumes exactly one field — would not reproduce.
+    let ct = tf_test_text(cond)?;
+    if ct != format!("\"${done}\" -eq 0") && ct != format!("${done} -eq 0") {
+        return None;
+    }
+    let [probe_assign, if_] = lb.as_slice() else {
+        return None;
+    };
+    let (pvar, pexpr) = tf_assign(probe_assign)?;
+    let (s, delim) = tf_grab(pexpr)?;
+    let IrStmt::If {
+        cond: icond,
+        then,
+        elsifs,
+        else_,
+    } = if_
+    else {
+        return None;
+    };
+    if !elsifs.is_empty() {
+        return None;
+    }
+    let it = tf_test_text(icond)?;
+    if it != format!("\"${pvar}\"=\"\"") && it != format!("\"{pvar}\" = \"\"") {
+        return None;
+    }
+    // then: done=1 + strip(s) in either order, exactly; else: strip(s).
+    if then.len() != 2 || else_.len() != 1 {
+        return None;
+    }
+    let mut saw_done = false;
+    let mut saw_strip = false;
+    for st in then.iter() {
+        let (v, e) = tf_assign(st)?;
+        if v == done {
+            if !matches!(e, IrExpr::Str(t, _) if t == "1") {
+                return None;
+            }
+            saw_done = true;
+        } else if v == s && tf_strip1(e) == Some(s) {
+            saw_strip = true;
+        } else {
+            return None;
+        }
+    }
+    if !saw_done || !saw_strip {
+        return None;
+    }
+    let (ev, ee) = tf_assign(&else_[0])?;
+    if ev != s || tf_strip1(ee) != Some(s) {
+        return None;
+    }
+    if done == s || done == pvar || s == pvar {
+        return None;
+    }
+    Some((done.to_string(), s.to_string(), pvar.to_string(), delim))
+}
+
+/// The reader body: exactly `[x=${s%%D*}, G()]` (no-arg call).
+/// Returns (x, s, delim, stripper name).
+fn tf_match_reader(body: &[IrStmt]) -> Option<(String, String, u8, String)> {
+    let [grab, call] = body else {
+        return None;
+    };
+    let (x, gexpr) = tf_assign(grab)?;
+    let (s, delim) = tf_grab(gexpr)?;
+    let IrStmt::Expr(IrExpr::Call { func, args }) = call else {
+        return None;
+    };
+    if func != "exec" && func != "builtin" {
+        return None;
+    }
+    let [name, arg2] = args.as_slice() else {
+        return None;
+    };
+    let gname = tf_str(name)?;
+    if !matches!(arg2, IrExpr::Array(items) if items.is_empty()) {
+        return None;
+    }
+    if x == s {
+        return None;
+    }
+    Some((x.to_string(), s.to_string(), delim, gname.to_string()))
+}
+
+/// A fused take as IR: the inline pair's replacement. Hand-written
+/// (not `.node`-generated): it only ever exists between the C
+/// backend's own pre-pass and its render arm, so no JSON registry
+/// entry and no other-backend fallback is needed. Carries var NAMES,
+/// not expressions, so there are no children for analyses to walk —
+/// which is why the fusing pre-pass runs after every analysis (just
+/// before `program()`), and why every analysis sees the originals.
+/// `done`/`probe` are `Some` for the function form (loop post-state to
+/// reproduce) and `None` for the inline form. (The function form keeps
+/// its render-time call hook instead of this node: its post-state goes
+/// through the standard assign path, which the node form skips.)
+#[derive(Debug, Clone)]
+struct TakeFieldNode {
+    x: String,
+    s: String,
+    delim: u8,
+}
+
+impl crate::shir_nodes::ExtNode for TakeFieldNode {
+    fn tag(&self) -> &'static str {
+        "TakeField"
+    }
+    fn to_json(&self) -> serde_json::Value {
+        serde_json::json!({
+            "type": "TakeField",
+            "x": self.x,
+            "s": self.s,
+            "delim": self.delim,
+        })
+    }
+    fn children(&self) -> Vec<&IrStmt> {
+        vec![]
+    }
+    fn children_mut(&mut self) -> Vec<&mut IrStmt> {
+        vec![]
+    }
+    fn clone_box(&self) -> Box<dyn crate::shir_nodes::ExtNode> {
+        Box::new(self.clone())
+    }
+    fn as_any(&self) -> &dyn std::any::Any {
+        self
+    }
+}
+
+/// `${s#*D}` strip-through-delimiter → (s, delim byte). `D` must be
+/// exactly `*` + one non-special byte (mirrors the grab rule below).
+fn tf_strip_through(e: &IrExpr) -> Option<(&str, u8)> {
+    let (op, var, pat) = tf_param(e)?;
+    if op != "#" {
+        return None;
+    }
+    let b = pat.as_bytes();
+    if b.len() != 2 || b[0] != b'*' {
+        return None;
+    }
+    match b[1] {
+        b'*' | b'?' | b'[' | b'\\' => None,
+        d => Some((var, d)),
+    }
+}
+
+/// Fuse adjacent `[x=${s%%D*}, s=${s#*D}]` pairs into `TakeFieldNode`s
+/// across a whole program (top level + sub bodies). Runs on the final
+/// layout (after every analysis — the node hides its vars from
+/// statement walkers, so analyses must see the originals), recursing
+/// statement lists but never into expression interiors
+/// (`Capture`/`Arrow`/call args): a pair is two sibling statements, and
+/// anything inside an expression keeps the slow path (safe).
+/// Gated by `SH2_NO_TAKE_FIELD=1` like the function form.
+fn fuse_inline_prog(prog: &mut IrProgram, bigints: &std::collections::BTreeSet<String>) {
+    if std::env::var("SH2_NO_TAKE_FIELD").map(|v| v == "1").unwrap_or(false) {
+        return;
+    }
+    let cx = TakeCx::of(prog, bigints);
+    fuse_inline_vec(&mut prog.stmts, &cx);
+    for sub in &mut prog.subs {
+        fuse_inline_vec(&mut sub.body, &cx);
+    }
+}
+
+/// An adjacent grab+strip pair in one statement list → fused node.
+/// Both must be single-target plain-scalar assigns on the same cursor
+/// var with the same delimiter byte; the grab target must differ; both
+/// vars must be plain `char*` stores (`TakeCx::plain`).
+fn match_inline_pair(a: &IrStmt, b: &IrStmt, cx: &TakeCx) -> Option<TakeFieldNode> {
+    let (IrStmt::Assign { targets: t1, expr: e1, .. },
+         IrStmt::Assign { targets: t2, expr: e2, .. }) = (a, b) else {
+        return None;
+    };
+    let [ta] = t1.as_slice() else { return None };
+    let [tb] = t2.as_slice() else { return None };
+    let x = tf_scalar_target(ta)?;
+    let s2 = tf_scalar_target(tb)?;
+    let (s1, d1) = tf_grab(e1)?;
+    let (s3, d2) = tf_strip_through(e2)?;
+    if s1 != s2 || s1 != s3 || d1 != d2 || x == s1 {
+        return None;
+    }
+    if !cx.plain(x) || !cx.plain(s1) {
+        return None;
+    }
+    Some(TakeFieldNode {
+        x: x.to_string(),
+        s: s1.to_string(),
+        delim: d1,
+    })
+}
+
+fn fuse_inline_vec(stmts: &mut Vec<IrStmt>, cx: &TakeCx) {
+    let mut i = 0;
+    while i < stmts.len() {
+        let mut paired = false;
+        if i + 1 < stmts.len() {
+            if let Some(node) = match_inline_pair(&stmts[i], &stmts[i + 1], cx) {
+                stmts[i] = IrStmt::Ext(Box::new(node));
+                stmts.remove(i + 1);
+                paired = true;
+            }
+        }
+        if !paired {
+            fuse_inline_stmt(&mut stmts[i], cx);
+        }
+        i += 1;
+    }
+}
+
+fn fuse_inline_stmt(st: &mut IrStmt, cx: &TakeCx) {
+    match st {
+        IrStmt::Block(b)
+        | IrStmt::Function { body: b, .. }
+        | IrStmt::While { body: b, .. }
+        | IrStmt::For { body: b, .. }
+        | IrStmt::ForInit { body: b, .. }
+        | IrStmt::DoWhile { body: b, .. } => fuse_inline_vec(b, cx),
+        IrStmt::Subshell(b) | IrStmt::Background(b) => fuse_inline_vec(b, cx),
+        IrStmt::If { then: b, elsifs, else_, .. } => {
+            fuse_inline_vec(b, cx);
+            for (_, eb) in elsifs.iter_mut() {
+                fuse_inline_vec(eb, cx);
+            }
+            fuse_inline_vec(else_, cx);
+        }
+        IrStmt::Pipeline { stages, .. } => {
+            for stage in stages.iter_mut() {
+                fuse_inline_vec(stage, cx);
+            }
+        }
+        _ => {}
+    }
+}
+
+/// Verdict context for take-field fusion: per-var facts deciding
+/// whether the fused block's plain `v = xstrdup(..)` assigns are valid
+/// for `v` (all computed pre-pass, so they describe the originals).
+#[derive(Default)]
+struct TakeCx {
+    types: HashMap<String, crate::ir::IrType>,
+    lengths: HashMap<String, Option<u64>>,
+    bigints: std::collections::BTreeSet<String>,
+}
+
+impl TakeCx {
+    fn of(prog: &IrProgram, bigints: &std::collections::BTreeSet<String>) -> Self {
+        TakeCx {
+            types: prog.var_types.iter().cloned().collect(),
+            lengths: prog.var_lengths.iter().cloned().collect(),
+            bigints: bigints.clone(),
+        }
+    }
+
+    /// May `v` be assigned by the fused block's plain `v = xstrdup(..)`?
+    /// The emission only supports `char*` heap stores. Refuse numerics
+    /// (would truncate), length-bounded vars (fixed `char[N]` buffers —
+    /// assign-to-array is a compile error), and bigint-homed vars
+    /// (`mpz_t` slots). Unlisted vars default to `char*` (the
+    /// declaration fallback), so absence allows. Const-lifted needs no
+    /// check: a grab-assigned var is never single-literal-init.
+    /// Managed strings need none either: the managed set is always
+    /// empty (that migration is deferred — every shell string assigns
+    /// through the `char*` path today).
+    fn plain(&self, v: &str) -> bool {
+        match self.types.get(v) {
+            None => {}
+            Some(crate::ir::IrType::Str)
+            | Some(crate::ir::IrType::AsciiStr)
+            | Some(crate::ir::IrType::Any) => {}
+            _ => return false,
+        }
+        if matches!(self.lengths.get(v), Some(Some(_))) {
+            return false;
+        }
+        if self.bigints.contains(v) {
+            return false;
+        }
+        true
+    }
+}
+
+/// Self-append shape: `v = Interpolate[read(v), segs...]` with a
+/// non-empty tail. Returns the tail as a synthetic Interpolate for the
+/// caller to render (same renderer, same flattening, minus the leading
+/// read). Reads accepted: bare `Var`/`Ident` and single-arg `getVar`
+/// (the shapes a `$v` word lowers to — anything else refuses, so a
+/// default-carrying `getVar` or a computed read never silently becomes
+/// a plain variable read). Leading empty literals are skipped (`"" +
+/// $v` is still a self-append). Segs may read `v` again (evaluated
+/// eagerly in the temp, exactly as today) but must contain no other
+/// `Call` (a pending-free temp would be copied instead of moved).
+fn self_append_segs(var: &str, expr: &IrExpr) -> Option<IrExpr> {
+    fn is_plain_read(var: &str, e: &IrExpr) -> bool {
+        match e {
+            IrExpr::Var(v, None) | IrExpr::Ident(v) => v == var,
+            IrExpr::Call { func, args } if func == "getVar" => {
+                matches!(args.as_slice(), [IrExpr::Str(n, _)] if n == var)
+            }
+            // The frontend's plain-read shape: `$v`/`${v}` lower to
+            // `param("", v)` (2-arg; every other op carries extras, so
+            // exactly-2-args with an empty op IS the bare read). Without
+            // this every real self-append missed the fast path (only
+            // hand-built `Var` shapes matched) — the game's per-cell
+            // payload appends paid snprintf+xstrdup+free each.
+            IrExpr::Call { func, args } if func == "param" => {
+                matches!(args.as_slice(), [IrExpr::Str(op, _), IrExpr::Str(n, _)] if op.is_empty() && n == var)
+            }
+            _ => false,
+        }
+    }
+    // Allowlist (anything else refuses — a pending-free temp would
+    // be copied instead of moved). Pure reads and pure math only;
+    // single-arg `getVar` is a plain variable read. Multi-arg calls
+    // (defaults with arbitrary expressions), captures, raw code and
+    // composite literals stay on the temp-swap path.
+    fn seg_ok(e: &IrExpr) -> bool {
+        match e {
+            IrExpr::Str(..)
+            | IrExpr::Int(..)
+            | IrExpr::Bool(..)
+            | IrExpr::Var(..)
+            | IrExpr::Ident(..)
+            | IrExpr::Arith(..) => true,
+            IrExpr::Call { func, args } => {
+                (func == "getVar" && matches!(args.as_slice(), [IrExpr::Str(..)]))
+                    // tail-placed plain reads lower the same way
+                    // (`param("", v)`); anything with an op or extras
+                    // refuses below via the arg-shape match.
+                    || (func == "param"
+                        && matches!(args.as_slice(), [IrExpr::Str(op, _), IrExpr::Str(..)] if op.is_empty()))
+            }
+            IrExpr::Interpolate(parts) => parts.iter().all(|p| match p {
+                InterpPart::Lit(_) => true,
+                InterpPart::Expr(x) => seg_ok(x),
+            }),
+            IrExpr::BinOp { lhs, rhs, .. } => seg_ok(lhs) && seg_ok(rhs),
+            IrExpr::Ternary { cond, then, else_, .. } => {
+                seg_ok(cond) && seg_ok(then) && seg_ok(else_)
+            }
+            IrExpr::DefinedOr { expr, default } => seg_ok(expr) && seg_ok(default),
+            IrExpr::Index { key, .. } => seg_ok(key),
+            _ => false,
+        }
+    }
+    // NOTE: getVar with siblings is allowed in segs but the LEADING
+    // read needs the strict single-arg form (checked in is_plain_read)
+    // — a default (`${v-d}`) is not the variable's value.
+    let IrExpr::Interpolate(parts) = expr else {
+        return None;
+    };
+    let mut rest = parts.as_slice();
+    while let [InterpPart::Lit(s), tail @ ..] = rest {
+        if !s.is_empty() {
+            return None;
+        }
+        rest = tail;
+    }
+    let [InterpPart::Expr(first), tail @ ..] = rest else {
+        return None;
+    };
+    if tail.is_empty() || !is_plain_read(var, first) {
+        return None;
+    }
+    for p in tail {
+        if let InterpPart::Expr(x) = p {
+            if !seg_ok(x) {
+                return None;
+            }
+        }
+    }
+    Some(IrExpr::Interpolate(tail.to_vec()))
+}
+
+/// Collect take-field fusion sites: reader fn name → shape. Walks
+/// top-level `Function` nodes (where shell functions live), resolving
+/// the stripper by name among its siblings.
+fn collect_take_fields(
+    prog: &IrProgram,
+    bigints: &std::collections::BTreeSet<String>,
+) -> HashMap<String, TakeField> {
+    // Escape hatch (bisecting a suspect fusion needs no rebuild, and a
+    // program whose shape accidentally matches stays runnable).
+    if std::env::var("SH2_NO_TAKE_FIELD").map(|v| v == "1").unwrap_or(false) {
+        return HashMap::new();
+    }
+    let cx = TakeCx::of(prog, bigints);
+    let stmts = &prog.stmts;
+    let mut fns: HashMap<&str, (&Vec<String>, &Vec<IrStmt>)> = HashMap::new();
+    for st in stmts {
+        if let IrStmt::Function {
+            name, params, body, ..
+        } = st
+        {
+            fns.insert(name.as_str(), (params, body));
+        }
+    }
+    let mut out = HashMap::new();
+    for (fname, (params, body)) in &fns {
+        if !params.is_empty() {
+            continue;
+        }
+        let Some((x, s, delim, gname)) = tf_match_reader(body) else {
+            continue;
+        };
+        let Some((gparams, gbody)) = fns.get(gname.as_str()) else {
+            continue;
+        };
+        if !gparams.is_empty() {
+            continue;
+        }
+        let Some((done, gs, probe, gdelim)) = tf_match_stripper(gbody) else {
+            continue;
+        };
+        if gs != s || gdelim != delim {
+            continue;
+        }
+        if x == done || x == probe {
+            continue;
+        }
+        // Plain `char*` stores only (see `TakeCx::plain`): exotic
+        // storage would need its own assign path.
+        if !cx.plain(&x) || !cx.plain(&s) {
+            continue;
+        }
+        out.insert(
+            fname.to_string(),
+            TakeField {
+                x,
+                s,
+                delim,
+                done,
+                probe,
+            },
+        );
+    }
+    out
+}
+
 /// Render an `IrProgram` to C source (main() body).
 pub fn shir_to_c(prog: &IrProgram) -> String {
     let mut prog = prog.clone();
     if std::env::var("SH2_DBG_VARS").is_ok() {
-        eprintln!("DBG shir_to_c entry stmts={} t0={}", prog.stmts.len(),
+        pdebug!("DBG shir_to_c entry stmts={} t0={}", prog.stmts.len(),
             match prog.stmts.first() { Some(IrStmt::Assign{..}) => "Assign", Some(IrStmt::Expr(_)) => "Expr", _ => "?" });
     }
     // A2 + var_lengths: the analyses run at serialization time in the
@@ -6188,6 +8858,10 @@ pub fn shir_to_c(prog: &IrProgram) -> String {
     // `result` is arith elsewhere but `result=$(echo ...)` here)
     // must be Str — an Int decl truncates the string pointer to 16
     // bits (garbage numbers). Numeric uses still work via atoll.
+    // Int-element readers seed first (their arrayIndex sources are
+    // numeric exactly when homed — see the `is_numeric` arrayIndex
+    // arm), so demote re-validates every seed below.
+    seed_int_element_readers(&mut prog);
     demote_stringy_ints(&mut prog);
     // sort for deterministic serialization (the C backend reads it as a
     // map, but the sort keeps output stable across runs)
@@ -6198,6 +8872,30 @@ pub fn shir_to_c(prog: &IrProgram) -> String {
     // observe the folded program. C-backend-local: other backends never
     // see the rewrite.
     fold_hoist_pairs(&mut prog);
+    // RANGE ANALYSIS, HOISTED TO ITS EARLIEST CORRECT POINT.
+    //
+    // Four separate callers want this map — the string-length bounds, the
+    // nonzero-divisor proof, the list-profile census, and the backend's own
+    // width decisions — and `analyze_var_ranges` is a full-program fixpoint
+    // that dominated the render (measured: 0.69 s here, plus 0.67 s re-derived
+    // by the nonzero proof, 1.49 s by the census, 0.66 s by the length
+    // analysis). Computing it ONCE and passing it to all four removes three
+    // redundant fixpoints.
+    //
+    // The position matters: it must be AFTER every program rewrite that can
+    // change a var's range (`fold_hoist_pairs` above is the last such
+    // rewrite), and BEFORE the first consumer. Only the `seed_*` calls below
+    // modify the map, and they deliberately run after this point, so a
+    // consumer that must see the UNSEEDED map takes the clone taken here.
+    let mut ranges = crate::shir::analyze_var_ranges(&prog);
+    // NOTE: `analyze_string_lengths` deliberately SELF-DERIVES its ranges
+    // rather than taking the map below. Passing it the shared map was tried
+    // and is WRONG: the length analysis feeds `var_lengths`, which the
+    // `%s`-format fusion further down consumes, and the bounds it derives
+    // from a pre-`var_lengths` range map differ — measured, it dropped
+    // arguments from `snprintf("%s %s %s %s %s", …)` (a real miscompile, not
+    // a formatting shift). Do not "optimise" this back to the with-ranges
+    // variant. The redundant fixpoint is the price of that ordering.
     prog.var_lengths = crate::shir::analyze_string_lengths(&prog);
     prog.var_lifetimes = crate::shir_passes::lifetime::analyze_var_lifetimes(&prog);
     prog.var_storage = crate::shir::select_storage_classes(&prog);
@@ -6205,11 +8903,11 @@ pub fn shir_to_c(prog: &IrProgram) -> String {
     // NONZERO-DIVISOR proof (shared shIR analysis): a var whose proven
     // range excludes 0 in every scope that mentions it — the mpz div/mod
     // emit drops the `mpz_sgn==0` guard for such divisors.
+    // NOTE: `compute_nonzero_vars` re-derives the range map internally
+    // (a redundant full-program fixpoint). The with-ranges variant that
+    // reuses the map computed just above lives in uncommitted churn;
+    // restore the reuse (and a `ranges_for_reuse` copy) once it lands.
     crate::shir::set_nonzero_vars(crate::shir::compute_nonzero_vars(&prog));
-    // Range analysis (M8 spike): conservative [lo, hi] per assigned var,
-    // + the Range/seq for-iter seeds the analysis doesn't track (loop
-    // vars are excluded from its assign set).
-    let mut ranges = crate::shir::analyze_var_ranges(&prog);
     seed_loop_var_ranges(&prog.stmts, &mut ranges);
     // isqrt-idiom bound temps (`int(n**0.5)` hoists): the arith-text
     // Call has no range, so seed the `_sh_isqrt` result range ([0,
@@ -6304,7 +9002,7 @@ pub fn shir_to_c(prog: &IrProgram) -> String {
     r.var_storage = prog.var_storage.iter().cloned().collect();
     r.const_vars = prog.var_const.iter().cloned().collect();
     r.const_rhs = const_assign_rhs(&prog.stmts, &r.const_vars);
-    r.int_arrays = crate::shir::analyze_int_arrays(&prog);
+    r.int_arrays = crate::c_backend::int_arrays_for_c(&prog);
     r.force_str = string_loop_vars(&prog, &r.int_arrays);
     r.reduce_arrays = crate::shir::analyze_reduce_arrays(&prog);
     r.int_array_widths = int_array_widths(&prog, &ranges);
@@ -6331,6 +9029,10 @@ pub fn shir_to_c(prog: &IrProgram) -> String {
     r.array_return_arrays = analyze_array_return_fns(&prog);
     r.array_return_fns = r.array_return_arrays.keys().cloned().collect();
     // list-container profiles (advisory verdicts; vec selection below)
+    // NOTE: `verdicts` re-derives the range map internally (measured at
+    // **1.49 s** on MIMEcroft_fb.sh for a map already in hand). The
+    // with-ranges variant that takes the map computed above lives in
+    // uncommitted churn; restore it once it lands.
     r.list_verdicts = crate::shir_passes::list_profile::verdicts(&prog);
     if !r.lifted_fns.is_empty() {
         // the lifted fns' return values live in the _sh_* runtime
@@ -6458,6 +9160,11 @@ pub fn shir_to_c(prog: &IrProgram) -> String {
             fold_const_branch_list(&mut sub.body, &const_rhs_owned);
         }
     }
+    // take-field fusion sites (grab-first-field + consume-through-
+    // delimiter idiom → one inline take per call). Pure shape match on
+    // the final layout; the render arm consults the map. Runs on the
+    // top-level statements (where shell Function nodes live).
+    r.take_fields = collect_take_fields(&prog, &r.bigint_vars);
     // small-int arrays (native sum/max/min fast path): string-stored
     // arrays with int-domain elements only. After fold_range_for
     // (final statement layout) and before rendering; needs var_types
@@ -6492,51 +9199,58 @@ pub fn shir_to_c(prog: &IrProgram) -> String {
         // bulk-len eligibility base (per-loop checks add the rest).
         r.counter_dense = routed;
     }
+    // Inline take-field fusion (adjacent grab+strip pairs → TakeField
+    // nodes). LAST pre-pass before render, on purpose: the node hides
+    // its vars from statement walkers, so every analysis above (array
+    // caps bail on Ext nodes globally — a fused node before caps would
+    // blanket-1024 the program) must see the originals. Renderers that
+    // do not know the node never see it either (C-backend-local pass).
+    fuse_inline_prog(&mut prog, &r.bigint_vars);
     r.program(&prog);
-    r.trim_sh_runtime();
+        r.trim_sh_runtime();
     // drop discarded `, _sh_rc == N` comma tails BEFORE the dead-rc
     // strip so the removed reads can cascade (item 39)
-    r.trim_discarded_rc_cmp();
+        r.trim_discarded_rc_cmp();
     // _sh_rc models bash's `$?`: the renderer stores it after every
     // command so a LATER read sees the right value. When nothing in
     // the final program reads it (no `$?`, no surviving shell-out
     // helper, no fn-call status), the stores are unobservable dead
     // code — strip them and the definition.
-    r.strip_dead_rc();
+        r.strip_dead_rc();
     // fold `T v = 0; ... v = K;` (K constant) into `T v = K;` — the
     // zero-init is dead when the first store is an unconditional
     // constant on the straight-line path (runs after strip_dead_rc so
     // dead `$?` stores are gone before the between-scan reads lines).
-    r.fold_init_store();
+        r.fold_init_store();
     // drop `1;`-style constant statements (strip_dead_rc residue)
-    r.drop_const_stmts();
+        r.drop_const_stmts();
     // `(exit(X), 0);` statement → `exit(X);` (BASHC_OPT item 21)
-    r.drop_exit_comma();
+        r.drop_exit_comma();
     // `(_sh_rc = N, CONST);` with live rc → `_sh_rc = N;`
     // (BASHC_OPT item 58; dead-rc whole drops are item 19's)
-    r.drop_live_comma_tail();
+        r.drop_live_comma_tail();
     // pipeline-result double-eval bind (BASHC_OPT item 65)
-    r.bind_pipeline_once();
+        r.bind_pipeline_once();
     // `} else {` + `}` (empty else) → `}` (BASHC_OPT item 46;
     // runs after the rc strip, which empties dead-rc-only elses)
-    r.drop_empty_else();
+        r.drop_empty_else();
     // `atoll` of a literal → the literal constant (BASHC_OPT item 25)
-    r.fold_atoll_consts();
+        r.fold_atoll_consts();
     // `V = xstrdup((V = E))` → `V = xstrdup(E)` (BASHC_OPT item 53)
-    r.fold_self_copy();
+        r.fold_self_copy();
     // `(T)((T)X)` → `(T)X` (BASHC_OPT item 52)
-    r.fold_stacked_casts();
+        r.fold_stacked_casts();
     // guard on a string literal → the literal (BASHC_OPT item 51)
-    r.drop_literal_guards();
+        r.drop_literal_guards();
     // `static T v = 0;` → `static T v;` (static zero-init)
-    r.strip_static_zero_init();
+        r.strip_static_zero_init();
     // drop orphaned num temps: `static char _sN[32]; snprintf(_sN,
     // ...)` pairs whose temp is never read afterwards (a consumer took
     // a different path after the temp was emitted — e.g. a test cond
     // rendered numerically, then routed through a shell-out site that
     // converts itself). Only when the snprintf value is call-free
     // (dropping must not lose a side effect).
-    r.drop_dead_num_temps();
+        r.drop_dead_num_temps();
     // the discarded-value echo collapsed to `(printf(...));` /
     // `(fputs(...));` — drop OUR comma-expr wrapper parens (safe: these
     // prefixes are never a cast/declaration at statement position).
@@ -6548,6 +9262,33 @@ pub fn shir_to_c(prog: &IrProgram) -> String {
         {
             let indent = &line[..line.len() - t.len()];
             *line = format!("{}{};", indent, &t[1..t.len() - 2]);
+        }
+    }
+    // <gmp.h> IS DISCOVERED DURING THE BODY RENDER, so it cannot be emitted
+    // with the other fixed includes at the top of `emit_runtime` — `need_gmp`
+    // is still false there (it is set by `bigint_into`/`tiered_decimal`/… as
+    // the body renders). Without this splice a program that uses a `Cast`
+    // bigint rendered `mpz_t` with no declaration at all and failed to
+    // compile: `error: unknown type name 'mpz_t'` on a plain
+    // `for ((i=0;i<4;i++))` (tests/cli_hygiene.rs::
+    // normal_invocation_is_unaffected_by_the_sigpipe_reset).
+    //
+    // Same shape as the _sh_xstrdup splice below: insert at the LAST
+    // `#include` so every header stays in the leading block, and let the
+    // include trim see the final text (which keeps it alive via the `mpz_`
+    // and `_sh_mpz` triggers — see the `mpz_t` entry in HEADERS).
+    if r.need_gmp {
+        let full = r.out.join("\n");
+        // `_SH_MPZ_INIT` is the marker the GMP runtime block always emits, so
+        // its absence means the body did not in fact need the header.
+        if full.contains("mpz_t") || full.contains("_SH_MPZ_INIT") {
+            let pos = r
+                .out
+                .iter()
+                .rposition(|l| l.trim_start().starts_with("#include "))
+                .map(|i| i + 1)
+                .unwrap_or(0);
+            r.out.insert(pos, "#include <gmp.h>".to_string());
         }
     }
     // P1 OOM policy: every strdup call site in the output reads
@@ -6606,8 +9347,8 @@ pub fn shir_to_c(prog: &IrProgram) -> String {
     // HOSTNAME/BASH_VERSION seeding no read sees) disappears too. Also
     // after strip_dead_rc so dead `_sh_rc`/`exit(` mentions don't keep
     // <stdlib.h> alive.
-    r.trim_main_prologue();
-    r.trim_includes();
+        r.trim_main_prologue();
+        r.trim_includes();
     // A stripped runtime block can leave blank-line runs — keep at most
     // two (the C convention between declarations/functions).
     let mut blanks = 0usize;
@@ -8264,8 +11005,11 @@ impl Render {
             self.emit("  if (i < 0 || !v) return;");
             self.emit("  if (i >= (long long)cap) { fprintf(stderr, \"sh2c: capacity exceeded\\n\"); exit(127); }");
             // strdup: the source may be a stack temp that dies when its
-            // block closes (a capture/arith string in a loop body)
-            self.emit("  a[i] = (char*)_sh_xstrdup(v);");
+            // block closes (a capture/arith string in a loop body).
+            // Copy FIRST, then free the old slot: v may alias a[i]
+            // itself (`a[k]=${a[k]}...`), and freeing first would leave
+            // the copy reading freed memory.
+            self.emit("  { char *_nv = (char*)_sh_xstrdup(v); free(a[i]); a[i] = _nv; }");
             self.emit("  if ((size_t)(i + 1) > *len) *len = (size_t)(i + 1);");
             self.emit("}");
             self.emit("static const char *_sh_arr_get(char **a, size_t len, long long i) {");
@@ -8278,11 +11022,16 @@ impl Render {
             let grows: Vec<String> = self.need_grow.iter().cloned().collect();
             for sfx in &grows {
                 if sfx == "str" {
-                    // string-vec grower: the array itself is char**
+                    // string-vec grower: the array itself is char**.
+                    // Zero the newly grown region: sparse indexed writes
+                    // may land past len, and element stores free the old
+                    // slot — an uninitialized slot would free garbage.
                     self.emit("static void _sh_grow_str(char ***p, size_t *cap) {");
+                    self.emit("  size_t ocap = *cap;");
                     self.emit("  size_t ncap = *cap ? *cap * 2 : 16;");
                     self.emit("  char **np = (char**)realloc(*p, ncap * sizeof *np);");
                     self.emit("  if (!np) { fprintf(stderr, \"sh2c: out of memory\\n\"); exit(127); }");
+                    self.emit("  for (size_t _zi = ocap; _zi < ncap; _zi++) np[_zi] = 0;");
                     self.emit("  *p = np; *cap = ncap;");
                     self.emit("}");
                     continue;
@@ -8351,7 +11100,9 @@ impl Render {
             self.emit("static void _sh_assoc_set(char **k, char **v, size_t *n, size_t cap, const char *key, const char *val) {");
             self.emit("  if (!key) return;");
             self.emit("  for (size_t i = 0; i < *n; i++)");
-            self.emit("    if (k[i] && strcmp(k[i], key) == 0) { v[i] = (char*)_sh_xstrdup(val ? val : \"\"); return; }");
+            // copy first, then free: val may alias v[i] itself, and the
+            // k/v stores are {0}-initialized, so the free is safe.
+            self.emit("    if (k[i] && strcmp(k[i], key) == 0) { char *_nv = (char*)_sh_xstrdup(val ? val : \"\"); free(v[i]); v[i] = _nv; return; }");
             self.emit("  if (*n < cap) { k[*n] = (char*)_sh_xstrdup(key); v[*n] = (char*)_sh_xstrdup(val ? val : \"\"); (*n)++; }");
             self.emit("  else { fprintf(stderr, \"sh2c: capacity exceeded\\n\"); exit(127); }");
             self.emit("}");
@@ -8449,6 +11200,18 @@ impl Render {
             }
             // format an mpz_t[] as "1, 2, 3" (the array-return ABI's
             // call-site formatting; the caller's print adds the brackets).
+            //
+            // GATED. This helper mentions `mpz_t`, so emitting it
+            // unconditionally put an `mpz_t` in the output of programs with no
+            // bigint in them at all — and, because `<gmp.h>` is spliced only
+            // for a real `need_gmp` render, those programs then failed to
+            // compile: `error: unknown type name 'mpz_t'` on a plain
+            // `for ((i=0;i<4;i++))` (tests/cli_hygiene.rs::
+            // normal_invocation_is_unaffected_by_the_sigpipe_reset). It is
+            // only ever CALLED for an array-return function whose element type
+            // is `mpz_t`, so `array_return_fns` non-empty is the exact
+            // condition — and it is known before this block runs.
+            if !self.array_return_fns.is_empty() {
             self.emit("static char *_sh_mpz_arr_join(mpz_t *a, size_t n) {");
             self.emit("  static _sh_vbuf d = {0, 0};");
             self.emit("  _sh_vgrow(&d, 1); d.p[0] = 0;");
@@ -8548,6 +11311,16 @@ impl Render {
             self.emit("  }");
             self.emit("  _sh_vgrow(d, dn + 1); d->p[dn] = 0;");
             self.emit("}");
+            } // !array_return_fns.is_empty(): the GMP join helpers
+            // GATED with `<gmp.h>`-style reasoning: these two helpers dereference
+            // `_sh_argc`/`_sh_argv`, which the block above declares ONLY when
+            // `!pos_const || need_sh_argv`. Emitting them unconditionally put an
+            // undeclared `_sh_argc` in every positional-const program:
+            // `error: '_sh_argc' undeclared` on a plain
+            // `for ((i=0;i<4;i++))` (tests/cli_hygiene.rs::
+            // normal_invocation_is_unaffected_by_the_sigpipe_reset). Same
+            // condition, same block, so they cannot drift apart again.
+            if !self.pos_const || self.need_sh_argv.get() {
             self.emit("static char *_sh_argv_join(_sh_vbuf *d) {");
             self.emit("  char *dp = _sh_vgrow(d, 1); dp[0] = 0; size_t n = 0;");
             self.emit("  for (int i = 1; i < _sh_argc; i++) {");
@@ -8574,6 +11347,7 @@ impl Render {
             self.emit("  }");
             self.emit("  _sh_vgrow(d, dn + 1); d->p[dn] = 0; return d->p;");
             self.emit("}");
+            } // !pos_const || need_sh_argv: the argv helpers
             self.emit("/* wrap the built command as `bash -c '<cmd>'` (single-quote escaped) */");
             self.emit("static void _sh_wrap_cmd(const char *cmd) {");
             self.emit("  size_t n = strlen(cmd), need = n * 2 + 16;");
@@ -8778,8 +11552,45 @@ impl Render {
             self.emit("  return n;");
             self.emit("}");
             self.emit("/* export a var value so `$name` in a bash -c child sees it */");
+            // setenv() allocates a FRESH `name=value` block on every call
+            // and does not reuse it at a stable address, so re-exporting
+            // one variable with a large value per frame grows the heap
+            // without bound. Measured on MIMEcroft_fb (the fb0 rasterizer
+            // exports its 41 KB `rbp_chunk` 15x per presented frame):
+            // uordblks 324 MB and climbing at f=1420 in the menu loop,
+            // RSS 55 MB and rising, versus FLAT once the exported value is
+            // capped at 1 KB — so the growth is O(exported value) per
+            // export, not the program's own allocations.
+            //
+            // Keep ONE parent-owned block per name and hand the CHILD that
+            // block directly via putenv(): the environ entry then points at
+            // our buffer instead of a fresh glibc copy, so a re-export
+            // costs a memcpy into a buffer that is only realloc'd when the
+            // value grows. The block is intentionally never freed (the
+            // environment outlives every call, and putenv keeps the
+            // pointer); the name copy is owned by the same table.
             self.emit("static void _sh_export(const char *name, const char *val) {");
-            self.emit("  setenv(name, val ? val : \"\", 1);");
+            self.emit("  struct _sh_xe { char *n; char *blk; size_t cap; };");
+            self.emit("  static struct _sh_xe _xe[64];");
+            self.emit("  static int _xn = 0;");
+            self.emit("  const char *v = val ? val : \"\";");
+            self.emit("  size_t ln = strlen(name), lv = strlen(v);");
+            self.emit("  int k = -1;");
+            self.emit("  for (int i = 0; i < _xn; i++) if (strcmp(_xe[i].n, name) == 0) { k = i; break; }");
+            self.emit("  if (k < 0) {");
+            self.emit("    if (_xn >= 64) { setenv(name, v, 1); return; }");
+            self.emit("    k = _xn++; _xe[k].n = _sh_xstrdup(name); _xe[k].blk = 0; _xe[k].cap = 0;");
+            self.emit("  }");
+            self.emit("  if (lv + ln + 2 > _xe[k].cap) {");
+            self.emit("    _xe[k].cap = lv + ln + 2;");
+            self.emit("    _xe[k].blk = (char*)realloc(_xe[k].blk, _xe[k].cap);");
+            self.emit("    if (!_xe[k].blk) { fprintf(stderr, \"sh2c: out of memory\\n\"); exit(127); }");
+            self.emit("  }");
+            self.emit("  memcpy(_xe[k].blk, name, ln);");
+            self.emit("  _xe[k].blk[ln] = '=';");
+            self.emit("  memcpy(_xe[k].blk + ln + 1, v, lv + 1);");
+            self.emit("  unsetenv(name);");
+            self.emit("  putenv(_xe[k].blk);");
             self.emit("}");
             // getenv-or-empty as a HELPER, not an inline ternary. clang's
             // analyzer cannot correlate the two separate getenv() calls in
@@ -8945,8 +11756,14 @@ impl Render {
             self.emit("}");
             self.emit("/* assign into a read-loop var (char* slot; mstr vars use their own setter) */");
             self.emit("static void _sh_mstr_set_from(char **slot, const char *val) {");
-            self.emit("  /* no free: the slot may be a fixed buffer, not heap */");
-            self.emit("  *slot = val ? _sh_xstrdup(val) : \"\";");
+            self.emit("  /* Heap ownership like the scalar COPY path: decls are");
+            self.emit("     NULL-init'd and every write here strdups, so freeing");
+            self.emit("     the old value is safe — and required, else every");
+            self.emit("     loop iteration leaks the previous line. Always");
+            self.emit("     strdup (never store a \"\" literal) so the slot never");
+            self.emit("     aliases static storage a later free would fault on. */");
+            self.emit("  free(*slot);");
+            self.emit("  *slot = _sh_xstrdup(val ? val : \"\");");
             self.emit("}");
             self.emit("/* ${s#pat}/${s##pat} prefix strip (glob-aware, greedy = longest) */");
             self.emit("static char *_sh_strippre(_sh_vbuf *d, const char *s, const char *pat, int greedy) {");
@@ -9368,6 +12185,18 @@ impl Render {
                 let mut lines = std::mem::take(&mut pending);
                 lines.push(line.clone());
                 segs.push((sh_tokens(t).into_iter().collect(), lines));
+            } else if depth == 0 && t.starts_with('#') {
+                // Preprocessor lines carry no C tokens of their own:
+                // pend for the NEXT segment, which they belong to (the
+                // documented glue: `#define SH2_ARENA_CAP` travels with
+                // the `_sh_arena` typedef). Attaching to the previous
+                // segment dropped the define whenever that segment died
+                // while the typedef lived — any new `_sh_adup` user in a
+                // small render broke the build with a missing define.
+                // (The only `#` line inside the trimmed span today is
+                // that define; the `#include`s precede `runtime_start`
+                // and never reach this loop.)
+                pending.push(line.clone());
             } else if let Some(last) = segs.last_mut() {
                 last.1.push(line.clone());
             } else {
@@ -9377,15 +12206,27 @@ impl Render {
             depth += line.matches('{').count() as i64;
             depth -= line.matches('}').count() as i64;
         }
-
         let mut needed: BTreeSet<String> = sh_tokens(&body);
+        // EACH SEGMENT'S TOKEN SET IS STATIC, so tokenize every segment ONCE
+        // up front. The fixpoint below used to call
+        // `sh_tokens(&lines.join("\n"))` for every still-unreached segment on
+        // every iteration, and re-scan the whole (already-tokenized) segment
+        // each time: on a game-sized render (MIMEcroft_fb.sh, 1.1 MB of C)
+        // that was 3.3 s of the 6.9 s post-pass budget, all of it recomputing
+        // the same token sets. `lines.join("\n")` also re-allocated the whole
+        // segment text per visit. Precomputing turns the fixpoint into set
+        // operations over the same data.
+        let seg_tokens: Vec<BTreeSet<String>> = segs
+            .iter()
+            .map(|(_, lines)| sh_tokens(&lines.join("\n")))
+            .collect();
         let mut changed = true;
         while changed {
             changed = false;
-            for (names, lines) in &segs {
-                if names.iter().any(|n| needed.contains(n)) {
-                    for t in sh_tokens(&lines.join("\n")) {
-                        if needed.insert(t) {
+            for toks in &seg_tokens {
+                if toks.iter().any(|t| needed.contains(t)) {
+                    for t in toks {
+                        if needed.insert(t.clone()) {
                             changed = true;
                         }
                     }
@@ -9808,6 +12649,38 @@ impl Render {
             }
             true
         }
+        // name -> the line indices mentioning it (word-boundary), built once.
+        // Only `_s<digits>` names can be asked about, so the scan only records
+        // those — the same shape the per-temp search tested for.
+        let mut uses: HashMap<String, Vec<usize>> = HashMap::new();
+        for (k, l) in self.out.iter().enumerate() {
+            let b = l.as_bytes();
+            let mut j = 0;
+            while j < b.len() {
+                // find an `_s` at a word boundary
+                if b[j] == b'_'
+                    && j + 1 < b.len()
+                    && b[j + 1] == b's'
+                    && (j == 0 || !(b[j - 1].is_ascii_alphanumeric() || b[j - 1] == b'_'))
+                {
+                    let mut e = j + 2;
+                    while e < b.len() && b[e].is_ascii_digit() {
+                        e += 1;
+                    }
+                    // a name is `_s` + at least one digit, and must END at a
+                    // word boundary (`_s1x` is a different identifier)
+                    if e > j + 2
+                        && (e == b.len()
+                            || !(b[e].is_ascii_alphanumeric() || b[e] == b'_'))
+                    {
+                        uses.entry(l[j..e].to_string()).or_default().push(k);
+                        j = e;
+                        continue;
+                    }
+                }
+                j += 1;
+            }
+        }
         let mut drop = vec![false; self.out.len()];
         let mut i = 0;
         while i + 1 < self.out.len() {
@@ -9856,27 +12729,21 @@ impl Render {
             // case is keeping a temp alive that a smarter analysis would
             // drop (an unused `static char[32]` is dead weight, not a
             // miscompile), whereas dropping a live one is a hard error.
-            let used = self
-                .out
-                .iter()
-                .enumerate()
-                .filter(|(k, _)| *k != i && *k != i + 1)
-                .any(|(_, l)| {
-                // word-boundary match so `_s1` doesn't match `_s10`.
-                let mut k = 0;
-                let b = l.as_bytes();
-                let nb = nm.as_bytes();
-                while k + nb.len() <= b.len() {
-                    if &b[k..k + nb.len()] == nb
-                        && (k == 0 || !(b[k - 1].is_ascii_alphanumeric() || b[k - 1] == b'_'))
-                        && (k + nb.len() == b.len()
-                            || !(b[k + nb.len()].is_ascii_alphanumeric() || b[k + nb.len()] == b'_'))
-                    {
-                        return true;
-                    }
-                    k += 1;
-                }
-                false
+            // ONE PASS OVER THE OUTPUT, NOT ONE PER TEMP.
+            //
+            // The check is "does any line OTHER than this temp's two lines
+            // mention its name". Done inline it scanned the whole file for
+            // every temp — O(temps x lines) substring searches over the 26K-line
+            // render, which measured at **4.5 s**, more than half of
+            // shir_to_c's total: the single largest cost in C generation.
+            //
+            // Every name this pass can ask about is `_s<digits>`, so ONE scan
+            // of each line can record the names it mentions, and each temp
+            // then gets an O(1) (per-temp) answer. `owner` makes the
+            // "other than its own two lines" part explicit: a mention only
+            // counts when it comes from a line this temp does not own.
+            let used = uses.get(&nm).is_some_and(|owners| {
+                owners.iter().any(|&k| k != i && k != i + 1)
             });
             if !used {
                 drop[i] = true;
@@ -12440,7 +15307,7 @@ fn param_copy_alias(
         let mut alias: HashMap<usize, String> = HashMap::new();
         let mut skip: HashSet<usize> = HashSet::new();
         // first pass: the FIRST top-level copy per param wins the alias.
-        for (bi, st) in body.iter().enumerate() {
+        for st in body.iter() {
             if let IrStmt::Assign { targets, expr, .. } = st {
                 if targets.len() != 1 {
                     continue;
@@ -13676,7 +16543,7 @@ fn param_copy_alias(
         // forward declaration: a function may CALL another defined later
         // (nested defs are hoisted in collection order — 081 inner/outer)
         let sig = self.fn_c_sig(name, &fname, &param_alias);
-        if std::env::var("SH2_DBG_ARR").is_ok() { eprintln!("DBG sig {name}: {sig:?}"); }
+        if std::env::var("SH2_DBG_ARR").is_ok() { pdebug!("DBG sig {name}: {sig:?}"); }
         self.fn_fwd_decls.push(format!("{sig};"));
         self.emit(&format!("{sig} {{"));
         self.depth += 1;
@@ -13800,7 +16667,7 @@ fn param_copy_alias(
     #[track_caller]
     fn store_ref(&self, name: &str) -> String {
         if name == "h" || name == "c" {
-            eprintln!("DBG store_ref({}) from {}", name, std::panic::Location::caller());
+            pdebug!("DBG store_ref({}) from {}", name, std::panic::Location::caller());
         }
         // nameref: read ultimate target (BASHC_FIX typeset -n). Positional
         // params ($1…) never alias (skip resolve for digit names).
@@ -13996,6 +16863,29 @@ fn param_copy_alias(
         // would read a clobbered value on the next iteration.
         self.emit(&format!("static char {t}[32];"));
         self.emit(&format!("snprintf({t}, sizeof {t}, \"%lld\", (long long)({v}));"));
+        t
+    }
+
+    /// Native microsecond clock temp for `$EPOCHREALTIME` (bash
+    /// `secs.usecs` form) / `$EPOCHSECONDS` (`secs`). `static` like
+    /// `num_temp` (same aliasing discipline: consumed immediately by
+    /// the enclosing expression). Sets `need_time` (`time.h` for
+    /// `struct timespec`/`clock_gettime`; the sleep helper rides along
+    /// harmlessly). Deliberately NOT registered in `num_temp_bufs`
+    /// (that machinery assumes a pure value expression; the clock is
+    /// impure — fusing or CSE-ing it across reads would freeze time).
+    fn epoch_temp(&mut self, seconds_only: bool) -> String {
+        self.need_time = true;
+        let t = format!("_et{}", self.temp_seq);
+        self.temp_seq += 1;
+        let ts = format!("_tets{}", self.temp_seq);
+        self.temp_seq += 1;
+        self.emit(&format!("static char {t}[32];"));
+        if seconds_only {
+            self.emit(&format!("{{ struct timespec {ts}; clock_gettime(CLOCK_REALTIME, &{ts}); snprintf({t}, sizeof {t}, \"%lld\", (long long){ts}.tv_sec); }}"));
+        } else {
+            self.emit(&format!("{{ struct timespec {ts}; clock_gettime(CLOCK_REALTIME, &{ts}); snprintf({t}, sizeof {t}, \"%lld.%06lld\", (long long){ts}.tv_sec, (long long)({ts}.tv_nsec / 1000)); }}"));
+        }
         t
     }
 
@@ -14849,6 +17739,17 @@ fn param_copy_alias(
                         self.emit(&format!("_sh_argv_join(&{t});"));
                         return format!("{t}.p");
                     }
+                    // `$EPOCHREALTIME` / `$EPOCHSECONDS`: native clock
+                    // (CLOCK_REALTIME), bash's `secs.usecs` / `secs`
+                    // forms. Without this, reads fall to the environment
+                    // (always "") and callers fork `date` per read —
+                    // milliseconds each where this costs ~100ns (gtick
+                    // runs dozens of times per frame in games). Fresh on
+                    // every evaluation (impure like getpid() below —
+                    // never const-foldable, never hoistable).
+                    if name == "EPOCHREALTIME" || name == "EPOCHSECONDS" {
+                        return self.epoch_temp(name == "EPOCHSECONDS");
+                    }
                     if name.chars().all(|c| c.is_ascii_digit()) {
                         return self.positional_str_l(&name);
                     }
@@ -14941,7 +17842,7 @@ fn param_copy_alias(
                 }
                 "arith" => {
                     if std::env::var("SH2_DBG_VARS").is_ok() {
-                        eprintln!("DBG value_c arith s={:?}", Self::str_arg(args, 0));
+                        pdebug!("DBG value_c arith s={:?}", Self::str_arg(args, 0));
                     }
                     // VALUE context `x=$(( dyn ))`: NATIVE evaluation
                     // first (parse_arith → the typed arith renderer —
@@ -15068,9 +17969,29 @@ fn param_copy_alias(
             IrExpr::Str(s, _) => match s.trim().parse::<i64>() {
                 Ok(n) => n.to_string(),
                 Err(_) => {
+                    let t = s.trim();
+                    // A HEX LITERAL IS A NUMBER, and the fallback below is
+                    // `atoll`, which stops at the `x` and yields 0 — so
+                    // `fb_clear 0xFF204060` cleared to 0 (transparent black)
+                    // and every `fb_clear 0xFF000000` in MIMEcroft_fb.sh
+                    // silently emitted `atoll("0xFF000000")`. It looked
+                    // identical (opaque black vs black under a blit that
+                    // ignores alpha), which is why it survived. Parse it as
+                    // the integer it is written as.
+                    if let Some(hex) = t
+                        .strip_prefix("0x")
+                        .or_else(|| t.strip_prefix("0X"))
+                        .filter(|h| !h.is_empty() && h.chars().all(|c| c.is_ascii_hexdigit()))
+                    {
+                        if let Ok(n) = i64::from_str_radix(hex, 16) {
+                            return n.to_string();
+                        }
+                        // Wider than i64 (e.g. a 0xffffffffffffffff mask):
+                        // emit the C constant and let the C type carry it.
+                        return format!("0x{hex}");
+                    }
                     // `$i` / `${i}` slice-index text: resolve the live
                     // value (a literal atoll("$i") is always 0)
-                    let t = s.trim();
                     let name = t.strip_prefix('$').map(|r| r.trim_matches('{').trim_matches('}'));
                     if let Some(name) = name {
                         if is_ident(name)
@@ -15325,7 +18246,6 @@ fn param_copy_alias(
             _ => None,
         })?;
         let mut new_args = args;
-        let mut written: BTreeSet<String> = BTreeSet::new();
         let mut written: BTreeSet<String> = BTreeSet::new();
         lic_writes_stmts(body, &mut written).ok()?;
         // Atomicity gate first (see doc above).
@@ -16377,7 +19297,7 @@ fn param_copy_alias(
         };
         fn expr_needs_group(e: &IrExpr) -> bool {
             match e {
-                IrExpr::Call { func, args } if func == "and" || func == "or" => true,
+                IrExpr::Call { func, .. } if func == "and" || func == "or" => true,
                 IrExpr::Call { func, args } if func == "redirect" => args
                     .first()
                     .and_then(|a| match a {
@@ -17087,7 +20007,7 @@ fn param_copy_alias(
                 )];
                 self.sh_pipeline_text(crate::c_backend::CmdBuf::Shared, &args_v);
 
-                let body_lines = std::mem::replace(&mut self.out, saved);
+                let _body_lines = std::mem::replace(&mut self.out, saved);
                 self.depth = saved_depth;
 
                 // Build site: popen the pipeline text, read lines natively
@@ -18133,9 +21053,17 @@ fn param_copy_alias(
                                 self.arrays.insert(var.clone());
                                 let id = self.c_ident(&var);
                                 if let Ok(i) = key.parse::<i64>() {
-                                    self.emit(&format!(
-                                        "if ({i} < {id}_len) {id}[{i}] = 0;"
-                                    ));
+                                    // free the dropped slot before clearing
+                                    // (a bare `= 0` orphaned its string)
+                                    if self.is_string_array(&var) {
+                                        self.emit(&format!(
+                                            "if ({i} < {id}_len) {{ free({id}[{i}]); {id}[{i}] = 0; }}"
+                                        ));
+                                    } else {
+                                        self.emit(&format!(
+                                            "if ({i} < {id}_len) {id}[{i}] = 0;"
+                                        ));
+                                    }
                                 }
                                 continue;
                             }
@@ -18145,6 +21073,12 @@ fn param_copy_alias(
                             if self.assoc_arrays.contains(&name) {
                                 self.emit(&format!("{id}_n = 0;"));
                             } else {
+                                // `unset arr` drops every element — free the
+                                // string slots first (a plain `_len = 0`
+                                // orphaned them).
+                                if self.is_string_array(&name) {
+                                    self.emit(&format!("for (size_t _fi = 0; _fi < {id}_len; _fi++) free({id}[_fi]);"));
+                                }
                                 self.emit(&format!("{id}_len = 0;"));
                             }
                         } else if !self.is_num(&name) {
@@ -18493,6 +21427,12 @@ fn param_copy_alias(
                 return self.shell_exec(args);
             }
             _ if self.functions.contains(&cmd) => {
+                // take-field fusion (see `collect_take_fields`): a call
+                // to a grab+consume reader renders as one inline take
+                // instead of a grab, a call, and a strip loop.
+                if let Some(fused) = self.take_field_opt(&cmd, &words) {
+                    return fused;
+                }
                 // a defined shell function's call; the body's last command
                 // sets _sh_rc, so `(f(), _sh_rc)` is the function's status.
                 // The call args become the function's positional params:
@@ -18679,6 +21619,19 @@ fn param_copy_alias(
     /// destructively strippable (see the exec_call note). Matched on
     /// the head of the rendered call, exactly as `fb_status` is.
     fn fb_is_void(call: &str) -> bool {
+        // MUST MIRROR runtime/fbdev.h. A void primitive left off this
+        // list is emitted as `_sh_rc = (fb_...(…))` — "void value not
+        // ignored as it ought to be", a hard compile failure (measured:
+        // fb_frag_flags/fb_frag_view, which MIMEcroft's
+        // emit_fragment_shader calls every frame). Conversely an INT
+        // primitive wrongly listed here is emitted bare, so its return
+        // value is silently discarded and the `, _sh_rc == 0` verdict
+        // the command emitter appends reads a stale rc.
+        //
+        // fb_overlay_alpha / fb_overlay_layer_alpha are declared `int`
+        // (they return the alpha they set); fb_frag_color is `void`
+        // like its two siblings. `grep '^void fb_' runtime/fbdev.h`
+        // is the authority whenever the device gains a primitive.
         matches!(
             call.split('(').next().unwrap_or(call),
             "fb_clear"
@@ -18686,8 +21639,9 @@ fn param_copy_alias(
                 | "fb_set_camera"
                 | "fb_overlay"
                 | "fb_overlay_flash"
-                | "fb_overlay_alpha"
-                | "fb_overlay_layer_alpha"
+                | "fb_frag_flags"
+                | "fb_frag_view"
+                | "fb_frag_color"
         )
     }
 
@@ -18759,6 +21713,84 @@ fn param_copy_alias(
             },
             _ => false,
         }
+    }
+
+    /// The take-field block shared by both spellings (function-call
+    /// fusion and the `TakeFieldNode` render arm): one scan (strchr) +
+    /// two fresh copies (field, remainder). One block: the swap reads
+    /// the temps, so everything shares a scope.
+    ///
+    /// Lifecycle mirrors `emit_owned_store`: fresh buffers are computed
+    /// first (the source is untouched during the read), then heap-store
+    /// vars swap-and-free their olds while the others keep today's leak
+    /// parity. Both vars join `store` first: the fused assigns replace
+    /// plain assigns that would have registered them, and later reads
+    /// must see known shell vars (direct reads) rather than the
+    /// environment fallback (`_sh_env` → `""`), with free-wrap on
+    /// reassign — exactly as the originals.
+    fn emit_take_block(&mut self, x: &str, s: &str, delim: u8) {
+        self.need_sh = true;
+        self.store.insert(x.to_string());
+        self.store.insert(s.to_string());
+        let t = self.temp_seq;
+        self.temp_seq += 1;
+        // `xi` is unused: the fused block below keys on `si` alone.
+        let _xi = self.c_ident(x);
+        let si = self.c_ident(s);
+        let mut block = format!(
+            "{{ const char *_tt{t} = ({si} ? {si} : \"\"); \
+             const char *_td{t} = strchr(_tt{t}, (char)0x{delim:02x}); \
+             size_t _tn{t} = _td{t} ? (size_t)(_td{t} - _tt{t}) : strlen(_tt{t}); \
+             static _sh_vbuf _v{t} = {{0, 0}}; \
+             _sh_vgrow(&_v{t}, _tn{t}+1); memcpy(_v{t}.p, _tt{t}, _tn{t}); _v{t}.p[_tn{t}] = 0; \
+             char *_nx{t} = _sh_xstrdup(_v{t}.p); \
+             char *_ns{t} = _sh_xstrdup(_td{t} ? _td{t}+1 : \"\");",
+            delim = delim
+        );
+        for (var, tmp) in [(x, format!("_nx{t}")), (s, format!("_ns{t}"))] {
+            let id = self.c_ident(var);
+            // Shell idents are C-safe; the suffix keeps the two swaps'
+            // temps distinct inside the shared block.
+            let old = format!("_o{t}_{var}");
+            if self.is_heap_store_var(var) {
+                block.push_str(&format!(
+                    " {{ char *{old} = {id}; {id} = {tmp}; free({old}); }}"
+                ));
+            } else {
+                block.push_str(&format!(" {id} = {tmp};"));
+            }
+        }
+        block.push_str(" }");
+        self.emit(&block);
+    }
+
+    /// A call to a take-field reader (`read_tex_field` with no args):
+    /// inline the whole grab+consume as one take-field block. The
+    /// returned expression matches the plain-call contract (`_sh_rc ==
+    /// 0` after; the original's last executed statement is always an
+    /// assign): statement and condition positions both behave.
+    ///
+    /// The `done`/`probe` post-state goes through the standard assign
+    /// path, so types, exports and const-lifting match the loop's own
+    /// assigns exactly.
+    fn take_field_opt(&mut self, cmd: &str, words: &[&IrExpr]) -> Option<String> {
+        let tf = self.take_fields.get(cmd)?.clone();
+        if !words.is_empty() {
+            return None;
+        }
+        self.emit_take_block(&tf.x.clone(), &tf.s.clone(), tf.delim);
+        for (var, val) in [(&tf.done, "1"), (&tf.probe, "")] {
+            self.stmt(&IrStmt::Assign {
+                targets: vec![crate::ir::AssignTarget {
+                    var: var.clone(),
+                    sigil: None,
+                    indices: vec![],
+                }],
+                expr: IrExpr::Str(val.to_string(), crate::ir::StrStyle::DoubleQuoted),
+                asm: None,
+            });
+        }
+        Some("(_sh_rc = 0, _sh_rc == 0)".to_string())
     }
 
     fn fb_call_opt(&mut self, cmd: &str, args: &[IrExpr]) -> Option<String> {
@@ -18848,6 +21880,17 @@ fn param_copy_alias(
             // changes. Both return the device's own static buffer,
             // which is the lifetime a capture helper's result has.
             "fb_window_key" => Some(("fb_window_key", 0)),
+            // the SURFACE SIZE, as "WxH". fbdev.h documents this as a
+            // return string precisely so a caller can capture it
+            // (`sz=$(fb_size)`), and MIMEcroft's DISPLAY row does — the
+            // AUTO/FULL cases ask the device what it actually got,
+            // because the fragment stage's vignette needs the real
+            // canvas width. Left as a statement-only primitive the
+            // capture fell to a `bash -c 'fb_size'` site, whose child
+            // has no such command: the size came back EMPTY, AUTO
+            // resolved to nothing, and every frame's vignette centred on
+            // 0x0.
+            "fb_size" => Some(("fb_size", 0)),
             _ => None,
         }
     }
@@ -20525,7 +23568,7 @@ fn param_copy_alias(
         let after_specials = self.arith_subst_specials_l(s);
         let pre_sub = subst_array_counts(&after_specials);
         if std::env::var("SH2_DBG_VARS").is_ok() {
-            eprintln!("DBG arith_text s={s} after_specials={after_specials} pre_sub={pre_sub}");
+            pdebug!("DBG arith_text s={s} after_specials={after_specials} pre_sub={pre_sub}");
         }
         for tok in pre_sub.split(|c: char| !c.is_ascii_alphanumeric() && c != '_') {
             if let Some(name) = tok.strip_prefix("__SHCNT_") {
@@ -22327,6 +25370,17 @@ fn param_copy_alias(
                     self.num_temp(&self.c_ident(name))
                 } else if self.store.contains(name) {
                     self.store_ref(name)
+                } else if !name.is_empty() && name.chars().all(|c| c.is_ascii_digit()) {
+                    // positional $N in a `[ ]` operand (`[ "$1" = x ]`):
+                    // the greedy scan above would otherwise shadow the
+                    // specials arm below and read getenv("1") (always
+                    // empty) — the game's --demo flag never arrived.
+                    // Same argv shape that arm uses.
+                    self.need_sh = true;
+                    format!(
+                        "(({0} < _sh_argc && _sh_argv[{0}]) ? _sh_argv[{0}] : \"\")",
+                        name
+                    )
                 } else {
                     format!(
                         "_sh_env({})",
@@ -22567,7 +25621,7 @@ fn param_copy_alias(
             return "0".into();
         };
         if std::env::var("SH2_DBG_PARAMS").is_ok() {
-            eprintln!("DBG param_call op={op:?} name={:?} nargs={}", Self::str_arg(args, 1), args.len());
+            pdebug!("DBG param_call op={op:?} name={:?} nargs={}", Self::str_arg(args, 1), args.len());
         }
         let Some(mut name) = Self::str_arg(args, 1) else {
             return "0".into();
@@ -22812,7 +25866,7 @@ fn param_copy_alias(
             .map(|x| self.default_word(x))
             .unwrap_or_else(|| "\"\"".into());
         if std::env::var("SH2_DBG_PARAMS").is_ok() {
-            eprintln!("DBG pre-match op={op:?} vexpr_arrget={}", var_expr.contains("_sh_arr_get"));
+            pdebug!("DBG pre-match op={op:?} vexpr_arrget={}", var_expr.contains("_sh_arr_get"));
         }
         // BASHC_OPT item 63: `(V && V[0])` with V a proven-nonnull
         // bare ident → `(V[0])` (the && only guards NULL via
@@ -22848,7 +25902,7 @@ fn param_copy_alias(
             }
             "#" | "#:" | "##" | "##:" => {
                 if std::env::var("SH2_DBG_PARAMS").is_ok() {
-                    eprintln!("DBG # arm fired name={name:?} pat={:?}", Self::str_arg(args, 2));
+                    pdebug!("DBG # arm fired name={name:?} pat={:?}", Self::str_arg(args, 2));
                 }
                 let pat = Self::str_arg(args, 2).unwrap_or_default();
                 self.need_sh = true;
@@ -23085,6 +26139,12 @@ fn param_copy_alias(
                     let t = self.vbuf_temp();
                     self.emit(&format!("_sh_argv_join(&{t});"));
                     return format!("{t}.p");
+                }
+                // `$EPOCHREALTIME` / `$EPOCHSECONDS`: native clock (see
+                // the value_c arm — same contract: fresh temp per
+                // evaluation, impure, never folded).
+                if name == "EPOCHREALTIME" || name == "EPOCHSECONDS" {
+                    return self.epoch_temp(name == "EPOCHSECONDS");
                 }
                 if name.chars().all(|c| c.is_ascii_digit()) {
                     // positional $N — a lifted fn's C param or the argv
@@ -24392,7 +27452,10 @@ fn param_copy_alias(
         let store = if self.int_arrays.contains(var) {
             format!("{id}[_kk{seq}] = (long long)atoll(_vv{seq});")
         } else {
-            format!("{id}[_kk{seq}] = _sh_xstrdup(_vv{seq});")
+            // copy first, then free the old slot: _vv may alias this
+            // very slot (`a[k]=...${a[k]}...`), and the grower zeroes
+            // unwritten slots, so the free never touches garbage.
+            format!("{{ char *_nv{seq} = _sh_xstrdup(_vv{seq}); free({id}[_kk{seq}]); {id}[_kk{seq}] = _nv{seq}; }}")
         };
         // Bulk-len mode: the loop epilogue sets len = max(len, need),
         // so per-store len traffic goes quiet (callers prove this store
@@ -24455,7 +27518,7 @@ fn param_copy_alias(
         // and every set-call guard agree via array_cap
         let acap = self.array_cap(var);
         let v = self.value_c(val);
-        if let IrExpr::Interpolate(parts) = key {
+        if let IrExpr::Interpolate(_parts) = key {
             // an Interpolate KEY (e.g. `m["${flags:j:1}"]=v` arrives as
             // Lit('"') + expr + Lit('"'))): concatenate the part VALUES
             // into a temp and use it as the assoc key
@@ -24658,9 +27721,9 @@ fn param_copy_alias(
             }
         };
         let n = items.len();
-        // redefine clears: free orphaned string elements for vecs (see
-        // emit_set_array)
-        if self.vec_arrays.contains(arr) && !self.int_arrays.contains(arr) {
+        // redefine clears: free orphaned string elements for string
+        // arrays (fixed AND vec — see emit_set_array)
+        if self.is_string_array(arr) {
             self.emit(&format!("for (size_t _fi = 0; _fi < {id}_len; _fi++) free({id}[_fi]);"));
         }
         self.emit(&format!("{id}_len = 0;"));
@@ -24858,10 +27921,16 @@ fn param_copy_alias(
         // empty literal (`arr=()`) clears a previously-populated array
         // (the item loop below re-sets _len per element; without this a
         // function-local array reused across calls keeps its old length).
-        // A string vec frees its orphaned elements first (fixed arrays
-        // leak them — pre-existing; a vec redefine in a loop would leak
-        // unboundedly and trip LSan).
-        if self.vec_arrays.contains(var) && !self.int_arrays.contains(var) {
+        // A string array frees its orphaned elements first. This used to
+        // be vec-only, with the comment "fixed arrays leak them —
+        // pre-existing"; that leak is real and observable: a capped array
+        // re-literalized per call (`lgi=(...)` in label_glyphs runs once
+        // per glyph) overwrote `_len` slots and dropped the old strings
+        // forever. LSan on MIMEcroft_fb points straight at it (`_sh_xstrdup`
+        // -> label_glyphs -> gen_label_tex -> load_labels). Fixed arrays
+        // are `static char *a[cap] = {0}` (zero-init, so the first free is
+        // a no-op) exactly like the vec case, so the same loop is safe.
+        if self.is_string_array(var) {
             self.emit(&format!("for (size_t _fi = 0; _fi < {id}_len; _fi++) free({id}[_fi]);"));
         }
         self.emit(&format!("{id}_len = 0;"));
@@ -24969,6 +28038,19 @@ fn param_copy_alias(
             return self.int_array_widths.get(var).copied().unwrap_or(Width::I64).suffix();
         }
         "str"
+    }
+
+    /// Does this array own a heap `char*` per element (so a bulk redefine
+    /// must `free` the old slots)? False for int arrays (inline values),
+    /// the `mpz_t[]` array-return arrays (mpz_clear, not free) and assoc
+    /// arrays (`_k`/`_v` pairs, handled by `_sh_assoc_set`). Every string
+    /// array — fixed `char *a[cap]` AND growable `char **a` — is
+    /// `_sh_xstrdup`-stored and zero-initialized, so `free(a[i])` is
+    /// always safe for `i < a_len`.
+    fn is_string_array(&self, var: &str) -> bool {
+        !self.int_arrays.contains(var)
+            && !self.assoc_arrays.contains(var)
+            && !self.array_return_arrays.values().any(|ra| ra == var)
     }
 
 
@@ -26424,12 +29506,19 @@ fn param_copy_alias(
                                 self.emit("}");
                             }
                             Some(s) if s.is_empty() => {
-                                // IFS= : raw whole line to the FIRST var
+                                // IFS= : raw whole line to the FIRST var.
+                                // Free-then-assign per iteration: the loop
+                                // body runs per line, so a bare strdup
+                                // leaks every previous line. Decls are
+                                // NULL-init'd, so the first free is safe;
+                                // strdup-then-free keeps `v="$v.."`-style
+                                // self-reference safe (same discipline as
+                                // the scalar COPY path).
                                 let vid = self.c_ident(&vars_c[0]);
-                                self.emit(&format!("{vid} = _sh_xstrdup(_rl{id}.p);"));
-                                for (vi, v) in vars_c.iter().enumerate().skip(1) {
+                                self.emit(&format!("{{ char *_old = {vid}; {vid} = _sh_xstrdup(_rl{id}.p); free(_old); }}"));
+                                for v in vars_c.iter().skip(1) {
                                     let vid2 = self.c_ident(v);
-                                    self.emit(&format!("{vid2} = _sh_xstrdup(\"\");"));
+                                    self.emit(&format!("{{ char *_old = {vid2}; {vid2} = _sh_xstrdup(\"\"); free(_old); }}"));
                                 }
                             }
                             Some(cs) => {
@@ -26565,16 +29654,19 @@ fn param_copy_alias(
                                     "{{ size_t _sk{id} = 0; while (_rl{id}.p[_sk{id}] == ' ' || _rl{id}.p[_sk{id}] == '\\t') _sk{id}++; if (_sk{id}) memmove(_rl{id}.p, _rl{id}.p + _sk{id}, strlen(_rl{id}.p + _sk{id}) + 1); }}"
                                 ));
                                 let vid = self.c_ident(&vars_c[0]);
-                                self.emit(&format!("{vid} = _sh_xstrdup(_rl{id}.p);"));
+                                // Free-then-assign per iteration (see the
+                                // sibling IFS= arm above): a bare strdup
+                                // leaks the previous line on every pass.
+                                self.emit(&format!("{{ char *_old = {vid}; {vid} = _sh_xstrdup(_rl{id}.p); free(_old); }}"));
                             }
                             Some(s) if s.is_empty() => {
                                 let vid = self.c_ident(&vars_c[0]);
-                                self.emit(&format!("{vid} = _sh_xstrdup(_rl{id}.p);"));
+                                self.emit(&format!("{{ char *_old = {vid}; {vid} = _sh_xstrdup(_rl{id}.p); free(_old); }}"));
                             }
                             Some(cs) if nv == 1 => {
                                 let vid = self.c_ident(&vars_c[0]);
                                 self.emit(&format!(
-                                    "{{ char *_d = strchr(_rl{id}.p, {cs_byte}); if (_d) *_d = 0; {vid} = _sh_xstrdup(_rl{id}.p); }}",
+                                    "{{ char *_d = strchr(_rl{id}.p, {cs_byte}); if (_d) *_d = 0; {{ char *_old = {vid}; {vid} = _sh_xstrdup(_rl{id}.p); free(_old); }} }}",
                                     cs_byte = cs.as_bytes()[0]
                                 ));
                             }
@@ -27478,6 +30570,42 @@ fn param_copy_alias(
                 }
                 let is_num = self.is_num(&t.var);
                 let is_float = self.is_float(&t.var);
+                // SELF-APPEND fast path (`v="$v<segs>"`): grow `v` in
+                // place (geometric realloc) instead of snprintf-temp +
+                // xstrdup + free (quadratic allocs/copies, plus a leak
+                // for function-scope vars). Placed BEFORE any rhs
+                // rendering so no dead temp is emitted. Every guard the
+                // plain COPY path relies on is either established above
+                // (single plain-scalar target at entry; const/bigint/
+                // typeset-arith/buf early-outs) or re-checked here
+                // (numeric/float, L/U case attrs, managed/bigint
+                // stores). `SH2_NO_GROWTH=1` disables it without a
+                // rebuild (bisecting a suspect growth). The tail
+                // (nonnull proof + export re-sync) mirrors the COPY
+                // branch exactly; nothing else in this arm touches
+                // `_sh_rc`, so status behavior is unchanged.
+                if std::env::var("SH2_NO_GROWTH").map(|v| v != "1").unwrap_or(true)
+                    && !is_num
+                    && !is_float
+                    && targets.len() == 1
+                    && t.indices.is_empty()
+                    && (self.typeset_attrs.get(&t.var).copied().unwrap_or(0) & 0b110) == 0
+                    && !self.managed_strings.contains(&t.var)
+                    && !self.bigint_vars.contains(&t.var)
+                {
+                    if let Some(seg_expr) = self_append_segs(&t.var, expr) {
+                        let seg = self.expr(&seg_expr);
+                        let tc = self.temp_seq;
+                        self.temp_seq += 1;
+                        let nid = self.c_ident(&t.var);
+                        self.emit(&format!("{{ size_t _o{tc} = ({nid}) ? strlen({nid}) : 0; size_t _n{tc} = strlen({seg}); char *_np{tc} = (char*)realloc(({nid}), (_o{tc} + _n{tc} + 1) * 2); if (!_np{tc}) {{ fprintf(stderr, \"sh2c: out of memory\\n\"); exit(127); }} ({nid}) = _np{tc}; memcpy(({nid}) + _o{tc}, {seg}, _n{tc} + 1); }}"));
+                        if !self.fn_written.contains(&t.var) {
+                            self.nonnull_var.insert(nid.clone());
+                        }
+                        self.emit_export_var(&t.var);
+                        return;
+                    }
+                }
                 let rhs = if is_float {
                     self.float_rhs(expr)
                 } else if is_num {
@@ -27593,15 +30721,15 @@ fn param_copy_alias(
                         // free-before left the var dangling across RHS
                         // evaluation — captures read it via exports).
                         // Temp-swap is self-ref safe, so no text guard.
-                        // Applies to FILE-SCOPE vars (reassigned across
-                        // calls); end-of-main/end-of-fn free owns LAST.
-                        if self.top_vars.contains(&t.var) {
-                            let old = format!("_old{}", self.temp_seq);
-                            self.temp_seq += 1;
-                            self.emit(&format!("{{ char *{old} = {name}; {name} = _sh_xstrdup((char*)({rhs})); free({old}); }}"));
-                        } else {
-                            self.emit(&format!("{name} = _sh_xstrdup((char*)({rhs}));"));
-                        }
+                        // Applies to ALL heap-store vars, not just
+                        // top-level: function-scope strings reassigned
+                        // per call/loop leaked every previous value
+                        // (the rasterizer's per-pixel row copies).
+                        // Decls are NULL-init'd, so the first free is a
+                        // no-op; end-of-main/end-of-fn free owns LAST.
+                        let old = format!("_old{}", self.temp_seq);
+                        self.temp_seq += 1;
+                        self.emit(&format!("{{ char *{old} = {name}; {name} = _sh_xstrdup((char*)({rhs})); free({old}); }}"));
                         // P1 follow-up: _sh_xstrdup aborts on OOM, so the
                         // fresh copy is non-NULL by construction (plus
                         // fn-written gate).
@@ -27666,8 +30794,14 @@ fn param_copy_alias(
                                         &format!("(char*)({v})"),
                                     );
                                 } else {
+                                    // heap char*: free the old value via
+                                    // temp swap (same as the assign path —
+                                    // a `local x=...` in a loop leaks
+                                    // otherwise); decls are NULL-init'd.
+                                    let old = format!("_old{}", self.temp_seq);
+                                    self.temp_seq += 1;
                                     self.emit(&format!(
-                                        "{name} = _sh_xstrdup((char*)({v}));"
+                                        "{{ char *{old} = {name}; {name} = _sh_xstrdup((char*)({v})); free({old}); }}"
                                     ));
                                 }
                             }
@@ -28971,6 +32105,18 @@ fn param_copy_alias(
             IrStmt::DeclareArray { var, elements, .. } => {
                 self.arrays.insert(var.clone());
                 let id = self.c_ident(var);
+                // A re-declaration REPLACES the array (`declare -a x=(...)`
+                // in a loop / twice in one function body). Free the string
+                // elements the old length owns before the stores below
+                // overwrite the slots — the stores strdup into `[0..n)`
+                // and would otherwise orphan everything the previous
+                // population held. Also shortens `_len` below when the new
+                // literal is shorter, so the freed prefix is exactly the
+                // dropped set.
+                if self.is_string_array(var) {
+                    self.emit(&format!("for (size_t _fi = 0; _fi < {id}_len; _fi++) free({id}[_fi]);"));
+                    self.emit(&format!("{id}_len = 0;"));
+                }
                 // P1: the literal indices are compile-time constants — a
                 // literal longer than the fixed [ARR_CAP] decl is a
                 // statically-known overflow, so refuse without emitting
@@ -28984,8 +32130,7 @@ fn param_copy_alias(
                     let v = self.value_c(e);
                     self.emit(&format!("{id}[{i}] = _sh_xstrdup((char*)({v}));"));
                 }
-                self.emit(&format!("{id}_len = {};", elements.len()));
-            }
+                self.emit(&format!("{id}_len = {};", elements.len()));            }
             IrStmt::Exec { cmd, args, capture, redirects, .. } => {
                 let mut call_args = vec![cmd.clone()];
                 call_args.push(IrExpr::Array(args.clone()));
@@ -29270,6 +32415,21 @@ fn param_copy_alias(
                 self.emit("  }");
                 self.emit("}");
             }
+            // TAKE-FIELD node (the inline grab+strip fusion pre-pass):
+            // one take block plus the `_sh_rc = 0` the two assigns set.
+            // Statement position only — the pre-pass never creates one
+            // anywhere else. Exports re-sync like the Assign path (a
+            // sticky-exported cursor must stay visible to children).
+            IrStmt::Ext(ref node) if node.tag() == "TakeField" => {
+                let tf = node
+                    .as_any()
+                    .downcast_ref::<TakeFieldNode>()
+                    .expect("tag/type agree");
+                self.emit_take_block(&tf.x, &tf.s, tf.delim);
+                self.emit_export_var(&tf.x);
+                self.emit_export_var(&tf.s);
+                self.emit("_sh_rc = 0;");
+            }
             IrStmt::Try { body, excepts, else_body, finally_body } => {
                 // P1 follow-up: exceptional paths may reassign — drop
                 // proofs (see Case).
@@ -29482,6 +32642,61 @@ fn param_copy_alias(
                 }
                 format!("(long long)atoll({})", self.expr(e))
             }
+            IrExpr::Call { func, args } if func == "arrayIndex" => {
+                // numeric-context element read of an int-homed array:
+                // the native slot directly (no num_temp/atoll
+                // round-trip). Out-of-bounds reads yield 0, exactly
+                // what the string form's `atoll("")` observes — the
+                // len guard below is the same one `array_index_read`
+                // emits, so the two arms can never disagree. Over a
+                // string array, fall through to the string form.
+                if let Some(name) = Self::str_arg(args, 0) {
+                    if self.int_arrays.contains(&name) {
+                        let id = self.c_ident(&name);
+                        // constant key: the guarded native read
+                        if let Some(IrExpr::Str(k, _)) = args.get(1) {
+                            if let Ok(i) = k.trim().parse::<i64>() {
+                                return format!(
+                                    "(({i} >= 0 && {i} < (long long){id}_len) ? (long long)({id}[{i}]) : 0LL)"
+                                );
+                            }
+                        }
+                        // dynamic key: evaluate once into a temp (same
+                        // shape as `array_index_read`'s dynamic arm),
+                        // then the guarded native read.
+                        let kt = format!("_ak{}", self.temp_seq);
+                        self.temp_seq += 1;
+                        let key_c = match args.get(1) {
+                            // "$v" texts read the var (atoll("$v")
+                            // would parse the literal dollar-text).
+                            Some(IrExpr::Str(k, _)) => {
+                                let t = k.trim();
+                                let v = t
+                                    .strip_prefix('$')
+                                    .unwrap_or(t)
+                                    .trim_start_matches('{')
+                                    .trim_end_matches('}');
+                                if crate::c_backend::is_ident(v) {
+                                    if self.is_num(v) {
+                                        format!("(long long)({})", self.c_ident(v))
+                                    } else {
+                                        format!("(long long)atoll({})", self.store_read(v))
+                                    }
+                                } else {
+                                    format!("(long long)({})", self.value_ll(args.get(1).unwrap()))
+                                }
+                            }
+                            Some(k) => format!("(long long)({})", self.value_ll(k)),
+                            None => "0".to_string(),
+                        };
+                        self.emit(&format!("long long {kt} = {key_c};"));
+                        return format!(
+                            "(({kt} >= 0 && {kt} < (long long){id}_len) ? (long long)({id}[{kt}]) : 0LL)"
+                        );
+                    }
+                }
+                format!("(long long)atoll({})", self.expr(e))
+            }
             _ => self.expr(e),
         }
     }
@@ -29497,7 +32712,7 @@ fn param_copy_alias(
         let mut vars: BTreeSet<String> = BTreeSet::new();
         let mut for_vars: BTreeSet<String> = BTreeSet::new();
         if std::env::var("SH2_DBG_VARS").is_ok() {
-            eprintln!("DBG program stmts={} first={:?}", prog.stmts.len(), prog.stmts.first().map(std::mem::discriminant));
+            pdebug!("DBG program stmts={} first={:?}", prog.stmts.len(), prog.stmts.first().map(std::mem::discriminant));
         }
         collect_vars_full(&prog.stmts, &mut vars, &mut for_vars);
         self.top_vars = vars.clone();
@@ -29662,7 +32877,6 @@ fn param_copy_alias(
             vars.remove(v);
         }
         let _ = &for_vars;
-
         // Pass 2: render the body first (helper flags known before
         // preamble). The var DECLARATIONS go into a separate preamble
         // buffer as FILE-SCOPE statics — the _sh_site_N/_cap_N helper
@@ -29704,16 +32918,16 @@ fn param_copy_alias(
         self.array_declared = self.arrays.clone();
         self.array_decls_done = true;
         for a in &arrays {
-            if std::env::var("SH2_DBG_ARR").is_ok() { eprintln!("DBG decl array {a}"); }
+            if std::env::var("SH2_DBG_ARR").is_ok() { pdebug!("DBG decl array {a}"); }
             let id = self.c_ident(a);
             if self.assoc_arrays.contains(a) {
-                if std::env::var("SH2_DBG_ARR").is_ok() { eprintln!("DBG {a} assoc"); }
+                if std::env::var("SH2_DBG_ARR").is_ok() { pdebug!("DBG {a} assoc"); }
                 let acap = self.array_cap(a);
                 self.emit(&format!("static char *{id}_k[{acap}] = {{0}};"));
                 self.emit(&format!("static char *{id}_v[{acap}] = {{0}};"));
                 self.emit(&format!("static size_t {id}_n = 0;"));
             } else if self.array_return_arrays.values().any(|ra| ra == a) {
-                if std::env::var("SH2_DBG_ARR").is_ok() { eprintln!("DBG {a} arr_ret"); }
+                if std::env::var("SH2_DBG_ARR").is_ok() { pdebug!("DBG {a} arr_ret"); }
                 // the return array of an array-return function: mpz_t[]
                 self.emit(&format!("static mpz_t {id}[{ARR_CAP}];"));
                 self.emit(&format!("static size_t {id}_len = 0;"));
@@ -29775,7 +32989,7 @@ fn param_copy_alias(
             self.emit("");
         }
         if std::env::var("SH2_DBG_VARS").is_ok() {
-            eprintln!("DBG vars={:?} store={:?} lifted={:?}", vars, self.store, self.const_lifted);
+            pdebug!("DBG vars={:?} store={:?} lifted={:?}", vars, self.store, self.const_lifted);
         }
         for v in &vars {
             // record the emitted file-decl lines per var: the
@@ -29835,7 +33049,7 @@ fn param_copy_alias(
         let lifetimes = self.var_lifetimes.clone();
         for (name, lt) in &lifetimes {
             if std::env::var("SH2_DBG_FREE").is_ok() {
-                eprintln!("DBG free {name}: esc={} store={} top={}", lt.escapes, self.store.contains(name), self.top_vars.contains(name));
+                pdebug!("DBG free {name}: esc={} store={} top={}", lt.escapes, self.store.contains(name), self.top_vars.contains(name));
             }
             if !lt.escapes && self.top_vars.contains(name) && self.is_heap_store_var(name) {
                 self.emit(&format!("free({});", self.c_ident(name)));
@@ -31247,7 +34461,7 @@ fn analyze_native_num_fns(prog: &IrProgram) -> BTreeSet<String> {
                     Some(IrType::Int | IrType::Int32 | IrType::Int64 | IrType::UInt32 | IrType::UInt64)
                 )
             });
-        if std::env::var("SH2_DBG_W").is_ok() { eprintln!("DBG {name}: all_num={all_num} bigint_arith={} calls_small={}", body_has_bigint_arith(body, &bigint), fn_call_sites_small(name, &prog.stmts, &bigint)); }
+        if std::env::var("SH2_DBG_W").is_ok() { pdebug!("DBG {name}: all_num={all_num} bigint_arith={} calls_small={}", body_has_bigint_arith(body, &bigint), fn_call_sites_small(name, &prog.stmts, &bigint)); }
         if !all_num {
             continue;
         }
@@ -32045,7 +35259,12 @@ fn pos_scan_arith(a: &ArithAst, fname: &str, defs: &BTreeMap<String, usize>, st:
     }
 }
 
-fn spawn_free_inline(fname: &str, defs: &BTreeMap<String, usize>) -> bool {
+// `_defs`: the predicate is exactly "there is no enclosing lifted function"
+// (a spawn-context positional read is free only then). The parameter is kept
+// because every caller threads the same context as pos_scan_arith, whose
+// OTHER branch does read `defs` — dropping it here would make the two arms
+// of one decision take different shapes for no gain.
+fn spawn_free_inline(fname: &str, _defs: &BTreeMap<String, usize>) -> bool {
     fname.is_empty()
 }
 
@@ -32897,16 +36116,26 @@ fn trigger_used(full: &str, tr: &str) -> bool {
     if t.is_empty() || t.len() > b.len() {
         return false;
     }
-    let mut i = 0;
-    while i + t.len() <= b.len() {
+    // ANCHOR ON THE FIRST BYTE. The old loop matched at every offset, so a
+    // 195-entry trigger table against a 1.1 MB render was ~215 MB of
+    // one-byte-at-a-time comparison (measured: 0.60 s, the largest single
+    // pass left in the render). `iter().position` uses the stdlib's
+    // memchr-backed slice search, which skips to the next candidate first
+    // byte instead of testing every offset.
+    let mut from = 0usize;
+    while let Some(rel) = b[from..].iter().position(|&c| c == t[0]) {
+        let i = from + rel;
+        if i + t.len() > b.len() {
+            return false;
+        }
         if &b[i..i + t.len()] == t {
+            // word-boundary on the LEFT (the right side is covered by the
+            // trigger's own spelling, e.g. `sqrt(`, or by the next test)
             if i == 0 || !(b[i - 1].is_ascii_alphanumeric() || b[i - 1] == b'_') {
                 return true;
             }
-            i += t.len();
-        } else {
-            i += 1;
         }
+        from = i + 1;
     }
     false
 }
@@ -36538,14 +39767,14 @@ fn collect_nested_declares_d(stmts: &[IrStmt], out: &mut BTreeSet<String>, depth
 /// read/declare/unset builtin targets) so they hoist as `char*` entries.
 fn collect_store_names(stmts: &[IrStmt], out: &mut BTreeSet<String>) {
     if std::env::var("SH2_DBG_VARS").is_ok() && !stmts.is_empty() {
-        eprintln!("DBG csn n={} first_type={}", stmts.len(), match &stmts[0] { IrStmt::Assign{..} => "Assign", IrStmt::Expr(_) => "Expr", _ => "?" });
+        pdebug!("DBG csn n={} first_type={}", stmts.len(), match &stmts[0] { IrStmt::Assign{..} => "Assign", IrStmt::Expr(_) => "Expr", _ => "?" });
     }
         for s in stmts {
         collect_ext_foreach_line_vars(s, out);
     match s {
             IrStmt::Assign { targets, expr, .. } => {
                 if std::env::var("SH2_DBG_VARS").is_ok() {
-                    eprintln!("DBG csn assign -> {:?}", targets.iter().map(|t| t.var.clone()).collect::<Vec<_>>());
+                    pdebug!("DBG csn assign -> {:?}", targets.iter().map(|t| t.var.clone()).collect::<Vec<_>>());
                 }
                 for t in targets {
                     out.insert(t.var.clone());
@@ -36833,6 +40062,17 @@ fn collect_vars_full(
                 collect_vars_expr(cond, out);
                 collect_vars(step, out);
                 collect_vars(body, out);
+            }
+            // Fused take-field (the inline grab+strip pre-pass): the two
+            // assigns it replaced both declared and assigned here, so
+            // the node declares both (its render arm assigns them the
+            // same way — plain `char*` stores, which the pre-pass's
+            // storage guard guarantees).
+            IrStmt::Ext(n) => {
+                if let Some(tf) = n.as_any().downcast_ref::<TakeFieldNode>() {
+                    out.insert(tf.x.clone());
+                    out.insert(tf.s.clone());
+                }
             }
             _ => {}
         }
@@ -37467,6 +40707,16 @@ fn collect_assigned_vars(stmts: &[IrStmt], out: &mut BTreeSet<String>) {
                 collect_assigned_vars(body, out);
             }
             IrStmt::Function { body, .. } => collect_assigned_vars(body, out),
+            // Fused take-field (the inline grab+strip pre-pass): assigns
+            // both vars, exactly like the pair it replaced (needed for
+            // function-local hoisting — without it the fused assigns
+            // write undeclared identifiers).
+            IrStmt::Ext(n) => {
+                if let Some(tf) = n.as_any().downcast_ref::<TakeFieldNode>() {
+                    out.insert(tf.x.clone());
+                    out.insert(tf.s.clone());
+                }
+            }
             _ => {}
         }
     }
@@ -39484,6 +42734,31 @@ mod tests {
     }
 
     #[test]
+    fn fb_clear_hex_literal_lowers_as_a_number() {
+        // `fb_clear 0xFF204060` is a PACKED ARGB COLOUR, and the int
+        // coercion used to fall through to `(int)atoll("0xFF204060")` —
+        // atoll stops at the `x` and yields 0, so the surface cleared to
+        // transparent black. EVERY `fb_clear 0xFF000000` in
+        // MIMEcroft_fb.sh was affected; it looked identical (black either
+        // way under a blit that ignores alpha), which is how it survived.
+        let c = shir_to_c(&prog_of(vec![builtin(
+            "fb_clear",
+            vec![IrExpr::Str(
+                "0xFF204060".to_string(),
+                crate::ir::StrStyle::DoubleQuoted,
+            )],
+        )]));
+        assert!(
+            !c.contains("atoll(\"0xFF"),
+            "a hex colour must not reach atoll (it returns 0):\n{c}"
+        );
+        assert!(
+            c.contains("4280303712"),
+            "0xFF204060 must lower to its numeric value:\n{c}"
+        );
+    }
+
+    #[test]
     fn pure_native_echo_drops_sh_rc() {
         // A pure-native `echo`: every status store is a literal 0 and
         // nothing reads $?, so the exit status is provably 0 — no
@@ -41376,6 +44651,410 @@ mod tests {
             },
             asm: None,
         }
+    }
+
+    /// take-field fusion fixtures: a `read_tex_field`-shaped reader plus
+    /// a `strip_tex_field`-shaped stripper over TAB, exactly as the
+    /// game's texture loader writes them.
+    fn tf_word(s: &str) -> IrExpr {
+        IrExpr::Str(s.to_string(), crate::ir::StrStyle::DoubleQuoted)
+    }
+    fn tf_assign(var: &str, expr: IrExpr) -> IrStmt {
+        IrStmt::Assign {
+            targets: vec![crate::ir::AssignTarget {
+                var: var.to_string(),
+                sigil: None,
+                indices: vec![],
+            }],
+            expr,
+            asm: None,
+        }
+    }
+    fn tf_grab(var: &str, pat: &str) -> IrExpr {
+        IrExpr::Call {
+            func: "param".to_string(),
+            args: vec![tf_word("%%"), tf_word(var), tf_word(pat)],
+        }
+    }
+    fn tf_strip(var: &str) -> IrExpr {
+        IrExpr::Call {
+            func: "param".to_string(),
+            args: vec![tf_word("#"), tf_word(var), tf_word("?")],
+        }
+    }
+    fn tf_test(text: &str) -> IrExpr {
+        IrExpr::Call {
+            func: "test".to_string(),
+            args: vec![tf_word(text)],
+        }
+    }
+    fn tf_call0(name: &str) -> IrStmt {
+        IrStmt::Expr(IrExpr::Call {
+            func: "exec".to_string(),
+            args: vec![tf_word(name), IrExpr::Array(vec![])],
+        })
+    }
+    fn tf_stripper() -> IrStmt {
+        IrStmt::Function {
+            name: "strip_tex_field".to_string(),
+            params: vec![],
+            body: vec![
+                tf_assign("sf_done", tf_word("0")),
+                IrStmt::While {
+                    cond: tf_test("\"$sf_done\" -eq 0"),
+                    body: vec![
+                        tf_assign("sf_probe", tf_grab("lt_s", "\t*")),
+                        IrStmt::If {
+                            cond: tf_test("\"$sf_probe\"=\"\""),
+                            then: vec![
+                                tf_assign("sf_done", tf_word("1")),
+                                tf_assign("lt_s", tf_strip("lt_s")),
+                            ],
+                            elsifs: vec![],
+                            else_: vec![tf_assign("lt_s", tf_strip("lt_s"))],
+                        },
+                    ],
+                },
+            ],
+            named_blocks: vec![],
+        }
+    }
+    fn tf_reader() -> IrStmt {
+        IrStmt::Function {
+            name: "read_tex_field".to_string(),
+            params: vec![],
+            body: vec![
+                tf_assign("f", tf_grab("lt_s", "\t*")),
+                tf_call0("strip_tex_field"),
+            ],
+            named_blocks: vec![],
+        }
+    }
+    fn tf_prog() -> IrProgram {
+        IrProgram {
+            imports: vec![],
+            requires: vec![],
+            stmts: vec![tf_stripper(), tf_reader(), tf_call0("read_tex_field")],
+            subs: vec![],
+            var_types: vec![],
+            stmt_lines: vec![],
+            var_lengths: vec![],
+            var_const: vec![],
+            var_lifetimes: vec![],
+            var_nospace: vec![],
+            var_storage: vec![],
+            var_bash_env: vec![],
+        }
+    }
+
+    #[test]
+    fn take_field_matches_grab_consume_pair() {
+        let map = collect_take_fields(&tf_prog(), &std::collections::BTreeSet::new());
+        let tf = map.get("read_tex_field").expect("reader should match");
+        assert_eq!(tf.x, "f");
+        assert_eq!(tf.s, "lt_s");
+        assert_eq!(tf.delim, b'\t');
+        assert_eq!(tf.done, "sf_done");
+        assert_eq!(tf.probe, "sf_probe");
+    }
+
+    #[test]
+    fn take_field_refuses() {
+        // multi-char delimiter: strchr would name the wrong byte.
+        let mut bad = tf_prog();
+        bad.stmts[1] = IrStmt::Function {
+            name: "read_tex_field".to_string(),
+            params: vec![],
+            body: vec![
+                tf_assign("f", tf_grab("lt_s", "ab*")),
+                tf_call0("strip_tex_field"),
+            ],
+            named_blocks: vec![],
+        };
+        assert!(
+            collect_take_fields(&bad, &std::collections::BTreeSet::new()).is_empty(),
+            "multi-char delim must refuse"
+        );
+        // extra statement in the stripper: effects the fusion would drop.
+        let mut bad2 = tf_prog();
+        if let IrStmt::Function { body, .. } = &mut bad2.stmts[0] {
+            body.push(tf_assign("sf_done", tf_word("0")));
+        }
+        assert!(
+            collect_take_fields(&bad2, &std::collections::BTreeSet::new()).is_empty(),
+            "extra stripper stmt must refuse"
+        );
+        // reader with params: the fused code has no argv to read them from.
+        let mut bad3 = tf_prog();
+        if let IrStmt::Function { params, .. } = &mut bad3.stmts[1] {
+            params.push("p".to_string());
+        }
+        assert!(
+            collect_take_fields(&bad3, &std::collections::BTreeSet::new()).is_empty(),
+            "parametrised reader must refuse"
+        );
+        // Int-typed cursor: the fused `char*` block must not touch it.
+        let mut bad4 = tf_prog();
+        bad4
+            .var_types
+            .push(("lt_s".to_string(), crate::ir::IrType::Int));
+        assert!(
+            collect_take_fields(&bad4, &std::collections::BTreeSet::new()).is_empty(),
+            "Int-typed cursor must refuse"
+        );
+    }
+
+    #[test]
+    fn take_field_fuses_call_site() {
+        let out = shir_to_c(&tf_prog());
+        assert!(out.contains("strchr("), "fused take missing:\n{out}");
+        // The top-level call site is fused (the definitions keep their
+        // original bodies for any other callers, so `strip_tex_field()`
+        // legitimately still appears inside `read_tex_field`'s def).
+        assert!(
+            !out.contains(", read_tex_field(),"),
+            "unfused reader call remains:\n{out}"
+        );
+        assert!(out.contains("_sh_rc = 0"), "status contract missing:\n{out}");
+    }
+
+    fn tf_strip_through(var: &str, pat: &str) -> IrExpr {
+        IrExpr::Call {
+            func: "param".to_string(),
+            args: vec![tf_word("#"), tf_word(var), tf_word(pat)],
+        }
+    }
+
+    /// Wrap bare statements in a verdict-free program (empty
+    /// type/storage/length maps → the storage guard allows, as for
+    /// unanalysed `char*` vars).
+    fn tf_prog_of(stmts: Vec<IrStmt>) -> IrProgram {
+        IrProgram {
+            imports: vec![],
+            requires: vec![],
+            stmts,
+            subs: vec![],
+            var_types: vec![],
+            stmt_lines: vec![],
+            var_lengths: vec![],
+            var_const: vec![],
+            var_lifetimes: vec![],
+            var_nospace: vec![],
+            var_storage: vec![],
+            var_bash_env: vec![],
+        }
+    }
+
+    #[test]
+    fn inline_pair_fuses_to_take_node() {
+        // adjacent grab+strip on one cursor var → one TakeField node.
+        let mut prog = tf_prog_of(vec![
+            tf_assign("tup_r", tf_grab("tup_s", " *")),
+            tf_assign("tup_s", tf_strip_through("tup_s", "* ")),
+        ]);
+        fuse_inline_prog(&mut prog, &std::collections::BTreeSet::new());
+        assert_eq!(prog.stmts.len(), 1, "pair should fuse:\n{:?}", prog.stmts);
+        match &prog.stmts[0] {
+            IrStmt::Ext(n) => assert_eq!(n.tag(), "TakeField"),
+            other => panic!("expected fused node, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn inline_pair_refuses() {
+        // different delimiters: fusing would split on the wrong byte.
+        let mut prog = tf_prog_of(vec![
+            tf_assign("tup_r", tf_grab("tup_s", " *")),
+            tf_assign("tup_s", tf_strip_through("tup_s", "*\t")),
+        ]);
+        fuse_inline_prog(&mut prog, &std::collections::BTreeSet::new());
+        assert_eq!(prog.stmts.len(), 2, "mismatched delims must stay");
+        // non-adjacent (a statement between): not a pair.
+        let mut prog2 = tf_prog_of(vec![
+            tf_assign("tup_r", tf_grab("tup_s", " *")),
+            tf_assign("other", tf_word("x")),
+            tf_assign("tup_s", tf_strip_through("tup_s", "* ")),
+        ]);
+        fuse_inline_prog(&mut prog2, &std::collections::BTreeSet::new());
+        assert_eq!(prog2.stmts.len(), 3, "split pair must stay");
+    }
+
+    #[test]
+    fn inline_pair_refuses_non_plain_storage() {
+        // an Int-typed cursor var would render numeric: the fused
+        // `char*` block must not touch it.
+        let mut prog = tf_prog_of(vec![
+            tf_assign("tup_r", tf_grab("tup_s", " *")),
+            tf_assign("tup_s", tf_strip_through("tup_s", "* ")),
+        ]);
+        prog.var_types
+            .push(("tup_s".to_string(), crate::ir::IrType::Int));
+        fuse_inline_prog(&mut prog, &std::collections::BTreeSet::new());
+        assert_eq!(prog.stmts.len(), 2, "Int-typed cursor must stay");
+        // a bigint-homed cursor var renders `mpz_t`: same refusal.
+        let mut prog2 = tf_prog_of(vec![
+            tf_assign("tup_r", tf_grab("tup_s", " *")),
+            tf_assign("tup_s", tf_strip_through("tup_s", "* ")),
+        ]);
+        let mut bigints = std::collections::BTreeSet::new();
+        bigints.insert("tup_s".to_string());
+        fuse_inline_prog(&mut prog2, &bigints);
+        assert_eq!(prog2.stmts.len(), 2, "bigint cursor must stay");
+    }
+
+    #[test]
+    fn inline_pair_renders_take_block() {
+        let prog = IrProgram {
+            imports: vec![],
+            requires: vec![],
+            stmts: vec![
+                tf_assign("tup_r", tf_grab("tup_s", " *")),
+                tf_assign("tup_s", tf_strip_through("tup_s", "* ")),
+            ],
+            subs: vec![],
+            var_types: vec![],
+            stmt_lines: vec![],
+            var_lengths: vec![],
+            var_const: vec![],
+            var_lifetimes: vec![],
+            var_nospace: vec![],
+            var_storage: vec![],
+            var_bash_env: vec![],
+        };
+        let out = shir_to_c(&prog);
+        assert!(out.contains("strchr("), "fused take missing:\n{out}");
+    }
+
+    fn epoch_prog(var: &str) -> IrProgram {
+        // x=$EPOCHREALTIME / x=$EPOCHSECONDS as IR
+        tf_prog_of(vec![tf_assign(
+            var,
+            IrExpr::Call {
+                func: "getVar".to_string(),
+                args: vec![tf_word("EPOCHREALTIME")],
+            },
+        )])
+    }
+
+    #[test]
+    fn epochrealtime_lowers_to_clock() {
+        let out = shir_to_c(&epoch_prog("t"));
+        assert!(
+            out.contains("clock_gettime(CLOCK_REALTIME"),
+            "native clock missing:\n{out}"
+        );
+        assert!(out.contains("%lld.%06lld"), "bash secs.usecs form missing");
+        assert!(
+            !out.contains("_sh_env(\"EPOCHREALTIME\")"),
+            "env fallback remains:\n{out}"
+        );
+        assert!(out.contains("#include <time.h>"), "time.h missing");
+    }
+
+    #[test]
+    fn epochseconds_lowers_to_clock() {
+        let mut prog = epoch_prog("t");
+        // rewrite the read to EPOCHSECONDS
+        if let IrStmt::Assign { expr, .. } = &mut prog.stmts[0] {
+            *expr = IrExpr::Call {
+                func: "getVar".to_string(),
+                args: vec![tf_word("EPOCHSECONDS")],
+            };
+        }
+        let out = shir_to_c(&prog);
+        assert!(
+            out.contains("clock_gettime(CLOCK_REALTIME"),
+            "native clock missing:\n{out}"
+        );
+        assert!(
+            !out.contains("_sh_env(\"EPOCHSECONDS\")"),
+            "env fallback remains:\n{out}"
+        );
+    }
+
+    fn sa_lit(s: &str) -> crate::ir::InterpPart {
+        crate::ir::InterpPart::Lit(s.to_string())
+    }
+    fn sa_var(v: &str) -> crate::ir::InterpPart {
+        crate::ir::InterpPart::Expr(Box::new(IrExpr::Var(v.to_string(), None)))
+    }
+    fn sa_append(var: &str) -> IrStmt {
+        // v="$v <$i>" — self-append with a space and a variable seg
+        tf_assign(
+            var,
+            IrExpr::Interpolate(vec![sa_var(var), sa_lit(" "), sa_var("i")]),
+        )
+    }
+
+    #[test]
+    fn self_append_matches() {
+        let st = sa_append("v");
+        let IrStmt::Assign { expr, .. } = &st else {
+            panic!()
+        };
+        let Some(tail) = self_append_segs("v", expr) else {
+            panic!("should match: {st:?}");
+        };
+        match &tail {
+            IrExpr::Interpolate(parts) => assert_eq!(parts.len(), 2, "tail drops the lead"),
+            other => panic!("expected tail Interpolate, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn self_append_refuses() {
+        // not an Interpolate at all
+        assert!(self_append_segs("v", &tf_word("x")).is_none());
+        // leading read is a different var (prepend, not append)
+        let st = tf_assign(
+            "v",
+            IrExpr::Interpolate(vec![sa_lit("x"), sa_var("v")]),
+        );
+        let IrStmt::Assign { expr, .. } = &st else {
+            panic!()
+        };
+        assert!(self_append_segs("v", expr).is_none());
+        // empty tail (pure self-copy): nothing to grow with
+        let st = tf_assign("v", IrExpr::Interpolate(vec![sa_var("v")]));
+        let IrStmt::Assign { expr, .. } = &st else {
+            panic!()
+        };
+        assert!(self_append_segs("v", expr).is_none());
+        // capture in the segs: temp ownership unclear, keep temp-swap
+        let st = tf_assign(
+            "v",
+            IrExpr::Interpolate(vec![
+                sa_var("v"),
+                crate::ir::InterpPart::Expr(Box::new(IrExpr::Capture {
+                    expr: Box::new(tf_word("x")),
+                    native: false,
+                })),
+            ]),
+        );
+        let IrStmt::Assign { expr, .. } = &st else {
+            panic!()
+        };
+        assert!(self_append_segs("v", expr).is_none());
+    }
+
+    #[test]
+    fn self_append_renders_growth_block() {
+        let prog = tf_prog_of(vec![tf_assign("v", tf_word("")), sa_append("v")]);
+        let out = shir_to_c(&prog);
+        assert!(out.contains("realloc("), "growth block missing:\n{out}");
+        // and the numeric-typed twin stays on the temp-swap path
+        let mut prog2 = tf_prog_of(vec![
+            tf_assign("w", tf_word("")),
+            tf_assign("w", IrExpr::Interpolate(vec![sa_var("w"), sa_lit("!")])),
+        ]);
+        prog2
+            .var_types
+            .push(("w".to_string(), crate::ir::IrType::Int));
+        let out2 = shir_to_c(&prog2);
+        assert!(
+            !out2.contains("realloc((w)"),
+            "Int-typed var must keep temp-swap:\n{out2}"
+        );
     }
 
     #[test]
@@ -44437,15 +48116,18 @@ mod tests {
                 ],
             }
         }
-        // small ints + a string read (forces char*[] storage, like
-        // t96's sum+index mix) → native __int128 loop, no GMP.
+        // small ints + a string read (like t96's sum+index mix) →
+        // native __int128 loop, no GMP. A single-element string read no
+        // longer forces char*[] storage (int-element homing renders the
+        // exact decimal text from the native slot), so the atoll loop is
+        // gone iff the array homed natively — either shape computes the
+        // same sum; what must not appear is GMP.
         let out = shir_to_c(&prog_of(vec![
             setarray("xs", vec![IrExpr::Int(10), IrExpr::Int(20)]),
             echo_expr(sum_call("xs")),
             echo_expr(index_read("xs", "0")),
         ]));
         assert!(out.contains("_sh_i128_str"), "no native sum helper:\n{out}");
-        assert!(out.contains("atoll(xs["), "no atoll loop:\n{out}");
         assert!(!out.contains("mpz_add"), "GMP kept for small ints:\n{out}");
         // a bigint element keeps the exact GMP path.
         let out = shir_to_c(&prog_of(vec![

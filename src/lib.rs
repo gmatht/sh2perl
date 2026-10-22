@@ -6,9 +6,12 @@
 /// Debug traces from the shell parser/renderer, normally OFF.
 ///
 /// These used to be unconditional `eprintln!`s, so ordinary constructs —
-/// `${1:-5}`, `a[0]`, `declare -A m` — wrote `DEBUG ...` lines to stderr:
-/// 26 of the 552 corpus examples did.  Set `SH2_DEBUG_PARSER=1` to get them
-/// back (the same env-gate convention `SH2_DEBUG_DEMOTE` already uses in
+/// `${1:-5}`, `a[0]`, `declare -A m` — wrote `DEBUG ...` lines to stderr;
+/// a single `bash-O4` parse of MIMEcroft_fb.sh wrote **176 lines** of
+/// `DEBUG parse_variable_expansion: …` / `DBG store_ref(…)` debris. That
+/// buries a real error in noise and makes any stderr assertion in a test
+/// or gate meaningless. Set `SH2_DEBUG_PARSER=1` to get them back (the
+/// same env-gate convention `SH2_DEBUG_DEMOTE` already uses in
 /// `c_backend.rs`).
 ///
 /// Defined before the `mod` declarations so textual macro scoping makes it
@@ -62,8 +65,9 @@ pub mod shir_passes;
 pub mod variable_analysis;
 pub mod zig_backend;
 pub mod lint_backend; // lint/diagnostic backend (renders analysis verdicts, not code)
-// Browser (JS/wasm-bindgen) API — wasm32-unknown-unknown only.
-#[cfg(not(target_os = "wasi"))]
+// Browser (JS/wasm-bindgen) API — wasm32 only (wasm-bindgen links the
+// wasm import shim; ungated it rides along on native/win32 builds).
+#[cfg(target_arch = "wasm32")]
 pub mod wasm;
 // WASI (wasm32-wasip1) library ABI — plain C exports, see wasi_api.rs.
 // Feature-gated so a WASI command build (the otranspilerl-cli bin) stays a

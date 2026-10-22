@@ -567,6 +567,37 @@ impl<'a> Walker<'a> {
                 // renderer adds helper paths: the C backend's
                 // post-render guard fails loud, never silent.)
                 if is_inline_call(func) {
+                    // `assign(name, op, val)` (`|| X=0`, `&& X=1`) WRITES
+                    // args[0] — the backend renders a real assignment.
+                    // Without the write mention `need_mut` undercounts
+                    // (E0384 on a pass-2 local).
+                    if func == "assign" {
+                        if let Some(IrExpr::Str(n, _)) = args.first() {
+                            if is_ident_word(n) {
+                                self.mention(n);
+                                self.mention_write(n);
+                            }
+                        }
+                    }
+                    // arith TEXT carries side effects the backend
+                    // rewrites to real assignments (`i++`, `x += 1`) —
+                    // record the writes or `need_mut` undercounts
+                    // (E0384). Reads still flow through `expr` below.
+                    if matches!(func.as_str(), "arith" | "arithEval") {
+                        for a in args {
+                            if let IrExpr::Str(t, _) = a {
+                                for w in arith_text_writes(t) {
+                                    // read AND write (same reasoning as
+                                    // the structured IncDec/Assign arms:
+                                    // the read keeps the first-mention
+                                    // gate conservative, the write
+                                    // drives `mut`).
+                                    self.mention(&w);
+                                    self.mention_write(&w);
+                                }
+                            }
+                        }
+                    }
                     for a in args {
                         self.expr(a);
                     }
@@ -677,10 +708,24 @@ impl<'a> Walker<'a> {
                 self.arith(else_);
             }
             ArithAst::Assign { var, rhs, .. } => {
+                // an arith assignment WRITES its target (`((x = 5))`,
+                // `((x += 1))`) — a read-only mention undercounts and
+                // the pass-2 `need_mut` verdict then emits an immutable
+                // `let` for a later-assigned local (E0384). Record BOTH:
+                // the read keeps the "first mention is a write" gate
+                // conservative (an `((i++))`-first var stays a static —
+                // a local would read uninitialised), the write drives
+                // `mut`.
                 self.mention(var);
+                self.mention_write(var);
                 self.arith(rhs);
             }
-            ArithAst::IncDec { var, .. } => self.mention(var),
+            ArithAst::IncDec { var, .. } => {
+                // read-then-write (`((i++))` observes the old value) —
+                // same both-mentions reasoning as the Assign arm.
+                self.mention(var);
+                self.mention_write(var);
+            }
             ArithAst::Cast { arg, .. } => self.arith(arg),
         }
     }
@@ -799,6 +844,67 @@ pub(crate) fn all_idents(text: &str) -> Vec<String> {
             i += 1;
         }
     }
+    out
+}
+
+/// Identifiers an arithmetic TEXT writes (`i++`, `++i`, `x = …`,
+/// `x += …`): the backend rewrites these to real assignments, so the
+/// scope analysis must see the write or the pass-2 `need_mut` verdict
+/// emits an immutable `let` for a later-assigned local (E0384).
+/// Conservative: `==`/`!=`/`<=`/`>=` are comparisons (the `=` must not
+/// follow `=`/`!`/`<`/`>`), and anything else bails toward "written"
+/// (over-marking only ever adds `mut`, never miscompiles).
+pub(crate) fn arith_text_writes(text: &str) -> Vec<String> {
+    let b = text.as_bytes();
+    let mut i = 0usize;
+    let mut out = vec![];
+    let is_ident = |c: u8| c.is_ascii_alphanumeric() || c == b'_';
+    while i < b.len() {
+        let c = b[i];
+        if (c.is_ascii_alphabetic() || c == b'_')
+            && (i == 0 || !is_ident(b[i - 1]))
+        {
+            let start = i;
+            while i < b.len() && is_ident(b[i]) {
+                i += 1;
+            }
+            let name = &text[start..i];
+            // skip whitespace after the identifier
+            let mut j = i;
+            while j < b.len() && (b[j] == b' ' || b[j] == b'\t') {
+                j += 1;
+            }
+            // postfix ++ / -- ?
+            if j + 1 < b.len() + 1 && j < b.len() {
+                if (b[j] == b'+' || b[j] == b'-') && j + 1 < b.len() && b[j + 1] == b[j] {
+                    out.push(name.to_string());
+                    i = j + 2;
+                    continue;
+                }
+            }
+            // assignment (but not ==, !=, <=, >=)?
+            if j < b.len() && (b[j] == b'=' || ((b[j] == b'+' || b[j] == b'-' || b[j] == b'*' || b[j] == b'/' || b[j] == b'%' || b[j] == b'<' || b[j] == b'>' || b[j] == b'&' || b[j] == b'|' || b[j] == b'^') && j + 1 < b.len() && b[j + 1] == b'=')) {
+                // a `=` that is part of ==/!=/<=/>= is a comparison
+                let is_cmp = b[j] == b'=' && j + 1 < b.len() && b[j + 1] == b'=';
+                let preceded = start > 0 && (b[start - 1] == b'=' || b[start - 1] == b'!' || b[start - 1] == b'<' || b[start - 1] == b'>');
+                if !is_cmp && !preceded {
+                    out.push(name.to_string());
+                }
+            }
+            // prefix ++ / -- applies to the NEXT identifier; handled when
+            // we reach it (check backwards for ++/-- before start)
+            if start >= 2 && ((b[start - 1] == b'+' || b[start - 1] == b'-') && b[start - 2] == b[start - 1]) {
+                // ensure the ++/-- isn't itself a postfix of something else:
+                // `a++ + ++i` — the second ++ precedes `i` with ` + ` before;
+                // `i+++++j` is invalid bash anyway. Accept.
+                out.push(name.to_string());
+            }
+            continue;
+        }
+        i += 1;
+    }
+    out.sort();
+    out.dedup();
     out
 }
 

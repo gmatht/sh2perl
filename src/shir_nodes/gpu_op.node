@@ -1,0 +1,32 @@
+# shir_nodes/gpu_op.node — a GPU device operation lifted from a shell write.
+#
+# THE §4.2 STAGE ② "gpu-prep" NODE (docs/BASH-O4.md). A shell program draws
+# by writing structured text to a device file (the Plan 9 model MIMEcroft's
+# fb0 port is built on):
+#
+#     echo "$blk_p" > /dev/fb0/blocks
+#     echo "swap"   > /dev/fb0/call
+#
+# This node is that write, lifted out of the shell program and into the
+# device boundary, so a backend with a GPU leg can emit a dispatch
+# (`_sh_gpu_*`, §4.4) instead of a filesystem write. A backend WITHOUT a GPU
+# leg renders the node as the original write — the correctness firewall.
+#
+# Fields:
+#   device        the device root ("/dev/fb0", "/dev/webgl")
+#   verb          the operation, i.e. the LAST path segment
+#                 ("blocks" | "call" | "depthmask" | "hud" | …)
+#   slot          the sub-segments before the verb, joined with '/'
+#                 (a uniform's "1f/uCamYaw"; empty for a top-level verb)
+#   payload       the written value (the batched draw payload, "swap", …)
+#   id            a stable per-program id (sh_gpu_dev_<n>), so an emitted
+#                 dispatch site and its SPIR-V blob can be named together
+#                 (docs/BASH-O4.md §4.4: `_sh_spv_<id>`)
+
+node GpuOp
+tag "GpuOp"
+field device: string
+field verb: string
+field slot: string
+field payload: expr
+field id: string

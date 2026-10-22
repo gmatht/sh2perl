@@ -129,7 +129,22 @@ fn merge_expansion_into_word(word: &mut Word, expansion: Word) -> bool {
             interp.parts.extend(parts);
             true
         }
-        _ => false,
+        _ => {
+            // Any other leading expansion word (`${a%.*}`, `$(cmd)`,
+            // `${m[k]}`...) glued to a following expansion: demote the
+            // leader to the first interpolation part instead of dropping
+            // the follower. Without this `${a%.*}${a#*.}` silently lost
+            // its second half (the game clock froze in whole seconds).
+            // Leaders with no part mapping (Array, BraceExpansion) keep
+            // the old refuse-and-break behaviour.
+            let leader = std::mem::replace(word, Word::Literal(String::new(), None));
+            let Some(mut new_parts) = expansion_into_parts(leader) else {
+                return false;
+            };
+            new_parts.extend(parts);
+            *word = Word::StringInterpolation(StringInterpolation { parts: new_parts }, None);
+            true
+        }
     }
 }
 

@@ -88,6 +88,17 @@ pub fn restructure_goto_only(prog: &mut IrProgram) {
     restructure::RestructureGoto.run(prog, &ctx);
 }
 
+/// `restructure_goto_only` only when the program actually carries a
+/// `Label`/`Goto`. Callers that must keep their output byte-identical for
+/// jump-free input (the estree ingress) use this instead of skipping the
+/// pass outright: a program with no jumps is untouched, and one WITH jumps
+/// is restructured rather than dying as `sh2.unsupported("goto <l>")`.
+pub fn restructure_goto_if_present(prog: &mut IrProgram) {
+    if restructure::program_has_goto(prog) {
+        restructure_goto_only(prog);
+    }
+}
+
 pub use pattern::grep_to_case::GrepToCase;
 pub use strip::strip_cfor;
 use pattern::PatternLift;

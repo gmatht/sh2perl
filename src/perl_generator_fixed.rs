@@ -32,6 +32,15 @@ pub fn generate(prog: &IrProgram) -> String {
     if std::env::var("PG_DUMP_IR").is_ok() {
         eprintln!("PG_DUMP_IR: {prog:#?}");
     }
+    // The array/hash census must be populated BEFORE `fixups`, not only
+    // inside `shir_to_perl`: `fix_array_slice_bounds` consults it (via
+    // `array_var`) to tell a scalar `${s:off:len}` (a SUBSTRING) from an
+    // array slice, and with an empty census it refuses every slice — so
+    // `${primes[@]: -10}` rendered as the WHOLE array
+    // (`@primes[0..$#primes]`) and 051_primes printed all 100 primes after
+    // "Last 10:". `shir_to_perl` re-populates it for its own use; this call
+    // is idempotent.
+    crate::ir::populate_var_census(prog);
     let fixed = fixups(prog);
     let src = shir_to_perl(&fixed);
     if std::env::var_os("SH2_DEBUG_PGFIX").is_some() {
@@ -118,7 +127,15 @@ fn bind_toplevel_positional_params(src: &str) -> String {
     // renderer produces for `$1` / `${@:…}`. The slice fix above already
     // rewrote `@ARGV[lo..hi]` slices, so what is left here is a bare
     // element read.
-    if !src.contains("$ARGV[") && !src.contains("$#ARGV") {
+    // `@__sh_args` / `$__sh_args_n` already in the body (a `set --` writes
+    // them, and `__sh_pos` reads them) still need the DECLARATIONS and the
+    // file-scope binding — without them `$__sh_args_n` is an undeclared
+    // global and the program dies under `use strict`.
+    if !src.contains("$ARGV[")
+        && !src.contains("$#ARGV")
+        && !src.contains("@__sh_args")
+        && !src.contains("$__sh_args_n")
+    {
         return src.to_string();
     }
     let out = replace_all_outside_strings(src, "$ARGV[", "$__sh_args[");
@@ -1138,91 +1155,41 @@ fn bash_b_operand_slots(fmt: &str) -> Vec<usize> {
     slots
 }
 
-// ── Fix 14 — an unrebuildable condition must be TRUE, not a bare `0` ──────
+// ── Fix 14 — an unbuildable condition must be TRUE, not a bare `0` ──────
 //
 // The shared renderer lowers a condition-position `redirect` / `block` /
 // `exec` to `(system('bash', '-c', q{…}) == 0)`. The `== 0` is the whole
 // point: it converts a bash STATUS into a Perl BOOLEAN, which is what the
-// condition slot needs. When the inner command cannot be rebuilt the
-// renderer falls back to the bare string `"0"` — a *status*, in a boolean
-// slot, where Perl reads it as FALSE.
-//
-// Nothing downstream of the renderer corrects it, and the result is not a
-// wrong value but a runaway: a `while` whose condition is a constant.
+// condition slot needs. When the inner command cannot be rebuilt the arm
+// now emits `ir::UNBUILDABLE_COND` — a `0` carrying a distinguishing
+// comment — which this pass rewrites to `1`.
 //
 //   sh:  while ! { : >> /tmp/f; } 2>/dev/null; do echo waiting; done
-//   pl:  while (!(0)) { print "waiting\n"; }        # !0 is TRUE in Perl
+//   pl:  while (!(0/*sh2:unbuildable-cond*/)) …   ->  while (!(1)) …
 //
-// bash's `!` on a zero status is false, so bash runs zero iterations; Perl
-// runs forever and the gate kills it at the 20 s timeout. Same shape
-// inverts a plain `if`, where it produces a silently missing branch.
+// bash's `!` on a zero status is false, so bash runs zero iterations; a bare
+// falsy `0` would make Perl run forever and the gate would kill it at the
+// 20 s timeout.
 //
-// The fix is the renderer's own convention, applied to its fallback: a
-// condition-position arm that fell through to `"0"` was standing in for a
-// status it could not compute, and "this condition holds" is the only
-// answer that keeps the control flow a loop rather than a hang. Rewriting
-// the bare `(0)` to `1` keeps the Perl boolean the slot requires.
-//
-// A rendered `== 0` is already a boolean and is deliberately untouched, so
-// a real status test is not inverted (see the a_real_status_comparison_is_
-// left_alone control test).
+// Keyed on the MARKER, never on the shape: a legitimately computed
+// `Bool(false)` also renders as a bare `0`, and rewriting that inverted real
+// conditions (redirect-all: `if ! command -v CMD` renders `!(0)` = TRUE).
+/// Rewrite the renderer's UNBUILDABLE-condition placeholder to `1`.
+///
+/// The renderer marks a condition-position command it cannot rebuild with
+/// `0/*sh2:unbuildable-cond*/` (see `ir::UNBUILDABLE_COND`). A bare `0` is a
+/// STATUS, and Perl reads it as FALSE — so a `while` never runs and an `if`
+/// silently drops its branch. `"this holds"` is the only answer that keeps
+/// the control flow a loop rather than a hang.
+///
+/// The rewrite is keyed on that exact marker, NOT on a bare `(0)`. An earlier
+/// version matched the shape instead, which also caught a legitimately
+/// computed `Bool(false)`: `if ! command -v CMD > /dev/null` renders
+/// `!(0)` — TRUE, which is what bash means — and the blanket
+/// `(!(0))`→`(!(1))` rewrite inverted it and dropped the branch
+/// (redirect-all lost its `not found` line).
 fn fix_condition_booleans(src: &str) -> String {
-    let mut out = String::with_capacity(src.len());
-    for line in src.split_inclusive('\n') {
-        out.push_str(&fix_condition_booleans_in_line(line));
-    }
-    out
-}
-
-/// Rewrite the renderer's bare-`(0)` condition fallback in one line.
-fn fix_condition_booleans_in_line(line: &str) -> String {
-    // Cheap reject: a real status comparison always has the `== 0` that
-    // makes it a boolean, so a line carrying one is already correct. The
-    // defect needs a parenthesised `0` in a control-flow head.
-    if !line.contains("(0)") {
-        return line.to_string();
-    }
-    let mut fixed = line.to_string();
-    for open in ["(!(0))", "((0))", "(0)"] {
-        let mut from = 0usize;
-        while let Some(rel) = fixed[from..].find(open) {
-            let start = from + rel;
-            let end = start + open.len();
-            // `(system('bash', …) == 0)` ends in `(0)`? No — it ends `== 0)`.
-            // Guard on the character that would have preceded a real
-            // comparison, so an `== 0` tail can never be matched here.
-            let preceded_by_comparison = fixed[..start].trim_end().ends_with('=')
-                || fixed[..start].trim_end().ends_with('!')
-                || fixed[..start].trim_end().ends_with('<')
-                || fixed[..start].trim_end().ends_with('>')
-                || fixed[..start].trim_end().ends_with('~');
-            if preceded_by_comparison {
-                from = end;
-                continue;
-            }
-            // Only a CONTROL-FLOW head is a condition slot. A bare `(0)` in
-            // an arithmetic or list context is legitimately the number zero,
-            // and rewriting that would corrupt the program.
-            let head = fixed[..start].trim_end();
-            if !(head.ends_with("while")
-                || head.ends_with("if")
-                || head.ends_with("elsif")
-                || head.ends_with("unless")
-                || head.ends_with("while (")
-                || head.ends_with("if ("))
-            {
-                from = end;
-                continue;
-            }
-            let replacement = match open {
-                "(!(0))" => "(!(1))",
-                _ => "(1)",
-            };
-            fixed.replace_range(start..end, replacement);
-            from = start + replacement.len();
-        }
-    }
-    fixed
+    src.replace(crate::ir::UNBUILDABLE_COND, "1")
 }
 
 // ── Fix 12 — a bareword argument to `print` must be a quoted string ────────
@@ -2576,6 +2543,10 @@ fn fixups(prog: &IrProgram) -> IrProgram {
     // it must run over the ALREADY-FIXED stmts, not the original (passing
     // `&prog.stmts` here discards every correction fix_stmts made above).
     fixed.stmts = fix_eval_stmts(&fixed.stmts);
+    // Fix 24 — `. FILE` / `source FILE` shares state with the caller, so a
+    // file this program wrote from a literal is inlined rather than
+    // delegated to a subprocess.
+    fixed.stmts = fix_dot_source_stmts(&fixed.stmts);
     // Fix 9 — the materialised process-substitution consumer's OWN status.
     // Same ordering rule as Fix 7: it walks whole statements (a rewrite of
     // the block's shape), so it runs over the ALREADY-FIXED statements.
@@ -3059,6 +3030,183 @@ fn unquote_operand(e: &IrExpr) -> Option<String> {
 //     program and running the fixes again would double-apply Fix 4.
 
 /// Fix 7 — expand `eval "<shell text>"` into inline statements.
+/// Fix 24 — `. FILE` / `source FILE` must share state with the caller.
+///
+/// bash sources a file INTO THE CURRENT SHELL: its assignments, function
+/// definitions and `set` changes all persist. Delegating to a subprocess
+/// (`bash -c '. ./lib'`) loses every one of them, so
+/// dot-source-lib printed `shared=` where bash prints `shared=secret`.
+///
+/// The general case (an arbitrary file on disk) cannot be resolved at
+/// translation time. The one shape that CAN is a file this very program
+/// wrote earlier from a known literal — the corpus's
+/// `echo 'v=secret' > lib.sh` then `. ./lib.sh` — so this pass collects the
+/// literal bodies written to each path and INLINES the parsed statements at
+/// the source site. `parse_shell_text` (shared with the eval lowering)
+/// supplies them, and `ast_to_ir_raw` keeps every statement (nothing in a
+/// sourced file is dead — the whole point is its side effects).
+///
+/// A path the program never wrote, or one written from a non-literal, is
+/// left alone: the delegated call is wrong for it too, but guessing would be
+/// worse than the status quo.
+fn fix_dot_source_stmts(stmts: &[IrStmt]) -> Vec<IrStmt> {
+    use std::collections::HashMap;
+    /// path -> literal body, in source order.
+    fn collect_writes(stmts: &[IrStmt], out: &mut HashMap<String, String>) {
+        for s in stmts {
+            match s {
+                // `echo LIT > FILE` arrives as Redirect{inner:[Expr(echo …)]}.
+                IrStmt::Redirect { inner, redirects } => {
+                    if let Some(r) = redirects.iter().find(|r| {
+                        matches!(r.mode.as_str(), "w" | "wc")
+                            && matches!(r.fd, None | Some(1))
+                    }) {
+                        if let Some(path) = crate::ir::call_arg_str(&r.target) {
+                            if let Some(body) = echo_body_text(inner) {
+                                out.insert(path, body);
+                            }
+                        }
+                    }
+                    collect_writes(inner, out);
+                }
+                // The neutral `echo LIT > FILE` form.
+                IrStmt::WriteFile { path, content, .. } => {
+                    if let (Some(p), Some(c)) =
+                        (crate::ir::call_arg_str(path), word_source_text(content))
+                    {
+                        out.insert(p, c);
+                    }
+                }
+                IrStmt::If { then, elsifs, else_, .. } => {
+                    collect_writes(then, out);
+                    for (_, b) in elsifs {
+                        collect_writes(b, out);
+                    }
+                    collect_writes(else_, out);
+                }
+                IrStmt::While { body, .. }
+                | IrStmt::DoWhile { body, .. }
+                | IrStmt::For { body, .. }
+                | IrStmt::Block(body)
+                | IrStmt::Subshell(body) => collect_writes(body, out),
+                _ => {}
+            }
+        }
+    }
+    /// The literal text an `echo LIT` body writes (with its newline).
+    fn echo_body_text(inner: &[IrStmt]) -> Option<String> {
+        // The native-statement transform folds `echo LIT` into an `Output`
+        // before this pass runs, but the un-folded `Expr(builtin("echo"))`
+        // form also occurs. Accept both.
+        let [one] = inner else { return None };
+        match one {
+            IrStmt::Output { value, newline, .. } => {
+                let text = word_source_text(value)?;
+                Some(if *newline { format!("{text}\n") } else { text })
+            }
+            IrStmt::Expr(e) => {
+                let IrExpr::Call { func, args } = e else { return None };
+                if func != "builtin" && func != "exec" {
+                    return None;
+                }
+                if crate::ir::call_arg_str(args.first()?)?.as_str() != "echo" {
+                    return None;
+                }
+                let mut words: Vec<String> = Vec::new();
+                for a in crate::ir::exec_word_args(args) {
+                    words.push(word_source_text(a)?);
+                }
+                if words.is_empty() {
+                    return Some("\n".to_string());
+                }
+                // `echo -n` suppresses the terminator.
+                let (nl, rest) = if words[0] == "-n" {
+                    ("", &words[1..])
+                } else {
+                    ("\n", &words[..])
+                };
+                Some(format!("{}{nl}", rest.join(" ")))
+            }
+            _ => None,
+        }
+    }
+
+    let mut writes: HashMap<String, String> = HashMap::new();
+    collect_writes(stmts, &mut writes);
+
+    fn walk(stmts: &[IrStmt], writes: &HashMap<String, String>) -> Vec<IrStmt> {
+        let mut out = Vec::with_capacity(stmts.len());
+        for s in stmts {
+            match s {
+                IrStmt::Expr(expr) => {
+                    if let Some(path) = dot_source_path(expr) {
+                        // Try the literal path, then the `./`-stripped and
+                        // `./`-prefixed spellings (`./lib.sh` vs `lib.sh`).
+                        let bare = path.strip_prefix("./").unwrap_or(&path).to_string();
+                        let dotted = format!("./{bare}");
+                        let body = writes
+                            .get(&path)
+                            .or_else(|| writes.get(&bare))
+                            .or_else(|| writes.get(&dotted));
+                        if let Some(body) = body {
+                            if let Some(inner) = parse_shell_text(body) {
+                                out.extend(inner);
+                                continue;
+                            }
+                        }
+                    }
+                    out.push(s.clone());
+                }
+                IrStmt::If { cond, then, elsifs, else_ } => out.push(IrStmt::If {
+                    cond: cond.clone(),
+                    then: walk(then, writes),
+                    elsifs: elsifs
+                        .iter()
+                        .map(|(c, b)| (c.clone(), walk(b, writes)))
+                        .collect(),
+                    else_: walk(else_, writes),
+                }),
+                IrStmt::While { cond, body } => out.push(IrStmt::While {
+                    cond: cond.clone(),
+                    body: walk(body, writes),
+                }),
+                IrStmt::DoWhile { cond, body, until } => out.push(IrStmt::DoWhile {
+                    cond: cond.clone(),
+                    body: walk(body, writes),
+                    until: *until,
+                }),
+                IrStmt::For { var, iter, body } => out.push(IrStmt::For {
+                    var: var.clone(),
+                    iter: iter.clone(),
+                    body: walk(body, writes),
+                }),
+                IrStmt::Block(b) => out.push(IrStmt::Block(walk(b, writes))),
+                IrStmt::Subshell(b) => out.push(IrStmt::Subshell(walk(b, writes))),
+                other => out.push(other.clone()),
+            }
+        }
+        out
+    }
+    walk(stmts, &writes)
+}
+
+/// The literal path of a `. FILE` / `source FILE` call, if that is its shape.
+fn dot_source_path(expr: &IrExpr) -> Option<String> {
+    let IrExpr::Call { func, args } = expr else {
+        return None;
+    };
+    if func != "builtin" && func != "exec" {
+        return None;
+    }
+    let cmd = crate::ir::call_arg_str(args.first()?)?;
+    if cmd != "." && cmd != "source" {
+        return None;
+    }
+    let words = crate::ir::exec_word_args(args);
+    let [one] = &words[..] else { return None };
+    word_source_text(one)
+}
+
 fn fix_eval_stmts(stmts: &[IrStmt]) -> Vec<IrStmt> {
     let mut out = Vec::with_capacity(stmts.len());
     for s in stmts {
@@ -3822,6 +3970,15 @@ sub __sh_fn_status {
         ? $rv + 0
         : ($? >> 8);
     $st = 1 if !defined $st;
+    # This sub is injected right after the `use` block, BEFORE the shared
+    # renderer's own preamble (`our $CHILD_ERROR = 0;`), so a bare
+    # $CHILD_ERROR here is a `use strict` COMPILE error ("Global symbol
+    # $CHILD_ERROR requires explicit package name") and the whole program
+    # aborts — 051_primes printed NOTHING. Re-declaring the package global
+    # inside the sub is always legal, makes the helper independent of
+    # preamble ordering, and (same package) still writes the caller's
+    # variable.
+    our $CHILD_ERROR;
     $CHILD_ERROR = $st;
     return $st == 0 ? 1 : 0;
 }
@@ -3849,14 +4006,27 @@ sub __sh_pos {
     # list contributes zero fields to the enclosing join, and a non-empty
     # one contributes exactly its elements. The offset is 1-based, as bash
     # counts it; a non-positive or past-the-end offset is empty.
+    # This sub is injected right after the `use` block, BEFORE the
+    # file-scope `our @__sh_args; our $__sh_args_n;` declarations, so a bare
+    # read here is a `use strict` COMPILE error and the whole program
+    # aborts. Re-declaring the package globals inside the sub is always
+    # legal and independent of preamble ordering (same package, so it still
+    # sees the caller's values).
+    our (@__sh_args, $__sh_args_n);
     my $__off = shift();
     my $__len = shift();
     return () if $__off < 1;
-    return () if $__off > $#ARGV + 1;
-    my $__end = defined($__len) ? $__off + $__len - 1 : $#ARGV;
-    $__end = $#ARGV if $__end > $#ARGV;
+    return () if $__off > $__sh_args_n;
+    # `@__sh_args` / `$__sh_args_n`, NOT `@ARGV` / `$#ARGV`: this helper is
+    # injected AFTER `post_pass`, which is what rebinds the file-scope
+    # positional reads to `@__sh_args` (a `set --` writes there, and `do
+    # FILE` runs with `@ARGV` already emptied). Reading `@ARGV` here saw a
+    # different (empty) list than the statements around it, so
+    # parse-at-slice-param printed no space where bash printed one.
+    my $__end = defined($__len) ? $__off + $__len - 1 : $__sh_args_n - 1;
+    $__end = $__sh_args_n - 1 if $__end > $__sh_args_n - 1;
     return () if $__end < $__off - 1;
-    return @ARGV[$__off - 1 .. $__end];
+    return @__sh_args[$__off - 1 .. $__end];
 }
 "#;
 /// {@link SLICE_PREAMBLE}, continued: the array-slice helper of Fix 16.
@@ -4433,7 +4603,11 @@ mod pgf_tests {
         let prog = crate::shir::ast_to_ir(&cmds);
         let out = generate(&prog);
         assert!(
-            !out.contains("while (!(0))") && !out.contains("(!(0))") && !out.contains("if (!(0))"),
+            !out.contains(crate::ir::UNBUILDABLE_COND),
+            "the unbuildable-condition marker survived into the output:\n{out}"
+        );
+        assert!(
+            !out.contains("while (!(0))"),
             "condition slot holds a bare falsy 0:\n{out}"
         );
     }
@@ -4449,16 +4623,38 @@ mod pgf_tests {
     /// `a_bare_zero_outside_a_condition_is_untouched` pins.
     #[test]
     fn every_unbuildable_condition_arm_is_a_perl_boolean() {
+        // Each arm emits `0/*sh2:unbuildable-cond*/`, which the pass must
+        // turn into `1` in every control-flow head.
+        for src in [
+            "use strict;\nif (!(0/*sh2:unbuildable-cond*/)) { print \"x\\n\"; }\n",
+            "use strict;\nif ((0/*sh2:unbuildable-cond*/)) { print \"x\\n\"; }\n",
+            "use strict;\nwhile ((0/*sh2:unbuildable-cond*/)) { print \"x\\n\"; }\n",
+            "use strict;\nelsif ((0/*sh2:unbuildable-cond*/)) { print \"x\\n\"; }\n",
+        ] {
+            let out = fix_condition_booleans(src);
+            assert!(
+                !out.contains(crate::ir::UNBUILDABLE_COND) && out.contains('1'),
+                "the marker was not rewritten to a truthy boolean:\n{out}"
+            );
+        }
+    }
+
+    /// A legitimately computed `Bool(false)` renders as a bare `0` and must
+    /// NOT be rewritten. This is the redirect-all regression: `if !
+    /// command -v CMD > /dev/null` is TRUE in bash, the renderer emitted
+    /// `!(0)`, and the old shape-matching rewrite turned it into `!(1)` and
+    /// dropped the branch.
+    #[test]
+    fn a_computed_false_condition_is_not_inverted() {
         for src in [
             "use strict;\nif (!(0)) { print \"x\\n\"; }\n",
             "use strict;\nif ((0)) { print \"x\\n\"; }\n",
             "use strict;\nwhile ((0)) { print \"x\\n\"; }\n",
-            "use strict;\nelsif ((0)) { print \"x\\n\"; }\n",
         ] {
-            let out = fix_condition_booleans(src);
-            assert!(
-                !out.contains("!(0)") && !out.contains("(0)"),
-                "still a falsy status in a boolean slot:\n{out}"
+            assert_eq!(
+                fix_condition_booleans(src),
+                src,
+                "a computed falsy condition was rewritten:\n{src}"
             );
         }
     }

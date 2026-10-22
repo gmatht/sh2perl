@@ -106,25 +106,39 @@ pub fn shaderize_enabled() -> bool {
 /// literal arithmetic fold (`shir_passes::optimize::fold_arith_literals`:
 /// `1 + 2` → `3`). Off at `-Og` (the default), whose contract is that the
 /// output resembles the input — a human should see `1 + 2` there.
-static SIZE_OPT: AtomicBool = AtomicBool::new(false);
+///
+/// THREAD-LOCAL, not a process-global `AtomicBool` (2026-10-21). cargo
+/// runs tests on parallel threads and this flag is flip-during-render
+/// state: a test that flips it while ANOTHER test renders made that
+/// render assert the wrong level. Measured on the clean core worktree:
+/// three `cargo test --lib` runs of the SAME commit yielded 21/20/19
+/// failures, the extras being `literal_literal_ops_are_widened` and
+/// `const_string_test_folds_only_with_size_opt` racing each other — the
+/// flake that flapped the core worker's gate RED on a clean tree. The
+/// production CLI sets the flag in `main()` and renders on that same
+/// thread, so thread-local is behaviourally identical there; in tests
+/// each thread gets its own flag, so a flip is invisible to parallel
+/// renders.
+std::thread_local! {
+    static SIZE_OPT: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
 
-/// Enable/disable `-Os` size-oriented lowering (default off).
+/// Enable/disable `-Os` size-oriented lowering (default off, per thread).
 pub fn set_size_opt(on: bool) {
-    SIZE_OPT.store(on, std::sync::atomic::Ordering::SeqCst);
+    SIZE_OPT.with(|f| f.set(on));
 }
 
 pub fn size_opt_enabled() -> bool {
-    SIZE_OPT.load(std::sync::atomic::Ordering::SeqCst)
+    SIZE_OPT.with(|f| f.get())
 }
 
 /// Serializes every test that flips [`SIZE_OPT`].
 ///
-/// `SIZE_OPT` is a process-global, and cargo runs tests on parallel
-/// threads: a test that calls [`set_size_opt`] while ANOTHER test is
-/// rendering observes the wrong level. This is the same hazard the
-/// dual-loop tests already serialize (see `dual_loop_tests`), and it is
-/// a real flake, not a theoretical one — `literal_literal_ops_are_widened`
-/// failed on ~2 runs in 5 purely from scheduling, with no source change.
+/// No longer load-bearing for correctness (the flag is thread-local as of
+/// 2026-10-21), but kept for the tests that already take it: it also
+/// pins the set→render→reset sequence against POOLED-THREAD reuse, where
+/// a test that flips the flag and forgets to restore it would leak `-Os`
+/// into the next test that happens to land on the same worker thread.
 ///
 /// Hold this for the whole set/render/reset sequence. The guard is
 /// re-entrant across the module so several `set_size_opt` tests can each
@@ -6362,7 +6376,14 @@ pub fn ast_to_ir_with_lines(commands: &[Command], lines: &[usize]) -> IrProgram 
     // write could tear them mid-emission (the determinism unit tests
     // compile concurrently). Never re-entered: shir_to_estree does not
     // call ast_to_ir and ast_to_ir does not call shir_to_estree.
-    let _compile_guard = COMPILE_LOCK.lock().unwrap();
+    //
+    // Poison-tolerant (2026-10-21): a panic while holding the lock must
+    // not cascade into every later compile in the process. In the test
+    // suite one panicking test under the poisoned mutex produced 178
+    // extra failures — unrelated tests red on `PoisonError`, which hides
+    // the real failing set from any gate. In production a panic unwinds
+    // the CLI out of the process anyway, so no state needs protecting.
+    let _compile_guard = COMPILE_LOCK.lock().unwrap_or_else(|p| p.into_inner());
     let after_optimize = stmts.clone();
     crate::transforms::apply(&mut stmts);
     // `after_optimize` is a FILTERED view of `src`, and `stmts` may differ
@@ -14604,6 +14625,165 @@ type Range = Option<(i128, i128)>;
 /// `--true64`.
 const SAFE_NUMBER: i128 = 1 << 53;
 
+/// Vars named inside an OPAQUE text position — a `[...]` subscript or a
+/// word the emitter hands to the runtime verbatim (e.g. the
+/// `options["${flags:j:1}"]` setVar key, the `arr[$i]` getVar name).
+///
+/// Those reads are resolved at RUN TIME by `normAssocKey`/`expandWord`
+/// against `sh2.vars`, never against the IR. A slot-homed var is written
+/// only to `__t64[k]`, so it never appears in `sh2.vars` and every such
+/// read silently yields the EMPTY/undefined value — the loop counter
+/// `options["${flags:j:1}"]="true"` collapsed to one key instead of one
+/// per character. So a var mentioned in opaque text must NOT be
+/// slot-homed.
+///
+/// This is a REFUSAL, deliberately conservative: it over-approximates (a
+/// var merely sharing a name with a subscript expression is refused),
+/// which costs a fast path but never correctness.
+/// One bare shell identifier inside an expansion's text, if `piece` is
+/// exactly that. `None` for operators, digits and the empty run — so
+/// `${flags:j:1}` yields `flags` and `j`, never `:1`.
+fn bare_name_at(piece: char) -> Option<String> {
+    if !(piece == '_' || piece.is_ascii_alphabetic()) {
+        return None;
+    }
+    Some(piece.to_string())
+}
+
+fn vars_in_opaque_text(text: &str, out: &mut HashSet<String>) {
+    let bytes = text.as_bytes();
+    let mut i = 0;
+    while i < bytes.len() {
+        if bytes[i] != b'$' {
+            i += 1;
+            continue;
+        }
+        // `${name...}` / `$name` — both are read from the store at runtime.
+        let (name, next) = match bytes.get(i + 1) {
+            Some(b'{') => {
+                let close = text[i + 2..].find('}').map(|p| i + 2 + p);
+                match close {
+                    // EVERY bare name inside `${…}` is a runtime read, not
+                    // just the leading one: `${flags:j:1}` reads `flags`
+                    // AND the slice offset `j`. Harvest the whole span.
+                    //
+                    // HARVEST WHOLE IDENTIFIERS, not single characters.
+                    // Walking the span char-by-char and asking
+                    // `bare_name_at(c)` yields `f`,`l`,`a`,`g`,`s`,`j` —
+                    // letters that match no real variable, so the
+                    // slot-homing refusal misses every var that actually
+                    // matters and `options["${flags:j:1}"]` collapses to
+                    // one key instead of one per character (063_09, "Processed
+                    // 1 options"). `bare_name_at` is still the filter for
+                    // each candidate; the scan just has to produce whole
+                    // names for it to judge.
+                    Some(c) => {
+                        let span = &text[i + 2..c];
+                        // Split the expansion body on the operators that
+                        // end a name — `:`, `#`, `[`, whitespace — so
+                        // `flags:j:1` yields `flags` and `j`, and never the
+                        // `1`. The candidates are WHOLE identifiers;
+                        // `bare_name_at` judges each one's first char.
+                        let mut ident = String::new();
+                        let mut flush = |ident: &mut String, out: &mut HashSet<String>| {
+                            if ident.is_empty() {
+                                return;
+                            }
+                            let first = ident.chars().next().unwrap_or(' ');
+                            if first == '_' || first.is_ascii_alphabetic() {
+                                out.insert(std::mem::take(ident));
+                            } else {
+                                ident.clear();
+                            }
+                        };
+                        for ch in span.chars() {
+                            if ch == '_' || ch.is_ascii_alphanumeric() {
+                                ident.push(ch);
+                            } else {
+                                flush(&mut ident, out);
+                            }
+                        }
+                        flush(&mut ident, out);
+                        // skip past this expansion
+                        while i < c {
+                            i += 1;
+                        }
+                        i += 1;
+                        continue;
+                    }
+                    None => break,
+                }
+            }
+            Some(c) if *c == b'_' || c.is_ascii_alphabetic() => {
+                let mut j = i + 1;
+                while j < bytes.len() && (bytes[j] == b'_' || bytes[j].is_ascii_alphanumeric()) {
+                    j += 1;
+                }
+                (text[i + 1..j].split(['[', '#', ':']).next().unwrap_or(""), j)
+            }
+            _ => {
+                i += 1;
+                continue;
+            }
+        };
+        let name = name.trim_start_matches('#');
+        if !name.is_empty()
+            && name.chars().next().is_some_and(|c| c == '_' || c.is_ascii_alphabetic())
+            && name.chars().all(|c| c == '_' || c.is_ascii_alphanumeric())
+        {
+            out.insert(name.to_string());
+        }
+        i = next;
+    }
+}
+
+/// Recursively harvest every var named inside an IR expression's OPAQUE
+/// text operands (`Str` payload of a call arg / assign target var).
+fn harvest_opaque_expr(e: &IrExpr, out: &mut HashSet<String>) {
+    match e {
+        IrExpr::Str(s, _) => vars_in_opaque_text(s, out),
+        IrExpr::Array(elems) => elems.iter().for_each(|e| harvest_opaque_expr(e, out)),
+        IrExpr::Call { args, .. } => args.iter().for_each(|a| harvest_opaque_expr(a, out)),
+        IrExpr::Arith(a) => harvest_opaque_arith(a, out),
+        IrExpr::Index { var, key } => {
+            vars_in_opaque_text(var, out);
+            harvest_opaque_expr(key, out);
+        }
+        IrExpr::Interpolate(parts) => {
+            for p in parts {
+                if let InterpPart::Lit(s) = p {
+                    vars_in_opaque_text(s, out);
+                }
+            }
+        }
+        IrExpr::Capture { expr, .. } | IrExpr::Splice(expr) => harvest_opaque_expr(expr, out),
+        _ => {}
+    }
+}
+
+fn harvest_opaque_arith(a: &ArithAst, out: &mut HashSet<String>) {
+    match a {
+        // A bare arith var is a real IR read, not an opaque-text read.
+        ArithAst::Var(_) | ArithAst::Ident(_) | ArithAst::Num(_) | ArithAst::Sizeof(_) => {}
+        ArithAst::Index { var, key } => {
+            vars_in_opaque_text(var, out);
+            harvest_opaque_arith(key, out);
+        }
+        ArithAst::Bin { lhs, rhs, .. } => {
+            harvest_opaque_arith(lhs, out);
+            harvest_opaque_arith(rhs, out);
+        }
+        ArithAst::Un { arg, .. } | ArithAst::Cast { arg, .. } => harvest_opaque_arith(arg, out),
+        ArithAst::Cond { test, then, else_ } => {
+            harvest_opaque_arith(test, out);
+            harvest_opaque_arith(then, out);
+            harvest_opaque_arith(else_, out);
+        }
+        ArithAst::Assign { rhs, .. } => harvest_opaque_arith(rhs, out),
+        ArithAst::IncDec { .. } => {}
+    }
+}
+
 /// The `--true64` analysis: which numeric vars escape ±2^53 (Int64/BigInt
 /// or a BigInt64Array slot), and which of those are slot-worthy — a
 /// self-RMW accumulator chain (`x = x op e` / `x op= e` / `x++`/`x--`)
@@ -14621,11 +14801,19 @@ pub fn analyze_true64(
         in_loop: &mut HashSet<String>,
         unsafe_write: &mut HashSet<String>,
         rmw_reads: &mut HashMap<String, HashSet<String>>,
+        opaque_read: &mut HashSet<String>,
         inside_loop: bool,
     ) {
         for s in stmts {
             match s {
                 IrStmt::Assign { targets, expr, .. } => {
+                    harvest_opaque_expr(expr, opaque_read);
+                    for t in targets {
+                        vars_in_opaque_text(&t.var, opaque_read);
+                        for i in &t.indices {
+                            harvest_opaque_expr(i, opaque_read);
+                        }
+                    }
                     if targets.len() == 1 && targets[0].indices.is_empty() {
                         let v = &targets[0].var;
                         if numeric.contains(v) || matches!(expr, IrExpr::Arith(_)) {
@@ -14665,20 +14853,25 @@ pub fn analyze_true64(
                 IrStmt::While { body, .. }
                 | IrStmt::For { body, .. }
                 | IrStmt::DoWhile { body, .. } => {
-                    walk_stmts(body, numeric, assigned, rmw, in_loop, unsafe_write, rmw_reads, true);
+                    walk_stmts(body, numeric, assigned, rmw, in_loop, unsafe_write, rmw_reads, opaque_read, true);
                 }
                 IrStmt::Block(body) | IrStmt::Subshell(body) | IrStmt::Background(body) => {
-                    walk_stmts(body, numeric, assigned, rmw, in_loop, unsafe_write, rmw_reads, inside_loop);
+                    walk_stmts(body, numeric, assigned, rmw, in_loop, unsafe_write, rmw_reads, opaque_read, inside_loop);
                 }
                 IrStmt::If { then, elsifs, else_, .. } => {
-                    walk_stmts(then, numeric, assigned, rmw, in_loop, unsafe_write, rmw_reads, inside_loop);
+                    walk_stmts(then, numeric, assigned, rmw, in_loop, unsafe_write, rmw_reads, opaque_read, inside_loop);
                     for (_, arm) in elsifs {
-                        walk_stmts(arm, numeric, assigned, rmw, in_loop, unsafe_write, rmw_reads, inside_loop);
+                        walk_stmts(arm, numeric, assigned, rmw, in_loop, unsafe_write, rmw_reads, opaque_read, inside_loop);
                     }
-                    walk_stmts(else_, numeric, assigned, rmw, in_loop, unsafe_write, rmw_reads, inside_loop);
+                    walk_stmts(else_, numeric, assigned, rmw, in_loop, unsafe_write, rmw_reads, opaque_read, inside_loop);
                 }
                 IrStmt::Redirect { inner, .. } => {
-                    walk_stmts(inner, numeric, assigned, rmw, in_loop, unsafe_write, rmw_reads, inside_loop);
+                    walk_stmts(inner, numeric, assigned, rmw, in_loop, unsafe_write, rmw_reads, opaque_read, inside_loop);
+                }
+                IrStmt::Expr(e) => {
+                    // `setVar("options[\"${flags:j:1}\"]", …)` and friends: the
+                    // call args are opaque runtime text.
+                    harvest_opaque_expr(e, opaque_read);
                 }
                 IrStmt::Function { body, .. } => {
                     // function-locals get their inits baked into `let`
@@ -14734,7 +14927,7 @@ pub fn analyze_true64(
                     for s in body {
                         mark_fn_writes(s, unsafe_write);
                     }
-                    walk_stmts(body, numeric, assigned, rmw, in_loop, unsafe_write, rmw_reads, inside_loop);
+                    walk_stmts(body, numeric, assigned, rmw, in_loop, unsafe_write, rmw_reads, opaque_read, inside_loop);
                 }
                 _ => {}
             }
@@ -14748,6 +14941,7 @@ pub fn analyze_true64(
     let mut in_loop = HashSet::new();
     let mut unsafe_write = HashSet::new();
     let mut rmw_reads: HashMap<String, HashSet<String>> = HashMap::new();
+    let mut opaque_read: HashSet<String> = HashSet::new();
     walk_stmts(
         &prog.stmts,
         &numeric,
@@ -14756,6 +14950,7 @@ pub fn analyze_true64(
         &mut in_loop,
         &mut unsafe_write,
         &mut rmw_reads,
+        &mut opaque_read,
         false,
     );
     let mut int_vars = HashSet::new();
@@ -14791,6 +14986,13 @@ pub fn analyze_true64(
         if rmw.contains(v)
             && in_loop.contains(v)
             && !unsafe_write.contains(v)
+            // A slot var lives ONLY in `__t64[k]`. Any read that resolves
+            // against `sh2.vars` at runtime (a `[...]` subscript or an
+            // opaque word text) can never see it, so it MUST NOT be
+            // slot-homed — otherwise the read yields undefined silently.
+            // 063_09: `options["${flags:j:1}"]="true"` in a `j` loop wrote
+            // one key instead of one per character ("Processed 1 options").
+            && !opaque_read.contains(v)
             && rmw_reads
                 .get(v)
                 .map(|reads| {
@@ -15738,7 +15940,21 @@ pub(crate) fn for_iter_range(iter: &IrExpr) -> Range {
 /// The for-loop's iteration count (trip): item count / range span.
 fn for_iter_trip(iter: &IrExpr) -> Option<u64> {
     match iter {
-        IrExpr::Array(items) => Some(items.len() as u64),
+        // Only a fully-literal element list runs exactly len times. A
+        // single dynamic element (`for w in $x` lowers to
+        // `Array[split($x)]`) expands at runtime to an unknown count —
+        // claiming len is an unsound trip bound: it capped a 12K-trip
+        // word-count loop at 1, narrowed the counter to u8, the counter
+        // wrapped, and the cache-validation gate never fired. Sound
+        // direction is None (unbounded → full-width types).
+        IrExpr::Array(items)
+            if items
+                .iter()
+                .all(|it| matches!(it, IrExpr::Str(..) | IrExpr::Int(..))) =>
+        {
+            Some(items.len() as u64)
+        }
+        IrExpr::Array(_) => None,
         IrExpr::Range { start, end } => {
             let span = ((*start as i128) - (*end as i128)).unsigned_abs() + 1;
             Some(span.min(u64::MAX as u128) as u64)
@@ -22409,7 +22625,7 @@ fn collect_native_arith_sources(args: &[IrExpr], assigns: &mut HashMap<String, V
 
 /// Every variable a (native-lowered) arith AST writes: assignment targets
 /// and `++`/`--` targets.
-fn arith_written_vars(a: &ArithAst) -> Vec<String> {
+pub(crate) fn arith_written_vars(a: &ArithAst) -> Vec<String> {
     match a {
         ArithAst::Assign { var, rhs, .. } => {
             let mut v = vec![var.clone()];
@@ -23382,7 +23598,7 @@ fn native_arith_text(t: &str) -> Option<ArithAst> {
 ///   - a ref in a WRITE position (`${#x} = 5` — bash: syntax error; the
 ///     placeholder would parse as an assign target and the native path
 ///     would WRITE it — the caller's written-vars guard rejects those).
-fn arith_len_strip(t: &str) -> Option<String> {
+pub(crate) fn arith_len_strip(t: &str) -> Option<String> {
     if t.contains("__sh2len") {
         return None;
     }
@@ -31157,7 +31373,9 @@ fn array_migrate_program(program: &mut Program, module_bound: &HashSet<String>) 
 }
 
 pub fn shir_to_estree(prog: &IrProgram) -> Program {
-    let _compile_guard = COMPILE_LOCK.lock().unwrap();
+    // Poison-tolerant — see the same note at the ast_to_ir lock site
+    // (2026-10-21): one panicking test must not redden the rest.
+    let _compile_guard = COMPILE_LOCK.lock().unwrap_or_else(|p| p.into_inner());
     // `for ((...))` (core request zsh-sh-go-20260813-153215): the shell
     // lowering now emits the rich A1 ForInit node — the shell-flavored
     // renderers never see an unstripped ForInit (REFUSE > GUESS), so
@@ -59345,6 +59563,52 @@ mod struct_member_tests {
 }
 
 #[cfg(test)]
+mod range_trip_tests {
+    use super::*;
+
+    fn ranges_of(src: &str) -> std::collections::HashMap<String, (i128, i128)> {
+        let cmds = crate::Parser::new(src).parse().expect("parse");
+        // RAW IR — the trip hint must already be sound here: a dynamic
+        // iterable is unbounded no matter what later transforms do.
+        let prog = ast_to_ir_raw(&cmds);
+        analyze_var_ranges(&prog)
+    }
+
+    #[test]
+    fn dynamic_split_loop_counter_stays_wide() {
+        // `for w in $words` lowers the iterable to `Array[split($words)]`
+        // — a single DYNAMIC element, not a 1-trip literal list. The trip
+        // hint must be None (unbounded) so the carried counter widens to
+        // the int domain. Counting len claimed 1 trip, capped a 12K-trip
+        // word counter at [0,1], narrowed it to u8 — the counter wrapped
+        // at 256 and a `>=` validation gate downstream never fired.
+        let r = ranges_of("n=0\nfor w in $words; do n=$((n + 1)); done");
+        let (lo, hi) = r.get("n").copied().expect("n must have a range");
+        // Fully widened to the bash int domain (the +1 wraps INTMAX to
+        // INTMIN under the shell wrapping model, so lo is INTMIN, not
+        // 0). The load-bearing property: hi is NOT ≤ 255, so no u8.
+        assert_eq!(
+            (lo, hi),
+            (i64::MIN as i128, i64::MAX as i128),
+            "unbounded counter must widen fully, got [{lo}, {hi}]"
+        );
+    }
+
+    #[test]
+    fn literal_list_loop_keeps_exact_trip_bound() {
+        // A fully-literal list still bounds by trips: 3 trips × step 1
+        // from 0. The post-loop re-walk applies the body once more to
+        // the converged state, so hi is 4, not 3 — an over-approximation
+        // by one step, still exact enough to keep narrow types. The
+        // soundness fix must not widen this to the full domain (that
+        // would regress narrow-type codegen).
+        let r = ranges_of("n=0\nfor w in 1 2 3; do n=$((n + 1)); done");
+        let (lo, hi) = r.get("n").copied().expect("n must have a range");
+        assert_eq!((lo, hi), (0, 4), "literal trips stay bounded");
+    }
+}
+
+#[cfg(test)]
 mod methodcall_estree_tests {
     use super::*;
 
@@ -60814,3 +61078,42 @@ mod record_store_tests {
     }
 }
 
+
+#[cfg(test)]
+mod opaque_text_harvest_tests {
+    use super::vars_in_opaque_text;
+    use std::collections::HashSet;
+
+    fn harvest(text: &str) -> HashSet<String> {
+        let mut out = HashSet::new();
+        vars_in_opaque_text(text, &mut out);
+        out
+    }
+
+    /// `${flags:j:1}` reads BOTH `flags` and the slice offset `j` at
+    /// runtime. Harvesting a char at a time (the shape this test exists to
+    /// reject) yields `f`,`l`,`a`,`g`,`s`,`j` — single letters that match no
+    /// real variable, so the slot-homing refusal misses every var that
+    /// actually matters and the `options["${flags:j:1}"]` key collapses.
+    #[test]
+    fn expansion_slice_harvests_whole_identifiers() {
+        let got = harvest("options[\"${flags:j:1}\"]");
+        assert!(got.contains("flags"), "missing base name: {got:?}");
+        assert!(got.contains("j"), "missing slice offset: {got:?}");
+        // The length `1` is not a name, and no single letter may leak.
+        assert!(!got.contains("1"), "digit harvested as a name: {got:?}");
+        assert!(!got.contains("f"), "single letter leaked: {got:?}");
+        assert_eq!(got.len(), 2, "harvest should be exactly flags+j: {got:?}");
+    }
+
+    #[test]
+    fn plain_subscript_and_name_harvest() {
+        // `arr[$i]` — the base is NOT inside an expansion, so only the
+        // subscript expression is harvested. (What matters is that `i`
+        // survives whole and no letter of it leaks.)
+        assert!(harvest("arr[$i]").contains("i"));
+        assert!(!harvest("arr[$i]").contains("A"));
+        // A multi-char identifier must survive whole, not as letters.
+        assert!(harvest("$a1_b").contains("a1_b"));
+    }
+}

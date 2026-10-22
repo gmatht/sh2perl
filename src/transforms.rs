@@ -70,6 +70,12 @@ pub fn transform_applies(name: &str) -> bool {
             None => true,
             Some(t) => crate::transforms::planner::emits_renderable_nodes(&t),
         },
+        // fbdev-gpu-calls EMITS fb_* Call nodes. Only the C backend
+        // renders those in-process (fb_call_opt); every other backend
+        // would route them to a shell-out, worse than the GpuOp
+        // file-write fallback. Explicit `c` target only — the
+        // text-ops-planner precedent (bash-o4/src/pipeline.rs sets it).
+        "fbdev-gpu-calls" => matches!(target().as_deref(), Some("c")),
         _ => true,
     }
 }
@@ -127,6 +133,12 @@ pub mod echo_return; // pure-output "echo a value and return" functions → fnVa
 pub mod loop_return_lift; // echo+return inside a loop → flag+break (makes strContainsAny/line_at echo-return-eligible)
 pub mod unreachable_after_exit; // PROVABLY-32-bit arith annotations
 pub mod split_set; // set[int] → small ∪ big partitions (runtime routing; speed-class, SH2_SPLIT_SETS)
+pub mod fbdev_gpu; // device write → GPU op (the §4.2 stage ② "gpu-prep" pass)
+pub mod fbdev_gpu_batch; // batch consecutive same-verb GpuOps into one dispatch
+pub mod fbdev_gpu_elim; // eliminate redundant GpuOps (exact duplicates)
+pub mod fbdev_gpu_calls; // GpuOp → the fb_* call it names (C target only)
+pub mod slice_identity;
+pub mod array_len_fold;
 
 
 pub fn all() -> Vec<(&'static str, TransformFn)> {
@@ -206,6 +218,10 @@ pub fn all() -> Vec<(&'static str, TransformFn)> {
         // Speed-class — gated by SH2_SPLIT_SETS (set at -O3/-O4 by the
         // CLI, mirroring set_dual_loops).
         ("split-set", split_set::transform),
+        ("fbdev-gpu", fbdev_gpu::transform),
+        ("fbdev-gpu-batch", fbdev_gpu_batch::transform),
+        ("fbdev-gpu-elim", fbdev_gpu_elim::transform),
+        ("fbdev-gpu-calls", fbdev_gpu_calls::transform),
         // split-in-place: liveness-proven destructive buffer reuse for
         // `for w in $var` iteration (C tokenizes the var's own buffer;
         // GC'd languages ignore the flag — see shir_passes/split_inplace)
@@ -214,6 +230,8 @@ pub fn all() -> Vec<(&'static str, TransformFn)> {
         //   ir::tests::embed_injects_carp_for_emulations regresses); the
         //   c worker's in-flight work continues. Flip this line when done.
         //   (Module declared in shir_passes/mod.rs; compiles inert.)
+("slice-identity", slice_identity::transform),
+("array-len-fold", array_len_fold::transform),
     ]
 }
 

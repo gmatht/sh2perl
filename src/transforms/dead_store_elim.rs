@@ -342,6 +342,41 @@ fn count_writes(stmts: &[IrStmt]) -> std::collections::HashMap<String, usize> {
     counts
 }
 
+/// `$name` / `${name}` references inside a case PATTERN's source text.
+///
+/// Patterns arrive as TEXT (see the census arm) and bash expands them before
+/// matching, so each `$name` is a read of that variable. Mirrors
+/// `shir::lift_walk_stmt`'s `lift_mark_string_refs` call on the same field —
+/// that walker already treats a pattern as a read, which is why a var used
+/// only in a pattern is correctly EXCLUDED from the lift verdicts; the DCE
+/// census must agree or it deletes the store the pattern depends on.
+fn dollar_names_in(text: &str) -> Vec<String> {
+    let b = text.as_bytes();
+    let mut out = Vec::new();
+    let mut i = 0usize;
+    while i < b.len() {
+        if b[i] != b'$' {
+            i += 1;
+            continue;
+        }
+        i += 1;
+        if i < b.len() && b[i] == b'{' {
+            i += 1;
+            if i < b.len() && (b[i] == b'#' || b[i] == b'!') {
+                i += 1;
+            }
+        }
+        let start = i;
+        while i < b.len() && (b[i].is_ascii_alphanumeric() || b[i] == b'_') {
+            i += 1;
+        }
+        if start < i && (b[start].is_ascii_alphabetic() || b[start] == b'_') {
+            out.push(text[start..i].to_string());
+        }
+    }
+    out
+}
+
 fn census(stmts: &[IrStmt], reads: &mut HashSet<String>, writes: &mut HashSet<String>, escapes: &mut HashSet<String>) {
     for st in stmts {
         census_stmt(st, reads, writes, escapes, false);
@@ -434,6 +469,21 @@ fn census_stmt(
         IrStmt::Case { discriminant, clauses } => {
             census_expr(discriminant, reads, writes, escapes, escaping);
             for cl in clauses {
+                // A case PATTERN is EXPANDED by bash before matching, and the
+                // frontends hand it over as SOURCE TEXT (a plain `String` on
+                // the clause, not an `IrExpr`), so a `$name` inside one is a
+                // READ of that variable. Without this the census saw no read
+                // at all for `x=bar; case bar in $x) …`: this transform
+                // dropped the ONLY store of `x` (and `analyze_var_types` then
+                // listed nothing, so no backend declared it either) and the
+                // renderers fell through to the environment variable —
+                // bash printed the clause body, every translation printed
+                // nothing. See core-requests/core-20261015-145805-case-pattern-reads.md.
+                for p in &cl.patterns {
+                    for v in dollar_names_in(p) {
+                        reads.insert(v);
+                    }
+                }
                 for s in &cl.body {
                     census_stmt(s, reads, writes, escapes, escaping);
                 }
@@ -944,6 +994,76 @@ mod tests {
 
     fn str_(s: &str) -> IrExpr {
         IrExpr::Str(s.to_string(), StrStyle::DoubleQuoted)
+    }
+
+    /// Regression pin (core-request core-20261015-145805, rust backend):
+    /// a var read ONLY inside a `case` PATTERN must keep its store.
+    ///
+    /// `x=bar; case bar in $x) echo MATCH;; esac` — the pattern is SOURCE
+    /// TEXT bash expands before matching, so `$x` is a read. The census
+    /// walked only the clause BODY, judged `x` never-read, and deleted its
+    /// only store; every backend then read `$x` from the environment and
+    /// printed nothing where bash prints MATCH.
+    #[test]
+    fn case_pattern_read_keeps_store() {
+        let case = IrStmt::Case {
+            discriminant: str_("bar"),
+            clauses: vec![crate::ir::IrCaseClause {
+                patterns: vec!["$x".to_string()],
+                body: vec![IrStmt::Expr(IrExpr::Call {
+                    func: "builtin".to_string(),
+                    args: vec![
+                        str_("echo"),
+                        IrExpr::Array(vec![str_("MATCH")]),
+                    ],
+                })],
+            }],
+        };
+        let mut prog = vec![
+            IrStmt::Assign {
+                targets: vec![AssignTarget {
+                    var: "x".to_string(),
+                    sigil: None,
+                    indices: vec![],
+                }],
+                expr: str_("bar"),
+                asm: None,
+            },
+            case,
+        ];
+        assert!(
+            !transform(&mut prog),
+            "the store feeding the case pattern must not be dropped"
+        );
+        assert_eq!(prog.len(), 2, "the `x=bar` assignment must survive");
+
+        // The control: a pattern with NO expansion is not a read, so a store
+        // nothing else uses is still dead and IS dropped.
+        let mut prog2 = vec![
+            IrStmt::Assign {
+                targets: vec![AssignTarget {
+                    var: "y".to_string(),
+                    sigil: None,
+                    indices: vec![],
+                }],
+                expr: str_("bar"),
+                asm: None,
+            },
+            IrStmt::Case {
+                discriminant: str_("bar"),
+                clauses: vec![crate::ir::IrCaseClause {
+                    patterns: vec!["bar".to_string()],
+                    body: vec![],
+                }],
+            },
+        ];
+        assert!(transform(&mut prog2), "a literal pattern reads nothing");
+        assert_eq!(prog2.len(), 1);
+
+        // `${x}` and a pattern with surrounding text are reads too.
+        assert_eq!(dollar_names_in("${x}"), vec!["x".to_string()]);
+        assert_eq!(dollar_names_in("pre$x-suf"), vec!["x".to_string()]);
+        assert!(dollar_names_in("*.txt").is_empty());
     }
 
     /// BASHC_FIX t03: a var read ONLY inside a pipeline stage must keep

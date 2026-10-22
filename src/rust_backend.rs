@@ -135,6 +135,17 @@ fn borrow_word(w: &str) -> String {
     format!("&{}", Render::unparen(w))
 }
 
+/// A rendered word that is a BARE identifier (a native `&str` loop
+/// binding, a borrowable local read): it yields `&str`, not an owned
+/// `String`, so an owned-String context must append `.to_string()`.
+fn is_bare_ident(w: &str) -> bool {
+    let t = w.trim();
+    !t.is_empty()
+        && t.chars()
+            .all(|c| c.is_ascii_alphanumeric() || c == '_')
+        && !t.chars().next().unwrap().is_ascii_digit()
+}
+
 /// The bare literal text when a rendered word is `<"…">.to_string()` (the
 /// form the renderer emits for a string constant), else None. A literal is
 /// `&'static str`, so it needs no allocation and no borrow of a temporary
@@ -257,6 +268,11 @@ pub struct Render {
     /// inside a `thread::spawn(move || ...)` body: `return` exits the
     /// closure, so value-returns keep their legacy shape there
     in_closure: usize,
+    /// Nesting depth of an ACTIVE output sink (capture block / fd-1
+    /// redirect). Inside one the sink is the buffer, not the process
+    /// stdout, so `sink_free_here` must refuse the direct `print!`
+    /// lowering (`val=$(echo x)` leaked the inner echo otherwise).
+    capture_depth: usize,
     /// pass-6 native loop bindings in scope: a STACK of (var, binding,
     /// kind) — nested loops push, so an inner loop shadows the outer
     /// and outer reads still resolve inside the inner body. Reads of a
@@ -1054,6 +1070,16 @@ fn strip_str_lit_refs(text: &str) -> String {
             // check for `.to_string()` after the literal
             let suffix = b".to_string()";
             if j < b.len() && b[j..].starts_with(suffix) {
+                // the borrow must END at the `.to_string()`: a chained
+                // call (`&"a".to_string().to_lowercase()`) would leave a
+                // bare String where `&str` is expected (E0308) — bail
+                // (missed opt, never miscompile).
+                let after = j + suffix.len();
+                if after < b.len() && b[after] == b'.' {
+                    out.push(b[i] as char);
+                    i += 1;
+                    continue;
+                }
                 let lit_end = j; // exclusive end of the string literal
                 // emit just the string literal
                 out.push_str(&text[i + 1..lit_end]);
@@ -1442,11 +1468,47 @@ fn simplify_let_b(mut text: String) -> String {
             search_from = at + prefix.len();
             continue;
         }
+        // If the status store survived inside EXPR, the wrapper must
+        // stay: the store sequences a LIVE `__SH_RC` write (statement
+        // position — `let _ = { let __b = …; STORE; __b };` exists
+        // exactly to record the status), and stripping the binding
+        // would orphan its `__b` reference (a hard E0425) or, worse,
+        // silently drop a status `$?` later reads. `rc_strip` already
+        // removes the store wherever the register is unreachable, so a
+        // surviving store is load-bearing by construction. Bail on
+        // this occurrence (missed opt, never miscompile).
+        if expr.contains("__SH_RC.store(if __b") {
+            search_from = at + prefix.len();
+            continue;
+        }
+        // The binding is dead after this replacement, so a surviving
+        // bare `__b` reference anywhere else in EXPR would be orphaned
+        // (same E0425 class) — bail then too.
+        if has_word(&expr, "__b") {
+            search_from = at + prefix.len();
+            continue;
+        }
         let replacement = expr.to_string();
         text.replace_range(at..close + 1, &replacement);
         search_from = at + replacement.len();
     }
     text
+}
+
+/// Word-bounded `needle` search (`__b` must not match `__backup`).
+fn has_word(hay: &str, needle: &str) -> bool {
+    let mut rest = hay;
+    while let Some(k) = rest.find(needle) {
+        let before = rest[..k].chars().last();
+        let after = rest[k + needle.len()..].chars().next();
+        if !before.map(|c| c.is_ascii_alphanumeric() || c == '_').unwrap_or(false)
+            && !after.map(|c| c.is_ascii_alphanumeric() || c == '_').unwrap_or(false)
+        {
+            return true;
+        }
+        rest = &rest[k + needle.len()..];
+    }
+    false
 }
 
 /// Split a comma-separated argument list at depth-0 commas,
@@ -2273,6 +2335,14 @@ impl Render {
     /// the whole-program case; this covers a redirect-bearing program
     /// whose individual function is still never redirected).
     fn sink_free_here(&self) -> bool {
+        // INSIDE a capture (or a redirected block) the sink is NOT the
+        // process stdout: the buffer is active and every print must go
+        // through the sink-aware helper or it leaks to the terminal
+        // (`val=$(echo x | tr ...)` printed the inner echo AND stored
+        // the raw word).
+        if self.capture_depth > 0 {
+            return false;
+        }
         if self.runtime_free {
             return true;
         }
@@ -2292,6 +2362,18 @@ impl Render {
             || line.contains("process::exit")
             || line.contains("=>")
             || line.contains("__sh_fn_")
+            // A line that RUNS something (a shell-out, a spawn, a
+            // pipeline, a trap handler) has observable side effects
+            // beyond the status register — its store is not dead
+            // bookkeeping and the line must never be collapsed (the
+            // `paste a b` class: removing it silently dropped the
+            // command's output).
+            || line.contains("__sh_run(")
+            || line.contains("__sh_spawn(")
+            || line.contains("__sh_pipe(")
+            || line.contains("__sh_run_traps(")
+            || line.contains("__sh_cap_bytes(")
+            || line.contains("__sh_capture_rc(")
         {
             return false;
         }
@@ -3436,7 +3518,15 @@ impl Render {
             return self.local_write_stmt(name, e);
         }
         let m = self.tls(name);
-        format!("{m}.with(|v| *v.borrow_mut() = {});", Self::unparen(e))
+        // a bare-`&str` value (native loop binding, borrowable local)
+        // must be owned for the `RefCell<String>` store (E0308).
+        let e = Self::unparen(e);
+        let e = if is_bare_ident(&e) {
+            format!("{e}.to_string()")
+        } else {
+            e.to_string()
+        };
+        format!("{m}.with(|v| *v.borrow_mut() = {e});")
     }
 
     /// Bind a string loop variable from a STATIC word list: the element
@@ -3650,6 +3740,34 @@ impl Render {
                 "{{ let __p = __SH_PIPESTATUS.lock().unwrap(); __p.get({key} as usize).cloned().unwrap_or(0).to_string() }}"
             );
         }
+        // LOCAL ARRAY: a fixed-size Rust array (`let a = [..]` in this
+        // scope) — read the element in place. Without this the read went
+        // to the (never-written) thread-local, yielding the default
+        // (empty/0) for every element.
+        if self.is_local_array(name) {
+            let m = self.ident_base(name);
+            let n = self.const_len_arrays.get(name).copied().unwrap_or(0);
+            // a `[i64; N]` element is Copy (bare read); a `[String; N]`
+            // element must be cloned out.
+            let int_home = self.local_array_is_int(name);
+            if let Some(k) = Self::const_int_of(key) {
+                let idx = if k < 0 { k + n as i64 } else { k };
+                if idx >= 0 && (idx as usize) < n {
+                    return if int_home {
+                        format!("{m}[{idx}]")
+                    } else {
+                        format!("{m}[{idx}].clone()")
+                    };
+                }
+            }
+            return format!(
+                "{{ let __k = {key}; let __n = {n}; \
+                   let __i = if __k < 0 {{ __n + __k }} else {{ __k }}; \
+                   if __i < 0 || __i >= __n {{ std::process::exit(1); }} \
+                   {m}[__i as usize]{sel} }}",
+                sel = if int_home { "" } else { ".clone()" }
+            );
+        }
         let m = self.tls(name);
         format!("{m}.with(|v| v.borrow().get({key} as usize).cloned().unwrap_or_default())")
     }
@@ -3727,6 +3845,70 @@ impl Render {
         }
         let m = self.tls(name);
         format!("{m}.with(|v| v.borrow().len() as i64)")
+    }
+
+    /// `${#name[@]}` as a `String`, WITHOUT the `as i64` detour:
+    /// `usize` already implements `Display`, so `len().to_string()`
+    /// is byte-identical to `(len() as i64).to_string()` for every
+    /// reachable length (a `Vec` cannot hold more than `i64::MAX`
+    /// elements on any target this backend supports). Used at the
+    /// string-context call sites so the numeric `array_len` (with
+    /// its load-bearing `as i64`) keeps serving arithmetic contexts.
+    fn array_len_to_string(&mut self, name: &str) -> String {
+        // LOCAL ARRAY: the length is a compile-time constant.
+        // Parenthesised: a bare `5.to_string()` lexes as a float.
+        if self.is_local_array(name) {
+            let n = self.const_len_arrays.get(name).copied().unwrap_or(0);
+            return format!("({n}).to_string()");
+        }
+        let m = self.tls(name);
+        format!("{m}.with(|v| v.borrow().len().to_string())")
+    }
+
+    /// A length-valued interpolation part as usize-native text, for
+    /// `format!("{}", …)` args where the numeric path's `as i64` would
+    /// be dead text. `Some` only for the two statically-named length
+    /// nodes (`param("len", name)`, `arrayLen(name)`); `None` (fall
+    /// back to the numeric/string paths) for everything else.
+    /// `{}` formats `usize` and `i64` byte-identically, so the render
+    /// is value-identical in both arms.
+    fn len_part_usize(&mut self, x: &IrExpr) -> Option<String> {
+        match x {
+            IrExpr::Call { func, args } if func == "arrayLen" => match args.first() {
+                Some(IrExpr::Str(name, _)) if !name.is_empty() => {
+                    // LOCAL ARRAY: a compile-time constant (bare — no
+                    // `.to_string()` float-lex trap inside `format!`).
+                    if self.is_local_array(name) {
+                        let n = self.const_len_arrays.get(name).copied().unwrap_or(0);
+                        return Some(format!("{n}"));
+                    }
+                    let m = self.tls(name);
+                    Some(format!("{m}.with(|v| v.borrow().len())"))
+                }
+                _ => None,
+            },
+            IrExpr::Call { func, args } if func == "param" => {
+                let op = str_arg(args, 0).unwrap_or("");
+                if op != "len" {
+                    return None;
+                }
+                let name = str_arg(args, 1).unwrap_or("");
+                if name.is_empty() {
+                    return None;
+                }
+                // mirror `expr_num`'s param-len arm (borrowable locals
+                // hand over without a `.to_string()` round-trip).
+                let s = self.read_str(&name);
+                let s = Render::unparen(&s);
+                // a numerically-homed var reads as i64 — stringify for
+                // the char count (bash counts the decimal digits).
+                if self.is_num(&name) {
+                    return Some(format!("({s}).to_string().chars().count()"));
+                }
+                Some(format!("{s}.chars().count()"))
+            }
+            _ => None,
+        }
     }
 
     /// Declare an array var with the given element expressions.
@@ -4696,6 +4878,11 @@ impl Render {
                 self.mark_todo("Arrow");
                 "String::new()".into()
             }
+            // a single-element list in word position is its element
+            // (`cmd ["$x"]` — the frontend wraps one word in Array;
+            // rendering the list as a word would nest `vec![vec![…]]`
+            // and break the caller's `Vec<String>` (E0308)).
+            IrExpr::Array(items) if items.len() == 1 => self.expr_any(&items[0]),
             IrExpr::Array(_) => {
                 self.mark_todo("Array expr");
                 "String::new()".into()
@@ -4772,11 +4959,19 @@ impl Render {
                 }
                 InterpPart::Expr(x) => {
                     fmt.push_str("{}");
-                    // A numerically-homed part IS an i64: `{}` formats it
-                    // directly, so the `.to_string()` `expr_any` would add
-                    // is a redundant allocation (t69's
-                    // `format!("value={}", x.to_string())`).
-                    if self.word_is_numeric(x) {
+                    // A length part (`param("len")`, `arrayLen`) is
+                    // usize-native: `{}` formats it directly, so the
+                    // `as i64` the numeric path's `__sh_len` peephole
+                    // adds is dead text here (same class as
+                    // `array_len_to_string` — byte-identical output for
+                    // every reachable length).
+                    if let Some(u) = self.len_part_usize(x) {
+                        args.push(u);
+                    } else if self.word_is_numeric(x) {
+                        // A numerically-homed part IS an i64: `{}` formats it
+                        // directly, so the `.to_string()` `expr_any` would add
+                        // is a redundant allocation (t69's
+                        // `format!("value={}", x.to_string())`).
                         args.push(self.expr_num(x));
                     } else {
                         args.push(self.expr_any(x));
@@ -4867,6 +5062,16 @@ impl Render {
             ArithAst::Index { var, key } => {
                 let k = self.arith(key);
                 if (self.is_array(var) || self.is_assoc(var)) && self.declared(var) {
+                    // int-homed arrays hold i64 elements — no
+                    // string round-trip (`.trim()` on an i64 is a
+                    // hard E0599); the forgiving OOB-exit arm below
+                    // already yields bare indexing. Same predicate
+                    // as the `expr_num` Index arm.
+                    if self.is_int_array(var)
+                        || (self.is_local_array(var) && self.local_array_is_int(var))
+                    {
+                        return self.array_index_num(var, &k);
+                    }
                     // arith-index stays forgiving (shell `$((arr[i]))`
                     // uses this path; OOB gives 0 via unwrap_or below).
                     let e = self.array_elem(var, &k);
@@ -6594,8 +6799,9 @@ impl Render {
                 if let Some(IrExpr::Str(name, _)) = args.first() {
                     let (ws, splat) = self.call_arg_words(args.get(1));
                     // pass-3: direct call, value wrapped for word context
+                    // (the value is ONE word — `vec![v]`).
                     if let Some(sig) = self.fn_sigs.get(name).cloned() {
-                        let v = self.fn_call_value(name, ws, &sig, false);
+                        let v = self.fn_call_value(name, ws, &sig);
                         return format!("vec![{v}]");
                     }
                     let m = self.fn_ident(name);
@@ -6747,13 +6953,11 @@ impl Render {
                 .unwrap_or(len_name);
             if !len_name.is_empty() && (idx_at || name_at) {
                 self.mark_written(len_name);
-                let l = if self.is_assoc(len_name) {
-                    let m = self.tls(len_name);
-                    format!("{m}.with(|v| v.borrow().len() as i64)")
-                } else {
-                    self.array_len(len_name)
-                };
-                return format!("vec![({l}).to_string()]");
+                // string context: no `as i64` detour (`usize`
+                // Display is byte-identical — see
+                // `array_len_to_string`).
+                let l = self.array_len_to_string(len_name);
+                return format!("vec![{l}]");
             }
         }
         let _ = op;
@@ -7270,9 +7474,11 @@ impl Render {
         // the captured commands must NOT consume the stage's stdin (a
         // nested mktemp would eat the pipeline buffer)
         self.emit("let __cap_oldin = __SH_STDIN.lock().unwrap().take();");
+        self.capture_depth += 1;
         for s in stmts {
             self.stmt(s);
         }
+        self.capture_depth -= 1;
         self.emit("*__SH_STDIN.lock().unwrap() = __cap_oldin;");
         self.emit("let __cap = __SH_OUT.lock().unwrap().take().unwrap();");
         self.emit("*__SH_OUT.lock().unwrap() = __old;");
@@ -8148,7 +8354,6 @@ impl Render {
         name: &str,
         ws: Vec<String>,
         sig: &FnSig,
-        cat: bool,
     ) -> String {
         let m = self.fn_ident(name);
         if sig.arity == 0 && !sig.argv {
@@ -8161,7 +8366,9 @@ impl Render {
         // than `{ let __a = vec![…]; f(__a.get(0)…unwrap_or_default()) }`).
         // Only when EVERY word is a single-element vec (no splat: a splat's
         // words are a runtime-sized `Vec<String>` and cannot be spread
-        // statically) and the arity matches the word count.
+        // statically) and the arity matches the word count. The caller
+        // decides the value's SHAPE (word-list callers wrap in `vec![…]`,
+        // string callers splice bare), so this returns the bare value.
         if sig.rest.is_none() && !sig.argv && ws.len() == sig.arity {
             let direct: Option<Vec<&str>> =
                 ws.iter().map(|w| Self::vec_of_one(w)).collect();
@@ -8179,8 +8386,21 @@ impl Render {
                             return borrow_word(w);
                         }
                         match sig.tys[i] {
-                            // the param is String: hand over the rendered word
-                            FnParamTy::Str => (*w).to_string(),
+                            // the param is String: hand over the rendered word.
+                            // `(*w).to_string()` is the IDENTITY on the
+                            // word text (a Rust-level &str→String, not
+                            // emitted code) — right when the word already
+                            // yields an owned String, but a bare `&str`
+                            // binding (native loop var, borrowable local)
+                            // needs the conversion appended or the call
+                            // is E0308.
+                            FnParamTy::Str => {
+                                if is_bare_ident(w) {
+                                    format!("{w}.to_string()")
+                                } else {
+                                    (*w).to_string()
+                                }
+                            }
                             FnParamTy::StrRef => borrow_word(w),
                             // the param is i64: the word is a String expr — the
                             // callee's signature forces a parse at the boundary
@@ -8196,16 +8416,23 @@ impl Render {
         // `ws` holds one `vec![word]` per argument; a SPLAT element holds
         // a multi-word `Vec<String>` instead, so the two cannot be
         // concatenated with `vec![a, b]` (that would nest). `__sh_cat`
-        // flattens a `&[Vec<String>]` — always correct, and what `cat`
-        // already selects.
-        if cat || ws.iter().any(|w| !w.starts_with("vec![")) {
+        // flattens a `&[Vec<String>]` — always correct. The legacy `cat`
+        // flag is now unused (kept as `_` at the top): a non-`vec![` word
+        // is ALWAYS a splat here, since every other word arrives wrapped.
+        // `ws` is one `vec![word]` PER WORD, so the `__a` initializer
+        // must FLATTEN them (`vec![w1, w2]` would build
+        // `Vec<Vec<String>>`); `__sh_cat` does that flattening. Use it
+        // whenever the words are not already a single flat list — i.e.
+        // always, unless there is exactly one word whose vec is the whole
+        // list.
+        let needs_cat = ws.len() != 1 || !ws[0].starts_with("vec![");
+        if needs_cat {
             self.add_helper("cat");
         }
-        let cat = cat || ws.iter().any(|w| !w.starts_with("vec!["));
-        let constr = if cat {
+        let constr = if needs_cat {
             format!("__sh_cat(&[{}])", ws.join(", "))
         } else {
-            format!("vec![{}]", ws.join(", "))
+            ws[0].clone()
         };
         let args = Self::fn_call_args(sig);
         format!("{{ let __a: Vec<String> = {constr}; {m}({args}) }}")
@@ -8240,7 +8467,18 @@ impl Render {
                             return borrow_word(w);
                         }
                         match sig.tys[i] {
-                            FnParamTy::Str => (*w).to_string(),
+                            // the param is String: a bare-`&str` word
+                            // (native loop binding, borrowable local)
+                            // needs `.to_string()` appended (see
+                            // `fn_call_value`); anything else already
+                            // yields an owned String.
+                            FnParamTy::Str => {
+                                if is_bare_ident(w) {
+                                    format!("{w}.to_string()")
+                                } else {
+                                    (*w).to_string()
+                                }
+                            },
                             FnParamTy::StrRef => borrow_word(w),
                             FnParamTy::Num => {
                                 format!("({w}).trim().parse::<i64>().unwrap_or(0)")
@@ -8793,6 +9031,11 @@ impl Render {
                 return;
             }
         }
+        // `call_words`' fnValue arm wraps the direct-form value in
+        // `vec![…]` ONLY when it is already a bare block (`{ let __a … }`
+        // is the word itself — wrapping again nests `vec![vec![…]]`,
+        // E0308). Every other arm yields an UNwrapped word vec that
+        // needs exactly one wrap here.
         let ws: Vec<String> = parts
             .into_iter()
             .map(|p| match p {
@@ -8905,7 +9148,17 @@ impl Render {
                     self.add_helper("split_ifs");
                     format!("__sh_split_ifs(&{c}, \" \\t\\n\")")
                 }
-                w => format!("vec![{}]", self.expr_str(w)),
+                // a bare-`&str` word (native loop binding, borrowable
+                // local) must be owned for the `Vec<String>` element
+                // (`&vec![x]` is `&Vec<&str>`, E0308).
+                w => {
+                    let e = self.expr_str(w);
+                    if is_bare_ident(&e) {
+                        format!("vec![{e}.to_string()]")
+                    } else {
+                        format!("vec![{e}]")
+                    }
+                }
             })
             .collect();
         self.add_helper("printf");
@@ -8982,13 +9235,10 @@ impl Render {
                 .unwrap_or(len_name);
             if !len_name.is_empty() && (idx_at || name_at) {
                 self.mark_written(len_name);
-                let l = if self.is_assoc(len_name) {
-                    let m = self.tls(len_name);
-                    format!("{m}.with(|v| v.borrow().len() as i64)")
-                } else {
-                    self.array_len(len_name)
-                };
-                return format!("({l}).to_string()");
+                // string context: no `as i64` detour (see
+                // `array_len_to_string`).
+                let l = self.array_len_to_string(len_name);
+                return l;
             }
         }
         if name.contains('[') && name.ends_with(']') {
@@ -9209,7 +9459,7 @@ impl Render {
                     // pass-3: a probed signature calls directly (the
                     // value IS the return, no __SH_RET re-read)
                     if let Some(sig) = self.fn_sigs.get(name).cloned() {
-                        return self.fn_call_value(name, ws, &sig, false);
+                        return self.fn_call_value(name, ws, &sig);
                     }
                     let m = self.fn_ident(name);
                     let constr = if splat {
@@ -9256,13 +9506,19 @@ impl Render {
             "test" => "String::new()".to_string(),
             "exec" | "builtin" => self.exec_value(args),
             "arrayIndex" => self.array_index_str(args),
-            "arrayLen" => format!(
-                "({}).to_string()",
-                self.expr_num(&IrExpr::Call {
-                    func: func.to_string(),
-                    args: args.to_vec(),
-                })
-            ),
+            "arrayLen" => match args.first() {
+                // string context: render the length directly, without
+                // the numeric `expr_num` round-trip (`(len as i64)
+                // .to_string()` — see `array_len_to_string`).
+                Some(IrExpr::Str(name, _)) => self.array_len_to_string(name),
+                _ => format!(
+                    "({}).to_string()",
+                    self.expr_num(&IrExpr::Call {
+                        func: func.to_string(),
+                        args: args.to_vec(),
+                    })
+                ),
+            },
             "join" => self.join_str(args),
             "listVar" => self.listvar_joined(args),
             "split" => {
@@ -10429,7 +10685,12 @@ impl Render {
                 }
             }
             IrStmt::While { cond, body } => {
-                let c = self.expr_bool(cond);
+                // `expr_bool` wraps the condition in a `{ let __b = …;
+                // store; __b }` status wrapper — strip it like the `if`
+                // arms do (`unwrap_cond`): a bare `while COND; store`
+                // is a parse error, and the loop's own capture/restore
+                // apparatus owns the status here.
+                let c = Self::unwrap_cond(&self.expr_bool(cond));
                 // bash: a while whose condition never tests true exits 0;
                 // otherwise the loop's rc = the last body command's rc —
                 // the cond eval stores its own rc every iteration, so the
@@ -10776,8 +11037,13 @@ impl Render {
                             self.loop_depth += 1;
                             self.depth += 1;
                             // the value handed to the shell variable's
-                            // storage (only needed when it escapes)
-                            let elem_expr = if is_num {
+                            // storage (only needed when it escapes).
+                            // An int-list iterable already yields i64 —
+                            // no parse (`.trim()` on an integer is a
+                            // hard E0599).
+                            let elem_expr = if int_list {
+                                elem_g.clone()
+                            } else if is_num {
                                 format!("{elem_g}.trim().parse::<i64>().unwrap_or(0)")
                             } else {
                                 format!("{elem_g}.to_string()")
@@ -10890,14 +11156,32 @@ impl Render {
                     }
                     // pass-3: the sticky __SH_RET cell becomes the return
                     // value (nested calls observe identical state: stores
-                    // still land in the cell, bare returns re-read it)
+                    // still land in the cell, bare returns re-read it).
+                    // When the value is UNUSED (`fn_value_used` false) the
+                    // signature returns `()`: keep the store (observable
+                    // state) but return nothing — `return __v` against a
+                    // `()` signature is E0308.
+                    let value_used = match self.active_fn.as_deref() {
+                        Some(f) => self.fn_value_used.contains(f),
+                        None => true,
+                    };
                     if let Some(x) = e {
                         let r = self.expr_str(x);
-                        self.emit(&format!(
-                            "let __v = {r}; *__SH_RET.lock().unwrap() = __v.clone(); return __v;"
-                        ));
+                        if value_used {
+                            self.emit(&format!(
+                                "let __v = {r}; *__SH_RET.lock().unwrap() = __v.clone(); return __v;"
+                            ));
+                        } else {
+                            self.emit(&format!(
+                                "let __v = {r}; *__SH_RET.lock().unwrap() = __v; return;"
+                            ));
+                        }
                     } else {
-                        self.emit("return __SH_RET.lock().unwrap().clone();");
+                        if value_used {
+                            self.emit("return __SH_RET.lock().unwrap().clone();");
+                        } else {
+                            self.emit("return;");
+                        }
                     }
                     return;
                 }
@@ -10923,8 +11207,34 @@ impl Render {
                 }
             }
             IrStmt::Block(b) => {
-                for s in b {
+                // A trailing process-substitution cleanup (`rm -f
+                // $__ps_tmp*`, appended by the core transform) is bash's
+                // SUBSHELL side effect: it must not clobber the consumer
+                // command's exit status, which a following `$?` reads
+                // (`diff <(echo one) <(echo two); echo $?`). Emit it
+                // last, behind a status save/restore.
+                let (body, cleanup) = match b.split_last() {
+                    Some((IrStmt::Exec { cmd, args, .. }, rest))
+                        if matches!(cmd, IrExpr::Str(c, _) if c == "rm")
+                            && args.iter().any(|a| {
+                                matches!(a, IrExpr::Var(n, _) | IrExpr::Ident(n)
+                                    if n.starts_with("__ps_tmp"))
+                            }) =>
+                    {
+                        (rest, Some(b.last().unwrap()))
+                    }
+                    _ => (b.as_slice(), None),
+                };
+                for s in body {
                     self.stmt(s);
+                }
+                if let Some(c) = cleanup {
+                    // the save must sit immediately before the cleanup —
+                    // it is the CONSUMER's status being preserved, so it
+                    // is read after the consumer has run.
+                    self.emit("let __ps_saved_rc = __SH_RC.load(Ordering::SeqCst);");
+                    self.stmt(c);
+                    self.emit("__SH_RC.store(__ps_saved_rc, Ordering::SeqCst);");
                 }
             }
             IrStmt::Subshell(b) => self.subshell_render(b),
@@ -12056,7 +12366,7 @@ fn helper_source(h: &str) -> &'static str {
     o
 }"#,
         "pow" => r#"fn __sh_pow(a: i64, b: i64) -> i64 {
-    let mut r = 1;
+    let mut r: i64 = 1;
     let mut i = 0;
     while i < b { r = r.wrapping_mul(a); i += 1; }
     r
@@ -14823,6 +15133,14 @@ impl<'a, 'r> ArithParser<'a, 'r> {
                         self.pos += 1;
                     }
                     if self.render.declared(name) {
+                        // int-homed arrays hold i64 — no string
+                        // round-trip (`.trim()` on i64 is E0599).
+                        if self.render.is_int_array(name)
+                            || (self.render.is_local_array(name)
+                                && self.render.local_array_is_int(name))
+                        {
+                            return Some(self.render.array_index_num(name, &k));
+                        }
                         let e = self.render.array_elem(name, &k);
                         return Some(format!("{e}.trim().parse::<i64>().unwrap_or(0)"));
                     }
@@ -19256,10 +19574,12 @@ mod tests {
     /// `-Og` ones this rule is about, then restore it.
     #[test]
     fn literal_literal_ops_are_widened() {
-        // NOTE: `-Os` is a process-global other tests flip, and the
-        // literal-only subtree below FOLDS under it. Both accepted shapes
-        // therefore carry the suffix — the invariant pinned is that a
-        // literal-only operation never loses its widening either way.
+        // NOTE: `-Os` (the literal-arith fold) is flag state other tests
+        // flip, and the literal-only subtree below FOLDS under it. Pin
+        // the level this test's shapes are asserted at (-Og) rather than
+        // trusting the thread's ambient value, which under pooled test
+        // threads can be a previous test's leftover `-Os`.
+        crate::shir::set_size_opt(false);
         let out = render("x=1\nz=$((2000000000 + 2000000000 + x))\necho \"$z\"\n");
         assert!(
             out.contains("2000000000i64 + 2000000000i64") || out.contains("4000000000i64"),
@@ -19278,6 +19598,7 @@ mod tests {
         assert!(mixed.contains("let x = 1;"), "{mixed}");
         assert!(mixed.contains("x << 2"), "{mixed}");
         assert!(!mixed.contains("2i64"), "needless widening:\n{mixed}");
+        crate::shir::set_size_opt(false); // restore the default for the thread
     }
 
     #[test]
