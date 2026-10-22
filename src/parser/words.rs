@@ -2425,71 +2425,15 @@ fn parse_variable_expansion_inner(lexer: &mut Lexer) -> Result<Word, ParserError
                     },
                     None,
                 ));
-            } else if braced_content.contains(":-") {
-                eprintln!(
-                    "DEBUG parse_variable_expansion: found :- in braced_content='{}'",
-                    braced_content
-                );
-                // ${var:-default} - use default if var is empty
-                let colon_pos = braced_content.find(":-").unwrap();
-                let var_name = &braced_content[..colon_pos];
-                let default_val = &braced_content[colon_pos + 2..];
+            } else if let Some((var, op, operand)) = split_colon_operator(&braced_content) {
+                // `${v:-d}` / `${v:=d}` / `${v:+d}` / `${v:?d}` — only when
+                // the FIRST colon introduces the operator; a later `:-` is
+                // operand text (`${s:1:-1}`).
                 return Ok(Word::ParameterExpansion(
-                    ParameterExpansion {
-                        variable: var_name.to_string(),
-                        operator: ParameterExpansionOperator::DefaultValue(default_val.to_string()),
-                        is_mutable: true,
-                    },
+                    colon_operator_expansion(var, op, operand),
                     None,
                 ));
-            } else if braced_content.contains(":=") {
-                // ${var:=default} - assign default if var is empty
-                let colon_pos = braced_content.find(":=").unwrap();
-                let var_name = &braced_content[..colon_pos];
-                let default_val = &braced_content[colon_pos + 2..];
-                return Ok(Word::ParameterExpansion(
-                    ParameterExpansion {
-                        variable: var_name.to_string(),
-                        operator: ParameterExpansionOperator::AssignDefault(
-                            default_val.to_string(),
-                        ),
-                        is_mutable: true,
-                    },
-                    None,
-                ));
-            } else if braced_content.contains(":+") {
-                // ${var:+alt} - use alt if var is set and not empty
-                let colon_pos = braced_content.find(":+").unwrap();
-                let var_name = &braced_content[..colon_pos];
-                let alt_val = &braced_content[colon_pos + 2..];
-                return Ok(Word::ParameterExpansion(
-                    ParameterExpansion {
-                        variable: var_name.to_string(),
-                        operator: ParameterExpansionOperator::DefaultValue(alt_val.to_string()),
-                        is_mutable: true,
-                    },
-                    None,
-                ));
-            } else if braced_content.contains(":?") {
-                // ${var:?error} - error if var is empty
-                let colon_pos = braced_content.find(":?").unwrap();
-                let var_name = &braced_content[..colon_pos];
-                let error_msg = &braced_content[colon_pos + 2..];
-                return Ok(Word::ParameterExpansion(
-                    ParameterExpansion {
-                        variable: var_name.to_string(),
-                        operator: ParameterExpansionOperator::ErrorIfUnset(error_msg.to_string()),
-                        is_mutable: true,
-                    },
-                    None,
-                ));
-            } else if braced_content.contains(':')
-                && !braced_content.contains("::")
-                && !braced_content.contains(":-")
-                && !braced_content.contains(":=")
-                && !braced_content.contains(":+")
-                && !braced_content.contains(":?")
-            {
+            } else if braced_content.contains(':') && !braced_content.contains("::") {
                 // ${var:offset} or ${var:offset:length} - substring/array-slice
                 // The first colon must not be part of any two-char operator.
                 let colon_pos = braced_content.find(':').unwrap();
@@ -2935,44 +2879,9 @@ fn parse_variable_expansion_inner(lexer: &mut Lexer) -> Result<Word, ParserError
                 }
                 content.push_str(&rest);
                 // Reuse the same analysis as DollarBraceAt (inline below)
-                if content.contains(":-") {
-                    let colon_pos = content.find(":-").unwrap();
-                    let var_name = &content[..colon_pos];
-                    let default_val = &content[colon_pos + 2..];
+                if let Some((var, op, operand)) = split_colon_operator(&content) {
                     Ok(Word::ParameterExpansion(
-                        ParameterExpansion {
-                            variable: var_name.to_string(),
-                            operator: ParameterExpansionOperator::DefaultValue(
-                                default_val.to_string(),
-                            ),
-                            is_mutable: true,
-                        },
-                        None,
-                    ))
-                } else if content.contains(":=") {
-                    let colon_pos = content.find(":=").unwrap();
-                    let var_name = &content[..colon_pos];
-                    let default_val = &content[colon_pos + 2..];
-                    Ok(Word::ParameterExpansion(
-                        ParameterExpansion {
-                            variable: var_name.to_string(),
-                            operator: ParameterExpansionOperator::AssignDefault(
-                                default_val.to_string(),
-                            ),
-                            is_mutable: true,
-                        },
-                        None,
-                    ))
-                } else if content.contains(":+") {
-                    let colon_pos = content.find(":+").unwrap();
-                    let var_name = &content[..colon_pos];
-                    let alt_val = &content[colon_pos + 2..];
-                    Ok(Word::ParameterExpansion(
-                        ParameterExpansion {
-                            variable: var_name.to_string(),
-                            operator: ParameterExpansionOperator::DefaultValue(alt_val.to_string()),
-                            is_mutable: true,
-                        },
+                        colon_operator_expansion(var, op, operand),
                         None,
                     ))
                 } else if let Some(minus_pos) = content.find('-') {
@@ -3043,13 +2952,7 @@ fn parse_variable_expansion_inner(lexer: &mut Lexer) -> Result<Word, ParserError
                     } else {
                         Ok(Word::Variable(content, true, None))
                     }
-                } else if content.contains(':')
-                    && !content.contains("::")
-                    && !content.contains(":-")
-                    && !content.contains(":=")
-                    && !content.contains(":+")
-                    && !content.contains(":?")
-                {
+                } else if content.contains(':') && !content.contains("::") {
                     // ${*:offset} or ${*:offset:length} - array slice
                     let colon_pos = content.find(':').unwrap();
                     let var_name = &content[..colon_pos];
@@ -3103,44 +3006,9 @@ fn parse_variable_expansion_inner(lexer: &mut Lexer) -> Result<Word, ParserError
                 content.push_str(&rest);
                 // Analyze the content using the same logic as the DollarBrace branch
                 // (inline analysis, same as lines ~1030-1275)
-                if content.contains(":-") {
-                    let colon_pos = content.find(":-").unwrap();
-                    let var_name = &content[..colon_pos];
-                    let default_val = &content[colon_pos + 2..];
+                if let Some((var, op, operand)) = split_colon_operator(&content) {
                     Ok(Word::ParameterExpansion(
-                        ParameterExpansion {
-                            variable: var_name.to_string(),
-                            operator: ParameterExpansionOperator::DefaultValue(
-                                default_val.to_string(),
-                            ),
-                            is_mutable: true,
-                        },
-                        None,
-                    ))
-                } else if content.contains(":=") {
-                    let colon_pos = content.find(":=").unwrap();
-                    let var_name = &content[..colon_pos];
-                    let default_val = &content[colon_pos + 2..];
-                    Ok(Word::ParameterExpansion(
-                        ParameterExpansion {
-                            variable: var_name.to_string(),
-                            operator: ParameterExpansionOperator::AssignDefault(
-                                default_val.to_string(),
-                            ),
-                            is_mutable: true,
-                        },
-                        None,
-                    ))
-                } else if content.contains(":+") {
-                    let colon_pos = content.find(":+").unwrap();
-                    let var_name = &content[..colon_pos];
-                    let alt_val = &content[colon_pos + 2..];
-                    Ok(Word::ParameterExpansion(
-                        ParameterExpansion {
-                            variable: var_name.to_string(),
-                            operator: ParameterExpansionOperator::DefaultValue(alt_val.to_string()),
-                            is_mutable: true,
-                        },
+                        colon_operator_expansion(var, op, operand),
                         None,
                     ))
                 } else if let Some(minus_pos) = content.find('-') {
@@ -3215,13 +3083,7 @@ fn parse_variable_expansion_inner(lexer: &mut Lexer) -> Result<Word, ParserError
                     } else {
                         Ok(Word::Variable(content, true, None))
                     }
-                } else if content.contains(':')
-                    && !content.contains("::")
-                    && !content.contains(":-")
-                    && !content.contains(":=")
-                    && !content.contains(":+")
-                    && !content.contains(":?")
-                {
+                } else if content.contains(':') && !content.contains("::") {
                     // ${@:offset} or ${@:offset:length} - array slice
                     let colon_pos = content.find(':').unwrap();
                     let var_name = &content[..colon_pos];
@@ -4269,6 +4131,46 @@ fn split_zsh_subscript_flag(key: &str) -> Option<(String, String)> {
     Some((flag_text.to_string(), rest[close + 1..].to_string()))
 }
 
+/// Recognise a `:`-prefixed operator (`:-`, `:=`, `:+`, `:?`) at the FIRST
+/// colon of the body only. Bash takes the variable name as the maximal
+/// plain-name prefix, so a colon later in the text belongs to the operand:
+/// `${s:1:-1}` is a substring whose length is `-1`, NOT `${s:1:-1}` with
+/// default `1`. Splitting on the first `:-` anywhere conflated the two and
+/// discarded the sign of the length (zig-20261021-param-lowering-gaps §2).
+///
+/// Returns `(name, op, operand)`; `None` when the first colon does not
+/// introduce one of the four operators (a substring/array slice instead).
+fn split_colon_operator(content: &str) -> Option<(&str, &'static str, &str)> {
+    let cp = content.find(':')?;
+    let rest = &content[cp + 1..];
+    let op = match rest.as_bytes().first().copied()? {
+        b'-' => ":-",
+        b'=' => ":=",
+        b'+' => ":+",
+        b'?' => ":?",
+        _ => return None,
+    };
+    Some((&content[..cp], op, &rest[1..]))
+}
+
+/// Build the [`ParameterExpansion`] for a `split_colon_operator` result.
+/// `:+` maps to [`ParameterExpansionOperator::UseAlternative`] with the
+/// non-empty test — folding it into `:-` (as the parser used to) makes the
+/// A1 unable to distinguish `${x:+y}` from `${x:-y}` in every backend.
+fn colon_operator_expansion(var: &str, op: &str, operand: &str) -> ParameterExpansion {
+    let operator = match op {
+        ":=" => ParameterExpansionOperator::AssignDefault(operand.to_string()),
+        ":+" => ParameterExpansionOperator::UseAlternative(operand.to_string(), true),
+        ":?" => ParameterExpansionOperator::ErrorIfUnset(operand.to_string()),
+        _ => ParameterExpansionOperator::DefaultValue(operand.to_string()),
+    };
+    ParameterExpansion {
+        variable: var.to_string(),
+        operator,
+        is_mutable: true,
+    }
+}
+
 pub fn parse_parameter_expansion_content(content: &str) -> Result<ParameterExpansion, ParserError> {
     let mut pe = parse_parameter_expansion_content_inner(content)?;
     // A double-quoted `${...}`: the VALUE operand follows the double-quote
@@ -4349,46 +4251,11 @@ fn parse_parameter_expansion_content_inner(
         });
     }
 
-    // Check for parameter expansion operators with colon prefix BEFORE array access
-    if content.contains(":-") {
-        let parts: Vec<&str> = content.splitn(2, ":-").collect();
-        if parts.len() == 2 {
-            return Ok(ParameterExpansion {
-                variable: parts[0].to_string(),
-                operator: ParameterExpansionOperator::DefaultValue(parts[1].to_string()),
-                is_mutable: true,
-            });
-        }
-    }
-    if content.contains(":=") {
-        let parts: Vec<&str> = content.splitn(2, ":=").collect();
-        if parts.len() == 2 {
-            return Ok(ParameterExpansion {
-                variable: parts[0].to_string(),
-                operator: ParameterExpansionOperator::AssignDefault(parts[1].to_string()),
-                is_mutable: true,
-            });
-        }
-    }
-    if content.contains(":+") {
-        let parts: Vec<&str> = content.splitn(2, ":+").collect();
-        if parts.len() == 2 {
-            return Ok(ParameterExpansion {
-                variable: parts[0].to_string(),
-                operator: ParameterExpansionOperator::DefaultValue(parts[1].to_string()),
-                is_mutable: true,
-            });
-        }
-    }
-    if content.contains(":?") {
-        let parts: Vec<&str> = content.splitn(2, ":?").collect();
-        if parts.len() == 2 {
-            return Ok(ParameterExpansion {
-                variable: parts[0].to_string(),
-                operator: ParameterExpansionOperator::ErrorIfUnset(parts[1].to_string()),
-                is_mutable: true,
-            });
-        }
+    // Check for parameter expansion operators with colon prefix BEFORE array access.
+    // Only the FIRST colon can introduce one (`${s:1:-1}` is a slice: the
+    // `-1` is the length, not a `:-` default).
+    if let Some((var, op, operand)) = split_colon_operator(content) {
+        return Ok(colon_operator_expansion(var, op, operand));
     }
 
     // Check for ${var:offset} or ${var:offset:length} - substring/array-slice
@@ -4597,10 +4464,6 @@ fn parse_parameter_expansion_content_inner(
         && !content.contains('[')
         && !content.contains(']')
         && !content.contains("::")
-        && !content.contains(":-")
-        && !content.contains(":=")
-        && !content.contains(":+")
-        && !content.contains(":?")
         && !content.contains('%')
         && !content.contains('#')
         && !content.contains('/')
@@ -4734,51 +4597,8 @@ fn parse_parameter_expansion_content_inner(
                 is_mutable: true,
             })
         }
-    } else if content.contains(":-") {
-        let parts: Vec<&str> = content.splitn(2, ":-").collect();
-        if parts.len() == 2 {
-            Ok(ParameterExpansion {
-                variable: parts[0].to_string(),
-                operator: ParameterExpansionOperator::DefaultValue(parts[1].to_string()),
-                is_mutable: true,
-            })
-        } else {
-            Ok(ParameterExpansion {
-                variable: content.to_string(),
-                operator: ParameterExpansionOperator::None,
-                is_mutable: true,
-            })
-        }
-    } else if content.contains(":=") {
-        let parts: Vec<&str> = content.splitn(2, ":=").collect();
-        if parts.len() == 2 {
-            Ok(ParameterExpansion {
-                variable: parts[0].to_string(),
-                operator: ParameterExpansionOperator::AssignDefault(parts[1].to_string()),
-                is_mutable: true,
-            })
-        } else {
-            Ok(ParameterExpansion {
-                variable: content.to_string(),
-                operator: ParameterExpansionOperator::None,
-                is_mutable: true,
-            })
-        }
-    } else if content.contains(":?") {
-        let parts: Vec<&str> = content.splitn(2, ":?").collect();
-        if parts.len() == 2 {
-            Ok(ParameterExpansion {
-                variable: parts[0].to_string(),
-                operator: ParameterExpansionOperator::ErrorIfUnset(parts[1].to_string()),
-                is_mutable: true,
-            })
-        } else {
-            Ok(ParameterExpansion {
-                variable: content.to_string(),
-                operator: ParameterExpansionOperator::None,
-                is_mutable: true,
-            })
-        }
+    } else if let Some((var, op, operand)) = split_colon_operator(content) {
+        Ok(colon_operator_expansion(var, op, operand))
     } else if content.contains('-')
         && !content.contains('%')
         && !content.contains('#')
@@ -6028,6 +5848,67 @@ mod backslash_operand_tests {
                 other => panic!("expected a / substitution, got {other:?}"),
             },
             other => panic!("expected a parameter expansion, got {other:?}"),
+        }
+    }
+}
+
+/// Regression pins for the two colon-operator information losses filed as
+/// `zig-20261021-param-lowering-gaps`.
+#[cfg(test)]
+mod colon_operator_tests {
+    use super::*;
+    use crate::ast::ParameterExpansionOperator as Op;
+
+    fn params(body: &str) -> ParameterExpansion {
+        parse_parameter_expansion_content(body).expect("parses")
+    }
+
+    /// `${x:+y}` is the ALTERNATE-VALUE operator: y only when x is SET and
+    /// NON-EMPTY. It used to parse as `DefaultValue` (`:-`), so the A1
+    /// could not distinguish it from `${x:-y}` and every backend printed
+    /// the fallback for an empty-but-set x.
+    #[test]
+    fn colon_plus_is_use_alternative_not_default() {
+        match params("x:+y").operator {
+            Op::UseAlternative(v, need_nonempty) => {
+                assert_eq!(v, "y");
+                assert!(need_nonempty, "`:+` requires the non-empty test");
+            }
+            other => panic!("expected UseAlternative, got {other:?}"),
+        }
+        // The plain `:-` must stay DefaultValue (the control).
+        match params("x:-y").operator {
+            Op::DefaultValue(v) => assert_eq!(v, "y"),
+            other => panic!("expected DefaultValue, got {other:?}"),
+        }
+    }
+
+    /// Only the FIRST colon can introduce a `:` operator. In `${s:1:-1}`
+    /// the first colon starts a SLICE and the `-1` is the LENGTH; splitting
+    /// on the `:-` substring produced variable "s:1" with default "1" and
+    /// discarded the sign.
+    #[test]
+    fn negative_slice_length_is_not_a_colon_dash_operator() {
+        match params("s:1:-1").operator {
+            Op::ArraySlice(off, len) => {
+                assert_eq!(off, "1");
+                assert_eq!(len.as_deref(), Some("-1"));
+            }
+            other => panic!("expected an ArraySlice, got {other:?}"),
+        }
+        // `${x::-2}` (empty offset) stays the working slice form.
+        match params("x::-2").operator {
+            Op::ArraySlice(off, len) => {
+                assert_eq!(off, "0");
+                assert_eq!(len.as_deref(), Some("-2"));
+            }
+            other => panic!("expected an ArraySlice, got {other:?}"),
+        }
+        // A genuine `:-` whose default contains a colon still splits at the
+        // FIRST colon only.
+        match params("x:-a:b").operator {
+            Op::DefaultValue(v) => assert_eq!(v, "a:b"),
+            other => panic!("expected DefaultValue, got {other:?}"),
         }
     }
 }

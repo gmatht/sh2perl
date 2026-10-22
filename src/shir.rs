@@ -6771,6 +6771,11 @@ pub fn ast_to_ir_transforms(prog: &mut IrProgram) {
     // mid-emission (the determinism unit tests compile concurrently).
     // Never re-entered: shir_to_estree does not call ast_to_ir.
     let _compile_guard = COMPILE_LOCK.lock().unwrap();
+    // Snapshot the list `stmt_lines` was indexed against (the
+    // post-`optimize_stmts` program `ast_to_ir_pre_transforms` built), so
+    // the map can be re-indexed at the end of this function once these
+    // passes have had their say.
+    let pre_transforms = prog.stmts.clone();
     crate::transforms::apply(&mut prog.stmts);
     // Generalise the split-fold offer (PLAN §11 marketplace): the shared
     // `shir_passes::split_fold` pass was a finished, unit-tested
@@ -6800,6 +6805,33 @@ pub fn ast_to_ir_transforms(prog: &mut IrProgram) {
         // to the statement expressions it rewrote.
         prog.var_nospace.clear();
     }
+
+    // The line map built in `ast_to_ir_pre_transforms` was indexed
+    // against the pre-transform list, but the passes above can ALSO drop,
+    // insert or rewrite statements — `dead-store-elim` and
+    // `copy-propagation` live in `transforms::apply`, not in
+    // `optimize_stmts` — so a map that is only reconciled around
+    // `optimize_stmts` goes stale here exactly the way the pre-transform
+    // half prevents there: for `x=hi` + `echo done` it still claimed
+    // statement 0 was the elided assignment, and for `x=hi` + `echo $x`
+    // (folded into one synthesized `echo hi`) it named statement indices
+    // past the end of a one-statement program. Re-index the survivors by
+    // the same identity match: a statement that survives keeps its own
+    // line, a dropped one takes its entry with it, and one these passes
+    // INSERTED has no origin and gets none (a missing line is
+    // recoverable, a wrong one is not).
+    let line_of: std::collections::HashMap<usize, usize> =
+        prog.stmt_lines.iter().copied().collect();
+    let mut stmt_lines: Vec<(usize, usize)> = Vec::with_capacity(line_of.len());
+    let to_pre = align_by_identity(&prog.stmts, &pre_transforms);
+    for (j, via) in to_pre.iter().enumerate() {
+        // stmts[j] -> pre_transforms[*via] -> the line that statement had.
+        let Some(b) = (*via) else { continue };
+        if let Some(&line) = line_of.get(&b) {
+            stmt_lines.push((j, line));
+        }
+    }
+    prog.stmt_lines = stmt_lines;
 }
 
 /// The CANONICAL statement lowering — `stmt_for_command` for every command,
@@ -48492,7 +48524,18 @@ fn try_native_param(args: &[IrExpr]) -> Option<Expr> {
                 Some(method(val(), "slice", vec![int_lit(o)]))
             } else {
                 let l = int_of(len)?;
-                Some(method(val(), "slice", vec![int_lit(o), int_lit(o + l)]))
+                if l < 0 {
+                    // A NEGATIVE length means "stop |l|-1 characters
+                    // before the END": the end index is `String(v).length
+                    // + l`, not `o + l` (`s=hello; ${s:1:-1}` → ell).
+                    Some(method(
+                        val(),
+                        "slice",
+                        vec![int_lit(o), bin(member(val(), "length"), "+", int_lit(l))],
+                    ))
+                } else {
+                    Some(method(val(), "slice", vec![int_lit(o), int_lit(o + l)]))
+                }
             }
         }
         // ${x##*/} — the parser's basename/dirname ops: pure string work

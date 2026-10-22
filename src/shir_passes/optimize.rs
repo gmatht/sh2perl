@@ -179,11 +179,36 @@ fn arith_reads(name: &str, a: &ArithAst) -> bool {
         ArithAst::Cond { test, then, else_ } => {
             arith_reads(name, test) || arith_reads(name, then) || arith_reads(name, else_)
         }
-        ArithAst::Assign { var: _, rhs, .. } => arith_reads(name, rhs),
-        ArithAst::IncDec { var: _, .. } => false,
+        // A compound arith assignment (`i+=2`, `i*=3`) is a READ of the
+        // target: its value is the current value combined with the rhs.
+        // `=` is a plain overwrite. Treating the compound form as
+        // write-only let the DSE drop the initialising store.
+        ArithAst::Assign { var, op, rhs } => {
+            arith_reads(name, rhs) || (op != "=" && var == name)
+        }
+        // `i++` / `--i` always read the current value.
+        ArithAst::IncDec { var, .. } => var == name,
         ArithAst::Sizeof(_) => false,
         ArithAst::Cast { arg, .. } => arith_reads(name, arg),
     }
+}
+
+/// `assign(V, OP, …)` with a compound `OP` is a read-modify-write of `V`
+/// (bash's scalar `+=` is string append; the arithmetic ops combine with
+/// the current value). Missing this read made the const-prop DSE drop the
+/// base write in `n=1; n+=2` — every backend then computed from an empty
+/// variable (zig-20261021-param-lowering-gaps §3).
+fn assign_rmw_reads(name: &str, expr: &IrExpr) -> bool {
+    if let IrExpr::Call { func, args } = expr {
+        if func == "assign" {
+            if let (Some(IrExpr::Str(v, _)), Some(IrExpr::Str(op, _))) =
+                (args.first(), args.get(1))
+            {
+                return v == name && op != "=";
+            }
+        }
+    }
+    false
 }
 
 /// Does a statement list READ `name`?
@@ -197,6 +222,7 @@ pub fn stmt_reads(name: &str, st: &IrStmt) -> bool {
         IrStmt::Expr(e) => expr_reads(name, e),
         IrStmt::Assign { targets, expr, .. } => {
             expr_reads(name, expr)
+                || assign_rmw_reads(name, expr)
                 // the index is either a live `indices` expr OR BAKED into
                 // the target name (`arr[$i]=v` → var "arr[$i]"). Both are
                 // READS of the index variable: without the baked case the
