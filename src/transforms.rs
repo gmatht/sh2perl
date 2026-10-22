@@ -147,6 +147,7 @@ pub mod typeset_attrs; // `typeset -i VAR` integer attribute → later assignmen
 pub mod arith_identity; // OFFER (core-requests/transforms/offered/arith-identity)
 pub mod arith_normalize; // frontend-shape normalisation (`0 - X` → `-X`); run by ingress, not the env-gated registry
 pub mod array_len_fold; // OFFER core-requests/transforms/offered/array-len-fold.rs: `${#arr[@]}` → arrayLen(arr)
+pub mod slice_identity; // OFFER core-requests/transforms/offered/slice-identity.rs: `${v:0}`/`${v:}` → the plain read param("", v)
 pub mod builtin;
 pub mod inline_pure_fns; // marketplace offer (estree-20260813-182431) // core-requests/shir-builtin-op: exec(cmd∈builtins) → the native `builtin` op
 pub mod isolate_accumulate; // loop-private temp inlining (single-accumulate isolation)
@@ -241,6 +242,14 @@ pub fn all() -> Vec<(&'static str, TransformFn)> {
         ("process-subst", process_subst::transform),
         ("arith-forms", arith_forms::transform),
         ("array-len-fold", array_len_fold::transform), // `${#arr[@]}` slice spelling → the contract's arrayLen node
+        // `${v:0}` / `${v:0:}` / `${v:}` is the WHOLE parameter — the offset
+        // form reads the same value. Fold the zero-offset empty-length
+        // param("slice") back to the plain read so every backend retires its
+        // substring helper (`__sh_substr`/`shSubstr`/`substr($v,0)`/`cut`) and
+        // copy-propagation sees a plain var read. REFUSE > GUESS: non-zero
+        // offsets, any length (incl. "0"), and every indexed/positional/
+        // indirect/array-list spelling are untouched.
+        ("slice-identity", slice_identity::transform),
         // `typeset -i VAR` marks VAR integer for the rest of the scope, so
         // later `VAR=EXPR` assignments must evaluate EXPR as arithmetic.
         // Bash semantics shared by every backend, so it lives in the shared
