@@ -1114,9 +1114,6 @@ fn hoist_nested_functions(st: &mut IrStmt, out: &mut Vec<IrStmt>) {
                         }
                         out.push(IrStmt::Function {
                             name: name.clone(),
-                            // bash functions bind positional args ($argv in
-                            // fish) — no named params to carry through.
-                            params: Vec::new(),
                             body: fb.clone(),
                             named_blocks: Vec::new(),
                         });
@@ -1289,6 +1286,8 @@ pub fn shir_to_fish(prog: &IrProgram) -> Result<String, String> {
     // the helpers it never called still counted as runtime calls. Deciding
     // from the rendered text is exact by construction: the definition is
     // emitted exactly when a call is, whichever lowering produced it.
+    // the loop-end sentinel is resolved at the very end (a redirect may still
+    // attach to it while the statements render)
     let mut body = String::new();
     for st in &prog.stmts {
         stmt_to_fish(st, 0, &mut body)?;
@@ -1304,6 +1303,7 @@ pub fn shir_to_fish(prog: &IrProgram) -> Result<String, String> {
         *LOCAL_VARS.lock().unwrap() = saved_locals;
         body.push_str("end\n");
     }
+    let body = loop_end_plain(&body);
     out.push_str(&arr_helper_preamble(&body));
     out.push_str(&shell_identity_preamble(&body));
     // A call is `_num "…"` or `$(_num "…")` — the `$(` prefix defeated the
@@ -1754,55 +1754,6 @@ fn ext_node_to_fish(node: &dyn crate::shir_nodes::ExtNode) -> Result<Option<Stri
 
 fn stmt_to_fish(st: &IrStmt, d: usize, out: &mut String) -> Result<(), String> {
     match st {
-        // ── Ext(GpuOp): the DEVICE WRITE the fbdev-gpu lift replaced ──
-        // `echo … > /dev/fb0/…` was lifted into a GPU-op node so a backend
-        // with a GPU leg can emit a dispatch. The fish renderer has no GPU leg,
-        // and the pass's own contract (§4.4 "the correctness firewall") says a
-        // renderer without one must render the ORIGINAL write. The A1
-        // ingress runs the transforms with THIS target bound, so the lift
-        // can reach here (mimecroft.sh): before this arm the whole render
-        // refused with "Ext node GpuOp unsupported".
-        IrStmt::Ext(n) if n.tag() == "GpuOp" => {
-            let path = {
-                let g = n
-                    .as_any()
-                    .downcast_ref::<crate::shir_nodes::GpuOp>()
-                    .expect("tag/type agree");
-                if g.slot.is_empty() {
-                    format!("{}/{}", g.device, g.verb)
-                } else {
-                    format!("{}/{}/{}", g.device, g.slot, g.verb)
-                }
-            };
-            let payload = n
-                .as_any()
-                .downcast_ref::<crate::shir_nodes::GpuOp>()
-                .expect("tag/type agree")
-                .payload
-                .clone();
-            stmt_to_fish(
-                &IrStmt::Redirect {
-                    // the ORIGINAL call, spelled the way `ast_to_ir`
-                    // lowers `echo "$p" > dev` (the frontends' lowering) —
-                    // a bare `Call { "echo", [p] }` is not renderable.
-                    inner: vec![IrStmt::Expr(IrExpr::Call {
-                        func: "exec".to_string(),
-                        args: vec![
-                            IrExpr::Str("echo".to_string(), StrStyle::DoubleQuoted),
-                            IrExpr::Array(vec![payload]),
-                        ],
-                    })],
-                    redirects: vec![IrRedirect {
-                        fd: None,
-                        mode: "w".to_string(),
-                        target: IrExpr::Str(path, StrStyle::SingleQuoted),
-                        interpolate: false,
-                    }],
-                },
-                d,
-                out,
-            )
-        }
         IrStmt::Ext(node) => {
             let Some(rendered) = ext_node_to_fish(node.as_ref())? else {
                 return Err(format!("sh renderer: Ext node {} unsupported", node.tag()));
@@ -1839,7 +1790,8 @@ fn stmt_to_fish(st: &IrStmt, d: usize, out: &mut String) -> Result<(), String> {
                 ));
             }
             indent(out, d);
-            out.push_str(&assign_to_fish(targets, expr)?);
+            let r = assign_to_fish(targets, expr)?;
+            out.push_str(&r);
             out.push('\n');
             Ok(())
         }
@@ -1900,7 +1852,8 @@ fn stmt_to_fish(st: &IrStmt, d: usize, out: &mut String) -> Result<(), String> {
                     stmt_to_fish(b, d + 1, out)?;
                 }
                 indent(out, d);
-                out.push_str("end\n");
+                out.push_str(LOOP_END);
+                out.push('\n');
                 return Ok(());
             }
             indent(out, d);
@@ -1913,7 +1866,8 @@ fn stmt_to_fish(st: &IrStmt, d: usize, out: &mut String) -> Result<(), String> {
                 stmt_to_fish(b, d + 1, out)?;
             }
             indent(out, d);
-            out.push_str("end\n");
+            out.push_str(LOOP_END);
+            out.push('\n');
             Ok(())
         }
         IrStmt::While { cond, body } => {
@@ -1925,7 +1879,8 @@ fn stmt_to_fish(st: &IrStmt, d: usize, out: &mut String) -> Result<(), String> {
                 stmt_to_fish(b, d + 1, out)?;
             }
             indent(out, d);
-            out.push_str("end\n");
+            out.push_str(LOOP_END);
+            out.push('\n');
             Ok(())
         }
         IrStmt::ForInit { .. } => Err(
@@ -2127,6 +2082,12 @@ fn stmt_to_fish(st: &IrStmt, d: usize, out: &mut String) -> Result<(), String> {
                     }
                 }
                 if any {
+                    // The dup no-op renders as the bare `:`; a CAPTURE body
+                    // needs the dup INSTALLED, which capture_lines does from
+                    // the IR itself (an exec-dup no-op followed by commands).
+                    indent(out, d);
+                    out.push_str(":");
+                    out.push('\n');
                     return Ok(());
                 }
             }
@@ -2475,6 +2436,7 @@ fn stmt_to_fish(st: &IrStmt, d: usize, out: &mut String) -> Result<(), String> {
 /// `var=value` for a statement-level assignment. Handles the sh2.* RHS
 /// forms (capture, pipeline, arith, setArray, assign) natively.
 fn assign_to_fish(targets: &[crate::ir::AssignTarget], expr: &IrExpr) -> Result<String, String> {
+
     // `((i++))` / `((i--))` — the arith-statement shape (triage-sh
     // t29_increment): the estree renderer emits the IncDec BARE when the
     // single target is the SAME var the arith mutates — the statement's value
@@ -2548,6 +2510,7 @@ fn assign_to_fish(targets: &[crate::ir::AssignTarget], expr: &IrExpr) -> Result<
         if i > 0 {
             out.push_str("; ");
         }
+
         let mut rhs = assign_rhs_to_fish(expr)?;
         // `typeset -i` vars assign ARITHMETICALLY (`n=n+1` -> 43)
         // `typeset -l` / `-u`: case-fold the value on every write.
@@ -3004,13 +2967,43 @@ fn matching_paren_close(s: &str) -> Option<usize> {
     None
 }
 
+/// Inside a command substitution a NEWLINE separates commands; a `; ` does
+/// not (fish ends the enclosing command line there, and the rest of the
+/// capture escaped — `x=$(exec 4>&1; echo before >&4)` ran fish's own `exec`).
+/// A multi-command body, and a `begin … end` group (which a second `begin`
+/// nested inside would turn into "Missing end to balance this begin"),
+/// therefore joins with newlines.
+fn cmdsub_newlines(body: String) -> String {
+    if body.contains("; ") || body.contains("\nbegin") {
+        body.replace("; ", "\n").replace("\nbegin", "\nbegin ")
+    } else {
+        body
+    }
+}
+
+/// A capture body of several commands, each on its own line. A bare sequence
+/// inside `( … )` would put the later commands OUTSIDE the substitution's
+/// pipeline (they printed straight to the terminal — `before sub after` instead
+/// of the capture's `before`), so a multi-line body is grouped.
+fn capture_body_fish(body: &str) -> String {
+    // The group is spelled `begin` / body / `end` on its OWN lines, so the
+    // substitution always reads `( begin … end | collect )` with the `begin`
+    // as the FIRST word of the line — a `begin` that merely starts a line
+    // inside a multi-line body does not open the group (measured: fish
+    // balanced the inner `begin`s against the outer `end` and reported "Missing
+    // end").
+    format!("begin\n{}\nend", body.trim_matches('\n'))
+}
+
+
 fn collect_wrap_fish(body: &str) -> String {
     // A body that already IS a parenthesised group (`(cmd 2>file) | collect`)
     // is INVALID fish in statement position — fish reads `( … )` as a command
     // substitution and rejects it ("command substitutions not allowed here").
     // It must be re-spelled as `begin … end`, which is fish's statement-level
     // grouping and pipes as a unit.
-    let t = body.trim();
+    let t0 = body.to_string();
+    let t = t0.trim();
     if t.starts_with('(') {
         // Split `(CMD) SUFFIX` into the group's body and whatever trails it
         // (typically the redirects). fish accepts `begin; CMD; end 2>file`
@@ -3024,10 +3017,10 @@ fn collect_wrap_fish(body: &str) -> String {
             return format!("begin; {inner}; end {suffix}");
         }
     }
-    if has_top_level_separator(body) {
-        return format!("begin; {body}; end");
+    if has_top_level_separator(&t0) {
+        return format!("begin; {t0}; end");
     }
-    body.to_string()
+    t0
 }
 
 /// Is there a command SEPARATOR — `;`, `&&` or `||` — at paren depth 0,
@@ -3092,7 +3085,10 @@ fn assign_rhs_to_fish(expr: &IrExpr) -> Result<String, String> {
             if let Some(lift) = capture_idiom_fish(inner)? {
                 return Ok(lift);
             }
-            let body = arrow_to_fish(std::slice::from_ref(inner.as_ref()))?;
+            let body = match inner.as_ref() {
+                IrExpr::Arrow(stmts) => capture_lines(stmts)?,
+                _ => arrow_to_fish(std::slice::from_ref(inner.as_ref()))?,
+            };
             // NOTE: `string collect` is NOT removable for a "single" command.
             // A lone command can still print MANY lines (`sha256sum a b`,
             // `ls`), and bash's `$(…)` keeps them as one newline-joined
@@ -3100,11 +3096,22 @@ fn assign_rhs_to_fish(expr: &IrExpr) -> Result<String, String> {
             // Dropping the wrap on the "one command => one line" assumption
             // regressed 5 files (000__04b/04c/06, readonly-cmdsub,
             // test_system_builtin).
-            Ok(format!("({} | string collect)", collect_wrap_fish(&body)))
+            // A body that is ONE command (`begin; …; end | cat`) is already
+            // grouped; everything else is wrapped so the commands after the
+            // first stay inside the substitution.
+            let grouped = if body.starts_with("begin; ") && !body.contains('\n') {
+                body.clone()
+            } else {
+                capture_body_fish(&body)
+            };
+            Ok(format!(
+                "({} | string collect)",
+                cmdsub_newlines(collect_wrap_fish(&grouped))
+            ))
         }
         IrExpr::Call { func, args } => match func.as_str() {
-            "capture" => Ok(cmdsub_word_fish(arrow_to_fish(args)?, true)),
-            "captureWords" => Ok(cmdsub_word_fish(arrow_to_fish(args)?, false)),
+            "capture" => Ok(cmdsub_word_fish(arrow_body(args, true)?.0, true)),
+            "captureWords" => Ok(cmdsub_word_fish(arrow_body(args, false)?.0, false)),
             "pipeline" => {
                 let stages = pipeline_stages(args)?;
                 Ok(format!("$({})", pipeline_line(&stages)?))
@@ -3832,8 +3839,8 @@ fn cmd_to_fish(e: &IrExpr) -> Result<String, String> {
                 Ok(format!("{}_{}={}", arr_base(&name), key, value))
             }
             "getVar" => Ok(var_ref_to_fish(&raw_arg(args, 0)?.replace('.', "_"), false)),
-            "capture" => Ok(cmdsub_word_fish(arrow_to_fish(args)?, true)),
-            "captureWords" => Ok(cmdsub_word_fish(arrow_to_fish(args)?, false)),
+            "capture" => Ok(cmdsub_word_fish(arrow_body(args, true)?.0, true)),
+            "captureWords" => Ok(cmdsub_word_fish(arrow_body(args, false)?.0, false)),
             "contains" => {
                 let arg = word_to_fish(arg(args, 0)?)?;
                 let pat = raw_arg(args, 1)?;
@@ -4457,9 +4464,15 @@ fn exec_line_to_fish(
 ) -> Result<String, String> {
     // `exec N>&M` — an fd dup with NO command. bash makes it persistent;
     // fish has no `exec` builtin at all (it would run fish's own `exec`, which
-    // replaces the process), so the dup is recorded in the fd table and a
-    // later `>&N` resolves through it. This is the ONLY reason the statement
-    // needs special handling — a bare `exec` with a command is a real exec.
+    // replaces the process), so the dup is recorded in the renderer's fd table
+    // (every later `>&N` resolves through it) and the statement renders as the
+    // `:` no-op.
+    //
+    // A CAPTURE body needs the dup INSTALLED at run time, not just resolved:
+    // fish has no persistent fd table and a redirect lives only on the
+    // command it is written on. There `capture_lines` carries these specs onto
+    // the next command (`echo before >&4 4>&1`), which is why they travel as a
+    // `:` + marker render rather than a bare no-op.
     if matches!(cmd, IrExpr::Str(c, _) if c == "exec") {
         // Redirects are spread across `args` as spec Objects (the `exec`
         // statement's `redirects` field arrives as a trailing Array/Object).
@@ -4484,6 +4497,10 @@ fn exec_line_to_fish(
                 }
             }
             if any {
+                // The dup is RECORDED above: every later `>&N` resolves
+                // through FD_DUPS to the fd it ultimately aliases, and the
+                // statement itself is the `:` no-op.
+                let _ = &redirs;
                 return Ok(":".into());
             }
         }
@@ -5652,6 +5669,16 @@ fn exec_line_to_fish(
     // inherited `_cmp` polyfill was POSIX sh and unparseable in fish, and
     // the gate's bash reference invokes the same GNU `cmp`.
     out.push_str(&word_to_fish(cmd)?);
+    // A BARE `exec` (no words, redirects already peeled above): bash replaces
+    // the shell only when it has a COMMAND. With redirects alone it is a
+    // no-op that leaves them installed, and fish's own `exec` is a different
+    // program — `exec` with no argument handed it `echo before` as its command
+    // name, which printed fish's help page and failed. The no-op keeps the
+    // redirects, so `exec 4>&1` inside a capture still installs fd 4 for the
+    // rest of that substitution.
+    if cmd_name == Some("exec") && args.is_empty() && !out.contains('>') && !out.contains('<') {
+        return Ok(":".into());
+    }
     for w in args {
         out.push(' ');
         out.push_str(&word_to_fish(w)?);
@@ -6378,9 +6405,14 @@ fn word_to_fish(e: &IrExpr) -> Result<String, String> {
             if let Some(lift) = capture_idiom_fish(expr)? {
                 Ok(lift)
             } else {
+                // the body joins its commands with NEWLINES when there are
+                // several (see body_separator) — legal inside `( … )` — and a
+                // multi-command body is grouped so the commands after the
+                // first stay inside the substitution
+                let body = capture_lines(arrow_stmts_of(std::slice::from_ref(expr.as_ref()))?)?;
                 Ok(format!(
                     "({})",
-                    arrow_to_fish(std::slice::from_ref(expr.as_ref()))?
+                    cmdsub_newlines(capture_body_fish(&body))
                 ))
             }
         }
@@ -6706,6 +6738,82 @@ fn cmdsub_sole_body(s: &str) -> Option<&str> {
     None
 }
 
+/// fish has no `; ` INSIDE a command substitution's `( … )`: a `;` ends the
+/// enclosing command line, so the rest of the capture escapes into the outer
+/// scope (`x=$(exec 4>&1; echo before >&4)` truncated at the first `;` and ran
+/// fish's own `exec`). A NEWLINE is a plain `( … )` separator, so a body of
+/// several commands is joined with newlines instead.
+fn body_separator(stmts: &[IrStmt]) -> &'static str {
+    if stmts.len() > 1 {
+        "\n"
+    } else {
+        "; "
+    }
+}
+
+/// A capture body of SEVERAL commands (`$(a; b)`), joined with separators
+/// that are legal inside `( … )`. A command that is itself a sequence
+/// (`&&`/`||`, so `has_top_level_separator`) is grouped so the line break
+/// cannot split its operands.
+
+/// Is this arrow a sequence (`$(a; b)`) whose render needs a newline
+/// separator rather than the inline `; `?
+fn body_needs_newlines(stmts: &[IrStmt]) -> bool {
+    stmts.len() > 1
+}
+
+
+fn capture_lines(stmts: &[IrStmt]) -> Result<String, String> {
+    let mut out: Vec<String> = Vec::new();
+    for st in stmts {
+        out.push(stmt_inline(st)?);
+    }
+    Ok(out.join(body_separator(stmts)))
+}
+
+/// A rendered line that OPENS a block whose `end` is on a later line
+/// (`begin`/`if`/`for`/`while`/`function`/`switch` on its own line, or a line
+/// whose `end` count is short of its openers).
+fn opens_block(line: &str) -> bool {
+    let first = line.trim_start();
+    let kw = first.split(|c: char| !(c.is_alphanumeric() || c == '_')).next().unwrap_or("");
+    if matches!(kw, "begin" | "if" | "for" | "while" | "function" | "switch") {
+        return true;
+    }
+    // `begin`/`if` … at the END of a line whose body continues below
+    let words: Vec<&str> = first
+        .split(|c: char| c.is_whitespace() || c == ';')
+        .filter(|w| !w.is_empty())
+        .collect();
+    let (opens, closes) = words.iter().fold((0i32, 0i32), |(o, c), w| match *w {
+        "begin" | "if" | "for" | "while" | "function" | "switch" => (o + 1, c),
+        "end" => (o, c + 1),
+        _ => (o, c),
+    });
+    opens > closes
+}
+
+/// The block renderer marks a loop's closing `end` with this sentinel: a
+/// redirect written after it attaches to the `end` (`end 4>&1`), turning the
+/// whole loop into ONE scoped command whose redirect stays installed for the
+/// rest of the enclosing `( … )`. A `begin` LINE cannot take a redirect, and a
+/// redirect placed after an already-balanced `end` is just the next command.
+const LOOP_END: &str = "\u{2}end";
+
+/// Finalize the sentinel once nothing can attach to it.
+fn loop_end_plain(out: &str) -> String {
+    out.replace(LOOP_END, "end")
+}
+
+/// The body of a `capture` / `captureWords` call — argument 0 is the Arrow
+/// of statements the substitution RUNS. The second element says whether the
+/// body's own separators are NEWLINES (several commands), which a `; `-joined
+/// enclosing form must not absorb.
+fn arrow_body(args: &[IrExpr], _words: bool) -> Result<(String, bool), String> {
+    let stmts = arrow_stmts_of(args)?;
+    Ok((capture_lines(stmts)?, stmts.len() > 1))
+}
+
 /// A `capture` / `captureWords` word: the arrow body wrapped in ONE fish
 /// command substitution (`"$( … )"` when the enclosing template needs the
 /// quotes, bare `$( … )` for the word-list form).
@@ -6714,6 +6822,7 @@ fn cmdsub_sole_body(s: &str) -> Option<&str> {
 /// substitution, so the two never nest (see `cmdsub_sole_body`).
 fn cmdsub_word_fish(inner: String, quoted: bool) -> String {
     let body = cmdsub_sole_body(&inner).map(str::to_string).unwrap_or(inner);
+    let body = cmdsub_newlines(body);
     if quoted {
         format!("\"$({body})\"")
     } else {
@@ -6910,8 +7019,8 @@ fn call_word_to_fish(func: &str, args: &[IrExpr]) -> Result<String, String> {
             let n = raw_arg(args, 0)?;
             Ok(arr_len_fish(&n))
         }
-        "capture" => Ok(cmdsub_word_fish(arrow_to_fish(args)?, true)),
-        "captureWords" => Ok(cmdsub_word_fish(arrow_to_fish(args)?, false)),
+        "capture" => Ok(cmdsub_word_fish(arrow_body(args, true)?.0, true)),
+        "captureWords" => Ok(cmdsub_word_fish(arrow_body(args, false)?.0, false)),
         // fish has NO `$(( ))` at all: it is a parse error, not a spelling
         // difference, so an arithmetic VALUE that reaches a word position goes
         // through `math` exactly like the interp and assign paths.
@@ -8151,8 +8260,8 @@ fn interp_expr_to_fish_atom(e: &IrExpr) -> Result<String, String> {
                 let n = raw_arg(args, 0)?;
                 Ok(arr_len_fish(&n))
             }
-            "capture" => Ok(cmdsub_word_fish(arrow_to_fish(args)?, true)),
-            "captureWords" => Ok(cmdsub_word_fish(arrow_to_fish(args)?, false)),
+            "capture" => Ok(cmdsub_word_fish(arrow_body(args, true)?.0, true)),
+            "captureWords" => Ok(cmdsub_word_fish(arrow_body(args, false)?.0, false)),
 
             "arith" => {
                 let raw = raw_arg(args, 0)?;
@@ -8191,7 +8300,7 @@ fn interp_expr_to_fish_atom(e: &IrExpr) -> Result<String, String> {
             } else {
                 Ok(format!(
                     "\"$({})\"",
-                    arrow_to_fish(std::slice::from_ref(expr.as_ref()))?
+                    cmdsub_newlines(capture_body_fish(&capture_lines(arrow_stmts_of(std::slice::from_ref(expr.as_ref()))?)?))
                 ))
             }
         }
@@ -9999,6 +10108,14 @@ fn arrow_to_fish(args: &[IrExpr]) -> Result<String, String> {
     arrow_at(args, 0)
 }
 
+/// The statement list of the arrow at arg 0.
+fn arrow_stmts_of(args: &[IrExpr]) -> Result<&[IrStmt], String> {
+    match args.first() {
+        Some(IrExpr::Arrow(stmts)) => Ok(stmts),
+        other => Err(format!("arrow not found at 0: {other:?}")),
+    }
+}
+
 fn arrow_at(args: &[IrExpr], idx: usize) -> Result<String, String> {
     match args.get(idx) {
         Some(IrExpr::Arrow(stmts)) => stmts_inline(stmts),
@@ -10024,11 +10141,19 @@ fn pipeline_stages(args: &[IrExpr]) -> Result<Vec<Vec<IrStmt>>, String> {
 /// Compact single-line rendering of a statement sequence (capture bodies,
 /// pipeline stages, inline compounds).
 fn stmts_inline(stmts: &[IrStmt]) -> Result<String, String> {
-    let mut out = Vec::new();
+    let mut out: Vec<String> = Vec::new();
     for s in stmts {
-        out.push(stmt_inline(s)?);
+        let line = stmt_inline(s)?;
+        // a loop's `end` may take the redirect written right after it
+        if let Some(prev) = out.last_mut() {
+            if prev.ends_with(LOOP_END) {
+                prev.push_str(&format!("\n\n{line}"));
+                continue;
+            }
+        }
+        out.push(line);
     }
-    Ok(out.join("; "))
+    Ok(out.join(body_separator(stmts)))
 }
 
 /// A pipeline rendered as ONE fish line.
@@ -10052,7 +10177,11 @@ fn pipeline_line(stages: &[Vec<IrStmt>]) -> Result<String, String> {
         // IR statements) or textually — a single statement whose lowering
         // emits its own `; ` sequence (the process-substitution transform's
         // `grep -f <(…)` shape).
-        if stg.len() > 1 || has_top_level_separator(&body) {
+        if stg.len() > 1 {
+            // a multi-command stage carries NEWLINE separators, which cannot
+            // be `;`-joined into `begin; …; end`
+            line.push_str(&format!("begin\n{body}\nend"));
+        } else if has_top_level_separator(&body) {
             line.push_str(&format!("begin; {body}; end"));
         } else {
             line.push_str(&body);
@@ -10090,13 +10219,18 @@ fn stmt_inline(st: &IrStmt) -> Result<String, String> {
                     stmts_inline(b)
                 }
             };
-            let mut out = format!("if {}; {}; end", cond_to_fish(cond)?, inline(then)?);
+            // the BRANCH BODIES go on their own lines: stmts_inline joins a
+            // multi-command body with NEWLINES (see body_separator), and a
+            // newline inside `if …; end` ends the `if`.
+            let kw_sep = |b: &[IrStmt]| if b.len() > 1 { "\n" } else { "; " };
+            let mut out = format!("if {}{}{}", cond_to_fish(cond)?, kw_sep(then), inline(then)?);
             for (ec, body) in elsifs {
-                out.push_str(&format!("; else if {}; {}; end", cond_to_fish(ec)?, inline(body)?));
+                out.push_str(&format!("\nelse if {}{}{}", cond_to_fish(ec)?, kw_sep(body), inline(body)?));
             }
             if !else_.is_empty() {
-                out.push_str(&format!("; else {}; end", stmts_inline(else_)?));
+                out.push_str(&format!("\nelse {}{}", kw_sep(else_), stmts_inline(else_)?));
             }
+            out.push_str("\nend");
             Ok(out)
         }
         IrStmt::For { var, iter, body } => {
@@ -10104,19 +10238,22 @@ fn stmt_inline(st: &IrStmt) -> Result<String, String> {
                 // the block renderer's numeric-range form (a fish `for`
                 // over `seq`), kept identical so both spellings agree
                 return Ok(format!(
-                    "for {var} in (seq {start} {end}); {}; end",
+                    "for {var} in (seq {start} {end}){}{}\n{LOOP_END}",
+                    if body.len() > 1 { "\n" } else { "; " },
                     stmts_inline(body)?
                 ));
             }
             Ok(format!(
-                "for {var} in {}; {}; end",
+                "for {var} in {}{}{}\n{LOOP_END}",
                 for_items_to_fish(iter)?,
+                if body.len() > 1 { "\n" } else { "; " },
                 stmts_inline(body)?
             ))
         }
         IrStmt::While { cond, body } => Ok(format!(
-            "while {}; {}; end",
+            "while {}{}{}\n{LOOP_END}",
             cond_to_fish(cond)?,
+            if body.len() > 1 { "\n" } else { "; " },
             stmts_inline(body)?
         )),
         IrStmt::ForInit { .. } => Err(
@@ -10214,9 +10351,14 @@ fn stmt_inline(st: &IrStmt) -> Result<String, String> {
             stmts_inline(body)?
         )),
         IrStmt::Redirect { inner, redirects } => {
-            let mut out = herestring_wrap_fish(redirects, stmts_inline(inner)?)?;
-            out.push_str(&redirects_to_fish(redirects)?);
-            Ok(out)
+            // process substitutions have no inline form; the remaining
+            // redirects render as suffixes on the inner command
+            let mut line = stmts_inline(inner)?;
+            if line.trim() == "''" {
+                line = ":".into();
+            }
+            line.push_str(&redirects_to_fish(redirects)?);
+            Ok(line)
         }
         // `begin … end` is fish's scoped block — the block renderer's form.
         IrStmt::Subshell(body) => Ok(format!("begin; {}; end", stmts_inline(body)?)),
