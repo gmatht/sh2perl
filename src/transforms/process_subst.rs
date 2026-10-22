@@ -120,7 +120,23 @@ fn mktemp_assign(tmp: &str) -> IrStmt {
 
 /// `{ producer…; } <op> tmp` — run the producer IR with the temp file as
 /// the redirect target (stdout for process-in, stdin for process-out).
+///
+/// The producer statements are re-parsed shell text (`parse_producer`), so
+/// a pipeline producer arrives here as a statement-position `pipeline(…)`
+/// CALL — the shape whose only Perl lowering is `system('bash', '-c', …)`.
+/// `shir-pipeline-native` sits EARLIER in the registry than this transform
+/// and therefore never sees these freshly created statements. Re-apply it
+/// here so the producer carries the canonical `IrStmt::Pipeline` form every
+/// renderer already lowers natively (Perl: the `Redirect` arm's native
+/// stage emission — the same shape Fix 8 lifts a redirect INTO; ESTree:
+/// `stmt_to_estree` rebuilds the identical pipeline Call, the transform's
+/// byte-identity contract). Gated the same way the registry gates it, so
+/// `SH2_TRANSFORMS` can still turn the lowering off end-to-end.
 fn producer_redirect(producer: Vec<IrStmt>, tmp: &IrExpr, mode: &str, fd: Option<i32>) -> IrStmt {
+    let mut producer = producer;
+    if crate::transforms::transform_enabled("shir-pipeline-native") {
+        crate::transforms::shir_pipeline_native::transform(&mut producer);
+    }
     IrStmt::Redirect {
         inner: producer,
         redirects: vec![IrRedirect {

@@ -1972,8 +1972,18 @@ pub(crate) fn emit_stmt(out: &mut String, stmt: &IrStmt, indent: usize) {
                 return;
             }
             // `while …; do …; done < FILE` — open FILE on STDIN for the
-            // loop body. `local *STDIN` restores the previous handle at
-            // block exit (the read builtin consumes the redirected STDIN).
+            // loop body, restoring the previous handle at block exit (the
+            // read builtin consumes the redirected STDIN).
+            //
+            // The save/restore must be a DUP, not `local *STDIN`: a
+            // localized typeglob is a fresh, fd-less handle, so the open
+            // lands on the LOWEST FREE fd (measured: fileno=3) and fd 0 is
+            // left pointing at the original stdin. `read` still worked — it
+            // follows the glob — but every CHILD inherits fd 0, so
+            // `tty-cmdsub.sh`'s `capture … < "$TTY_DEV"` ran `tty` on the
+            // wrong stdin and printed "not a tty" where bash printed the
+            // terminal. Duplicating first frees nothing, the open takes fd 0
+            // (bash's `< FILE` semantics), and the dup restores it.
             if let [IrStmt::While { .. }] = inner.as_slice() {
                 if let Some(r) = redirects.iter().find(|r| {
                     matches!(r.fd, None | Some(0)) && r.mode == "r"
@@ -1981,7 +1991,7 @@ pub(crate) fn emit_stmt(out: &mut String, stmt: &IrStmt, indent: usize) {
                     emit_indent(out, indent);
                     out.push_str("{\n");
                     emit_indent(out, indent + 1);
-                    out.push_str("local *STDIN;\n");
+                    out.push_str("open(my $__sh2_is0, '<&', \\*STDIN);\n");
                     emit_indent(out, indent + 1);
                     out.push_str(&format!(
                         "open(STDIN, '<', {}) or die \"Cannot read input: $!\\n\";\n",
@@ -2027,6 +2037,8 @@ pub(crate) fn emit_stmt(out: &mut String, stmt: &IrStmt, indent: usize) {
                     for s in inner {
                         emit_stmt(out, s, indent + 1);
                     }
+                    emit_indent(out, indent);
+                    out.push_str("if ($__sh2_is0) { open(STDIN, '<&', $__sh2_is0); close($__sh2_is0); }\n");
                     emit_indent(out, indent);
                     out.push_str("}\n");
                     return;
@@ -2116,8 +2128,12 @@ pub(crate) fn emit_stmt(out: &mut String, stmt: &IrStmt, indent: usize) {
             //                must land in FILE;
             //   fd 0 (r)   — `f LBL cmd < FILE`: the sub's `read`s (and
             //                any shell-out) must see FILE.
-            // `local *STDIN` makes the open unwind with the block, so a
-            // nest of redirects composes.
+            // The dup-and-restore (rather than `local *STDIN`) is what makes
+            // "any shell-out" true: `local` opens on a fd-less glob, so the
+            // file landed on fd 3 and a child still saw the ORIGINAL fd 0 —
+            // `tty-cmdsub.sh` printed "not a tty" where bash printed the
+            // terminal. Saving fd 0 by dup puts the file ON fd 0 (bash's
+            // semantics) and the dup restores it, so nests still compose.
             if let [IrStmt::Expr(IrExpr::Call { func, .. })] = inner.as_slice() {
                 if func == "$fn_call" || func == "fnCall" {
                     let mut body = String::new();
@@ -2142,7 +2158,7 @@ pub(crate) fn emit_stmt(out: &mut String, stmt: &IrStmt, indent: usize) {
                         emit_indent(out, indent);
                         out.push_str("{\n");
                         emit_indent(out, indent + 1);
-                        out.push_str("local *STDIN;\n");
+                        out.push_str("open(my $__sh2_is0, '<&', \\*STDIN);\n");
                         emit_indent(out, indent + 1);
                         out.push_str(&format!(
                             "open(STDIN, '<', {}) or die \"Cannot read input: $!\\n\";\n",
@@ -2150,6 +2166,8 @@ pub(crate) fn emit_stmt(out: &mut String, stmt: &IrStmt, indent: usize) {
                         ));
                         emit_indent(out, indent + 1);
                         out.push_str(&body.trim_start());
+                        emit_indent(out, indent);
+                        out.push_str("if ($__sh2_is0) { open(STDIN, '<&', $__sh2_is0); close($__sh2_is0); }\n");
                         emit_indent(out, indent);
                         out.push_str("}\n");
                         return;
@@ -9391,7 +9409,6 @@ fn rewrite_fn_calls(stmts: &[IrStmt], fns: &std::collections::HashSet<String>) -
 /// Render a test-expression string (the text inside `[ … ]` / `[[ … ]]`,
 /// as flattened by ast_to_ir) as a Perl boolean expression.
 fn render_test_expr(s: &str) -> String {
-    eprintln!("DBG_RTE in=[{}]", s);
     // `[[ ]]` tests flatten to NO-WHITESPACE forms ("$s==*.txt",
     // "$s=~^re$", "$f1==!(*.min).js", ""$y"="5"") that the spaced
     // tokenizer can't parse. Spaced strings (with -gt/-a/etc.) keep the

@@ -1362,7 +1362,13 @@ fn render_test_tokens(text: &str) -> IrExpr {
                     StrStyle::Raw,
                 )
             }
-            _ => test_fallback(text),
+            // Unhandled THREE-token shape: try the shared recursive parser
+            // (which handles `!`, parens and the unary file tests) before
+            // the historic always-truthy heuristic.
+            _ => match crate::ir::render_test_token_list(&tokens) {
+                Some(e) => IrExpr::Str(e, StrStyle::Raw),
+                None => test_fallback(text),
+            },
         }
     } else if tokens.len() == 2 && tokens[0].starts_with('-') {
         let (op, arg) = (tokens[0].as_str(), tokens[1].as_str());
@@ -1388,7 +1394,18 @@ fn render_test_tokens(text: &str) -> IrExpr {
                 };
                 IrExpr::Str(format!("(-t {})", handle), StrStyle::Raw)
             }
-            _ => test_fallback(text),
+            // Unhandled TWO-token shape — the remaining unary file tests
+            // (`-r`/`-w`/`-x`/`-p`/`-b`/`-c`/…). The shared recursive
+            // test parser (`is_file_test_op`) renders them as Perl's own
+            // unary filetests; without this the `[[ -r "$dev" ]]` class
+            // fell to the always-TRUE heuristic — `-r` matched
+            // `$t =~ /-\w+/` on its own flag text, so tty-cmdsub picked a
+            // nonexistent /dev/pts/2 over the readable /dev/pts/3 (bash
+            // disagreed) and the generated script died on the redirect.
+            _ => match crate::ir::render_test_token_list(&tokens) {
+                Some(e) => IrExpr::Str(e, StrStyle::Raw),
+                None => test_fallback(text),
+            },
         }
     } else if tokens.len() == 1 {
         // Bare operand: truthiness = non-empty string; delegate the
@@ -6546,5 +6563,66 @@ fn empty_herestring_to_status(st: &mut IrStmt) -> bool {
             true
         }
         _ => false,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// The test renderers return raw Perl text inside `IrExpr::Str`.
+    fn raw(e: IrExpr) -> String {
+        match e {
+            IrExpr::Str(s, _) => s,
+            other => panic!("expected a raw Str render, got {other:?}"),
+        }
+    }
+
+    /// Regression (tty-cmdsub.sh): `[[ -r "$dev" ]]` flattens to the
+    /// TWO-token text `-r "$dev" [[` — after the trailing `[[` marker is
+    /// popped it missed every three-token arm and fell to the historic
+    /// `my $t = "…"; $t =~ /-\w+/ ? 1 : 0` heuristic, which matches the
+    /// test's OWN flag text and is therefore always TRUE. tty-cmdsub then
+    /// selected an unreadable (or nonexistent) /dev/pts/N where bash
+    /// selected a readable one, and the generated script died on the
+    /// redirect. The two-token arm now hands the remaining unary file
+    /// tests (`-r`/`-w`/`-x`/…) to the shared recursive test parser, which
+    /// emits Perl's own filetest operator.
+    #[test]
+    fn unary_file_test_renders_a_filetest_not_the_flag_regex() {
+        for (text, want) in [
+            (r#"-r "$dev" [["#, "-r $dev"),
+            (r#"-w "$out" [["#, "-w $out"),
+            (r#"-x "$bin" [["#, "-x $bin"),
+            (r#"-e "$cfg" [["#, "-e $cfg"),
+        ] {
+            let got = raw(render_test_tokens(text));
+            assert_eq!(got, want, "`{text}` must render the actual file test");
+            assert!(
+                !got.contains("my $t") && !got.contains(r"/-\w+/"),
+                "`{text}` fell back to the always-TRUE flag heuristic: {got}"
+            );
+        }
+    }
+
+    /// The shared parser still owns the shapes the dedicated arms do not:
+    /// a NEGATED unary test, and a 3-token form whose middle operator has
+    /// no dedicated arm here, must render a real expression rather than
+    /// the always-truthy heuristic.
+    #[test]
+    fn negated_and_unhandled_shapes_reach_the_shared_parser() {
+        let negated = raw(render_test_tokens(r#"! -f "$cfg""#));
+        assert!(
+            negated.contains("-f") && !negated.contains("my $t"),
+            "negated file test must stay a file test: {negated}"
+        );
+
+        // `-nt` is a 3-token shape with no dedicated arm in this fn; the
+        // shared parser renders the real mtime comparison.
+        let cmp = raw(render_test_tokens(r#""$new" -nt "$old""#));
+        assert!(
+            cmp.contains("(stat(") && !cmp.contains("my $t"),
+            "mtime comparison must not degrade to the flag heuristic: {cmp}"
+        );
     }
 }
