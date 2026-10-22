@@ -44,6 +44,46 @@ fn sanitize(name: &str) -> String {
     s
 }
 
+/// `typeset -l`/`-u` (and the `declare`/`local` spellings) attach a
+/// persistent case-fold to the NAME, and the fold also applies to the
+/// value written by the declaration itself. The shared `typeset-attrs`
+/// transform rewrites LATER assignments; the declaration site belongs to
+/// the renderer (estree delegates it to the sh2 runtime's builtin).
+/// Combined bundles (`-il`, `-iu`) count. `-l` and `-u` together are
+/// refused — which one wins is not something this renderer will guess.
+fn decl_case_fold(rest: &[IrExpr]) -> Option<char> {
+    fn add(f: &str, lower: &mut bool, upper: &mut bool) {
+        if !f.starts_with('-') || f.starts_with("--") { return; }
+        if f.contains('l') { *lower = true; }
+        if f.contains('u') { *upper = true; }
+    }
+    let (mut lower, mut upper) = (false, false);
+    for w in rest {
+        match w {
+            IrExpr::Str(s, _) => add(s, &mut lower, &mut upper),
+            IrExpr::Array(items) => {
+                for it in items {
+                    if let IrExpr::Str(s, _) = it { add(s, &mut lower, &mut upper); }
+                }
+            }
+            _ => {}
+        }
+    }
+    match (lower, upper) {
+        (true, false) => Some('l'),
+        (false, true) => Some('u'),
+        _ => None,
+    }
+}
+
+fn fold_value(fold: Option<char>, v: String) -> String {
+    match fold {
+        Some('l') => format!("shLowerAll({v})"),
+        Some('u') => format!("shUpperAll({v})"),
+        _ => v,
+    }
+}
+
 /// A Java method name for a user shell function. Keep the user's name
 /// unless it collides with a Java reserved word or the generated
 /// `sh*`/`__*` helper namespace — `def f()` must render `f()`, not
@@ -1150,6 +1190,9 @@ impl JavaRender {
                 Ok(())
             }
             "local" | "typeset" | "declare" => {
+                // `typeset -l`/`-u` folds the value written HERE too.
+                let fold = decl_case_fold(rest);
+                if fold.is_some() { self.helper("case"); }
                 for w in rest.iter() {
                     if matches!(w, IrExpr::Call { func, .. } if func == "setArray" || func == "setArrayAppend") {
                         // declare arr=(elems): nested setArray call
@@ -1166,7 +1209,7 @@ impl JavaRender {
                                         let (n0, v0) = (&t[..eq], &t[eq + 1..]);
                                         self.ensure_field(n0);
                                         if !v0.is_empty() {
-                                            self.emit(&format!("__v_{} = {};", sanitize(n0), jstr(v0)));
+                                            self.emit(&format!("__v_{} = {};", sanitize(n0), fold_value(fold, jstr(v0))));
                                         } else {
                                             nm = Some(n0.to_string());
                                         }
@@ -1177,7 +1220,7 @@ impl JavaRender {
                                 other => {
                                     if let Some(base) = &nm {
                                         let v = self.expr_str(other)?;
-                                        self.emit(&format!("__v_{} = {v};", sanitize(base)));
+                                        self.emit(&format!("__v_{} = {};", sanitize(base), fold_value(fold, v)));
                                     }
                                 }
                             }
@@ -1187,7 +1230,7 @@ impl JavaRender {
                     if let IrExpr::Str(s2, _) = w {
                         if let Some(eq) = s2.find('=') {
                             self.ensure_field(&s2[..eq]);
-                            self.emit(&format!("__v_{} = {};", sanitize(&s2[..eq]), jstr(&s2[eq + 1..])));
+                            self.emit(&format!("__v_{} = {};", sanitize(&s2[..eq]), fold_value(fold, jstr(&s2[eq + 1..]))));
                         }
                     }
                 }
@@ -1428,6 +1471,28 @@ impl JavaRender {
                 let pat = self.expr_str(args.get(1).ok_or("globMatch: missing pattern")?)?;
                 self.helper("fnmatch");
                 Ok(format!("shFnmatch({pat}, {hay})"))
+            }
+            // A pipeline used as a CONDITION is its EXIT STATUS, never its
+            // captured stdout. The generic fallback below asks the VALUE
+            // channel (`!shCapture(..).isEmpty()`), which is a different
+            // question: `echo x | grep x > /dev/null` captures "" whether
+            // or not grep matched, so the condition was always false.
+            // shRun sets __SH_RC and returns the status, so this stays a
+            // re-evaluable expression (correct inside `while` too).
+            IrExpr::Call { func, args, .. } if func == "pipeline" => {
+                let mut parts = Vec::new();
+                if let Some(IrExpr::Array(stages)) = args.first() {
+                    for st in stages.iter() {
+                        if let IrExpr::Arrow(body) = st {
+                            parts.push(self.arrow_expr(body)?);
+                        } else {
+                            return Err("pipeline condition stage not an Arrow".into());
+                        }
+                    }
+                }
+                if parts.is_empty() { return Err("pipeline condition without stages".into()); }
+                self.helper("run");
+                Ok(format!("(shRun({}) == 0)", parts.join(" + \" | \" + ")))
             }
             other => {
                 let v = self.expr_str(other)?;
@@ -2545,22 +2610,29 @@ impl JavaRender {
         if let IrExpr::Object(props) = r {
             let mut mode = String::new();
             let mut target: Option<&IrExpr> = None;
+            let mut fd: i64 = 1;
             for (k, v) in props {
                 match k.as_str() {
                     "mode" => { if let IrExpr::Str(m, _) = v { mode = m.clone(); } }
                     "target" => target = Some(v),
+                    "fd" => { if let IrExpr::Int(n) = v { fd = *n; } }
                     _ => {}
                 }
             }
             if let Some(t) = target {
                 let t = self.expr_str(t)?;
+                // The fd is part of the OPERATOR: stderr is `2>`, not a
+                // second `>` (two `/dev/null` redirects — fd 1 then fd 2 —
+                // collapsed into `> x > x`, silently leaving stderr on the
+                // terminal). fd 1 is the shell default and stays bare.
+                let p = if fd == 1 { String::new() } else { fd.to_string() };
                 return Ok(match mode.as_str() {
-                    "w" => format!(" + \" > \" + shQuote({t})"),
-                    "a" => format!(" + \" >> \" + shQuote({t})"),
-                    "r" => format!(" + \" < \" + shQuote({t})"),
-                    "herestring" => format!(" + \" <<< \" + shQuote({t})"),
+                    "w" => format!(" + \" {p}> \" + shQuote({t})"),
+                    "a" => format!(" + \" {p}>> \" + shQuote({t})"),
+                    "r" => format!(" + \" {p}< \" + shQuote({t})"),
+                    "herestring" => format!(" + \" {p}<<< \" + shQuote({t})"),
                     "heredoc" | "heredoc-tabs" =>
-                        format!(" + \" <<'SH2EOF\\n\" + {t} + \"\\nSH2EOF\""),
+                        format!(" + \" {p}<<'SH2EOF\\n\" + {t} + \"\\nSH2EOF\""),
                     _ => String::new(),
                 });
             }
@@ -4002,5 +4074,73 @@ mod case_lowering_render_tests {
             !java.contains("not in the java subset") && !java.contains("not yet supported"),
             "no subset refusal for a fully-lowerable case:\n{java}"
         );
+    }
+}
+
+/// Regression pins for two renderer gaps that the cross-product triage
+/// filed as `FAIL-BACKEND` (the A1 was fine; the java arm dropped it).
+mod decl_and_pipeline_render_tests {
+    use super::*;
+
+    /// zsh-sh-go `t76_typeset_case.zsh`: `typeset -l low="HELLO"` rendered
+    /// as a plain assignment, so java printed `HELLO`/`world` where zsh
+    /// prints `hello`/`WORLD`. The shared `typeset-attrs` transform only
+    /// rewrites LATER assignments — the declaration site is the renderer's
+    /// (estree delegates it to the sh2 runtime's `typeset` builtin).
+    #[test]
+    fn typeset_case_attrs_fold_the_declaration_value() {
+        let src = "typeset -l low=\"HELLO\"\ntypeset -u up=\"world\"\necho \"$low\"\necho \"$up\"\n";
+        let cmds = crate::parser::commands::parse_commands_from_text(src).expect("parse");
+        crate::transforms::set_target(Some("java"));
+        let prog = crate::shir::ast_to_ir(&cmds);
+        crate::transforms::set_target(None);
+        let java = super::shir_to_java(&prog).expect("java must render typeset -l/-u");
+        assert!(java.contains("__v_low = shLowerAll("), "declaration value must be lowercased:\n{java}");
+        assert!(java.contains("__v_up = shUpperAll("), "declaration value must be uppercased:\n{java}");
+    }
+
+    /// fish-sh-go `t60_contains.fish`: a pipeline used as a CONDITION is
+    /// its EXIT STATUS, never its captured stdout. The generic fallback
+    /// rendered `!shCapture(..).isEmpty()`, and `echo x | grep x >
+    /// /dev/null` captures "" whether or not grep matched — java printed
+    /// `no`/`no2` where fish prints `has`/`no2`.
+    #[test]
+    fn pipeline_condition_is_exit_status_not_captured_stdout() {
+        let stage = |cmd: &str| IrExpr::Arrow(vec![IrStmt::Expr(IrExpr::Call {
+            func: "exec".into(),
+            args: vec![
+                IrExpr::Str(cmd.into(), StrStyle::DoubleQuoted),
+                IrExpr::Array(vec![IrExpr::Str("world".into(), StrStyle::DoubleQuoted)]),
+            ],
+        })]);
+        let cond = IrExpr::Call {
+            func: "pipeline".into(),
+            args: vec![IrExpr::Array(vec![stage("echo"), stage("grep")])],
+        };
+        let mut r = JavaRender::new();
+        let out = r.cond_bool(&cond).expect("pipeline condition must render");
+        assert!(
+            out.contains("shRun(") && out.contains("== 0"),
+            "the condition must be the pipeline's status:\n{out}"
+        );
+        assert!(
+            !out.contains("shCapture("),
+            "captured stdout is the wrong channel for a condition:\n{out}"
+        );
+    }
+
+    /// The `fd` of an object-form redirect is part of the OPERATOR. Two
+    /// `/dev/null` redirects (fd 1 then fd 2) used to collapse into
+    /// `> /dev/null > /dev/null`, silently leaving stderr on the terminal.
+    #[test]
+    fn stderr_redirect_keeps_its_fd_operator() {
+        let red = IrExpr::Object(vec![
+            ("fd".to_string(), IrExpr::Int(2)),
+            ("mode".to_string(), IrExpr::Str("w".into(), StrStyle::DoubleQuoted)),
+            ("target".to_string(), IrExpr::Str("/dev/null".into(), StrStyle::DoubleQuoted)),
+        ]);
+        let mut r = JavaRender::new();
+        let out = r.redirect_text(&red).expect("object redirect must render");
+        assert!(out.contains(" 2> "), "stderr must render as 2>, not a second >:\n{out}");
     }
 }
