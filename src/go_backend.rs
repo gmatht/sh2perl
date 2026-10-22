@@ -1355,6 +1355,14 @@ impl Render {
                 }
                 return Some(format!("capCmd({call})"));
             }
+            // `$(A && B)` / `$(A || B)` where both operands are single
+            // external commands: two `exec.Cmd`s in a closure, instead of a
+            // `bash -c` child handed the reconstructed script.
+            if let [IrStmt::Expr(IrExpr::BinOp { op, lhs, rhs })] = &body[..] {
+                if let Some(v) = self.and_or_capture(op.clone(), lhs, rhs) {
+                    return Some(v);
+                }
+            }
             if let Some(text) = self.cmd_text_stmts(body) {
                 // Same env narrowing the `redirRun` reconstructions use: the
                 // child runs `text`, so only the vars that text READS are
@@ -1364,6 +1372,79 @@ impl Render {
             }
         }
         None
+    }
+
+    /// A `&&`/`||` operand as a native `exec.Command(…)` call, or `None`.
+    ///
+    /// The operands come from inside a command substitution, so they are
+    /// real processes: an `exec` call with a literal command word and a
+    /// literal argv Array. A shell builtin is admitted only when the target
+    /// has a faithful external counterpart (`native_stage_builtin`) — the
+    /// same policy `body_single_exec_opt` applies to pipeline stages.
+    fn operand_exec_call(&mut self, e: &IrExpr) -> Option<String> {
+        let IrExpr::Call { func, args } = e else {
+            return None;
+        };
+        if func != "exec" && func != "builtin" {
+            return None;
+        }
+        let Some(IrExpr::Str(cmd, _)) = args.first() else {
+            return None;
+        };
+        let argv_items: &[IrExpr] = match args.get(1) {
+            Some(IrExpr::Array(items)) => items,
+            _ => return None,
+        };
+        if is_shell_builtin(cmd) && !native_stage_builtin(cmd, argv_items) {
+            return None;
+        }
+        let cmd = Self::go_str(cmd);
+        let argv = self.argv_strings(argv_items)?;
+        Some(Self::exec_cmd_call(&cmd, &argv))
+    }
+
+    /// `$(A && B)` / `$(A || B)` → a native closure running both stages.
+    ///
+    /// The captured value is the CONCATENATION of what the stages that ran
+    /// wrote to stdout (bash's substitution reads one shared stream), and
+    /// it is trimmed once at the end exactly like `capCmd` does — a stage
+    /// that exits nonzero still contributes its output, since bash keeps it.
+    fn and_or_capture(
+        &mut self,
+        op: crate::ir::BinOpKind,
+        lhs: &IrExpr,
+        rhs: &IrExpr,
+    ) -> Option<String> {
+        if op != crate::ir::BinOpKind::And && op != crate::ir::BinOpKind::Or {
+            return None;
+        }
+        let l = self.operand_exec_call(lhs)?;
+        let r = self.operand_exec_call(rhs)?;
+        let id = self.new_tmp();
+        let (ca, oa, ea) = (
+            format!("__aoca{id}"),
+            format!("__aoa{id}"),
+            format!("__aoe{id}"),
+        );
+        let (cb, ob, s) = (
+            format!("__aocb{id}"),
+            format!("__aob{id}"),
+            format!("__aos{id}"),
+        );
+        // `&&` runs the rhs when the first command SUCCEEDED, `||` when it
+        // failed.
+        let cond = if op == crate::ir::BinOpKind::And {
+            format!("{ea} == nil")
+        } else {
+            format!("{ea} != nil")
+        };
+        Some(format!(
+            "func() string {{ {ca} := {l}; shStdIn({ca}); shStdErr({ca}); \
+             {oa}, {ea} := {ca}.Output(); {s} := string({oa}); \
+             if {cond} {{ {cb} := {r}; shStdIn({cb}); shStdErr({cb}); \
+             {ob}, _ := {cb}.Output(); {s} += string({ob}) }}; \
+             return strings.TrimRight({s}, \"\\n\") }}()"
+        ))
     }
 
     /// If the body is exactly one external `exec` call, return its
@@ -2968,7 +3049,11 @@ impl Render {
                 };
                 let m = self.ident_of(&name);
                 self.mark_arr(&name);
-                format!("s2s(arrLen({m}))")
+                // `${#arr[@]}` in a string context: the count rendered as a
+                // Go string directly. `s2s(arrLen(m))` boxed an int64 into
+                // `any` and let fmt `%v` it back out — and a caller that
+                // ALSO coerced (join/printf) produced `s2s(s2s(…))`.
+                format!("strconv.FormatInt(arrLen({m}), 10)")
             }
             "split" => {
                 // bash word-splitting on whitespace (the default IFS):
@@ -5713,6 +5798,10 @@ impl Render {
                         && matches!(args.get(1), Some(IrExpr::Str(..)))
                 }
                 "arrayItems" => matches!(args.first(), Some(IrExpr::Str(..))),
+                // `arrayLen` renders `strconv.FormatInt(arrLen(m), 10)` — a
+                // Go string on both paths (the non-literal name stubs to the
+                // int 0, which is why the literal-name test is here).
+                "arrayLen" => matches!(args.first(), Some(IrExpr::Str(..))),
                 _ => false,
             },
             _ => false,
