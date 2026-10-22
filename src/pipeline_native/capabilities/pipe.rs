@@ -39,12 +39,52 @@ pub(crate) fn emit(ctx: &NativeCtx) -> Option<NativeEmit> {
         }
         // `tr SET1 SET2` — character translation of the payload
         "tr" if p.words.len() == 2 => {
+            // A leading word that is an OPTION is not a SET: the corpus
+            // pipes `echo "  spaced  " | tr -s ' '` (squeeze repeats).
+            // Decoding "-s" as SET1 transliterated the flag itself
+            // (`tr/-s/ /` → "paced"), so handle -s explicitly below and
+            // refuse any other option word — the caller then shells out
+            // to the real `tr`.
+            if p.words[0].starts_with('-') {
+                if p.words[0] != "-s" {
+                    return None;
+                }
+                let set = tr_set(&p.words[1])?;
+                if set.contains('[') {
+                    return None;
+                }
+                // `tr -s SET` translates SET→SET (identity) then squeezes
+                // runs of the result: perl tr/SET/SET/s. The payload's
+                // stripped trailing newline is restored first, as above.
+                let src = if p.producer_nl {
+                    format!("{body} . \"\\n\"")
+                } else {
+                    body.clone()
+                };
+                return Some(NativeEmit::Stmt(format!(
+                    "my $__t = {src}; $__t =~ tr/{set}/{set}/s; print $__t; $main_exit_code = $CHILD_ERROR = 0;"
+                )));
+            }
             let set1 = tr_set(&p.words[0])?;
             let set2 = tr_set(&p.words[1])?;
             // perl tr/// with escaped sets; refuse character classes (the
             // lexer lifts plain chars, ranges and `\n`/`\t` escapes).
             if set1.contains('[') || set2.contains('[') {
                 return None;
+            }
+            // `tr` transliterates the producer's bytes 1:1, so the payload's
+            // STRIPPED trailing newline has to be restored first — the
+            // result IS the pipeline's whole output (bash's `tr` appends
+            // nothing), so print it as-is rather than adding a newline back.
+            // `seq 1 3 | tr '\n' ' '` is the corpus case: seq writes
+            // `1\n2\n3\n`, the translation makes it `1 2 3 ` with NO final
+            // newline, and `$(…)` keeps the trailing SPACE (command
+            // substitution only strips newlines). Emitting `1 2 3` + a
+            // newline lost that space (070_gnuisms_thorough).
+            if p.producer_nl {
+                return Some(NativeEmit::Stmt(format!(
+                    "my $__t = {body} . \"\\n\"; $__t =~ tr/{set1}/{set2}/; print $__t; $main_exit_code = $CHILD_ERROR = 0;"
+                )));
             }
             Some(NativeEmit::Stmt(format!(
                 "my $__t = {body}; $__t =~ tr/{set1}/{set2}/; print $__t, \"\\n\"; $main_exit_code = $CHILD_ERROR = 0;"
@@ -62,6 +102,16 @@ pub(crate) fn emit(ctx: &NativeCtx) -> Option<NativeEmit> {
             let rx = re(&p.words[1]);
             Some(NativeEmit::Stmt(format!(
                 "my $__g = {body}; my $__m = 0; for my $__l (split(/\\n/, $__g)) {{ if ($__l =~ /{rx}/) {{ $__m = 1; last; }} }} $main_exit_code = $CHILD_ERROR = $__m ? 0 : 1;"
+            )))
+        }
+        // `grep -v PAT` (bare; prints the NON-matching lines) — literal
+        // pattern only. rc 0 iff at least one line was printed (some line
+        // did NOT match), exactly like grep -v over a stream; empty input
+        // prints nothing and exits 1.
+        "grep" if p.words.len() == 2 && p.words[0] == "-v" && no_flags(&p.words[1]) => {
+            let rx = re(&p.words[1]);
+            Some(NativeEmit::Stmt(format!(
+                "my $__g = {body}; my @__o = (); for my $__l (split(/\\n/, $__g)) {{ push @__o, $__l unless $__l =~ /{rx}/; }} print join(\"\\n\", @__o), \"\\n\" if @__o; $main_exit_code = $CHILD_ERROR = @__o ? 0 : 1;"
             )))
         }
         // `awk '{print $N ...}'` — a simple field print (string field or a
@@ -146,8 +196,15 @@ fn awk_simple_print(prog: &str) -> Option<String> {
 /// TRUE when the word has no pattern-meta characters a literal grep/tr
 /// lift must not reinterpret (the pipeline payload is the INNER text, so
 /// this only gates whether the regex is safely buildable).
+///
+/// A word LEADING WITH `-` is refused too: real grep parses it as a flag
+/// (`grep -f FILE` reads its patterns from FILE), and the parent drops a
+/// non-literal FILE operand from `words` — so a bare `grep -f $var` used
+/// to reach the bare-`grep PAT` leaf as the one word `-f` and emitted
+/// `=~ /-f/`, grepping for the literal flag text (012_ps). Refusing sends
+/// it back to the faithful shell-out.
 fn no_flags(w: &str) -> bool {
-    !w.contains('[') && !w.contains('\\') && !w.contains('$') && !w.contains('|')
+    !w.contains('[') && !w.contains('\\') && !w.contains('$') && !w.contains('|') && !w.starts_with('-')
 }
 
 /// Escape a literal grep pattern for a Perl regex.
