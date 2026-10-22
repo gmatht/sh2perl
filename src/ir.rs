@@ -2524,6 +2524,71 @@ fn emit_stmt_owned(out: &mut String, stmt: &IrStmt, indent: usize) {
                             // deliberately left untouched — inner `print`
                             // output must still reach stdout.
                             let is_stderr = r.fd == Some(2);
+                            // Render the body once; both paths below emit it.
+                            let mut body = String::new();
+                            for s in inner {
+                                emit_stmt(&mut body, s, indent);
+                            }
+                            // ── print-only fast path ────────────────────
+                            // When NO inner statement can fork a child, a
+                            // `select` onto a LEXICAL filehandle routes every
+                            // bare `print` into the target and the real
+                            // STDOUT glob / fd 1 are never touched — the
+                            // dup/close/reopen/restore dance above is only
+                            // needed to make CHILDREN inherit the redirected
+                            // fd 1 (the `capture_do_perl` scalar fast path
+                            // argues the same from the other side). This
+                            // retires the dance for the common redirected
+                            // print group (`{ echo a; echo b; } > f` — of the
+                            // 111 heavy stdout-dance sites across the corpus,
+                            // 75 convert and 36 refuse, measured 2026-10-23) and the emitted Perl no longer
+                            // mutates a GLOBAL handle, so a `die` mid-body
+                            // can no longer leave STDOUT closed. Refuse >
+                            // guess: the spawn-marker scan (same vocabulary
+                            // as capture_do_perl, plus the capture seam and
+                            // qx/backtick) keeps every forking body on the
+                            // proven heavy path byte-for-byte. The `STDOUT`
+                            // glob marker is the 063_14 lesson: a spawn-free
+                            // body may still hold an EXPLICIT alias of the
+                            // real handle (`my $__fh = \*STDOUT; print $__fh
+                            // …` — the pure-Perl diff emulation) or swap the
+                            // glob itself (`local *STDOUT` scalar capture,
+                            // `select(STDOUT)`), and every one of those
+                            // reads/writes the REAL glob, bypassing
+                            // `select($fh)` — only the reopened-glob dance
+                            // serves them. Any body mentioning STDOUT at all
+                            // therefore falls back.
+                            let spawns = [
+                                "__sh_uu_run(",
+                                "system(",
+                                "fork(",
+                                "__sh_pipe_run(",
+                                "__sh_pipe_capture(",
+                                "qx(",
+                                "`",
+                                "STDOUT",
+                            ]
+                            .iter()
+                            .any(|m| body.contains(m));
+                            if !is_stderr && !spawns {
+                                static RD3_SEQ: std::sync::atomic::AtomicUsize =
+                                    std::sync::atomic::AtomicUsize::new(0);
+                                let n = RD3_SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                                let fh = format!("$__sh2_rfh{n}");
+                                let sel = format!("$__sh2_rsel{n}");
+                                emit_indent(out, indent);
+                                out.push_str(&format!(
+                                    "open(my {fh}, {}, {}) or die \"Cannot write to {}: $!\\n\";\n",
+                                    mode,
+                                    render_word(&r.target),
+                                    target
+                                ));
+                                emit_indent(out, indent);
+                                out.push_str(&format!("my {sel} = select({fh});\n"));
+                                out.push_str(&body);
+                                emit_indent(out, indent);
+                                out.push_str(&format!("select({sel}); close({fh});\n"));
+                            } else {
                             let (h, lh) = if is_stderr {
                                 ("STDERR", "stderr")
                             } else {
@@ -2549,9 +2614,7 @@ fn emit_stmt_owned(out: &mut String, stmt: &IrStmt, indent: usize) {
                                 emit_indent(out, indent);
                                 out.push_str(&format!("my {} = select(STDOUT);\n", sel));
                             }
-                            for s in inner {
-                                emit_stmt(out, s, indent);
-                            }
+                            out.push_str(&body);
                             emit_indent(out, indent);
                             if is_stderr {
                                 out.push_str(&format!(
@@ -2562,6 +2625,7 @@ fn emit_stmt_owned(out: &mut String, stmt: &IrStmt, indent: usize) {
                                     "select({sel}); open(STDOUT, '>&', {fh}) or die \"Cannot restore stdout: $!\\n\"; close({fh});\n"
                                 ));
                             }
+                            } // end heavy path (spawn-capable body or fd 2)
                         }
                         _ => {
                             emit_indent(out, indent);
@@ -3275,11 +3339,19 @@ fn emit_stmt_owned(out: &mut String, stmt: &IrStmt, indent: usize) {
                                     inner,
                                     items.join(", ")
                                 ));
+                            } else if op == "+=" {
+                                // bash's scalar `+=` is STRING concatenation
+                                // (`s=ab; s+=cd` → `abcd`), not numeric add
+                                // — the estree runtime's `assign` does the
+                                // same (`getVar + v`). Perl's `+=` would
+                                // coerce both sides to numbers.
+                                let rhs = ir_expr_to_perl(&value);
+                                let lhs = perl_lhs_for(&inner);
+                                out.push_str(&format!("{} = {} . {};\n", lhs, lhs, rhs));
                             } else {
-                                // The numeric ops (`-=`, `*=`, `/=`) and
-                                // `+=` on a scalar are the same in both
-                                // languages — Perl's `+=` is numeric like
-                                // bash's on an integer.
+                                // The numeric ops (`-=`, `*=`, `/=`) are the
+                                // same in both languages — Perl's operator
+                                // is numeric like bash's on an integer.
                                 let rhs = ir_expr_to_perl(&value);
                                 out.push_str(&format!(
                                     "{} {} {};\n",
