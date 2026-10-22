@@ -3484,6 +3484,42 @@ impl Render {
         Some(format!("{f}([][]string{{{}}})", parts.join(", ")))
     }
 
+    /// `pipeline_capture` for the statement `Pipeline` NODE's stage bodies
+    /// (`stages: Vec<Vec<IrStmt>>`) instead of the call form's Arrow list.
+    /// Refuses — leaving the render state untouched — the moment a stage is
+    /// not a single plain command, so the caller keeps its fallback.
+    fn pipeline_capture_nodes(
+        &mut self,
+        stages: &[Vec<IrStmt>],
+        native: bool,
+    ) -> Option<String> {
+        let (todo, sides, tmp) = (self.todo, self.sides.len(), self.tmp);
+        let mut parts: Vec<String> = Vec::with_capacity(stages.len());
+        for stage in stages {
+            let got = self.body_single_exec_opt(stage, true);
+            let (cmd, argv) = match got {
+                Some(x) if self.todo == todo => x,
+                _ => {
+                    self.sides.truncate(sides);
+                    self.tmp = tmp;
+                    self.todo = todo;
+                    return None;
+                }
+            };
+            let mut s = vec![cmd];
+            s.extend(argv);
+            parts.push(self.stage_lit(&s));
+        }
+        if parts.is_empty() {
+            self.sides.truncate(sides);
+            self.tmp = tmp;
+            self.todo = todo;
+            return None;
+        }
+        let f = if native { "capPipeRaw" } else { "capPipe" };
+        Some(format!("{f}([][]string{{{}}})", parts.join(", ")))
+    }
+
     /// The stage bodies of a grouped command (`( a | b )`, `( while … )`):
     /// a statement `Pipeline`/`Subshell` node, or an Arrow holding exactly
     /// one such expression statement. `None` for anything else.
@@ -5831,6 +5867,28 @@ impl Render {
     /// value. Only side-effect-free ops qualify — anything else keeps the
     /// subprocess path.
     fn capture_value_op(&mut self, body: &[IrStmt], native: bool) -> Option<String> {
+        // `$(a | b)` also arrives as a statement `Pipeline` NODE (the
+        // frontends emit the call form for some inputs and the node for
+        // others). Same analysis, same native `capPipe` — without this arm
+        // the node form fell through to the `bash -c` reconstruction even
+        // though every stage was a plain command.
+        if let [IrStmt::Pipeline {
+            stages,
+            capture: None,
+            ..
+        }] = body
+        {
+            if let Some(v) = self.pipeline_capture_nodes(stages, native) {
+                return Some(v);
+            }
+        }
+        // A group around the command (`$( ( a | b ) )`) is not a command of
+        // its own: unwrap it and re-run the same analysis.
+        if let [IrStmt::Subshell(inner)] | [IrStmt::Block(inner)] = body {
+            if let Some(v) = self.capture_value_op(inner, native) {
+                return Some(v);
+            }
+        }
         let [IrStmt::Expr(IrExpr::Call { func, args })] = body else {
             return None;
         };
@@ -7797,6 +7855,31 @@ impl Render {
                     }
                     self.sides.truncate(sides);
                     self.tmp = tmp;
+                }
+                // `( cmd ) > f` — a GROUP around one external command. The
+                // group adds nothing here: bash's subshell discards variable
+                // writes, and a lone external command writes none, so the
+                // redirect welds onto the same native exec instead of
+                // reconstructing `( cmd ) > f` for a `bash -c` child.
+                {
+                    let (todo, sides, tmp) = (self.todo, self.sides.len(), self.tmp);
+                    if let [IrStmt::Subshell(group)] | [IrStmt::Block(group)] = &inner[..] {
+                        if let Some((cmd, argv)) = self.body_single_exec_opt(group, true) {
+                            if let Some(lines) =
+                                self.native_redirect_spec_lines(&cmd, &argv, redirects)
+                            {
+                                if self.todo == todo {
+                                    for l in lines {
+                                        self.emit(&l);
+                                    }
+                                    return;
+                                }
+                            }
+                        }
+                    }
+                    self.sides.truncate(sides);
+                    self.tmp = tmp;
+                    self.todo = todo;
                 }
                 // `a | b > f` / `a | b 2>e` / `a < f | b` in statement
                 // position: the stages run as real processes (the same
