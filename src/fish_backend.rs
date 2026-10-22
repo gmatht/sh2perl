@@ -1114,6 +1114,11 @@ fn hoist_nested_functions(st: &mut IrStmt, out: &mut Vec<IrStmt>) {
                         }
                         out.push(IrStmt::Function {
                             name: name.clone(),
+                            // Empty for bash functions (ir.rs:781): the fish
+                            // lift carries no named-parameter binding — the
+                            // original core added the field without this
+                            // initializer, breaking every build at HEAD.
+                            params: Vec::new(),
                             body: fb.clone(),
                             named_blocks: Vec::new(),
                         });
