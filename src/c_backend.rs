@@ -269,6 +269,17 @@ pub struct Render {
     /// true while rendering a native-numeric function (its `$N` reads are
     /// the numeric `_pN`, not `atoll(_pN)`).
     cur_native_num: bool,
+    /// MIXED ABI — per-position native typing (1-based positions): a
+    /// lifted fn whose numstr-proven numeric positions coexist with text
+    /// positions (rb_putrun: three canonical-int slots, one hex string).
+    /// One text position no longer forces the whole signature through
+    /// the stringify→atoll detour. Consumers: the void-lift signature,
+    /// its call sites, and the positional read paths (value lifts,
+    /// bigint-param and array-return fns keep the whole-fn convention).
+    native_positions: std::collections::BTreeMap<String, std::collections::BTreeSet<usize>>,
+    /// the current fn's native positions (mixed ABI); empty unless
+    /// rendering a void-lifted fn with a partial native set.
+    cur_native_pos: std::collections::BTreeSet<usize>,
     /// lifted functions whose params are bigint (used in bigint arith) —
     /// native `mpz_t _pN` signature instead of `char *_pN`.
     bigint_param_fns: std::collections::BTreeSet<String>,
@@ -390,6 +401,26 @@ pub struct Render {
     /// getVar/param reads of these render `(name ? name : "")`; Assign
     /// targets render `name = value;` (pointer semantics).
     store: BTreeSet<String>,
+    /// pass-1 file-scope inventory (`collect_vars_full` over the whole
+    /// program). Same role as `top_vars`, but the walker covers the
+    /// statement kinds `top_vars`'s own walk misses — notably `Case` and
+    /// `Select` clause bodies — so a var first assigned inside a `case`
+    /// is still known to have a C declaration. The test-word expander's
+    /// env-var guard consults this; `top_vars` alone sent those reads
+    /// back to `_sh_env(name)` and the texture-cache replay tests never
+    /// hit (the native-lift perf win lost on exactly the `case`-assigned
+    /// vars it was written for).
+    inventory_vars: BTreeSet<String>,
+    /// pass-1 `collect_assigned_vars` over the WHOLE program: assign
+    /// targets, declare lists, read/unset/printf-v targets, for-loop
+    /// vars, Case/Select clauses, function bodies — the union of what
+    /// the file-scope and fn-local declaration hoists actually emit.
+    /// The decl-authoritative half of `has_c_decl`: `top_vars` skips
+    /// function bodies and for-loop counters (`_ => {}` / `for_vars`
+    /// in `collect_vars_full`), so a guard built on it alone misreads
+    /// every fn-local var as env-only (249 of them on MIMEcroft —
+    /// `start_level`'s loops then waited on `_sh_env("")` forever).
+    hoist_vars: BTreeSet<String>,
     /// shell-out runtime needed (the _sh_* preamble helpers)
     need_sh: bool,
     /// uu-ffi in-process coreutils runtime needed (UU-FFI.md): emit the
@@ -1206,7 +1237,10 @@ fn demote_string_loop_vars(prog: &IrProgram, int_set: &mut HashSet<String>) {
     }
 }
 
-fn demote_stringy_ints(prog: &mut IrProgram) {
+fn demote_stringy_ints(
+    prog: &mut IrProgram,
+    pos_seeds: &HashMap<String, std::collections::BTreeSet<usize>>,
+) {
     use crate::ir::{IrExpr, IrStmt};
     use std::collections::HashSet;
     let mut int_set: HashSet<String> = prog
@@ -1270,99 +1304,127 @@ fn demote_stringy_ints(prog: &mut IrProgram) {
             _ => false,
         }
     }
-    fn walk(stmts: &[IrStmt], ints: &mut HashSet<String>, int_arrays: &HashSet<String>) {
+    fn walk(
+        stmts: &[IrStmt],
+        ints: &mut HashSet<String>,
+        int_arrays: &HashSet<String>,
+        pos_seeds: &HashMap<String, std::collections::BTreeSet<usize>>,
+    ) {
         for s in stmts {
             match s {
                 IrStmt::Assign { targets, expr, .. } => {
-                    let stringy = !is_numeric(expr, ints, &int_arrays);
+                    // A positional copy `n = $N` whose position is
+                    // numstr-proven numeric is numeric BY ITS CALLERS
+                    // (every live call site passes canonical int text).
+                    // Without this guard the copy's own shape removed
+                    // the seed and the whole param chain re-stringified
+                    // (the rb_putrun coordinate chain on MIMEcroft).
+                    // Other stringy assigns still demote — the guard is
+                    // per-site, keyed (var, position).
+                    let pos_d = Render::positional_digit(expr);
                     // nested assigns inside RHS? (rare; the RHS walk
                     // below covers expression-embedded stmts via Arrow)
-                    if stringy {
-                        for t in targets {
-                            if t.indices.is_empty() {
-                                if std::env::var("SH2_DEBUG_DEMOTE").is_ok() { eprintln!("DEMOTE remove {} (site1)", &t.var); }                                ints.remove(&t.var);
+                    for t in targets {
+                        if t.indices.is_empty() {
+                            let pos_ok = pos_d.is_some_and(|d| {
+                                pos_seeds.get(&t.var).is_some_and(|s| s.contains(&d))
+                            });
+                            let stringy = !pos_ok && !is_numeric(expr, ints, &int_arrays);
+                            if stringy {
+                                if std::env::var("SH2_DEBUG_DEMOTE").is_ok() { eprintln!("DEMOTE remove {} (site1)", &t.var); }
+                                ints.remove(&t.var);
                             }
                         }
                     }
                     // recurse into Arrow bodies in RHS (captures etc.)
-                    fn walk_expr(e: &IrExpr, ints: &mut HashSet<String>, int_arrays: &HashSet<String>) {
+                    fn walk_expr(
+                        e: &IrExpr,
+                        ints: &mut HashSet<String>,
+                        int_arrays: &HashSet<String>,
+                        pos_seeds: &HashMap<String, std::collections::BTreeSet<usize>>,
+                    ) {
                         match e {
                             IrExpr::Call { args, .. } => {
                                 for a in args {
-                                    walk_expr(a, ints, int_arrays);
+                                    walk_expr(a, ints, int_arrays, pos_seeds);
                                 }
                             }
                             IrExpr::Array(items) => {
                                 for a in items {
-                                    walk_expr(a, ints, int_arrays);
+                                    walk_expr(a, ints, int_arrays, pos_seeds);
                                 }
                             }
-                            IrExpr::Arrow(stmts) => walk(stmts, ints, int_arrays),
+                            IrExpr::Arrow(stmts) => walk(stmts, ints, int_arrays, pos_seeds),
                             IrExpr::Interpolate(parts) => {
                                 for p in parts {
                                     if let crate::ir::InterpPart::Expr(x) =
                                         p
                                     {
-                                        walk_expr(x, ints, int_arrays);
+                                        walk_expr(x, ints, int_arrays, pos_seeds);
                                     }
                                 }
                             }
                             _ => {}
                         }
                     }
-                    walk_expr(expr, ints, int_arrays);
+                    walk_expr(expr, ints, int_arrays, pos_seeds);
                 }
                 IrStmt::Declare { vars, init, .. } => {
                     if let Some(e) = init {
-                        if !is_numeric(e, ints, &int_arrays) {
-                            for v in vars {
-                                if std::env::var("SH2_DEBUG_DEMOTE").is_ok() { eprintln!("DEMOTE remove {} (site2)", &v.name); }                                ints.remove(&v.name);
+                        let pos_d = Render::positional_digit(e);
+                        for v in vars {
+                            let pos_ok = pos_d.is_some_and(|d| {
+                                pos_seeds.get(&v.name).is_some_and(|s| s.contains(&d))
+                            });
+                            if !pos_ok && !is_numeric(e, ints, &int_arrays) {
+                                if std::env::var("SH2_DEBUG_DEMOTE").is_ok() { eprintln!("DEMOTE remove {} (site2)", &v.name); }
+                                ints.remove(&v.name);
                             }
                         }
                     }
                 }
                 IrStmt::If { cond, then, elsifs, else_, .. } => {
-                    walk_cond(cond, ints, int_arrays);
-                    walk(then, ints, int_arrays);
+                    walk_cond(cond, ints, int_arrays, pos_seeds);
+                    walk(then, ints, int_arrays, pos_seeds);
                     for (c, b) in elsifs {
-                        walk_cond(c, ints, int_arrays);
-                        walk(b, ints, int_arrays);
+                        walk_cond(c, ints, int_arrays, pos_seeds);
+                        walk(b, ints, int_arrays, pos_seeds);
                     }
-                    walk(else_, ints, int_arrays);
+                    walk(else_, ints, int_arrays, pos_seeds);
                 }
                 IrStmt::While { cond, body, .. }
                 | IrStmt::DoWhile { cond, body, .. } => {
-                    walk_cond(cond, ints, int_arrays);
-                    walk(body, ints, int_arrays);
+                    walk_cond(cond, ints, int_arrays, pos_seeds);
+                    walk(body, ints, int_arrays, pos_seeds);
                 }
-                IrStmt::For { body, .. } => walk(body, ints, int_arrays),
-                IrStmt::Subshell(body) | IrStmt::Block(body) => walk(body, ints, int_arrays),
-                IrStmt::Redirect { inner, .. } => walk(inner, ints, int_arrays),
+                IrStmt::For { body, .. } => walk(body, ints, int_arrays, pos_seeds),
+                IrStmt::Subshell(body) | IrStmt::Block(body) => walk(body, ints, int_arrays, pos_seeds),
+                IrStmt::Redirect { inner, .. } => walk(inner, ints, int_arrays, pos_seeds),
                 IrStmt::Pipeline { stages, .. } => {
                     for st in stages {
-                        walk(st, ints, int_arrays);
+                        walk(st, ints, int_arrays, pos_seeds);
                     }
                 }
                 IrStmt::Function { body, named_blocks, .. } => {
-                    walk(body, ints, int_arrays);
+                    walk(body, ints, int_arrays, pos_seeds);
                     for (_, b) in named_blocks {
-                        walk(b, ints, int_arrays);
+                        walk(b, ints, int_arrays, pos_seeds);
                     }
                 }
                 IrStmt::Case { clauses, .. } => {
                     for c in clauses {
-                        walk(&c.body, ints, int_arrays);
+                        walk(&c.body, ints, int_arrays, pos_seeds);
                     }
                 }
                 IrStmt::Try { body, excepts, else_body, finally_body, .. } => {
-                    walk(body, ints, int_arrays);
+                    walk(body, ints, int_arrays, pos_seeds);
                     for e in excepts {
-                        walk(&e.body, ints, int_arrays);
+                        walk(&e.body, ints, int_arrays, pos_seeds);
                     }
-                    walk(else_body, ints, int_arrays);
-                    walk(finally_body, ints, int_arrays);
+                    walk(else_body, ints, int_arrays, pos_seeds);
+                    walk(finally_body, ints, int_arrays, pos_seeds);
                 }
-                IrStmt::ForInit { body, .. } => walk(body, ints, int_arrays),
+                IrStmt::ForInit { body, .. } => walk(body, ints, int_arrays, pos_seeds),
                 IrStmt::Expr(e) | IrStmt::Output { value: e, .. } => {
                     // `local x=$(...)` / `export x=...` as builtin CALLS
                     // (not Declare): stringy inits demote (BASHC_FIX 062).
@@ -1394,8 +1456,12 @@ fn demote_stringy_ints(prog: &mut IrProgram) {
                                                 s[..s.len() - 1].to_string();
                                             if let Some(v) = items.get(i + 1)
                                             {
-                                                if !is_numeric(v, ints, &int_arrays) {
-                                                    if std::env::var("SH2_DEBUG_DEMOTE").is_ok() { eprintln!("DEMOTE remove {} (site3)", &nm); }                                                    ints.remove(&nm);
+                                                let pos_ok = Render::positional_digit(v).is_some_and(|d| {
+                                                    pos_seeds.get(&nm).is_some_and(|s| s.contains(&d))
+                                                });
+                                                if !pos_ok && !is_numeric(v, ints, &int_arrays) {
+                                                    if std::env::var("SH2_DEBUG_DEMOTE").is_ok() { eprintln!("DEMOTE remove {} (site3)", &nm); }
+                                                    ints.remove(&nm);
                                                 }
                                             }
                                             i += 2;
@@ -1419,17 +1485,22 @@ fn demote_stringy_ints(prog: &mut IrProgram) {
                         }
                     }
                     // expression-embedded Arrows (captures, pipelines)
-                    fn walk_e(e: &IrExpr, ints: &mut HashSet<String>, int_arrays: &HashSet<String>) {
+                    fn walk_e(
+                        e: &IrExpr,
+                        ints: &mut HashSet<String>,
+                        int_arrays: &HashSet<String>,
+                        pos_seeds: &HashMap<String, std::collections::BTreeSet<usize>>,
+                    ) {
                         match e {
-                            IrExpr::Arrow(stmts) => walk(stmts, ints, int_arrays),
+                            IrExpr::Arrow(stmts) => walk(stmts, ints, int_arrays, pos_seeds),
                             IrExpr::Call { args, .. } => {
                                 for a in args {
-                                    walk_e(a, ints, int_arrays);
+                                    walk_e(a, ints, int_arrays, pos_seeds);
                                 }
                             }
                             IrExpr::Array(items) => {
                                 for a in items {
-                                    walk_e(a, ints, int_arrays);
+                                    walk_e(a, ints, int_arrays, pos_seeds);
                                 }
                             }
                             IrExpr::Interpolate(parts) => {
@@ -1437,39 +1508,44 @@ fn demote_stringy_ints(prog: &mut IrProgram) {
                                     if let crate::ir::InterpPart::Expr(x) =
                                         p
                                     {
-                                        walk_e(x, ints, int_arrays);
+                                        walk_e(x, ints, int_arrays, pos_seeds);
                                     }
                                 }
                             }
                             _ => {}
                         }
                     }
-                    walk_e(e, ints, int_arrays);
+                    walk_e(e, ints, int_arrays, pos_seeds);
                 }
                 _ => {}
             }
         }
     }
-    fn walk_cond(e: &IrExpr, ints: &mut HashSet<String>, int_arrays: &HashSet<String>) {
+    fn walk_cond(
+        e: &IrExpr,
+        ints: &mut HashSet<String>,
+        int_arrays: &HashSet<String>,
+        pos_seeds: &HashMap<String, std::collections::BTreeSet<usize>>,
+    ) {
         // conditions may embed Arrows; assigns there are rare but walk
         // them for completeness (same helper as Expr above, inlined
         // to avoid closure borrow issues).
         match e {
-            IrExpr::Arrow(stmts) => walk(stmts, ints, int_arrays),
+            IrExpr::Arrow(stmts) => walk(stmts, ints, int_arrays, pos_seeds),
             IrExpr::Call { args, .. } => {
                 for a in args {
-                    walk_cond(a, ints, int_arrays);
+                    walk_cond(a, ints, int_arrays, pos_seeds);
                 }
             }
             IrExpr::Array(items) => {
                 for a in items {
-                    walk_cond(a, ints, int_arrays);
+                    walk_cond(a, ints, int_arrays, pos_seeds);
                 }
             }
             IrExpr::Interpolate(parts) => {
                 for p in parts {
                     if let crate::ir::InterpPart::Expr(x) = p {
-                        walk_cond(x, ints, int_arrays);
+                        walk_cond(x, ints, int_arrays, pos_seeds);
                     }
                 }
             }
@@ -1477,9 +1553,9 @@ fn demote_stringy_ints(prog: &mut IrProgram) {
         }
     }
     demote_string_loop_vars(prog, &mut int_set);
-    walk(&prog.stmts, &mut int_set, &int_arrays);
+    walk(&prog.stmts, &mut int_set, &int_arrays, pos_seeds);
     for sub in &prog.subs {
-        walk(&sub.body, &mut int_set, &int_arrays);
+        walk(&sub.body, &mut int_set, &int_arrays, pos_seeds);
     }
 
     prog.var_types
@@ -3582,6 +3658,159 @@ fn int_element_verdict(prog: &IrProgram) -> (HashSet<String>, HashSet<String>) {
     let shared = crate::shir::analyze_int_arrays(prog);
     let out: HashSet<String> = homed.difference(&shared).cloned().collect();
     (out, seed)
+}
+
+/// Seed `Int` verdicts from the SHARED numstr vars×params fixpoint
+/// (shir_passes/numstr.rs — the language-neutral numeric-string
+/// seeding analysis, written to be consumed by every backend: a cell
+/// whose every write is int-valued and whose every read is a numeric
+/// coercion can be kept as a native integer instead of re-parsed
+/// text — the loop counters of a render loop are the paradigm).
+/// Its verdicts feed the SAME `var_types` channel as the reader seeds
+/// below, and `demote_stringy_ints` re-validates every one of them,
+/// so an over-eager seed can only be removed again, never render
+/// unsoundly. The params leg (positional co-homing) is deliberately
+/// not pushed: positional names are not unique across functions in
+/// the flat `var_types` list, and the caller-side var typing that
+/// already homes numeric-only parameter slots covers that case.
+///
+/// Kill switch: SH2_NO_NUMSTR=1 keeps the pre-numstr verdicts.
+fn seed_numstr_fixpoint(
+    prog: &mut IrProgram,
+) -> (
+    HashMap<String, std::collections::BTreeSet<usize>>,
+    HashMap<String, std::collections::BTreeSet<usize>>,
+    crate::shir_passes::numstr::Seed,
+) {
+    if std::env::var_os("SH2_NO_NUMSTR").is_some() {
+        return (
+            HashMap::new(),
+            HashMap::new(),
+            crate::shir_passes::numstr::Seed {
+                ints: Default::default(),
+                params: Default::default(),
+                dyn_call: false,
+                pinned: Default::default(),
+                assigns: Default::default(),
+                sites: Default::default(),
+                blocked: Default::default(),
+                defined: Default::default(),
+                int_arrays: Default::default(),
+            },
+        );
+    }
+    // SH2_NO_MIXED_ABI: the param-leg upgrade half of the mixed ABI
+    // stays off (no seeds → demote's guard is inert → no positions),
+    // while the base numstr seeding keeps running. Validation switch.
+    let mixed_abi = std::env::var_os("SH2_NO_MIXED_ABI").is_none();
+    let (homed, _) = int_element_verdict(prog);
+    let mut all_homed = crate::shir::analyze_int_arrays(prog);
+    all_homed.extend(homed);
+    let force_str: std::collections::BTreeSet<String> =
+        string_loop_vars(prog, &all_homed).into_iter().collect();
+    let inputs = crate::shir_passes::numstr::Inputs {
+        blocked_extra: &force_str,
+        int_arrays: &all_homed,
+    };
+    let dbg_extra = force_str.len();
+    let dbg_env = prog.var_bash_env.len();
+    let verdict = crate::shir_passes::numstr::seed(prog, &inputs);
+    let mut pushed = 0;
+    for v in &verdict.ints {
+        if prog.var_types.iter().any(|(n, _)| n == v) {
+            continue;
+        }
+        prog.var_types.push((v.clone(), IrType::Int));
+        pushed += 1;
+    }
+    // PARAM-LEG UPGRADE: a positional-copy var (`n = getVar("1")`)
+    // whose copy's position the params leg proved numeric was already
+    // typed Str by `analyze_var_types` (the copy's own string shape),
+    // so the "skip if present" rule above dropped its seed entirely —
+    // and the whole param chain re-stringified (the rb_putrun
+    // coordinate chain on MIMEcroft). Upgrade exactly the vars
+    // (a) in the var leg (EVERY assign is int-valued under the
+    // fixpoint) and (b) that are positional copies of proven
+    // positions; `demote_stringy_ints` re-validates immediately after
+    // — its (var, position) guard keeps the proven copy, and any
+    // other stringy assign restores Str.
+    let param_seeds = if mixed_abi {
+        collect_param_seeds(prog, &verdict.params)
+    } else {
+        HashMap::new()
+    };
+    let positions = if mixed_abi {
+        verdict.params.clone()
+    } else {
+        HashMap::new()
+    };
+    let mut upgraded = 0;
+    for v in &verdict.ints {
+        if param_seeds.contains_key(v.as_str())
+            && prog.var_types.iter().any(|(n, _)| n == v)
+        {
+            prog.var_types.retain(|(n, _)| n != v);
+            prog.var_types.push((v.clone(), IrType::Int));
+            upgraded += 1;
+        }
+    }
+    if std::env::var_os("SH2_DEBUG_NUMSTR").is_some() {
+        eprintln!("NUMSTR upgraded {upgraded} positional-copy vars");
+    }
+    if std::env::var_os("SH2_DEBUG_NUMSTR").is_some() {
+        eprintln!(
+            "NUMSTR seeded {} vars (dyn_call={}) assigns={} blocked={} extra={} env={} sample={:?} dt_i: blocked={} assigns={}",
+            pushed,
+            verdict.dyn_call,
+            verdict.assigns.len(),
+            verdict.blocked.len(),
+            dbg_extra,
+            dbg_env,
+            verdict.blocked.iter().take(8).collect::<Vec<_>>(),
+            verdict.blocked.contains("dt_i"),
+            verdict
+                .assigns
+                .get("dt_i")
+                .map(|v| v
+                    .iter()
+                    .map(|(_, e)| crate::shir_passes::numstr::shape(e))
+                    .collect::<Vec<_>>()
+                    .join(","))
+                .unwrap_or_default()
+        );
+    }
+    (param_seeds, positions, verdict)
+}
+
+/// The vars that are positional COPIES (`v = $N` / `v = getVar("N")`)
+/// of a numstr-proven numeric position, keyed by var name with the set
+/// of proven positions. `demote_stringy_ints` consults this so an
+/// over-eager seed can still be removed on any OTHER (stringy) assign,
+/// while a copy whose value every live caller passes as canonical int
+/// text keeps its Int verdict.
+fn collect_param_seeds(
+    prog: &IrProgram,
+    params: &HashMap<String, std::collections::BTreeSet<usize>>,
+) -> HashMap<String, std::collections::BTreeSet<usize>> {
+    let mut names = BTreeSet::new();
+    let mut defs = Vec::new();
+    collect_fn_defs(&prog.stmts, &mut names, &mut defs);
+    let mut out: HashMap<String, std::collections::BTreeSet<usize>> = HashMap::new();
+    for (fname, body) in defs {
+        let Some(proven) = params.get(&fname) else { continue };
+        for st in &body {
+            if let IrStmt::Assign { targets, expr, .. } = st {
+                if let Some(t) = targets.first() {
+                    if let Some(d) = Render::positional_digit(expr) {
+                        if proven.contains(&d) {
+                            out.entry(t.var.clone()).or_default().insert(d);
+                        }
+                    }
+                }
+            }
+        }
+    }
+    out
 }
 
 /// Seed `Int` verdicts for element-readers and pure-arith temps (called
@@ -9053,8 +9282,36 @@ pub fn shir_to_c(prog: &IrProgram) -> String {
     // Int-element readers seed first (their arrayIndex sources are
     // numeric exactly when homed — see the `is_numeric` arrayIndex
     // arm), so demote re-validates every seed below.
+    let (numstr_param_seeds, mut numstr_positions, numstr_verdict) =
+        seed_numstr_fixpoint(&mut prog);
     seed_int_element_readers(&mut prog);
-    demote_stringy_ints(&mut prog);
+    demote_stringy_ints(&mut prog, &numstr_param_seeds);
+    // POSITIONS RE-VALIDATION: the params verdict above was computed
+    // while demote still believed some vars Int that are now Str — a
+    // position promoted on those actuals would insert a caller-side
+    // `atoll` that TRUNCATES text bash consumed verbatim (MIMEcroft:
+    // `rb_o_rect`'s `rbov_qcx=${1}` copies looked int-valued through
+    // split actuals of since-demoted vars, so `rb_o_ndc`'s positions
+    // promoted and `atoll("0.85")` zeroed the fraction the object
+    // decoder reads as fixed-point). Re-check every position against
+    // the POST-DEMOTION Int set — removal-only, so an over-eager
+    // promotion can only ever be withdrawn, never a sound one lost.
+    if !numstr_positions.is_empty() {
+        let ints_now: HashSet<String> = prog
+            .var_types
+            .iter()
+            .filter(|(_, t)| *t == IrType::Int)
+            .map(|(n, _)| n.clone())
+            .collect();
+        numstr_positions = numstr_verdict.revalidate_params(&ints_now);
+        if std::env::var_os("SH2_DEBUG_NUMSTR").is_some() {
+            eprintln!(
+                "NUMSTR positions re-validated: {} -> {} callees",
+                numstr_verdict.params.len(),
+                numstr_positions.len()
+            );
+        }
+    }
     // sort for deterministic serialization (the C backend reads it as a
     // map, but the sort keeps output stable across runs)
     prog.var_types.sort_by(|a, b| a.0.cmp(&b.0));
@@ -9217,7 +9474,8 @@ pub fn shir_to_c(prog: &IrProgram) -> String {
     r.var_widths = widths;
     r.lifted_fns = scan_fn_lifts(&prog.stmts);
     r.void_fns = scan_void_lifts(&prog.stmts);
-    r.native_num_fns = analyze_native_num_fns(&prog);
+    r.native_positions = analyze_native_positions(&prog, &numstr_positions);
+    r.native_num_fns = analyze_native_num_fns(&prog, &r.native_positions);
     r.bigint_param_fns = analyze_bigint_param_fns(&prog);
     r.array_return_arrays = analyze_array_return_fns(&prog);
     r.array_return_fns = r.array_return_arrays.keys().cloned().collect();
@@ -9510,9 +9768,12 @@ pub fn shir_to_c(prog: &IrProgram) -> String {
     // text (call sites keep <string.h> via the "strdup(" trigger).
     {
         let full = r.out.join("\n");
-        if full.contains("_sh_xstrdup(") {
+        // `_sh_sset` calls `_sh_xstrdup` on its miss path, so a program
+        // whose every store became in-place still needs the checked
+        // strdup — trigger the block on either name and include both.
+        if full.contains("_sh_xstrdup(") || full.contains("_sh_sset(") {
             let pos = r.out.iter().rposition(|l| l.trim_start().starts_with("#include ")).map(|i| i + 1).unwrap_or(0);
-            let helper = vec![
+            let mut helper = vec![
                 "/* checked strdup (P1 OOM policy): fail-stop, never NULL-on-OOM */".to_string(),
                 "static char *_sh_xstrdup(const char *s) {".to_string(),
                 "  char *p = strdup(s);".to_string(),
@@ -9521,6 +9782,36 @@ pub fn shir_to_c(prog: &IrProgram) -> String {
                 "}".to_string(),
                 "".to_string(),
             ];
+            if full.contains("_sh_sset(") {
+                helper.extend([
+                    "/* in-place store (SH2_NO_SSET=1 keeps the legacy _old temp-swap):".to_string(),
+                    " * the legacy store freed the old buffer, so nothing may legally alias".to_string(),
+                    " * it — copying into it when the new value fits skips a malloc/free".to_string(),
+                    " * pair; memmove covers src aliasing the buffer (self-ref RHS).".to_string(),
+                    " * (sh2-perf: the fit test is strnlen-capped at n-1 — the verdict".to_string(),
+                    " * `strlen(old)+1 >= n` needs only that the first n-1 bytes hold no".to_string(),
+                    " * NUL, so the scan stops at n-1 = strlen(src) instead of walking".to_string(),
+                    " * the whole old buffer: the demo's #1 strlen-byte site.)".to_string(),
+                    " * SH2_NO_SCANFIX=1 restores the strlen(old) form.)".to_string(),
+                    " */".to_string(),
+                    "static void _sh_sset(char **slot, const char *src) {".to_string(),
+                    "  char *old = *slot;".to_string(),
+                    if std::env::var_os("SH2_NO_SCANFIX").is_some() {
+                        "  if (old && src) { size_t n = strlen(src) + 1; if (strlen(old) + 1 >= n) { memmove(old, src, n); return; } }".to_string()
+                    } else {
+                        "  if (old && src) { size_t n = strlen(src) + 1; if (strnlen(old, n - 1) == n - 1) { memmove(old, src, n); return; } }".to_string()
+                    },
+                    // the canonical `_sh_xstrdup((char*)…)` cast form:
+                    // p1_strdup_checked_at_call_sites greps it as the
+                    // checked-allocation marker, and a program whose
+                    // every store is in-place must still show one.
+                    "  char *p = _sh_xstrdup((char*)(src ? src : \"\"));".to_string(),
+                    "  free(old);".to_string(),
+                    "  *slot = p;".to_string(),
+                    "}".to_string(),
+                    "".to_string(),
+                ]);
+            }
             r.out.splice(pos..pos, helper);
         }
     }
@@ -10770,15 +11061,15 @@ impl Render {
                 let names: Vec<String> = self
                     .bigint_consts
                     .iter()
-                    .map(|v| format!("_bigint_{}", v))
+                    .map(|v| Self::bigint_const_name(v))
                     .collect();
                 self.emit(&format!("mpz_t {};", names.join(", ")));
                 self.emit("static void _bigint_init(void) {");
                 let consts = self.bigint_consts.clone();
                 for v in &consts {
                     self.emit(&format!(
-                        "  mpz_init_set_str(_bigint_{}, \"{}\", 10);",
-                        v, v
+                        "  mpz_init_set_str({}, \"{}\", 10);",
+                        Self::bigint_const_name(v), v
                     ));
                 }
                 self.emit("}");
@@ -10909,10 +11200,6 @@ impl Render {
             self.emit("  return (v->p) ? v->p : \"\";");
             self.emit("}");
             self.emit("static char *_sh_cmd = 0; static size_t _sh_cap = 0;");
-            // command-buffer length (BASHC_OPT: `_sh_add` was O(n^2) via
-            // strlen per append; tracked length makes it O(n) total.
-            // Callers unchanged (helpers maintain it); save/restore with
-            // the buffer in _sh_call_fn (else length/buffer mismatch).
             self.emit("static char *_sh_wb = 0; static size_t _sh_wcap = 0;");
             self.emit("static char *_sh_wrap = 0; static size_t _sh_wrapcap = 0;");
             self.emit("static void _sh_grow(char **b, size_t *cap, size_t need) {");
@@ -11978,8 +12265,18 @@ impl Render {
             self.emit("/* ${s#pat}/${s##pat} prefix strip (glob-aware, greedy = longest) */");
             self.emit("static char *_sh_strippre(_sh_vbuf *d, const char *s, const char *pat, int greedy) {");
             self.emit("  static _sh_vbuf sc = {0, 0};");
-            self.emit("  _sh_vgrow(&sc, strlen(s) + 1); strcpy(sc.p, s);");
-            self.emit("  size_t n = strlen(sc.p), best = 0;");
+            if std::env::var_os("SH2_NO_SCANFIX").is_none() {
+                // sh2-perf: one scan of `s` — the old form rescanned the
+                // just-made copy via `strlen(sc.p)` (the strip helpers were
+                // the demo's #2 strlen-byte site, ~10 KB strings). Toggle:
+                // SH2_NO_SCANFIX=1.
+                self.emit("  size_t n = strlen(s);");
+                self.emit("  _sh_vgrow(&sc, n + 1); strcpy(sc.p, s);");
+                self.emit("  size_t best = 0;");
+            } else {
+                self.emit("  _sh_vgrow(&sc, strlen(s) + 1); strcpy(sc.p, s);");
+                self.emit("  size_t n = strlen(sc.p), best = 0;");
+            }
             self.emit("  for (size_t i = 0; i <= n; i++) {");
             self.emit("    char c = sc.p[i]; sc.p[i] = 0;");
             self.emit("    if (fnmatch(pat, sc.p, 0) == 0) best = i;");
@@ -11993,8 +12290,14 @@ impl Render {
             self.emit("/* ${s%pat}/${s%%pat} suffix strip (the pattern matches a SUFFIX) */");
             self.emit("static char *_sh_stripsuf(_sh_vbuf *d, const char *s, const char *pat, int greedy) {");
             self.emit("  static _sh_vbuf sc = {0, 0};");
-            self.emit("  _sh_vgrow(&sc, strlen(s) + 1); strcpy(sc.p, s);");
-            self.emit("  size_t n = strlen(sc.p), best = n;");
+            if std::env::var_os("SH2_NO_SCANFIX").is_none() {
+                self.emit("  size_t n = strlen(s);");
+                self.emit("  _sh_vgrow(&sc, n + 1); strcpy(sc.p, s);");
+                self.emit("  size_t best = n;");
+            } else {
+                self.emit("  _sh_vgrow(&sc, strlen(s) + 1); strcpy(sc.p, s);");
+                self.emit("  size_t n = strlen(sc.p), best = n;");
+            }
             self.emit("  if (greedy) {");
             self.emit("    for (size_t i = n; i > 0; i--) {");
             self.emit("      if (fnmatch(pat, sc.p + (n - i), 0) == 0) { best = n - i; break; }");
@@ -14019,8 +14322,24 @@ impl Render {
                 }
             }
             IrExpr::Str(s, _) => Self::cstr(s),
-            IrExpr::Var(name, _) => self.c_ident(name),
-            IrExpr::Ident(name) => self.c_ident(name),
+            IrExpr::Var(name, _) | IrExpr::Ident(name) => {
+                // A bare ident compiles only when a C DECLARATION exists
+                // (has_c_decl): `store` collects READ mentions, so an
+                // env-only var (the game's `sm_size_old` — read in the
+                // texture-cache replay tests, never assigned in script)
+                // lands there with no decl, and the bare ident fails cc
+                // for the whole program. `_sh_env` reads the value the
+                // child exported.
+                if self.has_c_decl(name)
+                {
+                    self.c_ident(name)
+                } else {
+                    format!(
+                        "_sh_env({})",
+                        Self::cstr(name)
+                    )
+                }
+            }
             IrExpr::Bool(b) => {
                 if *b { "1".into() } else { "0".into() }
             }
@@ -14349,7 +14668,7 @@ impl Render {
                         }
                     }
                     let p = self.positional_read_l(name);
-                    if self.cur_native_num && self.lifted_param(name).is_some() {
+                    if self.cur_native_p(name) && self.lifted_param(name).is_some() {
                         p
                     } else {
                         format!("(long long){}", p)
@@ -14830,17 +15149,29 @@ impl Render {
                 Some(&n) => {
                     let native = self.native_num_fns.contains(name);
                     let big = self.bigint_param_fns.contains(name);
+                    // MIXED ABI: per-position `long long` for the
+                    // numstr-proven numeric positions, `char *` for the
+                    // text ones (one hex-string slot no longer forces the
+                    // whole signature through stringify→atoll).
+                    let positions = if big {
+                        std::collections::BTreeSet::new()
+                    } else {
+                        self.native_positions
+                            .get(name)
+                            .cloned()
+                            .unwrap_or_default()
+                    };
                     format!(
                         "static void {fname}({})",
                         (1..=n)
                             .map(|i| {
-                                if native {
+                                if big {
+                                    format!("mpz_t _p{i}")
+                                } else if native || positions.contains(&i) {
                                     format!(
                                         "long long {}",
                                         alias.get(&i).cloned().unwrap_or_else(|| format!("_p{i}"))
                                     )
-                                } else if big {
-                                    format!("mpz_t _p{i}")
                                 } else {
                                     format!("char *_p{i}")
                                 }
@@ -16570,10 +16901,22 @@ fn param_copy_alias(
         let void_arity = self.void_fns.get(name).copied();
         let saved_params = std::mem::take(&mut self.cur_params);
         let saved_native = self.cur_native_num;
+        let saved_native_pos = std::mem::take(&mut self.cur_native_pos);
         let saved_big = self.cur_bigint_param;
         let saved_arr = self.cur_array_return_arr.take();
         self.cur_native_num =
             (lifted_arity.is_some() || void_arity.is_some()) && self.native_num_fns.contains(name);
+        // MIXED ABI (void lifts only — value-lift call sites stay
+        // whole-fn, so `cur_native_pos` never fires for them; bigint-param
+        // fns keep their mpz_t convention).
+        self.cur_native_pos = if void_arity.is_some()
+            && lifted_arity.is_none()
+            && !self.bigint_param_fns.contains(name)
+        {
+            self.native_positions.get(name).cloned().unwrap_or_default()
+        } else {
+            std::collections::BTreeSet::new()
+        };
         self.cur_bigint_param =
             (lifted_arity.is_some() || void_arity.is_some()) && self.bigint_param_fns.contains(name);
         self.cur_array_return_arr = self.array_return_arrays.get(name).cloned();
@@ -16673,6 +17016,7 @@ fn param_copy_alias(
         }
         self.cur_params = saved_params;
         self.cur_native_num = saved_native;
+        self.cur_native_pos = saved_native_pos;
         self.cur_bigint_param = saved_big;
         self.cur_array_return_arr = saved_arr;
         let fn_file_vars: BTreeSet<String> = self
@@ -16927,8 +17271,23 @@ fn param_copy_alias(
     /// A char* read of a string-typed/untyped var (NULL-safe: unset vars
     /// render as the empty string, matching bash's unset semantics in
     /// expansions).
+    /// Does `name` have a C declaration? THE predicate for the
+    /// env-var guards. `var_types` = typed hoists; `inventory_vars` =
+    /// the file-scope walk (assigns/declares/If/While — skips function
+    /// bodies and for-loop counters); `hoist_vars` =
+    /// `collect_assigned_vars` over the whole program, which covers
+    /// exactly what the hoists declare (fn bodies, Case clauses, loop
+    /// vars). `store` membership is NOT evidence: it collects READ
+    /// mentions too (`collect_store_expr`), which is how the game's
+    /// env-only `sm_size_old` sat in `store` with nothing hoisted.
+    fn has_c_decl(&self, name: &str) -> bool {
+        self.var_types.contains_key(name)
+            || self.inventory_vars.contains(name)
+            || self.hoist_vars.contains(name)
+    }
+
     #[track_caller]
-    fn store_ref(&self, name: &str) -> String {
+    fn store_ref(&mut self, name: &str) -> String {
         if name == "h" || name == "c" {
             pdebug!("DBG store_ref({}) from {}", name, std::panic::Location::caller());
         }
@@ -16965,8 +17324,22 @@ fn param_copy_alias(
             // guard is dead (item 24). buf_bound ⟺ array decl (both the
             // const and mutable decl paths emit char[N]).
             id
-        } else {
+        } else if self.has_c_decl(name) {
             format!("({id} ? {id} : \"\")")
+        } else {
+            // No pass-1 C declaration for this name: `store` collects
+            // READ mentions as well as assignments (and render-time
+            // inserts), so an env-only var — the game's `sm_size_old`,
+            // written by the child bash and read only in if-conds —
+            // sits in `store` with nothing hoisted for it. The bare
+            // ident (`atoll((sm_size_old ? sm_size_old : ""))`) fails
+            // cc and takes the whole program down. Declared ⟺ the
+            // pass-1 walkers saw an assignment (var_types = typed,
+            // top_vars = file-scope walk, inventory_vars = full walk
+            // incl. Case/Select clauses), so no decl → read the real
+            // environment, which holds the value the child exported.
+            self.need_sh = true;
+            format!("_sh_env({})", Self::cstr(name))
         }
     }
 
@@ -16986,10 +17359,20 @@ fn param_copy_alias(
         Some(self.cur_params[i - 1].clone())
     }
 
+    /// True when `$n` (a 1-based positional digit string) reads a native
+    /// `long long _pN` in the current fn: whole-fn native, or a
+    /// mixed-ABI void lift whose position kept its Int verdict.
+    fn cur_native_p(&self, n: &str) -> bool {
+        self.cur_native_num
+            || (!self.cur_native_pos.is_empty()
+                && n.parse::<usize>()
+                    .is_ok_and(|i| i > 0 && self.cur_native_pos.contains(&i)))
+    }
+
     /// Numeric `$N` read: the lifted fn's param, else the caller's argv.
     fn positional_read_l(&self, n: &str) -> String {
         if let Some(p) = self.lifted_param(n) {
-            if self.cur_native_num {
+            if self.cur_native_p(n) {
                 // native numeric param: `_pN` is already the value
                 return format!("({p})");
             }
@@ -17013,8 +17396,18 @@ fn param_copy_alias(
     /// String `$N` read (the argv-or-param form, null-guarded). In a
     /// positional-const program read inline in main, the main params
     /// DIRECTLY — no globals.
-    fn positional_str_l(&self, n: &str) -> String {
+    fn positional_str_l(&mut self, n: &str) -> String {
         if let Some(p) = self.lifted_param(n) {
+            if self.cur_native_p(n) {
+                // native `long long _pN` in a string context: canonical
+                // decimal text via `num_temp` (exact for every long
+                // long). The old ternary `((p) ? (p) : "")` passed the
+                // long long as a `char*` — a garbage-pointer read
+                // (`strlen` of it segfaulted the game once the upgrade
+                // made most fns whole-native), and no corpus fn had
+                // dared this path before.
+                return self.num_temp(&format!("({p})"));
+            }
             return format!("(({p}) ? ({p}) : \"\")");
         }
         if self.in_site > 0 {
@@ -17077,9 +17470,18 @@ fn param_copy_alias(
             }
             None => name,
         };
+        // A store var needs a C DECLARATION before a bare-ident read can
+        // compile: `store` collects READ mentions (collect_store_expr),
+        // so an env-only var (the game's `sm_size_old`, written by the
+        // child bash and read here in the texture-cache replay tests)
+        // lands in `store` while hoisting no decl. `store_ref` is
+        // decl-aware (has_c_decl): declared → null-guard ident,
+        // otherwise `_sh_env(name)`, which reads the value the child
+        // exported.
         if self.store.contains(name) || self.var_types.contains_key(name) {
             self.store_ref(name)
         } else {
+            self.need_sh = true;
             format!(
                 "_sh_env({})",
                 Self::cstr(name)
@@ -17814,7 +18216,7 @@ fn param_copy_alias(
         // per-function duplication, no scope/lifetime juggling.
         if let Some(v) = Self::bigint_const_value(a) {
             self.bigint_consts.insert(v.clone());
-            return format!("_bigint_{}", v);
+            return Self::bigint_const_name(&v);
         }
         // a computed temp: a clear `_bigint_tmp_<seq>` name (distinct
         // from the value-named constants `_bigint_<value>`).
@@ -17834,6 +18236,17 @@ fn param_copy_alias(
             ArithAst::Num(n) => Some(n.to_string()),
             _ => Self::horner_chain_digits(a),
         }
+    }
+
+    /// C identifier for a value-named bigint constant. The value text
+    /// can carry a sign (`mpz_t _bigint_-1` is not a C identifier —
+    /// it breaks the render at the declaration), so `-` encodes as
+    /// `n`. Const values are otherwise all digits, so the encoding is
+    /// injective: `-1` → `_bigint_n1`, no collision with a literal
+    /// value. The `mpz_init_set_str` argument stays the ORIGINAL
+    /// value text — only the identifier is re-encoded.
+    fn bigint_const_name(v: &str) -> String {
+        format!("_bigint_{}", v.replace('-', "n"))
     }
 
     /// Decimal text of a bigint value into a fresh vbuf; returns the
@@ -18725,10 +19138,8 @@ fn param_copy_alias(
                             word(self, format!("{t}.p"));
                         }
                         Some(n) if n.chars().all(|c| c.is_ascii_digit()) => {
-                            self.emit(&format!(
-                                "_sh_export(\"_SHARGV\", {});",
-                                self.positional_str_l(n)
-                            ));
+                            let sv = self.positional_str_l(n);
+                            self.emit(&format!("_sh_export(\"_SHARGV\", {sv});"));
                             match buf {
                                 CmdBuf::Shared => self.emit("_sh_addraw(\"$_SHARGV\");"),
                                 CmdBuf::Private(id) => self.emit(&format!(
@@ -20556,10 +20967,11 @@ fn param_copy_alias(
                 let t = self.num_temp(&self.c_ident(name));
                 self.emit(&format!("_sh_export({}, {t});", Self::cstr(name)));
             } else {
+                let v = self.store_ref(name);
                 self.emit(&format!(
                     "_sh_export({}, {});",
                     Self::cstr(name),
-                    self.store_ref(name)
+                    v
                 ));
             }
         }
@@ -21349,6 +21761,21 @@ fn param_copy_alias(
                             if let Some(b) = self.buf_bound(&name) {
                                 self.emit(&format!("{id}[0] = '\\0';"));
                                 let _ = b;
+                            } else if self.is_heap_store_var(&name) {
+                                // Owned heap: free it and NULL it. The old
+                                // bare `= ""` aliased STATIC storage into a
+                                // var the exit teardown (and every later
+                                // store's `free(_old)`) still owns —
+                                // `s=hi; s=""; unset s` segfaulted at exit
+                                // on free(rodata). NULL reads back as ""
+                                // through the store guards and free(NULL)
+                                // is a no-op, so the NULL-or-heap invariant
+                                // every free site depends on is preserved.
+                                // The predicate is the teardown walker's
+                                // own (const-lifted literals keep the
+                                // literal clear — teardown never frees
+                                // them, so aliasing is safe there).
+                                self.emit(&format!("free({id}); {id} = NULL;"));
                             } else {
                                 self.emit(&format!("{id} = \"\";"));
                             }
@@ -21727,15 +22154,26 @@ fn param_copy_alias(
                     // argv swap (the body reads _pN), no stdout capture.
                     // Missing args pad ""/0 (unset positionals). Native
                     // args convert like value-lift params (value_ll),
-                    // bigint args via a temp mpz_t (value_mpz).
+                    // bigint args via a temp mpz_t (value_mpz). MIXED ABI
+                    // (per-position): a numeric position converts with
+                    // value_ll, a text position with value_c.
                     self.need_sh = true;
                     let native = self.native_num_fns.contains(&cmd);
                     let big = self.bigint_param_fns.contains(&cmd);
+                    let positions = if big {
+                        std::collections::BTreeSet::new()
+                    } else {
+                        self.native_positions
+                            .get(&cmd)
+                            .cloned()
+                            .unwrap_or_default()
+                    };
                     let mut a: Vec<String> = Vec::new();
                     for i in 0..arity {
+                        let native_i = native || positions.contains(&(i + 1));
                         let v = match words.get(i) {
                             Some(w) => {
-                                if native {
+                                if native_i {
                                     self.value_ll(w)
                                 } else if big {
                                     self.value_mpz(w)
@@ -21744,7 +22182,7 @@ fn param_copy_alias(
                                 }
                             }
                             None => {
-                                if native || big {
+                                if native_i || big {
                                     "0".into()
                                 } else {
                                     "\"\"".into()
@@ -22011,14 +22449,21 @@ fn param_copy_alias(
     }
 
     /// The take-field block shared by both spellings (function-call
-    /// fusion and the `TakeFieldNode` render arm): one scan (strchr) +
-    /// two fresh copies (field, remainder). One block: the swap reads
-    /// the temps, so everything shares a scope.
+    /// fusion and the `TakeFieldNode` render arm): one scan (strchr),
+    /// one copy of the FIELD into the shared vbuf, then the two stores.
+    /// One block: the swaps read the temps, so everything shares a scope.
     ///
-    /// Lifecycle mirrors `emit_owned_store`: fresh buffers are computed
-    /// first (the source is untouched during the read), then heap-store
-    /// vars swap-and-free their olds while the others keep today's leak
-    /// parity. Both vars join `store` first: the fused assigns replace
+    /// Lifecycle mirrors `emit_owned_store`: the field copy is made
+    /// while the source is untouched, then each dest stores. Heap-store
+    /// vars store through `_sh_sset` (SH2_NO_TAKE_SSET=1 keeps the
+    /// legacy fresh-copy + swap): for the REMAINDER dest the source
+    /// pointer is a suffix of that var's OWN buffer (`_tt` is `(s?s:"")`),
+    /// so the capacity branch memmoves the suffix forward in place —
+    /// the per-token `_sh_xstrdup(rest-of-payload)` + free that made
+    /// take-field splitting O(n²) bytes through the allocator (745k
+    /// strdup calls / 1.48 s of the MIMEcroft demo) becomes one move.
+    /// Non-heap dests keep today's fresh copy with leak parity.
+    /// Both vars join `store` first: the fused assigns replace
     /// plain assigns that would have registered them, and later reads
     /// must see known shell vars (direct reads) rather than the
     /// environment fallback (`_sh_env` → `""`), with free-wrap on
@@ -22032,18 +22477,40 @@ fn param_copy_alias(
         // `xi` is unused: the fused block below keys on `si` alone.
         let _xi = self.c_ident(x);
         let si = self.c_ident(s);
+        // In-place store (SH2_NO_TAKE_SSET=1 keeps the legacy path):
+        // only for heap-owned dests — a const-lifted or buffer dest
+        // must keep the fresh copy (its old storage is not freeable).
+        let take_sset = std::env::var_os("SH2_NO_TAKE_SSET").is_none();
+        let x_inplace = take_sset && self.is_heap_store_var(x);
+        let s_inplace = take_sset && self.is_heap_store_var(s);
         let mut block = format!(
             "{{ const char *_tt{t} = ({si} ? {si} : \"\"); \
              const char *_td{t} = strchr(_tt{t}, (char)0x{delim:02x}); \
              size_t _tn{t} = _td{t} ? (size_t)(_td{t} - _tt{t}) : strlen(_tt{t}); \
              static _sh_vbuf _v{t} = {{0, 0}}; \
-             _sh_vgrow(&_v{t}, _tn{t}+1); memcpy(_v{t}.p, _tt{t}, _tn{t}); _v{t}.p[_tn{t}] = 0; \
-             char *_nx{t} = _sh_xstrdup(_v{t}.p); \
-             char *_ns{t} = _sh_xstrdup(_td{t} ? _td{t}+1 : \"\");",
+             _sh_vgrow(&_v{t}, _tn{t}+1); memcpy(_v{t}.p, _tt{t}, _tn{t}); _v{t}.p[_tn{t}] = 0;",
             delim = delim
         );
-        for (var, tmp) in [(x, format!("_nx{t}")), (s, format!("_ns{t}"))] {
+        if !x_inplace {
+            block.push_str(&format!(" char *_nx{t} = _sh_xstrdup(_v{t}.p);"));
+        }
+        if !s_inplace {
+            block.push_str(&format!(" char *_ns{t} = _sh_xstrdup(_td{t} ? _td{t}+1 : \"\");"));
+        }
+        for (var, tmp, inplace, src) in [
+            (x, format!("_nx{t}"), x_inplace, format!("_v{t}.p")),
+            (
+                s,
+                format!("_ns{t}"),
+                s_inplace,
+                format!("_td{t} ? _td{t}+1 : \"\""),
+            ),
+        ] {
             let id = self.c_ident(var);
+            if inplace {
+                block.push_str(&format!(" _sh_sset(&{id}, {src});"));
+                continue;
+            }
             // Shell idents are C-safe; the suffix keeps the two swaps'
             // temps distinct inside the shared block.
             let old = format!("_o{t}_{var}");
@@ -22511,11 +22978,30 @@ fn param_copy_alias(
         // left the var dangling across RHS evaluation — captures read
         // it via exports). Subsumes the self-ref guard.
         if self.top_vars.contains(name) {
-            let old = format!("_old{}", self.temp_seq);
-            self.temp_seq += 1;
-            self.emit(&format!("{{ char *{old} = {id}; {id} = _sh_xstrdup((char*)({v})); free({old}); }}"));
+            self.emit_str_store(id, &v);
         } else {
             self.emit(&format!("{id} = _sh_xstrdup((char*)({v}));"));
+        }
+    }
+
+    /// Owned string store for a file-scope heap var: the `_sh_sset`
+    /// in-place helper (SH2_NO_SSET=1 keeps the legacy `_old`
+    /// temp-swap). The legacy store FREED the old buffer right after
+    /// the reassign, so nothing may legally alias it — copying the new
+    /// value into that buffer when it fits skips a malloc/free pair,
+    /// which is the whole steady-state allocation traffic of a game
+    /// loop (`x = xstrdup(vbuf); free(old)` per store). `src` aliasing
+    /// the buffer itself (self-ref RHS) is covered by memmove, and the
+    /// miss path is the legacy order: snapshot, free, own.
+    fn emit_str_store(&mut self, id: &str, v: &str) {
+        if std::env::var_os("SH2_NO_SSET").is_some() {
+            let old = format!("_old{}", self.temp_seq);
+            self.temp_seq += 1;
+            self.emit(&format!(
+                "{{ char *{old} = {id}; {id} = _sh_xstrdup((char*)({v})); free({old}); }}"
+            ));
+        } else {
+            self.emit(&format!("_sh_sset(&{id}, (char*)({v}));"));
         }
     }
 
@@ -23810,6 +24296,15 @@ fn param_copy_alias(
     fn value_num_dollar(&mut self, x: &IrExpr) -> String {
         if let IrExpr::Str(s, _) = x {
             if s.contains('$') {
+                // A bare `$name` / `${name}` / `$((expr))` reference in a
+                // numeric context resolves NATIVELY: materialising the
+                // expansion into a buffer and parsing it back cost
+                // `num_temp` snprintf + a vgrow/`%s` snprintf + atoll
+                // (three libc calls) for a value the store already holds
+                // as a `long long` — the `${row:0:$rbp_o}` slice index.
+                if let Some(v) = self.raw_num_text_native(s) {
+                    return v;
+                }
                 let v = self.heredoc_body_c(x);
                 // RAW numeric expr — num_temp would stringify it back
                 // into a char* buffer
@@ -23817,6 +24312,61 @@ fn param_copy_alias(
             }
         }
         self.value_num(x)
+    }
+
+    /// Raw `$name` / `${name}` / `$((expr))` text as a native C number
+    /// (numeric context only). Only the BARE forms resolve: a defaulting
+    /// or compound expansion (`${x:-y}`, `$x$y`, `${x#a}`) can inject
+    /// text the var's type does not describe, so those stay on the
+    /// buffer path (`heredoc_body_c` → atoll), which this mirrors value
+    /// for value:
+    ///
+    /// * Int-homed var → the C value (`atoll(num_temp(x))` == `x`);
+    /// * any other var → `atoll` of the SAME string `heredoc_body_c`
+    ///   would have `snprintf`'d into the buffer (getVar read, null-guard
+    ///   included);
+    /// * `$((…))` → the arith renderer (validated by `parse_arith`).
+    fn raw_num_text_native(&mut self, s: &str) -> Option<String> {
+        // Validation switch, part of the `SH2_NO_*` render_env_key family
+        // (bash-o4/src/cache.rs): set → this lift is inert and the
+        // historical buffer/atoll render comes out byte-for-byte.
+        if std::env::var("SH2_NO_NATIVE_LIFT").is_ok() { return None; }
+        let t = s.trim();
+        if t.starts_with("$((") && t.ends_with("))") && t.len() > 5 {
+            let inner = &t[3..t.len() - 2];
+            if !inner.contains("$(") && !inner.contains('`') {
+                if let Some(a) = crate::shir::parse_arith(inner) {
+                    return Some(format!("(long long)({})", self.arith(&a)));
+                }
+            }
+            return None;
+        }
+        let rest = t.strip_prefix('$')?;
+        let name = match rest.strip_prefix('{').and_then(|x| x.strip_suffix('}')) {
+            Some(inner) => inner,
+            None => rest,
+        };
+        if name.is_empty()
+            || !name
+                .chars()
+                .all(|c| c.is_ascii_alphanumeric() || c == '_')
+        {
+            return None;
+        }
+        if self.is_num(name) {
+            return Some(format!("(long long){}", self.c_ident(name)));
+        }
+        if self.bigint_vars.contains(name) || self.tiered_vars.contains(name) {
+            return Some(format!("(long long)({})", self.num_read_c(name)));
+        }
+        let v = self.call(
+            "getVar",
+            &[IrExpr::Str(
+                name.to_string(),
+                crate::ir::StrStyle::DoubleQuoted,
+            )],
+        );
+        Some(format!("(long long)atoll({v})"))
     }
 
     /// A shell-out exec site (statement or expr position).
@@ -25337,6 +25887,19 @@ fn param_copy_alias(
                 let (a, op, b) = (&toks[0], &toks[1], &toks[2]);
                 let raw_a = a.clone();
                 let raw_b = b.clone();
+                // Per-operand numeric lift FIRST: a provably numeric
+                // operand is read natively, so an Int-homed var is never
+                // stringified by `num_temp` only for `atoll` to parse it
+                // back (2 libc calls per operand per evaluation — the
+                // `[ "$y" -ge "$RFBH" ]` shape runs per rasterized span).
+                // Rendering `l`/`r` before this check would already have
+                // emitted that dead snprintf, so the probe must come
+                // first. Exactly value-preserving: `atoll(num_temp(x))`
+                // == x for every `long long`, and the non-numeric side
+                // keeps `atoll(<same string text>)`.
+                if let Some(e) = self.test_numeric_cmp(op, &raw_a, &raw_b) {
+                    return e;
+                }
                 let (l, r) = (self.test_value(a), self.test_value(b));
                 self.test_compare(op, &l, &r, &raw_a, &raw_b)
             }
@@ -25345,6 +25908,40 @@ fn param_copy_alias(
                 "0".into()
             }
         }
+    }
+
+    /// A numeric compare (`-eq`…`-ge`) whose operands are lifted
+    /// INDEPENDENTLY: an operand `test_num_operand` proves numeric is
+    /// used as a C value directly, and only the still-string operand
+    /// pays an `atoll`. Returns None when nothing is provable (the
+    /// caller falls through to the plain string compare), so a fully
+    /// textual compare is rendered exactly as before.
+    fn test_numeric_cmp(&mut self, op: &str, raw_l: &str, raw_r: &str) -> Option<String> {
+        // validation switch — see raw_num_text_native
+        if std::env::var("SH2_NO_NATIVE_LIFT").is_ok() { return None; }
+        let cop = match op {
+            "-gt" => ">",
+            "-lt" => "<",
+            "-ge" => ">=",
+            "-le" => "<=",
+            "-eq" => "==",
+            "-ne" => "!=",
+            _ => return None,
+        };
+        let ln = self.test_num_operand(raw_l);
+        let rn = self.test_num_operand(raw_r);
+        if ln.is_none() && rn.is_none() {
+            return None;
+        }
+        let l = match ln {
+            Some(v) => v,
+            None => format!("(long long)atoll({})", self.test_value(raw_l)),
+        };
+        let r = match rn {
+            Some(v) => v,
+            None => format!("(long long)atoll({})", self.test_value(raw_r)),
+        };
+        Some(format!("({l} {cop} {r})"))
     }
 
     fn test_compare(&mut self, op: &str, l: &str, r: &str, raw_l: &str, raw_r: &str) -> String {
@@ -25558,6 +26155,21 @@ fn param_copy_alias(
 
     fn test_value(&mut self, t: &str) -> String {
         let raw = t.trim();
+        // `$var` / `${var}` (pure or embedded in a literal word) used to
+        // reach the arms below as RAW text: `[ -f /tmp/x-$name ]` emitted
+        // `_sh_is_f("/tmp/x-$name")` — a filename that can never exist —
+        // and `[ -f "$x" ]` emitted the bare C identifier `x`. On the fb0
+        // game that made both texture-cache replay tests permanently
+        // false, so every launch regenerated every texture in a forked
+        // bash child (~57s CPU per launch). Expand whole-`$name` /
+        // `${name}` and mixed words of simple refs through `value_c`
+        // (Int-homed vars read natively, string vars keep the null
+        // guard); any other `$` form (positionals, `$?`, `$(…)`,
+        // `${x#pat}`, partial quoting) returns None and keeps the
+        // specialized arms below.
+        if let Some(v) = self.test_value_dollar(raw) {
+            return v;
+        }
         // `~` / `~/Documents` — home expansion (also `~user` is out of
         // scope: the gate runs as one user, $HOME is the same)
         if raw == "~" {
@@ -25745,6 +26357,120 @@ fn param_copy_alias(
             }
         } else {
             Self::cstr(stripped)
+        }
+    }
+
+    /// Expand a test operand containing `$`-references: a whole
+    /// `$name` / `${name}`, or a mixed literal word carrying simple refs
+    /// (`/tmp/mimecroft-tex-$lt_name-$lt_ts`). Renders through `value_c`
+    /// so the var's typing verdicts decide the read form.
+    ///
+    /// Refuses (None) everything else: single-quoted words (literal),
+    /// partially quoted words, special/positional refs (`$?`, `$1` — the
+    /// arms below own those when whole), `$(…)`, `$((…))`, `${x#pat}` and
+    /// any malformed `$`.
+    fn test_value_dollar(&mut self, raw: &str) -> Option<String> {
+        // validation switch — see raw_num_text_native
+        if std::env::var("SH2_NO_NATIVE_LIFT").is_ok() { return None; }
+        if !raw.contains('$') {
+            return None;
+        }
+        let word = if raw.len() >= 2 && raw.starts_with('\"') && raw.ends_with('\"') {
+            &raw[1..raw.len() - 1]
+        } else if raw.contains('\"') || raw.contains('\'') {
+            // single-quoted (literal — the dequote arm renders it) or a
+            // partially quoted word (too subtle; keep historical output)
+            return None;
+        } else {
+            raw
+        };
+        if !word.contains('$') {
+            return None;
+        }
+        let mut parts: Vec<crate::ir::InterpPart> = Vec::new();
+        let mut lit = String::new();
+        let bytes = word.as_bytes();
+        let mut i = 0usize;
+        while i < bytes.len() {
+            if bytes[i] != b'$' {
+                let ch = word[i..].chars().next()?;
+                lit.push(ch);
+                i += ch.len_utf8();
+                continue;
+            }
+            // `${name}` — plain name only; `$name` — must start alpha/underscore.
+            let (name, next_i) = if i + 1 < bytes.len() && bytes[i + 1] == b'{' {
+                let rest = &word[i + 2..];
+                let end = rest.find('}')?;
+                let n = &rest[..end];
+                if !Self::plain_var_name(n) {
+                    return None;
+                }
+                (n.to_string(), i + 2 + end + 1)
+            } else {
+                let mut j = i + 1;
+                while j < bytes.len() && (bytes[j].is_ascii_alphanumeric() || bytes[j] == b'_') {
+                    j += 1;
+                }
+                if j == i + 1 || !(bytes[i + 1].is_ascii_alphabetic() || bytes[i + 1] == b'_') {
+                    return None; // `$?`, `$1`, `$(`, `$'`, trailing `$` …
+                }
+                (word[i + 1..j].to_string(), j)
+            };
+            if !lit.is_empty() {
+                parts.push(crate::ir::InterpPart::Lit(std::mem::take(&mut lit)));
+            }
+            parts.push(crate::ir::InterpPart::Expr(Box::new(IrExpr::Var(name, None))));
+            i = next_i;
+        }
+        if parts.is_empty() {
+            return None;
+        }
+        // A plain ref becomes a direct C identifier only when the pass-1
+        // hoist declared it. An env-only var (the game's `sm_size_old`,
+        // never assigned in-script) has no C declaration: emitting the
+        // bare id compiles to an undeclared identifier. Bail to the
+        // historical arms below, which read `_sh_env(name)` for exactly
+        // this case — and only this case.
+        for p in &parts {
+            if let crate::ir::InterpPart::Expr(e) = p {
+                if let IrExpr::Var(n, _) = &**e {
+                    // A store name alone does NOT guarantee a C
+                    // declaration: `store` collects READ mentions, so a
+                    // pure env var (the game's `sm_size_old`) can sit
+                    // there while hoisting no decl, and the null-guard
+                    // read would emit an undeclared identifier.
+                    // `has_c_decl` is the decl ground truth (typed /
+                    // file-scope walk / whole-program assign walk).
+                    if !self.has_c_decl(n)
+                    {
+                        return None;
+                    }
+                }
+            }
+        }
+        if !lit.is_empty() {
+            parts.push(crate::ir::InterpPart::Lit(lit));
+        }
+        let expr = if parts.len() == 1 {
+            match parts.pop()? {
+                crate::ir::InterpPart::Expr(e) => *e,
+                crate::ir::InterpPart::Lit(_) => return None,
+            }
+        } else {
+            IrExpr::Interpolate(parts)
+        };
+        Some(self.value_c(&expr))
+    }
+
+    /// `[A-Za-z_][A-Za-z0-9_]*` — the only `${…}` content expanded here.
+    fn plain_var_name(n: &str) -> bool {
+        let mut cs = n.chars();
+        match cs.next() {
+            Some(c) if c.is_ascii_alphabetic() || c == '_' => {
+                cs.all(|c| c.is_ascii_alphanumeric() || c == '_')
+            }
+            _ => false,
         }
     }
 
@@ -25981,11 +26707,13 @@ fn param_copy_alias(
                     } else {
                         self.store_read(&name)
                     };
-                    // _sh_substr only READS its input: a stable lvalue
+                    // _sh_substr only READS its input: a stable source
                     // (bare ident — vars, arrays, temps all outlive the
-                    // call) needs no stabilizing copy (item 34). Anything
-                    // else (calls, ternaries) keeps the copy.
-                    if is_ident(&v) {
+                    // call — or store_read's null-guard `(x ? x : "")`
+                    // around one; see is_stable_src) needs no
+                    // stabilizing copy (item 34). Anything else
+                    // (calls, other ternaries) keeps the copy.
+                    if is_stable_src(&v) {
                         v
                     } else {
                         let t = self.vbuf_temp();
@@ -29227,7 +29955,18 @@ fn param_copy_alias(
                         Self::cstr(&fmt)
                     ));
                 }
-                return Some(format!("({name} = {}, 1)", Self::cstr(&fmt)));
+                // Heap-own the literal: the var is a store var and the
+                // exit teardown frees store vars, so a bare literal
+                // assignment made `printf -v p 'x'` end in free() of a
+                // .rodata pointer ("free(): invalid pointer"). Matches
+                // the non-empty-args path below (plain _sh_xstrdup
+                // reassign; the old buffer leaks on re-store exactly as
+                // that path does). The helper is content-spliced iff
+                // referenced, so no need_sh coupling here.
+                return Some(format!(
+                    "({name} = _sh_xstrdup({}), 1)",
+                    Self::cstr(&fmt)
+                ));
             }
             let t = self.vbuf_temp();
             let store = if self.buf_bound(name).is_some() {
@@ -29810,10 +30549,10 @@ fn param_copy_alias(
                                 // self-reference safe (same discipline as
                                 // the scalar COPY path).
                                 let vid = self.c_ident(&vars_c[0]);
-                                self.emit(&format!("{{ char *_old = {vid}; {vid} = _sh_xstrdup(_rl{id}.p); free(_old); }}"));
+                                self.emit_str_store(&vid, &format!("_rl{id}.p"));
                                 for v in vars_c.iter().skip(1) {
                                     let vid2 = self.c_ident(v);
-                                    self.emit(&format!("{{ char *_old = {vid2}; {vid2} = _sh_xstrdup(\"\"); free(_old); }}"));
+                                    self.emit_str_store(&vid2, "\"\"");
                                 }
                             }
                             Some(cs) => {
@@ -29952,18 +30691,20 @@ fn param_copy_alias(
                                 // Free-then-assign per iteration (see the
                                 // sibling IFS= arm above): a bare strdup
                                 // leaks the previous line on every pass.
-                                self.emit(&format!("{{ char *_old = {vid}; {vid} = _sh_xstrdup(_rl{id}.p); free(_old); }}"));
+                                self.emit_str_store(&vid, &format!("_rl{id}.p"));
                             }
                             Some(s) if s.is_empty() => {
                                 let vid = self.c_ident(&vars_c[0]);
-                                self.emit(&format!("{{ char *_old = {vid}; {vid} = _sh_xstrdup(_rl{id}.p); free(_old); }}"));
+                                self.emit_str_store(&vid, &format!("_rl{id}.p"));
                             }
                             Some(cs) if nv == 1 => {
                                 let vid = self.c_ident(&vars_c[0]);
                                 self.emit(&format!(
-                                    "{{ char *_d = strchr(_rl{id}.p, {cs_byte}); if (_d) *_d = 0; {{ char *_old = {vid}; {vid} = _sh_xstrdup(_rl{id}.p); free(_old); }} }}",
+                                    "{{ char *_d = strchr(_rl{id}.p, {cs_byte}); if (_d) *_d = 0;",
                                     cs_byte = cs.as_bytes()[0]
                                 ));
+                                self.emit_str_store(&vid, &format!("_rl{id}.p"));
+                                self.emit("}");
                             }
                             Some(cs) => {
                                 let ifs_s = cs.clone();
@@ -30167,8 +30908,33 @@ fn param_copy_alias(
             }
         }
         // statement-position `printf -v VAR …`: assign NATIVELY instead of
-        // losing the assignment in a child bash
-        if let IrStmt::Expr(IrExpr::Call { func, args }) = s {
+        // losing the assignment in a child bash. A Redirect wrapper whose
+        // every target is a literal `/dev/null` (mode "w") unwraps too:
+        // the native printf -v path writes only the variable — no
+        // stdout/stderr output exists to redirect — and opening
+        // /dev/null has no observable side effect. This is the exact
+        // shape `printf -v v 'x' 2>/dev/null >/dev/null` (the clock
+        // probe in the MIMEcroft texture scripts) parses to; the
+        // Redirect wrapper previously pushed the whole builtin into a
+        // shell-text site, where printf -v ran in a CHILD bash and the
+        // assignment was lost (probe_ok stayed empty → the scripts'
+        // stats line flipped onto stdout inside a captured `$(…)` and
+        // corrupted the payload). Non-/dev/null redirect targets keep
+        // the generic rendering (bash still creates/truncates the
+        // target file even when printf -v writes nothing to it).
+        let pv_inner: &IrStmt = match s {
+            IrStmt::Redirect { inner, redirects }
+                if inner.len() == 1
+                    && redirects.iter().all(|r| {
+                        r.mode == "w"
+                            && matches!(&r.target, IrExpr::Str(t, _) if t == "/dev/null")
+                    }) =>
+            {
+                &inner[0]
+            }
+            other => other,
+        };
+        if let IrStmt::Expr(IrExpr::Call { func, args }) = pv_inner {
             if (func == "exec" || func == "builtin")
                 && Self::str_arg(args, 0).as_deref() == Some("printf")
             {
@@ -31036,9 +31802,7 @@ fn param_copy_alias(
                         // (the rasterizer's per-pixel row copies).
                         // Decls are NULL-init'd, so the first free is a
                         // no-op; end-of-main/end-of-fn free owns LAST.
-                        let old = format!("_old{}", self.temp_seq);
-                        self.temp_seq += 1;
-                        self.emit(&format!("{{ char *{old} = {name}; {name} = _sh_xstrdup((char*)({rhs})); free({old}); }}"));
+                        self.emit_str_store(&name, &rhs);
                         // P1 follow-up: _sh_xstrdup aborts on OOM, so the
                         // fresh copy is non-NULL by construction (plus
                         // fn-written gate).
@@ -31107,11 +31871,7 @@ fn param_copy_alias(
                                     // temp swap (same as the assign path —
                                     // a `local x=...` in a loop leaks
                                     // otherwise); decls are NULL-init'd.
-                                    let old = format!("_old{}", self.temp_seq);
-                                    self.temp_seq += 1;
-                                    self.emit(&format!(
-                                        "{{ char *{old} = {name}; {name} = _sh_xstrdup((char*)({v})); free({old}); }}"
-                                    ));
+                                    self.emit_str_store(&name, &v);
                                 }
                             }
                             None => {
@@ -32650,6 +33410,26 @@ fn param_copy_alias(
             // NEW-CORE NODE: ForEachLine — STREAMING line iteration over
             // a file (O(1) memory; the node doc pins "C getline"). The
             // loop var is STRING-typed by construction.
+            // Ext(GpuOp) — the fbdev-gpu lift replaces a DEVICE WRITE
+            // (`echo … > /dev/webgl/…`) with a GPU-op node so a backend with
+            // a GPU leg can emit a dispatch. C has no GPU leg, so §4.4's
+            // correctness firewall applies: render the ORIGINAL write (the
+            // same text a plain `echo … > device` produces) instead of a
+            // TODO. Must precede the ForEachLine arm's tag filter.
+            IrStmt::Ext(ref node) if node.tag() == "GpuOp" => {
+                if let Some(g) = node.as_any().downcast_ref::<crate::shir_nodes::GpuOp>() {
+                    let path = if g.slot.is_empty() {
+                        format!("{}/{}", g.device.trim_end_matches('/'), g.verb)
+                    } else {
+                        format!("{}/{}/{}", g.device.trim_end_matches('/'), g.slot, g.verb)
+                    };
+                    let c = self.value_c(&g.payload);
+                    let p = self.value_c(&IrExpr::Str(path, crate::ir::StrStyle::DoubleQuoted));
+                    self.emit(&format!(
+                        "{{ FILE *_f = fopen({p}, \"w\"); if (_f) {{ fputs({c}, _f); fclose(_f); }} }}"
+                    ));
+                }
+            }
             IrStmt::Ext(ref node) if node.tag() == "ForEachLine" => {
                 // P1 follow-up: the loop assigns its var (body assigns
                 // are tracked by the Assign hooks as the body renders).
@@ -33006,6 +33786,28 @@ fn param_copy_alias(
                 }
                 format!("(long long)atoll({})", self.expr(e))
             }
+            // Numeric context, POSITIONAL read: go straight to the
+            // numeric form (`(_pN)` for a native long long param,
+            // atoll-guard otherwise). The text path (value_c →
+            // positional_str_l → num_temp) must not reach a long long
+            // store un-coerced — a mixed-ABI fn's copy assign
+            // (`len = $2` with len long long) rendered
+            // `len = _s0;` (char* into long long: garbage + empty
+            // stdout). Whole-native fns never hit this because
+            // param_copy_alias elides the copy assign entirely.
+            IrExpr::Var(n, _)
+                if !n.is_empty() && n.chars().all(|c| c.is_ascii_digit()) =>
+            {
+                self.positional_read_l(n)
+            }
+            IrExpr::Call { func, args } if func == "getVar" => {
+                match Self::str_arg(args, 0) {
+                    Some(n) if !n.is_empty() && n.chars().all(|c| c.is_ascii_digit()) => {
+                        self.positional_read_l(&n)
+                    }
+                    _ => self.expr(e),
+                }
+            }
             _ => self.expr(e),
         }
     }
@@ -33025,6 +33827,10 @@ fn param_copy_alias(
         }
         collect_vars_full(&prog.stmts, &mut vars, &mut for_vars);
         self.top_vars = vars.clone();
+        self.inventory_vars = vars.clone();
+        // Decl-ground truth for the env-var guards (see `hoist_vars`):
+        // everything the hoists emit a C declaration for.
+        collect_assigned_vars(&prog.stmts, &mut self.hoist_vars);
         // collect function definitions at ANY depth (a function may be
         // defined inside a block/loop — the shellbench eval benches do).
         collect_fn_defs(&prog.stmts, &mut self.functions, &mut self.fn_defs);
@@ -33422,7 +34228,7 @@ fn param_copy_alias(
         }
         let bigint_consts = self.bigint_consts.clone();
         for v in &bigint_consts {
-            self.emit(&format!("  mpz_clear(_bigint_{v});"));
+            self.emit(&format!("  mpz_clear({});", Self::bigint_const_name(v)));
         }
         // EXPERIMENTAL (status audit): return _sh_rc to expose latent
         // status bugs. Pure-native trims _sh_rc (need_sh false).
@@ -35208,19 +36014,32 @@ fn scan_void_uses(
 /// Lifted functions whose params are all provably-numeric (Int-typed,
 /// not bigint) AND every call site passes a provably-small (non-bigint)
 /// arg — eligible for a native `long long _pN` signature.
-fn analyze_native_num_fns(prog: &IrProgram) -> BTreeSet<String> {
+fn analyze_native_num_fns(
+    prog: &IrProgram,
+    positions: &BTreeMap<String, BTreeSet<usize>>,
+) -> BTreeSet<String> {
     // value- AND void-lifted fns both take real C params (see
     // scan_void_lifts) — the numeric selection covers both.
+    //
+    // WHOLE-FN native requires EVERY position 1..=arity to carry
+    // per-position evidence (an Int positional copy or a
+    // numstr-proven numeric position — see `analyze_native_positions`).
+    // The old rule inspected only the copy vars: a position read
+    // DIRECTLY (`$6`, no `n = $6` copy) was swept into the
+    // `long long` signature by copies elsewhere in it — draw_char's
+    // fractional tint args (`0.35 0.90 0.40`) then arrived as
+    // `atoll("0.35")` → 0 and a `long long` passed as `char*`, which
+    // erased every HUD glyph (first-frame A/B caught it; the fractional
+    // positions correctly stay `char *` in the MIXED signature).
     let mut lifted = scan_fn_lifts(&prog.stmts);
     lifted.extend(scan_void_lifts(&prog.stmts));
     let bigint = crate::shir::analyze_bigint_vars(prog);
-    let vt: HashMap<String, IrType> = prog.var_types.iter().cloned().collect();
     let mut names = BTreeSet::new();
     let mut defs = Vec::new();
     collect_fn_defs(&prog.stmts, &mut names, &mut defs);
     let defmap: BTreeMap<String, Vec<IrStmt>> = defs.iter().cloned().collect();
     let mut out = BTreeSet::new();
-    for (name, _arity) in &lifted {
+    for (name, arity) in &lifted {
         let Some(body) = defmap.get(name) else { continue };
         // find the param vars materialized from positionals (`n = $1`)
         let mut param_vars = BTreeSet::new();
@@ -35239,15 +36058,17 @@ fn analyze_native_num_fns(prog: &IrProgram) -> BTreeSet<String> {
                 }
             }
         }
-        let all_num = !param_vars.is_empty()
-            && param_vars.iter().all(|v| {
-                matches!(
-                    vt.get(v),
-                    Some(IrType::Int | IrType::Int32 | IrType::Int64 | IrType::UInt32 | IrType::UInt64)
-                )
-            });
-        if std::env::var("SH2_DBG_W").is_ok() { pdebug!("DBG {name}: all_num={all_num} bigint_arith={} calls_small={}", body_has_bigint_arith(body, &bigint), fn_call_sites_small(name, &prog.stmts, &bigint)); }
-        if !all_num {
+        if param_vars.is_empty() {
+            continue;
+        }
+        // every signature position must be evidenced — a partial set
+        // goes MIXED (void lifts) or stays text (value lifts)
+        let covered = positions
+            .get(name)
+            .map(|s| (1..=*arity).all(|p| s.contains(&p)))
+            .unwrap_or(false);
+        if std::env::var("SH2_DBG_W").is_ok() { pdebug!("DBG {name}: covered={covered} arity={arity} bigint_arith={} calls_small={}", body_has_bigint_arith(body, &bigint), fn_call_sites_small(name, &prog.stmts, &bigint)); }
+        if !covered {
             continue;
         }
         if body_has_bigint_arith(body, &bigint) {
@@ -35257,6 +36078,119 @@ fn analyze_native_num_fns(prog: &IrProgram) -> BTreeSet<String> {
             continue;
         }
         out.insert(name.clone());
+    }
+    out
+}
+
+/// Per-position native typing for the MIXED ABI (see the
+/// `native_positions` field). A position is native when its positional
+/// copy var carries an Int verdict — which, after
+/// `demote_stringy_ints`, means every assign including the copy was
+/// re-validated, and the copy's own position is numstr-proven numeric
+/// (the demote guard `collect_param_seeds` feeds in). Positions with no
+/// copy var stay text (no evidence). Same bigint guards as the
+/// whole-fn analysis; the bigint/array-return convention split is
+/// enforced at the consumers (they ignore `positions` when `big`).
+fn analyze_native_positions(
+    prog: &IrProgram,
+    params: &HashMap<String, std::collections::BTreeSet<usize>>,
+) -> BTreeMap<String, BTreeSet<usize>> {
+    if std::env::var_os("SH2_NO_MIXED_ABI").is_some() {
+        return BTreeMap::new();
+    }
+    let mut lifted = scan_fn_lifts(&prog.stmts);
+    lifted.extend(scan_void_lifts(&prog.stmts));
+    let bigint = crate::shir::analyze_bigint_vars(prog);
+    let vt: HashMap<String, IrType> = prog.var_types.iter().cloned().collect();
+    let mut names = BTreeSet::new();
+    let mut defs = Vec::new();
+    collect_fn_defs(&prog.stmts, &mut names, &mut defs);
+    let defmap: BTreeMap<String, Vec<IrStmt>> = defs.iter().cloned().collect();
+    fn arith_digits(a: &ArithAst, out: &mut BTreeSet<usize>) {
+        match a {
+            ArithAst::Var(n) | ArithAst::Ident(n) => {
+                if !n.is_empty() && n.chars().all(|c| c.is_ascii_digit()) {
+                    if let Ok(i) = n.parse::<usize>() {
+                        if i > 0 {
+                            out.insert(i);
+                        }
+                    }
+                }
+            }
+            ArithAst::Index { key, .. } => arith_digits(key, out),
+            ArithAst::Bin { lhs, rhs, .. } => {
+                arith_digits(lhs, out);
+                arith_digits(rhs, out);
+            }
+            ArithAst::Un { arg, .. } => arith_digits(arg, out),
+            ArithAst::Cond { test, then, else_ } => {
+                arith_digits(test, out);
+                arith_digits(then, out);
+                arith_digits(else_, out);
+            }
+            ArithAst::Assign { rhs, .. } => arith_digits(rhs, out),
+            ArithAst::Cast { arg, .. } => arith_digits(arg, out),
+            _ => {}
+        }
+    }
+    let mut out = BTreeMap::new();
+    for (name, _arity) in &lifted {
+        let Some(body) = defmap.get(name) else { continue };
+        if body_has_bigint_arith(body, &bigint) {
+            continue;
+        }
+        if !fn_call_sites_small(name, &prog.stmts, &bigint) {
+            continue;
+        }
+        // position (1-based) -> the vars copied from it
+        let mut pos_vars: HashMap<usize, BTreeSet<String>> = HashMap::new();
+        for st in body {
+            if let IrStmt::Assign { targets, expr, .. } = st {
+                if let Some(t) = targets.first() {
+                    let mut positions: BTreeSet<usize> = BTreeSet::new();
+                    if let IrExpr::Arith(a) = expr {
+                        if arith_refs_positional(a) {
+                            arith_digits(a, &mut positions);
+                        }
+                    }
+                    if let Some(d) = Render::positional_digit(expr) {
+                        positions.insert(d);
+                    }
+                    for p in positions {
+                        pos_vars.entry(p).or_default().insert(t.var.clone());
+                    }
+                }
+            }
+        }
+        let mut native: BTreeSet<usize> = pos_vars
+            .iter()
+            .filter(|(_, vs)| {
+                vs.iter().all(|v| {
+                    matches!(
+                        vt.get(v),
+                        Some(
+                            IrType::Int
+                                | IrType::Int32
+                                | IrType::Int64
+                                | IrType::UInt32
+                                | IrType::UInt64
+                        )
+                    )
+                })
+            })
+            .map(|(p, _)| *p)
+            .collect();
+        // numstr-proven numeric positions — the CALLER-SIDE evidence
+        // (every live call site passes canonical int text). This is
+        // what covers a position read directly (`$6`) with no copy var
+        // — and what REFUSES a fractional/text actual (`0.35`), keeping
+        // that slot `char *`.
+        if let Some(fp) = params.get(name) {
+            native.extend(fp.iter().copied());
+        }
+        if !native.is_empty() {
+            out.insert(name.clone(), native);
+        }
     }
     out
 }
@@ -41481,6 +42415,24 @@ fn collect_assigned_vars(stmts: &[IrStmt], out: &mut BTreeSet<String>) {
                 }
                 collect_assigned_vars(else_, out);
             }
+            // clause bodies assign (and may `local`-declare) — the
+            // fn-local hoist must see them or a case-assigned global
+            // renders as an undeclared C identifier (MIMEcroft
+            // `hardness`: `case $hd_t in 2) h=2 …` left `h` undeclared).
+            IrStmt::Case { clauses, .. } => {
+                if !std::env::var("SH2_CASEWALK_OFF").is_ok() {
+                for c in clauses {
+                    collect_assigned_vars(&c.body, out);
+                }
+                }
+            }
+            IrStmt::Select { clauses } => {
+                if !std::env::var("SH2_CASEWALK_OFF").is_ok() {
+                for c in clauses {
+                    collect_assigned_vars(&c.body, out);
+                }
+                }
+            }
             IrStmt::While { body, .. }
             | IrStmt::DoWhile { body, .. }
             | IrStmt::Block(body)
@@ -41754,6 +42706,40 @@ fn is_ident(s: &str) -> bool {
     !s.is_empty()
         && (s.chars().next().unwrap().is_ascii_alphabetic() || s.chars().next().unwrap() == '_')
         && s.chars().all(|c| c.is_ascii_alphanumeric() || c == '_')
+}
+
+/// A source expression that is STABLE for the duration of a helper
+/// call that only READS it (`_sh_substr` and friends): either a bare
+/// ident, or `store_read`'s null-guard form `(x ? x : "")` around a
+/// bare ident. The guard is pure sugar for `x` — it selects between
+/// `x`'s existing buffer and a literal, both of which hold the same
+/// address from argument evaluation until the call returns, and the
+/// callee never calls back into the program (so nothing can free or
+/// reallocate `x` mid-call). Skipping the stabilizing copy for the
+/// guarded form removes a `strlen` + full-source `strcpy` PER slice:
+/// `draw_text` paid it once per character (O(len²) per string).
+fn is_stable_src(v: &str) -> bool {
+    // Kill switch (keeps the pre-elision stabilizing copies):
+    // SH2_NO_STABLE_SUBSTR=1.
+    if std::env::var_os("SH2_NO_STABLE_SUBSTR").is_some() {
+        return is_ident(v);
+    }
+    if is_ident(v) {
+        return true;
+    }
+    let Some(inner) = v.strip_prefix('(').and_then(|s| s.strip_suffix(')')) else {
+        return false;
+    };
+    let Some((cond, rest)) = inner.split_once(" ? ") else {
+        return false;
+    };
+    let Some((then_b, els)) = rest.split_once(" : ") else {
+        return false;
+    };
+    is_ident(cond)
+        && cond == then_b
+        && els.starts_with('"')
+        && els.ends_with('"')
 }
 
 // ── numeric-range wiring (core's analyze_var_ranges / range_width_name) ──
@@ -46556,12 +47542,123 @@ mod tests {
             var_storage: vec![],
             var_bash_env: vec![],
         };
-        let native = analyze_native_num_fns(&prog);
+        let positions = analyze_native_positions(&prog, &HashMap::new());
+        let native = analyze_native_num_fns(&prog, &positions);
         assert!(native.contains("add"), "add not native-numeric: {native:?}");
         let out = shir_to_c(&prog);
         assert!(
             out.contains("static char *add(long long _p1, long long _p2)"),
             "native signature missing:\n{out}"
+        );
+    }
+
+    #[test]
+    fn native_positions_mixed_abi() {
+        // A void-lifted fn with two numstr-proven numeric positions and
+        // one text position emits a MIXED signature: `long long` for the
+        // numeric slots, `char *` for the text one — one stringy slot no
+        // longer stringifies the whole parameter list. The call site
+        // converts per position (value_ll for 1/2, value_c for 3).
+        use crate::ir::{IrType, StrStyle};
+        let copy = |var: &str, pos: &str| IrStmt::Assign {
+            targets: vec![crate::ir::AssignTarget {
+                var: var.to_string(),
+                sigil: None,
+                indices: vec![],
+            }],
+            expr: IrExpr::Call {
+                func: "getVar".to_string(),
+                args: vec![IrExpr::Str(pos.to_string(), StrStyle::DoubleQuoted)],
+            },
+            asm: None,
+        };
+        let prog = IrProgram {
+            imports: vec![],
+            requires: vec![],
+            stmts: vec![
+                IrStmt::Function {
+                    name: "f".to_string(),
+                    params: vec![],
+                    named_blocks: vec![],
+                    body: vec![
+                        copy("n", "1"),
+                        copy("m", "2"),
+                        copy("h", "3"),
+                        IrStmt::Expr(IrExpr::Call {
+                            func: "exec".to_string(),
+                            args: vec![
+                                IrExpr::Str("echo".to_string(), StrStyle::DoubleQuoted),
+                                IrExpr::Array(vec![
+                                    IrExpr::Var("h".to_string(), None),
+                                    IrExpr::Var("n".to_string(), None),
+                                ]),
+                            ],
+                        }),
+                    ],
+                },
+                // bare-statement call (the void-lift shape: exec + cmd
+                // word + arg array); actuals x,y are Int-typed, z is
+                // untyped text
+                IrStmt::Expr(IrExpr::Call {
+                    func: "exec".to_string(),
+                    args: vec![
+                        IrExpr::Str("f".to_string(), StrStyle::DoubleQuoted),
+                        IrExpr::Array(vec![
+                            IrExpr::Var("x".to_string(), None),
+                            IrExpr::Var("y".to_string(), None),
+                            IrExpr::Var("z".to_string(), None),
+                        ]),
+                    ],
+                }),
+            ],
+            subs: vec![],
+            var_types: vec![
+                ("x".to_string(), IrType::Int),
+                ("y".to_string(), IrType::Int),
+            ],
+            stmt_lines: vec![],
+            var_lengths: vec![],
+            var_const: vec![],
+            var_lifetimes: vec![],
+            var_nospace: vec![],
+            var_storage: vec![],
+            var_bash_env: vec![],
+        };
+        // the analysis consults the POST-seed state (shir_to_c's
+        // pipeline: analyze_var_types → frontend-int restore → seed)
+        let mut p2 = prog.clone();
+        let frontend_int: Vec<(String, IrType)> = prog
+            .var_types
+            .iter()
+            .filter(|(_, t)| *t == IrType::Int)
+            .cloned()
+            .collect();
+        p2.var_types = crate::shir::analyze_var_types(&prog);
+        for (n, t) in &frontend_int {
+            if !p2.var_types.contains(&(n.clone(), IrType::Int)) {
+                p2.var_types.retain(|(k, _)| k != n);
+                p2.var_types.push((n.clone(), t.clone()));
+            }
+        }
+        let (_seeds, params, _verdict) = seed_numstr_fixpoint(&mut p2);
+        let positions = analyze_native_positions(&p2, &params);
+        assert_eq!(
+            positions.get("f").cloned().unwrap_or_default(),
+            [1usize, 2]
+                .into_iter()
+                .collect::<std::collections::BTreeSet<_>>(),
+            "positions: {positions:?}"
+        );
+        let out = shir_to_c(&prog);
+        assert!(
+            out.contains("static void f(long long _p1, long long _p2, char *_p3)"),
+            "mixed signature missing:\n{out}"
+        );
+        // the call site converts per position: numeric slots take the
+        // long long, the text slot keeps the char *
+        assert!(
+            out.contains("f(x, y, "),
+            "per-position call-site conversion missing:\n{out}"
         );
     }
 
@@ -49341,8 +50438,12 @@ mod tests {
         // _sh_xstrdup explicitly (fail-stop, never NULL-on-OOM that
         // flows to a print guard as empty output) — no bare strdup
         // calls, no macro hiding the check. A capture+echo program has
-        // strdup sites; pure arithmetic has none.
-        let src = "x=$(echo hi); echo \"$x\"";
+        // strdup sites; pure arithmetic has none. The capture must be
+        // DYNAMIC (`$(echo $y)`): a constant `$(echo hi)` now folds to a
+        // literal in const-capture-fold, which correctly leaves the C
+        // backend with no strdup sites at all — the no-site case is
+        // covered by src2 below.
+        let src = "x=$(echo $y); echo \"$x\"";
         let cmds = crate::Parser::new(src).parse().expect("parse");
         let prog = crate::shir::ast_to_ir(&cmds);
         let out = shir_to_c(&prog);

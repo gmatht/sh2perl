@@ -83,9 +83,79 @@ fn fold_stmt(st: &mut IrStmt) {
         IrStmt::Redirect { inner, .. } => fold_stmts(inner),
         _ => {}
     }
-    if let Some(out) = constant_echo(st) {
+    if let Some(out) = constant_echo(st).or_else(|| constant_printf(st)) {
         *st = out;
     }
+}
+
+/// `Some(Output)` when `st` is a constant, ZERO-argument `printf` whose
+/// format carries no conversion specifiers.
+///
+/// The Rust renderer wraps every printf in `__sh_print_words(&[vec!
+/// [__sh_printf(…)]]…)` plus the `__sh_printf`/`__sh_q_printf`/`__sh_atoi`
+/// polyfill cluster even when the whole output is a compile-time literal
+/// (`printf "a\n"` — 70 such sites corpus-wide). This fold lowers that
+/// shape to the same native `IrStmt::Output` the constant-`echo` fold
+/// produces, so every backend prints it directly and the helper prune
+/// drops the whole cluster wherever no other printf survives.
+///
+/// Soundness — every refusal keeps the statement on the runtime path:
+///   * exactly ONE word: no args to service, no format-reuse rounds
+///     (bash re-applies the format per remaining argument), no
+///     `-v var fmt` target write;
+///   * no `%` in the format: with zero args the conversions still
+///     produce deterministic text (`%s` → "", `%d` → 0) — but that is
+///     the runtime helper's contract to keep, not this fold's to
+///     re-derive;
+///   * no glob sentinel: `SH2GLOB` is the core's EXPAND-me
+///     instruction, never literal text (the 064 lesson);
+///   * `-v` alone is a usage error the renderer prints verbatim — leave
+///     that path byte-identical.
+///
+/// The escape processing is [`echo_esc`], NOT a second implementation:
+/// the runtime `__sh_printf` body and `__sh_echo_esc` carry the
+/// line-for-line same table (`\n \t \r \a \b \f \v \e \\ \c`-truncates,
+/// `\0nnn`, `\xHH`, incomplete-`\x` → `x`), so folding with `echo_esc`
+/// is lockstep with what the helper would have produced. `newline:
+/// false` — printf appends no newline of its own (the `\n` lives inside
+/// the format, and `echo_esc` has already materialized it), and Output's
+/// status-0 contract matches printf's success status.
+fn constant_printf(st: &IrStmt) -> Option<IrStmt> {
+    let IrStmt::Expr(IrExpr::Call { func, args }) = st else {
+        return None;
+    };
+    if func != "exec" && func != "builtin" {
+        return None;
+    }
+    let IrExpr::Str(cmd, _) = args.first()? else {
+        return None;
+    };
+    if cmd != "printf" {
+        return None;
+    }
+    let IrExpr::Array(words) = args.get(1)? else {
+        return None;
+    };
+    let [fmt_word] = words.as_slice() else {
+        return None;
+    };
+    if let IrExpr::Str(f, _) = fmt_word {
+        if f == "-v" {
+            return None;
+        }
+    }
+    let text = const_word_text(fmt_word)?;
+    if text.contains('%') {
+        return None;
+    }
+    if text.contains('\u{1}') {
+        return None;
+    }
+    Some(IrStmt::Output {
+        value: IrExpr::Str(echo_esc(&text), StrStyle::DoubleQuoted),
+        newline: false,
+        target: None,
+    })
 }
 
 /// `Some(Output)` when `st` is a constant `echo` — see [`fold_to_output`].
@@ -403,6 +473,102 @@ mod tests {
         assert_eq!(echo_esc("a\\\\b"), "a\\b");
         assert_eq!(echo_esc("ab\\cde"), "ab"); // \c truncates
         assert_eq!(echo_esc("\\101"), "A"); // octal
+    }
+}
+
+#[cfg(test)]
+mod printf_tests {
+    use super::*;
+    use crate::ir::{IrExpr, IrStmt, StrStyle};
+
+    fn printf_stmt(words: &[&str]) -> IrStmt {
+        IrStmt::Expr(IrExpr::Call {
+            func: "exec".into(),
+            args: vec![
+                IrExpr::Str("printf".into(), StrStyle::DoubleQuoted),
+                IrExpr::Array(
+                    words
+                        .iter()
+                        .map(|s| IrExpr::Str(s.to_string(), StrStyle::DoubleQuoted))
+                        .collect(),
+                ),
+            ],
+        })
+    }
+
+    #[test]
+    fn constant_printf_folds_to_output() {
+        // the format's `\n` is materialized by echo_esc (lockstep with
+        // the runtime __sh_printf body); `newline: false` because printf
+        // appends no newline of its own.
+        let out = constant_printf(&printf_stmt(&["a\\nb\\n"]))
+            .expect("a literal zero-arg printf must fold");
+        match out {
+            IrStmt::Output { value, newline, target } => {
+                assert!(!newline);
+                assert_eq!(target, None);
+                assert_eq!(
+                    value,
+                    IrExpr::Str("a\nb\n".to_string(), StrStyle::DoubleQuoted)
+                );
+            }
+            other => panic!("expected Output, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn percent_format_refuses() {
+        // with zero args the conversions are still the runtime helper's
+        // contract to keep — the fold must not re-derive them
+        assert!(constant_printf(&printf_stmt(&["%s\\n"])).is_none());
+    }
+
+    #[test]
+    fn extra_args_refuse() {
+        // bash re-applies the format per remaining argument
+        assert!(constant_printf(&printf_stmt(&["x\\n", "y"])).is_none());
+        assert!(constant_printf(&printf_stmt(&["%s", "hi"])).is_none());
+    }
+
+    #[test]
+    fn v_option_refuses() {
+        // `-v var fmt` writes to a target, and `-v` alone is a usage
+        // error the renderer prints verbatim — leave that path alone
+        assert!(constant_printf(&printf_stmt(&["-v"])).is_none());
+    }
+
+    #[test]
+    fn glob_sentinel_refuses() {
+        // \u{1}SH2GLOB\u{1} is the core's EXPAND-me instruction, never
+        // literal text (the 064 lesson)
+        assert!(constant_printf(&printf_stmt(&["\u{1}SH2GLOB\u{1}"])).is_none());
+    }
+
+    #[test]
+    fn expansion_word_refuses() {
+        let st = IrStmt::Expr(IrExpr::Call {
+            func: "builtin".into(),
+            args: vec![
+                IrExpr::Str("printf".into(), StrStyle::DoubleQuoted),
+                IrExpr::Array(vec![IrExpr::Interpolate(vec![InterpPart::Expr(
+                    Box::new(IrExpr::Var("x".to_string(), None)),
+                )])]),
+            ],
+        });
+        assert!(constant_printf(&st).is_none());
+    }
+
+    #[test]
+    fn non_printf_exec_does_not_fold() {
+        // `echo` belongs to constant_echo; printf must not claim it
+        let st = IrStmt::Expr(IrExpr::Call {
+            func: "exec".into(),
+            args: vec![
+                IrExpr::Str("echo".into(), StrStyle::DoubleQuoted),
+                IrExpr::Array(vec![IrExpr::Str("hi".to_string(), StrStyle::DoubleQuoted)]),
+            ],
+        });
+        assert!(constant_printf(&st).is_none());
     }
 }
 

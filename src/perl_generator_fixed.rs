@@ -41,6 +41,15 @@ pub fn generate(prog: &IrProgram) -> String {
     // "Last 10:". `shir_to_perl` re-populates it for its own use; this call
     // is idempotent.
     crate::ir::populate_var_census(prog);
+    // Scalar-phase names (env-style vars with a plain assignment) store
+    // in perl scalars and only mirror into %ENV when already exported
+    // (ir.rs::scalar_phase_var — Bug A: `SHELL_VAR=\"…\"` used to leak
+    // into children before `export SHELL_VAR` ran). The set must be
+    // installed before ANY rendering — lhs routing, reads and the
+    // export arm all consult it.
+    let mut scalar_phase = std::collections::HashSet::new();
+    collect_scalar_phase_vars(&prog.stmts, &mut scalar_phase);
+    crate::ir::set_scalar_phase_vars(scalar_phase);
     let fixed = fixups(prog);
     let src = shir_to_perl(&fixed);
     if std::env::var_os("SH2_DEBUG_PGFIX").is_some() {
@@ -70,7 +79,76 @@ pub fn generate(prog: &IrProgram) -> String {
     if needs_pos_slice_helper(&src) {
         src = inject_before_first_stmt(&src, SLICE_PREAMBLE);
     }
+    // Glob words render natively through `__sh_glob()` (bash's
+    // unmatched-pattern rule keeps the literal word) — same injection
+    // discipline as the slice helpers.
+    if needs_glob_helper(&src) {
+        src = inject_before_first_stmt(&src, GLOB_PREAMBLE);
+    }
+    // The test-lowering transform's affix primitives: `contains` has a
+    // native arm in ir_expr_to_perl (`index >= 0`) but
+    // `strHasPrefix`/`strHasSuffix` had NONE, so a program whose
+    // status-unobserved test chain lifted an affix test called an
+    // UNDEFINED SUB at runtime — measured: `[[ "$s" != "abc"* ]]` →
+    // `Undefined subroutine &main::strHasPrefix called` (pre-existing:
+    // no corpus example lifts an affix test in an unobserved-status
+    // cond, so no gate ever hit the path — probeC in the 2026-10-20
+    // callout session did). Same injection discipline as above.
+    if needs_affix_helper(&src) {
+        src = inject_before_first_stmt(&src, AFFIX_PREAMBLE);
+    }
     src
+}
+
+/// Names with a plain (non-export) assignment anywhere in the program:
+/// scalar-phase (ir.rs::scalar_phase_var). A union, not a program-point
+/// flow — the guarded publish (`$ENV{N} = $N if exists $ENV{N}`) makes
+/// the runtime `exists` check decide propagation, so an export-first
+/// shape (`export X=1; X=2`) still publishes correctly.
+fn collect_scalar_phase_vars(stmts: &[IrStmt], out: &mut std::collections::HashSet<String>) {
+    for s in stmts {
+        match s {
+            IrStmt::Assign { targets, expr, .. } => {
+                let is_array_rhs = matches!(
+                    expr,
+                    IrExpr::Call { func, .. }
+                        if func == "setArray" || func == "setArrayAppend"
+                );
+                if is_array_rhs {
+                    continue;
+                }
+                for t in targets {
+                    if t.indices.is_empty()
+                        && crate::ir::is_env_style_var_name(&t.var)
+                    {
+                        out.insert(t.var.clone());
+                    }
+                }
+            }
+            IrStmt::Function { body, .. } => collect_scalar_phase_vars(body, out),
+            IrStmt::Block(stmts) | IrStmt::Subshell(stmts) | IrStmt::Background(stmts) => {
+                collect_scalar_phase_vars(stmts, out)
+            }
+            IrStmt::If {
+                then,
+                elsifs,
+                else_,
+                ..
+            } => {
+                collect_scalar_phase_vars(then, out);
+                for (_, b) in elsifs {
+                    collect_scalar_phase_vars(b, out);
+                }
+                collect_scalar_phase_vars(else_, out);
+            }
+            IrStmt::For { body, .. } | IrStmt::While { body, .. } => {
+                collect_scalar_phase_vars(body, out)
+            }
+            IrStmt::Redirect { inner, .. } => collect_scalar_phase_vars(inner, out),
+            IrStmt::Expr(IrExpr::Arrow(stmts)) => collect_scalar_phase_vars(stmts, out),
+            _ => {}
+        }
+    }
 }
 
 /// The textual post-pass over a rendered program.
@@ -94,10 +172,116 @@ fn post_pass(src: &str) -> String {
     let out = fix_printf_bash_conversions(&out);
     let out = fix_printf_b_percent_b(&out);
     let out = fix_pos_param_slice(&out);
+    let out = fix_literal_pipeline_pipestatus(&out);
     // LAST: it must see the final text, and it only ever PREPENDS
     // declarations, so it cannot disturb what the earlier passes matched.
     let out = bind_toplevel_positional_params(&out);
-    declare_undeclared_vars(&out)
+    // The declare result MUST be bound: as a bare statement its String is
+    // dropped and `declare_arith_operand_flag(&out)` would return the
+    // UNDECLARED source — every undeclared-var compile error comes back
+    // (`my @PIPESTATUS;` vanished and 070 printed nothing).
+    let out = declare_undeclared_vars(&out);
+    declare_arith_operand_flag(&out)
+}
+
+/// `$__SH2_AE` — the empty-operand flag `arith_str_to_perl` writes inside
+/// expression positions (`… && ($__SH2_AE = 1)`), which
+/// `declare_undeclared_vars` deliberately skips: `__`-prefixed names are
+/// renderer-owned and hoisted by the renderer itself (the same rule as
+/// `TOPLEVEL_POS_DECLS` for `@__sh_args`). Without this `our`, `use
+/// strict` rejects the flag write and the WHOLE file fails to compile.
+fn declare_arith_operand_flag(src: &str) -> String {
+    if !src.contains("$__SH2_AE") || src.contains("our $__SH2_AE") {
+        return src.to_string();
+    }
+    inject_before_first_stmt(src, "our $__SH2_AE;\n")
+}
+
+/// `false | true` (any all-literal-`true`/`false` pipeline) followed by a
+/// read of `${PIPESTATUS[n]}`: populate the array before the run.
+///
+/// `__sh_pipe_run` reports only the pipeline's final status, so
+/// `@PIPESTATUS` stayed EMPTY and `echo "ps=${PIPESTATUS[0]},${PIPESTATUS[1]}"`
+/// printed `ps=,` where bash prints `ps=1,0` (070_gnuisms_thorough). When
+/// every stage is the literal builtin `true` or `false`, bash's statuses are
+/// known statically (false→1, true→0), so prepend the exact array before the
+/// statement. Any other stage leaves the program untouched — guessing would
+/// be wrong, and the empty array is at least honest.
+///
+/// Runs BEFORE `declare_undeclared_vars`, which picks the write up as a
+/// referenced `@PIPESTATUS` and declares it when the script has no read.
+fn fix_literal_pipeline_pipestatus(src: &str) -> String {
+    // Both statement forms: the tracked one (`$main_exit_code =
+    // $CHILD_ERROR = __sh_pipe_run(q{…`) and the status-unread elision
+    // (`__sh_pipe_run(q{…` at statement start — the rc write was
+    // dropped, but the PIPESTATUS splice must still happen: 070_gnuisms
+    // printed `ps=,` when the anchor missed the elided form).
+    const ANCHOR: &str = "$main_exit_code = $CHILD_ERROR = __sh_pipe_run(q{";
+    const ANCHOR_ELV: &str = "__sh_pipe_run(q{";
+    fn find_anchor(s: &str) -> Option<usize> {
+        let tracked = s.find(ANCHOR);
+        let elided = s.find(ANCHOR_ELV).filter(|i| {
+            // elided form sits at a statement start: the rest of its line
+            // (up to the previous newline) is only indent. The tracked
+            // form has `$main_exit_code…` before it on the same line and
+            // is correctly rejected here, then found by `tracked`.
+            s[..*i].rsplit('\n').next().map_or(true, |l| l.trim().is_empty())
+        });
+        match (tracked, elided) {
+            (Some(t), Some(e)) => Some(t.min(e)),
+            (t, e) => t.or(e),
+        }
+    }
+    let mut out = String::with_capacity(src.len() + 64);
+    let mut rest = src;
+    while let Some(at) = find_anchor(rest) {
+        // The q{ payload starts at the end of whichever anchor matched.
+        let inner_start = if rest[at..].starts_with(ANCHOR) {
+            at + ANCHOR.len()
+        } else {
+            at + ANCHOR_ELV.len()
+        };
+        // Stages with no `}` in them (the literal true/false forms have no
+        // braces) — anything else bails out of this occurrence.
+        let Some(close_rel) = rest[inner_start..].find('}') else {
+            out.push_str(rest);
+            return out;
+        };
+        let inner = &rest[inner_start..inner_start + close_rel];
+        let statuses = literal_true_false_statuses(inner);
+        match statuses {
+            Some(list) => {
+                // Splice the array assignment in front of the statement,
+                // then copy the statement itself and step past it.
+                out.push_str(&rest[..at]);
+                out.push_str("@PIPESTATUS = (");
+                out.push_str(&list.iter().map(|s| s.to_string()).collect::<Vec<_>>().join(", "));
+                out.push_str("); ");
+                out.push_str(&rest[at..inner_start + close_rel]);
+                rest = &rest[inner_start + close_rel..];
+            }
+            None => {
+                out.push_str(&rest[..inner_start + close_rel]);
+                rest = &rest[inner_start + close_rel..];
+            }
+        }
+    }
+    out.push_str(rest);
+    out
+}
+
+/// `('true' | 'false') (| ('true' | 'false'))*` → the statuses bash would
+/// record. Anything else → None.
+fn literal_true_false_statuses(inner: &str) -> Option<Vec<u8>> {
+    let mut out = Vec::new();
+    for stage in inner.split('|') {
+        match stage.trim() {
+            "'true'" => out.push(0),
+            "'false'" => out.push(1),
+            _ => return None,
+        }
+    }
+    if out.is_empty() { None } else { Some(out) }
 }
 
 // ── Top-level positional parameters ───────────────────────────────────
@@ -400,13 +584,13 @@ fn leading_quoted_span(rest: &str) -> Option<(String, usize)> {
 }
 
 /// A command name made only of characters a bare command word can contain.
-fn is_plain_command_name(name: &str) -> bool {
+pub(crate) fn is_plain_command_name(name: &str) -> bool {
     !name.is_empty() && name.chars().all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '-')
 }
 
 /// Shell builtins whose names must reach `bash -c` unquoted. Mirrors
 /// `ir.rs::is_shell_builtin`, which refuses the same names for the uu-ffi seam.
-fn is_shell_builtin_name(name: &str) -> bool {
+pub(crate) fn is_shell_builtin_name(name: &str) -> bool {
     matches!(
         name,
         "eval" | "exec" | "." | "source" | "break" | "continue" | "return" | "shift"
@@ -2532,7 +2716,18 @@ fn fixups(prog: &IrProgram) -> IrProgram {
         eprintln!("PGFIX-IN: {:#?}", prog.stmts);
     }
     let mut fixed = prog.clone();
-    fixed.stmts = fix_stmts(&prog.stmts, &fns);
+    // `typeset -n REF=TGT` (every later read/write of REF must hit TGT) and
+    // the `typeset -f/-F/-p` display forms run FIRST: the alias walk
+    // rewrites reads/writes in place as bash parsed them, and the display
+    // walk clones function bodies before the other fixes reshape them
+    // (typeset-cmdsub: `ref="Changed via ref"` must change `original`, and
+    // -f/-F/-p must print what bash prints — a shell-out to a nonexistent
+    // `typeset` binary prints nothing at all). Both replace statements 1:1,
+    // so the downstream `# line` index mapping stays aligned.
+    fix_nameref_aliases(&mut fixed.stmts);
+    fix_typeset_display(&prog.subs, &mut fixed.stmts);
+    let fixed_stmts = fix_stmts(&fixed.stmts, &fns);
+    fixed.stmts = fixed_stmts;
     if std::env::var_os("SH2_DEBUG_PGFIX").is_some() {
         eprintln!("PGFIX-OUT: {:#?}", fixed.stmts);
     }
@@ -2547,10 +2742,31 @@ fn fixups(prog: &IrProgram) -> IrProgram {
     // file this program wrote from a literal is inlined rather than
     // delegated to a subprocess.
     fixed.stmts = fix_dot_source_stmts(&fixed.stmts);
+    // `type NAME` → its answer (transforms::type_query, SHARED core).
+    // Re-run HERE, not only in the transform phase: Fix 7 above spliced
+    // the eval'd program's function definitions into the statement list,
+    // and a transform-phase run alone would miss them — `type doselect`
+    // of a function defined inside an `eval '…'` would keep its shell-out
+    // and print nothing. Any backend that inlines eval text can call the
+    // same transform at its own equivalent point.
+    crate::transforms::type_query::transform(&mut fixed.stmts);
+    // Fix 10 — an INFINITE process-substitution producer must not run to
+    // completion. It rewrites the block's shape (forks the producer), so
+    // it runs BEFORE Fix 9, whose shape check then declines the rewritten
+    // block — Fix 10 saves and restores the consumer's status itself.
+    fixed.stmts = fix_ps_infinite_producer(&fixed.stmts);
     // Fix 9 — the materialised process-substitution consumer's OWN status.
     // Same ordering rule as Fix 7: it walks whole statements (a rewrite of
     // the block's shape), so it runs over the ALREADY-FIXED statements.
     fixed.stmts = fix_ps_status_blocks(&fixed.stmts);
+    // `exec N>&M` is PERSISTENT in bash (the parent's fd table), but the
+    // renderer lowers it as a one-shot `system('bash', …)` shell-out — fd N
+    // never exists in the parent, so a later `echo … >&N` resolved to
+    // "STDOUT follows STDERR" (the stand-in for any unknown fd) and the line
+    // leaked to stderr while bash kept it on stdout (parse-invalid-redirect:
+    // `exec 3>&1; echo "test" >&3` printed "test" on stderr). Record the
+    // installs and rewrite later dup targets through the map.
+    fixed.stmts = fix_exec_fd_dups(fixed.stmts);
     fixed.subs = prog
         .subs
         .iter()
@@ -2560,7 +2776,821 @@ fn fixups(prog: &IrProgram) -> IrProgram {
             body: fix_stmts(&s.body, &fns),
         })
         .collect();
+    // Function bodies execute in the same shell as file scope, so they
+    // inherit the fd map the top-level statements install.
+    let mut fd_map = fd_map_of(&fixed.stmts);
+    for sub in fixed.subs.iter_mut() {
+        walk_fd_dups(&mut sub.body, &mut fd_map);
+    }
     fixed
+}
+
+// ── typeset: nameref aliasing + the -f/-F/-p display forms ────────────────
+//
+// typeset-cmdsub.sh pins three behaviours a shell-out to `typeset` cannot
+// deliver on Linux (there is no `typeset` binary; the shell-out prints
+// nothing and exits 127):
+//
+// * `typeset -n REF=TGT` — REF becomes an ALIAS: every later read and write
+//   of REF hits TGT (`ref="Changed via ref"` must change `original`).
+// * `typeset -f NAME` — bash re-prints the definition, measured byte-exact:
+//   `NAME () \n{ \n    stmt;\n    stmt\n}\n` (trailing spaces after the
+//   `()` and `{`; all but the last statement carry `;`).
+// * `typeset -F NAME` / `typeset -p NAME` — the name alone / bash's own
+//   `declare -ir NAME="99"` line. `-f`/`-F` on an unknown name exit 1 with
+//   no output.
+//
+// Refuse > guess: display replacement only fires for plain literal operands
+// and bodies every statement of which renders back to bash; anything else
+// keeps the old shell-out rather than printing a wrong answer.
+
+/// A statement's shell call: command name + WORD list (`exec_word_args`
+/// skips `args[0]`). `Expr(Call{…})` only — a `Redirect` wrapper is unwrapped
+/// by the caller when it wants the whole statement replaced.
+fn shell_call_words(st: &IrStmt) -> Option<(String, Vec<&IrExpr>)> {
+    let IrStmt::Expr(IrExpr::Call { func, args }) = st else {
+        return None;
+    };
+    if !matches!(func.as_str(), "builtin" | "exec") {
+        return None;
+    }
+    let Some(IrExpr::Str(cmd, _)) = args.first() else {
+        return None;
+    };
+    Some((cmd.clone(), crate::ir::exec_word_args(args)))
+}
+
+/// The `$main_exit_code = $CHILD_ERROR = N;` write a replaced statement
+/// leaves behind — the status bash's command would have reported.
+fn status_raw(rc: u8) -> IrStmt {
+    IrStmt::RawText(format!("$main_exit_code = $CHILD_ERROR = {rc};\n"))
+}
+
+/// A perl `print` of the exact text, as its own statement.
+fn print_raw(text: &str) -> IrStmt {
+    IrStmt::RawText(format!(
+        "print(\"{}\");\n$main_exit_code = $CHILD_ERROR = 0;\n",
+        perl_dq_body(text)
+    ))
+}
+
+/// Escape text for a perl double-quoted string literal — the printed bytes
+/// must be the text itself (`$`/`@` must not interpolate, `\`/`"` must not
+/// terminate).
+fn perl_dq_body(s: &str) -> String {
+    let mut out = String::with_capacity(s.len() + 8);
+    for c in s.chars() {
+        match c {
+            '\\' => out.push_str("\\\\"),
+            '"' => out.push_str("\\\""),
+            '$' => out.push_str("\\$"),
+            '@' => out.push_str("\\@"),
+            '\n' => out.push_str("\\n"),
+            '\r' => out.push_str("\\r"),
+            '\t' => out.push_str("\\t"),
+            c => out.push(c),
+        }
+    }
+    out
+}
+
+/// A shell variable NAME (letters/digits/underscore, not starting with a
+/// digit).
+fn shell_plain_name(s: &str) -> bool {
+    let mut cs = s.chars();
+    match cs.next() {
+        Some(c) if c.is_ascii_alphabetic() || c == '_' => {
+            cs.all(|c| c.is_ascii_alphanumeric() || c == '_')
+        }
+        _ => false,
+    }
+}
+
+// ── nameref ───────────────────────────────────────────────────────────────
+
+/// What a statement does to the nameref map.
+enum NamerefCtl {
+    /// Not a nameref control statement.
+    No,
+    /// `unset -n NAME…` — the aliases go away.
+    Unset(Vec<String>),
+    /// `typeset -n REF=TGT` — REF becomes an alias for TGT.
+    Alias(String, String),
+}
+
+fn nameref_ctl(st: &IrStmt) -> NamerefCtl {
+    // `unset -n ref 2>/dev/null` arrives Redirect-wrapped; the control
+    // statement replaces the WHOLE thing (the redirect goes with it — the
+    // shell-out it belonged to is gone).
+    let call_st = match st {
+        IrStmt::Redirect { inner, .. } => match inner.as_slice() {
+            [one @ IrStmt::Expr(IrExpr::Call { .. })] => one,
+            _ => return NamerefCtl::No,
+        },
+        other => other,
+    };
+    let Some((cmd, words)) = shell_call_words(call_st) else {
+        return NamerefCtl::No;
+    };
+    let mut word_strs = Vec::with_capacity(words.len());
+    for w in words {
+        let IrExpr::Str(s, _) = w else {
+            return NamerefCtl::No;
+        };
+        word_strs.push(s.as_str());
+    }
+    if cmd == "unset" {
+        if !word_strs.iter().any(|w| *w == "-n") {
+            return NamerefCtl::No;
+        }
+        let mut names = Vec::new();
+        for w in &word_strs {
+            if w.starts_with('-') {
+                continue;
+            }
+            if shell_plain_name(w) {
+                names.push(w.to_string());
+            }
+        }
+        return NamerefCtl::Unset(names);
+    }
+    if matches!(cmd.as_str(), "typeset" | "declare") {
+        let mut ops = Vec::new();
+        for w in &word_strs {
+            if w.starts_with('-') && w.len() > 1 {
+                if *w != "-n" {
+                    return NamerefCtl::No; // any other flag — not ours
+                }
+            } else {
+                ops.push(*w);
+            }
+        }
+        if !word_strs.iter().any(|w| *w == "-n") || ops.len() != 1 {
+            return NamerefCtl::No;
+        }
+        let Some((r, t)) = ops[0].split_once('=') else {
+            return NamerefCtl::No;
+        };
+        if !shell_plain_name(r) || !shell_plain_name(t) {
+            return NamerefCtl::No;
+        }
+        return NamerefCtl::Alias(r.to_string(), t.to_string());
+    }
+    NamerefCtl::No
+}
+
+/// Sequential alias walk: each `typeset -n` installs its alias, each
+/// `unset -n` drops it, every statement in between has its reads and writes
+/// of the aliased name retargeted.
+fn fix_nameref_aliases(stmts: &mut Vec<IrStmt>) {
+    let mut al: std::collections::HashMap<String, String> = std::collections::HashMap::new();
+    nameref_walk(stmts, &mut al);
+}
+
+fn nameref_walk(stmts: &mut Vec<IrStmt>, al: &mut std::collections::HashMap<String, String>) {
+    for st in stmts.iter_mut() {
+        match nameref_ctl(st) {
+            NamerefCtl::Unset(names) => {
+                for n in names {
+                    al.remove(&n);
+                }
+                *st = status_raw(0);
+            }
+            NamerefCtl::Alias(r, t) => {
+                al.insert(r, t);
+                *st = status_raw(0);
+            }
+            NamerefCtl::No => nameref_rewrite_stmt(st, al),
+        }
+    }
+}
+
+fn nameref_rewrite_stmt(st: &mut IrStmt, al: &mut std::collections::HashMap<String, String>) {
+    match st {
+        IrStmt::Expr(e) => nameref_rewrite_expr(e, al),
+        IrStmt::Output { value, .. } => nameref_rewrite_expr(value, al),
+        IrStmt::Assign { targets, expr, .. } => {
+            for t in targets.iter_mut() {
+                if t.indices.is_empty() {
+                    if let Some(n) = al.get(&t.var) {
+                        t.var = n.clone();
+                    }
+                }
+            }
+            nameref_rewrite_expr(expr, al);
+        }
+        IrStmt::Declare { init: Some(e), .. } => nameref_rewrite_expr(e, al),
+        IrStmt::Redirect { inner, redirects } => {
+            for r in redirects.iter_mut() {
+                nameref_rewrite_expr(&mut r.target, al);
+            }
+            nameref_walk(inner, al);
+        }
+        IrStmt::Function { body, .. }
+        | IrStmt::Block(body)
+        | IrStmt::Subshell(body)
+        | IrStmt::Background(body) => nameref_walk(body, al),
+        IrStmt::While { cond, body } => {
+            nameref_rewrite_expr(cond, al);
+            nameref_walk(body, al);
+        }
+        IrStmt::DoWhile { body, cond, .. } => {
+            nameref_rewrite_expr(cond, al);
+            nameref_walk(body, al);
+        }
+        IrStmt::If { cond, then, elsifs, else_ } => {
+            nameref_rewrite_expr(cond, al);
+            nameref_walk(then, al);
+            for (c, b) in elsifs.iter_mut() {
+                nameref_rewrite_expr(c, al);
+                nameref_walk(b, al);
+            }
+            nameref_walk(else_, al);
+        }
+        // Try/For/Case/…: no corpus nameref reaches them — refuse > guess
+        // (their reads stay as written, exactly the pre-fix behaviour).
+        _ => {}
+    }
+}
+
+fn nameref_rewrite_expr(e: &mut IrExpr, al: &mut std::collections::HashMap<String, String>) {
+    match e {
+        IrExpr::Call { func, args } => {
+            if func == "getVar" {
+                if let Some(IrExpr::Str(n, style)) = args.first_mut() {
+                    if let Some(t) = al.get(n) {
+                        *n = t.clone();
+                        let _ = style;
+                        return; // name swapped; no need to walk the arg
+                    }
+                }
+            }
+            if func == "param" && args.len() == 2 {
+                let tgt = match &args[1] {
+                    IrExpr::Str(n, _) if shell_plain_name(n) => al.get(n).cloned(),
+                    _ => None,
+                };
+                if let (Some(t), Some(IrExpr::Str(n, _))) = (tgt, args.get_mut(1)) {
+                    *n = t;
+                    return;
+                }
+            }
+            for a in args.iter_mut() {
+                nameref_rewrite_expr(a, al);
+            }
+        }
+        IrExpr::Var(n, _) => {
+            if let Some(t) = al.get(n) {
+                *n = t.clone();
+            }
+        }
+        IrExpr::Interpolate(parts) => {
+            for p in parts.iter_mut() {
+                if let InterpPart::Expr(inner) = p {
+                    nameref_rewrite_expr(inner, al);
+                }
+            }
+        }
+        IrExpr::Arrow(stmts) => nameref_walk(stmts, al),
+        IrExpr::Array(items) => {
+            for i in items.iter_mut() {
+                nameref_rewrite_expr(i, al);
+            }
+        }
+        IrExpr::BinOp { lhs, rhs, .. } => {
+            nameref_rewrite_expr(lhs, al);
+            nameref_rewrite_expr(rhs, al);
+        }
+        IrExpr::DefinedOr { expr, default } => {
+            nameref_rewrite_expr(expr, al);
+            nameref_rewrite_expr(default, al);
+        }
+        IrExpr::Ternary { cond, then, else_ } => {
+            nameref_rewrite_expr(cond, al);
+            nameref_rewrite_expr(then, al);
+            nameref_rewrite_expr(else_, al);
+        }
+        IrExpr::Capture { expr, .. } => nameref_rewrite_expr(expr, al),
+        IrExpr::Index { key, .. } => nameref_rewrite_expr(key, al),
+        IrExpr::Splice(inner) => nameref_rewrite_expr(inner, al),
+        _ => {}
+    }
+}
+
+// ── typeset -f / -F / -p ──────────────────────────────────────────────────
+
+/// Function registry (name → bash re-print text, or None when the body
+/// does not render back to bash) and the declaration tracker
+/// (name → (attribute flags, literal value)).
+type TypesetCtx = (
+    std::collections::HashMap<String, Option<String>>,
+    std::collections::HashMap<String, (String, Option<String>)>,
+);
+
+fn fix_typeset_display(subs: &[crate::ir::IrSub], stmts: &mut Vec<IrStmt>) {
+    let mut funcs: std::collections::HashMap<String, Option<String>> =
+        std::collections::HashMap::new();
+    for s in subs {
+        funcs.insert(s.name.clone(), fn_bash_text(&s.name, &s.body));
+    }
+    let mut attrs: std::collections::HashMap<String, (String, Option<String>)> =
+        std::collections::HashMap::new();
+    typeset_display_walk(stmts, &mut funcs, &mut attrs);
+}
+
+fn typeset_display_walk(
+    stmts: &mut Vec<IrStmt>,
+    funcs: &mut std::collections::HashMap<String, Option<String>>,
+    attrs: &mut std::collections::HashMap<String, (String, Option<String>)>,
+) {
+    for st in stmts.iter_mut() {
+        if let IrStmt::Function { name, body, .. } = st {
+            let text = fn_bash_text(name, body);
+            funcs.insert(name.clone(), text);
+            typeset_display_walk(body, funcs, attrs);
+            continue;
+        }
+        if typeset_display_replace(st, funcs, attrs) {
+            continue;
+        }
+        typeset_track(st, attrs);
+    }
+}
+
+/// Replace a `typeset|declare -f|-F|-p NAME` statement with the print bash
+/// would produce (or its exit status). True when replaced.
+fn typeset_display_replace(
+    st: &mut IrStmt,
+    funcs: &std::collections::HashMap<String, Option<String>>,
+    attrs: &std::collections::HashMap<String, (String, Option<String>)>,
+) -> bool {
+    let Some((cmd, words)) = shell_call_words(st) else {
+        return false;
+    };
+    if cmd != "typeset" && cmd != "declare" {
+        return false;
+    }
+    let mut disp: Option<char> = None;
+    let mut other_flags = 0usize;
+    let mut ops: Vec<String> = Vec::new();
+    for w in words {
+        let IrExpr::Str(s, _) = w else {
+            return false; // non-literal word: not our display form
+        };
+        if s.starts_with('-') && s.len() > 1 {
+            let flag = &s[1..];
+            if flag.len() == 1 && "fFp".contains(flag) {
+                if disp.is_some() {
+                    return false;
+                }
+                disp = flag.chars().next();
+            } else {
+                other_flags += 1;
+            }
+        } else {
+            ops.push(s.clone());
+        }
+    }
+    let Some(d) = disp else {
+        return false;
+    };
+    if other_flags > 0 || ops.len() != 1 || !shell_plain_name(&ops[0]) {
+        return false;
+    }
+    let name = ops[0].clone();
+    match d {
+        'f' => match funcs.get(&name) {
+            Some(Some(text)) => {
+                let text = text.clone();
+                *st = print_raw(&text);
+                true
+            }
+            // Defined but does not render back to bash: keep the old path.
+            Some(None) => false,
+            // bash: `typeset -f nope` → rc 1, no output.
+            None => {
+                *st = status_raw(1);
+                true
+            }
+        },
+        'F' => match funcs.get(&name) {
+            Some(_) => {
+                *st = print_raw(&format!("{name}\n"));
+                true
+            }
+            None => {
+                *st = status_raw(1);
+                true
+            }
+        },
+        'p' => match attrs.get(&name) {
+            Some((flags, Some(value))) if declare_value_ok(value) => {
+                let line = if flags.is_empty() {
+                    format!("declare -- {name}=\"{value}\"")
+                } else {
+                    let mut f: Vec<char> = flags.chars().collect();
+                    f.sort_unstable();
+                    f.dedup();
+                    let f: String = f.into_iter().collect();
+                    format!("declare -{f} {name}=\"{value}\"")
+                };
+                *st = print_raw(&format!("{line}\n"));
+                true
+            }
+            // Not tracked (we cannot know the value) or an unsafe value:
+            // refuse rather than print bash's answer from a guess.
+            _ => false,
+        },
+        _ => false,
+    }
+}
+
+/// `declare -p`'s double-quoted value must round-trip through perl's
+/// string AND bash's own quoting; only values with no characters bash
+/// would escape are printed.
+fn declare_value_ok(v: &str) -> bool {
+    !v.is_empty() && !v.contains(['"', '\\', '$', '`', '\n', '\r'])
+}
+
+/// Declaration / unset / assignment tracking for `declare -p`.
+fn typeset_track(
+    st: &IrStmt,
+    attrs: &mut std::collections::HashMap<String, (String, Option<String>)>,
+) {
+    if let IrStmt::Assign { targets, expr, .. } = st {
+        if let [t] = targets.as_slice() {
+            if t.indices.is_empty() && shell_plain_name(&t.var) {
+                let value = track_literal(expr);
+                let slot = attrs
+                    .entry(t.var.clone())
+                    .or_insert_with(|| (String::new(), None));
+                slot.1 = value;
+            }
+        }
+        return;
+    }
+    let Some((cmd, words)) = shell_call_words(st) else {
+        return;
+    };
+    if cmd == "unset" {
+        for w in words {
+            if let IrExpr::Str(s, _) = w {
+                if !s.starts_with('-') && shell_plain_name(s) {
+                    attrs.remove(s);
+                }
+            }
+        }
+        return;
+    }
+    if !matches!(cmd.as_str(), "typeset" | "declare") {
+        return;
+    }
+    // Only the attribute flags this tracker honours declare anything;
+    // anything else (`-a`, `-g`, `-t`, the display forms) is not ours.
+    let mut flags = String::new();
+    let mut operands: Vec<&IrExpr> = Vec::new();
+    for w in words {
+        match w {
+            IrExpr::Str(s, _) if s.starts_with('-') && s.len() > 1 => {
+                let f: String = s[1..].chars().filter(|c| "irlux".contains(*c)).collect();
+                if f.len() != s.len() - 1 {
+                    return;
+                }
+                flags.push_str(&f);
+            }
+            other => operands.push(other),
+        }
+    }
+    if flags.is_empty() {
+        return;
+    }
+    let mut i = 0usize;
+    while i < operands.len() {
+        if let IrExpr::Str(s, _) = operands[i] {
+            if let Some((name, v)) = s.split_once('=') {
+                if shell_plain_name(name) {
+                    // `rovar="immutable"` arrives as `rovar=` + an
+                    // interpolated word; a dynamic value is value-unknown.
+                    let mut value = Some(v.to_string());
+                    if v.is_empty() && i + 1 < operands.len() {
+                        if let IrExpr::Interpolate(parts) = operands[i + 1] {
+                            value = match parts.as_slice() {
+                                [InterpPart::Lit(l)] => Some(l.clone()),
+                                _ => None,
+                            };
+                            i += 1;
+                        } else {
+                            value = None;
+                        }
+                    }
+                    let slot = attrs
+                        .entry(name.to_string())
+                        .or_insert_with(|| (String::new(), None));
+                    for c in flags.chars() {
+                        if !slot.0.contains(c) {
+                            slot.0.push(c);
+                        }
+                    }
+                    slot.1 = value;
+                }
+            } else if shell_plain_name(s) {
+                // `typeset -r printtest` — attributes only, value unchanged.
+                let slot = attrs
+                    .entry(s.to_string())
+                    .or_insert_with(|| (String::new(), None));
+                for c in flags.chars() {
+                    if !slot.0.contains(c) {
+                        slot.0.push(c);
+                    }
+                }
+            }
+        }
+        i += 1;
+    }
+}
+
+/// The literal text of an assignment RHS, if it has no expansions.
+fn track_literal(e: &IrExpr) -> Option<String> {
+    match e {
+        IrExpr::Str(s, _) => Some(s.clone()),
+        IrExpr::Interpolate(parts) => {
+            let mut out = String::new();
+            for p in parts {
+                match p {
+                    InterpPart::Lit(s) => out.push_str(s),
+                    InterpPart::Expr(_) => return None,
+                }
+            }
+            Some(out)
+        }
+        _ => None,
+    }
+}
+
+// ── bash re-print of a function body (`typeset -f`) ───────────────────────
+
+/// bash's own re-print format, measured on bash 5.2:
+/// `NAME () \n{ \n    stmt;\n    stmt\n}\n` — trailing space after the
+/// `()` and the `{`, 4-space indent, `;` on every statement but the last.
+fn fn_bash_text(name: &str, body: &[IrStmt]) -> Option<String> {
+    let mut lines = Vec::with_capacity(body.len());
+    for st in body {
+        lines.push(stmt_bash_line(st)?);
+    }
+    let mut out = format!("{name} () \n{{ \n");
+    let n = lines.len();
+    for (i, l) in lines.into_iter().enumerate() {
+        out.push_str("    ");
+        out.push_str(&l);
+        if i + 1 < n {
+            out.push(';');
+        }
+        out.push('\n');
+    }
+    out.push_str("}\n");
+    Some(out)
+}
+
+fn stmt_bash_line(st: &IrStmt) -> Option<String> {
+    match st {
+        IrStmt::Expr(IrExpr::Call { func, args })
+            if matches!(func.as_str(), "builtin" | "exec") =>
+        {
+            let Some(IrExpr::Str(cmd, _)) = args.first() else {
+                return None;
+            };
+            let mut out = cmd.clone();
+            for w in crate::ir::exec_word_args(args) {
+                out.push(' ');
+                out.push_str(&bash_word(w)?);
+            }
+            Some(out)
+        }
+        IrStmt::Declare {
+            vars, init: Some(init), local: true, ..
+        } => {
+            if vars.len() != 1 || vars[0].sigil.is_some() || !shell_plain_name(&vars[0].name) {
+                return None;
+            }
+            Some(format!("local {}={}", vars[0].name, bash_value(init)?))
+        }
+        // Output folds, Assigns, control flow in a printed body: no source
+        // text survives to reproduce — refuse and keep the shell-out.
+        _ => None,
+    }
+}
+
+/// A command word back to bash: a bare-safe literal word printed as-is,
+/// a quoted literal word re-quoted with bash's own spelling (the parser
+/// keeps the text LITERAL in `Str` with its [`StrStyle`] — an expansion
+/// would be `Interpolate`), or a double-quoted interpolation whose
+/// expansions re-render as `$name`.
+fn bash_word(w: &IrExpr) -> Option<String> {
+    match w {
+        IrExpr::Str(s, style) => {
+            if !s.is_empty()
+                && !s
+                    .chars()
+                    .any(|c| c.is_whitespace() || "'\"\\$`*?[]{};|&<>()#~".contains(c))
+            {
+                return Some(s.clone());
+            }
+            literal_word_quoted(s, style.clone())
+        }
+        IrExpr::Interpolate(parts) => {
+            let mut out = String::from("\"");
+            for p in parts {
+                match p {
+                    InterpPart::Lit(s) => {
+                        // `$`/`\`/`"` in a literal came from escapes whose
+                        // source spelling we no longer have — refuse.
+                        if s.contains(['"', '\\', '$', '`']) {
+                            return None;
+                        }
+                        out.push_str(s);
+                    }
+                    InterpPart::Expr(e) => match &**e {
+                        IrExpr::Call { func, args } if func == "getVar" => {
+                            let Some(IrExpr::Str(n, _)) = args.first() else {
+                                return None;
+                            };
+                            if !shell_plain_name(n) {
+                                return None;
+                            }
+                            out.push('$');
+                            out.push_str(n);
+                        }
+                        _ => return None,
+                    },
+                }
+            }
+            out.push('"');
+            Some(out)
+        }
+        _ => None,
+    }
+}
+
+/// An initialiser value (`local x=5`): a bare literal or a quoted string.
+fn bash_value(v: &IrExpr) -> Option<String> {
+    match v {
+        IrExpr::Str(s, style) => {
+            if !s.is_empty()
+                && !s
+                    .chars()
+                    .any(|c| c.is_whitespace() || "'\"\\$`*?[]{};|&<>()#~".contains(c))
+            {
+                return Some(s.clone());
+            }
+            literal_word_quoted(s, style.clone())
+        }
+        IrExpr::Interpolate(parts) => match parts.as_slice() {
+            [InterpPart::Lit(s)] if !s.contains(['"', '\\', '$', '`']) => {
+                Some(format!("\"{s}\""))
+            }
+            _ => None,
+        },
+        _ => None,
+    }
+}
+
+/// A literal text whose bare reprint is not the same word (it carries a
+/// whitespace or shell-special character) re-quoted the way bash itself
+/// re-quotes it in `typeset -f`: double quotes for a double-quoted word,
+/// single quotes for a single-quoted one. Only the characters a
+/// double-quoted re-render would RE-EXPAND (`"` `\\` `$` `` ` `` — their
+/// escape spelling is gone) or a `'` inside single quotes refuse.
+///
+/// Byte-exactness note: the parser does not record bare-vs-quoted for a
+/// word whose text happens to contain a special (`a#b` and `"a#b"` are
+/// both `Str("a#b", DoubleQuoted)`), so a rare bare `#`/`~` word reprints
+/// quoted — the same WORD, one spelling different from bash's echo of the
+/// source. That is no worse than the shell-out it replaces (prints
+/// nothing), and every currently-reproducing body keeps its bare reprint
+/// (this is only reached when the bare form would not parse back).
+fn literal_word_quoted(s: &str, style: crate::ir::StrStyle) -> Option<String> {
+    match style {
+        crate::ir::StrStyle::DoubleQuoted if !s.contains(['"', '\\', '$', '`']) => {
+            Some(format!("\"{s}\""))
+        }
+        crate::ir::StrStyle::SingleQuoted if !s.contains('\'') => Some(format!("'{s}'")),
+        _ => None,
+    }
+}
+
+/// Rewrite `exec N>&M` installs and later `>&N` uses in one sequential walk.
+///
+/// A bare `exec N>&M` (the literal `exec` builtin, no command words) records
+/// N→M; every fd-dup target `&K` in a later statement is then replaced by
+/// `&resolve(K)` — transitively, so `exec 3>&4` + `exec 4>&1` gives `&1`.
+/// `Subshell`/`Background` bodies walk a CLONE of the map (their fd table is
+/// a copy; installs there must not leak out), functions share it (same shell).
+fn fix_exec_fd_dups(stmts: Vec<IrStmt>) -> Vec<IrStmt> {
+    let mut stmts = stmts;
+    let mut map = std::collections::HashMap::new();
+    walk_fd_dups(&mut stmts, &mut map);
+    stmts
+}
+
+/// The fd map a statement list installs (used to seed function bodies, which
+/// execute in the same shell after the top-level statements have run).
+fn fd_map_of(stmts: &[IrStmt]) -> std::collections::HashMap<i32, i32> {
+    let mut map = std::collections::HashMap::new();
+    let mut owned = stmts.to_vec();
+    walk_fd_dups(&mut owned, &mut map);
+    map
+}
+
+fn walk_fd_dups(stmts: &mut Vec<IrStmt>, map: &mut std::collections::HashMap<i32, i32>) {
+    for st in stmts.iter_mut() {
+        match st {
+            IrStmt::Redirect { inner, redirects } => {
+                // This statement's own targets resolve through fds
+                // established EARLIER (an `exec` here installs AFTER its
+                // own redirect, matching bash: `exec 3>&3` is a no-op).
+                for r in redirects.iter_mut() {
+                    let Some(n) = redirect_dup_num(&r.target) else { continue; };
+                    let to = resolve_fd(map, n);
+                    if to != n {
+                        r.target = crate::ir::IrExpr::Str(
+                            format!("&{to}"),
+                            crate::ir::StrStyle::DoubleQuoted,
+                        );
+                    }
+                }
+                if is_bare_exec_call_stmt(inner) {
+                    for r in redirects.iter() {
+                        if let (Some(n), Some(m)) = (r.fd, redirect_dup_num(&r.target)) {
+                            map.insert(n, m);
+                        }
+                    }
+                }
+                walk_fd_dups(inner, map);
+            }
+            IrStmt::Block(v) | IrStmt::Subshell(v) | IrStmt::Background(v) => {
+                walk_fd_dups(v, map)
+            }
+            IrStmt::If { then, elsifs, else_, .. } => {
+                walk_fd_dups(then, map);
+                for (_, b) in elsifs.iter_mut() {
+                    walk_fd_dups(b, map);
+                }
+                walk_fd_dups(else_, map);
+            }
+            IrStmt::Try { body, excepts, else_body, finally_body } => {
+                walk_fd_dups(body, map);
+                for e in excepts.iter_mut() {
+                    walk_fd_dups(&mut e.body, map);
+                }
+                walk_fd_dups(else_body, map);
+                walk_fd_dups(finally_body, map);
+            }
+            IrStmt::For { body, .. }
+            | IrStmt::While { body, .. }
+            | IrStmt::DoWhile { body, .. }
+            | IrStmt::Function { body, .. } => walk_fd_dups(body, map),
+            IrStmt::ForInit { init, step, body, .. } => {
+                walk_fd_dups(init, map);
+                walk_fd_dups(step, map);
+                walk_fd_dups(body, map);
+            }
+            IrStmt::Pipeline { stages, .. } => {
+                for s in stages.iter_mut() {
+                    walk_fd_dups(s, map);
+                }
+            }
+            _ => {}
+        }
+    }
+}
+
+/// The numeric fd after `&` in a dup target (`"&3"` → 3).
+fn redirect_dup_num(target: &crate::ir::IrExpr) -> Option<i32> {
+    let crate::ir::IrExpr::Str(s, _) = target else { return None; };
+    s.strip_prefix('&')?.parse().ok()
+}
+
+/// Follow N→M chains; a cycle or unknown fd returns N unchanged.
+fn resolve_fd(map: &std::collections::HashMap<i32, i32>, mut n: i32) -> i32 {
+    for _ in 0..16 {
+        match map.get(&n) {
+            Some(&m) if m != n => n = m,
+            _ => break,
+        }
+    }
+    n
+}
+
+/// `[Expr(Call{ func: "exec", args: [Str("exec"), Array([])] })]` — the
+/// literal `exec` builtin with no command words (its redirects persist).
+fn is_bare_exec_call_stmt(inner: &[IrStmt]) -> bool {
+    matches!(
+        inner,
+        [IrStmt::Expr(IrExpr::Call { func, args })]
+            if func == "exec"
+                && matches!(args.as_slice(), [IrExpr::Str(c, _), IrExpr::Array(w)]
+                    if c == "exec" && w.is_empty())
+    )
 }
 
 // ── Fix 2 — a bash function's positional parameters ──────────────────
@@ -2618,6 +3648,18 @@ fn rewrite_positional_params(src: &str) -> String {
                     .ok()
                     .and_then(|s| s.parse().ok())
                     .unwrap_or(0);
+                // `$0` is NOT a positional parameter — bash's positional
+                // params start at $1, and `$0` is the SCRIPT NAME, which is
+                // exactly Perl's `$0` (the gate's harness assigns
+                // `$0 = <source path>`). Rewriting it would compute
+                // `n - 1` and underflow: any generated bare `$0` inside a
+                // `sub` body (the preamble's `system('bash', '-c', $cmd,
+                // $0)` argv0) panicked the whole generator. Pass it through.
+                if n == 0 {
+                    out.push_str("$0");
+                    i = end;
+                    continue;
+                }
                 let Some(open) = opens.last().copied() else {
                     out.push('$');
                     i += 1;
@@ -4067,6 +5109,53 @@ pub fn needs_pos_slice_helper(perl_src: &str) -> bool {
     perl_src.contains("__sh_pos(")
 }
 
+// ── Native glob words ───────────────────────────────────────────────────
+//
+// `render_word` lowers an unquoted glob word (`ls file_*.txt`) to
+// `__sh_glob('file_*.txt')` so the uu-ffi seam can take the command
+// instead of falling back to `system('bash', '-c', …)` — one process
+// instead of two, and perl-native output.
+//
+// Bash parity: with no nullglob, an UNMATCHED pattern reaches the command
+// as the literal word (`ls *.nope` errors on `*.nope`); a bare perl
+// `glob()` would return an EMPTY list and run `ls` with no arguments —
+// listing the directory instead of failing. Matches are returned as the
+// list, sorted, no dotfiles (same as bash's default collation).
+pub const GLOB_PREAMBLE: &str = r#"sub __sh_glob {
+    my @__g = glob($_[0]);
+    return @__g ? @__g : ($_[0]);
+}
+"#;
+
+/// True when the rendered program needs `__sh_glob` defined.
+pub fn needs_glob_helper(perl_src: &str) -> bool {
+    perl_src.contains("__sh_glob(")
+}
+
+// ── Affix primitives (test-lowering transform's glob arm) ──────────────
+//
+// estree renders these as `.startsWith`/`.endsWith`, C as
+// `strncmp`/suffix compares, and `contains` natively as `index >= 0`
+// — Perl had neither an arm nor a sub, so the lifted calls were bare
+// and died at runtime. LITERAL prefix/suffix decisions (the same value
+// semantics the transform's `operand()` guarantees: a var read or a
+// metachar-free literal). The empty needle is a prefix and a suffix of
+// everything (bash `[[ x == ""* ]]` is true), which the length guard
+// gives for free.
+pub const AFFIX_PREAMBLE: &str = r#"sub strHasPrefix {
+    return index($_[0], $_[1]) == 0;
+}
+sub strHasSuffix {
+    my ($__h, $__n) = @_;
+    return length($__n) <= length($__h) && substr($__h, length($__h) - length($__n)) eq $__n;
+}
+"#;
+
+/// True when the rendered program calls the affix primitives.
+pub fn needs_affix_helper(perl_src: &str) -> bool {
+    perl_src.contains("strHasPrefix(") || perl_src.contains("strHasSuffix(")
+}
+
 // ── Fix 22 — `${@:offset}` is a LIST slice; the renderer's join is not ────
 //
 // The `"slice"` arm of `param` in ir.rs lowers `${@:off}` to
@@ -4189,6 +5278,69 @@ mod pgf_tests {
         generate(&prog)
     }
 
+    // ── Fix 10 — an infinite process-substitution producer ─────────────
+
+    /// `head <(while true; …)` — the producer must be FORKED (and later
+    /// killed), never run to completion in the parent.
+    #[test]
+    fn infinite_procsub_producer_forks_and_is_killed() {
+        let perl = gen("head <(while true; do echo .; sleep 1; done)\n");
+        assert!(perl.contains("fork()"), "producer is forked: {perl}");
+        // pipe semantics: a regular temp file would hand head an immediate
+        // EOF where bash blocks for the writer's lines
+        assert!(perl.contains("POSIX::mkfifo"), "temp becomes a fifo: {perl}");
+        assert!(perl.contains("kill('TERM'"), "producer is signalled: {perl}");
+        assert!(perl.contains("waitpid("), "producer is reaped: {perl}");
+        // the CONSUMER's status still reaches `$?`
+        assert!(
+            perl.contains("$__ps_status0 = $CHILD_ERROR;"),
+            "consumer status saved: {perl}"
+        );
+    }
+
+    /// A FINITE producer keeps the sequential temp-file form (equivalent
+    /// there, and cheaper than a fork + fifo).
+    #[test]
+    fn finite_procsub_producer_stays_sequential() {
+        let perl = gen("head <(echo hi)\n");
+        assert!(!perl.contains("mkfifo"), "no fifo: {perl}");
+        assert!(!perl.contains("fork()"), "no fork: {perl}");
+    }
+
+    /// A `while true` whose body CAN leave (`break`) is not provably
+    /// infinite — the sequential form stays.
+    #[test]
+    fn breakable_loop_producer_stays_sequential() {
+        let perl = gen("head <(while true; do echo x; break; done)\n");
+        assert!(!perl.contains("mkfifo"), "no fifo: {perl}");
+        assert!(!perl.contains("fork()"), "no fork: {perl}");
+    }
+
+    /// `kill` lowers to Perl's builtin — never a shell-out — and a literal
+    /// `0` operand (bash's "my whole process group") is refused rather
+    /// than turned into a self-TERM.
+    #[test]
+    fn kill_builtin_renders_native_perl() {
+        let perl = gen("bgpid=5\nkill -TERM $bgpid\n");
+        // native Perl kill with the pid operand — no uu-ffi spawn (the
+        // seam has no kill) and no bash -c shell-out
+        assert!(perl.contains("kill('TERM', "), "native kill: {perl}");
+        assert!(
+            !perl.contains("__sh_uu_run('kill'"),
+            "no uu-ffi spawn: {perl}"
+        );
+        assert!(!perl.contains("system('bash'"), "no shell-out: {perl}");
+    }
+
+    #[test]
+    fn kill_literal_zero_pid_is_refused() {
+        let perl = gen("kill -TERM 0\n");
+        assert!(
+            !perl.contains("kill('TERM', 0)"),
+            "never signals the process group: {perl}"
+        );
+    }
+
     // ── Fix 16 — the array-slice bounds ─────────────────────────────────
     //
     // Each of these pins ONE of the three ways the shared renderer's
@@ -4257,7 +5409,11 @@ mod pgf_tests {
     fn slice_helper_matches_bash_bounds() {
         // Every expectation below is what bash prints for
         // `a=(1 2 3 4 5)` — derived from the interpreter, not reasoned out.
-        let helper = SLICE_PREAMBLE;
+        // SLICE_PREAMBLE now carries only `__sh_pos`; `__sh_slice` lives in
+        // SLICE_PREAMBLE_2 (the helpers are emitted independently, so each
+        // preamble holds exactly one sub). These assertions are about
+        // __sh_slice, so include _2.
+        let helper = SLICE_PREAMBLE_2;
         for (off, len, want) in [
             ("0", "2", "1 2"),
             ("2", "2", "3 4"),
@@ -4342,6 +5498,10 @@ mod pgf_tests {
             "print($__sh_args[0], $__sh_args[1], $__sh_args[9]);\n"
         );
         assert_eq!(rewrite_positional_params("print(\"$1\");\n"), "print(\"$__sh_args[0]\");\n");
+        assert_eq!(
+            rewrite_positional_params("system('bash', '-c', $cmd, $0);\n"),
+            "system('bash', '-c', $cmd, $0);\n"
+        );
         assert_eq!(rewrite_positional_params("x =~ s{^--}{}r;\n"), "x =~ s{^--}{}r;\n");
         assert_eq!(rewrite_positional_params("my @ARGV = @_;\n"), "my @ARGV = @_;\n");
     }
@@ -4519,6 +5679,31 @@ mod pgf_tests {
         let out = generate(&prog);
         assert!(!out.contains("my $a;"), "{out}");
         assert!(!out.contains("my $b;"), "{out}");
+    }
+
+    /// `@PIPESTATUS` — written by `fix_literal_pipeline_pipestatus` and
+    /// read as `$PIPESTATUS[n]` — must still receive its `my`. Without it
+    /// `use strict` rejects the WHOLE file at compile time and the program
+    /// prints nothing at all (070_gnuisms_thorough regressed exactly this
+    /// way: `Global symbol "@PIPESTATUS" requires explicit package name`).
+    #[test]
+    fn pipestatus_write_and_read_get_declared() {
+        let src = "use strict;\nmy $main_exit_code = 0;\nour $CHILD_ERROR = 0;\n@PIPESTATUS = (1, 0); $x = ($PIPESTATUS[0]);\nprint \"ps=$x\\n\";\n";
+        let out = declare_undeclared_vars(src);
+        assert!(out.contains("my @PIPESTATUS;"), "{out}");
+    }
+
+    /// The same requirement end-to-end: a real `false | true` pipeline
+    /// with a `${PIPESTATUS[n]}` read must render a compilable file.
+    #[test]
+    fn pipestatus_declared_in_real_render() {
+        let mut p = crate::Parser::new(
+            "false | true\necho \"ps=${PIPESTATUS[0]},${PIPESTATUS[1]}\"\n",
+        );
+        let cmds = p.parse().expect("parse");
+        let prog = crate::shir::ast_to_ir(&cmds);
+        let out = generate(&prog);
+        assert!(out.contains("my @PIPESTATUS;"), "{out}");
     }
 
     /// And the pass must still do its job: an ordinary undeclared read is
@@ -5085,11 +6270,22 @@ fn ps_consumer_position(
     rm_cleanup: &dyn Fn(&IrStmt) -> Option<Vec<String>>,
     is_ps_tmp: &dyn Fn(&IrExpr) -> bool,
 ) -> Option<(usize, Vec<String>, String)> {
-    let is_plain_consumer = |s: &IrStmt| {
-        matches!(s, IrStmt::Exec { .. } | IrStmt::Expr(IrExpr::Call { .. }))
-    };
     let rm_at = body.len().checked_sub(1)?;
     let tmps = rm_cleanup(&body[rm_at])?;
+    // A consumer may be wrapped in a redirect (`diff <(…) <(…) > out`
+    // materialises as a `Redirect` whose inner reads the `__ps_tmp`
+    // vars) — producers are also `Redirect`s, but their tmp appears only
+    // as a redirect TARGET, never inside the inner statements, so the
+    // inner-reference test separates the two exactly.
+    let is_consumer = |s: &IrStmt| -> bool {
+        if matches!(s, IrStmt::Exec { .. } | IrStmt::Expr(IrExpr::Call { .. })) {
+            return true;
+        }
+        if let IrStmt::Redirect { inner, .. } = s {
+            return tmps.iter().any(|t| inner.iter().any(|is| mentions_var(is, t)));
+        }
+        false
+    };
     // Every temp must have been created by a `mktemp` assignment in this
     // same block — otherwise these names belong to something else.
     for t in &tmps {
@@ -5105,7 +6301,7 @@ fn ps_consumer_position(
         .iter()
         .enumerate()
         .take(rm_at)
-        .filter(|(_, s)| is_plain_consumer(s))
+        .filter(|(_, s)| is_consumer(s))
         .map(|(i, _)| i)
         .last()?;
     // Exactly ONE consumer: two bare commands means we cannot tell which
@@ -5113,7 +6309,7 @@ fn ps_consumer_position(
     let consumers = body
         .iter()
         .take(rm_at)
-        .filter(|s| is_plain_consumer(s))
+        .filter(|s| is_consumer(s))
         .count();
     if consumers != 1 {
         return None;
@@ -5248,6 +6444,323 @@ fn restore_status(cleanup: IrStmt, _tmps: Vec<String>, saved: String) -> IrStmt 
         cleanup,
         IrStmt::SetChildError(IrExpr::Var(saved, None)),
     ])
+}
+
+// ── Fix 10 — an INFINITE process-substitution producer runs in the
+// background, not to completion ──────────────────────────────────────
+//
+// `transforms::process_subst` materialises `<(…)` / `>(…)` SEQUENTIALLY:
+// the producer fills a temp file, then the consumer runs over it. That is
+// equivalent for a producer that terminates — and hangs forever for one
+// that does not. `head <(while true; do echo .; sleep 1; done)`
+// (096_head_procsub) emitted the `while true` loop as a plain statement
+// block redirected at the temp, so the producer never finished and `head`
+// never ran: perl=124 (and a 1.1 GB temp file in the yes|head case) against
+// bash's 10 lines and exit 0. bash itself never waits for the producer: it
+// runs concurrently and the writer dies when the consumer's side closes.
+//
+// The correction is perl-side and shape-gated: a materialisation block
+// whose producer is PROVABLY infinite (a `while true` / `while :` loop —
+// or a `do {…} while` — whose body cannot leave it: no break/return/exit
+// at any depth). The producer is then FORKED via the renderer's own
+// `Background` arm (which already emits the fork and records the child
+// pid in `$__sh2_last_bg`), the pid is saved, and after the consumer runs,
+// the child is killed and reaped before the temp cleanup. The block still
+// reports the CONSUMER's status — the same save/restore Fix 9 performs —
+// so `echo "exit: $?"` after the statement keeps printing head's 0.
+//
+// Every other materialisation (a finite producer, a loop whose exit is
+// conditional…) keeps the sequential form, which is equivalent there.
+fn fix_ps_infinite_producer(stmts: &[IrStmt]) -> Vec<IrStmt> {
+    stmts
+        .iter()
+        .map(|s| match s {
+            IrStmt::Block(b) => IrStmt::Block(fix_ps_infinite_producer_block(b)),
+            IrStmt::Subshell(b) => IrStmt::Subshell(fix_ps_infinite_producer(b)),
+            IrStmt::Background(b) => IrStmt::Background(fix_ps_infinite_producer(b)),
+            IrStmt::If {
+                cond,
+                then,
+                elsifs,
+                else_,
+            } => IrStmt::If {
+                cond: cond.clone(),
+                then: fix_ps_infinite_producer(then),
+                elsifs: elsifs
+                    .iter()
+                    .map(|(c, b)| (c.clone(), fix_ps_infinite_producer(b)))
+                    .collect(),
+                else_: fix_ps_infinite_producer(else_),
+            },
+            IrStmt::While { cond, body } => IrStmt::While {
+                cond: cond.clone(),
+                body: fix_ps_infinite_producer(body),
+            },
+            IrStmt::DoWhile { cond, body, until } => IrStmt::DoWhile {
+                cond: cond.clone(),
+                body: fix_ps_infinite_producer(body),
+                until: *until,
+            },
+            IrStmt::ForInit {
+                init,
+                cond,
+                step,
+                body,
+            } => IrStmt::ForInit {
+                init: fix_ps_infinite_producer(init),
+                cond: cond.clone(),
+                step: fix_ps_infinite_producer(step),
+                body: fix_ps_infinite_producer(body),
+            },
+            IrStmt::Function {
+                name,
+                params,
+                body,
+                named_blocks,
+            } => IrStmt::Function {
+                name: name.clone(),
+                params: params.clone(),
+                body: fix_ps_infinite_producer(body),
+                named_blocks: named_blocks
+                    .iter()
+                    .map(|(n, b)| (n.clone(), fix_ps_infinite_producer(b)))
+                    .collect(),
+            },
+            other => other.clone(),
+        })
+        .collect()
+}
+
+/// One materialisation block: `[mktemp assigns, producer Redirect, …,
+/// consumer, rm -f tmp]` with a provably infinite producer — rewrite to
+/// fork/kill form. Anything not fully understood is returned unchanged.
+fn fix_ps_infinite_producer_block(body: &[IrStmt]) -> Vec<IrStmt> {
+    let Some(rm_at) = body.len().checked_sub(1) else {
+        return body.to_vec();
+    };
+    // Trailing `rm -f __ps_tmp…` — the same cleanup Fix 9 keys on.
+    let Some(rm_tmps) = ps_rm_cleanup(&body[rm_at]) else {
+        return body.to_vec();
+    };
+    // Every temp must be created by an assignment in this same block —
+    // proof this is the materialisation, not a user's own `__ps_tmp` name.
+    for t in &rm_tmps {
+        let created = body.iter().take(rm_at).any(|s| {
+            matches!(s, IrStmt::Assign { targets, .. }
+                if targets.iter().any(|tt| &tt.var == t))
+        });
+        if !created {
+            return body.to_vec();
+        }
+    }
+    // The producer: a stdout Redirect into one of the temps whose body is
+    // provably infinite.
+    let Some((prod_at, prod_tmp)) = body
+        .iter()
+        .take(rm_at)
+        .enumerate()
+        .find_map(|(i, s)| match s {
+            IrStmt::Redirect { inner, redirects } => redirects.iter().find_map(|r| {
+                let writes_tmp = r.fd == Some(1)
+                    && r.mode == "w"
+                    && matches!(&r.target, IrExpr::Var(n, _) if rm_tmps.contains(n));
+                if writes_tmp && stmts_run_forever(inner) {
+                    if let IrExpr::Var(n, _) = &r.target {
+                        return Some((i, n.clone()));
+                    }
+                }
+                None
+            }),
+            _ => None,
+        })
+    else {
+        return body.to_vec();
+    };
+    // The consumer must be the LAST statement before the cleanup: the
+    // status saved for the block is taken right there, so anything between
+    // them could have clobbered it.
+    if rm_at == 0
+        || !matches!(
+            body[rm_at - 1],
+            IrStmt::Exec { .. } | IrStmt::Expr(IrExpr::Call { .. })
+        )
+    {
+        return body.to_vec();
+    }
+
+    let pid = fresh_ps_var(body, &rm_tmps, "__ps_bgp");
+    let status = fresh_status_var(body, &rm_tmps);
+    let mut out: Vec<IrStmt> = Vec::with_capacity(body.len() + 4);
+    for (i, s) in body.iter().enumerate() {
+        if i == prod_at {
+            // The temp becomes a FIFO before the fork. `<(...)` IS a pipe
+            // in bash, and a regular temp FILE hands the consumer an
+            // immediate EOF at whatever the writer had flushed — `head`
+            // printed nothing where bash printed 10 lines (a read on a
+            // regular file does not wait for more data; a pipe read does).
+            // A fifo restores pipe semantics exactly: the consumer's
+            // open/read blocks for the writer's data, and — like bash — it
+            // sees EOF only when the writer side is gone. `POSIX::mkfifo`
+            // is core Perl, so no fork/exec is involved; the mktemp file
+            // is unlinked first (mkfifo refuses an existing path).
+            out.push(IrStmt::Require("POSIX".to_string()));
+            out.push(IrStmt::RawText(format!(
+                "unlink(${prod_tmp}); POSIX::mkfifo(${prod_tmp}, 0600) or die \"mkfifo: $!\\n\";\n"
+            )));
+            // fork: the Background arm emits the fork, records the pid in
+            // `$__sh2_last_bg`, and runs the body in the child. The pid is
+            // READ via `getVar("!")` — that is the path `var_read("!")`
+            // resolves to `$__sh2_last_bg`; a plain `Var("!")` renders as
+            // Perl's errno `$!`, and `kill('TERM', '')` numifies to pid 0
+            // — the ENTIRE process group, including this program.
+            out.push(IrStmt::Background(vec![s.clone()]));
+            out.push(ps_assign(
+                &pid,
+                IrExpr::Call {
+                    func: "getVar".to_string(),
+                    args: vec![IrExpr::Str("!".to_string(), crate::ir::StrStyle::DoubleQuoted)],
+                },
+            ));
+            continue;
+        }
+        if i == rm_at {
+            // the CONSUMER's status is what the block must report; kill,
+            // reap and the cleanup's own 0 are all overwritten by the
+            // restore below.
+            out.push(save_status(status.clone()));
+            out.push(ps_builtin_call(
+                "kill",
+                vec![
+                    IrExpr::Str("-TERM".to_string(), crate::ir::StrStyle::DoubleQuoted),
+                    IrExpr::Var(pid.clone(), None),
+                ],
+            ));
+            out.push(ps_builtin_call(
+                "wait",
+                vec![IrExpr::Var(pid.clone(), None)],
+            ));
+            out.push(s.clone());
+            out.push(IrStmt::SetChildError(IrExpr::Var(status.clone(), None)));
+            continue;
+        }
+        out.push(s.clone());
+    }
+    out
+}
+
+/// `rm -f __ps_tmp…` cleanup and the temps it removes — Fix 9's local
+/// shape check, repeated here so the two fixes stay independent.
+fn ps_rm_cleanup(s: &IrStmt) -> Option<Vec<String>> {
+    let IrStmt::Exec { cmd, args, .. } = s else {
+        return None;
+    };
+    if !matches!(cmd, IrExpr::Str(c, _) if c == "rm") {
+        return None;
+    }
+    match args.split_first() {
+        Some((IrExpr::Str(flag, _), rest)) if flag == "-f" => {
+            let mut tmps: Vec<String> = Vec::new();
+            for w in rest {
+                match w {
+                    IrExpr::Var(n, _) if n.starts_with("__ps_tmp") => tmps.push(n.clone()),
+                    _ => return None,
+                }
+            }
+            if tmps.is_empty() {
+                None
+            } else {
+                Some(tmps)
+            }
+        }
+        _ => None,
+    }
+}
+
+/// Provably non-terminating: a `while true` / `while :` loop whose body
+/// cannot leave it, a `do {…} while` with the same body guarantee (the
+/// body always runs and the loop comes back around), or a block holding
+/// one at the top level.
+fn stmts_run_forever(stmts: &[IrStmt]) -> bool {
+    stmts.iter().any(|s| match s {
+        IrStmt::While { cond, body } => always_true_cond(cond) && !stmts_may_leave(body),
+        IrStmt::DoWhile { body, .. } => !stmts_may_leave(body),
+        IrStmt::Block(b) => stmts_run_forever(b),
+        _ => false,
+    })
+}
+
+/// `while true` / `while :` — the command-condition spellings of
+/// "unconditional". `exec` covers the pre-builtin-lift shape.
+fn always_true_cond(cond: &IrExpr) -> bool {
+    match cond {
+        IrExpr::Call { func, args, .. } if func == "builtin" || func == "exec" => {
+            matches!(args.first(), Some(IrExpr::Str(s, _)) if s == "true" || s == ":")
+        }
+        _ => false,
+    }
+}
+
+/// Conservatively: could ANY of these statements end the enclosing loop?
+/// A `break` inside an `if` does; a `return`/`exit`/`die` anywhere does.
+/// Over-approximating (a case clause, a select, anything unrecognised)
+/// only keeps the sequential form — what every producer had before this
+/// fix — so the conservative direction can never change behaviour.
+fn stmts_may_leave(stmts: &[IrStmt]) -> bool {
+    stmts.iter().any(|s| match s {
+        IrStmt::Break | IrStmt::Return(_) | IrStmt::Exit(_) | IrStmt::Die { .. } => true,
+        IrStmt::Block(b) | IrStmt::Subshell(b) | IrStmt::Background(b) => stmts_may_leave(b),
+        IrStmt::Redirect { inner, .. } => stmts_may_leave(inner),
+        IrStmt::If {
+            then, elsifs, else_, ..
+        } => {
+            stmts_may_leave(then)
+                || elsifs.iter().any(|(_, b)| stmts_may_leave(b))
+                || stmts_may_leave(else_)
+        }
+        IrStmt::While { body, .. } | IrStmt::DoWhile { body, .. } => stmts_may_leave(body),
+        IrStmt::ForInit { body, .. } => stmts_may_leave(body),
+        _ => false,
+    })
+}
+
+/// A variable name no statement in the block can already be using.
+fn fresh_ps_var(body: &[IrStmt], tmps: &[String], prefix: &str) -> String {
+    let mut n = 0usize;
+    loop {
+        let cand = format!("{prefix}{n}");
+        let taken = body.iter().any(|s| mentions_var(s, &cand))
+            || tmps.iter().any(|t| t == &cand);
+        if !taken {
+            return cand;
+        }
+        n += 1;
+    }
+}
+
+fn ps_assign(var: &str, expr: IrExpr) -> IrStmt {
+    IrStmt::Assign {
+        targets: vec![crate::ir::AssignTarget {
+            var: var.to_string(),
+            sigil: None,
+            indices: vec![],
+        }],
+        expr,
+        asm: None,
+    }
+}
+
+/// `builtin(cmd, args…)` — the statement shape the renderer's builtin
+/// dispatch consumes (echo/sleep/wait/kill all arrive this way).
+fn ps_builtin_call(cmd: &str, args: Vec<IrExpr>) -> IrStmt {
+    let mut full = vec![IrExpr::Str(
+        cmd.to_string(),
+        crate::ir::StrStyle::DoubleQuoted,
+    )];
+    full.push(IrExpr::Array(args));
+    IrStmt::Expr(IrExpr::Call {
+        func: "builtin".to_string(),
+        args: full,
+    })
 }
 
 

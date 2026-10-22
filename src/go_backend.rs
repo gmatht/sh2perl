@@ -2754,6 +2754,27 @@ impl Render {
                     self.depth -= 1;
                     self.emit("}");
                     self.need_st = true;
+                } else if node.tag() == "GpuOp" {
+                    // Ext(GpuOp) — the DEVICE WRITE the fbdev-gpu lift
+                    // replaced (`echo … > /dev/webgl/…`). Go has no GPU leg,
+                    // so §4.4's correctness firewall applies: render the
+                    // ORIGINAL write (`os` is imported by scan_imports).
+                    let path = {
+                    let g = node.as_any().downcast_ref::<crate::shir_nodes::GpuOp>()
+                        .expect("tag/type agree");
+                    if g.slot.is_empty() {
+                        format!("{}/{}", g.device.trim_end_matches('/'), g.verb)
+                    } else {
+                        format!("{}/{}/{}", g.device.trim_end_matches('/'), g.slot, g.verb)
+                    }
+                };
+                let payload = {
+                    let g = node.as_any().downcast_ref::<crate::shir_nodes::GpuOp>()
+                        .expect("tag/type agree");
+                    let p = g.payload.clone();
+                    self.expr_any(&p)
+                };
+                    self.emit(&format!("_ = os.WriteFile({}, []byte({}), 0644)", Self::go_str(&path), payload));
                 } else {
                     panic!("go backend: Ext node {} unsupported", node.tag());
                 }

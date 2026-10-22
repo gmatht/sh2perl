@@ -4,7 +4,7 @@ use crate::parser::assignments::parse_array_elements;
 use crate::parser::control_flow::{
     parse_block, parse_break_statement, parse_case_statement, parse_continue_statement,
     parse_for_loop, parse_function, parse_if_statement, parse_posix_function,
-    parse_return_statement, parse_until_loop, parse_while_loop,
+    parse_return_statement, parse_select_loop, parse_until_loop, parse_while_loop,
 };
 use crate::parser::errors::ParserError;
 use crate::parser::redirects::parse_redirect;
@@ -23,6 +23,35 @@ fn word_to_parts(word: Word) -> Vec<StringPart> {
         Word::Arithmetic(ae, _) => vec![StringPart::Arithmetic(ae)],
         other => vec![StringPart::Literal(other.to_string())],
     }
+}
+
+/// The `select NAME in …` lookahead, for the dispatcher guard.
+///
+/// `peek_n` counts WHITESPACE tokens (the lexer pre-tokenizes and keeps
+/// Space/Tab/Comment in the stream), so the offsets are WALKED: the first
+/// non-space token after `select` must be the loop variable's identifier,
+/// and the next non-space one the `in` keyword. Without this the guard
+/// read a Space at +1, never matched, and `select x in aa; do …` kept
+/// parsing as four commands named select/do/…/done.
+fn select_in_form_ahead(parser: &Parser) -> bool {
+    let mut i = 1usize;
+    loop {
+        match parser.lexer.peek_n(i) {
+            Some(Token::Space | Token::Tab | Token::Comment | Token::CarriageReturn) => i += 1,
+            _ => break,
+        }
+    }
+    if !matches!(parser.lexer.peek_n(i), Some(Token::Identifier)) {
+        return false;
+    }
+    i += 1;
+    loop {
+        match parser.lexer.peek_n(i) {
+            Some(Token::Space | Token::Tab | Token::Comment | Token::CarriageReturn) => i += 1,
+            _ => break,
+        }
+    }
+    matches!(parser.lexer.peek_n(i), Some(Token::In))
 }
 
 pub struct Parser {
@@ -345,6 +374,12 @@ impl Parser {
                     Some(Token::While) => parse_while_loop(self)?,
                     Some(Token::Until) => parse_until_loop(self)?,
                     Some(Token::For) => parse_for_loop(self)?,
+                    // `select NAME in …` — desugared at parse time into
+                    // core nodes (control_flow.rs). The no-in form
+                    // (`select NAME; do`, items = the positional params)
+                    // is NOT desugared — its item count is dynamic — and
+                    // keeps the pre-existing command-name parse.
+                    Some(Token::Select) if select_in_form_ahead(self) => parse_select_loop(self)?,
                     Some(Token::Function) => parse_function(self)?,
                     Some(Token::Break) => parse_break_statement(self)?,
                     Some(Token::Continue) => parse_continue_statement(self)?,
@@ -792,6 +827,8 @@ impl Parser {
             Some(Token::While) => parse_while_loop(self),
             Some(Token::Until) => parse_until_loop(self),
             Some(Token::For) => parse_for_loop(self),
+            // Same `select` guard as the statement dispatcher above.
+            Some(Token::Select) if select_in_form_ahead(self) => parse_select_loop(self),
             Some(Token::Function) => parse_function(self),
             Some(Token::Break) => parse_break_statement(self),
             Some(Token::Continue) => parse_continue_statement(self),

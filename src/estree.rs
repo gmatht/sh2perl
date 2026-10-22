@@ -3084,6 +3084,34 @@ pub(crate) fn quasi_element(raw: &mut String, tail: bool) -> TemplateElement {
     }
 }
 
+/// A template-literal with NO expression slots and text that needs no
+/// escaping is just a string: `x = "World"` must emit `"World"`, not
+/// `` `World` ``.
+///
+/// The A1 ingress (otranspilerl) renders the CONTRACT export, whose words
+/// are canonical `Interpolate([Lit(..)])` nodes; the direct shell→estree
+/// path (`ast_to_estree`) reaches the same text as a plain `Str` and emits
+/// a Literal. Normalising here makes the two paths emit byte-identical
+/// ESTree for the same source — the page (contract export → render) and
+/// `otranspilerl_transpile` used to differ on every `echo "word"` and on
+/// brace-list `for i in {1..5}` iterations.
+pub(crate) fn literal_if_template_has_no_expr(e: Expr) -> Expr {
+    if let Expr::TemplateLiteral { quasis, expressions } = &e {
+        if expressions.is_empty() && quasis.len() == 1 {
+            let q = &quasis[0];
+            let cooked = q.value.cooked.as_deref().unwrap_or(&q.value.raw);
+            if !cooked.contains(['`', '\\', '$']) {
+                return Expr::Literal {
+                    value: serde_json::Value::String(cooked.to_string()),
+                    raw: None,
+                    regex: None,
+                };
+            }
+        }
+    }
+    e
+}
+
 /// Escape the literal text of a template-literal quasi. The JS emitter
 /// (estree.js → astring) writes `TemplateElement.value.raw` VERBATIM, so
 /// the three characters that are special inside a template literal must
@@ -7850,20 +7878,23 @@ greet");
     }
 
     #[test]
-    fn nested_param_default_chain_lowers_to_getvar_ternaries() {
+    fn nested_param_default_chain_lowers_to_store_read_ternaries() {
         // ${var:-${default:-${fallback:-$(echo "computed")}}} — the
         // nested chain: the runtime's expandWord would spawn bash for
-        // the $(echo) cmdsub; the native is a getVar ternary chain (one
-        // per level, `_g`-scratched) with the literal echo default. No
-        // param call, no spawn.
+        // the $(echo) cmdsub; the native is a `_g`-scratched ternary
+        // chain of store reads, one per level, with the literal echo
+        // default. No param call, no spawn.
         let json = to_json("echo \"${var:-${default:-${fallback:-$(echo \"computed\")}}}\"");
-        // the never-written `var` level reads through the runtime getVar
-        // dispatch ONCE (the `_g`-scratched primary — the DCE-safety
-        // fallback: the optimizer may have eliminated the only write while
-        // preserving the param read, so a folded "" primary would be
-        // unsound); the nested default levels read via the native store
-        // read (env-fallback property reads — no getVar dispatch)
-        assert_eq!(json.matches("\"name\":\"getVar\"").count(), 1);
+        // every plain-ident level — the never-written `var` primary
+        // included — reads through store_var_read_no_fold's native
+        // `sh2.vars.n ?? process.env.n ?? ''` into the `_g` scratch: the
+        // runtime getVar's exact plain-name decision inlined (the env
+        // fallback is what keeps it DCE-safe — never the "" fold, which
+        // parameter-expansion-nested.sh proved unsound for nested reads).
+        // Eligible plain names keep no getVar dispatch call at all.
+        assert_eq!(json.matches("\"name\":\"getVar\"").count(), 0, "{json}");
+        assert_eq!(json.matches("\"name\":\"env\"").count(), 3, "every level keeps the env fallback: {json}");
+        assert!(json.contains("\"name\":\"_g\""));
         assert!(json.contains("computed"));
         assert!(!json.contains("\"name\":\"param\""));
         assert!(!json.contains("unsupported"));
@@ -7876,10 +7907,10 @@ greet");
         assert!(!json2.contains("\"name\":\"param\""));
         // a ${NAME} plain-ref default lowers to the native store read too
         let json3 = to_json("echo ${MOUNTPOINT:-${NAME}}");
-        // the never-written MOUNTPOINT level reads through the same
-        // DCE-safety getVar fallback (once); the live NAME level reads
-        // natively
-        assert_eq!(json3.matches("\"name\":\"getVar\"").count(), 1);
+        // both levels — never-written MOUNTPOINT and live NAME — are
+        // eligible plain idents, so both read natively (store_var_read_no_fold,
+        // env fallback kept; no getVar dispatch call)
+        assert_eq!(json3.matches("\"name\":\"getVar\"").count(), 0, "{json3}");
         assert!(!json3.contains("\"name\":\"param\""));
     }
 

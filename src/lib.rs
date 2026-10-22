@@ -65,6 +65,8 @@ pub mod shir_passes;
 pub mod variable_analysis;
 pub mod zig_backend;
 pub mod lint_backend; // lint/diagnostic backend (renders analysis verdicts, not code)
+pub mod fish_backend; // idiomatic fish renderer (copied from backends/fish; otranspilerl TARGETS "fish")
+pub mod zsh_backend; // idiomatic zsh renderer (copied from backends/zsh; otranspilerl TARGETS "zsh")
 // Browser (JS/wasm-bindgen) API — wasm32 only (wasm-bindgen links the
 // wasm import shim; ungated it rides along on native/win32 builds).
 #[cfg(target_arch = "wasm32")]

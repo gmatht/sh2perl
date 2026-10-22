@@ -1058,12 +1058,41 @@ pub fn stmt_lastexit_write_is_dead(stmt: &IrStmt) -> bool {
 /// (only shapes it has a dead twin for); this is the general verdict.
 static LASTEXIT_UNREAD: Mutex<Option<HashSet<usize>>> = Mutex::new(None);
 
+/// The SOURCE-LANGUAGE status verdict recorded at install time: true when
+/// the program has no observable `$?` at all, so EVERY status write is
+/// dead by construction — including expression-position writes (the
+/// `whileLoop` call's rc side effect) that carry no statement pointer for
+/// [`stmt_status_write_is_unread`] to key on. Unset ⇒ conservative false
+/// (keep the bookkeeping).
+static SOURCE_STATUS_UNOBSERVABLE: Mutex<Option<bool>> = Mutex::new(None);
+
+/// Renderer accessor for [`SOURCE_STATUS_UNOBSERVABLE`].
+pub fn source_status_unobservable() -> bool {
+    SOURCE_STATUS_UNOBSERVABLE.lock().unwrap().unwrap_or(false)
+}
+
+/// Process-wide render-verdict lock: the verdict statics above are
+/// installed per program and consulted during the SAME render, so two
+/// in-process renders interleaving (concurrent test threads today;
+/// any embedder tomorrow) can overwrite each other's verdicts mid-render
+/// — observed as an order-dependent render-test flake. Renderer entry
+/// points hold this guard across install+render, serializing the pair.
+/// Leaf-order safe: it is taken FIRST and never nested under the other
+/// verdict locks.
+static RENDER_VERDICTS: Mutex<()> = Mutex::new(());
+
+/// Guard held across a render's verdict-install + emission.
+pub fn render_verdict_lock() -> std::sync::MutexGuard<'static, ()> {
+    RENDER_VERDICTS.lock().unwrap_or_else(|e| e.into_inner())
+}
+
 /// Install the general unread-status-write set (see [`LASTEXIT_UNREAD`]).
 /// Same pointer keys as [`LASTEXIT_DEAD`]: the caller MUST pass the exact
 /// `prog` it then renders.
 pub fn install_unread_status_writes(prog: &IrProgram, errexit: bool) {
     if errexit {
         *LASTEXIT_UNREAD.lock().unwrap() = Some(HashSet::new());
+        *SOURCE_STATUS_UNOBSERVABLE.lock().unwrap() = Some(false);
         return;
     }
     // SOURCE-LANGUAGE STATUS VERDICT: no source `$?` and no status read
@@ -1122,8 +1151,10 @@ pub fn install_unread_status_writes(prog: &IrProgram, errexit: bool) {
         }
         all(&prog.stmts, &mut unread);
         *LASTEXIT_UNREAD.lock().unwrap() = Some(unread);
+        *SOURCE_STATUS_UNOBSERVABLE.lock().unwrap() = Some(true);
         return;
     }
+    *SOURCE_STATUS_UNOBSERVABLE.lock().unwrap() = Some(false);
     let mut live: HashSet<usize> = HashSet::new();
     walk_lastexit_liveness(&prog.stmts, true, &mut live);
     let mut unread: HashSet<usize> = HashSet::new();
@@ -1199,6 +1230,140 @@ pub fn stmt_status_write_is_unread(stmt: &IrStmt) -> bool {
         .as_ref()
         .map(|s| s.contains(&(stmt as *const IrStmt as usize)))
         .unwrap_or(false)
+}
+
+/// Like [`install_unread_status_writes`], but EXIT-LIVE: the
+/// `exit_status_is_unobservable` shortcut (mark EVERY writer unread) is
+/// deliberately NOT applied, and `prog.subs` bodies participate.
+///
+/// For a backend whose PROCESS exit code IS the status register — Perl's
+/// `exit $main_exit_code`, whose gate compares exit codes byte-for-byte
+/// against bash — the final-path write must survive even when the source
+/// never reads `$?`: `false` has to still exit 1. The normal end-live
+/// walk keeps exactly the writes that can reach a `$?` read or program
+/// end, on every path; errexit still vetoes everything (a `set -e` abort
+/// observes status). The base install walks top-level stmts only; a sub's
+/// final status is its return value (observed by a caller's `$?` read),
+/// so each sub body additionally walks with end-live.
+///
+/// The nested collector is a MIRROR of the one inside
+/// [`install_unread_status_writes`] — keep the two in sync.
+pub fn install_unread_status_writes_exit_live(
+    prog: &IrProgram,
+    errexit: bool,
+) {
+    let bodies: Vec<&[IrStmt]> = prog.subs.iter().map(|s| s.body.as_slice()).collect();
+    install_unread_status_writes_exit_live_stmts(&prog.stmts, &bodies, errexit);
+}
+
+/// Slice core of the exit-live install — for a renderer whose statement
+/// source is a REWRITTEN/OPTIMIZED vec built after the program was
+/// cloned (the Perl renderer runs strip_cfor, shir_native_stmt and
+/// optimize_stmts on its copy), so the pointer keys must be THOSE
+/// statements, not `prog.stmts`. `sub_bodies` are the sub bodies
+/// emit_sub renders (their pointers are unchanged by those passes).
+pub fn install_unread_status_writes_exit_live_stmts(
+    top: &[IrStmt],
+    sub_bodies: &[&[IrStmt]],
+    errexit: bool,
+) {
+    if errexit {
+        *LASTEXIT_UNREAD.lock().unwrap() = Some(HashSet::new());
+        return;
+    }
+    let mut live: HashSet<usize> = HashSet::new();
+    walk_lastexit_liveness(top, true, &mut live);
+    for body in sub_bodies {
+        walk_lastexit_liveness(body, true, &mut live);
+    }
+    let mut unread: HashSet<usize> = HashSet::new();
+    fn collect(stmts: &[IrStmt], live: &HashSet<usize>, unread: &mut HashSet<usize>) {
+        for st in stmts {
+            let key = st as *const IrStmt as usize;
+            if ir_stmt_writes_lastexit(st) && !live.contains(&key) {
+                unread.insert(key);
+            }
+            match st {
+                IrStmt::While { body, .. }
+                | IrStmt::DoWhile { body, .. }
+                | IrStmt::For { body, .. }
+                | IrStmt::Block(body) => collect(body, live, unread),
+                IrStmt::ForInit { init, step, body, .. } => {
+                    collect(init, live, unread);
+                    collect(step, live, unread);
+                    collect(body, live, unread);
+                }
+                IrStmt::If { then, elsifs, else_, .. } => {
+                    collect(then, live, unread);
+                    for (_, arm) in elsifs {
+                        collect(arm, live, unread);
+                    }
+                    collect(else_, live, unread);
+                }
+                IrStmt::Subshell(b) | IrStmt::Background(b) => collect(b, live, unread),
+                IrStmt::Redirect { inner, .. } => collect(inner, live, unread),
+                IrStmt::Pipeline { stages, .. } => {
+                    for st2 in stages {
+                        collect(st2, live, unread);
+                    }
+                }
+                IrStmt::Function { body, named_blocks, .. } => {
+                    collect(body, live, unread);
+                    for (_, nb) in named_blocks {
+                        collect(nb, live, unread);
+                    }
+                }
+                IrStmt::Try { body, excepts, else_body, finally_body, .. } => {
+                    collect(body, live, unread);
+                    for e in excepts {
+                        collect(&e.body, live, unread);
+                    }
+                    collect(else_body, live, unread);
+                    collect(finally_body, live, unread);
+                }
+                IrStmt::Case { clauses, .. } => {
+                    for c in clauses {
+                        collect(&c.body, live, unread);
+                    }
+                }
+                IrStmt::Select { clauses } => {
+                    for c in clauses {
+                        collect(&c.body, live, unread);
+                    }
+                }
+                _ => {}
+            }
+        }
+    }
+    collect(top, &live, &mut unread);
+    for body in sub_bodies {
+        collect(body, &live, &mut unread);
+    }
+    *LASTEXIT_UNREAD.lock().unwrap() = Some(unread);
+}
+
+/// Pointer-keyed accessor for renderers that track the OWNING statement
+/// themselves (the Perl renderer's emit-time ownership stack): same
+/// verdict as [`stmt_status_write_is_unread`], keyed by address. The
+/// verdict set must have been installed for the program being rendered —
+/// its statements are alive, so a fresh allocation (an eval subprogram's
+/// statements) can never collide with a live member's address.
+pub fn status_write_is_unread_key(key: usize) -> bool {
+    LASTEXIT_UNREAD
+        .lock()
+        .unwrap()
+        .as_ref()
+        .map(|s| s.contains(&key))
+        .unwrap_or(false)
+}
+
+/// Drop the current verdict set to empty (keep-everything): piecemeal
+/// rendering with no program in hand (`stmt_to_perl`) must not consult
+/// pointer keys from an earlier compile whose statements may already be
+/// freed and their addresses reused.
+pub fn clear_unread_status_writes() {
+    *LASTEXIT_UNREAD.lock().unwrap() = Some(HashSet::new());
+    *SOURCE_STATUS_UNOBSERVABLE.lock().unwrap() = Some(false);
 }
 
 
@@ -1296,11 +1461,38 @@ pub(crate) fn ir_stmt_writes_lastexit(stmt: &IrStmt) -> bool {
 /// string stays the literal text (the runtime evalArith reads the status).
 /// Over-approximated (single-quoted literal "$?" text included) — a
 /// spurious reader only keeps a write live (safe).
+/// Does baked renderer text OBSERVE the status? `$?` is the shell form;
+/// `$CHILD_ERROR` / `$__sh_ok` are the perl-side spellings the native
+/// lowerings bake into `IrExpr::Str` / `RawText` values. Write forms are
+/// stripped first so a baked `$main_exit_code = $CHILD_ERROR = 0;` does
+/// not count as its own reader.
+pub(crate) fn text_reads_status(t: &str) -> bool {
+    if t.contains("$?") {
+        return true;
+    }
+    let stripped = t
+        .replace("$main_exit_code = $CHILD_ERROR = ", "")
+        .replace("$CHILD_ERROR = ", "");
+    stripped.contains("$CHILD_ERROR") || stripped.contains("$__sh_ok")
+}
+
 pub(crate) fn ir_expr_reads_status(e: &IrExpr) -> bool {
     match e {
-        IrExpr::Var(name, _) => name == "?",
-        IrExpr::Str(s, _) => s.contains("$?"),
-        IrExpr::Index { key, .. } => ir_expr_reads_status(key),
+        // `?` is the shell spelling; `CHILD_ERROR` is the IR spelling the
+        // process-subst status SAVE reads (`__ps_status0 = $CHILD_ERROR`)
+        // — missing it made the consumer's write look dead and 070_cmp
+        // reported the rm-cleanup's 0 instead of cmp's 1.
+        IrExpr::Var(name, _) => matches!(name.as_str(), "?" | "CHILD_ERROR"),
+        IrExpr::Str(s, _) => text_reads_status(s),
+        // A `${PIPESTATUS[i]}` element read OBSERVES the pipeline stage
+        // statuses — it is a status READ. Without it the backward scan
+        // marked pipeline-stage status writes unread and renderers
+        // stripped them: `false | true; echo "ps=${PIPESTATUS[0]},${PIPESTATUS[1]}"`
+        // pushed the STALE rc for the `true` stage (070_gnuisms: bash
+        // `ps=1,0` vs ours `ps=1,1`).
+        IrExpr::Index { var, key, .. } => {
+            matches!(var.as_str(), "PIPESTATUS") || ir_expr_reads_status(key)
+        }
         IrExpr::BinOp { lhs, rhs, .. } => ir_expr_reads_status(lhs) || ir_expr_reads_status(rhs),
         IrExpr::Call { func, args } => {
             // `$?` at word level lowers to `sh2.getVar("?")` (the runtime
@@ -1308,6 +1500,10 @@ pub(crate) fn ir_expr_reads_status(e: &IrExpr) -> bool {
             // on the lifted/native path
             args.iter().any(ir_expr_reads_status)
                 || (func == "getVar" && matches!(args.as_slice(), [IrExpr::Str(n, _)] if n == "?"))
+                // `${PIPESTATUS[i]}` lowers to `param("", "PIPESTATUS[i]")`
+                // (or `arrayIndex("PIPESTATUS", i)`) — same read as above
+                || ((func == "param" || func == "arrayIndex")
+                    && args.iter().any(|a| matches!(a, IrExpr::Str(s, _) if s.starts_with("PIPESTATUS["))))
         }
         IrExpr::MethodCall { obj, args, .. } => {
             ir_expr_reads_status(obj) || args.iter().any(ir_expr_reads_status)
@@ -1321,7 +1517,7 @@ pub(crate) fn ir_expr_reads_status(e: &IrExpr) -> bool {
             ir_expr_reads_status(expr) || ir_expr_reads_status(default)
         }
         IrExpr::Interpolate(parts) => parts.iter().any(|p| match p {
-            InterpPart::Lit(s) => s.contains("$?"),
+            InterpPart::Lit(s) => text_reads_status(s),
             InterpPart::Expr(e) => ir_expr_reads_status(e),
         }),
         // a command substitution inherits `$?` (bash runs it in a
@@ -1378,6 +1574,39 @@ pub(crate) fn ir_stmt_reads_status(stmt: &IrStmt) -> bool {
         IrStmt::Exit(opt) => opt.as_ref().map(ir_expr_reads_status).unwrap_or(true),
         // subshell/background bodies may read the inherited status
         IrStmt::Subshell(body) | IrStmt::Background(body) => ir_stmts_read_status(body),
+        // A `Block` wraps single statements after transforms (the native
+        // lowering wraps `echo …` + status bookkeeping in one) — a `$?`
+        // reader inside it MUST count: with no Block arm this fell to
+        // `_ => false` and every writer feeding a wrapped reader looked
+        // dead (arith-postfix-status lost all four `((…))` status writes
+        // that its `echo "post0=$?"` read).
+        IrStmt::Block(body) => ir_stmts_read_status(body),
+        IrStmt::Pipeline { stages, .. } => stages.iter().any(|s| ir_stmts_read_status(s)),
+        IrStmt::ForInit { init, step, body, .. } => {
+            ir_stmts_read_status(init)
+                || ir_stmts_read_status(step)
+                || ir_stmts_read_status(body)
+        }
+        IrStmt::Case { clauses, .. } => clauses.iter().any(|c| ir_stmts_read_status(&c.body)),
+        IrStmt::Select { clauses } => clauses.iter().any(|c| ir_stmts_read_status(&c.body)),
+        IrStmt::Try {
+            body,
+            excepts,
+            else_body,
+            finally_body,
+            ..
+        } => {
+            ir_stmts_read_status(body)
+                || excepts.iter().any(|e| ir_stmts_read_status(&e.body))
+                || ir_stmts_read_status(else_body)
+                || ir_stmts_read_status(finally_body)
+        }
+        // Baked renderer text (the native lowerings emit perl-side source
+        // including `$main_exit_code = $CHILD_ERROR = …;` writes): strip
+        // the write forms and treat any LEFTOVER `$CHILD_ERROR` /
+        // `$__sh_ok` / `$?` mention as a read (over-approximate — a
+        // spurious reader only keeps a write alive).
+        IrStmt::RawText(t) => text_reads_status(t),
         IrStmt::Function {
             body,
             named_blocks,
@@ -1457,6 +1686,45 @@ pub(crate) fn walk_lastexit_liveness(stmts: &[IrStmt], end_live: bool, live: &mu
         match stmt {
             IrStmt::While { body, .. } | IrStmt::For { body, .. } | IrStmt::Block(body) => {
                 walk_lastexit_liveness(body, self_live, live);
+            }
+            // The verdict collector recurses into ALL container shapes —
+            // the walk must too, or children of the shapes below get a
+            // key with NO liveness and read back `unread` unconditionally
+            // (their writes dropped regardless of readers: 070_cmp_basic
+            // lost the `__sh_uu_rc` write feeding `echo "$?"`).
+            IrStmt::Pipeline { stages, .. } => {
+                for st in stages {
+                    walk_lastexit_liveness(st, self_live, live);
+                }
+            }
+            IrStmt::ForInit { init, step, body, .. } => {
+                walk_lastexit_liveness(init, self_live, live);
+                walk_lastexit_liveness(step, self_live, live);
+                walk_lastexit_liveness(body, self_live, live);
+            }
+            IrStmt::Try {
+                body,
+                excepts,
+                else_body,
+                finally_body,
+                ..
+            } => {
+                walk_lastexit_liveness(body, self_live, live);
+                for e in excepts {
+                    walk_lastexit_liveness(&e.body, self_live, live);
+                }
+                walk_lastexit_liveness(else_body, self_live, live);
+                walk_lastexit_liveness(finally_body, self_live, live);
+            }
+            IrStmt::Case { clauses, .. } => {
+                for c in clauses {
+                    walk_lastexit_liveness(&c.body, self_live, live);
+                }
+            }
+            IrStmt::Select { clauses } => {
+                for c in clauses {
+                    walk_lastexit_liveness(&c.body, self_live, live);
+                }
             }
             IrStmt::DoWhile { body, .. } => walk_lastexit_liveness(body, self_live, live),
             IrStmt::If {
@@ -2616,12 +2884,85 @@ pub(crate) fn lastexit_scan_top_read(stmts: &[IrStmt], end_live: bool) -> bool {
 pub(crate) fn is_pure_test_chain(e: &IrExpr) -> bool {
     match e {
         IrExpr::Call { func, .. } => func == "test",
+        // A typed comparison leaf (the test-lowering's numeric rewrite):
+        // plain-var / literal / pure-arithmetic operands cannot read a
+        // status or call anything, so the chain stays pure. Anything
+        // richer (Capture, Call) is refused — refuse > guess.
+        IrExpr::BinOp { op, lhs, rhs }
+            if matches!(
+                op,
+                BinOpKind::Eq | BinOpKind::Ne | BinOpKind::Lt | BinOpKind::Gt
+                    | BinOpKind::Le | BinOpKind::Ge
+            ) =>
+        {
+            fn pure_arith(a: &crate::ir::ArithAst) -> bool {
+                use crate::ir::ArithAst;
+                match a {
+                    ArithAst::Num(_) | ArithAst::Var(_) | ArithAst::Ident(_) => true,
+                    ArithAst::Bin { lhs, rhs, .. } => pure_arith(lhs) && pure_arith(rhs),
+                    ArithAst::Un { arg, .. } => pure_arith(arg),
+                    _ => false,
+                }
+            }
+            fn pure_operand(x: &IrExpr) -> bool {
+                match x {
+                    IrExpr::Var(_, _) | IrExpr::Int(_) | IrExpr::Str(_, _) => true,
+                    IrExpr::Arith(a) => pure_arith(a),
+                    _ => false,
+                }
+            }
+            pure_operand(lhs) && pure_operand(rhs)
+        }
         IrExpr::BinOp { op, lhs, rhs } => {
             (matches!(op, BinOpKind::And | BinOpKind::Or)
                 && is_pure_test_chain(lhs)
                 && is_pure_test_chain(rhs))
                 || (matches!(op, BinOpKind::Not) && is_pure_test_chain(lhs))
         }
+        _ => false,
+    }
+}
+
+/// A PURE boolean VALUE expression: [`is_pure_test_chain`] plus the value
+/// primitives the shared test-lowering turns a `[[ ]]` leaf into
+/// (`strHasPrefix`/`strHasSuffix`/`contains` on literal/var operands, and
+/// their And/Or/Not nesting — including a compound `-a`/`-o` leaf that
+/// lowered to a comparison pair). The perl renderer's chain and
+/// statement-position paths use this to treat a lowered `[[ x ]] && cmd`
+/// chain exactly like the `test` Call it used to be: every operand is a
+/// side-effect-free boolean whose TRUE/FALSE matches the old test's, and
+/// whose 0/1 status write matches the old `test` arm's.
+pub(crate) fn is_pure_bool(e: &IrExpr) -> bool {
+    if is_pure_test_chain(e) {
+        return true;
+    }
+    match e {
+        IrExpr::Call { func, args } => {
+            matches!(func.as_str(), "strHasPrefix" | "strHasSuffix" | "contains")
+                && args.iter().all(pure_bool_operand)
+        }
+        IrExpr::BinOp { op, lhs, rhs } => match op {
+            BinOpKind::And | BinOpKind::Or => is_pure_bool(lhs) && is_pure_bool(rhs),
+            BinOpKind::Not => is_pure_bool(lhs),
+            _ => false,
+        },
+        _ => false,
+    }
+}
+
+fn pure_bool_operand(x: &IrExpr) -> bool {
+    fn arith(a: &crate::ir::ArithAst) -> bool {
+        use crate::ir::ArithAst;
+        match a {
+            ArithAst::Num(_) | ArithAst::Var(_) | ArithAst::Ident(_) => true,
+            ArithAst::Bin { lhs, rhs, .. } => arith(lhs) && arith(rhs),
+            ArithAst::Un { arg, .. } => arith(arg),
+            _ => false,
+        }
+    }
+    match x {
+        IrExpr::Var(_, _) | IrExpr::Int(_) | IrExpr::Str(_, _) => true,
+        IrExpr::Arith(a) => arith(a),
         _ => false,
     }
 }
@@ -3129,7 +3470,7 @@ fn collect_provably_running_loops(stmts: &[IrStmt], out: &mut HashSet<usize>) {
         if let Some(b) = body { collect_provably_running_loops(b, out); }
     }
 }
-pub(crate) fn set_provably_running_loops(stmts: &[IrStmt]) {
+pub fn set_provably_running_loops(stmts: &[IrStmt]) {
     let mut runs = HashSet::new();
     collect_provably_running_loops(stmts, &mut runs);
     *PROVABLY_RUNS.lock().unwrap() = Some(runs);
@@ -3137,6 +3478,14 @@ pub(crate) fn set_provably_running_loops(stmts: &[IrStmt]) {
 pub(crate) fn stmt_provably_runs(s: &IrStmt) -> bool {
     loop_provably_runs(s)
 }
+/// Public probe: does this loop provably run at least once? (The static is
+/// installed per compilation by `shir_to_estree` / `shir_to_shir_json`; a
+/// consumer that holds the PROGRAM the static came from — otranspilerl's
+/// export path — reads the same verdict through here.)
+pub fn stmt_loop_provably_runs(stmt: &IrStmt) -> bool {
+    loop_provably_runs(stmt)
+}
+
 fn loop_provably_runs(stmt: &IrStmt) -> bool {
     PROVABLY_RUNS
         .lock()
@@ -6328,6 +6677,20 @@ fn align_by_identity(new: &[IrStmt], old: &[IrStmt]) -> Vec<Option<usize>> {
 /// web GUI maps generated statements back to the source lines they came
 /// from.
 pub fn ast_to_ir_with_lines(commands: &[Command], lines: &[usize]) -> IrProgram {
+    let mut prog = ast_to_ir_pre_transforms(commands, lines);
+    ast_to_ir_transforms(&mut prog);
+    prog
+}
+
+/// The part of `ast_to_ir` that runs BEFORE `transforms::apply`: the
+/// statement lowering + `optimize_stmts` (+ the `stmt_lines` markup),
+/// with no worker transform applied. otranspilerl renders the A1 EXPORT
+/// (which has been through this, plus `transforms::apply`), so its ingress
+/// re-runs exactly this half on the parsed JSON — the pass ORDER must be
+/// `optimize_stmts` → transforms (once), or the ingest sees a different
+/// program than the direct compile (mimecroft's dead `x=""` stores came
+/// back when the order was inverted).
+pub fn ast_to_ir_pre_transforms(commands: &[Command], lines: &[usize]) -> IrProgram {
     // Shared optimization passes (M6): the same optimize_stmts the Perl
     // backend runs now also runs here, so future passes (constant folding,
     // dead-assignment elimination) benefit both consumers of the IR.
@@ -6356,15 +6719,9 @@ pub fn ast_to_ir_with_lines(commands: &[Command], lines: &[usize]) -> IrProgram 
     }
     let src: Vec<IrStmt> = origins.iter().map(|(_, s)| s.clone()).collect();
     let mut stmts = crate::ir::optimize_stmts(&src);
-    // Serialize against the shir_to_estree compile lock: the
-    // sync-ok-loops transform stores per-compilation POINTER-keyed
-    // verdicts in shared statics, and a parallel compilation's unlocked
-    // write could tear them mid-emission (the determinism unit tests
-    // compile concurrently). Never re-entered: shir_to_estree does not
-    // call ast_to_ir and ast_to_ir does not call shir_to_estree.
-    let _compile_guard = COMPILE_LOCK.lock().unwrap();
+    // The lock moved to `ast_to_ir_transforms` (this function no longer
+    // runs the transforms — see there).
     let after_optimize = stmts.clone();
-    crate::transforms::apply(&mut stmts);
     // `after_optimize` is a FILTERED view of `src`, and `stmts` may differ
     // from it again, so the source line is recovered by two order-preserving
     // subsequence matches rather than by using either list's indices
@@ -6388,7 +6745,7 @@ pub fn ast_to_ir_with_lines(commands: &[Command], lines: &[usize]) -> IrProgram 
             stmt_lines.push((i, line));
         }
     }
-    IrProgram {
+    let mut prog = IrProgram {
         imports: vec![],
         requires: vec![],
         stmts,
@@ -6401,7 +6758,59 @@ pub fn ast_to_ir_with_lines(commands: &[Command], lines: &[usize]) -> IrProgram 
         var_nospace: vec![],
         var_storage: vec![],
         var_bash_env: vec![],
+    };
+    prog
+}
+
+/// The worker-transform half of `ast_to_ir` (`transforms::apply`), then the
+/// post-transform fixups (the split-fold offer and the `var_nospace` reset).
+pub fn ast_to_ir_transforms(prog: &mut IrProgram) {
+    // Serialize against the shir_to_estree compile lock: the sync-ok-loops
+    // transform stores per-compilation POINTER-keyed verdicts in shared
+    // statics, and a parallel compilation's unlocked write could tear them
+    // mid-emission (the determinism unit tests compile concurrently).
+    // Never re-entered: shir_to_estree does not call ast_to_ir.
+    let _compile_guard = COMPILE_LOCK.lock().unwrap();
+    crate::transforms::apply(&mut prog.stmts);
+    // Generalise the split-fold offer (PLAN §11 marketplace): the shared
+    // `shir_passes::split_fold` pass was a finished, unit-tested
+    // shIR→shIR transform with NO caller in this tree — only the C
+    // renderer's split-shaped arms and bash-O4's pipeline consumed the
+    // feature, so every other backend kept paying for provably no-op
+    // `split[e]` nodes (a runtime word-split of a value that cannot
+    // contain IFS whitespace). Running it at the single funnel all
+    // backends share (ast_to_ir) means C, Perl, ESTree/JS, Go, Rust,
+    // Python, … all inherit the fold from one wiring, and the ESTree
+    // renderer's own render-time fold becomes the idempotent fallback
+    // its module doc already describes.
+    //
+    // Conservatism at this point is by construction: `var_types` is not
+    // populated yet, so the element-position carve-out (the 051_primes
+    // char**-flip) refuses EVERY array-element fold here, and
+    // `var_nospace` is computed locally by the pass itself. The
+    // `SH2_NO_SPLIT_FOLD` switch is the one C's renderer-side arms
+    // already honour — one switch disables the whole feature family for
+    // a baseline A/B (c_backend.rs `split_fold_off`).
+    if std::env::var("SH2_NO_SPLIT_FOLD").as_deref() != Ok("1") {
+        crate::shir_passes::split_fold::fold_trivial_splits(prog);
+        // The pass computes `var_nospace` on its local view when empty;
+        // restore the field to its pre-call state so the exported
+        // contract and every downstream analysis recompute exactly what
+        // they always did — the fold's observable effect stays confined
+        // to the statement expressions it rewrote.
+        prog.var_nospace.clear();
     }
+}
+
+/// The CANONICAL statement lowering — `stmt_for_command` for every command,
+/// no optimization. The one spelling shared by `ast_to_ir_pre_transforms`
+/// (which then runs `optimize_stmts` + the transforms) and an A1-ingress
+/// path feeding an EXPORT that has already been through those
+/// (otranspilerl's `shell_to_shir_export_prog`): the export JSON is the
+/// canonical statement stream, so re-lowering its SOURCE gives exactly the
+/// un-optimized twin of the program the export describes.
+pub fn canonical_stmts(commands: &[Command]) -> Vec<IrStmt> {
+    commands.iter().filter_map(stmt_for_command).collect()
 }
 
 /// Raw lowering (plan §2.3): skip the shared optimization passes
@@ -11136,10 +11545,25 @@ pub fn static_word_text(w: &IrExpr) -> Option<String> {
 ///
 /// Returns the element texts (in order) so a backend emits the literal
 /// array directly, or `None` when any element is dynamic.
+///
+/// A GLOB-TAGGED word (`\x01SH2GLOB\x01*.txt`) is refused here: the marker
+/// is the core's instruction to EXPAND the pattern against the filesystem at
+/// runtime, so the text is not a compile-time literal no matter how static
+/// the list shape is. Returning it would bake the sentinel into whatever the
+/// backend emits verbatim — the Rust `for`-iterand fast path printed
+/// `Text file: \x01SH2GLOB\x01*.txt` on stdout (064_19 /
+/// 064_hard_to_generate), and the static-array verdict stores it in the
+/// array's literal init (000__04h's glob-through-an-array shape).
+/// REFUSE > GUESS: `None` marks the list dynamic, which every backend
+/// already renders through its glob machinery (`__sh_glob` and friends).
 pub fn static_word_list(items: &[crate::ir::IrExpr]) -> Option<Vec<String>> {
     let mut out = Vec::with_capacity(items.len());
     for it in items {
-        out.push(static_word_text(it)?);
+        let t = static_word_text(it)?;
+        if t.contains(GLOB_MAGIC) {
+            return None;
+        }
+        out.push(t);
     }
     Some(out)
 }
@@ -17277,8 +17701,9 @@ fn not_ir(inner: IrExpr) -> IrExpr {
 
 fn command_arrow_stmts(c: &Command) -> Vec<IrStmt> {
     match c {
-        Command::Block(b) => b.commands.iter().filter_map(stmt_for_command).collect(),
-        // expression-bodied arrows
+        // `$(cmd arg …)` / the `A && B` / `A || B` / `! A` chain: ONE command
+        // whose value is the expression. `stmt_for_command` would lower these
+        // to expression-bodied arrows too (ir-command-to-ir-arrow-20261022).
         Command::Simple(_)
         | Command::BuiltinCommand(_)
         | Command::TestExpression(_)
@@ -17289,8 +17714,18 @@ fn command_arrow_stmts(c: &Command) -> Vec<IrStmt> {
         | Command::Not(_)
         | Command::Assignment(_)
         | Command::ShoptCommand(_) => vec![IrStmt::Expr(command_to_ir(c))],
-        // compound commands → block-bodied arrows
-        other => vec![stmt_for_command(other).unwrap_or(IrStmt::Expr(call("true", vec![])))],
+        // Every OTHER command is a GROUP (a block, a loop, a conditional, a
+        // subshell, several `;`-separated commands): a capture runs each of
+        // its commands in order, so each must lower to its own STATEMENT.
+        // Lowering the group as one `IrStmt::Expr(command_to_ir(..))` produced
+        // expression-bodied arrows whose renders were not even valid
+        // statements: backtick bodies with several commands dropped outright,
+        // `for …; done` became `(exec for x in a)` — which fish runs as a
+        // MISSING `for` (print-help + 127), `exec 4>&1` became
+        // `set r (exec 4>&1 …)` — fish's own `exec`. Blocks and simple
+        // commands agree under both lowerings, so this is the shape of the
+        // `$( … )` path the backends' capture tests pin.
+        other => body_stmts(other),
     }
 }
 
@@ -17599,6 +18034,21 @@ fn arg_word_ir(w: &Word, assoc: bool) -> IrExpr {
         Word::Variable(name, _, _) if name != "@" && name != "*" => {
             call("split", vec![call("getVar", vec![st(name)])])
         }
+        // A BARE `${...}` field-splits on IFS exactly like a bare `$v`
+        // (the same `split` contract): `v="a b"; printf %s ${v/Q/x}`
+        // passes TWO arguments, `printf %s "${v/Q/x}"` ONE — and the two
+        // sources previously emitted byte-identical shIR, so no backend
+        // could be right for both (measured: the raw `\"` and bare `"`
+        // operand sources collided the same way). A quoted occurrence
+        // arrives inside a StringInterpolation and never reaches this
+        // arm; `${v}` (Op::None) already lowers to the split(getVar)
+        // form. Every value-producing operator inherits the variable's
+        // field structure, so all of them split.
+        Word::ParameterExpansion(pe, _)
+            if !matches!(pe.operator, ParameterExpansionOperator::None) =>
+        {
+            call("split", vec![param_ir(pe)])
+        }
         _ => word_ir(w),
     }
 }
@@ -17621,6 +18071,15 @@ fn array_element_ir(w: &Word) -> IrExpr {
         }
         Word::Variable(name, _, _) if name != "@" && name != "*" => {
             call("split", vec![call("getVar", vec![st(name)])])
+        }
+        // A BARE `${...}` element field-splits like the Variable arm above
+        // (`arr=(${v/Q/x})` splits the result on IFS; same `split`
+        // contract as arg_word_ir — quoted occurrences arrive inside a
+        // StringInterpolation and stay one element).
+        Word::ParameterExpansion(pe, _)
+            if !matches!(pe.operator, ParameterExpansionOperator::None) =>
+        {
+            call("split", vec![param_ir(pe)])
         }
         // `arr=($@)` / `arr=($*)` — each positional is one element (the
         // runner's setArray splices the listVar array; bash field-splits
@@ -20896,7 +21355,7 @@ fn exec_or_builtin<'a>(func: &'a str, args: &[IrExpr]) -> &'a str {
 /// store or process.env (IFS drives field-splitting and joins; PATH feeds
 /// spawned commands; exported vars sync to process.env). Lifting any of
 /// these to a native binding would desync the runtime.
-fn is_reserved_var(name: &str) -> bool {
+pub(crate) fn is_reserved_var(name: &str) -> bool {
     matches!(
         name,
         "IFS"
@@ -31359,6 +31818,11 @@ pub fn shir_to_estree(prog: &IrProgram) -> Program {
     // strip here, BEFORE every analysis below (they must see the same
     // `init; while(cond){body; step}` shape the ingest path's CLI-level
     // strip produces; double-strip is a no-op).
+    //
+    // Verdict statics are process-global: hold the render-verdict lock for
+    // the whole install+emit pair so a concurrent in-process render cannot
+    // overwrite them mid-emission (see render_verdict_lock).
+    let _verdict_guard = render_verdict_lock();
     let mut stripped = prog.clone();
     crate::shir_passes::strip_cfor(&mut stripped);
     // builtin-op acceptance (shir-builtin-op-20260816): the estree
@@ -32277,7 +32741,7 @@ pub fn shir_to_estree_json(prog: &IrProgram) -> Result<String, serde_json::Error
 /// Conservative: rejects `$` (expansion), `(`, `)`, quotes, backslash,
 /// `!`, and any glob metacharacter inside the literal.
 #[derive(Debug, Clone, PartialEq)]
-enum CasePat {
+pub(crate) enum CasePat {
     Any,
     Substr(String),
     Prefix(String),
@@ -32423,7 +32887,7 @@ fn try_native_case_match(args: &[IrExpr]) -> Option<Expr> {
     ]))
 }
 
-fn classify_case_pat(pat: &str) -> Option<CasePat> {
+pub(crate) fn classify_case_pat(pat: &str) -> Option<CasePat> {
     // A quoted pattern (`"start"`, `''`) arrives with its quote chars; the
     // runtime's expandWord strips them (making a quoted `*a*` an ACTIVE
     // glob there too), so unwrap one pair of quotes before classifying.
@@ -32760,7 +33224,7 @@ fn glob_to_regex_segs(cs: &[char], i: &mut usize, out: &mut String) -> Option<()
 /// the alternation operator (`a|b` matches `a` or `b`). An escaped
 /// `\|` stays (a literal pipe); `|` inside `@(a|b)`-style parens stays
 /// (the extglob group's intrinsic alternation); quoted `|` stays.
-fn split_case_alternatives(pat: &str) -> Vec<String> {
+pub(crate) fn split_case_alternatives(pat: &str) -> Vec<String> {
     let mut out = Vec::new();
     let mut cur = String::new();
     let mut depth = 0i32;
@@ -36895,6 +37359,60 @@ fn stmt_to_estree(stmt: &IrStmt) -> Option<Stmt> {
             };
             Stmt::ExpressionStatement { expression: call }
         }
+        // ── Ext(GpuOp): the DEVICE WRITE the fbdev-gpu lift replaced ──
+        // `echo … > /dev/webgl/…` (or /dev/fb0/…) was lifted into a GPU-op
+        // node by transforms::fbdev_gpu so a backend with a GPU leg can emit
+        // a dispatch. ESTree has no GPU leg, and the pass's own contract
+        // (§4.4 "the correctness firewall") says a renderer without one must
+        // render the ORIGINAL write — that is what this arm does, rather
+        // than panic. Before it existed, a program with a device write made
+        // the whole estree render trap (mimecroft.sh: "Ext statement node
+        // (GpuOp) reached the ESTree renderer without a handler").
+        //
+        // TAG-GUARDED: the Ext arm further below handles the committed
+        // statement-level Ext renderings (ForEachLine/WalkDir) and refuses
+        // unknown tags loudly. Unguarded, THIS arm matched every Ext node
+        // first — silently, because #![allow(unreachable_patterns)] hides
+        // the shadowing — so ForEachLine fell into the `None =>
+        // unreachable!` below instead of its handler (estree
+        // json_writer_matches_serde panicked on `cat <<EOF`, poisoning a
+        // shared mutex and cascading ~207 collateral test failures).
+        IrStmt::Ext(n) if n.tag() == "GpuOp" => {
+            // The tag guard makes the downcast an invariant (tag/type
+            // agree); the match keeps the loud refusal if that invariant
+            // is ever broken.
+            let g = match crate::shir_nodes::ExtNode::as_any(&**n)
+                .downcast_ref::<crate::shir_nodes::GpuOp>()
+            {
+                Some(g) => g,
+                // an Ext node this renderer has no leg for: the old loud
+                // refusal, now only for nodes nobody has taught ESTree.
+                None => unreachable!(
+                    "Ext statement node ({}) reached the ESTree renderer without a handler",
+                    n.tag()),
+            };
+            let (device, verb, slot, payload) =
+                (g.device.clone(), g.verb.clone(), g.slot.clone(), g.payload.clone());
+            let path = if slot.is_empty() {
+                format!("{}/{}", device.trim_end_matches('/'), verb)
+            } else {
+                format!("{}/{}/{}", device.trim_end_matches('/'), slot, verb)
+            };
+            let write = crate::estree::sh2_call(
+                "fs.writeFile",
+                vec![
+                    Expr::Literal {
+                        value: serde_json::Value::String(path),
+                        raw: None,
+                        regex: None,
+                    },
+                    expr_to_estree(&payload),
+                ],
+            );
+            Stmt::ExpressionStatement {
+                expression: Expr::AwaitExpression { argument: Box::new(write) },
+            }
+        }
         IrStmt::Case {
             discriminant,
             clauses,
@@ -38274,7 +38792,17 @@ fn echo_join_args(echo_args: &[IrExpr]) -> Option<(Expr, bool, bool)> {
             // UNQUOTED $var wrapped by the core parser's field-split
             // marker: split(getVar(x)) — bash word-splits on IFS and DROPS
             // empty fields — `echo got $v` with v="" prints "got".
-            IrExpr::Call { func, args } if func == "split" => {
+            // ONLY the getVar-inner marker takes this path: other split
+            // shapes (the `${p#prefix}` strip split — split(param(...)) —
+            // from the split-fold lowering) carry the echo'd VALUE and must
+            // fall through to the generic arm below. Silently completing
+            // this arm without pushing dropped the arg (the joined result
+            // collapsed to "" — measured: `result=$(echo ${p#/})` estree
+            // printed an empty line while perl was correct).
+            IrExpr::Call { func, args }
+                if func == "split"
+                    && matches!(args.as_slice(), [IrExpr::Call { func: f, .. }] if f == "getVar") =>
+            {
                 if let [inner] = args.as_slice() {
                     if matches!(inner, IrExpr::Call { func: f, .. } if f == "getVar") {
                         // PROVABLY-NUMERIC vars: the field-split of a number
@@ -47092,6 +47620,28 @@ fn interp_pattern_expr(p: &str) -> Option<Expr> {
     out
 }
 
+/// Contract §5.7: the reader keeps one backslash level of a subst
+/// operand's source text; each CONSUMER applies bash's one level of
+/// removal before a literal use. Perl's arm does this in its render;
+/// this is the est side's copy (a `\x` that bash removes, a doubled
+/// `\\x` that survives as `\x`, anything else kept verbatim).
+fn unescape_one_level(s: &str) -> String {
+    let mut out = String::with_capacity(s.len());
+    let mut it = s.chars();
+    while let Some(c) = it.next() {
+        if c == '\\' {
+            if let Some(c2) = it.next() {
+                out.push(c2);
+            } else {
+                out.push('\\');
+            }
+        } else {
+            out.push(c);
+        }
+    }
+    out
+}
+
 fn try_native_param(args: &[IrExpr]) -> Option<Expr> {
     let [IrExpr::Str(op, _), IrExpr::Str(name, _), ..] = args else {
         return None;
@@ -47496,20 +48046,31 @@ fn try_native_param(args: &[IrExpr]) -> Option<Expr> {
             let [_, _, IrExpr::Str(p, _), IrExpr::Str(r, _), ..] = args else {
                 return None;
             };
-            let rep = fully_lifted_template(r)?;
-            if literal_pattern(p) {
+            // Contract §5.7: the operand arrives as the SOURCE text (one
+            // backslash level still intact — the reader keeps it so two
+            // shells stay distinguishable) and THIS consumer applies
+            // bash's one level of removal before the literal use:
+            // `${v/Q/\c}` → pattern `c`, `${v/Q/\\c}` → `\c`,
+            // `${v/\"/Z}` → `"`. Without it the literal fast path matched
+            // the RAW text (`\"` never matches the `"` bash expanded —
+            // measured: 062_09's `${3//\"/\\\"}` became a no-op replaceAll
+            // where perl/bash print the escaped result).
+            let p = unescape_one_level(p);
+            let r = unescape_one_level(r);
+            let rep = fully_lifted_template(&r)?;
+            if literal_pattern(&p) {
                 if r.contains('$') {
                     if op == "/" {
                         return None; // first-match splice needs the runtime
                     }
                     return Some(method(
-                        method(val(), "split", vec![str_lit(p)]),
+                        method(val(), "split", vec![str_lit(&p)]),
                         "join",
                         vec![rep],
                     ));
                 }
                 let m = if op == "/" { "replace" } else { "replaceAll" };
-                return Some(method(val(), m, vec![str_lit(p), rep]));
+                return Some(method(val(), m, vec![str_lit(&p), rep]));
             }
             // SINGLE bracket-class pattern (`${x//[^a-zA-Z0-9]/_}`): a
             // glob class matches exactly ONE char and the runtime's
@@ -52204,6 +52765,72 @@ fn expr_to_estree(e: &IrExpr) -> Expr {
                     ]);
                 }
             }
+            // The case-lowering transform's shared `globMatch(value,
+            // pattern)` predicate (char-class / `?` / mid-star case
+            // clauses): ONE runtime call instead of a whole-case refusal.
+            // `sh2.globMatch` is the exact matcher `sh2.caseMatch`
+            // dispatches with, so the predicate is equivalent to the
+            // native case render it replaces — same status-recording
+            // protocol as `contains` above (native_and_or's lastExit
+            // contract for &&/|| chains; `!globMatch` derives from the
+            // boolean like `!contains`).
+            if func == "globMatch" {
+                if let [v, p] = args.as_slice() {
+                    let native = Expr::CallExpression {
+                        callee: Box::new(Expr::MemberExpression {
+                            object: Box::new(Expr::Identifier {
+                                name: "sh2".to_string(),
+                            }),
+                            property: Box::new(Expr::Identifier {
+                                name: "globMatch".to_string(),
+                            }),
+                            computed: false,
+                            optional: false,
+                        }),
+                        // runtime order is globMatch(pattern, value)
+                        arguments: vec![
+                            expr_to_estree(p),
+                            Expr::CallExpression {
+                                callee: Box::new(Expr::Identifier {
+                                    name: "String".to_string(),
+                                }),
+                                arguments: vec![expr_to_estree(v)],
+                                optional: false,
+                            },
+                        ],
+                        optional: false,
+                    };
+                    if *AND_OR_DEPTH.lock().unwrap() == 0 {
+                        return native;
+                    }
+                    let tmp = sh2_member("_g");
+                    return seq(vec![
+                        Expr::AssignmentExpression {
+                            operator: "=".to_string(),
+                            left: Box::new(tmp.clone()),
+                            right: Box::new(native),
+                        },
+                        Expr::AssignmentExpression {
+                            operator: "=".to_string(),
+                            left: Box::new(sh2_member("lastExit")),
+                            right: Box::new(Expr::ConditionalExpression {
+                                test: Box::new(tmp.clone()),
+                                consequent: Box::new(Expr::Literal {
+                                    value: serde_json::Value::from(0),
+                                    raw: None,
+                                    regex: None,
+                                }),
+                                alternate: Box::new(Expr::Literal {
+                                    value: serde_json::Value::from(1),
+                                    raw: None,
+                                    regex: None,
+                                }),
+                            }),
+                        },
+                        tmp,
+                    ]);
+                }
+            }
             // `line(s, i)` — the i-th line of a captured multi-value
             // return (the out-param transform's multi-write destructure,
             // core request c-multi-return). Rendered NATIVE so a
@@ -53799,11 +54426,58 @@ fn expr_to_estree(e: &IrExpr) -> Expr {
                 BinOpKind::Ge => ">=",
                 _ => unreachable!("comparison arm: non-comparison op {op:?}"),
             };
-            Expr::BinaryExpression {
+            let cmp = Expr::BinaryExpression {
                 operator: js_op.to_string(),
                 left: Box::new(l),
                 right: Box::new(r),
+            };
+            // Chain-link status record — the SAME contract the `test` /
+            // `contains` / `strHasPrefix` / `strHasSuffix` arms honour:
+            // the statement-level `&&`/`||` arm branches on
+            // `sh2.lastExit` (native_and_or's protocol), which a bare
+            // comparison never writes. The test-lowering's statement
+            // chain rewrite turns `[[ … ]] && cmd`'s leaf into a typed
+            // BinOp, so without this wrap the guard read a STALE
+            // lastExit (measured: func-after-or-assign's
+            // `[ -n "${VAR}" ] || VAR=default` skipped the assignment
+            // and printed `hello ` where bash prints `hello default`).
+            // The operands are Var/Str/Arith (pure — the lowering's
+            // operand gate), so the `_g` scratch evaluates cmp exactly
+            // once, mirroring the test arm's protocol. Unstatused
+            // chains (compute_test_cond_deadness — a dead pure
+            // if/while guard) keep the bare form, like the test arm's
+            // depth>0 + UNSTATUSED branch.
+            if *AND_OR_DEPTH.lock().unwrap() > 0
+                && *TEST_UNSTATUSED_DEPTH.lock().unwrap() == 0
+            {
+                let tmp = sh2_member("_g");
+                return seq(vec![
+                    Expr::AssignmentExpression {
+                        operator: "=".to_string(),
+                        left: Box::new(tmp.clone()),
+                        right: Box::new(cmp),
+                    },
+                    Expr::AssignmentExpression {
+                        operator: "=".to_string(),
+                        left: Box::new(sh2_member("lastExit")),
+                        right: Box::new(Expr::ConditionalExpression {
+                            test: Box::new(tmp.clone()),
+                            consequent: Box::new(Expr::Literal {
+                                value: serde_json::Value::from(0),
+                                raw: None,
+                                regex: None,
+                            }),
+                            alternate: Box::new(Expr::Literal {
+                                value: serde_json::Value::from(1),
+                                raw: None,
+                                regex: None,
+                            }),
+                        }),
+                    },
+                    tmp,
+                ]);
             }
+            cmp
         }
         // The A1 `Regex` expr node (core request fish-sh-go-20260813-192709):
         // the fish `string match -r` lowering and the bash `=~` family share
@@ -54188,10 +54862,15 @@ fn interpolate_to_estree(parts: &[InterpPart]) -> Expr {
         }
     }
     quasis.push(quasi_element(&mut raw, true));
-    Expr::TemplateLiteral {
+    // `echo "word"` — an all-literal Interpolate is the string `word`, and
+    // the direct shell→estree path (`ast_to_estree` via `Str`) emits a plain
+    // Literal for it. Without this fold the A1-ingress render (the page)
+    // and the direct compile emit different ESTree for the same source
+    // (`` `word` `` vs `"word"`), e.g. inside a brace-list `for` body.
+    crate::estree::literal_if_template_has_no_expr(Expr::TemplateLiteral {
         quasis,
         expressions,
-    }
+    })
 }
 
 fn array(elements: Vec<Expr>) -> Expr {
@@ -57699,8 +58378,15 @@ if printf "%s\n" "$x" | grep world > /dev/null; then echo yes; fi"#;
         let cmds = crate::Parser::new(src).parse().expect("parse");
         let prog = ast_to_ir(&cmds);
         let perl = crate::ir::shir_to_perl(&prog);
+        // The lift must fire — a native `index` contains-check carrying the
+        // grep needle — whatever the haystack's spelling: with
+        // copy-propagation folding the single quoted def, the printf operand
+        // arrives already inlined (`index("hello world", 'world') >= 0`),
+        // which is the same lift and the same semantics (the byte-level
+        // output is what the corpus gate checks). Pinning the `index($x, …)`
+        // spelling would pin one operand representation, not the lift.
         assert!(
-            perl.contains("index($x, 'world') >= 0"),
+            perl.contains("index(") && perl.contains("'world') >= 0"),
             "printf|grep must lift to native contains: {perl}"
         );
         assert!(
@@ -60149,6 +60835,23 @@ mod static_word_list_tests {
     }
 
     #[test]
+    fn glob_tagged_element_is_not_static() {
+        // An unquoted glob word carries the \x01SH2GLOB\x01 marker: it must
+        // expand against the filesystem at runtime, so a list containing it
+        // is NOT a compile-time literal. Returning the tagged text would bake
+        // the sentinel into the backend's literal emission (the Rust
+        // `for`-iterand fast path printed `Text file: \x01SH2GLOB\x01*.txt`).
+        let tagged = format!("{}*.txt", "\u{1}SH2GLOB\u{1}");
+        assert_eq!(static_word_list(&[s(&tagged)]), None);
+        assert_eq!(static_word_list(&[s("a"), s(&tagged)]), None);
+        // a plain literal list stays static
+        assert_eq!(
+            static_word_list(&[s("a"), s("*.txt")]),
+            Some(vec!["a".to_string(), "*.txt".to_string()])
+        );
+    }
+
+    #[test]
     fn dynamic_element_is_not_static() {
         // a variable read is not a compile-time literal
         assert_eq!(static_word_list(&[s("a"), IrExpr::Var("y".to_string(), None)]), None);
@@ -61092,5 +61795,147 @@ mod opaque_text_harvest_tests {
         assert!(!harvest("arr[$i]").contains("A"));
         // A multi-char identifier must survive whole, not as letters.
         assert!(harvest("$a1_b").contains("a1_b"));
+    }
+}
+
+#[cfg(test)]
+mod bare_expansion_split_tests {
+    use super::*;
+    use crate::ast::{ParameterExpansion, ParameterExpansionOperator as Op, Word};
+
+    fn subst() -> ParameterExpansion {
+        ParameterExpansion {
+            variable: "v".to_string(),
+            operator: Op::SubstituteFirst("Q".to_string(), "x".to_string()),
+            is_mutable: false,
+        }
+    }
+
+    fn strs_of(e: &IrExpr) -> Vec<String> {
+        match e {
+            IrExpr::Str(s, _) => vec![s.clone()],
+            other => panic!("expected Str, got {other:?}"),
+        }
+    }
+
+    /// A BARE `${...}` in exec-arg position carries the A1 `split` marker:
+    /// `v="a b"; printf %s ${v/Q/x}` passes TWO arguments on IFS, while
+    /// `printf %s "${v/Q/x}"` passes one. Before this arm the two sources
+    /// emitted byte-identical shIR (measured — a raw-shIR collision), so
+    /// no backend could be right for both.
+    #[test]
+    fn a_bare_substitution_splits_in_exec_arg_position() {
+        let w = Word::ParameterExpansion(subst(), None);
+        match arg_word_ir(&w, false) {
+            IrExpr::Call { func, args, .. } => {
+                assert_eq!(func, "split");
+                assert_eq!(args.len(), 1);
+                match &args[0] {
+                    IrExpr::Call { func, args, .. } => {
+                        assert_eq!(func, "param");
+                        let got: Vec<String> = args.iter().flat_map(strs_of).collect();
+                        assert_eq!(got, ["/", "v", "Q", "x"]);
+                    }
+                    other => panic!("expected param(..), got {other:?}"),
+                }
+            }
+            other => panic!("expected split(..), got {other:?}"),
+        }
+    }
+
+    /// The same expansion in an ARRAY ELEMENT splits the same way
+    /// (`arr=(${v/Q/x})` splits the result on IFS).
+    #[test]
+    fn a_bare_substitution_splits_in_array_element_position() {
+        let w = Word::ParameterExpansion(subst(), None);
+        assert!(
+            matches!(array_element_ir(&w), IrExpr::Call { func, .. } if func == "split"),
+            "array elements field-split like exec args"
+        );
+    }
+
+    /// A QUOTED occurrence arrives inside a StringInterpolation and stays
+    /// ONE argument — the distinction the `split` marker exists to carry.
+    #[test]
+    fn a_quoted_substitution_does_not_split() {
+        let w = Word::StringInterpolation(
+            crate::ast::StringInterpolation {
+                parts: vec![crate::ast::StringPart::ParameterExpansion(subst())],
+            },
+            None,
+        );
+        match arg_word_ir(&w, false) {
+            IrExpr::Call { func, args, .. } => {
+                assert_eq!(func, "param", "quoted: one argument, no split");
+                let got: Vec<String> = args.iter().flat_map(strs_of).collect();
+                assert_eq!(got, ["/", "v", "Q", "x"]);
+            }
+            other => panic!("expected param(..), got {other:?}"),
+        }
+    }
+
+    /// `${v}` (Op::None) keeps its existing single-field lowering — it
+    /// already reaches the getVar/split contract and must not double-split.
+    #[test]
+    fn a_plain_bare_expansion_keeps_its_form() {
+        let pe = ParameterExpansion {
+            variable: "v".to_string(),
+            operator: Op::None,
+            is_mutable: true,
+        };
+        let w = Word::ParameterExpansion(pe, None);
+        let ir = arg_word_ir(&w, false);
+        let is_split = matches!(&ir, IrExpr::Call { func, .. } if func == "split");
+        assert!(
+            !is_split,
+            "Op::None keeps the existing lowering: {ir:?}"
+        );
+    }
+}
+
+// ── the Ext(GpuOp) ESTree arm ─────────────────────────────────────────
+// A device write (`echo … > /dev/webgl/…`) lifted by transforms::fbdev_gpu
+// must render as the ORIGINAL write on a backend with no GPU leg (§4.4's
+// correctness firewall). Before the arm existed the whole estree render
+// trapped with "Ext statement node (GpuOp) reached the ESTree renderer
+// without a handler".
+#[cfg(test)]
+mod gpuop_estree_tests {
+    use super::*;
+
+    fn lift(src: &str) -> Vec<IrStmt> {
+        let (cmds, _lines) = crate::Parser::new(src).parse_with_lines().unwrap();
+        let mut prog = crate::shir::ast_to_ir(&cmds);
+        crate::transforms::fbdev_gpu::transform(&mut prog.stmts);
+        prog.stmts
+    }
+
+    #[test]
+    fn gpuop_lifts_and_estree_renders_it() {
+        let stmts = lift("echo 1 > /dev/webgl/call\n");
+        assert!(stmts.iter().any(|s| matches!(s, IrStmt::Ext(n) if n.tag() == "GpuOp")),
+            "the lift did not fire: {stmts:?}");
+        let est = stmt_to_estree(&stmts[0]).expect("GpuOp must render");
+        let js = crate::estree::estree_to_json(&crate::estree::Program {
+            type_: "Program",
+            source_type: "module",
+            body: vec![est],
+        });
+        assert!(js.contains("/dev/webgl/call"), "the original device path must survive: {js}");
+        assert!(!js.contains("GpuOp"), "no IR leak into the ESTree JSON: {js}");
+    }
+
+    #[test]
+    fn gpuop_uniform_slot_path() {
+        let stmts = lift("echo 0.5 > /dev/fb0/uniform/1f/uCamYaw\n");
+        assert!(stmts.iter().any(|s| matches!(s, IrStmt::Ext(n) if n.tag() == "GpuOp")),
+            "the uniform lift did not fire: {stmts:?}");
+        let est = stmt_to_estree(&stmts[0]).expect("GpuOp must render");
+        let js = crate::estree::estree_to_json(&crate::estree::Program {
+            type_: "Program",
+            source_type: "module",
+            body: vec![est],
+        });
+        assert!(js.contains("/dev/fb0/uniform/1f/uCamYaw"), "slot path: {js}");
     }
 }

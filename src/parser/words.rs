@@ -2107,6 +2107,14 @@ fn parse_word_no_newline_skip_inner(lexer: &mut Lexer) -> Result<Word, ParserErr
 }
 
 pub fn parse_variable_expansion(lexer: &mut Lexer) -> Result<Word, ParserError> {
+    let w = parse_variable_expansion_inner(lexer)?;
+    // A bare `${...}`: both operand kinds follow the unquoted word rule.
+    Ok(unescape_word_operands(w, false))
+}
+
+/// The parser proper; `parse_variable_expansion` wraps it to apply the
+/// operand backslash rules. Do not call this directly from new code.
+fn parse_variable_expansion_inner(lexer: &mut Lexer) -> Result<Word, ParserError> {
     match lexer.peek() {
         Some(Token::Dollar) => {
             lexer.next();
@@ -3381,15 +3389,239 @@ fn parse_string_interpolation(lexer: &mut Lexer) -> Result<Word, ParserError> {
 }
 
 /// The double-quoted-string content preprocessing shared by both
-/// interpolation scanners: `\"` → `"`, `\\` → `\`, and backslash-newline
-/// line continuations are removed (the lexer's DoubleQuotedString regex
-/// captures them inside the token).
+/// interpolation scanners.
+///
+/// It resolves ONLY the two escapes that change how the content is SCANNED:
+/// `\"` → `"` (an escaped quote must not terminate or open anything) and
+/// backslash-newline line continuations (the lexer's DoubleQuotedString regex
+/// captures them inside the token). Every other escape is left intact for
+/// `scan_interpolation_parts`, which knows which of them is literal.
+///
+/// This has to be ONE left-to-right pass, not the chained `str::replace`
+/// calls it used to be. `.replace("\\\\", "\\")` collapses a doubled
+/// backslash but leaves the SINGLE remaining backslash in front of whatever
+/// followed the pair, so the scanner then re-read it as an escape of that
+/// character — a second, extra level of unescaping that bash never applies:
+/// (`printf '%s\n' "a\\$b"` prints `a\`: bash collapses `\\` to one
+/// literal backslash and then expands the unset `$b`; the collapsed text
+/// `a\$b` reached the scanner as an escaped dollar and printed the literal
+/// `a$b`). Measured against bash, the pre-pass corrupted EVERY `\\` followed
+/// by `$` or by a backtick.
+///
+/// It is also what makes the raw shIR contract able to tell two DIFFERENT
+/// shells apart. `parse_parameter_expansion_content` slices its operands out
+/// of this string verbatim, and bash applies exactly one level of backslash
+/// removal to a pattern/replacement (`${v/Q/\c}` → `c`, `${v/Q/\\c}` → `\c`,
+/// `${v/Q/\\\c}` → `\c`). While the pre-pass collapsed `\\`, those three
+/// sources all reached it as the same `\c`, so the shIR could not distinguish
+/// them and no renderer could be correct for all three.
 fn unescape_interpolation_content(content: &str) -> String {
-    content
-        .replace("\\\"", "\"")
-        .replace("\\\\", "\\")
-        .replace("\\\n", "")
-        .replace("\\\r\n", "")
+    let mut out = String::with_capacity(content.len());
+    let mut chars = content.chars().peekable();
+    // `${`...`}` nesting depth. INSIDE an expansion the `\"` pair is NOT
+    // collapsed: the operand's quote-escape count is part of the raw shIR
+    // contract (§5.7 of docs/backend-universal-contract.md) —
+    // `"${v/Q/\"}"` (bash replaces with `"`) must stay distinguishable
+    // from `"${v/Q/"}"` (bash exits 2) and from the bare `${v/Q/"}`
+    // (bash removes the quotes). Collapsing all three to operand `"` was
+    // a raw-shIR collision: one contract, two different shells.
+    let mut expansion_depth: usize = 0;
+    while let Some(c) = chars.next() {
+        if c != '\\' {
+            if c == '$' && chars.peek() == Some(&'{') {
+                out.push('$');
+                out.push(chars.next().unwrap());
+                expansion_depth += 1;
+                continue;
+            }
+            if expansion_depth > 0 {
+                match c {
+                    '{' => expansion_depth += 1,
+                    '}' => expansion_depth = expansion_depth.saturating_sub(1),
+                    _ => {}
+                }
+            }
+            out.push(c);
+            continue;
+        }
+        match chars.peek().copied() {
+            // `\"` — the quote is a literal of the content and cannot close
+            // (or reopen) anything. OUTSIDE `${...}` it collapses to `"`;
+            // INSIDE it stays `\"` so the operand keeps the source's escape
+            // count (the pattern consumers strip one level, per §5.7).
+            Some('"') if expansion_depth > 0 => {
+                chars.next();
+                out.push('\\');
+                out.push('"');
+            }
+            Some('"') => {
+                chars.next();
+                out.push('"');
+            }
+            // A backslash-newline line continuation disappears entirely.
+            Some('\n') => {
+                chars.next();
+            }
+            // CRLF continuation; a lone CR is ordinary text.
+            Some('\r') => {
+                let mut look = chars.clone();
+                look.next();
+                if look.peek() == Some(&'\n') {
+                    chars.next();
+                    chars.next();
+                } else {
+                    out.push('\\');
+                }
+            }
+            // EVERYTHING else — including `\$`, `\`` and a doubled `\\` —
+            // is handed to the scanner, which turns each of them into the
+            // right literal. Keeping the pair whole is what stops the
+            // leftover backslash from eating the following character.
+            Some(other) => {
+                chars.next();
+                out.push('\\');
+                out.push(other);
+            }
+            None => out.push('\\'),
+        }
+    }
+    out
+}
+
+/// The VALUE of a `:-` / `-` / `:=` / `=` / `:+` / `+` / `:?` / `?` operand
+/// is an ordinary WORD, so its backslashes follow the word rule of the
+/// enclosing context:
+///
+/// * inside double quotes only `\"` and `\\` lose the backslash and `\X` for
+///   any other X keeps it — `"${u:-\c}"` and `"${u:-\\c}"` both print `\c`,
+///   and `"${u:-\$c}"` prints the literal `$c` (measured);
+/// * in a bare word every `\X` loses the backslash — `${u:-\c}` prints `c`
+///   and `${u:-\\c}` prints `\c` (measured).
+fn unescape_value_operand(s: &str, in_dqs: bool) -> String {
+    let mut out = String::with_capacity(s.len());
+    let mut chars = s.chars();
+    while let Some(c) = chars.next() {
+        if c != '\\' {
+            out.push(c);
+            continue;
+        }
+        match chars.next() {
+            // A backslash-newline continuation disappears entirely.
+            Some('\n') => {}
+            Some(d) => {
+                if in_dqs {
+                    if !matches!(d, '"' | '\\') {
+                        out.push('\\');
+                    }
+                    out.push(d);
+                } else if d == '"' || d == '\'' {
+                    // A BARE word: the quote CHARACTERS are removed, their
+                    // content is literal (bash `${u:-"x"}` prints `x`,
+                    // measured). Without this the shIR kept operand `"x"`
+                    // — the same bytes the valid DQS `"${u:-\"x\"}"`
+                    // legitimately carries — one contract, two shells.
+                } else {
+                    out.push(d);
+                }
+            }
+            None => out.push('\\'),
+        }
+    }
+    out
+}
+
+/// Apply [`unescape_value_operand`] to a freshly parsed expansion's VALUE
+/// operands. Called through the wrappers on the two `${...}` parsers below, so
+/// no consumer of the AST can see the raw value text.
+///
+/// The PATTERN operands (`/`, `//`, `#`, `##`, `%`, `%%`) are deliberately left
+/// exactly as they were sliced out of the source. bash removes one level of
+/// backslash escaping from them (`"${v/Q/\c}"` replaces with `c`, `"${v/Q/\\c}"`
+/// with `\c`), but that removal belongs to the code that knows it is building a
+/// PATTERN, not here: a pattern's translation has to tell an escaped
+/// metacharacter from a live one — `${v/\*/x}` replaces a literal `*` while
+/// `${v/*/x}` replaces everything up to the first separator — and once the
+/// removal has run, `\*` and `*` are the same text. `glob_to_regex` /
+/// `repl_for_regex` in the renderer apply the removal where the distinction is
+/// still available.
+///
+/// Measured against bash for `\c`, `\\c`, `\\\c`, `\\\\c`, `\Q`, `\\Q`, `\ `,
+/// `\$` in every pattern operator, quoted and bare.
+fn unescape_expansion_operands(pe: &mut crate::ast::ParameterExpansion, in_dqs: bool) {
+    use crate::ast::ParameterExpansionOperator as Op;
+    match &mut pe.operator {
+        Op::DefaultValue(v) | Op::AssignDefault(v) | Op::ErrorIfUnset(v) => {
+            *v = unescape_value_operand(v, in_dqs);
+        }
+        _ => {}
+    }
+}
+
+/// Same, for a `Word` that came straight out of the source.
+fn unescape_word_operands(mut w: crate::ast::Word, in_dqs: bool) -> crate::ast::Word {
+    match &mut w {
+        crate::ast::Word::ParameterExpansion(pe, _) => unescape_expansion_operands(pe, in_dqs),
+        crate::ast::Word::StringInterpolation(si, _) => {
+            for part in si.parts.iter_mut() {
+                if let crate::ast::StringPart::ParameterExpansion(pe) = part {
+                    unescape_expansion_operands(pe, in_dqs);
+                }
+            }
+        }
+        _ => {}
+    }
+    w
+}
+
+/// A raw (unescaped) `"` inside `${...}` of a DOUBLE-QUOTED string is a
+/// bash quote TOGGLE that spans the expansion. bash lexes the whole WORD
+/// with quote toggling and then removes the toggled quotes, so:
+///
+/// * `"${u:-"x"}"` is ONE word whose net operand is `x` (bash prints
+///   `x`) — an even number of raw quotes, stripped here;
+/// * `"${v/Q/"}"` leaves the word unterminated (the `}` lands outside the
+///   expansion) and bash exits 2 — an odd number, a parse error.
+///
+/// `\"` (odd backslash parity) is the ESCAPED form and is left whole —
+/// the operand's escape count is part of the raw shIR contract (§5.7).
+/// Accepting raw and escaped quotes as the same operand was a raw-shIR
+/// collision: `"${v/\"/Z}"` (replaces a literal `"`) and `"${v/"/Z}"`
+/// (bash exit 2) emitted byte-identical shIR.
+fn strip_toggle_dquotes(s: &str) -> Result<String, ParserError> {
+    let b = s.as_bytes();
+    let mut out = String::with_capacity(s.len());
+    let mut raw = 0usize;
+    let mut i = 0;
+    while i < b.len() {
+        match b[i] {
+            b'\\' => {
+                // An escape pair: the escaped char cannot be a raw quote.
+                if i + 1 < b.len() {
+                    out.push('\\');
+                    out.push(b[i + 1] as char);
+                    i += 2;
+                } else {
+                    out.push('\\');
+                    i += 1;
+                }
+            }
+            b'"' => {
+                raw += 1;
+                i += 1;
+            }
+            _ => {
+                let ch = s[i..].chars().next().unwrap_or('?');
+                out.push(ch);
+                i += ch.len_utf8();
+            }
+        }
+    }
+    if raw % 2 == 1 {
+        return Err(ParserError::InvalidSyntax(
+            "unterminated quote inside `${...}` in a double-quoted string".to_string(),
+        ));
+    }
+    Ok(out)
 }
 
 /// Scan a double-quoted string's content into interpolation parts:
@@ -3410,44 +3642,22 @@ fn scan_interpolation_parts(content: &str) -> Result<Vec<StringPart>, ParserErro
 
     while i < content.len() {
         let _ch = content.chars().nth(i).unwrap_or('?');
-        if content[i..].starts_with("\\\\`") {
-            // We found an escaped backtick command substitution
-            // First, add any accumulated literal text
-            if !current_literal.is_empty() {
-                parts.push(StringPart::Literal(current_literal.clone()));
-                current_literal.clear();
-            }
-
-            // Find the closing escaped backtick
-            i += 3; // skip the \\`
-            let cmd_start = i;
-            while i < content.len() && !content[i..].starts_with("\\\\`") {
-                let ch = content[i..].chars().next().unwrap_or('?');
-                i += ch.len_utf8();
-            }
-
-            if i < content.len() {
-                // We found a complete escaped command substitution
-                let cmd_content = &content[cmd_start..i];
-                i += 3; // skip the closing \\`
-
-                // Parse the command content as a pipeline (to handle pipes)
-                if let Ok(cmd) = crate::parser::commands::parse_pipeline_from_text(cmd_content) {
-                    parts.push(StringPart::CommandSubstitution(Box::new(cmd)));
-                } else {
-                    // Fall back to treating it as a literal
-                    parts.push(StringPart::Literal(format!("\\\\`{}\\\\`", cmd_content)));
-                }
-            } else {
-                // Unmatched escaped backtick (`\\\`` = escaped backslash
-                // + escaped backtick in a DQS): bash consumes BOTH escapes —
-                // `\\` → `\` and `\`` → a literal backtick — so the
-                // literal text is `\`` (one backslash + backtick), NOT the
-                // raw `\\\``. (echo-with-escaped-backtick.sh: top-level
-                // DQS `\`` with no closing pair.)
-                parts.push(StringPart::Literal("\\`".to_string()));
-                i = cmd_start;
-            }
+        if content[i..].starts_with("\\\\") {
+            // A literal backslash. The pre-pass leaves `\\` alone on purpose
+            // (see `unescape_interpolation_content`); consuming the pair HERE
+            // rather than there is what keeps the pair's meaning local, so
+            // whatever follows it is still scanned normally: "a\\$b" is a
+            // literal backslash followed by the expansion of `$b`, and
+            // "a\\`x`" is a literal backslash followed by a command
+            // substitution.
+            //
+            // This arm has to stay FIRST among the backslash arms. In the old
+            // pre-collapsed form `\\`` meant "an escaped backtick
+            // substitution", and it was read as exactly that, so
+            // "a\\`echo hi\\`b" ran `echo hi` where bash prints a backslash
+            // followed by the substitution's output (measured).
+            current_literal.push('\\');
+            i += 2;
         } else if content[i..].starts_with("\\`") {
             // We found a single-escaped backtick command substitution
             // First, add any accumulated literal text
@@ -3697,6 +3907,12 @@ fn scan_interpolation_parts(content: &str) -> Result<Vec<StringPart>, ParserErro
                     // We found a complete parameter expansion
                     let expansion_content = &content[expansion_start..i - 1]; // -1 to exclude the closing }
 
+                    // A raw `"` toggles the quoting across the expansion:
+                    // stripped when balanced, a parse error (bash exit 2)
+                    // when not (see strip_toggle_dquotes).
+                    let expansion_content = strip_toggle_dquotes(expansion_content)?;
+                    let expansion_content = expansion_content.as_str();
+
                     // Parse the parameter expansion content
                     if let Ok(expansion_word) = parse_parameter_expansion_content(expansion_content)
                     {
@@ -3873,6 +4089,13 @@ fn scan_interpolation_parts(content: &str) -> Result<Vec<StringPart>, ParserErro
 
                 if brace_count == 0 {
                     let expansion_content = &content[expansion_start..i - 1];
+                    // Same rule as the identical arm in
+                    // parse_string_interpolation: a raw `"` toggles the
+                    // quoting across the expansion — stripped when
+                    // balanced, bash's exit 2 when not (see
+                    // strip_toggle_dquotes).
+                    let expansion_content = strip_toggle_dquotes(expansion_content)?;
+                    let expansion_content = expansion_content.as_str();
                     if let Ok(expansion_word) = parse_parameter_expansion_content(expansion_content)
                     {
                         parts.push(StringPart::ParameterExpansion(expansion_word));
@@ -4047,6 +4270,18 @@ fn split_zsh_subscript_flag(key: &str) -> Option<(String, String)> {
 }
 
 pub fn parse_parameter_expansion_content(content: &str) -> Result<ParameterExpansion, ParserError> {
+    let mut pe = parse_parameter_expansion_content_inner(content)?;
+    // A double-quoted `${...}`: the VALUE operand follows the double-quote
+    // rule, the pattern operands the pattern rule (see the helpers above).
+    unescape_expansion_operands(&mut pe, true);
+    Ok(pe)
+}
+
+/// The parser proper; `parse_parameter_expansion_content` wraps it to apply
+/// the operand backslash rules. Do not call this directly from new code.
+fn parse_parameter_expansion_content_inner(
+    content: &str,
+) -> Result<ParameterExpansion, ParserError> {
     // Parse parameter expansion content like "arr[1]", "map[foo]", "#arr[@]", etc.
 
     // zsh `${(flags)...}` flag prefix (core request
@@ -4648,9 +4883,15 @@ fn parse_ansic_quoted_string(lexer: &mut Lexer) -> Result<Word, ParserError> {
                     'v' => result.push('\x0B'), // Vertical tab
                     '\\' => result.push('\\'),  // Backslash
                     '\'' => result.push('\''),  // Single quote
-                    '"' => result.push('"'),    // Double quote
-                    '?' => result.push('?'),    // Question mark
-                    '0' => result.push('\0'),   // Null byte
+                    '"' => result.push('"'),    // Double quote                    '?' => result.push('?'), // Question mark
+                    // bash STRIPS NUL bytes out of a `$'…'` string
+                    // (documented: "NUL characters are ignored"), so
+                    // `$'\0'`/`$'\x00'` are the empty string. Emitting a
+                    // literal NUL flipped realpath-cmdsub's
+                    // `[[ "$stdout" == *$'\x00'* ]]` guard: bash's empty
+                    // pattern `**` matches everything (od branch taken),
+                    // while the NUL pattern matched nothing.
+                    '0' => {}
                     'x' => {
                         // Hex escape: \xHH
                         let mut hex_chars = String::new();
@@ -4671,7 +4912,10 @@ fn parse_ansic_quoted_string(lexer: &mut Lexer) -> Result<Word, ParserError> {
                             }
                         }
                         if let Ok(byte_val) = u8::from_str_radix(&hex_chars, 16) {
-                            result.push(byte_val as char);
+                            // NUL stripped, as above
+                            if byte_val != 0 {
+                                result.push(byte_val as char);
+                            }
                         } else {
                             return Err(ParserError::InvalidSyntax(format!(
                                 "Invalid hex value: {}",
@@ -5633,4 +5877,157 @@ fn parse_simple_command_from_text(text: &str) -> Result<Command, ParserError> {
     });
 
     Ok(cmd)
+}
+
+
+#[cfg(test)]
+mod backslash_operand_tests {
+    use super::*;
+    use crate::ast::{ParameterExpansionOperator as Op, StringPart};
+
+    fn params(body: &str) -> crate::ast::ParameterExpansion {
+        parse_parameter_expansion_content(body).expect("parses")
+    }
+
+    /// THE reason the raw contract has to keep the source's backslashes: bash
+    /// removes exactly one level from a pattern/replacement, so these four
+    /// sources are FOUR different expansions. Before the double-quote pre-pass
+    /// stopped collapsing `\\`, all of them reached the operand as the same
+    /// `\c`, and no renderer could be right for more than one.
+    #[test]
+    fn a_pattern_operand_keeps_the_sources_backslash_count() {
+        for (body, want_pat, want_rep) in [
+            (r"v/Q/\c", "Q", r"\c"),
+            (r"v/Q/\\c", "Q", r"\\c"),
+            (r"v/Q/\\\c", "Q", r"\\\c"),
+            (r"v/Q/\\\\c", "Q", r"\\\\c"),
+            (r"v/\Q/Z", r"\Q", "Z"),
+            (r"v/\\Q/Z", r"\\Q", "Z"),
+            (r"v/Q/\$c", "Q", r"\$c"),
+            (r"v/Q/\\$c", "Q", r"\\$c"),
+        ] {
+            match params(body).operator {
+                Op::SubstituteFirst(p, r) => {
+                    assert_eq!(p, want_pat, "pattern of {body}");
+                    assert_eq!(r, want_rep, "replacement of {body}");
+                }
+                other => panic!("{body}: expected a / substitution, got {other:?}"),
+            }
+        }
+        // The prefix/suffix operators take the same treatment.
+        match params(r"v#\Q").operator {
+            Op::RemoveShortestPrefix(p) => assert_eq!(p, r"\Q"),
+            other => panic!("expected a # removal, got {other:?}"),
+        }
+        match params(r"v##*[/\\]").operator {
+            Op::RemoveLongestPrefix(p) => assert_eq!(p, r"*[/\\]"),
+            other => panic!("expected a ## removal, got {other:?}"),
+        }
+    }
+
+    /// A `:-`-family VALUE is an ordinary word, so it follows the quoting
+    /// context: inside double quotes `\c` keeps its backslash, in a bare word
+    /// it loses it (measured against bash, both directions).
+    #[test]
+    fn a_default_value_follows_the_quoting_context() {
+        let dqs = |body: &str| match params(body).operator {
+            Op::DefaultValue(v) => v,
+            other => panic!("expected a :- default, got {other:?}"),
+        };
+        assert_eq!(dqs(r"u:-\c"), r"\c", "double-quoted `\\c` keeps it");
+        assert_eq!(dqs(r"u:-\\c"), r"\c", "double-quoted `\\\\c` collapses");
+        assert_eq!(dqs(r"u:-\\\c"), r"\\c");
+        assert_eq!(dqs(r"u:-\$c"), r"\$c", "the escape survives for `$`");
+        assert_eq!(dqs(r"u:-\ "), r"\ ");
+        assert_eq!(dqs(r"u:-\ "), r"\ ");
+
+        let bare = |s: &str| match parse_variable_expansion(&mut Lexer::new(s))
+            .expect("parses")
+        {
+            crate::ast::Word::ParameterExpansion(pe, _) => match pe.operator {
+                Op::DefaultValue(v) => v,
+                other => panic!("expected a :- default, got {other:?}"),
+            },
+            other => panic!("expected a parameter expansion, got {other:?}"),
+        };
+        assert_eq!(bare(r"${u:-\c}"), "c", "unquoted `\\c` loses it");
+        assert_eq!(bare(r"${u:-\\c}"), r"\c", "unquoted `\\\\c` collapses");
+        assert_eq!(bare(r"${u:-\\\c}"), r"\c");
+    }
+
+    /// `"a\\$b"` is a literal backslash followed by the expansion of `$b`
+    /// (bash prints `a\` when `b` is unset). The pre-pass used to collapse
+    /// `\\` first, so the scanner then read the leftover `\$` as an escaped
+    /// dollar and printed the literal `a$b`.
+    #[test]
+    fn a_doubled_backslash_does_not_escape_the_dollar_after_it() {
+        let parts = scan_interpolation_parts(&unescape_interpolation_content(r"a\\$b")).unwrap();
+        assert_eq!(
+            parts,
+            vec![
+                StringPart::Literal(r"a\".to_string()),
+                StringPart::Variable("b".to_string()),
+            ]
+        );
+    }
+
+    /// `"a\\`echo hi\\`b"` is a literal backslash followed by a command
+    /// substitution (bash prints `a\` + the substitution's output + `b`). The
+    /// old collapsed form `\\`` meant "escaped backtick substitution" and was
+    /// read as one, so the backslash vanished into a cmdsub delimiter.
+    #[test]
+    fn a_doubled_backslash_before_a_backtick_is_a_literal_backslash() {
+        let content = unescape_interpolation_content(r"a\\`echo hi\\`b");
+        let parts = scan_interpolation_parts(&content).unwrap();
+        assert_eq!(parts.len(), 3, "literal, substitution, literal: {parts:?}");
+        assert_eq!(parts[0], StringPart::Literal(r"a\".to_string()));
+        assert!(matches!(parts[1], StringPart::CommandSubstitution(_)));
+        assert_eq!(parts[2], StringPart::Literal("b".to_string()));
+    }
+
+    /// A raw `"` inside `${...}` of a double-quoted string is a quote
+    /// TOGGLE that spans the expansion: balanced → the toggled quotes are
+    /// removed (`"${u:-"x"}"` is ONE word with net operand `x`, bash
+    /// prints `x`), unbalanced → bash exits 2 (`"${v/Q/"}"`), and `\"`
+    /// is the escaped, valid form kept whole. All three used to collapse
+    /// to one operand, so the raw shIR could not tell a working shell
+    /// from a broken one.
+    #[test]
+    fn a_raw_dquote_toggles_or_errors_never_collides() {
+        // balanced: the toggled quotes are removed
+        assert_eq!(strip_toggle_dquotes(r#"u:-"x""#).unwrap(), "u:-x");
+        // unbalanced: bash's exit 2 is a parse error, not an operand
+        assert!(strip_toggle_dquotes(r#"v/Q/""#).is_err());
+        assert!(strip_toggle_dquotes(r#"v/Q/a"b"#).is_err());
+        // the escaped form is kept whole (the operand's escape count is
+        // the raw-shIR contract)
+        assert_eq!(strip_toggle_dquotes(r#"v/Q/\""#).unwrap(), r#"v/Q/\""#);
+        assert_eq!(strip_toggle_dquotes(r#"v/Q/a\"b"#).unwrap(), r#"v/Q/a\"b"#);
+        // `\\` is an escaped backslash, so the `"` after it is RAW
+        assert!(strip_toggle_dquotes(r#"v/Q/a\\""#).is_err());
+
+        // scan level: the balanced toggle parses to the NET operand
+        let parts =
+            scan_interpolation_parts(&unescape_interpolation_content(r#"${u:-"x"}"#)).unwrap();
+        assert_eq!(parts.len(), 1, "{parts:?}");
+        match &parts[0] {
+            StringPart::ParameterExpansion(pe) => match &pe.operator {
+                Op::DefaultValue(v) => assert_eq!(v, "x"),
+                other => panic!("expected a :- default, got {other:?}"),
+            },
+            other => panic!("expected a parameter expansion, got {other:?}"),
+        }
+        // the unbalanced one is the parse error bash has
+        assert!(scan_interpolation_parts(&unescape_interpolation_content(r#"${v/Q/"}"#)).is_err());
+        // the escaped quote keeps its escape and is NOT an error
+        let parts =
+            scan_interpolation_parts(&unescape_interpolation_content(r#"${v/Q/\"}"#)).unwrap();
+        match &parts[0] {
+            StringPart::ParameterExpansion(pe) => match &pe.operator {
+                Op::SubstituteFirst(_, r) => assert_eq!(r, r#"\""#),
+                other => panic!("expected a / substitution, got {other:?}"),
+            },
+            other => panic!("expected a parameter expansion, got {other:?}"),
+        }
+    }
 }

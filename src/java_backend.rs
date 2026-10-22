@@ -1381,6 +1381,54 @@ impl JavaRender {
             IrExpr::BinOp { op: BinOpKind::Or, lhs, rhs, .. } =>
                 Ok(format!("({} || {})", self.cond_bool(lhs)?, self.cond_bool(rhs)?)),
             IrExpr::Bool(b) => Ok(if *b { "true".into() } else { "false".into() }),
+            // The case-lowering transform's negated exact match — the shared
+            // `not_wrap` shape `BinOp { Not, lhs: inner, rhs: inner }`
+            // (test_lowering duplicates the operand so both renderer
+            // conventions read the same inner expr; the historical
+            // rhs: Bool(false) variant made perl's `if (!(0))` always-true).
+            // Render `!` over the INNER condition as a boolean; operands
+            // that DIFFER cannot come from not_wrap, so refuse rather than
+            // pick a side (REFUSE > GUESS — the java subset's discipline).
+            IrExpr::BinOp { op: BinOpKind::Not, lhs, rhs, .. } => {
+                if lhs != rhs {
+                    return Err(format!("java: Not with non-duplicated operands: {lhs:?} vs {rhs:?}"));
+                }
+                let inner = lhs.as_ref();
+                let b = match inner {
+                    IrExpr::BinOp { op, lhs: a, rhs: b, .. } if is_cmp(op) => self.binop_bool(op, a, b)?,
+                    other => self.cond_bool(other)?,
+                };
+                Ok(format!("(!{b})"))
+            }
+            // The case-lowering transform's glob-affix conditions (the same
+            // primitives test_lowering lifts [[ ]] affix tests to). Java's
+            // String methods are the exact substring decisions — no helper
+            // needed, and these are BOOLEAN expressions (the shContains
+            // helper returns long 1/0, wrong in a boolean context).
+            IrExpr::Call { func, args, .. }
+                if func == "contains" || func == "strHasPrefix" || func == "strHasSuffix" =>
+            {
+                let hay = self.expr_str(args.first().ok_or("affix: missing haystack")?)?;
+                let needle = self.expr_str(args.get(1).ok_or("affix: missing needle")?)?;
+                let m = match func.as_str() {
+                    "contains" => "contains",
+                    "strHasPrefix" => "startsWith",
+                    _ => "endsWith",
+                };
+                Ok(format!("({hay}).{m}({needle})"))
+            }
+            // The case-lowering transform's shared globMatch(value,
+            // pattern) predicate (char-class / `?` / mid-star case
+            // clauses): java's OWN glob engine — the same shFnmatch its
+            // native case render dispatches with, so the pattern keeps
+            // byte-identical semantics while the condition becomes the
+            // shared op. Boolean, like the affix arms above.
+            IrExpr::Call { func, args, .. } if func == "globMatch" => {
+                let hay = self.expr_str(args.first().ok_or("globMatch: missing value")?)?;
+                let pat = self.expr_str(args.get(1).ok_or("globMatch: missing pattern")?)?;
+                self.helper("fnmatch");
+                Ok(format!("shFnmatch({pat}, {hay})"))
+            }
             other => {
                 let v = self.expr_str(other)?;
                 Ok(format!("(!{v}.isEmpty())"))
@@ -3921,5 +3969,38 @@ mod shprintf_tests {
                 "the `{arm}` branch must increment `ai`"
             );
         }
+    }
+}
+
+#[cfg(test)]
+mod case_lowering_render_tests {
+    /// The case-lowering transform's three condition shapes must render as
+    /// Java BOOLEAN expressions: the shared `not_wrap` negation
+    /// (`BinOp { Not, lhs: inner, rhs: inner }`) and the glob-affix
+    /// primitives (contains/strHasPrefix/strHasSuffix). Before the
+    /// `cond_bool` arms were added, every one of these fell through to
+    /// `expr not in the java subset (str ctx)` and `--target java` on a
+    /// two-clause `case "$1"` refused to generate AT ALL (measured:
+    /// 057_case.sh rc=1 with case-lowering on, rc=0 with it off).
+    ///
+    /// End-to-end through the same pipeline the CLI uses:
+    /// parse → ast_to_ir (which runs transforms::apply under the java
+    /// target gate) → shir_to_java.
+    #[test]
+    fn case_lowering_conds_render_as_java_bools() {
+        let src = "case \"$1\" in\n  start) echo a ;;\n  *.txt) echo t ;;\n  *) echo o ;;\nesac\n";
+        let cmds = crate::parser::commands::parse_commands_from_text(src).expect("parse");
+        crate::transforms::set_target(Some("java"));
+        let prog = crate::shir::ast_to_ir(&cmds);
+        crate::transforms::set_target(None);
+        let java = super::shir_to_java(&prog).expect("java must render the lowered case");
+        assert!(
+            java.contains("(!") && java.contains(".endsWith("),
+            "negated exact match + suffix test must be java booleans:\n{java}"
+        );
+        assert!(
+            !java.contains("not in the java subset") && !java.contains("not yet supported"),
+            "no subset refusal for a fully-lowerable case:\n{java}"
+        );
     }
 }

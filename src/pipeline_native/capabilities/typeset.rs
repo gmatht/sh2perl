@@ -56,13 +56,20 @@ pub(crate) fn emit(ctx: &NativeCtx) -> Option<NativeEmit> {
         return None;
     }
     let val = crate::ir::safe_perl_q_string(value);
-    let mut stmt = match flags.as_str() {
-        f if f.contains('l') => format!("${var} = lc({val});"),
-        f if f.contains('u') => format!("${var} = uc({val});"),
-        _ => format!("${var} = {val};"),
+    // The attribute is applied to the VALUE ONCE and the same expression
+    // is stored in %ENV: bash exports the value the variable actually
+    // holds, so `$ENV{x} = raw` alongside `$x = lc(raw)` would publish the
+    // un-folded text.
+    let store = if flags.contains('l') {
+        format!("lc({val})")
+    } else if flags.contains('u') {
+        format!("uc({val})")
+    } else {
+        val
     };
+    let mut stmt = format!("${var} = {store};");
     if flags.contains('x') {
-        stmt.push_str(&format!(" $ENV{{{var}}} = {val};"));
+        stmt.push_str(&format!(" $ENV{{{var}}} = {store};"));
     }
     stmt.push_str("\n$main_exit_code = $CHILD_ERROR = 0;");
     Some(NativeEmit::Stmt(stmt))

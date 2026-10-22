@@ -72,6 +72,13 @@ pub fn transform(stmts: &mut Vec<IrStmt>) -> bool {
     // recognition is the SHARED analysis (`shir_passes::scc` — the same
     // call-graph Tarjan the test-parser work and the glob-matcher lift
     // consume).
+    if std::env::var("ECHO_RETURN_DBG").is_ok() {
+        let graph = crate::shir_passes::scc::build_call_graph_stmts(stmts);
+        eprintln!("[er] graph edges: {:?}", graph);
+        for st in stmts.iter() {
+            eprintln!("[er] stmt: {:?}", std::mem::discriminant(st));
+        }
+    }
     let graph = crate::shir_passes::scc::build_call_graph_stmts(stmts);
     let sccs = crate::shir_passes::scc::tarjan_sccs(&graph);
     let mut eligible: HashSet<String> = HashSet::new();
@@ -112,6 +119,17 @@ pub fn transform(stmts: &mut Vec<IrStmt>) -> bool {
     // Pass 3 — call-site rewrite: `exec("f", [args])` of an eligible
     // function → `exec("echo", [fnValue("f", [args])])` (the value +
     // newline the original echo produced).
+    // A pipeline's LAST stage writes the pipeline's output to the current
+    // fd-1 sink (sh2.pipelineSync restores `saved[1]` for it), so a bare `f`
+    // there is not in VALUE position: pass 3 (and rewrite_stmt's bare-call
+    // arms) must not collapse it to fnValue. Otherwise `y=$(echo hi | f)`
+    // with `f() { echo a+b*; }` captures "" where bash captures the echoed
+    // value (measured 2026-10-22) — an echo-return function called as the
+    // final pipeline stage is extremely common (every `… | wcLines`-style
+    // adapter), so this is a live shape, not a corner.
+    //
+    // The skip is handled INSIDE rewrite_call_stmt (which knows the stage
+    // index) rather than here, so it applies at every nesting depth.
     for st in stmts.iter_mut() {
         c |= rewrite_call_stmt(st, &eligible);
     }
@@ -530,16 +548,43 @@ fn rewrite_body(body: &mut Vec<IrStmt>, eligible: &HashSet<String>) -> bool {
     let mut changed = false;
     let mut out: Vec<IrStmt> = Vec::with_capacity(body.len());
     for st in body.drain(..) {
-        out.push(rewrite_stmt(&st, &mut changed, eligible));
+        // A pipeline's LAST stage writes the pipeline's output to the
+        // current fd-1 sink — a bare `f` there is not in value position, so
+        // it must keep its echo (see the pass-3 arm of rewrite_call_stmt:
+        // collapsing it makes `y=$(echo hi | f)` capture "").
+        let keep_pipeline_last = is_pipeline_with_last_call(&st, eligible);
+        out.push(rewrite_stmt(&st, &mut changed, eligible, keep_pipeline_last));
     }
     *body = out;
     changed
 }
 
+/// Is `st` a pipeline whose LAST stage is a bare call to an eligible
+/// function (the shape whose echo must survive)?
+fn is_pipeline_with_last_call(st: &IrStmt, eligible: &HashSet<String>) -> bool {
+    let IrStmt::Pipeline { stages, .. } = st else {
+        return false;
+    };
+    let Some(last) = stages.last() else {
+        return false;
+    };
+    matches!(
+        last.as_slice(),
+        [IrStmt::Expr(IrExpr::Call { func, args })]
+            if matches!(func.as_str(), "exec" | "fnCall")
+                && matches!(args.first(), Some(IrExpr::Str(n, _)) if eligible.contains(n))
+    )
+}
+
 /// Rewrite one statement: a value echo → Return(Some(word)); a bare
 /// return → dropped (unreachable after the echo-return); otherwise recurse
 /// into nested containers.
-fn rewrite_stmt(st: &IrStmt, changed: &mut bool, eligible: &HashSet<String>) -> IrStmt {
+fn rewrite_stmt(
+    st: &IrStmt,
+    changed: &mut bool,
+    eligible: &HashSet<String>,
+    keep_pipeline_last: bool,
+) -> IrStmt {
     match st {
         IrStmt::Expr(IrExpr::Call { func, args, .. })
             if matches!(func.as_str(), "builtin" | "exec") =>
@@ -557,10 +602,12 @@ fn rewrite_stmt(st: &IrStmt, changed: &mut bool, eligible: &HashSet<String>) -> 
             // non-echo exec call, leaving the bare call for pass 3 to
             // wrap in an ECHO — printing the value instead of returning
             // it, the extra-`0` self-test regression).
-            if let Some(IrExpr::Str(fname, _)) = args.first() {
-                if eligible.contains(fname) {
-                    *changed = true;
-                    return IrStmt::Return(Some(fn_value_call(args)));
+            if !keep_pipeline_last {
+                if let Some(IrExpr::Str(fname, _)) = args.first() {
+                    if eligible.contains(fname) {
+                        *changed = true;
+                        return IrStmt::Return(Some(fn_value_call(args)));
+                    }
                 }
             }
             st.clone()
@@ -571,10 +618,12 @@ fn rewrite_stmt(st: &IrStmt, changed: &mut bool, eligible: &HashSet<String>) -> 
         IrStmt::Expr(IrExpr::Call { func, args, .. })
             if matches!(func.as_str(), "exec" | "fnCall") =>
         {
-            if let Some(IrExpr::Str(fname, _)) = args.first() {
-                if eligible.contains(fname) {
-                    *changed = true;
-                    return IrStmt::Return(Some(fn_value_call(args)));
+            if !keep_pipeline_last {
+                if let Some(IrExpr::Str(fname, _)) = args.first() {
+                    if eligible.contains(fname) {
+                        *changed = true;
+                        return IrStmt::Return(Some(fn_value_call(args)));
+                    }
                 }
             }
             st.clone()
@@ -592,19 +641,19 @@ fn rewrite_stmt(st: &IrStmt, changed: &mut bool, eligible: &HashSet<String>) -> 
         } => {
             let mut t: Vec<IrStmt> = Vec::with_capacity(then.len());
             for s in then {
-                t.push(rewrite_stmt(s, changed, eligible));
+                t.push(rewrite_stmt(s, changed, eligible, false));
             }
             let mut es: Vec<(IrExpr, Vec<IrStmt>)> = Vec::with_capacity(elsifs.len());
             for (c, b) in elsifs {
                 let mut nb: Vec<IrStmt> = Vec::with_capacity(b.len());
                 for s in b {
-                    nb.push(rewrite_stmt(s, changed, eligible));
+                    nb.push(rewrite_stmt(s, changed, eligible, false));
                 }
                 es.push((c.clone(), nb));
             }
             let mut el: Vec<IrStmt> = Vec::with_capacity(else_.len());
             for s in else_ {
-                el.push(rewrite_stmt(s, changed, eligible));
+                el.push(rewrite_stmt(s, changed, eligible, false));
             }
             IrStmt::If {
                 cond: cond.clone(),
@@ -616,7 +665,7 @@ fn rewrite_stmt(st: &IrStmt, changed: &mut bool, eligible: &HashSet<String>) -> 
         IrStmt::While { cond, body } => {
             let mut b: Vec<IrStmt> = Vec::with_capacity(body.len());
             for s in body {
-                b.push(rewrite_stmt(s, changed, eligible));
+                b.push(rewrite_stmt(s, changed, eligible, false));
             }
             IrStmt::While {
                 cond: cond.clone(),
@@ -626,7 +675,7 @@ fn rewrite_stmt(st: &IrStmt, changed: &mut bool, eligible: &HashSet<String>) -> 
         IrStmt::For { var, iter, body } => {
             let mut b: Vec<IrStmt> = Vec::with_capacity(body.len());
             for s in body {
-                b.push(rewrite_stmt(s, changed, eligible));
+                b.push(rewrite_stmt(s, changed, eligible, false));
             }
             IrStmt::For {
                 var: var.clone(),
@@ -643,7 +692,7 @@ fn rewrite_stmt(st: &IrStmt, changed: &mut bool, eligible: &HashSet<String>) -> 
             for clause in clauses {
                 let mut b: Vec<IrStmt> = Vec::with_capacity(clause.body.len());
                 for s in &clause.body {
-                    b.push(rewrite_stmt(s, changed, eligible));
+                    b.push(rewrite_stmt(s, changed, eligible, false));
                 }
                 new_clauses.push(crate::ir::IrCaseClause {
                     patterns: clause.patterns.clone(),
@@ -663,7 +712,7 @@ fn rewrite_stmt(st: &IrStmt, changed: &mut bool, eligible: &HashSet<String>) -> 
         } => {
             let mut b: Vec<IrStmt> = Vec::with_capacity(body.len());
             for s in body {
-                b.push(rewrite_stmt(s, changed, eligible));
+                b.push(rewrite_stmt(s, changed, eligible, false));
             }
             IrStmt::ForInit {
                 init: init.clone(),
@@ -675,7 +724,7 @@ fn rewrite_stmt(st: &IrStmt, changed: &mut bool, eligible: &HashSet<String>) -> 
         IrStmt::Block(body) => {
             let mut b: Vec<IrStmt> = Vec::with_capacity(body.len());
             for s in body {
-                b.push(rewrite_stmt(s, changed, eligible));
+                b.push(rewrite_stmt(s, changed, eligible, false));
             }
             IrStmt::Block(b)
         }
@@ -775,7 +824,12 @@ fn rewrite_call_stmt(st: &mut IrStmt, eligible: &HashSet<String>) -> bool {
         }
         IrStmt::Pipeline { stages, .. } => {
             let mut c = false;
-            for stage in stages.iter_mut() {
+            // Last stage = the pipeline's OUTPUT sink: see the pass-3 note.
+            let last = stages.len().saturating_sub(1);
+            for (i, stage) in stages.iter_mut().enumerate() {
+                if i == last {
+                    continue;
+                }
                 for s in stage.iter_mut() {
                     c |= rewrite_call_stmt(s, eligible);
                 }
@@ -1079,6 +1133,25 @@ fn hoist_case_pattern_captures(
                 }
             } else {
                 changed |= rebuild_children(&mut st, eligible, seq);
+            }
+            // A pipeline's LAST stage writes the pipeline's output through
+            // the current fd-1 sink — a bare `f` there is not in value
+            // position, so the pass-3 collapse (`exec echo fnValue`) must
+            // not reach it either, from this recursion or from pass 3.
+            if is_pipeline_with_last_call(&st, eligible) {
+                if let IrStmt::Pipeline { stages, .. } = &mut st {
+                    if let Some(last) = stages.last_mut() {
+                        last.retain(|s| {
+                            !matches!(
+                                s,
+                                IrStmt::Expr(IrExpr::Call { func, args, .. })
+                                    if matches!(func.as_str(), "exec" | "fnCall")
+                                        && matches!(args.first(), Some(IrExpr::Str(n, _))
+                                            if eligible.contains(n))
+                            )
+                        });
+                    }
+                }
             }
         }
         out.extend(hoists);

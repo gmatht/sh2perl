@@ -58,6 +58,22 @@ pub mod maskable;
 pub mod list_profile;
 pub mod loop_opt; // LICM-lite (estree-20260813-182436/201235): hoist loop-invariant runs into loop prologues
 pub mod metric;
+/// Numeric-string seeding: the joint vars × params fixpoint — which
+/// shell vars hold canonical decimal text (so a consumer can home them
+/// as native integers) and which fn positions carry such values
+/// end-to-end. Grounded least fixpoint, then the anchored-coinduction
+/// phase that settles call-boundary cycles (`v=$1` copies in a callee
+/// whose actuals are `v` at every call site). Consumed by the C backend
+/// at ingest (after demote re-validates the A2 verdicts); offered to the
+/// other backends as-is per §11 (Inputs carries the only
+/// backend-specific sets).
+pub mod numstr;
+/// Shared "numeric-observed" analysis — which scalars, function-param slots,
+/// and array elements are only ever read as numbers. Enables int-homing of
+/// string tables (e.g. packed-texture arrays) whose elements are written from
+/// non-canonical text but read only numerically. Consumed by the C backend's
+/// int-array classification; the storage decision stays backend-owned.
+pub mod numeric_observed;
 pub mod optimize; // const_prop + dead_store_elim (the A1 optimizer family)
 /// Constant-echo lowering: `echo <literals>` → native `IrStmt::Output`,
 /// so every backend emits its host language's print instead of a
@@ -66,10 +82,14 @@ pub mod echo_fold;
 pub mod pattern;
 pub mod restructure;
 pub mod scc; // strongly-connected-component recognition over the call graph (mutual-recursion clusters)
-// split_inplace: registered-but-PARKED in transforms.rs pending the
-// c worker's embed/Carp interaction fix; declaration kept so the tree
-// compiles either way.
+// split_inplace: ACTIVE, target-gated to C in transforms.rs (the
+// embed/Carp fragment tests run with the target unset, where this
+// transform skips — see the registry comment).
 pub mod split_inplace; // destructive buffer reuse for for-in-split iteration
+/// Trivial word-split elimination: `split[e]` → `e` when `e` is provably
+/// IFS-whitespace-free (shared shIR→shIR; all backends — see the module
+/// header). Wired on the C path by `bash-o4/src/pipeline.rs` (O3/O4).
+pub mod split_fold;
 pub mod strip;
 pub mod transform;
 pub mod interval; // generic integer intervals (bash wrapping + Python floor-mod)

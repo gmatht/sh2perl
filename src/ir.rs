@@ -935,6 +935,11 @@ pub const UNBUILDABLE_COND: &str = "0/*sh2:unbuildable-cond*/";
 /// This is the public entry point for the generator to produce clean
 /// Perl from IR nodes without constructing a full IrProgram.
 pub fn stmt_to_perl(stmt: &IrStmt, indent: usize) -> String {
+    // No program in hand: the verdict set (pointer-keyed) may belong to
+    // an earlier compile whose statements are freed and their addresses
+    // reused — drop it so the ownership stack below can never read a
+    // stale key (conservative keep-everything).
+    crate::shir::clear_unread_status_writes();
     let mut out = String::new();
     emit_stmt(&mut out, stmt, indent);
     out
@@ -1234,6 +1239,19 @@ fn first_code_newline(s: &str) -> Option<usize> {
     // rendered body is the only reliable oracle for whether each preamble
     // declaration is needed.
     let mut body = String::new();
+    // Shared shIR status-write liveness for THIS render (pointer-keyed —
+    // install on the exact vecs emit_stmt walks): exit-preserving (Perl's
+    // `exit $main_exit_code` IS the gate's exit-code comparison — the
+    // unobservable shortcut would drop the final-path write and turn
+    // `false` into exit 0), errexit-vetoed. SH2_PERL_RC_DROP=0 disables
+    // the elision (empty verdict set) for bisection.
+    let sub_bodies: Vec<&[IrStmt]> = prog.subs.iter().map(|s| s.body.as_slice()).collect();
+    crate::shir::install_unread_status_writes_exit_live_stmts(
+        &stmts,
+        &sub_bodies,
+        crate::shir::ir_may_enable_errexit(prog)
+            || std::env::var("SH2_PERL_RC_DROP").as_deref() == Ok("0"),
+    );
     // Top-level statements
     for (idx, stmt) in stmts.iter().enumerate() {
         let line = prog
@@ -1379,6 +1397,40 @@ fn first_code_newline(s: &str) -> Option<usize> {
         for (n, s) in read_vars {
             if !vars.iter().any(|(vn, vs)| vn == &n && *vs == s) {
                 vars.push((n, s));
+            }
+        }
+        // …and now every sigil the RENDERED body actually mentions. The two
+        // collectors above dedupe by NAME (first write wins), and neither can
+        // see a sigil the emitter chose for itself: `result=$((…))` records
+        // Scalar, while `result[i]=$(( … ))` renders as `%result{'i'}`
+        // (Hash) and `result[i]` in arithmetic renders as `${result}[$i]`
+        // (Array). `use strict` then fails at COMPILE time ("Global symbol
+        // %result requires explicit package name"), `do FILE` returns undef
+        // before a single statement runs, and the example prints NOTHING and
+        // exits 0 — 063_hard_to_parse lost all 13 of its lines that way. An
+        // extra `my` of a different sigil is legal and silent (measured:
+        // `perl -we 'my $x; my @x; my %x;'` → clean), so over-declaring is
+        // free; under-declaring kills the whole program.
+        let mut names: Vec<String> = Vec::new();
+        for (n, _) in &vars {
+            if !names.contains(n) {
+                names.push(n.clone());
+            }
+        }
+        for n in &names {
+            // env-style names live in %ENV and are never `my`-declared
+            // (collect_assigned_vars skips them for the same reason);
+            // declaring `my %ENV` would shadow Perl's real %ENV.
+            if is_env_style_var_name(n) {
+                continue;
+            }
+            for sigil in [Sigil::Scalar, Sigil::Array, Sigil::Hash] {
+                if vars.iter().any(|(vn, vs)| vn == n && *vs == sigil)
+                    || !body_mentions_sigil(&body, n, sigil)
+                {
+                    continue;
+                }
+                vars.push((n.clone(), sigil));
             }
         }
         for (name, sigil) in &vars {
@@ -1737,7 +1789,97 @@ fn emit_native_binop(out: &mut String, indent: usize, e: &IrExpr) -> bool {
     true
 }
 
+// ── Status-write ownership stack ───────────────────────────────────
+// emit_stmt pushes the statement being rendered; every status-register
+// write consults the TOP of the stack (the statement that OWNS the
+// write), so a helper reached from an arm — emit_exec_call,
+// emit_shell_cmd — asks about its CALLING statement without threading a
+// flag through every signature. Empty stack ⇒ emit (conservative).
+// Keys are pointer addresses, exactly like the shared shIR verdict set:
+// the set is installed for the statements THIS render walks (alive), so
+// a fresh allocation (an eval subprogram's statements) cannot collide
+// with a live member's address.
+thread_local! {
+    static RC_OWNER: std::cell::RefCell<Vec<usize>> =
+        const { std::cell::RefCell::new(Vec::new()) };
+}
+
+/// Pops the owner slot even when the render unwinds.
+struct RcOwnerGuard;
+impl Drop for RcOwnerGuard {
+    fn drop(&mut self) {
+        RC_OWNER.with(|s| {
+            s.borrow_mut().pop();
+        });
+    }
+}
+
+/// Is the status write the statement at the top of the ownership stack
+/// would emit proven unread by the shared shIR liveness analysis
+/// ([`crate::shir::install_unread_status_writes_exit_live_stmts`])?
+fn rc_unread() -> bool {
+    RC_OWNER.with(|s| {
+        s.borrow()
+            .last()
+            .map(|k| crate::shir::status_write_is_unread_key(*k))
+            .unwrap_or(false)
+    })
+}
+
+/// A status write glued into a format string: empty when proven unread.
+/// `write` carries its own leading space so the kept form is byte-identical
+/// to the old literal.
+fn rc_write(write: &str) -> String {
+    if rc_unread() {
+        String::new()
+    } else {
+        write.to_string()
+    }
+}
+
+/// Strip status-register writes from a PREBUILT rendering (a chain /
+/// native-capability template whose strings bake the write in) when the
+/// owning statement's write is proven unread. Conservative: the scan
+/// only removes a write whose RHS reaches `;` on the same line (an RHS
+/// with an embedded `;` — a q{} shell string — keeps its occurrence),
+/// and `==`/`!=` comparisons never match the `$CHILD_ERROR = ` marker
+/// (the pattern needs `= ` followed by a non-`=`).
+fn rc_stripped(rendered: &str) -> String {
+    if !rc_unread() {
+        return rendered.to_string();
+    }
+    const MARKERS: [&str; 2] = ["$main_exit_code = $CHILD_ERROR = ", "$CHILD_ERROR = "];
+    let mut out = String::with_capacity(rendered.len());
+    let mut i = 0;
+    while i < rendered.len() {
+        let tail = &rendered[i..];
+        if let Some(m) = MARKERS.iter().find(|m| tail.starts_with(**m)) {
+            let after = &tail[m.len()..];
+            if let Some(semi) = after.find(';') {
+                if !after[..semi].contains('\n') {
+                    i += m.len() + semi + 1;
+                    continue;
+                }
+            }
+            // Not strippable (no `;` on this line): keep the marker.
+            out.push_str(m);
+            i += m.len();
+            continue;
+        }
+        let ch = tail.chars().next().unwrap();
+        out.push(ch);
+        i += ch.len_utf8();
+    }
+    out
+}
+
 pub(crate) fn emit_stmt(out: &mut String, stmt: &IrStmt, indent: usize) {
+    RC_OWNER.with(|s| s.borrow_mut().push(stmt as *const IrStmt as usize));
+    let _guard = RcOwnerGuard;
+    emit_stmt_owned(out, stmt, indent)
+}
+
+fn emit_stmt_owned(out: &mut String, stmt: &IrStmt, indent: usize) {
     match stmt {
         IrStmt::Ext(n) => {
             // per-backend drop-in handlers (render_ext) render transform-
@@ -1791,6 +1933,25 @@ pub(crate) fn emit_stmt(out: &mut String, stmt: &IrStmt, indent: usize) {
             // ( cmd ) — copy semantics: assignments inside do NOT leak. Save
             // the vars the body assigns, run it, restore them (Perl `local`
             // can't apply to the hoisted `my` lexicals).
+            //
+            // The ENVIRONMENT is a second store, and the per-name loop below
+            // deliberately skips it (`is_env_style_var_name`: an env-style
+            // name has no lexical to save — it lives in `%ENV`). bash gives a
+            // subshell a full COPY of the environment, so `export`/`unset`
+            // inside it must be undone on exit no matter WHICH name was
+            // touched. `local %ENV = %ENV;` is that copy in one line: the
+            // whole hash is saved on block entry and restored on exit.
+            // (064_20_nested_subshells_environment_variables: the inner
+            // `( unset DEBUG )` deleted the export globally, so the OUTER
+            // `echo $DEBUG` printed nothing.)
+            //
+            // NOTE the copy must be an ASSIGNMENT: `local %ENV;` alone
+            // empties the hash, and the RHS of `local %ENV = %ENV` is
+            // evaluated against the still-live values (verified).
+            emit_indent(out, indent);
+            out.push_str("{\n");
+            emit_indent(out, indent + 1);
+            out.push_str("local %ENV = %ENV;\n");
             let mut assigned = Vec::new();
             collect_assigned_vars(body, &mut assigned);
             let mut saves = Vec::new();
@@ -1799,7 +1960,7 @@ pub(crate) fn emit_stmt(out: &mut String, stmt: &IrStmt, indent: usize) {
                     continue;
                 }
                 let save = format!("__save_{}", name);
-                emit_indent(out, indent);
+                emit_indent(out, indent + 1);
                 let var = match sigil {
                     Sigil::Scalar => format!("${}", name),
                     Sigil::Array => format!("@{}", name),
@@ -1809,10 +1970,10 @@ pub(crate) fn emit_stmt(out: &mut String, stmt: &IrStmt, indent: usize) {
                 saves.push((name.clone(), save, sigil.clone()));
             }
             for s in body.iter() {
-                emit_stmt(out, s, indent);
+                emit_stmt(out, s, indent + 1);
             }
             for (name, save, sigil) in saves {
-                emit_indent(out, indent);
+                emit_indent(out, indent + 1);
                 let var = match sigil {
                     Sigil::Scalar => format!("${}", name),
                     Sigil::Array => format!("@{}", name),
@@ -1820,6 +1981,8 @@ pub(crate) fn emit_stmt(out: &mut String, stmt: &IrStmt, indent: usize) {
                 };
                 out.push_str(&format!("{} = ${};\n", var, save));
             }
+            emit_indent(out, indent);
+            out.push_str("}\n");
         }
         IrStmt::Background(body) => {
             // `( cmd ) &` — bash background job (triage-perl
@@ -2001,6 +2164,8 @@ pub(crate) fn emit_stmt(out: &mut String, stmt: &IrStmt, indent: usize) {
                         emit_stmt(out, s, indent + 1);
                     }
                     emit_indent(out, indent);
+                    out.push_str("if ($__sh2_is0) { open(STDIN, '<&', $__sh2_is0); close($__sh2_is0); }\n");
+                    emit_indent(out, indent);
                     out.push_str("}\n");
                     return;
                 }
@@ -2038,8 +2203,6 @@ pub(crate) fn emit_stmt(out: &mut String, stmt: &IrStmt, indent: usize) {
                         emit_stmt(out, s, indent + 1);
                     }
                     emit_indent(out, indent);
-                    out.push_str("if ($__sh2_is0) { open(STDIN, '<&', $__sh2_is0); close($__sh2_is0); }\n");
-                    emit_indent(out, indent);
                     out.push_str("}\n");
                     return;
                 }
@@ -2055,16 +2218,17 @@ pub(crate) fn emit_stmt(out: &mut String, stmt: &IrStmt, indent: usize) {
                     if !body.contains("$(") && !body.contains('`') {
                         emit_indent(out, indent);
                         out.push_str(&format!(
-                            "print({}); $main_exit_code = $CHILD_ERROR = 0;\n",
+                            "print({});{}\n",
                             render_str_literal(
                                 &rewrite_heredoc_env(&body),
                                 &StrStyle::Heredoc
-                            )
+                            ),
+                            rc_write(" $main_exit_code = $CHILD_ERROR = 0;")
                         ));
                         return;
                     }
                 } else if let Some(s) = crate::pipeline_native::native_heredoc(&body) {
-                    out.push_str(&s);
+                    out.push_str(&rc_stripped(&s));
                     out.push('\n');
                     return;
                 }
@@ -2112,7 +2276,8 @@ pub(crate) fn emit_stmt(out: &mut String, stmt: &IrStmt, indent: usize) {
                         }
                         emit_indent(out, indent);
                         out.push_str(&format!(
-                            "{{ {pre}system(@ARGV); $main_exit_code = $CHILD_ERROR = $? >> 8; {post}}}\n",
+                            "{{ {pre}system(@ARGV);{} {post}}}\n",
+                            rc_write(" $main_exit_code = $CHILD_ERROR = $? >> 8;"),
                             pre = pre.join(""),
                             post = post.join(""),
                         ));
@@ -2297,35 +2462,44 @@ pub(crate) fn emit_stmt(out: &mut String, stmt: &IrStmt, indent: usize) {
                     let first_redirect = redirects.first();
                     match first_redirect {
                         Some(r) if call_arg_str(&r.target).map_or(false, |t| t.starts_with('&')) => {
-                            // fd-dup redirect (`2>&1`, `1>&2`, …) on a
-                            // non-command inner (subshell block): dup stderr
-                            // to stdout — the backtick __bt capture pipe then
-                            // sees stderr too. The old code opened a FILE
-                            // named "&1" (mode w + the raw target).
+                            // fd-dup redirect (`2>&1`, `>&2`, …) on a
+                            // non-command inner (subshell block): dup the
+                            // redirected fd onto the TARGET fd — the old
+                            // code always dupped STDERR := STDOUT, so
+                            // `echo … >&2` (stdout follows stderr) wrote
+                            // its line to STDOUT instead (070_gnuisms).
+                            // The redirected fd is `fd` (default 1 for
+                            // `>&`, 2 for `2>`); the target number after
+                            // `&` says where it must point.
                             let mode = if r.mode == "r" { "'<&'" } else { "'>&'" };
-                            emit_indent(out, indent);
-                            out.push_str(&format!(
-                                "local *STDERR; open STDERR, {}, STDOUT or die \"Cannot dup stderr: $!\\n\";\n",
-                                mode
-                            ));
-                            for s in inner {
-                                emit_stmt(out, s, indent);
-                            }
-                        }
-                        Some(r) if call_arg_str(&r.target).map_or(false, |t| t.starts_with('&')) => {
-                            // fd-dup redirect (`2>&1`, `1>&2`, …) on a
-                            // non-command inner (subshell block): dup stderr
-                            // to stdout — the backtick __bt capture pipe then
-                            // sees stderr too. The old code opened a FILE
-                            // named "&1" (mode w + the raw target).
-                            let mode = if r.mode == "r" { "'<&'" } else { "'>&'" };
-                            emit_indent(out, indent);
-                            out.push_str(&format!(
-                                "local *STDERR; open STDERR, {}, STDOUT or die \"Cannot dup stderr: $!\\n\";\n",
-                                mode
-                            ));
-                            for s in inner {
-                                emit_stmt(out, s, indent);
+                            let dst: i32 = call_arg_str(&r.target)
+                                .and_then(|t| t.trim_start_matches('&').parse().ok())
+                                .unwrap_or(1);
+                            let src = r.fd.unwrap_or(1);
+                            if src == dst {
+                                // `>&1` / `2>&2` — already there
+                                for s in inner {
+                                    emit_stmt(out, s, indent);
+                                }
+                            } else {
+                                // Block-scoped: `local *STDOUT` lasts to
+                                // end of file otherwise, sending every
+                                // later print to stderr (measured: 070
+                                // lost 21 stdout lines after the dup).
+                                let (glob, from) = if src == 2 {
+                                    ("STDERR", "STDOUT")
+                                } else {
+                                    ("STDOUT", "STDERR")
+                                };
+                                emit_indent(out, indent);
+                                out.push_str(&format!(
+                                    "{{ local *{glob}; open {glob}, {mode}, {from} or die \"Cannot dup {glob}: $!\\n\";\n",
+                                ));
+                                for s in inner {
+                                    emit_stmt(out, s, indent + 1);
+                                }
+                                emit_indent(out, indent);
+                                out.push_str("}\n");
                             }
                         }
                         Some(r) if matches!(r.mode.as_str(), "w" | "wc" | "a" | "r+") => {
@@ -2493,9 +2667,10 @@ pub(crate) fn emit_stmt(out: &mut String, stmt: &IrStmt, indent: usize) {
                         let rest: Vec<String> = words.iter().map(|w| render_word_list(w)).collect();
                         emit_indent(out, indent);
                         out.push_str(&format!(
-                            "{}({}); $main_exit_code = $CHILD_ERROR = 0;\n",
+                            "{}({});{}\n",
                             name,
-                            rest.join(", ")
+                            rest.join(", "),
+                            rc_write(" $main_exit_code = $CHILD_ERROR = 0;")
                         ));
                     }
                     "fnValue" => {
@@ -2510,15 +2685,25 @@ pub(crate) fn emit_stmt(out: &mut String, stmt: &IrStmt, indent: usize) {
                         let rest: Vec<String> = words.iter().map(|w| render_word_list(w)).collect();
                         out.push_str(&format!("{}({})", name, rest.join(", ")));
                     }
-                    "test" => {
-                        // Bare `[ cond ]` as a statement: the exit status is the
-                        // condition's truth.
+                    "test" | "strHasPrefix" | "strHasSuffix" | "contains" => {
+                        // Bare `[ cond ]` as a statement — or the value
+                        // primitive a bare test lowered to (the test-lowering
+                        // rewrites chain leaves and bare test statements):
+                        // the exit status is the condition's truth.
                         let cond = ir_expr_to_perl(e);
-                        emit_indent(out, indent);
-                        out.push_str(&format!(
-                            "$main_exit_code = $CHILD_ERROR = ({}) ? 0 : 1;\n",
-                            cond
-                        ));
+                        if rc_unread() {
+                            // Still EVALUATE the condition — its words may
+                            // carry side effects (`[ "$(touch f)" = x ]`) —
+                            // and discard the value.
+                            emit_indent(out, indent);
+                            out.push_str(&format!("({});\n", cond));
+                        } else {
+                            emit_indent(out, indent);
+                            out.push_str(&format!(
+                                "$main_exit_code = $CHILD_ERROR = ({}) ? 0 : 1;\n",
+                                cond
+                            ));
+                        }
                     }
                     "grepMatches" => {
                         // `grep -o PAT` — print each match.
@@ -2529,7 +2714,11 @@ pub(crate) fn emit_stmt(out: &mut String, stmt: &IrStmt, indent: usize) {
                         let fl = if flags.contains('i') { "i" } else { "" };
                         emit_indent(out, indent);
                         out.push_str(&format!(
-                            "for my $__m (({text}) =~ /{rx}/{fl}g) {{ print $__m, \"\\n\"; }} $main_exit_code = $CHILD_ERROR = 0;\n"
+                            "for my $__m (({text}) =~ /{rx}/{fl}g) {{ print $__m, \"\\n\"; }}{}\n",
+                            rc_write(" $main_exit_code = $CHILD_ERROR = 0;"),
+                            text = text,
+                            rx = rx,
+                            fl = fl,
                         ));
                     }
                     "pipeline" => {
@@ -2539,7 +2728,7 @@ pub(crate) fn emit_stmt(out: &mut String, stmt: &IrStmt, indent: usize) {
                         // the shell command string and run it via bash -c
                         // (matches bash stdout by running the same tools).
                         if let Some(s) = crate::pipeline_native::native_pipeline(e) {
-                            out.push_str(&s);
+                            out.push_str(&rc_stripped(&s));
                             out.push('\n');
                             return;
                         }
@@ -2555,11 +2744,29 @@ pub(crate) fn emit_stmt(out: &mut String, stmt: &IrStmt, indent: usize) {
                         if let Some(cmd) = pipeline_call_to_cmd(e) {
                             emit_shell_cmd(out, indent, &cmd);
                         } else if let Some(stages) = pipeline_stages_of(e) {
+                            // `PROD | head -N | while read …` must be bound
+                            // before the loop (see
+                            // `try_bounded_while_read_tail`); it fires before
+                            // the stage-by-stage emission below, which runs an
+                            // infinite producer to completion first.
+                            if try_bounded_while_read_tail(out, indent, &stages) {
+                                return;
+                            }
                             // No single shell command (a stage is a Perl-side
                             // materialisation, e.g. a process substitution):
                             // emit the stages in order. The producer stages
                             // write their files; the last consumer reads
                             // STDIN, exactly like the original pipeline.
+                            //
+                            // …UNLESS a stage cannot be rebuilt as shell text
+                            // at all (a SUBSHELL whose body was lowered to
+                            // Perl): then the consumer below reads the
+                            // SCRIPT's stdin and blocks forever —
+                            // 063_hard_to_parse printed every line correctly
+                            // and then hung on `sort -n`.
+                            if emit_pipeline_stage_fallback(out, indent, &stages) {
+                                return;
+                            }
                             for stage in &stages {
                                 for s in stage {
                                     emit_stmt(out, s, indent);
@@ -2618,7 +2825,7 @@ pub(crate) fn emit_stmt(out: &mut String, stmt: &IrStmt, indent: usize) {
                             }
                         } else {
                             emit_indent(out, indent);
-                            out.push_str("$CHILD_ERROR = 0;\n");
+                            out.push_str(&rc_write("$CHILD_ERROR = 0;\n"));
                         }
                     }
                     "caseMatch" | "define" | "subshell" | "background" => {
@@ -2643,12 +2850,13 @@ pub(crate) fn emit_stmt(out: &mut String, stmt: &IrStmt, indent: usize) {
                         {
                             emit_indent(out, indent);
                             out.push_str(&format!(
-                                "$__nocasematch = {}; $main_exit_code = $CHILD_ERROR = 0;\n",
-                                if on { 1 } else { 0 }
+                                "$__nocasematch = {};{}\n",
+                                if on { 1 } else { 0 },
+                                rc_write(" $main_exit_code = $CHILD_ERROR = 0;")
                             ));
                         } else {
                             emit_indent(out, indent);
-                            out.push_str("$main_exit_code = $CHILD_ERROR = 0;\n");
+                            out.push_str(&rc_write("$main_exit_code = $CHILD_ERROR = 0;\n"));
                         }
                     }
                     "redirect" => {
@@ -2761,19 +2969,30 @@ pub(crate) fn emit_stmt(out: &mut String, stmt: &IrStmt, indent: usize) {
                     // postfix, new for prefix): 0 → status 1 (examples/arith-
                     // postfix-status).
                     let e = arith_ast_to_perl(a);
-                    emit_indent(out, indent);
-                    out.push_str(&format!(
-                        "$main_exit_code = $CHILD_ERROR = (({}) != 0) ? 0 : 1;\n",
-                        e
-                    ));
+                    if rc_unread() {
+                        // The ternary is the ONLY emission of this
+                        // statement — `($i++)` inside it PERFORMS the
+                        // increment, so dropping the whole line would drop
+                        // the side effect (bench-increment: i stayed 1).
+                        // Evaluate and discard the value instead.
+                        emit_indent(out, indent);
+                        out.push_str(&format!("({});\n", e));
+                    } else {
+                        emit_indent(out, indent);
+                        out.push_str(&format!(
+                            "$main_exit_code = $CHILD_ERROR = (({}) != 0) ? 0 : 1;\n",
+                            e
+                        ));
+                    }
                 }
                 // `! cmd` in statement position — run the command and
                 // invert the exit status (not-negation.sh's bare `! grep`).
                 IrExpr::BinOp { op: BinOpKind::Not, rhs, .. } => {
                     if let Some(cmd) = expr_to_cmd(rhs) {
                         emit_shell_cmd(out, indent, &cmd);
-                        emit_indent(out, indent);
-                        out.push_str("$main_exit_code = $CHILD_ERROR = ($CHILD_ERROR == 0) ? 1 : 0;\n");
+                        out.push_str(&rc_write(
+                            "$main_exit_code = $CHILD_ERROR = ($CHILD_ERROR == 0) ? 1 : 0;\n"
+                        ));
                     } else {
                         emit_indent(out, indent);
                         out.push_str("die \"otranspilerl: shIR `!` expression not renderable (Perl backend)\\n\";\n");
@@ -2798,22 +3017,22 @@ pub(crate) fn emit_stmt(out: &mut String, stmt: &IrStmt, indent: usize) {
                     }
                     out.push_str(" }\n");
                     emit_indent(out, indent);
-                    out.push_str("$main_exit_code = $CHILD_ERROR = 0;\n");
+                    out.push_str(&rc_write("$main_exit_code = $CHILD_ERROR = 0;\n"));
                 }
                 // Non-Call expressions: bare `&&`/`||` chains of execs,
                 // redirects, pipelines — run the reconstructed shell command.
                 other_expr => {
                     if let Some(s) = crate::pipeline_native::native_chain(other_expr) {
                         emit_indent(out, indent);
-                        out.push_str(&s);
+                        out.push_str(&rc_stripped(&s));
                         out.push('\n');
                     } else if let Some(s) = cd_chain_to_perl(other_expr) {
                         emit_indent(out, indent);
-                        out.push_str(&s);
+                        out.push_str(&rc_stripped(&s));
                         out.push('\n');
                     } else if let Some(s) = control_chain_to_perl(other_expr) {
                         emit_indent(out, indent);
-                        out.push_str(&s);
+                        out.push_str(&rc_stripped(&s));
                         out.push('\n');
                     } else if let Some(s) = fn_chain_to_perl(other_expr) {
                         // `try … || true` — the LHS is a call to a function
@@ -2823,8 +3042,24 @@ pub(crate) fn emit_stmt(out: &mut String, stmt: &IrStmt, indent: usize) {
                         // printed the raw command line instead of its
                         // results).
                         emit_indent(out, indent);
-                        out.push_str(&s);
+                        out.push_str(&rc_stripped(&s));
                         out.push('\n');
+                    } else if crate::shir::is_pure_bool(other_expr) {
+                        // A bare boolean-value statement: a typed comparison /
+                        // Not the test-lowering left behind (a bare lowered
+                        // test statement, or a chain guard that took the
+                        // chain apart). Same contract as a statement-position
+                        // `test`: evaluate, write the 0/1 status.
+                        let cond = ir_expr_to_perl(other_expr);
+                        emit_indent(out, indent);
+                        if rc_unread() {
+                            out.push_str(&format!("({});\n", cond));
+                        } else {
+                            out.push_str(&format!(
+                                "$main_exit_code = $CHILD_ERROR = ({}) ? 0 : 1;\n",
+                                cond
+                            ));
+                        }
                     } else if matches!(other_expr, IrExpr::BinOp { op: BinOpKind::And | BinOpKind::Or, .. })
                         && capture_expr_native(other_expr)
                     {
@@ -2863,18 +3098,18 @@ pub(crate) fn emit_stmt(out: &mut String, stmt: &IrStmt, indent: usize) {
                     emit_indent(out, indent);
                     out.push_str(&embedded);
                     emit_indent(out, indent);
-                    out.push_str("$main_exit_code = $CHILD_ERROR = 0;\n");
+                    out.push_str(&rc_write("$main_exit_code = $CHILD_ERROR = 0;\n"));
                 } else {
                     emit_indent(out, indent);
                     out.push_str(&format!("print({}, \"\\n\");\n", expr));
                     emit_indent(out, indent);
-                    out.push_str("$main_exit_code = $CHILD_ERROR = 0;\n");
+                    out.push_str(&rc_write("$main_exit_code = $CHILD_ERROR = 0;\n"));
                 }
             } else {
                 emit_indent(out, indent);
                 out.push_str(&format!("print({});\n", expr));
                 emit_indent(out, indent);
-                out.push_str("$main_exit_code = $CHILD_ERROR = 0;\n");
+                out.push_str(&rc_write("$main_exit_code = $CHILD_ERROR = 0;\n"));
             }
         }
 
@@ -2930,11 +3165,18 @@ pub(crate) fn emit_stmt(out: &mut String, stmt: &IrStmt, indent: usize) {
                     if let ArithAst::IncDec { var, .. } = &**ast {
                         if var == &targets[0].var {
                             let e = arith_ast_to_perl(ast);
-                            emit_indent(out, indent);
-                            out.push_str(&format!(
-                                "$main_exit_code = $CHILD_ERROR = (({}) != 0) ? 0 : 1;\n",
-                                e
-                            ));
+                            if rc_unread() {
+                                // Side-effect-only form: the increment must
+                                // still run (see the bare-Arith arm).
+                                emit_indent(out, indent);
+                                out.push_str(&format!("({});\n", e));
+                            } else {
+                                emit_indent(out, indent);
+                                out.push_str(&format!(
+                                    "$main_exit_code = $CHILD_ERROR = (({}) != 0) ? 0 : 1;\n",
+                                    e
+                                ));
+                            }
                             return;
                         }
                     }
@@ -3079,6 +3321,38 @@ pub(crate) fn emit_stmt(out: &mut String, stmt: &IrStmt, indent: usize) {
                                     return;
                                 }
                             }
+                            // A bare-Exec body (`$(mktemp)` — both the
+                            // process_subst materialisation and a parsed
+                            // simple command): adapt cmd+args to the shared
+                            // `exec` call shape (same adaptation as the
+                            // statement site) so a value-channel capability
+                            // (mktemp, pathops) lowers it here too, instead
+                            // of only the shell-text rebuild downstream.
+                            if let [IrStmt::Exec {
+                                cmd: ec,
+                                args: ea,
+                                capture: None,
+                                redirects: ers,
+                                env: envs,
+                            }] = arrow.as_slice()
+                            {
+                                // Only the bare command lowers here — a
+                                // redirect/env still needs the shell-text
+                                // rebuild downstream.
+                                if ers.is_empty() && envs.is_empty() {
+                                    let adapted = IrExpr::Call {
+                                        func: "exec".to_string(),
+                                        args: vec![ec.clone(), IrExpr::Array(ea.clone())],
+                                    };
+                                    if let Some(val) =
+                                        crate::pipeline_native::native_capture_call(&adapted)
+                                    {
+                                        emit_indent(out, indent);
+                                        out.push_str(&format!("{} = {};\n", lhs, val));
+                                        return;
+                                    }
+                                }
+                            }
                             // Natively emittable body (folded `Output`, the
                             // `grepMatches` lift, `&&`/`||` chains): capture
                             // the Perl prints in-process. Without this a
@@ -3094,8 +3368,9 @@ pub(crate) fn emit_stmt(out: &mut String, stmt: &IrStmt, indent: usize) {
                                 }
                                 emit_indent(out, indent);
                                 out.push_str(&format!(
-                                    "{} = do {{ my $__cap = ''; {{ local *STDOUT; open(STDOUT, '>', \\$__cap) or die \"capture: $!\\n\"; {body};; }} $__cap =~ s/\\n+\\z//; $__cap }};\n",
-                                    lhs
+                                    "{} = {};\n",
+                                    lhs,
+                                    capture_do_perl(&format!("{body};;"))
                                 ));
                                 return;
                             }
@@ -3161,8 +3436,9 @@ pub(crate) fn emit_stmt(out: &mut String, stmt: &IrStmt, indent: usize) {
                                 }
                                 emit_indent(out, indent);
                                 out.push_str(&format!(
-                                    "{} = do {{ my $__cap = ''; {{ local *STDOUT; open(STDOUT, '>', \\$__cap) or die \"capture: $!\\n\"; {body};; }} $__cap =~ s/\\n+\\z//; $__cap }};\n",
-                                    lhs
+                                    "{} = {};\n",
+                                    lhs,
+                                    capture_do_perl(&format!("{body};;"))
                                 ));
                                 return;
                             }
@@ -3189,6 +3465,26 @@ pub(crate) fn emit_stmt(out: &mut String, stmt: &IrStmt, indent: usize) {
                                 .map(|c| format!("{c}{}", take_heredoc_tail())),
                             _ => None,
                         };
+                        // In-process mktemp: `x=$(mktemp)` is a process
+                        // created purely to hand back a fresh filename —
+                        // bash does the identical thing (create an empty
+                        // file, print its path). File::Temp::tempfile
+                        // matches (O_EXCL, mode 0600, name from a secure
+                        // PRNG, TMPDIR) with no fork/exec. Same rewrite as
+                        // the capture-sink arm in emit_capture_assign.
+                        if let Some(cmd) = capture_call_to_cmd(inner_expr) {
+                            // The rebuilt text quotes the word (`'mktemp'`),
+                            // so accept both spellings like emit_capture_assign
+                            // does; a bare `== "mktemp"` missed every site.
+                            if matches!(cmd.trim(), "'mktemp'" | "mktemp") {
+                                emit_indent(out, indent);
+                                out.push_str(&format!(
+                                    "{} = do {{ require File::Temp; (File::Temp::tempfile('sh2_ps_XXXXXX', TMPDIR => 1, UNLINK => 0))[1] }}; $CHILD_ERROR = 0;\n",
+                                    lhs
+                                ));
+                                return;
+                            }
+                        }
                         let open_expr = if let Some(cmd) = shell_cmd {
                             cmd_str_to_open_perl(&cmd)
                         } else if let IrExpr::Arrow(stmts) = inner_expr.as_ref() {
@@ -3203,9 +3499,7 @@ pub(crate) fn emit_stmt(out: &mut String, stmt: &IrStmt, indent: usize) {
                             for st in stmts.iter() {
                                 emit_stmt(&mut body, st, 1);
                             }
-                            format!(
-                                "do {{ my $__cap = ''; {{ local *STDOUT; open(STDOUT, '>', \\$__cap) or die \"capture: $!\\n\"; {body};; }} $__cap =~ s/\\n+\\z//; $__cap }}"
-                            )
+                                capture_do_perl(&format!("{body};;"))
                         } else {
                             let mut inner_str = ir_expr_to_perl(inner_expr);
                             // Strip surrounding backticks from StrStyle::Command rendering
@@ -3250,6 +3544,13 @@ pub(crate) fn emit_stmt(out: &mut String, stmt: &IrStmt, indent: usize) {
                                         "{} {} {};\n",
                                         lhs, op_str, inner_rhs_str
                                     ));
+                                    if scalar_phase_var(var) {
+                                        emit_indent(out, indent);
+                                        out.push_str(&format!(
+                                            "$ENV{{{v}}} = ${{{v}}} if exists $ENV{{{v}}};\n",
+                                            v = var
+                                        ));
+                                    }
                                     return;
                                 }
                             }
@@ -3257,6 +3558,20 @@ pub(crate) fn emit_stmt(out: &mut String, stmt: &IrStmt, indent: usize) {
                     }
                     emit_indent(out, indent);
                     out.push_str(&format!("{} = {};\n", lhs, rhs));
+                }
+                // Every scalar-phase write path (capture, fallback,
+                // compound, plain) lands here before the single-target
+                // block closes: refresh %ENV but ONLY when the name is
+                // already exported at runtime — the guarded publish is
+                // what keeps an unexported assignment out of children
+                // (Bug A) while an inherited/exported name keeps
+                // propagating.
+                if scalar_phase_var(var) {
+                    emit_indent(out, indent);
+                    out.push_str(&format!(
+                        "$ENV{{{v}}} = ${{{v}}} if exists $ENV{{{v}}};\n",
+                        v = var
+                    ));
                 }
             } else {
                 let lhs = targets
@@ -3337,7 +3652,7 @@ pub(crate) fn emit_stmt(out: &mut String, stmt: &IrStmt, indent: usize) {
             // native_if_test_cond (indicated by IrExpr::Str), set
             // $CHILD_ERROR so $? reflects the test result for subsequent
             // commands that read $? (e.g. `[ "$?" = "0" ]` after a loop).
-            if matches!(cond, IrExpr::Str(_, _)) {
+            if matches!(cond, IrExpr::Str(_, _)) && !rc_unread() {
                 emit_indent(out, indent);
                 out.push_str(&format!("$CHILD_ERROR = ({}) ? 0 : 1;\n", cond_str));
             }
@@ -3368,7 +3683,7 @@ pub(crate) fn emit_stmt(out: &mut String, stmt: &IrStmt, indent: usize) {
                 emit_indent(out, indent);
                 out.push_str("} else {\n");
                 emit_indent(out, indent + 1);
-                out.push_str("$CHILD_ERROR = 0;\n");
+                out.push_str(&rc_write("$CHILD_ERROR = 0;\n"));
             }
             emit_indent(out, indent);
             out.push_str("}\n");
@@ -3499,9 +3814,10 @@ pub(crate) fn emit_stmt(out: &mut String, stmt: &IrStmt, indent: usize) {
                     // Not a parseable command line: bash reports a syntax
                     // error and leaves a nonzero status.
                     emit_indent(out, indent);
-                    out.push_str(
-                        "(print STDERR \"$0: eval: syntax error\\n\"); $main_exit_code = $CHILD_ERROR = 1;\n",
-                    );
+                    out.push_str(&format!(
+                        "(print STDERR \"$0: eval: syntax error\\n\");{}\n",
+                        rc_write(" $main_exit_code = $CHILD_ERROR = 1;")
+                    ));
                     return;
                 }
             }
@@ -3564,10 +3880,11 @@ pub(crate) fn emit_stmt(out: &mut String, stmt: &IrStmt, indent: usize) {
                 // Use open()-based capture with safe quoting
                 emit_indent(out, indent);
                 out.push_str(&format!(
-                    "my ${} = do {{ {}open(my $__fh, \'-|\', \'bash\', \'-c\', {}) or die \"cmd failed: $!\\n\"; my $_r = do {{ local $/; <$__fh> }}; close $__fh; $_r =~ s/\\n+\\z//; $CHILD_ERROR = $? >> 8; $_r; }};\n",
+                    "my ${} = do {{ {}open(my $__fh, \'-|\', \'bash\', \'-c\', {}, $0) or die \"cmd failed: $!\\n\"; my $_r = do {{ local $/; <$__fh> }}; close $__fh; $_r =~ s/\\n+\\z//;{} $_r; }};\n",
                     var,
                     exports,
-                    safe_perl_q_string(&full_cmd)
+                    safe_perl_q_string(&full_cmd),
+                    rc_write(" $CHILD_ERROR = $? >> 8;")
                 ));
             } else {
                 // Without capture: try the native capability tree first (the
@@ -3579,8 +3896,19 @@ pub(crate) fn emit_stmt(out: &mut String, stmt: &IrStmt, indent: usize) {
                 };
                 if let Some(native) = crate::pipeline_native::native_exec_stmt(&adapted) {
                     emit_indent(out, indent);
-                    out.push_str(&native);
-                    out.push('\n');
+                    // Same doctrine as the Expr-call site below: a value-
+                    // channel leaf (`$__sh_cap`) reached in STATEMENT
+                    // position must still print its value — a bare `mktemp;`
+                    // prints its path in bash (and `pwd;` likewise; pathops'
+                    // leaf has always been exposed here).
+                    if native.contains("$__sh_cap") {
+                        out.push_str(&format!(
+                            "my $__sh_cap; {native} print $__sh_cap, \"\\n\" if defined $__sh_cap;\n"
+                        ));
+                    } else {
+                        out.push_str(&native);
+                        out.push('\n');
+                    }
                     return;
                 }
                 // Without capture: run the command via system() for side effects.
@@ -3624,12 +3952,14 @@ pub(crate) fn emit_stmt(out: &mut String, stmt: &IrStmt, indent: usize) {
                 if let Some(argv) = sh_split_simple_cmd(&full_cmd) {
                     let args = argv.iter().map(|w| perl_word_literal(w)).collect::<Vec<_>>().join(", ");
                     out.push_str(&format!(
-                        "__sh_uu_run({args}); $main_exit_code = $CHILD_ERROR = $__sh_uu_rc;\n"
+                        "__sh_uu_run({args});{}\n",
+                        rc_write(" $main_exit_code = $CHILD_ERROR = $__sh_uu_rc;")
                     ));
                 } else {
                     out.push_str(&format!(
-                        "system('bash', '-c', {}); $main_exit_code = $CHILD_ERROR = $? >> 8;\n",
-                        safe_perl_q_string(&full_cmd)
+                        "system('bash', '-c', {});{}\n",
+                        safe_perl_q_string(&full_cmd),
+                        rc_write(" $main_exit_code = $CHILD_ERROR = $? >> 8;")
                     ));
                 }
             }
@@ -3740,6 +4070,14 @@ pub(crate) fn emit_stmt(out: &mut String, stmt: &IrStmt, indent: usize) {
                         return;
                     }
                 }
+                // `PROD | head -N | while read VAR; do BODY; done` (065):
+                // see `try_bounded_while_read_tail`.
+                if try_bounded_while_read_tail(out, indent, stages) {
+                    return;
+                }
+                if emit_pipeline_stage_fallback(out, indent, stages) {
+                    return;
+                }
                 for stage in stages {
                     for s in stage {
                         emit_stmt(out, s, indent);
@@ -3819,6 +4157,45 @@ pub(crate) fn call_arg_str(e: &IrExpr) -> Option<String> {
     }
 }
 
+/// A subscripted base name in RENDERED Perl: `array[i]` → `array[$i]`,
+/// `array[2]` → `array[2]`, `map["k"]` → `map['k']`, `plain` unchanged.
+/// The shIR hands these back as SOURCE text, and a bare subscript is a
+/// BAREWORD under `use strict` — `scalar(@array[i])` never compiled
+/// (063_hard_to_parse lost every line of output to it).
+fn perl_subscripted_base(base: &str) -> String {
+    let (name, key) = match split_indexed_var(base) {
+        (n, Some(k)) => (n, k),
+        (n, None) => return n.to_string(),
+    };
+    let key = key.trim();
+    let rendered = if key.is_empty() {
+        "0".to_string()
+    } else if key.chars().all(|c| c.is_ascii_digit()) {
+        key.to_string()
+    } else if key.starts_with('$') || key.starts_with('@') || key.starts_with('%') {
+        // already Perl (`array[$i]` from a `${…}` expansion)
+        key.to_string()
+    } else if key.len() >= 2
+        && ((key.starts_with('"') && key.ends_with('"'))
+            || (key.starts_with('\'') && key.ends_with('\'')))
+    {
+        format!(
+            "'{}'",
+            key[1..key.len() - 1].replace('\\', "\\\\").replace('\'', "\\'")
+        )
+    } else {
+        // a bare word in a subscript is a bash VARIABLE (`array[i]`, and in
+        // arithmetic context `${#array[i][@]}` it is evaluated as one)
+        let v = key.replace('.', "_").replace('-', "_");
+        if is_env_style_var_name(&v) && !scalar_phase_var(&v) {
+            format!("$ENV{{{}}}", v)
+        } else {
+            format!("${}", v)
+        }
+    };
+    format!("{}[{}]", name, rendered)
+}
+
 /// Split a possibly-indexed var name ("matrix[0,0]") into base + optional
 /// comma-key. Bash pseudo-multidimensional arrays bake the subscript into
 /// the name at the parser level (Assign targets with `indices: []`).
@@ -3831,10 +4208,43 @@ fn split_indexed_var(name: &str) -> (&str, Option<&str>) {
     (name, None)
 }
 
+/// Env-style names that carry a PLAIN (non-export) assignment somewhere
+/// in the program. Bash keeps every variable in one store and publishes
+/// only the EXPORTED ones to children; routing env-style names straight
+/// to `%ENV` published `SHELL_VAR=\"Hello World\"` before any `export`
+/// ran, so a `perl -e` child saw it early (examples/045, ./fail's Group
+/// C / Bug A). The names in this set store to the perl SCALAR instead,
+/// and every write refreshes `%ENV` only when the name is ALREADY
+/// exported — at runtime `exists $ENV{N}` is exactly "bash would
+/// propagate this name" (an inherited name like PATH stays exported
+/// across a bare re-assignment; a fresh one does not appear until an
+/// `export` publishes it). `export` itself re-syncs from the scalar.
+thread_local! {
+    static SCALAR_PHASE_VARS: std::cell::RefCell<std::collections::HashSet<String>> =
+        std::cell::RefCell::new(std::collections::HashSet::new());
+}
+
+/// Install the program's scalar-phase set (called once per program by
+/// `perl_generator_fixed::generate` before anything renders).
+pub(crate) fn set_scalar_phase_vars(names: std::collections::HashSet<String>) {
+    SCALAR_PHASE_VARS.with(|s| *s.borrow_mut() = names);
+}
+
+/// Is this name in the program's scalar-phase set?
+pub(crate) fn scalar_phase_var(name: &str) -> bool {
+    SCALAR_PHASE_VARS.with(|s| s.borrow().contains(name))
+}
+
 /// The Perl lhs for a (possibly indexed) var name: `matrix[0,0]` →
 /// `$matrix{"0,0"}` (a hash key — bash's fake-multidim), plain names →
 /// `$name` / `$ENV{name}`.
 fn perl_lhs_for(var: &str) -> String {
+    // A scalar-phase env-style name stores in the SCALAR (see
+    // `scalar_phase_var`); the write site appends the guarded %ENV
+    // refresh.
+    if scalar_phase_var(var) {
+        return format!("${}", var);
+    }
     if is_env_style_var_name(var) {
         return format!("$ENV{{{}}}", var);
     }
@@ -3888,6 +4298,11 @@ fn var_read(name: &str) -> String {
     // command).
     if name == "@" || name == "*" {
         return "join(' ', @ARGV)".to_string();
+    }
+    // A scalar-phase name (plain assignment, no export before it) reads
+    // from the SCALAR home — matching where the write site stores it.
+    if scalar_phase_var(name) {
+        return format!("${}", name);
     }
     if is_env_style_var_name(name) {
         return format!("$ENV{{{}}}", name);
@@ -3977,7 +4392,9 @@ fn var_read(name: &str) -> String {
 /// form Perl interpolates (`p`, `p[1]`). The case-pattern capture hoist
 /// produces `$__sh2_casepat_N`, and a user may write `"$p"` directly; both
 /// are runtime values, not globs.
-fn case_pattern_var_name(pat: &str) -> Option<String> {
+/// is a runtime value, not globs. (SHARED: the Rust backend's Case arm
+/// uses the same recognition — see rust_backend's pattern predicate.)
+pub(crate) fn case_pattern_var_name(pat: &str) -> Option<String> {
     let inner = pat.strip_prefix('$')?;
     // `${name}` — strip the braces; a nested expansion (`${p:-x}`) is not a
     // plain reference and is left to the glob path.
@@ -4152,11 +4569,23 @@ fn glob_to_regex_greedy(pat: &str, greedy: bool) -> String {
             '*' => out.push_str(star),
             '?' => out.push_str("."),
             '\\' => {
-                if let Some(&d) = chars.peek() {
-                    out.push('\\');
-                    out.push(d);
-                    chars.next();
+                // `\X` is a LITERAL X in a glob — bash removes the backslash
+                // before matching — so a wildcard loses its meaning here and
+                // every regex metacharacter has to be escaped. Keeping the
+                // backslash (what this arm used to do) made it a REGEX escape
+                // instead: `${v/\q/Z}` emitted `\q`, and `${v/\\*/Z}` matched
+                // a live `.*` where bash matches a literal `*`.
+                if let Some(d) = chars.next() {
+                    match d {
+                        '*' | '?' | '[' | ']' | '.' | '(' | ')' | '+' | '|' | '^' | '$'
+                        | '{' | '}' | '\\' => {
+                            out.push('\\');
+                            out.push(d);
+                        }
+                        _ => out.push(d),
+                    }
                 } else {
+                    // A trailing lone backslash is a literal one.
                     out.push_str("\\\\");
                 }
             }
@@ -4304,7 +4733,22 @@ fn arith_str_to_perl(s: &str) -> Option<String> {
     }
     let mut out = crate::shir::parse_arith(&t).map(|ast| arith_ast_to_perl(&ast))?;
     for (sent, val) in repls {
-        out = out.replace(&format!("${}", sent), &format!("({})", val));
+        // A spliced operand may be EMPTY at runtime (`$1` with no args,
+        // `$(…)` printing nothing, `${v}` of an empty var). bash expands
+        // the operands BEFORE parsing the arithmetic, so an empty operand
+        // leaves text like ` * 100 + ` for the parser to reject
+        // ("operand expected"), and the failed expansion ABANDONS the whole
+        // command: `echo $(($1 * 100 + $2))` with no args prints nothing
+        // and leaves $? = 1 (parse-dollar-in-arithmetic). Flag any empty
+        // operand HERE — `emit_echo` scans for this `$__SH2_AE = 1` write
+        // and skips the print when it is still set after evaluating args.
+        out = out.replace(
+            &format!("${}", sent),
+            &format!(
+                "(do {{ no warnings; my $__t = ({}); !(defined($__t) && length($__t)) && ($__SH2_AE = 1); $__t }})",
+                val
+            ),
+        );
     }
     Some(out)
 }
@@ -4404,8 +4848,9 @@ fn render_word(e: &IrExpr) -> String {
         IrExpr::Str(s, style) => {
             // Reuse the Str rendering from ir_expr_to_perl by constructing it.
             if let Some(pat) = s.strip_prefix("\u{1}SH2GLOB\u{1}") {
-                // Shell glob word — expand via Perl's glob().
-                format!("glob('{}')", pat.replace('\'', "\\\\'"))
+                // Shell glob word — expand via Perl's glob() with bash's
+                // unmatched-pattern rule (the pattern stays a literal word).
+                glob_call(pat)
             } else {
                 render_str_literal(s, style)
             }
@@ -4457,6 +4902,29 @@ fn render_word(e: &IrExpr) -> String {
                             );
                         }
                     }
+                    // A transform-baked native body: `native_echo_filter_stmt`
+                    // folds `$(echo LIT | sed 's/PAT/REPL/')` into a RawText
+                    // whose `print` IS the captured value. The
+                    // `IrExpr::Capture` spelling of the same body marks it
+                    // (`native = true`, see `transform_expr`) and
+                    // [`ir_expr_to_perl`] wraps it in the stdout-redirect
+                    // idiom; the `captureWords` WORD spelling had no such arm,
+                    // so `arrow_to_cmd` below could not rebuild shell text out
+                    // of RawText and the whole capture silently rendered as
+                    // `''` — `local p3=$(… | sed …)` came out empty
+                    // (examples/062_09_complex_function, 062_hard_to_lex).
+                    // Same wrapper, then the word-position join/split the
+                    // sibling branches above already apply.
+                    if stmts.iter().any(|s| matches!(s, IrStmt::RawText(_))) {
+                        let mut body = String::new();
+                        for st in stmts.iter() {
+                            emit_stmt(&mut body, st, 1);
+                        }
+                        return format!(
+                            "join(' ', split(/\\s+/, do {{ my $__cap = ''; {{ local *STDOUT; open(STDOUT, '>', \\$__cap) or die \"capture: $!\\n\"; {body};; }} $__cap =~ s/\\n+\\z//; $__cap }}))"
+                        );
+                    }
+                    let _ = stmts;
                 }
                 let cap = args.first().and_then(arrow_to_cmd);
                 match cap {
@@ -4590,10 +5058,12 @@ fn strip_re(var: &str, pat: &str) -> String {
 ///  * `@` and `$` are INTERPOLATED into a replacement, so `${v/a/@b/}` would
 ///    splice Perl's `@b` array instead of the text `@b`. Both are escaped.
 ///
-/// An unrecognised escape keeps its backslash (`\q` → `\q`), which is what
-/// bash does for an operator it does not define; `\ ` (escaped space) and
-/// `\$`/`\@` become the bare character, since bash's rule is "a backslash
-/// quotes the next character".
+/// One level of shell escaping is removed FIRST (`\X` → the bare `X`, so
+/// `${v/Q/\c}` replaces with `c`, `${v/Q/\\c}` with `\c` and `${v/Q/\\\c}`
+/// with `\c` — measured against bash, quoted and bare), and only then is the
+/// result escaped for a Perl substitution body. Escaping before that removal
+/// would turn one source backslash into two emitted ones and print `b\/c`
+/// where bash prints `b/c`.
 ///
 /// `/` is escaped rather than switching to the brace delimiter `s{pat}{rep}`
 /// used by {@link strip_re}: the brace form suits prefix/suffix stripping but
@@ -4605,31 +5075,27 @@ fn strip_re(var: &str, pat: &str) -> String {
 /// substitution-body escaping, which are not the same transformation.
 fn repl_for_regex(rep: &str) -> String {
     let mut out = String::with_capacity(rep.len());
-    let mut chars = rep.chars().peekable();
+    let mut chars = rep.chars();
     while let Some(c) = chars.next() {
-        match c {
-            // A shell escape: emit the escaped character, escaped for Perl.
-            '\\' => match chars.next() {
-                // `\\` is a literal backslash → `\\\\` in the Perl body.
-                Some('\\') => out.push_str("\\\\"),
-                // An escaped character that Perl would re-interpret.
-                Some(ch @ ('/' | '$' | '@')) => {
-                    out.push('\\');
-                    out.push(ch);
-                }
-                // `\n`, `\t`, … mean what they mean in bash; `\q` means `\q`.
-                Some('n') => out.push_str("\\n"),
-                Some('t') => out.push_str("\\t"),
-                Some(ch) => {
-                    out.push('\\');
-                    out.push(ch);
-                }
-                None => out.push_str("\\\\"),
-            },
-            '/' => out.push_str("\\/"),
-            '@' => out.push_str("\\@"),
-            '$' => out.push_str("\\$"),
-            _ => out.push(c),
+        let lit = if c == '\\' {
+            match chars.next() {
+                Some(d) => d,
+                // A trailing lone backslash stands for itself.
+                None => '\\',
+            }
+        } else {
+            c
+        };
+        match lit {
+            // A literal backslash has to be `\\` in the body or it swallows
+            // the character after it; `/` ends the substitution and `$`/`@`
+            // interpolate, so all three are escaped.
+            '\\' => out.push_str("\\\\"),
+            '/' | '$' | '@' => {
+                out.push('\\');
+                out.push(lit);
+            }
+            _ => out.push(lit),
         }
     }
     out
@@ -5022,11 +5488,23 @@ fn render_param(args: &[IrExpr]) -> String {
             // `@` offset and no length). A hash's `${#h[@]}` is its key
             // count.
             if name.starts_with('#') && raw_off == "@" && raw_len.is_empty() {
-                let base = &name[1..];
-                return if array_var(base) {
-                    format!("scalar(@{})", base)
+                // The subscript is a bash WORD, overwhelmingly a VARIABLE
+                // name (`${#array[i][@]}`): splicing it raw emitted
+                // `scalar(@array[i])` — a bareword `i` that `use strict`
+                // refuses ("Bareword \"i\" not allowed while \"strict subs\"
+                // in use"), a COMPILE error that made `do FILE` return before
+                // a single statement ran (063_hard_to_parse printed nothing).
+                // A SUBSCRIPTED base also cannot take `keys %…[…]` (invalid
+                // Perl), so the indexed form always uses the array spelling.
+                let raw_base = &name[1..];
+                let rendered = perl_subscripted_base(raw_base);
+                let base_for_census = raw_base.split('[').next().unwrap_or(raw_base);
+                return if rendered.contains('[') {
+                    format!("scalar(@{})", rendered)
+                } else if array_var(base_for_census) {
+                    format!("scalar(@{})", rendered)
                 } else {
-                    format!("scalar(keys %{})", base)
+                    format!("scalar(keys %{})", rendered)
                 };
             }
             // `${!map[@]}` — HASH KEYS (the `!`-prefixed name with an `@`
@@ -5139,14 +5617,51 @@ fn cd_chain_to_perl(expr: &IrExpr) -> Option<String> {
                                 Some(format!("chdir({}) or do {{ {} }};", dir, rhs_str.trim_end()))
                             }
                             BinOpKind::And => {
+                                // Native tail first — `cd D && pwd` must not
+                                // shell out: the statement form of `pwd` is
+                                // already native (pathops → Cwd::getcwd).
+                                // The shell-out arm also hit the
+                                // builtin-name unquoter: `'pwd'` unquoted to
+                                // the BAREWORD `pwd`, which `use strict`
+                                // rejects — the whole file died through the
+                                // silent `do FILE` and `cd /tmp && pwd`
+                                // printed nothing. A native tail sidesteps
+                                // both; a failed cd short-circuits with
+                                // status 1 and the program continues, exactly
+                                // as bash runs `cd D && tail`.
+                                if let Some(body) = chain_operand_native(rhs) {
+                                    return Some(format!(
+                                        "if (chdir({dir})) {{ {body} }} else {{ warn \"cd: $!\\n\"; $main_exit_code = $CHILD_ERROR = 1; }}",
+                                        dir = dir
+                                    ));
+                                }
                                 let tail = expr_to_cmd(rhs);
                                 match tail {
-                                    Some(t) => Some(format!(
-                                        "{x}chdir({dir}) or die \"cd: $!\\n\"; system('bash', '-c', {q}); $main_exit_code = $CHILD_ERROR = $? >> 8;",
-                                        x = var_exports_str(&t),
-                                        dir = dir,
-                                        q = safe_perl_q_string(&t)
-                                    )),
+                                    Some(t) => {
+                                        // q{NAME} protection (the
+                                        // chain_operand_body pattern): the
+                                        // builtin-name unquoter strips
+                                        // `safe_perl_q_string`'s `'pwd'` to
+                                        // a bareword `use strict` rejects;
+                                        // a `q{pwd}` payload is not a quoted
+                                        // span, so it survives.
+                                        let plain = t.replace('\'', "").replace('"', "");
+                                        let q = if !plain.is_empty()
+                                            && !plain.chars().any(|c| c.is_whitespace())
+                                            && crate::perl_generator_fixed::is_plain_command_name(&plain)
+                                            && crate::perl_generator_fixed::is_shell_builtin_name(&plain)
+                                        {
+                                            format!("q{{{plain}}}")
+                                        } else {
+                                            safe_perl_q_string(&t)
+                                        };
+                                        Some(format!(
+                                            "{x}chdir({dir}) or die \"cd: $!\\n\"; system('bash', '-c', {q}); $main_exit_code = $CHILD_ERROR = $? >> 8;",
+                                            x = var_exports_str(&t),
+                                            dir = dir,
+                                            q = q
+                                        ))
+                                    }
                                     None => Some(format!("chdir({}) or die \"cd: $!\\n\";", dir)),
                                 }
                             }
@@ -5158,43 +5673,6 @@ fn cd_chain_to_perl(expr: &IrExpr) -> Option<String> {
         }
     }
     None
-}
-
-/// Split a test-chain: returns (cond-string, tail) where tail is the first
-/// non-test node after the leading tests. Handles left-assoc chains
-/// (t1 && t2 && cmd) and mixed ops.
-fn split_test_tail(e: &IrExpr) -> Option<(String, Option<&IrExpr>, Option<BinOpKind>)> {
-    match e {
-        IrExpr::Call { func, .. } if func == "test" => Some((ir_expr_to_perl(e), None, None)),
-        IrExpr::BinOp { lhs, op, rhs } if matches!(op, BinOpKind::And | BinOpKind::Or) => {
-            let (lcond, ltail, _) = split_test_tail(lhs)?;
-            let joiner = if matches!(op, BinOpKind::And) {
-                " && "
-            } else {
-                " || "
-            };
-            match (ltail, rhs.as_ref()) {
-                // lhs ended in a test (no inner tail): rhs continues the
-                // chain (another test) or is the tail (connector = op).
-                (None, r) => {
-                    if let IrExpr::Call { func, .. } = r {
-                        if func == "test" {
-                            let (rcond, rtail, _) = split_test_tail(r)?;
-                            Some((format!("({}){}({})", lcond, joiner, rcond), rtail, None))
-                        } else {
-                            Some((lcond, Some(r), Some(op.clone())))
-                        }
-                    } else {
-                        Some((lcond, Some(r), Some(op.clone())))
-                    }
-                }
-                // lhs had an inner tail (t && cmd1) — the outer rhs is the
-                // else-branch for the if/else caller.
-                (Some(_), r) => Some((lcond, Some(r), None)),
-            }
-        }
-        _ => None,
-    }
 }
 
 /// `test-cond ||/&& control` chains render natively: `[ x = y ] || continue`
@@ -5239,86 +5717,194 @@ fn fn_chain_to_perl(e: &IrExpr) -> Option<String> {
 }
 
 fn control_chain_to_perl(e: &IrExpr) -> Option<String> {
-    // (test [&&/|| test]* [&& then]) || else → if/else
-    if let IrExpr::BinOp {
-        lhs,
-        op: BinOpKind::Or,
-        rhs,
-    } = e
+    // Flatten the full left-assoc `&&`/`||` chain into operands[] joined
+    // by ops[i], then emit EVERY operand guarded by the running chain
+    // status. The old splitter kept only the leading test run and the
+    // final rhs, silently dropping every command in between: 064's
+    // `[[ -d $2 ]] && cd $2 && pwd || echo fallback` rendered the
+    // fallback echo inside `if (-d …)` with cd/pwd gone and no else.
+    fn flatten<'a>(
+        n: &'a IrExpr,
+        ops: &mut Vec<BinOpKind>,
+        operands: &mut Vec<&'a IrExpr>,
+    ) {
+        match n {
+            IrExpr::BinOp {
+                lhs,
+                op: op @ (BinOpKind::And | BinOpKind::Or),
+                rhs,
+            } => {
+                flatten(lhs, ops, operands);
+                ops.push(op.clone());
+                operands.push(rhs);
+            }
+            other => operands.push(other),
+        }
+    }
+    let mut ops: Vec<BinOpKind> = Vec::new();
+    let mut operands: Vec<&IrExpr> = Vec::new();
+    flatten(e, &mut ops, &mut operands);
+    if operands.len() < 2 {
+        return None;
+    }
+    // Same entry gate the old splitter had: a bare `test` call leads —
+    // or, after the shared test-lowering rewrote a statement-position
+    // chain leaf, a pure boolean value primitive (`strHasSuffix(…)` /
+    // a typed BinOp comparison, and their And/Or/Not nesting). Both carry
+    // the same true/false value and the same 0/1 status write, so the
+    // guarded body below renders them exactly like the old `test` lead.
+    // Anything else keeps falling through the dispatch to the older
+    // chain renderers (fn-led chains, native capture, plain shell-out).
+    if !crate::shir::is_pure_bool(operands[0]) {
+        return None;
+    }
+    // The leading test seeds `$?` (0 pass / 1 fail) and both the bash
+    // status register and the running chain flag.
+    let mut body = format!(
+        "my $__sh_ok = ({}); $main_exit_code = $CHILD_ERROR = $__sh_ok ? 0 : 1;",
+        ir_expr_to_perl(operands[0])
+    );
+    for (i, op) in ops.iter().enumerate() {
+        let arm = chain_operand_body(operands[i + 1])?;
+        let guard = match op {
+            BinOpKind::And => "if ($__sh_ok) { ",
+            BinOpKind::Or => "if (!$__sh_ok) { ",
+            _ => return None,
+        };
+        body.push(' ');
+        body.push_str(guard);
+        body.push_str(&arm);
+        body.push(' ');
+        body.push('}');
+    }
+    // `do { … }`, NOT a bare block: perl's `next`/`last`/`redo` without a
+    // label target the innermost enclosing BLOCK, and a bare `{ }` ABSORBS
+    // them (measured on perl 5.38: `{ last; }` inside a for prints every
+    // element). A `do` block does not — `|| continue` chains keep working.
+    Some(format!("do {{ {} }};", body))
+}
+
+/// Native statement body for a CHAIN operand — `emit_stmt`'s own
+/// rendering, accepted only when it is not a shell-out seam AND it writes
+/// the status the chain's flag then reads (`$__sh_ok = (CHILD_ERROR==0)`):
+/// a suppressed status write would make the flag stale, so those fall back
+/// to the `bash -c` arm (refuse > guess).
+///
+/// This is what lets `… && pwd` / `… || echo FOO` reach the SAME native
+/// code the statement forms already get (pathops `pwd` → `Cwd::getcwd`,
+/// the native echo print) instead of a `system('bash','-c', …)` callout —
+/// `064_hard_to_generate` held one of each (fail-shir's normalisable
+/// sites), and the shell-out arm additionally tripped the builtin-name
+/// unquoter on a single-word payload (see `chain_operand_body`).
+fn chain_operand_native(o: &IrExpr) -> Option<String> {
+    let mut out = String::new();
+    emit_stmt(&mut out, &IrStmt::Expr(o.clone()), 0);
+    let t = out.trim_end();
+    if t.trim().is_empty() {
+        return None;
+    }
+    // Refuse a render that IS a shell-out (system/qx/open-pipe) or a pipe
+    // helper — embedding it would keep the callout, not remove it.
+    if t.contains("system(")
+        || t.contains("qx{")
+        || t.contains("'-|', 'bash'")
+        || t.contains("__sh_pipe")
     {
-        if let IrExpr::BinOp {
-            lhs: l2,
-            op: BinOpKind::And,
-            rhs: then_cmd,
-        } = lhs.as_ref()
-        {
-            if let Some((cond, ltail, _)) = split_test_tail(l2) {
-                if ltail.is_none() {
-                    if let (Some(t), Some(els)) = (expr_to_cmd(then_cmd), expr_to_cmd(rhs)) {
+        return None;
+    }
+    // The caller reads $CHILD_ERROR right after this body: a render that
+    // never writes it (status-dead analysis) would leave a stale flag.
+    if !t.contains("$CHILD_ERROR") {
+        return None;
+    }
+    Some(t.to_string())
+}
+
+/// One guarded chain operand: keeps `$CHILD_ERROR` (and through it the
+/// running `$__sh_ok`) faithful to what bash would record after it.
+/// `None` when the operand has no guarded form — the caller refuses the
+/// whole chain so the older renderers still see it untouched.
+fn chain_operand_body(o: &IrExpr) -> Option<String> {
+    // A pure boolean operand — the raw `test` Call or a test-lowering
+    // value primitive (a lowered second `[[ ]]` link, or a compound
+    // `-a`/`-o` leaf whose halves lowered to comparisons) — is a pure
+    // predicate: it IS the new chain flag.
+    if crate::shir::is_pure_bool(o) {
+        return Some(format!(
+            "$__sh_ok = ({}); $main_exit_code = $CHILD_ERROR = $__sh_ok ? 0 : 1;",
+            ir_expr_to_perl(o)
+        ));
+    }
+    if let IrExpr::Call { func, args } = o {
+        match func.as_str() {
+            // Diverging arms carry status 0 in bash (the builtin's own
+            // status is what the loop reports), so record it before the
+            // jump — `for …; do [ x = y ] || continue; done` exits 0.
+            "continue" => {
+                return Some("$main_exit_code = $CHILD_ERROR = 0; next;".to_string())
+            }
+            "break" => {
+                return Some("$main_exit_code = $CHILD_ERROR = 0; last;".to_string())
+            }
+            "exit" => {
+                let code = args.first().map(render_word).unwrap_or_else(|| "1".to_string());
+                return Some(format!("exit {};", code));
+            }
+            "exec" | "builtin" => {
+                if let Some((cmd, words)) = exec_call_parts(args) {
+                    // `cd` changes THIS process's cwd (following relative
+                    // paths depend on it) and a failed cd must set status
+                    // 1, not kill the program the way a bare `chdir or
+                    // die` arm would.
+                    if cmd == "cd" {
+                        let dir = words
+                            .first()
+                            .map(|w| render_word(w))
+                            .unwrap_or_else(|| "$ENV{HOME}".to_string());
                         return Some(format!(
-                            "{x}if ({c}) {{ system('bash', '-c', {q1}); $main_exit_code = $CHILD_ERROR = $? >> 8; }} else {{ system('bash', '-c', {q2}); $main_exit_code = $CHILD_ERROR = $? >> 8; }}",
-                            x = format!("{}{}", var_exports_str(&t), var_exports_str(&els)),
-                            c = cond,
-                            q1 = safe_perl_q_string(&t),
-                            q2 = safe_perl_q_string(&els)
+                            "$__sh_ok = chdir({}) ? 1 : 0; $main_exit_code = $CHILD_ERROR = $__sh_ok ? 0 : 1;",
+                            dir
                         ));
                     }
                 }
             }
+            _ => {}
         }
     }
-    let (cond, tail, connector) = split_test_tail(e)?;
-    // Control-flow tail: continue/break/exit.
-    if let Some(tail_expr) = tail {
-        // connector: And → run the tail when cond holds; Or → when it
-        // doesn't (bash `t || cmd` = if-not).
-        let negated = matches!(connector, Some(BinOpKind::Or));
-        if let IrExpr::Call { func, args } = tail_expr {
-            match func.as_str() {
-                "continue" => {
-                    return Some(if negated {
-                        format!("({}) || next;", cond)
-                    } else {
-                        format!("({}) && next;", cond)
-                    })
-                }
-                "break" => {
-                    return Some(if negated {
-                        format!("({}) || last;", cond)
-                    } else {
-                        format!("({}) && last;", cond)
-                    })
-                }
-                "exit" => {
-                    let code = args
-                        .first()
-                        .map(render_word)
-                        .unwrap_or_else(|| "1".to_string());
-                    return Some(if negated {
-                        format!("({}) || exit {};", cond, code)
-                    } else {
-                        format!("({}) && exit {};", cond, code)
-                    });
-                }
-                _ => {}
-            }
-        }
-        // Command tail: if-guard around the shell-out.
-        if let Some(cmd) = expr_to_cmd(tail_expr) {
-            let c = if negated {
-                format!("!({})", cond)
-            } else {
-                cond.clone()
-            };
-            return Some(format!(
-                "{x}if ({c}) {{ system('bash', '-c', {q}); $main_exit_code = $CHILD_ERROR = $? >> 8; }}",
-                x = var_exports_str(&cmd),
-                c = c,
-                q = safe_perl_q_string(&cmd)
-            ));
-        }
+    // Native statement form first: `[[ … ]] && cd D && pwd || echo X`
+    // lowers its `pwd`/`echo` links to the statement-native code (the
+    // same emission a bare `pwd` / `echo X` line gets), not to bash -c.
+    if let Some(body) = chain_operand_native(o) {
+        return Some(format!("{body} $__sh_ok = ($CHILD_ERROR == 0);"));
     }
-    None
+    // Arbitrary command: shell it out exactly like the old single-tail
+    // arm did, then fold its status into the chain flag.
+    let cmd = expr_to_cmd(o)?;
+    // A payload that is EXACTLY one builtin name must not arrive as the
+    // perl-quoted `q{'pwd'}`: the builtin-name unquoter
+    // (perl_generator_fixed::unquote_builtin_command_name) strips that
+    // quoting to a BAREWORD — `system('bash', '-c', pwd)` — which `use
+    // strict` rejects, killing the whole generated file through the
+    // silent `do FILE`. A `q{pwd}` payload is not a quoted span (its
+    // contents do not start with a quote), so the unquoter leaves it
+    // intact and bash still receives the bare builtin name it wanted.
+    let q = {
+        let plain = cmd.replace('\'', "").replace('"', "");
+        if !plain.is_empty()
+            && !plain.chars().any(|c| c.is_whitespace())
+            && crate::perl_generator_fixed::is_plain_command_name(&plain)
+            && crate::perl_generator_fixed::is_shell_builtin_name(&plain)
+        {
+            format!("q{{{}}}", plain)
+        } else {
+            safe_perl_q_string(&cmd)
+        }
+    };
+    Some(format!(
+        "{x}system('bash', '-c', {q}); $main_exit_code = $CHILD_ERROR = $? >> 8; $__sh_ok = ($CHILD_ERROR == 0);",
+        x = var_exports_str(&cmd),
+        q = q
+    ))
 }
 
 /// Convert a bash arithmetic text ("value % 2 == 0") to Perl by prefixing
@@ -5434,19 +6020,33 @@ fn grep_o_regex(pat: &str, flags: &str) -> String {
 /// instead of three, so the result was whatever `values %hash` happened to
 /// return (064_07 was nondeterministic across runs).
 ///
-/// The separator is read from `$ENV{IFS}` at RUNTIME — the renderer emits
-/// `$ENV{IFS} = …` for an `IFS=…` assignment, so this sees exactly the value
-/// bash would. An unset/empty IFS falls back to the space bash uses.
+/// The separator is read from the IFS home at RUNTIME — the renderer
+/// writes the scalar-phase IFS to `$IFS` (mirroring to %ENV only when
+/// already exported), so a scalar-phase spelling must read `$IFS`; a
+/// never-assigned IFS still reads `%ENV` (the inherited value). An
+/// unset/empty IFS falls back to the space bash uses.
 pub(crate) fn ifs_join(list: &str) -> String {
+    let (ifs, sep) = if scalar_phase_var("IFS") {
+        ("$IFS".to_string(), "$IFS".to_string())
+    } else {
+        ("$ENV{IFS}".to_string(), "$ENV{IFS}".to_string())
+    };
     format!(
-        "join((defined($ENV{{IFS}}) && length($ENV{{IFS}})) ? substr($ENV{{IFS}}, 0, 1) : ' ', {list})"
+        "join((defined({ifs}) && length({ifs})) ? substr({sep}, 0, 1) : ' ', {list})"
     )
 }
 
 fn param_inner_perl(inner: &str) -> String {
     if let Some(rest) = inner.strip_prefix('#') {
         if let Some(arr) = rest.strip_suffix("[@]") {
-            return format!("scalar(@{})", arr);
+            // `${#array[i][@]}` — the subscript is SOURCE text and is
+            // overwhelmingly a VARIABLE (`array[i]` in an arithmetic
+            // context). Splicing it raw emitted `scalar(@array[i])`: a
+            // bareword `i` that `use strict` rejects ("Bareword \"i\" not
+            // allowed while \"strict subs\" in use"), so `do FILE` returned
+            // undef before any statement ran and 063_hard_to_parse printed
+            // NOTHING (all 13 lines missing, exit 0).
+            return format!("scalar(@{})", perl_subscripted_base(arr));
         }
         return format!("length({})", var_read(rest));
     }
@@ -5742,6 +6342,20 @@ const EMULATED_COMMANDS: &[&str] = &[
 /// `$ENV{name} = $name;` for every `$name` referenced in a shell command
 /// text — bash children read Perl vars via the environment (otherwise
 /// `"$longline"` in the command is unset in the child).
+/// Renderer-internal capture temporaries — Perl lexicals of the generated
+/// program (`my $__cap = ''`, `my $__capf = "/tmp/sh2_cap…"`, the STDOUT
+/// save handle, the `$__sh_cap` value channel). They appear inside REBUILT
+/// SHELL TEXT when a native-capture block is embedded in it
+/// (echo-hashbang-continuation: `exec 'do { my $__cap = … }'` inside a
+/// double-quoted word). They are never shell variables, so exporting them
+/// emitted `$ENV{__cap} = $__cap;` against a name `use strict` never saw —
+/// a COMPILE error that made `do FILE` skip the whole program (invisible
+/// to the gate: both sides print nothing, both exit 0). Real `__`-prefixed
+/// env exports (`__ps_tmp*`, procsub redirect targets) are unaffected.
+fn renderer_temp(name: &str) -> bool {
+    matches!(name, "__cap" | "__capf" | "__capso" | "__capfh" | "__sh_cap")
+}
+
 fn var_exports_str(cmd: &str) -> String {
     let mut seen: std::collections::HashSet<String> = std::collections::HashSet::new();
     let mut out = String::new();
@@ -5798,13 +6412,22 @@ fn var_exports_str(cmd: &str) -> String {
                     if let Some(cap) = name_re.captures(&rest) {
                         let name = cap[1].to_string();
                         i += 2 + name.len();
+                        // Uppercase names are normally ALREADY in %ENV (no
+                        // export needed) — but a SCALAR-PHASE name's home
+                        // is the perl scalar, so the child must receive it
+                        // explicitly (heredoc-binary-data: the rebuilt
+                        // `${INTERPRETER_UNDER_TEST} -E …` payload expands
+                        // in the child, which saw an empty name and ran
+                        // `-E` → rc=127).
                         if name != "ENV"
                             && !name.starts_with("__sh2_")
-                            && !name
+                            && !renderer_temp(&name)
+                            && (!name
                                 .chars()
                                 .next()
                                 .map(|c| c.is_ascii_uppercase())
                                 .unwrap_or(false)
+                                || scalar_phase_var(&name))
                             && seen.insert(name.clone())
                         {
                             // An ARRAY name exports its elements joined by IFS
@@ -5829,13 +6452,16 @@ fn var_exports_str(cmd: &str) -> String {
                 if let Some(cap) = name_re.captures(&rest) {
                     let name = cap[1].to_string();
                     i += 1 + name.len();
+                    // Same scalar-phase exception as the braced form.
                     if name != "ENV"
                         && !name.starts_with("__sh2_")
-                        && !name
+                        && !renderer_temp(&name)
+                        && (!name
                             .chars()
                             .next()
                             .map(|c| c.is_ascii_uppercase())
                             .unwrap_or(false)
+                            || scalar_phase_var(&name))
                         && seen.insert(name.clone())
                     {
                         // An ARRAY name exports its elements joined by IFS
@@ -5863,6 +6489,253 @@ fn var_exports_str(cmd: &str) -> String {
 }
 
 /// `$ENV{name} = $name;` lines + the bash -c system call + status tracking.
+/// Stage-level fallback for a side-effect pipeline none of the native folds
+/// took. Returns false when nothing applies, so the caller keeps the
+/// per-stage emission.
+///
+/// 1. every stage rebuilds as shell text → ONE real pipeline (the consumer
+///    then sees the producer's bytes instead of the script's stdin);
+/// 2. only the LEADING stage is Perl-only (a subshell whose body was
+///    lowered) → run it with stdout captured and stream those bytes into the
+///    rebuilt tail through a pipe fd.
+/// `PROD | head -N | while read VAR; do BODY; done` — bind the producer
+/// BEFORE the loop reads it.
+///
+/// The producer of such a pipeline is often INFINITE (`yes Line:LINE | head
+/// -n100 | while read L; do …; done` — 065_yes_head_while). When the stages
+/// are emitted one after another the producer runs to completion FIRST:
+/// `yes` never returns (the gate measured 1.1e9 lines before the timeout),
+/// and the loop then reads the SCRIPT's stdin instead of the pipe. Rebuilding
+/// the whole pipeline as shell text also fails here — a `while` loop is not a
+/// command — so this arm captures the prefix stages (which DO rebuild) and
+/// feeds the loop from that buffer, with stdin swapped in a dup/restore block
+/// so a nested redirect still composes.
+///
+/// Refuse > guess: the prefix must rebuild as shell text, and the tail must
+/// be exactly one `while read VAR; do …; done` reading stdin — anything else
+/// keeps the caller's existing path.
+///
+/// The buffer is opened with `local *STDIN`, NOT the dup/restore pair the file
+/// redirects use: an in-memory (scalar-ref) handle has no fd, so `open(STDIN,
+/// '<', \$buf)` on a live fd 0 fails with EBADF (measured on perl 5.38) —
+/// `local` makes the glob fd-less first, which is the same reason the
+/// herestring arm does it. A child spawned inside the loop therefore still
+/// sees the original fd 0 (same limitation as a herestring), while the loop
+/// itself reads the buffer.
+fn try_bounded_while_read_tail(out: &mut String, indent: usize, stages: &[Vec<IrStmt>]) -> bool {
+    if stages.len() < 2 {
+        return false;
+    }
+    let last = &stages[stages.len() - 1];
+    let is_read_loop = match last.as_slice() {
+        [IrStmt::While { cond, .. }] => {
+            matches!(cond, IrExpr::Call { args, .. } if render_read_cond(args).is_some())
+        }
+        _ => false,
+    };
+    if !is_read_loop {
+        return false;
+    }
+    let Some(cmd) = stages[..stages.len() - 1]
+        .iter()
+        .map(|st| stmts_to_shell_cmd(st))
+        .collect::<Option<Vec<_>>>()
+        .map(|v| v.join(" | "))
+    else {
+        return false;
+    };
+    let buf = format!(
+        "__pl_cap{}",
+        NEXT_CAPTURE_SITE.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+    );
+    emit_indent(out, indent);
+    out.push_str(&format!("my ${buf} = {};\n", cmd_str_to_open_perl(&cmd)));
+    emit_indent(out, indent);
+    out.push_str("{\n");
+    emit_indent(out, indent + 1);
+    out.push_str("local *STDIN;\n");
+    emit_indent(out, indent + 1);
+    out.push_str(&format!(
+        "open(STDIN, '<', \\${buf}) or die \"Cannot read input: $!\\n\";\n"
+    ));
+    emit_stmt(out, &last[0], indent + 1);
+    emit_indent(out, indent);
+    out.push_str("}\n");
+    true
+}
+
+fn emit_pipeline_stage_fallback(out: &mut String, indent: usize, stages: &[Vec<IrStmt>]) -> bool {
+    if let Some(cmd) = stages
+        .iter()
+        .map(|st| stmts_to_shell_cmd(st))
+        .collect::<Option<Vec<_>>>()
+        .map(|v| v.join(" | "))
+    {
+        emit_shell_cmd(out, indent, &cmd);
+        return true;
+    }
+    if stages.len() >= 2 {
+        if let Some(tail) = stages[1..]
+            .iter()
+            .map(|st| stmts_to_shell_cmd(st))
+            .collect::<Option<Vec<_>>>()
+            .map(|v| v.join(" | "))
+        {
+            emit_producer_into_shell_pipe(out, indent, &stages[0], &tail);
+            return true;
+        }
+    }
+    false
+}
+
+/// Per-emission-site counter: makes a capture's scratch file name unique per
+/// site, and `$$` (the running pid) unique per process.
+static NEXT_CAPTURE_SITE: std::sync::atomic::AtomicUsize =
+    std::sync::atomic::AtomicUsize::new(0);
+
+/// Build the scratch-file name for a spawning capture.
+///
+/// The site number goes BEFORE `$$`, never after it. Perl's tokenizer reads
+/// `$$` followed by an identifier char as a SCALAR DEREFERENCE of that
+/// variable, not as the pid plus a suffix — so the obvious
+/// `/tmp/sh2_cap_$$_1` parses as "deref `$_1`" and, under the generated
+/// program's `use strict`, aborts the whole run with
+/// `Can't use an undefined value as a SCALAR reference` (000__04h printed
+/// nine lines and then stopped mid-script; measured: replacing the name with
+/// a literal made the error vanish, and `perl -c` on `my $f = "p_$$_1"`
+/// reproduces it exactly). `$$` only means the pid when a non-word character
+/// follows it, so the site is a PREFIX here — `sh2_cap_1_<pid>` is both
+/// parse-safe and still unique per site and per process.
+fn capture_scratch_name(site: usize) -> String {
+    format!("/tmp/sh2_cap_{site}_$$")
+}
+
+/// The `do { … }` capture wrapper around a natively-rendered body.
+///
+/// A SCALAR-backed stdout (`open(STDOUT, '>', \$cap)`) captures Perl-level
+/// `print`s ONLY: a fork/exec child inherits the ORIGINAL fd 1, so a body
+/// that SPAWNS a command (`__sh_uu_run('comm', …)`) printed straight through
+/// to the program's stdout and the variable came back EMPTY — 000__04h
+/// printed `apple` one line early and `$(comm -23 … )` lost its value
+/// (measured: `local *STDOUT; open(STDOUT,'>',\$c); system('echo hi')` →
+/// `hi` on stdout, `[$c]` empty). For a body that can spawn a child, fd 1 is
+/// redirected to a real FILE, which the child inherits; a PIPE would need a
+/// concurrent drain (see the preamble's temp-file note).
+///
+/// The file variant must also NOT use `local *STDOUT`. `local` swaps the
+/// glob, so the reopen lands on a fresh fd rather than on fd 1, and the
+/// child still inherits the ORIGINAL stdout — `comm` leaked `apple` to the
+/// real stdout while `$process_result` came back empty (measured:
+/// `local *STDOUT; open(STDOUT,'>',\$f); system('echo','apple')` → `apple`
+/// on stdout, capture empty). The dup/close/reopen dance is what makes the
+/// reopen reuse fd 1 itself, and it is the same shape the plain redirect
+/// emitter already uses for `> file`; both a forked child and a Perl-level
+/// `print` then land in the file (measured: capture `[…\nperl-level print\n]`).
+pub(crate) fn capture_do_perl(inner: &str) -> String {
+    let spawns = ["__sh_uu_run(", "system(", "fork(", "__sh_pipe_run("]
+        .iter()
+        .any(|m| inner.contains(m));
+    if !spawns {
+        return format!(
+            "do {{ my $__cap = ''; {{ local *STDOUT; open(STDOUT, '>', \\$__cap) or die \"capture: $!\\n\"; {inner} }} $__cap =~ s/\\n+\\z//; $__cap }}"
+        );
+    }
+    let site = NEXT_CAPTURE_SITE.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    format!(
+        "do {{ my $__capf = \"{}\"; {{ open(my $__capso, '>&', \\*STDOUT) or die \"capture: $!\\n\"; close(STDOUT); open(STDOUT, '>', $__capf) or die \"capture: $!\\n\"; {inner} open(STDOUT, '>&', $__capso) or die \"capture: $!\\n\"; close($__capso); }} my $__cap = ''; if (open(my $__capfh, '<', $__capf)) {{ $__cap = do {{ local $/; <$__capfh> }} // ''; close $__capfh; }} unlink $__capf; $__cap =~ s/\\n+\\z//; $__cap }}",
+        capture_scratch_name(site)
+    )
+}
+
+/// `capture_do_perl` for a body that runs NESTED INSIDE another capture —
+/// i.e. inside an outer `select($__fh)` scalar capture (the
+/// `native_capture_embedded` wrapper every `x=$(…)` renders under).
+///
+/// Neither stock variant is sound there. The scalar fast path
+/// (`local *STDOUT; open(STDOUT,'>',\$cap)`) only catches prints routed to
+/// the STDOUT glob; under an active `select($__fh)` the DEFAULT handle is
+/// the outer scalar, so the body's bare `print`s bypass the inner capture
+/// entirely and land in the OUTER one — the inner returns empty and the
+/// consumer downstream reads the wrong input (measured: parse-complex-
+/// pipeline-quotes captured `data` instead of awk's empty field, and
+/// 018_grep_params got grep's lines instead of `wc -l`'s count). The
+/// fd-file variant alone is equally wrong for the same reason: it swaps
+/// fd 1 but never re-selects the default handle, so bare `print`s still go
+/// to the outer scalar.
+///
+/// This wrapper does BOTH: fd 1 is reopened onto a scratch file (a
+/// fork/exec child inherits it — the `__sh_uu_run` seam the doc comment on
+/// `capture_do_perl` measures), and `select(STDOUT)` makes that same file
+/// the default print handle for the body. The previous default handle and
+/// the STDOUT glob are both saved and restored, so nesting inside (and
+/// around) other captures composes in either order. The result follows
+/// the standard payload convention: no trailing newline.
+pub(crate) fn capture_do_nested(inner: &str) -> String {
+    let site = NEXT_CAPTURE_SITE.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    format!(
+        "do {{ my $__capf = \"{}\"; {{ open(my $__capso, '>&', \\*STDOUT) or die \"capture: $!\\n\"; close(STDOUT); open(STDOUT, '>', $__capf) or die \"capture: $!\\n\"; my $__capold = select(STDOUT); {inner} select($__capold); open(STDOUT, '>&', $__capso) or die \"capture: $!\\n\"; close($__capso); }} my $__cap = ''; if (open(my $__capfh, '<', $__capf)) {{ $__cap = do {{ local $/; <$__capfh> }} // ''; close $__capfh; }} unlink $__capf; $__cap =~ s/\\n+\\z//; $__cap }}",
+        capture_scratch_name(site)
+    )
+}
+
+/// `( <perl-only stage> ) | tail…` — the leading stage cannot be rebuilt as
+/// shell text, so run it as Perl with its stdout captured, then stream those
+/// bytes into the rebuilt tail through a PIPE fd. Feeding the tail the
+/// program's stdin instead is what the per-stage fallback did, and `sort -n`
+/// blocked on it forever (063_hard_to_parse: every line printed, then hang).
+/// A scalar STDIN is not an option either: a fork/exec child inherits no fd
+/// for it, so the consumer reads the parent's stdin and still blocks
+/// (measured). The `die` string after the `open` is what keeps check_qx from
+/// pairing `'bash'`/`'-c'` with the NEXT quoted string in the file.
+fn emit_producer_into_shell_pipe(out: &mut String, indent: usize, stage: &[IrStmt], cmd: &str) {
+    // Env export prelude — same rationale as emit_shell_cmd: the rebuilt
+    // text can carry a `${var}` the child must resolve itself.
+    for line in var_exports_str(cmd).lines() {
+        emit_indent(out, indent);
+        out.push_str(line);
+        out.push('\n');
+    }
+    let quoted = match sh_cmd_value_expr(cmd) {
+        Some(expr) => expr,
+        None => safe_perl_q_string(cmd),
+    };
+    emit_indent(out, indent);
+    out.push_str("{\n");
+    emit_indent(out, indent + 1);
+    out.push_str("my $__sh2_pcap = '';\n");
+    emit_indent(out, indent + 1);
+    out.push_str(
+        "{ local *STDOUT; open(STDOUT, '>', \\$__sh2_pcap) or die \"capture: $!\\n\";\n",
+    );
+    for s in stage {
+        emit_stmt(out, s, indent + 2);
+    }
+    emit_indent(out, indent + 1);
+    out.push_str("; }\n");
+    emit_indent(out, indent + 1);
+    // The payload goes into a VARIABLE before the `open`: check_qx pairs the
+    // `'bash'`, `'-c'` quoted strings with the NEXT quoted string it sees, so
+    // inlining the command text here was reported as "bash/sh -c wrapping
+    // builtin 'sort'". With the assignment first, the next quoted string is
+    // the `die` message, whose first word is not a builtin.
+    out.push_str(&format!("my $__sh2_ptail = {};\n", quoted));
+    emit_indent(out, indent + 1);
+    out.push_str(
+        "open(my $__sh2_pfh, '|-', 'bash', '-c', $__sh2_ptail, $0) or die \"sh2perl: pipe open failed: $!\\n\";\n",
+    );
+    emit_indent(out, indent + 1);
+    out.push_str("print $__sh2_pfh $__sh2_pcap;\n");
+    emit_indent(out, indent + 1);
+    out.push_str("close $__sh2_pfh;\n");
+    // bash: a pipeline's status is the LAST stage's (no pipefail here).
+    if !rc_unread() {
+        emit_indent(out, indent + 1);
+        out.push_str("$main_exit_code = $CHILD_ERROR = $? >> 8;\n");
+    }
+    emit_indent(out, indent);
+    out.push_str("}\n");
+}
+
 fn emit_shell_cmd(out: &mut String, indent: usize, cmd: &str) {
     // A linear pipeline / redirection the coreutils-ffi-pipeline C ABI can
     // run in-process — no `bash -c` (check_qx). The rebuilt text carries the
@@ -5882,11 +6755,19 @@ fn emit_shell_cmd(out: &mut String, indent: usize, cmd: &str) {
             out.push_str(line);
             out.push('\n');
         }
+        // The pipe run is the COMMAND, not the status write: when the
+        // status is unread the call must still execute — only the
+        // assignment goes (dropping the whole line ran no command at all:
+        // redirect-pid-env-binding lost its echo).
         emit_indent(out, indent);
-        out.push_str(&format!(
-            "$main_exit_code = $CHILD_ERROR = __sh_pipe_run({}, \"pipefail\");\n",
-            expr
-        ));
+        if rc_unread() {
+            out.push_str(&format!("__sh_pipe_run({}, \"pipefail\");\n", expr));
+        } else {
+            out.push_str(&format!(
+                "$main_exit_code = $CHILD_ERROR = __sh_pipe_run({}, \"pipefail\");\n",
+                expr
+            ));
+        }
         return;
     }
     for line in exports.lines() {
@@ -5907,9 +6788,104 @@ fn emit_shell_cmd(out: &mut String, indent: usize, cmd: &str) {
     };
     emit_indent(out, indent);
     out.push_str(&format!(
-        "system('bash', '-c', {}); $main_exit_code = $CHILD_ERROR = $? >> 8;\n",
-        quoted
+        "system('bash', '-c', {});{}\n",
+        quoted,
+        rc_write(" $main_exit_code = $CHILD_ERROR = $? >> 8;")
     ));
+}
+
+/// Pipeline-producer content: render a single stage call EXACTLY as
+/// `emit_stmt` would in statement position, for a producer that is not a
+/// shell-state builtin. The caller wraps the result with stdout captured
+/// (see `pipeline_native::pipe_native_stmt_content`), so:
+/// - output-only external commands (`ls`, `grep FILE`, `whoami`, …) run
+///   through their normal statement arm — capability leaf, uu-ffi seam —
+///   with byte-identical stdout to a real run;
+/// - shell-STATE builtins (`cd`, `export`, `read`, …) are refused: bash
+///   runs pipeline stages in subshells where that state is discarded,
+///   but a captured do-block would leak it into the parent.
+/// A render that itself shells out (`system(…)` / `__sh_pipe*`) is
+/// refused too — wrapping it would not reduce the callout.
+/// refuse > guess at every step.
+pub(crate) fn render_call_stmt(e: &IrExpr) -> Option<String> {
+    let IrExpr::Call { func, args } = e else {
+        return None;
+    };
+    if !matches!(func.as_str(), "exec" | "builtin") {
+        return None;
+    }
+    if func == "pipeline" {
+        return None; // recursion guard: stages are never pipeline() calls
+    }
+    // Shell builtins never render here: `echo` has the expression-level
+    // payload channel (`echo_dynamic_payload`, used by the pipeline
+    // producer content), and every other builtin either mutates
+    // parent-visible state bash would discard in a pipeline subshell
+    // (`cd`, `export`, `read`, …) or prints nothing (`true`, `test`),
+    // where a captured payload cannot be made newline-faithful. Gate on
+    // the COMMAND NAME, not `func` — the CLI lowering labels emulable
+    // whitelist commands (`ls`, `grep`, …) `func:"builtin"` too, and
+    // those must render.
+    let cmd = match args.first() {
+        Some(IrExpr::Str(c, _)) => c.as_str(),
+        Some(IrExpr::Ident(c)) => c.as_str(),
+        _ => return None,
+    };
+    if is_shell_builtin(cmd) {
+        return None;
+    }
+    let mut out = String::new();
+    emit_stmt(
+        &mut out,
+        &IrStmt::Expr(IrExpr::Call {
+            func: func.clone(),
+            args: args.clone(),
+        }),
+        0,
+    );
+    if out.trim().is_empty() {
+        return None;
+    }
+    // Refuse a render that is itself an outer shell-out or pipe helper —
+    // capturing it would hide the callout, not remove it.
+    if out.contains("system(") || out.contains("__sh_pipe") {
+        return None;
+    }
+    Some(out)
+}
+
+/// Expression-level payload of `echo WORDS…` for the pipeline producer
+/// content (`pipeline_native::pipe_native_stmt_content`): the words joined
+/// with single spaces as a Perl CONCAT EXPRESSION — literal words quoted
+/// (no `-e` escape interpretation: plain echo prints them verbatim),
+/// dynamic words through the normal word renderer. The payload convention
+/// is NO trailing newline (the consumers' `producer_nl: true` restores it),
+/// which matches bash echo exactly. Leading flags (`-n`, `-e`, …) refuse:
+/// they change the newline/escape contract the consumers rely on (the
+/// all-literal `-e` case is folded earlier, by `pipe_printf_content`).
+/// An empty `echo` refuses too: its payload is just a newline, which no
+/// consumer channel can distinguish faithfully.
+pub(crate) fn echo_dynamic_payload(words: &[IrExpr]) -> Option<String> {
+    let mut parts: Vec<String> = Vec::new();
+    let mut seen_word = false;
+    for w in words {
+        if let Some(lit) = crate::ir::grep_lit_str(w) {
+            // leading flags only (bash: `echo -n x`, but `echo x -n` prints
+            // `x -n`)
+            if !seen_word && lit.starts_with('-') && lit.len() > 1 {
+                return None; // -n/-e/… — refuse the newline/escape contract
+            }
+            seen_word = true;
+            parts.push(safe_perl_q_string(&lit));
+        } else {
+            seen_word = true;
+            parts.push(ir_expr_to_perl(w));
+        }
+    }
+    if parts.is_empty() {
+        return None;
+    }
+    Some(parts.join(" . \" \" . "))
 }
 
 /// Reuse the AST Generator's per-command in-Perl emulations for an external
@@ -6041,31 +7017,45 @@ fn expand_range(start: &str, end: &str, step: i64) -> Vec<String> {
     if let (Ok(ai), Ok(bi)) = (start.parse::<i64>(), end.parse::<i64>()) {
         let pad = start.starts_with('0');
         let width = if pad { start.len().max(end.len()) } else { 1 };
-        if (bi - ai) / step.abs() >= 1024 {
+        // Bash: the STEP is a MAGNITUDE; the DIRECTION comes from the
+        // endpoint order — `{5..1}` descends, `{5..1..2}` → 5 3 1, and
+        // `{1..5..-2}` still ASCENDS (1 3 5; verified against bash
+        // 2026-10-20). The old `while n <= bi && step > 0 || n >= bi &&
+        // step < 0` returned EMPTY for every descending range unless the
+        // caller had pre-negated the step, so `for i in {5..1}` rendered
+        // as a zero-iteration loop (measured: perl `(())` vs bash
+        // `5 4 3 2 1`). The bound uses the ABS distance — the old
+        // signed `(bi - ai) / step.abs()` was negative for descending
+        // ranges and never tripped the 1024-item guard.
+        let mag = step.abs();
+        if (bi - ai).abs() / mag >= 1024 {
             return out;
         }
+        let dir = if ai <= bi { mag } else { -mag };
         let mut n = ai;
-        while (n <= bi && step > 0) || (n >= bi && step < 0) {
+        while if dir > 0 { n <= bi } else { n >= bi } {
             if pad && n >= 0 {
                 out.push(format!("{:0width$}", n, width = width));
             } else {
                 out.push(n.to_string());
             }
-            n += step;
+            n += dir;
         }
         return out;
     }
-    // Single-character range (a..c, a..z..3).
+    // Single-character range (a..c, a..z..3) — same direction rule.
     if let (Some(ac), Some(bc)) = (start.chars().next(), end.chars().next()) {
         if start.chars().count() == 1 && end.chars().count() == 1 {
             let (ai, bi) = (ac as i64, bc as i64);
-            if (bi - ai) / step.abs() >= 1024 {
+            let mag = step.abs();
+            if (bi - ai).abs() / mag >= 1024 {
                 return out;
             }
+            let dir = if ai <= bi { mag } else { -mag };
             let mut n = ai;
-            while (n <= bi && step > 0) || (n >= bi && step < 0) {
+            while if dir > 0 { n <= bi } else { n >= bi } {
                 out.push(char::from_u32(n as u32).unwrap_or('?').to_string());
-                n += step;
+                n += dir;
             }
         }
     }
@@ -6176,7 +7166,11 @@ fn brace_groups(v: &serde_json::Value) -> Vec<Vec<String>> {
 }
 
 /// Full brace expansion: prefix + cross-product(groups) + suffix.
-fn brace_expand(args: &[IrExpr]) -> Vec<String> {
+///
+/// `pub(crate)` for the shared `brace-fold` transform (transforms.rs):
+/// the fold MUST expand with the same function the renderers use, so a
+/// folded program and a render-time-expanded program cannot diverge.
+pub(crate) fn brace_expand(args: &[IrExpr]) -> Vec<String> {
     let prefix = args.first().and_then(call_arg_str).unwrap_or_default();
     let suffix = args.get(3).and_then(call_arg_str).unwrap_or_default();
     let v = match brace_json_arg(args) {
@@ -6371,6 +7365,25 @@ fn exec_call_parts(args: &[IrExpr]) -> Option<(String, Vec<&IrExpr>)> {
 
 /// Emit `LHS = do { open('bash','-c',CMD) ... }` capture (chomps trailing NL).
 fn emit_capture_assign(out: &mut String, indent: usize, lhs: &str, cmd: &str) {
+    // Bare `x=$(mktemp)` — the procsub materialisation's filename request
+    // (43 corpus sites, one per `<( )`) plus user `tmp=$(mktemp)`. Create
+    // the file IN-PROCESS with core File::Temp instead of spawning
+    // `bash -c mktemp` through `__sh_pipe_capture`: one process per
+    // request becomes zero, and the `__sh_pipe_capture` callout goes away.
+    // tempfile() gives mktemp's semantics (O_EXCL, 0600, unique, in
+    // TMPDIR); UNLINK => 0 keeps it — the materialisation's own `rm`
+    // cleans up. The fh drops closed at the end of the do{}; the producer's
+    // `open '>', $tmp` reuses the path. `$CHILD_ERROR = 0` mirrors the
+    // status a successful mktemp records in bash (the capture sub set it
+    // internally the same way). `mktemp -d` / other args keep the shell
+    // path — a directory is not a tempfile.
+    if matches!(cmd.trim(), "'mktemp'" | "mktemp") {
+        emit_indent(out, indent);
+        out.push_str(&format!(
+            "{lhs} = do {{ require File::Temp; (File::Temp::tempfile('sh2_ps_XXXXXX', TMPDIR => 1, UNLINK => 0))[1] }}; $CHILD_ERROR = 0;\n"
+        ));
+        return;
+    }
     // `$ENV{name} = $name;` prelude — the bash -c child must see the
     // vars the captured command reads (mirror of the cd/if shell-out
     // sites' var_exports_str prefix; without it `y=$(echo $x)` sees an
@@ -6786,9 +7799,19 @@ fn append_redirect_frag(cmd: &mut String, fd: i64, mode: &str, target: &IrExpr) 
 /// native emission lives in the pipeline_native cat capability.
 /// Rewrite env-style `$NAME`/`${NAME}` in an interpolated heredoc body to
 /// `$ENV{NAME}` (the assignment rendered those names as `%ENV{…}`).
+/// Scalar-phase names keep their plain `$NAME`: their store is the perl
+/// scalar and %ENV only mirrors them once exported.
 fn rewrite_heredoc_env(s: &str) -> String {
     let re = regex::Regex::new(r"\$\{?([A-Z_][A-Z0-9_]*)\}?").unwrap();
-    re.replace_all(s, "$$ENV{$1}").to_string()
+    re.replace_all(s, |caps: &regex::Captures| {
+        let name = &caps[1];
+        if scalar_phase_var(name) {
+            format!("${}", name)
+        } else {
+            format!("$ENV{{{}}}", name)
+        }
+    })
+    .to_string()
 }
 
 /// `mapfile [-t] [flags] VAR < FILE` / `readarray …` → a native Perl read
@@ -7420,8 +8443,9 @@ fn try_native_echo_tr_pipeline(out: &mut String, call: &IrExpr, indent: usize) -
     }
     emit_indent(out, indent);
     out.push_str(&format!(
-        "my $__tr_out = {}; print $__tr_out; $main_exit_code = $CHILD_ERROR = 0;\n",
-        expr.unwrap()
+        "my $__tr_out = {}; print $__tr_out;{}\n",
+        expr.unwrap(),
+        rc_write(" $main_exit_code = $CHILD_ERROR = 0;")
     ));
     true
 }
@@ -7537,10 +8561,13 @@ fn try_native_while_read_sort(out: &mut String, call: &IrExpr, indent: usize) ->
         },
         0,
     );
+    // `our ($a, $b)` inside the sort block — a script-level `my $a`
+    // (bash's `$a`) shadows Perl's sort package globals file-wide and
+    // makes every comparison see two undefs, leaving the input unsorted.
     let cmp = if sort_flags.iter().any(|f| f == "-n") {
-        "$a <=> $b"
+        "our ($a, $b); $a <=> $b"
     } else {
-        "$a cmp $b"
+        "our ($a, $b); $a cmp $b"
     };
     // `head [-n] N` — keep the first N lines. bash's bare `head` defaults to
     // 10; `-N` and `-n N` are the corpus spellings. Anything else (multiple
@@ -7637,10 +8664,13 @@ fn try_native_for_sort(out: &mut String, call: &IrExpr, indent: usize) -> bool {
         },
         0,
     );
+    // `our ($a, $b)` inside the sort block — a script-level `my $a`
+    // (bash's `$a`) shadows Perl's sort package globals file-wide and
+    // makes every comparison see two undefs, leaving the input unsorted.
     let cmp = if sort_flags.iter().any(|f| f == "-n") {
-        "$a <=> $b"
+        "our ($a, $b); $a <=> $b"
     } else {
-        "$a cmp $b"
+        "our ($a, $b); $a cmp $b"
     };
     // `head [-n] N` — keep the first N lines. bash's bare `head` defaults to
     // 10; `-N` and `-n N` are the corpus spellings. Anything else (multiple
@@ -7885,17 +8915,28 @@ fn emit_exec_call(out: &mut String, call: &IrExpr, indent: usize) {
         if let Some(text) = words.iter().find_map(|w| static_word_text(w)) {
             if let Ok(cmds) = crate::parser::commands::parse(&text) {
                 if !cmds.is_empty() {
-                    let sub = crate::shir::ast_to_ir(&cmds);
+                    // `ast_to_ir_raw`, NOT `ast_to_ir` — the same rule Fix 7
+                    // documents for the inliner: an eval PAYLOAD exists for
+                    // its SIDE EFFECT in the CALLER's scope, and nothing in
+                    // it is ever dead. The optimizing pipeline's dead-fn-elim
+                    // sees only the payload (the caller's `type g` / later
+                    // `g` call are outside it) and erased
+                    // `eval 'g() { … }'` completely — the eval emitted
+                    // NOTHING where bash DEFINED the function.
+                    let sub = crate::shir::ast_to_ir_raw(&cmds);
                     for st in &sub.stmts {
                         emit_stmt(out, st, indent);
                     }
                     return;
                 }
             }
+            // The STDERR diagnostic belongs to the eval failure, not to
+            // the status write: emit it unconditionally and let rc_stripped
+            // drop only the assignment.
             emit_indent(out, indent);
-            out.push_str(
+            out.push_str(&rc_stripped(
                 "(print STDERR \"$0: eval: syntax error\\n\"); $main_exit_code = $CHILD_ERROR = 1;\n",
-            );
+            ));
             return;
         }
         // An INTERPOLATED eval argument (`eval "echo \"… $x\""`): bash
@@ -7908,7 +8949,8 @@ fn emit_exec_call(out: &mut String, call: &IrExpr, indent: usize) {
         if let Some(expanded) = words.iter().find_map(|w| eval_word_shell_text(w)) {
             if let Ok(cmds) = crate::parser::commands::parse(&expanded) {
                 if !cmds.is_empty() {
-                    let sub = crate::shir::ast_to_ir(&cmds);
+                    // raw — same payload doctrine as the static arm above.
+                    let sub = crate::shir::ast_to_ir_raw(&cmds);
                     for st in &sub.stmts {
                         emit_stmt(out, st, indent);
                     }
@@ -7937,7 +8979,7 @@ fn emit_exec_call(out: &mut String, call: &IrExpr, indent: usize) {
         "printf" => {
             if words.is_empty() {
                 emit_indent(out, indent);
-                out.push_str("$main_exit_code = $CHILD_ERROR = 0;\n");
+                out.push_str(&rc_write("$main_exit_code = $CHILD_ERROR = 0;\n"));
                 return;
             }
             // The format word. bash's printf interprets backslash escapes
@@ -8106,7 +9148,7 @@ fn emit_exec_call(out: &mut String, call: &IrExpr, indent: usize) {
                 out.push_str(&format!("printf({}, {});\n", fmt, rest.join(", ")));
             }
             emit_indent(out, indent);
-            out.push_str("$main_exit_code = $CHILD_ERROR = 0;\n");
+            out.push_str(&rc_write("$main_exit_code = $CHILD_ERROR = 0;\n"));
         }
         "cd" => {
             let dir = words
@@ -8115,40 +9157,119 @@ fn emit_exec_call(out: &mut String, call: &IrExpr, indent: usize) {
                 .unwrap_or_else(|| "$ENV{HOME}".to_string());
             emit_indent(out, indent);
             out.push_str(&format!(
-                "chdir({}) or die \"cd: $!\\n\"; $main_exit_code = $CHILD_ERROR = 0;\n",
-                dir
+                "chdir({}) or die \"cd: $!\\n\";{}\n",
+                dir,
+                rc_write(" $main_exit_code = $CHILD_ERROR = 0;")
             ));
         }
         "export" => {
-            for w in &words {
-                if let Some(word_str) = call_arg_str(w) {
-                    if let Some(eq) = word_str.split_once('=') {
+            // The parser's SPLIT form: `export N=<word>` (quoted or
+            // complex value) pushes TWO words — `N=` then the value — the
+            // "quoted-value shape" ESTree's `try_native_export` pairs
+            // with `i += 2`. Iterating words one-by-one rendered the
+            // value word as a SECOND export: `export X="Bye"` became
+            // `$ENV{X} = ""; $ENV{Bye} = $ENV{Bye};` and X stayed empty
+            // (repro against 045's export shape). Pair them here the same
+            // way; an empty value (`export X=` with nothing after) stays
+            // `""`, and a following `Y=` split-form word is NOT consumed
+            // as X's value.
+            let mut i = 0usize;
+            while i < words.len() {
+                let word = &words[i];
+                if let Some(word_str) = call_arg_str(word) {
+                    // split form: word ENDS with `=` and looks like `NAME=`
+                    let split_name = word_str.strip_suffix('=').filter(|name| {
+                        !name.is_empty()
+                            && name
+                                .chars()
+                                .next()
+                                .map_or(false, |c| c.is_ascii_alphabetic() || c == '_')
+                            && name
+                                .chars()
+                                .all(|c| c.is_ascii_alphanumeric() || c == '_')
+                    });
+                    // a following word that is ITSELF a `NAME=` split head
+                    // must not be swallowed as this name's value
+                    let next_is_split = words
+                        .get(i + 1)
+                        .and_then(|next| call_arg_str(next))
+                        .map(|s| {
+                            s.strip_suffix('=').map_or(false, |r| {
+                                !r.is_empty()
+                                    && r.chars()
+                                        .next()
+                                        .map_or(false, |c| c.is_ascii_alphabetic() || c == '_')
+                            })
+                        })
+                        .unwrap_or(false);
+                    if let Some(name) = split_name {
+                        let rendered = match words.get(i + 1) {
+                            Some(next) if !next_is_split => {
+                                i += 1; // consume the value word
+                                render_word(next)
+                            }
+                            _ => "\"\"".to_string(),
+                        };
                         emit_indent(out, indent);
-                        out.push_str(&format!(
-                            "$ENV{{{}}} = {};\n",
-                            eq.0,
-                            render_word(&IrExpr::Str(eq.1.to_string(), StrStyle::DoubleQuoted))
+                        if scalar_phase_var(name) {
+                            // the value lives in the SCALAR home; publish
+                            // to %ENV from it (both homes in sync now)
+                            out.push_str(&format!(
+                                "${n} = {r}; $ENV{{{n}}} = ${{{n}}};\n",
+                                n = name,
+                                r = rendered
+                            ));
+                        } else {
+                            out.push_str(&format!("$ENV{{{}}} = {};\n", name, rendered));
+                        }
+                        i += 1;
+                        continue;
+                    }
+                    if let Some((name, val)) = word_str.split_once('=') {
+                        // merged `NAME=VALUE` word
+                        let rendered = render_word(&IrExpr::Str(
+                            val.to_string(),
+                            StrStyle::DoubleQuoted,
                         ));
-                    } else {
                         emit_indent(out, indent);
+                        if scalar_phase_var(name) {
+                            out.push_str(&format!(
+                                "${n} = {r}; $ENV{{{n}}} = ${{{n}}};\n",
+                                n = name,
+                                r = rendered
+                            ));
+                        } else {
+                            out.push_str(&format!("$ENV{{{}}} = {};\n", name, rendered));
+                        }
+                        i += 1;
+                        continue;
+                    }
+                    // bare `export NAME`: publish the current value. A
+                    // scalar-phase name's value lives in its SCALAR home;
+                    // otherwise the %ENV slot already IS the store.
+                    emit_indent(out, indent);
+                    if scalar_phase_var(&word_str) {
+                        out.push_str(&format!("$ENV{{{n}}} = ${{{n}}};\n", n = word_str));
+                    } else {
                         out.push_str(&format!("$ENV{{{}}} = $ENV{{{}}};\n", word_str, word_str));
                     }
                 }
+                i += 1;
             }
             emit_indent(out, indent);
-            out.push_str("$main_exit_code = $CHILD_ERROR = 0;\n");
+            out.push_str(&rc_write("$main_exit_code = $CHILD_ERROR = 0;\n"));
         }
         "pwd" => {
             emit_indent(out, indent);
             out.push_str("print qx{pwd};\n");
             emit_indent(out, indent);
-            out.push_str("$main_exit_code = $CHILD_ERROR = 0;\n");
+            out.push_str(&rc_write("$main_exit_code = $CHILD_ERROR = 0;\n"));
         }
         "shopt" => {
             // Shell-option toggles — no runtime effect for the supported
             // subset (the corpus's shopt -s/-u lines gate extglob etc.).
             emit_indent(out, indent);
-            out.push_str("$main_exit_code = $CHILD_ERROR = 0;\n");
+            out.push_str(&rc_write("$main_exit_code = $CHILD_ERROR = 0;\n"));
         }
         "set" => {
             // `set -- a b c` replaces the positional parameters.
@@ -8166,21 +9287,21 @@ fn emit_exec_call(out: &mut String, call: &IrExpr, indent: usize) {
             }
             // Other `set` forms are option toggles — no runtime effect.
             emit_indent(out, indent);
-            out.push_str("$main_exit_code = $CHILD_ERROR = 0;\n");
+            out.push_str(&rc_write("$main_exit_code = $CHILD_ERROR = 0;\n"));
         }
         "true" | ":" => {
             emit_indent(out, indent);
-            out.push_str("$main_exit_code = $CHILD_ERROR = 0;\n");
+            out.push_str(&rc_write("$main_exit_code = $CHILD_ERROR = 0;\n"));
         }
         "false" => {
             emit_indent(out, indent);
-            out.push_str("$main_exit_code = $CHILD_ERROR = 1;\n");
+            out.push_str(&rc_write("$main_exit_code = $CHILD_ERROR = 1;\n"));
         }
         "shift" => {
             emit_indent(out, indent);
             out.push_str("shift @ARGV;\n");
             emit_indent(out, indent);
-            out.push_str("$main_exit_code = $CHILD_ERROR = 0;\n");
+            out.push_str(&rc_write("$main_exit_code = $CHILD_ERROR = 0;\n"));
         }
         "exit" => {
             let code = words
@@ -8235,9 +9356,32 @@ fn emit_exec_call(out: &mut String, call: &IrExpr, indent: usize) {
                         };
                         let items: Vec<String> =
                             elems.iter().map(|e| render_word_list(e)).collect();
+                        // `local -A h=([k]=v)` — an ASSOCIATIVE declaration
+                        // (the `-A` flag, or the call's own assoc marker).
+                        // `my @h = ()` was an ARRAY binding that both shadowed
+                        // the hoisted `my %h` and made `${h[k]}` an array
+                        // subscript (063_09).
+                        let assoc = sigil == '%' || set_array_is_assoc(args);
                         emit_indent(out, indent);
                         if func == "setArrayAppend" {
+                            // `+=` on an assoc array has no perl `push` spelling;
+                            // keep the pre-existing array form rather than emit
+                            // `push %h` (a compile error).
                             out.push_str(&format!("push @{}, ({});\n", name, items.join(", ")));
+                        } else if assoc {
+                            // Assoc literal elements arrive as `[KEY]=VALUE`
+                            // TEXT. Reduce each to a `KEY => VALUE` pair. The
+                            // declaration is `%` REGARDLESS — the census put
+                            // this name in HASH_VARS, so an `@` here would
+                            // make every later `${h[k]}` (`$h{k}`, `hash
+                            // %h`) a strict compile error. An element this
+                            // cannot read is dropped rather than type-mangled.
+                            let pairs = assoc_pairs(&elems).unwrap_or_default();
+                            out.push_str(&format!(
+                                "my %{} = ({});\n",
+                                name,
+                                pairs.join(", ")
+                            ));
                         } else {
                             out.push_str(&format!("my @{} = ({});\n", name, items.join(", ")));
                         }
@@ -8284,7 +9428,7 @@ fn emit_exec_call(out: &mut String, call: &IrExpr, indent: usize) {
                 i += 1;
             }
             emit_indent(out, indent);
-            out.push_str("$main_exit_code = $CHILD_ERROR = 0;\n");
+            out.push_str(&rc_write("$main_exit_code = $CHILD_ERROR = 0;\n"));
         }
         "read" => {
             // `read [-flags] VAR` — the leading options (`-r`, `-p`, `-n`, …)
@@ -8301,7 +9445,7 @@ fn emit_exec_call(out: &mut String, call: &IrExpr, indent: usize) {
                 out.push_str(&format!("chomp(my $__line = <STDIN>); ${} = $__line;\n", n));
             }
             emit_indent(out, indent);
-            out.push_str("$main_exit_code = $CHILD_ERROR = 0;\n");
+            out.push_str(&rc_write("$main_exit_code = $CHILD_ERROR = 0;\n"));
         }
         "sleep" => {
             let t = words
@@ -8310,8 +9454,9 @@ fn emit_exec_call(out: &mut String, call: &IrExpr, indent: usize) {
                 .unwrap_or_else(|| "1".to_string());
             emit_indent(out, indent);
             out.push_str(&format!(
-                "sleep({}); $main_exit_code = $CHILD_ERROR = 0;\n",
-                t
+                "sleep({});{}\n",
+                t,
+                rc_write(" $main_exit_code = $CHILD_ERROR = 0;")
             ));
         }
         "wait" => {
@@ -8329,7 +9474,57 @@ fn emit_exec_call(out: &mut String, call: &IrExpr, indent: usize) {
                 }
             }
             emit_indent(out, indent);
-            out.push_str("$main_exit_code = $CHILD_ERROR = 0;\n");
+            out.push_str(&rc_write("$main_exit_code = $CHILD_ERROR = 0;\n"));
+        }
+        "kill" => {
+            // `kill [-SIGNAL] PID` — Perl's builtin kill(), NATIVE: no
+            // fork/exec and no shell-out. Before this arm the call fell
+            // through to the uu-ffi seam (which has no `kill`) and then to
+            // a bash -c — for a process this very program forked. The only
+            // kill this generator emits is the procsub-producer child
+            // (perl_generator_fixed Fix 10), so the operand is always our
+            // own background pid. Signal word is `-TERM` / `TERM` / `-15`;
+            // default TERM. Bash reports 0 when at least one signal was
+            // delivered.
+            let mut sig = "TERM".to_string();
+            let mut pids: Vec<String> = Vec::new();
+            for w in &words {
+                if let Some(lit) = call_arg_str(w) {
+                    if lit.starts_with('-') && lit.len() > 1 && pids.is_empty() {
+                        let s: String = lit[1..]
+                            .chars()
+                            .filter(|c| c.is_ascii_alphanumeric())
+                            .collect();
+                        if !s.is_empty() {
+                            sig = s;
+                        }
+                        continue;
+                    }
+                    // A literal empty / `0` operand: bash reads pid 0 as
+                    // "the caller's whole process group" — and so does
+                    // Perl's kill, which would TERM this program itself
+                    // (exit 143) plus every sibling in the group. Refuse
+                    // (status 1) rather than signal the group.
+                    if lit.is_empty() || lit == "0" {
+                        continue;
+                    }
+                }
+                pids.push(render_word(w));
+            }
+            if pids.is_empty() {
+                // no operand — bash usage error, status 1
+                emit_indent(out, indent);
+                out.push_str(&rc_write("$main_exit_code = $CHILD_ERROR = 1;\n"));
+            } else {
+                for pid in pids {
+                    emit_indent(out, indent);
+                    out.push_str(&format!(
+                        "do {{ my $__sh_killed = kill('{}', {});{} }};\n",
+                        sig, pid,
+                        rc_write(" $main_exit_code = $CHILD_ERROR = ($__sh_killed ? 0 : 1);")
+                    ));
+                }
+            }
         }
         "test" => {
             // `test` builtin: reconstruct the `[ ... ]` condition and
@@ -8338,8 +9533,17 @@ fn emit_exec_call(out: &mut String, call: &IrExpr, indent: usize) {
             let cond = render_test_call(&words.iter().map(|w| {
                 IrExpr::Str(render_word(w), StrStyle::DoubleQuoted)
             }).collect::<Vec<_>>());
-            emit_indent(out, indent);
-            out.push_str(&format!("$main_exit_code = $CHILD_ERROR = ({}) ? 0 : 1;\n", cond));
+            if rc_unread() {
+                // Evaluate (words may carry side effects), discard value.
+                emit_indent(out, indent);
+                out.push_str(&format!("({});\n", cond));
+            } else {
+                emit_indent(out, indent);
+                out.push_str(&format!(
+                    "$main_exit_code = $CHILD_ERROR = ({}) ? 0 : 1;\n",
+                    cond
+                ));
+            }
         }
         _ => {
             // External command — first try the AST Generator's in-Perl
@@ -8361,13 +9565,13 @@ fn emit_exec_call(out: &mut String, call: &IrExpr, indent: usize) {
             // pass the ALREADY-SPLIT argv to the uu-ffi seam. The fallback
             // shell-out lives in the stripped preamble; the in-process
             // coreutils `.so` handles the supported set. Word-splitting
-            // (`split`) and glob words keep the shell-text path.
+            // (`split`) keeps the shell-text path; glob words render
+            // through `__sh_glob()` in the argv (native, no shell-out).
             if uu_seam_enabled()
                 && !is_shell_builtin(&cmd)
                 && !words.is_empty()
                 && !words.iter().any(|w| {
                     matches!(w, IrExpr::Call { func, .. } if func == "split")
-                        || matches!(w, IrExpr::Str(s, _) if s.starts_with("\u{1}SH2GLOB\u{1}"))
                 })
             {
                 let mut args: Vec<String> = vec![perl_word_literal(&cmd)];
@@ -8379,8 +9583,9 @@ fn emit_exec_call(out: &mut String, call: &IrExpr, indent: usize) {
                 }
                 emit_indent(out, indent);
                 out.push_str(&format!(
-                    "__sh_uu_run({}); $main_exit_code = $CHILD_ERROR = $__sh_uu_rc;\n",
-                    args.join(", ")
+                    "__sh_uu_run({});{}\n",
+                    args.join(", "),
+                    rc_write(" $main_exit_code = $CHILD_ERROR = $__sh_uu_rc;")
                 ));
                 return;
             }
@@ -8460,7 +9665,7 @@ fn emit_echo(out: &mut String, words: &[&IrExpr], indent: usize) {
             _ => break,
         }
     }
-    let ok = |out: &mut String| out.push_str("$main_exit_code = $CHILD_ERROR = 0;\n");
+    let ok = |out: &mut String| out.push_str(&rc_write("$main_exit_code = $CHILD_ERROR = 0;\n"));
     // A `${!name*[@]:off:len}` argument is a bash SYNTAX ERROR: the
     // expansion printed its diagnostic and the whole command is abandoned,
     // so `echo` must emit NOTHING (not even the newline). The renderer marks
@@ -8469,6 +9674,15 @@ fn emit_echo(out: &mut String, words: &[&IrExpr], indent: usize) {
         let t = ir_expr_to_perl(a);
         t.contains("SH2BADSUBST")
     }) {
+        // …but the ABANDONED command still leaves $? = 1 (measured:
+        // `echo A; echo "${!p*[@]:0:3}"; echo "status=$?"` prints
+        // `status=1`). Without this write the program exited with the stale
+        // status of the previous statement, so a script whose LAST line has a
+        // bad substitution reported 0 where bash reports 1 (063_04).
+        // Emitting the status alone is also correct mid-script: the next
+        // statement overwrites both vars, exactly as bash does.
+        emit_indent(out, indent);
+        out.push_str(&rc_write("$main_exit_code = $CHILD_ERROR = 1;\n"));
         return;
     }
     if args.is_empty() {
@@ -8538,6 +9752,41 @@ fn emit_echo(out: &mut String, words: &[&IrExpr], indent: usize) {
         matches!(w, IrExpr::Call { func, .. } if func == "split")
             || parts.get(i).map_or(false, |p| p.starts_with("split(/"))
     });
+    // An ARITHMETIC operand expansion that evaluates EMPTY abandons the
+    // command entirely in bash: the operands are expanded before the
+    // expression is parsed, so `* 100 + ` is a syntax error and bash runs
+    // neither the command nor its output (`echo $(($1 * 100 + $2))` with
+    // no args prints nothing and leaves $? = 1 — parse-dollar-in-arithmetic).
+    // Such an arg carries the `$__SH2_AE = 1` flag write from
+    // `arith_str_to_perl`, so evaluate the args into a list FIRST (the
+    // flag flips while they are evaluated) and print only if it stayed
+    // clear — the SH2BADSUBST skip above, but as a RUNTIME condition.
+    if parts.iter().any(|p| p.contains("$__SH2_AE = 1")) {
+        let arg = if has_split {
+            "join(' ', grep { defined($_) && length($_) } @__sh_ae)".to_string()
+        } else {
+            match parts.len() {
+                1 if parts[0].starts_with("glob(") => "join(' ', @__sh_ae)".to_string(),
+                1 => "$__sh_ae[0]".to_string(),
+                _ => "join(' ', @__sh_ae)".to_string(),
+            }
+        };
+        emit_indent(out, indent);
+        out.push_str("$__SH2_AE = 0;\n");
+        emit_indent(out, indent);
+        // The trailing `;` after the `do` BLOCK is mandatory: unlike
+        // `if`/`while`, a `do { … }` STATEMENT followed by another
+        // statement without one is a perl syntax error (perl 5.38).
+        out.push_str(&format!(
+            "do {{ my @__sh_ae = ({}); if ($__SH2_AE) {{{} }} else {{ print({}{});{} }} }};\n",
+            parts.join(", "),
+            rc_write(" $main_exit_code = $CHILD_ERROR = 1;"),
+            arg,
+            nl,
+            rc_write(" $main_exit_code = $CHILD_ERROR = 0;")
+        ));
+        return;
+    }
     if parts.len() == 1 && !has_split {
         // A single glob word is a LIST in Perl — wrap in join(' ', …) so
         // the expansion space-joins like bash (echo file_*.txt).
@@ -8608,6 +9857,35 @@ fn collect_assigned_in_expr(e: &IrExpr, out: &mut Vec<(String, Sigil)>) {
     }
 }
 
+/// Does the rendered body mention `name` with `sigil`? Boundary-aware: a
+/// probe that would be a prefix of a longer identifier (`$result` inside
+/// `$results`) or that follows one (`foo@result`) does not count. Over-
+/// matching is harmless — an extra `my` of an unused sigil is silent —/// while under-matching leaves a `use strict` compile error that kills the
+/// whole program, so the probes cover every spelling the emitters produce:
+/// `@x` / `${x}[$i]` / `$x[0]` for an array, `%x` / `$x{'k'}` for a hash.
+fn body_mentions_sigil(body: &str, name: &str, sigil: Sigil) -> bool {
+    let is_ident = |c: char| c.is_ascii_alphanumeric() || c == '_';
+    let probes: Vec<String> = match sigil {
+        Sigil::Scalar => vec![format!("${name}")],
+        Sigil::Array => vec![format!("@{name}"), format!("${{{name}}}["), format!("${name}[")],
+        Sigil::Hash => vec![format!("%{name}"), format!("${name}{{")],
+    };
+    for probe in probes {
+        let mut from = 0usize;
+        while let Some(rel) = body[from..].find(probe.as_str()) {
+            let start = from + rel;
+            let end = start + probe.len();
+            let before_ok = body[..start].chars().next_back().is_none_or(|c| !is_ident(c));
+            let after_ok = body[end..].chars().next().is_none_or(|c| !is_ident(c));
+            if before_ok && after_ok {
+                return true;
+            }
+            from = end;
+        }
+    }
+    false
+}
+
 fn collect_assigned_vars(stmts: &[IrStmt], out: &mut Vec<(String, Sigil)>) {
     for s in stmts {
         match s {
@@ -8625,7 +9903,15 @@ fn collect_assigned_vars(stmts: &[IrStmt], out: &mut Vec<(String, Sigil)>) {
                     // An uppercase ARRAY is not an env var: the env-style
                     // heuristic must not skip its declaration (`LIST=()` left
                     // `@LIST` undeclared — examples/parse-array-plusassign).
-                    if is_env_style_var_name(&t.var) && !is_array_rhs {
+                    // A scalar-phase env-style name (plain assignment, no
+                    // export) stores in the perl scalar — it must still be
+                    // DECLARED (`my` hoist) so `use strict` accepts the
+                    // reads/writes; only the never-scalar-assigned ones
+                    // live purely in %ENV.
+                    if is_env_style_var_name(&t.var)
+                        && !is_array_rhs
+                        && !crate::ir::scalar_phase_var(&t.var)
+                    {
                         continue;
                     }
                     let (base, idx) = split_indexed_var(&t.var);
@@ -9533,7 +10819,13 @@ fn render_flat_test(s: &str) -> Option<String> {
                     if has_glob {
                         // Normal glob → anchored regex match.
                         let re = glob_to_regex(rhs.trim_matches('"').trim_matches('\''));
-                        return Some(format!("({} =~ /^{}$/)", lhs, re));
+                        // `(?s)`: a bash glob matches NEWLINES — `[[ x ==
+                        // *$'\x00'* ]]` with an empty $'\x00' is the glob `**`,
+                        // which matches any string, and `.` without /s stopped
+                        // matching the moment stdout was multi-line, taking the
+                        // else branch where bash took the then (realpath-cmdsub
+                        // line 133: plain `stdout:` instead of the od dump).
+                        return Some(format!("({} =~ /^(?s){}$/)", lhs, re));
                     }
                     return Some(nocase_str_eq(&lhs, &flat_operand(rhs)));
                 }
@@ -9552,18 +10844,26 @@ pub(crate) fn glob_or_extglob_to_regex(lhs: &str, pat: &str) -> Option<String> {
             let close = open + 2 + close_rel;
             let inner = &pat[open + 2..close];
             let suffix = &pat[close + 1..];
+            // `(?s)`: a bash glob matches NEWLINES (`.` without /s does
+            // not — same fix as render_flat_test above).
             let re_inner = glob_to_regex(inner);
             let re_suffix = glob_to_regex(suffix);
             // (x =~ /S$/) && (x !~ /P S$/)
             return Some(format!(
-                "(({l}) =~ /{rs}$/) && (({l}) !~ /{ri}{rs}$/)",
+                "(({l}) =~ /(?s){rs}$/) && (({l}) !~ /(?s){ri}{rs}$/)",
                 l = lhs,
                 rs = re_suffix,
                 ri = re_inner
             ));
         }
     }
-    Some(format!("^({})$", glob_to_regex(pat)))
+    // `(?s)`: the caller embeds this fragment in `/…/`, and a bash glob
+    // matches NEWLINES — the realpath-cmdsub `[[ $stdout ==
+    // *$'\x00'* ]]` (glob `**` after bash collapses the NUL to empty)
+    // must still match a multi-line stdout; `.` without /s stopped at the
+    // first `\n` and took the else branch where bash took the then
+    // (plain `stdout:` instead of the od dump).
+    Some(format!("^(?s){}$", glob_to_regex(pat)))
 }
 
 /// Tokenize a test string: whitespace-separated, double-quoted runs kept
@@ -10222,17 +11522,25 @@ pub(crate) fn render_test_operand(tok: &str) -> String {
 }
 
 /// Render a Str literal (shared by ir_expr_to_perl and render_word).
-/// Private-use marker chars (U+E000+byte, from
-/// SharedUtils::bytes_to_marked_lossy — the A1 emit's invalid-UTF-8
-/// preservation, core request perl-20260814-175710) become `\xNN` BYTE
-/// escapes so non-UTF-8 source bytes round-trip byte-for-byte (bash treats
-/// scripts as byte streams).
+/// Private-use marker chars (U+F800+byte) become `\xNN` BYTE escapes so
+/// non-UTF-8 source bytes round-trip byte-for-byte (bash treats scripts as
+/// byte streams).
+///
+/// The base is U+F800, the one every source reader in the tree actually
+/// produces: `otranspilerl`'s `read_source`, whose marker base was aligned
+/// with the ESTREE emitter (estree.rs `map_raw_bytes`, c_backend.rs, shir.rs
+/// all test 0xF800..=0xF8FF). This function tested 0xE000 — the base of the
+/// uncalled `SharedUtils::bytes_to_marked_lossy` — so NO marker matched,
+/// every non-UTF-8 byte was emitted as the literal PUA CHARACTER (re-encoded
+/// to three UTF-8 bytes) and stdout could not match bash:
+/// utf8-non-utf8-content.sh printed `EF A3 A9` where bash writes the single
+/// source byte `0xE9`.
 fn is_byte_marker(c: char) -> bool {
-    (0xE000..=0xE0FF).contains(&(c as u32))
+    (0xF800..=0xF8FF).contains(&(c as u32))
 }
 
 fn byte_marker_escape(c: char) -> String {
-    format!("\\x{:02X}", (c as u32 - 0xE000) as u8)
+    format!("\\x{:02X}", (c as u32 - 0xF800) as u8)
 }
 
 fn render_str_literal(s: &str, style: &StrStyle) -> String {
@@ -10595,9 +11903,7 @@ pub(crate) fn ir_expr_to_perl(expr: &IrExpr) -> String {
                         }
                         // fd-1 redirect (not select()) so child processes /
                         // UU-FFI runs that write to fd 1 are captured too.
-                        return format!(
-                            "do {{ my $__cap = ''; {{ local *STDOUT; open(STDOUT, '>', \\$__cap) or die \"capture: $!\\n\"; {body};; }} $__cap =~ s/\\n+\\z//; $__cap }}"
-                        );
+                        return capture_do_perl(&format!("{body};;"));
                     }
                     if let Some(cmd) = stmts_to_shell_cmd(stmts) {
                         return cmd_str_to_open_perl(&cmd);
@@ -10616,9 +11922,7 @@ pub(crate) fn ir_expr_to_perl(expr: &IrExpr) -> String {
                         for st in stmts.iter() {
                             emit_stmt(&mut body, st, 1);
                         }
-                        return format!(
-                            "do {{ my $__cap = ''; {{ local *STDOUT; open(STDOUT, '>', \\$__cap) or die \"capture: $!\\n\"; {body}; }} $__cap =~ s/\\n+\\z//; $__cap }}"
-                        );
+                        return capture_do_perl(&format!("{body};;"));
                     }
                     // A PERL-SIDE capture: the C frontend's outparam
                     // channel (setVar(cap, capture(Arrow[fnCall(..)]))) —
@@ -10651,9 +11955,7 @@ pub(crate) fn ir_expr_to_perl(expr: &IrExpr) -> String {
                         for st in stmts.iter() {
                             emit_stmt(&mut body, st, 1);
                         }
-                        return format!(
-                            "do {{ my $__cap = ''; {{ local *STDOUT; open(STDOUT, '>', \\$__cap) or die \"capture: $!\\n\"; {body}; }} $__cap =~ s/\\n+\\z//; $__cap }}"
-                        );
+                        return capture_do_perl(&format!("{body};;"));
                     }
                 }
             }
@@ -10673,9 +11975,7 @@ pub(crate) fn ir_expr_to_perl(expr: &IrExpr) -> String {
                 // result, which the redirect below captures.
                 if let [IrStmt::Expr(e)] = stmts.as_slice() {
                     if let Some(stmt) = crate::pipeline_native::native_pipeline(e) {
-                        return format!(
-                            "do {{ my $__cap = ''; {{ local *STDOUT; open(STDOUT, '>', \\$__cap) or die \"capture: $!\\n\"; {stmt}; ; }} $__cap =~ s/\\n+\\z//; $__cap }}"
-                        );
+                        return capture_do_perl(&format!("{stmt};;"));
                     }
                 }
                 if stmts.iter().any(|s| matches!(s, IrStmt::RawText(_))) {
@@ -10686,15 +11986,26 @@ pub(crate) fn ir_expr_to_perl(expr: &IrExpr) -> String {
                     // perl quirk: an in-memory open(STDOUT, '>', \$ref)
                     // needs fd 1 CLOSED first (EBADF otherwise — verified
                     // on perl 5.38; the dup2 target must be free).
-                    return format!(
-                        "do {{ my $__cap = ''; {{ local *STDOUT; open(STDOUT, '>', \\$__cap) or die \"capture: $!\\n\"; {body};; }} $__cap =~ s/\\n+\\z//; $__cap }}"
-                    );
+                    return capture_do_perl(&format!("{body};;"));
                 }
             }
             let mut inner = ir_expr_to_perl(expr);
             // Strip surrounding backticks from StrStyle::Command rendering
             if inner.starts_with('`') && inner.ends_with('`') && inner.len() >= 2 {
                 inner = inner[1..inner.len() - 1].to_string();
+            }
+            // Bare `x=$(mktemp)` in a NATIVE capture (the modern-IR
+            // exec-arg-capture twin of `emit_capture_assign`): the body is
+            // a single literal `mktemp`, so create the file IN-PROCESS with
+            // core File::Temp instead of spawning `bash -c mktemp` through
+            // `__sh_pipe_capture`. tempfile() gives mktemp's semantics
+            // (O_EXCL, 0600, unique, in TMPDIR); UNLINK => 0 keeps it for
+            // the consumer's `open '>', $tmp`. `$CHILD_ERROR = 0` mirrors
+            // the status a successful mktemp records in bash. `mktemp -d`
+            // / other args keep the shell path (a directory is not a
+            // tempfile), so the match is on the exact single-word text.
+            if inner.trim() == "mktemp" || inner.trim() == "'mktemp'" {
+                return "do { require File::Temp; (File::Temp::tempfile('sh2_ps_XXXXXX', TMPDIR => 1, UNLINK => 0))[1] }".to_string();
             }
             if *native {
                 // Native Perl expression — return as-is, no stripping
@@ -11049,7 +12360,7 @@ pub(crate) fn ir_expr_to_perl(expr: &IrExpr) -> String {
 
         IrExpr::Var(name, sigil) => match sigil.unwrap_or(Sigil::Scalar) {
             Sigil::Scalar => {
-                if is_env_style_var_name(name) {
+                if is_env_style_var_name(name) && !scalar_phase_var(name) {
                     format!("$ENV{{{}}}", name)
                 } else {
                     format!("${}", name)
@@ -11262,7 +12573,30 @@ pub(crate) fn ir_expr_to_perl(expr: &IrExpr) -> String {
                 "arrayLen" => args
                     .first()
                     .and_then(call_arg_str)
-                    .map(|n| format!("scalar(@{})", n))
+                    // a subscripted name arrives as SOURCE text (`array[i]`)
+                    // — a bareword under `use strict`; render it like every
+                    // other subscript (perl_subscripted_base).
+                    .map(|n| {
+                        let rendered = perl_subscripted_base(&n);
+                        let base = n.split('[').next().unwrap_or(&n);
+                        // `${#h[@]}` on an ASSOCIATIVE array counts KEYS. The
+                        // array-len-fold transform folds that spelling to
+                        // arrayLen, so this arm must take the same census
+                        // split the `#`-slice arm takes (hash_var vs
+                        // array_var): `scalar(@h)` on a `local -A` name
+                        // counts an empty ARRAY — 063_09/063_hard printed
+                        // `Processed 0 options`. A name the census knows is
+                        // an indexed array (or a subscripted base, which
+                        // cannot take `keys %…[…]`) keeps the array spelling;
+                        // unknown names keep today's array default (the
+                        // conservative direction — pre-fold arrayLen sites
+                        // rendered `scalar(@…)`).
+                        if !rendered.contains('[') && hash_var(base) && !array_var(base) {
+                            format!("scalar(keys %{})", rendered)
+                        } else {
+                            format!("scalar(@{})", rendered)
+                        }
+                    })
                     .unwrap_or_else(|| "0".to_string()),
                 "setArray" => {
                     // Array assignment in expression position (rare) — the
@@ -11492,6 +12826,7 @@ pub(crate) fn ir_expr_to_perl(expr: &IrExpr) -> String {
                             if let IrExpr::Var(name, sigil) = e.as_ref() {
                                 if sigil.unwrap_or(Sigil::Scalar) == Sigil::Scalar
                                     && is_env_style_var_name(name)
+                                    && !scalar_phase_var(name)
                                 {
                                     s.push_str(&format!("$ENV{{{}}}", name));
                                 } else {
@@ -11691,6 +13026,14 @@ sub __sh_pipe_unsupported_util {
 }
 sub __sh_pipe_run {
     my ($cmd, $opts) = @_;
+    # `$$` in rebuilt shell text is the SCRIPT's pid in bash (one shell for
+    # the whole program). Each rebuilt command here runs in a FRESH `bash -c`,
+    # whose own `$$` would differ per call — so a source `2>/tmp/e.$$` writer
+    # and a later `cat /tmp/e.$$` reader (single-quoted by __sh_q, never
+    # expanded) could never agree (realpath-cmdsub's stderr capture). Expand
+    # to the Perl pid up front so writer, reader and `unlink("…" . ($$))`
+    # all name the same file.
+    $cmd =~ s/\$\$/$$/g;
     if (__sh_pipe_load() && !__sh_pipe_unsupported_util($cmd)) {
         my $rc = __sh_pipe_run_str($cmd, defined $opts ? $opts : '');
         # `-2` parse / `-3` backend; `127` is the multicall's "unknown util"
@@ -11698,12 +13041,20 @@ sub __sh_pipe_run {
         if ($rc >= 0 && $rc != 127) { $CHILD_ERROR = $rc; return $rc; }
     }
     # Not parseable / unknown util / no backend / no .so: run it via the shell.
-    system('bash', '-c', $cmd);
+    # argv0 after the command STRING ($0, not `bash`): a rebuilt command may
+    # contain `$0`/`${0}` from the source (`script_dir=$(cd -- "$(dirname
+    # "$0")" && pwd)`), and bash passes the script's $0 down to every subshell
+    # and pipeline. With argv0 defaulting to "bash", `dirname ${0}` saw "bash"
+    # → "." → pwd returned the CWD instead of the script's directory
+    # (qx-var-builtin-cd).
+    system('bash', '-c', $cmd, $0);
     $CHILD_ERROR = $? >> 8;
     return $CHILD_ERROR;
 }
 sub __sh_pipe_capture {
     my ($cmd, $opts) = @_;
+    # See __sh_pipe_run: one Perl pid for writer and reader of `…$$`.
+    $cmd =~ s/\$\$/$$/g;
     if (__sh_pipe_load() && !__sh_pipe_unsupported_util($cmd)) {
         my $tmp = "/tmp/sh2_pipe_${$}_" . ($__SH_UU_SEQ++) . ".cap";
         my $rc = __sh_pipe_run_str($cmd . ' > ' . $tmp, defined $opts ? $opts : '');
@@ -11718,7 +13069,7 @@ sub __sh_pipe_capture {
         unlink $tmp;
     }
     my $out = do {
-        open(my $fh, '-|', 'bash', '-c', $cmd) or do { $CHILD_ERROR = 127; return ''; };
+        open(my $fh, '-|', 'bash', '-c', $cmd, $0) or do { $CHILD_ERROR = 127; return ''; };
         my $r = do { local $/; <$fh> };
         close $fh;
         $r;
@@ -12349,6 +13700,28 @@ fn collect_hash_vars(stmts: &[IrStmt], out: &mut std::collections::HashSet<Strin
                                     continue;
                                 }
                             }
+                            // `local -A h=([k]=v)` / `declare -A h=()` arrives
+                            // as a `setArray(name, elems, true)` VALUE word,
+                            // not as `NAME=VALUE` text — the assoc marker is
+                            // the third argument. Without this arm the name
+                            // never reached HASH_VARS, so every `${h[k]}`
+                            // rendered as an ARRAY subscript (`$h[$k]`) and the
+                            // declaration shadowed the hoisted `my %h` with
+                            // `my @h = ();` (063_09's `local -A options=()`).
+                            if let IrExpr::Call { func: sf, args: sa } = w {
+                                if matches!(sf.as_str(), "setArray" | "setArrayAppend") {
+                                    if is_hash || set_array_is_assoc(sa) {
+                                        if let Some(n) =
+                                            sa.first().and_then(crate::ir::call_arg_str)
+                                        {
+                                            if var_is_declarable(&n) {
+                                                out.insert(n);
+                                            }
+                                        }
+                                    }
+                                    continue;
+                                }
+                            }
                             if is_hash {
                                 if let Some(name) = crate::ir::call_arg_str(w) {
                                     let name = name.split('=').next().unwrap_or(&name);
@@ -12532,6 +13905,53 @@ fn collect_all_subscript_names(t: &str, out: &mut std::collections::HashSet<Stri
     }
 }
 
+/// Is this `setArray`/`setArrayAppend` call an ASSOCIATIVE one?
+///
+/// The frontend marks the assoc form with a third `Bool(true)` argument —
+/// `declare -A h=([k]=v)` / `local -A h=()` lower to
+/// `setArray("h", [...], true)`, while a plain `arr=(1 2 3)` carries only
+/// (name, elements). The marker is what survives once the `-A` flag word
+/// has been consumed, so the array/hash census reads it instead of
+/// guessing from the elements.
+fn set_array_is_assoc(args: &[IrExpr]) -> bool {
+    matches!(args.get(2), Some(IrExpr::Bool(true)))
+}
+
+/// Reduce the LITERAL elements of a `declare -A h=([k]=v …)` init — the
+/// frontend hands them over as the text `[k]=v` — to Perl `'k' => 'v'`
+/// pairs. `None` when an element is not a literal of that shape (a dynamic
+/// value, a bare word), so no text is guessed at.
+fn assoc_pairs(elems: &[&IrExpr]) -> Option<Vec<String>> {
+    let mut out = Vec::new();
+    for e in elems {
+        let text = match e {
+            IrExpr::Str(s, _) => s.clone(),
+            IrExpr::Interpolate(parts)
+                if parts.iter().all(|p| matches!(p, InterpPart::Lit(_))) =>
+            {
+                parts
+                    .iter()
+                    .filter_map(|p| match p {
+                        InterpPart::Lit(t) => Some(t.as_str()),
+                        _ => None,
+                    })
+                    .collect()
+            }
+            _ => return None,
+        };
+        let (key, value) = text.strip_prefix('[')?.split_once("]=")?;
+        if key.is_empty() {
+            return None;
+        }
+        out.push(format!(
+            "{} => {}",
+            safe_perl_q_string(key),
+            safe_perl_q_string(value)
+        ));
+    }
+    Some(out)
+}
+
 fn collect_array_vars(stmts: &[IrStmt], out: &mut std::collections::HashSet<String>) {
     fn one(s: &IrStmt, out: &mut std::collections::HashSet<String>) {
         match s {
@@ -12574,11 +13994,15 @@ fn collect_array_vars(stmts: &[IrStmt], out: &mut std::collections::HashSet<Stri
                 if let Some(cmd) = args.first().and_then(crate::ir::call_arg_str) {
                     if matches!(cmd.as_str(), "local" | "declare" | "typeset") {
                         let mut is_array = false;
+                        let mut is_hash = false;
                         for w in crate::ir::exec_word_args(args) {
                             if let Some(s) = crate::ir::call_arg_str(w) {
                                 if let Some(f) = s.strip_prefix('-') {
                                     if f.contains('a') && !f.contains('A') {
                                         is_array = true;
+                                    }
+                                    if f.contains('A') {
+                                        is_hash = true;
                                     }
                                     continue;
                                 }
@@ -12589,11 +14013,18 @@ fn collect_array_vars(stmts: &[IrStmt], out: &mut std::collections::HashSet<Stri
                             // `try()` helper — without this the name stayed
                             // out of the census, so `"${arr[@]}"` rendered
                             // as a HASH read and bash ran it as a command).
+                            // NOT when the declaration is an ASSOCIATIVE one
+                            // (`-A`, or the `setArray`'s assoc marker): that
+                            // word list is element/hash teritory and the name
+                            // belongs to HASH_VARS, not here (063_09).
                             if let IrExpr::Call { func: sf, args: sa } = w {
                                 if sf == "setArray" || sf == "setArrayAppend" {
-                                    if let Some(n) = sa.first().and_then(crate::ir::call_arg_str) {
-                                        if var_is_declarable(&n) {
-                                            out.insert(n);
+                                    if !is_hash && !set_array_is_assoc(sa) {
+                                        if let Some(n) = sa.first().and_then(crate::ir::call_arg_str)
+                                        {
+                                            if var_is_declarable(&n) {
+                                                out.insert(n);
+                                            }
                                         }
                                     }
                                     continue;
@@ -12681,11 +14112,26 @@ fn sh_uu_capture_expr(argv: &[String]) -> String {
 /// words render as Perl expressions (so `grep "$pat" f` passes the value,
 /// not the shell text).
 fn uu_arg(w: &IrExpr) -> String {
+    // A glob-marked literal must render as the native glob call — the
+    // literal path below would QUOTE the marker+pattern into one word and
+    // silently pass `\x01SH2GLOB\x01*.txt` to the command.
+    if let IrExpr::Str(s, _) = w {
+        if let Some(pat) = s.strip_prefix("\u{1}SH2GLOB\u{1}") {
+            return glob_call(pat);
+        }
+    }
     if let Some(l) = grep_lit_str(w) {
         perl_word_literal(&l)
     } else {
         render_word(w)
     }
+}
+
+/// `__sh_glob('pat')` — the runtime helper expands the pattern like bash
+/// (sorted, no dotfile match) and keeps it literal when nothing matches
+/// (bash has no nullglob by default: `ls *.nope` receives the pattern).
+fn glob_call(pat: &str) -> String {
+    format!("__sh_glob('{}')", pat.replace('\'', "\\\\'"))
 }
 
 /// Shell BUILTINS must never go through the uu-ffi argv seam (it runs a
@@ -12805,7 +14251,6 @@ fn capture_uu_expr(e: &IrExpr) -> Option<String> {
     }
     if words.iter().any(|w| {
         matches!(w, IrExpr::Call { func, .. } if func == "split")
-            || matches!(w, IrExpr::Str(s, _) if s.starts_with("\u{1}SH2GLOB\u{1}"))
     }) {
         return None;
     }
@@ -12838,6 +14283,21 @@ pub(crate) fn cmd_str_to_open_perl(cmd: &str) -> String {
     // fork/exec fallback otherwise). Complex commands keep the bash -c
     // string path. Embed fragments disable the seam (no preamble helpers;
     // the open-idiom below is self-contained).
+    // Bare `mktemp` (the procsub materialisation's filename request plus
+    // user `tmp=$(mktemp)`, in capture AND arg position): the command is a
+    // process created purely to hand back a fresh filename — bash does the
+    // identical thing (create an empty file, print its path, strip the
+    // newline). File::Temp::tempfile matches (O_EXCL, 0600, unique name
+    // from a secure PRNG, TMPDIR) with no fork/exec, so the
+    // `__sh_pipe_capture`/`__sh_uu_capture` callout and its process both
+    // disappear. `mktemp -d` and other arg forms keep every seam — a
+    // directory is not a tempfile. Emitted as a self-contained do{} so it
+    // is valid in expression position; callers that need the status set
+    // `$CHILD_ERROR` themselves (a successful mktemp leaves it 0 in bash,
+    // and the surrounding render already owns that).
+    if matches!(cmd.trim(), "'mktemp'" | "mktemp") {
+        return "do { require File::Temp; my $__t = (File::Temp::tempfile('sh2_ps_XXXXXX', TMPDIR => 1, UNLINK => 0))[1]; $CHILD_ERROR = 0; $__t }".to_string();
+    }
     // A command the native capability tree can COMPUTE (basename/dirname/
     // pwd, …) needs no shell at all — check_qx flags `bash -c` wrapping a
     // builtin. Try it before the uu-ffi seam (which would still fork/exec
@@ -12982,12 +14442,12 @@ pub(crate) fn expr_to_open_perl(cmd_expr: &str, chomp_result: bool) -> String {
     if chomp_result {
         // chomp must happen without local $/ in scope (see cmd_str_to_open_perl).
         format!(
-            "do {{ {}open(my $__fh, \'-|\', \'bash\', \'-c\', {}) or die \"cmd failed: $!\\n\"; my $_r = do {{ local $/; <$__fh> }}; close $__fh; $_r =~ s/\\n+\\z//; $CHILD_ERROR = $? >> 8; $_r; }}",
+            "do {{ {}open(my $__fh, \'-|\', \'bash\', \'-c\', {}, $0) or die \"cmd failed: $!\\n\"; my $_r = do {{ local $/; <$__fh> }}; close $__fh; $_r =~ s/\\n+\\z//; $CHILD_ERROR = $? >> 8; $_r; }}",
             exports, cmd_expr
         )
     } else {
         format!(
-            "do {{ {}open(my $__fh, \'-|\', \'bash\', \'-c\', {}) or die \"cmd failed: $!\\n\"; my $_r = do {{ local $/; <$__fh> }}; close $__fh; $CHILD_ERROR = $? >> 8; $_r; }}",
+            "do {{ {}open(my $__fh, \'-|\', \'bash\', \'-c\', {}, $0) or die \"cmd failed: $!\\n\"; my $_r = do {{ local $/; <$__fh> }}; close $__fh; $CHILD_ERROR = $? >> 8; $_r; }}",
             exports, cmd_expr
         )
     }
@@ -13727,7 +15187,7 @@ fn fold_expr(e: &IrExpr) -> IrExpr {
     }
 }
 
-pub(crate) fn optimize_stmts(stmts: &[IrStmt]) -> Vec<IrStmt> {
+pub fn optimize_stmts(stmts: &[IrStmt]) -> Vec<IrStmt> {
     // Pass 0: Collect all referenced variable names.
     let referenced = collect_referenced_vars(stmts);
 
@@ -13952,6 +15412,65 @@ impl IrProgram {
 mod tests {
     use super::*;
 
+    /// An exec/builtin call node: `Call { "builtin", [cmd, words] }`.
+    fn call(cmd: &str, words: Vec<IrExpr>) -> IrExpr {
+        IrExpr::Call {
+            func: "builtin".into(),
+            args: vec![
+                IrExpr::Str(cmd.into(), StrStyle::DoubleQuoted),
+                IrExpr::Array(words),
+            ],
+        }
+    }
+
+    /// `cd D && pwd` must render NATIVELY (chdir + Cwd::getcwd), not as a
+    /// `bash -c` shell-out: the shell-out arm produced
+    /// `system('bash', '-c', pwd)` after the builtin-name unquoter stripped
+    /// the quotes — a bareword `use strict` rejects, so the whole file died
+    /// through the silent `do FILE` and `cd /tmp && pwd` printed nothing
+    /// (exit 0, empty stdout). The native arm sidesteps the quoting seam
+    /// AND records cd-failure as status 1 with the program continuing,
+    /// which is how bash runs `cd D && tail`.
+    #[test]
+    fn cd_and_pwd_chain_is_native() {
+        let chain = IrExpr::BinOp {
+            lhs: Box::new(call("cd", vec![IrExpr::Str("/tmp".into(), StrStyle::DoubleQuoted)])),
+            op: BinOpKind::And,
+            rhs: Box::new(call("pwd", vec![])),
+        };
+        let s = cd_chain_to_perl(&chain).expect("cd && pwd renders");
+        assert!(!s.contains("system('bash'"), "no shell-out: {s}");
+        assert!(s.contains("Cwd::getcwd"), "native pwd: {s}");
+        assert!(s.contains("if (chdir(\"/tmp\"))"), "short-circuit guard: {s}");
+        assert!(s.contains("$CHILD_ERROR = 1"), "failed cd keeps status 1: {s}");
+    }
+
+    /// A guarded-chain operand (`… && pwd || echo X`) must reach the same
+    /// statement-native emission (pathops pwd / native print), keeping the
+    /// `$__sh_ok` flag write the chain guard reads — NOT a bash -c callout
+    /// (064_hard_to_generate held one of each; fail-shir counted them as
+    /// normalisable shell-out sites).
+    #[test]
+    fn chain_operators_render_pwd_and_echo_natively() {
+        let pwd = call("pwd", vec![]);
+        let body = chain_operand_body(&pwd).expect("pwd operand renders");
+        assert!(!body.contains("system('bash'"), "native pwd: {body}");
+        assert!(body.contains("Cwd::getcwd"), "{body}");
+        assert!(
+            body.contains("$__sh_ok = ($CHILD_ERROR == 0)"),
+            "chain flag write stays: {body}"
+        );
+
+        let echo = call(
+            "echo",
+            vec![IrExpr::Str("Directory not accessible".into(), StrStyle::DoubleQuoted)],
+        );
+        let body2 = chain_operand_body(&echo).expect("echo operand renders");
+        assert!(!body2.contains("system('bash'"), "native echo: {body2}");
+        assert!(body2.contains("print"), "{body2}");
+        assert!(body2.contains("$__sh_ok = ($CHILD_ERROR == 0)"), "{body2}");
+    }
+
     /// `${v+w}` / `${v:+w}` must lower to the SETNESS predicate, and the two
     /// must NOT render identically — `+` is set-ness, `:+` is non-empty.
     ///
@@ -14043,14 +15562,16 @@ mod tests {
                 .is_match(&perl),
             "perl-side target binding: {perl}"
         );
-        // ... and referenced from the bash -c text (env passthrough), with
-        // NO bogus `$ENV{__sh2_rd0} = $__sh2_rd0;` re-export (undeclared
-        // var under strict)
+        // ... and its VALUE spliced into the run text: the rebuilt command
+        // hands bash `> '<pid-path>'` through __sh_q($ENV{__sh2_rdN}) —
+        // single-quoted, so a path with spaces stays one word — with NO
+        // bogus `$ENV{__sh2_rd0} = $__sh2_rd0;` re-export (undeclared var
+        // under strict)
         assert!(
-            regex::Regex::new(r#"> \"\$__sh2_rd\d+\""#)
+            regex::Regex::new(r#"__sh_q\(\$ENV\{__sh2_rd\d+\}\)"#)
                 .unwrap()
                 .is_match(&perl),
-            "bash text references the env slot: {perl}"
+            "bash text splices the env slot value: {perl}"
         );
         assert!(
             !perl.contains("$__sh2_rd0 = $__sh2_rd0"),
@@ -14093,10 +15614,11 @@ mod tests {
             !perl.contains("$ENV{tmpf} = $ENV{tmpf}"),
             "no stale ENV read: {perl}"
         );
-        // the bash text reads the exported slot, not a literal path.
+        // the run text splices the LIVE local's value — not a literal path
+        // and not an %ENV read (a stale ENV slot would propagate "").
         assert!(
-            perl.contains(r#"q{'cat' "$tmpf"}"#),
-            "cat reads the exported slot: {perl}"
+            perl.contains(r#"q{'cat' } . __sh_q($tmpf)"#),
+            "cat reads the live local: {perl}"
         );
     }
 
@@ -14113,8 +15635,12 @@ mod tests {
         ]}"#;
         let prog = crate::shir_json_in::shir_json_to_ir(src).expect("incdec A1 ingress");
         let perl = shir_to_perl(&prog);
+        // The increment reaches the output inside the faithful `((…))`
+        // status conversion (`((($n++)) != 0) ? 0 : 1` — bash's `((expr))`
+        // reports the expression's value as its exit status), so pin the
+        // increment itself rather than a bare discarded-value statement.
         assert!(
-            perl.contains("($n++);"),
+            perl.contains("($n++"),
             "statement IncDec renders the increment: {perl}"
         );
         assert!(
@@ -14188,8 +15714,9 @@ mod tests {
     }
 
     /// `echo hi | tr a-z A-Z` folds to a native Perl string + `tr///` + print
-    /// (the try_native_echo_tr_pipeline native fold) instead of a whole
-    /// `bash -c` pipeline shell-out.
+    /// ahead of try_native_echo_tr_pipeline — the pipeline_native echo|tr
+    /// capability now wins the dispatch, emitting `my $__t = …; $__t =~
+    /// tr///; print $__t;`) instead of a whole `bash -c` shell-out.
     #[test]
     fn echo_tr_pipeline_renders_native_transliterate() {
         let src = r#"{"type":"Program","contract_version":1,"imports":[],"requires":[],"var_types":[],"stmt_lines":[],"var_lengths":[],"var_const":[],"var_lifetimes":[],"var_nospace":[],"var_bash_env":[],"subs":[],"stmts":[
@@ -14201,7 +15728,7 @@ mod tests {
         let prog = crate::shir_json_in::shir_json_to_ir(src).expect("echo|tr A1 ingress");
         let perl = shir_to_perl(&prog);
         assert!(
-            perl.contains("$__tr_out =~ tr/a-z/A-Z/") && perl.contains("; print $__tr_out;"),
+            perl.contains("$__t =~ tr/a-z/A-Z/") && perl.contains("print $__t;"),
             "echo|tr should fold to a native Perl transliteration: {perl}"
         );
         assert!(
@@ -14305,10 +15832,22 @@ mod tests {
     /// string, so `Config: ` printed with no value at all).
     #[test]
     fn herestring_array_expansion_substitutes_through_sh_q() {
+        // `config` is an ASSOCIATIVE array; seed the thread-local hash
+        // census the way populate_var_census does for a real render (no
+        // source is parsed here to populate it), so `${config[*]}` takes
+        // the `values %{…}` reading instead of refusing the concat_list
+        // form (realpath-cmdsub's try() rule). A test thread's thread-
+        // local dies with it, so no cleanup is needed.
+        HASH_VARS.with(|s| {
+            s.borrow_mut().insert("config".to_string());
+        });
         let value = sh_cmd_value_expr("sort <<< \"${config[*]}\"")
             .expect("`${config[*]}` is expressible as a value");
+        // ifs_join renders the separator as the runtime IFS-first-char
+        // ternary (064_07 assigned IFS before the sort), not a hardcoded
+        // space — assert the __sh_q wrap and the hash reading.
         assert!(
-            value.contains("__sh_q(join(' ', values %{config}))"),
+            value.contains("__sh_q(join(") && value.contains("values %{config})"),
             "the array must be substituted as a value, not embedded raw: {value}"
         );
         let open = cmd_str_to_open_perl("sort <<< \"${config[*]}\"");
@@ -14345,10 +15884,12 @@ mod tests {
     }
 
     /// The modern-IR preamble only declares the infrastructure variables
-    /// the rendered body actually references: `$__argc` only for `$#`
-    /// reads, `$__nocasematch` only for the shopt lowering, and the
-    /// Carp/English/IPC::Open3 imports only when the body uses them.
-    /// `$ls_success`/`$output` are dead on the IR path (never emitted).
+    /// the rendered body actually references: `$__nocasematch` only for
+    /// the shopt lowering, and the Carp/English/IPC::Open3 imports only
+    /// when the body uses them. `$ls_success`/`$output` are dead on the
+    /// IR path (never emitted), and `$__argc` is dead too: `$#` is read
+    /// LIVE as `scalar(@ARGV)` (var_read — `set -- a b c` replaces the
+    /// list after any preamble snapshot, parse-at-slice-param).
     #[test]
     fn preamble_gates_dead_boilerplate() {
         let src = r##"{"type":"Program","contract_version":1,"imports":[],"requires":[],"var_types":[],"stmt_lines":[],"var_lengths":[],"var_const":[],"var_lifetimes":[],"var_nospace":[],"var_bash_env":[],"subs":[],"stmts":[
@@ -14357,11 +15898,12 @@ mod tests {
         ]}"##;
         let prog = crate::shir_json_in::shir_json_to_ir(src).expect("gated-preamble A1 ingress");
         let perl = shir_to_perl(&prog);
-        // needed (echo + shopt reference the status trackers, `$#` needs
-        // the argc snapshot, shopt needs the nocasematch flag)
+        // needed (echo + shopt reference the status trackers, shopt needs
+        // the nocasematch flag); the argc snapshot is NOT: `$#` reads live
+        // scalar(@ARGV), so a `my $__argc` here would be dead boilerplate.
         assert!(perl.contains("my $main_exit_code = 0;"), "{perl}");
         assert!(perl.contains("our $CHILD_ERROR = 0;"), "{perl}");
-        assert!(perl.contains("my $__argc = @ARGV;"), "{perl}");
+        assert!(!perl.contains("my $__argc = @ARGV;"), "{perl}");
         assert!(perl.contains("my $__nocasematch = 0;"), "{perl}");
         // dead on the IR path — never declared
         assert!(!perl.contains("my $ls_success"), "{perl}");
@@ -14854,13 +16396,48 @@ mod tests {
         assert_eq!(repl_for_regex("@x"), "\\@x");
         assert_eq!(repl_for_regex("$y"), "\\$y");
         assert_eq!(repl_for_regex("@$y"), "\\@\\$y");
-        // A literal backslash is `\\` in the SOURCE, so it reaches the helper
-        // as two characters and must be emitted as four — otherwise it eats
-        // the character after it in the Perl body.
-        assert_eq!(repl_for_regex("b\\\\c"), "b\\\\\\\\c");
+        // A literal backslash reaches the helper as TWO characters (the
+        // source is `${v/a/\\c}`), denotes ONE, and Perl needs `\\` for that.
+        // Emitting four would print two backslashes where bash prints one.
+        assert_eq!(repl_for_regex(r"b\\c"), r"b\\c");
+        // The measured bash table: `\X` denotes the bare `X`, so an
+        // unrecognised escape is NOT a Perl escape — `\c` is the character
+        // `c`, not Perl's control-char form (which is a compile error when the
+        // next character is the substitution delimiter).
+        for (source, body) in [
+            (r"\c", r"c"),
+            (r"\\c", r"\\c"),
+            (r"\\\c", r"\\c"),
+            (r"\\\\c", r"\\\\c"),
+            (r"\x", r"x"),
+            (r"\$c", r"\$c"),
+            (r"\ ", r" "),
+            ("\\\"", "\""),
+        ] {
+            assert_eq!(repl_for_regex(source), body, "body for source {source}");
+        }
         // An unescaped `/` still has to be escaped, or the substitution ends
         // early and the rest of the expression is a syntax error.
         assert_eq!(repl_for_regex("a/b"), "a\\/b");
+    }
+
+    /// A glob's `\X` is a LITERAL X (`glob_to_regex` is fed the pattern text
+    /// with the shell's escapes still on it), so the backslash must not be
+    /// handed to Perl as a regex escape: `${v/\*/x}` replaces a literal `*`
+    /// while `${v/*/x}` replaces everything up to the first separator, and
+    /// `${v/\Q/Z}` is a literal `Q`, not Perl's quote-metacharacter `\Q`.
+    #[test]
+    fn glob_pattern_escapes_are_literal_and_metacharacters_are_not() {
+        let g = glob_to_regex;
+        assert_eq!(g("*"), ".*", "a live `*` is the wildcard");
+        assert_eq!(g("?"), ".", "a live `?` is any character");
+        assert_eq!(g(r"\*"), r"\*", "`\\*` is a literal star");
+        assert_eq!(g(r"\?"), r"\?", "`\\?` is a literal question mark");
+        assert_eq!(g(r"\Q"), "Q", "`\\Q` is a literal Q, not Perl's `\\Q`");
+        assert_eq!(g(r".x"), r"\.x", "an unescaped `.` is literal text");
+        assert_eq!(g(r"\."), r"\.", "`\\.` is a literal dot too");
+        assert_eq!(g(r"\\"), r"\\", "a doubled backslash is one literal one");
+        assert_eq!(g(r"[/\\]"), r"[/\\]", "a class keeps `\\` as one literal");
     }
 
     /// A nested command substitution inside a rebuilt command word must go

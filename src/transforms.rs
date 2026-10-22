@@ -48,6 +48,39 @@ pub fn target() -> Option<String> {
 /// target set here (e.g. a node-lowering that only C/JS want, so the
 /// shell-like backends never see the rich nodes — the "solve" idea).
 pub fn transform_applies(name: &str) -> bool {
+    // The target-specific transforms are a list of EXCLUSIONS ("only for
+    // c", "code-generating backends only"), so their historical reading of
+    // an UNSET target is "every transform applies". An A1-ingress caller
+    // that never set the target (otranspilerl's `render`) therefore ran the
+    // C-only rewrites for EVERY backend, and what the ingress produced
+    // depended on whatever happened to be linked into the binary.
+    // `otranspilerl::with_target` binds the target for each render call;
+    // this switch pins the old behaviour for an A/B measurement
+    // (SH2_TARGET_UNSET_ALL=0 = the unset target excludes, as `set_target`
+    // documents).
+    if std::env::var("SH2_TARGET_UNSET_ALL").as_deref() == Ok("0") {
+        return match target() {
+            // the unset target is the byte-pinned embed/A1-export path: no
+            // backend-specific rewrite applies
+            None => false,
+            // capture-node-fold and text-ops list an EXPLICIT target set that
+            // omits `shir`; every other arm (including `sh`/`glsl`) applies
+            Some(t) => match name {
+                "capture-node-fold" => matches!(
+                    t.as_str(),
+                    "c" | "js" | "estree" | "perl" | "go" | "rs" | "rust" | "zig" | "java" | "python" | "sh" | "glsl" | "glslv"
+                ),
+                "text-ops" => crate::transforms::planner::emits_renderable_nodes(&t),
+                _ => !matches!(
+                    (name, t.as_str()),
+                    ("text-ops-planner", "sh" | "zsh" | "fish" | "glsl" | "glslv" | "shir")
+                        | ("fbdev-gpu-calls", _)
+                        | ("split-in-place", _)
+                        | ("case-lowering", "sh" | "zsh" | "fish" | "glsl" | "glslv" | "shir")
+                ),
+            },
+        };
+    }
     match name {
         // text-ops-planner (the "solve" idea): only the backends that want
         // the rich node compositions run it. The shell-like backends (sh,
@@ -76,13 +109,44 @@ pub fn transform_applies(name: &str) -> bool {
         // file-write fallback. Explicit `c` target only — the
         // text-ops-planner precedent (bash-o4/src/pipeline.rs sets it).
         "fbdev-gpu-calls" => matches!(target().as_deref(), Some("c")),
+        // split-in-place emits Ext(Split{in_place}) — only the C backend
+        // consumes the flag today (its for-in-split arm tokenizes the
+        // var's own buffer instead of copying). Unset target must NOT run
+        // it: the embed/Carp test pins fragment output with the target
+        // unset, and the other backends' IR must stay byte-stable (the
+        // PENDING note this replaces; target gating is the fbdev-gpu-calls
+        // precedent that resolves the regressing test).
+        "split-in-place" => matches!(target().as_deref(), Some("c")),
+        // case-lowering: the shared Case→if/elif string-test lowering.
+        // Code-generating backends only — the shell-family targets
+        // (sh/zsh/fish) render `case…esac` natively and idiomatically,
+        // and an UNSET target or `shir` is the byte-pinned embed/A1-export
+        // path where every rewrite is refused (split-in-place precedent).
+        "case-lowering" => matches!(
+            target().as_deref(),
+            Some("c" | "js" | "estree" | "perl" | "go" | "rs" | "rust" | "zig" | "java" | "python")
+        ),
+        // capture-node-fold: `Call { "capture", [Arrow] }` → the
+        // first-class `Capture` node. Both forms render in every backend
+        // (est/c convert the node BACK to the call form; perl's node arm
+        // is a strict superset of the call arm; sh's is documented
+        // identical plus an idiom lift), so every CODEGEN target wants
+        // it — and an UNSET target or `shir` is the byte-pinned
+        // embed/A1-export path that must stay verbatim (case-lowering
+        // precedent).
+        "capture-node-fold" => matches!(
+            target().as_deref(),
+            Some("c" | "js" | "estree" | "perl" | "go" | "rs" | "rust" | "zig" | "java" | "python" | "sh" | "glsl" | "glslv")
+        ),
         _ => true,
     }
 }
 
 pub mod arith_forms;
+pub mod typeset_attrs; // `typeset -i VAR` integer attribute → later assignments become arith()
 pub mod arith_identity; // OFFER (core-requests/transforms/offered/arith-identity)
 pub mod arith_normalize; // frontend-shape normalisation (`0 - X` → `-X`); run by ingress, not the env-gated registry
+pub mod array_len_fold; // OFFER core-requests/transforms/offered/array-len-fold.rs: `${#arr[@]}` → arrayLen(arr)
 pub mod builtin;
 pub mod inline_pure_fns; // marketplace offer (estree-20260813-182431) // core-requests/shir-builtin-op: exec(cmd∈builtins) → the native `builtin` op
 pub mod isolate_accumulate; // loop-private temp inlining (single-accumulate isolation)
@@ -96,8 +160,11 @@ pub mod seq_range_for; // worker-submitted: `for i in $(seq A B)` → native num
 /// `pub mod <name>;` above) when a worker-submitted transform is accepted
 /// into the crate. Each entry is (name, transform_fn).
 pub mod shir_pipeline_native;
+pub mod brace_fold; // OFFER core-requests/transforms/offered/brace-fold.rs: literal brace call → its word LIST in list positions
+pub mod interp_fold; // `Interpolate([Lit(s)])` → `Str(s)` — canonical single-literal words for every backend
 pub mod dead_fn_elim; // generic: remove never-referenced shell functions
 pub mod text_ops; // common shell commands → semantic IR nodes (cut/tr/sed/head/tail/wc)
+pub mod type_query; // `type NAME` → the answer for program-defined functions / true builtins
 pub mod text_ops_planner; // the "solve" idea, observable: wc -l lowers per-backend by manifest (opt-in)
 pub mod planner; // backend node manifests + core solver (the "solve" idea, docs/shir-primitives.md)
 pub mod sub; // placeholder so the module compiles with an empty registry
@@ -115,6 +182,8 @@ pub mod function_purity; // function-level side-effect classes by call-graph fix
 pub mod i32_provable;
 pub mod f32_narrow; // binary32-exact float verdicts (cdef-float proofs)
 pub mod const_capture_fold;
+pub mod capture_node_fold; // `Call { "capture", [Arrow] }` → the first-class `Capture` node (shared; metric + perl native-capture paths)
+pub mod text_capture_fold; // constant `$(echo …)` in raw test/param/arith text → its literal output
 pub mod const_condition_elim;
 pub mod copy_propagation;
 pub mod counted_while_forinit;
@@ -129,6 +198,7 @@ pub mod string_accumulator;
 pub mod test_simplification;
 pub mod else_if_flatten; // an `else` whose only statement is an `If` IS an `elif` — flatten it
 pub mod test_lowering; // glob-affix `[[ ]]` tests → strHasPrefix/strHasSuffix/contains (polyfill speedup, CROSS_BACKEND_RUNTIME.md §8.1)
+pub mod case_lowering; // all-static `case` dispatch → if/elif chain over the same shared primitives (generalises the estree try_native_case lowering to every backend)
 pub mod echo_return; // pure-output "echo a value and return" functions → fnValue value-returning convention (CROSS_BACKEND_RUNTIME.md §8.3)
 pub mod loop_return_lift; // echo+return inside a loop → flag+break (makes strContainsAny/line_at echo-return-eligible)
 pub mod unreachable_after_exit; // PROVABLY-32-bit arith annotations
@@ -143,6 +213,16 @@ pub fn all() -> Vec<(&'static str, TransformFn)> {
     vec![
         ("stray-reserved-word", stray_reserved_word::transform),
         ("shir-pipeline-native", shir_pipeline_native::transform),
+        // brace-fold: expand a LITERAL brace call to its word list, in
+        // list positions only — runs early so const-capture-fold can
+        // cascade over the spliced literal words in the same pass.
+        ("brace-fold", brace_fold::transform),
+        // interp-fold: a quoted word that never needed wrapping
+        // (`Interpolate([Lit(s)])`) → the plain `Str` it always was —
+        // one canonical shape every backend renders without a
+        // concat/format wrapper and every Str-keyed fold can match.
+        // Runs early (right behind brace-fold splices literal words).
+        ("interp-fold", interp_fold::transform),
         ("dead-fn-elim", dead_fn_elim::transform),
         // (name, <name>::transform) — estree worker adds entries here
         ("inline-pure-fns", inline_pure_fns::inline_pure_fns),
@@ -151,11 +231,22 @@ pub fn all() -> Vec<(&'static str, TransformFn)> {
         ("grep-o", grep_o::transform),
         ("grep-pcre", grep_pcre::transform),
         ("cat-read", cat_read::transform),
+        // `type NAME` for a function THIS program defines (or a true shell
+        // builtin) → its answer; the eval-inliner re-runs it after Fix 7
+        // splices eval'd functions in (perl_generator_fixed).
+        ("type-query", type_query::transform),
         // process substitution: the estree corpus path never reaches this
         // (estree.rs transform_cmd rewrites `<(...)` pre-IR) — it serves
         // the --shir export and the A1 ingress (frontend-emitted JSON).
         ("process-subst", process_subst::transform),
         ("arith-forms", arith_forms::transform),
+        ("array-len-fold", array_len_fold::transform), // `${#arr[@]}` slice spelling → the contract's arrayLen node
+        // `typeset -i VAR` marks VAR integer for the rest of the scope, so
+        // later `VAR=EXPR` assignments must evaluate EXPR as arithmetic.
+        // Bash semantics shared by every backend, so it lives in the shared
+        // A1 channel and emits the neutral `arith` node each backend already
+        // lowers — no renderer changes.
+        ("typeset-attrs", typeset_attrs::transform),
         // native-stmt normalisation (fail-shir: perl shell-out elimination):
         // `echo args > file` → Block-wrapped exec (native select redirect),
         // empty herestrings → status exec, `test && echo || echo` → If.
@@ -181,6 +272,19 @@ pub fn all() -> Vec<(&'static str, TransformFn)> {
         ("text-ops-planner", text_ops_planner::transform),
         // core-requests/transforms/done batch merge (12 orphaned submissions)
         ("const-capture-fold", const_capture_fold::transform),
+        // capture-node-fold: the `Call { "capture", [Arrow] }` spelling →
+        // the first-class `Capture` node. Both render (see the module
+        // docs), but the call spelling is a sh2.* call site in the Metric
+        // and the node carries Perl's native/shell-out-free render arms.
+        ("capture-node-fold", capture_node_fold::transform),
+        // text-capture-fold: the raw-text twins of const-capture-fold —
+        // `[ "$(echo hello)" = hello ]` / `${v:-$(echo dflt)}` keep the
+        // substitution as TEXT (no Capture node exists), so every
+        // renderer re-derives it at render time (Perl: a
+        // `__sh_pipe_capture('echo hello', "pipefail")` fork per operand;
+        // estree: sh2.captureSync). Folds provably-constant substitutions
+        // into the text; refuse>guess keeps everything else verbatim.
+        ("text-capture-fold", text_capture_fold::transform),
         ("const-condition-elim", const_condition_elim::transform),
         ("copy-propagation", copy_propagation::transform),
         ("counted-while-forinit", counted_while_forinit::transform),
@@ -194,6 +298,11 @@ pub fn all() -> Vec<(&'static str, TransformFn)> {
         ("string-accumulator", string_accumulator::transform),
         ("test-simplification", test_simplification::transform),
         ("test-lowering", test_lowering::transform),
+        // case-lowering runs right behind test-lowering: same primitive
+        // vocabulary, the dispatch shape instead of the `[[ ]]` shape —
+        // later passes (const-condition-elim, else-if-flatten, …) then
+        // clean up the chain like any other If.
+        ("case-lowering", case_lowering::transform),
         // else-if flattening: `else { if c { … } }` → `elsifs`. Purely
         // structural; run before the backends so every renderer sees the
         // chain in the one shape it already handles.
@@ -221,13 +330,16 @@ pub fn all() -> Vec<(&'static str, TransformFn)> {
         ("fbdev-gpu-elim", fbdev_gpu_elim::transform),
         ("fbdev-gpu-calls", fbdev_gpu_calls::transform),
         // split-in-place: liveness-proven destructive buffer reuse for
-        // `for w in $var` iteration (C tokenizes the var's own buffer;
-        // GC'd languages ignore the flag — see shir_passes/split_inplace)
-        // ("split-in-place", crate::shir_passes::split_inplace::transform):
-        //   PENDING — activating it changes embed/Carp output (test
-        //   ir::tests::embed_injects_carp_for_emulations regresses); the
-        //   c worker's in-flight work continues. Flip this line when done.
-        //   (Module declared in shir_passes/mod.rs; compiles inert.)
+        // `for w in $var` iteration — the source var's OWN buffer is
+        // tokenized in place (delimiters stamped with NUL) instead of
+        // copied into a scratch first. The rewrite is gated to the C
+        // TARGET (transform_applies): only the C renderer consumes
+        // Ext(Split{in_place}) (its for-in-split arm), and the embed/Carp
+        // test pins fragment output with the target unset — where this
+        // transform now skips. (Was PENDING here pending exactly that
+        // gate; the census in split_inplace was hardened for activation:
+        // full read+write coverage, eval/unknown refusal.)
+        ("split-in-place", crate::shir_passes::split_inplace::transform),
     ]
 }
 
@@ -305,5 +417,20 @@ mod tests {
         // With no restricted transforms registered, everything applies.
         assert!(transform_applies("text-ops"));
         set_target(None);
+    }
+
+    #[test]
+    fn split_in_place_gated_to_c_only() {
+        // Registered, but only for the C target: the flag's sole consumer
+        // is the C for-in-split arm, and the embed/Carp test pins
+        // fragment output with the target unset (where it must skip).
+        set_target(Some("c"));
+        assert!(transform_applies("split-in-place"));
+        set_target(Some("perl"));
+        assert!(!transform_applies("split-in-place"));
+        set_target(Some("estree"));
+        assert!(!transform_applies("split-in-place"));
+        set_target(None);
+        assert!(!transform_applies("split-in-place"));
     }
 }

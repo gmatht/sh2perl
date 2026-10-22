@@ -2534,6 +2534,30 @@ impl Render {
                 self.emit("    }");
                 self.emit("}");
             }
+            // Ext(GpuOp) — a device write replaced by the fbdev-gpu lift.
+            // Zig has no GPU leg: render the ORIGINAL write (§4.4 firewall).
+            // The write is fallible in Zig, so it is wrapped in a discard
+            // block (`_ = blk: { … }`) whose value is void.
+            IrStmt::Ext(node) if node.tag() == "GpuOp" => {
+                let (path, payload) = {
+                    let g = node.as_any().downcast_ref::<crate::shir_nodes::GpuOp>()
+                        .expect("tag/type agree");
+                    let path = if g.slot.is_empty() {
+                        format!("{}/{}", g.device.trim_end_matches('/'), g.verb)
+                    } else {
+                        format!("{}/{}/{}", g.device.trim_end_matches('/'), g.slot, g.verb)
+                    };
+                    (path, g.payload.clone())
+                };
+                let p = Self::zig_str(&path);
+                let v = self.expr_any(&payload);
+                self.emit("_ = blk: {");
+                self.emit(&format!(
+                    "    const _g: std.fs.File = std.fs.cwd().createFile({p}, .{{ .truncate = true }}) catch break :blk {{}};"));
+                self.emit("    defer _g.close();");
+                self.emit(&format!("    _g.writeAll({v}) catch {{}};"));
+                self.emit("};");
+            }
             IrStmt::Ext(_) => panic!("zig backend: Ext node unsupported"),
             IrStmt::Expr(e) => {
                 // setVar(name, value) — the frontend-emitted store write:

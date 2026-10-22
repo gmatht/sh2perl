@@ -1294,8 +1294,17 @@ impl Render {
             },
             "arrayLen" => match Self::str_arg(args, 0) {
                 Some(name) => {
-                    self.arrays.insert(name.clone());
-                    format!("scalar(@{})", ident(&name))
+                    // `${#h[@]}` on an associative array counts KEYS — the
+                    // array-len-fold transform folds that spelling to
+                    // arrayLen, so consult the hash census here the way the
+                    // slice rendering does (a dead `my @h` would otherwise
+                    // be the only declaration seen for a hash name).
+                    if self.hashes.contains(&name) && !self.arrays.contains(&name) {
+                        format!("scalar(keys %{})", ident(&name))
+                    } else {
+                        self.arrays.insert(name.clone());
+                        format!("scalar(@{})", ident(&name))
+                    }
                 }
                 None => {
                     self.mark_todo("arrayLen arg");

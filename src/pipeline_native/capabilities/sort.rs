@@ -20,6 +20,13 @@ pub(crate) fn emit(ctx: &NativeCtx) -> Option<NativeEmit> {
 
 /// `sort {-n|-r|-f}` → the perl comparator (`$a cmp $b`, `<=>` for -n,
 /// `lc(...)` for -f; `reverse(...)` for -r). Unknown flags refuse.
+///
+/// The block opens with `our ($a, $b)`: a script-level `my $a` (bash's
+/// `$a`) is in scope file-wide and shadows Perl's sort package globals, so
+/// a bare `$a cmp $b` compares two undefs and leaves the input unsorted
+/// (verified: `my $a='x'; sort { $a cmp $b } qw(c a b)` returns `c a b`).
+/// `our` re-binds the package globals inside the block, which fixes the
+/// sort and silences Perl's "my $a used in sort comparison" warning.
 fn sort_body(words: &[String]) -> Option<String> {
     let (mut num, mut rev, mut fold) = (false, false, false);
     for w in words {
@@ -39,7 +46,7 @@ fn sort_body(words: &[String]) -> Option<String> {
     } else {
         format!("$a {op} $b")
     };
-    let base = format!("sort {{ {cmp} }} @__pl");
+    let base = format!("sort {{ our ($a, $b); {cmp} }} @__pl");
     if rev {
         Some(format!("reverse({base})"))
     } else {
