@@ -2672,6 +2672,27 @@ fn emit_stmt_owned(out: &mut String, stmt: &IrStmt, indent: usize) {
                         out.push_str("next;\n");
                         return;
                     }
+                    // A bare `return` from a shell function — the go frontend's
+                    // `return x` in a type-erased generic body arrives as
+                    // `Call{func:"return", args:[]}` (every expression channel
+                    // is a Call). It fell through to the unknown-op arm, which
+                    // could not rebuild it as shell text and emitted
+                    // `die "sh2.* call `return` not yet supported"`, aborting
+                    // the whole program (go-sh t83_type_args). A Perl sub
+                    // returns with the last command's status already in
+                    // $CHILD_ERROR; an explicit status word is the status
+                    // channel bash's `return N` sets.
+                    "return" => {
+                        emit_indent(out, indent);
+                        match args.first() {
+                            None => out.push_str("return;\n"),
+                            Some(a) => out.push_str(&format!(
+                                "$main_exit_code = $CHILD_ERROR = {}; return;\n",
+                                render_word(a)
+                            )),
+                        }
+                        return;
+                    }
                     "exec" => {
                         emit_exec_call(out, e, indent);
                     }
@@ -10657,6 +10678,15 @@ fn rewrite_fn_calls_in_expr(e: &IrExpr, fns: &std::collections::HashSet<String>)
             expr: Box::new(rewrite_fn_calls_in_expr(expr, fns)),
             native: *native,
         },
+        // A CAPTURE BODY is an Arrow holding statements, not an expression —
+        // `$(fn arg)` from a frontend arrives as
+        // `capture(Arrow([exec("fn", [args])]))`. Without this arm the body
+        // was cloned verbatim (`other => other.clone()`), so the call was
+        // never marked `$fn_call` and the capture rebuilt it as SHELL text:
+        // `<Target>$(fn 5)` ran `/usr/bin/fn 5` in a bash child that has no
+        // such command (go-sh t83_type_args printed nothing; the estree
+        // reference calls sh2.fnCall). Descend into the body.
+        IrExpr::Arrow(stmts) => IrExpr::Arrow(rewrite_fn_calls(stmts, fns)),
         other => other.clone(),
     }
 }
@@ -11892,6 +11922,23 @@ fn capture_body_native(stmts: &[IrStmt]) -> bool {
 /// `A || B` runs `A`; on a nonzero status it runs `B` instead. Used by
 /// `x=$(stat … || wc -c < f)` so the capture does not shell to `bash -c`
 /// (check_qx).
+/// Is this expression the bare no-op status command — `true` or `:` with
+/// NO arguments? Such a command contributes nothing but exit 0, which is
+/// what lets `chain_or_capture` fold `A || true` without running it.
+/// Structural (not a shell-text compare): `expr_to_cmd` single-quotes
+/// literal names (`'true'`), so a text guard would never match.
+fn is_noop_status_cmd(e: &IrExpr) -> bool {
+    match e {
+        IrExpr::Call { func, args } if func == "exec" || func == "builtin" => {
+            match exec_call_parts(args) {
+                Some((cmd, words)) => words.is_empty() && (cmd == "true" || cmd == ":"),
+                None => false,
+            }
+        }
+        _ => false,
+    }
+}
+
 fn chain_or_capture(e: &IrExpr) -> Option<String> {
     if let IrExpr::BinOp {
         lhs,
@@ -11899,6 +11946,24 @@ fn chain_or_capture(e: &IrExpr) -> Option<String> {
         rhs,
     } = e
     {
+        // `A || true` / `A || :` — the RHS contributes NOTHING but a zero
+        // status: bash's status for the whole chain is constantly 0, and
+        // the captured stdout is A's output IN FULL (the RHS writes no
+        // bytes but never clears what A already wrote — partial output
+        // when A fails is KEPT: `x=$(ls f g 2>/dev/null || true)` prints
+        // f's line). The generic form below instead ran a SECOND capture
+        // and REPLACED `$__c` with its result — discarding A's partial
+        // output — and paid a whole `bash -c true` fork for an empty
+        // string (2 corpus sites: `__sh_pipe_capture(q{'true'})`). Emit
+        // the degenerate case directly: run A once, force the status.
+        if is_noop_status_cmd(rhs) {
+            let l = chain_or_capture(lhs).or_else(|| pipeline_leaf_capture(lhs))?;
+            return Some(format!(
+                "do {{ my $__c = {}; {}$__c }}",
+                l,
+                rc_write("$CHILD_ERROR = 0; ")
+            ));
+        }
         let l = chain_or_capture(lhs).or_else(|| pipeline_leaf_capture(lhs))?;
         let r = pipeline_leaf_capture(rhs)?;
         return Some(format!(
@@ -12762,6 +12827,37 @@ pub(crate) fn ir_expr_to_perl(expr: &IrExpr) -> String {
                         .unwrap_or_else(|| "''".to_string());
                     format!("(index({hay}, {needle}) >= 0)")
                 }
+                // The sh2.strReplaceAll(s, old, neu) runtime op — a frontend
+                // emits it for its own word-splitting contract (go-sh's
+                // `strReplaceAll(capture(…), "\x1e", " ")` turns the capture
+                // body's newline separators into the spaces bash's unquoted
+                // `$(…)` would have produced). It reached the generic arm and
+                // emitted a call to an UNDEFINED sub, so the program died at
+                // runtime (`Undefined subroutine &main::strReplaceAll`, go-sh
+                // t83_type_args). Mirror the runtime's split/join exactly —
+                // an empty `old` splits into characters, and splitting on the
+                // literal (quoted via \Q…\E) keeps multi-char olds from being
+                // read as a regex; `-1` keeps trailing empty fields, which JS
+                // split also keeps.
+                "strReplaceAll" => {
+                    let s = args
+                        .first()
+                        .map(ir_expr_to_perl)
+                        .unwrap_or_else(|| "''".to_string());
+                    let old = args
+                        .get(1)
+                        .map(ir_expr_to_perl)
+                        .unwrap_or_else(|| "''".to_string());
+                    let new = args
+                        .get(2)
+                        .map(ir_expr_to_perl)
+                        .unwrap_or_else(|| "''".to_string());
+                    format!(
+                        "(do {{ my $__rs = {s}; my $__ro = {old}; \
+                         length($__ro) ? join({new}, split(/\\Q$__ro\\E/, $__rs, -1)) \
+                         : join({new}, split(//, $__rs)) }})"
+                    )
+                }
                 // (( arith )) as a condition — the `let` builtin form.
                 "exec" | "builtin"
                     if args.first().and_then(call_arg_str).as_deref() == Some("let") =>
@@ -12798,10 +12894,35 @@ pub(crate) fn ir_expr_to_perl(expr: &IrExpr) -> String {
                         native
                     } else {
                         match exec_call_to_cmd(expr) {
-                            Some(cmd) => format!(
-                                "(system('bash', '-c', {}) == 0)",
-                                safe_perl_q_string(&cmd)
-                            ),
+                            // The rebuilt command text keeps shell `$name`
+                            // references verbatim (safe_perl_q_string escapes
+                            // them so PERL does not interpolate) — the CHILD
+                            // must see the values, so export the referenced
+                            // Perl scalars into its environment first, exactly
+                            // as the statement-position seam does
+                            // (emit_shell_cmd). Without the prelude the child
+                            // resolved `$i` to the empty string: fish
+                            // t59_until's `while not test $i -ge 3` ran
+                            // `test -ge 3`, which fails forever, so the loop
+                            // never terminated (10k lines printed).
+                            Some(cmd) => {
+                                let exports = var_exports_str(&cmd);
+                                if exports.is_empty() {
+                                    format!(
+                                        "(system('bash', '-c', {}) == 0)",
+                                        safe_perl_q_string(&cmd)
+                                    )
+                                } else {
+                                    let pre: String = exports
+                                        .lines()
+                                        .map(|l| format!("{l} "))
+                                        .collect();
+                                    format!(
+                                        "(do {{ {pre}system('bash', '-c', {}) == 0 }})",
+                                        safe_perl_q_string(&cmd)
+                                    )
+                                }
+                            }
                             None => UNBUILDABLE_COND.to_string(),
                         }
                     }
@@ -16690,5 +16811,63 @@ mod run_ext_preamble_tests {
         assert!(with_q.contains("sub __sh_q "));
         let without_q = sh_run_ext_preamble("__sh_pipe_run($c);").expect("gate fires");
         assert!(!without_q.contains("sub __sh_q "));
+    }
+}
+
+#[cfg(test)]
+mod chain_or_true_fold_tests {
+    use super::*;
+
+    fn exec(cmd: &str, words: Vec<IrExpr>) -> IrExpr {
+        IrExpr::Call {
+            func: "exec".to_string(),
+            args: vec![IrExpr::Str(cmd.to_string(), StrStyle::DoubleQuoted), IrExpr::Array(words)],
+        }
+    }
+
+    fn or_chain(lhs: IrExpr, rhs: IrExpr) -> IrExpr {
+        IrExpr::BinOp {
+            lhs: Box::new(lhs),
+            op: BinOpKind::Or,
+            rhs: Box::new(rhs),
+        }
+    }
+
+    /// `A || true` must run A ONCE, force the status, and KEEP A's output
+    /// (bash keeps partial stdout when the LHS fails — the old generic
+    /// form replaced `$__c` with a second capture's result, discarding it,
+    /// and forked a whole `bash -c true` for an empty string).
+    #[test]
+    fn or_true_folds_to_single_run_with_forced_status() {
+        let e = or_chain(exec("ls", vec![]), exec("true", vec![]));
+        let got = chain_or_capture(&e).expect("lhs expressible");
+        assert!(got.contains("$CHILD_ERROR = 0;"), "status forced: {got}");
+        assert!(!got.contains("if ($CHILD_ERROR != 0)"), "no fallback run: {got}");
+        assert!(!got.contains("__sh_pipe_capture(q{':')") && !got.contains("'true'"), "one fork: {got}");
+    }
+
+    /// `:` is the same no-op status command.
+    #[test]
+    fn or_colon_folds_too() {
+        let e = or_chain(exec("ls", vec![]), exec(":", vec![]));
+        let got = chain_or_capture(&e).expect("lhs expressible");
+        assert!(got.contains("$CHILD_ERROR = 0;"), "status forced: {got}");
+    }
+
+    /// A non-noop RHS keeps the generic two-arm form byte-for-byte.
+    #[test]
+    fn or_real_command_keeps_the_generic_form() {
+        let e = or_chain(exec("ls", vec![]), exec("sort", vec![]));
+        let got = chain_or_capture(&e).expect("both expressible");
+        assert!(got.contains("if ($CHILD_ERROR != 0)"), "generic arm: {got}");
+        assert!(!got.contains("$CHILD_ERROR = 0; $__c"), "no forced status: {got}");
+    }
+
+    /// Arguments make it not-a-noop — refuse the fold.
+    #[test]
+    fn noop_with_arguments_is_not_folded() {
+        let e = or_chain(exec("ls", vec![]), exec("true", vec![IrExpr::Str("x".into(), StrStyle::DoubleQuoted)]));
+        let got = chain_or_capture(&e).expect("expressible");
+        assert!(got.contains("if ($CHILD_ERROR != 0)"), "generic arm: {got}");
     }
 }
