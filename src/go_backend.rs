@@ -30,7 +30,7 @@
 //! packages the helpers/body actually reference), so the output always
 //! compiles with exactly the imports it uses.
 
-use crate::ir::{ArithAst, InterpPart, IrExpr, IrProgram, IrStmt, IrType};
+use crate::ir::{ArithAst, InterpPart, IrExpr, IrProgram, IrStmt, IrType, Sigil};
 use std::collections::{BTreeSet, HashMap};
 
 enum Part {
@@ -51,6 +51,10 @@ pub struct Render {
     assoc: BTreeSet<String>,
     /// vars written anywhere (declared at the top of main)
     written: BTreeSet<String>,
+    /// write accounting for the string-scalar inference (see shir_to_go):
+    /// every noted write per var, and how many of those stored a Go string
+    writes: HashMap<String, usize>,
+    writes_str: HashMap<String, usize>,
     /// vars actually read (skip the `_ = x` dead-var guard)
     read: BTreeSet<String>,
     /// Go identifier per shell var name (sanitize + de-dup)
@@ -375,6 +379,40 @@ pub fn shir_to_go(prog: &IrProgram) -> String {
     // A2: the type verdicts are computed at serialization time in the JSON
     // path; the library path must run the same analysis.
     prog.var_types = crate::shir::analyze_var_types(&prog);
+    // Shell scalars hold TEXT, so an untyped var (A2 has no verdict) whose
+    // EVERY write stored a Go string is a Go `string`, not `any` + an
+    // `s2s(v)` coercion at each read. The write kinds are only known once
+    // the body has been rendered, so pass 1 renders with the A2 verdicts
+    // and notes the writes; pass 2 hoists the promoted vars as `string`.
+    let mut r = Render::default();
+    r.var_types = prog.var_types.iter().cloned().collect();
+    r.program(&prog);
+    let mut promoted: Vec<(String, IrType)> = Vec::new();
+    for (v, n) in &r.writes {
+        // every write must have been a string write, and the var must not
+        // already have a verdict or a non-scalar home (decl_lines' type
+        // order: functions, assoc, array, int64, string)
+        if *n == 0
+            || r.writes_str.get(v).copied().unwrap_or(0) != *n
+            || r.functions.contains(v)
+            || r.assoc.contains(v)
+            || r.arrays.contains(v)
+            || r.arith_ints.contains(v)
+            // a BAKED array-element target (`options["$k"]`): the name is a
+            // store KEY, and declaring a var_types entry for it is exactly
+            // what makes decl_lines' `n.contains('[')` rule hoist `[]any`
+            || v.contains('[')
+            || prog.var_types.iter().any(|(t, _)| t == v)
+        {
+            continue;
+        }
+        promoted.push((v.clone(), IrType::Str));
+    }
+    if promoted.is_empty() {
+        return r.out.join("\n");
+    }
+    promoted.sort_by(|a, b| a.0.cmp(&b.0));
+    prog.var_types.extend(promoted);
     let mut r = Render::default();
     r.var_types = prog.var_types.iter().cloned().collect();
     r.program(&prog);
@@ -489,7 +527,14 @@ impl Render {
     }
 
     fn is_str(&self, name: &str) -> bool {
-        self.var_types.get(name).copied() == Some(IrType::Str)
+        // AsciiStr is an ADDITIVE annotation ("backends that ignore it
+        // treat it as Str", src/ir.rs) — Go has one string type, so both
+        // verdicts hoist as `string`. Ignoring AsciiStr left every var the
+        // C/frontend paths annotate as `any` + `s2s(v)` at each read.
+        matches!(
+            self.var_types.get(name),
+            Some(IrType::Str) | Some(IrType::AsciiStr)
+        )
     }
 
     fn is_arr(&self, name: &str) -> bool {
@@ -524,6 +569,51 @@ impl Render {
             && (self.is_num(v) || self.arith_ints.contains(v))
     }
 
+    /// True when `expr_any` renders this expression as a Go `string` — the
+    /// write is a string write. Purely syntactic: no rendering, no state.
+    fn expr_yields_go_string(&self, e: &IrExpr) -> bool {
+        match e {
+            IrExpr::Str(_, _) | IrExpr::Interpolate(_) => true,
+            IrExpr::BinOp { op, .. } => *op == crate::ir::BinOpKind::Concat,
+            // `$( … )` lowers to a capCmd/capRun value — a Go string (the
+            // stub path renders the int 0 and raises a TODO, which the
+            // caller's TODO-delta check rejects)
+            IrExpr::Capture { .. } => true,
+            // A positional read (`$1`, `$@`) is `paramAt`/`strings.Join`,
+            // both Go strings; any other bare name is a string only when it
+            // hoists as one (see declared_go_string).
+            IrExpr::Var(v, _) | IrExpr::Ident(v) => {
+                Self::positional_str(v) || self.declared_go_string(v)
+            }
+            IrExpr::Call { func, args } => match func.as_str() {
+                // every one of these renders through a `string`-returning
+                // helper (see `call`): a capture, a `${…}` expansion, a
+                // join/brace list, an array/map element, a user-function
+                // value. The stub fallbacks render an int and raise a TODO,
+                // which the caller's TODO-delta check rejects.
+                "capture" | "captureWords" | "param" | "join" | "brace" | "arrayIndex"
+                | "fnValue" => true,
+                "getVar" => match args.first() {
+                    Some(IrExpr::Str(n, _)) => {
+                        Self::positional_str(n) || self.declared_go_string(n)
+                    }
+                    _ => false,
+                },
+                _ => false,
+            },
+            _ => false,
+        }
+    }
+
+    /// A positional/splat parameter name (`1`, `@`, `*`): bash holds it as
+    /// TEXT, and `getvar_any`/`getvar_str` both render it as a Go string
+    /// (`paramAt(i)` / `strings.Join(...)`). `#`/`$`/`?` stay out — those
+    /// are int64.
+    fn positional_str(name: &str) -> bool {
+        matches!(name, "@" | "*")
+            || (!name.is_empty() && name.chars().all(|c| c.is_ascii_digit()))
+    }
+
     /// The var has a hoisted declaration (written somewhere) — only then
     /// may generated code reference it as a bare identifier.
     fn declared(&self, name: &str) -> bool {
@@ -535,7 +625,17 @@ impl Render {
     }
 
     fn mark_written(&mut self, name: &str) {
+        *self.writes.entry(name.to_string()).or_insert(0) += 1;
         self.written.insert(name.to_string());
+    }
+
+    /// A write whose value is a Go `string` (a command substitution, a
+    /// builtin's capture value, …). shir_to_go's second pass hoists a var
+    /// whose EVERY write is one of these as Go `string` instead of `any` +
+    /// an `s2s(v)` coercion at each read.
+    fn mark_str_written(&mut self, name: &str) {
+        self.mark_written(name);
+        *self.writes_str.entry(name.to_string()).or_insert(0) += 1;
     }
 
     fn mark_arr(&mut self, name: &str) {
@@ -769,6 +869,20 @@ impl Render {
                     format!("s2s({s})")
                 }
             },
+            // An array/map element or length read renders as `s2s(arrIdx(…))`
+            // etc. — already a Go string, so the `other` arm's coercion would
+            // double it (`s2s(s2s(…))`). Only the stub fallback (an int `0`
+            // plus a TODO marker) needs the coercion, so the marker decides,
+            // not the shape — the same rule as `capture` below.
+            IrExpr::Call { func, args } if func == "arrayIndex" || func == "arrayLen" => {
+                let todo = self.todo;
+                let v = self.call(func, args);
+                if self.todo != todo {
+                    format!("s2s({v})")
+                } else {
+                    v
+                }
+            }
             // A `capture`/`captureWords` CALL lowers through the same
             // capture paths (capCmd/capRun/capPipe or a native value) —
             // already a Go string, so the coercion is a no-op. Only the
@@ -1883,7 +1997,7 @@ impl Render {
         let call = Self::exec_cmd_call(&c, &argv);
         let id = self.new_tmp();
         self.flush_sides();
-        self.mark_written(var);
+        self.mark_str_written(var);
         let m = self.go_ident(var);
         let sync = self.sync_inline(var);
         self.emit(&format!(
@@ -6266,7 +6380,7 @@ impl Render {
                         if let Some(v) = self.builtin_capture_value(name, args) {
                             if self.todo == todo {
                                 self.flush_sides();
-                                self.mark_written(var);
+                                self.mark_str_written(var);
                                 let m = self.go_ident(var);
                                 let sync = self.sync_inline(var);
                                 self.emit(&format!("{m} = {v};{sync}"));
@@ -6282,7 +6396,7 @@ impl Render {
                 self.flush_sides();
                 match capture {
                     Some(var) => {
-                        self.mark_written(var);
+                        self.mark_str_written(var);
                         let m = self.go_ident(var);
                         let sync = self.sync_inline(var);
                         self.emit(&format!("{m} = capCmd({call});{sync}"));
@@ -6334,7 +6448,7 @@ impl Render {
                             {
                                 if self.todo == todo {
                                     self.flush_sides();
-                                    self.mark_written(var);
+                                    self.mark_str_written(var);
                                     let m = self.go_ident(var);
                                     let sync = self.sync_inline(var);
                                     self.emit(&format!("{m} = {v};{sync}"));
@@ -6352,7 +6466,7 @@ impl Render {
             self.flush_sides();
             match capture {
                 Some(var) => {
-                    self.mark_written(var);
+                    self.mark_str_written(var);
                     let m = self.go_ident(var);
                     let sync = self.sync_inline(var);
                     self.emit(&format!(
@@ -7150,29 +7264,39 @@ impl Render {
             IrStmt::Assign { targets, expr, .. } => self.stmt_assign(targets, expr),
             IrStmt::Declare { vars, init, .. } => {
                 for d in vars {
-                    self.mark_written(&d.name);
                     let m = self.go_ident(&d.name);
-                    if let Some(e) = init {
-                        // Same verdict as `stmt_assign`: an arith-written var
-                        // hoists as int64 whatever A2 said the shell type is,
-                        // so its init must coerce numerically too — else
-                        // `local i=0` + `((i+=2))` emits `i = "0"` against an
-                        // `int64` declaration (063_hard_to_parse).
-                        let rhs = if self.is_num(&d.name) || self.arith_ints.contains(&d.name) {
-                            self.expr_num(e)
-                        } else if self.is_str(&d.name) {
-                            self.expr_str(e)
+                    if init.is_none() {
+                        // `local x` with no value leaves an EMPTY STRING in
+                        // the shell (only `-i`/`-a`/`-A` make it something
+                        // else, and those arrive as an int/array home, not a
+                        // scalar decl), so it is a string write — not a
+                        // non-string write that would veto the var's
+                        // promotion to a Go `string`.
+                        if matches!(d.sigil, Some(Sigil::Array) | Some(Sigil::Hash)) {
+                            self.mark_written(&d.name);
                         } else {
-                            self.expr_any(e)
-                        };
-                        self.flush_sides();
-                        let sync = self.sync_inline(&d.name);
-                        self.emit(&format!("{m} = {rhs};{sync}"));
-                        if self.need_st {
-                            self.emit("st = 0;");
+                            self.mark_str_written(&d.name);
                         }
-                    } else {
                         self.emit(&format!("// declare {m}"));
+                        continue;
+                    }
+                    // Same verdict and the same STRING-write accounting
+                    // as `stmt_assign` (see `scalar_assign`): an
+                    // arith-written var hoists as int64 whatever A2 said
+                    // the shell type is, so its init must coerce
+                    // numerically too — else `local i=0` + `((i+=2))`
+                    // emits `i = "0"` against an `int64` declaration
+                    // (063_hard_to_parse). The write is counted ONCE, after
+                    // scalar_assign, so a string init matches its string
+                    // write (`mark_written` before it counted a second,
+                    // non-string write and vetoed the promotion).
+                    let rhs = self.scalar_assign(&d.name, init.as_ref().expect("checked above"));
+                    self.mark_written(&d.name);
+                    self.flush_sides();
+                    let sync = self.sync_inline(&d.name);
+                    self.emit(&format!("{m} = {rhs};{sync}"));
+                    if self.need_st {
+                        self.emit("st = 0;");
                     }
                 }
             }
@@ -7710,7 +7834,7 @@ impl Render {
                 ..
             } => {
                 if let Some(name) = capture {
-                    self.mark_written(name);
+                    self.mark_str_written(name);
                     let m = self.go_ident(name);
                     // Native first: every stage a real process (echo/printf
                     // admitted when coreutils agrees — the same policy the
@@ -8176,19 +8300,41 @@ impl Render {
         }
         // an arith-written var (the goto restructure's flags) hoists as
         // int64 — its assignments must coerce string values numerically
-        let rhs = if self.is_num(&t.var) || self.arith_ints.contains(&t.var) {
-            self.expr_num(expr)
-        } else if self.is_str(&t.var) {
-            self.expr_str(expr)
-        } else {
-            self.expr_any(expr)
-        };
+        let rhs = self.scalar_assign(&t.var, expr);
         self.flush_sides();
         let sync = self.sync_inline(&t.var);
         self.emit(&format!("{m} = {rhs};{sync}"));
         if self.need_st {
             self.emit("st = 0;");
         }
+    }
+
+    /// Render the right-hand side of a scalar `var = expr`, choosing the
+    /// form from the var's verdict and recording a STRING write (see
+    /// `mark_str_written`) when the value is a Go string. `Assign` and
+    /// `Declare` share this so `local x=$(…)` and `x=$(…)` infer the same
+    /// type.
+    fn scalar_assign(&mut self, var: &str, expr: &IrExpr) -> String {
+        let mut str_write = self.is_str(var);
+        let rhs = if self.is_num(var) || self.arith_ints.contains(var) {
+            self.expr_num(expr)
+        } else if self.is_str(var) {
+            self.expr_str(expr)
+        } else {
+            let todo = self.todo;
+            let v = self.expr_any(expr);
+            // An untyped scalar stored from a Go string is still a STRING
+            // write: bash vars hold text. shir_to_go's second pass hoists
+            // such a var as Go `string` instead of `any` + `s2s(v)` at
+            // every read. A stubbed value renders as the int 0, so the
+            // TODO delta disqualifies it.
+            str_write = self.expr_yields_go_string(expr) && self.todo == todo;
+            v
+        };
+        if str_write {
+            *self.writes_str.entry(var.to_string()).or_insert(0) += 1;
+        }
+        rhs
     }
 
     /// Restore subshell-saved vars (the tmp names were the last N allocated).
@@ -9862,6 +10008,13 @@ impl Render {
                     } else {
                         v
                     };
+                    // `local x=…` stores TEXT unless the flag/verdict made
+                    // the var numeric (`declare -i`, A2 Int) — the same
+                    // string-write accounting `Assign` uses, so
+                    // `local x="$(…)"` hoists as a Go `string`.
+                    if last_flag != "-i" && !self.is_num(name) {
+                        *self.writes_str.entry(name.to_string()).or_insert(0) += 1;
+                    }
                     let sync = self.sync_inline(name);
                     self.emit(&format!("{m} = {v};{sync}"));
                     if self.need_st {
@@ -11404,7 +11557,10 @@ fn numify(e: String, k: Opnd, _r: &mut Render) -> String {
 }
 
 fn strify(e: String, k: Opnd, _r: &mut Render) -> String {
-    if k == Opnd::Str {
+    // `Dyn` operands reach here already run through a rendering path that
+    // may itself have coerced (`s2s(v)` → `s2s(s2s(v))`); the outer call is
+    // the same identity the helper performs, so it would only box twice.
+    if k == Opnd::Str || e.starts_with("s2s(") {
         e
     } else {
         format!("s2s({e})")
