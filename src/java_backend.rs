@@ -41,6 +41,7 @@ struct JavaRender {
     sync_pending: Vec<String>,
     lower_vars: BTreeSet<String>,  // `typeset -l`: value is lowercased on assign
     child_sym: BTreeSet<String>,   // vars the CHILD side computes (symbolic in child text)
+    nocase: Option<bool>,          // program's `shopt -s nocasematch` setting
     upper_vars: BTreeSet<String>,  // `typeset -u`: value is uppercased on assign     // vars a just-rendered child loop assigns (copied back)
     helpers: BTreeSet<&'static str>,
     java_helpers: Vec<String>,     // dynamically generated method sources
@@ -85,14 +86,62 @@ impl JavaRender {
     fn new() -> Self {
         JavaRender { in_fn: 0, cur_fn: String::new(), fields: BTreeSet::new(), arrays: BTreeSet::new(), assoc: BTreeSet::new(), funcs: BTreeSet::new(),
                      fnvalues: BTreeSet::new(), exit_traps: Vec::new(), temp_setup_done: BTreeSet::new(), sync_pending: Vec::new(), lower_vars: BTreeSet::new(), upper_vars: BTreeSet::new(),
-                     helpers: BTreeSet::new(), java_helpers: Vec::new(), redir_seq: 0, tmp_seq: 0, child_sym: BTreeSet::new(),
+                     helpers: BTreeSet::new(), java_helpers: Vec::new(), redir_seq: 0, tmp_seq: 0, child_sym: BTreeSet::new(), nocase: None,
                      out: Vec::new(), depth: 2 }
     }
 
     fn helper(&mut self, h: &'static str) { self.helpers.insert(h); }
 
     // ── pass 1: collect declared scalars/arrays/functions ────────────
+    /// Every `[[ … ]]` this render hands to a bash CHILD must carry the
+    /// program's `shopt -s nocasematch`, because bash options are per-shell:
+    /// `shopt -s nocasematch; [[ $word == foo ]]` matched in the script, so
+    /// the child that evaluates the test must match too.
+    fn scan_nocase(stmts: &[IrStmt]) -> Option<bool> {
+        fn walk_e(e: &IrExpr, c: &mut Option<bool>) {
+            match e {
+                IrExpr::Call { func, args, .. } => {
+                    if func == "shopt"
+                        && args.iter().any(|a| matches!(a, IrExpr::Str(t, _) if t == "nocasematch"))
+                    {
+                        if let Some(IrExpr::Bool(b)) = args.iter().find(|a| matches!(a, IrExpr::Bool(_))) {
+                            *c = Some(*b);
+                        }
+                    }
+                    for a in args { walk_e(a, c); }
+                }
+                IrExpr::Arrow(b) => walk_s(b, c),
+                IrExpr::Capture { expr, .. } => walk_e(expr, c),
+                IrExpr::BinOp { lhs, rhs, .. } => { walk_e(lhs, c); walk_e(rhs, c); }
+                IrExpr::Interpolate(parts) => {
+                    for p in parts { if let InterpPart::Expr(x) = p { walk_e(x, c); } }
+                }
+                _ => {}
+            }
+        }
+        fn walk_s(sts: &[IrStmt], c: &mut Option<bool>) {
+            for st in sts {
+                for e in stmt_exprs(st) { walk_e(e, c); }
+                walk_s(&stmt_children(st.clone()), c);
+            }
+        }
+        let mut c = None;
+        walk_s(stmts, &mut c);
+        c
+    }
+
+    /// Command text for a child, carrying the nocasematch setting.
+    fn child_cmd(&self, text: String) -> String {
+        match self.nocase {
+            Some(true) => format!("\"{{ shopt -s nocasematch; \" + ({text}) + \" ; }}\""),
+            Some(false) => format!("\"{{ shopt -u nocasematch; \" + ({text}) + \" ; }}\""),
+            None => text,
+        }
+    }
+
     fn scan(&mut self, stmts: Vec<IrStmt>) -> Result<(), String> {
+        // the LAST `shopt … nocasematch` in program order wins
+        if self.nocase.is_none() { self.nocase = Self::scan_nocase(&stmts); }
         for st in stmts {
             match st {
                 IrStmt::Assign { targets, expr, .. } => {
@@ -1985,6 +2034,7 @@ impl JavaRender {
                 if let Ok(t) = self.bracket_text(args, false) {
                     if !t.contains("shFnmatch(") && !t.contains("shRegexMatch(") {
                         self.helper("run");
+                        let t = self.child_cmd(t);
                         self.emit(&format!("__SH_RC = shRun({t});"));
                         return Ok(());
                     }
@@ -2927,6 +2977,7 @@ impl JavaRender {
                     let simple = t.contains("shFnmatch(") || t.contains("shRegexMatch(");
                     if !simple {
                         self.helper("run");
+                        let t = self.child_cmd(t);
                         return Ok(format!("(shRun({t}) == 0)"));
                     }
                 }
@@ -6057,7 +6108,17 @@ impl JavaRender {
     fn arith(&mut self, a: &ArithAst) -> Result<String, String> {
         match a {
             ArithAst::Num(n) => Ok(format!("{n}L")),
-            ArithAst::Var(n) | ArithAst::Ident(n) => self.getvar_num(n),
+            ArithAst::Var(n) | ArithAst::Ident(n) => {
+                // An untracked name has no java field, so getvar_num fell
+                // through to shEnv (the PROCESS environment) -- empty for
+                // every variable the script itself set. That is why
+                // `echo $((a*b))` printed nothing. Untracked = unset, and
+                // bash reads an unset name as 0.
+                if !self.fields.contains(&sanitize(n)) {
+                    return Ok("0L".to_string());
+                }
+                self.getvar_num(n)
+            }
             ArithAst::Index { var, key } => {
                 let k = self.arith(key)?;
                 self.arrays.insert(sanitize(var));
