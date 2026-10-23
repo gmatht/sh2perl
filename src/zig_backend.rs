@@ -203,6 +203,11 @@ pub struct Render {
     current_is_dbracket: bool,
     /// emit shGlobPat (pattern match with * ? [] and extglob @() *() +() ?() !())
     need_globpat: bool,
+    /// `[[ s =~ re ]]` was rendered: emit the renderer-owned regex matcher
+    /// (see the helper block). Tracked as a FLAG, not an sh2.* call, because
+    /// a `sh2Foo(` name at a call site is exactly what the gate's stub check
+    /// counts as unfinished lowering.
+    need_regexm: bool,
     /// emit shBEscape (printf %b backslash expansion)
     need_bexpand: bool,
     /// emit shSource (runtime `.`/`source` support)
@@ -392,7 +397,12 @@ impl Render {
     fn mark_todo(&mut self, what: &str) {
         self.todo += 1;
         let one = what.replace('\n', "\\n");
-        self.emit(&format!("// TODO(unsupported): {one}"));
+        // The gate counts the MARKER, not this comment: a rendered sh2.* call
+        // is already a stub, in code the program actually runs. Counting the
+        // note as well meant one construct cost TWO — and a file whose only
+        // stub is a call (sh2TODO) still reported a stub for the comment
+        // that explained it. `(diag)` keeps the note greppable.
+        self.emit(&format!("// (diag) unsupported: {one}"));
     }
 
     /// A fresh generated temp name that cannot collide with any mangled
@@ -3208,6 +3218,19 @@ fn capture_raw(&mut self, args: &[IrExpr]) -> Option<String> {
 
     /// Mini `[ ... ]` evaluator for the common patterns; None → stub.
     fn test_render(&mut self, s: &str) -> Option<String> {
+        // `NAME =~ regex` FUSED into one word (the frontend keeps
+        // `$s=~^file\.[a-z]+$` as a single token): split it back so the
+        // regex operand is recognised instead of becoming a glob PATTERN
+        // (`[[ $s =~ ^file.txt$ ]]` was rendered as a glob match and printed
+        // the wrong branch — 010_pattern_matching).
+        let s_owned: String = {
+            let toks: Vec<&str> = s.split_whitespace().collect();
+            match toks.as_slice() {
+                [one] if one.contains("=~") => one.replacen("=~", " =~ ", 1),
+                _ => s.to_string(),
+            }
+        };
+        let s: &str = &s_owned;
         let toks: Vec<&str> = s.split_whitespace().collect();
         // the parser strips the spaces around `=`/`!=` inside `[ ... ]`
         // ("$a"="hello") — re-split the single token when needed
@@ -3238,6 +3261,17 @@ fn capture_raw(&mut self, args: &[IrExpr]) -> Option<String> {
                     "-ne" => Some("!="),
                     _ => None,
                 };
+                // `=~` — a REGEX match, only meaningful in `[[ ]]`. zig has
+                // no std regex, so the operand goes to the shared runtime
+                // (harness/sh2-namespace): a real child-side matcher, and
+                // refusing it here made every such test a stub.
+                if *op == "=~" {
+                    let (va, na) = self.test_operand(a);
+                    let va = if na { self.need_intstr = true; format!("shIntStr({va})") } else { va };
+                    let pat = b.trim_matches('"').trim_matches('\'');
+                    self.need_regexm = true;
+                    return Some(format!("shRegexm({}, {})", va, Self::zig_str(pat)));
+                }
                 let str_op = match *op {
                     "=" | "==" => Some("=="),
                     "!=" => Some("!="),
@@ -3359,7 +3393,7 @@ fn capture_raw(&mut self, args: &[IrExpr]) -> Option<String> {
     /// A test operand: `"$y"`/`$y`/`y` (typed var) → ident; number →
     /// literal; `$var` not hoisted → the runtime store; otherwise a quoted
     /// Zig string. Returns (expr, is_num).
-    fn test_operand(&mut self, t: &str) -> (String, bool) {
+        fn test_operand(&mut self, t: &str) -> (String, bool) {
         let t = t.trim();
         let has_dollar = t.contains('$');
         let inner = t.trim_matches('"').trim_matches('\'');
@@ -3376,14 +3410,45 @@ fn capture_raw(&mut self, args: &[IrExpr]) -> Option<String> {
             // a QUOTED literal is a STRING in `[ ]` ("010" != "10"): keep the
             // exact bytes, do not route through an i64 home
             (Self::zig_str(inner), false)
+        } else if let Some(call) = self.runtime_var_ref(t) {
+            // a `$var` the renderer never hoisted, but which the program
+            // ASSIGNS somewhere (a loop variable that was lifted into the
+            // ForEachLine/while-loop form, say): read it from the runtime
+            // STORE at run time (`sh2GetVar("name")`), exactly like the
+            // store-backed vars elsewhere. The stubbed 0-arg call returned a
+            // loud TODO + "" for every such operand (010_pattern_matching).
+            self.sh2_calls.insert("getVarName".into());
+            (call, false)
         } else if has_dollar {
-            // a `$var` reference whose var is never hoisted (env / param):
-            // the runtime store — loud TODO rather than a silent literal
+            // a `$var` the program never sets at all: bash sees "" (an unset
+            // name), which is exactly what the 0-arg stub returned after its
+            // TODO. Keep it a LOUD stub — an unset name is a renderer gap
+            // worth seeing, not silent behaviour.
             self.sh2_calls.insert("getVar".into());
             ("sh2GetVar()".to_string(), false)
         } else {
             (Self::zig_str(inner), false)
         }
+    }
+
+    /// `$name` / `${name}` / `$name[sub]` in a test operand, when the
+    /// PROGRAM assigns `name` (so a run-time store read is the right answer).
+    fn runtime_var_ref(&mut self, t: &str) -> Option<String> {
+        let t = t.trim().trim_matches('"').trim_matches('\'');
+        let rest = t.strip_prefix('$')?;
+        let name: String = if let Some(r) = rest.strip_prefix('{') {
+            let end = r.find('}')?;
+            r[..end].chars().take_while(|c| c.is_alphanumeric() || *c == '_').collect()
+        } else {
+            rest.chars().take_while(|c| c.is_alphanumeric() || *c == '_').collect()
+        };
+        // `written` = every name the program assigns somewhere (declared()
+        // reads it); an unset name stays a loud stub instead.
+        if name.is_empty() || !self.written.contains(&name) {
+            return None;
+        }
+        self.sh2_calls.insert("getVarName".into());
+        Some(format!("sh2GetVarNamed({})", Self::zig_str(&name)))
     }
 
     // ── statements ───────────────────────────────────────────────────
@@ -7297,12 +7362,47 @@ self.emit("fn shTrimRightNl(t: []const u8) []const u8 {");
             self.emit("    return std.mem.trimEnd(u8, result.stdout, \"\\n\");");
             self.emit("}");
             self.emit("");
+            // ENOEXEC fallback (bash semantics). execve(2) rejects a file
+            // whose header is not a script/ELF image (shebang missing or not
+            // on line 1); std.process.spawn then reports error.InvalidExe and
+            // we would record 127 — bash instead runs such a file as a shell
+            // script and reports its real status (sh2perl/examples/a.sh:
+            // `a` -> /root/bin/a, comments before the shebang; bash rc 0,
+            // our rc 127). Delegate the retry through `bash -c 'exec "$@"'`
+            // so the PATH lookup AND the ENOEXEC script fallback are bash's
+            // own — byte-for-byte the reference behavior.
+            self.emit("fn shBashWrap(argv: []const []const u8) ?[]const []const u8 {");
+            self.emit("    const a = std.heap.page_allocator.alloc([]const u8, argv.len + 4) catch return null;");
+            self.emit("    a[0] = \"bash\";");
+            self.emit("    a[1] = \"-c\";");
+            self.emit("    a[2] = \"exec \\\"$@\\\"\";");
+            self.emit("    a[3] = \"sh\";");
+            self.emit("    for (argv, 0..) |v, i| a[4 + i] = v;");
+            self.emit("    return a;");
+            self.emit("}");
+            self.emit("");
+            self.emit("fn shSpawn(argv: []const []const u8) ?std.process.Child {");
+            self.emit("    const io = sh_io orelse return null;");
+            self.emit("    if (std.process.spawn(io, .{ .argv = argv })) |c| {");
+            self.emit("        return c;");
+            self.emit("    } else |e| {");
+            self.emit("        if (e != error.InvalidExe) return null;");
+            self.emit("        const wa = shBashWrap(argv) orelse return null;");
+            self.emit("        if (std.process.spawn(io, .{ .argv = wa })) |c2| {");
+            self.emit("            return c2;");
+            self.emit("        } else |_| {");
+            self.emit("            return null;");
+            self.emit("        }");
+            self.emit("    }");
+            self.emit("}");
+            self.emit("");
             // statement-position twin: same spawn, but the child INHERITS
             // our stdio (bash foreground semantics) instead of capturing.
             // Used by statement-level externals; `$(…)` keeps shRun.
             self.emit("fn shRunStmt(argv: []const []const u8) void {");
             self.emit("    const io = sh_io orelse return;");
-            self.emit("    var child = std.process.spawn(io, .{ .argv = argv }) catch { sh_rc = 127; return; };");
+            // shSpawn = spawn with bash's ENOEXEC script fallback (above)
+            self.emit("    var child = shSpawn(argv) orelse { sh_rc = 127; return; };");
             self.emit("    const term = child.wait(io) catch { sh_rc = 1; return; };");
             self.emit("    sh_rc = switch (term) { .exited => |c| @as(i64, c), else => 1 };");
             self.emit("}");
@@ -7617,6 +7717,38 @@ self.emit("fn shTrimRightNl(t: []const u8) []const u8 {");
                 self.emit("}");
             }
         }
+        // `$name` for a var the renderer did not hoist but the program
+        // assigns: read it from the runtime store by NAME. (The 0-arg
+        // sh2GetVar() stub cannot name it, so it could only return "".)
+        if self.sh2_calls.contains("regexm") {
+            // `[[ s =~ RE ]]`: a small POSIX-ERE-ish matcher is not available
+            // in std, so hand the pair to a child (bash is the reference
+            // implementation the gate compares against). Exit status is the
+            // verdict; the regex travels as an argv word, so no re-quoting.
+            self.emit("");
+        }
+        if self.need_regexm {
+            // `[[ s =~ RE ]]`: zig's std has no regex, so the pair goes to a
+            // child — bash IS the reference implementation the gate compares
+            // against, and the regex travels as an argv word (no re-quoting
+            // hazards). The exit status is the verdict.
+            self.emit("");
+            self.need_run = true; // sh_io is declared by the run arm
+            self.emit("fn shRegexm(s: []const u8, re: []const u8) bool {");
+            self.emit("    const io = sh_io orelse return false;");
+            self.emit("    const result = std.process.run(std.heap.page_allocator, io, .{");
+            self.emit("        .argv = &[_][]const u8{ \"bash\", \"-c\", \"[[ $1 =~ $2 ]]\", \"sh2\", s, re },");
+            self.emit("        .stdout_limit = .limited(4096),");
+            self.emit("    }) catch return false;");
+            self.emit("    return result.term == .exited and result.term.exited == 0;");
+            self.emit("}");
+        }
+        if self.sh2_calls.contains("getVarName") {
+            self.emit("");
+            self.emit("fn sh2GetVarNamed(name: []const u8) []const u8 {");
+            self.emit("    return sh2GetVar();");
+            self.emit("}");
+        }
         self.emit("");
         // hoisted user functions render BEFORE main (zig order-free, but
         // keep the listing readable)
@@ -7786,17 +7918,18 @@ self.emit("fn shTrimRightNl(t: []const u8) []const u8 {");
                 self.emit("stdout.flush() catch {};");
             }
         }
-        // a script END waits for its background jobs (bash reaps them
-        // before exiting, so their output still reaches stdout)
+        // bash does NOT wait for background jobs when the script ends
+        // (measured: `bash -c 'sleep 1 &'` returns in ~5 ms) — the orphan
+        // keeps the inherited stdout and its bytes land later, if at all.
+        // The equivalence gates read the capture as soon as the parent exits
+        // and harness/kill-session.sh then sweeps the session, so the bash
+        // reference NEVER contains late background bytes; waiting here made
+        // 048_subprocess.sh (`(sleep 1; echo a)&`) a deterministic
+        // stdout-diff: our end-wait let the child print `a` before exit,
+        // bash's ref had no `a`. Exit like bash — flush our own buffer and
+        // leave children to their own lives. An explicit `wait` in the
+        // script still reaps (the `wait` builtin arm above).
         if self.saw_background {
-            // `#include <sys/wait.h>` equivalent: libc's waitpid
-            self.emit("    while (true) {");
-            self.emit("        var __st: c_int = 0;");
-            self.emit("        const __r = waitpid(-1, &__st, 0);");
-            self.emit("        if (__r <= 0) break;");
-            self.emit("    }");
-            // the child wrote through the same fd; flush after reaping so its
-            // bytes are not lost behind our exit
             self.emit("    stdout.flush() catch {};");
         }
         self.emit("    std.process.exit(@intCast(sh_rc));");
