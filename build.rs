@@ -80,26 +80,32 @@ fn main() {
     // Each handler file in src/render_ext/handlers/ renders one stmt node.
     let render_dir = Path::new("src/render_ext/handlers");
     println!("cargo:rerun-if-changed={}", render_dir.display());
-    let mut hmods = String::new();
-    let mut hchain = String::new();
+    let mut render_files: Vec<String> = Vec::new();
     if let Ok(rd) = fs::read_dir(render_dir) {
         for entry in rd
             .filter_map(Result::ok)
             .filter(|e| e.file_type().map(|t| t.is_file()).unwrap_or(false))
         {
-            let file = entry.file_name().to_string_lossy().into_owned();
-            if !file.ends_with(".rs") || file == "mod.rs" {
-                continue;
-            }
-            let hname = file.trim_end_matches(".rs").to_string();
-            // map the handler file (snake_case) to the declared node + tag
-            if let Some(node) = all_nodes.iter().find(|n| snake(&n.name) == hname) {
-                hmods.push_str(&format!("    pub(crate) mod {hname};\n"));
-                hchain.push_str(&format!(
-                    "        \"{tag}\" => {{ let c = n.as_any().downcast_ref::<crate::shir_nodes::{name}>()\n                    .expect(\"tag/type agree\"); handlers::{hname}::render(ctx, c) }}\n",
-                    tag = node.tag, name = node.name, hname = hname
-                ));
-            }
+            render_files.push(entry.file_name().to_string_lossy().into_owned());
+        }
+    }
+    // fs::read_dir order is filesystem-arbitrary; sort so regeneration is
+    // byte-identical across checkouts (module order is semantics-free).
+    render_files.sort();
+    let mut hmods = String::new();
+    let mut hchain = String::new();
+    for file in &render_files {
+        if !file.ends_with(".rs") || file == "mod.rs" {
+            continue;
+        }
+        let hname = file.trim_end_matches(".rs").to_string();
+        // map the handler file (snake_case) to the declared node + tag
+        if let Some(node) = all_nodes.iter().find(|n| snake(&n.name) == hname) {
+            hmods.push_str(&format!("    pub(crate) mod {hname};\n"));
+            hchain.push_str(&format!(
+                "        \"{tag}\" => {{ let c = n.as_any().downcast_ref::<crate::shir_nodes::{name}>()\n                    .expect(\"tag/type agree\"); handlers::{hname}::render(ctx, c) }}\n",
+                tag = node.tag, name = node.name, hname = hname
+            ));
         }
     }
     fs::write(
@@ -118,36 +124,42 @@ fn main() {
     // ── Part 4: render_ext_expr dispatch (IrExpr::Ext handlers) ───────
     let expr_handler_dir = Path::new("src/render_ext_expr/handlers");
     println!("cargo:rerun-if-changed={}", expr_handler_dir.display());
-    let mut expr_hmods = String::new();
-    let mut expr_hchain = String::new();
+    let mut expr_files: Vec<String> = Vec::new();
     if let Ok(rd) = fs::read_dir(expr_handler_dir) {
         for entry in rd
             .filter_map(Result::ok)
             .filter(|e| e.file_type().map(|t| t.is_file()).unwrap_or(false))
         {
-            let file = entry.file_name().to_string_lossy().into_owned();
-            if !file.ends_with(".rs") || file == "mod.rs" {
-                continue;
-            }
-            let hname = file.trim_end_matches(".rs").to_string();
-            // Skip non-handler files (all_nodes.rs is a shared impl module)
-            if hname == "all_nodes" {
-                continue;
-            }
-            // Look up the tag from the .node declarations (not from filename)
-            let tag = all_nodes.iter()
-                .find(|n| snake(&n.name) == hname)
-                .map(|n| n.tag.clone());
-            let Some(tag) = tag else {
-                eprintln!("cargo:warning=handler {hname}.rs has no matching .node declaration, skipping");
-                continue;
-            };
-            expr_hmods.push_str(&format!("    pub(crate) mod {hname};\n"));
-            expr_hchain.push_str(&format!(
-                "        \"{tag}\" => handlers::{hname}::render(n.as_any().downcast_ref::<crate::shir_nodes::{tag}>().expect(\"tag/type agree\"), ctx),\n",
-                tag = tag, hname = hname
-            ));
+            expr_files.push(entry.file_name().to_string_lossy().into_owned());
         }
+    }
+    // fs::read_dir order is filesystem-arbitrary; sort so regeneration is
+    // byte-identical across checkouts (module order is semantics-free).
+    expr_files.sort();
+    let mut expr_hmods = String::new();
+    let mut expr_hchain = String::new();
+    for file in &expr_files {
+        if !file.ends_with(".rs") || file == "mod.rs" {
+            continue;
+        }
+        let hname = file.trim_end_matches(".rs").to_string();
+        // Skip non-handler files (all_nodes.rs is a shared impl module)
+        if hname == "all_nodes" {
+            continue;
+        }
+        // Look up the tag from the .node declarations (not from filename)
+        let tag = all_nodes.iter()
+            .find(|n| snake(&n.name) == hname)
+            .map(|n| n.tag.clone());
+        let Some(tag) = tag else {
+            eprintln!("cargo:warning=handler {hname}.rs has no matching .node declaration, skipping");
+            continue;
+        };
+        expr_hmods.push_str(&format!("    pub(crate) mod {hname};\n"));
+        expr_hchain.push_str(&format!(
+            "        \"{tag}\" => handlers::{hname}::render(n.as_any().downcast_ref::<crate::shir_nodes::{tag}>().expect(\"tag/type agree\"), ctx),\n",
+            tag = tag, hname = hname
+        ));
     }
     // Write the handlers mod.rs (source tree, for mod path resolution)
     // Include all_nodes as a non-handler module (shared impl)
@@ -172,27 +184,33 @@ fn main() {
     // a handler) — zero edits to shared core files.
     let st_dir = Path::new("src/render_ext_estree/handlers");
     println!("cargo:rerun-if-changed={}", st_dir.display());
-    let mut s_hmods = String::new();
-    let mut s_hchain = String::new();
+    let mut st_files: Vec<String> = Vec::new();
     if let Ok(rd) = fs::read_dir(st_dir) {
         for entry in rd.filter_map(Result::ok) {
-            let file = entry.file_name().to_string_lossy().into_owned();
-            if !file.ends_with(".rs") || file == "mod.rs" {
-                continue;
-            }
-            let hname = file.trim_end_matches(".rs").to_string();
-            let Some(tag) = all_nodes.iter()
-                .find(|n| snake(&n.name) == hname)
-                .map(|n| n.tag.clone()) else {
-                eprintln!("cargo:warning=estree handler {hname}.rs has no matching .node declaration, skipping");
-                continue;
-            };
-            s_hmods.push_str(&format!("    pub(crate) mod {hname};\n"));
-            s_hchain.push_str(&format!(
-                "        \"{tag}\" => handlers::{hname}::render(n.as_any().downcast_ref::<crate::shir_nodes::{tag}>().expect(\"tag/type agree\")),\n",
-                tag = tag, hname = hname
-            ));
+            st_files.push(entry.file_name().to_string_lossy().into_owned());
         }
+    }
+    // fs::read_dir order is filesystem-arbitrary; sort so regeneration is
+    // byte-identical across checkouts (module order is semantics-free).
+    st_files.sort();
+    let mut s_hmods = String::new();
+    let mut s_hchain = String::new();
+    for file in &st_files {
+        if !file.ends_with(".rs") || file == "mod.rs" {
+            continue;
+        }
+        let hname = file.trim_end_matches(".rs").to_string();
+        let Some(tag) = all_nodes.iter()
+            .find(|n| snake(&n.name) == hname)
+            .map(|n| n.tag.clone()) else {
+            eprintln!("cargo:warning=estree handler {hname}.rs has no matching .node declaration, skipping");
+            continue;
+        };
+        s_hmods.push_str(&format!("    pub(crate) mod {hname};\n"));
+        s_hchain.push_str(&format!(
+            "        \"{tag}\" => handlers::{hname}::render(n.as_any().downcast_ref::<crate::shir_nodes::{tag}>().expect(\"tag/type agree\")),\n",
+            tag = tag, hname = hname
+        ));
     }
     fs::write(
         st_dir.join("mod.rs"),

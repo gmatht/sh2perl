@@ -149,6 +149,32 @@ fn has_dynamic_write(stmts: &[IrStmt]) -> bool {
     stmts.iter().any(walk_stmt)
 }
 
+/// Shell variables the SHELL ITSELF reads implicitly. No syntactic
+/// reference is needed for the value to change behaviour, so a store to one
+/// of these is never dead:
+///   - `IFS` drives word splitting in every later unquoted expansion and
+///     every `$*` / `${arr[*]}` join, including the expansion of the SAME
+///     command (`IFS=$'\n' a=($(cmd))` — the capture splits on the new
+///     value);
+///   - `PATH` / `CDPATH` / `GLOBIGNORE` drive command lookup, `cd` and
+///     globbing for the `exec` calls that follow;
+///   - `HOME` / `PWD` / `OLDPWD` / `TMPDIR` are consulted by `cd`,
+///     `mktemp` and `~` expansion;
+///   - `ENV` / `BASH_ENV` are sourced by child shells;
+///   - `OPTIND` is advanced by `getopts`.
+/// The census only sees EXPLICIT reads, so `IFS=x x=5` (no `[*]` anywhere)
+/// judged the IFS store dead and dropped it — core request
+/// fish-20261016-core-ir-drops. Keeping the store is the faithful IR; a
+/// backend that never consults the value simply emits an inert assignment.
+const SHELL_IMPLICIT_VARS: &[&str] = &[
+    "IFS", "PATH", "CDPATH", "GLOBIGNORE", "HOME", "PWD", "OLDPWD", "TMPDIR", "ENV",
+    "BASH_ENV", "OPTIND",
+];
+
+fn is_shell_implicit(name: &str) -> bool {
+    SHELL_IMPLICIT_VARS.contains(&name)
+}
+
 /// Apply the transform. Returns whether anything changed.
 pub fn transform(stmts: &mut Vec<IrStmt>) -> bool {
     if has_dynamic_write(stmts) {
@@ -189,6 +215,9 @@ pub fn transform(stmts: &mut Vec<IrStmt>) -> bool {
         .iter()
         .filter(|v| {
             if reads.contains(*v) || escapes.contains(*v) {
+                return false;
+            }
+            if is_shell_implicit(v) {
                 return false;
             }
             if !consts.contains(*v) {
@@ -1136,8 +1165,44 @@ mod tests {
         transform(&mut star);
         assert_eq!(star.len(), 2, "[*] join must keep the IFS store: {star:?}");
 
+        // `[@]` does not join on IFS, but the store must STILL survive:
+        // IFS is a shell-implicit variable, and the same script can split
+        // on it later (a `$(cmd)` capture, an unquoted `$v`). This control
+        // asserted the old dead-store verdict before the shell-implicit
+        // guard landed (fish-20261016-core-ir-drops).
         let mut at = vec![ifs_store, read_of("config[@]")];
         transform(&mut at);
-        assert_eq!(at.len(), 1, "[@] does not read IFS — its store is dead: {at:?}");
+        assert_eq!(at.len(), 2, "IFS is shell-implicit; keep its store: {at:?}");
+    }
+
+    /// A store to a shell-IMPLICIT variable survives even with no syntactic
+    /// read anywhere: the shell consults the value itself (word splitting,
+    /// command lookup, `cd`, globbing), so it can never be proven dead.
+    ///
+    /// Repro (core request fish-20261016-core-ir-drops case 2):
+    /// `IFS=x x=5` emitted an EMPTY statement list — both assignment-only
+    /// words vanished — and a later `$var` expansion or `$(cmd)` capture
+    /// then split on the default IFS instead of the script's value.
+    #[test]
+    fn implicit_shell_var_store_is_never_dead() {
+        let assign = |name: &str, value: &str| IrStmt::Assign {
+            targets: vec![AssignTarget {
+                var: name.to_string(),
+                sigil: None,
+                indices: vec![],
+            }],
+            expr: str_(value),
+            asm: None,
+        };
+        let mut stmts = vec![assign("IFS", "\n"), assign("x", "5")];
+        transform(&mut stmts);
+        let kept: Vec<&str> = stmts
+            .iter()
+            .filter_map(|s| match s {
+                IrStmt::Assign { targets, .. } => targets.first().map(|t| t.var.as_str()),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(kept, vec!["IFS"], "IFS store must survive; x is genuinely dead: {stmts:?}");
     }
 }

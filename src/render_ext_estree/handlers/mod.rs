@@ -7,9 +7,9 @@
     pub(crate) mod deref;
     pub(crate) mod element_read;
     pub(crate) mod field_read;
+    pub(crate) mod gpu_op;
     pub(crate) mod map_literal;
     pub(crate) mod regexp_find;
     pub(crate) mod spread;
     pub(crate) mod type_assert;
-    pub(crate) mod gpu_op;
 
