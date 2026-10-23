@@ -49,6 +49,15 @@ pub struct Render {
     arrays: BTreeSet<String>,
     /// vars used as associative arrays (declare as map[string]any)
     assoc: BTreeSet<String>,
+    /// Collection homes proved by an EARLIER render of this program. `assoc`
+    /// fills up WHILE rendering (and `arrays` only from the statement shapes
+    /// the pre-scan walks), so a statement that comes before the collection's
+    /// first write — `unset arr` above `typeset -a arr=(10 20 30)` — cannot
+    /// see the home, and `unset`'s zero value depends on it (`nil` for a
+    /// collection, "" for a scalar). Carrying the completed answer in from the
+    /// previous render removes that order dependence; getting it wrong is a
+    /// compile error, not a wrong value (`arr = ""` into a `[]any`).
+    unset_collections: BTreeSet<String>,
     /// vars written anywhere (declared at the top of main)
     written: BTreeSet<String>,
     /// write accounting for the string-scalar inference (see shir_to_go):
@@ -405,24 +414,40 @@ pub fn shir_to_go(prog: &IrProgram) -> String {
     // only grows — a promoted name carries a `Str` verdict afterwards and
     // every predicate below refuses a verdict that is not `Any` — so each
     // round adds at least one name and the loop terminates.
+    //
+    // The same loop carries the COLLECTION homes forward. `assoc` is only
+    // discovered while rendering, so `unset arr` above `typeset -a arr=(…)`
+    // saw no home in this first pass; the set only grows and is bounded by
+    // the program's variables, so both halves terminate together.
+    let mut unset_collections: BTreeSet<String> = BTreeSet::new();
     loop {
+        let mut changed = false;
+        let seen: BTreeSet<String> = r.arrays.union(&r.assoc).cloned().collect();
+        if !seen.is_subset(&unset_collections) {
+            unset_collections.extend(seen);
+            changed = true;
+        }
         let mut promoted = promotable_scalars(&prog, &r);
-        if promoted.is_empty() {
+        if !promoted.is_empty() {
+            // `Render::writes`/`written` are hash maps, so the candidate order
+            // is arbitrary; sorting keeps the hoisted `var` block byte-identical
+            // across runs.
+            promoted.sort_by(|a, b| a.0.cmp(&b.0));
+            // A promoted name may already carry an `Any` entry; drop it so the
+            // program never holds two verdicts for one var — `var_types` is read
+            // as a map downstream and a duplicate would make the answer depend
+            // on entry order.
+            let names: BTreeSet<String> = promoted.iter().map(|(v, _)| v.clone()).collect();
+            prog.var_types
+                .retain(|(t, ty)| !(*ty == IrType::Any && names.contains(t)));
+            prog.var_types.extend(promoted);
+            changed = true;
+        }
+        if !changed {
             break;
         }
-        // `Render::writes`/`written` are hash maps, so the candidate order is
-        // arbitrary; sorting keeps the hoisted `var` block byte-identical
-        // across runs.
-        promoted.sort_by(|a, b| a.0.cmp(&b.0));
-        // A promoted name may already carry an `Any` entry; drop it so the
-        // program never holds two verdicts for one var — `var_types` is read
-        // as a map downstream and a duplicate would make the answer depend
-        // on entry order.
-        let names: BTreeSet<String> = promoted.iter().map(|(v, _)| v.clone()).collect();
-        prog.var_types
-            .retain(|(t, ty)| !(*ty == IrType::Any && names.contains(t)));
-        prog.var_types.extend(promoted);
         r = Render::default();
+        r.unset_collections = unset_collections.clone();
         r.var_types = prog.var_types.iter().cloned().collect();
         r.program(&prog);
     }
@@ -10161,6 +10186,7 @@ impl Render {
                         // those keep `nil`.
                         if self.is_arr(name)
                             || self.is_assoc(name)
+                            || self.unset_collections.contains(name)
                             || self.functions.contains(name)
                         {
                             self.mark_written(name);
