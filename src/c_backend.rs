@@ -296,8 +296,15 @@ pub struct Render {
     /// rendered (None otherwise) — its storage is `mpz_t[]`.
     cur_array_return_arr: Option<String>,
     /// var name -> lifetime (first/last access, escapes) for the
-    /// end-of-scope free pass.
-    var_lifetimes: std::collections::HashMap<String, crate::ir::VarLifetime>,
+    /// end-of-scope free pass. BTreeMap (not HashMap): this map is
+    /// CLONED and iterated at both free-emission sites (function exits
+    /// and main's teardown), and HashMap's RandomState ordering made
+    /// those `free(...)` lines flip between identical renders — measured
+    /// as run-to-run byte diffs in generated C (two `--emit-c` runs of
+    /// the same input differed ONLY in teardown free order). Sorted
+    /// iteration makes the render byte-reproducible, which the A/B
+    /// methodology (and cache trust) depends on.
+    var_lifetimes: std::collections::BTreeMap<String, crate::ir::VarLifetime>,
     /// heap-return temps (`_cnN`) created by native function calls that
     /// the caller must free after the enclosing statement (unless moved
     /// into a store var). Flushed at statement boundaries.
@@ -448,6 +455,9 @@ pub struct Render {
     need_stat_ops: BTreeSet<String>,
     /// fnmatch.h (test glob `==`/`!=` with * or ?)
     need_fnmatch: bool,
+    /// `_sh_sc` NULL-safe strcmp operand helper (string Eq/Ne on a
+    /// possibly-unassigned global — see the emission site)
+    need_sc_guard: bool,
     /// string-var ++/-- helpers (sequence-point-safe inc/dec)
     need_incdec: bool,
     /// regex.h (test `=~`)
@@ -11044,6 +11054,19 @@ impl Render {
         self.emit("#include <unistd.h>"); // chdir/access/getcwd/gethostname
         self.emit("#include <errno.h>"); // EINTR retry on capture reads
         self.emit("#include <ctype.h>"); // tolower/... in text transforms
+        if self.need_sc_guard {
+            // NULL-safe strcmp operand: a string-homed global read
+            // before its first assignment is a NULL char*, and
+            // strcmp(NULL, s) segfaults (observed at startup on
+            // mime-new: an AVX strcmp with rdi=0 straight out of
+            // main). The pointer-compare this path replaced was
+            // NULL-safe by accident; a helper that RETURNS non-NULL
+            // restores that at every site with one call — same
+            // rationale as `_sh_env`, and the operand evaluates
+            // exactly ONCE (a `(x)?(x):""` inline guard would re-run
+            // side-effecting Capture/Interpolate subjects).
+            self.emit("static const char *_sh_sc(const char *x) { return x ? x : \"\"; }");
+        }
         if self.need_gmp {
             // GMP bigint path (proven-big regime): <gmp.h> must precede
             // every use; linked with -lgmp (libgmp-dev on the gate).
@@ -14309,6 +14332,40 @@ impl Render {
         });
     }
 
+    /// Does this operand render as a C `char*` (so an Eq/Ne over it
+    /// must be a strcmp, never a pointer compare)? Conservative: only
+    /// shapes whose C type is certainly text. A numeric-homed var (Int/
+    /// Float/bigint verdicts — incl. the numstr `uint8_t` homes like
+    /// `lso_size`) is NOT string-valued, and unknown expr shapes refuse,
+    /// so a genuine integer compare can never be reinterpreted as
+    /// strcmp.
+    fn str_cmp_valued(&self, e: &IrExpr) -> bool {
+        match e {
+            IrExpr::Str(..) | IrExpr::Interpolate(..) | IrExpr::Capture { .. } => true,
+            IrExpr::Var(name, _) | IrExpr::Ident(name) => {
+                !self.is_num(name) && !self.is_float(name) && !self.bigint_vars.contains(name)
+            }
+            // `getVar "name"` — the value read the frontend/ingress
+            // substitutes for a bare `$name` (the case subject arrives
+            // this way: `Call { func: "getVar", args: [Str("lso_name")] }`
+            // — without this arm the MIMEcroft `case` predicates kept
+            // rendering as pointer compares). Stringness follows the
+            // NAMED var's verdict, exactly like the Var arm.
+            IrExpr::Call { func, args } if func == "getVar" => {
+                match args.first() {
+                    Some(IrExpr::Str(n, _)) => {
+                        !self.is_num(n) && !self.is_float(n) && !self.bigint_vars.contains(n)
+                    }
+                    _ => false,
+                }
+            }
+            IrExpr::Ternary { then, else_, .. } | IrExpr::DefinedOr { default: else_, expr: then, .. } => {
+                self.str_cmp_valued(then) && self.str_cmp_valued(else_)
+            }
+            _ => false,
+        }
+    }
+
     fn expr(&mut self, e: &IrExpr) -> String {
         match e {
             IrExpr::Int(i) => {
@@ -14358,6 +14415,62 @@ impl Render {
                 let l = self.expr(lhs);
                 let r = self.expr(rhs);
                 self.value_discarded = was_discarded;
+                // String CONTENT compare: C's `==`/`!=` on two `char*`
+                // compares ADDRESSES, not text. The shared case lowering
+                // builds `BinOp{Ne}(subject, Str)` for Exact patterns
+                // (transforms/case_lowering.rs `exact_cond`), so EVERY
+                // lowered literal `case` pattern here evaluated as a
+                // pointer compare — operands never alias, making `!=`
+                // vacuously TRUE and `==` vacuously FALSE. Measured on
+                // MIMEcroft: `case $lso_name in jpeg|png|octet|text)`
+                // never matched in native (bash picks 64px, the binary
+                // kept 32), the texture cache keys could never hit, and
+                // the game re-ran four child-bash texture generators
+                // EVERY run — 87.9% of demo CPU in child bash, ~50s of
+                // ~63s wall (prof samples + ps child sampling). Only C
+                // has this hazard (rust/perl/python `!=` are content
+                // compares), so the fix lives here, not in the shared
+                // transform. Conservative: both operands must be
+                // certainly-text shapes or the old numeric path stands.
+                if matches!(
+                    op,
+                    crate::ir::BinOpKind::Eq | crate::ir::BinOpKind::Ne
+                ) && self.str_cmp_valued(lhs)
+                    && self.str_cmp_valued(rhs)
+                {
+                    // Both operands may be raw global reads = NULL
+                    // before first assignment; the helper restores the
+                    // accidental NULL-safety of the pointer compare it
+                    // replaces. String LITERALS can't be NULL and stay
+                    // bare (a lowered case pattern is always one).
+                    self.need_sc_guard = true;
+                    let w = |s: &str| {
+                        if s.starts_with('"') {
+                            s.to_string()
+                        } else {
+                            format!("_sh_sc({s})")
+                        }
+                    };
+                    if self.nocasematch {
+                        // Mirror the test arm: nocasematch folds ==/!=.
+                        let pat = match &**rhs {
+                            IrExpr::Str(s, _) => Self::cstr(s),
+                            _ => w(&r),
+                        };
+                        self.need_fnmatch = true;
+                        let m = format!("fnmatch({}, {pat}, FNM_CASEFOLD)", w(&l));
+                        return format!(
+                            "({m} {} 0)",
+                            if matches!(op, crate::ir::BinOpKind::Eq) { "==" } else { "!=" }
+                        );
+                    }
+                    return format!(
+                        "(strcmp({}, {}) {} 0)",
+                        w(&l),
+                        w(&r),
+                        if matches!(op, crate::ir::BinOpKind::Eq) { "==" } else { "!=" }
+                    );
+                }
                 let c_op = match op {
                     crate::ir::BinOpKind::Add => "+",
                     crate::ir::BinOpKind::Sub => "-",
@@ -22698,23 +22811,34 @@ fn param_copy_alias(
     /// DYNAMIC (dynamic words render via value_c into the argv array).
     /// Returns Some(C-expr) when the fast path applies.
     fn uu_cmd_ok(cmd: &str) -> bool {
-        // kept in sync with runtime/build_uu_ffi.sh FEATURES
-        matches!(
-            cmd,
-            "cat"
-                | "wc"
-                | "ls"
-                | "sort"
-                | "sed"
-                | "awk"
-                | "grep"
-                | "date"
-                | "sha256sum"
-                | "uname"
-                | "basename"
-                | "dirname"
-                | "cp"
-        )
+        // The BUILTIN absorb set — kept in sync with
+        // runtime/build_uu_ffi.sh FEATURES (the `.so`'s dispatch gate; the
+        // same names ride the perl seam as SH_RUN_EXT_PREAMBLE's
+        // `__SH_UU_OK`). Always absorbed. Published as a const so the
+        // bash-o4 driver's feed computes its EXTRAS against this one list
+        // instead of growing a third copy.
+        if UU_BUILTIN_CMDS.iter().any(|&b| b == cmd) {
+            return true;
+        }
+        // DRIVER-FED absorb table (bash-o4 candidate discovery, bounded by
+        // build_uu_ffi.sh's availability stamp — an uncompiled util is
+        // rc 127 at runtime per uu_ffi.h, so the driver only feeds what
+        // the built `.so` carries). UNION semantics: the feed can only
+        // WIDEN the builtin set, never shrink it — discovery missing an
+        // indirect site (sourced text, eval) keeps the absorption it
+        // already had. Per-site eligibility in `uu_argv` (globs, brace
+        // words, env Objects, the grep subset) is unchanged and still
+        // refuses anything the native argv cannot carry.
+        // SH2_NO_ABSORB=1 — kill switch: ignore the feed and render the
+        // builtin set byte-for-byte (the A/B off side). SH2_UU_FFI=0
+        // (in `uu_argv`) independently disables the whole uu path.
+        if std::env::var("SH2_NO_ABSORB").is_ok() {
+            return false;
+        }
+        match std::env::var("SH2_ABSORB_CMDS") {
+            Ok(feed) => feed.split(',').any(|c| c.trim() == cmd),
+            Err(_) => false,
+        }
     }
 
     /// Does this word need child-bash glob expansion (the core's
@@ -41756,6 +41880,23 @@ fn collect_vars_full(
             }
             IrStmt::Expr(e) => collect_vars_expr(e, out),
             IrStmt::Output { value, .. } => collect_vars_expr(value, out),
+            // A /dev/null-redirect wrapper around `printf -v` unwraps in
+            // the render arm (pv_inner) and stores NATIVELY — the target
+            // var must hoist a declaration here exactly like the bare
+            // form does, or the native store writes an undeclared
+            // identifier. Only the exact shape the render handles
+            // (single inner stmt, literal /dev/null "w" targets, a
+            // printf -v call); anything else keeps the generic
+            // redirect rendering and collects nothing extra.
+            IrStmt::Redirect { .. } => {
+                if let Some(IrStmt::Expr(e)) = unwrap_devnull_redirect(s) {
+                    if let IrExpr::Call { args, .. } = e {
+                        if is_printf_v_call(args) {
+                            collect_vars_expr(e, out);
+                        }
+                    }
+                }
+            }
             IrStmt::If { cond, then, elsifs, else_ } => {
                 collect_vars_expr(cond, out);
                 collect_vars(then, out);
@@ -41964,6 +42105,46 @@ fn is_printf_v_call(args: &[IrExpr]) -> bool {
             args.get(1),
             Some(IrExpr::Array(items)) if matches!(items.first(), Some(IrExpr::Str(s, _)) if s == "-v")
         )
+}
+
+/// The BUILTIN absorb set: external commands the C backend lowers to the
+/// in-process `sh2_uu_run`/`sh2_uu_capture` call instead of fork/exec
+/// (`bash -c`). Hand-synced with `runtime/build_uu_ffi.sh` FEATURES —
+/// the dispatch gate of the built `libcoreutils_ffi.so` (and the perl
+/// seam's SH_RUN_EXT_PREAMBLE `__SH_UU_OK`). Published for the driver's
+/// absorb-table feed (bash-o4 pipeline::feed_absorb_table computes its
+/// extras against this list); the table can only WIDEN it.
+pub const UU_BUILTIN_CMDS: &[&str] = &[
+    "cat",
+    "wc",
+    "ls",
+    "sort",
+    "sed",
+    "awk",
+    "grep",
+    "date",
+    "sha256sum",
+    "uname",
+    "basename",
+    "dirname",
+    "cp",
+];
+
+/// A redirect wrapper that discards everything (`printf -v x f > /dev/null 2>&1`):
+/// the wrapped statement is still a native printf -v store, and the output
+/// would be discarded anyway, so render and analysis may unwrap it. Only
+/// literal `/dev/null` `w`/`c`/`a` targets qualify — anything else (a real
+/// file, a directory fd, an fd dup) keeps the shell-out path so the
+/// redirected bytes land where bash would put them.
+fn unwrap_devnull_redirect(stmt: &IrStmt) -> Option<&IrStmt> {
+    let IrStmt::Redirect { inner, redirects } = stmt else {
+        return None;
+    };
+    let ok = inner.len() == 1
+        && redirects.iter().all(|r| {
+            r.mode == "w" && matches!(&r.target, IrExpr::Str(t, _) if t == "/dev/null")
+        });
+    if ok { Some(&inner[0]) } else { None }
 }
 
 
@@ -42348,7 +42529,12 @@ fn inner_first_words(inner: &[IrStmt]) -> Option<&Vec<IrExpr>> {
 }
 
 fn collect_assigned_vars(stmts: &[IrStmt], out: &mut BTreeSet<String>) {
-    for s in stmts {
+    for s0 in stmts {
+        // A devnull-redirect wrapper (`printf -v p x 2>/dev/null >/dev/null`)
+        // unwraps in the render arm too — the wrapped statement's assignment
+        // lands natively, so its target must hoist exactly like the bare
+        // form does.
+        let s = unwrap_devnull_redirect(s0).unwrap_or(s0);
         match s {
             IrStmt::Assign { targets, expr, .. } => {
                 for t in targets {
