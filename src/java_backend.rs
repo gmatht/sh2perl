@@ -495,7 +495,7 @@ impl JavaRender {
             "escapes","substr","fnmatch","strip","replace","case","basename",
             "dirname","div","pow","ftype","readln","readsplit","sourcefile","split","aset","aget",
             "asetkey","agetkey",
-            "writefile","outswap","errswap","inswap","snapshot","regex",
+            "writefile","outswap","errswap","inswap","snapshot","regex","foreachline",
             "contains","quote","declared","errifempty","regexm","eq","testrc","envset",
         "aslice",
         // The Ext-node helpers (text_ops' rich nodes; see
@@ -1090,6 +1090,46 @@ impl JavaRender {
                 }
                 self.emit(&format!("{}.start();", bg));
                 self.emit("__SH_RC = 0;");
+                Ok(())
+            }
+            // NEW-CORE NODE: ForEachLine — STREAMING line iteration over a
+            // file (the text_ops lift of `cat F`, `tr A B < F`, `wc -l < F`,
+            // `head -n K F`). Every other code-generating backend renders it
+            // natively; java REFUSED the whole file, which is why
+            // 070_gnuisms_thorough and several others failed to render at
+            // all. The body is ordinary statements, so it renders with the
+            // normal statement path; the loop var is a field.
+            IrStmt::Ext(node) if node.tag() == "ForEachLine" => {
+                let fl = node.as_any()
+                    .downcast_ref::<crate::shir_nodes::ForEachLine>()
+                    .expect("tag/type agree");
+                let var = sanitize(&fl.var);
+                self.ensure_field(&fl.var);
+                let src = self.expr_str(&fl.source)?;
+                let limit = match &fl.limit {
+                    Some(l) => Some(self.expr_num(l)?),
+                    None => None,
+                };
+                // bash/cut/grep see lines WITHOUT the trailing newline
+                self.helper("foreachline");
+                self.tmp_seq += 1;
+                let k = self.tmp_seq;
+                self.emit(&format!("java.util.Iterator<String> __fli{k} = shForEachLine({src});"));
+                let has_lim = limit.is_some();
+                let lim = match limit {
+                    Some(ref l) => format!("__fln{k} < ({l}) && "),
+                    None => String::new(),
+                };
+                if has_lim {
+                    self.emit(&format!("long __fln{k} = 0L;"));
+                }
+                self.block_open(&format!("while ({lim}__fli{k}.hasNext()) {{"));
+                self.emit(&format!("__v_{var} = __fli{k}.next();"));
+                if has_lim {
+                    self.emit(&format!("__fln{k}++;"));
+                }
+                for b in &fl.body { self.stmt(b)?; }
+                self.block_close();
                 Ok(())
             }
             IrStmt::Ext(node) => Err(format!("ext node not supported by the java renderer: {node:?}")),
@@ -2556,7 +2596,13 @@ impl JavaRender {
                     }
                     break;
                 }
-                let joined = self.join_word_refs(&flat[words_start.min(flat.len())..], " + \" \" + ")?;
+                // a command-scoped env prefix on a NATIVE builtin
+                // (`FOO=bar echo hi`): bash applies it to the child only, and
+                // an echo has no child, so the prefix is consumed here and
+                // the var is NOT set for later statements.
+                let mut words: Vec<&IrExpr> = flat[words_start.min(flat.len())..].to_vec();
+                words.retain(|w| !matches!(w, IrExpr::Object(_)));
+                let joined = self.join_word_refs(&words, " + \" \" + ")?;
                 if interpret && joined.contains("\\") {
                     self.helper("escapes");
                     let with_nl = if newline { format!("shEscapes({joined}) + \"\\n\"") } else { format!("shEscapes({joined})") };
@@ -3015,10 +3061,18 @@ impl JavaRender {
                         out.push(self.expr_str(it)?);
                     }
                 }
-                // command-scoped env object (VAR=x cmd): tracked exports
-                // cover the child-env case; per-command overrides are a
-                // documented limitation
-                IrExpr::Object(_) => {}
+                // command-scoped env object (`VAR=val cmd`): bash puts the
+                // assignment in the CHILD's environment only. A child-text
+                // word `VAR=val` (a plain assignment word before the command)
+                // does exactly that, so emit the assignments as words
+                // (t86_env_cmd: `FOO=bar echo hi`). The old `{}` arm DROPPED
+                // them, and the render then failed on the empty word list.
+                IrExpr::Object(props) => {
+                    for (k, v) in props.iter() {
+                        let val = self.expr_str(v)?;
+                        out.push(format!("({} + \"=\" + {})", jstr(k), val));
+                    }
+                }
                 other => out.push(self.expr_str(other)?),
             }
         }
@@ -4327,6 +4381,21 @@ impl JavaRender {
                 if a.is_empty() { Ok(format!("({r}).{}()", sanitize(method))) }
                 else { Ok(format!("({r}).{}({a})", sanitize(method))) }
             }
+            // `contains(hay, needle)` — the text_ops lift of
+            // `[[ $s == *needle* ]]` / `grep -q` on a known haystack. It is a
+            // real runtime call in every other backend; java was REFUSING it
+            // ("expr not in the java subset (str ctx)"), which is the whole
+            // t60_contains failure.
+            IrExpr::Call { func, args, .. } if func == "contains" => {
+                let hay = self.expr_str(args.first().ok_or("contains: no haystack")?)?;
+                let needle = self.expr_str(args.get(1).unwrap_or(&IrExpr::Str(String::new(), StrStyle::DoubleQuoted)))?;
+                // shContains is a long 1/0 (it is a command's EXIT STATUS).
+                // In string context that is the word "1"/"0" — and "0" is a
+                // NON-EMPTY string, so a truth test on it is always true:
+                // t60_contains printed "has2" for a grep that found nothing.
+                // The status form is what a string context wants back.
+                Ok(format!("(shContains({hay}, {needle}) != 0 ? \"1\" : \"\")"))
+            }
             IrExpr::Call { func, args, .. } if func == "grepMatches" => {
                 // grep -c style: count of matching lines; approximate via
                 // single contains check (documented limitation)
@@ -4379,10 +4448,15 @@ impl JavaRender {
                     .any(|w| matches!(w, IrExpr::Str(x, _) if x == "-q"));
                 if words && quiet {
                     self.helper("capture");
-                    Ok(format!("shCapture({})", self.cmd_line_expr(args)?))
-                } else {
-                    Err(format!("expr not in the java subset (str ctx): {:?}", e))
+                    return Ok(format!("shCapture({})", self.cmd_line_expr(args)?));
                 }
+                // Any other command in STRING position (an ARGUMENT, e.g.
+                // `echo "$(date)"`-shaped words, or the `FOO=bar echo hi`
+                // node): its output IS the string, which is a capture of the
+                // command line. This used to be a hard refusal, so a whole
+                // file failed to render over one such word.
+                self.helper("capture");
+                Ok(format!("shCapture({})", self.cmd_line_expr(args)?))
             }
             other => Err(format!("expr not in the java subset (str ctx): {other:?}")),
         }
@@ -4649,10 +4723,30 @@ impl JavaRender {
                 let inner = self.getvar_str(&name)?;
                 Ok(format!("String.valueOf(shLen({inner}))"))
             }
-            "len" => {
-                self.helper("len");
-                let inner = self.getvar_str(&name)?;
-                Ok(format!("String.valueOf(shLen({inner}))"))
+            // `${v+word}` / `${v:+word}`: "is it SET" (and non-empty for the
+            // colon form). Unlike `:-` this yields the word only when the var
+            // IS set, and "" otherwise — `test -n "${MYVAR+set}"` is the
+            // corpus's idiom for a set-ness check (variable-plus-operator).
+            // `${v+word}` / `${v:+word}`: "is it SET" (and non-empty for the
+            // colon form). Unlike `:-` this yields the word only when the var
+            // IS set, "" otherwise — `test -n "${MYVAR+set}"` is the corpus's
+            // idiom for a set-ness check (variable-plus-operator).
+            "+" | ":+" => {
+                let w = match args.get(2) {
+                    Some(IrExpr::Str(sv, _)) => jstr(&strip_quotes_once(sv)),
+                    Some(other) => self.expr_str(other)?,
+                    None => jstr(""),
+                };
+                // Java has no "unset": every assignment records its name in
+                // __SH_SET (see shEnvSet), so the NON-colon form is decidable
+                // and the colon form is just "set and non-empty".
+                self.helper("envset");
+                let v = self.getvar_str(&name)?;
+                if op.starts_with(':') {
+                    Ok(format!("((!{v}.isEmpty()) ? {w} : (\"\"))"))
+                } else {
+                    Ok(format!("(__SH_SET.contains({n}) ? {w} : (\"\"))", n = jstr(&name)))
+                }
             }
             ":-" => {
                 // the default operand arrives as a QUOTED word (the frontend
@@ -6410,6 +6504,20 @@ impl JavaRender {
         }
         for w in args.iter().skip(1) {
             for x in flatten_words(std::slice::from_ref(w)) {
+                // command-scoped env (`VAR=val cmd`): the assignment words
+                // come BEFORE the command and are UNQUOTED bash assignment
+                // syntax — `FOO='bar' echo hi` would export the literal
+                // quotes (t86_env_cmd). Word order is preserved, so the
+                // command still receives only the words after them.
+                if let IrExpr::Object(props) = x {
+                    for (k, v) in props.iter() {
+                        let val = self.expr_str(v)?;
+                        // ONE word `NAME=VALUE`: the name is bare, the value
+                        // takes its OWN quotes (`FOO=bar`, `FOO='a b'`)
+                        pieces.push((format!("({} + \"=\" + {})", jstr(k), val), false));
+                    }
+                    continue;
+                }
                 let mut ps = self.word_pieces(x)?;
                 if Self::is_multi_word(x) {
                     for p in ps.iter_mut() { p.1 = false; }
@@ -7121,6 +7229,8 @@ fn helper_src(name: &str) -> Option<&'static str> {
     }
     static String shEnvSet(String n, String v) {
         __SH_ENV.put(n, v);
+        // `${v+word}` asks whether v is SET, which "" cannot express
+        __SH_SET.add(n);
         return v;
     }
     /// `shEnvSet NAME VALUE` inside child command text: a no-op there (the
@@ -7862,7 +7972,23 @@ fn helper_src(name: &str) -> Option<&'static str> {
         return String.join(" ", a.subList((int) start, (int) end));
     }
 "#,
-        "testrc" => r#"    static boolean shTestRc(boolean b) {
+        "foreachline" => r#"    static java.util.Iterator<String> shForEachLine(String path) {
+        try {
+            java.io.BufferedReader r = new java.io.BufferedReader(
+                new java.io.InputStreamReader(new java.io.FileInputStream(path), java.nio.charset.StandardCharsets.UTF_8));
+            java.util.List<String> lines = new java.util.ArrayList<>();
+            String l;
+            while ((l = r.readLine()) != null) lines.add(l);
+            r.close();
+            return lines.iterator();
+        } catch (java.io.IOException e) {
+            // an unreadable file yields no lines (bash's loop body never runs)
+            return new java.util.ArrayList<String>().iterator();
+        }
+    }
+"#,
+        "testrc" => r#"    static java.util.Set<String> __SH_SET = java.util.Collections.synchronizedSet(new java.util.LinkedHashSet<>());
+    static boolean shTestRc(boolean b) {
         __SH_RC = b ? 0 : 1;
         return b;
     }
