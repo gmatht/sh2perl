@@ -43,3 +43,42 @@ What is NOT claimed
   Unlike arith-identity (which had a directory and no manifest), this one
   needs the file converted to a directory first.  Recorded rather than
   invented.
+
+REACHABILITY — read this before trusting the theorem
+----------------------------------------------------
+The theorem is TRUE and the code path it describes is, for shell input,
+UNREACHABLE.  Measured, not assumed:
+
+  i=0; while [ $i -lt 10 ]; do echo "$i"; i=$((i+1)); done
+    SH2_TRANSFORMS=all            -> For nodes: 0
+    SH2_TRANSFORMS=for-recovery   -> For nodes: 0
+
+Cause: `loop_cond`'s lowered-comparison arm matches
+
+    (IrExpr::Var(v, _), IrExpr::Int(b)) => (v.clone(), *b)
+
+but the shell path emits the operands ARITH-WRAPPED:
+
+    {"type":"BinOp","op":"Lt",
+     "lhs":{"type":"Arith","ast":{"type":"Var","name":"i"}},
+     "rhs":{"type":"Arith","ast":{"type":"Num","value":10}}}
+
+No producer in the tree builds the bare shape: the parser constructs no
+`IrExpr::BinOp{Lt}` at all (no hits in src/parser/ or src/ast*.rs), and
+`shir_nodes/enc.rs`'s BinOp decoder handles only Add/Sub/Mul.  So the only
+live path is the `Call{test}` STRING arm (`while [ $i -lt 10 ]` becomes a
+test call only when the shell-form lowering keeps it as text), and the
+`BinOp` arm is dead for every input the tree can produce.
+
+What the theorem therefore establishes is the CONTRACT: if loop_cond
+returns (i, Lt, 10) then the rewrite preserves the iteration trace.  It is
+the specification that makes a fix safe — not evidence that the transform
+does anything today.  This is the same "proved, no consumer" shape
+recorded in div-mod-pow2's header; the difference is that here the arm
+cannot fire at all.
+
+Fix (not made here, transform owner's call): accept
+IrExpr::Arith(ArithAst::Var(n)) and IrExpr::Arith(ArithAst::Num(b)) as
+operands in the `BinOp` arm.  After that the transform fires on real
+loops, this session's lemmas cover the live path, and tests/transform_laws.rs
+would exercise it too.
