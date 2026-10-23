@@ -172,6 +172,12 @@ pub struct Render {
     /// fn name -> main-scope values the function READS (passed as params):
     /// (zig identifier, zig parameter type)
     fn_externs: std::collections::BTreeMap<String, Vec<(String, String)>>,
+    /// variables a function assigns (bash: global unless `local`). Emitted
+    /// at MODULE scope so the fn body and main share one cell.
+    fn_globals: BTreeSet<String>,
+    /// module-scope declarations for fn_globals: (shell name, zig decl),
+    /// emitted at file scope before the function that assigns them
+    fn_global_decls: Vec<(String, String)>,
     /// set-typed arrays (`factors = set(); factors.add(x)`) — lowered to
     /// a fixed i64 array + length counter (the C backend's model)
     set_arrays: BTreeSet<String>,
@@ -440,6 +446,7 @@ impl Render {
                 m.push('_');
             }
         }
+
         if m.is_empty() || m.chars().next().unwrap().is_ascii_digit() {
             m.insert_str(0, "v_");
         }
@@ -609,6 +616,13 @@ impl Render {
 
     fn mark_read(&mut self, name: &str) {
         self.read.insert(name.to_string());
+    }
+
+    /// The module-scope identifier of a fn-assigned variable (`g_<name>`).
+    fn fn_global_ident(&mut self, name: &str) -> String {
+        let m = format!("g_{}", self.zig_ident(name));
+        self.mangle.insert(name.to_string(), m.clone());
+        m
     }
 
     fn mark_written(&mut self, name: &str) {
@@ -2031,6 +2045,7 @@ fn capture_raw(&mut self, args: &[IrExpr]) -> Option<String> {
                     .unwrap_or_default();
                 let catch = if self.error_fns.contains(&orig) { " catch \"\"" } else { "" };
                 // the fn's main-scope reads travel as trailing params
+                let mut extra = String::new();
                 let mut extra = String::new();
                 if let Some(xs) = self.fn_externs.get(&orig).cloned() {
                     for (em, _ty) in xs { extra.push_str(", "); extra.push_str(&em); }
@@ -4131,6 +4146,7 @@ fn capture_raw(&mut self, args: &[IrExpr]) -> Option<String> {
         };
         // ...plus the main-scope values the fn reads (see fn_externs): pass
         // the LOCAL identifier by the same name.
+        let mut extra = String::new();
         let mut extra = String::new();
         if let Some(xs) = self.fn_externs.get(name).cloned() {
             for (em, _ty) in xs { extra.push_str(", "); extra.push_str(&em); }
@@ -6471,6 +6487,29 @@ fn capture_raw(&mut self, args: &[IrExpr]) -> Option<String> {
                 for v in &fn_locals_now {
                     self.written.insert(v.clone());
                 }
+                // BASH DYNAMIC SCOPE, applied BEFORE the body renders: a
+                // function's writes are GLOBAL unless `local`, so they get a
+                // MODULE-scope cell (`g_<name>`) that every fn and main
+                // share. This used to be a main LOCAL, so the fn body could
+                // not see it ("use of undeclared identifier"), and the value
+                // parameter invented to bridge the gap collided with the
+                // fn's own positional parameter or a runtime helper's
+                // (`shToInt(s: …)`) — "function parameter shadows
+                // declaration", a whole build-break class.
+                for v in function_locals(body) {
+                    if self.fn_globals.insert(v.clone()) {
+                        let _ = self.fn_global_ident(&v);
+                        let m = self.mangle.get(&v).cloned().unwrap_or_else(|| self.zig_ident(&v));
+                        let ty = if self.is_num(&v) { "i64 = 0" } else { "[]const u8 = \"\"" };
+                        // the fn body is about to be rendered into self.out
+                        // and SPLICED between the earlier lines — collect the
+                        // declaration separately so it lands at FILE scope,
+                        // before this function
+                        if !self.fn_global_decls.iter().any(|(n, _)| *n == *v) {
+                            self.fn_global_decls.push((v.clone(), format!("var {m}: {ty};")));
+                        }
+                    }
+                }
                 let prev_in_fn = self.in_function;
                 self.in_function = true;
                 let mut saved = std::mem::take(&mut self.out);
@@ -6511,6 +6550,7 @@ fn capture_raw(&mut self, args: &[IrExpr]) -> Option<String> {
                 // global unless `local`): keep them global here too, EXCEPT
                 // names this fn itself declares `local` (Declare{local} or
                 // a builtin `local` word — those genuinely shadow)
+                let mut must_local_set: BTreeSet<String> = BTreeSet::new();
                 {
                     let mut must_local: BTreeSet<String> = BTreeSet::new();
                     for st in body {
@@ -6531,29 +6571,29 @@ fn capture_raw(&mut self, args: &[IrExpr]) -> Option<String> {
                             }
                         }
                     }
+                    must_local_set = must_local.clone();
                     locals.retain(|v| must_local.contains(v) || !self.top_written.contains(v));
                 }
-                // A READ of a main-scope name (`echo "hello $VAR"` where main
-                // assigns VAR, and VAR was NOT a top-level write the scanner
-                // saw) must not compile to a bare identifier: the name lives
-                // in main's scope, not the fn's. Emit a value PARAMETER for
-                // it and pass the local at every call site (zig has no
-                // closures). func-after-or-assign pinned this: the fn body
-                // rendered `.{"hello {s}", .{VAR}}` and zig rejected the
-                // undeclared identifier, so the whole file failed to build.
-                let mut externs: Vec<(String, String)> = Vec::new();
-                let read_now: Vec<String> = self.read.iter().cloned().collect();
-                for v in read_now.iter() {
-                    let m = self.zig_ident(v);
-                    if locals.contains(v) || self.fn_locals.contains(v) || v.contains('[') { continue; }
-                    if !saved.iter().any(|l| l.contains(&m)) { continue; }
-                    let ty = if self.is_num(v) { "i64" } else { "[]const u8" };
-                    externs.push((m, ty.to_string()));
+                // the extern PARAMETERS are declared by the signature: add
+                // them to the fn-local set so the body's stores don't emit a
+                // shadowing `var` (zig: "function parameter shadows
+                // declaration")
+                // register the module-scope names BEFORE the body renders
+                // (zig_ident caches the mangled spelling on first use)
+                for v in &locals {
+                    let _ = self.fn_global_ident(v);
                 }
-                if !externs.is_empty() {
-                    self.fn_externs.insert(name.clone(), externs.clone());
-                }
-                self.fn_locals.extend(locals.iter().cloned());
+                // BASH DYNAMIC SCOPE: a function's writes are GLOBAL unless
+                // `local`. Emitting them as MAIN LOCALS was the bug behind a
+                // whole build-break class: the fn body could not see them
+                // ("use of undeclared identifier"), and a value parameter
+                // invented to bridge the gap collided with the fn's own
+                // positional parameter (`n` vs `n_`) or its `local`
+                // declaration ("parameter shadows declaration"). They are
+                // emitted at MODULE scope instead (see fn_globals), so every
+                // fn and main share the one cell bash does — and a genuine
+                // `local` keeps its own fn-scope declaration.
+                self.fn_globals.extend(locals.iter().cloned());
                 let uses_stdout = saved.iter().any(|l| l.contains("stdout.print") || l.contains("stdout.flush"));
                 let uses_args = saved.iter().any(|l| l.contains("__args"));
                 // a body with `try` (bigint Managed ops, file IO) must
@@ -6563,16 +6603,41 @@ fn capture_raw(&mut self, args: &[IrExpr]) -> Option<String> {
                     self.error_fns.insert(name.clone());
                 }
                 let ret = if uses_try { "![]const u8" } else { "[]const u8" };
-                // main-scope values this fn READS travel as parameters
+                // A MAIN-SCOPE name this fn body READS and does not write
+                // here: main's local is not in the fn's scope, so it comes in
+                // as a VALUE PARAMETER (zig has no closures). Writes are
+                // module-scope cells (fn_globals) and need nothing.
+                let own_local_names: BTreeSet<String> = {
+                    let mut n: BTreeSet<String> = BTreeSet::new();
+                    for st in body {
+                        for w in stmt_written_names(st) { n.insert(w); }
+                    }
+                    n
+                };
+                // ...and never a name the emitted RUNTIME HELPERS declare
+                // (`shToInt(s: …)`, `shIntStr(n: …)`) — a module-scope value
+                // parameter with the same name shadows it at file scope, and
+                // zig rejects that ("function parameter shadows declaration").
+                let helper_params: BTreeSet<String> = ["s", "t", "n", "re", "pat", "argv", "name", "cmd", "line", "text", "b", "x", "hay", "needle", "a", "off", "len", "longest", "repl", "all", "upper", "stages", "feeds", "capture", "fmt"]
+                    .iter().map(|x| x.to_string()).collect();
                 let mut extra_sig = String::new();
                 let mut extra_body = String::new();
-                if let Some(xs) = self.fn_externs.get(name).cloned() {
-                    for (m, ty) in xs {
-                        // a value parameter named after the shell variable:
-                        // the body's identifier then resolves to it
-                        extra_sig.push_str(&format!(", {m}: {ty}"));
-                        extra_body.push_str(&format!("    _ = &{m};\n"));
-                    }
+                let mut externs: Vec<(String, String)> = Vec::new();
+                let read_now: Vec<String> = self.read.iter().cloned().collect();
+                for v in read_now.iter() {
+                    if own_local_names.contains(v) || self.fn_globals.contains(v) { continue; }
+                    let m = self.zig_ident(v);
+                    if m == "io" || m == "init" || m == "stdout" || m == "__args" { continue; }
+                    if helper_params.contains(&m) { continue; }
+                    if !self.top_written.contains(v) { continue; }
+                    if !saved.iter().any(|l| contains_word(l, &m)) { continue; }
+                    let ty = if self.is_num(v) { "i64" } else { "[]const u8" };
+                    externs.push((m.clone(), ty.to_string()));
+                    extra_sig.push_str(&format!(", {m}: {ty}"));
+                    extra_body.push_str(&format!("    _ = &{m};\n"));
+                }
+                if !externs.is_empty() {
+                    self.fn_externs.insert(name.clone(), externs);
                 }
                 let mut fntext = format!(
                     "fn {id}(init: std.process.Init, __args: []const []const u8{extra_sig}) {ret} {{\n"
@@ -6591,8 +6656,13 @@ fn capture_raw(&mut self, args: &[IrExpr]) -> Option<String> {
                 if !uses_args {
                     fntext.push_str("    _ = &__args;\n");
                 }
+                let fn_global_names: BTreeSet<String> = self.fn_global_decls.iter()
+                    .map(|(n, _)| n.clone()).collect();
                 for v in &locals {
                     let m = self.zig_ident(v);
+                    // a fn-local `var` of the same name would shadow the
+                    // module cell (zig: "local variable shadows declaration")
+                    if fn_global_names.contains(v) { continue; }
                     if self.bigint_arrays.contains(v) {
                         // bigint list → fixed Managed array + length counter
                         fntext.push_str(&format!("    var {m}: [1024]std.math.big.int.Managed = undefined;\n"));
@@ -6614,8 +6684,17 @@ fn capture_raw(&mut self, args: &[IrExpr]) -> Option<String> {
                         fntext.push_str(&format!("    var {m}: []const u8 = \"\";\n"));
                     }
                 }
-                fntext.push_str(&saved.join("\n"));
-                fntext.push('\n');
+                // module-scope declarations for this fn's globals go OUTSIDE
+                // it, before its own text
+                for (_, d) in self.fn_global_decls.drain(..).collect::<Vec<_>>() {
+                    self.pending_fns.push(format!("{d}\n"));
+                }
+                let mut body_txt = String::new();
+                for l in &saved {
+                    body_txt.push_str(l);
+                    body_txt.push('\n');
+                }
+                fntext.push_str(&body_txt);
                 fntext.push_str("}\n");
                 self.pending_fns.push(fntext);
                 // defining a function executes nothing (bash: status 0) —
@@ -7853,6 +7932,10 @@ self.emit("fn shTrimRightNl(t: []const u8) []const u8 {");
             self.emit("}");
         }
         self.emit("");
+        // (fn-assigned variables were already emitted at module scope, as
+        // `//@module` declarations, before the function that assigns them —
+        // see fn_globals)
+        self.emit("");
         // hoisted user functions render BEFORE main (zig order-free, but
         // keep the listing readable)
         let pending = std::mem::take(&mut self.pending_fns);
@@ -7878,6 +7961,10 @@ self.emit("fn shTrimRightNl(t: []const u8) []const u8 {");
         // during body rendering add their names here
         let written_now: Vec<String> = self.written.iter().cloned().collect();
         for v in &written_now {
+            // fn-assigned vars have their own module-scope cell
+            if self.fn_globals.contains(v) {
+                continue;
+            }
             // user-function locals hoist with their fn — never in main
             if self.fn_locals.contains(v) {
                 continue;
@@ -8860,6 +8947,40 @@ fn collect_set_arrays_expr(e: &IrExpr, out: &mut BTreeSet<String>) {
 
 /// Collect every variable written by statements (assign targets, declare
 /// lists, For loop vars) — the hoisted declaration set.
+
+/// Word-bounded search for `w` in `l` (`s` must not match `std`/`sh_rc`).
+fn contains_word(l: &str, w: &str) -> bool {
+    let b = l.as_bytes();
+    let wb = w.as_bytes();
+    if wb.is_empty() { return false; }
+    let mut i = 0;
+    while i + wb.len() <= b.len() {
+        if &b[i..i + wb.len()] == wb {
+            let before_ok = i == 0 || !(b[i - 1].is_ascii_alphanumeric() || b[i - 1] == b'_');
+            let after = i + wb.len();
+            let after_ok = after == b.len() || !(b[after].is_ascii_alphanumeric() || b[after] == b'_');
+            if before_ok && after_ok { return true; }
+        }
+        i += 1;
+    }
+    false
+}
+
+/// Every NAME a statement WRITES (assign target, assign()/setVar() call,
+/// declare) — the fn-body half of the fn-locals analysis.
+fn stmt_written_names(st: &IrStmt) -> Vec<String> {
+    let mut out = Vec::new();
+    match st {
+        IrStmt::Assign { targets, .. } => { for t in targets { out.push(t.var.clone()); } }
+        IrStmt::Expr(IrExpr::Call { func, args }) if func == "assign" || func == "setVar" => {
+            if let Some(IrExpr::Str(n, _)) = args.first() { out.push(n.clone()); }
+        }
+        IrStmt::Declare { vars, .. } => { for d in vars { out.push(d.name.clone()); } }
+        _ => {}
+    }
+    out
+}
+
 fn collect_written(stmts: &[IrStmt], out: &mut BTreeSet<String>) {
     for s in stmts {
         match s {
