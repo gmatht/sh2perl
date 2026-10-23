@@ -2618,8 +2618,19 @@ impl Render {
                             }
                             let v = self.call("getVar", &[IrExpr::Str(name.to_string(), crate::ir::StrStyle::DoubleQuoted)]);
                             let o = self.expr_as_num(&args[2]);
-                            let l = self.expr_as_num(&args[3]);
-                            return format!("{v}[{o}:{o}+{l}]");
+                            // An EMPTY length means "to the end of the
+                            // string" — `${s:1}` / the C frontend's
+                            // `char *t = s + 1`. Numerifying it to 0 emitted
+                            // `s[1:1+0]`, an empty slice (c-sh-go
+                            // t10_string_pointer printed "" for "ello").
+                            let l = match args.get(3) {
+                                Some(IrExpr::Str(st, _)) if st.is_empty() => None,
+                                _ => Some(self.expr_as_num(&args[3])),
+                            };
+                            return match l {
+                                Some(l) => format!("{v}[{o}:{o}+{l}]"),
+                                None => format!("{v}[{o}:]"),
+                            };
                         }
                     }
                     // \${x##*/} / basename / dirname — native os.path
@@ -3441,7 +3452,10 @@ impl Render {
     /// prepends from `bash_pos()`.
     fn bash_env(&self) -> &'static str {
         if self.in_function > 0 {
-            "dict(__sh_env(), **{k: str(v) for k, v in list(locals().items()) if isinstance(v, (str, int, float)) and not k.startswith('__')})"
+            // Same dunder rule as the emitted `__sh_env` (see there): the
+            // frontend's `___tN` temps are shell variables and must ride
+            // the child's environment; python's `__x__` dunders must not.
+            "dict(__sh_env(), **{k: str(v) for k, v in list(locals().items()) if isinstance(v, (str, int, float)) and (k.startswith('___') or not k.startswith('__'))})"
         } else {
             "__sh_env()"
         }
@@ -5924,6 +5938,41 @@ impl Render {
                         return;
                     }
                 }
+                // Herestring into an ORDINARY command (`cat <<<"$v world"`):
+                // the value is computed in PYTHON (its target is usually an
+                // Interpolate of variables), so it cannot ride the heredoc
+                // body — bash would re-expand its contents. Run the command
+                // through the stdin-carrying seam instead, which is what a
+                // herestring IS (the value plus one newline on fd 0). The
+                // pair is unverifiable without this: the redirect was
+                // dropped entirely and `cat` read the script's own stdin
+                // (zsh-sh-go t90_herestring printed nothing where the
+                // estree reference prints `hello world`).
+                let herestr = redirects
+                    .iter()
+                    .find(|r| r.fd == Some(0) && r.mode == "herestring");
+                if let Some(r) = herestr {
+                    if let Some(inner_text) = self.body_shell_text(inner) {
+                        let data = self.expr(&r.target);
+                        self.need_subprocess = true;
+                        let (env, pos) = (self.bash_env(), self.bash_pos());
+                        let run = format!(
+                            "__sh_bash_in({}, {pos}, {env}, (({}) + chr(10))).stdout.decode()",
+                            Self::py_str(&inner_text),
+                            data
+                        );
+                        if let Some(fr) = redirects.iter().find(|r| {
+                            r.fd.unwrap_or(1) == 1 && (r.mode == "w" || r.mode == "a")
+                        }) {
+                            let p = self.expr(&fr.target);
+                            let mode = if fr.mode == "a" { "\"a\"" } else { "\"w\"" };
+                            self.emit(&format!("open({p}, {mode}).write({run})"));
+                        } else {
+                            self.emit(&format!("sys.stdout.write({run})"));
+                        }
+                        return;
+                    }
+                }
                 // `>&N` dups on fd 1/2 (`echo test >&3`): resolve via the
                 // alias table — stdout/stderr targets drop the redirect
                 // (render inner bare); anything else falls through.
@@ -6193,7 +6242,14 @@ impl Render {
             self.emit("    import os");
             self.emit("    e = dict(os.environ)");
             self.emit("    for _k, _v in list(globals().items()):");
-            self.emit("        if not _k.startswith(\"__\") and isinstance(_v, (str, int, float)):");
+            // Skip python's own dunders (`__name__`, `__doc__`, this
+            // module's `__sh_*` helpers) — but NOT the frontend's temp
+            // variables, which are spelled `___tN` (THREE underscores,
+            // c-sh-go's outparam/slice channel). A blanket `__` filter
+            // dropped them from the child's environment, so a `bash -c`
+            // seam reading `$___t1` saw it unset and `printf '%c'` printed
+            // a NUL byte (c-sh-go t10_string_pointer).
+            self.emit("        if (_k.startswith(\"___\") or not _k.startswith(\"__\")) and isinstance(_v, (str, int, float)):");
             self.emit("            e[_k] = str(_v)");
             self.emit("    for _k, _v in list(globals().items()):");
             self.emit("        if not _k.startswith(\"_\") and isinstance(_v, list):");
