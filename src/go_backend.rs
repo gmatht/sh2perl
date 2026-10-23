@@ -391,6 +391,49 @@ fn mkdir_native_shape(argv: &[IrExpr]) -> Option<(bool, Vec<&IrExpr>)> {
     }
 }
 
+/// `ls`'s accepted argv shape → (all, almost-all, directory-itself, operands).
+///
+/// `-1` is admitted as a no-op: `ls` only lays out columns on a tty, and the
+/// render's stdout never is one. `-l`/`-F`/`-R`/`-t`/`-S`/`-i` change the
+/// output itself and refuse, as does any long option outside the three the
+/// template reproduces. An empty operand list is valid (`ls` = `ls .`).
+fn ls_native_shape(argv: &[IrExpr]) -> Option<(bool, bool, bool, Vec<&IrExpr>)> {
+    let (mut all, mut almost, mut dir_itself) = (false, false, false);
+    let mut ops: Vec<&IrExpr> = Vec::new();
+    let mut operands = false;
+    for a in argv {
+        match a {
+            IrExpr::Str(s, _) if !operands && s == "--" => operands = true,
+            IrExpr::Str(s, _) if !operands && s.len() > 1 && s.starts_with('-') => {
+                let Some(long) = s.strip_prefix("--") else {
+                    for c in s[1..].chars() {
+                        match c {
+                            '1' => {}
+                            'a' => all = true,
+                            'A' => almost = true,
+                            'd' => dir_itself = true,
+                            _ => return None,
+                        }
+                    }
+                    continue;
+                };
+                match long {
+                    "all" => all = true,
+                    "almost-all" => almost = true,
+                    "directory" => dir_itself = true,
+                    _ => return None,
+                }
+            }
+            _ if !fs_literal_operand(a) => return None,
+            _ => {
+                operands = true;
+                ops.push(a);
+            }
+        }
+    }
+    Some((all, almost, dir_itself, ops))
+}
+
 /// Render an `IrProgram` to Go source (package main).
 pub fn shir_to_go(prog: &IrProgram) -> String {
     let mut prog = prog.clone();
@@ -1449,6 +1492,16 @@ impl Render {
             }
             // `$(wc -c|-l|-w|-m < f)`: the count, not a subprocess.
             if let Some(v) = self.wc_capture_body(body) {
+                return Some(v);
+            }
+            // `$(grep …)`: the same os.ReadFile+regexp scan the statement
+            // form runs, answering the hits instead of the status.
+            if let Some(v) = self.grep_capture_body(body) {
+                return Some(v);
+            }
+            // `$(ls …)` / `$(cat …)`: the same native reads/listing the
+            // statement forms run, answering the bytes instead of printing.
+            if let Some(v) = self.fs_capture_body(body) {
                 return Some(v);
             }
             // `allow_builtin`: a lone `echo`/`printf` exec's natively when
@@ -4281,6 +4334,16 @@ impl Render {
         // Exec'ing a `command` binary would invent a failure bash does not
         // have.
         let noop = cmd == "command" && argv.is_empty();
+        // `cat <<EOF … EOF` / `cat <<< s`: with no FILE operand cat copies
+        // its stdin byte for byte, so the command IS the text — printing it
+        // needs neither a child nor a descriptor. Only when the heredoc is
+        // the ONE redirect: with an output target as well, the bytes belong
+        // in that file and the general wiring below handles them.
+        if cmd == "cat" && argv.is_empty() && plan.len() == 1 {
+            if let NativeRedir::StdinStr(t) = &plan[0] {
+                return vec![format!("fmt.Print({t});"), "st = 0;".to_string()];
+            }
+        }
         if noop && plan.iter().any(|r| matches!(r, NativeRedir::DupStdoutToStderr)) {
             // `2>&1` needs a command's descriptors to duplicate.
             return vec!["st = 1;".to_string()];
@@ -5746,6 +5809,11 @@ impl Render {
         if let Some(v) = self.wc_capture_body(body) {
             return v;
         }
+        // `$(grep …)`: the same os.ReadFile+regexp scan the statement form
+        // runs, answering the hits instead of the status.
+        if let Some(v) = self.grep_capture_body(body) {
+            return v;
+        }
         // Same builtin policy as capture_str: a lone `echo`/`printf` exec's
         // natively when coreutils agrees with the builtin.
         if let Some((cmd, argv)) = self.body_single_exec_opt(body, true) {
@@ -6706,6 +6774,12 @@ impl Render {
                 }
                 return;
             }
+        }
+        // `cat <<EOF … EOF` / `cat <<< s` as a plain STATEMENT: with no FILE
+        // operand cat copies its stdin byte for byte, so the command is the
+        // text the redirect already holds — formatting it is the lowering.
+        if capture.is_none() && env.is_empty() && self.stdin_cat_stmt(cmd, args, redirects) {
+            return;
         }
         // `x=$(cmd <<< s)` / `x=$(cmd <<EOF … EOF)` as an Exec-statement
         // capture: stdin fed from the string, output captured.
@@ -9877,10 +9951,327 @@ impl Render {
         true
     }
 
+    /// `ls [-1aAd] [OPERAND…]` — the names, printed from `os.Stat`/`os.ReadDir`.
+    ///
+    /// What this reproduces exactly is the shape a script SEES: `ls` only
+    /// lays out columns on a tty, and the render's stdout is never one, so
+    /// the output is one name per line. GNU's remaining rules are kept:
+    /// operands sorted, non-directories listed first, directories expanded
+    /// under a `name:` header (with a blank line between blocks) once more
+    /// than one operand was given, dotfiles hidden unless `-a`/`-A`, and
+    /// status 2 for an operand that cannot be stat'ed.
+    ///
+    /// REFUSE > GUESS: `-l` (long format), `-F` (classify), `-R`, and the
+    /// sort/selection flags have no counterpart in this template, and a glob
+    /// operand splices at run time — all keep the fork.
+    fn ls_stmt(&mut self, argv: &[IrExpr]) -> bool {
+        let id = self.new_tmp();
+        self.ls_emit(argv, None, &id)
+    }
+
+    /// `$(ls …)`: the SAME emitter writing into a `strings.Builder`, trimmed
+    /// the way the substitution trims. A statement and a capture that
+    /// disagree about ordering or headers would be a silent wrong-output
+    /// bug, so there is one template, two sinks.
+    fn ls_value(&mut self, argv: &[IrExpr]) -> Option<String> {
+        let id = self.new_tmp();
+        let buf = format!("__lsb{id}");
+        // strings.Builder's Write has a pointer receiver, so the sink is the
+        // builder's ADDRESS.
+        let sink = format!("&{buf}");
+        let saved_depth = self.depth;
+        self.depth = 0;
+        let saved = std::mem::take(&mut self.out);
+        let ok = self.ls_emit(argv, Some(&sink), &id);
+        let lines = std::mem::replace(&mut self.out, saved);
+        self.depth = saved_depth;
+        if !ok {
+            return None;
+        }
+        Some(format!(
+            "func() string {{ var {buf} strings.Builder; {} ; return strings.TrimRight({buf}.String(), \"\\n\") }}()",
+            lines.join("; ")
+        ))
+    }
+
+    /// The single `ls` template. `sink` is `None` for stdout or the name of a
+    /// `strings.Builder` to append to.
+    fn ls_emit(&mut self, argv: &[IrExpr], sink: Option<&str>, id: &str) -> bool {
+        let Some((all, almost, dir_itself, ops)) = ls_native_shape(argv) else {
+            return false;
+        };
+        let mut items = Vec::with_capacity(ops.len());
+        for op in &ops {
+            items.push(self.expr_str(op));
+        }
+        self.flush_sides();
+        // No operand is `.` — the same directory `ls` defaults to, and a
+        // single directory operand never gets a header.
+        let list = if items.is_empty() {
+            "[]string{\".\"}".to_string()
+        } else {
+            format!("[]string{{{}}}", items.join(", "))
+        };
+        let (f, d) = (format!("__lsf{id}"), format!("__lsd{id}"));
+        let (x, n) = (format!("__lsx{id}"), format!("__lsn{id}"));
+        let nm = format!("__lsnm{id}");
+        let pr = |a: &str| match sink {
+            Some(w) => format!("fmt.Fprintln({w}, {a})"),
+            None => format!("fmt.Println({a})"),
+        };
+        self.emit("st = 0;");
+        self.need_st = true;
+        self.emit(&format!("{f} := []string{{}}; {d} := []string{{}}"));
+        self.emit(&format!("for _, {x} := range {list} {{"));
+        self.depth += 1;
+        self.emit(&format!("__lsi{id}, __lse{id} := os.Stat({x})"));
+        // A directory operand is expanded unless -d asks for the entry
+        // itself; anything else is printed as the operand was written.
+        self.emit(&format!(
+            "if __lse{id} != nil {{ st = 2 }} else if __lsi{id}.IsDir() && {} {{ {d} = append({d}, {x}) }} else {{ {f} = append({f}, {x}) }}",
+            if dir_itself { "false" } else { "true" }
+        ));
+        self.depth -= 1;
+        self.emit("}");
+        self.emit(&format!("sort.Strings({f}); sort.Strings({d})"));
+        self.emit(&format!("for _, {x} := range {f} {{ {} }}", pr(&x)));
+        self.emit(&format!("for __lsk{id}, {x} := range {d} {{"));
+        self.depth += 1;
+        self.emit(&format!(
+            "if len({f})+len({d}) > 1 {{ if __lsk{id} > 0 || len({f}) > 0 {{ {} }}; {} }}",
+            pr("\"\""),
+            pr(&format!("{x} + \":\""))
+        ));
+        self.emit(&format!("__lsr{id}, __lsre{id} := os.ReadDir({x})"));
+        self.emit(&format!("if __lsre{id} != nil {{ st = 2; continue }}"));
+        self.emit(&format!("{n} := []string{{}}"));
+        self.emit(&format!("for _, __lse{id} := range __lsr{id} {{"));
+        self.depth += 1;
+        self.emit(&format!("{nm} := __lse{id}.Name()"));
+        // os.ReadDir never yields `.` or `..`, so -A needs no filter and
+        // -a only has to prepend them below.
+        if !all && !almost {
+            self.emit(&format!("if strings.HasPrefix({nm}, \".\") {{ continue }}"));
+        }
+        self.emit(&format!("{n} = append({n}, {nm})"));
+        self.depth -= 1;
+        self.emit("}");
+        if all {
+            self.emit(&format!("{n} = append([]string{{\".\", \"..\"}}, {n}...)"));
+        }
+        self.emit(&format!("sort.Strings({n})"));
+        self.emit(&format!("for _, {nm} := range {n} {{ {} }}", pr(&nm)));
+        self.depth -= 1;
+        self.emit("}");
+        true
+    }
+
+    /// `cat FILE…` — `os.ReadFile` and a write, with cat's own status rule:
+    /// an unreadable operand reports 1 and the remaining files are still
+    /// copied.
+    fn cat_stmt(&mut self, argv: &[IrExpr]) -> bool {
+        let id = self.new_tmp();
+        self.cat_emit(argv, None, &id)
+    }
+
+    /// `$(cat FILE…)`: the same reads accumulating into a builder.
+    fn cat_value(&mut self, argv: &[IrExpr]) -> Option<String> {
+        let id = self.new_tmp();
+        let buf = format!("__catb{id}");
+        let saved_depth = self.depth;
+        self.depth = 0;
+        let saved = std::mem::take(&mut self.out);
+        let sink = format!("&{buf}");
+        let ok = self.cat_emit(argv, Some(&sink), &id);
+        let lines = std::mem::replace(&mut self.out, saved);
+        self.depth = saved_depth;
+        if !ok {
+            return None;
+        }
+        Some(format!(
+            "func() string {{ var {buf} strings.Builder; {} ; return strings.TrimRight({buf}.String(), \"\\n\") }}()",
+            lines.join("; ")
+        ))
+    }
+
+    fn cat_emit(&mut self, argv: &[IrExpr], sink: Option<&str>, id: &str) -> bool {
+        // No operand and a lone `-` are stdin, and an option (`-A`/`-n`/`-v`)
+        // transforms the bytes: both keep whatever path reached them.
+        if argv.is_empty() {
+            return false;
+        }
+        for a in argv {
+            match a {
+                IrExpr::Str(s, style) => {
+                    if s == "-" || (s.len() > 1 && s.starts_with('-')) || str_expands_glob(s, style)
+                    {
+                        return false;
+                    }
+                }
+                IrExpr::Call { func, .. } if func == "brace" => return false,
+                _ => {}
+            }
+        }
+        let ops: Vec<String> = argv.iter().map(|e| self.expr_str(e)).collect();
+        self.flush_sides();
+        self.emit("st = 0;");
+        self.need_st = true;
+        let w = |b: &str| match sink {
+            Some(s) => format!("fmt.Fprint({s}, string({b}))"),
+            None => format!("fmt.Print(string({b}))"),
+        };
+        for (i, op) in ops.iter().enumerate() {
+            let b = format!("__catb{id}_{i}");
+            let e = format!("__cate{id}_{i}");
+            let wr = w(&b);
+            self.emit(&format!(
+                "if {b}, {e} := os.ReadFile({op}); {e} != nil {{ st = 1 }} else {{ {wr} }}"
+            ));
+        }
+        true
+    }
+
+    /// `cat <<EOF … EOF` / `cat <<< s` in statement position: with no FILE
+    /// operand cat reproduces its stdin byte for byte, and the redirect
+    /// already holds that text — printing it is the whole command. Any FILE
+    /// operand, any other redirect, or an option refuses and keeps the fork.
+    fn stdin_cat_stmt(&mut self, cmd: &IrExpr, args: &[IrExpr], redirects: &[IrExpr]) -> bool {
+        if !matches!(cmd, IrExpr::Str(s, _) if s == "cat") {
+            return false;
+        }
+        let stdin_operand = args.is_empty()
+            || (args.len() == 1 && matches!(&args[0], IrExpr::Str(s, _) if s == "-"));
+        if !stdin_operand || redirects.len() != 1 {
+            return false;
+        }
+        let (todo, sides, tmp) = (self.todo, self.sides.len(), self.tmp);
+        let Some(NativeRedir::StdinStr(text)) = self.native_redirect(&redirects[0]) else {
+            return false;
+        };
+        if self.todo != todo {
+            self.sides.truncate(sides);
+            self.tmp = tmp;
+            self.todo = todo;
+            return false;
+        }
+        self.flush_sides();
+        self.emit(&format!("fmt.Print({text});"));
+        if self.need_st {
+            self.emit("st = 0;");
+        }
+        true
+    }
+
+    /// `cp SRC DST` — `os.Open`/`os.Create`/`io.Copy`, keeping GNU's two
+    /// observable rules the corpus relies on: the destination is created
+    /// with the SOURCE's mode, and a DST that is an existing directory
+    /// receives `SRC`'s basename.
+    fn cp_stmt(&mut self, argv: &[IrExpr]) -> bool {
+        let Some(ops) = self.copy_pair(argv) else {
+            return false;
+        };
+        let id = self.new_tmp();
+        let (src, dst) = (format!("__cpsrc{id}"), format!("__cpdst{id}"));
+        let (d, f, e, c) = (
+            format!("__cpf{id}"),
+            format!("__cpg{id}"),
+            format!("__cpe{id}"),
+            format!("__cpc{id}"),
+        );
+        self.emit(&format!("{src} := {}; {dst} := {};", ops.0, ops.1));
+        self.emit("st = 0;");
+        self.emit(&format!(
+            "if __cpi{id}, __cpie{id} := os.Stat({dst}); __cpie{id} == nil && __cpi{id}.IsDir() {{ {dst} = filepath.Join({dst}, filepath.Base({src})) }}"
+        ));
+        self.emit(&format!("if {f}, {e} := os.Open({src}); {e} != nil {{ st = 1 }} else {{"));
+        self.depth += 1;
+        self.emit(&format!("if {d}, {e} := os.Create({dst}); {e} != nil {{ st = 1 }} else {{"));
+        self.depth += 1;
+        self.emit(&format!(
+            "if _, {c} := io.Copy({d}, {f}); {c} != nil {{ st = 1 }}"
+        ));
+        self.emit(&format!("{d}.Close()"));
+        self.emit(&format!(
+            "if __csi{id}, __csie{id} := {f}.Stat(); __csie{id} == nil {{ os.Chmod({dst}, __csi{id}.Mode()) }}"
+        ));
+        self.depth -= 1;
+        self.emit("}");
+        self.emit(&format!("{f}.Close()"));
+        self.depth -= 1;
+        self.emit("}");
+        self.need_st = true;
+        true
+    }
+
+    /// `mv SRC DST` — `os.Rename`, with GNU's directory operand rule and its
+    /// cross-device fallback (copy, then unlink the source).
+    fn mv_stmt(&mut self, argv: &[IrExpr]) -> bool {
+        let Some(ops) = self.copy_pair(argv) else {
+            return false;
+        };
+        let id = self.new_tmp();
+        let (src, dst) = (format!("__mvsrc{id}"), format!("__mvdst{id}"));
+        let (s, d, e, c) = (
+            format!("__mvf{id}"),
+            format!("__mvg{id}"),
+            format!("__mve{id}"),
+            format!("__mvc{id}"),
+        );
+        self.emit(&format!("{src} := {}; {dst} := {};", ops.0, ops.1));
+        self.emit("st = 0;");
+        self.emit(&format!(
+            "if __mvi{id}, __mvie{id} := os.Stat({dst}); __mvie{id} == nil && __mvi{id}.IsDir() {{ {dst} = filepath.Join({dst}, filepath.Base({src})) }}"
+        ));
+        // A rename that fails for any reason (EXDEV being the interesting
+        // one) falls back to the copy GNU mv performs; if that fails too the
+        // status is 1 either way, so the fallback costs nothing.
+        self.emit(&format!("if {e} := os.Rename({src}, {dst}); {e} != nil {{"));
+        self.depth += 1;
+        self.emit(&format!("if {s}, {e} := os.Open({src}); {e} != nil {{ st = 1 }} else {{"));
+        self.depth += 1;
+        self.emit(&format!("if {d}, {e} := os.Create({dst}); {e} != nil {{ st = 1 }} else {{"));
+        self.depth += 1;
+        self.emit(&format!(
+            "if _, {c} := io.Copy({d}, {s}); {c} != nil {{ st = 1 }} else if os.Remove({src}) != nil {{ st = 1 }}"
+        ));
+        self.emit(&format!("{d}.Close()"));
+        self.depth -= 1;
+        self.emit("}");
+        self.emit(&format!("{s}.Close()"));
+        self.depth -= 1;
+        self.emit("}");
+        self.depth -= 1;
+        self.emit("}");
+        self.need_st = true;
+        true
+    }
+
+    /// The `SRC DST` operand pair `cp`/`mv` accept here: exactly two literal
+    /// paths. A third operand means "move these into a directory", `-t`/`-t`
+    /// take operands of their own, and any other flag changes what the
+    /// command means — all keep the fork.
+    fn copy_pair(&mut self, argv: &[IrExpr]) -> Option<(String, String)> {
+        let mut ops: Vec<&IrExpr> = Vec::new();
+        for a in argv {
+            match a {
+                IrExpr::Str(s, _) if s.starts_with('-') => return None,
+                _ if !fs_literal_operand(a) => return None,
+                _ => ops.push(a),
+            }
+        }
+        if ops.len() != 2 {
+            return None;
+        }
+        let src = self.expr_str(ops[0]);
+        let dst = self.expr_str(ops[1]);
+        self.flush_sides();
+        Some((src, dst))
+    }
+
     /// External commands Go expresses natively, so the renderer drops the
     /// fork/exec entirely (AGENTS.md §2). Currently `rm`, `mkdir`, `touch`,
-    /// `rmdir`, `ln`, `cmp` and `sleep`; any argv outside their exact shape
-    /// falls through to `runCmd`.
+    /// `rmdir`, `ln`, `cmp`, `sleep`, `ls`, `cat`, `cp` and `mv`; any argv
+    /// outside their exact shape falls through to `runCmd`.
     fn fs_argcmd_stmt(&mut self, cmd: &str, args: &[IrExpr]) -> bool {
         // `exec` Call shape is (cmd, [argv…]), same as exec_builtin_stmt
         let argv: &[IrExpr] = match args.get(1) {
@@ -9895,6 +10286,10 @@ impl Render {
             "ln" => self.ln_stmt(argv),
             "cmp" => self.cmp_stmt(argv),
             "sleep" => self.sleep_stmt(argv),
+            "ls" => self.ls_stmt(argv),
+            "cat" => self.cat_stmt(argv),
+            "cp" => self.cp_stmt(argv),
+            "mv" => self.mv_stmt(argv),
             "grep" => {
                 let Some(v) = self.grep_expr(argv) else {
                     return false;
@@ -9912,18 +10307,61 @@ impl Render {
     /// STATUS) that writes grep's stdout as it scans: `os.ReadFile` +
     /// `regexp` instead of forking grep (AGENTS.md §2 — the stdlib call is
     /// the target-native lowering, the child is the fallback).
-    ///
+    fn grep_expr(&mut self, argv: &[IrExpr]) -> Option<String> {
+        self.grep_scan(argv, GrepOut::Status)
+    }
+
+    /// `$(grep …)` — the same scan as `grep_expr`, yielding grep's stdout as
+    /// a Go string instead of printing it. A capture and a statement form
+    /// that disagree about matching are a silent wrong-value bug, so this
+    /// must stay ONE template (`grep_scan`), never a second copy.
+    fn grep_capture_body(&mut self, body: &[IrStmt]) -> Option<String> {
+        let args = lone_exec_args(body)?;
+        match args.first() {
+            Some(IrExpr::Str(c, _)) if c == "grep" => {}
+            _ => return None,
+        }
+        let argv: &[IrExpr] = match args.get(1) {
+            Some(IrExpr::Array(items)) => items.as_slice(),
+            _ => &[],
+        };
+        self.grep_scan(argv, GrepOut::Value)
+    }
+
+    /// `$(ls …)` / `$(cat …)` as a Go string, or `None` when the body is
+    /// anything else. Delegates to the statement template so the capture and
+    /// the statement can never disagree.
+    fn fs_capture_body(&mut self, body: &[IrStmt]) -> Option<String> {
+        let args = lone_exec_args(body)?;
+        let Some(IrExpr::Str(cmd, _)) = args.first() else {
+            return None;
+        };
+        let cmd = cmd.clone();
+        let argv: &[IrExpr] = match args.get(1) {
+            Some(IrExpr::Array(items)) => items.as_slice(),
+            _ => &[],
+        };
+        match cmd.as_str() {
+            "ls" => self.ls_value(argv),
+            "cat" => self.cat_value(argv),
+            _ => None,
+        }
+    }
+
     /// REFUSE > GUESS, because a wrong status silently flips an `if`/`&&`
     /// arm's direction:
-    ///   * flags — only `-q -n -c -v -i -w -x -E -F` (the ones this
-    ///     template reproduces exactly). `-H`/`-h`/`-l`/`-L`/`-o`/`-r`/
-    ///     `-A`/`-B`/`-C`/`-m`/`-f`/`-e` have no exact counterpart here.
+    ///   * flags — only `-q -n -c -v -i -w -x -E -F` and the single-operand
+    ///     name flags `-l -L -h -H` (the ones this template reproduces
+    ///     exactly). `-o`/`-r`/`-A`/`-B`/`-C`/`-m`/`-f`/`-e` have no exact
+    ///     counterpart here.
     ///   * operands — exactly one FILE (grep prefixes `name:` for several),
     ///     no `-` operand (stdin), no glob metacharacters (the child would
     ///     get the WORD, the glob is the shell's job), no option-like path.
-    fn grep_expr(&mut self, argv: &[IrExpr]) -> Option<String> {
+    fn grep_scan(&mut self, argv: &[IrExpr], out: GrepOut) -> Option<String> {
         let (mut quiet, mut numbered, mut counted) = (false, false, false);
         let (mut invert, mut word, mut whole) = (false, false, false);
+        let (mut no_prefix, mut force_prefix) = (false, false);
+        let mut list_mode = 0u8;
         let mut flags = String::new();
         let mut i = 0usize;
         while let Some(IrExpr::Str(a, _)) = argv.get(i) {
@@ -9945,11 +10383,23 @@ impl Render {
                     'F' => flags.push('F'),
                     'w' => word = true,
                     'x' => whole = true,
+                    'l' => list_mode = 1,
+                    'L' => list_mode = 2,
+                    'h' => no_prefix = true,
+                    'H' => force_prefix = true,
                     _ => return None,
                 }
             }
             i += 1;
         }
+        // `-l` answers "which file", not "which lines": the per-hit text and
+        // the `-c` total are both superseded. `-L` (files WITHOUT a match)
+        // additionally prints the name for a file grep could not READ, which
+        // this template reports as status 2 instead — so `-L` stays refused.
+        if list_mode == 2 || (list_mode == 1 && (counted || numbered)) {
+            return None;
+        }
+        let only_name = list_mode == 1;
         let pat = match argv.get(i) {
             Some(IrExpr::Str(p, _)) if !p.starts_with('-') || flags.contains('E') => p.clone(),
             _ => return None,
@@ -9976,31 +10426,64 @@ impl Render {
         let file = self.expr_str(file_arg);
         let idx = if numbered { "__gi, __gl" } else { "_, __gl" };
         let inv = if invert { "!" } else { "" };
-        let body = if numbered {
-            "__go += fmt.Sprintf(\"%d:%s\\n\", __gi+1, __gl)"
+        // `-H` prefixes every hit with the operand as written; with one
+        // operand grep does NOT prefix by default, and `-h` never does.
+        let line = if numbered {
+            "fmt.Sprintf(\"%d:%s\\n\", __gi+1, __gl)".to_string()
         } else {
-            "__go += __gl + \"\\n\""
+            "__gl + \"\\n\"".to_string()
         };
-        // `-q`/`-c` print nothing per hit; `-c` prints the total afterwards.
-        let hit = if quiet || counted { "" } else { body };
+        let body = if force_prefix && !no_prefix {
+            format!("__go += {file} + \":\" + {line}")
+        } else {
+            format!("__go += {line}")
+        };
+        // `-q`/`-c` print nothing per hit; `-c` prints the total afterwards;
+        // `-l` prints the name once, after the scan.
+        let hit = if quiet || counted || only_name {
+            ""
+        } else {
+            body.as_str()
+        };
         let count_out = if counted {
             "; __go = fmt.Sprintf(\"%d\\n\", __gc)"
         } else {
             ""
         };
+        let name_out = if only_name {
+            format!("; if __gc > 0 {{ __go = {file} + \"\\n\" }}")
+        } else {
+            String::new()
+        };
+        // Status mode prints the hits and answers grep's exit status; value
+        // mode answers the hits themselves (`$(grep …)` strips the trailing
+        // newlines the printer would have written anyway).
+        let (sig, tail) = match out {
+            GrepOut::Status => (
+                "func() int64",
+                "fmt.Print(__go); if __gc > 0 { return 0 }; return 1",
+            ),
+            GrepOut::Value => (
+                "func() string",
+                "return strings.TrimRight(__go, \"\\n\")",
+            ),
+        };
+        let err = if out == GrepOut::Value { "\"\"" } else { "2" };
         Some(format!(
-            "func() int64 {{ __gre, __gce := regexp.Compile({re}); if __gce != nil {{ return 2 }}; \
-             __gd, __gde := os.ReadFile({file}); if __gde != nil {{ return 2 }}; \
+            "{sig} {{ __gre, __gce := regexp.Compile({re}); if __gce != nil {{ return {err} }}; \
+             __gd, __gde := os.ReadFile({file}); if __gde != nil {{ return {err} }}; \
              __gls := strings.Split(string(__gd), \"\\n\"); \
              if len(__gls) > 0 && __gls[len(__gls)-1] == \"\" {{ __gls = __gls[:len(__gls)-1] }}; \
              __gc := 0; __go := \"\"; \
              for {idx} := range __gls {{ __gm := __gre.MatchString(__gl); \
-             if {inv}__gm {{ __gc++{hit} }} }}{count_out}; \
-             fmt.Print(__go); if __gc > 0 {{ return 0 }}; return 1 }}()",
+             if {inv}__gm {{ __gc++{hit} }} }}{count_out}{name_out}; \
+             {tail} }}()",
+            sig = sig,
             re = Self::go_str(&re),
             file = file,
             idx = idx,
             inv = inv,
+            err = err,
             // the per-hit statement only exists when something is printed
             hit = if hit.is_empty() {
                 String::new()
@@ -10008,6 +10491,8 @@ impl Render {
                 format!("; {hit}")
             },
             count_out = count_out,
+            name_out = name_out,
+            tail = tail,
         ))
     }
 
@@ -12475,6 +12960,14 @@ enum Opnd {
     Num,
     Str,
     Dyn,
+}
+
+/// What a `grep` scan answers: the exit STATUS (`grep …` as a command /
+/// condition) or grep's STDOUT as a Go string (`$(grep …)`).
+#[derive(Clone, Copy, PartialEq)]
+enum GrepOut {
+    Status,
+    Value,
 }
 
 fn numify(e: String, k: Opnd, _r: &mut Render) -> String {
@@ -15363,7 +15856,11 @@ mod tests {
     fn untyped_var_uses_any() {
         let out = render("y=$(ls)\necho \"$y\"\n");
         assert!(out.contains("var y string"), "{out}");
-        assert!(out.contains("capCmd(exec.Command("), "{out}");
+        // `$(ls)` reads the directory through the stdlib now — the capture
+        // and the statement form share the `ls_emit` template (a second
+        // copy would let them disagree about ordering or headers).
+        assert!(!out.contains("exec.Command(\"ls\")"), "{out}");
+        assert!(out.contains("os.ReadDir("), "{out}");
         assert!(out.contains("fmt.Println(fmt.Sprintf(\"%v\", y))"), "{out}");
     }
 
