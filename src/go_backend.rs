@@ -5714,6 +5714,228 @@ impl Render {
         )])
     }
 
+    /// `while read [-r] VAR…; do …; done < FILE` — a native `bufio.Scanner`
+    /// iteration whose BODY renders as Go statements. This is the shell's
+    /// line-reading idiom, and forking a whole `bash -c` loop (the previous
+    /// lowering) meant re-parsing and re-running the body as shell text: no
+    /// scoping, no types, and one process per loop.
+    ///
+    /// `read`'s semantics are far wider than what this template reproduces,
+    /// so REFUSE > GUESS — everything below keeps the fork:
+    ///   * a missing `-r` (bash then eats backslash-newline continuations),
+    ///   * any flag other than `-r` (`-n`/`-d`/`-p`/`-t`/`-u`/`-a`/`-s`),
+    ///   * an `IFS` that is neither empty nor a SINGLE non-blank character,
+    ///   * a non-literal `IFS`, or any other `VAR=v` prefix on `read`,
+    ///   * a non-literal variable name, or an array/hash target,
+    ///   * SEVERAL variables under a whitespace IFS (bash collapses runs
+    ///     of IFS whitespace and lets the last variable take the remainder;
+    ///     only the single-variable shape is reproduced here).
+    fn while_read_redirect(
+        &mut self,
+        inner: &[IrStmt],
+        redirects: &[crate::ir::IrRedirect],
+    ) -> bool {
+        let [IrStmt::While { cond, body }] = inner else {
+            return false;
+        };
+        if redirects.len() != 1 {
+            return false;
+        }
+        let r = &redirects[0];
+        if r.mode != "r" || !matches!(r.fd, None | Some(0)) {
+            return false;
+        }
+        let IrExpr::Call { func, args } = cond else {
+            return false;
+        };
+        if func != "builtin" && func != "exec" {
+            return false;
+        }
+        let (Some(IrExpr::Str(cmd, _)), Some(IrExpr::Array(argv))) = (args.first(), args.get(1))
+        else {
+            return false;
+        };
+        if cmd != "read" {
+            return false;
+        }
+        // `read -r a b` — every flag is refused except `-r`, which is
+        // REQUIRED: without it bash interprets backslashes, and this
+        // template hands the line over verbatim.
+        let mut dash_r = false;
+        let mut names: Vec<String> = Vec::new();
+        for a in argv {
+            let IrExpr::Str(s, _) = a else {
+                return false;
+            };
+            if s == "-r" {
+                dash_r = true;
+            } else if s.starts_with('-') {
+                return false;
+            } else {
+                names.push(s.clone());
+            }
+        }
+        if !dash_r || names.is_empty() {
+            return false;
+        }
+        // `IFS=: read …` arrives as the command-scoped env prefix.
+        let mut ifs: Option<String> = None;
+        if let Some(IrExpr::Object(props)) = args.get(2) {
+            for (k, v) in props {
+                let IrExpr::Str(val, _) = v else {
+                    return false;
+                };
+                if k != "IFS" {
+                    return false;
+                }
+                ifs = Some(val.clone());
+            }
+        }
+        // `None` = the default IFS (whitespace), `Some(None)` = `IFS=`
+        // (no splitting at all), `Some(Some(c))` = split on one char.
+        let sep: Option<Option<char>> = match ifs.as_deref() {
+            None => Some(None),
+            Some("") => Some(Some('\0')),
+            Some(s) => {
+                let mut cs = s.chars();
+                match (cs.next(), cs.next()) {
+                    (Some(c), None) if c != ' ' && c != '\t' && c != '\n' => Some(Some(c)),
+                    _ => None,
+                }
+            }
+        };
+        let Some(sep) = sep else {
+            return false;
+        };
+        if sep.is_none() && names.len() > 1 {
+            return false;
+        }
+        for n in &names {
+            if self.is_arr(n) || self.functions.contains(n) {
+                return false;
+            }
+        }
+        let (todo, sides, tmp) = (self.todo, self.sides.len(), self.tmp);
+        let path = self.expr_str(&r.target.clone());
+        if self.todo != todo {
+            self.sides.truncate(sides);
+            self.tmp = tmp;
+            return false;
+        }
+        let id = self.new_tmp();
+        let (rf, sc, ln) = (
+            format!("__wrf{id}"),
+            format!("__wsc{id}"),
+            format!("__wln{id}"),
+        );
+        let run = format!("__run{}", self.new_tmp());
+        self.flush_sides();
+        self.need_st = true;
+        self.emit(&format!(
+            "if {rf}, __wre{id} := os.Open({path}); __wre{id} != nil {{ st = 1 }} else {{"
+        ));
+        self.depth += 1;
+        self.emit(&format!("{sc} := bufio.NewScanner({rf})"));
+        // bash's `read` has no line-length limit; Scanner's default token
+        // cap is 64 KiB, so raise it to the same order as a shell variable.
+        self.emit(&format!(
+            "{sc}.Buffer(make([]byte, 0, 64*1024), 16*1024*1024)"
+        ));
+        self.emit(&format!("{run} := false"));
+        self.emit(&format!("for {sc}.Scan() {{"));
+        self.depth += 1;
+        self.emit(&format!("{run} = true"));
+        self.emit(&format!("{ln} := {sc}.Text()"));
+        self.emit_read_assigns(&names, &ln, sep, &id);
+        for s in body {
+            self.stmt(s);
+        }
+        self.depth -= 1;
+        self.emit("}");
+        // bash's `while` status is the last body command's, or 0 when the
+        // body never ran — the same rule the generic While arm applies.
+        self.emit(&format!("if !{run} {{ st = 0 }}"));
+        self.emit(&format!("if {sc}.Err() != nil {{ st = 1 }}"));
+        self.emit(&format!("{rf}.Close()"));
+        self.depth -= 1;
+        self.emit("}");
+        true
+    }
+
+    /// The `read` assignments of one line: `names` (already validated) from
+    /// the line text `ln`, under a resolved IFS (`sep`, see
+    /// `while_read_redirect`).
+    fn emit_read_assigns(
+        &mut self,
+        names: &[String],
+        ln: &str,
+        sep: Option<char>,
+        id: &str,
+    ) {
+        // One literal-value store, typed by the variable's home: `any`
+        // boxes the string, `int64` coerces it (bash's `read x` on an
+        // arithmetic variable still stores the TEXT, but every read of it
+        // is numeric — s2i is the same conversion those reads perform).
+        // The write is counted as the STRING it really is (or as an arith
+        // write for the int home), which is what lets an otherwise
+        // string-only variable hoist as Go `string` instead of `any` plus
+        // an `s2s(v)` at every read.
+        let store = |this: &mut Self, n: &str, val: &str| {
+            let m = this.go_ident(n);
+            if this.declared_go_int(n) {
+                this.mark_arith(n);
+                this.emit(&format!("{m} = s2i({val});"));
+            } else {
+                this.mark_str_written(n);
+                this.emit(&format!("{m} = {val};"));
+            }
+            let sync = this.sync_inline(n);
+            if !sync.is_empty() {
+                this.emit(&sync);
+            }
+        };
+        match sep {
+            // Default IFS: leading and trailing IFS whitespace is stripped
+            // and the rest is the value (one variable takes the remainder).
+            None => store(self, &names[0], &format!("strings.Trim({ln}, \" \\t\")")),
+            // `IFS=` — no field splitting and no stripping at all.
+            Some('\0') => store(self, &names[0], ln),
+            // `IFS=c`: SplitN keeps the remainder (separators intact) in the
+            // last field and yields nothing for the fields past the end,
+            // which is exactly bash's `read a b c` assignment.
+            Some(c) => {
+                self.emit(&format!(
+                    "__wrv{id} := strings.SplitN({ln}, {}, {})",
+                    Self::go_str(&c.to_string()),
+                    names.len()
+                ));
+                for (i, n) in names.iter().enumerate() {
+                    let m = self.go_ident(n);
+                    let int_home = self.declared_go_int(n);
+                    if int_home {
+                        self.mark_arith(n);
+                    } else {
+                        self.mark_str_written(n);
+                    }
+                    let zero = if int_home { "0" } else { "\"\"" };
+                    self.emit(&format!("{m} = {zero};"));
+                    let val = format!("__wrv{id}[{i}]");
+                    if int_home {
+                        self.emit(&format!(
+                            "if len(__wrv{id}) > {i} {{ {m} = s2i({val}) }}"
+                        ));
+                    } else {
+                        self.emit(&format!("if len(__wrv{id}) > {i} {{ {m} = {val} }}"));
+                    }
+                    let sync = self.sync_inline(n);
+                    if !sync.is_empty() {
+                        self.emit(&sync);
+                    }
+                }
+            }
+        }
+    }
+
     /// `redirect(Arrow(body), [redirs])` in statement position, lowered
     /// natively when the body is exactly one external exec. Speculative:
     /// the render state is rolled back when it refuses.
@@ -7948,6 +8170,18 @@ impl Render {
                             self.emit(&line);
                             return;
                         }
+                    }
+                    self.sides.truncate(sides);
+                    self.tmp = tmp;
+                    self.todo = todo;
+                }
+                // `while read -r VAR; do …; done < file` — the loop becomes
+                // a native scanner iteration over the file, with the body
+                // rendered as Go statements (see `while_read_redirect`).
+                {
+                    let (todo, sides, tmp) = (self.todo, self.sides.len(), self.tmp);
+                    if self.while_read_redirect(inner, redirects) {
+                        return;
                     }
                     self.sides.truncate(sides);
                     self.tmp = tmp;
