@@ -566,6 +566,30 @@ impl JavaRender {
             IrStmt::Expr(e) => self.expr_stmt(e),
             IrStmt::Assign { targets, expr, .. } => {
                 let t = targets.first().ok_or("assign: no target")?;
+                // `j=$(($j*$i))` arrives as Assign{j, Call{arith,"$j*$i"}}.
+                // As a VALUE that call is a bash child (`shCapture("echo
+                // $((...))")`), and a child never sees the java fields — the
+                // loop printed an empty line (047_for_arith). Parse the text
+                // natively and store the i64 through the string model.
+                if let IrExpr::Call { func: af, args: aa, .. } = expr {
+                    if af == "arith" {
+                        if let Some(IrExpr::Str(text, _)) = aa.first() {
+                            // `$j*$i` -> `j*i`: the native arith parser takes
+                            // BARE names (the `$` form is the runtime's
+                            // substitute-and-reparse path, a child)
+                            let bare: String = text.chars().filter(|c| *c != '$').collect();
+                            if let Some(ast) = crate::shir::parse_arith_native(text)
+                                .or_else(|| crate::shir::parse_arith_native(&bare)) {
+                                let code = self.arith(&ast)?;
+                                let sv = sanitize(&t.var);
+                                self.ensure_field(&t.var);
+                                self.emit(&format!("__v_{sv} = String.valueOf({code});"));
+                                self.emit("__SH_RC = 0;");
+                                return Ok(());
+                            }
+                        }
+                    }
+                }
                 // `((i++))` / `((++i))` arrive as Assign{i, Arith(IncDec)}
                 // (the estree contract: a NATIVE postfix update, not a
                 // value assignment). Rendering the value back (`__v_i =
@@ -684,6 +708,41 @@ impl JavaRender {
                 Ok(())
             }
             IrStmt::While { cond, body } => {
+                // A `let EXPR` / `(( EXPR ))` condition is JAVA STATE: the
+                // child form (`shRun("let i <= n")`) can never see the java
+                // fields, so the loop spins forever (092_for_arith_func's
+                // timeout). Parse it natively and test in-process.
+                if let Ok(c) = self.arith_cond_bool(cond) {
+                    if c.contains("shNum(") || !c.contains("shRun(") {
+                        let lb = format!("__lastA{}", { self.tmp_seq += 1; self.tmp_seq });
+                        self.emit(&format!("long {lb} = __SH_RC;"));
+                        self.block_open(&format!("while ({c}) {{"));
+                        let before = self.out.len();
+                        for b in body { self.stmt(b)?; }
+                        // code after a break/continue in the body would be
+                        // unreachable java — inspect the LINES the body
+                        // emitted (a chain prints `… break;` then the chain's
+                        // own closing `}`, and the IR Debug of a break chain
+                        // does not say "Break")
+                        let diverges = self.out[before..].iter().any(|l| {
+                            let t = l.trim();
+                            t.ends_with("break;") || t.ends_with("continue;")
+                                || t.contains("System.exit(") || t.starts_with("return ")
+                        });
+                        if !diverges { self.emit(&format!("{lb} = __SH_RC;")); }
+                        self.block_close();
+                        if !diverges { self.emit(&format!("__SH_RC = {lb};")); }
+                        return Ok(());
+                    }
+                }
+                // a body ending in break/continue/return exits the loop: the
+                // status shadow written AFTER the body would be unreachable
+                // java (parse-break-or, 096_head_procsub)
+                // The status shadow written AFTER the body is unreachable java
+                // when the body ends in break/continue/exit. (Debug prints a
+                // `break` chain as `BinOp { lhs: Call { func: "break" } }`, not
+                // as `Break`, so inspect the RENDERED lines, not the IR.)
+
                 // bash: the loop's status is the last BODY command's status
                 // (or 0), never the terminating condition's — keep a
                 // shadow and restore it when the condition turns false.
@@ -700,11 +759,27 @@ impl JavaRender {
                 // a body ending in a jump (break/continue/return/exit) never
                 // falls through — emitting the shadow update after it is a
                 // Java unreachable-statement error.
-                let diverged = self.out.last().map(|l| {
-                    let t = l.trim();
-                    t.ends_with("break;") || t.ends_with("continue;")
-                        || t.starts_with("return ") || t.contains("System.exit(")
-                }).unwrap_or(false);
+                // inspect every line of the block just emitted (an emitted
+                // `break;` can sit inside a chain's `if` — its closing `}` is
+                // the last line, so looking only at the LAST line missed it
+                // and the status shadow became unreachable java: parse-break-or)
+                let diverged = {
+                    // only the lines the BODY contributed (the loop head and
+                    // the condition epilogue are ours), and a `break;` may be
+                    // followed by a chain's closing `}`
+                    let mark = self.out.len();
+                    let _ = mark;
+                    let mut d = false;
+                    for l in self.out.iter().rev() {
+                        let t = l.trim();
+                        if t.ends_with("break;") || t.ends_with("continue;")
+                            || t.starts_with("return ") || t.contains("System.exit(") {
+                            d = true;
+                        }
+                        if t.starts_with("boolean __c") || t.starts_with("long __lastBody") { break; }
+                    }
+                    d
+                };
                 if !diverged {
                     self.emit(&format!("{lb} = __SH_RC;"));
                 }
@@ -730,11 +805,71 @@ impl JavaRender {
                 Err("shaderize (autoshaderization) not supported by the Java backend".into())
             }
             IrStmt::For { var, iter, body } => {
+                // A body that is JAVA STATE (arith assigns, mapfile, a call
+                // to a java-state fn) must run in-process: as child text it
+                // saw stale variables (echo of an arithmetic assignment in a
+                // child printed nothing - 047_for_arith). Text stays the
+                // default: it carries child-local loop variables faithfully.
+                // JAVA-STATE BODY => in-process loop, ALWAYS. The text path
+                // (below) also renders a body as child text and that is what
+                // a `j=$(($j*$i))` in the body became (047). The iterable
+                // being a literal `{1..5}` is irrelevant: child text sees
+                // stale java variables whatever the list is.
+                if body.iter().any(|b| Self::stmt_is_java_state(b)) {
+                    let items = self.for_items(iter)?;
+                    let sv = sanitize(var);
+                    self.fields.insert(sv.clone());
+                    self.tmp_seq += 1;
+                    let iv = format!("__fl{}", self.tmp_seq);
+                    let sep = '\u{1}';
+                    let plain = !items.contains("shSplit(") && !items.contains(sep) && !items.contains("__SH_ARGV");
+                    let list = if plain {
+                        // `$(seq 2 4)` renders as the numbers 2, 3, 4 — an
+                        // int in a String[] literal is a javac error
+                        // ("int cannot be converted to String", t58)
+                        let strs: Vec<String> = items.split(',')
+                            .map(|x| { let t = x.trim(); if !t.is_empty() && t.parse::<i64>().is_ok() { format!("\"{t}\"") } else { t.to_string() } })
+                            .collect();
+                        format!("List<String> {iv} = new ArrayList<>(List.of(new String[]{{{}}}));", strs.join(", "))
+                    } else {
+                        let mut l = String::new();
+                        for piece in items.split(sep) {
+                            if piece.is_empty() { continue; }
+                            if let Some(r) = piece.strip_prefix("String.join(\" \", shSplit(") {
+                                let inner = r.strip_suffix("))").unwrap_or(r);
+                                l.push_str(&format!("{iv}.addAll(shSplit({inner}));"));
+                            } else if piece.starts_with('"') || piece.starts_with('(') {
+                                l.push_str(&format!("{iv}.add({piece});"));
+                            } else {
+                                l.push_str(&format!("{iv}.addAll({piece});"));
+                            }
+                        }
+                        format!("List<String> {iv} = new ArrayList<>(); {l}")
+                    };
+                    self.tmp_seq += 1;
+                    let ev = format!("__it{}", self.tmp_seq);
+                    self.block_open("{");
+                    self.emit(&list);
+                    self.block_open(&format!("for (String {ev} : {iv}) {{"));
+                    self.emit(&format!("__v_{sv} = {ev};"));
+                    for b in body { self.stmt(b)?; }
+                    self.block_close();
+                    self.block_close();
+                    return Ok(());
+                }
                 let items = self.for_items(iter)?;
                 self.fields.insert(sanitize(var));
                 self.tmp_seq += 1;
                 let itv = format!("__it{}", self.tmp_seq);
                 self.emit(&format!("__v_{} = \"\";", sanitize(var)));
+                // numeric elements (seq 2 4 -> 2, 3, 4) need STRING literals:
+                // an int inside `new String[] {...}` is a javac error
+                let items = {
+                    let strs: Vec<String> = items.split(',')
+                        .map(|x| { let t = x.trim(); if !t.is_empty() && t.parse::<i64>().is_ok() { format!("{}", jstr(t)) } else { t.to_string() } })
+                        .collect();
+                    strs.join(", ")
+                };
                 let runtime_list = items.contains('\u{1}') || items.contains("shSplit(")
                    || items.contains("__SH_ARGV");
                 if runtime_list {
@@ -1133,7 +1268,22 @@ impl JavaRender {
                 Ok(())
             }
             IrStmt::Ext(node) => Err(format!("ext node not supported by the java renderer: {node:?}")),
-            IrStmt::ForInit { .. } => Err("C-style for not supported by the java renderer (strip_cfor should have lowered it)".into()),
+            // `for (( i=2; i<=n; i++ ))`: the frontend keeps the C-style loop
+            // as ForInit, and the arith CONDITION arrives as a `let` word.
+            // Rendering it natively (not refusing) matters: the refusal made
+            // the enclosing function render as text, and the `let i <= n` test
+            // re-ran a bash child per iteration that never saw the java-side
+            // `i` — the loop spun forever and the gate reported a TIMEOUT
+            // (092_for_arith_func).
+            IrStmt::ForInit { init, cond, step, body } => {
+                for st in init { self.stmt(st)?; }
+                let c = self.arith_cond_bool(cond)?;
+                self.block_open(&format!("while ({c}) {{"));
+                for st in body { self.stmt(st)?; }
+                for st in step { self.stmt(st)?; }
+                self.block_close();
+                Ok(())
+            }
             IrStmt::Try { .. } => Err("Try not supported by the java renderer".into()),
             IrStmt::Select { .. } => Err("Select not supported by the java renderer".into()),
             IrStmt::SetChildError(e) => {
@@ -1145,6 +1295,65 @@ impl JavaRender {
             IrStmt::Asm { .. } => Err("asm not supported by the java renderer".into()),
             IrStmt::Label(_) | IrStmt::Goto(_) => Err("goto not supported by the java renderer".into()),
         }
+    }
+
+    /// An ITERABLE that names java-side variables (`{1..5}` is literal, but a
+    /// body doing arithmetic over `$i` needs the java loop).
+    fn iter_is_java_state(iter: &IrExpr) -> bool {
+        let t = format!("{iter:?}");
+        t.contains("getVar") || t.contains("Var(\"" )
+    }
+
+    /// Does this statement read or write JAVA STATE (so a bash-child text
+    /// rendering would see stale/empty variables)?
+    fn stmt_is_java_state(st: &IrStmt) -> bool {
+        match st {
+            IrStmt::Assign { expr, .. } => matches!(expr, IrExpr::Arith(_))
+                || matches!(expr, IrExpr::Call { func, .. } if func == "arith")
+                || Self::expr_needs_native(expr),
+            IrStmt::Declare { .. } | IrStmt::DeclareArray { .. } => true,
+            IrStmt::Expr(e) => Self::expr_needs_native(e) || matches!(e, IrExpr::Arith(_))
+                || matches!(e, IrExpr::Call { func, .. } if func == "arith"),
+            IrStmt::If { then, .. } => then.iter().any(Self::stmt_is_java_state),
+            other => Self::body_needs_native(std::slice::from_ref(other)),
+        }
+    }
+
+    /// A loop CONDITION as a Java boolean. `let EXPR` (what the frontend
+    /// emits for a C-style `for` condition) and `(( EXPR ))` parse with the
+    /// native arithmetic parser, so the test runs in-process against the
+    /// java fields — a bash child would never see them.
+    fn arith_cond_bool(&mut self, cond: &IrExpr) -> Result<String, String> {
+        if let IrExpr::Call { func, args, .. } = cond {
+            if func == "builtin" || func == "exec" {
+                if let Some(IrExpr::Str(c, _)) = args.first() {
+                    if c == "let" {
+                        let words: Vec<String> = args.iter().skip(1)
+                            .flat_map(|a| flatten_words(std::slice::from_ref(a)))
+                            .filter_map(|w| match w { IrExpr::Str(t, _) => Some(t.clone()), _ => None })
+                            .collect();
+                        let text = words.join(" ");
+                        if let Some(ast) = crate::shir::parse_arith_native(&text) {
+                            let e = self.arith(&ast)?;
+                            return Ok(format!("({e}) != 0"));
+                        }
+                        return self.cond_bool(cond);
+                    }
+                }
+            }
+            if func == "arith" {
+                if let Some(IrExpr::Str(t, _)) = args.first() {
+                    if let Some(ast) = crate::shir::parse_arith_native(t) {
+                        let e = self.arith(&ast)?;
+                        return Ok(format!("({e}) != 0"));
+                    }
+                }
+            }
+        }
+        if let Some(ast) = crate::shir::parse_arith_native(&format!("{cond:?}")) {
+            let _ = ast;
+        }
+        self.cond_bool(cond)
     }
 
     fn case(&mut self, disc: &IrExpr, clauses: &[IrCaseClause]) -> Result<(), String> {
@@ -1819,7 +2028,31 @@ impl JavaRender {
         // the text — their byte behavior matches bash's).
         let mut parts = Vec::new();
         for st in stages {
-            parts.push(self.stage_expr(st)?);
+            // a LOOP stage (`while read …; done < f | sort`) is bash text of
+            // its own: the child's fd 0 is the redirect target and its stdout
+            // rides the pipe. stage_expr has no arm for the
+            // Expr(redirect(loop)) node and silently produced EMPTY text.
+            let mut handled = false;
+            if st.len() == 1 {
+                // the stage is `redirect(Arrow([Expr(Call{whileLoop})]), …)`:
+                // render the loop as TEXT and put the redirect ops outside it
+                if let Some((t, tail)) = self.loop_stage_text(&st[0]) {
+                    parts.push(format!("\"{{ \" + {t} + \" ; }}\" + {tail} + \" \""));
+                    handled = true;
+                }
+                if !handled {
+                    if let IrStmt::While { cond, body } = &st[0] {
+                        let one = IrStmt::Expr((*cond).clone());
+                        if let Ok(t) = self.whileloop_text(std::slice::from_ref(&one), body) {
+                            parts.push(t);
+                            handled = true;
+                        }
+                    }
+                }
+            }
+            if !handled {
+                parts.push(self.stage_expr(st)?);
+            }
         }
         let line = format!("({})", parts.join(") + \" | \" + ("));
         match capture {
@@ -1885,6 +2118,21 @@ impl JavaRender {
             }
             [IrStmt::Expr(IrExpr::Call { func, args, .. })] if func == "grepMatches" => {
                 self.grep_text(args)
+            }
+            [IrStmt::Expr(IrExpr::Call { func, args, .. })]
+                if func == "redirect" && Self::pipeline_stage_is_loop(args) =>
+            {
+                // a PIPE-fed loop (`while read …; done < f | sort`): the
+                // redirect call whose body is the loop. Bash text — the
+                // child's fd 0 is the redirect target and its stdout rides
+                // the pipe; the native capture path dropped the loop's output
+                // (088/091 read EOF or lost the bytes).
+                let body: Vec<IrStmt> = match args.first() {
+                    Some(IrExpr::Arrow(b)) => b.to_vec(),
+                    _ => return Err("redirect without Arrow body".into()),
+                };
+                let redirects = Self::redirect_list(args.get(1))?;
+                self.redirect_stage_text(&[IrStmt::Redirect { inner: body, redirects }])
             }
             [IrStmt::Expr(IrExpr::Call { func, args, .. })] if func == "redirect" => {
                 // redirect(Arrow(body), redirects...) — same text decision
@@ -2006,6 +2254,22 @@ impl JavaRender {
     /// a plain/compound body are expressible; a stdin-fed loop needs the
     /// java input stream and is left to the native runner.
     fn redirect_stage_text(&mut self, stage: &[IrStmt]) -> Result<String, String> {
+        // `while …; done < f | cmd` arrives as a block-wrapped redirect inside
+        // the PIPE stage; its `[IrStmt::Block([Redirect{…}])]` form must reach
+        // the same text decision.
+        if let [IrStmt::Block(bs)] = stage {
+            if let [IrStmt::Redirect { inner, redirects }] = &bs[..] {
+                let stdin_fed = redirects.iter().any(|r| matches!(r.fd, Some(0))
+                    || matches!(r.mode.as_str(), "heredoc" | "heredoc-tabs" | "herestring"));
+                if !(stdin_fed && inner.iter().any(|b| matches!(b, IrStmt::While { .. } | IrStmt::For { .. })))
+                    && !Self::body_needs_native(inner)
+                {
+                    let mut t = self.arrow_expr(inner)?;
+                    t += &self.redirect_ops_text(inner, redirects, &[])?;
+                    return Ok(t);
+                }
+            }
+        }
         if let [IrStmt::Redirect { inner, redirects }] = stage {
             let stdin_fed = redirects.iter().any(|r| matches!(r.fd, Some(0))
                 || matches!(r.mode.as_str(), "heredoc" | "heredoc-tabs" | "herestring"));
@@ -5243,6 +5507,51 @@ impl JavaRender {
     /// `in_child`: the text runs inside the loop's CHILD shell, so
     /// body-assigned vars must stay SYMBOLIC (`$line`) — the parent's java
     /// field is stale there (it is only written after the loop).
+    /// One pipeline STAGE as child bash text. A stage is a statement list
+    /// (usually a single command); joining with ` ; ` inside `{ }` keeps a
+    /// multi-statement stage one pipeline element.
+    fn body_cmd_stage_text(&mut self, stage: &[IrStmt], assigned: &std::collections::BTreeSet<String>) -> Result<String, String> {
+        if stage.len() == 1 {
+            // a loop stage (`while …; done < f | sort`) is bash text of its
+            // own — body_stmt_text_at has no While arm
+            if let IrStmt::While { cond, body } = &stage[0] {
+                let one = IrStmt::Expr((*cond).clone());
+                if let Ok(t) = self.whileloop_text(std::slice::from_ref(&one), body) {
+                    return Ok(t);
+                }
+            }
+            if let IrStmt::Redirect { inner, .. } = &stage[0] {
+                if inner.len() == 1 {
+                    if let IrStmt::While { cond, body } = &inner[0] {
+                        let one = IrStmt::Expr((*cond).clone());
+                        if let Ok(t) = self.whileloop_text(std::slice::from_ref(&one), body) {
+                            let mut tail = String::from("\"\"");
+                            let redirects = match &stage[0] { IrStmt::Redirect { redirects, .. } => redirects.clone(), _ => Vec::new() };
+                            for r in &redirects {
+                                let tg = self.expr_str(&r.target)?;
+                                let op = match (r.fd, r.mode.as_str()) {
+                                    (Some(0), "r") => "< ",
+                                    (None, "w") | (Some(1), "w") => "> ",
+                                    (None, "a") | (Some(1), "a") => ">> ",
+                                    _ => return Err("redirect on loop stage".into()),
+                                };
+                                self.helper("quote");
+                                tail += &format!(" + \" {op}\" + shQuote({tg})");
+                            }
+                            return Ok(format!("\"{{ \" + {t} + \" ; }}\" + {tail} + \" \""));
+                        }
+                    }
+                }
+            }
+            return self.body_stmt_text_at(&stage[0], assigned, true);
+        }
+        let mut parts: Vec<String> = Vec::new();
+        for st in stage {
+            parts.push(self.body_stmt_text_at(st, assigned, true)?);
+        }
+        Ok(format!("(\"{{ \" + {} + \" ; }}\")", parts.join(" + \" ; \" + ")))
+    }
+
     fn body_stmt_text_at(&mut self, st: &IrStmt, assigned: &std::collections::BTreeSet<String>, in_child: bool) -> Result<String, String> {
         // child-side command text: body-assigned vars stay symbolic
         if in_child && !self.child_sym.is_empty() {
@@ -5396,6 +5705,32 @@ impl JavaRender {
                     _ => return Err("whileLoop without arrows".into()),
                 };
                 self.whileloop_text(c, b)
+            }
+            // A PIPELINE inside a loop body (`echo "$w" | tr A-Z`): bash
+            // text, stage by stage. Without this arm the whole loop was
+            // declared non-text and run by the native stage helper — inside
+            // which the redirect's fd 0 is NOT the loop's feed, so
+            // `while read …; done < f` read EOF and printed NOTHING
+            // (084_while_pipeline, 088, 091, 063_11, 064_17).
+            IrStmt::Pipeline { stages, .. } => {
+                let mut sp: Vec<String> = Vec::new();
+                for stage in stages {
+                    sp.push(self.body_cmd_stage_text(stage, assigned)?);
+                }
+                if sp.is_empty() { return Err("empty pipeline".into()); }
+                Ok(sp.join(" + \" | \" + "))
+            }
+            // a loop as a pipeline STAGE (`while …; done < f | sort`): the
+            // text form, and a stage that is a whole loop needs no `{ }`
+            // group (its `( … )` already is one)
+            IrStmt::While { cond, body } => {
+                let one = IrStmt::Expr((*cond).clone());
+                self.whileloop_text(std::slice::from_ref(&one), body)
+            }
+            IrStmt::Redirect { inner, redirects }
+                if inner.iter().any(|b| matches!(b, IrStmt::While { .. } | IrStmt::For { .. })) =>
+            {
+                self.redirect_stage_text(&[st.clone()])
             }
             IrStmt::Continue { .. } => Ok("\"continue\"".to_string()),
             IrStmt::Break { .. } => Ok("\"break\"".to_string()),
@@ -5589,6 +5924,91 @@ impl JavaRender {
     /// A `whileLoop` whose FIRST argument is a plain expression carries a
     /// condition STATEMENT of its own (`while read …` in pipe position) and
     /// returns None — see `while_read_parts`.
+    /// Does this `redirect(Arrow(body), …)` call wrap a LOOP?
+    /// A pipeline stage that is a redirect carrying a LOOP, as bash text:
+    /// `Some((loop_text, redirect_ops_text))`. Looks through the frontend's
+    /// `Expr(Call{whileLoop})` wrapper.
+    fn loop_stage_text(&mut self, st: &IrStmt) -> Option<(String, String)> {
+        let (inner, redirects) = match st {
+            IrStmt::Expr(IrExpr::Call { func: rf, args: ra, .. }) if rf == "redirect" => {
+                let b = match ra.first() { Some(IrExpr::Arrow(b)) => b.to_vec(), _ => return None };
+                (b, Self::redirect_list(ra.get(1)).ok()?)
+            }
+            IrStmt::Redirect { inner, redirects } => (inner.clone(), redirects.clone()),
+            _ => return None,
+        };
+        let loop_text = self.while_text_in(&inner)?;
+        self.helper("quote");
+        let mut tail = String::from("\"\"");
+        for r in &redirects {
+            let tg = self.expr_str(&r.target).ok()?;
+            let op = match (r.fd, r.mode.as_str()) {
+                (Some(0), "r") | (Some(0), "r+") => "< ",
+                (None, "w") | (Some(1), "w") | (Some(1), "wc") => "> ",
+                (None, "a") | (Some(1), "a") => ">> ",
+                (Some(2), "w") => "2> ",
+                (Some(2), "a") => "2>> ",
+                _ => return None,
+            };
+            tail += &format!(" + \" {op}\" + shQuote({tg})");
+        }
+        Some((loop_text, tail))
+    }
+
+    /// The while-loop TEXT inside a statement list, looking through the
+    /// frontend's `Expr(Call{whileLoop})` wrapper.
+    fn while_text_in(&mut self, body: &[IrStmt]) -> Option<String> {
+        for st in body {
+            match st {
+                IrStmt::While { cond, body } => {
+                    let one = IrStmt::Expr((*cond).clone());
+                    if let Ok(t) = self.whileloop_text(std::slice::from_ref(&one), body) { return Some(t); }
+                }
+                IrStmt::Expr(IrExpr::Call { func, args, .. }) if func == "whileLoop" => {
+                    if let Some((c, b)) = Self::whileloop_parts(args) {
+                        if let Ok(t) = self.whileloop_text(c, b) { return Some(t); }
+                    }
+                    if let Some((c, b)) = Self::while_read_parts(args) {
+                        let one = IrStmt::Expr(c.clone());
+                        if let Ok(t) = self.whileloop_text(std::slice::from_ref(&one), b) { return Some(t); }
+                    }
+                }
+                IrStmt::Expr(IrExpr::Call { func, args, .. }) if func == "block" => {
+                    if let Some(IrExpr::Arrow(b)) = args.first() {
+                        if let Some(t) = self.while_text_in(b) { return Some(t); }
+                    }
+                }
+                _ => {}
+            }
+    }
+        None
+    }
+
+    /// The `redirect(Arrow(body), …)` call node wraps its body one or two
+    /// Expr layers deep depending on how the frontend built it: look through
+    /// `Expr(Call{whileLoop})` / `Expr(Call{block})` wrappers to the LOOP.
+    fn pipeline_stage_is_loop(args: &[IrExpr]) -> bool {
+        fn has_loop(b: &[IrStmt]) -> bool {
+            b.iter().any(|st| match st {
+                IrStmt::While { .. } | IrStmt::For { .. } | IrStmt::DoWhile { .. } => true,
+                IrStmt::Expr(IrExpr::Call { func, args, .. })
+                    if func == "whileLoop" || func == "block" || func == "and" || func == "or" =>
+                {
+                    args.iter().any(|a| match a {
+                        IrExpr::Arrow(x) => has_loop(x),
+                        _ => false,
+                    })
+                }
+                IrStmt::Block(x) | IrStmt::Subshell(x) => has_loop(x),
+                _ => false,
+            })
+        }
+        match args.first() {
+            Some(IrExpr::Arrow(b)) => has_loop(b),
+            _ => false,
+        }
+    }
+
     fn whileloop_parts(args: &[IrExpr]) -> Option<(&[IrStmt], &[IrStmt])> {
         match (args.first(), args.get(1)) {
             (Some(IrExpr::Arrow(c)), Some(IrExpr::Arrow(b))) => Some((c, b)),
@@ -6323,6 +6743,23 @@ impl JavaRender {
                 if let Some(IrExpr::Array(stages)) = args.first() {
                     for st in stages.iter() {
                         if let IrExpr::Arrow(body) = st {
+                            // a loop STAGE (`while …; done < f | sort`) is
+                            // bash text of its own; stage_expr has no arm for
+                            // an Expr(redirect(loop)) node and fell back to
+                            // the native capture, losing the loop's output
+                            if body.len() == 1 {
+                                if let IrStmt::Expr(IrExpr::Call { func: rf, args: ra, .. }) = &body[0] {
+                                    if rf == "redirect" && Self::pipeline_stage_is_loop(ra) {
+                                        let lb: Vec<IrStmt> = match ra.first() {
+                                            Some(IrExpr::Arrow(b)) => b.to_vec(),
+                                            _ => Vec::new(),
+                                        };
+                                        let lr = Self::redirect_list(ra.get(1))?;
+                                        parts2.push(self.redirect_stage_text(&[IrStmt::Redirect { inner: lb, redirects: lr }])?);
+                                        continue;
+                                    }
+                                }
+                            }
                             parts2.push(self.stage_expr(body)?);
                         }
                     }
