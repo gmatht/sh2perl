@@ -1,0 +1,6 @@
+(* for-recovery: the while->for rewrite visits the same counter values, and
+   the post-loop escape guard is load-bearing.  Build: isabelle build -d . *)
+session ForRecovery = HOL +
+  options [quick_and_dirty = false]
+  theories
+    ForRecovery

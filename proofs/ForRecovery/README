@@ -1,0 +1,45 @@
+for-recovery — the Tier-1 obligation for src/transforms/for_recovery.rs
+=======================================================================
+
+    isabelle build -d proofs/ForRecovery -b ForRecovery
+
+What is proved (ForRecovery.thy, quick_and_dirty = false)
+
+  the `while` -> `For` rewrite must let the body run on the SAME counter
+  values.  The trace is modelled in LIBRARY shape — a map over
+  [0..<n] — which is what made the proof go through; a hand-rolled
+  `a # while_trace (a+1)` recursion resisted every tactic.
+
+    upt_map_shift        map (λk. a + int k) [0..<n] = [a .. a + int n - 1]
+    lt_up_same_trace     i < b, step +1: same values, same order
+    le_up_same_trace     i <= b, step +1
+    gt_dn_same_values    descending: same VALUE SET (the Rust normalises to
+                         an ascending range: (lo,hi) swap)
+
+  the escape guard is load-bearing:
+    for_runs_three / post_loop_counter_differs
+      `while (i<3)` leaves the counter at 3; `For 0..2` leaves it at 2.
+      `try_convert_at` refuses exactly when the counter is mentioned after
+      the loop (stmt_mentions over stmts[i+1..]), and that check is what
+      makes the trace theorem sufficient.
+
+  the two UNGUARDED i64 corners (checked, because the first draft of this
+  analysis had them backwards):
+    low_add_stays_in_range    i64_min + 1 is still in range — no wrap there
+    high_add_leaves_range     i64_max + 1 leaves it      (Gt arm, bound + 1)
+    low_sub_leaves_range      i64_min - 1 leaves it      (Lt arm, bound - 1)
+
+What is NOT claimed
+-------------------
+* The BODY is abstracted: the theorem is about iteration traces.  With the
+  Rust's "the body must not touch the counter" guard, a body's effect
+  depends only on the counter value and the ambient state, so equal traces
+  give equal behaviour — argued in the file, not mechanized.
+* `parse_test_str` (the shell `test "$i -lt 10"` text form, incl. the
+  mirrored `"10 -ge $i"` spelling) is not modelled; the lowered BinOp form
+  is, and that is the form the For comparison table consumes.
+* No manifest: `core-requests/transforms/done/for-recovery.rs` is still a
+  BARE FILE, not a directory, so there is nowhere to hang a `proof:` line.
+  Unlike arith-identity (which had a directory and no manifest), this one
+  needs the file converted to a directory first.  Recorded rather than
+  invented.
