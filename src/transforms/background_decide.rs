@@ -57,6 +57,14 @@ pub enum BgClass {
 /// statement-pointer → verdict (mirrors the sync-ok-loops pattern).
 static VERDICTS: Mutex<Option<HashSet<usize>>> = Mutex::new(None);
 
+/// Drop the cached verdict — the out-of-band caller's reset (see
+/// `transforms::reset_verdicts`). These transforms are analysis-only: they
+/// return `false` from `run()` and a RENDERER reads the verdict, so without
+/// a reset a second run observes the PREVIOUS input's verdict.
+pub fn clear_verdicts() {
+    *VERDICTS.lock().unwrap() = None;
+}
+
 pub fn is_thread(ptr: usize) -> bool {
     VERDICTS.lock().unwrap().as_ref().map(|s| s.contains(&ptr)).unwrap_or(false)
 }

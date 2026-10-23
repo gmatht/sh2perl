@@ -35,6 +35,19 @@
 //! pass; do not let the description above stand in for the wiring.
 //! Prereq: i32-provable (the widening refinement).
 //!
+//! ## Reachability: it fires 4 times in a 554-file corpus, all by accident
+//! `optimize_stmts` (Pass 0.5, `fold_stmt`) constant-folds literal
+//! arithmetic — and runs BEFORE `transforms::apply` — so every `Num/Num`
+//! dividend is already an `Int` when this pass sees the program:
+//! `x=$(( 200 / 128 ))` leaves NO statement at all, and a variable dividend
+//! refuses (`prove_non_neg` has no Var case). Corpus sweep (554 examples,
+//! 2026-10-22): the verdict sets 4 marked statements, all of the shape
+//! `(( i = 1 + (2 * 3) / 4 ))` in 064_06 / 064_hard / 078_double_paren /
+//! parse-paren-close — where `2 * 3` is non-negative only because its
+//! operands are literals, so the shift target is `6 / 4`, which no backend
+//! consumer would have wanted. Combined with the missing consumer (see
+//! Placement), this pass currently changes nothing anywhere.
+//!
 //! ## The guard is checked, not commented
 //! The soundness obligation (fire ⟹ dividend provably non-negative) is
 //! carried by the [`NonNeg`] evidence type, whose only producer is
@@ -51,6 +64,14 @@ use crate::ir::{ArithAst, IrStmt};
 
 /// verdicts keyed by (fn-name, stmt index) — mirrors i32-provable.
 static VERDICTS: Mutex<Option<HashSet<(String, usize)>>> = Mutex::new(None);
+
+/// Drop the cached verdict — the out-of-band caller's reset (see
+/// `transforms::reset_verdicts`). These transforms are analysis-only: they
+/// return `false` from `run()` and a RENDERER reads the verdict, so without
+/// a reset a second run observes the PREVIOUS input's verdict.
+pub fn clear_verdicts() {
+    *VERDICTS.lock().unwrap() = None;
+}
 
 pub fn shiftable(fn_name: &str, stmt_idx: usize) -> bool {
     VERDICTS

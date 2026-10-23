@@ -148,6 +148,7 @@ pub mod arith_identity; // OFFER (core-requests/transforms/offered/arith-identit
 pub mod arith_normalize; // frontend-shape normalisation (`0 - X` → `-X`); run by ingress, not the env-gated registry
 pub mod array_len_fold; // OFFER core-requests/transforms/offered/array-len-fold.rs: `${#arr[@]}` → arrayLen(arr)
 pub mod slice_identity; // OFFER core-requests/transforms/offered/slice-identity.rs: `${v:0}`/`${v:}` → the plain read param("", v)
+pub mod affix_strip_fold; // OFFER: magic-free literal `${v#lit}`/`${v%lit}` → the shared AffixStrip node (retires the glob/regex strip helper on rust/go/java)
 pub mod builtin;
 pub mod inline_pure_fns; // marketplace offer (estree-20260813-182431) // core-requests/shir-builtin-op: exec(cmd∈builtins) → the native `builtin` op
 pub mod isolate_accumulate; // loop-private temp inlining (single-accumulate isolation)
@@ -250,6 +251,12 @@ pub fn all() -> Vec<(&'static str, TransformFn)> {
         // offsets, any length (incl. "0"), and every indexed/positional/
         // indirect/array-list spelling are untouched.
         ("slice-identity", slice_identity::transform),
+        // `${v#lit}` / `${v%lit}` with a MAGIC-FREE LITERAL pattern: a
+        // literal matches exactly once, so shortest ≡ longest and the
+        // strip removes at most one leading/trailing occurrence — the
+        // shared AffixStrip node. rust/go/java retire their glob/regex
+        // helper for it; other targets refuse (target-gated).
+        ("affix-strip-fold", affix_strip_fold::transform),
         // `typeset -i VAR` marks VAR integer for the rest of the scope, so
         // later `VAR=EXPR` assignments must evaluate EXPR as arithmetic.
         // Bash semantics shared by every backend, so it lives in the shared
@@ -384,6 +391,26 @@ pub fn apply(stmts: &mut Vec<IrStmt>) -> bool {
     }
     changed
 }
+
+/// Clear every transform's cached VERDICT state.
+///
+/// The analysis-only transforms compute a verdict into a `static Mutex`
+/// and return `false` from `run()`; a RENDERER reads the verdict. That is
+/// safe per compile (each recomputes its slot), but an out-of-band caller
+/// that runs transforms in isolation — the `transform_laws` property test,
+/// the bisect's `first-n` replay — must reset them, or run 2 observes run
+/// 1's verdict and a determinism law is vacuously true.
+pub fn reset_verdicts() {
+    div_mod_pow2::clear_verdicts();
+    i32_provable::clear_verdicts();
+    sync_ok_loops::clear_verdicts();
+    function_purity::clear_verdicts();
+    escape_classes::clear_verdicts();
+    background_decide::clear_verdicts();
+    string_accumulator::clear_verdicts();
+    f32_narrow::clear_verdicts();
+}
+
 
 /// Is a named transform enabled under the `SH2_TRANSFORMS` gate
 /// (empty/unset = ALL)? The renderer hooks that READ a transform's

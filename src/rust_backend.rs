@@ -1315,6 +1315,7 @@ fn strip_str_lit_refs(text: &str) -> String {
 /// * `__sh_freg("LIT")`        → `std::path::Path::new("LIT").is_file()`  (always)
 /// * `__sh_puts("LIT")`        → `print!("{}", "LIT")`  (only when sinks dead)
 /// * `__sh_print_words(&[vec![EXPR]], true, false)` → `println!("{}", EXPR)`
+///   and the `echo -n` spelling `…, false, false)` → `print!("{}", EXPR)`
 ///   (only when the sink-check tail is provably dead — i.e. no sink is
 ///   ever activated AND `__SH_ARITH_WORD_FAIL` is never set)
 fn inline_simple_helpers(
@@ -1401,6 +1402,7 @@ fn inline_simple_helpers(
             |lit| format!("print!(\"{{}}\", {})", lit));
 
         // __sh_print_words(&[vec![EXPR]], true, false) → println!("{}", EXPR)
+        // __sh_print_words(&[vec![EXPR]], false, false) → print!("{}", EXPR)
         inline_print_words(&mut out);
     }
 
@@ -1507,11 +1509,19 @@ fn inline_str_arg_helper(text: &mut String, name: &str, expand: impl Fn(&str) ->
     }
 }
 
-/// Rewrite `__sh_print_words(&[vec![EXPR]], true, false)` → `println!("{}", EXPR)`.
+/// Rewrite `__sh_print_words(&[vec![EXPR]], true, false)` → `println!("{}", EXPR)`
+/// and the `echo -n` spelling `…, false, false)` → `print!("{}", EXPR)`.
 /// Uses bracket-depth tracking (not a fixed suffix) so that expressions
 /// containing `]` or `]]` inside string literals or nested calls are handled.
-/// Only matches the exact shape with `nl=true, esc=false`; any other form
-/// (multi-word, escape handling, dynamic flags) is left untouched.
+/// Only matches a single word with `esc=false`; any other form (multi-word
+/// or multi-vec joins, escape handling, dynamic flags) is left untouched.
+///
+/// The `nl` flag is a pure byte difference the two macros already encode —
+/// with sinks dead the helper reduces to `print!("{}", s)` (+ `\n` when
+/// `nl`), so each spelling is byte-identical to its macro by construction.
+/// The `echo -n` sites are exactly what used to keep the helper (and its
+/// `__sh_echo_esc`/`__sh_q_printf` dependency chain) alive in sinks-dead
+/// programs: 56 corpus sites across ~40 files.
 fn inline_print_words(text: &mut String) {
     let pat = "__sh_print_words(&[vec![";
     let mut search_from = 0usize;
@@ -1575,14 +1585,21 @@ fn inline_print_words(text: &mut String) {
         while j < rest.len() && rest.as_bytes()[j].is_ascii_whitespace() {
             j += 1;
         }
-        if !rest[j..].starts_with(", true, false)") {
+        // `nl` picks the macro spelling: `true` → println! (word + '\n'),
+        // `false` → print! (the `echo -n` form). `esc` must be literal
+        // `false` — the escape arm is the helper's __sh_echo_esc dependency.
+        let (flags, mac) = if rest[j..].starts_with(", true, false)") {
+            (", true, false)", "println!")
+        } else if rest[j..].starts_with(", false, false)") {
+            (", false, false)", "print!")
+        } else {
             search_from = at + pat.len();
             continue;
-        }
+        };
         let expr = &text[start..close];
-        // end = position after the `)` of `, true, false)`
-        let end = bracket2_pos + 1 + j + ", true, false)".len();
-        let replacement = format!("println!(\"{{}}\", {})", expr);
+        // end = position after the `)` of the matched flags
+        let end = bracket2_pos + 1 + j + flags.len();
+        let replacement = format!("{}(\"{{}}\", {})", mac, expr);
         text.replace_range(at..end, &replacement);
         // The replacement may itself contain `pat`-adjacent text; resume the
         // scan at the end of what we just wrote so the loop always advances.
@@ -4532,25 +4549,32 @@ impl Render {
             // a compile-time key proven in range: Rust array indexing
             // takes `usize` natively, so `a[1]` — no cast, no guard
             // (a usize literal cannot be negative and the verdict
-            // proved the bound)
+            // proved the bound). A `[String; N]` element must be CLONED
+            // out: `&{ … a[k] }` (a format-arg block) evaluates its tail
+            // with no expected type, so a bare index MOVES the String out
+            // of the array while an earlier argument still borrows it —
+            // E0505/E0508, the emitted program failed to COMPILE
+            // (t83_array_index_read: `println!("{}{}{}", a[0], {…a[k]}, a[2])`).
+            // Reached only for string homes — int homes return in the
+            // `.to_string()` arm above (a Copy i64 never moves).
             if let Some(k) = Self::const_int_of(key) {
                 let idx = if k < 0 { k + n as i64 } else { k };
                 if idx >= 0 && (idx as usize) < n {
-                    return format!("{m}[{idx}]");
+                    return format!("{m}[{idx}].clone()");
                 }
             }
             if usize_key {
                 return format!(
                     "{{ let k = {key} as usize; let n: usize = {n}; \
                        if k >= n {{ std::process::exit(1); }} \
-                       {m}[k] }}"
+                       {m}[k].clone() }}"
                 );
             }
             return format!(
-                "{{ let k = {key}; let n = {n}; \
-                   let i = if k < 0 {{ n + k }} else {{ k }}; \
-                   if i < 0 || i >= n {{ std::process::exit(1); }} \
-                   {m}[i as usize] }}"
+                "{{ let k = {key}; let n = {n}; \\
+                   let i = if k < 0 {{ n + k }} else {{ k }}; \\
+                   if i < 0 || i >= n {{ std::process::exit(1); }} \\
+                   {m}[i as usize].clone() }}"
             );
         }
         if self.is_int_array(var) {
@@ -4569,6 +4593,30 @@ impl Render {
         // the program mid-script (063_hard_to_parse died at statement 2,
         // parse-redirect-in-case-pattern printed nothing, both rc=1 with
         // bash continuing).
+        //
+        // PYTHON source keeps CPython strictness HERE too: a py program's
+        // store-homed `xs[i]` (t95_list_growth100, t96) is an `Index` node
+        // with IndexError semantics, and a lenient `''`/0 printed an extra
+        // line python never prints. Source lang keys the difference the
+        // LOCAL/TLS split cannot: shell stays lenient (its Index nodes are
+        // transform-constructed — no source semantics to preserve), python
+        // aborts exit(1) with prior output standing.
+        if matches!(crate::shir::source_lang().as_deref(), Some("py")) {
+            return if usize_key {
+                format!(
+                    "{{ let __k = {key} as usize; let __n = {m}.with(|v| v.borrow().len()); \
+                       if __k >= __n {{ std::process::exit(1); }} \
+                       {m}.with(|v| v.borrow()[__k].clone()) }}"
+                )
+            } else {
+                format!(
+                    "{{ let __k = {key}; let __n = {m}.with(|v| v.borrow().len()) as i64; \
+                       let __idx = if __k < 0 {{ __n + __k }} else {{ __k }}; \
+                       if __idx < 0 || __idx >= __n {{ std::process::exit(1); }} \
+                       {m}.with(|v| v.borrow()[__idx as usize].clone()) }}"
+                )
+            };
+        }
         if usize_key {
             // key proven non-negative: no i64 temp, no negative-wrap, no
             // `as usize` cast at the index site.
@@ -4612,6 +4660,17 @@ impl Render {
         // same lenient rule as `array_index_strict`'s TLS branch (the A1
         // oracle's arrayIndex): OOB/negative-past-end → 0 (the numeric
         // reading of bash's empty expansion), never exit(1).
+        if matches!(crate::shir::source_lang().as_deref(), Some("py")) {
+            // PYTHON source: CPython IndexError — OOB aborts exit(1) with
+            // prior output standing (t95/t96: the lenient 0 printed a line
+            // python never prints). Shell keeps the lenient arm below.
+            return format!(
+                "{{ let __k = {key}; let __n = {m}.with(|v| v.borrow().len()) as i64; \
+                   let __idx = if __k < 0 {{ __n + __k }} else {{ __k }}; \
+                   if __idx < 0 || __idx >= __n {{ std::process::exit(1); }} \
+                   {m}.with(|v| v.borrow()[__idx as usize]) }}"
+            );
+        }
         format!(
             "{{ let __k = {key}; let __n = {m}.with(|v| v.borrow().len()) as i64; \
                let __idx = if __k < 0 {{ __n + __k }} else {{ __k }}; \
@@ -5926,7 +5985,39 @@ impl Render {
                     }
                     "String::new()".into()
                 }
+                "AffixStrip" => {
+                    let x = n.as_any().downcast_ref::<crate::shir_nodes::AffixStrip>()
+                        .expect("tag/type agree");
+                    self.affix_strip_str(x)
+                }
                 _ => "String::new()".into(),
+            }
+        }
+    }
+
+    /// `AffixStrip(text, pat, prefix)` — strip at most ONE leading
+    /// (`strip_prefix`) / trailing (`strip_suffix`) literal occurrence,
+    /// else pass the text through. Rust's stdlib expresses this directly
+    /// (no `__sh_fnmatch` glob engine) — the whole point of the shared
+    /// affix-strip-fold offering.
+    fn affix_strip_str(&mut self, x: &crate::shir_nodes::AffixStrip) -> String {
+        let t = self.expr_str(&x.text);
+        let op = if x.prefix { "strip_prefix" } else { "strip_suffix" };
+        match &x.pattern {
+            // Literal affix (the common case — affix-strip-fold only folds
+            // magic-free literals): bind the text once, strip, and fall back
+            // to the owned text when the affix is absent.
+            IrExpr::Str(s, _) => {
+                let p = Self::rust_str(s);
+                format!(
+                    "{{ let __s: String = {t}; if let Some(__r) = __s.{op}({p}) {{ __r.to_string() }} else {{ __s }} }}"
+                )
+            }
+            other => {
+                let p = self.expr_str(other);
+                format!(
+                    "{{ let __s: String = {t}; let __p: String = {p}; if let Some(__r) = __s.{op}(__p.as_str()) {{ __r.to_string() }} else {{ __s }} }}"
+                )
             }
         }
     }
@@ -7711,6 +7802,11 @@ impl Render {
                 }
                 self.mark_todo("word FieldExtract (complex fields)");
                 "vec![String::new()]".to_string()
+            }
+            IrExpr::Ext(n) if n.tag() == "AffixStrip" => {
+                let x = n.as_any().downcast_ref::<crate::shir_nodes::AffixStrip>()
+                    .expect("tag/type agree");
+                format!("vec![{}]", self.affix_strip_str(x))
             }
             other => {
                 self.mark_todo(&format!("word {:?}", other));

@@ -67,6 +67,14 @@ use crate::ir::{ArithAst, IrExpr, IrStmt};
 /// every `transform` call so verdicts never leak across compilations).
 static F32_VARS: Mutex<Option<HashSet<String>>> = Mutex::new(None);
 
+/// Drop the cached verdict — the out-of-band caller's reset (see
+/// `transforms::reset_verdicts`). These transforms are analysis-only: they
+/// return `false` from `run()` and a RENDERER reads the verdict, so without
+/// a reset a second run observes the PREVIOUS input's verdict.
+pub fn clear_verdicts() {
+    *F32_VARS.lock().unwrap() = None;
+}
+
 /// Renderer hook: may `name` be homed in 32 bits? False unless the
 /// `f32-narrow` transform ran and proved it (bisect-safe: disabling the
 /// transform end-to-end also disables the verdict).
