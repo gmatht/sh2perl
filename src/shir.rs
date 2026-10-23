@@ -52195,6 +52195,17 @@ fn expr_to_estree(e: &IrExpr) -> Expr {
                     };
                 }
             }
+            // `concatItems(NAME)` — the string-accumulator lowering's
+            // concatenation of a chunk array (core request
+            // estree-20260813-184909). The IR `join` is IFS-space-joined,
+            // so it cannot express this; the zero-separator array join
+            // is the exact value the growing `"$v$seg"` string had.
+            if func == "concatItems" {
+                if let [IrExpr::Str(name, _)] = args.as_slice() {
+                    let arr = sh2_call_estree("arrayValues", vec![str_lit(name)]);
+                    return crate::estree::method_call(arr, "join", vec![str_lit("")]);
+                }
+            }
             // `f args...` — a call to a PROVABLY-SYNC script-defined
             // function with await-free call-site args (see
             // [`SYNC_FN_CALLS`] / `try_native_fn_call`): the sync

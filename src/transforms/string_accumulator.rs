@@ -41,9 +41,10 @@
 //! only, no structural mutation. Renderer hooks: estree.rs (the shrinking
 //! `blk_p` cons-chain), and any backend with a mutable string builder.
 
+use std::collections::HashMap;
 use std::sync::Mutex;
 
-use crate::ir::{InterpPart, IrExpr, IrStmt};
+use crate::ir::{AssignTarget, InterpPart, IrExpr, IrStmt, StrStyle};
 
 #[derive(Debug, Clone, PartialEq)]
 pub struct Accumulator {
@@ -68,8 +69,32 @@ pub fn accumulators() -> Vec<Accumulator> {
     VERDICTS.lock().unwrap().clone().unwrap_or_default()
 }
 
-/// Apply the transform (analysis-only — computes + caches the verdicts).
+/// Apply the transform: compute + cache the verdicts, then (for the JS /
+/// ESTree renderer only, which has the `concatItems` arm) structurally
+/// lower the verifier's shape to a chunk array:
+///
+/// ```text
+/// v="";  while …; do v="$v$seg"; …; done;  echo "$v"
+///   ↓
+/// v="";  setArray("__acc_v", []);  while …; do setArrayAppend("__acc_v", [seg]); …; done;
+/// v = concatItems("__acc_v");  echo "$v"
+/// ```
+///
+/// Materializing ONCE right after the loop (instead of rewriting every
+/// read) is what keeps the lowering sound with no read-set walk: every
+/// post-loop read already sees `v`, and a pre-loop read still sees the
+/// init value because nothing before the loop changes. The two mid-loop
+/// read positions (the loop CONDITION and the body) are guarded below.
 pub fn transform(stmts: &mut Vec<IrStmt>) -> bool {
+    let verdicts = analyze(stmts);
+    *VERDICTS.lock().unwrap() = Some(verdicts.clone());
+    if !matches!(crate::transforms::target().as_deref(), Some("js") | Some("estree")) {
+        return false; // analysis-only for every other renderer
+    }
+    lower(stmts, &verdicts)
+}
+
+fn analyze(stmts: &[IrStmt]) -> Vec<Accumulator> {
     let mut out = Vec::new();
     for (li, st) in stmts.iter().enumerate() {
         let body = match st {
@@ -97,13 +122,30 @@ pub fn transform(stmts: &mut Vec<IrStmt>) -> bool {
             if body_reads_var_nonleading(body, &var) {
                 continue;
             }
+            // The loop CONDITION is a mid-loop read too (`while [ -n "$v" ]`
+            // observes the growing string) — the body scan above cannot see
+            // it.
+            if loop_reads_var(st, &var) {
+                continue;
+            }
             if reads_after_loop(&stmts[li + 1..], &var) {
                 out.push(Accumulator { var, loop_idx: li, init_idx: ii });
             }
         }
     }
-    *VERDICTS.lock().unwrap() = Some(out);
-    false // analysis-only
+    out
+}
+
+/// Does the loop's own header (the `while` condition / the `for` iterable)
+/// read `var`? That read runs once per iteration against the growing value.
+fn loop_reads_var(st: &IrStmt, var: &str) -> bool {
+    let mut found = false;
+    match st {
+        IrStmt::While { cond, .. } => expr_read_walk(cond, var, &mut found),
+        IrStmt::For { iter, .. } => expr_read_walk(iter, var, &mut found),
+        _ => {}
+    }
+    found
 }
 
 /// The vars whose ONLY writes in this body are self-appends.
@@ -258,11 +300,38 @@ fn read_walk(st: &IrStmt, var: &str, found: &mut bool) {
     }
 }
 
+/// A `$var` / `${var…}` reference (or a bare word) inside a command/test/
+/// arith TEXT. The A1 keeps those as strings — `test("-n $blk")`, `arith` —
+/// so an operand walk alone cannot see the read.
+fn text_mentions_var(s: &str, var: &str) -> bool {
+    let (bytes, vb) = (s.as_bytes(), var.as_bytes());
+    if vb.is_empty() || vb.len() > bytes.len() {
+        return false;
+    }
+    let ident = |c: u8| c.is_ascii_alphanumeric() || c == b'_';
+    for i in 0..=bytes.len() - vb.len() {
+        if &bytes[i..i + vb.len()] == vb {
+            let before_ok = i == 0 || !ident(bytes[i - 1]);
+            let after = i + vb.len();
+            let after_ok = after == bytes.len() || !ident(bytes[after]);
+            if before_ok && after_ok {
+                return true;
+            }
+        }
+    }
+    false
+}
+
 fn expr_read_walk(e: &IrExpr, var: &str, found: &mut bool) {
     if *found {
         return;
     }
     match e {
+        IrExpr::Str(s, _) => {
+            if text_mentions_var(s, var) {
+                *found = true;
+            }
+        }
         IrExpr::Var(v, _) | IrExpr::Ident(v) => {
             if v == var {
                 *found = true;
@@ -360,6 +429,163 @@ fn body_reads_var_nonleading(body: &[IrStmt], var: &str) -> bool {
     false
 }
 
+
+/// The literal text of the accumulator's init (`v=""`). The analysis
+/// already refused a non-literal init; the lowering re-derives the text
+/// because a non-empty init must SEED the chunk array.
+fn literal_init_text(st: &IrStmt, var: &str) -> Option<String> {
+    let expr = match st {
+        IrStmt::Assign { targets, expr, .. }
+            if targets.iter().any(|t| t.var == var && t.indices.is_empty()) =>
+        {
+            expr
+        }
+        IrStmt::Declare { vars, init: Some(init), .. }
+            if vars.iter().any(|d| d.name == var) =>
+        {
+            init
+        }
+        _ => return None,
+    };
+    match expr {
+        IrExpr::Str(s, _) => Some(s.clone()),
+        IrExpr::Interpolate(parts) => {
+            let mut out = String::new();
+            for p in parts {
+                match p {
+                    InterpPart::Lit(s) => out.push_str(s),
+                    InterpPart::Expr(_) => return None,
+                }
+            }
+            Some(out)
+        }
+        _ => None,
+    }
+}
+
+/// The appended segment: the interpolation's parts AFTER the leading
+/// self-read (`"$v$seg"` → `seg`).
+fn appended_segment(parts: &[InterpPart]) -> IrExpr {
+    let rest = parts.get(1..).unwrap_or(&[]);
+    match rest {
+        [] => IrExpr::Str(String::new(), StrStyle::DoubleQuoted),
+        [InterpPart::Lit(s)] => IrExpr::Str(s.clone(), StrStyle::DoubleQuoted),
+        [InterpPart::Expr(e)] => (**e).clone(),
+        _ => IrExpr::Interpolate(rest.to_vec()),
+    }
+}
+
+fn chunk_assign(target: &str, expr: IrExpr) -> IrStmt {
+    IrStmt::Assign {
+        targets: vec![AssignTarget {
+            var: target.to_string(),
+            sigil: None,
+            indices: vec![],
+        }],
+        expr,
+        asm: None,
+    }
+}
+
+fn array_call(func: &str, name: &str, items: Vec<IrExpr>) -> IrExpr {
+    IrExpr::Call {
+        func: func.to_string(),
+        args: vec![
+            IrExpr::Str(name.to_string(), StrStyle::DoubleQuoted),
+            IrExpr::Array(items),
+        ],
+    }
+}
+
+fn loop_body_mut(st: &mut IrStmt) -> Option<&mut Vec<IrStmt>> {
+    match st {
+        IrStmt::While { body, .. } | IrStmt::For { body, .. } => Some(body),
+        _ => None,
+    }
+}
+
+/// The structural lowering (JS/ESTree only): chunk init after the `v` init,
+/// `setArrayAppend` for each self-append, one `concatItems` materialization
+/// immediately after the loop.
+fn lower(stmts: &mut Vec<IrStmt>, accs: &[Accumulator]) -> bool {
+    // init_idx -> [(chunk name, seed text)]; loop_idx -> [(var, chunk name)]
+    let mut seeds: HashMap<usize, Vec<(String, String)>> = HashMap::new();
+    let mut at_loop: HashMap<usize, Vec<(String, String)>> = HashMap::new();
+    for a in accs {
+        // A reserved/special var (IFS, PATH, …) is read implicitly by the
+        // runtime between iterations; its growing value must stay visible.
+        if crate::shir::is_reserved_var(&a.var) {
+            continue;
+        }
+        let Some(seed) = literal_init_text(&stmts[a.init_idx], &a.var) else {
+            continue;
+        };
+        let acc = format!("__acc_{}", a.var);
+        seeds.entry(a.init_idx).or_default().push((acc.clone(), seed));
+        at_loop
+            .entry(a.loop_idx)
+            .or_default()
+            .push((a.var.clone(), acc));
+    }
+    if at_loop.is_empty() {
+        return false;
+    }
+    let mut out: Vec<IrStmt> = Vec::with_capacity(stmts.len() + at_loop.len() * 2);
+    let mut changed = false;
+    for (i, mut st) in stmts.drain(..).enumerate() {
+        if let Some(names) = at_loop.get(&i) {
+            if let Some(body) = loop_body_mut(&mut st) {
+                for (var, acc) in names {
+                    for b in body.iter_mut() {
+                        let seg = match b {
+                            IrStmt::Assign { targets, expr, .. }
+                                if targets.len() == 1
+                                    && targets[0].var == *var
+                                    && targets[0].indices.is_empty()
+                                    && is_self_append(var, expr) =>
+                            {
+                                match expr {
+                                    IrExpr::Interpolate(parts) => Some(appended_segment(parts)),
+                                    _ => None,
+                                }
+                            }
+                            _ => None,
+                        };
+                        if let Some(seg) = seg {
+                            *b = chunk_assign(acc, array_call("setArrayAppend", acc, vec![seg]));
+                            changed = true;
+                        }
+                    }
+                }
+            }
+        }
+        out.push(st);
+        if let Some(list) = seeds.get(&i) {
+            for (acc, seed) in list {
+                let items = if seed.is_empty() {
+                    vec![]
+                } else {
+                    vec![IrExpr::Str(seed.clone(), StrStyle::DoubleQuoted)]
+                };
+                out.push(chunk_assign(acc, array_call("setArray", acc, items)));
+            }
+        }
+        if let Some(names) = at_loop.get(&i) {
+            for (var, acc) in names {
+                out.push(chunk_assign(
+                    var,
+                    IrExpr::Call {
+                        func: "concatItems".to_string(),
+                        args: vec![IrExpr::Str(acc.clone(), StrStyle::DoubleQuoted)],
+                    },
+                ));
+                changed = true;
+            }
+        }
+    }
+    *stmts = out;
+    changed
+}
 
 #[cfg(test)]
 mod tests {
@@ -471,6 +697,162 @@ mod tests {
             accumulators().is_empty(),
             "a mid-loop read must refuse the verdict"
         );
+    }
+
+    /// A read in the loop HEADER observes the growing value just like a
+    /// body read, so it must refuse the verdict.
+    #[test]
+    fn refuses_loop_condition_read() {
+        let init = assign(
+            "blk",
+            IrExpr::Interpolate(vec![InterpPart::Lit(String::new())]),
+        );
+        let body = vec![assign(
+            "blk",
+            IrExpr::Interpolate(vec![
+                InterpPart::Expr(Box::new(get("blk"))),
+                InterpPart::Lit("x".into()),
+            ]),
+        )];
+        let mut stmts = vec![
+            init,
+            IrStmt::While {
+                cond: IrExpr::Call {
+                    func: "test".to_string(),
+                    args: vec![IrExpr::Str("-n $blk".into(), StrStyle::DoubleQuoted)],
+                },
+                body,
+            },
+            echo("blk"),
+        ];
+        transform(&mut stmts);
+        assert!(
+            accumulators().is_empty(),
+            "a loop-condition read must refuse the verdict"
+        );
+    }
+
+    /// Find a statement by shape: `Assign` whose single target is `target`
+    /// and whose expr is a call to `func` (searching nested loop bodies).
+    fn has_call(stmts: &[IrStmt], target: &str, func: &str) -> bool {
+        stmts.iter().any(|s| match s {
+            IrStmt::Assign { targets, expr, .. }
+                if targets.len() == 1 && targets[0].var == target =>
+            {
+                matches!(expr, IrExpr::Call { func: f, .. } if f == func)
+            }
+            IrStmt::While { body, .. } | IrStmt::For { body, .. } => {
+                has_call(body, target, func)
+            }
+            IrStmt::If { then, else_, .. } => {
+                has_call(then, target, func) || has_call(else_, target, func)
+            }
+            _ => false,
+        })
+    }
+
+    /// The canonical shape lowers to `setArray` (chunk init) + a body
+    /// `setArrayAppend` + ONE post-loop `concatItems` materialization, and
+    /// leaves no self-append assignment behind.
+    #[test]
+    fn lowers_self_append_to_chunks() {
+        crate::transforms::set_target(Some("js"));
+        let init = assign(
+            "blk",
+            IrExpr::Interpolate(vec![InterpPart::Lit(String::new())]),
+        );
+        let i_init = assign("i", IrExpr::Str("0".into(), StrStyle::DoubleQuoted));
+        let loop_body = vec![
+            assign(
+                "blk",
+                IrExpr::Interpolate(vec![
+                    InterpPart::Expr(Box::new(get("blk"))),
+                    InterpPart::Lit(" x ".into()),
+                    InterpPart::Expr(Box::new(get("i"))),
+                ]),
+            ),
+            assign("i", IrExpr::Str("1".into(), StrStyle::DoubleQuoted)),
+        ];
+        let mut stmts = vec![
+            init,
+            i_init,
+            IrStmt::While {
+                cond: IrExpr::Bool(true),
+                body: loop_body,
+            },
+            echo("blk"),
+        ];
+        assert!(transform(&mut stmts), "the lowering must report a change");
+        assert!(
+            has_call(&stmts, "__acc_blk", "setArray"),
+            "chunk init after the v init: {stmts:?}"
+        );
+        assert!(
+            has_call(&stmts, "__acc_blk", "setArrayAppend"),
+            "the self-append becomes a chunk push: {stmts:?}"
+        );
+        assert!(
+            has_call(&stmts, "blk", "concatItems"),
+            "one post-loop materialization: {stmts:?}"
+        );
+        // The materialization must sit AFTER the loop, not before it.
+        let loop_at = stmts
+            .iter()
+            .position(|s| matches!(s, IrStmt::While { .. }))
+            .expect("loop kept");
+        let mat_at = stmts
+            .iter()
+            .position(|s| match s {
+                IrStmt::Assign { targets, expr, .. } => {
+                    targets.len() == 1
+                        && targets[0].var == "blk"
+                        && matches!(expr, IrExpr::Call { func, .. } if func == "concatItems")
+                }
+                _ => false,
+            })
+            .expect("materialization emitted");
+        assert!(mat_at > loop_at, "materialization must follow the loop");
+        // The growing-template assignment must be gone.
+        assert!(
+            !stmts.iter().any(|s| match s {
+                IrStmt::Assign { targets, expr, .. } =>
+                    targets.iter().any(|t| t.var == "blk") && is_self_append("blk", expr),
+                _ => false,
+            }),
+            "no self-append assignment survives: {stmts:?}"
+        );
+        crate::transforms::set_target(None);
+    }
+
+    /// A NON-JS renderer keeps the analysis verdict but never sees the
+    /// chunk lowering (its `concatItems` op has no arm).
+    #[test]
+    fn does_not_lower_for_perl() {
+        crate::transforms::set_target(Some("perl"));
+        let init = assign(
+            "blk",
+            IrExpr::Interpolate(vec![InterpPart::Lit(String::new())]),
+        );
+        let body = vec![assign(
+            "blk",
+            IrExpr::Interpolate(vec![
+                InterpPart::Expr(Box::new(get("blk"))),
+                InterpPart::Lit("x".into()),
+            ]),
+        )];
+        let mut stmts = vec![
+            init,
+            IrStmt::While {
+                cond: IrExpr::Bool(true),
+                body,
+            },
+            echo("blk"),
+        ];
+        let before = format!("{stmts:?}");
+        assert!(!transform(&mut stmts), "perl target must not lower");
+        assert_eq!(format!("{stmts:?}"), before, "perl shape is unchanged");
+        assert_eq!(accumulators().len(), 1, "the verdict still fires");
+        crate::transforms::set_target(None);
     }
 
     /// A non-literal re-init before the loop poisons the verdict.
