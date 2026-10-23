@@ -59,6 +59,12 @@ pub struct Render {
     /// `x=5`, `x=<int var>`). bash stores the decimal TEXT of those, so the
     /// target is still a string scalar (see `int_text_expr`).
     writes_inttext: HashMap<String, usize>,
+    /// writes whose value is NEITHER a Go string NOR integer text (`x=$(( … ))`
+    /// is text, but `x` from a generic `any` render is genuinely any). One
+    /// such write disqualifies the string-scalar promotion. Counting these
+    /// directly is what makes the verdict independent of how many times a
+    /// caller happens to call `mark_written` for one write.
+    writes_plain: HashMap<String, usize>,
     /// vars actually read (skip the `_ = x` dead-var guard)
     read: BTreeSet<String>,
     /// Go identifier per shell var name (sanitize + de-dup)
@@ -388,11 +394,46 @@ pub fn shir_to_go(prog: &IrProgram) -> String {
     // Shell scalars hold TEXT, so an untyped var (A2 has no verdict) whose
     // EVERY write stored a Go string is a Go `string`, not `any` + an
     // `s2s(v)` coercion at each read. The write kinds are only known once
-    // the body has been rendered, so pass 1 renders with the A2 verdicts
-    // and notes the writes; pass 2 hoists the promoted vars as `string`.
+    // the body has been rendered, so a render notes the writes and the next
+    // one hoists the promoted vars as `string`.
     let mut r = Render::default();
     r.var_types = prog.var_types.iter().cloned().collect();
     r.program(&prog);
+    // Promotion is a FIXED POINT, not one round: making `n` a `string`
+    // turns `factors = n` from an `any` write into a `string` write, which
+    // is what lets `factors` promote in the next round. The promoted set
+    // only grows — a promoted name carries a `Str` verdict afterwards and
+    // every predicate below refuses a verdict that is not `Any` — so each
+    // round adds at least one name and the loop terminates.
+    loop {
+        let mut promoted = promotable_scalars(&prog, &r);
+        if promoted.is_empty() {
+            break;
+        }
+        // `Render::writes`/`written` are hash maps, so the candidate order is
+        // arbitrary; sorting keeps the hoisted `var` block byte-identical
+        // across runs.
+        promoted.sort_by(|a, b| a.0.cmp(&b.0));
+        // A promoted name may already carry an `Any` entry; drop it so the
+        // program never holds two verdicts for one var — `var_types` is read
+        // as a map downstream and a duplicate would make the answer depend
+        // on entry order.
+        let names: BTreeSet<String> = promoted.iter().map(|(v, _)| v.clone()).collect();
+        prog.var_types
+            .retain(|(t, ty)| !(*ty == IrType::Any && names.contains(t)));
+        prog.var_types.extend(promoted);
+        r = Render::default();
+        r.var_types = prog.var_types.iter().cloned().collect();
+        r.program(&prog);
+    }
+    r.out.join("\n")
+}
+
+/// The untyped scalars of one render that bash semantics say are `string`:
+/// every write stored Go text (a string value, or an integer's decimal
+/// TEXT), so the Go home can be `string` instead of `any` plus an `s2s(v)`
+/// coercion at every read.
+fn promotable_scalars(prog: &IrProgram, r: &Render) -> Vec<(String, IrType)> {
     let mut promoted: Vec<(String, IrType)> = Vec::new();
     for (v, n) in &r.writes {
         // every write must have been a string write, and the var must not
@@ -410,21 +451,45 @@ pub fn shir_to_go(prog: &IrProgram) -> String {
             // store KEY, and declaring a var_types entry for it is exactly
             // what makes decl_lines' `n.contains('[')` rule hoist `[]any`
             || v.contains('[')
-            || prog.var_types.iter().any(|(t, _)| t == v)
+            // A verdict that NAMES a Go scalar home is A2's answer and is
+            // kept. `Any` names none — it is the annotation for "no
+            // scalar type known" — so the write shapes above are strictly
+            // better evidence, and promoting it is what removes the
+            // `s2s(v)` coercion from every read.
+            || prog
+                .var_types
+                .iter()
+                .any(|(t, ty)| t == v && *ty != IrType::Any)
         {
             continue;
         }
         promoted.push((v.clone(), IrType::Str));
     }
-    if promoted.is_empty() {
-        return r.out.join("\n");
+    // A var the program only READS holds bash's value for an unset variable
+    // ("") — and the reads already resolve the hoisted Go var, not the
+    // environment (`getvar_str`/`expr_str` only call `os.Getenv` for a name
+    // that is NOT declared). A2 still hands such a name a verdict with no Go
+    // scalar home (`Any`), which hoisted it as `var v any` — nil, formatted
+    // by `s2s` at EVERY read. `string` is the faithful hoist: the same ""
+    // value with no coercion, so the read is the identifier itself.
+    for v in &r.written {
+        // Verdict-less or `Any` only: every OTHER verdict names a scalar home
+        // (int64 for Int, `string` for Str/AsciiStr) and overriding it here
+        // would fight A2 instead of completing it.
+        let verdict = prog.var_types.iter().find(|(t, _)| t == v).map(|(_, ty)| ty);
+        if r.writes.contains_key(v)
+            || r.functions.contains(v)
+            || r.assoc.contains(v)
+            || r.arrays.contains(v)
+            || r.arith_ints.contains(v)
+            || v.contains('[')
+            || !matches!(verdict, None | Some(IrType::Any))
+        {
+            continue;
+        }
+        promoted.push((v.clone(), IrType::Str));
     }
-    promoted.sort_by(|a, b| a.0.cmp(&b.0));
-    prog.var_types.extend(promoted);
-    let mut r = Render::default();
-    r.var_types = prog.var_types.iter().cloned().collect();
-    r.program(&prog);
-    r.out.join("\n")
+    promoted
 }
 
 impl Render {
@@ -588,10 +653,13 @@ impl Render {
             // caller's TODO-delta check rejects)
             IrExpr::Capture { .. } => true,
             // A positional read (`$1`, `$@`) is `paramAt`/`strings.Join`,
-            // both Go strings; any other bare name is a string only when it
-            // hoists as one (see declared_go_string).
+            // both Go strings; a var hoists as a string when it has the
+            // verdict. A var that is NOT declared anywhere is `os.Getenv(…)`
+            // in `expr_any` — a Go string too, which is what makes
+            // `cpu="$basic_machine"` a string write instead of leaving
+            // `cpu` an `any` boxed by `s2s` at every read.
             IrExpr::Var(v, _) | IrExpr::Ident(v) => {
-                Self::positional_str(v) || self.declared_go_string(v)
+                Self::positional_str(v) || self.declared_go_string(v) || !self.declared(v)
             }
             IrExpr::Call { func, args } => match func.as_str() {
                 // every one of these renders through a `string`-returning
@@ -600,10 +668,16 @@ impl Render {
                 // value. The stub fallbacks render an int and raise a TODO,
                 // which the caller's TODO-delta check rejects.
                 "capture" | "captureWords" | "param" | "join" | "brace" | "arrayIndex"
-                | "fnValue" => true,
+                | "fnValue"
+                // `split` is `strings.Join(strings.Fields(…), " ")` and
+                // `arrayItems` is `strings.Join(pList(…), " ")` — both Go
+                // strings, so the caller's `s2s` would only box them back.
+                | "split" | "arrayItems" => true,
                 "getVar" => match args.first() {
+                    // `getvar_any` returns `os.Getenv(…)` — a Go string —
+                    // for a name that is not declared anywhere.
                     Some(IrExpr::Str(n, _)) => {
-                        Self::positional_str(n) || self.declared_go_string(n)
+                        Self::positional_str(n) || self.declared_go_string(n) || !self.declared(n)
                     }
                     _ => false,
                 },
@@ -2023,6 +2097,14 @@ impl Render {
             fail(self);
             return None;
         }
+        // `$(cat <<EOF … EOF)` / `$(cat <<< s)`: `cat` with no FILE operand
+        // reproduces its stdin byte for byte, and the capture contract is
+        // that same text with the trailing newlines trimmed — so the value
+        // is the text we already hold. Spawning a process to copy it is pure
+        // marshalling (`strings.NewReader` in, `TrimRight` out).
+        if lone_cat_stdin(inner) {
+            return Some(format!("strings.TrimRight({text}, \"\\n\")"));
+        }
         let call = Self::exec_cmd_call(&cmd, &argv);
         let id = self.new_tmp();
         Some(format!(
@@ -2086,12 +2168,24 @@ impl Render {
             self.todo = todo;
             return false;
         }
+        let sync = self.sync_inline(var);
+        // Same `cat`-copies-stdin rule as `stdin_str_capture`: the value is
+        // the text the redirect already holds.
+        if lone_cat_stdin(&[IrStmt::Expr(IrExpr::Call {
+            func: "exec".to_string(),
+            args: vec![cmd.clone(), IrExpr::Array(args.to_vec())],
+        })]) {
+            self.flush_sides();
+            self.mark_str_written(var);
+            let m = self.go_ident(var);
+            self.emit(&format!("{m} = strings.TrimRight({text}, \"\\n\");{sync}"));
+            return true;
+        }
         let call = Self::exec_cmd_call(&c, &argv);
         let id = self.new_tmp();
         self.flush_sides();
         self.mark_str_written(var);
         let m = self.go_ident(var);
-        let sync = self.sync_inline(var);
         self.emit(&format!(
             "{m} = func() string {{ __hs{id}_c := {call}; \
              __hs{id}_c.Stdin = strings.NewReader({text}); \
@@ -8125,6 +8219,24 @@ impl Render {
                 // with an env literal (AGENTS.md §2). Stage-level stdio
                 // (`2>/dev/null`, `> f` on an edge) welds into the chain
                 // instead of refusing it (see `pipeline_chain`).
+                // `<loop printing lines> | sort` — the exec chain below can
+                // only admit single-command stages, and the `bash -c`
+                // reconstruction after it hands the child an env literal of
+                // SCALARS only, so a loop over a collection expanded to
+                // nothing there. Both stages are native Go
+                // (see `stmt_print_loop_pipeline`), so this is tried first.
+                {
+                    let bodies: Vec<&[IrStmt]> = stages.iter().map(|st| &st[..]).collect();
+                    let (todo, sides, tmp, out_len) =
+                        (self.todo, self.sides.len(), self.tmp, self.out.len());
+                    if self.stmt_print_loop_pipeline(&bodies) && self.todo == todo {
+                        return;
+                    }
+                    self.out.truncate(out_len);
+                    self.sides.truncate(sides);
+                    self.tmp = tmp;
+                    self.todo = todo;
+                }
                 {
                     let (todo, sides, tmp) = (self.todo, self.sides.len(), self.tmp);
                     let bodies: Vec<&[IrStmt]> = stages.iter().map(|st| &st[..]).collect();
@@ -9090,6 +9202,34 @@ impl Render {
                 self.mark_todo("exec");
             }
             IrExpr::Call { func, args } if func == "pipeline" => {
+                // `<loop printing lines> | sort` in STATEMENT position: the
+                // lowering is a statement block, not a value, so it has to
+                // happen here rather than inside `pipeline_expr` (see
+                // `stmt_print_loop_pipeline`).
+                if let Some(IrExpr::Array(items)) = args.first() {
+                    let mut bodies: Vec<&[IrStmt]> = Vec::with_capacity(items.len());
+                    let mut ok = true;
+                    for it in items {
+                        match it {
+                            IrExpr::Arrow(b) => bodies.push(&b[..]),
+                            _ => {
+                                ok = false;
+                                break;
+                            }
+                        }
+                    }
+                    if ok {
+                        let (todo, sides, tmp, out_len) =
+                            (self.todo, self.sides.len(), self.tmp, self.out.len());
+                        if self.stmt_print_loop_pipeline(&bodies) && self.todo == todo {
+                            return;
+                        }
+                        self.out.truncate(out_len);
+                        self.sides.truncate(sides);
+                        self.tmp = tmp;
+                        self.todo = todo;
+                    }
+                }
                 let v = self.pipeline_expr(args);
                 self.flush_sides();
                 self.emit(&format!("st = {v};"));
@@ -10010,17 +10150,29 @@ impl Render {
                 for a in argv {
                     if let IrExpr::Str(name, _) = a {
                         let m = self.go_ident(name);
-                        self.mark_written(name);
-                        if self.is_arr(name) {
+                        // bash has no null: an unset scalar reads as the
+                        // EMPTY STRING (`${x}` → "", `${x:-default}` →
+                        // "default"). Storing `nil` in an untyped slot forced
+                        // `s2s(v)` at every read to recover that same "",
+                        // so the slot could never hoist as a Go `string` —
+                        // storing "" directly is the native form AND the
+                        // faithful value (see `promotable_scalars`).
+                        // Collections and function values have no "" zero, so
+                        // those keep `nil`.
+                        if self.is_arr(name)
+                            || self.is_assoc(name)
+                            || self.functions.contains(name)
+                        {
+                            self.mark_written(name);
                             self.emit(&format!("{m} = nil;"));
-                        } else if self.is_num(name) {
+                        } else if self.declared_go_int(name) {
+                            self.mark_written(name);
                             let sync = self.sync_inline(name);
                             self.emit(&format!("{m} = 0;{sync}"));
-                        } else if self.is_str(name) {
+                        } else {
+                            self.mark_str_written(name);
                             let sync = self.sync_inline(name);
                             self.emit(&format!("{m} = \"\";{sync}"));
-                        } else {
-                            self.emit(&format!("{m} = nil;"));
                         }
                     }
                 }
@@ -10724,6 +10876,165 @@ impl Render {
                     return;
                 }
                 self.mark_todo(&format!("For iter {:?}", iter));
+            }
+        }
+    }
+
+    /// `<loop printing lines> | sort` — a pipeline whose first stage is a
+    /// loop and whose only other stage is a bare `sort`.
+    ///
+    /// Both halves have native Go forms, so neither needs a child: the loop
+    /// output is a `[]string` with one entry per printed `echo` line, and
+    /// `sort.Strings` is the ordering a flagless `sort` applies. The `bash
+    /// -c` fallback this replaces was not merely slower — it was WRONG for a
+    /// loop over a collection, because the reconstructed script's env
+    /// literal carries only scalars, so `${!map[@]}` expanded to nothing and
+    /// the pipeline printed no lines at all.
+    ///
+    /// REFUSE > GUESS: exactly two stages; the second is `sort` with NO
+    /// operand (`-n`/`-r`/`-u`/`-k`/a file all change the result); the body
+    /// is nothing but `echo` (one line each, so `Println` reproduces it, and
+    /// a flag such as `-n`/`-e` is refused for the same reason); and the
+    /// iter must resolve to a list `stmt_for` already renders natively.
+    /// Everything else keeps the fallback.
+    fn stmt_print_loop_pipeline(&mut self, stages: &[&[IrStmt]]) -> bool {
+        let [first, second] = stages else {
+            return false;
+        };
+        let [IrStmt::For { var, iter, body }] = *first else {
+            return false;
+        };
+        let [IrStmt::Expr(IrExpr::Call { func, args })] = *second else {
+            return false;
+        };
+        if !matches!(func.as_str(), "builtin" | "exec") {
+            return false;
+        }
+        if !matches!(args.first(), Some(IrExpr::Str(c, _)) if c == "sort") {
+            return false;
+        }
+        if !matches!(args.get(1), Some(IrExpr::Array(items)) if items.is_empty()) {
+            return false;
+        }
+        if body.is_empty() {
+            return false;
+        }
+        let Some(list) = self.for_list(iter) else {
+            return false;
+        };
+        // Render the line texts BEFORE emitting anything: a refusal below
+        // must leave the caller's rollback nothing to undo, and a body word
+        // that has no native spelling is a refusal, not a `runCmd` (which
+        // RETURNS AN EXIT CODE and writes to stdout — appending that code
+        // and then sorting it is what printed three `0`s instead of the
+        // three lines).
+        let (todo, sides, tmp) = (self.todo, self.sides.len(), self.tmp);
+        let mut lines: Vec<String> = Vec::with_capacity(body.len());
+        for s in body {
+            let IrStmt::Expr(call) = s else {
+                self.sides.truncate(sides);
+                self.tmp = tmp;
+                self.todo = todo;
+                return false;
+            };
+            let Some(text) = self.echo_line_text(call) else {
+                self.sides.truncate(sides);
+                self.tmp = tmp;
+                self.todo = todo;
+                return false;
+            };
+            lines.push(text);
+        }
+        let m = self.go_ident(var);
+        self.mark_written(var);
+        let pl = format!("__pl{}", self.new_tmp());
+        let vn = format!("__v{}", self.new_tmp());
+        let ln = format!("__l{}", self.new_tmp());
+        self.emit(&format!("{pl} := []string{{}};"));
+        match list {
+            ForList::Static(items) => {
+                let (t, elems) = if self.is_num(var) {
+                    (
+                        "int64",
+                        items
+                            .iter()
+                            .map(|e| format!("s2i({e})"))
+                            .collect::<Vec<_>>()
+                            .join(", "),
+                    )
+                } else if self.is_str(var) {
+                    ("string", items.join(", "))
+                } else {
+                    ("any", items.join(", "))
+                };
+                self.emit(&format!("for _, {vn} := range []{t}{{{elems}}} {{"));
+            }
+            ForList::Runtime { pre, slice } => {
+                self.emit(&pre);
+                self.emit(&format!("for _, {vn} := range {slice} {{"));
+            }
+        }
+        self.loop_depth += 1;
+        self.depth += 1;
+        if self.is_num(var) {
+            self.emit(&format!("{m} = s2i({vn});"));
+        } else if self.is_str(var) {
+            self.emit(&format!("{m} = {vn};"));
+        } else {
+            self.emit(&format!("{m} = s2s({vn});"));
+        }
+        self.emit_sync(var);
+        for text in lines {
+            self.flush_sides();
+            self.emit(&format!("{pl} = append({pl}, {text});"));
+        }
+        self.depth -= 1;
+        self.loop_depth -= 1;
+        self.emit("}");
+        self.emit(&format!("sort.Strings({pl});"));
+        self.emit(&format!(
+            "for _, {ln} := range {pl} {{ fmt.Println({ln}) }}"
+        ));
+        self.emit("st = 0;");
+        self.need_st = true;
+        true
+    }
+
+    /// The value of one `echo` line — exactly the words `echo` would write,
+    /// without its terminating newline (the caller's `Println` supplies it).
+    ///
+    /// REFUSE > GUESS: `-n` suppresses the terminator (the caller would add a
+    /// newline bash never wrote) and `-e` can expand one argument into
+    /// several lines (which `sort` orders separately, not as one entry);
+    /// `printf` is excluded because a format without a trailing newline is
+    /// not a line either. A word the renderer cannot spell natively —
+    /// `echo_parts` signals that with a TODO marker — refuses too, instead of
+    /// falling back to a subprocess that would print to OUR stdout.
+    fn echo_line_text(&mut self, e: &IrExpr) -> Option<String> {
+        let IrExpr::Call { func, args } = e else {
+            return None;
+        };
+        if !matches!(func.as_str(), "builtin" | "exec") {
+            return None;
+        }
+        let (Some(IrExpr::Str(cmd, _)), Some(IrExpr::Array(argv))) = (args.first(), args.get(1))
+        else {
+            return None;
+        };
+        if echo_cmd(cmd) != Some("echo") {
+            return None;
+        }
+        let (items, newline, escape) = Self::echo_options(argv);
+        if !newline || escape {
+            return None;
+        }
+        let todo = self.todo;
+        let parts = self.echo_parts(items, false);
+        match parts {
+            Some(parts) if self.todo == todo => Some(self.parts_str(parts)),
+            _ => {
+                self.todo = todo;
+                None
             }
         }
     }
@@ -12960,6 +13271,33 @@ fn lone_exec_args(body: &[crate::ir::IrStmt]) -> Option<Vec<crate::ir::IrExpr>> 
         return None;
     };
     lone_exec_stmt(s)
+}
+
+/// `cat` with no FILE operand (or a lone `-`): it copies stdin to stdout
+/// unchanged, so when the caller already knows the stdin text the command
+/// IS that text — no child process is needed to prove it.
+///
+/// Anything else refuses: a file operand reads the filesystem, and an option
+/// (`-A`/`-n`/`-v`) transforms the bytes on the way through.
+fn lone_cat_stdin(body: &[crate::ir::IrStmt]) -> bool {
+    let Some(args) = lone_exec_args(body) else {
+        return false;
+    };
+    let Some(crate::ir::IrExpr::Str(cmd, _)) = args.first() else {
+        return false;
+    };
+    if cmd != "cat" {
+        return false;
+    }
+    match args.get(1) {
+        None => true,
+        Some(crate::ir::IrExpr::Array(items)) => {
+            items.is_empty()
+                || (items.len() == 1
+                    && matches!(&items[0], crate::ir::IrExpr::Str(s, _) if s == "-"))
+        }
+        _ => false,
+    }
 }
 
 /// The `exec` Call-args shape for a lone command STATEMENT (see
