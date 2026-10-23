@@ -15467,7 +15467,87 @@ fn fold_expr(e: &IrExpr) -> IrExpr {
                 e.clone()
             }
         }
+        // The NEUTRAL arithmetic AST was never folded: Pass 0.5 only folds
+        // the `arith("…")` STRING spelling, so a fully literal `$((1000**7))`
+        // survived to the renderer and became a runtime helper call with an
+        // overflow branch (core request c-20261022-224500). Fold it here.
+        IrExpr::Arith(ast) => IrExpr::Arith(Box::new(fold_arith_ast(ast))),
         _ => e.clone(),
+    }
+}
+
+/// `$((b ** e))` in bash is int64 two's-complement arithmetic, so a literal
+/// power WRAPS — it does not saturate and does not error. Repeated squaring
+/// over i64 is the same product mod 2^64.
+///
+/// This exists because the C renderer's `_sh_pow` CLAMPS on overflow
+/// (`return 0`), which converts a wrong number into a different wrong
+/// number, silently: `3 * 1000 ** 7` prints `0` where bash prints
+/// `-6819284014656913408`. Folding the literal form both removes the
+/// helper call for the common shape and reproduces bash exactly.
+fn pow_wrapping(base: i64, exp: i64) -> i64 {
+    let mut acc: i64 = 1;
+    let mut b = base;
+    let mut e = exp;
+    while e > 0 {
+        if e & 1 == 1 {
+            acc = acc.wrapping_mul(b);
+        }
+        e >>= 1;
+        if e > 0 {
+            b = b.wrapping_mul(b);
+        }
+    }
+    acc
+}
+
+/// Constant-fold the neutral arithmetic AST. Only `**` is folded (the other
+/// operators keep their existing paths, and staying narrow keeps the change
+/// reviewable); every other node is rebuilt structurally so a subtree that
+/// is not fully literal keeps its exact shape.
+fn fold_arith_ast(ast: &ArithAst) -> ArithAst {
+    match ast {
+        ArithAst::Bin { op, lhs, rhs } => {
+            let l = fold_arith_ast(lhs);
+            let r = fold_arith_ast(rhs);
+            if op == "**" {
+                if let (ArithAst::Num(a), ArithAst::Num(b)) = (&l, &r) {
+                    // A negative exponent is a runtime ERROR in bash, not a
+                    // value — refuse to fold it rather than invent one.
+                    if *b >= 0 {
+                        return ArithAst::Num(pow_wrapping(*a, *b));
+                    }
+                }
+            }
+            ArithAst::Bin {
+                op: op.clone(),
+                lhs: Box::new(l),
+                rhs: Box::new(r),
+            }
+        }
+        ArithAst::Un { op, arg } => ArithAst::Un {
+            op: op.clone(),
+            arg: Box::new(fold_arith_ast(arg)),
+        },
+        ArithAst::Cond { test, then, else_ } => ArithAst::Cond {
+            test: Box::new(fold_arith_ast(test)),
+            then: Box::new(fold_arith_ast(then)),
+            else_: Box::new(fold_arith_ast(else_)),
+        },
+        ArithAst::Index { var, key } => ArithAst::Index {
+            var: var.clone(),
+            key: Box::new(fold_arith_ast(key)),
+        },
+        ArithAst::Assign { var, op, rhs } => ArithAst::Assign {
+            var: var.clone(),
+            op: op.clone(),
+            rhs: Box::new(fold_arith_ast(rhs)),
+        },
+        ArithAst::Cast { ty, arg } => ArithAst::Cast {
+            ty: ty.clone(),
+            arg: Box::new(fold_arith_ast(arg)),
+        },
+        other => other.clone(),
     }
 }
 
@@ -15705,6 +15785,58 @@ mod tests {
                 IrExpr::Array(words),
             ],
         }
+    }
+
+    /// A fully literal `$(( … ** … ))` folds to the WRAPPED product, exactly
+    /// as bash computes it (core request c-20261022-224500). Before this the
+    /// neutral `ArithAst` was never folded, so `3 * 1000 ** 7` reached the
+    /// renderer as a runtime `_sh_pow(...)` call whose overflow arm CLAMPED
+    /// to 0 — a silent wrong number.
+    #[test]
+    fn literal_pow_folds_with_bash_wrapping() {
+        let arith = IrExpr::Arith(Box::new(ArithAst::Bin {
+            op: "*".into(),
+            lhs: Box::new(ArithAst::Num(3)),
+            rhs: Box::new(ArithAst::Bin {
+                op: "**".into(),
+                lhs: Box::new(ArithAst::Num(1000)),
+                rhs: Box::new(ArithAst::Num(7)),
+            }),
+        }));
+        let IrExpr::Arith(ast) = fold_expr(&arith) else {
+            panic!("expected an Arith node");
+        };
+        // `1000 ** 7` wraps to 3875820019684212736, so the product wraps to
+        // bash's -6819284014656913408.
+        let ArithAst::Bin { op, rhs, .. } = &*ast else {
+            panic!("expected the outer product, got {ast:?}");
+        };
+        assert_eq!(op, "*");
+        assert_eq!(**rhs, ArithAst::Num(3875820019684212736));
+
+        // bash reference values (bash -c 'echo $((3 * 1000 ** k))')
+        assert_eq!(pow_wrapping(1000, 6), 1_000_000_000_000_000_000);
+        assert_eq!(pow_wrapping(1000, 7), 3_875_820_019_684_212_736);
+        assert_eq!(pow_wrapping(2, 10), 1024, "the narrow case stays exact");
+        assert_eq!(pow_wrapping(7, 0), 1, "x ** 0 == 1, as in bash");
+    }
+
+    /// A negative exponent is a bash ARITHMETIC ERROR, not a value, so the
+    /// fold must leave it to the runtime rather than invent `1`.
+    #[test]
+    fn literal_pow_negative_exponent_is_not_folded() {
+        let arith = IrExpr::Arith(Box::new(ArithAst::Bin {
+            op: "**".into(),
+            lhs: Box::new(ArithAst::Num(2)),
+            rhs: Box::new(ArithAst::Num(-1)),
+        }));
+        let IrExpr::Arith(ast) = fold_expr(&arith) else {
+            panic!("expected an Arith node");
+        };
+        assert!(
+            matches!(&*ast, ArithAst::Bin { op, .. } if op == "**"),
+            "2 ** -1 must stay a Bin (runtime error), got {ast:?}"
+        );
     }
 
     /// `cd D && pwd` must render NATIVELY (chdir + Cwd::getcwd), not as a
