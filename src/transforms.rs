@@ -90,6 +90,7 @@ pub mod seq_range_for; // worker-submitted: `for i in $(seq A B)` → native num
 /// `pub mod <name>;` above) when a worker-submitted transform is accepted
 /// into the crate. Each entry is (name, transform_fn).
 pub mod shir_pipeline_native;
+pub mod capture_dup_flatten; // a capture body whose `exec N>&M` dup must outlive sibling commands → ONE `begin … end` compound
 pub mod dead_fn_elim; // generic: remove never-referenced shell functions
 pub mod text_ops; // common shell commands → semantic IR nodes (cut/tr/sed/head/tail/wc)
 pub mod text_ops_planner; // the "solve" idea, observable: wc -l lowers per-backend by manifest (opt-in)
@@ -145,6 +146,9 @@ pub fn all() -> Vec<(&'static str, TransformFn)> {
         // (estree.rs transform_cmd rewrites `<(...)` pre-IR) — it serves
         // the --shir export and the A1 ingress (frontend-emitted JSON).
         ("process-subst", process_subst::transform),
+        // capture-dup-flatten: needs the dup stmt, which process-subst does not
+        // touch — but must run before any transform that rewrites captures.
+        ("capture-dup-flatten", capture_dup_flatten::transform),
         ("arith-forms", arith_forms::transform),
         // native-stmt normalisation (fail-shir: perl shell-out elimination):
         // `echo args > file` → Block-wrapped exec (native select redirect),

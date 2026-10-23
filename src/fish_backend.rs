@@ -3939,6 +3939,10 @@ fn cmd_to_fish(e: &IrExpr) -> Result<String, String> {
         // native spelling is `math`, not the bash `(( … ))` form fish
         // cannot parse in a condition.
         IrExpr::Arith(a) => Ok(format!("math --scale 0 {}", arith_to_fish(a))),
+        // a BOOLEAN operand of a `&&`/`||` chain inside a capture body
+        // (`$(true || …)`): `true`/`false` as commands, exactly as the
+        // condition renderer would spell them.
+        IrExpr::Bool(b) => Ok(if *b { "true".to_string() } else { "false".to_string() }),
         // a bare variable in command position: the goto restructure's
         // flag guards (`if (flag) break`) — truthiness of the store
         // value ([ -n ]), matching the runtime's nonempty-true semantics
