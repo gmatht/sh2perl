@@ -129,6 +129,7 @@ fn transform_stmt(
         }
         IrStmt::While { cond: _, body: _, .. } => {
             let mut x = native_while_multi_cond(st);
+            x |= native_while_test_cond(st);
             let IrStmt::While { cond, body, .. } = st else { return x; };
             x |= transform_with_printf(body, lower_printf, files);
             x |= transform_expr(cond, files);
@@ -194,6 +195,7 @@ fn transform_stmt(
             x |= native_echo_bc_stmt(st);
             x |= native_grep_devnull_or(st);
             x |= native_test_chain(st);
+            x |= native_eval_assign_stmt(st);
             x |= native_echo_or_chain(st);
             x |= native_if_test_cond(st);
             x |= native_test_exit_stmt(st);
@@ -233,6 +235,9 @@ fn transform_stmt(
                 // Revisit the newly-created If so its literal echo/printf
                 // branches receive the same native lowering.
                 x |= transform_stmt(st, lower_printf, files);
+            }
+            if cmd_and_chain_to_if(st, lower_printf, files) {
+                x = true;
             }
             x
         }
@@ -444,38 +449,73 @@ fn test_and_to_if(st: &mut IrStmt) -> bool {
     let IrStmt::Expr(IrExpr::BinOp { op: BinOpKind::And, lhs, rhs }) = st else {
         return false;
     };
-    let IrExpr::Call { func, args } = lhs.as_ref() else {
-        return false;
-    };
-    let static_pipeline = if func == "pipeline" {
-        static_pipeline_truth(lhs.as_ref())
-    } else {
-        None
-    };
-    let native_condition = if func == "test" {
-        true
-    } else if static_pipeline.is_some() {
-        true
-    } else if func == "grep" {
-        // The shared pipeline capability has a native condition lowering
-        // only for quiet grep with literal pattern/file operands.
-        args.iter().any(|arg| matches!(arg, IrExpr::Str(s, _) if s == "-q"))
-    } else {
-        false
+    // The leaf may be the raw `test`/pipeline/grep Call — or, after the
+    // shared test-lowering rewrote a statement-position chain leaf, a
+    // pure boolean value primitive (`strHasSuffix(…)` / a typed BinOp
+    // comparison / their And/Or/Not nesting): same TRUE/FALSE value and
+    // same 0/1 status write, so the same If rewrite applies unchanged.
+    let (static_pipeline, native_condition) = match lhs.as_ref() {
+        IrExpr::Call { func, args } => {
+            let sp = if func == "pipeline" {
+                static_pipeline_truth(lhs.as_ref())
+            } else {
+                None
+            };
+            let nc = func == "test"
+                || sp.is_some()
+                || (func == "grep"
+                    // The shared pipeline capability has a native condition lowering
+                    // only for quiet grep with literal pattern/file operands.
+                    && args.iter().any(|arg| matches!(arg, IrExpr::Str(s, _) if s == "-q")))
+                || crate::shir::is_pure_bool(lhs);
+            (sp, nc)
+        }
+        other => (None, crate::shir::is_pure_bool(other)),
     };
     if !native_condition {
         return false;
     }
-    let Some(then) = single_always_true_exec(rhs) else {
-        return false;
-    };
+    // `test ... && <echo/printf>`: the then branch is an always-success
+    // exec, which carries the true path's status; no else keeps the
+    // false path at the test's own (non-zero) status.
+    if let Some(then) = single_always_true_exec(rhs) {
+        *st = IrStmt::If {
+            cond: static_pipeline.map(IrExpr::Bool).unwrap_or_else(|| (**lhs).clone()),
+            then,
+            elsifs: vec![],
+            else_: vec![],
+        };
+        return true;
+    }
+    // `test ... && <assignment/other>`. Without this the whole compound
+    // stayed a raw BinOp for the backend, which has no rendering for a
+    // `test` whose words carry an unexpanded `$(...)`
+    // (parse-bracket-subshell-pipe.sh died in ir.rs's render_test_call).
+    // bash's status here is the test's own when it fails, so the else
+    // records a failing status explicitly (an If with no else would
+    // restart at 0, and the script's exit status is this compound's).
+    let Some(then) = single_stmt(rhs) else { return false };
     *st = IrStmt::If {
         cond: static_pipeline.map(IrExpr::Bool).unwrap_or_else(|| (**lhs).clone()),
-        then,
+        then: vec![then],
         elsifs: vec![],
-        else_: vec![],
+        else_: vec![status_exec(false)],
     };
     true
+}
+
+/// The statement form of a `&&`-RHS expression: a bare assignment is
+/// just an Expr statement. Returns None for shapes this rewrite should
+/// not touch (control flow, redirects, …).
+fn single_stmt(e: &IrExpr) -> Option<IrStmt> {
+    match e {
+        IrExpr::Call { func, .. }
+            if matches!(func.as_str(), "assign" | "exec" | "builtin" | "test") =>
+        {
+            Some(IrStmt::Expr(e.clone()))
+        }
+        _ => None,
+    }
 }
 
 fn test_chain_to_if(st: &mut IrStmt) -> bool {
@@ -497,18 +537,19 @@ fn test_chain_to_if(st: &mut IrStmt) -> bool {
     else {
         return false;
     };
-    let IrExpr::Call { func, .. } = cond.as_ref() else {
-        return false;
-    };
     // A static pipeline condition (`echo LIT | grep PAT`) is a provable
-    // boolean; a `test` condition is a native boolean. Anything else keeps
+    // boolean; a `test` condition is a native boolean; and — after the
+    // shared test-lowering rewrote a statement-position chain leaf — a
+    // pure boolean value primitive (`strHasSuffix(…)` / a typed BinOp
+    // comparison) carries the same true/false value. Anything else keeps
     // the shell-out.
-    let static_truth = if func == "pipeline" {
-        static_pipeline_truth(cond.as_ref())
-    } else {
-        None
+    let static_truth = match cond.as_ref() {
+        IrExpr::Call { func, .. } if func == "pipeline" => {
+            static_pipeline_truth(cond.as_ref())
+        }
+        _ => None,
     };
-    if func != "test" && static_truth.is_none() {
+    if static_truth.is_none() && !crate::shir::is_pure_bool(cond) {
         return false;
     }
     // then-arm must be ALWAYS-SUCCESS (echo/printf — status 0 on every
@@ -520,8 +561,12 @@ fn test_chain_to_if(st: &mut IrStmt) -> bool {
         return false;
     };
     if let Some(b) = static_truth {
-        // Statically known: keep only the taken branch (echo is pure).
-        *st = if b { then[0].clone() } else { else_[0].clone() };
+        // Statically known: keep only the taken branch (echo is pure). The
+        // pipeline itself still RUNS (its own output is observable —
+        // `echo LIT | grep PAT && echo OK` prints the matching lines AND
+        // OK), so it stays ahead of the taken branch.
+        let taken = if b { then[0].clone() } else { else_[0].clone() };
+        *st = IrStmt::Block(vec![IrStmt::Expr((**cond).clone()), taken]);
         return true;
     }
     *st = IrStmt::If {
@@ -531,6 +576,229 @@ fn test_chain_to_if(st: &mut IrStmt) -> bool {
         else_,
     };
     true
+}
+
+/// Is this expression a COMMAND shape every backend already renders
+/// natively as a STATEMENT (a fork + status write, or the backend's own
+/// builtin arm — perl `chdir`/`exit`/`%ENV` stores, c `_sh_rc` + `chdir`,
+/// js `sh2.lastExit`, …)?
+///
+/// Deliberately NOT a command-name allowlist: the `cmd_and_chain_to_if`
+/// rewrite only rearranges statements, so a process-state builtin keeps
+/// whatever its backend's statement arm does with it — no new rendering
+/// obligation is introduced, and a command unknown to every backend is a
+/// fork with a status write, which is what the chain needs from it.
+fn chain_stmt_expr(e: &IrExpr) -> bool {
+    match e {
+        IrExpr::Call { func, args } => match func.as_str() {
+            // a plain command (the word-args form) — except `cd`: its
+            // STATEMENT arm is `chdir … or die` (and it does not skip a
+            // `--` operand), while bash's cd in a chain records the failure
+            // and CONTINUES, so `$(cd /bad && pwd)` must capture an empty
+            // string instead of killing the script (cd-command-substitution,
+            // qx-var-builtin-cd). A cd-led chain keeps `cd_chain_to_perl`
+            // and the plain shell-out.
+            "exec" | "builtin" => match args.first() {
+                Some(IrExpr::Str(cmd, _)) => !(cmd == "cd" || cmd.ends_with("/cd")),
+                _ => false,
+            },
+            // a redirect call (its args are the body Arrow + redirect
+            // objects), an assignment, or a `test` — each renders as a
+            // statement today
+            "redirect" | "assign" | "test" => true,
+            _ => false,
+        },
+        _ => false,
+    }
+}
+
+/// The NATIVE statement form of a statement-position
+/// `Call { "redirect", [Arrow(stmts), spec…] }`: `IrStmt::Redirect`, the
+/// shape every backend's redirect arm renders natively (perl's file-write
+/// block, the c/js/rust/go redirect lowering). The `Call` spelling exists
+/// for EXPRESSION positions; as a statement the perl renderer rebuilds
+/// shell text from it (`redirect_call_to_cmd` → `emit_shell_cmd`), which
+/// is the very shell-out this rewrite removes.
+///
+/// `None` for shapes that must keep the shell-level semantics — a
+/// heredoc/herestring body, an unreadable spec — so the caller refuses the
+/// chain instead of guessing.
+fn redirect_call_to_stmt(e: &IrExpr) -> Option<IrStmt> {
+    let IrExpr::Call { func, args } = e else { return None };
+    if func != "redirect" {
+        return None;
+    }
+    let IrExpr::Arrow(inner) = args.first()? else { return None };
+    let mut redirects = Vec::new();
+    for spec in args.iter().skip(1) {
+        let specs: Vec<&IrExpr> = match spec {
+            IrExpr::Array(el) => el.iter().collect(),
+            other => vec![other],
+        };
+        for sp in specs {
+            let (fd, mode, target) = crate::ir::redirect_spec_fields(sp)?;
+            // only the plain file modes — a heredoc/herestring carries a
+            // body the Call spelling does not restate here
+            if !matches!(mode.as_str(), "r" | "w" | "a" | "r+" | "wc") {
+                return None;
+            }
+            redirects.push(crate::ir::IrRedirect {
+                fd: Some(fd as i32),
+                mode,
+                target,
+                interpolate: false,
+            });
+        }
+    }
+    Some(IrStmt::Redirect {
+        inner: inner.clone(),
+        redirects,
+    })
+}
+
+/// `A && B [&& C …]` in STATEMENT position where every element is a
+/// command shape every backend renders natively as a statement. The
+/// renderers see the whole chain as ONE raw `BinOp` and fall to the
+/// `system('bash', '-c', q{… && …})` rebuild on every backend
+/// (018_grep_params' `mkdir -p DIR && echo X > FILE`,
+/// parse-redirect-in-case-body's `cmd >/dev/null && echo ok`) — a fork
+/// and a bash dependency for commands each backend can already emit.
+///
+/// Lower to NESTED Ifs on the shared status register — exactly bash's
+/// shape: run A; run B only if the status is 0; the chain's status is the
+/// last element that ran. `Var("?")` is the status read every backend
+/// knows (perl `$CHILD_ERROR`, c `_sh_rc`, js `sh2.lastExit`), and an If
+/// with no else writes no status, so the failure path keeps A's own
+/// status the way `&&` requires.
+///
+/// Refusals (the shape stays a shell-out): a mixed `&&`/`||` chain (the
+/// `||` renderers own those), a pure-boolean first element (`test` /
+/// lowered `[[ ]]` / static pipeline — `test_and_to_if`,
+/// `test_chain_to_if` and the render-side chain renderers own those), and
+/// any element that is not a statement-native command shape.
+fn cmd_and_chain_to_if(
+    st: &mut IrStmt,
+    lower_printf: bool,
+    files: &mut std::collections::HashMap<String, String>,
+) -> bool {
+    let IrStmt::Expr(e) = st else { return false };
+    if !matches!(&*e, IrExpr::BinOp { op: BinOpKind::And, .. }) {
+        return false;
+    }
+    // Flatten the left-assoc chain: [e0, e1, …] joined by ops[].
+    fn flatten<'a>(
+        n: &'a IrExpr,
+        ops: &mut Vec<BinOpKind>,
+        out: &mut Vec<&'a IrExpr>,
+    ) {
+        if let IrExpr::BinOp {
+            lhs,
+            op: op @ (BinOpKind::And | BinOpKind::Or),
+            rhs,
+        } = n
+        {
+            flatten(lhs, ops, out);
+            ops.push(op.clone());
+            out.push(rhs);
+        } else {
+            out.push(n);
+        }
+    }
+    let mut ops: Vec<BinOpKind> = Vec::new();
+    let mut elems: Vec<&IrExpr> = Vec::new();
+    flatten(e, &mut ops, &mut elems);
+    if ops.iter().any(|o| *o != BinOpKind::And) {
+        return false;
+    }
+    // A pure-boolean LEAD is a TEST chain — the test rewrites (above) and
+    // the render-side `control_chain_to_perl` already own its rendering
+    // and its status bookkeeping.
+    if elems.first().is_some_and(|f| crate::shir::is_pure_bool(f)) {
+        return false;
+    }
+    if !elems.iter().all(|e| chain_stmt_expr(e)) {
+        return false;
+    }
+    // Build from the right: [e0] → Expr(e0);
+    // [e0, …rest] → Expr(e0), If{ $? == 0, then: <rest>, else: [] }.
+    let status_ok = IrExpr::BinOp {
+        op: BinOpKind::Eq,
+        lhs: Box::new(IrExpr::Var("?".to_string(), None)),
+        rhs: Box::new(IrExpr::Int(0)),
+    };
+    fn build(elems: &[&IrExpr], cond: &dyn Fn() -> IrExpr) -> Vec<IrStmt> {
+        let Some((first, rest)) = elems.split_first() else {
+            return vec![];
+        };
+        // a redirect element takes its native STATEMENT form (see
+        // redirect_call_to_stmt) — the Call spelling shell-outs as a stmt
+        let head = redirect_call_to_stmt(first).unwrap_or_else(|| IrStmt::Expr((*first).clone()));
+        if rest.is_empty() {
+            return vec![head];
+        }
+        vec![
+            head,
+            IrStmt::If {
+                cond: cond(),
+                then: build(rest, cond),
+                elsifs: vec![],
+                else_: vec![],
+            },
+        ]
+    }
+    let mut body = build(&elems, &|| status_ok.clone());
+    // The relocated statements get the same treatment any top-level
+    // statement gets (bottom-up convention): the echo inside a redirect
+    // body, a nested test, …
+    transform_with_printf(&mut body, lower_printf, files);
+    flatten_redirect_status_block(&mut body);
+    *st = IrStmt::Block(body);
+    true
+}
+
+/// Drop the redundant `Expr(exec true)` tail the echo fold leaves inside a
+/// redirect body, unwrapping `Block([Output, true])` to `[Output]`.
+///
+/// WHY this matters: the renderer's `stmts_to_shell_cmd` REBUILDS a
+/// Block-of-Output back into shell `echo` text (the `( echo test ) <<EOF`
+/// body shape needs it), but the BARE `[Output]` the top-level path reaches
+/// takes the NATIVE redirect path (`open(STDOUT, '>', …)` + a status write
+/// of its own). So the same `echo x > f` rendered natively at top level and
+/// as `__sh_pipe_run(q{echo … > …})` inside a chain — the native path
+/// already records `$CHILD_ERROR = 0`, making the tail write a duplicate.
+fn flatten_redirect_status_block(stmts: &mut [IrStmt]) {
+    for s in stmts.iter_mut() {
+        match s {
+            IrStmt::Redirect { inner, .. } => {
+                if let [IrStmt::Block(b)] = inner.as_slice() {
+                    if let [o @ IrStmt::Output { .. }, IrStmt::Expr(IrExpr::Call { func, args })] =
+                        b.as_slice()
+                    {
+                        let is_status_true = func == "exec"
+                            && matches!(args.as_slice(), [IrExpr::Str(c, _), IrExpr::Array(a)]
+                                if c == "true" && a.is_empty());
+                        if is_status_true {
+                            *inner = vec![o.clone()];
+                        }
+                    }
+                }
+            }
+            IrStmt::If {
+                then,
+                elsifs,
+                else_,
+                ..
+            } => {
+                flatten_redirect_status_block(then);
+                flatten_redirect_status_block(else_);
+                for (_, eb) in elsifs {
+                    flatten_redirect_status_block(eb);
+                }
+            }
+            IrStmt::Block(b) => flatten_redirect_status_block(b),
+            _ => {}
+        }
+    }
 }
 
 /// A single exec of an always-success builtin (echo/printf — the builtins
@@ -646,10 +914,11 @@ fn native_literal_let_stmt(st: &mut IrStmt) -> bool {
 /// Lower literal `declare`/`typeset` forms whose attributes are
 /// representable by the ordinary IR assignment. `declare` and `typeset`
 /// are bash synonyms, so the same lowering applies to both. Safe flags:
-/// `-r` (readonly), `-x` (export), `-t` (trace), `-g` (global), `-l`
-/// (lowercase), `-u` (uppercase), `-a`/`-A` (array). The `-i` integer
-/// attribute is NOT lowered (it changes future arithmetic), nor are
-/// `-n` (nameref), `-f`/`-F` (function display), `-p` (print).
+/// `-r` (readonly), `-t` (trace), `-g` (global), `-l` (lowercase),
+/// `-u` (uppercase), `-a`/`-A` (array). NOT lowered: `-i` (integer — it
+/// changes future arithmetic), `-x` (export — an assignment cannot express
+/// it, see below), `-n` (nameref), `-f`/`-F` (function display), `-p`
+/// (print).
 fn native_declare_typeset_stmt(st: &mut IrStmt) -> bool {
     let IrStmt::Expr(IrExpr::Call { func, args }) = st else { return false; };
     if !matches!(func.as_str(), "exec" | "builtin") { return false; }
@@ -662,6 +931,16 @@ fn native_declare_typeset_stmt(st: &mut IrStmt) -> bool {
             let flag = f[1..].to_string();
             // Unsafe attributes change semantics beyond a plain assignment.
             if flag.chars().any(|c| matches!(c, 'i' | 'n' | 'f' | 'F' | 'p')) {
+                return false;
+            }
+            // `-x` also stores the value in %ENV. There is no export node in
+            // the IR, so lowering this to an ASSIGNMENT silently dropped the
+            // store (`typeset -x v=val` stopped exporting — typeset-cmdsub's
+            // `env | grep` line). Refusing keeps the exec call, and the
+            // native declare/typeset capability lowers it WITH the %ENV
+            // store. The array forms keep this lowering (they are not
+            // exportable to %ENV anyway).
+            if flag.contains('x') && !flag.contains('a') && !flag.contains('A') {
                 return false;
             }
             (Some(flag), &words[1..])
@@ -682,7 +961,9 @@ fn native_declare_typeset_stmt(st: &mut IrStmt) -> bool {
                     }
                     out.push(IrStmt::Assign {
                         targets: vec![AssignTarget { var: name.to_string(), sigil: None, indices: vec![] }],
-                        expr: IrExpr::Str(value, StrStyle::Raw),
+                        // The value is a parser literal (the dynamic forms
+                        // are refused above) — quote it as a Perl string.
+                        expr: IrExpr::Str(value, StrStyle::DoubleQuoted),
                         asm: None,
                     });
                 } else {
@@ -690,7 +971,13 @@ fn native_declare_typeset_stmt(st: &mut IrStmt) -> bool {
                     // safe flags are attribute-only (no value change).
                     if !valid_var_name(assignment) { return false; }
                     if let Some(f) = &flag {
-                        if f.contains('a') || f.contains('A') {
+                        if f.contains('A') {
+                            out.push(IrStmt::DeclareArray {
+                                var: assignment.to_string(),
+                                sigil: Some(crate::ir::Sigil::Hash),
+                                elements: vec![],
+                            });
+                        } else if f.contains('a') {
                             out.push(empty_array_assign(assignment));
                         }
                     } else {
@@ -705,6 +992,30 @@ fn native_declare_typeset_stmt(st: &mut IrStmt) -> bool {
                 }
                 let Some(IrExpr::Str(name, _)) = sargs.first() else { return false; };
                 if !valid_var_name(name) { return false; }
+                // `declare -A name=([k]=v …)` → a Perl HASH literal
+                // (`%name = (k => v, …)`; `%assoc` was left undeclared before).
+                if flag.as_deref().map(|f| f.contains('A')).unwrap_or(false) {
+                    let Some(IrExpr::Array(elems)) = sargs.get(1) else { return false; };
+                    let mut flat: Vec<IrExpr> = Vec::new();
+                    for el in elems {
+                        let Some(s) = crate::ir::grep_lit_str(el) else { return false; };
+                        let Some(rest) = s.strip_prefix('[') else { return false; };
+                        let Some(close) = rest.find(']') else { return false; };
+                        let k = rest[..close].to_string();
+                        let v = rest[close + 1..]
+                            .strip_prefix('=')
+                            .unwrap_or("")
+                            .to_string();
+                        flat.push(IrExpr::Str(k, StrStyle::DoubleQuoted));
+                        flat.push(IrExpr::Str(v, StrStyle::DoubleQuoted));
+                    }
+                    out.push(IrStmt::DeclareArray {
+                        var: name.clone(),
+                        sigil: Some(crate::ir::Sigil::Hash),
+                        elements: flat,
+                    });
+                    continue;
+                }
                 out.push(IrStmt::Assign {
                     targets: vec![AssignTarget { var: name.clone(), sigil: None, indices: vec![] }],
                     expr: word.clone(),
@@ -775,7 +1086,7 @@ fn native_cat_heredoc_writefile(st: &mut IrStmt) -> bool {
     let (Some(path), Some(content)) = (write_target, heredoc_body) else { return false; };
     *st = IrStmt::WriteFile {
         path,
-        content: IrExpr::Str(content, StrStyle::Raw),
+        content: IrExpr::Str(content, StrStyle::DoubleQuoted),
         append: false,
     };
     true
@@ -813,9 +1124,14 @@ fn native_echo_bc_stmt(st: &mut IrStmt) -> bool {
     if cmd != "bc" || !bc_args.is_empty() { return false; }
     let Ok(out) = bc_eval(&expr) else { return false; };
     let out = if out.is_empty() { String::new() } else { out };
+    // The value MUST be a QUOTED string, not a raw literal: bc's output
+    // format is significant (`scale=2; 5/2` is `2.50`, `0.5+0.25` is
+    // `.75`), and a bare Perl number literal numifies — `print(2.50)`
+    // emits `2.5` and `print(.75)` emits `0.75`. Quoting preserves the
+    // exact bytes the evaluator produced.
     *st = IrStmt::Block(vec![
         IrStmt::Output {
-            value: IrExpr::Str(out, StrStyle::Raw),
+            value: IrExpr::Str(out, StrStyle::SingleQuoted),
             newline: true,
             target: None,
         },
@@ -862,6 +1178,8 @@ fn native_test_chain(st: &mut IrStmt) -> bool {
         if cmd != "test" && cmd != "[" { return false; };
         let cond_words: Vec<&IrExpr> = words.iter().collect();
         let cond = render_test_words(&cond_words);
+        // `test COND || echo B` runs B when COND is FALSE — negate.
+        let cond = IrExpr::Str(format!("(!{})", crate::ir::ir_expr_to_perl(&cond)), StrStyle::Raw);
         let Some(else_) = single_always_true_exec(rhs) else { return false; };
         *st = IrStmt::If {
             cond,
@@ -885,12 +1203,99 @@ fn native_test_chain(st: &mut IrStmt) -> bool {
             cond,
             then: then_,
             elsifs: vec![],
-            else_: vec![],
+            // `test COND && echo` — a false COND leaves `$?` == 1.
+            else_: vec![IrStmt::RawText("$main_exit_code = $CHILD_ERROR = 1;\n".to_string())],
         };
         return true;
     }
     
     false
+}
+
+/// `eval "NAME=…"` — a literal assignment. Bash's eval runs the expanded
+/// string as a command, so this is a STRING assignment (`y=5+1`, no
+/// arithmetic). A subprocess `eval` cannot affect the parent, so lower it
+/// to a native Perl assignment.
+fn native_eval_assign_stmt(st: &mut IrStmt) -> bool {
+    let IrStmt::Expr(IrExpr::Call { func, args }) = st else { return false; };
+    if !matches!(func.as_str(), "exec" | "builtin") {
+        return false;
+    }
+    let [IrExpr::Str(cmd, _), IrExpr::Array(words)] = args.as_slice() else {
+        return false;
+    };
+    if cmd != "eval" {
+        return false;
+    }
+    let [word] = words.as_slice() else { return false; };
+    let Some((name, value)) = eval_assign_parts(word) else {
+        return false;
+    };
+    // The value is the TEXT eval will RE-PARSE, so a shell expansion in it
+    // must be evaluated, not copied: `eval "result=\$(( \$var + 1 ))"` sets
+    // result to the ARITHMETIC RESULT, not to the literal `$(( … ))`.
+    // Copying the text was right only for a value with no expansion
+    // (`y=5+1`). Return false so the renderer's parse-the-text lowering
+    // handles it (063_12).
+    if let Some(text) = crate::ir::static_word_text(&value) {
+        if text.contains("$((") || text.contains("${") || text.contains("$(") || text.contains('`') {
+            return false;
+        }
+    }
+    *st = IrStmt::Assign {
+        targets: vec![crate::ir::AssignTarget {
+            var: name,
+            sigil: None,
+            indices: vec![],
+        }],
+        expr: value,
+        asm: None,
+    };
+    true
+}
+
+fn eval_assign_parts(word: &IrExpr) -> Option<(String, IrExpr)> {
+    let is_ident = |s: &str| {
+        !s.is_empty()
+            && s.chars()
+                .next()
+                .map(|c| c.is_ascii_alphabetic() || c == '_')
+                .unwrap_or(false)
+            && s.chars().all(|c| c.is_ascii_alphanumeric() || c == '_')
+    };
+    match word {
+        IrExpr::Str(s, _) => {
+            let (n, v) = s.split_once('=')?;
+            if !is_ident(n) {
+                return None;
+            }
+            Some((
+                n.to_string(),
+                IrExpr::Str(v.to_string(), crate::ir::StrStyle::DoubleQuoted),
+            ))
+        }
+        IrExpr::Interpolate(parts) => {
+            for (i, p) in parts.iter().enumerate() {
+                if let crate::ir::InterpPart::Lit(l) = p {
+                    if let Some((pre, post)) = l.split_once('=') {
+                        if !is_ident(pre) {
+                            return None;
+                        }
+                        let mut vp: Vec<crate::ir::InterpPart> = Vec::new();
+                        if !post.is_empty() {
+                            vp.push(crate::ir::InterpPart::Lit(post.to_string()));
+                        }
+                        vp.extend(parts[i + 1..].iter().cloned());
+                        return Some((pre.to_string(), IrExpr::Interpolate(vp)));
+                    }
+                } else {
+                    break;
+                }
+            }
+            None
+        }
+        _ => None,
+    }
 }
 
 fn render_test_words(words: &[&IrExpr]) -> IrExpr {
@@ -930,6 +1335,41 @@ fn render_test_words(words: &[&IrExpr]) -> IrExpr {
                     None
                 }
             }
+            // A parameter expansion word (`[ -n "${MYVAR+set}" ]`). Kept as
+            // the expansion TEXT so the `-n` arm renders the set/unset
+            // DECISION: pre-rendering it here made `${V+word}` an empty
+            // literal for an unset V, the argv collapsed to a lone `-n`, and
+            // `length('-n')` is true — the guard fired when bash's is not
+            // (variable-plus-operator). `${:PERL}` is the established
+            // splice for an already-rendered Perl operand below.
+            IrExpr::Call { func, args } if func == "param" => {
+                let lit = |i: usize| match args.get(i) {
+                    Some(IrExpr::Str(s, _)) => Some(s.as_str()),
+                    _ => None,
+                };
+                let (Some(op), Some(name)) = (lit(0), lit(1)) else {
+                    return None;
+                };
+                // Rebuild the EXPANSION TEXT in bash spelling. Two bugs
+                // lived here: the arm required EXACTLY two args, so a
+                // three-arg operator (`${V+d}` → param("+","V","d")) was
+                // dropped from the word list entirely — `test -n "${V+w}"`
+                // collapsed to the single token `-n` and rendered
+                // `length('-n')`, i.e. always TRUE — and the operator was
+                // placed BEFORE the name (`${+Vd}`) instead of after it.
+                // `""`/`len` are the two forms that prefix the name.
+                match op {
+                    "" => return Some(format!("${{{name}}}")),
+                    "len" => return Some(format!("${{#{name}}}")),
+                    // Not a plain expansion text — leave it to the caller.
+                    "slice" => return None,
+                    _ => {}
+                }
+                Some(match lit(2) {
+                    Some(arg) => format!("${{{name}{op}{arg}}}"),
+                    None => format!("${{{name}{op}}}"),
+                })
+            }
             // unquoted expansion (split(getVar)): single-element paths
             IrExpr::Call { func, args }
                 if func == "split"
@@ -946,6 +1386,40 @@ fn render_test_words(words: &[&IrExpr]) -> IrExpr {
                     None
                 }
             }
+            // unquoted expansion of a CONST value — split(Str) /
+            // split(all-lit Interpolate). copy-propagation folding `$v`
+            // into its literal produces exactly this shape, and dropping
+            // it here (the filter_map default) left the FLAG as the only
+            // token: one-arg `test -f` → `length('-f')` — true when bash's
+            // `-f /nonexistent` is FALSE, so `test -f $exec || exit 0`
+            // ran past its guard (parse-dollar-keyword-var.sh printed
+            // where bash prints nothing). A literal's split semantics are
+            // whitespace tokenization, which render_test_text's own space
+            // tokenization reproduces — the same way the `Str` arm pushes
+            // a literal-with-spaces — so the text is pushed verbatim.
+            IrExpr::Call { func, args }
+                if func == "split"
+                    && matches!(args.as_slice(), [IrExpr::Str(_, _) | IrExpr::Interpolate(_)]) =>
+            {
+                match &args[0] {
+                    IrExpr::Str(s, _) => Some(s.clone()),
+                    IrExpr::Interpolate(parts)
+                        if parts.iter().all(|p| matches!(p, crate::ir::InterpPart::Lit(_))) =>
+                    {
+                        Some(
+                            parts
+                                .iter()
+                                .map(|p| match p {
+                                    crate::ir::InterpPart::Lit(s) => s.as_str(),
+                                    _ => unreachable!(),
+                                })
+                                .collect::<Vec<_>>()
+                                .join(""),
+                        )
+                    }
+                    _ => None,
+                }
+            }
             _ => None,
         }
     }).collect();
@@ -959,12 +1433,26 @@ fn render_test_words(words: &[&IrExpr]) -> IrExpr {
 /// top-level && / || and recurse; single segments go through the token
 /// forms below.
 fn render_test_text(text: String) -> IrExpr {
-    for (word, is_and) in [("&&", true), ("||", false)] {
+    for (word, is_and) in [
+        ("&&", true),
+        ("-a", true),
+        ("||", false),
+        ("-o", false),
+    ] {
         if let Some(pos) = text.find(&format!(" {} ", word)) {
             let (l, r) = text.split_at(pos);
+            // A LEADING `-a`/`-o` is the file-test operand (`[ -a file ]`),
+            // not the AND/OR connector.
+            if l.trim().is_empty() {
+                continue;
+            }
             let r = &r[word.len() + 2..];
             return IrExpr::BinOp {
-                op: if is_and { crate::ir::BinOpKind::And } else { crate::ir::BinOpKind::Or },
+                op: if is_and {
+                    crate::ir::BinOpKind::And
+                } else {
+                    crate::ir::BinOpKind::Or
+                },
                 lhs: Box::new(render_test_text(l.to_string())),
                 rhs: Box::new(render_test_text(r.to_string())),
             };
@@ -973,15 +1461,76 @@ fn render_test_text(text: String) -> IrExpr {
     render_test_tokens(&text)
 }
 
+/// `-n $(cmd)` / `-z $(cmd)` (and the bare `$(cmd)` truth test) — a command
+/// substitution in a test. The flat test text carries the `$(...)` as a
+/// literal (the parser does not expand it), so the ordinary token arms
+/// would test a constant string. Run the command and test its output the
+/// way bash does: `-n` ⇔ output non-empty, `-z` ⇔ output empty.
+///
+/// Only the *whole* segment may be a substitution (trailing words would
+/// make the capture an approximation); anything else returns None and
+/// keeps the historic rendering.
+fn render_flag_substitution_test(text: &str) -> Option<IrExpr> {
+    // the `[[ ... ]]` form appends a trailing `[[` marker word
+    let t = text.trim().strip_suffix("[[ ").unwrap_or(text.trim());
+    let t = t.trim().strip_suffix("[[").unwrap_or(t);
+    let t = t.trim();
+    let (flag, rest) = if let Some(r) = t.strip_prefix("-n") {
+        ("-n", r)
+    } else if let Some(r) = t.strip_prefix("-z") {
+        ("-z", r)
+    } else {
+        ("", t)
+    };
+    let rest = rest.trim();
+    // the operand must be exactly one `$( ... )` spanning the whole rest
+    let inner = rest.strip_prefix("$(")?.strip_suffix(')')?;
+    // no nested close-paren ambiguity (the `[[ ... ]]` form's own parens)
+    if inner.contains("$(") || inner.trim().is_empty() {
+        return None;
+    }
+    let cap = crate::ir::cmd_str_to_open_perl_stripped(inner);
+    // `-n` → non-empty output ⇒ length != 0; `-z`/bare → empty ⇒ length == 0
+    let op = if flag == "-n" { crate::ir::BinOpKind::Ne } else { crate::ir::BinOpKind::Eq };
+    Some(IrExpr::BinOp {
+        op,
+        lhs: Box::new(IrExpr::Str(format!("length({cap})"), StrStyle::Raw)),
+        rhs: Box::new(IrExpr::Int(0)),
+    })
+}
+
 fn render_test_tokens(text: &str) -> IrExpr {
+    // `-n $(cmd)` / `-z $(cmd)`: the command substitution is still a
+    // literal in the flattened test text (the parser does not expand it),
+    // so the generic `-n` arms below would render `length("$(cmd)")` —
+    // a non-empty literal string, i.e. ALWAYS TRUE
+    // (parse-bracket-subshell-pipe.sh: bash leaves rc 1 when the pipeline
+    // prints nothing; the literal test left rc 0). Capture the command at
+    // runtime instead, which is what bash's `[[ -n $(...) ]]` means.
+    if let Some(e) = render_flag_substitution_test(text) {
+        return e;
+    }
     // Quote-aware tokenization (the ir.rs tokenizer: double-quoted
     // segments stay ONE token and their quotes are stripped). The old
     // naive split_whitespace handed operands still carrying their shell
     // quotes to the -f/-d/... wrappers, which re-quoted them — the
     // `-f ""test.txt""` doubling class (fail's largest red block).
+    //
+    // The catch-all embeds the raw test text in a Perl double-quoted
+    // string: escape `\`/`"` so `"$a"\>"$b"` stays one string literal.
+    let test_fallback = |t: &str| {
+        IrExpr::Str(
+            format!(
+                "do {{ my $t = \"{}\"; $t =~ /-\\w+/ ? 1 : 0 }}",
+                t.replace('\\', "\\\\").replace('"', "\\\"")
+            ),
+            StrStyle::Raw,
+        )
+    };
     let mut tokens: Vec<String> = crate::ir::tokenize_test(text);
     // the `[[ ... ]]` form appends a trailing `[[` marker word
-    if tokens.last().map(String::as_str) == Some("[[") {
+    let double_bracket = tokens.last().map(String::as_str) == Some("[[");
+    if double_bracket {
         tokens.pop();
     }
     // Build an IrExpr for the condition
@@ -994,16 +1543,68 @@ fn render_test_tokens(text: &str) -> IrExpr {
             "-s" => IrExpr::BinOp { op: crate::ir::BinOpKind::And, lhs: Box::new(IrExpr::Str(format!("-s \"{}\"", left), StrStyle::Raw)), rhs: Box::new(IrExpr::Bool(true)) },
             "-z" => IrExpr::BinOp { op: crate::ir::BinOpKind::Eq, lhs: Box::new(IrExpr::Str(format!("length(\"{}\")", left), StrStyle::Raw)), rhs: Box::new(IrExpr::Int(0)) },
             "-n" => IrExpr::BinOp { op: crate::ir::BinOpKind::Ne, lhs: Box::new(IrExpr::Str(format!("length(\"{}\")", left), StrStyle::Raw)), rhs: Box::new(IrExpr::Int(0)) },
-            "=" | "==" => IrExpr::BinOp { op: crate::ir::BinOpKind::Eq, lhs: Box::new(IrExpr::Str(left.to_string(), StrStyle::Raw)), rhs: Box::new(IrExpr::Str(right.to_string(), StrStyle::Raw)) },
-            "!=" => IrExpr::BinOp { op: crate::ir::BinOpKind::Ne, lhs: Box::new(IrExpr::Str(left.to_string(), StrStyle::Raw)), rhs: Box::new(IrExpr::Str(right.to_string(), StrStyle::Raw)) },
+            "=" | "==" => {
+                // A glob/extglob RHS (`[[ $x = @(foo|bar) ]]`) is a PATTERN
+                // match, not string equality.
+                let rhs = right.trim_matches('"').trim_matches('\'');
+                let has_glob = rhs.contains('*')
+                    || rhs.contains('?')
+                    || rhs.contains('[')
+                    || rhs.contains("@(")
+                    || rhs.contains("+(")
+                    || rhs.contains("*(")
+                    || rhs.contains("?(")
+                    || rhs.contains("!(");
+                // Globbing needs an UNQUOTED `[[ ]]` pattern: `[ ]`'s RHS is
+                // always literal, and a quoted `[[ ]]` pattern is too.
+                let rhs_quoted = text.contains(&format!("\"{right}\""))
+                    || text.contains(&format!("'{right}'"));
+                if has_glob && double_bracket && !rhs_quoted {
+                    let lhs = crate::ir::render_test_operand(left);
+                    if let Some(re) = crate::ir::glob_or_extglob_to_regex(&lhs, rhs) {
+                        // `glob_or_extglob_to_regex` returns either a bare
+                        // regex FRAGMENT or (for the `!(P).S` extglob) a
+                        // COMPLETE boolean expression, which must not be
+                        // wrapped again — `($f1 =~ /(($f1) =~ /…/) && …/)`
+                        // was a syntax error.
+                        return if re.contains("=~") || re.contains("!~") {
+                            IrExpr::Str(re, StrStyle::Raw)
+                        } else {
+                            IrExpr::Str(format!("({lhs} =~ /{re}/)"), StrStyle::Raw)
+                        };
+                    }
+                }
+                IrExpr::Str(
+                    crate::ir::nocase_str_eq(
+                        &crate::ir::render_test_operand(left),
+                        &crate::ir::render_test_operand(right),
+                    ),
+                    StrStyle::Raw,
+                )
+            }
+            "!=" => IrExpr::Str(
+                format!(
+                    "(!{})",
+                    crate::ir::nocase_str_eq(
+                        &crate::ir::render_test_operand(left),
+                        &crate::ir::render_test_operand(right),
+                    )
+                ),
+                StrStyle::Raw,
+            ),
+            // `[[ $s =~ re ]]` — a regex match, NOT string equality (the
+            // old catchall parsed it as "text contains a -flag", a bogus
+            // truthiness). Perl accepts a STRING as the pattern, so the
+            // single-quoted render is safe against delimiter chars;
+            // Perl's dialect ≈ ERE for the corpus patterns.
             "=~" => {
-                // `[[ $s =~ re ]]` — regex match (triage-perl t68_case_glob,
-                // regex_test_op_renders_match). The rhs is a bare ERE
-                // pattern; single-quoted so delimiter/interpolation chars
-                // stay literal (Perl's dialect ≈ ERE for the corpus).
-                let l = left.trim().trim_matches('"');
-                let r = right.trim().trim_matches('"').replace('\'', "\\'");
-                IrExpr::Str(format!("({} =~ '{}')", l, r), StrStyle::Raw)
+                let l = crate::ir::render_test_operand(left);
+                let pat = right
+                    .trim_matches('"')
+                    .trim_matches('\'')
+                    .replace('\\', "\\\\")
+                    .replace('\'', "\\'");
+                IrExpr::Str(format!("({} =~ '{}')", l, pat), StrStyle::Raw)
             }
             // numeric comparisons (`-eq`/`-ne`/`-gt`/`-ge`/`-lt`/`-le`):
             // the operands are `${name}` refs or literals — Perl numifies
@@ -1012,40 +1613,110 @@ fn render_test_tokens(text: &str) -> IrExpr {
             // stderr only). Before this arm these fell to the regex hack
             // below, which is ALWAYS TRUE whenever the string contains
             // `-eq` etc. — c-corpus rich.c rendered every loop-if taken.
-            "-eq" => IrExpr::BinOp { op: crate::ir::BinOpKind::Eq, lhs: Box::new(IrExpr::Str(format!("(0+{})", left), StrStyle::Raw)), rhs: Box::new(IrExpr::Str(format!("(0+{})", right), StrStyle::Raw)) },
-            "-ne" => IrExpr::BinOp { op: crate::ir::BinOpKind::Ne, lhs: Box::new(IrExpr::Str(format!("(0+{})", left), StrStyle::Raw)), rhs: Box::new(IrExpr::Str(format!("(0+{})", right), StrStyle::Raw)) },
-            "-gt" => IrExpr::BinOp { op: crate::ir::BinOpKind::Gt, lhs: Box::new(IrExpr::Str(format!("(0+{})", left), StrStyle::Raw)), rhs: Box::new(IrExpr::Str(format!("(0+{})", right), StrStyle::Raw)) },
-            "-ge" => IrExpr::BinOp { op: crate::ir::BinOpKind::Ge, lhs: Box::new(IrExpr::Str(format!("(0+{})", left), StrStyle::Raw)), rhs: Box::new(IrExpr::Str(format!("(0+{})", right), StrStyle::Raw)) },
-            "-lt" => IrExpr::BinOp { op: crate::ir::BinOpKind::Lt, lhs: Box::new(IrExpr::Str(format!("(0+{})", left), StrStyle::Raw)), rhs: Box::new(IrExpr::Str(format!("(0+{})", right), StrStyle::Raw)) },
-            "-le" => IrExpr::BinOp { op: crate::ir::BinOpKind::Le, lhs: Box::new(IrExpr::Str(format!("(0+{})", left), StrStyle::Raw)), rhs: Box::new(IrExpr::Str(format!("(0+{})", right), StrStyle::Raw)) },
+            "-eq" => IrExpr::BinOp { op: crate::ir::BinOpKind::Eq, lhs: Box::new(IrExpr::Str(format!("(0+{})", crate::ir::render_test_operand(left)), StrStyle::Raw)), rhs: Box::new(IrExpr::Str(format!("(0+{})", crate::ir::render_test_operand(right)), StrStyle::Raw)) },
+            "-ne" => IrExpr::BinOp { op: crate::ir::BinOpKind::Ne, lhs: Box::new(IrExpr::Str(format!("(0+{})", crate::ir::render_test_operand(left)), StrStyle::Raw)), rhs: Box::new(IrExpr::Str(format!("(0+{})", crate::ir::render_test_operand(right)), StrStyle::Raw)) },
+            "-gt" => IrExpr::BinOp { op: crate::ir::BinOpKind::Gt, lhs: Box::new(IrExpr::Str(format!("(0+{})", crate::ir::render_test_operand(left)), StrStyle::Raw)), rhs: Box::new(IrExpr::Str(format!("(0+{})", crate::ir::render_test_operand(right)), StrStyle::Raw)) },
+            "-ge" => IrExpr::BinOp { op: crate::ir::BinOpKind::Ge, lhs: Box::new(IrExpr::Str(format!("(0+{})", crate::ir::render_test_operand(left)), StrStyle::Raw)), rhs: Box::new(IrExpr::Str(format!("(0+{})", crate::ir::render_test_operand(right)), StrStyle::Raw)) },
+            "-lt" => IrExpr::BinOp { op: crate::ir::BinOpKind::Lt, lhs: Box::new(IrExpr::Str(format!("(0+{})", crate::ir::render_test_operand(left)), StrStyle::Raw)), rhs: Box::new(IrExpr::Str(format!("(0+{})", crate::ir::render_test_operand(right)), StrStyle::Raw)) },
+            "-le" => IrExpr::BinOp { op: crate::ir::BinOpKind::Le, lhs: Box::new(IrExpr::Str(format!("(0+{})", crate::ir::render_test_operand(left)), StrStyle::Raw)), rhs: Box::new(IrExpr::Str(format!("(0+{})", crate::ir::render_test_operand(right)), StrStyle::Raw)) },
+            // `[ a \\> b ]` — the escaped `>` is a STRING comparison
+            // (`gt`); the numeric form is `-gt`.
+            ">" | "\\>" => IrExpr::Str(
+                format!("({} gt {})", crate::ir::render_test_operand(left), crate::ir::render_test_operand(right)),
+                StrStyle::Raw,
+            ),
+            "<" | "\\<" => IrExpr::Str(
+                format!("({} lt {})", crate::ir::render_test_operand(left), crate::ir::render_test_operand(right)),
+                StrStyle::Raw,
+            ),
+            // `[[ $s =~ re ]]` — a regex match, NOT string equality (the
+            // old catchall parsed it as "text contains a -flag", a bogus
+            // truthiness). Perl accepts a STRING as the pattern, so the
+            // single-quoted render is safe against delimiter chars;
+            // Perl's dialect ≈ ERE for the corpus patterns.
+            "=~" => {
+                let l = left.trim_matches('"');
+                let pat = right
+                    .trim_matches('"')
+                    .trim_matches('\'')
+                    .replace('\\', "\\\\")
+                    .replace('\'', "\\'");
+                IrExpr::Str(format!("({} =~ '{}')", l, pat), StrStyle::Raw)
+            }
             "-ef" => {
-                // Compare device and inode: (stat(f))[0] eq (stat(g))[0] && (stat(f))[1] eq (stat(g))[1]
-                let stat_left = IrExpr::Str(format!("(stat(\"{}\"))[0]", left), StrStyle::Raw);
-                let stat_right = IrExpr::Str(format!("(stat(\"{}\"))[0]", right), StrStyle::Raw);
-                let stat_left_ino = IrExpr::Str(format!("(stat(\"{}\"))[1]", left), StrStyle::Raw);
-                let stat_right_ino = IrExpr::Str(format!("(stat(\"{}\"))[1]", right), StrStyle::Raw);
-                IrExpr::BinOp {
-                    op: crate::ir::BinOpKind::And,
-                    lhs: Box::new(IrExpr::BinOp { op: crate::ir::BinOpKind::Eq, lhs: Box::new(stat_left), rhs: Box::new(stat_right) }),
-                    rhs: Box::new(IrExpr::BinOp { op: crate::ir::BinOpKind::Eq, lhs: Box::new(stat_left_ino), rhs: Box::new(stat_right_ino) }),
-                }
+                // Compare device and inode; either operand missing ⇒ false
+                // (bash does not treat two missing files as the same file).
+                let l = crate::ir::render_test_operand(left);
+                let r = crate::ir::render_test_operand(right);
+                IrExpr::Str(
+                    format!(
+                        "(-e {l} && -e {r} && (stat({l}))[0] == (stat({r}))[0] && (stat({l}))[1] == (stat({r}))[1])"
+                    ),
+                    StrStyle::Raw,
+                )
+            }
+            // Unhandled THREE-token shape: try the shared recursive parser
+            // (which handles `!`, parens and the unary file tests) before
+            // the historic always-truthy heuristic.
+            _ => match crate::ir::render_test_token_list(&tokens) {
+                Some(e) => IrExpr::Str(e, StrStyle::Raw),
+                None => test_fallback(text),
             },
-            _ => IrExpr::Str(format!("do {{ my $t = \"{text}\"; $t =~ /-\\w+/ ? 1 : 0 }}"), StrStyle::Raw),
         }
     } else if tokens.len() == 2 && tokens[0].starts_with('-') {
         let (op, arg) = (tokens[0].as_str(), tokens[1].as_str());
         match op {
-            "-f" => IrExpr::Str(format!("-f \"{}\"", arg), StrStyle::Raw),
-            "-d" => IrExpr::Str(format!("-d \"{}\"", arg), StrStyle::Raw),
-            "-e" => IrExpr::Str(format!("-e \"{}\"", arg), StrStyle::Raw),
-            "-s" => IrExpr::Str(format!("-s \"{}\"", arg), StrStyle::Raw),
-            "-S" => IrExpr::Str(format!("-S \"{}\"", arg), StrStyle::Raw),
-            "-z" => IrExpr::BinOp { op: crate::ir::BinOpKind::Eq, lhs: Box::new(IrExpr::Str(format!("length(\"{}\")", arg), StrStyle::Raw)), rhs: Box::new(IrExpr::Int(0)) },
-            "-n" => IrExpr::BinOp { op: crate::ir::BinOpKind::Ne, lhs: Box::new(IrExpr::Str(format!("length(\"{}\")", arg), StrStyle::Raw)), rhs: Box::new(IrExpr::Int(0)) },
-            _ => IrExpr::Str(format!("do {{ my $t = \"{text}\"; $t =~ /-\\w+/ ? 1 : 0 }}"), StrStyle::Raw),
+            "-f" => IrExpr::Str(format!("-f {}", crate::ir::render_test_operand(arg)), StrStyle::Raw),
+            "-d" => IrExpr::Str(format!("-d {}", crate::ir::render_test_operand(arg)), StrStyle::Raw),
+            "-e" => IrExpr::Str(format!("-e {}", crate::ir::render_test_operand(arg)), StrStyle::Raw),
+            "-s" => IrExpr::Str(format!("-s {}", crate::ir::render_test_operand(arg)), StrStyle::Raw),
+            "-S" => IrExpr::Str(format!("-S {}", crate::ir::render_test_operand(arg)), StrStyle::Raw),
+            "-h" | "-L" => IrExpr::Str(format!("-l {}", crate::ir::render_test_operand(arg)), StrStyle::Raw),
+            "-a" => IrExpr::Str(format!("-e {}", crate::ir::render_test_operand(arg)), StrStyle::Raw),
+            "-z" => IrExpr::BinOp { op: crate::ir::BinOpKind::Eq, lhs: Box::new(IrExpr::Str(format!("length({})", crate::ir::render_test_operand(arg)), StrStyle::Raw)), rhs: Box::new(IrExpr::Int(0)) },
+            "-n" => IrExpr::BinOp { op: crate::ir::BinOpKind::Ne, lhs: Box::new(IrExpr::Str(format!("length({})", crate::ir::render_test_operand(arg)), StrStyle::Raw)), rhs: Box::new(IrExpr::Int(0)) },
+            "-t" => {
+                // `-t N`: test whether fd N is a terminal. Map the common
+                // literal fds to Perl's -t filehandle form; fall back to
+                // the regex hack for variable/numeric fd operands.
+                let handle = match arg.trim_matches('"').trim_matches('\'') {
+                    "0" => "STDIN",
+                    "1" => "STDOUT",
+                    "2" => "STDERR",
+                    _ => return test_fallback(text),
+                };
+                IrExpr::Str(format!("(-t {})", handle), StrStyle::Raw)
+            }
+            // Unhandled TWO-token shape — the remaining unary file tests
+            // (`-r`/`-w`/`-x`/`-p`/`-b`/`-c`/…). The shared recursive
+            // test parser (`is_file_test_op`) renders them as Perl's own
+            // unary filetests; without this the `[[ -r "$dev" ]]` class
+            // fell to the always-TRUE heuristic — `-r` matched
+            // `$t =~ /-\w+/` on its own flag text, so tty-cmdsub picked a
+            // nonexistent /dev/pts/2 over the readable /dev/pts/3 (bash
+            // disagreed) and the generated script died on the redirect.
+            _ => match crate::ir::render_test_token_list(&tokens) {
+                Some(e) => IrExpr::Str(e, StrStyle::Raw),
+                None => test_fallback(text),
+            },
         }
+    } else if tokens.len() == 1 {
+        // Bare operand: truthiness = non-empty string; delegate the
+        // `${…}` / `$(…)` / `$((…))` forms to the shared renderer.
+        IrExpr::Str(
+            format!("length({})", crate::ir::render_test_operand(&tokens[0])),
+            StrStyle::Raw,
+        )
     } else {
-        IrExpr::Str(format!("do {{ my $t = \"{text}\"; $t =~ /-\\w+/ ? 1 : 0 }}"), StrStyle::Raw)
+        // Compound/unhandled shape (`! ( "$name" == "x" )`, a NEGATED
+        // parenthesized test — the perl-sh-go `unless` lowering): route
+        // through the shared recursive test parser, which handles `!`,
+        // `(`/`)` and `&&`/`||`, before falling back to the historic
+        // always-truthy heuristic (correct only for a bare `-flag` text).
+        match crate::ir::render_test_token_list(&tokens) {
+            Some(e) => IrExpr::Str(e, StrStyle::Raw),
+            None => test_fallback(text),
+        }
     }
 }
 
@@ -1118,7 +1789,12 @@ fn native_head_tail_stmt(st: &mut IrStmt) -> bool {
     }
     let output = if let Some(n) = bytes {
         let n = n.min(input.len());
-        input[..n].to_string()
+        // `head -c N` keeps the FIRST N bytes, `tail -c N` the LAST N.
+        // Floor to a char boundary so a multi-byte input can't panic the
+        // renderer (bash would cut mid-sequence; the corpus is ASCII).
+        let mut cut = if cmd == "tail" { input.len() - n } else { n };
+        while cut > 0 && !input.is_char_boundary(cut) { cut -= 1; }
+        input[cut..].to_string()
     } else if let Some(n) = lines {
         let all: Vec<&str> = input.split('\n').collect();
         let selected: Vec<&str> = if cmd == "head" {
@@ -1341,13 +2017,11 @@ fn native_bash_script(st: &mut IrStmt) -> bool {
         let Some(w) = literal_text(w) else { return false; };
         argv.push(w);
     }
-    // Read the script and check it matches the known arg-demo pattern.
-    let candidates = [script.to_string(), format!("sh2perl/{script}")];
-    let mut src = None;
-    for c in &candidates {
-        if let Ok(s) = std::fs::read_to_string(c) { src = Some(s); break; }
-    }
-    let Some(src) = src else { return false; };
+    // Read the script from the same path bash would resolve at runtime
+    // (relative to CWD). Do NOT add a `sh2perl/` prefix fallback — that
+    // would find files bash can't, producing output the reference run
+    // doesn't have.
+    let Ok(src) = std::fs::read_to_string(script) else { return false; };
     let normalized: String = src.lines()
         .map(|l| l.trim())
         .filter(|l| !l.is_empty() && !l.starts_with('#'))
@@ -1370,7 +2044,7 @@ fn native_bash_script(st: &mut IrStmt) -> bool {
 /// A native `print` statement for a literal line.
 fn output_stmt(text: &str) -> IrStmt {
     IrStmt::Output {
-        value: IrExpr::Str(text.to_string(), StrStyle::Raw),
+        value: IrExpr::Str(text.to_string(), StrStyle::DoubleQuoted),
         newline: true,
         target: None,
     }
@@ -1516,7 +2190,7 @@ fn native_cat_heredoc_redirect_call(st: &mut IrStmt) -> bool {
     let Some(body) = body else { return false; };
     *st = IrStmt::Block(vec![
         IrStmt::Output {
-            value: IrExpr::Str(body, StrStyle::Raw),
+            value: IrExpr::Str(body, StrStyle::DoubleQuoted),
             newline: false,
             target: None,
         },
@@ -1716,7 +2390,12 @@ fn native_head_tail_pipeline(st: &mut IrStmt) -> bool {
     }
     let output = if let Some(n) = bytes {
         let n = n.min(input.len());
-        input[..n].to_string()
+        // `head -c N` keeps the FIRST N bytes, `tail -c N` the LAST N.
+        // Floor to a char boundary so a multi-byte input can't panic the
+        // renderer (bash would cut mid-sequence; the corpus is ASCII).
+        let mut cut = if cmd == "tail" { input.len() - n } else { n };
+        while cut > 0 && !input.is_char_boundary(cut) { cut -= 1; }
+        input[cut..].to_string()
     } else if let Some(n) = lines {
         let all: Vec<&str> = input.split('\n').collect();
         let selected: Vec<&str> = if cmd == "head" {
@@ -1823,7 +2502,7 @@ fn native_cat_herestring(st: &mut IrStmt) -> bool {
     };
     *st = IrStmt::Block(vec![
         IrStmt::Output {
-            value: IrExpr::Str(content, StrStyle::Raw),
+            value: IrExpr::Str(content, StrStyle::DoubleQuoted),
             newline: true,
             target: None,
         },
@@ -2246,10 +2925,17 @@ fn normalize_literal_exec_words(st: &mut IrStmt) -> bool {
     if !matches!(func.as_str(), "exec" | "builtin") {
         return false;
     }
-    let is_typeset = match args.first() {
-        Some(IrExpr::Str(name, _)) => name == "typeset",
-        _ => false,
+    let (is_typeset, is_local) = match args.first() {
+        Some(IrExpr::Str(name, _)) => (name == "typeset", name == "local"),
+        _ => (false, false),
     };
+    // `local` is an assignment builtin: its value words are rendered as Perl
+    // expressions by the `local` emitter, so a quoted literal must stay an
+    // Interpolate (`"hello"`) — collapsing it to `Str(Raw)` emitted the bare
+    // word `hello` (`my $msg = hello;`, examples/081_nested_functions).
+    if is_local {
+        return false;
+    }
     let [IrExpr::Str(_, _), IrExpr::Array(words)] = args.as_mut_slice() else {
         return false;
     };
@@ -2257,7 +2943,10 @@ fn normalize_literal_exec_words(st: &mut IrStmt) -> bool {
     for word in words.iter_mut() {
         if let Some(text) = literal_text(word) {
             if !matches!(word, IrExpr::Str(_, _)) {
-                *word = IrExpr::Str(text, StrStyle::Raw);
+                // Keep the string STYLE so `render_word` quotes it as a Perl
+                // string (`upper "hello"` → `upper("hello")`, not the
+                // bareword `hello`); `bash_word_for` shells-quotes either way.
+                *word = IrExpr::Str(text, StrStyle::DoubleQuoted);
                 changed = true;
             }
         }
@@ -2345,6 +3034,10 @@ fn native_echo_stmt(st: &mut IrStmt) -> bool {
                 *word = decoded;
             }
         }
+        // A backslash-newline continuation can leave an EMPTY word
+        // (`echo "a" \ "b"`); `echo` drops it (it joins the rest with
+        // single spaces), and an explicit empty arg is equivalent to no arg.
+        option_words.retain(|w| !w.is_empty());
         option_words
             .into_iter()
             .map(|word| IrExpr::Str(word, StrStyle::DoubleQuoted))
@@ -2354,13 +3047,28 @@ fn native_echo_stmt(st: &mut IrStmt) -> bool {
         // is represented by split(...) and is intentionally refused.
         // Leading option words (-e/-E/-n) are skipped.
         let mut ws: Vec<IrExpr> = Vec::new();
+        let mut leading = true;
         for w in words {
             if matches!(
                 w,
                 IrExpr::Str(sv, _) if sv == "-e" || sv == "-E" || sv == "-n"
             ) {
-                continue;
+                // The flags only count in LEADING position (bash: `echo x -n`
+                // prints `x -n`) — and `-n` must actually CLEAR the newline,
+                // not just be dropped (`echo -n "$x"` printed a newline).
+                if leading {
+                    if let IrExpr::Str(sv, _) = w {
+                        match sv.as_str() {
+                            "-n" => newline = false,
+                            "-e" => decode_escapes = true,
+                            "-E" => decode_escapes = false,
+                            _ => {}
+                        }
+                    }
+                    continue;
+                }
             }
+            leading = false;
             if !is_quoted_echo_expr(w) {
                 return false;
             }
@@ -2378,7 +3086,7 @@ fn native_echo_stmt(st: &mut IrStmt) -> bool {
                 lhs: Box::new(IrExpr::BinOp {
                     lhs: Box::new(value),
                     op: BinOpKind::Concat,
-                    rhs: Box::new(IrExpr::Str(" ".into(), StrStyle::Raw)),
+                    rhs: Box::new(IrExpr::Str(" ".into(), StrStyle::DoubleQuoted)),
                 }),
                 op: BinOpKind::Concat,
                 rhs: Box::new(word),
@@ -2453,7 +3161,7 @@ fn native_printf_v_stmt(st: &mut IrStmt) -> bool {
     }
     if used != values.len() { return false; }
     *st = IrStmt::Block(vec![
-        IrStmt::Assign { targets: vec![AssignTarget { var: name.clone(), sigil: None, indices: vec![] }], expr: IrExpr::Str(output, StrStyle::Raw), asm: None },
+        IrStmt::Assign { targets: vec![AssignTarget { var: name.clone(), sigil: None, indices: vec![] }], expr: IrExpr::Str(output, StrStyle::DoubleQuoted), asm: None },
         status_exec(true),
     ]);
     true
@@ -2632,6 +3340,18 @@ fn native_sort_file_stmt(st: &mut IrStmt) -> bool {
     // is refused — the real path isn't known at IR time.
     let out = match &r.target {
         IrExpr::Str(s, _) => crate::ir::safe_perl_q_string(s),
+        // A `Var`/`Ident` target: which of the two readings is right depends
+        // on the name. A process-substitution temp (`__ps_tmp0`) is a Perl
+        // SCALAR holding the `mktemp` path — the previous statement assigned
+        // it — so the filename is its VALUE. Anything else is a bash-side
+        // name the shell would resolve itself, so the name is the filename.
+        //
+        // Reading `__ps_tmp*` as a literal filename made `sort` write to
+        // a file actually named `__ps_tmp0` while `comm` read the real temp:
+        // 000__04h's process-substitution result was empty.
+        IrExpr::Var(n, _) | IrExpr::Ident(n) if n.starts_with("__ps_tmp") => {
+            format!("${n}")
+        }
         IrExpr::Var(n, _) | IrExpr::Ident(n) => crate::ir::safe_perl_q_string(n),
         _ => return false,
     };
@@ -2658,16 +3378,29 @@ fn native_sort_file_stmt(st: &mut IrStmt) -> bool {
     let Some(file) = file else { return false; };
     // process-substitution temps arrive as Var/Ident (`sort "$__ps_tmp0"`):
     // the NAME is the literal filename.
-    let fname = match file {
-        IrExpr::Str(fname, _) => fname.clone(),
-        IrExpr::Var(n, _) | IrExpr::Ident(n) => n.clone(),
+    // the INPUT side: `__ps_tmp*` names hold the runtime path, so quote the
+    // scalar READ, not the name (same rule as the output target above).
+    let fq = match file {
+        IrExpr::Str(fname, _) => crate::ir::safe_perl_q_string(fname),
+        IrExpr::Var(n, _) | IrExpr::Ident(n) if n.starts_with("__ps_tmp") => format!("${n}"),
+        IrExpr::Var(n, _) | IrExpr::Ident(n) => crate::ir::safe_perl_q_string(n),
         _ => return false,
     };
-    let fq = crate::ir::safe_perl_q_string(&fname);
-    let cmp = if numeric { "{ $a <=> $b }" } else { "{ $a cmp $b }" };
+    // `our ($a, $b)` INSIDE the sort block: a script-level `my $a` (bash's
+    // `$a`) is in scope for the whole file and shadows Perl's sort package
+    // globals, which makes every comparison see two undefs and leaves the
+    // input in its original order. Verified: with `my $a = 'x'` in scope,
+    // `sort { $a cmp $b }` returns the list unchanged, while
+    // `sort { our ($a, $b); $a cmp $b }` sorts correctly and silences the
+    // "my $a used in sort comparison" warning.
+    let cmp = if numeric {
+        "{ our ($a, $b); $a <=> $b }"
+    } else {
+        "{ our ($a, $b); $a cmp $b }"
+    };
     let reverse = if reverse { " @__sl = reverse @__sl;" } else { "" };
     let code = format!(
-        "do {{ my @__sl = do {{ local $INPUT_RECORD_SEPARATOR = undef; open(my $__fh, '<', {fq}) or die \"sort: {fq}: $ERRNO\"; my $__c = <$__fh>; close $__fh; split(/\\n/, $__c) }}; pop @__sl if @__sl && $__sl[-1] eq q{{}}; @__sl = sort {cmp} @__sl;{reverse} open(my $__ofh, '>', {out}) or die \"sort: {out}: $ERRNO\"; if (@__sl) {{ print $__ofh join(\"\\n\", @__sl), \"\\n\"; }} close $__ofh; }}; $main_exit_code = $CHILD_ERROR = 0;"
+        "do {{ my @__sl = do {{ local $INPUT_RECORD_SEPARATOR = undef; open(my $__fh, '<', {fq}) or do {{ $CHILD_ERROR = 2; () }}; my $__c = <$__fh> // ''; close $__fh; split(/\\n/, $__c) }}; pop @__sl if @__sl && $__sl[-1] eq q{{}}; @__sl = sort {cmp} @__sl;{reverse} open(my $__ofh, '>', {out}) or die \"sort: {out}: $ERRNO\"; if (@__sl) {{ print $__ofh join(\"\\n\", @__sl), \"\\n\"; }} close $__ofh; }}; $main_exit_code = $CHILD_ERROR = 0;"
     );
     *st = IrStmt::RawText(code);
     true
@@ -2878,7 +3611,7 @@ fn native_echo_grep_stmt(st: &mut IrStmt) -> bool {
             while i < chars.len() {
                 match chars[i] {
                     'A' | 'B' | 'C' => {
-                        let n: i64 = if i + 1 < chars.len() {
+                        let n = if i + 1 < chars.len() {
                             let d: String = chars[i+1..].iter().collect();
                             let Ok(v) = d.parse() else { return false; };
                             i = chars.len();
@@ -2945,7 +3678,7 @@ fn native_echo_grep_stmt(st: &mut IrStmt) -> bool {
     );
     match out {
         Some(oq) => code.push_str(&format!(
-            "open(my $__ofh, '>', {oq}) or die \"grep: {oq}: $ERRNO\"; if (@__out) {{ print $__ofh join(\"\\n\", @__out), \"\\n\"; }} close $__ofh; $main_exit_code = $CHILD_ERROR = 0;"
+            "open(my $__ofh, '>', {oq}) or die \"grep: {oq}: $ERRNO\"; if (@__out) {{ print $__ofh join(\"\\n\", @__out), \"\\n\"; }} close $__ofh; $main_exit_code = $CHILD_ERROR = 0; }}"
         )),
         None => {
             let tail = match &else_echo {
@@ -2955,7 +3688,7 @@ fn native_echo_grep_stmt(st: &mut IrStmt) -> bool {
                         "if (@__out) {{ print join(\"\\n\", @__out), \"\\n\"; $main_exit_code = $CHILD_ERROR = 0; }} else {{ print STDOUT {eq}, \"\\n\"; $main_exit_code = $CHILD_ERROR = 1; }}"
                     )
                 }
-                None => "if (@__out) { print join(\"\\n\", @__out), \"\\n\"; } $main_exit_code = $CHILD_ERROR = 0;".to_string(),
+                None => "if (@__out) { print join(\"\\n\", @__out), \"\\n\"; } $main_exit_code = $CHILD_ERROR = 0; }".to_string(),
             };
             code.push_str(&tail);
         }
@@ -2983,7 +3716,8 @@ fn native_echo_write_file_stmt(st: &mut IrStmt) -> bool {
 
     let out = match &r.target {
         IrExpr::Str(s, _) => crate::ir::safe_perl_q_string(s),
-        IrExpr::Var(n, _) | IrExpr::Ident(n) => crate::ir::safe_perl_q_string(n),
+        // A Var target is the runtime VALUE (`$__ps_tmp0`), not its name.
+        IrExpr::Var(_, _) | IrExpr::Ident(_) => crate::ir::ir_expr_to_perl(&r.target),
         _ => return false,
     };
     // the inner stmt may arrive Block-wrapped
@@ -3279,7 +4013,7 @@ fn native_grep_file_pipeline(st: &mut IrStmt) -> bool {
         None => String::new(),
     };
     let mut code = format!(
-        "do {{ my @__lp = do {{ local $INPUT_RECORD_SEPARATOR = undef; open(my $__f, '<', {fq}) or die \"grep: {fq}: $ERRNO\"; my $__c = <$__f>; close $__f; split(/\\n/, $__c) }}; pop @__lp if @__lp && $__lp[-1] eq q{{}};{filter}"
+        "do {{ my @__lp = do {{ local $INPUT_RECORD_SEPARATOR = undef; open(my $__f, '<', {fq}) or do {{ $CHILD_ERROR = 2; () }}; my $__c = <$__f> // ''; close $__f; split(/\\n/, $__c) }}; pop @__lp if @__lp && $__lp[-1] eq q{{}};{filter}"
     );
     for op in &ops {
         code.push_str(op);
@@ -4477,6 +5211,31 @@ fn native_echo_xargs_stmt(st: &mut IrStmt) -> bool {
     true
 }
 
+/// Re-escape a decoded `tr` set for Perl's `tr///` operator.
+///
+/// `tr///` is not a string literal: a literal control character in the set
+/// is a physical line break that ends the operator early. `tr ' ' '\n'`
+/// decodes to a raw 0x0A, so `tr/ /<NL>/` made Perl read an empty
+/// replacement set AND let the statement's `# line N` comment land inside
+/// the operator — `echo "hello world" | tr ' ' '\n' | sort | head -2`
+/// printed one line instead of two. tr/// accepts the same `\n` / `\t` /
+/// `\r` escapes, so emit them instead of the raw bytes.
+fn tr_set_escape(s: &str) -> String {
+    let mut out = String::with_capacity(s.len());
+    for c in s.chars() {
+        match c {
+            '\n' => out.push_str("\\n"),
+            '\t' => out.push_str("\\t"),
+            '\r' => out.push_str("\\r"),
+            '\x0c' => out.push_str("\\f"),
+            '\0' => out.push_str("\\0"),
+            '\\' => out.push_str("\\\\"),
+            c => out.push(c),
+        }
+    }
+    out
+}
+
 /// `echo LIT | tr SET1 SET2 [| sort] [| head -N]` (perl-only): char
 /// translation followed by optional sort and head on the lines.
 fn native_echo_tr_sort_stmt(st: &mut IrStmt) -> bool {
@@ -4597,6 +5356,10 @@ fn native_echo_tr_sort_stmt(st: &mut IrStmt) -> bool {
     if tr1.len() != 1 || tr2.len() != 1 {
         return false;
     }
+    // tr/// is an OPERATOR, not a string literal — a decoded control char
+    // would be emitted as a raw byte and break out of the operator.
+    let tr1 = tr_set_escape(&tr1);
+    let tr2 = tr_set_escape(&tr2);
     // optional stage 2: sort [flags]; stage 3: head -N
     let mut sort_flag = false;
     let mut head_n: Option<usize> = None;
@@ -4898,8 +5661,8 @@ fn native_diff_files_stmt(st: &mut IrStmt) -> bool {
             }
             let o = match &r.target {
                 IrExpr::Str(s, _) => Some(crate::ir::safe_perl_q_string(s)),
-                IrExpr::Var(n, _) | IrExpr::Ident(n) => {
-                    Some(crate::ir::safe_perl_q_string(n))
+                IrExpr::Var(_, _) | IrExpr::Ident(_) => {
+                    Some(crate::ir::ir_expr_to_perl(&r.target))
                 }
                 _ => return false,
             };
@@ -4919,7 +5682,7 @@ fn native_diff_files_stmt(st: &mut IrStmt) -> bool {
     let file_q = |w: &IrExpr| -> Option<String> {
         match w {
             IrExpr::Str(s, _) => Some(crate::ir::safe_perl_q_string(s)),
-            IrExpr::Var(n, _) | IrExpr::Ident(n) => Some(crate::ir::safe_perl_q_string(n)),
+            IrExpr::Var(_, _) | IrExpr::Ident(_) => Some(crate::ir::ir_expr_to_perl(w)),
             _ => None,
         }
     };
@@ -4933,7 +5696,7 @@ fn native_diff_files_stmt(st: &mut IrStmt) -> bool {
         None => r#" my $__is_out = 0; my $__fh = \*STDOUT; "#.to_string(),
     };
     let code = format!(
-        r#"my $__rc = 0; do {{ my @__a = split(/\n/, do {{ local $INPUT_RECORD_SEPARATOR = undef; open(my $__f, '<', {f1}) or die "diff: {f1}: $ERRNO"; my $__c = <$__f>; close $__f; $__c }}, -1); pop @__a if @__a && $__a[-1] eq q{{}}; my @__b = split(/\n/, do {{ local $INPUT_RECORD_SEPARATOR = undef; open(my $__g, '<', {f2}) or die "diff: {f2}: $ERRNO"; my $__c = <$__g>; close $__g; $__c }}, -1); pop @__b if @__b && $__b[-1] eq q{{}}; my @__dp; for my $__i (0..$#__a) {{ for my $__j (0..$#__b) {{ if ($__a[$__i] eq $__b[$__j]) {{ $__dp[$__i+1][$__j+1] = $__dp[$__i][$__j] + 1; }} else {{ $__dp[$__i+1][$__j+1] = ($__dp[$__i][$__j+1] > $__dp[$__i+1][$__j]) ? $__dp[$__i][$__j+1] : $__dp[$__i+1][$__j]; }} }} }} my ($__i, $__j) = ($#__a, $#__b); my @__ops; while ($__i >= 0 && $__j >= 0) {{ if ($__a[$__i] eq $__b[$__j]) {{ unshift @__ops, [0, $__i, $__j]; $__i--; $__j--; }} elsif ($__dp[$__i][$__j+1] >= $__dp[$__i+1][$__j]) {{ unshift @__ops, [-1, $__i, $__j]; $__i--; }} else {{ unshift @__ops, [1, $__i, $__j]; $__j--; }} }} while ($__i >= 0) {{ unshift @__ops, [-1, $__i, -1]; $__i--; }} while ($__j >= 0) {{ unshift @__ops, [1, -1, $__j]; $__j--; }} {out_code}my $__changed = 0; my $__idx = 0; while ($__idx < @__ops) {{ if ($__ops[$__idx][0] == 0) {{ $__idx++; next; }} my @__dels; my @__adds; my $__last_a = -1; my $__last_b = -1; while ($__idx < @__ops && $__ops[$__idx][0] != 0) {{ if ($__ops[$__idx][0] == -1) {{ push @__dels, $__ops[$__idx][1]; $__last_a = $__ops[$__idx][1]; }} else {{ push @__adds, $__ops[$__idx][2]; $__last_b = $__ops[$__idx][2]; }} $__idx++; }} $__changed = 1; my $__a1 = $__dels[0] + 1; my $__a2 = $__dels[-1] + 1; my $__b1 = $__adds[0] + 1; my $__b2 = $__adds[-1] + 1; my $__astr = $__a1 == $__a2 ? "$__a1" : "$__a1,$__a2"; my $__bstr = $__b1 == $__b2 ? "$__b1" : "$__b1,$__b2"; my $__opch = (@__dels && @__adds) ? "c" : (@__dels ? "d" : "a"); my $__hdr; if ($__opch eq "c") {{ $__hdr = "$__astr$__opch$__bstr"; }} elsif ($__opch eq "d") {{ $__hdr = "$__astr$__opch" . (defined $__last_b ? $__last_b + 1 : 1); }} else {{ my $__apos = $__last_a + 1; $__hdr = "$__apos$__opch$__bstr"; }} print $__fh "$__hdr\n"; for my $__k (@__dels) {{ print $__fh "< $__a[$__k]\n"; }} if (@__dels && @__adds) {{ print $__fh "---\n"; }} for my $__k (@__adds) {{ print $__fh "> $__b[$__k]\n"; }} }} $__rc = $__changed ? 1 : 0; close $__fh if $__is_out; }}; $main_exit_code = $CHILD_ERROR = $__rc; "#,
+        r#"my $__rc = 0; do {{ my @__a = split(/\n/, do {{ local $INPUT_RECORD_SEPARATOR = undef; open(my $__f, '<', {f1}) or die "diff: {f1}: $ERRNO"; my $__c = <$__f>; close $__f; $__c }}, -1); pop @__a if @__a && $__a[-1] eq q{{}}; my @__b = split(/\n/, do {{ local $INPUT_RECORD_SEPARATOR = undef; open(my $__g, '<', {f2}) or die "diff: {f2}: $ERRNO"; my $__c = <$__g>; close $__g; $__c }}, -1); pop @__b if @__b && $__b[-1] eq q{{}}; my @__dp; for my $__i (0..$#__a) {{ for my $__j (0..$#__b) {{ if ($__a[$__i] eq $__b[$__j]) {{ $__dp[$__i+1][$__j+1] = $__dp[$__i][$__j] + 1; }} else {{ $__dp[$__i+1][$__j+1] = ($__dp[$__i][$__j+1] > $__dp[$__i+1][$__j]) ? $__dp[$__i][$__j+1] : $__dp[$__i+1][$__j]; }} }} }} my ($__i, $__j) = ($#__a, $#__b); my @__ops; while ($__i >= 0 && $__j >= 0) {{ if ($__a[$__i] eq $__b[$__j]) {{ unshift @__ops, [0, $__i, $__j]; $__i--; $__j--; }} elsif ($__dp[$__i][$__j+1] >= $__dp[$__i+1][$__j]) {{ unshift @__ops, [-1, $__i, $__j]; $__i--; }} else {{ unshift @__ops, [1, $__i, $__j]; $__j--; }} }} while ($__i >= 0) {{ unshift @__ops, [-1, $__i, -1]; $__i--; }} while ($__j >= 0) {{ unshift @__ops, [1, -1, $__j]; $__j--; }} {out_code}my $__changed = 0; my $__idx = 0; my $__common = -1; while ($__idx < @__ops) {{ if ($__ops[$__idx][0] == 0) {{ $__common = $__ops[$__idx][1] + 1; $__idx++; next; }} my @__dels; my @__adds; my $__last_a = -1; my $__last_b = -1; while ($__idx < @__ops && $__ops[$__idx][0] != 0) {{ if ($__ops[$__idx][0] == -1) {{ push @__dels, $__ops[$__idx][1]; $__last_a = $__ops[$__idx][1]; }} else {{ push @__adds, $__ops[$__idx][2]; $__last_b = $__ops[$__idx][2]; }} $__idx++; }} $__changed = 1; my $__a1 = $__dels[0] + 1; my $__a2 = $__dels[-1] + 1; my $__b1 = $__adds[0] + 1; my $__b2 = $__adds[-1] + 1; my $__astr = $__a1 == $__a2 ? "$__a1" : "$__a1,$__a2"; my $__bstr = $__b1 == $__b2 ? "$__b1" : "$__b1,$__b2"; my $__opch = (@__dels && @__adds) ? "c" : (@__dels ? "d" : "a"); my $__hdr; if ($__opch eq "c") {{ $__hdr = "$__astr$__opch$__bstr"; }} elsif ($__opch eq "d") {{ $__hdr = "$__astr$__opch" . (defined $__last_b ? $__last_b + 1 : 1); }} else {{ my $__apos = $__common; $__hdr = "$__apos$__opch$__bstr"; }} print $__fh "$__hdr\n"; for my $__k (@__dels) {{ print $__fh "< $__a[$__k]\n"; }} if (@__dels && @__adds) {{ print $__fh "---\n"; }} for my $__k (@__adds) {{ print $__fh "> $__b[$__k]\n"; }} }} $__rc = $__changed ? 1 : 0; close $__fh if $__is_out; }}; $main_exit_code = $CHILD_ERROR = $__rc; "#,
         f1 = f1, f2 = f2
     );
     *st = IrStmt::RawText(code);
@@ -5044,22 +5807,95 @@ fn native_rm_rf_stmt(st: &mut IrStmt) -> bool {
     true
 }
 
-/// `If { cond: test(...), .. }` (perl-only): render the test condition
-/// natively (the renderer shells out unsupported flags like -S).
-fn native_if_test_cond(st: &mut IrStmt) -> bool {
-    let IrStmt::If { cond, .. } = st else { return false; };
-    let IrExpr::Call { func, args } = cond else { return false; };
-    if !matches!(func.as_str(), "test" | "[" | "[[" ) {
-        return false;
+/// Extract the test-command words from an `IrExpr::Call`, handling both
+/// `Call{func:"test"}` and `Call{func:"exec", args:[Str("test"), Array(words)]}`.
+fn extract_test_words(e: &IrExpr) -> Option<Vec<&IrExpr>> {
+    let IrExpr::Call { func, args } = e else { return None; };
+    match func.as_str() {
+        "test" | "[" | "[[" => match args.as_slice() {
+            [IrExpr::Str(_, _), IrExpr::Array(words)] => Some(words.iter().collect()),
+            _ => Some(args.iter().collect()),
+        },
+        "exec" | "builtin" => {
+            let [IrExpr::Str(cmd, _), IrExpr::Array(words)] = args.as_slice() else {
+                return None;
+            };
+            (cmd == "test" || cmd == "[").then(|| words.iter().collect())
+        }
+        _ => None,
     }
-    // the test args may be [Str("cmd"), Array(words)] or just the cond
-    // words ([Str(" -S /dev/null")]).
-    let cond_words: Vec<&IrExpr> = match args.as_slice() {
-        [IrExpr::Str(_, _), IrExpr::Array(words)] => words.iter().collect(),
-        _ => args.iter().collect(),
-    };
-    let new_cond = render_test_words(&cond_words);
-    *cond = new_cond;
+}
+
+/// `A && B` where A is a test command, and `If { cond: test(...), .. }`
+/// (perl-only): render the test condition natively (the renderer shells out
+/// unsupported flags like -S). `&&` chains are lowered to `RawText` with
+/// `$CHILD_ERROR` tracking so the non-zero failing status is preserved (a
+/// regular `if` with no else would reset it to 0), while `If` statements
+/// get their condition converted to an `IrExpr::Str` for the emitter to
+/// emit the tracking + `else { $CHILD_ERROR = 0; }` reset.
+fn native_if_test_cond(st: &mut IrStmt) -> bool {
+    // `test COND && B`: lower to RawText with $CHILD_ERROR tracking BEFORE
+    // test_and_to_if can rewrite it into an If that loses the failing status.
+    if let IrStmt::Expr(IrExpr::BinOp {
+        op: BinOpKind::And,
+        lhs,
+        rhs,
+    }) = st
+    {
+        // The leaf may be the raw `test` Call (its words render natively,
+        // nocasematch-aware) or — after the shared test-lowering rewrote
+        // it — a pure boolean value primitive. Both have the same truth,
+        // and BOTH need the explicit write below: the failing test's
+        // status is the chain's status, and an If-without-else would
+        // inherit the previous $CHILD_ERROR instead (measured: an
+        // eq-string-num-var loop iteration that fails its test must leave
+        // `$?` = 1 for the `[ "$?" = 0 ]` read after the loop).
+        let native_cond = if let Some(cond_words) = extract_test_words(lhs) {
+            let new_cond = render_test_words(&cond_words);
+            Some(crate::ir::ir_expr_to_perl(&new_cond))
+        } else if crate::shir::is_pure_bool(lhs) {
+            // Pure (side-effect-free) per the predicate, so re-evaluating
+            // it in the `if` after the write is value-identical — the
+            // same double-evaluation the raw-test arm has always done.
+            Some(crate::ir::ir_expr_to_perl(lhs))
+        } else {
+            None
+        };
+        if let Some(cond_p) = native_cond {
+            let rhs_stmt = IrStmt::Expr((**rhs).clone());
+            // BOTH status vars: `$main_exit_code` is what the program exits
+            // with, and bash's status for the chain when the test fails is the
+            // test's status (1). Tracking only `$CHILD_ERROR` left
+            // `exit $main_exit_code` reporting the stale 0 — the whole reason
+            // parse-bracket-subshell-pipe failed on exit code alone.
+            // The rhs writes its own status on success, so the leading write
+            // is exactly the short-circuit case.
+            let mut code = format!(
+                "$main_exit_code = $CHILD_ERROR = ({}) ? 0 : 1;\nif ({}) {{\n",
+                cond_p, cond_p
+            );
+            crate::ir::emit_stmt(&mut code, &rhs_stmt, 1);
+            code.push_str("}\n");
+            *st = IrStmt::RawText(code);
+            return true;
+        }
+    }
+    let IrStmt::If { cond, .. } = st else { return false; };
+    let Some(cond_words) = extract_test_words(cond) else { return false; };
+    *cond = render_test_words(&cond_words);
+    true
+}
+
+/// `while test COND` / `while [ COND ]` (frontend shapes like fish's
+/// `while test $i -lt 5`): render the loop condition natively. Left as a
+/// shell-out, the `bash -c` child cannot see the loop variable — the guard
+/// reads an empty value and the loop is silently skipped (fish t82_break
+/// rendered only `after 0`). Only a genuine test command is rewritten;
+/// anything else keeps its existing rendering.
+fn native_while_test_cond(st: &mut IrStmt) -> bool {
+    let IrStmt::While { cond, .. } = st else { return false; };
+    let Some(cond_words) = extract_test_words(cond) else { return false; };
+    *cond = render_test_words(&cond_words);
     true
 }
 
@@ -5103,7 +5939,7 @@ fn native_test_exit_stmt(st: &mut IrStmt) -> bool {
         return false;
     }
     // the exit code: literal int (default 0)
-    let mut code_n: i64 = 0;
+    let mut code_n = 0;
     for w in words {
         let Some(t) = literal_text(w) else { return false; };
         let Ok(v) = t.parse() else { return false; };
@@ -5233,10 +6069,26 @@ fn native_while_multi_cond(st: &mut IrStmt) -> bool {
         cond: rendered,
         then: vec![],
         elsifs: vec![],
-        else_: vec![IrStmt::Expr(IrExpr::Call {
-            func: "break".to_string(),
-            args: vec![],
-        })],
+        // The condition FAILED. bash reports 0 for a `while` whose body
+        // never ran, whatever the condition's own status was, so zero the
+        // status on this exit path:
+        //
+        //     while echo c; test -f /nope; do echo hi; break; done; echo $?
+        //     # c
+        //     # 0        <- not 1, the failing `test`'s status
+        //
+        // `$CHILD_ERROR` still holds that failing status at this point
+        // (the `test` lowering just set it), which is what the old code
+        // leaked (parse-multi-command-while-condition printed 1).
+        // Two statements, not one RawText: `break` must reach the IR's
+        // `last;` mapping, and a raw `break` is a strict-subs bareword.
+        else_: vec![
+            IrStmt::RawText("$main_exit_code = $CHILD_ERROR = 0;".to_string()),
+            IrStmt::Expr(IrExpr::Call {
+                func: "break".to_string(),
+                args: vec![],
+            }),
+        ],
     });
     new_body.extend(body.iter().cloned());
     match st {
@@ -5252,6 +6104,13 @@ fn native_while_multi_cond(st: &mut IrStmt) -> bool {
 /// `find DIR -name PAT | head -N` (perl-only): recursive readdir walk
 /// (depth-first in readdir order, like find), match the basename against
 /// the literal pattern (suffix/glob), print matching paths, then head.
+///
+/// The walk must NOT descend into a symlinked directory: `-d` follows
+/// symlinks, GNU `find` does not (not without `-L`), so testing `-d` alone
+/// walked into `./frontends -> sh2perl/frontends` and the first three
+/// matches came from a tree GNU find never looked at — `test_find.sh`
+/// printed three unrelated paths. The entry is still MATCHED, so a symlink
+/// named `x.sh` keeps appearing in the output exactly as find lists it.
 fn native_find_stmt(st: &mut IrStmt) -> bool {
     let IrStmt::Expr(IrExpr::Call { func, args }) = st else { return false; };
     if func != "pipeline" {
@@ -5368,14 +6227,14 @@ fn native_find_stmt(st: &mut IrStmt) -> bool {
     }
     let matcher = match &suffix {
         Some(sf) => format!(
-            "if (-d $__p) {{ $__walk->($__p); }} elsif (substr($__e, -{}) eq {}) {{ push @__out, $__p; }}",
+            "if (-d $__p && !-l $__p) {{ $__walk->($__p); }} elsif (substr($__e, -{}) eq {}) {{ push @__out, $__p; }}",
             sf.len(),
             crate::ir::safe_perl_q_string(sf)
         ),
         None => {
             let pq = crate::ir::safe_perl_q_string(&pat);
             format!(
-                "if (-d $__p) {{ $__walk->($__p); }} elsif ($__e eq {pq}) {{ push @__out, $__p; }}"
+                "if (-d $__p && !-l $__p) {{ $__walk->($__p); }} elsif ($__e eq {pq}) {{ push @__out, $__p; }}"
             )
         }
     };
@@ -5729,7 +6588,7 @@ fn native_comm_stmt(st: &mut IrStmt) -> bool {
     let file_q = |w: &IrExpr| -> Option<String> {
         match w {
             IrExpr::Str(s, _) => Some(crate::ir::safe_perl_q_string(s)),
-            IrExpr::Var(n, _) | IrExpr::Ident(n) => Some(crate::ir::safe_perl_q_string(n)),
+            IrExpr::Var(_, _) | IrExpr::Ident(_) => Some(crate::ir::ir_expr_to_perl(w)),
             _ => None,
         }
     };
@@ -6078,5 +6937,154 @@ fn empty_herestring_to_status(st: &mut IrStmt) -> bool {
             true
         }
         _ => false,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::parser::commands::parse_commands_from_text;
+    use crate::shir::ast_to_ir_raw;
+    use crate::shir_json::shir_to_shir_json;
+
+    /// Lower + run the transform, returning (before, after) shIR JSON.
+    fn lower(src: &str) -> (String, String) {
+        let commands = parse_commands_from_text(src).expect("parse source");
+        let mut prog = ast_to_ir_raw(&commands);
+        let before = shir_to_shir_json(&prog);
+        transform(&mut prog.stmts);
+        (before, shir_to_shir_json(&prog))
+    }
+
+    /// `mkdir -p DIR && echo X > FILE` (018_grep_params' normalisable
+    /// shell-out): a statement-position command chain with no test in it.
+    /// Before `cmd_and_chain_to_if` the whole BinOp reached the renderer as
+    /// one `system('bash', '-c', q{… && …})` — on EVERY backend, even
+    /// though each element already had a native statement form.
+    #[test]
+    fn command_chain_lowers_to_status_gated_ifs() {
+        let (before, after) = lower("mkdir -p /tmp/d && echo hi > /tmp/d/f");
+        assert!(before.contains("\"And\""), "chain starts as an And: {before}");
+        assert!(after.contains("\"If\""), "chain must lower to If(s): {after}");
+        assert!(
+            !after.contains("\"And\""),
+            "no raw And chain may survive: {after}"
+        );
+        // the gate is the shared status read (`$?`), not a re-test of mkdir
+        assert!(
+            after.contains("\"name\":\"?\"") || after.contains("\"name\": \"?\""),
+            "the If must be gated on the status register: {after}"
+        );
+        // the redirect element takes its NATIVE statement form — the Call
+        // spelling shells out as a statement on every backend
+        assert!(
+            after.contains("\"Redirect\""),
+            "redirect element must become IrStmt::Redirect: {after}"
+        );
+        // …and its body is the BARE Output the top-level path renders
+        // natively (the Block([Output, true]) spelling is what
+        // stmts_to_shell_cmd rebuilds into a shell echo — a shell-out)
+        let bare = after.replace(" ", "");
+        assert!(
+            !bare.contains("\"inner\":[{\"type\":\"Block\"")
+                && bare.contains("\"inner\":[{")
+                && bare.contains("\"type\":\"Output\""),
+            "redirect inner must be a bare Output (not Block-wrapped): {after}"
+        );
+    }
+
+    /// Three-command chain: nested Ifs, one per && (short-circuit kept).
+    #[test]
+    fn longer_command_chains_nest() {
+        let (_, after) = lower("mkdir -p /tmp/d && echo a > /tmp/d/f && echo done");
+        let ifs = after.matches("\"type\": \"If\"").count() + after.matches("\"type\":\"If\"").count();
+        assert!(ifs >= 2, "one If per && : {after}");
+        assert!(!after.contains("\"And\""), "chain gone: {after}");
+    }
+
+    /// Refusal: an element that is not a statement-native command shape
+    /// (a `pipeline(…)` CALL — its statement form is a shell-out) keeps
+    /// the chain as-is for the pipeline passes to own.
+    #[test]
+    fn non_statement_elements_refuse_the_chain_rewrite() {
+        let (_, after) = lower("echo a | grep b && echo ok");
+        // Another pass may legitimately rewrite this (the static-pipeline
+        // truth fold owns `echo a | grep b`), but the STATUS-GATED shape
+        // (`$? == 0` If) must not come from this rewrite.
+        assert!(
+            !after.contains("\"name\":\"?\"") && !after.contains("\"name\": \"?\""),
+            "a pipeline element must not produce the status-gated chain: {after}"
+        );
+    }
+
+    /// Refusal: `cd` inside a chain — the statement arm is `chdir … or die`
+    /// (and skips no `--`), so routing `$(cd /bad && pwd)` through it killed
+    /// the script where bash captures an empty string (cd-command-substitution,
+    /// qx-var-builtin-cd — both red on the first run of this rewrite).
+    #[test]
+    fn cd_chains_keep_their_dedicated_renderers() {
+        for src in ["cd /some/dir && pwd", "script_dir=$(cd -- \"$(dirname $0)\" && pwd)"] {
+            let (_, after) = lower(src);
+            assert!(
+                !after.contains("\"name\":\"?\"") && !after.contains("\"name\": \"?\""),
+                "`{src}` must not take the status-gated chain rewrite: {after}"
+            );
+        }
+    }
+
+    /// The test renderers return raw Perl text inside `IrExpr::Str`.
+    fn raw(e: IrExpr) -> String {
+        match e {
+            IrExpr::Str(s, _) => s,
+            other => panic!("expected a raw Str render, got {other:?}"),
+        }
+    }
+
+    /// Regression (tty-cmdsub.sh): `[[ -r "$dev" ]]` flattens to the
+    /// TWO-token text `-r "$dev" [[` — after the trailing `[[` marker is
+    /// popped it missed every three-token arm and fell to the historic
+    /// `my $t = "…"; $t =~ /-\w+/ ? 1 : 0` heuristic, which matches the
+    /// test's OWN flag text and is therefore always TRUE. tty-cmdsub then
+    /// selected an unreadable (or nonexistent) /dev/pts/N where bash
+    /// selected a readable one, and the generated script died on the
+    /// redirect. The two-token arm now hands the remaining unary file
+    /// tests (`-r`/`-w`/`-x`/…) to the shared recursive test parser, which
+    /// emits Perl's own filetest operator.
+    #[test]
+    fn unary_file_test_renders_a_filetest_not_the_flag_regex() {
+        for (text, want) in [
+            (r#"-r "$dev" [["#, "-r $dev"),
+            (r#"-w "$out" [["#, "-w $out"),
+            (r#"-x "$bin" [["#, "-x $bin"),
+            (r#"-e "$cfg" [["#, "-e $cfg"),
+        ] {
+            let got = raw(render_test_tokens(text));
+            assert_eq!(got, want, "`{text}` must render the actual file test");
+            assert!(
+                !got.contains("my $t") && !got.contains(r"/-\w+/"),
+                "`{text}` fell back to the always-TRUE flag heuristic: {got}"
+            );
+        }
+    }
+
+    /// The shared parser still owns the shapes the dedicated arms do not:
+    /// a NEGATED unary test, and a 3-token form whose middle operator has
+    /// no dedicated arm here, must render a real expression rather than
+    /// the always-truthy heuristic.
+    #[test]
+    fn negated_and_unhandled_shapes_reach_the_shared_parser() {
+        let negated = raw(render_test_tokens(r#"! -f "$cfg""#));
+        assert!(
+            negated.contains("-f") && !negated.contains("my $t"),
+            "negated file test must stay a file test: {negated}"
+        );
+
+        // `-nt` is a 3-token shape with no dedicated arm in this fn; the
+        // shared parser renders the real mtime comparison.
+        let cmp = raw(render_test_tokens(r#""$new" -nt "$old""#));
+        assert!(
+            cmp.contains("(stat(") && !cmp.contains("my $t"),
+            "mtime comparison must not degrade to the flag heuristic: {cmp}"
+        );
     }
 }

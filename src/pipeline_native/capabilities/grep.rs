@@ -12,8 +12,100 @@ pub(crate) fn emit(ctx: &NativeCtx) -> Option<NativeEmit> {
     match ctx {
         NativeCtx::Exec { call, cond: true } => grep_boolean(call).map(NativeEmit::Cond),
         NativeCtx::Chain(e) => grep_chain(e).map(NativeEmit::Stmt),
+        NativeCtx::Capture { call } => grep_herestring(call),
         _ => None,
     }
+}
+
+/// `x=$(grep [-c|-q] [-iv] PAT <<< LIT)` — a here-string literal input.
+fn grep_herestring(call: &IrExpr) -> Option<NativeEmit> {
+    use crate::ir::{IrExpr, IrStmt};
+    let IrExpr::Call { func, args } = call else {
+        return None;
+    };
+    if func != "redirect" {
+        return None;
+    }
+    let [IrExpr::Arrow(inner), IrExpr::Array(specs)] = args.as_slice() else {
+        return None;
+    };
+    let [IrStmt::Expr(exec)] = inner.as_slice() else {
+        return None;
+    };
+    let IrExpr::Call { func: f, args: a } = exec else {
+        return None;
+    };
+    if !matches!(f.as_str(), "exec" | "builtin") {
+        return None;
+    }
+    let [IrExpr::Str(cmd, _), IrExpr::Array(words)] = a.as_slice() else {
+        return None;
+    };
+    if cmd != "grep" {
+        return None;
+    }
+    let [spec] = specs.as_slice() else {
+        return None;
+    };
+    let IrExpr::Object(entries) = spec else {
+        return None;
+    };
+    let mut mode = String::new();
+    let mut target: Option<&IrExpr> = None;
+    for (k, v) in entries {
+        match k.as_str() {
+            "mode" => mode = crate::ir::call_arg_str(v).unwrap_or_default(),
+            "target" => target = Some(v),
+            _ => {}
+        }
+    }
+    if mode != "herestring" {
+        return None;
+    }
+    let input = crate::ir::grep_lit_str(target?)?;
+    let mut count = false;
+    let mut quiet = false;
+    let mut invert = false;
+    let mut insensitive = false;
+    let mut pattern: Option<String> = None;
+    for w in words {
+        let s = crate::ir::grep_lit_str(w)?;
+        if s.starts_with('-') && s.len() > 1 {
+            for c in s[1..].chars() {
+                match c {
+                    'c' => count = true,
+                    'q' => quiet = true,
+                    'v' => invert = true,
+                    'i' => insensitive = true,
+                    'E' | 'F' => {}
+                    _ => return None,
+                }
+            }
+        } else if pattern.is_none() {
+            pattern = Some(s);
+        } else {
+            return None;
+        }
+    }
+    let pat = pattern?;
+    let rx = pat.replace('\\', "\\\\").replace('/', "\\/");
+    let test = if insensitive {
+        format!("lc($__l) =~ qr/{}i/", rx)
+    } else {
+        format!("$__l =~ qr/{}/", rx)
+    };
+    let test = if invert { format!("!({test})") } else { test };
+    let body = if quiet {
+        format!("my $__m = 0; for my $__l (split(/\\n/, $__in)) {{ $__m = 1, last if {test}; }} $__sh_cap = q{{}}; $main_exit_code = $CHILD_ERROR = $__m ? 0 : 1;")
+    } else if count {
+        format!("my $__n = 0; for my $__l (split(/\\n/, $__in)) {{ $__n++ if {test}; }} $__sh_cap = $__n; $main_exit_code = $CHILD_ERROR = $__n > 0 ? 0 : 1;")
+    } else {
+        format!("my @__o; for my $__l (split(/\\n/, $__in)) {{ push @__o, $__l if {test}; }} $__sh_cap = join(\"\\n\", @__o); $main_exit_code = $CHILD_ERROR = @__o ? 0 : 1;")
+    };
+    Some(NativeEmit::Stmt(format!(
+        "my $__in = {} . \"\\n\"; {body}",
+        crate::ir::safe_perl_q_string(&input)
+    )))
 }
 
 /// A verified `grep [-q|c|l|L] [-i] [-s] PAT FILE` (single literal file).

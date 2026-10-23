@@ -94,10 +94,16 @@ fn main() {
     // frontend A1 ingress: the shared transforms (text-ops opt-in via
     // SH2_TRANSFORMS inside apply) — the same channel otranspilerl runs
     debashl::transforms::apply(&mut prog.stmts);
-    // the estree target renders goto/cfor natively — skip the structuring
-    // passes (otranspilerl ingest parity; restructuring changed gate output
-    // for goto/cfor-bearing examples)
-    if kind != "estree" {
+    // frontend A1 ingress: restructure Label/Goto into structured flow.
+    // The estree emitter has NO Goto arm — a survivor renders as
+    // `sh2.unsupported("goto <label>")` and dies at runtime — so estree
+    // runs the predicate-gated pass (jump-free output stays byte-identical;
+    // a goto-bearing program is restructured instead of refused). strip_cfor
+    // stays off for estree: that emitter handles cfor natively and its
+    // direct-path output must not change.
+    if kind == "estree" {
+        debashl::shir_passes::restructure_goto_if_present(&mut prog);
+    } else {
         debashl::shir_passes::restructure_goto_only(&mut prog);
         debashl::shir_passes::strip_cfor(&mut prog);
     }

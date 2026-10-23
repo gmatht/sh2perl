@@ -26,6 +26,14 @@ pub(crate) struct PipelineCtx {
     pub words: Vec<String>,
     /// the producer's literal payload, already a perl string literal
     pub content_perl: String,
+    /// Does the producer's REAL output end with a newline? The payload
+    /// convention strips trailing newlines (see `pipe_printf_content`),
+    /// which every byte-counting consumer accounts for itself — but `tr`
+    /// transliterates *every* byte including that final `\n`, so `tr`
+    /// must put it back before translating. Without it,
+    /// `seq 1 3 | tr '\n' ' '` printed `1 2 3` instead of `1 2 3 `
+    /// (070_gnuisms_thorough).
+    pub producer_nl: bool,
 }
 
 /// What a capability leaf produced: a boolean expression (for if/while
@@ -42,6 +50,11 @@ pub(crate) enum NativeCtx<'a> {
     Pipe(&'a PipelineCtx),
     /// an exec call: `cond=true` in if/while condition, `false` as a statement
     Exec { call: &'a IrExpr, cond: bool },
+    /// an exec call in CAPTURE position (`x=$(cmd)`) — the leaf returns its
+    /// value in `$__sh_cap` instead of printing. Distinct from `Exec` so a
+    /// value-channel leaf can never be reached from statement position,
+    /// where `$__sh_cap` has no declaration and no output.
+    Capture { call: &'a IrExpr },
     /// a `cat <<'EOF' … EOF` heredoc body (already unescaped literal)
     Heredoc(&'a str),
     /// a `(grep -q PAT FILE && echo A) || echo B` control chain
@@ -65,23 +78,118 @@ pub(crate) fn native_pipeline(e: &IrExpr) -> Option<String> {
     let [IrExpr::Array(stages)] = args.as_slice() else {
         return None;
     };
-    if stages.len() != 2 {
-        return None;
+    // Two stages: producer → consumer.
+    if let [IrExpr::Arrow(s1), IrExpr::Arrow(s2)] = stages.as_slice() {
+        // `yes [WORD] | head -N` — the only finite consumer of an infinite
+        // producer (examples 000__04d/04h/05).
+        if let Some(word) = yes_word(s1) {
+            if let Some(n) = head_n(s2) {
+                return Some(format!(
+                    "print(({} . \"\\n\") x {}); $main_exit_code = $CHILD_ERROR = 0;",
+                    crate::ir::safe_perl_q_string(&word),
+                    n
+                ));
+            }
+        }
+        // `echo EXPR | bc` — scale-0 integer arithmetic (the corpus uses
+        // `sqrt(N)` and `$a + $b`). Evaluate with Perl `int()`.
+        if let Some(w) = echo_single_word(s1) {
+            if is_bare_exec(s2, "bc") {
+                if let Some(expr) = bc_word_expr(w) {
+                    return Some(format!(
+                        "print int({expr}), \"\\n\"; $main_exit_code = $CHILD_ERROR = 0;"
+                    ));
+                }
+            }
+        }
+        let (content_perl, producer_nl) = producer_content(s1)?;
+        let (cmd, words) = pipe_consumer(s2)?;
+        let ctx = PipelineCtx {
+            cmd,
+            words,
+            content_perl,
+            producer_nl,
+        };
+        return match native_dispatch(&NativeCtx::Pipe(&ctx)) {
+            Some(NativeEmit::Stmt(s)) => Some(scope_stmt(&s)),
+            _ => None,
+        };
     }
-    let [IrExpr::Arrow(s1), IrExpr::Arrow(s2)] = stages.as_slice() else {
-        return None;
-    };
-    let content = pipe_printf_content(s1)?;
-    let (cmd, words) = pipe_consumer(s2)?;
-    let ctx = PipelineCtx {
-        cmd,
-        words,
-        content_perl: crate::ir::safe_perl_q_string(&content),
-    };
-    match native_dispatch(&NativeCtx::Pipe(&ctx)) {
-        Some(NativeEmit::Stmt(s)) => Some(s),
-        _ => None,
+    // N stages (`echo … | grep … | wc -l`, and the 4–5-stage corpus
+    // shapes `grep | grep -Eo | sed | grep -v | head`): stage 1 is the
+    // producer; every MID stage (2..N-1) lowers natively with its stdout
+    // captured into a chaining scalar; the final stage reads the last
+    // scalar. The capability contract takes `content_perl` as a Perl
+    // EXPRESSION (the leaves splice it into `split(/\n/, {body})`), so a
+    // variable works exactly like a literal. A single refusing stage
+    // bails the WHOLE pipeline (same as before — the caller rebuilds the
+    // shell text), so coverage grows one capability at a time without
+    // ever emitting a half-native chain. The 3-stage case is exactly the
+    // old special case (one mid → `__sh_pv`).
+    if stages.len() >= 3 {
+        let [IrExpr::Arrow(first), rest @ ..] = stages.as_slice() else {
+            return None;
+        };
+        let (content_perl, producer_nl) = producer_content(first)?;
+        let mut chain = String::new();
+        let mut content = content_perl;
+        let mut nl = producer_nl;
+        let last = rest.len() - 1;
+        for (i, stage) in rest[..last].iter().enumerate() {
+            let IrExpr::Arrow(mid_stmts) = stage else {
+                return None;
+            };
+            let (cmd, words) = pipe_consumer(mid_stmts)?;
+            let mid_ctx = PipelineCtx {
+                cmd,
+                words,
+                content_perl: content,
+                producer_nl: nl,
+            };
+            let mid = match native_dispatch(&NativeCtx::Pipe(&mid_ctx)) {
+                Some(NativeEmit::Stmt(s)) => scope_stmt(&s),
+                _ => return None,
+            };
+            // Distinct chaining scalars per link (`__sh_pv`, `__sh_pv2`,
+            // …) so a nested chain cannot mask an outer link's lexical.
+            let v = if i == 0 {
+                "__sh_pv".to_string()
+            } else {
+                format!("__sh_pv{}", i + 1)
+            };
+            // Capture via `capture_do_nested` (NESTED variant): this whole
+            // expression sits inside the outer `select($__fh)` scalar
+            // capture every `x=$(…)` renders under, so the capture must
+            // re-select its own default handle as well as reopen fd 1 —
+            // the plain variants each cover only one of the two channels
+            // (measured: parse-complex-pipeline-quotes captured `data`
+            // instead of the consumer's output), while a spawning mid
+            // needs the fd-file part for its child stdout.
+            let cap = crate::ir::capture_do_nested(&format!("{{ {mid} }}"));
+            chain.push_str(&format!("my ${v} = {cap}; "));
+            content = format!("${v}");
+            // `${v}` is the previous stage's stdout after the capture
+            // idiom's `s/\n+\z//` — the same stripped-newline convention,
+            // restored by the same rule.
+            nl = true;
+        }
+        let IrExpr::Arrow(last_stmts) = &rest[last] else {
+            return None;
+        };
+        let (cmd, words) = pipe_consumer(last_stmts)?;
+        let final_ctx = PipelineCtx {
+            cmd,
+            words,
+            content_perl: content,
+            producer_nl: nl,
+        };
+        let tail = match native_dispatch(&NativeCtx::Pipe(&final_ctx)) {
+            Some(NativeEmit::Stmt(s)) => scope_stmt(&s),
+            _ => return None,
+        };
+        return Some(format!("{chain}{tail}"));
     }
+    None
 }
 
 /// Parent (exec-in-condition): `grep -q PAT FILE` / `cmp -s F1 F2` etc.
@@ -97,16 +205,123 @@ pub(crate) fn native_exec_cond(call: &IrExpr) -> Option<String> {
 /// status assignment.
 pub(crate) fn native_exec_stmt(call: &IrExpr) -> Option<String> {
     match native_dispatch(&NativeCtx::Exec { call, cond: false }) {
-        Some(NativeEmit::Stmt(s)) => Some(s),
+        // Scoped: the leaves declare their own `my` temporaries (`$__g`,
+        // `$__m`, `$__pl`, …). Two leaves in the same Perl scope would
+        // mask each other's lexicals (a warning, and the second's
+        // initialization would shadow the first's live value).
+        Some(NativeEmit::Stmt(s)) => Some(scope_stmt(&s)),
         _ => None,
     }
+}
+
+/// Wrap a leaf's statement in a `do { … }` so its `my` temporaries live in
+/// their own scope. Leaves that already open their own block (a leading
+/// `if`/`for`/`{`) are left alone.
+fn scope_stmt(s: &str) -> String {
+    let t = s.trim_start();
+    let t = t.trim_end();
+    // A leaf that already opens its own block (`do {`, a control statement)
+    // needs only an explicit terminator — `do { … }` is an EXPRESSION, so
+    // without the `;` the next statement's first token parses as its
+    // operator (`}print`).
+    if t.starts_with("do {") || t.starts_with("if (") || t.starts_with("for ") {
+        return format!("{t};");
+    }
+    format!("do {{ {s} }};")
+}
+
+/// Parent (capture): `x=$(cmd)` where `cmd` is a single simple command the
+/// capability tree knows how to compute without a shell. Returns a Perl
+/// EXPRESSION for the captured value.
+///
+/// The shell text is split by `sh_split_simple_cmd` (which refuses shell
+/// metacharacters), then re-shaped as the exec call the leaves expect.
+/// `$__sh_cap` is the value channel: a leaf's statement assigns it, and
+/// this parent returns it as the expression.
+/// Parent (redirect-capture): the body of a `capture` whose expression is a
+/// `redirect(Arrow([exec …]), [{fd:0,in,FILE}])` — `x=$(wc -l < FILE)`.
+/// The shell-text view loses the redirect, so the capability tree is handed
+/// the IR call directly. Returns a Perl EXPRESSION for the captured value.
+pub(crate) fn native_capture_call(call: &IrExpr) -> Option<String> {
+    // The Capture shape first, then an Exec leaf that writes `$__sh_cap`
+    // (pathops' basename/dirname): both are value-channel leaves and the
+    // caller consumes the value as an expression.
+    for ctx in [
+        NativeCtx::Capture { call },
+        NativeCtx::Exec { call, cond: false },
+    ] {
+        if let Some(NativeEmit::Stmt(s)) = native_dispatch(&ctx) {
+            if s.contains("$__sh_cap") {
+                // bash's `$(…)` strips ALL trailing newlines — a leaf's value
+                // (e.g. `cat FILE`) keeps the file's final newline otherwise.
+                return Some(format!(
+                    "do {{ my $__sh_cap; {s} $__sh_cap =~ s/\\n+\\z// if defined $__sh_cap; $__sh_cap }}"
+                ));
+            }
+        }
+    }
+    None
+}
+
+pub(crate) fn native_capture(cmd_text: &str) -> Option<String> {
+    // Single simple command only. A command carrying a nested `$(…)`, a
+    // glob, or any shell metacharacter is left to the uu-ffi seam / the
+    // `bash -c` fallback: `sh_split_simple_cmd` refuses those, and a
+    // spliced inner expression would have to be threaded through the
+    // leaves' literal-word contract (which `grep_lit_str` deliberately
+    // restricts to literals).
+    let argv = crate::ir::sh_split_simple_cmd(cmd_text)?;
+    let (name, words) = argv.split_first()?;
+    let call = IrExpr::Call {
+        func: "exec".to_string(),
+        args: vec![
+            IrExpr::Str(name.clone(), crate::ir::StrStyle::DoubleQuoted),
+            IrExpr::Array(
+                words
+                    .iter()
+                    .map(|w| IrExpr::Str(w.clone(), crate::ir::StrStyle::DoubleQuoted))
+                    .collect(),
+            ),
+        ],
+    };
+    match native_dispatch(&NativeCtx::Exec { call: &call, cond: false }) {
+        // the leaf wrote the value into $__sh_cap
+        Some(NativeEmit::Stmt(s)) if s.contains("$__sh_cap") => {
+            Some(format!("do {{ my $__sh_cap; {s} $__sh_cap }}"))
+        }
+        _ => None,
+    }
+}
+
+/// Split out the FIRST `$(...)` from `s`, returning
+/// `(before, inner, after)`. Nested parens inside the substitution are
+/// balanced; `None` when there is no substitution.
+fn split_one_subst(s: &str) -> Option<(&str, &str, &str)> {
+    let start = s.find("$(")?;
+    let b = s.as_bytes();
+    let mut depth = 0usize;
+    let mut i = start + 1; // at '('
+    while i < b.len() {
+        match b[i] {
+            b'(' => depth += 1,
+            b')' => {
+                depth -= 1;
+                if depth == 0 {
+                    return Some((&s[..start], &s[start + 2..i], &s[i + 1..]));
+                }
+            }
+            _ => {}
+        }
+        i += 1;
+    }
+    None
 }
 
 /// Parent (cat-heredoc): the body of a verified `cat <<'EOF' … EOF` → a
 /// native print statement.
 pub(crate) fn native_heredoc(body: &str) -> Option<String> {
     match native_dispatch(&NativeCtx::Heredoc(body)) {
-        Some(NativeEmit::Stmt(s)) => Some(s),
+        Some(NativeEmit::Stmt(s)) => Some(scope_stmt(&s)),
         _ => None,
     }
 }
@@ -115,13 +330,193 @@ pub(crate) fn native_heredoc(body: &str) -> Option<String> {
 /// native if/else statement.
 pub(crate) fn native_chain(e: &IrExpr) -> Option<String> {
     match native_dispatch(&NativeCtx::Chain(e)) {
-        Some(NativeEmit::Stmt(s)) => Some(s),
+        Some(NativeEmit::Stmt(s)) => Some(scope_stmt(&s)),
         _ => None,
     }
 }
 
 /// The literal payload of a `printf LITERAL` first stage (single no-`%`
 /// format: escapes interpreted, no conversions).
+/// `yes [WORD]` producer — the repeated word (`y` by default).
+fn yes_word(s: &[IrStmt]) -> Option<String> {
+    let [IrStmt::Expr(e)] = s else {
+        return None;
+    };
+    let IrExpr::Call { func, args } = e else {
+        return None;
+    };
+    if !matches!(func.as_str(), "exec" | "builtin") {
+        return None;
+    }
+    let [IrExpr::Str(cmd, _), IrExpr::Array(words)] = args.as_slice() else {
+        return None;
+    };
+    if cmd != "yes" {
+        return None;
+    }
+    match words.as_slice() {
+        [] => Some("y".to_string()),
+        [w] => crate::ir::grep_lit_str(w),
+        _ => None,
+    }
+}
+
+/// `head -N` / `head -n N` consumer line count.
+fn head_n(s: &[IrStmt]) -> Option<i64> {
+    let [IrStmt::Expr(e)] = s else {
+        return None;
+    };
+    let IrExpr::Call { func, args } = e else {
+        return None;
+    };
+    if !matches!(func.as_str(), "exec" | "builtin") {
+        return None;
+    }
+    let [IrExpr::Str(cmd, _), IrExpr::Array(words)] = args.as_slice() else {
+        return None;
+    };
+    if cmd != "head" {
+        return None;
+    }
+    match words.as_slice() {
+        [w] => {
+            let t = crate::ir::grep_lit_str(w)?;
+            let n = t.strip_prefix('-')?.parse::<i64>().ok()?;
+            (n >= 0).then_some(n)
+        }
+        [a, b] => {
+            let a = crate::ir::grep_lit_str(a)?;
+            if a == "-n" {
+                crate::ir::grep_lit_str(b)?.parse::<i64>().ok()
+            } else {
+                None
+            }
+        }
+        _ => None,
+    }
+}
+
+/// Does the producer stage's REAL output end with a newline?
+///
+/// Every producer `pipe_printf_content` / `pipe_dynamic_content` folds
+/// (`echo`, `seq`, `find`, `paste`, `strings`, `printf '%s\n'`) writes a
+/// trailing newline — only a `printf` format that does not itself end in
+/// `\n` (or a `seq` range that emits nothing) does not. The payload these
+/// folds build has that newline STRIPPED, which is fine for consumers that
+/// count lines or fields but not for `tr`, which transliterates the byte.
+fn producer_ends_with_newline(s: &[IrStmt]) -> bool {
+    let [IrStmt::Expr(IrExpr::Call { func, args })] = s else {
+        return true;
+    };
+    if !matches!(func.as_str(), "exec" | "builtin") {
+        return true;
+    }
+    let [IrExpr::Str(cmd, _), IrExpr::Array(words)] = args.as_slice() else {
+        return true;
+    };
+    match cmd.as_str() {
+        // `seq FIRST LAST` with an empty range prints nothing at all.
+        "seq" => {
+            let nums: Vec<i64> = words
+                .iter()
+                .filter_map(|w| crate::ir::grep_lit_str(w)?.trim().parse::<i64>().ok())
+                .collect();
+            match nums.as_slice() {
+                [last] => *last >= 1,
+                [first, last] => first <= last,
+                [first, step, last] => {
+                    if *step == 0 {
+                        true
+                    } else if *step > 0 {
+                        first <= last
+                    } else {
+                        first >= last
+                    }
+                }
+                _ => true,
+            }
+        }
+        // `printf FMT` (single literal format, no `%`): the newline is in
+        // the FORMAT, so unescape it first (`printf 'a\n'`).
+        "printf" => match words.first().and_then(crate::ir::grep_lit_str) {
+            Some(fmt) => printf_unescape(&fmt).ends_with('\n'),
+            None => true,
+        },
+        _ => true,
+    }
+}
+
+/// The producer payload + its trailing-newline flag for the consumer
+/// dispatch. The three channels, in order (refuse > guess at every step):
+/// 1. `pipe_dynamic_content` — strings/paste/find/`printf '%s\n'` runtime
+///    expressions.
+/// 2. `pipe_printf_content` — the const echo/printf/seq payload.
+/// 3. `pipe_native_stmt_content` — a producer the capability tree renders
+///    natively as a STATEMENT (`ls`, `grep FILE`, `cat FILE`, `wc …`): its
+///    stdout is captured into a Perl expression, so consumers fire instead
+///    of the whole pipeline shelling out. The capture strips the trailing
+///    newline (the payload convention), hence `producer_nl: true`.
+fn producer_content(s1: &[IrStmt]) -> Option<(String, bool)> {
+    if let Some(expr) = pipe_dynamic_content(s1) {
+        return Some((expr, producer_ends_with_newline(s1)));
+    }
+    if let Some(payload) = pipe_printf_content(s1) {
+        return Some((
+            crate::ir::safe_perl_q_string(&payload),
+            producer_ends_with_newline(s1),
+        ));
+    }
+    pipe_native_stmt_content(s1).map(|expr| (expr, true))
+}
+
+/// Native-statement producer content: run the producer stage through the
+/// capability tree and turn its output into a Perl EXPRESSION the Pipe
+/// consumers splice. Two leaf channels, mirroring `native_capture_call`:
+/// - value-channel leaves assign `$__sh_cap` → reuse `native_capture_call`'s
+///   expression (strips trailing newlines like bash `$(…)`).
+/// - print-channel leaves write stdout → captured with the same
+///   select()-redirect idiom the multi-stage arm uses, then stripped to
+///   the payload convention (consumers restore it via `producer_nl`).
+/// The producer status is discarded on purpose: a pipeline's status is the
+/// LAST stage's, which the consumer sets after this expression runs.
+fn pipe_native_stmt_content(s: &[IrStmt]) -> Option<String> {
+    let [IrStmt::Expr(e)] = s else {
+        return None;
+    };
+    // Value channel first (identical contract to native_capture_call:
+    // the leaf assigns $__sh_cap, trailing newlines stripped).
+    if let Some(expr) = native_capture_call(e) {
+        return Some(expr);
+    }
+    // Expression channel: `echo WORDS…` → the word concat (no capture
+    // wrapper — this is exactly what the dedicated echo|tr arms built,
+    // and keeps `echo $w | tr a-z A-Z` byte-clean). Gate on the COMMAND
+    // name, not `func`: the CLI lowering labels emulable whitelist
+    // commands (`ls`, `grep`, …) `func:"builtin"` too.
+    if let IrExpr::Call { args, .. } = e {
+        if let Some(IrExpr::Array(words)) = args.get(1) {
+            if matches!(args.first(), Some(IrExpr::Str(c, _)) if c == "echo") {
+                return crate::ir::echo_dynamic_payload(words);
+            }
+        }
+    }
+    // Statement channel: ir.rs renders the stage exactly as a standalone
+    // statement (capability leaf / uu-ffi seam) and refuses shell-state
+    // builtins and outer shell-outs; its stdout is captured with
+    // `capture_do_nested` — the nesting-aware wrapper: this expression
+    // renders under the outer `select($__fh)` scalar capture of the
+    // command substitution, so the wrapper must both re-select its own
+    // default handle (bare `print`s would otherwise bypass it into the
+    // outer capture) and reopen fd 1 onto a scratch file (a spawning
+    // `__sh_uu_run(…)` body has no real fd 1 to inherit from a scalar
+    // handle — measured: 017_grep_context's
+    // `$(grep -l … | sort)` section gained a stray blank line from the
+    // empty-content consumer). The returned expression is already
+    // stripped to the payload convention.
+    let stmt = crate::ir::render_call_stmt(e)?;
+    Some(crate::ir::capture_do_nested(&format!("{{ {stmt} ; }}")))
+}
+
 fn pipe_printf_content(s: &[IrStmt]) -> Option<String> {
     let [IrStmt::Expr(e)] = s else {
         return None;
@@ -135,17 +530,376 @@ fn pipe_printf_content(s: &[IrStmt]) -> Option<String> {
     let [IrExpr::Str(cmd, _), IrExpr::Array(words)] = args.as_slice() else {
         return None;
     };
-    if cmd != "printf" || words.len() != 1 {
-        return None;
+    // `echo [flags] words…` — the corpus's dominant producer. Join the
+    // literal words with spaces. NOTE the payload convention shared with
+    // the `printf` path: NO trailing newline. The consumers add it back
+    // where it matters (`wc -c`'s `length(body) + 1`), so `echo -n` —
+    // which suppresses it — must refuse rather than be mis-counted.
+    // `-e` interprets backslash escapes (`echo -e "a\nb"`).
+    if cmd == "echo" {
+        let mut escapes = false;
+        let mut parts: Vec<String> = Vec::new();
+        let mut seen_word = false;
+        for w in words {
+            let lit = crate::ir::grep_lit_str(w)?;
+            // leading flags only (bash: `echo -n x`, but `echo x -n`
+            // prints `x -n`)
+            if !seen_word && lit.starts_with('-') && lit.len() > 1 {
+                for c in lit[1..].chars() {
+                    match c {
+                        'e' => escapes = true,
+                        'E' => escapes = false,
+                        // `-n` drops the trailing newline the consumers
+                        // assume is there
+                        _ => return None,
+                    }
+                }
+                continue;
+            }
+            seen_word = true;
+            parts.push(lit);
+        }
+        let mut payload = parts.join(" ");
+        if escapes {
+            payload = printf_unescape(&payload);
+        }
+        return Some(payload);
     }
-    let fmt = crate::ir::grep_lit_str(&words[0])?;
-    if fmt.contains('%') {
-        return None;
+    if cmd == "printf" {
+        if words.len() != 1 {
+            return None;
+        }
+        let fmt = crate::ir::grep_lit_str(&words[0])?;
+        if fmt.contains('%') {
+            return None;
+        }
+        return Some(printf_unescape(&fmt));
     }
-    Some(printf_unescape(&fmt))
+    // `seq [first [step]] last` — the ascending integer sequence, joined
+    // by newlines. The consumers split on `\n`, and the payload
+    // convention is no trailing newline (same as printf/echo), so a
+    // `seq 1 10 | wc -l` counts 10 lines. Descending (`seq 3 1`) prints
+    // nothing, matching bash. Non-integer or >3 operands refuse.
+    if cmd == "seq" {
+        let nums: Vec<i64> = words
+            .iter()
+            .map(|w| crate::ir::grep_lit_str(w)?.trim().parse::<i64>().ok())
+            .collect::<Option<_>>()?;
+        let (first, step, last) = match nums.as_slice() {
+            [last] => (1, 1, *last),
+            [first, last] => (*first, 1, *last),
+            [first, step, last] => (*first, *step, *last),
+            _ => return None,
+        };
+        if step == 0 {
+            return None;
+        }
+        let mut out: Vec<String> = Vec::new();
+        if step > 0 {
+            let mut v = first;
+            while v <= last {
+                out.push(v.to_string());
+                v += step;
+            }
+        } else {
+            let mut v = first;
+            while v >= last {
+                out.push(v.to_string());
+                v += step;
+            }
+        }
+        return Some(out.join("\n"));
+    }
+    None
 }
 
 /// The consumer command + option words of the second stage.
+/// A pipeline PRODUCER whose content is computed at runtime (a file read or
+/// directory walk), returned as a Perl expression. These feed the existing
+/// consumers (`head`/`sort`/`wc`/`sed`) without a shell.
+fn pipe_dynamic_content(s: &[IrStmt]) -> Option<String> {
+    let [IrStmt::Expr(e)] = s else {
+        return None;
+    };
+    let IrExpr::Call { func, args } = e else {
+        return None;
+    };
+    if !matches!(func.as_str(), "exec" | "builtin") {
+        return None;
+    }
+    let [IrExpr::Str(cmd, _), IrExpr::Array(words)] = args.as_slice() else {
+        return None;
+    };
+    match cmd.as_str() {
+        "strings" => strings_content(words),
+        "paste" => paste_content(words),
+        "find" => find_content(words),
+        // `printf '%s\n' <word>` — one line per expanded word. `%s\n` is the
+        // corpus's canonical "one element per line" producer (the shell
+        // would expand `${arr[@]}` / `${map[@]}` itself, which the rebuilt
+        // text cannot do for a Perl-side list).
+        "printf" => printf_lines_content(words),
+        _ => None,
+    }
+}
+
+/// `printf '%s\n' WORD` (also `printf "%s\n" "$@"`): the word (or list)
+/// joined by newlines — each element its own line.
+fn printf_lines_content(words: &[IrExpr]) -> Option<String> {
+    let [fmt, rest @ ..] = words else {
+        return None;
+    };
+    // The format may be a plain literal (`%s\n`) or a `"…"` Interpolate of
+    // literals; accept the simple shape only.
+    let f = crate::ir::grep_lit_str(fmt).or_else(|| match fmt {
+        IrExpr::Interpolate(parts)
+            if parts
+                .iter()
+                .all(|p| matches!(p, crate::ir::InterpPart::Lit(_))) =>
+        {
+            Some(
+                parts
+                    .iter()
+                    .map(|p| match p {
+                        crate::ir::InterpPart::Lit(t) => t.clone(),
+                        _ => String::new(),
+                    })
+                    .collect::<String>(),
+            )
+        }
+        _ => None,
+    })?;
+    // The corpus's per-line form only. Escapes decode like printf's.
+    if f != "%s\\n" && f != "%s\n" {
+        return None;
+    }
+    if rest.is_empty() {
+        return Some("''".to_string());
+    }
+    let vals: Vec<String> = rest.iter().map(printf_operand_list).collect();
+    Some(format!("join(\"\\n\", ({}))", vals.join(", ")))
+}
+
+/// A `printf '%s\n' …` operand as a LIST expression — each element on its
+/// own line. `${arr[@]}` / `${map[@]}` are element lists here (the joined
+/// scalar form would collapse them to one line).
+fn printf_operand_list(w: &IrExpr) -> String {
+    if let IrExpr::Call { func, args } = w {
+        if func == "param" {
+            let op = args.first().and_then(crate::ir::call_arg_str).unwrap_or_default();
+            let name = args.get(1).and_then(crate::ir::call_arg_str).unwrap_or_default();
+            let off = args.get(2).and_then(crate::ir::call_arg_str).unwrap_or_default();
+            let len = args.get(3).and_then(crate::ir::call_arg_str).unwrap_or_default();
+            if op == "slice" && off == "@" && len.is_empty() && !name.starts_with('#') {
+                // `${!map[@]}` keys, `${arr[@]}` elements, `${map[@]}` values.
+                if let Some(rest) = name.strip_prefix('!') {
+                    return format!("keys %{}", rest.trim_end_matches('*'));
+                }
+                if crate::ir::hash_var_pub(&name) {
+                    return format!("values %{name}");
+                }
+                return format!("@{name}");
+            }
+        }
+        if func == "listVar" {
+            let n = args.first().and_then(crate::ir::call_arg_str).unwrap_or_default();
+            if n == "@" {
+                return "@ARGV".to_string();
+            }
+        }
+    }
+    crate::ir::render_word_list(w)
+}
+
+/// `strings FILE` — the printable ASCII runs of length >= 4 (GNU default).
+fn strings_content(words: &[IrExpr]) -> Option<String> {
+    let [w] = words else {
+        return None;
+    };
+    let file = crate::ir::grep_lit_str(w)?;
+    if file.contains('*') || file.contains('?') {
+        return None;
+    }
+    let f = crate::ir::safe_perl_q_string(&file);
+    Some(format!(
+        "do {{ local $/; if (open(my $__f, '<', {f})) {{ my $__c = <$__f>; close $__f; join(\"\\n\", ($__c =~ /([\\x20-\\x7e]{{4,}})/g)) }} else {{ '' }} }}"
+    ))
+}
+
+/// `paste FILE1 FILE2` — corresponding lines joined by a tab.
+fn paste_content(words: &[IrExpr]) -> Option<String> {
+    let [a, b] = words else {
+        return None;
+    };
+    let fa = crate::ir::safe_perl_q_string(&crate::ir::grep_lit_str(a)?);
+    let fb = crate::ir::safe_perl_q_string(&crate::ir::grep_lit_str(b)?);
+    Some(format!(
+        "do {{ my @__r; if (open(my $__a, '<', {fa}) && open(my $__b, '<', {fb})) {{ while (1) {{ my $__x = <$__a>; my $__y = <$__b>; last unless defined $__x || defined $__y; $__x = '' unless defined $__x; $__y = '' unless defined $__y; chomp $__x; chomp $__y; push @__r, \"$__x\\t$__y\"; }} close $__a; close $__b; }} join(\"\\n\", @__r) }}"
+    ))
+}
+
+/// `find DIR [-maxdepth N] [-type f|d] [-name GLOB]` — a directory walk via
+/// core File::Find.
+fn find_content(words: &[IrExpr]) -> Option<String> {
+    let mut dir = ".".to_string();
+    let mut maxdepth: Option<i64> = None;
+    let mut typ: Option<char> = None;
+    let mut name: Option<String> = None;
+    let mut i = 0;
+    while i < words.len() {
+        let w = crate::ir::grep_lit_str(&words[i])?;
+        match w.as_str() {
+            "-maxdepth" => {
+                i += 1;
+                maxdepth = Some(crate::ir::grep_lit_str(&words[i])?.trim().parse().ok()?);
+            }
+            "-type" => {
+                i += 1;
+                typ = crate::ir::grep_lit_str(&words[i])?.chars().next();
+            }
+            "-name" => {
+                i += 1;
+                name = Some(crate::ir::grep_lit_str(&words[i])?);
+            }
+            s if s.starts_with('-') => return None,
+            _ => dir = w,
+        }
+        i += 1;
+    }
+    let dq = crate::ir::safe_perl_q_string(&dir);
+    let max = maxdepth.map(|n| n.to_string()).unwrap_or_else(|| "-1".to_string());
+    // `-type` must NOT follow symlinks: `-d`/`-f` do, but GNU find's
+    // `-type d`/`-type f` test the ENTRY (a symlink is type `l`), so the
+    // five symlinked directories at the workspace root were all counted —
+    // `find . -maxdepth 1 -type d | wc -l` reported 423 where bash says 418
+    // (058_advanced_bash_idioms). Same rule as the `find … | head` walker's
+    // no-descent guard.
+    let type_check = match typ {
+        Some('f') => "return unless -f $__p && !-l $__p;",
+        Some('d') => "return unless -d $__p && !-l $__p;",
+        _ => "",
+    };
+    let name_check = match name {
+        Some(pat) => format!(
+            "require File::Basename; return unless File::Basename::basename($__p) =~ /{}/;",
+            glob_re(&pat)
+        ),
+        None => String::new(),
+    };
+    Some(format!(
+        "do {{ require File::Find; my @__r; my $__max = {max}; File::Find::find({{ no_chdir => 1, wanted => sub {{ my $__p = $File::Find::name; my $__dep = ($__p =~ tr{{/}}{{/}}); if ($__max >= 0 && $__dep >= $__max) {{ $File::Find::prune = 1; }} return if $__max >= 0 && $__dep > $__max; {type_check} {name_check} push @__r, $__p; }} }}, {dq}); join(\"\\n\", @__r) }}"
+    ))
+}
+
+/// Glob → anchored Perl regex (for `find -name`).
+fn glob_re(pat: &str) -> String {
+    let mut out = String::from("^");
+    for c in pat.chars() {
+        match c {
+            '*' => out.push_str(".*"),
+            '?' => out.push('.'),
+            '.' | '+' | '(' | ')' | '[' | ']' | '{' | '}' | '^' | '$' | '|' | '\\' => {
+                out.push('\\');
+                out.push(c);
+            }
+            _ => out.push(c),
+        }
+    }
+    out.push('$');
+    out
+}
+
+/// The single word of `echo WORD` (no flags).
+fn echo_single_word(s: &[IrStmt]) -> Option<&IrExpr> {
+    let [IrStmt::Expr(e)] = s else {
+        return None;
+    };
+    let IrExpr::Call { func, args } = e else {
+        return None;
+    };
+    if !matches!(func.as_str(), "exec" | "builtin") {
+        return None;
+    }
+    let [IrExpr::Str(cmd, _), IrExpr::Array(words)] = args.as_slice() else {
+        return None;
+    };
+    if cmd != "echo" {
+        return None;
+    }
+    match words.as_slice() {
+        [w] if !matches!(w, IrExpr::Str(s, _) if s.starts_with('-')) => Some(w),
+        _ => None,
+    }
+}
+
+/// `s` is `[Expr(exec NAME)]` with no operands.
+fn is_bare_exec(s: &[IrStmt], name: &str) -> bool {
+    let [IrStmt::Expr(e)] = s else {
+        return false;
+    };
+    let IrExpr::Call { func, args } = e else {
+        return false;
+    };
+    if !matches!(func.as_str(), "exec" | "builtin") {
+        return false;
+    }
+    matches!(args.as_slice(), [IrExpr::Str(c, _), IrExpr::Array(w)] if c == name && w.is_empty())
+}
+
+/// `bc` arithmetic text → a Perl numeric expression. Only digits, `+ - * / %`
+/// `( )`, spaces and `sqrt(` are lifted; `int()` truncation matches scale 0.
+fn bc_word_expr(w: &IrExpr) -> Option<String> {
+    match w {
+        IrExpr::Str(s, _) => bc_text(s),
+        IrExpr::Interpolate(parts) => {
+            let mut out = String::new();
+            for p in parts {
+                match p {
+                    crate::ir::InterpPart::Lit(t) => out.push_str(&bc_text(t)?),
+                    crate::ir::InterpPart::Expr(e) => {
+                        out.push('(');
+                        out.push_str(&crate::ir::ir_expr_to_perl(e));
+                        out.push(')');
+                    }
+                }
+            }
+            Some(out)
+        }
+        _ => None,
+    }
+}
+
+fn bc_text(t: &str) -> Option<String> {
+    let mut out = String::new();
+    let mut it = t.chars().peekable();
+    while let Some(c) = it.next() {
+        match c {
+            '0'..='9' | '+' | '-' | '*' | '/' | '%' | '(' | ')' | ' ' | '^' => out.push(c),
+            's' | 'q' | 'r' | 't' => {
+                let mut word = String::from(c);
+                while let Some(&d) = it.peek() {
+                    if d.is_ascii_alphabetic() {
+                        word.push(d);
+                        it.next();
+                    } else {
+                        break;
+                    }
+                }
+                if word != "sqrt" {
+                    return None;
+                }
+                out.push_str(&word);
+            }
+            _ => return None,
+        }
+    }
+    if out.trim().is_empty() {
+        None
+    } else {
+        Some(out)
+    }
+}
+
 fn pipe_consumer(s: &[IrStmt]) -> Option<(String, Vec<String>)> {
     let [IrStmt::Expr(e)] = s else {
         return None;
@@ -202,4 +956,102 @@ fn printf_unescape(s: &str) -> String {
         }
     }
     out
+}
+
+#[cfg(test)]
+mod producer_content_tests {
+    use super::*;
+    use crate::parser::commands::parse_commands_from_text;
+    use crate::shir::ast_to_ir_raw;
+
+    /// Lower `src` and dispatch its statement-position `pipeline(...)`
+    /// expr — the shape native_pipeline matches (pre-transform IR).
+    fn pipe_stmt(src: &str) -> Option<String> {
+        let commands = parse_commands_from_text(src).expect("parse source");
+        let prog = ast_to_ir_raw(&commands);
+        match prog.stmts.into_iter().next()? {
+            IrStmt::Expr(e) => native_pipeline(&e),
+            other => panic!("expected a bare pipeline expr, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn const_producer_still_fires() {
+        // Regression: the const echo channel must survive the
+        // producer_content restructure.
+        let out = pipe_stmt("echo hi | grep d").expect("const echo producer");
+        assert!(!out.contains("__sh_pipe"), "must not shell out: {out}");
+    }
+
+    #[test]
+    fn ls_producer_fires_grep_head_chain() {
+        // The flagship corpus shape: worded `ls -l` renders through the
+        // uu-ffi seam (byte-faithful coreutils), captured into the payload
+        // the grep leaf splices, then the head leaf over the mid capture —
+        // the 3-stage arm with the new statement-channel content.
+        let out = pipe_stmt("ls -l | grep '^d' | head -5")
+            .expect("ls -l|grep|head should be native");
+        assert!(!out.contains("__sh_pipe"), "must not shell out: {out}");
+        assert!(!out.contains("system("), "must not shell out: {out}");
+    }
+
+    #[test]
+    fn grep_v_consumer_fires_on_statement_content() {
+        let out = pipe_stmt("ls -1 | grep -v a.txt")
+            .expect("ls -1|grep -v should be native");
+        assert!(!out.contains("__sh_pipe"), "must not shell out: {out}");
+    }
+
+    #[test]
+    fn grep_file_producer_fires_tr_consumer() {
+        let out = pipe_stmt("grep -v x /etc/passwd | tr a-z A-Z")
+            .expect("grep FILE|tr should be native");
+        assert!(!out.contains("__sh_pipe"), "must not shell out: {out}");
+    }
+
+    #[test]
+    fn external_producer_fires_via_statement_channel() {
+        // No capability leaf for `basename`, but ir.rs renders it through
+        // the uu-ffi seam (worded argv) → captured → consumer fires.
+        let out = pipe_stmt("basename /etc/hosts | grep hosts")
+            .expect("basename|grep should be native");
+        assert!(!out.contains("__sh_pipe"), "must not pipe-shell: {out}");
+        assert!(!out.contains("system("), "must not shell out: {out}");
+    }
+
+    #[test]
+    fn bare_external_producer_still_refuses() {
+        // Zero-argv externals skip ir.rs's uu arm (words.is_empty()) and
+        // render as an outer shell-out, which render_call_stmt refuses —
+        // no corpus pipeline producer is zero-argv, so this stays refused
+        // rather than growing a second uu entry point here.
+        assert!(
+            pipe_stmt("whoami | grep d").is_none(),
+            "zero-argv producer must keep the shell-out"
+        );
+    }
+
+    #[test]
+    fn shell_state_producer_still_refuses() {
+        // `cd /tmp | grep d` — cd mutates parent-visible state; bash runs
+        // pipeline stages in subshells where that is discarded, but a
+        // captured do-block would leak the chdir. Refuse > guess.
+        assert!(
+            pipe_stmt("cd /tmp | grep d").is_none(),
+            "shell-state producer must keep the shell-out"
+        );
+    }
+
+    #[test]
+    fn unsupported_consumer_still_refuses() {
+        // `od` has no Pipe leaf (cut DIDN'T until capabilities/cut.rs
+        // landed — `cut -d : -f 1` now lowers, which is why this fixture
+        // moved to a genuinely leaf-less consumer): even with a native
+        // producer, dispatch refuses → the whole pipeline keeps its
+        // shell-out.
+        assert!(
+            pipe_stmt("grep -v x /etc/passwd | od -A n -t x1").is_none(),
+            "unsupported consumer must keep the shell-out"
+        );
+    }
 }

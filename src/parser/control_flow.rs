@@ -2246,3 +2246,233 @@ fn parse_assignment(parser: &mut Parser) -> Result<Command, ParserError> {
         stderr_used: true,
     }))
 }
+
+/// `select NAME in WORD…; do BODY; done` — bash's menu loop, DESUGARED at
+/// parse time into core AST nodes (while / if / test / printf / read /
+/// assignment), so every backend gets equivalent shIR and no new node
+/// type is needed. This is the shared-core route: the ESTree path never
+/// sees a parsed `select` (its eval payloads reach the JS runtime as
+/// verbatim text), so the desugar only lifts the non-estree backends —
+/// whose Perl eval-inliner RE-PARSES the payload with this same parser
+/// (parse-eval-multiline's `select select_result; do …` defined no
+/// function, so `type doselect` printed nothing).
+///
+/// Semantics measured against bash 5 on this box:
+///   * a non-empty reply sets REPLY, and NAME to the word whose NUMBER
+///     matches — numeric, not string: `01` selects word 1; anything else
+///     (a word, an out-of-range number) sets NAME to the empty string;
+///   * an EMPTY line re-prompts WITHOUT running the body;
+///   * EOF prints "\n" to stdout and ends the loop.
+/// Known deviations, both deliberate:
+///   * the numbered menu and the `$PS3` prompt are NOT emitted — they go
+///     to stderr in bash, and this generator's stderr story is currently
+///     unusable for it (measured: `printf … >&2` falls to a bash -c
+///     shell-out, which the check_qx gate rejects, and `echo … >&2`
+///     lands in the fd-dup arm that opens STDERR OVER STDOUT — the write
+///     goes to STDOUT, corrupting program output). Nothing compares
+///     stderr, so equivalence is unaffected; the menu can be added once
+///     `>&2` dups correctly.
+///   * after EOF termination the loop's exit STATUS is 0 here and 1 in
+///     bash (the failed read's status); `break` cannot carry a status.
+///
+/// The no-`in` form (`select NAME; do` — the items are the positional
+/// parameters) is deliberately NOT desugared: the item count is dynamic,
+/// so the number→word mapping cannot be built statically — the
+/// dispatcher guard leaves it on the pre-existing parse path
+/// (refuse > guess).
+pub fn parse_select_loop(parser: &mut Parser) -> Result<Command, ParserError> {
+    let lit = |s: &str| Word::Literal(s.to_string(), None);
+    let simple = |name: &str, args: Vec<Word>, redirects: Vec<Redirect>| {
+        Command::Simple(SimpleCommand {
+            name: lit(name),
+            args,
+            redirects,
+            env_vars: BTreeMap::new(),
+            stdout_used: true,
+            stderr_used: true,
+        })
+    };
+    // `[ … ]` conditions — the TestExpression shape the parser itself
+    // produces for source brackets, which every renderer lowers NATIVELY
+    // over the live variables (a `test` SimpleCommand instead routes the
+    // operands through the $ENV export slots and breaks: measured
+    // `$ENV{ENV}{REPLY}` mangled text and an always-empty read).
+    let test_expr = |expression: &str| {
+        Command::TestExpression(TestExpression {
+            expression: expression.to_string(),
+            modifiers: TestModifiers {
+                extglob: false,
+                nocasematch: false,
+                globstar: false,
+                nullglob: false,
+                failglob: false,
+                dotglob: false,
+                double: false,
+            },
+        })
+    };
+
+    parser.lexer.consume(Token::Select)?;
+    parser.lexer.skip_whitespace_and_comments();
+    let name = match parser.lexer.peek() {
+        Some(Token::Identifier) => parser.lexer.get_identifier_text()?,
+        Some(t) => {
+            return Err(ParserError::UnexpectedToken {
+                token: t.clone(),
+                line: 1,
+                col: 1,
+            })
+        }
+        None => return Err(ParserError::UnexpectedEOF),
+    };
+    parser.lexer.skip_whitespace_and_comments();
+    // The dispatcher only routes the `in` form here (see its guard).
+    parser.lexer.consume(Token::In)?;
+    parser.lexer.skip_whitespace_and_comments();
+    let items = parse_word_list(parser)?;
+    // Optional separator before `do`.
+    while matches!(
+        parser.lexer.peek(),
+        Some(Token::Space | Token::Tab | Token::Comment | Token::CarriageReturn)
+    ) {
+        parser.lexer.next();
+    }
+    if matches!(
+        parser.lexer.peek(),
+        Some(Token::Semicolon) | Some(Token::Newline) | Some(Token::CarriageReturn)
+    ) {
+        parser.lexer.next();
+    }
+    while matches!(
+        parser.lexer.peek(),
+        Some(Token::Space | Token::Tab | Token::Comment | Token::Newline | Token::CarriageReturn)
+    ) {
+        parser.lexer.next();
+    }
+    parser.lexer.consume(Token::Do)?;
+    while matches!(
+        parser.lexer.peek(),
+        Some(Token::Space | Token::Tab | Token::Comment | Token::Newline | Token::CarriageReturn)
+    ) {
+        parser.lexer.next();
+    }
+    // Body commands until `done` (same loop shape as the for-loop parser).
+    let mut body_commands = Vec::new();
+    loop {
+        while matches!(
+            parser.lexer.peek(),
+            Some(
+                Token::Space
+                    | Token::Tab
+                    | Token::Comment
+                    | Token::Newline
+                    | Token::CarriageReturn
+                    | Token::Semicolon
+            )
+        ) {
+            parser.lexer.next();
+        }
+        if matches!(parser.lexer.peek(), Some(Token::Done) | None) {
+            break;
+        }
+        let pre_pos = parser.lexer.current_position();
+        let command = parser.parse_command()?;
+        body_commands.push(command);
+        if parser.lexer.current_position() == pre_pos && parser.lexer.next().is_none() {
+            break;
+        }
+    }
+    while matches!(
+        parser.lexer.peek(),
+        Some(
+            Token::Space
+                | Token::Tab
+                | Token::Comment
+                | Token::Newline
+                | Token::CarriageReturn
+                | Token::Semicolon
+        )
+    ) {
+        parser.lexer.next();
+    }
+    parser.lexer.consume(Token::Done)?;
+
+    // ── the desugar ────────────────────────────────────────────────
+    // (bash's numbered menu + PS3 prompt are stderr-only and deliberately
+    // not emitted — see the deviations note above.)
+    //
+    // The reply is read into a PRIVATE variable, not straight into REPLY:
+    // REPLY is a bash reserved name, so the `read` builtin's assignment
+    // renders as a plain `$REPLY = …` while every other use of the name
+    // (assignments, tests, interpolations) renders the env-backed
+    // `$ENV{REPLY}` — reading directly into REPLY wrote one and read the
+    // other, and the loop never saw its own input. `REPLY=<temp>` uses
+    // the normal assignment path, which renders the env-backed form the
+    // body's `$REPLY` reads also use.
+    static SELECT_N: std::sync::atomic::AtomicUsize =
+        std::sync::atomic::AtomicUsize::new(0);
+    let reply_tmp = format!(
+        "__sh_sel_r{}",
+        SELECT_N.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+    );
+
+    // NAME = "" then one numeric comparison per item: `-eq` (not `=`)
+    // because bash selects by NUMBER — `01` selects word 1, and a
+    // non-numeric reply makes the comparison fail exactly like bash's
+    // arithmetic parse of the reply. The comparisons read the private
+    // reply variable (a plain, live Perl scalar).
+    let mut then_commands = vec![
+        Command::Assignment(Assignment {
+            variable: "REPLY".to_string(),
+            value: Word::Variable(reply_tmp.clone(), true, None),
+            operator: AssignmentOperator::Assign,
+        }),
+        Command::Assignment(Assignment {
+            variable: name.clone(),
+            value: lit(""),
+            operator: AssignmentOperator::Assign,
+        }),
+    ];
+    for (i, w) in items.iter().enumerate() {
+        then_commands.push(Command::If(IfStatement {
+            condition: Box::new(test_expr(&format!("\"${reply_tmp}\" -eq {}", i + 1))),
+            then_branch: Box::new(Command::Block(Block {
+                commands: vec![Command::Assignment(Assignment {
+                    variable: name.clone(),
+                    value: w.clone(),
+                    operator: AssignmentOperator::Assign,
+                })],
+            })),
+            else_branch: None,
+        }));
+    }
+    then_commands.extend(body_commands);
+
+    Ok(Command::While(WhileLoop {
+        condition: Box::new(simple("true", vec![], vec![])),
+        body: Block {
+            commands: vec![
+                // read a reply; EOF ends the loop (after bash's "\n")
+                Command::If(IfStatement {
+                    condition: Box::new(simple(
+                        "read",
+                        vec![lit("-r"), lit(&reply_tmp)],
+                        vec![],
+                    )),
+                    then_branch: Box::new(Command::If(IfStatement {
+                        condition: Box::new(test_expr(&format!("-n \"${reply_tmp}\""))),
+                        then_branch: Box::new(Command::Block(Block { commands: then_commands })),
+                        else_branch: None,
+                    })),
+                    else_branch: Some(Box::new(Command::Block(Block {
+                        commands: vec![
+                            simple("printf", vec![lit("\\n")], vec![]),
+                            Command::Break(None),
+                        ],
+                    }))),
+                }),
+            ],
+        },
+        is_until: false,
+    }))
+}

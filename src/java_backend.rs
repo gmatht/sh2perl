@@ -44,6 +44,69 @@ fn sanitize(name: &str) -> String {
     s
 }
 
+/// `typeset -l`/`-u` (and the `declare`/`local` spellings) attach a
+/// persistent case-fold to the NAME, and the fold also applies to the
+/// value written by the declaration itself. The shared `typeset-attrs`
+/// transform rewrites LATER assignments; the declaration site belongs to
+/// the renderer (estree delegates it to the sh2 runtime's builtin).
+/// Combined bundles (`-il`, `-iu`) count. `-l` and `-u` together are
+/// refused — which one wins is not something this renderer will guess.
+fn decl_case_fold(rest: &[IrExpr]) -> Option<char> {
+    fn add(f: &str, lower: &mut bool, upper: &mut bool) {
+        if !f.starts_with('-') || f.starts_with("--") { return; }
+        if f.contains('l') { *lower = true; }
+        if f.contains('u') { *upper = true; }
+    }
+    let (mut lower, mut upper) = (false, false);
+    for w in rest {
+        match w {
+            IrExpr::Str(s, _) => add(s, &mut lower, &mut upper),
+            IrExpr::Array(items) => {
+                for it in items {
+                    if let IrExpr::Str(s, _) = it { add(s, &mut lower, &mut upper); }
+                }
+            }
+            _ => {}
+        }
+    }
+    match (lower, upper) {
+        (true, false) => Some('l'),
+        (false, true) => Some('u'),
+        _ => None,
+    }
+}
+
+fn fold_value(fold: Option<char>, v: String) -> String {
+    match fold {
+        Some('l') => format!("shLowerAll({v})"),
+        Some('u') => format!("shUpperAll({v})"),
+        _ => v,
+    }
+}
+
+/// A Java method name for a user shell function. Keep the user's name
+/// unless it collides with a Java reserved word or the generated
+/// `sh*`/`__*` helper namespace — `def f()` must render `f()`, not
+/// `fn_f()`.
+fn fn_name(name: &str) -> String {
+    let base = sanitize(name);
+    if JAVA_RESERVED.contains(&base.as_str()) || base.starts_with("__") || base.starts_with("sh") && base.len() > 2 {
+        format!("fn_{base}")
+    } else {
+        base
+    }
+}
+
+const JAVA_RESERVED: &[&str] = &[
+    "abstract", "assert", "boolean", "break", "byte", "case", "catch", "char", "class",
+    "const", "continue", "default", "do", "double", "else", "enum", "extends", "final",
+    "finally", "float", "for", "goto", "if", "implements", "import", "instanceof", "int",
+    "interface", "long", "native", "new", "package", "private", "protected", "public",
+    "return", "short", "static", "strictfp", "super", "switch", "synchronized", "this",
+    "throw", "throws", "transient", "try", "void", "volatile", "while", "true", "false",
+    "null", "var", "record", "yield", "sealed", "permits",
+];
+
 impl JavaRender {
     fn new() -> Self {
         JavaRender { in_fn: 0, fields: BTreeSet::new(), arrays: BTreeSet::new(), funcs: BTreeSet::new(),
@@ -211,7 +274,7 @@ impl JavaRender {
         collect_fns(&prog.stmts, &mut fn_list, &mut seen_fns);
         let mut fn_buf = String::new();
         for (name, body) in fn_list.iter() {
-                let fname = format!("fn_{}", sanitize(name));
+                let fname = fn_name(name);
                 fn_buf.push_str(&format!("    static boolean {fname}() throws Exception {{\n"));
                 fn_buf.push_str("        List<String> __saved = new ArrayList<>(__SH_ARGV);\n");
                 fn_buf.push_str("        try {\n");
@@ -267,6 +330,12 @@ impl JavaRender {
             "writefile","outswap","errswap","inswap","snapshot","regex",
             "contains","quote","declared","errifempty","regexm","eq","testrc",
         "aslice",
+        // The Ext-node helpers (text_ops' rich nodes; see
+        // src/render_ext_expr/handlers/all_nodes.rs): each implements ONE
+        // verified leaf so the shared handler stays a one-liner and the
+        // semantics live in a single place.
+        "wcwords","cutfield","regsub","regsuball","regcount","takelines",
+        "chartrans",
         ];
         for h in all_helpers {
             if let Some(src) = helper_src(h) {
@@ -390,6 +459,9 @@ impl JavaRender {
                 }
                 self.depth += 1;
                 Ok(())
+            }
+            IrStmt::Shaderize { .. } => {
+                Err("shaderize (autoshaderization) not supported by the Java backend".into())
             }
             IrStmt::For { var, iter, body } => {
                 let items = self.for_items(iter)?;
@@ -1118,6 +1190,9 @@ impl JavaRender {
                 Ok(())
             }
             "local" | "typeset" | "declare" => {
+                // `typeset -l`/`-u` folds the value written HERE too.
+                let fold = decl_case_fold(rest);
+                if fold.is_some() { self.helper("case"); }
                 for w in rest.iter() {
                     if matches!(w, IrExpr::Call { func, .. } if func == "setArray" || func == "setArrayAppend") {
                         // declare arr=(elems): nested setArray call
@@ -1134,7 +1209,7 @@ impl JavaRender {
                                         let (n0, v0) = (&t[..eq], &t[eq + 1..]);
                                         self.ensure_field(n0);
                                         if !v0.is_empty() {
-                                            self.emit(&format!("__v_{} = {};", sanitize(n0), jstr(v0)));
+                                            self.emit(&format!("__v_{} = {};", sanitize(n0), fold_value(fold, jstr(v0))));
                                         } else {
                                             nm = Some(n0.to_string());
                                         }
@@ -1145,7 +1220,7 @@ impl JavaRender {
                                 other => {
                                     if let Some(base) = &nm {
                                         let v = self.expr_str(other)?;
-                                        self.emit(&format!("__v_{} = {v};", sanitize(base)));
+                                        self.emit(&format!("__v_{} = {};", sanitize(base), fold_value(fold, v)));
                                     }
                                 }
                             }
@@ -1155,7 +1230,7 @@ impl JavaRender {
                     if let IrExpr::Str(s2, _) = w {
                         if let Some(eq) = s2.find('=') {
                             self.ensure_field(&s2[..eq]);
-                            self.emit(&format!("__v_{} = {};", sanitize(&s2[..eq]), jstr(&s2[eq + 1..])));
+                            self.emit(&format!("__v_{} = {};", sanitize(&s2[..eq]), fold_value(fold, jstr(&s2[eq + 1..]))));
                         }
                     }
                 }
@@ -1211,7 +1286,7 @@ impl JavaRender {
                         self.emit("__SH_ARGV = __callArgv;");
                         self.emit("}");
                     }
-                    self.emit(&format!("fn_{}();", sanitize(other)));
+                    self.emit(&format!("{}();", fn_name(other)));
                     return Ok(());
                 }
                 let mut pieces: Vec<(String, bool)> = Vec::new();
@@ -1349,6 +1424,76 @@ impl JavaRender {
             IrExpr::BinOp { op: BinOpKind::Or, lhs, rhs, .. } =>
                 Ok(format!("({} || {})", self.cond_bool(lhs)?, self.cond_bool(rhs)?)),
             IrExpr::Bool(b) => Ok(if *b { "true".into() } else { "false".into() }),
+            // The case-lowering transform's negated exact match — the shared
+            // `not_wrap` shape `BinOp { Not, lhs: inner, rhs: inner }`
+            // (test_lowering duplicates the operand so both renderer
+            // conventions read the same inner expr; the historical
+            // rhs: Bool(false) variant made perl's `if (!(0))` always-true).
+            // Render `!` over the INNER condition as a boolean; operands
+            // that DIFFER cannot come from not_wrap, so refuse rather than
+            // pick a side (REFUSE > GUESS — the java subset's discipline).
+            IrExpr::BinOp { op: BinOpKind::Not, lhs, rhs, .. } => {
+                if lhs != rhs {
+                    return Err(format!("java: Not with non-duplicated operands: {lhs:?} vs {rhs:?}"));
+                }
+                let inner = lhs.as_ref();
+                let b = match inner {
+                    IrExpr::BinOp { op, lhs: a, rhs: b, .. } if is_cmp(op) => self.binop_bool(op, a, b)?,
+                    other => self.cond_bool(other)?,
+                };
+                Ok(format!("(!{b})"))
+            }
+            // The case-lowering transform's glob-affix conditions (the same
+            // primitives test_lowering lifts [[ ]] affix tests to). Java's
+            // String methods are the exact substring decisions — no helper
+            // needed, and these are BOOLEAN expressions (the shContains
+            // helper returns long 1/0, wrong in a boolean context).
+            IrExpr::Call { func, args, .. }
+                if func == "contains" || func == "strHasPrefix" || func == "strHasSuffix" =>
+            {
+                let hay = self.expr_str(args.first().ok_or("affix: missing haystack")?)?;
+                let needle = self.expr_str(args.get(1).ok_or("affix: missing needle")?)?;
+                let m = match func.as_str() {
+                    "contains" => "contains",
+                    "strHasPrefix" => "startsWith",
+                    _ => "endsWith",
+                };
+                Ok(format!("({hay}).{m}({needle})"))
+            }
+            // The case-lowering transform's shared globMatch(value,
+            // pattern) predicate (char-class / `?` / mid-star case
+            // clauses): java's OWN glob engine — the same shFnmatch its
+            // native case render dispatches with, so the pattern keeps
+            // byte-identical semantics while the condition becomes the
+            // shared op. Boolean, like the affix arms above.
+            IrExpr::Call { func, args, .. } if func == "globMatch" => {
+                let hay = self.expr_str(args.first().ok_or("globMatch: missing value")?)?;
+                let pat = self.expr_str(args.get(1).ok_or("globMatch: missing pattern")?)?;
+                self.helper("fnmatch");
+                Ok(format!("shFnmatch({pat}, {hay})"))
+            }
+            // A pipeline used as a CONDITION is its EXIT STATUS, never its
+            // captured stdout. The generic fallback below asks the VALUE
+            // channel (`!shCapture(..).isEmpty()`), which is a different
+            // question: `echo x | grep x > /dev/null` captures "" whether
+            // or not grep matched, so the condition was always false.
+            // shRun sets __SH_RC and returns the status, so this stays a
+            // re-evaluable expression (correct inside `while` too).
+            IrExpr::Call { func, args, .. } if func == "pipeline" => {
+                let mut parts = Vec::new();
+                if let Some(IrExpr::Array(stages)) = args.first() {
+                    for st in stages.iter() {
+                        if let IrExpr::Arrow(body) = st {
+                            parts.push(self.arrow_expr(body)?);
+                        } else {
+                            return Err("pipeline condition stage not an Arrow".into());
+                        }
+                    }
+                }
+                if parts.is_empty() { return Err("pipeline condition without stages".into()); }
+                self.helper("run");
+                Ok(format!("(shRun({}) == 0)", parts.join(" + \" | \" + ")))
+            }
             other => {
                 let v = self.expr_str(other)?;
                 Ok(format!("(!{v}.isEmpty())"))
@@ -1387,7 +1532,7 @@ impl JavaRender {
                 if !flat.is_empty() {
                     return Err("function call with args not supported in condition position".into());
                 }
-                Ok(format!("fn_{}()", sanitize(other)))
+                Ok(format!("{}()", fn_name(other)))
             }
             _ => {
                 let words = self.words_to_args(rest)?;
@@ -1991,6 +2136,22 @@ impl JavaRender {
                 self.helper("regex");
                 Ok(format!("String.valueOf(shRegex({}, {}))", jstr(pattern), jstr(flags)))
             }
+            IrExpr::Ext(n) => {
+                // Transform-declared semantic nodes (text_ops' cut/tr/sed/
+                // head/tail/wc/basename compositions). The SHARED handler
+                // registry owns the semantics; this backend supplies its own
+                // child renderer so a handler can build a java expression.
+                let mut child = JavaChild { r: self };
+                crate::render_ext_expr::render_with(
+                    n.as_ref(),
+                    crate::render_ext_expr::Backend::Java,
+                    0,
+                    &mut child,
+                )
+                .ok_or_else(|| {
+                    format!("ext node not renderable by the java renderer: {}", n.tag())
+                })
+            }
             other => Err(format!("expr not in the java subset (str ctx): {other:?}")),
         }
     }
@@ -2449,22 +2610,29 @@ impl JavaRender {
         if let IrExpr::Object(props) = r {
             let mut mode = String::new();
             let mut target: Option<&IrExpr> = None;
+            let mut fd: i64 = 1;
             for (k, v) in props {
                 match k.as_str() {
                     "mode" => { if let IrExpr::Str(m, _) = v { mode = m.clone(); } }
                     "target" => target = Some(v),
+                    "fd" => { if let IrExpr::Int(n) = v { fd = *n; } }
                     _ => {}
                 }
             }
             if let Some(t) = target {
                 let t = self.expr_str(t)?;
+                // The fd is part of the OPERATOR: stderr is `2>`, not a
+                // second `>` (two `/dev/null` redirects — fd 1 then fd 2 —
+                // collapsed into `> x > x`, silently leaving stderr on the
+                // terminal). fd 1 is the shell default and stays bare.
+                let p = if fd == 1 { String::new() } else { fd.to_string() };
                 return Ok(match mode.as_str() {
-                    "w" => format!(" + \" > \" + shQuote({t})"),
-                    "a" => format!(" + \" >> \" + shQuote({t})"),
-                    "r" => format!(" + \" < \" + shQuote({t})"),
-                    "herestring" => format!(" + \" <<< \" + shQuote({t})"),
+                    "w" => format!(" + \" {p}> \" + shQuote({t})"),
+                    "a" => format!(" + \" {p}>> \" + shQuote({t})"),
+                    "r" => format!(" + \" {p}< \" + shQuote({t})"),
+                    "herestring" => format!(" + \" {p}<<< \" + shQuote({t})"),
                     "heredoc" | "heredoc-tabs" =>
-                        format!(" + \" <<'SH2EOF\\n\" + {t} + \"\\nSH2EOF\""),
+                        format!(" + \" {p}<<'SH2EOF\\n\" + {t} + \"\\nSH2EOF\""),
                     _ => String::new(),
                 });
             }
@@ -2868,6 +3036,19 @@ fn stmt_exprs(st: &IrStmt) -> Vec<&IrExpr> {
 }
 
 /// Runtime helper methods, emitted into Sh2Program on demand.
+/// The shared handler registry's child-renderer hook for java: delegates
+/// to this backend's own `expr_str`, so a shared handler emits a real java
+/// expression tree instead of a stub.
+struct JavaChild<'a> {
+    r: &'a mut JavaRender,
+}
+
+impl crate::render_ext_expr::ChildExprRenderer for JavaChild<'_> {
+    fn render_child(&mut self, e: &IrExpr) -> Option<String> {
+        self.r.expr_str(e).ok()
+    }
+}
+
 fn helper_src(name: &str) -> Option<&'static str> {
     Some(match name {
         "env" => r#"    static String shCwd() { return __SH_CWD; }
@@ -2878,6 +3059,172 @@ fn helper_src(name: &str) -> Option<&'static str> {
     static String shEnv(String n) {
         String v = System.getenv(n);
         return v == null ? "" : v;
+    }
+"#,
+        "chartrans" => r#"    // `tr SET1 SET2` (translate), `tr -d SET` (delete), `tr -s SET`
+    // (squeeze). SET2 shorter than SET1 repeats its LAST char (bash); an
+    // empty SET2 means "no translation" for -s.
+    static String shTrTranslate(String s, String from, String to) {
+        StringBuilder b = new StringBuilder();
+        for (int i = 0; i < s.length(); i++) {
+            char c = s.charAt(i);
+            int k = from.indexOf(c);
+            if (k < 0) { b.append(c); continue; }
+            b.append(to.isEmpty() ? c : to.charAt(Math.min(k, to.length() - 1)));
+        }
+        return b.toString();
+    }
+    static String shTrDelete(String s, String set) {
+        StringBuilder b = new StringBuilder();
+        for (int i = 0; i < s.length(); i++) {
+            if (set.indexOf(s.charAt(i)) < 0) b.append(s.charAt(i));
+        }
+        return b.toString();
+    }
+    static String shTrSqueeze(String s, String set) {
+        StringBuilder b = new StringBuilder();
+        char prev = 0;
+        for (int i = 0; i < s.length(); i++) {
+            char c = s.charAt(i);
+            if (c == prev && set.indexOf(c) >= 0) continue;
+            b.append(c);
+            prev = c;
+        }
+        return b.toString();
+    }
+    // `xargs`-style trim: remove leading/trailing whitespace AND squeeze
+    // internal whitespace runs to one space (the bare-xargs contract).
+    static String shXargsTrim(String s) {
+        StringBuilder b = new StringBuilder();
+        boolean spaced = false, started = false;
+        for (int i = 0; i < s.length(); i++) {
+            char c = s.charAt(i);
+            if (Character.isWhitespace(c)) { spaced = true; continue; }
+            if (started && spaced) b.append(' ');
+            b.append(c);
+            started = true;
+            spaced = false;
+        }
+        return b.toString();
+    }
+    // CutsetTrim: strip ALL leading/trailing chars present in the cutset
+    // (side: "left"/"right" = one end only, else both).
+    static String shCutsetTrim(String s, String cut, String side) {
+        int a = 0, z = s.length();
+        if (side == null || !side.equals("right")) {
+            while (a < z && cut.indexOf(s.charAt(a)) >= 0) a++;
+        }
+        if (side == null || !side.equals("left")) {
+            while (z > a && cut.indexOf(s.charAt(z - 1)) >= 0) z--;
+        }
+        return s.substring(a, z);
+    }
+"#,
+        "wcwords" => r#"    // `wc -w`: whitespace-delimited word count (runs of whitespace are ONE
+    // separator; leading/trailing whitespace never counts). The transition
+    // scan needs no allocation and is exact for every input.
+    static long shWcWords(String s) {
+        long n = 0;
+        boolean in = false;
+        for (int i = 0; i < s.length(); i++) {
+            if (Character.isWhitespace(s.charAt(i))) { in = false; }
+            else if (!in) { in = true; n++; }
+        }
+        return n;
+    }
+"#,
+        // GNU `cut -d D -f LIST` over a SINGLE line, exactly as the Perl arm
+        // renders it: a missing trailing field contributes NOTHING, and the
+        // selection is ascending regardless of the requested order.
+        "cutfield" => r#"    static String shCutField(String s, String delim, int[] fields) {
+        if (!s.contains(delim)) return s;
+        String[] parts = s.split(java.util.regex.Pattern.quote(delim), -1);
+        java.util.Arrays.sort(fields);
+        StringBuilder out = new StringBuilder();
+        boolean first = true;
+        for (int f : fields) {
+            if (f < 0 || f >= parts.length) continue;
+            if (!first) out.append(delim);
+            out.append(parts[f]);
+            first = false;
+        }
+        return out.toString();
+    }
+"#,
+        // `sed 's/PAT/REP/'` and `sed 's/PAT/REP/g'`. Java's replaceFirst/
+        // replaceAll take the replacement LITERALLY, so `&` (the whole match)
+        // and `\1` (a group) are expanded HERE — the sed replacement
+        // semantics, implemented once.
+        "regsub" => r#"    static String shRegSub(String s, String pat, String rep) {
+        return shRegSubImpl(s, pat, rep, false);
+    }
+    static String shRegSubAll(String s, String pat, String rep) {
+        return shRegSubImpl(s, pat, rep, true);
+    }
+    static String shRegSubImpl(String s, String pat, String rep, boolean global) {
+        java.util.regex.Pattern p = java.util.regex.Pattern.compile(pat);
+        java.util.regex.Matcher m = p.matcher(s);
+        if (!m.find()) return s;
+        StringBuilder out = new StringBuilder();
+        int last = 0;
+        int start = m.start();
+        out.append(s, 0, start);
+        do {
+            out.append(shExpandSed(m, rep));
+            last = m.end();
+            if (!global) break;
+        } while (m.find());
+        out.append(s, last, s.length());
+        return out.toString();
+    }
+    static String shExpandSed(java.util.regex.Matcher m, String rep) {
+        StringBuilder b = new StringBuilder();
+        for (int i = 0; i < rep.length(); i++) {
+            char c = rep.charAt(i);
+            if (c == '&') { b.append(m.group()); continue; }
+            if (c == '\\' && i + 1 < rep.length()) {
+                char d = rep.charAt(++i);
+                if (d >= '1' && d <= '9') {
+                    int g = d - '0';
+                    String v = g <= m.groupCount() ? m.group(g) : null;
+                    b.append(v == null ? "" : v);
+                } else { b.append(d); }
+                continue;
+            }
+            b.append(c);
+        }
+        return b.toString();
+    }
+"#,
+        // `wc -l`-family / `grep -c`: count NON-OVERLAPPING regex matches.
+        "regcount" => r#"    static long shRegCount(String s, String pat) {
+        java.util.regex.Matcher m = java.util.regex.Pattern.compile(pat).matcher(s);
+        long n = 0;
+        while (m.find()) n++;
+        return n;
+    }
+"#,
+        // head/tail in LINE mode and BYTE mode. Line mode splits on '\n'
+        // (keeping empty fields, like the Perl/JS arms) and rejoins.
+        "takelines" => r#"    static String shTakeLines(String s, int n) {
+        if (n <= 0) return "";
+        String[] l = s.split("\\n", -1);
+        StringBuilder b = new StringBuilder();
+        for (int i = 0; i < l.length && i < n; i++) { if (i > 0) b.append("\n"); b.append(l[i]); }
+        return b.toString();
+    }
+    static String shTakeLinesEnd(String s, int n) {
+        if (n <= 0) return "";
+        String[] l = s.split("\\n", -1);
+        StringBuilder b = new StringBuilder();
+        for (int i = Math.max(0, l.length - n); i < l.length; i++) { if (i > Math.max(0, l.length - n)) b.append("\n"); b.append(l[i]); }
+        return b.toString();
+    }
+    static String shTakeBytes(String s, int n) {
+        return n <= 0 ? "" : s.substring(0, Math.min(n, s.length()));
+    }
+    static String shTakeBytesEnd(String s, int n) {
+        return n <= 0 ? "" : s.substring(Math.max(0, s.length() - n));
     }
 "#,
         "len" => r#"    static long shLen(String s) {
@@ -2998,6 +3345,7 @@ fn helper_src(name: &str) -> Option<&'static str> {
                     used++;
                     if (n == 'd' || n == 'i') {
                         try { sb.append(Long.parseLong(arg.trim())); } catch (Exception e) { sb.append("0"); }
+                        if (ai < args.length) ai++;
                     } else if (n == 's') {
                         StringBuilder padded = new StringBuilder(arg);
                         while (padded.length() < width) {
@@ -3204,15 +3552,23 @@ fn helper_src(name: &str) -> Option<&'static str> {
 "#,
         "basename" => r#"    static String shBasename(String s) {
         while (s.endsWith("/") && s.length() > 1) s = s.substring(0, s.length() - 1);
+        // An all-slash input ("/" or "//") basenames to "/" — the naive
+        // substring(1) would yield "" (verified against bash).
+        if (s.equals("/")) return "/";
         int i = s.lastIndexOf('/');
         return i < 0 ? s : s.substring(i + 1);
     }
 "#,
         "dirname" => r#"    static String shDirname(String s) {
+        // GNU: strip trailing '/'s first, then the last component; a
+        // pathless word is "."; the prefix is re-stripped and "" -> "/".
+        // (The naive lastIndexOf-only form got "a/b/" -> "a/b" wrong.)
+        while (s.length() > 1 && s.endsWith("/")) s = s.substring(0, s.length() - 1);
         int i = s.lastIndexOf('/');
         if (i < 0) return ".";
-        if (i == 0) return "/";
-        return s.substring(0, i);
+        String d = s.substring(0, i);
+        while (d.length() > 1 && d.endsWith("/")) d = d.substring(0, d.length() - 1);
+        return d.isEmpty() ? "/" : d;
     }
 "#,
         "div" => r#"    static long shDiv(long a, long b) {
@@ -3495,6 +3851,22 @@ fn expand_group(items: &serde_json::Value) -> Result<Vec<String>, String> {
             seq.iter().filter_map(|x| x.as_str().map(|s| s.to_string())).collect()
         } else if let Some(n) = it.get("nested") {
             expand_group(n)?
+        } else if let Some(p) = it.get("product") {
+            // a Compound alternative: cartesian concatenation of the
+            // sub-groups (`x/{p,q}` -> `x/p`, `x/q`)
+            let subs = p.as_array().ok_or("product not array")?;
+            let mut combos: Vec<String> = vec![String::new()];
+            for g in subs {
+                let alts = expand_group(g)?;
+                let mut next = Vec::new();
+                for c in &combos {
+                    for a in &alts {
+                        next.push(format!("{c}{a}"));
+                    }
+                }
+                combos = next;
+            }
+            combos
         } else {
             return Err("unknown brace item".into());
         };
@@ -3619,4 +3991,156 @@ fn sh_aslice_src() -> &'static str {
         return String.join(" ", a.subList((int) start, (int) end));
     }
 "#
+}
+
+#[cfg(test)]
+mod shprintf_tests {
+    /// Every numeric conversion must advance the argument cursor.
+    ///
+    /// `shPrintf` drives its outer loop with `do { ... } while (ai < args.length)`,
+    /// so a branch that appends a value but never increments `ai` makes the
+    /// program spin forever — the java cell then produces NO output at all and
+    /// every example looks like an opaque "backend differs". The `%d`/`%i`
+    /// branch was the one missing the increment, so `printf "%d\n" $((x+3))`
+    /// hung on every integer format.
+    ///
+    /// This pins the increment structurally: the `%d` arm must advance `ai`
+    /// exactly like the `%s`/`%b`/default arms do. It is a source assertion
+    /// on purpose — compiling and running the generated java would need a JDK
+    /// in the unit-test sandbox, and a hang is exactly the failure a
+    /// behavioural test cannot time out of cheaply.
+    #[test]
+    fn numeric_conversion_advances_arg_cursor() {
+        let src = super::helper_src("printf").expect("printf helper must exist");
+        // isolate the numeric branch
+        let start = src
+            .find("if (n == 'd' || n == 'i')")
+            .expect("shPrintf must handle %d/%i");
+        let rest = &src[start..];
+        let end = rest.find("} else").expect("numeric branch must be bounded");
+        let arm = &rest[..end];
+        assert!(
+            arm.contains("ai++"),
+            "the %d/%i branch of shPrintf must increment `ai`, else the \
+             `do/while (ai < args.length)` outer loop never terminates and \
+             every integer printf hangs the generated program. Arm was:\n{arm}"
+        );
+    }
+
+    /// The other arms must keep advancing too — a guard against the same
+    /// regression landing on %s/%b/default later.
+    #[test]
+    fn every_conversion_arm_advances_arg_cursor() {
+        let src = super::helper_src("printf").expect("printf helper must exist");
+        for arm in ["n == 's'", "n == 'b'"] {
+            let start = src.find(arm).expect("arm must exist");
+            let rest = &src[start..];
+            let end = rest.find("} else").unwrap_or(rest.len());
+            assert!(
+                rest[..end].contains("ai++"),
+                "the `{arm}` branch must increment `ai`"
+            );
+        }
+    }
+}
+
+#[cfg(test)]
+mod case_lowering_render_tests {
+    /// The case-lowering transform's three condition shapes must render as
+    /// Java BOOLEAN expressions: the shared `not_wrap` negation
+    /// (`BinOp { Not, lhs: inner, rhs: inner }`) and the glob-affix
+    /// primitives (contains/strHasPrefix/strHasSuffix). Before the
+    /// `cond_bool` arms were added, every one of these fell through to
+    /// `expr not in the java subset (str ctx)` and `--target java` on a
+    /// two-clause `case "$1"` refused to generate AT ALL (measured:
+    /// 057_case.sh rc=1 with case-lowering on, rc=0 with it off).
+    ///
+    /// End-to-end through the same pipeline the CLI uses:
+    /// parse → ast_to_ir (which runs transforms::apply under the java
+    /// target gate) → shir_to_java.
+    #[test]
+    fn case_lowering_conds_render_as_java_bools() {
+        let src = "case \"$1\" in\n  start) echo a ;;\n  *.txt) echo t ;;\n  *) echo o ;;\nesac\n";
+        let cmds = crate::parser::commands::parse_commands_from_text(src).expect("parse");
+        crate::transforms::set_target(Some("java"));
+        let prog = crate::shir::ast_to_ir(&cmds);
+        crate::transforms::set_target(None);
+        let java = super::shir_to_java(&prog).expect("java must render the lowered case");
+        assert!(
+            java.contains("(!") && java.contains(".endsWith("),
+            "negated exact match + suffix test must be java booleans:\n{java}"
+        );
+        assert!(
+            !java.contains("not in the java subset") && !java.contains("not yet supported"),
+            "no subset refusal for a fully-lowerable case:\n{java}"
+        );
+    }
+}
+
+/// Regression pins for two renderer gaps that the cross-product triage
+/// filed as `FAIL-BACKEND` (the A1 was fine; the java arm dropped it).
+mod decl_and_pipeline_render_tests {
+    use super::*;
+
+    /// zsh-sh-go `t76_typeset_case.zsh`: `typeset -l low="HELLO"` rendered
+    /// as a plain assignment, so java printed `HELLO`/`world` where zsh
+    /// prints `hello`/`WORLD`. The shared `typeset-attrs` transform only
+    /// rewrites LATER assignments — the declaration site is the renderer's
+    /// (estree delegates it to the sh2 runtime's `typeset` builtin).
+    #[test]
+    fn typeset_case_attrs_fold_the_declaration_value() {
+        let src = "typeset -l low=\"HELLO\"\ntypeset -u up=\"world\"\necho \"$low\"\necho \"$up\"\n";
+        let cmds = crate::parser::commands::parse_commands_from_text(src).expect("parse");
+        crate::transforms::set_target(Some("java"));
+        let prog = crate::shir::ast_to_ir(&cmds);
+        crate::transforms::set_target(None);
+        let java = super::shir_to_java(&prog).expect("java must render typeset -l/-u");
+        assert!(java.contains("__v_low = shLowerAll("), "declaration value must be lowercased:\n{java}");
+        assert!(java.contains("__v_up = shUpperAll("), "declaration value must be uppercased:\n{java}");
+    }
+
+    /// fish-sh-go `t60_contains.fish`: a pipeline used as a CONDITION is
+    /// its EXIT STATUS, never its captured stdout. The generic fallback
+    /// rendered `!shCapture(..).isEmpty()`, and `echo x | grep x >
+    /// /dev/null` captures "" whether or not grep matched — java printed
+    /// `no`/`no2` where fish prints `has`/`no2`.
+    #[test]
+    fn pipeline_condition_is_exit_status_not_captured_stdout() {
+        let stage = |cmd: &str| IrExpr::Arrow(vec![IrStmt::Expr(IrExpr::Call {
+            func: "exec".into(),
+            args: vec![
+                IrExpr::Str(cmd.into(), StrStyle::DoubleQuoted),
+                IrExpr::Array(vec![IrExpr::Str("world".into(), StrStyle::DoubleQuoted)]),
+            ],
+        })]);
+        let cond = IrExpr::Call {
+            func: "pipeline".into(),
+            args: vec![IrExpr::Array(vec![stage("echo"), stage("grep")])],
+        };
+        let mut r = JavaRender::new();
+        let out = r.cond_bool(&cond).expect("pipeline condition must render");
+        assert!(
+            out.contains("shRun(") && out.contains("== 0"),
+            "the condition must be the pipeline's status:\n{out}"
+        );
+        assert!(
+            !out.contains("shCapture("),
+            "captured stdout is the wrong channel for a condition:\n{out}"
+        );
+    }
+
+    /// The `fd` of an object-form redirect is part of the OPERATOR. Two
+    /// `/dev/null` redirects (fd 1 then fd 2) used to collapse into
+    /// `> /dev/null > /dev/null`, silently leaving stderr on the terminal.
+    #[test]
+    fn stderr_redirect_keeps_its_fd_operator() {
+        let red = IrExpr::Object(vec![
+            ("fd".to_string(), IrExpr::Int(2)),
+            ("mode".to_string(), IrExpr::Str("w".into(), StrStyle::DoubleQuoted)),
+            ("target".to_string(), IrExpr::Str("/dev/null".into(), StrStyle::DoubleQuoted)),
+        ]);
+        let mut r = JavaRender::new();
+        let out = r.redirect_text(&red).expect("object redirect must render");
+        assert!(out.contains(" 2> "), "stderr must render as 2>, not a second >:\n{out}");
+    }
 }

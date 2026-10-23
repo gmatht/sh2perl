@@ -18,9 +18,12 @@ path = "src/bin/convert_examples.rs"
 [lib]
 crate-type = ["rlib", "cdylib"]
 
-# WASM-specific optimizations
+# WASM-only deps (wasm-bindgen API in src/wasm.rs, gated to wasm32 in lib.rs)
 [target.'cfg(target_arch = "wasm32")'.dependencies]
-# Use lighter alternatives where possible
+wasm-bindgen = "0.2"
+js-sys = "0.3"
+web-sys = { version = "0.3", features = ["console"] }
+console_error_panic_hook = "0.1"
 
 # Disable wasm-opt for now due to bulk memory issues
 [package.metadata.wasm-pack.profile.release]
@@ -28,11 +31,9 @@ wasm-opt = false
 
 [dependencies]
 logos = "0.15"
+# BigInt const-eval for Rust backend (t87 huge literals); cached offline.
+num-bigint = "0.4"
 thiserror = "2.0"
-wasm-bindgen = "0.2"
-js-sys = "0.3"
-web-sys = { version = "0.3", features = ["console"] }
-console_error_panic_hook = "0.1" 
 serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"
 sha2 = "0.10"
@@ -54,4 +55,3 @@ strip = true     # Strip symbols
 
 [profile.release.package."*"]
 opt-level = "z"
-

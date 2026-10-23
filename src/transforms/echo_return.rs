@@ -42,7 +42,7 @@
 //! emitter needs no new arms: `IrStmt::Return` renders natively and
 //! `Call("fnValue")` renders `sh2.fnValue(...)` (the general call path).
 
-use crate::ir::{InterpPart, IrExpr, IrStmt, StrStyle};
+use crate::ir::{AssignTarget, InterpPart, IrExpr, IrStmt, StrStyle};
 use std::collections::HashSet;
 
 /// Per-path echo state: no value echo yet / exactly one value echo /
@@ -72,6 +72,13 @@ pub fn transform(stmts: &mut Vec<IrStmt>) -> bool {
     // recognition is the SHARED analysis (`shir_passes::scc` — the same
     // call-graph Tarjan the test-parser work and the glob-matcher lift
     // consume).
+    if std::env::var("ECHO_RETURN_DBG").is_ok() {
+        let graph = crate::shir_passes::scc::build_call_graph_stmts(stmts);
+        eprintln!("[er] graph edges: {:?}", graph);
+        for st in stmts.iter() {
+            eprintln!("[er] stmt: {:?}", std::mem::discriminant(st));
+        }
+    }
     let graph = crate::shir_passes::scc::build_call_graph_stmts(stmts);
     let sccs = crate::shir_passes::scc::tarjan_sccs(&graph);
     let mut eligible: HashSet<String> = HashSet::new();
@@ -112,9 +119,32 @@ pub fn transform(stmts: &mut Vec<IrStmt>) -> bool {
     // Pass 3 — call-site rewrite: `exec("f", [args])` of an eligible
     // function → `exec("echo", [fnValue("f", [args])])` (the value +
     // newline the original echo produced).
+    // A pipeline's LAST stage writes the pipeline's output to the current
+    // fd-1 sink (sh2.pipelineSync restores `saved[1]` for it), so a bare `f`
+    // there is not in VALUE position: pass 3 (and rewrite_stmt's bare-call
+    // arms) must not collapse it to fnValue. Otherwise `y=$(echo hi | f)`
+    // with `f() { echo a+b*; }` captures "" where bash captures the echoed
+    // value (measured 2026-10-22) — an echo-return function called as the
+    // final pipeline stage is extremely common (every `… | wcLines`-style
+    // adapter), so this is a live shape, not a corner.
+    //
+    // The skip is handled INSIDE rewrite_call_stmt (which knows the stage
+    // index) rather than here, so it applies at every nesting depth.
     for st in stmts.iter_mut() {
         c |= rewrite_call_stmt(st, &eligible);
     }
+    // Pass 4 — `case` PATTERN captures. A pattern is opaque TEXT to every
+    // renderer, so a `$(f)` occupying a WHOLE pattern never reaches the
+    // lift above: the call is invisible (the callee is dropped as
+    // unreferenced) and the capture shells out to a child that cannot see
+    // the shell function → empty → the clause never matches. Hoist a
+    // whole-pattern capture of an eligible function into a preceding
+    // `__sh2_casepat_N=$(f)` capture-assign (which the normal capture
+    // path then lifts to `fnValue`) and point the pattern at the temp.
+    // Fires only for eligible (pure, echo-return) callees — a bare
+    // `echo`/external pattern is left exactly as-is.
+    let mut seq = 0usize;
+    c |= hoist_case_pattern_captures(stmts, &eligible, &mut seq);
     c
 }
 
@@ -518,16 +548,101 @@ fn rewrite_body(body: &mut Vec<IrStmt>, eligible: &HashSet<String>) -> bool {
     let mut changed = false;
     let mut out: Vec<IrStmt> = Vec::with_capacity(body.len());
     for st in body.drain(..) {
-        out.push(rewrite_stmt(&st, &mut changed, eligible));
+        // A pipeline's LAST stage writes the pipeline's output to the
+        // current fd-1 sink — a bare `f` there is not in value position, so
+        // it must keep its echo (see the pass-3 arm of rewrite_call_stmt:
+        // collapsing it makes `y=$(echo hi | f)` capture "").
+        let keep_pipeline_last = is_pipeline_with_last_call(&st, eligible);
+        out.push(rewrite_stmt(&st, &mut changed, eligible, keep_pipeline_last));
     }
     *body = out;
     changed
 }
 
+/// Is `st` a pipeline whose LAST stage is a bare call to an eligible
+/// function (the shape whose echo must survive)?
+fn is_pipeline_with_last_call(st: &IrStmt, eligible: &HashSet<String>) -> bool {
+    let IrStmt::Pipeline { stages, .. } = st else {
+        return false;
+    };
+    let Some(last) = stages.last() else {
+        return false;
+    };
+    matches!(
+        last.as_slice(),
+        [IrStmt::Expr(IrExpr::Call { func, args })]
+            if matches!(func.as_str(), "exec" | "fnCall")
+                && matches!(args.first(), Some(IrExpr::Str(n, _)) if eligible.contains(n))
+    )
+}
+
+/// Pipeline-stage twin of [`echo_pipeline_last_stage`] for the shell
+/// path's encoding: `a | b` lowers to
+/// `pipeline([Arrow([exec(a)]), Arrow([exec(b)])])`, so the stage is an
+/// `Arrow` wrapping the bare call statement.
+fn echo_pipeline_last_expr(stage: &mut IrExpr, eligible: &HashSet<String>) -> bool {
+    match stage {
+        IrExpr::Arrow(body) => {
+            let replacement = match body.as_slice() {
+                [IrStmt::Expr(IrExpr::Call { func, args })]
+                    if eligible_fn_call(func, args, eligible) =>
+                {
+                    Some(IrStmt::Expr(IrExpr::Call {
+                        func: "exec".to_string(),
+                        args: echo_of_fn_value(args),
+                    }))
+                }
+                _ => None,
+            };
+            match replacement {
+                Some(st) => {
+                    body[0] = st;
+                    true
+                }
+                None => false,
+            }
+        }
+        _ => rewrite_expr_calls(stage, eligible),
+    }
+}
+
+/// A pipeline's LAST stage writes the pipeline's output through the
+/// current fd-1 sink, so a bare call there is NOT in value position. The
+/// callee has been rewritten to a value `return`, and the emitter lowers a
+/// bare call to a value-returning `fnCall` that writes nothing — so the
+/// stage must ECHO the value: rewrite it to
+/// `exec("echo", [fnValue("f", [args…])])`, exactly the shape pass 3 uses
+/// for every other call position. (`y=$(echo hi | f)` / `y=$(f | cat)`
+/// captured "" without this; bash captures the callee's echoed value.)
+fn echo_pipeline_last_stage(stage: &mut Vec<IrStmt>, eligible: &HashSet<String>) -> bool {
+    let is_last_call = matches!(
+        stage.as_slice(),
+        [IrStmt::Expr(IrExpr::Call { func, args })]
+            if eligible_fn_call(func, args, eligible)
+    );
+    if !is_last_call {
+        return false;
+    }
+    let IrStmt::Expr(IrExpr::Call { args, .. }) = &stage[0] else {
+        unreachable!("checked by is_last_call");
+    };
+    let echo_args = echo_of_fn_value(args);
+    stage[0] = IrStmt::Expr(IrExpr::Call {
+        func: "exec".to_string(),
+        args: echo_args,
+    });
+    true
+}
+
 /// Rewrite one statement: a value echo → Return(Some(word)); a bare
 /// return → dropped (unreachable after the echo-return); otherwise recurse
 /// into nested containers.
-fn rewrite_stmt(st: &IrStmt, changed: &mut bool, eligible: &HashSet<String>) -> IrStmt {
+fn rewrite_stmt(
+    st: &IrStmt,
+    changed: &mut bool,
+    eligible: &HashSet<String>,
+    keep_pipeline_last: bool,
+) -> IrStmt {
     match st {
         IrStmt::Expr(IrExpr::Call { func, args, .. })
             if matches!(func.as_str(), "builtin" | "exec") =>
@@ -545,10 +660,12 @@ fn rewrite_stmt(st: &IrStmt, changed: &mut bool, eligible: &HashSet<String>) -> 
             // non-echo exec call, leaving the bare call for pass 3 to
             // wrap in an ECHO — printing the value instead of returning
             // it, the extra-`0` self-test regression).
-            if let Some(IrExpr::Str(fname, _)) = args.first() {
-                if eligible.contains(fname) {
-                    *changed = true;
-                    return IrStmt::Return(Some(fn_value_call(args)));
+            if !keep_pipeline_last {
+                if let Some(IrExpr::Str(fname, _)) = args.first() {
+                    if eligible.contains(fname) {
+                        *changed = true;
+                        return IrStmt::Return(Some(fn_value_call(args)));
+                    }
                 }
             }
             st.clone()
@@ -559,10 +676,12 @@ fn rewrite_stmt(st: &IrStmt, changed: &mut bool, eligible: &HashSet<String>) -> 
         IrStmt::Expr(IrExpr::Call { func, args, .. })
             if matches!(func.as_str(), "exec" | "fnCall") =>
         {
-            if let Some(IrExpr::Str(fname, _)) = args.first() {
-                if eligible.contains(fname) {
-                    *changed = true;
-                    return IrStmt::Return(Some(fn_value_call(args)));
+            if !keep_pipeline_last {
+                if let Some(IrExpr::Str(fname, _)) = args.first() {
+                    if eligible.contains(fname) {
+                        *changed = true;
+                        return IrStmt::Return(Some(fn_value_call(args)));
+                    }
                 }
             }
             st.clone()
@@ -580,19 +699,19 @@ fn rewrite_stmt(st: &IrStmt, changed: &mut bool, eligible: &HashSet<String>) -> 
         } => {
             let mut t: Vec<IrStmt> = Vec::with_capacity(then.len());
             for s in then {
-                t.push(rewrite_stmt(s, changed, eligible));
+                t.push(rewrite_stmt(s, changed, eligible, false));
             }
             let mut es: Vec<(IrExpr, Vec<IrStmt>)> = Vec::with_capacity(elsifs.len());
             for (c, b) in elsifs {
                 let mut nb: Vec<IrStmt> = Vec::with_capacity(b.len());
                 for s in b {
-                    nb.push(rewrite_stmt(s, changed, eligible));
+                    nb.push(rewrite_stmt(s, changed, eligible, false));
                 }
                 es.push((c.clone(), nb));
             }
             let mut el: Vec<IrStmt> = Vec::with_capacity(else_.len());
             for s in else_ {
-                el.push(rewrite_stmt(s, changed, eligible));
+                el.push(rewrite_stmt(s, changed, eligible, false));
             }
             IrStmt::If {
                 cond: cond.clone(),
@@ -604,7 +723,7 @@ fn rewrite_stmt(st: &IrStmt, changed: &mut bool, eligible: &HashSet<String>) -> 
         IrStmt::While { cond, body } => {
             let mut b: Vec<IrStmt> = Vec::with_capacity(body.len());
             for s in body {
-                b.push(rewrite_stmt(s, changed, eligible));
+                b.push(rewrite_stmt(s, changed, eligible, false));
             }
             IrStmt::While {
                 cond: cond.clone(),
@@ -614,7 +733,7 @@ fn rewrite_stmt(st: &IrStmt, changed: &mut bool, eligible: &HashSet<String>) -> 
         IrStmt::For { var, iter, body } => {
             let mut b: Vec<IrStmt> = Vec::with_capacity(body.len());
             for s in body {
-                b.push(rewrite_stmt(s, changed, eligible));
+                b.push(rewrite_stmt(s, changed, eligible, false));
             }
             IrStmt::For {
                 var: var.clone(),
@@ -631,7 +750,7 @@ fn rewrite_stmt(st: &IrStmt, changed: &mut bool, eligible: &HashSet<String>) -> 
             for clause in clauses {
                 let mut b: Vec<IrStmt> = Vec::with_capacity(clause.body.len());
                 for s in &clause.body {
-                    b.push(rewrite_stmt(s, changed, eligible));
+                    b.push(rewrite_stmt(s, changed, eligible, false));
                 }
                 new_clauses.push(crate::ir::IrCaseClause {
                     patterns: clause.patterns.clone(),
@@ -651,7 +770,7 @@ fn rewrite_stmt(st: &IrStmt, changed: &mut bool, eligible: &HashSet<String>) -> 
         } => {
             let mut b: Vec<IrStmt> = Vec::with_capacity(body.len());
             for s in body {
-                b.push(rewrite_stmt(s, changed, eligible));
+                b.push(rewrite_stmt(s, changed, eligible, false));
             }
             IrStmt::ForInit {
                 init: init.clone(),
@@ -663,7 +782,7 @@ fn rewrite_stmt(st: &IrStmt, changed: &mut bool, eligible: &HashSet<String>) -> 
         IrStmt::Block(body) => {
             let mut b: Vec<IrStmt> = Vec::with_capacity(body.len());
             for s in body {
-                b.push(rewrite_stmt(s, changed, eligible));
+                b.push(rewrite_stmt(s, changed, eligible, false));
             }
             IrStmt::Block(b)
         }
@@ -763,7 +882,13 @@ fn rewrite_call_stmt(st: &mut IrStmt, eligible: &HashSet<String>) -> bool {
         }
         IrStmt::Pipeline { stages, .. } => {
             let mut c = false;
-            for stage in stages.iter_mut() {
+            // Last stage = the pipeline's OUTPUT sink: see the pass-3 note.
+            let last = stages.len().saturating_sub(1);
+            for (i, stage) in stages.iter_mut().enumerate() {
+                if i == last {
+                    c |= echo_pipeline_last_stage(stage, eligible);
+                    continue;
+                }
                 for s in stage.iter_mut() {
                     c |= rewrite_call_stmt(s, eligible);
                 }
@@ -816,6 +941,16 @@ fn rewrite_call_stmt(st: &mut IrStmt, eligible: &HashSet<String>) -> bool {
         }
         IrStmt::Output { value, .. } => rewrite_expr_calls(value, eligible),
         IrStmt::Return(Some(v)) => rewrite_expr_calls(v, eligible),
+        // a `pipeline([...])` expression statement — the capture-assign
+        // path reaches its stages through the Capture/Arrow recursion, but
+        // a pipeline in statement position arrives here.
+        IrStmt::Expr(e) => {
+            if matches!(e, IrExpr::Call { func, .. } if func == "pipeline") {
+                rewrite_expr_calls(e, eligible)
+            } else {
+                false
+            }
+        }
         _ => false,
     }
 }
@@ -894,6 +1029,24 @@ fn rewrite_expr_calls(e: &mut IrExpr, eligible: &HashSet<String>) -> bool {
         return rewrite_expr_calls(expr, eligible);
     }
     match e {
+        // A shell pipeline lowered as `pipeline([Arrow(…), Arrow(…), …])`.
+        // The LAST stage writes the pipeline's output through the current
+        // fd-1 sink, so an eligible call there is not in value position —
+        // it must ECHO the fnValue result (see echo_pipeline_last_stage).
+        IrExpr::Call { func, args } if func == "pipeline" => {
+            let mut c = false;
+            if let Some(IrExpr::Array(stages)) = args.get_mut(0) {
+                let last = stages.len().saturating_sub(1);
+                for (i, stage) in stages.iter_mut().enumerate() {
+                    if i == last {
+                        c |= echo_pipeline_last_expr(stage, eligible);
+                    } else {
+                        c |= rewrite_expr_calls(stage, eligible);
+                    }
+                }
+            }
+            c
+        }
         IrExpr::Call { func, args } if matches!(func.as_str(), "exec" | "fnCall") => {
             if eligible_fn_call(func, args, eligible) {
                 *args = echo_of_fn_value(args);
@@ -1027,6 +1180,260 @@ fn function_body<'a>(stmts: &'a [IrStmt], name: &str) -> Option<&'a [IrStmt]> {
     None
 }
 
+/// Hoist whole-pattern `$(f)` / `` `f` `` captures out of `case` clause
+/// patterns. For each such pattern whose command is a SINGLE call to an
+/// ELIGIBLE function, insert a `__sh2_casepat_N = fnValue("f", […])`
+/// statement before the `case` and rewrite the pattern to the temp-var
+/// read. Recurses into every statement container. Returns changed.
+fn hoist_case_pattern_captures(
+    stmts: &mut Vec<IrStmt>,
+    eligible: &HashSet<String>,
+    seq: &mut usize,
+) -> bool {
+    let mut changed = false;
+    let mut out: Vec<IrStmt> = Vec::with_capacity(stmts.len());
+    for mut st in stmts.drain(..) {
+        // Scope the borrow of `st` so it can be moved into `out` after.
+        let mut hoists: Vec<IrStmt> = Vec::new();
+        {
+            if let IrStmt::Case { clauses, .. } = &mut st {
+                for clause in clauses.iter_mut() {
+                    changed |= hoist_case_pattern_captures(&mut clause.body, eligible, seq);
+                    let mut new_pats: Vec<String> = Vec::with_capacity(clause.patterns.len());
+                    for p in clause.patterns.drain(..) {
+                        match lift_pattern_capture(&p, eligible) {
+                            Some((fname, call_args, quoted)) => {
+                                let var = format!("__sh2_casepat_{seq}");
+                                *seq += 1;
+                                hoists.push(fnvalue_assign(&var, &fname, &call_args));
+                                new_pats.push(if quoted {
+                                    format!("\"${var}\"")
+                                } else {
+                                    format!("${var}")
+                                });
+                                changed = true;
+                            }
+                            None => new_pats.push(p),
+                        }
+                    }
+                    clause.patterns = new_pats;
+                }
+            } else {
+                changed |= rebuild_children(&mut st, eligible, seq);
+            }
+            // A pipeline's LAST stage writes the pipeline's output through
+            // the current fd-1 sink — a bare `f` there is not in value
+            // position, so the pass-3 collapse (`exec echo fnValue`) must
+            // not reach it either, from this recursion or from pass 3.
+            if is_pipeline_with_last_call(&st, eligible) {
+                if let IrStmt::Pipeline { stages, .. } = &mut st {
+                    if let Some(last) = stages.last_mut() {
+                        last.retain(|s| {
+                            !matches!(
+                                s,
+                                IrStmt::Expr(IrExpr::Call { func, args, .. })
+                                    if matches!(func.as_str(), "exec" | "fnCall")
+                                        && matches!(args.first(), Some(IrExpr::Str(n, _))
+                                            if eligible.contains(n))
+                            )
+                        });
+                    }
+                }
+            }
+        }
+        out.extend(hoists);
+        out.push(st);
+    }
+    *stmts = out;
+    changed
+}
+
+/// Recurse into the statement-bearing children of a non-`case` statement.
+fn rebuild_children(st: &mut IrStmt, eligible: &HashSet<String>, seq: &mut usize) -> bool {
+    let mut changed = false;
+    match st {
+        IrStmt::If {
+            then,
+            elsifs,
+            else_,
+            ..
+        } => {
+            changed |= hoist_case_pattern_captures(then, eligible, seq);
+            for (_, b) in elsifs.iter_mut() {
+                changed |= hoist_case_pattern_captures(b, eligible, seq);
+            }
+            changed |= hoist_case_pattern_captures(else_, eligible, seq);
+        }
+        IrStmt::While { body, .. }
+        | IrStmt::DoWhile { body, .. }
+        | IrStmt::For { body, .. }
+        | IrStmt::Block(body)
+        | IrStmt::Subshell(body)
+        | IrStmt::Background(body) => {
+            changed |= hoist_case_pattern_captures(body, eligible, seq);
+        }
+        IrStmt::ForInit {
+            init,
+            step,
+            body,
+            ..
+        } => {
+            changed |= hoist_case_pattern_captures(init, eligible, seq);
+            changed |= hoist_case_pattern_captures(step, eligible, seq);
+            changed |= hoist_case_pattern_captures(body, eligible, seq);
+        }
+        IrStmt::Redirect { inner, .. } => {
+            changed |= hoist_case_pattern_captures(inner, eligible, seq);
+        }
+        IrStmt::Pipeline { stages, .. } => {
+            for s in stages.iter_mut() {
+                changed |= hoist_case_pattern_captures(s, eligible, seq);
+            }
+        }
+        IrStmt::Function {
+            body,
+            named_blocks,
+            ..
+        } => {
+            changed |= hoist_case_pattern_captures(body, eligible, seq);
+            for (_, b) in named_blocks.iter_mut() {
+                changed |= hoist_case_pattern_captures(b, eligible, seq);
+            }
+        }
+        IrStmt::Try {
+            body,
+            excepts,
+            else_body,
+            finally_body,
+        } => {
+            changed |= hoist_case_pattern_captures(body, eligible, seq);
+            for e in excepts.iter_mut() {
+                changed |= hoist_case_pattern_captures(&mut e.body, eligible, seq);
+            }
+            changed |= hoist_case_pattern_captures(else_body, eligible, seq);
+            changed |= hoist_case_pattern_captures(finally_body, eligible, seq);
+        }
+        _ => {}
+    }
+    changed
+}
+
+/// `Some((fname, args, quoted))` iff `pat` is EXACTLY a whole-pattern
+/// command substitution `$(f args…)` / `` `f args…` `` (optionally wrapped
+/// in one matched quote pair) whose command is a single call to an
+/// ELIGIBLE function. Anything else (glob text around the substitution,
+/// a builtin/external command, an ineligible callee) returns `None`.
+fn lift_pattern_capture(
+    pat: &str,
+    eligible: &HashSet<String>,
+) -> Option<(String, Vec<IrExpr>, bool)> {
+    let t = pat.trim();
+    let (inner, quoted) = strip_one_quote_pair(t);
+    let body = whole_subst_body(inner.trim())?;
+    let cmds = crate::parser::commands::Parser::new(body).parse().ok()?;
+    let stmts: Vec<IrStmt> = cmds
+        .iter()
+        .filter_map(crate::shir::stmt_for_command)
+        .collect();
+    let args = match stmts.as_slice() {
+        [IrStmt::Expr(IrExpr::Call { func, args })] if matches!(func.as_str(), "exec" | "fnCall") => {
+            args
+        }
+        _ => return None,
+    };
+    let [IrExpr::Str(fname, _), IrExpr::Array(call_args)] = args.as_slice() else {
+        return None;
+    };
+    if !eligible.contains(fname) {
+        return None;
+    }
+    Some((fname.clone(), call_args.clone(), quoted))
+}
+
+/// Strip exactly one matched surrounding quote pair (double or single).
+fn strip_one_quote_pair(t: &str) -> (&str, bool) {
+    let b = t.as_bytes();
+    if b.len() >= 2
+        && ((b[0] == b'"' && b[b.len() - 1] == b'"')
+            || (b[0] == b'\'' && b[b.len() - 1] == b'\''))
+    {
+        (&t[1..t.len() - 1], true)
+    } else {
+        (t, false)
+    }
+}
+
+/// The body of a WHOLE `$( … )` / `` ` … ` `` substitution, or `None` when
+/// `s` is not one (glob text around it, unbalanced parens). Mirrors the
+/// renderer-side `case_subst_value` balanced scan (quote/escape aware).
+fn whole_subst_body(s: &str) -> Option<&str> {
+    if s.strip_prefix("$(").is_some() {
+        let b = s.as_bytes();
+        let mut depth = 0i32;
+        let mut in_s = false;
+        let mut in_d = false;
+        let mut esc = false;
+        let mut i = 0;
+        while i < b.len() {
+            let c = b[i] as char;
+            if esc {
+                esc = false;
+            } else if c == '\\' {
+                esc = true;
+            } else if in_s {
+                if c == '\'' {
+                    in_s = false;
+                }
+            } else if in_d {
+                if c == '"' {
+                    in_d = false;
+                }
+            } else if c == '\'' {
+                in_s = true;
+            } else if c == '"' {
+                in_d = true;
+            } else if c == '(' {
+                depth += 1;
+            } else if c == ')' {
+                depth -= 1;
+                if depth == 0 {
+                    // whole iff the matching close is the final byte
+                    return if i == b.len() - 1 {
+                        Some(&s[2..i])
+                    } else {
+                        None
+                    };
+                }
+            }
+            i += 1;
+        }
+        None
+    } else if s.len() >= 2 && s.starts_with('`') && s.ends_with('`') {
+        Some(&s[1..s.len() - 1])
+    } else {
+        None
+    }
+}
+
+/// `var = fnValue("fname", [args…])`.
+fn fnvalue_assign(var: &str, fname: &str, call_args: &[IrExpr]) -> IrStmt {
+    IrStmt::Assign {
+        targets: vec![AssignTarget {
+            var: var.to_string(),
+            sigil: None,
+            indices: vec![],
+        }],
+        expr: IrExpr::Call {
+            func: "fnValue".to_string(),
+            args: vec![
+                IrExpr::Str(fname.to_string(), StrStyle::DoubleQuoted),
+                IrExpr::Array(call_args.to_vec()),
+            ],
+        },
+        asm: None,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1097,5 +1504,53 @@ mod tests {
         // two sequential echoes → 2 lines on a path → refuse
         let json = lower_raw("f() { echo 1; echo 2; }; f");
         assert!(!json.contains("\"fnValue\""), "multi-echo lifted: {json}");
+    }
+
+    /// A pipeline's LAST stage is the pipeline's output sink: an eligible
+    /// call there must ECHO its value, not become a silent value-returning
+    /// call. Regression for `y=$(echo hi | f)` / `y=$(f | cat)` capturing
+    /// "" where bash captures the callee's echoed value.
+    #[test]
+    fn pipeline_last_stage_echoes_the_value() {
+        let src = "f() { echo \"x\"; }; y=$(echo hi | f); z=$(f | cat)";
+        let commands = parse_commands_from_text(src).expect("parse source");
+        let mut prog = ast_to_ir_raw(&commands);
+        assert!(transform(&mut prog.stmts), "transform was a no-op");
+        // both captures must have their `f` stage rewritten to an echo of
+        // fnValue — the trailing-pipe case (the call is the LAST stage) and
+        // the leading-call case (a non-last stage).
+        let mut echoed_f = 0;
+        let mut bare_f = 0;
+        for st in &prog.stmts {
+            let IrStmt::Assign { expr, .. } = st else { continue };
+            let IrExpr::Capture { expr: cap, .. } = expr else { continue };
+            let IrExpr::Arrow(body) = cap.as_ref() else { continue };
+            let [IrStmt::Expr(IrExpr::Call { func, args })] = body.as_slice() else {
+                continue;
+            };
+            if func != "pipeline" {
+                continue;
+            }
+            let Some(IrExpr::Array(stages)) = args.first() else { continue };
+            for stage in stages {
+                let IrExpr::Arrow(lbody) = stage else { continue };
+                let [IrStmt::Expr(IrExpr::Call { func, args })] = lbody.as_slice() else {
+                    continue;
+                };
+                let calls_f = matches!(args.first(), Some(IrExpr::Str(n, _)) if n == "f");
+                if func == "exec" && calls_f {
+                    bare_f += 1;
+                }
+                let echoes_fnvalue = func == "exec"
+                    && matches!(args.first(), Some(IrExpr::Str(s, _)) if s == "echo")
+                    && matches!(args.get(1), Some(IrExpr::Array(items))
+                        if matches!(items.as_slice(), [IrExpr::Call { func, .. }] if func == "fnValue"));
+                if echoes_fnvalue {
+                    echoed_f += 1;
+                }
+            }
+        }
+        assert_eq!(bare_f, 0, "a pipeline stage still calls f without echoing");
+        assert_eq!(echoed_f, 2, "expected both f stages to echo fnValue");
     }
 }

@@ -3,9 +3,11 @@
 //! proposal estree-20260813-183713 (a1-ssa-const-copy-prop). The GLSL
 //! backend's own fragment output shows the shape every backend has:
 //!
-//!     g_fx = g_frag_x;                    // copy, never re-assigned
-//!     g_hash = ((g_fx) * (7)) + ((g_fy) * (13));
-//!     g_corrupt = ... g_hash ...;         // hash is a dead intermediate
+//! ```text
+//! g_fx = g_frag_x;                    // copy, never re-assigned
+//! g_hash = ((g_fx) * (7)) + ((g_fy) * (13));
+//! g_corrupt = ... g_hash ...;         // hash is a dead intermediate
+//! ```
 //!
 //! ## Need
 //! The renderers are literal statement→code translators with zero value
@@ -111,9 +113,27 @@ fn collect_defs(stmts: &[IrStmt]) -> HashMap<String, Def> {
                 IrExpr::Int(_) | IrExpr::Str(_, _) | IrExpr::Bool(_) => {
                     Some((v, Def::Literal(e.clone())))
                 }
+                // A QUOTED string assignment (`s="a b"`, `s='x$y'`, `s=""`)
+                // lowers to an Interpolate whose parts are all literal text —
+                // the same constant value, spelled one layer deeper. Refusing
+                // it here left every quoted-literal assignment unfolded
+                // (measured: 886 surviving getVar reads across the corpus
+                // while the unquoted `s=abc` spelling of the same def folded
+                // fine), so the fold is keyed on the DEF's own node and the
+                // read is replaced by that node verbatim: the quoting style
+                // (and any `$`/`@` text a SingleQuoted def protects from
+                // Perl interpolation) travels with the value.
+                IrExpr::Interpolate(parts)
+                    if parts
+                        .iter()
+                        .all(|p| matches!(p, crate::ir::InterpPart::Lit(_))) =>
+                {
+                    Some((v, Def::Literal(e.clone())))
+                }
                 // a copy def (x=y) isn't itself a literal — its reads stay
                 // unfolded (conservative; the RHS read-of-y still folds in
-                // place when y is a literal)
+                // place when y is a literal); same for an Interpolate with a
+                // live expansion part (its value depends on that read)
                 _ => None,
             }
         })
@@ -999,6 +1019,43 @@ mod tests {
         ];
         assert!(transform(&mut stmts));
         assert_eq!(stmts[1], expr_stmt(str_lit("hello")));
+    }
+
+    /// `s="a b"; echo "$s"` — a quoted assignment lowers to an
+    /// all-literal `Interpolate`. It is the same constant value as the
+    /// bare spelling and must fold identically; the def node is cloned
+    /// verbatim so its quoting style travels with the value.
+    #[test]
+    fn folds_quoted_interpolate_def() {
+        let quoted = IrExpr::Interpolate(vec![crate::ir::InterpPart::Lit("a b".to_string())]);
+        let mut stmts = vec![assign("s", quoted.clone()), expr_stmt(getvar("s"))];
+        assert!(transform(&mut stmts));
+        assert_eq!(stmts[1], expr_stmt(quoted));
+    }
+
+    /// `s=""; echo "$s"` — the empty quoted string is an Interpolate
+    /// with no parts: still a constant, still foldable.
+    #[test]
+    fn folds_empty_quoted_def() {
+        let mut stmts = vec![
+            assign("s", IrExpr::Interpolate(vec![])),
+            expr_stmt(getvar("s")),
+        ];
+        assert!(transform(&mut stmts));
+        assert_eq!(stmts[1], expr_stmt(IrExpr::Interpolate(vec![])));
+    }
+
+    /// `s="a $x b"; echo "$s"` — an Interpolate with a LIVE expansion
+    /// part is not a constant: the read must stay unfolded.
+    #[test]
+    fn refuses_mixed_interpolate_def() {
+        let mixed = IrExpr::Interpolate(vec![
+            crate::ir::InterpPart::Lit("a ".to_string()),
+            crate::ir::InterpPart::Expr(Box::new(getvar("x"))),
+        ]);
+        let mut stmts = vec![assign("s", mixed), expr_stmt(getvar("s"))];
+        assert!(!transform(&mut stmts));
+        assert_eq!(stmts[1], expr_stmt(getvar("s")));
     }
 
     /// `typeset -l lc="HELLO WORLD"; lc="ANOTHER TEST"; echo $lc` — the

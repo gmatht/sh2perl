@@ -88,6 +88,29 @@ pub fn expr_reads(name: &str, e: &IrExpr) -> bool {
                         return true;
                     }
                 }
+            } else if matches!(func.as_str(), "memLoad" | "memAdvance" | "memStore" | "memFree" | "arrayStore") {
+                // the mem seam + element stores resolve their first arg
+                // (a var name or handle) through the store at runtime —
+                // a literal name here is a READ of that variable (a
+                // memStore also writes through it, which likewise keeps
+                // the name alive)
+                if let Some(IrExpr::Str(n, _)) = args.first() {
+                    if n == name {
+                        return true;
+                    }
+                }
+            } else if matches!(func.as_str(), "fnCall" | "fnValue" | "callDirect") {
+                // dispatch passes string args as the callee's $1.. and
+                // callees use those as VARIABLE NAMES (array-by-name
+                // in-place ops) — a literal arg matching name is a READ
+                // (the Array elements carry the actual words)
+                if args.iter().any(|a| match a {
+                    IrExpr::Str(n, _) => n == name,
+                    IrExpr::Array(items) => items.iter().any(|it| matches!(it, IrExpr::Str(n, _) if n == name)),
+                    _ => false,
+                }) {
+                    return true;
+                }
             }
             // $name references inside ANY string argument are reads — the
             // `test` operands (`[ "$x" -eq 5 ]`) AND the slice start of
@@ -156,11 +179,36 @@ fn arith_reads(name: &str, a: &ArithAst) -> bool {
         ArithAst::Cond { test, then, else_ } => {
             arith_reads(name, test) || arith_reads(name, then) || arith_reads(name, else_)
         }
-        ArithAst::Assign { var: _, rhs, .. } => arith_reads(name, rhs),
-        ArithAst::IncDec { var: _, .. } => false,
+        // A compound arith assignment (`i+=2`, `i*=3`) is a READ of the
+        // target: its value is the current value combined with the rhs.
+        // `=` is a plain overwrite. Treating the compound form as
+        // write-only let the DSE drop the initialising store.
+        ArithAst::Assign { var, op, rhs } => {
+            arith_reads(name, rhs) || (op != "=" && var == name)
+        }
+        // `i++` / `--i` always read the current value.
+        ArithAst::IncDec { var, .. } => var == name,
         ArithAst::Sizeof(_) => false,
         ArithAst::Cast { arg, .. } => arith_reads(name, arg),
     }
+}
+
+/// `assign(V, OP, …)` with a compound `OP` is a read-modify-write of `V`
+/// (bash's scalar `+=` is string append; the arithmetic ops combine with
+/// the current value). Missing this read made the const-prop DSE drop the
+/// base write in `n=1; n+=2` — every backend then computed from an empty
+/// variable (zig-20261021-param-lowering-gaps §3).
+fn assign_rmw_reads(name: &str, expr: &IrExpr) -> bool {
+    if let IrExpr::Call { func, args } = expr {
+        if func == "assign" {
+            if let (Some(IrExpr::Str(v, _)), Some(IrExpr::Str(op, _))) =
+                (args.first(), args.get(1))
+            {
+                return v == name && op != "=";
+            }
+        }
+    }
+    false
 }
 
 /// Does a statement list READ `name`?
@@ -174,7 +222,17 @@ pub fn stmt_reads(name: &str, st: &IrStmt) -> bool {
         IrStmt::Expr(e) => expr_reads(name, e),
         IrStmt::Assign { targets, expr, .. } => {
             expr_reads(name, expr)
-                || targets.iter().any(|t| t.indices.iter().any(|i| expr_reads(name, i)))
+                || assign_rmw_reads(name, expr)
+                // the index is either a live `indices` expr OR BAKED into
+                // the target name (`arr[$i]=v` → var "arr[$i]"). Both are
+                // READS of the index variable: without the baked case the
+                // definition of `i` looks dead and the DSE below deletes
+                // it, so `arr[$i]=v` writes a dead key `arr[]` (mimecroft
+                // lost `sp_i=$1` and recorded 1 of 10 artifacts).
+                || targets.iter().any(|t| {
+                    t.indices.iter().any(|i| expr_reads(name, i))
+                        || crate::shir::index_name_refs(&t.var).iter().any(|r| r == name)
+                })
         }
         IrStmt::Declare { init, .. } => init.as_ref().is_some_and(|i| expr_reads(name, i)),
         IrStmt::DeclareArray { elements, .. } => elements.iter().any(|e| expr_reads(name, e)),
@@ -267,6 +325,7 @@ pub fn stmt_reads(name: &str, st: &IrStmt) -> bool {
         }
         IrStmt::Return(None) | IrStmt::Exit(None) | IrStmt::Continue | IrStmt::Break
         | IrStmt::Require(_) | IrStmt::RawText(_) | IrStmt::Label(_) | IrStmt::Goto(_) => false,
+        IrStmt::Shaderize { body, .. } => body.iter().any(|s| stmt_reads(name, s)),
     }
 }
 
@@ -469,6 +528,29 @@ fn expr_reads_name(name: &str, e: &IrExpr) -> bool {
                         return true;
                     }
                 }
+            } else if matches!(func.as_str(), "memLoad" | "memAdvance" | "memStore" | "memFree" | "arrayStore") {
+                // the mem seam + element stores resolve their first arg
+                // (a var name or handle) through the store at runtime —
+                // a literal name here is a READ of that variable (a
+                // memStore also writes through it, which likewise keeps
+                // the name alive)
+                if let Some(IrExpr::Str(n, _)) = args.first() {
+                    if n == name {
+                        return true;
+                    }
+                }
+            } else if matches!(func.as_str(), "fnCall" | "fnValue" | "callDirect") {
+                // dispatch passes string args as the callee's $1.. and
+                // callees use those as VARIABLE NAMES (array-by-name
+                // in-place ops) — a literal arg matching name is a READ
+                // (the Array elements carry the actual words)
+                if args.iter().any(|a| match a {
+                    IrExpr::Str(n, _) => n == name,
+                    IrExpr::Array(items) => items.iter().any(|it| matches!(it, IrExpr::Str(n, _) if n == name)),
+                    _ => false,
+                }) {
+                    return true;
+                }
             } else if func == "test" {
                 for a in args {
                     if let IrExpr::Str(s, _) = a {
@@ -528,6 +610,12 @@ fn record_stmt_reads(rm: &mut ReadMap, name: &str, list: usize, pos: usize, st: 
             for t in targets {
                 for i in &t.indices {
                     record_expr_reads(rm, name, list, pos, i);
+                }
+                // baked index names (`arr[$i]`) read the index variable
+                for r in crate::shir::index_name_refs(&t.var) {
+                    if r == name {
+                        rm.reads.entry(r).or_default().push((list, pos));
+                    }
                 }
             }
         }
@@ -1194,6 +1282,151 @@ fn const_prop_recurse(list: &mut Vec<IrStmt>, consts: &HashSet<String>, st: &Fol
     changed
 }
 
+/// Fold arithmetic subtrees that are PURE LITERALS (`Num` leaves only, no
+/// variable reads) to a single `Num`, at i64 precision (bash's integer
+/// width). Returns true when anything changed.
+///
+/// This is the size-oriented fold (`-Os`): `1 + 2` becomes `3`, shrinking
+/// both the emitted expression and any const-pool entry derived from it.
+/// It is deliberately NOT run at `-Og`, whose contract is that the output
+/// resembles the input (a human reading `x = 1 + 2` should see `1 + 2`).
+/// Being purely literal, it cannot change behaviour: the operands are
+/// constants, so an overflowed intermediate is the one bash would also
+/// produce (wrapping i64 — `checked_*` refuses and leaves the tree
+/// alone, which is the safe direction).
+///
+/// Only `Bin`/`Un` over `Num` fold. A `Var`/`Ident`/`Index`/`Assign`/
+/// `IncDec`/`Cond` operand stops the fold at that node (its value is a
+/// runtime read), so the surrounding expression keeps its shape.
+pub fn fold_arith_literals(prog: &mut IrProgram) -> bool {
+    let mut changed = false;
+    /// Fold `a` in place; returns its constant value when the whole
+    /// subtree is a literal. `changed` records that SOMETHING folded —
+    /// including a literal child of an unfoldable parent.
+    fn fold(a: &mut ArithAst, changed: &mut bool) -> Option<i64> {
+        match a {
+            ArithAst::Num(n) => Some(*n),
+            ArithAst::Bin { op, lhs, rhs } => {
+                // recurse first so an unfoldable parent still folds its
+                // literal children (`(1 + 2) * a` -> `3 * a`)
+                let l = fold(lhs, changed);
+                let r = fold(rhs, changed);
+                let (l, r) = (l?, r?);
+                let v = match op.as_str() {
+                    "+" => l.checked_add(r),
+                    "-" => l.checked_sub(r),
+                    "*" => l.checked_mul(r),
+                    "/" => (r != 0).then(|| l.checked_div(r)).flatten(),
+                    "%" => (r != 0).then(|| l.checked_rem(r)).flatten(),
+                    "<<" => (0..64).contains(&r).then(|| l.checked_shl(r as u32)).flatten(),
+                    ">>" => (0..64).contains(&r).then(|| l.checked_shr(r as u32)).flatten(),
+                    // `**` is the pow helper's job (and `-O`-dependent);
+                    // comparisons/logicals follow the runtime's exact
+                    // rules, so leave them
+                    _ => None,
+                };
+                let v = v?;
+                *a = ArithAst::Num(v);
+                *changed = true;
+                Some(v)
+            }
+            ArithAst::Un { op, arg } => {
+                let v = fold(arg, changed)?;
+                let nv = match op.as_str() {
+                    "-" => v.checked_neg(),
+                    "!" => Some(if v == 0 { 1 } else { 0 }),
+                    "~" => Some(!v),
+                    _ => None,
+                };
+                let nv = nv?;
+                *a = ArithAst::Num(nv);
+                *changed = true;
+                Some(nv)
+            }
+            // a runtime read / assignment / ternary: not a literal
+            _ => None,
+        }
+    }
+    fn walk_expr(e: &mut IrExpr, changed: &mut bool) {
+        match e {
+            IrExpr::Arith(a) => {
+                fold(a, changed);
+            }
+            IrExpr::BinOp { lhs, rhs, .. } => {
+                walk_expr(lhs, changed);
+                walk_expr(rhs, changed);
+            }
+            IrExpr::Ternary { cond, then, else_ } => {
+                walk_expr(cond, changed);
+                walk_expr(then, changed);
+                walk_expr(else_, changed);
+            }
+            IrExpr::Interpolate(parts) => {
+                for p in parts {
+                    if let InterpPart::Expr(x) = p {
+                        walk_expr(x, changed);
+                    }
+                }
+            }
+            IrExpr::Call { args, .. } => {
+                for a in args {
+                    walk_expr(a, changed);
+                }
+            }
+            IrExpr::Index { key, .. } => walk_expr(key, changed),
+            IrExpr::Array(items) => {
+                for it in items {
+                    walk_expr(it, changed);
+                }
+            }
+            _ => {}
+        }
+    }
+    fn walk_stmts(stmts: &mut [IrStmt], changed: &mut bool) {
+        for s in stmts.iter_mut() {
+            match s {
+                IrStmt::Expr(e) | IrStmt::Output { value: e, .. } => walk_expr(e, changed),
+                IrStmt::Assign { expr, .. } => walk_expr(expr, changed),
+                IrStmt::Declare { init: Some(i), .. } => walk_expr(i, changed),
+                IrStmt::DeclareArray { elements, .. } => {
+                    for e in elements {
+                        walk_expr(e, changed);
+                    }
+                }
+                IrStmt::If { cond, then, elsifs, else_ } => {
+                    walk_expr(cond, changed);
+                    walk_stmts(then, changed);
+                    for (c, b) in elsifs {
+                        walk_expr(c, changed);
+                        walk_stmts(b, changed);
+                    }
+                    walk_stmts(else_, changed);
+                }
+                IrStmt::For { iter, body, .. } => {
+                    walk_expr(iter, changed);
+                    walk_stmts(body, changed);
+                }
+                IrStmt::While { cond, body } => {
+                    walk_expr(cond, changed);
+                    walk_stmts(body, changed);
+                }
+                IrStmt::DoWhile { body, cond, .. } => {
+                    walk_stmts(body, changed);
+                    walk_expr(cond, changed);
+                }
+                IrStmt::Block(b) => walk_stmts(b, changed),
+                IrStmt::Redirect { inner, .. } => walk_stmts(inner, changed),
+                _ => {}
+            }
+        }
+    }
+    walk_stmts(&mut prog.stmts, &mut changed);
+    for sub in &mut prog.subs {
+        walk_stmts(&mut sub.body, &mut changed);
+    }
+    changed
+}
+
 /// `shir_passes::const_prop(&mut IrProgram) -> bool` — the A1 SSA-style
 /// const/copy propagation + dead-store elimination over the `Const`
 /// verdict pool (estree-20260813-183713, honesty rules:
@@ -1401,6 +1634,11 @@ fn collect_stmt_read_names(st: &IrStmt, out: &mut Vec<String>) {
                 for i in t.indices.iter() {
                     collect_expr_read_names(i, out);
                 }
+                // a BAKED index name (`arr[$i]=v`) reads `i`: this is the
+                // scan the DCE uses to decide a store is dead, so without
+                // it `i`'s own definition is dropped and the write lands
+                // on the dead key `arr[]` (mimecroft: 1 of 10 artifacts).
+                out.extend(crate::shir::index_name_refs(&t.var));
             }
         }
         IrStmt::Declare { init, .. } => {
@@ -1554,6 +1792,24 @@ fn collect_stmt_read_names(st: &IrStmt, out: &mut Vec<String>) {
     }
 }
 
+/// A `name[*]` expansion reads IFS at RUNTIME.
+///
+/// The `[*]` join is not computed during lowering — the backend runtime
+/// joins the elements with the FIRST IFS character (bash uses IFS for `*`
+/// even when the expansion is quoted), so an `IFS=` store is live whenever
+/// a `[*]` is read. Without this, `dead_store_elim` sees only the array name
+/// and drops `IFS=$'\n'` as never-read; the join then falls back to a space
+/// and `IFS=$'\n'; ... ${config[*]}` emits "admin localhost" where bash
+/// emits the newline-joined (sort-able) string — the
+/// 064_07_complex_array_operations failure.
+///
+/// `[@]` joins with a hard space and does NOT read IFS.
+fn star_join_reads_ifs(name: &str, out: &mut Vec<String>) {
+    if name.ends_with("[*]") {
+        out.push("IFS".to_string());
+    }
+}
+
 fn collect_expr_read_names(e: &IrExpr, out: &mut Vec<String>) {
     match e {
         IrExpr::Var(n, _) | IrExpr::Ident(n) => out.push(n.clone()),
@@ -1651,6 +1907,7 @@ fn collect_expr_read_names(e: &IrExpr, out: &mut Vec<String>) {
                     if let Some(pos) = n.find('[') {
                         out.push(n[..pos].to_string());
                     }
+                    star_join_reads_ifs(n, out);
                 }
             } else if matches!(
                 func.as_str(),
@@ -1661,11 +1918,41 @@ fn collect_expr_read_names(e: &IrExpr, out: &mut Vec<String>) {
                     if let Some(pos) = n.find('[') {
                         out.push(n[..pos].to_string());
                     }
+                    star_join_reads_ifs(n, out);
+                }
+            } else if matches!(
+                func.as_str(),
+                // The whole-array reductions and the sorted joins: every
+                // one of these READS the store entry for the name in
+                // args[0], spelled as a bare string literal. They were
+                // missing here, so the name looked unread and this pass
+                // dropped its `setArray` as a dead store — after which the
+                // surviving call read an empty store. Measured on the
+                // py-sh-go corpus: t92_max_min_sum.py printed `0` for all
+                // six `print(max/min/sum(...))` lines (and t93, t88 with
+                // it), because `xs = [3,1,4]` was deleted before the call
+                // that consumes it. The element-style reads below already
+                // had this treatment; the reductions were the gap.
+                "max" | "min" | "sum" | "sortedIntJoin" | "sortedBigintJoin"
+            ) {
+                if let Some(IrExpr::Str(n, _)) = args.first() {
+                    out.push(n.clone());
+                    // `#name` is the param-style length spelling — the
+                    // store key is the bare name either way.
+                    let bare = n.trim_start_matches('#');
+                    if bare != n {
+                        out.push(bare.to_string());
+                    }
                 }
             } else if func == "arrayIndex"
                 || func == "addrVar"
                 || func == "derefGet"
                 || func == "derefSet"
+                || func == "memLoad"
+                || func == "memAdvance"
+                || func == "memStore"
+                || func == "memFree"
+                || func == "arrayStore"
             {
                 // pointer indirection (&x / *x): the named slot is BOTH
                 // read and written through the reference
@@ -1675,6 +1962,24 @@ fn collect_expr_read_names(e: &IrExpr, out: &mut Vec<String>) {
                 if func == "derefSet" {
                     if let Some(IrExpr::Str(n, _)) = args.get(1) {
                         out.push(n.clone());
+                    }
+                }
+            } else if matches!(func.as_str(), "fnCall" | "fnValue" | "callDirect") {
+                // dispatch passes string args as the callee's $1.. and
+                // callees use those as VARIABLE NAMES (array-by-name
+                // in-place ops) — every Str arg, including nested Array
+                // elements, is a potential read
+                for a in args {
+                    match a {
+                        IrExpr::Str(n, _) => out.push(n.clone()),
+                        IrExpr::Array(items) => {
+                            for it in items {
+                                if let IrExpr::Str(n, _) = it {
+                                    out.push(n.clone());
+                                }
+                            }
+                        }
+                        _ => {}
                     }
                 }
             } else if matches!(
@@ -1694,7 +1999,7 @@ fn collect_expr_read_names(e: &IrExpr, out: &mut Vec<String>) {
                         }
                     }
                 }
-            } else if func == "test" || func == "let" {
+            } else if func == "test" {
                 // `ternary` (the C frontend's `cond ? a : b`): args[0] is
                 // the cond TEST-STRING — try_native_test lowers it by
                 // scanning `$name` operands natively, so a store write a
@@ -1707,6 +2012,70 @@ fn collect_expr_read_names(e: &IrExpr, out: &mut Vec<String>) {
                 for a in args {
                     if let IrExpr::Str(s, _) = a {
                         for nm in bare_dollar_names(s) {
+                            out.push(nm);
+                        }
+                    } else {
+                        collect_expr_read_names(a, out);
+                    }
+                }
+            } else if func == "let" {
+                // `let "a+1" "i++"` — ARITHMETIC TEXT the runtime evaluates
+                // via evalArith: its refs are BARE identifiers, not `$name`
+                // tokens, so the `$`-scan above sees nothing. Same
+                // rationale (and the same over-mark-is-safe asymmetry) as
+                // the arith/arithEval arm below; a store whose only read
+                // lives in a `let` arg must survive DCE, or the never-written
+                // "" fold answers the arithmetic instead of the variable.
+                for a in args {
+                    if let IrExpr::Str(s, _) = a {
+                        for nm in bare_arith_idents(s) {
+                            out.push(nm);
+                        }
+                    } else {
+                        collect_expr_read_names(a, out);
+                    }
+                }
+            } else if func == "exec"
+                && matches!(
+                    args.first(),
+                    Some(IrExpr::Str(n, _)) if n == "let"
+                )
+            {
+                // `(( ))` and the bash `let` builtin LOWER to
+                // `Call("exec", ["let", Array([...arith words...])])` — the
+                // exec/builtin command form, NOT `func == "let"`. The arith
+                // words live in the arg-list Array, so scan those
+                // (bare_dollar_names would miss every one — a bare ident is
+                // not a `$name` token). Without this the read set stayed
+                // empty, DCE deleted the only store, and the emitter's
+                // never-written fold then blanked the operand IN THE SAME
+                // CONDITION: `x=5; if (( x > 3 ))` rendered
+                // `Number("") || 0 > 3` and took the else branch
+                // (zsh-sh-go t73_zsh_arith_cond). Over-marking only shrinks
+                // the elimination set.
+                if let Some(IrExpr::Array(words)) = args.get(1) {
+                    for w in words {
+                        if let IrExpr::Str(s, _) = w {
+                            for nm in bare_arith_idents(s) {
+                                out.push(nm);
+                            }
+                        } else {
+                            collect_expr_read_names(w, out);
+                        }
+                    }
+                }
+            } else if matches!(func.as_str(), "cstyleFor" | "arith" | "arithEval") {
+                // the header/expr string is ARITHMETIC TEXT the runtime
+                // evaluates via evalArith — bare identifiers are STORE
+                // reads (the `$`-ref scan above would miss
+                // `i < _i_sqrt_nv` in a cstyleFor header, dropping the
+                // loop bound's only store as dead → the runtime reads
+                // the never-written "" fold → the loop never runs — the
+                // py-sh-go t86/t88 JS-gate regression). Over-marking
+                // only shrinks the elimination set.
+                for a in args {
+                    if let IrExpr::Str(s, _) = a {
+                        for nm in bare_arith_idents(s) {
                             out.push(nm);
                         }
                     } else {
@@ -1752,6 +2121,35 @@ fn bare_dollar_names(s: &str) -> Vec<String> {
                 out.push(nm.to_string());
             }
             i = if braced && j < bytes.len() { j + 1 } else { j };
+        } else {
+            i += 1;
+        }
+    }
+    out
+}
+
+/// Bare identifiers inside an ARITHMETIC-TEXT string operand (a
+/// `cstyleFor` header, an `arith`/`arithEval` expression): the runtime's
+/// evalArith resolves them from the STORE, so a store whose only read is
+/// such a mention must survive DCE. Mirrors the lift walkers' `mark_all_idents`
+/// (shir.rs) — the `$`-ref scan above would miss `i < _i_sqrt_nv` (no `$`).
+fn bare_arith_idents(s: &str) -> Vec<String> {
+    let mut out = Vec::new();
+    let bytes = s.as_bytes();
+    let mut i = 0;
+    while i < bytes.len() {
+        let c = bytes[i] as char;
+        if (c.is_ascii_alphabetic() || c == '_')
+            && (i == 0 || !bytes[i - 1].is_ascii_alphanumeric())
+        {
+            let start = i;
+            while i < bytes.len() && (bytes[i].is_ascii_alphanumeric() || bytes[i] == b'_') {
+                i += 1;
+            }
+            let w = &s[start..i];
+            if !w.is_empty() {
+                out.push(w.to_string());
+            }
         } else {
             i += 1;
         }
@@ -1858,6 +2256,128 @@ pub fn optimize(prog: &mut IrProgram) -> bool {
 mod tests {
     use super::*;
     use crate::ir::{ArithAst, StrStyle};
+    use crate::shir::index_name_refs;
+
+    #[test]
+    fn fold_arith_literals_shrinks_constant_exprs() {
+        // x = 1 + 2  ->  x = 3
+        let mut prog = IrProgram {
+            var_storage: vec![],
+            var_nospace: vec![],
+            var_bash_env: vec![],
+            imports: vec![],
+            requires: vec![],
+            stmts: vec![IrStmt::Assign {
+                targets: vec![crate::ir::AssignTarget {
+                    var: "x".to_string(),
+                    sigil: None,
+                    indices: vec![],
+                }],
+                expr: IrExpr::Arith(Box::new(ArithAst::Bin {
+                    op: "+".to_string(),
+                    lhs: Box::new(ArithAst::Num(1)),
+                    rhs: Box::new(ArithAst::Num(2)),
+                })),
+                asm: None,
+            }],
+            subs: vec![],
+            var_types: vec![],
+            stmt_lines: vec![],
+            var_lengths: vec![],
+            var_const: vec![],
+            var_lifetimes: vec![],
+        };
+        assert!(fold_arith_literals(&mut prog));
+        let IrStmt::Assign { expr, .. } = &prog.stmts[0] else {
+            panic!("assign expected")
+        };
+        assert_eq!(*expr, IrExpr::Arith(Box::new(ArithAst::Num(3))));
+    }
+
+    #[test]
+    fn fold_arith_literals_leaves_vars_alone() {
+        // x = a + 1 — a runtime read stops the fold
+        let mut prog = IrProgram {
+            var_storage: vec![],
+            var_nospace: vec![],
+            var_bash_env: vec![],
+            imports: vec![],
+            requires: vec![],
+            stmts: vec![IrStmt::Assign {
+                targets: vec![crate::ir::AssignTarget {
+                    var: "x".to_string(),
+                    sigil: None,
+                    indices: vec![],
+                }],
+                expr: IrExpr::Arith(Box::new(ArithAst::Bin {
+                    op: "+".to_string(),
+                    lhs: Box::new(ArithAst::Var("a".to_string())),
+                    rhs: Box::new(ArithAst::Num(1)),
+                })),
+                asm: None,
+            }],
+            subs: vec![],
+            var_types: vec![],
+            stmt_lines: vec![],
+            var_lengths: vec![],
+            var_const: vec![],
+            var_lifetimes: vec![],
+        };
+        assert!(!fold_arith_literals(&mut prog));
+        let IrStmt::Assign { expr, .. } = &prog.stmts[0] else {
+            panic!("assign expected")
+        };
+        assert!(matches!(expr, IrExpr::Arith(_)));
+    }
+
+    #[test]
+    fn fold_arith_literals_partial_subtree() {
+        // (1 + 2) * a — the literal subtree folds, the var keeps the mul
+        let mut prog = IrProgram {
+            var_storage: vec![],
+            var_nospace: vec![],
+            var_bash_env: vec![],
+            imports: vec![],
+            requires: vec![],
+            stmts: vec![IrStmt::Assign {
+                targets: vec![crate::ir::AssignTarget {
+                    var: "x".to_string(),
+                    sigil: None,
+                    indices: vec![],
+                }],
+                expr: IrExpr::Arith(Box::new(ArithAst::Bin {
+                    op: "*".to_string(),
+                    lhs: Box::new(ArithAst::Bin {
+                        op: "+".to_string(),
+                        lhs: Box::new(ArithAst::Num(1)),
+                        rhs: Box::new(ArithAst::Num(2)),
+                    }),
+                    rhs: Box::new(ArithAst::Var("a".to_string())),
+                })),
+                asm: None,
+            }],
+            subs: vec![],
+            var_types: vec![],
+            stmt_lines: vec![],
+            var_lengths: vec![],
+            var_const: vec![],
+            var_lifetimes: vec![],
+        };
+        assert!(fold_arith_literals(&mut prog));
+        let IrStmt::Assign { expr, .. } = &prog.stmts[0] else {
+            panic!("assign expected")
+        };
+        let IrExpr::Arith(a) = expr else {
+            panic!("arith expected")
+        };
+        match a.as_ref() {
+            ArithAst::Bin { op, lhs, .. } => {
+                assert_eq!(op, "*");
+                assert_eq!(**lhs, ArithAst::Num(3));
+            }
+            other => panic!("bin expected, got {other:?}"),
+        }
+    }
 
     fn prog_of(stmts: Vec<IrStmt>) -> IrProgram {
         IrProgram {
@@ -1904,6 +2424,55 @@ mod tests {
         let mut prog = prog;
         assert!(dead_store_elim(&mut prog));
         assert_eq!(prog.stmts.len(), 1);
+    }
+
+    #[test]
+    fn index_name_refs_reads_baked_index_vars() {
+        // `arr[$i]=v` bakes the index into the target NAME — the refs are
+        // reads of those variables, not decoration.
+        assert_eq!(index_name_refs("tpx[$sp_i]"), vec!["sp_i".to_string()]);
+        assert_eq!(index_name_refs("a[${i}]"), vec!["i".to_string()]);
+        assert_eq!(index_name_refs("a[$i+$j]"), vec!["i".to_string(), "j".to_string()]);
+        // positionals/specials are not named vars; a literal index has no refs
+        assert!(index_name_refs("a[$1]").is_empty());
+        assert!(index_name_refs("a[7]").is_empty());
+        assert!(index_name_refs("plain").is_empty());
+    }
+
+    #[test]
+    fn dce_keeps_store_read_only_by_a_baked_index_name() {
+        // i=1; arr[$i]=v; …  → the ONLY use of `i` is inside the target
+        // name "arr[$i]". When the read scans missed that, DCE deleted
+        // `i=1`, the write landed on the dead key `arr[]` (the runtime
+        // expands an unset `$i` to "") and the remaining positional args
+        // renumbered — mimecroft recorded 1 of its 10 artifacts, so nine
+        // could never be claimed by walking into them.
+        let prog = prog_of(vec![
+            assign("i", IrExpr::Int(1)),
+            assign("arr[$i]", IrExpr::Str("v".to_string(), StrStyle::DoubleQuoted)),
+            assign("keep", IrExpr::Int(2)),
+            IrStmt::Expr(IrExpr::Call {
+                func: "arrayIndex".to_string(),
+                args: vec![
+                    IrExpr::Str("arr".to_string(), StrStyle::DoubleQuoted),
+                    IrExpr::Str("1".to_string(), StrStyle::DoubleQuoted),
+                ],
+            }),
+        ]);
+        let mut prog = prog;
+        dead_store_elim(&mut prog);
+        assert!(
+            prog.stmts.iter().any(|s| matches!(s, IrStmt::Assign { targets, .. }
+                if targets.iter().any(|t| t.var == "i"))),
+            "DCE dropped the definition feeding the baked index name: {:?}",
+            prog.stmts.len()
+        );
+        // …and the same for the two other scans that decide liveness
+        let mut reads = std::collections::HashSet::new();
+        collect_stmt_reads(&assign("arr[$i]", IrExpr::Int(0)), &mut reads);
+        assert!(reads.contains("i"), "collect_stmt_read_names missed the baked index ref");
+        assert!(stmt_reads("i", &assign("arr[$i]", IrExpr::Int(0))),
+            "stmt_reads missed the baked index ref");
     }
 
     #[test]
@@ -1959,6 +2528,131 @@ mod tests {
     }
 
     #[test]
+    fn dce_keeps_ifs_store_read_by_a_star_join() {
+        // IFS=$'\n'; echo "${config[*]}"
+        //
+        // The `[*]` join is computed by the BACKEND RUNTIME, not here: it
+        // joins the elements with the FIRST IFS character. Static liveness
+        // saw only getVar("config[*]") → reads {config[*], config} and
+        // judged the IFS store dead, so it dropped `IFS=$'\n'` and the join
+        // fell back to a space — estree printed "admin localhost" where bash
+        // printed the newline-joined, sort-able string
+        // (064_07_complex_array_operations).
+        //
+        // The `[@]` arm is the control: it joins with a hard space and must
+        // NOT keep a dead IFS store alive, or DCE silently stops working.
+        let star_read = || IrStmt::Expr(IrExpr::Call {
+            func: "builtin".to_string(),
+            args: vec![
+                IrExpr::Str("echo".to_string(), StrStyle::DoubleQuoted),
+                IrExpr::Array(vec![IrExpr::Call {
+                    func: "getVar".to_string(),
+                    args: vec![IrExpr::Str("config[*]".to_string(), StrStyle::DoubleQuoted)],
+                }]),
+            ],
+        });
+        let mut prog = prog_of(vec![assign("IFS", IrExpr::Str("\n".to_string(), StrStyle::SingleQuoted)), star_read()]);
+        assert!(
+            !dead_store_elim(&mut prog),
+            "a [*] join reads IFS at runtime — its store must survive DCE"
+        );
+        assert_eq!(prog.stmts.len(), 2, "the IFS store must still be present");
+
+        let at_read = IrStmt::Expr(IrExpr::Call {
+            func: "builtin".to_string(),
+            args: vec![
+                IrExpr::Str("echo".to_string(), StrStyle::DoubleQuoted),
+                IrExpr::Array(vec![IrExpr::Call {
+                    func: "getVar".to_string(),
+                    args: vec![IrExpr::Str("config[@]".to_string(), StrStyle::DoubleQuoted)],
+                }]),
+            ],
+        });
+        let mut prog2 = prog_of(vec![
+            assign("IFS", IrExpr::Str("\n".to_string(), StrStyle::SingleQuoted)),
+            at_read,
+        ]);
+        assert!(
+            dead_store_elim(&mut prog2),
+            "[@] joins with a hard space and does not read IFS — the store stays dead"
+        );
+
+        // The shape the 064_07 corpus case actually lowers to: an expansion
+        // inside an Interpolate becomes `param("", "config[*]")`, not
+        // getVar — so the param arm needs the same rule.
+        let param_read = IrStmt::Expr(IrExpr::Call {
+            func: "builtin".to_string(),
+            args: vec![
+                IrExpr::Str("echo".to_string(), StrStyle::DoubleQuoted),
+                IrExpr::Array(vec![IrExpr::Interpolate(vec![InterpPart::Expr(
+                    Box::new(IrExpr::Call {
+                        func: "param".to_string(),
+                        args: vec![
+                            IrExpr::Str(String::new(), StrStyle::DoubleQuoted),
+                            IrExpr::Str("config[*]".to_string(), StrStyle::DoubleQuoted),
+                        ],
+                    }),
+                )])]),
+            ],
+        });
+        let mut prog3 = prog_of(vec![
+            assign("IFS", IrExpr::Str("\n".to_string(), StrStyle::SingleQuoted)),
+            param_read,
+        ]);
+        assert!(
+            !dead_store_elim(&mut prog3),
+            "the param(\"\", \"x[*]\") expansion shape must also keep the IFS store"
+        );
+        assert_eq!(prog3.stmts.len(), 2, "param-shaped [*] must keep the IFS store");
+    }
+
+    #[test]
+    fn dce_keeps_store_read_only_by_a_let_arith_string() {
+        // x=5; if (( x > 3 )); then echo big; fi
+        //
+        // The `(( ))` / `let` condition reaches the DCE as a BARE-IDENTIFIER
+        // arithmetic string: `Call("exec", ["let", Array(["x > 3"])])`. The
+        // Str read scan only collects `$name` / `${name}` refs, so it saw NO
+        // read of `x`, judged the store dead and dropped `x=5` — which then
+        // made `never_written_read("x")` fold the cond's own read to `""`,
+        // so `(( x > 3 ))` evaluated `Number("") || 0` and the native zsh
+        // `echo big` became `echo small` (zsh-sh-go t73_zsh_arith_cond).
+        let prog = prog_of(vec![
+            assign("x", IrExpr::Int(5)),
+            IrStmt::If {
+                cond: IrExpr::Call {
+                    func: "exec".to_string(),
+                    args: vec![
+                        IrExpr::Str("let".to_string(), StrStyle::DoubleQuoted),
+                        IrExpr::Array(vec![IrExpr::Str(
+                            "x > 3".to_string(),
+                            StrStyle::DoubleQuoted,
+                        )]),
+                    ],
+                },
+                then: vec![IrStmt::Expr(IrExpr::Call {
+                    func: "builtin".to_string(),
+                    args: vec![
+                        IrExpr::Str("echo".to_string(), StrStyle::DoubleQuoted),
+                        IrExpr::Array(vec![IrExpr::Str(
+                            "big".to_string(),
+                            StrStyle::DoubleQuoted,
+                        )]),
+                    ],
+                })],
+                elsifs: vec![],
+                else_: vec![],
+            },
+        ]);
+        let mut prog = prog;
+        assert!(
+            !dead_store_elim(&mut prog),
+            "a `let` arith string reads its bare identifiers — the x store must survive"
+        );
+        assert_eq!(prog.stmts.len(), 2);
+    }
+
+    #[test]
     fn const_prop_folds_straight_line_arith_read() {
         // x=5; y=$(( x + 1 )); echo $y — the read of x is a NUMERIC
         // context (arith), the honesty rule allows the const fold; the
@@ -1994,5 +2688,41 @@ mod tests {
         } else {
             panic!("expected y assign");
         }
+    }
+
+    /// `export NAME` makes a store observable to CHILD PROCESSES, which the
+    /// read census cannot see — the declaration must guard the name, in BOTH
+    /// A1 shapes (the legacy Exec string and the builtin Call).
+    /// Regression for `X=…; export X; perl -e 'print $ENV{X}'` losing the
+    /// store (045_shell_calling_perl.sh).
+    #[test]
+    fn decl_guard_sees_both_shapes() {
+        let call_shape = IrStmt::Expr(IrExpr::Call {
+            func: "builtin".to_string(),
+            args: vec![
+                IrExpr::Str("export".to_string(), StrStyle::DoubleQuoted),
+                IrExpr::Array(vec![
+                    IrExpr::Str("X".to_string(), StrStyle::DoubleQuoted),
+                    IrExpr::Str("Y=1".to_string(), StrStyle::DoubleQuoted),
+                    IrExpr::Str("-p".to_string(), StrStyle::DoubleQuoted),
+                ]),
+            ],
+        });
+        let mut guarded: HashSet<String> = HashSet::new();
+        collect_decl_guard(&call_shape, &mut guarded);
+        assert!(guarded.contains("X"), "A1 Call shape not guarded: {guarded:?}");
+        assert!(!guarded.contains("Y"), "an assignment operand is not a name: {guarded:?}");
+        assert!(!guarded.contains("-p"), "a flag is not a name: {guarded:?}");
+
+        let exec_shape = IrStmt::Exec {
+            cmd: IrExpr::Str("export".to_string(), StrStyle::DoubleQuoted),
+            args: vec![IrExpr::Str("export Z".to_string(), StrStyle::DoubleQuoted)],
+            capture: None,
+            redirects: vec![],
+            env: vec![],
+        };
+        let mut guarded: HashSet<String> = HashSet::new();
+        collect_decl_guard(&exec_shape, &mut guarded);
+        assert!(guarded.contains("Z"), "legacy Exec shape not guarded: {guarded:?}");
     }
 }

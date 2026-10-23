@@ -56,7 +56,7 @@ pub fn shir_to_shir_json(prog: &IrProgram) -> String {
     // output is unchanged (Ident renders like a lifted Var read
     // everywhere; the estree arm emits the identifier directly).
     let numeric = crate::shir::numeric_lift_vars(&prog);
-    let string = crate::shir::string_lift_vars(&prog, &numeric);
+    let (string, _ascii) = crate::shir::string_lift_vars(&prog, &numeric);
     let (num, str) = crate::shir::analyze_loop_var_refs(&prog, &numeric, &string);
     let lifted: std::collections::HashSet<String> =
         num.union(&str).cloned().collect();
@@ -120,12 +120,32 @@ fn program_json(p: &IrProgram, contract_version: u32) -> Value {
 }
 
 fn sub_json(s: &IrSub) -> Value {
-    json!({
-        "type": "Sub",
-        "name": s.name,
-        "params": s.params,
-        "body": s.body.iter().map(stmt_json).collect::<Vec<_>>(),
-    })
+    let mut o = serde_json::Map::new();
+    o.insert("type".to_string(), json!("Sub"));
+    o.insert("name".to_string(), json!(s.name));
+    o.insert("params".to_string(), json!(s.params));
+    // Optional per-parameter defaults (core request
+    // cpp-sh-go-optional-param-20260815-172052). Emitted ONLY when the sub
+    // HAS defaults, so every existing emit stays byte-identical; `null`
+    // marks a required parameter in an otherwise defaulted list.
+    if !s.param_defaults.is_empty() {
+        o.insert(
+            "param_defaults".to_string(),
+            json!(s
+                .param_defaults
+                .iter()
+                .map(|d| match d {
+                    Some(e) => expr_json(e),
+                    None => Value::Null,
+                })
+                .collect::<Vec<_>>()),
+        );
+    }
+    o.insert(
+        "body".to_string(),
+        json!(s.body.iter().map(stmt_json).collect::<Vec<_>>()),
+    );
+    serde_json::Value::Object(o)
 }
 
 // ── Statements ───────────────────────────────────────────────────────
@@ -307,15 +327,20 @@ fn stmt_json(s: &IrStmt) -> Value {
         }),
         IrStmt::Function {
             name,
+            params,
             body,
             named_blocks,
         } => {
-            // `named_blocks` is emitted ONLY when non-empty: bash
-            // functions never have them, so every existing emit (and
+            // `params` / `named_blocks` are emitted ONLY when non-empty:
+            // bash functions have neither, so every existing emit (and
             // the frontends' byte-identical oracles) stays byte-identical.
+            // Absent means `[]` on the read side.
             let mut m = serde_json::Map::new();
             m.insert("type".to_string(), json!("Function"));
             m.insert("name".to_string(), json!(name));
+            if !params.is_empty() {
+                m.insert("params".to_string(), json!(params));
+            }
             m.insert("body".to_string(), json!(stmts_json(body)));
             if !named_blocks.is_empty() {
                 let blocks: serde_json::Map<String, serde_json::Value> = named_blocks
@@ -360,6 +385,11 @@ fn stmt_json(s: &IrStmt) -> Value {
         IrStmt::Expr(e) => json!({ "type": "Expr", "expr": expr_json(e) }),
         IrStmt::Label(name) => json!({ "type": "Label", "name": name }),
         IrStmt::Goto(name) => json!({ "type": "Goto", "name": name }),
+        IrStmt::Shaderize { var, start, end, step, op, body } => json!({
+            "type": "Shaderize", "var": var, "start": start,
+            "end": end, "step": step, "op": op,
+            "body": body.iter().map(stmt_json).collect::<Vec<_>>(),
+        }),
     }
 }
 
@@ -584,7 +614,7 @@ fn call_purity(func: &str, args: &[IrExpr]) -> &'static str {
         // PureCpu (namespace spec): no I/O, no state beyond args
         "contains" | "join" | "brace" | "idiv" | "imod" | "arith" | "arithEval" | "trimCapture"
         | "dirname" | "basename" | "not" | "guard" | "caseMatch" | "split" | "param"
-        | "callDirect" => "PureCpu",
+        | "callDirect" | "lit" => "PureCpu",
         // Emulable: implementable in a backend runtime (state/string/glob/fs-tests)
         "getVar" | "setVar" | "setLastExit" | "assign" | "test" | "grepText" | "listVar"
         | "setArray" | "setArrayAppend" | "arrayItems" | "arrayKeys" | "arrayLen"

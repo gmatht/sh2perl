@@ -129,7 +129,22 @@ fn merge_expansion_into_word(word: &mut Word, expansion: Word) -> bool {
             interp.parts.extend(parts);
             true
         }
-        _ => false,
+        _ => {
+            // Any other leading expansion word (`${a%.*}`, `$(cmd)`,
+            // `${m[k]}`...) glued to a following expansion: demote the
+            // leader to the first interpolation part instead of dropping
+            // the follower. Without this `${a%.*}${a#*.}` silently lost
+            // its second half (the game clock froze in whole seconds).
+            // Leaders with no part mapping (Array, BraceExpansion) keep
+            // the old refuse-and-break behaviour.
+            let leader = std::mem::replace(word, Word::Literal(String::new(), None));
+            let Some(mut new_parts) = expansion_into_parts(leader) else {
+                return false;
+            };
+            new_parts.extend(parts);
+            *word = Word::StringInterpolation(StringInterpolation { parts: new_parts }, None);
+            true
+        }
     }
 }
 
@@ -514,6 +529,9 @@ fn parse_word_inner(lexer: &mut Lexer) -> Result<Word, ParserError> {
             | Some(Token::While) | Some(Token::Until) | Some(Token::For)
             | Some(Token::Case) | Some(Token::Esac) | Some(Token::In)
             | Some(Token::Select) | Some(Token::Function) | Some(Token::Source)
+            // Word-INITIAL `true`/`false` may still continue (`false.sh`), so
+            // route them through the combine loop rather than ending the word.
+            | Some(Token::True) | Some(Token::False)
     ) {
         let mut combined = String::new();
         loop {
@@ -584,6 +602,10 @@ fn parse_word_inner(lexer: &mut Lexer) -> Result<Word, ParserError> {
                 | Some(Token::While) | Some(Token::Until) | Some(Token::For)
                 | Some(Token::Case) | Some(Token::Esac) | Some(Token::In)
                 | Some(Token::Select) | Some(Token::Function) | Some(Token::Source)
+                // `true`/`false` are reserved only as WHOLE words in bash; when
+                // the lexer's keyword token arrives mid-word (`/bin/false`,
+                // `a=true`) it is ordinary text and must continue the word.
+                | Some(Token::True) | Some(Token::False)
                 => {
                     // For $, check if the NEXT token is a variable name
                     // (Identifier or Number). If so, break out so that
@@ -1348,6 +1370,9 @@ fn parse_word_no_newline_skip_inner(lexer: &mut Lexer) -> Result<Word, ParserErr
             | Some(Token::While) | Some(Token::Until) | Some(Token::For)
             | Some(Token::Case) | Some(Token::Esac) | Some(Token::In)
             | Some(Token::Select) | Some(Token::Function) | Some(Token::Source)
+            // Word-INITIAL `true`/`false` may still continue (`false.sh`), so
+            // route them through the combine loop rather than ending the word.
+            | Some(Token::True) | Some(Token::False)
     ) {
         let mut combined = String::new();
         loop {
@@ -1425,6 +1450,10 @@ fn parse_word_no_newline_skip_inner(lexer: &mut Lexer) -> Result<Word, ParserErr
                 | Some(Token::While) | Some(Token::Until) | Some(Token::For)
                 | Some(Token::Case) | Some(Token::Esac) | Some(Token::In)
                 | Some(Token::Select) | Some(Token::Function) | Some(Token::Source)
+                // `true`/`false` are reserved only as WHOLE words in bash; when
+                // the lexer's keyword token arrives mid-word (`/bin/false`,
+                // `a=true`) it is ordinary text and must continue the word.
+                | Some(Token::True) | Some(Token::False)
                 => {
                     // For $, check if the NEXT token is a variable name
                     // (Identifier or Number). If so, break out so that
@@ -2092,6 +2121,14 @@ fn parse_word_no_newline_skip_inner(lexer: &mut Lexer) -> Result<Word, ParserErr
 }
 
 pub fn parse_variable_expansion(lexer: &mut Lexer) -> Result<Word, ParserError> {
+    let w = parse_variable_expansion_inner(lexer)?;
+    // A bare `${...}`: both operand kinds follow the unquoted word rule.
+    Ok(unescape_word_operands(w, false))
+}
+
+/// The parser proper; `parse_variable_expansion` wraps it to apply the
+/// operand backslash rules. Do not call this directly from new code.
+fn parse_variable_expansion_inner(lexer: &mut Lexer) -> Result<Word, ParserError> {
     match lexer.peek() {
         Some(Token::Dollar) => {
             lexer.next();
@@ -2402,71 +2439,15 @@ pub fn parse_variable_expansion(lexer: &mut Lexer) -> Result<Word, ParserError> 
                     },
                     None,
                 ));
-            } else if braced_content.contains(":-") {
-                eprintln!(
-                    "DEBUG parse_variable_expansion: found :- in braced_content='{}'",
-                    braced_content
-                );
-                // ${var:-default} - use default if var is empty
-                let colon_pos = braced_content.find(":-").unwrap();
-                let var_name = &braced_content[..colon_pos];
-                let default_val = &braced_content[colon_pos + 2..];
+            } else if let Some((var, op, operand)) = split_colon_operator(&braced_content) {
+                // `${v:-d}` / `${v:=d}` / `${v:+d}` / `${v:?d}` — only when
+                // the FIRST colon introduces the operator; a later `:-` is
+                // operand text (`${s:1:-1}`).
                 return Ok(Word::ParameterExpansion(
-                    ParameterExpansion {
-                        variable: var_name.to_string(),
-                        operator: ParameterExpansionOperator::DefaultValue(default_val.to_string()),
-                        is_mutable: true,
-                    },
+                    colon_operator_expansion(var, op, operand),
                     None,
                 ));
-            } else if braced_content.contains(":=") {
-                // ${var:=default} - assign default if var is empty
-                let colon_pos = braced_content.find(":=").unwrap();
-                let var_name = &braced_content[..colon_pos];
-                let default_val = &braced_content[colon_pos + 2..];
-                return Ok(Word::ParameterExpansion(
-                    ParameterExpansion {
-                        variable: var_name.to_string(),
-                        operator: ParameterExpansionOperator::AssignDefault(
-                            default_val.to_string(),
-                        ),
-                        is_mutable: true,
-                    },
-                    None,
-                ));
-            } else if braced_content.contains(":+") {
-                // ${var:+alt} - use alt if var is set and not empty
-                let colon_pos = braced_content.find(":+").unwrap();
-                let var_name = &braced_content[..colon_pos];
-                let alt_val = &braced_content[colon_pos + 2..];
-                return Ok(Word::ParameterExpansion(
-                    ParameterExpansion {
-                        variable: var_name.to_string(),
-                        operator: ParameterExpansionOperator::DefaultValue(alt_val.to_string()),
-                        is_mutable: true,
-                    },
-                    None,
-                ));
-            } else if braced_content.contains(":?") {
-                // ${var:?error} - error if var is empty
-                let colon_pos = braced_content.find(":?").unwrap();
-                let var_name = &braced_content[..colon_pos];
-                let error_msg = &braced_content[colon_pos + 2..];
-                return Ok(Word::ParameterExpansion(
-                    ParameterExpansion {
-                        variable: var_name.to_string(),
-                        operator: ParameterExpansionOperator::ErrorIfUnset(error_msg.to_string()),
-                        is_mutable: true,
-                    },
-                    None,
-                ));
-            } else if braced_content.contains(':')
-                && !braced_content.contains("::")
-                && !braced_content.contains(":-")
-                && !braced_content.contains(":=")
-                && !braced_content.contains(":+")
-                && !braced_content.contains(":?")
-            {
+            } else if braced_content.contains(':') && !braced_content.contains("::") {
                 // ${var:offset} or ${var:offset:length} - substring/array-slice
                 // The first colon must not be part of any two-char operator.
                 let colon_pos = braced_content.find(':').unwrap();
@@ -2912,44 +2893,9 @@ pub fn parse_variable_expansion(lexer: &mut Lexer) -> Result<Word, ParserError> 
                 }
                 content.push_str(&rest);
                 // Reuse the same analysis as DollarBraceAt (inline below)
-                if content.contains(":-") {
-                    let colon_pos = content.find(":-").unwrap();
-                    let var_name = &content[..colon_pos];
-                    let default_val = &content[colon_pos + 2..];
+                if let Some((var, op, operand)) = split_colon_operator(&content) {
                     Ok(Word::ParameterExpansion(
-                        ParameterExpansion {
-                            variable: var_name.to_string(),
-                            operator: ParameterExpansionOperator::DefaultValue(
-                                default_val.to_string(),
-                            ),
-                            is_mutable: true,
-                        },
-                        None,
-                    ))
-                } else if content.contains(":=") {
-                    let colon_pos = content.find(":=").unwrap();
-                    let var_name = &content[..colon_pos];
-                    let default_val = &content[colon_pos + 2..];
-                    Ok(Word::ParameterExpansion(
-                        ParameterExpansion {
-                            variable: var_name.to_string(),
-                            operator: ParameterExpansionOperator::AssignDefault(
-                                default_val.to_string(),
-                            ),
-                            is_mutable: true,
-                        },
-                        None,
-                    ))
-                } else if content.contains(":+") {
-                    let colon_pos = content.find(":+").unwrap();
-                    let var_name = &content[..colon_pos];
-                    let alt_val = &content[colon_pos + 2..];
-                    Ok(Word::ParameterExpansion(
-                        ParameterExpansion {
-                            variable: var_name.to_string(),
-                            operator: ParameterExpansionOperator::DefaultValue(alt_val.to_string()),
-                            is_mutable: true,
-                        },
+                        colon_operator_expansion(var, op, operand),
                         None,
                     ))
                 } else if let Some(minus_pos) = content.find('-') {
@@ -3020,13 +2966,7 @@ pub fn parse_variable_expansion(lexer: &mut Lexer) -> Result<Word, ParserError> 
                     } else {
                         Ok(Word::Variable(content, true, None))
                     }
-                } else if content.contains(':')
-                    && !content.contains("::")
-                    && !content.contains(":-")
-                    && !content.contains(":=")
-                    && !content.contains(":+")
-                    && !content.contains(":?")
-                {
+                } else if content.contains(':') && !content.contains("::") {
                     // ${*:offset} or ${*:offset:length} - array slice
                     let colon_pos = content.find(':').unwrap();
                     let var_name = &content[..colon_pos];
@@ -3080,44 +3020,9 @@ pub fn parse_variable_expansion(lexer: &mut Lexer) -> Result<Word, ParserError> 
                 content.push_str(&rest);
                 // Analyze the content using the same logic as the DollarBrace branch
                 // (inline analysis, same as lines ~1030-1275)
-                if content.contains(":-") {
-                    let colon_pos = content.find(":-").unwrap();
-                    let var_name = &content[..colon_pos];
-                    let default_val = &content[colon_pos + 2..];
+                if let Some((var, op, operand)) = split_colon_operator(&content) {
                     Ok(Word::ParameterExpansion(
-                        ParameterExpansion {
-                            variable: var_name.to_string(),
-                            operator: ParameterExpansionOperator::DefaultValue(
-                                default_val.to_string(),
-                            ),
-                            is_mutable: true,
-                        },
-                        None,
-                    ))
-                } else if content.contains(":=") {
-                    let colon_pos = content.find(":=").unwrap();
-                    let var_name = &content[..colon_pos];
-                    let default_val = &content[colon_pos + 2..];
-                    Ok(Word::ParameterExpansion(
-                        ParameterExpansion {
-                            variable: var_name.to_string(),
-                            operator: ParameterExpansionOperator::AssignDefault(
-                                default_val.to_string(),
-                            ),
-                            is_mutable: true,
-                        },
-                        None,
-                    ))
-                } else if content.contains(":+") {
-                    let colon_pos = content.find(":+").unwrap();
-                    let var_name = &content[..colon_pos];
-                    let alt_val = &content[colon_pos + 2..];
-                    Ok(Word::ParameterExpansion(
-                        ParameterExpansion {
-                            variable: var_name.to_string(),
-                            operator: ParameterExpansionOperator::DefaultValue(alt_val.to_string()),
-                            is_mutable: true,
-                        },
+                        colon_operator_expansion(var, op, operand),
                         None,
                     ))
                 } else if let Some(minus_pos) = content.find('-') {
@@ -3192,13 +3097,7 @@ pub fn parse_variable_expansion(lexer: &mut Lexer) -> Result<Word, ParserError> 
                     } else {
                         Ok(Word::Variable(content, true, None))
                     }
-                } else if content.contains(':')
-                    && !content.contains("::")
-                    && !content.contains(":-")
-                    && !content.contains(":=")
-                    && !content.contains(":+")
-                    && !content.contains(":?")
-                {
+                } else if content.contains(':') && !content.contains("::") {
                     // ${@:offset} or ${@:offset:length} - array slice
                     let colon_pos = content.find(':').unwrap();
                     let var_name = &content[..colon_pos];
@@ -3366,15 +3265,239 @@ fn parse_string_interpolation(lexer: &mut Lexer) -> Result<Word, ParserError> {
 }
 
 /// The double-quoted-string content preprocessing shared by both
-/// interpolation scanners: `\"` → `"`, `\\` → `\`, and backslash-newline
-/// line continuations are removed (the lexer's DoubleQuotedString regex
-/// captures them inside the token).
+/// interpolation scanners.
+///
+/// It resolves ONLY the two escapes that change how the content is SCANNED:
+/// `\"` → `"` (an escaped quote must not terminate or open anything) and
+/// backslash-newline line continuations (the lexer's DoubleQuotedString regex
+/// captures them inside the token). Every other escape is left intact for
+/// `scan_interpolation_parts`, which knows which of them is literal.
+///
+/// This has to be ONE left-to-right pass, not the chained `str::replace`
+/// calls it used to be. `.replace("\\\\", "\\")` collapses a doubled
+/// backslash but leaves the SINGLE remaining backslash in front of whatever
+/// followed the pair, so the scanner then re-read it as an escape of that
+/// character — a second, extra level of unescaping that bash never applies:
+/// (`printf '%s\n' "a\\$b"` prints `a\`: bash collapses `\\` to one
+/// literal backslash and then expands the unset `$b`; the collapsed text
+/// `a\$b` reached the scanner as an escaped dollar and printed the literal
+/// `a$b`). Measured against bash, the pre-pass corrupted EVERY `\\` followed
+/// by `$` or by a backtick.
+///
+/// It is also what makes the raw shIR contract able to tell two DIFFERENT
+/// shells apart. `parse_parameter_expansion_content` slices its operands out
+/// of this string verbatim, and bash applies exactly one level of backslash
+/// removal to a pattern/replacement (`${v/Q/\c}` → `c`, `${v/Q/\\c}` → `\c`,
+/// `${v/Q/\\\c}` → `\c`). While the pre-pass collapsed `\\`, those three
+/// sources all reached it as the same `\c`, so the shIR could not distinguish
+/// them and no renderer could be correct for all three.
 fn unescape_interpolation_content(content: &str) -> String {
-    content
-        .replace("\\\"", "\"")
-        .replace("\\\\", "\\")
-        .replace("\\\n", "")
-        .replace("\\\r\n", "")
+    let mut out = String::with_capacity(content.len());
+    let mut chars = content.chars().peekable();
+    // `${`...`}` nesting depth. INSIDE an expansion the `\"` pair is NOT
+    // collapsed: the operand's quote-escape count is part of the raw shIR
+    // contract (§5.7 of docs/backend-universal-contract.md) —
+    // `"${v/Q/\"}"` (bash replaces with `"`) must stay distinguishable
+    // from `"${v/Q/"}"` (bash exits 2) and from the bare `${v/Q/"}`
+    // (bash removes the quotes). Collapsing all three to operand `"` was
+    // a raw-shIR collision: one contract, two different shells.
+    let mut expansion_depth: usize = 0;
+    while let Some(c) = chars.next() {
+        if c != '\\' {
+            if c == '$' && chars.peek() == Some(&'{') {
+                out.push('$');
+                out.push(chars.next().unwrap());
+                expansion_depth += 1;
+                continue;
+            }
+            if expansion_depth > 0 {
+                match c {
+                    '{' => expansion_depth += 1,
+                    '}' => expansion_depth = expansion_depth.saturating_sub(1),
+                    _ => {}
+                }
+            }
+            out.push(c);
+            continue;
+        }
+        match chars.peek().copied() {
+            // `\"` — the quote is a literal of the content and cannot close
+            // (or reopen) anything. OUTSIDE `${...}` it collapses to `"`;
+            // INSIDE it stays `\"` so the operand keeps the source's escape
+            // count (the pattern consumers strip one level, per §5.7).
+            Some('"') if expansion_depth > 0 => {
+                chars.next();
+                out.push('\\');
+                out.push('"');
+            }
+            Some('"') => {
+                chars.next();
+                out.push('"');
+            }
+            // A backslash-newline line continuation disappears entirely.
+            Some('\n') => {
+                chars.next();
+            }
+            // CRLF continuation; a lone CR is ordinary text.
+            Some('\r') => {
+                let mut look = chars.clone();
+                look.next();
+                if look.peek() == Some(&'\n') {
+                    chars.next();
+                    chars.next();
+                } else {
+                    out.push('\\');
+                }
+            }
+            // EVERYTHING else — including `\$`, `\`` and a doubled `\\` —
+            // is handed to the scanner, which turns each of them into the
+            // right literal. Keeping the pair whole is what stops the
+            // leftover backslash from eating the following character.
+            Some(other) => {
+                chars.next();
+                out.push('\\');
+                out.push(other);
+            }
+            None => out.push('\\'),
+        }
+    }
+    out
+}
+
+/// The VALUE of a `:-` / `-` / `:=` / `=` / `:+` / `+` / `:?` / `?` operand
+/// is an ordinary WORD, so its backslashes follow the word rule of the
+/// enclosing context:
+///
+/// * inside double quotes only `\"` and `\\` lose the backslash and `\X` for
+///   any other X keeps it — `"${u:-\c}"` and `"${u:-\\c}"` both print `\c`,
+///   and `"${u:-\$c}"` prints the literal `$c` (measured);
+/// * in a bare word every `\X` loses the backslash — `${u:-\c}` prints `c`
+///   and `${u:-\\c}` prints `\c` (measured).
+fn unescape_value_operand(s: &str, in_dqs: bool) -> String {
+    let mut out = String::with_capacity(s.len());
+    let mut chars = s.chars();
+    while let Some(c) = chars.next() {
+        if c != '\\' {
+            out.push(c);
+            continue;
+        }
+        match chars.next() {
+            // A backslash-newline continuation disappears entirely.
+            Some('\n') => {}
+            Some(d) => {
+                if in_dqs {
+                    if !matches!(d, '"' | '\\') {
+                        out.push('\\');
+                    }
+                    out.push(d);
+                } else if d == '"' || d == '\'' {
+                    // A BARE word: the quote CHARACTERS are removed, their
+                    // content is literal (bash `${u:-"x"}` prints `x`,
+                    // measured). Without this the shIR kept operand `"x"`
+                    // — the same bytes the valid DQS `"${u:-\"x\"}"`
+                    // legitimately carries — one contract, two shells.
+                } else {
+                    out.push(d);
+                }
+            }
+            None => out.push('\\'),
+        }
+    }
+    out
+}
+
+/// Apply [`unescape_value_operand`] to a freshly parsed expansion's VALUE
+/// operands. Called through the wrappers on the two `${...}` parsers below, so
+/// no consumer of the AST can see the raw value text.
+///
+/// The PATTERN operands (`/`, `//`, `#`, `##`, `%`, `%%`) are deliberately left
+/// exactly as they were sliced out of the source. bash removes one level of
+/// backslash escaping from them (`"${v/Q/\c}"` replaces with `c`, `"${v/Q/\\c}"`
+/// with `\c`), but that removal belongs to the code that knows it is building a
+/// PATTERN, not here: a pattern's translation has to tell an escaped
+/// metacharacter from a live one — `${v/\*/x}` replaces a literal `*` while
+/// `${v/*/x}` replaces everything up to the first separator — and once the
+/// removal has run, `\*` and `*` are the same text. `glob_to_regex` /
+/// `repl_for_regex` in the renderer apply the removal where the distinction is
+/// still available.
+///
+/// Measured against bash for `\c`, `\\c`, `\\\c`, `\\\\c`, `\Q`, `\\Q`, `\ `,
+/// `\$` in every pattern operator, quoted and bare.
+fn unescape_expansion_operands(pe: &mut crate::ast::ParameterExpansion, in_dqs: bool) {
+    use crate::ast::ParameterExpansionOperator as Op;
+    match &mut pe.operator {
+        Op::DefaultValue(v) | Op::AssignDefault(v) | Op::ErrorIfUnset(v) => {
+            *v = unescape_value_operand(v, in_dqs);
+        }
+        _ => {}
+    }
+}
+
+/// Same, for a `Word` that came straight out of the source.
+fn unescape_word_operands(mut w: crate::ast::Word, in_dqs: bool) -> crate::ast::Word {
+    match &mut w {
+        crate::ast::Word::ParameterExpansion(pe, _) => unescape_expansion_operands(pe, in_dqs),
+        crate::ast::Word::StringInterpolation(si, _) => {
+            for part in si.parts.iter_mut() {
+                if let crate::ast::StringPart::ParameterExpansion(pe) = part {
+                    unescape_expansion_operands(pe, in_dqs);
+                }
+            }
+        }
+        _ => {}
+    }
+    w
+}
+
+/// A raw (unescaped) `"` inside `${...}` of a DOUBLE-QUOTED string is a
+/// bash quote TOGGLE that spans the expansion. bash lexes the whole WORD
+/// with quote toggling and then removes the toggled quotes, so:
+///
+/// * `"${u:-"x"}"` is ONE word whose net operand is `x` (bash prints
+///   `x`) — an even number of raw quotes, stripped here;
+/// * `"${v/Q/"}"` leaves the word unterminated (the `}` lands outside the
+///   expansion) and bash exits 2 — an odd number, a parse error.
+///
+/// `\"` (odd backslash parity) is the ESCAPED form and is left whole —
+/// the operand's escape count is part of the raw shIR contract (§5.7).
+/// Accepting raw and escaped quotes as the same operand was a raw-shIR
+/// collision: `"${v/\"/Z}"` (replaces a literal `"`) and `"${v/"/Z}"`
+/// (bash exit 2) emitted byte-identical shIR.
+fn strip_toggle_dquotes(s: &str) -> Result<String, ParserError> {
+    let b = s.as_bytes();
+    let mut out = String::with_capacity(s.len());
+    let mut raw = 0usize;
+    let mut i = 0;
+    while i < b.len() {
+        match b[i] {
+            b'\\' => {
+                // An escape pair: the escaped char cannot be a raw quote.
+                if i + 1 < b.len() {
+                    out.push('\\');
+                    out.push(b[i + 1] as char);
+                    i += 2;
+                } else {
+                    out.push('\\');
+                    i += 1;
+                }
+            }
+            b'"' => {
+                raw += 1;
+                i += 1;
+            }
+            _ => {
+                let ch = s[i..].chars().next().unwrap_or('?');
+                out.push(ch);
+                i += ch.len_utf8();
+            }
+        }
+    }
+    if raw % 2 == 1 {
+        return Err(ParserError::InvalidSyntax(
+            "unterminated quote inside `${...}` in a double-quoted string".to_string(),
+        ));
+    }
+    Ok(out)
 }
 
 /// Scan a double-quoted string's content into interpolation parts:
@@ -3395,44 +3518,22 @@ fn scan_interpolation_parts(content: &str) -> Result<Vec<StringPart>, ParserErro
 
     while i < content.len() {
         let _ch = content.chars().nth(i).unwrap_or('?');
-        if content[i..].starts_with("\\\\`") {
-            // We found an escaped backtick command substitution
-            // First, add any accumulated literal text
-            if !current_literal.is_empty() {
-                parts.push(StringPart::Literal(current_literal.clone()));
-                current_literal.clear();
-            }
-
-            // Find the closing escaped backtick
-            i += 3; // skip the \\`
-            let cmd_start = i;
-            while i < content.len() && !content[i..].starts_with("\\\\`") {
-                let ch = content[i..].chars().next().unwrap_or('?');
-                i += ch.len_utf8();
-            }
-
-            if i < content.len() {
-                // We found a complete escaped command substitution
-                let cmd_content = &content[cmd_start..i];
-                i += 3; // skip the closing \\`
-
-                // Parse the command content as a pipeline (to handle pipes)
-                if let Ok(cmd) = crate::parser::commands::parse_pipeline_from_text(cmd_content) {
-                    parts.push(StringPart::CommandSubstitution(Box::new(cmd)));
-                } else {
-                    // Fall back to treating it as a literal
-                    parts.push(StringPart::Literal(format!("\\\\`{}\\\\`", cmd_content)));
-                }
-            } else {
-                // Unmatched escaped backtick (`\\\`` = escaped backslash
-                // + escaped backtick in a DQS): bash consumes BOTH escapes —
-                // `\\` → `\` and `\`` → a literal backtick — so the
-                // literal text is `\`` (one backslash + backtick), NOT the
-                // raw `\\\``. (echo-with-escaped-backtick.sh: top-level
-                // DQS `\`` with no closing pair.)
-                parts.push(StringPart::Literal("\\`".to_string()));
-                i = cmd_start;
-            }
+        if content[i..].starts_with("\\\\") {
+            // A literal backslash. The pre-pass leaves `\\` alone on purpose
+            // (see `unescape_interpolation_content`); consuming the pair HERE
+            // rather than there is what keeps the pair's meaning local, so
+            // whatever follows it is still scanned normally: "a\\$b" is a
+            // literal backslash followed by the expansion of `$b`, and
+            // "a\\`x`" is a literal backslash followed by a command
+            // substitution.
+            //
+            // This arm has to stay FIRST among the backslash arms. In the old
+            // pre-collapsed form `\\`` meant "an escaped backtick
+            // substitution", and it was read as exactly that, so
+            // "a\\`echo hi\\`b" ran `echo hi` where bash prints a backslash
+            // followed by the substitution's output (measured).
+            current_literal.push('\\');
+            i += 2;
         } else if content[i..].starts_with("\\`") {
             // We found a single-escaped backtick command substitution
             // First, add any accumulated literal text
@@ -3682,6 +3783,12 @@ fn scan_interpolation_parts(content: &str) -> Result<Vec<StringPart>, ParserErro
                     // We found a complete parameter expansion
                     let expansion_content = &content[expansion_start..i - 1]; // -1 to exclude the closing }
 
+                    // A raw `"` toggles the quoting across the expansion:
+                    // stripped when balanced, a parse error (bash exit 2)
+                    // when not (see strip_toggle_dquotes).
+                    let expansion_content = strip_toggle_dquotes(expansion_content)?;
+                    let expansion_content = expansion_content.as_str();
+
                     // Parse the parameter expansion content
                     if let Ok(expansion_word) = parse_parameter_expansion_content(expansion_content)
                     {
@@ -3858,6 +3965,13 @@ fn scan_interpolation_parts(content: &str) -> Result<Vec<StringPart>, ParserErro
 
                 if brace_count == 0 {
                     let expansion_content = &content[expansion_start..i - 1];
+                    // Same rule as the identical arm in
+                    // parse_string_interpolation: a raw `"` toggles the
+                    // quoting across the expansion — stripped when
+                    // balanced, bash's exit 2 when not (see
+                    // strip_toggle_dquotes).
+                    let expansion_content = strip_toggle_dquotes(expansion_content)?;
+                    let expansion_content = expansion_content.as_str();
                     if let Ok(expansion_word) = parse_parameter_expansion_content(expansion_content)
                     {
                         parts.push(StringPart::ParameterExpansion(expansion_word));
@@ -4031,7 +4145,59 @@ fn split_zsh_subscript_flag(key: &str) -> Option<(String, String)> {
     Some((flag_text.to_string(), rest[close + 1..].to_string()))
 }
 
+/// Recognise a `:`-prefixed operator (`:-`, `:=`, `:+`, `:?`) at the FIRST
+/// colon of the body only. Bash takes the variable name as the maximal
+/// plain-name prefix, so a colon later in the text belongs to the operand:
+/// `${s:1:-1}` is a substring whose length is `-1`, NOT `${s:1:-1}` with
+/// default `1`. Splitting on the first `:-` anywhere conflated the two and
+/// discarded the sign of the length (zig-20261021-param-lowering-gaps §2).
+///
+/// Returns `(name, op, operand)`; `None` when the first colon does not
+/// introduce one of the four operators (a substring/array slice instead).
+fn split_colon_operator(content: &str) -> Option<(&str, &'static str, &str)> {
+    let cp = content.find(':')?;
+    let rest = &content[cp + 1..];
+    let op = match rest.as_bytes().first().copied()? {
+        b'-' => ":-",
+        b'=' => ":=",
+        b'+' => ":+",
+        b'?' => ":?",
+        _ => return None,
+    };
+    Some((&content[..cp], op, &rest[1..]))
+}
+
+/// Build the [`ParameterExpansion`] for a `split_colon_operator` result.
+/// `:+` maps to [`ParameterExpansionOperator::UseAlternative`] with the
+/// non-empty test — folding it into `:-` (as the parser used to) makes the
+/// A1 unable to distinguish `${x:+y}` from `${x:-y}` in every backend.
+fn colon_operator_expansion(var: &str, op: &str, operand: &str) -> ParameterExpansion {
+    let operator = match op {
+        ":=" => ParameterExpansionOperator::AssignDefault(operand.to_string()),
+        ":+" => ParameterExpansionOperator::UseAlternative(operand.to_string(), true),
+        ":?" => ParameterExpansionOperator::ErrorIfUnset(operand.to_string()),
+        _ => ParameterExpansionOperator::DefaultValue(operand.to_string()),
+    };
+    ParameterExpansion {
+        variable: var.to_string(),
+        operator,
+        is_mutable: true,
+    }
+}
+
 pub fn parse_parameter_expansion_content(content: &str) -> Result<ParameterExpansion, ParserError> {
+    let mut pe = parse_parameter_expansion_content_inner(content)?;
+    // A double-quoted `${...}`: the VALUE operand follows the double-quote
+    // rule, the pattern operands the pattern rule (see the helpers above).
+    unescape_expansion_operands(&mut pe, true);
+    Ok(pe)
+}
+
+/// The parser proper; `parse_parameter_expansion_content` wraps it to apply
+/// the operand backslash rules. Do not call this directly from new code.
+fn parse_parameter_expansion_content_inner(
+    content: &str,
+) -> Result<ParameterExpansion, ParserError> {
     // Parse parameter expansion content like "arr[1]", "map[foo]", "#arr[@]", etc.
 
     // zsh `${(flags)...}` flag prefix (core request
@@ -4099,46 +4265,11 @@ pub fn parse_parameter_expansion_content(content: &str) -> Result<ParameterExpan
         });
     }
 
-    // Check for parameter expansion operators with colon prefix BEFORE array access
-    if content.contains(":-") {
-        let parts: Vec<&str> = content.splitn(2, ":-").collect();
-        if parts.len() == 2 {
-            return Ok(ParameterExpansion {
-                variable: parts[0].to_string(),
-                operator: ParameterExpansionOperator::DefaultValue(parts[1].to_string()),
-                is_mutable: true,
-            });
-        }
-    }
-    if content.contains(":=") {
-        let parts: Vec<&str> = content.splitn(2, ":=").collect();
-        if parts.len() == 2 {
-            return Ok(ParameterExpansion {
-                variable: parts[0].to_string(),
-                operator: ParameterExpansionOperator::AssignDefault(parts[1].to_string()),
-                is_mutable: true,
-            });
-        }
-    }
-    if content.contains(":+") {
-        let parts: Vec<&str> = content.splitn(2, ":+").collect();
-        if parts.len() == 2 {
-            return Ok(ParameterExpansion {
-                variable: parts[0].to_string(),
-                operator: ParameterExpansionOperator::DefaultValue(parts[1].to_string()),
-                is_mutable: true,
-            });
-        }
-    }
-    if content.contains(":?") {
-        let parts: Vec<&str> = content.splitn(2, ":?").collect();
-        if parts.len() == 2 {
-            return Ok(ParameterExpansion {
-                variable: parts[0].to_string(),
-                operator: ParameterExpansionOperator::ErrorIfUnset(parts[1].to_string()),
-                is_mutable: true,
-            });
-        }
+    // Check for parameter expansion operators with colon prefix BEFORE array access.
+    // Only the FIRST colon can introduce one (`${s:1:-1}` is a slice: the
+    // `-1` is the length, not a `:-` default).
+    if let Some((var, op, operand)) = split_colon_operator(content) {
+        return Ok(colon_operator_expansion(var, op, operand));
     }
 
     // Check for ${var:offset} or ${var:offset:length} - substring/array-slice
@@ -4347,10 +4478,6 @@ pub fn parse_parameter_expansion_content(content: &str) -> Result<ParameterExpan
         && !content.contains('[')
         && !content.contains(']')
         && !content.contains("::")
-        && !content.contains(":-")
-        && !content.contains(":=")
-        && !content.contains(":+")
-        && !content.contains(":?")
         && !content.contains('%')
         && !content.contains('#')
         && !content.contains('/')
@@ -4484,42 +4611,29 @@ pub fn parse_parameter_expansion_content(content: &str) -> Result<ParameterExpan
                 is_mutable: true,
             })
         }
-    } else if content.contains(":-") {
-        let parts: Vec<&str> = content.splitn(2, ":-").collect();
-        if parts.len() == 2 {
+    } else if let Some((var, op, operand)) = split_colon_operator(content) {
+        Ok(colon_operator_expansion(var, op, operand))
+    } else if content.contains('+')
+        && !content.contains('%')
+        && !content.contains('#')
+        && !content.contains('/')
+        && !content.contains('!')
+        && !content.contains(':')
+    {
+        // ${var+word} — the ALTERNATE word when var is SET (bare `+`;
+        // set-but-empty counts, which is strictly weaker than `:+`).
+        // Without this arm the operator stayed GLUED to the name, so the
+        // A1 carried `param("", "E+d")` and every backend read a variable
+        // literally named `E+d`: the Perl renderer emitted `(${E+d})`,
+        // which does not compile under `use strict`, and the ESTree read
+        // an empty store entry. `ast_words` already distinguishes `+`
+        // from `:+` via UseAlternative's `need_nonempty`, so only the
+        // parser was missing.
+        let parts: Vec<&str> = content.splitn(2, '+').collect();
+        if parts.len() == 2 && !parts[0].is_empty() {
             Ok(ParameterExpansion {
                 variable: parts[0].to_string(),
-                operator: ParameterExpansionOperator::DefaultValue(parts[1].to_string()),
-                is_mutable: true,
-            })
-        } else {
-            Ok(ParameterExpansion {
-                variable: content.to_string(),
-                operator: ParameterExpansionOperator::None,
-                is_mutable: true,
-            })
-        }
-    } else if content.contains(":=") {
-        let parts: Vec<&str> = content.splitn(2, ":=").collect();
-        if parts.len() == 2 {
-            Ok(ParameterExpansion {
-                variable: parts[0].to_string(),
-                operator: ParameterExpansionOperator::AssignDefault(parts[1].to_string()),
-                is_mutable: true,
-            })
-        } else {
-            Ok(ParameterExpansion {
-                variable: content.to_string(),
-                operator: ParameterExpansionOperator::None,
-                is_mutable: true,
-            })
-        }
-    } else if content.contains(":?") {
-        let parts: Vec<&str> = content.splitn(2, ":?").collect();
-        if parts.len() == 2 {
-            Ok(ParameterExpansion {
-                variable: parts[0].to_string(),
-                operator: ParameterExpansionOperator::ErrorIfUnset(parts[1].to_string()),
+                operator: ParameterExpansionOperator::UseAlternative(parts[1].to_string(), false),
                 is_mutable: true,
             })
         } else {
@@ -4633,9 +4747,15 @@ fn parse_ansic_quoted_string(lexer: &mut Lexer) -> Result<Word, ParserError> {
                     'v' => result.push('\x0B'), // Vertical tab
                     '\\' => result.push('\\'),  // Backslash
                     '\'' => result.push('\''),  // Single quote
-                    '"' => result.push('"'),    // Double quote
-                    '?' => result.push('?'),    // Question mark
-                    '0' => result.push('\0'),   // Null byte
+                    '"' => result.push('"'),    // Double quote                    '?' => result.push('?'), // Question mark
+                    // bash STRIPS NUL bytes out of a `$'…'` string
+                    // (documented: "NUL characters are ignored"), so
+                    // `$'\0'`/`$'\x00'` are the empty string. Emitting a
+                    // literal NUL flipped realpath-cmdsub's
+                    // `[[ "$stdout" == *$'\x00'* ]]` guard: bash's empty
+                    // pattern `**` matches everything (od branch taken),
+                    // while the NUL pattern matched nothing.
+                    '0' => {}
                     'x' => {
                         // Hex escape: \xHH
                         let mut hex_chars = String::new();
@@ -4656,7 +4776,10 @@ fn parse_ansic_quoted_string(lexer: &mut Lexer) -> Result<Word, ParserError> {
                             }
                         }
                         if let Ok(byte_val) = u8::from_str_radix(&hex_chars, 16) {
-                            result.push(byte_val as char);
+                            // NUL stripped, as above
+                            if byte_val != 0 {
+                                result.push(byte_val as char);
+                            }
                         } else {
                             return Err(ParserError::InvalidSyntax(format!(
                                 "Invalid hex value: {}",
@@ -4771,9 +4894,44 @@ fn parse_brace_expansion(lexer: &mut Lexer) -> Result<Word, ParserError> {
     // should be merged into a single BraceItem::Literal.
     let mut acc: Option<String> = None;
 
-    /// Helper: flush the accumulator as a BraceItem::Literal.
-    fn flush_acc(items: &mut Vec<BraceItem>, acc: &mut Option<String>) {
+    // Track whether the current comma-separated alternative is a compound
+    // (has multiple parts: text + nested brace, or nested brace + text, etc.).
+    // When acc has content and we encounter a non-literal item (BraceOpen or
+    // Range), the literal text and the following expansion belong to the SAME
+    // alternative, so they must be grouped into a BraceItem::Compound rather
+    // than flushed as separate top-level items.
+    let mut compound: Option<Vec<BraceItem>> = None;
+
+    /// Move the accumulated literal text into the running compound (creating
+    /// it if needed). Called when a non-literal item follows accumulated text
+    /// in the same alternative — the text becomes a Literal part of the
+    /// compound instead of a standalone item.
+    fn acc_to_compound(
+        compound: &mut Option<Vec<BraceItem>>,
+        acc: &mut Option<String>,
+    ) {
         if let Some(text) = acc.take() {
+            if !text.is_empty() {
+                compound.get_or_insert_with(Vec::new).push(BraceItem::Literal(text));
+            }
+        }
+    }
+
+    /// Flush the current alternative: either a Compound (if parts were
+    /// collected) or a bare Literal (if only acc text remains).
+    fn flush_current(
+        items: &mut Vec<BraceItem>,
+        compound: &mut Option<Vec<BraceItem>>,
+        acc: &mut Option<String>,
+    ) {
+        acc_to_compound(compound, acc);
+        if let Some(parts) = compound.take() {
+            if parts.len() == 1 {
+                items.push(parts.into_iter().next().unwrap());
+            } else {
+                items.push(BraceItem::Compound(parts));
+            }
+        } else if let Some(text) = acc.take() {
             if !text.is_empty() {
                 items.push(BraceItem::Literal(text));
             }
@@ -4784,7 +4942,7 @@ fn parse_brace_expansion(lexer: &mut Lexer) -> Result<Word, ParserError> {
     loop {
         match lexer.peek() {
             Some(Token::BraceClose) => {
-                flush_acc(&mut items, &mut acc);
+                flush_current(&mut items, &mut compound, &mut acc);
                 lexer.next(); // consume '}'
                 break;
             }
@@ -4793,7 +4951,7 @@ fn parse_brace_expansion(lexer: &mut Lexer) -> Result<Word, ParserError> {
 
                 // Check if this is a range (look for ..)
                 if matches!(lexer.peek(), Some(Token::Range)) {
-                    flush_acc(&mut items, &mut acc);
+                    acc_to_compound(&mut compound, &mut acc);
                     lexer.next(); // consume '..'
 
                     if let Some(Token::Number) | Some(Token::PaddedNumber) = lexer.peek() {
@@ -4805,7 +4963,7 @@ fn parse_brace_expansion(lexer: &mut Lexer) -> Result<Word, ParserError> {
 
                             if let Some(Token::Number) | Some(Token::PaddedNumber) = lexer.peek() {
                                 let step = lexer.get_number_text()?;
-                                items.push(BraceItem::Range(BraceRange {
+                                compound.get_or_insert_with(Vec::new).push(BraceItem::Range(BraceRange {
                                     start,
                                     end,
                                     step: Some(step),
@@ -4818,7 +4976,7 @@ fn parse_brace_expansion(lexer: &mut Lexer) -> Result<Word, ParserError> {
                                 ));
                             }
                         } else {
-                            items.push(BraceItem::Range(BraceRange {
+                            compound.get_or_insert_with(Vec::new).push(BraceItem::Range(BraceRange {
                                 start,
                                 end,
                                 step: None,
@@ -4841,7 +4999,7 @@ fn parse_brace_expansion(lexer: &mut Lexer) -> Result<Word, ParserError> {
 
                 // Check if this is a range (look for ..)
                 if matches!(lexer.peek(), Some(Token::Range)) {
-                    flush_acc(&mut items, &mut acc);
+                    acc_to_compound(&mut compound, &mut acc);
                     lexer.next(); // consume '..'
 
                     if let Some(Token::Identifier) = lexer.peek() {
@@ -4853,7 +5011,7 @@ fn parse_brace_expansion(lexer: &mut Lexer) -> Result<Word, ParserError> {
 
                             if let Some(Token::Number) | Some(Token::PaddedNumber) = lexer.peek() {
                                 let step = lexer.get_number_text()?;
-                                items.push(BraceItem::Range(BraceRange {
+                                compound.get_or_insert_with(Vec::new).push(BraceItem::Range(BraceRange {
                                     start: text,
                                     end,
                                     step: Some(step),
@@ -4867,7 +5025,7 @@ fn parse_brace_expansion(lexer: &mut Lexer) -> Result<Word, ParserError> {
                                 ));
                             }
                         } else {
-                            items.push(BraceItem::Range(BraceRange {
+                            compound.get_or_insert_with(Vec::new).push(BraceItem::Range(BraceRange {
                                 start: text,
                                 end,
                                 step: None,
@@ -4886,10 +5044,13 @@ fn parse_brace_expansion(lexer: &mut Lexer) -> Result<Word, ParserError> {
                 }
             }
             Some(Token::BraceOpen) => {
-                flush_acc(&mut items, &mut acc);
+                // A nested brace following accumulated text (or another
+                // expansion) in the same alternative must be part of a
+                // Compound, not a separate top-level item.
+                acc_to_compound(&mut compound, &mut acc);
                 let nested = parse_brace_expansion(lexer)?;
                 if let Word::BraceExpansion(be, _) = nested {
-                    items.push(BraceItem::Nested(Box::new(be)));
+                    compound.get_or_insert_with(Vec::new).push(BraceItem::Nested(Box::new(be)));
                 } else {
                     return Err(ParserError::InvalidSyntax(
                         "Expected brace expansion from nested brace".to_string(),
@@ -4897,8 +5058,8 @@ fn parse_brace_expansion(lexer: &mut Lexer) -> Result<Word, ParserError> {
                 }
             }
             Some(Token::Comma) => {
-                // Comma terminates the current accumulated item.
-                flush_acc(&mut items, &mut acc);
+                // Comma terminates the current alternative (compound or literal).
+                flush_current(&mut items, &mut compound, &mut acc);
                 lexer.next(); // consume ','
             }
             Some(
@@ -4933,7 +5094,7 @@ fn parse_brace_expansion(lexer: &mut Lexer) -> Result<Word, ParserError> {
                 acc.get_or_insert_with(String::new).push_str(&text);
             }
             None => {
-                flush_acc(&mut items, &mut acc);
+                flush_current(&mut items, &mut compound, &mut acc);
                 break;
             }
             _ => {
@@ -4942,15 +5103,15 @@ fn parse_brace_expansion(lexer: &mut Lexer) -> Result<Word, ParserError> {
                     acc.get_or_insert_with(String::new).push_str(&text);
                     lexer.next();
                 } else {
-                    flush_acc(&mut items, &mut acc);
+                    flush_current(&mut items, &mut compound, &mut acc);
                     break;
                 }
             }
         }
     }
 
-    // Flush any remaining accumulated text
-    flush_acc(&mut items, &mut acc);
+    // Flush any remaining accumulated text / compound
+    flush_current(&mut items, &mut compound, &mut acc);
 
     // bash: a RANGE is only expanded when it is the ENTIRE brace content
     // (`{1..5}` → 1..5). A brace with a top-level comma (`{1..3,7..9}`)
@@ -5580,4 +5741,249 @@ fn parse_simple_command_from_text(text: &str) -> Result<Command, ParserError> {
     });
 
     Ok(cmd)
+}
+
+
+#[cfg(test)]
+mod backslash_operand_tests {
+    use super::*;
+    use crate::ast::{ParameterExpansionOperator as Op, StringPart};
+
+    fn params(body: &str) -> crate::ast::ParameterExpansion {
+        parse_parameter_expansion_content(body).expect("parses")
+    }
+
+    /// THE reason the raw contract has to keep the source's backslashes: bash
+    /// removes exactly one level from a pattern/replacement, so these four
+    /// sources are FOUR different expansions. Before the double-quote pre-pass
+    /// stopped collapsing `\\`, all of them reached the operand as the same
+    /// `\c`, and no renderer could be right for more than one.
+    #[test]
+    fn a_pattern_operand_keeps_the_sources_backslash_count() {
+        for (body, want_pat, want_rep) in [
+            (r"v/Q/\c", "Q", r"\c"),
+            (r"v/Q/\\c", "Q", r"\\c"),
+            (r"v/Q/\\\c", "Q", r"\\\c"),
+            (r"v/Q/\\\\c", "Q", r"\\\\c"),
+            (r"v/\Q/Z", r"\Q", "Z"),
+            (r"v/\\Q/Z", r"\\Q", "Z"),
+            (r"v/Q/\$c", "Q", r"\$c"),
+            (r"v/Q/\\$c", "Q", r"\\$c"),
+        ] {
+            match params(body).operator {
+                Op::SubstituteFirst(p, r) => {
+                    assert_eq!(p, want_pat, "pattern of {body}");
+                    assert_eq!(r, want_rep, "replacement of {body}");
+                }
+                other => panic!("{body}: expected a / substitution, got {other:?}"),
+            }
+        }
+        // The prefix/suffix operators take the same treatment.
+        match params(r"v#\Q").operator {
+            Op::RemoveShortestPrefix(p) => assert_eq!(p, r"\Q"),
+            other => panic!("expected a # removal, got {other:?}"),
+        }
+        match params(r"v##*[/\\]").operator {
+            Op::RemoveLongestPrefix(p) => assert_eq!(p, r"*[/\\]"),
+            other => panic!("expected a ## removal, got {other:?}"),
+        }
+    }
+
+    /// A `:-`-family VALUE is an ordinary word, so it follows the quoting
+    /// context: inside double quotes `\c` keeps its backslash, in a bare word
+    /// it loses it (measured against bash, both directions).
+    #[test]
+    fn a_default_value_follows_the_quoting_context() {
+        let dqs = |body: &str| match params(body).operator {
+            Op::DefaultValue(v) => v,
+            other => panic!("expected a :- default, got {other:?}"),
+        };
+        assert_eq!(dqs(r"u:-\c"), r"\c", "double-quoted `\\c` keeps it");
+        assert_eq!(dqs(r"u:-\\c"), r"\c", "double-quoted `\\\\c` collapses");
+        assert_eq!(dqs(r"u:-\\\c"), r"\\c");
+        assert_eq!(dqs(r"u:-\$c"), r"\$c", "the escape survives for `$`");
+        assert_eq!(dqs(r"u:-\ "), r"\ ");
+        assert_eq!(dqs(r"u:-\ "), r"\ ");
+
+        let bare = |s: &str| match parse_variable_expansion(&mut Lexer::new(s))
+            .expect("parses")
+        {
+            crate::ast::Word::ParameterExpansion(pe, _) => match pe.operator {
+                Op::DefaultValue(v) => v,
+                other => panic!("expected a :- default, got {other:?}"),
+            },
+            other => panic!("expected a parameter expansion, got {other:?}"),
+        };
+        assert_eq!(bare(r"${u:-\c}"), "c", "unquoted `\\c` loses it");
+        assert_eq!(bare(r"${u:-\\c}"), r"\c", "unquoted `\\\\c` collapses");
+        assert_eq!(bare(r"${u:-\\\c}"), r"\c");
+    }
+
+    /// `"a\\$b"` is a literal backslash followed by the expansion of `$b`
+    /// (bash prints `a\` when `b` is unset). The pre-pass used to collapse
+    /// `\\` first, so the scanner then read the leftover `\$` as an escaped
+    /// dollar and printed the literal `a$b`.
+    #[test]
+    fn a_doubled_backslash_does_not_escape_the_dollar_after_it() {
+        let parts = scan_interpolation_parts(&unescape_interpolation_content(r"a\\$b")).unwrap();
+        assert_eq!(
+            parts,
+            vec![
+                StringPart::Literal(r"a\".to_string()),
+                StringPart::Variable("b".to_string()),
+            ]
+        );
+    }
+
+    /// `"a\\`echo hi\\`b"` is a literal backslash followed by a command
+    /// substitution (bash prints `a\` + the substitution's output + `b`). The
+    /// old collapsed form `\\`` meant "escaped backtick substitution" and was
+    /// read as one, so the backslash vanished into a cmdsub delimiter.
+    #[test]
+    fn a_doubled_backslash_before_a_backtick_is_a_literal_backslash() {
+        let content = unescape_interpolation_content(r"a\\`echo hi\\`b");
+        let parts = scan_interpolation_parts(&content).unwrap();
+        assert_eq!(parts.len(), 3, "literal, substitution, literal: {parts:?}");
+        assert_eq!(parts[0], StringPart::Literal(r"a\".to_string()));
+        assert!(matches!(parts[1], StringPart::CommandSubstitution(_)));
+        assert_eq!(parts[2], StringPart::Literal("b".to_string()));
+    }
+
+    /// A raw `"` inside `${...}` of a double-quoted string is a quote
+    /// TOGGLE that spans the expansion: balanced → the toggled quotes are
+    /// removed (`"${u:-"x"}"` is ONE word with net operand `x`, bash
+    /// prints `x`), unbalanced → bash exits 2 (`"${v/Q/"}"`), and `\"`
+    /// is the escaped, valid form kept whole. All three used to collapse
+    /// to one operand, so the raw shIR could not tell a working shell
+    /// from a broken one.
+    #[test]
+    fn a_raw_dquote_toggles_or_errors_never_collides() {
+        // balanced: the toggled quotes are removed
+        assert_eq!(strip_toggle_dquotes(r#"u:-"x""#).unwrap(), "u:-x");
+        // unbalanced: bash's exit 2 is a parse error, not an operand
+        assert!(strip_toggle_dquotes(r#"v/Q/""#).is_err());
+        assert!(strip_toggle_dquotes(r#"v/Q/a"b"#).is_err());
+        // the escaped form is kept whole (the operand's escape count is
+        // the raw-shIR contract)
+        assert_eq!(strip_toggle_dquotes(r#"v/Q/\""#).unwrap(), r#"v/Q/\""#);
+        assert_eq!(strip_toggle_dquotes(r#"v/Q/a\"b"#).unwrap(), r#"v/Q/a\"b"#);
+        // `\\` is an escaped backslash, so the `"` after it is RAW
+        assert!(strip_toggle_dquotes(r#"v/Q/a\\""#).is_err());
+
+        // scan level: the balanced toggle parses to the NET operand
+        let parts =
+            scan_interpolation_parts(&unescape_interpolation_content(r#"${u:-"x"}"#)).unwrap();
+        assert_eq!(parts.len(), 1, "{parts:?}");
+        match &parts[0] {
+            StringPart::ParameterExpansion(pe) => match &pe.operator {
+                Op::DefaultValue(v) => assert_eq!(v, "x"),
+                other => panic!("expected a :- default, got {other:?}"),
+            },
+            other => panic!("expected a parameter expansion, got {other:?}"),
+        }
+        // the unbalanced one is the parse error bash has
+        assert!(scan_interpolation_parts(&unescape_interpolation_content(r#"${v/Q/"}"#)).is_err());
+        // the escaped quote keeps its escape and is NOT an error
+        let parts =
+            scan_interpolation_parts(&unescape_interpolation_content(r#"${v/Q/\"}"#)).unwrap();
+        match &parts[0] {
+            StringPart::ParameterExpansion(pe) => match &pe.operator {
+                Op::SubstituteFirst(_, r) => assert_eq!(r, r#"\""#),
+                other => panic!("expected a / substitution, got {other:?}"),
+            },
+            other => panic!("expected a parameter expansion, got {other:?}"),
+        }
+    }
+}
+
+/// Regression pins for the two colon-operator information losses filed as
+/// `zig-20261021-param-lowering-gaps`.
+#[cfg(test)]
+mod colon_operator_tests {
+    use super::*;
+    use crate::ast::ParameterExpansionOperator as Op;
+
+    fn params(body: &str) -> ParameterExpansion {
+        parse_parameter_expansion_content(body).expect("parses")
+    }
+
+    /// `${x:+y}` is the ALTERNATE-VALUE operator: y only when x is SET and
+    /// NON-EMPTY. It used to parse as `DefaultValue` (`:-`), so the A1
+    /// could not distinguish it from `${x:-y}` and every backend printed
+    /// the fallback for an empty-but-set x.
+    #[test]
+    fn colon_plus_is_use_alternative_not_default() {
+        match params("x:+y").operator {
+            Op::UseAlternative(v, need_nonempty) => {
+                assert_eq!(v, "y");
+                assert!(need_nonempty, "`:+` requires the non-empty test");
+            }
+            other => panic!("expected UseAlternative, got {other:?}"),
+        }
+        // The plain `:-` must stay DefaultValue (the control).
+        match params("x:-y").operator {
+            Op::DefaultValue(v) => assert_eq!(v, "y"),
+            other => panic!("expected DefaultValue, got {other:?}"),
+        }
+    }
+
+    /// Only the FIRST colon can introduce a `:` operator. In `${s:1:-1}`
+    /// the first colon starts a SLICE and the `-1` is the LENGTH; splitting
+    /// on the `:-` substring produced variable "s:1" with default "1" and
+    /// discarded the sign.
+    #[test]
+    fn negative_slice_length_is_not_a_colon_dash_operator() {
+        match params("s:1:-1").operator {
+            Op::ArraySlice(off, len) => {
+                assert_eq!(off, "1");
+                assert_eq!(len.as_deref(), Some("-1"));
+            }
+            other => panic!("expected an ArraySlice, got {other:?}"),
+        }
+        // `${x::-2}` (empty offset) stays the working slice form.
+        match params("x::-2").operator {
+            Op::ArraySlice(off, len) => {
+                assert_eq!(off, "0");
+                assert_eq!(len.as_deref(), Some("-2"));
+            }
+            other => panic!("expected an ArraySlice, got {other:?}"),
+        }
+        // A genuine `:-` whose default contains a colon still splits at the
+        // FIRST colon only.
+        match params("x:-a:b").operator {
+            Op::DefaultValue(v) => assert_eq!(v, "a:b"),
+            other => panic!("expected DefaultValue, got {other:?}"),
+        }
+    }
+
+    /// `${x+w}` — the bare `+` operator was never split out of the name, so
+    /// the A1 carried `param("", "E+d")` and every backend read a variable
+    /// literally named `E+d` (the Perl renderer emitted `(${E+d})`, which
+    /// does not compile under `use strict`). It is UseAlternative with the
+    /// SET test — `need_nonempty == false`, unlike `:+`.
+    #[test]
+    fn bare_plus_is_the_set_test_not_a_name_suffix() {
+        let pe = params("E+d");
+        assert_eq!(pe.variable, "E", "the operator must not stay in the name");
+        match pe.operator {
+            Op::UseAlternative(w, need_nonempty) => {
+                assert_eq!(w, "d");
+                assert!(
+                    !need_nonempty,
+                    "bare `+` accepts set-but-empty, so no non-empty test"
+                );
+            }
+            other => panic!("expected UseAlternative, got {other:?}"),
+        }
+        // An EMPTY alternate word is still the operator (`${v+}`).
+        match params("v+").operator {
+            Op::UseAlternative(w, false) => assert_eq!(w, ""),
+            other => panic!("expected UseAlternative(\"\", false), got {other:?}"),
+        }
+        // `:+` stays the distinct non-empty form (the control).
+        match params("E:+d").operator {
+            Op::UseAlternative(w, true) => assert_eq!(w, "d"),
+            other => panic!("expected UseAlternative(_, true), got {other:?}"),
+        }
+    }
 }

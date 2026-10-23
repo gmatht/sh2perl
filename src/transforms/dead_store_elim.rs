@@ -149,6 +149,32 @@ fn has_dynamic_write(stmts: &[IrStmt]) -> bool {
     stmts.iter().any(walk_stmt)
 }
 
+/// Shell variables the SHELL ITSELF reads implicitly. No syntactic
+/// reference is needed for the value to change behaviour, so a store to one
+/// of these is never dead:
+///   - `IFS` drives word splitting in every later unquoted expansion and
+///     every `$*` / `${arr[*]}` join, including the expansion of the SAME
+///     command (`IFS=$'\n' a=($(cmd))` — the capture splits on the new
+///     value);
+///   - `PATH` / `CDPATH` / `GLOBIGNORE` drive command lookup, `cd` and
+///     globbing for the `exec` calls that follow;
+///   - `HOME` / `PWD` / `OLDPWD` / `TMPDIR` are consulted by `cd`,
+///     `mktemp` and `~` expansion;
+///   - `ENV` / `BASH_ENV` are sourced by child shells;
+///   - `OPTIND` is advanced by `getopts`.
+/// The census only sees EXPLICIT reads, so `IFS=x x=5` (no `[*]` anywhere)
+/// judged the IFS store dead and dropped it — core request
+/// fish-20261016-core-ir-drops. Keeping the store is the faithful IR; a
+/// backend that never consults the value simply emits an inert assignment.
+const SHELL_IMPLICIT_VARS: &[&str] = &[
+    "IFS", "PATH", "CDPATH", "GLOBIGNORE", "HOME", "PWD", "OLDPWD", "TMPDIR", "ENV",
+    "BASH_ENV", "OPTIND",
+];
+
+fn is_shell_implicit(name: &str) -> bool {
+    SHELL_IMPLICIT_VARS.contains(&name)
+}
+
 /// Apply the transform. Returns whether anything changed.
 pub fn transform(stmts: &mut Vec<IrStmt>) -> bool {
     if has_dynamic_write(stmts) {
@@ -189,6 +215,9 @@ pub fn transform(stmts: &mut Vec<IrStmt>) -> bool {
         .iter()
         .filter(|v| {
             if reads.contains(*v) || escapes.contains(*v) {
+                return false;
+            }
+            if is_shell_implicit(v) {
                 return false;
             }
             if !consts.contains(*v) {
@@ -342,6 +371,41 @@ fn count_writes(stmts: &[IrStmt]) -> std::collections::HashMap<String, usize> {
     counts
 }
 
+/// `$name` / `${name}` references inside a case PATTERN's source text.
+///
+/// Patterns arrive as TEXT (see the census arm) and bash expands them before
+/// matching, so each `$name` is a read of that variable. Mirrors
+/// `shir::lift_walk_stmt`'s `lift_mark_string_refs` call on the same field —
+/// that walker already treats a pattern as a read, which is why a var used
+/// only in a pattern is correctly EXCLUDED from the lift verdicts; the DCE
+/// census must agree or it deletes the store the pattern depends on.
+fn dollar_names_in(text: &str) -> Vec<String> {
+    let b = text.as_bytes();
+    let mut out = Vec::new();
+    let mut i = 0usize;
+    while i < b.len() {
+        if b[i] != b'$' {
+            i += 1;
+            continue;
+        }
+        i += 1;
+        if i < b.len() && b[i] == b'{' {
+            i += 1;
+            if i < b.len() && (b[i] == b'#' || b[i] == b'!') {
+                i += 1;
+            }
+        }
+        let start = i;
+        while i < b.len() && (b[i].is_ascii_alphanumeric() || b[i] == b'_') {
+            i += 1;
+        }
+        if start < i && (b[start].is_ascii_alphabetic() || b[start] == b'_') {
+            out.push(text[start..i].to_string());
+        }
+    }
+    out
+}
+
 fn census(stmts: &[IrStmt], reads: &mut HashSet<String>, writes: &mut HashSet<String>, escapes: &mut HashSet<String>) {
     for st in stmts {
         census_stmt(st, reads, writes, escapes, false);
@@ -434,6 +498,21 @@ fn census_stmt(
         IrStmt::Case { discriminant, clauses } => {
             census_expr(discriminant, reads, writes, escapes, escaping);
             for cl in clauses {
+                // A case PATTERN is EXPANDED by bash before matching, and the
+                // frontends hand it over as SOURCE TEXT (a plain `String` on
+                // the clause, not an `IrExpr`), so a `$name` inside one is a
+                // READ of that variable. Without this the census saw no read
+                // at all for `x=bar; case bar in $x) …`: this transform
+                // dropped the ONLY store of `x` (and `analyze_var_types` then
+                // listed nothing, so no backend declared it either) and the
+                // renderers fell through to the environment variable —
+                // bash printed the clause body, every translation printed
+                // nothing. See core-requests/core-20261015-145805-case-pattern-reads.md.
+                for p in &cl.patterns {
+                    for v in dollar_names_in(p) {
+                        reads.insert(v);
+                    }
+                }
                 for s in &cl.body {
                     census_stmt(s, reads, writes, escapes, escaping);
                 }
@@ -458,6 +537,49 @@ fn census_stmt(
         IrStmt::Subshell(v) | IrStmt::Background(v) => {
             for s in v {
                 census_stmt(s, reads, writes, escapes, true);
+            }
+        }
+        IrStmt::Pipeline { stages, .. } => {
+            // stages run as separate processes, but their READS see
+            // the parent's values (a var read only here must keep its
+            // store — BASHC_FIX t03: `name` read only inside a pipeline
+            // was dropped as dead). Ambient escaping (like Block):
+            // stage-local writes don't outlive the stage.
+            for st in stages {
+                for s in st {
+                    census_stmt(s, reads, writes, escapes, escaping);
+                }
+            }
+        }
+        IrStmt::ForInit { init, cond, step, body, .. } => {
+            for s in init {
+                census_stmt(s, reads, writes, escapes, escaping);
+            }
+            census_expr(cond, reads, writes, escapes, escaping);
+            for s in step {
+                census_stmt(s, reads, writes, escapes, escaping);
+            }
+            for s in body {
+                census_stmt(s, reads, writes, escapes, escaping);
+            }
+        }
+        IrStmt::Try { body, excepts, else_body, finally_body, .. } => {
+            for s in body {
+                census_stmt(s, reads, writes, escapes, escaping);
+            }
+            for e in excepts {
+                if let Some(m) = &e.match_expr {
+                    census_expr(m, reads, writes, escapes, escaping);
+                }
+                for s in &e.body {
+                    census_stmt(s, reads, writes, escapes, escaping);
+                }
+            }
+            for s in else_body {
+                census_stmt(s, reads, writes, escapes, escaping);
+            }
+            for s in finally_body {
+                census_stmt(s, reads, writes, escapes, escaping);
             }
         }
         IrStmt::Block(v) => {
@@ -505,6 +627,7 @@ fn census_expr(
                 func.as_str(),
                 "getVar" | "arrayIndex" | "param" | "byteAt" | "jsonGet" | "jsonSet"
                     | "jsonArrGet" | "jsonArrSet" | "jsonArrAppend"
+                    | "memLoad" | "memAdvance" | "memFree"
             ) {
                 let idx = if func == "param" { 1 } else { 0 };
                 if let Some(IrExpr::Str(n, _)) = args.get(idx) {
@@ -518,6 +641,18 @@ fn census_expr(
                         if escaping {
                             escapes.insert(base.to_string());
                         }
+                    }
+                    // A `name[*]` expansion reads IFS at RUNTIME: the `[*]`
+                    // join is performed by the backend runtime, which joins
+                    // the elements with the FIRST IFS character (bash uses
+                    // IFS for `*` even when quoted). Without this the
+                    // `IFS=$'\n'` store is culled and the join falls back to
+                    // a space — 064_07_complex_array_operations printed
+                    // "admin localhost" where bash printed the
+                    // newline-joined, sort-able string. `[@]` joins with a
+                    // hard space and does not read IFS.
+                    if n.ends_with("[*]") {
+                        reads.insert("IFS".to_string());
                     }
                 }
                 // byteAt's index arg is arithmetic text naming vars
@@ -539,6 +674,38 @@ fn census_expr(
                     writes.insert(n.clone());
                 }
             }
+            // memStore/arrayStore write THROUGH their first-arg handle:
+            // the receiver name is both read (handle resolution) and
+            // written — its initializing stores stay live
+            if matches!(func.as_str(), "memStore" | "arrayStore") {
+                if let Some(IrExpr::Str(n, _)) = args.first() {
+                    reads.insert(n.clone());
+                    writes.insert(n.clone());
+                }
+            }
+            // fnCall/fnValue/callDirect dispatch passes its string args
+            // as the callee's $1.. — and callees routinely use those as
+            // VARIABLE NAMES (array-by-name in-place ops: the arg "a"
+            // becomes getVar/param reads inside the body, invisible here).
+            // Mark every Str arg as a read: over-marking only shrinks
+            // elimination, never drops live stores.
+            if matches!(func.as_str(), "fnCall" | "fnValue" | "callDirect") {
+                for a in args {
+                    match a {
+                        IrExpr::Str(n, _) => {
+                            reads.insert(n.clone());
+                        }
+                        IrExpr::Array(items) => {
+                            for it in items {
+                                if let IrExpr::Str(n, _) = it {
+                                    reads.insert(n.clone());
+                                }
+                            }
+                        }
+                        _ => {}
+                    }
+                }
+            }
             // a $name reference inside ANY string argument is a read —
             // the `test` operands (`[ "$x" -gt "$y" ]`) and the slice
             // start (`${s:$i:1}` → Str("$i")) carry $vars in Str nodes,
@@ -557,6 +724,19 @@ fn census_expr(
             }
         }
         IrExpr::Arith(a) => arith_census(a, reads, writes, escapes, escaping),
+        // A transform-declared (Ext) node's field expressions are ordinary
+        // reads/writes — the two walkers above already recurse into
+        // `ExtExpr::children`, but this census did NOT, so a read buried in
+        // an Ext node was invisible: affix-strip-fold's
+        // `AffixStrip{text: param("",x)}` judged `x` never-read, DSE
+        // dropped its only store, `analyze_var_types` then declared
+        // nothing and every renderer fell back to the environment
+        // variable (parse-heredoc-hash-in-brace printed empty).
+        IrExpr::Ext(n) => {
+            for c in crate::shir_nodes::ExtExpr::children(&**n) {
+                census_expr(c, reads, writes, escapes, escaping);
+            }
+        }
         IrExpr::Interpolate(parts) => {
             for p in parts {
                 if let crate::ir::InterpPart::Expr(x) = p {
@@ -838,8 +1018,9 @@ fn purge(st: IrStmt, dead: &[String]) -> Option<IrStmt> {
         IrStmt::Background(v) => Some(IrStmt::Background(
             v.into_iter().filter_map(|s| purge(s, dead)).collect(),
         )),
-        IrStmt::Function { name, body, .. } => Some(IrStmt::Function {
+        IrStmt::Function { name, params, body, .. } => Some(IrStmt::Function {
             name,
+            params,
             body: body.into_iter().filter_map(|s| purge(s, dead)).collect(),
             named_blocks: Vec::new(),
         }),
@@ -847,3 +1028,230 @@ fn purge(st: IrStmt, dead: &[String]) -> Option<IrStmt> {
     }
 }
 
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::ir::{AssignTarget, StrStyle};
+
+    fn str_(s: &str) -> IrExpr {
+        IrExpr::Str(s.to_string(), StrStyle::DoubleQuoted)
+    }
+
+    /// Regression pin (core-request core-20261015-145805, rust backend):
+    /// a var read ONLY inside a `case` PATTERN must keep its store.
+    ///
+    /// `x=bar; case bar in $x) echo MATCH;; esac` — the pattern is SOURCE
+    /// TEXT bash expands before matching, so `$x` is a read. The census
+    /// walked only the clause BODY, judged `x` never-read, and deleted its
+    /// only store; every backend then read `$x` from the environment and
+    /// printed nothing where bash prints MATCH.
+    #[test]
+    fn case_pattern_read_keeps_store() {
+        let case = IrStmt::Case {
+            discriminant: str_("bar"),
+            clauses: vec![crate::ir::IrCaseClause {
+                patterns: vec!["$x".to_string()],
+                body: vec![IrStmt::Expr(IrExpr::Call {
+                    func: "builtin".to_string(),
+                    args: vec![
+                        str_("echo"),
+                        IrExpr::Array(vec![str_("MATCH")]),
+                    ],
+                })],
+            }],
+        };
+        let mut prog = vec![
+            IrStmt::Assign {
+                targets: vec![AssignTarget {
+                    var: "x".to_string(),
+                    sigil: None,
+                    indices: vec![],
+                }],
+                expr: str_("bar"),
+                asm: None,
+            },
+            case,
+        ];
+        assert!(
+            !transform(&mut prog),
+            "the store feeding the case pattern must not be dropped"
+        );
+        assert_eq!(prog.len(), 2, "the `x=bar` assignment must survive");
+
+        // The control: a pattern with NO expansion is not a read, so a store
+        // nothing else uses is still dead and IS dropped.
+        let mut prog2 = vec![
+            IrStmt::Assign {
+                targets: vec![AssignTarget {
+                    var: "y".to_string(),
+                    sigil: None,
+                    indices: vec![],
+                }],
+                expr: str_("bar"),
+                asm: None,
+            },
+            IrStmt::Case {
+                discriminant: str_("bar"),
+                clauses: vec![crate::ir::IrCaseClause {
+                    patterns: vec!["bar".to_string()],
+                    body: vec![],
+                }],
+            },
+        ];
+        assert!(transform(&mut prog2), "a literal pattern reads nothing");
+        assert_eq!(prog2.len(), 1);
+
+        // `${x}` and a pattern with surrounding text are reads too.
+        assert_eq!(dollar_names_in("${x}"), vec!["x".to_string()]);
+        assert_eq!(dollar_names_in("pre$x-suf"), vec!["x".to_string()]);
+        assert!(dollar_names_in("*.txt").is_empty());
+    }
+
+    /// Regression (affix-strip-fold): a var read ONLY inside a
+    /// transform-declared (Ext) node's field must keep its store. The
+    /// census had no `IrExpr::Ext` arm, so the read buried in
+    /// `AffixStrip{text: param("",x)}` was invisible: `x="hello"` was
+    /// judged dead and dropped, and every renderer fell back to the
+    /// environment variable (parse-heredoc-hash-in-brace printed empty).
+    #[test]
+    fn ext_node_read_keeps_store() {
+        use crate::shir_nodes::AffixStrip;
+        let ext = IrExpr::Ext(Box::new(AffixStrip {
+            text: IrExpr::Call {
+                func: "param".to_string(),
+                args: vec![str_(""), str_("x")],
+            },
+            pattern: str_("h"),
+            prefix: true,
+        }));
+        let mut prog = vec![
+            IrStmt::Assign {
+                targets: vec![AssignTarget {
+                    var: "x".to_string(),
+                    sigil: None,
+                    indices: vec![],
+                }],
+                expr: str_("hello"),
+                asm: None,
+            },
+            IrStmt::Expr(ext),
+        ];
+        assert!(
+            !transform(&mut prog),
+            "a store read through an Ext node's field must survive"
+        );
+        assert_eq!(prog.len(), 2, "the `x=hello` assignment must survive");
+    }
+
+    /// BASHC_FIX t03: a var read ONLY inside a pipeline stage must keep
+    /// its store (`name="world"; echo $name | tr` dropped the assign).
+    #[test]
+    fn pipeline_read_keeps_store() {
+        let prog = vec![
+            IrStmt::Assign {
+                targets: vec![AssignTarget {
+                    var: "name".to_string(),
+                    sigil: None,
+                    indices: vec![],
+                }],
+                expr: str_("world"),
+                asm: None,
+            },
+            IrStmt::Pipeline {
+                stages: vec![vec![IrStmt::Expr(IrExpr::Call {
+                    func: "builtin".to_string(),
+                    args: vec![
+                        str_("echo"),
+                        IrExpr::Array(vec![IrExpr::Call {
+                            func: "getVar".to_string(),
+                            args: vec![str_("name")],
+                        }]),
+                    ],
+                })]],
+                last_output: None,
+                capture: None,
+                cmd_str: None,
+            },
+        ];
+        let mut stmts = prog;
+        transform(&mut stmts);
+        assert_eq!(stmts.len(), 2, "pipeline-read store dropped: {stmts:?}");
+    }
+
+    /// `IFS=$'\n'; echo "${config[*]}"` must keep the IFS store.
+    ///
+    /// The `[*]` join runs in the backend runtime and uses the FIRST IFS
+    /// character, so a static census that only records the array name
+    /// culls the IFS store and the join silently degrades to a space
+    /// (064_07_complex_array_operations). `[@]` is the control: it joins
+    /// with a hard space, so its store is still dead.
+    #[test]
+    fn star_join_keeps_ifs_store() {
+        let read_of = |n: &str| {
+            IrStmt::Expr(IrExpr::Call {
+                func: "builtin".to_string(),
+                args: vec![
+                    str_("echo"),
+                    IrExpr::Array(vec![IrExpr::Call {
+                        func: "param".to_string(),
+                        args: vec![str_(""), str_(n)],
+                    }]),
+                ],
+            })
+        };
+        let ifs_store = IrStmt::Assign {
+            targets: vec![AssignTarget {
+                var: "IFS".to_string(),
+                sigil: None,
+                indices: vec![],
+            }],
+            expr: str_("\n"),
+            asm: None,
+        };
+
+        let mut star = vec![ifs_store.clone(), read_of("config[*]")];
+        transform(&mut star);
+        assert_eq!(star.len(), 2, "[*] join must keep the IFS store: {star:?}");
+
+        // `[@]` does not join on IFS, but the store must STILL survive:
+        // IFS is a shell-implicit variable, and the same script can split
+        // on it later (a `$(cmd)` capture, an unquoted `$v`). This control
+        // asserted the old dead-store verdict before the shell-implicit
+        // guard landed (fish-20261016-core-ir-drops).
+        let mut at = vec![ifs_store, read_of("config[@]")];
+        transform(&mut at);
+        assert_eq!(at.len(), 2, "IFS is shell-implicit; keep its store: {at:?}");
+    }
+
+    /// A store to a shell-IMPLICIT variable survives even with no syntactic
+    /// read anywhere: the shell consults the value itself (word splitting,
+    /// command lookup, `cd`, globbing), so it can never be proven dead.
+    ///
+    /// Repro (core request fish-20261016-core-ir-drops case 2):
+    /// `IFS=x x=5` emitted an EMPTY statement list — both assignment-only
+    /// words vanished — and a later `$var` expansion or `$(cmd)` capture
+    /// then split on the default IFS instead of the script's value.
+    #[test]
+    fn implicit_shell_var_store_is_never_dead() {
+        let assign = |name: &str, value: &str| IrStmt::Assign {
+            targets: vec![AssignTarget {
+                var: name.to_string(),
+                sigil: None,
+                indices: vec![],
+            }],
+            expr: str_(value),
+            asm: None,
+        };
+        let mut stmts = vec![assign("IFS", "\n"), assign("x", "5")];
+        transform(&mut stmts);
+        let kept: Vec<&str> = stmts
+            .iter()
+            .filter_map(|s| match s {
+                IrStmt::Assign { targets, .. } => targets.first().map(|t| t.var.as_str()),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(kept, vec!["IFS"], "IFS store must survive; x is genuinely dead: {stmts:?}");
+    }
+}

@@ -171,7 +171,9 @@ fn expr_reads(e: &IrExpr, var: &str) -> bool {
         IrExpr::BinOp { lhs, rhs, .. } => expr_reads(lhs, var) || expr_reads(rhs, var),
         IrExpr::Arith(a) => arith_reads(a, var),
         IrExpr::Call { func, args, .. } => {
-            call_reads_var(func, args, var) || args.iter().any(|a| expr_reads(a, var))
+            call_reads_var(func, args, var)
+                || assign_rmw_reads(func, args, var)
+                || args.iter().any(|a| expr_reads(a, var))
         }
         IrExpr::MethodCall { obj, args, .. } => expr_reads(obj, var) || args.iter().any(|a| expr_reads(a, var)),
         IrExpr::Ternary { cond, then, else_, .. } => {
@@ -199,9 +201,26 @@ fn arith_reads(a: &ArithAst, var: &str) -> bool {
         ArithAst::Cond { test, then, else_, .. } => {
             arith_reads(test, var) || arith_reads(then, var) || arith_reads(else_, var)
         }
-        ArithAst::Assign { rhs, .. } => arith_reads(rhs, var),
+        ArithAst::Assign { var: v, op, rhs } => {
+            arith_reads(rhs, var) || (op != "=" && v == var)
+        }
         ArithAst::IncDec { var: v, .. } => v == var,
         ArithAst::Cast { arg, .. } => arith_reads(arg, var),
+        _ => false,
+    }
+}
+
+/// `assign(V, OP, …)` with a compound `OP` is a read-modify-write of `V`
+/// (bash's scalar `+=` string-appends, the arithmetic ops combine with the
+/// current value). Without counting it as a read, `n=1; n+=2` looked like
+/// two plain stores with nothing in between, so this pass dropped the base
+/// write (zig-20261021-param-lowering-gaps §3).
+fn assign_rmw_reads(func: &str, args: &[IrExpr], var: &str) -> bool {
+    if func != "assign" {
+        return false;
+    }
+    match (args.first(), args.get(1)) {
+        (Some(IrExpr::Str(v, _)), Some(IrExpr::Str(op, _))) => v == var && op != "=",
         _ => false,
     }
 }
@@ -406,5 +425,35 @@ mod tests {
         ];
         assert!(!transform(&mut stmts));
         assert_eq!(stmts[0], assign("x", int_lit(5)));
+    }
+
+    /// `n=1; n+=2` — a compound assignment is a READ-MODIFY-WRITE: the
+    /// base store feeds it, so it must NOT be treated as an overwritten
+    /// dead store. Before the RMW read was counted, this dropped `n=1`
+    /// and every backend computed from an unset variable
+    /// (zig-20261021-param-lowering-gaps §3).
+    #[test]
+    fn keeps_base_store_for_compound_assignment() {
+        let plus_assign = |var: &str, rhs: &str| IrStmt::Assign {
+            targets: vec![AssignTarget {
+                var: var.to_string(),
+                sigil: None,
+                indices: vec![],
+            }],
+            expr: IrExpr::Call {
+                func: "assign".to_string(),
+                args: vec![str_lit(var), str_lit("+="), str_lit(rhs)],
+            },
+            asm: None,
+        };
+        let mut stmts = vec![assign("n", str_lit("1")), plus_assign("n", "2")];
+        assert!(!transform(&mut stmts), "the base write must survive");
+        assert_eq!(stmts.len(), 2);
+        assert_eq!(stmts[0], assign("n", str_lit("1")));
+
+        // Control: a plain `=` overwrite still makes the earlier store dead.
+        let mut plain = vec![assign("n", str_lit("1")), assign("n", str_lit("2"))];
+        assert!(transform(&mut plain));
+        assert_eq!(plain.len(), 1);
     }
 }

@@ -1,0 +1,80 @@
+arith-identity — the Tier-1 obligation for src/transforms/arith_identity.rs
+=========================================================================
+
+    isabelle build -d proofs/ArithIdentity -b ArithIdentity
+
+What is proved (ArithIdentity.thy, 29 lemmas, quick_and_dirty = false):
+
+  each fold rule of `simplify` is stated over IR-shaped data only, with an
+  explicit error model (None = the evaluation raises, the only error in this
+  fragment being division/remainder by zero), quantified over an ARBITRARY
+  store — because the Rust's guards are shape-only:
+
+    +   add_zero_right / add_zero_left                 (ungated)
+    -   sub_zero_right                                 (ungated)
+        sub_self_when_no_err / sub_self_sound          (gated by arith_no_err)
+    *   mul_one_right / mul_one_left                   (ungated)
+        mul_zero_right_sound / mul_zero_left_sound     (gated by arith_no_err)
+    /   div_one_right                                  (ungated)
+        div_zero_over_pos                              (gated by n > 0)
+    %   mod_one / mod_one_value                        (ungated)
+
+  and the guards are shown LOAD-BEARING rather than decorative, by three
+  refutations that sit next to the lemmas they protect:
+
+    no_err_guard_needed_for_sub_self   `(1/0) - (1/0)` is None, `0` is Some 0
+    no_err_guard_needed_for_mul_zero   `(1/0) * 0`     is None, `0` is Some 0
+    positive_divisor_guard_needed      `0 / 0`         is None
+
+  Negative control on the session itself: replacing `assumes "no_err a"` by
+  `assumes "True"` in sub_self_when_no_err makes the build FAIL.  A session
+  that can only pass is not evidence.
+
+Run against the real code, not just the model: a throwaway unit test
+injected into the Rust drove `simplify` on `(1/0)*0`, `(1/0)-(1/0)` and
+`0/(1/0)`; all three stay unfolded (the guards fire).  The test was removed
+again — it is not committed.
+
+What is NOT claimed
+-------------------
+* The post-order recursion of `simplify` (re-testing a node after its
+  children were rewritten) is not mirrored as a single transformer theorem.
+  Every arm's content is discharged above; composing them adds transcription,
+  not content.
+* The shell-int reading only.  The module's open question — float-domain IR,
+  where `x % 1` on 5.5, `x * 0` on ±Inf and `x + 0` on -0.0 differ — is a
+  different theorem about a different evaluation, exactly as the module
+  header says.
+* The transform is UNREGISTERED (`all()` has no entry).  Proving it sound does
+  not register it; that still needs the float-domain decision.
+
+Fidelity of the model (read before trusting a lemma as "the Rust says X")
+----------------------------------------------------------------------------
+The theory models the Rust's *intent*; where the two differ, the difference is
+listed here rather than left to be discovered.
+
+* `x % 1 → 0` is UNGATED in the Rust (any divisor equal to the literal 1), and
+  the model matches that — but the Rust never checks the dividend for `no_err`,
+  so `(1/0) % 1` folds to `0` and swallows the abort.  That is a real (small)
+  unsoundness in the transform, NOT covered by any lemma above.  CONFIRMED
+  against the running code: an injected unit test drove `simplify` on
+  `(1/0) % 1` and it returned `Num(0)` (test removed again).  Recorded rather
+  than fixed, because the fix is a one-word change to the Rust (add
+  `&& arith_no_err(lhs)` to the `%` arm) and the point of this file is to say
+  what is proved, not to quietly widen it.
+* `0 * x → 0` is guarded by `arith_no_err(rhs)` in the model.  The Rust's arm is
+  `num(lhs) == Some(0) && arith_no_err(rhs)`, so the model matches — but note
+  the guard is on the *other* side of the `*`, which is the right side for
+  `0 * x` and is why `0 * (1/0)` is refused.
+* `x + 0 → x` (and `0 + x`) is proved only for the INTEGER reading, and the
+  Rust applies it to any operand.  Verified against the real `simplify`:
+  `$1 + 0` folds to `Var("1")`, and `$(($1 + 0))` is bash's string-to-int
+  coercion (`$1=abc` is an error; `$(($1 + 0))` is what raises it).  The
+  fold therefore turns a hard error into a silently wrong value.  The two
+  corpus examples that contain a foldable identity
+  (dollar-positional-arithmetic.sh, parse-dollar-in-arithmetic.sh) are
+  exactly this idiom.  NOT covered by any lemma here, because a lemma about
+  `int` cannot talk about the coercion that produces the int.
+* Every rule is stated for the shell-int reading (`div`/`mod` on `int`).  Float
+  IR is out of scope: `TransformFn` cannot see `var_types`, so no gate is
+  possible at this layer (see the module header's open registration item).

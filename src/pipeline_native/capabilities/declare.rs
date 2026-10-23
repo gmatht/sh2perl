@@ -83,13 +83,18 @@ pub(crate) fn emit(ctx: &NativeCtx) -> Option<NativeEmit> {
         return None;
     }
     let val = crate::ir::safe_perl_q_string(value);
-    let mut stmt = match flags.as_str() {
-        f if f.contains('l') => format!("${var} = lc({val});"),
-        f if f.contains('u') => format!("${var} = uc({val});"),
-        _ => format!("${var} = {val};"),
+    // Same value expression for the variable AND %ENV (see typeset):
+    // bash exports what the variable actually holds.
+    let store = if flags.contains('l') {
+        format!("lc({val})")
+    } else if flags.contains('u') {
+        format!("uc({val})")
+    } else {
+        val
     };
+    let mut stmt = format!("${var} = {store};");
     if flags.contains('x') {
-        stmt.push_str(&format!(" $ENV{{{var}}} = {val};"));
+        stmt.push_str(&format!(" $ENV{{{var}}} = {store};"));
     }
     stmt.push_str("\n$main_exit_code = $CHILD_ERROR = 0;");
     Some(NativeEmit::Stmt(stmt))

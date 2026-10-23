@@ -40,16 +40,29 @@ impl std::fmt::Display for ParameterExpansion {
             ParameterExpansionOperator::ErrorIfUnset(error) => {
                 write!(f, "${{{0}:?{1}}}", self.variable, error)
             }
+            ParameterExpansionOperator::UseAlternative(word, need_nonempty) => {
+                write!(
+                    f,
+                    "${{{0}{1}{2}}}",
+                    self.variable,
+                    if *need_nonempty { ":+" } else { "+" },
+                    word
+                )
+            }
             ParameterExpansionOperator::BadSubstitution => {
                 write!(f, "${{{0}}}", self.variable)
             }
             ParameterExpansionOperator::Basename => write!(f, "${{{0}##*/}}", self.variable),
             ParameterExpansionOperator::Dirname => write!(f, "${{{0}%/*}}", self.variable),
             ParameterExpansionOperator::ArraySlice(offset, length) => {
-                if let Some(length_str) = length {
-                    write!(f, "${{{}}}:{}:{}", self.variable, offset, length_str)
+                // `${arr[@]}` is parsed as ArraySlice("@", None); slices with a
+                // real offset render as `${arr[@]:off}` / `${arr[@]:off:len}`.
+                if offset == "@" || offset == "*" {
+                    write!(f, "${{{}[{}]}}", self.variable, offset)
+                } else if let Some(length_str) = length {
+                    write!(f, "${{{}[@]:{}:{}}}", self.variable, offset, length_str)
                 } else {
-                    write!(f, "${{{}}}:{}", self.variable, offset)
+                    write!(f, "${{{}[@]:{}}}", self.variable, offset)
                 }
             }
             ParameterExpansionOperator::ZshFlags(flags, sep) => match sep {
@@ -84,6 +97,20 @@ pub enum ParameterExpansionOperator {
     DefaultValue(String),  // :-default
     AssignDefault(String), // :=default
     ErrorIfUnset(String),  // :?error / ?error
+
+    // The "is it set" test, whose result is a WORD rather than the
+    // variable's value: `${v+w}` substitutes `w` when `v` is SET, and
+    // `${v:+w}` substitutes `w` when `v` is set AND NON-EMPTY. Both
+    // substitute the EMPTY string otherwise. Distinct from
+    // `DefaultValue`, which substitutes the VARIABLE when set-and-
+    // non-empty — `${v:-w}` yields `v`, never `w`, so reusing that arm
+    // (as the renderer did before this variant existed) printed `w` for
+    // an unset `v` and inverted the test.
+    //
+    // The bool is the non-empty requirement: `false` for `${v+w}` (any
+    // set value, including the empty string, passes), `true` for
+    // `${v:+w}`.
+    UseAlternative(String, bool), // +word / :+word
 
     // Invalid ${...} content (e.g. `${arr[1]>2}`) — bash prints "bad
     // substitution", skips the whole command (status 1), keeps going.
@@ -315,6 +342,14 @@ impl std::fmt::Display for Word {
                             ParameterExpansionOperator::ErrorIfUnset(error) => {
                                 result.push_str(&format!("${{{}}}:?{}", pe.variable, error))
                             }
+                            ParameterExpansionOperator::UseAlternative(word, need_nonempty) => {
+                                result.push_str(&format!(
+                                    "${{{}}}{}{}",
+                                    pe.variable,
+                                    if *need_nonempty { ":+" } else { "+" },
+                                    word
+                                ))
+                            }
                             ParameterExpansionOperator::BadSubstitution => {
                                 result.push_str(&format!("${{{}}}", pe.variable))
                             }
@@ -325,13 +360,15 @@ impl std::fmt::Display for Word {
                                 result.push_str(&format!("${{{}}}%/*", pe.variable))
                             }
                             ParameterExpansionOperator::ArraySlice(offset, length) => {
-                                if let Some(length_str) = length {
+                                if offset == "@" || offset == "*" {
+                                    result.push_str(&format!("${{{}[{}]}}", pe.variable, offset))
+                                } else if let Some(length_str) = length {
                                     result.push_str(&format!(
-                                        "${{{}}}:{1}:{2}",
+                                        "${{{}[@]:{}:{}}}",
                                         pe.variable, offset, length_str
                                     ))
                                 } else {
-                                    result.push_str(&format!("${{{}}}:{1}", pe.variable, offset))
+                                    result.push_str(&format!("${{{}[@]:{}}}", pe.variable, offset))
                                 }
                             }
                             ParameterExpansionOperator::ZshFlags(flags, sep) => match sep {
@@ -354,11 +391,11 @@ impl std::fmt::Display for Word {
                         StringPart::ArraySlice(array_name, offset, length) => {
                             if let Some(length_str) = length {
                                 result.push_str(&format!(
-                                    "${{{}[@]}}:{}:{}",
+                                    "${{{}[@]:{}:{}}}",
                                     array_name, offset, length_str
                                 ));
                             } else {
-                                result.push_str(&format!("${{{}[@]}}:{}", array_name, offset));
+                                result.push_str(&format!("${{{}[@]:{}}}", array_name, offset));
                             }
                         }
                         StringPart::Arithmetic(expr) => result.push_str(&expr.expression),
@@ -505,14 +542,22 @@ impl Word {
                 ParameterExpansionOperator::ErrorIfUnset(error) => {
                     format!("${{{}}}:?{}", pe.variable, error)
                 }
+                ParameterExpansionOperator::UseAlternative(word, need_nonempty) => format!(
+                    "${{{}}}{}{}",
+                    pe.variable,
+                    if *need_nonempty { ":+" } else { "+" },
+                    word
+                ),
                 ParameterExpansionOperator::BadSubstitution => format!("${{{}}}", pe.variable),
                 ParameterExpansionOperator::Basename => format!("${{{}}}##*/", pe.variable),
                 ParameterExpansionOperator::Dirname => format!("${{{}}}%/*", pe.variable),
                 ParameterExpansionOperator::ArraySlice(offset, length) => {
-                    if let Some(length_str) = length {
-                        format!("${{{}}}:{1}:{2}", pe.variable, offset, length_str)
+                    if offset == "@" || offset == "*" {
+                        format!("${{{}[{}]}}", pe.variable, offset)
+                    } else if let Some(length_str) = length {
+                        format!("${{{}[@]:{}:{}}}", pe.variable, offset, length_str)
                     } else {
-                        format!("${{{}}}:{1}", pe.variable, offset)
+                        format!("${{{}[@]:{}}}", pe.variable, offset)
                     }
                 }
                 ParameterExpansionOperator::ZshFlags(flags, sep) => match sep {
@@ -626,6 +671,14 @@ impl Word {
                             ParameterExpansionOperator::ErrorIfUnset(error) => {
                                 result.push_str(&format!("${{{}}}:?{}", pe.variable, error))
                             }
+                            ParameterExpansionOperator::UseAlternative(word, need_nonempty) => {
+                                result.push_str(&format!(
+                                    "${{{}}}{}{}",
+                                    pe.variable,
+                                    if *need_nonempty { ":+" } else { "+" },
+                                    word
+                                ))
+                            }
                             ParameterExpansionOperator::BadSubstitution => {
                                 result.push_str(&format!("${{{}}}", pe.variable))
                             }
@@ -636,13 +689,15 @@ impl Word {
                                 result.push_str(&format!("${{{}}}%/*", pe.variable))
                             }
                             ParameterExpansionOperator::ArraySlice(offset, length) => {
-                                if let Some(length_str) = length {
+                                if offset == "@" || offset == "*" {
+                                    result.push_str(&format!("${{{}[{}]}}", pe.variable, offset))
+                                } else if let Some(length_str) = length {
                                     result.push_str(&format!(
-                                        "${{{}}}:{1}:{2}",
+                                        "${{{}[@]:{}:{}}}",
                                         pe.variable, offset, length_str
                                     ))
                                 } else {
-                                    result.push_str(&format!("${{{}}}:{1}", pe.variable, offset))
+                                    result.push_str(&format!("${{{}[@]:{}}}", pe.variable, offset))
                                 }
                             }
                             ParameterExpansionOperator::ZshFlags(flags, sep) => match sep {
@@ -665,11 +720,11 @@ impl Word {
                         StringPart::ArraySlice(array_name, offset, length) => {
                             if let Some(length_str) = length {
                                 result.push_str(&format!(
-                                    "${{{}[@]}}:{}:{}",
+                                    "${{{}[@]:{}:{}}}",
                                     array_name, offset, length_str
                                 ));
                             } else {
-                                result.push_str(&format!("${{{}[@]}}:{}", array_name, offset));
+                                result.push_str(&format!("${{{}[@]:{}}}", array_name, offset));
                             }
                         }
                         StringPart::Arithmetic(expr) => result.push_str(&expr.expression),

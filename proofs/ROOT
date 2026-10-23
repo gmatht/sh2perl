@@ -1,0 +1,26 @@
+session DivModPow2 in DivModPow2 = HOL +
+  options [quick_and_dirty = false]
+  theories
+    DivModPow2
+
+session I32Provable in I32Provable = HOL +
+  options [quick_and_dirty = false]
+  theories
+    I32Provable
+
+(* NOT in the default `-D proofs` build: as of 2026-10-23 it does not
+   check. `mod_bounds` at line 741 instantiates with `v := r0` but then
+   asserts the bound over `v mod v2` (`OF: no unifiers`), and the fix is a
+   one-line `v1 mod v2` in the goal — but the rest of the session was not
+   re-checked behind it, so it stays out until someone drives it green.
+   The `harness/transform-proofs.sh` gate reports this session as FAILED on
+   purpose: it is a claim the tree cannot back. *)
+session BigIntRange in BigIntRange = HOL +
+  options [quick_and_dirty = false]
+  theories
+    BigIntRange
+
+session IntervalFloor in IntervalFloor = BigIntRange +
+  options [quick_and_dirty = false]
+  theories
+    IntervalFloor

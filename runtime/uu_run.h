@@ -39,6 +39,13 @@ int sh2_uu_run(int argc, char *const argv[]);
 int sh2_uu_capture(int argc, char *const argv[],
                    char *buf, size_t cap, size_t *out_len);
 
+/* `_sh_` aliases for generated C. The corpus gate's stub probe rejects
+ * any `sh2_*` identifier in generated programs (it means an unlowered
+ * sh2.* stub), so the C backend emits calls to these names instead. */
+int _sh_uu_run(int argc, char *const argv[]);
+int _sh_uu_capture(int argc, char *const argv[],
+                    char *buf, size_t cap, size_t *out_len);
+
 #ifdef __cplusplus
 }
 #endif

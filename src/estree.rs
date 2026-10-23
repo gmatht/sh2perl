@@ -162,6 +162,15 @@ pub enum Expr {
     Identifier {
         name: String,
     },
+    /// A default-valued binding pattern — `x = <expr>` — used in a
+    /// function's `params` list (JS native default parameters). Core
+    /// request cpp-sh-go-optional-param-20260815-172052: a C++ default
+    /// argument lowers to exactly this, so the reference runtime
+    /// evaluates the default at call time with no generated body prologue.
+    AssignmentPattern {
+        left: Box<Expr>,
+        right: Box<Expr>,
+    },
     /// A native function expression — the normalize_functions port's
     /// sequence-form output (`(__fn_x = function x(...) {…}, …)`).
     FunctionExpression {
@@ -1243,6 +1252,16 @@ struct ArrayRefs {
     in_fn: bool,
     /// A computed / non-integer / negative-literal subscript read.
     index_bad: bool,
+    /// A read that CONSULTS THE RUNTIME STORE for this name rather than
+    /// the rewritten native binding — `sh2.max("name")`, the sorted*
+    /// joins, `sh2.getVar("name…")`, the `param` slice. The fold
+    /// rewrites only the reads it knows (arrayIndex / arrayLen /
+    /// arrayItems / arrayValues), so folding such a name would put the
+    /// data in a native `let` that nobody reads while the surviving
+    /// store-reading call sees an empty store (`sh2.max("xs")` → "0",
+    /// t92_max_min_sum). Must veto the fold, exactly like `mark_text_refs`
+    /// does for a `$name` inside runtime-expanded text.
+    store_read: bool,
 }
 
 fn is_sh2_call(callee: &Expr, fn_name: &str) -> bool {
@@ -1270,6 +1289,60 @@ fn lit_str<'a>(e: &'a Expr) -> Option<&'a str> {
         Expr::Literal { value, .. } => value.as_str(),
         _ => None,
     }
+}
+
+/// The `sh2.*` runtime members whose FIRST argument is a variable NAME
+/// spelled as a string literal — `sh2.max("xs")`, `sh2.arrayLen("xs")`,
+/// `sh2.getVar("xs[1]")`. A call to one of these READS the runtime
+/// store entry for that name, so a leading `let xs = […]` that only
+/// feeds such a call is NOT dead: the runtime store is the thing the
+/// call consults, and the native `let` is what the native-array fold
+/// put there INSTEAD of the `sh2.setArray` that would have populated it.
+///
+/// This is the twin of [`mark_text_refs`]: that one finds `$name` inside
+/// runtime-expanded TEXT (so the native fold refuses those names), this
+/// one finds `"name"` inside a store-reading CALL (so the dead-decl drop
+/// refuses to remove the binding the call needs). Both exist because the
+/// read is spelled as DATA, not as an identifier, and a read-set walk
+/// that only follows identifiers cannot see either.
+///
+/// Deliberately an ALLOWLIST, not "any sh2 call with a string arg":
+/// `sh2.exec(["echo", "xs"])` mentions `xs` as data for a child process
+/// and reads no store entry, and marking it would keep a genuinely dead
+/// declaration alive. A name this list misses is a MISS, not a crash —
+/// the worst case is one dropped `let` whose decl was unread, which is
+/// what the pass was already doing for every name.
+fn sh2_var_name_member(fn_name: &str) -> bool {
+    matches!(
+        fn_name,
+        // whole-array reductions and sorted joins (the read is the array
+        // VALUE, and the runtime resolves it against the STORE)
+        "max" | "min" | "sum" | "sortedIntJoin" | "sortedBigintJoin"
+        // element / slice / length / items reads
+        | "arrayIndex" | "arrayLen" | "arrayItems" | "arrayValues"
+        // generic store access (getVar takes "name" or "name[idx]")
+        | "getVar"
+    )
+}
+
+/// The variable name a store-reading `sh2.*` call refers to, or `None`
+/// when the first argument is not a plain name literal (a computed
+/// argument is a runtime value, never a binding this pass can reason
+/// about). `getVar("name[1]")` / `arrayIndex("name", "1")` yield the
+/// BASE name — the binding under examination is the array.
+fn sh2_call_var_name<'a>(fn_name: &str, args: &'a [Expr]) -> Option<&'a str> {
+    if !sh2_var_name_member(fn_name) {
+        return None;
+    }
+    let s = lit_str(args.first()?)?;
+    if fn_name == "getVar" || fn_name == "setVar" {
+        // "name" or "name[idx]" — the store key is the base name
+        return parse_var_arg_str(s).map(|(n, _)| n);
+    }
+    // the array members take the bare name. `#name` is the `param`-style
+    // length spelling for a few call sites; strip it so the base name is
+    // recorded either way.
+    Some(s.trim_start_matches('#'))
 }
 
 /// Does runtime-expanded text `s` reference `name` (`$name` / `${name…}`)?
@@ -1367,6 +1440,15 @@ fn classify_array_call(
             Some(n) => n,
             None => return,
         },
+        // The whole-array reductions and sorted joins: they take the bare
+        // name string and this fold must leave the name alone (the runtime
+        // resolves it against the store) — see the `store_read` arm below.
+        "max" | "min" | "sum" | "sortedIntJoin" | "sortedBigintJoin" => {
+            match lit_str(first) {
+                Some(n) => n.trim_start_matches('#'),
+                None => return,
+            }
+        }
         "getVar" | "setVar" => {
             // Literal "name[idx]" / "name", or template `name[${i}]`
             match first {
@@ -1474,6 +1556,20 @@ fn classify_array_call(
             _ => entry.index_bad = true,
         },
         "arrayLen" | "arrayItems" | "arrayValues" => entry.read_stmt_idxs.push(stmt_idx),
+        // The whole-array reductions and the sorted joins: this fold does
+        // NOT rewrite these call sites (their argument is a bare name
+        // string that the runtime resolves against the STORE), so folding
+        // the name into a native binding strands it — the surviving call
+        // reads a store that was never populated. Refusing is correct even
+        // when the LATER `array_migrate_program` would have migrated the
+        // array: that pass rewrites the call site itself, and it only gets
+        // the chance when the fold left the array alone. Measured on
+        // py-sh-go t93_extent_mixed.py, where `ys` folded while
+        // `sh2.sortedBigintJoin("ys")` survived and printed `[]`.
+        "max" | "min" | "sum" | "sortedIntJoin" | "sortedBigintJoin" => {
+            entry.store_read = true;
+            entry.read_stmt_idxs.push(stmt_idx);
+        }
         "param" => {
             let op = args.first().and_then(lit_str).unwrap_or("");
             let _target = args.get(1).and_then(lit_str).unwrap_or("");
@@ -1588,6 +1684,12 @@ fn walk_expr(e: &Expr, in_fn: bool, f: &mut impl FnMut(&Expr, bool)) {
     f(e, in_fn);
     match e {
         Expr::Identifier { .. } | Expr::Literal { .. } => {}
+        // `x = <default>` binding patterns: both sides are part of the
+        // subtree (the default expression is real code).
+        Expr::AssignmentPattern { left, right } => {
+            walk_expr(left, in_fn, f);
+            walk_expr(right, in_fn, f);
+        }
         Expr::TemplateLiteral { expressions, .. } => {
             for q in expressions {
                 walk_expr(q, in_fn, f);
@@ -1755,6 +1857,7 @@ pub(crate) fn lower_native_arrays(prog: Program) -> Program {
                 && !a.whole
                 && !a.writes
                 && !a.index_bad
+                && !a.store_read
                 && !declared.contains(*name)
         })
         .map(|(n, _)| n.clone())
@@ -1981,6 +2084,10 @@ fn lower_expr(e: Expr, natives: &std::collections::HashSet<String>) -> Expr {
                 .map(|a| lower_expr(a, natives))
                 .collect(),
             optional,
+        },
+        Expr::AssignmentPattern { left, right } => Expr::AssignmentPattern {
+            left: Box::new(lower_expr(*left, natives)),
+            right: Box::new(lower_expr(*right, natives)),
         },
         Expr::Identifier { .. } | Expr::Literal { .. } => e,
         Expr::TemplateLiteral { quasis, expressions } => Expr::TemplateLiteral {
@@ -2402,6 +2509,10 @@ fn drop_nested_flags(stmt: &mut Stmt) {
 fn drop_expr_flags(e: &mut Expr) {
     match e {
         Expr::Identifier { .. } | Expr::Literal { .. } => {}
+        Expr::AssignmentPattern { left, right } => {
+            drop_expr_flags(left);
+            drop_expr_flags(right);
+        }
         Expr::TemplateLiteral { expressions, .. } => {
             for x in expressions {
                 drop_expr_flags(x);
@@ -2996,6 +3107,34 @@ pub(crate) fn quasi_element(raw: &mut String, tail: bool) -> TemplateElement {
     }
 }
 
+/// A template-literal with NO expression slots and text that needs no
+/// escaping is just a string: `x = "World"` must emit `"World"`, not
+/// `` `World` ``.
+///
+/// The A1 ingress (otranspilerl) renders the CONTRACT export, whose words
+/// are canonical `Interpolate([Lit(..)])` nodes; the direct shell→estree
+/// path (`ast_to_estree`) reaches the same text as a plain `Str` and emits
+/// a Literal. Normalising here makes the two paths emit byte-identical
+/// ESTree for the same source — the page (contract export → render) and
+/// `otranspilerl_transpile` used to differ on every `echo "word"` and on
+/// brace-list `for i in {1..5}` iterations.
+pub(crate) fn literal_if_template_has_no_expr(e: Expr) -> Expr {
+    if let Expr::TemplateLiteral { quasis, expressions } = &e {
+        if expressions.is_empty() && quasis.len() == 1 {
+            let q = &quasis[0];
+            let cooked = q.value.cooked.as_deref().unwrap_or(&q.value.raw);
+            if !cooked.contains(['`', '\\', '$']) {
+                return Expr::Literal {
+                    value: serde_json::Value::String(cooked.to_string()),
+                    raw: None,
+                    regex: None,
+                };
+            }
+        }
+    }
+    e
+}
+
 /// Escape the literal text of a template-literal quasi. The JS emitter
 /// (estree.js → astring) writes `TemplateElement.value.raw` VERBATIM, so
 /// the three characters that are special inside a template literal must
@@ -3332,6 +3471,27 @@ fn write_expr(out: &mut String, e: &Expr) {
             out.push_str("]}");
         }
         Expr::CallExpression { callee, arguments, optional } => {
+            // `sh2.lit(x)` is the runtime's IDENTITY (`lit(v) { return v; }`)
+            // — its only job is to make the interpolation passes treat a
+            // SingleQuoted-`$` payload as opaque so they cannot rewrite the
+            // verbatim text into a JS template (see IrExpr::Str at the
+            // emission site, shir.rs). Every such pass runs during
+            // `shir_to_estree`, i.e. BEFORE this serializer, and the JSON is
+            // output-only (ingress is A1 via `shir_json_to_ir`; nothing
+            // re-reads ESTree), so by the time we get here the wrapper is
+            // dead weight: unwrapping yields a byte-identical Literal — the
+            // payload stays a plain string, never a template, because no
+            // pass runs after serialization. One less sh2.* call site per
+            // site (40 across the corpus).
+            //
+            // Fail-closed: only a single-argument wrapper unwraps. Anything
+            // else (0 or 2+ args — the emitter never produces that) keeps its
+            // call so a malformed wrapper still routes to the runtime
+            // identity instead of silently changing arity.
+            if is_sh2_call(callee, "lit") && arguments.len() == 1 {
+                write_expr(out, &arguments[0]);
+                return;
+            }
             out.push_str("{\"type\":\"CallExpression\",\"callee\":");
             write_expr(out, callee);
             out.push_str(",\"arguments\":[");
@@ -3432,6 +3592,13 @@ fn write_expr(out: &mut String, e: &Expr) {
             out.push_str("{\"type\":\"BinaryExpression\",");
             push_key(out, "operator", operator);
             out.push_str(",\"left\":");
+            write_expr(out, left);
+            out.push_str(",\"right\":");
+            write_expr(out, right);
+            out.push('}');
+        }
+        Expr::AssignmentPattern { left, right } => {
+            out.push_str("{\"type\":\"AssignmentPattern\",\"left\":");
             write_expr(out, left);
             out.push_str(",\"right\":");
             write_expr(out, right);
@@ -3592,6 +3759,10 @@ pub(crate) fn visit_exprs(prog: &mut Program, f: &mut dyn FnMut(&mut Expr)) {
         f(e);
         match e {
             Expr::Identifier { .. } | Expr::Literal { .. } => {}
+            Expr::AssignmentPattern { left, right } => {
+                expr(left, f);
+                expr(right, f);
+            }
             Expr::TemplateLiteral { quasis: _, expressions } => {
                 for x in expressions { expr(x, f); }
             }
@@ -3656,6 +3827,9 @@ pub(crate) fn has_await_expr(e: &Expr) -> bool {
     match e {
         Expr::AwaitExpression { .. } => true,
         Expr::Identifier { .. } | Expr::Literal { .. } => false,
+        Expr::AssignmentPattern { left, right } => {
+            has_await_expr(left) || has_await_expr(right)
+        }
         Expr::TemplateLiteral { expressions, .. } => expressions.iter().any(has_await_expr),
         Expr::CallExpression { callee, arguments, .. } => {
             has_await_expr(callee) || arguments.iter().any(has_await_expr)
@@ -3888,6 +4062,10 @@ pub(crate) fn await_sync_fn_calls(mut prog: Program) -> Program {
                     for a in arguments { f(a, false, false); }
                 }
                 Expr::AwaitExpression { argument } => f(argument, false, false),
+                Expr::AssignmentPattern { left, right } => {
+                    f(left, false, false);
+                    f(right, false, false);
+                }
                 Expr::FunctionExpression { params, body, .. } => {
                     for p in params { f(p, false, false); }
                     visit_stmt(body, f);
@@ -4131,6 +4309,10 @@ pub(crate) fn visit_exprs_post(prog: &mut Program, f: &mut dyn FnMut(&mut Expr))
     fn expr(e: &mut Expr, f: &mut dyn FnMut(&mut Expr)) {
         match e {
             Expr::Identifier { .. } | Expr::Literal { .. } => {}
+            Expr::AssignmentPattern { left, right } => {
+                expr(left, f);
+                expr(right, f);
+            }
             Expr::TemplateLiteral { quasis: _, expressions } => {
                 for x in expressions { expr(x, f); }
             }
@@ -4467,6 +4649,10 @@ pub(crate) fn normalize_functions(mut prog: Program) -> Program {
         ) {
             match node {
                 Expr::Identifier { .. } | Expr::Literal { .. } => {}
+                Expr::AssignmentPattern { left, right } => {
+                    walk_usage(left, owner, usage, runtime_by_name);
+                    walk_usage(right, owner, usage, runtime_by_name);
+                }
                 Expr::TemplateLiteral { expressions, .. } => {
                     for x in expressions { walk_usage(x, owner, usage, runtime_by_name); }
                 }
@@ -5183,6 +5369,10 @@ fn visit_exprs_single(e: &mut Expr, f: &mut dyn FnMut(&mut Expr)) {
     while let Some(n) = stack.pop() {
         f(n);
         match n {
+            Expr::AssignmentPattern { left, right } => {
+                stack.push(left);
+                stack.push(right);
+            }
             Expr::TemplateLiteral { expressions, .. } => {
                 for x in expressions.iter_mut() { stack.push(x); }
             }
@@ -5335,6 +5525,10 @@ pub(crate) fn return_in_loop(mut prog: Program) -> Program {
                     rewrite_expr(a, i == 1);
                 }
                 return;
+            }
+            Expr::AssignmentPattern { left, right } => {
+                rewrite_expr(left, in_loop);
+                rewrite_expr(right, in_loop);
             }
             Expr::TemplateLiteral { expressions, .. } => {
                 for x in expressions { rewrite_expr(x, in_loop); }
@@ -5848,6 +6042,10 @@ pub(crate) fn direct_shell_fn_calls(mut prog: Program) -> Program {
     }
     fn recurse_expr(e: &mut Expr, fns: &std::collections::HashMap<String, FnInfo>, _stmt_pos: bool) {
         match e {
+            Expr::AssignmentPattern { left, right } => {
+                *left = Box::new(rewrite_expr_dispatch(left, fns, false));
+                *right = Box::new(rewrite_expr_dispatch(right, fns, false));
+            }
             Expr::TemplateLiteral { expressions, .. } => {
                 for x in expressions { *x = rewrite_expr_dispatch(x, fns, false); }
             }
@@ -5972,6 +6170,17 @@ fn scan_fn_stmt(s: &Stmt, has_return: &mut bool, pos_refs: &mut bool) {
     }
 }
 
+/// True when `s` names a POSITIONAL parameter: `$1`..`$9` (a plain
+/// positional value) or `#1`..`#9` (its length). The frontends emit
+/// those as `getVar("1")` / `getVar("#1")` rather than as a
+/// `sh2.positional` member read, so the direct-call pass has to see them
+/// too — otherwise it drops the positional bridge and the body reads
+/// positionals off the caller's (empty) frame.
+fn is_positional_name(s: &str) -> bool {
+    let rest = s.strip_prefix('#').unwrap_or(s);
+    matches!(rest, "1" | "2" | "3" | "4" | "5" | "6" | "7" | "8" | "9")
+}
+
 fn scan_fn_expr(e: &Expr, has_return: &mut bool, pos_refs: &mut bool) {
     match e {
         Expr::MemberExpression { object, property, computed: false, .. }
@@ -5979,9 +6188,41 @@ fn scan_fn_expr(e: &Expr, has_return: &mut bool, pos_refs: &mut bool) {
         {
             *pos_refs = true;
         }
+        // `sh2.getVar("1")` / `sh2.getVar("#1")` — a positional value /
+        // length read in the getVar convention.
+        Expr::CallExpression { callee, arguments, .. }
+            if matches!(&**callee, Expr::MemberExpression { object, property, computed: false, .. }
+                if is_ident_expr(object, "sh2") && is_ident_expr(property, "getVar")) =>
+        {
+            if let Some(Expr::Literal { value, .. }) = arguments.first() {
+                if let Some(s) = value.as_str() {
+                    if is_positional_name(s) {
+                        *pos_refs = true;
+                    }
+                }
+            }
+        }
+        // `sh2.param(op, "1", …)` — a positional slice/len/case-op read
+        // addressed BY NUMBER rather than by a live binding.
+        Expr::CallExpression { callee, arguments, .. }
+            if matches!(&**callee, Expr::MemberExpression { object, property, computed: false, .. }
+                if is_ident_expr(object, "sh2") && is_ident_expr(property, "param")) =>
+        {
+            if let Some(Expr::Literal { value, .. }) = arguments.get(1) {
+                if let Some(s) = value.as_str() {
+                    if is_positional_name(s) {
+                        *pos_refs = true;
+                    }
+                }
+            }
+        }
         _ => {}
     }
     match e {
+        Expr::AssignmentPattern { left, right } => {
+            scan_fn_expr(left, has_return, pos_refs);
+            scan_fn_expr(right, has_return, pos_refs);
+        }
         Expr::TemplateLiteral { expressions, .. } => {
             for x in expressions { scan_fn_expr(x, has_return, pos_refs); }
         }
@@ -6057,6 +6298,211 @@ mod tests {
     fn to_json(input: &str) -> String {
         let commands = Parser::new(input).parse().unwrap();
         serde_json::to_string(&ast_to_estree(&commands)).unwrap()
+    }
+
+    /// Lower an A1 body to estree and run `direct_shell_fn_calls` on it,
+    /// reporting whether the positional bridge survived.
+    ///
+    /// This is the pass boundary the request names. A frontend (go-sh's
+    /// `len($1)`, any raw A1 producer) emits positional reads as
+    /// `getVar("1")` / `param("len","1")`; if the A1→estree lowering has
+    /// NOT already turned those into a `sh2.positional` member read, the
+    /// direct-call rewrite must not drop the bridge — otherwise the body
+    /// reads the CALLER's positional frame and the argument is dropped.
+    ///
+    /// The pass is driven directly (not through `compile_head_passes`)
+    /// because the earlier `normalize_functions` pass rewrites some
+    /// positional shapes into real JS parameters, which would mask what
+    /// this pass does on its own.
+    fn direct_call_keeps_positional_bridge(a1: serde_json::Value) -> bool {
+        let ir = crate::shir_json_in::shir_json_to_ir(&a1.to_string()).expect("A1 ingress");
+        let prog = direct_shell_fn_calls(crate::shir::shir_to_estree(&ir));
+        // Walk the emitted TREE looking for the bridge, not the serialized
+        // text: `serde_json::to_string` renders this node as
+        // `{"type":"MemberExpression","object":{...,"name":"sh2"},"property":
+        // {..."name":"positional"}}` — the source-level spelling `sh2.positional`
+        // never appears in it, so a `contains("sh2.positional")` check on the
+        // serialization can NEVER match and silently reports "bridge dropped"
+        // for a correctly-lowered program. Match the AST shape instead.
+        let json = serde_json::to_value(&prog).unwrap();
+        has_positional_member(&json)
+    }
+
+    /// Does this ESTree tree contain a read of `sh2.positional` — the
+    /// positional bridge? Matches the whole member chain, not just the bare
+    /// form: `$1` lowers to `sh2.positional[0]` and `$#` to
+    /// `sh2.positional.length`, so requiring `property == positional`
+    /// literally would miss every read except the bare one.
+    fn has_positional_member(v: &serde_json::Value) -> bool {
+        fn is_member(t: &serde_json::Value, ty: &str) -> bool {
+            t.get("type").and_then(|x| x.as_str()) == Some(ty)
+        }
+        fn is_ident(t: &serde_json::Value, name: &str) -> bool {
+            is_member(t, "Identifier") && t.get("name").and_then(|x| x.as_str()) == Some(name)
+        }
+        /// Is `v` a `sh2.positional` read, or a member/property read DERIVED
+        /// from one (`sh2.positional[0]`, `sh2.positional.length`)?
+        fn rooted_at_positional(v: &serde_json::Value) -> bool {
+            if !is_member(v, "MemberExpression") {
+                return false;
+            }
+            let object_is_positional = v
+                .get("object")
+                .map(|o| {
+                    is_member(o, "MemberExpression")
+                        && is_ident(
+                            o.get("property").unwrap_or(&serde_json::Value::Null),
+                            "positional",
+                        )
+                        && is_ident(o.get("object").unwrap_or(&serde_json::Value::Null), "sh2")
+                })
+                .unwrap_or(false);
+            let bare = is_ident(v.get("object").unwrap_or(&serde_json::Value::Null), "sh2")
+                && is_ident(
+                    v.get("property").unwrap_or(&serde_json::Value::Null),
+                    "positional",
+                );
+            bare || object_is_positional || rooted_at_positional(v.get("object").unwrap())
+        }
+        match v {
+            serde_json::Value::Object(m) => {
+                rooted_at_positional(v) || m.values().any(has_positional_member)
+            }
+            serde_json::Value::Array(a) => a.iter().any(has_positional_member),
+            _ => false,
+        }
+    }
+
+    /// An A1 program with one `f` function and one `fnCall("f", …)` site.
+    /// `body` is the function body; it decides whether the bridge is needed.
+    fn a1_fn_call(body: serde_json::Value) -> serde_json::Value {
+        let s = |v: &str| serde_json::json!({"type":"Str","value":v,"style":"DoubleQuoted"});
+        serde_json::json!({
+            "contract_version": 1,
+            "type": "Program",
+            "imports": [], "requires": [], "stmt_lines": [], "subs": [],
+            "stmts": [
+                {"type":"Function","name":"f","body":[body],"named_blocks":{}},
+                {"type":"Expr","expr":{
+                    "type":"Call","func":"builtin","purity":"Emulable",
+                    "args":[s("echo"), {"type":"Array","elements":[
+                        {"type":"Call","func":"fnCall","purity":"Emulable",
+                         "args":[s("f"), {"type":"Array","elements":[s("hi")]}]}
+                    ]}]}}
+            ]
+        })
+    }
+
+    /// An Assign of `getVar(<name>)` to `a` — the store-convention read.
+    fn a1_assign_getvar(name: &str) -> serde_json::Value {
+        serde_json::json!({
+            "type":"Assign",
+            "targets":[{"var":"a","indices":[],"sigil":null}],
+            "expr":{"type":"Call","func":"getVar","purity":"Emulable",
+                    "args":[{"type":"Str","value":name,"style":"DoubleQuoted"}]}
+        })
+    }
+
+    #[test]
+    fn direct_call_bridges_getvar_positional_reads() {
+        // `a = getVar("1")` — the getVar convention for `$1`. Without the
+        // bridge the body reads the CALLER's positional frame and the
+        // argument is silently dropped.
+        //
+        // `#1` is DELIBERATELY not in this list: the runtime's getVar
+        // contract (sh2-namespace.mjs, the `#name` arm) defines `#N` for a
+        // digit N as "the LENGTH of positional N's VALUE" — go-sh's
+        // `len(src)` over a param lowers to `getVar("#1")` and the RUNTIME
+        // must count the caller's argument. That read is resolved inside
+        // getVar against the saved positional frame, so it must stay a
+        // runtime call: forcing a compile-time `sh2.positional` bridge onto
+        // it would lower `len($1)` to `sh2.positional[0].length` and drop the
+        // element entirely. See `getvar_hash_form_stays_a_runtime_read`.
+        for name in ["1", "2", "9"] {
+            assert!(
+                direct_call_keeps_positional_bridge(a1_fn_call(a1_assign_getvar(name))),
+                "positional bridge dropped for getVar({name:?})"
+            );
+        }
+    }
+
+    /// The negative half of the above, pinned structurally: `getVar("#1")`
+    /// must NOT be rewritten into a compile-time `sh2.positional` bridge.
+    /// The runtime resolves `#N` itself (length of positional N's value),
+    /// so a bridge here would turn `len($1)` into a read of a never-written
+    /// store name.
+    #[test]
+    fn getvar_hash_form_stays_a_runtime_read() {
+        let a1 = a1_fn_call(a1_assign_getvar("#1"));
+        let ir = crate::shir_json_in::shir_json_to_ir(&a1.to_string()).expect("A1 ingress");
+        let prog = direct_shell_fn_calls(crate::shir::shir_to_estree(&ir));
+        let json = serde_json::to_string(&prog).unwrap();
+        assert!(
+            json.contains("\"name\":\"getVar\""),
+            "getVar(#1) must stay a runtime read, not a positional bridge: {json}"
+        );
+        assert!(
+            !has_positional_member(&serde_json::to_value(&prog).unwrap()),
+            "getVar(#1) must NOT acquire a sh2.positional bridge: {json}"
+        );
+    }
+
+    #[test]
+    fn direct_call_bridges_param_positional_reads() {
+        // `n = param("len","1")` — go-sh's `len($1)`, the shape the
+        // request names: a positional read addressed BY NUMBER, with the
+        // name in the SECOND argument.
+        //
+        // `slice` is NOT in this list: `${1:off:len}` is a substring of a
+        // positional VALUE, and the runtime resolves that slice against the
+        // saved positional frame. The `len` op is the same argument in a
+        // different position (a real arithmetic op that keeps the argument
+        // live through the call) and the empty op is the bare read.
+        for op in ["len", ""] {
+            let body = serde_json::json!({
+                "type":"Assign",
+                "targets":[{"var":"a","indices":[],"sigil":null}],
+                "expr":{"type":"Call","func":"param","purity":"Emulable",
+                        "args":[{"type":"Str","value":op,"style":"DoubleQuoted"},
+                                {"type":"Str","value":"1","style":"DoubleQuoted"}]}
+            });
+            assert!(
+                direct_call_keeps_positional_bridge(a1_fn_call(body)),
+                "positional bridge dropped for param({op:?},\"1\")"
+            );
+        }
+    }
+
+    #[test]
+    fn direct_call_without_positional_read_stays_direct() {
+        // The negative half: a body with NO positional read must not pay
+        // the save/restore bridge — that is the point of the rewrite.
+        // `getVar("a")` names a store var; `getVar("0")` is not a
+        // positional ($0 is argv0, read through a different channel).
+        for name in ["a", "0", "#0", "10", "x1"] {
+            assert!(
+                !direct_call_keeps_positional_bridge(a1_fn_call(a1_assign_getvar(name))),
+                "bridge emitted for the non-positional read getVar({name:?})"
+            );
+        }
+    }
+
+    #[test]
+    fn zz_probe3() {
+        for (nm, body) in [("getvar1", a1_assign_getvar("1")),
+                           ("param_len1", serde_json::json!({
+                             "type":"Assign",
+                             "targets":[{"var":"a","indices":[],"sigil":null}],
+                             "expr":{"type":"Call","func":"param","purity":"Emulable",
+                                     "args":[{"type":"Str","value":"len","style":"DoubleQuoted"},
+                                             {"type":"Str","value":"1","style":"DoubleQuoted"}]}}))] {
+            let a1 = a1_fn_call(body);
+            let ir = crate::shir_json_in::shir_json_to_ir(&a1.to_string()).expect("ingress");
+            let e = crate::shir::shir_to_estree(&ir);
+            let s = serde_json::to_string(&e).unwrap();
+            println!("### {nm}: has_positional={} has_getVar={} has_param={}",
+                s.contains("sh2.positional"), s.contains("getVar"), s.contains(r#""param""#));
+        }
     }
 
     #[test]
@@ -6411,9 +6857,15 @@ mod tests {
         assert!(json2.contains("\"name\":\"cwd\""));
         assert!(!json2.contains("\"name\":\"test\""));
         assert!(!json2.contains("unsupported"));
-        // a cmdsub with a dynamic command keeps the runtime test
+        // a cmdsub with a dynamic command is PRE-EVALUATED into a temp
+        // (core request c-20261009-215050): the capture lowers natively
+        // (`fs.readFile`) and the compare is native — no runtime test
+        // text (which would spawn a child bash per evaluation), no
+        // unsupported.
         let json3 = to_json("[[ \"$(cat f)\" = x ]]");
-        assert!(json3.contains("\"name\":\"test\""));
+        assert!(!json3.contains("\"name\":\"test\""));
+        assert!(json3.contains("\"name\":\"readFile\""));
+        assert!(json3.contains("\"name\":\"setVar\""));
         assert!(!json3.contains("unsupported"));
     }
 
@@ -6960,7 +7412,14 @@ mod tests {
         // the capture value (the runtime capture always yields a string) —
         // no store round-trip. A pure echo capture lowers all the way to a
         // native join; other captures keep the await sh2.capture call.
-        let json3 = to_json("x=$(echo hi)");
+        //
+        // `x` MUST BE READ for the capture to survive: a write to a var that
+        // is never read is dead code and is correctly eliminated (an empty
+        // body), so the bare `x=$(echo hi)` form can never contain an
+        // AssignmentExpression and asserting one there pins nothing. Reading
+        // it back (`y=$x`) is what makes the lifted write observable, and it
+        // is the shape the corpus actually exercises.
+        let json3 = to_json("x=$(echo hi)\ny=$x\necho $y");
         assert!(json3.contains("\"type\":\"AssignmentExpression\""));
         // the pure echo capture folds to a single literal (the join of one
         // literal arg is the literal itself — no runtime join machinery)
@@ -7511,20 +7970,23 @@ greet");
     }
 
     #[test]
-    fn nested_param_default_chain_lowers_to_getvar_ternaries() {
+    fn nested_param_default_chain_lowers_to_store_read_ternaries() {
         // ${var:-${default:-${fallback:-$(echo "computed")}}} — the
         // nested chain: the runtime's expandWord would spawn bash for
-        // the $(echo) cmdsub; the native is a getVar ternary chain (one
-        // per level, `_g`-scratched) with the literal echo default. No
-        // param call, no spawn.
+        // the $(echo) cmdsub; the native is a `_g`-scratched ternary
+        // chain of store reads, one per level, with the literal echo
+        // default. No param call, no spawn.
         let json = to_json("echo \"${var:-${default:-${fallback:-$(echo \"computed\")}}}\"");
-        // the never-written `var` level reads through the runtime getVar
-        // dispatch ONCE (the `_g`-scratched primary — the DCE-safety
-        // fallback: the optimizer may have eliminated the only write while
-        // preserving the param read, so a folded "" primary would be
-        // unsound); the nested default levels read via the native store
-        // read (env-fallback property reads — no getVar dispatch)
-        assert_eq!(json.matches("\"name\":\"getVar\"").count(), 1);
+        // every plain-ident level — the never-written `var` primary
+        // included — reads through store_var_read_no_fold's native
+        // `sh2.vars.n ?? process.env.n ?? ''` into the `_g` scratch: the
+        // runtime getVar's exact plain-name decision inlined (the env
+        // fallback is what keeps it DCE-safe — never the "" fold, which
+        // parameter-expansion-nested.sh proved unsound for nested reads).
+        // Eligible plain names keep no getVar dispatch call at all.
+        assert_eq!(json.matches("\"name\":\"getVar\"").count(), 0, "{json}");
+        assert_eq!(json.matches("\"name\":\"env\"").count(), 3, "every level keeps the env fallback: {json}");
+        assert!(json.contains("\"name\":\"_g\""));
         assert!(json.contains("computed"));
         assert!(!json.contains("\"name\":\"param\""));
         assert!(!json.contains("unsupported"));
@@ -7537,10 +7999,10 @@ greet");
         assert!(!json2.contains("\"name\":\"param\""));
         // a ${NAME} plain-ref default lowers to the native store read too
         let json3 = to_json("echo ${MOUNTPOINT:-${NAME}}");
-        // the never-written MOUNTPOINT level reads through the same
-        // DCE-safety getVar fallback (once); the live NAME level reads
-        // natively
-        assert_eq!(json3.matches("\"name\":\"getVar\"").count(), 1);
+        // both levels — never-written MOUNTPOINT and live NAME — are
+        // eligible plain idents, so both read natively (store_var_read_no_fold,
+        // env fallback kept; no getVar dispatch call)
+        assert_eq!(json3.matches("\"name\":\"getVar\"").count(), 0, "{json3}");
         assert!(!json3.contains("\"name\":\"param\""));
     }
 
@@ -8415,6 +8877,11 @@ fn expr_read_set<'a>(e: &'a Expr, shadow: &ReadSet<'a>) -> ReadSet<'a> {
             out
         }
         Expr::Literal { .. } => ReadSet::new(),
+        // A defaulted parameter binds its own name (this walk is used to
+        // collect BINDINGS from a params list, not reads), so only the
+        // left side belongs here — a default expression's outer reads
+        // must not become shadows.
+        Expr::AssignmentPattern { left, .. } => expr_read_set(left, shadow),
         Expr::TemplateLiteral { expressions, .. } => {
             let mut out = ReadSet::new();
             for x in expressions {
@@ -8426,6 +8893,22 @@ fn expr_read_set<'a>(e: &'a Expr, shadow: &ReadSet<'a>) -> ReadSet<'a> {
             let mut out = expr_read_set(callee, shadow);
             for a in arguments {
                 out.extend(expr_read_set(a, shadow));
+            }
+            // A store-reading `sh2.*` call spells the variable as a STRING
+            // LITERAL (`sh2.max("xs")`), which the identifier walk above
+            // cannot see — the name would look unread and a leading
+            // `let xs = […]` (the native-array fold's replacement for the
+            // `sh2.setArray` that fed the store) would be dropped as dead,
+            // leaving the call to read an empty store. t92_max_min_sum:
+            // `xs = [3,1,…]` + `print(max(xs))` printed `0` six times for
+            // exactly this reason. Count the name as a read; a name under
+            // a SHADOW is the shadowing binding's, not this one's.
+            if let Some(fn_name) = sh2_callee_name(callee) {
+                if let Some(name) = sh2_call_var_name(fn_name, arguments) {
+                    if !shadow.contains(name) {
+                        out.insert(name);
+                    }
+                }
             }
             out
         }

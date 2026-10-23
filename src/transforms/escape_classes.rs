@@ -63,6 +63,14 @@ pub enum EscapeClass {
 /// verdicts keyed by variable name (one compilation per process).
 static VERDICTS: Mutex<Option<HashMap<String, EscapeClass>>> = Mutex::new(None);
 
+/// Drop the cached verdict — the out-of-band caller's reset (see
+/// `transforms::reset_verdicts`). These transforms are analysis-only: they
+/// return `false` from `run()` and a RENDERER reads the verdict, so without
+/// a reset a second run observes the PREVIOUS input's verdict.
+pub fn clear_verdicts() {
+    *VERDICTS.lock().unwrap() = None;
+}
+
 pub fn verdict(name: &str) -> Option<EscapeClass> {
     VERDICTS.lock().unwrap().as_ref().and_then(|m| m.get(name).copied())
 }

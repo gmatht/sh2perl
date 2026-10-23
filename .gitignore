@@ -91,3 +91,17 @@ target-core/
 
 # uu-ffi build artifact (runtime/build_uu_ffi.sh reproduces it; do not commit the 24MB .so)
 runtime/lib/
+
+# agent session logs / scratch (never commit)
+.pir/
+.scratch/
+
+# AI scratchpad (debug output)
+scratchpad/
+
+# worktree-local CLI build for the Ext-node work (untracked)
+/otranspilerl/
+
+# python bytecode from the runtime tools (fbdev-faces.py, the silhouette oracle)
+__pycache__/
+*.pyc

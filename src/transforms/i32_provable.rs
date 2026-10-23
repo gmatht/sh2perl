@@ -48,6 +48,14 @@ use crate::ir::{ArithAst, IrExpr, IrStmt};
 /// index of the Assign/Expr that carries the Arith node.
 static VERDICTS: Mutex<Option<HashSet<(String, usize)>>> = Mutex::new(None);
 
+/// Drop the cached verdict — the out-of-band caller's reset (see
+/// `transforms::reset_verdicts`). These transforms are analysis-only: they
+/// return `false` from `run()` and a RENDERER reads the verdict, so without
+/// a reset a second run observes the PREVIOUS input's verdict.
+pub fn clear_verdicts() {
+    *VERDICTS.lock().unwrap() = None;
+}
+
 pub fn is_i32(fn_name: &str, stmt_idx: usize) -> bool {
     VERDICTS
         .lock()

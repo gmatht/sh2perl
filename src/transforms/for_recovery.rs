@@ -150,7 +150,7 @@ fn parse_test_str(s: &str) -> Option<(String, BinOpKind, i64)> {
         let tail = rest[var_end..].trim();
         let mut it = tail.splitn(2, ' ');
         let op = it.next()?;
-        let num: i64 = it.next()?.trim().parse().ok()?;
+        let num = it.next()?.trim().parse().ok()?;
         let kind = match op {
             "-lt" => BinOpKind::Lt,
             "-le" => BinOpKind::Le,
@@ -162,7 +162,7 @@ fn parse_test_str(s: &str) -> Option<(String, BinOpKind, i64)> {
     }
     // "10 -lt $i" — bound first: 10 < i ≡ i > 10, etc.
     let mut it = s.splitn(3, ' ');
-    let num: i64 = it.next()?.parse().ok()?;
+    let num = it.next()?.parse().ok()?;
     let op = it.next()?;
     let var = it.next()?.strip_prefix('$')?.to_string();
     let kind = match op {

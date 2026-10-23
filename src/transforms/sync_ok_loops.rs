@@ -88,6 +88,15 @@ const STMT_COST_US: u64 = 3;
 static SYNC_OK_LOOPS: Mutex<Option<HashSet<usize>>> = Mutex::new(None);
 static BATCH_OK_LOOPS: Mutex<Option<HashSet<usize>>> = Mutex::new(None);
 
+/// Drop the cached verdict — the out-of-band caller's reset (see
+/// `transforms::reset_verdicts`). These transforms are analysis-only: they
+/// return `false` from `run()` and a RENDERER reads the verdict, so without
+/// a reset a second run observes the PREVIOUS input's verdict.
+pub fn clear_verdicts() {
+    *SYNC_OK_LOOPS.lock().unwrap() = None;
+    *BATCH_OK_LOOPS.lock().unwrap() = None;
+}
+
 /// Renderer hook: is this loop marked "do not break up" (run as ONE sync
 /// chunk)? Read by `compute_async_region_loops` + the loop sync gate.
 pub fn sync_ok(st: &IrStmt) -> bool {
@@ -418,7 +427,7 @@ fn brace_count(e: &IrExpr) -> Option<u64> {
         IrExpr::Call { func, args, .. } if func == "brace" && args.len() >= 2 => match &args[1] {
             IrExpr::Json(serde_json::Value::Array(groups)) => {
                 let range = groups.first()?.as_array()?.first()?.get("range")?;
-                let start: i64 = range.as_array()?.first()?.as_str()?.parse().ok()?;
+                let start = range.as_array()?.first()?.as_str()?.parse().ok()?;
                 let end: i64 = range.as_array()?.get(1)?.as_str()?.parse().ok()?;
                 if end >= start {
                     Some((end - start + 1) as u64)

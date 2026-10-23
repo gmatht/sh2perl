@@ -99,6 +99,20 @@ const ZIG_RESERVED: &[&str] = &[
     "sh2B2S",
 ];
 
+/// sh2.* callee names that collide with a real runtime helper (or the
+/// generic sh2TODO) — their per-callee stub gets a `Stub` suffix so the
+/// call site and the definition agree.
+const RESERVED_STUB: &[&str] = &[
+    "sh2TODO",
+    "sh2ToInt",
+    "sh2IntStr",
+    "sh2Truthy",
+    "sh2StrCat",
+    "sh2B2S",
+    "sh2Test",
+    "sh2Arith",
+];
+
 #[derive(Default)]
 pub struct Render {
     out: Vec<String>,
@@ -124,6 +138,8 @@ pub struct Render {
     need_fexist: bool,
     need_writefile: bool,
     need_run: bool,
+    /// glob matching helper needed (case patterns with wildcards)
+    need_glob: bool,
     loop_depth: usize,
     todo: usize,
     /// inside a user-function body (A1 Function): getVar("N") reads the
@@ -133,10 +149,27 @@ pub struct Render {
     pending_fns: Vec<String>,
     /// vars local to a hoisted user function (never declared in main)
     fn_locals: BTreeSet<String>,
+    /// set-typed arrays (`factors = set(); factors.add(x)`) — lowered to
+    /// a fixed i64 array + length counter (the C backend's model)
+    set_arrays: BTreeSet<String>,
+    /// set/list arrays with bigint elements — lowered to a fixed
+    /// std.math.big.int.Managed array + length counter
+    bigint_arrays: BTreeSet<String>,
+    /// bigint vars (arith beyond i64) — lowered to std.math.big.int.Managed
+    bigint_vars: BTreeSet<String>,
+    /// user functions whose body uses `try` (bigint/file IO) — they
+    /// return `![]const u8`, so call sites need `catch ""`
+    error_fns: BTreeSet<String>,
     /// counter for generated temp names (for-loop item bindings)
     tmp_counter: usize,
     /// text-ops primitive helpers (sh2Contains/sh2Sub/…) needed
     need_ext: bool,
+    /// sortedIntJoin helper (set-array sort+dedup+join) needed
+    need_sorted: bool,
+    /// max/min/sum reduction helpers needed
+    need_reduce: bool,
+    /// bigint (std.math.big.int.Managed) helpers needed
+    need_bigint: bool,
 }
 
 /// Render an `IrProgram` to Zig source.
@@ -170,6 +203,31 @@ pub fn shir_to_zig(prog: &IrProgram) -> String {
 }
 
 /// The Zig format specifier for a statically-typed part.
+/// A bare identifier (no spaces/operators) — used to recognize the
+/// cstyleFor loop var and increment LHS.
+fn is_ident(s: &str) -> bool {
+    !s.is_empty() && s.chars().all(|c| c.is_ascii_alphanumeric() || c == '_')
+}
+
+/// The single value of a trailing `echo V` statement (the function-return
+/// convention), or None for any other shape.
+fn trailing_echo_value(s: &IrStmt) -> Option<IrExpr> {
+    if let IrStmt::Expr(IrExpr::Call { func, args }) = s {
+        if func == "exec" {
+            if let Some(IrExpr::Str(cmd, _)) = args.first() {
+                if cmd == "echo" {
+                    if let Some(IrExpr::Array(items)) = args.get(1) {
+                        if items.len() == 1 {
+                            return items.first().cloned();
+                        }
+                    }
+                }
+            }
+        }
+    }
+    None
+}
+
 fn spec_char(spec: char) -> &'static str {
     match spec {
         'd' => "{d}",
@@ -362,7 +420,14 @@ impl Render {
                     format!("sh2ToInt({m})")
                 }
             }
-            IrExpr::Arith(a) => self.arith(a),
+            IrExpr::Arith(a) => {
+                if crate::shir::arith_refs_bigint(a, &self.bigint_vars) {
+                    self.need_bigint = true;
+                    let t = self.arith_bigint(a);
+                    return format!("@intCast({t}.toConst().toInt(i64) catch 0)");
+                }
+                self.arith(a)
+            }
             IrExpr::BinOp { lhs: _, op, rhs: _ }
                 if matches!(
                     op,
@@ -458,6 +523,11 @@ impl Render {
             }
             IrExpr::Interpolate(parts) => self.interpolate(parts),
             IrExpr::Arith(a) => {
+                if crate::shir::arith_refs_bigint(a, &self.bigint_vars) {
+                    self.need_bigint = true;
+                    let t = self.arith_bigint(a);
+                    return format!("sh2BigIntStr({t})");
+                }
                 self.need_intstr = true;
                 format!("sh2IntStr({})", self.arith(a))
             }
@@ -577,10 +647,10 @@ impl Render {
                 if let Some(code) = self.ext_value_zig(n.as_ref(), false) {
                     code
                 } else {
-                    let ctx = crate::render_ext_expr::ExprRenderCtx {
-                        backend: crate::render_ext_expr::Backend::Zig,
-                        indent: 0,
-                    };
+                    let ctx = crate::render_ext_expr::ExprRenderCtx::bare(
+                        crate::render_ext_expr::Backend::Zig,
+                        0,
+                    );
                     if let Some(code) = crate::render_ext_expr::render(&**n, &ctx) {
                         code
                     } else {
@@ -669,7 +739,13 @@ impl Render {
                 BinOpKind::Concat => format!("({} .len != 0)", self.expr_str(e)),
                 _ => format!("({} != 0)", self.expr_num(e)),
             },
-            IrExpr::Arith(a) => format!("({} != 0)", self.arith(a)),
+            IrExpr::Arith(a) => {
+                if crate::shir::arith_refs_bigint(a, &self.bigint_vars) {
+                    self.bigint_cond(a)
+                } else {
+                    format!("({} != 0)", self.arith(a))
+                }
+            }
             IrExpr::Call { func, args } if func == "test" => {
                 if let Some(IrExpr::Str(s, _)) = args.first() {
                     if let Some(c) = self.test_render(s) {
@@ -769,10 +845,10 @@ impl Render {
                 if let Some(code) = self.ext_value_zig(n.as_ref(), false) {
                     code
                 } else {
-                    let ctx = crate::render_ext_expr::ExprRenderCtx {
-                        backend: crate::render_ext_expr::Backend::Zig,
-                        indent: 0,
-                    };
+                    let ctx = crate::render_ext_expr::ExprRenderCtx::bare(
+                        crate::render_ext_expr::Backend::Zig,
+                        0,
+                    );
                     if let Some(code) = crate::render_ext_expr::render(&**n, &ctx) {
                         code
                     } else {
@@ -871,6 +947,11 @@ impl Render {
             IrExpr::Call { func, args } if func == "getVar" => {
                 if let Some(IrExpr::Str(name, _)) = args.first() {
                     self.mark_read(name);
+                    if self.bigint_vars.contains(name) {
+                        self.need_bigint = true;
+                        let m = self.zig_ident(name);
+                        return ('s', format!("sh2BigIntStr({m})"));
+                    }
                     if self.is_num(name) {
                         self.mark_read(name);
                         return ('d', self.expr_num(e));
@@ -933,6 +1014,18 @@ impl Render {
         match a {
             ArithAst::Num(n) => n.to_string(),
             ArithAst::Var(name) | ArithAst::Ident(name) => {
+                // inside a user function, a bare positional (`$1`) reads
+                // the param channel, not the process env
+                if self.in_function
+                    && !name.is_empty()
+                    && name.bytes().all(|b| b.is_ascii_digit())
+                {
+                    let idx: usize = name.parse().unwrap_or(1);
+                    self.need_toint = true;
+                    return format!(
+                        "sh2ToInt(if (__args.len >= {idx}) __args[{idx} - 1] else \"\")"
+                    );
+                }
                 if !self.declared(name) {
                     self.sh2_calls.insert("getVar".into());
                     self.need_toint = true;
@@ -986,10 +1079,192 @@ impl Render {
             ArithAst::Assign { .. } | ArithAst::IncDec { .. } => {
                 // runtime setVar semantics (x=, x+=, x++) — sh2.arith stub
                 self.sh2_calls.insert("arith".into());
-                "sh2Arith()".to_string()
+                "sh2ArithStub()".to_string()
             }
             ArithAst::Sizeof(ty) => ty.c_sizeof().unwrap_or(4).to_string(),
             ArithAst::Cast { arg, .. } => self.arith(arg),
+        }
+    }
+
+    // ── bigint (std.math.big.int.Managed) ────────────────────────────
+
+    /// Evaluate a bigint arith into a fresh Managed temp; returns its
+    /// name. The temp is declared + deferred before the current
+    /// statement's expression, so the caller can reference it in a
+    /// print/assign that follows.
+    fn arith_bigint(&mut self, a: &ArithAst) -> String {
+        self.bigint_eval_temp(a)
+    }
+
+    /// Materialize an operand as a Managed expression: bigint vars read
+    /// directly, everything else evaluates into a fresh temp.
+    fn bigint_operand(&mut self, a: &ArithAst) -> String {
+        match a {
+            ArithAst::Var(name) | ArithAst::Ident(name)
+                if self.bigint_vars.contains(name) =>
+            {
+                let m = self.zig_ident(name);
+                self.mark_read(name);
+                m
+            }
+            _ => self.bigint_eval_temp(a),
+        }
+    }
+
+    /// Evaluate bigint arith into a fresh Managed temp; returns its name.
+    fn bigint_eval_temp(&mut self, a: &ArithAst) -> String {
+        self.need_bigint = true;
+        let t = self.fresh_tmp("__bi");
+        self.emit(&format!(
+            "var {t} = try std.math.big.int.Managed.init(std.heap.page_allocator);"
+        ));
+        self.emit(&format!("defer {t}.deinit();"));
+        self.bigint_into(a, &t);
+        t
+    }
+
+    /// Compute bigint arith `a` into the already-initialized Managed
+    /// `target`. `//`/`%` are Python FLOOR ops (divFloor); `**` with a
+    /// negative exponent is 0.
+    fn bigint_into(&mut self, a: &ArithAst, target: &str) {
+        self.need_bigint = true;
+        match a {
+            ArithAst::Num(n) => {
+                self.emit(&format!("try {target}.setString(10, \"{n}\");"));
+            }
+            ArithAst::Var(name) | ArithAst::Ident(name) => {
+                if self.bigint_vars.contains(name) {
+                    let m = self.zig_ident(name);
+                    self.mark_read(name);
+                    self.emit(&format!("try {target}.copy({m}.toConst());"));
+                } else if self.is_num(name) {
+                    let m = self.zig_ident(name);
+                    self.mark_read(name);
+                    self.emit(&format!("try {target}.set({m});"));
+                } else {
+                    // positional / string var: parse its decimal text
+                    let v = self.bigint_str_operand(name);
+                    self.emit(&format!("try {target}.setString(10, {v});"));
+                }
+            }
+            ArithAst::Bin { op, lhs, rhs } => {
+                let lt = self.bigint_operand(lhs);
+                let rt = self.bigint_operand(rhs);
+                match op.as_str() {
+                    "+" => self.emit(&format!("try {target}.add(&{lt}, &{rt});")),
+                    "-" => self.emit(&format!("try {target}.sub(&{lt}, &{rt});")),
+                    "*" => self.emit(&format!("try {target}.mul(&{lt}, &{rt});")),
+                    "/" => {
+                        // floor div; zero divisor → 0
+                        self.emit(&format!(
+                            "if ({rt}.toConst().orderAgainstScalar(0) == .eq) {{ try {target}.set(0); }} else {{"
+                        ));
+                        self.emit(&format!(
+                            "    var __r = try std.math.big.int.Managed.init(std.heap.page_allocator); defer __r.deinit();"
+                        ));
+                        self.emit(&format!("    try {target}.divFloor(&__r, &{lt}, &{rt});"));
+                        self.emit("}");
+                    }
+                    "%" => {
+                        self.emit(&format!(
+                            "if ({rt}.toConst().orderAgainstScalar(0) == .eq) {{ try {target}.set(0); }} else {{"
+                        ));
+                        self.emit(&format!(
+                            "    var __q = try std.math.big.int.Managed.init(std.heap.page_allocator); defer __q.deinit();"
+                        ));
+                        self.emit(&format!("    try __q.divFloor(&{target}, &{lt}, &{rt});"));
+                        self.emit("}");
+                    }
+                    "**" => {
+                        self.emit(&format!(
+                            "if ({rt}.toConst().orderAgainstScalar(0) == .lt) {{ try {target}.set(0); }} else {{"
+                        ));
+                        self.emit(&format!(
+                            "    try {target}.pow(&{lt}, @intCast({rt}.toConst().toInt(u32) catch 0));"
+                        ));
+                        self.emit("}");
+                    }
+                    _ => {
+                        self.mark_todo(&format!("bigint op {op}"));
+                        self.emit(&format!("try {target}.set(0);"));
+                    }
+                }
+            }
+            ArithAst::Un { op, arg } => {
+                let at = self.bigint_operand(arg);
+                match op.as_str() {
+                    "-" => {
+                        let z = self.fresh_tmp("__bi");
+                        self.emit(&format!(
+                            "var {z} = try std.math.big.int.Managed.initSet(std.heap.page_allocator, 0); defer {z}.deinit();"
+                        ));
+                        self.emit(&format!("try {target}.sub(&{z}, &{at});"));
+                    }
+                    "+" => self.emit(&format!("try {target}.copy({at}.toConst());")),
+                    "!" => self.emit(&format!(
+                        "try {target}.set(@intFromBool({at}.toConst().orderAgainstScalar(0) == .eq));"
+                    )),
+                    _ => {
+                        self.mark_todo(&format!("bigint unop {op}"));
+                        self.emit(&format!("try {target}.set(0);"));
+                    }
+                }
+            }
+            ArithAst::Cast { arg, .. } => self.bigint_into(arg, target),
+            _ => {
+                self.mark_todo("bigint arith shape");
+                self.emit(&format!("try {target}.set(0);"));
+            }
+        }
+    }
+
+    /// A string operand for bigint setString: a positional/string var's
+    /// value (or "0" when undeclared).
+    fn bigint_str_operand(&mut self, name: &str) -> String {
+        if self.in_function && !name.is_empty() && name.bytes().all(|b| b.is_ascii_digit()) {
+            let idx: usize = name.parse().unwrap_or(1);
+            return format!(
+                "(if (__args.len >= {idx}) __args[{idx} - 1] else \"0\")"
+            );
+        }
+        if self.declared(name) {
+            let m = self.zig_ident(name);
+            self.mark_read(name);
+            return m;
+        }
+        self.sh2_calls.insert("getVar".into());
+        "sh2GetVar()".to_string()
+    }
+
+    /// A bigint arith in a BOOLEAN (condition) position: a comparison
+    /// evaluates both sides into Managed temps and compares via order
+    /// (exact — never truncates past i64); any other bigint value is
+    /// truthy iff its sign is nonzero.
+    fn bigint_cond(&mut self, a: &ArithAst) -> String {
+        self.need_bigint = true;
+        match a {
+            ArithAst::Bin { op, lhs, rhs }
+                if matches!(op.as_str(), "==" | "!=" | "<" | ">" | "<=" | ">=") =>
+            {
+                let lt = self.bigint_operand(lhs);
+                let rt = self.bigint_operand(rhs);
+                let ord = format!(
+                    "std.math.big.int.Managed.order({lt}, {rt})"
+                );
+                match op.as_str() {
+                    "==" => format!("({ord} == .eq)"),
+                    "!=" => format!("({ord} != .eq)"),
+                    "<" => format!("({ord} == .lt)"),
+                    ">" => format!("({ord} == .gt)"),
+                    "<=" => format!("({ord} != .gt)"),
+                    ">=" => format!("({ord} != .lt)"),
+                    _ => unreachable!(),
+                }
+            }
+            _ => {
+                let t = self.bigint_eval_temp(a);
+                format!("({t}.toConst().orderAgainstScalar(0) != .eq)")
+            }
         }
     }
 
@@ -1038,8 +1313,263 @@ impl Render {
             })
             .collect();
         let norm = norm.replace('{', " ").replace('}', " ");
+        if let Some(v) = self.mathfunc_arith_zig(norm.trim()) {
+            return Some(v);
+        }
         let ast = crate::shir::parse_arith(norm.trim())?;
         Some(self.arith(&ast))
+    }
+
+    /// zsh-mathfunc arith text → native Zig numeric expression. The
+    /// py-sh-go frontend emits `int(sqrt($1)) + 1`-style loop bounds as
+    /// arith texts; real bash cannot even parse a mathfunc call (it is a
+    /// bash arith SYNTAX error), so this is a dedicated parser (the same
+    /// shape as the C backend's mathfunc_arith_c). `int()` truncates
+    /// toward zero (@intFromFloat); the other names are the same-named
+    /// Zig float builtins.
+    fn mathfunc_arith_zig(&mut self, src: &str) -> Option<String> {
+        let chars: Vec<char> = src.chars().collect();
+        let mut pos = 0usize;
+        let out = self.mf_cmp(&chars, &mut pos)?;
+        Self::mf_ws(&chars, &mut pos);
+        if pos != chars.len() {
+            return None;
+        }
+        Some(out)
+    }
+
+    fn mf_ws(chars: &[char], pos: &mut usize) {
+        while *pos < chars.len() && chars[*pos].is_whitespace() {
+            *pos += 1;
+        }
+    }
+
+    fn mf_cmp(&mut self, chars: &[char], pos: &mut usize) -> Option<String> {
+        let l = self.mf_add(chars, pos)?;
+        Self::mf_ws(chars, pos);
+        let rest: String = chars[*pos..].iter().collect();
+        for op in ["<=", ">=", "==", "!=", "<", ">"] {
+            if rest.starts_with(op) {
+                *pos += op.len();
+                let r = self.mf_add(chars, pos)?;
+                return Some(format!("@intFromBool(({l}) {op} ({r}))"));
+            }
+        }
+        Some(l)
+    }
+
+    fn mf_add(&mut self, chars: &[char], pos: &mut usize) -> Option<String> {
+        let mut l = self.mf_mul(chars, pos)?;
+        loop {
+            Self::mf_ws(chars, pos);
+            let op = match chars.get(*pos) {
+                Some('+') => "+",
+                Some('-') => "-",
+                _ => return Some(l),
+            };
+            *pos += 1;
+            let r = self.mf_mul(chars, pos)?;
+            l = format!("(({l}) {op} ({r}))");
+        }
+    }
+
+    fn mf_mul(&mut self, chars: &[char], pos: &mut usize) -> Option<String> {
+        let mut l = self.mf_pow(chars, pos)?;
+        loop {
+            Self::mf_ws(chars, pos);
+            if chars.get(*pos) == Some(&'*') && chars.get(*pos + 1) != Some(&'*') {
+                *pos += 1;
+                let r = self.mf_pow(chars, pos)?;
+                l = format!("(({l}) * ({r}))");
+            } else if chars.get(*pos) == Some(&'/') {
+                *pos += 1;
+                let r = self.mf_pow(chars, pos)?;
+                l = format!("(@as(f64, @floatFromInt({l})) / @as(f64, @floatFromInt({r})))");
+            } else {
+                return Some(l);
+            }
+        }
+    }
+
+    fn mf_pow(&mut self, chars: &[char], pos: &mut usize) -> Option<String> {
+        Self::mf_ws(chars, pos);
+        let signed = matches!(chars.get(*pos), Some('+') | Some('-'));
+        let base = self.mf_unary(chars, pos)?;
+        Self::mf_ws(chars, pos);
+        if chars.get(*pos) == Some(&'*') && chars.get(*pos + 1) == Some(&'*') {
+            if signed {
+                return None;
+            }
+            *pos += 2;
+            let exp = self.mf_unary(chars, pos)?;
+            return Some(format!("std.math.pow(f64, @as(f64, @floatFromInt({base})), @as(f64, @floatFromInt({exp})))"));
+        }
+        Some(base)
+    }
+
+    fn mf_unary(&mut self, chars: &[char], pos: &mut usize) -> Option<String> {
+        Self::mf_ws(chars, pos);
+        match chars.get(*pos) {
+            Some('+') => {
+                *pos += 1;
+                self.mf_unary(chars, pos)
+            }
+            Some('-') => {
+                *pos += 1;
+                Some(format!("(-{})", self.mf_unary(chars, pos)?))
+            }
+            _ => self.mf_atom(chars, pos),
+        }
+    }
+
+    fn mf_atom(&mut self, chars: &[char], pos: &mut usize) -> Option<String> {
+        Self::mf_ws(chars, pos);
+        match chars.get(*pos) {
+            Some('(') => {
+                *pos += 1;
+                let e = self.mf_cmp(chars, pos)?;
+                Self::mf_ws(chars, pos);
+                if chars.get(*pos) != Some(&')') {
+                    return None;
+                }
+                *pos += 1;
+                Some(format!("({e})"))
+            }
+            Some('$') => self.mf_dollar(chars, pos),
+            Some(c) if c.is_ascii_digit() || *c == '.' => Self::mf_number(chars, pos),
+            Some(c) if c.is_ascii_alphabetic() || *c == '_' => self.mf_named(chars, pos),
+            _ => None,
+        }
+    }
+
+    fn mf_dollar(&mut self, chars: &[char], pos: &mut usize) -> Option<String> {
+        *pos += 1;
+        if chars.get(*pos) == Some(&'{') {
+            *pos += 1;
+            let name = Self::mf_name(chars, pos)?;
+            Self::mf_ws(chars, pos);
+            if chars.get(*pos) != Some(&'}') {
+                return None;
+            }
+            *pos += 1;
+            return Some(self.mf_numref(&name));
+        }
+        let name = Self::mf_name(chars, pos)?;
+        Some(self.mf_numref(&name))
+    }
+
+    fn mf_name(chars: &[char], pos: &mut usize) -> Option<String> {
+        let start = *pos;
+        while let Some(c) = chars.get(*pos) {
+            if c.is_ascii_alphanumeric() || *c == '_' {
+                *pos += 1;
+            } else {
+                break;
+            }
+        }
+        if *pos == start {
+            return None;
+        }
+        Some(chars[start..*pos].iter().collect())
+    }
+
+    fn mf_named(&mut self, chars: &[char], pos: &mut usize) -> Option<String> {
+        let name = Self::mf_name(chars, pos)?;
+        let save = *pos;
+        Self::mf_ws(chars, pos);
+        if chars.get(*pos) != Some(&'(') {
+            *pos = save;
+            return Some(self.mf_numref(&name));
+        }
+        *pos += 1;
+        let mut args: Vec<String> = Vec::new();
+        Self::mf_ws(chars, pos);
+        if chars.get(*pos) == Some(&')') {
+            *pos += 1;
+            return self.mf_call(&name, args);
+        }
+        loop {
+            args.push(self.mf_cmp(chars, pos)?);
+            Self::mf_ws(chars, pos);
+            match chars.get(*pos) {
+                Some(',') => {
+                    *pos += 1;
+                }
+                Some(')') => {
+                    *pos += 1;
+                    break;
+                }
+                _ => return None,
+            }
+        }
+        self.mf_call(&name, args)
+    }
+
+    fn mf_call(&mut self, name: &str, args: Vec<String>) -> Option<String> {
+        let dbl = |a: &String| format!("@as(f64, @floatFromInt({}))", a);
+        match name {
+            // `int(x)` truncates toward zero: the arg is a float expr
+            "int" if args.len() == 1 => Some(format!("@as(i64, @intFromFloat({}))", args[0])),
+            "abs" | "fabs" if args.len() == 1 => Some(format!("@abs({})", args[0])),
+            // float builtins return f64 (a later `int()` truncates)
+            "floor" | "ceil" | "round" | "trunc" | "sqrt" | "cbrt" | "exp"
+            | "log" | "log10" | "log2" | "sin" | "cos" | "tan" | "asin"
+            | "acos" | "atan" | "sinh" | "cosh" | "tanh" | "asinh" | "acosh"
+            | "atanh" if args.len() == 1 => Some(format!("@{}({})", name, dbl(&args[0]))),
+            "atan2" | "fmod" | "copysign" if args.len() == 2 => Some(format!(
+                "@{}({}, {})",
+                name,
+                dbl(&args[0]),
+                dbl(&args[1])
+            )),
+            _ => None,
+        }
+    }
+
+    fn mf_number(chars: &[char], pos: &mut usize) -> Option<String> {
+        let start = *pos;
+        while let Some(c) = chars.get(*pos) {
+            if c.is_ascii_digit() || *c == '.' {
+                *pos += 1;
+            } else {
+                break;
+            }
+        }
+        if *pos == start {
+            return None;
+        }
+        Some(chars[start..*pos].iter().collect())
+    }
+
+    /// Numeric read of a `$`-ref or bare name in a mathfunc text. A
+    /// positional param ($1) reads the function's param via the getVar
+    /// stub (matching the function body's own $N read); a typed-Int var
+    /// reads its ident; anything else atolls the store read.
+    fn mf_numref(&mut self, name: &str) -> String {
+        if !name.is_empty() && name.chars().all(|c| c.is_ascii_digit()) {
+            if self.in_function {
+                let idx: usize = name.parse().unwrap_or(1);
+                self.need_toint = true;
+                return format!(
+                    "sh2ToInt(if (__args.len >= {idx}) __args[{idx} - 1] else \"\")"
+                );
+            }
+            self.sh2_calls.insert("getVar".into());
+            self.need_toint = true;
+            return "sh2ToInt(sh2GetVar())".to_string();
+        }
+        if self.declared(name) {
+            let m = self.zig_ident(name);
+            self.mark_read(name);
+            if self.is_num(name) {
+                return m;
+            }
+            self.need_toint = true;
+            return format!("sh2ToInt({m})");
+        }
+        self.sh2_calls.insert("getVar".into());
+        self.need_toint = true;
+        "sh2ToInt(sh2GetVar())".to_string()
     }
 
     fn call_str(&mut self, func: &str, args: &[IrExpr]) -> String {
@@ -1048,13 +1578,14 @@ impl Render {
                 // a user-function call: name(args...) — values flow as
                 // strings (the positional-param convention); a numeric
                 // context coerces via sh2ToInt at the read site
-                let name = args
+                let orig = args
                     .first()
                     .and_then(|a| match a {
-                        IrExpr::Str(n, _) => Some(self.zig_ident(n)),
+                        IrExpr::Str(n, _) => Some(n.clone()),
                         _ => None,
                     })
-                    .unwrap_or_else(|| "sh2TODO".to_string());
+                    .unwrap_or_default();
+                let name = self.zig_ident(&orig);
                 let call_args: Vec<String> = args
                     .get(1)
                     .and_then(|a| match a {
@@ -1064,7 +1595,41 @@ impl Render {
                         _ => None,
                     })
                     .unwrap_or_default();
-                format!("{name}(&[_][]const u8{{ {} }})", call_args.join(", "))
+                let catch = if self.error_fns.contains(&orig) { " catch \"\"" } else { "" };
+                format!("{name}(init, &[_][]const u8{{ {} }}){catch}", call_args.join(", "))
+            }
+            "capture" | "captureWords" => {
+                // `$(fn args…)` of a user function DEFINED in this
+                // program: call it and use its return value. The capture
+                // body is a single `exec fn [args]`.
+                if let Some(IrExpr::Arrow(stmts)) = args.first() {
+                    if let Some(IrStmt::Expr(IrExpr::Call { func, args: cargs })) = stmts.first() {
+                        if func == "exec" {
+                            if let Some(IrExpr::Str(fname, _)) = cargs.first() {
+                                let m = self.zig_ident(fname);
+                                let call_args: Vec<String> = cargs
+                                    .get(1)
+                                    .and_then(|a| match a {
+                                        IrExpr::Array(items) => Some(
+                                            items.iter().map(|e| self.expr_str(e)).collect(),
+                                        ),
+                                        _ => None,
+                                    })
+                                    .unwrap_or_default();
+                                let catch = if self.error_fns.contains(fname) {
+                                    " catch \"\""
+                                } else {
+                                    ""
+                                };
+                                return format!(
+                                    "{m}(init, &[_][]const u8{{ {} }}){catch}",
+                                    call_args.join(", ")
+                                );
+                            }
+                        }
+                    }
+                }
+                self.sh2_stub("capture", "capture")
             }
             "getVar" => {
                 if let Some(IrExpr::Str(name, _)) = args.first() {
@@ -1112,6 +1677,48 @@ impl Render {
                 }
                 format!("[_] []const u8{{{}}}", parts.join(", "))
             }
+            "sortedIntJoin" => {
+                // `sorted(list(factors))` — sort+dedup+join the set array
+                if let Some(IrExpr::Str(name, _)) = args.first() {
+                    if self.set_arrays.contains(name) {
+                        let m = self.zig_ident(name);
+                        self.mark_read(name);
+                        self.need_sorted = true;
+                        return format!("sh2SortedIntJoin(&{m}, {m}_len)");
+                    }
+                }
+                self.sh2_stub("sortedIntJoin", "sortedIntJoin")
+            }
+            "sortedBigintJoin" => {
+                // `sorted(list(factors))` over a bigint list — sort+dedup+join
+                if let Some(IrExpr::Str(name, _)) = args.first() {
+                    if self.bigint_arrays.contains(name) {
+                        let m = self.zig_ident(name);
+                        self.mark_read(name);
+                        self.need_sorted = true;
+                        return format!("sh2SortedBigintJoin(&{m}, {m}_len)");
+                    }
+                }
+                self.sh2_stub("sortedBigintJoin", "sortedBigintJoin")
+            }
+            "max" | "min" | "sum" => {
+                // typed reduction over a list/set array
+                if let Some(IrExpr::Str(name, _)) = args.first() {
+                    if self.bigint_arrays.contains(name) {
+                        let m = self.zig_ident(name);
+                        self.mark_read(name);
+                        self.need_reduce = true;
+                        return format!("sh2{}Bigint(&{m}, {m}_len)", camel(func));
+                    }
+                    if self.set_arrays.contains(name) {
+                        let m = self.zig_ident(name);
+                        self.mark_read(name);
+                        self.need_reduce = true;
+                        return format!("sh2{}(&{m}, {m}_len)", camel(func));
+                    }
+                }
+                self.sh2_stub(func, func)
+            }
             "arith" => {
                 if let Some(IrExpr::Str(sv, _)) = args.first() {
                     if let Some(x) = self.arith_text(sv) {
@@ -1120,7 +1727,8 @@ impl Render {
                     }
                 }
                 self.need_intstr = true;
-                format!("sh2IntStr(sh2Arith())")
+                self.sh2_calls.insert("arith".into());
+                format!("sh2IntStr(sh2ArithStub())")
             }
             _ => self.sh2_stub(func, func),
         }
@@ -1135,7 +1743,18 @@ impl Render {
                         return x;
                     }
                 }
-                "sh2Arith()".to_string()
+                self.sh2_calls.insert("arith".into());
+                "sh2ArithStub()".to_string()
+            }
+            "isqrt" => {
+                // structured integer sqrt (py-sh-go `int(Y**0.5)` node
+                // — no arith-string detour). CPython parity by
+                // construction: trunc(sqrt(x)) in doubles.
+                if let Some(IrExpr::Arith(a)) = args.first() {
+                    let x = self.arith(a);
+                    return format!("@as(i64, @intFromFloat(@sqrt(@as(f64, @floatFromInt({x})))))" );
+                }
+                "0".to_string()
             }
             "test" => format!("@intFromBool({})", self.call_bool(func, args)),
             _ => {
@@ -1174,7 +1793,8 @@ impl Render {
                         return format!("({x} != 0)");
                     }
                 }
-                "(sh2Arith() != 0)".to_string()
+                self.sh2_calls.insert("arith".into());
+                "(sh2ArithStub() != 0)".to_string()
             }
             "getVar" => {
                 self.need_truthy = true;
@@ -1245,6 +1865,138 @@ impl Render {
         None
     }
 
+    /// `for (( i=1; i<n; i++ ))` — render as a native while loop. The
+    /// loop var is hoisted at i64 (function scope; bash leaves $i = LAST
+    /// after the loop), so the header's init assigns it and the body's
+    /// reads see the same ident.
+    fn emit_cstyle_for(&mut self, spec: &str, body: &[IrStmt]) {
+        let parts: Vec<&str> = spec.split(';').map(|s| s.trim()).collect();
+        let init = parts.first().copied().unwrap_or("");
+        let cond = parts.get(1).copied().unwrap_or("1");
+        let incr = parts.get(2).copied().unwrap_or("");
+        // the loop var: `i = 1` / `i=1` — the init's LHS
+        let (var, init_c) = if let Some(eq) = init.find('=') {
+            let v = init[..eq].trim().to_string();
+            let rhs = init[eq + 1..].trim().to_string();
+            if is_ident(&v) {
+                (Some(v), rhs)
+            } else {
+                (None, init.to_string())
+            }
+        } else if !init.is_empty() {
+            (None, init.to_string())
+        } else {
+            (None, String::new())
+        };
+        if let Some(v) = &var {
+            self.var_types.insert(v.clone(), IrType::Int);
+        }
+        let cond_c = self.cstyle_cond(cond);
+        let incr_c = if incr.is_empty() {
+            String::new()
+        } else {
+            self.cstyle_incr(incr)
+        };
+        let var_name = var.as_ref().map(|v| self.zig_ident(v)).unwrap_or_default();
+        if var.is_some() {
+            self.emit(&format!("{var_name} = {init_c};"));
+            self.emit(&format!("while ({cond_c}) {{"));
+        } else {
+            self.emit(&format!("{init_c};"));
+            self.emit(&format!("while ({cond_c}) {{"));
+        }
+        self.loop_depth += 1;
+        self.depth += 1;
+        for s in body {
+            self.stmt(s);
+        }
+        if !incr_c.is_empty() {
+            self.emit(&format!("{incr_c};"));
+        }
+        self.depth -= 1;
+        self.loop_depth -= 1;
+        self.emit("}");
+    }
+
+    /// The cstyleFor condition: split on the comparison ops, map the
+    /// operand names to Zig idents (numeric now) or literals.
+    fn cstyle_cond(&mut self, c: &str) -> String {
+        let c = c.trim();
+        if c.is_empty() {
+            return "true".into();
+        }
+        for op in ["<=", ">=", "==", "!=", "<", ">"] {
+            if let Some(pos) = c.find(op) {
+                let l = c[..pos].trim();
+                let r = c[pos + op.len()..].trim();
+                let lc = self.cstyle_operand(l);
+                let rc = self.cstyle_operand(r);
+                let c_op = match op {
+                    "<=" => "<=",
+                    ">=" => ">=",
+                    "==" => "==",
+                    "!=" => "!=",
+                    "<" => "<",
+                    _ => ">",
+                };
+                return format!("({lc} {c_op} {rc})");
+            }
+        }
+        self.cstyle_operand(c)
+    }
+
+    /// A cstyleFor operand: a var name → the numeric Zig expr.
+    fn cstyle_operand(&mut self, name: &str) -> String {
+        let name = name.trim();
+        if name.is_empty() {
+            return "0".into();
+        }
+        if let Ok(n) = name.parse::<i64>() {
+            return n.to_string();
+        }
+        if name.chars().all(|c| c.is_ascii_alphanumeric() || c == '_') {
+            if self.declared(name) {
+                let m = self.zig_ident(name);
+                self.mark_read(name);
+                if self.is_num(name) {
+                    return m;
+                }
+                // a string-homed var in an arith cond — coerce
+                self.need_toint = true;
+                return format!("sh2ToInt({m})");
+            }
+            return "0".into();
+        }
+        "0".into()
+    }
+
+    /// The cstyleFor increment: `i++` / `i--` / `i += 2`.
+    fn cstyle_incr(&mut self, s: &str) -> String {
+        let s = s.trim();
+        if s.ends_with("++") {
+            let v = s.trim_end_matches("++").trim();
+            if is_ident(v) {
+                return format!("{} += 1", self.zig_ident(v));
+            }
+        }
+        if s.ends_with("--") {
+            let v = s.trim_end_matches("--").trim();
+            if is_ident(v) {
+                return format!("{} -= 1", self.zig_ident(v));
+            }
+        }
+        for op in ["+=", "-=", "*=", "/=", "%="] {
+            if let Some((l, r)) = s.split_once(op) {
+                let l = l.trim();
+                if is_ident(l) {
+                    return format!("{} {op} {}", self.zig_ident(l), r.trim());
+                }
+            }
+        }
+        s.to_string()
+    }
+
+
     /// Build the argv literals for an external `exec` command
     /// (`["cmd", "arg", …]`). The command name is args[0]; the trailing
     /// args array is args[1].
@@ -1262,7 +2014,11 @@ impl Render {
         self.sh2_calls.insert(name.to_string());
         self.mark_todo(&format!("{note} → sh2.{name}"));
         self.mark_todo(&format!("{note} → sh2.{name}"));
-        format!("sh2{}()", camel(name))
+        let mut fname = format!("sh2{}", camel(name));
+        if RESERVED_STUB.contains(&fname.as_str()) {
+            fname.push_str("Stub");
+        }
+        format!("{fname}()")
     }
 
     /// The generic expression form (used by `_ = expr;` statements and
@@ -1303,7 +2059,10 @@ impl Render {
                 }
                 let m = self.zig_ident(name);
                 self.mark_read(name);
-                if self.is_num(name) {
+                if self.bigint_vars.contains(name) {
+                    self.need_bigint = true;
+                    vec![('s', format!("sh2BigIntStr({m})"))]
+                } else if self.is_num(name) {
                     vec![('d', m)]
                 } else {
                     vec![('s', m)]
@@ -1316,7 +2075,10 @@ impl Render {
                 }
                 let m = self.zig_ident(name);
                 self.mark_read(name);
-                if self.is_num(name) {
+                if self.bigint_vars.contains(name) {
+                    self.need_bigint = true;
+                    vec![('s', format!("sh2BigIntStr({m})"))]
+                } else if self.is_num(name) {
                     vec![('d', m)]
                 } else {
                     vec![('s', m)]
@@ -1346,7 +2108,15 @@ impl Render {
                     vec![('s', "\"\"".into())]
                 }
             }
-            IrExpr::Arith(a) => vec![('d', self.arith(a))],
+            IrExpr::Arith(a) => {
+                if crate::shir::arith_refs_bigint(a, &self.bigint_vars) {
+                    self.need_bigint = true;
+                    let t = self.arith_bigint(a);
+                    vec![('s', format!("sh2BigIntStr({t})"))]
+                } else {
+                    vec![('d', self.arith(a))]
+                }
+            }
             IrExpr::Bool(b) => {
                 if *b {
                     vec![('b', "true".into())]
@@ -1764,6 +2534,30 @@ impl Render {
                 self.emit("    }");
                 self.emit("}");
             }
+            // Ext(GpuOp) — a device write replaced by the fbdev-gpu lift.
+            // Zig has no GPU leg: render the ORIGINAL write (§4.4 firewall).
+            // The write is fallible in Zig, so it is wrapped in a discard
+            // block (`_ = blk: { … }`) whose value is void.
+            IrStmt::Ext(node) if node.tag() == "GpuOp" => {
+                let (path, payload) = {
+                    let g = node.as_any().downcast_ref::<crate::shir_nodes::GpuOp>()
+                        .expect("tag/type agree");
+                    let path = if g.slot.is_empty() {
+                        format!("{}/{}", g.device.trim_end_matches('/'), g.verb)
+                    } else {
+                        format!("{}/{}/{}", g.device.trim_end_matches('/'), g.slot, g.verb)
+                    };
+                    (path, g.payload.clone())
+                };
+                let p = Self::zig_str(&path);
+                let v = self.expr_any(&payload);
+                self.emit("_ = blk: {");
+                self.emit(&format!(
+                    "    const _g: std.fs.File = std.fs.cwd().createFile({p}, .{{ .truncate = true }}) catch break :blk {{}};"));
+                self.emit("    defer _g.close();");
+                self.emit(&format!("    _g.writeAll({v}) catch {{}};"));
+                self.emit("};");
+            }
             IrStmt::Ext(_) => panic!("zig backend: Ext node unsupported"),
             IrStmt::Expr(e) => {
                 // setVar(name, value) — the frontend-emitted store write:
@@ -1798,8 +2592,13 @@ impl Render {
                                     _ => None,
                                 })
                                 .unwrap_or_default();
+                            let catch = if self.error_fns.contains(name) {
+                                " catch \"\""
+                            } else {
+                                ""
+                            };
                             self.emit(&format!(
-                                "_ = {m}(&[_][]const u8{{ {} }});",
+                                "_ = {m}(&[_][]const u8{{ {} }}){catch};",
                                 call_args.join(", ")
                             ));
                             return;
@@ -1965,6 +2764,19 @@ impl Render {
                         self.emit("continue;");
                         return;
                     }
+                    if func == "cstyleFor" {
+                        // `for (( i=1; i<n; i++ ))` — init; cond; incr.
+                        // The loop var is hoisted at i64 (function scope,
+                        // bash leaves $i = LAST after the loop).
+                        if let Some(IrExpr::Str(spec, _)) = args.first() {
+                            if let Some(IrExpr::Arrow(body)) = args.get(1) {
+                                self.emit_cstyle_for(spec, body);
+                                return;
+                            }
+                        }
+                        self.mark_todo("cstyleFor args");
+                        return;
+                    }
                 }
                 let x = self.expr_any(e);
                 self.emit(&format!("_ = {x};"));
@@ -1985,6 +2797,57 @@ impl Render {
                 self.mark_written(&t.var);
                 if !t.indices.is_empty() {
                     self.mark_todo("array-index assign");
+                    return;
+                }
+                // set-array writes: `factors = set()` resets the length;
+                // `factors.add(x)` appends (dedup happens at sortedIntJoin)
+                if let IrExpr::Call { func, args } = expr {
+                    if matches!(func.as_str(), "setArray" | "setArrayAppend")
+                        && (self.set_arrays.contains(&t.var) || self.bigint_arrays.contains(&t.var))
+                    {
+                        if func == "setArray" {
+                            self.emit(&format!("{m}_len = 0;"));
+                        }
+                        // populate/append each element
+                        if let Some(IrExpr::Array(items)) = args.get(1) {
+                            for it in items {
+                                if self.bigint_arrays.contains(&t.var) {
+                                    // bigint element: init a Managed slot
+                                    self.emit(&format!("{m}[{m}_len] = try std.math.big.int.Managed.init(std.heap.page_allocator);"));
+                                    match it {
+                                        IrExpr::Arith(a) => self.bigint_into(a, &format!("{m}[{m}_len]")),
+                                        _ => {
+                                            let v = self.expr_str(it);
+                                            self.emit(&format!("try {m}[{m}_len].setString(10, {v});"));
+                                        }
+                                    }
+                                } else {
+                                    let v = self.expr_num(it);
+                                    self.emit(&format!("{m}[{m}_len] = {v};"));
+                                }
+                                self.emit(&format!("{m}_len += 1;"));
+                            }
+                        }
+                        return;
+                    }
+                }
+                // bigint target: compute the RHS into the Managed var
+                if self.bigint_vars.contains(&t.var) {
+                    self.need_bigint = true;
+                    match expr {
+                        IrExpr::Arith(a) => self.bigint_into(a, &m),
+                        IrExpr::Var(name, _) | IrExpr::Ident(name)
+                            if self.bigint_vars.contains(name) =>
+                        {
+                            let src = self.zig_ident(name);
+                            self.mark_read(name);
+                            self.emit(&format!("try {m}.copy({src}.toConst());"));
+                        }
+                        _ => {
+                            let v = self.expr_str(expr);
+                            self.emit(&format!("try {m}.setString(10, {v});"));
+                        }
+                    }
                     return;
                 }
                 let rhs = if self.is_num(&t.var) {
@@ -2122,17 +2985,33 @@ impl Render {
                         .patterns
                         .iter()
                         .filter(|p| p.as_str() != "*")
-                        .map(|p| format!("std.mem.eql(u8, {d}, {})", Self::zig_str(p)))
+                        .map(|p| {
+                            // a pattern with glob metacharacters is a MATCH, not
+                            // an equality test (`case x in a*)` matched "abc").
+                            if p.contains('*') || p.contains('?') || p.contains('[') {
+                                self.need_glob = true;
+                                format!("matchGlob({d}, {})", Self::zig_str(p))
+                            } else {
+                                format!("std.mem.eql(u8, {d}, {})", Self::zig_str(p))
+                            }
+                        })
                         .collect();
                     let is_default = cl.patterns.iter().any(|p| p.as_str() == "*");
                     if conds.is_empty() && is_default {
-                        self.emit("else {");
+                        // A default-only `case` (or one reached with no earlier
+                        // clause) has no `if` to chain from: `else {` alone is
+                        // not a statement. Close the previous arm when there was
+                        // one; otherwise emit a bare block.
+                        if emitted {
+                            self.emit("} else {");
+                        } else {
+                            self.emit("else {");
+                        }
                         self.depth += 1;
                         for s in &cl.body {
                             self.stmt(s);
                         }
                         self.depth -= 1;
-                        self.emit("}");
                         emitted = true;
                         continue;
                     }
@@ -2334,7 +3213,17 @@ impl Render {
                 let prev_in_fn = self.in_function;
                 self.in_function = true;
                 let mut saved = std::mem::take(&mut self.out);
-                for s in body {
+                let n_body = body.len();
+                for (bi, s) in body.iter().enumerate() {
+                    // the single trailing `echo V` becomes the return
+                    // value (the caller consumed it as the $(fn) capture)
+                    if bi == n_body - 1 {
+                        if let Some(v) = trailing_echo_value(s) {
+                            let r = self.expr_str(&v);
+                            self.emit(&format!("return {r};"));
+                            continue;
+                        }
+                    }
                     self.stmt(s);
                 }
                 std::mem::swap(&mut saved, &mut self.out);
@@ -2351,14 +3240,65 @@ impl Render {
                             locals.insert(d.name.clone());
                         }
                     }
+                    if let IrStmt::For { var, .. } = st {
+                        locals.insert(var.clone());
+                    }
+                    if let IrStmt::Expr(IrExpr::Call { func, args }) = st {
+                        if func == "cstyleFor" {
+                            if let Some(IrExpr::Str(spec, _)) = args.first() {
+                                for part in spec.split(';') {
+                                    let part = part.trim();
+                                    if let Some(eq) = part.find('=') {
+                                        let v = part[..eq].trim();
+                                        if is_ident(v) {
+                                            locals.insert(v.to_string());
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    }
                 }
                 self.fn_locals.extend(locals.iter().cloned());
+                let uses_stdout = saved.iter().any(|l| l.contains("stdout.print"));
+                let uses_args = saved.iter().any(|l| l.contains("__args"));
+                // a body with `try` (bigint Managed ops, file IO) must
+                // return an error union
+                let uses_try = saved.iter().any(|l| l.contains("try "));
+                if uses_try {
+                    self.error_fns.insert(name.clone());
+                }
+                let ret = if uses_try { "![]const u8" } else { "[]const u8" };
                 let mut fntext = format!(
-                    "fn {id}(__args: []const []const u8) []const u8 {{\n"
+                    "fn {id}(init: std.process.Init, __args: []const []const u8) {ret} {{\n"
                 );
+                if uses_stdout {
+                    fntext.push_str("    var stdout_buffer: [4096]u8 = undefined;\n");
+                    fntext.push_str("    var stdout_file_writer: std.Io.File.Writer = .init(.stdout(), init.io, &stdout_buffer);\n");
+                    fntext.push_str("    const stdout = &stdout_file_writer.interface;\n");
+                } else {
+                    // a pure value-return fn never touches init
+                    fntext.push_str("    _ = init;\n");
+                }
+                // mark __args used only when the body never reads a param
+                // (Zig rejects an unused function parameter)
+                if !uses_args {
+                    fntext.push_str("    _ = __args;\n");
+                }
                 for v in &locals {
                     let m = self.zig_ident(v);
-                    if self.is_num(v) {
+                    if self.bigint_arrays.contains(v) {
+                        // bigint list → fixed Managed array + length counter
+                        fntext.push_str(&format!("    var {m}: [1024]std.math.big.int.Managed = undefined;\n"));
+                        fntext.push_str(&format!("    var {m}_len: usize = 0;\n"));
+                    } else if self.set_arrays.contains(v) {
+                        // set → fixed i64 array + length counter
+                        fntext.push_str(&format!("    var {m}: [1024]i64 = undefined;\n"));
+                        fntext.push_str(&format!("    var {m}_len: usize = 0;\n"));
+                    } else if self.bigint_vars.contains(v) {
+                        fntext.push_str(&format!("    var {m} = try std.math.big.int.Managed.init(std.heap.page_allocator);\n"));
+                        fntext.push_str(&format!("    defer {m}.deinit();\n"));
+                    } else if self.is_num(v) {
                         fntext.push_str(&format!("    var {m}: i64 = 0;\n"));
                     } else {
                         fntext.push_str(&format!("    var {m}: []const u8 = \"\";\n"));
@@ -2398,10 +3338,11 @@ impl Render {
             }
             IrStmt::Continue => self.emit("continue;"),
             IrStmt::Break => self.emit("break;"),
+            IrStmt::Shaderize { .. } => {
+                self.mark_todo("shaderize (autoshaderization) not supported by the Zig backend");
+            }
         }
     }
-
-    // ── program ──────────────────────────────────────────────────────
 
     fn program(&mut self, prog: &IrProgram) {
         // Pass 1: collect written vars so declarations are hoisted.
@@ -2413,6 +3354,26 @@ impl Render {
         // `declared()` consults this during rendering (a var reference
         // before its assignment in source order still lowers natively).
         self.written = written.clone();
+
+        // set-typed arrays (setArray/setArrayAppend) — lowered to a
+        // fixed i64 array + length counter
+        let mut set_arrays = BTreeSet::new();
+        collect_set_arrays(&prog.stmts, &mut set_arrays);
+        self.set_arrays = set_arrays;
+
+        // bigint-element arrays — lowered to a Managed array
+        let mut bigint_arrays = BTreeSet::new();
+        collect_bigint_arrays(&prog.stmts, &self.bigint_vars, &mut bigint_arrays);
+        for sub in &prog.subs {
+            collect_bigint_arrays(&sub.body, &self.bigint_vars, &mut bigint_arrays);
+        }
+        self.bigint_arrays = bigint_arrays;
+
+        // bigint vars (arith beyond i64) — lowered to Managed
+        self.bigint_vars = crate::shir::analyze_bigint_vars(prog);
+        if !self.bigint_vars.is_empty() {
+            self.need_bigint = true;
+        }
 
         // Pass 2: render the body first (helper flags known before
         // preamble). The hoisted declarations must precede the statements
@@ -2430,15 +3391,23 @@ impl Render {
                 }
             }
         }
-        // dead-var guard: Zig rejects declared-but-never-read variables
+        // dead-var guard: Zig rejects declared-but-never-read variables.
+        // `_ = x;` is NOT enough on the 0.16+ target: a variable that was
+        // ASSIGNED (which is what `written` holds) makes the discard itself an
+        // error — "pointless discard of local variable" (verified on 0.16.0 and
+        // 0.17.0). Discarding the ADDRESS (`_ = &x;`) keeps the declaration
+        // live for both cases: it reads the variable AND satisfies
+        // "never mutated" for an unassigned one (taking the address counts as a
+        // potential mutation). This is a compile error the corpus-c zig column
+        // caught in 005/006/013/014 (e.g. `t = sh2ToInt(___t1); ... _ = t;`).
         for v in &written {
-            if !self.read.contains(v) {
+            if !self.read.contains(v) && !self.fn_locals.contains(v) {
                 let m = self
                     .mangle
                     .get(v)
                     .cloned()
                     .unwrap_or_else(|| self.zig_ident(v));
-                self.emit(&format!("_ = {m};"));
+                self.emit(&format!("_ = &{m};"));
             }
         }
         std::mem::swap(&mut self.out, &mut body_stmts);
@@ -2486,10 +3455,22 @@ impl Render {
             self.emit("    return if (b) \"1\" else \"0\";");
             self.emit("}");
         }
+        if self.need_env || self.need_run {
+            // Process handle for the runtime helpers. `Init` is only available
+            // inside the emitted `main`, and zig has no way to thread it into a
+            // free helper without changing every call site, so the emitted main
+            // publishes it here (see the `sh2_io = init.io;` injection).
+            self.emit("");
+            self.emit("var sh2_io: ?std.Io = null;");
+        }
+        if self.need_env {
+            self.emit("var sh2_environ: ?*std.process.Environ.Map = null;");
+        }
         if self.need_env {
             self.emit("");
             self.emit("fn sh2Env(name: []const u8) []const u8 {");
-            self.emit("    return std.process.getEnvVar(name) catch \"\";");
+            self.emit("    const m = sh2_environ orelse return \"\";");
+            self.emit("    return m.get(name) orelse \"\";");
             self.emit("}");
         }
         if self.need_fexist {
@@ -2641,24 +3622,138 @@ self.emit("fn sh2TrimRightNl(t: []const u8) []const u8 {");
             self.emit("    return s;");
             self.emit("}");
         }
+        if self.need_bigint {
+            self.emit("");
+            self.emit("fn sh2BigIntStr(v: std.math.big.int.Managed) []const u8 {");
+            self.emit("    return v.toString(std.heap.page_allocator, 10, .lower) catch \"\";");
+            self.emit("}");
+        }
+        if self.need_sorted {
+            self.emit("");
+            self.emit("fn sh2SortedIntJoin(a: []const i64, n: usize) []const u8 {");
+            self.emit("    var ix = std.heap.page_allocator.alloc(usize, n) catch return \"\";");
+            self.emit("    for (0..n) |i| ix[i] = i;");
+            self.emit("    std.mem.sort(usize, ix, a, struct {");
+            self.emit("        fn lt(ctx: []const i64, x: usize, y: usize) bool {");
+            self.emit("            return ctx[x] < ctx[y];");
+            self.emit("        }");
+            self.emit("    }.lt);");
+            self.emit("    var out: std.ArrayList(u8) = .empty;");
+            self.emit("    var prev: ?i64 = null;");
+            self.emit("    for (ix) |j| {");
+            self.emit("        if (prev != null and prev.? == a[j]) continue;");
+            self.emit("        if (out.items.len != 0) out.appendSlice(std.heap.page_allocator, \", \") catch return \"\";");
+            self.emit("        const num = std.fmt.allocPrint(std.heap.page_allocator, \"{d}\", .{a[j]}) catch return \"\";");
+            self.emit("        out.appendSlice(std.heap.page_allocator, num) catch return \"\";");
+            self.emit("        prev = a[j];");
+            self.emit("    }");
+            self.emit("    return out.items;");
+            self.emit("}");
+            self.emit("fn sh2SortedBigintJoin(a: []const std.math.big.int.Managed, n: usize) []const u8 {");
+            self.emit("    var ix = std.heap.page_allocator.alloc(usize, n) catch return \"\";");
+            self.emit("    for (0..n) |i| ix[i] = i;");
+            self.emit("    std.mem.sort(usize, ix, a, struct {");
+            self.emit("        fn lt(ctx: []const std.math.big.int.Managed, x: usize, y: usize) bool {");
+            self.emit("            return std.math.big.int.Managed.order(ctx[x], ctx[y]) == .lt;");
+            self.emit("        }");
+            self.emit("    }.lt);");
+            self.emit("    var out: std.ArrayList(u8) = .empty;");
+            self.emit("    var prev: ?std.math.big.int.Managed = null;");
+            self.emit("    for (ix) |j| {");
+            self.emit("        if (prev != null and std.math.big.int.Managed.order(prev.?, a[j]) == .eq) continue;");
+            self.emit("        if (out.items.len != 0) out.appendSlice(std.heap.page_allocator, \", \") catch return \"\";");
+            self.emit("        const num = a[j].toString(std.heap.page_allocator, 10, .lower) catch return \"\";");
+            self.emit("        out.appendSlice(std.heap.page_allocator, num) catch return \"\";");
+            self.emit("        prev = a[j];");
+            self.emit("    }");
+            self.emit("    return out.items;");
+            self.emit("}");
+        }
+        if self.need_reduce {
+            self.emit("");
+            self.emit("fn sh2Max(a: []const i64, n: usize) []const u8 {");
+            self.emit("    if (n == 0) return \"0\";");
+            self.emit("    var best = a[0];");
+            self.emit("    for (a[1..n]) |v| { if (v > best) best = v; }");
+            self.emit("    return std.fmt.allocPrint(std.heap.page_allocator, \"{d}\", .{best}) catch \"\";");
+            self.emit("}");
+            self.emit("fn sh2Min(a: []const i64, n: usize) []const u8 {");
+            self.emit("    if (n == 0) return \"0\";");
+            self.emit("    var best = a[0];");
+            self.emit("    for (a[1..n]) |v| { if (v < best) best = v; }");
+            self.emit("    return std.fmt.allocPrint(std.heap.page_allocator, \"{d}\", .{best}) catch \"\";");
+            self.emit("}");
+            self.emit("fn sh2Sum(a: []const i64, n: usize) []const u8 {");
+            self.emit("    var total: i64 = 0;");
+            self.emit("    for (a[0..n]) |v| total += v;");
+            self.emit("    return std.fmt.allocPrint(std.heap.page_allocator, \"{d}\", .{total}) catch \"\";");
+            self.emit("}");
+            self.emit("fn sh2MaxBigint(a: []const std.math.big.int.Managed, n: usize) []const u8 {");
+            self.emit("    if (n == 0) return \"0\";");
+            self.emit("    var best = a[0];");
+            self.emit("    for (a[1..n]) |v| { if (std.math.big.int.Managed.order(v, best) == .gt) best = v; }");
+            self.emit("    return best.toString(std.heap.page_allocator, 10, .lower) catch \"\";");
+            self.emit("}");
+            self.emit("fn sh2MinBigint(a: []const std.math.big.int.Managed, n: usize) []const u8 {");
+            self.emit("    if (n == 0) return \"0\";");
+            self.emit("    var best = a[0];");
+            self.emit("    for (a[1..n]) |v| { if (std.math.big.int.Managed.order(v, best) == .lt) best = v; }");
+            self.emit("    return best.toString(std.heap.page_allocator, 10, .lower) catch \"\";");
+            self.emit("}");
+            self.emit("fn sh2SumBigint(a: []const std.math.big.int.Managed, n: usize) []const u8 {");
+            self.emit("    var total = std.math.big.int.Managed.initSet(std.heap.page_allocator, 0) catch return \"\";");
+            self.emit("    defer total.deinit();");
+            self.emit("    for (a[0..n]) |v| {");
+            self.emit("        var t = std.math.big.int.Managed.init(std.heap.page_allocator) catch return \"\";");
+            self.emit("        defer t.deinit();");
+            self.emit("        t.add(&total, &v) catch return \"\";");
+            self.emit("        total.copy(t.toConst()) catch return \"\";");
+            self.emit("    }");
+            self.emit("    return total.toString(std.heap.page_allocator, 10, .lower) catch \"\";");
+            self.emit("}");
+        }
+        if self.need_glob {
+            self.emit("");
+            self.emit("fn matchGlob(s: []const u8, pat: []const u8) bool {");
+            self.emit("    var si: usize = 0;");
+            self.emit("    var pi: usize = 0;");
+            self.emit("    var ssi: usize = 0;");
+            self.emit("    var spi: usize = 0;");
+            self.emit("    var star = false;");
+            self.emit("    while (si < s.len) {");
+            self.emit("        if (pi < pat.len) {");
+            self.emit("            const pc = pat[pi];");
+            self.emit("            if (pc == '*') {");
+            self.emit("                star = true;");
+            self.emit("                ssi = si;");
+            self.emit("                spi = pi;");
+            self.emit("                pi += 1;");
+            self.emit("                continue;");
+            self.emit("            }");
+            self.emit("            if (pc == '?' or s[si] == pc) {");
+            self.emit("                si += 1;");
+            self.emit("                pi += 1;");
+            self.emit("                continue;");
+            self.emit("            }");
+            self.emit("        }");
+            self.emit("        if (star) { si = ssi + 1; ssi = si; pi = spi + 1; } else return false;");
+            self.emit("    }");
+            self.emit("    while (pi < pat.len and pat[pi] == '*') { pi += 1; }");
+            self.emit("    return pi == pat.len;");
+            self.emit("}");
+        }
         if self.need_run {
             self.emit("");
             self.emit("fn sh2Run(argv: []const []const u8) []const u8 {");
-            self.emit("    const result = std.process.Child.run(.{ .allocator = std.heap.page_allocator, .argv = argv }) catch return \"\";");
-            self.emit("    return std.mem.trimRight(u8, result.stdout, \"\\n\");");
+            self.emit("    const io = sh2_io orelse return \"\";");
+            self.emit("    const result = std.process.run(std.heap.page_allocator, io, .{");
+            self.emit("        .argv = argv,");
+            self.emit("        .stdout_limit = .limited(1 << 20),");
+            self.emit("    }) catch return \"\";");
+            self.emit("    return std.mem.trimEnd(u8, result.stdout, \"\\n\");");
             self.emit("}");
         }
         // per-callee stubs: compile-able, exit(2) at runtime
-        const RESERVED_STUB: &[&str] = &[
-            "sh2TODO",
-            "sh2ToInt",
-            "sh2IntStr",
-            "sh2Truthy",
-            "sh2StrCat",
-            "sh2B2S",
-            "sh2Test",
-            "sh2Arith",
-        ];
         if !self.sh2_calls.is_empty() {
             let mut seen: BTreeSet<String> = BTreeSet::new();
             let names: Vec<String> = self.sh2_calls.iter().cloned().collect();
@@ -2712,8 +3807,25 @@ self.emit("fn sh2TrimRightNl(t: []const u8) []const u8 {");
                 let pat = [format!("{m} ="), format!("{m}="), format!("{m} +="), format!("{m} -="), format!("{m} *="), format!("{m} /="), format!("{m} %="), format!("{m}++"), format!("{m}--")];
                 pat.iter().any(|p| l.contains(p.as_str()))
             });
-            let kw = if mutated { "var" } else { "const" };
-            if self.is_num(v) {
+            let kw = if mutated || self.bigint_vars.contains(v) || self.set_arrays.contains(v) {
+                "var"
+            } else {
+                "const"
+            };
+            if self.bigint_vars.contains(v) {
+                decls.push(format!(
+                    "    {kw} {m} = try std.math.big.int.Managed.init(std.heap.page_allocator);"
+                ));
+                decls.push(format!("    defer {m}.deinit();"));
+            } else if self.bigint_arrays.contains(v) {
+                // bigint list → fixed Managed array + length counter
+                decls.push(format!("    var {m}: [1024]std.math.big.int.Managed = undefined;"));
+                decls.push(format!("    var {m}_len: usize = 0;"));
+            } else if self.set_arrays.contains(v) {
+                // set/list → fixed i64 array + length counter
+                decls.push(format!("    {kw} {m}: [1024]i64 = undefined;"));
+                decls.push(format!("    var {m}_len: usize = 0;"));
+            } else if self.is_num(v) {
                 decls.push(format!("    {kw} {m}: i64 = 0;"));
             } else {
                 decls.push(format!("    {kw} {m}: []const u8 = \"\";"));
@@ -2725,20 +3837,26 @@ self.emit("fn sh2TrimRightNl(t: []const u8) []const u8 {");
                 self.emit(d);
             }
         }
-        if self.need_stdout {
-            self.emit("");
-            // zig 0.16 removed std.io.getStdOut: stdout writing needs the
-            // process Init's Io. Rewrite the already-emitted main signature
-            // and set up a buffered File.Writer as `stdout` — generated
-            // statements (`try stdout.print(...)`) are unchanged, each one
-            // is followed by an explicit flush (early returns / exit() must
-            // not lose buffered output).
+        // zig 0.16 removed std.io.getStdOut, and 0.14's std.process.getEnvVar /
+        // std.process.Child.run went with it: stdout writing, env reads and
+        // child capture ALL need the process `Init` now. So `main` takes
+        // `init` whenever any of the three is needed, and the ones that cannot
+        // be threaded into a free helper read it back through these globals.
+        let need_init = self.need_stdout || self.need_env || self.need_run;
+        if need_init {
+            // Rewrite the already-emitted main signature. Generated statements
+            // (`try stdout.print(...)`) are unchanged; each print is followed
+            // by an explicit flush (early returns / exit() must not lose
+            // buffered output).
             for line in self.out.iter_mut() {
                 if line == "pub fn main() !void {" {
                     *line = "pub fn main(init: std.process.Init) !void {".to_string();
                     break;
                 }
             }
+        }
+        if self.need_stdout {
+            self.emit("");
             self.out
                 .push("    var stdout_buffer: [4096]u8 = undefined;".to_string());
             self.out.push(
@@ -2747,6 +3865,19 @@ self.emit("fn sh2TrimRightNl(t: []const u8) []const u8 {");
             );
             self.out
                 .push("    const stdout = &stdout_file_writer.interface;".to_string());
+        }
+        if self.need_env || self.need_run {
+            self.out
+                .push("    sh2_io = init.io;".to_string());
+        }
+        if self.need_env {
+            self.out
+                .push("    sh2_environ = init.environ_map;".to_string());
+        }
+        if !self.need_stdout && !self.need_env && !self.need_run {
+            // `main` always takes `init`; if nothing consumed the handle the
+            // parameter is unused and zig rejects it.
+            self.out.push("    _ = init;".to_string());
         }
         if !body_stmts.is_empty() || !decls.is_empty() {
             self.emit("");
@@ -2784,6 +3915,102 @@ fn camel(s: &str) -> String {
         out.push_str("X");
     }
     out
+}
+
+/// Collect set-typed arrays (`factors = set(); factors.add(x)`) — the
+/// setArray/setArrayAppend call targets.
+/// Is this arith bigint-tainted (contains a sized Cast — the frontend's
+/// >i64 marker — or reads a bigint var)? Such subtrees render via
+/// std.math.big.int.Managed statements, never native i64 operators.
+
+/// Bigint vars: a var assigned an arith that is bigint-tainted (a sized
+/// Cast or a bigint var read). Fixed-point over the assign pairs.
+
+/// Arrays whose setArray/setArrayAppend elements are bigint-tainted —
+/// lowered to a std.math.big.int.Managed array (an i64 array would
+/// truncate the bigint elements).
+fn collect_bigint_arrays(stmts: &[IrStmt], big: &BTreeSet<String>, out: &mut BTreeSet<String>) {
+    fn walk(stmts: &[IrStmt], big: &BTreeSet<String>, out: &mut BTreeSet<String>) {
+        for s in stmts {
+            match s {
+                IrStmt::Assign { targets, expr, .. } => {
+                    if let IrExpr::Call { func, args } = expr {
+                        if matches!(func.as_str(), "setArray" | "setArrayAppend") {
+                            if let Some(IrExpr::Str(name, _)) = args.first() {
+                                if let Some(IrExpr::Array(items)) = args.get(1) {
+                                    if items.iter().any(|it| {
+                                        matches!(it, IrExpr::Arith(a) if crate::shir::arith_refs_bigint(a, big))
+                                    }) {
+                                        out.insert(name.clone());
+                                    }
+                                }
+                            }
+                        }
+                    }
+                    for t in targets {
+                        if big.contains(&t.var) {
+                            out.insert(t.var.clone());
+                        }
+                    }
+                }
+                IrStmt::If { then, elsifs, else_, .. } => {
+                    walk(then, big, out);
+                    for (_, b) in elsifs { walk(b, big, out); }
+                    walk(else_, big, out);
+                }
+                IrStmt::For { body, .. } => walk(body, big, out),
+                IrStmt::ForInit { body, .. } => walk(body, big, out),
+                IrStmt::While { body, .. } => walk(body, big, out),
+                IrStmt::Function { body, .. } => walk(body, big, out),
+                IrStmt::Subshell(body) => walk(body, big, out),
+                IrStmt::Background(body) => walk(body, big, out),
+                _ => {}
+            }
+        }
+    }
+    walk(stmts, big, out);
+}
+
+fn collect_set_arrays(stmts: &[IrStmt], out: &mut BTreeSet<String>) {
+    for s in stmts {
+        match s {
+            IrStmt::Assign { targets, expr, .. } => {
+                if let IrExpr::Call { func, .. } = expr {
+                    if matches!(func.as_str(), "setArray" | "setArrayAppend") {
+                        for t in targets {
+                            out.insert(t.var.clone());
+                        }
+                    }
+                }
+                collect_set_arrays_expr(expr, out);
+            }
+            IrStmt::Expr(e) => collect_set_arrays_expr(e, out),
+            IrStmt::If { then, elsifs, else_, .. } => {
+                collect_set_arrays(then, out);
+                for (_, b) in elsifs {
+                    collect_set_arrays(b, out);
+                }
+                collect_set_arrays(else_, out);
+            }
+            IrStmt::For { body, .. } => collect_set_arrays(body, out),
+            IrStmt::ForInit { body, .. } => collect_set_arrays(body, out),
+            IrStmt::While { body, .. } => collect_set_arrays(body, out),
+            IrStmt::Function { body, .. } => collect_set_arrays(body, out),
+            IrStmt::Subshell(body) => collect_set_arrays(body, out),
+            IrStmt::Background(body) => collect_set_arrays(body, out),
+            _ => {}
+        }
+    }
+}
+
+fn collect_set_arrays_expr(e: &IrExpr, out: &mut BTreeSet<String>) {
+    if let IrExpr::Call { func, args } = e {
+        if matches!(func.as_str(), "setArray" | "setArrayAppend") {
+            if let Some(IrExpr::Str(name, _)) = args.first() {
+                out.insert(name.clone());
+            }
+        }
+    }
 }
 
 /// Collect every variable written by statements (assign targets, declare

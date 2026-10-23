@@ -120,7 +120,23 @@ fn mktemp_assign(tmp: &str) -> IrStmt {
 
 /// `{ producer…; } <op> tmp` — run the producer IR with the temp file as
 /// the redirect target (stdout for process-in, stdin for process-out).
+///
+/// The producer statements are re-parsed shell text (`parse_producer`), so
+/// a pipeline producer arrives here as a statement-position `pipeline(…)`
+/// CALL — the shape whose only Perl lowering is `system('bash', '-c', …)`.
+/// `shir-pipeline-native` sits EARLIER in the registry than this transform
+/// and therefore never sees these freshly created statements. Re-apply it
+/// here so the producer carries the canonical `IrStmt::Pipeline` form every
+/// renderer already lowers natively (Perl: the `Redirect` arm's native
+/// stage emission — the same shape Fix 8 lifts a redirect INTO; ESTree:
+/// `stmt_to_estree` rebuilds the identical pipeline Call, the transform's
+/// byte-identity contract). Gated the same way the registry gates it, so
+/// `SH2_TRANSFORMS` can still turn the lowering off end-to-end.
 fn producer_redirect(producer: Vec<IrStmt>, tmp: &IrExpr, mode: &str, fd: Option<i32>) -> IrStmt {
+    let mut producer = producer;
+    if crate::transforms::transform_enabled("shir-pipeline-native") {
+        crate::transforms::shir_pipeline_native::transform(&mut producer);
+    }
     IrStmt::Redirect {
         inner: producer,
         redirects: vec![IrRedirect {
@@ -183,6 +199,26 @@ fn materialize(stmts: &mut Vec<IrStmt>, n: &mut usize) -> bool {
 }
 
 fn materialize_stmt(st: &mut IrStmt, n: &mut usize) -> bool {
+    // Process substitution on a PIPELINE STAGE hoists OUT of the pipeline
+    // first (see `materialize_pipeline_procsub`): the temps and producer
+    // writes become plain statements around the pipeline, leaving the
+    // stage as the bare consumer every renderer already lowers natively.
+    if is_pipeline_stmt(st) {
+        if let Some((pre, post)) = hoist_pipeline_procsub(st, n) {
+            let mut stmts = pre;
+            let pipeline = std::mem::replace(st, IrStmt::Block(Vec::new()));
+            stmts.push(pipeline);
+            stmts.extend(post);
+            *st = IrStmt::Block(stmts);
+            // Recurse: any leftover (non-exact) stage shape still takes the
+            // generic in-place path, and the hoisted statements walk
+            // normally (they hold no process specs of their own).
+            if let IrStmt::Block(b) = st {
+                materialize(b, n);
+            }
+            return true;
+        }
+    }
     match st {
         IrStmt::If {
             cond,
@@ -326,6 +362,244 @@ fn materialize_expr(e: &mut IrExpr, n: &mut usize) -> bool {
 /// process-out producer read(s), the cleanup `rm`), or `None` when the
 /// shape is not materializable — the redirect list is left untouched
 /// then.
+/// True for the two pipeline spellings: the call form
+/// `Expr(Call { "pipeline", [Array([Arrow…])] })` (what the file pipeline
+/// keeps when a stage is not natively renderable) and the statement form
+/// `IrStmt::Pipeline`.
+fn is_pipeline_stmt(st: &IrStmt) -> bool {
+    matches!(st, IrStmt::Pipeline { .. })
+        || matches!(
+            st,
+            IrStmt::Expr(IrExpr::Call { func, .. }) if func == "pipeline"
+        )
+}
+
+/// A redirect spec carrying process substitution.
+fn is_process_spec(s: &IrExpr) -> bool {
+    matches!(s, IrExpr::Object(pairs) if pairs.iter().any(|(k, v)| {
+        (k == "mode")
+            && matches!(v, IrExpr::Str(m, _) if m == "process-in" || m == "process-out")
+    }))
+}
+
+fn process_spec_mode(s: &IrExpr) -> Option<&'static str> {
+    match s {
+        IrExpr::Object(pairs) => pairs
+            .iter()
+            .find(|(k, _)| k == "mode")
+            .and_then(|(_, v)| match v {
+                IrExpr::Str(m, _) if m == "process-in" => Some("process-in"),
+                IrExpr::Str(m, _) if m == "process-out" => Some("process-out"),
+                _ => None,
+            }),
+        _ => None,
+    }
+}
+
+/// Process substitution as a PIPELINE-STAGE ARGUMENT (`paste <(a) <(b) |
+/// head`, `echo x | grep -f <(…)`): materialize the temps and producer
+/// writes OUTSIDE the pipeline, leaving the stage as the bare consumer
+/// with tmp-path args. Mutates the stage vectors in place; returns the
+/// statements to place BEFORE and AFTER the whole pipeline, or `None`
+/// when no exact stage carries a process spec (nothing is mutated then).
+///
+/// ## Why hoist
+///
+/// The in-place path (`materialize_redirect_call`) buries mktemp + the
+/// producer writes INSIDE the stage, so stage 0 becomes
+/// `redirect(and(…), [])` — a shape no renderer lowers natively. Perl's
+/// fallback (`ir.rs procsub_materialization_to_cmd`) then REVERSES the
+/// materialization back into `<(...)` text and shells the whole pipeline
+/// out to `bash -c` — the fail-shir sites on 064_hard_to_generate,
+/// 064_09_process_substitution_pipeline and 019_grep_regex. After the
+/// hoist the stage is `paste $__ps_tmp0 $__ps_tmp1 | head -10`, which the
+/// native pipeline paths already render, and the producers render as
+/// plain `{ cut|sort } > $__ps_tmpN` redirect statements.
+///
+/// ## Semantics
+///
+/// bash starts `<(...)` producers before the consumer runs; hoisting them
+/// to statements before the pipeline keeps that guarantee (the file is
+/// filled before the pipeline starts) — what the in-place path already
+/// assumed for the non-pipeline consumer. The trailing `rm` runs AFTER the
+/// whole pipeline (the consumer's stdout may still be draining through
+/// the pipe; the unlink does not disturb it). Non-process redirect specs
+/// stay on the consumer; nested process substitution inside a producer is
+/// materialized recursively (`materialize(&mut producer)`). Any
+/// parse/shape failure returns `None` with NOTHING mutated — the generic
+/// in-place path keeps charge (refuse > guess).
+fn hoist_pipeline_procsub(st: &mut IrStmt, n: &mut usize) -> Option<(Vec<IrStmt>, Vec<IrStmt>)> {
+    // Collect the stage vectors. The call form must be all-Arrows (any
+    // other element shape is left to the generic path).
+    let mut stages: Vec<&mut Vec<IrStmt>> = Vec::new();
+    match st {
+        IrStmt::Expr(IrExpr::Call { func, args }) if func == "pipeline" => {
+            if args.len() != 1 {
+                return None;
+            }
+            let Some(IrExpr::Array(els)) = args.first_mut() else {
+                return None;
+            };
+            if !els.iter().all(|e| matches!(e, IrExpr::Arrow(_))) {
+                return None;
+            }
+            for el in els.iter_mut() {
+                if let IrExpr::Arrow(v) = el {
+                    stages.push(v);
+                }
+            }
+        }
+        IrStmt::Pipeline { stages: stgs, .. } => stages.extend(stgs.iter_mut()),
+        _ => return None,
+    }
+
+    // Pass 1 (clones only — atomic: a failure mutates nothing): build the
+    // replacement consumer stage and the hoisted pre/post statements.
+    let mut pre: Vec<IrStmt> = Vec::new();
+    let mut post: Vec<IrStmt> = Vec::new();
+    let mut cleanup: Vec<IrExpr> = Vec::new();
+    let mut commits: Vec<(usize, Vec<IrStmt>)> = Vec::new();
+    for (idx, stage) in stages.iter().enumerate() {
+        // Exact shape with at least one process spec: the stage is a
+        // single call-form redirect wrapping a single exec/builtin.
+        let (inner_stmts, specs): (Vec<IrStmt>, Vec<IrExpr>) = match stage.as_slice() {
+            [IrStmt::Expr(IrExpr::Call { func, args })] if func == "redirect" => {
+                match args.as_slice() {
+                    [IrExpr::Arrow(v), IrExpr::Array(sp)]
+                        if matches!(
+                            v.as_slice(),
+                            [IrStmt::Expr(IrExpr::Call { func: f, .. })]
+                                if matches!(f.as_str(), "exec" | "builtin")
+                        ) =>
+                    {
+                        (v.clone(), sp.clone())
+                    }
+                    _ => continue,
+                }
+            }
+            _ => continue,
+        };
+        if !specs.iter().any(is_process_spec) {
+            continue;
+        }
+        let cmd_name = match inner_stmts.as_slice() {
+            [IrStmt::Expr(IrExpr::Call { args, .. })] => match args.first() {
+                Some(IrExpr::Str(s, _)) => Some(s.clone()),
+                _ => None,
+            },
+            _ => None,
+        };
+        let stdin_only = cmd_name.as_deref().map(stdin_only_command).unwrap_or(false);
+
+        let mut inner = inner_stmts;
+        let mut arg_paths: Vec<IrExpr> = Vec::new();
+        let mut kept: Vec<IrExpr> = Vec::new();
+        let mut ok = true;
+        for spec in &specs {
+            let mode = process_spec_mode(spec);
+            let Some(mode) = mode else {
+                kept.push(spec.clone()); // a plain redirect stays on the consumer
+                continue;
+            };
+            let IrExpr::Object(pairs) = spec else {
+                ok = false;
+                break;
+            };
+            let Some(text) = pairs
+                .iter()
+                .find(|(k, _)| k == "target")
+                .and_then(|(_, v)| match v {
+                    IrExpr::Str(s, _) => Some(s.clone()),
+                    _ => None,
+                })
+            else {
+                ok = false;
+                break;
+            };
+            let Some(mut producer) = parse_producer(&text) else {
+                ok = false;
+                break;
+            };
+            materialize(&mut producer, n); // nested process substitution
+            let tmp = format!("__ps_tmp{n}");
+            *n += 1;
+            let tmp_v = var(&tmp);
+            pre.push(mktemp_assign(&tmp));
+            cleanup.push(tmp_v.clone());
+            if mode == "process-in" {
+                pre.push(producer_redirect(producer, &tmp_v, "w", Some(1)));
+                if stdin_only {
+                    // mapfile/readarray cannot take a path arg: the kept
+                    // spec becomes a stdin read of the temp (the
+                    // materialize_redirect_call convention).
+                    let mut pairs2: Vec<(String, IrExpr)> = Vec::new();
+                    for (k, v) in pairs {
+                        if k == "mode" {
+                            pairs2.push((
+                                k.clone(),
+                                IrExpr::Str("r".to_string(), StrStyle::DoubleQuoted),
+                            ));
+                        } else if k == "target" {
+                            pairs2.push((k.clone(), tmp_v.clone()));
+                        } else {
+                            pairs2.push((k.clone(), v.clone()));
+                        }
+                    }
+                    kept.push(IrExpr::Object(pairs2));
+                } else {
+                    // bash passes the /dev/fd/N path as an argument
+                    arg_paths.push(tmp_v);
+                }
+            } else {
+                // process-out: the consumer writes the file; the producer
+                // reads it afterwards (post, before the rm below)
+                arg_paths.push(tmp_v.clone());
+                post.push(producer_redirect(producer, &tmp_v, "r", Some(0)));
+            }
+        }
+        if !ok {
+            return None; // nothing was mutated — generic path keeps charge
+        }
+        // Commit the consumer: exec args gain the tmp paths (trailing
+        // position — the same convention everywhere in this file).
+        if !arg_paths.is_empty() {
+            match inner.as_mut_slice() {
+                [IrStmt::Expr(IrExpr::Call { args, .. })] => match args.get_mut(1) {
+                    Some(IrExpr::Array(els)) => {
+                        els.extend(arg_paths.iter().cloned());
+                    }
+                    _ => return None,
+                },
+                _ => return None,
+            }
+        }
+        let consumer = if kept.is_empty() {
+            match inner.into_iter().next() {
+                Some(s) => vec![s],
+                None => return None,
+            }
+        } else {
+            vec![IrStmt::Expr(IrExpr::Call {
+                func: "redirect".to_string(),
+                args: vec![IrExpr::Arrow(inner), IrExpr::Array(kept)],
+            })]
+        };
+        commits.push((idx, consumer));
+    }
+    if commits.is_empty() {
+        return None; // no process spec on any exact stage
+    }
+    if !cleanup.is_empty() {
+        post.push(rm_exec(&cleanup));
+    }
+
+    // Pass 2: commit.
+    for (idx, consumer) in commits {
+        *stages[idx] = consumer;
+    }
+    Some((pre, post))
+}
+
 fn materialize_redirect(
     inner: &mut Vec<IrStmt>,
     redirects: &mut Vec<IrRedirect>,
@@ -373,10 +647,16 @@ fn materialize_redirect(
             let tmp_v = var(&tmp);
             pre.push(mktemp_assign(&tmp));
             cleanup.push(tmp_v.clone());
+            // The consumer's redirect, and the producer's, are INVERSES:
+            // `done < <(P)`  ->  `P > tmp` (fd 1, write) ; `cmd > >(P)`  ->
+            // `P < tmp` (fd 0, read). Reusing the consumer's pair made the
+            // process-in producer a READ of the temp file — nothing ever
+            // wrote it, so the consumer read an empty file and the real
+            // producer output leaked to the program's stdout.
             let (fd, mode) = if r.mode == "process-in" {
                 (Some(0), "r")
             } else {
-                (Some(0), "w")
+                (Some(1), "w")
             };
             new_redirects.push(IrRedirect {
                 fd,
@@ -384,7 +664,21 @@ fn materialize_redirect(
                 target: tmp_v.clone(),
                 interpolate: false,
             });
-            pre.push(producer_redirect(producer, &tmp_v, mode, fd));
+            let (pfd, pmode) = if r.mode == "process-in" {
+                (Some(1), "w")
+            } else {
+                (Some(0), "r")
+            };
+            let prod = producer_redirect(producer, &tmp_v, pmode, pfd);
+            if r.mode == "process-in" {
+                // the producer must have filled the file before the consumer reads it
+                pre.push(prod);
+            } else {
+                // process-out: the consumer writes the file, so the producer
+                // can only read it afterwards (it runs in `post`, before the
+                // cleanup `rm` appended below).
+                post.push(prod);
+            }
         }
         if !cleanup.is_empty() {
             post.push(rm_exec(&cleanup));
@@ -700,6 +994,96 @@ mod tests {
         let mut prog = ast_to_ir_raw(&commands);
         assert!(!transform(&mut prog.stmts), "transform should be a no-op");
         crate::shir_json::shir_to_shir_json(&prog)
+    }
+
+    /// The (fd, mode) of every redirect node in the lowered program, in
+    /// emission order — the observable shape a renderer consumes.
+    fn redirect_pairs(json: &str) -> Vec<(i64, String)> {
+        let mut out = Vec::new();
+        // `{"fd":N,...,"mode":"X","target":{"name":"__ps_tmpY"…`
+        let bytes: Vec<char> = json.chars().collect();
+        let mut i = 0;
+        while let Some(p) = json[i..].find("\"fd\":").map(|p| p + i) {
+            let rest: String = bytes[p + 5..].iter().take(64).collect();
+            let fd: String = rest.chars().take_while(|c| c.is_ascii_digit()).collect();
+            let mode = rest
+                .split_once("\"mode\":\"")
+                .and_then(|(_, m)| m.split_once('"'))
+                .map(|(m, _)| m.to_string());
+            out.push((fd.parse().unwrap_or(-1), mode.unwrap_or_default()));
+            i = p + 5;
+        }
+        out
+    }
+
+    /// `done < <(P)` is NOT an exec consumer, so it takes the
+    /// `!appendable` branch. There the producer's redirect must be the
+    /// INVERSE of the consumer's: producer writes fd 1, consumer reads fd 0.
+    /// Reusing the consumer's pair made the producer a READ of the temp
+    /// file — nothing wrote it, so the consumer read an empty file while the
+    /// real producer output leaked to the program's stdout.
+    #[test]
+    fn while_done_process_in_producer_writes_and_consumer_reads() {
+        let json = lower("while read -r line; do echo \"$line\"; done < <(printf 'a\\n')");
+        let pairs = redirect_pairs(&json);
+        assert_eq!(
+            pairs,
+            vec![(1, "w".to_string()), (0, "r".to_string())],
+            "producer must be fd 1 mode w, consumer fd 0 mode r: {json}"
+        );
+    }
+
+    /// The mirror: `cmd > >(P)` on a non-exec consumer. The consumer's
+    /// redirect is a WRITE on fd 1 and the producer READS fd 0 afterwards.
+    #[test]
+    fn process_out_consumer_writes_and_producer_reads() {
+        let json = lower("if true; then echo hi; fi > >(cat)");
+        let pairs = redirect_pairs(&json);
+        assert_eq!(
+            pairs,
+            vec![(1, "w".to_string()), (0, "r".to_string())],
+            "consumer must be fd 1 mode w, producer fd 0 mode r: {json}"
+        );
+    }
+
+    /// `paste <(a) <(b) | head` must hoist the materialization OUT of the
+    /// pipeline: mktemp + producer writes are plain statements BEFORE the
+    /// pipeline, the stage is the bare consumer with tmp-path args, and the
+    /// rm comes AFTER. In place, the stage became `redirect(and(…), [])` —
+    /// the shape perl's renderer reverses back into `<(...)` text and
+    /// shells out to `bash -c` (the fail-shir sites on 064 / 064_09).
+    #[test]
+    fn pipeline_process_ins_hoist_outside_the_pipeline() {
+        let json = lower("paste <(echo a) <(echo b) | head -2");
+        assert!(!json.contains("process-in"), "{json}");
+        assert!(
+            json.contains("__ps_tmp0") && json.contains("__ps_tmp1"),
+            "{json}"
+        );
+        let pipeline_at = json.find("\"func\":\"pipeline\"").expect("pipeline call");
+        let tmp_at = json.find("__ps_tmp0").expect("mktemp assign");
+        assert!(
+            tmp_at < pipeline_at,
+            "mktemp + producer writes hoisted BEFORE the pipeline: {json}"
+        );
+        let rm_at = json.rfind("\"rm\"").expect("cleanup rm");
+        assert!(rm_at > pipeline_at, "cleanup after the pipeline: {json}");
+        // the stage is the bare consumer: `paste` carries the tmp args
+        let paste_at = json.find("\"paste\"").expect("paste stage");
+        let tmp_arg = json[paste_at..].find("__ps_tmp0").expect("tmp arg on paste");
+        assert!(paste_at + tmp_arg < rm_at, "{json}");
+    }
+
+    /// A grep `-f` producer feeding a PIPELINE consumer hoists the same way
+    /// (019_grep_regex's `echo … | grep -f <(…)`).
+    #[test]
+    fn pipeline_consumer_grep_f_hoists_its_producer() {
+        let json = lower("echo x | grep -f <(echo y)");
+        assert!(!json.contains("process-in"), "{json}");
+        assert!(json.contains("\"grep\"") && json.contains("__ps_tmp0"), "{json}");
+        let pipeline_at = json.find("\"func\":\"pipeline\"").expect("pipeline call");
+        let tmp_at = json.find("__ps_tmp0").expect("mktemp assign");
+        assert!(tmp_at < pipeline_at, "hoisted before the pipeline: {json}");
     }
 
     #[test]

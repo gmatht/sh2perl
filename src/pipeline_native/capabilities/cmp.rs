@@ -10,6 +10,37 @@
 use crate::ir::IrExpr;
 use crate::pipeline_native::{NativeCtx, NativeEmit};
 
+
+/// Default `cmp` differ wording on THIS system ("byte" vs "char") —
+/// resurrected from PR #8's deleted `generator::commands::cmp` module
+/// (the generator restructure removed that path; the probe is std-only
+/// so it lives here at its sole call site). Probes once via temp files;
+/// "byte" (the current wording) is the fallback when no cmp answers.
+fn cmp_differ_word() -> &'static str {
+    static WORD: std::sync::OnceLock<&'static str> = std::sync::OnceLock::new();
+    WORD.get_or_init(|| {
+        (|| -> Option<&'static str> {
+            let dir = std::env::temp_dir();
+            let a = dir.join(format!("__cmp_probe_a_{}", std::process::id()));
+            let b = dir.join(format!("__cmp_probe_b_{}", std::process::id()));
+            std::fs::write(&a, b"x").ok()?;
+            std::fs::write(&b, b"y").ok()?;
+            let out = std::process::Command::new("cmp").arg(&a).arg(&b).output();
+            let _ = std::fs::remove_file(&a);
+            let _ = std::fs::remove_file(&b);
+            let text = String::from_utf8_lossy(&out.ok()?.stdout).into_owned();
+            if text.contains("differ: char") {
+                Some("char")
+            } else if text.contains("differ: byte") {
+                Some("byte")
+            } else {
+                None
+            }
+        })()
+        .unwrap_or("byte")
+    })
+}
+
 pub(crate) fn emit(ctx: &NativeCtx) -> Option<NativeEmit> {
     let NativeCtx::Exec { call, cond } = ctx else {
         return None;
@@ -158,8 +189,11 @@ fn cmp_stmt(s: &CmpSpec) -> String {
             "my $__o1 = ord(substr($__c1,$__i,1)); my $__o2 = ord(substr($__c2,$__i,1)); printf(\"%s %s differ: byte %d, line %d is %o %s %o %s\\n\", {f1}, {f2}, $__i+1, $__line, $__o1, chr($__o1), $__o2, chr($__o2)); $main_exit_code = $CHILD_ERROR = 1; "
         ));
     } else {
+        // default message wording ("char" vs "byte") follows the local
+        // cmp — see cmp_differ_word.
+        let differ_word = cmp_differ_word();
         b.push_str(&format!(
-            "printf(\"%s %s differ: byte %d, line %d\\n\", {f1}, {f2}, $__i+1, $__line); $main_exit_code = $CHILD_ERROR = 1; "
+            "printf(\"%s %s differ: {differ_word} %d, line %d\\n\", {f1}, {f2}, $__i+1, $__line); $main_exit_code = $CHILD_ERROR = 1; "
         ));
     }
     b.push_str("} elsif (length($__c1) == length($__c2)) { $main_exit_code = $CHILD_ERROR = 0; } elsif (length($__short) == 0) { printf STDERR (\"cmp: EOF on %s which is empty\\n\", $__sn); $main_exit_code = $CHILD_ERROR = 1; } else { my $__sl = 1 + (() = $__short =~ /\\n/g); if (substr($__short, -1) eq \"\\n\") { printf STDERR (\"cmp: EOF on %s after byte %d, line %d\\n\", $__sn, length($__short), $__sl); } else { printf STDERR (\"cmp: EOF on %s after byte %d, in line %d\\n\", $__sn, length($__short), $__sl); } $main_exit_code = $CHILD_ERROR = 1; }");
