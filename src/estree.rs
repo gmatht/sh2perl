@@ -3471,6 +3471,27 @@ fn write_expr(out: &mut String, e: &Expr) {
             out.push_str("]}");
         }
         Expr::CallExpression { callee, arguments, optional } => {
+            // `sh2.lit(x)` is the runtime's IDENTITY (`lit(v) { return v; }`)
+            // — its only job is to make the interpolation passes treat a
+            // SingleQuoted-`$` payload as opaque so they cannot rewrite the
+            // verbatim text into a JS template (see IrExpr::Str at the
+            // emission site, shir.rs). Every such pass runs during
+            // `shir_to_estree`, i.e. BEFORE this serializer, and the JSON is
+            // output-only (ingress is A1 via `shir_json_to_ir`; nothing
+            // re-reads ESTree), so by the time we get here the wrapper is
+            // dead weight: unwrapping yields a byte-identical Literal — the
+            // payload stays a plain string, never a template, because no
+            // pass runs after serialization. One less sh2.* call site per
+            // site (40 across the corpus).
+            //
+            // Fail-closed: only a single-argument wrapper unwraps. Anything
+            // else (0 or 2+ args — the emitter never produces that) keeps its
+            // call so a malformed wrapper still routes to the runtime
+            // identity instead of silently changing arity.
+            if is_sh2_call(callee, "lit") && arguments.len() == 1 {
+                write_expr(out, &arguments[0]);
+                return;
+            }
             out.push_str("{\"type\":\"CallExpression\",\"callee\":");
             write_expr(out, callee);
             out.push_str(",\"arguments\":[");
