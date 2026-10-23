@@ -6325,6 +6325,9 @@ fn str_has_positional_ref(s: &str) -> bool {
 fn estree_reads_positional(e: &Expr) -> bool {
     match e {
         Expr::Identifier { .. } | Expr::SpreadElement { .. } => false,
+        Expr::AssignmentPattern { left, right } => {
+            estree_reads_positional(left) || estree_reads_positional(right)
+        }
         // EVERY string literal is scanned for `$ref` text: the runtime
         // re-expands many strings against the CURRENT positionals —
         // builtin declare-family values (`local n=$1`), param
@@ -17544,10 +17547,18 @@ pub(crate) fn stmt_for_command(cmd: &Command) -> Option<IrStmt> {
             // different semantics (no word splitting, extglob patterns,
             // =~ regex, no empty-arg ambiguity). Additive — a backend
             // that ignores the tag keeps its current behavior.
-            if t.modifiers.double {
-                IrStmt::Expr(call("test", vec![st(&t.expression), st("[[")]))
-            } else {
-                IrStmt::Expr(call("test", vec![st(&t.expression)]))
+            //
+            // A `$(…)` operand is pre-evaluated into a temp (core request
+            // c-20261009-215050): the renderers then see a test body with
+            // no shell text to re-parse. A body with no substitution (or a
+            // shape already folded natively) keeps the exact previous
+            // shape — byte-identical IR.
+            match prelower_test_captures(&t.expression) {
+                Some((mut pre, text)) => {
+                    pre.push(IrStmt::Expr(test_call_ir(&text, t.modifiers.double)));
+                    IrStmt::Block(pre)
+                }
+                None => IrStmt::Expr(test_call_ir(&t.expression, t.modifiers.double)),
             }
         }
         Command::Simple(sc) => exec_stmt(&sc.name, &sc.args, &sc.env_vars, &sc.redirects),
@@ -17566,16 +17577,29 @@ pub(crate) fn stmt_for_command(cmd: &Command) -> Option<IrStmt> {
             expr: assignment_value_ir(a),
             asm: None,
         },
-        Command::If(if_stmt) => IrStmt::If {
-            cond: command_to_test_ir(&if_stmt.condition),
-            then: body_stmts(&if_stmt.then_branch),
-            elsifs: vec![],
-            else_: if_stmt
-                .else_branch
-                .as_ref()
-                .map(|b| body_stmts(b.as_ref()))
-                .unwrap_or_default(),
-        },
+        Command::If(if_stmt) => {
+            // A leading `$(…)` test operand is pre-evaluated BEFORE the
+            // `if` (an `if` condition runs once, so hoisting is faithful);
+            // `if [[ "$(cmd)" … ]]` no longer hands the renderers shell
+            // text (core request c-20261009-215050).
+            let (mut pre, cond) = prelower_cond_captures(&if_stmt.condition);
+            let stmt = IrStmt::If {
+                cond,
+                then: body_stmts(&if_stmt.then_branch),
+                elsifs: vec![],
+                else_: if_stmt
+                    .else_branch
+                    .as_ref()
+                    .map(|b| body_stmts(b.as_ref()))
+                    .unwrap_or_default(),
+            };
+            if pre.is_empty() {
+                stmt
+            } else {
+                pre.push(stmt);
+                IrStmt::Block(pre)
+            }
+        }
         Command::Case(c) => case_to_ir(c),
         Command::While(w) => {
             let cond = command_to_test_ir(&w.condition);
@@ -17693,16 +17717,37 @@ pub(crate) fn stmt_for_command(cmd: &Command) -> Option<IrStmt> {
             inner: vec![stmt_for_command(&rc.command).unwrap_or(IrStmt::Expr(call("true", vec![])))],
             redirects: rc.redirects.iter().map(redirect_to_ir).collect(),
         },
-        Command::And(l, r) => IrStmt::Expr(IrExpr::BinOp {
-            op: BinOpKind::And,
-            lhs: Box::new(command_to_ir(l)),
-            rhs: Box::new(command_to_ir(r)),
-        }),
-        Command::Or(l, r) => IrStmt::Expr(IrExpr::BinOp {
-            op: BinOpKind::Or,
-            lhs: Box::new(command_to_ir(l)),
-            rhs: Box::new(command_to_ir(r)),
-        }),
+        Command::And(l, r) => {
+            // A `[[ … $(…) … ]] && cmd` chain builds through the left
+            // operand (always evaluated), so its capture is hoisted here
+            // (core request c-20261009-215050).
+            let (mut pre, le) = prelower_left_captures(l, false);
+            let stmt = IrStmt::Expr(IrExpr::BinOp {
+                op: BinOpKind::And,
+                lhs: Box::new(le),
+                rhs: Box::new(command_to_ir(r)),
+            });
+            if pre.is_empty() {
+                stmt
+            } else {
+                pre.push(stmt);
+                IrStmt::Block(pre)
+            }
+        }
+        Command::Or(l, r) => {
+            let (mut pre, le) = prelower_left_captures(l, false);
+            let stmt = IrStmt::Expr(IrExpr::BinOp {
+                op: BinOpKind::Or,
+                lhs: Box::new(le),
+                rhs: Box::new(command_to_ir(r)),
+            });
+            if pre.is_empty() {
+                stmt
+            } else {
+                pre.push(stmt);
+                IrStmt::Block(pre)
+            }
+        }
         Command::Not(c) => IrStmt::Expr(not_ir(command_to_ir(c))),
         // First-class A1 nodes instead of the opaque builtin calls (core
         // requests zsh-sh-go-20260814-225040 / zsh-sh-go-20260815-015459
@@ -18560,6 +18605,246 @@ fn is_safe_grep_literal(pat: &str) -> bool {
         && !pat
             .chars()
             .any(|c| matches!(c, '^' | '$' | '.' | '[' | ']' | '*' | '\\' | '\n'))
+}
+
+/// The A1 `test` call for a test body (`[[ … ]]` carries the `"[[")` tag).
+fn test_call_ir(text: &str, double: bool) -> IrExpr {
+    if double {
+        call("test", vec![st(text), st("[[")])
+    } else {
+        call("test", vec![st(text)])
+    }
+}
+
+/// Shapes the emitter ALREADY folds natively out of the raw test text
+/// (`fold_cmdsub_test_operand` / `fold_echo_tr_cmdsub_text` /
+/// `fold_quiet_grep_test` below): hoisting those into temps would
+/// REPLACE a native fold with a runtime test, so they are left alone.
+/// Broad on purpose — a skipped hoist only keeps today's text form.
+fn test_capture_is_natively_folded(inner: &str) -> bool {
+    if fold_echo_tr_cmdsub_text(inner).is_some() {
+        return true;
+    }
+    if let Some(words) = shell_words_simple(inner) {
+        if let Some((cmd, _)) = words.split_first() {
+            if matches!(
+                cmd.as_str(),
+                "uname" | "hostname" | "whoami" | "date" | "readlink" | "pwd"
+            ) {
+                return true;
+            }
+        }
+    }
+    // `… | grep -q …` — the quiet stage provably writes no stdout, so the
+    // value test is a constant (see `fold_quiet_grep_test`).
+    if let Some(stages) = split_pipeline_stages(inner) {
+        if let Some(last) = stages.last() {
+            let mut w = last.split_whitespace();
+            if w.next() == Some("grep") && w.any(|x| x.starts_with("-q")) {
+                return true;
+            }
+        }
+    }
+    false
+}
+
+/// Pre-lower `$( … )` operands OUT of a test body into hygienic temps.
+///
+/// The A1 contract hands a test to the renderer as an opaque STRING, so a
+/// `$(…)` inside it forces a backend with no fold for that shape to run
+/// the body through `bash -c` (core request
+/// c-20261009-215050-test-text-command-substitution). The core has the
+/// parser, so it evaluates the substitution where it belongs: one
+/// `ir = $(cmd)` statement per operand, and the body carries `${ir}` —
+/// the operand shape every renderer already lowers natively.
+///
+/// Refuse > guess: a body with no substitution (or an unparseable /
+/// unbalanced one) returns `None` and the caller keeps the text
+/// BYTE-IDENTICAL (today's behaviour). Single-quoted spans never expand
+/// in bash and are left alone; `$(( … ))` is arithmetic, not a
+/// substitution; a shape the emitter already folds natively is skipped.
+fn prelower_test_captures(text: &str) -> Option<(Vec<IrStmt>, String)> {
+    if !text.contains("$(") {
+        return None;
+    }
+    let b = text.as_bytes();
+    let mut out = String::with_capacity(text.len());
+    let mut stmts: Vec<IrStmt> = Vec::new();
+    let mut i = 0usize;
+    let mut in_single = false;
+    let mut in_double = false;
+    while i < b.len() {
+        let c = b[i] as char;
+        if c == '\\' && i + 1 < b.len() {
+            out.push(c);
+            out.push(b[i + 1] as char);
+            i += 2;
+            continue;
+        }
+        if in_single {
+            out.push(c);
+            if c == '\'' {
+                in_single = false;
+            }
+            i += 1;
+            continue;
+        }
+        if c == '\'' && !in_double {
+            in_single = true;
+            out.push(c);
+            i += 1;
+            continue;
+        }
+        if c == '"' {
+            in_double = !in_double;
+            out.push(c);
+            i += 1;
+            continue;
+        }
+        if c == '$' && i + 1 < b.len() && b[i + 1] == b'(' {
+            // `$(( … ))` is arithmetic — never a command substitution.
+            if i + 2 < b.len() && b[i + 2] == b'(' {
+                out.push(c);
+                i += 1;
+                continue;
+            }
+            let Some(end) = find_capture_end(b, i + 2) else {
+                // Unbalanced: keep the text untouched (today's behaviour).
+                return None;
+            };
+            let inner = &text[i + 2..end];
+            if test_capture_is_natively_folded(inner) {
+                // Re-emit the whole substitution verbatim.
+                out.push_str(&text[i..=end]);
+                i = end + 1;
+                continue;
+            }
+            let Ok(cmds) = crate::Parser::new(inner).parse() else {
+                return None;
+            };
+            let body: Vec<IrStmt> = cmds.iter().filter_map(stmt_for_command).collect();
+            if body.is_empty() {
+                return None;
+            }
+            let name = format!("__sh2_tc{}", stmts.len());
+            stmts.push(IrStmt::Assign {
+                targets: vec![crate::ir::AssignTarget {
+                    var: name.clone(),
+                    sigil: None,
+                    indices: vec![],
+                }],
+                expr: IrExpr::Capture {
+                    expr: Box::new(IrExpr::Arrow(body)),
+                    native: false,
+                },
+                asm: None,
+            });
+            out.push_str(&format!("${{{name}}}"));
+            i = end + 1;
+            continue;
+        }
+        out.push(c);
+        i += 1;
+    }
+    if stmts.is_empty() {
+        return None;
+    }
+    Some((stmts, out))
+}
+
+/// Index of the `)` closing a `$(` whose body starts at `start`. Tracks
+/// nesting, both quote styles, backslash escapes and `$((`-arithmetic
+/// parens (they are balanced, so a plain depth count covers them).
+fn find_capture_end(b: &[u8], start: usize) -> Option<usize> {
+    let mut depth = 1usize;
+    let mut i = start;
+    let mut in_single = false;
+    let mut in_double = false;
+    while i < b.len() {
+        let c = b[i] as char;
+        if c == '\\' && !in_single {
+            i += 2;
+            continue;
+        }
+        if in_single {
+            if c == '\'' {
+                in_single = false;
+            }
+            i += 1;
+            continue;
+        }
+        if c == '\'' && !in_double {
+            in_single = true;
+            i += 1;
+            continue;
+        }
+        if c == '"' {
+            in_double = !in_double;
+            i += 1;
+            continue;
+        }
+        if c == '(' {
+            depth += 1;
+        } else if c == ')' {
+            depth -= 1;
+            if depth == 0 {
+                return Some(i);
+            }
+        }
+        i += 1;
+    }
+    None
+}
+
+/// Lower a condition, pre-evaluating any LEFT-MOST `$( … )` test operand
+/// into statements the caller runs first (core request
+/// c-20261009-215050). Only the leftmost operand of an `&&`/`||` chain is
+/// hoisted: bash evaluates it unconditionally, so moving its capture
+/// ahead of the enclosing statement cannot change side effects. Every
+/// other condition shape is left exactly as it was.
+fn prelower_cond_captures(cmd: &Command) -> (Vec<IrStmt>, IrExpr) {
+    prelower_left_captures(cmd, true)
+}
+
+/// [`prelower_cond_captures`] for a plain `&&`/`||` STATEMENT operand
+/// (the right side of a chain is never hoisted — it may not run at all).
+fn prelower_left_captures(cmd: &Command, for_condition: bool) -> (Vec<IrStmt>, IrExpr) {
+    let plain = |c: &Command| {
+        if for_condition {
+            command_to_test_ir(c)
+        } else {
+            command_to_ir(c)
+        }
+    };
+    match cmd {
+        Command::TestExpression(t) => match prelower_test_captures(&t.expression) {
+            Some((pre, text)) => (pre, test_call_ir(&text, t.modifiers.double)),
+            None => (vec![], plain(cmd)),
+        },
+        Command::And(l, r) => {
+            let (pre, le) = prelower_left_captures(l, for_condition);
+            (
+                pre,
+                IrExpr::BinOp {
+                    op: BinOpKind::And,
+                    lhs: Box::new(le),
+                    rhs: Box::new(command_to_ir(r)),
+                },
+            )
+        }
+        Command::Or(l, r) => {
+            let (pre, le) = prelower_left_captures(l, for_condition);
+            (
+                pre,
+                IrExpr::BinOp {
+                    op: BinOpKind::Or,
+                    lhs: Box::new(le),
+                    rhs: Box::new(command_to_ir(r)),
+                },
+            )
+        }
+        _ => (vec![], plain(cmd)),
+    }
 }
 
 fn command_to_ir(cmd: &Command) -> IrExpr {
@@ -25453,6 +25738,10 @@ fn hoist_collect_bound(e: &Expr, fx: &mut HoistCalls) {
 
 fn hoist_collect_expr(e: &Expr, fx: &mut HoistCalls) {
     match e {
+        Expr::AssignmentPattern { left, right } => {
+            hoist_collect_expr(left, fx);
+            hoist_collect_expr(right, fx);
+        }
         Expr::CallExpression { callee, arguments, .. } => {
             if let Expr::Identifier { name } = callee.as_ref() {
                 // Direct static call: record (the callee position itself
@@ -25845,6 +26134,10 @@ fn hoist_strip_in_expr(
     proven: &HashMap<String, HashSet<String>>,
 ) {
     match e {
+        Expr::AssignmentPattern { left, right } => {
+            hoist_strip_in_expr(left, cur, proven);
+            hoist_strip_in_expr(right, cur, proven);
+        }
         Expr::ArrowFunctionExpression { body, .. } => match body {
             // A bare arrow keeps the ambient context; the named
             // definition sites (assignment / declarator) set it.
@@ -26178,6 +26471,10 @@ fn hoist_scan_expr(e: &Expr, params: &HashSet<String>, scope: &mut HoistScope) {
     }
     match e {
         Expr::Identifier { .. } | Expr::Literal { .. } => {}
+        Expr::AssignmentPattern { left, right } => {
+            hoist_scan_expr(left, params, scope);
+            hoist_scan_expr(right, params, scope);
+        }
         Expr::CallExpression { callee, arguments, .. } => {
             if matches!(callee.as_ref(), Expr::Identifier { name } if name == "eval" || name == "Function")
             {
@@ -26546,6 +26843,10 @@ fn hoist_rewrite_expr(e: &mut Expr, map: &HashMap<(String, u8), String>) {
     }
     match e {
         Expr::Identifier { .. } | Expr::Literal { .. } => {}
+        Expr::AssignmentPattern { left, right } => {
+            hoist_rewrite_expr(left, map);
+            hoist_rewrite_expr(right, map);
+        }
         Expr::CallExpression { callee, arguments, .. } => {
             hoist_rewrite_expr(callee, map);
             for a in arguments.iter_mut() {
@@ -26721,6 +27022,10 @@ fn hoist_fn_in_expr(params: &[Expr], body: &mut Stmt, module_bound: &HashSet<Str
 
 fn hoist_in_expr(e: &mut Expr, module_bound: &HashSet<String>) {
     match e {
+        Expr::AssignmentPattern { left, right } => {
+            hoist_in_expr(left, module_bound);
+            hoist_in_expr(right, module_bound);
+        }
         Expr::ArrowFunctionExpression { params, body, .. } => match body {
             ArrowBody::Block(b) => hoist_fn_in_expr(params, b, module_bound),
             ArrowBody::Expr(x) => hoist_in_expr(x, module_bound),
@@ -27246,6 +27551,10 @@ fn array_index_key(s: &str) -> Option<i64> {
 #[allow(clippy::too_many_arguments)]
 fn array_scan_expr(e: &Expr, name: &str, scope: &mut ArrayScope, top_idx: usize) {
     match e {
+        Expr::AssignmentPattern { left, right } => {
+            array_scan_expr(left, name, scope, top_idx);
+            array_scan_expr(right, name, scope, top_idx);
+        }
         Expr::CallExpression { callee, arguments, .. } => {
             if let Expr::MemberExpression {
                 object,
@@ -28051,6 +28360,10 @@ fn array_counter_sh2call(func: &str, args: &[Expr], name: &str, saw: &mut bool, 
 fn array_counter_writes(stmts: &[Stmt], name: &str, saw: &mut bool, ok: &mut bool) {
     fn expr(e: &Expr, name: &str, saw: &mut bool, ok: &mut bool) {
         match e {
+            Expr::AssignmentPattern { left, right } => {
+                expr(left, name, saw, ok);
+                expr(right, name, saw, ok);
+            }
             Expr::AssignmentExpression { left, right, .. } => {
                 if matches!(left.as_ref(), Expr::Identifier { name: n } if n.as_str() == name)
                 {
@@ -29211,6 +29524,10 @@ fn array_rewrite_expr(e: &mut Expr, name: &str) {    // Post-order: rewrite the 
         }
     }
     match e {
+        Expr::AssignmentPattern { left, right } => {
+            array_rewrite_expr(left, name);
+            array_rewrite_expr(right, name);
+        }
         Expr::CallExpression { callee, arguments, .. } => {
             array_rewrite_expr(callee, name);
             for a in arguments.iter_mut() {
@@ -29433,6 +29750,10 @@ struct ArrayPreScan {
 
 fn array_pre_scan_expr(e: &Expr, pre: &mut ArrayPreScan) {
     match e {
+        Expr::AssignmentPattern { left, right } => {
+            array_pre_scan_expr(left, pre);
+            array_pre_scan_expr(right, pre);
+        }
         Expr::CallExpression { callee, arguments, .. } => {
             if let Expr::MemberExpression {
                 object,
@@ -29786,6 +30107,10 @@ fn array_decide(
         }
         match e {
             Expr::Identifier { name } => out.push(name.clone()),
+            Expr::AssignmentPattern { left, right } => {
+                collect_idents(left, out);
+                collect_idents(right, out);
+            }
             Expr::CallExpression { callee, arguments, .. } => {
                 collect_idents(callee, out);
                 for a in arguments {
@@ -30269,6 +30594,10 @@ fn array_migrate_bodies(
         migrated: &mut bool,
     ) {
         match e {
+            Expr::AssignmentPattern { left, right } => {
+                expr(left, snap_top, module_bound, pre, migrated);
+                expr(right, snap_top, module_bound, pre, migrated);
+            }
             Expr::ArrowFunctionExpression { params, body, .. } => {
                 if let ArrowBody::Block(b) = body {
                     if let Some(pnames) = array_ident_params(params) {
@@ -30643,6 +30972,10 @@ fn fold_temp_roundtrips(stmts: &mut Vec<Stmt>) {
                 }
             }
             match e {
+                Expr::AssignmentPattern { left, right } => {
+                    expr(left, name, writes, reads);
+                    expr(right, name, writes, reads);
+                }
                 Expr::CallExpression { callee, arguments, .. } => {
                     if let Expr::MemberExpression {
                         object,
@@ -31232,6 +31565,10 @@ fn peephole_idiv(stmts: &mut Vec<Stmt>) {
             }
         }
         match e {
+            Expr::AssignmentPattern { left, right } => {
+                expr(left, nums, nonzero);
+                expr(right, nums, nonzero);
+            }
             Expr::CallExpression { callee, arguments, .. } => {
                 expr(callee, nums, nonzero);
                 for a in arguments.iter_mut() {
@@ -31459,6 +31796,10 @@ fn peephole_arith_eval(stmts: &mut Vec<Stmt>) {
             }
         }
         match e {
+            Expr::AssignmentPattern { left, right } => {
+                expr(left, nums, nonzero);
+                expr(right, nums, nonzero);
+            }
             Expr::CallExpression { callee, arguments, .. } => {
                 expr(callee, nums, nonzero);
                 for a in arguments.iter_mut() {
@@ -31618,6 +31959,10 @@ fn peephole_arith_eval(stmts: &mut Vec<Stmt>) {
 fn fold_temp_roundtrips_program(program: &mut Program) {
     fn expr(e: &mut Expr) {
         match e {
+            Expr::AssignmentPattern { left, right } => {
+                expr(left);
+                expr(right);
+            }
             Expr::ArrowFunctionExpression { body, .. } => match body {
                 ArrowBody::Block(b) => stmt(b),
                 ArrowBody::Expr(x) => expr(x),
@@ -55098,6 +55443,10 @@ fn sync_arrow_flip(arrow: Expr) -> Expr {
 /// would only allocate a discarded promise.
 fn sync_arrow_flip_deep(e: Expr) -> Expr {
     match e {
+        Expr::AssignmentPattern { left, right } => Expr::AssignmentPattern {
+            left: Box::new(sync_arrow_flip_deep(*left)),
+            right: Box::new(sync_arrow_flip_deep(*right)),
+        },
         Expr::FunctionExpression { id, params, body, generator, expression, r#async } => Expr::FunctionExpression {
             id: Box::new(sync_arrow_flip_deep(*id)),
             params: params.into_iter().map(sync_arrow_flip_deep).collect(),
@@ -55676,6 +56025,10 @@ fn expr_contains_sh2(e: &Expr) -> bool {
 fn expr_sh2_call_count(e: &Expr) -> usize {
     fn walk(e: &Expr, n: &mut usize) {
         match e {
+            Expr::AssignmentPattern { left, right } => {
+                walk(left, n);
+                walk(right, n);
+            }
             Expr::CallExpression {
                 callee, arguments, ..
             } => {
@@ -61659,6 +62012,47 @@ mod named_param_emission_tests {
         assert!(
             js.contains(r#"ArrowFunctionExpression","params":[{"type":"Identifier","name":"s"}"#),
             "the declared parameter must be an arrow parameter: {js}"
+        );
+    }
+
+    /// ESTree contract groundwork for C++ default arguments (core request
+    /// cpp-sh-go-optional-param-20260815-172052): a defaulted parameter is
+    /// a native JS `AssignmentPattern`, so the reference runtime evaluates
+    /// the default at call time. The A1 ingress side of this request lives
+    /// on `Sub.param_defaults`; the `Function`-shaped frontends (c-sh-go's
+    /// `clib`) are the follow-up.
+    #[test]
+    fn assignment_pattern_serializes_as_estree_default_param() {
+        let f = Stmt::FunctionDeclaration {
+            id: Expr::Identifier {
+                name: "f".to_string(),
+            },
+            params: vec![
+                Expr::Identifier {
+                    name: "x".to_string(),
+                },
+                Expr::AssignmentPattern {
+                    left: Box::new(Expr::Identifier {
+                        name: "y".to_string(),
+                    }),
+                    right: Box::new(Expr::Literal {
+                        value: serde_json::json!(5),
+                        raw: None,
+                        regex: None,
+                    }),
+                },
+            ],
+            body: Box::new(Stmt::BlockStatement { body: vec![] }),
+            generator: false,
+            expression: false,
+            r#async: false,
+        };
+        let js = serde_json::to_string(&f).unwrap();
+        assert!(
+            js.contains(
+                r#""params":[{"type":"Identifier","name":"x"},{"type":"AssignmentPattern","left":{"type":"Identifier","name":"y"},"right":{"type":"Literal","value":5"#
+            ),
+            "a defaulted param must serialize as an AssignmentPattern: {js}"
         );
     }
 

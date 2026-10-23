@@ -458,6 +458,17 @@ pub struct Render {
     /// `_sh_sc` NULL-safe strcmp operand helper (string Eq/Ne on a
     /// possibly-unassigned global — see the emission site)
     need_sc_guard: bool,
+    /// Accumulator vars (shared string-accumulator analysis + the C
+    /// eligibility pre-pass) whose growth-append reads its length from
+    /// the `_alen_<ident>` mirror instead of a per-append
+    /// `strlen(dest)` — the O(n)-per-append scan that made a
+    /// `v="$v$seg"` accumulate O(n²). Shell-name namespace.
+    acc_lens: HashSet<String>,
+    /// The C idents of `acc_lens` (the store funnels receive idents).
+    acc_idents: HashSet<String>,
+    /// `_alen_<ident>` decls already emitted (first site declares the
+    /// `static`, later sites only assign).
+    acc_len_declared: HashSet<String>,
     /// string-var ++/-- helpers (sequence-point-safe inc/dec)
     need_incdec: bool,
     /// regex.h (test `=~`)
@@ -9630,6 +9641,91 @@ pub fn shir_to_c(prog: &IrProgram) -> String {
     // the final layout; the render arm consults the map. Runs on the
     // top-level statements (where shell Function nodes live).
     r.take_fields = collect_take_fields(&prog, &r.bigint_vars);
+    // String-accumulator length mirror — the C hook for the shared
+    // string-accumulator analysis. `acc_vars_tree` proves each loop's
+    // write surface (direct names only: for-vars, split targets and
+    // name-as-data refs are refused there); this adds the C-side
+    // verdicts, because a tracked var's `_alen_<ident>` mirror is kept
+    // in sync by EVERY store funnel (Assign chain, owned/fixed copies,
+    // growth arm) — so eligibility must exclude every var whose stores
+    // can reach an UNhooked path (arrays/indirections via the Local
+    // escape class, numeric/bigint/managed/typed store paths, const
+    // lifts, namerefs, env imports, callee writes). Untracked vars
+    // render byte-identically. SH2_NO_ACC_LEN=1 disables tracking
+    // end-to-end (A/B pin); SH2_NO_GROWTH disables it too, since the
+    // growth arm that reads the mirror would then never run.
+    if crate::transforms::transform_enabled("string-accumulator")
+        && crate::transforms::transform_enabled("escape-classes")
+        && std::env::var_os("SH2_NO_ACC_LEN").is_none()
+        && std::env::var_os("SH2_NO_GROWTH").is_none()
+    {
+        let mut cands = crate::transforms::string_accumulator::acc_vars_tree(&prog.stmts);
+        for sub in &prog.subs {
+            for v in crate::transforms::string_accumulator::acc_vars_tree(&sub.body) {
+                if !cands.contains(&v) {
+                    cands.push(v);
+                }
+            }
+        }
+        // Store-class widening belt: cross-FUNCTION writes are fine
+        // (every store funnel carries the mirror reset program-wide,
+        // and escape-class `Local` is only about scope), but an
+        // indirect write construct — `eval`/`source`/`.`/`${!name}` —
+        // can write a variable with NO IR statement naming it, so when
+        // the program contains one, only `Local` vars are trackable.
+        // The detection is the IR Debug form of any exact `Str`
+        // literal (over-broad on purpose: `echo "eval"` refuses the
+        // widening too — a refusal only loses tracking, never
+        // soundness).
+        let store_ok = {
+            let blob = format!("{:?} {:?}", prog.stmts, prog.subs);
+            !(blob.contains("Str(\"eval\"")
+                || blob.contains("Str(\"source\"")
+                || blob.contains("Str(\".\")")
+                || blob.contains("Str(\"!\"")
+                || blob.contains("func: \"eval\"")
+                || blob.contains("func: \"source\""))
+        };
+        for v in cands {
+            if std::env::var_os("SH2_DBG_ACC").is_some() {
+                eprintln!(
+                    "ACC candidate {v}: esc={:?} env={} num={} float={} bigint={} mstr={} arr={} typeset={} nameref={} fnw={} store_ok={store_ok}",
+                    crate::transforms::escape_classes::verdict(&v),
+                    prog.var_bash_env.contains(&v),
+                    r.is_num(&v),
+                    r.is_float(&v),
+                    r.bigint_vars.contains(&v),
+                    r.managed_strings.contains(&v),
+                    r.arrays.contains(&v),
+                    r.typeset_attrs.get(&v).copied().unwrap_or(0),
+                    r.nameref.contains_key(&v),
+                    r.fn_written.contains(&v),
+                );
+            }
+            let esc = crate::transforms::escape_classes::verdict(&v);
+            let ok = matches!(esc, Some(crate::transforms::escape_classes::EscapeClass::Local))
+                || (store_ok
+                    && matches!(esc, Some(crate::transforms::escape_classes::EscapeClass::Store)))
+                ;
+            let ok = ok
+                && !prog.var_bash_env.contains(&v)
+                && !r.is_num(&v)
+                && !r.is_float(&v)
+                && !r.bigint_vars.contains(&v)
+                && !r.managed_strings.contains(&v)
+                && !r.arrays.contains(&v)
+                && r.typeset_attrs.get(&v).copied().unwrap_or(0) == 0
+                && !r.nameref.contains_key(&v)
+                && !r.fn_written.contains(&v);
+            if ok {
+                r.acc_idents.insert(r.c_ident(&v));
+                r.acc_lens.insert(v);
+            }
+        }
+        if std::env::var_os("SH2_DBG_ACC").is_some() {
+            eprintln!("ACC tracked {} of candidates: {:?} idents={:?}", r.acc_lens.len(), r.acc_lens, r.acc_idents);
+        }
+    }
     // small-int arrays (native sum/max/min fast path): string-stored
     // arrays with int-domain elements only. After fold_range_for
     // (final statement layout) and before rendering; needs var_types
@@ -10950,6 +11046,7 @@ impl Render {
             if let Some(lit) = unescaped_literal(rhs) {
                 if (lit.len() as u64) <= b {
                     self.emit(&format!("strncpy({name}, {rhs_c}, {cap});"));
+                    self.acc_len_reset_ident(name);
                     return;
                 }
             }
@@ -10967,6 +11064,7 @@ impl Render {
         } else {
             self.emit(&format!("{name}[0] = '\\0';"));
         }
+        self.acc_len_reset_ident(name);
     }
 
     // ── shell-out runtime (native lowering via `bash -c` shell-outs) ──
@@ -12549,13 +12647,19 @@ impl Render {
         if self.need_pow {
             self.emit("/* integer power (no libm on the gate's cc) */");
             self.emit("static long long _sh_pow(long long b, long long e) {");
-            self.emit("  long long r = 1; if (e < 0) return 0;");
-            self.emit("  while (e--) {");
-            self.emit("    if (b != 0 && (r > (9223372036854775807LL / b) || r < (-9223372036854775807LL / b)))");
-            self.emit("      return 0; /* bash: overflow wraps to garbage — clamp to 0 */");
-            self.emit("    r *= b;");
-            self.emit("  }");
-            self.emit("  return r;");
+            // bash's `**` is int64 TWO'S-COMPLEMENT arithmetic: an overflow
+            // WRAPS (`3 * 1000 ** 7` → -6819284014656913408), it never
+            // saturates. Multiply in uint64_t (wrapping is well defined
+            // there) and reinterpret the bits — memcpy keeps the conversion
+            // defined even where `(long long)` of an out-of-range unsigned
+            // would be implementation-defined (core request
+            // c-20261022-224500-pow-overflow-clamps-instead-of-wrapping).
+            self.emit("  unsigned long long r = 1, ub = (unsigned long long)b;");
+            self.emit("  long long out;");
+            self.emit("  if (e < 0) return 0;");
+            self.emit("  while (e--) r *= ub;");
+            self.emit("  memcpy(&out, &r, sizeof out);");
+            self.emit("  return out;");
             self.emit("}");
             self.emit("");
         }
@@ -15166,6 +15270,11 @@ impl Render {
                     } else {
                         self.emit(&format!("const char* {name} = {init};"));
                     }
+                    // a NON-NULL declaration initializer is a write the
+                    // store funnels never see — seed the accumulator
+                    // length mirror here (NULL/0 decls are consistent
+                    // with the mirror's static-zero init already).
+                    self.acc_len_reset_ident(&name);
                     return;
                 }
             }
@@ -15193,6 +15302,10 @@ impl Render {
             // Raw char* with null-guard reads is correct today.
             self.emit(&format!("char* {name} = NULL;"));
         }
+        // the mirror decl travels WITH the var's declaration (see
+        // acc_len_decl_ident) — before any statement that resets or
+        // grows it.
+        self.acc_len_decl_ident(&name);
     }
 
     /// Render an expression as a C compile-time constant initializer, or
@@ -23091,11 +23204,13 @@ fn param_copy_alias(
         // num/buf/mstr/const/bigint have their own mechanisms.
         if !self.is_heap_store_var(name) {
             self.emit(&format!("{id} = {v};"));
+            self.acc_len_reset_ident(id);
             return;
         }
         if self.pending_frees.contains(&v) {
             self.emit(&format!("{id} = {v};"));
             self.pending_frees.retain(|x| x != &v);
+            self.acc_len_reset_ident(id);
             return;
         }
         // free-AFTER-reassign via temp swap (BASHC_FIX: free-before
@@ -23105,6 +23220,44 @@ fn param_copy_alias(
             self.emit_str_store(id, &v);
         } else {
             self.emit(&format!("{id} = _sh_xstrdup((char*)({v}));"));
+        }
+        self.acc_len_reset_ident(id);
+    }
+
+    /// After a plain store of a tracked accumulator, mirror the new
+    /// length — the invariant the growth arm's O(1) `_o` load reads
+    /// (`_alen_<ident>` always == strlen(buffer), so a mid-scope write
+    /// can never leave it stale). No-op for every other var.
+    fn acc_len_reset_ident(&mut self, id: &str) {
+        if std::env::var_os("SH2_DBG_ACC").is_some() && self.acc_idents.contains(id) {
+            eprintln!("ACC reset {id} declared={}", self.acc_len_declared.contains(&format!("_alen_{id}")));
+        }
+        if self.acc_idents.contains(id) {
+            let ol = format!("_alen_{id}");
+            if self.acc_len_declared.insert(ol.clone()) {
+                self.emit(&format!("static size_t {ol} = 0;"));
+            }
+            self.emit(&format!("{ol} = {id} ? (size_t)strlen({id}) : 0;"));
+        }
+    }
+
+    /// Declare the length mirror next to the variable's OWN
+    /// declaration. A cross-function (Store-class) accumulator's
+    /// resets and uses live in OTHER C functions, so the decl must sit
+    /// at file/function scope where the var itself is declared — a
+    /// first-use fallback decl would land in whichever function
+    /// touched the var first and leave the others undeclared (the
+    /// `_alen_gl_payload` tcc error). Reset/use sites keep their
+    /// fallback for any var whose decl took an unhooked path.
+    fn acc_len_decl_ident(&mut self, id: &str) {
+        if std::env::var_os("SH2_DBG_ACC").is_some() {
+            eprintln!("ACC decl_ident {id} contains={} declared={}", self.acc_idents.contains(id), self.acc_len_declared.contains(&format!("_alen_{id}")));
+        }
+        if self.acc_idents.contains(id) {
+            let ol = format!("_alen_{id}");
+            if self.acc_len_declared.insert(ol.clone()) {
+                self.emit(&format!("static size_t {ol} = 0;"));
+            }
         }
     }
 
@@ -31797,7 +31950,22 @@ fn param_copy_alias(
                         let tc = self.temp_seq;
                         self.temp_seq += 1;
                         let nid = self.c_ident(&t.var);
-                        self.emit(&format!("{{ size_t _o{tc} = ({nid}) ? strlen({nid}) : 0; size_t _n{tc} = strlen({seg}); char *_np{tc} = (char*)realloc(({nid}), (_o{tc} + _n{tc} + 1) * 2); if (!_np{tc}) {{ fprintf(stderr, \"sh2c: out of memory\\n\"); exit(127); }} ({nid}) = _np{tc}; memcpy(({nid}) + _o{tc}, {seg}, _n{tc} + 1); }}"));
+                        // LENGTH MIRROR (tracked accumulators): every store
+                        // funnel keeps `_alen_<id>` == strlen(buffer), so
+                        // the destination scan — O(n) per append, O(n²) per
+                        // accumulate — becomes an O(1) load, with the mirror
+                        // written back after the memcpy. Untracked vars keep
+                        // the exact previous text (byte-identical render).
+                        let (o_src, mirror) = if self.acc_lens.contains(&t.var) {
+                            let ol = format!("_alen_{nid}");
+                            if self.acc_len_declared.insert(ol.clone()) {
+                                self.emit(&format!("static size_t {ol} = 0;"));
+                            }
+                            (ol.clone(), format!(" {ol} = _o{tc} + _n{tc};"))
+                        } else {
+                            (format!("({nid}) ? strlen({nid}) : 0"), String::new())
+                        };
+                        self.emit(&format!("{{ size_t _o{tc} = {o_src}; size_t _n{tc} = strlen({seg}); char *_np{tc} = (char*)realloc(({nid}), (_o{tc} + _n{tc} + 1) * 2); if (!_np{tc}) {{ fprintf(stderr, \"sh2c: out of memory\\n\"); exit(127); }} ({nid}) = _np{tc}; memcpy(({nid}) + _o{tc}, {seg}, _n{tc} + 1);{mirror} }}"));
                         if !self.fn_written.contains(&t.var) {
                             self.nonnull_var.insert(nid.clone());
                         }
@@ -31950,6 +32118,10 @@ fn param_copy_alias(
                         }
                     }
                 }
+                // plain-store mirror reset: tracked accumulators only —
+                // keeps `_alen_<id>` == strlen after every COPY-chain
+                // completion above (stub cast, MOVE, mstr, sset/legacy).
+                self.acc_len_reset_ident(&name);
             }
             IrStmt::Declare { vars, init, .. } => {
                 // P1 follow-up: (re)definition writes the vars.
@@ -38673,7 +38845,7 @@ fn nonnull_written_expr(e: &IrExpr, out: &mut HashSet<String>) {
 }
 
 /// Nested arith writes at any depth (`j = i++ + ++i` writes j AND i).
-fn nonnull_written_arith(a: &ArithAst, out: &mut HashSet<String>) {
+pub(crate) fn nonnull_written_arith(a: &ArithAst, out: &mut HashSet<String>) {
     match a {
         ArithAst::Assign { var, rhs, .. } => {
             out.insert(var.clone());
@@ -44596,6 +44768,73 @@ mod tests {
         }
         assert!(!out.contains("_sh_pow(2,100)"), "i64 clamp path taken:\n{out}");
         assert!(!out.contains("_sh_"), "_sh_ runtime leaked into pure-bigint output:\n{out}");
+    }
+
+    /// A RUNTIME `**` (non-literal operands, so the literal fold cannot
+    /// fire) must reach a helper that WRAPS on overflow exactly as bash's
+    /// int64 arithmetic does. The old helper `return 0`-ed on overflow —
+    /// `3 * 1000 ** 7` printed `0` where bash prints
+    /// `-6819284014656913408` (core request
+    /// c-20261022-224500-pow-overflow-clamps-instead-of-wrapping).
+    #[test]
+    fn pow_helper_wraps_instead_of_clamping() {
+        use crate::ir::ArithAst;
+        // Var operands: the literal fold in `optimize_stmts` cannot fire, so
+        // the renderer must emit the runtime helper.
+        let prog = IrProgram {
+            imports: vec![],
+            requires: vec![],
+            stmts: vec![IrStmt::Expr(IrExpr::Call {
+                func: "exec".to_string(),
+                args: vec![
+                    IrExpr::Str("echo".to_string(), crate::ir::StrStyle::DoubleQuoted),
+                    IrExpr::Array(vec![IrExpr::Arith(Box::new(ArithAst::Bin {
+                        op: "*".to_string(),
+                        lhs: Box::new(ArithAst::Num(3)),
+                        rhs: Box::new(ArithAst::Bin {
+                            op: "**".to_string(),
+                            lhs: Box::new(ArithAst::Var("n".to_string())),
+                            rhs: Box::new(ArithAst::Var("k".to_string())),
+                        }),
+                    }))]),
+                ],
+            })],
+            subs: vec![],
+            var_types: vec![
+                ("n".to_string(), IrType::Int),
+                ("k".to_string(), IrType::Int),
+            ],
+            stmt_lines: vec![],
+            var_lengths: vec![],
+            var_const: vec![],
+            var_lifetimes: vec![],
+            var_nospace: vec![],
+            var_storage: vec![],
+            var_bash_env: vec![],
+        };
+        let out = shir_to_c(&prog);
+        let helper = out
+            .lines()
+            .skip_while(|l| !l.contains("_sh_pow(long long b, long long e)"))
+            .take(8)
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(
+            out.contains("_sh_pow("),
+            "the runtime `**` must use the helper — emitted:\n{out}"
+        );
+        assert!(
+            out.contains("unsigned long long r = 1, ub = (unsigned long long)b;"),
+            "the helper must multiply in uint64 (wrapping) — emitted:\n{helper}"
+        );
+        assert!(
+            !out.contains("clamp to 0"),
+            "the overflow arm must not clamp — emitted:\n{helper}"
+        );
+        assert!(
+            out.contains("memcpy(&out, &r, sizeof out);"),
+            "the unsigned→signed reinterpret must be defined — emitted:\n{helper}"
+        );
     }
 
     #[test]

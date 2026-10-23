@@ -845,6 +845,12 @@ pub enum IrStmt {
 pub struct IrSub {
     pub name: String,
     pub params: Vec<String>,
+    /// Default-value expressions, parallel to `params` (`None` = required).
+    /// Empty when the sub has no defaults — every shell-defined sub, and
+    /// every pre-existing frontend emit (core request
+    /// cpp-sh-go-optional-param-20260815-172052). When non-empty it is
+    /// exactly `params.len()` long so the positional pairing is total.
+    pub param_defaults: Vec<Option<IrExpr>>,
     pub body: Vec<IrStmt>,
 }
 

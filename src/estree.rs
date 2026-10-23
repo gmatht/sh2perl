@@ -162,6 +162,15 @@ pub enum Expr {
     Identifier {
         name: String,
     },
+    /// A default-valued binding pattern — `x = <expr>` — used in a
+    /// function's `params` list (JS native default parameters). Core
+    /// request cpp-sh-go-optional-param-20260815-172052: a C++ default
+    /// argument lowers to exactly this, so the reference runtime
+    /// evaluates the default at call time with no generated body prologue.
+    AssignmentPattern {
+        left: Box<Expr>,
+        right: Box<Expr>,
+    },
     /// A native function expression — the normalize_functions port's
     /// sequence-form output (`(__fn_x = function x(...) {…}, …)`).
     FunctionExpression {
@@ -1675,6 +1684,12 @@ fn walk_expr(e: &Expr, in_fn: bool, f: &mut impl FnMut(&Expr, bool)) {
     f(e, in_fn);
     match e {
         Expr::Identifier { .. } | Expr::Literal { .. } => {}
+        // `x = <default>` binding patterns: both sides are part of the
+        // subtree (the default expression is real code).
+        Expr::AssignmentPattern { left, right } => {
+            walk_expr(left, in_fn, f);
+            walk_expr(right, in_fn, f);
+        }
         Expr::TemplateLiteral { expressions, .. } => {
             for q in expressions {
                 walk_expr(q, in_fn, f);
@@ -2069,6 +2084,10 @@ fn lower_expr(e: Expr, natives: &std::collections::HashSet<String>) -> Expr {
                 .map(|a| lower_expr(a, natives))
                 .collect(),
             optional,
+        },
+        Expr::AssignmentPattern { left, right } => Expr::AssignmentPattern {
+            left: Box::new(lower_expr(*left, natives)),
+            right: Box::new(lower_expr(*right, natives)),
         },
         Expr::Identifier { .. } | Expr::Literal { .. } => e,
         Expr::TemplateLiteral { quasis, expressions } => Expr::TemplateLiteral {
@@ -2490,6 +2509,10 @@ fn drop_nested_flags(stmt: &mut Stmt) {
 fn drop_expr_flags(e: &mut Expr) {
     match e {
         Expr::Identifier { .. } | Expr::Literal { .. } => {}
+        Expr::AssignmentPattern { left, right } => {
+            drop_expr_flags(left);
+            drop_expr_flags(right);
+        }
         Expr::TemplateLiteral { expressions, .. } => {
             for x in expressions {
                 drop_expr_flags(x);
@@ -3553,6 +3576,13 @@ fn write_expr(out: &mut String, e: &Expr) {
             write_expr(out, right);
             out.push('}');
         }
+        Expr::AssignmentPattern { left, right } => {
+            out.push_str("{\"type\":\"AssignmentPattern\",\"left\":");
+            write_expr(out, left);
+            out.push_str(",\"right\":");
+            write_expr(out, right);
+            out.push('}');
+        }
         Expr::AssignmentExpression { operator, left, right } => {
             out.push_str("{\"type\":\"AssignmentExpression\",");
             push_key(out, "operator", operator);
@@ -3708,6 +3738,10 @@ pub(crate) fn visit_exprs(prog: &mut Program, f: &mut dyn FnMut(&mut Expr)) {
         f(e);
         match e {
             Expr::Identifier { .. } | Expr::Literal { .. } => {}
+            Expr::AssignmentPattern { left, right } => {
+                expr(left, f);
+                expr(right, f);
+            }
             Expr::TemplateLiteral { quasis: _, expressions } => {
                 for x in expressions { expr(x, f); }
             }
@@ -3772,6 +3806,9 @@ pub(crate) fn has_await_expr(e: &Expr) -> bool {
     match e {
         Expr::AwaitExpression { .. } => true,
         Expr::Identifier { .. } | Expr::Literal { .. } => false,
+        Expr::AssignmentPattern { left, right } => {
+            has_await_expr(left) || has_await_expr(right)
+        }
         Expr::TemplateLiteral { expressions, .. } => expressions.iter().any(has_await_expr),
         Expr::CallExpression { callee, arguments, .. } => {
             has_await_expr(callee) || arguments.iter().any(has_await_expr)
@@ -4004,6 +4041,10 @@ pub(crate) fn await_sync_fn_calls(mut prog: Program) -> Program {
                     for a in arguments { f(a, false, false); }
                 }
                 Expr::AwaitExpression { argument } => f(argument, false, false),
+                Expr::AssignmentPattern { left, right } => {
+                    f(left, false, false);
+                    f(right, false, false);
+                }
                 Expr::FunctionExpression { params, body, .. } => {
                     for p in params { f(p, false, false); }
                     visit_stmt(body, f);
@@ -4247,6 +4288,10 @@ pub(crate) fn visit_exprs_post(prog: &mut Program, f: &mut dyn FnMut(&mut Expr))
     fn expr(e: &mut Expr, f: &mut dyn FnMut(&mut Expr)) {
         match e {
             Expr::Identifier { .. } | Expr::Literal { .. } => {}
+            Expr::AssignmentPattern { left, right } => {
+                expr(left, f);
+                expr(right, f);
+            }
             Expr::TemplateLiteral { quasis: _, expressions } => {
                 for x in expressions { expr(x, f); }
             }
@@ -4583,6 +4628,10 @@ pub(crate) fn normalize_functions(mut prog: Program) -> Program {
         ) {
             match node {
                 Expr::Identifier { .. } | Expr::Literal { .. } => {}
+                Expr::AssignmentPattern { left, right } => {
+                    walk_usage(left, owner, usage, runtime_by_name);
+                    walk_usage(right, owner, usage, runtime_by_name);
+                }
                 Expr::TemplateLiteral { expressions, .. } => {
                     for x in expressions { walk_usage(x, owner, usage, runtime_by_name); }
                 }
@@ -5299,6 +5348,10 @@ fn visit_exprs_single(e: &mut Expr, f: &mut dyn FnMut(&mut Expr)) {
     while let Some(n) = stack.pop() {
         f(n);
         match n {
+            Expr::AssignmentPattern { left, right } => {
+                stack.push(left);
+                stack.push(right);
+            }
             Expr::TemplateLiteral { expressions, .. } => {
                 for x in expressions.iter_mut() { stack.push(x); }
             }
@@ -5451,6 +5504,10 @@ pub(crate) fn return_in_loop(mut prog: Program) -> Program {
                     rewrite_expr(a, i == 1);
                 }
                 return;
+            }
+            Expr::AssignmentPattern { left, right } => {
+                rewrite_expr(left, in_loop);
+                rewrite_expr(right, in_loop);
             }
             Expr::TemplateLiteral { expressions, .. } => {
                 for x in expressions { rewrite_expr(x, in_loop); }
@@ -5964,6 +6021,10 @@ pub(crate) fn direct_shell_fn_calls(mut prog: Program) -> Program {
     }
     fn recurse_expr(e: &mut Expr, fns: &std::collections::HashMap<String, FnInfo>, _stmt_pos: bool) {
         match e {
+            Expr::AssignmentPattern { left, right } => {
+                *left = Box::new(rewrite_expr_dispatch(left, fns, false));
+                *right = Box::new(rewrite_expr_dispatch(right, fns, false));
+            }
             Expr::TemplateLiteral { expressions, .. } => {
                 for x in expressions { *x = rewrite_expr_dispatch(x, fns, false); }
             }
@@ -6137,6 +6198,10 @@ fn scan_fn_expr(e: &Expr, has_return: &mut bool, pos_refs: &mut bool) {
         _ => {}
     }
     match e {
+        Expr::AssignmentPattern { left, right } => {
+            scan_fn_expr(left, has_return, pos_refs);
+            scan_fn_expr(right, has_return, pos_refs);
+        }
         Expr::TemplateLiteral { expressions, .. } => {
             for x in expressions { scan_fn_expr(x, has_return, pos_refs); }
         }
@@ -6771,9 +6836,15 @@ mod tests {
         assert!(json2.contains("\"name\":\"cwd\""));
         assert!(!json2.contains("\"name\":\"test\""));
         assert!(!json2.contains("unsupported"));
-        // a cmdsub with a dynamic command keeps the runtime test
+        // a cmdsub with a dynamic command is PRE-EVALUATED into a temp
+        // (core request c-20261009-215050): the capture lowers natively
+        // (`fs.readFile`) and the compare is native — no runtime test
+        // text (which would spawn a child bash per evaluation), no
+        // unsupported.
         let json3 = to_json("[[ \"$(cat f)\" = x ]]");
-        assert!(json3.contains("\"name\":\"test\""));
+        assert!(!json3.contains("\"name\":\"test\""));
+        assert!(json3.contains("\"name\":\"readFile\""));
+        assert!(json3.contains("\"name\":\"setVar\""));
         assert!(!json3.contains("unsupported"));
     }
 
@@ -8785,6 +8856,11 @@ fn expr_read_set<'a>(e: &'a Expr, shadow: &ReadSet<'a>) -> ReadSet<'a> {
             out
         }
         Expr::Literal { .. } => ReadSet::new(),
+        // A defaulted parameter binds its own name (this walk is used to
+        // collect BINDINGS from a params list, not reads), so only the
+        // left side belongs here — a default expression's outer reads
+        // must not become shadows.
+        Expr::AssignmentPattern { left, .. } => expr_read_set(left, shadow),
         Expr::TemplateLiteral { expressions, .. } => {
             let mut out = ReadSet::new();
             for x in expressions {

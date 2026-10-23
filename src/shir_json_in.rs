@@ -172,8 +172,54 @@ fn subs_from(v: Option<&Value>, where_: &str) -> Result<Vec<IrSub>, String> {
             }
             let name = req_str(o, "name", &format!("{where_}[{i}]"))?.to_string();
             let params = str_array(o.get("params"), &format!("{where_}[{i}].params"))?;
+            let param_defaults = param_defaults_from(
+                o.get("param_defaults"),
+                params.len(),
+                &format!("{where_}[{i}]"),
+            )?;
             let body = stmts_from(o.get("body"), &format!("{where_}[{i}].body"))?;
-            Ok(IrSub { name, params, body })
+            Ok(IrSub {
+                name,
+                params,
+                param_defaults,
+                body,
+            })
+        })
+        .collect()
+}
+
+/// Parse the optional `param_defaults` array (core request
+/// cpp-sh-go-optional-param-20260815-172052). Absent / `null` means "no
+/// defaults" (every pre-existing emit round-trips unchanged). A present
+/// array must be exactly as long as `params` — the pairing is positional,
+/// so a short or long list is a malformed contract and refuses.
+fn param_defaults_from(
+    v: Option<&Value>,
+    n_params: usize,
+    where_: &str,
+) -> Result<Vec<Option<IrExpr>>, String> {
+    let Some(v) = v else {
+        return Ok(Vec::new());
+    };
+    if v.is_null() {
+        return Ok(Vec::new());
+    }
+    let a = arr(Some(v), &format!("{where_}.param_defaults"))?;
+    if a.len() != n_params {
+        return Err(format!(
+            "{where_}.param_defaults: {} entries for {n_params} params",
+            a.len()
+        ));
+    }
+    a.iter()
+        .enumerate()
+        .map(|(j, e)| {
+            let w = format!("{where_}.param_defaults[{j}]");
+            if e.is_null() {
+                Ok(None)
+            } else {
+                expr_from(e, &w).map(Some)
+            }
         })
         .collect()
 }
@@ -1573,6 +1619,65 @@ mod tests {
             {"type":"Function","name":"f","params":[7],"body":[]}]}"#;
         let err = shir_json_to_ir(src).expect_err("a non-string param must refuse");
         assert!(err.contains("not a string"), "unexpected error: {err}");
+    }
+
+    /// `Sub.param_defaults` (core request
+    /// cpp-sh-go-optional-param-20260815-172052): a C++ default argument
+    /// arrives as a parallel array next to `params`; `null` marks a
+    /// required parameter. The expressions must survive ingress AND
+    /// re-emission with their positions intact (the pairing is
+    /// positional, so a dropped entry silently mis-binds every later
+    /// parameter).
+    #[test]
+    fn sub_param_defaults_survive_ingress_and_round_trip() {
+        let src = r#"{"type":"Program","contract_version":1,"imports":[],"requires":[],"stmt_lines":[],"subs":[
+            {"type":"Sub","name":"f","params":["x","y","z"],
+             "param_defaults":[{"type":"Int","value":5},null,{"type":"Int","value":3}],
+             "body":[]}],"stmts":[]}"#;
+        let prog = shir_json_to_ir(src).expect("param defaults ingress");
+        let sub = &prog.subs[0];
+        assert_eq!(sub.params, vec!["x", "y", "z"]);
+        assert_eq!(
+            sub.param_defaults,
+            vec![
+                Some(IrExpr::Int(5)),
+                None,
+                Some(IrExpr::Int(3)),
+            ],
+            "defaults must pair positionally, null = required"
+        );
+
+        let json2 = shir_to_shir_json(&prog);
+        let prog2 = shir_json_to_ir(&json2).expect("re-ingest");
+        assert_eq!(
+            prog2.subs[0].param_defaults, sub.param_defaults,
+            "param_defaults must round-trip, not be dropped"
+        );
+    }
+
+    /// `param_defaults` is optional: absent (every shell-defined sub and
+    /// every pre-existing frontend emit) parses to an empty list.
+    #[test]
+    fn sub_param_defaults_absent_is_empty() {
+        let src = r#"{"type":"Program","contract_version":1,"imports":[],"requires":[],"stmt_lines":[],"subs":[
+            {"type":"Sub","name":"f","params":["x"],"body":[]}],"stmts":[]}"#;
+        let prog = shir_json_to_ir(src).expect("absent defaults = none");
+        assert!(prog.subs[0].param_defaults.is_empty());
+        // and an omitted list stays omitted on re-emission (byte-compatible)
+        let json2 = shir_to_shir_json(&prog);
+        assert!(!json2.contains("param_defaults"), "absent must stay absent: {json2}");
+    }
+
+    /// A defaults list whose length disagrees with `params` is a malformed
+    /// contract: positional pairing would otherwise bind the wrong
+    /// expression to a parameter, so refuse loudly.
+    #[test]
+    fn sub_param_defaults_length_mismatch_refuses() {
+        let src = r#"{"type":"Program","contract_version":1,"imports":[],"requires":[],"stmt_lines":[],"subs":[
+            {"type":"Sub","name":"f","params":["x","y"],
+             "param_defaults":[{"type":"Int","value":5}],"body":[]}],"stmts":[]}"#;
+        let err = shir_json_to_ir(src).expect_err("a short defaults list must refuse");
+        assert!(err.contains("param_defaults"), "unexpected error: {err}");
     }
 
     /// Dynamic subscripts (core request c-dynamic-subscripts-20260806-b):

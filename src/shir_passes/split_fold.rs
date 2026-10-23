@@ -515,6 +515,7 @@ mod tests {
         p.subs.push(crate::ir::IrSub {
             name: "f".to_string(),
             params: vec![],
+            param_defaults: vec![],
             body: vec![IrStmt::Expr(IrExpr::Call {
                 func: "split".to_string(),
                 args: vec![IrExpr::Call {

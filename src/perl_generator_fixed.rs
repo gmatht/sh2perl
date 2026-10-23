@@ -2773,6 +2773,7 @@ fn fixups(prog: &IrProgram) -> IrProgram {
         .map(|s| crate::ir::IrSub {
             name: s.name.clone(),
             params: s.params.clone(),
+            param_defaults: s.param_defaults.clone(),
             body: fix_stmts(&s.body, &fns),
         })
         .collect();

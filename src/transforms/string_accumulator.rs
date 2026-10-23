@@ -149,27 +149,198 @@ fn loop_reads_var(st: &IrStmt, var: &str) -> bool {
 }
 
 /// The vars whose ONLY writes in this body are self-appends.
+///
+/// Statement kinds: `Assign` (the candidate writer — indexed writes mark
+/// the var bad), `If` and nested loops (recurse — the branches only
+/// narrow or repeat the same write surface, and `body_reads_var_nonleading`
+/// already walks them for mid-loop reads), and the read-only statement
+/// kinds (`Output`/`WriteFile`/`Die`/`Warn`/`Return`/`Exit` — they carry
+/// expression reads, which the read checks classify, and cannot write a
+/// shell variable). Everything else (Expr calls, Exec, Function defs,
+/// for-loop VARS, unknown Ext nodes) can write state this walk cannot
+/// name, so it refuses all candidates — same verdict as before for those
+/// shapes; the If/nested-loop/read-only allowance is the only widening.
 fn self_append_vars(body: &[IrStmt]) -> Vec<String> {
     let mut writes: Vec<String> = Vec::new();
     let mut bad: std::collections::HashSet<String> = std::collections::HashSet::new();
-    for s in body {
-        if let IrStmt::Assign { targets, expr, .. } = s {
-            for t in targets {
-                if t.indices.is_empty() && !writes.contains(&t.var) {
-                    writes.push(t.var.clone());
+    fn visit(
+        stmts: &[IrStmt],
+        writes: &mut Vec<String>,
+        bad: &mut std::collections::HashSet<String>,
+    ) -> bool {
+        for s in stmts {
+            match s {
+                IrStmt::Assign { targets, expr, .. } => {
+                    for t in targets {
+                        if t.indices.is_empty() && !writes.contains(&t.var) {
+                            writes.push(t.var.clone());
+                        }
+                        if !is_self_append(t.var.as_str(), expr) {
+                            bad.insert(t.var.clone());
+                        }
+                    }
                 }
-                if !is_self_append(t.var.as_str(), expr) {
-                    bad.insert(t.var.clone());
+                IrStmt::If {
+                    then,
+                    elsifs,
+                    else_,
+                    ..
+                } => {
+                    if !visit(then, writes, bad) {
+                        return false;
+                    }
+                    for (_, b) in elsifs {
+                        if !visit(b, writes, bad) {
+                            return false;
+                        }
+                    }
+                    if !visit(else_, writes, bad) {
+                        return false;
+                    }
                 }
+                IrStmt::While { body, .. } | IrStmt::For { body, .. } => {
+                    if !visit(body, writes, bad) {
+                        return false;
+                    }
+                }
+                IrStmt::Output { .. }
+                | IrStmt::WriteFile { .. }
+                | IrStmt::Die { .. }
+                | IrStmt::Warn { .. }
+                | IrStmt::Return(_)
+                | IrStmt::Exit(_) => {}
+                _ => return false, // unknown write surface — refuse
             }
-        } else {
-            // a non-assign statement reads/writes unknown things — mark
-            // everything crystal-clear only (conservative: bail on any
-            // other statement in the body)
-            return Vec::new();
         }
+        true
+    }
+    if !visit(body, &mut writes, &mut bad) {
+        return Vec::new();
     }
     writes.into_iter().filter(|v| !bad.contains(v)).collect()
+}
+
+/// Every accumulator candidate in a statement TREE: each statement list
+/// (top level, If branches, loop bodies, Function bodies) has its loops
+/// checked with the same `self_append_vars` rules, so a loop qualifies on
+/// its OWN body's write surface alone — there is no requirement that the
+/// literal init sit in the same list (the C renderer mirrors the buffer
+/// length at every store, so where the init sits cannot desync it).
+///
+/// Candidates are then filtered by REFUSAL: a var named anywhere this
+/// walk cannot classify as a direct read/write is dropped — a `for` LOOP
+/// VAR (implicit per-iteration write), an Ext/Split target (tokeniser
+/// stores), or a var named as DATA (a `Str` argument to Exec or to any
+/// call that is not a `getVar`/`param` read — `read v`, `unset v`,
+/// `printf -v v`, `setVar("v", …)` all hide a write behind a string).
+/// The same name appearing in `Str` inside a read-only statement kind
+/// (Output/Die/Warn — literal text) is not a reference.
+pub fn acc_vars_tree(stmts: &[IrStmt]) -> Vec<String> {
+    let mut candidates: Vec<String> = Vec::new();
+    let mut refused: std::collections::HashSet<String> = std::collections::HashSet::new();
+
+    fn walk(
+        list: &[IrStmt],
+        candidates: &mut Vec<String>,
+        refused: &mut std::collections::HashSet<String>,
+    ) {
+        for s in list {
+            // Refusal census: refs this walk cannot prove are direct.
+            match s {
+                IrStmt::For { var, .. } => {
+                    refused.insert(var.clone());
+                }
+                IrStmt::Exec { cmd, args, .. } => {
+                    for w in args.iter().chain(std::iter::once(cmd)) {
+                        str_literals(w, refused);
+                    }
+                }
+                // A `((x++))`/`((x = …))` side-effect statement writes its
+                // target(s) through the numeric arith path (unhooked by the
+                // C store funnels) — refuse everything it can touch.
+                IrStmt::Assign {
+                    expr: IrExpr::Arith(a),
+                    ..
+                } => {
+                    crate::c_backend::nonnull_written_arith(a, refused);
+                }
+                IrStmt::Expr(e) => str_call_args(e, refused),
+                _ => {}
+            }
+            match s {
+                IrStmt::While { body, .. } | IrStmt::For { body, .. } => {
+                    for v in self_append_vars(body) {
+                        if !candidates.contains(&v) {
+                            candidates.push(v);
+                        }
+                    }
+                    walk(body, candidates, refused);
+                }
+                IrStmt::If {
+                    then,
+                    elsifs,
+                    else_,
+                    ..
+                } => {
+                    walk(then, candidates, refused);
+                    for (_, b) in elsifs {
+                        walk(b, candidates, refused);
+                    }
+                    walk(else_, candidates, refused);
+                }
+                IrStmt::Function { body, .. } => walk(body, candidates, refused),
+                _ => {}
+            }
+        }
+    }
+
+    fn str_literals(e: &IrExpr, out: &mut std::collections::HashSet<String>) {
+        if let IrExpr::Str(s, _) = e {
+            out.insert(s.clone());
+        }
+    }
+
+    /// A `Str` argument on a non-read call names a var as DATA (write or
+    /// indirection). `getVar`/`param` hold the var name as a READ.
+    fn str_call_args(e: &IrExpr, out: &mut std::collections::HashSet<String>) {
+        match e {
+            IrExpr::Call { func, args } => {
+                if !matches!(func.as_str(), "getVar" | "param") {
+                    for a in args {
+                        str_literals(a, out);
+                    }
+                }
+                for a in args {
+                    str_call_args(a, out);
+                }
+            }
+            IrExpr::Interpolate(parts) => {
+                for p in parts {
+                    if let InterpPart::Expr(e) = p {
+                        str_call_args(e, out);
+                    }
+                }
+            }
+            IrExpr::BinOp { lhs, rhs, .. } => {
+                str_call_args(lhs, out);
+                str_call_args(rhs, out);
+            }
+            IrExpr::Arrow(stmts) => {
+                for st in stmts {
+                    if let IrStmt::Expr(e) = st {
+                        str_call_args(e, out);
+                    }
+                }
+            }
+            _ => {}
+        }
+    }
+
+    walk(stmts, &mut candidates, &mut refused);
+    candidates
+        .into_iter()
+        .filter(|v| !refused.contains(v))
+        .collect()
 }
 
 /// Is this expression a READ of `var`? The real A1 carries reads three ways:

@@ -120,12 +120,32 @@ fn program_json(p: &IrProgram, contract_version: u32) -> Value {
 }
 
 fn sub_json(s: &IrSub) -> Value {
-    json!({
-        "type": "Sub",
-        "name": s.name,
-        "params": s.params,
-        "body": s.body.iter().map(stmt_json).collect::<Vec<_>>(),
-    })
+    let mut o = serde_json::Map::new();
+    o.insert("type".to_string(), json!("Sub"));
+    o.insert("name".to_string(), json!(s.name));
+    o.insert("params".to_string(), json!(s.params));
+    // Optional per-parameter defaults (core request
+    // cpp-sh-go-optional-param-20260815-172052). Emitted ONLY when the sub
+    // HAS defaults, so every existing emit stays byte-identical; `null`
+    // marks a required parameter in an otherwise defaulted list.
+    if !s.param_defaults.is_empty() {
+        o.insert(
+            "param_defaults".to_string(),
+            json!(s
+                .param_defaults
+                .iter()
+                .map(|d| match d {
+                    Some(e) => expr_json(e),
+                    None => Value::Null,
+                })
+                .collect::<Vec<_>>()),
+        );
+    }
+    o.insert(
+        "body".to_string(),
+        json!(s.body.iter().map(stmt_json).collect::<Vec<_>>()),
+    );
+    serde_json::Value::Object(o)
 }
 
 // ── Statements ───────────────────────────────────────────────────────

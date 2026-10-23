@@ -701,6 +701,7 @@ mod tests {
         sub_prog.subs = vec![crate::ir::IrSub {
             name: "f".to_string(),
             params: vec![],
+            param_defaults: vec![],
             body: vec![echo_hi()],
         }];
         assert!(

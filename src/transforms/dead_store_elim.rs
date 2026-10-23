@@ -724,6 +724,19 @@ fn census_expr(
             }
         }
         IrExpr::Arith(a) => arith_census(a, reads, writes, escapes, escaping),
+        // A transform-declared (Ext) node's field expressions are ordinary
+        // reads/writes — the two walkers above already recurse into
+        // `ExtExpr::children`, but this census did NOT, so a read buried in
+        // an Ext node was invisible: affix-strip-fold's
+        // `AffixStrip{text: param("",x)}` judged `x` never-read, DSE
+        // dropped its only store, `analyze_var_types` then declared
+        // nothing and every renderer fell back to the environment
+        // variable (parse-heredoc-hash-in-brace printed empty).
+        IrExpr::Ext(n) => {
+            for c in crate::shir_nodes::ExtExpr::children(&**n) {
+                census_expr(c, reads, writes, escapes, escaping);
+            }
+        }
         IrExpr::Interpolate(parts) => {
             for p in parts {
                 if let crate::ir::InterpPart::Expr(x) = p {
@@ -1093,6 +1106,42 @@ mod tests {
         assert_eq!(dollar_names_in("${x}"), vec!["x".to_string()]);
         assert_eq!(dollar_names_in("pre$x-suf"), vec!["x".to_string()]);
         assert!(dollar_names_in("*.txt").is_empty());
+    }
+
+    /// Regression (affix-strip-fold): a var read ONLY inside a
+    /// transform-declared (Ext) node's field must keep its store. The
+    /// census had no `IrExpr::Ext` arm, so the read buried in
+    /// `AffixStrip{text: param("",x)}` was invisible: `x="hello"` was
+    /// judged dead and dropped, and every renderer fell back to the
+    /// environment variable (parse-heredoc-hash-in-brace printed empty).
+    #[test]
+    fn ext_node_read_keeps_store() {
+        use crate::shir_nodes::AffixStrip;
+        let ext = IrExpr::Ext(Box::new(AffixStrip {
+            text: IrExpr::Call {
+                func: "param".to_string(),
+                args: vec![str_(""), str_("x")],
+            },
+            pattern: str_("h"),
+            prefix: true,
+        }));
+        let mut prog = vec![
+            IrStmt::Assign {
+                targets: vec![AssignTarget {
+                    var: "x".to_string(),
+                    sigil: None,
+                    indices: vec![],
+                }],
+                expr: str_("hello"),
+                asm: None,
+            },
+            IrStmt::Expr(ext),
+        ];
+        assert!(
+            !transform(&mut prog),
+            "a store read through an Ext node's field must survive"
+        );
+        assert_eq!(prog.len(), 2, "the `x=hello` assignment must survive");
     }
 
     /// BASHC_FIX t03: a var read ONLY inside a pipeline stage must keep
