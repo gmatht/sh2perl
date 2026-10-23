@@ -2689,4 +2689,40 @@ mod tests {
             panic!("expected y assign");
         }
     }
+
+    /// `export NAME` makes a store observable to CHILD PROCESSES, which the
+    /// read census cannot see — the declaration must guard the name, in BOTH
+    /// A1 shapes (the legacy Exec string and the builtin Call).
+    /// Regression for `X=…; export X; perl -e 'print $ENV{X}'` losing the
+    /// store (045_shell_calling_perl.sh).
+    #[test]
+    fn decl_guard_sees_both_shapes() {
+        let call_shape = IrStmt::Expr(IrExpr::Call {
+            func: "builtin".to_string(),
+            args: vec![
+                IrExpr::Str("export".to_string(), StrStyle::DoubleQuoted),
+                IrExpr::Array(vec![
+                    IrExpr::Str("X".to_string(), StrStyle::DoubleQuoted),
+                    IrExpr::Str("Y=1".to_string(), StrStyle::DoubleQuoted),
+                    IrExpr::Str("-p".to_string(), StrStyle::DoubleQuoted),
+                ]),
+            ],
+        });
+        let mut guarded: HashSet<String> = HashSet::new();
+        collect_decl_guard(&call_shape, &mut guarded);
+        assert!(guarded.contains("X"), "A1 Call shape not guarded: {guarded:?}");
+        assert!(!guarded.contains("Y"), "an assignment operand is not a name: {guarded:?}");
+        assert!(!guarded.contains("-p"), "a flag is not a name: {guarded:?}");
+
+        let exec_shape = IrStmt::Exec {
+            cmd: IrExpr::Str("export".to_string(), StrStyle::DoubleQuoted),
+            args: vec![IrExpr::Str("export Z".to_string(), StrStyle::DoubleQuoted)],
+            capture: None,
+            redirects: vec![],
+            env: vec![],
+        };
+        let mut guarded: HashSet<String> = HashSet::new();
+        collect_decl_guard(&exec_shape, &mut guarded);
+        assert!(guarded.contains("Z"), "legacy Exec shape not guarded: {guarded:?}");
+    }
 }

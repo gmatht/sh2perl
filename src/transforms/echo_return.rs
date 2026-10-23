@@ -576,6 +576,64 @@ fn is_pipeline_with_last_call(st: &IrStmt, eligible: &HashSet<String>) -> bool {
     )
 }
 
+/// Pipeline-stage twin of [`echo_pipeline_last_stage`] for the shell
+/// path's encoding: `a | b` lowers to
+/// `pipeline([Arrow([exec(a)]), Arrow([exec(b)])])`, so the stage is an
+/// `Arrow` wrapping the bare call statement.
+fn echo_pipeline_last_expr(stage: &mut IrExpr, eligible: &HashSet<String>) -> bool {
+    match stage {
+        IrExpr::Arrow(body) => {
+            let replacement = match body.as_slice() {
+                [IrStmt::Expr(IrExpr::Call { func, args })]
+                    if eligible_fn_call(func, args, eligible) =>
+                {
+                    Some(IrStmt::Expr(IrExpr::Call {
+                        func: "exec".to_string(),
+                        args: echo_of_fn_value(args),
+                    }))
+                }
+                _ => None,
+            };
+            match replacement {
+                Some(st) => {
+                    body[0] = st;
+                    true
+                }
+                None => false,
+            }
+        }
+        _ => rewrite_expr_calls(stage, eligible),
+    }
+}
+
+/// A pipeline's LAST stage writes the pipeline's output through the
+/// current fd-1 sink, so a bare call there is NOT in value position. The
+/// callee has been rewritten to a value `return`, and the emitter lowers a
+/// bare call to a value-returning `fnCall` that writes nothing — so the
+/// stage must ECHO the value: rewrite it to
+/// `exec("echo", [fnValue("f", [args…])])`, exactly the shape pass 3 uses
+/// for every other call position. (`y=$(echo hi | f)` / `y=$(f | cat)`
+/// captured "" without this; bash captures the callee's echoed value.)
+fn echo_pipeline_last_stage(stage: &mut Vec<IrStmt>, eligible: &HashSet<String>) -> bool {
+    let is_last_call = matches!(
+        stage.as_slice(),
+        [IrStmt::Expr(IrExpr::Call { func, args })]
+            if eligible_fn_call(func, args, eligible)
+    );
+    if !is_last_call {
+        return false;
+    }
+    let IrStmt::Expr(IrExpr::Call { args, .. }) = &stage[0] else {
+        unreachable!("checked by is_last_call");
+    };
+    let echo_args = echo_of_fn_value(args);
+    stage[0] = IrStmt::Expr(IrExpr::Call {
+        func: "exec".to_string(),
+        args: echo_args,
+    });
+    true
+}
+
 /// Rewrite one statement: a value echo → Return(Some(word)); a bare
 /// return → dropped (unreachable after the echo-return); otherwise recurse
 /// into nested containers.
@@ -828,6 +886,7 @@ fn rewrite_call_stmt(st: &mut IrStmt, eligible: &HashSet<String>) -> bool {
             let last = stages.len().saturating_sub(1);
             for (i, stage) in stages.iter_mut().enumerate() {
                 if i == last {
+                    c |= echo_pipeline_last_stage(stage, eligible);
                     continue;
                 }
                 for s in stage.iter_mut() {
@@ -882,6 +941,16 @@ fn rewrite_call_stmt(st: &mut IrStmt, eligible: &HashSet<String>) -> bool {
         }
         IrStmt::Output { value, .. } => rewrite_expr_calls(value, eligible),
         IrStmt::Return(Some(v)) => rewrite_expr_calls(v, eligible),
+        // a `pipeline([...])` expression statement — the capture-assign
+        // path reaches its stages through the Capture/Arrow recursion, but
+        // a pipeline in statement position arrives here.
+        IrStmt::Expr(e) => {
+            if matches!(e, IrExpr::Call { func, .. } if func == "pipeline") {
+                rewrite_expr_calls(e, eligible)
+            } else {
+                false
+            }
+        }
         _ => false,
     }
 }
@@ -960,6 +1029,24 @@ fn rewrite_expr_calls(e: &mut IrExpr, eligible: &HashSet<String>) -> bool {
         return rewrite_expr_calls(expr, eligible);
     }
     match e {
+        // A shell pipeline lowered as `pipeline([Arrow(…), Arrow(…), …])`.
+        // The LAST stage writes the pipeline's output through the current
+        // fd-1 sink, so an eligible call there is not in value position —
+        // it must ECHO the fnValue result (see echo_pipeline_last_stage).
+        IrExpr::Call { func, args } if func == "pipeline" => {
+            let mut c = false;
+            if let Some(IrExpr::Array(stages)) = args.get_mut(0) {
+                let last = stages.len().saturating_sub(1);
+                for (i, stage) in stages.iter_mut().enumerate() {
+                    if i == last {
+                        c |= echo_pipeline_last_expr(stage, eligible);
+                    } else {
+                        c |= rewrite_expr_calls(stage, eligible);
+                    }
+                }
+            }
+            c
+        }
         IrExpr::Call { func, args } if matches!(func.as_str(), "exec" | "fnCall") => {
             if eligible_fn_call(func, args, eligible) {
                 *args = echo_of_fn_value(args);
@@ -1417,5 +1504,53 @@ mod tests {
         // two sequential echoes → 2 lines on a path → refuse
         let json = lower_raw("f() { echo 1; echo 2; }; f");
         assert!(!json.contains("\"fnValue\""), "multi-echo lifted: {json}");
+    }
+
+    /// A pipeline's LAST stage is the pipeline's output sink: an eligible
+    /// call there must ECHO its value, not become a silent value-returning
+    /// call. Regression for `y=$(echo hi | f)` / `y=$(f | cat)` capturing
+    /// "" where bash captures the callee's echoed value.
+    #[test]
+    fn pipeline_last_stage_echoes_the_value() {
+        let src = "f() { echo \"x\"; }; y=$(echo hi | f); z=$(f | cat)";
+        let commands = parse_commands_from_text(src).expect("parse source");
+        let mut prog = ast_to_ir_raw(&commands);
+        assert!(transform(&mut prog.stmts), "transform was a no-op");
+        // both captures must have their `f` stage rewritten to an echo of
+        // fnValue — the trailing-pipe case (the call is the LAST stage) and
+        // the leading-call case (a non-last stage).
+        let mut echoed_f = 0;
+        let mut bare_f = 0;
+        for st in &prog.stmts {
+            let IrStmt::Assign { expr, .. } = st else { continue };
+            let IrExpr::Capture { expr: cap, .. } = expr else { continue };
+            let IrExpr::Arrow(body) = cap.as_ref() else { continue };
+            let [IrStmt::Expr(IrExpr::Call { func, args })] = body.as_slice() else {
+                continue;
+            };
+            if func != "pipeline" {
+                continue;
+            }
+            let Some(IrExpr::Array(stages)) = args.first() else { continue };
+            for stage in stages {
+                let IrExpr::Arrow(lbody) = stage else { continue };
+                let [IrStmt::Expr(IrExpr::Call { func, args })] = lbody.as_slice() else {
+                    continue;
+                };
+                let calls_f = matches!(args.first(), Some(IrExpr::Str(n, _)) if n == "f");
+                if func == "exec" && calls_f {
+                    bare_f += 1;
+                }
+                let echoes_fnvalue = func == "exec"
+                    && matches!(args.first(), Some(IrExpr::Str(s, _)) if s == "echo")
+                    && matches!(args.get(1), Some(IrExpr::Array(items))
+                        if matches!(items.as_slice(), [IrExpr::Call { func, .. }] if func == "fnValue"));
+                if echoes_fnvalue {
+                    echoed_f += 1;
+                }
+            }
+        }
+        assert_eq!(bare_f, 0, "a pipeline stage still calls f without echoing");
+        assert_eq!(echoed_f, 2, "expected both f stages to echo fnValue");
     }
 }
