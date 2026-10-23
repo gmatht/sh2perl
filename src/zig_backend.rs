@@ -175,6 +175,9 @@ pub struct Render {
     /// variables a function assigns (bash: global unless `local`). Emitted
     /// at MODULE scope so the fn body and main share one cell.
     fn_globals: BTreeSet<String>,
+    /// fn-assigned names whose module cell has been declared (persists after
+    /// the decl is drained into the output, so main can still address them)
+    declared_fn_globals: BTreeSet<String>,
     /// module-scope declarations for fn_globals: (shell name, zig decl),
     /// emitted at file scope before the function that assigns them
     fn_global_decls: Vec<(String, String)>,
@@ -620,6 +623,11 @@ impl Render {
 
     /// The module-scope identifier of a fn-assigned variable (`g_<name>`).
     fn fn_global_ident(&mut self, name: &str) -> String {
+        // idempotent: callers may ask for the same name repeatedly, and
+        // re-mangling a cached id would produce g_g_<name>
+        if let Some(m) = self.mangle.get(name) {
+            if m.starts_with("g_") { return m.clone(); }
+        }
         let m = format!("g_{}", self.zig_ident(name));
         self.mangle.insert(name.to_string(), m.clone());
         m
@@ -4970,6 +4978,22 @@ fn capture_raw(&mut self, args: &[IrExpr]) -> Option<String> {
         acc
     }
 
+    /// Names assigned INSIDE any user function (bash: global unless `local`).
+    /// Collected up front because main renders BEFORE the functions and must
+    /// address the same module cell.
+    fn precollect_fn_globals(&mut self, stmts: &[IrStmt]) {
+        for st in stmts {
+            if let IrStmt::Function { body, .. } = st {
+                for v in function_locals(body) {
+                    self.declared_fn_globals.insert(v.clone());
+                    let _ = self.fn_global_ident(&v);
+                }
+                let kids: Vec<IrStmt> = body.clone();
+                self.precollect_fn_globals(&kids);
+            }
+        }
+    }
+
     fn stmt(&mut self, s: &IrStmt) {
         // `$?` regime: every simple command updates the status. Helpers
         // that record a real code (shRun/shRunStmt/shUuRun, `false`,
@@ -5358,7 +5382,11 @@ fn capture_raw(&mut self, args: &[IrExpr]) -> Option<String> {
                         if let (Some(IrExpr::Str(name, _)), Some(value)) =
                             (args.first(), args.get(1))
                         {
-                            let v = self.zig_ident(name);
+                            // a fn-assigned name has a MODULE cell: main must
+                            // write that one, not a local of the same name
+                            let v = if self.declared_fn_globals.contains(name) || self.fn_globals.contains(name) {
+                                self.fn_global_ident(name)
+                            } else { self.zig_ident(name) };
                             self.mark_written(name);
                             let rhs = if self.is_num(name) {
                                 self.expr_num(value)
@@ -5523,7 +5551,12 @@ fn capture_raw(&mut self, args: &[IrExpr]) -> Option<String> {
                     self.mark_todo("multi-target assign");
                     return;
                 };
-                let m = self.zig_ident(&t.var);
+                // a fn-assigned name lives in its module-scope cell: main
+                // must write the SAME cell (see fn_globals)
+                // the GLOBAL set is only complete once the FUNCTIONS have
+                // rendered, so consult the declared cells too
+                let is_fn_global = self.fn_globals.contains(&t.var) || self.declared_fn_globals.contains(&t.var);
+                let m = if is_fn_global { self.fn_global_ident(&t.var) } else { self.zig_ident(&t.var) };
                 self.mark_written(&t.var);
                 // the core may deliver an INDEXED target as the literal
                 // name `arr[1]` (indices: []) — parse it out
@@ -6505,6 +6538,7 @@ fn capture_raw(&mut self, args: &[IrExpr]) -> Option<String> {
                         // and SPLICED between the earlier lines — collect the
                         // declaration separately so it lands at FILE scope,
                         // before this function
+                        self.declared_fn_globals.insert(v.clone());
                         if !self.fn_global_decls.iter().any(|(n, _)| *n == *v) {
                             self.fn_global_decls.push((v.clone(), format!("var {m}: {ty};")));
                         }
@@ -6896,6 +6930,10 @@ fn capture_raw(&mut self, args: &[IrExpr]) -> Option<String> {
             self.need_bigint = true;
         }
 
+        // main renders BEFORE the functions, so the fn-assigned (global)
+        // names must be known now — see precollect_fn_globals
+        let all_stmts = prog.stmts.clone();
+        self.precollect_fn_globals(&all_stmts);
         // Pass 2: render the body first (helper flags known before
         // preamble). The hoisted declarations must precede the statements
         // lexically, so they are collected separately and spliced in.
@@ -7961,8 +7999,12 @@ self.emit("fn shTrimRightNl(t: []const u8) []const u8 {");
         // during body rendering add their names here
         let written_now: Vec<String> = self.written.iter().cloned().collect();
         for v in &written_now {
-            // fn-assigned vars have their own module-scope cell
-            if self.fn_globals.contains(v) {
+            // fn-assigned vars have their own module-scope cell — and MAIN
+            // must address it by the same g_ name (a main-local `var G`
+            // would leave the fn writing one cell and main reading another:
+            // t42_global_mut printed an empty line)
+            if self.fn_globals.contains(v) || self.declared_fn_globals.contains(v) {
+                let _ = self.fn_global_ident(v);
                 continue;
             }
             // user-function locals hoist with their fn — never in main
