@@ -10721,7 +10721,7 @@ fn rewrite_fn_calls(stmts: &[IrStmt], fns: &std::collections::HashSet<String>) -
     stmts
         .iter()
         .map(|s| match s {
-            IrStmt::Expr(IrExpr::Call { func, args }) if func == "exec" => {
+            IrStmt::Expr(e @ IrExpr::Call { func, args }) if func == "exec" => {
                 if let Some(name) = args.first().and_then(call_arg_str) {
                     if fns.contains(&name) {
                         return IrStmt::Expr(IrExpr::Call {
@@ -10730,7 +10730,15 @@ fn rewrite_fn_calls(stmts: &[IrStmt], fns: &std::collections::HashSet<String>) -
                         });
                     }
                 }
-                s.clone()
+                // A command that is NOT a program function still has
+                // ARGUMENTS that may contain one: `echo "$(fn 5)"` is an
+                // `exec("echo", …)` whose word holds a capture of `fn`.
+                // Cloning the statement verbatim left that nested call
+                // unmarked, so the capture rebuilt it as shell text and the
+                // child ran the HOST command of the same name — go-sh
+                // t83_type_args executed /usr/bin/id and printed
+                // `uid=5(games) …` instead of the program's own id().
+                IrStmt::Expr(rewrite_fn_calls_in_expr(e, fns))
             }
             // Any OTHER expression statement — most importantly an
             // `&&`/`||` CHAIN whose operand is a program function
@@ -10803,6 +10811,96 @@ fn rewrite_fn_calls(stmts: &[IrStmt], fns: &std::collections::HashSet<String>) -
                     .collect(),
             },
             IrStmt::Subshell(body) => IrStmt::Subshell(rewrite_fn_calls(body, fns)),
+            // The remaining statements that CARRY an expression. `echo "$(fn)"`
+            // reaches here as `Output` (the echo lowering runs before this
+            // rewrite), so a capture of a program function inside an Output
+            // was never marked `$fn_call` and rebuilt as shell text —
+            // go-sh t83_type_args ran `/usr/bin/id 5` (the host command that
+            // shadows the program's own `id`). Same class for a capture
+            // assignment, a declared initialiser, a return value, an Exec's
+            // argv and a redirect target list.
+            IrStmt::Output {
+                value,
+                newline,
+                target,
+            } => IrStmt::Output {
+                value: rewrite_fn_calls_in_expr(value, fns),
+                newline: *newline,
+                target: target.clone(),
+            },
+            IrStmt::WriteFile {
+                path,
+                content,
+                append,
+            } => IrStmt::WriteFile {
+                path: rewrite_fn_calls_in_expr(path, fns),
+                content: rewrite_fn_calls_in_expr(content, fns),
+                append: *append,
+            },
+            IrStmt::Assign { targets, expr, asm } => IrStmt::Assign {
+                targets: targets.clone(),
+                expr: rewrite_fn_calls_in_expr(expr, fns),
+                asm: asm.clone(),
+            },
+            IrStmt::Declare {
+                vars,
+                init,
+                local,
+            } => IrStmt::Declare {
+                vars: vars.clone(),
+                init: init
+                    .as_ref()
+                    .map(|i| rewrite_fn_calls_in_expr(i, fns)),
+                local: *local,
+            },
+            IrStmt::DeclareArray {
+                var,
+                sigil,
+                elements,
+            } => IrStmt::DeclareArray {
+                var: var.clone(),
+                sigil: *sigil,
+                elements: elements
+                    .iter()
+                    .map(|e| rewrite_fn_calls_in_expr(e, fns))
+                    .collect(),
+            },
+            IrStmt::Die { expr, carp } => IrStmt::Die {
+                expr: rewrite_fn_calls_in_expr(expr, fns),
+                carp: *carp,
+            },
+            IrStmt::Warn { expr, carp } => IrStmt::Warn {
+                expr: rewrite_fn_calls_in_expr(expr, fns),
+                carp: *carp,
+            },
+            IrStmt::Exec {
+                cmd,
+                args,
+                capture,
+                redirects,
+                env,
+            } => IrStmt::Exec {
+                cmd: rewrite_fn_calls_in_expr(cmd, fns),
+                args: args.iter().map(|a| rewrite_fn_calls_in_expr(a, fns)).collect(),
+                capture: capture.clone(),
+                redirects: redirects
+                    .iter()
+                    .map(|r| rewrite_fn_calls_in_expr(r, fns))
+                    .collect(),
+                env: env
+                    .iter()
+                    .map(|(k, v)| (k.clone(), rewrite_fn_calls_in_expr(v, fns)))
+                    .collect(),
+            },
+            IrStmt::Return(v) => IrStmt::Return(
+                v.as_ref().map(|e| rewrite_fn_calls_in_expr(e, fns)),
+            ),
+            IrStmt::Exit(v) => IrStmt::Exit(
+                v.as_ref().map(|e| rewrite_fn_calls_in_expr(e, fns)),
+            ),
+            IrStmt::SetChildError(e) => IrStmt::SetChildError(
+                rewrite_fn_calls_in_expr(e, fns),
+            ),
             IrStmt::Redirect { inner, redirects } => IrStmt::Redirect {
                 // A redirect-wrapped call to a PROGRAM-DEFINED function
                 // (`capture LBL tty < "$f"`) is still a Perl sub call — the
@@ -12876,10 +12974,24 @@ pub(crate) fn ir_expr_to_perl(expr: &IrExpr) -> String {
                         .get(2)
                         .map(ir_expr_to_perl)
                         .unwrap_or_else(|| "''".to_string());
+                    // A CAPTURE operand: bash strips ALL trailing newlines
+                    // from `$(…)` BEFORE the word splitting this op encodes
+                    // (the Perl-side capture shapes keep them), and the
+                    // frontend hands the value straight here — without the
+                    // strip `echo "$(fn)"` printed the value's newline plus
+                    // print's (go-sh t83 printed "5" then a blank line).
+                    // Only a capture operand chomps: a plain
+                    // `Go strings.ReplaceAll` keeps every byte.
+                    let chomp = matches!(
+                        args.first(),
+                        Some(IrExpr::Call { func, .. })
+                            if func == "capture" || func == "captureWords"
+                    );
                     format!(
-                        "(do {{ my $__rs = {s}; my $__ro = {old}; \
+                        "(do {{ my $__rs = {s};{} my $__ro = {old}; \
                          length($__ro) ? join({new}, split(/\\Q$__ro\\E/, $__rs, -1)) \
-                         : join({new}, split(//, $__rs)) }})"
+                         : join({new}, split(//, $__rs)) }})",
+                        if chomp { " $__rs =~ s/\\n+\\z//;" } else { "" }
                     )
                 }
                 // (( arith )) as a condition — the `let` builtin form.
