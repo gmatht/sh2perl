@@ -3444,10 +3444,32 @@ impl JavaRender {
     fn cond_bool(&mut self, cond: &IrExpr) -> Result<String, String> {
         match cond {
             IrExpr::Call { func, args, .. } if func == "test" => {
-                // A compound test (grouping parens, -a/-o chains, a
-                // regex/glob word list the tokenizer cannot classify) is
-                // CHEAPEST as its literal bash text: run `[ … ]`/`[[ … ]]`
-                // as a command and test the status.
+                // IN-PROCESS FIRST. bracket_text is cheap but it ships every
+                // operand to a child shell, and the child cannot see the java
+                // side (`"${V-}"` arrives already quoted, so the child
+                // compared literal text and the branch was always taken —
+                // param-expand-default-operator). The token renderer answers
+                // set-ness tests, fnmatch and regex natively; only what it
+                // cannot classify falls back to the child text.
+                let mut tw: Vec<TestTok> = Vec::new();
+                for a in args {
+                    match a {
+                        IrExpr::Str(s0, _) => self.push_test_str(&mut tw, s0),
+                        other => tw.push(TestTok::E(self.bash_word(other)?, false)),
+                    }
+                }
+                if let Ok(b) = self.test_tokens(&tw) {
+                    // A PATTERN/GLOB RHS (`[[ $x = @(foo|bar) ]]`) needs
+                    // fnmatch, not string equality — the bracket text does
+                    // that, so only a test with NO pattern operand is
+                    // answered in-process here (at-in-test compared the
+                    // literal `@(foo|bar)` and printed nothing).
+                    let has_pattern = !Self::current_is_extglob_pattern_free(&tw);
+                    if !has_pattern && !b.trim().is_empty() && b != "true" {
+                        self.helper("testrc");
+                        return Ok(format!("shTestRc({b})"));
+                    }
+                }
                 if let Ok(t) = self.bracket_text(args, false) {
                     let simple = t.contains("shFnmatch(") || t.contains("shRegexMatch(");
                     if !simple {
@@ -3688,12 +3710,37 @@ impl JavaRender {
             // a `~`-marked token is the REGEX operand of `=~`: it goes in
             // RAW — quoting makes bash compare against a literal string
             TestTok::S(x) if x.starts_with('~') && x.len() > 1 => jstr(&x[1..]),
+            // `${V-}` / `${V:-}` as a whole word in a test: a SET-ness test
+            // (`[ "${ZSH_VERSION-}" ]` asks "is it set and non-empty"). A
+            // child `[[ "${V-}" ]]` with an UNSET V still yields one empty
+            // argument — but the rendered form arrives with the token quoted
+            // (`"${V-}"`), so bash compared against the literal text and the
+            // branch was ALWAYS taken (param-expand-default-operator printed
+            // "zsh"). Decide it in-process from the set ledger instead.
+            TestTok::S(x) if Self::param_default_word(x).is_some() => {
+                let n = Self::param_default_word(x).unwrap();
+                let _ = format!("PDhit {x:?}->{n}");
+                // (in-process set-ness test: see param_default_word)
+                std::io::Write::write_all(&mut std::io::stderr(), format!("PDhit {x:?}->{n}\n").as_bytes()).ok();
+                self.helper("envset");
+                let v = self.getvar_str(&n).unwrap_or_else(|_| "\"\"".to_string());
+                format!("((!{v}.isEmpty()) ? \"1\" : \"\")")
+            }
             TestTok::S(x) if x.contains('$') => {
+                let _ = format!("DOLLAR {x:?}");
+                std::io::Write::write_all(&mut std::io::stderr(), format!("DOLhit {x:?}\n").as_bytes()).ok();
                 // A word the CHILD must expand (`"${ZSH_VERSION-}"`,
                 // `${#array[@]}>5`): bash needs it DOUBLE-QUOTED so it stays
                 // ONE word (an unquoted `$x>5` is a redirect!). The quoting
                 // is SHELL text, so the Java operand handed to shQuote is a
                 // STRING LITERAL whose content is `"…"`.
+                //
+                // STRIP FIRST: the frontend keeps the source quotes, so the
+                // token is already `"${V-}"` — adding another pair produced
+                // `""${V-}""`, which bash reads as the literal text
+                // `"${ZSH_VERSION-}"` and the test is then ALWAYS true
+                // (param-expand-default-operator printed zsh). Exactly one
+                // wrapping pair, always.
                 //
                 // It must be built with jstr, NOT by pasting `\"` directly:
                 // the previous form (`format!("shQuote({QD_ESC}{esc}{QD_ESC})")`)
@@ -3703,7 +3750,9 @@ impl JavaRender {
                 // literal` — a RENDERER bug that read like a corpus gap.
                 // jstr also escapes the token's own backslashes (no
                 // pre-escaping here: that would double them AGAIN).
-                format!("shQuote({})", jstr(&format!("\"{x}\""))) 
+                // exactly ONE wrapping pair, always (see above)
+                let bare = strip_quotes_once(x);
+                format!("shQuote({})", jstr(&format!("\"{}\"", bare)))
             }
             TestTok::S(x) => jstr(x),
             // RESTORED (2026-10-22): an uncommitted WIP in this worktree
@@ -3870,6 +3919,32 @@ impl JavaRender {
             i += 1;
         }
         None
+    }
+
+    /// `${NAME-}` / `${NAME:-}` / `${NAME-pattern}` as a WHOLE test word
+    /// (after quote stripping): returns NAME. Only the no-colon and colon
+    /// forms with a literal default are recognised.
+        /// No token looks like a GLOB/EXTGLOB pattern (so plain equality is
+    /// the right comparison).
+    fn current_is_extglob_pattern_free(toks: &[TestTok]) -> bool {
+        !toks.iter().any(|t| match t {
+            TestTok::S(x) => x.contains('*') || x.contains('?') || x.contains('[')
+                || (x.contains('@') && x.contains('(')) || (x.contains('!') && x.contains('(')),
+            _ => false,
+        })
+    }
+
+fn param_default_word(x: &str) -> Option<String> {
+        let _ = x;
+        let t = x.trim();
+        let t = t.strip_prefix('"').and_then(|r| r.strip_suffix('"')).unwrap_or(t);
+        let inner = t.strip_prefix("${")?.strip_suffix('}')?;
+        let (name, _rest) = inner.split_once('-')?;
+        let name = name.trim_end_matches(':');
+        if name.is_empty() || !name.chars().all(|c| c.is_ascii_alphanumeric() || c == '_') {
+            return None;
+        }
+        Some(name.to_string())
     }
 
     /// `operand=~regex` fused into ONE word (the frontend's `[[ $s =~ re ]]`
@@ -4248,7 +4323,20 @@ impl JavaRender {
             if let TestTok::S(op) = &w[0] {
                 let o = tok_str(&w[1]);
                 return match op.as_str() {
-                    "-n" => Ok(format!("(({}).isEmpty() == false)", o)),
+                    // `[ "${V-}" ]`: a SET-ness test on a word with a
+                    // parameter default. The operand text still carries the
+                    // SOURCE quotes, so a plain isEmpty() on it compared the
+                    // literal characters (`""${V-}""` is never empty) — the
+                    // branch was always taken (param-expand-default-operator).
+                    "-n" => {
+                        let wtext = match &w[1] { TestTok::S(t) => t.clone(), TestTok::E(..) => String::new() };
+                        if let Some(n) = Self::param_default_word(&wtext) {
+                            self.helper("envset");
+                            let v = self.getvar_str(&n).unwrap_or_else(|_| "\"\"".to_string());
+                            return Ok(format!("(!{v}.isEmpty())"));
+                        }
+                        Ok(format!("(({}).isEmpty() == false)", o))
+                    }
                     "-z" => Ok(format!("(({}).isEmpty())", o)),
                     "-f" | "-d" | "-e" | "-s" | "-r" | "-w" | "-x" | "-L" | "-h" | "-p" | "-b" | "-c" | "-S"
                     | "-g" | "-k" | "-u" | "-O" | "-G" | "-N" => {
