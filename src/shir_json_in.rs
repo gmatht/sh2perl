@@ -1575,6 +1575,64 @@ mod tests {
         assert!(err.contains("not a string"), "unexpected error: {err}");
     }
 
+    /// Dynamic subscripts (core request c-dynamic-subscripts-20260806-b):
+    /// the subscript/offset arguments of `arrayIndex` and `param("slice",
+    /// …)` are ordinary EXPRESSIONS, not Str-only. A frontend that emits a
+    /// variable key (`arr[k]`, `p+n`) must survive ingress with the key
+    /// intact — the renderer either evaluates it natively or resolves the
+    /// baked-name text. Asserts the STRUCTURE the C frontend relies on, at
+    /// both the shell-lowered text form and the expression form.
+    #[test]
+    fn dynamic_subscript_and_slice_offsets_are_expressions() {
+        // The shell lowering's canonical shapes: the array key arrives as
+        // baked-name TEXT (`arr[$i]`) and the slice offset as the variable
+        // text `$k`. They must round-trip byte-identically.
+        let json1 = {
+            let src = r#"arr=(10 20 30); i=1; echo "${arr[$i]}"; s=abcd; k=1; echo "${s:$k:1}""#;
+            let cmds = crate::parser::commands::Parser::new(src).parse().unwrap();
+            shir_to_shir_json(&crate::shir::ast_to_ir(&cmds))
+        };
+        assert!(
+            json1.contains("arr[$i]"),
+            "the dynamic array key must survive as text: {json1}"
+        );
+        assert!(
+            json1.contains("$k"),
+            "the dynamic slice offset must survive as text: {json1}"
+        );
+        let prog2 = shir_json_to_ir(&json1).expect("dynamic subscripts ingress");
+        assert_eq!(json1, shir_to_shir_json(&prog2), "dynamic subscripts must round-trip");
+
+        // The EXPRESSION form a frontend emits: a non-Str key/offset is
+        // accepted and kept as an expression (never silently blanked).
+        let src = r#"{"type":"Program","contract_version":1,"imports":[],"requires":[],"stmt_lines":[],"subs":[],"stmts":[
+            {"type":"Expr","expr":{"type":"Call","func":"arrayIndex","args":[
+                {"type":"Str","value":"arr","style":"DoubleQuoted"},
+                {"type":"Var","name":"i","sigil":null}]}},
+            {"type":"Expr","expr":{"type":"Call","func":"param","args":[
+                {"type":"Str","value":"slice","style":"DoubleQuoted"},
+                {"type":"Str","value":"s","style":"DoubleQuoted"},
+                {"type":"Var","name":"k","sigil":null},
+                {"type":"Str","value":"1","style":"DoubleQuoted"}]}}]}"#;
+        let prog = shir_json_to_ir(src).expect("expression-form subscripts ingress");
+        let crate::ir::IrStmt::Expr(crate::ir::IrExpr::Call { args, .. }) = &prog.stmts[0] else {
+            panic!("expected the arrayIndex call, got {:?}", prog.stmts[0]);
+        };
+        assert!(
+            matches!(&args[1], crate::ir::IrExpr::Var(n, _) if n == "i"),
+            "the arrayIndex key must stay an expression, got {:?}",
+            args[1]
+        );
+        let crate::ir::IrStmt::Expr(crate::ir::IrExpr::Call { args, .. }) = &prog.stmts[1] else {
+            panic!("expected the slice param call, got {:?}", prog.stmts[1]);
+        };
+        assert!(
+            matches!(&args[2], crate::ir::IrExpr::Var(n, _) if n == "k"),
+            "the slice offset must stay an expression, got {:?}",
+            args[2]
+        );
+    }
+
     /// IrType::Float(32/64) round-trips through the A1 JSON: serialized
     /// as {"kind":"Float","width":N} and re-ingested (core request
     /// c-sh-go-20260807-114757 — the C frontend's float/double type layer).

@@ -529,6 +529,9 @@ fn parse_word_inner(lexer: &mut Lexer) -> Result<Word, ParserError> {
             | Some(Token::While) | Some(Token::Until) | Some(Token::For)
             | Some(Token::Case) | Some(Token::Esac) | Some(Token::In)
             | Some(Token::Select) | Some(Token::Function) | Some(Token::Source)
+            // Word-INITIAL `true`/`false` may still continue (`false.sh`), so
+            // route them through the combine loop rather than ending the word.
+            | Some(Token::True) | Some(Token::False)
     ) {
         let mut combined = String::new();
         loop {
@@ -599,6 +602,10 @@ fn parse_word_inner(lexer: &mut Lexer) -> Result<Word, ParserError> {
                 | Some(Token::While) | Some(Token::Until) | Some(Token::For)
                 | Some(Token::Case) | Some(Token::Esac) | Some(Token::In)
                 | Some(Token::Select) | Some(Token::Function) | Some(Token::Source)
+                // `true`/`false` are reserved only as WHOLE words in bash; when
+                // the lexer's keyword token arrives mid-word (`/bin/false`,
+                // `a=true`) it is ordinary text and must continue the word.
+                | Some(Token::True) | Some(Token::False)
                 => {
                     // For $, check if the NEXT token is a variable name
                     // (Identifier or Number). If so, break out so that
@@ -1363,6 +1370,9 @@ fn parse_word_no_newline_skip_inner(lexer: &mut Lexer) -> Result<Word, ParserErr
             | Some(Token::While) | Some(Token::Until) | Some(Token::For)
             | Some(Token::Case) | Some(Token::Esac) | Some(Token::In)
             | Some(Token::Select) | Some(Token::Function) | Some(Token::Source)
+            // Word-INITIAL `true`/`false` may still continue (`false.sh`), so
+            // route them through the combine loop rather than ending the word.
+            | Some(Token::True) | Some(Token::False)
     ) {
         let mut combined = String::new();
         loop {
@@ -1440,6 +1450,10 @@ fn parse_word_no_newline_skip_inner(lexer: &mut Lexer) -> Result<Word, ParserErr
                 | Some(Token::While) | Some(Token::Until) | Some(Token::For)
                 | Some(Token::Case) | Some(Token::Esac) | Some(Token::In)
                 | Some(Token::Select) | Some(Token::Function) | Some(Token::Source)
+                // `true`/`false` are reserved only as WHOLE words in bash; when
+                // the lexer's keyword token arrives mid-word (`/bin/false`,
+                // `a=true`) it is ordinary text and must continue the word.
+                | Some(Token::True) | Some(Token::False)
                 => {
                     // For $, check if the NEXT token is a variable name
                     // (Identifier or Number). If so, break out so that
