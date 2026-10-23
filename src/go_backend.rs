@@ -266,6 +266,18 @@ fn is_shell_builtin(cmd: &str) -> bool {
     matches!(
         cmd,
         "echo" | "printf" | "exit" | "cd" | "let" | "local" | "read" | "test"
+            // Builtins with NO external executable at all: exec'ing the name
+            // spawns nothing (status 127, no work done), so the exec path
+            // must refuse and let the `bash -c` reconstruction run the real
+            // builtin. Measured on 070_gnuisms_thorough / heredoc-subshell-
+            // redirects, both of which exec'd `eval` and silently did
+            // nothing.
+            | "eval" | "source" | "." | "export" | "unset" | "declare" | "typeset"
+            | "readonly" | "alias" | "unalias" | "set" | "shift" | "shopt" | "trap"
+            | "wait" | "jobs" | "bg" | "fg" | "type" | "hash" | "umask" | "ulimit"
+            | "pushd" | "popd" | "dirs" | "getopts" | "mapfile" | "readarray"
+            | "disown" | "caller" | "enable" | "help"
+            | "history" | "times" | "suspend" | "logout"
     )
 }
 
@@ -1000,6 +1012,18 @@ impl Render {
             // arithmetic is int64 throughout, so its decimal form is
             // strconv's, not the `any`-boxing helper's
             IrExpr::Arith(a) => format!("strconv.FormatInt({}, 10)", self.arith(a)),
+            // Same value in the frontend's `arith` CALL spelling (`x=$(( … ))`
+            // arrives as a call, `x=…` inside an arithmetic context as the
+            // node above): the string form of an int64 is its decimal.
+            IrExpr::Call { func, args } if func == "arith" || func == "arithEval" => {
+                if let Some(IrExpr::Str(s, _)) = args.first() {
+                    if let Some((_, v)) = self.arith_str(s) {
+                        return format!("strconv.FormatInt({v}, 10)");
+                    }
+                }
+                let v = self.call(func, args);
+                format!("strconv.FormatInt({v}, 10)")
+            }
             IrExpr::Bool(b) => {
                 if *b {
                     "\"1\"".into()
@@ -3199,7 +3223,7 @@ impl Render {
                         Some(other) => self.expr_str(other),
                         None => return self.sh2_stub("arrayIndex"),
                     };
-                    return format!("s2s(assocIdx({m}, {key}))");
+                    return format!("assocIdx({m}, {key})");
                 }
                 self.mark_arr(&name);
                 let key = match args.get(1) {
@@ -3214,7 +3238,7 @@ impl Render {
                     Some(other) => self.expr_num(other),
                     None => return self.sh2_stub("arrayIndex"),
                 };
-                format!("s2s(arrIdx({m}, {key}))")
+                format!("arrIdx({m}, {key})")
             }
             "arrayItems" => {
                 let name = match args.first() {
@@ -4180,10 +4204,12 @@ impl Render {
         let target = target?;
         if let IrExpr::Str(s, _) = target {
             if let Some(rest) = s.strip_prefix('&') {
-                // `2>&1` and nothing else: any other fd-dup names a
-                // descriptor Go's exec.Cmd does not carry.
-                return match (fd, rest) {
-                    (Some(2), "1") => Some(NativeRedir::DupStdoutToStderr),
+                // `2>&1` / `1>&2` are the two fd-dups that name a descriptor
+                // exec.Cmd DOES carry (Stdout/Stderr are both `io.Writer`);
+                // any other fd names one it has no field for, so it refuses.
+                return match (fd.unwrap_or(1), rest) {
+                    (2, "1") => Some(NativeRedir::DupStdoutToStderr),
+                    (1, "2") => Some(NativeRedir::DupStderrToStdout),
                     _ => None,
                 };
             }
@@ -4280,19 +4306,13 @@ impl Render {
         redirs: &[IrExpr],
     ) -> Option<Vec<String>> {
         let mut plan: Vec<NativeRedir> = Vec::with_capacity(redirs.len());
-        // `2>&1` is only faithful once stdout is attached to something
-        // concrete — before that bash duplicates the inherited descriptor
-        // (os.Stdout), which a `c.Stderr = c.Stdout` with a nil Stdout
-        // cannot express.
-        let mut stdout_attached = false;
+        // `2>&1` BEFORE any stdout target is not a refusal: bash then
+        // duplicates the INHERITED fd 1, which the emitter spells
+        // `c.Stderr = os.Stdout` (see emit_native_redirect_lines). Only the
+        // attachment ORDER decides which of the two forms is faithful, and
+        // the emitter walks the plan in that order.
         for r in redirs {
-            let nr = self.native_redirect(r)?;
-            match &nr {
-                NativeRedir::File { fd: 1, .. } => stdout_attached = true,
-                NativeRedir::DupStdoutToStderr if !stdout_attached => return None,
-                _ => {}
-            }
-            plan.push(nr);
+            plan.push(self.native_redirect(r)?);
         }
         Some(self.emit_native_redirect_lines(cmd, argv, &plan))
     }
@@ -4305,15 +4325,9 @@ impl Render {
         redirs: &[crate::ir::IrRedirect],
     ) -> Option<Vec<String>> {
         let mut plan: Vec<NativeRedir> = Vec::with_capacity(redirs.len());
-        let mut stdout_attached = false;
+        // Same order rule as the expr-typed twin: no attachment precondition.
         for r in redirs {
-            let nr = self.native_redirect_spec(r)?;
-            match &nr {
-                NativeRedir::File { fd: 1, .. } => stdout_attached = true,
-                NativeRedir::DupStdoutToStderr if !stdout_attached => return None,
-                _ => {}
-            }
-            plan.push(nr);
+            plan.push(self.native_redirect_spec(r)?);
         }
         Some(self.emit_native_redirect_lines(cmd, argv, &plan))
     }
@@ -4327,31 +4341,59 @@ impl Render {
         let id = self.new_tmp();
         let cvar = format!("__rd{id}");
         let okvar = format!("__rdok{id}");
+        // `cmd` arrives as the Go string LITERAL the argv builder produced
+        // (`"command"`), so the name comparisons below read the unquoted
+        // form — comparing the literal against a bare name never matched.
+        let name = cmd.strip_prefix('"').and_then(|s| s.strip_suffix('"')).unwrap_or(cmd);
         // `command < a > b` (no operand): bash's `command` is a no-op that
         // SUCCEEDS, so there is no process to spawn — only the redirects
         // happen (each one still opens left to right, and an unopenable
         // input leaves the status at 1 with the output never created).
         // Exec'ing a `command` binary would invent a failure bash does not
         // have.
-        let noop = cmd == "command" && argv.is_empty();
+        let noop = name == "command" && argv.is_empty();
+        // `command -v NAME >/dev/null`: a PATH LOOKUP, not a process. The
+        // same reasoning as `noop` — there is no `command` binary to spawn
+        // — and the status is bash's: 0 when the name resolves, 1 when it
+        // does not (measured on double-bracket-and-chain.sh, where the
+        // lookup ran as 127 and silently skipped the branch). Only the
+        // OUTPUT-DISCARDED shape is admitted: with a real target bash writes
+        // the resolved path there, which a lookup that spawns nothing
+        // cannot reproduce (REFUSE > GUESS).
+        let lookup = if name == "command"
+            && argv.len() == 2
+            && argv[0] == Self::go_str("-v")
+            && plan.iter().all(|r| {
+                matches!(r, NativeRedir::File { path, .. } if path == "\"/dev/null\"")
+            })
+        {
+            Some(argv[1].clone())
+        } else {
+            None
+        };
         // `cat <<EOF … EOF` / `cat <<< s`: with no FILE operand cat copies
         // its stdin byte for byte, so the command IS the text — printing it
         // needs neither a child nor a descriptor. Only when the heredoc is
         // the ONE redirect: with an output target as well, the bytes belong
         // in that file and the general wiring below handles them.
-        if cmd == "cat" && argv.is_empty() && plan.len() == 1 {
+        if name == "cat" && argv.is_empty() && plan.len() == 1 {
             if let NativeRedir::StdinStr(t) = &plan[0] {
                 return vec![format!("fmt.Print({t});"), "st = 0;".to_string()];
             }
         }
-        if noop && plan.iter().any(|r| matches!(r, NativeRedir::DupStdoutToStderr)) {
+        // No process means no descriptors to attach: the redirects still
+        // happen for their side effects (a created/truncated file, an
+        // unopenable path failing the status), but there is nothing to weld
+        // them to.
+        let nocmd = noop || lookup.is_some();
+        if nocmd && plan.iter().any(|r| matches!(r, NativeRedir::DupStdoutToStderr)) {
             // `2>&1` needs a command's descriptors to duplicate.
             return vec!["st = 1;".to_string()];
         }
         // Spread-aware: a mid-list glob folds through `append` (see
         // `exec_cmd_call`) — a raw `join` would not compile.
         let call = Self::exec_cmd_call(cmd, argv);
-        let mut lines = if noop {
+        let mut lines = if nocmd {
             vec![format!("{okvar} := true;")]
         } else {
             vec![
@@ -4360,6 +4402,10 @@ impl Render {
             ]
         };
         let mut closes: Vec<String> = Vec::new();
+        // bash resolves each fd-dup against the descriptor table AS OF that
+        // redirect, so the emitter tracks whether fd 1 has a concrete target
+        // yet and spells `2>&1` accordingly.
+        let mut stdout_attached = false;
         for (i, nr) in plan.iter().enumerate() {
             match nr {
                 NativeRedir::File {
@@ -4368,6 +4414,9 @@ impl Render {
                     read,
                     append,
                 } => {
+                    if *fd == 1 {
+                        stdout_attached = true;
+                    }
                     let fv = format!("__rdf{id}_{i}");
                     let ev = format!("__rde{id}_{i}");
                     lines.push(if *read {
@@ -4388,7 +4437,7 @@ impl Render {
                     // A redirect that cannot be opened is a status-1 failure
                     // in bash and the command does NOT run — the run below is
                     // guarded, not merely best-effort.
-                    if noop {
+                    if nocmd {
                         lines.push(format!("if {ev} != nil {{ {okvar} = false }}"));
                     } else {
                         lines.push(format!(
@@ -4398,18 +4447,45 @@ impl Render {
                     closes.push(format!("if {ev} == nil {{ {fv}.Close() }}"));
                 }
                 NativeRedir::DupStdoutToStderr => {
-                    lines.push(format!("{cvar}.Stderr = {cvar}.Stdout;"));
+                    // `2>&1`: no stdout target yet means bash copies the
+                    // inherited fd 1, which is this process's os.Stdout (not
+                    // the still-nil c.Stdout).
+                    if stdout_attached {
+                        lines.push(format!("{cvar}.Stderr = {cvar}.Stdout;"));
+                    } else {
+                        lines.push(format!("{cvar}.Stderr = os.Stdout;"));
+                    }
+                }
+                NativeRedir::DupStderrToStdout => {
+                    // `1>&2`: every command this renderer spawns has its
+                    // stderr filtered (shStdErr), so land that default first
+                    // and then copy the descriptor — the Go twin of bash's
+                    // dup at this point in the list.
+                    if !nocmd {
+                        lines.push(format!("shStdErr({cvar});"));
+                        lines.push(format!("{cvar}.Stdout = {cvar}.Stderr;"));
+                        // fd 1 is now a concrete descriptor: a later `2>&1`
+                        // copies THAT, not the inherited stdout.
+                        stdout_attached = true;
+                    }
                 }
                 // `<<<`/`<<EOF`: stdin fed from a string — infallible, so
                 // no guard and no close.
                 NativeRedir::StdinStr(text) => {
-                    if !noop {
+                    if !nocmd {
                         lines.push(format!("{cvar}.Stdin = strings.NewReader({text});"));
                     }
                 }
             }
         }
-        if !noop {
+        if let Some(lbl) = lookup {
+            // The lookup only runs when every redirect opened (the `else 1`
+            // arm is the same unopenable-redirect failure as `runCmd`'s).
+            let name = format!("__cle{id}");
+            lines.push(format!(
+                "if {okvar} {{ if _, {name} := exec.LookPath({lbl}); {name} != nil {{ st = 1 }} else {{ st = 0 }} }} else {{ st = 1 }}"
+            ));
+        } else if !nocmd {
             lines.push(format!("shStdIn({cvar});"));
             lines.push(format!(
                 "if {okvar} {{ st = runCmd({cvar}) }} else {{ st = 1 }}"
@@ -4523,6 +4599,17 @@ impl Render {
                         swapped[2] = true;
                     }
                     lines.push("os.Stderr = os.Stdout;".to_string());
+                }
+                NativeRedir::DupStderrToStdout => {
+                    // `1>&2` on a user FUNCTION call: the body prints
+                    // through the process-wide os.Stdout, so swapping the
+                    // descriptor IS the duplicate (and the restore below
+                    // puts it back).
+                    if !swapped[1] {
+                        lines.push(format!("__rfoo{id} := os.Stdout;"));
+                        swapped[1] = true;
+                    }
+                    lines.push("os.Stdout = os.Stderr;".to_string());
                 }
                 NativeRedir::StdinStr(text) => {
                     if !swapped[0] {
@@ -4747,6 +4834,13 @@ impl Render {
                         } else {
                             combined.push(nr);
                         }
+                    }
+                    // `1>&2` on a chain stage: the welded stdio plan has no
+                    // slot for a stage that writes into fd 2, so the stage
+                    // keeps the reconstruction fallback (REFUSE > GUESS).
+                    NativeRedir::DupStderrToStdout => {
+                        fail(self);
+                        return None;
                     }
                 }
             }
@@ -6571,14 +6665,14 @@ impl Render {
                     return None;
                 }
                 let m = self.ident_of(base);
-                return Some(format!("s2s(assocIdx({m}, {}))", Self::go_str(key)));
+                return Some(format!("assocIdx({m}, {})", Self::go_str(key)));
             }
             if !key.chars().all(|c| c.is_ascii_digit()) {
                 return None;
             }
             let m = self.ident_of(base);
             let k: i64 = key.parse().ok()?;
-            return Some(format!("s2s(arrIdx({m}, {k}))"));
+            return Some(format!("arrIdx({m}, {k})"));
         }
         if !plain_ident {
             return None;
@@ -8897,6 +8991,23 @@ impl Render {
                         for sd in sides {
                             self.sides.push(sd);
                         }
+                        // `x=$(( … ))` stores the decimal TEXT of the Go
+                        // int64 `v`. Without recording that write shape the
+                        // untyped target stayed `any` (no write looked like a
+                        // string), so every READ paid `s2s(x)` — the same
+                        // boxing `int_text_expr` already records for a plain
+                        // arithmetic BinOp. With it the target hoists as
+                        // `string` and the read is the identifier.
+                        *self.writes_inttext.entry(t.var.clone()).or_insert(0) += 1;
+                        // A target hoisted as `string` (the promotion above,
+                        // or an A2 Str verdict) stores the int64's decimal
+                        // TEXT — assigning the int64 itself would not compile
+                        // and would not be bash's value either.
+                        let v = if self.is_str(&t.var) {
+                            format!("strconv.FormatInt({v}, 10)")
+                        } else {
+                            v
+                        };
                         self.flush_sides();
                         let sync = self.sync_inline(&t.var);
                         self.emit(&format!("{m} = {v};{sync}"));
@@ -9023,12 +9134,32 @@ impl Render {
             IrExpr::Int(_) | IrExpr::Arith(_) => true,
             IrExpr::Var(n, _) | IrExpr::Ident(n) => self.is_num(n),
             IrExpr::BinOp { op, .. } => !matches!(op, crate::ir::BinOpKind::Concat),
+            // `$(($1 + 0))` — the frontend's `arith` call renders as Go
+            // int64 arithmetic (`expr_any` of it is `s2i(…) + 0`), whose
+            // bash TEXT form is that int64's decimal.
+            IrExpr::Call { func, .. } if func == "arith" || func == "arithEval" => true,
             IrExpr::Call { func, args } if func == "getVar" => match args.first() {
                 Some(IrExpr::Str(n, _)) => matches!(n.as_str(), "?" | "#" | "$") || self.is_num(n),
                 _ => false,
             },
             _ => false,
         }
+    }
+
+    /// True when a `for` list is a provably TEXT list: every element is a
+    /// literal word that does not expand, or a brace expansion (which the
+    /// renderer turns into string literals). Those iterate values Go can
+    /// hold in a `string`.
+    fn static_text_list(iter: &IrExpr) -> bool {
+        let IrExpr::Array(items) = iter else {
+            return false;
+        };
+        !items.is_empty()
+            && items.iter().all(|it| match it {
+                IrExpr::Str(_, _) => !expr_glob(it),
+                IrExpr::Call { func, .. } => func == "brace",
+                _ => false,
+            })
     }
 
     /// Restore subshell-saved vars (the tmp names were the last N allocated).
@@ -11552,6 +11683,15 @@ impl Render {
     fn stmt_for(&mut self, var: &str, iter: &IrExpr, body: &[IrStmt]) {
         let m = self.go_ident(var);
         self.mark_written(var);
+        // `for v in a b c` binds TEXT on every iteration. When the list is
+        // provably literal words, that write is a Go string write, so an
+        // untyped `v` can hoist as `string` — the loop then ranges over
+        // `[]string` and each read is the identifier instead of an
+        // `s2s(v)` box. REFUSE > GUESS: a list with glob/parameter elements
+        // renders through a runtime slice and keeps the untyped home.
+        if !self.is_num(var) && !self.is_str(var) && Self::static_text_list(iter) {
+            *self.writes_str.entry(var.to_string()).or_insert(0) += 1;
+        }
         // Like `while`: an empty iteration leaves $? at 0 in bash.
         let runflag = format!("__run{}", self.new_tmp());
         self.emit(&format!("{runflag} := false;"));
@@ -13827,8 +13967,11 @@ enum NativeRedir {
     /// `<<< word` / `<<EOF … EOF` — stdin fed from a string. The Go
     /// expression evaluates the word exactly once, like the shell.
     StdinStr(String),
-    /// `2>&1` — stderr duplicated from the already-attached stdout.
+    /// `2>&1` — stderr duplicated from stdout (a target file when one is
+    /// already attached, else the inherited stdout).
     DupStdoutToStderr,
+    /// `1>&2` — stdout duplicated from stderr.
+    DupStderrToStdout,
 }
 
 /// One redirect spec's operator fragment — the mode→operator table is the
@@ -14902,14 +15045,20 @@ const RUNTIME_HELPERS: &[&str] = &[
     "    return a",
     "}",
     "",
-    "func arrIdx(a []any, i int64) any {",
-    "    if i >= 0 && int(i) < len(a) { return a[i] }",
-    "    return nil",
+    // An element READ is TOTAL and textual, exactly like bash: an index
+    // outside the array (or a key the map does not have) yields "" — not a
+    // nil the caller then has to coerce. The type is `string` rather than
+    // `any` for the same reason: every consumer of an element read is a
+    // shell word, so the old `s2s(arrIdx(…))` at each read was a second
+    // call doing what the read already had to do.
+    "func arrIdx(a []any, i int64) string {",
+    "    if i >= 0 && int(i) < len(a) { return s2s(a[i]) }",
+    "    return \"\"",
     "}",
     "",
-    "func assocIdx(m map[string]any, k string) any {",
-    "    if m == nil { return nil }",
-    "    return m[k]",
+    "func assocIdx(m map[string]any, k string) string {",
+    "    if m == nil { return \"\" }",
+    "    return s2s(m[k])",
     "}",
     "",
     "func appendStrings(m []any, ss []string) []any {",
