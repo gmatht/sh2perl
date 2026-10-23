@@ -1,0 +1,6 @@
+(* arith-identity: the fold rules, their guards, and the negative controls
+   that show each guard is load-bearing.  Build:  isabelle build -D . *)
+session ArithIdentity = HOL +
+  options [quick_and_dirty = false]
+  theories
+    ArithIdentity
