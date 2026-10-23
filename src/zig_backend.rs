@@ -169,6 +169,9 @@ pub struct Render {
     pending_fns: Vec<String>,
     /// vars local to a hoisted user function (never declared in main)
     fn_locals: BTreeSet<String>,
+    /// fn name -> main-scope values the function READS (passed as params):
+    /// (zig identifier, zig parameter type)
+    fn_externs: std::collections::BTreeMap<String, Vec<(String, String)>>,
     /// set-typed arrays (`factors = set(); factors.add(x)`) — lowered to
     /// a fixed i64 array + length counter (the C backend's model)
     set_arrays: BTreeSet<String>,
@@ -421,6 +424,10 @@ impl Render {
 
     /// Sanitize a shell var name to a valid Zig identifier and mangle
     /// reserved names (A6-consistent). De-duplicates collisions.
+    /// Names declared at main scope (the A2 verdicts + every write the
+    /// scanner saw). A hoisted FUNCTION that reads such a name refers to the
+    /// main local, which is not in its scope — the function needs its own
+    /// copy of the value (see the fn hoisting).
     fn zig_ident(&mut self, name: &str) -> String {
         if let Some(m) = self.mangle.get(name) {
             return m.clone();
@@ -2023,7 +2030,12 @@ fn capture_raw(&mut self, args: &[IrExpr]) -> Option<String> {
                     })
                     .unwrap_or_default();
                 let catch = if self.error_fns.contains(&orig) { " catch \"\"" } else { "" };
-                format!("{name}(init, &[_][]const u8{{ {} }}){catch}", call_args.join(", "))
+                // the fn's main-scope reads travel as trailing params
+                let mut extra = String::new();
+                if let Some(xs) = self.fn_externs.get(&orig).cloned() {
+                    for (em, _ty) in xs { extra.push_str(", "); extra.push_str(&em); }
+                }
+                format!("{name}(init, &[_][]const u8{{ {} }}{extra}){catch}", call_args.join(", "))
             }
             "capture" => {
                 if let Some(rendered) = self.capture_raw(args) {
@@ -4117,8 +4129,14 @@ fn capture_raw(&mut self, args: &[IrExpr]) -> Option<String> {
         } else {
             ""
         };
+        // ...plus the main-scope values the fn reads (see fn_externs): pass
+        // the LOCAL identifier by the same name.
+        let mut extra = String::new();
+        if let Some(xs) = self.fn_externs.get(name).cloned() {
+            for (em, _ty) in xs { extra.push_str(", "); extra.push_str(&em); }
+        }
         let call = format!(
-            "{m}(init, &[_][]const u8{{ {} }}){catch}",
+            "{m}(init, &[_][]const u8{{ {} }}{extra}){catch}",
             call_args.join(", ")
         );
         if let Some(newline) = self.value_fns.get(name).copied() {
@@ -4141,6 +4159,17 @@ fn capture_raw(&mut self, args: &[IrExpr]) -> Option<String> {
     /// arms); the connective branches on it. A side that is itself a
     /// chain recurses. Non-command sides (tests, captures) evaluate for
     /// effect and set sh_rc from their value.
+    /// A Str node that is really a TEST expression (`-n "$x"`, `$x -gt 3`):
+    /// the frontend sometimes passes the test words as one string instead of
+    /// a `test` Call.
+    fn looks_like_test(s: &str) -> bool {
+        let t = s.trim();
+        t.starts_with("-") || t.contains(" -eq ") || t.contains(" -ne ")
+            || t.contains(" -gt ") || t.contains(" -lt ") || t.contains(" -ge ")
+            || t.contains(" -le ") || t.contains(" = ") || t.contains(" != ")
+            || t.contains(" ]")
+    }
+
     fn chain_stmt(&mut self, lhs: &IrExpr, op: &BinOpKind, rhs: &IrExpr) {
         if *op == BinOpKind::Not {
             self.side_stmt(lhs);
@@ -4235,6 +4264,48 @@ fn capture_raw(&mut self, args: &[IrExpr]) -> Option<String> {
                 self.emit("_ = sh2Capture();");
                 self.rc_dirty = true;
             }
+            // `cmd || VAR=default`: an ASSIGNMENT as a chain side writes the
+            // var and leaves status 0 (func-after-or-assign, or-continue).
+            IrExpr::Call { func, args } if func == "assign" || func == "setVar" => {
+                if let Some(IrExpr::Str(name, _)) = args.first() {
+                    let is_append = args.iter().any(|a| matches!(a, IrExpr::Str(t, _) if t == "+="));
+                    let vi = if args.iter().any(|a| matches!(a, IrExpr::Str(t, _) if t == "=" || t == "+=")) { 2 } else { 1 };
+                    let empty = IrExpr::Str(String::new(), crate::ir::StrStyle::DoubleQuoted);
+                    let ve = args.get(vi).unwrap_or(&empty).clone();
+                    self.mark_written(name);
+                    let v = self.expr_str(&ve);
+                    let m = self.zig_ident(name);
+                    if is_append && !self.is_num(name) {
+                        self.emit(&format!("{m} = try std.fmt.allocPrint(std.heap.page_allocator, \"{{s}}{{s}}\", .{{ {m}, {v} }});"));
+                    } else if self.is_num(name) {
+                        self.emit(&format!("{m} = {v};"));
+                    } else {
+                        self.emit(&format!("{m} = {v};"));
+                    }
+                    self.emit("sh_rc = 0;");
+                    self.rc_dirty = true;
+                    return;
+                }
+                self.mark_todo("chain side assign without name");
+            }
+            // `[ -n "$x" ] || VAR=y`: the frontend puts the TEST on the lhs
+            // as a BinOp(Var OP Str) — the comparison must be EVALUATED, not
+            // dropped (func-after-or-assign printed "hello default").
+            IrExpr::BinOp { op, .. }
+                if matches!(op, BinOpKind::Eq | BinOpKind::Ne | BinOpKind::Lt | BinOpKind::Gt | BinOpKind::Le | BinOpKind::Ge) =>
+            {
+                let c = self.expr_bool(e);
+                self.emit(&format!("sh_rc = if ({c}) 0 else 1;"));
+                self.rc_dirty = true;
+            }
+            IrExpr::Var(name, _) => {
+                self.mark_read(name);
+                let m = self.zig_ident(name);
+                self.mark_written(name);
+                self.emit(&format!("sh_rc = if ({m}.len != 0) 0 else 1;"));
+                self.rc_dirty = true;
+            }
+            // a bare `$name` test-like side is not a command: keep it loud
             _ => {
                 self.mark_todo(&format!("chain side {e:?}"));
             }
@@ -6462,6 +6533,26 @@ fn capture_raw(&mut self, args: &[IrExpr]) -> Option<String> {
                     }
                     locals.retain(|v| must_local.contains(v) || !self.top_written.contains(v));
                 }
+                // A READ of a main-scope name (`echo "hello $VAR"` where main
+                // assigns VAR, and VAR was NOT a top-level write the scanner
+                // saw) must not compile to a bare identifier: the name lives
+                // in main's scope, not the fn's. Emit a value PARAMETER for
+                // it and pass the local at every call site (zig has no
+                // closures). func-after-or-assign pinned this: the fn body
+                // rendered `.{"hello {s}", .{VAR}}` and zig rejected the
+                // undeclared identifier, so the whole file failed to build.
+                let mut externs: Vec<(String, String)> = Vec::new();
+                let read_now: Vec<String> = self.read.iter().cloned().collect();
+                for v in read_now.iter() {
+                    let m = self.zig_ident(v);
+                    if locals.contains(v) || self.fn_locals.contains(v) || v.contains('[') { continue; }
+                    if !saved.iter().any(|l| l.contains(&m)) { continue; }
+                    let ty = if self.is_num(v) { "i64" } else { "[]const u8" };
+                    externs.push((m, ty.to_string()));
+                }
+                if !externs.is_empty() {
+                    self.fn_externs.insert(name.clone(), externs.clone());
+                }
                 self.fn_locals.extend(locals.iter().cloned());
                 let uses_stdout = saved.iter().any(|l| l.contains("stdout.print") || l.contains("stdout.flush"));
                 let uses_args = saved.iter().any(|l| l.contains("__args"));
@@ -6472,9 +6563,21 @@ fn capture_raw(&mut self, args: &[IrExpr]) -> Option<String> {
                     self.error_fns.insert(name.clone());
                 }
                 let ret = if uses_try { "![]const u8" } else { "[]const u8" };
+                // main-scope values this fn READS travel as parameters
+                let mut extra_sig = String::new();
+                let mut extra_body = String::new();
+                if let Some(xs) = self.fn_externs.get(name).cloned() {
+                    for (m, ty) in xs {
+                        // a value parameter named after the shell variable:
+                        // the body's identifier then resolves to it
+                        extra_sig.push_str(&format!(", {m}: {ty}"));
+                        extra_body.push_str(&format!("    _ = &{m};\n"));
+                    }
+                }
                 let mut fntext = format!(
-                    "fn {id}(init: std.process.Init, __args: []const []const u8) {ret} {{\n"
+                    "fn {id}(init: std.process.Init, __args: []const []const u8{extra_sig}) {ret} {{\n"
                 );
+                fntext.push_str(&extra_body);
                 if uses_stdout {
                     fntext.push_str("    var stdout_buffer: [4096]u8 = undefined;\n");
                     fntext.push_str("    var stdout_file_writer: std.Io.File.Writer = .initStreaming(.stdout(), init.io, &stdout_buffer);\n");
@@ -6905,7 +7008,7 @@ fn capture_raw(&mut self, args: &[IrExpr]) -> Option<String> {
             self.emit("");
             self.emit("extern fn waitpid(pid: c_int, status: ?*c_int, options: c_int) c_int;");
         }
-        if self.need_env || self.need_run || self.need_fexist || self.need_writefile || self.need_globpat || self.need_source {
+        if self.need_env || self.need_run || self.need_fexist || self.need_writefile || self.need_globpat || self.need_source || self.need_regexm {
             // Process handle for the runtime helpers. `Init` is only available
             // inside the emitted `main`, and zig has no way to thread it into a
             // free helper without changing every call site, so the emitted main
@@ -7886,7 +7989,7 @@ self.emit("fn shTrimRightNl(t: []const u8) []const u8 {");
             self.out
                 .push("    const stdout = &stdout_file_writer.interface;".to_string());
         }
-        if self.need_env || self.need_run || self.need_fexist || self.need_writefile {
+        if self.need_env || self.need_run || self.need_fexist || self.need_writefile || self.need_regexm {
             self.out
                 .push("    sh_io = init.io;".to_string());
         }
@@ -7894,7 +7997,7 @@ self.emit("fn shTrimRightNl(t: []const u8) []const u8 {");
             self.out
                 .push("    sh_environ = init.environ_map;".to_string());
         }
-        if !self.need_main_stdout && !self.need_env && !self.need_run && !self.need_fexist && !self.need_writefile {
+        if !self.need_main_stdout && !self.need_env && !self.need_run && !self.need_fexist && !self.need_writefile && !self.need_regexm {
             // `main` always takes `init`; if nothing consumed the handle the
             // parameter is unused and zig rejects it.
             self.emit("    _ = &init;");
@@ -8902,6 +9005,11 @@ fn collect_written_expr(e: &IrExpr, out: &mut BTreeSet<String>) {
             for i in items {
                 collect_written_expr(i, out);
             }
+        }
+        IrExpr::Call { func, args } if func == "test" => {
+            // a CONDITIONAL write lives inside the test's words:
+            // `[ -n "${VAR}" ] || VAR=default` (func-after-or-assign)
+            for a in args { collect_written_expr(a, out); }
         }
         IrExpr::Call { func, args } => {
             // a `local`/`declare`/`export`/`readonly` builtin call declares
