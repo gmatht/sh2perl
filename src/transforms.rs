@@ -186,6 +186,7 @@ pub mod f32_narrow; // binary32-exact float verdicts (cdef-float proofs)
 pub mod const_capture_fold;
 pub mod capture_node_fold; // `Call { "capture", [Arrow] }` → the first-class `Capture` node (shared; metric + perl native-capture paths)
 pub mod text_capture_fold; // constant `$(echo …)` in raw test/param/arith text → its literal output
+pub mod const_status_cond; // a `true`/`false`/`:` COMMAND in condition position → a constant cond + the command as the body's/branch's first statement (the `while true` fork-per-iteration, and the stale-`$CHILD_ERROR` condition it left behind)
 pub mod const_condition_elim;
 pub mod copy_propagation;
 pub mod counted_while_forinit;
@@ -301,6 +302,10 @@ pub fn all() -> Vec<(&'static str, TransformFn)> {
         // estree: sh2.captureSync). Folds provably-constant substitutions
         // into the text; refuse>guess keeps everything else verbatim.
         ("text-capture-fold", text_capture_fold::transform),
+        // const-status-cond runs right BEFORE const-condition-elim, which
+        // then prunes the constant `if`s it leaves (`if 0 { C; T } else {
+        // C; E }` → `{ C; E }`).
+        ("const-status-cond", const_status_cond::transform),
         ("const-condition-elim", const_condition_elim::transform),
         ("copy-propagation", copy_propagation::transform),
         ("counted-while-forinit", counted_while_forinit::transform),
