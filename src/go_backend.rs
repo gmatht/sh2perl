@@ -55,6 +55,10 @@ pub struct Render {
     /// every noted write per var, and how many of those stored a Go string
     writes: HashMap<String, usize>,
     writes_str: HashMap<String, usize>,
+    /// writes whose value is an INTEGER expression (`x=$?`, `x=$(( … ))`,
+    /// `x=5`, `x=<int var>`). bash stores the decimal TEXT of those, so the
+    /// target is still a string scalar (see `int_text_expr`).
+    writes_inttext: HashMap<String, usize>,
     /// vars actually read (skip the `_ = x` dead-var guard)
     read: BTreeSet<String>,
     /// Go identifier per shell var name (sanitize + de-dup)
@@ -284,7 +288,9 @@ fn native_stage_builtin(cmd: &str, argv: &[IrExpr]) -> bool {
 /// A `brace` operand is a splice too (`rm -f {a,b}` is two paths, one word).
 fn fs_literal_operand(e: &IrExpr) -> bool {
     match e {
-        IrExpr::Str(s, _) => s != "-" && !has_glob(&strip_sh2glob(s)),
+        IrExpr::Str(s, style) => {
+            s != "-" && !str_expands_glob(s, style)
+        }
         IrExpr::Call { func, .. } => func != "brace",
         _ => true,
     }
@@ -393,7 +399,9 @@ pub fn shir_to_go(prog: &IrProgram) -> String {
         // already have a verdict or a non-scalar home (decl_lines' type
         // order: functions, assoc, array, int64, string)
         if *n == 0
-            || r.writes_str.get(v).copied().unwrap_or(0) != *n
+            || r.writes_str.get(v).copied().unwrap_or(0)
+                + r.writes_inttext.get(v).copied().unwrap_or(0)
+                != *n
             || r.functions.contains(v)
             || r.assoc.contains(v)
             || r.arrays.contains(v)
@@ -820,7 +828,10 @@ impl Render {
     /// Render as a string-typed expression.
     fn expr_str(&mut self, e: &IrExpr) -> String {
         match e {
-            IrExpr::Str(s, _) => Self::go_str(s),
+            // The `\x01SH2GLOB\x01` prefix is core-internal metadata, never
+            // part of the value: emitting it raw put the marker INSIDE a
+            // filename (`os.Remove("\x01SH2GLOB\x01file_*.txt")`).
+            IrExpr::Str(s, _) => Self::go_str(&strip_sh2glob(s)),
             // a numeric literal's string form is known at render time —
             // bash never sees a separate value here.
             IrExpr::Int(i) => Self::go_str(&i.to_string()),
@@ -3236,6 +3247,25 @@ impl Render {
                 }
             }
         }
+        // `grep …` in status position (`if grep -q PAT FILE`, `x && grep …`):
+        // the same native scan the statement path uses, as an IIFE status.
+        if matches!(args.first(), Some(IrExpr::Str(c, _)) if c == "grep") {
+            let argv: &[IrExpr] = match args.get(1) {
+                Some(IrExpr::Array(items)) => items.as_slice(),
+                _ => &[],
+            };
+            let todo = self.todo;
+            let sides = self.sides.len();
+            let tmp = self.tmp;
+            if let Some(v) = self.grep_expr(argv) {
+                if self.todo == todo {
+                    return v;
+                }
+            }
+            self.sides.truncate(sides);
+            self.tmp = tmp;
+            self.todo = todo;
+        }
         if let Some((cmd, argv)) = self.exec_cmd_argv(args) {
             let call = Self::exec_cmd_call(&cmd, &argv);
             return format!("runCmd({call})");
@@ -3281,18 +3311,20 @@ impl Render {
                     continue;
                 }
             }
-            if let IrExpr::Str(s, _) = it {
+            if let IrExpr::Str(s, style) = it {
+                // Decide on the RAW text: the `\x01SH2GLOB\x01` marker is
+                // the core's authoritative "expand this word" flag, and it
+                // lives in the prefix {@link strip_sh2glob} removes.
+                let glob = str_expands_glob(s, style);
                 let s = strip_sh2glob(s);
-                // The shell expands the WORD as written, quotes and all
-                // (`grep -l pat "*.txt"` expands; bash only suppresses
-                // expansion for a WHOLE-word quote in the SOURCE, which the
-                // frontend has already unquoted). The decision therefore
-                // uses the value as it arrives, and the ARGUMENT keeps its
-                // text untouched -- the escape sequence `\n` inside a
-                // quoted word survives expansion, so stripping quotes here
-                // would eat the backslash and turn echo's `-e` newlines
-                // into literal `n`s.
-                if has_glob(&s) {
+                // The shell expands a word only where its metacharacter is
+                // UNQUOTED (`grep -c ".*"` is one regex argument; `*.txt` is
+                // a glob splice) — see `str_expands_glob`. The ARGUMENT keeps
+                // its text untouched either way: the escape sequence `\n`
+                // inside a quoted word survives expansion, so stripping
+                // quotes here would eat the backslash and turn echo's `-e`
+                // newlines into literal `n`s.
+                if glob {
                     // A glob splices its matches into the argv, as a spread
                     // element. Go allows a `…` spread only in FINAL position
                     // of a call or composite literal, so a mid-list glob is
@@ -7315,13 +7347,24 @@ impl Render {
                 Some(("st".to_string(), Opnd::Num))
             }
             n if n.chars().all(|c| c.is_ascii_digit()) && !n.is_empty() => {
-                if !has_dollar {
+                // `$10` is the tenth positional parameter.
+                if has_dollar {
+                    let i: i64 = n.parse().unwrap_or(1);
+                    return Some((format!("paramAt({i})"), Opnd::Str));
+                }
+                // A plain canonical decimal is a literal number. A QUOTED
+                // operand is TEXT (`[ "10" = "010" ]` compares the strings;
+                // re-parsing both sides as numbers made them agree), and a
+                // LEADING ZERO is octal in bash's arithmetic (`[ 010 -eq 8 ]`
+                // is true) while `parse` reads decimal — both stay strings so
+                // `numify`'s `s2i` (ParseInt base 0, leading 0 = octal) is
+                // what decides the value, not this parser.
+                if !quoted && (!n.starts_with('0') || n == "0") {
                     if let Ok(v) = n.parse::<i64>() {
                         return Some((v.to_string(), Opnd::Num));
                     }
                 }
-                let i: i64 = n.parse().unwrap_or(1);
-                Some((format!("paramAt({i})"), Opnd::Str))
+                Some((Self::go_str(n), Opnd::Str))
             }
             _ => {
                 if let Some(base) = inner.strip_suffix("[@]") {
@@ -7346,8 +7389,12 @@ impl Render {
                     };
                     let m = self.ident_of(inner);
                     Some((m, k))
-                } else if let Ok(n) = inner.parse::<i64>() {
-                    Some((n.to_string(), Opnd::Num))
+                } else if !quoted && inner.parse::<i64>().is_ok() {
+                    // A QUOTED operand is a literal STRING, never a number:
+                    // `[ "10" = "010" ]` compares the text, and re-parsing it
+                    // as an integer turned both sides into `s2s(10)` — a
+                    // wrong-but-compiling compare that agreed with itself.
+                    Some((inner.parse::<i64>().unwrap().to_string(), Opnd::Num))
                 } else if has_dollar {
                     // A word mixing literal text with expansions
                     // (`$HOME/Documents`, `pre$d`, `$a$b`): expand it
@@ -8373,18 +8420,21 @@ impl Render {
                     2 => &args[1],
                     _ => &args[2],
                 };
-                let rhs = if self.is_num(&t.var) {
-                    self.expr_num(value)
-                } else if op == "+=" && self.is_arr(&t.var) {
+                let rhs = if op == "+=" && self.is_arr(&t.var) {
                     // array += element
                     self.expr_any(value)
                 } else {
-                    self.expr_any(value)
+                    // the same write accounting `Assign` uses, so a var
+                    // written only through the `assign` builtin is still
+                    // typed (string vs int64) instead of collapsing to `any`
+                    self.scalar_assign(&t.var, value)
                 };
                 self.flush_sides();
                 let sync = self.sync_inline(&t.var);
                 if op == "+=" && self.is_arr(&t.var) {
                     self.emit(&format!("{m} = append({m}, {rhs});{sync}"));
+                } else if op == "+=" && self.is_str(&t.var) {
+                    self.emit(&format!("{m} = {m} + {rhs};{sync}"));
                 } else if op == "+=" && !self.is_num(&t.var) {
                     // any/string var += string value
                     self.emit(&format!("{m} = s2s({m}) + {rhs};{sync}"));
@@ -8501,12 +8551,39 @@ impl Render {
             // every read. A stubbed value renders as the int 0, so the
             // TODO delta disqualifies it.
             str_write = self.expr_yields_go_string(expr) && self.todo == todo;
+            // bash stores an integer write as its decimal TEXT (`x=$?` is
+            // "0", not the int 0), so an untyped target whose only writes
+            // are integer-valued is still a string scalar. The second pass
+            // renders it as `string` and the write through `expr_str`
+            // (`strconv.FormatInt`), which drops the `s2s(v)` coercion from
+            // every read.
+            if !str_write && self.todo == todo && self.int_text_expr(expr) {
+                *self.writes_inttext.entry(var.to_string()).or_insert(0) += 1;
+            }
             v
         };
         if str_write {
             *self.writes_str.entry(var.to_string()).or_insert(0) += 1;
         }
         rhs
+    }
+
+    /// True when the expression renders as a Go int64 whose bash TEXT form
+    /// is exactly its decimal (`strconv.FormatInt`): `x=$?`, `x=$#`, an
+    /// `$(( … ))`, an int literal, an int-typed var, a numeric BinOp. Those
+    /// writes do not disqualify an untyped target from being a string
+    /// scalar — bash has no integer variables, it stores the digits.
+    fn int_text_expr(&self, e: &IrExpr) -> bool {
+        match e {
+            IrExpr::Int(_) | IrExpr::Arith(_) => true,
+            IrExpr::Var(n, _) | IrExpr::Ident(n) => self.is_num(n),
+            IrExpr::BinOp { op, .. } => !matches!(op, crate::ir::BinOpKind::Concat),
+            IrExpr::Call { func, args } if func == "getVar" => match args.first() {
+                Some(IrExpr::Str(n, _)) => matches!(n.as_str(), "?" | "#" | "$") || self.is_num(n),
+                _ => false,
+            },
+            _ => false,
+        }
     }
 
     /// Restore subshell-saved vars (the tmp names were the last N allocated).
@@ -8726,15 +8803,18 @@ impl Render {
                 self.mark_written(&name);
                 let rhs = if op == "+=" && self.is_arr(&name) {
                     self.expr_any(value)
-                } else if self.is_num(&name) {
-                    self.expr_num(value)
                 } else {
-                    self.expr_any(value)
+                    // the same write accounting `Assign` uses, so a var
+                    // written only through the `assign` builtin is still
+                    // typed (string vs int64) instead of collapsing to `any`
+                    self.scalar_assign(&name, value)
                 };
                 self.flush_sides();
                 let sync = self.sync_inline(&name);
                 let stmt = if op == "+=" && self.is_arr(&name) {
                     format!("{m} = append({m}, {rhs});{sync}")
+                } else if op == "+=" && self.is_str(&name) {
+                    format!("{m} = {m} + {rhs};{sync}")
                 } else if op == "+=" && !self.is_num(&name) {
                     format!("{m} = s2s({m}) + {rhs};{sync}")
                 } else {
@@ -9252,7 +9332,7 @@ impl Render {
         let ops: Vec<(String, bool)> = list
             .iter()
             .map(|e| {
-                let glob = matches!(e, IrExpr::Str(s, _) if has_glob(&strip_sh2glob(s)));
+                let glob = expr_glob(e);
                 (self.expr_str(e), glob)
             })
             .collect();
@@ -9376,8 +9456,8 @@ impl Render {
         }
         for a in argv {
             match a {
-                IrExpr::Str(s, _) => {
-                    if s == "-" || s.starts_with('-') || has_glob(&strip_sh2glob(s)) {
+                IrExpr::Str(s, style) => {
+                    if s == "-" || s.starts_with('-') || str_expands_glob(s, style) {
                         return false;
                     }
                 }
@@ -9423,8 +9503,8 @@ impl Render {
         }
         for a in argv {
             match a {
-                IrExpr::Str(s, _) => {
-                    if s == "-" || s.starts_with('-') || has_glob(&strip_sh2glob(s)) {
+                IrExpr::Str(s, style) => {
+                    if s == "-" || s.starts_with('-') || str_expands_glob(s, style) {
                         return false;
                     }
                 }
@@ -9508,10 +9588,134 @@ impl Render {
         true
     }
 
+    /// `cmp` rendered with `cmpFiles` (see RUNTIME_HELPERS): the byte-exact
+    /// GNU cmp the corpus compares against, without a child. Accepts the
+    /// option set the helper reproduces — `-s`, `-l`, `-b`, `-i SKIP[:SKIP2]`
+    /// and `-n LIMIT` in any order, `--` ending the flags — and exactly two
+    /// operands. REFUSE > GUESS: a long option, an unknown short flag, a
+    /// non-decimal limit/skip, stdin (`-`), a glob splice or a brace keeps
+    /// the fork (GNU's suffix forms `-n 1K`, `-i 2k` included).
+    fn cmp_stmt(&mut self, argv: &[IrExpr]) -> bool {
+        let (mut silent, mut list, mut bytes_mode) = (false, false, false);
+        let (mut limit, mut skip1, mut skip2) = (-1i64, 0i64, 0i64);
+        let mut ops: Vec<&IrExpr> = Vec::new();
+        let mut flags_done = false;
+        let mut i = 0;
+        while i < argv.len() {
+            let word = match &argv[i] {
+                IrExpr::Str(s, _) if !flags_done && ops.is_empty() => Some(s.clone()),
+                _ => None,
+            };
+            let Some(w) = word else {
+                flags_done = true;
+                ops.push(&argv[i]);
+                i += 1;
+                continue;
+            };
+            if !w.starts_with('-') || w == "-" {
+                flags_done = true;
+                ops.push(&argv[i]);
+                i += 1;
+                continue;
+            }
+            if w == "--" {
+                flags_done = true;
+                i += 1;
+                continue;
+            }
+            if w.starts_with("--") {
+                return false;
+            }
+            if w == "-n" || w == "-i" {
+                let Some(IrExpr::Str(v, _)) = argv.get(i + 1) else {
+                    return false;
+                };
+                if w == "-n" {
+                    let Some(n) = cmp_dec(v) else { return false };
+                    limit = n;
+                } else {
+                    let (a, b) = match v.split_once(':') {
+                        Some((a, b)) => (a, b),
+                        None => (v.as_str(), v.as_str()),
+                    };
+                    let (Some(x), Some(y)) = (cmp_dec(a), cmp_dec(b)) else {
+                        return false;
+                    };
+                    skip1 = x;
+                    skip2 = y;
+                }
+                i += 2;
+                continue;
+            }
+            for c in w[1..].chars() {
+                match c {
+                    's' => silent = true,
+                    'l' => list = true,
+                    'b' => bytes_mode = true,
+                    _ => return false,
+                }
+            }
+            i += 1;
+        }
+        if ops.len() != 2 {
+            return false;
+        }
+        for op in &ops {
+            if !fs_literal_operand(op) {
+                return false;
+            }
+            if let IrExpr::Str(s, _) = op {
+                if s == "-" || s.starts_with('-') {
+                    return false;
+                }
+            }
+        }
+        let a = self.expr_str(ops[0]);
+        let b = self.expr_str(ops[1]);
+        self.flush_sides();
+        self.emit(&format!(
+            "st = cmpFiles({a}, {b}, {silent}, {list}, {bytes_mode}, {limit}, {skip1}, {skip2});"
+        ));
+        self.need_st = true;
+        true
+    }
+
+    /// `sleep` rendered with `time.Sleep`: no child process for a call that
+    /// is pure waiting. GNU's operand grammar is what the corpus writes —
+    /// plain decimal seconds, an optional `s`/`m`/`h`/`d` suffix, a
+    /// fractional part, and several operands summed. Anything else (`inf`,
+    /// `nan`, an option, a dynamic operand) keeps the fork. REFUSE > GUESS:
+    /// a mis-parsed interval would sleep for the wrong time and silently
+    /// change the program's behaviour.
+    fn sleep_stmt(&mut self, argv: &[IrExpr]) -> bool {
+        if argv.is_empty() {
+            return false;
+        }
+        let mut total = 0i64;
+        for a in argv {
+            let IrExpr::Str(s, _) = a else {
+                return false;
+            };
+            let Some(ns) = sleep_ns(s) else {
+                return false;
+            };
+            let Some(sum) = total.checked_add(ns) else {
+                return false;
+            };
+            total = sum;
+        }
+        self.flush_sides();
+        self.emit(&format!("{};", sleep_call(total)));
+        if self.need_st {
+            self.emit("st = 0;");
+        }
+        true
+    }
+
     /// External commands Go expresses natively, so the renderer drops the
     /// fork/exec entirely (AGENTS.md §2). Currently `rm`, `mkdir`, `touch`,
-    /// `rmdir` and `ln`; any argv outside their exact shape falls through
-    /// to `runCmd`.
+    /// `rmdir`, `ln`, `cmp` and `sleep`; any argv outside their exact shape
+    /// falls through to `runCmd`.
     fn fs_argcmd_stmt(&mut self, cmd: &str, args: &[IrExpr]) -> bool {
         // `exec` Call shape is (cmd, [argv…]), same as exec_builtin_stmt
         let argv: &[IrExpr] = match args.get(1) {
@@ -9524,8 +9728,122 @@ impl Render {
             "touch" => self.touch_stmt(argv),
             "rmdir" => self.rmdir_stmt(argv),
             "ln" => self.ln_stmt(argv),
+            "cmp" => self.cmp_stmt(argv),
+            "sleep" => self.sleep_stmt(argv),
+            "grep" => {
+                let Some(v) = self.grep_expr(argv) else {
+                    return false;
+                };
+                self.flush_sides();
+                self.emit(&format!("st = {v};"));
+                self.need_st = true;
+                true
+            }
             _ => false,
         }
+    }
+
+    /// `grep [flags] PAT FILE` as one Go expression (an IIFE yielding grep's
+    /// STATUS) that writes grep's stdout as it scans: `os.ReadFile` +
+    /// `regexp` instead of forking grep (AGENTS.md §2 — the stdlib call is
+    /// the target-native lowering, the child is the fallback).
+    ///
+    /// REFUSE > GUESS, because a wrong status silently flips an `if`/`&&`
+    /// arm's direction:
+    ///   * flags — only `-q -n -c -v -i -w -x -E -F` (the ones this
+    ///     template reproduces exactly). `-H`/`-h`/`-l`/`-L`/`-o`/`-r`/
+    ///     `-A`/`-B`/`-C`/`-m`/`-f`/`-e` have no exact counterpart here.
+    ///   * operands — exactly one FILE (grep prefixes `name:` for several),
+    ///     no `-` operand (stdin), no glob metacharacters (the child would
+    ///     get the WORD, the glob is the shell's job), no option-like path.
+    fn grep_expr(&mut self, argv: &[IrExpr]) -> Option<String> {
+        let (mut quiet, mut numbered, mut counted) = (false, false, false);
+        let (mut invert, mut word, mut whole) = (false, false, false);
+        let mut flags = String::new();
+        let mut i = 0usize;
+        while let Some(IrExpr::Str(a, _)) = argv.get(i) {
+            if a == "--" {
+                i += 1;
+                break;
+            }
+            if !a.starts_with('-') || a.len() < 2 {
+                break;
+            }
+            for c in a[1..].chars() {
+                match c {
+                    'q' => quiet = true,
+                    'n' => numbered = true,
+                    'c' => counted = true,
+                    'v' => invert = true,
+                    'i' => flags.push('i'),
+                    'E' => flags.push('E'),
+                    'F' => flags.push('F'),
+                    'w' => word = true,
+                    'x' => whole = true,
+                    _ => return None,
+                }
+            }
+            i += 1;
+        }
+        let pat = match argv.get(i) {
+            Some(IrExpr::Str(p, _)) if !p.starts_with('-') || flags.contains('E') => p.clone(),
+            _ => return None,
+        };
+        i += 1;
+        // one operand, and it must be the LAST word (multi-file grep prefixes
+        // every hit with the file name)
+        if argv.len() != i + 1 {
+            return None;
+        }
+        let file_arg = &argv[i];
+        if let IrExpr::Str(s, _) = file_arg {
+            if s == "-" || s.starts_with('-') || s.contains(['*', '?', '[', '~']) {
+                return None;
+            }
+        }
+        let mut re = grep_re_body(&pat, &flags);
+        if word {
+            re = format!("\\b(?:{re})\\b");
+        }
+        if whole {
+            re = format!("^(?:{re})$");
+        }
+        let file = self.expr_str(file_arg);
+        let idx = if numbered { "__gi, __gl" } else { "_, __gl" };
+        let inv = if invert { "!" } else { "" };
+        let body = if numbered {
+            "__go += fmt.Sprintf(\"%d:%s\\n\", __gi+1, __gl)"
+        } else {
+            "__go += __gl + \"\\n\""
+        };
+        // `-q`/`-c` print nothing per hit; `-c` prints the total afterwards.
+        let hit = if quiet || counted { "" } else { body };
+        let count_out = if counted {
+            "; __go = fmt.Sprintf(\"%d\\n\", __gc)"
+        } else {
+            ""
+        };
+        Some(format!(
+            "func() int64 {{ __gre, __gce := regexp.Compile({re}); if __gce != nil {{ return 2 }}; \
+             __gd, __gde := os.ReadFile({file}); if __gde != nil {{ return 2 }}; \
+             __gls := strings.Split(string(__gd), \"\\n\"); \
+             if len(__gls) > 0 && __gls[len(__gls)-1] == \"\" {{ __gls = __gls[:len(__gls)-1] }}; \
+             __gc := 0; __go := \"\"; \
+             for {idx} := range __gls {{ __gm := __gre.MatchString(__gl); \
+             if {inv}__gm {{ __gc++{hit} }} }}{count_out}; \
+             fmt.Print(__go); if __gc > 0 {{ return 0 }}; return 1 }}()",
+            re = Self::go_str(&re),
+            file = file,
+            idx = idx,
+            inv = inv,
+            // the per-hit statement only exists when something is printed
+            hit = if hit.is_empty() {
+                String::new()
+            } else {
+                format!("; {hit}")
+            },
+            count_out = count_out,
+        ))
     }
 
     /// `chain_operand`'s arm for the natively-lowered external commands:
@@ -9722,13 +10040,46 @@ impl Render {
                     return true;
                 }
                 let mut ps = Vec::new();
+                // `readInto` writes through `*string`, so only a var that
+                // hoists as Go `string` can be passed by address. An
+                // untyped (`any`) or int64 slot — `var line any` is what an
+                // unannotated `read -r line; echo "$line"` produces — used
+                // to be passed as `&line` and the render did not COMPILE
+                // (`cannot use &line (value of type *any) as *string`).
+                // Read the field into a temp string and store it after,
+                // boxing exactly as the declared slot expects.
+                let mut stores: Vec<(String, String, String)> = Vec::new();
                 for n in &names {
                     self.mark_written(n);
                     let m = self.go_ident(n);
-                    ps.push(format!("&{m}"));
+                    if self.declared_go_string(n) {
+                        ps.push(format!("&{m}"));
+                    } else {
+                        let id = self.new_tmp();
+                        ps.push(format!("&__rv{id}"));
+                        stores.push((n.clone(), m, id));
+                    }
                 }
                 self.flush_sides();
+                for (_, _, id) in &stores {
+                    self.emit(&format!("var __rv{id} string;"));
+                }
                 self.emit(&format!("_ = readInto({});", ps.join(", ")));
+                for (n, m, id) in &stores {
+                    if self.is_arr(n) {
+                        // `read a` on an array assigns element 0 and leaves
+                        // the other elements alone.
+                        self.emit(&format!(
+                            "if len({m}) > 0 {{ {m}[0] = __rv{id} }} else {{ {m} = []any{{__rv{id}}} }};"
+                        ));
+                    } else if self.declared_go_int(n) {
+                        let sync = self.sync_inline(n);
+                        self.emit(&format!("{m} = s2i(__rv{id});{sync}"));
+                    } else {
+                        let sync = self.sync_inline(n);
+                        self.emit(&format!("{m} = __rv{id};{sync}"));
+                    }
+                }
                 if self.need_st {
                     self.emit("st = 0;");
                 }
@@ -10494,7 +10845,7 @@ impl Render {
                     // `for f in *.{txt,log}` iterates files, not the literal
                     // pattern (measured: the marker text was printed).
                     if let IrExpr::Str(s, _) = it {
-                        if has_glob(&strip_sh2glob(s)) {
+                        if expr_glob(it) {
                             let pat = Self::go_str(&strip_sh2glob(s));
                             let t = self.new_tmp();
                             return Some(ForList::Runtime {
@@ -11404,6 +11755,75 @@ fn join_args(v: &[String]) -> String {
     }
 }
 
+/// Decimal non-negative integer — `cmp`'s `-n`/`-i` operands without GNU's
+/// size suffixes. Anything else refuses the native lowering.
+fn cmp_dec(s: &str) -> Option<i64> {
+    if s.is_empty() || !s.bytes().all(|b| b.is_ascii_digit()) {
+        return None;
+    }
+    s.parse::<i64>().ok()
+}
+
+/// A `sleep` operand → nanoseconds, GNU style: a decimal number with an
+/// optional fractional part and an optional `s`/`m`/`h`/`d` unit. Done in
+/// integer arithmetic on purpose — `0.1 * 1e9` in f64 is not exactly 1e8,
+/// and a sleep that is 20ns off is a bug that only shows up as a flake.
+fn sleep_ns(operand: &str) -> Option<i64> {
+    let s = operand.trim();
+    let (num, unit_ns): (&str, i64) = match s.as_bytes().last().copied() {
+        Some(b's') => (&s[..s.len() - 1], 1_000_000_000),
+        Some(b'm') => (&s[..s.len() - 1], 60_000_000_000),
+        Some(b'h') => (&s[..s.len() - 1], 3_600_000_000_000),
+        Some(b'd') => (&s[..s.len() - 1], 86_400_000_000_000),
+        _ => (s, 1_000_000_000),
+    };
+    let (whole_txt, frac) = match num.split_once('.') {
+        Some((a, b)) => (a, Some(b)),
+        None => (num, None),
+    };
+    if whole_txt.is_empty() || !whole_txt.bytes().all(|b| b.is_ascii_digit()) {
+        return None;
+    }
+    if let Some(f) = frac {
+        if f.is_empty() || !f.bytes().all(|b| b.is_ascii_digit()) {
+            return None;
+        }
+    }
+    let mut total = whole_txt.parse::<i64>().ok()?.checked_mul(unit_ns)?;
+    if let Some(f) = frac {
+        // digits past the ninth are below nanosecond resolution — the shell
+        // truncates there too
+        let mut scale = unit_ns;
+        for b in f.bytes().take(9) {
+            scale /= 10;
+            total = total.checked_add((b - b'0') as i64 * scale)?;
+        }
+    }
+    Some(total)
+}
+
+/// `time.Sleep` call for a nanosecond total, in the largest unit that
+/// divides it exactly (`time.Sleep(time.Second)`, not
+/// `time.Sleep(time.Duration(1000000000))`).
+fn sleep_call(ns: i64) -> String {
+    for (unit, size) in [
+        ("time.Hour", 3_600_000_000_000i64),
+        ("time.Minute", 60_000_000_000),
+        ("time.Second", 1_000_000_000),
+        ("time.Millisecond", 1_000_000),
+        ("time.Microsecond", 1_000),
+        ("time.Nanosecond", 1),
+    ] {
+        if ns % size == 0 {
+            return match ns / size {
+                1 => format!("time.Sleep({unit})"),
+                n => format!("time.Sleep({n} * {unit})"),
+            };
+        }
+    }
+    unreachable!("1ns divides every value")
+}
+
 fn parse_arith_num(s: &str) -> Option<i64> {
     if s.is_empty() {
         return None;
@@ -11734,6 +12154,15 @@ fn strify(e: String, k: Opnd, _r: &mut Render) -> String {
     // the same identity the helper performs, so it would only box twice.
     if k == Opnd::Str || e.starts_with("s2s(") {
         e
+    } else if k == Opnd::Num && e.parse::<i64>().is_ok() {
+        // A numeric LITERAL's text is known at render time — `s2s(10)` boxed
+        // an int64 into an `any` only to `%v`-format it back to "10".
+        format!("\"{e}\"")
+    } else if k == Opnd::Num {
+        // `Opnd::Num` is Go int64 by construction, so its decimal text is
+        // `strconv`'s — `s2s` boxed the value into an `any` (`%v`) for the
+        // same string.
+        format!("strconv.FormatInt({e}, 10)")
     } else {
         format!("s2s({e})")
     }
@@ -11790,6 +12219,65 @@ fn has_glob(s: &str) -> bool {
         || s.contains('?')
         || s.contains('[')
         || has_extglob(s)
+}
+
+/// Does this word undergo PATHNAME EXPANSION in the shell?
+///
+/// `has_glob` answers "does the text carry a metacharacter", which is NOT the
+/// same question: quoting makes a metacharacter literal. The frontend records
+/// whole-word quoting in `StrStyle`, so `grep -c ".*"` arrives as
+/// `Str(".*", DoubleQuoted)` — a REGEX argument, not a glob. Spreading it
+/// through `globArgs` handed grep every dotfile in the CWD as a separate
+/// operand (measured: `016_grep_basic.sh` printed an `ls -A`-shaped listing
+/// instead of a count).
+///
+/// A partially quoted word keeps its quote characters in the text, so the
+/// scan tracks quote runs too: `a"*"b` is literal, `'*'*` still expands on
+/// its unquoted `*`. Refusing to expand a word that the shell would expand is
+/// a robustness win only if the pattern is fully quoted, which the style
+/// check already covers — the text scan is the finer-grained twin.
+fn str_expands_glob(s: &str, style: &crate::ir::StrStyle) -> bool {
+    // The core prefixes an UNQUOTED glob word with `\x01SH2GLOB\x01`
+    // (shir.rs GLOB_MAGIC) and that marker is AUTHORITATIVE: the style is
+    // not reliable for these words — they arrive as `DoubleQuoted`, so the
+    // style test below said "quoted, no expansion" and `ls file_*.txt`
+    // passed the pattern through literally while `rm file_*.txt` even
+    // leaked the marker into the filename.
+    if s.starts_with('\u{1}') {
+        return true;
+    }
+    if matches!(
+        style,
+        crate::ir::StrStyle::DoubleQuoted | crate::ir::StrStyle::SingleQuoted
+    ) {
+        return false;
+    }
+    let b: Vec<char> = s.chars().collect();
+    let (mut sq, mut dq) = (false, false);
+    let mut i = 0;
+    while i < b.len() {
+        match b[i] {
+            '\\' if !sq => i += 2,
+            '\'' if !dq => {
+                sq = !sq;
+                i += 1;
+            }
+            '"' if !sq => {
+                dq = !dq;
+                i += 1;
+            }
+            '*' | '?' | '[' if !sq && !dq => return true,
+            '@' | '+' | '!' if !sq && !dq && i + 1 < b.len() && b[i + 1] == '(' => return true,
+            _ => i += 1,
+        }
+    }
+    false
+}
+
+/// `strip_sh2glob` + `str_expands_glob` for the `IrExpr::Str` shape every
+/// argv/operand scan uses.
+fn expr_glob(e: &IrExpr) -> bool {
+    matches!(e, IrExpr::Str(s, st) if str_expands_glob(s, st))
 }
 
 /// An extglob head anywhere in the pattern (`@(…)`, `!(…)`, `?(…)`,
@@ -12093,6 +12581,14 @@ fn scan_flags_expr(e: &IrExpr, r: &mut Render) {
             }
         }
         IrExpr::Index { key, .. } => scan_flags_expr(key, r),
+        // A block-shaped expression (`$( … )` is `Capture{Arrow(stmts)}`, a
+        // closure is `Lambda{body}`): the scan MUST descend into the nested
+        // statements, or a `param` read inside the block leaves need_vars
+        // false and an EARLIER plain assignment skips its `vars[…]` sync —
+        // `p=/home/user/script; echo "${p#/}"` then reads pExp → pVal →
+        // vars["p"] and finds nothing (parse-heredoc-dollar-paren).
+        IrExpr::Arrow(stmts) => scan_flags(stmts, r),
+        IrExpr::Lambda { body, .. } => scan_flags(body, r),
         IrExpr::Capture { expr, .. } => scan_flags_expr(expr, r),
         IrExpr::Array(items) => {
             for it in items {
@@ -12955,6 +13451,16 @@ fn go_uses_pkg(s: &str, q: &str) -> bool {
     }
     false
 }
+/// True when a declaration in the text asks for a NAMEREF (`declare -n`,
+/// `local -n`, `typeset -n`): after it every read of the name goes through
+/// the name it holds, so the text's spelling no longer says what is read.
+/// Erring towards `true` only keeps the complete env (see `sh_text_refs`).
+fn nameref_flag(text: &str) -> bool {
+    let declares = ["declare", "local", "typeset"]
+        .iter()
+        .any(|w| go_contains_word(text, w));
+    declares && go_contains_word(text, "-n")
+}
 fn go_contains_word(s: &str, w: &str) -> bool {
     if w.is_empty() || w.len() > s.len() { return false; }
     let b = s.as_bytes();
@@ -12976,33 +13482,40 @@ fn go_contains_word(s: &str, w: &str) -> bool {
 /// Used to shrink the `name=<value>` env list a `bash -c` child is handed:
 /// the child only ever sees a variable the text actually mentions, so
 /// shipping the whole written namespace is pure marshalling. `None` is the
-/// REFUSE > GUESS arm — it keeps the complete list — and covers the read
-/// forms that do not spell a name out:
+/// REFUSE > GUESS arm — it keeps the complete list — and is reserved for the
+/// forms whose reads are NOT recoverable from the text:
 ///
 ///   * `${!ref}`      — an indirect expansion names its target at run time.
-///   * `eval`/`declare`/`export`/`trap`/`set`/`unset`/`readonly`/`local`,
-///     `read`/`mapfile`/`readarray`/`getopts`/`shift` — dynamic or
-///     IMPLICIT reads (`read` consults IFS, which the text need not name).
-///   * `$((…))` / `$[…]` — arithmetic resolves BARE names (`$((x + 1))`).
-///   * `${#name}` / `$#` — `#` is not part of an identifier, so the name
-///     inside would be missed.
+///   * `eval`/`source`/`. f` — the code that runs is not in the text.
+///   * `trap`         — the saved code runs later, outside this text.
+///   * `declare -n` / `local -n` / `typeset -n` — a nameref turns every
+///     later read into an indirect one.
+///
+/// The forms that DO spell their reads in some other syntax — `$((…))` and
+/// `$[…]` arithmetic (bare names), `${#name}`/`$#` (`#` is not an identifier
+/// char), and the declarations/`set`/`shift`/`read` family — take the COARSE
+/// scan instead: every identifier in the text is returned, which can only
+/// over-approximate (plus `IFS` for the splitting `read` family).
 fn sh_text_refs(text: &str) -> Option<BTreeSet<String>> {
-    const DYNAMIC_WORDS: &[&str] = &[
-        "eval", "declare", "typeset", "export", "readonly", "local", "unset", "set", "trap",
-        "read", "mapfile", "readarray", "getopts", "shift", "nameref", "IFS",
-        // `source f` / `. f` run a FILE whose reads are not in the text at
-        // all, so no subset is provable — same reason the `eval`/`source`
-        // statement arms pass `None` (see `env_lit_for`). `source` rides
-        // the word list; `.` needs its own scan below (it is not a word).
-        "source",
+    // The words that make the text run code it does not spell, or resolve a
+    // name at run time. Only these keep the complete env — for them a subset
+    // is not provable. Everything else is handled by OVER-APPROXIMATION
+    // below, which is sound by construction: keeping a `name=<value>` the
+    // child never reads costs marshalling, while dropping one it does read
+    // would change behaviour. The old list refused ~55 `s2s` coercions worth
+    // of exports for forms whose reads ARE recoverable.
+    const DELEGATING_WORDS: &[&str] = &[
+        "eval", "source",
+        // `trap` SAVES code that runs later (a signal, or the EXIT trap):
+        // its reads are not in this text at all.
+        "trap",
     ];
-    if text.contains("${!") || text.contains("${#") || text.contains("$#") {
+    // A NAMEREF makes every later read of the name indirect (`local -n r=x;
+    // echo "$r"` reads `x`), so no spelling in the text proves what it reads.
+    if text.contains("${!") || nameref_flag(text) {
         return None;
     }
-    if text.contains("$((") || text.contains("$[") {
-        return None;
-    }
-    for w in DYNAMIC_WORDS {
+    for w in DELEGATING_WORDS {
         if go_contains_word(text, w) {
             return None;
         }
@@ -13032,6 +13545,53 @@ fn sh_text_refs(text: &str) -> Option<BTreeSet<String>> {
     let b = text.as_bytes();
     let is_id = |c: u8| c.is_ascii_alphanumeric() || c == b'_';
     let mut out: BTreeSet<String> = BTreeSet::new();
+    // COARSE forms: the text reads names the `$name` scan cannot see, but
+    // every one of them IS spelled somewhere in the text — so the scan
+    // returns every identifier instead, which can only over-approximate.
+    //
+    //   `$((…))` / `$[…]`  arithmetic resolves BARE names.
+    //   `${#name}` / `$#`  `#` is not part of an identifier, so the name
+    //                      inside a length expansion would be missed.
+    //   `declare -i x=a+2` / `local x=$((…))`-style declarations and
+    //   `set`'s positional forms: the reads ride a syntax, not a `$name`.
+    //   `read`/`mapfile`/`readarray`/`getopts` assign their own names
+    //                      (nothing to prove) — but they split on IFS,
+    //                      which the text need not spell, so it is added.
+    const COARSE_WORDS: &[&str] = &[
+        "declare", "typeset", "local", "export", "readonly", "unset", "set", "read", "mapfile",
+        "readarray", "getopts", "shift", "nameref", "IFS",
+    ];
+    let coarse = text.contains("$((")
+        || text.contains("$[")
+        || text.contains("${#")
+        || text.contains("$#")
+        || COARSE_WORDS.iter().any(|w| go_contains_word(text, w));
+    if coarse {
+        let mut i = 0;
+        while i < b.len() {
+            if is_id(b[i]) && (i == 0 || !is_id(b[i - 1])) {
+                let mut j = i;
+                while j < b.len() && is_id(b[j]) {
+                    j += 1;
+                }
+                if !b[i].is_ascii_digit() {
+                    out.insert(String::from_utf8_lossy(&b[i..j]).into_owned());
+                }
+                i = j;
+                continue;
+            }
+            i += 1;
+        }
+        // The splitting `read`-family consults the child's IFS, which the
+        // text may never name (it is usually inherited from the parent).
+        if ["read", "mapfile", "readarray"]
+            .iter()
+            .any(|w| go_contains_word(text, w))
+        {
+            out.insert("IFS".to_string());
+        }
+        return Some(out);
+    }
     let mut i = 0;
     while i < b.len() {
         // `$name` / `${name…}` — an expansion. Also accept a name only when
@@ -13768,12 +14328,14 @@ const RUNTIME_HELPERS: &[&str] = &[
     "}",
     "",
     "func pSuf(shortest bool, v, pat string) string {",
-    "    var re *regexp.Regexp",
-    "    if shortest {",
-    "        re = regexp.MustCompile(\"^(.*)\" + globRe(pat, true) + \".*?$\")",
-    "    } else {",
-    "        re = regexp.MustCompile(\"^(.*?)\" + globRe(pat, true) + \".*$\")",
-    "    }",
+    "    // `%`/`%%` remove a suffix, so the pattern is ANCHORED AT THE END:",
+    "    // `${HOME%/}` on /root keeps the whole value (there is no trailing",
+    "    // slash). An unanchored `^(.*)pat.*?$` matched the LEADING slash",
+    "    // and returned the empty string instead — the same shape broke every",
+    "    // `${v%…}`/`${v%%…}` whose pattern also occurs earlier in the value.",
+    "    pre := \"(.*)\"",
+    "    if !shortest { pre = \"(.*?)\" }",
+    "    re := regexp.MustCompile(\"(?s)^\" + pre + globRe(pat, true) + \"$\")",
     "    m := re.FindStringSubmatchIndex(v)",
     "    if m == nil { return v }",
     "    return v[:m[3]]",
@@ -13833,6 +14395,105 @@ const RUNTIME_HELPERS: &[&str] = &[
     "    sb, eb := os.Stat(b)",
     "    if ea != nil || eb != nil { return false }",
     "    return os.SameFile(sa, sb)",
+    "}",
+    "",
+    "// cmpDigits is the offset column width GNU cmp uses for -l: the number of",
+    "// decimal digits in the largest offset it can print (the compared length).",
+    "func cmpDigits(n int64) int {",
+    "    d := 1",
+    "    for n >= 10 { n /= 10; d++ }",
+    "    return d",
+    "}",
+    "",
+    "// cmpErrno spells a Go filesystem error the way GNU cmp's strerror does",
+    "// (capitalised, no path prefix — the caller adds `cmp: PATH: `).",
+    "func cmpErrno(err error) string {",
+    "    if err == nil { return \"\" }",
+    "    s := strings.ToLower(err.Error())",
+    "    switch {",
+    "    case strings.Contains(s, \"no such file\"): return \"No such file or directory\"",
+    "    case strings.Contains(s, \"permission denied\"): return \"Permission denied\"",
+    "    case strings.Contains(s, \"is a directory\"): return \"Is a directory\"",
+    "    }",
+    "    return err.Error()",
+    "}",
+    "",
+    "// cmpChar is cmp -b's rendering of a differing byte: printable ASCII as",
+    "// itself, control bytes as ^X, DEL as ^?, high bytes with the M- prefix.",
+    "func cmpChar(b byte) string {",
+    "    switch {",
+    "    case b >= 32 && b < 127: return string(rune(b))",
+    "    case b == 127: return \"^?\"",
+    "    case b < 32: return \"^\" + string(rune(b+64))",
+    "    }",
+    "    return fmt.Sprintf(\"M-%s\", cmpChar(b&0x7f))",
+    "}",
+    "",
+    "func cmpSlice(d []byte, skip int64) []byte {",
+    "    if skip <= 0 { return d }",
+    "    if skip >= int64(len(d)) { return nil }",
+    "    return d[skip:]",
+    "}",
+    "",
+    "// cmpFiles is GNU cmp over two files: default `differ: byte N, line M`,",
+    "// -s (silent), -l (one `OFFSET OCT1 OCT2` line per difference), -b",
+    "// (printable bytes), -n LIMIT and -i SKIP[:SKIP2]. Status is cmp's own:",
+    "// 0 equal, 1 differ/EOF, 2 unreadable. EOF diagnostics go to stderr, the",
+    "// differ lines to stdout, exactly like the program it replaces.",
+    "func cmpFiles(a, b string, silent, list, bytesMode bool, limit, skip1, skip2 int64) int64 {",
+    "    d1, e1 := os.ReadFile(a)",
+    "    if e1 != nil {",
+    "        if !silent { fmt.Fprintf(os.Stderr, \"cmp: %s: %s\\n\", a, cmpErrno(e1)) }",
+    "        return 2",
+    "    }",
+    "    d2, e2 := os.ReadFile(b)",
+    "    if e2 != nil {",
+    "        if !silent { fmt.Fprintf(os.Stderr, \"cmp: %s: %s\\n\", b, cmpErrno(e2)) }",
+    "        return 2",
+    "    }",
+    "    d1 = cmpSlice(d1, skip1)",
+    "    d2 = cmpSlice(d2, skip2)",
+    "    n1, n2 := int64(len(d1)), int64(len(d2))",
+    "    minlen := n1",
+    "    if n2 < n1 { minlen = n2 }",
+    "    n := minlen",
+    "    if limit >= 0 && limit < n { n = limit }",
+    "    width := cmpDigits(n)",
+    "    line := int64(1)",
+    "    differ := false",
+    "    for i := int64(0); i < n; i++ {",
+    "        if d1[i] == d2[i] {",
+    "            if d1[i] == '\\n' { line++ }",
+    "            continue",
+    "        }",
+    "        if silent { return 1 }",
+    "        if list {",
+    "            differ = true",
+    "            fmt.Printf(\"%*d %3o %3o\\n\", width, i+1, d1[i], d2[i])",
+    "            continue",
+    "        }",
+    "        if bytesMode {",
+    "            fmt.Printf(\"%s %s differ: byte %d, line %d is %3o %s %3o %s\\n\", a, b, i+1, line, d1[i], cmpChar(d1[i]), d2[i], cmpChar(d2[i]))",
+    "        } else {",
+    "            fmt.Printf(\"%s %s differ: byte %d, line %d\\n\", a, b, i+1, line)",
+    "        }",
+    "        return 1",
+    "    }",
+    "    if n1 != n2 && n == minlen && (limit < 0 || n < limit) {",
+    "        shorter, sl := a, n1",
+    "        if n2 < n1 { shorter, sl = b, n2 }",
+    "        if silent { return 1 }",
+    "        if sl == 0 {",
+    "            fmt.Fprintf(os.Stderr, \"cmp: EOF on %s which is empty\\n\", shorter)",
+    "        } else if list {",
+    "            fmt.Fprintf(os.Stderr, \"cmp: EOF on %s after byte %d\\n\", shorter, sl)",
+    "        } else {",
+    "            fmt.Fprintf(os.Stderr, \"cmp: EOF on %s after byte %d, in line %d\\n\", shorter, sl, line)",
+    "        }",
+    "        return 1",
+    "    }",
+    "    if differ { return 1 }",
+    "    return 0",
     "}",
     "",
     "var vars = map[string]any{}",
@@ -14348,6 +15009,31 @@ mod tests {
         assert!(out.contains("var type_ int64"), "{out}");
         assert!(!out.contains("var type int64"), "{out}");
     }
+
+    #[test]
+    fn sleep_renders_as_time_sleep() {
+        // one operand, and GNU's summed form
+        let out = render("sleep 1\nsleep 0.1 2s\n");
+        assert!(out.contains("time.Sleep(time.Second);"), "{out}");
+        assert!(out.contains("time.Sleep(2100 * time.Millisecond);"), "{out}");
+        assert!(!out.contains("exec.Command(\"sleep\""), "{out}");
+        // a statically-known variable folds into the same native sleep
+        let out = render("d=3\nsleep \"$d\"\n");
+        assert!(out.contains("time.Sleep(3 * time.Second);"), "{out}");
+        // a non-static interval keeps the fork
+        let out = render("read d\nsleep \"$d\"\n");
+        assert!(out.contains("exec.Command(\"sleep\""), "{out}");
+    }
+
+    #[test]
+    fn read_into_untyped_var_compiles() {
+        // `readInto` takes `...*string`; an unannotated var hoists as `any`,
+        // so passing its address produced *any and the render did not build.
+        let out = render("read -r line\necho \"got $line\"\n");
+        assert!(out.contains("var line any"), "{out}");
+        assert!(!out.contains("readInto(&line)"), "{out}");
+        assert!(out.contains("line = __rvt"), "{out}");
+    }
 }
 
 #[cfg(test)]
@@ -14391,6 +15077,26 @@ mod extglob_tests {
     fn test_op_split() {
         let toks = test_tokens("$f1==!(*.min).js").unwrap();
         assert_eq!(toks, vec!["$f1", "==", "!(*.min).js"], "{toks:?}");
+    }
+
+    #[test]
+    fn sleep_operand_grammar() {
+        assert_eq!(sleep_ns("1"), Some(1_000_000_000));
+        assert_eq!(sleep_ns("1s"), Some(1_000_000_000));
+        assert_eq!(sleep_ns("2m"), Some(120_000_000_000));
+        assert_eq!(sleep_ns("1h"), Some(3_600_000_000_000));
+        assert_eq!(sleep_ns("0.1"), Some(100_000_000));
+        assert_eq!(sleep_ns("0.01"), Some(10_000_000));
+        assert_eq!(sleep_ns("1.5s"), Some(1_500_000_000));
+        // GNU accepts `inf`/`nan` and suffixes on the *interval*, but neither
+        // has a static Go duration — the fork stays.
+        assert_eq!(sleep_ns("inf"), None);
+        assert_eq!(sleep_ns("nan"), None);
+        assert_eq!(sleep_ns("1x"), None);
+        assert_eq!(sleep_ns(""), None);
+        assert_eq!(sleep_ns("."), None);
+        assert_eq!(sleep_ns("1."), None);
+        assert_eq!(sleep_ns(".5"), None);
     }
 }
 
