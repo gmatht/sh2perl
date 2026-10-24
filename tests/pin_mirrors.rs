@@ -10,6 +10,7 @@
 
 use debashl::ir::{AsmSpec, AssignTarget, Decl, IrExpr, IrStmt, StrStyle, optimize_stmts};
 use debashl::transforms::dead_store_elim;
+use debashl::transforms::redundant_store_elim;
 
 // ---- shared builders (plain scalar shapes only — the modeled class) ----
 
@@ -204,4 +205,79 @@ fn pin_dynamic_write_freezes_all() {
         "dynamic write freezes the transform (early return, nothing removed)"
     );
     assert_eq!(prog.len(), 2, "even the dead store survives the freeze");
+}
+
+// ---- redundant_store_elim (model: proofs/verus/redundant_store_elim.rs) ----
+//
+// The three bug-scenario pins (side-effecting arith RHS, index read,
+// Str-embedded `$x`) already live as regression tests in the transform's
+// own `tests` module (they were the failing-first repros of the fix).
+// Mirrored here are the model pins with NO in-module coverage: the
+// cascade and the pure-observer stop. Builders below extend the shared
+// scalar shapes with indexed targets and observer statements.
+
+fn assign_idx(arr: &str, idx: IrExpr, rhs: IrExpr) -> IrStmt {
+    IrStmt::Assign {
+        targets: vec![AssignTarget {
+            var: arr.to_string(),
+            sigil: None,
+            indices: vec![idx],
+        }],
+        expr: rhs,
+        asm: None,
+    }
+}
+
+/// Pin `pin_cascade_drops`: `x=1; x=2; x=3` drops the first two stores —
+/// each is overwritten by a later scalar store with a clean middle.
+#[test]
+fn pin_rse_cascade_drops_first_two() {
+    let mut prog = vec![
+        assign("x", int_(5)),
+        assign("x", int_(6)),
+        assign("x", int_(7)),
+    ];
+    assert!(
+        redundant_store_elim::transform(&mut prog),
+        "cascading overwrites must drop"
+    );
+    assert_eq!(prog.len(), 1, "only the last store survives");
+    assert_eq!(prog[0], assign("x", int_(7)));
+}
+
+/// Pin `pin_observer_keeps`: `x=5; <call>; x=6` keeps the head — a call
+/// is an indirect observer, so no justifier is clean.
+#[test]
+fn pin_rse_observer_stops_scan() {
+    let mut prog = vec![
+        assign("x", int_(5)),
+        IrStmt::Expr(IrExpr::Call {
+            func: "exec".to_string(),
+            args: vec![str_("echo"), str_("hi")],
+        }),
+        assign("x", int_(6)),
+    ];
+    assert!(
+        !redundant_store_elim::transform(&mut prog),
+        "indirect observer between the stores: nothing removed"
+    );
+    assert_eq!(prog.len(), 3, "all three statements survive");
+}
+
+/// Pin `pin_bug2_idx_read_keeps` (mirror of the in-module
+/// `keeps_store_read_via_assign_target_index`): `x=5; arr[x]=1; x=6`
+/// keeps all three — the middle store's target index reads `x`.
+#[test]
+fn pin_rse_index_read_keeps_head() {
+    let mut prog = vec![
+        assign("x", int_(5)),
+        assign_idx("arr", var_("x"), int_(1)),
+        assign("x", int_(6)),
+    ];
+    assert!(
+        !redundant_store_elim::transform(&mut prog),
+        "index read observes the earlier store"
+    );
+    assert_eq!(prog.len(), 3, "all three statements survive");
+    assert_eq!(prog[0], assign("x", int_(5)));
 }

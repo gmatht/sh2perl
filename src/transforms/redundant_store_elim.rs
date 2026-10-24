@@ -106,7 +106,11 @@ fn expr_pure(e: &IrExpr) -> bool {
     match e {
         IrExpr::Int(_) | IrExpr::Var(_, _) | IrExpr::Str(_, _) | IrExpr::Range { .. } | IrExpr::Bool(_) => true,
         IrExpr::BinOp { lhs, rhs, .. } => expr_pure(lhs) && expr_pure(rhs),
-        IrExpr::Arith(_) => true,
+        // Arithmetic is pure ONLY when it performs no assignment: an
+        // `Assign`/`IncDec` node mutates its variable (the value AND the
+        // side effect would both be lost if the store were dropped).
+        // Same rule as dead_store_elim's `arith_pure`.
+        IrExpr::Arith(a) => arith_pure(a),
         IrExpr::Interpolate(parts) => parts.iter().all(|p| match p {
             crate::ir::InterpPart::Lit(_) => true,
             crate::ir::InterpPart::Expr(x) => expr_pure(x),
@@ -115,9 +119,35 @@ fn expr_pure(e: &IrExpr) -> bool {
     }
 }
 
+/// Whether an arithmetic tree is free of assignments (mirrors
+/// dead_store_elim's `arith_pure`: `Assign`/`IncDec` mutate state).
+fn arith_pure(a: &crate::ir::ArithAst) -> bool {
+    match a {
+        crate::ir::ArithAst::Num(_)
+        | crate::ir::ArithAst::Var(_)
+        | crate::ir::ArithAst::Ident(_)
+        | crate::ir::ArithAst::Sizeof(_) => true,
+        crate::ir::ArithAst::Index { key, .. } => arith_pure(key),
+        crate::ir::ArithAst::Bin { lhs, rhs, .. } => arith_pure(lhs) && arith_pure(rhs),
+        crate::ir::ArithAst::Un { arg, .. } => arith_pure(arg),
+        crate::ir::ArithAst::Cond { test, then, else_, .. } => {
+            arith_pure(test) && arith_pure(then) && arith_pure(else_)
+        }
+        crate::ir::ArithAst::Cast { arg, .. } => arith_pure(arg),
+        crate::ir::ArithAst::Assign { .. } | crate::ir::ArithAst::IncDec { .. } => false,
+    }
+}
+
 fn stmt_reads(st: &IrStmt, var: &str) -> bool {
     match st {
-        IrStmt::Assign { expr, .. } => expr_reads(expr, var),
+        // An indexed store (`arr[x]=…`) READS its index expressions, so
+        // a var used only there still observes an earlier store of it.
+        IrStmt::Assign { targets, expr, .. } => {
+            expr_reads(expr, var)
+                || targets
+                    .iter()
+                    .any(|t| t.indices.iter().any(|k| expr_reads(k, var)))
+        }
         IrStmt::Output { value, .. } => expr_reads(value, var),
         IrStmt::WriteFile { path, content, .. } => expr_reads(path, var) || expr_reads(content, var),
         IrStmt::Declare { init, .. } => init.as_ref().map(|i| expr_reads(i, var)).unwrap_or(false),
@@ -174,6 +204,16 @@ fn expr_reads(e: &IrExpr, var: &str) -> bool {
             call_reads_var(func, args, var)
                 || assign_rmw_reads(func, args, var)
                 || args.iter().any(|a| expr_reads(a, var))
+                // A `$name` reference inside ANY string argument is a
+                // read — `eval 'echo $x'` carries its variable inside a
+                // plain Str node, invisible to the walk above. Without
+                // this, `x=1; y=$(eval 'echo $x'); x=2` dropped `x=1`
+                // and the eval read the overwritten value. Mirrors
+                // dead_store_elim's `string_read_names`.
+                || args.iter().any(|a| match a {
+                    IrExpr::Str(s, _) => str_reads_var(s, var),
+                    _ => false,
+                })
         }
         IrExpr::MethodCall { obj, args, .. } => expr_reads(obj, var) || args.iter().any(|a| expr_reads(a, var)),
         IrExpr::Ternary { cond, then, else_, .. } => {
@@ -188,6 +228,11 @@ fn expr_reads(e: &IrExpr, var: &str) -> bool {
         IrExpr::Arrow(body) => body.iter().any(|s| stmt_reads(s, var)),
         IrExpr::Array(elems) => elems.iter().any(|e| expr_reads(e, var)),
         IrExpr::Object(fields) => fields.iter().any(|(_, e)| expr_reads(e, var)),
+        // A bare Str node can carry `$name` references too — the heredoc
+        // target (`cat << EOF` with `Hello $name`) arrives as a Str with
+        // interpolate:true, not a Call arg, so the scan above never sees
+        // it. Mirrors dead_store_elim's Str arm (079_heredoc case).
+        IrExpr::Str(s, _) => str_reads_var(s, var),
         _ => false,
     }
 }
@@ -245,6 +290,48 @@ fn call_reads_var(func: &str, args: &[IrExpr], var: &str) -> bool {
             IrExpr::Str(s, _) => str_maybe_reads(s, var),
             _ => false,
         });
+    }
+    false
+}
+
+/// Does the string reference `var` as a `$name` / `${name}` expansion?
+/// Predicate twin of dead_store_elim's `string_read_names` (which fills
+/// a set; here the scan answers for one variable): records the name even
+/// when the `}` is missing or delayed by expansion operators
+/// (`${x:-d}`, `${MAXWAIT% *}`).
+fn str_reads_var(s: &str, var: &str) -> bool {
+    if var.is_empty() {
+        return false;
+    }
+    let bytes = s.as_bytes();
+    let vb = var.as_bytes();
+    let mut i = 0;
+    while i < bytes.len() {
+        if bytes[i] != b'$' || i + 1 >= bytes.len() {
+            i += 1;
+            continue;
+        }
+        let mut j = i + 1;
+        if bytes[j] == b'{' {
+            j += 1;
+            // `${#name}` / `${!name}` prefix operators
+            if j < bytes.len() && (bytes[j] == b'#' || bytes[j] == b'!') {
+                j += 1;
+            }
+        }
+        let start = j;
+        while j < bytes.len() && (bytes[j].is_ascii_alphanumeric() || bytes[j] == b'_') {
+            j += 1;
+        }
+        if j > start
+            && (bytes[start].is_ascii_alphabetic() || bytes[start] == b'_')
+            && &bytes[start..j] == vb
+        {
+            return true;
+        }
+        // No match at this `$`: advance past it (not past j — a `$` inside
+        // the scanned run, e.g. `$x$y`, must be re-examined as an anchor).
+        i += 1;
     }
     false
 }
@@ -455,5 +542,110 @@ mod tests {
         let mut plain = vec![assign("n", str_lit("1")), assign("n", str_lit("2"))];
         assert!(transform(&mut plain));
         assert_eq!(plain.len(), 1);
+    }
+
+    /// Bug 1 (verus-rse): `x=$((i++)); x=<later>` — an arith RHS with a
+    /// side effect (`Assign`/`IncDec`) is NOT pure, so the earlier store
+    /// must not be dropped: dropping it skips the increment and every
+    /// later read of `i` sees the wrong value. `expr_pure` claimed
+    /// `Arith(_) => true`; dead_store_elim's `arith_pure` correctly
+    /// rejects `Assign`/`IncDec`.
+    #[test]
+    fn keeps_store_with_side_effecting_arith_rhs() {
+        let incdec = |var: &str| {
+            IrExpr::Arith(Box::new(crate::ir::ArithAst::IncDec {
+                var: var.to_string(),
+                delta: 1,
+                prefix: false,
+            }))
+        };
+        // `x=$((i++)); x=6` — dropping `x=$((i++))` would skip the
+        // increment of i. The store must survive (it is impure).
+        let mut stmts = vec![assign("x", incdec("i")), assign("x", int_lit(6))];
+        assert!(
+            !transform(&mut stmts),
+            "a side-effecting arith RHS is not a droppable pure store"
+        );
+        assert_eq!(stmts.len(), 2);
+
+        // Control: `$((i + 1))` (no Assign/IncDec) IS pure and still drops.
+        let pure_arith = IrExpr::Arith(Box::new(crate::ir::ArithAst::Bin {
+            op: "+".to_string(),
+            lhs: Box::new(crate::ir::ArithAst::Var("i".to_string())),
+            rhs: Box::new(crate::ir::ArithAst::Num(1)),
+        }));
+        let mut pure = vec![assign("x", pure_arith), assign("x", int_lit(6))];
+        assert!(transform(&mut pure));
+        assert_eq!(pure.len(), 1);
+    }
+
+    /// Bug 2 (verus-rse): `x=5; arr[x]=1; x=6` — the middle store's    /// TARGET INDEX reads `x`, so the earlier store is observed and must
+    /// survive. `stmt_reads` on `Assign` checked only the RHS and missed
+    /// target indices, dropping `x=5` and indexing `arr` by the unset
+    /// (empty) value instead.
+    #[test]
+    fn keeps_store_read_via_assign_target_index() {
+        let indexed_assign = |arr: &str, idx: IrExpr, rhs: IrExpr| IrStmt::Assign {
+            targets: vec![AssignTarget {
+                var: arr.to_string(),
+                sigil: None,
+                indices: vec![idx],
+            }],
+            expr: rhs,
+            asm: None,
+        };
+        let mut stmts = vec![
+            assign("x", int_lit(5)),
+            indexed_assign(
+                "arr",
+                IrExpr::Var("x".to_string(), None),
+                int_lit(1),
+            ),
+            assign("x", int_lit(6)),
+        ];
+        assert!(
+            !transform(&mut stmts),
+            "the index read of x observes the earlier store"
+        );
+        assert_eq!(stmts.len(), 3);
+        assert_eq!(stmts[0], assign("x", int_lit(5)));
+    }
+
+    /// Bug 3 (verus-rse): `x=1; y=$(eval 'echo $x'); x=2` — the `$x`
+    /// inside the eval's plain-Str argument is a read of `x`, so the
+    /// earlier store is observed and must survive. The Call-arm walk
+    /// never looked inside Str nodes (only `arith`/`test`/`caseMatch`
+    /// strings were scanned), and an `Assign` is never an indirect
+    /// observer, so the scan sailed past the capture and dropped `x=1`.
+    /// Mirrors dead_store_elim's `string_read_names`.
+    #[test]
+    fn keeps_store_read_via_str_arg_of_call() {
+        let eval_call = IrExpr::Call {
+            func: "builtin".to_string(),
+            args: vec![str_lit("eval"), str_lit("echo $x")],
+        };
+        let cap = IrExpr::Capture {
+            expr: Box::new(eval_call),
+            native: false,
+        };
+        let mut stmts = vec![
+            assign("x", str_lit("1")),
+            assign("y", cap),
+            assign("x", str_lit("2")),
+        ];
+        assert!(
+            !transform(&mut stmts),
+            "the $x inside the eval string observes the earlier store"
+        );
+        assert_eq!(stmts.len(), 3);
+        assert_eq!(stmts[0], assign("x", str_lit("1")));
+
+        // Unit pins for the scanner itself.
+        assert!(super::str_reads_var("echo $x", "x"));
+        assert!(super::str_reads_var("echo ${x}", "x"));
+        assert!(super::str_reads_var("echo ${x:-d}", "x"));
+        assert!(super::str_reads_var("$x$y", "y"));
+        assert!(!super::str_reads_var("echo hi", "x"));
+        assert!(!super::str_reads_var("echo $xy", "x"));
     }
 }
