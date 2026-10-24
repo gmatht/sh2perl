@@ -1,0 +1,6 @@
+session TextOps = HOL +
+  options [quick_and_dirty = false]
+  theories
+    ShIR_TextOps_Base
+    ShIR_TextOps_Strip
+    ShIR_TextOps_SortUniq
