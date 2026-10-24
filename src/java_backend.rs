@@ -1385,6 +1385,24 @@ impl JavaRender {
     /// emits for a C-style `for` condition) and `(( EXPR ))` parse with the
     /// native arithmetic parser, so the test runs in-process against the
     /// java fields — a bash child would never see them.
+    /// `let EXPR…` condition WITHOUT recursion: the join/strip/parse
+    /// shared with arith_cond_bool, but falling back to Err (never to
+    /// cond_bool) so a `let` in COND position cannot re-enter cond_bool and
+    /// consume the stack (cond_bool's exec arm calls HERE, not
+    /// arith_cond_bool).
+    fn arith_let_bool(&mut self, args: &[IrExpr]) -> Result<String, String> {
+        let words: Vec<String> = args.iter().skip(1)
+            .flat_map(|a| flatten_words(std::slice::from_ref(a)))
+            .filter_map(|w| match w { IrExpr::Str(t, _) => Some(t.clone()), _ => None })
+            .collect();
+        let text: String = words.join(" ").chars().filter(|c| *c != '$').collect();
+        if let Some(ast) = crate::shir::parse_arith_native(&text) {
+            let e = self.arith(&ast)?;
+            return Ok(format!("({e}) != 0"));
+        }
+        Err("let not native-parseable".into())
+    }
+
     fn arith_cond_bool(&mut self, cond: &IrExpr) -> Result<String, String> {
         if let IrExpr::Call { func, args, .. } = cond {
             if func == "builtin" || func == "exec" {
@@ -3646,11 +3664,11 @@ impl JavaRender {
             IrExpr::Call { func, args, .. } if func == "exec" || func == "builtin" => {
                 // `let`-style arithmetics test NATIVELY (in-process fields):
                 // a child `let "$n == 5"` never sees the java fields.
-                // ONLY for an actual `let`: unconditional delegation
-                // recursed cond_bool -> arith_cond_bool -> cond_bool ...
-                // until the stack blew (29 corpus files).
+                // ONLY for an actual `let`, via a NON-RECURSIVE helper:
+                // routing back through arith_cond_bool re-entered cond_bool
+                // and blew the stack on every `let` (29 corpus files).
                 if matches!(args.first(), Some(IrExpr::Str(c, _)) if c == "let") {
-                    if let Ok(c) = self.arith_cond_bool(&IrExpr::Call { func: func.clone(), args: args.clone() }) {
+                    if let Ok(c) = self.arith_let_bool(args) {
                         return Ok(c);
                     }
                 }
@@ -3911,16 +3929,12 @@ impl JavaRender {
             // "zsh"). Decide it in-process from the set ledger instead.
             TestTok::S(x) if Self::param_default_word(x).is_some() => {
                 let n = Self::param_default_word(x).unwrap();
-                let _ = format!("PDhit {x:?}->{n}");
                 // (in-process set-ness test: see param_default_word)
-                std::io::Write::write_all(&mut std::io::stderr(), format!("PDhit {x:?}->{n}\n").as_bytes()).ok();
                 self.helper("envset");
                 let v = self.getvar_str(&n).unwrap_or_else(|_| "\"\"".to_string());
                 format!("((!{v}.isEmpty()) ? \"1\" : \"\")")
             }
             TestTok::S(x) if x.contains('$') => {
-                let _ = format!("DOLLAR {x:?}");
-                std::io::Write::write_all(&mut std::io::stderr(), format!("DOLhit {x:?}\n").as_bytes()).ok();
                 // A word the CHILD must expand (`"${ZSH_VERSION-}"`,
                 // `${#array[@]}>5`): bash needs it DOUBLE-QUOTED so it stays
                 // ONE word (an unquoted `$x>5` is a redirect!). The quoting
