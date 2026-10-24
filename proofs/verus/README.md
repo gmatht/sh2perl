@@ -119,3 +119,72 @@ Same toolchain as above:
 
     RUSTUP_HOME=/root/.rustup CARGO_HOME=/root/.cargo \
       /path/to/verus-x86-linux/verus --triggers-mode silent --rlimit 40 proofs/verus/optimize_stmts.rs
+
+---
+
+# Verus proof of `dead-fn-elim` (dead-function elimination)
+
+STATUS: **checked.** Verus `0.2026.10.18.7d82994`, rust toolchain
+1.99.1:
+
+    verus --triggers-mode silent --rlimit 40 dead_fn_elim.rs
+    -> verification results:: 25 verified, 0 errors
+
+## What is proved
+
+`dead_fn_elim.rs` is a standalone model of
+`src/transforms/dead_fn_elim.rs` (Passes 1–4: defined names, the
+literal census with def names excluded, per-name removal, nested
+pruning): interned names, def/call/other statements, the keep rule
+(a def survives iff its name occurs as a literal anywhere), and
+
+    proof fn elim_sound(p: Seq<Stmt>, keep_all: bool, fuel: int)
+      requires fuel >= 0,
+      ensures run_prog(elim(p, keep_all), fuel) == run_prog(p, fuel),
+
+i.e. elimination preserves the call trace (all invocations, externals
+included) at every fuel bound — hence for the unbounded runs the fuel
+approximates. Execution is a worklist dispatch with first-def-wins
+lookup; an undefined callee emits and stops (the shell's external-exec
+fallback). The `KEEP_VARIABLES` hatch is a bool parameter (set =
+identity). Supporting lemmas: `find_body_kept` (lookup agrees after
+elimination for every referenced name), `exec_calls_same` (any
+all-referenced worklist runs identically), `top_calls_elim` (top-level
+calls unchanged), `body_calls_ref` (a found body mentions only the
+program's literals), plus `*_step`/`*_skip`/`*_hit` unfold lemmas and
+`elim_pins` (the fidelity pins — see below).
+
+## It can fail (checked)
+
+Inverting the keep rule (dropping *referenced* functions instead of
+unreferenced ones) makes the same command report **23 verified,
+2 errors** — the obligation is not vacuous. The file was restored and
+re-checked at **25 verified, 0 errors**.
+
+## Scope (read this before quoting it)
+
+- It is a proof about a MODEL: `dead_fn_elim.rs` duplicates the
+  transform by hand. Nothing ties the model to the Rust source, so the
+  two can drift — the same caveat as the files above.
+- NOT modelled: `InterpPart::Lit` runs. The real `collect_expr_strs`
+  skips `Lit` fragments, so a function referenced ONLY through a
+  concatenated literal is dropped by the real code but kept by this
+  model — the model is conservative (its keep-set is a superset of the
+  real one) and the proof covers every drop the model makes.
+  Lit-fragment-only drops are out of scope (flagged, not proved).
+- `find_body` is first-def-wins; bash uses last-def. Either rule is
+  preserved by per-name uniform removal, and both sides of the theorem
+  use the same rule — but this is an elim-preservation theorem, not a
+  bash-equivalence one.
+- Fuel bounds recursion in the spec (Verus needs structural
+  termination); the theorem holds for ALL fuel values.
+- Fidelity pins (`elim_pins`, mirroring `dead_fn_elim.rs`'s own
+  tests): an uncalled fn is removed; a called or indirectly-referenced
+  fn is kept.
+
+## Running it
+
+Same toolchain as above:
+
+    RUSTUP_HOME=/root/.rustup CARGO_HOME=/root/.cargo \
+      /path/to/verus-x86-linux/verus --triggers-mode silent --rlimit 40 proofs/verus/dead_fn_elim.rs
