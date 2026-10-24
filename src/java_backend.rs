@@ -1394,7 +1394,11 @@ impl JavaRender {
                             .flat_map(|a| flatten_words(std::slice::from_ref(a)))
                             .filter_map(|w| match w { IrExpr::Str(t, _) => Some(t.clone()), _ => None })
                             .collect();
-                        let text = words.join(" ");
+                        let raw = words.join(" ");
+                        let text: String = raw.chars().filter(|c| *c != '$').collect();
+                        // (same `$`-strip as the Assign{arith} arm: the native
+                        // parser takes bare names, and bash substitutes
+                        // canonical ints for $refs anyway)
                         if let Some(ast) = crate::shir::parse_arith_native(&text) {
                             let e = self.arith(&ast)?;
                             return Ok(format!("({e}) != 0"));
@@ -2245,6 +2249,11 @@ impl JavaRender {
                     // stdin, not the redirect) so stdin-fed loops read EOF
                     // and printed nothing (088/091).
                     None => {
+                        // single-command cond: route through the read-aware
+                        // text renderer (while_read_parts + whileloop_text).
+                        // Falling to stage_expr_native ran `read` against
+                        // __SH_IN (the PARENT's stdin, not the redirect),
+                        // so stdin-fed loops read EOF and printed nothing.
                         if let Some((c, b)) = Self::while_read_parts(args) {
                             let one = IrStmt::Expr(c.clone());
                             if let Ok(t) = self.whileloop_text(std::slice::from_ref(&one), b) {
@@ -2253,7 +2262,6 @@ impl JavaRender {
                         }
                         self.stage_expr_native(stage)
                     }
-                    None => self.stage_expr_native(stage),
                 }
             }
             [IrStmt::Exec { cmd, args, capture: None, redirects, env }] if redirects.is_empty() && env.is_empty() => {
@@ -2905,7 +2913,8 @@ impl JavaRender {
                     self.block_close();
                     return Ok(());
                 }
-                let cond = if matches!(lhs.as_ref(), IrExpr::Call { func, .. } if func == "test")
+                let cond = if matches!(lhs.as_ref(), IrExpr::BinOp { ref op, .. } if matches!(op, BinOpKind::Not | BinOpKind::Ne | BinOpKind::Eq | BinOpKind::Lt | BinOpKind::Gt | BinOpKind::Le | BinOpKind::Ge))
+                    || matches!(lhs.as_ref(), IrExpr::Call { func, .. } if func == "test")
                     || matches!(lhs.as_ref(), IrExpr::Str(..))
                     || matches!(lhs.as_ref(),
                         IrExpr::Call { func, args, .. }
@@ -2937,6 +2946,15 @@ impl JavaRender {
                         self.block_close();
                     }
                 }
+                Ok(())
+            }
+            IrExpr::BinOp { .. } => {
+                // a bare comparison / negation / chain as a STATEMENT: it
+                // records its status and nothing else. The generic
+                // expr_str arm below emits the VALUE and drops the status,
+                // so `[ $i = 2 ] || continue` never continued (or-continue).
+                let c = self.cond_bool(e)?;
+                self.emit(&format!("__SH_RC = ({c}) ? 0 : 1;"));
                 Ok(())
             }
             other => {
@@ -3629,6 +3647,11 @@ impl JavaRender {
                 Ok(format!("shTestRc({b})"))
             }
             IrExpr::Call { func, args, .. } if func == "exec" || func == "builtin" => {
+                // `let`-style arithmetics test NATIVELY (in-process fields):
+                // a child `let "$n == 5"` never sees the java fields
+                if let Ok(c) = self.arith_cond_bool(&IrExpr::Call { func: func.clone(), args: args.clone() }) {
+                    return Ok(c);
+                }
                 self.command_cond(args)
             }
             IrExpr::Call { func, args, .. } if func == "getVar" => {
