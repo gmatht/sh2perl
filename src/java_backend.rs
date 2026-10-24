@@ -1416,9 +1416,6 @@ impl JavaRender {
                 }
             }
         }
-        if let Some(ast) = crate::shir::parse_arith_native(&format!("{cond:?}")) {
-            let _ = ast;
-        }
         self.cond_bool(cond)
     }
 
@@ -3648,9 +3645,14 @@ impl JavaRender {
             }
             IrExpr::Call { func, args, .. } if func == "exec" || func == "builtin" => {
                 // `let`-style arithmetics test NATIVELY (in-process fields):
-                // a child `let "$n == 5"` never sees the java fields
-                if let Ok(c) = self.arith_cond_bool(&IrExpr::Call { func: func.clone(), args: args.clone() }) {
-                    return Ok(c);
+                // a child `let "$n == 5"` never sees the java fields.
+                // ONLY for an actual `let`: unconditional delegation
+                // recursed cond_bool -> arith_cond_bool -> cond_bool ...
+                // until the stack blew (29 corpus files).
+                if matches!(args.first(), Some(IrExpr::Str(c, _)) if c == "let") {
+                    if let Ok(c) = self.arith_cond_bool(&IrExpr::Call { func: func.clone(), args: args.clone() }) {
+                        return Ok(c);
+                    }
                 }
                 self.command_cond(args)
             }
