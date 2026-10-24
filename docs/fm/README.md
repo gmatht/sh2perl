@@ -27,7 +27,7 @@ node contract — "this node means this value, in every renderer" — lives.
 | The ASCII guard is neither vacuous nor a loss | `ascii_bytes_is_strlen`, `non_ascii_bytes_refused`, `utf8_e_acute_refused` | `wc -c` counts bytes, `StrLen` renderers count codepoints; the reduction fires exactly where they agree. |
 | The word count matches the shell at its edges | `words_*` (8 lemmas) | empty, single word, leading/trailing/doubled whitespace, newline as separator, all-whitespace. |
 | The strip keeps no leading newline | `rev_drop_last_nl_keep`, `rev_drop_last_nl_all_nl` | command substitution removes the trailing run; a surviving strip never starts with one, and a strip of nothing but newlines is empty. |
-| …and strips the WHOLE run, not one newline | `rev_drop_last_nl_idem` | chomp-one vs strip-all: a second strip changes nothing. |
+| …and strips the WHOLE run, not one newline | `rev_drop_last_nl_idem` (via `arg_cong_nl`) | chomp-one vs strip-all: a second strip changes nothing. |
 | `sort` loses no line | `insert_length`, `isort_length` | the ordering step is a permutation of its input. |
 | `uniq -c` counts every line exactly once | `run_count_total` | the printed run lengths sum to the number of input lines. |
 
@@ -55,9 +55,10 @@ These are written out where they belong and left as explicit open targets —
 never faked with `sorry` (the session is `quick_and_dirty = false`):
 
 - **`rev_drop_last_nl_prefix`** (`ShIR_TextOps_Strip`): the bytes the strip
-  keeps are a prefix of the input. The induction step needs "a newline at
-  the head of a non-empty strip survives", which no tactic tried discharges
-  in this build (see the box-health note below).
+  keeps are a prefix of the input. Everything reduces to one step —
+  `a # ((z # zs) @ w) = z # (zs @ (a # w))` with `a = 10` in scope, i.e.
+  associativity of `@` under a hypothesis — which no tactic in this build
+  discharges (see the box-health note below).
 - **`sorted_insert` / `isort_sorted`** (`ShIR_TextOps_SortUniq`): the model
   sort's output is ordered and stable.
 - **`drop_runs_idem` / `drop_runs_no_adjacent_eq`**, and hence
@@ -66,14 +67,29 @@ never faked with `sorry` (the session is `quick_and_dirty = false`):
 
 ## Box-health note (why the proofs look odd in places)
 
-On this box a fresh `HOL` session cannot discharge
-`(xs :: nat list) @ [] = xs` with `by simp`, while the same lemma closes
-inside `TextOps`. `rule refl`, `rule append_Cons` and `simp` also fail on
-`((a # x) @ y) = a # (x @ y)` from a *non-variable* left-hand side. The
-cause is undiagnosed; the workaround used throughout is to state the
-helper as an equation in the induction variables and close it with an
-explicit `cases`, which is why some proofs below are longer than they
-"should" be. Each such spot is commented in the theory.
+Narrowing the failure took a while; the reproducible rule is:
+
+**a lemma whose conclusion rewrites a non-variable `a # (x @ y)`, while a
+hypothesis `a = 10` is in scope, does not close** — `simp`, `rule refl`,
+`rule append_Cons` and `metis` all fail. The same lemma without the
+hypothesis closes immediately, and with the hypothesis it does not even
+typecheck as a standalone statement (`Clash of types "nat" and "_ list"`).
+`simp+` on one such step ran for 233 s before being killed. This is the
+one step left in `rev_drop_last_nl_prefix`.
+
+What works, and is used throughout:
+
+- state the helper as an equation in the induction variables and close it
+  by an explicit `cases` on the list, never by `simp` on a cons/append shape;
+- prove the congruence you need once (see `arg_cong_nl`) rather than
+  rewriting under the function inside each induction step;
+- fetch an induction hypothesis with `by assumption` (or `Cons(1)` plus
+  `..`) — `using Cons(1) by simp` frequently fails here.
+
+`rev_drop_last_nl_idem` was blocked for hours until those three rules were
+applied; it now goes through with no `simp` on a cons/append shape at all.
+This is a tooling defect, not a modelling one: worth reporting upstream
+with the `a = 10` repro, and worth remembering before blaming a definition.
 
 ## Where this should go next (not done here)
 
