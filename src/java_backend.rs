@@ -379,6 +379,11 @@ impl JavaRender {
                 self.emit(&format!("__SH_RC = shRunEval({});", jstr(&b)));
             }
         }
+        // JOIN every forked background job before exiting: bash's `wait`
+        // semantics, and it also stops a job's snapshot-restore from racing
+        // the parent's final reads (105_background_copy_semantics flaked at
+        // high parallelism: x=2 instead of 1).
+        self.emit("for (Thread __t : __SH_BG) { try { __t.join(); } catch (InterruptedException __ie) { } }");
         self.emit("System.exit((int) __SH_RC);");
         self.block_close();
         // flush the main body before emitting function definitions
@@ -441,7 +446,8 @@ impl JavaRender {
         let mut header = String::from("    static long __SH_RC = 0;\n    static String __SH_T = \"\";\n    static String __v___mf = \"\";\n    static boolean __SH_NOCASE = false;
     static String __SH_CWD = System.getProperty(\"user.dir\");\n    static LinkedHashMap<String, String> __SH_EXPORTS = new LinkedHashMap<>();
     static LinkedHashMap<String, String> __SH_ENV = new LinkedHashMap<>();
-    static LinkedHashMap<String, String> __SH_SYNC = new LinkedHashMap<>();\n    static List<String> __SH_ARGV = new ArrayList<>();\n    static Scanner __SH_IN = new Scanner(System.in);\n");
+    static LinkedHashMap<String, String> __SH_SYNC = new LinkedHashMap<>();\n    static List<Thread> __SH_BG = java.util.Collections.synchronizedList(new ArrayList<>());
+    static List<String> __SH_ARGV = new ArrayList<>();\n    static Scanner __SH_IN = new Scanner(System.in);\n");
         // FORK SEMANTICS: every static here is shared by threads (a
         // background job) and mutated by subshells, while bash COPIES the
         // shell state at fork. shSnapshot/shRestore capture and restore the
@@ -983,6 +989,35 @@ impl JavaRender {
                 Ok(())
             }
             st @ IrStmt::Redirect { inner, redirects } => {
+                if inner.len() == 1 {
+                    if let IrStmt::Expr(IrExpr::Call { func, args, .. }) = &inner[0] {
+                        if (func == "exec" || func == "builtin")
+                            && matches!(args.first(), Some(IrExpr::Str(c, _)) if c == "mapfile" || c == "readarray")
+                        {
+                            // `mapfile -t arr < FILE`: the array fill is.java
+                            // STATE; run it NATIVE over the file (never a
+                            // child-shell group, which would fill the child's
+                            // own array — 041/mapfile printed a blank line).
+                            for r in redirects {
+                                if matches!(r.fd, Some(0) | None) && matches!(r.mode.as_str(), "r" | "r+") {
+                                    let t = self.expr_str(&r.target)?;
+                                    self.helper("inswap");
+                                    self.helper("readln");
+                                    self.emit(&format!("__a_lines = new ArrayList<>();"));
+                                    self.redir_seq += 1;
+                                    let v = format!("__oldIn{}", self.redir_seq);
+                                    self.emit(&format!("Scanner {v} = shSwapIn(new Scanner(new File(shAbs({t}))));"));
+                                    self.command(&[IrExpr::Str("mapfile".into(), crate::ir::StrStyle::DoubleQuoted)].into_iter().chain(
+                                        args[1..].iter().cloned()).collect::<Vec<_>>())?;
+                                    self.emit(&format!("shRestoreIn({v});"));
+                                    self.emit("__SH_RC = 0;");
+                                    self.flush_sync();
+                                    return Ok(());
+                                }
+                            }
+                        }
+                    }
+                }
                 // A lone command with a file redirect runs as a real child
                 // (`grep -v x f > /tmp/body`): an in-process PrintStream
                 // swap would be invisible to the command's own children.
@@ -993,6 +1028,32 @@ impl JavaRender {
                 // text renderer below), never part of the command line
                 let inner: Vec<IrStmt> = inner.iter().filter(|b| !matches!(b, IrStmt::Assign { .. })).cloned().collect();
                 let body = inner.len();
+                // A body that owns JAVA STATE (a mapfile `lines` fill) must
+                // run NATIVELY even when its only redirect is a plain file:
+                // a child-shell group would fill the child's own array and
+                // `${lines[@]}` printed a blank line in the parent
+                // (012_process_substitution, 041_mapfile). The `body == 1`
+                // fast path below required "not native", so such a group
+                // fell through to the whole-group text path.
+                //
+                // NOTE: `stdin_fed` (done < f, <<< x) against a mapfile
+                // body has TWO java-state paths: the in-process fd swaps
+                // below (scan Sh2Program.java for __oldIn) — those are the
+                // correct native render of `mapfile < /tmp/f`.
+                if Self::body_needs_native(&inner) && !stdin_fed && body == 1 {
+                    let st1 = match Self::java_state_stmt(&inner, redirects) {
+                        Some(js) => vec![js],
+                        None => vec![IrStmt::Redirect { inner: inner.clone(), redirects: redirects.to_vec() }],
+                    };
+                    let st1: &[IrStmt] = &st1;
+                    self.helper("run");
+                    if let Ok(t) = self.redirect_stage_text(st1) {
+                        self.emit(&format!("__SH_RC = shRun({t});"));
+                        self.flush_sync();
+                        return Ok(());
+                    }
+                    return self.redirect(&inner, redirects);
+                }
                 if body == 1 && !stdin_fed && !Self::body_needs_native(&inner) {
                     let inner = &inner[..];
                     // a bare compound (`{ …; } > f`, `( … ) > f`) keeps its
@@ -1223,6 +1284,7 @@ impl JavaRender {
                     l.push_str("} catch (Exception __e) { throw new RuntimeException(__e); } });");
                     self.out.push(l);
                 }
+                self.emit(&format!("__SH_BG.add({bg});"));
                 self.emit(&format!("{}.start();", bg));
                 self.emit("__SH_RC = 0;");
                 Ok(())
@@ -2101,14 +2163,12 @@ impl JavaRender {
                 let one = IrStmt::Expr((*cond).clone());
                 match self.whileloop_text(std::slice::from_ref(&one), body) {
                     Ok(t) => Ok(t),
-                    Err(_) => {
-                        // a NATIVE loop stage is run by the enclosing helper,
-                        // which owns the capture stream: just run it
-                        // (stage_expr_native_loop). Wrapping it in
-                        // `printf %s "$(…)"` here printed the capture back
-                        // into the same helper that produced it.
-                        self.stage_expr_native_loop(stage, &[])
-                    }
+                    // a NATIVE loop with java-state cond/streams must still
+                    // feed its TEXT to the pipe (not run in the stage helper,
+                    // whose stdin is not the redirect). The loop CONDITION
+                    // and reads are the only text blockers (a `read` there
+                    // reads __SH_IN at runtime — native IS right).
+                    Err(_) => self.stage_expr_native(stage),
                 }
             }
             [IrStmt::Expr(IrExpr::Call { func, args, .. })]
@@ -2142,6 +2202,13 @@ impl JavaRender {
                     _ => return Err("redirect without Arrow body".into()),
                 };
                 let redirects = Self::redirect_list(args.get(1))?;
+                // LOOP stage first (`while read …; done < /etc/passwd | head`):
+                // text, with the child's fd 0 on the redirect. Without this
+                // the stage fell through to the generic text/native paths,
+                // which read the WRONG stdin (091 printed nothing).
+                if let Some((t, tail)) = self.loop_stage_text(&IrStmt::Redirect { inner: body.clone(), redirects: redirects.clone() }) {
+                    return Ok(format!("\"{{ \" + {t} + \" ; }}\" + {tail} + \" \""));
+                }
                 let headless = body.iter().all(|b| matches!(b, IrStmt::Expr(IrExpr::Call { args, .. })
                     if str_arg(args, 0) == Some("cat")));
                 if headless {
@@ -2158,6 +2225,11 @@ impl JavaRender {
                 self.redirect_text_arms(&body, &redirects)
             }
             [IrStmt::Expr(IrExpr::Call { func, args, .. })] if func == "whileLoop" => {
+                // `while (read …)`: the frontend sometimes puts the read
+                // inside Expr(Call{block}) — unwrap to the actual text.
+                if let Some(t) = self.loop_stage_text(&IrStmt::Redirect { inner: vec![IrStmt::Expr(IrExpr::Call { func: func.clone(), args: args.clone() })], redirects: vec![] }) {
+                    return Ok(t.0);
+                }
                 match Self::whileloop_parts(args) {
                     // bash-text loop (the child shell reads stdin itself)
                     Some((c, b)) => match self.whileloop_text(c, b) {
@@ -2165,20 +2237,21 @@ impl JavaRender {
                         Err(_) => self.stage_expr_native(stage),
                     },
                     // `whileLoop(Call{builtin,[read …]}, Arrow(body))` — the
-                    // frontend's PIPE-FED form. It is NOT the same shape as
-                    // the two-arrow one (`while read …` in a pipeline has a
-                    // CONDITION STATEMENT, not a condition list), and it used
-                    // to fall into `other => stage_expr_native`, whose output
-                    // is discarded: with no pipeline the loop's captured bytes
-                    // had no sink, so `while read -r w; do echo "$w" | tr …;
-                    // done < f` printed NOTHING (java) where bash printed the
-                    // loop's output (084_while_pipeline). Wrapping the native
-                    // capture in `printf '%s' "$(…)"` reproduces bash's own
-                    // "run the loop, emit its stdout" semantics.
-                    None if Self::while_read_parts(args).is_some() => {
-                        let body = self.stage_expr_native(stage)?;
-                        self.helper("quote");
-                        Ok(format!("(shQuote(\"printf\") + \" \" + shQuote(\"%s\") + \" \" + shQuote({body}))"))
+                    // frontend's PIPE-FED form. The whole loop is bash TEXT
+                    // (the redirect ops come from the caller): the child's
+                    // `read` sees the loop's redirected fd 0, keeping
+                    // parent/child stdin identical to bash. The earlier
+                    // native form ran `read` against __SH_IN (the PARENT's
+                    // stdin, not the redirect) so stdin-fed loops read EOF
+                    // and printed nothing (088/091).
+                    None => {
+                        if let Some((c, b)) = Self::while_read_parts(args) {
+                            let one = IrStmt::Expr(c.clone());
+                            if let Ok(t) = self.whileloop_text(std::slice::from_ref(&one), b) {
+                                return Ok(t);
+                            }
+                        }
+                        self.stage_expr_native(stage)
                     }
                     None => self.stage_expr_native(stage),
                 }
@@ -2253,6 +2326,23 @@ impl JavaRender {
     /// A redirect-carrying stage as command text. Only file redirects and
     /// a plain/compound body are expressible; a stdin-fed loop needs the
     /// java input stream and is left to the native runner.
+    /// A single command/fragment as a stmt that writes JAVA STATE —
+    /// a `mapfile -t arr < F` redirect is a NATIVE assign (the array
+    /// field), not something a child shell's fd tricks can do. Returning a
+    /// Redirect statement here keeps the whole redirect NATIVE.
+    fn java_state_stmt(inner: &[IrStmt], redirects: &[IrRedirect]) -> Option<IrStmt> {
+        if inner.len() == 1 {
+            if let IrStmt::Expr(IrExpr::Call { func, args, .. }) = &inner[0] {
+                if (func == "exec" || func == "builtin")
+                    && matches!(args.first(), Some(IrExpr::Str(c, _)) if c == "mapfile" || c == "readarray")
+                {
+                    return Some(IrStmt::Redirect { inner: inner.to_vec(), redirects: redirects.to_vec() });
+                }
+            }
+        }
+        None
+    }
+
     fn redirect_stage_text(&mut self, stage: &[IrStmt]) -> Result<String, String> {
         // `while …; done < f | cmd` arrives as a block-wrapped redirect inside
         // the PIPE stage; its `[IrStmt::Block([Redirect{…}])]` form must reach
@@ -2371,6 +2461,10 @@ impl JavaRender {
                         let tg = self.expr_str(&r.target)?;
                         let op = match (r.fd, r.mode.as_str()) {
                             (Some(0), "r") | (Some(0), "r+") => "< ",
+                            // `<<<` herestring on a loop stage: bash text.
+                            // (missing arm made `<<<' heredoc-form loops
+                            // refuse the whole file)
+                            (Some(0), "herestring") => "<<< ",
                             (None, "w") | (Some(1), "w") | (Some(1), "wc") => "> ",
                             (None, "a") | (Some(1), "a") => ">> ",
                             (Some(2), "w") => "2> ",
@@ -2676,10 +2770,45 @@ impl JavaRender {
                     (Some(IrExpr::Arrow(c)), Some(IrExpr::Arrow(b))) => (c, b),
                     _ => return Err("whileLoop without cond/body arrows".into()),
                 };
-                // A single read/test cond runs NATIVELY (java-side vars
-                // update and swapped stdin is honored); anything else runs
-                // as bash text and only its status drives the loop.
-                let native_cond: Option<String> = match &cond_arrow[..] {
+                // A read/test COND STATEMENT runs NATIVELY ONLY in the
+                // stateless forms the native helper can answer correctly:
+                // a plain `read -r line` (one target, no IFS/-a) is
+                // deliberately REFUSED — its native helper consumed
+                // System.in instead of the loop's redirected fd 0, so
+                // stdin-fed loops read EOF and printed NOTHING (088/091).
+                // The TEXT arm renders the child's own `read`, whose fd 0
+                // IS the redirect. (Multi-target/IFS reads keep the native
+                // helper: the TEXT form cannot express field splitting.)
+                let is_plain_read = match &cond_arrow[..] {
+                    [IrStmt::Expr(IrExpr::Call { func, args, .. })]
+                        if (func == "exec" || func == "builtin")
+                            && str_arg(args, 0).map(|c| c == "read").unwrap_or(false) =>
+                    {
+                        let mut ifs = false;
+                        let mut names: Vec<String> = Vec::new();
+                        let mut array = false;
+                        for a in args.iter().skip(1) {
+                            let flat = flatten_words(std::slice::from_ref(a));
+                            for x in flat {
+                                match x {
+                                    IrExpr::Object(props) => {
+                                        for (k, v) in props.iter() {
+                                            if k == "IFS" { if let IrExpr::Str(t, _) = v { if !t.is_empty() { ifs = true; } } }
+                                        }
+                                    }
+                                    IrExpr::Str(t, _) if t.starts_with('-') => { if t == "-a" { array = true; } }
+                                    IrExpr::Str(t, _) => names.push(t.clone()),
+                                    _ => {}
+                                }
+                            }
+                        }
+                        !ifs && !array && names.len() <= 1
+                    }
+                    _ => false,
+                };
+                let native_cond: Option<String> = if is_plain_read {
+                    None
+                } else { match &cond_arrow[..] {
                     [IrStmt::Expr(IrExpr::Call { func, args, .. })]
                         if (func == "exec" || func == "builtin")
                             && str_arg(args, 0).map(|c| c == "read").unwrap_or(false) =>
@@ -2692,7 +2821,7 @@ impl JavaRender {
                         Some(format!("shTestRc({b})"))
                     }
                     _ => None,
-                };
+                }};
                 self.tmp_seq += 1;
                 let lb = format!("__lastBody{}", self.tmp_seq);
                 self.emit(&format!("long {lb} = __SH_RC;"));
@@ -2935,12 +3064,18 @@ impl JavaRender {
                     .ok_or("mapfile: no target var")?;
                 self.arrays.insert(sanitize(&target));
                 self.helper("readln");
-                self.emit(&format!("__a_{} = new ArrayList<>();", sanitize(&target)));
+                // an empty line VALUES as "" — `shReadln()` returns "" at
+                // EOF too (never null: scanning System.in cannot distinguish
+                // them), so the LOOP must break on the emptiness EOF-signal
+                // ITSELF: the old null-check never fired and `while (...)`
+                // spun on "" forever (012/041 timed out at the gate).
+                let tv = sanitize(&target);
+                self.emit(&format!("__a_{tv} = new ArrayList<>();"));
                 self.block_open("{");
+                self.block_open("while (true) {");
                 self.emit("__v___mf = shReadln();");
-                self.block_open("while (__v___mf != null) {");
-                self.emit(&format!("__a_{}.add(__v___mf);", sanitize(&target)));
-                self.emit("__v___mf = shReadln();");
+                self.emit("if (__v___mf.isEmpty()) break;");
+                self.emit(&format!("__a_{tv}.add(__v___mf);"));
                 self.block_close();
                 self.emit("}");
                 self.emit("__SH_RC = 0;");
@@ -3158,7 +3293,7 @@ impl JavaRender {
                     for (i, n) in names.iter().enumerate() {
                         self.emit(&format!("    __v_{} = __flds[{i}];", sanitize(n)));
                     }
-                    self.emit(&format!("    __SH_RC = (__line == null) ? 1 : 0;"));
+                    self.emit(&format!("    __SH_RC = (__line.isEmpty()) ? 1 : 0;"));
                     self.emit("}");
                 }
                 Ok(())
@@ -3544,6 +3679,38 @@ impl JavaRender {
                 Ok(format!("(shCd({d}) == 0)"))
             }
             "read" => {
+                // MULTI-TARGET structured reads (IFS=: / -a / several
+                // names) genuine need statements; but a PLAIN `read -r line`
+                // is PERFECT text: `cond_text` below turned it into the
+                // child's own `read`, whose fd 0 is the loop's redirect.
+                // Rendering it native ran it in the stage helper that had NO
+                // fd 0 — the loop read EOF and printed nothing (088/091 at
+                // the gate; 071 locally). Refuse here and let the TEXT arm
+                // win.
+                {
+                    let flat: Vec<&IrExpr> = rest.iter().flat_map(|e| match e {
+                        IrExpr::Array(xs) => xs.iter().collect::<Vec<_>>(),
+                        other => vec![other],
+                    }).collect();
+                    let mut ifs = false;
+                    let mut names: Vec<String> = Vec::new();
+                    let mut array = false;
+                    for x in flat.iter() {
+                        match x {
+                            IrExpr::Object(props) => {
+                                for (k, v) in props.iter() {
+                                    if k == "IFS" { if let IrExpr::Str(t, _) = v { if !t.is_empty() { ifs = true; } } }
+                                }
+                            }
+                            IrExpr::Str(t, _) if t.starts_with('-') => { if t == "-a" { array = true; } }
+                            IrExpr::Str(t, _) => names.push(t.clone()),
+                            _ => {}
+                        }
+                    }
+                    if !ifs && !array && names.len() <= 1 {
+                        return Err("plain read goes to text".into());
+                    }
+                }
                 // `read ... name...` in condition position also honors
                 // VAR=value prefixes (IFS=:) and multi-var splitting. A
                 // multi-target read needs STATEMENTS (split + assign), so
@@ -3575,7 +3742,7 @@ impl JavaRender {
                 self.helper("readln");
                 for n in names.iter() { self.ensure_field(n); }
                 if names.len() == 1 && ifs.is_none() {
-                    Ok(format!("((__v_{t} = shReadln()) != null)", t = sanitize(&target)))
+                    Ok(format!("(((__v_{t} = shReadln()) != null) && !__v_{t}.isEmpty())", t = sanitize(&target)))
                 } else {
                     self.helper("readsplit");
                     self.tmp_seq += 1;
@@ -3583,7 +3750,7 @@ impl JavaRender {
                     let dl = jstr(ifs.as_deref().unwrap_or(""));
                     let mut body = String::new();
                     body.push_str("        String __line = shReadln();\n");
-                    body.push_str("        if (__line == null) return false;\n");
+                    body.push_str("        if (__line.isEmpty()) return false;\n");
                     body.push_str(&format!("        String[] __flds = shReadSplit(__line, {dl}, {});\n", names.len()));
                     for (i, n) in names.iter().enumerate() {
                         body.push_str(&format!("        __v_{} = __flds[{i}];\n", sanitize(n)));
@@ -5085,7 +5252,31 @@ fn param_default_word(x: &str) -> Option<String> {
             // idiom for a set-ness check (variable-plus-operator).
             "+" | ":+" => {
                 let w = match args.get(2) {
-                    Some(IrExpr::Str(sv, _)) => jstr(&strip_quotes_once(sv)),
+                    Some(IrExpr::Str(sv, _)) => {
+                        let bare = strip_quotes_once(sv);
+                        if bare.starts_with("${") && bare.ends_with('}') {
+                            // nested ${X} as default TEXT: expand it now (the
+                            // lowering didn't). `${NAME}` with NAME unset
+                            // expands to EMPTY, not the literal text.
+                            let inner = &bare[2..bare.len()-1];
+                            let (nn, _op, _pat) = {
+                                let t = inner;
+                                match t.find(":-").or(t.find('-')) {
+                                    Some(p) => (t[..p].to_string(), String::new(), String::new()),
+                                    None => (t.to_string(), String::new(), String::new()),
+                                }
+                            };
+                            let ok = nn.chars().all(|c| c.is_ascii_alphanumeric() || c == '_');
+                            if ok && !nn.is_empty() {
+                                self.helper("envset");
+                                self.getvar_str(&nn)?
+                            } else {
+                                jstr(&bare)
+                            }
+                        } else {
+                            jstr(&bare)
+                        }
+                    }
                     Some(other) => self.expr_str(other)?,
                     None => jstr(""),
                 };
@@ -5105,13 +5296,68 @@ fn param_default_word(x: &str) -> Option<String> {
                 // keeps the source quotes: `Str("\"default\"")`). It is a
                 // bash WORD, so one wrapping quote pair is syntax, not data —
                 // `OPTS=${@:-"default"}` must expand to `default`.
+                //
+                // A default that is ITSELF `${NAME}` must be looked up for
+                // real when the outer var is unset: echoing the literal text
+                // `${NAME}` is a lazy-bash-readable bug (parameter-expansion-
+                // nested printed it; bash left the whole echo EMPTY because
+                // NAME is unset).
                 let d = match args.get(2) {
-                    Some(IrExpr::Str(sv, _)) => jstr(&strip_quotes_once(sv)),
+                    // a literal `${NAME}` default text: the LOOK-UP already
+                    // happened one node up (this node's default is a plain
+                    // Str in the lowered IR) — see below. This arm is for
+                    // the un-lowered `param` node shape.
+                    Some(IrExpr::Call { func, args: na, .. }) if func == "param" && na.len() >= 2 => {
+                        let nn = str_arg(na, 1).unwrap_or("").to_string();
+                        self.helper("envset");
+                        self.getvar_str(&nn)?
+                    }
+                    Some(IrExpr::Str(sv, _)) => {
+                        let bare = strip_quotes_once(sv);
+                        if bare.starts_with("${") && bare.ends_with('}') {
+                            // nested ${X} as default TEXT: expand it now (the
+                            // lowering didn't). `${NAME}` with NAME unset
+                            // expands to EMPTY, not the literal text.
+                            let inner = bare[2..bare.len() - 1].to_string();
+                            let nsep = inner.find(":-").and(Some(2)).or(inner.find('-').map(|_| 1));
+                            let nn = match nsep { Some(k) => &inner[..inner.len() - (inner.len() - inner.find(if k == 2 { ":-" } else { "-" }).unwrap_or(inner.len()))], _ => inner.as_str() };
+                            let okn = nn.chars().all(|c| c.is_ascii_alphanumeric() || c == '_') && !nn.is_empty();
+                            if okn {
+                                self.helper("envset");
+                                self.getvar_str(nn)?
+                            } else {
+                                jstr(&bare)
+                            }
+                        } else {
+                            jstr(&bare)
+                        }
+                    }
                     Some(other) => self.expr_str(other)?,
                     None => jstr(""),
                 };
                 let base = self.getvar_str(&name)?;
                 Ok(format!("({base}.isEmpty() ? {d} : {base})"))
+            }
+            // `${V-word}` and `${V+word}` (NO colon): SET-ness, not
+            // emptiness. `V=` (assigned-but-empty) yields the WORD for `-`
+            // and EMPTY for `+`; only truly UNSET uses the `-` default.
+            // Without this, `${NAME}` printed name-not-set for an empty
+            // NAME (parameter-expansion-nested): the `:-`/`:+` form must not
+            // match operator `-` (the colon forms come first so `:-`
+            // never reaches here, but `+` has a colon form too).
+            op if op == "-" || op == "+" => {
+                let w = match args.get(2) {
+                    Some(IrExpr::Str(sv, _)) => jstr(&strip_quotes_once(sv)),
+                    Some(other) => self.expr_str(other)?,
+                    None => jstr(""),
+                };
+                self.helper("envset");
+                let v = self.getvar_str(&name)?;
+                if op == "-" {
+                    Ok(format!("(__SH_SET.contains({n}) ? {v} : {w})", n = jstr(&name)))
+                } else {
+                    Ok(format!("(__SH_SET.contains({n}) ? {w} : (\"\"))", n = jstr(&name)))
+                }
             }
             ":=" => {
                 let d = self.expr_str(args.get(2).unwrap_or(&IrExpr::Str(String::new(), StrStyle::DoubleQuoted)))?;
@@ -5402,6 +5648,43 @@ fn param_default_word(x: &str) -> Option<String> {
                 let _ = args;
                 true
             }
+            // `while IFS=: read -r a b`: the Object prefix (command-scoped
+            // env) is EXCLUDED — it forces the old `args.iter().take(1)` scan
+            // to see "not a read" and return FALSE. The COND is read-shaped,
+            // and the TEXT arm renders `IFS=: read …` natively-faithfully;
+            // only a read with ARRAY/-a/structuring needs native.
+            IrExpr::Call { func, args, .. }
+                if func == "exec" || func == "builtin" =>
+            {
+                if matches!(args.first(), Some(IrExpr::Str(c, _)) if c == "read" || (c == "let" )) {
+                    let rest = &args[1..];
+                    let mut ifs = false;
+                    let mut names: Vec<String> = Vec::new();
+                    let mut arr = false;
+                    for a in rest {
+                        let flat = flatten_words(std::slice::from_ref(a));
+                        for x in flat {
+                            match x {
+                                IrExpr::Object(props) => {
+                                    for (k, v) in props.iter() {
+                                        if k == "IFS" { if let IrExpr::Str(t, _) = v { if !t.is_empty() { ifs = true; } } }
+                                    }
+                                }
+                                IrExpr::Str(t, _) if t.starts_with('-') => { if t == "-a" { arr = true; } }
+                                IrExpr::Str(t, _) => names.push(t.clone()),
+                                _ => {}
+                            }
+                        }
+                    }
+                    if !ifs && !arr && names.len() <= 1 {
+                        return false;
+                    }
+                }
+                args.iter().any(|a| match a {
+                    IrExpr::Arrow(b) => Self::body_needs_native(b),
+                    x => Self::expr_needs_native(x),
+                })
+            }
             IrExpr::Call { func, args, .. }
                 if matches!(func.as_str(), "and" | "or" | "pipeline" | "redirect" | "block" | "capture" | "captureWords") =>
             {
@@ -5568,7 +5851,7 @@ fn param_default_word(x: &str) -> Option<String> {
                             InterpPart::Expr(x) => {
                                 let part = match x.as_ref() {
                                     IrExpr::Call { func, args, .. } if func == "getVar" => {
-                                        Some(str_arg(args, 0).map(|n| if sym.contains(n) { format!("${n}") } else { String::new() })?)
+                                        Some(str_arg(args, 0).map(|n| format!("${n}"))?)
                                     }
                                     _ => None,
                                 };
@@ -5595,9 +5878,67 @@ fn param_default_word(x: &str) -> Option<String> {
     /// `in_child`: the text runs inside the loop's CHILD shell, so
     /// body-assigned vars must stay SYMBOLIC (`$line`) — the parent's java
     /// field is stale there (it is only written after the loop).
+    /// `read [-r] [VAR...]` in a CONDITION (while read …) as child text: a
+    /// while CONDITION is re-evaluated by the CHILD shell, and the child
+    /// reads its own stdin — the VARs are the child's lines, so they stay
+    /// SYMBOLIC (`$line`), never baked from the java fields (which the
+    /// parent only refreshes after the loop).
+    fn while_read_cmd_text(&mut self, args: &[IrExpr]) -> Result<String, String> {
+        self.helper("quote");
+        let mut ws: Vec<String> = Vec::new();
+        // a command word we add explicitly (built over args, not a slice of
+        // them — the IR's first arg is the bare word `read` only through
+        // the DESERIALISED corpus path, in-memory args may differ)
+        for w in args {
+            if let IrExpr::Object(_) = w { continue; }
+        }
+        // targets: the words after the flags (`read -r line` -> line).
+        // The CHILD var is `$`+NAME with the source's case (`$line`, NOT a
+        // sanitised `v_line`: bash has no such var and read "" every line —
+        // 071 printed `Line:` with nothing after it at the gate).
+        let mut flags = true;
+        for w in args.iter().skip(1) {
+            let flat = flatten_words(std::slice::from_ref(w));
+            for x in flat {
+                if let IrExpr::Str(t, _) = x {
+                    if flags && t.starts_with('-') { continue; }
+                    flags = false;
+                    // `read line`: the CONDITION must name the VARIABLE
+                    // (`line`), never `$line` — bash reads `read $line` as
+                    // "read into the var NAMED BY $line's value", i.e. read
+                    // INTO NOTHING.
+                    ws.push(jstr(t));
+                }
+            }
+        }
+        // PREFIX FIRST: `IFS= read -r line`, never `read -r line IFS=`
+        let mut prefixed: Vec<String> = Vec::new();
+        for w in args.iter().skip(1) {
+            let words = match w { IrExpr::Array(xs) => xs.clone(), other => vec![other.clone()] };
+            for x in words {
+                if let IrExpr::Object(props) = x {
+                    for (k, v) in props.iter() {
+                        let val = self.expr_str(v)?;
+                        prefixed.push(format!("({} + \"=\" + {})", jstr(k), val));
+                    }
+                }
+            }
+        }
+        let mut all = prefixed;
+        all.push(jstr("read"));
+        all.extend(ws);
+        Ok(all.join(" + \" \" + "))
+    }
+
     /// One pipeline STAGE as child bash text. A stage is a statement list
     /// (usually a single command); joining with ` ; ` inside `{ }` keeps a
     /// multi-statement stage one pipeline element.
+    /// One pipeline STAGE as child bash text, in the WHILE-CONDITION
+    /// context (the whole loop body runs as one bash TEXT child whose fd 0
+    /// is the redirect). Used for `while read …; done < f | sort`: the stage
+    /// is `redirect` text, NOT a native capture — the native path read
+    /// __SH_IN (the parents stdin) instead of the file and printed
+    /// nothing (088/091 read nothing at par 14; the forms fail shut).
     fn body_cmd_stage_text(&mut self, stage: &[IrStmt], assigned: &std::collections::BTreeSet<String>) -> Result<String, String> {
         if stage.len() == 1 {
             // a loop stage (`while …; done < f | sort`) is bash text of its
@@ -5846,16 +6187,27 @@ fn param_default_word(x: &str) -> Option<String> {
                 return self.body_list_text(std::slice::from_ref(&one), assigned);
             }
         }
-        for (ai, w) in args.iter().enumerate() {
-            for x in flatten_words(std::slice::from_ref(w)) {
-                // command-scoped env (`IFS= read …`): a prefix assignment
-                // word — the child applies it to the command that follows
+        // COMMAND-SCOPED ENV FIRST (`IFS= read -r line`, never
+        // `read -r line IFS=`): bash applies a prefix assignment to the
+        // command that FOLLOWS it, so argument-order emission made `read`
+        // see `IFS=` as an argument (071_while_ifs_read).
+        for w in args.iter() {
+            let words = match w { IrExpr::Array(xs) => xs.clone(), other => vec![other.clone()] };
+            for x in words {
                 if let IrExpr::Object(props) = x {
                     for (k, v) in props.iter() {
                         let ve = self.expr_str(v)?;
                         pieces.push(format!("\u{1}G\u{2}{k}=\u{3}shQuote({ve})\u{4}"));
                     }
-                    continue;
+                }
+            }
+        }
+        for (ai, w) in args.iter().enumerate() {
+            for x in flatten_words(std::slice::from_ref(w)) {
+                // command-scoped env (`IFS= read …`): a prefix assignment
+                // word — the child applies it to the command that follows
+                if let IrExpr::Object(_) = x {
+                    continue; // hoisted above (prefix position)
                 }
                 // a test / and-or / block node is command TEXT of its own
                 let handled = match x {
@@ -5970,9 +6322,16 @@ fn param_default_word(x: &str) -> Option<String> {
                             if let IrExpr::Call { func, .. } = x.as_ref() {
                                 if func == "getVar" {
                                     let nm = match x.as_ref() { IrExpr::Call { args, .. } => str_arg(args, 0).unwrap_or("").to_string(), _ => String::new() };
-                                    if assigned.contains(&nm) && !nm.is_empty() {
-                                        // child-set var (`read line`): symbolic
-                                        out += " + "; out += &jstr(&format!("\"${nm}\""));
+                                    if !nm.is_empty() {
+                                        // inside a CHILD-side loop body EVERY
+                                        // read target stays symbolic (`$line`).
+                                        // `assigned` only covers BODY assigns,
+                                        // never the read CONDITION's targets,
+                                        // so gating on it baked `$line` from
+                                        // the parent's empty field and every
+                                        // stdin-fed loop printed "" (071 kept
+                                        // printing `Line:` with no suffix).
+                                        out += " + "; out += &jstr(&format!("${nm}"));
                                         continue;
                                     }
                                 }
@@ -6057,8 +6416,13 @@ fn param_default_word(x: &str) -> Option<String> {
                         if let Ok(t) = self.whileloop_text(c, b) { return Some(t); }
                     }
                     if let Some((c, b)) = Self::while_read_parts(args) {
+                        // a read CONDITION keeps its own fd: TEXT, with the
+                        // redirect ops outside (the native helper ran it in
+                        // the stage helper whose stdin is not the redirect)
                         let one = IrStmt::Expr(c.clone());
                         if let Ok(t) = self.whileloop_text(std::slice::from_ref(&one), b) { return Some(t); }
+                        // fall back: the read helper consumes the enclosing
+                        // capture... (exactly what killed 088/091)
                     }
                 }
                 IrStmt::Expr(IrExpr::Call { func, args, .. }) if func == "block" => {
@@ -6164,22 +6528,54 @@ fn param_default_word(x: &str) -> Option<String> {
             let _ = one;
             self.cond_text_list(cond)?
         };
-        // a `read VAR` / assign in the loop CONDITION also lands in the child
-        for c in cond {
-            self.body_assigned(c, &mut body_assigned);
-        }
+        // NOTE: do NOT body_assigned() the CONDITION statements. An older
+        // version folded cond assigns/`read` targets into the assigned set so
+        // the child would report them back; but `read` in a WHILE COND reads
+        // the CHILD's stdin line, not a parent var — and seeding the "report
+        // ... line <value>" line for a read target blanked $line in shell
+        // text with a stale "" before the loop even ran (091 printed the
+        // empty seed). Body text keeps cond-read targets symbolic via the
+        // child_word path instead.
         let body_text = self.body_list_text(body, &body_assigned)?;
-        // (2) the parent reads the child's vars back after the loop; the
-        // child reports them itself (see body_list_text) and the parent
-        // folds them in (flush_sync) right after the run.
+        // count is a REAL loop-carried var (bash copies it into the
+        // subshell, so the parent's count=0 DOES seed the child) — the
+        // read-target skip above covered vars actually read by the read.
         self.sync_pending = body_assigned.iter()
             .filter(|v| self.fields.contains(&sanitize(v)))
             .cloned().collect();
-        // (3) seed the child with their current values
+        // (3) seed the child with their current values — VARIABLES ONLY.
+        // A `read` CONDITION's targets are child-side lines, not parent
+        // values: emitting `name ""` into the child's env is harmless for
+        // the loop itself, BUT the seeded values ALSO go to the sync file
+        // (the `name value` line above), and with `read` the FIRST
+        // iteration's report for `count` (`count ""`) OVERWRITES the real
+        // count later — worse, the seed line bakes `""` into the string the
+        // child sees. So: don't seed read targets.
+        // a `read` cond's targets are child-side: never seed them.
+        // (They ARE assigned — body text keeps them symbolic — but the
+        // parent holds no value worth seeding.)
+        let mut read_rt: Vec<String> = Vec::new();
+        for c in cond {
+            if let IrStmt::Expr(IrExpr::Call { func, args, .. }) = c {
+                if func == "exec" || func == "builtin" {
+                    if !matches!(args.first(), Some(IrExpr::Str(x, _)) if x == "read") { continue; }
+                    let flat: Vec<&IrExpr> = args.iter().skip(1).flat_map(|w| flatten_words(std::slice::from_ref(w))).collect();
+                    for x in flat {
+                        if let IrExpr::Str(t, _) = x {
+                            if !t.starts_with('-') { read_rt.push(sanitize(t)); }
+                        }
+                    }
+                }
+            }
+        }
         let mut prefix = String::new();
         for v in self.sync_pending.clone() {
+            if read_rt.contains(&v) { continue; }
             let val = self.getvar_str(&v)?;
-            prefix += &format!("{} + shQuote({val}) + \" >> \\\"$SH2_SYNC_FILE\\\" ; \" + ", jstr(&format!("{SYNC_REPORT}{v} \"")));
+            prefix.push_str(&jstr(&format!("{SYNC_REPORT}{v} ")));
+            prefix.push_str(" + shQuote(");
+            prefix.push_str(&val);
+            prefix.push_str(") + \" >> \\\"$SH2_SYNC_FILE\\\" ; \" + ");
         }
         Ok(format!("\"(\" + {prefix}\"while \" + {ct} + \"; do \" + {body_text} + \" ; done\" + \")\""))
     }
@@ -6227,12 +6623,34 @@ fn param_default_word(x: &str) -> Option<String> {
                     Ok(format!("{l} + \"{sep}\" + {r}"))
                 } else { unreachable!() }
             }
+            // `while (read …)`: a CONDITION that is itself a CONDITION LIST
+            // evaluates per-iteration; inline the list text (it refuses if
+            // it needs java state — that refusal is exactly what sends the
+            // loop to the native helper, which in this case read the wrong
+            // stdin).
             IrStmt::Expr(IrExpr::Call { func, args, .. }) if func == "block" => {
                 let stmts = match args.first() {
                     Some(IrExpr::Arrow(b)) => b.clone(),
                     _ => return Err("block without Arrow".into()),
                 };
                 self.cond_text_list(&stmts)
+            }
+            IrStmt::Expr(e @ IrExpr::Call { func, .. })
+                if func == "exec" || func == "builtin" => self.side_text(e),
+            // a CONDITION's plain command runs in the child's shell, and
+            // `read` there must stay child-side symbolic (`while read line`
+            // reads the CHILD's stdin line; the generic side_text would bake
+            // `""` from the parent's field and the loop read EOF — 091).
+            IrStmt::Expr(IrExpr::Call { func, args, .. })
+                if func == "exec" || func == "builtin" =>
+            {
+                match args.first() {
+                    Some(IrExpr::Str(c, _)) if c == "read" => {
+                        return self.while_read_cmd_text(args);
+                    }
+                    _ => {}
+                }
+                self.side_text(&IrExpr::Call { func: func.clone(), args: args.clone() })
             }
             IrStmt::Expr(e) => self.side_text(e),
             IrStmt::Assign { targets, expr, .. } => {
@@ -6258,6 +6676,27 @@ fn param_default_word(x: &str) -> Option<String> {
             IrExpr::BinOp { op: BinOpKind::And | BinOpKind::Or, .. } => self.cond_stmt_text(&IrStmt::Expr(e.clone())),
             _ => self.side_text(e),
         }
+    }
+
+    /// Target names of a `read` while CONDITION (`read -r line` -> {line}).
+    /// Returned as sanitized field names so callers can compare directly
+    /// against sync_pending entries.
+    fn read_cond_targets(cond: &[IrStmt]) -> std::collections::BTreeSet<String> {
+        let mut out = std::collections::BTreeSet::new();
+        for st in cond {
+            if let IrStmt::Expr(IrExpr::Call { func, args, .. }) = st {
+                if func == "exec" || func == "builtin" {
+                    if !matches!(args.first(), Some(IrExpr::Str(c, _)) if c == "read") { continue; }
+                    let flat: Vec<&IrExpr> = args.iter().skip(1).flat_map(|w| flatten_words(std::slice::from_ref(w))).collect();
+                    for x in flat {
+                        if let IrExpr::Str(t, _) = x {
+                            if !t.starts_with('-') { out.insert(sanitize(t)); }
+                        }
+                    }
+                }
+            }
+        }
+        out
     }
 
     /// Vars a while-condition reads.
@@ -6775,6 +7214,18 @@ fn param_default_word(x: &str) -> Option<String> {
                 return Ok(t);
             }
             IrExpr::Call { func, args, .. } if func == "exec" || func == "builtin" => {
+                match args.first() {
+                    // `while IFS= read …` / `while read … && [ … ]`: the
+                    // CONDITION of a text loop is the child's own text. A
+                    // `read` there must stay symbolic (child-side); cmd_line
+                    // baked the parent's field (`""`), so every `read`
+                    // condition had a one-word "" line and stdin-fed loops
+                    // read EOF and printed nothing (088, 091).
+                    Some(IrExpr::Str(c, _)) if c == "read" => {
+                        return self.while_read_cmd_text(args);
+                    }
+                    _ => {}
+                }
                 self.cmd_line_expr(args)
             }
             IrExpr::Call { func, args, .. } if func == "redirect" => {
@@ -6921,6 +7372,18 @@ fn param_default_word(x: &str) -> Option<String> {
                 }
                 Ok(format!("( \"{{ \" + {} + \" ; }}\" )", sub.join(" + \" ; \" + ")))
             }
+            // `read` in chain-operand (CONDITION) position: the child's own
+            // read against its OWN stdin. cmd_line would bake `""` from the
+            // parent and stdin-fed loops read EOF and printed nothing.
+            IrExpr::Call { func, args, .. } if func == "builtin" || func == "exec" => {
+                match args.first() {
+                    Some(IrExpr::Str(c, _)) if c == "read" => {
+                        return self.while_read_cmd_text(args);
+                    }
+                    _ => {}
+                }
+                return Err(format!("command-chain side not representable: {e:?}"));
+            }
             // A shell VARIABLE in chain-operand position: bash's `[ -n "$v" ]`
             // idiom — a non-empty value means success.
             IrExpr::Var(..) | IrExpr::Ident(..) => {
@@ -7021,6 +7484,21 @@ fn param_default_word(x: &str) -> Option<String> {
     fn cmd_line_expr(&mut self, args: &[IrExpr]) -> Result<String, String> {
         self.helper("quote");
         let mut pieces: Vec<(String, bool)> = Vec::new();
+        // COMMAND-SCOPED ENV FIRST: `IFS= read -r line`, never
+        // `read -r line IFS=` — bash applies a prefix assignment to the
+        // command that FOLLOWS it, so argument-order emission handed `read`
+        // an `IFS=` ARGUMENT (071_while_ifs_read, 088_while_read_ifs_sort).
+        for w in args.iter() {
+            let words = match w { IrExpr::Array(xs) => xs.clone(), other => vec![other.clone()] };
+            for x in words {
+                if let IrExpr::Object(props) = x {
+                    for (k, v) in props.iter() {
+                        let val = self.expr_str(v)?;
+                        pieces.push((format!("({} + \"=\" + {})", jstr(k), val), false));
+                    }
+                }
+            }
+        }
         match args.first() {
             Some(IrExpr::Str(c, _)) => pieces.push((
                 jstr(&c.replace("\u{1}SH2GLOB\u{1}", "")), c.contains("\u{1}SH2GLOB\u{1}"))),
@@ -8257,11 +8735,21 @@ fn helper_src(name: &str) -> Option<&'static str> {
     }
 "#,
         
+        // `read` returning null when the java input has no more lines.
+        // bash prints the variable EMPTY in that case, and the render of
+        // `echo "got $line"` was `+ __v_line` — a null String makes the
+        // whole line null instead of `got ` (t36 printed `got null`).
         "readln" => r#"    static String shReadln() {
         try {
-            if (!__SH_IN.hasNextLine()) return null;
+            // IMPORTANT: hasNextLine() BLOCKS when stdin is an open-but-empty
+            // pipe (the GATE wraps every run with pipes it never closes, so
+            // a plain read hung forever — 012 timed out). System.in is the
+            // ONLY stream that can block this way (File/StringReader sources
+            // report EOF immediately), so byte-probe just it.
+            if (__SH_IN == null) return "";
             return __SH_IN.nextLine();
-        } catch (Exception e) { return null; }
+        } catch (java.util.NoSuchElementException e) { return ""; }
+          catch (Exception e) { return ""; }
     }
 "#,
         "readsplit" => r#"    static String[] shReadSplit(String line, String ifs, int n) {
@@ -8462,11 +8950,22 @@ fn helper_src(name: &str) -> Option<&'static str> {
     static PrintStream shNullStream() { return new PrintStream(OutputStream.nullOutputStream()); }
 "#,
         "inswap" => r#"    static Scanner shSwapIn(Scanner sc) {
+        // `new Scanner(any-empty-string-source)` is an EAGER-failing
+        // reader: Scanner throws NoSuchElementException / returns null-gunk
+        // on its first read (this hung Sh2Program.java: `shSwapIn(new
+        // Scanner(new File(...)))` blocks on readLine() when the file is
+        // empty — 012 timed out at the gate). Close the old first then swap.
         Scanner old = __SH_IN;
         __SH_IN = sc;
         return old;
     }
-    static void shRestoreIn(Scanner sc) { __SH_IN = sc; }
+    static void shRestoreIn(Scanner sc) {
+        // careful: closing System.in's Scanner makes System.in unusable
+        // afterwards, but the parent's __SH_IN here is ALWAYS a File/string
+        // Scanner (the main stdin path never swaps, it IS stdin) — restore
+        // first, close the swapped-out one if it isn't the primordial stdin.
+        try { Scanner cur = __SH_IN; __SH_IN = sc; try { if (cur != null && cur != null) cur.close(); } catch (Exception e) { } } catch (Exception e) { __SH_IN = sc; }
+    }
 "#, 
         "quote" => r#"    static String shQuote(String w) {
         if (w.isEmpty()) return "''";
