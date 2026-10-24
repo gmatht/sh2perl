@@ -270,3 +270,99 @@ Same toolchain as above:
 
     RUSTUP_HOME=/root/.rustup CARGO_HOME=/root/.cargo \
       /path/to/verus-x86-linux/verus --triggers-mode silent --rlimit 40 proofs/verus/dead_store_elim.rs
+
+---
+
+# Verus proof of `redundant-store-elim` (fixed pass)
+
+STATUS: **checked.** Verus `0.2026.10.18.7d82994`, rust toolchain
+1.99.1:
+
+    verus --triggers-mode silent --rlimit 80 redundant_store_elim.rs
+    -> verification results:: 53 verified, 0 errors
+
+## What is proved
+
+`redundant_store_elim.rs` is a standalone model of the FIXED
+`src/transforms/redundant_store_elim.rs` (a scalar store `x=A` at `i`
+drops iff a later scalar store to `x` overwrites it with a clean
+middle and a clean justifier): interned names, `Assign` (with target
+index expressions) / `Output` / `CallStmt` (observer) / `Other`,
+structural purity with side-effecting arithmetic (`ArithSE`, models
+`ArithAst::Assign`/`IncDec`) impure, index reads and `Str`-embedded
+`$name` reads counted, and
+
+    proof fn rse_sound_top(p: Seq<Stmt>, init: Store)
+      requires closed_for(p, init),
+      ensures
+        run(purge(p), init).1 == run(p, init).1,
+        forall|n: Name| lookup(run(purge(p), init).0, n) == lookup(run(p, init).0, n),
+
+i.e. purging is observationally exact — same trace, same value for
+every variable. The proof is a shadow argument: after dropping `i`
+(target `x`, justifier `j`), `x` is shadowed until the next store;
+shadowed vars are never read or observed (`shadow_stops_scan`, proved
+from the justifier's cleanliness), so the divergent intermediate
+bindings are unobservable. Drop chains always end at a kept store, so
+at end-of-program nothing is shadowed (`nothing_shadowed_at_end`).
+Supporting lemmas: `eval_same` (evaluations over agreeing state
+agree, writes included), `keep_step_same` / `drop_step_same`,
+`step_closed`, `shadow_preserved` / `unshadow_before`, plus seven
+fidelity pins — basic drop, `ArithSE`-RHS kept, pure-arith control,
+index-read kept (bug 2), `srefs`-read kept (bug 3), observer kept,
+cascade.
+
+## It can fail (checked)
+
+Two mutants, one per soundness fix:
+
+- Restoring the old `Arith(_) => true` purity lie (modelled
+  `ArithSE` pure) makes the same command report **51 verified,
+  2 errors**.
+- Restoring the old index-blind `stmt_reads` (RHS only) makes the
+  same command report **51 verified, 2 errors**.
+
+The file was restored and re-checked at **53 verified, 0 errors**.
+
+## Scope (read this before quoting it)
+
+- It is a proof about a MODEL: `redundant_store_elim.rs` duplicates
+  the fixed transform by hand. Nothing ties the model to the Rust
+  source, so the two can drift — the same caveat as the files above.
+- This proof covers the FIXED pass (three soundness holes repaired
+  in the same effort — see below). Proving the pre-fix code is
+  impossible: the mutants above are the machine-checked witnesses.
+- The three fixed holes (`redundant-store-elim: fix 3 soundness
+  holes`, same effort):
+  1. `expr_pure` claimed `Arith(_) => true`; `ArithAst::Assign`/
+     `IncDec` mutate state (`x=$((i++))` dropped the increment).
+     Now a dedicated `arith_pure` mirroring dead_store_elim's.
+  2. `stmt_reads` on `Assign` ignored target indices
+     (`x=5; arr[x]=1; x=6` dropped `x=5`). Indices are reads now.
+  3. `$name` inside plain-`Str` call args was invisible
+     (`x=1; y=$(eval 'echo $x'); x=2` dropped `x=1` — confirmed with
+     a failing probe before fixing). New `str_reads_var` mirroring
+     dead_store_elim's `string_read_names`, wired into the `Call`
+     arm and the bare-`Str` arm.
+  Each has a failing-then-passing Rust test in the transform's own
+  `tests` module; the full `--lib` suite shows the same 20
+  pre-existing failures before and after (unrelated backends).
+- NOT modelled: `Ext`-node field reads (another worker's uncommitted
+  WIP adds an `IrExpr::Ext` arm to the real `expr_reads` at the time
+  of writing — out of scope here, keep-direction so the model stays
+  the aggressive side), case-pattern text reads, `[*]`-reads-IFS,
+  whole-store-dumping builtins inside captures (env-dump shapes),
+  nested-statement recursion (the real pass applies the same scan
+  per function body — same lemma per body), multi-target assigns.
+- The drop rule is stated declaratively (exists a clean justifier);
+  the file header records the scan ⟺ declarative equivalence
+  argument, including the justifier-cleanliness clause the scan's
+  check order implies.
+
+## Running it
+
+Same toolchain as above (`--rlimit 80` for the shadow-induction
+obligations):
+
+    RUSTUP_HOME=/root/.rustup CARGO_HOME=/root/.cargo \
+      /path/to/verus-x86-linux/verus --triggers-mode silent --rlimit 80 proofs/verus/redundant_store_elim.rs
