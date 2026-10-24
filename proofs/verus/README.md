@@ -188,3 +188,85 @@ Same toolchain as above:
 
     RUSTUP_HOME=/root/.rustup CARGO_HOME=/root/.cargo \
       /path/to/verus-x86-linux/verus --triggers-mode silent --rlimit 40 proofs/verus/dead_fn_elim.rs
+
+---
+
+# Verus proof of `dead-store-elim`'s core (dead-variable elimination)
+
+STATUS: **checked.** Verus `0.2026.10.18.7d82994`, rust toolchain
+1.99.1:
+
+    verus --triggers-mode silent --rlimit 40 dead_store_elim.rs
+    -> verification results:: 45 verified, 0 errors
+
+## What is proved
+
+`dead_store_elim.rs` is a standalone model of the core of
+`src/transforms/dead_store_elim.rs` (the read/write census, the purity
+gate, and the purge, over store + observable-trace semantics):
+interned names, `Assign`/`Declare`/`SetVar`/`Output`/`Other`
+statements, a structural purity predicate over
+`Lit`/`Var`/`Add`/`Call`/`Capture` expressions, and
+
+    proof fn purge_sound_top(p: Seq<Stmt>, implicit: Set<Name>, init: Store)
+      requires closed_for(p, init),
+      ensures
+        run(purge(p, implicit), init).1 == run(p, init).1,
+        forall|n: Name| !is_dead(p, implicit, n) ==> lookup(...) == lookup(...),
+
+i.e. purging dead stores preserves the event trace and every live
+variable's final value, from any closed start store (every
+structurally-read name bound). The induction invariant is
+live-agreement (`agree_live`: stores agree on all non-dead names)
+plus trace equality; a dropped store is pure (no events, proved by
+`pure_no_events`) and dead (its bindings are unobservable). Supporting
+lemmas: `eval_same` (evaluations over agreeing state agree),
+`keep_step_same`/`drop_step_same` (kept steps run identically,
+dropped steps touch only dead state), `step_closed`/`bind_grows`
+(steps only add bindings), `bind_all_agree`, plus six fidelity pins —
+lone pure store drops, read-later store kept, impure RHS kept,
+twice-written kept, shell-implicit kept, dynamic-write freezes all.
+
+## It can fail (checked)
+
+Dropping the purity gate (purging dead stores regardless of RHS
+effects) makes the same command report **43 verified, 2 errors** — the
+obligation is not vacuous. The file was restored and re-checked at
+**45 verified, 0 errors**.
+
+## Scope (read this before quoting it)
+
+- It is a proof about a MODEL: `dead_store_elim.rs` duplicates the
+  transform's core by hand. Nothing ties the model to the Rust source,
+  so the two can drift — the same caveat as the files above.
+- The Const-only guard is modelled as single-write
+  (`count_writes == 1`): the `analyze_var_const` verdict's key
+  structural property for the exploited case. The full const analysis
+  is out of scope; the model takes "written once" as the sufficient
+  condition.
+- Dynamic writes are `Call` nodes with `dyn_write` set; they make the
+  read census total, so the dead set is empty and purge is the
+  identity — the same outcome as the real early-return, proved
+  uniformly rather than as a special case.
+- The escapes set is not modelled: every `escapes.insert` in the real
+  census is paired with a `reads.insert` on the same name, so escapes
+  ⊆ reads and the separate check is defensive redundancy (checked
+  arm-by-arm).
+- Indexed targets, case-pattern/`Str`-embedded/`[*]`-IFS/`Ext` reads,
+  and nested-statement recursion are out of scope as documented in the
+  file header: the model covers exactly the droppable class (plain
+  scalar stores) over flat sequences, assuming census completeness
+  for the covered constructs.
+- During this proof two REAL bugs were found in the sibling
+  `redundant_store_elim.rs` (not the modelled file): its `expr_pure`
+  claims `Arith(_) => true` while `dead_store_elim`'s `arith_pure`
+  correctly rejects `Assign`/`IncDec`, and its `stmt_reads` on
+  `Assign` ignores target indices, so `x=5; arr[x]=1; x=6` drops a
+  live store. Neither affects the modelled file.
+
+## Running it
+
+Same toolchain as above:
+
+    RUSTUP_HOME=/root/.rustup CARGO_HOME=/root/.cargo \
+      /path/to/verus-x86-linux/verus --triggers-mode silent --rlimit 40 proofs/verus/dead_store_elim.rs
