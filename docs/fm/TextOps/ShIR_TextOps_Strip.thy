@@ -70,6 +70,16 @@ qed
 text \<open>Idempotence: the whole run goes, not one newline. This is what makes
   the reduction a "strip" rather than a "chomp".\<close>
 
+text \<open>Congruence, stated for this function: it is the one step that rewriting
+  under the strip needs, and it is cheaper to prove once than to fight the
+  simplifier for it inside each induction step.\<close>
+
+lemma arg_cong_nl:
+  fixes t s :: "nat list"
+  assumes "t = s"
+  shows "rev_drop_last_nl t = rev_drop_last_nl s"
+  using assms by (rule arg_cong[where f=rev_drop_last_nl])
+
 lemma rev_drop_last_nl_idem:
   fixes u :: "nat list"
   shows "rev_drop_last_nl (rev_drop_last_nl u) = rev_drop_last_nl u"
@@ -77,21 +87,23 @@ proof (induct u)
   case Nil then show ?case by simp
 next
   case (Cons a u)
-  have h: "rev_drop_last_nl (a # u) = (if a = 10 then rev_drop_last_nl u else a # u)"
-    by (rule rev_drop_last_nl_cons)
+  have IH: "rev_drop_last_nl (rev_drop_last_nl u) = rev_drop_last_nl u"
+    using Cons(1) by assumption
+  have R: "rev_drop_last_nl (a # u) = (if a = 10 then rev_drop_last_nl u else a # u)"
+    by (rule rev_drop_last_nl.simps(2))
   show ?case
   proof (cases "a = 10")
     case True
-    have h1: "rev_drop_last_nl (a # u) = rev_drop_last_nl u" using h True by simp
-    have h2: "rev_drop_last_nl (rev_drop_last_nl u) = rev_drop_last_nl u"
-      using Cons(1) h1 by simp
-    show ?thesis using h2 h1 by simp
+    have e: "rev_drop_last_nl (a # u) = rev_drop_last_nl u" using R True by simp
+    have L: "rev_drop_last_nl (rev_drop_last_nl (a # u)) = rev_drop_last_nl (rev_drop_last_nl u)"
+      using e by (rule arg_cong_nl)
+    show ?thesis using L IH e by simp
   next
     case False
-    have h1: "rev_drop_last_nl (a # u) = a # u" using h False by simp
-    have h2: "rev_drop_last_nl (rev_drop_last_nl (a # u)) = rev_drop_last_nl (a # u)"
-      using h1 by simp
-    show ?thesis using h2 h1 by simp
+    have e: "rev_drop_last_nl (a # u) = a # u" using R False by simp
+    have L: "rev_drop_last_nl (rev_drop_last_nl (a # u)) = rev_drop_last_nl (a # u)"
+      using e by (rule arg_cong_nl)
+    show ?thesis using L e by simp
   qed
 qed
 
