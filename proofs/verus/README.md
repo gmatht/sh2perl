@@ -270,3 +270,136 @@ Same toolchain as above:
 
     RUSTUP_HOME=/root/.rustup CARGO_HOME=/root/.cargo \
       /path/to/verus-x86-linux/verus --triggers-mode silent --rlimit 40 proofs/verus/dead_store_elim.rs
+
+---
+
+# Verus proof of `array-len-fold` (value preservation)
+
+STATUS: **checked.** Verus `0.2026.10.18.7d82994`, rust toolchain
+1.99.1:
+
+    verus --triggers-mode silent --rlimit 40 array_len_fold.rs
+    -> verification results:: 10 verified, 0 errors
+
+## What is proved
+
+`array_len_fold.rs` is a standalone model of
+`src/transforms/array_len_fold.rs` (the `fold()` node rewrite with its
+refuse-on-doubt guards): the `param("slice", …)` / `arrayLen(…)`
+shapes, the guard conjunction (func, arity 3..=4, `"slice"` op, `#`
+prefix, plain-identifier base, `"@"` offset, absent-or-empty length),
+and
+
+    proof fn fold_sound(e: Expr, s: Store)
+      requires foldable(e),
+      ensures ev(fold(e), s) == ev(e, s),
+
+i.e. folding preserves the evaluated value (element count of the same
+array binding) from any store. Both spellings evaluate against the
+same binding, so the fold is a renaming with identical denotation;
+the guards' job is only to ensure the slice spelling MEANS element
+count. Eight fidelity pins (4-arg, 3-arg, plain-name kept,
+numeric-offset kept, non-empty-length kept, non-ident-base kept,
+bad-arity kept, folded-counts-elements).
+
+## It can fail (checked)
+
+Dropping the `"@"`-offset guard (folding any offset) makes the same
+command report **9 verified, 1 error** — the numeric-offset pin goes
+red, so the obligation is not vacuous. The file was restored and
+re-checked at **10 verified, 0 errors**.
+
+## Scope (read this before quoting it)
+
+- It is a proof about a MODEL: `array_len_fold.rs` duplicates `fold()`
+  by hand — guard order included, so the model tracks the code's
+  check sequence, not just its verdict. Nothing ties the model to the
+  Rust source, so the two can drift — the same caveat as the files
+  above.
+- Identifier-ness is an oracle (`is_plain_ident` over interned ids):
+  the proof covers every other guard and assumes the char-class scan.
+- Traversal is out of scope: the real `stmt()`/`expr()` walkers
+  recurse everywhere and rewrite bottom-up, but each site is an
+  independent local renaming — the theorem is per-node.
+- All eight pins are shape-mirrored 1:1 by the transform's own
+  in-module tests (15 tests, including traversal and report-shape
+  coverage); no `pin_mirrors.rs` addition was needed — the
+  dead_fn_elim precedent (already exactly mirrored).
+
+## Running it
+
+Same toolchain as above:
+
+    RUSTUP_HOME=/root/.rustup CARGO_HOME=/root/.cargo \
+      /path/to/verus-x86-linux/verus --triggers-mode silent --rlimit 40 proofs/verus/array_len_fold.rs
+
+---
+
+# Verus proof of `const-status-cond` (restructuring preservation)
+
+STATUS: **checked.** Verus `0.2026.10.18.7d82994`, rust toolchain
+1.99.1:
+
+    verus --triggers-mode silent --rlimit 60 const_status_cond.rs
+    -> verification results:: 35 verified, 0 errors
+
+## What is proved
+
+`const_status_cond.rs` is a standalone model of
+`src/transforms/const_status_cond.rs` (the 7-row restructuring table
+with refusal rules): bare `true`/`:`/`false` conditions with negation
+and words flags, `Bool` literals, the moved-command + literal-cond
+rewrite per row, and
+
+    proof fn rewrite_sound_top(p: Seq<Stmt>, s: int, f: nat)
+      requires f >= 0,
+      ensures exec_list(rewrite_list(p), s, f) == exec_list(p, s, f),
+
+i.e. rewriting preserves the (status, print-trace) run from any start
+status at every fuel bound — hence for the unbounded runs the fuel
+approximates. Execution threads the bash exit-status rules from the
+header (body-never-ran reports 0, taken-body reports its last status,
+untaken-if reports 0); fuel bounds loop iterations with a
+blast/ran convention both sides share. The induction is
+(fuel, size)-lexicographic with two general loop lemmas
+(`while_enters_gen`, `while_same_cond`) covering entry and tails
+uniformly. Eleven fidelity pins: all 7 table rows as shapes, words
+refused, elsifs refused, non-const untouched, plus a fuel-2 behavior
+run.
+
+## It can fail (checked)
+
+Two mutants, one per load-bearing choice:
+
+- Forgetting to move the command (dropping the prepend) makes the
+  same command report **31 verified, 3 errors** — the body-observed
+  status is lost.
+- `StatusZero` reporting 1 instead of 0 makes the same command
+  report **33 verified, 1 error** — the never-ran collapse status is
+  load-bearing.
+
+The file was restored and re-checked at **35 verified, 0 errors**.
+
+## Scope (read this before quoting it)
+
+- It is a proof about a MODEL: `const_status_cond.rs` duplicates the
+  table by hand. Nothing ties the model to the Rust source, so the
+  two can drift — the same caveat as the files above.
+- `do…while` is refused in the real code; the model omits the node
+  (nothing to refuse). Eval-adjacent dynamic effects beyond textual
+  `$name` reads, whole-store-dumping builtins inside captures, and
+  multi-target assigns are out of scope as documented in the file
+  header. `StatusZero` is observably `([], status:=0)` — the real
+  node is an `exec true` with that exact denotation.
+- All shape pins are mirrored 1:1 by the transform's own in-module
+  tests (11 tests: every row, both refusals, desugar, non-const);
+  the fuel-2 behavior pin is model-internal (its content IS the
+  soundness theorem at f=2). No `pin_mirrors.rs` addition was
+  needed — the dead_fn_elim precedent.
+
+## Running it
+
+Same toolchain as above (`--rlimit 60` for the fuel/size induction):
+
+    RUSTUP_HOME=/root/.rustup CARGO_HOME=/root/.cargo \
+      /path/to/verus-x86-linux/verus --triggers-mode silent --rlimit 60 proofs/verus/const_status_cond.rs
