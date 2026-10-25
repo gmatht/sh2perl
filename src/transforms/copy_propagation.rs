@@ -224,11 +224,19 @@ fn count_stmt_assigns(
                 count_expr_assigns(r, counts, values, top, dynamic);
             }
         }
-        IrStmt::If { then, elsifs, else_, .. } => {
+        // The CONDITION is a write site too: a branch/loop condition may
+        // run zero times, so it is never a foldable top-level def (`top =
+        // false`), but a write there (an `(( i++ ))` / `let i++`) makes the
+        // variable multi-def. Dropping it kept `count == 1` and folded the
+        // stale literal across the write (`i=0; if ((i++)); then :; fi;
+        // echo "$i"` printed the folded 0 in every backend).
+        IrStmt::If { cond, then, elsifs, else_ } => {
+            count_expr_assigns(cond, counts, values, false, dynamic);
             for s in then {
                 count_stmt_assigns(s, counts, values, false, dynamic);
             }
-            for (_, b) in elsifs {
+            for (c, b) in elsifs {
+                count_expr_assigns(c, counts, values, false, dynamic);
                 for s in b {
                     count_stmt_assigns(s, counts, values, false, dynamic);
                 }
@@ -237,10 +245,17 @@ fn count_stmt_assigns(
                 count_stmt_assigns(s, counts, values, false, dynamic);
             }
         }
-        IrStmt::While { body, .. } | IrStmt::DoWhile { body, .. } => {
+        IrStmt::While { cond, body } => {
+            count_expr_assigns(cond, counts, values, false, dynamic);
             for s in body {
                 count_stmt_assigns(s, counts, values, false, dynamic);
             }
+        }
+        IrStmt::DoWhile { body, cond, .. } => {
+            for s in body {
+                count_stmt_assigns(s, counts, values, false, dynamic);
+            }
+            count_expr_assigns(cond, counts, values, false, dynamic);
         }
         IrStmt::For { var, iter, body, .. } => {
             // the loop header WRITES var every iteration
@@ -407,6 +422,22 @@ fn classify_builtin_writes(
         for a in args {
             if let IrExpr::Str(s, _) = a {
                 for v in str_maybe_read_vars(s) {
+                    site(
+                        counts,
+                        values,
+                        &v,
+                        &IrExpr::Str(s.clone(), crate::ir::StrStyle::DoubleQuoted),
+                        false,
+                    );
+                }
+                // `let` carries a BARE arithmetic string (`i++`, `i+=2`,
+                // `i = i + 1`) — no `$`, so the `$name` scan above found
+                // nothing and the write went uncounted. That is the write
+                // the `(( i++ )) && true` / condition shapes take, so it
+                // must register here or the read folds across it.
+                for v in
+                    crate::shir_passes::list_profile::scopes::arith_text_writes(s)
+                {
                     site(
                         counts,
                         values,
@@ -1117,6 +1148,139 @@ mod tests {
         ];
         assert!(!transform(&mut stmts));
         assert_eq!(stmts[2], expr_stmt(getvar("x")));
+    }
+
+    /// The parser spells `(( i++ ))` in a CONDITION as
+    /// `builtin("let", ["i++"])` — a bare arithmetic string, no `$`.
+    fn let_builtin(expr: &str) -> IrExpr {
+        IrExpr::Call {
+            func: "builtin".to_string(),
+            args: vec![str_lit("let"), IrExpr::Array(vec![str_lit(expr)])],
+        }
+    }
+
+    /// `i=0; if (( i++ )); then :; fi; echo $i` — the arith write sits in
+    /// the CONDITION, which `count_stmt_assigns` used to drop; the read
+    /// folded to the stale `0` and every backend printed `i=0`.
+    #[test]
+    fn refuses_arith_write_in_if_condition() {
+        let mut stmts = vec![
+            assign("i", int_lit(0)),
+            IrStmt::If {
+                cond: let_builtin("i++"),
+                then: vec![],
+                elsifs: vec![],
+                else_: vec![],
+            },
+            expr_stmt(getvar("i")),
+        ];
+        assert!(!transform(&mut stmts));
+        assert_eq!(stmts[2], expr_stmt(getvar("i")));
+    }
+
+    /// The same write in an ELSIF condition is a write site too.
+    #[test]
+    fn refuses_arith_write_in_elsif_condition() {
+        let mut stmts = vec![
+            assign("i", int_lit(0)),
+            IrStmt::If {
+                cond: getvar("c"),
+                then: vec![],
+                elsifs: vec![(let_builtin("i++"), vec![])],
+                else_: vec![],
+            },
+            expr_stmt(getvar("i")),
+        ];
+        assert!(!transform(&mut stmts));
+        assert_eq!(stmts[2], expr_stmt(getvar("i")));
+    }
+
+    /// `i=0; while (( i++ )); do :; done; echo $i` — a While condition
+    /// may run zero times, so it is a write site but never a top-level
+    /// def.
+    #[test]
+    fn refuses_arith_write_in_while_condition() {
+        let mut stmts = vec![
+            assign("i", int_lit(0)),
+            IrStmt::While { cond: let_builtin("i++"), body: vec![] },
+            expr_stmt(getvar("i")),
+        ];
+        assert!(!transform(&mut stmts));
+        assert_eq!(stmts[2], expr_stmt(getvar("i")));
+    }
+
+    /// `i=0; do :; while (( i++ )); done; echo $i` — DoWhile's condition
+    /// was dropped by the same `..` pattern.
+    #[test]
+    fn refuses_arith_write_in_dowhile_condition() {
+        let mut stmts = vec![
+            assign("i", int_lit(0)),
+            IrStmt::DoWhile { body: vec![], cond: let_builtin("i++"), until: false },
+            expr_stmt(getvar("i")),
+        ];
+        assert!(!transform(&mut stmts));
+        assert_eq!(stmts[2], expr_stmt(getvar("i")));
+    }
+
+    /// `i=0; (( i++ )) && true; echo $i` — the chain's lhs is the same
+    /// `builtin("let", ["i++"])`; it must count in EITHER operand position.
+    #[test]
+    fn refuses_arith_write_in_and_chain() {
+        let mut stmts = vec![
+            assign("i", int_lit(0)),
+            expr_stmt(IrExpr::BinOp {
+                op: crate::ir::BinOpKind::And,
+                lhs: Box::new(let_builtin("i++")),
+                rhs: Box::new(getvar("true")),
+            }),
+            expr_stmt(getvar("i")),
+        ];
+        assert!(!transform(&mut stmts));
+        assert_eq!(stmts[2], expr_stmt(getvar("i")));
+    }
+
+    /// `i=0; let 'i++'; echo $i` — the same write as a STATEMENT: the
+    /// `$name` scan found no `$` in `i++`, so the write was invisible
+    /// even here.
+    #[test]
+    fn refuses_let_arith_statement_write() {
+        let mut stmts = vec![
+            assign("i", int_lit(0)),
+            expr_stmt(let_builtin("i++")),
+            expr_stmt(getvar("i")),
+        ];
+        assert!(!transform(&mut stmts));
+        assert_eq!(stmts[2], expr_stmt(getvar("i")));
+    }
+
+    /// `i=0; let 'i = i + 1'; echo $i` — assignment spelling.
+    #[test]
+    fn refuses_let_arith_assign_write() {
+        let mut stmts = vec![
+            assign("i", int_lit(0)),
+            expr_stmt(let_builtin("i = i + 1")),
+            expr_stmt(getvar("i")),
+        ];
+        assert!(!transform(&mut stmts));
+        assert_eq!(stmts[2], expr_stmt(getvar("i")));
+    }
+
+    /// control: a condition writing an UNRELATED var does not stop the
+    /// fold of a single-def literal read.
+    #[test]
+    fn folds_through_unrelated_condition_write() {
+        let mut stmts = vec![
+            assign("i", int_lit(0)),
+            IrStmt::If {
+                cond: let_builtin("j++"),
+                then: vec![],
+                elsifs: vec![],
+                else_: vec![],
+            },
+            expr_stmt(getvar("i")),
+        ];
+        assert!(transform(&mut stmts));
+        assert_eq!(stmts[2], expr_stmt(int_lit(0)));
     }
 
     /// `x=5; x++` (arith IncDec write) — the second write disqualifies.
