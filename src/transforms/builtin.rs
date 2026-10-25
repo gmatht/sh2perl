@@ -23,7 +23,7 @@
 
 use crate::ir::{ArithAst, IrExpr, IrStmt};
 
-/// The shared builtins namespace — harness/builtins.json (74 entries).
+/// The shared builtins namespace — harness/builtins.json (75 entries).
 ///
 /// This list must cover EVERY harness/builtins.json name: the workspace
 /// checker (harness/check_qx_shir.py) reads that file and flags any
@@ -36,7 +36,7 @@ use crate::ir::{ArithAst, IrExpr, IrStmt};
 pub const BUILTINS: &[&str] = &[
     ".", ":", "basename", "break", "cd", "cmp", "comm", "command", "continue", "cp", "cut",
     "date", "declare", "diff", "dirname", "echo", "egrep", "eval", "exit", "export", "false",
-    "find", "grep", "gunzip", "gzip", "head", "hostname", "id", "let", "local", "ls",
+    "find", "grep", "gunzip", "gzip", "head", "hostname", "id", "let", "ln", "local", "ls",
     "mapfile", "mkdir", "mv", "od", "panic", "paste", "printf", "pwd", "read", "readarray",
     "readlink", "readonly", "realpath", "return", "rm", "rmdir", "sed", "seq", "set",
     "sha256sum", "sha512sum", "shift", "sleep", "sort", "source", "stat", "tail", "tee",
