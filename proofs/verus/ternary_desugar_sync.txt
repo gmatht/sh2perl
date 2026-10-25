@@ -1,0 +1,36 @@
+# verus-sync-coverage manifest: ternary_desugar
+# source sha: ternary_desugar=e60db32621f3  proof sha: f29f77d029a0
+
+[pins]
+pin pin_arithstr_becomes_arith -> UNMIRRORED (by design — see VERUS.md §(b).4)
+pin pin_branch_preserved -> UNMIRRORED (by design — see VERUS.md §(b).4)
+pin pin_calls_pass_through -> UNMIRRORED (by design — see VERUS.md §(b).4)
+pin pin_other_refuses -> UNMIRRORED (by design — see VERUS.md §(b).4)
+pin pin_testarith_normalizes -> UNMIRRORED (by design — see VERUS.md §(b).4)
+pin pin_teststr_becomes_test -> UNMIRRORED (by design — see VERUS.md §(b).4)
+
+[guards]
+guard ternary-desugar ternary match: PRESENT
+guard ternary-desugar is_test_string: PRESENT
+guard ternary-desugar cond_args_clone: PRESENT
+guard ternary-desugar testArith normalization: PRESENT
+
+[counts]
+proof-fns: 8
+pins: 6
+# NOTE: proof-fns is a file-shape fact (change detector), NOT the
+# Verus obligation count — the gate asserts N verified separately.
+
+[exec]
+# Each MAPPED test above, EXECUTED against the live source (one
+# module-suite run per model; per-test verdicts grepped from output).
+# A mapped test that fails or vanishes from the run is drift — FATAL.
+# The checker RUNS each mapped test (one module-suite cargo test per
+# source file) and records the per-test PASS/FAIL verdict below.
+# all suites built; per-test verdicts below
+exec pin_arithstr_becomes_arith: UNMIRRORED (not executed)
+exec pin_branch_preserved: UNMIRRORED (not executed)
+exec pin_calls_pass_through: UNMIRRORED (not executed)
+exec pin_other_refuses: UNMIRRORED (not executed)
+exec pin_testarith_normalizes: UNMIRRORED (not executed)
+exec pin_teststr_becomes_test: UNMIRRORED (not executed)

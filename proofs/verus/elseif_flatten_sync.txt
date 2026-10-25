@@ -1,0 +1,31 @@
+# verus-sync-coverage manifest: elseif_flatten
+# source sha: else_if_flatten=ab8665a8f522  proof sha: 8ac4f6770ca5
+
+[pins]
+pin pin_chain_flattens_fully -> test a_bare_nested_if_chain_flattens_fully: MAPPED
+pin pin_else_if_becomes_elsif -> test else_if_becomes_an_elsif: MAPPED
+pin pin_extra_statements_keep_nesting -> test an_else_with_extra_statements_keeps_its_nesting: MAPPED
+pin pin_selection_preserved -> test else_if_becomes_an_elsif: MAPPED
+
+[guards]
+guard elseif-flatten flatten_chain: PRESENT
+guard elseif-flatten empty-elsifs trigger: PRESENT
+guard elseif-flatten elsif push: PRESENT
+
+[counts]
+proof-fns: 12
+pins: 4
+# NOTE: proof-fns is a file-shape fact (change detector), NOT the
+# Verus obligation count — the gate asserts N verified separately.
+
+[exec]
+# Each MAPPED test above, EXECUTED against the live source (one
+# module-suite run per model; per-test verdicts grepped from output).
+# A mapped test that fails or vanishes from the run is drift — FATAL.
+# The checker RUNS each mapped test (one module-suite cargo test per
+# source file) and records the per-test PASS/FAIL verdict below.
+# all suites built; per-test verdicts below
+exec pin_chain_flattens_fully (a_bare_nested_if_chain_flattens_fully): PASS
+exec pin_else_if_becomes_elsif (else_if_becomes_an_elsif): PASS
+exec pin_extra_statements_keep_nesting (an_else_with_extra_statements_keeps_its_nesting): PASS
+exec pin_selection_preserved (else_if_becomes_an_elsif): PASS

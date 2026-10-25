@@ -1,0 +1,41 @@
+# verus-sync-coverage manifest: slice_identity
+# source sha: slice_identity=3668f9a80c37  proof sha: 2651f3638c98
+
+[pins]
+pin pin_absent_length_folds -> test length_absent_to_end_folds_at_zero: MAPPED
+pin pin_empty_offset_folds -> test empty_offset_means_zero_and_folds: MAPPED
+pin pin_fold_invisible_at_runtime -> test zero_offset_empty_length_folds_to_plain_read: MAPPED
+pin pin_non_ident_kept -> test array_and_positional_names_are_kept: MAPPED
+pin pin_plain_read_untouched -> test transform_reports_false_when_nothing_matches: MAPPED
+pin pin_real_length_kept -> test real_length_is_kept: MAPPED
+pin pin_real_offset_kept -> test real_offset_is_kept: MAPPED
+pin pin_zero_offset_empty_length_folds -> test zero_offset_empty_length_folds_to_plain_read: MAPPED
+
+[guards]
+guard slice-identity param-call gate: PRESENT
+guard slice-identity arity gate: PRESENT
+guard slice-identity is_plain_ident gate: PRESENT
+guard slice-identity offset gate: PRESENT
+guard slice-identity length gate: PRESENT
+
+[counts]
+proof-fns: 9
+pins: 8
+# NOTE: proof-fns is a file-shape fact (change detector), NOT the
+# Verus obligation count — the gate asserts N verified separately.
+
+[exec]
+# Each MAPPED test above, EXECUTED against the live source (one
+# module-suite run per model; per-test verdicts grepped from output).
+# A mapped test that fails or vanishes from the run is drift — FATAL.
+# The checker RUNS each mapped test (one module-suite cargo test per
+# source file) and records the per-test PASS/FAIL verdict below.
+# all suites built; per-test verdicts below
+exec pin_absent_length_folds (length_absent_to_end_folds_at_zero): PASS
+exec pin_empty_offset_folds (empty_offset_means_zero_and_folds): PASS
+exec pin_fold_invisible_at_runtime (zero_offset_empty_length_folds_to_plain_read): PASS
+exec pin_non_ident_kept (array_and_positional_names_are_kept): PASS
+exec pin_plain_read_untouched (transform_reports_false_when_nothing_matches): PASS
+exec pin_real_length_kept (real_length_is_kept): PASS
+exec pin_real_offset_kept (real_offset_is_kept): PASS
+exec pin_zero_offset_empty_length_folds (zero_offset_empty_length_folds_to_plain_read): PASS

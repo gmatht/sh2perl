@@ -1,0 +1,56 @@
+# verus-sync-coverage manifest: case_lowering
+# source sha: case_lowering=581f16c2d0ff  proof sha: b2fc6aa76ef3
+
+[pins]
+pin pin_alternations_or -> test alternations_split_into_ored_conditions: MAPPED
+pin pin_arith_subject_binds -> test arith_subject_binds_text_form: MAPPED
+pin pin_glob_lowers_with_target -> test glob_clause_lowers_via_globmatch_on_accepting_target: MAPPED
+pin pin_glob_refuses_without_target -> test glob_class_refuses_whole_case: MAPPED
+pin pin_impure_binds_once -> test impure_discriminant_binds_once: MAPPED
+pin pin_leading_catchall_refuses -> test leading_catchall_refuses: MAPPED
+pin pin_literal_affix_dispatch -> test literal_and_affix_clauses_lower_to_native_tests: MAPPED
+pin pin_nocasematch_refuses -> test nocasematch_mention_refuses_the_whole_program: MAPPED
+pin pin_post_catchall_dropped -> UNMIRRORED (by design — see VERUS.md §(b).4)
+pin pin_pure_subject_lowers_unbound -> test optimizer_getvar_subject_lowers: MAPPED
+pin pin_quoted_star_is_literal -> test quoted_star_is_a_literal_not_the_catchall: MAPPED
+pin pin_refused_pattern_refuses -> test dynamic_and_partial_quote_patterns_refuse: MAPPED
+pin pin_reserved_subject_binds -> test getvar_reserved_name_binds_once: MAPPED
+pin pin_volatile_positional_binds -> test quoted_positional_subject_lowers_volatile_binds: MAPPED
+
+[guards]
+guard case-lowering lower_case: PRESENT
+guard case-lowering classify_pattern: PRESENT
+guard case-lowering pure_subject gate: PRESENT
+guard case-lowering glob_target_ok gate: PRESENT
+guard case-lowering fresh_subject_name: PRESENT
+guard case-lowering exact not_wrap encoding: PRESENT
+guard case-lowering globMatch arm: PRESENT
+guard case-lowering nocasematch probe: PRESENT
+
+[counts]
+proof-fns: 24
+pins: 14
+# NOTE: proof-fns is a file-shape fact (change detector), NOT the
+# Verus obligation count — the gate asserts N verified separately.
+
+[exec]
+# Each MAPPED test above, EXECUTED against the live source (one
+# module-suite run per model; per-test verdicts grepped from output).
+# A mapped test that fails or vanishes from the run is drift — FATAL.
+# The checker RUNS each mapped test (one module-suite cargo test per
+# source file) and records the per-test PASS/FAIL verdict below.
+# all suites built; per-test verdicts below
+exec pin_alternations_or (alternations_split_into_ored_conditions): PASS
+exec pin_arith_subject_binds (arith_subject_binds_text_form): PASS
+exec pin_glob_lowers_with_target (glob_clause_lowers_via_globmatch_on_accepting_target): PASS
+exec pin_glob_refuses_without_target (glob_class_refuses_whole_case): PASS
+exec pin_impure_binds_once (impure_discriminant_binds_once): PASS
+exec pin_leading_catchall_refuses (leading_catchall_refuses): PASS
+exec pin_literal_affix_dispatch (literal_and_affix_clauses_lower_to_native_tests): PASS
+exec pin_nocasematch_refuses (nocasematch_mention_refuses_the_whole_program): PASS
+exec pin_post_catchall_dropped: UNMIRRORED (not executed)
+exec pin_pure_subject_lowers_unbound (optimizer_getvar_subject_lowers): PASS
+exec pin_quoted_star_is_literal (quoted_star_is_a_literal_not_the_catchall): PASS
+exec pin_refused_pattern_refuses (dynamic_and_partial_quote_patterns_refuse): PASS
+exec pin_reserved_subject_binds (getvar_reserved_name_binds_once): PASS
+exec pin_volatile_positional_binds (quoted_positional_subject_lowers_volatile_binds): PASS

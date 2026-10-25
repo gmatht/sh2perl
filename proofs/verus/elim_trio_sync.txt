@@ -1,0 +1,43 @@
+# verus-sync-coverage manifest: elim_trio
+# source sha: const_condition_elim=ba7bbd048b97 unreachable_after_exit=963151afa875 merge_init_assignments=5354c2b10fac  proof sha: dc635af79198
+
+[pins]
+pin pin_cce_dowhile_once -> UNMIRRORED (by design — see VERUS.md §(b).4)
+pin pin_cce_false_branch -> UNMIRRORED (by design — see VERUS.md §(b).4)
+pin pin_cce_true_branch -> UNMIRRORED (by design — see VERUS.md §(b).4)
+pin pin_cce_while_false_drops -> UNMIRRORED (by design — see VERUS.md §(b).4)
+pin pin_mia_merges -> UNMIRRORED (by design — see VERUS.md §(b).4)
+pin pin_mia_pair_agrees -> UNMIRRORED (by design — see VERUS.md §(b).4)
+pin pin_uae_keeps_clean -> UNMIRRORED (by design — see VERUS.md §(b).4)
+pin pin_uae_truncates -> UNMIRRORED (by design — see VERUS.md §(b).4)
+
+[guards]
+guard const-condition-elim eval_cond: PRESENT
+guard const-condition-elim is_bare_literal gate: PRESENT
+guard unreachable-after-exit Exit trigger: PRESENT
+guard unreachable-after-exit Return trigger: PRESENT
+guard merge-init is_literal gate: PRESENT
+guard merge-init pure gate: PRESENT
+guard merge-init reads_var gate: PRESENT
+
+[counts]
+proof-fns: 16
+pins: 8
+# NOTE: proof-fns is a file-shape fact (change detector), NOT the
+# Verus obligation count — the gate asserts N verified separately.
+
+[exec]
+# Each MAPPED test above, EXECUTED against the live source (one
+# module-suite run per model; per-test verdicts grepped from output).
+# A mapped test that fails or vanishes from the run is drift — FATAL.
+# The checker RUNS each mapped test (one module-suite cargo test per
+# source file) and records the per-test PASS/FAIL verdict below.
+# all suites built; per-test verdicts below
+exec pin_cce_dowhile_once: UNMIRRORED (not executed)
+exec pin_cce_false_branch: UNMIRRORED (not executed)
+exec pin_cce_true_branch: UNMIRRORED (not executed)
+exec pin_cce_while_false_drops: UNMIRRORED (not executed)
+exec pin_mia_merges: UNMIRRORED (not executed)
+exec pin_mia_pair_agrees: UNMIRRORED (not executed)
+exec pin_uae_keeps_clean: UNMIRRORED (not executed)
+exec pin_uae_truncates: UNMIRRORED (not executed)

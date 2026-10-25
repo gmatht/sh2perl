@@ -1,3 +1,7 @@
+// RETIRED (see VERUS.md §(d) P0(iv)): the modelled `arith_bounds` never
+// landed — the live estimator is `arith_abs_bound`, proved in Isabelle
+// (`I32Provable.thy`). Kept as a superseded-design record; NOT gated.
+//
 // Verus proof of arith_bounds over the REAL ArithAst shape, with the
 // EXECUTABLE function carrying the postcondition.
 //

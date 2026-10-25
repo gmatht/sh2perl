@@ -1,0 +1,41 @@
+# verus-sync-coverage manifest: seq_range
+# source sha: seq_range_for=4b6ac06e4d83  proof sha: ea1eccc79ec0
+
+[pins]
+pin pin_body_write_disqualifies -> test body_write_disqualifies: MAPPED
+pin pin_descending_is_empty -> test descending_seq_is_an_empty_range: MAPPED
+pin pin_huge_span_disqualifies -> test huge_range_disqualifies: MAPPED
+pin pin_nonliteral_keeps_runtime -> test float_and_leading_zero_args_keep_runtime_path: MAPPED
+pin pin_one_arg_starts_at_one -> test one_arg_seq_starts_at_one: MAPPED
+pin pin_setvar_write_disqualifies -> test setvar_write_disqualifies: MAPPED
+pin pin_step_keeps_runtime -> test step_three_arg_seq_keeps_runtime_path: MAPPED
+pin pin_two_arg_lifts -> test two_arg_seq_lifts_to_range: MAPPED
+
+[guards]
+guard seq-range seq_range_bounds: PRESENT
+guard seq-range seq-name check: PRESENT
+guard seq-range exactness bound MAX_SAFE_INT: PRESENT
+guard seq-range materialization bound MAX_SPAN: PRESENT
+guard seq-range body-write scan: PRESENT
+
+[counts]
+proof-fns: 9
+pins: 8
+# NOTE: proof-fns is a file-shape fact (change detector), NOT the
+# Verus obligation count — the gate asserts N verified separately.
+
+[exec]
+# Each MAPPED test above, EXECUTED against the live source (one
+# module-suite run per model; per-test verdicts grepped from output).
+# A mapped test that fails or vanishes from the run is drift — FATAL.
+# The checker RUNS each mapped test (one module-suite cargo test per
+# source file) and records the per-test PASS/FAIL verdict below.
+# all suites built; per-test verdicts below
+exec pin_body_write_disqualifies (body_write_disqualifies): PASS
+exec pin_descending_is_empty (descending_seq_is_an_empty_range): PASS
+exec pin_huge_span_disqualifies (huge_range_disqualifies): PASS
+exec pin_nonliteral_keeps_runtime (float_and_leading_zero_args_keep_runtime_path): PASS
+exec pin_one_arg_starts_at_one (one_arg_seq_starts_at_one): PASS
+exec pin_setvar_write_disqualifies (setvar_write_disqualifies): PASS
+exec pin_step_keeps_runtime (step_three_arg_seq_keeps_runtime_path): PASS
+exec pin_two_arg_lifts (two_arg_seq_lifts_to_range): PASS
