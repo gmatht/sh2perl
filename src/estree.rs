@@ -17,6 +17,7 @@
 //! - every callee is in the `sh2.*` whitelist.
 
 use crate::ast::*;
+use crate::shir::NATIVE_STAGE_IN;
 use serde::Serialize;
 use std::collections::{HashMap, HashSet};
 
@@ -626,20 +627,37 @@ fn fix_expr(e: Expr, in_arrow: bool, in_func: bool, in_loop: bool) -> Expr {
             body,
             expression,
             r#async,
-        } => Expr::ArrowFunctionExpression {
-            params,
-            body: match body {
-                ArrowBody::Expr(inner) => {
-                    ArrowBody::Expr(Box::new(fix_expr(*inner, true, in_func, in_loop)))
-                }
-                ArrowBody::Block(b) => ArrowBody::Block(Box::new(
-                    fix_stmt(*b, true, in_func, false, in_loop)
-                        .unwrap_or(Stmt::BlockStatement { body: vec![] }),
-                )),
-            },
-            expression,
-            r#async,
-        },
+        } => {
+            // The emitter's own NATIVE PIPELINE STAGE arrows (src/shir.rs
+            // `native_stage_block_arrow`: head/tail/sed/cut/sort/wc/awk text
+            // transforms) are identified by their reserved parameter name.
+            // Their trailing `return [text, status]` is the arrow's VALUE, and
+            // the emitter builds the whole body — no shell `return` can occur
+            // in one. Without this exemption the in-loop signal rewrite turns
+            // that value return into `sh2.return([…])`, which THROWS a RETURN
+            // signal out of the pipeline stage and unwinds the enclosing shell
+            // function: `for i in 1 2; do find . -name '*.sh' | head -1; done`
+            // printed nothing and exited 1 (and the shipped
+            // dqs-nested-awk-sed.sh emits `sh2.return([R.map(…), 0])` in its
+            // awk stage today).
+            let native_stage = params.len() == 1
+                && matches!(&params[0], Expr::Identifier { name } if name == NATIVE_STAGE_IN);
+            let body_loop = in_loop && !native_stage;
+            Expr::ArrowFunctionExpression {
+                params,
+                body: match body {
+                    ArrowBody::Expr(inner) => {
+                        ArrowBody::Expr(Box::new(fix_expr(*inner, true, in_func, body_loop)))
+                    }
+                    ArrowBody::Block(b) => ArrowBody::Block(Box::new(
+                        fix_stmt(*b, true, in_func, false, body_loop)
+                            .unwrap_or(Stmt::BlockStatement { body: vec![] }),
+                    )),
+                },
+                expression,
+                r#async,
+            }
+        }
         Expr::ObjectExpression { properties } => Expr::ObjectExpression {
             properties: properties
                 .into_iter()
@@ -6403,6 +6421,140 @@ mod tests {
         })
     }
 
+    /// Does the tree contain a `CallExpression` to `<obj>.setVar(<name>, …)`?
+    fn has_set_var(v: &serde_json::Value, name: &str) -> bool {
+        fn walk(v: &serde_json::Value, name: &str) -> bool {
+            match v {
+                serde_json::Value::Object(m) => {
+                    if v.get("type").and_then(|t| t.as_str()) == Some("CallExpression")
+                        && v.get("callee")
+                            .and_then(|c| c.get("property"))
+                            .and_then(|p| p.get("name"))
+                            .and_then(|n| n.as_str())
+                            == Some("setVar")
+                        && v.get("arguments")
+                            .and_then(|a| a.get(0))
+                            .and_then(|a| a.get("value"))
+                            .and_then(|x| x.as_str())
+                            == Some(name)
+                    {
+                        return true;
+                    }
+                    m.values().any(|x| walk(x, name))
+                }
+                serde_json::Value::Array(a) => a.iter().any(|x| walk(x, name)),
+                _ => false,
+            }
+        }
+        walk(v, name)
+    }
+
+    /// Does the tree contain `name = …` (an AssignmentExpression to the
+    /// plain Identifier binding)?
+    fn has_native_assign(v: &serde_json::Value, name: &str) -> bool {
+        fn walk(v: &serde_json::Value, name: &str) -> bool {
+            match v {
+                serde_json::Value::Object(m) => {
+                    if v.get("type").and_then(|t| t.as_str()) == Some("AssignmentExpression")
+                        && v.get("left").and_then(|l| l.get("type")).and_then(|t| t.as_str())
+                            == Some("Identifier")
+                        && v.get("left")
+                            .and_then(|l| l.get("name"))
+                            .and_then(|n| n.as_str())
+                            == Some(name)
+                    {
+                        return true;
+                    }
+                    m.values().any(|x| walk(x, name))
+                }
+                serde_json::Value::Array(a) => a.iter().any(|x| walk(x, name)),
+                _ => false,
+            }
+        }
+        walk(v, name)
+    }
+
+    /// Does the tree contain `sh2.vars.<name> = …` (the native plain-object
+    /// store write — the runtime `setVar`'s plain path without the dispatch)?
+    fn has_store_write(v: &serde_json::Value, name: &str) -> bool {
+        fn walk(v: &serde_json::Value, name: &str) -> bool {
+            match v {
+                serde_json::Value::Object(m) => {
+                    if v.get("type").and_then(|t| t.as_str()) == Some("AssignmentExpression") {
+                        let left = v.get("left");
+                        let is_vars = left
+                            .and_then(|l| l.get("object"))
+                            .and_then(|o| o.get("property"))
+                            .and_then(|p| p.get("name"))
+                            .and_then(|n| n.as_str())
+                            == Some("vars")
+                            && left
+                                .and_then(|l| l.get("object"))
+                                .and_then(|o| o.get("object"))
+                                .and_then(|o| o.get("name"))
+                                .and_then(|n| n.as_str())
+                                == Some("sh2")
+                            && left
+                                .and_then(|l| l.get("object"))
+                                .and_then(|o| o.get("computed"))
+                                .and_then(|c| c.as_bool())
+                                == Some(false);
+                        let field = left
+                            .and_then(|l| l.get("property"))
+                            .and_then(|p| p.get("name"))
+                            .and_then(|n| n.as_str());
+                        if is_vars && field == Some(name) {
+                            return true;
+                        }
+                    }
+                    m.values().any(|x| walk(x, name))
+                }
+                serde_json::Value::Array(a) => a.iter().any(|x| walk(x, name)),
+                _ => false,
+            }
+        }
+        walk(v, name)
+    }
+
+    /// The string-accumulator flush (`v = concatItems("__acc_v")`) must land
+    /// in the NATIVE binding, not the `setVar` store. `string_src` admits
+    /// `concatItems` (so every read of `v` renders as the local binding); an
+    /// emitter arm missing for it fell through to the store write, leaving
+    /// the local at its pre-loop value — `tsv=""; …; echo "$tsv"` printed
+    /// "" instead of the accumulated chunks.
+    #[test]
+    fn concat_items_flush_writes_the_native_binding() {
+        let a1: serde_json::Value = serde_json::json!({
+            "contract_version": 1,
+            "type": "Program",
+            "imports": [], "requires": [], "stmt_lines": [], "subs": [],
+            "stmts": [
+                {"type":"Assign",
+                 "targets":[{"var":"tsv","indices":[],"sigil":null}],
+                 "expr":{"type":"Interpolate","parts":[{"kind":"lit","text":""}]}},
+                {"type":"Assign",
+                 "targets":[{"var":"tsv","indices":[],"sigil":null}],
+                 "expr":{"type":"Call","func":"concatItems","purity":"Emulable",
+                         "args":[{"type":"Str","value":"__acc_tsv","style":"DoubleQuoted"}]}},
+                {"type":"Expr","expr":{"type":"Call","func":"builtin","purity":"Emulable",
+                    "args":[{"type":"Str","value":"echo","style":"DoubleQuoted"},
+                            {"type":"Array","elements":[
+                                {"type":"Call","func":"getVar","purity":"Emulable",
+                                 "args":[{"type":"Str","value":"tsv","style":"DoubleQuoted"}]}]}]}}
+            ]
+        });
+        let ir = crate::shir_json_in::shir_json_to_ir(&a1.to_string()).expect("A1 ingress");
+        let json = serde_json::to_value(&crate::shir::shir_to_estree(&ir)).unwrap();
+        assert!(
+            !has_set_var(&json, "tsv"),
+            "the flush must not write the store: {json}"
+        );
+        assert!(
+            has_native_assign(&json, "tsv"),
+            "the flush must assign the native binding: {json}"
+        );
+    }
+
     #[test]
     fn direct_call_bridges_getvar_positional_reads() {
         // `a = getVar("1")` — the getVar convention for `$1`. Without the
@@ -6650,7 +6802,12 @@ mod tests {
         // (`String(name).slice(0, 4)` is a CallExpression whose callee is
         // the `.slice` member — the old root-only scan missed it and left
         // 5 corpus sites on the runtime join).
-        let json = to_json("n=hello; echo \"${n:0:4}\"");
+        // `n` is defined from a DYNAMIC source on purpose: a literal def
+        // would let copy-propagation's param-fold collapse the whole
+        // `${n:0:4}` chain to one string before estree ever sees it, and
+        // this test exists to pin the String(n).slice(0,4) + no-runtime-join
+        // path for the non-const shape (the corpus covers the const one).
+        let json = to_json("n=\"$1\"; echo \"${n:0:4}\"");
         assert!(json.contains("\"name\":\"slice\""));
         assert!(!json.contains("\"name\":\"join\""), "no runtime join");
         assert!(!json.contains("unsupported"));
@@ -6795,9 +6952,88 @@ mod tests {
     }
 
     #[test]
+    fn native_pipeline_stage_return_survives_loop_body_signal_rewrite() {
+        // A native pipeline STAGE arrow inside a LOOP BODY: its trailing
+        // `return [text, status]` is the arrow's VALUE. The loop-body signal
+        // rewrite used to convert it to `sh2.return([…])`, which THROWS a
+        // RETURN signal out of the stage and unwinds the enclosing function —
+        // `for i in 1 2; do find . -name '*.sh' | head -1; done` printed
+        // nothing and exited 1 (the shipped dqs-nested-awk-sed.sh carried the
+        // same `sh2.return([R.map(…), 0])` in its awk stage).
+        let json = to_json("for i in 1 2; do find . -name '*.sh' | tail -1; done");
+        assert!(json.contains("\"ReturnStatement\""), "{json}");
+        assert!(
+            !json.contains("\"name\":\"return\""),
+            "a stage's value return must stay a native return: {json}"
+        );
+        // …but a SHELL `return` inside a loop body must still signal, or the
+        // loop would swallow it (the rule this fix is scoped around).
+        let json2 = to_json("f() { for i in 1 2; do return 3; done; }; f");
+        assert!(json2.contains("\"name\":\"return\""), "{json2}");
+    }
+
+    #[test]
+    fn find_head_pipeline_carries_producer_cap() {
+        // `find … | head -N` — the runtime MATERIALISES pipe stages, so the
+        // producer used to run to completion before head looked at its first
+        // N lines (a 568k-entry tree walked in 14.2s vs bash's 7ms; bash's
+        // find dies of SIGPIPE). A two-stage pipeline whose consumer is the
+        // native head fold now carries the count so the runtime can cap the
+        // producer's fd-1 sink (harness sh2-namespace.mjs `capCapture`) and
+        // interruptible producers abort (builtins.find → status 141).
+        let json = to_json("find . -name '*.sh' | head -3");
+        assert!(json.contains("\"name\":\"pipelineSync\""), "{json}");
+        assert!(
+            json.contains("\"name\":\"lines\""),
+            "head -3 must cap the producer: {json}"
+        );
+        assert!(json.contains("\"value\":3"), "{json}");
+        // `head -c N` caps by BYTES (the fold is a bare slice)
+        let json2 = to_json("find . -name '*.sh' | head -c 5");
+        assert!(json2.contains("\"name\":\"bytes\""), "{json2}");
+        // a DYNAMIC count (a positional — not const-foldable) cannot be
+        // capped at compile time
+        let json3 = to_json("find . -name '*.sh' | head -n \"$1\"");
+        assert!(!json3.contains("\"name\":\"lines\""), "{json3}");
+        // a THREE-stage pipeline must NOT cap: the middle stage
+        // (find | sort | head) needs the producer's whole output
+        let json4 = to_json("find . -name '*.sh' | sort | head -3");
+        assert!(!json4.contains("\"name\":\"lines\""), "{json4}");
+        // `tail` is not a prefix consumer — never capped
+        let json5 = to_json("find . -name '*.sh' | tail -3");
+        assert!(!json5.contains("\"name\":\"lines\""), "{json5}");
+    }
+
+    #[test]
+    fn yes_head_stage_pair_folds_to_native_repeat() {
+        // `yes LIT | head -N` — an INFINITE producer: the pair's pipe text is
+        // exactly `("LIT" + "\n").repeat(N)`, the same fold the capture lift
+        // does. As a pipeline PREFIX the two stages collapse to that string
+        // stage, which removes the `yes` subprocess and the runtime's 1 MiB
+        // runaway-producer churn, and lets the remaining stages run sync.
+        let json = to_json("yes Line:LINE | head -n100 | while read L; do echo \"$L\"; done");
+        assert!(json.contains("\"name\":\"repeat\""), "{json}");
+        assert!(json.contains("\"value\":\"Line:LINE\""), "{json}");
+        assert!(json.contains("\"value\":100"), "{json}");
+        assert!(
+            !json.contains("\"name\":\"exec\""),
+            "the yes spawn must be gone: {json}"
+        );
+        assert!(!json.contains("\"value\":\"yes\""), "{json}");
+        // a bare two-stage pair is NOT collapsed (the runtime only carries a
+        // string stage forward as the next stage's stdin — one stage left
+        // would drop the output)
+        let json2 = to_json("yes x | head -2");
+        assert!(!json2.contains("\"name\":\"repeat\""), "{json2}");
+        // a dynamic yes word (a positional — not const-foldable) keeps the
+        // spawn; only one LITERAL word folds
+        let json3 = to_json("yes \"$1\" | head -2 | cat");
+        assert!(json3.contains("\"name\":\"exec\""), "{json3}");
+    }
+
+    #[test]
     fn echo_head_statement_pipeline_folds_to_native_write() {
         // statement-form `echo "select" | head -1` — a static echo
-        // producer feeding a static head consumer: the whole pipeline
         // folds to a native `process.stdout.write("select\n")` (the
         // head output over the echo text computed at emit time — no
         // pipeline machinery, no builtin dispatch). A DYNAMIC producer
@@ -6870,6 +7106,49 @@ mod tests {
     }
 
     #[test]
+    fn test_family_static_words_binary_file_ops_single_word_tilde() {
+        // `test WORD...` — the `test` BUILTIN's static word list joins into
+        // the same text `[ ]` uses, so the native lowering applies: no
+        // builtin dispatch, no tokenize/parse.
+        let json = to_json("test \"foo\" = \"bar\"");
+        assert!(!json.contains("\"value\":\"test\""));
+        assert!(!json.contains("\"name\":\"builtin\""));
+        assert!(json.contains("\"value\":\"foo\""));
+        // `test -f PATH` → the sync file test
+        let json = to_json("test -f /etc/passwd");
+        assert!(json.contains("\"name\":\"fileTest\""));
+        assert!(!json.contains("\"name\":\"builtin\""));
+        // a `$`/quote-bearing word keeps the runtime builtin (the join
+        // would not round-trip)
+        let json = to_json("test \"$x\" = \"y\"");
+        assert!(json.contains("\"value\":\"test\""));
+        // `-ef` / `-nt` / `-ot` → the direct stat-time/same-file call
+        let json = to_json("[ /path -ef /other ]");
+        assert!(json.contains("\"name\":\"fileTest2\""));
+        assert!(!json.contains("\"name\":\"test\""));
+        let json = to_json("[ a -nt b ]");
+        assert!(json.contains("\"value\":\"-nt\""));
+        assert!(!json.contains("\"name\":\"test\""));
+        // `[ WORD ]` — one token = the non-empty string test
+        let json = to_json("[ abc ]");
+        assert!(!json.contains("\"name\":\"test\""));
+        assert!(json.contains("\"operator\":\"!==\""));
+        // `${NAME-}` (empty default) is the plain read, so the one-token
+        // test lowers too
+        let json = to_json("[ \"${NOT_SET_XYZ-}\" ]");
+        assert!(!json.contains("\"name\":\"test\""));
+        // a tilde operand (unquoted) expands to the runtime's HOME read
+        let json = to_json("[ ~/Documents = \"$HOME/Documents\" ]");
+        assert!(!json.contains("\"name\":\"test\""));
+        assert!(json.contains("HOME"));
+        assert!(!json.contains("unsupported"));
+        // a QUOTED tilde stays the literal character
+        let json = to_json("[ \"~\" = \"x\" ]");
+        assert!(!json.contains("getVar"));
+        assert!(json.contains("\"value\":\"~\""));
+    }
+
+    #[test]
     fn quiet_grep_cmdsub_test_folds_constant() {
         // `[ "$(echo "$v" | grep -q "p")" ]` — grep -q NEVER writes
         // stdout, so the captured operand value is always "" and the
@@ -6884,10 +7163,19 @@ mod tests {
         let json2 = to_json("[ ! \"$(echo x | grep -q y)\" ]");
         assert!(json2.contains("\"value\":true"));
         assert!(!json2.contains("\"name\":\"test\""));
-        // a non-grep cmdsub operand keeps the runtime test
+        // `[ "$(echo x)" ]` — a one-token value test over a LITERAL echo
+        // cmdsub: the fold makes the operand a compile-time string, so the
+        // single-word rule (`parseTest`'s `str` node = non-empty) lowers to
+        // the native `String("x") !== ""` — no runtime test text.
         let json3 = to_json("[ \"$(echo x)\" ]");
-        assert!(json3.contains("\"name\":\"test\""));
+        assert!(!json3.contains("\"name\":\"test\""));
+        assert!(json3.contains("\"value\":\"x\""));
         assert!(!json3.contains("unsupported"));
+        // an array-expansion token (`${arr[@]}`) is a store shape the
+        // operand helper refuses — the runtime test stays
+        let json4 = to_json("[ \"${arr[@]}\" ]");
+        assert!(json4.contains("\"name\":\"test\""));
+        assert!(!json4.contains("unsupported"));
     }
 
     #[test]
@@ -7044,6 +7332,37 @@ mod tests {
         assert!(!json2.contains("\"name\":\"capture\""));
         assert!(!json2.contains("\"name\":\"exec\""));
         assert!(!json2.contains("unsupported"));
+    }
+
+    #[test]
+    fn capture_of_single_sync_builtin_lowers_to_builtin_value() {
+        // `$(SYNC-BUILTIN ARGS...)` whose body is exactly one sync-builtin
+        // dispatch collapses `captureSync(() => builtin(...))` into ONE
+        // `sh2.builtinValue(name, args)` call — the runtime twin replays the
+        // same fd-1 capture install and post-processing, minus a call frame
+        // and the per-call arrow allocation (src/shir.rs
+        // `native_capture_builtin_value`).
+        let json = to_json("x=$(diff a.txt b.txt)");
+        assert!(json.contains("\"name\":\"builtinValue\""), "{json}");
+        assert!(!json.contains("\"name\":\"captureSync\""), "{json}");
+        assert!(!json.contains("\"name\":\"capture\""), "{json}");
+        assert!(!json.contains("\"name\":\"exec\""), "{json}");
+        assert!(!json.contains("unsupported"));
+        // the redirect-wrapped form passes the spec array as the third
+        // argument: `captureSync(() => redirectSync(() => builtin(...)))` is
+        // the same composition the twin replays.
+        let json2 = to_json("x=$(sha256sum f.txt 2>/dev/null)");
+        assert!(json2.contains("\"name\":\"builtinValue\""), "{json2}");
+        assert!(!json2.contains("\"name\":\"redirectSync\""), "{json2}");
+        assert!(!json2.contains("\"name\":\"captureSync\""), "{json2}");
+        // The WORD-SPLIT form must stay on the runtime: `a=(`sort <<< x`)`
+        // word-splits the captured value, so its value IS the array —
+        // collapsing it to a plain string silently merged the elements
+        // (064_07's `sorted=($(sort <<<"${config[*]}"))` and 000__04h's
+        // `files=(`ls *.sh`)`).
+        let json3 = to_json("#!/bin/bash\nfiles=(`sort <<< \"$y\"`)\n");
+        assert!(!json3.contains("\"name\":\"builtinValue\""), "{json3}");
+        assert!(json3.contains("captureWords"), "{json3}");
     }
 
     #[test]
@@ -7242,20 +7561,64 @@ mod tests {
 
     #[test]
     fn grep_with_regex_pattern_not_lifted() {
-        // BRE metacharacters disqualify the lift: `grep 'a.c'` is a regex,
-        // not a substring test — the pipeline must stay.
+        // BRE metacharacters are NOT a substring test: `grep 'a.c'` keeps its
+        // REGEX semantics — the mini-grep evaluates the pattern as a regex,
+        // never as `String(x).includes(...)`. The two-stage pipeline still
+        // collapses to the one sync `grepText` call (no spawn, no stage
+        // machinery, no fd juggling).
         let json = to_json("if echo hi | grep a.c > /dev/null 2> /dev/null; then echo yes; fi");
-        assert!(!json.contains("contains"));
-        assert!(json.contains("pipeline"));
+        assert!(!json.contains("includes"));
+        assert_eq!(json.matches("\"name\":\"grepText\"").count(), 1);
+        assert!(!json.contains("\"name\":\"pipelineSync\""));
+        assert!(!json.contains("\"name\":\"pipeline\""));
     }
 
     #[test]
     fn statement_pipeline_grep_not_lifted() {
-        // Statement-position `echo x | grep y >/dev/null` keeps its $? status
-        // (read back by the next command) — only test-position conds lift.
+        // A statement-position `echo x | grep y >/dev/null` whose `$?` the
+        // next command reads keeps its status: the sync mini-grep records
+        // grep's exit code in sh2.lastExit, so the redirect collapse is
+        // value- and status-identical — and it must NOT degrade to a bare
+        // `includes` (that would lose the emit and the status).
         let json = to_json("echo hi | grep hi > /dev/null 2> /dev/null; echo $?");
-        assert!(!json.contains("contains"));
-        assert!(json.contains("pipeline"));
+        assert!(!json.contains("includes"));
+        assert!(json.contains("\"name\":\"grepText\""));
+        assert!(!json.contains("\"name\":\"pipelineSync\""));
+    }
+
+    #[test]
+    fn echo_grep_statement_pipeline_lowers_to_single_grep_text() {
+        // `echo T | grep FLAGS PAT > F` — static producer + mini-grep + stage
+        // redirect collapse to ONE sync call: grepText(text, argv, false,
+        // spec). No pipeline machinery, no builtin dispatch, and the spec is
+        // threaded into the helper's 4th parameter so the file write survives.
+        let json = to_json("echo l1 | grep -A 1 l1 > out.txt");
+        assert_eq!(json.matches("\"name\":\"grepText\"").count(), 1);
+        assert!(json.contains("\"value\":\"-A\""));
+        assert!(json.contains("\"value\":\"out.txt\""));
+        assert!(!json.contains("\"name\":\"pipelineSync\""));
+        assert!(!json.contains("\"name\":\"builtin\""));
+        // Flags the lift used to refuse (-w word lookarounds, -b byte
+        // offsets, --color) lower through the same shared grepSelect the
+        // builtin runs — never as a substring test.
+        for (src, flag) in [
+            ("echo \"word wordly\" | grep -w word", "-w"),
+            ("echo \"text here\" | grep -b text", "-b"),
+            ("echo \"abc\" | grep --color=always abc", "--color=always"),
+        ] {
+            let j = to_json(src);
+            assert!(j.contains("\"name\":\"grepText\""), "not lifted: {src}");
+            assert!(j.contains(&format!("\"value\":\"{flag}\"")), "flag lost: {src}");
+            assert!(!j.contains("includes"), "regex/substring confusion: {src}");
+        }
+        // `grep -P` also lowers (the `-P`→ERE polyfill may rewrite the flag,
+        // so only the lowering itself is pinned here).
+        let jp = to_json("echo \"a1\" | grep -P \"[0-9]\"");
+        assert!(jp.contains("\"name\":\"grepText\""));
+        assert!(!jp.contains("includes"));
+        // A FILE operand keeps the runtime: grepText has no multi-source form.
+        let json3 = to_json("echo hi | grep hi file.txt");
+        assert!(!json3.contains("\"name\":\"grepText\""));
     }
 
     #[test]
@@ -7631,28 +7994,74 @@ mod tests {
     }
 
     #[test]
-    fn file_target_redirect_lowers_to_sync_twin() {
+    fn file_target_redirect_collapses_into_builtin() {
         // `cat file.txt > out.txt` — a sync builtin body with a literal
-        // FILE target lowers to the runtime's `redirectSync` twin (the
-        // eligibility audit: every _applyRedirectSpecs mode is
-        // synchronous — existsSync/openSync/writeFileSync — so the
-        // await-free body is the only gate; see
-        // redirect_specs_sync_ok).
+        // FILE target: the single-builtin redirect body collapses into the
+        // one-call `sh2.builtin(NAME, ARGS, ENV, SPECS)` form (the runtime
+        // applies redirectSync's own spec install/restore pass around the
+        // same builtin — see try_builtin_redirect_collapse). One call
+        // frame, one arrow allocation and one fd-table save fewer.
         let json = to_json("cat file.txt > out.txt");
-        assert!(json.contains("\"name\":\"redirectSync\""));
+        assert!(!json.contains("\"name\":\"redirectSync\""));
         assert!(!json.contains("\"name\":\"redirect\""));
+        assert!(json.contains("\"name\":\"builtin\""));
+        assert!(json.contains("\"value\":\"cat\""));
+        assert!(json.contains("\"value\":\"out.txt\""));
         // a DYNAMIC target that lowers await-free (the `$(pwd)` twin is
-        // a native `sh2.cwd` read — no capture) also qualifies.
+        // a native `sh2.cwd` read — no call) also qualifies.
         let json2 = to_json("ls > \"$(pwd)/x\"");
-        assert!(json2.contains("\"name\":\"redirectSync\""));
+        assert!(!json2.contains("\"name\":\"redirectSync\""));
         assert!(!json2.contains("\"name\":\"redirect\""));
-        // a target whose cmdsub is a real capture (`$(cat ...)` — an
-        // await in the specs) keeps the async `redirect` path: the sync
-        // twin cannot wait for the capture before installing the spec.
+        assert!(json2.contains("\"name\":\"builtin\""));
+        // a target whose cmdsub is a real read (`$(cat ...)` lowers to a
+        // runtime call in the spec) keeps the general redirect form: the
+        // collapse requires prop provably call-free parts, so the arg
+        // order cannot be observed.
         let json3 = to_json("ls > \"$(cat /etc/hostname)\"");
-        assert!(json3.contains("\"name\":\"redirect\""));
-        assert!(!json3.contains("\"name\":\"redirectSync\""));
+        assert!(json3.contains("\"name\":\"redirectSync\""));
+        assert!(!json3.contains("\"name\":\"redirect\""));
         assert!(!json3.contains("unsupported"));
+    }
+
+    #[test]
+    fn single_builtin_redirect_collapses_to_builtin_call() {
+        // The three fd shapes all collapse: fd-1 write, fd-0 read, fd-2.
+        let out = to_json("ls -1 > /tmp/out.txt");
+        assert!(!out.contains("\"name\":\"redirectSync\""));
+        assert!(!out.contains("\"name\":\"redirect\""));
+        assert!(out.contains("\"name\":\"builtin\""));
+        assert!(out.contains("\"value\":\"-1\""));
+        assert!(out.contains("\"value\":\"/tmp/out.txt\""));
+        let inp = to_json("sort < /etc/passwd");
+        assert!(!inp.contains("\"name\":\"redirectSync\""));
+        assert!(inp.contains("\"name\":\"builtin\""));
+        assert!(inp.contains("\"value\":\"r\""));
+        let err = to_json("ls -l 2>/dev/null");
+        assert!(!err.contains("\"name\":\"redirectSync\""));
+        assert!(err.contains("\"name\":\"builtin\""));
+        assert!(err.contains("\"value\":2"));
+        // The expression-position form (`$()` / a pipeline stage) collapses
+        // the same way where the redirect survives; a single-file stdin
+        // read folds even further (a native readText chain) — either way no
+        // redirect frame is left behind.
+        let cap = to_json("x=$(sort < /etc/passwd)");
+        assert!(!cap.contains("\"name\":\"redirectSync\""));
+        assert!(!cap.contains("\"name\":\"redirect\""));
+        // NEGATIVES -----------------------------------------------------
+        // a persistent (`exec`-installed) redirect keeps the general form
+        let persist = to_json("exec 3>&1");
+        assert!(persist.contains("\"name\":\"persist\""));
+        assert!(!persist.contains("\"name\":\"builtin\""));
+        // a body with a side-effecting argument keeps the general form (the
+        // collapsed form would evaluate the args before the spec targets)
+        let impure = to_json("ls $(echo d) > /tmp/o.txt");
+        assert!(impure.contains("\"name\":\"redirectSync\""));
+        // a multi-statement body keeps the general form
+        let multi = to_json("{ true; ls; } > /tmp/o.txt");
+        assert!(multi.contains("\"name\":\"redirectSync\""));
+        // a non-builtin body (an external spawn) keeps the general form
+        let ext = to_json("awk '{print}' /etc/passwd > /tmp/o.txt");
+        assert!(ext.contains("\"name\":\"redirectSync\"") || ext.contains("\"name\":\"redirect\""));
     }
 
     #[test]
@@ -7832,10 +8241,42 @@ greet");
         }\n\
         complex_function --flag1 --option1=value1 -abc";
         let json = to_json(src);
-        // the `(( i += 2 ))` writes the store ONCE (the inner arith
-        // write); the redundant outer setVar is gone
-        assert_eq!(json.matches("\"name\":\"setVar\"").count(), 2);
+        // the `(( i += 2 ))` writes the store ONCE — the native plain-object
+        // store write (the arith arm's `sh2.vars.<name> = String(v)`, the
+        // runtime setVar's plain path); the redundant outer write is gone,
+        // so the ONLY remaining setVar is the dynamic-key subscript store
+        // (`options["$key"]="true"`).
+        let tree: serde_json::Value = serde_json::from_str(&json).unwrap();
+        assert!(!has_set_var(&tree, "i"), "the arith write is native: {json}");
+        assert!(has_store_write(&tree, "i"), "store write present: {json}");
+        assert_eq!(json.matches("\"name\":\"setVar\"").count(), 1);
         assert!(!json.contains("\"value\":\"i\"},{\"type\":\"SequenceExpression\""));
+        // and the write is not nested inside another store write (the old
+        // `setVar("i", (setVar("i", …), …))` double write)
+        assert!(!json.contains("\"value\":\"i\"}}),{\"type\":\"AssignmentExpression\""));
+    }
+
+    /// The native plain-object store write now also takes RHSs whose calls
+    /// provably return a plain scalar ([`store_rhs_plain_value`]): the
+    /// runtime `setVar` only diverges for the ARITH_BAD_MAGIC skip, the
+    /// array branch and the raw-object branch, so a `.toLowerCase()` /
+    /// `.replace(…)` / value-twin chain needs no dispatch. The shapes that
+    /// CAN produce the marker must keep the runtime write.
+    #[test]
+    fn plain_scalar_store_rhs_lowers_to_native_store_write() {
+        // A STORE-BOUND counter (the baked subscript `arr[$i]` keeps `i`
+        // store-observable) with an arith RHS: the write is the plain
+        // store property assignment, not the setVar dispatch.
+        let json = to_json("arr=(a b)\ni=0\narr[$i]=z\ni=$((i+1))");
+        let tree: serde_json::Value = serde_json::from_str(&json).unwrap();
+        assert!(!has_set_var(&tree, "i"), "{json}");
+        assert!(has_store_write(&tree, "i"), "{json}");
+        // the runtime arith text can return ARITH_BAD_MAGIC (`x=$((bad))`
+        // skips the assignment) — that stays on setVar.
+        let json2 = to_json("x=$(( $j*$i ))\necho \"$x\"");
+        let tree2: serde_json::Value = serde_json::from_str(&json2).unwrap();
+        assert!(has_set_var(&tree2, "x"), "magic-capable RHS keeps setVar: {json2}");
+        assert!(!has_store_write(&tree2, "x"), "{json2}");
     }
 
     #[test]
@@ -8105,7 +8546,10 @@ greet");
         // as raw text, arriving as the bare literal `--x=${X}`. The transform
         // splits it so the parameter expansion is evaluated — natively now
         // (X is a lifted string binding: `${X}` → bare `X`).
-        let json = to_json("X=test; echo --x=\"${X}\"");
+        // A dynamic def keeps `${X}` a real param read so the
+        // X-identifier lowering (not a const-folded literal) is what this
+        // lexer-split test exercises.
+        let json = to_json("X=\"$1\"; echo --x=\"${X}\"");
         assert!(json.contains("--x="));
         assert!(json.contains("\"type\":\"Identifier\",\"name\":\"X\""));
         assert!(!json.contains("\"name\":\"param\""));
@@ -8235,15 +8679,18 @@ greet");
         // whitespace IFS).
         let json = to_json("IFS=, read a b c <<< \"1,2,3\"");
         // the redirect wraps the env-carrying read (the env stays on the
-        // command; the no-op `true` split is gone) — a herestring target
-        // is an in-memory string target, sync-capable in the runtime
-        // twin, so the await-free body lowers to `redirectSync` (the
-        // fd-dup-only eligibility rule was retired — see
-        // redirect_specs_sync_ok)
-        assert!(json.contains("\"name\":\"redirectSync\""));
+        // command; the no-op `true` split is gone). The body is exactly
+        // one sync-builtin dispatch, so the redirect collapses into the
+        // single `sh2.builtin(NAME, ARGS, ENV, SPECS)` call — the
+        // runtime applies the same spec install/restore pass around the
+        // same builtin (see try_builtin_redirect_collapse); no separate
+        // redirectSync frame and no async redirect bridge.
+        assert!(!json.contains("\"name\":\"redirectSync\""));
         assert!(!json.contains("\"name\":\"redirect\""));
         assert!(json.contains("\"name\":\"builtin\""));
         assert!(json.contains("\"value\":\"read\""));
+        // the herestring target still reaches the runtime as a spec object
+        assert!(json.contains("\"value\":\"herestring\""));
         // the env object's property key is an Identifier (prop() renders
         // `key: {type: Identifier, name: IFS}`)
         assert!(json.contains("\"name\":\"IFS\""));
@@ -8298,10 +8745,10 @@ greet");
         assert!(!json2.contains("\"value\":\"unsupported\""));
         // the producer + mapfile body are both sync builtins and the
         // process-substitution fd-0 target is a here-string in-memory
-        // target — sync-capable in the runtime twin, so the redirect
-        // lowers to the sync path (the fd-dup-only rule was retired —
-        // see redirect_specs_sync_ok)
-        assert!(json2.contains("\"name\":\"redirectSync\""));
+        // target — the single-builtin redirect body collapses into the
+        // one-call `sh2.builtin(NAME, ARGS, ENV, SPECS)` form (the
+        // runtime applies the same spec pass redirectSync would).
+        assert!(!json2.contains("\"name\":\"redirectSync\""));
         assert!(!json2.contains("\"name\":\"redirect\""));
         assert!(json2.contains("\"name\":\"builtin\""));
     }

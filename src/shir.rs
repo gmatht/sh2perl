@@ -883,6 +883,20 @@ static TEST_UNSTATUSED_DEPTH: Mutex<usize> = Mutex::new(0);
 /// pre-existing behavior).
 static NATIVE_ECHO_SINK_SITES: Mutex<Option<HashSet<usize>>> = Mutex::new(None);
 fn native_echo_sink_site(stmts: &[IrStmt]) -> bool {
+    // The pointer-keyed verdict answers "is this site default-sink?" for a
+    // body reached by a NAME (function bodies — the define site says
+    // nothing about the call site's sink). For a subshell/background body
+    // the sink is inherited from the ENCLOSING context, which the emitter
+    // tracks exactly in `ECHO_SINK_DEPTH`: depth 0 also means default
+    // stdout. Rely on it as a second verdict because the pointer key does
+    // NOT survive the emitter's own `stmts.clone()` when the body is
+    // wrapped into an arrow (`(echo a) &` — the nested subshell body is
+    // re-allocated, so its key is absent and the nested arrow got the sink
+    // bump even though fd 1 was the default: `sh2.builtin("echo", …)`
+    // instead of the native write).
+    if *ECHO_SINK_DEPTH.lock().unwrap() == 0 {
+        return true;
+    }
     NATIVE_ECHO_SINK_SITES
         .lock()
         .unwrap()
@@ -1625,6 +1639,15 @@ pub(crate) fn ir_stmt_reads_status(stmt: &IrStmt) -> bool {
                     IrRedirect { fd: _, target, .. } => ir_expr_reads_status(target),
                 })
         }
+        // Extension nodes (ForEachLine & co.) run their body in the
+        // CURRENT register context and may read the inherited status at
+        // entry — but the read/write model has no arm for them, so every
+        // writer before an Ext statement looked dead while the body could
+        // still observe it. Over-approximate to reader (a spurious reader
+        // only keeps a write alive — the documented contract of this
+        // predicate); the Ext's OWN write stays unkeyed (`writes_lastexit`
+        // has no Ext arm either), so nothing new becomes strippable.
+        IrStmt::Ext(_) => true,
         _ => false,
     }
 }
@@ -4217,6 +4240,7 @@ pub(crate) const SYNC_BUILTINS: &[&str] = &[
     "gunzip",
     "head",
     "hostname",
+    "id",
     "let",
     "local",
     "ls",
@@ -4224,6 +4248,7 @@ pub(crate) const SYNC_BUILTINS: &[&str] = &[
     "mkdir",
     "mktemp",
     "mv",
+    "od",
     "paste",
     "printf",
     "pwd",
@@ -4231,6 +4256,7 @@ pub(crate) const SYNC_BUILTINS: &[&str] = &[
     "readarray",
     "readlink",
     "readonly",
+    "realpath",
     "return",
     "rm",
     "rmdir",
@@ -4250,6 +4276,7 @@ pub(crate) const SYNC_BUILTINS: &[&str] = &[
     "tr",
     "trap",
     "true",
+    "tty",
     "type",
     "typeset",
     "uname",
@@ -6267,10 +6294,43 @@ fn is_plain_fn_name_safe(name: &str) -> bool {
         return false;
     }
     // generated temp names (the sorted-join IIFE, true64 slots, …)
-    if name.starts_with("__") {
+    if is_generated_temp_name(name) {
         return false;
     }
     true
+}
+
+/// Does `name` collide with an identifier the ESTree renderer emits into
+/// the generated program? Those temps are emitted verbatim (`const __i`,
+/// `__sh2_loop_ran`, `__t64[k]`, `__acc_<var>`, …), so a shell variable of
+/// the same name must stay on the string-keyed store protocol instead of
+/// taking a native `let` binding (where it would shadow, or be shadowed
+/// by, the generated binding).
+///
+/// Deliberately NOT a blanket `__` ban: a USER variable such as shellbench's
+/// `__n` counter names no generated binding. Refusing to lift it cost a
+/// `setVar` dispatch plus three store reads on every iteration of the
+/// `count:posix` / `count:increment` loops (see the `__n` lift regression
+/// test); the exact-name rule lifts it with zero collision risk.
+fn is_generated_temp_name(name: &str) -> bool {
+    // prefixes the renderer composes with a suffix (loop bookkeeping,
+    // native-direct function bindings, the string-accumulator chunks,
+    // bc placeholder slots, true64-quantified temps, process-substitution
+    // paths, the sorted-join partials)
+    const PREFIXES: &[&str] = &[
+        "__sh2_", "__sh2len", "__fn_", "__acc_", "__bcv", "__tqw_", "__ps_", "__p1",
+    ];
+    if PREFIXES.iter().any(|p| name.starts_with(p)) {
+        return true;
+    }
+    // single-shot scratch identifiers emitted inside an IIFE / loop body
+    const EXACT: &[&str] = &[
+        "__", "__ac", "__bItems", "__bOrder", "__bVals", "__bi", "__fl0", "__gdone",
+        "__gout", "__i", "__items", "__j", "__k", "__l", "__order", "__out", "__ph",
+        "__push", "__r", "__sItems", "__sOrder", "__sVals", "__sh2else", "__si",
+        "__t64", "__vals",
+    ];
+    EXACT.contains(&name)
 }
 
 /// Is `name` a positional-parameter name the runtime resolves from its
@@ -16270,6 +16330,58 @@ fn cond_bound_resolved(
                 None
             }
         }
+        // STRUCTURED comparison (`BinOp { op: Lt, lhs: Arith(Var n),
+        // rhs: Arith(Num 1000) }`) — the shape `ast_to_ir` produces for a
+        // `[ $n -lt 1000 ]` condition that the native test lowering has
+        // already collapsed. Without this arm the counter of a
+        // `while [ $n -lt 1000 ]; do i=$((i+1)); n=$((n+1)); done` loop
+        // had NO bound, widened to the full i64 domain, and lost its
+        // Number home (see the PROOF-GATED SLOTS note). `!=`/`Ne`
+        // cannot cap a range and stays None, exactly like the Arith arm.
+        IrExpr::BinOp { op, lhs, rhs } => {
+            let cmp = match op {
+                BinOpKind::Lt => Cmp::Lt,
+                BinOpKind::Le => Cmp::Le,
+                BinOpKind::Gt => Cmp::Gt,
+                BinOpKind::Ge => Cmp::Ge,
+                BinOpKind::Eq => Cmp::Eq,
+                _ => return None,
+            };
+            // an operand of the comparison: a bare var read or a
+            // provable loop-invariant constant (mirrors `resolve`).
+            let var_name = |e: &IrExpr| match e {
+                IrExpr::Arith(a) => match a.as_ref() {
+                    crate::ir::ArithAst::Var(n) | crate::ir::ArithAst::Ident(n) => {
+                        Some(n.clone())
+                    }
+                    _ => None,
+                },
+                _ => None,
+            };
+            let num_val = |e: &IrExpr| match e {
+                IrExpr::Arith(a) => match a.as_ref() {
+                    crate::ir::ArithAst::Num(n) => Some(*n as i128),
+                    crate::ir::ArithAst::Var(n) | crate::ir::ArithAst::Ident(n) => {
+                        if carried.contains(n) {
+                            return None;
+                        }
+                        match pre.get(n).copied().flatten() {
+                            Some((lo, hi)) if lo == hi => Some(lo),
+                            _ => None,
+                        }
+                    }
+                    _ => None,
+                },
+                _ => None,
+            };
+            if let (Some(v), Some(n)) = (var_name(lhs), num_val(rhs)) {
+                Some((v, cmp, n))
+            } else if let (Some(n), Some(v)) = (num_val(lhs), var_name(rhs)) {
+                Some((v, cmp_flip(cmp), n))
+            } else {
+                None
+            }
+        }
         // `until cond` wraps the cond in BinOp(Not, cond, cond)
         IrExpr::BinOp {
             op: BinOpKind::Not,
@@ -20858,6 +20970,34 @@ fn force_wrap_arith(a: &mut ArithAst) {
     }
 }
 
+/// The store write for an arith assignment / increment of a STORE-BOUND
+/// variable: the native plain-object store write
+/// `sh2.vars.<name> = String(<value>)` for a name the runtime setVar's
+/// attribute branches cannot touch ([`native_store_write_ok`]), else the
+/// runtime `sh2.setVar(<name>, String(<value>))`. The value is always a JS
+/// number (or BigInt from the i53 escalation / `--true64` home), so the
+/// `String(…)` coercion is exactly the runtime's, and it can never be
+/// ARITH_BAD_MAGIC, an Array or an object — the native write is the
+/// runtime's plain-path assignment minus the dispatch + name regex.
+fn arith_store_write(var: &str, value: Expr) -> Expr {
+    let wrapped = Expr::CallExpression {
+        callee: Box::new(Expr::Identifier {
+            name: "String".to_string(),
+        }),
+        arguments: vec![value],
+        optional: false,
+    };
+    if native_store_write_ok(var) {
+        Expr::AssignmentExpression {
+            operator: "=".to_string(),
+            left: Box::new(store_member(var)),
+            right: Box::new(wrapped),
+        }
+    } else {
+        sh2_call("setVar", vec![str_lit(var), wrapped])
+    }
+}
+
 fn arith_to_estree(a: &ArithAst) -> Expr {
     if INT64_WRAP_FORCE.load(std::sync::atomic::Ordering::Relaxed) > 0
         && !arith_has_cast(a)
@@ -20975,22 +21115,7 @@ fn arith_to_estree(a: &ArithAst) -> Expr {
                     arith_var_read(var),
                 ]);
             }
-            seq(vec![
-                sh2_call(
-                    "setVar",
-                    vec![
-                        str_lit(var),
-                        Expr::CallExpression {
-                            callee: Box::new(Expr::Identifier {
-                                name: "String".to_string(),
-                            }),
-                            arguments: vec![new_val],
-                            optional: false,
-                        },
-                    ],
-                ),
-                arith_var_read(var),
-            ])
+            seq(vec![arith_store_write(var, new_val), arith_var_read(var)])
         }
         // `++x` / `x++` / `--x` / `x--` — the value is the NEW value
         // (prefix) or the OLD value (postfix). Lifted numeric vars use a
@@ -21080,22 +21205,7 @@ fn arith_to_estree(a: &ArithAst) -> Expr {
                     value,
                 ]);
             }
-            seq(vec![
-                sh2_call(
-                    "setVar",
-                    vec![
-                        str_lit(var),
-                        Expr::CallExpression {
-                            callee: Box::new(Expr::Identifier {
-                                name: "String".to_string(),
-                            }),
-                            arguments: vec![new_val],
-                            optional: false,
-                        },
-                    ],
-                ),
-                value,
-            ])
+            seq(vec![arith_store_write(var, new_val), value])
         }
         ArithAst::Index { var, key } => Expr::LogicalExpression {
             operator: "||".to_string(),
@@ -21381,21 +21491,30 @@ fn arith_to_estree(a: &ArithAst) -> Expr {
     }
 }
 
-/// `BigInt("N")` — a BigInt literal rendered as a call (the A1/ESTree
-/// JSON contract has no `bigint` field; the generic runner evaluates
-/// `BigInt(...)`). The STRING form keeps i64 literals exact — a Number
-/// literal would round at 2^53.
+/// `BigInt("N")` → emitted as a native BigInt LITERAL (`123n`).
+///
+/// MEASURED (2026-10-23, this box): a BigInt accumulator chain inside a
+/// 5M-iteration loop costs **675 ms** when every step re-creates the
+/// constant through the `BigInt("1")` CALL and **23 ms** with an `123n`
+/// literal at the same site — 29x. `BigInt("…")` parses a string and
+/// allocates a fresh BigInt object on EVERY evaluation; the literal is a
+/// constant the engine can intern, and it keeps the RMW store in
+/// V8's int64 fast path (`a[0] = a[0] + 1n`).
+///
+/// The A1/ESTree JSON contract has no `bigint` field on the emitter's
+/// `Expr::Literal` (value/raw/regex), but astring honours `raw`
+/// (`harness/vendor/astring.mjs` Literal: `raw != null` wins), so the
+/// node carries `raw: "123n"` and the printed JS is the literal form.
+/// `value` holds the decimal STRING (never a rounded Number — the whole
+/// point of the BigInt home is exactness past 2^53) and no pass reads it:
+/// the JSON is output-only (ingress is A1 via `shir_json_to_ir`), the
+/// estree gate does not inspect literal values, and lower.js's folds all
+/// guard on `typeof value === "number"`.
 fn bigint_lit_expr(n: i64) -> Expr {
-    Expr::CallExpression {
-        callee: Box::new(Expr::Identifier {
-            name: "BigInt".to_string(),
-        }),
-        arguments: vec![Expr::Literal {
-            value: serde_json::Value::from(n.to_string()),
-            raw: None,
-            regex: None,
-        }],
-        optional: false,
+    Expr::Literal {
+        value: serde_json::Value::String(n.to_string()),
+        raw: Some(format!("{n}n")),
+        regex: None,
     }
 }
 
@@ -24720,6 +24839,24 @@ pub(crate) fn numeric_lift_vars(prog: &IrProgram) -> HashSet<String> {
                                 }
                             }
                         }
+                        // `sh2.arrayIndex(base, "$i,$j")` — the baked
+                        // subscript KEY arg: the emitter always rewrites
+                        // it to the native key expression (see
+                        // [`array_index_key_expr`]) under the same
+                        // SH2_ASSUME_SUBSCRIPT_KEYS gate, so its `$ref`s
+                        // are native reads, not store reads. Refuse the
+                        // exemption for keys carrying a non-plain `$`
+                        // form (the runtime's expandWord must keep those
+                        // — `array_index_key_expr` returns None there).
+                        if func == "arrayIndex" && i == 1 {
+                            if let IrExpr::Str(n, _) = a {
+                                if subscript_keys_assumed_clean()
+                                    && array_index_key_expr(n).is_some()
+                                {
+                                    continue;
+                                }
+                            }
+                        }
                         mark_str_args(a, string_ctx);
                     }
                 }
@@ -27396,6 +27533,22 @@ fn array_elem_inert(
             .iter()
             .flatten()
             .all(|el| array_elem_inert(el, counters, b_dead)),
+        // A template literal is ONE scalar string (no word-splitting
+        // shape): inert when its static parts carry nothing the runtime's
+        // expandWord would re-expand (`$`, backtick, backslash) and every
+        // interpolated value is itself inert. This is the append element
+        // the ESTree string-accumulator transform emits
+        // (`__acc_v.push(`${i},`)`) — without the arm the chunk array
+        // refused migration and kept setArray/setArrayAppend/arrayValues
+        // runtime calls in the loop.
+        Expr::TemplateLiteral { quasis, expressions } => {
+            quasis.iter().all(|q| {
+                let s = q.value.cooked.as_deref().unwrap_or(&q.value.raw);
+                !s.contains('$') && !s.contains('`') && !s.contains('\\')
+            }) && expressions
+                .iter()
+                .all(|x| array_elem_inert(x, counters, b_dead))
+        }
         _ => false,
     }
 }
@@ -27783,7 +27936,21 @@ fn array_scan_expr(e: &Expr, name: &str, scope: &mut ArrayScope, top_idx: usize)
                                 }
                                 return;
                             }
-                            "arrayItems" => {
+                            // `${arr[@]}` (VALUES) — the twin of
+                            // arrayItems (keys); for an INDEXED array
+                            // both are a snapshot copy of the elements,
+                            // so the same `[...NAME]` rewrite applies
+                            // (the runtime's arrayValues returns
+                            // `[...store]` too, not the live array).
+                            // Without this arm the bare name literal
+                            // fell through to the mention scan: it
+                            // counted a str_ref with no budget entry, so
+                            // the array refused migration — which left
+                            // the ESTree string accumulator transform's
+                            // own chunk array (`__acc_<var>`) on
+                            // setArray/setArrayAppend/arrayValues runtime
+                            // calls inside the loop it was created for.
+                            "arrayValues" | "arrayItems" => {
                                 if let [Expr::Literal { value: nm, .. }] = arguments.as_slice()
                                 {
                                     if nm.as_str() == Some(name) {
@@ -28372,6 +28539,21 @@ fn array_counter_writes(stmts: &[Stmt], name: &str, saw: &mut bool, ok: &mut boo
                         Expr::Literal { value, .. } => {
                             value.as_i64().is_some()
                                 || matches!(value.as_str(), Some(s) if !s.contains('$') && !s.contains('`') && !s.contains('\\'))
+                        }
+                        // A NUMERIC COERCION reassigns the name to a JS
+                        // number, whose String() is always inert (digits /
+                        // `NaN` / `Infinity` — no `$`, backtick or
+                        // backslash for the runtime's expandWord to act
+                        // on). The ESTree lift emits exactly this for a
+                        // for-of loop var bound over string items
+                        // (`i = Number(i)`), and refusing it kept the
+                        // string-accumulator chunk array
+                        // (`__acc_<var>`) on three runtime calls per
+                        // iteration instead of a native `.push`.
+                        Expr::CallExpression { callee, .. } => {
+                            matches!(callee.as_ref(),
+                                Expr::Identifier { name }
+                                    if matches!(name.as_str(), "Number" | "parseInt" | "parseFloat"))
                         }
                         _ => false,
                     };
@@ -29505,8 +29687,9 @@ fn array_rewrite_expr(e: &mut Expr, name: &str) {    // Post-order: rewrite the 
                         array_rewrite_expr(e, name);
                         return;
                     }
-                    // `arrayItems(NAME)` → `[...NAME]` (snapshot copy).
-                    if func == "arrayItems"
+                    // `arrayItems(NAME)` / `arrayValues(NAME)` → `[...NAME]`
+                    // (snapshot copy — the runtime's `[...(store ?? [])]`).
+                    if (func == "arrayItems" || func == "arrayValues")
                         && matches!(arguments.as_slice(), [Expr::Literal { value, .. }] if value.as_str() == Some(name))
                     {
                         *e = Expr::ArrayExpression {
@@ -30441,7 +30624,7 @@ fn array_analyze_decide(
     } else {
         if std::env::var("SH2_ARRAY_DEBUG").is_ok() {
             eprintln!(
-                "array_analyze_decide({name}): REFUSE inits={} appends={} joins={} jm={} str={} ident={} poison={} other={} assoc={} store={} call={}",
+                "array_analyze_decide({name}): REFUSE inits={} appends={} joins={} jm={} str={} ident={} poison={} other={} assoc={} store={} call={} items={} lens={} idx={} cstyle={}",
                 scope.inits.len(),
                 scope.appends.len(),
                 scope.joins.len(),
@@ -30453,6 +30636,10 @@ fn array_analyze_decide(
                 scope.assoc_touch,
                 scope.store_violation,
                 scope.call_hazard,
+                scope.items.len(),
+                scope.lens.len(),
+                scope.index_reads.len(),
+                scope.cstyle_headers.len(),
             );
         }
         None
@@ -32236,8 +32423,65 @@ pub fn shir_to_estree(prog: &IrProgram) -> Program {
         // the non-slot out-of-range vars stay plain Number (i53) and
         // are covered by the i53 escalation below (proven-big → BigInt)
         // or the dual-loop guard (unproven → Number fast arm).
-        let (int_vars, slots, _) = analyze_true64(prog);
-        (slots.keys().cloned().collect(), slots)
+        //
+        // PROOF-GATED SLOTS (2026-10-23): `analyze_true64`'s candidate
+        // prior is Unknown-as-WIDE (the `--true64` contract: every
+        // numeric var not PROVEN within ±2^53 escalates), so at `-O3` it
+        // slots vars the range analysis simply never bounded — e.g. a
+        // `while [ $n -lt 1000 ]; do i=$((i+1)); n=$((n+1)); done`
+        // counter. A slot is BigInt, and the two alternatives are both
+        // cheaper than it when they are available:
+        //
+        //   plain Number binding   6 ms / 5M (`let i = 0; i = i + 1`)
+        //   BigInt64Array slot   125 ms / 5M (`a[0] = a[0] + 2n`)
+        //   store round-trip     251 ms / 5M (`sh2.setVar("i", …)`)
+        //
+        // (measured on this box; the `BigInt("1")` CALL form the slot
+        // used to emit was a further 5x worse — see `bigint_lit_expr`.)
+        //
+        // So a slot must WIN against the alternative the var would get:
+        //   - the var WILL be lifted to a plain Number binding → slot is
+        //     a 20x LOSS, drop it (it also stops the slot-exclusion from
+        //     keeping the var out of the lift). The lift's own verdict
+        //     is `numeric_lift_vars` PLUS the JS-identifier rule (a
+        //     `__`-prefixed or reserved-word name cannot be a binding —
+        //     `is_plain_fn_name_safe`), so that pair decides.
+        //   - anything else is store-visible and would fall back to the
+        //     `sh2.setVar` round-trip → the slot is a 2x WIN, keep it
+        //     (this is the pre-change behavior, so those files are
+        //     unchanged).
+        //   - a var whose range is PROVEN outside ±2^53 keeps its slot
+        //     under every alternative: the i53 escalation would home it
+        //     as BigInt values anyway, and the slot is the exact int64
+        //     fast path for an RMW chain.
+        //
+        // `SH2_ASSUME_I53=0` restores the pre-change (all-slot) emission.
+        let (_int_vars, slots, _) = analyze_true64(prog);
+        if i53_escalation_enabled() {
+            let ranges = analyze_var_ranges(prog);
+            let will_lift: HashSet<String> = numeric_lift_vars(prog)
+                .into_iter()
+                .filter(|v| is_plain_fn_name_safe(v))
+                .collect();
+            let mut proven: Vec<String> = slots
+                .keys()
+                .filter(|v| {
+                    let proven_big = ranges.get(*v).is_some_and(|&(lo, hi)| {
+                        (lo < -SAFE_NUMBER || hi > SAFE_NUMBER)
+                            && lo != INT_DOMAIN.0
+                            && hi != INT_DOMAIN.1
+                    });
+                    proven_big || !will_lift.contains(*v)
+                })
+                .cloned()
+                .collect();
+            proven.sort();
+            let slots: HashMap<String, usize> =
+                proven.into_iter().enumerate().map(|(i, n)| (n, i)).collect();
+            (slots.keys().cloned().collect(), slots)
+        } else {
+            (slots.keys().cloned().collect(), slots)
+        }
     } else {
         (HashSet::new(), HashMap::new())
     };
@@ -33034,8 +33278,8 @@ fn call_is_always_true(e: &Expr) -> bool {
     };
     match prop.as_str() {
         // runtime helpers that always return truthy
-        "setVar" | "setArray" | "shopt" | "forLoopSync" | "whileLoopSync" | "forLoopBatch"
-        | "whileLoopBatch" => true,
+        "setVar" | "setArray" | "setArrayAppend" | "shopt" | "forLoopSync" | "whileLoopSync"
+        | "forLoopBatch" | "whileLoopBatch" => true,
         "builtin" => match arguments.first() {
             Some(Expr::Literal { value, .. }) => match value {
                 serde_json::Value::String(bn) => ALWAYS_TRUE_BUILTINS.contains(&bn.as_str()),
@@ -33311,6 +33555,82 @@ pub(crate) fn classify_case_pat(pat: &str) -> Option<CasePat> {
     // patterns the RUNTIME would leave unexpanded qualify (`glob_to_regex`
     // rejects `$`/extglob); anything else keeps the runtime switch form.
     glob_to_regex(bare).map(CasePat::Glob)
+}
+
+/// `sh2.globMatch(<value>, "<literal pattern>")` → the SAME predicate as a
+/// plain JS string op.
+///
+/// The case-lowering transform (`transforms/case_lowering.rs`) rewrites a
+/// `case` clause into a `globMatch(value, pattern)` call for every glob
+/// shape that is not one of the four affix forms, which left 19 corpus
+/// sites dispatching into the runtime's parseGlob + backtracking matcher
+/// on EVERY evaluation. The pattern is always a byte-verbatim literal
+/// (the transform refuses `$`/`\``/quoting at the clause level, and it
+/// refuses the whole program when `nocasematch` is mentioned — so no
+/// case-folding is in play), and [`classify_case_pat`] is the exact
+/// transliteration of the runtime's glob grammar that the `[[ x == pat ]]`
+/// renderer already uses:
+///
+///   `*`            → `true`
+///   `*lit*`        → `String(v).includes(lit)`
+///   `lit*`         → `String(v).startsWith(lit)`
+///   `*lit`         → `String(v).endsWith(lit)`
+///   `lit`          → `String(v) === lit`
+///   `?`/`[a-z]`/`i*86`/escaped metas → `/^…$/s.test(String(v))`
+///
+/// The value coercion (`String(v)`, no `?? ''`) is byte-identical to the
+/// call it replaces. `None` for a pattern the runtime would EXPAND — that
+/// keeps `sh2.globMatch`.
+fn glob_match_native_test(v: &IrExpr, pat: &str) -> Option<Expr> {
+    let pat = classify_case_pat(pat)?;
+    let value = Expr::CallExpression {
+        callee: Box::new(Expr::Identifier {
+            name: "String".to_string(),
+        }),
+        arguments: vec![expr_to_estree(v)],
+        optional: false,
+    };
+    let str_op = |name: &str, arg: &str| Expr::CallExpression {
+        callee: Box::new(Expr::MemberExpression {
+            object: Box::new(value.clone()),
+            property: Box::new(Expr::Identifier {
+                name: name.to_string(),
+            }),
+            computed: false,
+            optional: false,
+        }),
+        arguments: vec![str_lit(arg)],
+        optional: false,
+    };
+    Some(match pat {
+        CasePat::Any => Expr::Literal {
+            value: serde_json::Value::Bool(true),
+            raw: None,
+            regex: None,
+        },
+        CasePat::Substr(lit) => str_op("includes", &lit),
+        CasePat::Prefix(lit) => str_op("startsWith", &lit),
+        CasePat::Suffix(lit) => str_op("endsWith", &lit),
+        CasePat::Exact(lit) => Expr::BinaryExpression {
+            operator: "===".to_string(),
+            left: Box::new(value.clone()),
+            right: Box::new(str_lit(&lit)),
+        },
+        // The anchored regex with the `s` flag — the case renderer's own
+        // convention (dotAll: the runtime's `*`/`?` cross newlines).
+        CasePat::Glob(re) => Expr::CallExpression {
+            callee: Box::new(Expr::MemberExpression {
+                object: Box::new(regex_lit_flags(&re, "s")),
+                property: Box::new(Expr::Identifier {
+                    name: "test".to_string(),
+                }),
+                computed: false,
+                optional: false,
+            }),
+            arguments: vec![value.clone()],
+            optional: false,
+        },
+    })
 }
 
 /// Escape a literal char for a JS regex OUTSIDE a character class.
@@ -34501,13 +34821,7 @@ pub(crate) fn ir_has_persist_fd1(prog: &IrProgram) -> bool {
 /// shadow, no persistent fd-1). No new assumption: every runtime
 /// transform is either reproduced at compile time or provably absent.
 fn try_native_cat_heredoc(inner: &[IrStmt], redirects: &[IrRedirect]) -> Option<Expr> {
-    if *ECHO_SINK_DEPTH.lock().unwrap() != 0 {
-        return None;
-    }
     if program_defines_function("cat") {
-        return None;
-    }
-    if PROGRAM_PERSIST_FD1.lock().unwrap().unwrap_or(true) {
         return None;
     }
     let [IrStmt::Expr(IrExpr::Call { func, args })] = inner else {
@@ -34528,45 +34842,49 @@ fn try_native_cat_heredoc(inner: &[IrStmt], redirects: &[IrRedirect]) -> Option<
     if !arg_ok {
         return None;
     }
+    // `cat <<EOF > file` / `>> file`: cat is the identity on its stdin, so
+    // the whole redirect + builtin pair collapses to a native file write of
+    // the folded heredoc/herestring content. Delegated to
+    // `try_native_echo_redirect`'s battle-tested writer (the SAME
+    // write-failure tolerance: bash reports `bash: <target>: …`, sets
+    // status 1 and CONTINUES) by synthesising the equivalent
+    // all-literal `printf '%s' CONTENT` command with only the fd-1 spec.
+    if let [r0, r1] = redirects {
+        if r0.fd.unwrap_or(0) != 0 || r1.fd.unwrap_or(1) != 1 {
+            return None;
+        }
+        if r1.mode != "w" && r1.mode != "a" {
+            return None;
+        }
+        let content = fd0_known_text_string(&r0.target, r0.mode.as_str(), r0.interpolate)?;
+        let synthetic = [IrStmt::Expr(IrExpr::Call {
+            func: "exec".to_string(),
+            args: vec![
+                IrExpr::Str("printf".to_string(), StrStyle::SingleQuoted),
+                IrExpr::Array(vec![
+                    IrExpr::Str("%s".to_string(), StrStyle::SingleQuoted),
+                    IrExpr::Str(content, StrStyle::SingleQuoted),
+                ]),
+            ],
+        })];
+        let specs = [(1, r1.mode.as_str(), &r1.target)];
+        return try_native_echo_redirect(&synthetic, &specs, false);
+    }
+    // `cat <<EOF` / `cat <<< "text"` at the module's DEFAULT stdout sink —
+    // the fd-0 spec is the only redirect.
+    if *ECHO_SINK_DEPTH.lock().unwrap() != 0 {
+        return None;
+    }
+    if PROGRAM_PERSIST_FD1.lock().unwrap().unwrap_or(true) {
+        return None;
+    }
     let [r] = redirects else {
         return None;
     };
     if r.fd.unwrap_or(0) != 0 {
         return None;
     }
-    let content: String = match r.mode.as_str() {
-        "heredoc" | "heredoc-tabs" => {
-            let IrExpr::Str(body, _) = &r.target else {
-                return None;
-            };
-            if r.interpolate && body.chars().any(|c| matches!(c, '$' | '`' | '\\')) {
-                // the runtime's expandWord (or bash itself) would transform it
-                return None;
-            }
-            let mut body = body.clone();
-            if r.mode == "heredoc-tabs" {
-                // the runtime's heredoc-tabs transform (before expansion):
-                // strip leading tabs per line — exact compile-time twin
-                body = body
-                    .split('\n')
-                    .map(|l| l.trim_start_matches('\t'))
-                    .collect::<Vec<_>>()
-                    .join("\n");
-            }
-            body
-        }
-        "herestring" => {
-            // the runtime appends a newline to herestrings and never
-            // interpolates them — a static target folds exactly
-            let IrExpr::Str(target, _) = &r.target else {
-                return None;
-            };
-            let mut t = target.clone();
-            t.push('\n');
-            t
-        }
-        _ => return None,
-    };
+    let content = fd0_known_text_string(&r.target, r.mode.as_str(), r.interpolate)?;
     Some(seq(vec![
         printf_write_expr(str_lit(&content)),
         Expr::AssignmentExpression {
@@ -34582,12 +34900,62 @@ fn try_native_cat_heredoc(inner: &[IrStmt], redirects: &[IrRedirect]) -> Option<
     ]))
 }
 
+/// `$(cat <<EOF … EOF)` / `$(cat <<< "text")` in CAPTURE position: cat is
+/// the identity, so the captured value is the heredoc/herestring body with
+/// the capture's strips (NULs, then trailing newlines) applied — folded at
+/// compile time into a plain string literal. No capture arrow, no fd
+/// swapping, no sh2.* call at all (the emitter's `x = <literal>` binding).
+fn native_capture_cat_stdin(inner: &[IrExpr], redirects: &[RedirectSpec<'_>]) -> Option<Expr> {
+    if program_defines_function("cat") {
+        return None;
+    }
+    let [IrExpr::Arrow(stmts)] = inner else {
+        return None;
+    };
+    let [IrStmt::Expr(IrExpr::Call { func, args })] = stmts.as_slice() else {
+        return None;
+    };
+    if !matches!(func.as_str(), "exec" | "builtin") {
+        return None;
+    }
+    let [IrExpr::Str(name, _), IrExpr::Array(cat_args)] = args.as_slice() else {
+        return None;
+    };
+    if name != "cat" {
+        return None;
+    }
+    let arg_ok = cat_args.is_empty()
+        || matches!(cat_args.as_slice(), [IrExpr::Str(s, _)] if s == "-");
+    if !arg_ok {
+        return None;
+    }
+    let [spec] = redirects else {
+        return None;
+    };
+    if spec.fd != 0 {
+        return None;
+    }
+    let content = fd0_known_text_string(spec.target, spec.mode, spec.interpolate)?;
+    let mut v: String = content.chars().filter(|c| *c != '\0').collect();
+    while v.ends_with('\n') {
+        v.pop();
+    }
+    Some(str_lit(&v))
+}
+
 fn try_native_echo_redirect(
     inner: &[IrStmt],
     specs: &[(i64, &str, &IrExpr)],
     status_dead: bool,
 ) -> Option<Expr> {
     if program_defines_function("echo") {
+        return None;
+    }
+    // SH2_ASSUME_SYNC_FS=0: decline the native write entirely — the caller
+    // then lowers the statement through the runtime redirect machinery
+    // (redirectSync + the echo/printf builtin), which is the exact
+    // pre-lift behavior.
+    if !sync_fs_enabled() {
         return None;
     }
     // A Block-wrapped single exec (the shir-native-stmt transform wraps
@@ -34675,21 +35043,27 @@ fn try_native_echo_redirect(
             }
         }
     }
+    // Sync write twin (SH2_ASSUME_SYNC_FS, default ON): ONE
+    // `sh2.fs.writeText(path, text, append)` — a writeFileSync in the
+    // runtime — instead of the `await sh2.fs.writeFile(...).then(...)
+    // .catch(...)` promise chain. Same value (true on success, false on
+    // failure), same lastExit protocol (0 / 1), same stderr report, but no
+    // promise and — the part that compounds — no `await` in the emitted
+    // statement, so the enclosing arrow (and every function it belongs to)
+    // stays sync.
     let write = sh2_fs_call(
-        if *mode == "a" {
-            "appendFile"
-        } else {
-            "writeFile"
-        },
-        vec![tgt.clone(), text],
+        "writeText",
+        vec![tgt.clone(), text, bool_lit(*mode == "a")],
     );
     // Write-failure tolerance (core request
     // go-sh-writefile-eacces): bash reports `bash: <target>: Permission
-    // denied`, sets status 1 and CONTINUES — the uncaught fs rejection
-    // would kill the whole module (empty stdout). Mirror the runtime's
-    // generic redirect error path: `.then(r => (sh2.lastExit = 0, true),
-    // e => (stderr report, sh2.lastExit = 1, false))` — the falsy tail
-    // keeps `&&`/`||`/errexit semantics of the redirect command.
+    // denied`, sets status 1 and CONTINUES — an uncaught failure would kill
+    // the whole module (empty stdout). Mirror the runtime's generic
+    // redirect error path: on failure report to stderr and yield false (the
+    // falsy value keeps `&&`/`||`/errexit semantics of the redirect
+    // command). The runtime helper stashes the failure in `sh2._writeErr`
+    // so the message can name the code — the exact text the promise chain's
+    // `catch(e => …)` produced from `e`.
     let err_msg = Expr::BinaryExpression {
         operator: "+".to_string(),
         left: Box::new(Expr::BinaryExpression {
@@ -34707,9 +35081,7 @@ fn try_native_echo_redirect(
                 test: Box::new(Expr::BinaryExpression {
                     operator: "===".to_string(),
                     left: Box::new(Expr::MemberExpression {
-                        object: Box::new(Expr::Identifier {
-                            name: "e".to_string(),
-                        }),
+                        object: Box::new(sh2_member("_writeErr")),
                         property: Box::new(Expr::Identifier {
                             name: "code".to_string(),
                         }),
@@ -34725,9 +35097,7 @@ fn try_native_echo_redirect(
                 // of 'bash: <target>: undefined'
                 alternate: Box::new(Expr::LogicalExpression {
                     left: Box::new(Expr::MemberExpression {
-                        object: Box::new(Expr::Identifier {
-                            name: "e".to_string(),
-                        }),
+                        object: Box::new(sh2_member("_writeErr")),
                         property: Box::new(Expr::Identifier {
                             name: "code".to_string(),
                         }),
@@ -34737,9 +35107,7 @@ fn try_native_echo_redirect(
                     operator: "??".to_string(),
                     right: Box::new(Expr::LogicalExpression {
                         left: Box::new(Expr::MemberExpression {
-                        object: Box::new(Expr::Identifier {
-                            name: "e".to_string(),
-                        }),
+                        object: Box::new(sh2_member("_writeErr")),
                         property: Box::new(Expr::Identifier {
                             name: "message".to_string(),
                         }),
@@ -34747,9 +35115,7 @@ fn try_native_echo_redirect(
                         optional: false,
                     }),
                         operator: "??".to_string(),
-                        right: Box::new(Expr::Identifier {
-                            name: "e".to_string(),
-                        }),
+                        right: Box::new(sh2_member("_writeErr")),
                     }),
                 }),
             }),
@@ -34777,84 +35143,35 @@ fn try_native_echo_redirect(
         arguments: vec![err_msg],
         optional: false,
     };
-    let set1 = if status_dead {
+    let on_fail: Expr = if status_dead {
         // the write's exit status is provably unread, so the failure path
         // reports to stderr and nothing else — the `sh2.lastExit = 1` store
-        // exists only to record `$?` for a reader that does not exist.
-        stderr_write.clone()
+        // exists only to record `$?` for a reader that does not exist (the
+        // runtime helper still records it; a dead status cannot observe it).
+        seq(vec![stderr_write, bool_lit(false)])
     } else {
-        Expr::AssignmentExpression {
-            operator: "=".to_string(),
-            left: Box::new(sh2_member("lastExit")),
-            right: Box::new(Expr::Literal {
-                value: serde_json::Value::from(1),
-                raw: None,
-                regex: None,
-            }),
-        }
-    };
-    let then = Expr::ArrowFunctionExpression {
-        params: vec![Expr::Identifier {
-            name: "r".to_string(),
-        }],
-        body: ArrowBody::Expr(Box::new(seq(vec![
+        seq(vec![
+            stderr_write,
             Expr::AssignmentExpression {
                 operator: "=".to_string(),
                 left: Box::new(sh2_member("lastExit")),
                 right: Box::new(Expr::Literal {
-                    value: serde_json::Value::from(0),
+                    value: serde_json::Value::from(1),
                     raw: None,
                     regex: None,
                 }),
             },
-            bool_lit(true),
-        ]))),
-        expression: true,
-        r#async: false,
+            bool_lit(false),
+        ])
     };
-    let catch = Expr::ArrowFunctionExpression {
-        params: vec![Expr::Identifier {
-            name: "e".to_string(),
-        }],
-        body: ArrowBody::Expr(Box::new(seq(vec![stderr_write, set1, bool_lit(false)]))),
-        expression: true,
-        r#async: false,
-    };
-    // The `.then` status closure exists ONLY to record `$?` on success. When
-    // the write's status is lastexit-dead nothing reads it, so the chain
-    // collapses to `await write(...).catch(report)` — one fewer promise
-    // reaction and closure per write. The `.catch` is NOT droppable: it
-    // REPORTS the failure to stderr (core request
-    // go-sh-writefile-eacces), so a failing device still surfaces.
-    let after_write: Expr = if status_dead {
-        write
-    } else {
-        Expr::CallExpression {
-            callee: Box::new(Expr::MemberExpression {
-                object: Box::new(write),
-                property: Box::new(Expr::Identifier {
-                    name: "then".to_string(),
-                }),
-                computed: false,
-                optional: false,
-            }),
-            arguments: vec![then],
-            optional: false,
-        }
-    };
-    let chained = Expr::CallExpression {
-        callee: Box::new(Expr::MemberExpression {
-            object: Box::new(after_write),
-            property: Box::new(Expr::Identifier {
-                name: "catch".to_string(),
-            }),
-            computed: false,
-            optional: false,
-        }),
-        arguments: vec![catch],
-        optional: false,
-    };
-    Some(await_expr(chained))
+    // `sh2.fs.writeText(tgt, text, append) || (report, false)` — the helper
+    // yields true (lastExit 0) on success, so the right side runs only on a
+    // failed write, exactly where the promise chain's `.catch` ran.
+    Some(Expr::LogicalExpression {
+        operator: "||".to_string(),
+        left: Box::new(write),
+        right: Box::new(on_fail),
+    })
 }
 
 /// Native-loop signal scan: does a LOWERED loop body contain a control-flow
@@ -35550,7 +35867,24 @@ fn stmt_to_estree(stmt: &IrStmt) -> Option<Stmt> {
                                     Stmt::BlockStatement { body: stmts }
                                 });
                             }
+                            // Store-bound names (not local-lifted — e.g. a
+                            // name a runtime text/subscript resolves from
+                            // the store): the native plain-object store
+                            // write, the exact `builtins.local`/`declare`
+                            // write for a name with no array/assoc/
+                            // nameref/attribute/env story (the Exec arm's
+                            // twin — the sync-builtin Call statement shape
+                            // otherwise never reaches it).
+                            if let Some(native) = try_native_declare_stmt(args) {
+                                return Some(Stmt::ExpressionStatement { expression: native });
+                            }
                         }
+                    }
+                    // `unset NAME` — the native deletes (the Exec arm's
+                    // twin; the sync-builtin Call statement shape
+                    // otherwise emits a dispatch).
+                    if let Some(native) = try_native_unset(args) {
+                        return Some(Stmt::ExpressionStatement { expression: native });
                     }
                 }
             }
@@ -35927,6 +36261,48 @@ fn stmt_to_estree(stmt: &IrStmt) -> Option<Stmt> {
                     // store mark for param name args on this assumption)
                     // and returns the computed string into the binding.
                     IrExpr::Call { func, .. } if func == "param" => expr_to_estree(expr),
+                    // The REST of `string_src`'s admitted source set
+                    // (string_lift_vars): join/arrayIndex/arrayItems/
+                    // dirname-family/uc/lc/date/mktempValue, an Index
+                    // element read, a string MethodCall, a both-branches-
+                    // string Ternary. The ANALYSIS admits these as
+                    // assignment sources (so every read of the var renders
+                    // as the native binding), but the emitter had no arm —
+                    // `_ => return None` fell to the STORE write and the
+                    // binding stayed at its old value (go-sh's
+                    // `t = join(param("slice",…))`: every tok.text came
+                    // back empty, CText returned whitespace). The store is
+                    // NOT "authoritative" for a lifted var — reads are
+                    // native by construction; the analysis's invariant
+                    // ("every assignment is a string") is exactly what
+                    // makes the native write sound.
+                    IrExpr::Call { func, .. }
+                        if matches!(
+                            func.as_str(),
+                            "dirname" | "basename" | "uname" | "hostname" | "whoami"
+                                | "readlink" | "mktempValue" | "uc" | "lc" | "join"
+                                | "arrayIndex" | "arrayItems" | "date"
+                        ) =>
+                    {
+                        expr_to_estree(expr)
+                    }
+                    // `v = concatItems("__acc_v")` — the string-accumulator
+                    // flush. `string_src` admits it (so `v` is lifted and
+                    // every READ is the native binding), and the binding is
+                    // where the joined chunks must land: the store write this
+                    // arm replaces left the local at its pre-loop value
+                    // (`tsv=""; …; tsv="$tsv$i,"` echoed ""). Same Str-arg
+                    // guard as `string_src` — any other shape stays on the
+                    // store path below.
+                    IrExpr::Call { func, args } if func == "concatItems" => {
+                        match args.as_slice() {
+                            [IrExpr::Str(_, _)] => expr_to_estree(expr),
+                            _ => return None,
+                        }
+                    }
+                    IrExpr::Index { .. } => expr_to_estree(expr),
+                    IrExpr::MethodCall { .. } => expr_to_estree(expr),
+                    IrExpr::Ternary { .. } => expr_to_estree(expr),
                     _ => return None,
                     })
                 })();
@@ -35992,9 +36368,7 @@ fn stmt_to_estree(stmt: &IrStmt) -> Option<Stmt> {
                     // assignment).
                     if let Expr::SequenceExpression { expressions } = &ve {
                         if let [head, ..] = expressions.as_slice() {
-                            if sh2_callee_name(head) == Some("setVar")
-                                && sh2_name_arg(head) == Some(target.var.as_str())
-                            {
+                            if store_write_name(head) == Some(target.var.as_str()) {
                                 let mut exprs = expressions.clone();
                                 exprs.push(bool_lit(true));
                                 return Some(Stmt::ExpressionStatement {
@@ -36007,7 +36381,7 @@ fn stmt_to_estree(stmt: &IrStmt) -> Option<Stmt> {
                     }
                     let native = target.indices.is_empty()
                         && native_store_write_ok(&target.var)
-                        && call_free_expr(&ve).is_some();
+                        && store_rhs_plain_value(&ve);
                     let rhs = if native && !store_rhs_string(&ve) {
                         Expr::CallExpression {
                             callee: Box::new(Expr::Identifier {
@@ -37667,19 +38041,27 @@ fn stmt_to_estree(stmt: &IrStmt) -> Option<Stmt> {
             // `echo args > file` / `echo args >> file`: a native
             // fs.writeFile replaces the redirect+builtin pair (see
             // try_native_echo_redirect).
-            let redirect_specs = redirects
+            let rs: Vec<RedirectSpec<'_>> = redirects
                 .iter()
-                .map(|r| (r.fd.unwrap_or(0) as i64, r.mode.as_str(), &r.target))
-                .collect::<Vec<_>>();
+                .map(|r| RedirectSpec {
+                    fd: r.fd.unwrap_or(0) as i64,
+                    mode: r.mode.as_str(),
+                    target: &r.target,
+                    interpolate: r.interpolate,
+                })
+                .collect();
+            let redirect_specs = RedirectSpec::triples(&rs);
             if let Some(native) =
                 try_native_echo_redirect(inner, &redirect_specs, stmt_status_write_is_unread(stmt))
             {
                 return Some(Stmt::ExpressionStatement { expression: native });
             }
-            // `grep -q PAT <<< TEXT` (statement position): the fd-0
-            // herestring redirect form of the substring test — no spawn,
-            // no fd plumbing (see `try_native_grep_q_redirect`).
-            if let Some(native) = try_native_grep_q_redirect(inner, &redirect_specs) {
+            // `grep ARGS <<< TEXT` / `grep ARGS <<EOF … EOF` (statement
+            // position): the fd-0 redirect form of the mini-grep — one
+            // sync `grepText` call, no spawn, no fd plumbing (see
+            // `try_native_grep_redirect`; `-q` keeps the cheaper bare
+            // `includes`).
+            if let Some(native) = try_native_grep_redirect(inner, &rs, false) {
                 return Some(Stmt::ExpressionStatement { expression: native });
             }
             // `cat <<EOF` / `cat <<< "text"` (statement position): the
@@ -37702,6 +38084,19 @@ fn stmt_to_estree(stmt: &IrStmt) -> Option<Stmt> {
                         && matches!(args.as_slice(), [IrExpr::Str(name, _), IrExpr::Array(a)]
                             if name == "exec" && a.is_empty())
             );
+            // `CMD ARGS <SPECS>` where CMD lowers to exactly one sync builtin
+            // dispatch: collapse `redirectSync(() => sh2.builtin(NAME, ARGS),
+            // SPECS)` into the single `sh2.builtin(NAME, ARGS, ENV, SPECS)`
+            // form. The runtime applies the SAME spec install/restore/persist
+            // path around the same builtin call (`redirectSync` is literally
+            // that path plus a call frame and a per-site arrow allocation),
+            // so the value and the statuses are identical — one runtime call
+            // and one fd-table save less per site (the corpus's most common
+            // redirect shape). Persistent (`exec`-installed) redirects keep
+            // the general form.
+            if let Some(native) = try_builtin_redirect_collapse(inner, redirects, &redirect_specs, persist) {
+                return Some(Stmt::ExpressionStatement { expression: native });
+            }
             // Only fd-1 specs swap the body's stdout sink (see
             // [`redirect_specs_touch_fd1`]): an fd-0 input redirect
             // (`while ... done < f` — the read-loop family) or an
@@ -38073,6 +38468,21 @@ fn stmt_to_estree(stmt: &IrStmt) -> Option<Stmt> {
                     }
                 }
             }
+            // `test WORD...` with a compile-time-static word list — the
+            // statement form of the `test` BUILTIN (`test -f /path`,
+            // `test "a" = "a"`). Same exact join rule as the expression
+            // arm's hook (see [`test_words_join`]): the words were already
+            // lowered, so the joined text re-tokenizes to the runtime's
+            // token list and the whole test takes the native lowering.
+            if let IrExpr::Str(name, _) = cmd {
+                if name == "test" && env.is_empty() && !program_defines_function("test") {
+                    if let Some(sv) = test_words_join(args) {
+                        if let Some(native) = native_test_static_form(&sv) {
+                            return Some(Stmt::ExpressionStatement { expression: native });
+                        }
+                    }
+                }
+            }
             let mut call_args = vec![
                 expr_to_estree(cmd),
                 expr_to_estree(&IrExpr::Array(args.clone())),
@@ -38172,7 +38582,31 @@ fn stmt_to_estree(stmt: &IrStmt) -> Option<Stmt> {
                         ]),
                     }
                 } else {
-                    // `local v` (no value): the runtime builtin sets "".
+                    // `local v` (no value) — the runtime's bare-name arm
+                    // is exactly `vars[v] = ''` + lastExit 0, with NO
+                    // scope/attribute story. Reuse the same native paths
+                    // as the init form: the per-function local lift (a
+                    // native `let`/binding reset — the module-write leak
+                    // the local scope must fix), then the plain-object
+                    // store write (`sh2.vars.v = ""` — exact for a name
+                    // with no array/assoc/nameref/attribute/env story),
+                    // then the runtime builtin. Option-off
+                    // (SH2_ASSUME_LOCAL_SCOPE=0) falls through to the
+                    // builtin byte-identically.
+                    let args = vec![
+                        IrExpr::Str("local".into(), StrStyle::DoubleQuoted),
+                        IrExpr::Array(vec![IrExpr::Str(name.clone(), StrStyle::DoubleQuoted)]),
+                    ];
+                    if let Some(stmts) = try_native_local_decl_stmt(&args) {
+                        return Some(if stmts.len() == 1 {
+                            stmts.into_iter().next().unwrap()
+                        } else {
+                            Stmt::BlockStatement { body: stmts }
+                        });
+                    }
+                    if let Some(native) = try_native_declare_stmt(&args) {
+                        return Some(Stmt::ExpressionStatement { expression: native });
+                    }
                     Stmt::ExpressionStatement {
                         expression: sh2_call(
                             "builtin",
@@ -38194,21 +38628,35 @@ fn stmt_to_estree(stmt: &IrStmt) -> Option<Stmt> {
                         },
                     }
                 } else {
+                    let ve = expr_to_estree(init);
+                    // Store-bound name with no attribute/array/nameref
+                    // story and a plain-scalar RHS: the native plain-object
+                    // store write — the runtime setVar's plain path exactly
+                    // (see the Assign arm; this is the Declare shape the
+                    // case-lowering transform's subject temp uses).
+                    let native = native_store_write_ok(&v) && store_rhs_plain_value(&ve);
+                    let rhs = if native && !store_rhs_string(&ve) {
+                        Expr::CallExpression {
+                            callee: Box::new(Expr::Identifier {
+                                name: "String".to_string(),
+                            }),
+                            arguments: vec![ve],
+                            optional: false,
+                        }
+                    } else {
+                        ve
+                    };
                     Stmt::ExpressionStatement {
                         expression: seq(vec![
-                            sh2_call(
-                                "setVar",
-                                vec![
-                                    str_lit(&v),
-                                    Expr::CallExpression {
-                                        callee: Box::new(Expr::Identifier {
-                                            name: "String".to_string(),
-                                        }),
-                                        arguments: vec![expr_to_estree(init)],
-                                        optional: false,
-                                    },
-                                ],
-                            ),
+                            if native {
+                                Expr::AssignmentExpression {
+                                    operator: "=".to_string(),
+                                    left: Box::new(store_member(&v)),
+                                    right: Box::new(rhs),
+                                }
+                            } else {
+                                sh2_call("setVar", vec![str_lit(&v), rhs])
+                            },
                             Expr::AssignmentExpression {
                                 operator: "=".to_string(),
                                 left: Box::new(sh2_member("lastExit")),
@@ -38653,6 +39101,166 @@ fn redirect_spec_to_estree(r: &IrRedirect, persist: bool) -> Expr {
     Expr::ObjectExpression { properties: props }
 }
 
+/// `CMD ARGS <SPECS>` whose body lowers to exactly ONE sync-builtin
+/// dispatch → the one-call `sh2.builtin(NAME, ARGS, ENV, SPECS)` form
+/// (see the redirect statement arm). The runtime's new fourth parameter
+/// runs the same `_applyRedirectSpecs` install/restore/persist pass that
+/// `redirectSync` wraps around the same call, so the builtin's value and
+/// every status are identical — one call frame, one arrow allocation and
+/// one fd-table save less per site.
+///
+/// Eligibility (all provable):
+///  - the body is a single expression statement that lowers to a plain
+///    `sh2.builtin(...)` call (not a native echo write, not a capture,
+///    not a spawn, no await wrapper);
+///  - the redirects are NOT persistent (a `persist` spec belongs to the
+///    `exec`-installs-forever form, which keeps its own lowering);
+///  - the collapsed argument order is unobservable: the spec expressions
+///    AND the builtin's arguments are CALL-FREE. The original form
+///    evaluates the spec TARGETS first and the runtime `expandWord`s them
+///    before the body's arguments; the collapsed form evaluates the
+///    arguments first. A call-free expression cannot observe that order.
+fn try_builtin_redirect_collapse(
+    inner: &[IrStmt],
+    redirects: &[IrRedirect],
+    spec_triples: &[(i64, &str, &IrExpr)],
+    persist: bool,
+) -> Option<Expr> {
+    if persist || redirects.is_empty() {
+        return None;
+    }
+    let touched = redirect_specs_touch_fd1(spec_triples);
+    let lowered = redirect_body_expr(inner, touched)?;
+    let specs = array(
+        redirects
+            .iter()
+            .map(|r| redirect_spec_to_estree(r, false))
+            .collect(),
+    );
+    finish_builtin_redirect(lowered, specs)
+}
+
+/// The EXPRESSION-position twin of [`try_builtin_redirect_collapse`]:
+/// `redirect [Arrow(stmts), specs]` — the form every `$(cmd > f)` /
+/// pipeline stage redirect lowers through — collapses to the same
+/// one-call `sh2.builtin(NAME, ARGS, ENV, SPECS)` shape.
+fn try_builtin_redirect_call(args: &[IrExpr]) -> Option<Expr> {
+    let [IrExpr::Arrow(stmts), specs_ir] = args else {
+        return None;
+    };
+    let lowered = redirect_body_expr(stmts, redirect_call_touches_fd1(args))?;
+    // The IR spec array never carries `persist` (that flag is added by the
+    // statement form's `redirect_spec_to_estree` for `exec`-installed
+    // redirects); verify on the lowered tree so a future producer cannot
+    // silently bypass the general form's persist handling.
+    let specs = expr_to_estree(specs_ir);
+    if let Expr::ArrayExpression { elements } = &specs {
+        for e in elements.iter().flatten() {
+            if let Expr::ObjectExpression { properties } = e {
+                if properties.iter().any(|p| {
+                    matches!(&p.key, Expr::Identifier { name } if name == "persist")
+                }) {
+                    return None;
+                }
+            }
+        }
+    }
+    finish_builtin_redirect(lowered, specs)
+}
+
+/// Lower a redirect body statement list to its SINGLE expression, under
+/// the same fd-1 sink discipline the redirect arrow uses. `None` unless
+/// the body is exactly one expression (the collapse needs it).
+fn redirect_body_expr(inner: &[IrStmt], touch_fd1: bool) -> Option<Expr> {
+    let arrow_expr = if touch_fd1 {
+        arrow_sink(vec![], IrExpr::Arrow(inner.to_vec()))
+    } else {
+        arrow(vec![], IrExpr::Arrow(inner.to_vec()))
+    };
+    let Expr::ArrowFunctionExpression { body, .. } = arrow_expr else {
+        return None;
+    };
+    match body {
+        ArrowBody::Expr(e) => Some(*e),
+        ArrowBody::Block(b) => match b.as_ref() {
+            Stmt::BlockStatement { body } => match body.as_slice() {
+                [Stmt::ExpressionStatement { expression }] => Some(expression.clone()),
+                _ => None,
+            },
+            _ => None,
+        },
+    }
+}
+
+/// Is a redirect-collapse part (the spec array / a builtin argument) free of
+/// calls ALL THE WAY DOWN? `call_free_expr` covers expression nodes but does
+/// not recurse into object literals — and the redirect spec's `target` lives
+/// in one, so a `$(...)`-bearing target would slip through. Walk the array /
+/// object containers here and delegate the leaves to `call_free_expr`.
+fn redirect_parts_are_pure(e: &Expr) -> bool {
+    match e {
+        Expr::ArrayExpression { elements } => {
+            elements.iter().flatten().all(redirect_parts_are_pure)
+        }
+        Expr::ObjectExpression { properties } => {
+            properties.iter().all(|p| redirect_parts_are_pure(&p.value))
+        }
+        _ => call_free_expr(e).is_some(),
+    }
+}
+
+/// The shared tail of the redirect collapse: the lowered body must be one
+/// plain `sh2.builtin(...)` call, its arguments and the spec array must be
+/// CALL-FREE (the collapsed argument order evaluates the args before the
+/// spec targets — a pure expression cannot observe that), and the runtime
+/// signature gets its `env` slot filled with null. Appends `specs` as the
+/// 4th argument.
+fn finish_builtin_redirect(lowered: Expr, specs: Expr) -> Option<Expr> {
+    let Expr::CallExpression {
+        callee,
+        mut arguments,
+        optional,
+    } = lowered
+    else {
+        return None;
+    };
+    let Expr::MemberExpression {
+        object,
+        property,
+        computed: false,
+        ..
+    } = callee.as_ref()
+    else {
+        return None;
+    };
+    if !matches!(object.as_ref(), Expr::Identifier { name } if name == "sh2")
+        || !matches!(property.as_ref(), Expr::Identifier { name } if name == "builtin")
+    {
+        return None;
+    }
+    if !redirect_parts_are_pure(&specs)
+        || arguments.iter().any(|a| !redirect_parts_are_pure(a))
+    {
+        return None;
+    }
+    match arguments.len() {
+        // (name, args) — insert the `env` slot the runtime signature needs.
+        2 => arguments.push(Expr::Literal {
+            value: serde_json::Value::Null,
+            raw: None,
+            regex: None,
+        }),
+        3 => {}
+        _ => return None,
+    }
+    arguments.push(specs);
+    Some(Expr::CallExpression {
+        callee,
+        arguments,
+        optional,
+    })
+}
+
 fn str_operand(e: &str) -> Option<Expr> {
     let e = e.trim();
     if let Some(inner) = e.strip_prefix('"').and_then(|x| x.strip_suffix('"')) {
@@ -38695,13 +39303,23 @@ fn str_operand(e: &str) -> Option<Expr> {
     if !e.is_empty()
         && !e.contains(['*', '?', '[', '$'])
         && e.chars()
-            .all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '-' || c == '.')
+            .all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '-' || c == '.' || c == '/' || c == ':')
     {
         return Some(Expr::Literal {
             value: serde_json::Value::String(e.to_string()),
             raw: None,
             regex: None,
         });
+    }
+    // Not a strict literal (a `~` tilde word, a `$NAME`+tail interpolation,
+    // a quoted empty, ...): the general operand helper, which handles those
+    // shapes exactly. Glob metachars must NOT reach it — an unquoted `*P*`
+    // operand is a PATTERN the runtime glob-matches (`[[ ]]`), never a
+    // literal (the caller's glob path handles the patterns it can lower).
+    if !e.contains(['*', '?', '[']) {
+        if let Some(v) = test_value_operand(e) {
+            return Some(v);
+        }
     }
     None
 }
@@ -38716,19 +39334,22 @@ fn str_operand(e: &str) -> Option<Expr> {
 fn eq_test_operand(e: &str) -> Option<Expr> {
     let e = e.trim();
     if let Some(inner) = e.strip_prefix('"').and_then(|x| x.strip_suffix('"')) {
-        // a glob metachar inside quotes is a glob in `[[ ]]` context
-        // (the runtime glob-matches `=` operands) — EXCEPT `?` right
-        // after `$`, which is the `$?` status-var sigil, not a glob
-        // (`"$?"` reads the runtime's lastExit field natively).
-        if inner.contains(['*', '[']) || (inner.contains('?') && !inner.contains("$?")) {
-            return None; // glob pattern — the runtime glob-matches
-        }
+        // A QUOTED `=`/`==` operand is a LITERAL STRING, metacharacters
+        // and all: bash only pattern-matches an UNQUOTED `[[ ]]` RHS
+        // ("`[[ abc == "a*" ]]` is a literal compare" — the runtime's own
+        // `doGlob = isDestructuring && !ast.rQuoted`), and `[ ]`/`test`
+        // never glob at all. Refusing metachar-bearing quoted operands
+        // (the pre-2026-10-23 rule) pushed `[ "abc" = "a*" ]` and
+        // `[[ "abc" == "a*" ]]` onto the runtime `sh2.test` string parse
+        // for a constant answer (examples/test-glob-rhs-fallback.sh).
+        // `test_value_operand` keeps the two hazards out: a backslash
+        // (the `$'\x00'` escape family, where the runtime TRUNCATES the
+        // pattern at NUL) and any unresolved `$`/backtick form.
         return test_value_operand(&format!("\"{inner}\""));
     }
     if let Some(inner) = e.strip_prefix('\'').and_then(|x| x.strip_suffix('\'')) {
-        if inner.contains(['*', '?', '[']) {
-            return None;
-        }
+        // single-quoted: literal by construction (same rule as the `"`
+        // branch above — metacharacters are just characters).
         return test_value_operand(&format!("'{inner}'"));
     }
     if e.starts_with('$') {
@@ -38868,7 +39489,11 @@ fn try_native_glob_test(lhs: &str, rhs: &str, negate: bool) -> Option<Expr> {
             &pat,
             CasePat::Substr(_) | CasePat::Prefix(_) | CasePat::Suffix(_) | CasePat::Glob(_)
         ) {
-            if let Some(l) = str_operand(lhs) {
+            // The value side is any plain operand — a lifted binding OR a
+            // native store read (`$var` resolution mirrors the `-n`/`-z`
+            // path): `[[ $var == ?* ]]` is `String(var).length >= 1` with
+            // a property read, not a `sh2.test` string parse.
+            if let Some(l) = str_operand(lhs).or_else(|| test_value_operand(lhs)) {
                 return Some(build(l, &pat));
             }
         }
@@ -39444,20 +40069,122 @@ fn sh2_fs_call(name: &str, args: Vec<Expr>) -> Expr {
 /// path would capture for a pure file-reading command, INCLUDING its exit
 /// status (`$?` reads lastExit after the cmdsub: bash yields the spawned
 /// binary's code — 0 on success, 1 on a missing/unreadable file).
-fn read_file_value(path: Expr, encoding: Option<&'static str>, ok: i64, err: i64) -> Expr {
-    await_expr(read_file_promise(path, encoding, ok, err))
+///
+/// Now the SYNC twin (the ladder's next rung down): `sh2.readText(path,
+/// err)` is one readFileSync in the runtime — no promise, no microtask, no
+/// `await` in the emitted expression (which used to force the whole
+/// enclosing arrow async, cascading captureSync → capture and fnCall →
+/// exec for every caller). The value and the recorded status are exactly
+/// the promise chain's: the text on success (lastExit = 0), "" on failure
+/// (lastExit = err).
+fn read_file_value(path: Expr, _encoding: Option<&'static str>, ok: i64, err: i64) -> Expr {
+    debug_assert_eq!(ok, 0, "readText records status 0 on success");
+    read_text_value(path, err)
 }
 
-/// The un-awaited `sh2.fs.readFile(path, enc?)` promise with the runtime's
-/// exit-status recording chained on — `read_file_value` awaits it; the
-/// capture-pipeline lifts chain their own `.then(...)` transform on it
-/// before the single await.
-fn read_file_promise(path: Expr, encoding: Option<&'static str>, ok: i64, err: i64) -> Expr {
-    let mut args = vec![path];
-    if let Some(enc) = encoding {
-        args.push(str_lit(enc));
+/// `sh2.fs.readText(path, errStatus)` — the sync read twin (see the
+/// runtime's contract): the file's utf8 text, '' on failure, with lastExit
+/// recorded. `sh2.fs` is the fs namespace (its async sibling `readFile`
+/// lives there), so the call is one property read + call — no dispatch.
+///
+/// `SH2_ASSUME_SYNC_FS=0` restores the awaited `readFile` chain, keeping the
+/// SAME `sh2._r` / `sh2._readOk` contract the sync helper establishes (the
+/// mapped forms below read both), so the two rungs are interchangeable.
+fn read_text_value(path: Expr, err: i64) -> Expr {
+    if sync_fs_enabled() {
+        return sh2_fs_call("readText", vec![path, int_lit_expr(err)]);
     }
-    fs_promise_status(sh2_fs_call("readFile", args), ok, err)
+    seq(vec![Expr::AssignmentExpression {
+        operator: "=".to_string(),
+        left: Box::new(sh2_member("_r")),
+        right: Box::new(await_expr(read_file_promise_ok(path, err))),
+    }])
+}
+
+/// The pre-change awaited read, carrying the sync twin's full contract:
+/// `readFile(p,'utf8').then(r => (lastExit = 0, _readOk = true, _r = r, r))
+/// .catch(e => (lastExit = err, _readOk = false, _r = "", ""))`. Only the
+/// `SH2_ASSUME_SYNC_FS=0` path builds this.
+fn read_file_promise_ok(path: Expr, err: i64) -> Expr {
+    let status = |exit: i64| Expr::AssignmentExpression {
+        operator: "=".to_string(),
+        left: Box::new(sh2_member("lastExit")),
+        right: Box::new(int_lit_expr(exit)),
+    };
+    let bind = |value: Expr, ok: bool| {
+        seq(vec![
+            Expr::AssignmentExpression {
+                operator: "=".to_string(),
+                left: Box::new(sh2_member("_r")),
+                right: Box::new(value),
+            },
+            Expr::AssignmentExpression {
+                operator: "=".to_string(),
+                left: Box::new(sh2_member("_readOk")),
+                right: Box::new(bool_lit(ok)),
+            },
+        ])
+    };
+    let r = Expr::Identifier {
+        name: "r".to_string(),
+    };
+    let then_body = seq(vec![status(0), bind(r.clone(), true), r]);
+    let catch_body = seq(vec![status(err), bind(str_lit(""), false), str_lit("")]);
+    let chain = method_call(
+        sh2_fs_call("readFile", vec![path, str_lit("utf8")]),
+        "then",
+        vec![Expr::ArrowFunctionExpression {
+            params: vec![Expr::Identifier {
+                name: "r".to_string(),
+            }],
+            body: ArrowBody::Expr(Box::new(then_body)),
+            expression: true,
+            r#async: false,
+        }],
+    );
+    Expr::CallExpression {
+        callee: Box::new(Expr::MemberExpression {
+            object: Box::new(chain),
+            property: Box::new(Expr::Identifier {
+                name: "catch".to_string(),
+            }),
+            computed: false,
+            optional: false,
+        }),
+        arguments: vec![Expr::ArrowFunctionExpression {
+            params: vec![Expr::Identifier {
+                name: "e".to_string(),
+            }],
+            body: ArrowBody::Expr(Box::new(catch_body)),
+            expression: true,
+            r#async: false,
+        }],
+        optional: false,
+    }
+}
+
+/// `(sh2._r = sh2.fs.readText(path, err), sh2._readOk ? <mapped> : "")` —
+/// the mapped form: unlike the plain read, a transform (a line count, a
+/// filter, a field slice) must run ONLY on the success branch, because the
+/// error sentinel "" and an empty file's content are the same string. The
+/// text is bound to the `sh2._r` scratch (the transforms below read it);
+/// no arrow, no promise — the sync twin of `fs_promise_map`/`.then(...)`.
+///
+/// Both rungs (the sync helper and the `SH2_ASSUME_SYNC_FS=0` awaited chain)
+/// maintain `_r` + `_readOk`, so this wrapper is the same for both.
+fn read_text_map(path: Expr, err: i64, mapped: Expr) -> Expr {
+    seq(vec![
+        Expr::AssignmentExpression {
+            operator: "=".to_string(),
+            left: Box::new(sh2_member("_r")),
+            right: Box::new(read_text_value(path, err)),
+        },
+        Expr::ConditionalExpression {
+            test: Box::new(sh2_member("_readOk")),
+            consequent: Box::new(mapped),
+            alternate: Box::new(str_lit("")),
+        },
+    ])
 }
 
 /// Chain the runtime's exit-status recording onto an arbitrary
@@ -39594,6 +40321,11 @@ fn native_capture_mktemp_dir(e: &IrExpr) -> Option<Expr> {
     if !mktemp_native_enabled() {
         return None;
     }
+    // SH2_ASSUME_SYNC_FS=0: keep the runtime builtin path (the capture
+    // around a sync `mktemp` dispatch — exact, one rung up).
+    if !sync_fs_enabled() {
+        return None;
+    }
     let IrExpr::Call { func, args } = e else {
         return None;
     };
@@ -39635,12 +40367,17 @@ fn native_capture_mktemp_dir(e: &IrExpr) -> Option<Expr> {
     if xrun < 3 {
         return None; // GNU mktemp errors on <3 trailing X's
     }
-    let prefix = &tpl[..tpl.len() - xrun];
-    Some(await_expr(fs_promise_status(
-        sh2_fs_call("mkdtemp", vec![str_lit(prefix)]),
-        0,
-        1,
-    )))
+    // The sync twin, `sh2.mktempValue` — the SAME helper the file form
+    // below uses (it parses `-d` itself and creates with mkdirSync), so
+    // the value, the trailing-X rule and the lastExit protocol are the
+    // runtime builtin's own. It also reproduces GNU's "replace the trailing
+    // X-run" structure exactly, where `fs.mkdtemp(prefix)` appended a fixed
+    // six random chars (same uniqueness, shorter name — unobservable, but
+    // the exact form costs nothing). No promise, no `await`.
+    Some(sh2_call(
+        "mktempValue",
+        vec![array(vec![str_lit("-d"), str_lit(tpl)])],
+    ))
 }
 
 /// `$(mktemp TPL)` — the FILE form of the temp-creating capture (the
@@ -39962,7 +40699,6 @@ fn native_capture_grep_cut(stages: &[IrExpr]) -> Option<Expr> {
         return None; // multi-char / newline delimiters keep the runtime
     }
     let file_expr = native_fs_path_arg(file)?;
-    let s = read_file_promise(file_expr, Some("utf8"), 0, 0);
     // l => KEEP
     let keep = |l: Expr| {
         let pred = match &gpat {
@@ -40006,7 +40742,7 @@ fn native_capture_grep_cut(stages: &[IrExpr]) -> Option<Expr> {
     let body = method_call(
         method_call(
             method_call(
-                method_call(ident("t"), "split", vec![str_lit("\n")]),
+                method_call(sh2_member("_r"), "split", vec![str_lit("\n")]),
                 "filter",
                 vec![sync_arrow_expr_param("l", keep(ident("l")))],
             ),
@@ -40016,8 +40752,7 @@ fn native_capture_grep_cut(stages: &[IrExpr]) -> Option<Expr> {
         "join",
         vec![str_lit("\n")],
     );
-    let chained = method_call(s, "then", vec![sync_arrow_expr_param("t", body)]);
-    Some(trim_capture(await_expr(chained)))
+    Some(trim_capture(read_text_map(file_expr, 0, body)))
 }
 
 /// `l => l.includes(D) ? (l.split(D)[F-1] ?? "") : l` — the GNU-cut field
@@ -40096,9 +40831,8 @@ fn native_capture_cut_sort(stages: &[IrExpr]) -> Option<Expr> {
         _ => return None,
     };
     let file_expr = native_fs_path_arg(file)?;
-    let s = read_file_promise(file_expr, Some("utf8"), 0, 0);
     // (t.endsWith("\n") ? t.slice(0, -1) : t).split("\n").map(l => …).sort(…).join("\n")
-    let t = ident("t");
+    let t = sh2_member("_r");
     let no_trailing_nl = Expr::ConditionalExpression {
         test: Box::new(method_call(t.clone(), "endsWith", vec![str_lit("\n")])),
         consequent: Box::new(method_call(
@@ -40178,8 +40912,7 @@ fn native_capture_cut_sort(stages: &[IrExpr]) -> Option<Expr> {
         method_call(fields, "sort", vec![])
     };
     let joined = method_call(sorted, "join", vec![str_lit("\n")]);
-    let chained = method_call(s, "then", vec![sync_arrow_expr_param("t", joined)]);
-    Some(trim_capture(await_expr(chained)))
+    Some(trim_capture(read_text_map(file_expr, 0, joined)))
 }
 
 /// `$(cat FILE | head -N)` / `$(cat FILE | head -c N)` — the capture's
@@ -40440,8 +41173,7 @@ fn native_capture_cat_head(stages: &[IrExpr]) -> Option<Expr> {
         }
         _ => return None,
     };
-    let s = read_file_promise(file_expr, Some("utf8"), 0, 1);
-    let t = ident("t");
+    let t = sh2_member("_r");
     let value = if bytes {
         // head -c N: the first N bytes (UTF-8 slice — the runtime's
         // String.slice on the decoded text, same as builtins.head)
@@ -40465,8 +41197,8 @@ fn native_capture_cat_head(stages: &[IrExpr]) -> Option<Expr> {
         );
         method_call(keep, "join", vec![str_lit("\n")])
     };
-    let chained = method_call(s, "then", vec![sync_arrow_expr_param("t", value)]);
-    Some(trim_capture(await_expr(chained)))
+    let chained = read_text_map(file_expr, 1, value);
+    Some(trim_capture(chained))
 }
 
 /// `$(wc -l < f)` / `$(wc -c < f)` — newline count / byte count of the
@@ -40500,9 +41232,7 @@ fn native_capture_wc(cmd_args: &[IrExpr], stdin_file: &IrExpr) -> Option<Expr> {
             regex: None,
         }),
     };
-    let r = Expr::Identifier {
-        name: "r".to_string(),
-    };
+    let r = sh2_member("_r");
     let count: Expr = match flag.as_str() {
         "-l" => {
             // newline count over the decoded text (the runtime's exact
@@ -40563,13 +41293,7 @@ fn native_capture_wc(cmd_args: &[IrExpr], stdin_file: &IrExpr) -> Option<Expr> {
         arguments: vec![count],
         optional: false,
     };
-    let chain = fs_promise_map(
-        sh2_fs_call("readFile", vec![expr_to_estree(stdin_file)]),
-        0,
-        1,
-        mapped,
-    );
-    Some(await_expr(chain))
+    Some(read_text_map(expr_to_estree(stdin_file), 1, mapped))
 }
 
 /// `$(dirname X)` / `$(basename X)` / `$(pwd)` — the sync runtime helpers
@@ -40615,6 +41339,85 @@ fn native_capture_path(cmd: &str, cmd_args: &[IrExpr]) -> Option<Expr> {
         },
         value,
     ]))
+}
+
+/// One `exec("name", [...])` / `builtin("name", [...])` dispatch whose
+/// command name is a literal sync builtin the program does not shadow.
+/// Returns the name and the argument list.
+fn sync_builtin_dispatch(e: &IrExpr) -> Option<(&str, &[IrExpr])> {
+    let IrExpr::Call { func, args } = e else {
+        return None;
+    };
+    if !matches!(func.as_str(), "exec" | "builtin") {
+        return None;
+    }
+    let [IrExpr::Str(name, _), IrExpr::Array(items)] = args.as_slice() else {
+        return None;
+    };
+    if !SYNC_BUILTINS.contains(&name.as_str()) || program_defines_function(name) {
+        return None;
+    }
+    Some((name.as_str(), items.as_slice()))
+}
+
+/// The redirect-spec array of a capture body (`[{fd, mode, target, …}]` —
+/// the emitter's object-literal shape). Only an all-object, non-empty
+/// array is a spec install the runtime twin can replay; anything else
+/// (an awaited target expression, a dynamic element) keeps the runtime
+/// capture machinery.
+fn capture_specs_value(specs: &IrExpr) -> Option<Expr> {
+    let IrExpr::Array(items) = specs else {
+        return None;
+    };
+    if items.is_empty() || !items.iter().all(|i| matches!(i, IrExpr::Object(_))) {
+        return None;
+    }
+    Some(expr_to_estree(specs))
+}
+
+/// `$(SYNC-BUILTIN ARGS...)` / `$(SYNC-BUILTIN ARGS... <redirs)` — the
+/// generic capture collapse: a capture whose body is EXACTLY one
+/// sync-builtin dispatch, optionally wrapped in a `sh2.redirect` spec
+/// install, emits ONE `sh2.builtinValue(name, args[, specs])` call instead
+/// of `captureSync(() => [redirectSync(() =>] builtin(...)[, specs)])`.
+/// The runtime twin replays the same fd-1 capture install, the same
+/// spec apply/restore/persist pass, and the same buffer post-processing
+/// (NUL + trailing-newline strips, temp-result resolution), so the value
+/// and the recorded statuses are identical — minus two call frames and the
+/// per-call arrow allocation. All the more specific lifts run first, so
+/// only shapes they do not model reach this one.
+fn native_capture_builtin_value(stmts: &[IrStmt]) -> Option<Expr> {
+    let [IrStmt::Expr(inner)] = stmts else {
+        return None;
+    };
+    let to_call = |name: &str, items: &[IrExpr], specs: Option<Expr>| {
+        let mut args = vec![
+            str_lit(name),
+            array(items.iter().map(expr_to_estree).collect()),
+        ];
+        if let Some(specs) = specs {
+            args.push(specs);
+        }
+        sh2_call("builtinValue", args)
+    };
+    if let Some((name, items)) = sync_builtin_dispatch(inner) {
+        return Some(to_call(name, items, None));
+    }
+    let IrExpr::Call { func, args } = inner else {
+        return None;
+    };
+    if !matches!(func.as_str(), "redirect" | "redirectSync") {
+        return None;
+    }
+    let [IrExpr::Arrow(body), specs] = args.as_slice() else {
+        return None;
+    };
+    let [IrStmt::Expr(inner)] = body.as_slice() else {
+        return None;
+    };
+    let (name, items) = sync_builtin_dispatch(inner)?;
+    let specs = capture_specs_value(specs)?;
+    Some(to_call(name, items, Some(specs)))
 }
 
 /// `$(cat ...)` / `$(sort ...)` / `$(wc ...)` / `$(dirname ...)` /
@@ -41303,7 +42106,42 @@ fn try_native_let_dead(args: &[IrExpr]) -> Option<Expr> {
 /// mkdir: `-p`/`--parents` → recursive mkdir (existing dirs are fine,
 /// exactly `mkdir -p`; EEXIST without `-p` fails like bash). Any other
 /// option keeps the runtime.
+/// SH2_ASSUME_SYNC_FS=0 — restore the ASYNC fs lifts (the pre-change
+/// `await sh2.fs.readFile/unlink/rm/mkdir/mkdtemp(...)` promise chains) for
+/// every pure-file lift. Default ON: the sync twins are the same values and
+/// the same lastExit protocol, one ladder rung cheaper — a readFileSync
+/// instead of a promise + microtask per call (measured >100x per call on
+/// this box), and no `await` in the emitted expression.
+///
+/// Why it matters beyond the per-call cost: an awaited call forces the
+/// whole enclosing arrow ASYNC, which cascades down the call graph — a
+/// function that reads one file turns every one of its call sites from
+/// `sh2.fnCall` (sync) into `sh2.exec` (async), and every capture around
+/// it from `captureSync` into `capture`. The sync twins stop that cascade
+/// at the source, exactly like the sync fileTest (Plan 25) and the sync
+/// builtins (`cat`/`grep`/`sort`/`rm` already read the filesystem with
+/// readFileSync in the runtime).
+///
+/// No behavioural assumption is being made — each twin reproduces the
+/// promise chain's value AND status byte-for-byte (the swapped-then/catch
+/// branches are the twin's success/failure arms) — but the option exists
+/// so a bisect can return to the promise forms without a rebuild.
+fn sync_fs_enabled() -> bool {
+    std::env::var("SH2_ASSUME_SYNC_FS").map_or(true, |v| v != "0")
+}
+
 fn try_native_fs_exec(name: &str, args: &[IrExpr]) -> Option<Expr> {
+    if sync_fs_enabled() {
+        // `rm` / `mkdir` are SYNC BUILTINS in the runtime (SYNC_BUILTINS,
+        // Plan 21 — GNU-verified: per-path continuation, -f/-r/-p, GNU's
+        // error statuses). Declining here lets the call fall through to
+        // that dispatch, which is strictly cheaper than the promise chain
+        // this hook used to build (`Promise.all` over unlink/rm + a status
+        // fold): one sync call, no promise, and no `await` dragging the
+        // enclosing arrow async. The builtin additionally glob-expands
+        // GLOB_MAGIC operands, which the chain refused.
+        return None;
+    }
     match name {
         "rm" => try_native_rm(args),
         "mkdir" => try_native_mkdir(args),
@@ -41600,18 +42438,23 @@ fn try_native_mkdir(args: &[IrExpr]) -> Option<Expr> {
 }
 
 /// `grep -q PAT FILE` — a pure substring test over a file's contents: the
-/// spawned grep collapses to an `await sh2.fs.readFile(FILE, "utf8")`
-/// promise chain that returns grep's exact truthiness (match) and records
-/// grep's exact exit statuses — 0 match, 1 no match, 2 unreadable/missing
-/// file (the runtime's spawn yields the real grep code; `$?` reads it
-/// back). No spawn, no stderr noise, no regex engine: the pattern must be
-/// a plain literal (is_safe_grep_literal) in the single-file `-q` form
-/// (`grep -q PAT FILE`); the stdin/`-e`/multi-file forms keep the runtime.
+/// spawned grep collapses to a sync `sh2.fs.readText(FILE, 2)` + an
+/// `String(text).includes(PAT)` test, returning grep's exact truthiness
+/// (match) and recording grep's exact exit statuses — 0 match, 1 no match,
+/// 2 unreadable/missing file (the runtime's spawn yields the real grep
+/// code; `$?` reads it back). No spawn, no stderr noise, no regex engine:
+/// the pattern must be a plain literal (is_safe_grep_literal) in the
+/// single-file `-q` form (`grep -q PAT FILE`); the stdin/`-e`/multi-file
+/// forms keep the runtime.
+///
+/// Sync, not the old `await sh2.fs.readFile(...).then(...).catch(...)`:
+/// one readFileSync in the runtime (the ladder's sync rung — the read used
+/// to cost a promise + microtask per evaluation AND drag an `await` into
+/// the enclosing arrow).
 fn native_exec_grep_q(file: &IrExpr, pat: &str) -> Option<Expr> {
     if !is_safe_grep_literal(pat) {
         return None;
     }
-    let read = sh2_fs_call("readFile", vec![expr_to_estree(file), str_lit("utf8")]);
     let hit = |s: Expr| Expr::CallExpression {
         callee: Box::new(Expr::MemberExpression {
             object: Box::new(Expr::CallExpression {
@@ -41630,9 +42473,8 @@ fn native_exec_grep_q(file: &IrExpr, pat: &str) -> Option<Expr> {
         arguments: vec![str_lit(pat)],
         optional: false,
     };
-    let h = hit(Expr::Identifier {
-        name: "s".to_string(),
-    });
+    let text = sh2_member("_r");
+    let h = hit(text);
     let status = |v: Expr| Expr::AssignmentExpression {
         operator: "=".to_string(),
         left: Box::new(sh2_member("lastExit")),
@@ -41650,74 +42492,174 @@ fn native_exec_grep_q(file: &IrExpr, pat: &str) -> Option<Expr> {
             }),
         }),
     };
-    let then = Expr::CallExpression {
-        callee: Box::new(Expr::MemberExpression {
-            object: Box::new(read),
-            property: Box::new(Expr::Identifier {
-                name: "then".to_string(),
-            }),
-            computed: false,
-            optional: false,
-        }),
-        arguments: vec![Expr::ArrowFunctionExpression {
-            params: vec![Expr::Identifier {
-                name: "s".to_string(),
-            }],
-            body: ArrowBody::Expr(Box::new(seq(vec![status(h.clone()), h]))),
-            expression: true,
-            r#async: false,
-        }],
-        optional: false,
-    };
-    let catch = Expr::CallExpression {
-        callee: Box::new(Expr::MemberExpression {
-            object: Box::new(then),
-            property: Box::new(Expr::Identifier {
-                name: "catch".to_string(),
-            }),
-            computed: false,
-            optional: false,
-        }),
-        arguments: vec![Expr::ArrowFunctionExpression {
-            params: vec![Expr::Identifier {
-                name: "e".to_string(),
-            }],
-            body: ArrowBody::Expr(Box::new(seq(vec![
-                Expr::AssignmentExpression {
-                    operator: "=".to_string(),
-                    left: Box::new(sh2_member("lastExit")),
-                    right: Box::new(Expr::Literal {
-                        value: serde_json::Value::from(2),
-                        raw: None,
-                        regex: None,
-                    }),
-                },
-                bool_lit(false),
-            ]))),
-            expression: true,
-            r#async: false,
-        }],
-        optional: false,
-    };
-    Some(await_expr(catch))
+    // `readText(FILE, 2)` already records grep's error code on a failed
+    // read; the success branch records the 0/1 match status.
+    Some(seq(vec![
+        Expr::AssignmentExpression {
+            operator: "=".to_string(),
+            left: Box::new(sh2_member("_r")),
+            right: Box::new(read_text_value(expr_to_estree(file), 2)),
+        },
+        Expr::ConditionalExpression {
+            test: Box::new(sh2_member("_readOk")),
+            consequent: Box::new(seq(vec![status(h.clone()), h])),
+            alternate: Box::new(bool_lit(false)),
+        },
+    ]))
 }
 
-/// `grep -q PAT <<< TEXT` — the fd-0 herestring redirect form of the
-/// substring test: the spawned grep collapses to a native `includes` over
-/// the herestring text with grep's exact status (0 match, 1 no match)
-/// recorded to lastExit. The herestring's appended newline cannot affect
-/// a literal pattern (real newlines are rejected by is_safe_grep_literal).
-/// Only a single fd-0 herestring spec qualifies — any other redirect
-/// shape (files, extra fds, `2>&1` that would surface grep's stderr)
-/// keeps the runtime redirect.
-fn try_native_grep_q_redirect(inner: &[IrStmt], specs: &[(i64, &str, &IrExpr)]) -> Option<Expr> {
-    if specs.len() != 1 || specs[0].0 != 0 || specs[0].1 != "herestring" {
+/// One redirect spec in the ESTree arm's `{fd, mode, target, interpolate}`
+/// shape, extracted from either an `IrRedirect` (statement position) or a
+/// `IrExpr::Object` spec (expression position — the emitter writes the
+/// same four keys). The three-value prefix is what the older lifts take;
+/// [`RedirectSpec::triples`] hands it to them unchanged.
+#[derive(Clone, Copy)]
+struct RedirectSpec<'a> {
+    fd: i64,
+    mode: &'a str,
+    target: &'a IrExpr,
+    interpolate: bool,
+}
+
+impl<'a> RedirectSpec<'a> {
+    fn triples(specs: &[RedirectSpec<'a>]) -> Vec<(i64, &'a str, &'a IrExpr)> {
+        specs.iter().map(|s| (s.fd, s.mode, s.target)).collect()
+    }
+}
+
+/// Extract [`RedirectSpec`]s from the ESTree emitter's spec-object array
+/// (`[IrExpr::Object([("fd", Int), ("mode", Str), ("target", _),
+/// ("interpolate", Bool)])]`). `None` for any other element shape — the
+/// caller then keeps the runtime redirect.
+fn ir_redirect_specs(specs: &[IrExpr]) -> Option<Vec<RedirectSpec<'_>>> {
+    let mut out: Vec<RedirectSpec<'_>> = Vec::with_capacity(specs.len());
+    for so in specs {
+        let IrExpr::Object(props) = so else {
+            return None;
+        };
+        let (mut fd, mut mode, mut target, mut interpolate) = (0i64, "", None, false);
+        for (k, v) in props {
+            match k.as_str() {
+                "fd" => {
+                    if let IrExpr::Int(i) = v {
+                        fd = *i;
+                    }
+                }
+                "mode" => {
+                    if let IrExpr::Str(m, _) = v {
+                        mode = m.as_str();
+                    }
+                }
+                "target" => target = Some(v),
+                "interpolate" => {
+                    if let IrExpr::Bool(b) = v {
+                        interpolate = *b;
+                    }
+                }
+                _ => {}
+            }
+        }
+        out.push(RedirectSpec {
+            fd,
+            mode,
+            target: target?,
+            interpolate,
+        });
+    }
+    Some(out)
+}
+
+/// The exact bytes a *verbatim* fd-0 heredoc/herestring delivers on the
+/// command's stdin, as a native expression — `None` when the body is not
+/// static or the runtime's expansion could alter it.
+///
+/// The three runtime transforms are reproduced at compile time or proven
+/// absent, so no assumption is needed:
+/// * a QUOTED heredoc (`<<'EOF'`) is verbatim by construction
+///   (interpolate=false);
+/// * an unquoted one is identity only when free of `$`, backtick and
+///   backslash — `expandWord`'s only triggers (`try_native_cat_heredoc`
+///   uses the same test);
+/// * `<<-EOF` strips leading tabs per line before expansion;
+/// * a herestring (`<<<`) appends exactly one newline and never
+///   interpolates, and its target must be a compile-time value (no
+///   glob/PS/badsub marker, no `$` read that could re-expand).
+fn fd0_known_text(stdin: &IrExpr, mode: &str, interpolate: bool) -> Option<Expr> {
+    fd0_known_text_string(stdin, mode, interpolate).map(|s| str_lit(&s))
+}
+
+/// The compile-time text twin of [`fd0_known_text`] (same guards); used by
+/// the fold sites that need the STRING (a synthesised `printf` argument, a
+/// constant-folded capture value) rather than an expression.
+fn fd0_known_text_string(stdin: &IrExpr, mode: &str, interpolate: bool) -> Option<String> {
+    match mode {
+        "heredoc" | "heredoc-tabs" => {
+            let IrExpr::Str(body, _) = stdin else {
+                return None;
+            };
+            if interpolate && body.chars().any(|c| matches!(c, '$' | '`' | '\\')) {
+                return None;
+            }
+            if mode == "heredoc-tabs" {
+                // the runtime's heredoc-tabs transform (before expansion):
+                // strip leading tabs per line — exact compile-time twin
+                Some(
+                    body.split('\n')
+                        .map(|l| l.trim_start_matches('\t'))
+                        .collect::<Vec<_>>()
+                        .join("\n"),
+                )
+            } else {
+                Some(body.clone())
+            }
+        }
+        "herestring" => {
+            if !ir_expr_compile_time(stdin) {
+                return None;
+            }
+            let mut s = static_text(stdin)?;
+            s.push('\n');
+            Some(s)
+        }
+        _ => None,
+    }
+}
+
+/// `grep ARGS <<< TEXT` / `grep ARGS <<EOF … EOF` — the fd-0 redirect
+/// form of the mini-grep (`harness/sh2-namespace.mjs grepText`).
+///
+/// The spawn (or runtime builtin dispatch) plus the whole fd-0 install /
+/// restore collapses to ONE sync helper call over the known stdin text.
+/// `grepText` writes through the CURRENT fd-1 sink (module stdout, a
+/// capture buffer, a redirect target — exactly where the grep stage would
+/// write) and records grep's status in `sh2.lastExit`, so both observable
+/// effects are byte-identical. In capture position the matched text is
+/// the value (`captureMode=true`), and the capture's NUL / trailing-
+/// newline strips apply via [`trim_capture`].
+///
+/// `grep -q PAT` keeps the cheaper form: `-q` never writes stdout, so the
+/// whole command is the status write plus a native `String(TEXT).includes`
+/// ([`native_grep_q_herestring`]) — no sh2.* call at all.
+///
+/// Only a single fd-0 spec qualifies: any other redirect shape (a file
+/// operand, extra fds, `2>&1` that would surface grep's stderr) keeps the
+/// runtime redirect. The argv must pass [`grep_argv_safe`] (static args,
+/// supported flags, no FILE operand — the fd-0 spec IS the input).
+fn try_native_grep_redirect(
+    inner: &[IrStmt],
+    specs: &[RedirectSpec<'_>],
+    capture: bool,
+) -> Option<Expr> {
+    let [spec] = specs else {
+        return None;
+    };
+    if spec.fd != 0 {
         return None;
     }
     let [IrStmt::Expr(IrExpr::Call { func, args })] = inner else {
         return None;
     };
-    if func != "exec" {
+    if !matches!(func.as_str(), "exec" | "builtin") {
         return None;
     }
     let [IrExpr::Str(name, _), IrExpr::Array(gargs)] = args.as_slice() else {
@@ -41726,13 +42668,18 @@ fn try_native_grep_q_redirect(inner: &[IrStmt], specs: &[(i64, &str, &IrExpr)]) 
     if name != "grep" {
         return None;
     }
-    let [IrExpr::Str(q, _), IrExpr::Str(pat, _)] = gargs.as_slice() else {
-        return None;
-    };
-    if q != "-q" {
-        return None;
+    // `-q PAT`: the status-only form — a bare native substring test.
+    if !capture {
+        if let [IrExpr::Str(q, _), IrExpr::Str(pat, _)] = gargs.as_slice() {
+            if q == "-q" {
+                return native_grep_q_herestring(spec.target, pat);
+            }
+        }
     }
-    native_grep_q_herestring(&specs[0].2, pat)
+    let text = fd0_known_text(spec.target, spec.mode, spec.interpolate)?;
+    let argv = grep_argv_safe(gargs)?;
+    let call = sh2_call("grepText", vec![text, array(argv), bool_lit(capture)]);
+    Some(if capture { trim_capture(call) } else { call })
 }
 fn native_grep_q_herestring(target: &IrExpr, pat: &str) -> Option<Expr> {
     if !is_safe_grep_literal(pat) {
@@ -43402,6 +44349,2621 @@ fn try_native_echo_pipe_stmt(pipe: &IrExpr) -> Option<Expr> {
     ]))
 }
 
+// ── native pipeline STAGES — the ladder rung below `sh2.builtin` ───────
+//
+// A pipeline stage is emitted as `() => sh2.builtin(NAME, ARGS)`: the
+// runtime installs an fd-1 capture target, the builtin `readFd0()`s the
+// previous stage's text and `emit()`s its own, and the buffer is copied
+// into the next stage's stdin. When the stage is a PURE TEXT TRANSFORM
+// whose output is a closed-form function of its input text, all of that
+// collapses to a plain JS arrow: the runtime's `pipeline`/`pipelineSync`
+// hand the previous stage's string to an arrow that declares ONE
+// parameter and use its `[text, status]` return as the next stage's
+// stdin (`harness/sh2-namespace.mjs`).
+//
+// Every formula below is the runtime builtin's OWN arithmetic (copied
+// from `builtins.head`/`tail`/`wc`/`sort` in sh2-namespace.mjs), so the
+// lowering is value-identical by construction — no assumption gate and
+// no new sh2.* name.
+
+/// The one-parameter contract marker: a stage arrow whose single param is
+/// this name receives the previous stage's output text. `pub(crate)` so the
+/// control-flow pass (src/estree.rs `fix_control_flow`) can recognize the
+/// emitter's own stage arrows and leave their value `return` alone.
+pub(crate) const NATIVE_STAGE_IN: &str = "__sh2_stage_in";
+
+fn stage_ident(name: &str) -> Expr {
+    Expr::Identifier {
+        name: name.to_string(),
+    }
+}
+
+/// `obj.name` — a plain member read.
+fn stage_member(obj: Expr, name: &str) -> Expr {
+    Expr::MemberExpression {
+        object: Box::new(obj),
+        property: Box::new(stage_ident(name)),
+        computed: false,
+        optional: false,
+    }
+}
+
+/// `obj[index]` — a computed member read.
+fn stage_index(obj: Expr, index: Expr) -> Expr {
+    Expr::MemberExpression {
+        object: Box::new(obj),
+        property: Box::new(index),
+        computed: true,
+        optional: false,
+    }
+}
+
+fn stage_bin(op: &str, l: Expr, r: Expr) -> Expr {
+    Expr::BinaryExpression {
+        operator: op.to_string(),
+        left: Box::new(l),
+        right: Box::new(r),
+    }
+}
+
+fn stage_math(name: &str, args: Vec<Expr>) -> Expr {
+    Expr::CallExpression {
+        callee: Box::new(stage_member(stage_ident("Math"), name)),
+        arguments: args,
+        optional: false,
+    }
+}
+
+/// `const <name> = <init>;` inside a stage body.
+fn stage_const(name: &str, init: Expr) -> Stmt {
+    Stmt::VariableDeclaration {
+        kind: "const",
+        declarations: vec![VariableDeclarator {
+            type_: "VariableDeclarator",
+            id: stage_ident(name),
+            init: Some(init),
+        }],
+    }
+}
+
+/// A native stage arrow returning `[text, status]` (expression body).
+fn native_stage_arrow(text: Expr, status: i64) -> Expr {
+    Expr::ArrowFunctionExpression {
+        params: vec![stage_ident(NATIVE_STAGE_IN)],
+        body: ArrowBody::Expr(Box::new(array(vec![text, int_lit_expr(status)]))),
+        expression: true,
+        r#async: false,
+    }
+}
+
+/// A native stage arrow with a statement body (`decls…; return [text,
+/// status];`) — for the formulas that need the split array more than once.
+fn native_stage_block_arrow(decls: Vec<Stmt>, text: Expr, status: i64) -> Expr {
+    let mut body = decls;
+    body.push(Stmt::ReturnStatement {
+        argument: Some(array(vec![text, int_lit_expr(status)])),
+    });
+    Expr::ArrowFunctionExpression {
+        params: vec![stage_ident(NATIVE_STAGE_IN)],
+        body: ArrowBody::Block(Box::new(Stmt::BlockStatement { body })),
+        expression: false,
+        r#async: false,
+    }
+}
+
+/// `if (L.length && L[L.length - 1] === "") L.pop();` — the runtime's
+/// trailing-newline pop, on a freshly-split array (so mutating it is safe).
+fn stage_pop_trailing_empty(l: &str) -> Stmt {
+    let len = || stage_member(stage_ident(l), "length");
+    let last = stage_index(stage_ident(l), stage_bin("-", len(), int_lit_expr(1)));
+    Stmt::IfStatement {
+        test: Expr::LogicalExpression {
+            left: Box::new(len()),
+            operator: "&&".to_string(),
+            right: Box::new(stage_bin("===", last, str_lit(""))),
+        },
+        consequent: Box::new(Stmt::ExpressionStatement {
+            expression: method_call(stage_ident(l), "pop", vec![]),
+        }),
+        alternate: None,
+    }
+}
+
+/// Parse `head`/`tail` argv into `(bytes, n, from)` — the runtime's
+/// `parseHeadTailArgs` subset with NO file operands (a file operand needs
+/// the runtime's `readFileSafe` error path, so it keeps the builtin).
+fn head_tail_stage_args(argv: &[IrExpr]) -> Option<(bool, i64, bool)> {
+    let mut bytes = false;
+    let mut n: i64 = 10;
+    let mut from = false;
+    let mut i = 0;
+    while i < argv.len() {
+        let IrExpr::Str(a, _) = &argv[i] else {
+            return None;
+        };
+        if a == "-" {
+            i += 1;
+            continue;
+        }
+        if a == "-n" || a == "-c" {
+            let IrExpr::Str(v, _) = argv.get(i + 1)? else {
+                return None;
+            };
+            bytes = a == "-c";
+            if bytes {
+                n = v.parse().ok()?;
+            } else {
+                n = v.trim_start_matches('+').parse().ok()?;
+                from = v.starts_with('+');
+            }
+            i += 1;
+        } else if let Some(rest) = a.strip_prefix('+') {
+            n = rest.parse().ok()?;
+            from = true;
+        } else if let Some(rest) = a.strip_prefix("-n") {
+            n = rest.parse().ok()?;
+            from = false;
+        } else if let Some(rest) = a.strip_prefix("-c") {
+            bytes = true;
+            n = rest.parse().ok()?;
+        } else if let Some(rest) = a.strip_prefix('-') {
+            n = rest.parse().ok()?;
+            from = false;
+        } else {
+            return None; // FILE operand
+        }
+        if n < 0 {
+            return None;
+        }
+        i += 1;
+    }
+    Some((bytes, n, from))
+}
+
+/// A block-bodied arrow with named params (`(a, b) => { decls…; return
+/// ret; }`) — the comparator / callback shape the filter stages need
+/// (`native_stage_block_arrow` is the one-param `[text, status]` form).
+fn stage_arrow_named(params: Vec<&str>, decls: Vec<Stmt>, ret: Expr) -> Expr {
+    let mut body = decls;
+    body.push(Stmt::ReturnStatement {
+        argument: Some(ret),
+    });
+    Expr::ArrowFunctionExpression {
+        params: params
+            .into_iter()
+            .map(|p| stage_ident(p))
+            .collect::<Vec<_>>(),
+        body: ArrowBody::Block(Box::new(Stmt::BlockStatement { body })),
+        expression: false,
+        r#async: false,
+    }
+}
+
+/// `parseFloat(x) || 0` — the runtime sort/wc numeric coercion.
+fn stage_parse_float(v: Expr) -> Expr {
+    stage_bin(
+        "||",
+        Expr::CallExpression {
+            callee: Box::new(stage_ident("parseFloat")),
+            arguments: vec![v],
+            optional: false,
+        },
+        int_lit_expr(0),
+    )
+}
+
+/// The flags `builtins.sort` honours that this formula models. Anything
+/// else (`-t`/`-k` change the key, `-o` redirects the output, `-h` needs
+/// the human-size parser, a FILE operand needs a fallible read) refuses.
+#[derive(Default, Clone, Copy)]
+struct SortStageOpts {
+    numeric: bool,
+    reverse: bool,
+    unique: bool,
+    fold: bool,
+}
+
+fn sort_stage_args(argv: &[IrExpr]) -> Option<SortStageOpts> {
+    let mut o = SortStageOpts::default();
+    for a in argv {
+        // a quoted flag/operand arrives as an all-Lit Interpolate; a
+        // dynamic one (or a FILE operand) refuses
+        let Some(sv) = static_str(a) else {
+            return None;
+        };
+        let s = sv.as_str();
+        if s.len() < 2 || !s.starts_with('-') {
+            return None; // FILE operand
+        }
+        for ch in s[1..].chars() {
+            match ch {
+                'n' => o.numeric = true,
+                'r' => o.reverse = true,
+                'u' => o.unique = true,
+                'f' => o.fold = true,
+                _ => return None,
+            }
+        }
+    }
+    Some(o)
+}
+
+/// `sort [FLAGS]` as a native stage arrow — the runtime `builtins.sort`
+/// arithmetic transcribed: `L = in.split('\n')`, pop the trailing empty,
+/// `L.sort(cmp)`, [dedupe], `L.join('\n') + (L.length ? '\n' : '')`.
+fn sort_stage(argv: &[IrExpr]) -> Option<Expr> {
+    let o = sort_stage_args(argv)?;
+    // `-u` dedupes ADJACENT lines by RAW text (the runtime's `seen` scan).
+    // GNU instead collapses lines whose KEYS compare equal, so `-u -f` /
+    // `-u -n` need key-aware dedupe — that shape keeps the builtin.
+    if o.unique && (o.fold || o.numeric) {
+        return None;
+    }
+    let key = |v: Expr| {
+        if o.fold {
+            method_call(v, "toLowerCase", vec![])
+        } else {
+            v
+        }
+    };
+    let cmp = {
+        let mut decls = vec![
+            stage_const("ka", key(stage_ident("a"))),
+            stage_const("kb", key(stage_ident("b"))),
+        ];
+        let (ka, kb) = if o.numeric {
+            decls.push(stage_const("na", stage_parse_float(stage_ident("ka"))));
+            decls.push(stage_const("nb", stage_parse_float(stage_ident("kb"))));
+            (stage_ident("na"), stage_ident("nb"))
+        } else {
+            (stage_ident("ka"), stage_ident("kb"))
+        };
+        let c = Expr::ConditionalExpression {
+            test: Box::new(stage_bin("<", ka.clone(), kb.clone())),
+            consequent: Box::new(int_lit_expr(-1)),
+            alternate: Box::new(Expr::ConditionalExpression {
+                test: Box::new(stage_bin(">", ka, kb)),
+                consequent: Box::new(int_lit_expr(1)),
+                alternate: Box::new(int_lit_expr(0)),
+            }),
+        };
+        decls.push(stage_const("c", c));
+        let ret = if o.reverse {
+            Expr::UnaryExpression {
+                operator: "-".to_string(),
+                argument: Box::new(stage_ident("c")),
+                prefix: true,
+            }
+        } else {
+            stage_ident("c")
+        };
+        stage_arrow_named(vec!["a", "b"], decls, ret)
+    };
+    let mut decls = vec![
+        stage_const("L", method_call(stage_ident(NATIVE_STAGE_IN), "split", vec![str_lit("\n")])),
+        stage_pop_trailing_empty("L"),
+        Stmt::ExpressionStatement {
+            expression: method_call(stage_ident("L"), "sort", vec![cmp]),
+        },
+    ];
+    let out_name = if o.unique {
+        // The runtime keeps a line unless it repeats the PREVIOUS line
+        // (`seen[seen.length - 1]`) — after a (spec-mandated stable) sort
+        // equal keys are adjacent, so comparing with the previous element
+        // selects exactly the same lines.
+        decls.push(stage_const(
+            "U",
+            method_call(
+                stage_ident("L"),
+                "filter",
+                vec![stage_arrow_named(
+                    vec!["l", "i"],
+                    vec![],
+                    Expr::LogicalExpression {
+                        left: Box::new(stage_bin("===", stage_ident("i"), int_lit_expr(0))),
+                        operator: "||".to_string(),
+                        right: Box::new(stage_bin(
+                            "!==",
+                            stage_ident("l"),
+                            stage_index(
+                                stage_ident("L"),
+                                stage_bin("-", stage_ident("i"), int_lit_expr(1)),
+                            ),
+                        )),
+                    },
+                )],
+            ),
+        ));
+        "U"
+    } else {
+        "L"
+    };
+    let text = stage_bin(
+        "+",
+        method_call(stage_ident(out_name), "join", vec![str_lit("\n")]),
+        Expr::ConditionalExpression {
+            test: Box::new(stage_member(stage_ident(out_name), "length")),
+            consequent: Box::new(str_lit("\n")),
+            alternate: Box::new(str_lit("")),
+        },
+    );
+    Some(native_stage_block_arrow(decls, text, 0))
+}
+
+// ── BRE/ERE → JS regex translation (Rust port of harness/sh2-namespace.mjs)
+//
+// The runtime's `breToJs`/`ereToJs`/`classToJs`/`posixClass` are the
+// canonical translators — `grepText` and `builtins.sed` compile their
+// patterns with them, so a stage lowered from this port produces the SAME
+// JS regex the runtime helper would build. Keep the two in lockstep: the
+// corpus's grep/sed examples are the differential test.
+
+/// POSIX character classes → the JS class body the runtime uses.
+fn posix_class_js(name: &str) -> &'static str {
+    match name {
+        "alpha" => "a-zA-Z",
+        "digit" => "0-9",
+        "alnum" => "a-zA-Z0-9",
+        "upper" => "A-Z",
+        "lower" => "a-z",
+        "space" => "\\s",
+        "blank" => " \\t",
+        "punct" => "\\x21-\\x2F\\x3A-\\x40\\x5B-\\x60\\x7B-\\x7E",
+        "print" => "\\x20-\\x7E",
+        "graph" => "\\x21-\\x7E",
+        "cntrl" => "\\x00-\\x1F\\x7F",
+        "xdigit" => "a-fA-F0-9",
+        "word" => "a-zA-Z0-9_",
+        "ascii" => "\\x00-\\x7F",
+        _ => "",
+    }
+}
+
+/// `[...]` starting at `start` → (JS source, index after the class).
+/// `None` for an unterminated class (the caller emits a literal `[`).
+fn regex_class_to_js(pat: &[char], start: usize) -> Option<(String, usize)> {
+    let mut j = start + 1;
+    let mut neg = false;
+    if pat.get(j) == Some(&'^') {
+        neg = true;
+        j += 1;
+    }
+    let mut inner = String::new();
+    if pat.get(j) == Some(&']') {
+        inner.push_str("\\]");
+        j += 1;
+    }
+    while j < pat.len() && pat[j] != ']' {
+        // a POSIX class `[:name:]` carries its OWN `]` inside the outer
+        // bracket — skip the whole `[:…:]` sequence
+        if pat[j] == '[' && pat.get(j + 1) == Some(&':') {
+            let rest: String = pat[j..].iter().collect();
+            let close = rest.find(":]")?;
+            inner.push_str(&rest[..close + 2]);
+            j += close + 2;
+            continue;
+        }
+        inner.push(pat[j]);
+        j += 1;
+    }
+    if j >= pat.len() {
+        return None;
+    }
+    // expand the `[:name:]` sequences
+    let chars: Vec<char> = inner.chars().collect();
+    let mut out = String::new();
+    let mut i = 0usize;
+    while i < chars.len() {
+        if chars[i] == '[' && chars.get(i + 1) == Some(&':') {
+            let rest: String = chars[i..].iter().collect();
+            if let Some(close) = rest.find(":]") {
+                let name: String = rest[2..close].chars().filter(|c| c.is_alphanumeric()).collect();
+                out.push_str(posix_class_js(&name));
+                i += close + 2;
+                continue;
+            }
+        }
+        out.push(chars[i]);
+        i += 1;
+    }
+    Some((format!("[{}{}]", if neg { "^" } else { "" }, out), j + 1))
+}
+
+/// BRE → JS (`breToJs`): bare `( ) { } + ? |` are LITERALS, the
+/// backslashed forms are the operators, `^`/`$` anchor only at the
+/// pattern's ends.
+fn bre_to_js(pat: &str) -> String {
+    let chars: Vec<char> = pat.chars().collect();
+    let mut out = String::new();
+    let mut i = 0usize;
+    while i < chars.len() {
+        let c = chars[i];
+        if c == '\\' {
+            match chars.get(i + 1).copied() {
+                None => {
+                    out.push_str("\\\\");
+                    i += 1;
+                }
+                Some(d) => {
+                    if matches!(d, '(' | ')' | '{' | '}' | '+' | '?' | '|') {
+                        out.push(d);
+                    } else {
+                        out.push('\\');
+                        out.push(d);
+                    }
+                    i += 2;
+                }
+            }
+            continue;
+        }
+        if c == '^' {
+            out.push_str(if i == 0 { "^" } else { "\\^" });
+            i += 1;
+            continue;
+        }
+        if c == '$' {
+            out.push_str(if i == chars.len() - 1 { "$" } else { "\\$" });
+            i += 1;
+            continue;
+        }
+        if matches!(c, '(' | ')' | '{' | '}' | '+' | '?' | '|') {
+            out.push('\\');
+            out.push(c);
+            i += 1;
+            continue;
+        }
+        if c == '[' {
+            if let Some((js, next)) = regex_class_to_js(&chars, i) {
+                out.push_str(&js);
+                i = next;
+                continue;
+            }
+            out.push_str("\\[");
+            i += 1;
+            continue;
+        }
+        out.push(c);
+        i += 1;
+    }
+    out
+}
+
+/// ERE → JS (`ereToJs`): already JS-flavored; only the classes translate.
+fn ere_to_js(pat: &str) -> String {
+    let chars: Vec<char> = pat.chars().collect();
+    let mut out = String::new();
+    let mut i = 0usize;
+    while i < chars.len() {
+        let c = chars[i];
+        if c == '\\' {
+            match chars.get(i + 1).copied() {
+                None => {
+                    out.push_str("\\\\");
+                    i += 1;
+                }
+                Some(d) => {
+                    out.push('\\');
+                    out.push(d);
+                    i += 2;
+                }
+            }
+            continue;
+        }
+        if c == '[' {
+            if let Some((js, next)) = regex_class_to_js(&chars, i) {
+                out.push_str(&js);
+                i = next;
+                continue;
+            }
+            out.push_str("\\[");
+            i += 1;
+            continue;
+        }
+        out.push(c);
+        i += 1;
+    }
+    out
+}
+
+/// A translated regex source, safe to print as a `/…/ ` literal (`\/` is
+/// equivalent to a bare `/` in a JS regex).
+fn regex_source_literal_safe(src: &str) -> String {
+    src.replace('/', "\\/")
+}
+
+/// sed's `s///` replacement → the JS replacement string (`sedReplJs`):
+/// `&` → `$&`, `\N` → `$N`, `\\` → a literal backslash, `\t`/`\n` real.
+fn sed_repl_js(repl: &str) -> String {
+    let chars: Vec<char> = repl.chars().collect();
+    let mut out = String::new();
+    let mut i = 0usize;
+    while i < chars.len() {
+        let c = chars[i];
+        if c == '\\' {
+            let d = chars.get(i + 1).copied().unwrap_or('\0');
+            i += 2;
+            match d {
+                '&' => out.push('&'),
+                '\\' => out.push_str("\\\\"),
+                't' => out.push('\t'),
+                'n' => out.push('\n'),
+                '1'..='9' => {
+                    out.push('$');
+                    out.push(d);
+                }
+                other => {
+                    out.push('\\');
+                    out.push(other);
+                }
+            }
+            continue;
+        }
+        if c == '&' {
+            out.push_str("$&");
+        } else {
+            out.push(c);
+        }
+        i += 1;
+    }
+    out
+}
+
+/// One bare `s<PAT><REPL>[gpi]` sed command (surrounding whitespace
+/// tolerated, no address, no other command). Anything else refuses — a
+/// general sed script needs `sedParseScript`'s command/range machinery.
+struct SedSubst {
+    pat: String,
+    repl: String,
+    global: bool,
+    print: bool,
+    ci: bool,
+}
+
+fn sed_parse_single_subst(script: &str) -> Option<SedSubst> {
+    let chars: Vec<char> = script.chars().collect();
+    let mut i = 0usize;
+    while i < chars.len() && chars[i].is_whitespace() {
+        i += 1;
+    }
+    if chars.get(i) != Some(&'s') {
+        return None;
+    }
+    i += 1;
+    let delim = *chars.get(i)?;
+    if delim == '\n' || delim == '\\' || delim.is_alphanumeric() || delim.is_whitespace() {
+        return None;
+    }
+    i += 1;
+    let mut pat = String::new();
+    let mut repl = String::new();
+    for phase in 0..2 {
+        let mut closed = false;
+        while i < chars.len() {
+            let ch = chars[i];
+            if ch == '\\' {
+                let esc = *chars.get(i + 1)?;
+                if phase == 0 {
+                    pat.push('\\');
+                    pat.push(esc);
+                } else {
+                    repl.push('\\');
+                    repl.push(esc);
+                }
+                i += 2;
+                continue;
+            }
+            if ch == delim {
+                i += 1;
+                closed = true;
+                break;
+            }
+            if phase == 0 {
+                pat.push(ch);
+            } else {
+                repl.push(ch);
+            }
+            i += 1;
+        }
+        if !closed {
+            return None;
+        }
+    }
+    let mut global = false;
+    let mut print = false;
+    let mut ci = false;
+    while let Some(ch) = chars.get(i).copied() {
+        match ch {
+            'g' => global = true,
+            'p' => print = true,
+            'i' => ci = true,
+            _ => break,
+        }
+        i += 1;
+    }
+    // nothing else may follow (another command, a `;`, stray text)
+    while let Some(ch) = chars.get(i).copied() {
+        if !ch.is_whitespace() && ch != ';' {
+            return None;
+        }
+        i += 1;
+    }
+    Some(SedSubst {
+        pat,
+        repl,
+        global,
+        print,
+        ci,
+    })
+}
+
+/// `sed [-n] [-r|-E] [-e] 's<PAT><REPL>[gpi]'` as a native stage arrow —
+/// `builtins.sed`'s single-substitution path transcribed: split/pop with
+/// the runtime's `last && !endsNL` newline rule, the per-line
+/// replace/print protocol, and `-n`'s auto-print suppression.
+fn sed_stage(argv: &[IrExpr]) -> Option<Expr> {
+    let mut quiet = false;
+    let mut ere = false;
+    let mut scripts: Vec<String> = Vec::new();
+    let mut positional: Vec<String> = Vec::new();
+    let mut i = 0usize;
+    while i < argv.len() {
+        let a = static_str(&argv[i])?;
+        if a == "-n" {
+            quiet = true;
+            i += 1;
+            continue;
+        }
+        if a == "-r" || a == "-E" {
+            ere = true;
+            i += 1;
+            continue;
+        }
+        if a == "-e" {
+            scripts.push(static_str(argv.get(i + 1)?)?);
+            i += 2;
+            continue;
+        }
+        if let Some(rest) = a.strip_prefix("-e") {
+            if !rest.is_empty() {
+                scripts.push(rest.to_string());
+                i += 1;
+                continue;
+            }
+        }
+        if a == "--" {
+            for v in argv.iter().skip(i + 1) {
+                positional.push(static_str(v)?);
+            }
+            break;
+        }
+        positional.push(a);
+        i += 1;
+    }
+    // exactly one script, no FILE operand (a file read is fallible at run
+    // time — the runtime's error path stays)
+    let script = match (scripts.len(), positional.len()) {
+        (0, 1) => positional[0].clone(),
+        (1, 0) => scripts[0].clone(),
+        _ => return None,
+    };
+    let sub = sed_parse_single_subst(&script)?;
+    let src = regex_source_literal_safe(&if ere {
+        ere_to_js(&sub.pat)
+    } else {
+        bre_to_js(&sub.pat)
+    });
+    let repl = sed_repl_js(&sub.repl);
+    let mut flags = String::new();
+    if sub.global {
+        flags.push('g');
+    }
+    if sub.ci {
+        flags.push('i');
+    }
+    let re = regex_lit_flags(&src, &flags);
+    let line = || stage_ident("line");
+    let mut body: Vec<Stmt> = vec![
+        stage_const(
+            "last",
+            stage_bin(
+                "===",
+                stage_ident("li"),
+                stage_bin("-", stage_member(stage_ident("L"), "length"), int_lit_expr(1)),
+            ),
+        ),
+        // the runtime's `printLine`: `cur + (last && !endsNL ? '' : '\n')`
+        stage_const(
+            "nl",
+            Expr::ConditionalExpression {
+                test: Box::new(Expr::LogicalExpression {
+                    left: Box::new(stage_ident("last")),
+                    operator: "&&".to_string(),
+                    right: Box::new(Expr::UnaryExpression {
+                        operator: "!".to_string(),
+                        argument: Box::new(stage_ident("E")),
+                        prefix: true,
+                    }),
+                }),
+                consequent: Box::new(str_lit("")),
+                alternate: Box::new(str_lit("\n")),
+            },
+        ),
+    ];
+    if sub.print {
+        // the `p` flag needs the MATCH verdict (a substitution that yields
+        // the same text still prints)
+        body.push(stage_const(
+            "hit",
+            method_call(re.clone(), "test", vec![line()]),
+        ));
+    }
+    // `String.replace` is a no-op without a match, so the substitution
+    // value needs no verdict; only the `p` flag does.
+    let sub_expr = method_call(line(), "replace", vec![re, str_lit(&repl)]);
+    body.push(stage_const(
+        "r",
+        if sub.print {
+            Expr::ConditionalExpression {
+                test: Box::new(stage_ident("hit")),
+                consequent: Box::new(sub_expr),
+                alternate: Box::new(line()),
+            }
+        } else {
+            sub_expr
+        },
+    ));
+    let printed = stage_bin("+", stage_ident("r"), stage_ident("nl"));
+    if !quiet {
+        body.push(Stmt::ExpressionStatement {
+            expression: method_call(stage_ident("O"), "push", vec![printed.clone()]),
+        });
+    }
+    if sub.print {
+        body.push(Stmt::IfStatement {
+            test: if sub.global {
+                stage_bin("!==", stage_ident("r"), line())
+            } else {
+                stage_ident("hit")
+            },
+            consequent: Box::new(Stmt::ExpressionStatement {
+                expression: method_call(stage_ident("O"), "push", vec![printed]),
+            }),
+            alternate: None,
+        });
+    }
+    let cb = Expr::ArrowFunctionExpression {
+        params: vec![stage_ident("line"), stage_ident("li")],
+        body: ArrowBody::Block(Box::new(Stmt::BlockStatement { body })),
+        expression: false,
+        r#async: false,
+    };
+    let decls = vec![
+        stage_const(
+            "E",
+            method_call(stage_ident(NATIVE_STAGE_IN), "endsWith", vec![str_lit("\n")]),
+        ),
+        stage_const(
+            "L",
+            method_call(stage_ident(NATIVE_STAGE_IN), "split", vec![str_lit("\n")]),
+        ),
+        Stmt::IfStatement {
+            test: stage_ident("E"),
+            consequent: Box::new(Stmt::ExpressionStatement {
+                expression: method_call(stage_ident("L"), "pop", vec![]),
+            }),
+            alternate: None,
+        },
+        stage_const("O", array(vec![])),
+        Stmt::ExpressionStatement {
+            expression: method_call(stage_ident("L"), "forEach", vec![cb]),
+        },
+    ];
+    Some(native_stage_block_arrow(
+        decls,
+        method_call(stage_ident("O"), "join", vec![str_lit("")]),
+        0,
+    ))
+}
+
+/// Is `p` a grep pattern with no regex meaning — a bare literal, or one
+/// with a `^` head / `$` tail anchor? Returns `(literal, anchored_start,
+/// anchored_end)`; the caller turns it into `includes` / `startsWith` /
+/// `endsWith` / `===`. The literal part must be metachar-free (no
+/// `. * [ ] \` and no inner `^`/`$`), so the three JS ops are exactly
+/// grep's BRE matching for it.
+fn grep_literal_pattern(pat: &str) -> Option<(String, bool, bool)> {
+    if pat.contains('\n') || pat.starts_with('-') {
+        return None;
+    }
+    let (a_start, rest) = match pat.strip_prefix('^') {
+        Some(r) => (true, r),
+        None => (false, pat),
+    };
+    let (a_end, body) = match rest.strip_suffix('$') {
+        Some(r) => (true, r),
+        None => (false, rest),
+    };
+    // Every BRE/ERE operator must be absent: the flag parse above does not
+    // distinguish `-E`/`-F`, so a pattern carrying `|`/`(`/`+`/`?`/`{`
+    // (literals in BRE, operators in ERE) cannot be treated as text.
+    if body
+        .chars()
+        .any(|c| matches!(c, '^' | '$' | '.' | '[' | ']' | '*' | '\\' | '|' | '(' | ')' | '{' | '}' | '+' | '?'))
+    {
+        return None;
+    }
+    Some((body.to_string(), a_start, a_end))
+}
+
+/// `grep [FLAGS] PAT` as a native stage arrow — `builtins.grep`'s
+/// plain-mode line selection for a metachar-free literal pattern:
+/// `L.filter(<includes|startsWith|endsWith|===>)`, GNU's empty-input rule
+/// (no lines at all), `-v` inversion, `-c` count, `-q` status-only.
+/// Anything else (`-i`/`-w`/`-x` case or word semantics beyond ASCII
+/// folding, `-o`, context flags, `-f`, `-m`, byte offsets, a FILE
+/// operand, a real regex) keeps the builtin.
+fn grep_stage(argv: &[IrExpr]) -> Option<Expr> {
+    let mut invert = false;
+    let mut count = false;
+    let mut quiet = false;
+    let mut exclusive = false;
+    let mut patterns: Vec<String> = Vec::new();
+    let mut pos: Vec<String> = Vec::new();
+    let mut i = 0usize;
+    while i < argv.len() {
+        let a = static_str(&argv[i])?;
+        if a == "--" {
+            i += 1;
+            while i < argv.len() {
+                pos.push(static_str(&argv[i])?);
+                i += 1;
+            }
+            break;
+        }
+        if a == "-e" {
+            patterns.push(static_str(argv.get(i + 1)?)?);
+            i += 2;
+            continue;
+        }
+        if a.len() > 2 && a.starts_with("-e") {
+            patterns.push(a[2..].to_string());
+            i += 1;
+            continue;
+        }
+        if a.len() > 1 && a.starts_with('-') && !a.starts_with("--") {
+            for ch in a[1..].chars() {
+                match ch {
+                    'v' => invert = true,
+                    'c' => count = true,
+                    'q' => quiet = true,
+                    'x' => exclusive = true,
+                    // a literal pattern is unaffected by the flavor flags
+                    'E' | 'F' => {}
+                    _ => return None,
+                }
+            }
+            i += 1;
+            continue;
+        }
+        pos.push(a);
+        i += 1;
+    }
+    // one pattern; every other positional is a FILE operand
+    let pat = match (patterns.len(), pos.len()) {
+        (0, 1) => pos[0].clone(),
+        (1, 0) => patterns[0].clone(),
+        _ => return None,
+    };
+    let (lit, a_start, a_end) = grep_literal_pattern(&pat)?;
+    let (a_start, a_end) = if exclusive {
+        (true, true)
+    } else {
+        (a_start, a_end)
+    };
+    let line = || stage_ident("line");
+    let p = str_lit(&lit);
+    let test = if a_start && a_end {
+        stage_bin("===", line(), p)
+    } else if a_start {
+        method_call(line(), "startsWith", vec![p])
+    } else if a_end {
+        method_call(line(), "endsWith", vec![p])
+    } else {
+        method_call(line(), "includes", vec![p])
+    };
+    let test = if invert {
+        Expr::UnaryExpression {
+            operator: "!".to_string(),
+            argument: Box::new(test),
+            prefix: true,
+        }
+    } else {
+        test
+    };
+    let filter = method_call(
+        stage_ident("L"),
+        "filter",
+        vec![Expr::ArrowFunctionExpression {
+            params: vec![stage_ident("line")],
+            body: ArrowBody::Expr(Box::new(test)),
+            expression: true,
+            r#async: false,
+        }],
+    );
+    let mut decls = vec![
+        // GNU: an EMPTY input has NO lines (`printf '' | grep -v x` prints
+        // nothing and exits 1) — the split of '' yields one empty line
+        stage_const(
+            "S",
+            stage_ident(NATIVE_STAGE_IN),
+        ),
+        stage_const(
+            "L",
+            Expr::ConditionalExpression {
+                test: Box::new(stage_bin("===", stage_ident("S"), str_lit(""))),
+                consequent: Box::new(array(vec![])),
+                alternate: Box::new(method_call(stage_ident("S"), "split", vec![str_lit("\n")])),
+            },
+        ),
+        Stmt::IfStatement {
+            test: Expr::LogicalExpression {
+                left: Box::new(stage_member(stage_ident("L"), "length")),
+                operator: "&&".to_string(),
+                right: Box::new(method_call(
+                    stage_ident("S"),
+                    "endsWith",
+                    vec![str_lit("\n")],
+                )),
+            },
+            consequent: Box::new(Stmt::ExpressionStatement {
+                expression: method_call(stage_ident("L"), "pop", vec![]),
+            }),
+            alternate: None,
+        },
+        stage_const("M", filter),
+    ];
+    if quiet {
+        decls.push(Stmt::ReturnStatement {
+            argument: Some(array(vec![
+                str_lit(""),
+                Expr::ConditionalExpression {
+                    test: Box::new(stage_member(stage_ident("M"), "length")),
+                    consequent: Box::new(int_lit_expr(0)),
+                    alternate: Box::new(int_lit_expr(1)),
+                },
+            ])),
+        });
+        return Some(Expr::ArrowFunctionExpression {
+            params: vec![stage_ident(NATIVE_STAGE_IN)],
+            body: ArrowBody::Block(Box::new(Stmt::BlockStatement { body: decls })),
+            expression: false,
+            r#async: false,
+        });
+    }
+    // `-c`: the selected-line count + newline; otherwise one line per
+    // selected entry with GNU's record terminator
+    let text = if count {
+        stage_bin(
+            "+",
+            Expr::CallExpression {
+                callee: Box::new(stage_ident("String")),
+                arguments: vec![stage_member(stage_ident("M"), "length")],
+                optional: false,
+            },
+            str_lit("\n"),
+        )
+    } else {
+        method_call(
+            method_call(
+                stage_ident("M"),
+                "map",
+                vec![Expr::ArrowFunctionExpression {
+                    params: vec![stage_ident("l")],
+                    body: ArrowBody::Expr(Box::new(stage_bin(
+                        "+",
+                        stage_ident("l"),
+                        str_lit("\n"),
+                    ))),
+                    expression: true,
+                    r#async: false,
+                }],
+            ),
+            "join",
+            vec![str_lit("")],
+        )
+    };
+    decls.push(Stmt::ReturnStatement {
+        argument: Some(array(vec![
+            text,
+            Expr::ConditionalExpression {
+                test: Box::new(stage_member(stage_ident("M"), "length")),
+                consequent: Box::new(int_lit_expr(0)),
+                alternate: Box::new(int_lit_expr(1)),
+            },
+        ])),
+    });
+    Some(Expr::ArrowFunctionExpression {
+        params: vec![stage_ident(NATIVE_STAGE_IN)],
+        body: ArrowBody::Block(Box::new(Stmt::BlockStatement { body: decls })),
+        expression: false,
+        r#async: false,
+    })
+}
+
+/// `tr [-d|-s] SET1 [SET2]` as a native stage arrow — both sets expanded
+/// at COMPILE time with the runtime's own `trExpandSet` grammar (escapes,
+/// `a-z` ranges, POSIX classes), then a closed-form string transform:
+///
+///   * a pure map whose pairs are a contiguous constant shift (`A-Z` →
+///     `a-z`) → `x.replace(/[A-Z]/g, c => String.fromCharCode(c.charCodeAt(0) + 32))`
+///   * any other map whose sources and targets are disjoint → a chain of
+///     `split(src).join(tgt)` (order-independent, so sequential literal
+///     replacement is exact)
+///   * `-d` → `x.replace(/[SET1]/g, "")`
+///   * `-s` → `x.replace(/([SET1])\1+/g, "$1")` (run squeeze)
+///
+/// Anything the closed forms cannot express exactly (`-c` complement,
+/// `-t` truncate, `-d`+`-s`, a map whose targets are themselves sources,
+/// an unparsable set) keeps the builtin.
+fn tr_stage(argv: &[IrExpr]) -> Option<Expr> {
+    let mut complement = false;
+    let mut del = false;
+    let mut squeeze = false;
+    let mut truncate = false;
+    let mut sets: Vec<String> = Vec::new();
+    for a in argv {
+        let Some(sv) = static_str(a) else {
+            return None;
+        };
+        let s = sv.as_str();
+        if sets.is_empty() && s.len() > 1 && s.starts_with('-') {
+            for ch in s[1..].chars() {
+                match ch {
+                    'c' | 'C' => complement = true,
+                    'd' => del = true,
+                    's' => squeeze = true,
+                    't' => truncate = true,
+                    _ => return None,
+                }
+            }
+            continue;
+        }
+        if s == "--" && sets.is_empty() {
+            continue;
+        }
+        sets.push(sv);
+    }
+    if complement || truncate || (del && squeeze) || sets.is_empty() {
+        return None;
+    }
+    if del && sets.len() > 1 {
+        return None;
+    }
+    let x = || stage_ident(NATIVE_STAGE_IN);
+    let set1 = tr_expand_set(&sets[0])?;
+    if del {
+        return Some(native_stage_arrow(
+            method_call(x(), "replace", vec![tr_class_delete_regex(&set1), str_lit("")]),
+            0,
+        ));
+    }
+    let set2 = if sets.len() > 1 {
+        tr_expand_set(&sets[1])?
+    } else {
+        Vec::new()
+    };
+    if sets.len() == 1 {
+        // `tr SET1` with no SET2 and no -d is GNU's missing-operand error.
+        if !squeeze {
+            return None;
+        }
+        return Some(native_stage_arrow(
+            method_call(
+                x(),
+                "replace",
+                vec![tr_class_squeeze_regex(&set1), str_lit("$1")],
+            ),
+            0,
+        ));
+    }
+    if set2.is_empty() {
+        return None; // `tr a ''` → GNU deletes; keep the builtin
+    }
+    // translation table: SET2 shorter → its last char repeats
+    let mut pairs: Vec<(u32, u32)> = Vec::new();
+    for (k, src) in set1.iter().enumerate() {
+        let tgt = set2[std::cmp::min(k, set2.len() - 1)];
+        if *src != tgt {
+            pairs.push((*src, tgt));
+        }
+    }
+    if pairs.is_empty() {
+        // identity table
+        return Some(native_stage_arrow(x(), 0));
+    }
+    if squeeze {
+        return None; // -s over a map needs the runtime's prev-tracking loop
+    }
+    // contiguous constant shift? (`A-Z` → `a-z`, `a-z` → `A-Z`)
+    let shift = |p: &(u32, u32)| p.1 as i64 - p.0 as i64;
+    let d = shift(&pairs[0]);
+    let contiguous =
+        pairs.windows(2).all(|w| w[1].0 == w[0].0 + 1) && pairs.iter().all(|p| shift(p) == d);
+    // a one-pair table is a plain literal replacement — the shift form
+    // would emit a degenerate `[x-x]` class for it
+    if contiguous && pairs.len() > 1 && d != 0 {
+        let cls = format!("[{}-{}]", tr_class_char(pairs[0].0), tr_class_char(pairs[pairs.len() - 1].0));
+        let op = if d > 0 { "+" } else { "-" };
+        let mapped = Expr::CallExpression {
+            callee: Box::new(Expr::MemberExpression {
+                object: Box::new(stage_ident("String")),
+                property: Box::new(stage_ident("fromCharCode")),
+                computed: false,
+                optional: false,
+            }),
+            arguments: vec![stage_bin(
+                op,
+                method_call(
+                    stage_ident("c"),
+                    "charCodeAt",
+                    vec![int_lit_expr(0)],
+                ),
+                int_lit_expr(d.abs()),
+            )],
+            optional: false,
+        };
+        return Some(native_stage_arrow(
+            method_call(
+                x(),
+                "replace",
+                vec![
+                    regex_lit_flags(&cls, "g"),
+                    Expr::ArrowFunctionExpression {
+                        params: vec![stage_ident("c")],
+                        body: ArrowBody::Expr(Box::new(mapped)),
+                        expression: true,
+                        r#async: false,
+                    },
+                ],
+            ),
+            0,
+        ));
+    }
+    // general map: sequential literal replacement, only when no target is
+    // also a source (otherwise an earlier replacement would be re-mapped)
+    let srcs: HashSet<u32> = pairs.iter().map(|p| p.0).collect();
+    if pairs.iter().any(|p| srcs.contains(&p.1)) || srcs.len() != pairs.len() {
+        return None;
+    }
+    let mut e = x();
+    for (s, t) in &pairs {
+        e = method_call(
+            method_call(
+                e,
+                "split",
+                vec![str_lit(&tr_char_string(*s))],
+            ),
+            "join",
+            vec![str_lit(&tr_char_string(*t))],
+        );
+    }
+    Some(native_stage_arrow(e, 0))
+}
+
+/// One code point as a Rust string (`\0` and friends survive).
+fn tr_char_string(n: u32) -> String {
+    char::from_u32(n).map(String::from).unwrap_or_default()
+}
+
+/// A single char escaped for use inside a `[...]` regex class.
+fn tr_class_char(n: u32) -> String {
+    let c = char::from_u32(n).unwrap_or('\u{0}');
+    match c {
+        '\\' | ']' | '[' | '^' | '-' => format!("\\{c}"),
+        '\n' => "\\n".to_string(),
+        '\r' => "\\r".to_string(),
+        '\t' => "\\t".to_string(),
+        _ => c.to_string(),
+    }
+}
+
+/// `/[<set>]/g` — the set as a character class (runs collapsed to `a-z`
+/// so the corpus's 26-char class maps stay compact).
+fn tr_class_delete_regex(set: &[u32]) -> Expr {
+    regex_lit_flags(&format!("[{}]", tr_class_body(set)), "g")
+}
+
+/// `/([<set>])\1+/g` — the run-squeeze form (consecutive identical set
+/// chars collapse to one, exactly the runtime's `prev`-tracking loop).
+fn tr_class_squeeze_regex(set: &[u32]) -> Expr {
+    regex_lit_flags(&format!("([{}])\\1+", tr_class_body(set)), "g")
+}
+
+/// A set as a `[...]` body, with consecutive runs collapsed to `a-z`.
+fn tr_class_body(set: &[u32]) -> String {
+    let mut sorted: Vec<u32> = set.to_vec();
+    sorted.sort_unstable();
+    sorted.dedup();
+    let mut out = String::new();
+    let mut i = 0usize;
+    while i < sorted.len() {
+        let start = i;
+        while i + 1 < sorted.len() && sorted[i + 1] == sorted[i] + 1 {
+            i += 1;
+        }
+        if i - start >= 3 {
+            out.push_str(&tr_class_char(sorted[start]));
+            out.push('-');
+            out.push_str(&tr_class_char(sorted[i]));
+        } else {
+            for v in &sorted[start..=i] {
+                out.push_str(&tr_class_char(*v));
+            }
+        }
+        i += 1;
+    }
+    out
+}
+
+/// The runtime's `trExpandSet` over the subset the corpus uses: literal
+/// chars, `\n`/`\t`/`\r`/`\\`/`\0` escapes (octal + `\xNN` too), `a-z`
+/// ranges and the POSIX `[:upper:]`/`[:lower:]`/`[:digit:]`/`[:space:]`
+/// classes. Anything else refuses (the caller keeps the builtin).
+///
+/// Like the runtime's `push`, a code point above 255 is dropped from the
+/// set (tr's table is byte-wide — a higher char is never mapped).
+fn tr_expand_set(s: &str) -> Option<Vec<u32>> {
+    let chars: Vec<char> = s.chars().collect();
+    let mut out: Vec<u32> = Vec::new();
+    let mut push = |v: u32, out: &mut Vec<u32>| {
+        if v <= 255 {
+            out.push(v);
+        }
+    };
+    let mut i = 0usize;
+    while i < chars.len() {
+        let c = chars[i];
+        if c == '\\' {
+            let n = *chars.get(i + 1)?;
+            let v: u32 = match n {
+                'a' => 7,
+                'b' => 8,
+                'f' => 12,
+                'n' => 10,
+                'r' => 13,
+                't' => 9,
+                'v' => 11,
+                '\\' => 92,
+                '0' => {
+                    let mut oct = String::from("0");
+                    let mut j = i + 2;
+                    while j < chars.len() && oct.len() < 4 && ('0'..='7').contains(&chars[j]) {
+                        oct.push(chars[j]);
+                        j += 1;
+                    }
+                    i = j - 2;
+                    u32::from_str_radix(&oct, 8).ok()?
+                }
+                'x' => {
+                    let mut hex = String::new();
+                    let mut j = i + 2;
+                    while j < chars.len() && hex.len() < 2 && chars[j].is_ascii_hexdigit() {
+                        hex.push(chars[j]);
+                        j += 1;
+                    }
+                    if hex.is_empty() {
+                        return None;
+                    }
+                    i = j - 2;
+                    u32::from_str_radix(&hex, 16).ok()?
+                }
+                other => other as u32,
+            };
+            push(v, &mut out);
+            i += 2;
+            continue;
+        }
+        if c == '[' && chars.get(i + 1) == Some(&':') {
+            let rest: String = chars[i..].iter().collect();
+            let end = rest.find(":]")?;
+            let cls = &rest[2..end];
+            for (lo, hi) in tr_class_ranges(cls)? {
+                for v in lo..=hi {
+                    push(v as u32, &mut out);
+                }
+            }
+            i += end + 2;
+            continue;
+        }
+        if chars.get(i + 1) == Some(&'-') && chars.get(i + 2).is_some() {
+            let lo = c as u32;
+            let hi = chars[i + 2] as u32;
+            if lo <= hi {
+                for v in lo..=hi {
+                    push(v, &mut out);
+                }
+                i += 3;
+                continue;
+            }
+        }
+        push(c as u32, &mut out);
+        i += 1;
+    }
+    Some(out)
+}
+
+/// The ASCII POSIX classes `tr` supports (everything else refuses).
+fn tr_class_ranges(cls: &str) -> Option<Vec<(u8, u8)>> {
+    Some(match cls {
+        "upper" => vec![(b'A', b'Z')],
+        "lower" => vec![(b'a', b'z')],
+        "digit" => vec![(b'0', b'9')],
+        "alpha" => vec![(b'A', b'Z'), (b'a', b'z')],
+        "alnum" => vec![(b'0', b'9'), (b'A', b'Z'), (b'a', b'z')],
+        "space" => vec![(9, 13), (32, 32)],
+        "blank" => vec![(9, 9), (32, 32)],
+        "xdigit" => vec![(b'0', b'9'), (b'A', b'F'), (b'a', b'f')],
+        "punct" => vec![(33, 47), (58, 64), (91, 96), (123, 126)],
+        _ => return None,
+    })
+}
+
+/// `cut [FLAGS]` as a native stage arrow — `builtins.cut`'s per-line
+/// selection transcribed: split/pop, per line either the whole line (no
+/// delimiter present), the selected fields joined by the delimiter, or a
+/// dropped line under `-s`; GNU's final-newline mirror (`out.push('')`
+/// when the input ended with one).
+///
+/// Only SINGLE-POSITION lists qualify (`-f 1`, `-f 1,3`): a RANGE
+/// (`-f 2-`) needs `cutPositions`' clamping grammar, and `-b` is the
+/// byte mode. Those keep the builtin.
+fn cut_stage(argv: &[IrExpr]) -> Option<Expr> {
+    let mut delim: Option<String> = None;
+    let mut mode: Option<char> = None;
+    let mut pos: Vec<i64> = Vec::new();
+    let mut suppress = false;
+    let mut out_delim: Option<String> = None;
+    let mut i = 0usize;
+    while i < argv.len() {
+        let a = static_str(&argv[i])?;
+        let a = a.as_str();
+        let take_next = |i: &mut usize| -> Option<String> {
+            let v = static_str(argv.get(*i + 1)?)?;
+            *i += 2;
+            Some(v)
+        };
+        if a == "--" || a == "-" {
+            return None; // file operands
+        }
+        if a == "--output-delimiter" {
+            out_delim = Some(take_next(&mut i)?);
+            continue;
+        }
+        if let Some(v) = a.strip_prefix("--output-delimiter=") {
+            out_delim = Some(v.to_string());
+            i += 1;
+            continue;
+        }
+        if a == "-s" {
+            suppress = true;
+            i += 1;
+            continue;
+        }
+        if a == "-d" {
+            let v = take_next(&mut i)?;
+            delim = Some(v.chars().next().map(String::from).unwrap_or_default());
+            continue;
+        }
+        if let Some(v) = a.strip_prefix("-d") {
+            delim = Some(v.chars().next()?.to_string());
+            i += 1;
+            continue;
+        }
+        // `-f LIST` / `-fLIST` (and the -c/-b twins)
+        let (m, rest) = if a == "-f" || a == "-c" || a == "-b" {
+            let v = take_next(&mut i)?;
+            (a.chars().nth(1)?, v)
+        } else if a.len() > 2 && matches!(a.as_bytes()[1], b'f' | b'c' | b'b') {
+            (a.chars().nth(1)?, a[2..].to_string())
+        } else {
+            return None;
+        };
+        if m == 'b' {
+            return None; // byte mode
+        }
+        mode = Some(m);
+        pos = cut_single_positions(&rest)?;
+        continue;
+    }
+    let mode = mode?;
+    let delim = delim.unwrap_or_else(|| "\t".to_string());
+    let join = out_delim.unwrap_or_else(|| delim.clone());
+    let d = || str_lit(&delim);
+    let j = || str_lit(&join);
+    let sel = if pos.is_empty() {
+        str_lit("")
+    } else {
+        let src = if mode == 'f' {
+            method_call(stage_ident("line"), "split", vec![d()])
+        } else {
+            // `-c`: the code-point array (`[...line]`)
+            array(vec![Expr::SpreadElement {
+                argument: Box::new(stage_ident("line")),
+            }])
+        };
+        let picked = method_call(
+            method_call(
+                array(pos.iter().map(|p| int_lit_expr(*p)).collect()),
+                "filter",
+                vec![Expr::ArrowFunctionExpression {
+                    params: vec![stage_ident("p")],
+                    body: ArrowBody::Expr(Box::new(stage_bin(
+                        "<=",
+                        stage_ident("p"),
+                        stage_member(stage_ident("F"), "length"),
+                    ))),
+                    expression: true,
+                    r#async: false,
+                }],
+            ),
+            "map",
+            vec![Expr::ArrowFunctionExpression {
+                params: vec![stage_ident("p")],
+                body: ArrowBody::Expr(Box::new(stage_index(
+                    stage_ident("F"),
+                    stage_bin("-", stage_ident("p"), int_lit_expr(1)),
+                ))),
+                expression: true,
+                r#async: false,
+            }],
+        );
+        let pick = method_call(picked, "join", vec![j()]);
+        // `F` must be declared first — wrap in a block-bodied callback.
+        let decl = stage_const("F", src);
+        // `-c` has no delimiter test: always the selected characters.
+        let body = if mode == 'f' {
+            Expr::ConditionalExpression {
+                test: Box::new(Expr::UnaryExpression {
+                    operator: "!".to_string(),
+                    argument: Box::new(method_call(
+                        stage_ident("line"),
+                        "includes",
+                        vec![d()],
+                    )),
+                    prefix: true,
+                }),
+                consequent: Box::new(if suppress {
+                    Expr::Literal {
+                        value: serde_json::Value::Null,
+                        raw: None,
+                        regex: None,
+                    }
+                } else {
+                    stage_ident("line")
+                }),
+                alternate: Box::new(pick),
+            }
+        } else {
+            pick
+        };
+        let cb = stage_arrow_named(vec!["line"], vec![decl], body);
+        method_call(stage_ident("L"), "map", vec![cb])
+    };
+    let sel_name = if suppress && mode == 'f' {
+        // the `-s` line drops become `null` in the map
+        "K"
+    } else {
+        "O"
+    };
+    let mut decls = vec![
+        stage_const(
+            "E",
+            method_call(stage_ident(NATIVE_STAGE_IN), "endsWith", vec![str_lit("\n")]),
+        ),
+        stage_const(
+            "L",
+            method_call(stage_ident(NATIVE_STAGE_IN), "split", vec![str_lit("\n")]),
+        ),
+        Stmt::IfStatement {
+            test: stage_ident("E"),
+            consequent: Box::new(Stmt::ExpressionStatement {
+                expression: method_call(stage_ident("L"), "pop", vec![]),
+            }),
+            alternate: None,
+        },
+        stage_const("O", sel),
+    ];
+    if sel_name == "K" {
+        decls.push(stage_const(
+            "K",
+            method_call(
+                stage_ident("O"),
+                "filter",
+                vec![Expr::ArrowFunctionExpression {
+                    params: vec![stage_ident("v")],
+                    body: ArrowBody::Expr(Box::new(stage_bin(
+                        "!==",
+                        stage_ident("v"),
+                        Expr::Literal {
+                            value: serde_json::Value::Null,
+                            raw: None,
+                            regex: None,
+                        },
+                    ))),
+                    expression: true,
+                    r#async: false,
+                }],
+            ),
+        ));
+    }
+    // GNU emits the final newline even when the last line selected nothing.
+    decls.push(Stmt::IfStatement {
+        test: stage_ident("E"),
+        consequent: Box::new(Stmt::ExpressionStatement {
+            expression: method_call(stage_ident(sel_name), "push", vec![str_lit("")]),
+        }),
+        alternate: None,
+    });
+    Some(native_stage_block_arrow(
+        decls,
+        method_call(stage_ident(sel_name), "join", vec![str_lit("\n")]),
+        0,
+    ))
+}
+
+/// `-f 1` / `-f 1,3` / `-f3` → the position list. RANGES (`2-`, `1-3`)
+/// need `cutPositions`' clamping; `0` and a malformed list are GNU
+/// errors. Refuses anything but non-empty single positions.
+fn cut_single_positions(list: &str) -> Option<Vec<i64>> {
+    let mut out = Vec::new();
+    for part in list.split(',') {
+        let t = part.trim();
+        if t.is_empty() || !t.chars().all(|c| c.is_ascii_digit()) {
+            return None;
+        }
+        let n: i64 = t.parse().ok()?;
+        if n < 1 {
+            return None;
+        }
+        out.push(n);
+    }
+    if out.is_empty() {
+        return None;
+    }
+    out.sort_unstable();
+    out.dedup();
+    Some(out)
+}
+
+/// `awk '{print $N}'` — the single-field print grammar, whitespace
+/// insensitive (`{print $1}`, `{print$3}`, `{ print $1 }`). Returns N.
+fn awk_print_field(prog: &str) -> Option<i64> {
+    let compact: String = prog.chars().filter(|c| !c.is_ascii_whitespace()).collect();
+    let rest = compact.strip_prefix("{print$")?.strip_suffix('}')?;
+    let n: i64 = rest.parse().ok()?;
+    if n < 1 {
+        return None;
+    }
+    Some(n)
+}
+
+/// The JS arrow for one pipeline stage, when the stage is a pure text
+/// transform with an exact closed form. See the section comment above.
+fn native_pipeline_stage(stage: &IrExpr) -> Option<Expr> {
+    let IrExpr::Arrow(stmts) = stage else {
+        return None;
+    };
+    let [IrStmt::Expr(IrExpr::Call { func, args })] = stmts.as_slice() else {
+        return None;
+    };
+    if !matches!(func.as_str(), "exec" | "builtin") {
+        return None;
+    }
+    let [IrExpr::Str(name, _), IrExpr::Array(argv)] = args.as_slice() else {
+        return None;
+    };
+    if program_defines_function(name) {
+        return None;
+    }
+    let x = || stage_ident(NATIVE_STAGE_IN);
+    match name.as_str() {
+        // `cat` with no operands (or the `-` stdin marker) is the identity
+        // on its stdin — the stage's output IS its input.
+        "cat" => {
+            if !(argv.is_empty() || matches!(argv.as_slice(), [IrExpr::Str(s, _)] if s == "-")) {
+                return None;
+            }
+            Some(native_stage_arrow(x(), 0))
+        }
+        // builtins.head: `s.slice(0, c)` or
+        // `keep = lines.slice(0, n); out = keep.join('\n');
+        //  if (lines.length > n && n > 0) out += '\n';`
+        "head" => {
+            let (bytes, n, from) = head_tail_stage_args(argv)?;
+            if from {
+                return None; // head has no `+N` form
+            }
+            if bytes {
+                return Some(native_stage_arrow(
+                    method_call(x(), "slice", vec![int_lit_expr(0), int_lit_expr(n)]),
+                    0,
+                ));
+            }
+            if n == 0 {
+                return Some(native_stage_arrow(str_lit(""), 0));
+            }
+            let text = stage_bin(
+                "+",
+                method_call(
+                    method_call(
+                        stage_ident("L"),
+                        "slice",
+                        vec![int_lit_expr(0), int_lit_expr(n)],
+                    ),
+                    "join",
+                    vec![str_lit("\n")],
+                ),
+                Expr::ConditionalExpression {
+                    test: Box::new(stage_bin(
+                        ">",
+                        stage_member(stage_ident("L"), "length"),
+                        int_lit_expr(n),
+                    )),
+                    consequent: Box::new(str_lit("\n")),
+                    alternate: Box::new(str_lit("")),
+                },
+            );
+            Some(native_stage_block_arrow(
+                vec![stage_const("L", method_call(x(), "split", vec![str_lit("\n")]))],
+                text,
+                0,
+            ))
+        }
+        // builtins.tail: `-c N` → `s.slice(max(0, s.length - c))`; `+N` /
+        // last-N lines → pop the trailing empty, slice from the computed
+        // first line, re-join, and always append the final newline.
+        "tail" => {
+            let (bytes, n, from) = head_tail_stage_args(argv)?;
+            if bytes {
+                let start = stage_math(
+                    "max",
+                    vec![
+                        int_lit_expr(0),
+                        stage_bin("-", stage_member(x(), "length"), int_lit_expr(n)),
+                    ],
+                );
+                return Some(native_stage_arrow(
+                    method_call(x(), "slice", vec![start]),
+                    0,
+                ));
+            }
+            let start = if from {
+                stage_math(
+                    "max",
+                    vec![
+                        int_lit_expr(0),
+                        stage_math(
+                            "min",
+                            vec![
+                                int_lit_expr(n - 1),
+                                stage_member(stage_ident("L"), "length"),
+                            ],
+                        ),
+                    ],
+                )
+            } else {
+                stage_math(
+                    "max",
+                    vec![
+                        int_lit_expr(0),
+                        stage_bin("-", stage_member(stage_ident("L"), "length"), int_lit_expr(n)),
+                    ],
+                )
+            };
+            let text = stage_bin(
+                "+",
+                method_call(
+                    method_call(stage_ident("L"), "slice", vec![start]),
+                    "join",
+                    vec![str_lit("\n")],
+                ),
+                Expr::ConditionalExpression {
+                    test: Box::new(stage_member(stage_ident("L"), "length")),
+                    consequent: Box::new(str_lit("\n")),
+                    alternate: Box::new(str_lit("")),
+                },
+            );
+            Some(native_stage_block_arrow(
+                vec![
+                    stage_const("L", method_call(x(), "split", vec![str_lit("\n")])),
+                    stage_pop_trailing_empty("L"),
+                ],
+                text,
+                0,
+            ))
+        }
+        // builtins.wc: one flag, the runtime's exact per-flag formula plus
+        // its `fmt(...) + '\n'` line.
+        "wc" => {
+            let [IrExpr::Str(flag, _)] = argv.as_slice() else {
+                return None;
+            };
+            let count: Expr = match flag.as_str() {
+                "-l" => stage_bin(
+                    "-",
+                    stage_member(method_call(x(), "split", vec![str_lit("\n")]), "length"),
+                    int_lit_expr(1),
+                ),
+                "-c" => Expr::CallExpression {
+                    callee: Box::new(stage_member(stage_ident("Buffer"), "byteLength")),
+                    arguments: vec![x(), str_lit("utf8")],
+                    optional: false,
+                },
+                "-w" => Expr::ConditionalExpression {
+                    test: Box::new(method_call(x(), "trim", vec![])),
+                    consequent: Box::new(stage_member(
+                        method_call(
+                            method_call(x(), "trim", vec![]),
+                            "split",
+                            vec![regex_lit("\\s+")],
+                        ),
+                        "length",
+                    )),
+                    alternate: Box::new(int_lit_expr(0)),
+                },
+                _ => return None,
+            };
+            Some(native_stage_arrow(stage_bin("+", count, str_lit("\n")), 0))
+        }
+        // builtins.sort: split/pop, the runtime's comparator (default
+        // `ka < kb` lexicographic, `-n` parseFloat-or-0, `-r` negation,
+        // `-u` adjacent dedupe, `-f` lowercase keys), re-join + the
+        // trailing newline when any line survives. `-t`/`-k`/`-o`/`-h`
+        // change the output in ways this formula does not model (and a
+        // FILE operand needs the runtime's readFileSafe error path), so
+        // they keep the builtin.
+        "sort" => sort_stage(argv),
+        // builtins.tr with both sets static — the compile-time-expanded
+        // map/squeeze/delete closed forms (see [`tr_stage`]).
+        "tr" => tr_stage(argv),
+        // builtins.cut's single-position field/char selection (see
+        // [`cut_stage`]): `-d D` + `-f N[,M…]`.
+        "cut" => cut_stage(argv),
+        // builtins.sed's single `s///` substitution (see [`sed_stage`]):
+        // the BRE/ERE source and the replacement are translated at compile
+        // time by the ported `breToJs`/`sedReplJs`.
+        "sed" => sed_stage(argv),
+        // builtins.grep's plain line selection over a metachar-free literal
+        // pattern (see [`grep_stage`]): includes/startsWith/endsWith.
+        "grep" => grep_stage(argv),
+        // `awk '{print $N}'`: awk's default FS `" "` splits each record on
+        // runs of blanks, ignoring leading/trailing ones (the runtime's
+        // readFd0 text IS the record stream; `print` appends ORS '\n').
+        "awk" => {
+            let [IrExpr::Str(prog, _)] = argv.as_slice() else {
+                return None;
+            };
+            let field = awk_print_field(prog)?;
+            let pick = Expr::ArrowFunctionExpression {
+                params: vec![stage_ident("l")],
+                body: ArrowBody::Expr(Box::new(Expr::LogicalExpression {
+                    left: Box::new(stage_index(
+                        method_call(
+                            method_call(stage_ident("l"), "trim", vec![]),
+                            "split",
+                            vec![regex_lit("[ \\t]+")],
+                        ),
+                        int_lit_expr(field - 1),
+                    )),
+                    operator: "??".to_string(),
+                    right: Box::new(str_lit("")),
+                })),
+                expression: true,
+                r#async: false,
+            };
+            let text = stage_bin(
+                "+",
+                method_call(
+                    method_call(stage_ident("R"), "map", vec![pick]),
+                    "join",
+                    vec![str_lit("\n")],
+                ),
+                Expr::ConditionalExpression {
+                    test: Box::new(stage_member(stage_ident("R"), "length")),
+                    consequent: Box::new(str_lit("\n")),
+                    alternate: Box::new(str_lit("")),
+                },
+            );
+            Some(native_stage_block_arrow(
+                vec![
+                    stage_const("R", method_call(x(), "split", vec![str_lit("\n")])),
+                    stage_pop_trailing_empty("R"),
+                ],
+                text,
+                0,
+            ))
+        }
+        _ => None,
+    }
+}
+
+/// The echo-stage STRING collapse — `(sh2.lastExit = 0, <produced text>)` —
+/// for a non-last pipeline stage whose args are compile-time static (see
+/// [`try_echo_stage_text`]). The runtime's pipeline treats a non-function
+/// stage as the stage's produced bytes, so the `builtin("echo")` dispatch
+/// and the inter-stage fd juggling disappear. Shared by the generic
+/// pipeline arm and [`native_pipeline_call`] (a pipeline that carries a
+/// native stage must keep this collapse too).
+fn echo_stage_collapse(stage: &IrExpr) -> Option<Expr> {
+    let text = try_echo_stage_text(stage)?;
+    Some(seq(vec![
+        Expr::AssignmentExpression {
+            operator: "=".to_string(),
+            left: Box::new(sh2_member("lastExit")),
+            right: Box::new(Expr::Literal {
+                value: serde_json::Value::from(0),
+                raw: None,
+                regex: None,
+            }),
+        },
+        text,
+    ]))
+}
+
+/// BOUNDED PRODUCER — the `PRODUCER | head -N` family.
+///
+/// This runtime materialises each pipe stage, so a two-stage pipeline runs
+/// the producer to COMPLETION before `head` looks at its first N lines. In
+/// bash the producer is killed by SIGPIPE the moment head has what it
+/// needs. Measured: `find . -name '*.sh' | head -3` walked a 568k-entry tree
+/// in **14.2 s** where bash finished in **7 ms** — the same output.
+///
+/// When the SECOND stage of a two-stage pipeline is the native `head` fold
+/// with a LITERAL count, the pipeline call carries that count as its second
+/// argument (`sh2.pipelineSync(stages, { lines: N })`), and the runtime caps
+/// the producer's fd-1 sink at what head needs (harness/sh2-namespace.mjs
+/// `capCapture`), with interruptible producers (builtins.find) aborting
+/// their walk exactly like a SIGPIPE'd `find` (status 141).
+///
+/// EXACTNESS: the head fold's value depends only on the first N newline
+/// fields and on whether the buffer held MORE than N; truncating at the Nth
+/// newline preserves both (see the runtime comment for the derivation), and
+/// `head -c N` is a bare `.slice(0, N)`. The two-stage restriction is what
+/// makes the truncation unobservable — with an intermediate stage
+/// (`find | sort | head`) the sort must see the whole producer output.
+/// No option gate: nothing is assumed about the environment, only about the
+/// emitter's own stage lowering.
+fn pipeline_head_cap(stage: &IrExpr) -> Option<Expr> {
+    let IrExpr::Arrow(stmts) = stage else {
+        return None;
+    };
+    let [IrStmt::Expr(IrExpr::Call { func, args })] = stmts.as_slice() else {
+        return None;
+    };
+    if !matches!(func.as_str(), "exec" | "builtin") {
+        return None;
+    }
+    let [IrExpr::Str(name, _), IrExpr::Array(argv)] = args.as_slice() else {
+        return None;
+    };
+    if name != "head" || program_defines_function("head") {
+        return None;
+    }
+    // The stage must have lowered to the native fold (otherwise there is no
+    // `L.slice(0, N)` contract to preserve).
+    native_pipeline_stage(stage)?;
+    let (bytes, n, from) = head_tail_stage_args(argv)?;
+    if from || n <= 0 {
+        return None;
+    }
+    Some(Expr::ObjectExpression {
+        properties: vec![prop(if bytes { "bytes" } else { "lines" }, int_lit_expr(n))],
+    })
+}
+
+/// The argv of a pipeline stage that is exactly one `exec`/`builtin NAME`
+/// call, or `None` for any other stage shape.
+fn pipeline_stage_argv<'a>(stage: &'a IrExpr, name: &str) -> Option<&'a [IrExpr]> {
+    let IrExpr::Arrow(stmts) = stage else {
+        return None;
+    };
+    let [IrStmt::Expr(IrExpr::Call { func, args })] = stmts.as_slice() else {
+        return None;
+    };
+    if !matches!(func.as_str(), "exec" | "builtin") {
+        return None;
+    }
+    let [IrExpr::Str(n, _), IrExpr::Array(argv)] = args.as_slice() else {
+        return None;
+    };
+    if n != name {
+        return None;
+    }
+    Some(argv)
+}
+
+/// `yes LIT | head -N` as two pipeline stages — the INFINITE producer pair.
+///
+/// `yes LIT` repeats one string forever and `head -N` keeps the first N
+/// lines, so the pair's pipe text is exactly `("LIT" + "\n").repeat(N)`:
+/// the same fold the capture lift already does
+/// ([`native_capture_yes_head`]), applied where the pair is a *stage list*
+/// (`065_yes_head_while.sh`: `yes Line:LINE | head -n100 | while read L`).
+///
+/// What this buys: the runtime used to SPAWN `yes` and let it run until the
+/// pipeline's 1 MiB runaway-producer cap (100k lines produced for the 100
+/// consumed), then discard 99.9% of them. The fold removes the subprocess,
+/// the cap churn, and the awaits that kept the whole pipeline async.
+///
+/// Exactness: `yes`'s output is unconditionally `LIT + "\n"` per line
+/// (GNU yes prints its arguments joined by spaces, or "y" with none — the
+/// one-literal shape is the only one accepted here), and head's line fold
+/// is the identity on the first N of them.
+fn pipeline_yes_head_text(s_yes: &IrExpr, s_head: &IrExpr) -> Option<Expr> {
+    if program_defines_function("yes") || program_defines_function("head") {
+        return None;
+    }
+    let yes_args = pipeline_stage_argv(s_yes, "yes")?;
+    let head_args = pipeline_stage_argv(s_head, "head")?;
+    // The head stage must have lowered to the native fold — otherwise the
+    // count's meaning (and the byte model) is the runtime's, not ours.
+    native_pipeline_stage(s_head)?;
+    let lit: String = match yes_args {
+        [IrExpr::Str(s, _)] => s.clone(),
+        // the quoted form parses as an all-literal Interpolate
+        [IrExpr::Interpolate(parts)] if parts.iter().all(|p| matches!(p, InterpPart::Lit(_))) => {
+            let mut s = String::new();
+            for p in parts {
+                if let InterpPart::Lit(t) = p {
+                    s.push_str(t);
+                }
+            }
+            s
+        }
+        _ => return None,
+    };
+    native_capture_yes_head_text(&lit, head_args)
+}
+
+/// `pipeline [a] [b] …` with at least one NATIVE stage (see
+/// [`native_pipeline_stage`]): lower the stage list with the native arrows
+/// spliced in, then dispatch exactly like the generic call arm (the *Sync
+/// twin when nothing awaits). `None` when no stage qualifies — the caller
+/// keeps the existing lowering untouched.
+fn native_pipeline_call(args: &[IrExpr]) -> Option<Expr> {
+    let [IrExpr::Array(stages)] = args else {
+        return None;
+    };
+    if stages.len() < 2 || !stages.iter().skip(1).any(|s| native_pipeline_stage(s).is_some()) {
+        return None;
+    }
+    // `yes LIT | head -N` prefix collapse (pipeline_yes_head_text). Needs a
+    // stage AFTER head to consume the text — a bare two-stage pair would
+    // leave a lone string stage, and the runtime only carries a string
+    // stage's value forward as the NEXT stage's stdin.
+    let yes_head = if stages.len() >= 3 {
+        pipeline_yes_head_text(&stages[0], &stages[1])
+    } else {
+        None
+    };
+    let yes_head_skip = yes_head.is_some();
+    // The stage bodies run under a swapped fd-1 sink (mapped_args's
+    // `sink_args` rule) — keep native echo/printf suppressed there exactly
+    // like the generic path.
+    let out: Vec<Expr> = {
+        *ECHO_SINK_DEPTH.lock().unwrap() += 1;
+        let echo_shadowed = program_defines_function("echo");
+        let mut out: Vec<Expr> = Vec::with_capacity(stages.len());
+        if let Some(t) = yes_head {
+            out.push(t);
+        }
+        for (i, st) in stages.iter().enumerate() {
+            if i < if yes_head_skip { 2 } else { 0 } {
+                continue;
+            }
+            if i + 1 < stages.len() && !echo_shadowed {
+                if let Some(collapsed) = echo_stage_collapse(st) {
+                    out.push(collapsed);
+                    continue;
+                }
+            }
+            out.push(match if i > 0 { native_pipeline_stage(st) } else { None } {
+                Some(native) => native,
+                None => expr_to_estree(st),
+            });
+        }
+        *ECHO_SINK_DEPTH.lock().unwrap() -= 1;
+        out
+    };
+    let arr = array(out);
+    // BOUNDED PRODUCER (pipeline_head_cap): a two-stage `PRODUCER | head -N`
+    // carries N so the runtime can stop the producer early instead of
+    // materialising output the consumer throws away.
+    let cap = if stages.len() == 2 {
+        pipeline_head_cap(&stages[1])
+    } else {
+        None
+    };
+    Some(if expr_has_await(&arr) {
+        let mut call_args = vec![arr];
+        if let Some(c) = cap {
+            call_args.push(c);
+        }
+        await_expr(sh2_call("pipeline", call_args))
+    } else {
+        let mut call_args = vec![sync_arrow_flip_deep(arr)];
+        if let Some(c) = cap {
+            call_args.push(c);
+        }
+        sh2_call("pipelineSync", call_args)
+    })
+}
+
+// ── static producer → native stage chain: the WHOLE pipeline folds ─────
+//
+// `echo LIT | tr a-z A-Z` / `printf 'a:b\n' | cut -d: -f1` / any chain of
+// NATIVE stages ([`native_pipeline_stage`] — tr/sed/cut/sort/head/tail/cat
+// /…) behind a COMPILE-TIME producer ([`pipe_stage_static_text`]) never
+// needs the pipeline machinery at all. The runtime's contract
+// (harness/sh2-namespace.mjs `pipeline`/`pipelineSync`, `_nativeStage`) is
+//
+//     prev = <stage 0's text>                    // a string stage
+//     for each later stage:  r = stage(prev)
+//                            text = String(r[0] ?? '')
+//                            lastExit = Number(r[1]) || 0
+//     the LAST stage's text is emitted to the current fd-1 sink.
+//
+// The producer text is known at compile time and every stage is a PURE JS
+// text function, so the chain composes into ONE native expression:
+//
+//     value = <stage n text>[in := <stage n-1 text>[in := … ]]
+//
+// That is a β-reduction of code the emitter itself generated, so it is
+// value-identical by construction — no option gate, no new sh2.* name.
+// The fold's own preconditions are the gates:
+//   * the producer must be a static echo/printf ([`pipe_stage_static_text`]);
+//   * every later stage must be a native stage ([`native_pipeline_stage`]);
+//   * every stage's status must be the LITERAL 0 — then the pipeline's
+//     `lastExit = 0` is exactly what the native assignment path records,
+//     so the fold does not lose a status the runtime would have set;
+//   * a stage body must never ASSIGN its `__sh2_stage_in` parameter and
+//     never shadow it (a nested arrow/function declaring the same name) —
+//     the substitution would change meaning.
+//
+// The win is the ladder's top rung: the pipeline call, the per-stage
+// arrays/fd swaps, and (for a `builtin("printf")` producer) the builtin
+// dispatch all disappear — in CAPTURE position the fold replaces
+// `sh2.captureSync(() => sh2.pipelineSync([…]))` (2+ call sites) with a
+// bare native expression.
+
+/// True when `e` ASSIGNS `name` or lexically SHADOWS it (a nested arrow or
+/// function declaring it as a parameter) — both make a naive substitution
+/// unsound.
+fn stage_param_conflict(e: &Expr, name: &str) -> bool {
+    stage_conflict_expr(e, name)
+}
+
+/// The statement twin of [`stage_param_conflict`] (a block-bodied stage).
+fn stage_block_param_conflict(s: &Stmt, name: &str) -> bool {
+    stage_conflict_stmt(s, name)
+}
+
+fn stage_conflict_params_shadow(params: &[Expr], name: &str) -> bool {
+    params.iter().any(|p| match p {
+        Expr::Identifier { name: n } => n == name,
+        Expr::AssignmentPattern { left, .. } => {
+            matches!(&**left, Expr::Identifier { name: n } if n == name)
+        }
+        _ => false,
+    })
+}
+
+fn stage_conflict_expr(e: &Expr, name: &str) -> bool {
+    match e {
+        Expr::Identifier { .. } | Expr::Literal { .. } => false,
+        Expr::AssignmentPattern { left, right } => {
+            stage_conflict_expr(left, name) || stage_conflict_expr(right, name)
+        }
+        Expr::AssignmentExpression { left, right, .. } => {
+            if matches!(&**left, Expr::Identifier { name: n } if n == name) {
+                return true;
+            }
+            stage_conflict_expr(left, name) || stage_conflict_expr(right, name)
+        }
+        Expr::TemplateLiteral { expressions, .. } => {
+            expressions.iter().any(|x| stage_conflict_expr(x, name))
+        }
+        Expr::CallExpression { callee, arguments, .. } => {
+            stage_conflict_expr(callee, name)
+                || arguments.iter().any(|a| stage_conflict_expr(a, name))
+        }
+        Expr::NewExpression { callee, arguments } => {
+            stage_conflict_expr(callee, name)
+                || arguments.iter().any(|a| stage_conflict_expr(a, name))
+        }
+        Expr::MemberExpression { object, property, .. } => {
+            stage_conflict_expr(object, name) || stage_conflict_expr(property, name)
+        }
+        Expr::AwaitExpression { argument } => stage_conflict_expr(argument, name),
+        Expr::ArrowFunctionExpression { params, body, .. } => {
+            if stage_conflict_params_shadow(params, name) {
+                return true;
+            }
+            let in_params = params.iter().any(|p| stage_conflict_expr(p, name));
+            let in_body = match body {
+                ArrowBody::Expr(x) => stage_conflict_expr(x, name),
+                ArrowBody::Block(s) => stage_conflict_stmt(s, name),
+            };
+            in_params || in_body
+        }
+        Expr::FunctionExpression { id, params, body, .. } => {
+            if stage_conflict_params_shadow(params, name) {
+                return true;
+            }
+            stage_conflict_expr(id, name)
+                || params.iter().any(|p| stage_conflict_expr(p, name))
+                || stage_conflict_stmt(body, name)
+        }
+        Expr::ObjectExpression { properties } => properties
+            .iter()
+            .any(|p| stage_conflict_expr(&p.key, name) || stage_conflict_expr(&p.value, name)),
+        Expr::ArrayExpression { elements } => {
+            elements.iter().flatten().any(|x| stage_conflict_expr(x, name))
+        }
+        Expr::SpreadElement { argument } => stage_conflict_expr(argument, name),
+        Expr::LogicalExpression { left, right, .. }
+        | Expr::BinaryExpression { left, right, .. } => {
+            stage_conflict_expr(left, name) || stage_conflict_expr(right, name)
+        }
+        Expr::ConditionalExpression { test, consequent, alternate } => {
+            stage_conflict_expr(test, name)
+                || stage_conflict_expr(consequent, name)
+                || stage_conflict_expr(alternate, name)
+        }
+        Expr::UnaryExpression { argument, .. } => stage_conflict_expr(argument, name),
+        Expr::SequenceExpression { expressions } => {
+            expressions.iter().any(|x| stage_conflict_expr(x, name))
+        }
+    }
+}
+
+fn stage_conflict_stmt(s: &Stmt, name: &str) -> bool {
+    match s {
+        Stmt::ExpressionStatement { expression } => stage_conflict_expr(expression, name),
+        Stmt::BlockStatement { body } => body.iter().any(|s| stage_conflict_stmt(s, name)),
+        Stmt::IfStatement { test, consequent, alternate } => {
+            stage_conflict_expr(test, name)
+                || stage_conflict_stmt(consequent, name)
+                || alternate.as_ref().is_some_and(|a| stage_conflict_stmt(a, name))
+        }
+        Stmt::TryStatement { block, handler, finalizer } => {
+            stage_conflict_stmt(block, name)
+                || handler.as_ref().is_some_and(|h| {
+                    h.param
+                        .as_ref()
+                        .is_some_and(|p| stage_conflict_params_shadow(std::slice::from_ref(&**p), name))
+                        || stage_conflict_stmt(&h.body, name)
+                })
+                || finalizer.as_ref().is_some_and(|f| stage_conflict_stmt(f, name))
+        }
+        Stmt::ThrowStatement { argument } => stage_conflict_expr(argument, name),
+        Stmt::SwitchStatement { discriminant, cases } => {
+            stage_conflict_expr(discriminant, name)
+                || cases.iter().any(|c| {
+                    c.test.as_ref().is_some_and(|t| stage_conflict_expr(t, name))
+                        || c.consequent.iter().any(|s| stage_conflict_stmt(s, name))
+                })
+        }
+        Stmt::WhileStatement { test, body } | Stmt::DoWhileStatement { test, body } => {
+            stage_conflict_expr(test, name) || stage_conflict_stmt(body, name)
+        }
+        Stmt::ForStatement { init, test, update, body } => {
+            stage_conflict_stmt(init, name)
+                || stage_conflict_expr(test, name)
+                || stage_conflict_expr(update, name)
+                || stage_conflict_stmt(body, name)
+        }
+        Stmt::ForOfStatement { left, right, body } => {
+            stage_conflict_stmt(left, name)
+                || stage_conflict_expr(right, name)
+                || stage_conflict_stmt(body, name)
+        }
+        Stmt::FunctionDeclaration { id, params, body, .. } => {
+            if stage_conflict_params_shadow(params, name) {
+                return true;
+            }
+            stage_conflict_expr(id, name)
+                || params.iter().any(|p| stage_conflict_expr(p, name))
+                || stage_conflict_stmt(body, name)
+        }
+        Stmt::VariableDeclaration { declarations, .. } => declarations.iter().any(|d| {
+            matches!(&d.id, Expr::Identifier { name: n } if n == name)
+                || d.init.as_ref().is_some_and(|i| stage_conflict_expr(i, name))
+        }),
+        Stmt::BreakStatement { .. } | Stmt::ContinueStatement { .. } => false,
+        Stmt::ReturnStatement { argument } => {
+            argument.as_ref().is_some_and(|a| stage_conflict_expr(a, name))
+        }
+    }
+}
+
+/// Rebuild `e` with every `Identifier{name}` replaced by `repl` (a clone —
+/// the argument is always a pure, compile-time-derived expression, so
+/// duplicating it is free of side effects).
+fn subst_stage_param(e: &Expr, name: &str, repl: &Expr) -> Expr {
+    let r = |x: &Expr| Box::new(subst_stage_param(x, name, repl));
+    match e {
+        Expr::Identifier { name: n } if n == name => repl.clone(),
+        Expr::Identifier { .. } | Expr::Literal { .. } => e.clone(),
+        Expr::AssignmentPattern { left, right } => Expr::AssignmentPattern {
+            left: r(left),
+            right: r(right),
+        },
+        Expr::AssignmentExpression {
+            operator,
+            left,
+            right,
+        } => Expr::AssignmentExpression {
+            operator: operator.clone(),
+            left: r(left),
+            right: r(right),
+        },
+        Expr::TemplateLiteral { quasis, expressions } => Expr::TemplateLiteral {
+            quasis: quasis.clone(),
+            expressions: expressions.iter().map(|x| subst_stage_param(x, name, repl)).collect(),
+        },
+        Expr::CallExpression {
+            callee,
+            arguments,
+            optional,
+        } => Expr::CallExpression {
+            callee: r(callee),
+            arguments: arguments.iter().map(|a| subst_stage_param(a, name, repl)).collect(),
+            optional: *optional,
+        },
+        Expr::NewExpression { callee, arguments } => Expr::NewExpression {
+            callee: r(callee),
+            arguments: arguments.iter().map(|a| subst_stage_param(a, name, repl)).collect(),
+        },
+        Expr::MemberExpression {
+            object,
+            property,
+            computed,
+            optional,
+        } => Expr::MemberExpression {
+            object: r(object),
+            property: r(property),
+            computed: *computed,
+            optional: *optional,
+        },
+        Expr::AwaitExpression { argument } => Expr::AwaitExpression { argument: r(argument) },
+        Expr::ArrowFunctionExpression {
+            params,
+            body,
+            expression,
+            r#async,
+        } => {
+            // A nested arrow shadows `name` only when it (re)declares it —
+            // the caller refuses those shapes up front (see
+            // [`stage_param_conflict`]), so params are substituted as
+            // ordinary expressions here.
+            let body = match body {
+                ArrowBody::Expr(x) => ArrowBody::Expr(r(x)),
+                ArrowBody::Block(s) => ArrowBody::Block(s.clone()),
+            };
+            Expr::ArrowFunctionExpression {
+                params: params.iter().map(|p| subst_stage_param(p, name, repl)).collect(),
+                body,
+                expression: *expression,
+                r#async: *r#async,
+            }
+        }
+        Expr::FunctionExpression {
+            id,
+            params,
+            body,
+            generator,
+            expression,
+            r#async,
+        } => Expr::FunctionExpression {
+            id: r(id),
+            params: params.iter().map(|p| subst_stage_param(p, name, repl)).collect(),
+            body: body.clone(),
+            generator: *generator,
+            expression: *expression,
+            r#async: *r#async,
+        },
+        Expr::ObjectExpression { properties } => Expr::ObjectExpression {
+            properties: properties
+                .iter()
+                .map(|p| Property {
+                    type_: p.type_,
+                    key: subst_stage_param(&p.key, name, repl),
+                    value: subst_stage_param(&p.value, name, repl),
+                    kind: p.kind,
+                    computed: p.computed,
+                    shorthand: p.shorthand,
+                })
+                .collect(),
+        },
+        Expr::ArrayExpression { elements } => Expr::ArrayExpression {
+            elements: elements
+                .iter()
+                .map(|el| el.as_ref().map(|x| subst_stage_param(x, name, repl)))
+                .collect(),
+        },
+        Expr::SpreadElement { argument } => Expr::SpreadElement { argument: r(argument) },
+        Expr::LogicalExpression {
+            operator,
+            left,
+            right,
+        } => Expr::LogicalExpression {
+            operator: operator.clone(),
+            left: r(left),
+            right: r(right),
+        },
+        Expr::BinaryExpression {
+            operator,
+            left,
+            right,
+        } => Expr::BinaryExpression {
+            operator: operator.clone(),
+            left: r(left),
+            right: r(right),
+        },
+        Expr::ConditionalExpression {
+            test,
+            consequent,
+            alternate,
+        } => Expr::ConditionalExpression {
+            test: r(test),
+            consequent: r(consequent),
+            alternate: r(alternate),
+        },
+        Expr::UnaryExpression {
+            operator,
+            argument,
+            prefix,
+        } => Expr::UnaryExpression {
+            operator: operator.clone(),
+            argument: r(argument),
+            prefix: *prefix,
+        },
+        Expr::SequenceExpression { expressions } => Expr::SequenceExpression {
+            expressions: expressions.iter().map(|x| subst_stage_param(x, name, repl)).collect(),
+        },
+    }
+}
+
+/// `0` as a literal — the only stage status the static chain fold accepts.
+fn stage_status_is_zero(e: &Expr) -> bool {
+    match e {
+        Expr::Literal { value, .. } => value.as_i64() == Some(0),
+        _ => false,
+    }
+}
+
+/// Apply one native stage arrow to a known input text.
+///
+/// The arrow is the emitter's own [`native_pipeline_stage`] output, always
+/// `(__sh2_stage_in) => [text, status]` (or the block-bodied twin ending in
+/// `return [text, status]`). An expression body is β-reduced by
+/// substitution; a block body is called as an IIFE (`(arrow)(input)[0]` —
+/// still zero runtime surface, and V8 inlines a single-argument arrow).
+fn apply_native_stage_arrow(arrow: &Expr, input: Expr) -> Option<Expr> {
+    let Expr::ArrowFunctionExpression {
+        params,
+        body,
+        r#async,
+        ..
+    } = arrow
+    else {
+        return None;
+    };
+    if *r#async {
+        return None;
+    }
+    let [Expr::Identifier { name: param }] = params.as_slice() else {
+        return None;
+    };
+    match body {
+        ArrowBody::Expr(inner) => {
+            let Expr::ArrayExpression { elements } = &**inner else {
+                return None;
+            };
+            let [Some(text), Some(status)] = elements.as_slice() else {
+                return None;
+            };
+            if !stage_status_is_zero(status) || stage_param_conflict(text, param) {
+                return None;
+            }
+            Some(subst_stage_param(text, param, &input))
+        }
+        ArrowBody::Block(block) => {
+            // the body must END in `return [text, 0];` — the native stage
+            // contract; anything else is not a shape this fold understands
+            let Stmt::BlockStatement { body: stmts } = &**block else {
+                return None;
+            };
+            let Some(Stmt::ReturnStatement { argument: Some(ret) }) = stmts.last() else {
+                return None;
+            };
+            let Expr::ArrayExpression { elements } = ret else {
+                return None;
+            };
+            let [Some(_), Some(status)] = elements.as_slice() else {
+                return None;
+            };
+            if std::env::var("SH2_DBG_FOLD").is_ok() {
+                eprintln!("BLOCK: zero={} conflict={}", stage_status_is_zero(status), stage_block_param_conflict(block, param));
+            }
+            if !stage_status_is_zero(status) || stage_block_param_conflict(block, param) {
+                return None;
+            }
+            let call = Expr::CallExpression {
+                callee: Box::new(arrow.clone()),
+                arguments: vec![input],
+                optional: false,
+            };
+            Some(stage_index(call, int_lit_expr(0)))
+        }
+    }
+}
+
+/// Apply one native stage arrow to a known input text, keeping the stage's
+/// WHOLE `[text, status]` pair (single evaluation).
+fn apply_native_stage_pair(arrow: &Expr, input: Expr) -> Option<Expr> {
+    let Expr::ArrowFunctionExpression {
+        params,
+        body,
+        r#async,
+        ..
+    } = arrow
+    else {
+        return None;
+    };
+    if *r#async {
+        return None;
+    }
+    let [Expr::Identifier { name: param }] = params.as_slice() else {
+        return None;
+    };
+    match body {
+        ArrowBody::Expr(inner) => {
+            let Expr::ArrayExpression { elements } = &**inner else {
+                return None;
+            };
+            let [Some(_), Some(_)] = elements.as_slice() else {
+                return None;
+            };
+            if stage_param_conflict(inner, param) {
+                return None;
+            }
+            Some(subst_stage_param(inner, param, &input))
+        }
+        ArrowBody::Block(block) => {
+            // the body must END in `return [text, status];` — the native
+            // stage contract; anything else is not a shape this fold
+            // understands
+            let Stmt::BlockStatement { body: stmts } = &**block else {
+                return None;
+            };
+            let Some(Stmt::ReturnStatement {
+                argument: Some(ret),
+            }) = stmts.last()
+            else {
+                return None;
+            };
+            let Expr::ArrayExpression { elements } = ret else {
+                return None;
+            };
+            let [Some(_), Some(_)] = elements.as_slice() else {
+                return None;
+            };
+            if stage_block_param_conflict(block, param) {
+                return None;
+            }
+            Some(Expr::CallExpression {
+                callee: Box::new(arrow.clone()),
+                arguments: vec![input],
+                optional: false,
+            })
+        }
+    }
+}
+
+fn static_pipeline_pair(pipe: &IrExpr) -> Option<Expr> {
+    let IrExpr::Call { func, args } = pipe else {
+        return None;
+    };
+    if func != "pipeline" && func != "pipelineSync" {
+        return None;
+    }
+    let [IrExpr::Array(stages)] = args.as_slice() else {
+        return None;
+    };
+    if stages.len() < 2 {
+        return None;
+    }
+    let text = static_producer_text(&stages[0])?;
+    let mut cur = str_lit(&text);
+    let last = stages.len() - 1;
+    for (i, stage) in stages.iter().enumerate().skip(1) {
+        let arrow = native_pipeline_stage(stage)?;
+        if i == last {
+            return apply_native_stage_pair(&arrow, cur);
+        }
+        cur = apply_native_stage_arrow(&arrow, cur)?;
+    }
+    None
+}
+
+/// The compile-time bytes a pipeline's FIRST stage produces, or `None`
+/// (see [`pipe_stage_static_text`]). Raw-byte markers
+/// (`\x01SH2BYTE\x01…`) are refused: the runtime's emit() decodes them, a
+/// folded write would pass them through verbatim.
+fn static_producer_text(stage: &IrExpr) -> Option<String> {
+    let text = pipe_stage_static_text(stage)?;
+    if text.contains('\u{1}') {
+        return None;
+    }
+    Some(text)
+}
+
+/// Wrap a folded `[text, status]` pair in a single-evaluation arrow and
+/// apply `body` to the pair's two elements. `body(r)` returns the
+/// expression the call site wants (a capture value, or the statement
+/// protocol's write).
+fn with_stage_pair(pair: Expr, body: impl FnOnce(Expr, Expr) -> Expr) -> Expr {
+    let r = "__sh2_sp";
+    let text = stage_index(stage_ident(r), int_lit_expr(0));
+    let status = stage_index(stage_ident(r), int_lit_expr(1));
+    // `Number(status) || 0` — the runtime's `_nativeStage` coercion
+    let status_num = Expr::LogicalExpression {
+        operator: "||".to_string(),
+        left: Box::new(Expr::CallExpression {
+            callee: Box::new(stage_ident("Number")),
+            arguments: vec![status],
+            optional: false,
+        }),
+        right: Box::new(int_lit_expr(0)),
+    };
+    Expr::CallExpression {
+        callee: Box::new(Expr::ArrowFunctionExpression {
+            params: vec![stage_ident(r)],
+            body: ArrowBody::Expr(Box::new(body(text, status_num))),
+            expression: true,
+            r#async: false,
+        }),
+        arguments: vec![pair],
+        optional: false,
+    }
+}
+
+/// The chain's final text, when the WHOLE chain's status is the literal 0
+/// (the shapes whose `lastExit = 0` the assignment path records anyway).
+/// Non-zero statuses need [`with_stage_pair`] — the status is observable
+/// (`$?` after a `| grep …`), so it cannot be dropped.
+fn static_pipeline_text(pipe: &IrExpr) -> Option<Expr> {
+    let IrExpr::Call { func, args } = pipe else {
+        return None;
+    };
+    if func != "pipeline" && func != "pipelineSync" {
+        return None;
+    }
+    let [IrExpr::Array(stages)] = args.as_slice() else {
+        return None;
+    };
+    if stages.len() < 2 {
+        return None;
+    }
+    let mut cur = str_lit(&static_producer_text(&stages[0])?);
+    for stage in &stages[1..] {
+        cur = apply_native_stage_arrow(&native_pipeline_stage(stage)?, cur)?;
+    }
+    Some(cur)
+}
+
 fn native_capture_yes_head(pipe: &IrExpr) -> Option<Expr> {
     let IrExpr::Call { func, args } = pipe else {
         return None;
@@ -44499,7 +48061,7 @@ fn cut_echo_lines(text: Expr, no_newline: bool) -> Expr {
     }
 }
 
-fn try_native_echo_grep(pipe: &IrExpr) -> Option<(Expr, Vec<Expr>)> {
+fn try_native_echo_grep(pipe: &IrExpr) -> Option<(Expr, Vec<Expr>, Option<Vec<Expr>>)> {
     let IrExpr::Call { func, args } = pipe else {
         return None;
     };
@@ -44515,18 +48077,22 @@ fn try_native_echo_grep(pipe: &IrExpr) -> Option<(Expr, Vec<Expr>)> {
     let [IrExpr::Arrow(s1), IrExpr::Arrow(s2)] = stages.as_slice() else {
         return None;
     };
-    // stage 1: exec("echo", args) — the exact bytes echo writes (the
-    // runtime's join + `-e` escape processing + trailing newline)
+    // stage 1: echo ARGS — the exact bytes echo writes (the runtime's join
+    // + `-e` escape processing + trailing newline). The call may still be
+    // `exec` or already the sync-builtin twin; both produce the same bytes.
     let [IrStmt::Expr(IrExpr::Call { func: f1, args: a1 })] = s1.as_slice() else {
         return None;
     };
-    if f1 != "exec" {
+    if !matches!(f1.as_str(), "exec" | "builtin") {
         return None;
     }
     let [IrExpr::Str(name1, _), IrExpr::Array(echo_args)] = a1.as_slice() else {
         return None;
     };
     if name1 != "echo" {
+        return None;
+    }
+    if echo_args.iter().any(ir_expr_needs_runtime) {
         return None;
     }
     let (joined, no_newline, _) = echo_join_args(echo_args)?;
@@ -44539,21 +48105,69 @@ fn try_native_echo_grep(pipe: &IrExpr) -> Option<(Expr, Vec<Expr>)> {
             right: Box::new(str_lit("\n")),
         }
     };
-    // stage 2: exec("grep", args)
-    let [IrStmt::Expr(IrExpr::Call { func: f2, args: a2 })] = s2.as_slice() else {
-        return None;
+    // stage 2: grep ARGS, optionally under the stage's own redirects
+    // (`echo T | grep A > f` — the pipeline arm has already pushed the
+    // spec onto this stage). A spec array is threaded into the helper so
+    // the whole 2-stage pipeline still collapses to ONE sync call.
+    let (grep_args, specs) = match s2.as_slice() {
+        [IrStmt::Expr(IrExpr::Call { func: f2, args: a2 })]
+            if matches!(f2.as_str(), "exec" | "builtin") =>
+        {
+            let [IrExpr::Str(name2, _), IrExpr::Array(g)] = a2.as_slice() else {
+                return None;
+            };
+            if name2 != "grep" {
+                return None;
+            }
+            (g, None)
+        }
+        // `CMD ARGS <SPECS>` — in EXPRESSION position the redirect arrives
+        // as `redirect [Arrow([grep dispatch]), SPECS]` (the pipeline-stage
+        // form). The spec install/restore/persist pass is identical in the
+        // runtime's `grepText` 4th parameter (it mirrors `builtin`'s), so
+        // the whole 2-stage pipeline still collapses to ONE sync call.
+        [IrStmt::Expr(IrExpr::Call { func: f2, args: a2 })] if f2 == "redirect" => {
+            let [IrExpr::Arrow(inner), IrExpr::Array(specs_ir)] = a2.as_slice() else {
+                return None;
+            };
+            let [IrStmt::Expr(IrExpr::Call { func: f3, args: a3 })] = inner.as_slice() else {
+                return None;
+            };
+            if !matches!(f3.as_str(), "exec" | "builtin") {
+                return None;
+            }
+            let [IrExpr::Str(name2, _), IrExpr::Array(g)] = a3.as_slice() else {
+                return None;
+            };
+            if name2 != "grep" {
+                return None;
+            }
+            (g, Some(specs_ir.iter().map(expr_to_estree).collect()))
+        }
+        // Same redirect in STATEMENT position (`IrStmt::Redirect`).
+        [IrStmt::Redirect { inner, redirects }] => {
+            let [IrStmt::Expr(IrExpr::Call { func: f2, args: a2 })] = inner.as_slice() else {
+                return None;
+            };
+            if !matches!(f2.as_str(), "exec" | "builtin") {
+                return None;
+            }
+            let [IrExpr::Str(name2, _), IrExpr::Array(g)] = a2.as_slice() else {
+                return None;
+            };
+            if name2 != "grep" {
+                return None;
+            }
+            let lowered: Vec<Expr> = redirects
+                .iter()
+                .map(|r| redirect_spec_to_estree(r, false))
+                .collect();
+            (g, Some(lowered))
+        }
+        _ => return None,
     };
-    if f2 != "exec" {
-        return None;
-    }
-    let [IrExpr::Str(name2, _), IrExpr::Array(grep_args)] = a2.as_slice() else {
-        return None;
-    };
-    if name2 != "grep" {
-        return None;
-    }
     let argv = grep_argv_safe(grep_args)?;
-    Some((text, argv))
+    Some((text, argv, specs))
 }
 
 /// `echo ARGS` as a NON-LAST pipeline stage whose args are all
@@ -44673,14 +48287,30 @@ fn grep_argv_safe(args: &[IrExpr]) -> Option<Vec<Expr>> {
                     pushed = true;
                     i += 1;
                 }
-                s if s.len() > 1
-                    && s[1..]
-                        .chars()
-                        .all(|c| matches!(c, 'v' | 'i' | 'n' | 'c' | 'o' | 'q' | 'x')) =>
-                {
-                    // single-char flags, possibly combined (`-vi`)
+                s if s == "--color" || s.starts_with("--color=") => {
+                    // `--color` / `--color=always|never|auto`: grepText feeds
+                    // `opts.color` straight into the same grepSelect the
+                    // builtin uses, so a pipe's coloring is byte-identical.
+                    if let Some(v) = s.strip_prefix("--color=") {
+                        if !matches!(v, "always" | "never" | "auto") {
+                            return None;
+                        }
+                    }
                 }
-                _ => return None, // unknown flag (-w/-b/-r/-f/-l/-L/--color...) → runtime
+                s if s.len() > 1
+                    && s[1..].chars().all(|c| {
+                        matches!(c, 'v' | 'i' | 'n' | 'c' | 'o' | 'q' | 'x' | 'w' | 'b' | 'P')
+                    }) =>
+                {
+                    // single-char flags, possibly combined (`-vi`): every one
+                    // is a grepSelect/grepRegexes option the mini-grep
+                    // evaluates exactly like the builtin (-w word lookarounds,
+                    // -b byte offsets, -P perl flavor).
+                }
+                // Everything else stays on the runtime: -l/-L/-Z (file-name
+                // output has no stdin form), -h/-H (name prefixes), -r (dir
+                // walk), -f (pattern file), -G, unknown flags.
+                _ => return None,
             }
             if !pushed {
                 out.push(str_lit(&av));
@@ -45570,45 +49200,181 @@ fn test_value_operand(op: &str) -> Option<Expr> {
     if let Some(v) = fold_cmdsub_test_operand(bare) {
         return Some(v);
     }
-    if let Some(name) = bare
-        .strip_prefix("${")
-        .and_then(|x| x.strip_suffix('}'))
+    let braced = bare.strip_prefix("${").and_then(|x| x.strip_suffix('}'));
+    if let Some(name) = braced
+        .and_then(|n| n.strip_suffix('-'))
+        .or(braced)
         .or_else(|| bare.strip_prefix('$'))
     {
-        if name.starts_with('!')
+        // `${NAME-}` — the no-colon form with an EMPTY default: identical
+        // to the plain read (the default only fires when NAME is unset,
+        // where the read answers "" too). The `-` suffix is stripped
+        // above; a non-empty default (`${NAME-x}`) is not a plain name and
+        // is refused below.
+        let refused = name.starts_with('!')
             || name.starts_with('#')
             || name.contains('[')
             || name.contains('@')
-            || name.contains('*')
-        {
+            || name.contains('*');
+        if !refused {
+            if is_lifted(name) {
+                return Some(Expr::Identifier {
+                    name: name.to_string(),
+                });
+            }
+            if let Some(native) = native_special_var(name) {
+                return Some(native);
+            }
+            if is_plain_ident(name) {
+                return Some(store_var_read(name));
+            }
+        }
+        // `$NAME` + an expansion-free literal tail (`$HOME/Documents`):
+        // the runtime's tokenizer CONCATENATES the expansion with the
+        // following literal text. Falls through to the interpolation
+        // branch below; anything else (`$NAME[...]`, `$!`, `${X}tail`)
+        // still refuses there.
+        if bare.starts_with('$') && !bare.starts_with("${") {
+            if let Some(expr) = test_ref_suffix_operand(&bare[1..]) {
+                return Some(expr);
+            }
+        }
+        return None;
+    }
+    // Leading `~` (not `~user`, and only UNQUOTED — a quoted `"~"` is the
+    // literal tilde): the runtime tokenizer expands it to
+    // `getVar('HOME') || process.env.HOME || ''` and appends the rest of
+    // the word. The tail must be expansion-free — every other shape keeps
+    // the runtime (`~user` stays literal in the runtime too, so this
+    // returns None for it).
+    if !op.starts_with('"') && !op.starts_with('\'') {
+        if let Some(tail) = bare.strip_prefix('~') {
+            let expands = !tail
+                .chars()
+                .next()
+                .map(|c| c.is_ascii_alphanumeric() || c == '_')
+                .unwrap_or(false);
+            if expands
+                && !tail
+                    .chars()
+                    .any(|c| matches!(c, '$' | '`' | '\\' | '"' | '\''))
+            {
+                return Some(test_tilde_operand(tail));
+            }
             return None;
         }
-        if is_lifted(name) {
-            return Some(Expr::Identifier {
-                name: name.to_string(),
-            });
-        }
-        if let Some(native) = native_special_var(name) {
-            return Some(native);
-        }
-        if !is_plain_ident(name) {
-            return None;
-        }
-        return Some(store_var_read(name));
     }
     // A QUOTED literal may contain whitespace (the runtime tokenizer
     // consumes the quoted region as ONE token); an unquoted one may not
-    // (whitespace would split it into separate test tokens).
+    // (whitespace would split it into separate test tokens). A QUOTED
+    // EMPTY operand is the "" literal (`[ "$x" = "" ]`).
     let quoted = op.strip_prefix('"').is_some();
-    if !bare.is_empty()
-        && !bare
-            .chars()
-            .any(|c| matches!(c, '$' | '`' | '\\' | '"' | '\''))
+    if bare.is_empty() {
+        return if quoted { Some(str_lit("")) } else { None };
+    }
+    if !bare
+        .chars()
+        .any(|c| matches!(c, '$' | '`' | '\\' | '"' | '\''))
         && (quoted || !bare.chars().any(|c| matches!(c, ' ' | '\t')))
     {
         return Some(str_lit(bare));
     }
     None
+}
+
+/// `$NAME` + literal tail (`HOME/Documents`, the text after the `$`): the
+/// runtime token produces `expand(NAME) + tail`. Exact only for a plain
+/// name whose read is a string and an expansion-free tail.
+fn test_ref_suffix_operand(rest: &str) -> Option<Expr> {
+    let n = rest
+        .chars()
+        .take_while(|c| c.is_ascii_alphanumeric() || *c == '_')
+        .count();
+    if n == 0 {
+        return None;
+    }
+    let name = &rest[..n];
+    let tail = &rest[n..];
+    if tail
+        .chars()
+        .any(|c| matches!(c, '$' | '`' | '\\' | '"' | '\'' | '[' | '@' | '*'))
+    {
+        return None;
+    }
+    if tail.chars().any(|c| matches!(c, ' ' | '\t')) {
+        return None;
+    }
+    let read = if is_lifted(name) {
+        Expr::Identifier {
+            name: name.to_string(),
+        }
+    } else if let Some(native) = native_special_var(name) {
+        native
+    } else if is_plain_ident(name) {
+        store_var_read(name)
+    } else {
+        return None;
+    };
+    Some(Expr::BinaryExpression {
+        operator: "+".to_string(),
+        left: Box::new(Expr::CallExpression {
+            callee: Box::new(Expr::Identifier {
+                name: "String".to_string(),
+            }),
+            arguments: vec![read],
+            optional: false,
+        }),
+        right: Box::new(str_lit(tail)),
+    })
+}
+
+/// The runtime's tilde expansion (`tokenizeTest`): `getVar('HOME') ||
+/// process.env.HOME || ''` followed by the literal tail. [`store_var_read`]
+/// IS that `getVar` for a plain name (the `vars.HOME ?? env.HOME ?? ''`
+/// property read, same fallback chain), so the whole expression stays a
+/// native read on the fast path and only falls back to the call when the
+/// store-read proof refuses the name.
+fn test_tilde_operand(tail: &str) -> Expr {
+    let env_home = Expr::MemberExpression {
+        object: Box::new(Expr::MemberExpression {
+            object: Box::new(Expr::Identifier {
+                name: "process".to_string(),
+            }),
+            property: Box::new(Expr::Identifier {
+                name: "env".to_string(),
+            }),
+            computed: false,
+            optional: false,
+        }),
+        property: Box::new(Expr::Identifier {
+            name: "HOME".to_string(),
+        }),
+        computed: false,
+        optional: false,
+    };
+    let home = Expr::LogicalExpression {
+        operator: "||".to_string(),
+        left: Box::new(Expr::LogicalExpression {
+            operator: "||".to_string(),
+            left: Box::new(store_var_read("HOME")),
+            right: Box::new(env_home),
+        }),
+        right: Box::new(str_lit("")),
+    };
+    if tail.is_empty() {
+        return home;
+    }
+    Expr::BinaryExpression {
+        operator: "+".to_string(),
+        left: Box::new(Expr::CallExpression {
+            callee: Box::new(Expr::Identifier {
+                name: "String".to_string(),
+            }),
+            arguments: vec![home],
+            optional: false,
+        }),
+        right: Box::new(str_lit(tail)),
+    }
 }
 
 /// `$(echo LIT...)` — a literal echo command substitution inside a test
@@ -46185,7 +49951,97 @@ fn regex_test_pattern(rhs: &str) -> Option<String> {
     Some(out)
 }
 
+/// The native-test verdict for the `test WORD...` BUILTIN form (see the
+/// emitter hook in the exec/builtin arm): the word list was joined into a
+/// test text by [`test_words_join`], so the SAME native lowering applies —
+/// with the chain conservatism of the `test`-call arm's fallback (inside
+/// `&&`/`||` the chain links branch on `lastExit`; a native form there needs
+/// the single-read cap, which this helper applies — same rule as the
+/// `test`-call arm).
+fn native_test_static_form(sv: &str) -> Option<Expr> {
+    if *TEST_UNSTATUSED_DEPTH.lock().unwrap() > 0 {
+        return try_native_test_unstatused(sv);
+    }
+    if *AND_OR_DEPTH.lock().unwrap() == 0 {
+        return try_native_test(sv);
+    }
+    // Inside `&&`/`||` the chain links branch on `lastExit`, which a native
+    // form never sets on its own — `try_native_test`'s status protocol does
+    // (`(sh2._g = t, sh2.lastExit = _g ? 0 : 1, _g)`), so the same
+    // single-read cap the `test`-call arm applies keeps this metric-neutral
+    // (a 1-call native vs the 1-call runtime test).
+    let native = try_native_test(sv)?;
+    if expr_sh2_call_count(&native) > 1 {
+        return None;
+    }
+    if expr_has_await(&native) && in_sync_arrow() {
+        return None;
+    }
+    Some(native)
+}
+
+/// `test "foo" = "bar"` — reconstruct the test TEXT from the `test`
+/// BUILTIN's compile-time-static word list. The runtime's `builtins.test`
+/// calls `parseTest(args.map(String))`: each word is ONE token, with no
+/// re-tokenization and no expansion. Space-joining therefore reproduces the
+/// token list exactly when no word can be split or expanded by the
+/// tokenizer — i.e. no whitespace, quotes, `$`, backtick, backslash,
+/// parens, `~`, `!` or `<`/`>` (beyond the bare operator words), and `=`
+/// only as a whole-word operator (`=`/`==`/`!=`/`=~`). Empty words refuse
+/// (the tokenizer's word-splitting drops them, so the join would lose a
+/// token). Refuse > guess: anything else keeps the runtime builtin.
+fn test_words_join(words: &[IrExpr]) -> Option<String> {
+    fn word_text(w: &IrExpr) -> Option<String> {
+        match w {
+            IrExpr::Str(s, _) => Some(s.clone()),
+            IrExpr::Interpolate(parts) => {
+                let mut out = String::new();
+                for p in parts {
+                    match p {
+                        InterpPart::Lit(s) => out.push_str(s),
+                        InterpPart::Expr(_) => return None,
+                    }
+                }
+                Some(out)
+            }
+            _ => None,
+        }
+    }
+    let mut out = String::new();
+    for w in words {
+        let t = word_text(w)?;
+        if t.is_empty() {
+            return None;
+        }
+        if t
+            .chars()
+            .any(|c| matches!(c, ' ' | '\t' | '\n' | '"' | '\'' | '$' | '`' | '\\' | '(' | ')' | '~' | '!'))
+        {
+            return None;
+        }
+        if t.contains(['<', '>']) && !matches!(t.as_str(), "<" | ">") {
+            return None;
+        }
+        if matches!(t.as_str(), "<" | ">") {
+            return None; // lexical ops stay on the runtime (`[` style only)
+        }
+        if t.contains('=') && !matches!(t.as_str(), "=" | "==" | "!=" | "=~") {
+            return None;
+        }
+        if !out.is_empty() {
+            out.push(' ');
+        }
+        out.push_str(&t);
+    }
+    if out.is_empty() {
+        None
+    } else {
+        Some(out)
+    }
+}
+
 /// Native lowering for a SIMPLE test expression whose operands are all
+
 /// lifted numeric variables (or integer literals): `"$count" -lt 100`
 /// becomes `count < 100` — no runtime test-string round-trip. Returns None
 /// for anything else (falls back to the injected template / runtime).
@@ -46406,6 +50262,36 @@ fn try_native_test_unstatused(s: &str) -> Option<Expr> {
                 arguments: vec![val],
                 optional: false,
             });
+        }
+    }
+    // `-nt` / `-ot` / `-ef` — file-time / same-file binary operators. The
+    // runtime's evalTest resolves them through `statTime`/`statInfo` over
+    // `path.resolve(operand)` (lstat; a missing or EMPTY operand counts as
+    // infinitely old / unusable), so a native `sh2.fileTest2(op, l, r)` is
+    // the SAME computation minus the tokenize/parse/dispatch. Operands go
+    // through `test_value_operand` (a `$var`/literal operand — a cmdsub
+    // operand stays runtime) and are String()-wrapped exactly like the
+    // runtime's `String(ast.l)`.
+    for op in ["-ef", "-nt", "-ot"] {
+        let pat = format!(" {op} ");
+        if let Some(p) = s.find(&pat) {
+            let (lhs, rhs) = (&s[..p], &s[p + pat.len()..]);
+            let l = test_value_operand(lhs);
+            let r = test_value_operand(rhs);
+            let (Some(l), Some(r)) = (l, r) else {
+                return None; // an operand did not lower — keep the runtime test
+            };
+            let stringify = |e: Expr| Expr::CallExpression {
+                callee: Box::new(Expr::Identifier {
+                    name: "String".to_string(),
+                }),
+                arguments: vec![e],
+                optional: false,
+            };
+            return Some(sh2_call(
+                "fileTest2",
+                vec![str_lit(op), stringify(l), stringify(r)],
+            ));
         }
     }
     // numeric ops first (their standalone tokens are unambiguous)
@@ -46679,6 +50565,7 @@ fn try_native_test_unstatused(s: &str) -> Option<Expr> {
                     || before == b'$'
                     || before == b'_'
                     || before == b')'
+                    || before == b'~'
                     || before.is_ascii_alphanumeric();
                 if is_op {
                     let (lhs, rhs) = (&s[..idx], &s[idx + op.len()..]);
@@ -46861,6 +50748,51 @@ fn try_native_test_unstatused(s: &str) -> Option<Expr> {
                 });
             }
             idx += 1;
+        }
+    }
+    // `[ WORD ]` — a ONE-token test: parseTest's `str` node, whose runtime
+    // meaning is `String(arg).length > 0` (bash's one-argument rule). Exact
+    // when the token lowers as an operand and is NOT itself an operator or
+    // unary flag (the runtime reads those as a dangling operator / unary
+    // flag and answers FALSE, while bash's one-arg rule says non-empty —
+    // keep those shapes on the runtime). A quoted token may contain spaces
+    // (the tokenizer consumes the quoted region as one token).
+    {
+        let t = s.trim();
+        let inside = if t.len() >= 2
+            && ((t.starts_with('"') && t.ends_with('"'))
+                || (t.starts_with('\'') && t.ends_with('\'')))
+        {
+            &t[1..t.len() - 1]
+        } else {
+            t
+        };
+        let op_tokens = [
+            "-a", "-o", "!", "(", ")", "=", "==", "!=", "=~", "<", ">", "-eq", "-ne", "-lt", "-le",
+            "-gt", "-ge", "-nt", "-ot", "-ef", "-f", "-d", "-e", "-L", "-h", "-s", "-r", "-w", "-x",
+            "-b", "-c", "-p", "-S", "-u", "-g", "-k", "-O", "-G", "-N", "-t", "-n", "-z",
+        ];
+        if !inside.chars().any(|c| matches!(c, ' ' | '\t' | '\n'))
+            && !op_tokens.contains(&t)
+            // The runtime TOKENIZER splits on `=`/`<`/`>` (and a leading
+            // `!`/paren), so a "single token" containing one is really a
+            // multi-token test whose operator scan already refused the
+            // operands — never treat the raw text as one literal operand.
+            && !t.contains(['=', '<', '>', '!', '(', ')'])
+        {
+            if let Some(v) = test_value_operand(t) {
+                return Some(Expr::BinaryExpression {
+                    operator: "!==".to_string(),
+                    left: Box::new(Expr::CallExpression {
+                        callee: Box::new(Expr::Identifier {
+                            name: "String".to_string(),
+                        }),
+                        arguments: vec![v],
+                        optional: false,
+                    }),
+                    right: Box::new(str_lit("")),
+                });
+            }
         }
     }
     // Compound `-a` / `-o` chains: the runtime's parseTest binds `-a`
@@ -47276,16 +51208,11 @@ fn split_test_param(inner: &str) -> Option<(String, String, String, String)> {
     Some((name, op.to_string(), a, b))
 }
 
-/// The native key expression for an `sh2.arrayIndex("arr", KEY)` call /
-/// `${arr[KEY]}` text whose KEY contains a LIFTED `$ref` — the runtime
-/// evalArith's the key against the STORE, where a lifted binding is not
-/// present (it reads `""` → index 0 → every read returns element 0).
-/// Lifted refs inline as their native binding identifier; store-bound
-/// refs read the store (the exact value the runtime's getVar yields);
-/// literal runs stay string literals — concatenated in key order. Returns
-/// `None` when nothing is stale (no refs, or every ref is store-bound):
-/// the caller keeps the literal text and the runtime resolves it exactly.
-fn array_index_key_expr(key: &str) -> Option<Expr> {
+/// Parse a baked subscript KEY text (`$i,$j`, `${index}`, `(2*$i)-1`)
+/// into (is_ref, text) parts. `None` when the text carries any `$` form
+/// other than a plain `$name`/`${name}` ref (cmdsubs, positionals,
+/// `${x:-d}`, `${#x}`, …) — the runtime's expandWord must keep those.
+fn baked_key_parts(key: &str) -> Option<Vec<(bool, String)>> {
     let bytes = key.as_bytes();
     let mut parts: Vec<(bool, String)> = Vec::new();
     let mut lit = String::new();
@@ -47329,16 +51256,56 @@ fn array_index_key_expr(key: &str) -> Option<Expr> {
     if !lit.is_empty() {
         parts.push((false, lit));
     }
-    if !parts.iter().any(|(is_ref, v)| *is_ref && is_lifted(v)) {
-        return None; // nothing stale — the runtime resolves the key
+    Some(parts)
+}
+
+/// The native key expression for an `sh2.arrayIndex("arr", KEY)` call /
+/// `${arr[KEY]}` text whose KEY contains `$refs` — the runtime
+/// evalArith's/expandWord's the key against the STORE. Lifted refs inline
+/// as their native binding identifier; store-bound refs read the store
+/// (the exact value the runtime's expandWord yields); literal runs stay
+/// string literals — concatenated in key order.
+///
+/// Multi-part keys wrap each ref in `String()`: `$i$j` must CONCATENATE
+/// (`"1" + "2"` → "12"), not add, and `(2*$i)-1` must stay arithmetic
+/// TEXT for the runtime's evalArith. The runtime's own
+/// `String(k)`/evalArith path sees exactly the expanded text either way —
+/// the documented SH2_ASSUME_SUBSCRIPT_KEYS assumption (a key VALUE
+/// carrying quotes/brackets/`$`/backticks would re-expand differently;
+/// the corpus keys are clean text).
+///
+/// Returns `None` when the key has no refs (a literal key needs no
+/// rewrite) or does not parse as plain refs — the caller keeps the
+/// literal text and the runtime resolves it.
+fn array_index_key_expr(key: &str) -> Option<Expr> {
+    let parts = baked_key_parts(key)?;
+    if !parts.iter().any(|(is_ref, _)| *is_ref) {
+        return None; // literal key — nothing to rewrite
+    }
+    // A single bare ref is the value itself (`map[$k]` → `arrayIndex(map, k)`
+    // — the runtime String()s it); any longer key concatenates strings.
+    if parts.len() == 1 {
+        let (_, v) = &parts[0];
+        return Some(if is_lifted(v) {
+            Expr::Identifier { name: v.clone() }
+        } else {
+            store_var_read(v)
+        });
     }
     let mut concat: Option<Expr> = None;
     for (is_ref, part) in &parts {
         let pe: Expr = if *is_ref {
-            if is_lifted(part) {
+            let read = if is_lifted(part) {
                 Expr::Identifier { name: part.clone() }
             } else {
                 store_var_read(part)
+            };
+            Expr::CallExpression {
+                callee: Box::new(Expr::Identifier {
+                    name: "String".to_string(),
+                }),
+                arguments: vec![read],
+                optional: false,
             }
         } else {
             str_lit(part)
@@ -48434,6 +52401,17 @@ fn try_native_param(args: &[IrExpr]) -> Option<Expr> {
             // where perl/bash print the escaped result).
             let p = unescape_one_level(p);
             let r = unescape_one_level(r);
+            // `${v/#pat/r}` / `${v/%pat/r}` — an unescaped leading `#`/`%`
+            // ANCHORS a single substitution to the start/end of the value,
+            // and the anchored form takes the LONGEST match at that end
+            // (`${s/#al*/Z}` replaces the whole of "alphabet"). Neither
+            // `replace` nor `replaceAll` expresses that, so the anchored
+            // shape stays on the runtime (substGlobFirst implements it).
+            // Only the single-substitution `/` op anchors — bash treats the
+            // `#` in `${v//#p/r}` literally.
+            if op == "/" && (p.starts_with('#') || p.starts_with('%')) {
+                return None;
+            }
             let rep = fully_lifted_template(&r)?;
             if literal_pattern(&p) {
                 if r.contains('$') {
@@ -48864,11 +52842,75 @@ fn try_native_param(args: &[IrExpr]) -> Option<Expr> {
                     t.parse::<i64>().ok()
                 }
             };
-            let o = int_of(off)?;
+            // ── DYNAMIC offset / length (`${s:$i:1}`, `${s:2:$((n-2))}`) ──
+            // The runtime re-PARSES the operand text through evalArith on
+            // EVERY evaluation — a per-iteration string parse when the
+            // slice sits in a loop (010_substring_loop / 011_substring_loop_param
+            // exist precisely to pin the per-iteration read). Under
+            // SH2_ASSUME_ARITH_VARS (default ON — the same documented gate
+            // the `$(( $var ))` family already uses) the operand texts are
+            // native arith expressions. The dynamic operand is evaluated
+            // EXACTLY ONCE through the runtime's `_g` scratch (the guard
+            // protocol): the start index is read twice (start, start+len),
+            // and a store read duplicated would double its runtime count.
+            // Exactly ONE operand may be dynamic — two live temps would need
+            // a second scratch slot, so that shape keeps the runtime call.
+            let len_absent = len.trim().is_empty();
+            let off_lit = int_of(off);
+            let len_lit = if len_absent { None } else { int_of(len) };
+            let off_dyn = off_lit.is_none();
+            let len_dyn = !len_absent && len_lit.is_none();
+            if off_dyn && len_dyn {
+                return None;
+            }
+            if off_dyn {
+                // `${s:$i:1}` / `${s:$i}` — the exact runtime formula
+                // `v.slice(off, ln < 0 ? v.length + ln : off + ln)` with
+                // `off` single-evaluated into `_g`.
+                let off_e = arith_to_estree_wrapped(&native_arith_text(off)?);
+                let g = sh2_member("_g");
+                let slice_args = match len_lit {
+                    None => vec![g.clone()],
+                    Some(l) if l < 0 => {
+                        vec![g.clone(), bin(member(val(), "length"), "+", int_lit(l))]
+                    }
+                    Some(l) => vec![g.clone(), bin(g.clone(), "+", int_lit(l))],
+                };
+                return Some(seq(vec![
+                    Expr::AssignmentExpression {
+                        operator: "=".to_string(),
+                        left: Box::new(g),
+                        right: Box::new(off_e),
+                    },
+                    method(val(), "slice", slice_args),
+                ]));
+            }
+            if len_dyn {
+                // `${s:2:$((n-2))}` — literal start, dynamic length; the
+                // length is single-evaluated into `_g` and the runtime's
+                // `ln < 0 ? v.length + ln : off + ln` rule selects the end.
+                let o = off_lit?;
+                let len_e = arith_to_estree_wrapped(&native_arith_text(len)?);
+                let g = sh2_member("_g");
+                let end = Expr::ConditionalExpression {
+                    test: Box::new(bin(g.clone(), "<", int_lit(0))),
+                    consequent: Box::new(bin(member(val(), "length"), "+", g.clone())),
+                    alternate: Box::new(bin(int_lit(o), "+", g.clone())),
+                };
+                return Some(seq(vec![
+                    Expr::AssignmentExpression {
+                        operator: "=".to_string(),
+                        left: Box::new(g),
+                        right: Box::new(len_e),
+                    },
+                    method(val(), "slice", vec![int_lit(o), end]),
+                ]));
+            }
+            let o = off_lit?;
             if len.trim().is_empty() {
                 Some(method(val(), "slice", vec![int_lit(o)]))
             } else {
-                let l = int_of(len)?;
+                let l = len_lit?;
                 if l < 0 {
                     // A NEGATIVE length means "stop |l|-1 characters
                     // before the END": the end index is `String(v).length
@@ -48983,6 +53025,7 @@ fn try_native_file_test(s: &str) -> Option<Expr> {
             | 'O'
             | 'G'
             | 'N'
+            | 't'
     ) {
         return None;
     }
@@ -49245,6 +53288,24 @@ fn lift_walk_expr(
                             if plain
                                 || (subscript_keys_assumed_clean()
                                     && baked_subscript_read(n).is_some())
+                            {
+                                continue;
+                            }
+                        }
+                    }
+                    // Key text of a baked subscript READ — the
+                    // `param("", "map[$k]")` form cleared just above, and
+                    // the `arrayIndex(base, "$i,$j")` form the word IR
+                    // emits for `${arr[$i,$j]}`: the renderer always
+                    // rewrites the key to the native expression under
+                    // SH2_ASSUME_SUBSCRIPT_KEYS, so its plain `$ref`s are
+                    // native reads. Non-plain keys (cmdsubs/positionals/
+                    // param ops) keep their marks — `array_index_key_expr`
+                    // returns None for them and the runtime expands them.
+                    if func == "arrayIndex" && i == 1 {
+                        if let IrExpr::Str(n, _) = a {
+                            if subscript_keys_assumed_clean()
+                                && array_index_key_expr(n).is_some()
                             {
                                 continue;
                             }
@@ -49708,7 +53769,8 @@ fn lift_walk_stmt(
 /// PURE-VALUE `local`/`declare`/`typeset`/`readonly` call?
 fn lift_stmt_is_pure_decl(st: &IrStmt, name: &str) -> bool {
     // The declarative contract form: `Declare { local: true }` with a
-    // literal init.
+    // literal init — or BARE (no init: `local x`, the empty-string
+    // declaration, `builtins.local`'s bare-name arm).
     if let IrStmt::Declare {
         vars,
         init,
@@ -49717,7 +53779,7 @@ fn lift_stmt_is_pure_decl(st: &IrStmt, name: &str) -> bool {
     {
         return vars.len() == 1
             && vars[0].name == name
-            && init.as_ref().and_then(literal_decl_value).is_some();
+            && (init.is_none() || init.as_ref().and_then(literal_decl_value).is_some());
     }
     // Both IR shapes carry the call's args compatible with
     // pure_value_declare: the frontend `IrStmt::Exec { cmd, args }` and
@@ -50080,7 +54142,14 @@ fn local_lift_analysis(prog: &IrProgram) -> HashMap<String, HashSet<String>> {
                         init,
                         local: true,
                     } => {
-                        if vars.len() == 1 && init.as_ref().and_then(literal_decl_value).is_some() {
+                        // A BARE `local x` (no init) is the empty-string
+                        // declaration (`builtins.local`'s bare-name arm is
+                        // exactly `vars[x] = ''`) — the same pure-value
+                        // shape as `local x=` for the local-lift family.
+                        if vars.len() == 1
+                            && (init.is_none()
+                                || init.as_ref().and_then(literal_decl_value).is_some())
+                        {
                             Some(&[])
                         } else {
                             None
@@ -50617,30 +54686,68 @@ pub(crate) fn string_lift_vars(
                 // twin's guard; a `let s.X` would be a syntax error).
                 continue;
             }
-            let all_string = exprs.iter().all(|e| match e {
-                IrExpr::Str(_, _) => true,
-                IrExpr::Interpolate(_) => true,
-                IrExpr::Var(n, _) => lifted.contains(n.as_str()),
-                IrExpr::Call { func, args } if func == "getVar" => {
-                    matches!(args.as_slice(), [IrExpr::Str(n, _)]
-                        if lifted.contains(n.as_str()) || positional_name(n))
+            // Is this expression PROVABLY a string? The shipped cases were
+            // literals/interpolation/var-copy/command-substitution; the
+            // rest of the string-producing IR surface is added here — a
+            // store element read (`Index`), the string-valued runtime
+            // twins (dirname/basename/uname/hostname/whoami/readlink/
+            // mktempValue/uc/lc/join/param/arrayIndex/arrayItems), the
+            // native `String`-method calls the emitters produce
+            // (toUpperCase/toLowerCase/trim/…, plus replace/slice when the
+            // receiver is itself provably a string), and a ternary whose
+            // BOTH branches are strings. Narrowing this to "every
+            // assignment is a string" is what makes the native binding
+            // sound — a lifted var never reaches the runtime store, so a
+            // single non-string assignment would desync.
+            fn string_src(e: &IrExpr, lifted: &HashSet<String>) -> bool {
+                match e {
+                    IrExpr::Str(_, _) | IrExpr::Interpolate(_) => true,
+                    IrExpr::Var(n, _) => lifted.contains(n.as_str()),
+                    // a store element read is always the element's string
+                    IrExpr::Index { .. } => true,
+                    IrExpr::Call { func, args } => match func.as_str() {
+                        // `x=$(cmd)` — command substitution ALWAYS yields a
+                        // string (the runtime capture strips NULs + trailing
+                        // newlines and returns the buffer). The assignment
+                        // lowers to a native `x = await sh2.capture(...)`.
+                        // (captureWords is the unquoted form and yields an
+                        // ARRAY — never a string.)
+                        "capture" => matches!(args.as_slice(), [IrExpr::Arrow(_)]),
+                        "getVar" => matches!(args.as_slice(), [IrExpr::Str(n, _)]
+                            if lifted.contains(n.as_str()) || positional_name(n)),
+                        "dirname" | "basename" | "uname" | "hostname" | "whoami"
+                        | "readlink" | "mktempValue" | "uc" | "lc" | "join" | "param"
+                        | "arrayIndex" | "arrayItems" | "date" => true,
+                        // The string-accumulator transform's chunk join
+                        // (`v = concatItems("__acc_v")` → the runtime's
+                        // `arrayValues(acc).join("")`): ALWAYS a string, so
+                        // the accumulator itself takes a native binding
+                        // instead of a `setVar` round-trip.
+                        "concatItems" => matches!(args.as_slice(), [IrExpr::Str(_, _)]),
+                        _ => false,
+                    },
+                    // the first-class Capture node (core request
+                    // zsh-sh-go-20260814-230503) — same string verdict as
+                    // the legacy call form above.
+                    IrExpr::Capture { expr, .. } => matches!(expr.as_ref(), IrExpr::Arrow(_)),
+                    IrExpr::MethodCall { obj, method, .. } => match method.as_str() {
+                        "toUpperCase" | "toLowerCase" | "trim" | "trimStart" | "trimEnd"
+                        | "charAt" | "padStart" | "padEnd" | "repeat" | "normalize" => true,
+                        // these preserve the receiver's TYPE: a string
+                        // receiver yields a string, an array receiver an
+                        // array — only lift when the receiver is proven.
+                        "replace" | "replaceAll" | "slice" | "substring" => {
+                            string_src(obj, lifted)
+                        }
+                        _ => false,
+                    },
+                    IrExpr::Ternary { then, else_, .. } => {
+                        string_src(then, lifted) && string_src(else_, lifted)
+                    }
+                    _ => false,
                 }
-                // `x=$(cmd)` — command substitution ALWAYS yields a string
-                // (the runtime capture strips NULs + trailing newlines and
-                // returns the buffer). The assignment lowers to a native
-                // `x = await sh2.capture(...)`, so the target can be a
-                // plain `let` binding. Exported/reflected vars stay
-                // excluded (mark_write_builtin_vars on export/declare/read
-                // ...); the runtime never sees a lifted var.
-                IrExpr::Call { func, args } if func == "capture" => {
-                    matches!(args.as_slice(), [IrExpr::Arrow(_)])
-                }
-                // the first-class Capture node (core request
-                // zsh-sh-go-20260814-230503) — same string verdict as the
-                // legacy call form above.
-                IrExpr::Capture { expr, .. } => matches!(expr.as_ref(), IrExpr::Arrow(_)),
-                _ => false,
-            });
+            }
+            let all_string = exprs.iter().all(|e| string_src(e, &lifted));
             if all_string {
                 lifted.insert(name.clone());
                 changed = true;
@@ -51899,14 +56006,27 @@ fn collect_native_store_access(prog: &IrProgram) -> (HashSet<String>, HashSet<St
                 // attributes: skip the attr mark so the native store
                 // write path applies exactly like the legacy exec-call
                 // form (mirror of lift_stmt_is_pure_decl's pure-value
-                // skip). Other Declare forms (typed frontend decls,
-                // dynamic inits, bare declarations) keep the
-                // conservative attr block.
+                // skip). A BARE `local x` (no init) is the same shape —
+                // `builtins.local`'s bare-name arm is exactly
+                // `vars[x] = ''`, no attribute. Other Declare forms
+                // (typed frontend decls, dynamic inits, bare non-local
+                // declarations) keep the conservative attr block.
                 let pure_local = *local
                     && vars.len() == 1
-                    && init.as_ref().and_then(literal_decl_value).is_some();
+                    && (init.is_none()
+                        || init.as_ref().and_then(literal_decl_value).is_some());
                 if !pure_local {
                     for v in vars {
+                        // The renderer's OWN temps (`__sh2_casesubj_N` — the
+                        // case-lowering subject bind — `__sh2_tc0`, …) are
+                        // composed at compile time and probe-checked against
+                        // the source tree, so no script statement can give
+                        // them an attribute; marking them write-blocked only
+                        // costs the native store write for a value the
+                        // analysis already proved plain.
+                        if is_generated_temp_name(&v.name) {
+                            continue;
+                        }
                         mark_word(&v.name, attr);
                     }
                 }
@@ -52190,6 +56310,23 @@ fn store_var_read(name: &str) -> Expr {
 /// element-0, assoc first-value) cannot fire for those names, and the
 /// env fallback reproduces getVar's `process.env[name] ?? ''`.
 fn native_store_read(name: &str) -> Expr {
+    // The `process.env.<name>` fallback is DROPPED for every name the
+    // SH2_ASSUME_NO_ENV contract ([`assume_no_env`], default ON) says the
+    // caller's environment cannot supply — only [`env_resident`] names may
+    // arrive from outside the script. That is a real cost, not a cosmetic
+    // one: Node's `process.env` is a C++-backed object and a MISS (the
+    // state every unset shell variable is in) costs ~600 ns — measured on
+    // 5M reads: 3029 ms with the fallback vs 20 ms without (152x), i.e. a
+    // hot loop reading an unset variable paid it on EVERY iteration. With
+    // SH2_ASSUME_NO_ENV=0 every read keeps the full fallback (maximal
+    // fidelity to a caller that exports arbitrary names).
+    if assume_no_env() && !env_resident(name) {
+        return Expr::LogicalExpression {
+            operator: "??".to_string(),
+            left: Box::new(store_member(name)),
+            right: Box::new(str_lit("")),
+        };
+    }
     Expr::LogicalExpression {
         operator: "??".to_string(),
         left: Box::new(store_member(name)),
@@ -52296,6 +56433,226 @@ fn sh2_state_set(map: &str, method: &str, name: &str) -> Expr {
         arguments: vec![str_lit(name)],
         optional: false,
     }
+}
+
+/// The store name a statement-expression writes, for the redundant
+/// outer-write detection: `sh2.setVar("<name>", …)` or the native plain
+/// store assignment `sh2.vars.<name> = …` (both shapes carry the same
+/// write for a name that passes [`native_store_write_ok`]).
+fn store_write_name(e: &Expr) -> Option<&str> {
+    if sh2_callee_name(e) == Some("setVar") {
+        return sh2_name_arg(e);
+    }
+    let Expr::AssignmentExpression { left, .. } = e else {
+        return None;
+    };
+    let Expr::MemberExpression {
+        object,
+        property,
+        computed,
+        ..
+    } = left.as_ref()
+    else {
+        return None;
+    };
+    if *computed {
+        return None;
+    }
+    let Expr::MemberExpression {
+        object: vars_obj,
+        property: field,
+        ..
+    } = object.as_ref()
+    else {
+        return None;
+    };
+    if !matches!(vars_obj.as_ref(), Expr::Identifier { name } if name == "sh2")
+        || !matches!(field.as_ref(), Expr::Identifier { name } if name == "vars")
+    {
+        return None;
+    }
+    match property.as_ref() {
+        Expr::Identifier { name } => Some(name),
+        _ => None,
+    }
+}
+
+/// Runtime value twins whose result is ALWAYS a plain scalar — never the
+/// `ARITH_BAD_MAGIC` sentinel, an Array, or a raw object (the three value
+/// shapes the runtime `setVar` special-cases before its plain store
+/// write). Each is verified against harness/sh2-namespace.mjs: they end
+/// in `String(…)`, a capture-buffer `.replace(…)`, or a numeric result.
+const STORE_RHS_SAFE_TWINS: &[&str] = &[
+    "basename",
+    "cutText",
+    "date",
+    "dirname",
+    "grepMatches",
+    "grepText",
+    "hostname",
+    "lc",
+    "mktempValue",
+    "readlink",
+    "uc",
+    "uname",
+    "whoami",
+];
+
+/// JS methods on a plain-scalar receiver whose result is still a plain
+/// scalar (string / number / boolean) — never an Array or an object. The
+/// array-returning methods (`split`, `match`, `matchAll`) and the
+/// callback-taking array methods are deliberately absent: their receivers
+/// are refused anyway, but the omission keeps the rule obvious.
+const STORE_RHS_SAFE_METHODS: &[&str] = &[
+    "at",
+    "charAt",
+    "charCodeAt",
+    "codePointAt",
+    "concat",
+    "endsWith",
+    "includes",
+    "indexOf",
+    "lastIndexOf",
+    "localeCompare",
+    "normalize",
+    "padEnd",
+    "padStart",
+    "repeat",
+    "replace",
+    "replaceAll",
+    "slice",
+    "startsWith",
+    "substring",
+    "substr",
+    "test",
+    "toLocaleLowerCase",
+    "toLocaleUpperCase",
+    "toLowerCase",
+    "toString",
+    "toUpperCase",
+    "trim",
+    "trimEnd",
+    "trimStart",
+    "valueOf",
+];
+
+/// Is the lowered RHS fit for the native plain-store write
+/// `sh2.vars.<name> = String(<rhs>)`? [`call_free_expr`] answers this by
+/// refusing EVERY CallExpression; this admits the calls that provably
+/// return a plain scalar, so shapes like `x=$(mktemp -t …)` or
+/// `x=$(grep -c …)` stay on the native rung of the ladder.
+///
+/// The runtime `setVar` has exactly three value-shape branches the plain
+/// property write lacks: the `ARITH_BAD_MAGIC` SKIP (`x=$((bad))` — the
+/// expansion aborted, bash skips the assignment), the Array branch
+/// (`arrays` table + a space-joined scalar), and the raw-object branch
+/// (objects are stored uncoerced). Only calls that can produce one of
+/// those need the runtime write.
+fn store_rhs_plain_value(e: &Expr) -> bool {
+    /// `sh2.fs.readFile(…)` — the emitter's utf8 read, which resolves a
+    /// STRING (the `.then(…)/.catch(…)` chain only replaces it with '').
+    fn is_fs_read(e: &Expr) -> bool {
+        let Expr::CallExpression { callee, .. } = e else {
+            return false;
+        };
+        let Expr::MemberExpression {
+            object, property, ..
+        } = callee.as_ref()
+        else {
+            return false;
+        };
+        let Expr::MemberExpression {
+            object: fs_obj,
+            property: fs_prop,
+            ..
+        } = object.as_ref()
+        else {
+            return false;
+        };
+        matches!(fs_obj.as_ref(), Expr::Identifier { name } if name == "sh2")
+            && matches!(fs_prop.as_ref(), Expr::Identifier { name } if name == "fs")
+            && matches!(property.as_ref(), Expr::Identifier { name } if name == "readFile")
+    }
+    fn call_ok(callee: &Expr, args: &[Expr]) -> bool {
+        if !args.iter().all(plain) {
+            return false;
+        }
+        match callee {
+            // the plain coercions: always a scalar
+            Expr::Identifier { name } => matches!(
+                name.as_str(),
+                "String" | "Number" | "Boolean" | "parseInt" | "parseFloat"
+            ),
+            Expr::MemberExpression {
+                object, property, ..
+            } => {
+                // Math.floor / Math.trunc / … — always a number
+                if matches!(object.as_ref(), Expr::Identifier { name } if name == "Math") {
+                    return true;
+                }
+                // `sh2.<value twin>` — verified plain-scalar helpers
+                if matches!(object.as_ref(), Expr::Identifier { name } if name == "sh2") {
+                    if let Expr::Identifier { name } = property.as_ref() {
+                        return STORE_RHS_SAFE_TWINS.contains(&name.as_str());
+                    }
+                    return false;
+                }
+                // `….then(…)/.catch(…)/.finally(…)` on an fs read
+                if let Expr::Identifier { name } = property.as_ref() {
+                    if matches!(name.as_str(), "then" | "catch" | "finally") {
+                        return is_fs_read(object);
+                    }
+                    // a scalar-returning method on a plain receiver:
+                    // `String(v).toLowerCase()`, `.replace(…)`, `.startsWith(…)`
+                    if STORE_RHS_SAFE_METHODS.contains(&name.as_str()) {
+                        return plain(object);
+                    }
+                }
+                false
+            }
+            _ => false,
+        }
+    }
+    fn plain(e: &Expr) -> bool {
+        match e {
+            Expr::Identifier { .. } | Expr::Literal { .. } => true,
+            Expr::TemplateLiteral { expressions, .. } => expressions.iter().all(plain),
+            Expr::CallExpression {
+                callee, arguments, ..
+            } => call_ok(callee, arguments),
+            Expr::MemberExpression {
+                object, property, ..
+            } => plain(object) && plain(property),
+            Expr::AwaitExpression { argument } => plain(argument),
+            Expr::ArrowFunctionExpression { body, .. } => match body {
+                crate::estree::ArrowBody::Expr(b) => plain(b),
+                crate::estree::ArrowBody::Block(_) => false,
+            },
+            Expr::LogicalExpression { left, right, .. } => plain(left) && plain(right),
+            Expr::BinaryExpression { left, right, .. } => plain(left) && plain(right),
+            Expr::AssignmentExpression { left, right, .. } => plain(left) && plain(right),
+            Expr::ConditionalExpression {
+                test,
+                consequent,
+                alternate,
+            } => plain(test) && plain(consequent) && plain(alternate),
+            Expr::UnaryExpression { argument, .. } => plain(argument),
+            Expr::SequenceExpression { expressions } => expressions.iter().all(plain),
+            // `x = default` in a params list — a binding pattern, always a
+            // plain value (frontend-only shape; never a shell store RHS)
+            Expr::AssignmentPattern { left, right } => plain(left) && plain(right),
+            // the runtime's array/object branches live behind these
+            Expr::ObjectExpression { .. }
+            | Expr::ArrayExpression { .. }
+            | Expr::NewExpression { .. }
+            | Expr::SpreadElement { .. }
+            | Expr::FunctionExpression { .. } => false,
+        }
+    }
+    // Purely additive: everything the old call-free gate admitted stays
+    // admitted (it also passes array/object literals through, whose store
+    // branch the frontends rely on).
+    call_free_expr(e).is_some() || plain(e)
 }
 
 /// A setVar/Assign RHS that lowers to a CALL-FREE expression (pure
@@ -52551,6 +56908,14 @@ fn expr_to_estree(e: &IrExpr) -> Expr {
                     return crate::estree::method_call(arr, "join", vec![str_lit("")]);
                 }
             }
+            // `redirect [Arrow(stmts), specs]` whose body is exactly one
+            // sync-builtin dispatch: the expression-position twin of the
+            // statement collapse (see [`try_builtin_redirect_call`]).
+            if func == "redirect" {
+                if let Some(native) = try_builtin_redirect_call(args) {
+                    return native;
+                }
+            }
             // `f args...` — a call to a PROVABLY-SYNC script-defined
             // function with await-free call-site args (see
             // [`SYNC_FN_CALLS`] / `try_native_fn_call`): the sync
@@ -52772,6 +57137,61 @@ fn expr_to_estree(e: &IrExpr) -> Expr {
             // sits in the default stdout context (see
             // [`native_echo_sink_sites`]) runs its body in a clone of the
             // default sink.
+            // `pipeline [a] [b] …` — splice in the NATIVE stage arrows (the
+            // pure-text-transform ladder rung below `sh2.builtin`; see
+            // `native_pipeline_stage`). None → the generic lowering below is
+            // byte-identical to the pre-existing emission.
+            if func == "pipeline" {
+                // …and when the PRODUCER is compile-time text and EVERY
+                // later stage is native, the whole chain is a pure function
+                // of a constant: fold it to one native expression (see
+                // [`static_pipeline_text`]) written through the DEFAULT
+                // stdout sink — the same sink discipline every native-echo
+                // lowering follows (`ECHO_SINK_DEPTH == 0`). Inside a
+                // capture/redirect the write must go through the runtime's
+                // fd-1 target, so those keep the pipeline; the capture arm
+                // folds the same static shapes with `trimCapture`.
+                if *ECHO_SINK_DEPTH.lock().unwrap() == 0 {
+                    if let Some(text) = static_pipeline_text(e) {
+                        if !expr_has_await(&text) && expr_sh2_call_count(&text) == 0 {
+                            return seq(vec![
+                                printf_write_expr(text),
+                                Expr::AssignmentExpression {
+                                    operator: "=".to_string(),
+                                    left: Box::new(sh2_member("lastExit")),
+                                    right: Box::new(int_lit_expr(0)),
+                                },
+                                bool_lit(true),
+                            ]);
+                        }
+                    }
+                    if let Some(pair) = static_pipeline_pair(e) {
+                        if !expr_has_await(&pair) && expr_sh2_call_count(&pair) == 0 {
+                            // a status-bearing last stage (`| grep …`):
+                            // evaluate the chain once, record the status,
+                            // write the text, and yield the pipeline's value
+                            return with_stage_pair(pair, |text, status| {
+                                seq(vec![
+                                    Expr::AssignmentExpression {
+                                        operator: "=".to_string(),
+                                        left: Box::new(sh2_member("lastExit")),
+                                        right: Box::new(status),
+                                    },
+                                    printf_write_expr(text),
+                                    Expr::BinaryExpression {
+                                        operator: "===".to_string(),
+                                        left: Box::new(sh2_member("lastExit")),
+                                        right: Box::new(int_lit_expr(0)),
+                                    },
+                                ])
+                            });
+                        }
+                    }
+                }
+                if let Some(native) = native_pipeline_call(args) {
+                    return native;
+                }
+            }
             let mapped_args: Vec<Expr> = {
                 let sink_args = match func.as_str() {
                     "capture" | "captureWords" | "pipeline" | "define" => true,
@@ -52906,7 +57326,7 @@ fn expr_to_estree(e: &IrExpr) -> Expr {
                 if let [IrExpr::Str(name, _), e] = args.as_slice() {
                     if native_store_write_ok(name) {
                         let ve = expr_to_estree(e);
-                        if call_free_expr(&ve).is_some() {
+                        if store_rhs_plain_value(&ve) {
                             let rhs = if store_rhs_string(&ve) {
                                 ve
                             } else {
@@ -53175,6 +57595,27 @@ fn expr_to_estree(e: &IrExpr) -> Expr {
             // boolean like `!contains`).
             if func == "globMatch" {
                 if let [v, p] = args.as_slice() {
+                    // STATIC PATTERN (2026-10-23): the transform always
+                    // emits a literal pattern, and `classify_case_pat`
+                    // already translates every shape the runtime's
+                    // parseGlob grammar accepts into a plain JS string op
+                    // (includes / startsWith / endsWith / ===) or an
+                    // anchored regex. Emitting that instead of the
+                    // `sh2.globMatch` dispatch is EXACT (same grammar,
+                    // same `String(value)` coercion the call performs)
+                    // and removes a per-evaluation glob compile +
+                    // backtracking matcher. A pattern outside the
+                    // classified set (a `$`/quote bearing one the
+                    // runtime would expand) keeps the runtime call.
+                    if let IrExpr::Str(pat, _) = p {
+                        if let Some(native) = glob_match_native_test(v, pat) {
+                            return if *AND_OR_DEPTH.lock().unwrap() == 0 {
+                                native
+                            } else {
+                                native_test_statused(native)
+                            };
+                        }
+                    }
                     let native = Expr::CallExpression {
                         callee: Box::new(Expr::MemberExpression {
                             object: Box::new(Expr::Identifier {
@@ -53422,6 +57863,68 @@ fn expr_to_estree(e: &IrExpr) -> Expr {
                             _ => false,
                         }
                     }
+                    // A provably NON-ARRAY scalar: `sh2.join(v)` is then
+                    // exactly `String(v)` (the runtime body is
+                    // `Array.isArray(v) ? v.join(' ') : String(v)` — the
+                    // else branch). The corpus shapes are
+                    // `join(arrayLen(x))` (the runtime returns a string) and
+                    // `join(<expr>.length)` (a number): the generic join
+                    // wrapper was applied before the emitter knew the value
+                    // cannot be an array. Everything that could hold an array
+                    // (a bare identifier, an index read, a conditional, a
+                    // user call) is refused.
+                    fn provably_scalar_value(e: &Expr) -> bool {
+                        match e {
+                            Expr::Literal { .. } | Expr::TemplateLiteral { .. } => true,
+                            Expr::BinaryExpression { .. } | Expr::UnaryExpression { .. } => true,
+                            Expr::LogicalExpression { left, right, .. } => {
+                                provably_scalar_value(left) && provably_scalar_value(right)
+                            }
+                            Expr::CallExpression { callee, .. } => match &**callee {
+                                Expr::Identifier { name } => matches!(
+                                    name.as_str(),
+                                    "String" | "Number" | "Boolean" | "parseInt" | "parseFloat"
+                                ),
+                                Expr::MemberExpression { object, property, .. } => {
+                                    if matches!(&**object, Expr::Identifier { name } if name == "Math")
+                                    {
+                                        return true;
+                                    }
+                                    if matches!(&**object, Expr::Identifier { name } if name == "sh2") {
+                                        return matches!(&**property, Expr::Identifier { name }
+                                            if matches!(
+                                                name.as_str(),
+                                                "arrayLen"
+                                                    | "uname"
+                                                    | "hostname"
+                                                    | "whoami"
+                                                    | "readlink"
+                                                    | "basename"
+                                                    | "dirname"
+                                                    | "date"
+                                                    | "cutText"
+                                                    | "grepMatches"
+                                                    | "int"
+                                                    | "lc"
+                                                    | "uc"
+                                                    | "mktempValue"
+                                            ));
+                                    }
+                                    // a scalar-returning string method on a
+                                    // provably-string receiver
+                                    matches!(&**property, Expr::Identifier { name }
+                                        if string_method_ok(name))
+                                        && provably_string_value(object)
+                                }
+                                _ => false,
+                            },
+                            // `.length` is always a number
+                            Expr::MemberExpression { property, .. } => {
+                                matches!(&**property, Expr::Identifier { name } if name == "length")
+                            }
+                            _ => false,
+                        }
+                    }
                     let provably_string = provably_string_value(&ve);
                     let always_string = provably_string
                         || matches!(v, IrExpr::Call { func: f, args: a }
@@ -53468,6 +57971,15 @@ fn expr_to_estree(e: &IrExpr) -> Expr {
                                 if op != "slice" && !(op == "" && a.len() >= 3)))
                     {
                         return ve;
+                    }
+                    if provably_scalar_value(&ve) {
+                        return Expr::CallExpression {
+                            callee: Box::new(Expr::Identifier {
+                                name: "String".to_string(),
+                            }),
+                            arguments: vec![ve],
+                            optional: false,
+                        };
                     }
                     return sh2_call("join", vec![ve]);
                 }
@@ -53615,6 +58127,29 @@ fn expr_to_estree(e: &IrExpr) -> Expr {
                         // the injected template is the ARGUMENT to the
                         // runtime test (a bare template is always truthy)
                         return sh2_call("test", vec![tpl]);
+                    }
+                }
+            }
+            // `test WORD...` — the `test` BUILTIN with a compile-time-static
+            // word list (`test "foo" = "bar"`, `test -f /path`). The runtime's
+            // builtins.test hands the words straight to parseTest (one word
+            // per token), so when no word carries a character the runtime
+            // TOKENIZER would split or expand, space-joining them
+            // round-trips the token list EXACTLY and the whole test takes the
+            // same native lowering `[ ... ]` uses: no tokenize, no parse, no
+            // builtin dispatch (and a static `test -f path` becomes the sync
+            // `sh2.fileTest`). `[ ... ]`/`[[ ... ]]` arrive as `test` Calls
+            // with a TEXT argument and never reach here. Anything dynamic
+            // (an already-lowered operand expression, a `$`/quote/glob word)
+            // keeps the runtime builtin.
+            if matches!(func.as_str(), "builtin" | "exec") {
+                if let [IrExpr::Str(nm, _), IrExpr::Array(words)] = args.as_slice() {
+                    if nm == "test" && !program_defines_function("test") {
+                        if let Some(sv) = test_words_join(words) {
+                            if let Some(native) = native_test_static_form(&sv) {
+                                return native;
+                            }
+                        }
                     }
                 }
             }
@@ -53779,8 +58314,12 @@ fn expr_to_estree(e: &IrExpr) -> Expr {
                 // last stage would write — and the sync call keeps
                 // &&/||/if/while contexts on their native/`*Sync` paths.
                 if !program_defines_function("echo") && !program_defines_function("grep") {
-                    if let Some((text, argv)) = try_native_echo_grep(e) {
-                        return sh2_call("grepText", vec![text, array(argv), bool_lit(false)]);
+                    if let Some((text, argv, specs)) = try_native_echo_grep(e) {
+                        let mut call_args = vec![text, array(argv), bool_lit(false)];
+                        if let Some(specs) = specs {
+                            call_args.push(array(specs));
+                        }
+                        return sh2_call("grepText", call_args);
                     }
                 }
                 // `echo ARGS | cut OP` — a sync runtime mini-cut (the
@@ -53837,19 +58376,8 @@ fn expr_to_estree(e: &IrExpr) -> Expr {
                         let mut changed = false;
                         for (i, stage) in stages.iter().enumerate() {
                             if i + 1 < stages.len() {
-                                if let Some(text) = try_echo_stage_text(stage) {
-                                    out.push(seq(vec![
-                                        Expr::AssignmentExpression {
-                                            operator: "=".to_string(),
-                                            left: Box::new(sh2_member("lastExit")),
-                                            right: Box::new(Expr::Literal {
-                                                value: serde_json::Value::from(0),
-                                                raw: None,
-                                                regex: None,
-                                            }),
-                                        },
-                                        text,
-                                    ]));
+                                if let Some(collapsed) = echo_stage_collapse(stage) {
+                                    out.push(collapsed);
                                     changed = true;
                                     continue;
                                 }
@@ -53891,39 +58419,8 @@ fn expr_to_estree(e: &IrExpr) -> Expr {
             // truthiness semantics the runtime helpers branch on).
             if func == "redirect" {
                 if let [IrExpr::Arrow(stmts), IrExpr::Array(spec_objs)] = args.as_slice() {
-                    let mut specs: Vec<(i64, &str, &IrExpr)> = Vec::new();
-                    let mut ok = true;
-                    for so in spec_objs {
-                        if let IrExpr::Object(props) = so {
-                            let mut fd = 0i64;
-                            let mut mode = "";
-                            let mut target: Option<&IrExpr> = None;
-                            for (k, v) in props {
-                                match k.as_str() {
-                                    "fd" => {
-                                        if let IrExpr::Int(i) = v {
-                                            fd = *i;
-                                        }
-                                    }
-                                    "mode" => {
-                                        if let IrExpr::Str(m, _) = v {
-                                            mode = m;
-                                        }
-                                    }
-                                    "target" => target = Some(v),
-                                    _ => {}
-                                }
-                            }
-                            if let Some(t) = target {
-                                specs.push((fd, mode, t));
-                            } else {
-                                ok = false;
-                            }
-                        } else {
-                            ok = false;
-                        }
-                    }
-                    if ok {
+                    if let Some(rs) = ir_redirect_specs(spec_objs) {
+                        let specs = RedirectSpec::triples(&rs);
                         // EXPRESSION position: the chain's boolean VALUE is
                         // the command's truth value (a `$(cmd > f)` capture,
                         // a `&&`/`||` operand), so the `true`/`false` tails
@@ -53932,11 +58429,11 @@ fn expr_to_estree(e: &IrExpr) -> Expr {
                         if let Some(native) = try_native_echo_redirect(stmts, &specs, false) {
                             return native;
                         }
-                        // `grep -q PAT <<< TEXT` — the fd-0 herestring
-                        // redirect form of the substring test (see
-                        // `try_native_grep_q_redirect`): no spawn, no fd
+                        // `grep ARGS <<< TEXT` / `grep ARGS <<EOF … EOF` —
+                        // the fd-0 redirect form of the mini-grep (see
+                        // `try_native_grep_redirect`): no spawn, no fd
                         // plumbing.
-                        if let Some(native) = try_native_grep_q_redirect(stmts, &specs) {
+                        if let Some(native) = try_native_grep_redirect(stmts, &rs, false) {
                             return native;
                         }
                     }
@@ -53965,6 +58462,39 @@ fn expr_to_estree(e: &IrExpr) -> Expr {
                                         if let Some(call) = try_native_fn_call(fname, elems) {
                                             return call;
                                         }
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+                // `$(grep ARGS <<< TEXT)` / `$(grep ARGS <<EOF … EOF)` —
+                // the fd-0 redirect form of the mini-grep in CAPTURE
+                // position: the helper returns the selected lines
+                // (`captureMode=true`), and the capture's NUL /
+                // trailing-newline strips apply exactly like a real
+                // `$(grep …)` (see `try_native_grep_redirect`). No spawn,
+                // no async capture arrow, no fd swapping.
+                // `$(cat <<EOF … EOF)` — cat is the identity, so the
+                // captured value is the heredoc/herestring body with the
+                // capture strips applied, folded to a plain literal.
+                if let [IrExpr::Arrow(stmts)] = args.as_slice() {
+                    if let [IrStmt::Expr(IrExpr::Call { func: rf, args: rargs })] =
+                        stmts.as_slice()
+                    {
+                        if rf == "redirect" {
+                            if let [IrExpr::Arrow(inner), IrExpr::Array(spec_objs)] =
+                                rargs.as_slice()
+                            {
+                                if let Some(rs) = ir_redirect_specs(spec_objs) {
+                                    if !program_defines_function("grep") {
+                                        if let Some(v) = try_native_grep_redirect(inner, &rs, true)
+                                        {
+                                            return v;
+                                        }
+                                    }
+                                    if let Some(v) = native_capture_cat_stdin(rargs, &rs) {
+                                        return v;
                                     }
                                 }
                             }
@@ -54131,7 +58661,11 @@ fn expr_to_estree(e: &IrExpr) -> Expr {
                 if !program_defines_function("echo") && !program_defines_function("grep") {
                     if let [IrExpr::Arrow(stmts)] = args.as_slice() {
                         if let [IrStmt::Expr(pipe)] = stmts.as_slice() {
-                            if let Some((text, argv)) = try_native_echo_grep(pipe) {
+                            // A redirected grep stage keeps the runtime form:
+                            // the capture value is "" there (the matched text
+                            // went to the file), which the emit-mode collapse
+                            // cannot express.
+                            if let Some((text, argv, None)) = try_native_echo_grep(pipe) {
                                 return trim_capture(sh2_call(
                                     "grepText",
                                     vec![text, array(argv), bool_lit(true)],
@@ -54190,6 +58724,40 @@ fn expr_to_estree(e: &IrExpr) -> Expr {
                         return value;
                     }
                 }
+                // `$(echo LIT | tr …| sed …| cut …| grep …)` — a STATIC
+                // producer feeding NATIVE stages: the whole pipeline is a
+                // pure function of a compile-time string, so it β-reduces
+                // to a single native JS expression (see
+                // [`static_pipeline_pair`]). In capture position that
+                // replaces `sh2.captureSync(() => sh2.pipelineSync([…]))`
+                // with zero sh2.* call sites. trimCapture applies the
+                // capture's NUL + trailing-newline strips. A chain whose
+                // last stage has an observable status (`| grep …`) carries
+                // it as a single-evaluation pair and records `lastExit` —
+                // exactly what the runtime pipeline would have left behind.
+                if let [IrExpr::Arrow(stmts)] = args.as_slice() {
+                    if let [IrStmt::Expr(pipe)] = stmts.as_slice() {
+                        if let Some(text) = static_pipeline_text(pipe) {
+                            if !expr_has_await(&text) && expr_sh2_call_count(&text) == 0 {
+                                return trim_capture(text);
+                            }
+                        }
+                        if let Some(pair) = static_pipeline_pair(pipe) {
+                            if !expr_has_await(&pair) && expr_sh2_call_count(&pair) == 0 {
+                                return with_stage_pair(pair, |text, status| {
+                                    seq(vec![
+                                        Expr::AssignmentExpression {
+                                            operator: "=".to_string(),
+                                            left: Box::new(sh2_member("lastExit")),
+                                            right: Box::new(status),
+                                        },
+                                        trim_capture(text),
+                                    ])
+                                });
+                            }
+                        }
+                    }
+                }
             }
             // `$(echo EXPR | bc)` — a native bc evaluation (SH2_BC_NATIVE,
             // default ON; see [`native_capture_echo_bc`]): the spawn +
@@ -54235,6 +58803,30 @@ fn expr_to_estree(e: &IrExpr) -> Expr {
                         return array(vec![v]);
                     }
                 }
+                // `$(SYNC-BUILTIN ARGS...)` / `$(SYNC-BUILTIN ARGS... <redir)`
+                // — a capture whose body is EXACTLY one sync-builtin
+                // dispatch (optionally wrapped in a redirect spec install):
+                // the 2-3 emitted runtime calls (`captureSync` +
+                // `redirectSync` + `builtin`) collapse to ONE
+                // `sh2.builtinValue(name, args[, specs])` with identical
+                // semantics (see the runtime twin — same fd-1 capture
+                // install, same spec apply/restore/persist, same buffer
+                // post-processing). Everything the specific lifts above did
+                // not claim keeps its full fidelity here.
+                //
+                // captureWords is NOT eligible: the unquoted form
+                // word-splits the captured value (`captureWordsSync`), so
+                // its value must stay the runtime's array — the emitter
+                // keeps that shape.
+                if func == "capture" {
+                    if let [IrExpr::Arrow(stmts)] = args.as_slice() {
+                        if let Some(value) = native_capture_builtin_value(stmts) {
+                            if !expr_has_await(&value) {
+                                return value;
+                            }
+                        }
+                    }
+                }
             }
             // `printf FORMAT ARGS...` with a static format at the module's
             // default stdout sink: a native `process.stdout.write`, no
@@ -54277,7 +58869,7 @@ fn expr_to_estree(e: &IrExpr) -> Expr {
             }
             // `let ARITH...` / `(( ARITH ))` — see try_native_let (the
             // statement/condition whose EVERY arith arg parses natively).
-            if func == "exec" {
+            if func == "exec" || func == "builtin" {
                 if let Some(native) = try_native_let(args) {
                     return native;
                 }
@@ -54285,8 +58877,9 @@ fn expr_to_estree(e: &IrExpr) -> Expr {
             // `unset NAME` with a single plain name (see try_native_unset)
             // — the two native deletes, no builtin dispatch. The
             // expression-position twin of the statement arm (pipeline
-            // stages, `&&`/`||` operands, condition positions).
-            if func == "exec" {
+            // stages, `&&`/`||` operands, condition positions); the
+            // sync-builtin Call shape carries the identical args.
+            if func == "exec" || func == "builtin" {
                 if let Some(native) = try_native_unset(args) {
                     return native;
                 }
@@ -54450,6 +59043,67 @@ fn expr_to_estree(e: &IrExpr) -> Expr {
                         },
                         bool_lit(true),
                     ]);
+                }
+            }
+            // `assign(NAME, "=", v)` — the EXPRESSION-position assignment
+            // twin (an `||`/`&&` RHS, a function-arg default). The runtime
+            // body is `setVar(NAME, String(v))` for op "=" with a non-array
+            // v, i.e. exactly the plain store write Plan 36 already emits
+            // for statement-position assigns. Same two gates: the name must
+            // be attribute-free ([`native_store_write_ok`] — int/lc/uc/
+            // nameref/exported/PATH keep the runtime coercion) and the value
+            // must be provably plain ([`store_rhs_plain_value`] — no array,
+            // no raw object: `assign` String()s an object, so only the
+            // string-shaped values are exact). Keeps `true` as the seq value
+            // (assign's return, the and/or chain's status).
+            if func == "assign" {
+                if let [IrExpr::Str(name, _), IrExpr::Str(op, _), value] = args.as_slice() {
+                    if op == "=" && native_store_write_ok(name) {
+                        let ve = expr_to_estree(value);
+                        if store_rhs_plain_value(&ve)
+                            && !matches!(ve, Expr::ObjectExpression { .. })
+                        {
+                            let rhs = if store_rhs_string(&ve) {
+                                ve
+                            } else {
+                                Expr::CallExpression {
+                                    callee: Box::new(Expr::Identifier {
+                                        name: "String".to_string(),
+                                    }),
+                                    arguments: vec![ve],
+                                    optional: false,
+                                }
+                            };
+                            return seq(vec![
+                                Expr::AssignmentExpression {
+                                    operator: "=".to_string(),
+                                    left: Box::new(store_member(name)),
+                                    right: Box::new(rhs),
+                                },
+                                bool_lit(true),
+                            ]);
+                        }
+                    }
+                }
+            }
+            // `listVar("@")` / `listVar("*")` — the runtime returns
+            // `[...this.positional]` (a COPY of the live positional array;
+            // `$*` is the same list, its join being the caller's). The
+            // native spread `[...sh2.positional]` is the identical copy
+            // with no dispatch. `$@` inside a function body reads that
+            // frame's positionals — `sh2.positional` is exactly what the
+            // runtime call would read (the call machinery saves/restores
+            // it around every script-function call), so the read stays
+            // frame-correct.
+            if func == "listVar" {
+                if let [IrExpr::Str(n, _)] = args.as_slice() {
+                    if n == "@" || n == "*" {
+                        return Expr::ArrayExpression {
+                            elements: vec![Some(Expr::SpreadElement {
+                                argument: Box::new(sh2_member("positional")),
+                            })],
+                        };
+                    }
                 }
             }
             let callee_name = exec_or_builtin(func, args);
@@ -55020,14 +59674,54 @@ fn ext_to_native_estree(n: &dyn crate::shir_nodes::ExtExpr) -> Option<Expr> {
             Some(crate::estree::method_call(expr_to_estree(text), "substring",
                 vec![expr_to_estree(offset), end]))
         }
-        "RegSub" => {
+        "Substitute" => {
+            // Per-LINE substitution (the node's domain is a text whose lines
+            // are mapped). `sed s///` without `-n` prints every line, so the
+            // value is the line list re-joined — NOT a bare String.replace,
+            // which would also match across newlines.
             let text = children.get(0)?;
-            let node = n.as_any().downcast_ref::<crate::shir_nodes::RegSub>()?;
-            // text.replace(/pat/g, repl) or text.replace(/pat/, repl)
-            let re = crate::estree::regex_lit_flags(&node.pattern,
-                if node.global { "g" } else { "" });
+            let node = n.as_any().downcast_ref::<crate::shir_nodes::Substitute>()?;
+            let flags = match (node.global, node.ignore_case) {
+                (true, true) => "gi",
+                (true, false) => "g",
+                (false, true) => "i",
+                (false, false) => "",
+            };
+            let re = crate::estree::regex_lit_flags(&node.pattern, flags);
+            // The BRE dialect question is REFUSED here rather than answered
+            // by the JS regex engine: `\(x\)`, `\|`, `\{n,m\}` mean group,
+            // alternation and repetition in POSIX BRE but are literals in
+            // ECMAScript. A pattern containing them would be quietly
+            // mistranslated, so the renderer declines and the caller keeps
+            // its shell-out (harness transform-diff records it).
+            if ["\\(", "\\|", "\\{", "*\\{"].iter().any(|m| node.pattern.contains(m)) {
+                return None;
+            }
+            // text.split('\n').map(l => l.replace(re, repl)).join('\n')
+            let split = crate::estree::method_call(expr_to_estree(text), "split",
+                vec![crate::estree::str_lit("\n")]);
+            let inner = crate::estree::method_call(Expr::Identifier {
+                    name: "l".to_string() }, "replace",
+                vec![re, crate::estree::str_lit(&node.replacement)]);
+            let arrow = Expr::ArrowFunctionExpression {
+                params: vec![Expr::Identifier { name: "l".to_string() }],
+                body: crate::estree::ArrowBody::Expr(Box::new(inner)),
+                expression: true,
+                r#async: false,
+            };
+            let mapped = crate::estree::method_call(split, "map", vec![arrow]);
+            Some(crate::estree::method_call(mapped, "join",
+                vec![crate::estree::str_lit("\n")]))
+        }
+        // SortLines / UniqLines render through the shared registry
+        // (render_ext_expr), where each backend's arm lives once.
+        "SortLines" | "UniqLines" => None,
+        "NewlineStrip" => {
+            let text = children.get(0)?;
+            // text.replace(/\n+$/, "")
             Some(crate::estree::method_call(expr_to_estree(text), "replace",
-                vec![re, crate::estree::str_lit(&node.replacement)]))
+                vec![crate::estree::regex_lit("\\n+$"),
+                     crate::estree::str_lit("")]))
         }
         "Split" => {
             let text = children.get(0)?;
@@ -56765,6 +61459,22 @@ fn subscript_refs_var(name: &str, var: &str) -> bool {
     false
 }
 
+/// Runtime builtins whose argument list is DATA — they never resolve a
+/// name against the shell store (no getVar/expandWord of a variable by
+/// name, no read/shift/eval/declare-family store writes). A loop body
+/// containing one of these calls cannot observe the loop var's store
+/// slot, so it does not block the native for-of store-sync elimination.
+/// Anything name-taking (`eval`, `let`, `test`, `read`, `shift`,
+/// `declare`/`local`/`typeset`/`readonly`, `export`, `unset`, `mapfile`,
+/// `source`, `.`, `trap`, `printf -v`) is deliberately absent.
+pub(crate) const STORE_BLIND_BUILTINS: &[&str] = &[
+    "echo", "printf", "cat", "sort", "tr", "sed", "grep", "egrep", "head", "tail", "wc", "cut",
+    "ls", "find", "diff", "comm", "paste", "rev", "uniq", "tee", "gzip", "gunzip", "sha256sum",
+    "sha512sum", "sha1sum", "md5sum", "whoami", "uname", "date", "hostname", "readlink",
+    "dirname", "basename", "seq", "mktemp", "which", "stat", "cmp", "pwd", "env", "true",
+    "false", ":",
+];
+
 /// Native-ForOf store-sync elimination — eligibility scan over the loop
 /// body (minus the sync statement itself). The optimization replaces the
 /// per-iteration `sh2.setVar(var, i)` store sync + the body's
@@ -56772,18 +61482,57 @@ fn subscript_refs_var(name: &str, var: &str) -> bool {
 /// store read and one post-loop store write. It is ONLY sound when the
 /// body cannot observe the store's `var` through any other channel:
 ///   (a) any sh2.* call outside the allow-list {getVar, setVar, setArray,
-///       setArrayAppend, assign} — a runtime call could read or write
-///       `var` through the store (test strings, eval, fnCall/exec of
-///       script functions, param ops, `read`/`shift` builtins, ...);
+///       setArrayAppend, assign, STORE_BLIND_BUILTINS, arrayIndex} — a
+///       runtime call could read or write `var` through the store (test
+///       strings, eval, fnCall/exec of script functions, param ops,
+///       `read`/`shift` builtins, ...);
 ///   (b) a store WRITE to `var` (setVar/assign/setArray/setArrayAppend
 ///       with a literal `var` name — incl. a nested for-loop on the same
 ///       var, whose own sync/post-write are exactly such writes);
 ///   (c) a dynamic name argument (getVar/setVar with a non-literal name
-///       could resolve to `var` at runtime).
+///       could resolve to `var` at runtime);
+///   (d) a direct `sh2.vars.var` store read anywhere in the body — that
+///       read would see the stale slot once the per-iteration sync is
+///       gone (the var's own reads are emitted as native identifiers
+///       when it is lifted, so this only matches genuinely store-bound
+///       reads, which keep the sync).
 /// Native non-sh2 constructs (echo writes, arith, comparisons) cannot
 /// touch the store — always allowed.
 fn forof_sync_elim_ok(stmts: &[Stmt], var: &str) -> bool {
+    /// `sh2.vars.<var>` (or `sh2.vars["<var>"]`) — a direct store read.
+    fn is_store_member(e: &Expr, var: &str) -> bool {
+        let Expr::MemberExpression {
+            object,
+            property,
+            computed,
+            ..
+        } = e
+        else {
+            return false;
+        };
+        let Expr::MemberExpression {
+            object: base,
+            property: map,
+            ..
+        } = &**object
+        else {
+            return false;
+        };
+        if !matches!(&**base, Expr::Identifier { name } if name == "sh2")
+            || !matches!(&**map, Expr::Identifier { name } if name == "vars")
+        {
+            return false;
+        }
+        match (&**property, computed) {
+            (Expr::Identifier { name }, false) => name == var,
+            (Expr::Literal { value, .. }, true) => value.as_str() == Some(var),
+            _ => false,
+        }
+    }
     fn expr_ok(e: &Expr, var: &str) -> bool {
+        if is_store_member(e, var) {
+            return false;
+        }
         match e {
             Expr::CallExpression {
                 callee, arguments, ..
@@ -56820,6 +61569,14 @@ fn forof_sync_elim_ok(stmts: &[Stmt], var: &str) -> bool {
                             None => false,
                         }
                     }
+                    // A data-transform builtin takes its arguments as
+                    // VALUES — it cannot read the store's `var` slot.
+                    Some("builtin") => matches!(sh2_name_arg(e), Some(n) if STORE_BLIND_BUILTINS.contains(&n)),
+                    // `arrayIndex(base, key)` — the key is a native
+                    // expression (the baked-subscript rewrite), the base a
+                    // literal name; only `this.arrays`/`this.assocStore`
+                    // are consulted, never `vars`.
+                    Some("arrayIndex") => sh2_name_arg(e).is_some(),
                     Some(_) => false, // any other sh2 call disqualifies
                     None => true,
                 }
