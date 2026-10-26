@@ -20,7 +20,7 @@
 //! assignment. Any control escape, nested write, or `$?` observation causes
 //! the original while form to remain intact.
 
-use crate::ir::{BinOpKind, IrExpr, IrStmt};
+use crate::ir::{ArithAst, BinOpKind, IrExpr, IrStmt};
 
 pub fn transform(stmts: &mut Vec<IrStmt>) -> bool {
     let mut changed = false;
@@ -96,6 +96,10 @@ fn counter_step(st: &IrStmt) -> Option<(String, IrStmt)> {
         return None;
     }
     let name = targets[0].var.clone();
+    // Shell arithmetic lowers to `Arith(Bin{…})`, never to a top-level
+    // `BinOp` — matching only `BinOp` left every `$((i+1))` loop on the
+    // floor (the `for-recovery` Arith-wrap class). Both spellings below
+    // denote the same step: `v = v +/- K`, K a nonzero literal.
     let ok = match expr {
         IrExpr::BinOp {
             lhs,
@@ -106,6 +110,13 @@ fn counter_step(st: &IrStmt) -> Option<(String, IrStmt)> {
         {
             true
         }
+        IrExpr::Arith(ast) => matches!(
+            ast.as_ref(),
+            ArithAst::Bin { op, lhs, rhs }
+                if (op == "+" || op == "-")
+                    && matches!(lhs.as_ref(), ArithAst::Var(v) if v == &name)
+                    && matches!(rhs.as_ref(), ArithAst::Num(n) if *n != 0)
+        ),
         _ => false,
     };
     if ok {
@@ -376,5 +387,161 @@ fn recurse(st: &mut IrStmt) -> bool {
             .map(|c| transform(&mut c.body))
             .any(|x| x),
         _ => false,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::ir::{ArithAst, AssignTarget, Decl};
+
+    fn target(var: &str) -> AssignTarget {
+        AssignTarget { var: var.to_string(), sigil: None, indices: vec![] }
+    }
+
+    fn init(var: &str) -> IrStmt {
+        IrStmt::Assign {
+            targets: vec![target(var)],
+            expr: IrExpr::Int(0),
+            asm: None,
+        }
+    }
+
+    fn arith_step(var: &str, op: &str, n: i64) -> IrStmt {
+        IrStmt::Assign {
+            targets: vec![target(var)],
+            expr: IrExpr::Arith(Box::new(ArithAst::Bin {
+                op: op.to_string(),
+                lhs: Box::new(ArithAst::Var(var.to_string())),
+                rhs: Box::new(ArithAst::Num(n)),
+            })),
+            asm: None,
+        }
+    }
+
+    fn binop_step(var: &str, n: i64) -> IrStmt {
+        IrStmt::Assign {
+            targets: vec![target(var)],
+            expr: IrExpr::BinOp {
+                op: BinOpKind::Add,
+                lhs: Box::new(IrExpr::Var(var.to_string(), None)),
+                rhs: Box::new(IrExpr::Int(n)),
+            },
+            asm: None,
+        }
+    }
+
+    fn cond(var: &str) -> IrExpr {
+        IrExpr::Call {
+            func: "test".to_string(),
+            args: vec![IrExpr::Str(format!("${var} -lt 10"), crate::ir::StrStyle::DoubleQuoted)],
+        }
+    }
+
+    fn body(var: &str, step: IrStmt) -> Vec<IrStmt> {
+        vec![
+            IrStmt::Expr(IrExpr::Var(var.to_string(), None)),
+            step,
+        ]
+    }
+
+    fn while_loop(var: &str, step: IrStmt) -> Vec<IrStmt> {
+        vec![
+            init(var),
+            IrStmt::While { cond: cond(var), body: body(var, step) },
+        ]
+    }
+
+    fn is_forinit(stmts: &[IrStmt]) -> bool {
+        matches!(stmts.get(0), Some(IrStmt::ForInit { .. }))
+    }
+
+    /// `i=$((i+1))` — the shell-lowered Arith step folds (031 shape).
+    #[test]
+    fn arith_wrapped_step_folds() {
+        let mut stmts = while_loop("i", arith_step("i", "+", 1));
+        assert!(transform(&mut stmts));
+        assert!(is_forinit(&stmts), "Arith step should lift: {stmts:?}");
+    }
+
+    /// The pre-existing BinOp arm keeps working.
+    #[test]
+    fn binop_step_still_folds() {
+        let mut stmts = while_loop("i", binop_step("i", 1));
+        assert!(transform(&mut stmts));
+        assert!(is_forinit(&stmts), "BinOp step should lift: {stmts:?}");
+    }
+
+    /// A zero step (`i=$((i+0))`) never advances — refuse, like the BinOp arm.
+    #[test]
+    fn zero_arith_step_refuses() {
+        let mut stmts = while_loop("i", arith_step("i", "+", 0));
+        assert!(!transform(&mut stmts));
+    }
+
+    /// A dynamic rhs (`i=$((i+n))`) is not a literal step — refuse.
+    #[test]
+    fn dynamic_arith_step_refuses() {
+        let step = IrStmt::Assign {
+            targets: vec![target("i")],
+            expr: IrExpr::Arith(Box::new(ArithAst::Bin {
+                op: "+".to_string(),
+                lhs: Box::new(ArithAst::Var("i".to_string())),
+                rhs: Box::new(ArithAst::Var("n".to_string())),
+            })),
+            asm: None,
+        };
+        let mut stmts = while_loop("i", step);
+        assert!(!transform(&mut stmts));
+    }
+
+    /// A body that writes the counter derails the sequence — refuse.
+    #[test]
+    fn body_write_refuses() {
+        let mut stmts = vec![
+            init("i"),
+            IrStmt::While {
+                cond: cond("i"),
+                body: vec![
+                    IrStmt::Assign {
+                        targets: vec![target("i")],
+                        expr: IrExpr::Int(9),
+                        asm: None,
+                    },
+                    arith_step("i", "+", 1),
+                ],
+            },
+        ];
+        assert!(!transform(&mut stmts));
+    }
+
+    /// No matching shape — the transform reports false.
+    #[test]
+    fn plain_while_is_untouched() {
+        let mut stmts = vec![IrStmt::While {
+            cond: cond("i"),
+            body: vec![IrStmt::Expr(IrExpr::Var("i".to_string(), None))],
+        }];
+        assert!(!transform(&mut stmts));
+    }
+
+    /// `declare`d counters disqualify the same way (writes_or_escapes).
+    #[test]
+    fn declare_in_body_refuses() {
+        let mut stmts = vec![
+            init("i"),
+            IrStmt::While {
+                cond: cond("i"),
+                body: vec![
+                    IrStmt::Declare {
+                        vars: vec![Decl { name: "i".to_string(), sigil: None }],
+                        init: None,
+                        local: false,
+                    },
+                    arith_step("i", "+", 1),
+                ],
+            },
+        ];
+        assert!(!transform(&mut stmts));
     }
 }
