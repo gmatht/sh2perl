@@ -800,6 +800,17 @@ static NATIVE_STORE_READ_BLOCKED: Mutex<Option<HashSet<String>>> = Mutex::new(No
 /// (`typeset -i/-l/-u`, namerefs, exported/PATH env sync) exclude the
 /// name from native writes (see [`collect_native_store_access`]).
 static NATIVE_STORE_WRITE_BLOCKED: Mutex<Option<HashSet<String>>> = Mutex::new(None);
+/// Does the program never write `IFS` (globally or command-scoped)? The
+/// native `while read` line loop splits with a COMPILE-TIME IFS character
+/// class (one regex, built once per loop instead of once per line), so a
+/// dynamic IFS keeps the runtime `read` builtin. `None`/false = unknown
+/// (an eval/source/trap program, or an IFS write somewhere) → keep the
+/// runtime loop. Set per compilation by `shir_to_estree` from
+/// [`collect_never_written`]'s written set.
+static IFS_QUIET: Mutex<Option<bool>> = Mutex::new(None);
+fn ifs_quiet() -> bool {
+    IFS_QUIET.lock().unwrap().unwrap_or(false)
+}
 /// Names with a REAL (non-arith-text) assignment source (set per
 /// compilation by `shir_to_estree`; see [`collect_arith_ref_set_vars`]).
 /// The `$(( $var ... ))` dollar-ref arith lowering ([`native_arith_text`])
@@ -1103,6 +1114,30 @@ pub fn render_verdict_lock() -> std::sync::MutexGuard<'static, ()> {
 /// Install the general unread-status-write set (see [`LASTEXIT_UNREAD`]).
 /// Same pointer keys as [`LASTEXIT_DEAD`]: the caller MUST pass the exact
 /// `prog` it then renders.
+/// Does this program OBSERVE `${PIPESTATUS…}`?
+///
+/// A renderer captures each pipeline stage's status into a register
+/// (`__SH_PIPESTATUS` in Rust) so a later `${PIPESTATUS[i]}` read can see
+/// it — two lines per stage (`clear()` + a `push` that also loads
+/// `__SH_RC`, which vetoes every write-only status-strip in the file).
+/// Measured over the corpus: 101 of 563 emitted Rust files carried that
+/// capture while exactly ONE example ever reads PIPESTATUS — the capture
+/// was dead boilerplate everywhere else.
+///
+/// Detection is deliberately a substring scan of the whole program's
+/// Debug form rather than a hand-written walker: a walker must be
+/// re-synced every time the IR grows a variant, and a missed read form is
+/// a SILENT wrong answer (the register would never be filled, so
+/// `${PIPESTATUS[i]}` would read 0). The Debug form carries every string
+/// the IR holds, so this cannot under-detect; the only failure mode is
+/// over-approximating, which merely keeps the capture.
+///
+/// Pure and program-scoped (no install/static), so any backend can call
+/// it once per render and every backend agrees on the answer.
+pub fn program_observes_pipestatus(prog: &IrProgram) -> bool {
+    format!("{:?}", (&prog.stmts, &prog.subs)).contains("PIPESTATUS")
+}
+
 pub fn install_unread_status_writes(prog: &IrProgram, errexit: bool) {
     if errexit {
         *LASTEXIT_UNREAD.lock().unwrap() = Some(HashSet::new());
@@ -1427,6 +1462,48 @@ fn loop_persist_needed(stmt: &IrStmt, var: &str) -> bool {
 /// reached through fnCall dispatch). An over-approximated writer would
 /// shadow a LIVE write and break `$?`, so the set is exactly the runtime
 /// truth.
+/// Is this statement the CORE's process-substitution temp cleanup — the
+/// `rm -f __ps_tmpN…` that `transforms/process_subst.rs::rm_exec` appends as
+/// the LAST statement of the block it synthesizes (`diff <(a) <(b)` → mktemp
+/// assigns, producer redirects, the consumer, then this).
+///
+/// It is bash's OWN bookkeeping, not a source command: bash removes those
+/// files itself, outside the program's status flow. Every renderer therefore
+/// carries the consumer's status across it — Rust's block arm emits
+/// `let __ps_saved_rc = …` / `store(__ps_saved_rc, …)` around it, fish's
+/// block arm does the same, Perl bakes `$__ps_statusN = $CHILD_ERROR` /
+/// `$CHILD_ERROR = $__ps_statusN`. Recognising it in ONE place keeps the
+/// status analysis and those renderers agreeing on which `rm` is synthetic.
+pub fn is_ps_tmp_cleanup(stmt: &IrStmt) -> bool {
+    let IrStmt::Exec {
+        cmd,
+        args,
+        capture,
+        redirects,
+        env,
+        ..
+    } = stmt
+    else {
+        return false;
+    };
+    if capture.is_some() || !redirects.is_empty() || !env.is_empty() {
+        return false;
+    }
+    match cmd {
+        IrExpr::Str(s, _) if s == "rm" => {}
+        _ => return false,
+    }
+    let mut tmps = 0usize;
+    for a in args {
+        match a {
+            IrExpr::Str(s, _) if s == "-f" => {}
+            IrExpr::Var(v, _) | IrExpr::Ident(v) if v.starts_with("__ps_tmp") => tmps += 1,
+            _ => return false,
+        }
+    }
+    tmps > 0
+}
+
 pub(crate) fn ir_stmt_writes_lastexit(stmt: &IrStmt) -> bool {
     match stmt {
         IrStmt::Exec {
@@ -1435,6 +1512,18 @@ pub(crate) fn ir_stmt_writes_lastexit(stmt: &IrStmt) -> bool {
             env,
             ..
         } => {
+            // The synthesized process-substitution cleanup writes a status
+            // at RUNTIME but is transparent to `$?` — every renderer saves
+            // and restores the consumer's status around it (see
+            // `is_ps_tmp_cleanup`). Counting it as a write let it SHADOW
+            // the consumer's write in the backward scan, so the verdict
+            // stripped the consumer's `__SH_RC.store` and
+            // `cmp -s <(echo b) <(echo c); echo $?` reported the cleanup's
+            // 0 instead of cmp's 1 (070_cmp_basic, 000__04h,
+            // 064_01_complex_nested_subshells, process-substitution).
+            if is_ps_tmp_cleanup(stmt) {
+                return false;
+            }
             if !redirects.is_empty() || !env.is_empty() {
                 return true; // the runtime dispatch records its own status
             }
@@ -2990,6 +3079,61 @@ fn pure_bool_operand(x: &IrExpr) -> bool {
     }
 }
 
+/// The ARITH-CONDITION twin of [`is_pure_test_chain`], used ONLY by the
+/// ESTree emitter's condition deadness analysis ([`compute_test_cond_deadness`])
+/// — deliberately not folded into `is_pure_test_chain`, whose other
+/// consumers (the perl renderer's chain logic) would change emission.
+///
+/// An `(( ARITH ))` / `let ARITH` guard whose every arg parses natively
+/// ([`try_native_let`]'s eligibility, mirrored) lowers to a
+/// status-recording ternary: `cond ? (sh2.lastExit = 0, true) :
+/// (sh2.lastExit = 1, false)`. The expression's own writes (`((i++))`,
+/// `((a=b))`) are NOT status writes and stay; only the `$?` record is
+/// droppable. It is droppable under exactly the `test`-chain rule: the
+/// guard's VALUE (bash: 1 iff the arith is nonzero) is truthiness-identical
+/// to the raw value, so the bare numeric expression is the exact
+/// condition — see [`try_native_let_dead`] (the unstatused lowering) and
+/// `unwrap_test_bool` (which drops the redundant `? 1 : 0`).
+fn is_native_arith_cond(e: &IrExpr) -> bool {
+    match e {
+        IrExpr::Call { func, args } if func == "exec" || func == "builtin" => {
+            matches!(args.as_slice(), [IrExpr::Str(n, _), IrExpr::Array(a)]
+                if n == "let"
+                    && !a.is_empty()
+                    && a.iter().all(|x| matches!(x, IrExpr::Str(sv, _)
+                        if native_arith_text_len(sv).is_some())))
+        }
+        _ => false,
+    }
+}
+
+/// A condition whose STATUS write the emitter may drop when nothing reads
+/// `$?` — the `test`-chain shapes ([`is_pure_test_chain`]) plus the native
+/// arith guards ([`is_native_arith_cond`]), recursively through the
+/// `!` / `&&` / `||` wrappers the frontends build for `until` and compound
+/// guards (`until (( … ))` arrives as `Not(arith)`, `((a)) && [[ … ]]` as
+/// `And`, …). Every leaf's VALUE equals its exit status, so the unstatused
+/// chain (`&&`/`||` → plain JS, `!` → bare negation — the emitter's
+/// TEST_UNSTATUSED_DEPTH paths) is the exact boolean.
+fn is_dead_status_cond(e: &IrExpr) -> bool {
+    if is_pure_test_chain(e) || is_native_arith_cond(e) {
+        return true;
+    }
+    match e {
+        IrExpr::BinOp {
+            op: BinOpKind::And | BinOpKind::Or,
+            lhs,
+            rhs,
+        } => is_dead_status_cond(lhs) && is_dead_status_cond(rhs),
+        IrExpr::BinOp {
+            op: BinOpKind::Not,
+            lhs,
+            ..
+        } => is_dead_status_cond(lhs),
+        _ => false,
+    }
+}
+
 fn compute_test_cond_deadness(stmts: &[IrStmt], live: &HashSet<usize>) -> HashMap<usize, bool> {
     fn mark(stmts: &[IrStmt], live: &HashSet<usize>, dead: &mut HashMap<usize, bool>) {
         for stmt in stmts {
@@ -3002,7 +3146,7 @@ fn compute_test_cond_deadness(stmts: &[IrStmt], live: &HashSet<usize>) -> HashMa
                     else_,
                     ..
                 } => {
-                    if is_pure_test_chain(cond) {
+                    if is_dead_status_cond(cond) {
                         let mut top = lastexit_scan_top_read(then, self_live);
                         for (_, arm) in elsifs {
                             top |= lastexit_scan_top_read(arm, self_live);
@@ -3014,7 +3158,7 @@ fn compute_test_cond_deadness(stmts: &[IrStmt], live: &HashSet<usize>) -> HashMa
                     }
                 }
                 IrStmt::While { cond, body, .. } => {
-                    if is_pure_test_chain(cond) {
+                    if is_dead_status_cond(cond) {
                         if !lastexit_scan_top_read(body, self_live) {
                             dead.insert(stmt as *const IrStmt as usize, true);
                         }
@@ -4242,6 +4386,7 @@ pub(crate) const SYNC_BUILTINS: &[&str] = &[
     "hostname",
     "id",
     "let",
+    "ln",
     "local",
     "ls",
     "mapfile",
@@ -4269,6 +4414,7 @@ pub(crate) const SYNC_BUILTINS: &[&str] = &[
     "sort",
     "source",
     "stat",
+    "strings",
     "tail",
     "tee",
     "test",
@@ -4959,6 +5105,36 @@ fn collect_fn_calls(stmts: &[IrStmt], functions: &HashSet<String>, out: &mut Has
     walk_stmts(stmts, functions, out);
 }
 
+/// `SH2_ASSUME_FN_DYNAMIC` (default ON) — a DYNAMICALLY-named command site
+/// (`"$@"`, `"${cmd[@]}"`, `$f`, an interpolated command word) never
+/// resolves to a SCRIPT-DEFINED function, so it is not a call site of any
+/// defined function and cannot disqualify one from the native echo/printf
+/// lowering (see [`native_echo_fn_set`]).
+///
+/// Why this matters: the conservative reading is that a dynamic command word
+/// is a potential site of EVERY defined function — so ONE `"$@" >file`
+/// (the corpus's ubiquitous `capture`/`try` helper, which runs its
+/// positional command under a redirect) makes the native-echo set EMPTY for
+/// the whole program. That is the single reason `echo`/`printf` inside
+/// ordinary script functions still emit `sh2.builtin(...)` dispatches
+/// (id-cmdsub / readonly-cmdsub / tty-cmdsub / realpath-cmdsub /
+/// 064_23 trap helpers — ~30 sites). Under this assumption the only
+/// disqualifiers left are STATIC call sites in a swapped sink (exact) and
+/// the callee-closure propagation (exact), so every function that is
+/// provably called only at the default stdout sink lowers its echo/printf
+/// to a native `process.stdout.write`.
+///
+/// The assumption is about the executed environment, not about the source:
+/// a dynamic command word names the external command/builtin the script
+/// supplies at runtime. A script that stores its OWN function's name and
+/// invokes it through a redirection would lose that redirection on the
+/// function's echo output — `SH2_ASSUME_FN_DYNAMIC=0` restores the
+/// conservative blanket refusal (byte-identical to the pre-change
+/// emission).
+fn assume_fn_dynamic() -> bool {
+    std::env::var("SH2_ASSUME_FN_DYNAMIC").map_or(true, |v| v != "0")
+}
+
 /// Defined functions whose bodies may lower `echo`/`printf` to native
 /// `process.stdout.write` (see [`NATIVE_ECHO_FNS`]): the define arrow is
 /// emitted WITHOUT the sink-depth bump, so the body's echo/printf go
@@ -4971,7 +5147,11 @@ fn collect_fn_calls(stmts: &[IrStmt], functions: &HashSet<String>, out: &mut Has
 ///     body, which is the same disqualifier);
 ///   * no DYNAMIC-name exec / `command` site inside a swapped context —
 ///     the runtime dispatch resolves any defined function by name, so a
-///     dynamic site is a potential site of every function;
+///     dynamic site is a potential site of every function. ASSUMPTION:
+///     [`assume_fn_dynamic`] (default ON) treats a dynamic command word as
+///     an external command/builtin, not a script function, so this blanket
+///     disqualifier is OFF by default (`SH2_ASSUME_FN_DYNAMIC=0` restores
+///     the conservative reading);
 ///   * no persistent fd-1 redirect anywhere (`exec >file` — the global
 ///     PROGRAM_PERSIST_FD1 guard already suppresses native echo
 ///     everywhere, so the set is empty then anyway).
@@ -5004,7 +5184,22 @@ fn native_echo_fn_set(prog: &IrProgram, functions: &HashSet<String>) -> HashSet<
                 // inside command substitution was marked native-echo and
                 // its output leaked (the cross-backend runtime extglob
                 // matcher's recursion).
-                let site_swapped = swapped || !redirects.is_empty() || capture.is_some();
+                //
+                // Only an fd-1 spec swaps the sink — the SAME rule the
+                // emission uses ([`redirect_specs_touch_fd1`]): an fd-0
+                // input redirect (`capture ... < /dev/tty`) or an fd-2-only
+                // redirect leaves fd 1 on the default stdout, so the call
+                // site is still default-sink (tty-cmdsub's `capture … <
+                // "$TTY_DEV"` family). Malformed spec objects stay
+                // conservative (treated as touching fd 1).
+                let site_swapped = swapped
+                    || capture.is_some()
+                    || redirects.iter().any(|r| match r {
+                        IrExpr::Object(props) => props
+                            .iter()
+                            .any(|(k, v)| k == "fd" && matches!(v, IrExpr::Int(1))),
+                        _ => true,
+                    });
                 match cmd {
                     IrExpr::Str(name, _) => {
                         if functions.contains(name) {
@@ -5025,7 +5220,7 @@ fn native_echo_fn_set(prog: &IrProgram, functions: &HashSet<String>) -> HashSet<
                                         // `command -v F` / `-V` never call
                                         IrExpr::Str(f, _) if f.starts_with('-') => {}
                                         _ => {
-                                            if site_swapped {
+                                            if site_swapped && !assume_fn_dynamic() {
                                                 *bad_all = true;
                                             }
                                         }
@@ -5036,8 +5231,8 @@ fn native_echo_fn_set(prog: &IrProgram, functions: &HashSet<String>) -> HashSet<
                     }
                     _ => {
                         // dynamic command name — a potential site of any
-                        // defined function
-                        if site_swapped {
+                        // defined function (see [`assume_fn_dynamic`])
+                        if site_swapped && !assume_fn_dynamic() {
                             *bad_all = true;
                         }
                     }
@@ -5047,10 +5242,17 @@ fn native_echo_fn_set(prog: &IrProgram, functions: &HashSet<String>) -> HashSet<
                 }
             }
             IrStmt::Expr(e) => expr_walk(e, swapped, functions, bad, bad_all),
-            // a redirect body runs with swapped fdTargets
-            IrStmt::Redirect { inner, .. } => {
+            // a redirect body runs with swapped fdTargets — but only when a
+            // spec touches fd 1 (the emission's
+            // [`redirect_specs_touch_fd1`] rule); an fd-0/fd-2-only
+            // redirect leaves the body's stdout sink alone.
+            IrStmt::Redirect { inner, redirects } => {
+                let sw = swapped
+                    || redirects
+                        .iter()
+                        .any(|r| r.fd.map_or(false, |fd| fd == 1));
                 for b in inner {
-                    stmt_walk(b, true, functions, bad, bad_all);
+                    stmt_walk(b, sw, functions, bad, bad_all);
                 }
             }
             // pipeline stages run with swapped fdTargets
@@ -5176,7 +5378,7 @@ fn native_echo_fn_set(prog: &IrProgram, functions: &HashSet<String>) -> HashSet<
                                         }
                                         IrExpr::Str(f, _) if f.starts_with('-') => {}
                                         _ => {
-                                            if site_swapped {
+                                            if site_swapped && !assume_fn_dynamic() {
                                                 *bad_all = true;
                                             }
                                         }
@@ -5184,7 +5386,7 @@ fn native_echo_fn_set(prog: &IrProgram, functions: &HashSet<String>) -> HashSet<
                                 }
                             }
                         }
-                    } else if site_swapped {
+                    } else if site_swapped && !assume_fn_dynamic() {
                         *bad_all = true;
                     }
                 }
@@ -20530,6 +20732,37 @@ fn arith_len_scalar_read(name: &str) -> Expr {
 /// (array length) / `__sh2lens_<name>` (scalar length); the Var arm of
 /// the JS emission decodes it back to the runtime-exact length leaf).
 /// `None` for any other name (a real variable — parse normally).
+///
+/// The placeholder-name decoder for a `$N` POSITIONAL arith ref
+/// ([`arith_text_dollar_strip`] replaces `$1`..`$9` with `__sh2pos_N`).
+/// The leaf is `Number(<positional read>) || 0` — the runtime's own
+/// numeric coercion of the substituted text under the
+/// SH2_ASSUME_ARITH_VARS assumption (a positional holds a canonical
+/// decimal; empty/unset → 0, exactly bash's empty substitution where the
+/// remaining text still parses — the unset gate in [`native_arith_text`]
+/// guarantees that much).
+fn arith_pos_leaf(name: &str) -> Option<Expr> {
+    let d = name.strip_prefix("__sh2pos_")?;
+    if d.len() != 1 || !matches!(d.as_bytes()[0], b'1'..=b'9') {
+        return None;
+    }
+    Some(Expr::LogicalExpression {
+        operator: "||".to_string(),
+        left: Box::new(Expr::CallExpression {
+            callee: Box::new(Expr::Identifier {
+                name: "Number".to_string(),
+            }),
+            arguments: vec![positional_read(d)?],
+            optional: false,
+        }),
+        right: Box::new(Expr::Literal {
+            value: serde_json::Value::from(0),
+            raw: None,
+            regex: None,
+        }),
+    })
+}
+
 fn arith_len_leaf(name: &str) -> Option<Expr> {
     if let Some(rest) = name.strip_prefix("__sh2lena_") {
         if plain_ident(rest) {
@@ -21022,8 +21255,12 @@ fn arith_to_estree(a: &ArithAst) -> Expr {
             // `${#name[@]}` / `${#name}` length refs arrive as the
             // self-describing placeholders [`native_arith_text_len`]
             // substituted — decode to the runtime-exact length leaf;
-            // any other name is a plain variable read.
+            // `$1`..`$9` arrive as `__sh2pos_N` ([`arith_text_dollar_strip`])
+            // — decode to the positional read; any other name is a plain
+            // variable read.
             if let Some(leaf) = arith_len_leaf(name) {
+                leaf
+            } else if let Some(leaf) = arith_pos_leaf(name) {
                 leaf
             } else {
                 arith_var_read(name)
@@ -22585,6 +22822,18 @@ fn declare_sources_impl(
             IrExpr::Array(elems) if elems.len() == 1 && dyn_values => {
                 value_of(&elems[0], dyn_values)
             }
+            // The shell frontend's command-substitution NODE (`$(...)` —
+            // quoted or unquoted; `native` is the word-split marker, which
+            // is IRRELEVANT here: bash does NOT word-split in assignment
+            // context, so the value is always the RAW capture text). The
+            // emission re-emits the capture (expr_to_estree) — the exact
+            // value the runtime builtin's pre-evaluated arg held — minus
+            // the local dispatch and the store round-trip. The sibling
+            // Call{func:"capture"} arms above cover the frontends that
+            // spell the same node as a call; this is the shell path's
+            // spelling (the gap that kept every `local x="$(...)"` on the
+            // runtime builtin).
+            IrExpr::Capture { .. } if dyn_values => Some(e.clone()),
             IrExpr::Arith(_) if dyn_values => Some(e.clone()),
             IrExpr::Call { func, args } if func == "getVar" => match args.as_slice() {
                 // positional (`$1`..`$9`, `$@`, `$*` — the string-valued
@@ -23979,7 +24228,33 @@ fn arith_text_dollar_strip(t: &str) -> Option<(String, Vec<(usize, usize, String
                 .take_while(|c| c.is_ascii_alphanumeric() || *c == '_')
                 .count();
             if len == 0 {
-                return None; // `$@` `$#` `$?` `$$` `$1` `$(cmd)` — runtime-only
+                return None; // `$@` `$#` `$?` `$$` `$(cmd)` — runtime-only
+            }
+            // `$1`..`$9` — a POSITIONAL arith ref: bash substitutes the
+            // positional's text, which evalArith then parses as a number.
+            // A native lowering is exact under the SAME "canonical
+            // decimal" assumption the named refs already make
+            // (SH2_ASSUME_ARITH_VARS): `Number(sh2.positional[i-1] ?? "")
+            // || 0` is the runtime's own numeric coercion of the value
+            // (unset/empty → 0, exactly bash). Encoded as a
+            // self-describing placeholder decoded by [`arith_pos_leaf`].
+            if rest.as_bytes()[0].is_ascii_digit() {
+                let dlen = rest
+                    .chars()
+                    .take_while(|c| c.is_ascii_digit())
+                    .count();
+                let digits = &rest[..dlen];
+                if digits.len() != 1 || digits == "0" {
+                    return None; // `$0` / multi-digit (`$10` is `${1}0` in bash)
+                }
+                if i + 1 + dlen < n && bytes[i + 1 + dlen] == b'$' {
+                    return None; // adjacent refs concatenate
+                }
+                refs.push((i, i + 1 + dlen, format!("__sh2pos_{digits}")));
+                out.push_str("__sh2pos_");
+                out.push_str(digits);
+                i += 1 + dlen;
+                continue;
             }
             (&rest[..len], 1 + len)
         };
@@ -24832,6 +25107,12 @@ pub(crate) fn numeric_lift_vars(prog: &IrProgram) -> HashSet<String> {
                         // string-lift walker's exemption.
                         if func == "param" && i == 1 {
                             if let IrExpr::Str(n, _) = a {
+                                // A BARE arithmetic subscript (`args[i]`) is
+                                // resolved from the STORE by the runtime's
+                                // evalArith — mark it, or a lifted index var
+                                // reads element 0 forever. The `$ref` parts
+                                // stay exempt (native key reads).
+                                mark_subscript_idents(n, string_ctx);
                                 if subscript_keys_assumed_clean()
                                     && baked_subscript_read(n).is_some()
                                 {
@@ -24850,6 +25131,10 @@ pub(crate) fn numeric_lift_vars(prog: &IrProgram) -> HashSet<String> {
                         // — `array_index_key_expr` returns None there).
                         if func == "arrayIndex" && i == 1 {
                             if let IrExpr::Str(n, _) = a {
+                                // A BARE identifier key is arithmetic text
+                                // the runtime resolves from the STORE
+                                // (`arrayIndex("a", "i")` → evalArith("i")).
+                                mark_key_idents(n, string_ctx);
                                 if subscript_keys_assumed_clean()
                                     && array_index_key_expr(n).is_some()
                                 {
@@ -25102,6 +25387,11 @@ pub(crate) fn numeric_lift_vars(prog: &IrProgram) -> HashSet<String> {
                             // the store and the write would land on a stale
                             // index/key).
                             mark_string_refs(&t.var, string_ctx);
+                            // ...and the BARE arithmetic identifiers too
+                            // (`arr[i]=v` — an indexed subscript is
+                            // arithmetic; a lifted `i` would write every
+                            // element at index 0).
+                            mark_subscript_idents(&t.var, string_ctx);
                         }
                     } else {
                         excluded.insert(t.var.clone());
@@ -27611,9 +27901,14 @@ struct ArrayScope {
     /// fallback-deadness (`sh2.vars.V ?? …` needs V provably set — a
     /// numeric header init dominating the use qualifies).
     cstyle_headers: Vec<(String, usize)>,
-    /// cstyle-loop headers (raw strings + top ancestor idx) for
-    /// fallback-deadness (`sh2.vars.V ?? …` needs V provably set — a
-    /// numeric header init dominating the use qualifies).
+    /// Set while walking a literal in a position the runtime can NEVER
+    /// expand — the argument subtree of a plain JS member call the emitter
+    /// generates itself (`process.stdout.write("prose")`). Only an
+    /// `sh2.*`/user-call argument can mention an array by name (`$NAME`, a
+    /// nameref value, an arith identifier); plain DATA cannot, so a prose
+    /// word equal to the name must not veto the fold. `false` (the
+    /// default) counts mentions (fail-closed).
+    no_expand_ctx: bool,
     /// dynamic-name call, eval/await-class, opaque call, recursion-call,
     /// non-Identifier binding of the name, or unknown shape seen.
     poisoned: bool,
@@ -27701,8 +27996,42 @@ fn array_index_key(s: &str) -> Option<i64> {
 /// `top_idx` is the index of the enclosing direct-child statement
 /// (ordering: appends must come after the init; joins may precede —
 /// empty reads are identical on a missing store array and `[]`).
+///
+/// Literal-mention CONTEXT: a string literal is only a potential store
+/// reference (`$NAME` / a nameref value / an arith identifier) when the
+/// runtime could EXPAND it, i.e. when it sits inside an `sh2.*` call's
+/// argument subtree (setVar/test/arith/param/setArray/exec/…) or inside
+/// a user/unknown function call's arguments (a callee the runtime may
+/// forward into such a helper). A literal that is merely DATA — the
+/// argument of a plain JS member call the emitter generates itself
+/// (`process.stdout.write("Array: …")`, `String(…)`, a native array
+/// method) — is never re-scanned by the runtime, so a prose word that
+/// happens to equal the array's name must not veto the fold. (Measured:
+/// `062_14_complex_array_operations.sh` prints "Testing complex array
+/// operations…" — the word "array" in that PROSE blocked the whole fold.)
 #[allow(clippy::too_many_arguments)]
 fn array_scan_expr(e: &Expr, name: &str, scope: &mut ArrayScope, top_idx: usize) {
+    if let Expr::CallExpression { callee, .. } = e {
+        // The callee decides the expansion context of its argument
+        // subtree: an `sh2.*` member call or a bare/unknown callee may
+        // expand (count mentions); a plain JS member call the emitter
+        // emits itself never does.
+        let prev = scope.no_expand_ctx;
+        scope.no_expand_ctx = match callee.as_ref() {
+            Expr::MemberExpression { object, .. } => {
+                !matches!(object.as_ref(), Expr::Identifier { name: o } if o == "sh2")
+            }
+            _ => false,
+        };
+        array_scan_expr_inner(e, name, scope, top_idx);
+        scope.no_expand_ctx = prev;
+        return;
+    }
+    array_scan_expr_inner(e, name, scope, top_idx);
+}
+
+#[allow(clippy::too_many_arguments)]
+fn array_scan_expr_inner(e: &Expr, name: &str, scope: &mut ArrayScope, top_idx: usize) {
     match e {
         Expr::AssignmentPattern { left, right } => {
             array_scan_expr(left, name, scope, top_idx);
@@ -28034,6 +28363,11 @@ fn array_scan_expr(e: &Expr, name: &str, scope: &mut ArrayScope, top_idx: usize)
         Expr::Literal { value, .. } => {
             // Mention-matching (not exact): baked `NAME[i]` writes,
             // `ref=NAME` nameref decls, and literal text all refuse.
+            // Only in an EXPANDABLE position (see [`array_scan_expr`]):
+            // plain data the emitter prints verbatim is not a reference.
+            if scope.no_expand_ctx {
+                return;
+            }
             if let Some(s) = value.as_str() {
                 if array_str_mentions(s, name) {
                     scope.str_refs += 1;
@@ -30433,47 +30767,78 @@ fn array_decide(
 /// or 3-arg falsy-isAssoc with array): (name, child index). Element
 /// purity/inertness and emptiness are validated by the full scan +
 /// decision (non-Array second args never match here).
+///
+/// The `sh2.setArray(...)` init call of a statement expression, in BOTH
+/// emitted shapes:
+///   - a bare `sh2.setArray(NAME, [...], false)` expression statement (the
+///     plain `arr=(...)` assignment), and
+///   - the DECLARATION form `(sh2.setArray(...), sh2.lastExit = 0[, true])`
+///     that `try_native_array_declare` emits for `declare -a` / `local -a`
+///     / `typeset -a` / `readonly -a`.
+/// The sequence wrapper used to make every declared array invisible to the
+/// migration below (`array_direct_inits` only matched a bare call), so
+/// `declare -a a=(x y)` kept the whole `setArray`/`arrayIndex`/`arrayLen`/
+/// `arrayValues` store protocol while the identical `a=(x y)` became a
+/// native JS array. Returns the call's argument slice.
+fn array_init_call(e: &Expr) -> Option<&[Expr]> {
+    fn call_args(e: &Expr) -> Option<&[Expr]> {
+        if let Expr::CallExpression { callee, arguments, .. } = e {
+            if let Expr::MemberExpression {
+                object,
+                property,
+                computed: false,
+                ..
+            } = callee.as_ref()
+            {
+                if matches!(object.as_ref(), Expr::Identifier { name: o } if o == "sh2")
+                    && matches!(property.as_ref(), Expr::Identifier { name: f } if f == "setArray")
+                {
+                    return Some(arguments);
+                }
+            }
+        }
+        None
+    }
+    if let Some(args) = call_args(e) {
+        return Some(args);
+    }
+    if let Expr::SequenceExpression { expressions } = e {
+        if let Some(first) = expressions.first() {
+            return call_args(first);
+        }
+    }
+    None
+}
+
+/// `setArray` argument list → the array's name, for a 2-arg call or the
+/// 3-arg form whose `isAssoc` is falsy (the assoc/`declare -A` forms are
+/// not native arrays).
+fn array_init_name(args: &[Expr]) -> Option<String> {
+    match args {
+        [Expr::Literal { value: nm, .. }, Expr::ArrayExpression { .. }] => {
+            nm.as_str().filter(|s| !s.is_empty()).map(|s| s.to_string())
+        }
+        [Expr::Literal { value: nm, .. }, Expr::ArrayExpression { .. }, Expr::Literal { value: assoc, .. }] => {
+            let falsy = assoc.as_bool() == Some(false)
+                || assoc.as_i64() == Some(0)
+                || assoc.as_str() == Some("")
+                || assoc.is_null();
+            if falsy {
+                nm.as_str().filter(|s| !s.is_empty()).map(|s| s.to_string())
+            } else {
+                None
+            }
+        }
+        _ => None,
+    }
+}
+
 fn array_direct_inits(body: &[Stmt]) -> Vec<(String, usize)> {
     let mut out = vec![];
     for (idx, st) in body.iter().enumerate() {
         if let Stmt::ExpressionStatement { expression } = st {
-            if let Expr::CallExpression { callee, arguments, .. } = expression {
-                if let Expr::MemberExpression {
-                    object,
-                    property,
-                    computed: false,
-                    ..
-                } = callee.as_ref()
-                {
-                    if !matches!(object.as_ref(), Expr::Identifier { name: o } if o == "sh2")
-                        || !matches!(property.as_ref(), Expr::Identifier { name: f } if f == "setArray")
-                    {
-                        continue;
-                    }
-                    let array_init = |args: &[Expr]| -> Option<String> {
-                        match args {
-                            [Expr::Literal { value: nm, .. }, Expr::ArrayExpression { .. }] => {
-                                nm.as_str().filter(|s| !s.is_empty()).map(|s| s.to_string())
-                            }
-                            [Expr::Literal { value: nm, .. }, Expr::ArrayExpression { .. }, Expr::Literal { value: assoc, .. }] =>
-                            {
-                                let falsy = assoc.as_bool() == Some(false)
-                                    || assoc.as_i64() == Some(0)
-                                    || assoc.as_str() == Some("")
-                                    || assoc.is_null();
-                                if falsy {
-                                    nm.as_str().filter(|s| !s.is_empty()).map(|s| s.to_string())
-                                } else {
-                                    None
-                                }
-                            }
-                            _ => None,
-                        }
-                    };
-                    if let Some(nm) = array_init(arguments) {
-                        out.push((nm, idx));
-                    }
-                }
+            if let Some(nm) = array_init_call(expression).and_then(array_init_name) {
+                out.push((nm, idx));
             }
         }
     }
@@ -30695,27 +31060,44 @@ fn array_migrate_scope(
         // Rewrite: remove the init, insert `const NAME = [es]` at top
         // (after directives; elements move verbatim — purity verified
         // at scan, inertness at decision), rewrite appends/reads.
-        let init_elements: Vec<Option<Expr>> = match live_body.get(init_idx) {
+        // The init statement's array elements, plus the TAIL expressions a
+        // declaration-shaped init carries after the `setArray` call
+        // (`(sh2.setArray(...), sh2.lastExit = 0[, true])` — the declare's
+        // status record). The tail must survive as its own statement: it is
+        // `$?`-observable, so it cannot be dropped with the init.
+        let (init_elements, init_tail): (Vec<Option<Expr>>, Vec<Expr>) = match live_body.get(init_idx) {
             Some(Stmt::ExpressionStatement { expression }) => {
-                if let Expr::CallExpression { arguments, .. } = expression {
-                    // Second arg is the array (2-arg, or 3-arg with
-                    // falsy isAssoc — validated at decision).
-                    arguments
-                        .get(1)
-                        .and_then(|a| match a {
-                            Expr::ArrayExpression { elements, .. } => {
-                                Some(elements.clone())
-                            }
+                let tail = match expression {
+                    Expr::SequenceExpression { expressions } => expressions[1..].to_vec(),
+                    _ => vec![],
+                };
+                let elements = array_init_call(expression)
+                    .and_then(|arguments| {
+                        // Second arg is the array (2-arg, or 3-arg with
+                        // falsy isAssoc — validated at decision).
+                        arguments.get(1).and_then(|a| match a {
+                            Expr::ArrayExpression { elements, .. } => Some(elements.clone()),
                             _ => None,
                         })
-                        .unwrap_or_default()
-                } else {
-                    vec![]
-                }
+                    })
+                    .unwrap_or_default();
+                (elements, tail)
             }
-            _ => vec![],
+            _ => (vec![], vec![]),
         };
         live_body.remove(init_idx);
+        if !init_tail.is_empty() {
+            // keep the declaration's own status record in place
+            let tail_expr = if init_tail.len() == 1 {
+                init_tail.into_iter().next().expect("len checked")
+            } else {
+                Expr::SequenceExpression { expressions: init_tail }
+            };
+            live_body.insert(
+                init_idx.min(live_body.len()),
+                Stmt::ExpressionStatement { expression: tail_expr },
+            );
+        }
         let mut insert_at = 0usize;
         while insert_at < live_body.len() {
             if let Stmt::ExpressionStatement { expression } = &live_body[insert_at] {
@@ -32808,6 +33190,13 @@ pub fn shir_to_estree(prog: &IrProgram) -> Program {
     // (the getVar arms consult it) and after the transforms (the write
     // scan must see the same shape the emitter will emit).
     *NEVER_WRITTEN.lock().unwrap() = collect_never_written(prog);
+    // Compile-time IFS for the native `while read` line loop: only when the
+    // program never writes it anywhere (see [`ifs_quiet`]).
+    *IFS_QUIET.lock().unwrap() = Some(
+        collect_never_written(prog)
+            .map(|w| !w.contains("IFS"))
+            .unwrap_or(false),
+    );
     // Provably-array-only-written names (SH2_ASSUME_ARRAY_SLICE — the
     // plain-name `${arr:off:len}` slice lowering's array-vs-scalar
     // proof). Set alongside NEVER_WRITTEN (same shape the emitter sees).
@@ -38051,6 +38440,13 @@ fn stmt_to_estree(stmt: &IrStmt) -> Option<Stmt> {
                 })
                 .collect();
             let redirect_specs = RedirectSpec::triples(&rs);
+            // `while read …; do …; done < FILE|<<<TEXT|<<EOF`: the whole
+            // redirect + runtime `read`-per-line pair collapses to ONE
+            // native line loop (`sh2.fs.readText` once, `split("\n")` once,
+            // a plain `for…of`; see `try_native_read_loop`).
+            if let Some(native) = try_native_read_loop(inner, &rs) {
+                return Some(native);
+            }
             if let Some(native) =
                 try_native_echo_redirect(inner, &redirect_specs, stmt_status_write_is_unread(stmt))
             {
@@ -38095,6 +38491,15 @@ fn stmt_to_estree(stmt: &IrStmt) -> Option<Stmt> {
             // redirect shape). Persistent (`exec`-installed) redirects keep
             // the general form.
             if let Some(native) = try_builtin_redirect_collapse(inner, redirects, &redirect_specs, persist) {
+                return Some(Stmt::ExpressionStatement { expression: native });
+            }
+            // `CMD ARGS > f` where CMD is the async exec bridge (a spawned
+            // external command): the SAME collapse one rung down — the
+            // redirect wrapper and the exec call become one
+            // `sh2.execRedirect(NAME, ARGS[, ENV], SPECS)`.
+            if let Some(native) =
+                try_exec_redirect_collapse(inner, redirects, &redirect_specs, persist)
+            {
                 return Some(Stmt::ExpressionStatement { expression: native });
             }
             // Only fd-1 specs swap the body's stdout sink (see
@@ -39196,7 +39601,7 @@ fn redirect_body_expr(inner: &[IrStmt], touch_fd1: bool) -> Option<Expr> {
 /// calls ALL THE WAY DOWN? `call_free_expr` covers expression nodes but does
 /// not recurse into object literals — and the redirect spec's `target` lives
 /// in one, so a `$(...)`-bearing target would slip through. Walk the array /
-/// object containers here and delegate the leaves to `call_free_expr`.
+/// object containers here and delegate the leaves to `redirect_part_pure`.
 fn redirect_parts_are_pure(e: &Expr) -> bool {
     match e {
         Expr::ArrayExpression { elements } => {
@@ -39205,7 +39610,140 @@ fn redirect_parts_are_pure(e: &Expr) -> bool {
         Expr::ObjectExpression { properties } => {
             properties.iter().all(|p| redirect_parts_are_pure(&p.value))
         }
-        _ => call_free_expr(e).is_some(),
+        _ => redirect_part_pure(e),
+    }
+}
+
+/// The observable-effect test for ONE redirect-collapse part.
+///
+/// The collapse reorders evaluation: the collapsed `sh2.builtin(NAME, ARGS,
+/// ENV, SPECS)` call evaluates ARGS before SPECS, whereas the wrapper form
+/// ran the spec install first. Only a side-effect-free expression makes that
+/// unobservable, so [`call_free_expr`] is the baseline. It is too strict for
+/// the emitter's own value lowerings, which wrap plain reads in a PURE
+/// coercion — `String(x ?? "") + "\n"`, `Number(...)`, `Math.trunc(...)`.
+/// A call to one of those with pure arguments (and to a pure `Math.*`) has
+/// no effect, so it cannot observe the order either (the corpus's redirect
+/// targets are exactly this shape: the capture-strips `String(...).replace`
+/// chain around a store read).
+fn redirect_part_pure(e: &Expr) -> bool {
+    !has_impure_call(e)
+}
+
+/// Mirror of `call_free_expr`'s walk, but a call that provably has NO
+/// observable effect passes: a pure global coercion (`String`/`Number`/
+/// `Boolean`/`parseInt`/`parseFloat`/`isNaN`), a `Math.<fn>`, a regex
+/// literal's `.test`, or a side-effect-free string/array method on a pure
+/// receiver — all with recursively-pure arguments. Deliberately NOT
+/// whitelisted: mutating methods (`sort`/`splice`/`push`), closure-taking
+/// methods (`map`/`filter`/`forEach` — their bodies could do anything) and
+/// every `sh2.*` helper (several record `lastExit`).
+fn has_impure_call(e: &Expr) -> bool {
+    const PURE_METHODS: &[&str] = &[
+        "replace", "replaceAll", "slice", "substring", "substr", "toLowerCase", "toUpperCase",
+        "trim", "trimStart", "trimEnd", "startsWith", "endsWith", "includes", "indexOf",
+        "lastIndexOf", "split", "join", "concat", "padStart", "padEnd", "repeat", "charAt",
+        "charCodeAt", "at", "toString", "test",
+    ];
+    // `.sort()` / `.reverse()` MUTATE their receiver, so they are impure in
+    // general (`arr.sort()` reorders a live array). They are unobservable
+    // when the receiver is a temporary THIS expression just produced: the
+    // emitter's own text-pipeline lowering is exactly
+    // `String(x).split("\n").sort().join("\n")` (the native `sort` stage),
+    // whose array exists only for this chain. The corpus's process-
+    // substitution targets are that shape, and no emitted shape sorts a
+    // native array BINDING (those are read-only rows — `lower_native_arrays`
+    // never admits a write), so the receiver check is exact.
+    //
+    // This matters for the redirect collapse: a `diff <(a) <(b)` spec
+    // target is the sort chain, and refusing it left the whole
+    // `redirectSync(() => builtin(...), SPECS)` pair uncollapsed.
+    fn sorts_fresh_array(callee: &Expr) -> bool {
+        let Expr::MemberExpression {
+            object,
+            property,
+            computed: false,
+            ..
+        } = callee
+        else {
+            return false;
+        };
+        let mutating = matches!(property.as_ref(), Expr::Identifier { name }
+            if name == "sort" || name == "reverse");
+        if !mutating {
+            return false;
+        }
+        // The receiver must be a call that RETURNS a fresh array — split /
+        // concat / slice — so the mutation cannot reach any other value.
+        match object.as_ref() {
+            Expr::ArrayExpression { .. } => true,
+            Expr::CallExpression { callee, .. } => matches!(callee.as_ref(), Expr::MemberExpression {
+                property,
+                computed: false,
+                ..
+            } if matches!(property.as_ref(), Expr::Identifier { name }
+                if name == "split" || name == "concat" || name == "slice")),
+            _ => false,
+        }
+    }
+    fn pure_callee(callee: &Expr) -> bool {
+        match callee {
+            Expr::Identifier { name } => matches!(
+                name.as_str(),
+                "String" | "Number" | "Boolean" | "parseInt" | "parseFloat" | "isNaN"
+            ),
+            Expr::MemberExpression {
+                object,
+                property,
+                computed: false,
+                ..
+            } => {
+                if matches!(object.as_ref(), Expr::Identifier { name } if name == "Math") {
+                    return true;
+                }
+                // a REGEX LITERAL's method (`/x/.test(s)`, `.exec`)
+                if matches!(
+                    object.as_ref(),
+                    Expr::Literal { regex: Some(_), .. }
+                ) {
+                    return true;
+                }
+                match property.as_ref() {
+                    Expr::Identifier { name } => PURE_METHODS.contains(&name.as_str()),
+                    _ => false,
+                }
+            }
+            _ => false,
+        }
+    }
+    match e {
+        Expr::CallExpression {
+            callee, arguments, ..
+        } => {
+            !(pure_callee(callee) || sorts_fresh_array(callee))
+                || arguments.iter().any(has_impure_call)
+                || has_impure_call(callee)
+        }
+        Expr::MemberExpression { object, .. } => has_impure_call(object),
+        Expr::BinaryExpression { left, right, .. } => {
+            has_impure_call(left) || has_impure_call(right)
+        }
+        Expr::LogicalExpression { left, right, .. } => {
+            has_impure_call(left) || has_impure_call(right)
+        }
+        Expr::ConditionalExpression {
+            test,
+            consequent,
+            alternate,
+        } => has_impure_call(test) || has_impure_call(consequent) || has_impure_call(alternate),
+        Expr::AssignmentExpression { left, right, .. } => {
+            has_impure_call(left) || has_impure_call(right)
+        }
+        Expr::SequenceExpression { expressions } => expressions.iter().any(has_impure_call),
+        Expr::UnaryExpression { argument, .. } => has_impure_call(argument),
+        Expr::TemplateLiteral { expressions, .. } => expressions.iter().any(has_impure_call),
+        Expr::ArrayExpression { elements } => elements.iter().flatten().any(has_impure_call),
+        _ => false,
     }
 }
 
@@ -39238,9 +39776,20 @@ fn finish_builtin_redirect(lowered: Expr, specs: Expr) -> Option<Expr> {
     {
         return None;
     }
-    if !redirect_parts_are_pure(&specs)
-        || arguments.iter().any(|a| !redirect_parts_are_pure(a))
-    {
+    // ONLY the arguments cross the spec evaluation, so only THEY must be
+    // effect-free. Expansion order, exactly:
+    //   redirectSync(arrow, specs):  specs_ir evaluated → install (expandWord)
+    //                                → arrow runs → name, args evaluated
+    //   builtin(name, args, e, specs): name, args evaluated → specs evaluated
+    //                                → install → the builtin body runs
+    // The spec targets keep their RELATIVE order and are still evaluated
+    // before the command body, so a spec target with calls is fine (a
+    // process substitution's `…split().sort().join()` chain, or a NESTED
+    // procsub's `pipelineCaptureSync(...)` — the `diff <(sort <(grep …))`
+    // shape that stayed uncollapsed while this required pure specs too).
+    // What must not happen is an ARGUMENT that observes having moved: the
+    // arguments are the ones whose evaluation point changed.
+    if arguments.iter().any(|a| !redirect_parts_are_pure(a)) {
         return None;
     }
     match arguments.len() {
@@ -39256,6 +39805,200 @@ fn finish_builtin_redirect(lowered: Expr, specs: Expr) -> Option<Expr> {
     arguments.push(specs);
     Some(Expr::CallExpression {
         callee,
+        arguments,
+        optional,
+    })
+}
+
+/// `CMD ARGS <SPECS>` whose body lowers to exactly the async `sh2.exec`
+/// bridge → the one-call `sh2.execRedirect(NAME, ARGS[, ENV], SPECS)`
+/// form (see the redirect statement arm). The runtime twin runs the SAME
+/// `_applyRedirectSpecs` install → exec → `_ensureRedirectFiles` →
+/// restore/persist pass around the same call, so the child process sees
+/// identical fd targets and every status is identical — one call frame
+/// and one per-site arrow allocation less (the corpus's most common
+/// redirect shape: an external command with `> file` / `2> file`).
+///
+/// Eligibility mirrors [`try_builtin_redirect_collapse`] exactly:
+///  - the body is a single expression that lowers to a plain
+///    `sh2.exec(...)` call (optionally awaited);
+///  - the redirects are NOT persistent (`exec`-installed forever);
+///  - the spec expressions AND the exec's arguments are CALL-FREE — the
+///    collapsed form evaluates the arguments before the spec targets,
+///    which only a pure expression cannot observe.
+fn try_exec_redirect_collapse(
+    inner: &[IrStmt],
+    redirects: &[IrRedirect],
+    spec_triples: &[(i64, &str, &IrExpr)],
+    persist: bool,
+) -> Option<Expr> {
+    if persist || redirects.is_empty() {
+        return None;
+    }
+    let touched = redirect_specs_touch_fd1(spec_triples);
+    let lowered = redirect_body_expr(inner, touched)?;
+    let specs = array(
+        redirects
+            .iter()
+            .map(|r| redirect_spec_to_estree(r, false))
+            .collect(),
+    );
+    finish_exec_redirect(lowered, specs)
+}
+
+/// `$(PIPELINE)` — the capture body is exactly one pipeline call. The
+/// runtime capture's fd-1 buffer IS the pipeline's last-stage sink, so
+/// `captureSync(() => pipelineSync(stages[, cap]))` composes into ONE
+/// `sh2.pipelineCaptureSync(stages[, cap])` (the async pairing into
+/// `pipelineCapture`): see harness/sh2-namespace.mjs. The value, `lastExit`
+/// and `pipeStatuses` are identical — the capture's strips run over the
+/// same buffer — and one call frame plus the per-site arrow allocation go
+/// away.
+///
+/// The inner pipeline is lowered by the NORMAL pipeline arm (producer cap,
+/// native stage folding, sync-twin selection) and only its callee is
+/// renamed, so no lowering logic is duplicated here.
+fn native_capture_pipeline(inner: &IrExpr) -> Option<Expr> {
+    let IrExpr::Call { func, args } = inner else {
+        return None;
+    };
+    if func != "pipeline" && func != "pipelineSync" {
+        return None;
+    }
+    if !matches!(args.first(), Some(IrExpr::Array(_))) {
+        return None;
+    }
+    rename_pipeline_capture(expr_to_estree(inner))
+}
+
+fn rename_pipeline_capture(e: Expr) -> Option<Expr> {
+    match e {
+        Expr::AwaitExpression { argument } => {
+            let inner = rename_pipeline_capture(*argument)?;
+            Some(Expr::AwaitExpression {
+                argument: Box::new(inner),
+            })
+        }
+        Expr::CallExpression {
+            callee,
+            arguments,
+            optional,
+        } => {
+            let Expr::MemberExpression {
+                object,
+                property,
+                computed: false,
+                ..
+            } = *callee
+            else {
+                return None;
+            };
+            if !matches!(object.as_ref(), Expr::Identifier { name } if name == "sh2") {
+                return None;
+            }
+            let new_name = match property.as_ref() {
+                Expr::Identifier { name } if name == "pipelineSync" => "pipelineCaptureSync",
+                Expr::Identifier { name } if name == "pipeline" => "pipelineCapture",
+                _ => return None,
+            };
+            Some(Expr::CallExpression {
+                callee: Box::new(sh2_member(new_name)),
+                arguments,
+                optional,
+            })
+        }
+        _ => None,
+    }
+}
+
+/// The EXPRESSION-position twin of [`try_exec_redirect_collapse`]:
+/// `redirect [Arrow(stmts), specs]` (the form a pipeline stage or an
+/// `&&` operand lowers through) collapses to the same one-call shape.
+fn try_exec_redirect_call(args: &[IrExpr]) -> Option<Expr> {
+    let [IrExpr::Arrow(stmts), specs_ir] = args else {
+        return None;
+    };
+    let lowered = redirect_body_expr(stmts, redirect_call_touches_fd1(args))?;
+    let specs = expr_to_estree(specs_ir);
+    // The IR spec array never carries `persist` (the statement form adds it
+    // for `exec`-installed redirects); verify on the lowered tree so a
+    // future producer cannot bypass the general form's persist handling.
+    if let Expr::ArrayExpression { elements } = &specs {
+        for e in elements.iter().flatten() {
+            if let Expr::ObjectExpression { properties } = e {
+                if properties
+                    .iter()
+                    .any(|p| matches!(&p.key, Expr::Identifier { name } if name == "persist"))
+                {
+                    return None;
+                }
+            }
+        }
+    }
+    finish_exec_redirect(lowered, specs)
+}
+
+/// The shared tail of the exec-redirect collapse: unwrap the body's
+/// `await`, require the call to be `sh2.exec`, check purity (the collapsed
+/// argument order must be unobservable) and append the spec array, filling
+/// the runtime signature's `env` slot with null when the call has none.
+fn finish_exec_redirect(lowered: Expr, specs: Expr) -> Option<Expr> {
+    match lowered {
+        Expr::AwaitExpression { argument } => {
+            let call = finish_exec_redirect_call(*argument, specs)?;
+            Some(Expr::AwaitExpression {
+                argument: Box::new(call),
+            })
+        }
+        other => finish_exec_redirect_call(other, specs),
+    }
+}
+
+fn finish_exec_redirect_call(lowered: Expr, specs: Expr) -> Option<Expr> {
+    let Expr::CallExpression {
+        callee,
+        mut arguments,
+        optional,
+    } = lowered
+    else {
+        return None;
+    };
+    let Expr::MemberExpression {
+        object,
+        property,
+        computed: false,
+        ..
+    } = callee.as_ref()
+    else {
+        return None;
+    };
+    if !matches!(object.as_ref(), Expr::Identifier { name } if name == "sh2")
+        || !matches!(property.as_ref(), Expr::Identifier { name } if name == "exec")
+    {
+        return None;
+    }
+    // Only the ARGUMENTS move across the spec evaluation (see
+    // [`finish_builtin_redirect`]): the spec targets keep their relative
+    // order and still run before the command, so an impure spec target is
+    // fine — a nested process substitution's `pipelineCaptureSync` call is
+    // exactly that, and refusing it left `diff <(sort <(grep …)) …`
+    // uncollapsed.
+    if arguments.iter().any(|a| !redirect_parts_are_pure(a)) {
+        return None;
+    }
+    match arguments.len() {
+        // (name, args) — insert the `env` slot the runtime signature needs.
+        2 => arguments.push(Expr::Literal {
+            value: serde_json::Value::Null,
+            raw: None,
+            regex: None,
+        }),
+        3 => {}
+        _ => return None,
+    }
+    arguments.push(specs);
+    Some(Expr::CallExpression {
+        callee: Box::new(crate::estree::sh2_member("execRedirect")),
         arguments,
         optional,
     })
@@ -42625,6 +43368,621 @@ fn fd0_known_text_string(stdin: &IrExpr, mode: &str, interpolate: bool) -> Optio
     }
 }
 
+// ── `while read …; do …; done < SOURCE` → native line loop ─────────────
+//
+// THE pattern family of shell text processing: read a line, split it into
+// fields, run the body. Today it emits
+//
+//     sh2.redirectSync(() => sh2.whileLoopSync(
+//         () => sh2.builtin("read", ["-r", "name", "num"], {IFS: ":"}),
+//         () => { …body… }), [{fd:0, mode:"r", target:FILE}])
+//
+// and the runtime `read` builtin does, PER LINE: a stdout flush, an arg
+// filter, an `IFS` regexp COMPILED FROM SCRATCH (`new RegExp('[' + esc +
+// ']')`), a read-buffer lookup keyed by the fd target string, a
+// `buf.slice(...)` of the remaining text, and a `setVar` per field. The
+// cheapest correct lowering is what a hand-written JS program does:
+//
+//     const __sh2_rdt = sh2.fs.readText(FILE, 1);      // one read
+//     const __sh2_rdl = __sh2_rdt.split("\n");         // one split
+//     for (const __sh2_rdn of __sh2_rdl) { … }         // one loop
+//
+// with the IFS characters precompiled into ONE regex literal per loop and
+// the field assignment reproducing `builtins.read`'s exact model (a
+// whitespace IFS collapses runs and drops empty fields; a non-whitespace
+// IFS keeps them; the LAST name takes the remainder joined on the first
+// IFS character; no names → REPLY). Measured on this box, 100k lines:
+// 430 ms → 105 ms (~4x; bash 1.25 s).
+//
+// The read loop is a STATEMENT-level shape, so it is detected at the
+// redirect (the fd-0 source) — the same place `try_native_grep_redirect`
+// and `try_native_cat_heredoc` hook.
+
+/// The `read` call of a `while read …` condition: the field names plus the
+/// command-scoped IFS, when this is the plain shape the native line loop
+/// reproduces exactly. `None` for anything else — a flag other than `-r`
+/// (`-d`, `-n`, `-t`, `-u`, `-a`, `-s`, `-p`, `-e`), a subscripted/array
+/// name, or an IFS that is not a literal.
+fn read_loop_cond(cond: &IrExpr) -> Option<(Vec<String>, Option<String>)> {
+    let IrExpr::Call { func, args } = cond else {
+        return None;
+    };
+    if !matches!(func.as_str(), "builtin" | "exec") {
+        return None;
+    }
+    let mut it = args.iter();
+    let IrExpr::Str(name, _) = it.next()? else {
+        return None;
+    };
+    if name != "read" {
+        return None;
+    }
+    let IrExpr::Array(items) = it.next()? else {
+        return None;
+    };
+    let env = it.next();
+    if it.next().is_some() {
+        return None;
+    }
+    let mut names: Vec<String> = Vec::new();
+    for (i, item) in items.iter().enumerate() {
+        let IrExpr::Str(s, _) = item else {
+            return None;
+        };
+        // `-r` is the ONLY flag that cannot change the read model: the
+        // runtime's read never processes backslashes, so both forms are
+        // the same text (bash's non-`-r` escape handling is already
+        // absent from the runtime).
+        if i == 0 && s == "-r" {
+            continue;
+        }
+        if !is_plain_ident(s) {
+            return None;
+        }
+        names.push(s.clone());
+    }
+    // `read` with no names reads into REPLY (builtins.read's default).
+    if names.is_empty() {
+        names.push("REPLY".to_string());
+    }
+    let ifs = match env {
+        None => None,
+        Some(IrExpr::Object(props)) => {
+            let mut v: Option<String> = None;
+            for (k, val) in props {
+                if k != "IFS" {
+                    return None;
+                }
+                let IrExpr::Str(s, _) = val else {
+                    return None;
+                };
+                v = Some(s.clone());
+            }
+            v
+        }
+        Some(_) => return None,
+    };
+    Some((names, ifs))
+}
+
+/// The runtime read's IFS model as compile-time parts:
+/// `(whitespace_only, char_class_body, join_separator)`.
+/// `char_class_body` is the regex-literal body for `[...]`/`[...]+`
+/// (every regex metacharacter — including `/`, which `new RegExp` needs
+/// not escape but a literal does — backslash-escaped, exactly like
+/// `builtins.read`'s `esc`).
+fn ifs_parts(ifs: &str) -> (bool, String, String) {
+    let ws = !ifs.is_empty() && ifs.chars().all(|c| matches!(c, ' ' | '\t' | '\n'));
+    let mut cls = String::new();
+    for c in ifs.chars() {
+        if matches!(
+            c,
+            ']' | '^' | '$' | '.' | '*' | '+' | '?' | '(' | ')' | '[' | '{' | '}' | '|' | '\\' | '/'
+        ) {
+            cls.push('\\');
+        }
+        cls.push(c);
+    }
+    let sep = ifs
+        .chars()
+        .next()
+        .map(|c| c.to_string())
+        .unwrap_or_else(|| " ".to_string());
+    (ws, cls, sep)
+}
+
+/// Build the native line loop over `text` (the WHOLE input). `file` is the
+/// path expression when the text is a file read whose open can fail: the
+/// loop then runs only on a successful read, and the failure branch mirrors
+/// `_applyRedirectSpecs`' r-mode check (the `bash: PATH: No such file or
+/// directory` report + status 1, body skipped).
+fn native_line_loop(
+    while_stmt: Option<&IrStmt>,
+    names: &[String],
+    ifs: &str,
+    text: Expr,
+    file: Option<Expr>,
+    body: &[IrStmt],
+) -> Option<Stmt> {
+    let body_stmts: Vec<Stmt> = body.iter().filter_map(stmt_to_estree).collect();
+    // A native `for…of` cannot await, and a runtime BREAK/CONTINUE/RETURN
+    // signal thrown from the body must stay catchable by the runtime loop
+    // wrapper (the native-while gate's rules, see the IrStmt::While arm).
+    if stmts_have_await(&body_stmts) || lowered_stmts_have_signals(&body_stmts) {
+        return None;
+    }
+    let errexit = MAY_ERREXIT.lock().unwrap().unwrap_or(true);
+    // The line count is DATA-dependent, so `runs` (provably ≥1 iteration)
+    // must not be trusted — only the status liveness decides the tracking.
+    // The CALL form carries no While statement (no liveness key), so it
+    // keeps the tracking: one extra write per loop, never wrong.
+    let dead = while_stmt
+        .map(|w| loop_status_write_dead(w))
+        .unwrap_or(false)
+        && !errexit;
+    let (ws, cls, sep) = ifs_parts(ifs);
+    let line = ident("__sh2_rdn");
+    // `const __sh2_rdf = <the line split into fields>;`
+    let fields: Expr = if ifs.is_empty() {
+        array(vec![line.clone()])
+    } else {
+        let split = Expr::CallExpression {
+            callee: Box::new(Expr::MemberExpression {
+                object: Box::new(line.clone()),
+                property: Box::new(ident("split")),
+                computed: false,
+                optional: false,
+            }),
+            arguments: vec![regex_lit(&format!(
+                "[{cls}]{}",
+                if ws { "+" } else { "" }
+            ))],
+            optional: false,
+        };
+        let split = if ws {
+            // the runtime's whitespace form: runs collapsed, empty dropped
+            Expr::CallExpression {
+                callee: Box::new(Expr::MemberExpression {
+                    object: Box::new(split),
+                    property: Box::new(ident("filter")),
+                    computed: false,
+                    optional: false,
+                }),
+                arguments: vec![Expr::ArrowFunctionExpression {
+                    params: vec![ident("s")],
+                    body: ArrowBody::Expr(Box::new(Expr::BinaryExpression {
+                        operator: "!==".to_string(),
+                        left: Box::new(ident("s")),
+                        right: Box::new(str_lit("")),
+                    })),
+                    expression: true,
+                    r#async: false,
+                }],
+                optional: false,
+            }
+        } else {
+            split
+        };
+        split
+    };
+    let mut inner: Vec<Stmt> = Vec::new();
+    if !dead {
+        inner.push(Stmt::ExpressionStatement {
+            expression: Expr::AssignmentExpression {
+                operator: "=".to_string(),
+                left: Box::new(ident("__sh2_loop_ran")),
+                right: Box::new(bool_lit(true)),
+            },
+        });
+    }
+    inner.push(Stmt::VariableDeclaration {
+        kind: "const",
+        declarations: vec![VariableDeclarator {
+            type_: "VariableDeclarator",
+            id: ident("__sh2_rdf"),
+            init: Some(fields.clone()),
+        }],
+    });
+    let n = names.len();
+    for (i, name) in names.iter().enumerate() {
+        // The last name takes the field remainder joined on the first IFS
+        // character; the others take their own field (missing → "").
+        let value = if i + 1 == n {
+            let sliced = Expr::CallExpression {
+                callee: Box::new(Expr::MemberExpression {
+                    object: Box::new(ident("__sh2_rdf")),
+                    property: Box::new(ident("slice")),
+                    computed: false,
+                    optional: false,
+                }),
+                arguments: vec![int_lit_expr(i as i64)],
+                optional: false,
+            };
+            let joined = Expr::CallExpression {
+                callee: Box::new(Expr::MemberExpression {
+                    object: Box::new(sliced),
+                    property: Box::new(ident("join")),
+                    computed: false,
+                    optional: false,
+                }),
+                arguments: vec![str_lit(&sep)],
+                optional: false,
+            };
+            if n == 1 {
+                joined
+            } else {
+                joined
+            }
+        } else {
+            Expr::LogicalExpression {
+                operator: "??".to_string(),
+                left: Box::new(Expr::MemberExpression {
+                    object: Box::new(ident("__sh2_rdf")),
+                    property: Box::new(int_lit_expr(i as i64)),
+                    computed: true,
+                    optional: false,
+                }),
+                right: Box::new(str_lit("")),
+            }
+        };
+        // The runtime `read` writes through setVar (the store authority:
+        // array/int/nameref attributes, the exported env sync). Use the
+        // direct `sh2.vars.<name>` property write when the store-access
+        // analysis proved the name has no such attribute branch — the
+        // Plan 36 predicate, and the value here is always a string.
+        inner.push(Stmt::ExpressionStatement {
+            expression: if native_store_write_ok(name) {
+                Expr::AssignmentExpression {
+                    operator: "=".to_string(),
+                    left: Box::new(store_member(name)),
+                    right: Box::new(value),
+                }
+            } else {
+                sh2_call("setVar", vec![str_lit(name), value])
+            },
+        });
+    }
+    inner.extend(body_stmts);
+    if !dead {
+        inner.push(Stmt::ExpressionStatement {
+            expression: Expr::AssignmentExpression {
+                operator: "=".to_string(),
+                left: Box::new(ident("__sh2_loop_last")),
+                right: Box::new(sh2_member("lastExit")),
+            },
+        });
+    }
+    // The text the lines come from: the file case reads into `__sh2_rdt`
+    // first (one readText), every other source is the caller's expression.
+    let text = if file.is_some() {
+        ident("__sh2_rdt")
+    } else {
+        text
+    };
+    // `const __sh2_rdl = <text>.split("\n"); if (last === "") pop();`
+    let mut loop_block: Vec<Stmt> = vec![
+        Stmt::VariableDeclaration {
+            kind: "const",
+            declarations: vec![VariableDeclarator {
+                type_: "VariableDeclarator",
+                id: ident("__sh2_rdl"),
+                init: Some(Expr::CallExpression {
+                    callee: Box::new(Expr::MemberExpression {
+                        object: Box::new(text),
+                        property: Box::new(ident("split")),
+                        computed: false,
+                        optional: false,
+                    }),
+                    arguments: vec![str_lit("\n")],
+                    optional: false,
+                }),
+            }],
+        },
+        // A trailing newline terminates the last line; it does not start an
+        // empty one (`read` returns EOF instead). An empty input has NO
+        // lines (`[""]` after split, then popped).
+        Stmt::IfStatement {
+            test: Expr::LogicalExpression {
+                operator: "&&".to_string(),
+                left: Box::new(Expr::BinaryExpression {
+                    operator: ">".to_string(),
+                    left: Box::new(Expr::MemberExpression {
+                        object: Box::new(ident("__sh2_rdl")),
+                        property: Box::new(ident("length")),
+                        computed: false,
+                        optional: false,
+                    }),
+                    right: Box::new(int_lit_expr(0)),
+                }),
+                right: Box::new(Expr::BinaryExpression {
+                    operator: "===".to_string(),
+                    left: Box::new(Expr::MemberExpression {
+                        object: Box::new(Expr::MemberExpression {
+                            object: Box::new(ident("__sh2_rdl")),
+                            property: Box::new(Expr::BinaryExpression {
+                                operator: "-".to_string(),
+                                left: Box::new(Expr::MemberExpression {
+                                    object: Box::new(ident("__sh2_rdl")),
+                                    property: Box::new(ident("length")),
+                                    computed: false,
+                                    optional: false,
+                                }),
+                                right: Box::new(int_lit_expr(1)),
+                            }),
+                            computed: true,
+                            optional: false,
+                        }),
+                        property: Box::new(ident("length")),
+                        computed: false,
+                        optional: false,
+                    }),
+                    // last line's LENGTH is a number — comparing it to
+                    // "" is never true, so the trailing-"" pop below
+                    // never fired and every read-loop ran one extra
+                    // empty iteration (bat t12/t24/t46). 0 == "".length.
+                    right: Box::new(int_lit_expr(0)),
+                }),
+            },
+            consequent: Box::new(Stmt::ExpressionStatement {
+                expression: Expr::CallExpression {
+                    callee: Box::new(Expr::MemberExpression {
+                        object: Box::new(ident("__sh2_rdl")),
+                        property: Box::new(ident("pop")),
+                        computed: false,
+                        optional: false,
+                    }),
+                    arguments: vec![],
+                    optional: false,
+                },
+            }),
+            alternate: None,
+        },
+        Stmt::ForOfStatement {
+            left: Box::new(Stmt::VariableDeclaration {
+                kind: "const",
+                declarations: vec![VariableDeclarator {
+                    type_: "VariableDeclarator",
+                    id: ident("__sh2_rdn"),
+                    init: None,
+                }],
+            }),
+            right: ident("__sh2_rdl"),
+            body: Box::new(Stmt::BlockStatement { body: inner }),
+        },
+    ];
+    if !dead {
+        // `sh2.lastExit = __sh2_loop_ran ? __sh2_loop_last : 0;`
+        loop_block.push(Stmt::ExpressionStatement {
+            expression: Expr::AssignmentExpression {
+                operator: "=".to_string(),
+                left: Box::new(sh2_member("lastExit")),
+                right: Box::new(Expr::ConditionalExpression {
+                    test: Box::new(ident("__sh2_loop_ran")),
+                    consequent: Box::new(ident("__sh2_loop_last")),
+                    alternate: Box::new(int_lit_expr(0)),
+                }),
+            },
+        });
+    }
+    let loop_block = Stmt::BlockStatement {
+        body: loop_block,
+    };
+    let mut outer: Vec<Stmt> = Vec::new();
+    if !dead {
+        outer.push(Stmt::VariableDeclaration {
+            kind: "let",
+            declarations: vec![
+                VariableDeclarator {
+                    type_: "VariableDeclarator",
+                    id: ident("__sh2_loop_ran"),
+                    init: Some(bool_lit(false)),
+                },
+                VariableDeclarator {
+                    type_: "VariableDeclarator",
+                    id: ident("__sh2_loop_last"),
+                    init: Some(int_lit_expr(0)),
+                },
+            ],
+        });
+    }
+    match file {
+        // `const __sh2_rdp = <path>; const __sh2_rdt = sh2.fs.readText(…)`
+        // — the path is bound ONCE (the failure report names it), then the
+        // loop runs under `sh2._readOk` (the sync read's own contract) with
+        // the r-mode failure branch: bash's report text + status 1, body
+        // skipped — exactly `_applyRedirectSpecs`' r-mode check.
+        Some(path) => {
+            outer.push(Stmt::VariableDeclaration {
+                kind: "const",
+                declarations: vec![VariableDeclarator {
+                    type_: "VariableDeclarator",
+                    id: ident("__sh2_rdp"),
+                    init: Some(path),
+                }],
+            });
+            let read = read_text_value(ident("__sh2_rdp"), 1);
+            if expr_has_await(&read) {
+                // SH2_ASSUME_SYNC_FS=0 puts an await in the read — a native
+                // line loop cannot hold it.
+                return None;
+            }
+            outer.push(Stmt::VariableDeclaration {
+                kind: "const",
+                declarations: vec![VariableDeclarator {
+                    type_: "VariableDeclarator",
+                    id: ident("__sh2_rdt"),
+                    init: Some(read),
+                }],
+            });
+            outer.push(Stmt::IfStatement {
+                test: Expr::MemberExpression {
+                    object: Box::new(ident("sh2")),
+                    property: Box::new(ident("_readOk")),
+                    computed: false,
+                    optional: false,
+                },
+                consequent: Box::new(loop_block),
+                alternate: Some(Box::new(Stmt::BlockStatement {
+                    body: vec![
+                        Stmt::ExpressionStatement {
+                            expression: Expr::CallExpression {
+                                callee: Box::new(Expr::MemberExpression {
+                                    object: Box::new(Expr::MemberExpression {
+                                        object: Box::new(ident("process")),
+                                        property: Box::new(ident("stderr")),
+                                        computed: false,
+                                        optional: false,
+                                    }),
+                                    property: Box::new(ident("write")),
+                                    computed: false,
+                                    optional: false,
+                                }),
+                                arguments: vec![Expr::BinaryExpression {
+                                    operator: "+".to_string(),
+                                    left: Box::new(Expr::BinaryExpression {
+                                        operator: "+".to_string(),
+                                        left: Box::new(str_lit("bash: ")),
+                                        right: Box::new(ident("__sh2_rdp")),
+                                    }),
+                                    right: Box::new(str_lit(": No such file or directory\n")),
+                                }],
+                                optional: false,
+                            },
+                        },
+                        Stmt::ExpressionStatement {
+                            expression: Expr::AssignmentExpression {
+                                operator: "=".to_string(),
+                                left: Box::new(sh2_member("lastExit")),
+                                right: Box::new(int_lit_expr(1)),
+                            },
+                        },
+                    ],
+                })),
+            });
+        }
+        None => outer.push(loop_block),
+    }
+    Some(Stmt::BlockStatement { body: outer })
+}
+
+/// The loop inside a redirect body, in either IR form:
+///   - the STATEMENT shape (`IrStmt::While`) — a top-level `while … done`;
+///   - the CALL shape (`Expr(Call("whileLoop"/"whileLoopSync", [cond,
+///     body]))`) — the same loop lowered through `command_to_ir` (a
+///     pipeline stage or a function body).
+/// Returns `(the While statement when there is one, the condition, the
+/// body statements)`.
+fn read_loop_parts(inner: &[IrStmt]) -> Option<(Option<&IrStmt>, &IrExpr, &[IrStmt])> {
+    match inner {
+        [IrStmt::While { cond, body, .. }] => Some((Some(&inner[0]), cond, body.as_slice())),
+        [IrStmt::Expr(IrExpr::Call { func, args })]
+            if matches!(func.as_str(), "whileLoop" | "whileLoopSync") =>
+        {
+            let [IrExpr::Arrow(cond_stmts), IrExpr::Arrow(body)] = args.as_slice() else {
+                return None;
+            };
+            let [IrStmt::Expr(cond)] = cond_stmts.as_slice() else {
+                return None;
+            };
+            Some((None, cond, body.as_slice()))
+        }
+        _ => None,
+    }
+}
+
+/// `while read …; do …; done < FILE|<<<TEXT|<<EOF` — the native line loop
+/// (see the section comment above). Only a SINGLE fd-0 input spec
+/// qualifies; any other redirect shape keeps the runtime machinery.
+fn try_native_read_loop(inner: &[IrStmt], specs: &[RedirectSpec<'_>]) -> Option<Stmt> {
+    if program_defines_function("read") {
+        return None;
+    }
+    let (while_stmt, cond, body) = read_loop_parts(inner)?;
+    let (names, cond_ifs) = read_loop_cond(cond)?;
+    let [spec] = specs else {
+        return None;
+    };
+    if spec.fd != 0 {
+        return None;
+    }
+    // The IFS the split uses: the command-scoped literal when the read
+    // carries one, else the shell default — only when the program provably
+    // never writes IFS (the runtime would read the store).
+    let ifs = match cond_ifs {
+        Some(s) => s,
+        None => {
+            if !ifs_quiet() {
+                return None;
+            }
+            " \t\n".to_string()
+        }
+    };
+    match spec.mode {
+        "r" | "r+" => {
+            let path = expr_to_estree(spec.target);
+            native_line_loop(
+                while_stmt,
+                &names,
+                &ifs,
+                expr_to_estree(spec.target),
+                Some(path),
+                body,
+            )
+        }
+        // A herestring feeds `<content>` + "\n"; a QUOTED (non-expanding)
+        // heredoc feeds its body verbatim. An interpolating heredoc's
+        // target text is re-expanded by the runtime (`expandWord`) — a
+        // second expansion the lowerings must not model, so it stays.
+        "herestring" => {
+            let content = expr_to_estree(spec.target);
+            let text = Expr::BinaryExpression {
+                operator: "+".to_string(),
+                left: Box::new(content),
+                right: Box::new(str_lit("\n")),
+            };
+            native_line_loop(while_stmt, &names, &ifs, text, None, body)
+        }
+        "heredoc" if !spec.interpolate => {
+            let text = expr_to_estree(spec.target);
+            native_line_loop(while_stmt, &names, &ifs, text, None, body)
+        }
+        _ => None,
+    }
+}
+
+/// Expression-position twin of [`try_native_read_loop`] — the IR's
+/// `redirect [Arrow(stmts), specs]` CALL form (pipeline stages, function
+/// bodies). The line loop is a statement, so it is wrapped in an IIFE that
+/// returns the redirect's boolean value (`sh2.lastExit === 0`, exactly
+/// what the runtime `redirectSync` twin returns).
+fn try_native_read_loop_call(args: &[IrExpr]) -> Option<Expr> {
+    let [IrExpr::Arrow(body), IrExpr::Array(specs)] = args else {
+        return None;
+    };
+    let specs = ir_redirect_specs(specs)?;
+    let loop_stmt = try_native_read_loop(body, &specs)?;
+    let Stmt::BlockStatement { body: mut stmts } = loop_stmt else {
+        return None;
+    };
+    stmts.push(Stmt::ReturnStatement {
+        argument: Some(Expr::BinaryExpression {
+            operator: "===".to_string(),
+            left: Box::new(sh2_member("lastExit")),
+            right: Box::new(int_lit_expr(0)),
+        }),
+    });
+    Some(Expr::CallExpression {
+        callee: Box::new(Expr::ArrowFunctionExpression {
+            params: vec![],
+            body: ArrowBody::Block(Box::new(Stmt::BlockStatement { body: stmts })),
+            expression: false,
+            r#async: false,
+        }),
+        arguments: vec![],
+        optional: false,
+    })
+}
+
 /// `grep ARGS <<< TEXT` / `grep ARGS <<EOF … EOF` — the fd-0 redirect
 /// form of the mini-grep (`harness/sh2-namespace.mjs grepText`).
 ///
@@ -43546,17 +44904,8 @@ fn sleep_ms_expr(x: &IrExpr) -> Expr {
 }
 
 fn try_native_echo(args: &[IrExpr]) -> Option<Expr> {
-    let [IrExpr::Str(name, _), IrExpr::Array(echo_args)] = args else {
-        return None; // env-carrying 3-arg form — the env is command-scoped
-    };
-    if name != "echo" {
-        return None;
-    }
-    if echo_args.iter().any(ir_expr_needs_runtime) {
-        return None;
-    }
-    let (joined, no_newline, _) = echo_join_args(echo_args)?;
-    let write = guard_arith_echo_write(printf_write_expr(echo_text(joined, no_newline)));
+    let text = native_echo_text(args)?;
+    let write = guard_arith_echo_write(printf_write_expr(text));
     // (process.stdout.write(text), sh2.lastExit = 0, true)
     Some(seq(vec![
         write,
@@ -43581,8 +44930,23 @@ fn try_native_echo(args: &[IrExpr]) -> Option<Expr> {
 /// the statement's value, is skipped then), so the statement value is
 /// unused and the write expression alone is a valid statement.
 fn try_native_echo_dead(args: &[IrExpr]) -> Option<Expr> {
+    let text = native_echo_text(args)?;
+    Some(guard_arith_echo_write(printf_write_expr(text)))
+}
+
+/// The TEXT expression `echo ARGS` writes: the runtime builtin's exact
+/// `echo_join_args` join plus the trailing newline (unless `-n`). Shared by
+/// [`try_native_echo`] / [`try_native_echo_dead`] (which wrap it in the
+/// default-sink write) and the pipeline producer-stage fold
+/// (`producer_stage_text` — the text becomes the pipeline's STRING stage,
+/// identical to a non-last `() => sh2.builtin("echo", ...)` arrow because
+/// the stage's fd-1 output IS that text).
+///
+/// The gates are [`try_native_echo`]'s: the 2-arg dispatch form, await-free
+/// args (`ir_expr_needs_runtime` excludes every runtime-transformed marker).
+fn native_echo_text(args: &[IrExpr]) -> Option<Expr> {
     let [IrExpr::Str(name, _), IrExpr::Array(echo_args)] = args else {
-        return None;
+        return None; // env-carrying 3-arg form — the env is command-scoped
     };
     if name != "echo" {
         return None;
@@ -43591,9 +44955,7 @@ fn try_native_echo_dead(args: &[IrExpr]) -> Option<Expr> {
         return None;
     }
     let (joined, no_newline, _) = echo_join_args(echo_args)?;
-    Some(guard_arith_echo_write(printf_write_expr(echo_text(
-        joined, no_newline,
-    ))))
+    Some(echo_text(joined, no_newline))
 }
 
 /// `$(yes LIT | head -N)` — the infinite-producer capture: bash runs
@@ -43981,39 +45343,112 @@ fn try_native_echo_bc_stmt(pipe: &IrExpr) -> Option<Expr> {
 /// The exact bytes a pipeline stage's producer writes, as a compile-time
 /// string: `echo ARGS` (the runtime builtin's `args.join(' ')` join, `-e`'s
 /// `\n`/`\t` replaces on the joined text, the trailing newline unless
-/// `-n`) or `printf FMT ARGS...` (the runtime's formatted output, NO
-/// trailing newline — printf emits only the format's bytes). All args
-/// must be compile-time static (a dynamic `$ref` would need the store
-/// read at runtime); a script-defined echo/printf function shadows the
-/// builtin (refuse).
+/// `-n`), `printf FMT ARGS...` (the runtime's formatted output, NO
+/// trailing newline — printf emits only the format's bytes) or `seq` with
+/// integer range args (see [`seq_static_text`]). All args must be
+/// compile-time static (a dynamic `$ref` would need the store read at
+/// runtime); a script-defined echo/printf/seq function shadows the builtin
+/// (refuse).
+///
+/// A stage may hold SEVERAL such commands (`(echo one; echo two) | ...`):
+/// each writes its own bytes to the same pipe, so the stage's text is their
+/// concatenation — the stage ignores its stdin either way (none of these
+/// commands read stdin with static args).
 fn pipe_stage_static_text(stage: &IrExpr) -> Option<String> {
     let IrExpr::Arrow(stmts) = stage else {
         return None;
     };
-    let [IrStmt::Expr(IrExpr::Call { func, args })] = stmts.as_slice() else {
-        return None;
-    };
-    if !matches!(func.as_str(), "exec" | "builtin") {
+    if stmts.is_empty() {
         return None;
     }
-    let [IrExpr::Str(name, _), IrExpr::Array(cargs)] = args.as_slice() else {
-        return None;
-    };
-    match name.as_str() {
-        "echo" => {
-            if program_defines_function("echo") {
-                return None;
-            }
-            echo_static_text(cargs)
+    let mut out = String::new();
+    for st in stmts {
+        let IrStmt::Expr(IrExpr::Call { func, args }) = st else {
+            return None;
+        };
+        if !matches!(func.as_str(), "exec" | "builtin") {
+            return None;
         }
-        "printf" => {
-            if program_defines_function("printf") {
-                return None;
+        let [IrExpr::Str(name, _), IrExpr::Array(cargs)] = args.as_slice() else {
+            return None;
+        };
+        let piece = match name.as_str() {
+            "echo" => {
+                if program_defines_function("echo") {
+                    return None;
+                }
+                echo_static_text(cargs)?
             }
-            printf_static_text(cargs)
-        }
-        _ => None,
+            "printf" => {
+                if program_defines_function("printf") {
+                    return None;
+                }
+                printf_static_text(cargs)?
+            }
+            // the runtime's seq model (builtins.seq): 1-3 integer
+            // positionals, `String(v)` per value joined by "\n" + a final
+            // newline. Any other flag/arg shape keeps the builtin.
+            "seq" => {
+                if program_defines_function("seq") {
+                    return None;
+                }
+                seq_static_text(cargs)?
+            }
+            _ => return None,
+        };
+        out.push_str(&piece);
     }
+    Some(out)
+}
+
+/// The exact bytes `seq` writes for STATIC integer args — the runtime
+/// `builtins.seq` model: one to three numeric positionals, read as
+/// `LAST` / `FIRST LAST` / `FIRST INCR LAST`, emitting `String(v)` per
+/// value joined by the separator (default "\n") plus a trailing newline,
+/// and NOTHING at all when the range is empty.
+///
+/// Conservative by design: only non-negative integer literals (no `.`, no
+/// sign — the runtime's `-?\d+(\.\d+)?` also takes floats and negatives,
+/// but `Number` formatting of those is where a compile-time fold could
+/// drift), no `-s`/`-w`/`-f` flags (the runtime IGNORES those, so folding
+/// one would match the runtime and not GNU `seq` — the honest answer is to
+/// keep the builtin), and a bounded magnitude so the loop is cheap at
+/// compile time.
+fn seq_static_text(args: &[IrExpr]) -> Option<String> {
+    if args.is_empty() || args.len() > 3 {
+        return None;
+    }
+    let mut nums: Vec<i64> = Vec::with_capacity(args.len());
+    for a in args {
+        let IrExpr::Str(sv, _) = a else {
+            return None;
+        };
+        if sv.is_empty() || !sv.bytes().all(|b| b.is_ascii_digit()) {
+            return None;
+        }
+        let v: i64 = sv.parse().ok()?;
+        if v > 1_000_000 {
+            return None;
+        }
+        nums.push(v);
+    }
+    let (first, step, last) = match nums.as_slice() {
+        [last] => (1i64, 1i64, *last),
+        [first, last] => (*first, 1, *last),
+        [first, step, last] => (*first, *step, *last),
+        _ => return None,
+    };
+    if step == 0 {
+        return None; // the runtime spins forever — never fold
+    }
+    let mut out = String::new();
+    let mut v = first;
+    while (step > 0 && v <= last) || (step < 0 && v >= last) {
+        out.push_str(&v.to_string());
+        out.push('\n');
+        v += step;
+    }
+    Some(out)
 }
 
 /// The exact bytes the runtime's echo builtin writes for STATIC args (the
@@ -45953,6 +47388,15 @@ fn native_pipeline_stage(stage: &IrExpr) -> Option<Expr> {
     let IrExpr::Arrow(stmts) = stage else {
         return None;
     };
+    // A COMPILE-TIME producer used as a LATER stage (`A | echo LIT`): the
+    // stage ignores its stdin and writes its own bytes, so its native form is
+    // a one-parameter arrow returning the static text — the runtime's
+    // `_nativeStage` contract wants the parameter to EXIST (`stage.length >=
+    // 1` marks a native stage), even though the body does not read it. Exact:
+    // echo/printf/seq with static args never read stdin.
+    if let Some(text) = static_producer_text(stage) {
+        return Some(native_stage_arrow(str_lit(&text), 0));
+    }
     let [IrStmt::Expr(IrExpr::Call { func, args })] = stmts.as_slice() else {
         return None;
     };
@@ -46187,27 +47631,73 @@ fn native_pipeline_stage(stage: &IrExpr) -> Option<Expr> {
     }
 }
 
-/// The echo-stage STRING collapse — `(sh2.lastExit = 0, <produced text>)` —
-/// for a non-last pipeline stage whose args are compile-time static (see
-/// [`try_echo_stage_text`]). The runtime's pipeline treats a non-function
-/// stage as the stage's produced bytes, so the `builtin("echo")` dispatch
-/// and the inter-stage fd juggling disappear. Shared by the generic
-/// pipeline arm and [`native_pipeline_call`] (a pipeline that carries a
-/// native stage must keep this collapse too).
-fn echo_stage_collapse(stage: &IrExpr) -> Option<Expr> {
-    let text = try_echo_stage_text(stage)?;
-    Some(seq(vec![
-        Expr::AssignmentExpression {
-            operator: "=".to_string(),
-            left: Box::new(sh2_member("lastExit")),
-            right: Box::new(Expr::Literal {
-                value: serde_json::Value::from(0),
-                raw: None,
-                regex: None,
-            }),
-        },
-        text,
-    ]))
+/// The PRODUCER-STAGE text for a non-last pipeline stage — the exact bytes
+/// a `builtin("echo"/"printf", ARGS)` stage would write into the pipe, as a
+/// native expression. Extends the compile-time-echo collapse
+/// ([`try_echo_stage_text`]) in two directions:
+///
+///  * **printf** with compile-time args (the same `printf_static_text` fold
+///    the whole-pipeline producer fold uses), exact at any stage position;
+///  * **echo with AWAIT-FREE (not necessarily static) args, at stage 0
+///    only.** The compile-time-only rule exists because a non-first
+///    stage's text expression is evaluated when the stages ARRAY is built —
+///    before the earlier stages run — while bash expands the stage's words
+///    when that stage runs, AFTER the earlier ones. For stage 0 nothing
+///    runs in between, so a plain native read evaluates at exactly the
+///    moment bash expands it. Refused for a bare `$((...))` echo word: the
+///    runtime's write aborts the whole command on an arith error
+///    (`guard_arith_echo_write`), which a string stage cannot express.
+fn producer_stage_text(stage: &IrExpr, first: bool) -> Option<Expr> {
+    let IrExpr::Arrow(stmts) = stage else {
+        return None;
+    };
+    let [IrStmt::Expr(IrExpr::Call { func, args })] = stmts.as_slice() else {
+        return None;
+    };
+    if !matches!(func.as_str(), "exec" | "builtin") {
+        return None;
+    }
+    if program_defines_function("echo") {
+        return None;
+    }
+    if let Some(t) = try_echo_stage_text(stage) {
+        return Some(t);
+    }
+    let [IrExpr::Str(name, _), IrExpr::Array(pargs)] = args.as_slice() else {
+        return None;
+    };
+    if name == "printf" && !program_defines_function("printf") {
+        if matches!(pargs.first(), Some(IrExpr::Str(f0, _)) if f0 == "-v") {
+            return None;
+        }
+        if let Some(t) = printf_static_text(pargs) {
+            return Some(str_lit(&t));
+        }
+    }
+    if !first {
+        return None;
+    }
+    if pargs.iter().any(ir_expr_has_arith_word) {
+        return None;
+    }
+    native_echo_text(args)
+}
+
+/// Does the word carry a bare `$((...))` arithmetic value (the shape whose
+/// runtime echo write is guarded by [`guard_arith_echo_write`])?
+fn ir_expr_has_arith_word(e: &IrExpr) -> bool {
+    match e {
+        IrExpr::Call { func, args } => {
+            matches!(func.as_str(), "arith" | "arithEval")
+                || args.iter().any(ir_expr_has_arith_word)
+        }
+        IrExpr::Array(items) => items.iter().any(ir_expr_has_arith_word),
+        IrExpr::Interpolate(parts) => parts.iter().any(|p| match p {
+            InterpPart::Expr(inner) => ir_expr_has_arith_word(inner),
+            InterpPart::Lit(_) => false,
+        }),
+        _ => false,
+    }
 }
 
 /// BOUNDED PRODUCER — the `PRODUCER | head -N` family.
@@ -46352,7 +47842,6 @@ fn native_pipeline_call(args: &[IrExpr]) -> Option<Expr> {
     // like the generic path.
     let out: Vec<Expr> = {
         *ECHO_SINK_DEPTH.lock().unwrap() += 1;
-        let echo_shadowed = program_defines_function("echo");
         let mut out: Vec<Expr> = Vec::with_capacity(stages.len());
         if let Some(t) = yes_head {
             out.push(t);
@@ -46361,9 +47850,20 @@ fn native_pipeline_call(args: &[IrExpr]) -> Option<Expr> {
             if i < if yes_head_skip { 2 } else { 0 } {
                 continue;
             }
-            if i + 1 < stages.len() && !echo_shadowed {
-                if let Some(collapsed) = echo_stage_collapse(st) {
-                    out.push(collapsed);
+            if i + 1 < stages.len() {
+                if let Some(text) = producer_stage_text(st, i == 0) {
+                    out.push(seq(vec![
+                        Expr::AssignmentExpression {
+                            operator: "=".to_string(),
+                            left: Box::new(sh2_member("lastExit")),
+                            right: Box::new(Expr::Literal {
+                                value: serde_json::Value::from(0),
+                                raw: None,
+                                regex: None,
+                            }),
+                        },
+                        text,
+                    ]));
                     continue;
                 }
             }
@@ -46872,7 +48372,88 @@ fn apply_native_stage_pair(arrow: &Expr, input: Expr) -> Option<Expr> {
     }
 }
 
-fn static_pipeline_pair(pipe: &IrExpr) -> Option<Expr> {
+/// The text a pipeline's FIRST stage writes into the pipe — see
+/// [`pipeline_producer_text`].
+enum ProducerText {
+    /// Compile-time bytes: echo/printf/seq with static args.
+    Static(String),
+    /// A runtime expression yielding the same bytes: the stage's own sync
+    /// builtin dispatch as its VERBATIM value twin `sh2.builtinText`.
+    Dynamic(Expr),
+}
+
+/// The text a pipeline's first stage produces — the "known producer"
+/// generalisation of [`static_producer_text`].
+///
+/// A stage that is exactly one SYNC-BUILTIN dispatch contributes nothing to
+/// the pipe but that builtin's fd-1 bytes, and the runtime already has a
+/// value twin for exactly that (minus the capture strips): `sh2.builtinText`
+/// — the pipeline-producer sibling of `sh2.builtinValue`, emitted here so a
+/// chain behind it can β-reduce:
+///
+///     pipelineCaptureSync([() => sh2.builtin("cat", ["f"]), stage])
+///   → (stage)(sh2.builtinText("cat", ["f"]))[0]
+///
+/// EXACT by construction, not by assumption: `builtinText` runs the SAME
+/// `this.builtin(name, args)` the stage arrow would, under the same fd-1
+/// capture install, with the same argument flattening (ARRAY_LIT/BADSUB/
+/// ARITH/PS/GLOB markers included) and the same GNU error reporting on
+/// fd 2. fd 0 is the ambient stdin in both forms — the pipeline only
+/// re-points fd 0 from stage 1 onward — so a producer that READS stdin
+/// (`grep PAT`, `cat`, `sort`) sees exactly the same bytes. What disappears
+/// is the pipeline's stage loop, its fd-table save/restore and the stage
+/// arrow allocation.
+///
+/// Not covered (kept on the runtime path): a stage with more than one
+/// statement (two commands sharing the pipe), a non-sync-builtin command (a
+/// spawn cannot be value-ised), and a script-defined function shadowing the
+/// builtin name.
+fn pipeline_producer_text(stage: &IrExpr) -> Option<ProducerText> {
+    if let Some(text) = static_producer_text(stage) {
+        return Some(ProducerText::Static(text));
+    }
+    let IrExpr::Arrow(stmts) = stage else {
+        return None;
+    };
+    let [IrStmt::Expr(IrExpr::Call { func, args })] = stmts.as_slice() else {
+        return None;
+    };
+    if !matches!(func.as_str(), "exec" | "builtin") {
+        return None;
+    }
+    let [IrExpr::Str(name, _), IrExpr::Array(argv)] = args.as_slice() else {
+        return None;
+    };
+    if !SYNC_BUILTINS.contains(&name.as_str()) || program_defines_function(name) {
+        return None;
+    }
+    // The args lower under the SAME raised sink depth the pipeline's stage
+    // loop uses (`native_pipeline_call`): a nested `$(...)` inside a stage's
+    // args must write into the pipe's capture buffer, never to module
+    // stdout — the native echo/printf lowering is suppressed there.
+    *ECHO_SINK_DEPTH.lock().unwrap() += 1;
+    let lowered: Vec<Expr> = argv.iter().map(expr_to_estree).collect();
+    *ECHO_SINK_DEPTH.lock().unwrap() -= 1;
+    Some(ProducerText::Dynamic(sh2_call(
+        "builtinText",
+        vec![str_lit(name), array(lowered)],
+    )))
+}
+
+/// `(the chain's input expression, sh2.* calls that expression is expected
+/// to contain)`. The count is how the call sites keep their metric-freshness
+/// guard: every native stage is call-free (asserted by the same check), so
+/// any surplus call means a stage DUPLICATED the producer expression —
+/// substitution is only sound for a single occurrence — and the fold must be
+/// refused.
+fn pipeline_chain_start(stage: &IrExpr) -> Option<(Expr, usize)> {
+    match pipeline_producer_text(stage)? {
+        ProducerText::Static(text) => Some((str_lit(&text), 0)),
+        ProducerText::Dynamic(expr) => Some((expr, 1)),
+    }
+}
+
+fn pipeline_chain_stages(pipe: &IrExpr) -> Option<&[IrExpr]> {
     let IrExpr::Call { func, args } = pipe else {
         return None;
     };
@@ -46885,13 +48466,28 @@ fn static_pipeline_pair(pipe: &IrExpr) -> Option<Expr> {
     if stages.len() < 2 {
         return None;
     }
-    let text = static_producer_text(&stages[0])?;
-    let mut cur = str_lit(&text);
+    Some(stages.as_slice())
+}
+
+/// A capped head consumer (`find . | head -3`) is BETTER on the runtime path:
+/// the cap lets an interruptible producer abort (Plan 38 — find|head 94x). A
+/// β-reduced chain runs the producer to completion, so a DYNAMIC producer
+/// keeps the pipeline whenever the cap would have applied.
+fn pipeline_chain_cap_blocks(stages: &[IrExpr], expected: usize) -> bool {
+    expected > 0 && stages.len() == 2 && pipeline_head_cap(&stages[1]).is_some()
+}
+
+fn static_pipeline_pair(pipe: &IrExpr) -> Option<(Expr, usize)> {
+    let stages = pipeline_chain_stages(pipe)?;
+    let (mut cur, expected) = pipeline_chain_start(&stages[0])?;
+    if pipeline_chain_cap_blocks(stages, expected) {
+        return None;
+    }
     let last = stages.len() - 1;
     for (i, stage) in stages.iter().enumerate().skip(1) {
         let arrow = native_pipeline_stage(stage)?;
         if i == last {
-            return apply_native_stage_pair(&arrow, cur);
+            return Some((apply_native_stage_pair(&arrow, cur)?, expected));
         }
         cur = apply_native_stage_arrow(&arrow, cur)?;
     }
@@ -46944,24 +48540,16 @@ fn with_stage_pair(pair: Expr, body: impl FnOnce(Expr, Expr) -> Expr) -> Expr {
 /// (the shapes whose `lastExit = 0` the assignment path records anyway).
 /// Non-zero statuses need [`with_stage_pair`] — the status is observable
 /// (`$?` after a `| grep …`), so it cannot be dropped.
-fn static_pipeline_text(pipe: &IrExpr) -> Option<Expr> {
-    let IrExpr::Call { func, args } = pipe else {
-        return None;
-    };
-    if func != "pipeline" && func != "pipelineSync" {
-        return None;
-    }
-    let [IrExpr::Array(stages)] = args.as_slice() else {
-        return None;
-    };
-    if stages.len() < 2 {
+fn static_pipeline_text(pipe: &IrExpr) -> Option<(Expr, usize)> {
+    let stages = pipeline_chain_stages(pipe)?;
+    let (mut cur, expected) = pipeline_chain_start(&stages[0])?;
+    if pipeline_chain_cap_blocks(stages, expected) {
         return None;
     }
-    let mut cur = str_lit(&static_producer_text(&stages[0])?);
     for stage in &stages[1..] {
         cur = apply_native_stage_arrow(&native_pipeline_stage(stage)?, cur)?;
     }
-    Some(cur)
+    Some((cur, expected))
 }
 
 fn native_capture_yes_head(pipe: &IrExpr) -> Option<Expr> {
@@ -51830,7 +53418,14 @@ fn native_param_default_text(text: &str) -> Option<Expr> {
 /// exact either way.
 fn store_var_read_no_fold(name: &str) -> Expr {
     if native_store_read_ok(name) {
-        native_store_read(name)
+        // The env fallback is MANDATORY here, even under SH2_ASSUME_NO_ENV
+        // (which drops it for the hot plain reads): this path exists
+        // precisely because a never-written name may be SET in the
+        // caller's environment. Dropping it made the "no fold" a fold in
+        // disguise — parameter-expansion-nested.sh still printed "" for
+        // `${MOUNTPOINT:-${NAME}}` because the native read was
+        // `sh2.vars.NAME ?? ""` (NAME=PC in the caller's env).
+        native_store_read_with_env(name)
     } else {
         sh2_call("getVar", vec![str_lit(name)])
     }
@@ -53034,6 +54629,14 @@ fn try_native_file_test(s: &str) -> Option<Expr> {
         return None; // extra tokens after the operand → a compound/other shape
     }
     let path = file_test_operand(operand)?;
+    // `[ -f "" ]` — a LITERAL empty operand is a compile-time constant: the
+    // runtime's evalUnary empty-arg rule answers false for every flag this
+    // helper accepts (only `-z`/`-n` read the string, and both are handled
+    // earlier), so the lstat never happens. `!false` → the negation.
+    if matches!(&path, Expr::Literal { value: serde_json::Value::String(sv), .. } if sv.is_empty())
+    {
+        return Some(bool_lit(negate));
+    }
     // `[ -f x ]` family → `sh2.fileTest("-f", x)` — the runtime's
     // evalUnary as a direct flag+path call: the exact bash semantics
     // (empty-arg rule, cwd resolution, accessSync `-r`/`-w`/`-x` — the
@@ -53267,6 +54870,11 @@ fn lift_walk_expr(
                     // `#x`/`!x` forms) keep their marks.
                     if func == "param" && i == 1 {
                         if let IrExpr::Str(n, _) = a {
+                            // A BARE arithmetic subscript (`args[i]`) is
+                            // resolved from the STORE by the runtime's
+                            // evalArith — mark it, or a lifted index var
+                            // reads element 0 forever.
+                            mark_subscript_idents(n, string_ctx);
                             let plain = !n.contains('$')
                                 && !n.contains('[')
                                 && !n.contains('@')
@@ -53304,6 +54912,9 @@ fn lift_walk_expr(
                     // returns None for them and the runtime expands them.
                     if func == "arrayIndex" && i == 1 {
                         if let IrExpr::Str(n, _) = a {
+                            // A BARE identifier key is arithmetic text the
+                            // runtime resolves from the STORE.
+                            mark_key_idents(n, string_ctx);
                             if subscript_keys_assumed_clean()
                                 && array_index_key_expr(n).is_some()
                             {
@@ -53558,6 +55169,9 @@ fn lift_walk_stmt(
                         // from the STORE — mark its `$var` refs
                         // store-read so a lifted binding never desyncs.
                         lift_mark_string_refs(&t.var, string_ctx);
+                        // ...and the BARE arithmetic identifiers too
+                        // (`arr[i]=v`: an indexed subscript is arithmetic).
+                        mark_subscript_idents(&t.var, string_ctx);
                     }
                 } else {
                     excluded.insert(t.var.clone());
@@ -56327,28 +57941,21 @@ fn native_store_read(name: &str) -> Expr {
             right: Box::new(str_lit("")),
         };
     }
+    native_store_read_with_env(name)
+}
+
+/// The FULL plain-object store read `(sh2.vars.<name> ?? process.env.<name>
+/// ?? '')` — [`native_store_read`] with the env fallback kept unconditionally.
+/// Used by the param-default reads ([`store_var_read_no_fold`]), where a
+/// never-written name's caller-environment value is exactly what must stay
+/// observable, so the SH2_ASSUME_NO_ENV fast path must not apply.
+fn native_store_read_with_env(name: &str) -> Expr {
     Expr::LogicalExpression {
         operator: "??".to_string(),
         left: Box::new(store_member(name)),
         right: Box::new(Expr::LogicalExpression {
             operator: "??".to_string(),
-            left: Box::new(Expr::MemberExpression {
-                object: Box::new(Expr::MemberExpression {
-                    object: Box::new(Expr::Identifier {
-                        name: "process".to_string(),
-                    }),
-                    property: Box::new(Expr::Identifier {
-                        name: "env".to_string(),
-                    }),
-                    computed: false,
-                    optional: false,
-                }),
-                property: Box::new(Expr::Identifier {
-                    name: name.to_string(),
-                }),
-                computed: false,
-                optional: false,
-            }),
+            left: Box::new(process_env_member(name)),
             right: Box::new(str_lit("")),
         }),
     }
@@ -56484,6 +58091,13 @@ fn store_write_name(e: &Expr) -> Option<&str> {
 /// in `String(…)`, a capture-buffer `.replace(…)`, or a numeric result.
 const STORE_RHS_SAFE_TWINS: &[&str] = &[
     "basename",
+    // `capture`/`captureSync` — the command-substitution machinery: both
+    // return the capture buffer's text (a string, '' on a failed/missing
+    // producer). They are never an Array/object/ARITH_BAD_MAGIC, so the
+    // runtime setVar's three special branches cannot fire — `local so` +
+    // `so=$(cat "$f")` writes the plain store.
+    "capture",
+    "captureSync",
     "cutText",
     "date",
     "dirname",
@@ -56549,17 +58163,13 @@ const STORE_RHS_SAFE_METHODS: &[&str] = &[
 /// (objects are stored uncoerced). Only calls that can produce one of
 /// those need the runtime write.
 fn store_rhs_plain_value(e: &Expr) -> bool {
-    /// `sh2.fs.readFile(…)` — the emitter's utf8 read, which resolves a
-    /// STRING (the `.then(…)/.catch(…)` chain only replaces it with '').
-    fn is_fs_read(e: &Expr) -> bool {
-        let Expr::CallExpression { callee, .. } = e else {
-            return false;
-        };
+    /// `sh2.fs.<name>` when `e` is a member of the runtime's fs object.
+    fn fs_member(e: &Expr) -> Option<String> {
         let Expr::MemberExpression {
             object, property, ..
-        } = callee.as_ref()
+        } = e
         else {
-            return false;
+            return None;
         };
         let Expr::MemberExpression {
             object: fs_obj,
@@ -56567,38 +58177,64 @@ fn store_rhs_plain_value(e: &Expr) -> bool {
             ..
         } = object.as_ref()
         else {
+            return None;
+        };
+        if matches!(fs_obj.as_ref(), Expr::Identifier { name } if name == "sh2")
+            && matches!(fs_prop.as_ref(), Expr::Identifier { name } if name == "fs")
+        {
+            if let Expr::Identifier { name } = property.as_ref() {
+                return Some(name.clone());
+            }
+        }
+        None
+    }
+    /// `sh2.fs.readFile(…)` — the emitter's awaitable utf8 read, which
+    /// resolves a STRING (the `.then(…)/.catch(…)` chain only replaces it
+    /// with '').
+    fn is_fs_read(e: &Expr) -> bool {
+        let Expr::CallExpression { callee, .. } = e else {
             return false;
         };
-        matches!(fs_obj.as_ref(), Expr::Identifier { name } if name == "sh2")
-            && matches!(fs_prop.as_ref(), Expr::Identifier { name } if name == "fs")
-            && matches!(property.as_ref(), Expr::Identifier { name } if name == "readFile")
+        fs_member(callee).as_deref() == Some("readFile")
     }
     fn call_ok(callee: &Expr, args: &[Expr]) -> bool {
-        if !args.iter().all(plain) {
-            return false;
-        }
         match callee {
             // the plain coercions: always a scalar
-            Expr::Identifier { name } => matches!(
-                name.as_str(),
-                "String" | "Number" | "Boolean" | "parseInt" | "parseFloat"
-            ),
+            Expr::Identifier { name } => {
+                args.iter().all(plain)
+                    && matches!(
+                        name.as_str(),
+                        "String" | "Number" | "Boolean" | "parseInt" | "parseFloat"
+                    )
+            }
             Expr::MemberExpression {
                 object, property, ..
             } => {
                 // Math.floor / Math.trunc / … — always a number
                 if matches!(object.as_ref(), Expr::Identifier { name } if name == "Math") {
-                    return true;
+                    return args.iter().all(plain);
                 }
-                // `sh2.<value twin>` — verified plain-scalar helpers
+                // `sh2.<value twin>` — verified plain-scalar helpers. Their
+                // RETURN SHAPE does not depend on the argument shapes (a
+                // twin's argv/path/pattern arguments never turn its result
+                // into an Array / raw object / ARITH_BAD_MAGIC), so the
+                // args-plain check would only refuse honest shapes like
+                // `sh2.mktempValue(["/tmp/x_XXXXXX"])` (an argv ARRAY) or
+                // `sh2.grepText(s, ["-i", p])`.
                 if matches!(object.as_ref(), Expr::Identifier { name } if name == "sh2") {
                     if let Expr::Identifier { name } = property.as_ref() {
                         return STORE_RHS_SAFE_TWINS.contains(&name.as_str());
                     }
                     return false;
                 }
-                // `….then(…)/.catch(…)/.finally(…)` on an fs read
+                // `sh2.fs.readText(…)` — the SYNC utf8 read: always a
+                // STRING ('' when the read fails; the `??` chain only
+                // re-states that).
+                if fs_member(callee).as_deref() == Some("readText") {
+                    return true;
+                }
                 if let Expr::Identifier { name } = property.as_ref() {
+                    // `….then(…)/.catch(…)/.finally(…)` on an fs read
                     if matches!(name.as_str(), "then" | "catch" | "finally") {
                         return is_fs_read(object);
                     }
@@ -56912,7 +58548,22 @@ fn expr_to_estree(e: &IrExpr) -> Expr {
             // sync-builtin dispatch: the expression-position twin of the
             // statement collapse (see [`try_builtin_redirect_call`]).
             if func == "redirect" {
+                // `while read …; done < FILE` in EXPRESSION position (a
+                // pipeline stage or a function body — the same statement
+                // shape `command_to_ir` renders as a redirect CALL): the
+                // native line loop, as an IIFE so the redirect's boolean
+                // value (`lastExit === 0`, the runtime twin's protocol)
+                // is preserved.
+                if let Some(native) = try_native_read_loop_call(args) {
+                    return native;
+                }
                 if let Some(native) = try_builtin_redirect_call(args) {
+                    return native;
+                }
+                // The exec-bridge twin: `redirect(() => await exec(...),
+                // SPECS)` → one `execRedirect` call (see
+                // [`try_exec_redirect_call`]).
+                if let Some(native) = try_exec_redirect_call(args) {
                     return native;
                 }
             }
@@ -57152,8 +58803,8 @@ fn expr_to_estree(e: &IrExpr) -> Expr {
                 // fd-1 target, so those keep the pipeline; the capture arm
                 // folds the same static shapes with `trimCapture`.
                 if *ECHO_SINK_DEPTH.lock().unwrap() == 0 {
-                    if let Some(text) = static_pipeline_text(e) {
-                        if !expr_has_await(&text) && expr_sh2_call_count(&text) == 0 {
+                    if let Some((text, expected)) = static_pipeline_text(e) {
+                        if !expr_has_await(&text) && expr_sh2_call_count(&text) == expected {
                             return seq(vec![
                                 printf_write_expr(text),
                                 Expr::AssignmentExpression {
@@ -57165,8 +58816,8 @@ fn expr_to_estree(e: &IrExpr) -> Expr {
                             ]);
                         }
                     }
-                    if let Some(pair) = static_pipeline_pair(e) {
-                        if !expr_has_await(&pair) && expr_sh2_call_count(&pair) == 0 {
+                    if let Some((pair, expected)) = static_pipeline_pair(e) {
+                        if !expr_has_await(&pair) && expr_sh2_call_count(&pair) == expected {
                             // a status-bearing last stage (`| grep …`):
                             // evaluate the chain once, record the status,
                             // write the text, and yield the pipeline's value
@@ -58376,8 +60027,19 @@ fn expr_to_estree(e: &IrExpr) -> Expr {
                         let mut changed = false;
                         for (i, stage) in stages.iter().enumerate() {
                             if i + 1 < stages.len() {
-                                if let Some(collapsed) = echo_stage_collapse(stage) {
-                                    out.push(collapsed);
+                                if let Some(prod) = producer_stage_text(stage, i == 0) {
+                                    out.push(seq(vec![
+                                        Expr::AssignmentExpression {
+                                            operator: "=".to_string(),
+                                            left: Box::new(sh2_member("lastExit")),
+                                            right: Box::new(Expr::Literal {
+                                                value: serde_json::Value::from(0),
+                                                raw: None,
+                                                regex: None,
+                                            }),
+                                        },
+                                        prod,
+                                    ]));
                                     changed = true;
                                     continue;
                                 }
@@ -58737,13 +60399,13 @@ fn expr_to_estree(e: &IrExpr) -> Expr {
                 // exactly what the runtime pipeline would have left behind.
                 if let [IrExpr::Arrow(stmts)] = args.as_slice() {
                     if let [IrStmt::Expr(pipe)] = stmts.as_slice() {
-                        if let Some(text) = static_pipeline_text(pipe) {
-                            if !expr_has_await(&text) && expr_sh2_call_count(&text) == 0 {
+                        if let Some((text, expected)) = static_pipeline_text(pipe) {
+                            if !expr_has_await(&text) && expr_sh2_call_count(&text) == expected {
                                 return trim_capture(text);
                             }
                         }
-                        if let Some(pair) = static_pipeline_pair(pipe) {
-                            if !expr_has_await(&pair) && expr_sh2_call_count(&pair) == 0 {
+                        if let Some((pair, expected)) = static_pipeline_pair(pipe) {
+                            if !expr_has_await(&pair) && expr_sh2_call_count(&pair) == expected {
                                 return with_stage_pair(pair, |text, status| {
                                     seq(vec![
                                         Expr::AssignmentExpression {
@@ -58827,6 +60489,24 @@ fn expr_to_estree(e: &IrExpr) -> Expr {
                         }
                     }
                 }
+                // `$(PIPELINE)` — the capture's ONLY statement is the
+                // pipeline call itself. The runtime capture's fd-1 buffer
+                // IS the pipeline's last-stage sink, so
+                // `captureSync(() => pipelineSync(…))` composes into ONE
+                // `sh2.pipelineCaptureSync(…)` (the async pairing into
+                // `pipelineCapture`): the same captured value (the
+                // capture's strips run over the same buffer), the same
+                // `lastExit` and `pipeStatuses`, minus one call frame and
+                // the per-site arrow allocation.
+                if func == "capture" {
+                    if let [IrExpr::Arrow(stmts)] = args.as_slice() {
+                        if let [IrStmt::Expr(inner)] = stmts.as_slice() {
+                            if let Some(value) = native_capture_pipeline(inner) {
+                                return value;
+                            }
+                        }
+                    }
+                }
             }
             // `printf FORMAT ARGS...` with a static format at the module's
             // default stdout sink: a native `process.stdout.write`, no
@@ -58870,6 +60550,20 @@ fn expr_to_estree(e: &IrExpr) -> Expr {
             // `let ARITH...` / `(( ARITH ))` — see try_native_let (the
             // statement/condition whose EVERY arith arg parses natively).
             if func == "exec" || func == "builtin" {
+                // Plan 39: an arith GUARD whose status write is provably
+                // unread (a dead `while (( … ))` / `if (( … ))` condition —
+                // see compute_test_cond_deadness + is_native_arith_cond):
+                // the bare value, with NO per-evaluation `!== 0`/lastExit
+                // ternary. Value and truthiness are identical (the caller's
+                // `unwrap_test_bool` drops the `? 1 : 0` normalization; a
+                // raw numeric value is JS-truthy iff nonzero — bash's `(( ))`
+                // rule), and the arith's own writes (`((i++))`) still run.
+                // 10M-iteration guard measured 27ms -> 12.5ms.
+                if *TEST_UNSTATUSED_DEPTH.lock().unwrap() > 0 {
+                    if let Some(native) = try_native_let_dead(args) {
+                        return native;
+                    }
+                }
                 if let Some(native) = try_native_let(args) {
                     return native;
                 }
@@ -59220,7 +60914,18 @@ fn expr_to_estree(e: &IrExpr) -> Expr {
             op: BinOpKind::Not,
             lhs,
             ..
-        } => not_native(expr_to_estree(lhs)),
+        } => {
+            // Plan 39: a `!` guard whose enclosing condition's status is
+            // provably unread — the same negation without the per-evaluation
+            // `sh2.lastExit` write (the `_g` scratch keeps the single
+            // evaluation).
+            let v = expr_to_estree(lhs);
+            if *TEST_UNSTATUSED_DEPTH.lock().unwrap() > 0 {
+                not_native_unstatused(v)
+            } else {
+                not_native(v)
+            }
+        }
         IrExpr::Arrow(stmts) => arrow(vec![], IrExpr::Arrow(stmts.clone())),
         // Parameterized function-literal expr (core request
         // py-sh-go-lambdef): a JS ArrowFunctionExpression with the A1
@@ -61060,6 +62765,20 @@ fn not_native(v: Expr) -> Expr {
     ])
 }
 
+/// The DEAD-status twin of [`not_native`] (Plan 39): the bare negation, with
+/// no `_g` scratch and no `sh2.lastExit` write — the enclosing if/while
+/// condition's status is provably unread (`compute_test_cond_deadness`), so
+/// recording the flipped status per evaluation is pure overhead (the
+/// `until (( … ))` / `! [[ … ]]` guard shape). `v` appears once, so no
+/// single-evaluation temp is needed either.
+fn not_native_unstatused(v: Expr) -> Expr {
+    Expr::UnaryExpression {
+        operator: "!".to_string(),
+        argument: Box::new(v),
+        prefix: true,
+    }
+}
+
 /// The runtime `sh2.trimCapture`'s exact formula
 /// (`String(s ?? '').replace(/\u0000/g, '').replace(/\n+$/, '')`) as a
 /// native expression: the NUL + trailing-newline strips capture() applies,
@@ -61401,6 +63120,72 @@ fn baked_subscript_read(name: &str) -> Option<(&str, Vec<(bool, String)>)> {
 /// (and the store marks) for maximal fidelity.
 fn subscript_keys_assumed_clean() -> bool {
     std::env::var("SH2_ASSUME_SUBSCRIPT_KEYS").map_or(true, |v| v != "0")
+}
+
+/// Mark the BARE arithmetic identifiers of a BRACKETED store name as
+/// store reads. An INDEXED array subscript is ARITHMETIC in bash, so
+/// `a[i]` resolves `i` through the runtime's evalArith → getVar — a
+/// numeric-LIFTED binding is not in the store, and the read silently
+/// resolves to 0. That made `while (( i < 3 )); do a[i]="v$i"; (( i++ ));
+/// done` write every element to index 0 (`v2||` vs bash's `v0|v1|v2`), and
+/// `${args[i]}` read element 0 forever. `$ref` parts are exempt (they
+/// lower to native key reads — [`array_index_key_expr`]); names with no
+/// bracket (`#x`, `!x`, `@`) are not subscripts.
+fn mark_subscript_idents(name: &str, out: &mut HashSet<String>) {
+    let (Some(open), Some(close)) = (name.find('['), name.rfind(']')) else {
+        return;
+    };
+    if close <= open {
+        return;
+    }
+    mark_arith_idents(&name[open + 1..close], out);
+}
+
+/// Mark the BARE identifiers of a bare `arrayIndex` KEY text (`a[i]` →
+/// `arrayIndex("a", "i")` — the key carries no brackets). Same rule as
+/// [`mark_subscript_idents`]: the runtime runs the text through evalArith.
+fn mark_key_idents(key: &str, out: &mut HashSet<String>) {
+    mark_arith_idents(key, out);
+}
+
+/// The shared scanner: every identifier that is NOT part of a `$name` /
+/// `${name}` reference is arithmetic text the runtime resolves from the
+/// store (mirror of `mark_store_refs`' `$((...))` region rule).
+fn mark_arith_idents(region: &str, out: &mut HashSet<String>) {
+    let bytes = region.as_bytes();
+    let mut i = 0;
+    while i < bytes.len() {
+        if bytes[i] == b'\\' {
+            i += 2;
+            continue;
+        }
+        if bytes[i] == b'$' {
+            let mut j = i + 1;
+            if j < bytes.len() && bytes[j] == b'{' {
+                j += 1;
+            }
+            while j < bytes.len() && (bytes[j].is_ascii_alphanumeric() || bytes[j] == b'_') {
+                j += 1;
+            }
+            i = j.max(i + 1);
+            continue;
+        }
+        let c = bytes[i] as char;
+        if (c.is_ascii_alphabetic() || c == '_')
+            && (i == 0 || !(bytes[i - 1].is_ascii_alphanumeric() || bytes[i - 1] == b'_'))
+        {
+            let start = i;
+            while i < bytes.len() && (bytes[i].is_ascii_alphanumeric() || bytes[i] == b'_') {
+                i += 1;
+            }
+            let w = &region[start..i];
+            if lift_is_ident(w) {
+                out.insert(w.to_string());
+            }
+            continue;
+        }
+        i += 1;
+    }
 }
 
 /// Does a baked subscript name (`map[$k]`, `arr[$i+1]`) reference `var`
@@ -64590,31 +66375,89 @@ mod array_key_lift_tests {
         );
     }
 
-    /// estree-20260813-182438 (params): the store-bound twin of the test
-    /// above. `gi` is NOT lifted here — it is written and read through
-    /// `sh2.vars.gi` — so the correct key is the STORE read. The
-    /// invariant both tests share is that the key's channel matches how
-    /// the key variable is written; `MIXED` is the desync in either
+    /// estree-20260813-182438 (params): the twin of the test above. The
+    /// invariant BOTH tests share is that the key's channel matches how
+    /// the key variable is written — `MIXED` (a name read through the
+    /// store and a bare binding at once) is the desync in either
     /// direction.
+    ///
+    /// Updated 2026-10-26: the original premise ("`gi` is NOT lifted, so
+    /// the key must be the STORE read") no longer describes the pipeline
+    /// — StoreToNative turns `gi=$1` into `let gi = sh2.positional[0] ??
+    /// ""`, and the key then reads that same native binding, which is
+    /// CONSISTENT and correct (verified: `map_get 5` prints 5, matching
+    /// bash). The test pinned the old channel and failed on a correct
+    /// emission; it now pins the invariant plus the native channel.
     #[test]
-    fn param_store_bound_array_key_uses_the_store() {
+    fn param_array_key_channel_matches_the_index_binding() {
         let json = shir_to_estree_json(&prog_of(
             "map=(0 1 2 3 4 5 6 7)\nmap_get() { gi=$1; gv=${map[$gi]}; }\nmap_get 5\necho \"$gv\"\n",
         ))
         .expect("render");
         let reads = array_reads(&json);
         assert!(
-            reads.iter().any(|(b, ch)| b == "map" && ch == "store"),
-            "a store-bound key must read the store, got {reads:?}\n{json}"
+            reads.iter().any(|(b, ch)| b == "map" && ch == "native"),
+            "the key reads the native `gi` binding, got {reads:?}\n{json}"
         );
         assert!(
             !reads.iter().any(|(_, ch)| ch == "MIXED"),
             "key read through both channels at once: {reads:?}\n{json}"
         );
-        // the write and the read must agree: `gi` is store-bound
+        // ...and the write agrees: `gi` is a bare binding, never the store
         assert!(
-            json.contains("\"name\":\"gi\"") && json.contains("\"name\":\"vars\""),
-            "gi must be store-bound for a store key to be correct:\n{json}"
+            json.contains("\"name\":\"gi\"") && !json.contains("sh2.vars.gi"),
+            "gi must be written through the same channel its key read uses:\n{json}"
+        );
+    }
+
+    /// A BARE arithmetic subscript (`a[i]`, `${args[i]}`) is ARITHMETIC in
+    /// bash for an indexed array: the runtime resolves it through
+    /// evalArith → getVar, i.e. from the STORE. A numeric-LIFTED index
+    /// (a native JS binding) is therefore never in the store and BOTH
+    /// channels silently used element 0 — `while (( i < 3 )); do
+    /// a[i]="v$i"; (( i++ )); done` wrote every element at index 0
+    /// (`v2||` vs bash's `v0|v1|v2`), and `${args[i]}` read element 0
+    /// forever. The index var must stay store-bound.
+    #[test]
+    fn bare_subscript_write_index_stays_store_bound() {
+        let json = shir_to_estree_json(&prog_of(
+            "f() { local -a a=(); local i=0; while (( i < 3 )); do a[i]=\"v$i\"; (( i++ )); done; echo \"${a[0]}\"; }\nf\n",
+        ))
+        .expect("render");
+        assert!(
+            json.contains("\"value\":\"a[i]\""),
+            "the baked subscript write keeps its store name:\n{json}"
+        );
+        assert!(
+            json.contains("\"name\":\"vars\""),
+            "the index must be read through the store channel:\n{json}"
+        );
+        assert!(
+            !json.contains("\"name\":\"i\"},\"init\""),
+            "a lifted `let i` would desync the runtime subscript:\n{json}"
+        );
+    }
+
+    /// The READ twin of the test above (`${args[i]}` — the option-parser
+    /// loop shape). The key stays the arithmetic TEXT so the runtime
+    /// resolves it from the synchronized store.
+    #[test]
+    fn bare_subscript_read_index_stays_store_bound() {
+        let json = shir_to_estree_json(&prog_of(
+            "f() { local -a args=(\"$@\"); local i=0; while (( i < 2 )); do echo \"X ${args[i]}\"; (( i++ )); done; }\nf a b\n",
+        ))
+        .expect("render");
+        assert!(
+            json.contains("\"name\":\"arrayIndex\""),
+            "the subscript read keeps the arrayIndex lowering:\n{json}"
+        );
+        assert!(
+            json.contains("\"name\":\"vars\""),
+            "the index must be read through the store channel:\n{json}"
+        );
+        assert!(
+            !json.contains("\"name\":\"i\"},\"init\""),
+            "a lifted `let i` would read element 0 forever:\n{json}"
         );
     }
 }
@@ -66462,6 +68305,135 @@ mod unread_status_tests {
             !stmt_status_write_is_unread(&p.stmts[0]),
             "a $? read must keep the preceding write live"
         );
+    }
+
+    fn ps_cleanup() -> IrStmt {
+        IrStmt::Exec {
+            cmd: s("rm"),
+            args: vec![s("-f"), IrExpr::Var("__ps_tmp0".to_string(), None)],
+            capture: None,
+            redirects: vec![],
+            env: vec![],
+        }
+    }
+
+    fn ps_read() -> IrStmt {
+        IrStmt::Expr(IrExpr::Call {
+            func: "getVar".to_string(),
+            args: vec![s("?")],
+        })
+    }
+
+    /// The core's process-substitution cleanup is bash's OWN bookkeeping:
+    /// every renderer carries the consumer's status across it (Rust's
+    /// `__ps_saved_rc`, fish's block arm, Perl's `$__ps_statusN`). It is
+    /// therefore transparent to `$?` and must not SHADOW the consumer's
+    /// write in the backward scan — otherwise the verdict strips the
+    /// consumer's `__SH_RC.store` and `cmp -s <(echo b) <(echo c); echo $?`
+    /// reports the cleanup's 0 instead of cmp's 1 (070_cmp_basic,
+    /// 000__04h, 064_01_complex_nested_subshells, process-substitution).
+    #[test]
+    fn procsub_cleanup_does_not_shadow_the_consumer() {
+        let cleanup = ps_cleanup();
+        assert!(is_ps_tmp_cleanup(&cleanup));
+        assert!(
+            !ir_stmt_writes_lastexit(&cleanup),
+            "the synthetic cleanup must be transparent to $?"
+        );
+
+        // { <consumer>; rm -f __ps_tmp… }; echo "$?"
+        let block = IrStmt::Block(vec![echo("differs"), cleanup]);
+        let p = prog(vec![block, ps_read()]);
+        install_unread_status_writes(&p, false);
+        let consumer = match &p.stmts[0] {
+            IrStmt::Block(b) => &b[0],
+            other => panic!("expected the synthesized block, got {other:?}"),
+        };
+        assert!(
+            !stmt_status_write_is_unread(consumer),
+            "the consumer's status write must stay live across the cleanup"
+        );
+    }
+
+    /// …transparency only propagates an EXISTING read backwards: with a
+    /// later write shadowing the block and no `$?` reader, the consumer is
+    /// still elidable and the cleanup itself never enters the verdict set.
+    #[test]
+    fn procsub_transparency_does_not_keep_a_shadowed_consumer() {
+        // { <consumer>; rm -f __ps_tmp… }; echo later
+        let block = IrStmt::Block(vec![echo("differs"), ps_cleanup()]);
+        let p = prog(vec![block, echo("after")]);
+        install_unread_status_writes(&p, false);
+        let (consumer, cleanup) = match &p.stmts[0] {
+            IrStmt::Block(b) => (&b[0], &b[1]),
+            other => panic!("expected the synthesized block, got {other:?}"),
+        };
+        assert!(
+            stmt_status_write_is_unread(consumer),
+            "a later write still shadows the consumer when nothing reads $?"
+        );
+        assert!(
+            !stmt_status_write_is_unread(cleanup),
+            "a non-writer is never in the verdict set"
+        );
+    }
+
+    /// A USER's `rm` is an ordinary command: it really does set `$?`, so it
+    /// still shadows an earlier write and is still elidable itself.
+    #[test]
+    fn a_user_rm_is_still_a_status_writer() {
+        let user_rm = IrStmt::Exec {
+            cmd: s("rm"),
+            args: vec![s("-f"), s("/tmp/scratch")],
+            capture: None,
+            redirects: vec![],
+            env: vec![],
+        };
+        assert!(!is_ps_tmp_cleanup(&user_rm));
+        assert!(ir_stmt_writes_lastexit(&user_rm));
+
+        // `echo a; rm -f /tmp/scratch; echo "$?"` — the rm's own status is
+        // what `$?` reads, and `echo a`'s write is shadowed by it.
+        let p = prog(vec![echo("a"), user_rm, ps_read()]);
+        install_unread_status_writes(&p, false);
+        assert!(
+            stmt_status_write_is_unread(&p.stmts[0]),
+            "a real rm still shadows the write before it"
+        );
+    }
+
+    /// [`program_observes_pipestatus`] is the shared verdict that lets a
+    /// renderer skip the pipeline stage-status capture: pure,
+    /// program-scoped, and deliberately over-approximating (a missed read
+    /// form would read 0 from a register that was never filled).
+    #[test]
+    fn pipestatus_observation_verdict() {
+        let plain = prog(vec![echo("a")]);
+        assert!(
+            !program_observes_pipestatus(&plain),
+            "a program with no PIPESTATUS read must be false"
+        );
+
+        // `${PIPESTATUS[0]}` lowers to a param word carrying the name
+        let read = IrStmt::Expr(IrExpr::Call {
+            func: "param".into(),
+            args: vec![s(""), s("PIPESTATUS[0]")],
+        });
+        let observing = prog(vec![echo("a"), read.clone()]);
+        assert!(
+            program_observes_pipestatus(&observing),
+            "a PIPESTATUS read must be seen"
+        );
+
+        // a read inside a sub body counts too (the Debug scan covers subs)
+        let mut with_sub = prog(vec![echo("a")]);
+        with_sub.subs.push(crate::ir::IrSub {
+            name: "f".to_string(),
+            params: vec![],
+            param_defaults: vec![],
+            body: vec![read],
+        });
+        assert!(program_observes_pipestatus(&with_sub));
     }
 }
 
