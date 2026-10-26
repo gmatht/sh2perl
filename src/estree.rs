@@ -8520,9 +8520,16 @@ greet");
         assert!(!json.contains("\"value\":\"j\""));
         assert!(!json.contains("\"name\":\"getVar\""));
         // `[@]`/`[*]` whole-array forms and PIPESTATUS never rewrite
-        // (the join / pipeStatuses arms are getVar-special)
+        // (the join / pipeStatuses arms are getVar-special). `[*]` is the
+        // all-VALUES expansion joined with IFS[0] at runtime, so the native
+        // assoc fold must REFUSE the map (staying on the store path) — a
+        // migrated map is never registered in `assocNames`, leaving the
+        // runtime read with nothing to resolve against (064_07).
         let json2 = to_json("declare -A map\nmap[a]=1\necho \"${map[*]}\"\necho \"${PIPESTATUS[0]}\"");
         assert!(json2.contains("\"name\":\"getVar\""));
+        assert!(json2.contains("\"value\":\"map[*]\""));
+        assert!(json2.contains("\"name\":\"assocNames\""), "map must stay on the store path");
+        assert!(!json2.contains("\"name\":\"has\""), "no `*` key-lookup fold");
     }
 
     #[test]

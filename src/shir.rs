@@ -34059,7 +34059,17 @@ fn na_scan_expr(e: &Expr, name: &str, ctx: NaCtx, a: &mut AssocRefs) {
                                         }
                                     }
                                     Some(k) => {
-                                        if assoc_literal_key(k).is_none() {
+                                        // `${M[*]}` / `${M[@]}` is the
+                                        // all-VALUES expansion, not a lookup
+                                        // of a key named `*`/`@` — and `*`
+                                        // joins with IFS[0] at RUNTIME (the
+                                        // native fold cannot bake it, and the
+                                        // migrated name is never entered in
+                                        // `assocNames`, so the runtime read
+                                        // has nothing to fall back to).
+                                        // Unclassified touch ⇒ refuse the
+                                        // map, keeping it on the store path.
+                                        if k == "*" || k == "@" || assoc_literal_key(k).is_none() {
                                             a.poisoned = true;
                                         } else {
                                             a.sites += 1;
@@ -34405,6 +34415,12 @@ fn na_rewrite_call(callee: &Expr, arguments: &[Expr], set: &HashSet<String>) -> 
         }
         "getVar" | "arrayIndex" | "assocGet" => {
             let key_expr: Expr = match key {
+                // `${M[*]}` / `${M[@]}` is the all-values expansion, not a
+                // lookup of a key named `*`/`@`: `*` joins with IFS[0] at
+                // RUNTIME (064_07 sets IFS=$'\n' before this read), so the
+                // native fold cannot bake it. Leave the call for the
+                // runtime's getVar/arrayIndex, which knows the join.
+                Some(k) if k == "*" || k == "@" => return None,
                 Some(k) => na_str(&assoc_literal_key(&k)?),
                 None => match arguments.get(1)? {
                     Expr::Literal { value, .. } => {
