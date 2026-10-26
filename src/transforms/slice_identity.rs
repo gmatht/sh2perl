@@ -409,7 +409,11 @@ mod tests {
     /// back to the plain read. Proves the registry wiring, not just `fold()`.
     #[test]
     fn parser_to_registry_folds_zero_offset_slice() {
-        let cmds = crate::Parser::new("v=hello\necho \"${v:0}\"\n")
+        // A dynamic def keeps `v` a real read after the slice-identity
+        // fold (param("", "v")): with a literal def, copy-propagation's
+        // param-fold would collapse the plain read to a constant too and
+        // this test would stop exercising slice-identity's own fold.
+        let cmds = crate::Parser::new("v=\"$1\"\necho \"${v:0}\"\n")
             .parse()
             .expect("parse");
         let prog = crate::shir::ast_to_ir(&cmds);

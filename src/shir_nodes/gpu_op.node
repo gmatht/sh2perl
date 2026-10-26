@@ -30,3 +30,4 @@ field verb: string
 field slot: string
 field payload: expr
 field id: string
+spec: none (effect: device)

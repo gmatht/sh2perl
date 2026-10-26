@@ -4580,6 +4580,65 @@ fn param_frame_read(pos: u32) -> Option<Expr> {
     }
 }
 
+/// POSITIONAL_LOCAL param lift (`SH2_ASSUME_POSITIONAL_LOCAL`, default ON):
+/// a script function whose positionals (`$1..$9`, `$@`, `$*`, `$#`,
+/// `shift`) are consumed only inside the script — every reference is a
+/// STATIC `exec("f", args)` call site and the name appears nowhere else —
+/// takes its positional array as ONE ordinary parameter (`__pos`) instead
+/// of the runtime's global `sh2.positional` store. The define lowers to a
+/// plain `function f(__pos) { … }` (async when the body awaits) and every
+/// call site to `f([a1, a2, …])`: no `sh2.exec` dispatch, no Map lookup,
+/// no arg flatten, no positional save/restore. The map value records
+/// whether the define is SYNC (call sites do not await it).
+///
+/// ASSUMPTION (option-gated, default ON): no code outside the script can
+/// observe or replace the function's positionals mid-call (no `source`
+/// callback from a parent shell, no `declare -f`/`export -f`, no `trap`
+/// handler invoking it) — enforced conservatively by the analysis: the
+/// name must appear ONLY in static exec call sites (any other mention of
+/// the name as a string, or any non-exec call, disqualifies the lift).
+/// Bash semantics inside the script are preserved exactly: `$N` indexes
+/// the array (`?? ""`), `$@`/`$*` read it whole, `shift` reassigns the
+/// slice, and each call site passes a FRESH array literal (so `shift`
+/// cannot mutate a caller's array). `SH2_ASSUME_POSITIONAL_LOCAL=0`
+/// restores the runtime positional store + `sh2.exec` dispatch.
+static POS_LIFT: Mutex<Option<HashMap<String, bool>>> = Mutex::new(None);
+
+/// Set while the emitter lowers a positional-lifted function's define body
+/// (the `__pos` parameter is in scope). Saved/restored around nested
+/// body lowering.
+static POS_FRAME: Mutex<Option<()>> = Mutex::new(None);
+
+fn pos_lift_entry(name: &str) -> Option<bool> {
+    POS_LIFT
+        .lock()
+        .unwrap()
+        .as_ref()
+        .and_then(|m| m.get(name).copied())
+}
+
+fn pos_frame_active() -> bool {
+    POS_FRAME.lock().unwrap().is_some()
+}
+
+/// The positional array expression: the function's own `__pos` parameter
+/// inside a positional-lifted body, else the runtime store.
+fn positionals_expr() -> Expr {
+    if pos_frame_active() {
+        Expr::Identifier {
+            name: "__pos".to_string(),
+        }
+    } else {
+        sh2_member("positional")
+    }
+}
+
+/// SH2_ASSUME_POSITIONAL_LOCAL=0 — keep every positional-using function on
+/// the runtime `sh2.exec` / `sh2.positional` dispatch (maximal fidelity).
+fn positional_local_enabled() -> bool {
+    std::env::var("SH2_ASSUME_POSITIONAL_LOCAL").map_or(true, |v| v != "0")
+}
+
 /// Names of script-defined functions whose CALLS lower to the native
 /// `sh2.callDirect(__fn_f, args)` path (see [`direct_fn_set`] /
 /// [`try_native_fn_call`]): the SYNC subset whose every body is
@@ -6431,10 +6490,745 @@ fn param_lift_set(prog: &IrProgram) -> HashMap<String, usize> {
 }
 
 
-/// `let __fn_<name>` — the module binding name for a native-direct
-/// function, or None when the composed identifier would be invalid JS
-/// (shell function names may contain `-` etc.; those keep the fnCall
-/// dispatch).
+/// POSITIONAL_LOCAL analysis (see [`POS_LIFT`]): the set of script
+/// functions whose positionals are consumed only inside the script, mapped
+/// to whether their define arrow is SYNC (call sites must not await).
+///
+/// Eligibility (all conservative — a single failed check keeps the
+/// runtime path):
+///   - exactly ONE definition (redefinitions keep the runtime map);
+///   - the body contains NO nested function definition;
+///   - positional use is limited to `$1..$9` / `$@` / `$*` / `$#` reads and
+///     `shift`; `$0`, `set --`, positional `param(...)` slices, and runtime
+///     re-parsed texts (`arith`/`let`/`eval` carrying `$`) disqualify (they
+///     would read the runtime store, which the lift never populates);
+///   - every mention of the NAME is a static `exec("name", [...])` /
+///     `fnCall("name", ...)` call site whose args need no runtime flatten
+///     ([`direct_call_arg_ok`]); `fnValue`, `command`, `export -f`,
+///     `declare -f`, `trap`, echo text, … disqualify;
+///   - no DYNAMIC `exec`/`fnCall`/`fnValue` (non-literal command name)
+///     exists outside the lifted body itself — such a site could dispatch
+///     to the name at runtime, and the lifted define is not registered in
+///     the runtime function map;
+///   - the name binds as a valid JS identifier ([`direct_binding_name`]).
+fn pos_lift_set(prog: &IrProgram, sync_fns: &HashSet<String>) -> HashMap<String, bool> {
+    let mut out: HashMap<String, bool> = HashMap::new();
+    if !positional_local_enabled() {
+        return out;
+    }
+    let mut bodies: HashMap<String, Vec<&[IrStmt]>> = HashMap::new();
+    collect_fn_bodies(&prog.stmts, &mut bodies);
+    for sub in &prog.subs {
+        bodies.entry(sub.name.clone()).or_default().push(&sub.body);
+    }
+    if bodies.is_empty() {
+        return out;
+    }
+
+    #[derive(Default)]
+    struct PosUse {
+        uses: bool,
+        bad: bool,
+    }
+
+    /// Is this call a positional WRITE (`shift` / `set --`)?
+    fn pos_write_form(func: &str, args: &[IrExpr]) -> bool {
+        match func {
+            "set" | "shift" => true,
+            "exec" | "builtin" => matches!(
+                args.first(),
+                Some(IrExpr::Str(n, _)) if n == "set" || n == "shift"
+            ),
+            _ => false,
+        }
+    }
+
+    fn is_shift_call(func: &str, args: &[IrExpr]) -> bool {
+        func == "shift"
+            || matches!(args.first(), Some(IrExpr::Str(n, _)) if n == "shift")
+    }
+
+    /// Does the `shift` shape match the native lowering's accepted forms
+    /// (`shift` / `shift N` with a canonical decimal, see
+    /// `try_native_set_shift`)? Anything else keeps the runtime builtin.
+    fn native_shift_form(func: &str, args: &[IrExpr]) -> bool {
+        let items = if func == "shift" {
+            match args.first() {
+                Some(IrExpr::Array(items)) => Some(items.as_slice()),
+                _ => None,
+            }
+        } else {
+            match args.get(1) {
+                Some(IrExpr::Array(items)) => Some(items.as_slice()),
+                _ => None,
+            }
+        };
+        match items {
+            Some([]) => true,
+            Some([IrExpr::Str(sv, _)]) => {
+                !sv.is_empty() && sv.chars().all(|c| c.is_ascii_digit())
+            }
+            _ => false,
+        }
+    }
+
+    /// A positional WRITE anywhere inside a SUBSCOPE (`( … )`, `&`, a
+    /// pipeline stage, a capture/arrow body): bash discards the write with
+    /// the subshell, while the frame's `__pos` array is a shared binding —
+    /// the lift would leak it into the caller's view. Refuse.
+    fn pos_write_in_subscope(body: &[IrStmt]) -> bool {
+        /// Any positional write at ANY depth (whole-subtree check).
+        fn write_e(e: &IrExpr) -> bool {
+            match e {
+                IrExpr::Call { func, args } => {
+                    pos_write_form(func, args) || args.iter().any(write_e)
+                }
+                IrExpr::Arrow(stmts) | IrExpr::Lambda { body: stmts, .. } => write_ss(stmts),
+                IrExpr::Capture { expr: inner, .. } => write_e(inner),
+                IrExpr::Interpolate(parts) => parts.iter().any(|p| match p {
+                    InterpPart::Expr(x) => write_e(x),
+                    _ => false,
+                }),
+                IrExpr::Array(xs) => xs.iter().any(write_e),
+                IrExpr::BinOp { lhs, rhs, .. } => write_e(lhs) || write_e(rhs),
+                IrExpr::Ternary { cond, then, else_ } => {
+                    write_e(cond) || write_e(then) || write_e(else_)
+                }
+                IrExpr::DefinedOr { expr: a, default } => write_e(a) || write_e(default),
+                IrExpr::Index { key, .. } => write_e(key),
+                IrExpr::MethodCall { obj, args, .. } => write_e(obj) || args.iter().any(write_e),
+                IrExpr::Object(kv) => kv.iter().any(|(_, v)| write_e(v)),
+                IrExpr::Splice(x) => write_e(x),
+                _ => false,
+            }
+        }
+        fn write_ss(stmts: &[IrStmt]) -> bool {
+            stmts.iter().any(write_s)
+        }
+        fn write_s(st: &IrStmt) -> bool {
+            match st {
+                IrStmt::Subshell(b) | IrStmt::Background(b) => write_ss(b),
+                IrStmt::Pipeline { stages, .. } => stages.iter().any(|s| write_ss(s)),
+                IrStmt::Expr(e) => write_e(e),
+                IrStmt::Assign { expr: e, .. } => write_e(e),
+                IrStmt::Declare { init, .. } => init.as_ref().map(write_e).unwrap_or(false),
+                IrStmt::DeclareArray { elements, .. } => elements.iter().any(write_e),
+                IrStmt::If { cond, then, elsifs, else_ } => {
+                    write_e(cond)
+                        || write_ss(then)
+                        || elsifs.iter().any(|(c, b)| write_e(c) || write_ss(b))
+                        || write_ss(else_)
+                }
+                IrStmt::While { cond, body } | IrStmt::DoWhile { cond, body, .. } => {
+                    write_e(cond) || write_ss(body)
+                }
+                IrStmt::For { iter, body, .. } => write_e(iter) || write_ss(body),
+                IrStmt::ForInit { init, cond, step, body } => {
+                    write_ss(init) || write_e(cond) || write_ss(step) || write_ss(body)
+                }
+                IrStmt::Case { discriminant, clauses } => {
+                    write_e(discriminant) || clauses.iter().any(|c| write_ss(&c.body))
+                }
+                IrStmt::Redirect { inner, .. } => write_ss(inner),
+                IrStmt::Block(b) => write_ss(b),
+                IrStmt::Output { value, .. } => write_e(value),
+                IrStmt::Exec { cmd, args, .. } => write_e(cmd) || args.iter().any(write_e),
+                _ => false,
+            }
+        }
+
+        /// Locate SUBSCOPE nodes and flag a positional write inside one.
+        fn sub_e(e: &IrExpr) -> bool {
+            match e {
+                // a subscope — bash discards its positional writes
+                IrExpr::Arrow(stmts) | IrExpr::Lambda { body: stmts, .. } => {
+                    write_ss(stmts) || stmts.iter().any(sub_s)
+                }
+                IrExpr::Capture { expr: inner, .. } => write_e(inner) || sub_e(inner),
+                IrExpr::Call { args, .. } => args.iter().any(sub_e),
+                IrExpr::MethodCall { obj, args, .. } => sub_e(obj) || args.iter().any(sub_e),
+                IrExpr::Interpolate(parts) => parts.iter().any(|p| match p {
+                    InterpPart::Expr(x) => sub_e(x),
+                    _ => false,
+                }),
+                IrExpr::Array(xs) => xs.iter().any(sub_e),
+                IrExpr::BinOp { lhs, rhs, .. } => sub_e(lhs) || sub_e(rhs),
+                IrExpr::Ternary { cond, then, else_ } => {
+                    sub_e(cond) || sub_e(then) || sub_e(else_)
+                }
+                IrExpr::DefinedOr { expr: a, default } => sub_e(a) || sub_e(default),
+                IrExpr::Index { key, .. } => sub_e(key),
+                IrExpr::Object(kv) => kv.iter().any(|(_, v)| sub_e(v)),
+                IrExpr::Splice(x) => sub_e(x),
+                _ => false,
+            }
+        }
+        fn sub_s(st: &IrStmt) -> bool {
+            match st {
+                IrStmt::Subshell(b) | IrStmt::Background(b) => {
+                    write_ss(b) || b.iter().any(sub_s)
+                }
+                IrStmt::Pipeline { stages, .. } => stages
+                    .iter()
+                    .any(|s| write_ss(s) || s.iter().any(sub_s)),
+                IrStmt::Expr(e) => sub_e(e),
+                IrStmt::Assign { expr: e, .. } => sub_e(e),
+                IrStmt::Declare { init, .. } => init.as_ref().map(sub_e).unwrap_or(false),
+                IrStmt::DeclareArray { elements, .. } => elements.iter().any(sub_e),
+                IrStmt::If { cond, then, elsifs, else_ } => {
+                    sub_e(cond)
+                        || then.iter().any(sub_s)
+                        || elsifs.iter().any(|(c, b)| sub_e(c) || b.iter().any(sub_s))
+                        || else_.iter().any(sub_s)
+                }
+                IrStmt::While { cond, body } | IrStmt::DoWhile { cond, body, .. } => {
+                    sub_e(cond) || body.iter().any(sub_s)
+                }
+                IrStmt::For { iter, body, .. } => sub_e(iter) || body.iter().any(sub_s),
+                IrStmt::ForInit { init, cond, step, body } => {
+                    init.iter().any(sub_s)
+                        || sub_e(cond)
+                        || step.iter().any(sub_s)
+                        || body.iter().any(sub_s)
+                }
+                IrStmt::Case { discriminant, clauses } => {
+                    sub_e(discriminant) || clauses.iter().any(|c| c.body.iter().any(sub_s))
+                }
+                IrStmt::Redirect { inner, .. } => inner.iter().any(sub_s),
+                IrStmt::Block(b) => b.iter().any(sub_s),
+                IrStmt::Output { value, .. } => sub_e(value),
+                IrStmt::Exec { cmd, args, .. } => sub_e(cmd) || args.iter().any(sub_e),
+                _ => false,
+            }
+        }
+        body.iter().any(sub_s)
+    }
+
+    fn scan_arith(a: &ArithAst, u: &mut PosUse) {
+        match a {
+            ArithAst::Var(n) | ArithAst::Ident(n) => match n.as_str() {
+                "@" | "*" | "#" => u.uses = true,
+                "0" => u.bad = true,
+                _ => {
+                    if let Ok(d) = n.parse::<u32>() {
+                        if (1..=9).contains(&d) {
+                            u.uses = true;
+                        } else {
+                            u.bad = true;
+                        }
+                    }
+                }
+            },
+            ArithAst::Index { key, .. } => scan_arith(key, u),
+            ArithAst::Bin { lhs, rhs, .. } => {
+                scan_arith(lhs, u);
+                scan_arith(rhs, u);
+            }
+            ArithAst::Un { arg, .. } | ArithAst::Cast { arg, .. } => scan_arith(arg, u),
+            ArithAst::Cond { test, then, else_ } => {
+                scan_arith(test, u);
+                scan_arith(then, u);
+                scan_arith(else_, u);
+            }
+            ArithAst::Assign { rhs, .. } => scan_arith(rhs, u),
+            _ => {}
+        }
+    }
+
+    fn scan_expr(e: &IrExpr, u: &mut PosUse) {
+        match e {
+            IrExpr::Var(n, _) | IrExpr::Ident(n) => match n.as_str() {
+                "@" | "*" | "#" => u.uses = true,
+                "0" => u.bad = true,
+                _ => {
+                    if let Ok(d) = n.parse::<u32>() {
+                        if (1..=9).contains(&d) {
+                            u.uses = true;
+                        } else {
+                            u.bad = true;
+                        }
+                    }
+                }
+            },
+            IrExpr::Int(_) | IrExpr::Bool(_) => {}
+            IrExpr::Arith(a) => scan_arith(a, u),
+            IrExpr::Index { key, .. } => scan_expr(key, u),
+            IrExpr::BinOp { lhs, rhs, .. } => {
+                scan_expr(lhs, u);
+                scan_expr(rhs, u);
+            }
+            IrExpr::Ternary { cond, then, else_ } => {
+                scan_expr(cond, u);
+                scan_expr(then, u);
+                scan_expr(else_, u);
+            }
+            IrExpr::DefinedOr { expr, default } => {
+                scan_expr(expr, u);
+                scan_expr(default, u);
+            }
+            IrExpr::Interpolate(parts) => {
+                for p in parts {
+                    if let InterpPart::Expr(x) = p {
+                        scan_expr(x, u);
+                    }
+                }
+            }
+            IrExpr::Capture { expr, .. } => scan_expr(expr, u),
+            IrExpr::MethodCall { obj, args, .. } => {
+                scan_expr(obj, u);
+                for a in args {
+                    scan_expr(a, u);
+                }
+            }
+            IrExpr::Call { func, args } => {
+                // positional WRITES: `shift` is frame-correct only in the
+                // form the native lowering handles (`shift` / `shift N` with a
+                // canonical decimal N — exactly what try_native_set_shift
+                // accepts); `set --` and dynamic counts fall back to the
+                // runtime store and would desync from `__pos`.
+                if pos_write_form(func, args) {
+                    if is_shift_call(func, args) && native_shift_form(func, args) {
+                        u.uses = true;
+                    } else {
+                        u.bad = true;
+                    }
+                }
+                // `getVar("1")` / `listVar("@")` / `param(op, "@", …)` carry
+                // the positional name as a STRING argument (the bash
+                // frontend's shape) — the Var arms above never see it.
+                match func.as_str() {
+                    "arith" | "let" | "eval" => {
+                        for a in args {
+                            if let IrExpr::Str(x, _) = a {
+                                if x.contains('$') {
+                                    u.bad = true;
+                                }
+                            }
+                        }
+                    }
+                    "getVar" | "listVar" => {
+                        if let Some(IrExpr::Str(n, _)) = args.first() {
+                            match n.as_str() {
+                                "@" | "*" | "#" => u.uses = true,
+                                "0" => u.bad = true,
+                                _ => {
+                                    if let Ok(d) = n.parse::<u32>() {
+                                        if (1..=9).contains(&d) {
+                                            u.uses = true;
+                                        } else {
+                                            u.bad = true;
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    }
+                    "param" => {
+                        // a positional in the NAME slot is a slice/expansion
+                        // form the frame does not render — refuse
+                        if let Some(IrExpr::Str(n, _)) = args.get(1) {
+                            let pos = matches!(n.as_str(), "@" | "*" | "#")
+                                || n.parse::<u32>().is_ok();
+                            if pos {
+                                u.uses = true;
+                                u.bad = true;
+                            }
+                        }
+                    }
+                    _ => {}
+                }
+                for a in args {
+                    scan_expr(a, u);
+                }
+            }
+            IrExpr::Arrow(stmts) | IrExpr::Lambda { body: stmts, .. } => {
+                for s in stmts {
+                    scan_stmt(s, u);
+                }
+            }
+            IrExpr::Array(xs) => {
+                for x in xs {
+                    scan_expr(x, u);
+                }
+            }
+            IrExpr::Object(kv) => {
+                for (_, v) in kv {
+                    scan_expr(v, u);
+                }
+            }
+            IrExpr::Splice(x) => scan_expr(x, u),
+            // unanalysable: never lift
+            IrExpr::ArrayComp { .. } | IrExpr::Ext(_) | IrExpr::RawExpr(_) | IrExpr::Json(_) => {
+                u.bad = true
+            }
+            _ => {}
+        }
+    }
+
+    fn scan_stmt(st: &IrStmt, u: &mut PosUse) {
+        match st {
+            // a nested define has its OWN positionals when called — refuse
+            IrStmt::Function { .. } => u.bad = true,
+            IrStmt::Output { value, .. } => scan_expr(value, u),
+            IrStmt::WriteFile { path, content, .. } => {
+                scan_expr(path, u);
+                scan_expr(content, u);
+            }
+            IrStmt::Assign { expr, targets, .. } => {
+                for t in targets {
+                    if t.var.parse::<u32>().is_ok() {
+                        u.bad = true;
+                    }
+                }
+                scan_expr(expr, u);
+            }
+            IrStmt::Declare { init, .. } => {
+                if let Some(i) = init {
+                    scan_expr(i, u);
+                }
+            }
+            IrStmt::DeclareArray { elements, .. } => {
+                for e in elements {
+                    scan_expr(e, u);
+                }
+            }
+            IrStmt::If { cond, then, elsifs, else_ } => {
+                scan_expr(cond, u);
+                for s in then {
+                    scan_stmt(s, u);
+                }
+                for (c, b) in elsifs {
+                    scan_expr(c, u);
+                    for s in b {
+                        scan_stmt(s, u);
+                    }
+                }
+                for s in else_ {
+                    scan_stmt(s, u);
+                }
+            }
+            IrStmt::Try { body, excepts, else_body, finally_body } => {
+                for s in body {
+                    scan_stmt(s, u);
+                }
+                for ex in excepts {
+                    if let Some(m) = &ex.match_expr {
+                        scan_expr(m, u);
+                    }
+                    for s in &ex.body {
+                        scan_stmt(s, u);
+                    }
+                }
+                for s in else_body {
+                    scan_stmt(s, u);
+                }
+                for s in finally_body {
+                    scan_stmt(s, u);
+                }
+            }
+            IrStmt::For { var, iter, body } => {
+                if var.parse::<u32>().is_ok() {
+                    u.bad = true;
+                }
+                scan_expr(iter, u);
+                for s in body {
+                    scan_stmt(s, u);
+                }
+            }
+            IrStmt::ForInit { init, cond, step, body } => {
+                for s in init {
+                    scan_stmt(s, u);
+                }
+                scan_expr(cond, u);
+                for s in step {
+                    scan_stmt(s, u);
+                }
+                for s in body {
+                    scan_stmt(s, u);
+                }
+            }
+            IrStmt::While { cond, body } | IrStmt::DoWhile { cond, body, .. } => {
+                scan_expr(cond, u);
+                for s in body {
+                    scan_stmt(s, u);
+                }
+            }
+            IrStmt::Die { expr, .. } | IrStmt::Warn { expr, .. } | IrStmt::SetChildError(expr) => {
+                scan_expr(expr, u)
+            }
+            IrStmt::Exec { cmd, args, redirects, env, .. } => {
+                scan_expr(cmd, u);
+                for a in args {
+                    scan_expr(a, u);
+                }
+                for r in redirects {
+                    scan_expr(r, u);
+                }
+                for (_, v) in env {
+                    scan_expr(v, u);
+                }
+            }
+            IrStmt::Pipeline { stages, .. } => {
+                for stage in stages {
+                    for s in stage {
+                        scan_stmt(s, u);
+                    }
+                }
+            }
+            IrStmt::Return(x) | IrStmt::Exit(x) => {
+                if let Some(x) = x {
+                    scan_expr(x, u);
+                }
+            }
+            IrStmt::Case { discriminant, clauses } => {
+                scan_expr(discriminant, u);
+                for c in clauses {
+                    for s in &c.body {
+                        scan_stmt(s, u);
+                    }
+                }
+            }
+            IrStmt::Redirect { inner, redirects } => {
+                for s in inner {
+                    scan_stmt(s, u);
+                }
+                for r in redirects {
+                    scan_expr(&r.target, u);
+                }
+            }
+            IrStmt::Subshell(body) | IrStmt::Background(body) | IrStmt::Block(body) => {
+                for s in body {
+                    scan_stmt(s, u);
+                }
+            }
+            IrStmt::Select { clauses } => {
+                for c in clauses {
+                    for s in &c.body {
+                        scan_stmt(s, u);
+                    }
+                }
+            }
+            IrStmt::Expr(e) => scan_expr(e, u),
+            _ => {}
+        }
+    }
+
+    // Call-site scan. `found` counts static sites; `bad` also flags any
+    // non-static mention of the name, any dynamic dispatch OUTSIDE the
+    // lifted body, and any call arg that needs the runtime flatten.
+    fn scan_calls_expr(
+        e: &IrExpr,
+        name: &str,
+        found: &mut usize,
+        bad: &mut bool,
+    ) {
+        match e {
+            IrExpr::Call { func, args } => {
+                let is_call = matches!(func.as_str(), "exec" | "fnCall" | "fnValue");
+                let mut name_slot = false;
+                if is_call {
+                    match args.first() {
+                        Some(IrExpr::Str(n, _)) if n == name => {
+                            name_slot = true;
+                            if func == "fnValue" {
+                                // the value-position emission does not go
+                                // through the native call arm
+                                *bad = true;
+                            } else {
+                                *found += 1;
+                                match args.get(1) {
+                                    Some(IrExpr::Array(elems)) => {
+                                        if !elems.iter().all(pos_call_arg_ok) {
+                                            *bad = true;
+                                        }
+                                    }
+                                    Some(_) => *bad = true,
+                                    None => {}
+                                }
+                            }
+                        }
+                        Some(IrExpr::Str(..)) => {}
+                        _ => *bad = true, // dynamic dispatch
+                    }
+                }
+                // the name as ANY other string argument is a dynamic ref
+                // (arg 0 of a matched static site is the name itself)
+                for (i, a) in args.iter().enumerate() {
+                    if name_slot && i == 0 {
+                        continue;
+                    }
+                    if let IrExpr::Str(s, _) = a {
+                        if s == name {
+                            *bad = true;
+                        }
+                    }
+                    scan_calls_expr(a, name, found, bad);
+                }
+            }
+            IrExpr::Arrow(stmts) | IrExpr::Lambda { body: stmts, .. } => {
+                for s in stmts {
+                    scan_calls_stmt(s, name, found, bad);
+                }
+            }
+            IrExpr::Interpolate(parts) => {
+                for p in parts {
+                    if let InterpPart::Expr(x) = p {
+                        scan_calls_expr(x, name, found, bad);
+                    }
+                }
+            }
+            IrExpr::Array(xs) => {
+                for x in xs {
+                    scan_calls_expr(x, name, found, bad);
+                }
+            }
+            _ => {}
+        }
+    }
+
+    fn scan_calls_stmt(st: &IrStmt, name: &str, found: &mut usize, bad: &mut bool) {
+        match st {
+            IrStmt::Assign { expr, .. } => scan_calls_expr(expr, name, found, bad),
+            IrStmt::Expr(e) => scan_calls_expr(e, name, found, bad),
+            IrStmt::Output { value, .. } => scan_calls_expr(value, name, found, bad),
+            IrStmt::Declare { init, .. } => {
+                if let Some(i) = init {
+                    scan_calls_expr(i, name, found, bad);
+                }
+            }
+            IrStmt::DeclareArray { elements, .. } => {
+                for e in elements {
+                    scan_calls_expr(e, name, found, bad);
+                }
+            }
+            IrStmt::If { cond, then, elsifs, else_ } => {
+                scan_calls_expr(cond, name, found, bad);
+                for s in then {
+                    scan_calls_stmt(s, name, found, bad);
+                }
+                for (c, b) in elsifs {
+                    scan_calls_expr(c, name, found, bad);
+                    for s in b {
+                        scan_calls_stmt(s, name, found, bad);
+                    }
+                }
+                for s in else_ {
+                    scan_calls_stmt(s, name, found, bad);
+                }
+            }
+            IrStmt::While { cond, body } | IrStmt::DoWhile { cond, body, .. } => {
+                scan_calls_expr(cond, name, found, bad);
+                for s in body {
+                    scan_calls_stmt(s, name, found, bad);
+                }
+            }
+            IrStmt::ForInit { init, cond, step, body } => {
+                for s in init {
+                    scan_calls_stmt(s, name, found, bad);
+                }
+                scan_calls_expr(cond, name, found, bad);
+                for s in step {
+                    scan_calls_stmt(s, name, found, bad);
+                }
+                for s in body {
+                    scan_calls_stmt(s, name, found, bad);
+                }
+            }
+            IrStmt::For { iter, body, .. } => {
+                scan_calls_expr(iter, name, found, bad);
+                for s in body {
+                    scan_calls_stmt(s, name, found, bad);
+                }
+            }
+            IrStmt::Case { discriminant, clauses } => {
+                scan_calls_expr(discriminant, name, found, bad);
+                for c in clauses {
+                    for s in &c.body {
+                        scan_calls_stmt(s, name, found, bad);
+                    }
+                }
+            }
+            IrStmt::Pipeline { stages, .. } => {
+                for stage in stages {
+                    for s in stage {
+                        scan_calls_stmt(s, name, found, bad);
+                    }
+                }
+            }
+            IrStmt::Redirect { inner, .. } => {
+                for s in inner {
+                    scan_calls_stmt(s, name, found, bad);
+                }
+            }
+            IrStmt::Subshell(body) | IrStmt::Background(body) | IrStmt::Block(body) => {
+                for s in body {
+                    scan_calls_stmt(s, name, found, bad);
+                }
+            }
+            IrStmt::Return(Some(x)) | IrStmt::Exit(Some(x)) | IrStmt::SetChildError(x) => {
+                scan_calls_expr(x, name, found, bad)
+            }
+            _ => {}
+        }
+    }
+
+    for (name, defs) in &bodies {
+        if defs.len() != 1 {
+            continue;
+        }
+        if direct_binding_name(name).is_none() {
+            continue;
+        }
+        let mut u = PosUse::default();
+        for st in defs[0] {
+            scan_stmt(st, &mut u);
+        }
+        let subwrite = pos_write_in_subscope(defs[0]);
+        if subwrite {
+            u.bad = true;
+        }
+        if u.bad || !u.uses {
+            if std::env::var("SH2_DBG_POSL").is_ok() {
+                eprintln!(
+                    "DBG posl-body-reject {name}: uses={} bad={} subwrite={subwrite}",
+                    u.uses, u.bad
+                );
+            }
+            continue;
+        }
+        let mut found = 0usize;
+        let mut bad = false;
+        for st in &prog.stmts {
+            // skip the definition itself: its body legitimately contains the
+            // function's own `"$@"` dynamic exec
+            if matches!(st, IrStmt::Function { name: n, .. } if n == name) {
+                continue;
+            }
+            scan_calls_stmt(st, name, &mut found, &mut bad);
+        }
+        for sub in &prog.subs {
+            if sub.name == *name {
+                continue;
+            }
+            for st in &sub.body {
+                scan_calls_stmt(st, name, &mut found, &mut bad);
+            }
+        }
+        if bad || found == 0 {
+            if std::env::var("SH2_DBG_POSL").is_ok() {
+                eprintln!(
+                    "DBG posl-reject {name}: uses={} bad_body={} found={found} bad_sites={bad} defs={}",
+                    u.uses, u.bad, defs.len()
+                );
+            }
+            continue;
+        }
+        out.insert(name.clone(), sync_fns.contains(name));
+    }
+    out
+}
+
+
 ///
 /// The `__fn_` prefix is applied ONLY when the plain name would collide
 /// with a JS reserved word, a JS global the generated code uses, or a
@@ -6586,7 +7380,12 @@ fn str_has_positional_ref(s: &str) -> bool {
 ///     code that would run under the current positionals).
 fn estree_reads_positional(e: &Expr) -> bool {
     match e {
-        Expr::Identifier { .. } | Expr::SpreadElement { .. } => false,
+        // `[...sh2.positional]` — the native `"$@"` list lowering IS a
+        // positional read (the spread's argument must be walked; treating
+        // the node as inert made a positional-using function look
+        // positional-free to the direct-call analysis).
+        Expr::SpreadElement { argument } => estree_reads_positional(argument),
+        Expr::Identifier { .. } => false,
         Expr::AssignmentPattern { left, right } => {
             estree_reads_positional(left) || estree_reads_positional(right)
         }
@@ -32756,6 +33555,1286 @@ fn array_migrate_program(program: &mut Program, module_bound: &HashSet<String>) 
     }
 }
 
+// ── Native associative-map migration (SH2_ASSUME_NATIVE_ASSOC) ─────────
+//
+// A top-level `declare -A M` emits `sh2.assocNames.add("M")`, and every later
+// touch is a *text* round-trip through the runtime store:
+//
+//     sh2.setVar("map[foo]", v)          // name-text regex + normAssocKey
+//     sh2.arrayIndex("map", k)           // name-text + evalArith/expandWord
+//     sh2.arrayItems("map")              // keys copy
+//     sh2.arrayLen("map")                // count
+//
+// When the map is provably unobservable outside this script (the
+// SELF_CONTAINED / NO_RUNTIME_REFLECTION assumption) the whole family lowers
+// to a native `Map` — the ladder's cheapest rung:
+//
+//     let map;                                  // hoisted, so reads before
+//     (map = new Map())                         //   the declare stay ""
+//     (map || (map = new Map()), map.set("foo", String(v ?? "")), true)
+//     (map && map.has(k)) ? String(map.get(k)) : ""
+//     [...(map ? map.keys() : [])] / [...(map ? map.values() : [])]
+//     String(map ? map.size : 0)
+//
+// SOUNDNESS (fail-closed — one unclassified touch refuses the whole map):
+//  * exactly ONE declaration site, and it is a direct top-level statement
+//    (a re-executed `map = new Map()` inside a loop would CLEAR the map,
+//    where `assocNames.add` is idempotent);
+//  * no nested `declare -A` for the name (a function-local would shadow);
+//  * every key is a compile-time-inert literal (no `$`, backtick, `\` or
+//    leading `~`) or a plain Identifier — no key text the runtime's
+//    `normAssocKey`→`expandWord` could rewrite;
+//  * no writes inside a subshell/capture/pipeline/redirect body (those run
+//    against a CLONED store, so a write could not escape — a native global
+//    would leak it);
+//  * name-mention budget: every literal occurrence of the name (in an
+//    EXPANDABLE position: an `sh2.*`/user-call argument or a template) must
+//    be one of the whitelisted sites — anything left over ( `test`/`arith`/
+//    `eval`/`exec` text, a nameref, `declare -p`, a prose literal) refuses;
+//  * no bare `M` identifier, no `sh2.vars.M`, no dynamic-name store call,
+//    no `eval`/`source` dispatch.
+//
+// DOCUMENTED ASSUMPTION — SH2_ASSUME_NATIVE_ASSOC (ON by default; `=0`
+// turns it off for maximal fidelity):
+//  * the map is never observed from outside the script: no parent-shell
+//    `declare -p`/`set` dump, no `read`/`mapfile` into it, no export;
+//  * assoc KEYS are inert data (a key whose *value* carries `$`/backticks
+//    would be re-expanded by the runtime's `normAssocKey`, but not by a
+//    native Map);
+//  * assoc VALUES are scalars (the runtime space-joins an array RHS; an
+//    array-valued write refuses the map here).
+fn native_assoc_enabled() -> bool {
+    match std::env::var("SH2_ASSUME_NATIVE_ASSOC") {
+        Ok(v) => !(v.is_empty() || v == "0" || v.eq_ignore_ascii_case("false")),
+        Err(_) => true,
+    }
+}
+
+fn na_str(s: &str) -> Expr {
+    Expr::Literal {
+        value: serde_json::Value::from(s),
+        raw: None,
+        regex: None,
+    }
+}
+
+fn na_id(n: &str) -> Expr {
+    Expr::Identifier {
+        name: n.to_string(),
+    }
+}
+
+fn na_bool(b: bool) -> Expr {
+    Expr::Literal {
+        value: serde_json::Value::Bool(b),
+        raw: None,
+        regex: None,
+    }
+}
+
+fn na_num(n: i64) -> Expr {
+    Expr::Literal {
+        value: serde_json::Value::from(n),
+        raw: None,
+        regex: None,
+    }
+}
+
+fn na_new_map() -> Expr {
+    Expr::NewExpression {
+        callee: Box::new(na_id("Map")),
+        arguments: vec![],
+    }
+}
+
+fn na_member_call(obj: Expr, prop: &str, args: Vec<Expr>) -> Expr {
+    Expr::CallExpression {
+        callee: Box::new(Expr::MemberExpression {
+            object: Box::new(obj),
+            property: Box::new(na_id(prop)),
+            computed: false,
+            optional: false,
+        }),
+        arguments: args,
+        optional: false,
+    }
+}
+
+fn na_binary(op: &str, l: Expr, r: Expr) -> Expr {
+    Expr::BinaryExpression {
+        operator: op.to_string(),
+        left: Box::new(l),
+        right: Box::new(r),
+    }
+}
+
+fn na_logical(op: &str, l: Expr, r: Expr) -> Expr {
+    Expr::LogicalExpression {
+        operator: op.to_string(),
+        left: Box::new(l),
+        right: Box::new(r),
+    }
+}
+
+fn na_cond(t: Expr, c: Expr, a: Expr) -> Expr {
+    Expr::ConditionalExpression {
+        test: Box::new(t),
+        consequent: Box::new(c),
+        alternate: Box::new(a),
+    }
+}
+
+fn na_string_of(e: Expr) -> Expr {
+    Expr::CallExpression {
+        callee: Box::new(na_id("String")),
+        arguments: vec![e],
+        optional: false,
+    }
+}
+
+/// `[...M.keys()]` / `[...M.values()]` — the runtime's `[...store.keys()]`
+/// copy (spread INSIDE the array literal so the conditional wrapper never
+/// meets a spread-precedence hazard).
+fn na_map_copy(m: &str, prop: &str) -> Expr {
+    Expr::ArrayExpression {
+        elements: vec![Some(Expr::SpreadElement {
+            argument: Box::new(na_member_call(na_id(m), prop, vec![])),
+        })],
+    }
+}
+
+/// `(M || (M = new Map()))` — the lazy home shared by every rewrite (reads
+/// before the declaration see `""`, exactly like an unset assoc element).
+fn na_home(m: &str) -> Expr {
+    na_logical(
+        "||",
+        na_id(m),
+        Expr::AssignmentExpression {
+            operator: "=".to_string(),
+            left: Box::new(na_id(m)),
+            right: Box::new(na_new_map()),
+        },
+    )
+}
+
+/// The runtime's `normAssocKey` (quote/bracket strip) restricted to keys it
+/// cannot rewrite: any `$`, backtick, backslash or leading `~` goes through
+/// `expandWord` at runtime and therefore refuses the native fold.
+fn assoc_literal_key(k: &str) -> Option<String> {
+    let mut s = k.trim();
+    if s.starts_with('[') && s.ends_with(']') && s.len() >= 2 {
+        s = &s[1..s.len() - 1];
+        s = s.trim();
+    }
+    let bytes = s.as_bytes();
+    if bytes.len() >= 2 {
+        let q = bytes[0];
+        if (q == b'"' || q == b'\'') && bytes[bytes.len() - 1] == q {
+            s = &s[1..s.len() - 1];
+        }
+    }
+    if s.contains('$') || s.contains('`') || s.contains('\\') || s.starts_with('~') {
+        return None;
+    }
+    // an empty assoc key is legal but the runtime's baked-name regex
+    // (`\[([^\]]+)\]`) cannot carry one — refuse rather than guess
+    if s.is_empty() {
+        return None;
+    }
+    Some(s.to_string())
+}
+
+#[derive(Default)]
+struct AssocRefs {
+    /// Top-level statement indices of `assocNames.add("M")` sites.
+    decl_idxs: Vec<usize>,
+    /// Whitelisted sites that consumed the name argument.
+    sites: usize,
+    /// Literal occurrences of the name in expandable positions.
+    str_refs: usize,
+    /// Bare `M` identifiers.
+    ident_refs: usize,
+    /// Writes inside an isolated (cloned-store) body.
+    write_isolated: bool,
+    /// A second/nested declaration of the same name.
+    nested_decl: bool,
+    poisoned: bool,
+}
+
+#[derive(Clone, Copy)]
+struct NaCtx {
+    /// Not the direct top-level statement expression any more.
+    nested: bool,
+    /// Inside an arrow/function body.
+    in_fn: bool,
+    /// Inside a subshell/capture/pipeline/redirect body (cloned store).
+    in_iso: bool,
+    /// A literal here is plain data the runtime never re-expands.
+    no_expand: bool,
+    top_idx: usize,
+}
+
+/// Functions whose FIRST argument is a store name — a non-literal first arg
+/// can touch the map invisibly.
+fn na_name_taking(func: &str) -> bool {
+    matches!(
+        func,
+        "getVar"
+            | "setVar"
+            | "setArray"
+            | "setArrayAppend"
+            | "arrayIndex"
+            | "arrayLen"
+            | "arrayItems"
+            | "arrayValues"
+            | "arrayKeys"
+            | "assocValues"
+            | "assocKeys"
+            | "assocGet"
+            | "assocSet"
+            | "assocDel"
+            | "toAssocInto"
+            | "param"
+            | "assign"
+            | "listVar"
+            | "memStore"
+            | "memLoad"
+            | "addrOf"
+            | "sortedIntJoin"
+            | "sortedBigintJoin"
+            | "unset"
+            | "export"
+    )
+}
+
+/// Call wrappers whose arrow bodies run against a CLONED store.
+fn na_isolated(func: &str) -> bool {
+    matches!(
+        func,
+        "subshell"
+            | "subshellSync"
+            | "background"
+            | "capture"
+            | "captureSync"
+            | "captureWords"
+            | "captureWordsSync"
+            | "pipeline"
+            | "pipelineSync"
+            | "pipelineCapture"
+            | "pipelineCaptureSync"
+            | "redirect"
+            | "redirectSync"
+    )
+}
+
+fn na_poison_call(func: &str, args: &[Expr]) -> bool {
+    if na_name_taking(func) && !matches!(args.first(), Some(Expr::Literal { value, .. }) if value.is_string()) {
+        return true;
+    }
+    // `eval` / `source` run arbitrary text that may name the map.
+    if (func == "exec" || func == "builtin") {
+        match args.first() {
+            Some(Expr::Literal { value, .. }) => {
+                if matches!(value.as_str(), Some("eval" | "source" | ".")) {
+                    return true;
+                }
+            }
+            _ => return true, // dynamic command: could be eval/source
+        }
+    }
+    false
+}
+
+fn na_scan_expr(e: &Expr, name: &str, ctx: NaCtx, a: &mut AssocRefs) {
+    match e {
+        Expr::Literal { value, .. } => {
+            if ctx.no_expand {
+                return;
+            }
+            if let Some(s) = value.as_str() {
+                if array_str_mentions(s, name) {
+                    a.str_refs += 1;
+                }
+            }
+        }
+        Expr::Identifier { name: n } => {
+            if n == name {
+                a.ident_refs += 1;
+            }
+        }
+        Expr::MemberExpression {
+            object,
+            property,
+            computed,
+            ..
+        } => {
+            // `sh2.vars.M` (a store read of the map itself) — refuse.
+            if let Expr::MemberExpression {
+                object: inner,
+                property: mid,
+                computed: mid_computed,
+                ..
+            } = object.as_ref()
+            {
+                if !mid_computed
+                    && matches!(inner.as_ref(), Expr::Identifier { name: o } if o == "sh2")
+                    && matches!(mid.as_ref(), Expr::Identifier { name: p } if p == "vars")
+                {
+                    let hit = match property.as_ref() {
+                        Expr::Identifier { name: p } if !computed => p == name,
+                        Expr::Literal { value, .. } => value.as_str() == Some(name),
+                        _ => true, // dynamic member read: could be the map
+                    };
+                    if hit {
+                        a.poisoned = true;
+                    }
+                }
+            }
+            // Direct store-map access (`sh2.arrays`/`assocStore`/`assocNames`
+            // chains other than the decl/add form) bypasses every helper.
+            fn chain_root_sh2(e: &Expr) -> bool {
+                match e {
+                    Expr::Identifier { name } => name == "sh2",
+                    Expr::MemberExpression { object, .. } => chain_root_sh2(object),
+                    _ => false,
+                }
+            }
+            if let Expr::MemberExpression {
+                object: o2,
+                property: p2,
+                ..
+            } = e
+            {
+                let store_prop = match p2.as_ref() {
+                    Expr::Identifier { name: p } => {
+                        matches!(p.as_str(), "arrays" | "assocStore")
+                    }
+                    Expr::Literal { value, .. } => {
+                        matches!(value.as_str(), Some("arrays" | "assocStore"))
+                    }
+                    _ => false,
+                };
+                if store_prop && chain_root_sh2(o2) {
+                    a.poisoned = true;
+                }
+            }
+            na_scan_expr(object, name, ctx, a);
+            if *computed {
+                na_scan_expr(property, name, ctx, a);
+            }
+        }
+        Expr::CallExpression {
+            callee, arguments, ..
+        } => {
+            // `sh2.assocNames.add("M")` — the `declare -A M` site (its
+            // callee object is itself a member chain, so it must be matched
+            // before the generic `sh2.*` unwrap below).
+            if let Expr::MemberExpression {
+                object: ic,
+                property: ip,
+                computed: false,
+                ..
+            } = callee.as_ref()
+            {
+                if matches!(ip.as_ref(), Expr::Identifier { name: p } if p == "add") {
+                    if let Expr::MemberExpression {
+                        object: o2,
+                        property: p2,
+                        computed: false,
+                        ..
+                    } = ic.as_ref()
+                    {
+                        if matches!(p2.as_ref(), Expr::Identifier { name: p } if p == "assocNames")
+                            && matches!(o2.as_ref(), Expr::Identifier { name: o } if o == "sh2")
+                        {
+                            if let Some(Expr::Literal { value, .. }) = arguments.first() {
+                                if value.as_str() == Some(name) {
+                                    if ctx.nested || ctx.in_fn || ctx.in_iso {
+                                        a.nested_decl = true;
+                                    } else {
+                                        a.decl_idxs.push(ctx.top_idx);
+                                    }
+                                    a.sites += 1;
+                                    a.str_refs += 1;
+                                }
+                            }
+                            return;
+                        }
+                    }
+                }
+            }
+            let mut func: Option<&str> = None;
+            if let Expr::MemberExpression {
+                object,
+                property,
+                computed,
+                ..
+            } = callee.as_ref()
+            {
+                if !computed
+                    && matches!(object.as_ref(), Expr::Identifier { name: o } if o == "sh2")
+                {
+                    if let Expr::Identifier { name: f } = property.as_ref() {
+                        func = Some(f.as_str());
+                    } else {
+                        a.poisoned = true; // sh2[<dynamic>]
+                    }
+                }
+            }
+            if let Some(f) = func {
+                if na_poison_call(f, arguments) {
+                    a.poisoned = true;
+                }
+                // Classify the name-bearing shapes. A recognised first
+                // argument is CONSUMED by the site count — it must not be
+                // re-counted as a bare literal mention below.
+                let mut skip_first = false;
+                let first_lit = match arguments.first() {
+                    Some(Expr::Literal { value, .. }) => value.as_str(),
+                    _ => None,
+                };
+                // Some(Some(key)) — element form; Some(None) — bare name.
+                fn arg_name_hit<'a>(nm: &'a str, name: &str) -> Option<Option<&'a str>> {
+                    if nm == name {
+                        return Some(None);
+                    }
+                    nm.strip_prefix(name)
+                        .and_then(|r| r.strip_prefix('['))
+                        .and_then(|r| r.strip_suffix(']'))
+                        .map(Some)
+                }
+                match f {
+                    "setVar" | "assocSet" => {
+                        if let Some(nm) = first_lit {
+                            if let Some(hit) = arg_name_hit(nm, name) {
+                                skip_first = true;
+                                match hit {
+                                    None => a.poisoned = true, // scalar write to an assoc
+                                    Some(k) => {
+                                        if assoc_literal_key(k).is_none() {
+                                            a.poisoned = true;
+                                        } else {
+                                            a.sites += 1;
+                                            a.str_refs += 1;
+                                            if ctx.in_iso {
+                                                a.write_isolated = true;
+                                            }
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    }
+                    "getVar" | "arrayIndex" => {
+                        if let Some(nm) = first_lit {
+                            if let Some(hit) = arg_name_hit(nm, name) {
+                                skip_first = true;
+                                match hit {
+                                    None => {
+                                        if f == "getVar" {
+                                            a.poisoned = true; // `${M}`
+                                        } else {
+                                            // `arrayIndex("M", key)`
+                                            let key_ok = match arguments.get(1) {
+                                                None => false,
+                                                Some(Expr::Literal { value, .. }) => {
+                                                    match value.as_str() {
+                                                        Some(k) => {
+                                                            k == "@"
+                                                                || k == "*"
+                                                                || assoc_literal_key(k).is_some()
+                                                        }
+                                                        None => false,
+                                                    }
+                                                }
+                                                Some(Expr::Identifier { .. }) => true,
+                                                Some(_) => false,
+                                            };
+                                            if !key_ok {
+                                                a.poisoned = true;
+                                            } else {
+                                                a.sites += 1;
+                                                a.str_refs += 1;
+                                            }
+                                        }
+                                    }
+                                    Some(k) => {
+                                        if assoc_literal_key(k).is_none() {
+                                            a.poisoned = true;
+                                        } else {
+                                            a.sites += 1;
+                                            a.str_refs += 1;
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    }
+                    "arrayItems" | "arrayKeys" | "arrayValues" | "arrayLen" => {
+                        if let Some(nm) = first_lit {
+                            if arg_name_hit(nm, name).is_some() {
+                                skip_first = true;
+                                // only the bare-name form is meaningful
+                                if !matches!(arguments.len(), 1) || nm != name {
+                                    a.poisoned = true;
+                                } else {
+                                    a.sites += 1;
+                                    a.str_refs += 1;
+                                }
+                            }
+                        }
+                    }
+                    _ => {}
+                }
+                // Recurse: isolated bodies vs script-function bodies.
+                let iso = ctx.in_iso || na_isolated(f);
+                let child = NaCtx {
+                    nested: true,
+                    in_fn: true,
+                    in_iso: iso,
+                    no_expand: ctx.no_expand,
+                    top_idx: ctx.top_idx,
+                };
+                for (i, arg) in arguments.iter().enumerate() {
+                    if i == 0 && skip_first {
+                        continue;
+                    }
+                    na_scan_expr(arg, name, child, a);
+                }
+                return;
+            }
+            // A plain JS member call the emitter generates itself
+            // (`process.stdout.write("prose")`, `String(...)`): its literal
+            // arguments are DATA, not expandable text.
+            let no_expand = match callee.as_ref() {
+                Expr::MemberExpression { object, .. } => {
+                    !matches!(object.as_ref(), Expr::Identifier { name: o } if o == "sh2")
+                }
+                _ => ctx.no_expand,
+            };
+            let child = NaCtx {
+                nested: true,
+                in_fn: true,
+                in_iso: ctx.in_iso,
+                no_expand,
+                top_idx: ctx.top_idx,
+            };
+            na_scan_expr(callee, name, ctx, a);
+            for arg in arguments {
+                na_scan_expr(arg, name, child, a);
+            }
+        }
+        Expr::TemplateLiteral { expressions, .. } => {
+            for q in expressions {
+                na_scan_expr(q, name, ctx, a);
+            }
+        }
+        Expr::ArrowFunctionExpression { params, body, .. } => {
+            let child = NaCtx {
+                nested: true,
+                in_fn: true,
+                ..ctx
+            };
+            for p in params {
+                na_scan_expr(p, name, child, a);
+            }
+            match body {
+                ArrowBody::Expr(x) => na_scan_expr(x, name, child, a),
+                ArrowBody::Block(s) => na_scan_stmt(s, name, child, a),
+            }
+        }
+        Expr::FunctionExpression { params, body, .. } => {
+            let child = NaCtx {
+                nested: true,
+                in_fn: true,
+                ..ctx
+            };
+            for p in params {
+                na_scan_expr(p, name, child, a);
+            }
+            na_scan_stmt(body, name, child, a);
+        }
+        Expr::AssignmentPattern { left, right } => {
+            na_scan_expr(left, name, ctx, a);
+            na_scan_expr(right, name, ctx, a);
+        }
+        Expr::AwaitExpression { argument } => na_scan_expr(argument, name, ctx, a),
+        Expr::ObjectExpression { properties } => {
+            for p in properties {
+                na_scan_expr(&p.key, name, ctx, a);
+                na_scan_expr(&p.value, name, ctx, a);
+            }
+        }
+        Expr::ArrayExpression { elements } => {
+            for el in elements.iter().flatten() {
+                na_scan_expr(el, name, ctx, a);
+            }
+        }
+        Expr::SpreadElement { argument } => na_scan_expr(argument, name, ctx, a),
+        Expr::LogicalExpression { left, right, .. }
+        | Expr::BinaryExpression { left, right, .. } => {
+            na_scan_expr(left, name, ctx, a);
+            na_scan_expr(right, name, ctx, a);
+        }
+        Expr::AssignmentExpression { left, right, .. } => {
+            na_scan_expr(left, name, ctx, a);
+            na_scan_expr(right, name, ctx, a);
+        }
+        Expr::ConditionalExpression {
+            test,
+            consequent,
+            alternate,
+        } => {
+            na_scan_expr(test, name, ctx, a);
+            na_scan_expr(consequent, name, ctx, a);
+            na_scan_expr(alternate, name, ctx, a);
+        }
+        Expr::UnaryExpression {
+            operator, argument, ..
+        } => {
+            if (operator == "++" || operator == "--" || operator == "delete")
+                && matches!(argument.as_ref(), Expr::Identifier { name: n } if n == name)
+            {
+                a.poisoned = true;
+            }
+            na_scan_expr(argument, name, ctx, a);
+        }
+        Expr::SequenceExpression { expressions } => {
+            for x in expressions {
+                na_scan_expr(x, name, ctx, a);
+            }
+        }
+        Expr::NewExpression { callee, arguments } => {
+            na_scan_expr(callee, name, ctx, a);
+            for x in arguments {
+                na_scan_expr(x, name, ctx, a);
+            }
+        }
+    }
+}
+
+fn na_scan_stmt(s: &Stmt, name: &str, ctx: NaCtx, a: &mut AssocRefs) {
+    let nested = NaCtx {
+        nested: true,
+        ..ctx
+    };
+    match s {
+        Stmt::ExpressionStatement { expression } => na_scan_expr(expression, name, ctx, a),
+        Stmt::BlockStatement { body } => {
+            for x in body {
+                na_scan_stmt(x, name, nested, a);
+            }
+        }
+        Stmt::IfStatement {
+            test,
+            consequent,
+            alternate,
+        } => {
+            na_scan_expr(test, name, ctx, a);
+            na_scan_stmt(consequent, name, nested, a);
+            if let Some(alt) = alternate {
+                na_scan_stmt(alt, name, nested, a);
+            }
+        }
+        Stmt::TryStatement {
+            block,
+            handler,
+            finalizer,
+        } => {
+            na_scan_stmt(block, name, nested, a);
+            if let Some(h) = handler {
+                if let Some(p) = &h.param {
+                    na_scan_expr(p, name, nested, a);
+                }
+                na_scan_stmt(&h.body, name, nested, a);
+            }
+            if let Some(f) = finalizer {
+                na_scan_stmt(f, name, nested, a);
+            }
+        }
+        Stmt::ThrowStatement { argument } => na_scan_expr(argument, name, ctx, a),
+        Stmt::SwitchStatement {
+            discriminant,
+            cases,
+        } => {
+            na_scan_expr(discriminant, name, ctx, a);
+            for c in cases {
+                if let Some(t) = &c.test {
+                    na_scan_expr(t, name, ctx, a);
+                }
+                for x in &c.consequent {
+                    na_scan_stmt(x, name, nested, a);
+                }
+            }
+        }
+        Stmt::WhileStatement { test, body } | Stmt::DoWhileStatement { test, body } => {
+            na_scan_expr(test, name, ctx, a);
+            na_scan_stmt(body, name, nested, a);
+        }
+        Stmt::ForStatement {
+            init,
+            test,
+            update,
+            body,
+        } => {
+            na_scan_stmt(init, name, nested, a);
+            na_scan_expr(test, name, ctx, a);
+            na_scan_expr(update, name, ctx, a);
+            na_scan_stmt(body, name, nested, a);
+        }
+        Stmt::ForOfStatement { left, right, body } => {
+            na_scan_stmt(left, name, nested, a);
+            na_scan_expr(right, name, ctx, a);
+            na_scan_stmt(body, name, nested, a);
+        }
+        Stmt::FunctionDeclaration { params, body, .. } => {
+            let fn_ctx = NaCtx {
+                nested: true,
+                in_fn: true,
+                ..ctx
+            };
+            for p in params {
+                na_scan_expr(p, name, fn_ctx, a);
+            }
+            na_scan_stmt(body, name, fn_ctx, a);
+        }
+        Stmt::VariableDeclaration { declarations, .. } => {
+            for d in declarations {
+                na_scan_expr(&d.id, name, ctx, a);
+                if let Some(init) = &d.init {
+                    na_scan_expr(init, name, ctx, a);
+                }
+            }
+        }
+        Stmt::ReturnStatement { argument } => {
+            if let Some(x) = argument {
+                na_scan_expr(x, name, ctx, a);
+            }
+        }
+        Stmt::BreakStatement { .. } | Stmt::ContinueStatement { .. } => {}
+    }
+}
+
+/// Does the program already declare top-level `name` (a lifted array, a
+/// hoisted store-only var, a function)? A collision would shadow the map.
+fn na_name_taken(prog: &Program, name: &str) -> bool {
+    prog.body.iter().any(|s| match s {
+        Stmt::VariableDeclaration { declarations, .. } => declarations
+            .iter()
+            .any(|d| matches!(&d.id, Expr::Identifier { name: n } if n == name)),
+        Stmt::FunctionDeclaration { id, .. } => {
+            matches!(id, Expr::Identifier { name: n } if n == name)
+        }
+        _ => false,
+    })
+}
+
+/// Rewrite one classified call. Returns the replacement expression.
+fn na_rewrite_call(callee: &Expr, arguments: &[Expr], set: &HashSet<String>) -> Option<Expr> {
+    // `declare -A M` → `(M = new Map())` — the callee object is a member
+    // chain (`sh2.assocNames`), so match it before the plain `sh2.*` unwrap.
+    if let Expr::MemberExpression {
+        object: ic,
+        property: ip,
+        computed: false,
+        ..
+    } = callee
+    {
+        if matches!(ip.as_ref(), Expr::Identifier { name: p } if p == "add") {
+            if let Expr::MemberExpression {
+                object: o2,
+                property: p2,
+                computed: false,
+                ..
+            } = ic.as_ref()
+            {
+                if matches!(p2.as_ref(), Expr::Identifier { name: p } if p == "assocNames")
+                    && matches!(o2.as_ref(), Expr::Identifier { name: o } if o == "sh2")
+                {
+                    if let Some(Expr::Literal { value, .. }) = arguments.first() {
+                        if let Some(nm) = value.as_str() {
+                            if set.contains(nm) {
+                                return Some(Expr::AssignmentExpression {
+                                    operator: "=".to_string(),
+                                    left: Box::new(na_id(nm)),
+                                    right: Box::new(na_new_map()),
+                                });
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+    let Expr::MemberExpression {
+        object,
+        property,
+        computed: false,
+        ..
+    } = callee
+    else {
+        return None;
+    };
+    if !matches!(object.as_ref(), Expr::Identifier { name: o } if o == "sh2") {
+        return None;
+    }
+    let Expr::Identifier { name: f } = property.as_ref() else {
+        return None;
+    };
+    let first_lit = match arguments.first() {
+        Some(Expr::Literal { value, .. }) => value.as_str(),
+        _ => None,
+    }?;
+    let (nm, key) = match first_lit.strip_prefix_any(set) {
+        Some(v) => v,
+        None => return None,
+    };
+    let m = nm.as_str();
+    match f.as_str() {
+        "setVar" | "assocSet" => {
+            let k = key?;
+            let key = assoc_literal_key(&k)?;
+            let v = arguments.get(1)?.clone();
+            // runtime value coercion: String(value ?? '') (arrays refused at
+            // scan time — they would need bash's space-join)
+            let coerced = na_string_of(na_logical("??", v, na_str("")));
+            let set_expr = na_member_call(na_home(m), "set", vec![na_str(&key), coerced]);
+            Some(Expr::SequenceExpression {
+                expressions: vec![set_expr, na_bool(true)],
+            })
+        }
+        "getVar" | "arrayIndex" | "assocGet" => {
+            let key_expr: Expr = match key {
+                Some(k) => na_str(&assoc_literal_key(&k)?),
+                None => match arguments.get(1)? {
+                    Expr::Literal { value, .. } => {
+                        let k = value.as_str()?;
+                        if k == "@" || k == "*" {
+                            // `${M[@]}` — the values copy
+                            return Some(na_cond(
+                                na_id(m),
+                                na_map_copy(m, "values"),
+                                Expr::ArrayExpression { elements: vec![] },
+                            ));
+                        }
+                        na_str(&assoc_literal_key(k)?)
+                    }
+                    Expr::Identifier { .. } => arguments.get(1)?.clone(),
+                    _ => return None,
+                },
+            };
+            Some(na_cond(
+                na_logical(
+                    "&&",
+                    na_id(m),
+                    na_member_call(na_id(m), "has", vec![key_expr.clone()]),
+                ),
+                na_string_of(na_member_call(na_id(m), "get", vec![key_expr])),
+                na_str(""),
+            ))
+        }
+        "arrayItems" | "arrayKeys" | "arrayValues" => {
+            let prop = if f == "arrayValues" { "values" } else { "keys" };
+            Some(na_cond(
+                na_id(m),
+                na_map_copy(m, prop),
+                Expr::ArrayExpression { elements: vec![] },
+            ))
+        }
+        "arrayLen" => Some(na_string_of(na_cond(
+            na_id(m),
+            Expr::MemberExpression {
+                object: Box::new(na_id(m)),
+                property: Box::new(na_id("size")),
+                computed: false,
+                optional: false,
+            },
+            na_num(0),
+        ))),
+        _ => None,
+    }
+}
+
+/// Small helper: split a literal store name into `(map, Option<key>)` for the
+/// FIRST name in `set` that it matches.
+trait StripAny {
+    fn strip_prefix_any(&self, set: &HashSet<String>) -> Option<(String, Option<String>)>;
+}
+
+impl StripAny for str {
+    fn strip_prefix_any(&self, set: &HashSet<String>) -> Option<(String, Option<String>)> {
+        for n in set {
+            if self == n {
+                return Some((n.clone(), None));
+            }
+            if let Some(rest) = self.strip_prefix(n.as_str()) {
+                if let Some(k) = rest.strip_prefix('[').and_then(|r| r.strip_suffix(']')) {
+                    return Some((n.clone(), Some(k.to_string())));
+                }
+            }
+        }
+        None
+    }
+}
+
+fn na_rewrite_expr(e: &mut Expr, set: &HashSet<String>) {
+    if let Expr::CallExpression {
+        callee, arguments, ..
+    } = e
+    {
+        if let Some(repl) = na_rewrite_call(callee, arguments, set) {
+            *e = repl;
+            return;
+        }
+    }
+    match e {
+        Expr::Literal { .. } | Expr::Identifier { .. } => {}
+        Expr::AssignmentPattern { left, right } => {
+            na_rewrite_expr(left, set);
+            na_rewrite_expr(right, set);
+        }
+        Expr::TemplateLiteral { expressions, .. } => {
+            for q in expressions {
+                na_rewrite_expr(q, set);
+            }
+        }
+        Expr::CallExpression {
+            callee, arguments, ..
+        } => {
+            na_rewrite_expr(callee, set);
+            for a in arguments {
+                na_rewrite_expr(a, set);
+            }
+        }
+        Expr::MemberExpression {
+            object,
+            property,
+            computed,
+            ..
+        } => {
+            na_rewrite_expr(object, set);
+            if *computed {
+                na_rewrite_expr(property, set);
+            }
+        }
+        Expr::AwaitExpression { argument } => na_rewrite_expr(argument, set),
+        Expr::ArrowFunctionExpression { params, body, .. } => {
+            for p in params {
+                na_rewrite_expr(p, set);
+            }
+            match body {
+                ArrowBody::Expr(x) => na_rewrite_expr(x, set),
+                ArrowBody::Block(s) => na_rewrite_stmt(s, set),
+            }
+        }
+        Expr::FunctionExpression { params, body, .. } => {
+            for p in params {
+                na_rewrite_expr(p, set);
+            }
+            na_rewrite_stmt(body, set);
+        }
+        Expr::ObjectExpression { properties } => {
+            for p in properties {
+                na_rewrite_expr(&mut p.key, set);
+                na_rewrite_expr(&mut p.value, set);
+            }
+        }
+        Expr::ArrayExpression { elements } => {
+            for el in elements.iter_mut().flatten() {
+                na_rewrite_expr(el, set);
+            }
+        }
+        Expr::SpreadElement { argument } => na_rewrite_expr(argument, set),
+        Expr::LogicalExpression { left, right, .. }
+        | Expr::BinaryExpression { left, right, .. } => {
+            na_rewrite_expr(left, set);
+            na_rewrite_expr(right, set);
+        }
+        Expr::AssignmentExpression { left, right, .. } => {
+            na_rewrite_expr(left, set);
+            na_rewrite_expr(right, set);
+        }
+        Expr::ConditionalExpression {
+            test,
+            consequent,
+            alternate,
+        } => {
+            na_rewrite_expr(test, set);
+            na_rewrite_expr(consequent, set);
+            na_rewrite_expr(alternate, set);
+        }
+        Expr::UnaryExpression { argument, .. } => na_rewrite_expr(argument, set),
+        Expr::SequenceExpression { expressions } => {
+            for x in expressions {
+                na_rewrite_expr(x, set);
+            }
+        }
+        Expr::NewExpression { callee, arguments } => {
+            na_rewrite_expr(callee, set);
+            for a in arguments {
+                na_rewrite_expr(a, set);
+            }
+        }
+    }
+}
+
+fn na_rewrite_stmt(s: &mut Stmt, set: &HashSet<String>) {
+    match s {
+        Stmt::ExpressionStatement { expression } => na_rewrite_expr(expression, set),
+        Stmt::BlockStatement { body } => {
+            for x in body {
+                na_rewrite_stmt(x, set);
+            }
+        }
+        Stmt::IfStatement {
+            test,
+            consequent,
+            alternate,
+        } => {
+            na_rewrite_expr(test, set);
+            na_rewrite_stmt(consequent, set);
+            if let Some(alt) = alternate {
+                na_rewrite_stmt(alt, set);
+            }
+        }
+        Stmt::TryStatement {
+            block,
+            handler,
+            finalizer,
+        } => {
+            na_rewrite_stmt(block, set);
+            if let Some(h) = handler {
+                if let Some(p) = &mut h.param {
+                    na_rewrite_expr(p, set);
+                }
+                na_rewrite_stmt(&mut h.body, set);
+            }
+            if let Some(f) = finalizer {
+                na_rewrite_stmt(f, set);
+            }
+        }
+        Stmt::ThrowStatement { argument } => na_rewrite_expr(argument, set),
+        Stmt::SwitchStatement {
+            discriminant,
+            cases,
+        } => {
+            na_rewrite_expr(discriminant, set);
+            for c in cases {
+                if let Some(t) = &mut c.test {
+                    na_rewrite_expr(t, set);
+                }
+                for x in &mut c.consequent {
+                    na_rewrite_stmt(x, set);
+                }
+            }
+        }
+        Stmt::WhileStatement { test, body } | Stmt::DoWhileStatement { test, body } => {
+            na_rewrite_expr(test, set);
+            na_rewrite_stmt(body, set);
+        }
+        Stmt::ForStatement {
+            init,
+            test,
+            update,
+            body,
+        } => {
+            na_rewrite_stmt(init, set);
+            na_rewrite_expr(test, set);
+            na_rewrite_expr(update, set);
+            na_rewrite_stmt(body, set);
+        }
+        Stmt::ForOfStatement { left, right, body } => {
+            na_rewrite_stmt(left, set);
+            na_rewrite_expr(right, set);
+            na_rewrite_stmt(body, set);
+        }
+        Stmt::FunctionDeclaration { params, body, .. } => {
+            for p in params {
+                na_rewrite_expr(p, set);
+            }
+            na_rewrite_stmt(body, set);
+        }
+        Stmt::VariableDeclaration { declarations, .. } => {
+            for d in declarations {
+                na_rewrite_expr(&mut d.id, set);
+                if let Some(init) = &mut d.init {
+                    na_rewrite_expr(init, set);
+                }
+            }
+        }
+        Stmt::ReturnStatement { argument } => {
+            if let Some(x) = argument {
+                na_rewrite_expr(x, set);
+            }
+        }
+        Stmt::BreakStatement { .. } | Stmt::ContinueStatement { .. } => {}
+    }
+}
+
+/// The pass entry point: fold every migratable `declare -A` map onto a native
+/// JS `Map`. Refuses per map (fail-closed) — the store path is unchanged.
+fn assoc_migrate_program(program: &mut Program) {
+    if !native_assoc_enabled() {
+        return;
+    }
+    // Candidate names: a top-level `sh2.assocNames.add("M")` literal.
+    let mut candidates: Vec<String> = Vec::new();
+    for stmt in &program.body {
+        if let Stmt::ExpressionStatement { expression } = stmt {
+            na_collect_decl(expression, &mut candidates);
+        }
+    }
+    candidates.sort();
+    candidates.dedup();
+    if candidates.is_empty() {
+        return;
+    }
+    let mut accepted: Vec<String> = Vec::new();
+    for name in candidates {
+        if !array_valid_const_name(&name) || name == "PIPESTATUS" || na_name_taken(program, &name) {
+            continue;
+        }
+        let mut a = AssocRefs::default();
+        for (idx, stmt) in program.body.iter().enumerate() {
+            let ctx = NaCtx {
+                nested: false,
+                in_fn: false,
+                in_iso: false,
+                no_expand: false,
+                top_idx: idx,
+            };
+            na_scan_stmt(stmt, &name, ctx, &mut a);
+        }
+        if a.poisoned
+            || a.nested_decl
+            || a.write_isolated
+            || a.ident_refs != 0
+            || a.decl_idxs.len() != 1
+        {
+            if std::env::var("SH2_ASSOC_DEBUG").is_ok() {
+                eprintln!(
+                    "assoc_migrate({name}): REFUSE decls={} sites={} str={} ident={} iso={} nested={} poison={}",
+                    a.decl_idxs.len(), a.sites, a.str_refs, a.ident_refs, a.write_isolated, a.nested_decl, a.poisoned
+                );
+            }
+            continue;
+        }
+        // Name-mention budget: the declaration plus every whitelisted site.
+        if a.str_refs != a.sites {
+            if std::env::var("SH2_ASSOC_DEBUG").is_ok() {
+                eprintln!(
+                    "assoc_migrate({name}): REFUSE budget str={} sites={}",
+                    a.str_refs, a.sites
+                );
+            }
+            continue;
+        }
+        accepted.push(name);
+    }
+    if accepted.is_empty() {
+        return;
+    }
+    let set: HashSet<String> = accepted.iter().cloned().collect();
+    for stmt in program.body.iter_mut() {
+        na_rewrite_stmt(stmt, &set);
+    }
+    // Hoist `let M;` FIRST: every read/declare site may run in any order, and
+    // the lazy `M || (M = new Map())` home keeps pre-declaration reads "".
+    let decls: Vec<VariableDeclarator> = accepted
+        .iter()
+        .map(|n| VariableDeclarator {
+            type_: "VariableDeclarator",
+            id: na_id(n),
+            init: None,
+        })
+        .collect();
+    program.body.insert(
+        0,
+        Stmt::VariableDeclaration {
+            declarations: decls,
+            kind: "let",
+        },
+    );
+}
+
+/// Collect `sh2.assocNames.add("M")` literals from a top-level statement's
+/// expression tree (sequence wrappers included) WITHOUT descending into
+/// arrows/functions (a nested `declare -A` is a different scope).
+fn na_collect_decl(e: &Expr, out: &mut Vec<String>) {
+    match e {
+        Expr::CallExpression {
+            callee, arguments, ..
+        } => {
+            if let Expr::MemberExpression {
+                object,
+                property,
+                computed: false,
+                ..
+            } = callee.as_ref()
+            {
+                if let Expr::MemberExpression {
+                    object: o2,
+                    property: p2,
+                    computed: false,
+                    ..
+                } = object.as_ref()
+                {
+                    if matches!(p2.as_ref(), Expr::Identifier { name: p } if p == "assocNames")
+                        && matches!(o2.as_ref(), Expr::Identifier { name: o } if o == "sh2")
+                        && matches!(property.as_ref(), Expr::Identifier { name: p } if p == "add")
+                    {
+                        if let Some(Expr::Literal { value, .. }) = arguments.first() {
+                            if let Some(n) = value.as_str() {
+                                out.push(n.to_string());
+                            }
+                        }
+                        return;
+                    }
+                }
+            }
+            na_collect_decl(callee, out);
+            for a in arguments {
+                na_collect_decl(a, out);
+            }
+        }
+        Expr::SequenceExpression { expressions } => {
+            for x in expressions {
+                na_collect_decl(x, out);
+            }
+        }
+        Expr::AssignmentExpression { left, right, .. }
+        | Expr::LogicalExpression { left, right, .. }
+        | Expr::BinaryExpression { left, right, .. } => {
+            na_collect_decl(left, out);
+            na_collect_decl(right, out);
+        }
+        Expr::ConditionalExpression {
+            test,
+            consequent,
+            alternate,
+        } => {
+            na_collect_decl(test, out);
+            na_collect_decl(consequent, out);
+            na_collect_decl(alternate, out);
+        }
+        Expr::UnaryExpression { argument, .. } | Expr::AwaitExpression { argument } => {
+            na_collect_decl(argument, out)
+        }
+        Expr::MemberExpression {
+            object,
+            property,
+            computed,
+            ..
+        } => {
+            na_collect_decl(object, out);
+            if *computed {
+                na_collect_decl(property, out);
+            }
+        }
+        _ => {}
+    }
+}
+
 pub fn shir_to_estree(prog: &IrProgram) -> Program {
     let _compile_guard = COMPILE_LOCK.lock().unwrap();
     // `for ((...))` (core request zsh-sh-go-20260813-153215): the shell
@@ -33230,7 +35309,7 @@ pub fn shir_to_estree(prog: &IrProgram) -> Program {
     // The second set is the native-DIRECT subset (positional-free bodies —
     // calls skip fnCall's positional swap, see [`DIRECT_FN_CALLS`]).
     let (sync_fns, direct_fns) = fn_call_sync_set(prog, &functions);
-    *SYNC_FN_CALLS.lock().unwrap() = Some(sync_fns);
+    *SYNC_FN_CALLS.lock().unwrap() = Some(sync_fns.clone());
     *DIRECT_FN_CALLS.lock().unwrap() = Some(direct_fns.clone());
     // Param-lift (native functions): a sync function whose body reads
     // ONLY $1..$k and whose every call site is a static exec/fnCall
@@ -33244,6 +35323,20 @@ pub fn shir_to_estree(prog: &IrProgram) -> Program {
         eprintln!("DBG direct: {:?}", DIRECT_FN_CALLS.lock().unwrap().as_ref());
     }
     *PARAM_LIFT.lock().unwrap() = Some(pl.clone());
+    // POSITIONAL_LOCAL param lift (see [`POS_LIFT`]): functions whose
+    // positionals are consumed only inside the script take the positional
+    // array as ONE ordinary parameter and are called natively
+    // (`f([a1, …])`) — no sh2.exec dispatch, no positional save/restore.
+    // Runs after the sync fixpoint (the map records per-function
+    // sync-ness so async defines are awaited at their call sites) and
+    // before the main emission (define + call sites both consult it).
+    let posl = pos_lift_set(prog, &sync_fns);
+    if std::env::var("SH2_DBG_POSL").is_ok() {
+        let mut v: Vec<_> = posl.iter().collect();
+        v.sort();
+        eprintln!("DBG pos_lift: {:?}", v);
+    }
+    *POS_LIFT.lock().unwrap() = Some(posl);
     // VALUE-RETURN: a param-lifted function whose body's final statement
     // is a single value echo — the define arrow returns the value and the
     // call sites use it directly (no captureSync, no echo).
@@ -33430,7 +35523,30 @@ pub fn shir_to_estree(prog: &IrProgram) -> Program {
     // Sorted iteration (core request fish-sh-go-20260806-181309): the
     // direct-fn set is HashSet-backed; deterministic declaration order
     // keeps A1->ESTree output byte-stable across processes.
-    let mut direct_sorted: Vec<&String> = direct_fns.iter().collect();
+    // Lifted defines emit their own binding (`function f(…)` for the
+    // param / POSITIONAL_LOCAL lifts, an assignment for a direct function),
+    // so they must NOT also get the `let <name> = null;` prologue entry —
+    // a `let` + a hoisted `function` of the same name is a SyntaxError.
+    let lifted_names: HashSet<String> = PARAM_LIFT
+        .lock()
+        .unwrap()
+        .as_ref()
+        .map(|m| m.keys().cloned().collect::<HashSet<_>>())
+        .unwrap_or_default()
+        .into_iter()
+        .chain(
+            POS_LIFT
+                .lock()
+                .unwrap()
+                .as_ref()
+                .map(|m| m.keys().cloned().collect::<Vec<_>>())
+                .unwrap_or_default(),
+        )
+        .collect();
+    let mut direct_sorted: Vec<&String> = direct_fns
+        .iter()
+        .filter(|n| !lifted_names.contains(*n))
+        .collect();
     // param-lifted functions are EXCLUDED from the `let = null` prologue
     // — their define site emits `function <binding>(<params>)` directly
     // (a hoisted declaration — no `=`/`=>`). The analysis proves
@@ -33533,6 +35649,12 @@ pub fn shir_to_estree(prog: &IrProgram) -> Program {
         // transforms; the fold is independent of arrays).
         fold_temp_roundtrips_program(&mut program);
     }
+    // Native associative-map migration (SH2_ASSUME_NATIVE_ASSOC): a
+    // script-local `declare -A M` becomes a JS `Map` — see
+    // [`assoc_migrate_program`] for the fail-closed soundness argument.
+    // Runs last so the earlier passes see the store shapes they were
+    // written against.
+    assoc_migrate_program(&mut program);
     program
 }
 
@@ -35575,6 +37697,11 @@ fn try_native_echo_redirect(
 /// CALLED) keeps the runtime loop. The synthetic trailing `break` of the
 /// case-switch lowering is exempt (it terminates the switch, never a
 /// loop).
+/// The PRE-CONVERSION conservative scan (kept as the reference rule; the loop
+/// lowerings now use [`stmts_have_break_continue`] +
+/// [`convert_native_loop_signals`], which allow the loop-local break/continue
+/// statements a native loop can terminate itself).
+#[allow(dead_code)]
 fn lowered_stmts_have_signals(stmts: &[Stmt]) -> bool {
     fn stmt_has_signal(s: &Stmt, in_switch_consequent: bool) -> bool {
         match s {
@@ -35689,6 +37816,518 @@ fn lowered_stmts_have_signals(stmts: &[Stmt]) -> bool {
         }
     }
     stmts.iter().any(|s| stmt_has_signal(s, false))
+}
+
+// ── NATIVE-LOOP CONTROL SIGNALS ────────────────────────────────────────
+//
+// A source `break`/`continue` renders as `sh2.break()` / `sh2.continue()` —
+// a THROW the runtime loops (`whileLoop`, `whileLoopSync`, `forLoopSync`, …)
+// catch. A NATIVE JS loop has no catch, so the `lowered_stmts_have_signals`
+// gate above refuses one whenever any signal source appears in the body.
+//
+// That gate is over-conservative in the common case: a `break`/`continue`
+// that is a DIRECT statement of the loop body (possibly nested in blocks,
+// `if`/`else`, try/finally — but NOT inside an arrow/function and NOT inside
+// a `switch` consequent, where a native `break` would exit the switch
+// instead) belongs to THIS loop, and its native JS statement is exactly the
+// terminator the runtime loop emulates. `return` needs no conversion at all:
+// the runtime loops RETHROW a RETURN signal, so a native `return` inside a
+// native loop unwinds to the same place (and inside a function arrow it is
+// the function's return, which `fix_control_flow` keeps native once the
+// enclosing loop is no longer a loop-body arrow).
+//
+// Converting those statements earns the ladder's top rung — a plain JS
+// `while`/`for`/`for…of` with no per-iteration closure and no try/catch —
+// and removes the `sh2.break`/`sh2.continue` call sites with it.
+//
+/// `Some(true)` = `sh2.break()`, `Some(false)` = `sh2.continue()`. Only the
+/// zero-argument CALL form (the emitter's own signal spelling) matches.
+fn break_continue_call(e: &Expr) -> Option<bool> {
+    if let Expr::CallExpression {
+        callee, arguments, ..
+    } = e
+    {
+        if arguments.is_empty() {
+            if let Expr::MemberExpression {
+                object,
+                property,
+                computed: false,
+                ..
+            } = callee.as_ref()
+            {
+                if matches!(object.as_ref(), Expr::Identifier { name } if name == "sh2") {
+                    if let Expr::Identifier { name } = property.as_ref() {
+                        if name == "break" {
+                            return Some(true);
+                        }
+                        if name == "continue" {
+                            return Some(false);
+                        }
+                    }
+                }
+            }
+        }
+    }
+    None
+}
+
+/// Does this expression subtree contain a break/continue signal? Arrows and
+/// function expressions are descended (a signal thrown from a nested closure
+/// is still a throw the runtime loop would have caught). `sh2.return` is
+/// deliberately NOT a signal here — see the note above.
+fn expr_has_break_continue(e: &Expr) -> bool {
+    if break_continue_call(e).is_some() {
+        return true;
+    }
+    match e {
+        Expr::CallExpression {
+            callee, arguments, ..
+        } => expr_has_break_continue(callee) || arguments.iter().any(expr_has_break_continue),
+        Expr::ArrowFunctionExpression { body, .. } => match body {
+            ArrowBody::Expr(inner) => expr_has_break_continue(inner),
+            ArrowBody::Block(b) => stmt_has_break_continue(b),
+        },
+        Expr::AssignmentExpression { left, right, .. } => {
+            expr_has_break_continue(left) || expr_has_break_continue(right)
+        }
+        Expr::SequenceExpression { expressions } => expressions.iter().any(expr_has_break_continue),
+        Expr::ConditionalExpression {
+            test,
+            consequent,
+            alternate,
+            ..
+        } => {
+            expr_has_break_continue(test)
+                || expr_has_break_continue(consequent)
+                || expr_has_break_continue(alternate)
+        }
+        Expr::LogicalExpression { left, right, .. } | Expr::BinaryExpression { left, right, .. } => {
+            expr_has_break_continue(left) || expr_has_break_continue(right)
+        }
+        Expr::MemberExpression {
+            object, property, ..
+        } => expr_has_break_continue(object) || expr_has_break_continue(property),
+        Expr::UnaryExpression { argument, .. } => expr_has_break_continue(argument),
+        Expr::AwaitExpression { argument } => expr_has_break_continue(argument),
+        Expr::TemplateLiteral { expressions, .. } => {
+            expressions.iter().any(expr_has_break_continue)
+        }
+        Expr::ArrayExpression { elements } => elements
+            .iter()
+            .filter_map(|e| e.as_ref())
+            .any(expr_has_break_continue),
+        Expr::ObjectExpression { properties } => {
+            properties.iter().any(|p| expr_has_break_continue(&p.value))
+        }
+        Expr::NewExpression {
+            callee, arguments, ..
+        } => expr_has_break_continue(callee) || arguments.iter().any(expr_has_break_continue),
+        Expr::SpreadElement { argument } => expr_has_break_continue(argument),
+        _ => false,
+    }
+}
+
+/// Does this expression subtree contain a RETURN source? A `return` in a
+/// NATIVE loop would be the enclosing function arrow's return, and today that
+/// lowers to a bare `return <value>` whose value is the captured text,
+/// not the function's exit STATUS (`f() { return 3; }; f; echo $?` prints 0,
+/// bash 3 — a pre-existing divergence; the runtime RETURN signal is what
+/// keeps the status). Until the two readings are distinguished, a return
+/// anywhere in the loop body keeps the runtime loop, exactly as before this
+/// lowering existed.
+fn expr_has_return_signal(e: &Expr) -> bool {
+    if let Expr::CallExpression {
+        callee, arguments, ..
+    } = e
+    {
+        if let Expr::MemberExpression {
+            object,
+            property,
+            computed: false,
+            ..
+        } = callee.as_ref()
+        {
+            if matches!(object.as_ref(), Expr::Identifier { name } if name == "sh2")
+                && matches!(property.as_ref(), Expr::Identifier { name } if name == "return")
+            {
+                return true;
+            }
+        }
+        if expr_has_return_signal(callee) || arguments.iter().any(expr_has_return_signal) {
+            return true;
+        }
+        return false;
+    }
+    match e {
+        Expr::ArrowFunctionExpression { body, .. } => match body {
+            ArrowBody::Expr(inner) => expr_has_return_signal(inner),
+            ArrowBody::Block(b) => stmt_has_return_signal(b),
+        },
+        Expr::AssignmentExpression { left, right, .. } => {
+            expr_has_return_signal(left) || expr_has_return_signal(right)
+        }
+        Expr::SequenceExpression { expressions } => expressions.iter().any(expr_has_return_signal),
+        Expr::ConditionalExpression {
+            test,
+            consequent,
+            alternate,
+            ..
+        } => {
+            expr_has_return_signal(test)
+                || expr_has_return_signal(consequent)
+                || expr_has_return_signal(alternate)
+        }
+        Expr::LogicalExpression { left, right, .. } | Expr::BinaryExpression { left, right, .. } => {
+            expr_has_return_signal(left) || expr_has_return_signal(right)
+        }
+        Expr::MemberExpression {
+            object, property, ..
+        } => expr_has_return_signal(object) || expr_has_return_signal(property),
+        Expr::UnaryExpression { argument, .. } => expr_has_return_signal(argument),
+        Expr::AwaitExpression { argument } => expr_has_return_signal(argument),
+        Expr::TemplateLiteral { expressions, .. } => {
+            expressions.iter().any(expr_has_return_signal)
+        }
+        Expr::ArrayExpression { elements } => elements
+            .iter()
+            .filter_map(|e| e.as_ref())
+            .any(expr_has_return_signal),
+        Expr::ObjectExpression { properties } => {
+            properties.iter().any(|p| expr_has_return_signal(&p.value))
+        }
+        Expr::NewExpression {
+            callee, arguments, ..
+        } => expr_has_return_signal(callee) || arguments.iter().any(expr_has_return_signal),
+        Expr::SpreadElement { argument } => expr_has_return_signal(argument),
+        _ => false,
+    }
+}
+
+fn stmts_have_return_signal(stmts: &[Stmt]) -> bool {
+    stmts.iter().any(stmt_has_return_signal)
+}
+
+fn stmt_has_return_signal(s: &Stmt) -> bool {
+    match s {
+        Stmt::ReturnStatement { .. } => true,
+        Stmt::ExpressionStatement { expression } => expr_has_return_signal(expression),
+        Stmt::BlockStatement { body } => stmts_have_return_signal(body),
+        Stmt::IfStatement {
+            test,
+            consequent,
+            alternate,
+        } => {
+            expr_has_return_signal(test)
+                || stmt_has_return_signal(consequent)
+                || alternate
+                    .as_deref()
+                    .map(stmt_has_return_signal)
+                    .unwrap_or(false)
+        }
+        Stmt::TryStatement {
+            block,
+            handler,
+            finalizer,
+        } => {
+            stmt_has_return_signal(block)
+                || handler
+                    .as_ref()
+                    .map(|h| stmt_has_return_signal(&h.body))
+                    .unwrap_or(false)
+                || finalizer
+                    .as_deref()
+                    .map(stmt_has_return_signal)
+                    .unwrap_or(false)
+        }
+        Stmt::SwitchStatement {
+            discriminant,
+            cases,
+        } => {
+            expr_has_return_signal(discriminant)
+                || cases.iter().any(|c| {
+                    c.test
+                        .as_ref()
+                        .map(expr_has_return_signal)
+                        .unwrap_or(false)
+                        || stmts_have_return_signal(&c.consequent)
+                })
+        }
+        Stmt::WhileStatement { test, body } | Stmt::DoWhileStatement { test, body } => {
+            expr_has_return_signal(test) || stmt_has_return_signal(body)
+        }
+        Stmt::ForStatement {
+            init,
+            test,
+            update,
+            body,
+        } => {
+            stmt_has_return_signal(init)
+                || expr_has_return_signal(test)
+                || expr_has_return_signal(update)
+                || stmt_has_return_signal(body)
+        }
+        Stmt::ForOfStatement { left, right, body } => {
+            stmt_has_return_signal(left)
+                || expr_has_return_signal(right)
+                || stmt_has_return_signal(body)
+        }
+        Stmt::FunctionDeclaration { params, body, .. } => {
+            params.iter().any(expr_has_return_signal) || stmt_has_return_signal(body)
+        }
+        Stmt::VariableDeclaration { declarations, .. } => declarations
+            .iter()
+            .any(|d| d.init.as_ref().map(expr_has_return_signal).unwrap_or(false)),
+        Stmt::ThrowStatement { argument } => expr_has_return_signal(argument),
+        Stmt::BreakStatement { .. } | Stmt::ContinueStatement { .. } => false,
+    }
+}
+
+/// Pure scan: is every break/continue in this statement subtree either already
+/// a NATIVE statement or convertible to one? (Used to decide eligibility
+/// before any mutation — the caller only converts when this says yes.)
+fn stmts_have_break_continue(stmts: &[Stmt]) -> bool {
+    stmts.iter().any(stmt_has_break_continue)
+}
+
+fn stmt_has_break_continue(s: &Stmt) -> bool {
+    match s {
+        Stmt::ExpressionStatement { expression } => expr_has_break_continue(expression),
+        Stmt::BlockStatement { body } => stmts_have_break_continue(body),
+        Stmt::IfStatement {
+            test,
+            consequent,
+            alternate,
+        } => {
+            expr_has_break_continue(test)
+                || stmt_has_break_continue(consequent)
+                || alternate
+                    .as_deref()
+                    .map(stmt_has_break_continue)
+                    .unwrap_or(false)
+        }
+        Stmt::TryStatement {
+            block,
+            handler,
+            finalizer,
+        } => {
+            stmt_has_break_continue(block)
+                || handler
+                    .as_ref()
+                    .map(|h| stmt_has_break_continue(&h.body))
+                    .unwrap_or(false)
+                || finalizer
+                    .as_deref()
+                    .map(stmt_has_break_continue)
+                    .unwrap_or(false)
+        }
+        // a break/continue inside a switch consequent can only be the
+        // switch's own terminator; a converted one would exit the switch,
+        // so any SIGNAL there keeps the runtime loop
+        Stmt::SwitchStatement {
+            discriminant,
+            cases,
+        } => {
+            expr_has_break_continue(discriminant)
+                || cases.iter().any(|c| {
+                    c.test
+                        .as_ref()
+                        .map(expr_has_break_continue)
+                        .unwrap_or(false)
+                        || stmts_have_break_continue(&c.consequent)
+                })
+        }
+        Stmt::WhileStatement { test, body } | Stmt::DoWhileStatement { test, body } => {
+            expr_has_break_continue(test) || stmt_has_break_continue(body)
+        }
+        Stmt::ForStatement {
+            init,
+            test,
+            update,
+            body,
+        } => {
+            stmt_has_break_continue(init)
+                || expr_has_break_continue(test)
+                || expr_has_break_continue(update)
+                || stmt_has_break_continue(body)
+        }
+        Stmt::ForOfStatement { left, right, body } => {
+            stmt_has_break_continue(left)
+                || expr_has_break_continue(right)
+                || stmt_has_break_continue(body)
+        }
+        Stmt::FunctionDeclaration { params, body, .. } => {
+            params.iter().any(expr_has_break_continue) || stmt_has_break_continue(body)
+        }
+        Stmt::VariableDeclaration { declarations, .. } => declarations
+            .iter()
+            .any(|d| d.init.as_ref().map(expr_has_break_continue).unwrap_or(false)),
+        Stmt::ReturnStatement { argument } => argument
+            .as_ref()
+            .map(expr_has_break_continue)
+            .unwrap_or(false),
+        Stmt::ThrowStatement { argument } => expr_has_break_continue(argument),
+        Stmt::BreakStatement { .. } | Stmt::ContinueStatement { .. } => false,
+    }
+}
+
+/// Mutating twin of the scan above: replace every loop-local
+/// `sh2.break()`/`sh2.continue()` statement with the native JS statement.
+/// Returns false when a break/continue signal remains (something the caller
+/// still needs a runtime loop to catch).
+/// `prelude` runs immediately BEFORE the native `break`/`continue`: bash
+/// gives the loop the keyword's own status (0), which the runtime loops
+/// reproduce with `bodyLastExit = 0` — a native jump must write it, or the
+/// loop's final status leaks the previous command's failure. Returns
+/// `(everything converted, something converted)`.
+fn convert_native_loop_signals(stmts: &mut [Stmt], prelude: &[Stmt]) -> (bool, bool) {
+    let (mut ok, mut changed) = (true, false);
+    for s in stmts.iter_mut() {
+        let (s_ok, s_changed) = convert_native_loop_signal_stmt(s, prelude);
+        if !s_ok {
+            ok = false;
+        }
+        if s_changed {
+            changed = true;
+        }
+    }
+    (ok, changed)
+}
+
+/// `sh2.lastExit = 0;` — the status a `break`/`continue` leaves behind.
+fn native_jump_status_reset() -> Stmt {
+    Stmt::ExpressionStatement {
+        expression: Expr::AssignmentExpression {
+            operator: "=".to_string(),
+            left: Box::new(sh2_member("lastExit")),
+            right: Box::new(Expr::Literal {
+                value: serde_json::Value::from(0),
+                raw: None,
+                regex: None,
+            }),
+        },
+    }
+}
+
+fn convert_native_loop_signal_stmt(s: &mut Stmt, prelude: &[Stmt]) -> (bool, bool) {
+    // pass 1: statement-level replacement (borrow of the callee ends before
+    // the assignment)
+    let repl = match &*s {
+        Stmt::ExpressionStatement { expression } => match break_continue_call(expression) {
+            Some(is_break) => {
+                let mut body: Vec<Stmt> = prelude.to_vec();
+                body.push(if is_break {
+                    Stmt::BreakStatement { label: None }
+                } else {
+                    Stmt::ContinueStatement { label: None }
+                });
+                Some(Stmt::BlockStatement { body })
+            }
+            None => None,
+        },
+        _ => None,
+    };
+    if let Some(r) = repl {
+        *s = r;
+        return (true, true);
+    }
+    match s {
+        Stmt::ExpressionStatement { expression } => (!expr_has_break_continue(expression), false),
+        Stmt::BlockStatement { body } => convert_native_loop_signals(body, prelude),
+        Stmt::IfStatement {
+            test,
+            consequent,
+            alternate,
+        } => {
+            let (mut ok, mut changed) = (!expr_has_break_continue(test), false);
+            let (c_ok, c_ch) = convert_native_loop_signal_stmt(consequent, prelude);
+            ok &= c_ok;
+            changed |= c_ch;
+            if let Some(a) = alternate {
+                let (a_ok, a_ch) = convert_native_loop_signal_stmt(a, prelude);
+                ok &= a_ok;
+                changed |= a_ch;
+            }
+            (ok, changed)
+        }
+        Stmt::TryStatement {
+            block,
+            handler,
+            finalizer,
+        } => {
+            let (mut ok, mut changed) = convert_native_loop_signal_stmt(block, prelude);
+            if let Some(h) = handler {
+                let (h_ok, h_ch) = convert_native_loop_signal_stmt(&mut h.body, prelude);
+                ok &= h_ok;
+                changed |= h_ch;
+            }
+            if let Some(f) = finalizer {
+                let (f_ok, f_ch) = convert_native_loop_signal_stmt(f, prelude);
+                ok &= f_ok;
+                changed |= f_ch;
+            }
+            (ok, changed)
+        }
+        // switch consequents keep signals (a native break would exit the
+        // switch) — scan only
+        Stmt::SwitchStatement {
+            discriminant,
+            cases,
+        } => (
+            !expr_has_break_continue(discriminant)
+                && !cases.iter().any(|c| {
+                    c.test
+                        .as_ref()
+                        .map(expr_has_break_continue)
+                        .unwrap_or(false)
+                        || stmts_have_break_continue(&c.consequent)
+                }),
+            false,
+        ),
+        Stmt::WhileStatement { test, body } | Stmt::DoWhileStatement { test, body } => {
+            let (ok, changed) = convert_native_loop_signal_stmt(body, prelude);
+            (!expr_has_break_continue(test) && ok, changed)
+        }
+        Stmt::ForStatement {
+            init,
+            test,
+            update,
+            body,
+        } => {
+            let (mut ok, mut changed) = convert_native_loop_signal_stmt(init, prelude);
+            ok &= !expr_has_break_continue(test) && !expr_has_break_continue(update);
+            let (b_ok, b_ch) = convert_native_loop_signal_stmt(body, prelude);
+            ok &= b_ok;
+            changed |= b_ch;
+            (ok, changed)
+        }
+        Stmt::ForOfStatement { left, right, body } => {
+            let (mut ok, mut changed) = convert_native_loop_signal_stmt(left, prelude);
+            ok &= !expr_has_break_continue(right);
+            let (b_ok, b_ch) = convert_native_loop_signal_stmt(body, prelude);
+            ok &= b_ok;
+            changed |= b_ch;
+            (ok, changed)
+        }
+        Stmt::FunctionDeclaration { params, body, .. } => {
+            let (ok, changed) = convert_native_loop_signal_stmt(body, prelude);
+            (ok && !params.iter().any(expr_has_break_continue), changed)
+        }
+        Stmt::VariableDeclaration { declarations, .. } => (
+            !declarations
+                .iter()
+                .any(|d| d.init.as_ref().map(expr_has_break_continue).unwrap_or(false)),
+            false,
+        ),
+        Stmt::ReturnStatement { argument } => (
+            !argument
+                .as_ref()
+                .map(expr_has_break_continue)
+                .unwrap_or(false),
+            false,
+        ),
+        Stmt::ThrowStatement { argument } => (!expr_has_break_continue(argument), false),
+        Stmt::BreakStatement { .. } | Stmt::ContinueStatement { .. } => (true, false),
+    }
 }
 
 /// Is a for-loop ITERABLE safe to emit as a flat native array (matching the
@@ -37225,21 +39864,55 @@ fn stmt_to_estree(stmt: &IrStmt) -> Option<Stmt> {
             // evaluated for truthiness only — see [`unwrap_test_bool`].
             let cond_e = unwrap_test_bool(cond_e);
             let body_stmts: Vec<Stmt> = body.iter().filter_map(stmt_to_estree).collect();
+            // Loop-local break/continue → native JS statements (the runtime
+            // loop's BREAK/CONTINUE catch is then unused). Converted on a
+            // CLONE: the gate below may still decline the native loop, and the
+            // runtime fallback needs the signal calls.
+            let mut native_body = body_stmts.clone();
+            // bash gives a `break`/`continue` the keyword's own status (0);
+            // the runtime loops reproduce it with `bodyLastExit = 0`, so the
+            // native jump must write it — plus the tracked loop status when
+            // this loop keeps the `__sh2_loop_last` discipline (the jump
+            // skips that per-iteration read).
+            let jumps = stmts_have_break_continue(&body_stmts);
+            let errexit = MAY_ERREXIT.lock().unwrap().unwrap_or(true);
+            let dead = loop_status_write_dead(stmt) && !errexit;
+            let mut jump_prelude: Vec<Stmt> = vec![];
+            if jumps {
+                jump_prelude.push(native_jump_status_reset());
+                if !dead {
+                    jump_prelude.push(Stmt::ExpressionStatement {
+                        expression: Expr::AssignmentExpression {
+                            operator: "=".to_string(),
+                            left: Box::new(Expr::Identifier {
+                                name: "__sh2_loop_last".to_string(),
+                            }),
+                            right: Box::new(Expr::Literal {
+                                value: serde_json::Value::from(0),
+                                raw: None,
+                                regex: None,
+                            }),
+                        },
+                    });
+                }
+            }
             if !expr_has_await(&cond_e) && !stmts_have_await(&body_stmts) {
                 // Native loop (the ladder's top rung): a plain JS `while`
                 // statement — no runtime call, no per-iteration closures,
                 // no try/catch. Eligibility: (1) NOT a potential capture
                 // producer (a native loop would lose the runtime
                 // `_capExceeded` bound — see compute_async_region_loops),
-                // (2) NO signal sources in the body (source break/continue
-                // lower to native statements and work in a native loop,
-                // but the runtime BREAK/CONTINUE/RETURN THROWS — case-body
-                // conversions, nested arrows, sh2.return() — must stay
-                // catchable), (3) the loop's own status write liveness
+                // (2) NO signal sources the runtime loop would have to catch
+                // — a break/continue that is a DIRECT body statement is
+                // converted to the native JS statement first (see
+                // [`convert_native_loop_signals`]); a signal inside a nested
+                // arrow or a switch consequent still keeps the runtime loop,
+                // (3) the loop's own status write liveness
                 // decides the tracking (dead → bare loop, zero overhead).
-                if !loop_in_async_region(stmt) && !lowered_stmts_have_signals(&body_stmts) {
-                    let errexit = MAY_ERREXIT.lock().unwrap().unwrap_or(true);
-                    let dead = loop_status_write_dead(stmt) && !errexit;
+                if !loop_in_async_region(stmt)
+                    && !stmts_have_return_signal(&body_stmts)
+                    && convert_native_loop_signals(&mut native_body, &jump_prelude).0
+                {
                     // shIR markup: a loop provably run at least once (the
                     // A1's `"runs": true`) needs no `ran` flag — but when
                     // the loop's status write is LIVE (a trailing loop's
@@ -37307,7 +39980,7 @@ fn stmt_to_estree(stmt: &IrStmt) -> Option<Stmt> {
                             });
                         }
                     }
-                    inner.extend(body_stmts);
+                    inner.extend(native_body);
                     if !dead {
                         // `__sh2_loop_last = sh2.lastExit;` — the runtime's
                         // bodyLastExit read after the body fn
@@ -37593,7 +40266,15 @@ fn stmt_to_estree(stmt: &IrStmt) -> Option<Stmt> {
             // numeric binding's invariant; string bindings hold the raw
             // item), and the post-loop assignment restores the module
             // binding. Mirror of the store-sync-elim shape below.
-            let persist_block = |make_loop: Box<dyn FnOnce(Vec<Stmt>) -> Stmt>| -> Stmt {
+            // (`persist_body_e`/`persist_has_coercion` are captured by value:
+            // the native branches below SHADOW `body_e` with the
+            // control-signal-converted clone, and a borrowing closure would
+            // keep the original alive and block the move.)
+            let persist_has_coercion = coercion.is_some();
+            let persist_body_e = body_e.clone();
+            let persist_js_var = js_var.clone();
+            let persist_block = move |make_loop: Box<dyn FnOnce(Vec<Stmt>) -> Stmt>| -> Stmt {
+                let js_var = persist_js_var;
                 let temp = format!("__sh2_for_last_{js_var}");
                 // the temp write must come AFTER the lifted-num coercion
                 // (`i = Number(i)`) — the temp then holds the NUMBER
@@ -37609,13 +40290,13 @@ fn stmt_to_estree(stmt: &IrStmt) -> Option<Stmt> {
                     },
                 };
                 let mut body2: Vec<Stmt> = Vec::new();
-                if coercion.is_some() {
-                    body2.push(body_e[0].clone());
+                if persist_has_coercion {
+                    body2.push(persist_body_e[0].clone());
                     body2.push(temp_write);
-                    body2.extend(body_e[1..].iter().cloned());
+                    body2.extend(persist_body_e[1..].iter().cloned());
                 } else {
                     body2.push(temp_write);
-                    body2.extend(body_e.iter().cloned());
+                    body2.extend(persist_body_e.iter().cloned());
                 }
                 let mut out: Vec<Stmt> = vec![Stmt::VariableDeclaration {
                     kind: "let",
@@ -37647,10 +40328,20 @@ fn stmt_to_estree(stmt: &IrStmt) -> Option<Stmt> {
             // transform's guarantees cover the rest (pure integer
             // bounds, body never writes the var).
             if let Some((lo, hi)) = range {
+                // loop-local break/continue → native JS statements (with the
+                // keyword's status-0 write: see the While arm)
+                let mut native_body_e = body_e.clone();
+                let jump_prelude: Vec<Stmt> = if stmts_have_break_continue(&body_e) {
+                    vec![native_jump_status_reset()]
+                } else {
+                    vec![]
+                };
                 if !stmts_have_await(&body_e)
                     && !loop_in_async_region(stmt)
-                    && !lowered_stmts_have_signals(&body_e)
+                    && !stmts_have_return_signal(&body_e)
+                    && convert_native_loop_signals(&mut native_body_e, &jump_prelude).0
                 {
+                    let body_e = native_body_e;
                     // Store-sync elimination — the mirror of the for-of
                     // path below: a STORE-BACKED loop var (unliftable —
                     // read after the loop etc.) whose body only observes
@@ -37780,10 +40471,20 @@ fn stmt_to_estree(stmt: &IrStmt) -> Option<Stmt> {
                 // the closure param, so the lifted-num coercion
                 // (`i = Number(i)`) and the store sync (`sh2.setVar`) work
                 // unchanged.
+                // loop-local break/continue → native JS statements (with the
+                // keyword's status-0 write: see the While arm)
+                let mut native_body_e = body_e.clone();
+                let jump_prelude: Vec<Stmt> = if stmts_have_break_continue(&body_e) {
+                    vec![native_jump_status_reset()]
+                } else {
+                    vec![]
+                };
                 if !loop_in_async_region(stmt)
-                    && !lowered_stmts_have_signals(&body_e)
+                    && !stmts_have_return_signal(&body_e)
+                    && convert_native_loop_signals(&mut native_body_e, &jump_prelude).0
                     && for_iter_flattenable(iter)
                 {
+                    let body_e = native_body_e;
                     // Store-sync elimination (the SELF_CONTAINED read
                     // pattern, doc in forof_sync_elim_ok): a STORE-BACKED
                     // loop var whose body only ever observes it through
@@ -38135,6 +40836,24 @@ fn stmt_to_estree(stmt: &IrStmt) -> Option<Stmt> {
             if let Some(k) = lifted_arity {
                 *PARAM_FRAME.lock().unwrap() = Some(k);
             }
+            // POSITIONAL_LOCAL param lift (see [`POS_LIFT`]): the define
+            // takes the positional array as ONE ordinary parameter
+            // (`__pos`) and the body's `$N`/`$@`/`$*`/`$#`/`shift` reads
+            // render against it instead of the runtime store. Disjoint from
+            // the param lift above (which wins when both could apply — its
+            // plain `p1..pk` params are the cheaper form).
+            let pos_lifted = if lifted_arity.is_none() {
+                pos_lift_entry(name)
+            } else {
+                None
+            };
+            let saved_pos_frame = if pos_lifted.is_some() {
+                let prev = *POS_FRAME.lock().unwrap();
+                *POS_FRAME.lock().unwrap() = Some(());
+                Some(prev)
+            } else {
+                None
+            };
             // A1-DECLARED parameters (core request rust-20260930-031500):
             // the arrow takes them as real JS parameters, and the body's
             // reads of them render bare (see [`is_named_param`]). Empty
@@ -38143,7 +40862,7 @@ fn stmt_to_estree(stmt: &IrStmt) -> Option<Stmt> {
             // A param-lifted function already takes `p1..pk` and is
             // positional-free by construction; the two shapes are disjoint
             // in practice, but the lift wins if both are present.
-            let named_params: Vec<Expr> = if lifted_arity.is_some() {
+            let named_params: Vec<Expr> = if lifted_arity.is_some() || pos_lifted.is_some() {
                 Vec::new()
             } else {
                 params
@@ -38151,6 +40870,16 @@ fn stmt_to_estree(stmt: &IrStmt) -> Option<Stmt> {
                     .filter(|p| is_plain_ident(p))
                     .map(|p| ident(p))
                     .collect()
+            };
+            // The define arrow's parameter list: `p1..pk` (param lift), the
+            // single `__pos` positional array (POSITIONAL_LOCAL lift), the
+            // A1-declared names, or nothing.
+            let define_params: Vec<Expr> = if let Some(k) = lifted_arity {
+                (1..=k).map(|i| ident(&format!("p{i}"))).collect()
+            } else if pos_lifted.is_some() {
+                vec![ident("__pos")]
+            } else {
+                named_params.clone()
             };
             let named_set: HashSet<String> = named_params
                 .iter()
@@ -38172,21 +40901,18 @@ fn stmt_to_estree(stmt: &IrStmt) -> Option<Stmt> {
                 // from the sync set, so call sites await the arrow.
                 named_block_arrow(body, named_blocks)
             } else if fn_call_is_sync(name) {
-                let params = lifted_arity
-                    .map(|k| (1..=k).map(|i| ident(&format!("p{i}"))).collect())
-                    .unwrap_or_else(|| named_params.clone());
                 if native_echo_fn(name) {
                     // eligible: the body may lower echo/printf
                     // to native writes — no sink-depth bump
                     // (see [`native_echo_fn_set`])
-                    arrow_native_echo_sync(params, IrExpr::Arrow(cloned_body))
+                    arrow_native_echo_sync(define_params, IrExpr::Arrow(cloned_body))
                 } else {
-                    arrow_sink_sync(params, IrExpr::Arrow(cloned_body))
+                    arrow_sink_sync(define_params, IrExpr::Arrow(cloned_body))
                 }
             } else if native_echo_fn(name) {
-                arrow_native_echo(named_params.clone(), IrExpr::Arrow(cloned_body))
+                arrow_native_echo(define_params, IrExpr::Arrow(cloned_body))
             } else {
-                arrow_sink(named_params.clone(), IrExpr::Arrow(cloned_body))
+                arrow_sink(define_params, IrExpr::Arrow(cloned_body))
             };
             // The arrow construction is complete — restore the previous
             // arrow-body deadness (the clone's statements are dropped with
@@ -38198,27 +40924,32 @@ fn stmt_to_estree(stmt: &IrStmt) -> Option<Stmt> {
             if lifted_arity.is_some() {
                 *PARAM_FRAME.lock().unwrap() = None;
             }
+            if let Some(prev) = saved_pos_frame {
+                *POS_FRAME.lock().unwrap() = prev;
+            }
             if pushed_named {
                 *NAMED_PARAMS.lock().unwrap() = None;
             }
-            let binding = if lifted_arity.is_some() {
-                // param-lifted: the runtime map is never consulted (the
-                // analysis proved every call site is a static native
-                // call) — the binding alone defines the function
+            let link_lifted = lifted_arity.is_some() || pos_lifted.is_some();
+            let binding = if link_lifted {
+                // lifted: the runtime map is never consulted (the analysis
+                // proved every call site is a static native call) — the
+                // binding alone defines the function
                 direct_binding_name(name)
             } else {
                 fn_call_is_direct(name)
                     .then(|| direct_binding_name(name).expect("direct set is binding-valid"))
             };
-            // param-lifted: idiomatic `function <binding>(<params>)` at
+            // lifted: idiomatic `function <binding>(<params>)` at
             // the define site (a hoisted declaration — no `=`/`=>`, no
             // `let = null` prologue entry, which we skipped above). Safe
             // because the arrow never binds `this`/`arguments`/`super`
             // (the emitter never generates them), params are plain `p1..`
-            // identifiers, and the analysis proves top-level single
-            // definition with static calls (hoisting only widens the
-            // callable window vs `const`, never narrows it).
-            if lifted_arity.is_some() {
+            // identifiers or the single `__pos` rest array, and the
+            // analysis proves top-level single definition with static
+            // calls (hoisting only widens the callable window vs `const`,
+            // never narrows it).
+            if link_lifted {
                 if let Some(b) = &binding {
                     if let Expr::ArrowFunctionExpression {
                         params,
@@ -38254,7 +40985,7 @@ fn stmt_to_estree(stmt: &IrStmt) -> Option<Stmt> {
                     right: Box::new(arrow.clone()),
                 });
             }
-            if lifted_arity.is_none() {
+            if !link_lifted {
                 items.push(Expr::CallExpression {
                     callee: Box::new(Expr::MemberExpression {
                         object: Box::new(sh2_member("functions")),
@@ -42630,6 +45361,27 @@ fn ir_expr_needs_runtime(e: &IrExpr) -> bool {
 /// fallback / command-not-found 127 when the binding is still null), the
 /// binding is the direct arrow.
 fn try_native_fn_call(name: &str, args: &[IrExpr]) -> Option<Expr> {
+    // POSITIONAL_LOCAL param lift (see [`POS_LIFT`]): the define takes the
+    // positional array as ONE ordinary parameter, so the call is a plain
+    // `f([a1, …])` — no `sh2.exec` dispatch, no arg flatten, no positional
+    // save/restore, no Map lookup. Async defines are awaited (the caller is
+    // always an async context here: the IR call is `exec`, which is
+    // await-bearing either way). The analysis guarantees every call site of
+    // the function took this exact shape (magic-free args, static name), so
+    // no runtime registration is needed.
+    if let Some(sync) = pos_lift_entry(name) {
+        if !args.iter().all(pos_call_arg_ok) {
+            return None;
+        }
+        let binding = direct_binding_name(name)?;
+        let elements: Vec<Option<Expr>> = args.iter().map(|a| Some(expr_to_estree(a))).collect();
+        let call = Expr::CallExpression {
+            callee: Box::new(Expr::Identifier { name: binding }),
+            arguments: vec![Expr::ArrayExpression { elements }],
+            optional: false,
+        };
+        return Some(if sync { call } else { await_expr(call) });
+    }
     if !fn_call_is_sync(name) {
         return None;
     }
@@ -42691,6 +45443,27 @@ fn direct_call_arg_ok(a: &IrExpr) -> bool {
         // flatten DROPS (the call is a side effect); callDirect would pass
         // the marker string through — keep the fnCall dispatch
         IrExpr::Call { func, .. } => !matches!(func.as_str(), "setArray" | "setArrayAppend"),
+        _ => true,
+    }
+}
+
+/// Call-arg eligibility for the POSITIONAL_LOCAL lift: the arg must lower to
+/// a SINGLE scalar — no runtime flatten is performed at the native call, so
+/// an array-valued arg (a spread list, an array-valued `param`/`listVar`,
+/// a field-split) would be passed as one nested array. Stricter than
+/// [`direct_call_arg_ok`], whose flatten-free contract has the same hazard
+/// but only ever meets scalar args in the corpus.
+fn pos_call_arg_ok(a: &IrExpr) -> bool {
+    if !direct_call_arg_ok(a) {
+        return false;
+    }
+    match a {
+        IrExpr::Splice(_) | IrExpr::Array(_) => false,
+        IrExpr::Var(n, _) => !matches!(n.as_str(), "@" | "*"),
+        IrExpr::Call { func, .. } => !matches!(
+            func.as_str(),
+            "listVar" | "arrayValues" | "arrayItems" | "split" | "param"
+        ),
         _ => true,
     }
 }
@@ -43504,11 +46277,20 @@ fn native_line_loop(
     file: Option<Expr>,
     body: &[IrStmt],
 ) -> Option<Stmt> {
-    let body_stmts: Vec<Stmt> = body.iter().filter_map(stmt_to_estree).collect();
-    // A native `for…of` cannot await, and a runtime BREAK/CONTINUE/RETURN
-    // signal thrown from the body must stay catchable by the runtime loop
-    // wrapper (the native-while gate's rules, see the IrStmt::While arm).
-    if stmts_have_await(&body_stmts) || lowered_stmts_have_signals(&body_stmts) {
+    let mut body_stmts: Vec<Stmt> = body.iter().filter_map(stmt_to_estree).collect();
+    // A native `for…of` cannot await, and every loop-local break/continue is
+    // converted to the native JS statement (a remaining signal — nested arrow
+    // or switch consequent — keeps the runtime loop: the native-while gate's
+    // rules, see the IrStmt::While arm).
+    let jump_prelude: Vec<Stmt> = if stmts_have_break_continue(&body_stmts) {
+        vec![native_jump_status_reset()]
+    } else {
+        vec![]
+    };
+    if stmts_have_await(&body_stmts)
+        || stmts_have_return_signal(&body_stmts)
+        || !convert_native_loop_signals(&mut body_stmts, &jump_prelude).0
+    {
         return None;
     }
     let errexit = MAY_ERREXIT.lock().unwrap().unwrap_or(true);
@@ -45120,7 +47902,7 @@ fn try_native_set_shift(name: &str, args: &[IrExpr]) -> Option<Expr> {
             Some(seq(vec![
                 Expr::AssignmentExpression {
                     operator: "=".to_string(),
-                    left: Box::new(sh2_member("positional")),
+                    left: Box::new(positionals_expr()),
                     right: Box::new(Expr::ArrayExpression { elements: elems }),
                 },
                 status(),
@@ -45145,7 +47927,7 @@ fn try_native_set_shift(name: &str, args: &[IrExpr]) -> Option<Expr> {
             }?;
             let slice = Expr::CallExpression {
                 callee: Box::new(Expr::MemberExpression {
-                    object: Box::new(sh2_member("positional")),
+                    object: Box::new(positionals_expr()),
                     property: Box::new(Expr::Identifier {
                         name: "slice".to_string(),
                     }),
@@ -45162,7 +47944,7 @@ fn try_native_set_shift(name: &str, args: &[IrExpr]) -> Option<Expr> {
             Some(seq(vec![
                 Expr::AssignmentExpression {
                     operator: "=".to_string(),
-                    left: Box::new(sh2_member("positional")),
+                    left: Box::new(positionals_expr()),
                     right: Box::new(slice),
                 },
                 status(),
@@ -53195,7 +55977,7 @@ fn fully_lifted_template(s: &str) -> Option<Expr> {
 /// function-call machinery saves/restores — sound inside function bodies
 /// too). Non-positional names → None.
 fn positional_read(name: &str) -> Option<Expr> {
-    let positional = || sh2_member("positional");
+    let positional = positionals_expr;
     match name {
         "0" => Some(sh2_member("argv0")),
         "@" | "*" => Some(Expr::CallExpression {
@@ -54189,10 +56971,10 @@ fn try_native_param(args: &[IrExpr]) -> Option<Expr> {
                     method(
                         array(vec![sh2_member("argv0")]),
                         "concat",
-                        vec![sh2_member("positional")],
+                        vec![positionals_expr()],
                     )
                 } else {
-                    sh2_member("positional")
+                    positionals_expr()
                 };
                 let start: i64 = if o == 0 {
                     0
@@ -60794,9 +63576,27 @@ fn expr_to_estree(e: &IrExpr) -> Expr {
                     if n == "@" || n == "*" {
                         return Expr::ArrayExpression {
                             elements: vec![Some(Expr::SpreadElement {
-                                argument: Box::new(sh2_member("positional")),
+                                argument: Box::new(positionals_expr()),
                             })],
                         };
+                    }
+                }
+            }
+            // `fnCall("f", [args])` — the A1 contract's frontend spelling
+            // of a script-function call. The lift analyses treat a static
+            // `fnCall` site exactly like the `exec` site the bash frontend
+            // emits (see [`pos_lift_set`] / [`param_lift_set`] /
+            // [`fn_call_sync_set`]), so the SAME native-call rewrites must
+            // apply here: a lifted define is deliberately NOT registered in
+            // `sh2.functions`, and dispatching the call through
+            // `sh2.fnCall` would look up that empty map — status 127, body
+            // never executed, no diagnostic on either side. When no lift
+            // applies the helper returns the identical `sh2.fnCall` call
+            // (core request rust-frontend-20261026-151500).
+            if func == "fnCall" {
+                if let [IrExpr::Str(name, _), IrExpr::Array(a)] = args.as_slice() {
+                    if let Some(call) = try_native_fn_call(name, a) {
+                        return call;
                     }
                 }
             }
@@ -62817,7 +65617,7 @@ fn trim_capture(inner: Expr) -> Expr {
 /// tracked cwd. The value is identical to the runtime's getVar for every
 /// corpus-observable state (the corpus is the oracle).
 fn native_special_var(name: &str) -> Option<Expr> {
-    let positional = || sh2_member("positional");
+    let positional = positionals_expr;
     // param-lifted function: the $i arith read IS the pi param
     if let Ok(d) = name.parse::<u32>() {
         if (1..=9).contains(&d) {
@@ -69114,5 +71914,152 @@ mod gpuop_estree_tests {
             body: vec![est],
         });
         assert!(js.contains("/dev/fb0/uniform/1f/uCamYaw"), "slot path: {js}");
+    }
+}
+
+#[cfg(test)]
+mod positional_lift_tests {
+    use super::*;
+
+    fn js_of(src: &str) -> String {
+        let cmds = crate::Parser::new(src).parse().expect("parse");
+        let prog = ast_to_ir(&cmds);
+        serde_json::to_string(&shir_to_estree(&prog)).unwrap()
+    }
+
+    /// JSON walk: does any CallExpression call `name` with an
+    /// ArrayExpression as its single argument (the positional-call shape)?
+    fn has_array_call(v: &serde_json::Value, name: &str) -> bool {
+        match v {
+            serde_json::Value::Object(o) => {
+                if o.get("type").and_then(|t| t.as_str()) == Some("CallExpression") {
+                    let callee_ok = o
+                        .get("callee")
+                        .map(|c| {
+                            c.get("type").and_then(|t| t.as_str()) == Some("Identifier")
+                                && c.get("name").and_then(|n| n.as_str()) == Some(name)
+                        })
+                        .unwrap_or(false);
+                    let arg_ok = o
+                        .get("arguments")
+                        .and_then(|a| a.as_array())
+                        .map(|a| {
+                            a.len() == 1
+                                && a[0].get("type").and_then(|t| t.as_str())
+                                    == Some("ArrayExpression")
+                        })
+                        .unwrap_or(false);
+                    if callee_ok && arg_ok {
+                        return true;
+                    }
+                }
+                o.values().any(|x| has_array_call(x, name))
+            }
+            serde_json::Value::Array(a) => a.iter().any(|x| has_array_call(x, name)),
+            _ => false,
+        }
+    }
+
+    /// POSITIONAL_LOCAL: a function whose positionals are consumed only
+    /// inside the script (`$1`, `shift`, `$@`, `$#`) lowers to a native
+    /// define taking the positional ARRAY as one parameter, and its call
+    /// sites to plain `<name>([args…])` calls — no `sh2.exec` dispatch, no
+    /// `sh2.positional` store, no function-map registration.
+    #[test]
+    fn positional_at_shift_function_lifts_to_native_call() {
+        if !positional_local_enabled() {
+            // SH2_ASSUME_POSITIONAL_LOCAL=0 fidelity mode: the runtime path
+            // is the intended emission, so there is nothing to assert.
+            return;
+        }
+        // `true` last: a trailing single value echo would be rewritten to a
+        // value RETURN by the frontend's value-return fold, turning the call
+        // site into `fnValue` (which the positional lift refuses).
+        let js = js_of("f() { local x=\"$1\"; shift; echo \"[$x][$#][$@]\"; true; }\nf a b c\n");
+        assert!(
+            js.contains("\"FunctionDeclaration\""),
+            "the lifted define is a hoisted function declaration: {js}"
+        );
+        assert!(js.contains("__pos"), "__pos parameter/reads: {js}");
+        assert!(
+            !js.contains("\"name\":\"positional\""),
+            "no runtime positional store inside the lifted body: {js}"
+        );
+        assert!(
+            !js.contains("\"name\":\"functions\""),
+            "a lifted define is not registered in the runtime map: {js}"
+        );
+        assert!(
+            !js.contains("\"name\":\"exec\""),
+            "the static call site is a plain native call, not exec: {js}"
+        );
+        let v: serde_json::Value = serde_json::from_str(&js).unwrap();
+        assert!(
+            has_array_call(&v, "f"),
+            "the call site passes the positional array: {js}"
+        );
+        assert!(
+            js.contains("\"slice\""),
+            "shift lowers to the array slice on __pos: {js}"
+        );
+    }
+
+    /// Negative: `shift` inside a SUBSCOPE writes positionals bash would
+    /// discard with the subshell — the frame is shared, so keep the
+    /// runtime dispatch.
+    #[test]
+    fn shift_inside_subshell_keeps_the_runtime_path() {
+        let js = js_of("f() { ( shift ); echo \"$1\"; }\nf a b\n");
+        assert!(
+            js.contains("\"name\":\"functions\""),
+            "subshell shift must keep the runtime registration: {js}"
+        );
+        assert!(
+            !js.contains("__pos"),
+            "no positional frame for a subshell-writing function: {js}"
+        );
+    }
+
+    /// Negative: `set --` rewrites positionals through the runtime builtin
+    /// in forms the native lowering refuses (`set -e -- a`) — keep the
+    /// dispatch rather than desyncing `__pos` from the store.
+    #[test]
+    fn set_positional_keeps_the_runtime_path() {
+        let js = js_of("f() { set -- p q; echo \"$1\"; }\nf a\n");
+        assert!(
+            js.contains("\"name\":\"functions\""),
+            "set -- must keep the runtime registration: {js}"
+        );
+        assert!(!js.contains("__pos"), "no positional frame: {js}");
+    }
+
+    /// Negative: a DYNAMIC dispatch outside the body (`$h z`) could reach
+    /// the function at runtime, and a lifted define is not in the map.
+    #[test]
+    fn dynamic_dispatch_disqualifies_the_lift() {
+        let js = js_of("g() { echo \"$1\"; }\nh=g\n$h z\n");
+        assert!(
+            js.contains("\"name\":\"functions\""),
+            "dynamic dispatch keeps the runtime registration: {js}"
+        );
+        assert!(!js.contains("__pos"), "no positional frame: {js}");
+    }
+
+    /// The positional-reader fix: `[...sh2.positional]` (the native `"$@"`
+    /// list lowering) IS a positional read. Treating a SpreadElement as
+    /// inert made positional-using functions look positional-free to the
+    /// direct-call analysis, which then emitted the `let <name> = null`
+    /// prologue entry for a function that also got a hoisted
+    /// `function <name>(…)` — a SyntaxError.
+    #[test]
+    fn spread_of_positional_reads_as_positional() {
+        let spread = Expr::SpreadElement {
+            argument: Box::new(sh2_member("positional")),
+        };
+        assert!(estree_reads_positional(&spread));
+        let arr = Expr::ArrayExpression {
+            elements: vec![Some(spread)],
+        };
+        assert!(estree_reads_positional(&arr));
     }
 }

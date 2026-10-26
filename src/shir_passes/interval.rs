@@ -16,7 +16,7 @@
 
 use std::collections::HashMap;
 
-use crate::ir::IrProgram;
+use crate::ir::{ArithAst, IrProgram};
 use crate::shir_passes::PassContext;
 
 /// How `%`/`//` behave.
@@ -80,6 +80,62 @@ fn analyze_ranges_floor(prog: &IrProgram, _cfg: IntervalConfig) -> HashMap<Strin
     ranges
 }
 
+fn floor_arith_range(a: &ArithAst, env: &HashMap<String, (i128, i128)>) -> Option<(i128, i128)> {
+    match a {
+        ArithAst::Bin { op, lhs, rhs } if op == "%" => {
+            let (l0, l1) = arith_floor_range(lhs, env)?;
+            let (r0, r1) = arith_floor_range(rhs, env)?;
+            if l0 >= 0 && r0 > 0 {
+                // Python floor-mod with positive divisor
+                Some((0, r1 - 1))
+            } else {
+                None
+            }
+        }
+        ArithAst::Bin { op, lhs, rhs } if op == "/" => {
+            // `//` is lowered as `/` with floor semantics in Python
+            let (l0, l1) = arith_floor_range(lhs, env)?;
+            let (r0, r1) = arith_floor_range(rhs, env)?;
+            if l0 >= 0 && r0 > 0 {
+                // floor div, both nonneg -> trunc == floor, endpoints suffice
+                let qs = [l0 / r1, l0 / r0, l1 / r1, l1 / r0];
+                Some((*qs.iter().min()?, *qs.iter().max()?))
+            } else {
+                None
+            }
+        }
+        _ => None,
+    }
+}
+fn arith_floor_range(a: &ArithAst, env: &HashMap<String, (i128, i128)>) -> Option<(i128, i128)> {
+    match a {
+        ArithAst::Num(i) => Some((*i as i128, *i as i128)),
+        ArithAst::Var(n) | ArithAst::Ident(n) => env.get(n).copied(),
+        ArithAst::Bin { op, lhs, rhs } => {
+            let l = arith_floor_range(lhs, env)?;
+            let r = arith_floor_range(rhs, env)?;
+            match op.as_str() {
+                "+" => Some((l.0.checked_add(r.0)?, l.1.checked_add(r.1)?)),
+                "-" => Some((l.0.checked_sub(r.1)?, l.1.checked_sub(r.0)?)),                    "*" => {
+                        // Checked like `+`/`-` and every other corner site
+                        // in the tree: a raw `*` panics in debug and wraps
+                        // in release, and a wrapped corner is a silently
+                        // wrong verdict (IntervalFloor's `v0_not_sound` --
+                        // 2^64 * 2^64 naming [0,0]). Overflow refuses.
+                        let ps = [
+                            l.0.checked_mul(r.0)?,
+                            l.0.checked_mul(r.1)?,
+                            l.1.checked_mul(r.0)?,
+                            l.1.checked_mul(r.1)?,
+                        ];
+                        Some((*ps.iter().min()?, *ps.iter().max()?))
+                    }
+                _ => None,
+            }
+        }
+        _ => None,
+    }
+}
 fn refine_floor_mod(prog: &IrProgram, ranges: &mut HashMap<String, (i128, i128)>) {
     // Walk assigns whose RHS is an arith `%`/`//` and, when the lhs is
     // provably >=0 and divisor >0, clamp to the floor interval
@@ -140,53 +196,6 @@ fn refine_floor_mod(prog: &IrProgram, ranges: &mut HashMap<String, (i128, i128)>
         }
     }
     fn arith_writes_refine(_a: &ArithAst, _ranges: &mut HashMap<String, (i128, i128)>) {}
-    fn floor_arith_range(a: &ArithAst, env: &HashMap<String, (i128, i128)>) -> Option<(i128, i128)> {
-        match a {
-            ArithAst::Bin { op, lhs, rhs } if op == "%" => {
-                let (l0, l1) = arith_floor_range(lhs, env)?;
-                let (r0, r1) = arith_floor_range(rhs, env)?;
-                if l0 >= 0 && r0 > 0 {
-                    // Python floor-mod with positive divisor
-                    Some((0, r1 - 1))
-                } else {
-                    None
-                }
-            }
-            ArithAst::Bin { op, lhs, rhs } if op == "/" => {
-                // `//` is lowered as `/` with floor semantics in Python
-                let (l0, l1) = arith_floor_range(lhs, env)?;
-                let (r0, r1) = arith_floor_range(rhs, env)?;
-                if l0 >= 0 && r0 > 0 {
-                    // floor div, both nonneg -> trunc == floor, endpoints suffice
-                    let qs = [l0 / r1, l0 / r0, l1 / r1, l1 / r0];
-                    Some((*qs.iter().min()?, *qs.iter().max()?))
-                } else {
-                    None
-                }
-            }
-            _ => None,
-        }
-    }
-    fn arith_floor_range(a: &ArithAst, env: &HashMap<String, (i128, i128)>) -> Option<(i128, i128)> {
-        match a {
-            ArithAst::Num(i) => Some((*i as i128, *i as i128)),
-            ArithAst::Var(n) | ArithAst::Ident(n) => env.get(n).copied(),
-            ArithAst::Bin { op, lhs, rhs } => {
-                let l = arith_floor_range(lhs, env)?;
-                let r = arith_floor_range(rhs, env)?;
-                match op.as_str() {
-                    "+" => Some((l.0.checked_add(r.0)?, l.1.checked_add(r.1)?)),
-                    "-" => Some((l.0.checked_sub(r.1)?, l.1.checked_sub(r.0)?)),
-                    "*" => {
-                        let ps = [l.0 * r.0, l.0 * r.1, l.1 * r.0, l.1 * r.1];
-                        Some((*ps.iter().min()?, *ps.iter().max()?))
-                    }
-                    _ => None,
-                }
-            }
-            _ => None,
-        }
-    }
     for s in &prog.stmts {
         stmt_refine(s, ranges);
     }
@@ -215,5 +224,61 @@ impl crate::shir_passes::Analysis for PyInterval {
     }
     fn run(&self, prog: &IrProgram, ctx: &mut PassContext) {
         ctx.var_ranges = analyze_ranges(prog, IntervalConfig::python());
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn ranges_of(src: &str) -> HashMap<String, (i128, i128)> {
+        let cmds = crate::Parser::new(src).parse().expect("parse");
+        let prog = crate::shir::ast_to_ir_raw(&cmds);
+        analyze_ranges(&prog, IntervalConfig::python())
+    }
+
+    /// The `*` arm's corner products: `2^120 * 2^120 = 2^240` escapes
+    /// i128. The raw `*` that used to compute the corners panicked in a
+    /// debug build (this test, red before the fix) and wrapped in
+    /// release -- a wrapped corner is a silently wrong verdict, the
+    /// defect class the BigInt pass was built to dodge one level down.
+    /// Overflow now refuses, like the `+`/`-` siblings.
+    /// Mirrors `v0_not_sound` in proofs/IntervalFloor/IntervalFloor.thy.
+    #[test]
+    fn floor_multiply_overflow_refuses() {
+        let mut env: HashMap<String, (i128, i128)> = HashMap::new();
+        env.insert("c".to_string(), (1_i128 << 120, 1_i128 << 120));
+        let cc = ArithAst::Bin {
+            op: "*".to_string(),
+            lhs: Box::new(ArithAst::Var("c".to_string())),
+            rhs: Box::new(ArithAst::Var("c".to_string())),
+        };
+        // 2^120 fits i128 but its square does not: refuse, do not wrap
+        assert_eq!(arith_floor_range(&cc, &env), None);
+    }
+
+    /// Full pipeline: a deep `c*c` chain under `%` reaches the floor
+    /// refine without panicking and leaves `m` with no verdict (today's
+    /// env comes from the wrapping bash walk, which caps values near
+    /// 2^63, so the `r0 > 0` guard refuses this one before any corner
+    /// product is formed).
+    #[test]
+    fn deep_chain_reaches_floor_refine_without_verdict() {
+        let r = ranges_of("a=1073741824\nb=$((a*a))\nc=$((b*b))\nm=$(( (c*c) % c ))");
+        assert!(!r.contains_key("m"), "got {:?}", r.get("m"));
+    }
+
+    /// The floor-mod transfer itself: proved-nonneg lhs with positive
+    /// divisor refines toward [0, r1-1] and only ever narrows (the
+    /// intersect keeps the existing range when it is tighter).
+    #[test]
+    fn floor_mod_refines_to_zero_based() {
+        let r = ranges_of("x=100\nd=30\nm=$((x % d))");
+        let (lo, hi) = r.get("m").expect("m has a range");
+        assert!(
+            *lo >= 0 && *hi <= 29,
+            "floor mod of a nonneg lhs in [0,29], got {:?}",
+            r.get("m")
+        );
     }
 }

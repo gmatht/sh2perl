@@ -191,50 +191,112 @@ fn rewrite(list: &mut Vec<IrStmt>) -> bool {
 pub fn transform(stmts: &mut Vec<IrStmt>) -> bool {
     let mut changed = rewrite(stmts);
     for st in stmts.iter_mut() {
-        changed |= rewrite_nested(st);
+        changed |= walk_stmt(st);
     }
     changed
 }
 
-/// Walk into the statement lists this pass rewrites. (`transform` is
-/// re-entered on the nested lists, so a `while true` inside an `if` arm
-/// or a loop body is rewritten the same way.)
-fn rewrite_nested(st: &mut IrStmt) -> bool {
+/// Recurse into the nested statement lists (each gets its own
+/// [`rewrite`]) AND into the statement's expressions: a process
+/// substitution carries a whole loop in an OPERAND
+/// (`head <(while true; do echo .; sleep 1; done)`), so a statement-only
+/// walk never reaches it. The expression list mirrors the sibling
+/// `shir-pipeline-native` walk.
+fn walk_stmt(st: &mut IrStmt) -> bool {
     match st {
         IrStmt::If {
+            cond,
             then,
             elsifs,
             else_,
-            ..
         } => {
-            let mut c = rewrite(then);
-            for (_, arm) in elsifs.iter_mut() {
-                c |= rewrite(arm);
+            let mut c = walk_expr(cond);
+            c |= transform(then);
+            for (ec, arm) in elsifs.iter_mut() {
+                c |= walk_expr(ec);
+                c |= transform(arm);
             }
-            c | rewrite(else_)
+            c | transform(else_)
         }
-        IrStmt::For { body, .. }
-        | IrStmt::While { body, .. }
-        | IrStmt::DoWhile { body, .. }
-        | IrStmt::Block(body)
-        | IrStmt::Subshell(body)
-        | IrStmt::Background(body)
-        | IrStmt::Function { body, .. }
-        | IrStmt::Redirect { inner: body, .. } => rewrite(body),
-        IrStmt::Case { clauses, .. } => {
-            let mut c = false;
+        IrStmt::For { iter, body, .. } => walk_expr(iter) | transform(body),
+        IrStmt::While { cond, body } => walk_expr(cond) | transform(body),
+        IrStmt::DoWhile { body, cond, .. } => transform(body) | walk_expr(cond),
+        IrStmt::Case {
+            discriminant,
+            clauses,
+        } => {
+            let mut c = walk_expr(discriminant);
             for cl in clauses.iter_mut() {
-                c |= rewrite(&mut cl.body);
+                c |= transform(&mut cl.body);
+            }
+            c
+        }
+        IrStmt::Block(b)
+        | IrStmt::Subshell(b)
+        | IrStmt::Background(b)
+        | IrStmt::Function { body: b, .. } => transform(b),
+        IrStmt::Redirect { inner, redirects } => {
+            let mut c = transform(inner);
+            for r in redirects.iter_mut() {
+                c |= walk_expr(&mut r.target);
             }
             c
         }
         IrStmt::Pipeline { stages, .. } => {
             let mut c = false;
             for stage in stages.iter_mut() {
-                c |= rewrite(stage);
+                c |= transform(stage);
             }
             c
         }
+        IrStmt::Expr(e) => walk_expr(e),
+        IrStmt::Output { value, .. } => walk_expr(value),
+        IrStmt::Assign { expr, .. } => walk_expr(expr),
+        IrStmt::Declare { init: Some(e), .. } => walk_expr(e),
+        IrStmt::WriteFile { path, content, .. } => walk_expr(path) | walk_expr(content),
+        IrStmt::Exec { cmd, args, env, .. } => {
+            let mut c = walk_expr(cmd);
+            for a in args.iter_mut() {
+                c |= walk_expr(a);
+            }
+            for (_, v) in env.iter_mut() {
+                c |= walk_expr(v);
+            }
+            c
+        }
+        _ => false,
+    }
+}
+
+/// Recurse into an expression's statement-carrying parts (`Arrow` bodies,
+/// call arguments, …).
+fn walk_expr(e: &mut IrExpr) -> bool {
+    match e {
+        IrExpr::Arrow(stmts) => transform(stmts),
+        IrExpr::Call { args, .. } => {
+            let mut c = false;
+            for a in args.iter_mut() {
+                c |= walk_expr(a);
+            }
+            c
+        }
+        IrExpr::Array(items) => {
+            let mut c = false;
+            for a in items.iter_mut() {
+                c |= walk_expr(a);
+            }
+            c
+        }
+        IrExpr::Object(pairs) => {
+            let mut c = false;
+            for (_, v) in pairs.iter_mut() {
+                c |= walk_expr(v);
+            }
+            c
+        }
+        IrExpr::BinOp { lhs, rhs, .. } => walk_expr(lhs) | walk_expr(rhs),
+        IrExpr::Index { key, .. } => walk_expr(key),
+        IrExpr::Capture { expr, .. } => walk_expr(expr),
         _ => false,
     }
 }
@@ -415,6 +477,60 @@ mod tests {
     fn a_real_command_condition_is_left_alone() {
         let mut stmts = lower("while grep -q x f; do echo hi; done");
         assert!(!transform(&mut stmts), "must not rewrite: {stmts:?}");
+    }
+
+    /// A process substitution carries the loop in an OPERAND
+    /// (`head <(while true; do echo .; done)` — 096_head_procsub): the
+    /// expression walk has to reach it, or the fork-per-iteration
+    /// condition survives inside the fork block.
+    #[test]
+    fn a_loop_inside_a_process_substitution_operand_is_rewritten() {
+        use crate::shir_json::shir_to_shir_json;
+        let commands =
+            parse_commands_from_text("head <(while true; do echo .; done)").expect("parse");
+        let mut prog = ast_to_ir_raw(&commands);
+        // The pipeline order: `process-subst` materializes the producer
+        // (the loop) out of the redirect's TEXT target first.
+        let _ = crate::transforms::process_subst::transform(&mut prog.stmts);
+        assert!(transform(&mut prog.stmts), "must rewrite: {:?}", prog.stmts);
+        let json = shir_to_shir_json(&prog);
+        let v: serde_json::Value = serde_json::from_str(&json).expect("json");
+        assert!(
+            no_command_cond(&v),
+            "a command condition survived: {json}"
+        );
+    }
+
+    /// No `cond` anywhere in the tree is still a `true`/`false`/`:` call.
+    fn no_command_cond(v: &serde_json::Value) -> bool {
+        match v {
+            serde_json::Value::Object(m) => {
+                if m.get("cond").map(is_status_call) == Some(true) {
+                    return false;
+                }
+                m.values().all(no_command_cond)
+            }
+            serde_json::Value::Array(a) => a.iter().all(no_command_cond),
+            _ => true,
+        }
+    }
+
+    fn is_status_call(v: &serde_json::Value) -> bool {
+        v.get("type").and_then(|t| t.as_str()) == Some("Call")
+            && matches!(v.get("func").and_then(|f| f.as_str()), Some("builtin" | "exec"))
+            && v.get("args")
+                .and_then(|a| a.as_array())
+                .map(|args| {
+                    matches!(
+                        args.first().and_then(|a| a.get("value")).and_then(|s| s.as_str()),
+                        Some("true" | "false" | ":")
+                    ) && args
+                        .get(1)
+                        .and_then(|w| w.get("elements"))
+                        .and_then(|e| e.as_array())
+                        .is_none_or(|e| e.is_empty())
+                })
+                == Some(true)
     }
 
     /// Is `stmt` the canonical status-zero statement this pass emits?

@@ -12,3 +12,4 @@ field init: int
 field step: int
 field cond: expr
 field body: stmts
+spec: none (effect: control flow)

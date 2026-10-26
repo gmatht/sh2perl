@@ -446,8 +446,50 @@ fn producer_ends_with_newline(s: &[IrStmt]) -> bool {
     }
 }
 
+/// A FOLDED constant producer — EchoFold's canonical `IrStmt::Output` —
+/// as `(payload, producer trailing-newline flag)`.
+///
+/// The payload convention is the one the `echo`/`printf` channels build
+/// from raw words: the text with ONE trailing newline stripped, and
+/// `producer_nl` telling the consumer to put it back. EchoFold resolves
+/// the escapes at transform time, so `text` is already the emitted bytes:
+///
+///   * `echo "a"`     → `Output { "a",   nl: true  }` → ("a",   true)
+///   * `printf "a\\n"` → `Output { "a\\n", nl: false }` → ("a",   true)
+///   * `printf "foo"` → `Output { "foo", nl: false }` → ("foo", false)
+///   * `echo -n "a"`  → `Output { "a",   nl: false }` → ("a",   false)
+///
+/// which is byte-for-byte what the unfolded channels report for the same
+/// source statement (the `-n` case is a bonus: `pipe_printf_content`
+/// refuses it outright). A non-constant `value` refuses (REFUSE > GUESS),
+/// as does a filehandle `target` (that output never reaches the pipe).
+/// A numeric value (`echo 42 | tr …`, EchoFold's numeric arm) renders as
+/// a Perl EXPRESSION — the consumers splice `{body}` in expression
+/// position, so a bare number formats exactly like echo's word.
+fn output_content(s: &[IrStmt]) -> Option<(String, bool)> {
+    let [IrStmt::Output {
+        value,
+        newline,
+        target: None,
+    }] = s
+    else {
+        return None;
+    };
+    let (expr, text_nl) = match value {
+        IrExpr::Str(t, _) => {
+            let body = t.strip_suffix('\n').unwrap_or(t);
+            (crate::ir::safe_perl_q_string(body), t.ends_with('\n'))
+        }
+        other => (crate::ir::ir_expr_to_perl(other), false),
+    };
+    Some((expr, *newline || text_nl))
+}
+
 /// The producer payload + its trailing-newline flag for the consumer
-/// dispatch. The three channels, in order (refuse > guess at every step):
+/// dispatch. The channels, in order (refuse > guess at every step):
+/// 0. [`output_content`] — a folded constant producer (`IrStmt::Output`,
+///    EchoFold's canonical node); must come first because every channel
+///    below matches `IrStmt::Expr` only.
 /// 1. `pipe_dynamic_content` — strings/paste/find/`printf '%s\n'` runtime
 ///    expressions.
 /// 2. `pipe_printf_content` — the const echo/printf/seq payload.
@@ -457,6 +499,18 @@ fn producer_ends_with_newline(s: &[IrStmt]) -> bool {
 ///    of the whole pipeline shelling out. The capture strips the trailing
 ///    newline (the payload convention), hence `producer_nl: true`.
 fn producer_content(s1: &[IrStmt]) -> Option<(String, bool)> {
+    // Channel 0 — a FOLDED constant producer (EchoFold's canonical
+    // `IrStmt::Output`): the fold has already resolved the escapes, so the
+    // payload is the text itself. It must come first: the three channels
+    // below all match `IrStmt::Expr` only, so without this arm a folded
+    // producer falls off ALL of them and the whole pipeline shells out —
+    // which is not merely slower. The shell fallback feeds the consumer
+    // through `open '|-'`, and a forked child cannot write into the
+    // parent's scalar capture, so `$(echo x | tee f)` lost its payload
+    // entirely (000__02 / 000__04f went equivalence-red exactly this way).
+    if let Some(pair) = output_content(s1) {
+        return Some(pair);
+    }
     if let Some(expr) = pipe_dynamic_content(s1) {
         return Some((expr, producer_ends_with_newline(s1)));
     }
@@ -573,7 +627,21 @@ fn pipe_printf_content(s: &[IrStmt]) -> Option<String> {
         if fmt.contains('%') {
             return None;
         }
-        return Some(printf_unescape(&fmt));
+        // Payload convention (see `producer_ends_with_newline`): the
+        // producer's trailing newline is STRIPPED and `producer_nl` tells
+        // the consumer to restore it. echo/seq build a payload that is
+        // newline-free by construction; printf's payload IS the unescaped
+        // format, so strip ONE trailing newline here — otherwise every
+        // restoring consumer (`tr`'s `body . "\n"`, the split -1 +
+        // print-newline families) double-terminates and the output gains a
+        // blank line per pipeline stage (zz_probe/058-class regression).
+        let payload = printf_unescape(&fmt);
+        return Some(
+            payload
+                .strip_suffix('\n')
+                .map(str::to_string)
+                .unwrap_or(payload),
+        );
     }
     // `seq [first [step]] last` — the ascending integer sequence, joined
     // by newlines. The consumers split on `\n`, and the payload
@@ -811,6 +879,18 @@ fn glob_re(pat: &str) -> String {
 
 /// The single word of `echo WORD` (no flags).
 fn echo_single_word(s: &[IrStmt]) -> Option<&IrExpr> {
+    // Folded form: `echo CONST | bc` lowers to `Output { value, newline }`.
+    // `newline: true` keeps the contract the unfolded arm enforces by
+    // refusing multi-word/`-n` lists (`echo -n X | bc` has no trailing
+    // newline the consumer's `print int(..), "\n"` would restore).
+    if let [IrStmt::Output {
+        value,
+        newline: true,
+        target: None,
+    }] = s
+    {
+        return Some(value);
+    }
     let [IrStmt::Expr(e)] = s else {
         return None;
     };

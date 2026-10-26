@@ -15,7 +15,7 @@
 use num_bigint::BigInt;
 use std::collections::{HashMap, HashSet};
 
-use crate::ir::{ArithAst, IrExpr, IrStmt};
+use crate::ir::{ArithAst, IrExpr, IrStmt, IrType};
 use crate::shir::{collect_assigned, for_iter_range};
 use crate::shir_nodes::ExtNode;
 
@@ -146,39 +146,40 @@ pub(crate) fn big_arith_range(
                     Some((v.clone(), v))
                 }
                 "%" => {
-                    // Python sign-of-divisor over endpoint divisors ×
-                    // endpoint dividends (exact floor at each corner)
-                    let mut first = true;
-                    let (mut lo, mut hi) = (BigInt::from(0), BigInt::from(0));
-                    for b in [&r0, &r1] {
-                        if b == &BigInt::from(0) {
-                            return None;
-                        }
-                        for x in [&l0, &l1] {
-                            let m = floor_mod(x, b)?;
-                            if first {
-                                lo = m.clone();
-                                hi = m;
-                                first = false;
-                            } else {
-                                if m < lo {
-                                    lo = m.clone();
-                                }
-                                if m > hi {
-                                    hi = m;
-                                }
-                            }
-                        }
+                    // Floor-mod's value set over an interval is an interval
+                    // the *corners* miss (the DivModPow2 class): corner
+                    // min/max here was unsound. The sign-of-divisor
+                    // property needs NO dividend bound -- the old comment
+                    // was right, the corner loop beside it was not -- so:
+                    // point-exact when both ranges are points, otherwise
+                    // the divisor's sign alone bounds the residue, and a
+                    // straddling divisor range is refused.
+                    // (floor_mod's b = 0 → None is the point-branch guard.)
+                    if l0 == l1 && r0 == r1 {
+                        let m = floor_mod(&l0, &r0)?;
+                        Some((m.clone(), m))
+                    } else if r0 > BigInt::from(0) {
+                        Some((BigInt::from(0), &r1 - 1))
+                    } else if r1 < BigInt::from(0) {
+                        Some((&r0 + 1, BigInt::from(0)))
+                    } else {
+                        None
                     }
-                    Some((lo, hi))
                 }
                 "//" => {
+                    // Corners suffice only for POSITIVE divisor ranges:
+                    // floor-div jumps at the pole ([-5,3] claimed (-2,2),
+                    // true 6 // -1 = -6), and divisor monotonicity -- the
+                    // reason corners work at all -- is only available here
+                    // for 0 < b. Refuse every other divisor range; with
+                    // r0 > 0 neither endpoint is zero, so the loop needs
+                    // no zero check.
+                    if r0 <= BigInt::from(0) {
+                        return None;
+                    }
                     let mut first = true;
                     let (mut lo, mut hi) = (BigInt::from(0), BigInt::from(0));
                     for b in [&r0, &r1] {
-                        if b == &BigInt::from(0) {
-                            return None;
-                        }
                         for x in [&l0, &l1] {
                             let q = floor_div(x, b)?;
                             if first {
@@ -217,6 +218,11 @@ pub(crate) fn big_arith_range(
         // in-expression writes (`x=$((x++))`): the target's new value is
         // unmodelled here (the statement walk binds it) — unknown value.
         ArithAst::Assign { .. } | ArithAst::IncDec { .. } => None,
+        // A float-typed cast has no integer value to read -- name a
+        // range for it only if eval reads it, and eval does not (the
+        // fix mirrors Cast f a: f ⇒ refuse). Integer-identity casts
+        // recurse, as v0 did.
+        ArithAst::Cast { ty, arg } if matches!(ty, IrType::Float(_)) => None,
         ArithAst::Cast { arg, .. } => big_arith_range(arg, env),
         ArithAst::Sizeof(_) => None,
     }
@@ -542,6 +548,58 @@ mod tests {
             big_arith_range(&neg7, &env),
             Some((bi(2), bi(2)))
         );
+    }
+
+    /// The DivModPow2-class corner bug: min/max of floor-mod at the
+    /// interval corners misses the value set (29 % 30 = 29 ∉ [0,10]).
+    #[test]
+    fn floor_mod_positive_range_is_sign_bounded() {
+        let mut env: HashMap<String, (BigInt, BigInt)> = HashMap::new();
+        env.insert("x".to_string(), (bi(0), bi(100)));
+        let m = ArithAst::Bin {
+            op: "%".to_string(),
+            lhs: Box::new(ArithAst::Var("x".to_string())),
+            rhs: Box::new(ArithAst::Num(30)),
+        };
+        // sound (0 ≤ r < 30) where the corner loop claimed (0, 10)
+        assert_eq!(big_arith_range(&m, &env), Some((bi(0), bi(29))));
+    }
+
+    /// Floor-div jumps at the pole: 6 // -1 = -6 is outside any
+    /// corner-min/max of [-5,3] -- straddling divisor ranges refuse.
+    #[test]
+    fn floor_div_straddling_divisor_refused() {
+        let mut env: HashMap<String, (BigInt, BigInt)> = HashMap::new();
+        env.insert("b".to_string(), (bi(-5), bi(3)));
+        let d = ArithAst::Bin {
+            op: "//".to_string(),
+            lhs: Box::new(ArithAst::Num(6)),
+            rhs: Box::new(ArithAst::Var("b".to_string())),
+        };
+        assert_eq!(big_arith_range(&d, &env), None);
+        // positive divisor ranges keep their exact corners
+        env.insert("b".to_string(), (bi(2), bi(5)));
+        assert_eq!(
+            big_arith_range(&d, &env),
+            Some((bi(1), bi(3)))
+        );
+    }
+
+    /// A float-typed cast has no integer value to name a range for;
+    /// integer-identity casts still recurse (v0 behavior).
+    #[test]
+    fn float_cast_refused_integer_cast_recurse() {
+        let env: HashMap<String, (BigInt, BigInt)> = HashMap::new();
+        let f = ArithAst::Cast {
+            ty: IrType::Float(64),
+            arg: Box::new(ArithAst::Num(5)),
+        };
+        let i = ArithAst::Cast {
+            ty: IrType::Int64,
+            arg: Box::new(ArithAst::Num(5)),
+        };
+        assert_eq!(big_arith_range(&f, &env), None);
+        assert_eq!(big_arith_range(&i, &env), Some((bi(5), bi(5))));
     }
 
     #[test]

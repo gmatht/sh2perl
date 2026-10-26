@@ -1,0 +1,40 @@
+# shir_nodes/str_splice.node — expression-level semantic IR node.
+# StrSplice(base, start, end, repl): the value of a
+# `${b:0:$start}${repl}${b:$end}` interpolation — b's prefix [0,start),
+# then repl, then b's suffix from `end` — with BOTH slice offsets clamped
+# exactly as bash clamps `${x:off:len}` (negative `end` counts back from
+# the end; a negative `start` drops that many trailing bytes). Folded from
+# that Interpolate shape by `str-splice-fold`
+# (transforms/str_splice_fold.rs), which only fires when both slices read
+# the SAME base and the suffix runs to the end of the string.
+#
+# Why a node instead of the concat it replaced: the concat form forces
+# every backend to build TWO substring temps plus a join temp, which the
+# store then copies a fourth time — ~4 passes over the whole string per
+# store (the per-pixel row rebuild in MIMEcroft's rasterizer: 2 substr +
+# snprintf + array copy over a 2560-byte row for EVERY pixel). A node
+# lets the destination's store write the result STRAIGHT INTO its own
+# buffer when it fits (capacity-guarded, one pass) while remaining
+# exactly the concat it replaced for every other consumer.
+#
+# Backends: C (capacity-guarded fused store — target-gated offer, PLAN
+# §11 marketplace: a backend accepts by adding the value/store arms and
+# its target in transforms::transform_applies). Targets that do not run
+# the fold never see the node: they keep the original Interpolate.
+# Fallback expansion: the exact Interpolate this was folded from
+# (renderers may always rebuild it — the C value-position arm does).
+#
+# `base` is an EXPR field holding the plain `Var` read of the base
+# string (not a bare name string): the analysis walkers recurse
+# `ExtExpr::children`, so the base read counts as an ordinary read
+# (dead_store_elim's census — a `string` field would have hidden it and
+# let DSE drop the base's only store).
+#
+node StrSplice
+tag "StrSplice"
+kind expr
+field base: expr
+field start: expr
+field end: expr
+field repl: expr
+spec: none (unstated)

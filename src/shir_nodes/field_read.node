@@ -17,3 +17,4 @@ kind expr
 # storage_class str_bounded
 field object: expr
 field name: string
+spec: none (effect: frontend shape)

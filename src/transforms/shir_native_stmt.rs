@@ -3703,14 +3703,12 @@ fn native_echo_grep_stmt(st: &mut IrStmt) -> bool {
 /// The target is a literal Str path, or a Var/Ident whose NAME is the
 /// literal filename (process-substitution temps like `__ps_tmp0`).
 fn native_echo_write_file_stmt(st: &mut IrStmt) -> bool {
-    let IrStmt::Redirect { inner, redirects } = st else { eprintln!("DWF: not redirect {:?}", std::mem::discriminant(st)); return false; };
-    let [r] = redirects.as_slice() else { eprintln!("DWF: n redirects {}", redirects.len()); return false; };
+    let IrStmt::Redirect { inner, redirects } = st else { return false; };
+    let [r] = redirects.as_slice() else { return false; };
     if r.fd.unwrap_or(1) != 1 {
-        eprintln!("DWF: fd {}", r.fd.unwrap_or(1));
         return false;
     }
     if !matches!(r.mode.as_str(), "w" | "wc") {
-        eprintln!("DWF: mode {:?}", r.mode);
         return false;
     }
 
@@ -3772,7 +3770,6 @@ fn native_echo_write_file_stmt(st: &mut IrStmt) -> bool {
             }
         }
     } else if cmd == "printf" {
-        eprintln!("DWF: printf stmt");
         // printf FMT > FILE: exactly one literal format word, no args,
         // no %-directives (those need argument substitution)
         if words.len() != 1 {
@@ -6238,12 +6235,29 @@ fn native_find_stmt(st: &mut IrStmt) -> bool {
             )
         }
     };
-    let head = match head_n {
-        Some(n) => format!(" splice(@__out, {n}) if @__out > {n};"),
-        None => String::new(),
+    // `head -N` SHORT-CIRCUITS: a real `find | head -N` stops reading after
+    // N lines (the reader closes the pipe). Collecting the ENTIRE traversal
+    // into @__out and splicing to N afterwards yields the same N results in
+    // the same readdir/depth-first order — but it walks the WHOLE tree first.
+    // On a large tree (the live workspace: 43 GB, 11 worktrees) that full
+    // walk times out where GNU find's own short-circuit finishes instantly
+    // (observed: test_find.sh produced EMPTY stdout under the gate — the
+    // walker hit the 20s cap while `find` had long since printed 3 lines).
+    // So with a head limit present, bail out of the recursion (early_ret) and
+    // the entry loop (loop_guard) the MOMENT N matches are collected:
+    // byte-identical first-N, but bounded by N instead of by tree size. The
+    // trailing splice is kept as a belt-and-braces no-op.
+    let (lim_decl, early_ret, loop_guard, head) = match head_n {
+        Some(n) => (
+            format!(" my $__lim = {n};"),
+            " return if @__out >= $__lim;".to_string(),
+            "last if @__out >= $__lim; ".to_string(),
+            format!(" splice(@__out, {n}) if @__out > {n};"),
+        ),
+        None => (String::new(), String::new(), String::new(), String::new()),
     };
     let code = format!(
-        r#"do {{ my @__out; my $__walk; $__walk = sub {{ my ($__d) = @_; opendir(my $__h, $__d) or return; my @__e = readdir($__h); closedir $__h; for my $__e (@__e) {{ next if $__e eq '.' || $__e eq '..'; my $__p = "$__d/$__e"; {matcher} }} }}; $__walk->({dq});{head} if (@__out) {{ print STDOUT join("\n", @__out), "\n"; }} }}; $main_exit_code = $CHILD_ERROR = 0;"#
+        r#"do {{ my @__out;{lim_decl} my $__walk; $__walk = sub {{ my ($__d) = @_;{early_ret} opendir(my $__h, $__d) or return; my @__e = readdir($__h); closedir $__h; for my $__e (@__e) {{ {loop_guard}next if $__e eq '.' || $__e eq '..'; my $__p = "$__d/$__e"; {matcher} }} }}; $__walk->({dq});{head} if (@__out) {{ print STDOUT join("\n", @__out), "\n"; }} }}; $main_exit_code = $CHILD_ERROR = 0;"#
     );
     *st = IrStmt::RawText(code);
     true
@@ -7085,6 +7099,42 @@ mod tests {
         assert!(
             cmp.contains("(stat(") && !cmp.contains("my $t"),
             "mtime comparison must not degrade to the flag heuristic: {cmp}"
+        );
+    }
+
+    /// `find DIR -name PAT | head -N` must SHORT-CIRCUIT the walk after N
+    /// matches (a real `find | head -N` stops reading once the reader has
+    /// its N lines). The old fold collected the ENTIRE traversal into
+    /// @__out then spliced to N — same bytes, but it walked the whole tree
+    /// first. On the live workspace (43 GB, 11 worktrees) that unbounded
+    /// walk timed out under `./fail` while GNU find's own short-circuit
+    /// printed 3 lines instantly (test_find.sh: EMPTY perl stdout).
+    #[test]
+    fn find_with_head_short_circuits_the_walk() {
+        let (_, after) = lower("find . -name \"*.sh\" | head -3");
+        // the bound is minted once as $__lim = N …
+        assert!(
+            after.contains("my $__lim = 3;"),
+            "head -N must mint the bound: {after}"
+        );
+        // …and the recursion + entry loop both bail on it once N reached
+        assert!(
+            after.contains("return if @__out >= $__lim")
+                && after.contains("last if @__out >= $__lim"),
+            "head -N must bound the walk, not splice after a full traversal: {after}"
+        );
+        // the trailing splice survives as the belt-and-braces no-op
+        assert!(after.contains("splice(@__out, 3)"), "{after}");
+    }
+
+    /// Without a `head` stage there is no bound to short-circuit to — the
+    /// walker must still collect every match (no spurious limit guard).
+    #[test]
+    fn find_without_head_keeps_the_full_walk() {
+        let (_, after) = lower("find . -name \"*.sh\"");
+        assert!(
+            !after.contains("@__out >=") && !after.contains("splice(@__out"),
+            "no head means no early exit: {after}"
         );
     }
 }

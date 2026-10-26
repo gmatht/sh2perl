@@ -16,3 +16,4 @@ field type_filter: optional_string
 # -name GLOB (basename glob match); renderers implement fnmatch-style
 field name_filter: optional_string
 field maxdepth: optional_expr
+spec: none (effect: filesystem)

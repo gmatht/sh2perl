@@ -653,7 +653,40 @@ fn try_lower_pipeline(stages: &[IrExpr], stmt_level: bool) -> Option<(IrExpr, bo
     // stage1 produces text (echo, a literal, …)
     let source = extract_text_from_stage(stage1_body)?;
 
+    // Line-structured commands (sort/uniq, and sed's per-LINE substitution)
+    // own their trailing-newline behaviour: they split the text into lines
+    // themselves and re-join with the newline the source had. The other
+    // reductions reproduce the input's final newline through
+    // `Output { newline: true }`, which is why THEY need `trailing_newline`.
+    let line_structured = matches!(cmd_name, "sort" | "uniq")
+        || (cmd_name == "sed" && sed_is_line_structured(cmd_args));
+    let source = if line_structured {
+        TextSource { is_literal: true, ..source }
+    } else {
+        source
+    };
     lower_text_cmd(source, cmd_name, cmd_args, stmt_level).map(|e| (e, false))
+}
+
+/// Does this `sed` invocation take the per-line path (no `-n`, no `p`)?
+/// `-n` suppresses the default print and `p` prints explicitly, so the
+/// output is no longer "the lines with each substitution applied" —
+/// `substitute`'s denotation does not cover either.
+fn sed_is_line_structured(args: &[IrExpr]) -> bool {
+    for a in args {
+        if let IrExpr::Str(s, _) = a {
+            if s == "-n" || s == "--quiet" || s == "--silent" {
+                return false;
+            }
+            if s.starts_with("s/") {
+                let flags = s.rsplit('/').next().unwrap_or("");
+                if flags.chars().any(|c| c == 'p') {
+                    return false;
+                }
+            }
+        }
+    }
+    true
 }
 
 /// `yes "X" | head -n K` → RepeatStr("X\n", K). `yes` repeats "X\n";
@@ -732,6 +765,10 @@ fn lower_text_cmd(source: TextSource, cmd_name: &str, cmd_args: &[IrExpr], stmt_
         "sed" if single_line_literal => try_lower_sed(text, cmd_args),
         "grep" if !stmt_level => try_lower_grep(text, cmd_args),
         "xargs" => try_lower_xargs(text, cmd_args, is_literal),
+        // Ordering and run-collapsing are pure functions of the text and do
+        // not care about the trailing newline (they split lines themselves).
+        "sort" => try_lower_sort(text, cmd_args),
+        "uniq" => try_lower_uniq(text, cmd_args),
         _ => None,
     }
 }
@@ -1169,19 +1206,166 @@ fn try_lower_sed(text: IrExpr, args: &[IrExpr]) -> Option<IrExpr> {
             if parts.len() >= 2 {
                 let pattern = parts[0].to_string();
                 let replacement = parts[1].to_string();
-                let global = parts.get(2).map(|f| f.contains('g')).unwrap_or(false);
-
-                return Some(IrExpr::Ext(Box::new(RegSub {
-                    text: text,
+                let flags = parts.get(2).copied().unwrap_or("");
+                // Only the VALUE-PRESERVING flags are accepted. POSIX `sed`
+                // also allows `p` (print, which changes what the command
+                // prints), `w file` and `N`, and a leading number (`s///2`)
+                // selects the Nth match. Each of those makes the command's
+                // output differ from "every line with its substitution", so
+                // the node's denotation does not cover them and the lowering
+                // REFUSES rather than dropping the flag on the floor.
+                if flags.chars().any(|c| !matches!(c, 'g' | 'i')) {
+                    return None;
+                }
+                // (`s/x/y/2` is refused below with the digit check.)
+                // A leading digit after the flags selects the Nth match
+                // (`s/x/y/2`) — a different function, and one the node does
+                // not model. Caught here because `flags` is the whole tail
+                // (`"g2"`, `"2"`, …), not just a char set.
+                if flags.chars().any(|c| c.is_ascii_digit()) {
+                    return None;
+                }
+                return Some(IrExpr::Ext(Box::new(Substitute {
+                    text,
                     pattern,
                     replacement,
-                    global,
-                    line_mode: true,
+                    global: flags.contains('g'),
+                    ignore_case: flags.contains('i'),
                 })));
             }
         }
     }
     None
+}
+
+// ── sort / uniq → SortLines / UniqLines ─────────────────────────────
+
+/// `| sort [flags]` → `SortLines`.
+///
+/// The corpus pipes `sort` in 20 of 562 examples (`sort`, `sort -n`,
+/// `sort -nr`, `sort -u`, `sort -t: -k2 -n`) and there was no node for it:
+/// every backend shelled out, so the shell-out WAS the meaning. Ordering is
+/// a pure function of the text, so it belongs in the shared layer.
+///
+/// Accepts exactly the flags whose meaning the node covers:
+///   -n / -g   numeric key comparison (`-g` is `-n` without the leading-blank
+///             rule; the corpus never distinguishes them and the node's
+///             `numeric` flag does not either — a `-g` sort that would
+///             differ is a locale/number-syntax question, so it is REFUSED)
+///   -r        reverse             -u  de-duplicate (`sort -u`)
+///   -f        case-insensitive    -t X  field separator   -kN  sort by field N
+/// Anything else (`-k1,2`, `-V`, `-h`, `-M`, `-R`, `-o`, `-m`, `--parallel`)
+/// REFUSES: each is a different ordering, and guessing one would silently
+/// reorder a program's output.
+fn try_lower_sort(text: IrExpr, args: &[IrExpr]) -> Option<IrExpr> {
+    // Only flags, and only the accepted ones; every operand must be a
+    // literal (a non-literal `-k "$spec"` cannot be checked here).
+    let mut strs: Vec<String> = Vec::new();
+    for a in args {
+        match a {
+            IrExpr::Str(s, _) => strs.push(s.clone()),
+            _ => return None,
+        }
+    }
+    let mut numeric = false;
+    let mut reverse = false;
+    let mut unique = false;
+    let mut ignore_case = false;
+    let mut sep: Option<String> = None;
+    let mut field: Option<u32> = None;
+    let mut i = 0;
+    while i < strs.len() {
+        let s = strs[i].as_str();
+        match s {
+            "-n" => numeric = true,
+            "-r" => reverse = true,
+            "-u" => unique = true,
+            "-f" => ignore_case = true,
+            "-t" if i + 1 < strs.len() => {
+                // POSIX: the separator is the FIRST character of the operand.
+                let sepstr = &strs[i + 1];
+                if sepstr.chars().count() != 1 {
+                    return None;
+                }
+                sep = Some(sepstr.clone());
+                i += 1;
+            }
+            _ if s.starts_with("-k") && s.len() > 2 => {
+                // Only a bare field number. `-k1,2` / `-k1.2n` are ranges and
+                // per-key options the node does not model.
+                if s[2..].contains(|c: char| !c.is_ascii_digit()) {
+                    return None;
+                }
+                field = s[2..].parse::<u32>().ok();
+                if field == Some(0) {
+                    return None; // sort fields are 1-based
+                }
+            }
+            // Combined single-dash flags (`-nr`) — every char must be known.
+            _ if s.starts_with('-') && s.len() > 1 => {
+                for c in s[1..].chars() {
+                    match c {
+                        'n' => numeric = true,
+                        'r' => reverse = true,
+                        'u' => unique = true,
+                        'f' => ignore_case = true,
+                        _ => return None,
+                    }
+                }
+            }
+            _ => return None, // a file operand: not a pure text transform
+        }
+        i += 1;
+    }
+    // A field key without a separator sorts by the default (blank-run)
+    // separator, which is a different, whitespace-collapsing rule — refuse.
+    let key = match (field, sep) {
+        (None, _) => String::new(), // whole line
+        (Some(n), Some(sep)) => format!("{sep}{n}"),
+        (Some(_), None) => return None,
+    };
+    Some(IrExpr::Ext(Box::new(SortLines {
+        text,
+        key,
+        numeric,
+        reverse,
+        unique,
+        ignore_case,
+    })))
+}
+
+/// `| uniq [flags]` → `UniqLines`.
+///
+/// `-c` (prefix the run length), `-s N` (skip N chars when comparing).
+/// `-d` / `-u` (only duplicated / only unique lines) are FILTERS whose
+/// output depends on the run lengths of the WHOLE input; they need a
+/// different node, so they refuse here rather than being approximated.
+fn try_lower_uniq(text: IrExpr, args: &[IrExpr]) -> Option<IrExpr> {
+    let mut count = false;
+    let mut skip: i64 = 0;
+    let mut i = 0;
+    while i < args.len() {
+        let IrExpr::Str(s, _) = &args[i] else { return None };
+        match s.as_str() {
+            "-c" => count = true,
+            "-s" => {
+                let IrExpr::Str(n, _) = args.get(i + 1)? else { return None };
+                skip = n.parse::<i64>().ok()?;
+                if skip < 0 {
+                    return None;
+                }
+                i += 1;
+            }
+            _ if s.starts_with('-') && s.len() > 2 => {
+                // a combined form such as `-cs3` is not accepted: parsing it
+                // reliably needs getopt, and a mis-parse re-orders a program.
+                return None;
+            }
+            _ => return None, // a file operand
+        }
+        i += 1;
+    }
+    Some(IrExpr::Ext(Box::new(UniqLines { text, skip, count })))
 }
 
 // ── xargs (trim) ─────────────────────────────────────────────────────
@@ -1432,15 +1616,18 @@ mod tests {
 
     #[test]
     fn sed_subst_is_regsub() {
+        // `RegSub` was replaced by the `Substitute` node (see
+        // shir_nodes/substitute.node): one node, one domain — the lines of
+        // a text — instead of two booleans over a string and a line list.
         let r = try_lower_sed(st("aaa"), &[st("s/a/b/g")]).unwrap();
         let IrExpr::Ext(n) = &r else { panic!() };
-        let rs = n.as_any().downcast_ref::<RegSub>().unwrap();
+        let rs = n.as_any().downcast_ref::<Substitute>().unwrap();
         assert_eq!(rs.pattern, "a");
         assert_eq!(rs.replacement, "b");
         assert!(rs.global);
         let r = try_lower_sed(st("aaa"), &[st("s/a/b/")]).unwrap();
         let IrExpr::Ext(n) = &r else { panic!() };
-        assert!(!n.as_any().downcast_ref::<RegSub>().unwrap().global);
+        assert!(!n.as_any().downcast_ref::<Substitute>().unwrap().global);
     }
 
     // ── head/tail compositions ───────────────────────────────────────
@@ -1583,8 +1770,13 @@ mod tests {
     fn unknown_command_falls_back() {
         // The fallback rule: anything the core cannot reduce returns None
         // (the caller keeps the original command).
-        assert!(lower_text_cmd(lit_src("x"), "sort", &[], true).is_none());
+        //
+        // `sort` was the first example here; it now REDUCES (SortLines,
+        // see try_lower_sort), so it is asserted as a positive case — the
+        // rule itself is still pinned by the commands that stay refused.
         assert!(lower_text_cmd(lit_src("x"), "awk", &[st("{print}")], true).is_none());
+        assert!(lower_text_cmd(lit_src("x"), "frobnicate", &[], true).is_none());
+        assert!(lower_text_cmd(lit_src("x"), "sort", &[], true).is_some());
     }
 
     // ── echo/printf source extraction policy ─────────────────────────
@@ -2049,12 +2241,14 @@ fn try_reduce_capture_assign(stmt: &IrStmt, _arrays: &std::collections::HashSet<
                                         })),
                                         IrStmt::Assign {
                                             targets: targets.clone(),
-                                            expr: IrExpr::Ext(Box::new(RegSub {
+                                            // Command-substitution strips
+                                            // trailing newlines. That is its
+                                            // own node: it was spelled as a
+                                            // RegSub with a magic pattern,
+                                            // which is a node doing a job its
+                                            // denotation does not cover.
+                                            expr: IrExpr::Ext(Box::new(NewlineStrip {
                                                 text: IrExpr::Var(target0.clone(), None),
-                                                pattern: "\n+$".to_string(),
-                                                replacement: String::new(),
-                                                global: false,
-                                                line_mode: false,
                                             })),
                                             asm: asm.clone(),
                                         },

@@ -188,6 +188,17 @@ fn expr_reads(e: &IrExpr, var: &str) -> bool {
         IrExpr::Arrow(body) => body.iter().any(|s| stmt_reads(s, var)),
         IrExpr::Array(elems) => elems.iter().any(|e| expr_reads(e, var)),
         IrExpr::Object(fields) => fields.iter().any(|(_, e)| expr_reads(e, var)),
+        // A read BURIED in a transform-declared (Ext) node's field is a
+        // read — the same arm dead_store_elim's census carries (its
+        // ext_node_read_keeps_store). Without it here,
+        // str-chop-cursor's `off = "0"` init looked like a store
+        // overwritten by the later `off = FieldStrip(…)` with nothing
+        // in between (the FieldGrab/FieldStrip nodes read `off` as
+        // their offset field) and was dropped — a re-entered converted
+        // function then started from the previous run's cursor.
+        IrExpr::Ext(n) => crate::shir_nodes::ExtExpr::children(&**n)
+            .into_iter()
+            .any(|c| expr_reads(c, var)),
         _ => false,
     }
 }
@@ -350,6 +361,35 @@ mod tests {
         assert!(!transform(&mut stmts));
         assert_eq!(stmts[0], assign("x", int_lit(5)));
         assert_eq!(stmts.len(), 3);
+    }
+
+    /// A read inside a transform-declared (Ext) node's field keeps the
+    /// store: str-chop-cursor emits `cur = "0"` (the cursor init), then
+    /// FieldGrab/FieldStrip nodes that read `cur` as their offset field,
+    /// then later `cur = FieldStrip(…)` stores. With no `IrExpr::Ext`
+    /// arm in `expr_reads`, the field reads were invisible and the init
+    /// was judged redundant and dropped.
+    #[test]
+    fn keeps_store_read_via_ext_node_field() {
+        use crate::shir_nodes::{FieldGrab, FieldStrip};
+        let grab = IrExpr::Ext(Box::new(FieldGrab {
+            text: str_lit("s"),
+            off: IrExpr::Var("cur".to_string(), None),
+            delim: "|".to_string(),
+        }));
+        let strip = IrExpr::Ext(Box::new(FieldStrip {
+            text: str_lit("s"),
+            off: IrExpr::Var("cur".to_string(), None),
+            delim: "|".to_string(),
+        }));
+        let mut stmts = vec![
+            assign("cur", str_lit("0")),
+            assign("x", grab),
+            assign("cur", strip),
+        ];
+        assert!(!transform(&mut stmts));
+        assert_eq!(stmts.len(), 3, "the init store must survive");
+        assert_eq!(stmts[0], assign("cur", str_lit("0")));
     }
 
     /// `x=A; x=B` with NO read between — the intermediate store drops.

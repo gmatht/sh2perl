@@ -2383,7 +2383,7 @@ fn parse_variable_expansion_inner(lexer: &mut Lexer) -> Result<Word, ParserError
                 }
             }
 
-            eprintln!(
+            pdebug!(
                 "DEBUG parse_variable_expansion: braced_content='{}'",
                 braced_content
             );
@@ -2639,7 +2639,12 @@ fn parse_variable_expansion_inner(lexer: &mut Lexer) -> Result<Word, ParserError
                     },
                     None,
                 ))
-            } else if braced_content.contains("##") && !braced_content.ends_with("##*/") {
+            } else if braced_content.contains("##")
+                && !braced_content.ends_with("##*/")
+                && braced_content
+                    .find('/')
+                    .map_or(true, |s| braced_content.find("##").unwrap_or(0) < s)
+            {
                 let parts: Vec<&str> = braced_content.split("##").collect();
                 if parts.len() == 2 {
                     Ok(Word::ParameterExpansion(
@@ -2657,6 +2662,9 @@ fn parse_variable_expansion_inner(lexer: &mut Lexer) -> Result<Word, ParserError
                 }
             } else if braced_content.contains("%%")
                 && !(braced_content.ends_with("%/*") && !braced_content.ends_with("%%/*"))
+                && braced_content
+                    .find('/')
+                    .map_or(true, |s| braced_content.find("%%").unwrap_or(0) < s)
             {
                 let parts: Vec<&str> = braced_content.split("%%").collect();
                 if parts.len() == 2 {
@@ -2673,7 +2681,12 @@ fn parse_variable_expansion_inner(lexer: &mut Lexer) -> Result<Word, ParserError
                 } else {
                     Ok(Word::Variable(braced_content, true, None))
                 }
-            } else if braced_content.contains("#") && !braced_content.contains("##") {
+            } else if braced_content.contains("#")
+                && !braced_content.contains("##")
+                && braced_content
+                    .find('/')
+                    .map_or(true, |s| braced_content.find('#').unwrap_or(0) < s)
+            {
                 let parts: Vec<&str> = braced_content.splitn(2, "#").collect();
                 if parts.len() == 2 {
                     Ok(Word::ParameterExpansion(
@@ -2692,6 +2705,9 @@ fn parse_variable_expansion_inner(lexer: &mut Lexer) -> Result<Word, ParserError
             } else if braced_content.contains("%")
                 && !braced_content.contains("%%")
                 && !(braced_content.ends_with("%/*") && !braced_content.ends_with("%%/*"))
+                && braced_content
+                    .find('/')
+                    .map_or(true, |s| braced_content.find('%').unwrap_or(0) < s)
             {
                 let parts: Vec<&str> = braced_content.splitn(2, "%").collect();
                 if parts.len() == 2 {
@@ -2709,24 +2725,33 @@ fn parse_variable_expansion_inner(lexer: &mut Lexer) -> Result<Word, ParserError
                     Ok(Word::Variable(braced_content, true, None))
                 }
             } else if braced_content.contains("//") {
-                let parts: Vec<&str> = braced_content.split("//").collect();
-                if parts.len() == 3 {
-                    Ok(Word::ParameterExpansion(
+                // `${var//pattern/replacement}`. Split at the FIRST `//` and
+                // then at the FIRST `/` inside the remainder — the
+                // replacement may itself contain slashes
+                // (`${s/a/b/c}`, `${x//p/}`), and counting split parts
+                // instead (the old rule) baked those into a
+                // `Word::Variable("s/a/b/c")` name that no backend can
+                // resolve. Mirrors the quoted path
+                // (parse_parameter_expansion_content_inner).
+                let parts: Vec<&str> = braced_content.splitn(2, "//").collect();
+                match parts.get(1).and_then(|rest| rest.find('/').map(|i| (i, *rest))) {
+                    Some((slash_pos, rest)) => Ok(Word::ParameterExpansion(
                         ParameterExpansion {
                             variable: parts[0].to_string(),
                             operator: ParameterExpansionOperator::SubstituteAll(
-                                parts[1].to_string(),
-                                parts[2].to_string(),
+                                rest[..slash_pos].to_string(),
+                                rest[slash_pos + 1..].to_string(),
                             ),
                             is_mutable: true,
                         },
                         None,
-                    ))
-                } else {
-                    Ok(Word::Variable(braced_content, true, None))
+                    )),
+                    None => Ok(Word::Variable(braced_content, true, None)),
                 }
             } else if braced_content.contains("/") && !braced_content.contains("//") {
-                let parts: Vec<&str> = braced_content.split("/").collect();
+                // `${var/pattern/replacement}` — same first-two-slashes rule
+                // (the replacement may contain `/`).
+                let parts: Vec<&str> = braced_content.splitn(3, "/").collect();
                 if parts.len() == 3 {
                     Ok(Word::ParameterExpansion(
                         ParameterExpansion {

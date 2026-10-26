@@ -10,3 +10,4 @@ node ReadLine
 tag "ReadLine"
 kind expr
 # storage_class str_bounded
+spec: none (effect: I/O)

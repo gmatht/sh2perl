@@ -40,11 +40,33 @@
 //! Registered in `transforms.rs` (SH2_TRANSFORMS gated). Composes
 //! with dead-store-elim (a folded-away variable's def becomes a dead
 //! store) and i32-provable (a folded literal becomes a constant leaf).
+//!
+//! ## param-const-fold (in this pass)
+//! `param(OP, NAME, …)` is the parser's word-expansion form of `${v…}`:
+//! when NAME is a foldable single-def literal (the SAME def-before-read
+//! gate as every other fold here) every operator in the table in
+//! `fold_param_const` is computable NOW, and the whole expansion
+//! collapses to ONE literal for EVERY backend — no call, no helper, no
+//! cast, no polyfill (measured: 116 of 299 corpus param calls are such
+//! const reads; rust drags `__sh_case`/`__sh_substr` for them, C/JS/Java
+//! a helper each). The evaluator mirrors the runtime helpers
+//! byte-for-byte (case/len/slice/substitute) and uses GNU
+//! dirname/basename semantics on the literal (exact where the runtime
+//! `rfind` helper misses trailing slashes); everything else — a
+//! glob-magic pattern (the engine is REQUIRED then), `&` in a
+//! replacement (bash 5.2 patsub_replacement expands it, the runtime
+//! helpers do not), an unknown op/arity — refuses. The AffixStrip NODE
+//! (affix-strip-fold's output, which copy-propagation sees on the
+//! rust/java targets) folds the same way when its text and pattern are
+//! both literal: a literal strip is one `strip_prefix`/`strip_suffix`,
+//! itself computable here.
 
 use std::collections::HashMap;
 use std::collections::HashSet;
 
-use crate::ir::{ArithAst, IrExpr, IrStmt};
+use crate::ir::{ArithAst, IrExpr, IrStmt, StrStyle};
+use crate::shir_nodes::AffixStrip;
+use crate::transforms::affix_strip_fold::{is_literal_pattern, is_plain_ident};
 
 /// A foldable single-def literal value (`Int`/`Str`/`Bool`).
 #[derive(Clone)]
@@ -400,9 +422,15 @@ fn classify_builtin_writes(
     ) {
         for a in args {
             if let IrExpr::Str(s, _) = a {
+                // A flag is a word that actually carried a leading dash.
+                // Testing the dash-stripped remainder made every bare 1-2
+                // letter NAME (`unset x`, `read ab`, `local n`) look like a
+                // flag, so the write was dropped and copy-propagation folded
+                // a stale literal across it.
+                let dashed = s.starts_with('-');
                 let s = s.trim_start_matches('-');
-                if s.is_empty() || (s.chars().all(|c| c.is_ascii_alphabetic()) && s.len() <= 2) {
-                    continue; // a flag like -i/-r/-x/-a/-A/-l/-u/-n/-g/-t/-p/-f/-F
+                if s.is_empty() || (dashed && s.chars().all(|c| c.is_ascii_alphabetic()) && s.len() <= 2) {
+                    continue; // a flag like -i/-r/-x/-v
                 }
                 let name = s.split('=').next().unwrap_or(s);
                 if !name.is_empty() {
@@ -740,8 +768,31 @@ fn fold_expr(
             c |= fold_expr(lhs, defs, resolved, foldable);
             c |= fold_expr(rhs, defs, resolved, foldable);
         }
-        IrExpr::Arith(a) => c |= fold_arith(a, defs, resolved, foldable),
+        IrExpr::Arith(a) => {
+            c |= fold_arith(a, defs, resolved, foldable);
+            if c {
+                // Pass 0.5's const fold runs PRE-transforms (optimize_stmts
+                // → transforms::apply — see ast_to_ir_pre_transforms), so
+                // once fold_arith has substituted a constant Var the
+                // now-literal tree needs its own fold right here. The
+                // cascade `x=5; y=$((x+1))` → `y=6` completes in THIS
+                // pass, for every backend.
+                let folded = crate::ir::fold_arith_ast(a);
+                if folded != **a {
+                    *a = Box::new(folded);
+                }
+            }
+        }
         IrExpr::Call { func, args } => {
+            // `${v…}` word-expansion on a foldable const: the operator and
+            // every operand are literal, so the whole expansion folds to
+            // one Str here — for every backend, no helper.
+            if func == "param" {
+                if let Some(rep) = fold_param_const(args, resolved, foldable) {
+                    *e = rep;
+                    return true;
+                }
+            }
             if matches!(func.as_str(), "getVar" | "arrayIndex") {
                 if let Some(IrExpr::Str(n, _)) = args.first() {
                     if foldable.contains(n) {
@@ -801,6 +852,36 @@ fn fold_expr(
                 c |= fold_expr(e, defs, resolved, foldable);
             }
         }
+        IrExpr::Ext(n) => {
+            // AffixStrip(text, pattern, prefix) — affix-strip-fold's node
+            // (rust/java targets see it here, its .text still the
+            // param("", NAME) read). Fold the sub-expressions first; when
+            // text AND pattern are literal with a magic-free pattern, the
+            // single affix strip is computable: one Str replaces the node.
+            if n.tag() != "AffixStrip" {
+                return false;
+            }
+            let Some(aff) = n.as_any().downcast_ref::<AffixStrip>() else {
+                return false;
+            };
+            let mut text = aff.text.clone();
+            let mut pattern = aff.pattern.clone();
+            let prefix = aff.prefix;
+            c |= fold_expr(&mut text, defs, resolved, foldable);
+            c |= fold_expr(&mut pattern, defs, resolved, foldable);
+            if let (Some(t), Some(p)) = (literal_text(&text), literal_text(&pattern)) {
+                if is_literal_pattern(&p) {
+                    *e = IrExpr::Str(strip_affix(&t, &p, prefix), StrStyle::DoubleQuoted);
+                    return true;
+                }
+            }
+            // `c` is false at arm entry (one arm runs per node); true means
+            // a sub-expression folded — rebuild the node with the folded
+            // text/pattern so the change is reported and kept.
+            if c {
+                *e = IrExpr::Ext(Box::new(AffixStrip { text, pattern, prefix }));
+            }
+        }
         _ => {}
     }
     c
@@ -816,8 +897,19 @@ fn fold_arith(
         ArithAst::Var(v) => {
             if foldable.contains(v) {
                 if let Some(rep) = resolved.get(v) {
+                    // An `Int` def is the direct constant. A STRING def
+                    // (`x=5` — the parser's usual spelling of a numeric
+                    // assignment) folds too when its value is an
+                    // unambiguous decimal arith literal: bash reads the
+                    // VALUE as arithmetic, so the fold is exact and the
+                    // runtime `.trim().parse::<i64>().unwrap_or(0)` chain
+                    // disappears for every backend.
                     if let IrExpr::Int(n) = rep {
                         *a = ArithAst::Num(*n);
+                        return true;
+                    }
+                    if let Some(n) = arith_lit_int(rep) {
+                        *a = ArithAst::Num(n);
                         return true;
                     }
                 }
@@ -835,6 +927,236 @@ fn fold_arith(
                 | fold_arith(else_, defs, resolved, foldable)
         }
         _ => false,
+    }
+}
+
+/// The exact runtime text of a literal node — what bash reads from the
+/// variable at the def site. `Str`/`Int` fold directly; an all-literal
+/// `Interpolate` (a quoted def, `s="a b"`) is its concatenated text. A
+/// `Bool` or anything with a live part refuses (no guessing).
+fn literal_text(e: &IrExpr) -> Option<String> {
+    match e {
+        IrExpr::Str(s, _) => Some(s.clone()),
+        IrExpr::Int(n) => Some(n.to_string()),
+        IrExpr::Interpolate(parts) => {
+            let mut out = String::new();
+            for p in parts {
+                match p {
+                    crate::ir::InterpPart::Lit(s) => out.push_str(s),
+                    _ => return None,
+                }
+            }
+            Some(out)
+        }
+        _ => None,
+    }
+}
+
+/// First-char case transform, mirroring __sh_case's `^`/`,` arms exactly
+/// (first char upper/lowercased, the rest untouched).
+fn first_char_case(s: &str, upper: bool) -> String {
+    let mut cs = s.chars();
+    match cs.next() {
+        None => String::new(),
+        Some(c) => {
+            let head: String =
+                if upper { c.to_uppercase().collect() } else { c.to_lowercase().collect() };
+            format!("{}{}", head, cs.as_str())
+        }
+    }
+}
+
+/// Strip at most ONE leading (prefix) / trailing (suffix) occurrence —
+/// AffixStrip's and bash-literal-pattern `${v#p}`/`${v%p}` semantics
+/// (a magic-free pattern matches exactly once, so shortest ≡ longest).
+fn strip_affix(text: &str, pat: &str, prefix: bool) -> String {
+    if prefix {
+        text.strip_prefix(pat).unwrap_or(text).to_string()
+    } else {
+        text.strip_suffix(pat).unwrap_or(text).to_string()
+    }
+}
+
+/// GNU basename on a literal — exact (verified: `a/b/`→`b`, `//`→`/`,
+/// `a//b`→`b`, empty→empty). The runtime `__sh_basename` rfind helper
+/// misses the trailing-slash forms; a literal fold must match bash, the
+/// equivalence oracle — not the helper.
+fn gnu_basename(s: &str) -> String {
+    if s.is_empty() {
+        return String::new();
+    }
+    let t = s.trim_end_matches('/');
+    if t.is_empty() {
+        // an all-slash name ("/", "//") — one directory
+        return "/".to_string();
+    }
+    match t.rfind('/') {
+        Some(i) => t[i + 1..].to_string(),
+        None => t.to_string(),
+    }
+}
+
+/// GNU dirname on a literal — exact (verified: `a/b/`→`a`, `a//b`→`a`,
+/// `//a`→`/`, `a///`→`.`, empty→`.`).
+fn gnu_dirname(s: &str) -> String {
+    if s.is_empty() {
+        return ".".to_string();
+    }
+    let t = s.trim_end_matches('/');
+    if t.is_empty() {
+        return "/".to_string();
+    }
+    match t.rfind('/') {
+        None => ".".to_string(),
+        Some(0) => "/".to_string(),
+        Some(i) => {
+            // the prefix may itself end in slashes (`a//b` → `a/` → `a`)
+            let prefix = t[..i].trim_end_matches('/');
+            if prefix.is_empty() {
+                "/".to_string()
+            } else {
+                prefix.to_string()
+            }
+        }
+    }
+}
+
+/// A literal non-negative index operand (`${v:1:2}` — the parser spells
+/// offsets as digit strings; Int accepted too).
+fn lit_index(e: &IrExpr) -> Option<usize> {
+    match e {
+        IrExpr::Str(s, _) => s.parse().ok(),
+        IrExpr::Int(n) if *n >= 0 => Some(*n as usize),
+        _ => None,
+    }
+}
+
+/// A var def usable as an arithmetic constant: the value itself, read the
+/// way bash reads it. Only an unambiguous DECIMAL literal folds — a
+/// leading zero means OCTAL in bash arithmetic (`010` = 8), hex/binary
+/// have their own spellings, and a non-numeric value is the runtime
+/// zero-or-name-recursion evaluation the backends already implement
+/// exactly. Refuse-on-doubt, i64 range included (parse fails → None).
+///
+/// The value must also be a SAFE JS INTEGER (|n| ≤ 2^53−1): the estree
+/// backend's BigInt escalation (analyze_big_i53) keys on VAR RANGES, so
+/// folding a bigger constant away would leave the literal on the plain
+/// Number path, where JS rounds it at parse time. Keeping big values as
+/// runtime var reads leaves that machinery (and bash's int64 result)
+/// exactly as it is; every counted corpus def fits comfortably in range.
+fn arith_lit_int(e: &IrExpr) -> Option<i64> {
+    let text = literal_text(e)?;
+    let digits = text.trim_start_matches(['-', '+']);
+    if digits.is_empty() || !digits.bytes().all(|b| b.is_ascii_digit()) {
+        return None;
+    }
+    if digits.len() > 1 && digits.starts_with('0') {
+        return None; // bash: leading zero = octal
+    }
+    let n = text.parse::<i64>().ok()?;
+    const JS_SAFE_MAX: i64 = (1 << 53) - 1; // 9_007_199_254_740_991
+    if !(-JS_SAFE_MAX..=JS_SAFE_MAX).contains(&n) {
+        return None;
+    }
+    Some(n)
+}
+
+/// param(OP, NAME, …) on a foldable single-def literal NAME: OP and every
+/// operand are computable here, so the expansion folds to one literal
+/// for EVERY backend (a plain Str — no call, no helper, no cast). The
+/// gate is the pass's own: NAME plain-identifier, in `foldable` (single
+/// top-level literal def, def-before-read, no dynamic eval/source).
+///
+/// The evaluator mirrors the runtime helpers byte-for-byte where one
+/// exists (case→__sh_case, len→__sh_len, slice→__sh_substr's char
+/// skip/take, substitute→literal replace) and GNU dirname/basename
+/// semantics on the literal (exact where the runtime rfind helper
+/// diverges on trailing slashes). Refuse-on-doubt: a glob-magic pattern
+/// (the engine is REQUIRED then), an empty pattern, `&` in a
+/// replacement (bash 5.2 patsub_replacement expands it to the match;
+/// the runtime helpers replace literally — the fold must not pick a
+/// side), a non-literal pattern/offset, an unset-error shape (`${v:?}`
+/// on an empty literal), and any op/arity not in the table — the call
+/// survives and renders exactly as before.
+fn fold_param_const(
+    args: &[IrExpr],
+    resolved: &HashMap<String, IrExpr>,
+    foldable: &HashSet<String>,
+) -> Option<IrExpr> {
+    let (op, name) = match (args.first()?, args.get(1)?) {
+        (IrExpr::Str(op, _), IrExpr::Str(name, _)) => (op.as_str(), name.as_str()),
+        _ => return None,
+    };
+    if !is_plain_ident(name) || !foldable.contains(name) {
+        return None;
+    }
+    let text = literal_text(resolved.get(name)?)?;
+    let lit = |s: String| Some(IrExpr::Str(s, StrStyle::DoubleQuoted));
+    match (op, args.len()) {
+        // `${v}` — the plain read itself (the parser's word-expansion
+        // spelling of a bare `$v`/`${v}`).
+        ("", 2) => lit(text),
+        // `${#v}` — character count, matching __sh_len.
+        ("len", 2) => lit(text.chars().count().to_string()),
+        // case ops — byte-identical to __sh_case's whole-string and
+        // first-char arms (per-char to_uppercase/to_lowercase).
+        ("^^", 2) => lit(text.to_uppercase()),
+        (",,", 2) => lit(text.to_lowercase()),
+        ("^", 2) => lit(first_char_case(&text, true)),
+        (",", 2) => lit(first_char_case(&text, false)),
+        // literal-pattern affix strips — a magic-free pattern matches
+        // exactly once, so # ≡ ## and % ≡ %% (affix_strip_fold's proof).
+        ("#" | "##", 3) => {
+            let p = literal_text(&args[2])?;
+            if !is_literal_pattern(&p) {
+                return None;
+            }
+            lit(text.strip_prefix(&p)?.to_string())
+        }
+        ("%" | "%%", 3) => {
+            let p = literal_text(&args[2])?;
+            if !is_literal_pattern(&p) {
+                return None;
+            }
+            lit(text.strip_suffix(&p)?.to_string())
+        }
+        // pattern substitution on a magic-free literal pattern: `/`
+        // replaces the FIRST occurrence, `//` every occurrence.
+        ("/" | "//", 4) => {
+            let p = literal_text(&args[2])?;
+            let r = literal_text(&args[3])?;
+            if !is_literal_pattern(&p) || r.contains('&') {
+                return None;
+            }
+            if op == "/" {
+                if let Some(i) = text.find(&p) {
+                    let mut out = text.clone();
+                    out.replace_range(i..i + p.len(), &r);
+                    return lit(out);
+                }
+                lit(text)
+            } else {
+                lit(text.replace(&p, &r))
+            }
+        }
+        // `${v:off:len}` on literal non-negative offsets — char-based,
+        // matching __sh_substr's chars().skip().take().
+        ("slice", 4) => {
+            let off = lit_index(&args[2])?;
+            let len = lit_index(&args[3])?;
+            lit(text.chars().skip(off).take(len).collect())
+        }
+        // `${v:-word}` / `${v:?word}` — the def SET the var, so a
+        // non-empty literal never consults word (and never errors).
+        (":-" | ":?", 3) if !text.is_empty() => lit(text),
+        // `${v:-word}` with an EMPTY literal v: the default word is used
+        // — fold it when the word is itself literal (a live word keeps
+        // the call so its expansion still runs).
+        (":-", 3) => literal_text(&args[2]).and_then(lit),
+        // GNU name helpers on the literal (see gnu_basename/gnu_dirname).
+        ("basename", 2) => lit(gnu_basename(&text)),
+        ("dirname", 2) => lit(gnu_dirname(&text)),
+        _ => None,
     }
 }
 
@@ -881,6 +1203,64 @@ mod tests {
             assign("x", int_lit(5)),
             expr_stmt(getvar("x")),
         ];
+        assert!(transform(&mut stmts));
+        assert_eq!(stmts[1], expr_stmt(int_lit(5)));
+    }
+
+    /// `x=5; unset x; echo $x` — the builtin write disqualifies the fold.
+    /// Pinned with a 1-letter name: `classify_builtin_writes` read a bare
+    /// `x` as the flag `-x` and dropped the write, so the stale literal was
+    /// substituted across the `unset`.
+    #[test]
+    fn unset_invalidates_single_def() {
+        let unset_x = IrStmt::Expr(IrExpr::Call {
+            func: "builtin".to_string(),
+            args: vec![str_lit("unset"), IrExpr::Array(vec![str_lit("x")])],
+        });
+        let mut stmts = vec![assign("x", int_lit(5)), unset_x, expr_stmt(getvar("x"))];
+        assert!(!transform(&mut stmts));
+        assert_eq!(stmts[2], expr_stmt(getvar("x")));
+    }
+
+    /// `ab=5; read ab; echo $ab` — same hole, 2-letter name.
+    #[test]
+    fn read_invalidates_single_def() {
+        let read_ab = IrStmt::Expr(IrExpr::Call {
+            func: "builtin".to_string(),
+            args: vec![str_lit("read"), IrExpr::Array(vec![str_lit("ab")])],
+        });
+        let mut stmts = vec![
+            assign("ab", int_lit(1)),
+            read_ab,
+            expr_stmt(getvar("ab")),
+        ];
+        assert!(!transform(&mut stmts));
+        assert_eq!(stmts[2], expr_stmt(getvar("ab")));
+    }
+
+    /// Flags are still skipped: `unset -v x` counts `x`, not `v`.
+    #[test]
+    fn dashed_flag_is_still_skipped() {
+        let unset_v_x = IrStmt::Expr(IrExpr::Call {
+            func: "builtin".to_string(),
+            args: vec![
+                str_lit("unset"),
+                IrExpr::Array(vec![str_lit("-v"), str_lit("x")]),
+            ],
+        });
+        let mut stmts = vec![
+            assign("x", int_lit(5)),
+            unset_v_x,
+            expr_stmt(getvar("x")),
+        ];
+        assert!(!transform(&mut stmts));
+        assert_eq!(stmts[2], expr_stmt(getvar("x")));
+    }
+
+    /// control: without the builtin the same program still folds.
+    #[test]
+    fn folds_without_unset() {
+        let mut stmts = vec![assign("x", int_lit(5)), expr_stmt(getvar("x"))];
         assert!(transform(&mut stmts));
         assert_eq!(stmts[1], expr_stmt(int_lit(5)));
     }
@@ -1283,6 +1663,100 @@ mod tests {
         assert_eq!(stmts[2], expr_stmt(int_lit(0)));
     }
 
+    /// `x=5; y=$((x+1))` — the parser spells `x=5` as a STRING literal.
+    /// The arith read folds to the constant and the tree cascades (Pass
+    /// 0.5 already ran pre-transforms), so y's def becomes the literal 6:
+    /// no runtime `.parse::<i64>().unwrap_or(0)` chain, in any backend.
+    #[test]
+    fn folds_string_digit_def_into_arith_and_cascades() {
+        let mut stmts = vec![
+            assign("x", str_lit("5")),
+            assign(
+                "y",
+                IrExpr::Arith(Box::new(ArithAst::Bin {
+                    op: "+".to_string(),
+                    lhs: Box::new(ArithAst::Var("x".to_string())),
+                    rhs: Box::new(ArithAst::Num(1)),
+                })),
+            ),
+            expr_stmt(getvar("y")),
+        ];
+        assert!(transform(&mut stmts));
+        match &stmts[1] {
+            IrStmt::Assign { expr: IrExpr::Arith(a), .. } => {
+                assert_eq!(**a, ArithAst::Num(6));
+            }
+            other => panic!("expected folded arith def, got {:?}", other),
+        }
+    }
+
+    /// `x=010; y=$((x+1))` — a leading zero is OCTAL in bash arithmetic
+    /// (010 = 8), so the string value is not an unambiguous decimal
+    /// constant: the read must NOT fold (the runtime parse chain decides).
+    #[test]
+    fn refuses_leading_zero_arith_def() {
+        let mut stmts = vec![
+            assign("x", str_lit("010")),
+            assign(
+                "y",
+                IrExpr::Arith(Box::new(ArithAst::Bin {
+                    op: "+".to_string(),
+                    lhs: Box::new(ArithAst::Var("x".to_string())),
+                    rhs: Box::new(ArithAst::Num(1)),
+                })),
+            ),
+        ];
+        assert!(!transform(&mut stmts));
+        match &stmts[1] {
+            IrStmt::Assign { expr: IrExpr::Arith(a), .. } => {
+                assert_eq!(**a, ArithAst::Bin {
+                    op: "+".to_string(),
+                    lhs: Box::new(ArithAst::Var("x".to_string())),
+                    rhs: Box::new(ArithAst::Num(1)),
+                });
+            }
+            other => panic!("expected unfolded arith def, got {:?}", other),
+        }
+    }
+
+    /// `x=abc; y=$((x+1))` — a non-numeric value is bash's runtime
+    /// zero evaluation; never a compile-time constant.
+    #[test]
+    fn refuses_non_numeric_arith_def() {
+        let mut stmts = vec![
+            assign("x", str_lit("abc")),
+            assign(
+                "y",
+                IrExpr::Arith(Box::new(ArithAst::Bin {
+                    op: "+".to_string(),
+                    lhs: Box::new(ArithAst::Var("x".to_string())),
+                    rhs: Box::new(ArithAst::Num(1)),
+                })),
+            ),
+        ];
+        assert!(!transform(&mut stmts));
+    }
+
+    /// `x=9007199254740993; y=$((x+1))` — a value beyond 2^53−1 must NOT
+    /// fold: the estree BigInt escalation keys on the VAR's range, and a
+    /// folded constant would land on the plain Number path where JS
+    /// rounds it. The runtime var read stays (exact on every backend).
+    #[test]
+    fn refuses_beyond_js_safe_arith_def() {
+        let mut stmts = vec![
+            assign("x", str_lit("9007199254740993")),
+            assign(
+                "y",
+                IrExpr::Arith(Box::new(ArithAst::Bin {
+                    op: "+".to_string(),
+                    lhs: Box::new(ArithAst::Var("x".to_string())),
+                    rhs: Box::new(ArithAst::Num(1)),
+                })),
+            ),
+        ];
+        assert!(!transform(&mut stmts));
+    }
+
     /// `x=5; x++` (arith IncDec write) — the second write disqualifies.
     #[test]
     fn refuses_arith_incdec_write() {
@@ -1297,5 +1771,232 @@ mod tests {
         ];
         assert!(!transform(&mut stmts));
         assert_eq!(stmts[2], expr_stmt(getvar("x")));
+    }
+
+    // ── param-const-fold ──────────────────────────────────────────────
+
+    /// The parser's `${v…}` spelling: param(OP, NAME, …) with string ops.
+    fn param(op: &str, name: &str, extra: &[IrExpr]) -> IrExpr {
+        let mut args = vec![str_lit(op), str_lit(name)];
+        args.extend_from_slice(extra);
+        IrExpr::Call { func: "param".to_string(), args }
+    }
+
+    /// `x=abc; echo "${x}"` — the plain param read folds to the literal.
+    #[test]
+    fn folds_param_plain_read() {
+        let mut stmts =
+            vec![assign("x", str_lit("abc")), expr_stmt(param("", "x", &[]))];
+        assert!(transform(&mut stmts));
+        assert_eq!(stmts[1], expr_stmt(str_lit("abc")));
+    }
+
+    /// `x="a b"; echo "${x}"` — a quoted (all-literal Interpolate) def
+    /// folds too; the result is the concatenated literal text.
+    #[test]
+    fn folds_param_quoted_def() {
+        let quoted = IrExpr::Interpolate(vec![crate::ir::InterpPart::Lit("a b".to_string())]);
+        let mut stmts = vec![assign("x", quoted), expr_stmt(param("", "x", &[]))];
+        assert!(transform(&mut stmts));
+        assert_eq!(stmts[1], expr_stmt(str_lit("a b")));
+    }
+
+    /// `${#x}` on a const folds to the digit string (chars, matching
+    /// __sh_len).
+    #[test]
+    fn folds_param_len() {
+        let mut stmts =
+            vec![assign("x", str_lit("abc")), expr_stmt(param("len", "x", &[]))];
+        assert!(transform(&mut stmts));
+        assert_eq!(stmts[1], expr_stmt(str_lit("3")));
+    }
+
+    /// `${x^^}` / `${x,,}` on consts fold to the case-transformed literal
+    /// (byte-identical to __sh_case's whole-string arms).
+    #[test]
+    fn folds_param_case() {
+        let mut stmts = vec![
+            assign("x", str_lit("ab-c")),
+            expr_stmt(param("^^", "x", &[])),
+            expr_stmt(param(",,", "x", &[])),
+            expr_stmt(param("^", "x", &[])),
+            expr_stmt(param(",", "x", &[])),
+        ];
+        assert!(transform(&mut stmts));
+        assert_eq!(stmts[1], expr_stmt(str_lit("AB-C")));
+        assert_eq!(stmts[2], expr_stmt(str_lit("ab-c")));
+        assert_eq!(stmts[3], expr_stmt(str_lit("Ab-c")));
+        assert_eq!(stmts[4], expr_stmt(str_lit("ab-c")));
+    }
+
+    /// `${x##p}` / `${x#p}` on a const path folds — one literal strip,
+    /// both longest and shortest spellings (a magic-free pattern matches
+    /// once, so # ≡ ## on a literal — see affix_strip_fold).
+    #[test]
+    fn folds_param_affix_strip() {
+        let mut stmts = vec![
+            assign("x", str_lit("/usr/bin")),
+            expr_stmt(param("##", "x", &[str_lit("/usr/")])),
+            expr_stmt(param("#", "x", &[str_lit("/usr")])),
+            expr_stmt(param("%", "x", &[str_lit("bin")])),
+        ];
+        assert!(transform(&mut stmts));
+        assert_eq!(stmts[1], expr_stmt(str_lit("bin")));
+        assert_eq!(stmts[2], expr_stmt(str_lit("/bin")));
+        assert_eq!(stmts[3], expr_stmt(str_lit("/usr/")));
+    }
+
+    /// `${x#p}` with a glob-magic pattern must NOT fold — the glob engine
+    /// is required at runtime.
+    #[test]
+    fn refuses_param_glob_pattern() {
+        let mut stmts = vec![
+            assign("x", str_lit("/usr/bin")),
+            expr_stmt(param("#", "x", &[str_lit("*/")])),
+        ];
+        let pat = param("#", "x", &[str_lit("*/")]);
+        assert!(!transform(&mut stmts));
+        assert_eq!(stmts[1], expr_stmt(pat));
+    }
+
+    /// `${x/bc/X}` (first) and `${x//a/Y}` (all) on consts fold.
+    #[test]
+    fn folds_param_substitute() {
+        let mut stmts = vec![
+            assign("x", str_lit("abcabc")),
+            expr_stmt(param("/", "x", &[str_lit("bc"), str_lit("X")])),
+            expr_stmt(param("//", "x", &[str_lit("a"), str_lit("Y")])),
+        ];
+        assert!(transform(&mut stmts));
+        assert_eq!(stmts[1], expr_stmt(str_lit("aXabc")));
+        assert_eq!(stmts[2], expr_stmt(str_lit("YbcYbc")));
+    }
+
+    /// A replacement containing `&` must NOT fold — bash 5.2's
+    /// patsub_replacement expands it to the match while the runtime
+    /// helpers replace literally.
+    #[test]
+    fn refuses_param_amp_replacement() {
+        let mut stmts = vec![
+            assign("x", str_lit("abc")),
+            expr_stmt(param("//", "x", &[str_lit("a"), str_lit("&")])),
+        ];
+        let call = param("//", "x", &[str_lit("a"), str_lit("&")]);
+        assert!(!transform(&mut stmts));
+        assert_eq!(stmts[1], expr_stmt(call));
+    }
+
+    /// `${x:1:2}` on a const folds (char-based, matching __sh_substr).
+    #[test]
+    fn folds_param_slice() {
+        let mut stmts = vec![
+            assign("x", str_lit("abcdef")),
+            expr_stmt(param("slice", "x", &[str_lit("1"), str_lit("2")])),
+        ];
+        assert!(transform(&mut stmts));
+        assert_eq!(stmts[1], expr_stmt(str_lit("bc")));
+    }
+
+    /// basename/dirname on a const path fold to the literal result with
+    /// GNU semantics (trailing slash and all-slash forms included).
+    #[test]
+    fn folds_param_name_helpers() {
+        let mut stmts = vec![
+            assign("x", str_lit("/a/b/")),
+            expr_stmt(param("basename", "x", &[])),
+            expr_stmt(param("dirname", "x", &[])),
+        ];
+        assert!(transform(&mut stmts));
+        assert_eq!(stmts[1], expr_stmt(str_lit("b")));
+        assert_eq!(stmts[2], expr_stmt(str_lit("/a")));
+    }
+
+    /// `${x:-word}` with a NON-EMPTY const never consults the word — folds
+    /// to the const (the word is not evaluated either way).
+    #[test]
+    fn folds_param_default_nonempty() {
+        let mut stmts = vec![
+            assign("x", str_lit("v")),
+            expr_stmt(param(":-", "x", &[str_lit("fallback")])),
+        ];
+        assert!(transform(&mut stmts));
+        assert_eq!(stmts[1], expr_stmt(str_lit("v")));
+    }
+
+    /// `${x:?msg}` with a non-empty const can never error — folds.
+    #[test]
+    fn folds_param_err_nonempty() {
+        let mut stmts = vec![
+            assign("x", str_lit("v")),
+            expr_stmt(param(":?", "x", &[str_lit("msg")])),
+        ];
+        assert!(transform(&mut stmts));
+        assert_eq!(stmts[1], expr_stmt(str_lit("v")));
+    }
+
+    /// A multi-def var is not foldable — the param call survives intact.
+    #[test]
+    fn refuses_param_multidef() {
+        let mut stmts = vec![
+            assign("x", str_lit("a")),
+            assign("x", str_lit("b")),
+            expr_stmt(param("", "x", &[])),
+        ];
+        assert!(!transform(&mut stmts));
+        let call = param("", "x", &[]);
+        assert_eq!(stmts[2], expr_stmt(call));
+    }
+
+    /// A read BEFORE the def must NOT fold (unset empty-string default).
+    #[test]
+    fn refuses_param_read_before_def() {
+        let mut stmts =
+            vec![expr_stmt(param("", "x", &[])), assign("x", str_lit("a"))];
+        assert!(!transform(&mut stmts));
+        let call = param("", "x", &[]);
+        assert_eq!(stmts[0], expr_stmt(call));
+    }
+
+    // ── AffixStrip-literal fold (the Ext arm) ───────────────────────────
+
+    /// affix-strip-fold's node with a const operand: text = param("",x)
+    /// folds, then the whole literal strip folds to one Str.
+    #[test]
+    fn folds_affix_strip_node_literal() {
+        let mut stmts = vec![
+            assign("x", str_lit("/usr/bin")),
+            expr_stmt(IrExpr::Ext(Box::new(AffixStrip {
+                text: param("", "x", &[]),
+                pattern: str_lit("/usr/"),
+                prefix: true,
+            }))),
+        ];
+        assert!(transform(&mut stmts));
+        assert_eq!(stmts[1], expr_stmt(str_lit("bin")));
+    }
+
+    /// With a glob-magic pattern the node cannot fold entirely, but its
+    /// const text still folds inside the rebuilt node.
+    #[test]
+    fn folds_affix_strip_text_only() {
+        let mut stmts = vec![
+            assign("x", str_lit("hello")),
+            expr_stmt(IrExpr::Ext(Box::new(AffixStrip {
+                text: param("", "x", &[]),
+                pattern: str_lit("l*"),
+                prefix: false,
+            }))),
+        ];
+        assert!(transform(&mut stmts));
+        match &stmts[1] {
+            IrStmt::Expr(IrExpr::Ext(n)) => {
+                assert_eq!(n.tag(), "AffixStrip");
+                let aff = n.as_any().downcast_ref::<AffixStrip>().unwrap();
+                assert_eq!(aff.text, str_lit("hello"));
+                assert_eq!(aff.pattern, str_lit("l*"));
+                assert!(!aff.prefix);
+            }
+            other => panic!("expected rebuilt AffixStrip node, got {:?}", other),
+        }
     }
 }

@@ -342,7 +342,7 @@ pub(crate) fn fix_control_flow(prog: Program) -> Program {
         body: prog
             .body
             .into_iter()
-            .filter_map(|s| fix_stmt(s, false, false, false, false))
+            .filter_map(|s| fix_stmt(s, false, false, false, false, false))
             .collect(),
     }
 }
@@ -352,7 +352,11 @@ pub(crate) fn fix_control_flow(prog: Program) -> Program {
 /// bash `return` inside a loop body / pipeline stage / subshell exits the
 /// enclosing FUNCTION, which in generated JS is a loop-body arrow the
 /// runtime must unwind via the RETURN signal); `in_switch` — directly
-/// inside a switch-case consequent (native break is legal there).
+/// inside a switch-case consequent (native break is legal there);
+/// `in_js_loop` — inside a NATIVE JS loop body with no arrow boundary since,
+/// so a `break`/`continue` statement terminates that loop and must stay a
+/// native statement (the emitter converts a loop-local `sh2.break()` /
+/// `sh2.continue()` to it — see shir.rs `convert_native_loop_signals`).
 // ── raw-byte preservation (non-UTF-8 sources) ───────────────────────
 //
 // The CLI decodes non-UTF-8 source bytes (>= 0x80) to U+F800+byte private-
@@ -381,14 +385,25 @@ fn map_raw_bytes(s: &str) -> String {
     out
 }
 
-fn fix_stmt(stmt: Stmt, in_arrow: bool, in_func: bool, in_switch: bool, in_loop: bool) -> Option<Stmt> {
+fn fix_stmt(
+    stmt: Stmt,
+    in_arrow: bool,
+    in_func: bool,
+    in_switch: bool,
+    in_loop: bool,
+    in_js_loop: bool,
+) -> Option<Stmt> {
     Some(match stmt {
-        Stmt::BreakStatement { label: _ } if in_arrow && !in_switch => Stmt::ExpressionStatement {
-            expression: sh2_call("break", vec![]),
-        },
-        Stmt::ContinueStatement { label: _ } if in_arrow && !in_switch => Stmt::ExpressionStatement {
-            expression: sh2_call("continue", vec![]),
-        },
+        Stmt::BreakStatement { label: _ } if in_arrow && !in_switch && !in_js_loop => {
+            Stmt::ExpressionStatement {
+                expression: sh2_call("break", vec![]),
+            }
+        }
+        Stmt::ContinueStatement { label: _ } if in_arrow && !in_switch && !in_js_loop => {
+            Stmt::ExpressionStatement {
+                expression: sh2_call("continue", vec![]),
+            }
+        }
         Stmt::ReturnStatement { argument } if !in_arrow || in_loop => {
             let mut args = vec![];
             if let Some(a) = argument {
@@ -404,7 +419,7 @@ fn fix_stmt(stmt: Stmt, in_arrow: bool, in_func: bool, in_switch: bool, in_loop:
         Stmt::BlockStatement { body } => Stmt::BlockStatement {
             body: body
                 .into_iter()
-                .filter_map(|s| fix_stmt(s, in_arrow, in_func, false, in_loop))
+                .filter_map(|s| fix_stmt(s, in_arrow, in_func, false, in_loop, in_js_loop))
                 .collect(),
         },
         Stmt::IfStatement {
@@ -414,12 +429,12 @@ fn fix_stmt(stmt: Stmt, in_arrow: bool, in_func: bool, in_switch: bool, in_loop:
         } => Stmt::IfStatement {
             test: fix_expr(test, in_arrow, in_func, in_loop),
             consequent: Box::new(
-                fix_stmt(*consequent, in_arrow, in_func, false, in_loop)
+                fix_stmt(*consequent, in_arrow, in_func, false, in_loop, in_js_loop)
                     .unwrap_or(Stmt::BlockStatement { body: vec![] }),
             ),
             alternate: alternate.map(|a| {
                 Box::new(
-                    fix_stmt(*a, in_arrow, in_func, false, in_loop)
+                    fix_stmt(*a, in_arrow, in_func, false, in_loop, in_js_loop)
                         .unwrap_or(Stmt::BlockStatement { body: vec![] }),
                 )
             }),
@@ -435,20 +450,20 @@ fn fix_stmt(stmt: Stmt, in_arrow: bool, in_func: bool, in_switch: bool, in_loop:
             finalizer,
         } => Stmt::TryStatement {
             block: Box::new(
-                fix_stmt(*block, in_arrow, in_func, false, in_loop)
+                fix_stmt(*block, in_arrow, in_func, false, in_loop, in_js_loop)
                     .unwrap_or(Stmt::BlockStatement { body: vec![] }),
             ),
             handler: handler.map(|h| CatchClause {
                 type_: h.type_,
                 param: h.param,
                 body: Box::new(
-                    fix_stmt(*h.body, in_arrow, in_func, false, in_loop)
+                    fix_stmt(*h.body, in_arrow, in_func, false, in_loop, in_js_loop)
                         .unwrap_or(Stmt::BlockStatement { body: vec![] }),
                 ),
             }),
             finalizer: finalizer.map(|f| {
                 Box::new(
-                    fix_stmt(*f, in_arrow, in_func, false, in_loop)
+                    fix_stmt(*f, in_arrow, in_func, false, in_loop, in_js_loop)
                         .unwrap_or(Stmt::BlockStatement { body: vec![] }),
                 )
             }),
@@ -469,7 +484,7 @@ fn fix_stmt(stmt: Stmt, in_arrow: bool, in_func: bool, in_switch: bool, in_loop:
                     consequent: c
                         .consequent
                         .into_iter()
-                        .filter_map(|s| fix_stmt(s, in_arrow, in_func, true, in_loop))
+                        .filter_map(|s| fix_stmt(s, in_arrow, in_func, true, in_loop, in_js_loop))
                         .collect(),
                 })
                 .collect(),
@@ -477,14 +492,14 @@ fn fix_stmt(stmt: Stmt, in_arrow: bool, in_func: bool, in_switch: bool, in_loop:
         Stmt::WhileStatement { test, body } => Stmt::WhileStatement {
             test: fix_expr(test, in_arrow, in_func, in_loop),
             body: Box::new(
-                fix_stmt(*body, in_arrow, in_func, false, in_loop)
+                fix_stmt(*body, in_arrow, in_func, false, in_loop, true)
                     .unwrap_or(Stmt::BlockStatement { body: vec![] }),
             ),
         },
         Stmt::DoWhileStatement { test, body } => Stmt::DoWhileStatement {
             test: fix_expr(test, in_arrow, in_func, in_loop),
             body: Box::new(
-                fix_stmt(*body, in_arrow, in_func, false, in_loop)
+                fix_stmt(*body, in_arrow, in_func, false, in_loop, true)
                     .unwrap_or(Stmt::BlockStatement { body: vec![] }),
             ),
         },
@@ -492,7 +507,7 @@ fn fix_stmt(stmt: Stmt, in_arrow: bool, in_func: bool, in_switch: bool, in_loop:
             left,
             right: fix_expr(right, in_arrow, in_func, in_loop),
             body: Box::new(
-                fix_stmt(*body, in_arrow, in_func, false, in_loop)
+                fix_stmt(*body, in_arrow, in_func, false, in_loop, true)
                     .unwrap_or(Stmt::BlockStatement { body: vec![] }),
             ),
         },
@@ -503,13 +518,13 @@ fn fix_stmt(stmt: Stmt, in_arrow: bool, in_func: bool, in_switch: bool, in_loop:
             body,
         } => Stmt::ForStatement {
             init: Box::new(
-                fix_stmt(*init, in_arrow, in_func, false, in_loop)
+                fix_stmt(*init, in_arrow, in_func, false, in_loop, in_js_loop)
                     .unwrap_or(Stmt::BlockStatement { body: vec![] }),
             ),
             test: fix_expr(test, in_arrow, in_func, in_loop),
             update: fix_expr(update, in_arrow, in_func, in_loop),
             body: Box::new(
-                fix_stmt(*body, in_arrow, in_func, false, in_loop)
+                fix_stmt(*body, in_arrow, in_func, false, in_loop, true)
                     .unwrap_or(Stmt::BlockStatement { body: vec![] }),
             ),
         },
@@ -650,7 +665,7 @@ fn fix_expr(e: Expr, in_arrow: bool, in_func: bool, in_loop: bool) -> Expr {
                         ArrowBody::Expr(Box::new(fix_expr(*inner, true, in_func, body_loop)))
                     }
                     ArrowBody::Block(b) => ArrowBody::Block(Box::new(
-                        fix_stmt(*b, true, in_func, false, body_loop)
+                        fix_stmt(*b, true, in_func, false, body_loop, false)
                             .unwrap_or(Stmt::BlockStatement { body: vec![] }),
                     )),
                 },
@@ -6571,11 +6586,24 @@ mod tests {
         // it would lower `len($1)` to `sh2.positional[0].length` and drop the
         // element entirely. See `getvar_hash_form_stays_a_runtime_read`.
         for name in ["1", "2", "9"] {
+            let a1 = a1_fn_call(a1_assign_getvar(name));
             assert!(
-                direct_call_keeps_positional_bridge(a1_fn_call(a1_assign_getvar(name))),
-                "positional bridge dropped for getVar({name:?})"
+                direct_call_keeps_positional_bridge(a1.clone()) || pos_lift_call(a1),
+                "positional argument dropped for getVar({name:?})"
             );
         }
+    }
+
+    /// POSITIONAL_LOCAL lift (src/shir.rs `POS_LIFT`): the define takes the
+    /// positional array as ONE ordinary parameter (`function f(__pos)`) and
+    /// the call site passes it. That is the SAME invariant as
+    /// `direct_call_keeps_positional_bridge` — the callee must not read the
+    /// CALLER's positional frame — satisfied by a stronger mechanism (no
+    /// runtime save/restore, no dispatch), so either form is acceptable.
+    fn pos_lift_call(a1: serde_json::Value) -> bool {
+        let ir = crate::shir_json_in::shir_json_to_ir(&a1.to_string()).expect("A1 ingress");
+        let json = serde_json::to_string(&crate::shir::shir_to_estree(&ir)).unwrap();
+        json.contains("\"type\":\"FunctionDeclaration\"") && json.contains("__pos")
     }
 
     /// The negative half of the above, pinned structurally: `getVar("#1")`
@@ -6888,6 +6916,67 @@ mod tests {
     }
 
     #[test]
+    fn capture_of_pipeline_lowers_to_one_pipeline_capture_sync() {
+        // `$(PRODUCER | CONSUMER)` — the runtime capture's fd-1 buffer IS
+        // the pipeline's last-stage sink, so `captureSync(() =>
+        // pipelineSync(stages))` composes into ONE
+        // `sh2.pipelineCaptureSync(stages)` (the runtime twin applies the
+        // same capture strips to the same buffer, leaving the same
+        // lastExit/pipeStatuses).
+        // `ls | wc -l` no longer reaches this path: both stages reduce
+        // natively (`sh2.builtinText("ls", …)` fed straight into the
+        // split/length count), so there is no pipeline left to capture —
+        // strictly fewer sh2 calls for the same bytes. A pipeline whose
+        // stages stay EXTERNAL is the shape this collapse rule still
+        // governs, and that is what is asserted here.
+        let json = to_json("a=$(sort f | head -2)");
+        assert!(
+            json.contains("\"name\":\"pipelineCaptureSync\""),
+            "not collapsed: {json}"
+        );
+        assert!(
+            !json.contains("\"name\":\"captureSync\""),
+            "captureSync kept: {json}"
+        );
+        assert!(
+            !json.contains("\"name\":\"pipelineSync\""),
+            "pipelineSync kept: {json}"
+        );
+        // A capture body with MORE than the pipeline keeps the runtime
+        // pair: the capture value would be the concatenation of both
+        // statements' output, not the pipeline text alone.
+        let multi = to_json("a=$(sort f | head -2; echo x)");
+        assert!(
+            !multi.contains("pipelineCaptureSync"),
+            "multi-statement body collapsed: {multi}"
+        );
+        assert!(multi.contains("\"name\":\"captureSync\""));
+    }
+
+    #[test]
+    fn exec_redirect_lowers_to_one_exec_redirect_call() {
+        // `CMD ARGS > f` where CMD is the async exec bridge: the redirect
+        // wrapper and the exec call become one
+        // `sh2.execRedirect(NAME, ARGS, ENV, SPECS)` (the runtime twin runs
+        // the same spec install/restore/persist pass around the same exec).
+        let json = to_json("perl -e 'print 1' > out.txt");
+        assert!(
+            json.contains("\"name\":\"execRedirect\""),
+            "not collapsed: {json}"
+        );
+        assert!(!json.contains("\"name\":\"redirect\""), "redirect kept: {json}");
+        assert!(!json.contains("\"name\":\"exec\""), "exec kept: {json}");
+        // the spec rides as the 4th argument, and the runtime signature's
+        // empty `env` slot is filled with null
+        assert!(json.contains("\"value\":\"out.txt\""));
+        // A sync builtin keeps its own (cheaper) collapse into
+        // `builtin(NAME, ARGS, ENV, SPECS)`.
+        let b = to_json("ls -l /tmp > out.txt");
+        assert!(!b.contains("execRedirect"), "builtin collapsed as exec: {b}");
+        assert!(b.contains("\"name\":\"builtin\""));
+    }
+
+    #[test]
     fn echo_pipe_cut_statement_uses_cuttext() {
         // statement-form `echo X | cut OP` → the sync cutText helper
         // (the grepText precedent) — no async pipeline machinery
@@ -6967,9 +7056,13 @@ mod tests {
             "a stage's value return must stay a native return: {json}"
         );
         // …but a SHELL `return` inside a loop body must still signal, or the
-        // loop would swallow it (the rule this fix is scoped around).
+        // loop would swallow it (the rule this fix is scoped around). A
+        // native `return` would also lose the function's exit STATUS
+        // (`f() { return 3; }; f; echo $?` must print 3), so a return
+        // anywhere in the body keeps the runtime loop.
         let json2 = to_json("f() { for i in 1 2; do return 3; done; }; f");
         assert!(json2.contains("\"name\":\"return\""), "{json2}");
+        assert!(json2.contains("\"name\":\"forLoopSync\""), "{json2}");
     }
 
     #[test]
@@ -7522,6 +7615,105 @@ mod tests {
         // the dynamic interpolate is a template literal value
         assert!(json.contains("\"type\":\"TemplateLiteral\""));
         assert!(!json.contains("unsupported"));
+    }
+
+    #[test]
+    fn while_loop_with_break_lowers_to_a_native_loop() {
+        // A source `break` renders as `sh2.break()` — a THROW the runtime
+        // loops catch — so the old eligibility gate refused a native loop for
+        // ANY break/continue in the body. A break/continue that is a DIRECT
+        // body statement terminates THIS loop, and the native JS statement is
+        // exactly what the runtime emulates; converting it earns the plain
+        // `while` (no runtime call, no per-iteration closure, no try/catch).
+        let json = to_json("f() { while true; do echo x; break; done; }\nf");
+        assert!(
+            !json.contains("\"name\":\"whileLoopSync\""),
+            "the runtime loop must be gone: {json}"
+        );
+        assert!(
+            json.contains("\"type\":\"WhileStatement\""),
+            "a native while is expected: {json}"
+        );
+        assert!(
+            json.contains("\"type\":\"BreakStatement\""),
+            "the break is a native statement: {json}"
+        );
+        assert!(
+            !json.contains("\"value\":\"break\""),
+            "no sh2.break() call may remain: {json}"
+        );
+        assert!(!json.contains("unsupported"), "{json}");
+    }
+
+    #[test]
+    fn for_loop_with_continue_lowers_to_a_native_loop() {
+        // `[ … ] || continue` — the `continue` is a direct body statement, so
+        // the native `for…of` takes it. Bash gives the keyword status 0, so
+        // the jump carries the `sh2.lastExit = 0` write the runtime loop's
+        // `bodyLastExit = 0` reproduces (or-continue's exit status).
+        let json = to_json(
+            "f() { for i in 1 2 3; do [ \"$i\" = 2 ] || continue; echo \"$i\"; done; }\nf",
+        );
+        assert!(
+            !json.contains("\"name\":\"forLoopSync\""),
+            "the runtime loop must be gone: {json}"
+        );
+        assert!(
+            json.contains("\"type\":\"ForOfStatement\""),
+            "a native for-of is expected: {json}"
+        );
+        assert!(
+            json.contains("\"type\":\"ContinueStatement\""),
+            "the continue is a native statement: {json}"
+        );
+        assert!(
+            json.contains("\"name\":\"lastExit\""),
+            "the jump writes the keyword's status (0): {json}"
+        );
+        assert!(!json.contains("unsupported"), "{json}");
+    }
+
+    #[test]
+    fn loop_local_break_keeps_the_runtime_loop_inside_a_capture() {
+        // A break that belongs to a NESTED arrow (a command substitution's
+        // body) cannot become a native statement — it is illegal there — and
+        // the runtime loop is what catches its signal. The conversion must
+        // therefore refuse the loop entirely.
+        let json = to_json("while true; do x=$(echo a; break); echo \"$x\"; break; done");
+        assert!(
+            json.contains("\"name\":\"whileLoopSync\""),
+            "a signal inside a nested arrow keeps the runtime loop: {json}"
+        );
+        assert!(
+            !json.contains("\"type\":\"BreakStatement\""),
+            "no native break may be emitted: {json}"
+        );
+        assert!(!json.contains("unsupported"), "{json}");
+    }
+
+    #[test]
+    fn quoted_capture_local_decl_lifts_to_let() {
+        // The shell frontend spells `$(...)` as `IrExpr::Capture`, while
+        // the `declare_sources_dyn` widening only matched the CALL spelling
+        // (`Call { func: "capture" }` — the frontend form). Every
+        // `local x="$(...)"` therefore stayed on the runtime
+        // `builtin("local")` dispatch + store round-trip, and every later
+        // read stayed a store read (`sh2.vars.x`) instead of the binding.
+        // Pin the lift AND that the capture EXPRESSION (with its side
+        // effect) is what initializes the binding.
+        let json = to_json(
+            "f() { local a=\"$(cat file.txt)\"; local b=\"$(echo hi | grep h)\"; echo \"$a $b\"; }; f",
+        );
+        assert!(
+            !json.contains("\"value\":\"local\""),
+            "the local dispatch must be gone: {json}"
+        );
+        assert!(json.contains("\"name\":\"a\""), "a must be a native binding: {json}");
+        assert!(json.contains("\"name\":\"b\""), "b must be a native binding: {json}");
+        // the capture VALUES survive (file read / grep) — not empty strings
+        assert!(json.contains("readText"), "the file capture must survive: {json}");
+        assert!(json.contains("grepText"), "the grep capture must survive: {json}");
+        assert!(!json.contains("unsupported"), "{json}");
     }
 
     #[test]
@@ -8306,16 +8498,26 @@ greet");
 
     #[test]
     fn baked_subscript_read_uses_native_key() {
-        // `${map[$k]}` with a lifted `k` (the loop var): the baked-text
-        // store read (`sh2.getVar("map[$k]")` — the runtime resolves
-        // `$k` from the STORE) rewrites to `sh2.arrayIndex("map", k)`
-        // with the native binding — no store sync, no store round-trip.
+        // `${arr[$i]}` with a lifted `i` (the loop var): the baked-text
+        // store read (`sh2.getVar("arr[$i]")` — the runtime resolves `$i`
+        // from the STORE) rewrites to `sh2.arrayIndex("arr", i)` with the
+        // native binding — no store sync, no store round-trip.
         // SH2_ASSUME_SUBSCRIPT_KEYS-gated (see baked_subscript_read).
-        let json = to_json("declare -A map\nmap[foo]=bar\nfor k in \"${!map[@]}\"; do echo \"${map[$k]}\"; done");
+        //
+        // The array is filled INSIDE the loop, so `array_migrate` cannot
+        // prove it top-level-initialized and the read stays store-bound —
+        // exactly the shape this rewrite exists for. A `declare -A` map
+        // was the original example; it no longer reaches here by default,
+        // because the native-Map migration (`assoc_migrate_program`,
+        // SH2_ASSUME_NATIVE_ASSOC, ON) takes it first and turns the whole
+        // loop into `map.keys()` / `map.get(k)` — also store-bound-free,
+        // and covered by its own tests. `SH2_ASSUME_NATIVE_ASSOC=0`
+        // renders the old `arrayIndex` form for that program.
+        let json = to_json("arr=()\ni=0\nwhile [ $i -lt 3 ]; do arr[$i]=$i; i=$((i+1)); done\nj=0\nwhile [ $j -lt 3 ]; do echo \"${arr[$j]}\"; j=$((j+1)); done");
         assert!(json.contains("\"name\":\"arrayIndex\""));
-        assert!(json.contains("\"value\":\"map\""));
+        assert!(json.contains("\"value\":\"arr\""));
         // no per-iteration store sync of the lifted loop var
-        assert!(!json.contains("\"value\":\"k\""));
+        assert!(!json.contains("\"value\":\"j\""));
         assert!(!json.contains("\"name\":\"getVar\""));
         // `[@]`/`[*]` whole-array forms and PIPESTATUS never rewrite
         // (the join / pipeStatuses arms are getVar-special)
@@ -8611,17 +8813,19 @@ greet");
     }
 
     #[test]
-    fn break_inside_loop_lowers_to_sh2_call() {
-        // `break`/`continue` inside a loop body is emitted INSIDE an arrow
-        // function, so it must become a sh2.break() call, never a native
-        // `break;` statement (illegal JS in an arrow body).
+    fn break_inside_loop_lowers_to_native_statement() {
+        // A break/continue that terminates THIS loop becomes the native JS
+        // statement (the loop itself is native — see
+        // `convert_native_loop_signals`). The `sh2.break()` CALL form is only
+        // for a signal the loop cannot terminate natively (a nested arrow —
+        // see `loop_local_break_keeps_the_runtime_loop_inside_a_capture`).
         let json = to_json("while true; do echo x; break; done");
-        assert!(json.contains("\"name\":\"break\""));
-        assert!(!json.contains("\"type\":\"BreakStatement\""));
+        assert!(json.contains("\"type\":\"BreakStatement\""));
+        assert!(!json.contains("\"name\":\"break\""), "{json}");
         assert!(!json.contains("unsupported"));
         let json2 = to_json("for i in a b; do continue; done");
-        assert!(json2.contains("\"name\":\"continue\""));
-        assert!(!json2.contains("\"type\":\"ContinueStatement\""));
+        assert!(json2.contains("\"type\":\"ContinueStatement\""));
+        assert!(!json2.contains("\"name\":\"continue\""), "{json2}");
     }
 
     #[test]

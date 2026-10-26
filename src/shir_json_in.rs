@@ -1953,6 +1953,94 @@ mod tests {
         );
     }
 
+    /// A static `fnCall("f", args)` site takes the SAME native-call rewrite
+    /// as the `exec` site the bash frontend emits (core request
+    /// rust-frontend-20261026-151500). The lift analyses accept a `fnCall`
+    /// site, so a lifted define is deliberately NOT registered in
+    /// `sh2.functions` — dispatching the call through `sh2.fnCall` looked
+    /// up that empty map: status 127, the body never ran, and NEITHER side
+    /// produced a diagnostic. Define and call site must be the direct pair.
+    #[test]
+    fn fn_call_site_honours_the_positional_lift() {
+        // `echo "$@"` reads `$@`, which disqualifies the plain-param lift,
+        // leaving the POSITIONAL_LOCAL lift — the exact split reported.
+        let src = serde_json::json!({
+            "type": "Program",
+            "contract_version": 1,
+            "imports": [], "requires": [], "stmt_lines": [], "subs": [],
+            "stmts": [
+                {"type": "Function", "name": "hello", "named_blocks": {}, "body": [
+                    {"type": "Expr", "expr": {"type": "Call", "func": "builtin",
+                        "purity": "Emulable", "args": [
+                        {"type": "Str", "value": "echo", "style": "DoubleQuoted"},
+                        {"type": "Array", "elements": [{"type": "Var", "name": "@", "sigil": null}]}
+                    ]}}
+                ]},
+                {"type": "Expr", "expr": {"type": "Call", "func": "fnCall",
+                    "purity": "Emulable", "args": [
+                    {"type": "Str", "value": "hello", "style": "DoubleQuoted"},
+                    {"type": "Array", "elements": [{"type": "Str", "value": "3", "style": "DoubleQuoted"}]}
+                ]}}
+            ]
+        })
+        .to_string();
+        let prog = shir_json_to_ir(&src).expect("fnCall shape ingresses");
+        let json = crate::shir::shir_to_estree_json(&prog).expect("render");
+        assert!(
+            json.contains("\"name\":\"__pos\""),
+            "the positional lift must still fire for this body: {json}"
+        );
+        assert!(
+            json.contains("\"callee\":{\"type\":\"Identifier\",\"name\":\"hello\"}"),
+            "the lifted call site must call the define directly: {json}"
+        );
+        assert!(
+            !json.contains("\"name\":\"fnCall\""),
+            "a lifted fnCall site must not dispatch through the emptied function map: {json}"
+        );
+    }
+
+    /// The param-lift twin of the test above: `$1` only, so the define
+    /// takes `p1` and the `fnCall` site must lower to the direct call
+    /// rather than `sh2.fnCall` (same missing-registration failure).
+    #[test]
+    fn fn_call_site_honours_the_param_lift() {
+        let src = serde_json::json!({
+            "type": "Program",
+            "contract_version": 1,
+            "imports": [], "requires": [], "stmt_lines": [], "subs": [],
+            "stmts": [
+                {"type": "Function", "name": "hello", "named_blocks": {}, "body": [
+                    {"type": "Expr", "expr": {"type": "Call", "func": "builtin",
+                        "purity": "Emulable", "args": [
+                        {"type": "Str", "value": "echo", "style": "DoubleQuoted"},
+                        {"type": "Array", "elements": [{"type": "Var", "name": "1", "sigil": null}]}
+                    ]}}
+                ]},
+                {"type": "Expr", "expr": {"type": "Call", "func": "fnCall",
+                    "purity": "Emulable", "args": [
+                    {"type": "Str", "value": "hello", "style": "DoubleQuoted"},
+                    {"type": "Array", "elements": [{"type": "Str", "value": "3", "style": "DoubleQuoted"}]}
+                ]}}
+            ]
+        })
+        .to_string();
+        let prog = shir_json_to_ir(&src).expect("fnCall shape ingresses");
+        let json = crate::shir::shir_to_estree_json(&prog).expect("render");
+        assert!(
+            json.contains("\"name\":\"p1\""),
+            "the param lift must still fire for this body: {json}"
+        );
+        assert!(
+            json.contains("\"callee\":{\"type\":\"Identifier\",\"name\":\"hello\"}"),
+            "the lifted call site must call the define directly: {json}"
+        );
+        assert!(
+            !json.contains("\"name\":\"fnCall\""),
+            "a lifted fnCall site must not dispatch through the emptied function map: {json}"
+        );
+    }
+
     #[test]
     fn c_sizeof_constants() {
         use crate::ir::IrType;
@@ -1988,11 +2076,11 @@ mod tests {
 
     #[test]
     fn var_const_roundtrip() {
-        // LIMIT is read in arithmetic (`$((LIMIT * 2))`) — copy-propagation
-        // cannot fold a Str def into an arith read (only Int literals), so
-        // the single-assignment LIMIT survives as a Const verdict.
+        // LIMIT is read in arithmetic (`$((LIMIT * 2))`) — its def is
+        // DYNAMIC, so copy-propagation never folds it into the arith read
+        // and the single-assignment LIMIT survives as a Const verdict.
         let json =
-            round_trip("LIMIT=10\nsum=0\nfor i in 1 2; do sum=$((sum+i)); done\necho $((LIMIT * 2)) $sum");
+            round_trip("LIMIT=\"$1\"\nsum=0\nfor i in 1 2; do sum=$((sum+i)); done\necho $((LIMIT * 2)) $sum");
         let v: serde_json::Value = serde_json::from_str(&json).unwrap();
         let vc = v.get("var_const").and_then(|x| x.as_array());
         assert!(

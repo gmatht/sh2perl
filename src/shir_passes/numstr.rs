@@ -253,6 +253,23 @@ pub fn expr_int(
         IrExpr::Call { func, args } if matches!(func.as_str(), "min" | "max" | "sum" | "arrayIndex") => {
             matches!(str_arg(args, 0), Some(n) if int_arrays.contains(&n))
         }
+        // `str-chop-cursor`'s cursor advance (shir_nodes/field_strip.node):
+        // the ABSOLUTE byte offset past the delimiter — a non-negative
+        // integer by construction, written as canonical decimal by the
+        // render arm that computes it, and grounded by the transform's own
+        // canonical `"0"` init (the seed is never a pure self-cycle).
+        // Homing the cursor native drops the per-chop `atoll` + itoa +
+        // string store the decimal channel costs — the MIMEcroft texture
+        // tokenizer runs 6+ chops per texel.
+        IrExpr::Ext(n) if n.tag() == "FieldStrip" => true,
+        // …and the guarded pair's draining advance (field_strip_end.node):
+        // same absolute offset, `end of text` instead of `off` on a miss —
+        // equally a non-negative integer by construction, equally grounded
+        // by the same canonical `"0"` init. Homing it is REQUIRED, not an
+        // optimization: a cursor var whose advance homes native must not
+        // be demoted by the next pass or the two advances disagree about
+        // the channel the cursor lives on.
+        IrExpr::Ext(n) if n.tag() == "FieldStripEnd" => true,
         _ => false,
     }
 }
@@ -375,6 +392,17 @@ fn walk_expr(e: &IrExpr, cur: &str, ctx: &mut Ctx) {
             walk_expr(iter, cur, ctx);
             walk_expr(elem, cur, ctx);
             if let Some(c) = cond {
+                walk_expr(c, cur, ctx);
+            }
+        }
+        // Ext expression nodes are pure forms over their operands
+        // (FieldGrab/FieldStrip's text+off, the primitive nodes' fields):
+        // walk them so reads and nested call sites inside still register.
+        // Skipping them silently would let a hidden `eval` in an operand go
+        // unrecorded — the STATEMENT-level Ext arm is the one that blocks
+        // a whole program, and it is unchanged here.
+        IrExpr::Ext(n) => {
+            for c in n.children() {
                 walk_expr(c, cur, ctx);
             }
         }
@@ -772,6 +800,41 @@ pub fn seed(prog: &IrProgram, inputs: &Inputs) -> Seed {
         .collect();
     let mut ints = ints_g.clone();
     ints.extend(candidates.iter().cloned());
+    // Phase 2b — COPY CLOSURE: a pure pass-through (a swap temp such
+    // as `rbt_t=$rbt_x1` in MIMEcroft's rb_tri, whose every assign is a
+    // read of another var) has no anchor of its own, so the per-var
+    // anchor filter above cannot admit it — and without it the anchored
+    // cycle around it collapses in the removal loop below: x2's copy of
+    // `t` fails once `t` leaves, then x1's copy of `x2` follows, and
+    // three long-long-worthy scalars pay the atoll/snprintf channel
+    // forever. Admit any var whose every assign is int-valued while
+    // GRANTING the candidates int, grown least-fixpoint-style FROM the
+    // anchored set: a var only enters when its reads already resolve,
+    // so a purely text cycle (`w=$x; x=$w` with no producer anywhere)
+    // never enters — nothing joins in round 1 without an anchored name
+    // behind it. Grounding therefore still comes from the anchors; this
+    // only widens candidacy. The removal loop re-validates every
+    // candidate afterwards, so a member whose support collapses still
+    // leaves (taking its dependents with it).
+    loop {
+        let mut grew = false;
+        for (v, als) in &assigns {
+            if ints.contains(v) {
+                continue;
+            }
+            if als
+                .iter()
+                .all(|(f, e)| expr_int(e, &ints, &params_g, f, int_arrays))
+            {
+                ints.insert(v.clone());
+                candidates.insert(v.clone());
+                grew = true;
+            }
+        }
+        if !grew {
+            break;
+        }
+    }
     loop {
         let mut removed_any = false;
         // params first: a position that goes unsat can unseat its

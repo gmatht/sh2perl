@@ -13,3 +13,4 @@ field from: string
 field to: string
 field delete: bool
 field squeeze: bool
+spec: none (unstated)

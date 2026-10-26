@@ -1,0 +1,47 @@
+# shir_nodes/sort_lines.node — expression-level semantic IR node.
+# Order the LINES of a text (`sort`, `sort -n`, `sort -r`, `sort -u`,
+# `sort -t: -k2 -n`).
+#
+# The corpus piped `sort` in 20 of 562 examples and there was no node for
+# it at all: every backend shelled out, and that shell-out WAS its
+# semantics. Ordering is a pure function of the text, so it belongs here.
+#
+# meaning: sort_lines key dir uniq s == the lines of `s` (a text split at
+#   '\n', with the empty string produced by a FINAL newline dropped, i.e.
+#   `lines s`) stably ordered by `key`, reversed iff `dir = Desc`, and
+#   de-duplicated (keeping the first of each equal-key run, which is what
+#   `sort -u` does after ordering) iff `uniq`.
+#
+# Domains this node deliberately does NOT cover (each needs its own node or
+# a refusal, never a guess):
+#   * the field separator / key offsets of `-t` / `-k` — `key` selects
+#     WHOLE LINES or `-t X -kN`'s field N, spelled by the lowering;
+#   * locale collation (`LC_ALL` order) — `Numeric` and `Lexicographic`
+#     are byte/number orders, so a locale-sensitive sort must refuse;
+#   * `sort -m`, `--stable` variants and `-o` (an output file, not a value).
+#
+# Backends: Perl sort, JS lines.sort, Go sort.SliceStable, Rust sort_by,
+#   C qsort_r
+# Fallback: sh2.sortLines(text, key, dir, uniq)
+#
+# Provenance: sh2perl/docs/fm/TextOps/SortLines.thy
+
+node SortLines
+tag "SortLines"
+kind expr
+field text: expr
+# key: WholeLine (default), or one 1-based field of a delimiter-separated
+# line. `""` means WholeLine. Otherwise "<sep><n>" (e.g. ":\x32" is field 2
+# of a colon-separated line); a malformed value is REFUSED by the lowering,
+# never defaulted.
+field key: string
+# numeric: compare the key as a number (what `sort -n` does).
+field numeric: bool
+# reverse: what `sort -r` does — the whole comparison reversed.
+field reverse: bool
+# uniq: what `sort -u` does — one line per equal-key run.
+field unique: bool
+# stable is always TRUE (sort_lines is defined as a stable order); recorded
+# so a renderer does not have to guess which sort the languages provide.
+field ignore_case: bool
+spec: TextOps#sort_lines_sound

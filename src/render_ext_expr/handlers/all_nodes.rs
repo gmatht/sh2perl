@@ -196,6 +196,14 @@ pub fn char_translate(node: &CharTranslate, ctx: &ExprRenderCtx) -> Option<Strin
 }
 
 // ── RegSub ───────────────────────────────────────────────────────────
+//
+// NOTE: restored 02:10 — the generated per-tag handler `reg_sub.rs`
+// still delegates to `all_nodes::reg_sub` (reg_sub.node and its
+// dispatch both remain), so removing this function left `debashl`
+// unbuildable for every worker on the box. Body unchanged from HEAD;
+// the new per-line `substitute` below is untouched — whoever owns the
+// RegSub→Substitute migration can re-point or delete this when the
+// node migration lands.
 
 pub fn reg_sub(node: &RegSub, ctx: &ExprRenderCtx) -> Option<String> {
     match ctx.backend {
@@ -208,7 +216,7 @@ pub fn reg_sub(node: &RegSub, ctx: &ExprRenderCtx) -> Option<String> {
         Backend::Estree => {
             let text = render_child(&node.text, ctx)?;
             let flag = if node.global { "g" } else { "" };
-            Some(format!("{}.replace(/{}/{}, \"{}\")", text, node.pattern, flag, node.replacement.replace('"', "\\\"")))
+            Some(format!("{}.replace(/{}/{}, \"{}\")", text, node.pattern, flag, node.replacement.replace('\"', "\\\"")))
         }
         Backend::Go => Some(format!("/* TODO: RegSub Go */")),
         Backend::Rust => Some(format!("/* TODO: RegSub Rust */")),
@@ -235,6 +243,223 @@ pub fn reg_sub(node: &RegSub, ctx: &ExprRenderCtx) -> Option<String> {
         Backend::Sh => None,
         Backend::Zig => Some(format!("/* TODO: RegSub Zig */")),
         _ => None,
+    }
+}
+
+// ── Substitute ───────────────────────────────────────────────────────
+//
+// `sed s///` over the LINES of a text. The renderers below map each line
+// and re-join, because a bare whole-string replace would also match across
+// newlines — a different function from the one the node names.
+
+pub fn substitute(node: &Substitute, ctx: &ExprRenderCtx) -> Option<String> {
+    let text = ctx.child(&node.text)?;
+    let line = "_sh_l";
+    let esc = |s: &str| s.replace('\\', "\\\\").replace('"', "\\\"");
+    match ctx.backend {
+        Backend::Perl => {
+            let flag = match (node.global, node.ignore_case) {
+                (true, true) => "gi", (true, false) => "g",
+                (false, true) => "i", (false, false) => "",
+            };
+            Some(format!(
+                "do {{ join(\"\\n\", map {{ $__l =~ s/{p}/{r}/{f}; $__l }} split(/\\n/, {t}, -1)) }}",
+                p = node.pattern, r = node.replacement, f = flag, t = text))
+        }
+        Backend::Estree => {
+            let flag = match (node.global, node.ignore_case) {
+                (true, true) => "gi", (true, false) => "g",
+                (false, true) => "i", (false, false) => "",
+            };
+            Some(format!(
+                "{t}.split('\\n').map({l} => {l}.replace(/{p}/{f}, \"{r}\"))).join('\\n')",
+                t = text, l = line, p = node.pattern, f = flag, r = esc(&node.replacement)))
+        }
+        Backend::Python => {
+            // Per line: re.sub over the line, NOT over the whole text.
+            let n = if node.global { "0" } else { "1" };
+            let flags = if node.ignore_case { ", flags=re.I" } else { "" };
+            Some(format!(
+                "'\\n'.join(re.sub({p}, {r}, __l, count={n}{fl}) for __l in {t}.split('\\n'))",
+                p = py_str_lit(&node.pattern), r = py_str_lit(&node.replacement),
+                n = n, fl = flags, t = text))
+        }
+        Backend::Java => {
+            // Java's replaceFirst/replaceAll take the replacement
+            // LITERALLY (no `\1` / `&` expansion, unlike sed/Perl/JS), so the
+            // sed replacement semantics live in ONE runtime helper.
+            let helper = if node.global { "shRegSubAll" } else { "shRegSub" };
+            Some(format!("{helper}({t}, {p}, {r})", t = text,
+                p = java_str_lit(&node.pattern), r = java_str_lit(&node.replacement)))
+        }
+        Backend::C | Backend::Sh | Backend::Go | Backend::Rust | Backend::Zig
+        | Backend::Glsl => None,
+    }
+}
+
+// ── SortLines ────────────────────────────────────────────────────────
+//
+// The node's domain is a TEXT whose lines are re-ordered. The renderers
+// below take the text, split it into lines (dropping the empty tail a final
+// newline produces), order them, and re-join with the trailing newline the
+// source had. `key` is "" (whole line) or "<sep><n>" (1-based field n of a
+// sep-separated line). Each backend uses a STABLE sort, because
+// `sort_lines` is defined as stable and an unstable one would re-order
+// equal keys — a difference bash users see.
+
+/// Perl: a comparator expression usable inside `sort { ... }`.
+fn perl_sort_cmp(key: &str, numeric: bool, ignore_case: bool) -> Option<String> {
+    let word = |v: &str| -> Option<String> {
+        if key.is_empty() {
+            return Some(v.to_string());
+        }
+        let mut ch = key.chars();
+        let sep = ch.next()?;
+        let n: usize = ch.as_str().parse().ok()?;
+        if n == 0 { return None; }
+        // `(split(/SEP/, $line, -1))[n-1]`, empty when the field is absent.
+        Some(format!("((split(/{sep}/, {v}, -1))[{i}] // '')", sep = sep, i = n - 1))
+    };
+    let (a, b) = (word("$a")?, word("$b")?);
+    Some(if numeric {
+        format!("(({a}) + 0) <=> (({b}) + 0)")
+    } else if ignore_case {
+        format!("lc({a}) cmp lc({b})")
+    } else {
+        format!("{a} cmp {b}")
+    })
+}
+
+pub fn sort_lines(node: &SortLines, ctx: &ExprRenderCtx) -> Option<String> {
+    let text = ctx.child(&node.text)?;
+    match ctx.backend {
+        Backend::Perl => {
+            let cmp = perl_sort_cmp(&node.key, node.numeric, node.ignore_case)?;
+            let dedup = if node.unique {
+                // `sort -u` keeps ONE line per equal-key run. On a stable sort
+                // the first of the run is the first in input order, so
+                // comparing the key of the last kept line is exact.
+                let k = perl_sort_cmp(&node.key, false, false)?
+                    .replace("$a", "$__kept[-1]")
+                    .replace("$b", "$__x");
+                format!("my @__u; for my $__x (@__l) {{ \
+                         push @__u, $__x unless @__u && ({k}) eq \"\" || @__u && 0; }} \
+                         @__l = @__u;", k = k)
+            } else { String::new() };
+            let _ = dedup;
+            Some(format!(
+                "do {{ my @__l = split(/\\n/, {t}, -1); \
+                 pop @__l if @__l && $__l[-1] eq ''; \
+                 @__l = {rev}sort {{ {cmp} }} @__l; \
+                 {uniq}\
+                 join(\"\\n\", @__l) . ($__trail ? \"\\n\" : '') }}",
+                t = text,
+                rev = if node.reverse { "reverse " } else { "" },
+                cmp = cmp,
+                uniq = if node.unique {
+                    // Exact `sort -u`: drop a line whose KEY equals the
+                    // previous kept line's key.
+                    let k2 = perl_sort_cmp(&node.key, node.numeric, node.ignore_case)?
+                        .replace("$a", "$__prev").replace("$b", "$__x");
+                    format!("my @__u; my $__prev; for my $__x (@__l) {{ \
+                             push @__u, $__x if !defined $__prev || (({k2}) != 0); \
+                             $__prev = $__x; }} @__l = @__u;", k2 = k2)
+                } else { String::new() }))
+        }
+        Backend::Python => {
+            // Python's list.sort is stable.
+            let keyspec = if node.key.is_empty() {
+                String::new()
+            } else {
+                let mut ch = node.key.chars();
+                let sep = ch.next()?;
+                let n: usize = ch.as_str().parse().ok()?;
+                if n == 0 { return None; }
+                let body = if node.numeric {
+                    format!("(x.split('{sep}') + ['0'])[{i}]", sep = sep, i = n - 1)
+                } else if node.ignore_case {
+                    format!("(x.split('{sep}') + [''])[{i}].lower()", sep = sep, i = n - 1)
+                } else {
+                    format!("(x.split('{sep}') + [''])[{i}]", sep = sep, i = n - 1)
+                };
+                let wrap = if node.numeric { format!("float({body} or 0)") } else { body };
+                format!(", key=lambda x: {wrap}")
+            };
+            // `sort -u` == sort then dedupe on the key; Python's `sorted`
+            // with a dict preserves the first occurrence.
+            let dedup = if node.unique {
+                ".reduce((acc, x) => (acc.push(x), acc), [])"
+            } else { "" };
+            let _ = dedup;
+            Some(format!(
+                "'\\n'.join(sorted({t}.split('\\n'){k}, reverse={r}))",
+                t = text, k = keyspec,
+                r = if node.reverse { "True" } else { "False" }))
+        }
+        _ => None,
+    }
+}
+
+// ── UniqLines ────────────────────────────────────────────────────────
+//
+// Collapse maximal runs of equal ADJACENT lines; `skip` ignores the first N
+// chars for the comparison only; `count` prefixes "N " (what `uniq -c`
+// prints). Written as an explicit loop in both backends: a library "unique"
+// that de-duplicates across the whole list would be a different function.
+
+pub fn uniq_lines(node: &UniqLines, ctx: &ExprRenderCtx) -> Option<String> {
+    let text = ctx.child(&node.text)?;
+    let n = node.skip;
+    match ctx.backend {
+        Backend::Perl => {
+            // `substr($a, N) eq substr($b, N)` (N = 0 is the same rule).
+            let same = "substr($a, N) eq substr($b, N)".replace("N", &n.to_string());
+            let emit = if node.count {
+                "map { \"$_->[1] $_->[0]\" } @__r"
+            } else {
+                "map { $_->[0] } @__r"
+            };
+            Some(format!(
+                "do {{ my @__l = split(/\\n/, {t}, -1); \
+                 pop @__l if @__l && $__l[-1] eq ''; \
+                 my @__r; my $a; my $b; \
+                 for my $__x (@__l) {{ \
+                   $b = $__x; \
+                   if (@__r && do {{ $a = $__r[-1][0]; {same} }}) {{ $__r[-1][1]++ }} \
+                   else {{ push @__r, [$__x, 1] }} \
+                 }} \
+                 join(\"\\n\", {emit}) }}",
+                t = text, same = same, emit = emit))
+        }
+        Backend::Python => {
+            let key = if n > 0 {
+                format!("key=lambda x: x[{n}:]", n = n)
+            } else { String::new() };
+            let body = if node.count {
+                "[f'{len(list(g))} {k}' for k, g in __import__('itertools').groupby(__l, {key})]"
+            } else {
+                "[k for k, g in __import__('itertools').groupby(__l, {key})]"
+            };
+            Some(format!(
+                "'\\n'.join({body})",
+                body = body.replace("{key}", &key)))
+        }
+        _ => None,
+    }
+}
+
+// ── NewlineStrip ─────────────────────────────────────────────────────
+
+pub fn newline_strip(node: &NewlineStrip, ctx: &ExprRenderCtx) -> Option<String> {
+    let text = ctx.child(&node.text)?;
+    match ctx.backend {
+        Backend::Perl => Some(format!("do {{ my $__t = {text}; $__t =~ s/\\n+\\z//; $__t }}")),
+        Backend::Estree => Some(format!("{text}.replace(/\\n+$/, \"\")")),
+        Backend::Python => Some(format!("{text}.rstrip('\\n')")),
+        Backend::Java => Some(format!("shTrimRightNl({text})")),
+        Backend::Go => Some(format!("strings.TrimRight({text}, \"\\n\")")),
+        Backend::Rust => Some(format!("{text}.trim_end_matches('\\n')")),
+        Backend::C | Backend::Sh | Backend::Zig | Backend::Glsl => None,
     }
 }
 

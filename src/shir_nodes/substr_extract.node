@@ -11,3 +11,4 @@ kind expr
 field text: expr
 field offset: expr
 field length: optional_expr
+spec: none (unstated)

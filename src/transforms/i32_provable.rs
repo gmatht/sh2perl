@@ -92,28 +92,60 @@ fn expr_is_i32(e: &IrExpr) -> bool {
     }
 }
 
-fn arith_is_i32(a: &ArithAst) -> bool {
+/// Upper bound on `|value|` of the tree, or `None` (unprovable — refuse).
+///
+/// Every node COMPOSES its subtree bounds and refuses as soon as the
+/// result would leave i32.  A leaf-only check is not a range check:
+/// `2^29 * 2^29 * 2^29` has three literals under 2^30 and only `*`, and
+/// evaluates to 2^87 — the first version of this function marked it I32.
+/// `proofs/I32Provable.thy` machine-checks that counterexample next to
+/// the soundness theorem for this version, so the two cannot drift apart
+/// again silently.
+///
+/// Refusals only ever mark FEWER nodes (the manifest allows false
+/// negatives), so tightening this cannot turn a passing verdict into a
+/// wrong one.
+fn arith_abs_bound(a: &ArithAst) -> Option<i128> {
+    /// Refuse anything not provably `|v| < 2^31`; literals keep the
+    /// stricter `|n| < 2^30` they had before the bound was composed.
+    const I32_ABS_BOUND: i128 = 1i128 << 31;
+    const LITERAL_ABS_BOUND: i128 = 1i128 << 30;
+    let cap = |b: i128| (b < I32_ABS_BOUND).then_some(b);
     match a {
-        ArithAst::Num(n) => n.abs() < (1 << 30),
-        ArithAst::Var(_) => false, // untyped var — refuse (escape-classes may sharpen)
-        ArithAst::Index { .. } => false,
+        ArithAst::Num(n) => {
+            // `unsigned_abs`, not `abs`: i64::MIN.abs() overflows (and
+            // panics in debug builds) instead of just being refused.
+            let b = n.unsigned_abs() as i128;
+            (b < LITERAL_ABS_BOUND).then_some(b)
+        }
         ArithAst::Bin { op, lhs, rhs } => {
+            let (l, r) = (arith_abs_bound(lhs)?, arith_abs_bound(rhs)?);
             match op.as_str() {
-                "+" | "-" | "*" => arith_is_i32(lhs) && arith_is_i32(rhs),
+                // |lhs - rhs| <= |lhs| + |rhs|, exactly as for `+`
+                "+" | "-" => cap(l.checked_add(r)?),
+                "*" => cap(l.checked_mul(r)?),
                 // div/mod: truncation + zero-divisor edges — refuse
-                _ => false,
+                _ => None,
             }
         }
         ArithAst::Un { op, arg } => match op.as_str() {
-            "-" => arith_is_i32(arg),
-            _ => false,
+            "-" => arith_abs_bound(arg),
+            _ => None,
         },
         ArithAst::Cond { test, then, else_, .. } => {
-            arith_is_i32(test) && arith_is_i32(then) && arith_is_i32(else_)
+            arith_abs_bound(test)?; // the test is part of the compound
+            // Each branch is already < 2^31, so their max is too; the
+            // value is one of them, never an arithmetic combination.
+            Some(arith_abs_bound(then)?.max(arith_abs_bound(else_)?))
         }
-        ArithAst::Assign { .. } => false,
-        _ => false,
+        // untyped var / ident / index / assignment / ++-- / sizeof / cast:
+        // refuse (escape-classes may sharpen the Var case later)
+        _ => None,
     }
+}
+
+fn arith_is_i32(a: &ArithAst) -> bool {
+    arith_abs_bound(a).is_some()
 }
 
 // name: i32-provable
@@ -121,9 +153,70 @@ fn arith_is_i32(a: &ArithAst) -> bool {
 //   verdict only fires on literal-only compounds, which is still the
 //   common `$((a * 1000 + b))` emitter shape]
 // invariant: analysis-only; no structural mutation. A node is marked
-//   only when EVERY literal is small and every op is + - * — the
-//   estimate is monotone, so a false POSITIVE is impossible by
-//   construction (false negatives are fine).
+//   only when EVERY literal is small AND every op is + - * AND the
+//   composed |value| bound stays under 2^31 at EVERY node (see
+//   arith_abs_bound — the bound used to be checked at the leaves only,
+//   which accepted 2^29 * 2^29 * 2^29 = 2^87; that false positive is
+//   machine-checked in proofs/I32Provable.thy next to the soundness
+//   theorem for the current estimator). False negatives are fine.
 // scope: offered to estree (owner — supersedes lowerI32Trunc), c, go,
 //   rust, glsl
-// updates: none (first offer)
+// updates: 2026-10-23 arith_abs_bound composes the per-node bound
+//   (leaf-only check was unsound); proofs/I32Provable.thy is the
+//   checked obligation.
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn num(n: i64) -> ArithAst {
+        ArithAst::Num(n)
+    }
+    fn mul(l: ArithAst, r: ArithAst) -> ArithAst {
+        ArithAst::Bin {
+            op: "*".to_string(),
+            lhs: Box::new(l),
+            rhs: Box::new(r),
+        }
+    }
+
+    /// The leaf-only check marked this I32: three literals under 2^30,
+    /// only `*`, value 2^87. Refused since arith_abs_bound composed the
+    /// bound per node; the same counterexample is machine-checked in
+    /// proofs/I32Provable.thy.
+    #[test]
+    fn overflow_compound_is_refused() {
+        let boom = mul(mul(num(1 << 29), num(1 << 29)), num(1 << 29));
+        assert!(!arith_is_i32(&boom));
+    }
+
+    /// The fix must only remove FALSE positives: a compound that really
+    /// fits i32 is still marked.
+    #[test]
+    fn in_range_compound_is_marked() {
+        let ok = ArithAst::Bin {
+            op: "+".to_string(),
+            lhs: Box::new(mul(num(1 << 29), num(3))), // 1_610_612_736
+            rhs: Box::new(num(7)),
+        };
+        assert!(arith_is_i32(&ok));
+    }
+
+    /// The bound composes ACROSS nodes: each leaf is a legal literal
+    /// (< 2^30), but their product is ~2^60 and is refused. Two maximal
+    /// literals added give 2^31 - 2, which still fits — so the cap is the
+    /// i32 bound exactly, not something cruder.
+    #[test]
+    fn composed_bound_over_i32_is_refused() {
+        let prod = mul(num((1 << 30) - 1), num((1 << 30) - 1));
+        assert!(!arith_is_i32(&prod));
+
+        let sum = ArithAst::Bin {
+            op: "+".to_string(),
+            lhs: Box::new(num((1 << 30) - 1)),
+            rhs: Box::new(num((1 << 30) - 1)),
+        };
+        assert!(arith_is_i32(&sum));
+        assert!(arith_is_i32(&num((1 << 30) - 1)));
+    }
+}

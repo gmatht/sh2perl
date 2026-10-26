@@ -1,0 +1,42 @@
+# shir_nodes/substitute.node — expression-level semantic IR node.
+# POSIX `s/pattern/replacement/flags` applied to the LINES of a text
+# (lowered from `sed s///`). REPLACES the old `RegSub`, which carried
+# `global: bool` + `line_mode: bool` — two booleans that encoded four
+# meanings over two different domains (a string vs a list of lines), set
+# inconsistently at two call sites. That is the same class of ambiguity
+# that shipped `wc -l` as `length + 1`; one node, one domain, one meaning.
+#
+# meaning: substitute pattern repl occ s == the lines of `s` (split at
+#   '\n', the empty string after a FINAL newline dropped), each line with
+#   the LEFTMOST (or, with Global, EVERY non-overlapping) occurrence of the
+#   POSIX BRE-ish pattern replaced by `repl`, re-joined with '\n' and given
+#   a final newline iff `s` had one. `&` in `repl` is the matched text and
+#   `\N` a back-reference (what sed does); an EMPTY match advances by one
+#   byte, as POSIX specifies, so `s/x*/-/g` terminates.
+#
+# NOT covered (refuse, never guess):
+#   * `-n` + a `p` flag (that is a filter, not a value — a print flag makes
+#     the command's OUTPUT differ from its input line set);
+#   * addresses (`2,4s///`), `d`, `y///`, multiple `-e` scripts (each is a
+#     different program shape and each needs its own node or a composition);
+#   * ERE/extended syntax selection beyond the flags recorded here.
+#
+# Backends: Perl s///, JS replace, Go regexp.ReplaceAllString, Rust regex,
+#   C regcomp/regexec
+# Fallback: sh2.substitute(text, pattern, repl, flags)
+#
+# Provenance: sh2perl/docs/fm/TextOps/Substitute.thy
+
+node Substitute
+tag "Substitute"
+kind expr
+field text: expr
+field pattern: string
+field replacement: string
+# global: every non-overlapping match (sed's `g` flag), not just the first.
+field global: bool
+# flags the lowering accepted but that do not change the VALUE; anything
+# value-changing (`p`, `w file`, an address) is refused before this node
+# is built rather than carried here.
+field ignore_case: bool
+spec: TextOps#substitute_sound

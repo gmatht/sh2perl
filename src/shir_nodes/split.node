@@ -13,3 +13,4 @@ field is_regex: bool
 # split. C renders an in-place tokenizer on the var's own storage; GC'd
 # string languages ignore it (immutable strings — flag meaningless).
 field in_place: optional_bool
+spec: none (unstated)

@@ -2602,6 +2602,23 @@ fn emit_stmt_owned(out: &mut String, stmt: &IrStmt, indent: usize) {
                                 ));
                                 emit_indent(out, indent);
                                 out.push_str(&format!("my {sel} = select({fh});\n"));
+                                // Autoflush the SELECTED handle. `$|` is
+                                // per-handle, so this arms `{fh}` only — the
+                                // `select({sel})` below restores the previous
+                                // handle with its own setting intact.
+                                // Without it the body's `print`s sit in the
+                                // handle's buffer until close, which is
+                                // invisible for a regular file (close flushes)
+                                // but DEADLOCKS on a fifo: the reader blocks
+                                // for data that the writer only holds in
+                                // userspace, and an infinite producer never
+                                // reaches close at all. That is exactly the
+                                // process-substitution shape — the Background
+                                // arm already relies on `$| = 1` reaching
+                                // STDOUT, and this path selects a fresh lexical
+                                // instead, so it must set it itself.
+                                emit_indent(out, indent);
+                                out.push_str("$| = 1;\n");
                                 out.push_str(&body);
                                 emit_indent(out, indent);
                                 out.push_str(&format!("select({sel}); close({fh});\n"));
@@ -3184,7 +3201,47 @@ fn emit_stmt_owned(out: &mut String, stmt: &IrStmt, indent: usize) {
             target,
         } => {
             let expr = ir_expr_to_perl(value);
-            if let Some(fh) = target {
+            // A print FOLDED out of `echo`/`printf` inherits `emit_echo`'s two
+            // RUNTIME guards. Both are decided while the value is evaluated,
+            // so no fold can prove them away statically — dropping either
+            // changes observable behaviour:
+            //
+            //  * a value marked SH2BADSUBST ABANDONS the print (bash printed
+            //    its expansion diagnostic and ran the command not at all)
+            //    and leaves `$?` = 1;
+            //  * an arithmetic operand that expands EMPTY flips `$__SH2_AE`
+            //    while it is evaluated, and bash then runs NEITHER the
+            //    arithmetic NOR the print, leaving `$?` = 1 —
+            //    `echo $(($1 * 100))` with no args prints nothing
+            //    (parse-dollar-in-arithmetic), where the unguarded form
+            //    printed a coerced 0 and reported success.
+            if target.is_none() && expr.contains("SH2BADSUBST") {
+                emit_indent(out, indent);
+                out.push_str(&rc_write("$main_exit_code = $CHILD_ERROR = 1;\n"));
+            } else if target.is_none() && expr.contains("$__SH2_AE = 1") {
+                // Evaluate into a list FIRST — the flag flips DURING that
+                // evaluation — then print only if it stayed clear. The
+                // trailing `;` after the `do` BLOCK is mandatory: unlike
+                // `if`/`while`, a `do { … }` statement followed by another
+                // statement without one is a perl syntax error (perl 5.38).
+                let arg = if expr.starts_with("glob(") {
+                    "join(' ', @__sh_ae)".to_string()
+                } else {
+                    "$__sh_ae[0]".to_string()
+                };
+                let nl = if *newline { ", \"\\n\"" } else { "" };
+                emit_indent(out, indent);
+                out.push_str("$__SH2_AE = 0;\n");
+                emit_indent(out, indent);
+                out.push_str(&format!(
+                    "do {{ my @__sh_ae = ({}); if ($__SH2_AE) {{{} }} else {{ print({}{});{} }} }};\n",
+                    expr,
+                    rc_write(" $main_exit_code = $CHILD_ERROR = 1;"),
+                    arg,
+                    nl,
+                    rc_write(" $main_exit_code = $CHILD_ERROR = 0;")
+                ));
+            } else if let Some(fh) = target {
                 // Output to a specific filehandle: print {$fh} ...
                 emit_indent(out, indent);
                 if *newline {
@@ -3235,6 +3292,16 @@ fn emit_stmt_owned(out: &mut String, stmt: &IrStmt, indent: usize) {
             out.push_str(";\n");
             emit_indent(out, indent);
             out.push_str("close $__fh;\n");
+            // A file write is a status-0 statement in bash (`echo x > f`;
+            // `echo $?` → 0). Rust's and Java's arms record that status
+            // and the ESTree arm gets it from the runtime's write call —
+            // Perl's `open`/`print`/`close` on a plain filehandle touch
+            // `$!`, NOT `$?`, so without this the register kept its STALE
+            // value (`false; echo x > f; echo $?` printed 1) and the
+            // shared `redirected_output_to_writefile` fold would have
+            // changed observable behaviour on this path alone.
+            emit_indent(out, indent);
+            out.push_str(&rc_write("$main_exit_code = $CHILD_ERROR = 0;\n"));
         }
 
         IrStmt::Assign {
@@ -13711,6 +13778,84 @@ fn sh_cmd_value_expr(cmd: &str) -> Option<String> {
             }
             continue;
         }
+        // A DOUBLE-QUOTED span: keep it verbatim when it carries no
+        // expansion; otherwise splice each expansion's value in and
+        // shell-quote the WHOLE span as one word. `"$d/f1"` must reach
+        // bash as `'value/f1'` — the previous inline splice emitted
+        // `q{… > "} . __sh_q($d) . q{/f1"}`, stranding __sh_q's single
+        // quotes INSIDE the double quotes, so bash redirected to a file
+        // literally named `'/tmp/x'/f1` → ENOENT (complex-command-substitution,
+        // double-paren-subshell, nested-subshell-paren — reached once the
+        // printf fold made stage 1 a producer instead of shell text).
+        if c == '"' {
+            let mut j = i + 1;
+            let close = loop {
+                match chars.get(j) {
+                    None => return None, // unterminated — refuse
+                    Some(&'\\') => j += 2, // escaped char stays inside
+                    Some(&'"') => break j,
+                    Some(_) => j += 1,
+                }
+            };
+            let content: String = chars[i + 1..close].iter().collect();
+            if !content.contains('$') {
+                // No expansion: quotes and content are literal shell text.
+                lit.push('"');
+                lit.push_str(&content);
+                lit.push('"');
+                i = close + 1;
+                continue;
+            }
+            // An expansion is present, so the span must be rebuilt from
+            // value pieces. A backslash escape changes the shell-level
+            // meaning and an unrecognised `$` shape (operator form like
+            // `${x:-y}`, `$(`) is not a value we can produce — refuse the
+            // whole form and let the caller keep the native shell text,
+            // which the child bash expands itself (same as before, when
+            // such shapes were pushed through verbatim).
+            if content.contains('\\') || content.contains('`') {
+                return None;
+            }
+            let cchars: Vec<char> = content.chars().collect();
+            let mut pieces: Vec<String> = Vec::new();
+            let mut clit = String::new();
+            let mut k = 0;
+            while k < cchars.len() {
+                if cchars[k] == '$' && k + 1 < cchars.len() {
+                    let Some((expr, next)) = expansion_at(&cchars, k) else {
+                        return None; // unrecognised `$` shape — keep native
+                    };
+                    // Same refusals as the unquoted path: an array expansion
+                    // is MULTIPLE argv words in bash ("${a[@]}" splits even
+                    // inside quotes), which one __sh_q word cannot express.
+                    if expr.starts_with('@') || expr.starts_with("concat_list(") {
+                        return None;
+                    }
+                    if !clit.is_empty() {
+                        pieces.push(safe_perl_q_string(&clit));
+                        clit.clear();
+                    }
+                    pieces.push(expr);
+                    k = next;
+                    continue;
+                }
+                clit.push(cchars[k]);
+                k += 1;
+            }
+            if pieces.is_empty() {
+                return None;
+            }
+            if !clit.is_empty() {
+                pieces.push(safe_perl_q_string(&clit));
+            }
+            if !lit.is_empty() {
+                parts.push(safe_perl_q_string(&lit));
+                lit.clear();
+            }
+            parts.push(format!("__sh_q({})", pieces.join(" . ")));
+            i = close + 1;
+            continue;
+        }
         if c == '$' && i + 1 < chars.len() {
             if let Some((expr, next)) = expansion_at(&chars, i) {
                 if !lit.is_empty() {
@@ -15619,22 +15764,77 @@ fn pow_wrapping(base: i64, exp: i64) -> i64 {
     acc
 }
 
-/// Constant-fold the neutral arithmetic AST. Only `**` is folded (the other
-/// operators keep their existing paths, and staying narrow keeps the change
-/// reviewable); every other node is rebuilt structurally so a subtree that
-/// is not fully literal keeps its exact shape.
-fn fold_arith_ast(ast: &ArithAst) -> ArithAst {
+/// Fold a fully-literal binary arith node to bash's EXACT int64 answer.
+/// Returns None (keep shape) whenever the answer could differ from what
+/// bash computes at runtime — div/mod by zero, an overflow bash treats as
+/// a runtime error, an out-of-range shift — or whenever the operator is
+/// not one we model byte-for-byte (REFUSE > GUESS).
+fn fold_bin_op(op: &str, a: i64, b: i64) -> Option<i64> {
+    match op {
+        // bash arithmetic is int64 two's-complement — wrap like Rust does.
+        "+" => Some(a.wrapping_add(b)),
+        "-" => Some(a.wrapping_sub(b)),
+        "*" => Some(a.wrapping_mul(b)),
+        // `/` and `%` truncate toward zero (Rust's ops already do), but a
+        // zero divisor is a bash runtime ERROR (value stays unset) and
+        // `i64::MIN / -1` overflows — refuse both rather than invent one.
+        "/" if b != 0 && !(a == i64::MIN && b == -1) => Some(a / b),
+        "%" if b != 0 && !(a == i64::MIN && b == -1) => Some(a % b),
+        // bitwise — always exact on int64.
+        "&" => Some(a & b),
+        "|" => Some(a | b),
+        "^" => Some(a ^ b),
+        // `<<`/`>>`: bash on this platform (x86-64, the equivalence
+        // oracle) masks the shift count mod 64 and wraps the result in
+        // int64 two's-complement — `1 << 63` = i64::MIN, `1 << 64` = 1,
+        // `1 << -1` = i64::MIN, `8 >> 70` = 0 (measured against this
+        // box's bash). Rust's wrapping_shl/shr mask the count to 6 bits
+        // the same way, so the fold is byte-identical to the oracle —
+        // the same precedent pow_wrapping sets for `**`.
+        ">>" => Some(a.wrapping_shr(b as u32)),
+        "<<" => Some(a.wrapping_shl(b as u32)),
+        // arithmetic `&&`/`||` yield 1/0; both operands are literals here,
+        // so short-circuiting cannot skip a side effect.
+        "&&" => Some(((a != 0) && (b != 0)) as i64),
+        "||" => Some(((a != 0) || (b != 0)) as i64),
+        // bash `$((b ** e))` is int64 two's-complement (wraps, never
+        // errors) but a NEGATIVE exponent is a bash runtime ERROR, not a
+        // value — refuse to fold it rather than invent one.
+        "**" if b >= 0 => Some(pow_wrapping(a, b)),
+        _ => None,
+    }
+}
+
+/// Fold a fully-literal unary arith node (see [`fold_bin_op`] for the
+/// refusal discipline). The op vocabulary is the one
+/// `arith_ast_to_perl` renders: `!` `~` `-` `+`.
+fn fold_un_op(op: &str, a: i64) -> Option<i64> {
+    match op {
+        // bash `$((-x))` is two's-complement negation — wraps, no error.
+        "-" => Some(a.wrapping_neg()),
+        "+" => Some(a),
+        // logical not → 1/0; signed not: `~x == -x - 1`.
+        "!" => Some((a == 0) as i64),
+        "~" => Some(!a),
+        _ => None,
+    }
+}
+
+pub(crate) fn fold_arith_ast(ast: &ArithAst) -> ArithAst {
     match ast {
         ArithAst::Bin { op, lhs, rhs } => {
             let l = fold_arith_ast(lhs);
             let r = fold_arith_ast(rhs);
-            if op == "**" {
-                if let (ArithAst::Num(a), ArithAst::Num(b)) = (&l, &r) {
-                    // A negative exponent is a runtime ERROR in bash, not a
-                    // value — refuse to fold it rather than invent one.
-                    if *b >= 0 {
-                        return ArithAst::Num(pow_wrapping(*a, *b));
-                    }
+            // Fully-literal operands fold to a single `Num` so EVERY backend
+            // emits the literal instead of re-deriving the arithmetic at
+            // runtime (`3i64 * 4i64` in Rust, a `__sh_div` polyfill for
+            // `10/2`, `int(a/b)` guards in Perl). REFUSE > GUESS: any op we
+            // cannot evaluate to bash's exact int64 answer (div-by-zero, an
+            // out-of-range shift, an overflow the renderer models
+            // differently) keeps its shape.
+            if let (ArithAst::Num(a), ArithAst::Num(b)) = (&l, &r) {
+                if let Some(v) = fold_bin_op(op, *a, *b) {
+                    return ArithAst::Num(v);
                 }
             }
             ArithAst::Bin {
@@ -15643,10 +15843,19 @@ fn fold_arith_ast(ast: &ArithAst) -> ArithAst {
                 rhs: Box::new(r),
             }
         }
-        ArithAst::Un { op, arg } => ArithAst::Un {
-            op: op.clone(),
-            arg: Box::new(fold_arith_ast(arg)),
-        },
+        ArithAst::Un { op, arg } => {
+            let a = fold_arith_ast(arg);
+            // A fully-literal unary operand folds too (`$((-3))` → -3).
+            if let ArithAst::Num(n) = &a {
+                if let Some(v) = fold_un_op(op, *n) {
+                    return ArithAst::Num(v);
+                }
+            }
+            ArithAst::Un {
+                op: op.clone(),
+                arg: Box::new(a),
+            }
+        }
         ArithAst::Cond { test, then, else_ } => ArithAst::Cond {
             test: Box::new(fold_arith_ast(test)),
             then: Box::new(fold_arith_ast(then)),
@@ -15909,7 +16118,8 @@ mod tests {
     /// as bash computes it (core request c-20261022-224500). Before this the
     /// neutral `ArithAst` was never folded, so `3 * 1000 ** 7` reached the
     /// renderer as a runtime `_sh_pow(...)` call whose overflow arm CLAMPED
-    /// to 0 — a silent wrong number.
+    /// to 0 — a silent wrong number. The general literal fold now takes it
+    /// ALL the way to bash's exact wrapped answer.
     #[test]
     fn literal_pow_folds_with_bash_wrapping() {
         let arith = IrExpr::Arith(Box::new(ArithAst::Bin {
@@ -15924,19 +16134,119 @@ mod tests {
         let IrExpr::Arith(ast) = fold_expr(&arith) else {
             panic!("expected an Arith node");
         };
+        // bash reference values (bash -c 'echo $((3 * 1000 ** k))'):
         // `1000 ** 7` wraps to 3875820019684212736, so the product wraps to
-        // bash's -6819284014656913408.
-        let ArithAst::Bin { op, rhs, .. } = &*ast else {
-            panic!("expected the outer product, got {ast:?}");
-        };
-        assert_eq!(op, "*");
-        assert_eq!(**rhs, ArithAst::Num(3875820019684212736));
-
-        // bash reference values (bash -c 'echo $((3 * 1000 ** k))')
+        // -6819284014656913408 — the whole literal tree folds to it.
+        assert_eq!(
+            *ast, ArithAst::Num(-6819284014656913408),
+            "the whole literal product must fold to bash's wrapped answer"
+        );
         assert_eq!(pow_wrapping(1000, 6), 1_000_000_000_000_000_000);
         assert_eq!(pow_wrapping(1000, 7), 3_875_820_019_684_212_736);
         assert_eq!(pow_wrapping(2, 10), 1024, "the narrow case stays exact");
         assert_eq!(pow_wrapping(7, 0), 1, "x ** 0 == 1, as in bash");
+    }
+
+    /// A fully-literal binary op folds to a single Num so every backend
+    /// emits the literal instead of re-deriving the arithmetic at runtime
+    /// (Rust `3i64 * 4i64`, a `__sh_div` polyfill, Perl `int(a/b)` guards).
+    #[test]
+    fn literal_binop_folds_to_a_single_num() {
+        let fold = |op: &str, a: i64, b: i64| {
+            let arith = IrExpr::Arith(Box::new(ArithAst::Bin {
+                op: op.into(),
+                lhs: Box::new(ArithAst::Num(a)),
+                rhs: Box::new(ArithAst::Num(b)),
+            }));
+            let IrExpr::Arith(ast) = fold_expr(&arith) else {
+                panic!("expected an Arith node");
+            };
+            *ast
+        };
+        assert_eq!(fold("*", 3, 4), ArithAst::Num(12));
+        assert_eq!(fold("+", 2, 5), ArithAst::Num(7));
+        assert_eq!(fold("-", 2, 5), ArithAst::Num(-3));
+        assert_eq!(fold("/", 10, 2), ArithAst::Num(5));
+        assert_eq!(fold("/", -7, 2), ArithAst::Num(-3), "truncates toward zero");
+        assert_eq!(fold("%", 7, 3), ArithAst::Num(1));
+        assert_eq!(fold("<<", 1, 10), ArithAst::Num(1024));
+        assert_eq!(fold(">>", 1024, 3), ArithAst::Num(128));
+        assert_eq!(fold("&", 0b1100, 0b1010), ArithAst::Num(0b1000));
+        assert_eq!(fold("|", 0b1100, 0b1010), ArithAst::Num(0b1110));
+        assert_eq!(fold("^", 0b1100, 0b1010), ArithAst::Num(0b0110));
+        assert_eq!(fold("&&", 3, 0), ArithAst::Num(0));
+        assert_eq!(fold("||", 0, 4), ArithAst::Num(1));
+        // wrapping arithmetic: bash int64 two's-complement
+        assert_eq!(fold("+", i64::MAX, 1), ArithAst::Num(i64::MIN));
+        assert_eq!(fold("*", i64::MAX, 2), ArithAst::Num(-2));
+    }
+
+    /// REFUSE > GUESS: a literal whose runtime answer bash treats as an
+    /// ERROR (zero divisor, the `i64::MIN / -1` overflow) must keep its
+    /// shape — the runtime computes the error (unset value), and a folded
+    /// constant cannot express it. Shifts fold with bash's exact x86-64
+    /// masking (count mod 64, int64 wrapping), measured against this
+    /// box's bash.
+    #[test]
+    fn literal_binop_error_shapes_are_not_folded() {
+        let fold = |op: &str, a: i64, b: i64| {
+            let arith = IrExpr::Arith(Box::new(ArithAst::Bin {
+                op: op.into(),
+                lhs: Box::new(ArithAst::Num(a)),
+                rhs: Box::new(ArithAst::Num(b)),
+            }));
+            let IrExpr::Arith(ast) = fold_expr(&arith) else {
+                panic!("expected an Arith node");
+            };
+            *ast
+        };
+        // div/mod by zero: a bash runtime error, not a value
+        assert!(matches!(fold("/", 1, 0), ArithAst::Bin { .. }));
+        assert!(matches!(fold("%", 1, 0), ArithAst::Bin { .. }));
+        // the signed overflow pair (bash: "expression error")
+        assert!(matches!(fold("/", i64::MIN, -1), ArithAst::Bin { .. }));
+        assert!(matches!(fold("%", i64::MIN, -1), ArithAst::Bin { .. }));
+        // shift counts mask mod 64 and wrap — bash reference values
+        // (bash -c 'echo $((…))'):
+        assert_eq!(fold("<<", 1, 63), ArithAst::Num(i64::MIN));
+        assert_eq!(fold("<<", 1, 64), ArithAst::Num(1), "count masked to 0");
+        assert_eq!(fold("<<", 1, -1), ArithAst::Num(i64::MIN), "count masked to 63");
+        assert_eq!(fold(">>", 8, 70), ArithAst::Num(0), "count masked to 6");
+        assert_eq!(fold(">>", 8, 64), ArithAst::Num(8), "count masked to 0");
+        assert_eq!(fold("<<", -1, 62), ArithAst::Num(-4611686018427387904));
+    }
+
+    /// A fully-literal unary folds too; the error-shaped shifts and the
+    /// two's-complement identities are pinned below.
+    #[test]
+    fn literal_unop_folds_to_a_single_num() {
+        let fold = |op: &str, a: i64| {
+            let arith = IrExpr::Arith(Box::new(ArithAst::Un {
+                op: op.into(),
+                arg: Box::new(ArithAst::Num(a)),
+            }));
+            let IrExpr::Arith(ast) = fold_expr(&arith) else {
+                panic!("expected an Arith node");
+            };
+            *ast
+        };
+        assert_eq!(fold("-", 3), ArithAst::Num(-3));
+        assert_eq!(fold("+", 3), ArithAst::Num(3));
+        assert_eq!(fold("!", 0), ArithAst::Num(1));
+        assert_eq!(fold("!", 7), ArithAst::Num(0));
+        assert_eq!(fold("~", 0), ArithAst::Num(-1), "signed not, as in bash");
+        assert_eq!(fold("~", -1), ArithAst::Num(0));
+        // wrapping negation: bash two's-complement
+        assert_eq!(fold("-", i64::MIN), ArithAst::Num(i64::MIN));
+        // a NON-literal argument keeps its shape
+        let arith = IrExpr::Arith(Box::new(ArithAst::Un {
+            op: "-".into(),
+            arg: Box::new(ArithAst::Var("x".into())),
+        }));
+        let IrExpr::Arith(ast) = fold_expr(&arith) else {
+            panic!("expected an Arith node");
+        };
+        assert!(matches!(&*ast, ArithAst::Un { .. }), "got {ast:?}");
     }
 
     /// A negative exponent is a bash ARITHMETIC ERROR, not a value, so the
@@ -16392,6 +16702,27 @@ mod tests {
         assert!(
             open.contains("__sh_pipe_capture(") && open.contains("__sh_q("),
             "the herestring must still run through the capture seam: {open}"
+        );
+    }
+
+    /// A double-quoted span carrying an expansion must be shell-quoted as
+    /// ONE word: `"$d/f1"` → `__sh_q($d . '/f1')`. The old inline splice
+    /// emitted `q{… > "} . __sh_q($d) . q{/f1"}`, stranding __sh_q's
+    /// single quotes INSIDE the double quotes, so bash redirected to a
+    /// file literally named `'/tmp/x'/f1` → ENOENT (complex-command-substitution,
+    /// double-paren-subshell, nested-subshell-paren — reached once the
+    /// printf fold made pipeline stage 1 a producer instead of shell text).
+    #[test]
+    fn dq_span_with_expansion_is_one_quoted_word() {
+        let value = sh_cmd_value_expr("'gzip' > \"$d/f1\"")
+            .expect("a dq target holding a plain expansion is expressible");
+        assert!(
+            value.contains("__sh_q("),
+            "the span must be shell-quoted as one word: {value}"
+        );
+        assert!(
+            !value.contains("\"} . __sh_q") && !value.contains(") . '/f1\"'"),
+            "no part of the dq span may stay outside the __sh_q word \n  (quotes stranded around it is the ENOENT bug): {value}"
         );
     }
 

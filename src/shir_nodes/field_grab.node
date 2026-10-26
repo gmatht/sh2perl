@@ -1,0 +1,19 @@
+# shir_nodes/field_grab.node — expression-level semantic IR node.
+# `${s%%D*}` evaluated over the TAIL of `text` starting at byte offset
+# `off`: the head field up to the first `delim` at/after `off`, or the
+# whole tail when no `delim` follows `off` (bash leaves the value when
+# the pattern does not match). Emitted by the `str-chop-cursor` transform
+# together with FieldStrip; together they replace the quadratic
+# `x=${s%%D*}; s=${s#*D}` front-chop pair with an O(1) cursor.
+#
+# Backends: C (strchr-at-offset; target-gated offer — other backends
+# accept by adding a render arm and their target to the gate).
+# Fallback: sh2.fieldGrab(text, off, delim)
+
+node FieldGrab
+tag "FieldGrab"
+kind expr
+field text: expr
+field off: expr
+field delim: string
+spec: none (unstated)

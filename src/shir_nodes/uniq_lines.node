@@ -1,0 +1,39 @@
+# shir_nodes/uniq_lines.node — expression-level semantic IR node.
+# Collapse runs of EQUAL ADJACENT lines (`uniq`, `uniq -c`, `uniq -s N`).
+#
+# Small (3 corpus files) but load-bearing: it is half of the canonical
+# word-frequency pipeline `sort | uniq -c | sort -nr`, which no backend
+# could express. With SortLines it makes that pipeline a COMPOSITION of two
+# specified nodes rather than an opaque shell-out.
+#
+# meaning: uniq_lines skip count s == the lines of `s` with every maximal
+#   run of equal lines reduced to one line. `skip` drops the first `skip`
+#   CHARACTERS of each line for the COMPARISON only (what `uniq -s N` does —
+#   the printed line keeps them). `count` prefixes each surviving line with
+#   its run length and a single space, as `uniq -c` prints it.
+#
+# Deliberately NOT covered: `uniq -d` / `-u` (filters, not a value node —
+# they need the run lengths, so they are a later node or a composition),
+# `-f N` (skip FIELDS; needs the IFS question that `sort -t` also raises)
+# and `-i` (case folding, which is locale-sensitive).
+#
+# Backends: Perl List::Util uniq-free run collapse, JS filter, Go slice
+#   walk, Rust dedup_by
+# Fallback: sh2.uniqLines(text, skip, count)
+#
+# Provenance: sh2perl/docs/fm/TextOps/UniqLines.thy
+
+node UniqLines
+tag "UniqLines"
+kind expr
+field text: expr
+# skip: characters ignored at the START of each line when deciding whether
+# two lines are equal (`uniq -s N`). Values beyond a line's length make it
+# compare as the empty suffix, which is what uniq does.
+field skip: int
+# count: prefix each surviving line with its run length and a space
+# (`uniq -c`). The count node is NOT a separate node: it is the same run
+# walk with a different projection, and splitting it would give two nodes
+# the same denotation.
+field count: bool
+spec: TextOps#uniq_lines_sound

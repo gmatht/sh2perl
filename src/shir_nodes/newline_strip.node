@@ -1,0 +1,23 @@
+# shir_nodes/newline_strip.node — expression-level semantic IR node.
+# Remove the trailing newlines of a text (`$(...)` command substitution).
+#
+# Carved out of `RegSub`, which used to express this as the magic pattern
+# `"\n+$"` with `line_mode: false`. A node whose meaning is "apply this
+# regex" should not also mean "and therefore strip trailing newlines"; the
+# pattern was doing a job the denotation did not cover.
+#
+# meaning: newline_strip s == `s` with every trailing '\n' removed. This is
+#   exactly what bash's `$(cmd)` does to cmd's output (POSIX: remove all
+#   trailing newlines, not just one).
+#
+# Backends: Perl s/\n+\z//, JS replace(/\n+$/), Go strings.TrimRight, Rust
+#   trim_end_matches, Zig sh2TrimRightNl
+# Fallback: sh2.newlineStrip(text)
+#
+# Provenance: sh2perl/docs/fm/TextOps/NewlineStrip.thy
+
+node NewlineStrip
+tag "NewlineStrip"
+kind expr
+field text: expr
+spec: TextOps#newline_strip_sound

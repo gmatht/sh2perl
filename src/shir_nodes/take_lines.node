@@ -12,3 +12,4 @@ field text: expr
 field count: expr
 field from_end: bool
 field bytes: bool
+spec: none (unstated)

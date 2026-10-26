@@ -10,3 +10,4 @@ tag "WordCount"
 kind expr
 # storage_class str_bounded
 field text: expr
+spec: TextOps#lowered_wc_sound

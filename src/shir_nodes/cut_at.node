@@ -1,0 +1,35 @@
+# shir_nodes/cut_at.node — expression-level semantic IR node.
+# CutAt: cut `text` at ONE occurrence of `delim` — the four single-star
+# glob-strip identities that are pure find()/rfind() work:
+#
+#   ${v%%lit*}   keep the head BEFORE the first  occurrence  (head,  first)
+#   ${v%lit*}    keep the head BEFORE the last   occurrence  (head,  !first)
+#   ${v#*lit}    keep the tail AFTER  the first  occurrence  (!head, first)
+#   ${v##*lit}   keep the tail AFTER  the last   occurrence  (!head, !first)
+#
+# No match leaves the text unchanged (bash's strip is a no-op when the
+# pattern does not match). `delim` is a magic-free literal (the fold
+# refuses `*`/`?`/`[`/`\` bodies), so the glob engine is never needed —
+# each identity follows from glob semantics: `*` matches the empty
+# string, shortest-vs-longest picks the cut point. Verified against bash
+# (match / no-match / empty-delim / multi-byte literal cases) before the
+# node was written; see transforms/affix_strip_fold.rs's module doc.
+#
+# Emitted by the `affix-strip-fold` transform (the star-form branch; the
+# plain-literal branch keeps using AffixStrip).
+#
+# Backends: Rust (find/rfind + slicing), C (one strstr find + a vbuf
+#   copy — see c_backend's ext_value_c CutAt arm) — target-gated offers;
+#   other backends accept by adding a render arm and their target to the
+#   gate (the FieldGrab offer pattern).
+# Fallback: sh2.cutAt(text, delim, head, first)
+
+node CutAt
+tag "CutAt"
+kind expr
+# storage_class str_bounded
+field text: expr
+field delim: string
+field head: bool
+field first: bool
+spec: none (unstated)

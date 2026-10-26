@@ -292,6 +292,12 @@ fn cond_status_observable(
 /// Rewrite a cond that is a pure `test` chain whose status write is
 /// provably unread. Returns whether anything changed.
 fn rewrite_cond(cond: &mut IrExpr, observable: bool, nc: bool) -> bool {
+    if std::env::var("SH2_TL_DEBUG").is_ok() && observable {
+        eprintln!("[tl] refuse: status observable :: {cond:?}");
+    }
+    if std::env::var("SH2_TL_DEBUG").is_ok() && !crate::shir::is_pure_test_chain(cond) {
+        eprintln!("[tl] refuse: not a pure test chain :: {cond:?}");
+    }
     if observable || !crate::shir::is_pure_test_chain(cond) {
         return false;
     }
@@ -343,11 +349,15 @@ fn rewrite_test_chain(e: &mut IrExpr, nc: bool) -> bool {
 /// shapes, then a two-operand `-a`/`-o` compound of those. The test text
 /// is args[0] (a Str); args[1] is the `[[`/`[` style tag (ignored).
 fn lower_test_leaf(args: &[IrExpr], nc: bool) -> Option<IrExpr> {
-    glob_affix_primitive(args, nc)
+    let r = glob_affix_primitive(args, nc)
         .or_else(|| numeric_compare_primitive(args))
         .or_else(|| nonempty_primitive(args))
         .or_else(|| string_eq_primitive(args, nc))
-        .or_else(|| compound_primitive(args, nc))
+        .or_else(|| compound_primitive(args, nc));
+    if r.is_none() && std::env::var("SH2_TL_DEBUG").is_ok() {
+        eprintln!("[tl] refuse: no arm :: {args:?}");
+    }
+    r
 }
 
 /// `A -a B` / `A -o B` (EXACTLY one top-level connective) →

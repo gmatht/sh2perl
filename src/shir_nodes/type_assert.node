@@ -18,3 +18,4 @@ kind expr
 # storage_class str_bounded
 field expr: expr
 field kind: string
+spec: none (effect: control flow)

@@ -49,16 +49,24 @@
 //!     backend's case render makes the same unwrap, so lowering keeps
 //!     both sides byte-identical);
 //!     a partially-quoted pattern (`a"b`) refuses outright;
-//!   * a discriminant that is not a cheap pure read (`Var`/`Str`/`Int`/
-//!     `Interpolate` over those / nested `Index` of those) — the chain
-//!     reads the subject once PER CONDITION, so an impure subject
-//!     (`$(…)`, `$((…))`) must never be re-evaluated (bash evaluates
-//!     the case word ONCE). bash's runtime-live specials (`RANDOM`,
-//!     `SECONDS`, `LINENO`, `PPID`, … — `shir::is_reserved_var`) refuse
-//!     too: a re-read would observe a FRESH value per condition where
-//!     bash pins one at case entry. An ordinary quoted subject like
-//!     `case "$1" in` (`Interpolate` of pure parts) is the common case
-//!     and lowers;
+//!   * an impure or runtime-live discriminant (`$(…)`, `$((…))`,
+//!     `RANDOM`/`SECONDS`/`LINENO`/`PPID`/… — anything `pure_subject`
+//!     refuses) is bound to a fresh `__sh2_casesubj_N` temp BEFORE the
+//!     chain: bash evaluates the case word ONCE at entry, so one
+//!     pre-chain binding reproduces that exactly — the conds read only
+//!     the temp, no capture re-runs and no special re-draws. The bind
+//!     is TEXT-typed (`bind_init`): a non-text subject (`$((…))`, a
+//!     reserved `Var`) is wrapped in the `Interpolate` that is its
+//!     expansion, because bash's case word is a string — an `Arith`
+//!     init types the temp `Int`, which the C renderer turns into
+//!     `atoll((char*)(<native int>))` (the value read as a pointer →
+//!     SIGSEGV) and a `long long != "pat"` pointer compare. The name
+//!     is probe-checked against the whole statement tree (the same
+//!     Debug-substring conservative probe this pass uses for
+//!     nocasematch), so it cannot collide with a source or transform
+//!     name. A pure subject (`Var`/`Str`/`Int`/`Interpolate` over those
+//!     / nested `Index` of those) skips the bind; `case "$1" in` is the
+//!     common pure case.
 //!   * the program mentioning `nocasematch` anywhere — the same
 //!     conservative whole-program Debug probe test_lowering uses: the
 //!     typed `ne`/primitive compares are case-sensitive while bash's
@@ -86,7 +94,7 @@
 //! unset/`shir` target is the byte-pinned embed/A1-export path (the
 //! split-in-place precedent — never rewrite there).
 
-use crate::ir::{BinOpKind, InterpPart, IrCaseClause, IrExpr, IrStmt, StrStyle};
+use crate::ir::{BinOpKind, Decl, InterpPart, IrCaseClause, IrExpr, IrStmt, StrStyle};
 use crate::shir::{classify_case_pat, is_reserved_var, split_case_alternatives, CasePat};
 
 use super::test_lowering::not_wrap;
@@ -105,6 +113,9 @@ pub fn transform(stmts: &mut Vec<IrStmt>) -> bool {
         return false;
     }
     dbg(&format!("enter target={:?} stmts={}", crate::transforms::target(), stmts.len()));
+    // Fresh-name probe: the whole tree AT ENTRY (see `FRESH`).
+    let probe = format!("{stmts:?}");
+    FRESH.with(|f| *f.borrow_mut() = (probe, 0));
     let mut changed = false;
     walk(stmts, &mut changed);
     changed
@@ -120,6 +131,31 @@ fn dbg(msg: &str) {
 fn no(reason: &str) -> Option<IrStmt> {
     dbg(reason);
     None
+}
+
+/// Fresh temp names for impure-subject binding: `(probe, next_index)`.
+/// Reset at every `transform()` entry with the whole statement tree
+/// Debug-formatted, so the probe both guards against any pre-existing
+/// source/transform name AND — on a re-run — against names this pass
+/// allocated earlier (they are in the tree by then).
+thread_local! {
+    static FRESH: std::cell::RefCell<(String, usize)> =
+        std::cell::RefCell::new((String::new(), 0));
+}
+
+/// The next `__sh2_casesubj_N` not mentioned anywhere in the probe.
+/// The counter never repeats within a run; the probe skips taken names.
+fn fresh_subject_name() -> String {
+    FRESH.with(|f| {
+        let mut st = f.borrow_mut();
+        loop {
+            let cand = format!("__sh2_casesubj_{}", st.1);
+            st.1 += 1;
+            if !st.0.contains(&cand) {
+                return cand;
+            }
+        }
+    })
 }
 
 /// In-place walk: find every `Case` (nested in any statement container
@@ -231,9 +267,29 @@ fn lower_case(disc: &IrExpr, clauses: &[IrCaseClause]) -> Option<IrStmt> {
     if clauses.is_empty() {
         return no("empty clauses");
     }
-    if !pure_subject(disc) {
-        return no(&format!("impure subject: {disc:?}"));
+    // A subject `pure_subject` refuses is bound to a fresh temp BEFORE
+    // the chain (module docs): bash evaluates the case word ONCE at
+    // entry — one pre-chain binding reproduces that exactly, where the
+    // per-condition reads the pure path relies on would re-run a
+    // capture or re-draw a runtime-live special. Conds read the temp.
+    let bind;
+    let bound_disc;
+    if pure_subject(disc) {
+        bind = None;
+        bound_disc = disc.clone();
+    } else {
+        let name = fresh_subject_name();
+        bind = Some(IrStmt::Declare {
+            vars: vec![Decl {
+                name: name.clone(),
+                sigil: None,
+            }],
+            init: Some(bind_init(disc)),
+            local: false,
+        });
+        bound_disc = IrExpr::Var(name, None);
     }
+    let disc = &bound_disc;
     let mut chain: Vec<(IrExpr, Vec<IrStmt>)> = Vec::new();
     let mut else_body: Option<Vec<IrStmt>> = None;
     for cl in clauses {
@@ -298,12 +354,16 @@ fn lower_case(disc: &IrExpr, clauses: &[IrCaseClause]) -> Option<IrStmt> {
     let (cond, then) = chain.first()?.clone();
     dbg(&format!("LOWERS subject={disc:?} clauses={} conds={}", clauses.len(), chain.len()));
     let elsifs = chain.into_iter().skip(1).collect();
-    Some(IrStmt::If {
+    let if_stmt = IrStmt::If {
         cond,
         then,
         elsifs,
         else_: else_body.unwrap_or_default(),
-    })
+    };
+    match bind {
+        Some(decl) => Some(IrStmt::Block(vec![decl, if_stmt])),
+        None => Some(if_stmt),
+    }
 }
 
 /// Classify ONE pattern alternative for the lowering. Quote-aware on
@@ -339,6 +399,25 @@ fn classify_pattern(raw: &str) -> Option<CasePat> {
         return None;
     }
     classify_case_pat(raw)
+}
+
+/// The bind's init: TEXT-shaped subjects bind verbatim, everything
+/// else is wrapped in the `Interpolate` that is its expansion
+/// (`$((…))` → `"$((…))"`, `$RANDOM` → `"$RANDOM"`). bash's case word
+/// is a STRING, so the temp must stay text-typed on every backend:
+/// an `Arith` init types it `Int`, and the C renderer then wraps the
+/// native integer init in `atoll((char*)(…))` — the VALUE read as a
+/// pointer (the MIMEcroft demo's `atoll(0x1)` SIGSEGV) — and renders
+/// each cond as `long long != "pat"`, a pointer compare where a
+/// strcmp belongs (`str_cmp_valued` refuses an Int-typed temp, so the
+/// string-compare arm is never taken). `Capture`/`Interpolate`/`Str`
+/// already render as text everywhere (and the
+/// `impure_discriminant_binds_once` test pins the Capture shape).
+fn bind_init(disc: &IrExpr) -> IrExpr {
+    match disc {
+        IrExpr::Str(..) | IrExpr::Interpolate(..) | IrExpr::Capture { .. } => disc.clone(),
+        other => IrExpr::Interpolate(vec![InterpPart::Expr(Box::new(other.clone()))]),
+    }
 }
 
 /// `Not(disc ne lit)` — exact string equality (see module docs).
@@ -474,10 +553,13 @@ mod tests {
         assert!(format!("{cond:?}").contains("start"), "{cond:?}");
     }
 
-    /// …and a volatile special refuses through getVar too — `RANDOM`
-    /// re-reads would draw fresh values per condition.
+    /// …and a volatile special BINDS once through getVar — `RANDOM`
+    /// draws a single fresh value into the temp at chain entry, exactly
+    /// the one value bash pins at case entry (the old refusal kept the
+    /// backend's own render, which some backends re-read per clause; a
+    /// temp is strictly closer to bash).
     #[test]
-    fn getvar_reserved_name_refuses() {
+    fn getvar_reserved_name_binds_once() {
         let stmt = IrStmt::Case {
             discriminant: IrExpr::Call {
                 func: "getVar".to_string(),
@@ -488,7 +570,17 @@ mod tests {
                 body: vec![IrStmt::Break],
             }],
         };
-        assert!(lower(stmt).is_none(), "RANDOM through getVar must refuse");
+        let IrStmt::Block(stmts) = lower(stmt).expect("RANDOM must lower via a binding")
+        else {
+            panic!("expected Block[Declare, If]");
+        };
+        assert_eq!(stmts.len(), 2, "{stmts:?}");
+        assert!(
+            matches!(&stmts[0], IrStmt::Declare { init: Some(_), .. }),
+            "bind first: {:?}",
+            stmts[0]
+        );
+        assert!(matches!(&stmts[1], IrStmt::If { .. }), "chain second");
     }
 
     #[test]
@@ -662,7 +754,7 @@ mod tests {
     }
 
     #[test]
-    fn impure_discriminant_refuses() {
+    fn impure_discriminant_binds_once() {
         let stmt = IrStmt::Case {
             discriminant: IrExpr::Capture {
                 expr: Box::new(IrExpr::Str("cmd".into(), StrStyle::DoubleQuoted)),
@@ -673,7 +765,90 @@ mod tests {
                 body: vec![IrStmt::Break],
             }],
         };
-        assert!(lower(stmt).is_none(), "the subject must not be re-read per condition");
+        let IrStmt::Block(stmts) = lower(stmt).expect("capture subject binds and lowers")
+        else {
+            panic!("expected Block[Declare, If]");
+        };
+        assert_eq!(stmts.len(), 2, "{stmts:?}");
+        assert!(
+            matches!(&stmts[0], IrStmt::Declare { init: Some(IrExpr::Capture { .. }), .. }),
+            "temp binds the capture: {:?}",
+            stmts[0]
+        );
+        let IrStmt::If { cond, .. } = &stmts[1] else {
+            panic!("second stmt is the chain")
+        };
+        let c = format!("{cond:?}");
+        assert!(c.contains("__sh2_casesubj_"), "cond reads the temp: {c}");
+        assert!(!c.contains("Capture"), "capture must not repeat per condition: {c}");
+    }
+
+    /// An `Arith` subject (`case $((frame % 200)) in`) must bind its
+    /// TEXT form: the temp stays string-typed, so every backend's
+    /// string conds (strcmp/fnmatch/regex) apply. Binding the bare
+    /// `Arith` types the temp `Int` and the C render emits
+    /// `atoll((char*)(<native int>))` — the value read as a pointer —
+    /// plus `long long != "pat"` pointer compares (the MIMEcroft demo
+    /// SIGSEGV this fixes).
+    #[test]
+    fn arith_subject_binds_text_form() {
+        use crate::ir::ArithAst;
+        let stmt = IrStmt::Case {
+            discriminant: IrExpr::Arith(Box::new(ArithAst::Bin {
+                op: "%".into(),
+                lhs: Box::new(ArithAst::Var("frame".into())),
+                rhs: Box::new(ArithAst::Num(200)),
+            })),
+            clauses: vec![IrCaseClause {
+                patterns: vec!["25".into()],
+                body: vec![IrStmt::Break],
+            }],
+        };
+        let IrStmt::Block(stmts) = lower(stmt).expect("arith subject binds and lowers")
+        else {
+            panic!("expected Block[Declare, If]");
+        };
+        let IrStmt::Declare { init: Some(init), .. } = &stmts[0] else {
+            panic!("bind first: {:?}", stmts[0])
+        };
+        assert!(
+            matches!(init, IrExpr::Interpolate(_)),
+            "text-form bind (not the bare Arith): {init:?}"
+        );
+    }
+
+    /// A name already in the tree (`__sh2_casesubj_0`) is probe-skipped
+    /// — the bind allocates the next free index instead.
+    #[test]
+    fn fresh_name_skips_probe_collisions() {
+        let mut stmts = vec![
+            IrStmt::Declare {
+                vars: vec![Decl {
+                    name: "__sh2_casesubj_0".into(),
+                    sigil: None,
+                }],
+                init: None,
+                local: false,
+            },
+            IrStmt::Case {
+                discriminant: IrExpr::Capture {
+                    expr: Box::new(IrExpr::Str("cmd".into(), StrStyle::DoubleQuoted)),
+                    native: false,
+                },
+                clauses: vec![IrCaseClause {
+                    patterns: vec!["a".into()],
+                    body: vec![IrStmt::Break],
+                }],
+            },
+        ];
+        assert!(transform(&mut stmts));
+        let IrStmt::Block(inner) = &stmts[1] else {
+            panic!("case lowered to a Block")
+        };
+        let IrStmt::Declare { vars, .. } = &inner[0] else {
+            panic!("bind first: {inner:?}")
+        };
+        assert_eq!(vars[0].name, "__sh2_casesubj_1", "probe skips the taken name");
     }
 
     #[test]
@@ -721,7 +896,7 @@ mod tests {
     }
 
     #[test]
-    fn quoted_positional_subject_lowers_but_volatile_refuses() {
+    fn quoted_positional_subject_lowers_volatile_binds() {
         // `case "$1" in …` — Interpolate over a pure Var: the DOMINANT
         // subject shape; must lower.
         let stmt = IrStmt::Case {
@@ -734,8 +909,9 @@ mod tests {
             }],
         };
         assert!(lower(stmt).is_some(), "\"$1\" subject must lower");
-        // `case $RANDOM in` — a runtime-live special: every condition
-        // would draw a FRESH value where bash pins one at entry.
+        // `case $RANDOM in` — a runtime-live special: the chain binds
+        // it ONCE into the temp (the single value bash pins at entry)
+        // instead of re-drawing per condition.
         for subj in [
             IrExpr::Var("RANDOM".into(), None),
             IrExpr::Interpolate(vec![InterpPart::Expr(Box::new(IrExpr::Var(
@@ -750,7 +926,16 @@ mod tests {
                     body: vec![IrStmt::Break],
                 }],
             };
-            assert!(lower(stmt).is_none(), "volatile subject must refuse");
+            let IrStmt::Block(stmts) = lower(stmt).expect("volatile subject binds")
+            else {
+                panic!("expected Block[Declare, If]")
+            };
+            assert!(
+                matches!(&stmts[0], IrStmt::Declare { init: Some(_), .. }),
+                "bind first: {:?}",
+                stmts[0]
+            );
+            assert!(matches!(&stmts[1], IrStmt::If { .. }), "chain second");
         }
     }
 

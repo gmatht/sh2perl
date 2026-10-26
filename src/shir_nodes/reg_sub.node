@@ -13,3 +13,4 @@ field pattern: string
 field replacement: string
 field global: bool
 field line_mode: bool
+spec: none (unstated)

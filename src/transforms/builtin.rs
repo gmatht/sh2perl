@@ -23,15 +23,25 @@
 
 use crate::ir::{ArithAst, IrExpr, IrStmt};
 
-/// The shared builtins namespace — harness/builtins.json (69 entries).
+/// The shared builtins namespace — harness/builtins.json (75 entries).
+///
+/// This list must cover EVERY harness/builtins.json name: the workspace
+/// checker (harness/check_qx_shir.py) reads that file and flags any
+/// surviving `exec` of a listed name as a transform gap — the drift is
+/// exactly what turned the core worker's A1 gate red on 2026-10-25
+/// (id/od/realpath were in the JSON + A4 sync list but never added here,
+/// so `realpath-cmdsub` kept 4 raw execs). The embedded table stays a
+/// verbatim copy: the submodule is self-contained; harness/builtins.json
+/// in the workspace is the same contract copy.
 pub const BUILTINS: &[&str] = &[
     ".", ":", "basename", "break", "cd", "cmp", "comm", "command", "continue", "cp", "cut",
     "date", "declare", "diff", "dirname", "echo", "egrep", "eval", "exit", "export", "false",
-    "find", "grep", "gunzip", "gzip", "head", "hostname", "let", "local", "ls", "mapfile",
-    "mkdir", "mv", "paste", "printf", "pwd", "read", "readarray", "readlink", "readonly",
-    "return", "rm", "rmdir", "sed", "seq", "set", "sha256sum", "sha512sum", "shift", "sleep",
-    "sort", "source", "stat", "tail", "tee", "touch", "tr", "trap", "true", "type", "typeset",
-    "uname", "uniq", "unset", "wait", "wc", "which", "whoami", "xargs",
+    "find", "grep", "gunzip", "gzip", "head", "hostname", "id", "let", "ln", "local", "ls",
+    "mapfile", "mkdir", "mv", "od", "panic", "paste", "printf", "pwd", "read", "readarray",
+    "readlink", "readonly", "realpath", "return", "rm", "rmdir", "sed", "seq", "set",
+    "sha256sum", "sha512sum", "shift", "sleep", "sort", "source", "stat", "tail", "tee",
+    "touch", "tr", "trap", "true", "tty", "type", "typeset", "uname", "uniq", "unset",
+    "wait", "wc", "which", "whoami", "xargs",
 ];
 
 /// Is `cmd` in the shared builtins namespace?

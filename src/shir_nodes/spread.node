@@ -17,3 +17,4 @@ tag "Spread"
 kind expr
 # storage_class str_bounded
 field expr: expr
+spec: none (effect: control flow)

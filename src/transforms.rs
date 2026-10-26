@@ -71,6 +71,17 @@ pub fn transform_applies(name: &str) -> bool {
                     "c" | "js" | "estree" | "perl" | "go" | "rs" | "rust" | "zig" | "java" | "python" | "sh" | "glsl" | "glslv"
                 ),
                 "text-ops" => crate::transforms::planner::emits_renderable_nodes(&t),
+                // str-chop-cursor EMITS FieldGrab/FieldStrip — C renders
+                // them today; a backend accepts the offer by adding the
+                // two render arms and its target here (§11 marketplace;
+                // split-in-place's Ext(Split) precedent).
+                "str-chop-cursor" => matches!(t.as_str(), "c"),
+                // str-splice-fold EMITS StrSplice — C's capacity-guarded
+                // store arm consumes it today (same §11 offer).
+                "str-splice-fold" => matches!(t.as_str(), "c"),
+                // not-identity-flip: rust only (the Perl Eq/Ne
+                // asymmetry — not_identity's module doc).
+                "not-identity-flip" => matches!(t.as_str(), "rs" | "rust"),
                 _ => !matches!(
                     (name, t.as_str()),
                     ("text-ops-planner", "sh" | "zsh" | "fish" | "glsl" | "glslv" | "shir")
@@ -117,6 +128,29 @@ pub fn transform_applies(name: &str) -> bool {
         // PENDING note this replaces; target gating is the fbdev-gpu-calls
         // precedent that resolves the regressing test).
         "split-in-place" => matches!(target().as_deref(), Some("c")),
+        // str-chop-cursor: the front-chop pair → one O(1) cursor, emitting
+        // the shared FieldGrab/FieldStrip nodes. Only the C renderer has
+        // the two arms today (text-ops/split-in-place precedent — the
+        // core declines to emit nodes the target cannot consume).
+        "str-chop-cursor" => matches!(target().as_deref(), Some("c")),
+        // str-splice-fold: the two-slice Interpolate → the shared
+        // StrSplice node (the per-pixel row splice in MIMEcroft's
+        // rasterizer). Only the C renderer has the value + capacity-
+        // guarded store arms today (str-chop-cursor precedent — a backend
+        // accepts the §11 offer by adding its arms and its name here).
+        "str-splice-fold" => matches!(target().as_deref(), Some("c")),
+        // not-identity-flip: the ¬(a OP b) → flipped-OP rewrite, only
+        // where the renderer's operator pairs are EXACT complements.
+        // Verified rust: `==`/`!=`, `<`/`>=`, and the `Ne(X,"")`
+        // empty-string idiom `!({X}).is_empty()` (whose double wrap was
+        // the measured 12-file `!(!(` residue). Perl renders Eq as
+        // NUMERIC `==` and Ne as STRING `ne` — flipping there turned a
+        // correct `!(x ne "")` into a wrong `x == ""` (4 corpus
+        // regressions: double-equals-in-test, test-expr-true,
+        // heredoc-binary-data, tty-cmdsub). Refuse > guess: other
+        // targets keep their Not until their pairs are verified.
+        // Unset target (the byte-pinned embed/A1 path) does not run it.
+        "not-identity-flip" => matches!(target().as_deref(), Some("rs" | "rust")),
         // case-lowering: the shared Case→if/elif string-test lowering.
         // Code-generating backends only — the shell-family targets
         // (sh/zsh/fish) render `case…esac` natively and idiomatically,
@@ -145,10 +179,15 @@ pub fn transform_applies(name: &str) -> bool {
 pub mod arith_forms;
 pub mod typeset_attrs; // `typeset -i VAR` integer attribute → later assignments become arith()
 pub mod arith_identity; // OFFER (core-requests/transforms/offered/arith-identity)
+pub mod not_identity; // not-identity: fold double negation `!(!x)` → `x` (duplicated-consistent Nots only)
+pub mod const_str_cmp_fold; // const-str-cmp-fold: literal-vs-literal Eq/Ne → Bool (glob-metachar-free RHS only)
 pub mod arith_normalize; // frontend-shape normalisation (`0 - X` → `-X`); run by ingress, not the env-gated registry
 pub mod array_len_fold; // OFFER core-requests/transforms/offered/array-len-fold.rs: `${#arr[@]}` → arrayLen(arr)
 pub mod slice_identity; // OFFER core-requests/transforms/offered/slice-identity.rs: `${v:0}`/`${v:}` → the plain read param("", v)
+pub mod default_empty_fold; // OFFER: `${v:-}`/`${v-}` (empty default) → the plain read param("", v); retires the per-backend "value or default" conditional
 pub mod affix_strip_fold; // OFFER: magic-free literal `${v#lit}`/`${v%lit}` → the shared AffixStrip node (retires the glob/regex strip helper on rust/go/java)
+pub mod str_chop_cursor; // OFFER: front-chop `${s%%D*}`/`${s#*D}` series → shared FieldGrab/FieldStrip cursor nodes (C-target until others accept)
+pub mod str_splice_fold; // OFFER: the `${b:0:$o}${repl}${b:$k}` two-slice Interpolate → the shared StrSplice node (C-target: capacity-guarded fused store until others accept)
 pub mod builtin;
 pub mod inline_pure_fns; // marketplace offer (estree-20260813-182431) // core-requests/shir-builtin-op: exec(cmd∈builtins) → the native `builtin` op
 pub mod isolate_accumulate; // loop-private temp inlining (single-accumulate isolation)
@@ -243,6 +282,23 @@ pub fn all() -> Vec<(&'static str, TransformFn)> {
         // the --shir export and the A1 ingress (frontend-emitted JSON).
         ("process-subst", process_subst::transform),
         ("arith-forms", arith_forms::transform),
+        // arith-identity: identities on NON-literal operands
+        // (`$((x+0))` → `x`). Domain-gated inside (int_domain): the
+        // full shell-integer rules when the source is the bash family
+        // or unset (the shell pipeline), the pinned float-exact subset
+        // otherwise; operand-eliminating rules are never folded (see
+        // the module doc).
+        ("arith-identity", arith_identity::transform),
+        // not-identity: `!(!x)` → `x` — the composed Not wraps the
+        // parser/test-lowering layers leave behind (rust/js/c/perl all
+        // render the nesting verbatim; 11 corpus files). Before
+        // const-condition-elim so the flattened cond feeds it.
+        ("not-identity", not_identity::transform),
+        // not-identity-flip: the comparison flip half, TARGET-GATED to
+        // rust in `transform_applies` — Perl's Eq renders numeric `==`
+        // while Ne renders string `ne`, so the flip would invert
+        // operand semantics there (not_identity's module doc).
+        ("not-identity-flip", not_identity::transform_flip),
         ("array-len-fold", array_len_fold::transform), // `${#arr[@]}` slice spelling → the contract's arrayLen node
         // `${v:0}` / `${v:0:}` / `${v:}` is the WHOLE parameter — the offset
         // form reads the same value. Fold the zero-offset empty-length
@@ -252,12 +308,56 @@ pub fn all() -> Vec<(&'static str, TransformFn)> {
         // offsets, any length (incl. "0"), and every indexed/positional/
         // indirect/array-list spelling are untouched.
         ("slice-identity", slice_identity::transform),
+        // `${v:-}` / `${v-}` with an EMPTY default IS `${v}` for any
+        // value of v — the "value or default" conditional is a no-op, so
+        // every backend retires that branch (`if v.is_empty(){""}else{v}`
+        // in Rust, the equivalent in Perl/JS/C/Go/Java/Zig/Python/Fish).
+        // Nounset-safe: an unset-but-declared var holds "" and both forms
+        // read it; a truly unknown name makes BOTH forms an unbound-variable
+        // error, so the plain read is the same verdict. REFUSE > GUESS:
+        // nounset set, non-plain names (arr[@], !p, #n, positional…),
+        // non-empty defaults.
+        ("default-empty-fold", default_empty_fold::transform),
+        // str-chop-cursor: the `${s%%D*}`/`${s#*D}` front-chop series →
+        // one absolute-offset cursor (shared FieldGrab/FieldStrip nodes,
+        // O(1) per chop instead of re-scanning the consumed prefix — the
+        // MIMEcroft demo's ~6.8 GB of strchr traffic). Runs EARLY so the
+        // later analyses (copy-propagation, dead-store-elim, …) see the
+        // new shape; target-gated in transform_applies (C only until a
+        // backend adds its render arms), SH2_NO_STR_CHOP_CURSOR=1 for
+        // the A/B perf gates.
+        //
+        // ORDER vs affix-strip-fold (measured): must run BEFORE it. The
+        // fold's CutAt matches the same front-chop shapes and, running
+        // first, stole every assignment-chain series from the cursor —
+        // the fused `_sh_sset_field` store (find once, copy the field
+        // with its known length) degraded to a two-step vbuf copy: +22%
+        // instructions on the demo (8.907B → 10.880B, 5-run median).
+        // The cursor takes the series it can fuse; the fold then folds
+        // the LEFTOVER `param(...)` calls (isolated reads, refused
+        // candidates) to CutAt, retiring their fnmatch strip helper.
+        ("str-chop-cursor", str_chop_cursor::transform),
         // `${v#lit}` / `${v%lit}` with a MAGIC-FREE LITERAL pattern: a
         // literal matches exactly once, so shortest ≡ longest and the
         // strip removes at most one leading/trailing occurrence — the
         // shared AffixStrip node. rust/go/java retire their glob/regex
         // helper for it; other targets refuse (target-gated).
+        // Star forms (`lit*`/`*lit`) → CutAt; runs AFTER str-chop-cursor
+        // (order note above) — the cursor's Ext output is invisible to
+        // this pass's `param(...)` match, so consumed shapes are simply
+        // never seen here.
         ("affix-strip-fold", affix_strip_fold::transform),
+        // str-splice-fold: `${b:0:$o}${repl}${b:$k}` (same-base slices,
+        // prefix from 0, suffix to end) → ONE StrSplice node so the C
+        // renderer can write the splice straight into the destination
+        // buffer (capacity-guarded) instead of shuttling it through
+        // 2 substring temps + a join + the store copy. Target-gated in
+        // transform_applies (C only until a backend adds its arms);
+        // SH2_NO_SPLICE=1 for the A/B perf gate. Runs here — after the
+        // affix/chop folds that share the same var and before
+        // copy-propagation/dead-store-elim, which then see ONE Ext expr
+        // (its children() expose the slices for the walkers).
+        ("str-splice-fold", str_splice_fold::transform),
         // `typeset -i VAR` marks VAR integer for the rest of the scope, so
         // later `VAR=EXPR` assignments must evaluate EXPR as arithmetic.
         // Bash semantics shared by every backend, so it lives in the shared
@@ -324,6 +424,23 @@ pub fn all() -> Vec<(&'static str, TransformFn)> {
         // later passes (const-condition-elim, else-if-flatten, …) then
         // clean up the chain like any other If.
         ("case-lowering", case_lowering::transform),
+        // not-identity, SECOND registration: test-lowering and
+        // case-lowering run above the first one and mint new
+        // `Not(Ne)` pairs via not_wrap (`-z X` → `Not(X ne "")`),
+        // which every renderer then double-wraps (`!(!(X).is_empty())`
+        // in rust — the measured 12-file `!(!(` residue). The early
+        // registration feeds const-condition-elim; this late one folds
+        // what the lowering layers produced. Pure, idempotent, same
+        // SH2_TRANSFORMS gate for both entries.
+        ("not-identity", not_identity::transform),
+        ("not-identity-flip", not_identity::transform_flip),
+        // const-str-cmp-fold: a comparison whose BOTH operands are
+        // frozen literals is decidable now — fold to Bool so rust's
+        // `const_cond_truth` drops the dead branch at render and the
+        // other backends emit a literal `if (0)`. Runs here (after
+        // case-lowering) because that is where the literal-subject
+        // `Eq` chains appear — `apply()` walks the list exactly once.
+        ("const-str-cmp-fold", const_str_cmp_fold::transform),
         // else-if flattening: `else { if c { … } }` → `elsifs`. Purely
         // structural; run before the backends so every renderer sees the
         // chain in the one shape it already handles.
@@ -473,5 +590,34 @@ mod tests {
         assert!(!transform_applies("split-in-place"));
         set_target(None);
         assert!(!transform_applies("split-in-place"));
+    }
+
+    #[test]
+    fn str_chop_cursor_gated_to_c_only() {
+        // The FieldGrab/FieldStrip render arms exist only in c_backend;
+        // every other backend accepts the offer by extending this gate.
+        set_target(Some("c"));
+        assert!(transform_applies("str-chop-cursor"));
+        set_target(Some("perl"));
+        assert!(!transform_applies("str-chop-cursor"));
+        set_target(Some("estree"));
+        assert!(!transform_applies("str-chop-cursor"));
+        set_target(None);
+        assert!(!transform_applies("str-chop-cursor"));
+    }
+
+    #[test]
+    fn str_splice_fold_gated_to_c_only() {
+        // The StrSplice value + capacity-guarded store arms exist only in
+        // c_backend; the unset target is the byte-pinned embed/A1-export
+        // path and must skip (str-chop-cursor precedent).
+        set_target(Some("c"));
+        assert!(transform_applies("str-splice-fold"));
+        set_target(Some("perl"));
+        assert!(!transform_applies("str-splice-fold"));
+        set_target(Some("estree"));
+        assert!(!transform_applies("str-splice-fold"));
+        set_target(None);
+        assert!(!transform_applies("str-splice-fold"));
     }
 }

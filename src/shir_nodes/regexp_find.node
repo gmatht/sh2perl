@@ -17,3 +17,4 @@ kind expr
 # storage_class str_bounded
 field text: expr
 field pattern: expr
+spec: none (unstated)

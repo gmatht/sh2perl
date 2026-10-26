@@ -1,0 +1,35 @@
+# shir_nodes/field_strip_end.node — expression-level semantic IR node.
+# The cursor advance behind a CASE-GUARDED front-chop:
+#
+#   case $s in
+#     *"D"*) x=${s%%D*}; s=${s#*D} ;;   # hit  → head field + advance
+#     *)     x=$s;        s=""      ;;   # miss → tail, then DRAIN
+#   esac
+#
+# `FieldStrip` deliberately does NOT move the cursor on a miss (bash's
+# `${s#*D}` is a no-op when the pattern does not match), but the guarded
+# pair's fallback arm does something stronger: it EMPTIES `s`, so every
+# later read of the field yields "". FieldStripEnd encodes exactly that:
+# the ABSOLUTE byte offset just past the first `delim` at/after `off`,
+# or the END of `text` when no `delim` follows it (drain). Draining is
+# what makes dropping the guard sound — a grab from the end reads ""
+# exactly like a grab of the emptied string, so the whole `case`
+# collapses to the two cursor statements with no per-chop fnmatch over
+# the row.
+#
+# The result is a decimal STRING (the same channel every shell scalar
+# number travels), consumed by the companion FieldGrab reads of the same
+# cursor var. Emitted by `str-chop-cursor` only for a recognized guard.
+#
+# Backends: C (strchr-at-offset + strlen-on-miss; target-gated offer —
+#   other backends accept by adding a render arm and their target to
+#   the gate, the FieldStrip offer pattern).
+# Fallback: sh2.fieldStripEnd(text, off, delim)
+
+node FieldStripEnd
+tag "FieldStripEnd"
+kind expr
+field text: expr
+field off: expr
+field delim: string
+spec: none (unstated)
