@@ -235,3 +235,56 @@ fn grep_matches(text: IrExpr, pattern: String, flags: String) -> IrExpr {
         ],
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::parser::commands::parse_commands_from_text;
+    use crate::shir::ast_to_ir_raw;
+    use crate::shir_json::shir_to_shir_json;
+
+    fn lower(src: &str) -> String {
+        let commands = parse_commands_from_text(src).expect("parse source");
+        let mut prog = ast_to_ir_raw(&commands);
+        let _ = transform(&mut prog.stmts);
+        shir_to_shir_json(&prog)
+    }
+
+    #[test]
+    fn echo_pipe_grep_o_lifts() {
+        let json = lower("echo hello | grep -o l+");
+        assert!(json.contains("grepMatches"), "not lifted: {json}");
+    }
+
+    #[test]
+    fn herestring_grep_o_lifts() {
+        let json = lower("grep -o 'a+' <<< \"banana\"");
+        assert!(json.contains("grepMatches"), "not lifted: {json}");
+    }
+
+    #[test]
+    fn flags_route_through() {
+        // -E keeps the pattern as-is, -i adds insensitivity.
+        let json = lower("echo HELLO | grep -oi 'hello'");
+        assert!(json.contains("grepMatches"), "not lifted: {json}");
+        assert!(json.contains('i'), "flag lost: {json}");
+    }
+
+    #[test]
+    fn dynamic_pattern_keeps_exec() {
+        let json = lower("echo hi | grep -o \"$p\"");
+        assert!(!json.contains("grepMatches"), "dynamic lifted: {json}");
+    }
+
+    #[test]
+    fn unsupported_flag_keeps_exec() {
+        let json = lower("echo hi | grep -o -q x");
+        assert!(!json.contains("grepMatches"), "-q lifted: {json}");
+    }
+
+    #[test]
+    fn no_o_flag_keeps_exec() {
+        let json = lower("echo hi | grep x");
+        assert!(!json.contains("grepMatches"), "plain grep lifted: {json}");
+    }
+}

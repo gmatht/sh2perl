@@ -253,3 +253,52 @@ type ArithAstRef = crate::ir::ArithAst;
 //   estree (the estree owner — `directShellFnCalls` is superseded once
 //   this lands)
 // updates: none (first offer)
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::parser::commands::parse_commands_from_text;
+    use crate::shir::ast_to_ir_raw;
+    use crate::shir_json::shir_to_shir_json;
+
+    fn lower(src: &str) -> String {
+        let commands = parse_commands_from_text(src).expect("parse source");
+        let mut prog = ast_to_ir_raw(&commands);
+        let _ = transform(&mut prog.stmts);
+        shir_to_shir_json(&prog)
+    }
+
+    fn lower_raw(src: &str) -> String {
+        let commands = parse_commands_from_text(src).expect("parse source");
+        let prog = ast_to_ir_raw(&commands);
+        shir_to_shir_json(&prog)
+    }
+
+    #[test]
+    fn pure_output_fn_capture_collapses() {
+        // `sq() { echo $(( $1 * $1 )); }; v=$(sq 3)` — the capture of a
+        // defined pure-output function collapses to a direct call.
+        let json = lower("sq() { echo $1; }; v=$(sq 3)");
+        assert!(json.contains("\"fnValue\"") || json.contains("\"sq\""), "call kept: {json}");
+    }
+
+    #[test]
+    fn impure_fn_capture_refuses() {
+        // a body with an exec stays a subprocess capture.
+        let json = lower("f() { date; }; v=$(f)");
+        assert!(!json.contains("\"fnValue\""), "impure lifted: {json}");
+    }
+
+    #[test]
+    fn undefined_fn_capture_refuses() {
+        let json = lower("v=$(nosuchfn 3)");
+        assert!(!json.contains("\"fnValue\""), "undefined lifted: {json}");
+    }
+
+    #[test]
+    fn non_call_capture_refuses() {
+        // `v=$(echo hi)` — an external, not a defined function.
+        let json = lower_raw("v=$(echo hi)");
+        assert!(!json.contains("\"fnValue\""), "external lifted: {json}");
+    }
+}

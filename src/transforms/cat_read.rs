@@ -169,3 +169,57 @@ fn output_line(line_var: &str) -> IrStmt {
         target: None,
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::parser::commands::parse_commands_from_text;
+    use crate::shir::ast_to_ir_raw;
+    use crate::shir_json::shir_to_shir_json;
+
+    fn lower(src: &str) -> String {
+        let commands = parse_commands_from_text(src).expect("parse source");
+        let mut prog = ast_to_ir_raw(&commands);
+        let _ = transform(&mut prog.stmts);
+        shir_to_shir_json(&prog)
+    }
+
+    #[test]
+    fn plain_cat_lifts_to_foreach_line() {
+        let json = lower("cat /tmp/f");
+        assert!(json.contains("ForEachLine"), "cat not lifted: {json}");
+        assert!(!json.contains("\"cat\""), "cat exec survived: {json}");
+    }
+
+    #[test]
+    fn numbered_cat_lifts_with_counter() {
+        let json = lower("cat -n /tmp/f");
+        assert!(json.contains("ForEachLine"), "cat -n not lifted: {json}");
+        assert!(json.contains("printf"), "numbered body missing printf: {json}");
+    }
+
+    #[test]
+    fn multi_file_chains_in_order() {
+        let json = lower("cat /tmp/a /tmp/b");
+        let n = json.matches("ForEachLine").count();
+        assert!(n >= 2, "expected chained lifts, got {n}: {json}");
+    }
+
+    #[test]
+    fn dynamic_source_keeps_exec() {
+        let json = lower("cat \"$f\"");
+        assert!(!json.contains("ForEachLine"), "dynamic lifted: {json}");
+    }
+
+    #[test]
+    fn bare_cat_reads_stdin_keeps_exec() {
+        let json = lower("cat");
+        assert!(!json.contains("ForEachLine"), "bare cat lifted: {json}");
+    }
+
+    #[test]
+    fn unsupported_flag_keeps_exec() {
+        let json = lower("cat -v /tmp/f");
+        assert!(!json.contains("ForEachLine"), "-v lifted: {json}");
+    }
+}
