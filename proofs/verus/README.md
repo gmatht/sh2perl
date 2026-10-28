@@ -1273,3 +1273,179 @@ at **9 verified, 0 errors**.
 ## Running it
 
 Same toolchain as the P6/P7/P8 files (`--rlimit 40`).
+
+---
+
+## P12 — `escape_classes.rs`, `f32_narrow.rs` (VERDICT analyses)
+
+The first two models aimed at an ANALYSIS-ONLY pass whose output is a
+`static Mutex` verdict table a RENDERER reads, rather than at a
+rewriting. They take the `function_purity` shape (P4): the theorem
+quantifies over the table the analysis would produce, and proves the
+consumer's use of it sound.
+
+### `escape_classes.rs` — 14 obligations
+
+```
+    verus --triggers-mode silent --rlimit 40 escape_classes.rs
+    -> verification results:: 14 verified, 0 errors
+```
+
+**What is proved.** `escape_classes.rs` builds a reference census
+(`scopes` : name → the set of function scopes it appears in;
+`dynkey` : names indexed by a non-literal key; `whole` : whole-array
+positions) and classifies in pass 2. The model states `class_of` as
+that classification verbatim over an interned census (`c[n]` = the
+number of distinct scopes) and proves the two directions the C
+consumer (`c_backend.rs:9929`, `acc_idents`) needs:
+
+- `local_is_plain` / `local_sound`: a **Local** verdict implies the name
+  carries **no** dynamic-key mark and **no** whole-array mark — so a
+  native binding for it cannot be defeated by an indexed access, because
+  there is none in the program.
+- `marked_not_local` (+`_whole`) and `multi_scope_store`: any mark at
+  all, or a reference from two scopes, forbids Local — the verdict is
+  not vacuous.
+- `pin_acc_ok_matches_consumer`: the model's acceptance predicate equals
+  the C arm `Local || (store_ok && Store)` read off the class, so the
+  theorem is about the decision the renderer actually makes.
+- `pin_local_accepted_without_store_ok`: the Local arm needs **no**
+  `store_ok` premise — which is why the `eval`/`source`/`${!name}` blob
+  gates only the Store arm.
+
+Six fidelity pins record the census→class shapes (plain scalar ⇒ Local,
+`arr[$i]` ⇒ Store / StoreArray, literal-key array ⇒ NativeArray, two
+scopes ⇒ Store). UNMIRRORED — analysis-only source, no unit suite
+(recorded, not claimed).
+
+**It can fail (checked).** Dropping the multi-scope arm of `class_of`
+(a `Local` verdict for a name referenced from two scopes) reports
+**11 verified, 2 errors**. Restored and re-checked at **14 verified,
+0 errors**.
+
+**Scope.** The census is a PARAMETER: the theorem is about the
+classification given the three sets, not about the census walk
+recomputing them — the walk's fidelity is the guard list in the sync
+manifest (`multi-scope criterion`, `dynkey mark (assign target)`,
+`dynkey mark (Index)`, both consumer arms in `c_backend.rs`).
+String-keyed indirection (`$name`, `eval`) is outside the census by
+construction and is the C `store_ok` blob's job, not modelled here.
+Firing: the verdict fires on 1 of 563 corpus files (measured with
+`SH2_DBG_ACC=1` over `--target c`, 2026-10-28: 1 candidate line) —
+the analysis is narrow by construction (every array, `local`, or
+cross-scope name is refused), so the proof's value is the decision
+rule, not corpus coverage. Coverage sync registered
+(`verus-sync-coverage.sh:escape_classes`).
+
+### `f32_narrow.rs` — 8 obligations
+
+```
+    verus --triggers-mode silent --rlimit 40 f32_narrow.rs
+    -> verification results:: 8 verified, 0 errors
+```
+
+**What is proved.** The verdict (`is_f32_var`, consumed by the C
+renderer's `float` home and the estree `Math.fround` lowering) rests
+on the exactness-preserving form table in `combine`'s non-literal arm.
+The model states the lattice (`FVal { dom, exact, has_cval, cval }`),
+`operand_exact` (Float ⇒ `exact`; Int ⇒ the `cval` round-trip;
+Unknown ⇒ never) and `form_ok` verbatim, and pins:
+
+- `pin_mod_refused`: `%`/`//`/`**` are never accepted (the table
+  enumerates only `+`,`-`,`*`,`/`).
+- `pin_general_mul_not_form` / `pin_mul_one_form`: a general `*` of two
+  exact floats is REFUSED (the `4097.0 * 4097.0 = 16785409` hazard,
+  which f32 rounds to 16785408) while `*±1` is accepted.
+- `pin_lit_pair_contract`: an accepted literal fold carries the
+  round-trip contract (`f32_exact` of the folded value), not an
+  accident of the operand rule.
+- `pin_var_lattice` / `pin_unknown_not_exact` / `pin_int_operand_uses_roundtrip`:
+  the four lattice states and the two operand rules, including
+  `16777217`-style ints refusing.
+- `zero_exact`: `*±0` is accepted only because zero itself round-trips.
+
+UNMIRRORED — analysis-only source, no unit suite (recorded).
+
+**It can fail (checked).** Dropping the `*` arm from `form_ok` (the
+exactness-preserving product rule) reports **7 verified, 1 error**
+(`pin_mul_one_form`). Restored and re-checked at **8 verified, 0 errors**.
+
+**Scope.** The model is a `real`-valued abstraction: `f32_round` is
+uninterpreted with the idempotence law `f32_exact` spells, and
+`fold_val` is uninterpreted (the `py_fmod`/floor semantics are out of
+scope — the caller's contract is the round-trip, which is what is
+stated). The whole-program at-risk FIXPOINT (dropping candidates whose
+inexact op may execute in f32) is not modelled step-by-step; the model
+states its premise as the lattice-level rule it preserves
+(`cand_subset`: candidates are only removed). Firing: on shell input
+the verdict set is EMPTY by construction (`f32_narrow.rs` header: shell
+A1 has no float-domain defs) — the proof is for the Python-frontend
+consumer. Coverage sync registered (`verus-sync-coverage.sh:f32_narrow`).
+
+### Not attempted from the same batch (recorded, not proved)
+
+- `background_decide` — process/exec classification is **Tier-3** by the
+  standing rule (`docs/transform-verification.md`, VERUS.md §(d)
+  "Explicitly deprioritized"): no bash-semantics model exists to state
+  the obligation against.
+- `sync_ok_loops` — criterion 1 ("~200 ms confidence") is a wall-clock
+  heuristic with no bash fact to prove; criterion 2 (no observable
+  output) is a pure predicate but its verdict only selects a rendering
+  strategy, so the Tier-1 obligation is "the chosen form preserves the
+  output order", i.e. preservation of the run — out of Tier 1.
+- `type_query` — the eval-time rewrite's obligation is
+  "the answer equals what `type` would print", which needs bash's
+  function-definition state at the splice point; the transform re-runs
+  after `perl_generator_fixed::fixups`, which Tier-1 does not model.
+
+---
+
+## C-generator `cstr` escaper — `c_str_lit.rs` (19 obligations)
+
+```
+    verus --triggers-mode silent --rlimit 40 c_str_lit.rs
+    -> verification results:: 19 verified, 0 errors
+```
+
+**What is proved.** Standalone model of the C backend's STRING-LITERAL
+ESCAPER — `cstr` (`src/c_backend.rs:10732`), the single funnel for every
+emitted C string literal (178 call sites incl. heredoc bodies AND the
+printf FORMAT string built by `heredoc_body_c`). Models the C lexer as a
+finite-state machine over one char per step (`run` + `flush`) and proves
+the round trip:
+
+- `round_trip` — THE OBLIGATION: `decode(emit(s), Normal) ==
+  Some(bytes_of(s))` for every valid source string — the bytes the C
+  compiler puts in the program are exactly the bytes bash would have
+  seen;
+- `decode_char` — the per-char bridge: `decode(emit_char(c) ++ b) ==
+  pre(byte_of(c), decode(b))`, the locality property that is exactly
+  what the hex spelling fails;
+- `oct3_value` — `fold_digits(oct3(v), 8) == v` for `v ≤ 255` (the
+  `{:03o}` spelling is value-exact);
+- pins: the measured literal texts (`\001a`, `\0019`, `\0017` digit
+  followers, named escapes, marker `\263` for byte 0xAB).
+
+**It can fail (checked).** The SHIPPED-HEX DIVERGENCE pins are the
+negative control: `decode` of the OLD `\xNN` spelling gives the MEASURED
+wrong values — `emit_old([1,'a'])` decodes to `Some([26])` not `[1,97]`
+(t1), `[1,'9']` to `Some([25])` (t5), and `[1,'A','B','C']` to `None`
+(the out-of-range arm, t7). Each is an `assert(... != ...)`-style pin
+against `bytes_of`, so reintroducing the hex spelling fails loudly.
+
+**Scope.** Domain `valid_c`: ASCII (≤ 127) or marker (U+F800..F8FF); NUL
+round-trips at this level but bash values are NUL-free anyway. NOT
+modelled: non-ASCII Unicode re-encoding (raw passthrough is
+byte-identity under UTF-8); `read_source`'s marker DECODING (input side);
+the atoll numeric fold's separate unescape; printf `%` semantics
+(`%` doubling lives in `heredoc_body_c`, upstream of `cstr`); compiler
+source-charset assumptions (UTF-8 default). Unknown escapes are refused
+(fail-closed: `cstr` never emits one). Gate-registered
+(`c_str_lit.rs:19:40`). The `c_*` models are C-generator emission
+decisions, not shIR→shIR passes, so they carry no
+`verus-sync-coverage.sh` baseline — their living tie is the pin↔probe
+mapping, as in `C_UB_PROOF.md`.
+
+## Running it
+
+Same toolchain as the P6/P7/P8 files (`--rlimit 40`).
