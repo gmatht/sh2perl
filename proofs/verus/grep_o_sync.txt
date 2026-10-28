@@ -1,0 +1,36 @@
+# verus-sync-coverage manifest: grep_o
+# source sha: grep_o=5a2be787ec1b  proof sha: 1406e21d69d6
+
+[pins]
+pin pin_bad_flag_refuses -> test unsupported_flag_keeps_exec: MAPPED
+pin pin_dynamic_refuses -> test dynamic_pattern_keeps_exec: MAPPED
+pin pin_flags_route -> test flags_route_through: MAPPED
+pin pin_herestring_lifts -> test herestring_grep_o_lifts: MAPPED
+pin pin_match_output_shape -> UNMIRRORED (by design — see VERUS.md §(b).4)
+pin pin_no_o_refuses -> test no_o_flag_keeps_exec: MAPPED
+pin pin_pipe_lifts -> test echo_pipe_grep_o_lifts: MAPPED
+
+[guards]
+guard argv parse: PRESENT
+guard matches op: PRESENT
+
+[counts]
+proof-fns: 8
+pins: 7
+# NOTE: proof-fns is a file-shape fact (change detector), NOT the
+# Verus obligation count — the gate asserts N verified separately.
+
+[exec]
+# Each MAPPED test above, EXECUTED against the live source (one
+# module-suite run per model; per-test verdicts grepped from output).
+# A mapped test that fails or vanishes from the run is drift — FATAL.
+# The checker RUNS each mapped test (one module-suite cargo test per
+# source file) and records the per-test PASS/FAIL verdict below.
+# all suites built; per-test verdicts below
+exec pin_bad_flag_refuses (unsupported_flag_keeps_exec): PASS
+exec pin_dynamic_refuses (dynamic_pattern_keeps_exec): PASS
+exec pin_flags_route (flags_route_through): PASS
+exec pin_herestring_lifts (herestring_grep_o_lifts): PASS
+exec pin_match_output_shape: UNMIRRORED (not executed)
+exec pin_no_o_refuses (no_o_flag_keeps_exec): PASS
+exec pin_pipe_lifts (echo_pipe_grep_o_lifts): PASS

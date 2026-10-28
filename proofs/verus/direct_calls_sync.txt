@@ -1,0 +1,32 @@
+# verus-sync-coverage manifest: direct_calls
+# source sha: direct_calls=7932f20b828a  proof sha: 18103711fe00
+
+[pins]
+pin pin_external_refuses -> test non_call_capture_refuses: MAPPED
+pin pin_impure_refuses -> test impure_fn_capture_refuses: MAPPED
+pin pin_pure_output_collapses -> test pure_output_fn_capture_collapses: MAPPED
+pin pin_undefined_refuses -> test undefined_fn_capture_refuses: MAPPED
+pin pin_value_preserved -> UNMIRRORED (by design — see VERUS.md §(b).4)
+
+[guards]
+guard call extraction: PRESENT
+guard pure-function gate: PRESENT
+
+[counts]
+proof-fns: 6
+pins: 5
+# NOTE: proof-fns is a file-shape fact (change detector), NOT the
+# Verus obligation count — the gate asserts N verified separately.
+
+[exec]
+# Each MAPPED test above, EXECUTED against the live source (one
+# module-suite run per model; per-test verdicts grepped from output).
+# A mapped test that fails or vanishes from the run is drift — FATAL.
+# The checker RUNS each mapped test (one module-suite cargo test per
+# source file) and records the per-test PASS/FAIL verdict below.
+# all suites built; per-test verdicts below
+exec pin_external_refuses (non_call_capture_refuses): PASS
+exec pin_impure_refuses (impure_fn_capture_refuses): PASS
+exec pin_pure_output_collapses (pure_output_fn_capture_collapses): PASS
+exec pin_undefined_refuses (undefined_fn_capture_refuses): PASS
+exec pin_value_preserved: UNMIRRORED (not executed)
