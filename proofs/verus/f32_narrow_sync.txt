@@ -1,0 +1,42 @@
+# verus-sync-coverage manifest: f32_narrow
+# source sha: f32_narrow=9fd0af2daa0d  proof sha: 7bbd44091f51
+
+[pins]
+pin pin_general_mul_not_form -> UNMIRRORED (by design — see VERUS.md §(b).4)
+pin pin_int_operand_uses_roundtrip -> UNMIRRORED (by design — see VERUS.md §(b).4)
+pin pin_lit_pair_contract -> UNMIRRORED (by design — see VERUS.md §(b).4)
+pin pin_mod_refused -> UNMIRRORED (by design — see VERUS.md §(b).4)
+pin pin_mul_one_form -> UNMIRRORED (by design — see VERUS.md §(b).4)
+pin pin_unknown_not_exact -> UNMIRRORED (by design — see VERUS.md §(b).4)
+pin pin_var_lattice -> UNMIRRORED (by design — see VERUS.md §(b).4)
+
+[guards]
+guard f32_exact round-trip: PRESENT
+guard form +0/-0: PRESENT
+guard form *±1/*±0: PRESENT
+guard form /±1: PRESENT
+guard form -0: PRESENT
+guard operand_exact int round-trip: PRESENT
+guard is_f32_var hook: PRESENT
+guard C consumer f32 arm: PRESENT
+
+[counts]
+proof-fns: 7
+pins: 7
+# NOTE: proof-fns is a file-shape fact (change detector), NOT the
+# Verus obligation count — the gate asserts N verified separately.
+
+[exec]
+# Each MAPPED test above, EXECUTED against the live source (one
+# module-suite run per model; per-test verdicts grepped from output).
+# A mapped test that fails or vanishes from the run is drift — FATAL.
+# The checker RUNS each mapped test (one module-suite cargo test per
+# source file) and records the per-test PASS/FAIL verdict below.
+# all suites built; per-test verdicts below
+exec pin_general_mul_not_form: UNMIRRORED (not executed)
+exec pin_int_operand_uses_roundtrip: UNMIRRORED (not executed)
+exec pin_lit_pair_contract: UNMIRRORED (not executed)
+exec pin_mod_refused: UNMIRRORED (not executed)
+exec pin_mul_one_form: UNMIRRORED (not executed)
+exec pin_unknown_not_exact: UNMIRRORED (not executed)
+exec pin_var_lattice: UNMIRRORED (not executed)

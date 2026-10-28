@@ -1,0 +1,42 @@
+# verus-sync-coverage manifest: escape_classes
+# source sha: escape_classes=b1298e8ba779  proof sha: 95fdc0ba09c7
+
+[pins]
+pin pin_acc_ok_matches_consumer -> UNMIRRORED (by design — see VERUS.md §(b).4)
+pin pin_dynamic_key_store -> UNMIRRORED (by design — see VERUS.md §(b).4)
+pin pin_dynamic_key_store_array -> UNMIRRORED (by design — see VERUS.md §(b).4)
+pin pin_local_accepted_without_store_ok -> UNMIRRORED (by design — see VERUS.md §(b).4)
+pin pin_native_array -> UNMIRRORED (by design — see VERUS.md §(b).4)
+pin pin_plain_scalar_local -> UNMIRRORED (by design — see VERUS.md §(b).4)
+pin pin_two_scopes_store -> UNMIRRORED (by design — see VERUS.md §(b).4)
+
+[guards]
+guard multi-scope criterion: PRESENT
+guard class EscapeClass::StoreArray: PRESENT
+guard class EscapeClass::NativeArray: PRESENT
+guard class EscapeClass::Local: PRESENT
+guard dynkey mark (assign target): PRESENT
+guard dynkey mark (Index): PRESENT
+guard C consumer Local arm: PRESENT
+guard C consumer Store arm: PRESENT
+
+[counts]
+proof-fns: 13
+pins: 7
+# NOTE: proof-fns is a file-shape fact (change detector), NOT the
+# Verus obligation count — the gate asserts N verified separately.
+
+[exec]
+# Each MAPPED test above, EXECUTED against the live source (one
+# module-suite run per model; per-test verdicts grepped from output).
+# A mapped test that fails or vanishes from the run is drift — FATAL.
+# The checker RUNS each mapped test (one module-suite cargo test per
+# source file) and records the per-test PASS/FAIL verdict below.
+# all suites built; per-test verdicts below
+exec pin_acc_ok_matches_consumer: UNMIRRORED (not executed)
+exec pin_dynamic_key_store: UNMIRRORED (not executed)
+exec pin_dynamic_key_store_array: UNMIRRORED (not executed)
+exec pin_local_accepted_without_store_ok: UNMIRRORED (not executed)
+exec pin_native_array: UNMIRRORED (not executed)
+exec pin_plain_scalar_local: UNMIRRORED (not executed)
+exec pin_two_scopes_store: UNMIRRORED (not executed)
