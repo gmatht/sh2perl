@@ -1446,6 +1446,84 @@ decisions, not shIR→shIR passes, so they carry no
 `verus-sync-coverage.sh` baseline — their living tie is the pin↔probe
 mapping, as in `C_UB_PROOF.md`.
 
+---
+
+## Store-forward sweep — `append_store.rs` (20), `split_set.rs` (14), `echo_return.rs` (13)
+
+Three per-rewrite Tier-1 models over the store-forwarding transforms,
+each with its guards as oracle premises, its pins mapped to the
+source's unit tests, and a checked failing mutant (gate-registered
+`append_store.rs:20:40`, `split_set.rs:14:40`, `echo_return.rs:13:40`;
+coverage syncs registered for all three).
+
+### `append_store.rs` — 20 obligations
+
+```
+    verus --triggers-mode silent --rlimit 40 append_store.rs
+    -> verification results:: 20 verified, 0 errors
+```
+
+**What is proved.** Standalone model of the counted-loop rewrite
+`a = setArrayAppend(a, [v])` -> indexed store `a[i] = v` (the loop
+counter). `trip_sound` (rewriting the append at trip k with array
+length k preserves the store), `loop_sound_shift`/`loop_sound`
+(whole-loop induction under the guard-verdict oracles), `run_loop_len`
+(length invariant), `run_loop_snoc` (the snoc-run composition the
+induction steps through). The census walks (`collect`,
+`const_int_vars`, `literal_bound`, `zero_init_of`, `counted_forinit`,
+`escapes`) and the traversal are PARAMETERS — exactly as
+`array_len_fold` takes `is_plain_ident` as oracle.
+
+Ten fidelity pins mirror the 7 unit tests (the passing verdict shares
+a pin with the rewrite; the runtime-agreement check is
+model-internal): counted-loop rewrite, all-guards-pass, unknown-bound
+(two-appends/nonempty-init/other-write/break/step2 refusals), plus
+the multi-element structural refusal (no `Trip` for it — the 1:1 gate
+in `appended_value`). Mutant (no-other-write premise dropped) red at
+18v/2e. Executed tests 8/8 PASS in the committed sync baseline.
+
+### `split_set.rs` — 14 obligations
+
+```
+    verus --triggers-mode silent --rlimit 40 split_set.rs
+    -> verification results:: 14 verified, 0 errors
+```
+
+**What is proved.** `isSmallInt` routing partition soundness:
+`partition_sound` (membership agreement between routed and unsplit
+runs, via the `contains_push`/`insert_contains` lemmas) and
+`merge_agrees` (the `sortedJoinMerge` consumer sees the same
+membership). The append-only census and the `SH2_SPLIT_SETS` gate are
+PARAMETERS; the two-loop iteration follow-up is out of scope
+(deferred in the source too).
+
+Six pins mirror the 4 unit tests (dedup shares the split pin; the
+runtime agreement is model-internal). Mutant (routing gate dropped —
+big values to the small partition) red at 12v/2e. Executed tests 5/5
+PASS in the committed sync baseline.
+
+### `echo_return.rs` — 13 obligations
+
+```
+    verus --triggers-mode silent --rlimit 40 echo_return.rs
+    -> verification results:: 13 verified, 0 errors
+```
+
+**What is proved.** Passes 2–4 under an eligible-set parameter: the
+body echo -> Return and the call-site `echo(fnValue(...))` preserve
+(print-bytes, status) at statement, capture, and pipeline-last-stage
+positions (`stmt_sound`, `capture_sound`, `last_stage_sound`,
+`body_total`). Pass 1 (the SCC fixpoint over `shir_passes::scc`) and
+pass 4 (case-pattern capture hoisting) are PARAMETERS — the SCC
+soundness lands with the verdict-analyses sweep.
+
+Eight pins mirror the 6 unit tests (the wrapped-print check shares
+the lift pin) plus the bare-shape negative control
+(`pin_bare_is_not_echo`: an unwrapped fnValue prints nothing —
+observably not the echo). Mutant (bare fnValue at statement
+position) red at 10v/3e. Executed tests 7/7 PASS in the committed
+sync baseline.
+
 ## Running it
 
 Same toolchain as the P6/P7/P8 files (`--rlimit 40`).
