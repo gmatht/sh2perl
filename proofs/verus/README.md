@@ -1708,6 +1708,59 @@ param-slot sound. Mutant (text-observed marked) red at 8v/2e.
 Executed tests 4/4 PASS + 2 UNMIRRORED in the committed sync
 baseline.
 
+---
+
+## String/cursor sweep — `str_splice_fold.rs` (11), `str_chop_cursor.rs` (17)
+
+Two per-rewrite Tier-1 models over the string/cursor transforms (the
+third family member, `interp_fold`, was proved in the P6 sweep).
+Each carries its gate/shape premises, its pins mapped to the
+source's unit tests, and a checked failing mutant (gate-registered
+with the counts below; coverage syncs registered for both).
+
+### `str_splice_fold.rs` — 11 obligations
+
+```
+    verus --triggers-mode silent --rlimit 40 str_splice_fold.rs
+    -> verification results:: 11 verified, 0 errors
+```
+
+**What is proved.** The `StrSplice` denotation identity:
+`splice_den == concat_den` under one clamping rule (the
+`_sh_substr` clamping both spellings share), with the fold-gate
+conjunction as premises (2+ parts, Expr ends, slice reads, same
+plain-ident base, prefix offset 0, suffix to end) plus the
+join-unwrap and the repl middle. Traversal, kill switch, and the C
+target-gate are placement PARAMETERS.
+
+Nine pins mirror the 8 unit tests (the value identity is
+model-internal): splice folds, idempotent, bases must match, prefix
+zero, suffix open, ident base, kill switch, reaches functions.
+Mutant (gates dropped) red at 9v/2e. Executed tests 8/8 PASS in the
+committed sync baseline (all suites built live).
+
+### `str_chop_cursor.rs` — 17 obligations
+
+```
+    verus --triggers-mode silent --rlimit 40 str_chop_cursor.rs
+    -> verification results:: 17 verified, 0 errors, 0 warnings
+```
+
+**What is proved.** Cursor dynamics over `Seq<char>`: `grab_sound`
+(head-field identity), `strip_advances` (strict advance past the
+delimiter — never replays a field), `init_sound` (cursor 0 reads the
+whole head; empty reads empty like the shell default). The five
+read-law premises (init window, reads, region, program-wide, pairs)
+as oracles; window scans, Edits plan, guard/drain arms, and the C
+render arms out of scope.
+
+Eleven pins mirror the 11 unit tests 1:1 (series converts, window
+tolerates append, array base refuses, init survives, late read
+refuses, mid-window write refuses, init placement, numeric refuses,
+needs pair, cursor name, C gate). Mutant (cursor lands ON the
+delimiter) red at 16v/1e. Executed tests 11/11 PASS in the committed
+sync baseline.
+
 ## Running it
 
 Same toolchain as the P6/P7/P8 files (`--rlimit 40`).
