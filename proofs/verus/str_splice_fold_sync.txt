@@ -1,0 +1,41 @@
+# verus-sync-coverage manifest: str_splice_fold
+# source sha: str_splice_fold=e23b0864e5f4  proof sha: 8c9ea9fbc2f9
+
+[pins]
+pin pin_bases_must_match -> test refuses_different_bases: MAPPED
+pin pin_idempotent -> test two_slice_interpolate_is_idempotent_after_folding: MAPPED
+pin pin_ident_base -> test refuses_non_identifier_base: MAPPED
+pin pin_kill_switch -> test kill_switch_disables_the_fold: MAPPED
+pin pin_prefix_zero -> test refuses_prefix_not_starting_at_zero: MAPPED
+pin pin_reaches_functions -> test reaches_function_bodies: MAPPED
+pin pin_splice_folds -> test folds_the_mimecroft_splice_shape: MAPPED
+pin pin_suffix_open -> test refuses_bounded_suffix: MAPPED
+pin pin_value_identity -> UNMIRRORED (by design — see VERUS.md §(b).4)
+
+[guards]
+guard fold fn: PRESENT
+guard slice reader: PRESENT
+guard splice node: PRESENT
+
+[counts]
+proof-fns: 10
+pins: 9
+# NOTE: proof-fns is a file-shape fact (change detector), NOT the
+# Verus obligation count — the gate asserts N verified separately.
+
+[exec]
+# Each MAPPED test above, EXECUTED against the live source (one
+# module-suite run per model; per-test verdicts grepped from output).
+# A mapped test that fails or vanishes from the run is drift — FATAL.
+# The checker RUNS each mapped test (one module-suite cargo test per
+# source file) and records the per-test PASS/FAIL verdict below.
+# all suites built; per-test verdicts below
+exec pin_bases_must_match (refuses_different_bases): PASS
+exec pin_idempotent (two_slice_interpolate_is_idempotent_after_folding): PASS
+exec pin_ident_base (refuses_non_identifier_base): PASS
+exec pin_kill_switch (kill_switch_disables_the_fold): PASS
+exec pin_prefix_zero (refuses_prefix_not_starting_at_zero): PASS
+exec pin_reaches_functions (reaches_function_bodies): PASS
+exec pin_splice_folds (folds_the_mimecroft_splice_shape): PASS
+exec pin_suffix_open (refuses_bounded_suffix): PASS
+exec pin_value_identity: UNMIRRORED (not executed)

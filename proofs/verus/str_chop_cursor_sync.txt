@@ -1,0 +1,45 @@
+# verus-sync-coverage manifest: str_chop_cursor
+# source sha: str_chop_cursor=2cfc7d7a1bc8  proof sha: 0e3b96c3ac8c
+
+[pins]
+pin pin_array_base_refuses -> test refuses_when_s_is_an_appended_array: MAPPED
+pin pin_c_gate -> test gate_requires_c_target: MAPPED
+pin pin_cursor_name -> test off_name_avoids_collision: MAPPED
+pin pin_init_placement -> test refuses_init_inside_use_loop: MAPPED
+pin pin_init_survives -> test cursor_init_survives_full_registry: MAPPED
+pin pin_late_read_refuses -> test refuses_when_s_read_after_chops: MAPPED
+pin pin_mid_window_write_refuses -> test refuses_write_inside_window: MAPPED
+pin pin_needs_pair -> test refuses_without_strip_partner: MAPPED
+pin pin_numeric_refuses -> test refuses_numeric_target: MAPPED
+pin pin_series_converts -> test fires_on_front_chop_loop: MAPPED
+pin pin_window_tolerates_append -> test fires_with_array_append_in_window: MAPPED
+
+[guards]
+guard edits plan: PRESENT
+guard grab node: PRESENT
+guard strip node: PRESENT
+
+[counts]
+proof-fns: 14
+pins: 11
+# NOTE: proof-fns is a file-shape fact (change detector), NOT the
+# Verus obligation count — the gate asserts N verified separately.
+
+[exec]
+# Each MAPPED test above, EXECUTED against the live source (one
+# module-suite run per model; per-test verdicts grepped from output).
+# A mapped test that fails or vanishes from the run is drift — FATAL.
+# The checker RUNS each mapped test (one module-suite cargo test per
+# source file) and records the per-test PASS/FAIL verdict below.
+# all suites built; per-test verdicts below
+exec pin_array_base_refuses (refuses_when_s_is_an_appended_array): PASS
+exec pin_c_gate (gate_requires_c_target): PASS
+exec pin_cursor_name (off_name_avoids_collision): PASS
+exec pin_init_placement (refuses_init_inside_use_loop): PASS
+exec pin_init_survives (cursor_init_survives_full_registry): PASS
+exec pin_late_read_refuses (refuses_when_s_read_after_chops): PASS
+exec pin_mid_window_write_refuses (refuses_write_inside_window): PASS
+exec pin_needs_pair (refuses_without_strip_partner): PASS
+exec pin_numeric_refuses (refuses_numeric_target): PASS
+exec pin_series_converts (fires_on_front_chop_loop): PASS
+exec pin_window_tolerates_append (fires_with_array_append_in_window): PASS
