@@ -1,0 +1,40 @@
+# verus-sync-coverage manifest: counted_while_forinit
+# source sha: counted_while_forinit=4308a4459399  proof sha: a41102c5a409
+
+[pins]
+pin pin_arith_step_folds -> test arith_wrapped_step_folds: MAPPED
+pin pin_binop_step_folds -> test binop_step_still_folds: MAPPED
+pin pin_body_write_refuses -> test body_write_refuses: MAPPED
+pin pin_declare_refuses -> test declare_in_body_refuses: MAPPED
+pin pin_dynamic_step_refuses -> test dynamic_arith_step_refuses: MAPPED
+pin pin_plain_while_untouched -> test plain_while_is_untouched: MAPPED
+pin pin_step_gate_load_bearing -> UNMIRRORED (by design — see VERUS.md §(b).4)
+pin pin_trace_agrees -> UNMIRRORED (by design — see VERUS.md §(b).4)
+pin pin_zero_step_refuses -> test zero_arith_step_refuses: MAPPED
+
+[guards]
+guard counter step: PRESENT
+guard no-write veto: PRESENT
+guard no-status veto: PRESENT
+
+[counts]
+proof-fns: 11
+pins: 9
+# NOTE: proof-fns is a file-shape fact (change detector), NOT the
+# Verus obligation count — the gate asserts N verified separately.
+
+[exec]
+# Each MAPPED test above, EXECUTED against the live source (one
+# module-suite run per model; per-test verdicts grepped from output).
+# A mapped test that fails or vanishes from the run is drift — FATAL.
+# The checker RUNS each mapped test (one module-suite cargo test per
+# source file) and records the per-test PASS/FAIL verdict below.
+exec pin_arith_step_folds: PASS (test arith_wrapped_step_folds)
+exec pin_binop_step_folds: PASS (test binop_step_still_folds)
+exec pin_body_write_refuses: PASS (test body_write_refuses)
+exec pin_declare_refuses: PASS (test declare_in_body_refuses)
+exec pin_dynamic_step_refuses: PASS (test dynamic_arith_step_refuses)
+exec pin_plain_while_untouched: PASS (test plain_while_is_untouched)
+exec pin_step_gate_load_bearing: UNMIRRORED (not executed)
+exec pin_trace_agrees: UNMIRRORED (not executed)
+exec pin_zero_step_refuses: PASS (test zero_arith_step_refuses)

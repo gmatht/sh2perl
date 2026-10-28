@@ -1,0 +1,47 @@
+# verus-sync-coverage manifest: arith_forms
+# source sha: arith_forms=9efe4e1d1dfe  proof sha: ea6a5e055027
+
+[pins]
+pin pin_comma_list -> test double_paren_comma_list_lowered: MAPPED
+pin pin_multi_arg -> test let_multiple_forms_emit_multiple_assigns: MAPPED
+pin pin_nested_rewrite -> test let_in_nested_block_rewrites_recursively: MAPPED
+pin pin_non_arith_refuses -> test let_with_non_arith_arg_is_left_alone: MAPPED
+pin pin_non_let_untouched -> test non_let_exec_is_left_alone: MAPPED
+pin pin_paren_compound -> test double_paren_compound_assign_is_not_glob_tagged: MAPPED
+pin pin_paren_incdec -> test double_paren_incdec_is_lowered: MAPPED
+pin pin_plain_assign -> test let_simple_assign_becomes_structured_assign: MAPPED
+pin pin_plus_equals -> test let_compound_assign_plus_equals: MAPPED
+pin pin_postfix_inc -> test let_incdec_becomes_incdec_arith: MAPPED
+pin pin_prefix_inc -> test let_prefix_incdec: MAPPED
+pin pin_var_rhs -> test let_arith_with_var_rhs: MAPPED
+
+[guards]
+guard let-arg text: PRESENT
+guard assign builder: PRESENT
+guard expr lowering: PRESENT
+guard stmt lowering: PRESENT
+
+[counts]
+proof-fns: 14
+pins: 12
+# NOTE: proof-fns is a file-shape fact (change detector), NOT the
+# Verus obligation count — the gate asserts N verified separately.
+
+[exec]
+# Each MAPPED test above, EXECUTED against the live source (one
+# module-suite run per model; per-test verdicts grepped from output).
+# A mapped test that fails or vanishes from the run is drift — FATAL.
+# The checker RUNS each mapped test (one module-suite cargo test per
+# source file) and records the per-test PASS/FAIL verdict below.
+exec pin_comma_list: PASS (test double_paren_comma_list_lowered)
+exec pin_multi_arg: PASS (test let_multiple_forms_emit_multiple_assigns)
+exec pin_nested_rewrite: PASS (test let_in_nested_block_rewrites_recursively)
+exec pin_non_arith_refuses: PASS (test let_with_non_arith_arg_is_left_alone)
+exec pin_non_let_untouched: PASS (test non_let_exec_is_left_alone)
+exec pin_paren_compound: PASS (test double_paren_compound_assign_is_not_glob_tagged)
+exec pin_paren_incdec: PASS (test double_paren_incdec_is_lowered)
+exec pin_plain_assign: PASS (test let_simple_assign_becomes_structured_assign)
+exec pin_plus_equals: PASS (test let_compound_assign_plus_equals)
+exec pin_postfix_inc: PASS (test let_incdec_becomes_incdec_arith)
+exec pin_prefix_inc: PASS (test let_prefix_incdec)
+exec pin_var_rhs: PASS (test let_arith_with_var_rhs)
