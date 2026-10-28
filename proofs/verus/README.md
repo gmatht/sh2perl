@@ -1581,6 +1581,133 @@ model-internal). Mutant (zero step accepted) red at 12v/1e. Executed
 tests 7/7 PASS in the committed sync baseline. Firing: 9/563
 in-pipeline (measured in the P12 sweep).
 
+---
+
+## Verdict-analyses sweep — `scc.rs` (21), `used_before_decl.rs` (15), `maskable.rs` (12), `lifetime.rs` (14), `numstr.rs` (11), `numeric_observed.rs` (10)
+
+Six verdict-soundness Tier-1 models over the shared analyses, each
+with its census/fixpoint as oracle parameters, its pins mapped to
+the source's unit tests, and a checked failing mutant (gate-registered
+with the counts below; coverage syncs registered for all six — the
+checker grew a per-model source directory, `transforms/` vs
+`shir_passes/`).
+
+### `scc.rs` — 21 obligations
+
+```
+    verus --triggers-mode silent --rlimit 40 scc.rs
+    -> verification results:: 21 verified, 0 errors
+```
+
+**What is proved.** The Tarjan-output contract the echo_return
+fixpoint consumes: reported sets are strongly connected (pairwise
+mutual reachability via a fuel-bounded path predicate), disjoint and
+covering (partition_valid), maximal (no cross-set merge), and the
+condensation acyclic (`condensation_acyclic` — the fixpoint
+termination property). `reaches_mono` (fuel monotonicity) bridges the
+2-step witnesses to the fuel-3/4 ensures. The collect-callees walk
+(exec/fnCall/capture shapes, defined-only edges) is a PARAMETER.
+
+Nine pins mirror the 6 unit tests (pair/set lemmas are model-internal
+helpers, not pins): mutual pair, self-loop, leaf singleton, chain
+singletons, matcher triple, capture edge, parser cluster, plus the
+singleton-partition and condensation-acyclicity facts. Mutant (merged
+claim across an acyclic edge) red at 20v/1e. Executed tests 7/7 PASS
+in the committed sync baseline (6 module tests + shared pins).
+
+### `used_before_decl.rs` — 15 obligations
+
+```
+    verus --triggers-mode silent --rlimit 40 used_before_decl.rs
+    -> verification results:: 15 verified, 0 errors
+```
+
+**What is proved.** Must-defined dataflow soundness: `meet_sound`
+(intersection keeps only all-path defs), `def_sound` (Def adds),
+`flag_sound` (a flagged read has no reaching def), `loop_fallback`
+(zero-trip exit restores the entry set), the subshell/function-entry
+discipline as premises. Census, positions, traversal as PARAMETERS.
+
+Ten pins mirror the 11 unit tests (prose-only behaviors share pins):
+straight-def clean, read-before-def warns, both-arms clean, one-arm
+warns, loop no-leak, subshell no-propagate (UNMIRRORED — no unit
+test, fork-semantics verdict), function-entry union, never-defined
+warns, sequential accumulation, if-without-else fall-through. Mutant
+(union meet) red at 13v/2e. Executed tests 9/9 PASS in the committed
+sync baseline.
+
+### `maskable.rs` — 12 obligations
+
+```
+    verus --triggers-mode silent --rlimit 40 maskable.rs
+    -> verification results:: 12 verified, 0 errors
+```
+
+**What is proved.** `mask_threshold` formula soundness: the square
+bracket (`3037000499^2 < 2^63 <= 3037000500^2`, by compute), the
+linear inversion (`max_i*c+k <= M` from the threshold via
+`lemma_mul_inequality` — Verus's nonlinear_arith cannot do
+monotonicity, probed red), the concrete formula value for the pinned
+shape (c=37,k=3 by compute), the divisor/pow2 gates. Shape
+classifiers and isqrt as oracles.
+
+Seven pins mirror the 6 unit tests (formula-ok is model-internal):
+bare INF, square brackets, linear math, refusals, const folds, pow2
+table. Mutant (le-arm off-by-one) red at 10v/2e. Executed tests 6/6
+PASS in the committed sync baseline.
+
+### `lifetime.rs` — 14 obligations
+
+```
+    verus --triggers-mode silent --rlimit 40 lifetime.rs
+    -> verification results:: 14 verified, 0 errors
+```
+
+**What is proved.** Span coverage (every access in [first,last]),
+consumption liveness (buffer live at every use), escape
+conservatism (store/closure/return imply escape; exec/pipeline/
+capture are byte-copy uses). The census walk as oracle.
+
+Ten pins mirror the 12 unit tests (order fact and spurious-escape
+note UNMIRRORED): degenerate/single span, full coverage, three
+escape rules, no-escape exec, use liveness, retained-escape,
+spurious-escape safety. Mutant (shrunk span) red at 12v/2e.
+Executed tests 8/8 PASS in the committed sync baseline.
+
+### `numstr.rs` — 11 obligations
+
+```
+    verus --triggers-mode silent --rlimit 40 numstr.rs
+    -> verification results:: 11 verified, 0 errors
+```
+
+**What is proved.** Seed-table consistency (function_purity shape):
+pinned stability, var/position soundness under earned sets,
+revalidate removal-only. Fixpoint and classifiers as parameters.
+
+Six pins mirror the 10 unit tests (consistency shapes share pins):
+canonical homing, earned promotion, pinned stability, stringy
+demote, revalidate-only-removes, position disqualification. Mutant
+(verdict needs no justification) red at 9v/2e. Executed tests 6/6
+PASS in the committed sync baseline.
+
+### `numeric_observed.rs` — 10 obligations
+
+```
+    verus --triggers-mode silent --rlimit 40 numeric_observed.rs
+    -> verification results:: 10 verified, 0 errors
+```
+
+**What is proved.** Marked ==> all-uses-numeric per cell and per
+(param,idx) slot, chain-veto propagation downstream. Census and
+fixpoint as parameters.
+
+Six pins mirror the 11 unit tests (vacuous/unmarked shapes
+UNMIRRORED): scalar-all-numeric, text veto, array-chain veto,
+param-slot sound. Mutant (text-observed marked) red at 8v/2e.
+Executed tests 4/4 PASS + 2 UNMIRRORED in the committed sync
+baseline.
+
 ## Running it
 
 Same toolchain as the P6/P7/P8 files (`--rlimit 40`).
