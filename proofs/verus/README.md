@@ -1524,6 +1524,63 @@ observably not the echo). Mutant (bare fnValue at statement
 position) red at 10v/3e. Executed tests 7/7 PASS in the committed
 sync baseline.
 
+---
+
+## Arith-lowering sweep — `arith_forms.rs` (15), `counted_while_forinit.rs` (13)
+
+Two per-rewrite Tier-1 models over the arithmetic lowerings, each
+with its parse/step gate as oracle, its pins mapped to the source's
+unit tests, and a checked failing mutant (gate-registered
+`arith_forms.rs:15:40`, `counted_while_forinit.rs:13:40`; coverage
+syncs registered for both).
+
+### `arith_forms.rs` — 15 obligations
+
+```
+    verus --triggers-mode silent --rlimit 40 arith_forms.rs
+    -> verification results:: 15 verified, 0 errors
+```
+
+**What is proved.** Standalone model of the `let`-arg lowering:
+`let "x+=1"` / `let "x++"` execs become structured
+`Assign{Arith(Assign|IncDec)}`. `arith_forms_sound` (the lowered
+Assign updates the store exactly like the let-exec's arithmetic
+evaluation) and `pluseq_reads_old` (the compound read-modify-write
+keeps the old value — the load-bearing lemma). The `parse_arith`
+verdict, the `let_arg_text` unwrap, and the traversal are PARAMETERS
+(the parse gate is the oracle: Assign/IncDec nodes lower, anything
+else refuses the whole exec).
+
+Twelve pins mirror the 15 unit tests (several map to one test family;
+the runtime shape is model-internal): plain/compound/postfix/prefix
+assigns, multi-arg sequencing, var rhs, non-let untouched, nested
+rewrite, non-arith refusal, paren-compound/incdec, comma list. Mutant
+(`x+=E` as `x=E`, dropping the old-value read) red at 14v/1e.
+Executed tests 12/12 PASS in the committed sync baseline. Firing: the
+`((...))`/`let` shapes appear in 14+ corpus files.
+
+### `counted_while_forinit.rs` — 13 obligations
+
+```
+    verus --triggers-mode silent --rlimit 40 counted_while_forinit.rs
+    -> verification results:: 13 verified, 0 errors
+```
+
+**What is proved.** `forinit_sound` (init + counter-while +
+trailing-step runs the same iteration trace as the spliced ForInit)
+under the guard conjunction (adjacent scalar init, trailing step
+with nonzero literal delta in either spelling, clean body prefix and
+cond — no counter write/escape, no `$?` read). `step_advances` (a
+nonzero delta moves the counter) and the nonzero-gate load-bearing
+pin. The cond-text semantics and body transitions are PARAMETERS
+(opaque predicates); traversal is per-site.
+
+Nine pins mirror the 7 unit tests (both step spellings share the
+passing verdict; the trace agreement and gate load-bearing are
+model-internal). Mutant (zero step accepted) red at 12v/1e. Executed
+tests 7/7 PASS in the committed sync baseline. Firing: 9/563
+in-pipeline (measured in the P12 sweep).
+
 ## Running it
 
 Same toolchain as the P6/P7/P8 files (`--rlimit 40`).
