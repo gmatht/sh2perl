@@ -1,0 +1,33 @@
+# verus-sync-coverage manifest: numstr
+# source sha: numstr=ccbc1a2c274d  proof sha: 9e9949e0388e
+
+[pins]
+pin pin_int_homed_canonical -> test noncanonical_literal_disqualifies: MAPPED
+pin pin_params_positions -> test omitted_arg_disqualifies_param: MAPPED
+pin pin_pinned_never_reproposed -> test pinned_verdicts_survive: MAPPED
+pin pin_position_promoted -> test anchored_cycle_admitted: MAPPED
+pin pin_revalidate_removes_only -> test revalidate_params_withdraws_demoted_chain: MAPPED
+pin pin_stringy_assign_demotes -> test revalidate_params_withdraws_demoted_chain: MAPPED
+
+[guards]
+guard seed entry: PRESENT
+guard revalidation: PRESENT
+
+[counts]
+proof-fns: 10
+pins: 6
+# NOTE: proof-fns is a file-shape fact (change detector), NOT the
+# Verus obligation count — the gate asserts N verified separately.
+
+[exec]
+# Each MAPPED test above, EXECUTED against the live source (one
+# module-suite run per model; per-test verdicts grepped from output).
+# A mapped test that fails or vanishes from the run is drift — FATAL.
+# The checker RUNS each mapped test (one module-suite cargo test per
+# source file) and records the per-test PASS/FAIL verdict below.
+exec pin_int_homed_canonical: PASS (test noncanonical_literal_disqualifies)
+exec pin_params_positions: PASS (test omitted_arg_disqualifies_param)
+exec pin_pinned_never_reproposed: PASS (test pinned_verdicts_survive)
+exec pin_position_promoted: PASS (test anchored_cycle_admitted)
+exec pin_revalidate_removes_only: PASS (test revalidate_params_withdraws_demoted_chain)
+exec pin_stringy_assign_demotes: PASS (test revalidate_params_withdraws_demoted_chain)

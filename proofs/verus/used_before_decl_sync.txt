@@ -1,0 +1,42 @@
+# verus-sync-coverage manifest: used_before_decl
+# source sha: used_before_decl=61a105c29270  proof sha: 7205fb78dd68
+
+[pins]
+pin pin_branch_both_arms_no_warn -> test branch_both_sides_define_is_clean: MAPPED
+pin pin_branch_one_arm_warns -> test branch_meet_suppresses_when_one_side_undefs: MAPPED
+pin pin_function_entry_union -> test function_capture_of_top_level_is_clean: MAPPED
+pin pin_if_without_else_falls_through -> test branch_meet_suppresses_when_one_side_undefs: MAPPED
+pin pin_loop_body_def_no_leak -> test loop_body_def_does_not_propagate: MAPPED
+pin pin_never_defined_warns -> test function_body_read_of_never_assigned_warns: MAPPED
+pin pin_read_before_def_warns -> test straight_line_use_before_decl: MAPPED
+pin pin_sequential_defs_accumulate -> test defined_before_use_is_clean: MAPPED
+pin pin_straight_def_no_warn -> test defined_before_use_is_clean: MAPPED
+pin pin_subshell_no_propagate -> UNMIRRORED (by design — see VERUS.md §(b).4)
+
+[guards]
+guard analysis entry: PRESENT
+guard must-def set: PRESENT
+guard finding shape: PRESENT
+
+[counts]
+proof-fns: 14
+pins: 10
+# NOTE: proof-fns is a file-shape fact (change detector), NOT the
+# Verus obligation count — the gate asserts N verified separately.
+
+[exec]
+# Each MAPPED test above, EXECUTED against the live source (one
+# module-suite run per model; per-test verdicts grepped from output).
+# A mapped test that fails or vanishes from the run is drift — FATAL.
+# The checker RUNS each mapped test (one module-suite cargo test per
+# source file) and records the per-test PASS/FAIL verdict below.
+exec pin_branch_both_arms_no_warn: PASS (test branch_both_sides_define_is_clean)
+exec pin_branch_one_arm_warns: PASS (test branch_meet_suppresses_when_one_side_undefs)
+exec pin_function_entry_union: PASS (test function_capture_of_top_level_is_clean)
+exec pin_if_without_else_falls_through: PASS (test branch_meet_suppresses_when_one_side_undefs)
+exec pin_loop_body_def_no_leak: PASS (test loop_body_def_does_not_propagate)
+exec pin_never_defined_warns: PASS (test function_body_read_of_never_assigned_warns)
+exec pin_read_before_def_warns: PASS (test straight_line_use_before_decl)
+exec pin_sequential_defs_accumulate: PASS (test defined_before_use_is_clean)
+exec pin_straight_def_no_warn: PASS (test defined_before_use_is_clean)
+exec pin_subshell_no_propagate: UNMIRRORED (not executed)

@@ -1,0 +1,40 @@
+# verus-sync-coverage manifest: scc
+# source sha: scc=d735295a7631  proof sha: 25e7addc4588
+
+[pins]
+pin pin_capture_edge -> test capture_is_a_call_edge: MAPPED
+pin pin_chain_singletons -> test acyclic_chain_is_singletons: MAPPED
+pin pin_condensation_acyclic -> UNMIRRORED (by design — see VERUS.md §(b).4)
+pin pin_leaf_singleton -> test self_recursion_is_scc_of_one: MAPPED
+pin pin_matcher_triple -> test matcher_cycle_is_one_scc: MAPPED
+pin pin_mutual_pair -> test mutual_recursion_is_one_scc: MAPPED
+pin pin_parser_cluster -> test test_parser_cluster_is_one_scc: MAPPED
+pin pin_self_loop -> test self_recursion_is_scc_of_one: MAPPED
+pin pin_singleton_leaf -> UNMIRRORED (by design — see VERUS.md §(b).4)
+
+[guards]
+guard call-graph builder: PRESENT
+guard Tarjan SCC: PRESENT
+guard scc_of query: PRESENT
+
+[counts]
+proof-fns: 19
+pins: 9
+# NOTE: proof-fns is a file-shape fact (change detector), NOT the
+# Verus obligation count — the gate asserts N verified separately.
+
+[exec]
+# Each MAPPED test above, EXECUTED against the live source (one
+# module-suite run per model; per-test verdicts grepped from output).
+# A mapped test that fails or vanishes from the run is drift — FATAL.
+# The checker RUNS each mapped test (one module-suite cargo test per
+# source file) and records the per-test PASS/FAIL verdict below.
+exec pin_capture_edge: PASS (test capture_is_a_call_edge)
+exec pin_chain_singletons: PASS (test acyclic_chain_is_singletons)
+exec pin_condensation_acyclic: UNMIRRORED (not executed)
+exec pin_leaf_singleton: PASS (test self_recursion_is_scc_of_one)
+exec pin_matcher_triple: PASS (test matcher_cycle_is_one_scc)
+exec pin_mutual_pair: PASS (test mutual_recursion_is_one_scc)
+exec pin_parser_cluster: PASS (test test_parser_cluster_is_one_scc)
+exec pin_self_loop: PASS (test self_recursion_is_scc_of_one)
+exec pin_singleton_leaf: UNMIRRORED (not executed)

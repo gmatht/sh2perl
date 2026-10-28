@@ -1,0 +1,36 @@
+# verus-sync-coverage manifest: maskable
+# source sha: maskable=c6d2c8d22cc1  proof sha: 0871b3d05354
+
+[pins]
+pin pin_bare_inf -> test bare_is_inf: MAPPED
+pin pin_bound_sound -> UNMIRRORED (by design — see VERUS.md §(b).4)
+pin pin_const_folds -> test const_dividends: MAPPED
+pin pin_linear_math -> test linear_threshold_math: MAPPED
+pin pin_pow2_table -> test pow2_lit: MAPPED
+pin pin_refusals -> test refuses: MAPPED
+pin pin_square_brackets -> test square_threshold_brackets_i64: MAPPED
+
+[guards]
+guard threshold fn: PRESENT
+guard pow2 gate: PRESENT
+guard INF bound: PRESENT
+
+[counts]
+proof-fns: 11
+pins: 7
+# NOTE: proof-fns is a file-shape fact (change detector), NOT the
+# Verus obligation count — the gate asserts N verified separately.
+
+[exec]
+# Each MAPPED test above, EXECUTED against the live source (one
+# module-suite run per model; per-test verdicts grepped from output).
+# A mapped test that fails or vanishes from the run is drift — FATAL.
+# The checker RUNS each mapped test (one module-suite cargo test per
+# source file) and records the per-test PASS/FAIL verdict below.
+exec pin_bare_inf: PASS (test bare_is_inf)
+exec pin_bound_sound: UNMIRRORED (not executed)
+exec pin_const_folds: PASS (test const_dividends)
+exec pin_linear_math: PASS (test linear_threshold_math)
+exec pin_pow2_table: PASS (test pow2_lit)
+exec pin_refusals: PASS (test refuses)
+exec pin_square_brackets: PASS (test square_threshold_brackets_i64)

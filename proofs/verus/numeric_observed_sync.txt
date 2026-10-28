@@ -1,0 +1,34 @@
+# verus-sync-coverage manifest: numeric_observed
+# source sha: numeric_observed=7bfc22ece59d  proof sha: 7dccf02776b7
+
+[pins]
+pin pin_array_chain_veto -> test array_chain_reaches_downstream_scalars: MAPPED
+pin pin_empty_uses_marked -> UNMIRRORED (by design — see VERUS.md §(b).4)
+pin pin_param_slot_sound -> test numeric_sink_param_is_numeric: MAPPED
+pin pin_scalar_all_numeric -> test atoll_only_scalar_is_numeric: MAPPED
+pin pin_text_use_vetoes -> test echo_observed_scalar_is_not_numeric: MAPPED
+pin pin_unmarked_no_claim -> UNMIRRORED (by design — see VERUS.md §(b).4)
+
+[guards]
+guard analysis entry: PRESENT
+guard numeric-use verdict: PRESENT
+
+[counts]
+proof-fns: 9
+pins: 6
+# NOTE: proof-fns is a file-shape fact (change detector), NOT the
+# Verus obligation count — the gate asserts N verified separately.
+
+[exec]
+# Each MAPPED test above, EXECUTED against the live source (one
+# module-suite run per model; per-test verdicts grepped from output).
+# A mapped test that fails or vanishes from the run is drift — FATAL.
+# The checker RUNS each mapped test (one module-suite cargo test per
+# source file) and records the per-test PASS/FAIL verdict below.
+# all suites built; per-test verdicts below
+exec pin_array_chain_veto (array_chain_reaches_downstream_scalars): PASS
+exec pin_empty_uses_marked: UNMIRRORED (not executed)
+exec pin_param_slot_sound (numeric_sink_param_is_numeric): PASS
+exec pin_scalar_all_numeric (atoll_only_scalar_is_numeric): PASS
+exec pin_text_use_vetoes (echo_observed_scalar_is_not_numeric): PASS
+exec pin_unmarked_no_claim: UNMIRRORED (not executed)

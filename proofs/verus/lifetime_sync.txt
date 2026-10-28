@@ -1,0 +1,40 @@
+# verus-sync-coverage manifest: lifetime
+# source sha: lifetime=2ba0c2739aeb  proof sha: 4fb2204c7ee1
+
+[pins]
+pin pin_escape_closure -> test closure_capture_escapes: MAPPED
+pin pin_escape_return -> test return_escapes: MAPPED
+pin pin_escape_store -> test array_element_write_escapes: MAPPED
+pin pin_no_escape_exec -> test exec_args_are_uses_not_escapes: MAPPED
+pin pin_retained_needs_escape -> test return_escapes: MAPPED
+pin pin_single_access_degenerate -> test live_span_covers_def_to_use: MAPPED
+pin pin_span_covers_all -> test live_span_covers_def_to_use: MAPPED
+pin pin_span_ordering -> UNMIRRORED (by design — see VERUS.md §(b).4)
+pin pin_spurious_escape_ok -> UNMIRRORED (by design — see VERUS.md §(b).4)
+pin pin_use_needs_liveness -> test live_span_covers_def_to_use: MAPPED
+
+[guards]
+guard analysis entry: PRESENT
+
+[counts]
+proof-fns: 13
+pins: 10
+# NOTE: proof-fns is a file-shape fact (change detector), NOT the
+# Verus obligation count — the gate asserts N verified separately.
+
+[exec]
+# Each MAPPED test above, EXECUTED against the live source (one
+# module-suite run per model; per-test verdicts grepped from output).
+# A mapped test that fails or vanishes from the run is drift — FATAL.
+# The checker RUNS each mapped test (one module-suite cargo test per
+# source file) and records the per-test PASS/FAIL verdict below.
+exec pin_escape_closure: PASS (test closure_capture_escapes)
+exec pin_escape_return: PASS (test return_escapes)
+exec pin_escape_store: PASS (test array_element_write_escapes)
+exec pin_no_escape_exec: PASS (test exec_args_are_uses_not_escapes)
+exec pin_retained_needs_escape: PASS (test return_escapes)
+exec pin_single_access_degenerate: PASS (test live_span_covers_def_to_use)
+exec pin_span_covers_all: PASS (test live_span_covers_def_to_use)
+exec pin_span_ordering: UNMIRRORED (not executed)
+exec pin_spurious_escape_ok: UNMIRRORED (not executed)
+exec pin_use_needs_liveness: PASS (test live_span_covers_def_to_use)
