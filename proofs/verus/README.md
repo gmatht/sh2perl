@@ -1796,6 +1796,60 @@ refused) plus the 0-trip negative control. Mutant (gate without
 `invariant_reads`) red at 19v/3e. Executed tests 8/8 PASS in the
 committed sync baseline (all suites built live).
 
+---
+
+## Suites-then-proofs trio — `direct_calls.rs` (7), `cat_read.rs` (11), `grep_o.rs` (10)
+
+Three per-rewrite Tier-1 models over transforms that had NO unit
+suite: the suites were written first (end-to-end lower → transform
+→ JSON shape asserts, 4/6/6 green), then the models with pins mapped
+to them (gate-registered with the counts below; coverage syncs
+registered for all three).
+
+### `direct_calls.rs` — 7 obligations
+
+```
+    verus --triggers-mode silent --rlimit 40 direct_calls.rs
+    -> verification results:: 7 verified, 0 errors
+```
+
+**What is proved.** Capture-of-pure-function collapses to a direct
+in-process call with identical captured value (the fnValue channel
+needs no stdout round-trip). The function table and capture census
+as oracles. Four pins mirror the 4 new unit tests; the value check
+is model-internal. Mutant (purity gate dropped) red at 6v/1e.
+Executed tests 4/4 PASS (all suites built live).
+
+### `cat_read.rs` — 11 obligations
+
+```
+    verus --triggers-mode silent --rlimit 40 cat_read.rs
+    -> verification results:: 11 verified, 0 errors
+```
+
+**What is proved.** Statement `cat`/`cat -n` lowers to ForEachLine
+loops emitting the same bytes: plain concatenation, and the
+GNU-numbered sequence (counter from 0, per-line increment, files
+chained in order). The operand census as gate premises. Six pins
+mirror the 6 new unit tests. Mutant (number from 1) red at 9v/1e.
+Executed tests 6/6 PASS (all suites built live).
+
+### `grep_o.rs` — 10 obligations
+
+```
+    verus --triggers-mode silent --rlimit 40 grep_o.rs
+    -> verification results:: 10 verified, 0 errors
+```
+
+**What is proved.** The `grepMatches(text, pattern, flags)` op
+carries the same triple the exec did, with the match list as output
+(one per line); the argv gate (combined shorts, `--`, `-E/-i/-F`,
+exactly one static pattern). The BRE→ERE translation and the
+regex engine as oracle. Six pins mirror the 6 new unit tests; the
+output-shape check is model-internal. Mutant (`-o` requirement
+dropped) red at 9v/1e. Executed tests 6/6 PASS (all suites built
+live).
+
 ## Running it
 
 Same toolchain as the P6/P7/P8 files (`--rlimit 40`).
