@@ -1,0 +1,39 @@
+# verus-sync-coverage manifest: echo_return
+# source sha: echo_return=9fc06a254cd7  proof sha: 7d5772866290
+
+[pins]
+pin pin_bare_is_not_echo -> UNMIRRORED (by design — see VERUS.md §(b).4)
+pin pin_both_arms_return -> test if_arms_lift: MAPPED
+pin pin_impure_refused -> test impure_body_refuses: MAPPED
+pin pin_last_stage_echoes -> test pipeline_last_stage_echoes_the_value: MAPPED
+pin pin_multi_echo_refuses -> test multi_echo_refuses: MAPPED
+pin pin_no_echo_refuses -> test no_echo_path_refuses: MAPPED
+pin pin_single_echo_lifts -> test simple_value_function_lifts: MAPPED
+pin pin_wrapped_prints_value -> test simple_value_function_lifts: MAPPED
+
+[guards]
+guard echo-state machine: PRESENT
+guard body recognition: PRESENT
+guard fnValue wrap: PRESENT
+guard last-stage echo: PRESENT
+
+[counts]
+proof-fns: 12
+pins: 8
+# NOTE: proof-fns is a file-shape fact (change detector), NOT the
+# Verus obligation count — the gate asserts N verified separately.
+
+[exec]
+# Each MAPPED test above, EXECUTED against the live source (one
+# module-suite run per model; per-test verdicts grepped from output).
+# A mapped test that fails or vanishes from the run is drift — FATAL.
+# The checker RUNS each mapped test (one module-suite cargo test per
+# source file) and records the per-test PASS/FAIL verdict below.
+exec pin_bare_is_not_echo: UNMIRRORED (not executed)
+exec pin_both_arms_return: PASS (test if_arms_lift)
+exec pin_impure_refused: PASS (test impure_body_refuses)
+exec pin_last_stage_echoes: PASS (test pipeline_last_stage_echoes_the_value)
+exec pin_multi_echo_refuses: PASS (test multi_echo_refuses)
+exec pin_no_echo_refuses: PASS (test no_echo_path_refuses)
+exec pin_single_echo_lifts: PASS (test simple_value_function_lifts)
+exec pin_wrapped_prints_value: PASS (test simple_value_function_lifts)
