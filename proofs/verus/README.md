@@ -1761,6 +1761,41 @@ needs pair, cursor name, C gate). Mutant (cursor lands ON the
 delimiter) red at 16v/1e. Executed tests 11/11 PASS in the committed
 sync baseline.
 
+---
+
+## Loop-hoist — `hoist_loop_invariants.rs` (22)
+
+One Tier-1 model over the loop-invariant hoist, with the five gates
+as oracle premises, its pins mapped to the source's unit tests, and
+a checked failing mutant (gate-registered `hoist_loop_invariants.rs:
+22:40`; coverage sync registered).
+
+```
+    verus --triggers-mode silent --rlimit 40 hoist_loop_invariants.rs
+    -> verification results:: 22 verified, 0 errors
+```
+
+**What is proved.** The leading invariant run moves to the loop
+prologue preserving the iteration trace, pointwise
+(`run_hoisted(s,n)` and `run_loop(s,n)` both agree with the
+prolouge state on every lookup). The census walks
+(`stmt_writes`/`writes_of_expr` with the called-function fixpoint,
+`read_set`, `str_reads`) and traversal as PARAMETERS.
+
+**The proof found a REAL SOUNDNESS HOLE** (BUGS_FOUND.md 7, open):
+at n = 0 the prologue runs while the original runs nothing
+(`while false; do y = 5; done` hoists `y = 5` unconditionally —
+verified live against the transform). The theorem covers exactly
+the sound fragment (n >= 1); `pin_zero_trip_diverges` is the
+failing-first shape for the transform owner.
+
+Eight pins mirror the 8 unit tests 1:1 (accumulator refused,
+invariant hoists, read-before refused, counter read refused,
+indexed target refuses, independent hoists, fn body/cond write
+refused) plus the 0-trip negative control. Mutant (gate without
+`invariant_reads`) red at 19v/3e. Executed tests 8/8 PASS in the
+committed sync baseline (all suites built live).
+
 ## Running it
 
 Same toolchain as the P6/P7/P8 files (`--rlimit 40`).
