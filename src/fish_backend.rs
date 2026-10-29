@@ -6799,7 +6799,11 @@ fn call_word_to_fish(func: &str, args: &[IrExpr]) -> Result<String, String> {
             Ok(format!("({inner})"))
         }
         "listVar" => {
-            let n = raw_arg(args, 0)?;
+            // The name is unused (fish has one positional list, `$argv`),
+            // but the argument is still VALIDATED: a malformed IR must be a
+            // loud error, not a silent `$argv`. Same idiom as the
+            // interp_expr_to_fish_atom arm below.
+            let _ = raw_arg(args, 0)?;
             // `"$@"` is a hard PARSE ERROR in fish ("$@ is not supported.
             // In fish, please use $argv"), so this cannot be spelled
             // literally. Bare `$argv` is the positional-parameter LIST and
