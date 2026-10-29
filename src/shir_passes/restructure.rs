@@ -748,7 +748,7 @@ fn forward_skip_site(
             continue;
         };
         // Where does the dead region start in THIS list?
-        let skip_from = if depth == path.len() {
+        let _skip_from = if depth == path.len() {
             // the goto is a statement of this list
             if lpos <= goto_index {
                 continue; // backward — not a forward jump

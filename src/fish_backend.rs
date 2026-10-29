@@ -6961,7 +6961,7 @@ fn call_word_to_fish(func: &str, args: &[IrExpr]) -> Result<String, String> {
             Ok(format!("({inner})"))
         }
         "listVar" => {
-            let n = raw_arg(args, 0)?;
+            let _ = raw_arg(args, 0)?;
             // `"$@"` is a hard PARSE ERROR in fish ("$@ is not supported.
             // In fish, please use $argv"), so this cannot be spelled
             // literally. Bare `$argv` is the positional-parameter LIST and

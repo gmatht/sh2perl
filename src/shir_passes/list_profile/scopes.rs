@@ -139,7 +139,7 @@ impl<'a> Walker<'a> {
     /// being compared/bound — i.e. when the value looks like a reference
     /// (`$v` present) or a `name=value` binding head. A bare word that is
     /// neither is data.
-    fn mentions_value_str_style(&mut self, text: &str, quoted: bool) {
+    fn mentions_value_str_style(&mut self, text: &str, _quoted: bool) {
         // a `name=value` head always names the variable being bound
         if let Some((head, _)) = text.split_once('=') {
             if is_ident_word(head) {

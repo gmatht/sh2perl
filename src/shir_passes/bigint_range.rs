@@ -222,7 +222,7 @@ pub(crate) fn big_arith_range(
         // range for it only if eval reads it, and eval does not (the
         // fix mirrors Cast f a: f ⇒ refuse). Integer-identity casts
         // recurse, as v0 did.
-        ArithAst::Cast { ty, arg } if matches!(ty, IrType::Float(_)) => None,
+        ArithAst::Cast { ty, arg: _ } if matches!(ty, IrType::Float(_)) => None,
         ArithAst::Cast { arg, .. } => big_arith_range(arg, env),
         ArithAst::Sizeof(_) => None,
     }

@@ -83,7 +83,7 @@ fn analyze_ranges_floor(prog: &IrProgram, _cfg: IntervalConfig) -> HashMap<Strin
 fn floor_arith_range(a: &ArithAst, env: &HashMap<String, (i128, i128)>) -> Option<(i128, i128)> {
     match a {
         ArithAst::Bin { op, lhs, rhs } if op == "%" => {
-            let (l0, l1) = arith_floor_range(lhs, env)?;
+            let (l0, _l1) = arith_floor_range(lhs, env)?;
             let (r0, r1) = arith_floor_range(rhs, env)?;
             if l0 >= 0 && r0 > 0 {
                 // Python floor-mod with positive divisor

@@ -312,7 +312,7 @@ type Ctx<'a, 'b> = (
 );
 
 fn walk_expr(e: &IrExpr, cur: &str, ctx: &mut Ctx) {
-    let (defined, assigns, sites, blocked, saw_ext) = ctx;
+    let (defined, _assigns, sites, _blocked, saw_ext) = ctx;
     match e {
         IrExpr::Call { func, args } => {
             // A literal eval/source/. executes text this walk never
