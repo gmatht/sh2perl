@@ -1,0 +1,7 @@
+(* string-accumulator: the Tier-1 obligation for
+   src/transforms/string_accumulator.rs — the read walks and the
+   first-read position rule.  Build: isabelle build -d . StringAccumulator *)
+session StringAccumulator = HOL +
+  options [quick_and_dirty = false]
+  theories
+    StringAccumulator

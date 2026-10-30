@@ -1,0 +1,60 @@
+string-accumulator — the Tier-1 obligation for
+src/transforms/string_accumulator.rs
+=======================================================================
+
+    isabelle build -d proofs/StringAccumulator -b StringAccumulator
+
+STATUS: checked — 18 lemmas, quick_and_dirty = false, ~1 min from a warm
+HOL image. One negative control run and failed (see below).
+
+What is proved (StringAccumulator.thy)
+
+  §1-2  the READ WALKS. mirror_read_walk is the Rust
+        read_walk / expr_read_walk / arith_read_walk triple, one constructor
+        per arm, no wildcard — the same shape as the code, which is why the
+        Arith arm had to be added in BOTH places at once.
+
+  §3-4  the pre-fix walk (v0_expr_reads, with the catch-all arms) and the
+        bug report's own witness:
+
+          the_fix_is_load_bearing
+            expr_reads (Arith (AVar "tsv")) "tsv"  /\
+            ~ v0_expr_reads (Arith (AVar "tsv")) "tsv"
+
+        i.e. `n=$(( tsv + 0 ))` IS a read, and the pre-fix walk did not see
+        it. That is BUGS_FOUND.md #11 as a theorem rather than a repro.
+
+  §5    carrier completeness — a read buried in a redirect, a subshell, a
+        block, a background job, a pipeline stage, a function body (and its
+        named blocks), a ForInit body, a try body, a try EXCEPT clause, a
+        case clause body, a case PATTERN, a thunk, a comprehension or an
+        arith index key is still found.
+
+  §6    the position rule: before_any_read ss n ==> ~ stmts_read ss n, i.e.
+        if no statement before the self-append reads the variable, then the
+        append is read #0 of the iteration — the condition under which the
+        join-at-read lowering is faithful. a_body_that_reads_after_the_append_
+        breaks_the_rule is the contrapositive shape.
+
+The negative control
+
+  Replacing the fixed Arith arm with the pre-fix `False` makes the session
+  FAIL at the_fix_is_load_bearing ("Failed to finish proof"). Restored, it is
+  green. A session that only ever passes is not evidence.
+
+What is NOT claimed
+
+  * The LOWERING (push-per-append, one join per post-loop read) is statement
+    and runtime semantics — Tier 3, unchanged by this file.
+  * The C length mirror's vetoes (float/numeric/bigint/env/nameref/...): they
+    are consumers' own gates, not part of this verdict.
+  * mentions (the raw-text scan) is primitive: the byte-wise identifier-
+    boundary scan in text_mentions_var is not modelled, only relied on
+    conservatively (a hit refuses, a miss cannot make the verdict wrong when
+    the operand is really text).
+  * The mirror is VERBATIM-in-shape, not mechanically extracted. The Rust
+    side carries the executable half: walk_tests::
+    an_arith_read_of_the_accumulator_refuses_the_verdict (verified failing-
+    first by restoring the catch-all), the_same_loop_without_the_arith_read_
+    still_fires (the control), an_arith_write_through_incdec_refuses_the_body,
+    carriers_do_not_hide_reads, continue_does_not_refuse_the_body.
