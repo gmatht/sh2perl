@@ -2017,3 +2017,33 @@ built live).
 ## Running it
 
 Same toolchain as the P6/P7/P8 files (`--rlimit 40`).
+
+## isolate-accumulate — `isolate_accumulate.rs` (18)
+
+Per-trip Tier-1 model over `transforms/isolate_accumulate.rs`
+(loop-private temp inlining): single-use pure temps substitute
+into their unique later use with identical reads
+(`subst_agrees`), isolating one self-referential tail. The use
+discipline (single later use, no earlier read, no redefinition),
+the purity gate, and the commit rule are premises; the loop
+header/trips and the worklist traversal are per-site. Eight pins
+mirror the 8 source unit tests; the substitution runtime check is
+model-internal.
+
+### `isolate_accumulate.rs` — 18 obligations
+
+```
+    verus --triggers-mode silent --rlimit 40 isolate_accumulate.rs
+    -> verification results:: 18 verified, 0 errors
+```
+
+**What is proved.** Substituting a pure RHS for its variable reads
+the same value when the store binds the variable to the RHS's
+value; the gate conjunction (ordered, single-use, uncarried,
+undef-redefined) makes each inline store-preserving. Mutant
+(multi-use inlines) red at 17v/1e. Executed tests 8/8 PASS (all
+suites built live).
+
+## Running it
+
+Same toolchain as the P6/P7/P8 files (`--rlimit 40`).

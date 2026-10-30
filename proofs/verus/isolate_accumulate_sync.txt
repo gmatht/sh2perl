@@ -1,0 +1,44 @@
+# verus-sync-coverage manifest: isolate_accumulate
+# source sha: isolate_accumulate=cf2f599ac401  proof sha: edc9a3ebbb38
+
+[pins]
+pin pin_carried_blocks -> test carried_temp_blocks: MAPPED
+pin pin_chain_collapses -> test temp_chain_collapses: MAPPED
+pin pin_control_flow_blocks -> test control_flow_blocks: MAPPED
+pin pin_counter_write_blocks -> test counter_write_blocks: MAPPED
+pin pin_hash_isolates -> test hash_isolates: MAPPED
+pin pin_multi_use_blocks -> test multi_use_temp_blocks: MAPPED
+pin pin_nonacc_tail_blocks -> test nonacc_tail_blocks: MAPPED
+pin pin_status_blocks -> test status_temp_blocks: MAPPED
+pin pin_subst_agrees -> UNMIRRORED (by design — see VERUS.md §(b).4)
+
+[guards]
+guard body isolation: PRESENT
+guard temp inline: PRESENT
+guard purity gate: PRESENT
+guard substitution: PRESENT
+guard single-use gate: PRESENT
+guard tail commit rule: PRESENT
+
+[counts]
+proof-fns: 10
+pins: 9
+# NOTE: proof-fns is a file-shape fact (change detector), NOT the
+# Verus obligation count — the gate asserts N verified separately.
+
+[exec]
+# Each MAPPED test above, EXECUTED against the live source (one
+# module-suite run per model; per-test verdicts grepped from output).
+# A mapped test that fails or vanishes from the run is drift — FATAL.
+# The checker RUNS each mapped test (one module-suite cargo test per
+# source file) and records the per-test PASS/FAIL verdict below.
+# all suites built; per-test verdicts below
+exec pin_carried_blocks (carried_temp_blocks): PASS
+exec pin_chain_collapses (temp_chain_collapses): PASS
+exec pin_control_flow_blocks (control_flow_blocks): PASS
+exec pin_counter_write_blocks (counter_write_blocks): PASS
+exec pin_hash_isolates (hash_isolates): PASS
+exec pin_multi_use_blocks (multi_use_temp_blocks): PASS
+exec pin_nonacc_tail_blocks (nonacc_tail_blocks): PASS
+exec pin_status_blocks (status_temp_blocks): PASS
+exec pin_subst_agrees: UNMIRRORED (not executed)
