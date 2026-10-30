@@ -36,13 +36,26 @@ fn status_codes_are_shifted_into_the_register() {
     assert!(out.contains("<< 8"), "unshifted register write:\n{out}");
 }
 
-/// A source `$?` read still sees the shell CODE (`$CHILD_ERROR`).
+/// A source `$?` read still sees the shell CODE: the mirror
+/// `$CHILD_ERROR` is refreshed by every register write.
 #[test]
 fn a_source_status_read_keeps_the_code() {
     let out = render("false\necho \"rc=$?\"\n");
+    assert!(out.contains("$CHILD_ERROR"), "the $? read lost its carrier:\n{out}");
     assert!(
-        out.contains("$CHILD_ERROR") && out.contains("rc="),
-        "the $? read lost its carrier:\n{out}"
+        out.contains("$CHILD_ERROR = $? >> 8"),
+        "the mirror is not refreshed on write:\n{out}"
+    );
+}
+
+/// `((i++))` writes a status that must not be clobbered by precedence:
+/// `a ? 0 : 1 << 8` would shift only the `1` branch.
+#[test]
+fn ternary_status_shift_is_parenthesised() {
+    let out = render("i=0\n((i++))\necho \"post=$?\"\n");
+    assert!(
+        !out.contains("? 0 : 1 << 8"),
+        "the shift bound to one branch only:\n{out}"
     );
 }
 
@@ -62,4 +75,24 @@ fn print_with_comma_is_untouched() {
         !out.contains("print \"k=") || out.contains(","),
         "a comma list was re-joined:\n{out}"
     );
+}
+
+/// `print(X, "\n")` — the renderer's explicit-newline output — is `say X`,
+/// and the `say` feature is imported when the renderer had not already.
+#[test]
+fn print_with_newline_is_say() {
+    let out = render("i=3\necho \"Number: $i\"\n");
+    assert!(out.contains("say "), "no say:\n{out}");
+    assert!(!out.contains(", \"\\n\")"), "explicit newline argument survived:\n{out}");
+    assert!(
+        out.contains("use feature 'say'"),
+        "say used without the feature:\n{out}"
+    );
+}
+
+/// A concat chain in `say` becomes one interpolated string.
+#[test]
+fn say_interpolates_a_concat_chain() {
+    let out = render("x=abc\necho \"x is $x\"\n");
+    assert!(out.contains("say \"x is abc\""), "got:\n{out}");
 }

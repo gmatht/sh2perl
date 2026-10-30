@@ -1885,10 +1885,20 @@ fn rc_write(write: &str) -> String {
     {
         // `$?` is a WAIT status, and assignment to it is direct — `$? = 1`
         // reads back as code 0 (`$? >> 8`), not 1 (measured). Every write
-        // therefore shifts its shell CODE into place, literal or not.
-        let val = format!("{rc} << 8");
+        // therefore shifts its shell CODE into place — and the shift must
+        // bind to the VALUE, not to the last operand of a ternary
+        // (`a ? 0 : 1 << 8` would shift only the `1` branch).
+        let val = if !rc.is_empty() && rc.chars().all(|c| c.is_ascii_digit()) {
+            format!("{rc} << 8")
+        } else {
+            format!("({rc}) << 8")
+        };
         let nl = if write.ends_with('\n') { "\n" } else { "" };
-        return format!("$? = {val};{nl}");
+        // The mirror `$CHILD_ERROR` (what a source `$?` read names, and what
+        // the process-substitution save/restore moves) tracks the register:
+        // a write that moved only the register would leave a later read
+        // stale (measured: `((i++)); echo "post=$?"` printed 0 for 1).
+        return format!("$? = {val}; $CHILD_ERROR = $? >> 8;{nl}");
     }
     write.to_string()
 }
@@ -1913,7 +1923,12 @@ fn rc_register_in_text(body: &str) -> String {
         match after.find(';') {
             Some(j) if !after[..j].contains('\n') => {
                 let rc = after[..j].trim();
-                out.push_str(&format!("$? = {rc} << 8;"));
+                let val = if !rc.is_empty() && rc.chars().all(|c| c.is_ascii_digit()) {
+                    format!("{rc} << 8")
+                } else {
+                    format!("({rc}) << 8")
+                };
+                out.push_str(&format!("$? = {val}; $CHILD_ERROR = $? >> 8;"));
                 i = at + MARKER.len() + j + 1;
             }
             _ => {
@@ -4608,6 +4623,11 @@ fn var_read(name: &str) -> String {
         // scopes.
         "#" => "scalar(@ARGV)".to_string(),
         "-" => "'hB'".to_string(), // bash's default non-interactive $- (hashall + braceexpand)
+        // `$?` is the shell CODE, which `$CHILD_ERROR` carries: the
+        // process-substitution status SAVE (`$__ps_statusN = $CHILD_ERROR`)
+        // and its restore write that variable directly, so the register is
+        // not the only carrier. Every register write refreshes the mirror
+        // (see `rc_write`) so the two cannot drift.
         "?" => "$CHILD_ERROR".to_string(),
         // `$!` — the pid of the most recent background job. The Background
         // arm writes it; without this arm the name fell through to the
