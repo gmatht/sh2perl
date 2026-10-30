@@ -3969,8 +3969,20 @@ fn seed_int_element_readers(prog: &mut IrProgram) {
         })
     }
     let mut pushed = 0;
+    let mut upgraded = 0;
     for v in &seed {
-        if prog.var_types.iter().any(|(n, _)| n == v) {
+        if let Some(pos) = prog.var_types.iter().position(|(n, _)| n == v) {
+            // Seed-proven but core-typed as text (e.g. `td_cs=$rd_cs`
+            // where rd_cs reads a native int array): promote to Int.
+            // Every assignment is value-int and nothing observes the var
+            // as text (the seed gate), so the native home reads
+            // identically; demote_stringy_ints (below) re-validates each
+            // promotion with the renderer's own is_numeric and demotes
+            // back anything it cannot home numerically.
+            if prog.var_types[pos].1 != IrType::Int {
+                prog.var_types[pos].1 = IrType::Int;
+                upgraded += 1;
+            }
             continue;
         }
         let rhs = assigns.get(v);
@@ -3988,7 +4000,7 @@ fn seed_int_element_readers(prog: &mut IrProgram) {
         pushed += 1;
     }
     if std::env::var("SH2_DEBUG_INT_ELEM").is_ok() {
-        eprintln!("INT_ELEM seeded {} readers", pushed);
+        eprintln!("INT_ELEM seeded {} readers ({} upgrades)", pushed, upgraded);
     }
 }
 
