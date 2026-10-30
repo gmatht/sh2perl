@@ -1853,3 +1853,35 @@ live).
 ## Running it
 
 Same toolchain as the P6/P7/P8 files (`--rlimit 40`).
+
+## exec-call-fold — `exec_call_fold.rs` (8)
+
+Per-site Tier-1 model over `transforms/exec_call_fold.rs` (carrier
+canonicalization): the payload-free `IrStmt::Exec` inside an arrow
+body / pipeline stage becomes the canonical `Expr(Call{"exec"})`
+spelling with the identical (cmd, argv) payload. The carrier flag
+(Arrow sets, Lambda/Function reset, Pipeline stages set) is a
+parameter; the `is_ps_tmp_cleanup` oracle and the `shir`-target gate
+are placement. Four pins mirror the 4 source unit tests; the
+runtime-invisibility check is model-internal.
+
+### `exec_call_fold.rs` — 8 obligations
+
+```
+    verus --triggers-mode silent --rlimit 40 exec_call_fold.rs
+    -> verification results:: 8 verified, 0 errors
+```
+
+**What is proved.** Folding never changes the command payload
+(`fold_preserves_payload`), and the folded call form is stable under
+a second pass (`fold_idempotent` — the source's own idempotence
+assertion). The value theorem holds even without the cleanup gate
+(both sides carry the same payload), so the pin, not the lemma, is
+load-bearing — the slice_identity/array_len_fold shape: the gates
+preserve recognisability (status-restore recognition, renderer Exec
+arms), not value. Mutant (cleanup refusal dropped) red at 7v/1e.
+Executed tests 4/4 PASS (all suites built live).
+
+## Running it
+
+Same toolchain as the P6/P7/P8 files (`--rlimit 40`).

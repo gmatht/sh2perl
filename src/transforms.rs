@@ -160,6 +160,14 @@ pub fn transform_applies(name: &str) -> bool {
             target().as_deref(),
             Some("c" | "js" | "estree" | "perl" | "go" | "rs" | "rust" | "zig" | "java" | "python")
         ),
+        // exec-call-fold: every code-generating renderer accepts the
+        // canonical command form (it IS the spelling the corpus already
+        // carries for ordinary commands), so the offer is open — except
+        // the `shir` A1-export target, where the byte-pinned contract
+        // keeps its statements verbatim (capture-node-fold/case-lowering
+        // precedent). The renderers still see the fold: `shir_render`
+        // binds no target, and a direct render binds the backend name.
+        "exec-call-fold" => !matches!(target().as_deref(), Some("shir")),
         // capture-node-fold: `Call { "capture", [Arrow] }` → the
         // first-class `Capture` node. Both forms render in every backend
         // (est/c convert the node BACK to the call form; perl's node arm
@@ -228,6 +236,13 @@ pub mod text_capture_fold; // constant `$(echo …)` in raw test/param/arith tex
 pub mod const_status_cond; // a `true`/`false`/`:` COMMAND in condition position → a constant cond + the command as the body's/branch's first statement (the `while true` fork-per-iteration, and the stale-`$CHILD_ERROR` condition it left behind)
 pub mod const_condition_elim;
 pub mod copy_propagation;
+// exec-call-fold: the payload-free `IrStmt::Exec` inside a command carrier
+// (arrow body / pipeline stage) → the canonical `Expr(Call{"exec"})`
+// command spelling the compound-context replayers key on (go's shell-text
+// rebuild, python's `body_shell_text`/`pipeline_run`, perl's native-capture
+// whitelist). Refuse > GUESS: a capture channel, redirect set, command env
+// or the synthetic `__ps_tmp` cleanup keeps its carrier.
+pub mod exec_call_fold;
 pub mod counted_while_forinit;
 pub mod counted_arith_forinit; // structured-Arith counted while → ForInit (frontend shapes)
 pub mod append_to_store; // counted-loop `a = append(a,v)` → `a[i] = v` (frontend shapes)
@@ -478,6 +493,12 @@ pub fn all() -> Vec<(&'static str, TransformFn)> {
         // gate; the census in split_inplace was hardened for activation:
         // full read+write coverage, eval/unknown refusal.)
         ("split-in-place", crate::shir_passes::split_inplace::transform),
+        // exec-call-fold, LAST (module doc "Placement"): every pass that
+        // keys `IrStmt::Exec` by name (`arith-forms`' `let`, `for-recovery`,
+        // `bc-float-clean`, `shir-pipeline-native`, `fuse-fill-consume`,
+        // `hoist-loop-invariants`, `isolate-accumulate`) has run by this
+        // slot, so only the renderers receive the canonical command form.
+        ("exec-call-fold", exec_call_fold::transform),
     ]
 }
 

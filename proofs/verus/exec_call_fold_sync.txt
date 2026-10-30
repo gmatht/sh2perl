@@ -1,0 +1,34 @@
+# verus-sync-coverage manifest: exec_call_fold
+# source sha: exec_call_fold=cfe60992d8e0  proof sha: 8f00d74a9db4
+
+[pins]
+pin pin_arrow_body_folds -> test arrow_body_exec_folds_to_the_call_form: MAPPED
+pin pin_capture_kept -> test payload_bearing_exec_refuses: MAPPED
+pin pin_fold_invisible_at_runtime -> UNMIRRORED (by design — see VERUS.md §(b).4)
+pin pin_ps_tmp_cleanup_kept -> test ps_tmp_cleanup_keeps_its_carrier: MAPPED
+pin pin_statement_position_kept -> test statement_position_exec_is_left_alone: MAPPED
+
+[guards]
+guard carrier gate: PRESENT
+guard ps-tmp-cleanup refusal: PRESENT
+guard payload-free gate: PRESENT
+guard canonical exec spelling: PRESENT
+
+[counts]
+proof-fns: 7
+pins: 5
+# NOTE: proof-fns is a file-shape fact (change detector), NOT the
+# Verus obligation count — the gate asserts N verified separately.
+
+[exec]
+# Each MAPPED test above, EXECUTED against the live source (one
+# module-suite run per model; per-test verdicts grepped from output).
+# A mapped test that fails or vanishes from the run is drift — FATAL.
+# The checker RUNS each mapped test (one module-suite cargo test per
+# source file) and records the per-test PASS/FAIL verdict below.
+# all suites built; per-test verdicts below
+exec pin_arrow_body_folds (arrow_body_exec_folds_to_the_call_form): PASS
+exec pin_capture_kept (payload_bearing_exec_refuses): PASS
+exec pin_fold_invisible_at_runtime: UNMIRRORED (not executed)
+exec pin_ps_tmp_cleanup_kept (ps_tmp_cleanup_keeps_its_carrier): PASS
+exec pin_statement_position_kept (statement_position_exec_is_left_alone): PASS
