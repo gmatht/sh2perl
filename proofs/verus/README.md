@@ -2047,3 +2047,30 @@ suites built live).
 ## Running it
 
 Same toolchain as the P6/P7/P8 files (`--rlimit 40`).
+
+## lane-private — `lane_private.rs` (12)
+
+Verdict-soundness Tier-1 model over `shir_passes/lane_private.rs`
+(sequential lane-nest classification): a Some verdict implies the
+structural facts the device consumer needs — chain writes ⊆
+init-defined names (dominating defs: lanes independent), the tail
+accumulates a private var, the acc is clean. The arith-purity
+gates, the let-text audit, and the censuses are oracle inputs;
+traversal is per-site. All nine pins mirror the 9 source unit
+tests (no UNMIRRORED).
+
+### `lane_private.rs` — 12 obligations
+
+```
+    verus --triggers-mode silent --rlimit 40 lane_private.rs
+    -> verification results:: 12 verified, 0 errors
+```
+
+**What is proved.** classify_sound (Some ⇒ covered writes +
+private tail var + clean acc) with the dominating-defs gate
+load-bearing. Mutant (uninit chain write admitted) red at 10v/2e.
+Executed tests 9/9 PASS (all suites built live).
+
+## Running it
+
+Same toolchain as the P6/P7/P8 files (`--rlimit 40`).

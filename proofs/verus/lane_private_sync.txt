@@ -1,0 +1,44 @@
+# verus-sync-coverage manifest: lane_private
+# source sha: lane_private=5e0ecba5e8fc  proof sha: eecfafe28191
+
+[pins]
+pin pin_acc_in_chain_vetoes -> test acc_written_in_chain_vetoes: MAPPED
+pin pin_call_in_chain_vetoes -> test call_in_chain_vetoes: MAPPED
+pin pin_cast_collatz_classifies -> test cast_wrapped_collatz_classifies: MAPPED
+pin pin_collatz_classifies -> test collatz_classifies: MAPPED
+pin pin_counter_write_vetoes -> test counter_write_in_chain_vetoes: MAPPED
+pin pin_forward_ref_vetoes -> test forward_ref_init_vetoes: MAPPED
+pin pin_output_in_chain_vetoes -> test output_in_chain_vetoes: MAPPED
+pin pin_tail_position_vetoes -> test tail_not_last_vetoes: MAPPED
+pin pin_uninit_write_vetoes -> test chain_writes_uninit_vetoes: MAPPED
+
+[guards]
+guard classifier entry: PRESENT
+guard verdict struct: PRESENT
+guard dominating-defs gate: PRESENT
+guard additive-tail gate: PRESENT
+guard purity gate: PRESENT
+guard plain-scalar check: PRESENT
+
+[counts]
+proof-fns: 11
+pins: 9
+# NOTE: proof-fns is a file-shape fact (change detector), NOT the
+# Verus obligation count — the gate asserts N verified separately.
+
+[exec]
+# Each MAPPED test above, EXECUTED against the live source (one
+# module-suite run per model; per-test verdicts grepped from output).
+# A mapped test that fails or vanishes from the run is drift — FATAL.
+# The checker RUNS each mapped test (one module-suite cargo test per
+# source file) and records the per-test PASS/FAIL verdict below.
+# all suites built; per-test verdicts below
+exec pin_acc_in_chain_vetoes (acc_written_in_chain_vetoes): PASS
+exec pin_call_in_chain_vetoes (call_in_chain_vetoes): PASS
+exec pin_cast_collatz_classifies (cast_wrapped_collatz_classifies): PASS
+exec pin_collatz_classifies (collatz_classifies): PASS
+exec pin_counter_write_vetoes (counter_write_in_chain_vetoes): PASS
+exec pin_forward_ref_vetoes (forward_ref_init_vetoes): PASS
+exec pin_output_in_chain_vetoes (output_in_chain_vetoes): PASS
+exec pin_tail_position_vetoes (tail_not_last_vetoes): PASS
+exec pin_uninit_write_vetoes (chain_writes_uninit_vetoes): PASS
