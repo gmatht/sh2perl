@@ -173,7 +173,15 @@ fn subs_from(v: Option<&Value>, where_: &str) -> Result<Vec<IrSub>, String> {
             let name = req_str(o, "name", &format!("{where_}[{i}]"))?.to_string();
             let params = str_array(o.get("params"), &format!("{where_}[{i}].params"))?;
             let body = stmts_from(o.get("body"), &format!("{where_}[{i}].body"))?;
-            Ok(IrSub { name, params, body })
+            // No defaults in this wire format: the field still has to be
+            // set, and every producer of this JSON emits required params
+            // only (the field is empty exactly when there are none).
+            Ok(IrSub {
+                name,
+                params,
+                param_defaults: Vec::new(),
+                body,
+            })
         })
         .collect()
 }
