@@ -10396,6 +10396,7 @@ pub fn shir_to_c(prog: &IrProgram) -> String {
         // strdup — trigger the block on either name and include both.
         if full.contains("_sh_xstrdup(")
             || full.contains("_sh_sset(")
+            || full.contains("_sh_sset_own(")
             || full.contains("_sh_sset_field(")
         {
             let pos = r.out.iter().rposition(|l| l.trim_start().starts_with("#include ")).map(|i| i + 1).unwrap_or(0);
@@ -10408,7 +10409,10 @@ pub fn shir_to_c(prog: &IrProgram) -> String {
                 "}".to_string(),
                 "".to_string(),
             ];
-            if full.contains("_sh_sset(") {
+            // `_sh_sset_own`'s NULL branch routes through `_sh_sset`,
+            // so either name keeps BOTH definitions (disjoint greps:
+            // `_sh_sset(` does not match `_sh_sset_own(`).
+            if full.contains("_sh_sset(") || full.contains("_sh_sset_own(") {
                 helper.extend([
                     "/* in-place store (SH2_NO_SSET=1 keeps the legacy _old temp-swap):".to_string(),
                     " * the legacy store freed the old buffer, so nothing may legally alias".to_string(),
@@ -10434,6 +10438,44 @@ pub fn shir_to_c(prog: &IrProgram) -> String {
                     "  char *p = _sh_xstrdup((char*)(src ? src : \"\"));".to_string(),
                     "  free(old);".to_string(),
                     "  *slot = p;".to_string(),
+                    "}".to_string(),
+                    "".to_string(),
+                ]);
+            }
+            // MOVE store: the value IS this statement's freshly built
+            // `_vN` buffer, so the store has the bytes in hand. The helper
+            // is `_sh_sset` with ONE difference: when the slot's buffer
+            // cannot absorb the value — or the value is over 1 KiB, the
+            // memcpy/alloc crossover — it ADOPTS the block (and hands the
+            // scratch a fresh block of that capacity, so its next fill
+            // keeps its high-water mark instead of re-doubling from 256)
+            // instead of strdup-ing a copy and freeing the old one. Small
+            // values that fit keep `_sh_sset`'s alloc-free in-place path
+            // byte-for-byte; the crossover is flat from 256 to 2048 on the
+            // MIMEcroft demo (−1.03% of first-frame instructions either
+            // way; 0 = always adopt is +1.4%, never adopt is −0.3%), so
+            // 1 KiB sits mid-plateau rather than on either cliff.
+            // Gate is its own call sites; `_sh_sset` above is guaranteed
+            // alongside it (the OR gate on the way in).
+            if full.contains("_sh_sset_own(") {
+                helper.extend([
+                    "/* move store: `src` is the just-built `_vN` buffer. A value that".to_string(),
+                    " * fits in the slot and is at most 1 KiB copies in place (alloc-free,".to_string(),
+                    " * exactly _sh_sset); otherwise the slot ADOPTS the block instead of".to_string(),
+                    " * copying it, and the scratch gets a fresh block of that capacity (no".to_string(),
+                    " * re-doubling from 256). NULL src is unreachable — the fill precedes".to_string(),
+                    " * the value — and falls back to the store this replaces.".to_string(),
+                    " * SH2_NO_MOVESTORE=1 keeps the copy.".to_string(),
+                    " */".to_string(),
+                    "static void _sh_sset_own(char **slot, char **vp, size_t *vcap) {".to_string(),
+                    "  if (!*vp) { _sh_sset(slot, \"\"); return; }".to_string(),
+                    "  char *old = *slot;".to_string(),
+                    "  size_t n = strlen(*vp) + 1;".to_string(),
+                    "  if (n <= 1024 && old && strnlen(old, n - 1) == n - 1) { memmove(old, *vp, n); return; }".to_string(),
+                    "  size_t c = *vcap; free(old); *slot = *vp;".to_string(),
+                    "  *vp = (char*)malloc(c);".to_string(),
+                    "  if (!*vp) { fprintf(stderr, \"sh2c: out of memory\\n\"); exit(127); }".to_string(),
+                    "  *vcap = c;".to_string(),
                     "}".to_string(),
                     "".to_string(),
                 ]);
@@ -12184,6 +12226,29 @@ impl Render {
             // itself (`a[k]=${a[k]}...`), and freeing first would leave
             // the copy reading freed memory.
             self.emit("  { char *_nv = (char*)_sh_xstrdup(v); free(a[i]); a[i] = _nv; }");
+            self.emit("  if ((size_t)(i + 1) > *len) *len = (size_t)(i + 1);");
+            self.emit("}");
+            // MOVE variant: `_sh_arr_set` with ONE difference — an element
+            // whose buffer cannot absorb the value, or whose value is over
+            // the same 1 KiB copy/alloc crossover, ADOPTS the just-built
+            // `_vN` block (and the scratch gets a fresh block of that
+            // capacity) instead of strdup-ing a copy and freeing the old
+            // one: same two allocs, no copy of a row that was just spliced
+            // into it. Smaller values that fit take `_sh_sset`'s
+            // probe+memmove, which arrays have no path to today — the
+            // probe buys the two allocs the copy version always pays.
+            // Guard-for-guard the same as `_sh_arr_set` (negative stores
+            // nothing, past-cap exits 127, NULL value stores nothing);
+            // present-if-used through the runtime trim like every helper
+            // here.
+            self.emit("static void _sh_arr_set_own(char **a, size_t *len, size_t cap, long long i, char **vp, size_t *vcap) {");
+            self.emit("  if (i < 0 || !*vp) return;");
+            self.emit("  if (i >= (long long)cap) { fprintf(stderr, \"sh2c: capacity exceeded\\n\"); exit(127); }");
+            self.emit("  char *old = a[i];");
+            self.emit("  size_t n = strlen(*vp) + 1;");
+            self.emit("  if (n <= 1024 && old && strnlen(old, n - 1) == n - 1) { memmove(old, *vp, n);");
+            self.emit("  } else { size_t c = *vcap; free(old); a[i] = *vp; *vp = (char*)malloc(c);");
+            self.emit("    if (!*vp) { fprintf(stderr, \"sh2c: out of memory\\n\"); exit(127); } *vcap = c; }");
             self.emit("  if ((size_t)(i + 1) > *len) *len = (size_t)(i + 1);");
             self.emit("}");
             self.emit("static const char *_sh_arr_get(char **a, size_t len, long long i) {");
@@ -24538,9 +24603,36 @@ fn param_copy_alias(
             self.emit(&format!(
                 "{{ char *{old} = {id}; {id} = _sh_xstrdup((char*)({v})); free({old}); }}"
             ));
+        } else if let Some(t) = Self::ownable_vbuf(v) {
+            self.emit(&format!("_sh_sset_own(&{id}, &{t}.p, &{t}.cap);"));
         } else {
             self.emit(&format!("_sh_sset(&{id}, (char*)({v}));"));
         }
+    }
+
+    /// The `_vN.p` value of a `vbuf_temp()` buffer: the value IS that
+    /// freshly built heap block (minted and filled while rendering THIS
+    /// statement), so a store of it already holds the bytes and can keep
+    /// them instead of strdup-ing them into the slot and freeing the old
+    /// buffer — the double copy (`rb_putrun` splices a row, the store
+    /// then copies ~2.5 KB of it) that dominated the MIMEcroft demo.
+    /// Returns the buffer name so the store can pass `&{t}.p` /
+    /// `&{t}.cap` and let the helper decide between its in-place path and
+    /// taking ownership.
+    ///
+    /// C-specific by construction: the fact needed is "this value is a
+    /// buffer THIS backend minted while rendering" — no shIR node can
+    /// name a temp that exists only in the emitted C. `SH2_NO_SSET=1`
+    /// keeps the legacy path (the move only ever replaces `_sh_sset`) and
+    /// `SH2_NO_MOVESTORE=1` keeps the copy; both switches are in bash-O4's
+    /// artifact cache key, so neither can be served a stale render.
+    fn ownable_vbuf(v: &str) -> Option<&str> {
+        if std::env::var_os("SH2_NO_MOVESTORE").is_some() {
+            return None;
+        }
+        let t = v.strip_suffix(".p")?;
+        let n = t.strip_prefix("_v")?;
+        (!n.is_empty() && n.bytes().all(|b| b.is_ascii_digit())).then_some(t)
     }
 
     /// FUSED chop store: `x = <FieldGrab …>` when the extraction IS the
@@ -30156,6 +30248,10 @@ fn param_copy_alias(
         if self.int_arrays.contains(var) {
             let nv = self.store_int_item_c(val);
             self.emit(&format!("{{ long long _kk = (long long)({key}); if (_kk >= 0) {{ if (_kk >= {acap}) {{ fprintf(stderr, \"sh2c: capacity exceeded: {id}\\n\"); exit(127); }} {id}[_kk] = {nv}; if ((size_t)(_kk + 1) > {id}_len) {id}_len = _kk + 1; }} }}"));
+        } else if let Some(t) = Self::ownable_vbuf(v) {
+            self.emit(&format!(
+                "_sh_arr_set_own({id}, &{id}_len, {acap}, {key}, &{t}.p, &{t}.cap);"
+            ));
         } else {
             self.emit(&format!(
                 "_sh_arr_set({id}, &{id}_len, {acap}, {key}, {v});"
