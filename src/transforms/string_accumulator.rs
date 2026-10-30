@@ -41,7 +41,7 @@
 //! only, no structural mutation. Renderer hooks: estree.rs (the shrinking
 //! `blk_p` cons-chain), and any backend with a mutable string builder.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::sync::Mutex;
 
 use crate::ir::{AssignTarget, InterpPart, IrExpr, IrStmt, StrStyle};
@@ -1047,4 +1047,428 @@ mod tests {
         transform(&mut stmts);
         assert!(accumulators().is_empty(), "non-literal init must refuse");
     }
+}
+
+// ====================================================================
+// Whole-program callee write sets — the crossing proof `arr_load_fwd`
+// asks ("is CALLING this function inert with respect to `arr`?"),
+// computed once per unit and shared so every consumer agrees by
+// construction.
+// ====================================================================
+
+/// Key: every program-defined function in the unit. Value: its
+/// transitive name-write set, or `None` when any part of the body lies
+/// outside the model — an external/unknown callee, a form the census
+/// does not model. A `None` entry is the caller's refusal: the consumer
+/// must refuse rather than trust a partial set as complete.
+pub type Cw = HashMap<String, Option<HashSet<String>>>;
+
+/// Callees whose name effects are either recorded by DSE's `census`
+/// itself (the read helpers read their name args; the writers record
+/// their Str target) or that write no name at all (the stdout/status-
+/// only shell builtins). Anything else — an external command, an
+/// `eval`/`source`-style dispatch (`fnCall`/`fnValue`/`callDirect`),
+/// a bare builtin we have not vetted — collapses the containing
+/// function's verdict to `None`. A program definition of the same name
+/// shadows this list (the `cw.contains_key` check comes first), so a
+/// script that redefines `echo` is judged by its body instead.
+const CALLEE_SAFE: &[&str] = &[
+    // stdout / status only — no name writes
+    "echo", "printf", ":", "true", "false", "test",
+    // census-modelled helpers: reads, or writes of their Str target
+    "getVar", "arrayIndex", "param", "byteAt", "jsonGet", "jsonSet",
+    "jsonArrGet", "jsonArrSet", "jsonArrAppend", "memLoad", "memAdvance",
+    "memFree", "memStore", "arrayStore", "setVar", "setArray",
+];
+
+/// A callee that contributes no observable name writes beyond what the
+/// census already records (the shared read-only/pure helper lists).
+fn safe_callee(f: &str) -> bool {
+    CALLEE_SAFE.contains(&f) || super::READ_ONLY_CALLS.contains(&f)
+}
+
+/// Compute the transitive write set of every program function in the
+/// unit. The map starts optimistically (`Some(∅)`) — a pessimistic
+/// `None` would be absorbing and every verdict would stay refused —
+/// and is re-derived to a fixpoint: `None` is only ever produced by a
+/// fact about a body itself (unknown callee, unmodelled form), never by
+/// another function's current uncertainty, so it cannot be transient.
+pub fn callee_write_sets(stmts: &[IrStmt]) -> Cw {
+    let mut defs: HashMap<String, Vec<Vec<IrStmt>>> = HashMap::new();
+    collect_defs(stmts, &mut defs);
+    if defs.is_empty() {
+        return Cw::new();
+    }
+    let mut cw: Cw = defs.keys().map(|n| (n.clone(), Some(HashSet::new()))).collect();
+    let rounds = defs.len() + 2; // chain depth + margin
+    for _ in 0..rounds {
+        let mut changed = false;
+        for (name, bodies) in &defs {
+            let mut merged: Option<HashSet<String>> = Some(HashSet::new());
+            for b in bodies {
+                merged = match (merged.take(), body_write_set(b, &cw)) {
+                    (Some(mut acc), Some(s)) => {
+                        acc.extend(s);
+                        Some(acc)
+                    }
+                    _ => None,
+                };
+                if merged.is_none() {
+                    break;
+                }
+            }
+            if cw.get(name).cloned() != Some(merged.clone()) {
+                cw.insert(name.clone(), merged);
+                changed = true;
+            }
+        }
+        if !changed {
+            break;
+        }
+    }
+    cw
+}
+
+/// Collect every `IrStmt::Function` definition, at any nesting depth.
+/// A name defined twice contributes BOTH bodies (the write set is the
+/// union — shadowing must never under-model).
+fn collect_defs(list: &[IrStmt], out: &mut HashMap<String, Vec<Vec<IrStmt>>>) {
+    for st in list {
+        if let IrStmt::Function { name, body, .. } = st {
+            out.entry(name.clone()).or_default().push(body.clone());
+        }
+        for l in child_lists(st) {
+            collect_defs(l, out);
+        }
+    }
+}
+
+/// The nested statement lists of one statement (for whole-unit walks).
+fn child_lists(st: &IrStmt) -> Vec<&[IrStmt]> {
+    match st {
+        IrStmt::If { then, elsifs, else_, .. } => {
+            let mut v: Vec<&[IrStmt]> = vec![then, else_];
+            for (_, b) in elsifs {
+                v.push(b);
+            }
+            v
+        }
+        IrStmt::For { body, .. }
+        | IrStmt::While { body, .. }
+        | IrStmt::DoWhile { body, .. }
+        | IrStmt::Function { body, .. } => vec![body],
+        IrStmt::ForInit { init, step, body, .. } => vec![init, step, body],
+        IrStmt::Block(v) | IrStmt::Subshell(v) | IrStmt::Background(v) => vec![v],
+        IrStmt::Case { clauses, .. } => clauses.iter().map(|c| c.body.as_slice()).collect(),
+        IrStmt::Redirect { inner, .. } => vec![inner],
+        IrStmt::Pipeline { stages, .. } => stages.iter().map(|s| s.as_slice()).collect(),
+        IrStmt::Try {
+            body,
+            excepts,
+            else_body,
+            finally_body,
+            ..
+        } => {
+            let mut v: Vec<&[IrStmt]> = vec![body, else_body, finally_body];
+            for e in excepts {
+                v.push(&e.body);
+            }
+            v
+        }
+        _ => Vec::new(),
+    }
+}
+
+/// `Some(set)` only when every statement in `body` is inside the model:
+/// DSE's `census` supplies the direct writes (the same model DSE itself
+/// trusts), the scan unions the sets of the program functions it calls
+/// transitively, and the first unknown — an external callee, a form the
+/// census does not model — collapses the verdict to `None`.
+///
+/// Command substitutions, subshell/background bodies and pipeline
+/// stages are deliberately SKIPPED: their name writes cannot escape the
+/// subshell/stage into the caller, so they cannot touch `arr` either.
+fn body_write_set(body: &[IrStmt], cw: &Cw) -> Option<HashSet<String>> {
+    let mut reads = HashSet::new();
+    let mut writes = HashSet::new();
+    let mut escapes = HashSet::new();
+    crate::transforms::dead_store_elim::census(body, &mut reads, &mut writes, &mut escapes);
+    scan_list(body, cw, &mut writes)?;
+    Some(writes)
+}
+
+/// Union the callee's current set into `writes`, or refuse when it is
+/// unknown (not a program function we modelled) / unmodelled (`None`).
+fn union_cw(name: &str, cw: &Cw, writes: &mut HashSet<String>) -> Option<()> {
+    match cw.get(name) {
+        Some(Some(s)) => {
+            writes.extend(s.iter().cloned());
+            Some(())
+        }
+        _ => None,
+    }
+}
+
+/// Refuse-or-extend statement walk. Every arm either descends (so a
+/// parent-shell call inside is caught), unions a program callee, or
+/// skips a construct whose writes provably cannot reach the caller.
+/// Field shapes mirror `dead_store_elim::census_stmt` and
+/// `arr_load_fwd::stmt_refuses` — the two proven consumers of these
+/// patterns.
+fn scan_list(list: &[IrStmt], cw: &Cw, writes: &mut HashSet<String>) -> Option<()> {
+    for st in list {
+        match st {
+            IrStmt::Assign { targets, expr, .. } => {
+                scan_expr(expr, cw, writes)?;
+                for t in targets {
+                    for i in &t.indices {
+                        scan_expr(i, cw, writes)?;
+                    }
+                }
+            }
+            IrStmt::Declare { init, .. } => {
+                if let Some(i) = init {
+                    scan_expr(i, cw, writes)?;
+                }
+            }
+            IrStmt::DeclareArray { elements, .. } => {
+                for e in elements {
+                    scan_expr(e, cw, writes)?;
+                }
+            }
+            IrStmt::Output { value, .. } => scan_expr(value, cw, writes)?,
+            IrStmt::WriteFile { path, content, .. } => {
+                scan_expr(path, cw, writes)?;
+                scan_expr(content, cw, writes)?;
+            }
+            IrStmt::Expr(e) => scan_expr(e, cw, writes)?,
+            IrStmt::Return(Some(e)) | IrStmt::Exit(Some(e)) | IrStmt::SetChildError(e) => {
+                scan_expr(e, cw, writes)?
+            }
+            IrStmt::Die { expr, .. } | IrStmt::Warn { expr, .. } => scan_expr(expr, cw, writes)?,
+            IrStmt::If { cond, then, elsifs, else_ } => {
+                scan_expr(cond, cw, writes)?;
+                scan_list(then, cw, writes)?;
+                for (c, b) in elsifs {
+                    scan_expr(c, cw, writes)?;
+                    scan_list(b, cw, writes)?;
+                }
+                scan_list(else_, cw, writes)?;
+            }
+            IrStmt::While { cond, body } => {
+                scan_expr(cond, cw, writes)?;
+                scan_list(body, cw, writes)?;
+            }
+            IrStmt::DoWhile { body, cond, .. } => {
+                scan_list(body, cw, writes)?;
+                scan_expr(cond, cw, writes)?;
+            }
+            IrStmt::For { iter, body, .. } => {
+                scan_expr(iter, cw, writes)?;
+                scan_list(body, cw, writes)?;
+            }
+            IrStmt::ForInit { init, cond, step, body } => {
+                for s in init {
+                    scan_list(std::slice::from_ref(s), cw, writes)?;
+                }
+                scan_expr(cond, cw, writes)?;
+                for s in step {
+                    scan_list(std::slice::from_ref(s), cw, writes)?;
+                }
+                scan_list(body, cw, writes)?;
+            }
+            IrStmt::Block(v) => scan_list(v, cw, writes)?,
+            IrStmt::Case { discriminant, clauses } => {
+                scan_expr(discriminant, cw, writes)?;
+                for cl in clauses {
+                    // a clause PATTERN is text (expanded like a word) —
+                    // the census records its `$name` reads; nothing else
+                    // executes there.
+                    scan_list(&cl.body, cw, writes)?;
+                }
+            }
+            IrStmt::Redirect { inner, redirects } => {
+                for r in redirects {
+                    scan_expr(&r.target, cw, writes)?;
+                }
+                scan_list(inner, cw, writes)?;
+            }
+            IrStmt::Try {
+                body,
+                excepts,
+                else_body,
+                finally_body,
+                ..
+            } => {
+                scan_list(body, cw, writes)?;
+                for e in excepts {
+                    if let Some(m) = &e.match_expr {
+                        scan_expr(m, cw, writes)?;
+                    }
+                    scan_list(&e.body, cw, writes)?;
+                }
+                scan_list(else_body, cw, writes)?;
+                scan_list(finally_body, cw, writes)?;
+            }
+            IrStmt::Exec {
+                cmd,
+                args,
+                env,
+                redirects,
+                ..
+            } => {
+                match cmd {
+                    IrExpr::Str(n, _) | IrExpr::Ident(n) => {
+                        if cw.contains_key(n.as_str()) {
+                            union_cw(n, cw, writes)?;
+                        } else if !safe_callee(n.as_str()) {
+                            return None; // external/unknown command
+                        }
+                    }
+                    _ => return None, // a dynamic command name — refuse
+                }
+                for a in args {
+                    scan_expr(a, cw, writes)?;
+                }
+                for (_, e) in env {
+                    scan_expr(e, cw, writes)?;
+                }
+                for r in redirects {
+                    scan_expr(r, cw, writes)?;
+                }
+            }
+            // a definition does not execute where it sits; its own body
+            // is a separate entry in `cw` (and `census` already folded
+            // its literal writes into ours — an over-approximation).
+            IrStmt::Function { .. } => {}
+            // subshell isolation: their writes (and their callees'
+            // writes) cannot reach the caller's names.
+            IrStmt::Subshell(_) | IrStmt::Background(_) | IrStmt::Pipeline { .. } => {}
+            // no expressions of their own:
+            IrStmt::Return(None)
+            | IrStmt::Exit(None)
+            | IrStmt::Continue
+            | IrStmt::Break
+            | IrStmt::Label(_)
+            | IrStmt::Goto(_) => {}
+            // unmodelled forms — refuse:
+            IrStmt::Select { .. }
+            | IrStmt::Ext(_)
+            | IrStmt::Asm { .. }
+            | IrStmt::Shaderize { .. }
+            | IrStmt::Require(_)
+            | IrStmt::RawText(_) => return None,
+            _ => return None,
+        }
+    }
+    Some(())
+}
+
+/// Refuse-or-extend expression walk: find the calls that EXECUTE in
+/// the current shell (a `Capture`'s contents do not — subshell) and
+/// union their sets. `Arith` is skipped because its AST cannot hold a
+/// call; census's `arith_census` already recorded its assignments.
+/// Default arm refuses, so an unmodelled/new node type can never
+/// silently pass.
+fn scan_expr(e: &IrExpr, cw: &Cw, writes: &mut HashSet<String>) -> Option<()> {
+    match e {
+        IrExpr::Call { func, args } => {
+            if func == "exec" {
+                // exec(NAME, …) runs program fn NAME in this shell
+                match args.split_first() {
+                    Some((IrExpr::Str(n, _), rest)) | Some((IrExpr::Ident(n), rest)) => {
+                        union_cw(n, cw, writes)?;
+                        for a in rest {
+                            scan_expr(a, cw, writes)?;
+                        }
+                    }
+                    _ => return None,
+                }
+            } else if cw.contains_key(func.as_str()) {
+                union_cw(func, cw, writes)?;
+                for a in args {
+                    scan_expr(a, cw, writes)?;
+                }
+            } else if safe_callee(func.as_str()) {
+                for a in args {
+                    scan_expr(a, cw, writes)?;
+                }
+            } else {
+                return None; // unknown callee (incl. fnCall-style dispatch)
+            }
+        }
+        // a command substitution runs in a subshell: its name writes
+        // cannot reach the caller (census already recorded its reads),
+        // and expr_refuses refuses the substitution at the CROSSING
+        // site anyway, so nothing here can admit an unknown effect.
+        IrExpr::Capture { .. } => {}
+        IrExpr::Interpolate(parts) => {
+            for p in parts {
+                if let InterpPart::Expr(x) = p {
+                    scan_expr(x, cw, writes)?;
+                }
+            }
+        }
+        IrExpr::Arrow(body) => scan_list(body, cw, writes)?,
+        IrExpr::Lambda { body, .. } => scan_list(body, cw, writes)?,
+        IrExpr::Array(items) => {
+            for x in items {
+                scan_expr(x, cw, writes)?;
+            }
+        }
+        IrExpr::Object(kvs) => {
+            for (_, x) in kvs {
+                scan_expr(x, cw, writes)?;
+            }
+        }
+        IrExpr::Splice(x) => scan_expr(x, cw, writes)?,
+        IrExpr::ArrayComp {
+            iter, elem, cond, ..
+        } => {
+            scan_expr(iter, cw, writes)?;
+            scan_expr(elem, cw, writes)?;
+            if let Some(c) = cond {
+                scan_expr(c, cw, writes)?;
+            }
+        }
+        IrExpr::BinOp { lhs, rhs, .. } => {
+            scan_expr(lhs, cw, writes)?;
+            scan_expr(rhs, cw, writes)?;
+        }
+        IrExpr::Index { key, .. } => scan_expr(key, cw, writes)?,
+        IrExpr::Ternary { cond, then, else_ } => {
+            scan_expr(cond, cw, writes)?;
+            scan_expr(then, cw, writes)?;
+            scan_expr(else_, cw, writes)?;
+        }
+        IrExpr::DefinedOr { expr, default } => {
+            scan_expr(expr, cw, writes)?;
+            scan_expr(default, cw, writes)?;
+        }
+        IrExpr::MethodCall { obj, args, .. } => {
+            scan_expr(obj, cw, writes)?;
+            for a in args {
+                scan_expr(a, cw, writes)?;
+            }
+        }
+        IrExpr::Ext(n) => {
+            for c in n.children() {
+                scan_expr(c, cw, writes)?;
+            }
+        }
+        // no calls possible: values, variables, parsed arithmetic,
+        // ranges (i64s), and raw text we refuse instead of guessing
+        // (see the default arm).
+        IrExpr::Int(_)
+        | IrExpr::Str(_, _)
+        | IrExpr::Var(_, _)
+        | IrExpr::Bool(_)
+        | IrExpr::Json(_)
+        | IrExpr::Ident(_)
+        | IrExpr::Regex { .. }
+        | IrExpr::Range { .. }
+        | IrExpr::Arith(_) => {}
+        _ => return None,
+    }
+    Some(())
 }

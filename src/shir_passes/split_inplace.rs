@@ -659,7 +659,7 @@ fn is_plain_mutable_name(x: &str) -> bool {
 
 /// Names given the EXPORT attribute or otherwise env-visible — never
 /// eligible for in-place destruction.
-fn exported_names(stmts: &[IrStmt]) -> BTreeSet<String> {
+pub fn exported_names(stmts: &[IrStmt]) -> BTreeSet<String> {
     let mut out = BTreeSet::new();
     let add_word = |ws: &str, out: &mut BTreeSet<String>| {
         if let Some((n, _)) = ws.split_once('=') {

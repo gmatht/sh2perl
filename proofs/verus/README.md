@@ -1982,3 +1982,38 @@ by exactly one. Mutant (accepting +2) red at 9v/3e. Executed tests
 ## Running it
 
 Same toolchain as the P6/P7/P8 files (`--rlimit 40`).
+
+## arr-load-fwd — `arr_load_fwd.rs` (37)
+
+Per-site Tier-1 model over `transforms/arr_load_fwd.rs`
+(single-def element-load copy propagation): `v = arr[key]` folds
+its later same-list reads back to the element load, preserving the
+run (final store + trace) from any closed start store. The
+copy-propagation twin with an array-read payload: the element map
+with its stability argument, and the clean-span oracle (`span_mono`
+nesting + `span_sound` no-store-to-array contract) in place of the
+twin's literal permanence. Nine pins mirror the 9 source unit
+tests; the orphan-preservation exhibit and the trace check are
+model-internal. Lands with its compile dependencies (the
+`callee_write_sets` analysis, `READ_ONLY_CALLS`, the DSE purity
+arm, four visibility widenings).
+
+### `arr_load_fwd.rs` — 37 obligations
+
+```
+    verus --triggers-mode silent --rlimit 40 arr_load_fwd.rs
+    -> verification results:: 37 verified, 0 errors
+```
+
+**What is proved.** Single-store induction with `prefix_ok` (every
+executed def holds its element's current value while the span stays
+clean) + the two-write contradiction; ArrStore arms fold their RHS
+(RHS-before-store) while breaking later spans; the orphan drop is
+exhibited per-shape under DSE's standard (the general purge is the
+proved dead_store_elim rule, cited). Mutant (folding without the
+clean-span gate) red at 33v/4e. Executed tests 9/9 PASS (all suites
+built live).
+
+## Running it
+
+Same toolchain as the P6/P7/P8 files (`--rlimit 40`).

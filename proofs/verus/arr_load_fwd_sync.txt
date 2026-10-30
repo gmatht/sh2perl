@@ -1,0 +1,50 @@
+# verus-sync-coverage manifest: arr_load_fwd
+# source sha: arr_load_fwd=efa6605f3fdd  proof sha: 1eb2817e96cc
+
+[pins]
+pin pin_array_write_refuses -> test refuses_when_the_array_is_written_in_between: MAPPED
+pin pin_forward_folds -> test forwards_a_single_def_element_load_and_drops_the_store: MAPPED
+pin pin_key_write_refuses -> test refuses_when_the_key_variable_is_written_in_between: MAPPED
+pin pin_multi_def_refuses -> test refuses_a_second_write_to_the_scalar: MAPPED
+pin pin_opaque_refuses -> test refuses_a_call_between_def_and_read: MAPPED
+pin pin_orphan_drops -> test removes_a_function_body_orphan_dse_can_never_take: MAPPED
+pin pin_orphan_preserves -> UNMIRRORED (by design — see VERUS.md §(b).4)
+pin pin_refuse_before_def -> test a_read_before_the_def_never_folds: MAPPED
+pin pin_sibling_call_inert -> test forwards_the_call_spelling_across_sibling_element_loads: MAPPED
+pin pin_sibling_read_inert -> test an_intervening_read_of_the_array_is_inert: MAPPED
+pin pin_trace_agrees -> UNMIRRORED (by design — see VERUS.md §(b).4)
+
+[guards]
+guard candidate gate: PRESENT
+guard call spelling: PRESENT
+guard pure-key gate: PRESENT
+guard key-vars gate: PRESENT
+guard span-refusal verdict: PRESENT
+guard store-break verdict: PRESENT
+guard read-only calls: PRESENT
+guard orphan sweep: PRESENT
+
+[counts]
+proof-fns: 31
+pins: 11
+# NOTE: proof-fns is a file-shape fact (change detector), NOT the
+# Verus obligation count — the gate asserts N verified separately.
+
+[exec]
+# Each MAPPED test above, EXECUTED against the live source (one
+# module-suite run per model; per-test verdicts grepped from output).
+# A mapped test that fails or vanishes from the run is drift — FATAL.
+# The checker RUNS each mapped test (one module-suite cargo test per
+# source file) and records the per-test PASS/FAIL verdict below.
+# all suites built; per-test verdicts below
+exec pin_array_write_refuses (refuses_when_the_array_is_written_in_between): PASS
+exec pin_forward_folds (forwards_a_single_def_element_load_and_drops_the_store): PASS
+exec pin_key_write_refuses (refuses_when_the_key_variable_is_written_in_between): PASS
+exec pin_multi_def_refuses (refuses_a_second_write_to_the_scalar): PASS
+exec pin_opaque_refuses (refuses_a_call_between_def_and_read): PASS
+exec pin_orphan_drops (removes_a_function_body_orphan_dse_can_never_take): PASS
+exec pin_orphan_preserves: UNMIRRORED (not executed)
+exec pin_refuse_before_def (a_read_before_the_def_never_folds): PASS
+exec pin_sibling_call_inert (forwards_the_call_spelling_across_sibling_element_loads): PASS
+exec pin_sibling_read_inert (an_intervening_read_of_the_array_is_inert): PASS
+exec pin_trace_agrees: UNMIRRORED (not executed)

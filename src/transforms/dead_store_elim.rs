@@ -171,7 +171,7 @@ const SHELL_IMPLICIT_VARS: &[&str] = &[
     "BASH_ENV", "OPTIND",
 ];
 
-fn is_shell_implicit(name: &str) -> bool {
+pub fn is_shell_implicit(name: &str) -> bool {
     SHELL_IMPLICIT_VARS.contains(&name)
 }
 
@@ -406,7 +406,7 @@ fn dollar_names_in(text: &str) -> Vec<String> {
     out
 }
 
-fn census(stmts: &[IrStmt], reads: &mut HashSet<String>, writes: &mut HashSet<String>, escapes: &mut HashSet<String>) {
+pub fn census(stmts: &[IrStmt], reads: &mut HashSet<String>, writes: &mut HashSet<String>, escapes: &mut HashSet<String>) {
     for st in stmts {
         census_stmt(st, reads, writes, escapes, false);
     }
@@ -861,7 +861,7 @@ fn arith_census(
 /// DCE must not erase a command substitution, a runtime call, an arithmetic
 /// assignment/incdec, or any opaque/raw expression merely because its result
 /// flows into a dead variable.
-fn expr_pure(e: &IrExpr) -> bool {
+pub fn expr_pure(e: &IrExpr) -> bool {
     match e {
         IrExpr::Int(_)
         | IrExpr::Str(_, _)
@@ -884,6 +884,22 @@ fn expr_pure(e: &IrExpr) -> bool {
         IrExpr::Array(items) => items.iter().all(expr_pure),
         IrExpr::Object(items) => items.iter().all(|(_, x)| expr_pure(x)),
         IrExpr::Splice(x) => expr_pure(x),
+        // A read helper in call form is a pure LOAD — the shared
+        // `READ_ONLY_CALLS` list (the same one `arr_load_fwd`'s crossing
+        // verdict trusts): evaluating it reads names and nothing else,
+        // so skipping it when its destination is dead cannot skip, move
+        // or observe anything — exactly the standard `arr_load_fwd`'s
+        // orphan sweep needs for an element-load RHS (`bh=HEX[$b]` is
+        // `Call { "arrayIndex" }` in the lowered form, and DSE itself
+        // refuses every function-body site as multi-run, so without
+        // this recognition no backend ever drops that copy). The args
+        // go through `expr_pure` too, so a capture hiding inside a key
+        // still refuses.
+        IrExpr::Call { func, args }
+            if super::READ_ONLY_CALLS.contains(&func.as_str()) && args.iter().all(expr_pure) =>
+        {
+            true
+        }
         // Calls, captures, method calls, arrows/lambdas and comprehensions
         // can execute work or observe shell state. Keep their enclosing
         // assignment rather than trying to prove more here.

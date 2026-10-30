@@ -251,6 +251,10 @@ pub mod text_capture_fold; // constant `$(echo …)` in raw test/param/arith tex
 pub mod const_status_cond; // a `true`/`false`/`:` COMMAND in condition position → a constant cond + the command as the body's/branch's first statement (the `while true` fork-per-iteration, and the stale-`$CHILD_ERROR` condition it left behind)
 pub mod const_condition_elim;
 pub mod copy_propagation;
+// arr-load-fwd: a single-def element load (`v=${T[$k]}`) forwarded into
+// its later reads, so the scalar copy never materialises. The shIR→shIR
+// twin of copy-propagation's literal case; same dominance argument.
+pub mod arr_load_fwd;
 // exec-call-fold: the payload-free `IrStmt::Exec` inside a command carrier
 // (arrow body / pipeline stage) → the canonical `Expr(Call{"exec"})`
 // command spelling the compound-context replayers key on (go's shell-text
@@ -259,6 +263,22 @@ pub mod copy_propagation;
 // or the synthetic `__ps_tmp` cleanup keeps its carrier.
 pub mod exec_call_fold;
 pub mod counted_while_forinit;
+
+/// Calls whose result is a READ of shell state and nothing else: the
+/// element/word readers cannot write a variable or touch anything else
+/// the program observes, so evaluating one is side-effect free.
+/// Shared because two passes need the same verdict:
+///   - `arr-load-fwd` proves an intervening statement inert with it
+///     (a sibling `arrayIndex` must not stop the forward),
+///   - `dead-store-elim` proves a dead store's RHS pure with it — without
+///     that, a forwarded element load leaves `v = arrayIndex(…)` behind
+///     with no reader and no purge (`IrExpr::Call` refuses by default),
+///     so the scalar copy the forward just orphaned is never removed.
+/// A name missing from this list is treated as opaque by both: refuse >
+/// guess.
+pub const READ_ONLY_CALLS: &[&str] = &[
+    "arrayIndex", "arrayItems", "arrayLen", "getVar", "param", "listVar",
+];
 pub mod counted_arith_forinit; // structured-Arith counted while → ForInit (frontend shapes)
 pub mod append_to_store; // counted-loop `a = append(a,v)` → `a[i] = v` (frontend shapes)
 pub mod dead_store_elim;
@@ -438,6 +458,11 @@ pub fn all() -> Vec<(&'static str, TransformFn)> {
         ("const-status-cond", const_status_cond::transform),
         ("const-condition-elim", const_condition_elim::transform),
         ("copy-propagation", copy_propagation::transform),
+        // arr-load-fwd runs right after copy-propagation (the same
+        // single-def-dominates-its-reads argument, payload = an element
+        // load instead of a literal) and BEFORE dead-store-elim, which
+        // inherits the freshly dead scalar stores.
+        ("arr-load-fwd", arr_load_fwd::transform),
         ("counted-while-forinit", counted_while_forinit::transform),
         ("counted-arith-forinit", counted_arith_forinit::transform),
         ("append-to-store", append_to_store::transform),
