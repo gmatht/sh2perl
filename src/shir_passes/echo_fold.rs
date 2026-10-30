@@ -103,6 +103,26 @@ fn fold_narrow(stmts: &mut [IrStmt]) {
             IrStmt::DoWhile { body, .. } => fold_narrow(body),
             IrStmt::Block(b) => fold_narrow(b),
             IrStmt::Redirect { inner, .. } => fold_narrow(inner),
+            // A function BODY is the same statement list a `Block` is:
+            // a standalone `echo` written inside `f() { … }` folds
+            // exactly as it does at top level, so `f() { echo x > file; }`
+            // reaches `WriteFile` and renders `fs::write` in Rust with no
+            // sink machinery (`function_bodies_are_runtime_free_when_
+            // redirect_free`), and every other backend drops the same
+            // word-printing polyfill. The four matcher-keyed containers
+            // fold_narrow's doc names are NOT this one — the chain /
+            // subshell-capture / bc-producer arms key on shapes this arm
+            // does not create (it only ever replaces a standalone
+            // `Expr(echo)` statement), so their `Expr(Call echo)` matchers
+            // keep the shapes they were measured against.
+            IrStmt::Function {
+                body, named_blocks, ..
+            } => {
+                fold_narrow(body);
+                for (_, b) in named_blocks.iter_mut() {
+                    fold_narrow(b);
+                }
+            }
             _ => {}
         }
         if let Some(out) = constant_echo(st)
@@ -328,6 +348,20 @@ fn fold_wide_stmt(st: &mut IrStmt, fold_echo: bool) {
 /// * Status: a successful write is 0 in bash, and `WriteFile` is a
 ///   status-0 statement for Rust/Java/estree already (their arms store
 ///   it); the Perl arm records it too.
+/// The null command with NO arguments — the `:` of `: > f`. It produces
+/// nothing, so inside a redirect it is an empty file write; `: word` is
+/// a command with arguments and stays put. Like [`is_var_read`] this is
+/// a shape test, not an evaluation: nothing here is ever executed.
+fn is_noop_colon(e: &IrExpr) -> bool {
+    let IrExpr::Call { func, args, .. } = e else {
+        return false;
+    };
+    (func == "builtin" || func == "exec")
+        && matches!(args.first(), Some(IrExpr::Str(c, _)) if c == ":")
+        && (matches!(args.get(1), None)
+            || matches!(args.get(1), Some(IrExpr::Array(a)) if a.is_empty()))
+}
+
 pub fn redirected_output_to_writefile(st: &mut IrStmt) -> bool {
     let IrStmt::Redirect { inner, redirects } = st else {
         return false;
@@ -343,6 +377,21 @@ pub fn redirected_output_to_writefile(st: &mut IrStmt) -> bool {
         "a" => true,
         _ => return false,
     };
+    // `: > f` has no `Output` half to wait for — it produces nothing — so
+    // give it the empty one and let the rest of this fold (target rules,
+    // content building, status) apply unchanged: `w` truncates, `a`
+    // touches, both exactly what bash does. Only here: a bare `:` with no
+    // redirect never reaches this function, so that statement keeps its
+    // shape.
+    if let [IrStmt::Expr(e)] = inner.as_slice() {
+        if is_noop_colon(e) {
+            inner[0] = IrStmt::Output {
+                value: IrExpr::Str(String::new(), StrStyle::DoubleQuoted),
+                newline: false,
+                target: None,
+            };
+        }
+    }
     let [IrStmt::Output {
         value,
         newline,
@@ -383,6 +432,7 @@ pub fn redirected_output_to_writefile(st: &mut IrStmt) -> bool {
     // folds. Refuse > guess.
     fn contains_call(e: &IrExpr) -> bool {
         match e {
+            IrExpr::Call { .. } if is_var_read(e) => false,
             IrExpr::Call { .. } | IrExpr::Arrow(_) | IrExpr::Lambda { .. } => true,
             IrExpr::Interpolate(parts) => parts
                 .iter()
@@ -685,6 +735,25 @@ fn arg_expands_to_many_words(e: &IrExpr) -> bool {
     }
 }
 
+/// A plain variable read in its shIR spelling — `Call { "getVar",
+/// [Str(name)] }`, the node `$name` lowers to — is opaque text exactly
+/// like `IrExpr::Var`, not a call: it runs no callee, arms no
+/// arithmetic guard, splits nothing and homes no parameter, so every
+/// refusal reason below (all about a call's side effects) is untouched
+/// by it. Only an IDENTIFIER name counts: `getVar` also spells the
+/// special parameters (`$-`, `$?`, `$@`, `$*`, positionals …), each of
+/// which its own renderer expands differently from a plain read — and
+/// the word path and the write path would then disagree. Any other
+/// `func`, a non-identifier name or extra arguments stay a call and
+/// keep refusing.
+fn is_var_read(e: &IrExpr) -> bool {
+    matches!(e, IrExpr::Call { func, args, .. }
+        if func == "getVar"
+            && matches!(args.as_slice(), [IrExpr::Str(n, _)]
+                if n.starts_with(|c: char| c.is_ascii_alphabetic() || c == '_')
+                    && n.chars().all(|c| c.is_ascii_alphanumeric() || c == '_')))
+}
+
 /// Does this word contain a call (or an arithmetic node)?
 ///
 /// Everything the echo CALL path does beyond producing text hangs off a
@@ -693,9 +762,11 @@ fn arg_expands_to_many_words(e: &IrExpr) -> bool {
 /// one that bit t89/t90 — the parameter probe that runs while those word
 /// renders happen. Wrappers are walked so a call buried in an
 /// interpolation, a condition or a concatenation is caught too; a plain
-/// literal or variable reference is opaque text and safe to fold.
+/// literal or variable reference is opaque text and safe to fold —
+/// including a bare [`is_var_read`], which is how `$name` reaches here.
 fn word_contains_call(e: &IrExpr) -> bool {
     match e {
+        IrExpr::Call { .. } if is_var_read(e) => false,
         IrExpr::Call { .. } | IrExpr::Arrow(_) | IrExpr::Lambda { .. } => true,
         // `((…))` in word position goes to the same evaluator as
         // `Call { func: "arith" }`

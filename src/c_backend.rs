@@ -292,6 +292,19 @@ pub struct Render {
     /// array-return function name -> the array it returns (for the
     /// `mpz_t[]` storage + return).
     array_return_arrays: std::collections::HashMap<String, String>,
+    /// A `_sh_sorted_bigint_join(&v, a, n)` CALL SITE was actually
+    /// rendered (both the value_c and printf-arg paths go through
+    /// [`Render::sorted_join_call`] or its inline twin). The helper's
+    /// DEFINITION lives behind the emit_runtime GMP gate, which until
+    /// now keyed only on `array_return_fns` — so a top-level
+    /// `echo $(sortedBigintJoin a)` with NO array-return function got
+    /// the call but not the definition (a dangling symbol, and the
+    /// `mpz_cmp`-in-output pin in `sorted_join_nodes_lower_natively`
+    /// went red). Set during body render, which runs BEFORE
+    /// `emit_runtime`, so the gate can read it. Default `false` —
+    /// conservative (no definition) in exactly the direction the
+    /// original cli_hygiene fix needed.
+    sorted_bigint_join_used: bool,
     /// the return array of the array-return function currently being
     /// rendered (None otherwise) — its storage is `mpz_t[]`.
     cur_array_return_arr: Option<String>,
@@ -428,7 +441,9 @@ pub struct Render {
     /// every fn-local var as env-only (249 of them on MIMEcroft —
     /// `start_level`'s loops then waited on `_sh_env("")` forever).
     hoist_vars: BTreeSet<String>,
-    /// shell-out runtime needed (the _sh_* preamble helpers)
+    /// shell-out runtime needed (the _sh_* preamble helpers). Derived,
+    /// never assigned: `sh_runtime_needed` writes it once, so an emitter
+    /// of a `_sh_*` symbol has nothing to remember.
     need_sh: bool,
     /// uu-ffi in-process coreutils runtime needed (UU-FFI.md): emit the
     /// `#include "uu_run.h"` + a `sh2_uu_run` statement for a static
@@ -1322,6 +1337,13 @@ fn demote_stringy_ints(
                     None => false,
                 }
             }
+            // str-chop-cursor's cursor advance (field_strip.node): an
+            // ABSOLUTE byte offset, written as canonical decimal by the
+            // FieldStrip arm — the same argument as the `Str` arm above.
+            // Without this the numstr seed (which admits the cursor on the
+            // same verdict) is demoted again on its very next check and the
+            // per-chop atoll/itoa round-trip stays.
+            IrExpr::Ext(n) if n.tag() == "FieldStrip" || n.tag() == "FieldStripEnd" => true,
             _ => false,
         }
     }
@@ -2206,6 +2228,39 @@ fn int_element_verdict(prog: &IrProgram) -> (HashSet<String>, HashSet<String>) {
                 walk_u_expr(key, true, u, arrs);
             }
             IrExpr::Call { func, args } => {
+                if func == "param" {
+                    // param("slice", NAME|!NAME|NAME[@], "@"|"*", LEN)
+                    // renders a WHOLE-ARRAY value join (array_join_all →
+                    // `_sh_join_arr(char**)`). A read never decides
+                    // storage class, but a whole-array string op must
+                    // VETO native (long long[]) homing: without this the
+                    // veto list missed every join shaped as `param`, so
+                    // `v="${arr[@]}"` homed arr as long long[] while the
+                    // join passed that long long* where char** was
+                    // expected (probe a6_indexed_join: incompatible-
+                    // pointer warning, runtime SIGSEGV). The old arm
+                    // only knew slice/arrayItems/listVar/… calls.
+                    if let (Some(IrExpr::Str(op, _)), Some(IrExpr::Str(nm, _))) =
+                        (args.first(), args.get(1))
+                    {
+                        let idx_at =
+                            matches!(args.get(2), Some(IrExpr::Str(s, _)) if s == "@" || s == "*");
+                        let name_at = nm.ends_with("[@]") || nm.ends_with("[*]");
+                        if op == "slice" && (idx_at || name_at) {
+                            let base = nm.strip_prefix('!').unwrap_or(nm);
+                            let base = base
+                                .strip_suffix("[@]")
+                                .or_else(|| base.strip_suffix("[*]"))
+                                .unwrap_or(base);
+                            u.str_read.insert(base.to_string());
+                        }
+                    }
+                    // walk the args exactly like the old default arm
+                    for a in args {
+                        walk_u_expr(a, false, u, arrs);
+                    }
+                    return;
+                }
                 if func == "arrayIndex" {
                     // transparent (see module docs); key is arithmetic.
                     for a in args.iter().skip(1) {
@@ -6965,6 +7020,13 @@ fn array_fixed_caps(
         // index writes on assocs are extra string keys beyond bulk
         // counts — they poison literal sizing (item 41).
         is_assoc: bool,
+        // a scalar write to this bare name (`m=z`): for an assoc that is
+        // the STRING key "0" — one distinct key no bulk or index count
+        // saw (the `+=`/array-scalar probe, 2026-10-29: an exact cap of 2
+        // from `declare -A m=([a]=1 [b]=2)` plus a later `m=z` hit the
+        // exit-127 guard on the third key). For an indexed array the same
+        // write is element 0, already inside any cap ≥ 1.
+        scalar_write: bool,
         // max index+1 from counter-indexed writes in counted loops
         // (exact by enumeration — see counter_index_caps; 0 = absent).
         // Combined via max(); bypasses the ARR_CAP gate below (which
@@ -8152,6 +8214,19 @@ fn array_fixed_caps(
                     if matches!(args.get(2), Some(IrExpr::Bool(true))) {
                         info.is_assoc = true;
                     }
+                    // the same `[k]=v` literal shape emit_set_array uses
+                    // to infer an assoc (a dict literal without the flag)
+                    if let Some(IrExpr::Array(items)) = args.get(1) {
+                        if items.iter().any(|it| match it {
+                            IrExpr::Str(s, _) => {
+                                let t = s.trim_start();
+                                t.starts_with('[') && t.contains("]=")
+                            }
+                            _ => false,
+                        }) {
+                            info.is_assoc = true;
+                        }
+                    }
                     record_bulk(func, args, info, mult, depth);
                 }
                 for a in args {
@@ -8266,6 +8341,14 @@ fn array_fixed_caps(
                                 info.max_reset =
                                     info.max_reset.max(items.len() as u64);
                             }
+                        } else if let Some(info) = map.get_mut(&t.var) {
+                            // a SCALAR write to a bare name that is
+                            // already tracked as an array (`m=z`) — see
+                            // `scalar_write`. Only recorded on an
+                            // existing entry, so plain scalar variables
+                            // never gain one.
+                            info.defined = true;
+                            info.scalar_write = true;
                         }
                     }
                     caps_expr_of(expr, map, mult, depth);
@@ -8480,6 +8563,15 @@ fn array_fixed_caps(
             .saturating_add(info.appends)
             .max(info.lit_index_max)
             .max(info.counter_index_max);
+        // an assoc's scalar write is the extra STRING key "0": +1 slot
+        // over whatever the bulk/index counts proved (upper bound — an
+        // already-counted key "0" only costs one spare slot, while an
+        // uncounted one would have hit the exit-127 guard).
+        let need = if info.is_assoc && info.scalar_write {
+            need.saturating_add(1)
+        } else {
+            need
+        };
         // defined-but-always-empty still needs one slot; need >=
         // ARR_CAP keeps the status quo — except counter-exact terms,
         // which are proven (not heuristic) and bypass the gate (the
@@ -9107,6 +9199,220 @@ impl TakeCx {
 /// $v` is still a self-append). Segs may read `v` again (evaluated
 /// eagerly in the temp, exactly as today) but must contain no other
 /// `Call` (a pending-free temp would be copied instead of moved).
+/// C source for the recognised-command fast path — emitted immediately
+/// before `_sh_system_rc` (and only when the path is enabled), because
+/// that is the single call every built command funnels through. Static
+/// `echo`/`:` redirects never reach it: they fold to `IrStmt::WriteFile`
+/// in shIR (see the emit site below), so those arrive as command text
+/// assembled at run time. `xxd -r -p` is the one STATIC site here — the
+/// fold has no decode node to fold it to — and it is the reason this
+/// parses a string instead of keying off a node.
+///
+/// `free(w)`/`free(a)`/`free(t)` happen on BOTH exits: `_sh_fa` mallocs
+/// through `_sh_grow`, and the fallback path (`return -1`) hands the same
+/// command to `system()`, so a leak there would run once per command.
+const ECHO_FAST_C: &str = r##"/* `echo`/`:`, or `xxd -r -p IN`, with one `>`/`>>` redirect, run in
+ * process (see the emit site). Returns 0 with _sh_rc set when the
+ * command was a recognised shape, -1 otherwise — the caller then runs
+ * system() unchanged. */
+static void _sh_fa(char **b, size_t *cap, size_t *len, const char *s, size_t n) {
+  _sh_grow(b, cap, *len + n + 1);
+  memcpy(*b + *len, s, n);
+  *len += n;
+  (*b)[*len] = 0;
+}
+static int _sh_echo_fast(const char *cmd) {
+  char *w = 0, *a = 0, *t = 0;
+  size_t wcap = 0, acap = 0, tcap = 0, wl = 0, al = 0, tl = 0;
+  int nredir = 0, append = 0, nwords = 0, tgt = 0, bad = 0, seg = 0;
+  const char *p = cmd;
+  size_t vl;
+  int is_echo, is_colon;
+  FILE *f;
+  if (!cmd || !*cmd) return -1;
+  while (!bad) {
+    while (*p == ' ' || *p == '\t') p++;
+    if (!*p) break;
+    /* a raw newline is a COMMAND SEPARATOR to the shell, never more
+     * whitespace — falling back here keeps two commands from merging */
+    if (*p == '\n') { bad = 1; break; }
+    if (*p == '>') {
+      /* The operator must be its own token. `echo hi 2>/dev/null` has the
+       * fd digit glued to the `>`; taking that as a plain output redirect
+       * would swallow `2` as an echo argument and redirect the payload to
+       * /dev/null instead of discarding stderr. Any adjacency (digit, quote
+       * or word end) falls back to the shell. */
+      if (p > cmd && p[-1] != ' ' && p[-1] != '\t') { bad = 1; break; }
+      if (p[1] == '>') { p += 2; append = 1; } else { p += 1; append = 0; }
+      if (*p == '>' || *p == '&' || *p == '<') { bad = 1; break; }
+      if (++nredir > 1) { bad = 1; break; }
+      tgt = 1;
+      continue;
+    }
+    if (*p == '<' || *p == '&' || *p == '|' || *p == ';' || *p == '`' ||
+        *p == '(' || *p == ')') { bad = 1; break; }
+    /* one word = one or more ADJACENT segments (`'/a/' "$b" -c`) */
+    wl = 0; seg = 0;
+    if (w) w[0] = 0;
+    for (;;) {
+      if (*p == '\'') {
+        const char *q = strchr(++p, '\'');
+        if (!q) { bad = 1; break; }
+        _sh_fa(&w, &wcap, &wl, p, (size_t)(q - p));
+        p = q + 1; seg = 1;
+      } else if (*p == '"') {
+        int closed = 0;
+        p++;
+        while (*p && !bad) {
+          if (*p == '"') { closed = 1; p++; break; }
+          if (*p == '\\') {
+            char c = p[1];
+            if (!c || c == '\n') { bad = 1; break; }
+            if (c == '$' || c == '`' || c == '"' || c == '\\') {
+              _sh_fa(&w, &wcap, &wl, &c, 1); p += 2;
+            } else { _sh_fa(&w, &wcap, &wl, "\\", 1); p++; }
+            continue;
+          }
+          if (*p == '`') { bad = 1; break; }
+          if (*p == '$') {
+            const char *q = p + 1, *ns;
+            char nm[256];
+            size_t nlen;
+            int br = 0;
+            if (*q == '{') { br = 1; q++; }
+            if (!(*q == '_' || (*q >= 'A' && *q <= 'Z') || (*q >= 'a' && *q <= 'z'))) { bad = 1; break; }
+            q++;
+            while (*q == '_' || (*q >= '0' && *q <= '9') || (*q >= 'A' && *q <= 'Z') || (*q >= 'a' && *q <= 'z')) q++;
+            if (br) { if (*q != '}') { bad = 1; break; } }
+            ns = p + 1 + (br ? 1 : 0);
+            nlen = (size_t)(q - ns);
+            if (nlen == 0 || nlen >= sizeof nm) { bad = 1; break; }
+            memcpy(nm, ns, nlen); nm[nlen] = 0;
+            { const char *val = getenv(nm); if (val) _sh_fa(&w, &wcap, &wl, val, strlen(val)); }
+            p = q + (br ? 1 : 0);
+            seg = 1;
+            continue;
+          }
+          _sh_fa(&w, &wcap, &wl, p, 1); p++;
+        }
+        if (bad) break;
+        if (!closed) { bad = 1; break; }
+        seg = 1;
+      } else if (!*p || *p == ' ' || *p == '\t' || *p == '\n' || *p == '>' ||
+                 *p == '<' || *p == '&' || *p == '|' || *p == ';' || *p == '`' ||
+                 *p == '(' || *p == ')') {
+        /* a newline ends the word here; the next loop turn then bails */
+        break;
+      } else if (*p == '\\') {
+        if (!p[1] || p[1] == '\n') { bad = 1; break; }
+        _sh_fa(&w, &wcap, &wl, p + 1, 1); p += 2; seg = 1;
+      } else if (*p == '$' || *p == '*' || *p == '?' || *p == '[' || *p == '~' ||
+                 *p == '!' || *p == '{' || *p == '}') {
+        bad = 1; break;
+      } else {
+        _sh_fa(&w, &wcap, &wl, p, 1); p++; seg = 1;
+      }
+    }
+    if (bad || !seg) { bad = 1; break; }
+    if (tgt) {
+      if (tl) { bad = 1; break; }
+      _sh_fa(&t, &tcap, &tl, w, wl);
+      tgt = 0;
+    } else {
+      if (nwords) _sh_fa(&a, &acap, &al, " ", 1);
+      _sh_fa(&a, &acap, &al, w, wl);
+      nwords++;
+    }
+  }
+  if (!bad && tgt == 0 && nredir == 1 && tl > 0 && nwords >= 1 && a) {
+    /* `xxd -r -p IN` — the reverse-plain decode, in process: the
+     * frame-present path runs it once per frame (~200KB of hex), and
+     * forking bash + xxd for that was 4.7% of a first-frame run.
+     * Semantics copied from xxd: ' ' TAB LF CR skip without disturbing
+     * a pending nibble, any other non-hex byte discards it, a trailing
+     * odd nibble is dropped. A file that does not open (xxd would exit
+     * 2 with its own message) falls through to system() untouched. */
+    if (nwords == 4 && al >= 10 && memcmp(a, "xxd -r -p ", 10) == 0) {
+      FILE *in = fopen(a + 10, "rb");
+      if (in) {
+        f = fopen(t, append ? "ab" : "wb");
+        if (f) {
+          unsigned char hbuf[8192], obuf[4096];
+          size_t hgot, hi_i, on = 0;
+          int hlo = -1, hd;
+          while ((hgot = fread(hbuf, 1, sizeof hbuf, in)) > 0) {
+            for (hi_i = 0; hi_i < hgot; hi_i++) {
+              int hc = hbuf[hi_i];
+              if (hc >= '0' && hc <= '9') hd = hc - '0';
+              else if (hc >= 'a' && hc <= 'f') hd = hc - 'a' + 10;
+              else if (hc >= 'A' && hc <= 'F') hd = hc - 'A' + 10;
+              else if (hc == ' ' || hc == '\t' || hc == '\n' || hc == '\r') continue;
+              else { hlo = -1; continue; }
+              if (hlo < 0) hlo = hd;
+              else {
+                /* batched: one fwrite per 4KB, not per byte — a 1-byte
+                 * fwrite costs a stdio call per pixel otherwise */
+                obuf[on++] = (unsigned char)((hlo << 4) | hd);
+                hlo = -1;
+                if (on == sizeof obuf) { fwrite(obuf, 1, on, f); on = 0; }
+              }
+            }
+          }
+          if (on) fwrite(obuf, 1, on, f);
+          fclose(f);
+          fclose(in);
+          _sh_rc = 0;
+          free(w); free(a); free(t);
+          return 0;
+        }
+        fclose(in);
+      }
+    }
+    vl = 0;
+    while (a[vl] && a[vl] != ' ') vl++;
+    is_echo = (vl == 4 && memcmp(a, "echo", 4) == 0);
+    is_colon = (vl == 1 && a[0] == ':');
+    /* only a first argument that cannot be an option: bash's echo would
+     * honour -n/-e/-E there, and we always want its one trailing newline */
+    if (is_colon || (is_echo && (nwords == 1 || a[vl + 1] != '-'))) {
+      f = fopen(t, append ? "a" : "w");
+      if (f) {
+        if (is_echo) {
+          if (nwords > 1) fwrite(a + vl + 1, 1, al - vl - 1, f);
+          fputc('\n', f);
+        }
+        fclose(f);
+        _sh_rc = 0;
+        free(w); free(a); free(t);
+        return 0;
+      }
+    }
+  }
+  free(w); free(a); free(t);
+  return -1;
+}
+"##;
+
+/// One piece of a direct string concatenation: a literal (raw source
+/// text, NUL-free by construction) or an already-rendered `char*` C
+/// argument. Used by the C backend's direct-concat arms (the snprintf
+/// grow-loop replacement — `direct_concat_fill` / `direct_append`).
+enum ConcatPiece {
+    Lit(String),
+    Arg(String),
+}
+
+/// Join a part-length list into one `a + b + …` expression (zero-length
+/// literal pieces drop out; an empty list is the constant 0).
+fn sum_toks(toks: &[String]) -> String {
+    let s: Vec<&str> = toks.iter().map(|s| s.as_str()).filter(|s| *s != "0").collect();
+    if s.is_empty() {
+        "0".to_string()
+    } else {
+        s.join(" + ")
+    }
+}
+
 fn self_append_segs(var: &str, expr: &IrExpr) -> Option<IrExpr> {
     fn is_plain_read(var: &str, e: &IrExpr) -> bool {
         match e {
@@ -9367,6 +9673,15 @@ pub fn shir_to_c(prog: &IrProgram) -> String {
     // a formatting shift). Do not "optimise" this back to the with-ranges
     // variant. The redundant fixpoint is the price of that ordering.
     prog.var_lengths = crate::shir::analyze_string_lengths(&prog);
+    // Bounds supplement: the core walk misses Declare-inits (`local
+    // x=1`) and every `${NAME=word}` write (an expression-side
+    // side-effect) — without them `char x[1]` + the write arm's
+    // `strcpy(buf, default)` is a stack overflow waiting to happen.
+    // MAX-fold into the core result (see supplement_write_lengths).
+    supplement_write_lengths_stmts(&prog.stmts, &mut prog.var_lengths);
+    for sub in &prog.subs {
+        supplement_write_lengths_stmts(&sub.body, &mut prog.var_lengths);
+    }
     prog.var_lifetimes = crate::shir_passes::lifetime::analyze_var_lifetimes(&prog);
     prog.var_storage = crate::shir::select_storage_classes(&prog);
     prog.var_const = crate::shir::analyze_var_const(&prog);
@@ -9508,7 +9823,6 @@ pub fn shir_to_c(prog: &IrProgram) -> String {
     r.list_verdicts = crate::shir_passes::list_profile::verdicts(&prog);
     if !r.lifted_fns.is_empty() {
         // the lifted fns' return values live in the _sh_* runtime
-        r.need_sh = true;
     }
     // GMP bigint vars (Cast(Int64)-tainted assigns, fixpoint over
     // reads). Set before rendering: decls need it, and need_gmp must
@@ -9865,6 +10179,197 @@ pub fn shir_to_c(prog: &IrProgram) -> String {
             r.out.insert(pos, "#include <gmp.h>".to_string());
         }
     }
+    // Exact division helpers for magic_div_mod — present iff used (same
+    // discipline as the P1 strdup block: no unused-function warning, and
+    // the gate links nothing extra). _sh_divp2 and the divodd pair are
+    // inserted independently so a program using only one shape gets only
+    // one. Fixed-width uint64_t (stdint.h) rather than
+    // `unsigned long long`: the unsigned-wrap lowering arms own that
+    // exact spelling as their pin, and these helpers are exact for all
+    // signs — no wrap semantics anywhere.
+    {
+        let full = r.out.join("\n");
+        if full.contains("_sh_divp2(") {
+            let pos = r
+                .out
+                .iter()
+                .rposition(|l| l.trim_start().starts_with("#include "))
+                .map(|i| i + 1)
+                .unwrap_or(0);
+            r.out.splice(
+                pos..pos,
+                [
+                    "/* exact signed division by 2^n: the shift floors, C99 truncates".to_string(),
+                    " * toward zero — negative non-multiples need the +1 back. */".to_string(),
+                    "static long long _sh_divp2(long long x, int n) {".to_string(),
+                    "  long long q = x >> n;".to_string(),
+                    "  if (x < 0 && (x & (((long long)1 << n) - 1))) q++;".to_string(),
+                    "  return q;".to_string(),
+                    "}".to_string(),
+                    "".to_string(),
+                ],
+            );
+        }
+        let full = r.out.join("\n");
+        if full.contains("_sh_divodd(") {
+            let pos = r
+                .out
+                .iter()
+                .rposition(|l| l.trim_start().starts_with("#include "))
+                .map(|i| i + 1)
+                .unwrap_or(0);
+            let slow = std::env::var("SH2_NO_DIVMULHU")
+                .map(|v| v == "1" || v == "true" || v == "yes")
+                .unwrap_or(false);
+            let mut block: Vec<String> = vec!["#include <stdint.h>".to_string()];
+            if slow {
+                block.extend([
+                    "/* 64x64 -> high 64 without __int128 (tcc has none): the four".to_string(),
+                    " * 32-bit partial products; neither carry line can overflow. */".to_string(),
+                    "static uint64_t _sh_mulhu(uint64_t a, uint64_t b) {".to_string(),
+                    "  uint64_t a1 = a >> 32, b1 = b >> 32;".to_string(),
+                    "  uint64_t p00 = (uint64_t)(unsigned int)a * (unsigned int)b;".to_string(),
+                    "  uint64_t p01 = (uint64_t)(unsigned int)a * b1;".to_string(),
+                    "  uint64_t p10 = a1 * (unsigned int)b;".to_string(),
+                    "  uint64_t mid = p10 + (p00 >> 32) + (unsigned int)p01;".to_string(),
+                    "  return a1 * b1 + (mid >> 32) + (p01 >> 32);".to_string(),
+                    "}".to_string(),
+                    "/* |x| / r for odd r >= 3 via mulhi(|x|, M) >> s, M = ceil(2^S / r),".to_string(),
+                    " * S = 63 + bits(r) — floor never crosses (error < 1/r), exact for".to_string(),
+                    " * every long long; the sign is restored as C99 truncation. */".to_string(),
+                    "static long long _sh_divodd(long long x, uint64_t M, unsigned int s) {".to_string(),
+                    "  uint64_t u = (uint64_t)x;".to_string(),
+                    "  int neg = x < 0;".to_string(),
+                    "  if (neg) u = -u;".to_string(),
+                    "  uint64_t q = _sh_mulhu(u, M) >> s;".to_string(),
+                    "  return neg ? -(long long)q : (long long)q;".to_string(),
+                    "}".to_string(),
+                ]);
+            } else {
+                // `mulq` inline asm unless SH2_DIVMULHU_NOASM=1.  Both forms
+                // are exact: 4240 mulhu cases and 24088 divodd cases (all 8
+                // emitted M/s pairs, C truncation semantics) match a Python
+                // big-int reference with zero mismatches, and the deterministic
+                // first frame is byte-identical to the recorded reference.
+                // (The `--demo` dump is NOT an oracle here: rebuilding the
+                // UNMODIFIED source through a different link line changes it
+                // too, so that path is layout-sensitive.)
+                let asm = !std::env::var("SH2_DIVMULHU_NOASM")
+                    .map(|v| v == "1" || v == "true" || v == "yes")
+                    .unwrap_or(false);
+                let mut fast: Vec<String> = vec![
+                    "/* 64x64 -> high 64: the four 32-bit partial products (tcc has no".to_string(),
+                    " * __int128).  MACROS, not functions: tcc never inlines, and every".to_string(),
+                    " * division site passes a literal M and s, so the magic work and both".to_string(),
+                    " * calls land straight in the caller. */".to_string(),
+                ];
+                if asm {
+                    fast.extend([
+                        "#if defined(__x86_64__) && (defined(__GNUC__) || defined(__clang__) || defined(__TINYC__))".to_string(),
+                        "#define _sh_mulhu(a, b) \\".to_string(),
+                        "  ({ uint64_t _mh_lo, _mh_hi, _mh_x = (uint64_t)(a), _mh_y = (uint64_t)(b); \\".to_string(),
+                        "     __asm__(\"mulq %3\" : \"=a\"(_mh_lo), \"=d\"(_mh_hi) : \"a\"(_mh_x), \"r\"(_mh_y) : \"cc\"); \\".to_string(),
+                        "     _mh_hi; })".to_string(),
+                        "#else".to_string(),
+                    ]);
+                }
+                fast.extend([
+                    "#define _sh_mulhu(a, b) \\".to_string(),
+                    "  ({ uint64_t _mh_x = (uint64_t)(a), _mh_y = (uint64_t)(b); \\".to_string(),
+                    "     uint64_t _mh_a1 = _mh_x >> 32, _mh_b1 = _mh_y >> 32; \\".to_string(),
+                    "     uint64_t _mh_p00 = (uint64_t)(unsigned int)_mh_x * (unsigned int)_mh_y; \\".to_string(),
+                    "     uint64_t _mh_p01 = (uint64_t)(unsigned int)_mh_x * _mh_b1; \\".to_string(),
+                    "     uint64_t _mh_p10 = _mh_a1 * (unsigned int)_mh_y; \\".to_string(),
+                    "     uint64_t _mh_mid = _mh_p10 + (_mh_p00 >> 32) + (unsigned int)_mh_p01; \\".to_string(),
+                    "     _mh_a1 * _mh_b1 + (_mh_mid >> 32) + (_mh_p01 >> 32); })".to_string(),
+                ]);
+                if asm {
+                    fast.push("#endif".to_string());
+                }
+                fast.extend([
+                    "/* |x| / r for odd r >= 3 via mulhi(|x|, M) >> s, M = ceil(2^S / r),".to_string(),
+                    " * S = 63 + bits(r) — floor never crosses (error < 1/r), exact for".to_string(),
+                    " * every long long; the sign is restored as C99 truncation. */".to_string(),
+                    "#define _sh_divodd(x, M, s) \\".to_string(),
+                    "  ({ long long _dd_x = (long long)(x); \\".to_string(),
+                    "     uint64_t _dd_u = (uint64_t)_dd_x; \\".to_string(),
+                    "     int _dd_neg = _dd_x < 0; \\".to_string(),
+                    "     if (_dd_neg) _dd_u = -_dd_u; \\".to_string(),
+                    "     uint64_t _dd_q = _sh_mulhu(_dd_u, (M)) >> (s); \\".to_string(),
+                    "     _dd_neg ? -(long long)_dd_q : (long long)_dd_q; })".to_string(),
+                ]);
+                block.extend(fast);
+            }
+            block.push(String::new());
+            r.out.splice(pos..pos, block);
+        }
+    }
+    // Fast long long -> decimal for num_temp (the DEFAULT spelling —
+    // SH2_NO_ITOA=1 renders snprintf instead). Present iff a call site
+    // survives the printf fusion, so the helper is never dead code;
+    // memcpy keeps <string.h> via trim_includes' trigger list.
+    {
+        let full = r.out.join("\n");
+        if full.contains("_sh_ll2s(") {
+            let pos = r
+                .out
+                .iter()
+                .rposition(|l| l.trim_start().starts_with("#include "))
+                .map(|i| i + 1)
+                .unwrap_or(0);
+            r.out.splice(
+                pos..pos,
+                {
+                    let fastdiv = !std::env::var("SH2_NO_ITOA_FASTDIV")
+                        .map(|v| v == "1" || v == "true" || v == "yes")
+                        .unwrap_or(false);
+                    let mut b: Vec<String> = vec![
+                        "/* fast long long -> decimal: byte-for-byte what snprintf(\"%lld\")".to_string(),
+                        " * writes for every long long (incl. LLONG_MIN) — no format parse,".to_string(),
+                        " * no locale machinery (SH2_NO_ITOA=1 restores snprintf). */".to_string(),
+                    ];
+                    if fastdiv {
+                        b.extend([
+                            "/* The per-digit `u / 10` is this helper's whole cost under tcc: `%`".to_string(),
+                            " * and `/` each lower to a 64-bit `div` — two of them per digit, in".to_string(),
+                            " * the hottest function of the MIMEcroft render.  One `mulq` by".to_string(),
+                            " * 0xCCCC...CD >> 3 does both jobs (the remainder follows from".to_string(),
+                            " * `u - q*10`). SH2_NO_ITOA_FASTDIV=1 restores the plain spelling. */".to_string(),
+                            "#ifndef _SH_DIV10".to_string(),
+                            "#if defined(__x86_64__) && (defined(__GNUC__) || defined(__clang__) || defined(__TINYC__))".to_string(),
+                            "#define _SH_DIV10(u, q) \\".to_string(),
+                            "  do { unsigned long long _d10_u = (unsigned long long)(u), \\".to_string(),
+                            "       _d10_m = 14757395258967641293ull, _d10_lo, _d10_hi; \\".to_string(),
+                            "       __asm__(\"mulq %3\" : \"=a\"(_d10_lo), \"=d\"(_d10_hi) : \"a\"(_d10_u), \"r\"(_d10_m) : \"cc\"); \\".to_string(),
+                            "       (q) = _d10_hi >> 3; } while (0)".to_string(),
+                            "#else".to_string(),
+                            "#define _SH_DIV10(u, q) do { (q) = (unsigned long long)(u) / 10; } while (0)".to_string(),
+                            "#endif".to_string(),
+                            "#endif".to_string(),
+                        ]);
+                    }
+                    b.extend([
+                        "static void _sh_ll2s(char *d, long long v) {".to_string(),
+                        "  char t[24]; int i = 24; int neg = (v < 0);".to_string(),
+                        "  unsigned long long u = neg ? (unsigned long long)(-(v + 1)) + 1 : (unsigned long long)v;".to_string(),
+                    ]);
+                    if fastdiv {
+                        b.push("  do { unsigned long long _d10_q; _SH_DIV10(u, _d10_q);".to_string());
+                        b.push("       t[--i] = (char)('0' + (u - _d10_q * 10)); u = _d10_q; } while (u);".to_string());
+                    } else {
+                        b.push("  do { t[--i] = (char)('0' + (u % 10)); u /= 10; } while (u);".to_string());
+                    }
+                    b.extend([
+                        "  if (neg) t[--i] = '-';".to_string(),
+                        "  { size_t n = (size_t)(24 - i); memcpy(d, t + i, n); d[n] = 0; }".to_string(),
+                        "}".to_string(),
+                        String::new(),
+                    ]);
+                    b
+                },
+            );
+        }
+    }
     // P1 OOM policy: every strdup call site in the output reads
     // _sh_xstrdup explicitly (fail-stop on allocation failure — never
     // a NULL that flows to a print guard as empty output). The helper
@@ -9877,7 +10382,10 @@ pub fn shir_to_c(prog: &IrProgram) -> String {
         // `_sh_sset` calls `_sh_xstrdup` on its miss path, so a program
         // whose every store became in-place still needs the checked
         // strdup — trigger the block on either name and include both.
-        if full.contains("_sh_xstrdup(") || full.contains("_sh_sset(") {
+        if full.contains("_sh_xstrdup(")
+            || full.contains("_sh_sset(")
+            || full.contains("_sh_sset_field(")
+        {
             let pos = r.out.iter().rposition(|l| l.trim_start().starts_with("#include ")).map(|i| i + 1).unwrap_or(0);
             let mut helper = vec![
                 "/* checked strdup (P1 OOM policy): fail-stop, never NULL-on-OOM */".to_string(),
@@ -9912,6 +10420,35 @@ pub fn shir_to_c(prog: &IrProgram) -> String {
                     // checked-allocation marker, and a program whose
                     // every store is in-place must still show one.
                     "  char *p = _sh_xstrdup((char*)(src ? src : \"\"));".to_string(),
+                    "  free(old);".to_string(),
+                    "  *slot = p;".to_string(),
+                    "}".to_string(),
+                    "".to_string(),
+                ]);
+            }
+            // Fused chop store (emit_fused_field_store): own helper —
+            // triggered by ITS call sites so a program that never fuses
+            // emits neither definition. Miss path keeps _sh_sset's
+            // snapshot → own → free order; malloc is checked, never a
+            // raw strdup (the P1 call-site lint greps for those).
+            if full.contains("_sh_sset_field(") {
+                helper.extend([
+                    "/* fused chop store: `x = <field-extract>` — find the delimiter".to_string(),
+                    " * ONCE and copy the field with its KNOWN length straight into the".to_string(),
+                    " * destination (the temp-vbuf path copies twice and rescans the bytes".to_string(),
+                    " * it just wrote). memmove covers src aliasing *slot (self-ref RHS);".to_string(),
+                    " * the miss path is _sh_sset's snapshot → own → free.".to_string(),
+                    " */".to_string(),
+                    "static void _sh_sset_field(char **slot, const char *t, size_t off, const char *d) {".to_string(),
+                    "  const char *gt = t ? t : \"\";".to_string(),
+                    "  const char *gp = (*d) ? strstr(gt + off, d) : 0;".to_string(),
+                    "  size_t gl = gp ? (size_t)(gp - (gt + off)) : strlen(gt + off);".to_string(),
+                    "  char *old = *slot;".to_string(),
+                    "  if (old && strnlen(old, gl) == gl) { memmove(old, gt + off, gl); old[gl] = 0; return; }".to_string(),
+                    "  char *p = (char*)malloc(gl + 1);".to_string(),
+                    "  if (!p) { fprintf(stderr, \"sh2c: out of memory\\n\"); exit(127); }".to_string(),
+                    "  if (gl) memcpy(p, gt + off, gl);".to_string(),
+                    "  p[gl] = 0;".to_string(),
                     "  free(old);".to_string(),
                     "  *slot = p;".to_string(),
                     "}".to_string(),
@@ -10742,10 +11279,17 @@ impl Render {
                 // byte-preserving markers (U+F800+byte, from read_source):
                 // emit as raw single-byte escapes (bash passthrough —
                 // BASHC_FIX utf8). Mirrors estree map_raw_bytes.
+                // ESCAPE SPELLING: 3-digit OCTAL, never \x — C's \x is
+                // greedily hex (it eats every following hex digit), so
+                // "\x01" + 'a' lexes as ONE escape 0x1a (measured:
+                // stdout 1a vs bash 01 61) and 3+ digits can exceed
+                // 255 (diagnostic-required range violation). A fixed
+                // 3-digit octal consumes at most those 3 digits, so a
+                // following hex digit stays literal (C99 6.4.4.4).
                 c if (0xF800..=0xF8FF).contains(&(c as u32)) => {
-                    out.push_str(&format!("\\x{:02x}", (c as u32 - 0xF800) as u8))
+                    out.push_str(&format!("\\{:03o}", (c as u32 - 0xF800) as u8))
                 }
-                c if (c as u32) < 32 => out.push_str(&format!("\\x{:02x}", c as u32)),
+                c if (c as u32) < 32 => out.push_str(&format!("\\{:03o}", c as u32)),
                 c => out.push(c),
             }
         }
@@ -11730,6 +12274,26 @@ impl Render {
             self.emit("    if (k[i] && strcmp(k[i], key) == 0) return v[i] ? v[i] : \"\";");
             self.emit("  return \"\";");
             self.emit("}");
+            // `unset 'm[k]'` — drop ONE entry: free the owned strings and
+            // compact the table (the k/v lists stay dense, so the
+            // survivors keep their iteration order — exactly the two
+            // entries a bash `unset` removes from its own lists). k/v
+            // slots are owned heap (`_sh_assoc_set` xstrdup's both) and
+            // every reader copies out (value reads go through
+            // _sh_sset/_sh_xstrdup, joins memcpy into a vbuf), so the
+            // free aliases nothing. The runtime trim drops the helper
+            // when no unset call site survives.
+            self.emit("static void _sh_assoc_unset(char **k, char **v, size_t *n, const char *key) {");
+            self.emit("  if (!key) return;");
+            self.emit("  for (size_t i = 0; i < *n; i++) {");
+            self.emit("    if (k[i] && strcmp(k[i], key) == 0) {");
+            self.emit("      free(v[i]); v[i] = 0; free(k[i]); k[i] = 0;");
+            self.emit("      for (size_t j = i; j + 1 < *n; j++) { k[j] = k[j + 1]; v[j] = v[j + 1]; }");
+            self.emit("      k[*n - 1] = 0; v[*n - 1] = 0; (*n)--;");
+            self.emit("      return;");
+            self.emit("    }");
+            self.emit("  }");
+            self.emit("}");
             self.emit("static void _sh_join_arr_nl(_sh_vbuf *d, char **a, size_t n) {");
             self.emit("  size_t dn = 0;");
             self.emit("  for (size_t i = 0; i < n; i++) {");
@@ -11739,11 +12303,19 @@ impl Render {
             self.emit("  }");
             self.emit("  _sh_vgrow(d, dn + 1); d->p[dn] = 0;");
             self.emit("}");
+            // Separator BETWEEN PRESENT ELEMENTS (fixed 2026-10-29):
+            // the `i > 0` separator used to be emitted BEFORE the NULL
+            // skip, so every hole contributed a stray space — bash
+            // `arr=(a b c); arr[5]=z` → `echo "${arr[*]}"` is
+            // `a b c z` (holes vanish), we rendered `a b c   z`. A
+            // set-but-EMPTY element still gets its separators
+            // (`arr=(a "" c)` → `a  c` on both sides) — the _f flag
+            // tracks presence, not emptiness.
             self.emit("static void _sh_join_arr(_sh_vbuf *d, char **a, size_t n) {");
-            self.emit("  size_t dn = 0;");
+            self.emit("  size_t dn = 0; int _f = 1;");
             self.emit("  for (size_t i = 0; i < n; i++) {");
-            self.emit("    if (i > 0) { _sh_vgrow(d, dn + 2); d->p[dn++] = ' '; }");
             self.emit("    if (!a[i]) continue;");
+            self.emit("    if (_f) { _f = 0; } else { _sh_vgrow(d, dn + 2); d->p[dn++] = ' '; }");
             self.emit("    for (const char *s = a[i]; *s; s++) { _sh_vgrow(d, dn + 2); d->p[dn++] = *s; }");
             self.emit("  }");
             self.emit("  _sh_vgrow(d, dn + 1); d->p[dn] = 0;");
@@ -11756,6 +12328,41 @@ impl Render {
             self.emit("    for (const char *s = k[i]; *s; s++) { _sh_vgrow(d, dn + 2); d->p[dn++] = *s; }");
             self.emit("  }");
             self.emit("  _sh_vgrow(d, dn + 1); d->p[dn] = 0;");
+            self.emit("}");
+            // ${!arr[@]} over INDEXED char** storage: the key set is the
+            // SET indices, ascending — non-NULL slots only. The decimal
+            // index is rendered through a 24-byte buffer (size_t max is
+            // 20 digits, 24 leaves the NUL and then some).
+            self.emit("static void _sh_join_ikind(_sh_vbuf *d, char **a, size_t n) {");
+            self.emit("  size_t dn = 0; int _f = 1;");
+            self.emit("  for (size_t i = 0; i < n; i++) {");
+            self.emit("    if (!a[i]) continue;");
+            self.emit("    if (_f) { _f = 0; } else { _sh_vgrow(d, dn + 2); d->p[dn++] = ' '; }");
+            self.emit("    char _b[24]; int _l = snprintf(_b, sizeof _b, \"%zu\", i);");
+            self.emit("    for (int _j = 0; _j < _l; _j++) { _sh_vgrow(d, dn + 2); d->p[dn++] = _b[_j]; }");
+            self.emit("  }");
+            self.emit("  _sh_vgrow(d, dn + 1); d->p[dn] = 0;");
+            self.emit("}");
+            // ${!arr[@]} over VALUE storage (long long[]/mpz_t[]): no
+            // per-slot presence marker exists, so the key set is the
+            // DENSE index range — reads no element (type-free), exact
+            // for dense arrays, the documented coverage edge otherwise.
+            self.emit("static void _sh_join_idx(_sh_vbuf *d, size_t n) {");
+            self.emit("  size_t dn = 0; int _f = 1;");
+            self.emit("  for (size_t i = 0; i < n; i++) {");
+            self.emit("    if (_f) { _f = 0; } else { _sh_vgrow(d, dn + 2); d->p[dn++] = ' '; }");
+            self.emit("    char _b[24]; int _l = snprintf(_b, sizeof _b, \"%zu\", i);");
+            self.emit("    for (int _j = 0; _j < _l; _j++) { _sh_vgrow(d, dn + 2); d->p[dn++] = _b[_j]; }");
+            self.emit("  }");
+            self.emit("  _sh_vgrow(d, dn + 1); d->p[dn] = 0;");
+            self.emit("}");
+            // ${#arr[@]} over char** storage: bash counts ELEMENTS
+            // (non-NULL slots), never the dense max-index+1 —
+            // `arr=(a b c); arr[5]=z` is 4, not 6.
+            self.emit("static long long _sh_icount(char **a, size_t n) {");
+            self.emit("  long long c = 0;");
+            self.emit("  for (size_t i = 0; i < n; i++) if (a[i]) c++;");
+            self.emit("  return c;");
             self.emit("}");
             // typed sorted-unique join (py-sh-go sortedIntJoin/sortedBigintJoin
             // nodes): the elements are CONTRACTUALLY canonical Python-int
@@ -11825,11 +12432,21 @@ impl Render {
             // for a real `need_gmp` render, those programs then failed to
             // compile: `error: unknown type name 'mpz_t'` on a plain
             // `for ((i=0;i<4;i++))` (tests/cli_hygiene.rs::
-            // normal_invocation_is_unaffected_by_the_sigpipe_reset). It is
-            // only ever CALLED for an array-return function whose element type
-            // is `mpz_t`, so `array_return_fns` non-empty is the exact
-            // condition — and it is known before this block runs.
-            if !self.array_return_fns.is_empty() {
+            // normal_invocation_is_unaffected_by_the_sigpipe_reset).
+            //
+            // CALLERS (both known before this block runs — body render
+            // precedes emit_runtime): an array-return function whose
+            // element type is `mpz_t` (`array_return_fns`, the original
+            // condition), OR a rendered `_sh_sorted_bigint_join` call
+            // site (`sorted_bigint_join_used` — set by
+            // [`Render::sorted_join_call`] and its inline twin). The
+            // second arm used to be missing: the CALL was emitted
+            // unconditionally while the DEFINITION stayed gated, so a
+            // top-level `echo $(sortedBigintJoin a)` linked against a
+            // symbol nobody defined (and the GMP-header splice still
+            // fires for those renders — `sorted_join_call` sets
+            // `need_gmp`, so `<gmp.h>` arrives with the block).
+            if !self.array_return_fns.is_empty() || self.sorted_bigint_join_used {
             self.emit("static char *_sh_mpz_arr_join(mpz_t *a, size_t n) {");
             self.emit("  static _sh_vbuf d = {0, 0};");
             self.emit("  _sh_vgrow(&d, 1); d.p[0] = 0;");
@@ -11995,7 +12612,51 @@ impl Render {
                 self.emit("  }");
             }
             self.emit("}");
+            // ECHO/COLON REDIRECT FAST PATH — the RESIDUAL of the generic
+            // fold, not a second implementation of it.
+            //
+            // The generic node exists: `IrStmt::WriteFile`, reached through
+            // `shir_passes::echo_fold::redirected_output_to_writefile`,
+            // which folds `echo … > f`, `echo … >> f` AND `: > f` for every
+            // backend (a `$name` word is a plain variable read, so it folds
+            // too). Measured on MIMEcroft_fb.sh: all 16 statically-shaped
+            // sites fold — the render carries zero `_sh_word("echo")` /
+            // `_sh_word(":")` builders and writes the files in process.
+            //
+            // What reaches THIS instead, measured over the 644-file C gate:
+            //   * an echo/colon redirect inside a container the narrow echo
+            //     walk deliberately does not reach (subshell, pipeline,
+            //     capture body) — 3 of the 6 remaining static sites;
+            //   * a target that is not a plain path (`>&2`), a word that is
+            //     a command substitution, a parenthesised producer — each
+            //     refused by the fold on purpose, the other 3;
+            //   * command text that does not exist until run time (a
+            //     command held in a variable), which shIR never sees as a
+            //     `Redirect` at all — none in the corpus, and the reason
+            //     this parses a STRING instead of keying off a node.
+            //   * `xxd -r -p IN > OUT`, the ONE static site here: the
+            //     frame-present path forks bash + xxd once per frame for
+            //     ~200KB of hex (measured 4.7% of a first-frame run), and
+            //     shIR has no decode-a-file node for the fold to target —
+            //     a C-only seam, so only this backend drops the exec.
+            //
+            // The shape rule is the fold's: exactly one `>`/`>>`, `echo`
+            // with a non-option first argument or `:`, no pipe / second
+            // redirect / unquoted `$` / glob / an expansion we do not
+            // model. Anything else returns -1 and system() runs as before.
+            // SH2_NO_ECHOFIX=1 keeps the fork for every command (A/B).
+            let echo_fast = std::env::var("SH2_NO_ECHOFIX").map(|v| v != "1").unwrap_or(true);
+            if echo_fast {
+                for l in ECHO_FAST_C.lines() {
+                    self.emit(l);
+                }
+            }
             self.emit("static int _sh_system_rc(void) {");
+            if echo_fast {
+                self.emit(
+                    "  if (_sh_echo_fast(_sh_cmd ? _sh_cmd : \"\") >= 0) return _sh_rc;",
+                );
+            }
             self.emit("  _sh_wrap_cmd(_sh_cmd ? _sh_cmd : \"\");");
             self.emit("  int rc = system(_sh_wrap);");
             self.emit("  _sh_rc = (rc == -1) ? 127 : (WIFEXITED(rc) ? WEXITSTATUS(rc) : 1);");
@@ -13240,10 +13901,21 @@ impl Render {
     /// construction (fresh `_sN` per site), so def-use is unambiguous.
     fn drop_dead_num_temps(&mut self) {
         fn snprintf_value_call_free(line: &str) -> bool {
-            // extract the value expression: text between the format
-            // string's closing `", ` and the final `));`.
-            let Some(start) = line.find("\", ") else {
-                return false;
+            // extract the value expression: text between the conversion's
+            // argument separator and the final `));` — the format
+            // string's closing `", ` for the snprintf spelling, or just
+            // past the temp name for the default `_sh_ll2s(_sN, ` one.
+            let start = if let Some(p) = line.find("_sh_ll2s(") {
+                let open = p + "_sh_ll2s(".len();
+                match line[open..].find(", ") {
+                    Some(q) => open + q + 2,
+                    None => return false,
+                }
+            } else {
+                match line.find("\", ") {
+                    Some(s) => s + 3,
+                    None => return false,
+                }
             };
             let Some(end) = line.rfind("));") else {
                 return false;
@@ -13251,7 +13923,7 @@ impl Render {
             if end <= start {
                 return false;
             }
-            let mut v = line[start + 3..end].to_string();
+            let mut v = line[start..end].to_string();
             for cast in ["(long long)", "(size_t)", "(char*)", "(const char*)", "(int)", "(unsigned)"] {
                 v = v.replace(cast, "");
             }
@@ -13343,7 +14015,9 @@ impl Render {
                 continue;
             };
             let snp = self.out[i + 1].trim_start();
-            if !snp.starts_with(&format!("snprintf({nm}, sizeof {nm}, ")) {
+            if !snp.starts_with(&format!("snprintf({nm}, sizeof {nm}, "))
+                && !snp.starts_with(&format!("_sh_ll2s({nm}, "))
+            {
                 i += 1;
                 continue;
             }
@@ -14495,6 +15169,8 @@ impl Render {
                 {
                     self.c_ident(name)
                 } else {
+                    // an env read renders as the RUNTIME helper: naming
+                    // `_sh_env` is what earns the block defining it
                     format!(
                         "_sh_env({})",
                         Self::cstr(name)
@@ -14745,6 +15421,121 @@ impl Render {
         }
     }
 
+    /// Resolve a div/mod divisor to a positive literal: a `Num`, or a
+    /// `Var`/`Ident` whose value is a proven single-assignment literal
+    /// (`analyze_var_const`'s `Const` verdict → `const_rhs`, the same
+    /// map that renders `const long long SSC = 1000;`). Non-literal or
+    /// non-positive divisors refuse (guard path — one division beats a
+    /// wrong answer).
+    fn arith_lit_divisor(rhs: &ArithAst, const_rhs: &HashMap<String, IrExpr>) -> Option<i64> {
+        let d = match rhs {
+            ArithAst::Num(d) => *d,
+            // const-prop'd var: reuse the shared const-operand resolver
+            // (single-write, no read-before-write by construction)
+            ArithAst::Var(n) | ArithAst::Ident(n) => match resolve_const_var(n, const_rhs)? {
+                ConstVal::Int(i) => i,
+                ConstVal::Str(_) => return None,
+            },
+            _ => return None,
+        };
+        (d > 0).then_some(d)
+    }
+
+    /// Side-effect-free arithmetic subtree — a value-position `mod`
+    /// lowers to `x - (x / d) * d` (the dividend text appears twice),
+    /// which is only sound when re-evaluating the tree cannot mutate
+    /// (`Assign`/`IncDec` refuse; everything else is a pure read).
+    fn arith_side_effect_free(a: &ArithAst) -> bool {
+        match a {
+            ArithAst::Num(_) | ArithAst::Var(_) | ArithAst::Ident(_) | ArithAst::Sizeof(_) => true,
+            ArithAst::Index { key, .. } => Self::arith_side_effect_free(key),
+            ArithAst::Bin { lhs, rhs, .. } => {
+                Self::arith_side_effect_free(lhs) && Self::arith_side_effect_free(rhs)
+            }
+            ArithAst::Un { arg, .. } => Self::arith_side_effect_free(arg),
+            ArithAst::Cond { test, then, else_ } => {
+                Self::arith_side_effect_free(test)
+                    && Self::arith_side_effect_free(then)
+                    && Self::arith_side_effect_free(else_)
+            }
+            ArithAst::Cast { arg, .. } => Self::arith_side_effect_free(arg),
+            _ => false,
+        }
+    }
+
+    /// Exact division-free lowering of `l op d` (op ∈ {"/", "%"},
+    /// d a positive literal) — returns `None` to keep the ordinary
+    /// guarded division.
+    ///
+    /// Why this exists: tcc (bash-O4's default toolchain — millisecond
+    /// compiles) performs NO strength reduction, so every
+    /// literal-divisor site is a real ~30-cycle idiv at runtime
+    /// (MIMEcroft's render: 456 idiv sites under tcc vs 162 under
+    /// gcc -O2, whose remainders are the *variable* divisors gcc
+    /// cannot fold either). gcc -O2 would find these magics itself;
+    /// emitting them makes the fast path compiler-independent.
+    ///
+    /// Exactness (holds for EVERY long long dividend, no range proof):
+    /// ONE magic-multiply for the WHOLE divisor — `mulhi(|x|, M) >> s`
+    /// with M = ceil(2^S / d), S = 63 + bits(d). The rounding error is
+    /// δ = |x|·(M/2^S − 1/d) < 2^(S−1)/2^S · 1/d … i.e. < 2^-bits(d),
+    /// strictly less than the 1/d spacing of the quotient's fractional
+    /// parts, so floor never crosses an integer boundary — exact on the
+    /// whole domain incl. LLONG_MIN.
+    ///
+    /// The 2-adic split (`_sh_divp2(x, n)` around an odd-only magic) is
+    /// deliberately NOT emitted: for d = 2^n·r the odd magic M and the
+    /// fused magic are the SAME integer (ceil(2^(S+n)/(2^n·r)) =
+    /// ceil(2^S/r)) and only the shift grows by n, so the split cost one
+    /// extra helper call per division for no accuracy — a call tcc never
+    /// inlines, at 206 sites in MIMEcroft's render (`x / 1000` →
+    /// `_sh_divodd(_sh_divp2(x, 3), M, 6)` → `_sh_divodd(x, M, 9)`).
+    /// A pure power of two (r == 1) keeps the plain shift: there the
+    /// magic would be 2^64, which does not fit.
+    /// `tests/c_div_magic.rs` pins both forms against bash's own
+    /// `$(( ))` over boundary and random values.
+    fn magic_div_mod(l: &str, op: &str, d: i64, lhs_pure: bool) -> Option<String> {
+        if d <= 0 {
+            return None;
+        }
+        // mod binds the dividend twice (and `x % 1` still has to
+        // EVALUATE x for its side effects) — pure dividends only.
+        if op == "%" && !lhs_pure {
+            return None;
+        }
+        if d == 1 {
+            return Some(if op == "%" {
+                // long long (not bare `0`): printf("%lld") reads a 64-bit
+                // arg — an int there is a -Wformat hit and varargs UB
+                "0ll".to_string()
+            } else {
+                format!("({l})")
+            });
+        }
+        let du = d as u64;
+        let n = du.trailing_zeros();
+        let r = du >> n; // odd part, >= 1
+        let div = if r == 1 {
+            // pure power of two: a shift is cheaper than a call
+            format!("_sh_divp2({l}, {n})")
+        } else {
+            // ONE magic for the whole divisor d = 2^n·r. bits(d) =
+            // bits(r) + n and ceil(2^(S+n)/(2^n·r)) = ceil(2^S/r), so
+            // M is the odd-part magic and only the shift grows by n —
+            // the nested-trunc split folded into a single call.
+            let bits = 64 - du.leading_zeros();
+            let s_total: u32 = 63 + bits; // >= 65, <= 126
+            let m = ((1u128 << s_total) + (du as u128) - 1) / (du as u128);
+            debug_assert!(m > u64::MAX as u128 / 2 && m <= u64::MAX as u128);
+            format!("_sh_divodd({l}, {m}ull, {})", s_total - 64)
+        };
+        Some(match op {
+            "/" => format!("({div})"),
+            "%" => format!("(({l}) - ({div}) * {d})"),
+            _ => return None,
+        })
+    }
+
     /// Proven-nonnegative arithmetic operand (unsigned lowering gate):
     /// the shared range proof says lo >= 0. Unknown ranges → false
     /// (stay signed — miss, never a wrap divergence).
@@ -14896,7 +15687,6 @@ impl Render {
                     let v = if self.store.contains(name) {
                         self.store_ref(name)
                     } else {
-                        self.need_sh = true;
                         format!(
                             "_sh_env({})",
                             Self::cstr(name)
@@ -14908,7 +15698,6 @@ impl Render {
             ArithAst::Index { var, key } => {
                 // `$((arr[i]))` — the element's numeric value
                 self.arrays.insert(var.clone());
-                self.need_sh = true;
                 let id = self.c_ident(var);
                 let k = self.arith(key);
                 if self.int_arrays.contains(var) {
@@ -14993,6 +15782,32 @@ impl Render {
                             } else {
                                 let shift = (*d as u64).trailing_zeros();
                                 return format!("((unsigned long long)({l}) >> {shift}u)");
+                            }
+                        }
+                    }
+                    // Exact division-free lowering for a POSITIVE
+                    // literal divisor (or a const-prop'd var holding
+                    // one) — any dividend sign. Runs before the
+                    // unsigned/versioned arms: those still lower to an
+                    // idiv under tcc, the magic does not. The div
+                    // binds the dividend once; mod twice (purity-gated
+                    // inside). Suppressed inside a versioned clone
+                    // (ver_ctx spans fast AND slow clone — the plan's
+                    // threshold proofs and pinned shapes stay
+                    // authoritative there; versioning does not fire in
+                    // MIMEcroft — zero `_vi >= 0` sites measured).
+                    if self.ver_ctx.is_none()
+                        && !self.arith_has_float(lhs)
+                        && !self.arith_has_float(rhs)
+                    {
+                        if let Some(d) = Self::arith_lit_divisor(rhs, &self.const_rhs) {
+                            if let Some(t) = Self::magic_div_mod(
+                                &l,
+                                op.as_str(),
+                                d,
+                                Self::arith_side_effect_free(lhs),
+                            ) {
+                                return t;
                             }
                         }
                     }
@@ -17457,7 +18272,7 @@ fn param_copy_alias(
         for a in &owned {
             let id = self.c_ident(a);
             if !self.int_arrays.contains(a) {
-                self.emit(&format!("for (size_t _fi = 0; _fi < {id}_len; _fi++) free({id}[_fi]);"));
+                self.emit(&format!("for (size_t _fi = 0; _fi < {id}_len; _fi++) {{ free({id}[_fi]); {id}[_fi] = 0; }}"));
             }
             self.emit(&format!("free({id});"));
         }
@@ -17481,7 +18296,7 @@ fn param_copy_alias(
         for a in &owned {
             let id = self.c_ident(a);
             if !self.int_arrays.contains(a) {
-                self.emit(&format!("for (size_t _fi = 0; _fi < {id}_len; _fi++) free({id}[_fi]);"));
+                self.emit(&format!("for (size_t _fi = 0; _fi < {id}_len; _fi++) {{ free({id}[_fi]); {id}[_fi] = 0; }}"));
             }
             self.emit(&format!("free({id});"));
         }
@@ -17564,7 +18379,6 @@ fn param_copy_alias(
             // top_vars = file-scope walk, inventory_vars = full walk
             // incl. Case/Select clauses), so no decl → read the real
             // environment, which holds the value the child exported.
-            self.need_sh = true;
             format!("_sh_env({})", Self::cstr(name))
         }
     }
@@ -17707,7 +18521,6 @@ fn param_copy_alias(
         if self.store.contains(name) || self.var_types.contains_key(name) {
             self.store_ref(name)
         } else {
-            self.need_sh = true;
             format!(
                 "_sh_env({})",
                 Self::cstr(name)
@@ -17753,7 +18566,16 @@ fn param_copy_alias(
         // scopes (gcc -O0 coalesces non-overlapping blocks) and the var
         // would read a clobbered value on the next iteration.
         self.emit(&format!("static char {t}[32];"));
-        self.emit(&format!("snprintf({t}, sizeof {t}, \"%lld\", (long long)({v}));"));
+        // DEFAULT: the hand-rolled itoa — byte-for-byte what
+        // snprintf("%lld") writes (incl. LLONG_MIN), with no format
+        // parse and no locale machinery — the contract proofs/verus/
+        // c_dec_str.rs verifies. SH2_NO_ITOA=1 renders the snprintf
+        // spelling for A/B, exactly like SH2_NO_CONCAT below.
+        if std::env::var("SH2_NO_ITOA").map(|v| v != "1").unwrap_or(true) {
+            self.emit(&format!("_sh_ll2s({t}, (long long)({v}));"));
+        } else {
+            self.emit(&format!("snprintf({t}, sizeof {t}, \"%lld\", (long long)({v}));"));
+        }
         t
     }
 
@@ -17791,6 +18613,9 @@ fn param_copy_alias(
         let src = self.num_temp_src.get(v)?.clone();
         let decl = format!("static char {v}[32];");
         let snp = format!("snprintf({v}, sizeof {v}, \"%lld\", ");
+        // the default (SH2_NO_ITOA) spelling — one conversion line of
+        // the same shape, recognised so fusion works in BOTH arms
+        let its = format!("_sh_ll2s({v}, ");
         let mut hits = 0usize;
         let mut snp_idx = None;
         for (i, l) in self.out.iter().enumerate() {
@@ -17800,7 +18625,7 @@ fn param_copy_alias(
             let t = l.trim();
             if t == decl {
                 hits += 1;
-            } else if t.starts_with(&snp) && t.ends_with(");") {
+            } else if (t.starts_with(&snp) || t.starts_with(&its)) && t.ends_with(");") {
                 hits += 1;
                 snp_idx = Some(i);
             } else {
@@ -17838,6 +18663,7 @@ fn param_copy_alias(
             }
         } else {
             self.need_gmp = true;
+            self.sorted_bigint_join_used = true;
             self.emit(&format!("_sh_sorted_bigint_join(&{vb}, {id}, {id}_len);"));
         }
         format!("{vb}.p")
@@ -17963,8 +18789,245 @@ fn param_copy_alias(
     /// a loud TODO (the C backend implements the primitives, not every
     /// Ext node). Sets `need_primitives` so the preamble emits the helpers.
     fn ext_value_c(&mut self, node: &dyn crate::shir_nodes::ExtExpr) -> String {
-        use crate::shir_nodes::{ArrayLen, RegCount, Split, StrLen, WordCount};
+        use crate::shir_nodes::{ArrayLen, CutAt, FieldGrab, FieldStrip, FieldStripEnd, RegCount, Split, StrLen, WordCount};
         match node.tag() {
+            // ── str-splice-fold (transforms/str_splice_fold.rs) ──────
+            // VALUE-position fallback: rebuild the exact Interpolate
+            // the node was folded from —
+            // join(slice(base, 0, start)) ++ repl ++ join(slice(base, end, ""))
+            // — and render THAT. Both slice arms receive the same
+            // arguments the fold consumed (Str("0") / Str("") included),
+            // so any site that is not the fused capacity-guarded store
+            // (emit_array_assign's StrSplice arm) behaves byte-for-byte
+            // like the pre-fold program.
+            "StrSplice" => {
+                let sp = node
+                    .as_any()
+                    .downcast_ref::<crate::shir_nodes::StrSplice>()
+                    .expect("tag/type agree");
+                let style = crate::ir::StrStyle::DoubleQuoted;
+                // The base as the param name-arg the slice arms expect.
+                // The fold only ever stores a plain Var read; anything
+                // else refuses (refuse > guess).
+                //
+                // `arr-load-fwd`'s folded read arrives in the def's own
+                // `Call { "arrayIndex", [Str(arr), key] }` spelling —
+                // the same element read the `Index` arm below matches,
+                // so normalise the DISPATCH only; that arm re-renders
+                // `&sp.base` with value_c, which handles the call form.
+                let norm;
+                let dispatch = match &sp.base {
+                    IrExpr::Call { func, args, .. } if func == "arrayIndex" && args.len() == 2 => {
+                        match (&args[0], &args[1]) {
+                            (IrExpr::Str(a, _), k) => {
+                                norm = IrExpr::Index {
+                                    var: a.clone(),
+                                    key: Box::new(k.clone()),
+                                };
+                                &norm
+                            }
+                            _ => &sp.base,
+                        }
+                    }
+                    other => other,
+                };
+                let base = match dispatch {
+                    IrExpr::Var(n, _) | IrExpr::Ident(n) | IrExpr::Str(n, _) => {
+                        IrExpr::Str(n.clone(), style.clone())
+                    }
+                    // arr-load-fwd folded the element copy into the base
+                    // (`row=${TAB[$y]}` → base = TAB[$y]): the param-
+                    // slice reconstruction needs a plain NAME, so build
+                    // the splice directly instead — three writes into a
+                    // FRESH vbuf, which is never `_row`'s storage, so the
+                    // aliasing the fused STORE arm branches on cannot
+                    // arise here (memcpy, not memmove). Clamps are the
+                    // same arithmetic `_sh_substr` / the store arm apply.
+                    IrExpr::Index { .. } => {
+                        let base_c = self.value_c(&sp.base);
+                        let start_c = self.value_num_dollar(&sp.start);
+                        let end_c = self.value_num_dollar(&sp.end);
+                        let repl_c = self.value_c(&sp.repl);
+                        let v = self.vbuf_temp();
+                        self.emit(&format!(
+                            "{{ const char *_row=(char*)({base_c}); long long _bl=(long long)strlen(_row); \
+                             const char *_rp=(char*)({repl_c}); size_t _rl=_rp?strlen(_rp):0; \
+                             long long _s=({start_c}); \
+                             long long _pe=(_s<0)?_bl+_s:_s; if(_pe<0)_pe=0; if(_pe>_bl)_pe=_bl; \
+                             long long _k=({end_c}); \
+                             long long _sb=(_k<0)?_bl+_k:_k; if(_sb<0)_sb=0; if(_sb>_bl)_sb=_bl; \
+                             long long _res=_pe+(long long)_rl+(_bl-_sb); \
+                             _sh_vgrow(&{v},(size_t)_res+1); \
+                             if(_pe)memcpy({v}.p,_row,(size_t)_pe); \
+                             if(_rl)memcpy({v}.p+_pe,_rp,_rl); \
+                             if(_bl>_sb)memcpy({v}.p+_pe+(long long)_rl,_row+_sb,(size_t)(_bl-_sb)); \
+                             {v}.p[_res]=0; }}"
+                        ));
+                        return format!("{v}.p");
+                    }
+                    _ => {
+                        self.mark_todo("StrSplice base not a plain name");
+                        return Self::cstr("");
+                    }
+                };
+                let join = |e: IrExpr| IrExpr::Call {
+                    func: "join".to_string(),
+                    args: vec![e],
+                };
+                let prefix = join(IrExpr::Call {
+                    func: "param".to_string(),
+                    args: vec![
+                        IrExpr::Str("slice".to_string(), style.clone()),
+                        base.clone(),
+                        IrExpr::Str("0".to_string(), style.clone()),
+                        sp.start.clone(),
+                    ],
+                });
+                let suffix = join(IrExpr::Call {
+                    func: "param".to_string(),
+                    args: vec![
+                        IrExpr::Str("slice".to_string(), style.clone()),
+                        base,
+                        sp.end.clone(),
+                        IrExpr::Str(String::new(), style),
+                    ],
+                });
+                let mut parts = vec![
+                    crate::ir::InterpPart::Expr(Box::new(prefix)),
+                ];
+                match &sp.repl {
+                    IrExpr::Interpolate(mid) => {
+                        parts.extend(mid.iter().cloned());
+                    }
+                    other => parts.push(crate::ir::InterpPart::Expr(Box::new(other.clone()))),
+                }
+                parts.push(crate::ir::InterpPart::Expr(Box::new(suffix)));
+                return self.value_c(&IrExpr::Interpolate(parts));
+            }
+            // ── str-chop-cursor pair (transforms/str_chop_cursor.rs) ──
+            // `off` is the ABSOLUTE byte offset of the unconsumed tail
+            // (decimal string — the channel every shell scalar number
+            // travels). Both arms are O(1) in the number of prior
+            // chops: no prefix re-scan, which is the whole point of the
+            // conversion (the W²/2 front-chop traffic).
+            //
+            // NO whole-string strlen, ever: the old defensive
+            // `strlen(_gt)` / `strlen(_st)` clamps re-scanned the FULL
+            // buffer on every chop — O(W) per chop, i.e. exactly the
+            // quadratic this transform exists to remove (measured on
+            // the MIMEcroft demo: cursor-on setup burned ~190 AVX2
+            // strlen samples/s for 20 s where the off build finished
+            // setup in ~3 s). The arms lean on the transform's read
+            // law 1 instead: the text is frozen between init and last
+            // use, the cursor starts at 0, and FieldStrip only advances
+            // it past a delimiter it FOUND — so `off <= strlen(text)`
+            // holds by construction. The other half of that contract
+            // (the init must not be elided by a later analysis) is
+            // pinned by str_chop_cursor's
+            // cursor_init_survives_full_registry test.
+            "FieldGrab" => {
+                // head field of text[start..]: up to the first `delim`
+                // AT/AFTER `off`, else the whole remaining tail (bash
+                // leaves the value when the pattern does not match).
+                // The nomatch arm pays `strlen(_gt+_go)` — the TAIL
+                // after the cursor (once per series: the last field),
+                // never the whole buffer on every chop.
+                let n = node.as_any().downcast_ref::<FieldGrab>().unwrap();
+                let t = self.value_c(&n.text);
+                let go = self.off_as_size(&n.off);
+                let d = Self::cstr(&n.delim);
+                // needs _sh_vgrow/_sh_vbuf (emitted in the need_sh
+                // runtime block). NOT need_primitives: this arm calls
+                // none of the three primitive helpers — setting it
+                // emitted ~15 lines of dead code into every chop render.
+                let v = self.vbuf_temp();
+                self.emit(&format!(
+                    "{{ const char *_gt=(char*)({t}); size_t _go={go}; const char *_gp=(_gt&&(*{d}))?strstr(_gt+_go,{d}):0; size_t _gl=_gp?(size_t)(_gp-(_gt+_go)):(_gt?strlen(_gt+_go):0); _sh_vgrow(&{v},_gl+1); if(_gt&&_gl)memcpy({v}.p,_gt+_go,_gl); {v}.p[_gl]=0; }}"
+                ));
+                format!("{v}.p")
+            }
+            "FieldStrip" => {
+                // cursor advance: absolute offset just past the first
+                // `delim` at/after `off` — or `off` UNCHANGED when no
+                // `delim` follows (bash's `${s#*D}` is a no-op on a
+                // non-match, so the cursor must not move). Result is a
+                // decimal string in a bounded static (size_t ≤ 20
+                // digits + NUL ≤ 24). No strlen at all: the old
+                // `_sn`/clamp rescan bought nothing the read law does
+                // not already guarantee (see the pair note above).
+                let n = node.as_any().downcast_ref::<FieldStrip>().unwrap();
+                let t = self.value_c(&n.text);
+                let go = self.off_as_size(&n.off);
+                let d = Self::cstr(&n.delim);
+                // see FieldGrab: no primitive helper is called here
+                let b = self.str_temp(24);
+                self.emit(&format!(
+                    "{{ const char *_st=(char*)({t}); size_t _so={go}; const char *_sp=(_st&&(*{d}))?strstr(_st+_so,{d}):0; if(_sp)_so=(size_t)(_sp-_st)+strlen({d}); size_t _i=23; {b}[23]=0; size_t _v=_so; if(!_v){{ {b}[--_i]='0'; }} else while(_v&&_i){{ {b}[--_i]=(char)('0'+_v%10); _v/=10; }} memmove({b},{b}+_i,24-_i); }}"
+                ));
+                b.to_string()
+            }
+            "FieldStripEnd" => {
+                // the GUARDED pair's advance (field_strip_end.node):
+                // same as FieldStrip, but a miss DRAINS to the end of
+                // `text` instead of leaving `off` alone — that is the
+                // case fallback's `s=""`, and draining is what lets the
+                // whole `case` collapse into these two statements (a
+                // grab from the end reads "" exactly like a grab of the
+                // emptied string). One `strlen(_st)` on the miss path
+                // only: the hit path — every chop but the last field —
+                // never rescans the row.
+                let n = node.as_any().downcast_ref::<FieldStripEnd>().unwrap();
+                let t = self.value_c(&n.text);
+                let go = self.off_as_size(&n.off);
+                let d = Self::cstr(&n.delim);
+                let b = self.str_temp(24);
+                self.emit(&format!(
+                    "{{ const char *_st=(char*)({t}); size_t _so={go}; const char *_sp=(_st&&(*{d}))?strstr(_st+_so,{d}):0; if(_sp)_so=(size_t)(_sp-_st)+strlen({d}); else if(_st)_so=strlen(_st); size_t _i=23; {b}[23]=0; size_t _v=_so; if(!_v){{ {b}[--_i]='0'; }} else while(_v&&_i){{ {b}[--_i]=(char)('0'+_v%10); _v/=10; }} memmove({b},{b}+_i,24-_i); }}"
+                ));
+                b.to_string()
+            }
+            // ── affix-strip-fold's single-star cut (shir_nodes/cut_at.node) ──
+            // `CutAt(text, delim, head, first)` = the four single-star
+            // glob-strip identities — `${v%%lit*}`, `${v%lit*}`,
+            // `${v#*lit}`, `${v##*lit}` — as ONE find/rfind cut over a
+            // magic-free literal. Mirrors rust's `cut_at_str` exactly:
+            //   * NO match leaves the text UNCHANGED (bash's strip is a
+            //     no-op when the pattern does not match);
+            //   * an empty delimiter lands on find("")/rfind(""'s)
+            //     boundaries (i = 0 / i = len), which is what makes
+            //     `${v#*}` the identity and `${v##*}` the empty string.
+            // Without this arm the fold REFUSES target c (no verified
+            // render) and every site keeps _sh_strippre/_sh_stripsuf:
+            // an O(len) loop of fnmatch() calls per chop. Measured on
+            // MIMEcroft's texture tokenizer (~608k strip calls → ~2.7M
+            // fnmatch → ~14% of the run's executed lines in the two
+            // helper bodies alone).
+            "CutAt" => {
+                let n = node.as_any().downcast_ref::<CutAt>().unwrap();
+                let t = self.value_c(&n.text);
+                let d = Self::cstr(&n.delim);
+                let head = if n.head { 1 } else { 0 };
+                let first = if n.first { 1 } else { 0 };
+                // _sh_vgrow/_sh_vbuf come from the need_sh runtime block
+                // (same argument as the FieldGrab arm above).
+                let v = self.vbuf_temp();
+                self.emit(&format!(
+                    "{{ const char *_t=({t}); size_t _n=_t?strlen(_t):0; const char *_d={d}; \
+                       size_t _dl=strlen(_d); size_t _i=_n; int _hit=0; \
+                       if(!_dl){{ _hit=1; _i=({first})?0:_n; }} \
+                       else if(_t){{ const char *_p=strstr(_t,_d); \
+                         if(_p){{ _hit=1; _i=(size_t)(_p-_t); \
+                           if(!({first})){{ const char *_q=_p+_dl; \
+                             for(;;){{ const char *_r=strstr(_q,_d); if(!_r)break; \
+                               _q=_r+_dl; _i=(size_t)(_r-_t); }} }} }} }} \
+                       size_t _off=(!_hit)?0:(({head})?0:_i+_dl); \
+                       size_t _gl =(!_hit)?_n:(({head})?_i:(_n>_i+_dl?_n-(_i+_dl):0)); \
+                       _sh_vgrow(&{v},_gl+1); \
+                       if(_t&&_gl)memcpy({v}.p,_t+_off,_gl); \
+                       {v}.p[_gl]=0; }}"
+                ));
+                format!("{v}.p")
+            }
             "StrLen" => {
                 let n = node.as_any().downcast_ref::<StrLen>().unwrap();
                 let t = self.value_c(&n.text);
@@ -18044,6 +19107,36 @@ fn param_copy_alias(
         self.emit(&format!("static char {t}[{cap}];"));
         t
     }
+    /// Emit `static long long _iN = 0;` and return `_iN` — a scalar VALUE
+    /// slot for an Ext node whose result is an INTEGER (FieldStrip's cursor
+    /// advance in a numeric context). Same per-site static,
+    /// consume-immediately discipline as `str_temp`; the `_i` prefix keeps
+    /// the temp families (`_s` string/num, `_v` vbuf, `_i` int) disjoint.
+    fn int_temp_slot(&mut self) -> String {
+        let t = format!("_i{}", self.temp_seq);
+        self.temp_seq += 1;
+        self.emit(&format!("static long long {t} = 0;"));
+        t
+    }
+    /// The `off` operand of a str-chop-cursor node as a `size_t`: read the
+    /// NATIVE slot when the cursor is a variable homed Int (numstr's
+    /// FieldStrip verdict — nothing to parse), `atoll` of decimal text
+    /// otherwise. The native arm is deliberately restricted to a plain
+    /// `Var`/`Ident` read: for any other numeric expression `value_c`
+    /// STRINGIFIES into a temp (`num_temp`), so casting that result to
+    /// `long long` would reinterpret the buffer's ADDRESS as the offset —
+    /// and `atoll` of the same temp is exact anyway. For a string cursor
+    /// `value_c` yields its `(x ? x : "")` store read, which is what the
+    /// hard-coded `atoll((char*)(…))` used to parse.
+    fn off_as_size(&mut self, off: &IrExpr) -> String {
+        if let IrExpr::Var(name, _) | IrExpr::Ident(name) = off {
+            if self.is_num(name) {
+                return format!("(size_t)(long long)({})", self.c_ident(name));
+            }
+        }
+        let o = self.value_c(off);
+        format!("(size_t)atoll((char*)({o}))")
+    }
     /// Emit `static _sh_vbuf _vN = {0,0};` and return `_vN` — a
     /// growable heap value buffer for sizes no analysis can prove
     /// (captures, joins, slices, argv joins — the unbounded case).
@@ -18052,6 +19145,9 @@ fn param_copy_alias(
     fn vbuf_temp(&mut self) -> String {
         let t = format!("_v{}", self.temp_seq);
         self.temp_seq += 1;
+        // v10b #4: `_sh_vbuf` is a typedef that exists ONLY inside the
+        // runtime block — naming it is what keeps that block, and the
+        // runtime trim pass then keeps only the referenced helpers.
         self.emit(&format!("static _sh_vbuf {t} = {{0, 0}};"));
         t
     }
@@ -18063,6 +19159,138 @@ fn param_copy_alias(
         self.temp_seq += 1;
         self.emit(&format!("_sh_vgrow(&{t}, 256);"));
         self.emit(&format!("for (;;) {{ int {m} = snprintf({t}.p, {t}.cap, {fmt}{args}); if ({m} < 0) break; if ((size_t){m} < {t}.cap) break; _sh_vgrow(&{t}, (size_t){m} + 1); }}"));
+    }
+
+    /// Direct-concat fill of vbuf `t` from already-rendered pieces —
+    /// the C-specific replacement for `snprintf_grow` when the fmt is
+    /// pure `%s` (which is every value-context Interpolate: its parts
+    /// are value_c'd to `char*`). One capacity check, one strlen per
+    /// part, one memcpy per part — no format-string parse, no locale
+    /// machinery, no second pass over the assembled bytes.
+    /// SH2_NO_CONCAT=1 keeps the snprintf grow loop (A/B).
+    fn direct_concat_fill(&mut self, t: &str, pieces: &[ConcatPiece]) {
+        let tc = self.temp_seq;
+        self.temp_seq += 1;
+        let mut caps: Vec<String> = Vec::new();
+        let mut lens: Vec<String> = Vec::new();
+        let mut toks: Vec<String> = Vec::new();
+        let mut cop: Vec<String> = Vec::new();
+        let mut li = 0usize;
+        for p in pieces {
+            match p {
+                ConcatPiece::Lit(s) => {
+                    if !s.is_empty() {
+                        toks.push(s.len().to_string());
+                        cop.push(format!(
+                            "memcpy(_w{tc}, {}, {}); _w{tc} += {};",
+                            Self::cstr(s),
+                            s.len(),
+                            s.len()
+                        ));
+                    }
+                }
+                ConcatPiece::Arg(a) => {
+                    caps.push(format!("const char *_a{tc}_{li} = ({a});"));
+                    lens.push(format!("size_t _l{tc}_{li} = strlen(_a{tc}_{li});"));
+                    toks.push(format!("_l{tc}_{li}"));
+                    cop.push(format!(
+                        "memcpy(_w{tc}, _a{tc}_{li}, _l{tc}_{li}); _w{tc} += _l{tc}_{li};"
+                    ));
+                    li += 1;
+                }
+            }
+        }
+        let total = sum_toks(&toks);
+        self.emit(&format!(
+            "{{ {caps} {lens} _sh_vgrow(&{t}, {total} + 1); char *_w{tc} = {t}.p; {cop} _w{tc}[0] = 0; }}",
+            caps = caps.join(" "),
+            lens = lens.join(" "),
+            cop = cop.join(" "),
+        ));
+    }
+
+    /// Fused direct append for the self-append growth arm
+    /// (`acc = acc + <seg>`): capture each part ONCE, size the buffer
+    /// from the summed part lengths, memcpy the parts straight into
+    /// the accumulator. The materialize path it replaces assembles the
+    /// seg into a temp vbuf (snprintf loop), then strlens the temp and
+    /// memcpys it — three copies of the same bytes plus a format parse.
+    /// SH2_NO_CONCAT=1 keeps that path (A/B).
+    ///
+    /// Refuses — BEFORE rendering anything, so the fallback path never
+    /// sees duplicated emissions — when the seg is not an Interpolate
+    /// or any part MENTIONS the accumulator: such a part reads through
+    /// a pointer into the very buffer the realloc may move, and only
+    /// the materialize path evaluates it before the grow. (Parts are
+    /// seg_ok-guaranteed pure, and `expr_mentions` is conservative on
+    /// unknown calls.)
+    fn direct_append(&mut self, var: &str, seg: &IrExpr) -> bool {
+        let IrExpr::Interpolate(parts) = seg else {
+            return false;
+        };
+        if parts.iter().any(|p| match p {
+            InterpPart::Expr(x) => expr_mentions(x, var),
+            InterpPart::Lit(_) => false,
+        }) {
+            return false;
+        }
+        let parts = flatten_parts(parts);
+        let tc = self.temp_seq;
+        self.temp_seq += 1;
+        let nid = self.c_ident(var);
+        let mut caps: Vec<String> = Vec::new();
+        let mut lens: Vec<String> = Vec::new();
+        let mut toks: Vec<String> = Vec::new();
+        let mut cop: Vec<String> = Vec::new();
+        let mut li = 0usize;
+        for p in &parts {
+            match p {
+                InterpPart::Lit(s) => {
+                    if !s.is_empty() {
+                        toks.push(s.len().to_string());
+                        cop.push(format!(
+                            "memcpy(_w{tc}, {}, {}); _w{tc} += {};",
+                            Self::cstr(s),
+                            s.len(),
+                            s.len()
+                        ));
+                    }
+                }
+                InterpPart::Expr(x) => {
+                    // value_c emissions come first: bash expands the
+                    // whole RHS before the store, and the captures below
+                    // read the parts exactly once, before any realloc.
+                    let a = self.value_c(x);
+                    caps.push(format!("const char *_a{tc}_{li} = ({a});"));
+                    lens.push(format!("size_t _l{tc}_{li} = strlen(_a{tc}_{li});"));
+                    toks.push(format!("_l{tc}_{li}"));
+                    cop.push(format!(
+                        "memcpy(_w{tc}, _a{tc}_{li}, _l{tc}_{li}); _w{tc} += _l{tc}_{li};"
+                    ));
+                    li += 1;
+                }
+            }
+        }
+        // LENGTH MIRROR — same bookkeeping as the materialize arm: a
+        // tracked accumulator's `_alen_<id>` is the O(1) old-length
+        // load, written back after the copy; untracked vars strlen.
+        let (olen, mirror) = if self.acc_lens.contains(var) {
+            let ol = format!("_alen_{nid}");
+            if self.acc_len_declared.insert(ol.clone()) {
+                self.emit(&format!("static size_t {ol} = 0;"));
+            }
+            (ol.clone(), format!(" {ol} = _o{tc} + _n{tc};"))
+        } else {
+            (format!("({nid}) ? strlen({nid}) : 0"), String::new())
+        };
+        let total = sum_toks(&toks);
+        self.emit(&format!(
+            "{{ {caps} {lens} size_t _o{tc} = {olen}; size_t _n{tc} = {total}; char *_np{tc} = (char*)realloc(({nid}), (_o{tc} + _n{tc} + 1) * 2); if (!_np{tc}) {{ fprintf(stderr, \"sh2c: out of memory\\n\"); exit(127); }} ({nid}) = _np{tc}; char *_w{tc} = ({nid}) + _o{tc}; {cop} _w{tc}[0] = 0;{mirror} }}",
+            caps = caps.join(" "),
+            lens = lens.join(" "),
+            cop = cop.join(" "),
+        ));
+        true
     }
 
     /// Is a param call a LENGTH form (${#x}, ${#arr[@]}, param("slice","#arr","@"))?
@@ -18204,7 +19432,6 @@ fn param_copy_alias(
             }
             ArithAst::Index { var, key } => {
                 self.arrays.insert(var.clone());
-                self.need_sh = true;
                 let id = self.c_ident(var);
                 // key could be bigint-tainted: evaluate for the index,
                 // then parse the element decimal (get_si truncates the
@@ -18590,16 +19817,31 @@ fn param_copy_alias(
                 }
                 let mut fmt = String::new();
                 let mut cargs: Vec<String> = Vec::new();
+                let mut pieces: Vec<ConcatPiece> = Vec::new();
                 for p in &parts {
                     match p {
-                        InterpPart::Lit(s) => fmt.push_str(&s.replace('%', "%%")),
+                        InterpPart::Lit(s) => {
+                            fmt.push_str(&s.replace('%', "%%"));
+                            pieces.push(ConcatPiece::Lit(s.to_string()));
+                        }
                         InterpPart::Expr(x) => {
                             fmt.push_str("%s");
-                            cargs.push(self.value_c(x));
+                            let a = self.value_c(x);
+                            pieces.push(ConcatPiece::Arg(a.clone()));
+                            cargs.push(a);
                         }
                     }
                 }
                 let t = self.vbuf_temp();
+                // DIRECT CONCAT (SH2_NO_CONCAT=1 keeps the snprintf grow
+                // loop): every value_c'd part renders as a `char*`, so the
+                // fmt is pure %s — one capacity check, one strlen per part,
+                // one memcpy per part. No format parse, no locale, no
+                // second pass over the assembled bytes.
+                if std::env::var("SH2_NO_CONCAT").map(|v| v != "1").unwrap_or(true) {
+                    self.direct_concat_fill(&t, &pieces);
+                    return format!("{t}.p");
+                }
                 let args = if cargs.is_empty() {
                     String::new()
                 } else {
@@ -18966,7 +20208,6 @@ fn param_copy_alias(
     /// every identifier assignment back via setenv — later reads go
     /// through getenv, children inherit through _sh_export/getenv.
     fn source_eval_site(&mut self, kind: &str, args: &[IrExpr]) -> String {
-        self.need_sh = true;
         let words = match args.get(1) {
             Some(IrExpr::Array(items)) => items.clone(),
             _ => Vec::new(),
@@ -19011,7 +20252,6 @@ fn param_copy_alias(
     }
 
     fn shell_site(&mut self, body: impl FnOnce(&mut Render), invert: bool) -> String {
-        self.need_sh = true;
         self.in_site += 1;
         self.site_exported.clear();
         let id = self.site_seq;
@@ -19221,7 +20461,6 @@ fn param_copy_alias(
     /// Register a capture site (private command/wb buffers + result buf).
     /// Returns the call expression `_cap_N()` (a char*).
     fn cap_site(&mut self, body: impl FnOnce(&mut Render, usize)) -> String {
-        self.need_sh = true;
         self.in_site += 1;
         self.site_exported.clear();
         let id = self.site_seq;
@@ -20884,6 +22123,21 @@ fn param_copy_alias(
                     self.sh_raw(buf, if *newline { "'%s\\n'" } else { "'%s'" });
                     self.sh_word(buf, value);
                 }
+                IrStmt::WriteFile { path, content, append } => {
+                    // The write half of the same fold (`echo … > f`, and
+                    // `: > f` with empty content): the child does it, so
+                    // reconstruct the command the source wrote —
+                    // `printf '%s' <content> > <path>`. Content carries
+                    // its own trailing newline, hence no `\\n` in the
+                    // format. Without this arm the fold's node fell to
+                    // `TODO(unsupported)` and the marker failed the C
+                    // gate's stub check.
+                    self.sh_raw(buf, "printf");
+                    self.sh_raw(buf, "'%s'");
+                    self.sh_word(buf, content);
+                    self.sh_raw(buf, if *append { ">>" } else { ">" });
+                    self.sh_word(buf, path);
+                }
                 IrStmt::Pipeline { stages, capture: None, .. }
                 if stages.iter().any(|s2| {
                     let j = format!("{s2:?}");
@@ -21629,7 +22883,6 @@ fn param_copy_alias(
                         false
                     }
                     if words.iter().any(|w| has_bad(w)) {
-                        self.need_sh = true;
                         return "(_sh_rc = 1, 0)".into();
                     }
                 }
@@ -21834,7 +23087,6 @@ fn param_copy_alias(
                         }
                     }
                     let p = self.printf_from_parts(parts);
-                    self.need_sh = true;
                     // value 1: the chain peel publishes the verdict from
                     // this expr — a trailing `_sh_rc = 0` would make the
                     // comma value 0 (falsy) and flip every `echo && …`.
@@ -21857,7 +23109,6 @@ fn param_copy_alias(
                     if items.len() == 1 {
                         if let Some(nm) = Self::str_arg(&[items[0].clone()], 0) {
                             if self.functions.contains(&nm) {
-                                self.need_sh = true;
                                 return format!(
                                     "(printf(\"%s is a function\\n\", {}), _sh_rc = 0, 1)",
                                     Self::cstr(&nm)
@@ -21880,7 +23131,6 @@ fn param_copy_alias(
                             let rest: Vec<&IrExpr> = words.iter().skip(2).copied().collect();
                             if let Some(p) = self.try_native_printf_into(&rest, Some(&self.c_ident(&name))) {
                                 self.store.insert(name.clone());
-                                self.need_sh = true;
                                 return format!("(_sh_rc = 0, {p})");
                             }
                         }
@@ -21888,7 +23138,6 @@ fn param_copy_alias(
                     }
                 }
                 if let Some(p) = self.try_native_printf(&words) {
-                    self.need_sh = true;
                     format!("(_sh_rc = 0, {p})")
                 } else {
                     self.shell_exec(args)
@@ -21899,7 +23148,6 @@ fn param_copy_alias(
                     Some(w) => self.value_c(w),
                     None => "\"\"".into(),
                 };
-                self.need_sh = true;
                 // bash cd: silent failure (stderr is /dev/null in the
                 // gate), rc 0 on success — chdir's return is inverted;
                 // PWD must follow (bash keeps it in sync)
@@ -21915,22 +23163,18 @@ fn param_copy_alias(
                 format!("(exit({code}), 0)")
             }
             ":" | "true" => {
-                self.need_sh = true;
                 "(_sh_rc = 0, 1)".into()
             }
             "false" => {
-                self.need_sh = true;
                 "(_sh_rc = 1, 0)".into()
             }
             "local" | "declare" | "typeset" | "export" | "readonly" => {
                 // declaration builtins: `export X=1` assigns the store;
                 // bare declarations are no-ops (the hoist declares all)
-                self.need_sh = true;
                 self.declare_words(&words);
                 "(_sh_rc = 0, 1)".into()
             }
             "unset" => {
-                self.need_sh = true;
                 for w in &words {
                     if let Some(name) = Self::str_arg(&[(*w).clone()], 0) {
                         // nameref: `unset [-n] ref` removes the alias (not
@@ -21948,24 +23192,20 @@ fn param_copy_alias(
                         self.nonnull_forget(&name);
                         if let Some(open) = name.find('[') {
                             if name.ends_with(']') {
-                                // `unset arr[i]` — clear the element
+                                // `unset NAME[KEY]` — clear the element.
+                                // Storage class decides the subscript's
+                                // MEANING (see emit_unset_element); the old
+                                // arm only handled a numeric literal and had
+                                // no else branch at all, so `unset 'm[b]'`
+                                // emitted NOTHING and `unset 'm[0]'` on
+                                // assoc storage emitted an indexed clear
+                                // naming `{id}_len`.
                                 let var = name[..open].to_string();
                                 let key = name[open + 1..name.len() - 1].to_string();
-                                self.arrays.insert(var.clone());
-                                let id = self.c_ident(&var);
-                                if let Ok(i) = key.parse::<i64>() {
-                                    // free the dropped slot before clearing
-                                    // (a bare `= 0` orphaned its string)
-                                    if self.is_string_array(&var) {
-                                        self.emit(&format!(
-                                            "if ({i} < {id}_len) {{ free({id}[{i}]); {id}[{i}] = 0; }}"
-                                        ));
-                                    } else {
-                                        self.emit(&format!(
-                                            "if ({i} < {id}_len) {id}[{i}] = 0;"
-                                        ));
-                                    }
-                                }
+                                self.emit_unset_element(
+                                    &var,
+                                    &IrExpr::Str(key, crate::ir::StrStyle::DoubleQuoted),
+                                );
                                 continue;
                             }
                         }
@@ -21978,7 +23218,7 @@ fn param_copy_alias(
                                 // string slots first (a plain `_len = 0`
                                 // orphaned them).
                                 if self.is_string_array(&name) {
-                                    self.emit(&format!("for (size_t _fi = 0; _fi < {id}_len; _fi++) free({id}[_fi]);"));
+                                    self.emit(&format!("for (size_t _fi = 0; _fi < {id}_len; _fi++) {{ free({id}[_fi]); {id}[_fi] = 0; }}"));
                                 }
                                 self.emit(&format!("{id}_len = 0;"));
                             }
@@ -22006,6 +23246,34 @@ fn param_copy_alias(
                                 self.emit(&format!("{id} = \"\";"));
                             }
                         }
+                    } else if let IrExpr::Interpolate(parts) = w {
+                        // `unset "m[$k]"` — the word arrives bracketed by
+                        // literal parts: Lit("m["), …expr…, Lit("]"). Split
+                        // off the var name and the key expression and
+                        // dispatch on STORAGE CLASS exactly like the
+                        // literal form — the old arm only matched Str
+                        // words, so this unset emitted nothing at all.
+                        if let (Some(InterpPart::Lit(first)), Some(InterpPart::Lit(last))) =
+                            (parts.first(), parts.last())
+                        {
+                            if first.ends_with('[') && last == "]" {
+                                let var = first[..first.len() - 1].to_string();
+                                if is_ident(&var) {
+                                    self.nonnull_forget(&var);
+                                    let inner: Vec<InterpPart> =
+                                        parts[1..parts.len() - 1].to_vec();
+                                    let keyv = if inner.is_empty() {
+                                        IrExpr::Str(
+                                            String::new(),
+                                            crate::ir::StrStyle::DoubleQuoted,
+                                        )
+                                    } else {
+                                        IrExpr::Interpolate(inner)
+                                    };
+                                    self.emit_unset_element(&var, &keyv);
+                                }
+                            }
+                        }
                     }
                 }
                 "(_sh_rc = 0, 1)".into()
@@ -22018,7 +23286,6 @@ fn param_copy_alias(
                 // old $N — `set -- "$1" ...`).
                 if let Some(IrExpr::Str(s, _)) = words.first() {
                     if s.trim() == "--" {
-                        self.need_sh = true;
                         let n = words.len() - 1;
                         let av = format!("_sh_av{}", self.temp_seq);
                         self.temp_seq += 1;
@@ -22046,12 +23313,10 @@ fn param_copy_alias(
                         return "(_sh_rc = 0, 1)".into();
                     }
                 }
-                self.need_sh = true;
                 "(_sh_rc = 0, 1)".into()
             }
             "shift" => {
                 // `shift [n]` — drop the first n positionals ($0 stays)
-                self.need_sh = true;
                 let n = match words.first() {
                     Some(w) => self.value_num(w),
                     None => "1".into(),
@@ -22065,7 +23330,6 @@ fn param_copy_alias(
                     Some(w) => self.value_c(w),
                     None => "\"0\"".into(),
                 };
-                self.need_sh = true;
                 self.need_time = true;
                 format!(
                     "({{ int _r = _sh_sleep({v}); _sh_rc = (_r == 0 ? 0 : 1); _r == 0; }})"
@@ -22095,7 +23359,6 @@ fn param_copy_alias(
             "read" => {
                 // `read [-r] var...` — read a line into the first var
                 // (stdin is the gate's /dev/null → EOF → var = "", rc 1)
-                self.need_sh = true;
                 let mut target = String::new();
                 for w in &words {
                     if let Some(n) = Self::str_arg(&[(*w).clone()], 0) {
@@ -22130,7 +23393,6 @@ fn param_copy_alias(
                             if let Some(ast) = crate::shir::parse_arith(&substituted) {
                                 let cexpr = self.arith(&ast);
                                 let cexpr = self.apply_array_counts(&cexpr);
-                                self.need_sh = true;
                                 if self.rc_unobserved && self.in_cond > 0 {
                                     return format!("({cexpr})");
                                 }
@@ -22141,7 +23403,6 @@ fn param_copy_alias(
                             // parse failed — restore and fall through
                         }
                         if let Some(c) = self.let_render(expr) {
-                            self.need_sh = true;
                             // `let` succeeds (rc 0) iff the arith is nonzero.
                             // In cond position with unobserved rc, the
                             // store is dead (the value is used, rc is
@@ -22163,14 +23424,12 @@ fn param_copy_alias(
                         return self.arith_string_site(expr);
                     }
                 }
-                self.need_sh = true;
                 "(_sh_rc = 0, 1)".into()
             }
             "mkdir" => {
                 // `mkdir [-p] dir...` — native mkdir(2). -p makes
                 // parents (mkdir -p semantics); plain form fails if
                 // the parent is missing (bash parity: rc!=0).
-                self.need_sh = true;
                 self.need_stat_ops.insert("mkdir".to_string());
                 let mut mkp = false;
                 let mut dirs: Vec<String> = Vec::new();
@@ -22224,7 +23483,6 @@ fn param_copy_alias(
             "touch" => {
                 // `touch file...` — create-or-keep (fopen "a").
                 // Flags other than -c keep the shell site.
-                self.need_sh = true;
                 let mut files: Vec<String> = Vec::new();
                 let mut ok = true;
                 for w in &words {
@@ -22260,7 +23518,6 @@ fn param_copy_alias(
                 );
             }
             "rmdir" => {
-                self.need_sh = true;
                 let mut dirs: Vec<String> = Vec::new();
                 let mut ok = true;
                 for w in &words {
@@ -22326,7 +23583,6 @@ fn param_copy_alias(
                     files.push(self.value_c(w));
                 }
                 if ok && has_f {
-                    self.need_sh = true;
                     return format!(
                         "({{ {} _sh_rc = 0; (_sh_rc == 0); }})",
                         files
@@ -22337,7 +23593,6 @@ fn param_copy_alias(
                     );
                 }
                 if let Some(uu) = self.uu_run_opt(&cmd, &args) {
-                    self.need_sh = true;
                     return format!("(_sh_rc = {uu}, _sh_rc == 0)");
                 }
                 return self.shell_exec(args);
@@ -22355,7 +23610,6 @@ fn param_copy_alias(
                 // set _sh_argv (save/restore around the call for nesting).
                 // Under the positional-const proof NO callee reads
                 // positionals — the swap is unobservable, omitted.
-                self.need_sh = true;
                 let n = words.len() + 1;
                 if let Some(&arity) = self.lifted_fns.get(&cmd) {
                     // LIFTED fn: plain C call with the args as params
@@ -22383,7 +23637,6 @@ fn param_copy_alias(
                     // bigint args via a temp mpz_t (value_mpz). MIXED ABI
                     // (per-position): a numeric position converts with
                     // value_ll, a text position with value_c.
-                    self.need_sh = true;
                     let native = self.native_num_fns.contains(&cmd);
                     let big = self.bigint_param_fns.contains(&cmd);
                     let positions = if big {
@@ -22489,12 +23742,10 @@ fn param_copy_alias(
                     if Self::fb_is_void(&fb) {
                         format!("({fb})")
                     } else {
-                        self.need_sh = true;
                         let ok = Self::fb_status(&fb);
                         format!("(_sh_rc = {ok}, _sh_rc == 0)")
                     }
                 } else if let Some(uu) = self.uu_run_opt(&cmd, &args) {
-                    self.need_sh = true;
                     format!("(_sh_rc = {uu}, _sh_rc == 0)")
                 } else {
                     self.shell_exec(args)
@@ -22695,7 +23946,6 @@ fn param_copy_alias(
     /// environment fallback (`_sh_env` → `""`), with free-wrap on
     /// reassign — exactly as the originals.
     fn emit_take_block(&mut self, x: &str, s: &str, delim: u8) {
-        self.need_sh = true;
         self.store.insert(x.to_string());
         self.store.insert(s.to_string());
         let t = self.temp_seq;
@@ -23177,7 +24427,6 @@ fn param_copy_alias(
     fn uu_capture_opt(&mut self, cmd: &str, args: &[IrExpr]) -> Option<String> {
         let av = self.uu_argv(cmd, args)?;
         let buf = self.vbuf_temp();
-        self.need_sh = true;
         self.emit(&format!("_sh_vgrow(&{buf}, 65536);"));
         self.emit(&format!(
             "_sh_rc = _sh_uu_capture((int)(sizeof {av} / sizeof {av}[0]) - 1, {av}, {buf}.p, {buf}.cap, 0);"
@@ -23282,6 +24531,59 @@ fn param_copy_alias(
         }
     }
 
+    /// FUSED chop store: `x = <FieldGrab …>` when the extraction IS the
+    /// whole RHS. The generic path renders the Ext value into a
+    /// `_sh_vbuf` temp (`_sh_vgrow` + `memcpy`) and then `_sh_sset`s
+    /// that temp, so every chop COPIES the field twice and SCANS it
+    /// twice — `strlen` over the bytes that were just written, plus
+    /// `strnlen` over the old value, plus the `memmove` itself — for a
+    /// result the IR already stated in one statement. Here the
+    /// delimiter is found once and the field lands in the destination
+    /// with its KNOWN length: one source scan, one capped old-buffer
+    /// scan, one copy. Measured on the MIMEcroft demo, the whole
+    /// per-frame/per-setup `_sh_sset` traffic IS this pattern (402,622
+    /// of 402,622 setup call sites and ~405k of 787k `_sh_vgrow` calls
+    /// are FieldGrab stores: 14.4% + 18.3% of setup's executed lines).
+    ///
+    /// C-specific BY CONSTRUCTION, not by preference: the IR is
+    /// already in its best shape — a single Assign whose RHS is the
+    /// extraction (`str-chop-cursor` did the generic work upstream) —
+    /// so no shIR→shIR pass can see this redundancy. The temp exists
+    /// only because THIS backend renders Ext expressions
+    /// compositionally, with nowhere to put the result but a scratch
+    /// buffer; every other backend stores `substr(text, off, len)`
+    /// directly. Fusing at the store is therefore the whole fix.
+    ///
+    /// Semantics are exactly `_sh_sset`'s: memmove covers src
+    /// aliasing the destination (self-ref RHS), and the miss path is
+    /// the snapshot → own → free order. `SH2_NO_FUSEGRAB=1` restores
+    /// the temp + `_sh_sset` pair for bisecting a suspect render (the
+    /// switch folds into bash-O4's artifact cache key like every other
+    /// SH2_NO_* render switch). Returns false with NOTHING emitted when
+    /// the RHS is not a fusible extraction.
+    fn emit_fused_field_store(&mut self, id: &str, expr: &IrExpr) -> bool {
+        let IrExpr::Ext(n) = expr else {
+            return false;
+        };
+        if n.tag() != "FieldGrab" {
+            return false;
+        }
+        let Some(g) = n.as_any().downcast_ref::<crate::shir_nodes::FieldGrab>() else {
+            return false;
+        };
+        // Same operands ext_value_c's FieldGrab arm renders — only the
+        // destination differs (none → the store's own slot).
+        let t = self.value_c(&g.text);
+        let go = self.off_as_size(&g.off);
+        let d = Self::cstr(&g.delim);
+        // The temp path set this; value_c above may have emitted
+        // temps of its own, so keep the same runtime block guarantee.
+        self.emit(&format!(
+            "_sh_sset_field(&{id}, (const char*)({t}), {go}, {d});"
+        ));
+        true
+    }
+
     /// Parse a pure attribute flag word (`-il`, `+u`): Some((set,clear))
     /// bitmasks, None for anything else (arrays `-a`, `-p`, `-f`, ...
     /// keep existing paths). Tracked: i/l/u/r/x (X=16, auto-export).
@@ -23313,7 +24615,6 @@ fn param_copy_alias(
     /// Runtime case-fold of a C string value (BASHC_FIX typeset -l/-u).
     /// Mirrors the ^^/,, arms. Returns temp .p (caller assigns it).
     fn fold_case_temp(&mut self, v: &str, to_upper: bool) -> String {
-        self.need_sh = true;
         let t = self.vbuf_temp();
         let f = if to_upper { "toupper" } else { "tolower" };
         self.emit(&format!(
@@ -24132,10 +25433,9 @@ fn param_copy_alias(
         if capture {
             if let Some(arr) = sorted_join_array(stages) {
                 if self.arrays.contains(&arr) && !self.assoc_arrays.contains(&arr) {
-                    // the runtime region (helpers, _sh_rc, vbuf core)
-                    // lives under need_sh — set it; the trimmer drops
+                    // the `_sh_*` names emitted below are what the
+                    // runtime-block verdict keys on; the trimmer drops
                     // everything this lowering doesn't reference
-                    self.need_sh = true;
                     let id = self.c_ident(&arr);
                     let b = format!("_sj{pid}");
                     self.emit(&format!("static _sh_vbuf {b} = {{0, 0}};"));
@@ -24146,7 +25446,6 @@ fn param_copy_alias(
             }
         } else if let Some(arr) = sorted_join_array(stages) {
             if self.arrays.contains(&arr) && !self.assoc_arrays.contains(&arr) {
-                self.need_sh = true;
                 let id = self.c_ident(&arr);
                 let b = format!("_sj{pid}");
                 self.emit(&format!("static _sh_vbuf {b} = {{0, 0}};"));
@@ -24220,7 +25519,6 @@ fn param_copy_alias(
             }
         }
         self.need_pipeline = true;
-        self.need_sh = true;
         for d in &decls {
             self.emit(d);
         }
@@ -24444,7 +25742,6 @@ fn param_copy_alias(
                                         return;
                                     }
                                 }
-                                r.need_sh = true;
                                 let n = call_args.len() + 1;
                                 let av = format!("_sh_av{}", r.temp_seq);
                                 r.temp_seq += 1;
@@ -24995,7 +26292,6 @@ fn param_copy_alias(
     /// argv; typed-Int vars read as their C ident; everything else
     /// atoll()s the store read (env fallback for never-assigned names).
     fn mf_numref(&mut self, name: &str) -> String {
-        self.need_sh = true;
         if !name.is_empty() && name.chars().all(|c| c.is_ascii_digit()) {
             return self.positional_read_l(name);
         }
@@ -25458,6 +26754,20 @@ fn param_copy_alias(
                     self.need_pow = true;
                     format!("_sh_pow({l},{r})")
                 } else if op == "/" || op == "%" {
+                    // exact magic for a positive literal divisor — the
+                    // dividend `l` is a bound temp (or a pure inline
+                    // read), so mod's double evaluation is safe here.
+                    // Suppressed inside a versioned clone (value arm).
+                    if self.ver_ctx.is_none()
+                        && !self.arith_has_float(lhs)
+                        && !self.arith_has_float(rhs)
+                    {
+                        if let Some(d) = Self::arith_lit_divisor(rhs, &self.const_rhs) {
+                            if let Some(t) = Self::magic_div_mod(&l, op.as_str(), d, true) {
+                                return t;
+                            }
+                        }
+                    }
                     // the seq-position div/mod guard — same bounded
                     // proof elision as the value position above
                     if crate::shir::arith_divisor_bounded_nonzero(rhs) {
@@ -26531,7 +27841,6 @@ fn param_copy_alias(
                 // an unassigned var (env var): read the real environment
                 // (render-time store.insert is TOO LATE — the hoist ran
                 // in pass 1; an insert here yields an undeclared id)
-                self.need_sh = true;
                 format!(
                     "_sh_env({})",
                     Self::cstr(stripped)
@@ -26560,7 +27869,6 @@ fn param_copy_alias(
                     // specials arm below and read getenv("1") (always
                     // empty) — the game's --demo flag never arrived.
                     // Same argv shape that arm uses.
-                    self.need_sh = true;
                     format!(
                         "(({0} < _sh_argc && _sh_argv[{0}]) ? _sh_argv[{0}] : \"\")",
                         name
@@ -26607,7 +27915,6 @@ fn param_copy_alias(
         } else if raw.starts_with('$') && raw.len() > 1 {
             // positional / special vars — $? is the LAST STATUS (a
             // constant "" broke `[ "$?" = "0" ]` chains)
-            self.need_sh = true;
             match &raw[1..] {
                 "?" => self.num_temp("_sh_rc"),
                 "$" => self.num_temp("getpid()"),
@@ -26936,7 +28243,6 @@ fn param_copy_alias(
             .and_then(|r| r.strip_suffix(']'))
         {
             if let Ok(i) = rest.parse::<usize>() {
-                self.need_sh = true;
                 return format!("(char*)_sh_ps({i})");
             }
         }
@@ -27031,7 +28337,6 @@ fn param_copy_alias(
                         return joined;
                     }
                 }
-                self.need_sh = true;
                 let t = self.vbuf_temp();
                 if is_positional {
                     // `${@:off:len}` — bash's offset is 1-based (0
@@ -27102,10 +28407,8 @@ fn param_copy_alias(
         } else if name.is_empty() {
             "\"\"".to_string()
         } else if name == "#" {
-            self.need_sh = true;
             self.argc_expr_l()
         } else if name == "@" || name == "*" {
-            self.need_sh = true;
             let t = self.vbuf_temp();
             self.emit(&format!("_sh_argv_join(&{t});"));
             format!("{t}.p")
@@ -27113,7 +28416,6 @@ fn param_copy_alias(
             self.num_temp(&self.c_ident(&name))
         } else if name.starts_with('$') || name.chars().all(|c| c.is_ascii_digit()) {
             // positional $N — a lifted fn's C param or the caller's argv
-            self.need_sh = true;
             self.positional_str_l(name.trim_start_matches('$'))
         } else if self.arrays.contains(&name) || self.assoc_arrays.contains(&name) {
             // `${LIST:-}` / `${MAP[k]}` — an ARRAY read: element 0 for
@@ -27129,7 +28431,6 @@ fn param_copy_alias(
         } else {
             // never-assigned: an environment variable (or unset — the
             // default/expansion handles it)
-            self.need_sh = true;
             format!(
                 "_sh_env({})",
                 Self::cstr(&name)
@@ -27197,7 +28498,19 @@ fn param_copy_alias(
                     // `:=` ASSIGNS the default back (fixed buffer: copy)
                     format!("(strcpy({}, {v}), {v})", self.c_ident(&name))
                 } else {
-                    format!("({} = {v}, {v})", self.c_ident(&name))
+                    // A non-buf scalar store var is HEAP-OWNED — its
+                    // end-of-scope cleanup runs `free()` on it
+                    // (is_heap_store_var), so leaving the default
+                    // LITERAL in it frees a static string at exit
+                    // (`munmap_chunk(): invalid pointer`, the p13/p11/
+                    // p14 probe shapes: a `:=` whose only write is the
+                    // default, so no buf grant was proven). Own the
+                    // default IN THE STORE ARM only; the value arm
+                    // re-reads y (same bytes), and the double-eval
+                    // count matches the old `(y = v, v)`.
+                    let v_owned =
+                        format!("({nonempty_test} ? ({var_expr}) : ({val}))"); // NEGATIVE CONTROL A: xstrdup dropped
+                    format!("({} = {v_owned}, {v})", self.c_ident(&name))
                 }
             }
             "#" | "#:" | "##" | "##:" => {
@@ -27205,7 +28518,6 @@ fn param_copy_alias(
                     pdebug!("DBG # arm fired name={name:?} pat={:?}", Self::str_arg(args, 2));
                 }
                 let pat = Self::str_arg(args, 2).unwrap_or_default();
-                self.need_sh = true;
                 self.need_fnmatch = true;
                 let t = self.vbuf_temp();
                 let greedy = if op.starts_with("##") { "1" } else { "0" };
@@ -27217,7 +28529,6 @@ fn param_copy_alias(
             }
             "%" | "%:" | "%%" | "%%:" => {
                 let pat = Self::str_arg(args, 2).unwrap_or_default();
-                self.need_sh = true;
                 self.need_fnmatch = true;
                 let t = self.vbuf_temp();
                 let greedy = if op.starts_with("%%") { "1" } else { "0" };
@@ -27229,7 +28540,6 @@ fn param_copy_alias(
             }
             "//" | "/" => {
                 let pat = Self::str_arg(args, 2).unwrap_or_default();
-                self.need_sh = true;
                 let t = self.vbuf_temp();
                 // `/` replaces the FIRST match only; `//` replaces all —
                 // one helper served both and \${y/one/1} clobbered every
@@ -27256,7 +28566,6 @@ fn param_copy_alias(
                     .get(3)
                     .map(|x| self.value_num_dollar(x))
                     .unwrap_or_else(|| "(long long)1LL<<60".into());
-                self.need_sh = true;
                 let t = self.vbuf_temp();
                 self.emit(&format!(
                     "_sh_substr(&{t}, {var_expr}, {off}, {len});"
@@ -27264,7 +28573,6 @@ fn param_copy_alias(
                 format!("{t}.p")
             }
             "^^" | "^^:" => {
-                self.need_sh = true;
                 let t = self.vbuf_temp();
                 self.emit(&format!(
                     "{{ const char *_u = {var_expr}; _sh_vgrow(&{t}, strlen(_u) + 1); char *_d = {t}.p; size_t _i; for (_i = 0; _u[_i]; _i++) _d[_i] = (char)toupper((unsigned char)_u[_i]); _d[_i] = 0; }}"
@@ -27272,7 +28580,6 @@ fn param_copy_alias(
                 format!("{t}.p")
             }
             ",," | ",,:" => {
-                self.need_sh = true;
                 let t = self.vbuf_temp();
                 self.emit(&format!(
                     "{{ const char *_u = {var_expr}; _sh_vgrow(&{t}, strlen(_u) + 1); char *_d = {t}.p; size_t _i; for (_i = 0; _u[_i]; _i++) _d[_i] = (char)tolower((unsigned char)_u[_i]); _d[_i] = 0; }}"
@@ -27280,7 +28587,6 @@ fn param_copy_alias(
                 format!("{t}.p")
             }
             "^" | "^:" => {
-                self.need_sh = true;
                 let t = self.vbuf_temp();
                 self.emit(&format!(
                     "{{ const char *_u = {var_expr}; _sh_vgrow(&{t}, strlen(_u) + 1); strcpy({t}.p, _u); if ({t}.p[0]) {t}.p[0] = (char)toupper((unsigned char){t}.p[0]); }}"
@@ -27288,7 +28594,6 @@ fn param_copy_alias(
                 format!("{t}.p")
             }
             "," | ",:" => {
-                self.need_sh = true;
                 let t = self.vbuf_temp();
                 self.emit(&format!(
                     "{{ const char *_u = {var_expr}; _sh_vgrow(&{t}, strlen(_u) + 1); strcpy({t}.p, _u); if ({t}.p[0]) {t}.p[0] = (char)tolower((unsigned char){t}.p[0]); }}"
@@ -27296,7 +28601,6 @@ fn param_copy_alias(
                 format!("{t}.p")
             }
             "dirname" => {
-                self.need_sh = true;
                 let t = self.vbuf_temp();
                 self.emit(&format!(
                     "{{ const char *_u = {var_expr}; const char *_s = strrchr(_u, '/'); size_t _n = _s ? (size_t)(_s - _u) : 0; if (_n == 0 && _s) _n = 1; _sh_vgrow(&{t}, _n + 1); memcpy({t}.p, _u, _n); {t}.p[_n] = 0; }}"
@@ -27304,7 +28608,6 @@ fn param_copy_alias(
                 format!("{t}.p")
             }
             "basename" => {
-                self.need_sh = true;
                 let t = self.vbuf_temp();
                 self.emit(&format!(
                     "{{ const char *_u = {var_expr}; const char *_s = strrchr(_u, '/'); const char *_b = _s ? _s + 1 : _u; _sh_vgrow(&{t}, strlen(_b) + 1); strcpy({t}.p, _b); }}"
@@ -27387,7 +28690,6 @@ fn param_copy_alias(
                     return "0".into();
                 };
                 if name == "?" {
-                    self.need_sh = true;
                     return "_sh_rc".into();
                 }
                 if name == "$" {
@@ -27414,13 +28716,11 @@ fn param_copy_alias(
                     }
                 }
                 if name == "#" {
-                    self.need_sh = true;
                     return self.argc_expr_l();
                 }
                 if name == "0" {
                     // $0 — the program name (argv[0]; bash carries the
                     // script path there, the transpiled binary its own)
-                    self.need_sh = true;
                     if self.pos_const && !self.in_function {
                         self.const_digits.set(true);
                         return "((argc > 0 && argv[0]) ? argv[0] : \"\")".into();
@@ -27431,11 +28731,9 @@ fn param_copy_alias(
                     // $- — current option flags. The native runtime keeps
                     // them in a mutable string seeded with the interactive-
                     // off defaults; `set ±x/v/e` update it when rendered.
-                    self.need_sh = true;
                     return "_sh_opts".into();
                 }
                 if name == "@" || name == "*" {
-                    self.need_sh = true;
                     let t = self.vbuf_temp();
                     self.emit(&format!("_sh_argv_join(&{t});"));
                     return format!("{t}.p");
@@ -27448,7 +28746,6 @@ fn param_copy_alias(
                 }
                 if name.chars().all(|c| c.is_ascii_digit()) {
                     // positional $N — a lifted fn's C param or the argv
-                    self.need_sh = true;
                     return self.positional_str_l(&name);
                 }
                 if self.bigint_vars.contains(&name) {
@@ -27469,7 +28766,6 @@ fn param_copy_alias(
                     } else if self.store.contains(rest) || self.var_types.contains_key(rest) {
                         self.store_read(rest)
                     } else {
-                        self.need_sh = true;
                         format!(
                             "_sh_env({})",
                             Self::cstr(rest)
@@ -27491,7 +28787,6 @@ fn param_copy_alias(
                 } else {
                     // an environment variable (HOME, PATH, ...): read the
                     // real environment (the gate runs with the same env)
-                    self.need_sh = true;
                     format!("_sh_env({})", Self::cstr(&name))
                 }
             }
@@ -27551,31 +28846,84 @@ fn param_copy_alias(
                 else {
                     return "0".into();
                 };
-                self.store.insert(name.clone());
+                // An ELEMENT target (`arr[0]+=x`, `m[k]+=y`) is not a
+                // scalar: registering `arr[0]` in the scalar store made
+                // the teardown walker free a phantom `arr_0_` that no
+                // declaration ever emitted (cc red on every compound
+                // element write). The write lands in the array.
+                if !name.contains('[') {
+                    self.store.insert(name.clone());
+                    let id = self.c_ident(&name);
+                    // P1 follow-up: inline store write invalidates proofs.
+                    self.nonnull_var.remove(&id);
+                }
                 let id = self.c_ident(&name);
-                // P1 follow-up: inline store write invalidates proofs.
-                self.nonnull_var.remove(&id);
                 let Some(value) = args.get(2) else {
                     return "0".into();
                 };
                 if op == "=" {
                     let v = self.value_c(value);
-                    if let Some(_b) = self.buf_bound(&name) {
+                    if name.contains('[') || self.arrays.contains(&name) {
+                        // an ELEMENT / array-name target: the caller's
+                        // element writer performs the store — this node
+                        // only computes the value (an `(arr_0_ = v)`
+                        // lvalue names a var nothing declares).
+                        v
+                    } else if let Some(_b) = self.buf_bound(&name) {
                         // a fixed buffer cannot be re-pointed
                         format!("(strcpy({id}, {v}), {v})")
                     } else {
                         format!("({id} = {v})")
                     }
-                } else if self.is_num(&name) {
+                } else if self.is_num(&name) && !name.contains('[') {
                     format!("({id} {op} {})", self.expr(value))
                 } else {
-                    let v = self.value_c(value);
-                    // a Str var: the op must be the BASE op — `atoll(y)
-                    // += 2` is an lvalue error; the read is NULL-safe
-                    let base = op.trim_end_matches('=');
-                    let read = self.store_read(&name);
-                    let t = self.num_temp(&format!("(atoll({read}) {base} atoll({v}))"));
-                    format!("({id} = {t})")
+                    // COMPOUND ASSIGNMENT (the `+=` probe family,
+                    // 2026-10-29). This arm used to return a
+                    // SELF-ASSIGNMENT `({id} = <num temp>)` while the
+                    // caller — the Assign stmt's store, or
+                    // emit_array_assign — ALSO assigned through its own
+                    // machinery, so the C came out as
+                    // `_sh_sset(&s, (s = _s0))`: argument evaluation
+                    // points the var at a static temp and the callee
+                    // then frees it → `free(): invalid pointer` (the
+                    // `s=ab; s+=cd` abort), and on an element target the
+                    // lvalue `arr_0_`/`m_a_` is never declared at all
+                    // (cc red). An expression node returns a VALUE; the
+                    // target write belongs to the caller.
+                    //
+                    // For a non-numeric target the value is bash's own
+                    // rule: `name+=word` is STRING CONCATENATION — the
+                    // only compound assignment bash parses for a name
+                    // (`x-=1` is a command word, not an assignment).
+                    // The read comes from wherever the caller writes,
+                    // so the pair agrees subscript-for-subscript.
+                    let read = self.compound_read(&name);
+                    // `declare -i n; n+=3` — the integer ATTRIBUTE makes
+                    // bash evaluate the whole assignment arithmetically
+                    // (`8`), not concatenate (`53` — probe
+                    // c6_int_decl). Same guards as the declare arm's
+                    // emit_attr_int: managed/bigint/const-lifted targets
+                    // keep their own paths, and `is_num` targets never
+                    // reach here (handled above). Without this the
+                    // string-concat arm ran for every `+=`, int attr or
+                    // not, and `atoll("53")` is what the caller stored.
+                    let ai = self.typeset_attrs.get(&name).copied().unwrap_or(0);
+                    let int_attr = ai & 1 != 0
+                        && !self.managed_strings.contains(&name)
+                        && !self.bigint_vars.contains(&name)
+                        && !self.const_lifted.contains(&name);
+                    if op == "+=" && !int_attr {
+                        let new = self.value_c(value);
+                        self.concat_value(&[read, new])
+                    } else {
+                        // an arithmetic compound op over a string
+                        // target: evaluate the RMW as a VALUE (the
+                        // caller stores it) — NULL-safe read, no lvalue.
+                        let v = self.value_c(value);
+                        let base = op.trim_end_matches('=');
+                        self.num_temp(&format!("(atoll({read}) {base} atoll({v}))"))
+                    }
                 }
             }
             "arith" => match Self::str_arg(args, 0) {
@@ -27665,7 +29013,6 @@ fn param_copy_alias(
                     s2.push_str("  return !_sh_state_run();\n}");
                     self.site_bodies.push(s2);
                     self.site_ids.push(id);
-                    self.need_sh = true;
                     return format!("_sh_site_{id}()");
                 }
                 if let Some(v) = self.native_pipeline(&args, false) {
@@ -27683,7 +29030,6 @@ fn param_copy_alias(
             "let" => {
                 if let Some(IrExpr::Str(s, _)) = args.first() {
                     if let Some(c) = self.let_render(s) {
-                        self.need_sh = true;
                         return format!(
                             "({{ long long _r = ({c}); _sh_rc = (_r != 0 ? 0 : 1); _r != 0; }})"
                         );
@@ -27693,7 +29039,6 @@ fn param_copy_alias(
                     // spin the enclosing loop forever
                     return self.arith_string_site(s);
                 }
-                self.need_sh = true;
                 "(_sh_rc = 0, 1)".into()
             }
             "shopt" => {
@@ -27711,16 +29056,13 @@ fn param_copy_alias(
                         self.nocasematch = *b;
                     }
                 }
-                self.need_sh = true;
                 self.need_fnmatch = true;
                 "(_sh_rc = 0, 1)".into()
             }
             "break" => {
-                self.need_sh = true;
                 "(_sh_rc = 0, 0)".into()
             }
             "continue" => {
-                self.need_sh = true;
                 "(_sh_rc = 0, 1)".into()
             }
             "return" => {
@@ -27728,7 +29070,6 @@ fn param_copy_alias(
                     Some(x) => self.value_num(x),
                     None => "0".into(),
                 };
-                self.need_sh = true;
                 if self.in_function {
                     format!("(_sh_rc = {v}, 0)")
                 } else {
@@ -27849,7 +29190,6 @@ fn param_copy_alias(
             }
             _ if self.functions.contains(func) => {
                 let id = self.c_ident(func);
-                self.need_sh = true;
                 // bash `if f; then` is TRUE iff the function's rc == 0 — the
                 // truthiness is the INVERTED rc. The call args become the
                 // function's positional params (set _sh_argv, save/restore
@@ -27897,7 +29237,6 @@ fn param_copy_alias(
                 if !self.functions.contains(&fname) {
                     return self.sh2_stub(func, args, func);
                 }
-                self.need_sh = true;
                 let n = call_args.len() + 1;
                 // the callee reuses the same file-scope globals — a
                 // cross-function call clobbers the caller's shared vars.
@@ -28055,7 +29394,6 @@ fn param_copy_alias(
                 // matches (the capture/value context)
                 self.need_grep = true;
                 self.need_regex = true;
-                self.need_sh = true; // the helper reads/writes _sh_rc
                 let text = args
                     .first()
                     .map(|x| self.expr(x))
@@ -28265,7 +29603,6 @@ fn param_copy_alias(
                         } else {
                             // unassigned (env) var — render-time insert
                             // would be too late for the pass-1 hoist
-                            self.need_sh = true;
                             format!(
                                 "_sh_env({})",
                                 Self::cstr(&name)
@@ -28593,12 +29930,15 @@ fn param_copy_alias(
         self.ver_ctx = Some(ctx.clone());
         self.emit_while_loop(c, body, cond_pure, lrc2);
         self.ver_fast = saved_fast;
-        self.ver_ctx = saved_ctx;
         self.depth -= 1;
         self.emit("} else {");
         self.depth += 1;
+        // slow clone keeps ver_ctx set: it marks "inside a versioned
+        // plan" for the magic-div gate (ver_fast stays false — the
+        // fast-clone arm's semantics are unchanged).
         self.emit_while_loop(c, body, cond_pure, lrc2);
         self.depth -= 1;
+        self.ver_ctx = saved_ctx;
         self.emit("}");
         self.emit("}");
     }
@@ -28719,12 +30059,13 @@ fn param_copy_alias(
         self.ver_ctx = Some(ctx.clone());
         self.emit_forinit_loop(cond_ref, body, step);
         self.ver_fast = saved_fast;
-        self.ver_ctx = saved_ctx;
         self.depth -= 1;
         self.emit("} else {");
         self.depth += 1;
+        // slow clone keeps ver_ctx set (see the while-shape twin).
         self.emit_forinit_loop(cond_ref, body, step);
         self.depth -= 1;
+        self.ver_ctx = saved_ctx;
         self.emit("}");
         self.emit("}");
     }
@@ -28827,6 +30168,39 @@ fn param_copy_alias(
             let id2 = self.c_ident(var);
             self.emit(&format!(
                 "_sh_assoc_set({id2}_k, {id2}_v, &{id2}_n, {acap}, {kv}, {v});"
+            ));
+            return;
+        }
+        // ASSOC STORAGE WINS THE SUBSCRIPT (probe `+=`/array-scalar,
+        // 2026-10-29): a k/v/n table stores STRING keys, so a
+        // numeric-looking subscript is still the key "0" — bash
+        // `declare -A m; m[0]=x` stores the key `0` — and a bare name
+        // is a LITERAL key, never an arithmetic index. The numeric/vec/
+        // fixed-index arms below name `{id}`/`{id}_len`, which no assoc
+        // declaration ever emits (it emits `{id}_k`/`{id}_v`/`{id}_n`),
+        // so reaching them was an `m_len undeclared` cc red.
+        if self.assoc_arrays.contains(var) {
+            let kv = match key {
+                IrExpr::Str(kraw, _) => {
+                    let kq = kraw
+                        .trim()
+                        .trim_matches(|c| c == '"' || c == '\'')
+                        .to_string();
+                    if kq.contains('$') {
+                        // a key carrying `$expansions` resolves at RUNTIME
+                        self.heredoc_body_c(key)
+                    } else {
+                        Self::cstr(&kq)
+                    }
+                }
+                // bash assoc subscripts are not arithmetic: `m[i]=v`
+                // stores the key "i", so an Ident/Var key names the key
+                // itself (only an indexed array would read the var).
+                IrExpr::Var(v, _) | IrExpr::Ident(v) => Self::cstr(v),
+                other => self.value_c(other),
+            };
+            self.emit(&format!(
+                "_sh_assoc_set({id}_k, {id}_v, &{id}_n, {acap}, {kv}, {v});"
             ));
             return;
         }
@@ -29024,7 +30398,7 @@ fn param_copy_alias(
         // redefine clears: free orphaned string elements for string
         // arrays (fixed AND vec — see emit_set_array)
         if self.is_string_array(arr) {
-            self.emit(&format!("for (size_t _fi = 0; _fi < {id}_len; _fi++) free({id}[_fi]);"));
+            self.emit(&format!("for (size_t _fi = 0; _fi < {id}_len; _fi++) {{ free({id}[_fi]); {id}[_fi] = 0; }}"));
         }
         self.emit(&format!("{id}_len = 0;"));
         if n == 0 {
@@ -29231,7 +30605,7 @@ fn param_copy_alias(
         // are `static char *a[cap] = {0}` (zero-init, so the first free is
         // a no-op) exactly like the vec case, so the same loop is safe.
         if self.is_string_array(var) {
-            self.emit(&format!("for (size_t _fi = 0; _fi < {id}_len; _fi++) free({id}[_fi]);"));
+            self.emit(&format!("for (size_t _fi = 0; _fi < {id}_len; _fi++) {{ free({id}[_fi]); {id}[_fi] = 0; }}"));
         }
         self.emit(&format!("{id}_len = 0;"));
         if self.reduce_arrays.contains(var) {
@@ -29362,7 +30736,49 @@ fn param_copy_alias(
             Some(IrExpr::Array(items)) => items.clone(),
             _ => vec![],
         };
-        // P1 OOM policy: the stores below write {id}[{id}_len ..] into a
+        // `m+=([k]=v …)` on an ASSOC target (the `+=` probe, 2026-10-29):
+        // bash sets each pair — an existing key is overwritten, a new one
+        // inserted — and there is no length to grow. The arms below name
+        // `{id}_len`/`{id}` (only `{id}_k`/`{id}_v`/`{id}_n` are ever
+        // declared for a k/v/n table), so they were an `m_len undeclared`
+        // cc red for every assoc bulk append.
+        let kv_literal = |it: &IrExpr| match it {
+            IrExpr::Str(s, _) => {
+                let t = s.trim_start();
+                t.starts_with('[') && t.contains("]=")
+            }
+            _ => false,
+        };
+        if self.assoc_arrays.contains(var)
+            || (!items.is_empty() && items.iter().all(&kv_literal))
+        {
+            if items.iter().all(&kv_literal) {
+                self.assoc_arrays.insert(var.to_string());
+                let acap = self.array_cap(var);
+                for it in &items {
+                    if let IrExpr::Str(s, _) = it {
+                        let t = s.trim();
+                        let inner = t.trim_start_matches('[');
+                        if let Some(eq) = inner.find("]=") {
+                            let k = inner[..eq].trim().trim_matches('"').trim_matches('\'');
+                            let v = inner[eq + 2..].trim();
+                            self.emit(&format!(
+                                "_sh_assoc_set({id}_k, {id}_v, &{id}_n, {acap}, {}, {});",
+                                Self::cstr(k),
+                                Self::cstr(v)
+                            ));
+                        }
+                    }
+                }
+                return;
+            }
+            // an assoc target whose items are not `[k]=v` literals —
+            // no key/value split is possible here; report it rather than
+            // render an indexed append against storage that has no
+            // `{id}_len`.
+            self.mark_todo("assoc bulk append non-literal items");
+            return;
+        }
         // fixed [ARR_CAP] array with no per-store guard — one upfront
         // check covers every arm (mpz/int/string) instead of silent
         // overflow past the cap. Vec arrays grow instead.
@@ -29477,6 +30893,151 @@ fn param_copy_alias(
         }
     }
 
+    /// The OLD value a compound assignment (`v += w`) reads — from the
+    /// same storage slot the caller is about to write, so the two agree
+    /// subscript-for-subscript (probe `+=` family, 2026-10-29).
+    ///
+    /// Three shapes, all decided by the TARGET spelling — the core
+    /// flattens the whole subscript into the name:
+    ///   * `base[subscript]` → the element read (`array_index_read`
+    ///     dispatches on storage class: `_sh_assoc_get` for a k/v/n
+    ///     table, a guarded slot read for `char**`, the native element
+    ///     for an int-homed array);
+    ///   * a bare ARRAY name → subscript 0, because bash's scalar write
+    ///     to an array is a subscript-0 write (`arr=x` → element 0 = x,
+    ///     `arr+=x` → element 0 becomes `1x`), never an append at the
+    ///     end;
+    ///   * anything else → the plain store read.
+    fn compound_read(&mut self, name: &str) -> String {
+        if let Some(open) = name.find('[') {
+            if open > 0 && name.ends_with(']') {
+                let base = name[..open].to_string();
+                let key = name[open + 1..name.len() - 1].to_string();
+                return self.array_index_read(&base, &key);
+            }
+        }
+        if self.arrays.contains(name) {
+            return self.array_index_read(name, "0");
+        }
+        self.store_read(name)
+    }
+
+    /// Materialize the concatenation of already-rendered `char*` pieces
+    /// into a fresh vbuf temp and return `<t>.p`. Mirrors the
+    /// Interpolate value path exactly: the direct memcpy fill when
+    /// SH2_NO_CONCAT is off, the snprintf grow loop otherwise — so a
+    /// compound-assign value reads byte-for-byte like the interpolated
+    /// word that would have built it.
+    fn concat_value(&mut self, parts: &[String]) -> String {
+        if parts.len() == 1 {
+            return parts[0].clone();
+        }
+        let t = self.vbuf_temp();
+        if std::env::var("SH2_NO_CONCAT").map(|v| v != "1").unwrap_or(true) {
+            let pieces: Vec<ConcatPiece> =
+                parts.iter().map(|p| ConcatPiece::Arg(p.clone())).collect();
+            self.direct_concat_fill(&t, &pieces);
+        } else {
+            let fmt = "%s".repeat(parts.len());
+            let args: String = parts.iter().map(|p| format!(", {p}")).collect();
+            self.snprintf_grow(&t, &Self::cstr(&fmt), &args);
+        }
+        format!("{t}.p")
+    }
+
+    /// `unset NAME[KEY]` — clear ONE element. STORAGE CLASS DECIDES the
+    /// subscript's meaning (2026-10-30):
+    ///   - assoc storage: the subscript is the KEY STRING, numeric-
+    ///     looking or not (`declare -A m; unset 'm[0]'` removes the key
+    ///     "0"), resolved through `_sh_assoc_unset`;
+    ///   - indexed storage: the subscript is ARITHMETIC — a literal is
+    ///     the index, a bare name reads the variable, an unknown name is
+    ///     0 (bash's own arithmetic rule, so `atoll` of the spelling is
+    ///     exact for both the known-number and unknown-name cases).
+    /// The previous arm only handled a numeric literal and had no else
+    /// branch at all: `unset 'm[b]'` emitted NOTHING (the entry
+    /// survived — probe b1/b3) and `unset 'm[0]'` on assoc storage
+    /// emitted an indexed clear naming `{id}_len`, which no assoc
+    /// declaration ever emits (probe b2: `m_len undeclared` cc red).
+    fn emit_unset_element(&mut self, var: &str, key: &IrExpr) {
+        self.arrays.insert(var.to_string());
+        let id = self.c_ident(var);
+        if self.assoc_arrays.contains(var) {
+            let kv = match key {
+                IrExpr::Str(k, _) => {
+                    // bash strips subscript QUOTES at parse time
+                    let kq = k.trim().trim_matches(|c| c == '"' || c == '\'').to_string();
+                    if kq.contains('$') {
+                        // `unset 'm[$k]'` — resolve the key at RUNTIME
+                        self.heredoc_body_c(&IrExpr::Str(kq, crate::ir::StrStyle::DoubleQuoted))
+                    } else {
+                        Self::cstr(&kq)
+                    }
+                }
+                // an interpolated key: concatenate the part VALUES
+                other => self.value_c(other),
+            };
+            self.emit(&format!(
+                "_sh_assoc_unset({id}_k, {id}_v, &{id}_n, {kv});"
+            ));
+            return;
+        }
+        // indexed storage: arithmetic subscript
+        let k = match key {
+            IrExpr::Str(kraw, _) => {
+                let kt = kraw.trim().trim_matches(|c| c == '"' || c == '\'');
+                if let Ok(i) = kt.parse::<i64>() {
+                    // free the dropped slot before clearing (a bare
+                    // `= 0` orphaned its string)
+                    if self.is_string_array(var) {
+                        self.emit(&format!(
+                            "if ({i} < {id}_len) {{ free({id}[{i}]); {id}[{i}] = 0; }}"
+                        ));
+                    } else {
+                        self.emit(&format!("if ({i} < {id}_len) {id}[{i}] = 0;"));
+                    }
+                    return;
+                }
+                if kraw.contains('$') {
+                    // `unset 'arr[$i]'` — the subscript text resolves
+                    // at runtime
+                    format!("(long long)atoll({})", self.heredoc_body_c(key))
+                } else if is_ident(kt) {
+                    if self.store.contains(kt) || self.var_types.contains_key(kt) {
+                        // `unset 'arr[i]'` — bash reads the variable
+                        if self.is_num(kt) {
+                            format!("(long long)({})", self.c_ident(kt))
+                        } else {
+                            format!("(long long)atoll({})", self.store_read(kt))
+                        }
+                    } else {
+                        // never assigned: arithmetic reads it as 0 —
+                        // atoll of the spelling matches (non-numeric
+                        // text parses to 0 on both sides)
+                        format!("(long long)atoll({})", Self::cstr(kt))
+                    }
+                } else if looks_like_arith(kt) {
+                    self.arith_text_expr(kt)
+                } else {
+                    format!("(long long)atoll({})", Self::cstr(kt))
+                }
+            }
+            other => format!("(long long)atoll({})", self.value_c(other)),
+        };
+        // one evaluation, both guards (mirrors emit_fixed_index_write)
+        let t = format!("_uk{}", self.temp_seq);
+        self.temp_seq += 1;
+        if self.is_string_array(var) {
+            self.emit(&format!(
+                "{{ long long {t} = {k}; if ({t} >= 0 && {t} < (long long){id}_len) {{ free({id}[{t}]); {id}[{t}] = 0; }} }}"
+            ));
+        } else {
+            self.emit(&format!(
+                "{{ long long {t} = {k}; if ({t} >= 0 && {t} < (long long){id}_len) {id}[{t}] = 0; }}"
+            ));
+        }
+    }
+
     fn array_index_read(&mut self, var: &str, key: &str) -> String {
         self.arrays.insert(var.to_string());
         // post-decl first sighting → never assigned → empty (same
@@ -29484,7 +31045,6 @@ fn param_copy_alias(
         if self.array_decls_done && !self.array_declared.contains(var) {
             return String::from("\"\"");
         }
-        self.need_sh = true;
         let id = self.c_ident(var);
         // `${arr[${k}]}` — the core keeps the `${...}` text; strip it
         let key = key.trim();
@@ -29608,14 +31168,32 @@ fn param_copy_alias(
     }
 
     /// `${#arr[@]}` — the element count
+    /// Value-storage arrays (`long long[]`, `mpz_t[]`) carry NO per-slot
+    /// presence marker — a hole is indistinguishable from a 0 element —
+    /// so their bash-visible element set (count, keys) can only be
+    /// recovered as the DENSE range. char** storage tracks presence
+    /// exactly: a NULL slot IS an unset element (initialised `{0}`,
+    /// NULLed after every free, never written by `_sh_arr_set`'s growth
+    /// gap). This predicate mirrors the DECL router's kinds exactly, so
+    /// any helper emitted on the char** branch is type-correct by
+    /// construction.
+    fn dense_value_storage(&self, var: &str) -> bool {
+        self.int_arrays.contains(var)
+            || self.array_return_arrays.values().any(|ra| ra.as_str() == var)
+    }
+
     fn array_len(&mut self, var: &str) -> String {
         self.arrays.insert(var.to_string());
         let id = self.c_ident(var);
-        self.need_sh = true;
         if self.assoc_arrays.contains(var) {
             format!("(long long){id}_n")
-        } else {
+        } else if self.dense_value_storage(var) {
+            // no presence marker — dense extent (documented edge)
             format!("(long long){id}_len")
+        } else {
+            // bash counts ELEMENTS, not the dense extent:
+            // `arr=(a b c); arr[5]=z` → `${#arr[@]}` is 4, never 6.
+            format!("(long long)_sh_icount({id}, {id}_len)")
         }
     }
 
@@ -29623,7 +31201,6 @@ fn param_copy_alias(
     fn array_join_all(&mut self, var: &str) -> String {
         if var == "@" || var == "*" {
             // `$@`/`$*` in an expansion — the positional params
-            self.need_sh = true;
             let t = self.vbuf_temp();
             self.emit(&format!("_sh_argv_join(&{t});"));
             return t;
@@ -29779,13 +31356,11 @@ fn param_copy_alias(
                             return vec![Part::Arg(self.argc_expr_l(), NumSpec::Num("%d", false))];
                         }
                         if name == "@" || name == "*" {
-                            self.need_sh = true;
                             let t = self.vbuf_temp();
                             self.emit(&format!("_sh_argv_join(&{t});"));
                             return vec![Part::Arg(format!("{t}.p"), NumSpec::Str)];
                         }
                         if name.chars().all(|c| c.is_ascii_digit()) {
-                            self.need_sh = true;
                             return vec![Part::Arg(
                                 self.positional_str_l(name),
                                 NumSpec::Str,
@@ -29857,6 +31432,7 @@ fn param_copy_alias(
                                 }
                             } else {
                                 self.need_gmp = true;
+                                self.sorted_bigint_join_used = true;
                                 self.emit(&format!("_sh_sorted_bigint_join(&{vb}, {id}, {id}_len);"));
                             }
                             return vec![Part::Arg(format!("{vb}.p"), NumSpec::Str)];
@@ -30437,12 +32013,19 @@ fn param_copy_alias(
         for t in toks {
             let name = t.trim_start_matches("__SHCNT_");
             let id = self.c_ident(name);
-            // assoc arrays count via _n; indexed via _len; a SCALAR var
-            // (${#flags} on a Str) is its strlen
+            // assoc arrays count via _n; indexed via the ELEMENT count
+            // (bash `${#arr[@]}` = non-NULL slots — same face as
+            // `array_len`; value storage has no presence marker → dense,
+            // see dense_value_storage); a SCALAR var (`${#flags}` on a
+            // Str) is its strlen
             let expr = if self.assoc_arrays.contains(name) {
                 format!("((long long){id}_n)")
             } else if self.arrays.contains(name) {
-                format!("((long long){id}_len)")
+                if self.dense_value_storage(name) {
+                    format!("((long long){id}_len)")
+                } else {
+                    format!("((long long)_sh_icount({id}, {id}_len))")
+                }
             } else {
                 let v = self.store_read(name);
                 format!("((long long)strlen({v} ? {v} : \"\"))")
@@ -30459,6 +32042,16 @@ fn param_copy_alias(
                 &format!("atoll((getenv(\"{t}\") ? getenv(\"{t}\") : \"\"))"),
                 &expr,
             );
+            // _sh_env("T") — the FUNCTION-call wrapper the arith/let
+            // fallbacks emit (the getenv forms above are inlined; this
+            // one calls the helper at 12694). WITHOUT these two rewrites
+            // the bare-token replace below lands INSIDE the quoted key,
+            // leaving `atoll(_sh_env("((long long)arr_len)"))` — getenv
+            // misses, atoll("") = 0, and a `for ((i < ${#arr[@]}))`
+            // bound never runs (measured: zero iterations for dense AND
+            // sparse arrays — this face never worked).
+            out = out.replace(&format!("atoll(_sh_env(\"{t}\"))"), &expr);
+            out = out.replace(&format!("_sh_env(\"{t}\")"), &expr);
             // atoll(EXPR) where EXPR is already a native count — strip
             out = out.replace(&format!("atoll({expr})"), &expr);
             out = out.replace(&t, &expr);
@@ -30510,7 +32103,6 @@ fn param_copy_alias(
                 return false;
             }
         }
-        self.need_sh = true;
         for rd in redirects {
             let fd = rd.fd.unwrap_or(1);
             let target = match &rd.target {
@@ -30754,7 +32346,6 @@ fn param_copy_alias(
                         if has_capture(&body_cl) {
                             // fall through to the generic (text) path
                         } else {
-                        self.need_sh = true;
                         let id = self.site_seq;
                         self.site_seq += 1;
                         let saved = std::mem::take(&mut self.out);
@@ -30913,7 +32504,6 @@ fn param_copy_alias(
                         let rest_c = rest.clone();
                         let vars_c = vars.clone();
 
-                        self.need_sh = true;
                         let id = self.site_seq;
                         self.site_seq += 1;
                         let saved = std::mem::take(&mut self.out);
@@ -31369,7 +32959,6 @@ fn param_copy_alias(
                             None => "0".into(),
                         };
                         if self.in_function {
-                            self.need_sh = true;
                             self.emit(&format!("_sh_rc = {v};"));
                             self.emit("return;");
                         } else {
@@ -31560,32 +33149,24 @@ fn param_copy_alias(
                         return;
                     }
                 }
-                // a scalar write to an ARRAY var: bash `arr=x` sets
-                // element 0, `arr+=x` appends
+                // A scalar write to an ARRAY var — a SUBSCRIPT-0 write,
+                // not an append (the `+=`/array-scalar probe,
+                // 2026-10-29). Measured in bash:
+                //   arr=(1 2); arr=x   → `[x 2]`      (element 0 := x)
+                //   arr=(1 2); arr+=x  → `[1x 2]`     (element 0 .= x)
+                //   declare -A m=…; m=z → key "0" gets z (n grows by 1)
+                // The old arm appended at `{id}_len` for BOTH operators
+                // (and dropped the compound op entirely, writing just the
+                // RHS), which put `x` at the end instead of element 0,
+                // read `sh2c: capacity exceeded` the moment len hit the
+                // capacity (d1), and named `m`/`m_len` — undeclared for a
+                // k/v/n table — on an assoc target (d3, cc red).
+                // Delegating to the element writer resolves the storage
+                // class per target: char** slot, vec slot, int-homed
+                // element, or `_sh_assoc_set` with the STRING key "0".
                 if self.arrays.contains(&t.var) {
-                    let id = self.c_ident(&t.var);
-                    let v = match expr {
-                        IrExpr::Call { func, args } if func == "assign" => {
-                            match args.get(2) {
-                                Some(x) => self.value_c(x),
-                                None => "\"\"".into(),
-                            }
-                        }
-                        _ => self.value_c(expr),
-                    };
-                    if self.vec_arrays.contains(&t.var) {
-                        // growable vec: store at len (= append). The
-                        // helper hoists value+key (single evaluation,
-                        // null-safe) and extends len itself. Appends are
-                        // never bulk-len counter writes (they extend len
-                        // by construction), so len updates stay.
-                        self.emit_vec_index_write(&t.var, &format!("{id}_len"), &v, false);
-                        return;
-                    }
-                    self.emit(&format!(
-                        "_sh_arr_set({id}, &{id}_len, {}, {id}_len, {v});",
-                        self.array_cap(&t.var)
-                    ));
+                    let zero = IrExpr::Str("0".to_string(), crate::ir::StrStyle::DoubleQuoted);
+                    self.emit_array_assign(&t.var, &zero, expr);
                     return;
                 }
                 // Tiered grower (SH2_ASSUME_OBSERVED_WIDTHS bucket >= 17):
@@ -31783,7 +33364,6 @@ fn param_copy_alias(
                         // a nested mutation (j = i++ + ++i) must not be
                         // reordered by hoisted temps — sequence it
                         let c = self.arith_sequenced(a);
-                        self.need_sh = true;
                         let is_self = matches!(a.as_ref(), ArithAst::IncDec { var, .. } if var == &t.var)
                             || matches!(a.as_ref(), ArithAst::Assign { var, .. } if var == &t.var);
                         // Loop-nested arith assigns with unobserved rc:
@@ -31946,6 +33526,20 @@ fn param_copy_alias(
                     && !self.bigint_vars.contains(&t.var)
                 {
                     if let Some(seg_expr) = self_append_segs(&t.var, expr) {
+                        // FUSED direct append (SH2_NO_CONCAT=1 keeps the
+                        // materialize path below): an all-text seg copies
+                        // straight into the accumulator — one capacity
+                        // check, one memcpy per part, no vbuf round trip
+                        // and no second strlen of the assembled bytes.
+                        if std::env::var("SH2_NO_CONCAT").map(|v| v != "1").unwrap_or(true)
+                            && self.direct_append(&t.var, &seg_expr)
+                        {
+                            if !self.fn_written.contains(&t.var) {
+                                self.nonnull_var.insert(self.c_ident(&t.var));
+                            }
+                            self.emit_export_var(&t.var);
+                            return;
+                        }
                         let seg = self.expr(&seg_expr);
                         let tc = self.temp_seq;
                         self.temp_seq += 1;
@@ -31972,6 +33566,36 @@ fn param_copy_alias(
                         self.emit_export_var(&t.var);
                         return;
                     }
+                }
+                // FUSED chop store: `x = <FieldGrab …>` extracts
+                // straight into the destination (see
+                // emit_fused_field_store) — placed BEFORE any rhs
+                // rendering, exactly like the self-append growth arm
+                // above, so no dead temp is emitted. The guards are
+                // that arm's, plus the same case-attr gate
+                // apply_case_fold keys off (0b110 = typeset l/u): a
+                // folded target must still get its fold applied, so it
+                // falls through to the generic COPY path.
+                if std::env::var("SH2_NO_FUSEGRAB").map(|v| v != "1").unwrap_or(true)
+                    && std::env::var_os("SH2_NO_SSET").is_none()
+                    && !is_num
+                    && !is_float
+                    && targets.len() == 1
+                    && t.indices.is_empty()
+                    && (self.typeset_attrs.get(&t.var).copied().unwrap_or(0) & 0b110) == 0
+                    && !self.managed_strings.contains(&t.var)
+                    && !self.bigint_vars.contains(&t.var)
+                    && self.emit_fused_field_store(&name, expr)
+                {
+                    // Tail of the plain COPY path, verbatim: proof,
+                    // sticky auto-export re-sync, accumulator mirror
+                    // reset (the store replaced the whole buffer).
+                    if !self.fn_written.contains(&t.var) {
+                        self.nonnull_var.insert(name.clone());
+                    }
+                    self.emit_export_var(&t.var);
+                    self.acc_len_reset_ident(&name);
+                    return;
                 }
                 let rhs = if is_float {
                     self.float_rhs(expr)
@@ -32542,7 +34166,6 @@ fn param_copy_alias(
                         r.emit(&format!("_sh_capture(&buf, _c{id}_cmd);"));
                         r.emit("return buf.p;");
                     });
-                    self.need_sh = true;
                     let wn = format!("_wn_{}", self.temp_seq);
                     self.temp_seq += 1;
                     let ws = format!("_ws_{}", self.temp_seq);
@@ -32572,7 +34195,6 @@ fn param_copy_alias(
                             _ => String::new(),
                         };
                         if name == "@" || name == "*" {
-                            self.need_sh = true;
                             let var_name = self.c_ident(var);
                             if name == "*" {
                                 // `"$*"` is ONE word (the joined argv) —
@@ -32625,18 +34247,49 @@ fn param_copy_alias(
                             if (op == "slice" || op.is_empty()) && (idx == "@" || idx == "*") {
                                 let var_name = self.c_ident(var);
                                 if let Some(keys) = name.strip_prefix('!') {
-                                    // assoc keys
+                                    // A READ NEVER DECIDES STORAGE CLASS
+                                    // (see array_keys_join): no assoc
+                                    // insert here either — `for k in
+                                    // "${!arr[@]}"` on an indexed array
+                                    // keeps indexed storage.
                                     self.arrays.insert(keys.to_string());
-                                    self.assoc_arrays.insert(keys.to_string());
-                                    self.need_sh = true;
                                     let kid = self.c_ident(keys);
-                                    self.emit(&format!(
-                                        "for (size_t _ai_{kid} = 0; _ai_{kid} < {kid}_n; _ai_{kid}++) {{"
-                                    ));
-                                    self.depth += 1;
-                                    self.emit(&format!(
-                                        "{var_name} = {kid}_k[_ai_{kid}];"
-                                    ));
+                                    if self.assoc_arrays.contains(keys) {
+                                        self.emit(&format!(
+                                            "for (size_t _ai_{kid} = 0; _ai_{kid} < {kid}_n; _ai_{kid}++) {{"
+                                        ));
+                                        self.depth += 1;
+                                        self.emit(&format!(
+                                            "{var_name} = {kid}_k[_ai_{kid}];"
+                                        ));
+                                    } else {
+                                        // indexed keys: enumerate the
+                                        // SET indices, ascending. The
+                                        // loop var is char* by
+                                        // construction (string_loop_vars
+                                        // sees the param name WITH `!`,
+                                        // so int_arrays never matches →
+                                        // force_str), so the index is
+                                        // rendered through a decimal
+                                        // buffer. char** skips holes
+                                        // (= bash exactly); value
+                                        // storage has no presence
+                                        // marker and enumerates dense.
+                                        let kb = format!("_kb{}", self.temp_seq);
+                                        self.temp_seq += 1;
+                                        self.emit(&format!(
+                                            "for (size_t _ai_{kid} = 0; _ai_{kid} < {kid}_len; _ai_{kid}++) {{"
+                                        ));
+                                        self.depth += 1;
+                                        if !self.dense_value_storage(keys) {
+                                            self.emit(&format!(
+                                                "if (!{kid}[_ai_{kid}]) continue;"
+                                            ));
+                                        }
+                                        self.emit(&format!(
+                                            "static char {kb}[24]; snprintf({kb}, sizeof {kb}, \"%zu\", (size_t)_ai_{kid}); {var_name} = {kb};"
+                                        ));
+                                    }
                                     for s in body {
                                         self.stmt(s);
                                     }
@@ -32647,7 +34300,6 @@ fn param_copy_alias(
                                 // indexed elements (an ASSOC array iterates
                                 // its VALUES: aa_v[0..aa_n])
                                 self.arrays.insert(name.clone());
-                                self.need_sh = true;
                                 let aid = self.c_ident(&name);
                                 if self.assoc_arrays.contains(&name) {
                                     self.emit(&format!(
@@ -32668,6 +34320,13 @@ fn param_copy_alias(
                                     "for (size_t _ai_{aid} = 0; _ai_{aid} < {aid}_len; _ai_{aid}++) {{"
                                 ));
                                 self.depth += 1;
+                                if !self.dense_value_storage(&name) {
+                                    // a hole is an UNSET element: bash's
+                                    // `for x in "${arr[@]}"` skips it
+                                    self.emit(&format!(
+                                        "if (!{aid}[_ai_{aid}]) continue;"
+                                    ));
+                                }
                                 self.emit(&format!(
                                     "{var_name} = {aid}[_ai_{aid}];"
                                 ));
@@ -32689,7 +34348,6 @@ fn param_copy_alias(
                             // wrapping the whole call yielded an empty site
                             let inner: Vec<IrExpr> = args.clone();
                             let cap = self.capture_call(&inner);
-                            self.need_sh = true;
                             let wn = format!("_wn_{}", self.temp_seq);
                             self.temp_seq += 1;
                             let ws = format!("_ws_{}", self.temp_seq);
@@ -32715,7 +34373,6 @@ fn param_copy_alias(
                         if func == "split" {
                             // `for w in $y` — split the value at runtime
                             let v = self.value_c(&args[0]);
-                            self.need_sh = true;
                             let wn = format!("_wn_{}", self.temp_seq);
                             self.temp_seq += 1;
                             let ws = format!("_ws_{}", self.temp_seq);
@@ -32971,7 +34628,6 @@ fn param_copy_alias(
                 // (`local __sh2_found=0` + trailing `if __sh2_found; then
                 // return; fi`), which are also native.
                 if let Some(hs) = Self::herestring_block(inner, redirects) {
-                    self.need_sh = true;
                     let hs = self.value_c(&hs);
                     self.emit(&format!("size_t _hs_pos = 0;"));
                     self.emit(&format!("static _sh_vbuf _hs_line = {{0, 0}};"));
@@ -33175,7 +34831,6 @@ fn param_copy_alias(
                 s5.push_str("  return !_sh_system_rc();\n}");
                 self.site_bodies.push(s5);
                 self.site_ids.push(id);
-                self.need_sh = true;
                 self.emit(&format!("_sh_site_{id}();"));
             }
             IrStmt::Pipeline { stages, capture, .. } => {
@@ -33241,7 +34896,6 @@ fn param_copy_alias(
                         s2.push_str("  return !_sh_state_run();\n}");
                         self.site_bodies.push(s2);
                         self.site_ids.push(id);
-                        self.need_sh = true;
                         self.emit(&format!("_sh_site_{id}();"));
                         return;
                     }
@@ -33431,7 +35085,6 @@ fn param_copy_alias(
                 self.emit(&format!("fprintf(stderr, \"%s\\n\", (char*)({v}));"));
             }
             IrStmt::SetChildError(e) => {
-                self.need_sh = true;
                 let v = self.expr(e);
                 self.emit(&format!("_sh_rc = ({v});"));
             }
@@ -33479,7 +35132,7 @@ fn param_copy_alias(
                 // literal is shorter, so the freed prefix is exactly the
                 // dropped set.
                 if self.is_string_array(var) {
-                    self.emit(&format!("for (size_t _fi = 0; _fi < {id}_len; _fi++) free({id}[_fi]);"));
+                    self.emit(&format!("for (size_t _fi = 0; _fi < {id}_len; _fi++) {{ free({id}[_fi]); {id}[_fi] = 0; }}"));
                     self.emit(&format!("{id}_len = 0;"));
                 }
                 // P1: the literal indices are compile-time constants — a
@@ -34000,6 +35653,43 @@ fn param_copy_alias(
                 }
             }
             IrExpr::Int(i) => i.to_string(),
+            // str-chop-cursor's cursor advance in a NUMERIC context (an
+            // Int-homed cursor): compute the new offset natively and skip
+            // the decimal round-trip the string form pays per chop — the
+            // MIMEcroft texture tokenizer runs 6+ chops per texel, each one
+            // an itoa to store and an atoll to read back. The string form
+            // stays reachable through `value_c` for a cursor numstr did not
+            // home, so the two render paths never have to agree on type.
+            IrExpr::Ext(en) if en.tag() == "FieldStrip" => {
+                let node = en
+                    .as_any()
+                    .downcast_ref::<crate::shir_nodes::FieldStrip>()
+                    .expect("FieldStrip tag");
+                let go = self.off_as_size(&node.off);
+                let t = self.value_c(&node.text);
+                let d = Self::cstr(&node.delim);
+                let slot = self.int_temp_slot();
+                self.emit(&format!(
+                    "{{ const char *_st=(char*)({t}); size_t _so={go}; const char *_sp=(_st&&(*{d}))?strstr(_st+_so,{d}):0; if(_sp)_so=(size_t)(_sp-_st)+strlen({d}); {slot}=(long long)_so; }}"
+                ));
+                slot
+            }
+            // …and the guarded pair's draining advance in the same
+            // numeric slot (see the FieldStripEnd string arm above).
+            IrExpr::Ext(en) if en.tag() == "FieldStripEnd" => {
+                let node = en
+                    .as_any()
+                    .downcast_ref::<crate::shir_nodes::FieldStripEnd>()
+                    .expect("FieldStripEnd tag");
+                let go = self.off_as_size(&node.off);
+                let t = self.value_c(&node.text);
+                let d = Self::cstr(&node.delim);
+                let slot = self.int_temp_slot();
+                self.emit(&format!(
+                    "{{ const char *_st=(char*)({t}); size_t _so={go}; const char *_sp=(_st&&(*{d}))?strstr(_st+_so,{d}):0; if(_sp)_so=(size_t)(_sp-_st)+strlen({d}); else if(_st)_so=strlen(_st); {slot}=(long long)_so; }}"
+                ));
+                slot
+            }
             IrExpr::Call { func, args } if matches!(func.as_str(), "max" | "min" | "sum") => {
                 // numeric-context reduction: an int-homed array with the
                 // maintained aggregate reads it natively (`_min_xs =
@@ -34429,6 +36119,31 @@ fn param_copy_alias(
         if std::env::var("SH2_DBG_VARS").is_ok() {
             pdebug!("DBG vars={:?} store={:?} lifted={:?}", vars, self.store, self.const_lifted);
         }
+        // Length mirrors for tracked accumulators: ONE file-scope block,
+        // emitted before any per-site hook can fire — and pre-populating
+        // `acc_len_declared` downgrades every later site to the
+        // assignment-only form. The per-site decl path was unreliable:
+        // a function's decl pre-render pairs fvars with decl LINES
+        // positionally (fvars.zip(decl_lines)), so a var emitting two
+        // lines (decl + mirror) shifts every subsequent pairing off by
+        // one and zip truncates the tail — the mirror line was dropped
+        // while `declared` stayed set, silencing the file-scope passes
+        // too (`_alen_gl_payload` undeclared at tcc). Mirrors must be
+        // file scope anyway: resets and growth arms live in OTHER C
+        // functions. They're independent of the var's own decl (a
+        // size_t at 0), so position is free — main-localization can
+        // never move them (file_decl_text won't contain the line).
+        let mut acc_ids: Vec<String> = self.acc_idents.iter().cloned().collect();
+        acc_ids.sort(); // HashSet order must not churn the output
+        for id in &acc_ids {
+            let ol = format!("_alen_{id}");
+            if self.acc_len_declared.insert(ol.clone()) {
+                self.emit(&format!("static size_t {ol} = 0;"));
+            }
+        }
+        if !acc_ids.is_empty() {
+            self.emit("");
+        }
         for v in &vars {
             // record the emitted file-decl lines per var: the
             // main-localization pass below may move a main-private
@@ -34476,7 +36191,6 @@ fn param_copy_alias(
             // helpers directly — request the runtime block here (the body
             // used to set it via the constant-echo path; EchoFold's
             // IrStmt::Output no longer does).
-            self.need_sh = true;
             self.emit(&format!(
                 "_sh_wrap_cmd({}); system(_sh_wrap);",
                 Self::cstr(body)
@@ -34508,7 +36222,7 @@ fn param_copy_alias(
             let id = self.c_ident(a);
             if !self.int_arrays.contains(a) {
                 self.emit(&format!(
-                    "for (size_t _fi = 0; _fi < {id}_len; _fi++) free({id}[_fi]);"
+                    "for (size_t _fi = 0; _fi < {id}_len; _fi++) {{ free({id}[_fi]); {id}[_fi] = 0; }}"
                 ));
             }
             self.emit(&format!("free({id});"));
@@ -34526,9 +36240,21 @@ fn param_copy_alias(
         for v in &bigint_consts {
             self.emit(&format!("  mpz_clear({});", Self::bigint_const_name(v)));
         }
-        // EXPERIMENTAL (status audit): return _sh_rc to expose latent
-        // status bugs. Pure-native trims _sh_rc (need_sh false).
-        if self.need_sh {
+        // main's exit status: `return _sh_rc` when the status register is
+        // live, `return 0` when the render never uses it. Same derivation
+        // as the runtime block below, scoped to what has rendered SO FAR —
+        // function bodies come afterwards, so they cannot feed a line that
+        // is already main's last statement. The capture/site/stage helper
+        // bodies count: they are collected, not yet flushed, and they are
+        // exactly the code that calls the runtime.
+        if sh_runtime_needed([
+            &self.out[..],
+            &decl_out[..],
+            &body_out[..],
+            &self.site_bodies[..],
+            &self.cap_bodies[..],
+            &self.stage_thunks[..],
+        ]) {
             self.emit("return _sh_rc;");
         } else {
             self.emit("return 0;");
@@ -34583,6 +36309,17 @@ fn param_copy_alias(
         // includes, runtime helpers, the global var decls, then the
         // site/capture helpers (definition-before-use: main + functions
         // call them), the sh2.* stubs (should be none), main.
+        // THE one write of `need_sh`: settled here, after every buffer
+        // above exists and before emit_runtime's gates read it.
+        self.need_sh = sh_runtime_needed([
+            &self.out[..],
+            &decl_out[..],
+            &fn_out[..],
+            &body_out[..],
+            &self.site_bodies[..],
+            &self.cap_bodies[..],
+            &self.stage_thunks[..],
+        ]);
         self.in_runtime = true;
         self.emit_runtime();
         self.in_runtime = false;
@@ -35185,8 +36922,19 @@ fn lift_scan_expr(e: &IrExpr, spawn: bool, fname: &str, st: &mut LiftScan) {
             }
         }
         IrExpr::Splice(x) => lift_scan_expr(x, spawn, fname, st),
+        // known-pure chop Ext nodes (str-chop-cursor's pair,
+        // affix-strip-fold's CutAt): walk the operands —
+        // refusing here is program-wide, not local (see chop_operands)
+        IrExpr::Ext(n) => match chop_operands(&**n) {
+            Some(ops) => {
+                for o in ops {
+                    lift_scan_expr(o, spawn, fname, st);
+                }
+            }
+            None => st.bad = true,
+        },
         // opaque / unknown shapes — refuse the lift
-        IrExpr::RawExpr(_) | IrExpr::Ext(_) | IrExpr::Lambda { .. } => st.bad = true,
+        IrExpr::RawExpr(_) | IrExpr::Lambda { .. } => st.bad = true,
         IrExpr::Int(_) | IrExpr::Bool(_) | IrExpr::Json(_) | IrExpr::Regex { .. }
         | IrExpr::Range { .. } => {}
     }
@@ -35216,6 +36964,56 @@ fn lift_scan_arith(a: &ArithAst, st: &mut LiftScan) {
         ArithAst::Un { arg, .. } | ArithAst::Cast { arg, .. } => lift_scan_arith(arg, st),
         ArithAst::Index { var: _, key } => lift_scan_arith(key, st),
         _ => {}
+    }
+}
+
+/// The KNOWN-PURE chop Ext nodes as their ordinary operand expressions:
+/// str-chop-cursor's FieldGrab/FieldStrip (text, off) and affix-strip-
+/// fold's CutAt (text — its `delim` is a magic-free LITERAL the fold
+/// guaranteed, so it adds no surface of its own). They are KNOWN and
+/// pure: the operands compose exactly like any sub-expression, and the
+/// nodes themselves add no shell semantics (no call, no spawn, no
+/// positional surface beyond their operands). An IR walker must
+/// therefore walk them, not refuse them — and the cost of refusing is
+/// NOT local:
+/// `scan_fn_lifts`/`scan_void_lifts` return an EMPTY lift map when any
+/// body trips `bad`, so one converted `${s%%D*}` series dropped EVERY
+/// function's C param and all arguments travelled as file-scope globals
+/// (MIMEcroft A/B: 32 GB vs 14.6 GB memmove, 2.4x task-clock/frame).
+/// CutAt measured the same cliff the other way: one CutAt in one
+/// function voided the whole void-lift map → 40 → 1272 argv
+/// save/restore wrappers and +548 int→string conversions in the C.
+/// Returns None for every other Ext node — still refused (Refuse >
+/// guess: an unknown node may hide anything).
+fn chop_operands(n: &dyn crate::shir_nodes::ExtExpr) -> Option<Vec<&IrExpr>> {
+    use crate::shir_nodes::{CutAt, FieldGrab, FieldStrip, FieldStripEnd};
+    if let Some(g) = n.as_any().downcast_ref::<FieldGrab>() {
+        Some(vec![&g.text, &g.off])
+    } else if let Some(f) = n.as_any().downcast_ref::<FieldStrip>() {
+        Some(vec![&f.text, &f.off])
+    } else if let Some(f) = n.as_any().downcast_ref::<FieldStripEnd>() {
+        // The drain advance (str-chop-cursor's guarded pair) is the
+        // same two operands as the plain advance. Missing from this
+        // whitelist tripped the PROGRAM-WIDE `bad` in all three
+        // consumers (lift_scan_expr, scan_bare_calls, …): one guarded
+        // chop somewhere killed every value lift — 93 MIMEcroft
+        // functions silently fell back to the argv transport.
+        Some(vec![&f.text, &f.off])
+    } else if let Some(c) = n.as_any().downcast_ref::<CutAt>() {
+        Some(vec![&c.text])
+    } else if let Some(sp) = n.as_any().downcast_ref::<crate::shir_nodes::StrSplice>() {
+        // str-splice-fold's node: the four exprs ARE the operands of
+        // the Interpolate it replaced (`join(slice(b,0,start)) ++
+        // repl ++ join(slice(b,end,""))`) — no call surface beyond
+        // them, so walking them keeps the scans exactly as permissive
+        // as the pre-fold program. Missing from this whitelist tripped
+        // the program-wide `bad` the same way FieldStripEnd once did:
+        // ONE fused splice store somewhere voided the whole void/value
+        // lift map (all 130 MIMEcroft lifts → argv transport, +36%
+        // instructions on `--first-frame`).
+        Some(vec![&sp.base, &sp.start, &sp.end, &sp.repl])
+    } else {
+        None
     }
 }
 
@@ -36296,8 +38094,20 @@ fn scan_void_uses(
                 taint_expr(default, st);
             }
             IrExpr::Capture { expr, .. } => taint_expr(expr, st),
+            // known-pure chop Ext nodes (str-chop-cursor's pair,
+            // affix-strip-fold's CutAt): walk the operands
+            // (scan_void_uses' `bad` voids the WHOLE program's void-lift
+            // map — see chop_operands)
+            IrExpr::Ext(n) => match chop_operands(&**n) {
+                Some(ops) => {
+                    for o in ops {
+                        taint_expr(o, st);
+                    }
+                }
+                None => st.bad = true,
+            },
             IrExpr::ArrayComp { .. } | IrExpr::Splice(_) | IrExpr::RawExpr(_)
-            | IrExpr::Ext(_) | IrExpr::Lambda { .. } => st.bad = true,
+            | IrExpr::Lambda { .. } => st.bad = true,
         }
     }
     let mut st = St { defs, bare: BTreeMap::new(), tainted: BTreeSet::new(), bad: false };
@@ -37026,8 +38836,20 @@ fn scan_bare_calls(top: &[IrStmt], defs: &BTreeMap<String, Vec<IrStmt>>) -> (BTr
                     }
                 }
             }
+            // known-pure chop Ext nodes (str-chop-cursor's pair,
+            // affix-strip-fold's CutAt): no call surface beyond their
+            // operands — walk them so coverage is kept without
+            // tripping the program-wide `bad` (see chop_operands)
+            IrExpr::Ext(n) => match chop_operands(&**n) {
+                Some(ops) => {
+                    for o in ops {
+                        walk_expr(o, spawn, defs, out, bad);
+                    }
+                }
+                None => *bad = true,
+            },
             // opaque/unknown shapes may hide a bare call — refuse lifts
-            IrExpr::RawExpr(_) | IrExpr::Ext(_) | IrExpr::Lambda { .. }
+            IrExpr::RawExpr(_) | IrExpr::Lambda { .. }
             | IrExpr::ArrayComp { .. } | IrExpr::Splice(_) => *bad = true,
             IrExpr::Int(_) | IrExpr::Bool(_) | IrExpr::Json(_) | IrExpr::Regex { .. }
             | IrExpr::Range { .. }
@@ -37403,6 +39225,62 @@ fn sh_tokens(s: &str) -> BTreeSet<String> {
     }
     out
 }
+
+/// Does this rendered text NAME a shell-runtime symbol? The single
+/// owner of the `need_sh` verdict: every helper, register and buffer
+/// `emit_runtime` gates behind `need_sh` is defined in that block, and
+/// every one of them is spelled `_sh_*` — so naming one is both the only
+/// way to need the block and the only way to be caught out by its
+/// absence. Derived from text instead of a flag set at each emitter:
+/// there is nothing for a new emitter to forget.
+fn sh_runtime_needed<'a>(parts: impl IntoIterator<Item = &'a [String]>) -> bool {
+    parts
+        .into_iter()
+        .flat_map(|buf| buf.iter())
+        .any(|line| line_needs_sh(line))
+}
+
+/// One rendered line as evidence for that verdict. A `_sh_*` helper that
+/// lives in the runtime block is direct evidence; for `_sh_rc` alone the
+/// register only needs the block when the line READS it or can store
+/// something other than 0 — the statement renderer writes a literal-zero
+/// status store after every command, and `strip_dead_rc` deletes all of
+/// them again once nothing reads the register, so a program whose every
+/// `_sh_` mention is such a store needs no runtime block at all.
+fn line_needs_sh(line: &str) -> bool {
+    let toks = sh_tokens(line);
+    if toks.is_empty() {
+        return false;
+    }
+    if toks
+        .iter()
+        .any(|t| t != "_sh_rc" && !SH_NON_RUNTIME.contains(&t.as_str()))
+    {
+        return true;
+    }
+    toks.contains("_sh_rc") && (rc_is_read(line) || rc_may_be_nonzero(line))
+}
+
+/// `_sh_*` helpers defined OUTSIDE the block `emit_runtime` gates on
+/// `need_sh`, each with its own gate: the number helpers (`_sh_ll2s`,
+/// `_sh_mulhu`/`_sh_divodd`/`_sh_divp2`, `_sh_isqrt`, `_sh_i128_str`,
+/// `_sh_pyfloat_str`) and the string/test/regex/pow/time helpers are
+/// spliced in or emitted under their own `need_*` flag, and exist whether
+/// or not the block does. Naming one therefore says nothing about the
+/// block — counting them would hand every native-only program 30 KB of
+/// runtime it never calls. A name wrongly listed costs only that block
+/// back (FAIL compile shows it); a name missing from the list costs the
+/// dead helpers on the programs naming it.
+const SH_NON_RUNTIME: &[&str] = &[
+    "_sh_count_char", "_sh_divodd", "_sh_divp2", "_sh_echo_fast", "_sh_fa",
+    "_sh_grep_matches", "_sh_i128_str", "_sh_is_G", "_sh_is_N", "_sh_is_O",
+    "_sh_is_S", "_sh_is_b", "_sh_is_c", "_sh_is_d", "_sh_is_e", "_sh_is_f",
+    "_sh_is_g", "_sh_is_h", "_sh_is_k", "_sh_is_l", "_sh_is_p", "_sh_is_r",
+    "_sh_is_s", "_sh_is_t", "_sh_is_u", "_sh_is_w", "_sh_is_x", "_sh_isint31",
+    "_sh_isqrt", "_sh_ll2s", "_sh_mkdir_p", "_sh_mtime", "_sh_mulhu", "_sh_pow",
+    "_sh_pyfloat_str", "_sh_raise", "_sh_regex_match", "_sh_sc", "_sh_sleep",
+    "_sh_split_count", "_sh_sset", "_sh_sset_field", "_sh_wc_words", "_sh_xstrdup",
+];
 
 /// Does the generated text READ `_sh_rc` anywhere? A write is `_sh_rc =`
 /// (the definition and every status store, always space-padded); anything
@@ -39428,6 +41306,181 @@ fn collect_capture_vars(stmts: &[IrStmt], out: &mut BTreeSet<String>) {
     }
 }
 
+/// The CONST-LIFT VETO — the model's `paramw_s`/`paramw_e` (v10b #1):
+/// exactly the positions where a `param` write-op (`=`/`:=`) or raw
+/// text `${NAME:=…}` can change the store. A var this set names is NOT
+/// a constant — const-lifting it would freeze a live binding. Unlike
+/// the hoist's exclusive statement arms, every position recurses: the
+/// veto can only err by missing a write, and the model's bridge
+/// (`paramw` ⟺ the emit dispatch's writing-param arm) is what says it
+/// never does.
+fn collect_param_write_targets(stmts: &[IrStmt], out: &mut BTreeSet<String>) {
+    for s in stmts {
+        collect_param_write_stmt(s, out);
+    }
+}
+
+fn collect_param_write_seq(stmts: &[IrStmt], out: &mut BTreeSet<String>) {
+    for s in stmts {
+        collect_param_write_stmt(s, out);
+    }
+}
+
+fn collect_param_write_stmt(s: &IrStmt, out: &mut BTreeSet<String>) {
+    match s {
+        // expr-only: an Assign's targets are SPELLT writes (seen
+        // directly by const_assign_rhs), not param writes.
+        IrStmt::Assign { expr, .. } => collect_param_write_expr(expr, out),
+        IrStmt::Declare { init, .. } => {
+            if let Some(e) = init {
+                collect_param_write_expr(e, out);
+            }
+        }
+        IrStmt::DeclareArray { elements, .. } => {
+            for x in elements {
+                collect_param_write_expr(x, out);
+            }
+        }
+        IrStmt::Expr(e) | IrStmt::Output { value: e, .. } => collect_param_write_expr(e, out),
+        IrStmt::Die { expr: e, .. }
+        | IrStmt::Warn { expr: e, .. }
+        | IrStmt::SetChildError(e) => collect_param_write_expr(e, out),
+        IrStmt::Return(e) | IrStmt::Exit(e) => {
+            if let Some(x) = e {
+                collect_param_write_expr(x, out);
+            }
+        }
+        IrStmt::WriteFile { path, content, .. } => {
+            collect_param_write_expr(path, out);
+            collect_param_write_expr(content, out);
+        }
+        IrStmt::Exec { cmd, args, redirects, env, .. } => {
+            collect_param_write_expr(cmd, out);
+            for a in args {
+                collect_param_write_expr(a, out);
+            }
+            for r in redirects {
+                collect_param_write_expr(r, out);
+            }
+            for (_, x) in env {
+                collect_param_write_expr(x, out);
+            }
+        }
+        IrStmt::Redirect { inner, redirects } => {
+            collect_param_write_seq(inner, out);
+            for r in redirects {
+                collect_param_write_expr(&r.target, out);
+            }
+        }
+        IrStmt::Pipeline { stages, .. } => {
+            for st in stages {
+                collect_param_write_seq(st, out);
+            }
+        }
+        IrStmt::If { cond, then, elsifs, else_ } => {
+            collect_param_write_expr(cond, out);
+            collect_param_write_seq(then, out);
+            for (c, b) in elsifs {
+                collect_param_write_expr(c, out);
+                collect_param_write_seq(b, out);
+            }
+            collect_param_write_seq(else_, out);
+        }
+        IrStmt::Case { discriminant, clauses, .. } => {
+            collect_param_write_expr(discriminant, out);
+            for c in clauses {
+                collect_param_write_seq(&c.body, out);
+            }
+        }
+        IrStmt::Select { clauses } => {
+            for c in clauses {
+                if let Some(x) = &c.ch {
+                    collect_param_write_expr(x, out);
+                }
+                if let Some(x) = &c.value {
+                    collect_param_write_expr(x, out);
+                }
+                collect_param_write_seq(&c.body, out);
+            }
+        }
+        IrStmt::While { cond, body } | IrStmt::DoWhile { cond, body, .. } => {
+            collect_param_write_expr(cond, out);
+            collect_param_write_seq(body, out);
+        }
+        // the loop VAR is not a param write (the model's For arm takes
+        // iter + body only) — only the iter expr can carry one.
+        IrStmt::For { iter, body, .. } => {
+            collect_param_write_expr(iter, out);
+            collect_param_write_seq(body, out);
+        }
+        IrStmt::ForInit { init, cond, step, body } => {
+            collect_param_write_seq(init, out);
+            collect_param_write_expr(cond, out);
+            collect_param_write_seq(step, out);
+            collect_param_write_seq(body, out);
+        }
+        IrStmt::Function { body, .. } => collect_param_write_seq(body, out),
+        IrStmt::Try { body, excepts, else_body, finally_body } => {
+            collect_param_write_seq(body, out);
+            for e in excepts {
+                if let Some(m) = &e.match_expr {
+                    collect_param_write_expr(m, out);
+                }
+                collect_param_write_seq(&e.body, out);
+            }
+            collect_param_write_seq(else_body, out);
+            collect_param_write_seq(finally_body, out);
+        }
+        IrStmt::Block(b) | IrStmt::Subshell(b) | IrStmt::Background(b) => {
+            collect_param_write_seq(b, out)
+        }
+        _ => {}
+    }
+}
+
+fn collect_param_write_expr(e: &IrExpr, out: &mut BTreeSet<String>) {
+    match e {
+        IrExpr::Str(text, style) => {
+            scan_raw_assigns_str(
+                text,
+                matches!(style, crate::ir::StrStyle::SingleQuoted),
+                out,
+            );
+        }
+        IrExpr::Call { func, args } if func == "param" => {
+            if let Some(n) = param_write_target(args) {
+                out.insert(n);
+            }
+            for a in args {
+                collect_param_write_expr(a, out);
+            }
+        }
+        IrExpr::Call { args, .. } => {
+            for a in args {
+                collect_param_write_expr(a, out);
+            }
+        }
+        IrExpr::BinOp { lhs, rhs, .. } => {
+            collect_param_write_expr(lhs, out);
+            collect_param_write_expr(rhs, out);
+        }
+        IrExpr::Interpolate(parts) => {
+            for p in parts {
+                if let InterpPart::Expr(x) = p {
+                    collect_param_write_expr(x, out);
+                }
+            }
+        }
+        IrExpr::Array(items) => {
+            for i in items {
+                collect_param_write_expr(i, out);
+            }
+        }
+        IrExpr::Arrow(body) => collect_param_write_seq(body, out),
+        _ => {}
+    }
+}
+
 fn const_assign_rhs(stmts: &[IrStmt], const_vars: &HashMap<String, VarKind>) -> HashMap<String, IrExpr> {
     let mut out = HashMap::new();
     let mut seen: BTreeSet<String> = BTreeSet::new();
@@ -39439,6 +41492,13 @@ fn const_assign_rhs(stmts: &[IrStmt], const_vars: &HashMap<String, VarKind>) -> 
         collect_arith_text_names(s, &mut arith_names);
     }
     let mut poisoned: BTreeSet<String> = arith_names;
+    // the const-lift VETO (v10b #1): `${NAME:=…}` / `param("=", …)`
+    // writes are RUNTIME writes — a var they name is not constant even
+    // when no Assign spells one (the write hides in raw default text or
+    // a param's default word).
+    let mut paramw: BTreeSet<String> = BTreeSet::new();
+    collect_param_write_targets(stmts, &mut paramw);
+    poisoned.extend(paramw);
     for s in stmts {
         if let IrStmt::Assign { targets, expr, .. } = s {
             for t in targets {
@@ -41352,20 +43412,16 @@ fn text_contains_ident(text: &str, id: &str) -> bool {
 fn collect_assoc_expr(e: &IrExpr, out: &mut BTreeSet<String>) {
     match e {
         IrExpr::Call { func, args } => {
-            // `${!map[@]}` — assoc KEY joins
-            if func == "param" {
-                if let Some(IrExpr::Str(n, _)) = args.get(1) {
-                    if let Some(rest) = n.strip_prefix('!') {
-                        let rest = rest
-                            .strip_suffix("[@]")
-                            .or_else(|| rest.strip_suffix("[*]"))
-                            .unwrap_or(rest);
-                        if !rest.is_empty() {
-                            out.insert(rest.to_string());
-                        }
-                    }
-                }
-            }
+            // `param` with a `!name` argument (a `${!name[@]}` KEY read)
+            // is deliberately NOT collected here (fixed 2026-10-29): a
+            // READ never decides storage class. This arm used to insert
+            // `name` unconditionally, flipping any indexed array read as
+            // `${!arr[@]}` onto the assoc DECL path while every write
+            // still rendered `arr`/`arr_len` — undeclared identifiers;
+            // the keys face never compiled for an indexed array. Every
+            // WRITE shape below still registers the class: declare -A
+            // (DeclareArray / exec arm), setArray(..., true), string-key
+            // stores, non-integer literal subscripts.
             if func == "setArray" {
                 if matches!(args.get(2), Some(IrExpr::Bool(true))) {
                     if let Some(IrExpr::Str(n, _)) = args.first() {
@@ -41884,6 +43940,20 @@ fn collect_store_names(stmts: &[IrStmt], out: &mut BTreeSet<String>) {
                     out.insert(v.clone());
                 }
             }
+            // fix (0): Try writes must reach decl emission (the setjmp
+            // render) — the store census is half of the file-scope
+            // decl list.
+            IrStmt::Try { body, excepts, else_body, finally_body } => {
+                collect_store_names(body, out);
+                for e in excepts {
+                    if let Some(m) = &e.match_expr {
+                        collect_store_expr(m, out);
+                    }
+                    collect_store_names(&e.body, out);
+                }
+                collect_store_names(else_body, out);
+                collect_store_names(finally_body, out);
+            }
             _ => {}
         }
     }
@@ -41891,6 +43961,25 @@ fn collect_store_names(stmts: &[IrStmt], out: &mut BTreeSet<String>) {
 
 fn collect_store_expr(e: &IrExpr, out: &mut BTreeSet<String>) {
     match e {
+        // v10b #3: raw `${NAME:=…}` default text is re-parsed at emit
+        // time — census it from the text here.
+        IrExpr::Str(text, style) => {
+            scan_raw_assigns_str(
+                text,
+                matches!(style, crate::ir::StrStyle::SingleQuoted),
+                out,
+            );
+        }
+        // v10b #1: the store census carries the writing-param arm —
+        // extraction AND the generic arg walk below.
+        IrExpr::Call { func, args } if func == "param" => {
+            if let Some(n) = param_write_target(args) {
+                out.insert(n);
+            }
+            for a in args {
+                collect_store_expr(a, out);
+            }
+        }
         IrExpr::Call { func, args } => {
             match func.as_str() {
                 "setVar" | "assign" => {
@@ -42092,7 +44181,10 @@ fn collect_vars_full(
             }
             // loop bodies assign/read vars — hoist them (they are
             // ordinary top-level vars, unlike for-loop counters).
-            IrStmt::While { body, .. } | IrStmt::DoWhile { body, .. } => {
+            // The CONDITION walks too (the model's While/DoWhile arm is
+            // cond || body in every mode).
+            IrStmt::While { cond, body } | IrStmt::DoWhile { cond, body, .. } => {
+                collect_vars_expr(cond, out);
                 collect_vars(body, out)
             }
             IrStmt::Block(b) | IrStmt::Subshell(b) | IrStmt::Background(b) => collect_vars(b, out),
@@ -42112,6 +44204,21 @@ fn collect_vars_full(
                     out.insert(tf.x.clone());
                     out.insert(tf.s.clone());
                 }
+            }
+            // fix (0): Try walks the inventory like every other reachable
+            // position (the C backend renders Try via setjmp/longjmp —
+            // without this arm a Try write reached no decl channel,
+            // not even file-scope decl emission).
+            IrStmt::Try { body, excepts, else_body, finally_body } => {
+                collect_vars(body, out);
+                for e in excepts {
+                    if let Some(m) = &e.match_expr {
+                        collect_vars_expr(m, out);
+                    }
+                    collect_vars(&e.body, out);
+                }
+                collect_vars(else_body, out);
+                collect_vars(finally_body, out);
             }
             _ => {}
         }
@@ -42766,9 +44873,14 @@ fn collect_assigned_vars(stmts: &[IrStmt], out: &mut BTreeSet<String>) {
                     collect_assigned_expr(e, out);
                 }
             }
-            IrStmt::If { then, elsifs, else_, .. } => {
+            IrStmt::If { cond, then, elsifs, else_ } => {
+                // (a) the condition(s) can write too — a `${y:=…}` or
+                // printf -v in a condition is a store write whose
+                // read-back routes through has_c_decl.
+                collect_assigned_expr(cond, out);
                 collect_assigned_vars(then, out);
-                for (_, b) in elsifs {
+                for (c, b) in elsifs {
+                    collect_assigned_expr(c, out);
                     collect_assigned_vars(b, out);
                 }
                 collect_assigned_vars(else_, out);
@@ -42777,7 +44889,8 @@ fn collect_assigned_vars(stmts: &[IrStmt], out: &mut BTreeSet<String>) {
             // fn-local hoist must see them or a case-assigned global
             // renders as an undeclared C identifier (MIMEcroft
             // `hardness`: `case $hd_t in 2) h=2 …` left `h` undeclared).
-            IrStmt::Case { clauses, .. } => {
+            IrStmt::Case { discriminant, clauses, .. } => {
+                collect_assigned_expr(discriminant, out);
                 if !std::env::var("SH2_CASEWALK_OFF").is_ok() {
                 for c in clauses {
                     collect_assigned_vars(&c.body, out);
@@ -42787,18 +44900,33 @@ fn collect_assigned_vars(stmts: &[IrStmt], out: &mut BTreeSet<String>) {
             IrStmt::Select { clauses } => {
                 if !std::env::var("SH2_CASEWALK_OFF").is_ok() {
                 for c in clauses {
+                    // a top-level `select` MENU writes through its
+                    // ch/value exprs (the measured shape: a param write
+                    // in the menu list) — bodies alone miss it.
+                    if let Some(x) = &c.ch {
+                        collect_assigned_expr(x, out);
+                    }
+                    if let Some(x) = &c.value {
+                        collect_assigned_expr(x, out);
+                    }
                     collect_assigned_vars(&c.body, out);
                 }
                 }
             }
-            IrStmt::While { body, .. }
-            | IrStmt::DoWhile { body, .. }
-            | IrStmt::Block(body)
+            IrStmt::While { cond, body } | IrStmt::DoWhile { cond, body, .. } => {
+                // the while-cond write (the measured silent-wrong-value
+                // diff: printf -v in a loop condition)
+                collect_assigned_expr(cond, out);
+                collect_assigned_vars(body, out);
+            }
+            IrStmt::Block(body)
             | IrStmt::Subshell(body)
             | IrStmt::Background(body) => collect_assigned_vars(body, out),
-            IrStmt::For { var, body, .. } => {
-                // the loop var is ASSIGNED by the loop
+            IrStmt::For { var, iter, body } => {
+                // the loop var is ASSIGNED by the loop; (b) the iter
+                // expr is walked like every other expr position
                 out.insert(var.clone());
+                collect_assigned_expr(iter, out);
                 collect_assigned_vars(body, out);
             }
             IrStmt::Expr(e) => collect_assigned_expr(e, out),
@@ -42819,13 +44947,398 @@ fn collect_assigned_vars(stmts: &[IrStmt], out: &mut BTreeSet<String>) {
                     out.insert(tf.s.clone());
                 }
             }
+            // every remaining position whose exprs can carry a write
+            // (the model's Hoist chain has an arm for each): output,
+            // array elements, die/warn/setchild, return/exit (v10b #2 —
+            // the echo-return transform's `return ${y:=…}` shape), file
+            // writes, redirects, pipelines, execs, and (0) Try.
+            IrStmt::Output { value, .. } => collect_assigned_expr(value, out),
+            IrStmt::DeclareArray { elements, .. } => {
+                for x in elements {
+                    collect_assigned_expr(x, out);
+                }
+            }
+            IrStmt::Die { expr, .. }
+            | IrStmt::Warn { expr, .. }
+            | IrStmt::SetChildError(expr) => collect_assigned_expr(expr, out),
+            IrStmt::Return(e) | IrStmt::Exit(e) => {
+                if let Some(x) = e {
+                    collect_assigned_expr(x, out);
+                }
+            }
+            IrStmt::WriteFile { path, content, .. } => {
+                collect_assigned_expr(path, out);
+                collect_assigned_expr(content, out);
+            }
+            IrStmt::Redirect { inner, redirects } => {
+                collect_assigned_vars(inner, out);
+                for r in redirects {
+                    collect_assigned_expr(&r.target, out);
+                }
+            }
+            IrStmt::Pipeline { stages, .. } => {
+                for st in stages {
+                    collect_assigned_vars(st, out);
+                }
+            }
+            IrStmt::Exec { cmd, args, redirects, env, .. } => {
+                collect_assigned_expr(cmd, out);
+                for a in args {
+                    collect_assigned_expr(a, out);
+                }
+                for r in redirects {
+                    collect_assigned_expr(r, out);
+                }
+                for (_, x) in env {
+                    collect_assigned_expr(x, out);
+                }
+            }
+            // fix (0): Try reaches no decl channel without this arm —
+            // inside a FUNCTION (inventory skips fn bodies) hoist alone
+            // must cover every write, which is the coverage theorem.
+            IrStmt::Try { body, excepts, else_body, finally_body } => {
+                collect_assigned_vars(body, out);
+                for e in excepts {
+                    if let Some(m) = &e.match_expr {
+                        collect_assigned_expr(m, out);
+                    }
+                    collect_assigned_vars(&e.body, out);
+                }
+                collect_assigned_vars(else_body, out);
+                collect_assigned_vars(finally_body, out);
+            }
             _ => {}
         }
     }
 }
 
+/// The shared `${NAME:=w}` / `${NAME=w}` write gate — the model's
+/// `param_gate`: op ∈ {`=` , `:=`} on a plain identifier, target
+/// carried as args[1]. Used by every census and the const-lift veto.
+fn param_write_target(args: &[IrExpr]) -> Option<String> {
+    if let (Some(IrExpr::Str(op, _)), Some(IrExpr::Str(name, _))) =
+        (args.first(), args.get(1))
+    {
+        if (op == "=" || op == ":=") && is_ident(name) {
+            return Some(name.clone());
+        }
+    }
+    None
+}
+
+/// `${NAME:=w}` / `${NAME=w}` write targets read out of RAW Str text —
+/// the model's `scan_raw_assigns_str` (v10b #3). The core keeps a
+/// param's default word as raw text and re-parses it at EMIT time,
+/// AFTER the decl censuses froze their sets, so the write must be
+/// found in the text itself: `${` not preceded by `\`, an identifier
+/// run, then `=` or `:=`. Single-quoted text is literal (no
+/// expansion ⇒ no write).
+fn scan_raw_assigns_str(text: &str, single_quoted: bool, out: &mut BTreeSet<String>) {
+    if single_quoted {
+        return;
+    }
+    let b = text.as_bytes();
+    let mut i = 0usize;
+    while i + 2 < b.len() {
+        if b[i] == b'$'
+            && b[i + 1] == b'{'
+            && (i == 0 || b[i - 1] != b'\\')
+            && (b[i + 2].is_ascii_alphabetic() || b[i + 2] == b'_')
+        {
+            let start = i + 2;
+            let mut end = start;
+            while end < b.len() && (b[end].is_ascii_alphanumeric() || b[end] == b'_') {
+                end += 1;
+            }
+            if end > start
+                && ((end < b.len() && b[end] == b'=')
+                    || (end + 1 < b.len() && b[end] == b':' && b[end + 1] == b'='))
+            {
+                out.insert(text[start..end].to_string());
+            }
+        }
+        i += 1;
+    }
+}
+
+/// Fold one store's static bound into the length census: max with an
+/// existing bound, insert when missing, and widen to unbounded (None)
+/// when either side is dynamic — None ⇒ no fixed buffer ⇒ no
+/// `strcpy` into a too-small `char[]` (the safe direction both ways).
+fn bump_len(lens: &mut Vec<(String, Option<u64>)>, name: &str, len: Option<u64>) {
+    match lens.iter_mut().find(|(n, _)| n == name) {
+        Some((_, slot)) => {
+            *slot = match (*slot, len) {
+                (Some(a), Some(b)) => Some(a.max(b)),
+                _ => None,
+            };
+        }
+        None => lens.push((name.to_string(), len)),
+    }
+}
+
+/// The STATIC length of a `${NAME=word}` default word: the literal's
+/// byte length (raw length ≥ strlen for escapes — an over-estimate
+/// fits the bound direction), or None when the word is dynamic.
+fn literal_word_len(e: &IrExpr) -> Option<u64> {
+    match e {
+        IrExpr::Str(s, _) => Some(s.len() as u64),
+        IrExpr::Interpolate(parts) => {
+            let mut n = 0u64;
+            for p in parts {
+                match p {
+                    crate::ir::InterpPart::Lit(s) => n = n.saturating_add(s.len() as u64),
+                    crate::ir::InterpPart::Expr(_) => return None,
+                }
+            }
+            Some(n)
+        }
+        _ => None,
+    }
+}
+
+/// `${NAME=word}` / `${NAME:=word}` written in RAW text (the v10b #3
+/// re-parse-at-emit carrier): the word runs to the first `}`. A word
+/// holding `$`, a backtick or a backslash is not a static bound.
+fn supplement_raw_assigns(text: &str, single_quoted: bool, lens: &mut Vec<(String, Option<u64>)>) {
+    if single_quoted {
+        return;
+    }
+    let b = text.as_bytes();
+    let mut i = 0usize;
+    while i + 2 < b.len() {
+        if b[i] == b'$'
+            && b[i + 1] == b'{'
+            && (i == 0 || b[i - 1] != b'\\')
+            && (b[i + 2].is_ascii_alphabetic() || b[i + 2] == b'_')
+        {
+            let start = i + 2;
+            let mut end = start;
+            while end < b.len() && (b[end].is_ascii_alphanumeric() || b[end] == b'_') {
+                end += 1;
+            }
+            if end > start {
+                let word_start = if end < b.len() && b[end] == b'=' {
+                    Some(end + 1)
+                } else if end + 1 < b.len() && b[end] == b':' && b[end + 1] == b'=' {
+                    Some(end + 2)
+                } else {
+                    None
+                };
+                if let Some(w) = word_start {
+                    let word = text[w..].split('}').next().unwrap_or("");
+                    let len = if word.contains('$')
+                        || word.contains('`')
+                        || word.contains('\\')
+                    {
+                        None
+                    } else {
+                        Some(word.len() as u64)
+                    };
+                    bump_len(lens, &text[start..end], len);
+                }
+            }
+        }
+        i += 1;
+    }
+}
+
+/// The length-census supplement (bounds half of the write-arm
+/// contract): two store shapes the core walk
+/// (`shir::analyze_string_lengths`) does not collect, folded as MAX
+/// against its result —
+///
+///  1. `IrStmt::Declare { init }` — `local x=1` stores "1", but the
+///     core walk only knows the exec("local", ["x=1"]) lowering. A var
+///     whose only other store is `x=` then got `max_len 0` → `char
+///     x[1]` → the debug `assert(strlen("1") <= 0)` aborts at STARTUP
+///     (probe: `f(){ local x=1 y=2; x=; echo "[$x]"; }; f`).
+///  2. the `${NAME=word}` / `${NAME:=word}` WRITE side-effect — the C
+///     arm runs `strcpy(buf, default)` against the SAME capacity, so a
+///     default longer than the census bound overflows the buffer.
+///     The write lives in an expression (assign RHS, echo text,
+///     condition…), never a statement the core walk collects; this
+///     walker mirrors `collect_assigned_vars`' arm set so the write
+///     cannot hide in a position the decl censuses already cover.
+///
+/// Dynamic words widen the entry to None (no fixed buffer). That can
+/// demote a var from buf to heap — decl, store and read paths all read
+/// the same map, so the class stays consistent.
+fn supplement_write_lengths_stmts(stmts: &[IrStmt], lens: &mut Vec<(String, Option<u64>)>) {
+    for s0 in stmts {
+        let s = unwrap_devnull_redirect(s0).unwrap_or(s0);
+        match s {
+            IrStmt::Assign { targets, expr, .. } => {
+                let _ = targets;
+                supplement_write_lengths_expr(expr, lens);
+            }
+            IrStmt::Expr(e) | IrStmt::Output { value: e, .. } => {
+                supplement_write_lengths_expr(e, lens)
+            }
+            IrStmt::Declare { vars, init, .. } => {
+                if let Some(e) = init {
+                    let len = literal_word_len(e);
+                    for d in vars {
+                        bump_len(lens, &d.name, len);
+                    }
+                    supplement_write_lengths_expr(e, lens);
+                }
+            }
+            IrStmt::If { cond, then, elsifs, else_ } => {
+                supplement_write_lengths_expr(cond, lens);
+                supplement_write_lengths_stmts(then, lens);
+                for (c, b) in elsifs {
+                    supplement_write_lengths_expr(c, lens);
+                    supplement_write_lengths_stmts(b, lens);
+                }
+                supplement_write_lengths_stmts(else_, lens);
+            }
+            IrStmt::Case { discriminant, clauses, .. } => {
+                supplement_write_lengths_expr(discriminant, lens);
+                for c in clauses {
+                    supplement_write_lengths_stmts(&c.body, lens);
+                }
+            }
+            IrStmt::Select { clauses } => {
+                for c in clauses {
+                    if let Some(x) = &c.ch {
+                        supplement_write_lengths_expr(x, lens);
+                    }
+                    if let Some(x) = &c.value {
+                        supplement_write_lengths_expr(x, lens);
+                    }
+                    supplement_write_lengths_stmts(&c.body, lens);
+                }
+            }
+            IrStmt::While { cond, body } | IrStmt::DoWhile { cond, body, .. } => {
+                supplement_write_lengths_expr(cond, lens);
+                supplement_write_lengths_stmts(body, lens);
+            }
+            IrStmt::Block(body)
+            | IrStmt::Subshell(body)
+            | IrStmt::Background(body) => supplement_write_lengths_stmts(body, lens),
+            IrStmt::For { iter, body, .. } => {
+                supplement_write_lengths_expr(iter, lens);
+                supplement_write_lengths_stmts(body, lens);
+            }
+            IrStmt::ForInit { init, cond, step, body } => {
+                supplement_write_lengths_stmts(init, lens);
+                supplement_write_lengths_expr(cond, lens);
+                supplement_write_lengths_stmts(step, lens);
+                supplement_write_lengths_stmts(body, lens);
+            }
+            IrStmt::Function { body, .. } => supplement_write_lengths_stmts(body, lens),
+            IrStmt::DeclareArray { elements, .. } => {
+                for x in elements {
+                    supplement_write_lengths_expr(x, lens);
+                }
+            }
+            IrStmt::Die { expr, .. }
+            | IrStmt::Warn { expr, .. }
+            | IrStmt::SetChildError(expr) => supplement_write_lengths_expr(expr, lens),
+            IrStmt::Return(e) | IrStmt::Exit(e) => {
+                if let Some(x) = e {
+                    supplement_write_lengths_expr(x, lens);
+                }
+            }
+            IrStmt::WriteFile { path, content, .. } => {
+                supplement_write_lengths_expr(path, lens);
+                supplement_write_lengths_expr(content, lens);
+            }
+            IrStmt::Redirect { inner, redirects } => {
+                supplement_write_lengths_stmts(inner, lens);
+                for r in redirects {
+                    supplement_write_lengths_expr(&r.target, lens);
+                }
+            }
+            IrStmt::Pipeline { stages, .. } => {
+                for st in stages {
+                    supplement_write_lengths_stmts(st, lens);
+                }
+            }
+            IrStmt::Exec { cmd, args, redirects, env, .. } => {
+                supplement_write_lengths_expr(cmd, lens);
+                for a in args {
+                    supplement_write_lengths_expr(a, lens);
+                }
+                for r in redirects {
+                    supplement_write_lengths_expr(r, lens);
+                }
+                for (_, x) in env {
+                    supplement_write_lengths_expr(x, lens);
+                }
+            }
+            IrStmt::Try { body, excepts, else_body, finally_body } => {
+                supplement_write_lengths_stmts(body, lens);
+                for e in excepts {
+                    if let Some(m) = &e.match_expr {
+                        supplement_write_lengths_expr(m, lens);
+                    }
+                    supplement_write_lengths_stmts(&e.body, lens);
+                }
+                supplement_write_lengths_stmts(else_body, lens);
+                supplement_write_lengths_stmts(finally_body, lens);
+            }
+            _ => {}
+        }
+    }
+}
+
+/// One expression position: find the write side-effects it carries.
+/// `param("=…"/":=…", NAME, word)` bumps NAME with the word's static
+/// bound; every other shape recurses so a write nested in a word,
+/// interpolation, pipeline arrow or capture still counts.
+fn supplement_write_lengths_expr(e: &IrExpr, lens: &mut Vec<(String, Option<u64>)>) {
+    match e {
+        // v10b #3: raw default text re-parses to a write at emit time.
+        IrExpr::Str(text, style) => supplement_raw_assigns(
+            text,
+            matches!(style, crate::ir::StrStyle::SingleQuoted),
+            lens,
+        ),
+        IrExpr::Call { func, args } => {
+            if func == "param" {
+                if let Some(name) = param_write_target(args) {
+                    bump_len(lens, &name, args.get(2).and_then(literal_word_len));
+                }
+            }
+            for a in args {
+                supplement_write_lengths_expr(a, lens);
+            }
+        }
+        IrExpr::Interpolate(parts) => {
+            for p in parts {
+                if let crate::ir::InterpPart::Expr(x) = p {
+                    supplement_write_lengths_expr(x, lens);
+                }
+            }
+        }
+        IrExpr::Array(items) => {
+            for x in items {
+                supplement_write_lengths_expr(x, lens);
+            }
+        }
+        IrExpr::BinOp { lhs, rhs, .. } => {
+            supplement_write_lengths_expr(lhs, lens);
+            supplement_write_lengths_expr(rhs, lens);
+        }
+        IrExpr::Arrow(body) => supplement_write_lengths_stmts(body, lens),
+        IrExpr::Capture { expr, .. } => supplement_write_lengths_expr(expr, lens),
+        _ => {}
+    }
+}
+
 fn collect_assigned_expr(e: &IrExpr, out: &mut BTreeSet<String>) {
     match e {
+        // v10b #3: raw default text is re-parsed at emit time — census
+        // it from the text here, before the hoist set freezes.
+        IrExpr::Str(text, style) => {
+            scan_raw_assigns_str(
+                text,
+                matches!(style, crate::ir::StrStyle::SingleQuoted),
+                out,
+            );
+        }
         IrExpr::Arith(a) => collect_assigned_arith(a, out),
         // `local x=$1` / `export V=...` — the core spells declarations
         // as exec("local", ["x=", <value>]) calls; the fn hoist must
@@ -42885,6 +45398,76 @@ fn collect_assigned_expr(e: &IrExpr, out: &mut BTreeSet<String>) {
                 }
             }
         }
+        // (c) expr-position `printf -v NAME …` — extraction AND the
+        // generic arg walk (the model's Hoist chain is an OR of both).
+        IrExpr::Call { args, .. } if is_printf_v_call(args) => {
+            if let Some(IrExpr::Array(items)) = args.get(1) {
+                if let Some(IrExpr::Str(n, _)) = items.get(1) {
+                    out.insert(n.clone());
+                }
+            }
+            for a in args {
+                collect_assigned_expr(a, out);
+            }
+        }
+        // (d) expr-position `let "i++"` hides its var inside a STRING
+        // arg — the hoist must see it or the loop var is undeclared.
+        IrExpr::Call { args, .. }
+            if matches!(args.first(), Some(IrExpr::Str(c, _)) if c == "let")
+                && matches!(
+                    args.get(1),
+                    Some(IrExpr::Array(items))
+                        if matches!(items.first(), Some(IrExpr::Str(..)))
+                ) =>
+        {
+            if let Some(IrExpr::Array(items)) = args.get(1) {
+                if let Some(IrExpr::Str(expr, _)) = items.first() {
+                    if let Some(n) = let_var_name(expr) {
+                        out.insert(n);
+                    }
+                }
+            }
+            for a in args {
+                collect_assigned_expr(a, out);
+            }
+        }
+        // v10/v10b #1: `param` `=`/`:=` carries its target as args[1] —
+        // extraction AND recursion, same as the model's chain.
+        IrExpr::Call { func, args } if func == "param" => {
+            if let Some(n) = param_write_target(args) {
+                out.insert(n);
+            }
+            for a in args {
+                collect_assigned_expr(a, out);
+            }
+        }
+        // the generic walk: every remaining call recurses into args,
+        // and the structural forwarders reach the positions whose
+        // writes arrive inside sub-expressions (v10b #1).
+        IrExpr::Call { args, .. } => {
+            for a in args {
+                collect_assigned_expr(a, out);
+            }
+        }
+        IrExpr::BinOp { lhs, rhs, .. } => {
+            collect_assigned_expr(lhs, out);
+            collect_assigned_expr(rhs, out);
+        }
+        IrExpr::Interpolate(parts) => {
+            for p in parts {
+                if let InterpPart::Expr(x) = p {
+                    collect_assigned_expr(x, out);
+                }
+            }
+        }
+        IrExpr::Array(items) => {
+            for i in items {
+                collect_assigned_expr(i, out);
+            }
+        }
+        // v10b forwarder: statements inside a block-valued expr hoist
+        // exactly like statement-position ones.
+        IrExpr::Arrow(body) => collect_assigned_vars(body, out),
         _ => {}
     }
 }
@@ -42900,6 +45483,15 @@ fn collect_assigned_arith(a: &ArithAst, out: &mut BTreeSet<String>) {
 
 fn collect_vars_expr(e: &IrExpr, out: &mut BTreeSet<String>) {
     match e {
+        // v10b #3: raw `${NAME:=…}` default text is re-parsed at emit
+        // time — census it from the text here.
+        IrExpr::Str(text, style) => {
+            scan_raw_assigns_str(
+                text,
+                matches!(style, crate::ir::StrStyle::SingleQuoted),
+                out,
+            );
+        }
         IrExpr::Var(name, _) => {
             out.insert(name.clone());
         }
@@ -42952,6 +45544,18 @@ fn collect_vars_expr(e: &IrExpr, out: &mut BTreeSet<String>) {
             }
         }
         IrExpr::Call { args, .. } => {
+            for a in args {
+                collect_vars_expr(a, out);
+            }
+        }
+        // v10: `param` `=`/`:=` targets are declaration sources (the
+        // same precedent as printf -v's) — t04's `y`, whose Assign the
+        // dead-store elim dropped. Write ops only; every other param op
+        // reads the var or writes a temp.
+        IrExpr::Call { func, args } if func == "param" => {
+            if let Some(n) = param_write_target(args) {
+                out.insert(n);
+            }
             for a in args {
                 collect_vars_expr(a, out);
             }
@@ -47608,6 +50212,62 @@ mod tests {
     }
 
     #[test]
+    fn fused_chop_store_extracts_straight_into_the_slot() {
+        // `tok = <FieldGrab …>` — the extraction IS the whole RHS, so
+        // the field goes straight into the destination slot with its
+        // KNOWN length: no intermediate `_sh_vbuf` temp (vgrow +
+        // memcpy) and no `_sh_sset` rescan of the bytes just written
+        // (strlen(src) + strnlen(old) + memmove → strstr + strnlen +
+        // one copy). The IR was already in that shape, so the wasted
+        // round-trip was purely this backend's compositional Ext
+        // rendering; nothing generic could see it.
+        use crate::shir_nodes::FieldGrab;
+        let grab = || {
+            IrExpr::Ext(Box::new(FieldGrab {
+                text: IrExpr::Var("s".to_string(), None),
+                off: IrExpr::Var("fc".to_string(), None),
+                delim: " ".to_string(),
+            }))
+        };
+        let out = shir_to_c(&tf_prog_of(vec![
+            tf_assign("s", tf_word("a b c")),
+            tf_assign("fc", tf_word("0")),
+            tf_assign("tok", grab()),
+        ]));
+        assert!(
+            out.contains("_sh_sset_field(&tok,"),
+            "fused chop store missing:\n{out}"
+        );
+        assert!(
+            !out.contains("_sh_sset(&tok,"),
+            "the temp + _sh_sset round-trip must be gone:\n{out}"
+        );
+        assert!(
+            out.contains("static void _sh_sset_field("),
+            "fused-store helper missing:\n{out}"
+        );
+        // A program that never fuses must not carry the helper (the
+        // post-pass keys it on its own call sites, like _sh_sset).
+        let plain = shir_to_c(&tf_prog_of(vec![tf_assign("tok", tf_word("a b"))]));
+        assert!(
+            !plain.contains("_sh_sset_field"),
+            "helper emitted with no call site:\n{plain}"
+        );
+        // ...and the chop's operands are forwarded verbatim: the same
+        // text/off expressions and delimiter the generic arm renders
+        // (declared vars keep their null guard; an undeclared one goes
+        // through _sh_env — either way the operand reaches the helper).
+        assert!(
+            out.contains("(const char*)((s ? s : \"\"))")
+                || out.contains("(const char*)(_sh_env(\"s\"))")
+                || out.contains("(const char*)(s)"),
+            "text operand not forwarded:\n{out}"
+        );
+        assert!(out.contains("fc"), "cursor operand not forwarded:\n{out}");
+        assert!(out.contains("\" \");"), "delimiter not forwarded:\n{out}");
+    }
+
+    #[test]
     fn vec_array_grows_past_cap() {
         // unbounded append loop over an int-consumed array: pointer +
         // len + cap decl, grow helper + call, heap free — and no fixed
@@ -49151,7 +51811,12 @@ mod tests {
             !out.contains("unsigned long long"),
             "unsigned lowering on negative-capable dividend:\n{out}"
         );
-        assert!(out.contains('%'), "modulo missing:\n{out}");
+        // The signed exact magic replaces the literal `%` text: it
+        // evaluates negative dividends correctly (bash's trunc semantics,
+        // `tests/c_div_magic.rs` pins it against the oracle) and stays
+        // division-free — the wrap-divergence this test refuses is still
+        // absent, so the intent holds with a stronger lowering.
+        assert!(out.contains("_sh_divp2("), "signed magic missing:\n{out}");
     }
 
     #[test]

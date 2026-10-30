@@ -3375,6 +3375,21 @@ fn stmt_bash_line(st: &IrStmt) -> Option<String> {
             }
             Some(format!("local {}={}", vars[0].name, bash_value(init)?))
         }
+        // The echo fold's canonical node, re-spelled as the `echo` that
+        // produced it. `fold_to_output`/`fold_dynamic_to_output` bake the
+        // joined words into the value and carry the trailing newline in
+        // the flag (never in the text), so `bash_word` round-trips the
+        // two shapes the fold emits: a literal and an interpolation
+        // whose expansions re-render as `$name`. A target-bearing
+        // Output is not an echo; anything else keeps the old refusal.
+        IrStmt::Output {
+            value,
+            newline,
+            target: None,
+        } => {
+            let w = bash_word(value)?;
+            Some(format!("echo{} {}", if *newline { "" } else { " -n" }, w))
+        }
         // Output folds, Assigns, control flow in a printed body: no source
         // text survives to reproduce — refuse and keep the shell-out.
         _ => None,
