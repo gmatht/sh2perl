@@ -1918,3 +1918,37 @@ red at 23v/1e. Executed tests 6/6 PASS (all suites built live).
 ## Running it
 
 Same toolchain as the P6/P7/P8 files (`--rlimit 40`).
+
+## strip_cfor — `strip.rs` (13)
+
+Per-shape Tier-1 model over `shir_passes/strip.rs` (ForInit
+lowering): `ForInit { init, cond, step, body }` becomes
+`Block(init ++ [While(cond, splice(body) ++ step)])` with the step
+re-inserted before every top-level continue — the trailing step on
+the normal path, spliced steps on continue paths, skipped on break.
+Fuel-bounded loop combinators (`for_loop` / `while_loop`) agree by
+construction on these shapes; the If-arm splice recursion IS
+modelled (fuel-bounded on nesting depth); the nested-loop continue
+boundary is a parameter. Five pins mirror the 2 source unit tests;
+the If-arm and nested-boundary pins are model-internal.
+
+### `strip.rs` — 13 obligations
+
+```
+    verus --triggers-mode silent --rlimit 40 strip.rs
+    -> verification results:: 13 verified, 0 errors
+```
+
+**What is proved.** The splice-shape identity per iteration shape:
+normal path runs the trailing step, both continue spellings run
+their spliced step, break skips it. Land with a SOUNDNESS FIX:
+`splice_continue` matched only first-class `Continue`, so a leveled
+`continue 2` (the legacy `Expr(Call("continue"))` form the shell
+lowering emits) skipped the step and the loop spun — measured live
+before the fix. Failing-first test, then the one-arm fix; both
+spellings now splice. Mutant (step spliced before `Break`) red at
+11v/2e. Executed tests 5/5 PASS (all suites built live).
+
+## Running it
+
+Same toolchain as the P6/P7/P8 files (`--rlimit 40`).

@@ -221,6 +221,17 @@ fn splice_continue(st: IrStmt, step: Vec<IrStmt>) -> IrStmt {
             seq.push(IrStmt::Continue);
             IrStmt::Block(seq)
         }
+        // the legacy `Expr(Call("continue"))` form (`continue 2`, and the
+        // expression-context arm): the step must run before it too, or the
+        // loop spins — `is_continue` names both shapes, and the splice
+        // honors them both.
+        IrStmt::Expr(crate::ir::IrExpr::Call { func, args })
+            if func == "continue" =>
+        {
+            let mut seq = step;
+            seq.push(IrStmt::Expr(crate::ir::IrExpr::Call { func, args }));
+            IrStmt::Block(seq)
+        }
         IrStmt::If {
             cond,
             then,
@@ -256,6 +267,56 @@ fn splice_continue(st: IrStmt, step: Vec<IrStmt>) -> IrStmt {
 mod tests {
     use super::*;
     use crate::ir::{IrExpr, IrProgram, IrStmt, StrStyle};
+
+    #[test]
+    fn legacy_continue_call_gets_the_step_splice() {
+        // `continue 2` lowers to the legacy Expr(Call("continue")) form —
+        // the step must run before it, or the loop spins on iteration 2.
+        let step_of = || {
+            vec![IrStmt::Assign {
+                targets: vec![crate::ir::AssignTarget {
+                    var: "i".into(),
+                    sigil: None,
+                    indices: vec![],
+                }],
+                expr: IrExpr::Str("i + 1".into(), StrStyle::DoubleQuoted),
+                asm: None,
+            }]
+        };
+        let legacy = IrStmt::Expr(IrExpr::Call {
+            func: "continue".into(),
+            args: vec![],
+        });
+        let mut prog = IrProgram { imports: vec![], requires: vec![], stmts: vec![],
+            subs: vec![], var_types: vec![], stmt_lines: vec![], var_const: vec![],
+            var_lengths: vec![], var_lifetimes: vec![], var_bash_env: vec![], var_nospace: vec![],
+            var_storage: vec![] };
+        prog.stmts = vec![IrStmt::ForInit {
+            init: vec![],
+            cond: IrExpr::Bool(true),
+            step: step_of(),
+            body: vec![legacy],
+        }];
+        strip_cfor(&mut prog);
+        match &prog.stmts[0] {
+            IrStmt::Block(body) => {
+                assert_eq!(body.len(), 1, "empty init elided, While only");
+                if let IrStmt::While { body: wb, .. } = &body[0] {
+                    // [ Block([step, Expr(Call continue)]), step ]
+                    assert_eq!(wb.len(), 2, "spliced continue + trailing step");
+                    assert!(
+                        matches!(&wb[0], IrStmt::Block(b) if b.len() == 2
+                            && matches!(&b[1], IrStmt::Expr(IrExpr::Call { func, .. }) if func == "continue")),
+                        "step+legacy-continue splice, got {:?}",
+                        wb[0],
+                    );
+                } else {
+                    panic!("not a While");
+                }
+            }
+            other => panic!("not a Block: {other:?}"),
+        }
+    }
 
     #[test]
     fn forinit_lowers_to_while_with_step_and_continue_splice() {

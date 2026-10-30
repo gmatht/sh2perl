@@ -1,0 +1,40 @@
+# verus-sync-coverage manifest: strip
+# source sha: strip=03664a7e6b30  proof sha: faa136095ca7
+
+[pins]
+pin pin_both_spellings_continue -> test legacy_continue_call_gets_the_step_splice: MAPPED
+pin pin_break_kept -> test forinit_lowers_to_while_with_step_and_continue_splice: MAPPED
+pin pin_if_arm_continue_spliced -> UNMIRRORED (by design — see VERUS.md §(b).4)
+pin pin_legacy_continue_spliced -> test legacy_continue_call_gets_the_step_splice: MAPPED
+pin pin_nested_opaque -> UNMIRRORED (by design — see VERUS.md §(b).4)
+pin pin_normal_path_runs_step -> test forinit_lowers_to_while_with_step_and_continue_splice: MAPPED
+pin pin_top_continue_spliced -> test forinit_lowers_to_while_with_step_and_continue_splice: MAPPED
+
+[guards]
+guard lowering entry: PRESENT
+guard statement walker: PRESENT
+guard continue splice: PRESENT
+guard continue verdict: PRESENT
+guard legacy-continue splice arm: PRESENT
+guard Block lowering shape: PRESENT
+
+[counts]
+proof-fns: 7
+pins: 7
+# NOTE: proof-fns is a file-shape fact (change detector), NOT the
+# Verus obligation count — the gate asserts N verified separately.
+
+[exec]
+# Each MAPPED test above, EXECUTED against the live source (one
+# module-suite run per model; per-test verdicts grepped from output).
+# A mapped test that fails or vanishes from the run is drift — FATAL.
+# The checker RUNS each mapped test (one module-suite cargo test per
+# source file) and records the per-test PASS/FAIL verdict below.
+# all suites built; per-test verdicts below
+exec pin_both_spellings_continue (legacy_continue_call_gets_the_step_splice): PASS
+exec pin_break_kept (forinit_lowers_to_while_with_step_and_continue_splice): PASS
+exec pin_if_arm_continue_spliced: UNMIRRORED (not executed)
+exec pin_legacy_continue_spliced (legacy_continue_call_gets_the_step_splice): PASS
+exec pin_nested_opaque: UNMIRRORED (not executed)
+exec pin_normal_path_runs_step (forinit_lowers_to_while_with_step_and_continue_splice): PASS
+exec pin_top_continue_spliced (forinit_lowers_to_while_with_step_and_continue_splice): PASS
