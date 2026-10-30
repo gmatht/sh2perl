@@ -1952,3 +1952,33 @@ spellings now splice. Mutant (step spliced before `Break`) red at
 ## Running it
 
 Same toolchain as the P6/P7/P8 files (`--rlimit 40`).
+
+## counted-arith-forinit — `counted_arith_forinit.rs` (12)
+
+Per-site Tier-1 model over `transforms/counted_arith_forinit.rs`
+(structured-Arith counted-while recovery): `i=INIT; while ARITH(i)
+{ PREFIX; STEP }` becomes one `ForInit` with the same iteration
+trace. The structured-Arith twin of `counted_while_forinit` (same
+trace-identity shape); the differences are the three +1 step
+spellings (IncDec, `+=`, Bin `+`) and the Arith-cond
+mention/status gates. Six pins mirror the 6 source unit tests; the
+trace check and the one-gate exhibit are model-internal. Firing:
+0/563 on the shell corpus by construction (shell conds lower to
+`test` calls, never `Arith`); the producers are the structured
+frontends, the unit tests the witness.
+
+### `counted_arith_forinit.rs` — 12 obligations
+
+```
+    verus --triggers-mode silent --rlimit 40 counted_arith_forinit.rs
+    -> verification results:: 12 verified, 0 errors
+```
+
+**What is proved.** The ForInit runs the same counter trace as the
+init + while + trailing-step form; the +1 step advances the counter
+by exactly one. Mutant (accepting +2) red at 9v/3e. Executed tests
+6/6 PASS (all suites built live).
+
+## Running it
+
+Same toolchain as the P6/P7/P8 files (`--rlimit 40`).

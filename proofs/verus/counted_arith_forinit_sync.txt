@@ -1,0 +1,43 @@
+# verus-sync-coverage manifest: counted_arith_forinit
+# source sha: counted_arith_forinit=9e961939f940  proof sha: c9ef6ba6071e
+
+[pins]
+pin pin_continue_body_refuses -> test continue_in_body_vetoes: MAPPED
+pin pin_expr_step_normalizes -> test expr_incdec_step_recovers: MAPPED
+pin pin_incdec_step_folds -> test prefix_incdec_step_recovers: MAPPED
+pin pin_non_counter_cond_refuses -> test cond_not_reading_counter_vetoes: MAPPED
+pin pin_plus_one_step_folds -> test plus_one_assign_recovers: MAPPED
+pin pin_text_cond_refuses -> test shell_text_cond_left_alone: MAPPED
+pin pin_trace_agrees -> UNMIRRORED (by design — see VERUS.md §(b).4)
+pin pin_unit_gate_load_bearing -> UNMIRRORED (by design — see VERUS.md §(b).4)
+
+[guards]
+guard step gate: PRESENT
+guard IncDec one-gate: PRESENT
+guard += spelling: PRESENT
+guard Bin+ spelling: PRESENT
+guard cond-mention gate: PRESENT
+guard status veto: PRESENT
+guard no-write veto: PRESENT
+
+[counts]
+proof-fns: 10
+pins: 8
+# NOTE: proof-fns is a file-shape fact (change detector), NOT the
+# Verus obligation count — the gate asserts N verified separately.
+
+[exec]
+# Each MAPPED test above, EXECUTED against the live source (one
+# module-suite run per model; per-test verdicts grepped from output).
+# A mapped test that fails or vanishes from the run is drift — FATAL.
+# The checker RUNS each mapped test (one module-suite cargo test per
+# source file) and records the per-test PASS/FAIL verdict below.
+# all suites built; per-test verdicts below
+exec pin_continue_body_refuses (continue_in_body_vetoes): PASS
+exec pin_expr_step_normalizes (expr_incdec_step_recovers): PASS
+exec pin_incdec_step_folds (prefix_incdec_step_recovers): PASS
+exec pin_non_counter_cond_refuses (cond_not_reading_counter_vetoes): PASS
+exec pin_plus_one_step_folds (plus_one_assign_recovers): PASS
+exec pin_text_cond_refuses (shell_text_cond_left_alone): PASS
+exec pin_trace_agrees: UNMIRRORED (not executed)
+exec pin_unit_gate_load_bearing: UNMIRRORED (not executed)
