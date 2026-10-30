@@ -51,7 +51,34 @@ pub fn generate(prog: &IrProgram) -> String {
     collect_scalar_phase_vars(&prog.stmts, &mut scalar_phase);
     crate::ir::set_scalar_phase_vars(scalar_phase);
     let fixed = fixups(prog);
+    // A program that reads `$?` renders that read through the
+    // `$CHILD_ERROR` mirror; a program that MOVES the status through a
+    // variable (`$__ps_statusN = $CHILD_ERROR`) needs the mirror kept in
+    // step by every register write. Everything else reads the register
+    // directly and gets the clean form.
+    // Does the SOURCE test a status (`if cmd; then`, `[ "$?" = 0 ]`)? Then
+    // the register is read directly and must not be clobbered by a body
+    // statement's write.
+    let read_carrier = crate::perl_backend::stmts_read_status(&fixed.stmts)
+        || fixed.subs.iter().any(|sb| crate::perl_backend::stmts_read_status(&sb.body));
+    // The verdict cannot come from the IR alone: the process-substitution
+    // materialisation is a TEXT template, so its `$__ps_statusN =
+    // $CHILD_ERROR` save exists only after rendering. Render once with the
+    // mirror OFF, and if the body turns out to move the value through
+    // `$CHILD_ERROR`, render again with the mirror kept in step.
+    crate::ir::set_childe_error_carrier(false);
     let src = shir_to_perl(&fixed);
+    // A condition that runs a command (`if ps …; then`) READS the status
+    // through the register: the test's own `system()` set it, and the
+    // `$? = …` written by a body statement would clobber it.
+    let src = if src.contains("$CHILD_ERROR") || src.contains("($? >> 8)") && !read_carrier {
+        crate::ir::set_childe_error_carrier(true);
+        let again = shir_to_perl(&fixed);
+        crate::ir::set_childe_error_carrier(false);
+        again
+    } else {
+        src
+    };
     if std::env::var_os("SH2_DEBUG_PGFIX").is_some() {
         eprintln!("PGFIX-RENDERED:\n{src}");
     }

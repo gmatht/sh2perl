@@ -996,6 +996,24 @@ fn stmt_uses_say(stmt: &IrStmt) -> bool {
 /// migrate, the Generator emits real IR nodes and this renderer emits
 /// them as Perl; `from_raw_perl` becomes unnecessary when the Generator
 /// emits pure IR nodes. See PLAN.md §3 and `docs/ir-design.md`.
+thread_local! {
+    /// True while rendering a program that MOVES the status through
+    /// `$CHILD_ERROR` itself (the process-substitution save/restore). Only
+    /// then does the register write also refresh that mirror — otherwise the
+    /// source `$?` read is the register read `($? >> 8)` and the extra
+    /// assignment would be noise on every statement.
+    static CHILD_ERROR_CARRIER: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+fn childe_error_carrier() -> bool {
+    CHILD_ERROR_CARRIER.with(|c| c.get())
+}
+
+/// Install the carrier verdict for the render about to run.
+pub fn set_childe_error_carrier(v: bool) {
+    CHILD_ERROR_CARRIER.with(|c| c.set(v));
+}
+
 pub fn shir_to_perl(prog: &IrProgram) -> String {
     let mut out = String::new();
 
@@ -1894,11 +1912,25 @@ fn rc_write(write: &str) -> String {
             format!("({rc}) << 8")
         };
         let nl = if write.ends_with('\n') { "\n" } else { "" };
-        // The mirror `$CHILD_ERROR` (what a source `$?` read names, and what
-        // the process-substitution save/restore moves) tracks the register:
-        // a write that moved only the register would leave a later read
-        // stale (measured: `((i++)); echo "post=$?"` printed 0 for 1).
-        return format!("$? = {val}; $CHILD_ERROR = $? >> 8;{nl}");
+        // `$CHILD_ERROR` is what a source `$?` read names. A program whose
+        // status plumbing is self-contained (the common case) needs only the
+        // register — the read renders as `($? >> 8)`. A program that MOVES
+        // the value through a variable of its own (the process-substitution
+        // save/restore, `$__ps_statusN = $CHILD_ERROR`) needs the mirror
+        // kept in step, so those get both writes.
+        // A write that is already `$? >> 8` is DERIVED from the register
+        // (`system('bash', …)` just set it): assigning it back would read
+        // the value it is about to overwrite.
+        if rc.trim() == "$? >> 8" {
+            if childe_error_carrier() {
+                return format!("$CHILD_ERROR = $? >> 8;{nl}");
+            }
+            return String::new();
+        }
+        if childe_error_carrier() {
+            return format!("$? = {val}; $CHILD_ERROR = $? >> 8;{nl}");
+        }
+        return format!("$? = {val};{nl}");
     }
     write.to_string()
 }
@@ -1928,7 +1960,11 @@ fn rc_register_in_text(body: &str) -> String {
                 } else {
                     format!("({rc}) << 8")
                 };
-                out.push_str(&format!("$? = {val}; $CHILD_ERROR = $? >> 8;"));
+                if childe_error_carrier() {
+                    out.push_str(&format!("$? = {val}; $CHILD_ERROR = $? >> 8;"));
+                } else {
+                    out.push_str(&format!("$? = {val};"));
+                }
                 i = at + MARKER.len() + j + 1;
             }
             _ => {
@@ -4628,7 +4664,13 @@ fn var_read(name: &str) -> String {
         // and its restore write that variable directly, so the register is
         // not the only carrier. Every register write refreshes the mirror
         // (see `rc_write`) so the two cannot drift.
-        "?" => "$CHILD_ERROR".to_string(),
+        "?" => {
+            if childe_error_carrier() {
+                "$CHILD_ERROR".to_string()
+            } else {
+                "($? >> 8)".to_string()
+            }
+        }
         // `$!` — the pid of the most recent background job. The Background
         // arm writes it; without this arm the name fell through to the
         // generic branch and rendered `${!}` (an undefined Perl symbolic
