@@ -129,6 +129,7 @@ pub mod string_accumulator;
 pub mod test_simplification;
 pub mod else_if_flatten; // an `else` whose only statement is an `If` IS an `elif` — flatten it
 pub mod test_lowering; // glob-affix `[[ ]]` tests → strHasPrefix/strHasSuffix/contains (polyfill speedup, CROSS_BACKEND_RUNTIME.md §8.1)
+pub mod type_query; // `type NAME` → the answer for program-defined functions / true builtins
 pub mod echo_return; // pure-output "echo a value and return" functions → fnValue value-returning convention (CROSS_BACKEND_RUNTIME.md §8.3)
 pub mod loop_return_lift; // echo+return inside a loop → flag+break (makes strContainsAny/line_at echo-return-eligible)
 pub mod unreachable_after_exit; // PROVABLY-32-bit arith annotations
@@ -196,6 +197,8 @@ pub fn all() -> Vec<(&'static str, TransformFn)> {
         ("string-accumulator", string_accumulator::transform),
         ("test-simplification", test_simplification::transform),
         ("test-lowering", test_lowering::transform),
+        // `type NAME` → its answer for the names THIS program defines.
+        ("type-query", type_query::transform),
         // else-if flattening: `else { if c { … } }` → `elsifs`. Purely
         // structural; run before the backends so every renderer sees the
         // chain in the one shape it already handles.

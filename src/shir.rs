@@ -1072,6 +1072,17 @@ pub fn stmt_lastexit_write_is_dead(stmt: &IrStmt) -> bool {
 /// (only shapes it has a dead twin for); this is the general verdict.
 static LASTEXIT_UNREAD: Mutex<Option<HashSet<usize>>> = Mutex::new(None);
 
+/// Did the SOURCE language make its status unobservable (no `$?` read and
+/// no source status anywhere — see `exit_status_is_unobservable`)? Set by
+/// [`install_unread_status_writes`]; `None` means "no verdict yet", which
+/// readers must treat as observable.
+static SOURCE_STATUS_UNOBSERVABLE: Mutex<Option<bool>> = Mutex::new(None);
+
+/// Renderer-facing: the current source-status verdict, false when unset.
+pub fn source_status_unobservable() -> bool {
+    SOURCE_STATUS_UNOBSERVABLE.lock().unwrap().unwrap_or(false)
+}
+
 /// Install the general unread-status-write set (see [`LASTEXIT_UNREAD`]).
 /// Same pointer keys as [`LASTEXIT_DEAD`]: the caller MUST pass the exact
 /// `prog` it then renders.
@@ -1213,6 +1224,113 @@ pub fn stmt_status_write_is_unread(stmt: &IrStmt) -> bool {
         .as_ref()
         .map(|s| s.contains(&(stmt as *const IrStmt as usize)))
         .unwrap_or(false)
+}
+
+/// [`install_unread_status_writes`] for a caller that holds the statement
+/// list but no `IrProgram` (a renderer rewriting `stmts` in place, or a
+/// backend that inlined a sub-body). Same liveness walk, same pointer keys:
+/// the caller MUST then render exactly these slices.
+pub fn install_unread_status_writes_exit_live_stmts(
+    top: &[IrStmt],
+    sub_bodies: &[&[IrStmt]],
+    errexit: bool,
+) {
+    if errexit {
+        *LASTEXIT_UNREAD.lock().unwrap() = Some(HashSet::new());
+        return;
+    }
+    let mut live: HashSet<usize> = HashSet::new();
+    walk_lastexit_liveness(top, true, &mut live);
+    for body in sub_bodies {
+        walk_lastexit_liveness(body, true, &mut live);
+    }
+    let mut unread: HashSet<usize> = HashSet::new();
+    fn collect(stmts: &[IrStmt], live: &HashSet<usize>, unread: &mut HashSet<usize>) {
+        for st in stmts {
+            let key = st as *const IrStmt as usize;
+            if ir_stmt_writes_lastexit(st) && !live.contains(&key) {
+                unread.insert(key);
+            }
+            match st {
+                IrStmt::While { body, .. }
+                | IrStmt::DoWhile { body, .. }
+                | IrStmt::For { body, .. }
+                | IrStmt::Block(body) => collect(body, live, unread),
+                IrStmt::ForInit { init, step, body, .. } => {
+                    collect(init, live, unread);
+                    collect(step, live, unread);
+                    collect(body, live, unread);
+                }
+                IrStmt::If { then, elsifs, else_, .. } => {
+                    collect(then, live, unread);
+                    for (_, arm) in elsifs {
+                        collect(arm, live, unread);
+                    }
+                    collect(else_, live, unread);
+                }
+                IrStmt::Subshell(b) | IrStmt::Background(b) => collect(b, live, unread),
+                IrStmt::Redirect { inner, .. } => collect(inner, live, unread),
+                IrStmt::Pipeline { stages, .. } => {
+                    for st2 in stages {
+                        collect(st2, live, unread);
+                    }
+                }
+                IrStmt::Function { body, named_blocks, .. } => {
+                    collect(body, live, unread);
+                    for (_, nb) in named_blocks {
+                        collect(nb, live, unread);
+                    }
+                }
+                IrStmt::Try { body, excepts, else_body, finally_body, .. } => {
+                    collect(body, live, unread);
+                    for e in excepts {
+                        collect(&e.body, live, unread);
+                    }
+                    collect(else_body, live, unread);
+                    collect(finally_body, live, unread);
+                }
+                IrStmt::Case { clauses, .. } => {
+                    for c in clauses {
+                        collect(&c.body, live, unread);
+                    }
+                }
+                IrStmt::Select { clauses } => {
+                    for c in clauses {
+                        collect(&c.body, live, unread);
+                    }
+                }
+                _ => {}
+            }
+        }
+    }
+    collect(top, &live, &mut unread);
+    for body in sub_bodies {
+        collect(body, &live, &mut unread);
+    }
+    *LASTEXIT_UNREAD.lock().unwrap() = Some(unread);
+}
+
+/// [`stmt_status_write_is_unread`] for a caller that kept the raw POINTER KEY
+/// of a statement it no longer holds (a map built before the statement list
+/// was rebuilt). Conservative false when no verdict is installed.
+pub fn status_write_is_unread_key(key: usize) -> bool {
+    LASTEXIT_UNREAD
+        .lock()
+        .unwrap()
+        .as_ref()
+        .map(|s| s.contains(&key))
+        .unwrap_or(false)
+}
+
+/// Drop the status verdict before rendering a statement list out of band.
+///
+/// [`LASTEXIT_UNREAD`] is keyed by statement POINTER, so a verdict from an
+/// earlier compile whose statements are freed can point at a reused address.
+/// Clearing is conservative: nothing is reported unread, every status write
+/// is kept.
+pub fn clear_unread_status_writes() {
+    *LASTEXIT_UNREAD.lock().unwrap() = Some(HashSet::new());
+    *SOURCE_STATUS_UNOBSERVABLE.lock().unwrap() = Some(false);
 }
 
 
@@ -2636,6 +2754,46 @@ pub(crate) fn is_pure_test_chain(e: &IrExpr) -> bool {
                 && is_pure_test_chain(rhs))
                 || (matches!(op, BinOpKind::Not) && is_pure_test_chain(lhs))
         }
+        _ => false,
+    }
+}
+
+/// The operand shapes an `is_pure_bool` call may take: a value that carries
+/// no status of its own (variables, literals, and arithmetic over them).
+fn pure_bool_operand(x: &IrExpr) -> bool {
+    fn arith(a: &crate::ir::ArithAst) -> bool {
+        use crate::ir::ArithAst;
+        match a {
+            ArithAst::Num(_) | ArithAst::Var(_) | ArithAst::Ident(_) => true,
+            ArithAst::Bin { lhs, rhs, .. } => arith(lhs) && arith(rhs),
+            ArithAst::Un { arg, .. } => arith(arg),
+            _ => false,
+        }
+    }
+    match x {
+        IrExpr::Var(_, _) | IrExpr::Int(_) | IrExpr::Str(_, _) => true,
+        IrExpr::Arith(a) => arith(a),
+        _ => false,
+    }
+}
+
+/// Is `e` a boolean whose VALUE is all that matters — no status side effect
+/// a caller could observe? Extends [`is_pure_test_chain`] to the native
+/// string predicates and to `&&`/`||`/`!` built from them.
+pub(crate) fn is_pure_bool(e: &IrExpr) -> bool {
+    if is_pure_test_chain(e) {
+        return true;
+    }
+    match e {
+        IrExpr::Call { func, args } => {
+            matches!(func.as_str(), "strHasPrefix" | "strHasSuffix" | "contains")
+                && args.iter().all(pure_bool_operand)
+        }
+        IrExpr::BinOp { op, lhs, rhs } => match op {
+            BinOpKind::And | BinOpKind::Or => is_pure_bool(lhs) && is_pure_bool(rhs),
+            BinOpKind::Not => is_pure_bool(lhs),
+            _ => false,
+        },
         _ => false,
     }
 }
