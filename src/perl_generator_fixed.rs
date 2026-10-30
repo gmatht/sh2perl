@@ -206,9 +206,12 @@ fn post_pass(src: &str) -> String {
     let out = fix_eval_payload_expansion(&out);
     let out = fix_printf_bash_conversions(&out);
     let out = fix_printf_b_percent_b(&out);
-    let out = fix_pos_param_slice(&out);
-    let out = fix_print_concat_interp(&out);
+    // The output idioms run BEFORE the position-parameter slicing: that pass
+    // rewrites `$N` reads textually and can reformat a statement's tail,
+    // which left `print($result, "\n")` unchanged when it ran first.
     let out = fix_print_newline_to_say(&out);
+    let out = fix_print_concat_interp(&out);
+    let out = fix_pos_param_slice(&out);
     let out = fix_literal_pipeline_pipestatus(&out);
     // LAST: it must see the final text, and it only ever PREPENDS
     // declarations, so it cannot disturb what the earlier passes matched.
@@ -1458,7 +1461,7 @@ fn fix_print_concat_interp(src: &str) -> String {
             }
         }
         let open = at + CALL.len() - 1;
-        let Some(close) = matching_paren(rest, open) else {
+        let Some(close) = call_close(rest, open) else {
             out.push_str(&rest[..at + CALL.len()]);
             rest = &rest[at + CALL.len()..];
             continue;
@@ -1634,7 +1637,11 @@ fn fix_print_newline_to_say(src: &str) -> String {
             }
         }
         let open = at + CALL.len() - 1;
-        let Some(close) = matching_paren(rest, open) else {
+        // `print`/`say` take a FLAT list, so the call ends at the first `)`
+        // outside a string — a `)` inside a literal (`die "…: $!\n"`) is
+        // data, not structure. (A paren-depth walk is wrong here AND
+        // fragile: the renderer's own literals carry unbalanced `)`.)
+        let Some(close) = call_close(rest, open) else {
             out.push_str(&rest[..at + CALL.len()]);
             rest = &rest[at + CALL.len()..];
             continue;
@@ -1646,6 +1653,10 @@ fn fix_print_newline_to_say(src: &str) -> String {
                 // `say "Number: " . ($i)` is `say "Number: $i"`.
                 let head = match concat_chain_to_interp(head) {
                     Some(interp) => interp,
+                    // A single scalar/literal head needs no chain rewrite —
+                    // it is already an interpolating `say` operand, and
+                    // `print($x, "\n")` -> `say $x` is the whole point.
+                    None if is_plain_say_operand(head) => head.to_string(),
                     // NOT a safe chain: keep the parenthesised call. A bare
                     // `say ($k) . " => " . …` is parsed as `say(...)` fed the
                     // CONCATENATED result — Perl warns ("say (...) interpreted
@@ -1666,6 +1677,97 @@ fn fix_print_newline_to_say(src: &str) -> String {
             }
         }
     }
+}
+
+/// Is `head` a single value `say` can take bare?
+///
+/// Only when there is no top-level comma and no top-level operator that
+/// would bind differently: `say $x = 1` is an assignment, `say $x . "!"` is
+/// fine but is handled by the interpolation chain instead. Anything with a
+/// space-separated binary operator at depth 0 (`.`, `+`, `=`, `?:`, `//`, …)
+/// is left to `concat_chain_to_interp` so the shape never changes.
+fn is_plain_say_operand(head: &str) -> bool {
+    let t = head.trim();
+    if t.is_empty() || has_toplevel_comma(t) {
+        return false;
+    }
+    // A scalar/hash-element/array-element/bareword/literal, plus simple
+    // indexing and dereference sugar — no ` `, `.`, `+`, `=`, `?` at depth 0.
+    let mut depth = 0i32;
+    let mut in_str: Option<char> = None;
+    let mut esc = false;
+    for c in t.chars() {
+        if let Some(q) = in_str {
+            if esc {
+                esc = false;
+            } else if c == '\\' {
+                esc = true;
+            } else if c == q {
+                in_str = None;
+            }
+            continue;
+        }
+        match c {
+            '"' | '\'' | '`' => in_str = Some(c),
+            '(' | '[' | '{' => depth += 1,
+            ')' | ']' | '}' => depth -= 1,
+            ' ' | '.' | '+' | '-' | '*' | '/' | '%' | '=' | '?' | ':' | '|' | '&'
+            | '<' | '>' | '!' if depth == 0 => return false,
+            _ => {}
+        }
+    }
+    depth == 0 && in_str.is_none()
+}
+
+/// The `)` that closes a print/say call.
+///
+/// Bracket depth IS tracked (an argument may itself be a call or a grouped
+/// expression) but a quoted span is skipped whole — a `(` or `)` inside a
+/// literal (`die "capture: $!\n"`, `q{…}` shell text) is data, not
+/// structure. [`matching_paren`] can't be used here because it also has to
+/// understand `q{…}`/`qw(…)` literals, whose braces unbalance a plain walk.
+fn call_close(s: &str, open: usize) -> Option<usize> {
+    let b = s.as_bytes();
+    let mut depth = 0i32;
+    let mut i = open;
+    while i < b.len() {
+        match b[i] {
+            q @ (b'\'' | b'"' | b'`') => {
+                // Skip the whole quoted span, closing quote included: a `(`
+                // or `)` inside a literal is DATA (`die "capture: $!\n"`,
+                // `q{…}` shell text), not structure.
+                i += 1;
+                while i < b.len() && b[i] != b'\n' {
+                    if b[i] == b'\\' && q != b'\'' {
+                        i += 1;
+                    } else if b[i] == q {
+                        break;
+                    }
+                    i += 1;
+                }
+                // Only past the closer if there IS one: an unterminated
+                // literal runs to end-of-line, and this `+1` then used to
+                // swallow the following newline and desynchronise the scan
+                // for the rest of the source.
+                if i < b.len() && b[i] == q {
+                    i += 1;
+                }
+            }
+            b'(' => {
+                depth += 1;
+                i += 1;
+            }
+            b')' => {
+                depth -= 1;
+                if depth == 0 {
+                    return Some(i);
+                }
+                i += 1;
+            }
+            _ => i += 1,
+        }
+    }
+    None
 }
 
 /// A comma at bracket depth 0 outside a quoted string — a list separator.
@@ -2502,8 +2604,7 @@ fn matching_paren(s: &str, open: usize) -> Option<usize> {
         match b[i] {
             // Single-quoted, double-quoted, and backtick — a `'` inside a
             // double-quoted string is literal and must not end this one.
-            b'\'' | b'"' | b'`' => {
-                let q = b[i];
+            q @ (b'\'' | b'"' | b'`') => {
                 i += 1;
                 while i < b.len() && b[i] != b'\n' {
                     if b[i] == b'\\' && q != b'\'' {
@@ -2513,7 +2614,9 @@ fn matching_paren(s: &str, open: usize) -> Option<usize> {
                     }
                     i += 1;
                 }
-                i += 1;
+                if i < b.len() && b[i] == q {
+                    i += 1;
+                }
             }
             b'q' | b'Q' | b'w' => {
                 if matches!(b.get(i + 1), Some(b'{') | Some(b'(') | Some(b'[') | Some(b'<'))
