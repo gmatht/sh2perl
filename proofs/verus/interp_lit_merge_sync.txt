@@ -1,0 +1,40 @@
+# verus-sync-coverage manifest: interp_lit_merge
+# source sha: interp_lit_merge=bea2ec82bf20  proof sha: 4b8924345dc0
+
+[pins]
+pin pin_adjacent_lits_merge -> test merges_preexisting_adjacent_lits: MAPPED
+pin pin_command_style_refused -> test refuses_command_style: MAPPED
+pin pin_frozen_literal_folds_and_merges -> test folds_frozen_literal_expr_part_and_merges: MAPPED
+pin pin_heredoc_raw_refused -> test refuses_heredoc_and_raw_styles: MAPPED
+pin pin_merge_invisible_at_runtime -> UNMIRRORED (by design — see VERUS.md §(b).4)
+pin pin_middle_literal_merges -> test middle_literal_between_expr_parts_merges_after_the_fold: MAPPED
+pin pin_non_literal_untouched -> test refuses_non_literal_expr_and_is_idempotent: MAPPED
+
+[guards]
+guard part rewrite: PRESENT
+guard plain-quoting gate: PRESENT
+guard lit-merge append: PRESENT
+guard Command-style refusal: PRESENT
+guard Heredoc-style refusal: PRESENT
+guard Raw-style refusal: PRESENT
+
+[counts]
+proof-fns: 20
+pins: 7
+# NOTE: proof-fns is a file-shape fact (change detector), NOT the
+# Verus obligation count — the gate asserts N verified separately.
+
+[exec]
+# Each MAPPED test above, EXECUTED against the live source (one
+# module-suite run per model; per-test verdicts grepped from output).
+# A mapped test that fails or vanishes from the run is drift — FATAL.
+# The checker RUNS each mapped test (one module-suite cargo test per
+# source file) and records the per-test PASS/FAIL verdict below.
+# all suites built; per-test verdicts below
+exec pin_adjacent_lits_merge (merges_preexisting_adjacent_lits): PASS
+exec pin_command_style_refused (refuses_command_style): PASS
+exec pin_frozen_literal_folds_and_merges (folds_frozen_literal_expr_part_and_merges): PASS
+exec pin_heredoc_raw_refused (refuses_heredoc_and_raw_styles): PASS
+exec pin_merge_invisible_at_runtime: UNMIRRORED (not executed)
+exec pin_middle_literal_merges (middle_literal_between_expr_parts_merges_after_the_fold): PASS
+exec pin_non_literal_untouched (refuses_non_literal_expr_and_is_idempotent): PASS

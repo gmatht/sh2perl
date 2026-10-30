@@ -1885,3 +1885,36 @@ Executed tests 4/4 PASS (all suites built live).
 ## Running it
 
 Same toolchain as the P6/P7/P8 files (`--rlimit 40`).
+
+## interp-lit-merge — `interp_lit_merge.rs` (24)
+
+Per-site Tier-1 model over `transforms/interp_lit_merge.rs` (part
+canonicalization): a frozen-literal `Expr` part (DoubleQuoted |
+SingleQuoted) becomes `Lit`, then adjacent `Lit`s merge — the merged
+list denotes exactly the concat the original denoted
+(`merge_sound`, via `fold_exprs_sound` + `merge_lits_sound` over
+`Seq<Part>` with whole-seq cons lemmas). The style gate is data; the
+walkers and the per-backend rollout are placement. Six pins mirror
+the 7 source unit tests; the runtime-invisibility check is
+model-internal.
+
+### `interp_lit_merge.rs` — 24 obligations
+
+```
+    verus --triggers-mode silent --rlimit 40 interp_lit_merge.rs
+    -> verification results:: 24 verified, 0 errors
+```
+
+**What is proved.** Phase 1 preserves the denotation (a folded part
+denotes its text) and phase 2 preserves it (concat associativity at
+the seam, with the constructed-term projection asserts the solver
+needs). The denotation theorem holds even without the style gate
+(both sides append the same text), so the pin, not the lemma, is
+load-bearing — the slice_identity/exec_call_fold shape: the gates
+preserve renderer-visible semantics (unrendered substitutions, Perl
+`$`/`@` interpolation), not value. Mutant (Command style folds)
+red at 23v/1e. Executed tests 6/6 PASS (all suites built live).
+
+## Running it
+
+Same toolchain as the P6/P7/P8 files (`--rlimit 40`).

@@ -151,6 +151,20 @@ pub fn transform_applies(name: &str) -> bool {
         // targets keep their Not until their pairs are verified.
         // Unset target (the byte-pinned embed/A1 path) does not run it.
         "not-identity-flip" => matches!(target().as_deref(), Some("rs" | "rust")),
+        // interp-lit-merge (OFFER): per-backend rollout manifest, exactly
+        // like split-in-place/str-chop-cursor (C) and not-identity-flip
+        // (rust). The rewrite is renderer-agnostic and sound for every
+        // backend, but accepting it CHANGES each backend's output shape —
+        // measured: with it on, 5 core tests in three OTHER backends go red
+        // because their proxies assume the unfolded shape (rust expects a
+        // `println!` where it now emits a direct `print!`, estree expects a
+        // TemplateLiteral/a runtime bc `pipeline` where the word is now one
+        // constant and folds statically, zsh expects a quoted word). Those
+        // are stronger programs, not weaker ones, so the accepting backend
+        // updates its own pins when it joins — nobody's gate moves until
+        // they opt in. Unset target stays OFF: the byte-pinned A1-export /
+        // embed path keeps its exact bytes.
+        "interp-lit-merge" => matches!(target().as_deref(), Some("zig" | "rs" | "rust")),
         // case-lowering: the shared Case→if/elif string-test lowering.
         // Code-generating backends only — the shell-family targets
         // (sh/zsh/fish) render `case…esac` natively and idiomatically,
@@ -189,6 +203,7 @@ pub mod typeset_attrs; // `typeset -i VAR` integer attribute → later assignmen
 pub mod arith_identity; // OFFER (core-requests/transforms/offered/arith-identity)
 pub mod not_identity; // not-identity: fold double negation `!(!x)` → `x` (duplicated-consistent Nots only)
 pub mod const_str_cmp_fold; // const-str-cmp-fold: literal-vs-literal Eq/Ne → Bool (glob-metachar-free RHS only)
+pub mod interp_lit_merge; // OFFER (core-requests/transforms/offered/interp-lit-merge.rs): fold a frozen-literal Expr part in an Interpolate to Lit and merge adjacent Lits — one constant, one slot, for every backend
 pub mod arith_normalize; // frontend-shape normalisation (`0 - X` → `-X`); run by ingress, not the env-gated registry
 pub mod array_len_fold; // OFFER core-requests/transforms/offered/array-len-fold.rs: `${#arr[@]}` → arrayLen(arr)
 pub mod slice_identity; // OFFER core-requests/transforms/offered/slice-identity.rs: `${v:0}`/`${v:}` → the plain read param("", v)
@@ -493,6 +508,12 @@ pub fn all() -> Vec<(&'static str, TransformFn)> {
         // gate; the census in split_inplace was hardened for activation:
         // full read+write coverage, eval/unknown refusal.)
         ("split-in-place", crate::shir_passes::split_inplace::transform),
+        // interp-lit-merge (OFFER): runs right BEFORE decl-value-rejoin on
+        // purpose — that pass canonicalises a single-part Interpolate to a
+        // plain `Str`, so merging the parts first lets it fire on more words.
+        // Both folds that FREEZE a word (const-capture-fold,
+        // copy-propagation) are already behind us by this slot.
+        ("interp-lit-merge", interp_lit_merge::transform),
         // exec-call-fold, LAST (module doc "Placement"): every pass that
         // keys `IrStmt::Exec` by name (`arith-forms`' `let`, `for-recovery`,
         // `bc-float-clean`, `shir-pipeline-native`, `fuse-fill-consume`,
