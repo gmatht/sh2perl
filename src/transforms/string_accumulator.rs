@@ -267,30 +267,81 @@ pub fn acc_vars_tree(stmts: &[IrStmt]) -> Vec<String> {
                 IrStmt::Expr(e) => str_call_args(e, refused),
                 _ => {}
             }
-            match s {
-                IrStmt::While { body, .. } | IrStmt::For { body, .. } => {
-                    for v in self_append_vars(body) {
-                        if !candidates.contains(&v) {
-                            candidates.push(v);
-                        }
+            // A loop body is an accumulation scope: vars whose only writes
+            // there are self-appends are candidates.
+            if let IrStmt::While { body, .. }
+            | IrStmt::For { body, .. }
+            | IrStmt::DoWhile { body, .. }
+            | IrStmt::ForInit { body, .. } = s
+            {
+                for v in self_append_vars(body) {
+                    if !candidates.contains(&v) {
+                        candidates.push(v);
                     }
-                    walk(body, candidates, refused);
                 }
-                IrStmt::If {
-                    then,
-                    elsifs,
-                    else_,
-                    ..
-                } => {
-                    walk(then, candidates, refused);
-                    for (_, b) in elsifs {
-                        walk(b, candidates, refused);
-                    }
-                    walk(else_, candidates, refused);
-                }
-                IrStmt::Function { body, .. } => walk(body, candidates, refused),
-                _ => {}
             }
+            // Recurse through every list the node owns. One enumeration
+            // point on purpose: a container kind missing from `child_lists`
+            // hides every loop under it, and a hidden loop's accumulator is
+            // never tracked.
+            for b in child_lists(s) {
+                walk(b, candidates, refused);
+            }
+        }
+    }
+
+    /// Every statement list `s` owns — the complete recursion set of `walk`.
+    /// Exhaustive on purpose: a kind missing here hides every loop under it,
+    /// and a hidden loop's accumulator never reaches `acc_lens`. `Block` was
+    /// the missing one — MIMEcroft's `rb_dump_ppm` pixel loop sits in a
+    /// `{ … }` group holding the lowered C-style `for`, so `walk` never
+    /// entered it and `rbd_body` was rescanned with `strlen` on every append.
+    fn child_lists(s: &IrStmt) -> Vec<&[IrStmt]> {
+        match s {
+            IrStmt::ForInit {
+                init, step, body, ..
+            } => {
+                vec![init.as_slice(), step.as_slice(), body.as_slice()]
+            }
+            IrStmt::Function {
+                body, named_blocks, ..
+            } => {
+                let mut out: Vec<&[IrStmt]> = vec![body.as_slice()];
+                out.extend(named_blocks.iter().map(|(_, b)| b.as_slice()));
+                out
+            }
+            IrStmt::If {
+                then,
+                elsifs,
+                else_,
+                ..
+            } => {
+                let mut out: Vec<&[IrStmt]> = vec![then.as_slice(), else_.as_slice()];
+                out.extend(elsifs.iter().map(|(_, b)| b.as_slice()));
+                out
+            }
+            IrStmt::Try {
+                body,
+                else_body,
+                finally_body,
+                ..
+            } => vec![
+                body.as_slice(),
+                else_body.as_slice(),
+                finally_body.as_slice(),
+            ],
+            IrStmt::While { body, .. }
+            | IrStmt::For { body, .. }
+            | IrStmt::DoWhile { body, .. }
+            | IrStmt::Shaderize { body, .. }
+            | IrStmt::Subshell(body)
+            | IrStmt::Background(body)
+            | IrStmt::Block(body) => vec![body.as_slice()],
+            IrStmt::Redirect { inner, .. } => vec![inner.as_slice()],
+            IrStmt::Pipeline { stages, .. } => stages.iter().map(|v| v.as_slice()).collect(),
+            IrStmt::Case { clauses, .. } => clauses.iter().map(|c| c.body.as_slice()).collect(),
+            IrStmt::Select { clauses, .. } => clauses.iter().map(|c| c.body.as_slice()).collect(),
+            _ => Vec::new(),
         }
     }
 
