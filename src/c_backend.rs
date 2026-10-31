@@ -9405,6 +9405,111 @@ static int _sh_echo_fast(const char *cmd) {
 }
 "##;
 
+/// C source for the `wc -c < FILE` capture fast path — the RESIDUAL of
+/// the same shape the echo fold is the residual of: the command text
+/// only exists at run time (built by `_sh_bword`/`_sh_badd` around a
+/// `$var` target and handed to `_sh_capture`), so shIR sees no node a
+/// generic transform could fold it to — there is no file-size node in
+/// the IR — and only this backend can drop the exec. On MIMEcroft_fb.sh
+/// it is 19 of the 23 subprocesses a first-frame run forked (the
+/// texture-cache sizing loop, measured ~30% of the run's samples), so
+/// the fork is the cost, not the wc.
+///
+/// Only the SUCCESS shape is taken: an unreadable path (missing file, a
+/// fifo, a target with an expansion we do not model) returns 0 and bash
+/// runs `wc` itself, so its error text and exit status stay exactly as
+/// they were. SH2_NO_WCFAST=1 keeps the fork for every command (A/B).
+const WCCOUNT_FAST_C: &str = r##"/* `wc -c < FILE` (the emitter's `0<` form included) with a plain or
+ * `$var` target, read in process. Returns 1 with d filled and _sh_rc
+ * set when the command was that shape, 0 otherwise — the caller then
+ * popen()s unchanged. */
+static const char *_sh_env(const char *name); /* defined below */
+static int _sh_wcword(const char **pp, char *out, size_t cap) {
+  const char *p = *pp;
+  size_t n = 0;
+  while (*p == ' ' || *p == '\t') p++;
+  if (*p == '\'') {
+    p++;
+    for (;;) {
+      if (!*p) return 0;
+      if (*p == '\'') { p++; break; }
+      if (n + 1 >= cap) return 0;
+      out[n++] = *p++;
+    }
+  } else {
+    while (*p && *p != ' ' && *p != '\t') {
+      if (n + 1 >= cap) return 0;
+      out[n++] = *p++;
+    }
+  }
+  out[n] = 0;
+  *pp = p;
+  return 1;
+}
+static int _sh_wccount_fast(const char *cmd, _sh_vbuf *d) {
+  char w[64], path[4096], nb[32];
+  const char *p = cmd, *src = 0;
+  size_t n;
+  FILE *f;
+  long sz;
+  int k;
+  if (!cmd) return 0;
+  if (!_sh_wcword(&p, w, sizeof w) || strcmp(w, "wc") != 0) return 0;
+  if (!_sh_wcword(&p, w, sizeof w) || (strcmp(w, "-c") && strcmp(w, "--bytes"))) return 0;
+  while (*p == ' ' || *p == '\t') p++;
+  /* the input side only: `0<` (what `_sh_badd` emits) or `<` */
+  if (p[0] == '0' && p[1] == '<') p += 2;
+  else if (p[0] == '<') p += 1;
+  else return 0;
+  while (*p == ' ' || *p == '\t') p++;
+  if (*p == '"') {
+    /* `"$name"` — _sh_export put the value in the environment, so the
+     * variable resolves with no shell. The dollar-brace form is left
+     * to bash: a literal brace anywhere in this text unbalances the
+     * runtime trimmer's depth count and it cuts helpers mid-body. */
+    const char *q = p + 1;
+    if (*q++ != '$') return 0;
+    n = 0;
+    while (*q && *q != '"' && n + 1 < sizeof w) w[n++] = *q++;
+    w[n] = 0;
+    if (*q != '"') return 0; /* `"$a$b"` — an expansion we do not model */
+    p = q + 1;
+    src = _sh_env(w);
+    if (!*src) return 0; /* unset → let bash fail exactly as before */
+  } else {
+    n = 0;
+    if (*p == '\'') {
+      p++;
+      while (*p && *p != '\'' && n + 1 < sizeof path) path[n++] = *p++;
+      if (*p != '\'') return 0;
+      p++;
+    } else {
+      while (*p && *p != ' ' && *p != '\t' && n + 1 < sizeof path) path[n++] = *p++;
+    }
+    if (!n) return 0;
+    path[n] = 0;
+    src = path;
+  }
+  while (*p == ' ' || *p == '\t') p++;
+  if (*p) return 0; /* a second word, a pipe, a further redirect */
+  f = fopen(src, "rb");
+  if (!f) return 0;
+  if (fseek(f, 0, SEEK_END) != 0) { fclose(f); return 0; }
+  sz = ftell(f);
+  fclose(f);
+  if (sz < 0) return 0;
+  k = snprintf(nb, sizeof nb, "%ld", sz);
+  if (k <= 0 || (size_t)k >= sizeof nb) return 0;
+  {
+    char *dp = _sh_vgrow(d, (size_t)k + 1);
+    memcpy(dp, nb, (size_t)k);
+    dp[k] = 0;
+  }
+  _sh_rc = 0;
+  return 1;
+}
+"##;
+
 /// One piece of a direct string concatenation: a literal (raw source
 /// text, NUL-free by construction) or an already-rendered `char*` C
 /// argument. Used by the C backend's direct-concat arms (the snprintf
@@ -12728,6 +12833,15 @@ impl Render {
                     self.emit(l);
                 }
             }
+            // `wc -c < f` runs as a CAPTURE, so it reaches the helper
+            // below rather than `_sh_system_rc` — its fast path emits
+            // here and hooks the capture, not the run.
+            let wc_fast = std::env::var("SH2_NO_WCFAST").map(|v| v != "1").unwrap_or(true);
+            if wc_fast {
+                for l in WCCOUNT_FAST_C.lines() {
+                    self.emit(l);
+                }
+            }
             self.emit("static int _sh_system_rc(void) {");
             if echo_fast {
                 self.emit(
@@ -12744,6 +12858,9 @@ impl Render {
             self.emit("static void _sh_capture(_sh_vbuf *d, const char *cmd) {");
             self.emit("  char *dp = _sh_vgrow(d, 1); dp[0] = 0;");
             self.emit("  if (!cmd || !*cmd) { _sh_rc = 0; return; }");
+            if wc_fast {
+                self.emit("  if (_sh_wccount_fast(cmd, d)) return;");
+            }
             self.emit("  _sh_wrap_cmd(cmd);");
             self.emit("  FILE *p = popen(_sh_wrap, \"r\");");
             self.emit("  if (!p) { _sh_rc = 127; return; }");
