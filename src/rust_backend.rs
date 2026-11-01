@@ -3423,8 +3423,109 @@ impl Render {
         if s.is_empty() {
             self.out.push(String::new());
         } else {
-            self.out.push(format!("{}{}", "    ".repeat(self.depth), s));
+            let s = Self::strip_let_parens(s);
+            self.out.push(format!("{}{}", "    ".repeat(self.depth), &s));
         }
+    }
+
+    /// Strip a redundant paren pair from a `let NAME = (EXPR);` initializer.
+    ///
+    /// Every template that interpolates a rendered value can end up with
+    /// `let __k = (i + 1);` — the value's OWN precedence parens, which a
+    /// `let` (which takes any expression) never needs; rustc calls it
+    /// "unnecessary parentheses around assigned value". Doing it at the one
+    /// choke point every statement passes through covers every template
+    /// (and any added later) instead of a hunt for each emit site.
+    ///
+    /// Only a pair that opens right after `=` and closes right before `;`
+    /// is touched, and a top-level `,` (a tuple — `let (a, b) = (x, y);`
+    /// would become invalid) is refused, so the rewrite is valid for ANY
+    /// initializer.
+    fn strip_let_parens(text: &str) -> String {
+        let b = text.as_bytes();
+        if !text.contains("let ") {
+            return text.to_string();
+        }
+        let mut out = String::with_capacity(text.len());
+        let mut i = 0usize;
+        while i < b.len() {
+            let boundary = i == 0 || !(b[i - 1].is_ascii_alphanumeric() || b[i - 1] == b'_');
+            if boundary && text[i..].starts_with("let ") {
+                if let Some(op) = Self::let_paren_pair(text, i) {
+                    let (open, close) = op;
+                    out.push_str(&text[i..open]);
+                    out.push_str(text[open + 1..close].trim());
+                    i = close + 1;
+                    continue;
+                }
+            }
+            let ch = text[i..].chars().next().unwrap_or(' ');
+            out.push(ch);
+            i += ch.len_utf8();
+        }
+        out
+    }
+
+    /// The `(offset, close)` of a strippable initializer paren pair for the
+    /// `let` starting at `at`, or `None`.
+    fn let_paren_pair(text: &str, at: usize) -> Option<(usize, usize)> {
+        let b = text.as_bytes();
+        // skip `let `, then the binding (ident / mut / `_`), then `=`
+        let eq = text[at + 4..].find('=').map(|p| at + 4 + p)?;
+        // `==` / `=>` are not an assignment
+        if b.get(eq + 1) == Some(&b'=') || b.get(eq + 1) == Some(&b'>') {
+            return None;
+        }
+        let mut open = eq + 1;
+        while open < b.len() && b[open] == b' ' {
+            open += 1;
+        }
+        if open >= b.len() || b[open] != b'(' {
+            return None;
+        }
+        let mut depth = 0i32;
+        let mut in_str = false;
+        let mut esc = false;
+        let mut top_comma = false;
+        let mut j = open;
+        while j < b.len() {
+            let c = b[j];
+            if in_str {
+                if esc {
+                    esc = false;
+                } else if c == b'\\' {
+                    esc = true;
+                } else if c == b'"' {
+                    in_str = false;
+                }
+                j += 1;
+                continue;
+            }
+            match c {
+                b'"' => in_str = true,
+                b'(' | b'[' | b'{' => depth += 1,
+                b')' | b']' | b'}' => {
+                    depth -= 1;
+                    if depth == 0 {
+                        if c != b')' || top_comma {
+                            return None;
+                        }
+                        let mut k = j + 1;
+                        while k < b.len() && b[k] == b' ' {
+                            k += 1;
+                        }
+                        if k < b.len() && b[k] == b';' {
+                            return Some((open, j));
+                        }
+                        return None;
+                    }
+                }
+                b',' if depth == 1 => top_comma = true,
+                _ => {}
+            }
+            j += 1;
+        }
+        None
     }
 
     fn mark_todo(&mut self, what: &str) {
@@ -3816,6 +3917,25 @@ impl Render {
             }
         }
         s
+    }
+
+    /// [`Self::unparen`] applied until it stops changing.
+    ///
+    /// A CONDITION takes any expression, so every enclosing pair is pure
+    /// text there — and the renderer can stack two (a glob test renders
+    /// `(__sh_fnmatch(…))` and the case chain adds another), which rustc
+    /// reports as "unnecessary parentheses around `if` condition" at 4
+    /// corpus sites. Only used where a tuple cannot appear (a condition is
+    /// bool), so stripping repeatedly cannot merge arguments.
+    fn unparen_deep(s: &str) -> &str {
+        let mut cur = s;
+        loop {
+            let next = Self::unparen(cur);
+            if next.len() == cur.len() {
+                return cur;
+            }
+            cur = next;
+        }
     }
 
     /// True when `s` binds tighter than any operator: no top-level infix
@@ -4930,7 +5050,13 @@ impl Render {
                 "0" => "std::env::args().next().unwrap_or_default()".to_string(),
                 "!" => {
                     // empty until a background job starts (bash's $!)
-                    "{{ let __p = __SH_BGPID.load(Ordering::SeqCst); if __p == 0 {{ String::new() }} else {{ __p.to_string() }} }}".to_string()
+                    // SINGLE braces: this is a plain `String` — a VALUE other
+                    // templates splice in with `{}`, never a `format!`
+                    // template of its own — so `{{`/`}}` were emitted
+                    // verbatim and rustc reported the doubled block
+                    // ("unnecessary braces around block return value", 4
+                    // corpus sites: `*v.borrow_mut() = {{ let __p = … }}`).
+                    "{ let __p = __SH_BGPID.load(Ordering::SeqCst); if __p == 0 { String::new() } else { __p.to_string() } }".to_string()
                 }
                 "RANDOM" => {
                     self.add_helper("rand");
@@ -6223,7 +6349,7 @@ impl Render {
                 match op.as_str() {
                     "**" => {
                         self.add_helper("pow");
-                        format!("__sh_pow({l},{r})")
+                        format!("__sh_pow({},{})", Self::let_value(&l), Self::let_value(&r))
                     }
                     "&&" => format!("(({l} != 0 && {r} != 0) as i64)"),
                     "||" => format!("(({l} != 0 || {r} != 0) as i64)"),
@@ -6269,11 +6395,11 @@ impl Render {
                     ),
                     "/" => {
                         self.add_helper("div");
-                        format!("__sh_div({l},{r})")
+                        format!("__sh_div({},{})", Self::let_value(&l), Self::let_value(&r))
                     }
                     "%" => {
                         self.add_helper("mod");
-                        format!("__sh_mod({l},{r})")
+                        format!("__sh_mod({},{})", Self::let_value(&l), Self::let_value(&r))
                     }
                     _ => format!(
                         "({} {op} {})",
@@ -9872,7 +9998,7 @@ impl Render {
                     IrExpr::Call { func, args } if func == "test" => self.test_call_bool(args),
                     _ => self.expr_bool(c),
                 };
-                self.emit(&format!("if {} {{", Self::unparen(&b)));
+                self.emit(&format!("if {} {{", Self::unparen_deep(&b)));
                 self.depth += 1;
             }
             // push elem
@@ -11462,7 +11588,7 @@ impl Render {
                     // num-var: `[ "$i" = "2" ] && echo` inside a loop whose
                     // exit status is read afterwards).
                     if self.rc_disabled || crate::shir::stmt_status_write_is_unread(s) {
-                        self.emit(&format!("if {} {{", Self::unparen(&l)));
+                        self.emit(&format!("if {} {{", Self::unparen_deep(&l)));
                     } else {
                         let unw = Self::unwrap_cond(&l);
                         let core = Self::unparen(&unw);
@@ -12031,7 +12157,7 @@ impl Render {
                             inlined = true;
                         }
                     } else {
-                        self.emit(&format!("if {} {{", Self::unparen(&c)));
+                        self.emit(&format!("if {} {{", Self::unparen_deep(&c)));
                         self.depth += 1;
                         for s in then {
                             self.stmt(s);
@@ -12039,7 +12165,7 @@ impl Render {
                         self.depth -= 1;
                         for (ec, body) in elsifs {
                             let ec = Self::unwrap_cond(&self.expr_bool(ec));
-                            self.emit(&format!("}} else if {} {{", Self::unparen(&ec)));
+                            self.emit(&format!("}} else if {} {{", Self::unparen_deep(&ec)));
                             self.depth += 1;
                             for s in body {
                                 self.stmt(s);
@@ -12063,7 +12189,7 @@ impl Render {
                         }
                     }
                 } else {
-                    self.emit(&format!("if {} {{", Self::unparen(&c)));
+                    self.emit(&format!("if {} {{", Self::unparen_deep(&c)));
                     self.depth += 1;
                     for s in then {
                         self.stmt(s);
@@ -12071,7 +12197,7 @@ impl Render {
                     self.depth -= 1;
                     for (ec, body) in elsifs {
                         let ec = Self::unwrap_cond(&self.expr_bool(ec));
-                        self.emit(&format!("}} else if {} {{", Self::unparen(&ec)));
+                        self.emit(&format!("}} else if {} {{", Self::unparen_deep(&ec)));
                         self.depth += 1;
                         for s in body {
                             self.stmt(s);
@@ -12145,7 +12271,7 @@ impl Render {
                 // the idiomatic spelling of a condition that is always
                 // true, and it is the same program (a plain `break` leaves
                 // both as `()`).
-                let c = Self::unparen(&c);
+                let c = Self::unparen_deep(&c);
                 if c == "true" {
                     self.emit("loop {");
                 } else {
@@ -12777,10 +12903,10 @@ impl Render {
                         format!("({})", pats.join(" || "))
                     };
                     if first {
-                        self.emit(&format!("if {} {{", Self::unparen(&cond)));
+                        self.emit(&format!("if {} {{", Self::unparen_deep(&cond)));
                         first = false;
                     } else {
-                        self.emit(&format!("}} else if {cond} {{"));
+                        self.emit(&format!("}} else if {} {{", Self::unparen_deep(&cond)));
                     }
                     self.depth += 1;
                     for s in &c.body {
@@ -12867,7 +12993,7 @@ impl Render {
                 // the idiomatic spelling of a condition that is always
                 // true, and it is the same program (a plain `break` leaves
                 // both as `()`).
-                let c = Self::unparen(&c);
+                let c = Self::unparen_deep(&c);
                 if c == "true" {
                     self.emit("loop {");
                 } else {
@@ -21043,6 +21169,50 @@ mod tests {
             assert!(!out.contains("TODO"), "CutAt left a TODO:\n{out}");
             assert!(!out.contains("fnmatch"), "glob helper dragged in:\n{out}");
         }
+    }
+
+    /// `strip_let_parens` runs at the ONE choke point every statement
+    /// passes, so a template that interpolates a parenthesized value loses
+    /// the pair without hunting each emit site: `let __k = (i + 1);` →
+    /// `let __k = i + 1;`.
+    #[test]
+    fn let_initializer_parens_are_stripped() {
+        assert_eq!(Render::strip_let_parens("let __k = (i + 1);"), "let __k = i + 1;");
+        assert_eq!(
+            Render::strip_let_parens("let mut x = (a * (b + c));"),
+            "let mut x = a * (b + c);"
+        );
+        // a TUPLE initializer must keep its parens (stripping would change
+        // the meaning: destructuring pattern vs a 2-element expression)
+        assert_eq!(
+            Render::strip_let_parens("let (a, b) = (x, y);"),
+            "let (a, b) = (x, y);"
+        );
+        // a comma inside a CALL is not top-level
+        assert_eq!(
+            Render::strip_let_parens("let s = (format!(\"{}, {}\", a, b));"),
+            "let s = format!(\"{}, {}\", a, b);"
+        );
+        // `==` is a comparison, not the binding's `=`
+        assert_eq!(
+            Render::strip_let_parens("let b = (a == b);"),
+            "let b = a == b;"
+        );
+        // and only a `let` takes the rewrite: an argument keeps its pair
+        assert_eq!(
+            Render::strip_let_parens("f((a + b), c);"),
+            "f((a + b), c);"
+        );
+    }
+
+    /// A CONDITION takes any expression, so stacked pairs are pure text
+    /// there — the renderer can produce two (a glob test plus the case
+    /// chain), and `unparen` strips only one.
+    #[test]
+    fn unparen_deep_strips_stacked_pairs() {
+        assert_eq!(Render::unparen_deep("((x))", ), "x");
+        assert_eq!(Render::unparen_deep("(a && (b || c))"), "a && (b || c)");
+        assert_eq!(Render::unparen_deep("a && b"), "a && b");
     }
 
     /// A condition that is always true renders as `loop {`: `while true`
