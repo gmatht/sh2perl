@@ -16933,13 +16933,27 @@ mod tests {
         ]}"##;
         let prog = crate::shir_json_in::shir_json_to_ir(src).expect("gated-preamble A1 ingress");
         let perl = shir_to_perl(&prog);
-        // needed (echo + shopt reference the status trackers, shopt needs
-        // the nocasematch flag); the argc snapshot is NOT: `$#` reads live
-        // scalar(@ARGV), so a `my $__argc` here would be dead boilerplate.
-        assert!(perl.contains("my $main_exit_code = 0;"), "{perl}");
-        assert!(perl.contains("our $CHILD_ERROR = 0;"), "{perl}");
+        // needed: `shopt` lowers against the nocasematch flag.
+        //
+        // NOT needed — each of these is exactly the dead boilerplate this
+        // test exists to keep out:
+        //   - the argc snapshot: `$#` reads live scalar(@ARGV), so a
+        //     `my $__argc` here would be dead;
+        //   - the status trackers: since the `$?`-register work the status
+        //     IS Perl's own `$?` (`rc_write` spells a write `$? = rc << 8`),
+        //     so a body that only writes the register mentions neither
+        //     `$main_exit_code` nor `$CHILD_ERROR`. Declaring either would
+        //     be boilerplate nothing reads — the `$CHILD_ERROR` mirror is
+        //     added only for a program that MOVES the status through a
+        //     variable of its own (see `childe_error_carrier`).
         assert!(!perl.contains("my $__argc = @ARGV;"), "{perl}");
+        assert!(!perl.contains("my $main_exit_code"), "{perl}");
+        assert!(!perl.contains("our $CHILD_ERROR"), "{perl}");
         assert!(perl.contains("my $__nocasematch = 0;"), "{perl}");
+        assert!(
+            perl.contains("$? = 0 << 8;"),
+            "status written as the register: {perl}"
+        );
         // dead on the IR path — never declared
         assert!(!perl.contains("my $ls_success"), "{perl}");
         assert!(!perl.contains("my $output"), "{perl}");
@@ -17172,9 +17186,13 @@ mod tests {
 
     #[test]
     fn embed_collapses_main_exit_writes() {
-        // an external command lowers to system('bash','-c',…); the standalone
-        // status tracker ($main_exit_code) is dead in an embed — the write is
-        // collapsed to the $CHILD_ERROR mirror, and CHILD_ERROR is declared
+        // An external command lowers to system('bash','-c',…). The standalone
+        // status tracker ($main_exit_code) is dead in an embed, and since the
+        // `$?`-register work neither is the `$CHILD_ERROR` MIRROR: `system`
+        // already leaves the child's wait status in `$?`, so the fragment
+        // needs no tracker and no mirror — the host reads `$?` directly.
+        // What an embed must never do is push a file/package-scoped variable
+        // of its own into the host, which is what this pins.
         let src = "grep foo /tmp/nonexistent || echo no";
         let r = render(src, &[]);
         assert!(
@@ -17189,13 +17207,19 @@ mod tests {
             r.fragment
         );
         assert!(
-            r.fragment.contains("our $CHILD_ERROR = 0;"),
-            "CHILD_ERROR declared in fragment: {}",
+            !r.fragment.contains("$CHILD_ERROR"),
+            "no status mirror in an embed (the register carries it): {}",
             r.fragment
         );
         assert!(
-            r.fragment.contains("$CHILD_ERROR = $? >> 8"),
-            "status mirror kept: {}",
+            !r.fragment.contains("our $") && !r.fragment.contains("my $"),
+            "an embed must not declare its own variables: {}",
+            r.fragment
+        );
+        // The status still reaches the host: the shell-out sets `$?`.
+        assert!(
+            r.fragment.contains("system("),
+            "shell-out kept: {}",
             r.fragment
         );
     }
