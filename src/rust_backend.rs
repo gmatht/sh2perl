@@ -3441,6 +3441,22 @@ impl Render {
     /// is touched, and a top-level `,` (a tuple — `let (a, b) = (x, y);`
     /// would become invalid) is refused, so the rewrite is valid for ANY
     /// initializer.
+    /// The attribute line a USER-defined function needs.
+    ///
+    /// Shell names are not Rust identifiers' conventions (`exitScript`,
+    /// `INFO`, `test`), and an uncalled definition is legal shell — both are
+    /// the SOURCE's shape, not ours to rename or delete (v104's cobra
+    /// lesson: `typeset -f` prints the definition). `dead_code` is waived
+    /// only for these: the pipeline's own helpers keep it, so an orphaned
+    /// runtime helper still shows up.
+    fn fn_attr(name: &str) -> String {
+        if name.chars().any(|c| c.is_ascii_uppercase()) {
+            "#[allow(non_snake_case, dead_code)]".to_string()
+        } else {
+            "#[allow(dead_code)]".to_string()
+        }
+    }
+
     fn strip_let_parens(text: &str) -> String {
         let b = text.as_bytes();
         if !text.contains("let ") {
@@ -13569,8 +13585,17 @@ impl Render {
                     params.push("__argv: &[String]".to_string());
                 }
                 let ret = if value_used { " -> String" } else { "" };
+                // A shell function name is the USER's (`exitScript`, `INFO`,
+                // `test`) and must survive verbatim: callers use it and
+                // `typeset -f`/`declare -f` print it. A definition may also be
+                // legitimately uncalled (bash permits it, and `declare -f`
+                // can still print it), which is exactly why dead_fn_elim
+                // refuses to drop it. Both lints are therefore silenced at
+                // the definition instead of by renaming the function.
+                self.emit(&Self::fn_attr(&m));
                 self.emit(&format!("fn {m}({}){ret} {{", params.join(", ")));
             } else {
+                self.emit(&Self::fn_attr(&m));
                 self.emit(&format!("fn {m}() {{"));
             }
             self.depth += 1;
@@ -14268,41 +14293,45 @@ fn helper_source(h: &str) -> &'static str {
                 let left = flags.contains('-');
                 let zero = flags.contains('0');
                 let p = prec.as_ref().map(|s| s.parse().unwrap_or(0)).unwrap_or(-1);
-                let mut piece = String::new();
-                match conv {
+                // The match IS the initializer: every arm produced a value,
+                // so `let mut piece = String::new();` was a dead store that
+                // rustc flagged once per arm ("value assigned to `piece` is
+                // never read", 9 corpus sites — the helper is emitted once
+                // per program that uses printf).
+                let mut piece = match conv {
                     's' => {
-                        piece = arg.clone();
-                        if p >= 0 { piece = piece.chars().take(p as usize).collect(); }
+                        let t = arg.clone();
+                        if p >= 0 { t.chars().take(p as usize).collect() } else { t }
                     }
                     'b' => {
-                        piece = __sh_printf_b(&arg);
-                        if p >= 0 { piece = piece.chars().take(p as usize).collect(); }
+                        let t = __sh_printf_b(&arg);
+                        if p >= 0 { t.chars().take(p as usize).collect() } else { t }
                     }
-                    'q' => { piece = __sh_q_printf(&arg); }
-                    'c' => { piece = arg.chars().next().map(|c| c.to_string()).unwrap_or_default(); }
-                    'd' | 'i' => { piece = format!("{}", __sh_atoi(&arg)); }
-                    'u' => { piece = format!("{}", __sh_atou(&arg)); }
-                    'o' => { piece = format!("{:o}", __sh_atou(&arg)); }
-                    'x' => { piece = format!("{:x}", __sh_atou(&arg)); }
-                    'X' => { piece = format!("{:X}", __sh_atou(&arg)); }
+                    'q' => __sh_q_printf(&arg),
+                    'c' => arg.chars().next().map(|c| c.to_string()).unwrap_or_default(),
+                    'd' | 'i' => format!("{}", __sh_atoi(&arg)),
+                    'u' => format!("{}", __sh_atou(&arg)),
+                    'o' => format!("{:o}", __sh_atou(&arg)),
+                    'x' => format!("{:x}", __sh_atou(&arg)),
+                    'X' => format!("{:X}", __sh_atou(&arg)),
                     'f' | 'F' => {
                         let fv = __sh_atof(&arg);
                         let p2 = if p < 0 { 6 } else { p as usize };
-                        piece = format!("{:.*}", p2, fv);
+                        format!("{:.*}", p2, fv)
                     }
                     'e' | 'E' => {
                         let fv = __sh_atof(&arg);
                         let p2 = if p < 0 { 6 } else { p as usize };
-                        piece = format!("{:.*e}", p2, fv);
-                        if conv == 'E' { piece = piece.to_uppercase(); }
+                        let s = format!("{:.*e}", p2, fv);
+                        if conv == 'E' { s.to_uppercase() } else { s }
                     }
                     'g' | 'G' => {
                         let fv = __sh_atof(&arg);
                         let p2 = if p < 0 { 6 } else { p as usize };
-                        piece = format!("{:.*}", p2, fv);
+                        format!("{:.*}", p2, fv)
                     }
-                    _ => { piece = arg.clone(); }
-                }
+                    _ => arg.clone(),
+                };
                 if w > piece.chars().count() {
                     let pad = w - piece.chars().count();
                     if left { piece = format!("{}{}", piece, " ".repeat(pad)); }
