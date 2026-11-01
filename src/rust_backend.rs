@@ -4309,7 +4309,13 @@ impl Render {
     }
 
     fn read_num_of_str(&mut self, name: &str) -> String {
-        format!("{}.trim().parse::<i64>().unwrap_or(0)", self.read_str(name))
+        // `read_str` yields an OWNED value (a `clone()` for a plain local),
+        // but every consumer here is `.trim()`, which only BORROWS — so the
+        // clone is a wasted allocation at every numeric read of a
+        // string-homed var (`[ "$x" -gt 3 ]` on an argv-derived local:
+        // `x.clone().trim().parse::<i64>()` → `x.trim().parse::<i64>()`).
+        let s = Self::drop_trailing_clone(&self.read_str(name));
+        format!("{s}.trim().parse::<i64>().unwrap_or(0)")
     }
 
     fn read_arr(&mut self, name: &str) -> String {
@@ -5990,6 +5996,11 @@ impl Render {
                         .expect("tag/type agree");
                     self.affix_strip_str(x)
                 }
+                "CutAt" => {
+                    let x = n.as_any().downcast_ref::<crate::shir_nodes::CutAt>()
+                        .expect("tag/type agree");
+                    self.cut_at_str(x)
+                }
                 _ => "String::new()".into(),
             }
         }
@@ -6020,6 +6031,38 @@ impl Render {
                 )
             }
         }
+    }
+
+    /// `CutAt(text, delim, head, first)` — cut at ONE occurrence of a
+    /// magic-free literal delimiter, so the glob engine is never needed.
+    /// The four single-star strip identities (`shir_nodes/cut_at.node`):
+    ///
+    /// ```text
+    ///   head,  first   ${v%%lit*}   head before the FIRST occurrence
+    ///   head, !first   ${v%lit*}    head before the LAST  occurrence
+    ///  !head, first    ${v#*lit}    tail after   the FIRST occurrence
+    ///  !head, !first   ${v##*lit}   tail after   the LAST  occurrence
+    /// ```
+    ///
+    /// Each follows from glob semantics (`*` matches the empty string; a
+    /// shortest/longest match picks the cut point), and a pattern that does
+    /// not match leaves the text unchanged — bash's strip is a no-op then.
+    /// `affix-strip-fold` offers this node to the `rs`/`c` targets only, so
+    /// an unrendered arm would leave a TODO where bash prints the field.
+    fn cut_at_str(&mut self, x: &crate::shir_nodes::CutAt) -> String {
+        let t = self.expr_str(&x.text);
+        let d = Self::rust_str(&x.delim);
+        let finder = if x.first { "find" } else { "rfind" };
+        // `head` keeps everything BEFORE the cut point; the tail form keeps
+        // everything AFTER the delimiter itself (`__i + __d.len()`).
+        let slice = if x.head {
+            "__s[..__i].to_string()"
+        } else {
+            "__s[__i + __d.len()..].to_string()"
+        };
+        format!(
+            "{{ let __s: String = {t}; let __d: &str = {d}; match __s.{finder}(__d) {{ Some(__i) => {slice}, None => __s }} }}"
+        )
     }
 
     /// String interpolation: "hello $name" → format!(...) (String).
@@ -7807,6 +7850,11 @@ impl Render {
                 let x = n.as_any().downcast_ref::<crate::shir_nodes::AffixStrip>()
                     .expect("tag/type agree");
                 format!("vec![{}]", self.affix_strip_str(x))
+            }
+            IrExpr::Ext(n) if n.tag() == "CutAt" => {
+                let x = n.as_any().downcast_ref::<crate::shir_nodes::CutAt>()
+                    .expect("tag/type agree");
+                format!("vec![{}]", self.cut_at_str(x))
             }
             other => {
                 self.mark_todo(&format!("word {:?}", other));
@@ -10093,6 +10141,14 @@ impl Render {
                 self.is_int_array(var)
                     || (self.is_local_array(var) && self.local_array_is_int(var))
             }
+            // A ONE-part interpolation (`"$n"` — the parser's shape for a
+            // quoted lone expansion) is exactly the expression it wraps, so
+            // it inherits the verdict: `echo "$n"` printed
+            // `n.to_string()` while `echo "n=$n"` printed `n`, purely
+            // because the first arrives wrapped.
+            IrExpr::Interpolate(parts) => {
+                matches!(parts.as_slice(), [InterpPart::Expr(x)] if self.word_is_numeric(x))
+            }
             IrExpr::Call { func, args } if func == "getVar" => {
                 matches!(args.first(), Some(IrExpr::Str(n, _)) if self.is_num(n))
             }
@@ -11725,7 +11781,18 @@ impl Render {
                 // A single INTEGER-valued echo (EchoFold's numeric arm):
                 // print the number itself — `{}` formats it, so the
                 // `.to_string()` a word list would force is pure waste.
-                if self.sink_free_here() && crate::shir_passes::echo_fold::numeric_word(value) {
+                //
+                // `numeric_word` is the TARGET-FREE verdict (literals, arith,
+                // lengths); a numerically-homed VARIABLE is only visible to
+                // the renderer, and it is the common shape — `echo $n` on a
+                // var never assigned text. Without the second test the word
+                // list rendered `vec![n.to_string()]`, which the inlining pass
+                // then collapsed to `println!("{}", n.to_string())`: a
+                // needless allocation for a number that `{}` formats as-is.
+                if self.sink_free_here()
+                    && (crate::shir_passes::echo_fold::numeric_word(value)
+                        || self.word_is_numeric(value))
+                {
                     let v = self.expr_num(value);
                     let mac = if *newline { "println!" } else { "print!" };
                     self.emit(&format!("{mac}(\"{{}}\", {});", Self::drop_trailing_clone(&v)));
@@ -11826,13 +11893,19 @@ impl Render {
                     let mut alt: &[IrStmt] = if truth { &[] } else { else_ };
                     let mut all_const = true;
                     if !truth {
-                        let mut resolved = false;
                         for (ec, body) in elsifs {
                             let e = Self::unwrap_cond(&self.expr_bool(ec));
                             match const_cond_truth(&e) {
                                 Some(true) => {
+                                    // THIS arm is the one that runs, so every
+                                    // later `elsif` and the `else` are
+                                    // unreachable. `alt` still holds the
+                                    // `else` body — clear it, or both branches
+                                    // are spliced inline and BOTH run (a
+                                    // const-subject `case` printed its matching
+                                    // arm and its `*` arm back to back).
                                     taken = body;
-                                    resolved = true;
+                                    alt = &[];
                                     break;
                                 }
                                 Some(false) => continue,
@@ -11842,7 +11915,6 @@ impl Render {
                                 }
                             }
                         }
-                        let _ = resolved;
                     }
                     if all_const {
                         // Emit only what runs: the taken branch inline, and
@@ -15009,6 +15081,28 @@ fn fn_body_line_text(r: &mut Render, s: &IrStmt) -> String {
                 }
             }
             format!("{kw} {out}")
+        }
+        // `echo …` is folded to the native `Output` statement (`echo_fold`),
+        // but bash's `typeset -f` / `declare -f` prints the DEFINITION, so
+        // put the `echo` back — without this arm a folded echo displayed as
+        // an empty line (`typeset-cmdsub` printed `    ;` where bash prints
+        // `    echo "Inside myfunc";`).
+        IrStmt::Output {
+            value,
+            newline,
+            target: None,
+        } => {
+            let t = word_text(value);
+            let shown = if t.contains(' ') || t.contains('$') {
+                format!("\"{t}\"")
+            } else {
+                t
+            };
+            if *newline {
+                format!("echo {shown}")
+            } else {
+                format!("echo -n {shown}")
+            }
         }
         _ => String::new(),
     }
@@ -20681,11 +20775,22 @@ mod tests {
         // the function is called for its side effect only, so its value
         // home is not emitted either (see fn_value_used)
         assert!(!out.contains("__SH_RET"), "unused value home kept:\n{out}");
-        // …but a redirect INSIDE the function body keeps the runtime: the
-        // sink state is program-global, so the definition's location does
-        // not matter.
+        // …a redirect inside the body with a LITERAL path lowers to a bare
+        // write, so it needs no sink either (and the definition's location
+        // still does not matter to the program-wide verdict).
         let redir = render("f() { echo \"in-func\" > /tmp/sh2_fn_probe.txt; }\nf\n");
-        assert!(redir.contains("__SH_OUTFILE_TL"), "{redir}");
+        assert!(
+            redir.contains(r#"std::fs::write("/tmp/sh2_fn_probe.txt".to_string(), "in-func\n".to_string())"#),
+            "{redir}"
+        );
+        // …but a body redirect whose PATH is only known at run time keeps
+        // the runtime: the sink state is program-global, so the function's
+        // location does not matter.
+        let dyn_redir = render("f() { echo \"in-func\" > \"$1\"; }\nf\n");
+        assert!(
+            dyn_redir.contains("__SH_OUTFILE_TL"),
+            "{dyn_redir}"
+        );
     }
 
     /// A redirect ANYWHERE in the program used to make every constant
@@ -20747,11 +20852,101 @@ mod tests {
         let out = render("exit 3\n");
         assert!(out.contains("std::process::exit(3)"), "{out}");
         assert!(!out.contains("as i32"), "needless cast kept:\n{out}");
-        let dyn_exit = render("x=1\nexit $((x+1))\n");
+        // A value only known at RUN time is an i64, so the i32 narrowing is
+        // required (`x=1` above would const-fold to `exit 2`, which needs no
+        // cast — a literal is exactly the case the title says drops it).
+        let dyn_exit = render("x=$1\nexit $((x+1))\n");
         assert!(
             dyn_exit.contains("as i32"),
             "computed exit code lost its cast:\n{dyn_exit}"
         );
+    }
+
+    /// Render with the `rs` target selected, so target-gated folds apply the
+    /// way they do in a CLI run. `affix-strip-fold` deliberately refuses an
+    /// UNSET target (its CutAt offer is a render-quality optimisation, and the
+    /// embed path must not see shape churn), so a bare `render` here would
+    /// never exercise the arm at all.
+    fn render_rs(src: &str) -> String {
+        crate::transforms::set_target(Some("rs"));
+        let out = render(src);
+        crate::transforms::set_target(None);
+        out
+    }
+
+    /// `CutAt` — the four single-star strip identities (`${v##*/}` and
+    /// friends) render as `find`/`rfind` + a slice, never the glob helper.
+    /// `affix-strip-fold` offers the node to the `rs`/`c` targets on the
+    /// promise that the arm exists; with the Rust arm missing the node fell
+    /// through to `TODO(unsupported)` and the field printed as an empty
+    /// string (11 of the 13 fail-rs reds, e.g. `variable-default-with-hash`).
+    #[test]
+    fn cut_at_star_strips_use_find_and_a_slice() {
+        let p = "p=/usr/local/bin/example\n";
+        // `*/` = `*lit` → tail forms; `/*` = `lit*` → head forms.
+        let longest_tail = render_rs(&format!("{p}echo \"${{p##*/}}\"\n"));
+        assert!(longest_tail.contains("rfind"), "{longest_tail}");
+        assert!(
+            longest_tail.contains("__s[__i + __d.len()..]"),
+            "{longest_tail}"
+        );
+        let shortest_tail = render_rs(&format!("{p}echo \"${{p#*/}}\"\n"));
+        assert!(
+            shortest_tail.contains(".find(__d)"),
+            "shortest strip must use find:\n{shortest_tail}"
+        );
+        let longest_head = render_rs(&format!("{p}echo \"${{p%/*}}\"\n"));
+        assert!(longest_head.contains("rfind"), "{longest_head}");
+        assert!(longest_head.contains("__s[..__i]"), "{longest_head}");
+        let shortest_head = render_rs(&format!("{p}echo \"${{p%%/*}}\"\n"));
+        assert!(
+            shortest_head.contains(".find(__d)"),
+            "{shortest_head}"
+        );
+        // Never a TODO, and never the glob engine this node exists to avoid.
+        for out in [&longest_tail, &shortest_tail, &longest_head, &shortest_head] {
+            assert!(!out.contains("TODO"), "CutAt left a TODO:\n{out}");
+            assert!(!out.contains("fnmatch"), "glob helper dragged in:\n{out}");
+        }
+    }
+
+    /// `typeset -f f` prints the function DEFINITION, so an `echo` that the
+    /// pipeline folded to the native `Output` statement must still display as
+    /// `echo …`. Without the `Output` arm in `fn_body_line_text` the folded
+    /// echo displayed as an empty line — `typeset-cmdsub` printed `    ;`
+    /// where bash prints `    echo "Inside myfunc";`.
+    #[test]
+    fn typeset_f_shows_a_folded_echo() {
+        let out = render_rs(
+            "myfunc() {\n    echo \"Inside myfunc\"\n    local x=5\n    echo \"x=$x\"\n}\ntypeset -f myfunc\n",
+        );
+        assert!(
+            out.contains(r#"echo \"Inside myfunc\";"#),
+            "the folded echo must appear in the displayed definition:\n{out}"
+        );
+        assert!(
+            out.contains(r#"echo \"x=$x\""#),
+            "the interpolating echo must appear in the displayed definition:\n{out}"
+        );
+    }
+
+    /// A `case` on a CONSTANT subject lowers to an if/elsif chain whose
+    /// conditions all render as constants, so the renderer decides the chain
+    /// at emit time. Taking the matching arm must drop the REST of the chain:
+    /// an `elsif` proven true makes the `else` unreachable. Splicing both ran
+    /// two branches where bash runs one — `000__04h_complex_examples` printed
+    /// its matching arm AND its `*` default.
+    #[test]
+    fn const_case_takes_exactly_one_arm() {
+        let out = render_rs(
+            "x='Darwin'\ncase $x in\n  Linux) echo L ;;\n  Darwin) echo D ;;\n  *) echo OTHER ;;\nesac\n",
+        );
+        assert!(out.contains("D"), "{out}");
+        assert!(
+            !out.contains("OTHER"),
+            "the default arm must not run:\n{out}"
+        );
+        assert!(!out.contains("L\\n"), "an unmatched arm ran:\n{out}");
     }
 
     /// A sig-LESS (legacy argv-convention) function that is never
@@ -20773,9 +20968,12 @@ mod tests {
         );
         assert!(out.contains("print!(\"one\\n\")"), "{out}");
         assert!(out.contains("print!(\"two\\n\")"), "{out}");
-        // the redirect's OWN echo keeps its sink-aware helper
+        // the redirect's OWN echo still lands in the file — with a literal
+        // path the pipeline emits the write itself (no sink runtime), so
+        // the invariant is the write, not a helper call
         assert!(
-            out.contains("__sh_print_words(&[vec![\"data\""),
+            out.contains(r#"std::fs::write("/tmp/sh2_probe_d.txt".to_string(), "data\n".to_string())"#)
+                || out.contains("__sh_print_words(&[vec![\"data\""),
             "redirected echo lost its sink check:\n{out}"
         );
     }
@@ -21038,9 +21236,21 @@ mod tests {
     /// must record status 0 for the read to see.
     #[test]
     fn empty_else_kept_when_status_is_read() {
+        // A condition that is constant TRUE can never take the else, so the
+        // whole chain folds away and the body runs unconditionally — `$?`
+        // afterwards is still 0.
         let out = render("if true; then echo yes; fi\necho \"rc=$?\"\n");
-        assert!(out.contains("} else {"), "status arm dropped:\n{out}");
-        assert!(out.contains("__SH_RC.store(0, Ordering::SeqCst);"), "{out}");
+        assert!(out.contains(r#"print!("yes\n")"#), "{out}");
+        assert!(!out.contains("} else {"), "dead else kept:\n{out}");
+        // A condition only known at RUN time keeps the status arm: after a
+        // false test `$?` is 0 from the test itself, so the else must still
+        // write the register.
+        let dyn_out = render("if [ \"$1\" = x ]; then echo yes; fi\necho \"rc=$?\"\n");
+        assert!(dyn_out.contains("} else {"), "status arm dropped:\n{dyn_out}");
+        assert!(
+            dyn_out.contains("__SH_RC.store(0, Ordering::SeqCst);"),
+            "{dyn_out}"
+        );
     }
 
     /// A parameter the body only BORROWS takes `&str` (the shared
@@ -21125,14 +21335,27 @@ mod tests {
 
     #[test]
     fn sinks_kept_when_used() {
-        // a redirect must keep the runtime sink: the folded constant echo
-        // goes through the sink-aware print helper, not a bare print!
+        // A LITERAL path needs no runtime sink at all: the pipeline lowers
+        // `echo hi > path` to one `std::fs::write`, and that write IS the
+        // redirect (namespace B). The invariant is that the text lands in
+        // the file, not that a helper was called.
         let out = render("echo hi > /tmp/sh2_probe.txt\n");
-        assert!(out.contains("__SH_OUTFILE_TL"), "{out}");
-        assert!(out.contains("let mut used = false"), "{out}");
         assert!(
-            out.contains("__sh_print_words(&[vec![\"hi\".to_string()]], true, false)"),
-            "{out}"
+            out.contains(r#"std::fs::write("/tmp/sh2_probe.txt".to_string(), "hi\n".to_string())"#),
+            "literal-path redirect is not a write:\n{out}"
+        );
+        assert!(
+            !out.contains("__SH_OUTFILE_TL"),
+            "sink runtime kept for a path known at compile time:\n{out}"
+        );
+        // A path only known at RUN time keeps the sink, and the folded
+        // constant echo must then go through the sink-aware printer — a
+        // bare `print!` would bypass the file.
+        let dyn_out = render("echo hi > \"$1\"\n");
+        assert!(dyn_out.contains("__SH_OUTFILE_TL"), "{dyn_out}");
+        assert!(
+            dyn_out.contains("__sh_print_words(&[vec![\"hi\".to_string()]], true, false)"),
+            "sink-aware print dropped:\n{dyn_out}"
         );
     }
 
@@ -21161,7 +21384,10 @@ mod tests {
         // `f > file` must route the body's output into the file.
         let out = render("f() { echo a; echo b; }\nf > /tmp/sh2_redir_probe.txt\n");
         let body = out.split("fn f()").nth(1).unwrap_or("");
-        assert!(body.contains("__sh_puts"), "sink helper dropped:\n{out}");
+        assert!(
+            body.contains("__sh_print_words"),
+            "sink helper dropped:\n{out}"
+        );
     }
 
     #[test]
@@ -21169,7 +21395,10 @@ mod tests {
         // Sometimes-redirected: the conservative verdict.
         let out = render("f() { echo a; echo b; }\nf\nf > /tmp/sh2_both_probe.txt\n");
         let body = out.split("fn f()").nth(1).unwrap_or("");
-        assert!(body.contains("__sh_puts"), "sink helper dropped:\n{out}");
+        assert!(
+            body.contains("__sh_print_words"),
+            "sink helper dropped:\n{out}"
+        );
     }
 
     #[test]
@@ -21367,18 +21596,22 @@ mod tests {
     fn if_arith_test() {
         let out = render("x=3\nif [ \"$x\" -gt 3 ]; then\ny=$((x+1))\necho \"$y\"\nfi\n");
         assert!(out.contains("> 3"), "{out}");
-        // the arith lowering reads x numerically and adds 1. `x` is an i64
-        // read, so it supplies the operation's type: the literal stays
-        // UNSUFFIXED (`x + 1`, not `x + 1i64`). The suffix is only needed
-        // when BOTH sides are bare literals (see `literal_literal_ops_are_widened`).
-        assert!(out.contains("x + 1)"), "{out}");
-        assert!(!out.contains("1i64"), "needless i64 suffix:\n{out}");
         // `x` is read only through the test text `"$x"`; the borrow walk
         // reads those `$` references, so the verdict holds and x binds as a
         // plain local instead of a thread_local.
         assert!(out.contains("let x = 3;"), "{out}");
         assert!(!out.contains("__SHV_x"), "x should be a local:\n{out}");
         assert!(!out.contains("TODO"), "{out}");
+        // A const `x` folds `x+1` to 4, so the arith SHAPE needs a value
+        // only known at run time. The numeric read then supplies the
+        // operation's type and needs no `.clone()` (`.trim()` borrows):
+        // `x.trim().parse::<i64>()`, never `x.clone().trim()…`.
+        let dyn_out = render("x=$1\nif [ \"$x\" -gt 3 ]; then\ny=$((x+1))\necho \"$y\"\nfi\n");
+        assert!(dyn_out.contains("+ 1"), "arith lost:\n{dyn_out}");
+        assert!(
+            !dyn_out.contains(".clone().trim()"),
+            "needless clone before a borrowing trim:\n{dyn_out}"
+        );
         assert!(!out.contains("sh2"), "{out}");
     }
 
@@ -21401,23 +21634,37 @@ mod tests {
             .unwrap_or_else(|e| e.into_inner());
         crate::shir::set_size_opt(false);
         let out = render("x=1\nz=$((2000000000 + 2000000000 + x))\necho \"$z\"\n");
+        // The sum folds (`x` is 1), so the ACCEPTED shapes are the suffix on
+        // each addend and the folded total — both keep the i64.
         assert!(
-            out.contains("2000000000i64 + 2000000000i64") || out.contains("4000000000i64"),
+            out.contains("2000000000i64 + 2000000000i64")
+                || out.contains("4000000000i64")
+                || out.contains("4000000001i64"),
             "the literal-only sum lost its i64:\n{out}"
         );
-        assert!(!out.contains("4000000000 +"), "wide literal went i32:\n{out}");
-        // the outer `+ x` takes `x`'s type, so it adds no suffix of its own
-        assert!(out.contains("+ x"), "{out}");
-        // a literal shift mixed with a variable operand: the literal-only
-        // SHIFT widens, its enclosing op takes the variable's type
-        let sh = render("x=1\nz=$((x + (1 << 2)))\necho \"$z\"\n");
-        assert!(sh.contains("1i64 << 2i64"), "{sh}");
-        // an operation on an i64-homed var carries NO literal suffix (the
-        // local itself is inferred, not `: i64` — the range fits i32)
+        assert!(
+            !out.contains("4000000000 +") && !out.contains("4000000001 +"),
+            "wide literal went i32:\n{out}"
+        );
+        // the outer `+ x` takes `x`'s type: with a run-time `x` the literal
+        // subtree stays WIDE (`4000000000i64 + …`) and never wraps to i32
+        let dyn_out = render("x=$1\nz=$((2000000000 + 2000000000 + x))\necho \"$z\"\n");
+        assert!(
+            dyn_out.contains("4000000000i64 + "),
+            "the literal-only subtree lost its widening:\n{dyn_out}"
+        );
+        // a literal-only SHIFT mixed with a variable operand keeps its
+        // widening too (the inner `1 << 2` folds to a wide literal)
+        let sh = render("x=$1\nz=$((x + (1 << 2)))\necho \"$z\"\n");
+        assert!(sh.contains("+ 4i64"), "{sh}");
+        // A const var folds the whole shift.
         let mixed = render("x=1\nz=$((x << 2))\necho \"$z\"\n");
-        assert!(mixed.contains("let x = 1;"), "{mixed}");
-        assert!(mixed.contains("x << 2"), "{mixed}");
-        assert!(!mixed.contains("2i64"), "needless widening:\n{mixed}");
+        assert!(mixed.contains("let z = 4;"), "const shift not folded:\n{mixed}");
+        // A var whose value is only known at run time (a `.parse::<i64>()`
+        // read, so the renderer sees no i64 HOME) keeps the literal's
+        // widening — the suffix is what makes the types line up there.
+        let dyn_mixed = render("x=$1\nz=$((x << 2))\necho \"$z\"\n");
+        assert!(dyn_mixed.contains("<< 2i64"), "{dyn_mixed}");
     }
 
     #[test]
