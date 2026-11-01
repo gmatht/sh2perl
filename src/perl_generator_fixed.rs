@@ -51,7 +51,34 @@ pub fn generate(prog: &IrProgram) -> String {
     collect_scalar_phase_vars(&prog.stmts, &mut scalar_phase);
     crate::ir::set_scalar_phase_vars(scalar_phase);
     let fixed = fixups(prog);
+    // A program that reads `$?` renders that read through the
+    // `$CHILD_ERROR` mirror; a program that MOVES the status through a
+    // variable (`$__ps_statusN = $CHILD_ERROR`) needs the mirror kept in
+    // step by every register write. Everything else reads the register
+    // directly and gets the clean form.
+    // Does the SOURCE test a status (`if cmd; then`, `[ "$?" = 0 ]`)? Then
+    // the register is read directly and must not be clobbered by a body
+    // statement's write.
+    let read_carrier = crate::perl_backend::stmts_read_status(&fixed.stmts)
+        || fixed.subs.iter().any(|sb| crate::perl_backend::stmts_read_status(&sb.body));
+    // The verdict cannot come from the IR alone: the process-substitution
+    // materialisation is a TEXT template, so its `$__ps_statusN =
+    // $CHILD_ERROR` save exists only after rendering. Render once with the
+    // mirror OFF, and if the body turns out to move the value through
+    // `$CHILD_ERROR`, render again with the mirror kept in step.
+    crate::ir::set_childe_error_carrier(false);
     let src = shir_to_perl(&fixed);
+    // A condition that runs a command (`if ps …; then`) READS the status
+    // through the register: the test's own `system()` set it, and the
+    // `$? = …` written by a body statement would clobber it.
+    let src = if src.contains("$CHILD_ERROR") || src.contains("($? >> 8)") && !read_carrier {
+        crate::ir::set_childe_error_carrier(true);
+        let again = shir_to_perl(&fixed);
+        crate::ir::set_childe_error_carrier(false);
+        again
+    } else {
+        src
+    };
     if std::env::var_os("SH2_DEBUG_PGFIX").is_some() {
         eprintln!("PGFIX-RENDERED:\n{src}");
     }
@@ -96,6 +123,14 @@ pub fn generate(prog: &IrProgram) -> String {
     // callout session did). Same injection discipline as above.
     if needs_affix_helper(&src) {
         src = inject_before_first_stmt(&src, AFFIX_PREAMBLE);
+    }
+    // Fix 26 turns `print(X, "\n")` into `say X`. The shared renderer adds
+    // `use feature 'say'` when IT emits a `say`; a program whose output was
+    // all explicit-newline prints gets no such import, and `say` is then a
+    // `strict subs` compile error. Add it when the body says `say` and the
+    // preamble does not.
+    if src.contains("say ") && !src.contains("use feature 'say'") {
+        src = inject_before_first_stmt(&src, "use feature 'say';\n");
     }
     src
 }
@@ -171,6 +206,11 @@ fn post_pass(src: &str) -> String {
     let out = fix_eval_payload_expansion(&out);
     let out = fix_printf_bash_conversions(&out);
     let out = fix_printf_b_percent_b(&out);
+    // The output idioms run BEFORE the position-parameter slicing: that pass
+    // rewrites `$N` reads textually and can reformat a statement's tail,
+    // which left `print($result, "\n")` unchanged when it ran first.
+    let out = fix_print_newline_to_say(&out);
+    let out = fix_print_concat_interp(&out);
     let out = fix_pos_param_slice(&out);
     let out = fix_literal_pipeline_pipestatus(&out);
     // LAST: it must see the final text, and it only ever PREPENDS
@@ -216,10 +256,18 @@ fn fix_literal_pipeline_pipestatus(src: &str) -> String {
     // (`__sh_pipe_run(q{…` at statement start — the rc write was
     // dropped, but the PIPESTATUS splice must still happen: 070_gnuisms
     // printed `ps=,` when the anchor missed the elided form).
-    const ANCHOR: &str = "$main_exit_code = $CHILD_ERROR = __sh_pipe_run(q{";
+    // The tracked forms: the register spelling the renderer now emits
+    // (`$? = (__sh_pipe_run(…) << 8;`) and the older tracker prefix, kept so
+    // the pass still fires on either shape.
+    const ANCHORS: [&str; 3] = [
+        "$? = (__sh_pipe_run(q{",
+        "$? = __sh_pipe_run(q{",
+        "$main_exit_code = $CHILD_ERROR = __sh_pipe_run(q{",
+    ];
+    const ANCHOR: &str = ANCHORS[2];
     const ANCHOR_ELV: &str = "__sh_pipe_run(q{";
     fn find_anchor(s: &str) -> Option<usize> {
-        let tracked = s.find(ANCHOR);
+        let tracked = ANCHORS.iter().filter_map(|a| s.find(a)).min();
         let elided = s.find(ANCHOR_ELV).filter(|i| {
             // elided form sits at a statement start: the rest of its line
             // (up to the previous newline) is only indent. The tracked
@@ -236,10 +284,9 @@ fn fix_literal_pipeline_pipestatus(src: &str) -> String {
     let mut rest = src;
     while let Some(at) = find_anchor(rest) {
         // The q{ payload starts at the end of whichever anchor matched.
-        let inner_start = if rest[at..].starts_with(ANCHOR) {
-            at + ANCHOR.len()
-        } else {
-            at + ANCHOR_ELV.len()
+        let inner_start = match ANCHORS.iter().find(|a| rest[at..].starts_with(**a)) {
+            Some(a) => at + a.len(),
+            None => at + ANCHOR_ELV.len(),
         };
         // Stages with no `}` in them (the literal true/false forms have no
         // braces) — anything else bails out of this occurrence.
@@ -1376,6 +1423,380 @@ fn fix_condition_booleans(src: &str) -> String {
     src.replace(crate::ir::UNBUILDABLE_COND, "1")
 }
 
+// ── Fix 25 — `print($a . " " . $b)` reads better as one interpolated string ─
+//
+// The shared renderer joins `echo`-style words with Perl's concat operator:
+//
+//     print(($a) . " " . ($b) . " ");      print(($k) . " => " . ($v));
+//
+// A Perl programmer writes the same statement as a single interpolated
+// string, which is easier to read and to diff:
+//
+//     print "$a $b ";                      print "$k => $v";
+//
+// The rewrite is deliberately narrow:
+//   * the WHOLE argument list must be one chain of `.`-joined pieces, each a
+//     plain scalar `($x)`, an interpolatable double-quoted literal, or a
+//     number — any other call, index or expression keeps the concat form
+//     (re-parenthesising its precedence is not ours to do);
+//   * a list with a TOP-LEVEL comma (`print($x, "\n")`) is left alone: the
+//     trailing `, "\n"` is the renderer's explicit newline, re-joining which
+//     is a separate, riskier change;
+//   * `say` is not touched.
+fn fix_print_concat_interp(src: &str) -> String {
+    const CALL: &str = "print(";
+    let mut out = String::with_capacity(src.len());
+    let mut rest = src;
+    loop {
+        let Some(at) = rest.find(CALL) else {
+            out.push_str(rest);
+            return out;
+        };
+        if at > 0 {
+            let prev = rest[..at].chars().next_back().unwrap_or(' ');
+            if prev.is_ascii_alphanumeric() || prev == '_' {
+                out.push_str(&rest[..at + CALL.len()]);
+                rest = &rest[at + CALL.len()..];
+                continue;
+            }
+        }
+        let open = at + CALL.len() - 1;
+        let Some(close) = call_close(rest, open) else {
+            out.push_str(&rest[..at + CALL.len()]);
+            rest = &rest[at + CALL.len()..];
+            continue;
+        };
+        match concat_chain_to_interp(&rest[open + 1..close]) {
+            Some(interp) => {
+                out.push_str(&rest[..at]);
+                out.push_str(&format!("print {interp}"));
+                rest = &rest[close + 1..];
+            }
+            None => {
+                out.push_str(&rest[..close + 1]);
+                rest = &rest[close + 1..];
+            }
+        }
+    }
+}
+
+/// Escape the characters that must not interpolate in a literal being folded
+/// into a larger double-quoted string. An ALREADY-escaped `\$` stays as it
+/// is — escaping it again turned `"\$" . ("42")` into `\\$42`, which prints a
+/// backslash (dollar-escape-in-interpolate).
+fn escape_literal_dollars(lit: &str) -> String {
+    let mut out = String::with_capacity(lit.len() + 2);
+    let mut chars = lit.chars().peekable();
+    while let Some(c) = chars.next() {
+        match c {
+            '\\' => {
+                out.push('\\');
+                if let Some(n) = chars.next() {
+                    out.push(n);
+                }
+            }
+            '$' | '@' => {
+                out.push('\\');
+                out.push(c);
+            }
+            _ => out.push(c),
+        }
+    }
+    out
+}
+
+/// Turn a `.`-joined print argument list into ONE double-quoted string, or
+/// `None` when any piece is not safely interpolatable.
+fn concat_chain_to_interp(inner: &str) -> Option<String> {
+    let pieces = split_concat_chain(inner.trim())?;
+    if pieces.len() < 2 {
+        return None;
+    }
+    let mut body = String::new();
+    for p in pieces {
+        let p = p.trim();
+        if let Some(name) = p.strip_prefix('(').and_then(|t| t.strip_suffix(')')) {
+            let name = name.trim();
+            if let Some(var) = name.strip_prefix('$') {
+                if !var.is_empty()
+                    && var.chars().all(|c| c.is_ascii_alphanumeric() || c == '_')
+                {
+                    body.push_str(&format!("${var}"));
+                    continue;
+                }
+            }
+            // A CONSTANT operand (`("abc")`, the renderer's spelling for a
+            // folded literal) is the literal it names.
+            if let Some(lit) = name.strip_prefix('"').and_then(|t| t.strip_suffix('"')) {
+                body.push_str(&escape_literal_dollars(lit));
+                continue;
+            }
+            return None;
+        }
+        if let Some(lit) = p.strip_prefix('"').and_then(|t| t.strip_suffix('"')) {
+            // Already a literal: keep its escapes and keep it a literal.
+            body.push_str(&escape_literal_dollars(lit));
+            continue;
+        }
+        if !p.is_empty() && p.chars().all(|c| c.is_ascii_digit()) {
+            body.push_str(p);
+            continue;
+        }
+        return None;
+    }
+    Some(format!("\"{body}\""))
+}
+
+/// Split on a top-level ` . ` — the renderer's concat spelling (spaced), which
+/// cannot be confused with a `.` inside a string or a number. Returns `None`
+/// when the list has a top-level comma (a multi-argument `print`).
+fn split_concat_chain(s: &str) -> Option<Vec<&str>> {
+    let mut parts = Vec::new();
+    let mut depth = 0i32;
+    let mut in_str = false;
+    let mut esc = false;
+    let chars: Vec<char> = s.chars().collect();
+    let mut start = 0usize;
+    let mut i = 0usize;
+    while i < chars.len() {
+        let c = chars[i];
+        if in_str {
+            if esc {
+                esc = false;
+            } else if c == '\\' {
+                esc = true;
+            } else if c == '"' {
+                in_str = false;
+            }
+            i += 1;
+            continue;
+        }
+        match c {
+            '"' => in_str = true,
+            '(' | '[' | '{' => depth += 1,
+            ')' | ']' | '}' => {
+                depth -= 1;
+                if depth < 0 {
+                    return None;
+                }
+            }
+            ',' if depth == 0 => return None,
+            ' ' if depth == 0 && i + 2 < chars.len() && chars[i + 1] == '.' && chars[i + 2] == ' ' => {
+                parts.push(&s[start..i]);
+                start = i + 3;
+                i += 3;
+                continue;
+            }
+            _ => {}
+        }
+        i += 1;
+    }
+    if in_str {
+        return None;
+    }
+    parts.push(&s[start..]);
+    Some(parts)
+}
+
+// ── Fix 26 — `print(X, "\n")` is `say X` ─────────────────────────────────
+//
+// The renderer ends every newline-terminated output with an explicit
+// `"\n"` argument:
+//
+//     print("Counter: " . ($i), "\n");        print($result, "\n");
+//
+// Perl has a statement for exactly this, and `use feature 'say'` is already
+// in the preamble of every program that prints a newline — so the two-arg
+// form is pure ceremony:
+//
+//     say "Counter: $i";                      say $result;
+//
+// Only the exact `, "\n")` tail is rewritten (651 of the corpus's 670
+// two-argument prints), and only when the preceding argument list has no
+// top-level comma of its own (so `print(a, b, "\n")` — a genuine list print —
+// is left alone; its join is a different question).
+fn fix_print_newline_to_say(src: &str) -> String {
+    const CALL: &str = "print(";
+    const TAIL: &str = ", \"\\n\")";
+    if !src.contains(TAIL) {
+        return src.to_string();
+    }
+    let mut out = String::with_capacity(src.len());
+    let mut rest = src;
+    loop {
+        let Some(at) = rest.find(CALL) else {
+            out.push_str(rest);
+            return out;
+        };
+        if at > 0 {
+            let prev = rest[..at].chars().next_back().unwrap_or(' ');
+            if prev.is_ascii_alphanumeric() || prev == '_' {
+                out.push_str(&rest[..at + CALL.len()]);
+                rest = &rest[at + CALL.len()..];
+                continue;
+            }
+        }
+        let open = at + CALL.len() - 1;
+        // `print`/`say` take a FLAT list, so the call ends at the first `)`
+        // outside a string — a `)` inside a literal (`die "…: $!\n"`) is
+        // data, not structure. (A paren-depth walk is wrong here AND
+        // fragile: the renderer's own literals carry unbalanced `)`.)
+        let Some(close) = call_close(rest, open) else {
+            out.push_str(&rest[..at + CALL.len()]);
+            rest = &rest[at + CALL.len()..];
+            continue;
+        };
+        let inner = &rest[open + 1..close];
+        match inner.strip_suffix(", \"\\n\"") {
+            // the head must be a single argument: no top-level comma
+            Some(head) if !has_toplevel_comma(head) => {
+                // `say "Number: " . ($i)` is `say "Number: $i"`.
+                let head = match concat_chain_to_interp(head) {
+                    Some(interp) => interp,
+                    // A single scalar/literal head needs no chain rewrite —
+                    // it is already an interpolating `say` operand, and
+                    // `print($x, "\n")` -> `say $x` is the whole point.
+                    None if is_plain_say_operand(head) => head.to_string(),
+                    // NOT a safe chain: keep the parenthesised call. A bare
+                    // `say ($k) . " => " . …` is parsed as `say(...)` fed the
+                    // CONCATENATED result — Perl warns ("say (...) interpreted
+                    // as function") and the value changes shape.
+                    None => {
+                        out.push_str(&rest[..close + 1]);
+                        rest = &rest[close + 1..];
+                        continue;
+                    }
+                };
+                out.push_str(&rest[..at]);
+                out.push_str(&format!("say {head}"));
+                rest = &rest[close + 1..];
+            }
+            _ => {
+                out.push_str(&rest[..close + 1]);
+                rest = &rest[close + 1..];
+            }
+        }
+    }
+}
+
+/// Is `head` a single value `say` can take bare?
+///
+/// Only when there is no top-level comma and no top-level operator that
+/// would bind differently: `say $x = 1` is an assignment, `say $x . "!"` is
+/// fine but is handled by the interpolation chain instead. Anything with a
+/// space-separated binary operator at depth 0 (`.`, `+`, `=`, `?:`, `//`, …)
+/// is left to `concat_chain_to_interp` so the shape never changes.
+fn is_plain_say_operand(head: &str) -> bool {
+    let t = head.trim();
+    if t.is_empty() || has_toplevel_comma(t) {
+        return false;
+    }
+    // A scalar/hash-element/array-element/bareword/literal, plus simple
+    // indexing and dereference sugar — no ` `, `.`, `+`, `=`, `?` at depth 0.
+    let mut depth = 0i32;
+    let mut in_str: Option<char> = None;
+    let mut esc = false;
+    for c in t.chars() {
+        if let Some(q) = in_str {
+            if esc {
+                esc = false;
+            } else if c == '\\' {
+                esc = true;
+            } else if c == q {
+                in_str = None;
+            }
+            continue;
+        }
+        match c {
+            '"' | '\'' | '`' => in_str = Some(c),
+            '(' | '[' | '{' => depth += 1,
+            ')' | ']' | '}' => depth -= 1,
+            ' ' | '.' | '+' | '-' | '*' | '/' | '%' | '=' | '?' | ':' | '|' | '&'
+            | '<' | '>' | '!' if depth == 0 => return false,
+            _ => {}
+        }
+    }
+    depth == 0 && in_str.is_none()
+}
+
+/// The `)` that closes a print/say call.
+///
+/// Bracket depth IS tracked (an argument may itself be a call or a grouped
+/// expression) but a quoted span is skipped whole — a `(` or `)` inside a
+/// literal (`die "capture: $!\n"`, `q{…}` shell text) is data, not
+/// structure. [`matching_paren`] can't be used here because it also has to
+/// understand `q{…}`/`qw(…)` literals, whose braces unbalance a plain walk.
+fn call_close(s: &str, open: usize) -> Option<usize> {
+    let b = s.as_bytes();
+    let mut depth = 0i32;
+    let mut i = open;
+    while i < b.len() {
+        match b[i] {
+            q @ (b'\'' | b'"' | b'`') => {
+                // Skip the whole quoted span, closing quote included: a `(`
+                // or `)` inside a literal is DATA (`die "capture: $!\n"`,
+                // `q{…}` shell text), not structure.
+                i += 1;
+                while i < b.len() && b[i] != b'\n' {
+                    if b[i] == b'\\' && q != b'\'' {
+                        i += 1;
+                    } else if b[i] == q {
+                        break;
+                    }
+                    i += 1;
+                }
+                // Only past the closer if there IS one: an unterminated
+                // literal runs to end-of-line, and this `+1` then used to
+                // swallow the following newline and desynchronise the scan
+                // for the rest of the source.
+                if i < b.len() && b[i] == q {
+                    i += 1;
+                }
+            }
+            b'(' => {
+                depth += 1;
+                i += 1;
+            }
+            b')' => {
+                depth -= 1;
+                if depth == 0 {
+                    return Some(i);
+                }
+                i += 1;
+            }
+            _ => i += 1,
+        }
+    }
+    None
+}
+
+/// A comma at bracket depth 0 outside a quoted string — a list separator.
+fn has_toplevel_comma(s: &str) -> bool {
+    let mut depth = 0i32;
+    let mut in_str: Option<char> = None;
+    let mut esc = false;
+    for c in s.chars() {
+        if let Some(q) = in_str {
+            if esc {
+                esc = false;
+            } else if c == '\\' {
+                esc = true;
+            } else if c == q {
+                in_str = None;
+            }
+            continue;
+        }
+        match c {
+            '"' | '\'' | '`' => in_str = Some(c),
+            '(' | '[' | '{' => depth += 1,
+            ')' | ']' | '}' => depth -= 1,
+            ',' if depth == 0 => return true,
+            _ => {}
+        }
+    }
+    false
+}
+
 // ── Fix 12 — a bareword argument to `print` must be a quoted string ────────
 //
 // `echo ab` renders as `print(ab);`. Under the `use strict` the preamble
@@ -2183,8 +2604,7 @@ fn matching_paren(s: &str, open: usize) -> Option<usize> {
         match b[i] {
             // Single-quoted, double-quoted, and backtick — a `'` inside a
             // double-quoted string is literal and must not end this one.
-            b'\'' | b'"' | b'`' => {
-                let q = b[i];
+            q @ (b'\'' | b'"' | b'`') => {
                 i += 1;
                 while i < b.len() && b[i] != b'\n' {
                     if b[i] == b'\\' && q != b'\'' {
@@ -2194,7 +2614,9 @@ fn matching_paren(s: &str, open: usize) -> Option<usize> {
                     }
                     i += 1;
                 }
-                i += 1;
+                if i < b.len() && b[i] == q {
+                    i += 1;
+                }
             }
             b'q' | b'Q' | b'w' => {
                 if matches!(b.get(i + 1), Some(b'{') | Some(b'(') | Some(b'[') | Some(b'<'))
@@ -6707,11 +7129,24 @@ fn stmts_run_forever(stmts: &[IrStmt]) -> bool {
 
 /// `while true` / `while :` — the command-condition spellings of
 /// "unconditional". `exec` covers the pre-builtin-lift shape.
+///
+/// The CONSTANT spelling counts too: the shared `const-status-cond` transform
+/// replaces a `true`/`:` COMMAND in condition position with `Bool(true)` (so
+/// the condition stops forking a subprocess), and that is the shape the
+/// optimizer hands this pass for `while true; do …; done`. Missing it here
+/// meant an infinite process-substitution producer was never recognised as
+/// infinite, so it ran to completion in the sequential materialisation and
+/// the consumer (`head <(while true; …)` — example 096) never ran at all.
 fn always_true_cond(cond: &IrExpr) -> bool {
     match cond {
         IrExpr::Call { func, args, .. } if func == "builtin" || func == "exec" => {
             matches!(args.first(), Some(IrExpr::Str(s, _)) if s == "true" || s == ":")
         }
+        // Constant condition: `Bool(true)`, or a non-zero integer literal —
+        // the same things a shell treats as success. `Int(0)` is FALSE, so
+        // it must not be taken as unconditional (and `while 0` never runs).
+        IrExpr::Bool(b) => *b,
+        IrExpr::Int(n) => *n != 0,
         _ => false,
     }
 }

@@ -11841,6 +11841,22 @@ impl Render {
             self.emit("#include <fbsound.h>");
         }
         self.emit("");
+        // bash RESETS an inherited IFS to " \t\n" at startup, so the
+        // DECLARATION is the startup state: `${a[*]}` reads IFS[0]
+        // from it before any assignment ever runs (probe c01). IFS is
+        // declared HERE, once, unconditionally — emit_var_decl skips
+        // it — because the const-lift branch would bake the assigned
+        // literal into the decl AND suppress the assignment
+        // statement, freezing IFS at time 0 (probe c09). Every
+        // `IFS=…` therefore stays a runtime write.
+        //
+        // It sits OUTSIDE the `need_sh` runtime block: the runtime is
+        // trimmed when a program needs none of its helpers, but
+        // `IFS=$'\n\t'` still renders `strncpy(IFS, …)` — an undeclared
+        // identifier in a program with no array join at all
+        // (parse-dollar-single-quote.sh failed to COMPILE with the decl
+        // inside that block).
+        self.emit("char IFS[256] = \" \"; /* bash's startup IFS */");
         if self.need_sh {
             self.runtime_start = self.out.len();
             self.emit("/* sh2 runtime: exit-status register + shell-out helpers */");
@@ -12329,6 +12345,42 @@ impl Render {
             self.emit("    if (!a[i]) continue;");
             self.emit("    if (_f) { _f = 0; } else { _sh_vgrow(d, dn + 2); d->p[dn++] = ' '; }");
             self.emit("    for (const char *s = a[i]; *s; s++) { _sh_vgrow(d, dn + 2); d->p[dn++] = *s; }");
+            self.emit("  }");
+            self.emit("  _sh_vgrow(d, dn + 1); d->p[dn] = 0;");
+            self.emit("}");
+            // ${arr[*]} / ${arr[@]:off:len} — the SAME presence fold,
+            // parameterised by the separator: `sep` is IFS[0] for the
+            // `[*]` face (bash reads ONE char, and an empty IFS joins
+            // with NOTHING — sep==0 skips the separator entirely, which
+            // is exactly ifs_sep(None)) and ' ' for `[@]`.
+            self.emit("static void _sh_join_arr_sep(_sh_vbuf *d, char **a, size_t n, char sep) {");
+            self.emit("  size_t dn = 0; int _f = 1;");
+            self.emit("  for (size_t i = 0; i < n; i++) {");
+            self.emit("    if (!a[i]) continue;");
+            self.emit("    if (_f) { _f = 0; } else if (sep) { _sh_vgrow(d, dn + 2); d->p[dn++] = sep; }");
+            self.emit("    for (const char *s = a[i]; *s; s++) { _sh_vgrow(d, dn + 2); d->p[dn++] = *s; }");
+            self.emit("  }");
+            self.emit("  _sh_vgrow(d, dn + 1); d->p[dn] = 0;");
+            self.emit("}");
+            // ${arr[@]:off:len} / ${arr[*]:off:len} — the ELEMENT slice,
+            // taken over the STORE (not over a space-joined string, which
+            // cannot round-trip an empty leading element or an element
+            // containing a space). Bounds are ELEMENT ordinals: bash
+            // counts words, holes skipped — `a=(a b c); a[5]=z` →
+            // `${a[*]:1:3}` is `b c z`, not an index window.
+            self.emit("/* ${arr[@]:off:len} — an ELEMENT slice of the store */");
+            self.emit("static void _sh_join_arr_rng(_sh_vbuf *d, char **a, size_t n, long long off, long long len, char sep) {");
+            self.emit("  long long cnt = 0; for (size_t i = 0; i < n; i++) if (a[i]) cnt++;");
+            self.emit("  long long b0 = off < 0 ? cnt + off : off; long long b = b0 < 0 ? 0 : (b0 > cnt ? cnt : b0);");
+            self.emit("  long long e0 = b + (len < 0 ? cnt + len : len); long long e = e0 > cnt ? cnt : (e0 < b ? b : e0);");
+            self.emit("  size_t dn = 0; int _f = 1; long long bi = 0;");
+            self.emit("  for (size_t i = 0; i < n; i++) {");
+            self.emit("    if (!a[i]) continue;");
+            self.emit("    if (bi >= b && bi < e) {");
+            self.emit("      if (_f) { _f = 0; } else if (sep) { _sh_vgrow(d, dn + 2); d->p[dn++] = sep; }");
+            self.emit("      for (const char *s = a[i]; *s; s++) { _sh_vgrow(d, dn + 2); d->p[dn++] = *s; }");
+            self.emit("    }");
+            self.emit("    bi++;");
             self.emit("  }");
             self.emit("  _sh_vgrow(d, dn + 1); d->p[dn] = 0;");
             self.emit("}");
@@ -16056,6 +16108,12 @@ impl Render {
         // var reference declared later in the hoist order).
         // Float vars skip const lifting (a `const char*` would mistype;
         // they get `double` decls plus regular assigns below instead)
+        if v == "IFS" {
+            // declared once in the prologue (see there): no const-lift,
+            // no per-var decl — the assignment statements must run.
+            self.acc_len_decl_ident(&name);
+            return;
+        }
         if self.is_float(v) {
         } else if let Some(rhs) = self.const_rhs.get(v).cloned() {
             // numeric vars need a numeric initializer: the Str RHS parses
@@ -16166,6 +16224,12 @@ impl Render {
     fn emit_bound_asserts(&mut self, vars: &BTreeSet<String>) {
         for v in vars {
             if self.const_lifted.contains(v) {
+                continue;
+            }
+            // IFS carries the prologue's STARTUP space (" "), which can
+            // legitimately exceed the b the analysis proved for a later
+            // literal — the tripwire would fire on correct code.
+            if v == "IFS" {
                 continue;
             }
             if let Some(b) = self.buf_bound(v) {
@@ -28275,9 +28339,16 @@ fn param_copy_alias(
         // `${arr[@]:off:len}` — the shir shapes: the idx arg carries
         // `@`/`*`, the name carries `[@]`, or the plain name with the
         // idx being the offset
-        if op == "slice" {
-            let idx_is_at = matches!(args.get(2), Some(IrExpr::Str(s, _)) if s == "@" || s == "*");
-            let name_has_at = name.ends_with("[@]") || name.ends_with("[*]");
+        if op == "slice" {                    let idx_is_at = matches!(args.get(2), Some(IrExpr::Str(s, _)) if s == "@" || s == "*");
+                    let name_has_at = name.ends_with("[@]") || name.ends_with("[*]");
+                    // the FACE of this expansion: `[*]` joins on
+                    // IFS[0], `[@]` on a space (bash reads ONE char of
+                    // IFS — an empty IFS means no separator at all)
+                    let face_star = if idx_is_at {
+                        matches!(args.get(2), Some(IrExpr::Str(s, _)) if s == "*")
+                    } else {
+                        name.ends_with("[*]")
+                    };
             if idx_is_at || name_has_at || args.len() >= 4 {
                 self.cur_param_args = args.to_vec();
                 let mut is_array = true;
@@ -28288,11 +28359,10 @@ fn param_copy_alias(
                     // `${@:off:len}` — the positional params (the
                     // helper slices _sh_argv directly)
                     is_positional = true;
-                    "\"\"".to_string()
-                } else if name_has_at {
-                    self.array_join_all(&name[..name.len() - 3])
-                } else if self.arrays.contains(&name) || self.assoc_arrays.contains(&name) {
-                    self.array_join_all(&name)
+                    "\"\"".to_string()                        } else if name_has_at {
+                            self.array_join_all_face(&name[..name.len() - 3], face_star)
+                        } else if self.arrays.contains(&name) || self.assoc_arrays.contains(&name) {
+                            self.array_join_all_face(&name, face_star)
                 } else {
                     // a scalar string slice `${x:off:len}` — CHAR-based
                     is_array = false;
@@ -28358,9 +28428,41 @@ fn param_copy_alias(
                         "_sh_argv_slice(&{t}, {off}, {len});"
                     ));
                 } else if is_array {
-                    self.emit(&format!(
-                        "_sh_arr_slice(&{t}, {joined}, {off}, {len});"
-                    ));
+                    // An indexed char** array takes the STORE-based
+                    // element slice: the join-then-split route below
+                    // splits on BYTES, so an empty leading element and
+                    // an element containing a space both come back
+                    // wrong, and its bounds are word ordinals over the
+                    // joined string rather than over the store.
+                    let base = if name_has_at {
+                        name[..name.len() - 3].to_string()
+                    } else {
+                        name.clone()
+                    };
+                    let star_face = if idx_is_at {
+                        matches!(args.get(2), Some(IrExpr::Str(s, _)) if s == "*")
+                    } else {
+                        name.ends_with("[*]")
+                    };
+                    let decl_ok = !self.array_decls_done || self.array_declared.contains(&base);
+                    if !name.starts_with('!')
+                        && decl_ok
+                        && (self.arrays.contains(&base) || self.assoc_arrays.contains(&base))
+                        && !self.assoc_arrays.contains(&base)
+                        && !self.dense_value_storage(&base)
+                    {
+                        self.arrays.insert(base.clone());
+                        self.need_sh = true;
+                        let id = self.c_ident(&base);
+                        let sep = if star_face { "IFS[0]" } else { "' '" };
+                        self.emit(&format!(
+                            "_sh_join_arr_rng(&{t}, {id}, {id}_len, {off}, {len}, {sep});"
+                        ));
+                    } else {
+                        self.emit(&format!(
+                            "_sh_arr_slice(&{t}, {joined}, {off}, {len});"
+                        ));
+                    }
                 } else {
                     self.emit(&format!(
                         "_sh_substr(&{t}, {joined}, {off}, {len});"
@@ -28659,24 +28761,40 @@ fn param_copy_alias(
         // `${arr[@]}` / `${arr[*]}` — all elements
         if name.ends_with("[@]") || name.ends_with("[*]") {
             let var = &name[..name.len() - 3];
+            // the FACE: `[*]` joins on IFS[0], `[@]` on a space
+            let star = name.ends_with("[*]");
             match op {
                 "len" | "#" => return self.array_len(var),
                 "slice" => {
-                    // `${arr[@]:off:len}` — slice of the joined elements
+                    // `${arr[@]:off:len}` — an ELEMENT slice of the store
                     let off = self.args_value_num(2);
                     let len = match self.cur_param_args.get(3) {
                         None => "(long long)1LL<<60".to_string(),
                         Some(IrExpr::Str(s, _)) if s.is_empty() => "(long long)1LL<<60".to_string(),
                         Some(_) => self.args_value_num(3),
                     };
-                    let joined = self.array_join_all(var);
+                    if self.array_decls_done && !self.array_declared.contains(var) {
+                        return "\"\"".into();
+                    }
                     let t = self.vbuf_temp();
-                    self.emit(&format!(
-                        "_sh_substr(&{t}, {joined}, {off}, {len});"
-                    ));
+                    if self.assoc_arrays.contains(var) {
+                        // assoc storage has no per-slot presence marker
+                        // beyond its dense n — the key/value join keeps
+                        // the pre-fix path (documented edge)
+                        let joined = self.array_join_all_face(var, star);
+                        self.emit(&format!("_sh_substr(&{t}, {joined}, {off}, {len});"));
+                    } else {
+                        self.arrays.insert(var.to_string());
+                        self.need_sh = true;
+                        let id = self.c_ident(var);
+                        let sep = if star { "IFS[0]" } else { "' '" };
+                        self.emit(&format!(
+                            "_sh_join_arr_rng(&{t}, {id}, {id}_len, {off}, {len}, {sep});"
+                        ));
+                    }
                     return format!("{t}.p");
                 }
-                _ => return self.array_join_all(var),
+                _ => return self.array_join_all_face(var, star),
             }
         }
         // `${arr[i]}` — element read
@@ -31211,6 +31329,14 @@ fn param_copy_alias(
 
     /// `${arr[@]}` — all elements joined by a space
     fn array_join_all(&mut self, var: &str) -> String {
+        self.array_join_all_face(var, false)
+    }
+
+    /// The same join with the FACE applied: `[*]` joins on IFS[0]
+    /// (bash reads one char; empty IFS = no separator), `[@]` on a
+    /// space. `star` never reaches the positional/assoc branches —
+    /// `$*`/`${!m[@]}` have their own joins.
+    fn array_join_all_face(&mut self, var: &str, star: bool) -> String {
         if var == "@" || var == "*" {
             // `$@`/`$*` in an expansion — the positional params
             let t = self.vbuf_temp();
@@ -31233,7 +31359,13 @@ fn param_copy_alias(
             // is one line and passes through sort unchanged)
             self.emit(&format!("_sh_join_arr_nl(&{t}, {id}_v, {id}_n);"));
         } else {
-            self.emit(&format!("_sh_join_arr(&{t}, {id}, {id}_len);"));
+            if star {
+                self.emit(&format!(
+                    "_sh_join_arr_sep(&{t}, {id}, {id}_len, IFS[0]);"
+                ));
+            } else {
+                self.emit(&format!("_sh_join_arr(&{t}, {id}, {id}_len);"));
+            }
         }
         format!("{t}.p")
     }

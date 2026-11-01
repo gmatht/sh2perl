@@ -7834,7 +7834,7 @@ pub fn ast_to_ir_transforms(prog: &mut IrProgram) {
     // statics, and a parallel compilation's unlocked write could tear them
     // mid-emission (the determinism unit tests compile concurrently).
     // Never re-entered: shir_to_estree does not call ast_to_ir.
-    let _compile_guard = COMPILE_LOCK.lock().unwrap();
+    let _compile_guard = COMPILE_LOCK.lock().unwrap_or_else(|p| p.into_inner());
     // Snapshot the list `stmt_lines` was indexed against (the
     // post-`optimize_stmts` program `ast_to_ir_pre_transforms` built), so
     // the map can be re-indexed at the end of this function once these
@@ -34852,7 +34852,7 @@ fn na_collect_decl(e: &Expr, out: &mut Vec<String>) {
 }
 
 pub fn shir_to_estree(prog: &IrProgram) -> Program {
-    let _compile_guard = COMPILE_LOCK.lock().unwrap();
+    let _compile_guard = COMPILE_LOCK.lock().unwrap_or_else(|p| p.into_inner());
     // `for ((...))` (core request zsh-sh-go-20260813-153215): the shell
     // lowering now emits the rich A1 ForInit node — the shell-flavored
     // renderers never see an unstripped ForInit (REFUSE > GUESS), so

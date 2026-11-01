@@ -2498,24 +2498,47 @@ fn parse_variable_expansion_inner(lexer: &mut Lexer) -> Result<Word, ParserError
                             || map_name.contains('%')
                             || map_name.contains('/'))
                         {
-                            // Special case: if key is "@", this is array iteration
-                            if key == "@" {
+                            // Special case: if key is "@", this is array iteration.
+                            // `[*]` joins the SAME slice arm when a ':' follows:
+                            // `${arr[*]:1:2}` slices the element list exactly like
+                            // `${arr[@]:1:2}` (bash) — without this it fell through
+                            // to the subscript path and the OFFSET AND LENGTH WERE
+                            // DROPPED, expanding to the whole array (measured:
+                            // `${a[*]:1:2}` over `(x y z)` printed `x y z`).
+                            // The no-colon `[*]` keeps its own handling below.
+                            if key == "@"
+                                || (key == "*"
+                                    && braced_content[bracket_end + 1..].starts_with(':'))
+                            {
                                 // Check if there's array slicing in braced_content after ']'
                                 let after_bracket = &braced_content[bracket_end + 1..];
                                 if after_bracket.starts_with(':') {
                                     // This is array slicing like ${arr[@]:start:length}
+                                    //
+                                    // The FACE rides in the name: bash joins the
+                                    // `[*]` slice on IFS[0] and the `[@]` slice on
+                                    // a space, so the two must not reach the
+                                    // renderer as one shape.  Slice arms strip a
+                                    // trailing `[@]`/`[*]` (c_backend,
+                                    // sh_backend), so the subscript is inert for
+                                    // every consumer but the face.
+                                    let face_name = if key == "*" {
+                                        format!("{map_name}[*]")
+                                    } else {
+                                        map_name.to_string()
+                                    };
                                     let slice_part = &after_bracket[1..]; // skip leading ':'
                                     if let Some(second_colon) = slice_part.find(':') {
                                         let offset = &slice_part[..second_colon];
                                         let length = &slice_part[second_colon + 1..];
                                         return Ok(Word::array_slice(
-                                            map_name.to_string(),
+                                            face_name,
                                             offset.to_string(),
                                             Some(length.to_string()),
                                         ));
                                     } else {
                                         return Ok(Word::array_slice(
-                                            map_name.to_string(),
+                                            face_name,
                                             slice_part.to_string(),
                                             None,
                                         ));
@@ -4360,17 +4383,32 @@ fn parse_parameter_expansion_content_inner(
                 let var_name = &content[..bracket_start];
                 let key = &content[bracket_start + 1..bracket_end];
 
-                // Special case: if key is "@", this is array iteration
-                if key == "@" {
+                // Special case: if key is "@", this is array iteration — and
+                // `[*]` when a slice follows, mirroring the bracket branch above
+                // (`${arr[*]:off:len}` is bash's element slice too; the offset
+                // and length used to be dropped and the WHOLE array returned).
+                // Without a ':' the `*` subscript keeps its ordinary path.
+                if key == "@"
+                    || (key == "*" && content[bracket_end + 1..].starts_with(':'))
+                {
                     // Check if there is a slice specification after the bracket: @]:offset:length
                     let rest = &content[bracket_end + 1..];
                     if rest.starts_with(':') {
+                        // The `[*]` face rides in the name (see the bracket
+                        // branch above): the renderer reads IFS[0] for `[*]`
+                        // and a space for `[@]`, and a slice arm that does not
+                        // know the face must default to the `[@]` one.
+                        let face_name = if key == "*" {
+                            format!("{var_name}[*]")
+                        } else {
+                            var_name.to_string()
+                        };
                         let slice_spec = &rest[1..]; // skip ':'
                         if let Some(colon_pos) = slice_spec.find(':') {
                             let offset = &slice_spec[..colon_pos];
                             let length = &slice_spec[colon_pos + 1..];
                             return Ok(ParameterExpansion {
-                                variable: var_name.to_string(),
+                                variable: face_name,
                                 operator: ParameterExpansionOperator::ArraySlice(
                                     offset.to_string(),
                                     Some(length.to_string()),
@@ -4380,7 +4418,7 @@ fn parse_parameter_expansion_content_inner(
                         } else {
                             // offset without length
                             return Ok(ParameterExpansion {
-                                variable: var_name.to_string(),
+                                variable: face_name,
                                 operator: ParameterExpansionOperator::ArraySlice(
                                     slice_spec.to_string(),
                                     None,

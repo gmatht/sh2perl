@@ -241,10 +241,17 @@ impl std::fmt::Display for Word {
             Word::MapKeys(map_name, _) => write!(f, "!{}[@]", map_name),
             Word::MapLength(map_name, _) => write!(f, "#{}[@]", map_name),
             Word::ArraySlice(array_name, offset, length, _) => {
-                if let Some(length_str) = length {
-                    write!(f, "${{{}}}[@]:{}:{}", array_name, offset, length_str)
+                // A face-carrying name (`a[*]` — see the StringPart arm)
+                // must not get a second subscript.
+                let face = if array_name.ends_with("[@]") || array_name.ends_with("[*]") {
+                    ""
                 } else {
-                    write!(f, "${{{}}}[@]:{}", array_name, offset)
+                    "[@]"
+                };
+                if let Some(length_str) = length {
+                    write!(f, "${{{array_name}}}{face}:{offset}:{length_str}")
+                } else {
+                    write!(f, "${{{array_name}}}{face}:{offset}")
                 }
             }
             Word::Arithmetic(expr, _) => write!(f, "{}", expr.expression),
@@ -389,13 +396,24 @@ impl std::fmt::Display for Word {
                             result.push_str(&format!("#{}[@]", map_name))
                         }
                         StringPart::ArraySlice(array_name, offset, length) => {
+                            // A name that already carries the FACE (the star
+                            // slice parses as `a[*]` so the renderer can join
+                            // on IFS[0]) must not be subscripted again —
+                            // `${a[*][*]:1:2}`.  A bare name keeps `[@]`,
+                            // which is what it has always meant.
+                            let face = if array_name.ends_with("[@]")
+                                || array_name.ends_with("[*]")
+                            {
+                                array_name.clone()
+                            } else {
+                                format!("{array_name}[@]")
+                            };
                             if let Some(length_str) = length {
                                 result.push_str(&format!(
-                                    "${{{}[@]:{}:{}}}",
-                                    array_name, offset, length_str
+                                    "${{{face}:{offset}:{length_str}}}"
                                 ));
                             } else {
-                                result.push_str(&format!("${{{}[@]:{}}}", array_name, offset));
+                                result.push_str(&format!("${{{face}:{offset}}}"));
                             }
                         }
                         StringPart::Arithmetic(expr) => result.push_str(&expr.expression),
@@ -570,10 +588,16 @@ impl Word {
             Word::MapKeys(map_name, _) => format!("!{}[@]", map_name),
             Word::MapLength(map_name, _) => format!("#{}[@]", map_name),
             Word::ArraySlice(array_name, offset, length, _) => {
-                if let Some(length_str) = length {
-                    format!("${{{}}}[@]:{}:{}", array_name, offset, length_str)
+                // A face-carrying name (`a[*]`) must not get a second subscript.
+                let face = if array_name.ends_with("[@]") || array_name.ends_with("[*]") {
+                    ""
                 } else {
-                    format!("${{{}}}[@]:{}", array_name, offset)
+                    "[@]"
+                };
+                if let Some(length_str) = length {
+                    format!("${{{array_name}}}{face}:{offset}:{length_str}")
+                } else {
+                    format!("${{{array_name}}}{face}:{offset}")
                 }
             }
             Word::Arithmetic(expr, _) => expr.expression.to_string(),
@@ -718,13 +742,24 @@ impl Word {
                             result.push_str(&format!("${{#{}}}[@]", map_name))
                         }
                         StringPart::ArraySlice(array_name, offset, length) => {
+                            // A name that already carries the FACE (the star
+                            // slice parses as `a[*]` so the renderer can join
+                            // on IFS[0]) must not be subscripted again —
+                            // `${a[*][*]:1:2}`.  A bare name keeps `[@]`,
+                            // which is what it has always meant.
+                            let face = if array_name.ends_with("[@]")
+                                || array_name.ends_with("[*]")
+                            {
+                                array_name.clone()
+                            } else {
+                                format!("{array_name}[@]")
+                            };
                             if let Some(length_str) = length {
                                 result.push_str(&format!(
-                                    "${{{}[@]:{}:{}}}",
-                                    array_name, offset, length_str
+                                    "${{{face}:{offset}:{length_str}}}"
                                 ));
                             } else {
-                                result.push_str(&format!("${{{}[@]:{}}}", array_name, offset));
+                                result.push_str(&format!("${{{face}:{offset}}}"));
                             }
                         }
                         StringPart::Arithmetic(expr) => result.push_str(&expr.expression),

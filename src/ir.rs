@@ -996,6 +996,24 @@ fn stmt_uses_say(stmt: &IrStmt) -> bool {
 /// migrate, the Generator emits real IR nodes and this renderer emits
 /// them as Perl; `from_raw_perl` becomes unnecessary when the Generator
 /// emits pure IR nodes. See PLAN.md §3 and `docs/ir-design.md`.
+thread_local! {
+    /// True while rendering a program that MOVES the status through
+    /// `$CHILD_ERROR` itself (the process-substitution save/restore). Only
+    /// then does the register write also refresh that mirror — otherwise the
+    /// source `$?` read is the register read `($? >> 8)` and the extra
+    /// assignment would be noise on every statement.
+    static CHILD_ERROR_CARRIER: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+fn childe_error_carrier() -> bool {
+    CHILD_ERROR_CARRIER.with(|c| c.get())
+}
+
+/// Install the carrier verdict for the render about to run.
+pub fn set_childe_error_carrier(v: bool) {
+    CHILD_ERROR_CARRIER.with(|c| c.set(v));
+}
+
 pub fn shir_to_perl(prog: &IrProgram) -> String {
     let mut out = String::new();
 
@@ -1288,6 +1306,17 @@ fn first_code_newline(s: &str) -> Option<usize> {
         body.push('\n');
     }
 
+    // ── The status register is Perl's own `$?` (second half) ──────────
+    //
+    // `rc_write` spells the statement-level writes as register updates, but
+    // several capability templates bake the tracker into a PREBUILT string
+    // (`print(…); $main_exit_code = $CHILD_ERROR = 0;`, the capture and
+    // process-substitution helpers). Those cannot be reached by `rc_write`,
+    // so the surviving literal writes are rewritten here — over the finished
+    // body, before the preamble scan (which decides whether the tracker is
+    // declared at all) and before the epilogue.
+    body = rc_register_in_text(&body);
+
     // Exit — only if $main_exit_code might be non-zero (i.e. if any
     // statement references it).  For scripts that never touch it,
     // omit the exit so Perl's default exit(0) applies.
@@ -1298,7 +1327,11 @@ fn first_code_newline(s: &str) -> Option<usize> {
             .iter()
             .any(|sub| sub.body.iter().any(|s| stmt_refers_to_main_exit(s)));
     if has_main_exit {
-        body.push_str("exit $main_exit_code;\n");
+        // The register IS the status: `$?` holds the wait status left by the
+        // last child, so the epilogue shifts the shell code back out of it.
+        // A body ending in a builtin leaves `$?` at the previous child's
+        // status, exactly as bash's `$?` does.
+        body.push_str("exit $? >> 8;\n");
     }
 
     if modern_ir {
@@ -1848,10 +1881,100 @@ fn rc_unread() -> bool {
 /// to the old literal.
 fn rc_write(write: &str) -> String {
     if rc_unread() {
-        String::new()
-    } else {
-        write.to_string()
+        return String::new();
     }
+    // ── The status register is Perl's own `$?` ────────────────────────
+    //
+    // The rendered bookkeeping and Perl's register mean the same thing:
+    // `$?` is the WAIT status (shell code << 8) of the last child. Spelling
+    // each write as that register update makes the bookkeeping MEANINGFUL
+    // instead of a private tracker pair that nothing but the epilogue reads:
+    //
+    //   `$main_exit_code = $CHILD_ERROR = 0;`  →  `$? = 0;`
+    //   `$main_exit_code = $CHILD_ERROR = X;`  →  `$? = X << 8;`
+    //
+    // `$CHILD_ERROR` remains the shell CODE (the sites that read it by name
+    // are untouched, and a source `$?` read maps to it), so nothing that
+    // reads a status changes meaning.
+    if let Some(rc) = write
+        .trim()
+        .strip_suffix(';')
+        .and_then(|t| t.strip_prefix("$main_exit_code = $CHILD_ERROR = "))
+    {
+        // `$?` is a WAIT status, and assignment to it is direct — `$? = 1`
+        // reads back as code 0 (`$? >> 8`), not 1 (measured). Every write
+        // therefore shifts its shell CODE into place — and the shift must
+        // bind to the VALUE, not to the last operand of a ternary
+        // (`a ? 0 : 1 << 8` would shift only the `1` branch).
+        let val = if !rc.is_empty() && rc.chars().all(|c| c.is_ascii_digit()) {
+            format!("{rc} << 8")
+        } else {
+            format!("({rc}) << 8")
+        };
+        let nl = if write.ends_with('\n') { "\n" } else { "" };
+        // `$CHILD_ERROR` is what a source `$?` read names. A program whose
+        // status plumbing is self-contained (the common case) needs only the
+        // register — the read renders as `($? >> 8)`. A program that MOVES
+        // the value through a variable of its own (the process-substitution
+        // save/restore, `$__ps_statusN = $CHILD_ERROR`) needs the mirror
+        // kept in step, so those get both writes.
+        // A write that is already `$? >> 8` is DERIVED from the register
+        // (`system('bash', …)` just set it): assigning it back would read
+        // the value it is about to overwrite.
+        if rc.trim() == "$? >> 8" {
+            if childe_error_carrier() {
+                return format!("$CHILD_ERROR = $? >> 8;{nl}");
+            }
+            return String::new();
+        }
+        if childe_error_carrier() {
+            return format!("$? = {val}; $CHILD_ERROR = $? >> 8;{nl}");
+        }
+        return format!("$? = {val};{nl}");
+    }
+    write.to_string()
+}
+
+/// Rewrite every literal `$main_exit_code = $CHILD_ERROR = <rc>;` in a
+/// RENDERED body to the register form (`$? = <rc>` / `$? = <rc> << 8;`),
+/// leaving `$CHILD_ERROR` untouched (the sites that read the shell CODE by
+/// name are what source `$?` reads map to). Only whole-statement writes are
+/// rewritten: the RHS must reach its `;` on the same line, so a `q{…}`
+/// template that merely CONTAINS the text is left alone.
+fn rc_register_in_text(body: &str) -> String {
+    const MARKER: &str = "$main_exit_code = $CHILD_ERROR = ";
+    if !body.contains(MARKER) {
+        return body.to_string();
+    }
+    let mut out = String::with_capacity(body.len());
+    let mut i = 0usize;
+    while let Some(rel) = body[i..].find(MARKER) {
+        let at = i + rel;
+        out.push_str(&body[i..at]);
+        let after = &body[at + MARKER.len()..];
+        match after.find(';') {
+            Some(j) if !after[..j].contains('\n') => {
+                let rc = after[..j].trim();
+                let val = if !rc.is_empty() && rc.chars().all(|c| c.is_ascii_digit()) {
+                    format!("{rc} << 8")
+                } else {
+                    format!("({rc}) << 8")
+                };
+                if childe_error_carrier() {
+                    out.push_str(&format!("$? = {val}; $CHILD_ERROR = $? >> 8;"));
+                } else {
+                    out.push_str(&format!("$? = {val};"));
+                }
+                i = at + MARKER.len() + j + 1;
+            }
+            _ => {
+                out.push_str(MARKER);
+                i = at + MARKER.len();
+            }
+        }
+    }
+    out.push_str(&body[i..]);
+    out
 }
 
 /// Strip status-register writes from a PREBUILT rendering (a chain /
@@ -4536,7 +4659,18 @@ fn var_read(name: &str) -> String {
         // scopes.
         "#" => "scalar(@ARGV)".to_string(),
         "-" => "'hB'".to_string(), // bash's default non-interactive $- (hashall + braceexpand)
-        "?" => "$CHILD_ERROR".to_string(),
+        // `$?` is the shell CODE, which `$CHILD_ERROR` carries: the
+        // process-substitution status SAVE (`$__ps_statusN = $CHILD_ERROR`)
+        // and its restore write that variable directly, so the register is
+        // not the only carrier. Every register write refreshes the mirror
+        // (see `rc_write`) so the two cannot drift.
+        "?" => {
+            if childe_error_carrier() {
+                "$CHILD_ERROR".to_string()
+            } else {
+                "($? >> 8)".to_string()
+            }
+        }
         // `$!` — the pid of the most recent background job. The Background
         // arm writes it; without this arm the name fell through to the
         // generic branch and rendered `${!}` (an undefined Perl symbolic
@@ -5989,9 +6123,17 @@ fn chain_operand_native(o: &IrExpr) -> Option<String> {
     {
         return None;
     }
-    // The caller reads $CHILD_ERROR right after this body: a render that
-    // never writes it (status-dead analysis) would leave a stale flag.
-    if !t.contains("$CHILD_ERROR") {
+    // The caller reads the operand's STATUS right after this body: a render
+    // that never writes it (status-dead analysis) would leave a stale flag.
+    //
+    // EITHER spelling counts. `$CHILD_ERROR` carries the shell CODE, but the
+    // renderer now spells a status write as the register update (`$? = rc << 8`
+    // — see `rc_write`) whenever the program does not move the value through a
+    // variable of its own (`childe_error_carrier()`), in which case the body
+    // legitimately contains no `$CHILD_ERROR` at all. Testing only for the
+    // carrier made every such operand fall back to the `system('bash', …)`
+    // arm — the callout this function exists to remove.
+    if !t.contains("$CHILD_ERROR") && !t.contains("$?") {
         return None;
     }
     Some(t.to_string())
@@ -6319,6 +6461,34 @@ fn bash_param_syntax(args: &[IrExpr]) -> String {
         let val = args.get(2).and_then(call_arg_str).unwrap_or_default();
         format!("${{{}{}{}}}", name, op, val)
     }
+}
+
+/// Contract §5.7 (docs/backend-universal-contract.md): the reader keeps
+/// ONE backslash level of a substitution operand's source text, and each
+/// CONSUMER strips it before a literal use — `"${v/Q/\c}"` replaces with
+/// `c`, `"${v/Q/\\c}"` with `\c` (measured against bash). Rebuilding the
+/// shell text (`bash_param_syntax` above) must NOT strip: the raw spelling
+/// is what bash re-parses. Stripping belongs to the consumers that take
+/// the operand apart themselves — a constant fold, or a backend that
+/// lowers the expansion to its own string operation instead of replaying
+/// it to a child shell. `estree`'s `unescape_one_level` and `perl`'s
+/// render arm are earlier copies of exactly this rule; keeping it in one
+/// place is what stops the copies drifting (a literal `\\` collapsed to
+/// nothing, or an escaped quote that never matched).
+pub fn subst_operand_unescape(s: &str) -> String {
+    let mut out = String::with_capacity(s.len());
+    let mut it = s.chars();
+    while let Some(c) = it.next() {
+        if c == '\\' {
+            match it.next() {
+                Some(c2) => out.push(c2),
+                None => out.push('\\'),
+            }
+        } else {
+            out.push(c);
+        }
+    }
+    out
 }
 
 fn bash_word_for(w: &IrExpr) -> String {

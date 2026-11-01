@@ -85,7 +85,7 @@ pub(crate) fn native_pipeline(e: &IrExpr) -> Option<String> {
         if let Some(word) = yes_word(s1) {
             if let Some(n) = head_n(s2) {
                 return Some(format!(
-                    "print(({} . \"\\n\") x {}); $main_exit_code = $CHILD_ERROR = 0;",
+                    "print(({} . \"\\n\") x {}); $? = 0;",
                     crate::ir::safe_perl_q_string(&word),
                     n
                 ));
@@ -97,7 +97,7 @@ pub(crate) fn native_pipeline(e: &IrExpr) -> Option<String> {
             if is_bare_exec(s2, "bc") {
                 if let Some(expr) = bc_word_expr(w) {
                     return Some(format!(
-                        "print int({expr}), \"\\n\"; $main_exit_code = $CHILD_ERROR = 0;"
+                        "print int({expr}), \"\\n\"; $? = 0;"
                     ));
                 }
             }

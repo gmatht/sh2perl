@@ -3248,3 +3248,63 @@ fn brace_range(r: &serde_json::Value) -> Vec<String> {
     }
     vec![format!("{start}..{end}")]
 }
+
+/// Does any statement in `stmts` READ the shell exit status?
+///
+/// The read surfaces: the `?` variable (a `$?` / `$CHILD_ERROR` read the IR
+/// kept as a Var), a `PIPESTATUS` peek, and the renderer-baked spellings.
+/// Errs on the side of reporting a read: a false positive only keeps the
+/// status mirror, which is always correct.
+pub fn stmts_read_status(stmts: &[IrStmt]) -> bool {
+    fn expr_reads(e: &IrExpr) -> bool {
+        match e {
+            IrExpr::Var(n, _) => matches!(n.as_str(), "?" | "CHILD_ERROR" | "PIPESTATUS"),
+            IrExpr::Str(s, _) => s.contains("$? >> 8") || s.contains("$CHILD_ERROR"),
+            IrExpr::BinOp { lhs, rhs, .. } => expr_reads(lhs) || expr_reads(rhs),
+            IrExpr::Index { key, .. } => expr_reads(key),
+            IrExpr::Interpolate(parts) => parts.iter().any(|p| match p {
+                InterpPart::Lit(s) => s.contains("$? >> 8") || s.contains("$CHILD_ERROR"),
+                InterpPart::Expr(x) => expr_reads(x),
+            }),
+            IrExpr::Ternary { cond, then, else_ } => {
+                expr_reads(cond) || expr_reads(then) || expr_reads(else_)
+            }
+            IrExpr::DefinedOr { expr, default } => expr_reads(expr) || expr_reads(default),
+            IrExpr::Call { func, args } => {
+                func.contains("PIPESTATUS") || args.iter().any(expr_reads)
+            }
+            IrExpr::MethodCall { obj, args, .. } => expr_reads(obj) || args.iter().any(expr_reads),
+            IrExpr::Capture { expr, .. } => expr_reads(expr),
+            IrExpr::Arrow(body) => stmts_read_status(body),
+            _ => false,
+        }
+    }
+    stmts.iter().any(|st| match st {
+        IrStmt::Assign { expr, .. } => expr_reads(expr),
+        IrStmt::Declare { init, .. } => init.as_ref().map(expr_reads).unwrap_or(false),
+        IrStmt::Output { value, .. } => expr_reads(value),
+        IrStmt::Expr(e) => expr_reads(e),
+        IrStmt::Return(Some(e)) | IrStmt::Exit(Some(e)) => expr_reads(e),
+        IrStmt::SetChildError(e) => expr_reads(e),
+        IrStmt::If { cond, then, elsifs, else_, .. } => {
+            expr_reads(cond)
+                || stmts_read_status(then)
+                || elsifs.iter().any(|(c, b)| expr_reads(c) || stmts_read_status(b))
+                || stmts_read_status(else_)
+        }
+        IrStmt::While { cond, body, .. } | IrStmt::DoWhile { cond, body, .. } => {
+            expr_reads(cond) || stmts_read_status(body)
+        }
+        IrStmt::For { body, .. } => stmts_read_status(body),
+        IrStmt::Case { discriminant, clauses, .. } => {
+            expr_reads(discriminant) || clauses.iter().any(|c| stmts_read_status(&c.body))
+        }
+        IrStmt::Block(b)
+        | IrStmt::Subshell(b)
+        | IrStmt::Background(b)
+        | IrStmt::Function { body: b, .. }
+        | IrStmt::Redirect { inner: b, .. } => stmts_read_status(b),
+        IrStmt::Pipeline { stages, .. } => stages.iter().any(|s| stmts_read_status(s)),
+        _ => false,
+    })
+}
