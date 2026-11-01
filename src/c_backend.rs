@@ -4004,6 +4004,106 @@ fn seed_int_element_readers(prog: &mut IrProgram) {
     }
 }
 
+/// Seed the shared `numeric_observed` verdict into the Int set.
+///
+/// The analysis answers a language-neutral question: which scalars and
+/// callee param slots are only ever READ as numbers (an arithmetic
+/// operand, an array subscript key, a numeric test, a copy into another
+/// such cell, a pass into another such slot) and never as text. Storing
+/// the *parsed* value is then observationally identical — every reader
+/// re-parses — so homing the cell `long long` deletes the per-read
+/// strdup/atoll round trip. The paradigm is MIMEcroft's per-pixel
+/// `rb_mkhex`: three text params copied into text globals that nothing
+/// reads as text, only as `RBHEX[atoll(x)]` keys.
+///
+/// Seeding only ADDS verdicts. `demote_stringy_ints` re-validates every
+/// one per (var, position) site, so a seed whose value is stringy
+/// anywhere — the mixed-ABI truncation that would pass `atoll("0.85")`
+/// as a fraction — is removed again exactly as it was before this seed
+/// existed. `SH2_NO_NUMOBS=1` reverts to the pre-seed verdicts.
+fn seed_numeric_observed(
+    prog: &mut IrProgram,
+    param_seeds: &mut HashMap<String, BTreeSet<usize>>,
+    positions: &mut HashMap<String, BTreeSet<usize>>,
+) {
+    if std::env::var_os("SH2_NO_NUMOBS").is_some() {
+        return;
+    }
+    let nb = crate::shir_passes::numeric_observed::analyze(prog);
+    // A cell is promoteable when the SHARED verdict says so AND the name
+    // is defined in exactly one function. The second half is this
+    // backend's own gate, not the analysis's, and it closes the two
+    // hazards this file already documents: a read the IR does not model
+    // — the name interpolated into a command string,
+    // `lt_cache=/tmp/x-$lt_name-$ts` — and a positional name reused
+    // across functions (`lt_name=$1` in both load_tex and load_tex4).
+    // `lt_name` hit both: promoting it deleted the global the hoisted
+    // capture helper still reads (`undeclared lt_name`).
+    let mut names = BTreeSet::new();
+    let mut defs = Vec::new();
+    collect_fn_defs(&prog.stmts, &mut names, &mut defs);
+    let mut def_in: HashMap<String, Vec<&String>> = HashMap::new();
+    for (fname, body) in &defs {
+        for st in body {
+            if let IrStmt::Assign { targets, .. } = st {
+                for t in targets {
+                    def_in.entry(t.var.clone()).or_default().push(fname);
+                }
+            }
+        }
+    }
+    let unique_def = |v: &str| -> Option<&String> {
+        match def_in.get(v).map(|f| f.as_slice()) {
+            Some([only]) => Some(only),
+            _ => None,
+        }
+    };
+    let promote = |prog: &mut IrProgram, v: &str| -> bool {
+        if prog.var_types.contains(&(v.to_string(), IrType::Int)) {
+            return false;
+        }
+        prog.var_types.retain(|(n, _)| n != v);
+        prog.var_types.push((v.to_string(), IrType::Int));
+        true
+    };
+    let mut pushed = 0usize;
+    // Param leg: a positional copy `v = $d` whose slot every read treats
+    // numerically. The (var, position) pair is what both the demote gate
+    // and the native-signature analysis key on.
+    for (fname, body) in &defs {
+        for st in body {
+            let IrStmt::Assign { targets, expr, .. } = st else {
+                continue;
+            };
+            let Some(d) = Render::positional_digit(expr) else {
+                continue;
+            };
+            let Some(t) = targets.first() else { continue };
+            if !t.indices.is_empty()
+                || !nb.scalar(&t.var)
+                || !nb.param(fname, d)
+                || unique_def(&t.var) != Some(fname)
+            {
+                continue;
+            }
+            positions.entry(fname.clone()).or_default().insert(d);
+            param_seeds.entry(t.var.clone()).or_default().insert(d);
+            if promote(prog, &t.var) {
+                pushed += 1;
+            }
+        }
+    }
+    // Var leg: every further numeric-observed scalar with a single def.
+    for (name, _) in prog.var_types.clone() {
+        if nb.scalar(&name) && unique_def(&name).is_some() && promote(prog, &name) {
+            pushed += 1;
+        }
+    }
+    if std::env::var("SH2_DEBUG_NUMOBS").is_ok() {
+        eprintln!("NUMOBS seeded {pushed} Int upgrades");
+    }
+}
+
 /// Int-array verdict for the C backend: the shared analysis UNION the
 /// int-element arrays (C-backend-local — other backends keep the shared
 /// verdict exactly).
@@ -9726,9 +9826,10 @@ pub fn shir_to_c(prog: &IrProgram) -> String {
     // Int-element readers seed first (their arrayIndex sources are
     // numeric exactly when homed — see the `is_numeric` arrayIndex
     // arm), so demote re-validates every seed below.
-    let (numstr_param_seeds, mut numstr_positions, numstr_verdict) =
+    let (mut numstr_param_seeds, mut numstr_positions, numstr_verdict) =
         seed_numstr_fixpoint(&mut prog);
     seed_int_element_readers(&mut prog);
+    seed_numeric_observed(&mut prog, &mut numstr_param_seeds, &mut numstr_positions);
     demote_stringy_ints(&mut prog, &numstr_param_seeds);
     // POSITIONS RE-VALIDATION: the params verdict above was computed
     // while demote still believed some vars Int that are now Str — a
