@@ -1134,6 +1134,80 @@ pub fn render_verdict_lock() -> std::sync::MutexGuard<'static, ()> {
 ///
 /// Pure and program-scoped (no install/static), so any backend can call
 /// it once per render and every backend agrees on the answer.
+/// Does this ONE statement end control flow for the list it sits in?
+///
+/// The shared definition of "terminator" for every consumer that needs
+/// one: the `unreachable-after-terminator` transform (to drop a dead
+/// tail), and renderers (to skip an epilogue or a synthesized restore
+/// that no path can reach). Keeping it in ONE place is what makes "dead
+/// after `exit`" and "dead after `while true`" agree.
+///
+/// `in_fn` gates `return`: a `return` leaves the enclosing FUNCTION, and
+/// outside one it is a bash error that backends may render as something
+/// else entirely.
+pub fn stmt_terminates(st: &IrStmt, in_fn: bool) -> bool {
+    match st {
+        IrStmt::Exit(_) | IrStmt::Die { .. } | IrStmt::Break | IrStmt::Continue => true,
+        IrStmt::Return(_) => in_fn,
+        // an infinite loop only ends through `break`/`return`/`exit` in
+        // its body, so with no escaping `break` it never falls through
+        IrStmt::While { cond, body } => is_true_cond(cond) && !loop_escapes(body),
+        IrStmt::ForInit { cond, body, .. } => is_true_cond(cond) && !loop_escapes(body),
+        _ => false,
+    }
+}
+
+/// Does this statement LIST never fall through to the next statement?
+///
+/// Only the LAST statement decides: a terminator nested in an `if`/`case`
+/// still falls through on another arm.
+pub fn list_terminates(stmts: &[IrStmt], in_fn: bool) -> bool {
+    stmts.last().is_some_and(|s| stmt_terminates(s, in_fn))
+}
+
+fn is_true_cond(cond: &IrExpr) -> bool {
+    matches!(cond, IrExpr::Bool(true))
+}
+
+/// Can a `break` inside this loop body escape the loop? A `break` inside
+/// a DEEPER loop is that loop's business; a `break` inside a `case` still
+/// breaks the enclosing loop (bash's `case` captures nothing), and a
+/// `break` inside a function body cannot escape at all.
+pub fn loop_escapes(stmts: &[IrStmt]) -> bool {
+    fn has_break(st: &IrStmt) -> bool {
+        match st {
+            IrStmt::Break => true,
+            // a nested loop owns its own breaks
+            IrStmt::While { .. }
+            | IrStmt::DoWhile { .. }
+            | IrStmt::For { .. }
+            | IrStmt::ForInit { .. } => false,
+            // the constructs a `break` can hide inside
+            IrStmt::If { then, elsifs, else_, .. } => {
+                then.iter().any(has_break)
+                    || elsifs.iter().any(|(_, b)| b.iter().any(has_break))
+                    || else_.iter().any(has_break)
+            }
+            IrStmt::Case { clauses, .. } => {
+                clauses.iter().any(|c| c.body.iter().any(has_break))
+            }
+            IrStmt::Block(b) | IrStmt::Subshell(b) | IrStmt::Background(b) => {
+                b.iter().any(has_break)
+            }
+            // `break` does not always arrive as the STATEMENT: `break ||
+            // exit 1` keeps it as a CONTROL CALL inside a `BinOp`
+            // (`func: "break"`, purity Control). Missing that form is
+            // how the first version pruned the statements after
+            // `while true; do break || exit 1; done` — the loop looked
+            // infinite. The Debug form carries every call the IR holds,
+            // so this cannot under-detect; it can only over-approximate,
+            // which merely keeps a tail that is dead anyway.
+            other => format!("{other:?}").contains("func: \"break\""),
+        }
+    }
+    stmts.iter().any(has_break)
+}
+
 pub fn program_observes_pipestatus(prog: &IrProgram) -> bool {
     format!("{:?}", (&prog.stmts, &prog.subs)).contains("PIPESTATUS")
 }

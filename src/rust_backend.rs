@@ -4309,11 +4309,25 @@ impl Render {
     }
 
     fn read_num_of_str(&mut self, name: &str) -> String {
-        // `read_str` yields an OWNED value (a `clone()` for a plain local),
-        // but every consumer here is `.trim()`, which only BORROWS — so the
-        // clone is a wasted allocation at every numeric read of a
-        // string-homed var (`[ "$x" -gt 3 ]` on an argv-derived local:
-        // `x.clone().trim().parse::<i64>()` → `x.trim().parse::<i64>()`).
+        // A TLS home parses INSIDE the borrow: the whole read is
+        // `__SHV_x.with(|v| v.borrow().trim().parse::<i64>()…)`, so the
+        // String `read_str` would hand over is never created. This is the
+        // shape `read_str` falls through to for any var with no local,
+        // captured or loop binding — 88 corpus sites cloned one String per
+        // numeric read (`__SHV_y.with(|v| v.borrow().clone()).trim()…`).
+        if !self.captured.contains_key(name)
+            && !self.local_vars.contains_key(name)
+            && !self
+                .active_loop
+                .iter()
+                .any(|(v, _, k)| v == name && *k == LoopBind::Str)
+        {
+            let m = self.tls(name);
+            return format!("{m}.with(|v| v.borrow().trim().parse::<i64>().unwrap_or(0))");
+        }
+        // Otherwise `read_str` yields an OWNED value (a `clone()` for a
+        // plain local), but every consumer here is `.trim()`, which only
+        // BORROWS — so the clone is wasted there too (`x.trim()…`).
         let s = Self::drop_trailing_clone(&self.read_str(name));
         format!("{s}.trim().parse::<i64>().unwrap_or(0)")
     }
@@ -6286,7 +6300,11 @@ impl Render {
                 let r = self.arith(rhs);
                 let cur = self.getvar_num(var);
                 match op.as_str() {
-                    "=" => format!("{{ let __v = {r}; {} __v }}", self.write_num_or_str(var, "__v")),
+                    "=" => format!(
+                        "{{ let __v = {}; {} __v }}",
+                        Self::let_value(&r),
+                        self.write_num_or_str(var, "__v")
+                    ),
                     _ => {
                         let aop = op.trim_end_matches('=');
                         let stmt = self.write_num_or_str(var, &format!("({cur} {aop} {r})"));
@@ -6552,7 +6570,8 @@ impl Render {
                     .join(" ");
                 if let Some(e) = self.let_expr(&text) {
                     self.emit(&format!(
-                        "let _ = {{ let __v = ({e}); __SH_RC.store(if __v != 0 {{ 0 }} else {{ 1 }}, Ordering::SeqCst); __v }};"
+                        "let _ = {{ let __v = {}; __SH_RC.store(if __v != 0 {{ 0 }} else {{ 1 }}, Ordering::SeqCst); __v }};",
+                        Self::let_value(&e)
                     ));
                 } else {
                     self.mark_todo("let");
@@ -6803,7 +6822,10 @@ impl Render {
                 if is_bool {
                     format!("{{ let __b = {e}; __SH_RC.store(if __b {{ 0 }} else {{ 1 }}, Ordering::SeqCst); __b }}")
                 } else {
-                    format!("{{ let __v = ({e}); __SH_RC.store(if __v != 0 {{ 0 }} else {{ 1 }}, Ordering::SeqCst); __v != 0 }}")
+                    format!(
+                        "{{ let __v = {}; __SH_RC.store(if __v != 0 {{ 0 }} else {{ 1 }}, Ordering::SeqCst); __v != 0 }}",
+                        Self::let_value(&e)
+                    )
                 }
             }
             "test" => {
@@ -9334,7 +9356,15 @@ impl Render {
                     "__SH_OUTFILE_TL.with(|v| *v.borrow_mut() = Some(std::fs::OpenOptions::new().append(true).create(true).open(&{te}).unwrap_or_else(|_| std::fs::File::open(\"/dev/null\").unwrap())));"
                 ));
             }
-            post.push("__SH_OUTFILE_TL.with(|v| *v.borrow_mut() = __oldout);".to_string());
+            // The restore is unreachable when the region's body never
+            // falls through (an infinite loop, an `exit`): rustc says so
+            // ("unreachable statement", 096_head_procsub's
+            // `loop { print; sleep }` followed by the restore). The
+            // shared terminator verdict decides, so the IR prune and this
+            // guard can never disagree.
+            if !crate::shir::list_terminates(inner, false) {
+                post.push("__SH_OUTFILE_TL.with(|v| *v.borrow_mut() = __oldout);".to_string());
+            }
         }
         // an fd-1 FILE sink (or the closed-fd/stderr null dup) makes
         // every print inside `inner` sink-routed: `sink_free_here` reads
@@ -10096,6 +10126,58 @@ impl Render {
         // the receiver was parenthesized (`(x).clone()`): keep the parens
         // only if the base itself needed them — a bare path does not
         base.to_string()
+    }
+
+    /// Strip ONE outer paren pair from a value that lands in a `let`
+    /// initializer.
+    ///
+    /// A `let` takes ANY expression, so the pair the renderer wraps around a
+    /// compound value for precedence is pure text here — rustc's
+    /// `unused_parens` names the exact position ("unnecessary parentheses
+    /// around assigned value", 10 corpus sites from the arith-capture
+    /// template alone: `let __v = (y + 2);`).
+    ///
+    /// Refused when the pair does NOT enclose the whole value (depth returns
+    /// to 0 early), when there is a top-level `,` (a tuple), or when the
+    /// scan cannot be sure about a string/char literal.
+    fn let_value(expr: &str) -> String {
+        let t = expr.trim();
+        let b = t.as_bytes();
+        if b.len() < 3 || b[0] != b'(' || b[b.len() - 1] != b')' {
+            return expr.to_string();
+        }
+        let inner = &t[1..t.len() - 1];
+        let mut depth = 0i32;
+        let mut in_str = false;
+        let mut esc = false;
+        for c in inner.chars() {
+            if in_str {
+                if esc {
+                    esc = false;
+                } else if c == '\\' {
+                    esc = true;
+                } else if c == '"' {
+                    in_str = false;
+                }
+                continue;
+            }
+            match c {
+                '"' => in_str = true,
+                '(' | '[' | '{' => depth += 1,
+                ')' | ']' | '}' => {
+                    depth -= 1;
+                    if depth < 0 {
+                        return expr.to_string();
+                    }
+                }
+                ',' if depth == 0 => return expr.to_string(),
+                _ => {}
+            }
+        }
+        if in_str || depth != 0 {
+            return expr.to_string();
+        }
+        inner.trim().to_string()
     }
 
     fn vec_of_one(expr: &str) -> Option<&str> {
@@ -11583,7 +11665,7 @@ impl Render {
                     // ONE evaluation — the side-effecting arith must not
                     // run twice (the increments would double-apply)
                     let v = self.gensym("__sh_arith_v");
-                    self.emit(&format!("let {v} = {x};"));
+                    self.emit(&format!("let {v} = {};", Self::let_value(&x)));
                     if arith_writes_target {
                         if let Some(t) = targets.first() {
                             let tvar = t.var.split('[').next().unwrap_or(&t.var).to_string();
@@ -12059,7 +12141,16 @@ impl Render {
                     self.emit(&format!("let mut {ran} = false;"));
                     self.emit(&format!("let mut {last} = 0;"));
                 }
-                self.emit(&format!("while {} {{", Self::unparen(&c)));
+                // `while true {` is rustc's `while_true` lint: `loop {` is
+                // the idiomatic spelling of a condition that is always
+                // true, and it is the same program (a plain `break` leaves
+                // both as `()`).
+                let c = Self::unparen(&c);
+                if c == "true" {
+                    self.emit("loop {");
+                } else {
+                    self.emit(&format!("while {c} {{"));
+                }
                 self.loop_depth += 1;
                 self.depth += 1;
                 if track {
@@ -12772,7 +12863,16 @@ impl Render {
                 let last = self.gensym("__sh_forinit_last");
                 self.emit(&format!("let mut {ran} = false;"));
                 self.emit(&format!("let mut {last} = 0;"));
-                self.emit(&format!("while {} {{", Self::unparen(&c)));
+                // `while true {` is rustc's `while_true` lint: `loop {` is
+                // the idiomatic spelling of a condition that is always
+                // true, and it is the same program (a plain `break` leaves
+                // both as `()`).
+                let c = Self::unparen(&c);
+                if c == "true" {
+                    self.emit("loop {");
+                } else {
+                    self.emit(&format!("while {c} {{"));
+                }
                 self.loop_depth += 1;
                 self.depth += 1;
                 self.emit(&format!("{ran} = true;"));
@@ -13189,6 +13289,19 @@ impl Render {
         // falls off its end. EXIT traps still run — they are a side
         // effect, not a status.
         let rc_zero = Self::body_rc_is_zero(&self.out);
+        // Two independent reasons the epilogue's `exit` would be dead text
+        // rustc calls an "unreachable statement": the IR tail never falls
+        // through (the SHARED terminator verdict — including an infinite
+        // `loop {}`), or the last line ALREADY emitted is a `process::exit`
+        // written by another layer (a trap-carrying body folds its saved
+        // code to a literal `exit(0)`).
+        let body_already_exits = crate::shir::list_terminates(&prog.stmts, false)
+            || self
+                .out
+                .iter()
+                .rev()
+                .find(|l| !l.trim().is_empty())
+                .is_some_and(|l| l.trim_start().starts_with("std::process::exit("));
         if self.rc_disabled {
             if !self.trap_exit.is_empty() {
                 self.add_helper("run_traps");
@@ -13221,12 +13334,25 @@ impl Render {
                 }
             }
         } else if self.trap_exit.is_empty() {
-            self.emit("std::process::exit(__SH_RC.load(Ordering::SeqCst));");
+            // A body that never falls through cannot reach the epilogue:
+            // its own `process::exit(…)` already ended the process (or an
+            // infinite loop never returns). Emitting the read anyway is
+            // dead text rustc reports as an "unreachable statement"
+            // (`std::process::exit(0);` followed by the epilogue; an
+            // infinite `loop {}` followed by it). The verdict is the
+            // SHARED one, with `in_fn = false` so a top-level `return`
+            // still gets the epilogue — it leaves the exit code in the
+            // register, and dropping the epilogue would change it to 0.
+            if !body_already_exits {
+                self.emit("std::process::exit(__SH_RC.load(Ordering::SeqCst));");
+            }
         } else {
             self.emit("let __sh_final = __SH_RC.load(Ordering::SeqCst);");
             self.add_helper("run_traps");
             self.emit("__sh_run_traps();");
-            self.emit("std::process::exit(__sh_final);");
+            if !body_already_exits {
+                self.emit("std::process::exit(__sh_final);");
+            }
         }
         std::mem::swap(&mut self.out, &mut body_out);
         self.depth = 0;
@@ -20917,6 +21043,18 @@ mod tests {
             assert!(!out.contains("TODO"), "CutAt left a TODO:\n{out}");
             assert!(!out.contains("fnmatch"), "glob helper dragged in:\n{out}");
         }
+    }
+
+    /// A condition that is always true renders as `loop {`: `while true`
+    /// is rustc's `while_true` lint, and the two programs are the same (a
+    /// plain `break` leaves both as `()`).
+    #[test]
+    fn while_true_renders_as_a_loop() {
+        let out = render(
+            "i=0\nwhile true; do\n  i=$((i+1))\n  if [ \"$i\" -ge 3 ]; then break; fi\ndone\necho \"$i\"\n",
+        );
+        assert!(out.contains("loop {"), "{out}");
+        assert!(!out.contains("while true"), "{out}");
     }
 
     /// `$?` / `$$` / `$#` are integers BY CONSTRUCTION (the rc load, the pid,
