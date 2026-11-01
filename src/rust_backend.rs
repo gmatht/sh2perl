@@ -10150,7 +10150,16 @@ impl Render {
                 matches!(parts.as_slice(), [InterpPart::Expr(x)] if self.word_is_numeric(x))
             }
             IrExpr::Call { func, args } if func == "getVar" => {
-                matches!(args.first(), Some(IrExpr::Str(n, _)) if self.is_num(n))
+                matches!(args.first(), Some(IrExpr::Str(n, _))
+                    if self.is_num(n)
+                        // The SPECIAL shell reads are integers by
+                        // construction (`getvar_num`: `$?` → the rc load,
+                        // `$$` → the pid, `$#` → the argv length), so
+                        // `{}` formats them directly. Without this an
+                        // `echo "rc=$?"` produced
+                        // `__SH_RC.load(…).to_string()` — 177 such
+                        // allocations corpus-wide.
+                        || matches!(n.as_str(), "?" | "$" | "#"))
             }
             // int-RETURNING value builtins: `{}` formats an i64 directly,
             // so appending `.to_string()` is a redundant allocation
@@ -20908,6 +20917,27 @@ mod tests {
             assert!(!out.contains("TODO"), "CutAt left a TODO:\n{out}");
             assert!(!out.contains("fnmatch"), "glob helper dragged in:\n{out}");
         }
+    }
+
+    /// `$?` / `$$` / `$#` are integers BY CONSTRUCTION (the rc load, the pid,
+    /// the argv length), so `{}` formats them directly and an `echo "rc=$?"`
+    /// must not allocate a String for the status read — 177 corpus sites did.
+    #[test]
+    fn special_var_echoes_print_their_integer_directly() {
+        let out = render("sleep 0\necho \"rc=$?\"\necho \"$#\"\n");
+        assert!(
+            out.contains("println!(\"rc={}\", __SH_RC.load(Ordering::SeqCst))"),
+            "{out}"
+        );
+        assert!(
+            !out.contains("__SH_RC.load(Ordering::SeqCst).to_string()"),
+            "status read stringified:\n{out}"
+        );
+        assert!(out.contains("len() as i64)"), "{out}");
+        assert!(
+            !out.contains("len().to_string()"),
+            "argv length stringified:\n{out}"
+        );
     }
 
     /// `typeset -f f` prints the function DEFINITION, so an `echo` that the
