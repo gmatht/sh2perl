@@ -1276,6 +1276,7 @@ fn demote_string_loop_vars(prog: &IrProgram, int_set: &mut HashSet<String>) {
 fn demote_stringy_ints(
     prog: &mut IrProgram,
     pos_seeds: &HashMap<String, std::collections::BTreeSet<usize>>,
+    obs: &crate::shir_passes::numeric_observed::NumericObserved,
 ) {
     use crate::ir::{IrExpr, IrStmt};
     use std::collections::HashSet;
@@ -1289,7 +1290,18 @@ fn demote_stringy_ints(
         return;
     }
     let int_arrays = crate::c_backend::int_arrays_for_c(prog);
-    fn is_numeric(e: &IrExpr, ints: &HashSet<String>, int_arrays: &HashSet<String>) -> bool {
+    // `obs` is the shared numeric-observed verdict: a cell it proves is read
+    // ONLY as a number is numeric by construction — every reader parses it, so
+    // carrying the parsed value through a copy is the reader's own `atoll`
+    // hoisted one step earlier. Without this a copy CHAIN demotes its tail
+    // (`rbx_s = rbp_ftx`, text in, numeric out) and the whole chain falls back
+    // to text.
+    fn is_numeric(
+        e: &IrExpr,
+        ints: &HashSet<String>,
+        int_arrays: &HashSet<String>,
+        obs: &crate::shir_passes::numeric_observed::NumericObserved,
+    ) -> bool {
         match e {
             IrExpr::Int(_) => true,
             IrExpr::Arith(_) => true,
@@ -1301,12 +1313,12 @@ fn demote_stringy_ints(
                 !t.is_empty() && t.bytes().all(|c| c.is_ascii_digit())
             }
             IrExpr::Var(n, _) | IrExpr::Ident(n) => {
-                ints.contains(n) || matches!(n.as_str(), "?" | "#" | "!" | "$")
+                ints.contains(n) || obs.scalar(n) || matches!(n.as_str(), "?" | "#" | "!" | "$")
             }
             IrExpr::Call { func, args } if func == "getVar" => {
                 match crate::c_backend::Render::str_arg(args, 0).as_deref() {
                     Some(n) => {
-                        ints.contains(n) || matches!(n, "?" | "#" | "!" | "$")
+                        ints.contains(n) || obs.scalar(n) || matches!(n, "?" | "#" | "!" | "$")
                     }
                     None => false,
                 }
@@ -1352,6 +1364,7 @@ fn demote_stringy_ints(
         ints: &mut HashSet<String>,
         int_arrays: &HashSet<String>,
         pos_seeds: &HashMap<String, std::collections::BTreeSet<usize>>,
+        obs: &crate::shir_passes::numeric_observed::NumericObserved,
     ) {
         for s in stmts {
             match s {
@@ -1372,7 +1385,7 @@ fn demote_stringy_ints(
                             let pos_ok = pos_d.is_some_and(|d| {
                                 pos_seeds.get(&t.var).is_some_and(|s| s.contains(&d))
                             });
-                            let stringy = !pos_ok && !is_numeric(expr, ints, &int_arrays);
+                            let stringy = !pos_ok && !is_numeric(expr, ints, &int_arrays, obs);
                             if stringy {
                                 if std::env::var("SH2_DEBUG_DEMOTE").is_ok() { eprintln!("DEMOTE remove {} (site1)", &t.var); }
                                 ints.remove(&t.var);
@@ -1385,32 +1398,33 @@ fn demote_stringy_ints(
                         ints: &mut HashSet<String>,
                         int_arrays: &HashSet<String>,
                         pos_seeds: &HashMap<String, std::collections::BTreeSet<usize>>,
+                        obs: &crate::shir_passes::numeric_observed::NumericObserved,
                     ) {
                         match e {
                             IrExpr::Call { args, .. } => {
                                 for a in args {
-                                    walk_expr(a, ints, int_arrays, pos_seeds);
+                                    walk_expr(a, ints, int_arrays, pos_seeds, obs);
                                 }
                             }
                             IrExpr::Array(items) => {
                                 for a in items {
-                                    walk_expr(a, ints, int_arrays, pos_seeds);
+                                    walk_expr(a, ints, int_arrays, pos_seeds, obs);
                                 }
                             }
-                            IrExpr::Arrow(stmts) => walk(stmts, ints, int_arrays, pos_seeds),
+                            IrExpr::Arrow(stmts) => walk(stmts, ints, int_arrays, pos_seeds, obs),
                             IrExpr::Interpolate(parts) => {
                                 for p in parts {
                                     if let crate::ir::InterpPart::Expr(x) =
                                         p
                                     {
-                                        walk_expr(x, ints, int_arrays, pos_seeds);
+                                        walk_expr(x, ints, int_arrays, pos_seeds, obs);
                                     }
                                 }
                             }
                             _ => {}
                         }
                     }
-                    walk_expr(expr, ints, int_arrays, pos_seeds);
+                    walk_expr(expr, ints, int_arrays, pos_seeds, obs);
                 }
                 IrStmt::Declare { vars, init, .. } => {
                     if let Some(e) = init {
@@ -1419,7 +1433,7 @@ fn demote_stringy_ints(
                             let pos_ok = pos_d.is_some_and(|d| {
                                 pos_seeds.get(&v.name).is_some_and(|s| s.contains(&d))
                             });
-                            if !pos_ok && !is_numeric(e, ints, &int_arrays) {
+                            if !pos_ok && !is_numeric(e, ints, &int_arrays, obs) {
                                 if std::env::var("SH2_DEBUG_DEMOTE").is_ok() { eprintln!("DEMOTE remove {} (site2)", &v.name); }
                                 ints.remove(&v.name);
                             }
@@ -1427,47 +1441,47 @@ fn demote_stringy_ints(
                     }
                 }
                 IrStmt::If { cond, then, elsifs, else_, .. } => {
-                    walk_cond(cond, ints, int_arrays, pos_seeds);
-                    walk(then, ints, int_arrays, pos_seeds);
+                    walk_cond(cond, ints, int_arrays, pos_seeds, obs);
+                    walk(then, ints, int_arrays, pos_seeds, obs);
                     for (c, b) in elsifs {
-                        walk_cond(c, ints, int_arrays, pos_seeds);
-                        walk(b, ints, int_arrays, pos_seeds);
+                        walk_cond(c, ints, int_arrays, pos_seeds, obs);
+                        walk(b, ints, int_arrays, pos_seeds, obs);
                     }
-                    walk(else_, ints, int_arrays, pos_seeds);
+                    walk(else_, ints, int_arrays, pos_seeds, obs);
                 }
                 IrStmt::While { cond, body, .. }
                 | IrStmt::DoWhile { cond, body, .. } => {
-                    walk_cond(cond, ints, int_arrays, pos_seeds);
-                    walk(body, ints, int_arrays, pos_seeds);
+                    walk_cond(cond, ints, int_arrays, pos_seeds, obs);
+                    walk(body, ints, int_arrays, pos_seeds, obs);
                 }
-                IrStmt::For { body, .. } => walk(body, ints, int_arrays, pos_seeds),
-                IrStmt::Subshell(body) | IrStmt::Block(body) => walk(body, ints, int_arrays, pos_seeds),
-                IrStmt::Redirect { inner, .. } => walk(inner, ints, int_arrays, pos_seeds),
+                IrStmt::For { body, .. } => walk(body, ints, int_arrays, pos_seeds, obs),
+                IrStmt::Subshell(body) | IrStmt::Block(body) => walk(body, ints, int_arrays, pos_seeds, obs),
+                IrStmt::Redirect { inner, .. } => walk(inner, ints, int_arrays, pos_seeds, obs),
                 IrStmt::Pipeline { stages, .. } => {
                     for st in stages {
-                        walk(st, ints, int_arrays, pos_seeds);
+                        walk(st, ints, int_arrays, pos_seeds, obs);
                     }
                 }
                 IrStmt::Function { body, named_blocks, .. } => {
-                    walk(body, ints, int_arrays, pos_seeds);
+                    walk(body, ints, int_arrays, pos_seeds, obs);
                     for (_, b) in named_blocks {
-                        walk(b, ints, int_arrays, pos_seeds);
+                        walk(b, ints, int_arrays, pos_seeds, obs);
                     }
                 }
                 IrStmt::Case { clauses, .. } => {
                     for c in clauses {
-                        walk(&c.body, ints, int_arrays, pos_seeds);
+                        walk(&c.body, ints, int_arrays, pos_seeds, obs);
                     }
                 }
                 IrStmt::Try { body, excepts, else_body, finally_body, .. } => {
-                    walk(body, ints, int_arrays, pos_seeds);
+                    walk(body, ints, int_arrays, pos_seeds, obs);
                     for e in excepts {
-                        walk(&e.body, ints, int_arrays, pos_seeds);
+                        walk(&e.body, ints, int_arrays, pos_seeds, obs);
                     }
-                    walk(else_body, ints, int_arrays, pos_seeds);
-                    walk(finally_body, ints, int_arrays, pos_seeds);
+                    walk(else_body, ints, int_arrays, pos_seeds, obs);
+                    walk(finally_body, ints, int_arrays, pos_seeds, obs);
                 }
-                IrStmt::ForInit { body, .. } => walk(body, ints, int_arrays, pos_seeds),
+                IrStmt::ForInit { body, .. } => walk(body, ints, int_arrays, pos_seeds, obs),
                 IrStmt::Expr(e) | IrStmt::Output { value: e, .. } => {
                     // `local x=$(...)` / `export x=...` as builtin CALLS
                     // (not Declare): stringy inits demote (BASHC_FIX 062).
@@ -1502,7 +1516,7 @@ fn demote_stringy_ints(
                                                 let pos_ok = Render::positional_digit(v).is_some_and(|d| {
                                                     pos_seeds.get(&nm).is_some_and(|s| s.contains(&d))
                                                 });
-                                                if !pos_ok && !is_numeric(v, ints, &int_arrays) {
+                                                if !pos_ok && !is_numeric(v, ints, &int_arrays, obs) {
                                                     if std::env::var("SH2_DEBUG_DEMOTE").is_ok() { eprintln!("DEMOTE remove {} (site3)", &nm); }
                                                     ints.remove(&nm);
                                                 }
@@ -1533,17 +1547,18 @@ fn demote_stringy_ints(
                         ints: &mut HashSet<String>,
                         int_arrays: &HashSet<String>,
                         pos_seeds: &HashMap<String, std::collections::BTreeSet<usize>>,
+                        obs: &crate::shir_passes::numeric_observed::NumericObserved,
                     ) {
                         match e {
-                            IrExpr::Arrow(stmts) => walk(stmts, ints, int_arrays, pos_seeds),
+                            IrExpr::Arrow(stmts) => walk(stmts, ints, int_arrays, pos_seeds, obs),
                             IrExpr::Call { args, .. } => {
                                 for a in args {
-                                    walk_e(a, ints, int_arrays, pos_seeds);
+                                    walk_e(a, ints, int_arrays, pos_seeds, obs);
                                 }
                             }
                             IrExpr::Array(items) => {
                                 for a in items {
-                                    walk_e(a, ints, int_arrays, pos_seeds);
+                                    walk_e(a, ints, int_arrays, pos_seeds, obs);
                                 }
                             }
                             IrExpr::Interpolate(parts) => {
@@ -1551,14 +1566,14 @@ fn demote_stringy_ints(
                                     if let crate::ir::InterpPart::Expr(x) =
                                         p
                                     {
-                                        walk_e(x, ints, int_arrays, pos_seeds);
+                                        walk_e(x, ints, int_arrays, pos_seeds, obs);
                                     }
                                 }
                             }
                             _ => {}
                         }
                     }
-                    walk_e(e, ints, int_arrays, pos_seeds);
+                    walk_e(e, ints, int_arrays, pos_seeds, obs);
                 }
                 _ => {}
             }
@@ -1569,26 +1584,27 @@ fn demote_stringy_ints(
         ints: &mut HashSet<String>,
         int_arrays: &HashSet<String>,
         pos_seeds: &HashMap<String, std::collections::BTreeSet<usize>>,
+        obs: &crate::shir_passes::numeric_observed::NumericObserved,
     ) {
         // conditions may embed Arrows; assigns there are rare but walk
         // them for completeness (same helper as Expr above, inlined
         // to avoid closure borrow issues).
         match e {
-            IrExpr::Arrow(stmts) => walk(stmts, ints, int_arrays, pos_seeds),
+            IrExpr::Arrow(stmts) => walk(stmts, ints, int_arrays, pos_seeds, obs),
             IrExpr::Call { args, .. } => {
                 for a in args {
-                    walk_cond(a, ints, int_arrays, pos_seeds);
+                    walk_cond(a, ints, int_arrays, pos_seeds, obs);
                 }
             }
             IrExpr::Array(items) => {
                 for a in items {
-                    walk_cond(a, ints, int_arrays, pos_seeds);
+                    walk_cond(a, ints, int_arrays, pos_seeds, obs);
                 }
             }
             IrExpr::Interpolate(parts) => {
                 for p in parts {
                     if let crate::ir::InterpPart::Expr(x) = p {
-                        walk_cond(x, ints, int_arrays, pos_seeds);
+                        walk_cond(x, ints, int_arrays, pos_seeds, obs);
                     }
                 }
             }
@@ -1596,9 +1612,9 @@ fn demote_stringy_ints(
         }
     }
     demote_string_loop_vars(prog, &mut int_set);
-    walk(&prog.stmts, &mut int_set, &int_arrays, pos_seeds);
+    walk(&prog.stmts, &mut int_set, &int_arrays, pos_seeds, obs);
     for sub in &prog.subs {
-        walk(&sub.body, &mut int_set, &int_arrays, pos_seeds);
+        walk(&sub.body, &mut int_set, &int_arrays, pos_seeds, obs);
     }
 
     prog.var_types
@@ -4004,6 +4020,162 @@ fn seed_int_element_readers(prog: &mut IrProgram) {
     }
 }
 
+/// Seed the shared `numeric_observed` verdict into the Int set.
+///
+/// The analysis answers a language-neutral question: which scalars and
+/// callee param slots are only ever READ as numbers (an arithmetic
+/// operand, an array subscript key, a numeric test, a copy into another
+/// such cell, a pass into another such slot) and never as text. Storing
+/// the *parsed* value is then observationally identical — every reader
+/// re-parses — so homing the cell `long long` deletes the per-read
+/// strdup/atoll round trip. The paradigm is MIMEcroft's per-pixel
+/// `rb_mkhex`: three text params copied into text globals that nothing
+/// reads as text, only as `RBHEX[atoll(x)]` keys.
+///
+/// Seeding only ADDS verdicts. `demote_stringy_ints` re-validates every
+/// one per (var, position) site, so a seed whose value is stringy
+/// anywhere — the mixed-ABI truncation that would pass `atoll("0.85")`
+/// as a fraction — is removed again exactly as it was before this seed
+/// existed. `SH2_NO_NUMOBS=1` reverts to the pre-seed verdicts.
+fn seed_numeric_observed(
+    prog: &mut IrProgram,
+    param_seeds: &mut HashMap<String, BTreeSet<usize>>,
+    positions: &mut HashMap<String, BTreeSet<usize>>,
+) {
+    if std::env::var_os("SH2_NO_NUMOBS").is_some() {
+        return;
+    }
+    let nb = crate::shir_passes::numeric_observed::analyze(prog);
+    // A cell is promoteable when the SHARED verdict says so AND the name
+    // is defined in exactly one function. The second half is this
+    // backend's own gate, not the analysis's, and it closes the two
+    // hazards this file already documents: a read the IR does not model
+    // — the name interpolated into a command string,
+    // `lt_cache=/tmp/x-$lt_name-$ts` — and a positional name reused
+    // across functions (`lt_name=$1` in both load_tex and load_tex4).
+    // `lt_name` hit both: promoting it deleted the global the hoisted
+    // capture helper still reads (`undeclared lt_name`).
+    let mut names = BTreeSet::new();
+    let mut defs = Vec::new();
+    collect_fn_defs(&prog.stmts, &mut names, &mut defs);
+    let mut def_in: HashMap<String, Vec<&String>> = HashMap::new();
+    // A store through an INDEX (`a[i]=…`) is not a whole-cell definition:
+    // promoting the ARRAY name would be a different decision, judged by
+    // `int_arrays_for_c`. Tracked so the multi-def allowance below only
+    // covers cells every store replaces outright.
+    let mut indexed_def: HashSet<String> = HashSet::new();
+    for (fname, body) in &defs {
+        for st in body {
+            if let IrStmt::Assign { targets, .. } = st {
+                for t in targets {
+                    def_in.entry(t.var.clone()).or_default().push(fname);
+                    if !t.indices.is_empty() {
+                        indexed_def.insert(t.var.clone());
+                    }
+                }
+            }
+        }
+    }
+    let unique_def = |v: &str| -> Option<&String> {
+        match def_in.get(v).map(|f| f.as_slice()) {
+            Some([only]) => Some(only),
+            _ => None,
+        }
+    };
+    // Multi-def allowance: a cell stored in SEVERAL functions is still a
+    // legitimate Int home when the shared verdict proves every read of it
+    // numeric and every store replaces the whole cell. That is the
+    // MIMEcroft per-pixel texture slot (`rbx_s`): `rb_frag` copies the
+    // block's slot in, `rb_tex_sample` copies its `$1` over it, and both
+    // functions then read it only as `RBTEX_*[$rbx_s]` keys — homing it
+    // deletes a strdup AND both per-pixel `atoll`s. The original gate was
+    // `unique_def` because two hazards were seen together on a positional
+    // name (`lt_name`, `$1` in both load_tex and load_tex4, interpolated
+    // into a command string the IR does not model). Neither applies here:
+    // positionals are excluded below, and an interpolated read is text to
+    // the shared analysis, so it never reaches this point. `SH2_NO_MULTIDEF=1`
+    // restores the single-def gate for A/B.
+    let multi_ok = std::env::var_os("SH2_NO_MULTIDEF").is_none();
+    let promoteable = |v: &str| -> bool {
+        if unique_def(v).is_some() {
+            return true;
+        }
+        multi_ok
+            && def_in.get(v).is_some_and(|f| f.len() > 1)
+            && !indexed_def.contains(v)
+            && !v.chars().all(|c| c.is_ascii_digit())
+    };
+    let promote = |prog: &mut IrProgram, v: &str| -> bool {
+        if prog.var_types.contains(&(v.to_string(), IrType::Int)) {
+            return false;
+        }
+        prog.var_types.retain(|(n, _)| n != v);
+        prog.var_types.push((v.to_string(), IrType::Int));
+        true
+    };
+    // How often each function binds each digit. Every positional read the
+    // render lowers to a STRING gets a bind, so a digit bound once has no
+    // second text read hiding in the body; reads that stay numeric (`$(( $3 ))`)
+    // need no bind and are unaffected by the signature change.
+    let mut binds: HashMap<(String, usize), usize> = HashMap::new();
+    for (fname, body) in &defs {
+        for st in body {
+            let IrStmt::Assign { targets, expr, .. } = st else {
+                continue;
+            };
+            let Some(d) = Render::positional_digit(expr) else {
+                continue;
+            };
+            if targets.first().is_some_and(|t| t.indices.is_empty()) {
+                *binds.entry((fname.clone(), d)).or_default() += 1;
+            }
+        }
+    }
+    let mut pushed = 0usize;
+    // Param leg: a positional copy `v = $d` whose VAR the shared verdict proves
+    // is read only as a number, in a function whose only bind of `$d` is that
+    // copy. The slot half of the verdict is deliberately not consulted: it
+    // folds in whether each CALLER passes numeric text, and for a callee that
+    // only ever `atoll`s the parameter that is irrelevant — `atoll(actual)` at
+    // the call site and `atoll` inside the callee yield the same value for
+    // every actual. Requiring the caller fact instead left `rb_mkhex $5 $6 $7`
+    // third slot text, so the per-pixel render stringified the blue channel
+    // only for the callee to parse it straight back.
+    for (fname, body) in &defs {
+        for st in body {
+            let IrStmt::Assign { targets, expr, .. } = st else {
+                continue;
+            };
+            let Some(d) = Render::positional_digit(expr) else {
+                continue;
+            };
+            let Some(t) = targets.first() else { continue };
+            if !t.indices.is_empty()
+                || !nb.scalar(&t.var)
+                || binds.get(&(fname.clone(), d)) != Some(&1)
+                || !promoteable(&t.var)
+            {
+                continue;
+            }
+            positions.entry(fname.clone()).or_default().insert(d);
+            param_seeds.entry(t.var.clone()).or_default().insert(d);
+            if promote(prog, &t.var) {
+                pushed += 1;
+            }
+        }
+    }
+    // Var leg: every further numeric-observed scalar with a single def (or
+    // several, per the multi-def allowance).
+    for (name, _) in prog.var_types.clone() {
+        if nb.scalar(&name) && promoteable(&name) && promote(prog, &name) {
+            pushed += 1;
+        }
+    }
+    if std::env::var("SH2_DEBUG_NUMOBS").is_ok() {
+        eprintln!("NUMOBS seeded {pushed} Int upgrades");
+    }
+}
+
 /// Int-array verdict for the C backend: the shared analysis UNION the
 /// int-element arrays (C-backend-local — other backends keep the shared
 /// verdict exactly).
@@ -4012,6 +4184,24 @@ fn int_arrays_for_c(prog: &IrProgram) -> HashSet<String> {
     let (homed, _) = int_element_verdict(prog);
     for a in homed {
         out.insert(a);
+    }
+    // NUMERIC-OBSERVED TABLES: the element VALUE rule above keeps a table as
+    // text unless every stored value is provably canonical-int text. A table
+    // loaded from a split payload (`RBTEX_R+=("$rv")`, `$rv` a slice) is not
+    // provable, yet every reader re-parses it — so keeping the parsed value
+    // is observationally identical and deletes the per-read strdup/atoll.
+    // That is `numeric_observed`'s stated purpose; the shared verdict is the
+    // fact, this homing is the backend's storage decision. Vetoed when the
+    // store can reach a cell that parses with wider semantics than `atoll`
+    // (bigint exact parse), per `array_chain`.
+    if std::env::var_os("SH2_NO_NUMOBS_ARR").is_none() {
+        let nb = crate::shir_passes::numeric_observed::analyze(prog);
+        let bigint = crate::shir::analyze_bigint_vars(prog);
+        for a in nb.arrays() {
+            if !nb.array_chain(a).iter().any(|n| bigint.contains(n)) {
+                out.insert(a.clone());
+            }
+        }
     }
     out
 }
@@ -8568,13 +8758,20 @@ fn array_fixed_caps(
         }
         // literal index writes need max(idx)+1 slots too (BASHC_FIX:
         // `typeset -a arr` + arr[0]/arr[1] sized [1], overflowing).
-        // max (not sum): each term upper-bounds the final length
-        // independently (bulk fill vs max index); overwrites never grow.
-        let need = info
+        // The STARTING extent is the max of the independent terms (bulk
+        // fill vs max index; overwrites never grow), and APPENDS come
+        // after whatever that left — so they ADD to it rather than
+        // competing with it. The old shape `max(reset + appends, idx)`
+        // under-counted a real case: `declare -ia d=(1); d[3]=9; d+=(5)`
+        // needs 5 slots while max(1+1, 4) = 4, so the runtime guard
+        // exited 127 where bash has three elements (MEASURED 2026-11-04).
+        // Growing a cap is always the safe direction — the guard still
+        // exits 127 loudly if the estimate is ever short.
+        let base_need = info
             .max_reset
-            .saturating_add(info.appends)
             .max(info.lit_index_max)
             .max(info.counter_index_max);
+        let need = base_need.saturating_add(info.appends);
         // an assoc's scalar write is the extra STRING key "0": +1 slot
         // over whatever the bulk/index counts proved (upper bound — an
         // already-counted key "0" only costs one spare slot, while an
@@ -9227,6 +9424,27 @@ const ECHO_FAST_C: &str = r##"/* `echo`/`:`, or `xxd -r -p IN`, with one `>`/`>>
  * process (see the emit site). Returns 0 with _sh_rc set when the
  * command was a recognised shape, -1 otherwise — the caller then runs
  * system() unchanged. */
+/* nibble table for the `xxd -r -p` decode: 0-15 nibble, 0xFF
+ * separator whitespace, 0xFE any other byte (resets a half
+ * pair, like xxd). */
+static const unsigned char _sh_hexv[256] = {
+  0xfe, 0xfe, 0xfe, 0xfe, 0xfe, 0xfe, 0xfe, 0xfe, 0xfe, 0xff, 0xff, 0xfe, 0xfe, 0xff, 0xfe, 0xfe,
+  0xfe, 0xfe, 0xfe, 0xfe, 0xfe, 0xfe, 0xfe, 0xfe, 0xfe, 0xfe, 0xfe, 0xfe, 0xfe, 0xfe, 0xfe, 0xfe,
+  0xff, 0xfe, 0xfe, 0xfe, 0xfe, 0xfe, 0xfe, 0xfe, 0xfe, 0xfe, 0xfe, 0xfe, 0xfe, 0xfe, 0xfe, 0xfe,
+  0x00, 0x01, 0x02, 0x03, 0x04, 0x05, 0x06, 0x07, 0x08, 0x09, 0xfe, 0xfe, 0xfe, 0xfe, 0xfe, 0xfe,
+  0xfe, 0x0a, 0x0b, 0x0c, 0x0d, 0x0e, 0x0f, 0xfe, 0xfe, 0xfe, 0xfe, 0xfe, 0xfe, 0xfe, 0xfe, 0xfe,
+  0xfe, 0xfe, 0xfe, 0xfe, 0xfe, 0xfe, 0xfe, 0xfe, 0xfe, 0xfe, 0xfe, 0xfe, 0xfe, 0xfe, 0xfe, 0xfe,
+  0xfe, 0x0a, 0x0b, 0x0c, 0x0d, 0x0e, 0x0f, 0xfe, 0xfe, 0xfe, 0xfe, 0xfe, 0xfe, 0xfe, 0xfe, 0xfe,
+  0xfe, 0xfe, 0xfe, 0xfe, 0xfe, 0xfe, 0xfe, 0xfe, 0xfe, 0xfe, 0xfe, 0xfe, 0xfe, 0xfe, 0xfe, 0xfe,
+  0xfe, 0xfe, 0xfe, 0xfe, 0xfe, 0xfe, 0xfe, 0xfe, 0xfe, 0xfe, 0xfe, 0xfe, 0xfe, 0xfe, 0xfe, 0xfe,
+  0xfe, 0xfe, 0xfe, 0xfe, 0xfe, 0xfe, 0xfe, 0xfe, 0xfe, 0xfe, 0xfe, 0xfe, 0xfe, 0xfe, 0xfe, 0xfe,
+  0xfe, 0xfe, 0xfe, 0xfe, 0xfe, 0xfe, 0xfe, 0xfe, 0xfe, 0xfe, 0xfe, 0xfe, 0xfe, 0xfe, 0xfe, 0xfe,
+  0xfe, 0xfe, 0xfe, 0xfe, 0xfe, 0xfe, 0xfe, 0xfe, 0xfe, 0xfe, 0xfe, 0xfe, 0xfe, 0xfe, 0xfe, 0xfe,
+  0xfe, 0xfe, 0xfe, 0xfe, 0xfe, 0xfe, 0xfe, 0xfe, 0xfe, 0xfe, 0xfe, 0xfe, 0xfe, 0xfe, 0xfe, 0xfe,
+  0xfe, 0xfe, 0xfe, 0xfe, 0xfe, 0xfe, 0xfe, 0xfe, 0xfe, 0xfe, 0xfe, 0xfe, 0xfe, 0xfe, 0xfe, 0xfe,
+  0xfe, 0xfe, 0xfe, 0xfe, 0xfe, 0xfe, 0xfe, 0xfe, 0xfe, 0xfe, 0xfe, 0xfe, 0xfe, 0xfe, 0xfe, 0xfe,
+  0xfe, 0xfe, 0xfe, 0xfe, 0xfe, 0xfe, 0xfe, 0xfe, 0xfe, 0xfe, 0xfe, 0xfe, 0xfe, 0xfe, 0xfe, 0xfe,
+};
 static void _sh_fa(char **b, size_t *cap, size_t *len, const char *s, size_t n) {
   _sh_grow(b, cap, *len + n + 1);
   memcpy(*b + *len, s, n);
@@ -9249,12 +9467,20 @@ static int _sh_echo_fast(const char *cmd) {
      * whitespace — falling back here keeps two commands from merging */
     if (*p == '\n') { bad = 1; break; }
     if (*p == '>') {
-      /* The operator must be its own token. `echo hi 2>/dev/null` has the
-       * fd digit glued to the `>`; taking that as a plain output redirect
-       * would swallow `2` as an echo argument and redirect the payload to
-       * /dev/null instead of discarding stderr. Any adjacency (digit, quote
-       * or word end) falls back to the shell. */
-      if (p > cmd && p[-1] != ' ' && p[-1] != '\t') { bad = 1; break; }
+      /* `word>file` IS a plain redirect — bash splits the word at the `>`
+       * too. The one glued form that is not is an fd number: `echo hi
+       * 2>/dev/null` would otherwise take the `2` as an echo argument and
+       * redirect the payload to /dev/null instead of discarding stderr.
+       * So a glued `>` is refused only when the word it ends is all
+       * digits. This backend's own word emitter separates the two with a
+       * space (`_sh_addraw` prepends one), so the rule never fires on its
+       * output — it exists for a raw concat (`_sh_add(">")`) and for any
+       * other producer of the text. */
+      if (p > cmd && p[-1] != ' ' && p[-1] != '\t' && wl > 0 && w) {
+        size_t di = 0;
+        while (di < wl && w[di] >= '0' && w[di] <= '9') di++;
+        if (di == wl) { bad = 1; break; }
+      }
       if (p[1] == '>') { p += 2; append = 1; } else { p += 1; append = 0; }
       if (*p == '>' || *p == '&' || *p == '<') { bad = 1; break; }
       if (++nredir > 1) { bad = 1; break; }
@@ -9349,17 +9575,26 @@ static int _sh_echo_fast(const char *cmd) {
       if (in) {
         f = fopen(t, append ? "ab" : "wb");
         if (f) {
-          unsigned char hbuf[8192], obuf[4096];
+          /* 64 KiB out: an fwrite this size skips stdio's buffer and is
+           * ONE write(2), so a 300 KB frame leaves in ~5 syscalls, not
+           * 75. A watcher polling the destination then finds a whole
+           * frame (or a clean truncation) instead of a stream of
+           * quarter-written ones, and the kernel stops paying a syscall
+           * per 4 KB of every hex-decoded file. */
+          unsigned char hbuf[65536], obuf[65536];
           size_t hgot, hi_i, on = 0;
           int hlo = -1, hd;
           while ((hgot = fread(hbuf, 1, sizeof hbuf, in)) > 0) {
             for (hi_i = 0; hi_i < hgot; hi_i++) {
-              int hc = hbuf[hi_i];
-              if (hc >= '0' && hc <= '9') hd = hc - '0';
-              else if (hc >= 'a' && hc <= 'f') hd = hc - 'a' + 10;
-              else if (hc >= 'A' && hc <= 'F') hd = hc - 'A' + 10;
-              else if (hc == ' ' || hc == '\t' || hc == '\n' || hc == '\r') continue;
-              else { hlo = -1; continue; }
+              /* ONE table lookup per byte instead of a class chain: the
+               * input is random hex, so the chain mispredicted on nearly
+               * every byte. Measured on a 320x240 frame's hex (691KB):
+               * 7.2 ms -> 1.6 ms per decode. Values < 16 are nibbles, 0xFF
+               * is separator whitespace, 0xFE is any other byte. */
+              unsigned hv = _sh_hexv[hbuf[hi_i]];
+              if (hv < 16u) hd = (int)hv;
+              else if (hv == 0xFEu) { hlo = -1; continue; }
+              else continue;
               if (hlo < 0) hlo = hd;
               else {
                 /* batched: one fwrite per 4KB, not per byte — a 1-byte
@@ -9378,6 +9613,107 @@ static int _sh_echo_fast(const char *cmd) {
           return 0;
         }
         fclose(in);
+      }
+    }
+    /* `cat SRC > DEST` and `tail -n +2 SRC > DEST` — file-to-file copies,
+     * and between them the standard way a script pops the first line off a
+     * queue file (`x=$(head -n 1 F)`, then `tail -n +2 F > T; cat T > F`).
+     * Both forked a coreutils process per call; MIMEcroft pays them once
+     * per key consumed, which is why its input phase measured 13 ms/frame
+     * (60% of the loop) while a key was held. Only a plain single-operand
+     * copy is taken: the source must be a regular file, the output is
+     * truncated first exactly as the shell's redirect truncates, and an
+     * unreadable source falls back to system() so bash's stderr text and
+     * exit status are unchanged. */
+    {
+      const char *src = 0;
+      int skip_first = 0;
+      struct stat cst;
+      if (nwords == 2 && al > 4 && memcmp(a, "cat ", 4) == 0) {
+        src = a + 4;
+      } else if (nwords == 4 && al > 11 && memcmp(a, "tail -n +2 ", 11) == 0) {
+        src = a + 11;
+        skip_first = 1;
+      }
+      if (src && *src && stat(src, &cst) == 0 && S_ISREG(cst.st_mode)) {
+        FILE *in;
+        f = fopen(t, append ? "ab" : "wb");
+        if (f) {
+          in = fopen(src, "rb");
+          if (in) {
+            char cbuf[8192];
+            size_t cgot;
+            int cerr = 0;
+            if (skip_first) {
+              int hit = 0;
+              while (!hit && (cgot = fread(cbuf, 1, sizeof cbuf, in)) > 0) {
+                size_t ci = 0;
+                while (ci < cgot && cbuf[ci] != '\n') ci++;
+                if (ci < cgot) {
+                  hit = 1;
+                  fwrite(cbuf + ci + 1, 1, cgot - ci - 1, f);
+                }
+              }
+              cerr = ferror(in);
+            }
+            while (!cerr && (cgot = fread(cbuf, 1, sizeof cbuf, in)) > 0) {
+              fwrite(cbuf, 1, cgot, f);
+            }
+            cerr = cerr || ferror(in);
+            fclose(in);
+            fclose(f);
+            _sh_rc = cerr ? 1 : 0;
+            free(w); free(a); free(t);
+            return 0;
+          }
+          fclose(f);
+        }
+      }
+    }
+    /* `printf FORMAT WORD > FILE` — printf with ONE argument and a format
+     * that is literal text plus `%s` plus the simple escapes (`\n`, `\t`,
+     * `\r`, `\\`) has fully determined bytes, so it is a file WRITE and
+     * not a shell command. MIMEcroft truncates its key queue with
+     * `printf %s` once per key read, which forked bash per frame.
+     *
+     * Refused (system() path, byte-identical to before): a format with an
+     * embedded space (the word join above cannot re-split it), any other
+     * conversion or a width/precision flag, the `\0nnn`/`\xHH`/`\u`
+     * escapes this does not reproduce, more than one argument, and any
+     * argument count the join could have flattened. Every refusal keeps
+     * bash's bytes, which is what `printf` would have printed. */
+    if (nwords == 3 && al > 7 && memcmp(a, "printf ", 7) == 0) {
+      const char *fmt = a + 7;
+      const char *sp = strchr(fmt, ' ');
+      if (sp && sp > fmt) {
+        const char *arg = sp + 1;
+        int ok = 1, ns = 0;
+        for (const char *q = fmt; q < sp && ok; q++) {
+          if (*q == '%') {
+            if (q + 1 < sp && q[1] == 's') { ns++; q++; } else ok = 0;
+          } else if (*q == '\\') {
+            char e = q[1];
+            if (e == 'n' || e == 't' || e == 'r' || e == '\\') q++;
+            else ok = 0;
+          }
+        }
+        if (ok && ns == 1) {
+          f = fopen(t, append ? "ab" : "wb");
+          if (f) {
+            for (const char *q = fmt; q < sp; q++) {
+              if (*q == '%') { fwrite(arg, 1, strlen(arg), f); q++; }
+              else if (*q == '\\') {
+                q++;
+                fputc(*q == 'n' ? '\n' : *q == 't' ? '\t'
+                    : *q == 'r' ? '\r' : '\\', f);
+              } else fputc(*q, f);
+            }
+            fclose(f);
+            _sh_rc = 0;
+            free(w); free(a); free(t);
+            return 0;
+          }
+        }
       }
     }
     vl = 0;
@@ -9621,10 +9957,12 @@ pub fn shir_to_c(prog: &IrProgram) -> String {
     // Int-element readers seed first (their arrayIndex sources are
     // numeric exactly when homed — see the `is_numeric` arrayIndex
     // arm), so demote re-validates every seed below.
-    let (numstr_param_seeds, mut numstr_positions, numstr_verdict) =
+    let (mut numstr_param_seeds, mut numstr_positions, numstr_verdict) =
         seed_numstr_fixpoint(&mut prog);
     seed_int_element_readers(&mut prog);
-    demote_stringy_ints(&mut prog, &numstr_param_seeds);
+    seed_numeric_observed(&mut prog, &mut numstr_param_seeds, &mut numstr_positions);
+    let obs = crate::shir_passes::numeric_observed::analyze(&prog);
+    demote_stringy_ints(&mut prog, &numstr_param_seeds, &obs);
     // POSITIONS RE-VALIDATION: the params verdict above was computed
     // while demote still believed some vars Int that are now Str — a
     // position promoted on those actuals would insert a caller-side
@@ -10213,7 +10551,7 @@ pub fn shir_to_c(prog: &IrProgram) -> String {
                 [
                     "/* exact signed division by 2^n: the shift floors, C99 truncates".to_string(),
                     " * toward zero — negative non-multiples need the +1 back. */".to_string(),
-                    "static long long _sh_divp2(long long x, int n) {".to_string(),
+                    "static inline long long _sh_divp2(long long x, int n) {".to_string(),
                     "  long long q = x >> n;".to_string(),
                     "  if (x < 0 && (x & (((long long)1 << n) - 1))) q++;".to_string(),
                     "  return q;".to_string(),
@@ -10382,6 +10720,54 @@ pub fn shir_to_c(prog: &IrProgram) -> String {
             );
         }
     }
+    // Fast integer parse. Every emitted `atoll(` — array reads in numeric
+    // context, arithmetic on a captured/assigned string, `$((...))` on a
+    // var that is not Int-homed — pays libc's strtoll: locale-aware, base
+    // autodetection, errno, unlimited digits. A digits-only loop parses
+    // the same text (gprof on MIMEcroft: 31M calls, 17.7% of CPU). The
+    // `#define` leaves the emitted call sites untouched; the helper
+    // defers to atoll for anything that could differ (19+ digits, i.e.
+    // the overflow cases), so the value is always atoll's value.
+    // SH2_NO_ATOI_FAST=1 restores plain atoll.
+    {
+        let full = r.out.join("\n");
+        let off = std::env::var("SH2_NO_ATOI_FAST")
+            .map(|v| v == "1" || v == "true" || v == "yes")
+            .unwrap_or(false);
+        if full.contains("atoll(") && !off {
+            let pos = r
+                .out
+                .iter()
+                .rposition(|l| l.trim_start().starts_with("#include "))
+                .map(|i| i + 1)
+                .unwrap_or(0);
+            r.out.splice(
+                pos..pos,
+                [
+                    "/* fast atoll: same text -> same value as strtoll (leading".to_string(),
+                    " * whitespace, optional sign, digits, stop at the first other".to_string(),
+                    " * byte, 0 when there are none); 19+ digits go to atoll so the".to_string(),
+                    " * overflow result is libc's too. SH2_NO_ATOI_FAST=1 restores".to_string(),
+                    " * plain atoll. */".to_string(),
+                    "static inline long long _sh_atoi(const char *s) {".to_string(),
+                    "  const unsigned char *p = (const unsigned char *)(s ? s : \"\");".to_string(),
+                    "  int neg = 0, nd = 0;".to_string(),
+                    "  unsigned long long v = 0;".to_string(),
+                    "  while (*p == ' ' || (*p >= 9 && *p <= 13)) p++;".to_string(),
+                    "  if (*p == '+' || *p == '-') { neg = (*p == '-'); p++; }".to_string(),
+                    "  if (*p < '0' || *p > '9') return 0;".to_string(),
+                    "  do {".to_string(),
+                    "    if (++nd > 18) return atoll(s);".to_string(),
+                    "    v = v * 10 + (unsigned long long)(*p - '0');".to_string(),
+                    "  } while (*++p >= '0' && *p <= '9');".to_string(),
+                    "  return neg ? -(long long)v : (long long)v;".to_string(),
+                    "}".to_string(),
+                    "#define atoll _sh_atoi".to_string(),
+                    String::new(),
+                ],
+            );
+        }
+    }
     // P1 OOM policy: every strdup call site in the output reads
     // _sh_xstrdup explicitly (fail-stop on allocation failure — never
     // a NULL that flows to a print guard as empty output). The helper
@@ -10420,7 +10806,7 @@ pub fn shir_to_c(prog: &IrProgram) -> String {
                     " * the whole old buffer: the demo's #1 strlen-byte site.)".to_string(),
                     " * SH2_NO_SCANFIX=1 restores the strlen(old) form.)".to_string(),
                     " */".to_string(),
-                    "static void _sh_sset(char **slot, const char *src) {".to_string(),
+                    "static inline void _sh_sset(char **slot, const char *src) {".to_string(),
                     "  char *old = *slot;".to_string(),
                     if std::env::var_os("SH2_NO_SCANFIX").is_some() {
                         "  if (old && src) { size_t n = strlen(src) + 1; if (strlen(old) + 1 >= n) { memmove(old, src, n); return; } }".to_string()
@@ -11708,6 +12094,12 @@ impl Render {
         self.emit("#include <unistd.h>"); // chdir/access/getcwd/gethostname
         self.emit("#include <errno.h>"); // EINTR retry on capture reads
         self.emit("#include <ctype.h>"); // tolower/... in text transforms
+        // stat/S_ISREG — the in-process `cat`/`tail` copy refuses anything
+        // that is not a regular file. Emitted here, with the base includes:
+        // a later include becomes the splice point for the checked-strdup
+        // helper (rposition over `#include `), which would leave that
+        // helper after the arena code that calls it.
+        self.emit("#include <sys/stat.h>");
         if self.need_sc_guard {
             // NULL-safe strcmp operand: a string-homed global read
             // before its first assignment is a NULL char*, and
@@ -11856,7 +12248,11 @@ impl Render {
         // identifier in a program with no array join at all
         // (parse-dollar-single-quote.sh failed to COMPILE with the decl
         // inside that block).
-        self.emit("char IFS[256] = \" \"; /* bash's startup IFS */");
+        // bash's startup IFS is space, tab, newline — not just a space. The
+        // splitter now reads it, so the three have to BE there (the pre-fix
+        // helper hard-coded them, which is why the decl could get away with
+        // one space). `IFS[0]` is still ' ', so the join faces are unchanged.
+        self.emit("char IFS[256] = \" \\t\\n\"; /* bash's startup IFS */");
         if self.need_sh {
             self.runtime_start = self.out.len();
             self.emit("/* sh2 runtime: exit-status register + shell-out helpers */");
@@ -11911,7 +12307,7 @@ impl Render {
             // the same consume-immediately discipline as the old statics
             // (no ownership transfer, no frees, nothing to leak).
             self.emit("typedef struct { char *p; size_t cap; } _sh_vbuf;");
-            self.emit("static char *_sh_vgrow(_sh_vbuf *b, size_t need) {");
+            self.emit("static inline char *_sh_vgrow(_sh_vbuf *b, size_t need) {");
             self.emit("  if (need <= b->cap && b->p) return b->p;");
             self.emit("  size_t ncap = b->cap ? b->cap : 256;");
             self.emit("  while (ncap < need) ncap *= 2;");
@@ -12202,7 +12598,20 @@ impl Render {
             self.emit("  { char *_nv = (char*)_sh_xstrdup(v); free(a[i]); a[i] = _nv; }");
             self.emit("  if ((size_t)(i + 1) > *len) *len = (size_t)(i + 1);");
             self.emit("}");
-            self.emit("static const char *_sh_arr_get(char **a, size_t len, long long i) {");
+            // Move store: the value is a buffer the caller just BUILT for
+            // this very store (a fused splice), so hand it over instead
+            // of strdup-ing it — one row copy and one malloc/free pair
+            // less per element write. The donor buffer is emptied so its
+            // next use grows a fresh one (a moved pointer must never be
+            // read or reused). Same guards as _sh_arr_set, including the
+            // null-value early return (nothing stored, like a NULL v).
+            self.emit("static void _sh_arr_set_own(char **a, size_t *len, size_t cap, long long i, char **pp, size_t *pcap) {");
+            self.emit("  if (i < 0 || !pp || !*pp) return;");
+            self.emit("  if (i >= (long long)cap) { fprintf(stderr, \"sh2c: capacity exceeded\\n\"); exit(127); }");
+            self.emit("  free(a[i]); a[i] = *pp; *pp = 0; *pcap = 0;");
+            self.emit("  if ((size_t)(i + 1) > *len) *len = (size_t)(i + 1);");
+            self.emit("}");
+            self.emit("static inline const char *_sh_arr_get(char **a, size_t len, long long i) {");
             self.emit("  if (i < 0 || i >= (long long)len || !a[i]) return \"\";");
             self.emit("  return a[i];");
             self.emit("}");
@@ -12371,8 +12780,12 @@ impl Render {
             self.emit("/* ${arr[@]:off:len} — an ELEMENT slice of the store */");
             self.emit("static void _sh_join_arr_rng(_sh_vbuf *d, char **a, size_t n, long long off, long long len, char sep) {");
             self.emit("  long long cnt = 0; for (size_t i = 0; i < n; i++) if (a[i]) cnt++;");
-            self.emit("  long long b0 = off < 0 ? cnt + off : off; long long b = b0 < 0 ? 0 : (b0 > cnt ? cnt : b0);");
-            self.emit("  long long e0 = b + (len < 0 ? cnt + len : len); long long e = e0 > cnt ? cnt : (e0 < b ? b : e0);");
+            self.emit("  long long b = off < 0 ? ((off < -cnt) ? -1 : cnt + off) : off;");
+            self.emit("  /* bash (MEASURED 2026-11-01): out-of-range offset -> EMPTY, never a");
+            self.emit("     clamped slice; array len<0 -> expansion error, no value */");
+            self.emit("  if (b < 0 || b >= cnt) { _sh_vgrow(d, 1); d->p[0] = 0; return; }");
+            self.emit("  if (len < 0) { fprintf(stderr, \"%lld: substring expression < 0\\n\", len); exit(1); }");
+            self.emit("  long long e = len > cnt - b ? cnt : b + len; /* b<=cnt: no signed overflow (UBSAN-measured) */");
             self.emit("  size_t dn = 0; int _f = 1; long long bi = 0;");
             self.emit("  for (size_t i = 0; i < n; i++) {");
             self.emit("    if (!a[i]) continue;");
@@ -12397,11 +12810,23 @@ impl Render {
             // SET indices, ascending — non-NULL slots only. The decimal
             // index is rendered through a 24-byte buffer (size_t max is
             // 20 digits, 24 leaves the NUL and then some).
-            self.emit("static void _sh_join_ikind(_sh_vbuf *d, char **a, size_t n) {");
+            // `${!arr[*]}` / `${!arr[@]}` — the index list of an INDEXED
+            // array. char** storage enumerates its SET slots; value
+            // storage (below) has no marker and enumerates the extent.
+            // The separator is the FACE's (bash MEASURED 2026-11-04:
+            // `declare -ia n; n[0]=7; n[2]=9; n[5]=4` gives `0:2:5`
+            // under `IFS=:`, `025` under `IFS=`, `0 1 4` for a char**
+            // array under the startup IFS — the same `[*]` rule as the
+            // VALUES face, and `sep == 0` must write NO separator).
+            // Before this, `${!n[@]}` on a value-storage array rendered
+            // `n_k`/`n_v`/`n_n` — storage that was never declared, so
+            // the C did not COMPILE (`array_keys_join` forced the var
+            // into `assoc_arrays`).
+            self.emit("static void _sh_join_ikind(_sh_vbuf *d, char **a, size_t n, char sep) {");
             self.emit("  size_t dn = 0; int _f = 1;");
             self.emit("  for (size_t i = 0; i < n; i++) {");
             self.emit("    if (!a[i]) continue;");
-            self.emit("    if (_f) { _f = 0; } else { _sh_vgrow(d, dn + 2); d->p[dn++] = ' '; }");
+            self.emit("    if (_f) { _f = 0; } else if (sep) { _sh_vgrow(d, dn + 2); d->p[dn++] = sep; }");
             self.emit("    char _b[24]; int _l = snprintf(_b, sizeof _b, \"%zu\", i);");
             self.emit("    for (int _j = 0; _j < _l; _j++) { _sh_vgrow(d, dn + 2); d->p[dn++] = _b[_j]; }");
             self.emit("  }");
@@ -12411,14 +12836,26 @@ impl Render {
             // per-slot presence marker exists, so the key set is the
             // DENSE index range — reads no element (type-free), exact
             // for dense arrays, the documented coverage edge otherwise.
-            self.emit("static void _sh_join_idx(_sh_vbuf *d, size_t n) {");
+            // `s` is the array's PRESENCE marker, or 0 for storage that
+            // has none (the documented extent rule).
+            self.emit("static void _sh_join_idx(_sh_vbuf *d, const unsigned char *s, size_t n, char sep) {");
             self.emit("  size_t dn = 0; int _f = 1;");
             self.emit("  for (size_t i = 0; i < n; i++) {");
-            self.emit("    if (_f) { _f = 0; } else { _sh_vgrow(d, dn + 2); d->p[dn++] = ' '; }");
+            self.emit("    if (s && !s[i]) continue;");
+            self.emit("    if (_f) { _f = 0; } else if (sep) { _sh_vgrow(d, dn + 2); d->p[dn++] = sep; }");
             self.emit("    char _b[24]; int _l = snprintf(_b, sizeof _b, \"%zu\", i);");
             self.emit("    for (int _j = 0; _j < _l; _j++) { _sh_vgrow(d, dn + 2); d->p[dn++] = _b[_j]; }");
             self.emit("  }");
             self.emit("  _sh_vgrow(d, dn + 1); d->p[dn] = 0;");
+            self.emit("}");
+            // ${#arr[@]} over DENSE value storage with a presence
+            // marker: bash counts SET elements only (`n[0]=7; n[2]=9` is
+            // 2, never the extent 3). Shares the count shape with the
+            // char** helper below — presence, not density.
+            self.emit("static long long _sh_ccount(const unsigned char *s, size_t n) {");
+            self.emit("  long long c = 0;");
+            self.emit("  for (size_t i = 0; i < n; i++) if (s[i]) c++;");
+            self.emit("  return c;");
             self.emit("}");
             // ${#arr[@]} over char** storage: bash counts ELEMENTS
             // (non-NULL slots), never the dense max-index+1 —
@@ -12620,27 +13057,42 @@ impl Render {
             // normal_invocation_is_unaffected_by_the_sigpipe_reset). Same
             // condition, same block, so they cannot drift apart again.
             if !self.pos_const || self.need_sh_argv.get() {
-            self.emit("static char *_sh_argv_join(_sh_vbuf *d) {");
+            // `sep` is the FACE's joiner, passed by every call site:
+            // `$*` → IFS[0] (bash MEASURED 2026-11-03: `IFS=:; set -- p
+            // q r; v="$*"` → `p:q:r`, `IFS=""` → `pqr`, default →
+            // `p q r`), `"$@"` → always a space (measured the same run:
+            // `v="$@"` → `p q r` under every IFS). The old body hard-coded
+            // `' '` — right for `$@`, silently wrong for `$*` under any
+            // non-default IFS. `sep == 0` (empty IFS) joins with NOTHING,
+            // so the separator store is guarded, not just written.
+            self.emit("static char *_sh_argv_join(_sh_vbuf *d, char sep) {");
             self.emit("  char *dp = _sh_vgrow(d, 1); dp[0] = 0; size_t n = 0;");
             self.emit("  for (int i = 1; i < _sh_argc; i++) {");
-            self.emit("    if (i > 1) { _sh_vgrow(d, n + 2); d->p[n++] = ' '; }");
+            self.emit("    if (i > 1 && sep) { _sh_vgrow(d, n + 2); d->p[n++] = sep; }");
             self.emit("    const char *s = _sh_argv[i];");
             self.emit("    while (s && *s) { _sh_vgrow(d, n + 2); d->p[n++] = *s++; }");
             self.emit("  }");
             self.emit("  _sh_vgrow(d, n + 1); d->p[n] = 0; return d->p;");
             self.emit("}");
             self.emit("/* ${@:off:len} — positional-param slice (off is 1-based; off 0 includes $0) */");
-            self.emit("static char *_sh_argv_slice(_sh_vbuf *d, long long off, long long len) {");
+            // `sep` is the slice's JOIN FACE, exactly as for `_sh_argv_join`
+            // (MEASURED 2026-11-04, `harness/ifs-probe.sh` cases 32-37):
+            //   `${*:o:l}`  -> IFS[0]; an EMPTY IFS concatenates (sep 0)
+            //   `${@:o:l}`  -> IFS[0] when IFS is non-empty, else a SPACE
+            //     (`@`-slice is NOT the `$@` rule: `v="$@"` stays space-joined
+            //      under `IFS=:`, but `v="${@:2:2}"` becomes `q:r`.)
+            self.emit("static char *_sh_argv_slice(_sh_vbuf *d, long long off, long long len, char sep) {");
             self.emit("  long long total = (long long)_sh_argc;");
-            self.emit("  long long b = (off <= 0) ? 0 : off;");
-            self.emit("  if (b > total) b = total;");
-            self.emit("  long long nav = total - b;");
-            self.emit("  long long e = b + ((len < 0) ? nav + len : len);");
-            self.emit("  if (e > total) e = total; if (e < b) e = b;");
+            self.emit("  long long b = off < 0 ? ((off < -total) ? -1 : total + off) : off;");
+            self.emit("  /* bash (MEASURED 2026-11-01): offset out of range -> EMPTY; positional");
+            self.emit("     len<0 errors for EVERY in-range b (0..total inclusive) */");
+            self.emit("  if (b < 0 || b > total) { char *q = _sh_vgrow(d, 1); q[0] = 0; return d->p; }");
+            self.emit("  if (len < 0) { fprintf(stderr, \"%lld: substring expression < 0\\n\", len); exit(1); }");
+            self.emit("  long long e = len > total - b ? total : b + len; /* b<=total: no signed overflow */");
             self.emit("  size_t dn = 0; long long i;");
             self.emit("  char *dp = _sh_vgrow(d, 1); dp[0] = 0;");
             self.emit("  for (i = b; i < e; i++) {");
-            self.emit("    if (i > b) { _sh_vgrow(d, dn + 2); d->p[dn++] = ' '; }");
+            self.emit("    if (i > b && sep) { _sh_vgrow(d, dn + 2); d->p[dn++] = sep; }");
             self.emit("    const char *s = _sh_argv[i] ? _sh_argv[i] : \"\";");
             self.emit("    while (*s) { _sh_vgrow(d, dn + 2); d->p[dn++] = *s++; }");
             self.emit("  }");
@@ -12703,6 +13155,11 @@ impl Render {
             //     ~200KB of hex (measured 4.7% of a first-frame run), and
             //     shIR has no decode-a-file node for the fold to target —
             //     a C-only seam, so only this backend drops the exec.
+            //   * `cat SRC > DEST` / `tail -n +2 SRC > DEST`, the two-byte
+            //     copies a queue file is popped with. They are pure copies
+            //     of a regular file, so the exec buys nothing; MIMEcroft
+            //     ran both once per key consumed (13 ms/frame of its input
+            //     phase). No node carries "copy this file" either.
             //
             // The shape rule is the fold's: exactly one `>`/`>>`, `echo`
             // with a non-option first argument or `:`, no pipe / second
@@ -12731,6 +13188,35 @@ impl Render {
             self.emit("static void _sh_capture(_sh_vbuf *d, const char *cmd) {");
             self.emit("  char *dp = _sh_vgrow(d, 1); dp[0] = 0;");
             self.emit("  if (!cmd || !*cmd) { _sh_rc = 0; return; }");
+            /* `head -n 1 "$VAR"` — the shape a script's queue pop makes,
+             * once per item (`k=$(head -n 1 "$QUEUE")`). One line out of
+             * one exported path needs no shell, no fork and no pipe: read
+             * it here. This is the last of the per-key spawns (tail/cat
+             * went in process already), and it costs a fork+exec+pipe on
+             * every key a program consumes. Only that exact text is
+             * taken — a bare exported NAME, one quoted argument, nothing
+             * else — and anything that cannot be served in process (no
+             * such variable, unreadable path) falls through to the shell,
+             * so stderr and the exit status stay bash's own. */
+            self.emit("  if (strncmp(cmd, \"head -n 1 \\\"$\", 12) == 0) {");
+            self.emit("    const char *nm = cmd + 12; size_t nl = 0; int ok = 1;");
+            self.emit("    while (nm[nl] && nm[nl] != '\\\"') { if (!isalnum((unsigned char)nm[nl]) && nm[nl] != '_') ok = 0; nl++; }");
+            self.emit("    if (ok && nl > 0 && nl < 64 && nm[nl] == '\\\"' && nm[nl + 1] == 0) {");
+            self.emit("      char vn[80]; memcpy(vn, nm, nl); vn[nl] = 0;");
+            self.emit("      const char *path = getenv(vn);");
+            self.emit("      if (path) {");
+            self.emit("        FILE *hf = fopen(path, \"r\");");
+            self.emit("        if (hf) {");
+            self.emit("          size_t n = 0; int c;");
+            self.emit("          while ((c = fgetc(hf)) != EOF && c != '\\n') { _sh_vgrow(d, n + 2); d->p[n++] = (char)c; }");
+            self.emit("          d->p[n] = 0;");
+            self.emit("          fclose(hf);");
+            self.emit("          while (n > 0 && d->p[n - 1] == '\\r') d->p[--n] = 0;");
+            self.emit("          _sh_rc = 0; return;");
+            self.emit("        }");
+            self.emit("      }");
+            self.emit("    }");
+            self.emit("  }");
             self.emit("  _sh_wrap_cmd(cmd);");
             self.emit("  FILE *p = popen(_sh_wrap, \"r\");");
             self.emit("  if (!p) { _sh_rc = 127; return; }");
@@ -12873,7 +13359,13 @@ impl Render {
             self.emit("  if (f && *f) _sh_import_env(f);");
             self.emit("  return rc;");
             self.emit("}");
-            self.emit("/* split a captured string on IFS whitespace into words */");
+            self.emit("/* field splitting (POSIX 2.5.6), IFS-DRIVEN — MEASURED 2026-11-04:");
+            self.emit("   a run of IFS WHITESPACE is ONE delimiter and is stripped at both");
+            self.emit("   ends; each IFS non-whitespace char delimits one field, so `a::b`");
+            self.emit("   has an empty middle field and `:a:` an empty first; an EMPTY IFS");
+            self.emit("   disables splitting. The pre-fix helper hard-coded space/tab/");
+            self.emit("   newline and never read IFS, so `IFS=:; for w in $v` gave 2 fields");
+            self.emit("   where bash gives 4 (`a::b: c` -> a, '', b, ' c').  */");
             self.emit("static void _sh_wgrow(char ***w, size_t *cap, size_t need) {");
             self.emit("  if (need <= *cap) return;");
             self.emit("  size_t ncap = *cap ? *cap : 64;");
@@ -12882,15 +13374,27 @@ impl Render {
             self.emit("  if (!nw) { fprintf(stderr, \"sh2c: out of memory\\n\"); exit(127); }");
             self.emit("  *w = nw; *cap = ncap;");
             self.emit("}");
+            // An IFS char is WHITESPACE only when IFS itself lists it (bash:
+            // `IFS=' '` makes a tab an ordinary character, and `IFS=':'` makes
+            // the space ordinary).
+            self.emit("static int _sh_ifs_ws(char c) { return (c==' '||c=='\\t'||c=='\\n') && strchr(IFS, c) != 0; }");
+            self.emit("static int _sh_ifs_nw(char c) { return c && c!=' ' && c!='\\t' && c!='\\n' && strchr(IFS, c) != 0; }");
             self.emit("static size_t _sh_split(char *buf, char ***w, size_t *wcap) {");
             self.emit("  size_t n = 0; char *p = buf;");
+            self.emit("  if (!IFS[0]) { if (*p) { _sh_wgrow(w, wcap, n + 1); (*w)[n++] = p; } return n; }");
+            self.emit("  while (_sh_ifs_ws(*p)) p++;");
             self.emit("  while (*p) {");
-            self.emit("    while (*p == ' ' || *p == '\\t' || *p == '\\n') p++;");
-            self.emit("    if (!*p) break;");
-            self.emit("    _sh_wgrow(w, wcap, n + 1);");
-            self.emit("    (*w)[n++] = p;");
-            self.emit("    while (*p && *p != ' ' && *p != '\\t' && *p != '\\n') p++;");
-            self.emit("    if (*p) *p++ = 0;");
+            self.emit("    char *start = p; char d;");
+            self.emit("    while (*p && !_sh_ifs_ws(*p) && !_sh_ifs_nw(*p)) p++;");
+            self.emit("    d = *p; if (d) *p = 0;");
+            self.emit("    _sh_wgrow(w, wcap, n + 1); (*w)[n++] = start;");
+            self.emit("    if (!d) break;");
+            self.emit("    p++;");
+            self.emit("    if (_sh_ifs_ws(d)) {");
+            self.emit("      while (_sh_ifs_ws(*p)) p++;");
+            self.emit("      if (_sh_ifs_nw(*p)) p++;");
+            self.emit("      while (_sh_ifs_ws(*p)) p++;");
+            self.emit("    } else { while (_sh_ifs_ws(*p)) p++; }");
             self.emit("  }");
             self.emit("  return n;");
             self.emit("}");
@@ -12941,7 +13445,18 @@ impl Render {
             // possibly-NULL at every consumer and the C gate's
             // static-analysis step fails the file. A helper that RETURNS
             // non-NULL removes the doubt at all sites at once.
+            // IFS is a SHELL variable with a declared buffer, not an
+            // inherited environment string: bash ignores an inherited IFS
+            // at startup and re-creates its three chars (space, tab,
+            // newline). Reading it through getenv therefore reported ""
+            // for an IFS the program never assigned — and the IFS-driven
+            // join/split helpers consume the BUFFER, so `$IFS` displayed a
+            // different value than the one splitting used. Answering from
+            // the buffer here covers every read shape at once (plain
+            // `$IFS`, `${#IFS}`, `getVar`, indirect), including the ones
+            // that bypass `store_ref`/`store_read`.
             self.emit("static const char *_sh_env(const char *name) {");
+            self.emit("  if (name && name[0] == 'I' && strcmp(name, \"IFS\") == 0) return IFS;");
             self.emit("  const char *v = getenv(name);");
             self.emit("  return v ? v : \"\";");
             self.emit("}");
@@ -12995,37 +13510,60 @@ impl Render {
             self.emit("  *pos = (i < n) ? i + 1 : i;");
             self.emit("  return 1;");
             self.emit("}");
-            self.emit("/* ${x:off:len} substring (bash: off<0 counts from the end) */");
+            self.emit("/* ${x:off:len} substring (bash: off<0 counts from the end; len<0 counts\n   from the STRING end and errors when it lands before the offset) */");
             self.emit("/* ${arr[@]:off:len} — an ELEMENT slice of the space-joined string */");
-            self.emit("static void _sh_arr_slice(_sh_vbuf *d, const char *s, long long off, long long len) {");
-            self.emit("  const char *p = s; size_t n = 0;");
-            self.emit("  while (*p) { while (*p == ' ') p++; if (!*p) break; n++; while (*p && *p != ' ') p++; }");
-            self.emit("  long long b = off < 0 ? (long long)n + off : off;");
-            self.emit("  if (b < 0) b = 0; if (b > (long long)n) b = (long long)n;");
-            self.emit("  long long e = b + ((len < 0) ? (long long)n + len : len);");
-            self.emit("  if (e > (long long)n) e = (long long)n; if (e < b) e = b;");
-            self.emit("  size_t dn = 0, i = 0; p = s;");
-            self.emit("  while (*p && i < (size_t)e) {");
-            self.emit("    while (*p == ' ') p++;");
-            self.emit("    if (!*p) break;");
+            // THE FALLBACK SLICE must be the exact INVERSE of the join that
+            // produced `s`. `array_join_all_face` joins `${a[*]}` on IFS[0]
+            // and `${a[@]}` on a literal space, but this helper split on a
+            // space unconditionally — so a non-default IFS made the word
+            // COUNT wrong (`a=(x y z); IFS=:; ${a[*]:1:2}` saw ONE word
+            // `x:y:z` instead of three). It now takes the same separator the
+            // join used, and keeps EMPTY fields: the join only ever inserts
+            // `sep` BETWEEN words, so words = 1 + occurrences(sep) and a
+            // leading/trailing/inner run of `sep` is an empty element, not
+            // padding to skip (`a=("" x)` joined on ':' is `:x` = 2 words).
+            // The slice's OUTPUT face (IFS[0] for `*`, IFS[0]-else-space for
+            // `@`) belongs to the exact store-based arm `_sh_join_arr_rng`;
+            // this arm re-joins with the separator it split on, which is the
+            // faithful round trip for an array whose storage it cannot walk.
+            self.emit("static void _sh_arr_slice(_sh_vbuf *d, const char *s, long long off, long long len, char sep) {");
+            self.emit("  long long n = 0; const char *q;");
+            self.emit("  if (*s) { n = 1; for (q = s; *q; q++) if (*q == sep) n++; }");
+            self.emit("  long long b = off < 0 ? ((off < -(long long)n) ? -1 : (long long)n + off) : off;");
+            self.emit("  /* bash (MEASURED 2026-11-01): offset out of range -> EMPTY, never a");
+            self.emit("     clamped slice; array len<0 -> expansion error, no value */");
+            self.emit("  if (b < 0 || b >= (long long)n) { _sh_vgrow(d, 1); d->p[0] = 0; return; }");
+            self.emit("  if (len < 0) { fprintf(stderr, \"%lld: substring expression < 0\\n\", len); exit(1); }");
+            self.emit("  long long e = len > (long long)n - b ? (long long)n : b + len; /* b<n: no signed overflow */");
+            self.emit("  size_t dn = 0; const char *p = s; long long i = 0;");
+            self.emit("  while (i < e) {");
             self.emit("    const char *w = p;");
-            self.emit("    while (*p && *p != ' ') p++;");
-            self.emit("    if (i >= (size_t)b) {");
-            self.emit("      if (dn) { _sh_vgrow(d, dn + 2); d->p[dn++] = ' '; }");
+            self.emit("    while (*p && *p != sep) p++;");
+            self.emit("    if (i >= b) {");
+            self.emit("      if (i > b) { _sh_vgrow(d, dn + 2); d->p[dn++] = sep; }");
             self.emit("      size_t wl = (size_t)(p - w);");
             self.emit("      _sh_vgrow(d, dn + wl + 1);");
             self.emit("      memcpy(d->p + dn, w, wl); dn += wl;");
             self.emit("    }");
             self.emit("    i++;");
+            self.emit("    if (*p == sep) p++; else break;");
             self.emit("  }");
             self.emit("  _sh_vgrow(d, dn + 1); d->p[dn] = 0;");
             self.emit("}");
             self.emit("static char *_sh_substr(_sh_vbuf *d, const char *s, long long off, long long len) {");
             self.emit("  size_t n = strlen(s);");
-            self.emit("  long long b = off < 0 ? (long long)n + off : off;");
-            self.emit("  if (b < 0) b = 0; if (b > (long long)n) b = (long long)n;");
-            self.emit("  long long e = b + ((len < 0) ? (long long)n + len : len);");
-            self.emit("  if (e > (long long)n) e = (long long)n; if (e < b) e = b;");
+            self.emit("  long long b = off < 0 ? ((off < -(long long)n) ? -1 : (long long)n + off) : off;");
+            self.emit("  /* bash (MEASURED 2026-11-01): offset out of range -> EMPTY; len<0");
+            self.emit("     counts from the STRING end (e = n+len, NOT b+n+len) and errors");
+            self.emit("     when the adjusted end falls before b */");
+            self.emit("  if (b < 0 || b > (long long)n) { _sh_vgrow(d, 1); d->p[0] = 0; return d->p; }");
+            self.emit("  long long e;");
+            self.emit("  if (len < 0) {");
+            self.emit("    if (len < -(long long)n) { fprintf(stderr, \"%lld: substring expression < 0\\n\", len); exit(1); }");
+            self.emit("    e = (long long)n + len;");
+            self.emit("    if (e < b) { fprintf(stderr, \"%lld: substring expression < 0\\n\", len); exit(1); }");
+            self.emit("  } else { e = len > (long long)n - b ? (long long)n : b + len; }");
+            self.emit("  if (e > (long long)n) e = (long long)n;");
             self.emit("  size_t out = (size_t)(e - b);");
             self.emit("  _sh_vgrow(d, out + 1);");
             self.emit("  memcpy(d->p, s + b, out); d->p[out] = 0;");
@@ -13244,9 +13782,61 @@ impl Render {
         }
         if self.need_primitives {
             // primitive ext-node helpers (StrLen/WordCount/RegCount/
-            // ArrayLen(Split)) — pure C, no shell-out runtime. Emitted
-            // OUTSIDE the need_sh block so a program that uses only a
-            // primitive (no shell-out) still gets them.
+            // ArrayLen(Split), StrSplice) — pure C, no shell-out runtime.
+            // Emitted OUTSIDE the need_sh block so a program that uses only
+            // a primitive (no shell-out) still gets them.
+            //
+            // str-splice-fold's value form: base[0..start) ++ repl ++
+            // base[end..) in ONE pass into `d`. The clamps are chosen to be
+            // exactly what TWO `_sh_substr` calls produce, slice by slice,
+            // so the fused result is byte-identical to the concat it
+            // replaced — an out-of-range start/end empties THAT slice
+            // rather than the whole result, and a negative `start` counts
+            // back from the end and errors when it crosses 0, like bash.
+            // `b` must not alias `d` (callers pass a fresh vbuf).
+            self.emit("/* str-splice-fold: base[0..start) ++ repl ++ base[end..) */");
+            self.emit("static char *_sh_splice_v(_sh_vbuf *d, const char *base, long long start, long long end, const char *repl) {");
+            self.emit("  const char *b = base ? base : \"\"; size_t n = strlen(b);");
+            self.emit("  const char *r = repl ? repl : \"\"; size_t rl = strlen(r);");
+            self.emit("  long long pe;");
+            self.emit("  if (start < 0) { if (start < -(long long)n) { fprintf(stderr, \"%lld: substring expression < 0\\n\", start); exit(1); } pe = (long long)n + start; }");
+            self.emit("  else pe = start > (long long)n ? (long long)n : start;");
+            self.emit("  long long sb = end < 0 ? (long long)n + end : end;");
+            self.emit("  if (sb < 0 || sb > (long long)n) sb = (long long)n;");
+            self.emit("  size_t out = (size_t)(pe + (long long)rl + ((long long)n - sb));");
+            self.emit("  _sh_vgrow(d, out + 1);");
+            self.emit("  char *w = d->p;");
+            self.emit("  if (pe) memcpy(w, b, (size_t)pe);");
+            self.emit("  if (rl) memcpy(w + pe, r, rl);");
+            self.emit("  if ((long long)n > sb) memcpy(w + pe + rl, b + sb, n - (size_t)sb);");
+            self.emit("  w[out] = 0; return w;");
+            self.emit("}");
+            // str-splice-fold's SELF-store form (`arr[i]="${arr[i]:0:$o}
+            // ${repl}${arr[i]:$k}"`): the base IS the cell being written,
+            // so when the replacement is exactly as wide as the span it
+            // replaces the row can be patched where it already lives —
+            // the pixel-run case, where one memcpy replaces a copy of the
+            // whole 2560-byte row plus a malloc and a free per run. Any
+            // other width rebuilds exactly the way `_sh_splice_v` does.
+            self.emit("static void _sh_splice_arr(char **a, size_t *len, size_t cap, long long i, long long start, long long end, const char *repl) {");
+            self.emit("  if (i < 0) return;");
+            self.emit("  if (i >= (long long)cap) { fprintf(stderr, \"sh2c: capacity exceeded\\n\"); exit(127); }");
+            self.emit("  const char *cur = a[i] ? a[i] : \"\"; size_t n = strlen(cur);");
+            self.emit("  const char *r = repl ? repl : \"\"; size_t rl = strlen(r);");
+            self.emit("  long long pe;");
+            self.emit("  if (start < 0) { if (start < -(long long)n) { fprintf(stderr, \"%lld: substring expression < 0\\n\", start); exit(1); } pe = (long long)n + start; }");
+            self.emit("  else pe = start > (long long)n ? (long long)n : start;");
+            self.emit("  long long sb = end < 0 ? (long long)n + end : end;");
+            self.emit("  if (sb < 0 || sb > (long long)n) sb = (long long)n;");
+            self.emit("  if (a[i] && sb >= pe && (size_t)(sb - pe) == rl) {");
+            self.emit("    if (rl) memcpy(a[i] + pe, r, rl);");
+            self.emit("  } else {");
+            self.emit("    _sh_vbuf t = {0, 0};");
+            self.emit("    _sh_splice_v(&t, cur, start, end, r);");
+            self.emit("    free(a[i]); a[i] = t.p;");
+            self.emit("  }");
+            self.emit("  if ((size_t)(i + 1) > *len) *len = (size_t)(i + 1);");
+            self.emit("}");
             self.emit("/* count whitespace-delimited words (WordCount) */");
             self.emit("static size_t _sh_wc_words(const char *s) {");
             self.emit("  size_t n = 0; int in = 0;");
@@ -18430,6 +19020,18 @@ fn param_copy_alias(
         if !name.is_empty() && name.chars().all(|c| c.is_ascii_digit()) {
             return self.positional_str_l(&name);
         }
+        // IFS is declared ONCE in the prologue (`char IFS[256] = " \t\n"`)
+        // and deliberately skipped by the per-var hoist (`emit_var_decl`
+        // returns early for it), so `has_c_decl` says false and this read
+        // fell through to `_sh_env("IFS")` = getenv. An IFS the program
+        // never ASSIGNED therefore read "" where bash reports its three
+        // startup characters — and, worse, the value `$IFS` displayed was
+        // not the value the IFS-driven join/split helpers consume. The
+        // buffer IS the store for this name; bash ignores an inherited
+        // IFS at startup anyway, so `getenv` was never the right source.
+        if name == "IFS" {
+            return "IFS".to_string();
+        }
         let id = self.c_ident(name);
         // managed-string vars read via .p; raw char* vars via null-guard
         if self.managed_strings.contains(name) {
@@ -18868,117 +19470,35 @@ fn param_copy_alias(
         use crate::shir_nodes::{ArrayLen, CutAt, FieldGrab, FieldStrip, FieldStripEnd, RegCount, Split, StrLen, WordCount};
         match node.tag() {
             // ── str-splice-fold (transforms/str_splice_fold.rs) ──────
-            // VALUE-position fallback: rebuild the exact Interpolate
-            // the node was folded from —
-            // join(slice(base, 0, start)) ++ repl ++ join(slice(base, end, ""))
-            // — and render THAT. Both slice arms receive the same
-            // arguments the fold consumed (Str("0") / Str("") included),
-            // so any site that is not the fused capacity-guarded store
-            // (emit_array_assign's StrSplice arm) behaves byte-for-byte
-            // like the pre-fold program.
+            // VALUE-position form: ONE `_sh_splice_v` call into a fresh
+            // buffer — `base[0..start) ++ repl ++ base[end..)`, clamped
+            // exactly as the two `_sh_substr` calls it replaces clamp, so
+            // the shape is byte-for-byte what the pre-fold Interpolate
+            // produced. The pre-fold concat cost two substring temps, a
+            // join temp and the store's own copy over the same string —
+            // four passes over a 2560-byte framebuffer row for EVERY pixel
+            // of MIMEcroft's rasterizer.
             "StrSplice" => {
                 let sp = node
                     .as_any()
                     .downcast_ref::<crate::shir_nodes::StrSplice>()
                     .expect("tag/type agree");
-                let style = crate::ir::StrStyle::DoubleQuoted;
-                // The base as the param name-arg the slice arms expect.
-                // The fold only ever stores a plain Var read; anything
-                // else refuses (refuse > guess).
-                //
-                // `arr-load-fwd`'s folded read arrives in the def's own
-                // `Call { "arrayIndex", [Str(arr), key] }` spelling —
-                // the same element read the `Index` arm below matches,
-                // so normalise the DISPATCH only; that arm re-renders
-                // `&sp.base` with value_c, which handles the call form.
-                let norm;
-                let dispatch = match &sp.base {
-                    IrExpr::Call { func, args, .. } if func == "arrayIndex" && args.len() == 2 => {
-                        match (&args[0], &args[1]) {
-                            (IrExpr::Str(a, _), k) => {
-                                norm = IrExpr::Index {
-                                    var: a.clone(),
-                                    key: Box::new(k.clone()),
-                                };
-                                &norm
-                            }
-                            _ => &sp.base,
-                        }
-                    }
-                    other => other,
-                };
-                let base = match dispatch {
-                    IrExpr::Var(n, _) | IrExpr::Ident(n) | IrExpr::Str(n, _) => {
-                        IrExpr::Str(n.clone(), style.clone())
-                    }
-                    // arr-load-fwd folded the element copy into the base
-                    // (`row=${TAB[$y]}` → base = TAB[$y]): the param-
-                    // slice reconstruction needs a plain NAME, so build
-                    // the splice directly instead — three writes into a
-                    // FRESH vbuf, which is never `_row`'s storage, so the
-                    // aliasing the fused STORE arm branches on cannot
-                    // arise here (memcpy, not memmove). Clamps are the
-                    // same arithmetic `_sh_substr` / the store arm apply.
-                    IrExpr::Index { .. } => {
-                        let base_c = self.value_c(&sp.base);
-                        let start_c = self.value_num_dollar(&sp.start);
-                        let end_c = self.value_num_dollar(&sp.end);
-                        let repl_c = self.value_c(&sp.repl);
-                        let v = self.vbuf_temp();
-                        self.emit(&format!(
-                            "{{ const char *_row=(char*)({base_c}); long long _bl=(long long)strlen(_row); \
-                             const char *_rp=(char*)({repl_c}); size_t _rl=_rp?strlen(_rp):0; \
-                             long long _s=({start_c}); \
-                             long long _pe=(_s<0)?_bl+_s:_s; if(_pe<0)_pe=0; if(_pe>_bl)_pe=_bl; \
-                             long long _k=({end_c}); \
-                             long long _sb=(_k<0)?_bl+_k:_k; if(_sb<0)_sb=0; if(_sb>_bl)_sb=_bl; \
-                             long long _res=_pe+(long long)_rl+(_bl-_sb); \
-                             _sh_vgrow(&{v},(size_t)_res+1); \
-                             if(_pe)memcpy({v}.p,_row,(size_t)_pe); \
-                             if(_rl)memcpy({v}.p+_pe,_rp,_rl); \
-                             if(_bl>_sb)memcpy({v}.p+_pe+(long long)_rl,_row+_sb,(size_t)(_bl-_sb)); \
-                             {v}.p[_res]=0; }}"
-                        ));
-                        return format!("{v}.p");
-                    }
-                    _ => {
-                        self.mark_todo("StrSplice base not a plain name");
-                        return Self::cstr("");
-                    }
-                };
-                let join = |e: IrExpr| IrExpr::Call {
-                    func: "join".to_string(),
-                    args: vec![e],
-                };
-                let prefix = join(IrExpr::Call {
-                    func: "param".to_string(),
-                    args: vec![
-                        IrExpr::Str("slice".to_string(), style.clone()),
-                        base.clone(),
-                        IrExpr::Str("0".to_string(), style.clone()),
-                        sp.start.clone(),
-                    ],
-                });
-                let suffix = join(IrExpr::Call {
-                    func: "param".to_string(),
-                    args: vec![
-                        IrExpr::Str("slice".to_string(), style.clone()),
-                        base,
-                        sp.end.clone(),
-                        IrExpr::Str(String::new(), style),
-                    ],
-                });
-                let mut parts = vec![
-                    crate::ir::InterpPart::Expr(Box::new(prefix)),
-                ];
-                match &sp.repl {
-                    IrExpr::Interpolate(mid) => {
-                        parts.extend(mid.iter().cloned());
-                    }
-                    other => parts.push(crate::ir::InterpPart::Expr(Box::new(other.clone()))),
-                }
-                parts.push(crate::ir::InterpPart::Expr(Box::new(suffix)));
-                return self.value_c(&IrExpr::Interpolate(parts));
+                // ONE pass into a fresh buffer: `_sh_splice_v` applies the
+                // same clamping `_sh_substr` applies to each slice, so this
+                // is exactly the concat the node was folded from — while
+                // the pre-fused shape paid two substring temps, a join temp
+                // AND the store's copy over the same string (four passes
+                // per pixel over MIMEcroft's 2560-byte framebuffer row).
+                self.need_primitives = true;
+                let base_c = self.value_c(&sp.base);
+                let start_c = self.value_num_dollar(&sp.start);
+                let end_c = self.value_num_dollar(&sp.end);
+                let repl_c = self.value_c(&sp.repl);
+                let v = self.vbuf_temp();
+                self.emit(&format!(
+                    "_sh_splice_v(&{v}, (char*)({base_c}), {start_c}, {end_c}, (char*)({repl_c}));"
+                ));
+                format!("{v}.p")
             }
             // ── str-chop-cursor pair (transforms/str_chop_cursor.rs) ──
             // `off` is the ABSOLUTE byte offset of the unconsumed tail
@@ -19956,7 +20476,8 @@ fn param_copy_alias(
                     }
                     if name == "@" || name == "*" {
                         let t = self.vbuf_temp();
-                        self.emit(&format!("_sh_argv_join(&{t});"));
+                        let sep = if name == "*" { "IFS[0]" } else { "' '" };
+                        self.emit(&format!("_sh_argv_join(&{t}, {sep});"));
                         return format!("{t}.p");
                     }
                     // `$EPOCHREALTIME` / `$EPOCHSECONDS`: native clock
@@ -20176,6 +20697,17 @@ fn param_copy_alias(
             IrExpr::Str(s, _) => match s.trim().parse::<i64>() {
                 Ok(n) => n.to_string(),
                 Err(_) => format!("atoll({})", Self::cstr(s)),
+            },
+            // An UNQUOTED positional (or `$x`) in a numeric slot arrives as
+            // `split(word)`. Its text form is that word, so stringifying it
+            // only to `atoll` it again computes the same value twice — the
+            // MIMEcroft texture slot paid `_sh_ll2s` + `atoll` per pixel.
+            // An empty word splits to no argument, which the callee reads as
+            // `atoll("")` = 0 — exactly the value of the int-homed cell, so
+            // the two forms agree for every input this slot can receive.
+            IrExpr::Call { func, args } if func == "split" => match args.as_slice() {
+                [one] => self.value_ll(one),
+                _ => format!("atoll((char*)({}))", self.value_c(e)),
             },
             _ => format!("atoll((char*)({}))", self.value_c(e)),
         }
@@ -20675,7 +21207,7 @@ fn param_copy_alias(
                         }
                         Some("*") => {
                             let t = self.vbuf_temp();
-                            self.emit(&format!("_sh_argv_join(&{t});"));
+                            self.emit(&format!("_sh_argv_join(&{t}, IFS[0]);"));
                             word(self, format!("{t}.p"));
                         }
                         Some(n) if n.chars().all(|c| c.is_ascii_digit()) => {
@@ -20692,9 +21224,12 @@ fn param_copy_alias(
                             // "$@" / "$*" — the JOINED positional value,
                             // evaluated at site-build time while _sh_argv
                             // is live (an env export of "@" is always
-                            // empty: generator-system-echo-checkqx)
+                            // empty: generator-system-echo-checkqx).
+                            // Face decides the joiner: `$*` on IFS[0],
+                            // `$@` always on a space (MEASURED above).
                             let t = self.vbuf_temp();
-                            self.emit(&format!("_sh_argv_join(&{t});"));
+                            let sep = if n == "*" { "IFS[0]" } else { "' '" };
+                            self.emit(&format!("_sh_argv_join(&{t}, {sep});"));
                             word(self, format!("{t}.p"));
                         }
                         Some("IFS") => {
@@ -21070,11 +21605,13 @@ fn param_copy_alias(
                                     first_seg = false;
                                     return;
                                 } else if n == "@" || n == "*" {
-                                    // "$@" — the JOINED positional value at
-                                    // site-build time (an env export of "@"
-                                    // is always empty)
+                                    // "$@"/"$*" — the JOINED positional value
+                                    // at site-build time (an env export of
+                                    // "@" is always empty); `$*` joins on
+                                    // IFS[0], `$@` on a space.
                                     let t = self.vbuf_temp();
-                                    self.emit(&format!("_sh_argv_join(&{t});"));
+                                    let sep = if n == "*" { "IFS[0]" } else { "' '" };
+                                    self.emit(&format!("_sh_argv_join(&{t}, {sep});"));
                                     // mid-word: GLUE the runtime value in
                                     // as a double-quoted piece (`"hello $@"`
                                     // is ONE word — a word separator would
@@ -23297,6 +23834,12 @@ fn param_copy_alias(
                                     self.emit(&format!("for (size_t _fi = 0; _fi < {id}_len; _fi++) {{ free({id}[_fi]); {id}[_fi] = 0; }}"));
                                 }
                                 self.emit(&format!("{id}_len = 0;"));
+                                if self.dense_presence(&name) {
+                                    // `unset arr` drops every SET bit too,
+                                    // or a later write past a former hole
+                                    // would expose a phantom element.
+                                    self.emit(&format!("memset(_sh_pres_{id}, 0, sizeof _sh_pres_{id});"));
+                                }
                             }
                         } else if !self.is_num(&name) {
                             let id = self.c_ident(&name);
@@ -28354,7 +28897,7 @@ fn param_copy_alias(
                 let mut is_array = true;
                 let mut is_positional = name == "@" || name == "*";
                 let joined = if let Some(keys) = name.strip_prefix('!') {
-                    self.array_keys_join(keys)
+                    self.array_keys_join(keys, face_star)
                 } else if name == "@" || name == "*" {
                     // `${@:off:len}` — the positional params (the
                     // helper slices _sh_argv directly)
@@ -28389,11 +28932,12 @@ fn param_copy_alias(
                 let off_idx = if idx_is_at { 3 } else { 2 };
                 let len_idx = off_idx + 1;
                 let off = self.args_value_num(off_idx);
-                // `_sh_substr`/`_sh_arr_slice` count negative lengths
-                // from the END (bash `${x::-2}` = n-2 chars), so the
-                // no-length sentinel must be a huge POSITIVE value that
-                // clamps to n (a -1 sentinel would chop the last char
-                // under the end-counting rule)
+                // No-length sentinel: a huge POSITIVE value that clamps
+                // to n. Negative lengths follow bash's MEASURED rules
+                // (2026-11-01 grids): the scalar arm counts from the
+                // STRING end (e = n+len, error iff e < b), the array
+                // arms ERROR outright — so a -1 sentinel would both chop
+                // a char and, on an array face, kill the program.
                 let len = match args.get(len_idx) {
                     None => "(long long)1LL<<60".to_string(),
                     Some(IrExpr::Str(s, _)) if s.is_empty() => "(long long)1LL<<60".to_string(),
@@ -28423,9 +28967,26 @@ fn param_copy_alias(
                 if is_positional {
                     // `${@:off:len}` — bash's offset is 1-based (0
                     // includes $0); the helper slices _sh_argv directly
-                    // (the space-joined form would lose empty elements)
+                    // (the joined form would lose empty elements).
+                    // The separator is the FACE's (MEASURED 2026-11-04):
+                    // `*` joins on IFS[0] (empty IFS -> concatenate), `@`
+                    // on IFS[0] too but falls back to a SPACE on an empty
+                    // IFS. Both differ from the old unconditional ' '.
+                    // The face lives in TWO places depending on the shIR
+                    // shape: `param("slice", NAME, "@"|"*", off, len)` puts
+                    // it in args[2] (`face_star`), while a positional
+                    // `param("slice", "*"|"@", off, len)` puts it in the
+                    // NAME. Reading only the first kept the `*` face on the
+                    // `@` join — MEASURED: `IFS=''; v="${*:2:2}"` rendered
+                    // `q r` where bash gives `qr`.
+                    let pos_star = face_star || name == "*";
+                    let sep = if pos_star {
+                        "IFS[0]".to_string()
+                    } else {
+                        "(IFS[0] ? IFS[0] : ' ')".to_string()
+                    };
                     self.emit(&format!(
-                        "_sh_argv_slice(&{t}, {off}, {len});"
+                        "_sh_argv_slice(&{t}, {off}, {len}, {sep});"
                     ));
                 } else if is_array {
                     // An indexed char** array takes the STORE-based
@@ -28454,13 +29015,25 @@ fn param_copy_alias(
                         self.arrays.insert(base.clone());
                         self.need_sh = true;
                         let id = self.c_ident(&base);
-                        let sep = if star_face { "IFS[0]" } else { "' '" };
+                        // the SLICE face (MEASURED 2026-11-04): `[@]:o:l`
+                        // joins on IFS[0] with a SPACE fallback on an empty
+                        // IFS — unlike the whole-array `[@]`, which is
+                        // always space-joined (`a=(x y z); IFS=:` gives
+                        // `${a[@]}`="x y z" but `${a[@]:1:2}`="y:z").
+                        let sep = if star_face { "IFS[0]" } else { "(IFS[0] ? IFS[0] : ' ')" };
                         self.emit(&format!(
                             "_sh_join_arr_rng(&{t}, {id}, {id}_len, {off}, {len}, {sep});"
                         ));
                     } else {
+                        // The FALLBACK arm (dense value storage / undeclared /
+                        // `!`-named): the helper splits `joined` back into
+                        // words, so it must split on the separator
+                        // `array_join_all_face` JOINED with — IFS[0] for
+                        // `${a[*]}`, a literal space for `${a[@]}` — and not
+                        // the space it used to hard-code.
+                        let slice_sep = if star_face { "IFS[0]" } else { "' '" };
                         self.emit(&format!(
-                            "_sh_arr_slice(&{t}, {joined}, {off}, {len});"
+                            "_sh_arr_slice(&{t}, {joined}, {off}, {len}, {slice_sep});"
                         ));
                     }
                 } else {
@@ -28524,7 +29097,8 @@ fn param_copy_alias(
             self.argc_expr_l()
         } else if name == "@" || name == "*" {
             let t = self.vbuf_temp();
-            self.emit(&format!("_sh_argv_join(&{t});"));
+            let sep = if name == "*" { "IFS[0]" } else { "' '" };
+            self.emit(&format!("_sh_argv_join(&{t}, {sep});"));
             format!("{t}.p")
         } else if self.var_types.contains_key(&name) && self.is_num(&name) {
             self.num_temp(&self.c_ident(&name))
@@ -28740,12 +29314,21 @@ fn param_copy_alias(
     fn param_array(&mut self, op: &str, name: &str) -> String {
         // `${!map[@]}` — the keys
         if let Some(rest) = name.strip_prefix('!') {
+            // The FACE lives in TWO places depending on the shIR shape
+            // (same split the values face has): `param("keys", "!n[*]",
+            // …)` puts it in the NAME, while a `slice` shape carries it
+            // in args[2] and leaves the name `!n[@]`. Reading only the
+            // name kept `[*]` on the space join — MEASURED: `declare -ia
+            // n; n[0]=7; n[2]=9; IFS=:; echo "${!n[*]}"` rendered
+            // `0 2` where bash gives `0:2`.
+            let star = rest.ends_with("[*]")
+                || matches!(self.cur_param_args.get(2), Some(IrExpr::Str(s, _)) if s == "*");
             let rest = rest
                 .strip_suffix("[@]")
                 .or_else(|| rest.strip_suffix("[*]"))
                 .unwrap_or(rest);
             if !rest.is_empty() {
-                return self.array_keys_join(rest);
+                return self.array_keys_join(rest, star);
             }
         }
         // `${#arr[@]}` — length
@@ -28787,7 +29370,8 @@ fn param_copy_alias(
                         self.arrays.insert(var.to_string());
                         self.need_sh = true;
                         let id = self.c_ident(var);
-                        let sep = if star { "IFS[0]" } else { "' '" };
+                        // slice face, as above: IFS[0], space on an empty IFS
+                        let sep = if star { "IFS[0]" } else { "(IFS[0] ? IFS[0] : ' ')" };
                         self.emit(&format!(
                             "_sh_join_arr_rng(&{t}, {id}, {id}_len, {off}, {len}, {sep});"
                         ));
@@ -28865,7 +29449,8 @@ fn param_copy_alias(
                 }
                 if name == "@" || name == "*" {
                     let t = self.vbuf_temp();
-                    self.emit(&format!("_sh_argv_join(&{t});"));
+                    let sep = if name == "*" { "IFS[0]" } else { "' '" };
+                    self.emit(&format!("_sh_argv_join(&{t}, {sep});"));
                     return format!("{t}.p");
                 }
                 // `$EPOCHREALTIME` / `$EPOCHSECONDS`: native clock (see
@@ -30269,11 +30854,24 @@ fn param_copy_alias(
     /// corrupts — it reads back as garbage), `_sh_arr_set` otherwise.
     /// Guard mirrors _sh_arr_set exactly (negative stores nothing,
     /// past-cap exits 127); native values are never null so no !v check.
-    fn emit_fixed_index_write(&mut self, var: &str, key: &str, val: &IrExpr, v: &str, acap: usize) {
+    fn emit_fixed_index_write(&mut self, var: &str, key: &str, val: &IrExpr, v: &str, acap: usize, own: Option<&str>) {
         let id = self.c_ident(var);
         if self.int_arrays.contains(var) {
             let nv = self.store_int_item_c(val);
-            self.emit(&format!("{{ long long _kk = (long long)({key}); if (_kk >= 0) {{ if (_kk >= {acap}) {{ fprintf(stderr, \"sh2c: capacity exceeded: {id}\\n\"); exit(127); }} {id}[_kk] = {nv}; if ((size_t)(_kk + 1) > {id}_len) {id}_len = _kk + 1; }} }}"));
+            // a dense array with a presence marker must record the SET:
+            // `n[2]=9` makes index 2 an element even though index 1 is a
+            // zeroed slot (`${{#n[@]}}` counts 2, `${{n[*]}}` is `7 9`).
+            let pset = if self.dense_presence(var) {
+                format!(" _sh_pres_{id}[_kk] = 1;")
+            } else {
+                String::new()
+            };
+            self.emit(&format!("{{ long long _kk = (long long)({key}); if (_kk >= 0) {{ if (_kk >= {acap}) {{ fprintf(stderr, \"sh2c: capacity exceeded: {id}\\n\"); exit(127); }} {id}[_kk] = {nv};{pset} if ((size_t)(_kk + 1) > {id}_len) {id}_len = _kk + 1; }} }}"));
+        } else if let Some(vb) = own {
+            // the value IS this vbuf's storage (fresh, unaliased) — move
+            self.emit(&format!(
+                "_sh_arr_set_own({id}, &{id}_len, {acap}, {key}, &{vb}.p, &{vb}.cap);"
+            ));
         } else {
             self.emit(&format!(
                 "_sh_arr_set({id}, &{id}_len, {acap}, {key}, {v});"
@@ -30288,7 +30886,53 @@ fn param_copy_alias(
         // exact assoc capacity from proofs (not blanket 1024) — decl
         // and every set-call guard agree via array_cap
         let acap = self.array_cap(var);
+        // `arr[i] = "${arr[i]:0:$o}${repl}${arr[i]:$k}"` — str-splice-fold's
+        // self-store relink: the splice's base IS the cell this store
+        // writes, so the element is patched in place (see `_sh_splice_arr`)
+        // instead of being rebuilt, copied and swapped.
+        if let IrExpr::Ext(n) = val {
+            if n.tag() == "StrSplice" {
+                if let Some(sp) = n
+                    .as_any()
+                    .downcast_ref::<crate::shir_nodes::StrSplice>()
+                {
+                    if let IrExpr::Call { func, args } = &sp.base {
+                        if let ([IrExpr::Str(a, _), IrExpr::Str(k, _), ..], IrExpr::Str(kk, _)) =
+                            (args.as_slice(), key)
+                        {
+                            let same_cell = func == "arrayIndex"
+                                && a == var
+                                && k.trim() == kk.trim();
+                            if same_cell
+                                && !self.assoc_arrays.contains(var)
+                                && !self.vec_arrays.contains(var)
+                                && !self.int_arrays.contains(var)
+                            {
+                                let idx = self.dyn_key_c(k);
+                                let s = self.value_num_dollar(&sp.start);
+                                let e = self.value_num_dollar(&sp.end);
+                                let r = self.value_c(&sp.repl);
+                                self.need_primitives = true;
+                                self.emit(&format!(
+                                    "_sh_splice_arr({id}, &{id}_len, {acap}, (long long)({idx}), (long long)({s}), (long long)({e}), (char*)({r}));"
+                                ));
+                                return;
+                            }
+                        }
+                    }
+                }
+            }
+        }
         let v = self.value_c(val);
+        // A fused splice renders as exactly `<vbuf>.p` — the buffer it
+        // just filled for this store, aliased by nothing else — so the
+        // store can MOVE it instead of strdup-ing a copy of a copy.
+        let own = match &val {
+            IrExpr::Ext(n) if n.tag() == "StrSplice" => {
+                v.strip_suffix(".p").filter(|b| b.starts_with("_v"))
+            }
+            _ => None,
+        };
         if let IrExpr::Interpolate(_parts) = key {
             // an Interpolate KEY (e.g. `m["${flags:j:1}"]=v` arrives as
             // Lit('"') + expr + Lit('"'))): concatenate the part VALUES
@@ -30360,7 +31004,7 @@ fn param_copy_alias(
                     self.emit_vec_index_write(var, &i.to_string(), &v, skip);
                     return;
                 }
-                self.emit_fixed_index_write(var, &i.to_string(), val, &v, acap);
+                self.emit_fixed_index_write(var, &i.to_string(), val, &v, acap, own);
             } else if is_ident(k.trim())
                 && (self.var_types.contains_key(k.trim())
                     || self.store.contains(k.trim()))
@@ -30377,7 +31021,7 @@ fn param_copy_alias(
                     self.emit_vec_index_write(var, &kv, &v, skip);
                     return;
                 }
-                self.emit_fixed_index_write(var, &kv, val, &v, acap);
+                self.emit_fixed_index_write(var, &kv, val, &v, acap, own);
             } else if !Self::is_bare_dollar_var(k.trim()) {
                 // A literal string key implies assoc (`m[os]=v` — an
                 // indexed array cannot have string keys). Bare `$var`
@@ -30401,7 +31045,7 @@ fn param_copy_alias(
                 self.emit_vec_index_write(var, &k, &v, skip);
                 return;
             }
-            self.emit_fixed_index_write(var, &k, val, &v, acap);
+            self.emit_fixed_index_write(var, &k, val, &v, acap, own);
         }
         // `arr[$i]=x` — the Str key carries the raw `$i` text: dynamic,
         // assoc-aware. Indexed arrays take the numeric index; assoc
@@ -30459,7 +31103,7 @@ fn param_copy_alias(
                         }
                         return;
                     }
-                    self.emit_fixed_index_write(var, &kv, val, &v, acap);
+                    self.emit_fixed_index_write(var, &kv, val, &v, acap, own);
                     return;
                 }
             }
@@ -30497,6 +31141,16 @@ fn param_copy_alias(
                     _ => None,
                 }
             }
+            // `${src[i]}` stored into an int-homed array: the numeric
+            // element read, exactly as any other numeric context renders
+            // it. Without this arm the int store fell through to
+            // `atoll(value_c(..))`, which stringifies the element with
+            // `_sh_ll2s` and parses it straight back — two conversions per
+            // store, per iteration, in the innermost loop.
+            IrExpr::Call { func, args } if func == "arrayIndex" => match Self::str_arg(args, 0) {
+                Some(name) if self.int_arrays.contains(&name) => Some(self.expr_as_num(e)),
+                _ => None,
+            },
             _ => None,
         };
         match native {
@@ -30531,6 +31185,9 @@ fn param_copy_alias(
             self.emit(&format!("for (size_t _fi = 0; _fi < {id}_len; _fi++) {{ free({id}[_fi]); {id}[_fi] = 0; }}"));
         }
         self.emit(&format!("{id}_len = 0;"));
+        if self.dense_presence(arr) {
+            self.emit(&format!("memset(_sh_pres_{id}, 0, sizeof _sh_pres_{id});"));
+        }
         if n == 0 {
             return;
         }
@@ -30738,6 +31395,9 @@ fn param_copy_alias(
             self.emit(&format!("for (size_t _fi = 0; _fi < {id}_len; _fi++) {{ free({id}[_fi]); {id}[_fi] = 0; }}"));
         }
         self.emit(&format!("{id}_len = 0;"));
+        if self.dense_presence(var) {
+            self.emit(&format!("memset(_sh_pres_{id}, 0, sizeof _sh_pres_{id});"));
+        }
         if self.reduce_arrays.contains(var) {
             self.emit(&format!("{id}_max = 0;"));
             self.emit(&format!("{id}_min = 0;"));
@@ -30814,6 +31474,10 @@ fn param_copy_alias(
                 // int-typed array: store the native 64-bit value directly
                 let nv = self.store_int_item_c(it);
                 self.emit(&format!("{id}[{ai}] = {nv};"));
+                if self.dense_presence(var) {
+                    // a literal/append element is a SET slot
+                    self.emit(&format!("_sh_pres_{id}[{ai}] = 1;"));
+                }
                 if self.reduce_arrays.contains(var) {
                     // maintain the aggregates (Optimisation 1)
                     self.emit(&format!("if ({ai} == 0) {{ {id}_max = {id}_min = (long long){nv}; {id}_sum = (__int128)({nv}); }} else {{"));
@@ -30909,24 +31573,40 @@ fn param_copy_alias(
             self.mark_todo("assoc bulk append non-literal items");
             return;
         }
+        // Where the append lands. Bash appends at (last SET index)+1,
+        // which is `_len` for a dense array but NOT for one with a
+        // presence marker: `i=(5); unset 'i[0]'; i+=(6)` appends at index
+        // 0 (the array is EMPTY), while `_len` is still 1 — measured
+        // 2026-11-04 (bash: count 1, keys `0`). So a marked array scans
+        // back for the last present slot; everything else keeps `_len`.
+        let base = if self.dense_presence(var) && !items.is_empty() {
+            let bt = format!("_ab{}", self.temp_seq);
+            self.temp_seq += 1;
+            self.emit(&format!(
+                "size_t {bt} = 0; for (size_t _i{bt} = {id}_len; _i{bt}-- > 0; ) {{ if (_sh_pres_{id}[_i{bt}]) {{ {bt} = _i{bt} + 1; break; }} }}"
+            ));
+            bt
+        } else {
+            format!("{id}_len")
+        };
         // fixed [ARR_CAP] array with no per-store guard — one upfront
         // check covers every arm (mpz/int/string) instead of silent
         // overflow past the cap. Vec arrays grow instead.
         if !items.is_empty() {
             if self.vec_arrays.contains(var) {
                 let sfx = self.vec_grow_suffix(var);
-                self.emit(&format!("while ({id}_len + {} > {id}_cap) _sh_grow_{sfx}(&{id}, &{id}_cap);", items.len()));
+                self.emit(&format!("while ({base} + {} > {id}_cap) _sh_grow_{sfx}(&{id}, &{id}_cap);", items.len()));
             } else {
                 let cap = self.array_cap(var);
-                self.emit(&format!("if ({id}_len + {} > {cap}) {{ fprintf(stderr, \"sh2c: capacity exceeded: {id}\\n\"); exit(127); }}", items.len()));
+                self.emit(&format!("if ({base} + {} > {cap}) {{ fprintf(stderr, \"sh2c: capacity exceeded: {id}\\n\"); exit(127); }}", items.len()));
             }
         }
         for (i, it) in items.iter().enumerate() {
-            // `arr[len + 0]` -> `arr[len]` (drop the +0 for the first)
+            // `arr[base + 0]` -> `arr[base]` (drop the +0 for the first)
             let idx = if i == 0 {
-                format!("{id}_len")
+                base.clone()
             } else {
-                format!("{id}_len + {i}")
+                format!("{base} + {i}")
             };
             if self.cur_array_return_arr.as_deref() == Some(var) {
                 // the return array of an array-return function: mpz_t[]
@@ -30936,6 +31616,13 @@ fn param_copy_alias(
                 // int-typed array: store the native 64-bit value directly
                 let nv = self.store_int_item_c(it);
                 self.emit(&format!("{id}[{idx}] = {nv};"));
+                if self.dense_presence(var) {
+                    // an appended element is a SET slot (the marker is
+                    // what count/join/keys read): without this the
+                    // elements are stored but invisible — measured
+                    // `declare -ia a=(1 2); a+=(3 4)` printed `2 [1 2]`.
+                    self.emit(&format!("_sh_pres_{id}[{idx}] = 1;"));
+                }
                 if self.reduce_arrays.contains(var) {
                     // maintain the aggregates (Optimisation 1)
                     self.emit(&format!("if ({idx} == 0) {{ {id}_max = {id}_min = (long long){nv}; {id}_sum = (__int128)({nv}); }} else {{"));
@@ -30949,8 +31636,17 @@ fn param_copy_alias(
                 self.emit(&format!("{id}[{idx}] = _sh_xstrdup((char*)({v}));"));
             }
         }
-        // a single append is `++len`; more is `len += n`
-        if items.len() == 1 {
+        // a single append is `++len`; more is `len += n` — but a MARKED
+        // array's extent is max(base + n, _len), because the append base
+        // can be an EARLIER index than `_len` (the empty-after-unset case
+        // above must not leave `_len` at 1 when it wrote slot 0).
+        if self.dense_presence(var) && !items.is_empty() {
+            self.emit(&format!(
+                "if ({base} + {} > {id}_len) {id}_len = {base} + {};",
+                items.len(),
+                items.len()
+            ));
+        } else if items.len() == 1 {
             self.emit(&format!("++{id}_len;"));
         } else {
             self.emit(&format!("{id}_len += {};", items.len()));
@@ -31123,6 +31819,15 @@ fn param_copy_alias(
                         self.emit(&format!(
                             "if ({i} < {id}_len) {{ free({id}[{i}]); {id}[{i}] = 0; }}"
                         ));
+                    } else if self.dense_presence(var) {
+                        // a value slot needs the PRESENCE bit cleared, not
+                        // just the value zeroed: bash's `unset 'n[0]'`
+                        // removes the ELEMENT, so `${{#n[@]}}` drops and
+                        // `${{n[*]}}` skips the slot (MEASURED 2026-11-04:
+                        // `n[0]=7; n[2]=9; unset 'n[0]'` -> 1, `9`, `2`).
+                        self.emit(&format!(
+                            "if ({i} < {id}_len) {{ {id}[{i}] = 0; _sh_pres_{id}[{i}] = 0; }}"
+                        ));
                     } else {
                         self.emit(&format!("if ({i} < {id}_len) {id}[{i}] = 0;"));
                     }
@@ -31162,9 +31867,52 @@ fn param_copy_alias(
                 "{{ long long {t} = {k}; if ({t} >= 0 && {t} < (long long){id}_len) {{ free({id}[{t}]); {id}[{t}] = 0; }} }}"
             ));
         } else {
+            // value storage: the slot is zeroed AND the presence bit
+            // cleared — bash's `unset 'n[0]'` removes the ELEMENT, so
+            // `${{#n[@]}}` drops and `${{n[*]}}` skips the slot.
+            let pclear = if self.dense_presence(var) {
+                format!("_sh_pres_{id}[{t}] = 0;")
+            } else {
+                String::new()
+            };
             self.emit(&format!(
-                "{{ long long {t} = {k}; if ({t} >= 0 && {t} < (long long){id}_len) {id}[{t}] = 0; }}"
+                "{{ long long {t} = {k}; if ({t} >= 0 && {t} < (long long){id}_len) {{ {id}[{t}] = 0; {pclear} }} }}"
             ));
+        }
+    }
+
+    /// The NUMERIC value of a dynamic subscript (`$i`, `${arr[i]}`'s bare
+    /// `i`, an arithmetic expression like `(2*$i)-1`) — the one spelling
+    /// both the element READ and the self-splice STORE use, so an index
+    /// can never be evaluated two different ways.
+    fn dyn_key_c(&mut self, key: &str) -> String {
+        let key = key.trim();
+        let key = key
+            .strip_prefix("${")
+            .and_then(|k| k.strip_suffix('}'))
+            .unwrap_or(key);
+        if let Some(rest) = key.strip_prefix('$') {
+            if rest.chars().all(|c| c.is_ascii_digit()) {
+                format!("(({rest} < _sh_argc && _sh_argv[{rest}]) ? atoll(_sh_argv[{rest}]) : 0)")
+            } else if self.var_types.contains_key(rest) && self.is_num(rest) {
+                format!("(long long)({})", self.c_ident(rest))
+            } else {
+                format!("(long long)atoll({})", self.store_read(rest))
+            }
+        } else if looks_like_arith(key) {
+            // `${arr[(2*$i)-1]}` — an arithmetic index expression
+            self.arith_text_expr(key)
+        } else if is_ident(key) && (self.store.contains(key) || self.var_types.contains_key(key)) {
+            // `${args[i]}` — bash arithmetic subscripts allow BARE var
+            // names: a bare identifier naming a program var reads its
+            // value (atoll("i") would be a constant 0)
+            if self.is_num(key) {
+                format!("(long long)({})", self.c_ident(key))
+            } else {
+                format!("(long long)atoll({})", self.store_read(key))
+            }
+        } else {
+            format!("(long long)atoll({})", Self::cstr(key))
         }
     }
 
@@ -31253,36 +32001,19 @@ fn param_copy_alias(
                 // element must print "0" (Python/bash parity), which
                 // the pointer-truthiness test would treat as unset.
                 let el = self.num_temp(&format!("{id}[{i}]"));
+                // with a presence marker an UNSET slot reads EMPTY, not
+                // "0" (MEASURED: `n[0]=7; n[2]=9; ${n[1]}` is "" while
+                // a stored 0 still prints "0")
+                if self.dense_presence(var) {
+                    return format!(
+                        "(({i} >= 0 && {i} < (long long){id}_len && _sh_pres_{id}[{i}]) ? {el} : \"\")"
+                    );
+                }
                 return format!("(({i} >= 0 && {i} < (long long){id}_len) ? {el} : \"\")");
             }
             return format!("(({i} < {id}_len && {id}[{i}]) ? {id}[{i}] : \"\")");
         }
-        let k = if let Some(rest) = key.strip_prefix('$') {
-            if rest.chars().all(|c| c.is_ascii_digit()) {
-                format!("(({rest} < _sh_argc && _sh_argv[{rest}]) ? atoll(_sh_argv[{rest}]) : 0)")
-            } else if self.var_types.contains_key(rest) && self.is_num(rest) {
-                format!("(long long)({})", self.c_ident(rest))
-            } else {
-                format!("(long long)atoll({})", self.store_read(rest))
-            }
-        } else if looks_like_arith(key) {
-            // `${arr[(2*$i)-1]}` — an arithmetic index expression
-            self.arith_text_expr(key)
-        } else if is_ident(key.trim())
-            && (self.store.contains(key.trim()) || self.var_types.contains_key(key.trim()))
-        {
-            // `${args[i]}` — bash arithmetic subscripts allow BARE var
-            // names: a bare identifier naming a program var reads its
-            // value (atoll("i") would be a constant 0)
-            let t = key.trim();
-            if self.is_num(t) {
-                format!("(long long)({})", self.c_ident(t))
-            } else {
-                format!("(long long)atoll({})", self.store_read(t))
-            }
-        } else {
-            format!("(long long)atoll({})", Self::cstr(key))
-        };
+        let k = self.dyn_key_c(key);
         // int-homed array with a dynamic key: read the native element.
         // The key is pure (bounds/arith reads only) but evaluated here
         // into a temp so it drives both the guard and the index once.
@@ -31291,6 +32022,12 @@ fn param_copy_alias(
             self.temp_seq += 1;
             self.emit(&format!("long long {kt} = {k};"));
             let el = self.num_temp(&format!("{id}[{kt}]"));
+            if self.dense_presence(var) {
+                // the key is already in a temp, so presence costs one test
+                return format!(
+                    "(({kt} >= 0 && {kt} < (long long){id}_len && _sh_pres_{id}[{kt}]) ? {el} : \"\")"
+                );
+            }
             format!("(({kt} >= 0 && {kt} < (long long){id}_len) ? {el} : \"\")")
         } else {
             format!("(char*)_sh_arr_get({id}, {id}_len, {k})")
@@ -31312,13 +32049,38 @@ fn param_copy_alias(
             || self.array_return_arrays.values().any(|ra| ra.as_str() == var)
     }
 
+    /// Does this array carry a per-slot PRESENCE marker?
+    ///
+    /// A fixed dense integer array does: bash tracks which elements are
+    /// SET, and a `long long[]` cannot express "unset" (a zero slot is
+    /// the value 0), so the renderer emits a parallel `_sh_pres_{id}[]` byte
+    /// array. MEASURED bash (2026-11-04), all of which needs it:
+    ///   n[0]=7; n[2]=9  ->  ${#n[@]}=2, ${n[*]}=`7 9`, ${!n[@]}=`0 2`,
+    ///                       ${n[1]}="" (an unset slot is EMPTY, not 0).
+    ///
+    /// The growable-VEC form (`static T *id` + len/cap) does NOT: its
+    /// slots are written by `+=`/loops and the presence buffer would
+    /// need the same realloc dance at every growth site, so it keeps the
+    /// documented dense-extent rule (`array_len` returns `_len`, holes
+    /// read as 0). That is the one remaining shape with the old
+    /// approximation, and it is pinned as an xfail in the battery.
+    /// `mpz_t[]` array-return storage also keeps the extent rule.
+    fn dense_presence(&self, var: &str) -> bool {
+        self.int_arrays.contains(var) && !self.vec_arrays.contains(var)
+    }
+
     fn array_len(&mut self, var: &str) -> String {
         self.arrays.insert(var.to_string());
         let id = self.c_ident(var);
         if self.assoc_arrays.contains(var) {
             format!("(long long){id}_n")
+        } else if self.dense_presence(var) {
+            // bash counts ELEMENTS: `n[0]=7; n[2]=9` is 2, never the
+            // extent 3 (MEASURED 2026-11-04)
+            format!("(long long)_sh_ccount(_sh_pres_{id}, {id}_len)")
         } else if self.dense_value_storage(var) {
-            // no presence marker — dense extent (documented edge)
+            // no presence marker — dense extent (documented edge: the
+            // growable-vec form and `mpz_t[]` array-return storage)
             format!("(long long){id}_len")
         } else {
             // bash counts ELEMENTS, not the dense extent:
@@ -31338,10 +32100,29 @@ fn param_copy_alias(
     /// `$*`/`${!m[@]}` have their own joins.
     fn array_join_all_face(&mut self, var: &str, star: bool) -> String {
         if var == "@" || var == "*" {
-            // `$@`/`$*` in an expansion — the positional params
+            // `$@`/`$*` in an expansion — the positional params.
+            // TWO defects fixed 2026-11-02 (both produced C that does
+            // not COMPILE, measured /tmp/spread_probe s2/s6/p4):
+            //  1. the join writes into the vbuf and the value lives in
+            //     `t.p` — returning bare `t` handed a `_sh_vbuf` to a
+            //     `const char *` initializer (`incompatible types
+            //     when initializing type 'const char *' using type
+            //     '_sh_vbuf'`).  The array branches below have always
+            //     returned `format!("{t}.p")`;
+            //  2. the branch returned WITHOUT `need_sh_argv`, so a
+            //     program whose only positional shape is `$@` inside a
+            //     function never declared `_sh_argc`/`_sh_argv` nor
+            //     emitted `_sh_argv_join` — `implicit declaration of
+            //     function '_sh_argv_join'` (the helper is gated on
+            //     `!pos_const || need_sh_argv`, and `scan_pos_const`
+            //     does not walk into function bodies for `$@`).
+            // Setting the flag here is the same mechanism every other
+            // positional reader uses (18829/18856/21001/…).
+            self.need_sh_argv.set(true);
             let t = self.vbuf_temp();
-            self.emit(&format!("_sh_argv_join(&{t});"));
-            return t;
+            let sep = if var == "*" { "IFS[0]" } else { "' '" };
+            self.emit(&format!("_sh_argv_join(&{t}, {sep});"));
+            return format!("{t}.p");
         }
         self.arrays.insert(var.to_string());
         // first seen after decl emission (backend text-parsed refs) →
@@ -31358,6 +32139,92 @@ fn param_copy_alias(
             // pipelines can sort individual values (space-joined text
             // is one line and passes through sort unchanged)
             self.emit(&format!("_sh_join_arr_nl(&{t}, {id}_v, {id}_n);"));
+        } else if self.int_arrays.contains(var) {
+            // DENSE numeric storage (`declare -ia a=(1 2 3)`): `{id}` is
+            // an INTEGER array — `long long[]`, or the narrowest width
+            // that fits the analysed elements, or the growable-vec
+            // pointer form — never `char**`. Handing it to
+            // `_sh_join_arr_sep` type-confused a `long long` slot for a
+            // `char *` and SEGFAULTED on the first element (MEASURED
+            // 2026-11-04: `declare -ia a=(1 2 3); echo "${a[*]}"` -> rc
+            // 139, bash `1 2 3`).
+            //
+            // The element type is not fixed (the width analysis picks
+            // it per array), so the conversion is emitted INLINE rather
+            // than through a helper: a `const long long *` parameter
+            // would need a cast at every site, and casting `int *` to
+            // `long long *` reinterprets 4-byte slots as 8-byte ones.
+            // `_sh_ll2s` is exact for every integer width, and the trim
+            // pass keeps the helper because the rendered text mentions
+            // it (the `full.contains` gate, same mechanism as any other
+            // emitted call).
+            //
+            // FACES (bash MEASURED 2026-11-04): `[*]` joins on IFS[0]
+            // and an EMPTY IFS concatenates (`IFS=; a=(1 2 3)` -> `123`,
+            // the `if (_jsep)` arm); `[@]` joins on a space even with a
+            // non-default IFS (`IFS=:; echo "${a[@]}"` -> `1 2 3`).
+            // Unlike the char** helper there is NO presence skip: dense
+            // storage keeps no per-slot marker, so the extent IS the
+            // element set (the documented `dense_value_storage` edge —
+            // a sparse `n[0]=7; n[2]=9` renders `7 0 9`/len 3 where bash
+            // says `7 9`/len 2).
+            let sq = self.site_seq;
+            self.site_seq += 1;
+            let sep = if star { "IFS[0]" } else { "' '" };
+            // presence first: with a marker an unset slot is NOT an
+            // element (bash `n[0]=7; n[2]=9` joins `7 9`), so the
+            // separator rides a FIRST-PRESENT flag rather than the index
+            let skip = if self.dense_presence(var) {
+                format!("    if (!_sh_pres_{id}[_jdi{sq}]) continue;\n")
+            } else {
+                String::new()
+            };
+            self.emit(&format!("{{ size_t _jdn{sq} = 0; int _jdf{sq} = 1; char _jdb{sq}[24];"));
+            self.emit(&format!(
+                "  for (size_t _jdi{sq} = 0; _jdi{sq} < {id}_len; _jdi{sq}++) {{"
+            ));
+            if !skip.is_empty() {
+                self.emit(skip.trim_end());
+            }
+            self.emit(&format!("    if (_jdf{sq}) {{ _jdf{sq} = 0; }} else {{ char _jsep = {sep}; if (_jsep) {{ _sh_vgrow(&{t}, _jdn{sq} + 2); {t}.p[_jdn{sq}++] = _jsep; }} }}"));
+            self.emit(&format!(
+                "    _sh_ll2s(_jdb{sq}, (long long)({id}[_jdi{sq}]));"
+            ));
+            self.emit(&format!("    for (const char *_jds{sq} = _jdb{sq}; *_jds{sq}; _jds{sq}++) {{ _sh_vgrow(&{t}, _jdn{sq} + 2); {t}.p[_jdn{sq}++] = *_jds{sq}; }}"));
+            self.emit(&format!("  }}"));
+            self.emit(&format!(
+                "  _sh_vgrow(&{t}, _jdn{sq} + 1); {t}.p[_jdn{sq}] = 0; }}"
+            ));
+        } else if self.array_return_arrays.values().any(|ra| ra.as_str() == var) {
+            // The OTHER dense storage kind: an array-return function's
+            // `mpz_t {id}[N]`. Same type confusion as the int arm above
+            // (`mpz_t` slot read as a `char *`), so it converts inline
+            // too — through `mpz_get_str`, which mallocs. Not measured
+            // end-to-end: reaching it needs a program that both lifts an
+            // array-returning function and joins that array, which no
+            // corpus example does; the arm exists so the shape cannot
+            // fall through to the `char **` helper if one ever does.
+            // `_sh_mpz_arr_join` (the `, ` debug dump) is NOT reusable:
+            // its separator is a fixed comma-space, not the face's.
+            self.need_gmp = true;
+            self.need_sh = true;
+            let sq = self.site_seq;
+            self.site_seq += 1;
+            let sep = if star { "IFS[0]" } else { "' '" };
+            self.emit(&format!("{{ size_t _jdn{sq} = 0;"));
+            self.emit(&format!(
+                "  for (size_t _jdi{sq} = 0; _jdi{sq} < {id}_len; _jdi{sq}++) {{"
+            ));
+            self.emit(&format!("    if (_jdi{sq}) {{ char _jsep = {sep}; if (_jsep) {{ _sh_vgrow(&{t}, _jdn{sq} + 2); {t}.p[_jdn{sq}++] = _jsep; }} }}"));
+            self.emit(&format!(
+                "    char *_jds{sq} = mpz_get_str(0, 10, {id}[_jdi{sq}]);"
+            ));
+            self.emit(&format!("    for (const char *_jdp{sq} = _jds{sq}; *_jdp{sq}; _jdp{sq}++) {{ _sh_vgrow(&{t}, _jdn{sq} + 2); {t}.p[_jdn{sq}++] = *_jdp{sq}; }}"));
+            self.emit(&format!("    free(_jds{sq});"));
+            self.emit(&format!("  }}"));
+            self.emit(&format!(
+                "  _sh_vgrow(&{t}, _jdn{sq} + 1); {t}.p[_jdn{sq}] = 0; }}"
+            ));
         } else {
             if star {
                 self.emit(&format!(
@@ -31371,13 +32238,45 @@ fn param_copy_alias(
     }
 
     /// `${!map[@]}` — assoc keys joined
-    fn array_keys_join(&mut self, var: &str) -> String {
+    /// `${!arr[*]}` / `${!arr[@]}` — the KEY set. Three storages, three
+    /// key sets (bash MEASURED 2026-11-04): an assoc array's keys are its
+    /// insertion-ordered key list, space-joined even under a non-default
+    /// IFS (`declare -A m=([b]=1 [a]=2); IFS=:; ${!m[*]}` -> `b a`); an
+    /// INDEXED array's keys are its set indices, joined on the FACE's
+    /// separator (`IFS=:; ${!n[*]}` -> `0:2:5`, empty IFS -> `025`).
+    ///
+    /// This used to force EVERY var into `assoc_arrays`, so the indexed
+    /// faces emitted `{id}_k`/`{id}_v`/`{id}_n` for storage that was
+    /// never declared — `declare -ia n; n[0]=7; echo "${!n[@]}"`
+    /// produced C that did not COMPILE, and it also poisoned the rest of
+    /// the render (the var then looked assoc to every later reader).
+    fn array_keys_join(&mut self, var: &str, star: bool) -> String {
         self.arrays.insert(var.to_string());
-        self.assoc_arrays.insert(var.to_string());
         self.need_sh = true;
         let id = self.c_ident(var);
         let t = self.vbuf_temp();
-        self.emit(&format!("_sh_join_keys(&{t}, {id}_k, {id}_n);"));
+        if self.assoc_arrays.contains(var) {
+            // the key LIST, in insertion order, always space-joined
+            self.emit(&format!("_sh_join_keys(&{t}, {id}_k, {id}_n);"));
+            return format!("{t}.p");
+        }
+        // the face's separator: IFS[0] for `[*]` (empty IFS -> nothing),
+        // a literal space for `[@]` — the same rule the VALUES join uses
+        let sep = if star { "IFS[0]" } else { "' '" };
+        if self.dense_value_storage(var) {
+            // value storage: no presence marker, so the key set is the
+            // dense index range (exact for a dense array; the documented
+            // `dense_value_storage` edge when the array has holes)
+            let pset = if self.dense_presence(var) {
+                format!("_sh_pres_{id}")
+            } else {
+                String::from("0")
+            };
+            self.emit(&format!("_sh_join_idx(&{t}, {pset}, {id}_len, {sep});"));
+        } else {
+            // char** storage: a NULL slot is an UNSET element
+            self.emit(&format!("_sh_join_ikind(&{t}, {id}, {id}_len, {sep});"));
+        }
         format!("{t}.p")
     }
 
@@ -31501,7 +32400,13 @@ fn param_copy_alias(
                         }
                         if name == "@" || name == "*" {
                             let t = self.vbuf_temp();
-                            self.emit(&format!("_sh_argv_join(&{t});"));
+                            // `_sh_argv_join` takes the FACE's joiner as its
+                            // second argument (a 1-arg call does not compile):
+                            // `$*` → IFS[0], `"$@"` → always a space (bash
+                            // MEASURED 2026-11-03: `IFS=:; set -- p q r; v="$@"`
+                            // → `p q r` while `v="$*"` → `p:q:r`).
+                            let sep = if name == "*" { "IFS[0]" } else { "' '" };
+                            self.emit(&format!("_sh_argv_join(&{t}, {sep});"));
                             return vec![Part::Arg(format!("{t}.p"), NumSpec::Str)];
                         }
                         if name.chars().all(|c| c.is_ascii_digit()) {
@@ -34344,7 +35249,7 @@ fn param_copy_alias(
                                 // `"$*"` is ONE word (the joined argv) —
                                 // bash runs the body exactly once
                                 let t = self.vbuf_temp();
-                                self.emit(&format!("_sh_argv_join(&{t});"));
+                                self.emit(&format!("_sh_argv_join(&{t}, IFS[0]);"));
                                 self.emit(&format!("{var_name} = {t}.p;"));
                                 self.emit("{");
                                 self.depth += 1;
@@ -34425,7 +35330,14 @@ fn param_copy_alias(
                                             "for (size_t _ai_{kid} = 0; _ai_{kid} < {kid}_len; _ai_{kid}++) {{"
                                         ));
                                         self.depth += 1;
-                                        if !self.dense_value_storage(keys) {
+                                        if self.dense_presence(keys) {
+                                            // value storage WITH a marker:
+                                            // the bit says set, the slot
+                                            // holds the value
+                                            self.emit(&format!(
+                                                "if (!_sh_pres_{kid}[_ai_{kid}]) continue;"
+                                            ));
+                                        } else if !self.dense_value_storage(keys) {
                                             self.emit(&format!(
                                                 "if (!{kid}[_ai_{kid}]) continue;"
                                             ));
@@ -35935,9 +36847,20 @@ fn param_copy_alias(
                     Some(n) if !n.is_empty() && n.chars().all(|c| c.is_ascii_digit()) => {
                         self.positional_read_l(&n)
                     }
-                    _ => self.expr(e),
+                    // `x=$src` with src text-homed reaches here as
+                    // getVar("src"); `expr` renders the C name, so the
+                    // long long target stored the POINTER. value_ll is
+                    // the numeric render of the same read.
+                    _ => self.value_ll(e),
                 }
             }
+            // A plain NAME on a numeric target: parse a text-homed cell
+            // instead of storing its pointer. `expr` renders the name
+            // verbatim, which is only a value when the cell is already
+            // Int — a text source produced `rbx_s = rbp_ftx;` (char* into
+            // long long: garbage) on the MIMEcroft texture-slot copy.
+            // `value_ll` is the numeric renderer for the same name.
+            IrExpr::Var(..) | IrExpr::Ident(..) => self.value_ll(e),
             _ => self.expr(e),
         }
     }
@@ -36199,6 +37122,14 @@ fn param_copy_alias(
                     } else {
                         self.emit(&format!("static {} {id}[{cap}] = {{0}};", w.c_type()));
                         self.emit(&format!("static size_t {id}_len = 0;"));
+                        // the PRESENCE marker (§ dense_presence): a
+                        // value-typed slot cannot say "unset", so bash's
+                        // element set rides alongside. Same capacity as
+                        // the values, so an index inside `_len` is always
+                        // inside both.
+                        if self.dense_presence(a) {
+                            self.emit(&format!("static unsigned char _sh_pres_{id}[{cap}] = {{0}};"));
+                        }
                     }
                     if self.reduce_arrays.contains(a) {
                         // maintained max/min/sum aggregates (Optimisation 1).

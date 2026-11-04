@@ -1,0 +1,140 @@
+# verus-sync-coverage manifest: c_decl_coverage
+# source sha: c_backend-walkers=4047d414a29e  proof sha: 09018a3eb4a7
+
+[pins]
+pin pin_array_elem -> UNMIRRORED (by design — see VERUS.md §(b).4)
+pin pin_elsif_cond -> UNMIRRORED (by design — see VERUS.md §(b).4)
+pin pin_printf_nested -> UNMIRRORED (by design — see VERUS.md §(b).4)
+pin pin_raw_nested -> UNMIRRORED (by design — see VERUS.md §(b).4)
+pin pin_return_fn3 -> UNMIRRORED (by design — see VERUS.md §(b).4)
+pin pin_select_ch -> UNMIRRORED (by design — see VERUS.md §(b).4)
+pin pin_t04_param -> UNMIRRORED (by design — see VERUS.md §(b).4)
+pin pin_while_cond -> UNMIRRORED (by design — see VERUS.md §(b).4)
+
+[guards]
+fn collect_vars_full
+  arm IrStmt::Assign { targets, expr, .. } | calls: collect_vars_expr
+  arm IrStmt::Declare { vars, init, .. } | calls: collect_vars_expr
+  arm IrStmt::Expr(e) | calls: collect_vars_expr
+  arm IrStmt::Output { value, .. } | calls: collect_vars_expr
+  arm IrStmt::Redirect { .. } | calls: collect_vars_expr,is_printf_v_call,unwrap_devnull_redirect
+  arm IrStmt::If { cond, then, elsifs, else_ } | calls: collect_varsx3,collect_vars_exprx2
+  arm IrStmt::Exit(e) | calls: collect_vars_expr
+  arm IrStmt::For { var, iter, body } | calls: collect_vars_expr,collect_vars_full
+  arm IrStmt::While { cond, body } | IrStmt::DoWhile { cond, body, .. } | calls: collect_vars,collect_vars_expr
+  arm IrStmt::Block(b) | IrStmt::Subshell(b) | IrStmt::Background(b) | calls: collect_vars
+  arm IrStmt::ForInit { init, cond, step, body } | calls: collect_varsx3,collect_vars_expr
+  arm IrStmt::Ext(n) | calls: -
+  arm IrStmt::Try { body, excepts, else_body, finally_body } | calls: collect_varsx4,collect_vars_expr
+  arm _ | calls: -
+fn collect_vars_expr
+  arm IrExpr::Str(text, style) | calls: scan_raw_assigns_str
+  arm IrExpr::Var(name, _) | calls: -
+  arm IrExpr::BinOp { lhs, rhs, .. } | calls: collect_vars_exprx2
+  arm IrExpr::Arith(a) | calls: -
+  arm IrExpr::Interpolate(parts) | calls: collect_vars_expr
+  arm IrExpr::Array(items) | calls: collect_vars_expr
+  arm IrExpr::Call { func, args } if func == "exec" || func == "builtin" | calls: collect_vars_expr,let_var_name
+  arm IrExpr::Call { args, .. } | calls: collect_vars_expr
+  arm IrExpr::Call { func, args } if func == "param" | calls: collect_vars_expr,param_write_target
+  arm _ | calls: -
+fn collect_assigned_vars
+  pre | calls: unwrap_devnull_redirect
+  arm IrStmt::Assign { targets, expr, .. } | calls: collect_assigned_expr
+  arm IrStmt::Expr(IrExpr::Call { func: _, args }) if is_printf_v_call(args) | calls: -
+  arm IrStmt::Expr(IrExpr::Call { func, args }) if (func == "exec" || func == "builtin") && Self3::str_is(args, 0, "unset") | calls: -
+  arm IrStmt::Expr(IrExpr::Call { func, args }) if (func == "exec" || func == "builtin") && Self3::str_is(args, 0, "read") | calls: -
+  arm IrStmt::Declare { vars, init, .. } | calls: collect_assigned_expr
+  arm IrStmt::If { cond, then, elsifs, else_ } | calls: collect_assigned_exprx2,collect_assigned_varsx3
+  arm IrStmt::Case { discriminant, clauses, .. } | calls: collect_assigned_expr,collect_assigned_vars
+  arm IrStmt::Select { clauses } | calls: collect_assigned_exprx2,collect_assigned_vars
+  arm IrStmt::While { cond, body } | IrStmt::DoWhile { cond, body, .. } | calls: collect_assigned_expr,collect_assigned_vars
+  arm IrStmt::Block(body) | IrStmt::Subshell(body) | IrStmt::Background(body) | calls: collect_assigned_vars
+  arm IrStmt::For { var, iter, body } | calls: collect_assigned_expr,collect_assigned_vars
+  arm IrStmt::Expr(e) | calls: collect_assigned_expr
+  arm IrStmt::ForInit { init, cond, step, body } | calls: collect_assigned_expr,collect_assigned_varsx3
+  arm IrStmt::Function { body, .. } | calls: collect_assigned_vars
+  arm IrStmt::Ext(n) | calls: -
+  arm IrStmt::Output { value, .. } | calls: collect_assigned_expr
+  arm IrStmt::DeclareArray { elements, .. } | calls: collect_assigned_expr
+  arm IrStmt::Die { expr, .. } | IrStmt::Warn { expr, .. } | IrStmt::SetChildError(expr) | calls: collect_assigned_expr
+  arm IrStmt::Return(e) | IrStmt::Exit(e) | calls: collect_assigned_expr
+  arm IrStmt::WriteFile { path, content, .. } | calls: collect_assigned_exprx2
+  arm IrStmt::Redirect { inner, redirects } | calls: collect_assigned_expr,collect_assigned_vars
+  arm IrStmt::Pipeline { stages, .. } | calls: collect_assigned_vars
+  arm IrStmt::Exec { cmd, args, redirects, env, .. } | calls: collect_assigned_exprx4
+  arm IrStmt::Try { body, excepts, else_body, finally_body } | calls: collect_assigned_expr,collect_assigned_varsx4
+  arm _ | calls: -
+fn collect_assigned_expr
+  arm IrExpr::Str(text, style) | calls: scan_raw_assigns_str
+  arm IrExpr::Arith(a) | calls: -
+  arm IrExpr::Call { func, args } if (func == "exec" || func == "builtin") && matches!( args.first(), Some(IrExpr::Str(c, _)) if matches!( c.as_str(), "local" | "declare" | "typeset" | "export" | "readonly" ) ) | calls: -
+  arm IrExpr::Array(items) | calls: -
+  arm IrExpr::Call { func, args } if (func == "exec" || func == "builtin") && matches!(args.first(), Some(IrExpr::Str(c, _)) if c == "unset") | calls: -
+  arm IrExpr::Array(items) | calls: -
+  arm IrExpr::Call { args, .. } if is_printf_v_call(args) | calls: collect_assigned_expr
+  arm IrExpr::Call { args, .. } if matches!(args.first(), Some(IrExpr::Str(c, _)) if c == "let") && matches!( args.get(1), Some(IrExpr::Array(items)) if matches!(items.first(), Some(IrExpr::Str(..))) ) | calls: collect_assigned_expr,let_var_name
+  arm IrExpr::Call { func, args } if func == "param" | calls: collect_assigned_expr,param_write_target
+  arm IrExpr::Call { args, .. } | calls: collect_assigned_expr
+  arm IrExpr::BinOp { lhs, rhs, .. } | calls: collect_assigned_exprx2
+  arm IrExpr::Interpolate(parts) | calls: collect_assigned_expr
+  arm IrExpr::Array(items) | calls: collect_assigned_expr
+  arm IrExpr::Arrow(body) | calls: collect_assigned_vars
+  arm _ | calls: -
+fn collect_param_write_targets
+  pre | calls: collect_param_write_stmt
+fn collect_param_write_seq
+  pre | calls: collect_param_write_stmt
+fn collect_param_write_stmt
+  arm IrStmt::Assign { expr, .. } | calls: collect_param_write_expr
+  arm IrStmt::Declare { init, .. } | calls: collect_param_write_expr
+  arm IrStmt::DeclareArray { elements, .. } | calls: collect_param_write_expr
+  arm IrStmt::Expr(e) | IrStmt::Output { value: e, .. } | calls: collect_param_write_expr
+  arm IrStmt::Die { expr: e, .. } | IrStmt::Warn { expr: e, .. } | IrStmt::SetChildError(e) | calls: collect_param_write_expr
+  arm IrStmt::Return(e) | IrStmt::Exit(e) | calls: collect_param_write_expr
+  arm IrStmt::WriteFile { path, content, .. } | calls: collect_param_write_exprx2
+  arm IrStmt::Exec { cmd, args, redirects, env, .. } | calls: collect_param_write_exprx4
+  arm IrStmt::Redirect { inner, redirects } | calls: collect_param_write_expr,collect_param_write_seq
+  arm IrStmt::Pipeline { stages, .. } | calls: collect_param_write_seq
+  arm IrStmt::If { cond, then, elsifs, else_ } | calls: collect_param_write_exprx2,collect_param_write_seqx3
+  arm IrStmt::Case { discriminant, clauses, .. } | calls: collect_param_write_expr,collect_param_write_seq
+  arm IrStmt::Select { clauses } | calls: collect_param_write_exprx2,collect_param_write_seq
+  arm IrStmt::While { cond, body } | IrStmt::DoWhile { cond, body, .. } | calls: collect_param_write_expr,collect_param_write_seq
+  arm IrStmt::For { iter, body, .. } | calls: collect_param_write_expr,collect_param_write_seq
+  arm IrStmt::ForInit { init, cond, step, body } | calls: collect_param_write_expr,collect_param_write_seqx3
+  arm IrStmt::Function { body, .. } | calls: collect_param_write_seq
+  arm IrStmt::Try { body, excepts, else_body, finally_body } | calls: collect_param_write_expr,collect_param_write_seqx4
+  arm IrStmt::Block(b) | IrStmt::Subshell(b) | IrStmt::Background(b) | calls: collect_param_write_seq
+  arm _ | calls: -
+fn collect_param_write_expr
+  arm IrExpr::Str(text, style) | calls: scan_raw_assigns_str
+  arm IrExpr::Call { func, args } if func == "param" | calls: collect_param_write_expr,param_write_target
+  arm IrExpr::Call { args, .. } | calls: collect_param_write_expr
+  arm IrExpr::BinOp { lhs, rhs, .. } | calls: collect_param_write_exprx2
+  arm IrExpr::Interpolate(parts) | calls: collect_param_write_expr
+  arm IrExpr::Array(items) | calls: collect_param_write_expr
+  arm IrExpr::Arrow(body) | calls: collect_param_write_seq
+  arm _ | calls: -
+guard decl-coverage walker chains: EXTRACTED
+
+[counts]
+proof-fns: 21
+pins: 8
+# NOTE: proof-fns is a file-shape fact (change detector), NOT the
+# Verus obligation count — the gate asserts N verified separately.
+
+[exec]
+# Each MAPPED test above, EXECUTED against the live source (one
+# module-suite run per model; per-test verdicts grepped from output).
+# A mapped test that fails or vanishes from the run is drift — FATAL.
+# The checker RUNS each mapped test (one module-suite cargo test per
+# source file) and records the per-test PASS/FAIL verdict below.
+# all suites built; per-test verdicts below
+exec pin_array_elem: UNMIRRORED (not executed)
+exec pin_elsif_cond: UNMIRRORED (not executed)
+exec pin_printf_nested: UNMIRRORED (not executed)
+exec pin_raw_nested: UNMIRRORED (not executed)
+exec pin_return_fn3: UNMIRRORED (not executed)
+exec pin_select_ch: UNMIRRORED (not executed)
+exec pin_t04_param: UNMIRRORED (not executed)
+exec pin_while_cond: UNMIRRORED (not executed)

@@ -1446,6 +1446,47 @@ decisions, not shIR→shIR passes, so they carry no
 `verus-sync-coverage.sh` baseline — their living tie is the pin↔probe
 mapping, as in `C_UB_PROOF.md`.
 
+## The C-generator redirect reorder + quoter — `c_redirect.rs` (46 obligations)
+
+```
+    verus --triggers-mode silent --rlimit 40 c_redirect.rs
+    -> verification results:: 46 verified, 0 errors
+```
+
+**What is proved.** Standalone model of the C backend's redirect
+emission: the fd-prefix round trip (`fd_parse`), the word quoter
+(`quote_roundtrip`/`esc_in_sq` — the bytes the child shell word-parses
+out of `_sh_word(v)` are exactly `v`), the dup/close raw arm
+(`raw_arm_no_quotes` — `2>&1`/`2>&-` emit no quote characters), and the
+heredoc reorder: `reorder_safe` says `emit_order` preserves the fd
+table for every starting table under `safe(rds)`, `commute_here` is the
+swap it rests on, and `n1_fd0_conflict` proves the side condition
+NECESSARY (measured 2026-11-01 `/tmp/redprobe`: bash `cat <<EOF <
+in.txt` → FROM_FILE, the generated C → FROM_HEREDOC; the swapped script
+agrees in both).
+
+**It can fail (checked).** The named mutants are the negative
+controls: `m1` (unescaped word — an embedded `'` closes it early),
+`m2` (`>&'1'` would name a file), `m3` (terminator not moved). The
+proof also REFUTED an over-strong lemma on the way: `ends_with_concat`
+without the `|suf| <= |s|` guard is false, and the guarded form is what
+the model states.
+
+**Model defect found and fixed.** `reads0` covered `W|R|Rplus` while
+`written` matches `W|Wc|A|R|Rplus` — a Wc/A Rd with a `&0` target read
+`t.get(0)` with `reads0 == false`, making `written_frame` provably
+false; `reads0` now covers exactly `written`'s mode set (the strict,
+sound direction for `safe`).
+
+**Scope + discipline.** `by (compute)` over `run` with a symbolic state
+diverges (measured >15 min in the interpreter thread) — the quoter uses
+the structural `run_one`/`run_concat` chain instead, and ground seq
+facts are explicit asserts. Beyond the quoting layer, the child's word
+splitting is bash's contract; the IR has no Close mode so `2>&-`/`2>-`
+render identically (`n2` pin). Gate-registered (`c_redirect.rs:46:40`);
+no sync baseline — the pin↔probe mapping (`/tmp/redprobe`) is its
+living tie.
+
 ## Running it
 
 Same toolchain as the P6/P7/P8 files (`--rlimit 40`).
