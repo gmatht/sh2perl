@@ -78,6 +78,7 @@ pub struct Render {
     /// hoists — a missing file yields [], like bash continuing with
     /// empty stdin, instead of crashing)
     need_read_lines: bool,
+
     /// fd aliases from bare-`exec` redirection statements (`exec 3>&1`
     /// aliases fd 3 to stdout for the rest of the program; `3>&-`
     /// closes). Values: "1"/"2" (stdout/stderr) or a file path expr.
@@ -328,6 +329,51 @@ impl Render {
     /// Look up the preamble body for a sh2.* name or helper.
     fn runtime_body(name: &str) -> Option<&'static str> {
         Render::RUNTIME.iter().find(|(n, _)| *n == name).map(|(_, b)| *b)
+    }
+
+    /// The subprocess-runtime helpers and the helpers each one calls.
+    /// (`__sh_names` is a data global, gated by its two users instead.)
+    const SUBPROC_HELPERS: &'static [(&'static str, &'static [&'static str])] = &[
+        ("__sh_exec", &[]),
+        ("__sh_env", &[]),
+        ("__sh_bash", &[]),
+        ("__sh_bash_in", &[]),
+        ("__sh_pipe_status", &["__sh_bash"]),
+        ("__sh_cap", &[]),
+        ("__sh_declare_parse", &[]),
+        ("__sh_source", &["__sh_declare_parse"]),
+        ("__sh_eval", &["__sh_declare_parse"]),
+    ];
+
+    /// Which subprocess helpers a rendered body references — call sites are
+    /// literal names in the emitted text — plus their transitive deps. The
+    /// whole group is ~120 lines of bash re-entry machinery, so emitting it
+    /// for a program that calls none of it turns a plain script into an
+    /// embedded shell.
+    fn used_helpers(body: &str) -> std::collections::BTreeSet<&'static str> {
+        let mut used = std::collections::BTreeSet::new();
+        for (name, _) in Self::SUBPROC_HELPERS {
+            if body.contains(&format!("{name}(")) {
+                used.insert(*name);
+            }
+        }
+        loop {
+            let mut added = false;
+            for (name, deps) in Self::SUBPROC_HELPERS {
+                if !used.contains(name) {
+                    continue;
+                }
+                for d in *deps {
+                    if used.insert(*d) {
+                        added = true;
+                    }
+                }
+            }
+            if !added {
+                break;
+            }
+        }
+        used
     }
 }
 
@@ -1011,6 +1057,11 @@ impl Render {
                                 // idiom lifts: `$(seq …)` / `$(wc -l FILE)`
                                 // — native, no subprocess
                                 if let Some(lift) = self.capture_idiom(args) {
+                                    return lift;
+                                }
+                                // `$(sort F)` / `$(cat F)` / `$(ls)` — the
+                                // stdlib value, not a fork
+                                if let Some(lift) = self.native_capture(args) {
                                     return lift;
                                 }
                                 let argv = self.build_argv(args);
@@ -2337,6 +2388,11 @@ impl Render {
                         }
                     }
                 }
+                // native lowering for commands the stdlib reproduces
+                // exactly (no output, bash continues past failure)
+                if let Some(native) = self.native_exec(args) {
+                    return native;
+                }
                 // external command: fork/exec via subprocess
                 let argv = self.build_argv(args);
                 self.need_subprocess = true;
@@ -3380,7 +3436,7 @@ impl Render {
     /// branch).
     fn cond_test(&mut self, e: &IrExpr) -> (Vec<String>, String) {
         let c = self.expr(e);
-        if c.starts_with("__sh_exec([") {
+        if c.starts_with("__sh_exec([") || Self::is_native_rc(&c) {
             return (vec![], format!("({c} == 0)"));
         }
         if c.starts_with("__sh_cap(") || c.starts_with("__sh_bash(") {
@@ -4089,6 +4145,258 @@ impl Render {
             },
             _ => false,
         })
+    }
+
+    /// True when an expression is one of the native command lowerings that
+    /// yields a bash exit status (0 = success), so condition and statement
+    /// positions can treat it exactly like `__sh_exec`.
+    fn is_native_rc(c: &str) -> bool {
+        c.starts_with("__sh_rm(")
+            || c.starts_with("__sh_mkdir(")
+            || c.starts_with("__sh_touch(")
+            || c.starts_with("(time.sleep(")
+    }
+
+    /// Split an `exec` call into (flags, operand expressions), or None when
+    /// an operand needs shell expansion (glob/brace/splice) and the native
+    /// lowering cannot be exact.
+    fn exec_words(&mut self, args: &[IrExpr]) -> Option<(Vec<String>, Vec<String>)> {
+        let items = match args.get(1) {
+            Some(IrExpr::Array(items)) => items,
+            _ => return None,
+        };
+        let mut flags = Vec::new();
+        let mut ops = Vec::new();
+        let mut opts_done = false;
+        for it in items {
+            match it {
+                IrExpr::Str(s, _) => {
+                    if !opts_done && s == "--" {
+                        opts_done = true;
+                        continue;
+                    }
+                    if !opts_done && s.starts_with('-') && s.len() > 1 {
+                        flags.push(s.clone());
+                        continue;
+                    }
+                    // sentinel-tagged glob words and plain patterns re-glob
+                    // in the child; a native call would not
+                    if s.starts_with('\u{1}')
+                        || s.contains('*')
+                        || s.contains('?')
+                        || s.contains('[')
+                    {
+                        return None;
+                    }
+                    ops.push(Self::py_str(s));
+                }
+                IrExpr::Int(i) => ops.push(i.to_string()),
+                IrExpr::Call { func, .. } if func == "brace" || func == "argvSlice" => {
+                    return None;
+                }
+                other => ops.push(self.expr(other)),
+            }
+        }
+        Some((flags, ops))
+    }
+
+    /// Native lowerings for external commands whose POSIX behaviour the
+    /// Python stdlib reproduces (`shutil`, `os`, `time`) — no child process.
+    /// Returns an expression yielding the command's exit status, or None to
+    /// keep the fork/exec fallback. Deliberately narrow: only commands with
+    /// no stdout whose failures bash continues past; output-producing
+    /// commands live in `native_capture`.
+    fn native_exec(&mut self, args: &[IrExpr]) -> Option<String> {
+        let cmd = match args.first() {
+            Some(IrExpr::Str(c, _)) => c.clone(),
+            _ => return None,
+        };
+        match cmd.as_str() {
+            "rm" => {
+                let (flags, ops) = self.exec_words(args)?;
+                if ops.is_empty() {
+                    return None;
+                }
+                let (mut recursive, mut force) = (false, false);
+                for f in &flags {
+                    for ch in f.trim_start_matches('-').chars() {
+                        match ch {
+                            'r' | 'R' => recursive = true,
+                            'f' => force = true,
+                            _ => return None,
+                        }
+                    }
+                }
+                Some(format!(
+                    "__sh_rm([{}], {}, {})",
+                    ops.join(", "),
+                    if recursive { "True" } else { "False" },
+                    if force { "True" } else { "False" }
+                ))
+            }
+            "mkdir" => {
+                let (flags, ops) = self.exec_words(args)?;
+                if ops.is_empty() {
+                    return None;
+                }
+                let mut parents = false;
+                for f in &flags {
+                    if f == "-p" || f == "--parents" {
+                        parents = true;
+                    } else {
+                        return None;
+                    }
+                }
+                Some(format!(
+                    "__sh_mkdir([{}], {})",
+                    ops.join(", "),
+                    if parents { "True" } else { "False" }
+                ))
+            }
+            "touch" => {
+                let (flags, ops) = self.exec_words(args)?;
+                if ops.is_empty() || !flags.is_empty() {
+                    return None;
+                }
+                Some(format!("__sh_touch([{}])", ops.join(", ")))
+            }
+            "sleep" => {
+                let items = match args.get(1) {
+                    Some(IrExpr::Array(items)) => items,
+                    _ => return None,
+                };
+                if items.len() != 1 {
+                    return None;
+                }
+                let secs = match &items[0] {
+                    IrExpr::Str(s, _) if !s.starts_with('-') => {
+                        let (num, mult) = match s.chars().last() {
+                            Some('s') => (&s[..s.len() - 1], 1.0),
+                            Some('m') => (&s[..s.len() - 1], 60.0),
+                            Some('h') => (&s[..s.len() - 1], 3600.0),
+                            _ => (s.as_str(), 1.0),
+                        };
+                        let v: f64 = match num.parse() {
+                            Ok(v) => v,
+                            Err(_) => return None,
+                        };
+                        format!("{}", v * mult)
+                    }
+                    IrExpr::Str(_, _) => return None,
+                    IrExpr::Int(i) => i.to_string(),
+                    other => self.expr(other),
+                };
+                Some(format!("(time.sleep(float({secs})) or 0)"))
+            }
+            _ => None,
+        }
+    }
+
+    /// Native lowerings for command substitutions whose value a stdlib call
+    /// produces directly (`sorted()` for sort, `open().read()` for cat,
+    /// `os.listdir` for ls) — no child process. Bash strips the trailing
+    /// newlines, which each arm reproduces. Literal operands only: a dynamic
+    /// path would have to be evaluated twice.
+    fn native_capture(&mut self, args: &[IrExpr]) -> Option<String> {
+        let cmd = match args.first() {
+            Some(IrExpr::Str(c, _)) => c.clone(),
+            _ => return None,
+        };
+        let items = match args.get(1) {
+            Some(IrExpr::Array(items)) => items,
+            _ => return None,
+        };
+        match cmd.as_str() {
+            "cat" => {
+                let mut lits = Vec::new();
+                for it in items {
+                    match it {
+                        IrExpr::Str(s, _)
+                            if !s.starts_with('-')
+                                && !s.starts_with('\u{1}')
+                                && !s.contains('*')
+                                && !s.contains('?') =>
+                        {
+                            lits.push(s.clone())
+                        }
+                        _ => return None,
+                    }
+                }
+                if lits.is_empty() {
+                    return Some("sys.stdin.read().rstrip(\"\\n\")".into());
+                }
+                let parts: Vec<String> = lits
+                    .iter()
+                    .map(|p| {
+                        format!(
+                            "(open({p}, errors=\"surrogateescape\").read() if os.path.exists({p}) else \"\")",
+                            p = Self::py_str(p)
+                        )
+                    })
+                    .collect();
+                Some(format!("\"\".join([{}]).rstrip(\"\\n\")", parts.join(", ")))
+            }
+            "ls" => {
+                let mut lits = Vec::new();
+                for it in items {
+                    match it {
+                        IrExpr::Str(s, _)
+                            if !s.starts_with('-')
+                                && !s.starts_with('\u{1}')
+                                && !s.contains('*')
+                                && !s.contains('?') =>
+                        {
+                            lits.push(s.clone())
+                        }
+                        _ => return None,
+                    }
+                }
+                if lits.len() > 1 {
+                    return None;
+                }
+                let d = Self::py_str(lits.first().map(|s| s.as_str()).unwrap_or("."));
+                Some(format!(
+                    "(\"\\n\".join(sorted(n for n in os.listdir({d}) if not n.startswith(\".\"))) if os.path.isdir({d}) else ({d} if os.path.exists({d}) else \"\"))"
+                ))
+            }
+            "sort" => {
+                let (mut numeric, mut reverse, mut unique) = (false, false, false);
+                let mut files: Vec<String> = Vec::new();
+                for it in items {
+                    match it {
+                        IrExpr::Str(s, _) if s.starts_with('-') && s.len() > 1 => {
+                            for ch in s.trim_start_matches('-').chars() {
+                                match ch {
+                                    'n' => numeric = true,
+                                    'r' => reverse = true,
+                                    'u' => unique = true,
+                                    _ => return None,
+                                }
+                            }
+                        }
+                        IrExpr::Str(s, _) => files.push(s.clone()),
+                        _ => return None,
+                    }
+                }
+                if files.len() > 1 {
+                    return None;
+                }
+                let lines = match files.first() {
+                    Some(f) => format!(
+                        "open({}, errors=\"surrogateescape\").read().splitlines()",
+                        Self::py_str(f)
+                    ),
+                    None => "sys.stdin.read().splitlines()".to_string(),
+                };
+                Some(format!(
+                    "__sh_sort({lines}, {}, {}, {})",
+                    if numeric { "True" } else { "False" },
+                    if reverse { "True" } else { "False" },
+                    if unique { "True" } else { "False" }
+                ))
+            }
+            _ => None,
+        }
     }
 
     /// `$(seq …)` / `$(wc -l FILE)` — native idiom lifts (no subprocess).
@@ -5045,7 +5353,9 @@ impl Render {
                 // prints 2. Native statements reset it to 0 (bash: a
                 // successful assignment/echo/builtin clears $?); compound
                 // statements and rc-recording forms manage it themselves.
-                if x.starts_with("__sh_exec([") && x.ends_with("])") {
+                if (x.starts_with("__sh_exec([") && x.ends_with("])"))
+                    || Self::is_native_rc(&x)
+                {
                     self.emit(&format!("__sh_rc = {x}"));
                     return;
                 }
@@ -6152,12 +6462,62 @@ impl Render {
         }
         std::mem::swap(&mut self.out, &mut body_out);
 
+        // Subroutine definitions render BEFORE the preamble so their bodies
+        // contribute helper-usage flags (they used to render after it, which
+        // also hid their `need_*` flags from the preamble). Buffered here and
+        // appended in order below.
+        let mut subs_out: Vec<String> = Vec::new();
+        for sub in &prog.subs {
+            let params: Vec<String> = sub.params.iter().map(|p| self.py_ident(p)).collect();
+            self.emit(&format!(
+                "def {}({}):",
+                self.py_ident(&sub.name),
+                params.join(", ")
+            ));
+            self.in_function += 1;
+            self.block(&sub.body);
+            self.in_function -= 1;
+            self.emit("");
+        }
+        std::mem::swap(&mut self.out, &mut subs_out);
+
+        // Which `__sh_*` subprocess helpers the rendered program actually
+        // calls, plus their transitive deps. The block is ~120 lines of bash
+        // re-entry machinery; emitting it unconditionally made every output
+        // read as an embedded shell even when it used none of it.
+        let body_src = body_out.join("\n");
+        let subs_src = subs_out.join("\n");
+        let mut used = Render::used_helpers(&body_src);
+        used.extend(Render::used_helpers(&subs_src));
+        let need_names = used.contains("__sh_env") || used.contains("__sh_bash");
+        // Native-command helper usage, from the FINAL text (a speculative
+        // render can return an expression it then discards).
+        let fs_src = format!("{body_src}\n{subs_src}");
+        let use_rm = fs_src.contains("__sh_rm(");
+        let use_mkdir = fs_src.contains("__sh_mkdir(");
+        let use_touch = fs_src.contains("__sh_touch(");
+        let use_sort = fs_src.contains("__sh_sort(");
+        let need_os = body_src.contains("os.")
+            || subs_src.contains("os.")
+            || used.contains("__sh_eval")
+            || use_rm
+            || use_mkdir
+            || use_touch;
+        let need_sp = body_src.contains("subprocess.") || subs_src.contains("subprocess.");
+
         // Preamble: shebang, imports, then the sh2.* stubs
         // (definition-before-use, so the body's calls link).
         self.emit("#!/usr/bin/env python3");
         self.emit("# Generated by the python backend (debashl::python_backend).");
-        self.emit("import os");
-        self.emit("import subprocess");
+        if need_os {
+            self.emit("import os");
+        }
+        if fs_src.contains("time.sleep(") {
+            self.emit("import time");
+        }
+        if need_sp {
+            self.emit("import subprocess");
+        }
         self.emit("import sys");
         if self.need_re {
             self.emit("import re");
@@ -6203,7 +6563,13 @@ impl Render {
             self.emit("        return []");
             self.emit("");
         }
-        if self.need_subprocess {
+        if self.need_subprocess && !used.is_empty() {
+            // Emit the helper set into a scratch buffer, then keep only the
+            // definitions the rendered program references (`used`). Each
+            // helper is a `def __sh_…` at column 0; blank lines belong to the
+            // definition above them and ride the same keep flag.
+            let mut scratch: Vec<String> = Vec::new();
+            std::mem::swap(&mut self.out, &mut scratch);
             self.emit("");
             let mut pairs: Vec<String> = Vec::new();
             {
@@ -6358,6 +6724,24 @@ impl Render {
             self.emit("    for _l in __sh_declare_parse(decls):");
             self.emit("        globals()[_l[0]] = _l[1]; os.environ[_l[0]] = str(_l[1])");
             self.emit("    return r.returncode");
+            std::mem::swap(&mut self.out, &mut scratch);
+            let mut keep = false;
+            let mut first = true;
+            for line in scratch {
+                if let Some(rest) = line.strip_prefix("def ") {
+                    let name = rest.split('(').next().unwrap_or("");
+                    keep = used.contains(name);
+                } else if line.starts_with("__sh_names = ") {
+                    keep = need_names;
+                }
+                if keep {
+                    if first {
+                        self.out.push(String::new());
+                        first = false;
+                    }
+                    self.out.push(line);
+                }
+            }
         }
         if self.need_run_status {
             // exec operand inside an &&/|| chain: bash truth (rc == 0),
@@ -6443,6 +6827,73 @@ impl Render {
                     }
                 }
             }
+        }
+        // Native filesystem commands: `rm`/`mkdir -p`/`touch` through
+        // `shutil`/`os` (no child process), `sort` through `sorted()`.
+        // Each returns the bash exit status and continues past a failure the
+        // way bash does. Emitted only when the FINAL text calls them.
+        if use_rm {
+            self.emit("def __sh_rm(paths, recursive, force):");
+            self.emit("    import shutil");
+            self.emit("    rc = 0");
+            self.emit("    for p in paths:");
+            self.emit("        try:");
+            self.emit("            if recursive and os.path.isdir(p) and not os.path.islink(p):");
+            self.emit("                shutil.rmtree(p)");
+            self.emit("            else:");
+            self.emit("                os.remove(p)");
+            self.emit("        except OSError:");
+            self.emit("            if not force:");
+            self.emit("                rc = 1");
+            self.emit("    return rc");
+            self.emit("");
+        }
+        if use_mkdir {
+            self.emit("def __sh_mkdir(paths, parents):");
+            self.emit("    rc = 0");
+            self.emit("    for p in paths:");
+            self.emit("        try:");
+            self.emit("            if parents:");
+            self.emit("                os.makedirs(p, exist_ok=True)");
+            self.emit("            else:");
+            self.emit("                os.mkdir(p)");
+            self.emit("        except OSError:");
+            self.emit("            rc = 1");
+            self.emit("    return rc");
+            self.emit("");
+        }
+        if use_touch {
+            self.emit("def __sh_touch(paths):");
+            self.emit("    rc = 0");
+            self.emit("    for p in paths:");
+            self.emit("        try:");
+            self.emit("            with open(p, \"a\"):");
+            self.emit("                os.utime(p, None)");
+            self.emit("        except OSError:");
+            self.emit("            rc = 1");
+            self.emit("    return rc");
+            self.emit("");
+        }
+        if use_sort {
+            self.emit("def __sh_sort(lines, numeric, reverse, unique):");
+            self.emit("    if numeric:");
+            self.emit("        def _key(s):");
+            self.emit("            t = str(s).strip().split()");
+            self.emit("            try:");
+            self.emit("                return float(t[0]) if t else 0.0");
+            self.emit("            except ValueError:");
+            self.emit("                return 0.0");
+            self.emit("        lines = sorted(lines, key=_key, reverse=reverse)");
+            self.emit("    else:");
+            self.emit("        lines = sorted(lines, reverse=reverse)");
+            self.emit("    if unique:");
+            self.emit("        out = []");
+            self.emit("        for s in lines:");
+            self.emit("            if not out or out[-1] != s:");
+            self.emit("                out.append(s)");
+            self.emit("        lines = out");
+            self.emit("    return \"\\n\".join(lines)");
+            self.emit("");
         }
         if self.need_ok {
             // `__sh_ok(fn, *args)` — True on success, False on OSError
@@ -6560,19 +7011,9 @@ impl Render {
             self.emit("    return s[:m.start(2)] if m else s");
             self.emit("");
         }
-        // Subroutine definitions (before the body that calls them).
-        for sub in &prog.subs {
-            let params: Vec<String> = sub.params.iter().map(|p| self.py_ident(p)).collect();
-            self.emit(&format!(
-                "def {}({}):",
-                self.py_ident(&sub.name),
-                params.join(", ")
-            ));
-            self.in_function += 1;
-            self.block(&sub.body);
-            self.in_function -= 1;
-            self.emit("");
-        }
+        // Subroutine definitions (rendered before the preamble, above; they
+        // precede the body that calls them).
+        self.out.extend(subs_out.iter().cloned());
         self.out.extend(body_out.iter().cloned());
         if self.todo > 0 {
             self.emit(&format!(
@@ -6924,6 +7365,70 @@ fn py_brace_words(args: &[IrExpr]) -> Option<Vec<String>> {
 mod tests {
     use super::*;
     use crate::ir::{AssignTarget, IrStmt};
+
+    fn st(v: &str) -> IrExpr {
+        IrExpr::Str(v.to_string(), crate::ir::StrStyle::DoubleQuoted)
+    }
+    fn ex(cmd: &str, items: Vec<IrExpr>) -> Vec<IrExpr> {
+        vec![st(cmd), IrExpr::Array(items)]
+    }
+
+    /// `rm -f F` is `shutil`/`os`, never a forked `rm`.
+    #[test]
+    fn native_rm_uses_stdlib_not_fork() {
+        let mut r = Render::default();
+        let out = r
+            .native_exec(&ex("rm", vec![st("-f"), st("x.txt")]))
+            .expect("native rm");
+        assert_eq!(out, "__sh_rm([\"x.txt\"], False, True)");
+        // an unsupported flag keeps the fork/exec fallback
+        let mut r2 = Render::default();
+        assert!(r2.native_exec(&ex("rm", vec![st("-v"), st("x")])).is_none());
+        // a glob operand must re-glob in the child, so it stays a fallback
+        let mut r3 = Render::default();
+        assert!(r3.native_exec(&ex("rm", vec![st("-f"), st("*.txt")])).is_none());
+    }
+
+    /// `mkdir -p` / `touch` / `sleep` lower to os/time.
+    #[test]
+    fn native_mkdir_touch_sleep() {
+        let mut r = Render::default();
+        assert_eq!(
+            r.native_exec(&ex("mkdir", vec![st("-p"), st("a/b")]))
+                .expect("native mkdir"),
+            "__sh_mkdir([\"a/b\"], True)"
+        );
+        assert_eq!(
+            r.native_exec(&ex("touch", vec![st("f")])).expect("native touch"),
+            "__sh_touch([\"f\"])"
+        );
+        let mut t = Render::default();
+        let sleep = t
+            .native_exec(&ex("sleep", vec![st("0.5s")]))
+            .expect("native sleep");
+        assert!(sleep.contains("time.sleep(float(0.5))"));
+    }
+
+    /// A capture is the stdlib value, not `bash -c`.
+    #[test]
+    fn native_capture_uses_sorted_and_open() {
+        let mut r = Render::default();
+        let sort = r
+            .native_capture(&ex("sort", vec![st("-n"), st("f")]))
+            .expect("native sort");
+        assert!(sort.starts_with("__sh_sort(open(\"f\""), "{sort}");
+        assert!(sort.ends_with(", True, False, False)"), "{sort}");
+        let mut c = Render::default();
+        let cat = c
+            .native_capture(&ex("cat", vec![st("f")]))
+            .expect("native cat");
+        assert!(cat.contains("open(\"f\"") && !cat.contains("__sh_cap"), "{cat}");
+        let mut l = Render::default();
+        let ls = l.native_capture(&ex("ls", vec![])).expect("native ls");
+        assert!(ls.contains("os.listdir(\".\")"), "{ls}");
+        // glob operands keep the shell fallback
+        assert!(l.native_capture(&ex("cat", vec![st("*.txt")])).is_none());
+    }
 
     /// translator-level: the factor shape lowers, flags set.
     #[test]
