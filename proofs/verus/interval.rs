@@ -1,6 +1,8 @@
 // RETIRED (see VERUS.md §(d) P0(iv)): the modelled `arith_bounds` never
 // landed — the live estimator is `arith_abs_bound`, proved in Isabelle
-// (`I32Provable.thy`). Kept as a superseded-design record; NOT gated.
+// (`I32Provable.thy`). Kept as a superseded-design record; the gate
+// verifies it as a RETIRED entry (see RETIRED_MODELS), counted outside
+// every total.
 // Standalone model of arith_bounds (sh2perl/src/transforms/i32_provable.rs)
 // with its soundness obligation. Mirrors the enum's relevant constructors;
 // the Rust's Box<ArithAst> becomes Verus's Box<> directly.
