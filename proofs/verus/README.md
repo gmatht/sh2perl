@@ -1517,3 +1517,105 @@ size (58), duplicate-freedom, and the absence of `ls`/`head`, so the
 abstraction is auditable. The echo's per-line TEXT is not modelled (a
 line is a function of its name and classification); the node carries the
 names in order, which is what the consumer reads.
+
+---
+
+# Verus proof of `terminator_binop` (`terminator_binop.rs`, 19)
+
+STATUS: **checked.** Verus `0.2026.10.18.7d82994`, rust toolchain
+1.99.1:
+
+    verus --triggers-mode silent --rlimit 40 terminator_binop.rs
+    -> verification results:: 19 verified, 0 errors
+
+## What is proved
+
+`terminator_binop.rs` is a standalone model of
+`src/transforms/terminator_binop.rs`: the fold
+`Expr(BinOp{op: And|Or, lhs: <control call>, rhs})` →
+`Expr(<control call>)`, i.e. `break || exit 1` loses its dead right
+operand. Trace + status + abort-flag semantics:
+
+    proof fn bin_control_dead(lhs, is_and, rhs)
+      requires is_control(lhs),
+      ensures  step(Bin{lhs, is_and, rhs}, false)
+               == step(Plain(lhs), false)
+
+for BOTH operators, ANY right operand, and ANY status the control call
+reports — the operator is never consulted, so `break` (0), `exit 3` (3)
+and `return 2` (2) all fold. `fold_stmt_sound` is the per-statement
+lemma; `fold_list_sound` lifts it over a statement list by induction,
+so the transform's body recursion is that theorem instantiated at each
+body list (a body is just another list). `run_list` threads the abort
+flag, which is the vocabulary the other termination folds reuse: once a
+step aborts, the tail is unobservable.
+
+`capture_and_fold_unsound` is the REFUSAL, not a nicety: inside `$( )`
+a control word is the subshell's business. Measured on this box:
+
+    while true; do break 99; done; echo $?   -> 0
+    while true; do break && echo RHS; done   -> no RHS
+    while true; do break || echo RHS; done   -> no RHS
+    exit 3 && echo RHS; echo $?              -> no RHS, rc=3
+    f() { return 2 || echo RHS; }; f         -> no RHS, rc=2
+    x=$(break && echo RHS); echo "[$x]"      -> "[RHS]"
+    x=$(break || echo RHS); echo "[$x]"      -> "[]"
+    i=0; while [ $i -lt 1 ]; do i=1; if true; then break; fi; echo TAIL; done
+                                             -> no TAIL
+
+So in capture position `&&`'s right operand DOES run: folding there
+would silently drop output. The model proves exactly that difference
+(`step(..., subshell=true)` prints the RHS, the folded form prints
+nothing), which is why the transform only visits a statement-position
+`BinOp`. The abort flag also crosses a body boundary
+(`pin_abort_through_if`: `if true; then break; fi; echo TAIL` never
+prints TAIL).
+
+## It can fail (checked)
+
+Two mutants, one per load-bearing choice:
+
+- A control call returning normally instead of aborting (the `aborted`
+  flag dropped) makes the same command report **14 verified, 5 errors**
+  — `&&`'s right operand becomes reachable and the fold loses it.
+- Ignoring the subshell flag (control aborts inside `$( )` too) makes
+  the same command report **18 verified, 1 error** — the refusal
+  theorem's premise collapses.
+
+The file was restored and re-checked at **19 verified, 0 errors**.
+
+## Scope (read this before quoting it)
+
+- It is a proof about a MODEL: `terminator_binop.rs` duplicates the
+  fold by hand. Nothing ties the model to the Rust source, so the two
+  can drift — the same caveat as the files above.
+- **The transform is PARKED.** `terminator_binop` has no `pub mod`
+  line in `src/transforms.rs` (69 declarations for 77 files), so the
+  rule is in the tree but changes no emitted byte today — the same
+  gate-visible status as `loop_opt`'s `DEAD CODE` note. The theorem is
+  about the rule the module implements; wiring it up is a separate,
+  measured decision (the corpus carries the shapes:
+  `examples/parse-break-or.sh`, `parse-return-and.sh`,
+  `parse-return-or.sh`).
+- Name recognition (`control_call_name`) is modelled as data and
+  pinned, not proved: the bare spelling and the `builtin`/`exec`
+  wrapper both resolve to a control word; a non-static word
+  (`"$cmd" || …`) is refused. That is a lookup, not a value theorem.
+- Bodies (`If`/`Nested`) exist to show the abort flag crossing a body
+  boundary; the model's fold is stated per list, so the transform's
+  traversal recursion adds no obligation.
+- The emitted targets are not modelled: the obligation is that the
+  rewrite preserves the shell run, not that a renderer's `break` arm
+  emits the right bytes (those are C_UB_PROOF.md / per-backend
+  obligations).
+- `ran` distinguishes "some step happened" from an empty tail, so a
+  list's final status is its last real step's (`[Fail]` stays 1).
+- Pins mirror 6 of the source's 7 unit tests (break-or, lifted break,
+  exit-or, ordinary-guard kept, and-after-control, capture refusal);
+  the 7th (loop-body recursion) is the per-list instantiation above.
+- No `*_sync.txt` baseline: the source is suite-only and the model is a
+  reduction, so pins are recorded rather than transcribed.
+
+## Running it
+
+Same toolchain as above (`--rlimit 40`).
