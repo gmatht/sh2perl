@@ -1490,3 +1490,30 @@ living tie.
 ## Running it
 
 Same toolchain as the P6/P7/P8 files (`--rlimit 40`).
+
+## `type_query.rs`
+
+Target: `sh2perl/src/transforms/type_query.rs` (`type NAME...` -> one
+`echo` line per queried name). 17 verified obligations, 0 errors.
+
+The theorem is stated over the call's fields (`names`, the `-`-flag and
+non-Str-word refusal flags), per call site. What it proves:
+
+* `rewrite_shape` -- a rewrite preserves the queried names and their
+  order; a refusal leaves the call untouched. Order is the `head -1`
+  property: `type doselect 2>/dev/null | head -1` must report `doselect`.
+* `answer_complete` -- every emitted line has an answer, because the
+  rewrite's premise is `all_classified`; nothing is answered by guessing.
+* `unclassified_refuses` -- one unclassifiable name refuses the WHOLE
+  call. A partial rewrite would print the known lines and silently drop
+  bash's `not found` line for the unknown one.
+* `pin_function_precedes_builtin` / `pin_external_no_claim` -- a program
+  function shadows a builtin of the same name, and a name in neither set
+  is never answered (`type ls` must not say "a shell builtin").
+
+Fidelity: the function set and the builtin table are parameters. The
+Rust-side test `builtin_table_is_the_58_true_builtins` pins the table's
+size (58), duplicate-freedom, and the absence of `ls`/`head`, so the
+abstraction is auditable. The echo's per-line TEXT is not modelled (a
+line is a function of its name and classification); the node carries the
+names in order, which is what the consumer reads.

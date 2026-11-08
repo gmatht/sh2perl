@@ -373,6 +373,24 @@ mod tests {
     }
 
     #[test]
+    fn builtin_table_is_the_58_true_builtins() {
+        // The Verus model (`proofs/verus/type_query.rs`) takes the table as
+        // a predicate parameter, so this pin is what makes the abstraction
+        // auditable: the count, duplicate-freedom, and the names it must
+        // NOT contain -- `type ls` claiming "a shell builtin" is the one
+        // wrong answer the table exists to prevent.
+        assert_eq!(BASH_BUILTINS.len(), 58);
+        assert!(BASH_BUILTINS.contains(&"printf"));
+        assert!(BASH_BUILTINS.contains(&"type"));
+        assert!(!BASH_BUILTINS.contains(&"ls"));
+        assert!(!BASH_BUILTINS.contains(&"head"));
+        let mut sorted = BASH_BUILTINS.to_vec();
+        sorted.sort();
+        sorted.dedup();
+        assert_eq!(sorted.len(), BASH_BUILTINS.len(), "duplicate table entry");
+    }
+
+    #[test]
     fn mixed_known_and_unknown_keeps_the_call() {
         // bash would print the known line THEN the not-found error; a
         // partial rewrite would silently lose the error — refuse.
