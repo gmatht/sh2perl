@@ -418,6 +418,7 @@ impl Render {
                 "def sh2_redirect(cap, redirects):\n",
                 "    global __sh_rc\n",
                 "    data = \"\"\n",
+                "    _has_fd1 = False\n",
                 "    if isinstance(cap, str):\n",
                 "        data = cap\n",
                 "    else:\n",
@@ -436,11 +437,17 @@ impl Render {
                 "        _mode = _r.get('mode', 'w')\n",
                 "        _tgt = _r.get('target', '')\n",
                 "        if _fd == 1 and isinstance(_tgt, str) and _tgt and not _tgt.startswith('&'):\n",
+                "            _has_fd1 = True\n",
                 "            try:\n",
                 "                with open(_tgt, 'ab' if _mode == 'a' else 'wb') as _f:\n",
                 "                    _f.write(data.encode())\n",
                 "            except OSError:\n",
                 "                pass\n",
+                "    # no fd-1 redirect into a file: the command's stdout passes\n",
+                "    # through (bash semantics; the captured value is consumed as\n",
+                "    # the bool only)\n",
+                "    if not _has_fd1 and data:\n",
+                "        sys.stdout.write(data if data.endswith('\\n') else data + '\\n')\n",
                 "    return __sh_rc == 0\n",
             ),
         ),
@@ -1505,6 +1512,36 @@ impl Render {
                         return format!("({run}.stdout.decode().rstrip(\"\\n\"))");
                     }
                 }
+                // a single Exec as the body (the process-substitution
+                // transform materializes tmp paths this way:
+                // `__ps_tmp0 = capture(arrow[Exec mktemp])`): capture the
+                // argv directly. Refuse when env/redirects are present —
+                // the placeholder is still better than a wrong command.
+                if let [IrStmt::Exec {
+                    cmd,
+                    args: eargs,
+                    capture: None,
+                    redirects,
+                    env: eenv,
+                }] = body.as_slice()
+                {
+                    if redirects.is_empty() && eenv.is_empty() {
+                        let mut argv: Vec<String> = Vec::new();
+                        match cmd {
+                            IrExpr::Str(c, _) => argv.push(Self::py_str(c)),
+                            _ => argv.push(self.expr(cmd)),
+                        }
+                        for a in eargs {
+                            argv.push(self.expr(a));
+                        }
+                        self.need_subprocess = true;
+                        let env = self.bash_env();
+                        return format!(
+                            "__sh_cap([{}], {env})",
+                            argv.join(", ")
+                        );
+                    }
+                }
                 // a single native-armed call as the body: render the
                 // native expression directly instead of a placeholder.
                 // Only stub-free arms qualify (each guarded by its own
@@ -2166,6 +2203,19 @@ impl Render {
                         );
                     }
                 }
+                // The process-substitution / backtick rewrite wraps a
+                // command body as capture(Arrow[body]). When the Arrow arm
+                // renders that body to a native command capture, reuse it:
+                // bash `$( )` strips trailing newlines and so does the
+                // capture renderer. Anything else stays the stub.
+                if args.len() == 1 {
+                    if let IrExpr::Arrow(body) = &args[0] {
+                        let code = self.expr(&IrExpr::Arrow(body.clone()));
+                        if code.starts_with("__sh_cap(") || code.starts_with('(') {
+                            return code;
+                        }
+                    }
+                }
                 self.sh2_stub("capture", args, "capture")
             }
             // `echo X | grep LIT >/dev/null` → contains(X, LIT): native
@@ -2749,11 +2799,12 @@ impl Render {
                                 self.written.insert(nm.clone());
                                 self.need_sys = true;
                                 // hoisted stdin (`< file`, herestring,
-                                // heredoc) or real stdin. Without the
-                                // hoist there is no `__sh_stdin` binding
-                                // (NameError — parse-heredoc-dollar-at).
-                                if self.stdin_file.is_some() {
-                                    self.emit(&format!("{m} = list(__sh_stdin)"));
+                                // heredoc) or real stdin — inline the
+                                // staged lines expression (there is no
+                                // `__sh_stdin` binding; the read arm does
+                                // the same).
+                                if let Some(e) = self.stdin_file.clone() {
+                                    self.emit(&format!("{m} = {e}"));
                                 } else {
                                     self.emit(&format!(
                                         "{m} = sys.stdin.read().splitlines()"
@@ -3898,6 +3949,9 @@ impl Render {
                     None
                 }
             }
+            // a bare variable in argv position (`diff $__ps_tmp3
+            // $__ps_tmp4`): the scalar's value, quoted
+            IrExpr::Var(n, _) => Some(format!("\"${n}\"")),
             IrExpr::Interpolate(parts) => {
                 let mut result = String::new();
                 for part in parts {
@@ -3963,7 +4017,16 @@ impl Render {
             match st {
                 IrStmt::Expr(e) => {
                     if let IrExpr::Call { func, args } = e {
-                        if func == "exec" {
+                        // the `&&`/`||` chain wraps a statement in
+                        // and/or(Arrow[body]): shell-text the inner body.
+                        if (func == "and" || func == "or")
+                            && matches!(body, [IrStmt::Expr(_)])
+                        {
+                            if let Some(IrExpr::Arrow(inner)) = args.first() {
+                                return self.body_shell_text(inner);
+                            }
+                        }
+                        if func == "exec" || func == "builtin" {
                             let mut one = Vec::new();
                             if let Some(IrExpr::Str(cmd, _)) = args.first() {
                                 one.push(Self::sh_quote(cmd));
@@ -3981,8 +4044,160 @@ impl Render {
                 }
                 IrStmt::Assign { targets, expr, .. } => {
                     let var = targets.first()?.var.clone();
+                    // `__ps_tmp0=$(mktemp)` as shell text: the expr is a
+                    // capture over a single-Exec arrow (either the
+                    // IrExpr::Capture node or the ESTree-shape capture
+                    // Call the expression arm produces).
+                    let cap_inner: Option<&IrExpr> = match expr {
+                        IrExpr::Capture { expr: inner, .. } => Some(inner),
+                        IrExpr::Call { func, args } if func == "capture" => {
+                            args.first()
+                        }
+                        _ => None,
+                    };
+                    if let Some(inner) = cap_inner {
+                        if let IrExpr::Arrow(ib) = inner {
+                            // nested `X=$(X=$(mktemp))` (the
+                            // process-subst transform's double wrap):
+                            // the inner assign is the real shell text.
+                            if let [IrStmt::Assign { targets: it, expr: ie, .. }] =
+                                ib.as_slice()
+                            {
+                                let ivar = it.first()?.var.clone();
+                                let iinner: Option<&IrExpr> = match ie {
+                                    IrExpr::Capture { expr: x, .. } => Some(x),
+                                    IrExpr::Call { func, args } if func == "capture" => {
+                                        args.first()
+                                    }
+                                    _ => None,
+                                };
+                                if let Some(iinner) = iinner {
+                                    if let IrExpr::Arrow(ii) = iinner {
+                                        if let [IrStmt::Exec {
+                                            cmd: ic,
+                                            args: ia,
+                                            capture: None,
+                                            redirects: ir,
+                                            env: iee,
+                                        }] = ii.as_slice()
+                                        {
+                                            if ir.is_empty() && iee.is_empty() {
+                                                let mut one = Vec::new();
+                                                match ic {
+                                                    IrExpr::Str(c, _) => {
+                                                        one.push(Self::sh_quote(c))
+                                                    }
+                                                    _ => one.push(self.sh_arg(ic)?),
+                                                }
+                                                for a in ia {
+                                                    one.push(self.sh_arg(a)?);
+                                                }
+                                                parts.push(format!(
+                                                    "{}=$({})",
+                                                    ivar,
+                                                    one.join(" ")
+                                                ));
+                                                continue;
+                                            }
+                                        }
+                                    }
+                                }
+                            }
+                            if let [IrStmt::Exec {
+                                cmd,
+                                args: eargs,
+                                capture: None,
+                                redirects: er,
+                                env: eenv,
+                            }] = ib.as_slice()
+                            {
+                                if er.is_empty() && eenv.is_empty() {
+                                    let mut one = Vec::new();
+                                    match cmd {
+                                        IrExpr::Str(c, _) => {
+                                            one.push(Self::sh_quote(c))
+                                        }
+                                        _ => one.push(self.sh_arg(cmd)?),
+                                    }
+                                    for a in eargs {
+                                        one.push(self.sh_arg(a)?);
+                                    }
+                                    parts.push(format!("{}=$({})", var, one.join(" ")));
+                                    continue;
+                                }
+                            }
+                        }
+                    }
                     let val = self.sh_arg(expr)?;
                     parts.push(format!("{var}={val}"));
+                }
+                // `producer > $__ps_tmpN`: a redirect stmt whose inner
+                // is one exec/builtin call — re-attach the redirect
+                // text (`> "$__ps_tmpN"`).
+                IrStmt::Redirect { inner, redirects, .. } => {
+                    if let [IrStmt::Expr(e)] = inner.as_slice() {
+                        if let IrExpr::Call { func, args } = e {
+                            if func == "exec" || func == "builtin" {
+                                let mut one = Vec::new();
+                                if let Some(IrExpr::Str(cmd, _)) = args.first() {
+                                    one.push(Self::sh_quote(cmd));
+                                }
+                                if let Some(IrExpr::Array(items)) = args.get(1) {
+                                    for it in items {
+                                        one.push(self.sh_arg(it)?);
+                                    }
+                                }
+                                let mut text = one.join(" ");
+                                for r in redirects {
+                                    text.push(' ');
+                                    text.push_str(&self.irredirect_text(r)?);
+                                }
+                                parts.push(text);
+                                continue;
+                            }
+                            // producer is a pipeline call (Arrow stages of
+                            // single exec/builtin calls): join with `|`.
+                            if func == "pipeline" {
+                                let stages = match args.first()? {
+                                    IrExpr::Array(stages) => stages,
+                                    _ => return None,
+                                };
+                                let mut texts = Vec::new();
+                                for st in stages {
+                                    let IrExpr::Arrow(sb) = st else {
+                                        return None;
+                                    };
+                                    let [IrStmt::Expr(se)] = sb.as_slice() else {
+                                        return None;
+                                    };
+                                    let IrExpr::Call { func: sf, args: sa } = se else {
+                                        return None;
+                                    };
+                                    if sf != "exec" && sf != "builtin" {
+                                        return None;
+                                    }
+                                    let mut one = Vec::new();
+                                    if let Some(IrExpr::Str(cmd, _)) = sa.first() {
+                                        one.push(Self::sh_quote(cmd));
+                                    }
+                                    if let Some(IrExpr::Array(items)) = sa.get(1) {
+                                        for it in items {
+                                            one.push(self.sh_arg(it)?);
+                                        }
+                                    }
+                                    texts.push(one.join(" "));
+                                }
+                                let mut text = texts.join(" | ");
+                                for r in redirects {
+                                    text.push(' ');
+                                    text.push_str(&self.irredirect_text(r)?);
+                                }
+                                parts.push(text);
+                                continue;
+                            }
+                        }
+                    }
+                    return None;
                 }
                 _ => return None,
             }
@@ -4005,6 +4220,12 @@ impl Render {
             _ => return None,
         };
         let target = match &r.target {
+            IrExpr::Var(n, _) => {
+                if n.starts_with('&') {
+                    return None;
+                }
+                format!("\"${n}\"")
+            }
             IrExpr::Str(s, _) => {
                 if s.starts_with('&') || s == "-" {
                     return None;
@@ -4204,6 +4425,51 @@ impl Render {
             return None;
         }
         let arg_exprs: Vec<String> = fmt_args.iter().map(|a| self.expr(a)).collect();
+        // `printf '%s ' "${arr[@]}"` — a whole-array slice arg: bash
+        // runs the format once per ELEMENT. A single splice with a
+        // single spec expands to a per-element join comprehension.
+        if n_specs == 1 && fmt_args.len() == 1 {
+            if let IrExpr::Call { func, args: pargs } = fmt_args[0] {
+                if func == "param" {
+                    let nm = match pargs.as_slice() {
+                        [IrExpr::Str(op, _), IrExpr::Str(nm, _), IrExpr::Str(sub, _), ..]
+                            if op == "slice" && (sub == "@" || sub == "*") =>
+                        {
+                            Some(nm.clone())
+                        }
+                        _ => None,
+                    };
+                    if let Some(nm) = nm {
+                        // per-element one-pass for fmt els with one spec:
+                        // fmt text parts are constant across elements.
+                        let conv = els
+                            .iter()
+                            .find_map(|(_, s)| s.as_ref().map(|t| t.3))
+                            .unwrap_or('s');
+                        let val = match conv {
+                            'd' | 'i' | 'u' => {
+                                self.need_atoi = true;
+                                "str(__sh_atoi(__sh_e))".to_string()
+                            }
+                            _ => "str(__sh_e)".to_string(),
+                        };
+                        let per_el: Vec<String> = els
+                            .iter()
+                            .map(|(text, spec)| match spec {
+                                Some(_) => val.clone(),
+                                None => Self::py_str(&Self::printf_unescape(text)),
+                            })
+                            .collect();
+                        let m = self.py_ident(&nm);
+                        return Some(vec![format!(
+                            "''.join(({} + {}) for __sh_e in {m})",
+                            per_el.join(" + "),
+                            "''"
+                        )]);
+                    }
+                }
+            }
+        }
         // a spec with flags/width/prec must keep the runtime builtin
         let complex = els.iter().any(|(_, s)| match s {
             Some((flags, width, prec, _)) => {
@@ -5074,7 +5340,7 @@ impl Render {
         }
         let mut terms: Vec<String> = Vec::new();
         let mut lit = String::new();
-        let mut flush = |lit: &mut String, terms: &mut Vec<String>| {
+        let flush = |lit: &mut String, terms: &mut Vec<String>| {
             if !lit.is_empty() {
                 terms.push(Self::py_str(lit));
                 lit.clear();
@@ -6673,6 +6939,15 @@ impl Render {
                                     ));
                                     self.need_read_lines = true;
                                 }
+                                // `mapfile x < "$tmp"` — a variable file
+                                // (the process-substitution transform's
+                                // `__ps_tmpN` materialize): read the named
+                                // file instead of real stdin.
+                                ("r", _) => {
+                                    let p = self.expr(&r.target);
+                                    lines = Some(format!("__sh_read_lines({p})"));
+                                    self.need_read_lines = true;
+                                }
                                 ("heredoc" | "heredoc-tabs" | "herestring", t)
                                     if Self::redirect_target_lit(t).is_some() =>
                                 {
@@ -7088,7 +7363,10 @@ impl Render {
             // dropped them from the child's environment, so a `bash -c`
             // seam reading `$___t1` saw it unset and `printf '%c'` printed
             // a NUL byte (c-sh-go t10_string_pointer).
-            self.emit("        if (_k.startswith(\"___\") or not _k.startswith(\"__\")) and isinstance(_v, (str, int, float)):");
+            // The process-substitution temps (`__ps_tmpN`, the staged
+            // paths `bash -c` seams read as `$__ps_tmpN`) are shell
+            // variables too — same rule as `___tN` above.
+            self.emit("        if (_k.startswith(\"___\") or _k.startswith(\"__ps_tmp\") or not _k.startswith(\"__\")) and isinstance(_v, (str, int, float)):");
             self.emit("            e[_k] = str(_v)");
             self.emit("    for _k, _v in list(globals().items()):");
             self.emit("        if not _k.startswith(\"_\") and isinstance(_v, list):");
