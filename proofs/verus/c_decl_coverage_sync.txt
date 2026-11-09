@@ -1,9 +1,8 @@
 # verus-sync-coverage manifest: c_decl_coverage
-# source sha: c_backend-walkers=840274f9b61b  proof sha: b7aab46b8f06
+# source sha: c_backend-walkers=4047d414a29e  proof sha: 09018a3eb4a7
 
 [pins]
 pin pin_array_elem -> UNMIRRORED (by design — see VERUS.md §(b).4)
-pin pin_assign_chain -> test expr_position_assign_routes_to_the_variable: MAPPED
 pin pin_elsif_cond -> UNMIRRORED (by design — see VERUS.md §(b).4)
 pin pin_printf_nested -> UNMIRRORED (by design — see VERUS.md §(b).4)
 pin pin_raw_nested -> UNMIRRORED (by design — see VERUS.md §(b).4)
@@ -76,7 +75,6 @@ fn collect_assigned_expr
   arm IrExpr::Call { args, .. } if is_printf_v_call(args) | calls: collect_assigned_expr
   arm IrExpr::Call { args, .. } if matches!(args.first(), Some(IrExpr::Str(c, _)) if c == "let") && matches!( args.get(1), Some(IrExpr::Array(items)) if matches!(items.first(), Some(IrExpr::Str(..))) ) | calls: collect_assigned_expr,let_var_name
   arm IrExpr::Call { func, args } if func == "param" | calls: collect_assigned_expr,param_write_target
-  arm IrExpr::Call { func, args } if func == "assign" | calls: collect_assigned_expr
   arm IrExpr::Call { args, .. } | calls: collect_assigned_expr
   arm IrExpr::BinOp { lhs, rhs, .. } | calls: collect_assigned_exprx2
   arm IrExpr::Interpolate(parts) | calls: collect_assigned_expr
@@ -120,8 +118,8 @@ fn collect_param_write_expr
 guard decl-coverage walker chains: EXTRACTED
 
 [counts]
-proof-fns: 23
-pins: 9
+proof-fns: 21
+pins: 8
 # NOTE: proof-fns is a file-shape fact (change detector), NOT the
 # Verus obligation count — the gate asserts N verified separately.
 
@@ -133,7 +131,6 @@ pins: 9
 # source file) and records the per-test PASS/FAIL verdict below.
 # all suites built; per-test verdicts below
 exec pin_array_elem: UNMIRRORED (not executed)
-exec pin_assign_chain (expr_position_assign_routes_to_the_variable): PASS
 exec pin_elsif_cond: UNMIRRORED (not executed)
 exec pin_printf_nested: UNMIRRORED (not executed)
 exec pin_raw_nested: UNMIRRORED (not executed)
