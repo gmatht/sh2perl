@@ -1,0 +1,34 @@
+# verus-sync-coverage manifest: list_folds
+# source sha: brace_fold=3cbc85981aa1 affix_strip_fold=62e557c7454a  proof sha: 0098be0a40b9
+
+[pins]
+pin pin_brace_empty_group -> test empty_expansion_is_refused: MAPPED
+pin pin_brace_two_words -> test echo_arg_fans_out: MAPPED
+pin pin_prefix_no_match_keeps -> test glob_magic_pattern_is_kept: MAPPED
+pin pin_prefix_strips -> test literal_prefix_strip_folds_on_rust: MAPPED
+pin pin_splice_keeps_neighbours -> test array_literal_expands_elements: MAPPED
+pin pin_suffix_strips -> test literal_suffix_strip_folds_on_java: MAPPED
+
+[guards]
+guard brace-fold list-position gate: PRESENT
+guard affix-strip literal-pattern gate: PRESENT
+
+[counts]
+proof-fns: 10
+pins: 6
+# NOTE: proof-fns is a file-shape fact (change detector), NOT the
+# Verus obligation count — the gate asserts N verified separately.
+
+[exec]
+# Each MAPPED test above, EXECUTED against the live source (one
+# module-suite run per model; per-test verdicts grepped from output).
+# A mapped test that fails or vanishes from the run is drift — FATAL.
+# The checker RUNS each mapped test (one module-suite cargo test per
+# source file) and records the per-test PASS/FAIL verdict below.
+# all suites built; per-test verdicts below
+exec pin_brace_empty_group (empty_expansion_is_refused): PASS
+exec pin_brace_two_words (echo_arg_fans_out): PASS
+exec pin_prefix_no_match_keeps (glob_magic_pattern_is_kept): PASS
+exec pin_prefix_strips (literal_prefix_strip_folds_on_rust): PASS
+exec pin_splice_keeps_neighbours (array_literal_expands_elements): PASS
+exec pin_suffix_strips (literal_suffix_strip_folds_on_java): PASS

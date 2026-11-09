@@ -1,0 +1,36 @@
+# verus-sync-coverage manifest: copy_propagation
+# source sha: copy_propagation=2bce47b3f3b3  proof sha: bab6ad48bf1b
+
+[pins]
+pin pin_copy_def_not_folded -> test folds_copy_rhs: MAPPED
+pin pin_fold_after_def -> test folds_read_after_def: MAPPED
+pin pin_fold_both_reads -> test folds_both_reads_in_one_stmt: MAPPED
+pin pin_other_opaque -> test refuses_background_read: MAPPED
+pin pin_refuse_before_def -> test refuses_read_before_def: MAPPED
+pin pin_refuse_multi_def -> test refuses_multi_def: MAPPED
+
+[guards]
+guard def-before-read di<i: PRESENT
+guard opaque-kind Subshell/Background refusal: PRESENT
+guard opaque-kind Capture: PRESENT
+guard single-def census: PRESENT
+
+[counts]
+proof-fns: 23
+pins: 6
+# NOTE: proof-fns is a file-shape fact (change detector), NOT the
+# Verus obligation count — the gate asserts N verified separately.
+
+[exec]
+# Each MAPPED test above, EXECUTED against the live source (one
+# module-suite run per model; per-test verdicts grepped from output).
+# A mapped test that fails or vanishes from the run is drift — FATAL.
+# The checker RUNS each mapped test (one module-suite cargo test per
+# source file) and records the per-test PASS/FAIL verdict below.
+# all suites built; per-test verdicts below
+exec pin_copy_def_not_folded (folds_copy_rhs): PASS
+exec pin_fold_after_def (folds_read_after_def): PASS
+exec pin_fold_both_reads (folds_both_reads_in_one_stmt): PASS
+exec pin_other_opaque (refuses_background_read): PASS
+exec pin_refuse_before_def (refuses_read_before_def): PASS
+exec pin_refuse_multi_def (refuses_multi_def): PASS

@@ -1,0 +1,36 @@
+# verus-sync-coverage manifest: capture_folds
+# source sha: const_capture_fold=7f4b0d0dfb10 text_capture_fold=f76d26e31190  proof sha: b2c4c1df6296
+
+[pins]
+pin pin_and_chain_status_refuses -> test chain_status_loss_refuses: MAPPED
+pin pin_echo_joins_space -> test multi_word_echo_joins_with_a_space: MAPPED
+pin pin_echo_newline_stripped -> test frontend_constant_echo_capture_folds: MAPPED
+pin pin_or_chain_reachable -> test or_chain_folds_to_reachable_arm: MAPPED
+pin pin_true_empty -> test folds_true_to_empty: MAPPED
+pin pin_unknown_refuses -> test other_command_refuses: MAPPED
+
+[guards]
+guard const-capture newline strip: PRESENT
+guard const-capture chain-status: PRESENT
+guard text-capture TEXT_FUNCS gate: PRESENT
+guard text-capture safe_repl: PRESENT
+
+[counts]
+proof-fns: 10
+pins: 6
+# NOTE: proof-fns is a file-shape fact (change detector), NOT the
+# Verus obligation count — the gate asserts N verified separately.
+
+[exec]
+# Each MAPPED test above, EXECUTED against the live source (one
+# module-suite run per model; per-test verdicts grepped from output).
+# A mapped test that fails or vanishes from the run is drift — FATAL.
+# The checker RUNS each mapped test (one module-suite cargo test per
+# source file) and records the per-test PASS/FAIL verdict below.
+# all suites built; per-test verdicts below
+exec pin_and_chain_status_refuses (chain_status_loss_refuses): PASS
+exec pin_echo_joins_space (multi_word_echo_joins_with_a_space): PASS
+exec pin_echo_newline_stripped (frontend_constant_echo_capture_folds): PASS
+exec pin_or_chain_reachable (or_chain_folds_to_reachable_arm): PASS
+exec pin_true_empty (folds_true_to_empty): PASS
+exec pin_unknown_refuses (other_command_refuses): PASS

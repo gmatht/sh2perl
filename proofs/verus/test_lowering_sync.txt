@@ -1,0 +1,51 @@
+# verus-sync-coverage manifest: test_lowering
+# source sha: test_lowering=1597cbdfb29e  proof sha: 5c4be71f5f7a
+
+[pins]
+pin pin_affix_neg -> test negated_affix_not_carries_primitive_on_both_sides: MAPPED
+pin pin_affix_shapes -> test glob_affix_tests_lower_to_primitives: MAPPED
+pin pin_nonempty_empty -> test nonempty_tests_lower_to_string_ne: MAPPED
+pin pin_nonempty_var -> test nonempty_tests_lower_to_string_ne: MAPPED
+pin pin_numeric_ge -> test numeric_compare_tests_lower_to_binop: MAPPED
+pin pin_string_eq_not_ne -> test string_eq_tests_lower_to_string_ne: MAPPED
+pin pin_string_eq_true -> test string_eq_tests_lower_to_string_ne: MAPPED
+pin pin_string_ne_direct -> test string_eq_tests_lower_to_string_ne: MAPPED
+pin pin_zero_negation -> test nonempty_tests_lower_to_string_ne: MAPPED
+
+[guards]
+guard eq-as-Not(Ne) not_wrap def: PRESENT
+guard eq-as-Not(Ne) site not_wrap(ne): PRESENT
+guard eq-as-Not(Ne) site not_wrap(call): PRESENT
+guard primitive "strHasPrefix": PRESENT
+guard primitive "contains": PRESENT
+guard primitive "strHasSuffix": PRESENT
+guard numeric-op " -eq ": PRESENT
+guard numeric-op " -ne ": PRESENT
+guard numeric-op " -gt ": PRESENT
+guard numeric-op " -ge ": PRESENT
+guard numeric-op " -lt ": PRESENT
+guard numeric-op " -le ": PRESENT
+guard nonempty -n/-z: PRESENT
+
+[counts]
+proof-fns: 24
+pins: 9
+# NOTE: proof-fns is a file-shape fact (change detector), NOT the
+# Verus obligation count — the gate asserts N verified separately.
+
+[exec]
+# Each MAPPED test above, EXECUTED against the live source (one
+# module-suite run per model; per-test verdicts grepped from output).
+# A mapped test that fails or vanishes from the run is drift — FATAL.
+# The checker RUNS each mapped test (one module-suite cargo test per
+# source file) and records the per-test PASS/FAIL verdict below.
+# all suites built; per-test verdicts below
+exec pin_affix_neg (negated_affix_not_carries_primitive_on_both_sides): PASS
+exec pin_affix_shapes (glob_affix_tests_lower_to_primitives): PASS
+exec pin_nonempty_empty (nonempty_tests_lower_to_string_ne): PASS
+exec pin_nonempty_var (nonempty_tests_lower_to_string_ne): PASS
+exec pin_numeric_ge (numeric_compare_tests_lower_to_binop): PASS
+exec pin_string_eq_not_ne (string_eq_tests_lower_to_string_ne): PASS
+exec pin_string_eq_true (string_eq_tests_lower_to_string_ne): PASS
+exec pin_string_ne_direct (string_eq_tests_lower_to_string_ne): PASS
+exec pin_zero_negation (nonempty_tests_lower_to_string_ne): PASS

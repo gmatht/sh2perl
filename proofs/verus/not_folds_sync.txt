@@ -1,0 +1,42 @@
+# verus-sync-coverage manifest: not_folds
+# source sha: not_identity=9208238a69ac  proof sha: 9fafbb4156fd
+
+[pins]
+pin pin_double_not_folds -> test folds_double_not: MAPPED
+pin pin_flip_invisible_at_runtime -> test flips_negated_comparison: MAPPED
+pin pin_flip_lt_to_ge -> test flips_ordering_comparisons: MAPPED
+pin pin_flip_ne_to_eq -> test flips_negated_comparison: MAPPED
+pin pin_fold_invisible_at_runtime -> test folds_double_not: MAPPED
+pin pin_inconsistent_inner_refuses -> test unbalanced_inner_not_is_refused: MAPPED
+pin pin_inconsistent_outer_refuses -> UNMIRRORED (by design — see VERUS.md §(b).4)
+pin pin_single_not_untouched -> test single_not_is_untouched: MAPPED
+
+[guards]
+guard not-identity consistency gate: PRESENT
+guard not-identity flip entry: PRESENT
+guard not-identity flip entry: PRESENT
+guard not-identity flip entry: PRESENT
+guard not-identity-flip separate entry: PRESENT
+guard not-identity non-comparison refusal: PRESENT
+
+[counts]
+proof-fns: 11
+pins: 8
+# NOTE: proof-fns is a file-shape fact (change detector), NOT the
+# Verus obligation count — the gate asserts N verified separately.
+
+[exec]
+# Each MAPPED test above, EXECUTED against the live source (one
+# module-suite run per model; per-test verdicts grepped from output).
+# A mapped test that fails or vanishes from the run is drift — FATAL.
+# The checker RUNS each mapped test (one module-suite cargo test per
+# source file) and records the per-test PASS/FAIL verdict below.
+# all suites built; per-test verdicts below
+exec pin_double_not_folds (folds_double_not): PASS
+exec pin_flip_invisible_at_runtime (flips_negated_comparison): PASS
+exec pin_flip_lt_to_ge (flips_ordering_comparisons): PASS
+exec pin_flip_ne_to_eq (flips_negated_comparison): PASS
+exec pin_fold_invisible_at_runtime (folds_double_not): PASS
+exec pin_inconsistent_inner_refuses (unbalanced_inner_not_is_refused): PASS
+exec pin_inconsistent_outer_refuses: UNMIRRORED (not executed)
+exec pin_single_not_untouched (single_not_is_untouched): PASS

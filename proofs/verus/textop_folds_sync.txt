@@ -1,0 +1,36 @@
+# verus-sync-coverage manifest: textop_folds
+# source sha: text_ops=68bfaa6813fb  proof sha: 4f885f265c26
+
+[pins]
+pin pin_basename_interior_slashes -> UNMIRRORED (by design — see VERUS.md §(b).4)
+pin pin_basename_trailing_slash -> UNMIRRORED (by design — see VERUS.md §(b).4)
+pin pin_case_lower -> test param_case_lower: MAPPED
+pin pin_case_upper -> test param_case_upper: MAPPED
+pin pin_strlen_literal -> test wc_c_is_strlen: MAPPED
+pin pin_substr_slice -> UNMIRRORED (by design — see VERUS.md §(b).4)
+
+[guards]
+guard text-op node StrLen: PRESENT
+guard text-op node CaseTransform: PRESENT
+guard text-op node SubStr: PRESENT
+guard text-op node PathName: PRESENT
+
+[counts]
+proof-fns: 11
+pins: 6
+# NOTE: proof-fns is a file-shape fact (change detector), NOT the
+# Verus obligation count — the gate asserts N verified separately.
+
+[exec]
+# Each MAPPED test above, EXECUTED against the live source (one
+# module-suite run per model; per-test verdicts grepped from output).
+# A mapped test that fails or vanishes from the run is drift — FATAL.
+# The checker RUNS each mapped test (one module-suite cargo test per
+# source file) and records the per-test PASS/FAIL verdict below.
+# all suites built; per-test verdicts below
+exec pin_basename_interior_slashes: UNMIRRORED (not executed)
+exec pin_basename_trailing_slash: UNMIRRORED (not executed)
+exec pin_case_lower (param_case_lower): PASS
+exec pin_case_upper (param_case_upper): PASS
+exec pin_strlen_literal (wc_c_is_strlen): PASS
+exec pin_substr_slice: UNMIRRORED (not executed)

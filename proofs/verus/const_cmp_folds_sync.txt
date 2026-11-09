@@ -1,0 +1,45 @@
+# verus-sync-coverage manifest: const_cmp_folds
+# source sha: const_str_cmp_fold=af524df6a29b  proof sha: d62ec0cde44d
+
+[pins]
+pin pin_command_style_refuses -> test refuses_command_style: MAPPED
+pin pin_dynamic_refuses -> test refuses_dynamic_and_mixed_operands: MAPPED
+pin pin_equal_literals -> test folds_equal_literals: MAPPED
+pin pin_glob_rhs_refuses -> test refuses_glob_rhs: MAPPED
+pin pin_globmatch_literal -> test folds_globmatch_with_literal_pattern: MAPPED
+pin pin_int_literals -> test folds_int_literals: MAPPED
+pin pin_mixed_refuses -> test refuses_dynamic_and_mixed_operands: MAPPED
+pin pin_ne_literals -> test folds_equal_literals: MAPPED
+pin pin_wrapped_exact -> test folds_wrapped_exact_cond: MAPPED
+
+[guards]
+guard const-str-cmp plain-style gate: PRESENT
+guard const-str-cmp glob-metachar refusal: PRESENT
+guard const-str-cmp int/int arm: PRESENT
+guard const-str-cmp mixed refusal: PRESENT
+guard const-str-cmp wrapped-Not arm: PRESENT
+guard const-str-cmp globMatch arm: PRESENT
+guard const-str-cmp affix leave-alone: PRESENT
+
+[counts]
+proof-fns: 13
+pins: 9
+# NOTE: proof-fns is a file-shape fact (change detector), NOT the
+# Verus obligation count — the gate asserts N verified separately.
+
+[exec]
+# Each MAPPED test above, EXECUTED against the live source (one
+# module-suite run per model; per-test verdicts grepped from output).
+# A mapped test that fails or vanishes from the run is drift — FATAL.
+# The checker RUNS each mapped test (one module-suite cargo test per
+# source file) and records the per-test PASS/FAIL verdict below.
+# all suites built; per-test verdicts below
+exec pin_command_style_refuses (refuses_command_style): PASS
+exec pin_dynamic_refuses (refuses_dynamic_and_mixed_operands): PASS
+exec pin_equal_literals (folds_equal_literals): PASS
+exec pin_glob_rhs_refuses (refuses_glob_rhs): PASS
+exec pin_globmatch_literal (folds_globmatch_with_literal_pattern): PASS
+exec pin_int_literals (folds_int_literals): PASS
+exec pin_mixed_refuses (refuses_dynamic_and_mixed_operands): PASS
+exec pin_ne_literals (folds_equal_literals): PASS
+exec pin_wrapped_exact (folds_wrapped_exact_cond): PASS

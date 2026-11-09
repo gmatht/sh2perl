@@ -1,0 +1,40 @@
+# verus-sync-coverage manifest: string_folds
+# source sha: interp_fold=3aea4df5c382 default_empty_fold=2ea08342e7b4  proof sha: 7003ba148a5d
+
+[pins]
+pin pin_default_invisible_at_runtime -> test empty_default_folds_to_plain_read: MAPPED
+pin pin_fold_invisible_at_runtime -> test single_literal_interpolate_folds_to_str: MAPPED
+pin pin_gates_open_folds -> test empty_default_folds_to_plain_read: MAPPED
+pin pin_gates_refuse -> test array_homed_names_refuse: MAPPED
+pin pin_multi_part_stays -> test multi_part_interpolate_is_left_alone: MAPPED
+pin pin_single_expr_refuses -> test single_expr_interpolate_is_refused: MAPPED
+pin pin_single_literal_folds -> test single_literal_interpolate_folds_to_str: MAPPED
+
+[guards]
+guard interp single-lit rule: PRESENT
+guard interp assign-head refusal: PRESENT
+guard default-empty op gate: PRESENT
+guard default-empty plain-ident gate: PRESENT
+guard default-empty nounset gate: PRESENT
+guard default-empty array-homed gate: PRESENT
+
+[counts]
+proof-fns: 9
+pins: 7
+# NOTE: proof-fns is a file-shape fact (change detector), NOT the
+# Verus obligation count — the gate asserts N verified separately.
+
+[exec]
+# Each MAPPED test above, EXECUTED against the live source (one
+# module-suite run per model; per-test verdicts grepped from output).
+# A mapped test that fails or vanishes from the run is drift — FATAL.
+# The checker RUNS each mapped test (one module-suite cargo test per
+# source file) and records the per-test PASS/FAIL verdict below.
+# all suites built; per-test verdicts below
+exec pin_default_invisible_at_runtime (empty_default_folds_to_plain_read): PASS
+exec pin_fold_invisible_at_runtime (single_literal_interpolate_folds_to_str): PASS
+exec pin_gates_open_folds (empty_default_folds_to_plain_read): PASS
+exec pin_gates_refuse (array_homed_names_refuse): PASS
+exec pin_multi_part_stays (multi_part_interpolate_is_left_alone): PASS
+exec pin_single_expr_refuses (single_expr_interpolate_is_refused): PASS
+exec pin_single_literal_folds (single_literal_interpolate_folds_to_str): PASS

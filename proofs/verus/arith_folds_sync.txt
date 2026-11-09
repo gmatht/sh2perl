@@ -1,0 +1,40 @@
+# verus-sync-coverage manifest: arith_folds
+# source sha: arith_normalize=3688dae316cb bc_float_clean=b872f6c06797  proof sha: 344ad4aeffe8
+
+[pins]
+pin pin_bc_strip_identity -> UNMIRRORED (by design — see VERUS.md §(b).4)
+pin pin_nonzero_no_fold -> UNMIRRORED (by design — see VERUS.md §(b).4)
+pin pin_norm_invisible_at_runtime -> UNMIRRORED (by design — see VERUS.md §(b).4)
+pin pin_one_mul_identity -> UNMIRRORED (by design — see VERUS.md §(b).4)
+pin pin_zero_add_identity -> UNMIRRORED (by design — see VERUS.md §(b).4)
+pin pin_zero_minus_negates -> UNMIRRORED (by design — see VERUS.md §(b).4)
+pin pin_zero_mul_div_refuse -> UNMIRRORED (by design — see VERUS.md §(b).4)
+
+[guards]
+guard arith-normalize rule ArithAst::Num(0): PRESENT
+guard arith-normalize rule ArithAst::Num(1): PRESENT
+guard arith-normalize negation: PRESENT
+guard arith-normalize zero-mul refusal: PRESENT
+guard bc-float-clean +0.0 gate: PRESENT
+guard bc-float-clean decimal requirement: PRESENT
+
+[counts]
+proof-fns: 9
+pins: 7
+# NOTE: proof-fns is a file-shape fact (change detector), NOT the
+# Verus obligation count — the gate asserts N verified separately.
+
+[exec]
+# Each MAPPED test above, EXECUTED against the live source (one
+# module-suite run per model; per-test verdicts grepped from output).
+# A mapped test that fails or vanishes from the run is drift — FATAL.
+# The checker RUNS each mapped test (one module-suite cargo test per
+# source file) and records the per-test PASS/FAIL verdict below.
+# all suites built; per-test verdicts below
+exec pin_bc_strip_identity: UNMIRRORED (not executed)
+exec pin_nonzero_no_fold: UNMIRRORED (not executed)
+exec pin_norm_invisible_at_runtime: UNMIRRORED (not executed)
+exec pin_one_mul_identity: UNMIRRORED (not executed)
+exec pin_zero_add_identity: UNMIRRORED (not executed)
+exec pin_zero_minus_negates: UNMIRRORED (not executed)
+exec pin_zero_mul_div_refuse: UNMIRRORED (not executed)
