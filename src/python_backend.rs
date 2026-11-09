@@ -1494,6 +1494,42 @@ impl Render {
                         Self::py_str(&text)
                     );
                 }
+                // backtick/`$()` form: Arrow[Pipeline] (e.g.
+                // captureWords(arrow) over `ls | grep -v …`) — run it
+                // through the shared pipeline_run instead of leaving an
+                // empty sh2_arrow() placeholder with no command data.
+                if let [IrStmt::Pipeline { stages, .. }] = body.as_slice() {
+                    let stages: Vec<IrExpr> =
+                        stages.iter().map(|s| IrExpr::Arrow(s.clone())).collect();
+                    if let Some(run) = self.pipeline_run(&[IrExpr::Array(stages)]) {
+                        return format!("({run}.stdout.decode().rstrip(\"\\n\"))");
+                    }
+                }
+                // a single native-armed call as the body: render the
+                // native expression directly instead of a placeholder.
+                // Only stub-free arms qualify (each guarded by its own
+                // Option/run check) — anything else keeps the arrow
+                // placeholder (rendering its body blindly would surface
+                // TODO stubs that were never visible).
+                if let [IrStmt::Expr(IrExpr::Call { func, args })] = body.as_slice() {
+                    match func.as_str() {
+                        "grepMatches" => return self.call(func, args),
+                        "pipeline" => {
+                            if let Some(run) = self.pipeline_run(args) {
+                                return format!(
+                                    "({run}.stdout.decode().rstrip(\"\\n\"))"
+                                );
+                            }
+                        }
+                        "redirect" => {
+                            // `$(cmd < file)` as an arrow body
+                            if let Some(c) = self.capture_redirect(args) {
+                                return c;
+                            }
+                        }
+                        _ => {}
+                    }
+                }
                 self.sh2_stub("arrow", &[], "arrow")
             }
             IrExpr::Array(items) => {
@@ -2192,6 +2228,14 @@ impl Render {
                                     IrExpr::Str(s, _) => self
                                         .glob_item(s)
                                         .unwrap_or_else(|| self.expr(i)),
+                                    // captureWords yields the word list
+                                    // bash field-splits into separate echo
+                                    // fields — splice it like a glob so
+                                    // print space-joins the words, not the
+                                    // python list repr.
+                                    IrExpr::Call { func, .. } if func == "captureWords" => {
+                                        format!("*{}", self.expr(i))
+                                    }
                                     _ => self.expr(i),
                                 })
                                 .collect();
@@ -2202,7 +2246,13 @@ impl Render {
                                 self.need_echo_e = true;
                                 let parts: Vec<String> = rendered
                                     .iter()
-                                    .map(|r| format!("__sh_echo_e({r})"))
+                                    .map(|r| match r.strip_prefix('*') {
+                                        // spliced word list: join first,
+                                        // then interpret escapes over the
+                                        // joined text (same per-word result)
+                                        Some(e) => format!("__sh_echo_e(\" \".join({e}))"),
+                                        None => format!("__sh_echo_e({r})"),
+                                    })
                                     .collect();
                                 if no_nl {
                                     self.need_sys = true;
@@ -3603,17 +3653,55 @@ impl Render {
             _ => return None,
         };
         // fast path: every stage is shell-textable — one bash -c.
+        // A stage may carry redirects (`wc -c < "$file"`): unwrap the
+        // Redirect to its inner call and re-attach the redirect text.
         let mut parts = Vec::new();
         let mut all_shell = true;
         for stage in stages {
             if let IrExpr::Arrow(body) = stage {
-                if let [IrStmt::Expr(e)] = body.as_slice() {
-                    if let IrExpr::Call { func, args } = e {
-                        if func == "exec" || func == "builtin" {
-                            if let Some(argv) = self.shell_argv(args) {
-                                parts.push(argv.join(" "));
-                                continue;
+                let (call, redirs): (&IrExpr, Option<&Vec<crate::ir::IrRedirect>>) =
+                    match body.as_slice()
+                {
+                    [IrStmt::Expr(e)] => (e, None),
+                    [IrStmt::Redirect {
+                        inner, redirects, ..
+                    }] => match inner.as_slice() {
+                        [IrStmt::Expr(e)] => (e, Some(redirects)),
+                        _ => {
+                            all_shell = false;
+                            break;
+                        }
+                    },
+                    _ => {
+                        all_shell = false;
+                        break;
+                    }
+                };
+                if let IrExpr::Call { func, args } = call {
+                    if func == "exec" || func == "builtin" {
+                        if let Some(argv) = self.shell_argv(args) {
+                            let mut text = argv.join(" ");
+                            if let Some(redirs) = redirs {
+                                let mut ok = true;
+                                for r in redirs {
+                                    match self.irredirect_text(r) {
+                                        Some(t) => {
+                                            text.push(' ');
+                                            text.push_str(&t);
+                                        }
+                                        None => {
+                                            ok = false;
+                                            break;
+                                        }
+                                    }
+                                }
+                                if !ok {
+                                    all_shell = false;
+                                    break;
+                                }
                             }
+                            parts.push(text);
+                            continue;
                         }
                     }
                 }
@@ -3900,6 +3988,56 @@ impl Render {
             }
         }
         Some(parts.join("; "))
+    }
+    /// Render an `IrRedirect` (statement-pipeline stage form) to shell
+    /// text: optional fd prefix + mode symbol + literal target.
+    /// Refuses dup/close targets (`2>&1`, `>&-`) and non-literal targets
+    /// (only Str / all-literal Interpolate / getVar, mirroring
+    /// `redirect_shell_text`).
+    fn irredirect_text(&self, r: &crate::ir::IrRedirect) -> Option<String> {
+        if r.interpolate {
+            return None;
+        }
+        let sym = match r.mode.as_str() {
+            "r" => "<",
+            "w" => ">",
+            "a" => ">>",
+            _ => return None,
+        };
+        let target = match &r.target {
+            IrExpr::Str(s, _) => {
+                if s.starts_with('&') || s == "-" {
+                    return None;
+                }
+                Self::sh_quote(s)
+            }
+            IrExpr::Interpolate(parts) => {
+                // mixed (`getVar` + literals, `x/$file`): emit each part
+                // in shell words (quotes only for space-bearing lits).
+                let mut out = String::new();
+                for p in parts {
+                    match p {
+                        crate::ir::InterpPart::Lit(s) => out.push_str(s),
+                        crate::ir::InterpPart::Expr(e) => out.push_str(&self.sh_arg(e)?),
+                    }
+                }
+                if out.starts_with('&') || out == "-" {
+                    return None;
+                }
+                out
+            }
+            IrExpr::Call { func, args } if func == "getVar" => {
+                let IrExpr::Str(n, _) = args.first()? else {
+                    return None;
+                };
+                format!("\"${n}\"")
+            }
+            _ => return None,
+        };
+        Some(match r.fd {
+            Some(fd) => format!("{fd}{sym}{target}"),
+            None => format!("{sym}{target}"),
+        })
     }
     /// Render a {fd, mode, target} redirect object to shell text.
     fn redirect_shell_text(&self, r: &IrExpr) -> Option<String> {
