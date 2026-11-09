@@ -3310,3 +3310,158 @@ pub fn stmts_read_status(stmts: &[IrStmt]) -> bool {
         _ => false,
     })
 }
+
+// ── escaping: the consumer for proofs/verus/perl_str_escape.rs ───────
+//
+// The Verus model proves the RULES round-trip; this runs the real Perl over
+// the strings the corpus and the gate work actually hit, so a change to
+// `perl_str` that the model was not updated for shows up as a red test here
+// rather than as a silently different string in a rendered example.
+#[cfg(test)]
+mod escaping_tests {
+    use super::Render;
+
+    fn hex(bytes: &[u8]) -> String {
+        bytes.iter().map(|b| format!("{b:02x}")).collect()
+    }
+
+    /// THE CLAIM: whatever `perl_str` emits for `s`, Perl's double-quote
+    /// parser evaluates it back to exactly `s` — no `$`/`@` interpolation,
+    /// no re-read escape, no premature close.
+    #[test]
+    fn perl_str_literals_evaluate_back_to_the_ir_string() {
+        let mut corpus: Vec<String> = vec![String::new()];
+        // every ASCII code point on its own: the metacharacters, the control
+        // range that goes through `\x{h}`, and DEL (which is emitted raw)
+        for b in 0u8..0x80 {
+            corpus.push((b as char).to_string());
+        }
+        // the shapes from the corpus / gate work: `${x}` is the splice class
+        for s in [
+            "${x}",
+            "$x",
+            "x${x}y",
+            "${x:-default}",
+            "$#x",
+            "@ARGV",
+            "@{x}",
+            "@*",
+            "$@",
+            "\\",
+            "\\\\",
+            "\\$",
+            "\\n",
+            "\\x41",
+            "\"",
+            "\"\"",
+            "a\"b",
+            "\"${x}\"",
+            "'\"'",
+            "\\\"$x\\\"",
+            "`id`",
+            "%s%s",
+            "<<EOF",
+            "a\x01b",
+            "\x00\x01\x1f\x7f",
+            "\t\n\r",
+            "trailing\\",
+            "\\\\trailing",
+            "日",
+            "héllo",
+            "a\x01é",
+        ] {
+            corpus.push(s.to_string());
+        }
+
+        let perl = std::env::var("PERL_BIN").unwrap_or_else(|_| "perl".to_string());
+        let mut script = String::from("use strict;\nuse warnings;\nmy @v;\n");
+        for s in &corpus {
+            script.push_str(&format!("push @v, {};\n", Render::perl_str(s)));
+        }
+        // hex dump so NULs and control characters compare byte-exactly
+        script.push_str("for my $i (0..$#v) { printf \"%d:%s\\n\", $i, unpack(\"H*\", $v[$i]); }\n");
+
+        let dir = std::env::temp_dir().join(format!("sh2_perl_str_esc_{}", std::process::id()));
+        std::fs::create_dir_all(&dir).expect("tmpdir");
+        let path = dir.join("literals.pl");
+        std::fs::write(&path, script.as_bytes()).expect("write script");
+        let out = std::process::Command::new(&perl)
+            .arg(&path)
+            .output()
+            .unwrap_or_else(|e| {
+                panic!("escaping test needs a Perl interpreter ({perl}: {e}); set PERL_BIN")
+            });
+        let stderr = String::from_utf8_lossy(&out.stderr);
+        assert!(out.status.success(), "{perl} failed: {stderr}");
+
+        let got = String::from_utf8_lossy(&out.stdout);
+        let lines: Vec<&str> = got.lines().collect();
+        assert_eq!(
+            lines.len(),
+            corpus.len(),
+            "{perl} printed {} lines for {} literals: {got}",
+            lines.len(),
+            corpus.len()
+        );
+        let mut bad: Vec<String> = Vec::new();
+        for (i, s) in corpus.iter().enumerate() {
+            let mut parts = lines[i].splitn(2, ':');
+            let idx: usize = parts.next().expect("index").parse().expect("index");
+            let val = parts.next().expect("hex");
+            if idx != i || val != hex(s.as_bytes()) {
+                bad.push(format!(
+                    "{s:?} emitted as {} evaluated back to {} (want {})",
+                    Render::perl_str(s),
+                    val,
+                    hex(s.as_bytes())
+                ));
+            }
+        }
+        assert!(
+            bad.is_empty(),
+            "{} of {} literals do not round-trip through perl:\n{}",
+            bad.len(),
+            corpus.len(),
+            bad.join("\n")
+        );
+    }
+
+    /// The proof above is only meaningful if the harness can SEE the bug it
+    /// prevents: wrapping the same text in quotes WITHOUT escaping must fail
+    /// to round-trip. This is the model's `dollar_is_load_bearing` control,
+    /// run against the real interpreter.
+    #[test]
+    fn naive_wrapping_is_detected() {
+        let s = "${x}";
+        let naive = format!("\"{s}\"");
+        assert_ne!(
+            naive,
+            Render::perl_str(s),
+            "the shipped escaper must not emit the naive form"
+        );
+        let script = format!(
+            "use strict;\nmy $x = 'ZZ';\n\
+             my $naive = {naive};\n\
+             my $shipped = {};\n\
+             printf \"%s|%s\\n\", $naive, $shipped;\n",
+            Render::perl_str(s)
+        );
+        let perl = std::env::var("PERL_BIN").unwrap_or_else(|_| "perl".to_string());
+        let dir = std::env::temp_dir().join(format!("sh2_perl_str_naive_{}", std::process::id()));
+        std::fs::create_dir_all(&dir).expect("tmpdir");
+        let path = dir.join("naive.pl");
+        std::fs::write(&path, script.as_bytes()).expect("write script");
+        let out = std::process::Command::new(&perl)
+            .arg(&path)
+            .output()
+            .unwrap_or_else(|e| {
+                panic!("escaping test needs a Perl interpreter ({perl}: {e}); set PERL_BIN")
+            });
+        assert!(out.status.success(), "{perl} failed: {}", String::from_utf8_lossy(&out.stderr));
+        assert_eq!(
+            String::from_utf8_lossy(&out.stdout).trim_end(),
+            "ZZ|${x}",
+            "naive wrapping must interpolate (ZZ); the shipped escaper must keep the dollar escaped"
+        );
+    }
+}
