@@ -1,6 +1,21 @@
 (* arith-identity: the fold rules, their guards, and the negative controls
-   that show each guard is load-bearing.  Build:  isabelle build -D . *)
+   that show each guard is load-bearing.  Build:  isabelle build -D .
+
+   The session carries THREE theory layers of one denotation, in dependency
+   order: ArithIdentity (the shell-int reading `ev`), ArithWidth (the
+   machine-width reading the C checked-i64 tier needs, importing
+   ArithIdentity), ArithDec (the byte-level decimal rendering the hand-rolled
+   itoas need, importing ArithWidth). A failure still names the theory.
+
+   The latter two sat in this directory UNTRACKED and in no ROOT until
+   2026-11-09, while C_UB_PROOF.md §14b cited `ArithDec.thy` as the
+   mechanization of the decimal renderers — a claim no build reached. They are
+   separate SESSIONS only if each gets its own directory; Isabelle rejects two
+   sessions sharing one ("Duplicate use of directory"), so they ride in this
+   session's `theories` list instead. *)
 session ArithIdentity = HOL +
   options [quick_and_dirty = false]
   theories
     ArithIdentity
+    ArithWidth
+    ArithDec

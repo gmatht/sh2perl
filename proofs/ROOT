@@ -25,3 +25,13 @@ session IntervalFloor in IntervalFloor = BigIntRange +
   options [quick_and_dirty = false]
   theories
     IntervalFloor
+
+(* Maskable — ATTEMPTED 2026-11-09, NOT REGISTERED. The theory is
+   proofs/Maskable/Maskable.thy, mirroring sh2perl/src/shir_passes/maskable.rs
+   over this session's BigIntRange (it imports BigIntRange.BigIntRange). It is
+   untracked WIP and does NOT build: `by` fails at line 251 (tactic), `show` at
+   621 ("Unbound schematic variable: ?case"), and `by` at 800 (an
+   \<open>\<le> a\<close> goal). Declaring the session here would turn the Isabelle
+   gate red for everyone, so it stays unregistered until the proof is
+   finished. C_UB_PROOF.md and PLAN.md cite it as prose, and this comment is
+   why: no ROOT reached it, and the file is not yet a proof. *)
