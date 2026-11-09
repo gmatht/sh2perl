@@ -144,6 +144,26 @@ fn site(
     values.insert(var.to_string(), (expr.clone(), top));
 }
 
+/// The shared subshell-write rule.
+///
+/// A subshell, a `&` background job, and a `$( … )` capture all run their
+/// body in a CHILD process: the writes never reach the parent's binding, and
+/// the child may run zero or many times. The premise copy-propagation leans on
+/// — "assigned exactly once in the whole program" — is therefore never true
+/// for a variable written inside one of them. Promoting each such variable to
+/// two recorded writes disqualifies the single-def fold; the value slot is
+/// cleared to the inert `false` literal for the same reason.
+fn promote_child_writes(
+    counts: &mut HashMap<String, usize>,
+    values: &mut HashMap<String, (IrExpr, bool)>,
+    child_writes: &HashMap<String, usize>,
+) {
+    for var in child_writes.keys() {
+        *counts.entry(var.clone()).or_insert(0) += 2;
+        values.insert(var.clone(), (IrExpr::Bool(false), false));
+    }
+}
+
 fn count_stmt_assigns(
     st: &IrStmt,
     counts: &mut HashMap<String, usize>,
@@ -244,7 +264,25 @@ fn count_stmt_assigns(
                 count_stmt_assigns(s, counts, values, false, dynamic);
             }
         }
-        IrStmt::Subshell(b) | IrStmt::Background(b) | IrStmt::Block(b) => {
+        // Child-process scopes (see `promote_child_writes`): the body's
+        // writes are counted in a scratch map and then promoted, so a single
+        // write inside a subshell can never look like a single static def.
+        IrStmt::Subshell(b) | IrStmt::Background(b) => {
+            let mut child_counts: HashMap<String, usize> = HashMap::new();
+            let mut child_values: HashMap<String, (IrExpr, bool)> = HashMap::new();
+            let mut child_dynamic = false;
+            for s in b {
+                count_stmt_assigns(
+                    s,
+                    &mut child_counts,
+                    &mut child_values,
+                    false,
+                    &mut child_dynamic,
+                );
+            }
+            promote_child_writes(counts, values, &child_counts);
+        }
+        IrStmt::Block(b) => {
             for s in b {
                 count_stmt_assigns(s, counts, values, false, dynamic);
             }
@@ -510,8 +548,22 @@ fn count_expr_assigns(
             count_expr_assigns(expr, counts, values, top, dynamic);
             count_expr_assigns(default, counts, values, top, dynamic);
         }
-        IrExpr::Index { key, .. } | IrExpr::Capture { expr: key, .. } => {
+        IrExpr::Index { key, .. } => {
             count_expr_assigns(key, counts, values, top, dynamic);
+        }
+        // `$( … )` is a subshell — same shared rule as the statement form.
+        IrExpr::Capture { expr, .. } => {
+            let mut child_counts: HashMap<String, usize> = HashMap::new();
+            let mut child_values: HashMap<String, (IrExpr, bool)> = HashMap::new();
+            let mut child_dynamic = false;
+            count_expr_assigns(
+                expr,
+                &mut child_counts,
+                &mut child_values,
+                false,
+                &mut child_dynamic,
+            );
+            promote_child_writes(counts, values, &child_counts);
         }
         IrExpr::Interpolate(parts) => {
             for p in parts {
@@ -657,6 +709,9 @@ fn fold_stmt(
         }
         // Subshell/Background may execute out of program order (a
         // background job can run before the def) — never fold inside.
+        // Refused: the body runs in a child (out of program order, zero
+        // or many times), and `promote_child_writes` has already made
+        // every variable it writes a multi-write — see that helper.
         IrStmt::Subshell(_) | IrStmt::Background(_) => false,
         IrStmt::Block(b) => b.iter_mut().any(|s| fold_stmt(s, defs, resolved, foldable)),
         _ => false,
@@ -721,10 +776,12 @@ fn fold_expr(
             c |= fold_expr(then, defs, resolved, foldable);
             c |= fold_expr(else_, defs, resolved, foldable);
         }
-        IrExpr::DefinedOr { expr, default, .. } => {
-            c |= fold_expr(expr, defs, resolved, foldable);
-            c |= fold_expr(default, defs, resolved, foldable);
-        }
+        // v136: the shared `definedor_hoist` transform binds the subject to
+        // an IR temp, so the subject is a plain `Var` by the time this pass
+        // runs. Folding into the node re-inlines a copy/const on BOTH sides
+        // of the emptiness test and undoes the single evaluation, so a
+        // `DefinedOr` is opaque here.
+        IrExpr::DefinedOr { .. } => {}
         IrExpr::Interpolate(parts) => {
             for p in parts.iter_mut() {
                 if let crate::ir::InterpPart::Expr(x) = p {
@@ -1078,5 +1135,62 @@ mod tests {
         ];
         assert!(!transform(&mut stmts));
         assert_eq!(stmts[2], expr_stmt(getvar("x")));
+    }
+
+    /// The shared subshell rule: a write inside a subshell runs in a CHILD, so
+    /// the variable is recorded as a multi-write (never a single static def).
+    #[test]
+    fn subshell_body_writes_are_multi_write() {
+        let stmts = vec![IrStmt::Subshell(vec![assign(
+            "x",
+            IrExpr::Str("a".to_string(), crate::ir::StrStyle::DoubleQuoted),
+        )])];
+        let mut counts = HashMap::new();
+        let mut values = HashMap::new();
+        let mut dynamic = false;
+        count_assigns(&stmts, &mut counts, &mut values, &mut dynamic);
+        assert_eq!(
+            counts.get("x").copied().unwrap_or(0),
+            2,
+            "a subshell write must count as a multi-write"
+        );
+    }
+
+    /// `$( … )` is a child process too: same rule.
+    #[test]
+    fn capture_body_writes_are_multi_write() {
+        let stmts = vec![IrStmt::Expr(IrExpr::Capture {
+            expr: Box::new(IrExpr::Arrow(vec![assign(
+                "x",
+                IrExpr::Str("a".to_string(), crate::ir::StrStyle::DoubleQuoted),
+            )])),
+            native: false,
+        })];
+        let mut counts = HashMap::new();
+        let mut values = HashMap::new();
+        let mut dynamic = false;
+        count_assigns(&stmts, &mut counts, &mut values, &mut dynamic);
+        assert_eq!(
+            counts.get("x").copied().unwrap_or(0),
+            2,
+            "a capture's write must count as a multi-write"
+        );
+    }
+
+    /// A plain block is NOT a child process: its single write still folds.
+    #[test]
+    fn block_body_write_is_still_single_def() {
+        let stmts = vec![
+            IrStmt::Block(vec![assign(
+                "x",
+                IrExpr::Str("a".to_string(), crate::ir::StrStyle::DoubleQuoted),
+            )]),
+            IrStmt::Expr(getvar("x")),
+        ];
+        let mut counts = HashMap::new();
+        let mut values = HashMap::new();
+        let mut dynamic = false;
+        count_assigns(&stmts, &mut counts, &mut values, &mut dynamic);
+        assert_eq!(counts.get("x").copied().unwrap_or(0), 1);
     }
 }
