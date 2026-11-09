@@ -44,7 +44,7 @@
 use std::collections::HashMap;
 use std::sync::Mutex;
 
-use crate::ir::{AssignTarget, InterpPart, IrExpr, IrStmt, StrStyle};
+use crate::ir::{ArithAst, AssignTarget, InterpPart, IrExpr, IrStmt, StrStyle};
 
 #[derive(Debug, Clone, PartialEq)]
 pub struct Accumulator {
@@ -180,12 +180,7 @@ fn self_append_vars(body: &[IrStmt]) -> Vec<String> {
                         }
                     }
                 }
-                IrStmt::If {
-                    then,
-                    elsifs,
-                    else_,
-                    ..
-                } => {
+                IrStmt::If { then, elsifs, else_, .. } => {
                     if !visit(then, writes, bad) {
                         return false;
                     }
@@ -209,7 +204,13 @@ fn self_append_vars(body: &[IrStmt]) -> Vec<String> {
                 | IrStmt::Warn { .. }
                 | IrStmt::Return(_)
                 | IrStmt::Exit(_) => {}
-                _ => return false, // unknown write surface — refuse
+                // `continue` SKIPS the rest of the iteration: it is not a
+                // write surface, so it must not refuse the body.
+                IrStmt::Continue => {}
+                // Everything else can write state this walk cannot name —
+                // `((v++))`/`((v = …))`, `read v`, `printf -v v`, `unset v`,
+                // function calls, `eval` — so it refuses the whole body.
+                _ => return false,
             }
         }
         true
@@ -426,48 +427,155 @@ fn read_walk(st: &IrStmt, var: &str, found: &mut bool) {
     if *found {
         return;
     }
+    // EVERY statement list is visited, so a read cannot hide behind a block,
+    // a subshell, a background job, a pipeline stage, a redirect region, a
+    // case clause or a function body. No wildcard arm: a new `IrStmt` form is
+    // a compile error here, not a silently invisible read.
+    let mut lists: Vec<&Vec<IrStmt>> = Vec::new();
     match st {
         IrStmt::Output { value, .. } => expr_read_walk(value, var, found),
-        IrStmt::Assign { expr, .. } => expr_read_walk(expr, var, found),
+        IrStmt::WriteFile { path, content, .. } => {
+            expr_read_walk(path, var, found);
+            expr_read_walk(content, var, found);
+        }
+        IrStmt::Assign { targets, expr, .. } => {
+            for t in targets {
+                for i in &t.indices {
+                    expr_read_walk(i, var, found);
+                }
+            }
+            expr_read_walk(expr, var, found);
+        }
+        IrStmt::Declare { init, .. } => {
+            if let Some(i) = init {
+                expr_read_walk(i, var, found);
+            }
+        }
+        IrStmt::DeclareArray { elements, .. } => {
+            for e in elements {
+                expr_read_walk(e, var, found);
+            }
+        }
+        IrStmt::If { cond, then, elsifs, else_, .. } => {
+            expr_read_walk(cond, var, found);
+            for (c, b) in elsifs {
+                expr_read_walk(c, var, found);
+                lists.push(b);
+            }
+            lists.push(then);
+            lists.push(else_);
+        }
         IrStmt::Exec { cmd, args, .. } => {
             expr_read_walk(cmd, var, found);
             for a in args {
                 expr_read_walk(a, var, found);
             }
         }
-        IrStmt::WriteFile { path, content, .. } => {
-            expr_read_walk(path, var, found);
-            expr_read_walk(content, var, found);
-        }
-        IrStmt::If { cond, then, elsifs, else_, .. } => {
-            expr_read_walk(cond, var, found);
-            for s in then {
-                read_walk(s, var, found);
-            }
-            for (c, b) in elsifs {
-                expr_read_walk(c, var, found);
-                for s in b {
-                    read_walk(s, var, found);
-                }
-            }
-            for s in else_ {
-                read_walk(s, var, found);
-            }
-        }
         IrStmt::While { cond, body } => {
             expr_read_walk(cond, var, found);
-            for s in body {
-                read_walk(s, var, found);
-            }
+            lists.push(body);
         }
         IrStmt::For { iter, body, .. } => {
             expr_read_walk(iter, var, found);
-            for s in body {
+            lists.push(body);
+        }
+        IrStmt::ForInit { init, cond, step, body } => {
+            for s in init.iter().chain(step.iter()) {
                 read_walk(s, var, found);
             }
+            expr_read_walk(cond, var, found);
+            lists.push(body);
         }
+        IrStmt::DoWhile { body, cond, .. } => {
+            expr_read_walk(cond, var, found);
+            lists.push(body);
+        }
+        IrStmt::Die { expr, .. } | IrStmt::Warn { expr, .. } => expr_read_walk(expr, var, found),
+        IrStmt::Pipeline { stages, .. } => {
+            for stage in stages {
+                lists.push(stage);
+            }
+        }
+        IrStmt::Return(e) | IrStmt::Exit(e) => {
+            if let Some(x) = e {
+                expr_read_walk(x, var, found);
+            }
+        }
+        IrStmt::SetChildError(e) => expr_read_walk(e, var, found),
+        IrStmt::Case { discriminant, clauses } => {
+            expr_read_walk(discriminant, var, found);
+            for c in clauses {
+                for p in &c.patterns {
+                    if text_mentions_var(p, var) {
+                        *found = true;
+                    }
+                }
+                lists.push(&c.body);
+            }
+        }
+        IrStmt::Redirect { inner, redirects } => {
+            for r in redirects {
+                expr_read_walk(&r.target, var, found);
+            }
+            lists.push(inner);
+        }
+        IrStmt::Function { body, named_blocks, .. } => {
+            lists.push(body);
+            for (_, b) in named_blocks {
+                lists.push(b);
+            }
+        }
+        IrStmt::Try { body, excepts, else_body, finally_body } => {
+            for e in excepts {
+                if let Some(m) = &e.match_expr {
+                    expr_read_walk(m, var, found);
+                }
+                lists.push(&e.body);
+            }
+            lists.push(body);
+            lists.push(else_body);
+            lists.push(finally_body);
+        }
+        IrStmt::Select { clauses } => {
+            for c in clauses {
+                if let Some(ch) = &c.ch {
+                    expr_read_walk(ch, var, found);
+                }
+                if let Some(v) = &c.value {
+                    expr_read_walk(v, var, found);
+                }
+                lists.push(&c.body);
+            }
+        }
+        IrStmt::Asm { outputs, inputs, .. } => {
+            for (_, e) in outputs.iter().chain(inputs.iter()) {
+                expr_read_walk(e, var, found);
+            }
+        }
+        IrStmt::Shaderize { var: v, body, .. } => {
+            if v == var {
+                *found = true;
+            }
+            expr_read_walk(&IrExpr::Arrow(body.clone()), var, found);
+        }
+        IrStmt::Block(b) | IrStmt::Subshell(b) | IrStmt::Background(b) => lists.push(b),
         IrStmt::Expr(e) => expr_read_walk(e, var, found),
-        _ => {}
+        IrStmt::RawText(t) => {
+            if text_mentions_var(t, var) {
+                *found = true;
+            }
+        }
+        IrStmt::Continue
+        | IrStmt::Break
+        | IrStmt::Label(_)
+        | IrStmt::Goto(_)
+        | IrStmt::Require(_) => {}
+        IrStmt::Ext(_) => *found = true,
+    }
+    for l in lists {
+        for s in l {
+            read_walk(s, var, found);
+        }
     }
 }
 
@@ -493,13 +601,64 @@ fn text_mentions_var(s: &str, var: &str) -> bool {
     false
 }
 
+/// The arithmetic reader: `ArithAst::Var` is a read, `Index`'s key is a read,
+/// and `Assign`/`IncDec` name their target as data (a mention). Pre-fix this
+/// arm did not exist at all, so `n=$(( tsv + 0 ))` was invisible to the
+/// verdict — BUGS_FOUND.md #11.
+fn arith_read_walk(a: &ArithAst, var: &str, found: &mut bool) {
+    if *found {
+        return;
+    }
+    match a {
+        ArithAst::Num(_) | ArithAst::Sizeof(_) => {}
+        ArithAst::Var(v) | ArithAst::Ident(v) => {
+            if v == var {
+                *found = true;
+            }
+        }
+        ArithAst::Index { var: v, key } => {
+            if v == var {
+                *found = true;
+            }
+            arith_read_walk(key, var, found);
+        }
+        ArithAst::Bin { lhs, rhs, .. } => {
+            arith_read_walk(lhs, var, found);
+            arith_read_walk(rhs, var, found);
+        }
+        ArithAst::Un { arg, .. } | ArithAst::Cast { arg, .. } => arith_read_walk(arg, var, found),
+        ArithAst::Cond { test, then, else_ } => {
+            arith_read_walk(test, var, found);
+            arith_read_walk(then, var, found);
+            arith_read_walk(else_, var, found);
+        }
+        ArithAst::Assign { var: v, rhs, .. } => {
+            if v == var {
+                *found = true;
+            }
+            arith_read_walk(rhs, var, found);
+        }
+        ArithAst::IncDec { var: v, .. } => {
+            if v == var {
+                *found = true;
+            }
+        }
+    }
+}
+
 fn expr_read_walk(e: &IrExpr, var: &str, found: &mut bool) {
     if *found {
         return;
     }
     match e {
-        IrExpr::Str(s, _) => {
+        IrExpr::Int(_) | IrExpr::Bool(_) | IrExpr::Range { .. } | IrExpr::Json(_) => {}
+        IrExpr::Str(s, _) | IrExpr::RawExpr(s) => {
             if text_mentions_var(s, var) {
+                *found = true;
+            }
+        }
+        IrExpr::Regex { pattern, flags } => {
+            if text_mentions_var(pattern, var) || text_mentions_var(flags, var) {
                 *found = true;
             }
         }
@@ -555,6 +714,12 @@ fn expr_read_walk(e: &IrExpr, var: &str, found: &mut bool) {
                 expr_read_walk(a, var, found);
             }
         }
+        IrExpr::Capture { expr, .. } => expr_read_walk(expr, var, found),
+        IrExpr::Arrow(stmts) | IrExpr::Lambda { body: stmts, .. } => {
+            for s in stmts {
+                read_walk(s, var, found);
+            }
+        }
         IrExpr::Call { func, args } => {
             // `getVar("v")` / `param("", "v")` — the name is a STRING arg,
             // so the operand walk below cannot see the reference.
@@ -568,7 +733,17 @@ fn expr_read_walk(e: &IrExpr, var: &str, found: &mut bool) {
                 expr_read_walk(a, var, found);
             }
         }
-        _ => {}
+        IrExpr::Arith(a) => arith_read_walk(a, var, found),
+        IrExpr::ArrayComp { iter, elem, cond, .. } => {
+            expr_read_walk(iter, var, found);
+            expr_read_walk(elem, var, found);
+            if let Some(c) = cond {
+                expr_read_walk(c, var, found);
+            }
+        }
+        // An extension node's payload is outside the model — refuse rather
+        // than assume it is inert.
+        IrExpr::Ext(_) => *found = true,
     }
 }
 
@@ -920,6 +1095,129 @@ mod tests {
             }
             _ => false,
         })
+    }
+
+    /// The verdict's read walks used to have `_ => {}` arms: no
+    /// `IrExpr::Arith` arm, so `n=$(( tsv + 0 ))` was invisible, and no
+    /// Redirect/Block/Subshell/Pipeline/Function/Case arms. A mid-loop read
+    /// of the accumulator means the join-at-read lowering would change what
+    /// the rest of the body sees, so the verdict must refuse.
+    #[test]
+    fn an_arith_read_of_the_accumulator_refuses_the_verdict() {
+        let body = vec![
+            assign(
+                "tsv",
+                IrExpr::Interpolate(vec![
+                    InterpPart::Expr(Box::new(get("tsv"))),
+                    InterpPart::Expr(Box::new(get("x"))),
+                ]),
+            ),
+            assign("n", IrExpr::Arith(Box::new(ArithAst::Var("tsv".into())))),
+        ];
+        assert!(body_reads_var_nonleading(&body, "tsv"), "arith read is a mid-loop read");
+        let mut stmts = vec![
+            assign("tsv", IrExpr::Str(String::new(), StrStyle::DoubleQuoted)),
+            IrStmt::While { cond: IrExpr::Bool(true), body },
+            echo("tsv"),
+        ];
+        transform(&mut stmts);
+        assert!(accumulators().is_empty(), "the arith read must refuse the verdict");
+    }
+
+    /// The control: the same program WITHOUT the arith read still fires, so
+    /// the test above fails for the right reason.
+    #[test]
+    fn the_same_loop_without_the_arith_read_still_fires() {
+        let body = vec![assign(
+            "tsv",
+            IrExpr::Interpolate(vec![
+                InterpPart::Expr(Box::new(get("tsv"))),
+                InterpPart::Expr(Box::new(get("x"))),
+            ]),
+        )];
+        let mut stmts = vec![
+            assign("tsv", IrExpr::Str(String::new(), StrStyle::DoubleQuoted)),
+            IrStmt::While { cond: IrExpr::Bool(true), body },
+            echo("tsv"),
+        ];
+        transform(&mut stmts);
+        assert_eq!(accumulators().len(), 1, "the control program is an accumulator");
+    }
+
+    /// `(( tsv++ ))` is a WRITE through the arith path, so the body's write
+    /// surface is no longer "self-appends only".
+    #[test]
+    fn an_arith_write_through_incdec_refuses_the_body() {
+        let body = vec![
+            assign(
+                "tsv",
+                IrExpr::Interpolate(vec![
+                    InterpPart::Expr(Box::new(get("tsv"))),
+                    InterpPart::Expr(Box::new(get("x"))),
+                ]),
+            ),
+            IrStmt::Expr(IrExpr::Arith(Box::new(ArithAst::IncDec {
+                var: "tsv".into(),
+                delta: 1,
+                prefix: false,
+            }))),
+        ];
+        assert!(self_append_vars(&body).is_empty(), "((tsv++)) is a second write");
+    }
+
+    /// A read hidden in a redirect target, a subshell, a block, a background
+    /// job, a pipeline stage, a case clause/pattern, a function body or a
+    /// for-body is still a read.
+    #[test]
+    fn carriers_do_not_hide_reads() {
+        let carriers: Vec<IrStmt> = vec![
+            IrStmt::Redirect {
+                inner: vec![echo("tsv")],
+                redirects: vec![crate::ir::IrRedirect {
+                    fd: Some(1),
+                    mode: "w".into(),
+                    target: get("tsv"),
+                    interpolate: false,
+                }],
+            },
+            IrStmt::Subshell(vec![echo("tsv")]),
+            IrStmt::Block(vec![echo("tsv")]),
+            IrStmt::Background(vec![echo("tsv")]),
+            IrStmt::Pipeline { stages: vec![vec![echo("tsv")]], last_output: None, capture: None, cmd_str: None },
+            IrStmt::Function { name: "f".into(), params: vec![], body: vec![echo("tsv")], named_blocks: vec![] },
+            IrStmt::For { var: "i".into(), iter: IrExpr::Int(1), body: vec![echo("tsv")] },
+            IrStmt::Case {
+                discriminant: IrExpr::Str("a".into(), StrStyle::DoubleQuoted),
+                clauses: vec![crate::ir::IrCaseClause { patterns: vec!["$tsv".into()], body: vec![] }],
+            },
+        ];
+        for c in &carriers {
+            let mut found = false;
+            read_walk(c, "tsv", &mut found);
+            assert!(found, "carrier hid the read: {c:?}");
+        }
+    }
+
+    /// `continue` skips the rest of the iteration; it must not refuse the
+    /// body (it is not a write surface).
+    #[test]
+    fn continue_does_not_refuse_the_body() {
+        let body = vec![
+            IrStmt::If {
+                cond: IrExpr::Bool(true),
+                then: vec![IrStmt::Continue],
+                elsifs: vec![],
+                else_: vec![],
+            },
+            assign(
+                "tsv",
+                IrExpr::Interpolate(vec![
+                    InterpPart::Expr(Box::new(get("tsv"))),
+                    InterpPart::Expr(Box::new(get("x"))),
+                ]),
+            ),
+        ];
+        assert_eq!(self_append_vars(&body), vec!["tsv".to_string()]);
     }
 
     /// The canonical shape lowers to `setArray` (chunk init) + a body
