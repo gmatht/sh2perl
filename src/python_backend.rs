@@ -3494,6 +3494,25 @@ impl Render {
         if rest.is_empty() {
             return None;
         }
+        // `printf … | …`: the printf lift already computed the exact bytes
+        // the head writes, and `newline` is printf's own verdict (it emits
+        // none unless the format says so) — feed value+newline as-is
+        // instead of the echo path's forced `chr(10)`.
+        if let [IrStmt::Output {
+            value,
+            newline,
+            target: None,
+        }] = head.as_slice()
+        {
+            let rest_text = self.pipeline_rest_text(rest)?;
+            let v = self.expr(value);
+            let feed = if *newline {
+                format!("({v} + chr(10))")
+            } else {
+                format!("({v})")
+            };
+            return Some((feed, rest_text));
+        }
         let [IrStmt::Expr(IrExpr::Call { func, args })] = head.as_slice() else {
             return None;
         };
@@ -3516,26 +3535,34 @@ impl Render {
             Some(IrExpr::Str(s, _)) if s == "-n" || s == "-e" || s == "-E" => &eitems[1..],
             _ => eitems,
         };
-        let mut rest_parts = Vec::new();
+        let rest_text = self.pipeline_rest_text(rest)?;
+        let vals: Vec<String> = eitems
+            .iter()
+            .map(|i| format!("str({})", self.expr(i)))
+            .collect();
+        Some((format!("({} + chr(10))", vals.join(" + \" \" + ")), rest_text))
+    }
+
+    /// Shell text for a pipeline's stages after the native-rendered head,
+    /// joined with `|`; None when any stage is not shell-textable.
+    fn pipeline_rest_text(&self, rest: &[Vec<IrStmt>]) -> Option<String> {
+        let mut parts = Vec::new();
         for stage in rest {
-            if let [IrStmt::Expr(IrExpr::Call { func: f2, args: a2 })] = stage.as_slice() {
-                if f2 == "exec" || f2 == "builtin" {
-                    if let Some(argv) = self.shell_argv(a2) {
-                        rest_parts.push(argv.join(" "));
+            if let [IrStmt::Expr(IrExpr::Call { func, args })] = stage.as_slice() {
+                if func == "exec" || func == "builtin" {
+                    if let Some(argv) = self.shell_argv(args) {
+                        parts.push(argv.join(" "));
                         continue;
                     }
                 }
             }
             return None;
         }
-        if rest_parts.is_empty() {
-            return None;
+        if parts.is_empty() {
+            None
+        } else {
+            Some(parts.join(" | "))
         }
-        let vals: Vec<String> = eitems
-            .iter()
-            .map(|i| format!("str({})", self.expr(i)))
-            .collect();
-        Some((vals.join(" + \" \" + "), rest_parts.join(" | ")))
     }
 
     /// Run a body with copy semantics: snapshot the body's own written
@@ -3778,13 +3805,12 @@ impl Render {
             })
             .collect::<Option<Vec<_>>>();
         if let Some(stage_vecs) = stage_vecs {
-            if let Some((vals, rest)) = self.pipeline_head_value(&stage_vecs) {
+            if let Some((feed, rest)) = self.pipeline_head_value(&stage_vecs) {
                 self.need_subprocess = true;
                 let (env, pos) = (self.bash_env(), self.bash_pos());
                 return Some(format!(
-                    "__sh_bash_in({}, {pos}, {env}, ({} + chr(10)))",
-                    Self::py_str(&rest),
-                    vals
+                    "__sh_bash_in({}, {pos}, {env}, {feed})",
+                    Self::py_str(&rest)
                 ));
             }
         }
