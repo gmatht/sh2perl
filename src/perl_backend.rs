@@ -629,9 +629,11 @@ impl Render {
                 self.expr(then),
                 self.expr(else_)
             ),
+            // v136: the subject is evaluated ONCE into a lexical temp. The
+            // old three-slot format called `self.expr(expr)` twice, so a
+            // `$(cmd)` subject ran twice in the generated Perl.
             IrExpr::DefinedOr { expr, default } => format!(
-                "((({} // \"\") ne \"\") ? {} : {})",
-                self.expr(expr),
+                "((sub {{ my $__sh2_dor_v = {}; (defined($__sh2_dor_v) && $__sh2_dor_v ne \"\") ? $__sh2_dor_v : {} }})->())",
                 self.expr(expr),
                 self.expr(default)
             ),

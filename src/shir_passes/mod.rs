@@ -95,6 +95,7 @@ pub mod transform;
 pub mod interval; // generic integer intervals (bash wrapping + Python floor-mod)
 pub mod bigint_range; // exact unbounded intervals for the Python reading (past i128, no wrapping)
 pub mod used_before_decl; // use-before-declaration lint (the "definitely uninitialized" dataflow)
+pub mod definedor_hoist; // v136: bind a `DefinedOr` subject to an IR temp so it is evaluated once
 
 pub use context::PassContext;
 pub use metric::{CalleeCount, Metric};
@@ -361,6 +362,10 @@ impl Pipeline {
                 // labeled-break families); shell has no goto, so this runs
                 // for EVERY backend via the shared pipeline.
                 Box::new(restructure::RestructureGoto),
+                // v136: `x=${a:-b}` -> `t=a; x=${t:-b}` so a subject with a
+                // side effect runs ONCE. Last, so no other transform has to
+                // reason about the extra temp binding it introduces.
+                Box::new(definedor_hoist::DefinedOrHoist),
             ],
             lifts: vec![
                 // The grep-to-case lift: test-position `echo "$x" | grep PAT`

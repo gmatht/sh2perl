@@ -179,7 +179,14 @@ impl JavaRender {
             IrExpr::Ternary { cond, then, else_ } => {
                 self.scan_expr(*cond)?; self.scan_expr(*then)?; self.scan_expr(*else_)?;
             }
-            IrExpr::DefinedOr { expr, default } => { self.scan_expr(*expr)?; self.scan_expr(*default)?; }
+            IrExpr::DefinedOr { expr, default } => {
+                // v136: the helper must be requested during the SCAN pass —
+                // the helper block is emitted before the body is rendered, so
+                // a request made while rendering `expr_str` lands too late.
+                self.helper("definedor");
+                self.scan_expr(*expr)?;
+                self.scan_expr(*default)?;
+            }
             IrExpr::MethodCall { obj, args, .. } => { self.scan_expr(*obj)?; for a in args { self.scan_expr(a)?; } }
             IrExpr::Index { key, .. } => { self.scan_expr(*key)?; }
             IrExpr::Arith(a) => {
@@ -329,6 +336,10 @@ impl JavaRender {
             "dirname","div","pow","ftype","readln","split","aset","aget",
             "writefile","outswap","errswap","inswap","snapshot","regex",
             "contains","quote","declared","errifempty","regexm","eq","testrc",
+            // v136 DefinedOr (single evaluation, lazy default) — the
+            // helper block is emitted from THIS list, not from the
+            // `helpers` set (that set is discarded above).
+            "definedor",
         "aslice",
         // The Ext-node helpers (text_ops' rich nodes; see
         // src/render_ext_expr/handlers/all_nodes.rs): each implements ONE
@@ -2113,10 +2124,16 @@ impl JavaRender {
                 let t = self.cond_bool(cond)?;
                 Ok(format!("({t} ? {} : {})", self.expr_str(then)?, self.expr_str(else_)?))
             }
+            // v136: single evaluation. The old form spelled the subject text
+            // out twice (and left a stray paren), so a subject carrying a
+            // call ran twice and the expression did not parse. The helper
+            // takes both sides as lazy suppliers, which keeps bash's rule
+            // that the default is evaluated ONLY when the subject is empty.
             IrExpr::DefinedOr { expr, default } => {
                 let e = self.expr_str(expr)?;
                 let d = self.expr_str(default)?;
-                Ok(format!("({e}.isEmpty() ? {d} : {e}))"))
+                self.helper("definedor");
+                Ok(format!("shDefinedOr(() -> ({e}), () -> ({d}))"))
             }
             IrExpr::MethodCall { obj, method, args, .. } => {
                 let r = self.expr_str(obj)?;
@@ -3051,6 +3068,13 @@ impl crate::render_ext_expr::ChildExprRenderer for JavaChild<'_> {
 
 fn helper_src(name: &str) -> Option<&'static str> {
     Some(match name {
+        // v136 DefinedOr: the subject is read ONCE; the default is a
+        // supplier so `${a:-$(cmd)}` only runs `cmd` when `a` is empty.
+        "definedor" => r#"    static String shDefinedOr(java.util.function.Supplier<String> subject, java.util.function.Supplier<String> dflt) {
+        String v = subject.get();
+        return v.isEmpty() ? dflt.get() : v;
+    }
+"#,
         "env" => r#"    static String shCwd() { return __SH_CWD; }
     static String shAbs(String p) {
         if (p.isEmpty() || p.startsWith("/")) return p;
@@ -3713,6 +3737,13 @@ fn helper_src(name: &str) -> Option<&'static str> {
         return hay.contains(needle) ? 1L : 0L;
     }
 "#,
+        // v136 DefinedOr: the subject is read ONCE; the default is a
+        // supplier so `${a:-$(cmd)}` only runs `cmd` when `a` is empty.
+        "definedor" => r#"    static String shDefinedOr(java.util.function.Supplier<String> subject, java.util.function.Supplier<String> dflt) {
+        String v = subject.get();
+        return v.isEmpty() ? dflt.get() : v;
+    }
+"#,
         _ => "",
     })
 }
@@ -4079,8 +4110,10 @@ mod case_lowering_render_tests {
 
 /// Regression pins for two renderer gaps that the cross-product triage
 /// filed as `FAIL-BACKEND` (the A1 was fine; the java arm dropped it).
+#[cfg(test)]
 mod decl_and_pipeline_render_tests {
     use super::*;
+    
 
     /// zsh-sh-go `t76_typeset_case.zsh`: `typeset -l low="HELLO"` rendered
     /// as a plain assignment, so java printed `HELLO`/`world` where zsh

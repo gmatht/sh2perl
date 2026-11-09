@@ -13365,9 +13365,16 @@ pub(crate) fn ir_expr_to_perl(expr: &IrExpr) -> String {
         }
 
         IrExpr::DefinedOr { expr, default } => {
+            // v136: bash `${a:-b}` is "unset OR EMPTY -> b", with `a`
+            // expanded exactly ONCE. Perl's `//` tests undef only (a
+            // set-but-empty `$a` wrongly won) and this arm interpolated
+            // the subject text twice, so bind it to a lexical temp in an
+            // immediately-invoked sub.
             let e = ir_expr_to_perl(expr);
             let d = ir_expr_to_perl(default);
-            format!("({} // {})", e, d)
+            format!(
+                "((sub {{ my $__sh2_dor_v = {e}; (defined($__sh2_dor_v) && $__sh2_dor_v ne \"\") ? $__sh2_dor_v : ({d}) }})->())"
+            )
         }
 
         IrExpr::Interpolate(parts) => {

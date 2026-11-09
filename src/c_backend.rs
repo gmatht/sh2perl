@@ -15985,6 +15985,21 @@ impl Render {
                 };
                 self.array_index_read(var, &k)
             }
+            // v136: the subject is evaluated ONCE into a C temp, and the
+            // default is evaluated ONLY when that temp is empty (bash
+            // `${a:-b}`) — a plain `?:` over two spelled-out copies of the
+            // subject would both double-evaluate it and run the default
+            // unconditionally. GNU statement expressions are already this
+            // backend's idiom for value-producing temporaries (see the
+            // mulhi/divmod helper text).
+            IrExpr::DefinedOr { expr, default } => {
+                let subj = self.expr(expr);
+                let dflt = self.expr(default);
+                self.need_sc_guard = true;
+                format!(
+                    "({{ char *__sh2_dor_t = _sh_sc({subj}); (__sh2_dor_t && *__sh2_dor_t) ? __sh2_dor_t : ({dflt}); }})"
+                )
+            }
             other => {
                 self.mark_todo(&format!("expr {:?}", other));
                 "0".into()
