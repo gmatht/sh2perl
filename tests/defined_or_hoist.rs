@@ -119,3 +119,41 @@ fn java_renders_the_lazy_helper() {
         "the default must stay lazy (a supplier), got:\n{out}"
     );
 }
+
+/// The A1 ingress is what actually reaches these arms — the shell frontend
+/// lowers `${a:-b}` textually, so no corpus example can produce a
+/// `DefinedOr`. Every assertion above starts from a hand-built `IrExpr`; this
+/// one starts from A1 JSON, so a drift in the ingress (the `sigil`/`indices`
+/// shape, a renamed node key) or in `Pipeline::canonical`'s registration fails
+/// here instead of silently leaving three renderers untested by any gate.
+#[test]
+fn a1_json_reaches_the_renderer_arms() {
+    let json = debashl::shir_json::shir_to_shir_json(&sample());
+    let ingested = debashl::shir_json_in::shir_json_to_ir(&json)
+        .expect("the A1 writer's own output must re-ingress");
+
+    // The ingress really produced the node (not, say, a refused/unknown expr).
+    match &ingested.stmts[0] {
+        IrStmt::Assign { expr: IrExpr::DefinedOr { .. }, .. } => {}
+        other => panic!("the A1 ingress did not decode the DefinedOr: {other:?}"),
+    }
+
+    let (_ctx, p, _m) = Pipeline::canonical().run(&ingested);
+    assert_eq!(p.stmts.len(), 2, "canonical must hoist the INGESTED DefinedOr");
+    match &p.stmts[1] {
+        IrStmt::Assign { expr: IrExpr::DefinedOr { expr, .. }, .. } => {
+            assert_eq!(**expr, IrExpr::Var("__sh2_dor_0".to_string(), None));
+        }
+        other => panic!("expected DefinedOr over the hoist temp, got {other:?}"),
+    }
+
+    let perl = debashl::ir::shir_to_perl(&p);
+    assert!(perl.contains("__sh2_dor_v"), "perl temp missing:\n{perl}");
+    let c = debashl::c_backend::shir_to_c(&p);
+    assert!(c.contains("__sh2_dor_t"), "c temp missing:\n{c}");
+    let java = debashl::java_backend::shir_to_java(&p).expect("java render");
+    assert!(
+        java.matches("shDefinedOr").count() >= 2,
+        "java helper missing:\n{java}"
+    );
+}
