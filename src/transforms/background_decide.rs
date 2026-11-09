@@ -406,8 +406,15 @@ fn arith_reads(a: &crate::ir::ArithAst, reads: &mut HashSet<String>) {
 // prereqs: [escape-classes — the parent-scope read test is the weak
 //   form; the shared escape verdict sharpens it]
 // invariant: analysis-only; no structural mutation. Verdicts are
-//   keyed by statement POINTER — the renderers must consume them in
-//   the SAME compilation the transform ran (same tree, no clone).
+//   keyed by the BODY TEXT (`body_key`), not by a statement pointer:
+//   `shir_to_rust` and friends render a CLONE of the program, so a
+//   pointer taken while the transform walked the original can never
+//   match inside the renderer (the first wiring attempt was inert for
+//   exactly that reason). A body the table does not hold is FORK —
+//   including when the transform never ran, which is the default a
+//   consumer gets from `is_thread_body`. Proof: VERUS.md /
+//   proofs/verus/background_decide.rs (`classify_thread_sound`,
+//   `route_thread_is_sound`, `unclassified_stays_fork`).
 // scope: offered to estree (owner — supersedes backgroundDecide), c,
 //   go, perl, sh
 // updates: none (first offer)

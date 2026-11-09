@@ -44,6 +44,35 @@
 //     x, prints 7; a worker with a fresh runtime sees x unset, prints
 //     nothing. The ordered rule rejects that body.
 //
+// The verdict itself (2026-11-09), i.e. the SHIPPED classifier rather than
+// the rule it approximates:
+//
+//   - `walk_ok_implies_intended` -- the bridge. `walk_self_contained` (the
+//     code that decides today) accepts only bodies the proved-sound rule
+//     accepts. Its post-set is dominated by the rule's (`walk_after` keeps
+//     straight-line binds only, because a branch may not run; the rule also
+//     keeps what both arms bind), which is exactly the monotonicity the
+//     `Seq` arm needs (`walk_ok_mono`).
+//   - `classify_thread_sound` -- END TO END over the shipped walk: a THREAD
+//     verdict implies the two routings print the same bytes.
+//   - `route_thread_is_sound` -- and over the shipped PREDICATE
+//     (`is_thread_body`, table-membership keyed by body text): a Thread route
+//     implies the same, given only that the table holds accepted bodies --
+//     which is `classify`'s insertion rule itself (`table_sound`).
+//   - `unclassified_stays_fork`, `absent_table_routes_fork` -- the REFUSAL
+//     direction: with no table (transform absent/cleared) or no entry for the
+//     body, the route is FORK. The verdict never guesses.
+//   - `side_effect_stays_fork` -- a body carrying an unmodelled observable (a
+//     file write, a control transfer) is never accepted, so it can never enter
+//     the table: refusal is by construction, not by luck.
+//
+// Coverage note, stated rather than implied: `is_thread_body` still has ZERO
+// call sites outside its own file, so these obligations make the verdict
+// usable and gateable -- a refutation turned into a sound decision -- but no
+// emitted program depends on it yet. That is the honest status of every
+// "offered" transform here, and the reason the wiring, not the proof, is the
+// remaining work.
+//
 // ## What is NOT proved
 //
 //   - concurrency: threads, races, the runtime's scheduling. The model
@@ -59,6 +88,14 @@
 //     the finding does not depend on the loop shape.
 //   - the pass's traversal/verdict cache (pointer-keyed HashSet); this is
 //     about the predicate, not the plumbing.
+//   - the KEY: `body_key` is the body's `Debug` text, and the model treats
+//     the body as its own key. The step "equal text => equal body" holds for
+//     these IR values (their `Debug` rendering is structural), but it is an
+//     assumption about `IrStmt`'s derived `Debug`, not a proved injectivity
+//     lemma. A body whose text collides with another's would share a verdict;
+//     the verdict is computed FROM the body, so a collision could only ever
+//     attribute one body's THREAD to a different-but-identically-rendered
+//     body -- i.e. to itself.
 use vstd::prelude::*;
 
 verus! {
@@ -472,6 +509,422 @@ proof fn shipped_check_is_unsound()
         reveal(witness);
         reveal_with_fuel(run, 5);
     }
+}
+
+// =====================================================================
+// THE VERDICT: from the shipped walk to the routing decision
+// =====================================================================
+//
+// Everything above proves the RULE sound. The shipped artifact is the pair
+// (`walk_self_contained`, `is_thread_body`), and `is_thread_body` had no
+// users outside its own file, so a green rule was the same shape
+// `interval.rs` shipped in: a proved decision nothing made. These
+// obligations connect the two, so the theorem is about the shipped
+// predicate and the shipped walk, not about a spec-shaped cousin of them.
+//
+// The chain, end to end:
+//   walk_ok(s, {})            -- the walk accepts the body
+//   => intended_ok(s, {})     -- `walk_ok_implies_intended` (the bridge)
+//   => as_fork == as_thread   -- `thread_equals_fork` (the sound rule)
+// and, on the refusal side:
+//   the table holds only accepted bodies, so a Thread route implies
+//   walk_ok; an absent table routes FORK; a side-effecting body is never
+//   accepted (so it can never be routed Thread).
+
+/// `walk_after`: the names the shipped walk reports bound after `s`.
+///
+/// Mirrors `walk_self_contained`'s MUTATION exactly: a straight-line
+/// assignment (or declaration) inserts; `If`/loops/`Block`-less control flow
+/// leave the set untouched, because the shipped code passes a CLONE into
+/// every branch and loop body (`a branch may not run, so nothing it assigns
+/// is defined afterwards`). That is stricter than `defined_after`, which
+/// keeps what both arms bind.
+pub open spec fn walk_after(s: S, d: Set<int>) -> Set<int>
+    decreases s,
+{
+    match s {
+        S::Assign(x, _) => d.insert(x),
+        S::Seq(a, b) => walk_after(*b, walk_after(*a, d)),
+        _ => d,
+    }
+}
+
+/// `walk_self_contained` / `stmt_self_contained`: the shipped ordered walk
+/// (every read must be of a name bound BEFORE it on that path; anything the
+/// walk does not model is refused).
+pub open spec fn walk_ok(s: S, d: Set<int>) -> bool
+    decreases s,
+{
+    match s {
+        S::Skip => true,
+        S::Assign(_, _) => true,          // the model's RHS is a literal
+        S::OutRead(x) => d.contains(x),
+        S::OutConst(_) => true,
+        S::WriteFile => false,            // the walk refuses every side effect
+        S::Exit => false,                 // ... and every control transfer
+        S::IfRead(x, a, b) => d.contains(x) && walk_ok(*a, d) && walk_ok(*b, d),
+        S::Seq(a, b) => walk_ok(*a, d) && walk_ok(*b, walk_after(*a, d)),
+    }
+}
+
+/// The walk never loses a binding: `d` survives any statement.
+pub open spec fn walk_keeps(s: S, d: Set<int>) -> bool {
+    d.subset_of(walk_after(s, d))
+}
+
+proof fn defined_after_extensive(s: S, d: Set<int>)
+    ensures
+        d.subset_of(defined_after(s, d)),
+    decreases s,
+{
+    match s {
+        S::IfRead(_, a, b) => {
+            defined_after_extensive(*a, d);
+            defined_after_extensive(*b, d);
+            assert forall|y: int| d.contains(y) implies defined_after(s, d).contains(y) by {
+                assert(defined_after(*a, d).contains(y));
+                assert(defined_after(*b, d).contains(y));
+            }
+        }
+        S::Seq(a, b) => {
+            defined_after_extensive(*a, d);
+            defined_after_extensive(*b, defined_after(*a, d));
+        }
+        _ => {}
+    }
+}
+
+proof fn defined_after_mono(s: S, small: Set<int>, big: Set<int>)
+    requires
+        small.subset_of(big),
+    ensures
+        defined_after(s, small).subset_of(defined_after(s, big)),
+    decreases s,
+{
+    match s {
+        S::Assign(_, _) => {
+            assert forall|y: int|
+                defined_after(s, small).contains(y) implies defined_after(s, big).contains(y) by {
+                if small.contains(y) {
+                } else {
+                }
+            }
+        }
+        S::IfRead(_, a, b) => {
+            defined_after_mono(*a, small, big);
+            defined_after_mono(*b, small, big);
+        }
+        S::Seq(a, b) => {
+            defined_after_mono(*a, small, big);
+            defined_after_mono(*b, defined_after(*a, small), defined_after(*a, big));
+        }
+        _ => {}
+    }
+}
+
+/// The shipped walk's post-set is dominated by the rule's: what the walk kept
+/// bound (straight-line only) the rule also keeps (it additionally allows a
+/// name both branches bind).
+pub open spec fn dominated(s: S, d: Set<int>) -> bool {
+    walk_after(s, d).subset_of(defined_after(s, d))
+}
+
+/// `walk_after` is monotone in the incoming set (bindings only ever add).
+proof fn walk_after_mono(s: S, d1: Set<int>, d2: Set<int>)
+    requires
+        d1.subset_of(d2),
+    ensures
+        walk_after(s, d1).subset_of(walk_after(s, d2)),
+    decreases s,
+{
+    match s {
+        S::Assign(_, _) => {
+            assert forall|y: int| walk_after(s, d1).contains(y) implies walk_after(s, d2).contains(y) by {
+                if d1.contains(y) {
+                    assert(d2.contains(y));
+                } else {
+                }
+            }
+        }
+        S::Seq(a, b) => {
+            walk_after_mono(*a, d1, d2);
+            walk_after_mono(*b, walk_after(*a, d1), walk_after(*a, d2));
+        }
+        _ => {
+            assert(walk_after(s, d1) == d1) by {
+                reveal(walk_after);
+            }
+            assert(walk_after(s, d2) == d2) by {
+                reveal(walk_after);
+            }
+        }
+    }
+}
+
+proof fn walk_after_dominated(s: S, d: Set<int>)
+    ensures
+        dominated(s, d),
+    decreases s,
+{
+    match s {
+        S::Assign(x, _) => {
+            assert(walk_after(s, d) == d.insert(x)) by {
+                reveal(walk_after);
+            }
+            assert(defined_after(s, d) == d.insert(x)) by {
+                reveal(defined_after);
+            }
+        }
+        S::Seq(a, b) => {
+            walk_after_dominated(*a, d);
+            walk_after_dominated(*b, defined_after(*a, d));
+            walk_after_mono(*b, walk_after(*a, d), defined_after(*a, d));
+            assert forall|y: int|
+                walk_after(s, d).contains(y) implies defined_after(s, d).contains(y) by {
+                assert(walk_after(s, d) == walk_after(*b, walk_after(*a, d))) by {
+                    reveal(walk_after);
+                }
+                assert(defined_after(s, d) == defined_after(*b, defined_after(*a, d))) by {
+                    reveal(defined_after);
+                }
+                if walk_after(*b, walk_after(*a, d)).contains(y) {
+                    assert(defined_after(*b, defined_after(*a, d)).contains(y));
+                }
+            }
+        }
+        _ => {
+            defined_after_extensive(s, d);
+            assert(walk_after(s, d) == d) by {
+                reveal(walk_after);
+            }
+        }
+    }
+}
+
+/// THE BRIDGE: the shipped walk only accepts bodies the (proved-sound) rule
+/// accepts. This is what turns `thread_equals_fork` into a theorem about the
+/// shipped classifier rather than about a rule that merely resembles it.
+pub open spec fn walk_refines(s: S, d: Set<int>) -> bool {
+    walk_ok(s, d) ==> intended_ok(s, d)
+}
+
+proof fn walk_ok_implies_intended(s: S, d: Set<int>)
+    requires
+        walk_ok(s, d),
+    ensures
+        intended_ok(s, d),
+    decreases s,
+{
+    match s {
+        S::Skip => {}
+        S::Assign(_, _) => {}
+        S::OutRead(x) => {
+            assert(d.contains(x));
+        }
+        S::OutConst(_) => {}
+        S::WriteFile => {}
+        S::Exit => {}
+        S::IfRead(x, a, b) => {
+            walk_ok_implies_intended(*a, d);
+            walk_ok_implies_intended(*b, d);
+        }
+        S::Seq(a, b) => {
+            walk_ok_implies_intended(*a, d);
+            // the walk's post-set is dominated by the rule's ...
+            walk_after_dominated(*a, d);
+            // ... so a body the walk accepts against the smaller set is
+            // accepted by the rule against the larger one: every read the
+            // walk proved bound is still bound.
+            walk_ok_mono(*b, walk_after(*a, d), defined_after(*a, d));
+        }
+    }
+}
+
+/// `walk_ok` is monotone in the already-bound set: proving a body safe against
+/// fewer bindings proves it against more.
+proof fn walk_ok_mono(s: S, small: Set<int>, big: Set<int>)
+    requires
+        walk_ok(s, small),
+        small.subset_of(big),
+    ensures
+        intended_ok(s, big),
+    decreases s,
+{
+    match s {
+        S::Skip => {}
+        S::Assign(_, _) => {}
+        S::OutRead(x) => {
+            assert(small.contains(x));
+            assert(big.contains(x));
+        }
+        S::OutConst(_) => {}
+        S::WriteFile => {}
+        S::Exit => {}
+        S::IfRead(x, a, b) => {
+            assert(small.contains(x));
+            assert(big.contains(x));
+            walk_ok_mono(*a, small, big);
+            walk_ok_mono(*b, small, big);
+        }
+        S::Seq(a, b) => {
+            walk_ok_mono(*a, small, big);
+            walk_after_dominated(*a, small);
+            walk_after_dominated(*a, big);
+            // walk_after(a, small) ⊆ defined_after(a, small) ⊆ defined_after(a, big)
+            defined_after_mono(*a, small, big);
+            walk_ok_mono(*b, walk_after(*a, small), defined_after(*a, big));
+        }
+    }
+}
+
+// ---- the classifier the renderer asks ----
+
+pub enum Class {
+    Thread,
+    Fork,
+}
+
+/// The transform's verdict for one body: `classify` inserts the body's key
+/// only when the walk accepts it, and `is_thread_body` reports membership.
+/// The model's key IS the body (`body_key` is the body's `Debug` text, which
+/// is injective over these IR values), so membership is structural equality.
+pub open spec fn classify(s: S) -> Class {
+    if walk_ok(s, Set::empty()) {
+        Class::Thread
+    } else {
+        Class::Fork
+    }
+}
+
+/// THE VERDICT THEOREM: a Thread verdict from the shipped walk prints what
+/// bash's subshell prints, under the stated model (inherited reads, discarded
+/// writes, shared stdout).
+proof fn classify_thread_sound(s: S, m: M)
+    ensures
+        classify(s) == Class::Thread ==> as_fork(s, m) == as_thread(s, m),
+{
+    if classify(s) == Class::Thread {
+        walk_ok_implies_intended(s, Set::empty());
+        thread_equals_fork(s, m);
+    }
+}
+
+// ---- the refusal direction ----
+
+/// The shipped predicate: true iff the transform's table (when it ran) holds
+/// this body's key. `None` = the transform never ran (or its verdicts were
+/// cleared) — the conservative FORK default in `is_thread_body`.
+pub open spec fn is_thread_body(tbl: Option<Seq<S>>, body: S) -> bool {
+    match tbl {
+        Option::Some(t) => t.contains(body),
+        Option::None => false,
+    }
+}
+
+/// What a renderer DOES with the predicate: anything it cannot prove is a
+/// fork.
+pub open spec fn route(tbl: Option<Seq<S>>, body: S) -> Class {
+    if is_thread_body(tbl, body) {
+        Class::Thread
+    } else {
+        Class::Fork
+    }
+}
+
+/// The transform only inserts bodies the walk accepted — the insertion rule in
+/// `classify` (`if body_is_self_contained(body) { thread.insert(...) }`), which
+/// `walk_ok` mirrors.
+pub open spec fn table_sound(t: Seq<S>) -> bool {
+    forall|b: S| #[trigger] t.contains(b) ==> walk_ok(b, Set::empty())
+}
+
+/// Unclassified ⇒ FORK: with no table (transform absent), every body routes
+/// fork, and a body the table does not hold routes fork. The verdict never
+/// guesses.
+proof fn unclassified_stays_fork(tbl: Option<Seq<S>>, body: S)
+    ensures
+        !is_thread_body(tbl, body) ==> route(tbl, body) == Class::Fork,
+{
+}
+
+proof fn absent_table_routes_fork(body: S)
+    ensures
+        route(Option::None, body) == Class::Fork,
+{
+}
+
+/// The soundness side of the same predicate: a Thread route can only come
+/// from a table entry, and every table entry is a body the walk accepted.
+proof fn table_entry_is_accepted(t: Seq<S>, body: S)
+    requires
+        table_sound(t),
+    ensures
+        route(Option::Some(t), body) == Class::Thread ==> walk_ok(body, Set::empty()),
+{
+}
+
+/// END TO END: the shipped predicate, with the transform's insertion rule,
+/// only ever says THREAD for a body that prints identically under both
+/// routings.
+proof fn route_thread_is_sound(t: Seq<S>, body: S, m: M)
+    requires
+        table_sound(t),
+    ensures
+        route(Option::Some(t), body) == Class::Thread ==> as_fork(body, m) == as_thread(body, m),
+{
+    if route(Option::Some(t), body) == Class::Thread {
+        table_entry_is_accepted(t, body);
+        classify_thread_sound(body, m);
+    }
+}
+
+/// A body carrying an unmodelled observable (a file write, a control
+/// transfer) is never accepted by the walk, so it can never enter the table:
+/// the refused shapes stay FORK by construction, not by luck.
+pub open spec fn has_se_walk_refused(s: S) -> bool {
+    has_se(s) ==> !walk_ok(s, Set::empty())
+}
+
+proof fn side_effect_never_accepted(s: S, d: Set<int>)
+    requires
+        has_se(s),
+    ensures
+        !walk_ok(s, d),
+    decreases s,
+{
+    match s {
+        S::Skip => {}
+        S::Assign(_, _) => {}
+        S::OutRead(_) => {}
+        S::OutConst(_) => {}
+        S::WriteFile => {}
+        S::Exit => {}
+        S::IfRead(_, a, b) => {
+            if has_se(*a) {
+                side_effect_never_accepted(*a, d);
+            } else {
+                assert(has_se(*b));
+                side_effect_never_accepted(*b, d);
+            }
+        }
+        S::Seq(a, b) => {
+            if has_se(*a) {
+                side_effect_never_accepted(*a, d);
+            } else {
+                assert(has_se(*b));
+                side_effect_never_accepted(*b, walk_after(*a, d));
+            }
+        }
+    }
+}
+
+proof fn side_effect_stays_fork(s: S)
+    requires
+        has_se(s),
+    ensures
+        classify(s) == Class::Fork,
+{
+    side_effect_never_accepted(s, Set::empty());
 }
 
 fn main() {}
