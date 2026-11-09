@@ -1512,9 +1512,13 @@ non-Str-word refusal flags), per call site. What it proves:
   is never answered (`type ls` must not say "a shell builtin").
 
 Fidelity: the function set and the builtin table are parameters. The
-Rust-side test `builtin_table_is_the_58_true_builtins` pins the table's
-size (58), duplicate-freedom, and the absence of `ls`/`head`, so the
-abstraction is auditable. The echo's per-line TEXT is not modelled (a
+table is MEASURED, not recited: `builtin_table_matches_compgen` asserts it
+equals `compgen -A builtin` on the bash that runs the suite (61 names —
+the recited table was 58 and missing the special builtins `.`, `:` and
+`break` until this test existed), and
+`builtin_table_excludes_externals_and_has_no_copies` keeps it
+duplicate-free with `ls`/`head` absent. Set `SH2_BASH` to measure a
+different build. The echo's per-line TEXT is not modelled (a
 line is a function of its name and classification); the node carries the
 names in order, which is what the consumer reads.
 

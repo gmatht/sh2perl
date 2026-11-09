@@ -29,10 +29,17 @@ use crate::ir::{IrExpr, IrStmt, StrStyle};
 /// transpiler's wider builtins namespace (`transforms::builtin::BUILTINS`),
 /// which also lists external coreutils like `head`/`ls`; `type ls` must
 /// never claim "ls is a shell builtin".
+///
+/// MEASURED, not recited: `builtin_table_matches_compgen` compares this list
+/// against `compgen -A builtin` on the bash that runs the suite, so a shell
+/// that gains or loses a builtin fails the test instead of silently feeding a
+/// stale table to the (parameterised) Verus model. Three entries were missing
+/// until that test existed — `.`, `:` and `break` are special builtins, and
+/// `type` answers "a shell builtin" for all three.
 const BASH_BUILTINS: &[&str] = &[
-    "[", "alias", "bg", "bind", "builtin", "caller", "cd", "command", "compgen", "complete",
-    "compopt", "continue", "declare", "dirs", "disown", "echo", "enable", "eval", "exec", "exit",
-    "export", "false", "fc", "fg", "getopts", "hash", "help", "history", "jobs", "kill", "let",
+    ".", ":", "[", "alias", "bg", "bind", "break", "builtin", "caller", "cd", "command", "compgen",
+    "complete", "compopt", "continue", "declare", "dirs", "disown", "echo", "enable", "eval", "exec",
+    "exit", "export", "false", "fc", "fg", "getopts", "hash", "help", "history", "jobs", "kill", "let",
     "local", "logout", "mapfile", "popd", "printf", "pushd", "pwd", "read", "readarray",
     "readonly", "return", "set", "shift", "shopt", "source", "suspend", "test", "times", "trap",
     "true", "type", "typeset", "ulimit", "umask", "unalias", "unset", "wait",
@@ -373,13 +380,38 @@ mod tests {
     }
 
     #[test]
-    fn builtin_table_is_the_58_true_builtins() {
-        // The Verus model (`proofs/verus/type_query.rs`) takes the table as
-        // a predicate parameter, so this pin is what makes the abstraction
-        // auditable: the count, duplicate-freedom, and the names it must
-        // NOT contain -- `type ls` claiming "a shell builtin" is the one
-        // wrong answer the table exists to prevent.
-        assert_eq!(BASH_BUILTINS.len(), 58);
+    fn builtin_table_matches_compgen() {
+        // The Verus model (`proofs/verus/type_query.rs`) takes the table as a
+        // parameter, so no proof can notice a stale table: THIS is the
+        // measurement that ties it to a shell. `type X` answers "a shell
+        // builtin" exactly for the names `compgen -A builtin` lists, so the
+        // constant is asserted equal to bash's own answer rather than to a
+        // number someone typed. Set SH2_BASH to measure a different build.
+        let bash = std::env::var("SH2_BASH").unwrap_or_else(|_| "bash".to_string());
+        let out = std::process::Command::new(&bash)
+            .args(["-c", "compgen -A builtin"])
+            .output()
+            .unwrap_or_else(|e| {
+                panic!("cannot run `{bash}` — the builtin table is unmeasurable: {e}")
+            });
+        assert!(out.status.success(), "`{bash} -c 'compgen -A builtin'` failed: {}", out.status);
+        let text = String::from_utf8(out.stdout).expect("compgen output is not utf-8");
+        let mut measured: Vec<&str> = text.lines().collect();
+        measured.sort_unstable();
+        let mut table = BASH_BUILTINS.to_vec();
+        table.sort_unstable();
+        assert_eq!(
+            table, measured,
+            "BASH_BUILTINS drifted from `compgen -A builtin` on {bash} (left = table, right = shell)"
+        );
+    }
+
+    #[test]
+    fn builtin_table_excludes_externals_and_has_no_copies() {
+        // The differential above proves the table equals the shell's list; this
+        // pins the two things that must stay TRUE of it even so: an external
+        // never claims to be a builtin (`type ls` is the wrong answer the table
+        // exists to prevent), and no name appears twice.
         assert!(BASH_BUILTINS.contains(&"printf"));
         assert!(BASH_BUILTINS.contains(&"type"));
         assert!(!BASH_BUILTINS.contains(&"ls"));

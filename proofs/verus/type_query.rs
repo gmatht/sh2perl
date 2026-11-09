@@ -33,10 +33,13 @@
 //     `answer_complete` pins. The echo node carries the names in order:
 //     one line per name is the length rule, exactly what `head -1` reads.
 //   - the function-name set `fns` and the builtin table `table` are
-//     PARAMETERS. The Rust-side pin
-//     `builtin_table_is_the_58_true_builtins` makes the abstraction
-//     auditable: 58 entries, duplicate-free, and coreutils absent
-//     (`ls`/`head` are not builtins, so `type ls` must refuse).
+//     PARAMETERS. The abstraction is auditable on the Rust side:
+//     `builtin_table_matches_compgen` asserts the constant equals
+//     `compgen -A builtin` on the bash that runs the suite (61 names — `.`,
+//     `:` and `break` were missing while the table was recited rather than
+//     measured), and `builtin_table_excludes_externals_and_has_no_copies`
+//     keeps coreutils out (`ls`/`head` are not builtins, so `type ls` must
+//     refuse) and the list duplicate-free.
 //   - `shadowed` is the program defining its own `type` (the source
 //     returns false for the whole statement list). Modelled per node,
 //     which is the same observable: no rewrite anywhere.
