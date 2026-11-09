@@ -109,6 +109,10 @@ impl NumericObserved {
     pub fn array(&self, name: &str) -> bool {
         self.arrays.contains(name)
     }
+    /// Iterate over all numeric-observed arrays.
+    pub fn arrays(&self) -> impl Iterator<Item = &String> {
+        self.arrays.iter()
+    }
 
     /// Downstream value-flow closure of reads of `name`: every scalar that
     /// a value stored in `name` can reach transitively through copies,
