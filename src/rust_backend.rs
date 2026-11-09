@@ -13161,11 +13161,46 @@ impl Render {
                     }
                     return;
                 }
-                if let Some(x) = e {
+                // MAIN body (not a user function): `main` returns
+                // `ExitCode`, so a top-level `return N` has to RETURN a
+                // status value — a bare `return;` is E0069 here. Three
+                // shapes, because the same IR arm is reused:
+                //   * inside a closure (thread/procsub body) `return` exits
+                //     the closure, which returns `()` — unchanged;
+                //   * rc_disabled has no register to read, so the operand
+                //     is cast directly (`SUCCESS` when absent);
+                //   * otherwise the operand is stored ONCE and re-loaded
+                //     (it can have side effects, so it must not be emitted
+                //     twice).
+                if self.in_closure > 0 {
+                    if let Some(x) = e {
+                        let n = self.expr_num(x);
+                        self.emit(&format!(
+                            "__SH_RC.store({}, Ordering::Relaxed); return;",
+                            i32_arg(&n)
+                        ));
+                    } else {
+                        self.emit("return;");
+                    }
+                } else if self.rc_disabled {
+                    match e {
+                        Some(x) => {
+                            let n = self.expr_num(x);
+                            self.emit(&format!(
+                                "return std::process::ExitCode::from({} as u8);",
+                                i32_arg(&n)
+                            ));
+                        }
+                        None => self.emit("return std::process::ExitCode::SUCCESS;"),
+                    }
+                } else if let Some(x) = e {
                     let n = self.expr_num(x);
-                    self.emit(&format!("__SH_RC.store({}, Ordering::Relaxed); return;", i32_arg(&n)));
+                    self.emit(&format!(
+                        "__SH_RC.store({}, Ordering::Relaxed); return std::process::ExitCode::from(__SH_RC.load(Ordering::Relaxed) as u8);",
+                        i32_arg(&n)
+                    ));
                 } else {
-                    self.emit("return;");
+                    self.emit("return std::process::ExitCode::from(__SH_RC.load(Ordering::Relaxed) as u8);");
                 }
             }
             IrStmt::Continue => {
@@ -13803,19 +13838,22 @@ impl Render {
             self.stmt(s);
         }
         // the script's exit code is the LAST statement's rc (bash's final
-        // status = the last command's). When the final status is
-        // statically 0 (the body ends in a `__SH_RC.store(0, …)`), the
-        // whole epilogue is redundant: falling off the end of `fn main`
-        // exits 0 and the runtime flushes stdout just the same. With EXIT
-        // traps the rc must be saved BEFORE they run (their __sh_spawn
-        // calls clobber __SH_RC).
+        // status = the last command's). `main` RETURNS it as an `ExitCode`
+        // rather than calling `process::exit`, so the normal path flushes
+        // stdout and runs destructors (process::exit skips both — a
+        // trailing `print!` with no newline was lost when stdout was a
+        // pipe). The status is masked to 8 bits, which is what bash does
+        // for `exit 300` (44) and what process::exit did anyway. When the
+        // final status is statically 0 (the body ends in a
+        // `__SH_RC.store(0, …)`), there is nothing to carry:
+        // `ExitCode::SUCCESS` is the tail. With EXIT traps the rc must be
+        // saved BEFORE they run (their __sh_spawn calls clobber __SH_RC).
         //
         // With the register DISABLED (`rc_disabled` — no source status,
         // no status read) there is no final status to carry at all: the
         // exit code is 0 (there is nothing the source language could have
-        // observed), so the epilogue is dropped outright and `fn main`
-        // falls off its end. EXIT traps still run — they are a side
-        // effect, not a status.
+        // observed), so the epilogue is just `ExitCode::SUCCESS`. EXIT
+        // traps still run — they are a side effect, not a status.
         let rc_zero = Self::body_rc_is_zero(&self.out);
         // Two independent reasons the epilogue's `exit` would be dead text
         // rustc calls an "unreachable statement": the IR tail never falls
@@ -13842,6 +13880,11 @@ impl Render {
                     break;
                 }
             }
+            // no status exists to return; a body that already diverged
+            // needs no tail (and one would warn as unreachable)
+            if !body_already_exits {
+                self.emit("std::process::ExitCode::SUCCESS");
+            }
         } else if rc_zero && self.trap_exit.is_empty() {
             // The final status is statically 0, so nothing reads __SH_RC
             // after the body. In a runtime-free program there is no
@@ -13861,6 +13904,11 @@ impl Render {
                     break;
                 }
             }
+            // the status is statically 0 and the register was dropped, so
+            // the tail is SUCCESS (not a load of a pruned static)
+            if !body_already_exits {
+                self.emit("std::process::ExitCode::SUCCESS");
+            }
         } else if self.trap_exit.is_empty() {
             // A body that never falls through cannot reach the epilogue:
             // its own `process::exit(…)` already ended the process (or an
@@ -13872,14 +13920,14 @@ impl Render {
             // still gets the epilogue — it leaves the exit code in the
             // register, and dropping the epilogue would change it to 0.
             if !body_already_exits {
-                self.emit("std::process::exit(__SH_RC.load(Ordering::Relaxed));");
+                self.emit("std::process::ExitCode::from(__SH_RC.load(Ordering::Relaxed) as u8)");
             }
         } else {
             self.emit("let __sh_final = __SH_RC.load(Ordering::Relaxed);");
             self.add_helper("run_traps");
             self.emit("__sh_run_traps();");
             if !body_already_exits {
-                self.emit("std::process::exit(__sh_final);");
+                self.emit("std::process::ExitCode::from(__sh_final as u8)");
             }
         }
         std::mem::swap(&mut self.out, &mut body_out);
@@ -14119,7 +14167,7 @@ impl Render {
                 self.emit("");
             }
         }
-        // The body is rendered at depth 1, so `fn main() {` is emitted
+        // The body is rendered at depth 1, so the `fn main` line is emitted
         // here. When the body is a SINGLE statement, the `}` it emitted
         // sits in the same buffer line as the statement (the buffer is
         // joined with `\n` afterwards) — splice the opening brace into
@@ -14131,7 +14179,7 @@ impl Render {
         });
         if seen_var {
             self.emit("#[allow(non_upper_case_globals)]");
-            self.emit("fn main() {");
+            self.emit("fn main() -> std::process::ExitCode {");
             let decls = self.entry_decls(&crate::shir_passes::list_profile::Scope::Main);
             // the body lines below are already rendered at depth 1
             self.depth = 1;
@@ -14143,7 +14191,7 @@ impl Render {
             self.emit("}");
         } else {
             self.depth = 0;
-            self.emit("fn main() {");
+            self.emit("fn main() -> std::process::ExitCode {");
             let decls = self.entry_decls(&crate::shir_passes::list_profile::Scope::Main);
             // the body lines below are already rendered at depth 1
             self.depth = 1;
@@ -21730,7 +21778,58 @@ mod tests {
         // and the exit epilogue must survive even with no `$?` read.
         let out = render("echo hi\nfalse\n");
         assert!(out.contains("__SH_RC.store(1"), "{out}");
-        assert!(out.contains("process::exit(__SH_RC.load"), "{out}");
+        assert!(out.contains("ExitCode::from(__SH_RC.load"), "{out}");
+    }
+
+    #[test]
+    fn main_returns_an_exit_code() {
+        // `main` hands the final status back as `ExitCode` instead of
+        // calling `process::exit`, so the normal path flushes stdout and
+        // runs destructors. The status is masked to 8 bits, matching both
+        // bash (`exit 300` is 44) and what `process::exit` did anyway.
+        let out = render("false\n");
+        assert!(out.contains("fn main() -> std::process::ExitCode {"), "{out}");
+        assert!(
+            out.contains("std::process::ExitCode::from(__SH_RC.load(Ordering::Relaxed) as u8)"),
+            "{out}"
+        );
+        assert!(!out.contains("process::exit(__SH_RC.load"), "{out}");
+        // the tail is an EXPRESSION: a statement would fall off the end of
+        // an `-> ExitCode` fn and fail to type-check
+        assert!(
+            !out.contains("ExitCode::from(__SH_RC.load(Ordering::Relaxed) as u8);"),
+            "tail carries a semicolon:\n{out}"
+        );
+    }
+
+    /// A top-level `return` reaches main's body (not a function body), so it
+    /// must return a STATUS value — the bare `return;` this arm used to emit
+    /// is E0069 once main returns `ExitCode`. Regression for
+    /// `return-double-semicolon.sh` (a `case` arm ending in `return`).
+    #[test]
+    fn top_level_return_returns_a_status() {
+        let out = render("return 3\n");
+        assert!(out.contains("fn main() -> std::process::ExitCode {"), "{out}");
+        assert!(
+            out.contains("return std::process::ExitCode::from(__SH_RC.load(Ordering::Relaxed) as u8);"),
+            "{out}"
+        );
+        // nothing in main may be a bare `return;`
+        assert!(!out.contains("; return;"), "bare return in main:\n{out}");
+    }
+
+    #[test]
+    fn status_free_main_returns_success() {
+        // rc_disabled / statically-zero status: no register to carry, so the
+        // tail is `ExitCode::SUCCESS` rather than a load of a pruned static.
+        let out = render("echo \"hi\"\n");
+        assert!(out.contains("fn main() -> std::process::ExitCode {"), "{out}");
+        assert!(
+            out.contains("    std::process::ExitCode::SUCCESS\n}") ||
+                out.contains("std::process::ExitCode::SUCCESS\n}"),
+            "no SUCCESS tail:\n{out}"
+        );
+        assert!(!out.contains("__SH_RC"), "dead rc kept:\n{out}");
     }
 
     #[test]
@@ -22635,7 +22734,7 @@ mod tests {
     fn assigns_and_echo() {
         // pass 2: single-scope x is a plain local (`let` at first write)
         let out = render("x=5\necho \"$x\"\nx=6\necho \"x is $x\"\n");
-        assert!(out.contains("fn main() {"), "{out}");
+        assert!(out.contains("fn main() -> std::process::ExitCode {"), "{out}");
         // an Int-homed local reads as a plain `let` (the `: i64` is
         // omitted — the range fits i32 and Rust infers from the literal)
         assert!(out.contains("let mut x = 5;"), "{out}");
@@ -22803,7 +22902,10 @@ mod tests {
         let prog = crate::shir_json_in::shir_json_to_ir(src).expect("ingress");
         let out = shir_to_rust(&prog);
         assert!(!out.contains("non_upper_case_globals"), "stray allow:\n{out}");
-        assert!(out.contains("fn main() {"), "main missing:\n{out}");
+        assert!(
+            out.contains("fn main() -> std::process::ExitCode {"),
+            "main missing:\n{out}"
+        );
         // the braces must balance (a single-statement body shares the
         // buffer line with its closing brace)
         assert_eq!(
@@ -22831,7 +22933,10 @@ mod tests {
             "const-len array not a local:\n{out}"
         );
         assert!(!out.contains("__SHV_a"), "local array leaked a static:\n{out}");
-        assert!(out.contains("fn main() {"), "main missing:\n{out}");
+        assert!(
+            out.contains("fn main() -> std::process::ExitCode {"),
+            "main missing:\n{out}"
+        );
     }
     /// t21 (`a = [1, 2, 3]; print(a[1])`): a main-scope
     /// constant-length int array in a runtime-free program lowers to a
