@@ -194,6 +194,7 @@ pub mod isolate_accumulate; // loop-private temp inlining (single-accumulate iso
 pub mod grep_o; // `grep -o PAT` → the generic grepMatches(text, pattern, flags) op
 pub mod grep_pcre; // `grep -P 'PCRE'` → portable `grep -E 'ERE'` (lookbehind absorbed + var patterns reduced; refuse>guess)
 pub mod cat_read; // `cat [-n] FILE` → ForEachLine streaming loop (native in every backend)
+pub mod cat_heredoc; // `cat <<'EOF'` (literal body) → a native Output print (retires the `bash -c` spawn; output-line-fold then makes it a line print)
 pub mod process_subst;
 pub mod ternary_desugar; // C frontend's `ternary(cond,a,b)` call → backend-neutral Ternary + test-call (non-estree backends)
 pub mod seq_range_for; // worker-submitted: `for i in $(seq A B)` → native numeric range loop
@@ -273,6 +274,11 @@ pub fn all() -> Vec<(&'static str, TransformFn)> {
         ("grep-o", grep_o::transform),
         ("grep-pcre", grep_pcre::transform),
         ("cat-read", cat_read::transform),
+        // cat-heredoc: `cat <<'EOF' … EOF` with no operands is a pure
+        // print of the body — an Output, not a bash -c per heredoc.
+        // Registered BEFORE output-line-fold so the body's trailing \n
+        // folds into `newline: true` in the same pass (println!).
+        ("cat-heredoc", cat_heredoc::transform),
         // `type NAME` for a function THIS program defines (or a true shell
         // builtin) → its answer; the eval-inliner re-runs it after Fix 7
         // splices eval'd functions in (perl_generator_fixed).
@@ -505,7 +511,7 @@ pub fn apply(stmts: &mut Vec<IrStmt>) -> bool {
     let enabled = enabled_names();
     let mut changed = false;
     for (name, tf) in all() {
-        if (enabled.is_empty() || enabled.iter().any(|e| e == name)) {
+        if enabled.is_empty() || enabled.iter().any(|e| e == name) {
             if transform_applies(name) {
                 changed |= tf(stmts);
             }
