@@ -33,6 +33,20 @@
 //! Analysis-only (like `sync-ok-loops`): verdicts stored in module
 //! statics, read by the renderers. No structural mutation.
 //!
+//! ## Consumers
+//! `c_backend.rs`'s `tiered_i64_expr` is the first: a subtree the verdict
+//! covers cannot overflow `long long` at any intermediate step (the bound
+//! is composed over the WHOLE tree, so every sub-result is inside i32 too),
+//! which makes the tier's `__builtin_*_overflow` guard on that subtree dead
+//! code — the renderer emits the plain expression instead. It calls
+//! `exact_i32_bound` on the node rather than `is_i32` on a statement index
+//! because a store expression's subtrees have no index of their own. Model:
+//! `proofs/verus/i32_emit.rs` (the two-armed decision and the dead check).
+//! Note the transform itself only walks TOP-LEVEL statements
+//! (`transforms::apply` is called once on `prog.stmts`), so the static
+//! table — and `is_i32` — never covers a function body; the node-level
+//! predicate has no such hole.
+//!
 //! ## Placement
 //! Registered in `transforms.rs` (SH2_TRANSFORMS gated). The estree
 //! worker mediates the renderer hooks: estree.rs reads the verdicts for
@@ -63,6 +77,16 @@ pub fn is_i32(fn_name: &str, stmt_idx: usize) -> bool {
         .as_ref()
         .map(|s| s.contains(&(fn_name.to_string(), stmt_idx)))
         .unwrap_or(false)
+}
+
+/// The renderer-facing verdict as a VALUE: `Some(bound)` means every node of
+/// the tree is provably `|v| <= bound < 2^31`, so 32-bit arithmetic on it is
+/// exact and any wider defensive check is dead code; `None` means the
+/// renderer must take the width-safe path. Same decision as `is_i32`, but
+/// callable where no statement index exists (the C tier calls it on a
+/// subtree of a store expression — `c_backend.rs`'s `tiered_i64_expr`).
+pub fn exact_i32_bound(a: &ArithAst) -> Option<i128> {
+    arith_abs_bound(a)
 }
 
 /// Apply the transform (analysis-only — computes + caches the verdicts).
@@ -218,5 +242,38 @@ mod tests {
         };
         assert!(arith_is_i32(&sum));
         assert!(arith_is_i32(&num((1 << 30) - 1)));
+    }
+
+    /// The two renderer-facing answers must be the SAME decision: the
+    /// statement table (`is_i32`, index-keyed) and the node predicate the C
+    /// tier calls (`exact_i32_bound`, no index) cannot drift apart, or a
+    /// renderer consuming one would disagree with a renderer consuming the
+    /// other. The bound is returned as a value, not just yes/no, because the
+    /// fast path also needs it.
+    #[test]
+    fn node_predicate_agrees_with_statement_verdict() {
+        clear_verdicts();
+        let ok = ArithAst::Bin {
+            op: "*".to_string(),
+            lhs: Box::new(num(1000)),
+            rhs: Box::new(num(3)),
+        };
+        let boom = mul(mul(num(1 << 29), num(1 << 29)), num(1 << 29));
+        let mk = |name: &str, a: ArithAst| IrStmt::Assign {
+            targets: vec![crate::ir::AssignTarget {
+                var: name.to_string(),
+                sigil: None,
+                indices: vec![],
+            }],
+            expr: IrExpr::Arith(Box::new(a)),
+            asm: None,
+        };
+        let mut stmts = vec![mk("a", ok.clone()), mk("b", boom.clone())];
+        transform(&mut stmts);
+        assert_eq!(exact_i32_bound(&ok), Some(3000));
+        assert_eq!(exact_i32_bound(&boom), None);
+        assert!(is_i32("", 0));
+        assert!(!is_i32("", 1));
+        clear_verdicts();
     }
 }

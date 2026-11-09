@@ -10993,7 +10993,56 @@ impl Render {
     /// accumulates into `ov` (an early overflow leaves later ops on
     /// wrapped-but-defined values that are then discarded). None when a
     /// leaf cannot be computed in i64 (a non-tiered bigint var).
+    /// Zero-check emission for a tree the `i32-provable` verdict covers:
+    /// every value in it is provably inside i32, so the `long long` result of
+    /// the plain C expression cannot overflow and the tier's
+    /// `__builtin_*_overflow` guard would never fire. Returns `None` for any
+    /// shape the estimator cannot mark — under the CURRENT estimator that is
+    /// `Num`/`Cast`/unary `+ -`/`+ - *`/`?:` only, because `arith_abs_bound`
+    /// refuses every variable read (the escape-classes refinement is still
+    /// outstanding). The refusal arm is what keeps this function honest: the
+    /// fast path cannot silently lose a tiered mirror update.
+    fn plain_i64_expr(&self, a: &ArithAst) -> Option<String> {
+        match a {
+            ArithAst::Num(n) => Some(format!("{n}LL")),
+            ArithAst::Cast { arg, .. } => self.plain_i64_expr(arg),
+            ArithAst::Un { op, arg } if op == "+" => self.plain_i64_expr(arg),
+            ArithAst::Un { op, arg } if op == "-" => {
+                Some(format!("(-{})", self.plain_i64_expr(arg)?))
+            }
+            ArithAst::Bin { op, lhs, rhs } if matches!(op.as_str(), "+" | "-" | "*") => Some(
+                format!(
+                    "({} {op} {})",
+                    self.plain_i64_expr(lhs)?,
+                    self.plain_i64_expr(rhs)?
+                ),
+            ),
+            ArithAst::Cond { test, then, else_ } => Some(format!(
+                "({} ? {} : {})",
+                self.plain_i64_expr(test)?,
+                self.plain_i64_expr(then)?,
+                self.plain_i64_expr(else_)?
+            )),
+            _ => None,
+        }
+    }
+
     fn tiered_i64_expr(&mut self, a: &ArithAst, ov: &str) -> Option<String> {
+        // i32-provable (transforms::i32_provable): a tree whose every value
+        // is provably inside i32 cannot overflow the long long it is computed
+        // in, at ANY intermediate step — the estimator composes the bound, so
+        // the `__builtin_*_overflow` checks the arms below emit are dead code
+        // here. Emit the plain expression and skip them. Model:
+        // proofs/verus/i32_emit.rs (marked ⇒ plain form, unmarked ⇒ every
+        // check retained); the verdict is refused for any tree containing a
+        // variable read, so the tiered mirrors are never bypassed by this.
+        if crate::transforms::transform_enabled("i32-provable") {
+            if crate::transforms::i32_provable::exact_i32_bound(a).is_some() {
+                if let Some(p) = self.plain_i64_expr(a) {
+                    return Some(p);
+                }
+            }
+        }
         match a {
             ArithAst::Num(n) => Some(format!("{n}LL")),
             ArithAst::Var(n) | ArithAst::Ident(n) => {
