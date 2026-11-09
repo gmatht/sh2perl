@@ -2360,6 +2360,24 @@ fn inline_sh_substr(
     out
 }
 
+/// A `Cargo.toml` for a rendered program.
+///
+/// Generated programs are single files compiled directly by `rustc` — there
+/// is no manifest and therefore no way to link a crate. The one helper that
+/// reaches outside `std` is `__sh_regex`, so this returns a dependency-free
+/// manifest for the rest of the corpus and adds `regex = "1"` only when the
+/// rendered text actually references it. Callers (`--cargo-dir`) write it
+/// next to a `src/main.rs` to produce a buildable project.
+pub fn cargo_manifest(rendered: &str) -> String {
+    let mut m = String::from(
+        "[package]\nname = \"sh2prog\"\nversion = \"0.1.0\"\nedition = \"2021\"\n",
+    );
+    if rendered.contains("regex::Regex") {
+        m.push_str("\n[dependencies]\nregex = \"1\"\n");
+    }
+    m
+}
+
 /// `__sh_replace(&VAR, "PAT", "REPL", bool)` → `VAR.replace("PAT","REPL")` /
 /// `VAR.replacen("PAT","REPL",1)` when PAT is a literal with no glob characters.
 fn inline_sh_replace(text: &str) -> String {
@@ -15473,15 +15491,20 @@ fn helper_source(h: &str) -> &'static str {
     while s.ends_with('\n') { s.pop(); }
     (s, rc)
 }"#,
+        // The `regex` crate (declared by `cargo_manifest` below): the old
+        // body shelled out to `bash -c '[[ $1 =~ $2 ]]'` for EVERY match —
+        // a process per test, and a runtime dependency on bash being on
+        // PATH. Rust's regex engine covers what `=~` accepts in practice
+        // (`[[:alpha:]]` classes, `{m,n}` repetition, alternation, anchors);
+        // `nocasematch` folds to the `i` flag. An INVALID pattern is a
+        // shell error (status 2, never a match), so failing to build the
+        // regex is `false` here rather than a panic.
         "regex" => r#"fn __sh_regex(text: &str, pat: &str, flags: &str) -> bool {
-    let cmd = if flags.contains('i') {
-        "shopt -s nocasematch; [[ $1 =~ $2 ]]"
-    } else {
-        "[[ $1 =~ $2 ]]"
-    };
-    let mut c = std::process::Command::new("bash");
-    c.arg("-c").arg(cmd).arg("sh").arg(text).arg(pat);
-    c.status().map(|s| s.success()).unwrap_or(false)
+    let pat = if flags.contains('i') { format!("(?i){}", pat) } else { pat.to_string() };
+    match regex::Regex::new(&pat) {
+        Ok(re) => re.is_match(text),
+        Err(_) => false,
+    }
 }"#,
         "wait_all" => r#"fn __sh_wait_all() {
     let hs = std::mem::take(&mut *__SH_BG.lock().unwrap());
@@ -21816,6 +21839,21 @@ mod tests {
         );
         // nothing in main may be a bare `return;`
         assert!(!out.contains("; return;"), "bare return in main:\n{out}");
+    }
+
+    /// Generated programs are single files, so a crate dependency needs a
+    /// manifest. `__sh_regex` is the only helper that reaches outside `std`,
+    /// so the manifest is dependency-free unless that helper is present.
+    #[test]
+    fn cargo_manifest_declares_regex_only_when_used() {
+        let plain = super::cargo_manifest("fn main() { print!(\"x\"); }");
+        assert!(plain.contains("[package]"), "{plain}");
+        assert!(
+            !plain.contains("regex"),
+            "std-only program declares a dependency:\n{plain}"
+        );
+        let with = super::cargo_manifest("fn __sh_regex(t: &str) { regex::Regex::new(t); }");
+        assert!(with.contains("regex = \"1\""), "{with}");
     }
 
     #[test]
