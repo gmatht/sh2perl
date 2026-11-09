@@ -231,6 +231,11 @@ pub struct Render {
     /// mention sits in one non-risky scope renders as a real Rust `let`
     /// in that scope instead of a `thread_local!` static.
     local_vars: HashMap<String, crate::shir_passes::list_profile::Scope>,
+    /// Pass-2 locals whose first mention is NOT a top-level write (a read
+    /// before the first write, or a first write inside a branch/loop).
+    /// Their `let` cannot ride on the write, so it is emitted at the top
+    /// of the owning scope, initialised to bash's unset value ("" / 0).
+    local_entry: BTreeSet<String>,
     /// vars assigned somewhere (drives `let`/`let mut` for locals)
     assigned: BTreeSet<String>,
     /// pass-2 locals whose deferred `let` has already been emitted
@@ -1499,8 +1504,7 @@ fn inline_str_arg_helper(text: &mut String, name: &str, expand: impl Fn(&str) ->
             j += 1;
         }
         if j >= bytes.len() { break; } // unterminated — bail
-        let lit = &after[..j + 1]; // include closing `)`
-        // lit is `"..."`  (the string literal including quotes but not `)`)
+        // lit_str is `"..."` (the string literal including quotes but not `)`)
         let lit_str = &after[..j]; // `"..."` (with closing quote)
         if !lit_str.ends_with('"') { break; }
         let replacement = expand(lit_str);
@@ -2457,7 +2461,7 @@ fn inline_sinks_when_unused(text: String, sink_check_needed: bool) -> String {
 ///    (renamed as a unit), pass-2 locals render bare — and the mangler
 ///    appends `_` to any bare base starting with `__` while golf is on
 ///    (see `ident_base`), so no bare local can spell a pool name.
-///    `Ordering::SeqCst` and other `PascalCase::names` are untouched
+///    `Ordering::Relaxed` and other `PascalCase::names` are untouched
 ///    (the pool regex requires a lowercase/digit tail after `__` —
 ///    actually it matches any `__[a-zA-Z0-9_]+`: `__SH_RC` etc. ARE the
 ///    targets; `std`/`Vec`/`String` don't start with `__`).
@@ -2704,6 +2708,34 @@ fn mentions_ident(line: &str, name: &str) -> bool {
         !before.map(|c| c.is_ascii_alphanumeric() || c == '_').unwrap_or(false)
             && !after.map(|c| c.is_ascii_alphanumeric() || c == '_').unwrap_or(false)
     })
+}
+
+/// Drop the prose comments INSIDE helper bodies.
+///
+/// The registry's helper sources are documented for the maintainer, but
+/// every helper line is emitted into every program that uses it: 2,496
+/// comment lines / 163 KB across the corpus (7.7% of the emitted bytes)
+/// for text no program executes. A comment is only dropped when it sits
+/// between a `fn __sh_*` signature and its closing brace at column 0, so
+/// no emitted statement can be touched; `// TODO(` is kept — it is the
+/// renderer's own signal, not prose.
+fn strip_helper_comments(text: String) -> String {
+    let mut out: Vec<&str> = Vec::new();
+    let mut in_helper = false;
+    for line in text.lines() {
+        if line.starts_with("fn __sh_") {
+            in_helper = true;
+        } else if in_helper && line == "}" {
+            in_helper = false;
+        } else if in_helper {
+            let t = line.trim_start();
+            if t.starts_with("//") && !t.starts_with("// TODO(") {
+                continue;
+            }
+        }
+        out.push(line);
+    }
+    out.join("\n")
 }
 
 fn prune_unused_helpers(text: String) -> String {
@@ -3162,6 +3194,7 @@ pub fn shir_to_rust(prog: &IrProgram) -> String {
     // the sinks being dead — the redirect-aware `print_words` variant
     // is left untouched.
     let text = inline_simple_helpers(&text, r.runtime_free, &r.var_types);
+    let text = strip_helper_comments(text);
     let text = prune_unused_helpers(text);
     let text = prune_unused_statics(text);
     // `-Oz` golf: strip comments/whitespace and shorten every
@@ -3255,6 +3288,15 @@ impl Render {
             || line.contains("__sh_run_traps(")
             || line.contains("__sh_cap_bytes(")
             || line.contains("__sh_capture_rc(")
+            // the native filesystem commands: their whole effect is the
+            // syscall, so collapsing the store would DELETE the command
+            // (measured: `mkdir sub` / `touch a.sh` / `rm -rf $d` vanished
+            // from every rc-disabled program, and three corpus examples
+            // went equivalence-red with the filesystem untouched).
+            || line.contains("__sh_rm(")
+            || line.contains("__sh_mkdir(")
+            || line.contains("__sh_touch(")
+            || line.contains("__sh_cat_stmt(")
         {
             return false;
         }
@@ -3281,8 +3323,8 @@ impl Render {
 
     /// Remove every reference to the exit-status register from ONE emitted
     /// unit (`rc_disabled` only). Textual by construction: the register is
-    /// an `AtomicI32` that only ever appears as a `store(…, Ordering::SeqCst)`
-    /// side effect or a `load(Ordering::SeqCst)` value, and the arm that
+    /// an `AtomicI32` that only ever appears as a `store(…, Ordering::Relaxed)`
+    /// side effect or a `load(Ordering::Relaxed)` value, and the arm that
     /// emits it always keeps whichever of {the side effect, the value} the
     /// host expression needs elsewhere (the stored value is never the
     /// expression's only effect: shell-outs, spawns and captures all have
@@ -3298,7 +3340,7 @@ impl Render {
         if crate::shir::stmt_status_write_is_unread(s) {
             return;
         }
-        self.emit("__SH_RC.store(0, Ordering::SeqCst);");
+        self.emit("__SH_RC.store(0, Ordering::Relaxed);");
     }
 
     fn rc_strip(&self, s: &str) -> String {
@@ -3317,6 +3359,36 @@ impl Render {
                     rest = &tail["__SH_RC".len()..];
                     continue;
                 };
+                // A store of a CALL is the STATEMENT itself — a status-only
+                // command such as `store(__sh_rm(…))` — not bookkeeping.
+                // Deleting it deletes the command (measured: `mkdir sub`,
+                // `touch a.sh` and `rm -rf $d` disappeared from every
+                // rc-disabled program, and three corpus examples went
+                // equivalence-red with the filesystem untouched). Keep the
+                // call, drop the register: `let _ = <call>;`. A store of a
+                // PLAIN value (identifier/number/bool) is bookkeeping and
+                // goes — the decision is the value's SHAPE, so a helper
+                // added later cannot silently become droppable.
+                if let Some(arg) = tail
+                    .get("__SH_RC.store(".len()..end - 1)
+                {
+                    if let Some(value) = split_args(arg).into_iter().next() {
+                        let value = value.trim();
+                        if value.contains('(') {
+                            let mut k = end;
+                            let bytes = tail.as_bytes();
+                            while k < bytes.len() && (bytes[k] == b' ' || bytes[k] == b'\t') {
+                                k += 1;
+                            }
+                            if k < bytes.len() && bytes[k] == b';' {
+                                k += 1;
+                            }
+                            out.push_str(&format!("let _ = {value};"));
+                            rest = &tail[k..];
+                            continue;
+                        }
+                    }
+                }
                 let mut after = end;
                 // swallow the trailing `;` (and any whitespace before it)
                 let bytes = tail.as_bytes();
@@ -3385,7 +3457,7 @@ impl Render {
 
     fn emit(&mut self, s: &str) {
         // `rc_strip` can reduce a whole unit to nothing — a status-store
-        // line is exactly `__SH_RC.store(0, Ordering::SeqCst);`, and with
+        // line is exactly `__SH_RC.store(0, Ordering::Relaxed);`, and with
         // the register disabled (`rc_disabled` — a source with no `$?`,
         // e.g. Python) every statement's trailing store is stripped. That
         // is a REMOVED line, not an intentional blank separator: only an
@@ -3729,7 +3801,7 @@ impl Render {
     /// restores it (a plain `for` needs no restore: no cond eval clobbers).
     fn loop_capture_rc(&mut self) {
         if let Some(v) = self.loop_rc_last.last() {
-            self.emit(&format!("{v} = __SH_RC.load(Ordering::SeqCst);"));
+            self.emit(&format!("{v} = __SH_RC.load(Ordering::Relaxed);"));
         }
     }
 
@@ -3840,7 +3912,7 @@ impl Render {
         let marker = "; __SH_RC.store(";
         let (expr, after) = rest.split_once(marker)?;
         // the store must be the `if __b { 0 } else { 1 }` status write …
-        let tail = after.strip_prefix("if __b { 0 } else { 1 }, Ordering::SeqCst); ")?;
+        let tail = after.strip_prefix("if __b { 0 } else { 1 }, Ordering::Relaxed); ")?;
         // … and the block must close right there
         let rem = tail.strip_prefix("__b }")?;
         Some((Self::unparen(expr.trim()).to_string(), rem))
@@ -5046,7 +5118,7 @@ impl Render {
             }
         } else {
             match name {
-                "?" => "__SH_RC.load(Ordering::SeqCst).to_string()".to_string(),
+                "?" => "__SH_RC.load(Ordering::Relaxed).to_string()".to_string(),
                 "$" => "std::process::id().to_string()".to_string(),
                 "#" => {
                     if let Some(n) = self.argv_len() {
@@ -5072,7 +5144,7 @@ impl Render {
                     // verbatim and rustc reported the doubled block
                     // ("unnecessary braces around block return value", 4
                     // corpus sites: `*v.borrow_mut() = {{ let __p = … }}`).
-                    "{ let __p = __SH_BGPID.load(Ordering::SeqCst); if __p == 0 { String::new() } else { __p.to_string() } }".to_string()
+                    "{ let __p = __SH_BGPID.load(Ordering::Relaxed); if __p == 0 { String::new() } else { __p.to_string() } }".to_string()
                 }
                 "RANDOM" => {
                     self.add_helper("rand");
@@ -5138,7 +5210,7 @@ impl Render {
             }
         } else {
             match name {
-                "?" => "__SH_RC.load(Ordering::SeqCst)".to_string(),
+                "?" => "__SH_RC.load(Ordering::Relaxed)".to_string(),
                 "$" => "std::process::id() as i64".to_string(),
                 "#" => {
                     if let Some(n) = self.argv_len() {
@@ -5572,7 +5644,7 @@ impl Render {
             }
         }
         format!(
-            "{{ let __v = ({}).to_string(); if __SH_ARITH_ERR.swap(false, Ordering::SeqCst) {{ String::new() }} else {{ __v }} }}",
+            "{{ let __v = ({}).to_string(); if __SH_ARITH_ERR.swap(false, Ordering::Relaxed) {{ String::new() }} else {{ __v }} }}",
             self.arith(a)
         )
     }
@@ -5692,7 +5764,7 @@ impl Render {
                             // (status write included, so unwrap_cond can
                             // strip it in condition position)
                             return format!(
-                                "{{ let __b = {}; __SH_RC.store(if __b {{ 0 }} else {{ 1 }}, Ordering::SeqCst); __b }}",
+                                "{{ let __b = {}; __SH_RC.store(if __b {{ 0 }} else {{ 1 }}, Ordering::Relaxed); __b }}",
                                 Self::unparen(&c)
                             );
                         }
@@ -5713,7 +5785,7 @@ impl Render {
                             // so `unwrap_cond` can strip it in condition
                             // position — same contract as `test_call_bool`.
                             return format!(
-                                "{{ let __b = {r};\n__SH_RC.store(if __b {{ 0 }} else {{ 1 }}, Ordering::SeqCst); __b }}"
+                                "{{ let __b = {r};\n__SH_RC.store(if __b {{ 0 }} else {{ 1 }}, Ordering::Relaxed); __b }}"
                             );
                         }
                     }
@@ -5845,7 +5917,7 @@ impl Render {
                 let pat = args.get(1).map(|a| self.expr_str(a)).unwrap_or_default();
                 let flags = args.get(2).map(|a| self.expr_str(a)).unwrap_or_default();
                 format!(
-                    "{{ let (__m, __r) = __sh_grepmatches(&{text}, &{pat}, &{flags}); __SH_RC.store(__r, Ordering::SeqCst); __r == 0 }}"
+                    "{{ let (__m, __r) = __sh_grepmatches(&{text}, &{pat}, &{flags}); __SH_RC.store(__r, Ordering::Relaxed); __r == 0 }}"
                 )
             }
             IrExpr::Call { func, args } if func == "getVar" => {
@@ -5904,18 +5976,18 @@ impl Render {
             IrExpr::Call { func, args } if func == "arith" => {
                 let text = str_arg(args, 0).unwrap_or("").replace(GLOB_SENTINEL, "");
                 if let Some(e) = self.arith_text_bool(&text) {
-                    format!("{{ let __b = ({e}); __SH_RC.store(if __b {{ 0 }} else {{ 1 }}, Ordering::SeqCst); __b }}")
+                    format!("{{ let __b = ({e}); __SH_RC.store(if __b {{ 0 }} else {{ 1 }}, Ordering::Relaxed); __b }}")
                 } else if text.contains("$(") {
-                    format!("{{ let __v = {}; __SH_RC.store(if __v != 0 {{ 0 }} else {{ 1 }}, Ordering::SeqCst); __v != 0 }}", self.arith_text_unparsed(&text, true))
+                    format!("{{ let __v = {}; __SH_RC.store(if __v != 0 {{ 0 }} else {{ 1 }}, Ordering::Relaxed); __v != 0 }}", self.arith_text_unparsed(&text, true))
                 } else {
-                    "{{ __SH_RC.store(1, Ordering::SeqCst); false }}".to_string()
+                    "{{ __SH_RC.store(1, Ordering::Relaxed); false }}".to_string()
                 }
             }
             IrExpr::Call { func, args } if func == "assign" => {
                 // run the assignment; the lhs's rc (e.g. a capture's)
                 // decides the condition
                 let block = self.assign_call_str(args);
-                format!("{{ let _ = {block}; __SH_RC.load(Ordering::SeqCst) == 0 }}")
+                format!("{{ let _ = {block}; __SH_RC.load(Ordering::Relaxed) == 0 }}")
             }
             IrExpr::Call { func, args } if func == "return" => {
                 // `return` WITH a value in a value-convention function:
@@ -5931,7 +6003,7 @@ impl Render {
                     // deadlock — polyfills brace/param)
                     self.add_helper("ret_rc");
                     format!(
-                        "{{ let __v = {v}; *__SH_RET.lock().unwrap() = __v.clone(); __SH_RC.store(__sh_ret_rc(&__v), Ordering::SeqCst); return; }}"
+                        "{{ let __v = {v}; *__SH_RET.lock().unwrap() = __v.clone(); __SH_RC.store(__sh_ret_rc(&__v), Ordering::Relaxed); return; }}"
                     )
                 } else {
                     // bare `return` = `return $?` — PROPAGATE the last
@@ -5944,9 +6016,9 @@ impl Render {
             IrExpr::Call { func, args: _ } if func == "break" => {
                 if self.loop_depth > 0 {
                     if let Some(v) = self.loop_rc_last.last() {
-                        format!("{{ __SH_RC.store(0, Ordering::SeqCst); {v} = __SH_RC.load(Ordering::SeqCst); break; false }}")
+                        format!("{{ __SH_RC.store(0, Ordering::Relaxed); {v} = __SH_RC.load(Ordering::Relaxed); break; false }}")
                     } else {
-                        "{ __SH_RC.store(0, Ordering::SeqCst); break; false }".to_string()
+                        "{ __SH_RC.store(0, Ordering::Relaxed); break; false }".to_string()
                     }
                 } else {
                     "false".to_string()
@@ -5955,9 +6027,9 @@ impl Render {
             IrExpr::Call { func, args: _ } if func == "continue" => {
                 if self.loop_depth > 0 {
                     if let Some(v) = self.loop_rc_last.last() {
-                        format!("{{ __SH_RC.store(0, Ordering::SeqCst); {v} = __SH_RC.load(Ordering::SeqCst); continue; false }}")
+                        format!("{{ __SH_RC.store(0, Ordering::Relaxed); {v} = __SH_RC.load(Ordering::Relaxed); continue; false }}")
                     } else {
-                        "{ __SH_RC.store(0, Ordering::SeqCst); continue; false }".to_string()
+                        "{ __SH_RC.store(0, Ordering::Relaxed); continue; false }".to_string()
                     }
                 } else {
                     "false".to_string()
@@ -6409,13 +6481,39 @@ impl Render {
                         self.arith_i64(&l, rhs),
                         self.arith_i64(&r, lhs)
                     ),
-                    "/" => {
-                        self.add_helper("div");
-                        format!("__sh_div({},{})", Self::let_value(&l), Self::let_value(&r))
-                    }
-                    "%" => {
-                        self.add_helper("mod");
-                        format!("__sh_mod({},{})", Self::let_value(&l), Self::let_value(&r))
+                    // Division/modulo carry a zero-divisor guard: the
+                    // helper sets __SH_ARITH_ERR instead of panicking in
+                    // i64. That guard is only reachable when the divisor
+                    // can BE zero, so:
+                    //   * a non-zero LITERAL divisor (`n / 10`) needs no
+                    //     helper — emit the operator directly;
+                    //   * `0 / <non-zero literal>` is 0 with no error, so
+                    //     the whole expression folds.
+                    // A NON-literal divisor keeps the helper: `1/0` prints
+                    // bash's "division by 0" diagnostic and sets the status,
+                    // which is exactly what the flag models. (Refusing the
+                    // `0 / expr` fold is deliberate for the same reason —
+                    // `0/0` is an observable arith error in bash, not 0.)
+                    "/" | "%" => {
+                        if let ArithAst::Num(d) = &**rhs {
+                            if *d != 0 {
+                                if matches!(&**lhs, ArithAst::Num(0)) {
+                                    return "0i64".to_string();
+                                }
+                                return format!(
+                                    "({} {op} {})",
+                                    self.arith_i64(&l, rhs),
+                                    self.arith_i64(&r, lhs)
+                                );
+                            }
+                        }
+                        if op.as_str() == "/" {
+                            self.add_helper("div");
+                            format!("__sh_div({},{})", Self::let_value(&l), Self::let_value(&r))
+                        } else {
+                            self.add_helper("mod");
+                            format!("__sh_mod({},{})", Self::let_value(&l), Self::let_value(&r))
+                        }
                     }
                     _ => format!(
                         "({} {op} {})",
@@ -6598,7 +6696,7 @@ impl Render {
                                     "__SH_TRAPS.lock().unwrap().push({}.to_string());",
                                     Self::rust_str(&handler)
                                 ));
-                                self.emit("__SH_RC.store(0, Ordering::SeqCst);");
+                                self.emit("__SH_RC.store(0, Ordering::Relaxed);");
                                 return;
                             }
                         }
@@ -6606,11 +6704,11 @@ impl Render {
                 }
                 // ERR/other traps: registered but not fired by the
                 // native lowering (a no-op is faithful when no error)
-                self.emit("__SH_RC.store(0, Ordering::SeqCst);");
+                self.emit("__SH_RC.store(0, Ordering::Relaxed);");
             }
             "cd" => {
-                let e = self.cd_expr(&words);
-                self.emit(&format!("let _ = {e};"));
+                let e = self.cd_expr(&words, false);
+                self.emit_discard(&e);
             }
             "export" | "local" | "declare" | "typeset" | "readonly" => {
                 // `typeset -f name` (body) / `-F name` (names) / `-p name`
@@ -6625,22 +6723,22 @@ impl Render {
                             } else {
                                 self.fn_print(&name, flag == "-F");
                             }
-                            self.emit("__SH_RC.store(0, Ordering::SeqCst);");
+                            self.emit("__SH_RC.store(0, Ordering::Relaxed);");
                             return;
                         }
                     }
                 }
                 let exported = matches!(cmd, "export" | "readonly");
                 self.decl_words(&words, exported);
-                self.emit("__SH_RC.store(0, Ordering::SeqCst);");
+                self.emit("__SH_RC.store(0, Ordering::Relaxed);");
             }
             "unset" => {
                 self.unset_words(&words);
-                self.emit("__SH_RC.store(0, Ordering::SeqCst);");
+                self.emit("__SH_RC.store(0, Ordering::Relaxed);");
             }
             "set" => {
                 self.set_words(&words);
-                self.emit("__SH_RC.store(0, Ordering::SeqCst);");
+                self.emit("__SH_RC.store(0, Ordering::Relaxed);");
             }
             "shift" => {
                 let n = match words.first() {
@@ -6657,7 +6755,7 @@ impl Render {
                     if let Some(p) = self.probe.as_mut() {
                         p.saw_shift = true;
                     }
-                    self.emit("__SH_RC.store(0, Ordering::SeqCst);");
+                    self.emit("__SH_RC.store(0, Ordering::Relaxed);");
                     return;
                 }
                 // pass-3: rebinding argv poisons the signature verdict
@@ -6665,12 +6763,12 @@ impl Render {
                 self.emit(&format!(
                     "{{ let mut __v = __SH_ARGV.lock().unwrap(); let __n = ({n}).min(__v.len() as i64) as usize; __v.drain(0..__n); }}"
                 ));
-                self.emit("__SH_RC.store(0, Ordering::SeqCst);");
+                self.emit("__SH_RC.store(0, Ordering::Relaxed);");
             }
             "read" => {
                 let ifs = env_ifs(&env);
                 let e = self.read_expr(&words, ifs);
-                self.emit(&format!("let _ = {e};"));
+                self.emit_discard(&e);
             }
             "mapfile" | "readarray" => {
                 // `mapfile -t arr < <(producer)` — read ALL stdin lines
@@ -6702,7 +6800,7 @@ impl Render {
                         ));
                     }
                 }
-                self.emit("__SH_RC.store(0, Ordering::SeqCst);");
+                self.emit("__SH_RC.store(0, Ordering::Relaxed);");
             }
             "let" => {
                 let text = words
@@ -6711,13 +6809,15 @@ impl Render {
                     .collect::<Vec<_>>()
                     .join(" ");
                 if let Some(e) = self.let_expr(&text) {
+                    // the block IS the statement: its `__v` tail is the
+                    // value the shell discards, so no `let _ =` wrapper
                     self.emit(&format!(
-                        "let _ = {{ let __v = {}; __SH_RC.store(if __v != 0 {{ 0 }} else {{ 1 }}, Ordering::SeqCst); __v }};",
+                        "{{ let __v = {}; __SH_RC.store(if __v != 0 {{ 0 }} else {{ 1 }}, Ordering::Relaxed); __v }};",
                         Self::let_value(&e)
                     ));
                 } else {
                     self.mark_todo("let");
-                    self.emit("__SH_RC.store(0, Ordering::SeqCst);");
+                    self.emit("__SH_RC.store(0, Ordering::Relaxed);");
                 }
             }
             "shopt" => {
@@ -6736,7 +6836,7 @@ impl Render {
                         }
                     }
                 }
-                self.emit("__SH_RC.store(0, Ordering::SeqCst);");
+                self.emit("__SH_RC.store(0, Ordering::Relaxed);");
             }
             "type" => {
                 // `type doselect` — a registered (eval'd) function
@@ -6751,20 +6851,20 @@ impl Render {
                         }
                     }
                 }
-                self.emit("__SH_RC.store(0, Ordering::SeqCst);");
+                self.emit("__SH_RC.store(0, Ordering::Relaxed);");
             }
             "true" | ":" => {
-                self.emit("__SH_RC.store(0, Ordering::SeqCst);");
+                self.emit("__SH_RC.store(0, Ordering::Relaxed);");
             }
             "false" => {
-                self.emit("__SH_RC.store(1, Ordering::SeqCst);");
+                self.emit("__SH_RC.store(1, Ordering::Relaxed);");
             }
             "pwd" => {
                 self.add_helper("print_words");
                 self.emit(&format!(
                     "__sh_print_words(&[vec![std::env::current_dir().map(|p| p.display().to_string()).unwrap_or_default()]], true, false);"
                 ));
-                self.emit("__SH_RC.store(0, Ordering::SeqCst);");
+                self.emit("__SH_RC.store(0, Ordering::Relaxed);");
             }
             "sleep" => {
                 let v = match words.first() {
@@ -6773,25 +6873,25 @@ impl Render {
                 };
                 self.add_helper("sleep");
                 self.emit(&format!("__sh_sleep(&{v});"));
-                self.emit("__SH_RC.store(0, Ordering::SeqCst);");
+                self.emit("__SH_RC.store(0, Ordering::Relaxed);");
             }
             "wait" => {
                 self.add_helper("wait_all");
                 self.emit("__sh_wait_all();");
-                self.emit("__SH_RC.store(0, Ordering::SeqCst);");
+                self.emit("__SH_RC.store(0, Ordering::Relaxed);");
             }
             "break" => {
                 if self.loop_depth > 0 {
                     // break/continue are status-0 builtins; the loop's rc
                     // is the last body command's — capture 0 before jumping
-                    self.emit("__SH_RC.store(0, Ordering::SeqCst);");
+                    self.emit("__SH_RC.store(0, Ordering::Relaxed);");
                     self.loop_capture_rc();
                     self.emit("break;");
                 }
             }
             "continue" => {
                 if self.loop_depth > 0 {
-                    self.emit("__SH_RC.store(0, Ordering::SeqCst);");
+                    self.emit("__SH_RC.store(0, Ordering::Relaxed);");
                     self.loop_capture_rc();
                     self.emit_continue();
                 }
@@ -6804,11 +6904,11 @@ impl Render {
                     .join(" ");
                 if let Some(c) = self.test_expr(&text, "[") {
                     self.emit(&format!(
-                        "let _ = {{ let __b = {}; __SH_RC.store(if __b {{ 0 }} else {{ 1 }}, Ordering::SeqCst); __b }};", Self::unparen(&c)
+                        "{{ let __b = {}; __SH_RC.store(if __b {{ 0 }} else {{ 1 }}, Ordering::Relaxed); __b }};", Self::unparen(&c)
                     ));
                 } else {
                     self.mark_todo("test");
-                    self.emit("__SH_RC.store(0, Ordering::SeqCst);");
+                    self.emit("__SH_RC.store(0, Ordering::Relaxed);");
                 }
             }
             "eval" => {
@@ -6854,7 +6954,7 @@ impl Render {
                             self.write_str(name, &v)
                         };
                         self.emit(&st);
-                        self.emit("__SH_RC.store(0, Ordering::SeqCst);");
+                        self.emit("__SH_RC.store(0, Ordering::Relaxed);");
                         return;
                     }
                 }
@@ -6863,12 +6963,12 @@ impl Render {
                 // (a child bash would not see the native store)
                 let interp = self.dollar_interp(&joined);
                 self.add_helper("run");
-                self.emit(&format!("__SH_RC.store(__sh_run(&{interp}), Ordering::SeqCst);"));
+                self.emit(&format!("__SH_RC.store(__sh_run(&{interp}), Ordering::Relaxed);"));
             }
             "command" => {
                 let text = self.cmd_text(&words, None);
                 self.add_helper("run");
-                self.emit(&format!("__SH_RC.store(__sh_run(&{text}), Ordering::SeqCst);"));
+                self.emit(&format!("__SH_RC.store(__sh_run(&{text}), Ordering::Relaxed);"));
             }
             "source" | "." => {
                 // `. file args` — the sourced assignments must land in
@@ -6908,7 +7008,7 @@ impl Render {
                         format!("{} else {{ std::env::set_var(__n, __val.trim()); }}", assigns.join(" else "))
                     }
                 ));
-                self.emit("__SH_RC.store(0, Ordering::SeqCst);");
+                self.emit("__SH_RC.store(0, Ordering::Relaxed);");
             }
             "exec" | "builtin" => {
                 // `exec cmd args` — run the command, then exit with its rc.
@@ -6917,12 +7017,26 @@ impl Render {
                 let text = self.cmd_text(&words, None);
                 if words.is_empty() {
                     self.add_helper("run");
-                    self.emit(&format!("__SH_RC.store(__sh_run(&{text}), Ordering::SeqCst);"));
+                    self.emit(&format!("__SH_RC.store(__sh_run(&{text}), Ordering::Relaxed);"));
                     return;
                 }
                 self.add_helper("run");
                 self.emit(&format!("std::process::exit(__sh_run(&{text}));"));
             }
+            "rm" | "mkdir" | "touch" => {
+                // Native filesystem commands. `rm` alone was 66 of the
+                // corpus's ~100 literal forked sites; each of these is a
+                // std::fs call, so the child `/bin/bash -c` bought nothing
+                // (and lost the parent's view of a path).
+                match self.native_fs_stmt(cmd, &words) {
+                    Some(st) => self.emit(&st),
+                    None => self.shell_stmt(cmd, &words, env.as_deref()),
+                }
+            }
+            "cat" => match self.native_cat_stmt(&words) {
+                Some(st) => self.emit(&st),
+                None => self.shell_stmt(cmd, &words, env.as_deref()),
+            },
             _ => {
                 // unknown builtin or external command — bash -c shell-out
                 let cmd_word = IrExpr::Str(cmd.to_string(), crate::ir::StrStyle::DoubleQuoted);
@@ -6930,9 +7044,203 @@ impl Render {
                 all.extend(words.iter());
                 let text = self.cmd_text(&all, env.as_deref());
                 self.add_helper("run");
-                self.emit(&format!("__SH_RC.store(__sh_run(&{text}), Ordering::SeqCst);"));
+                self.emit(&format!("__SH_RC.store(__sh_run(&{text}), Ordering::Relaxed);"));
             }
         }
+    }
+
+    /// The plain `bash -c` statement shell-out (rc captured).
+    fn shell_stmt(&mut self, cmd: &str, words: &[&IrExpr], env: Option<&[(String, IrExpr)]>) {
+        let cmd_word = IrExpr::Str(cmd.to_string(), crate::ir::StrStyle::DoubleQuoted);
+        let mut all: Vec<&IrExpr> = vec![&cmd_word];
+        all.extend(words.iter());
+        let text = self.cmd_text(&all, env);
+        self.add_helper("run");
+        self.emit(&format!("__SH_RC.store(__sh_run(&{text}), Ordering::Relaxed);"));
+    }
+
+    /// The options a native command arm knows how to honour. A word list
+    /// carrying any other static flag refuses the native lowering, so the
+    /// shell-out keeps the flag's exact semantics (`Refuse > guess`).
+    fn fs_flags_ok(cmd: &str, words: &[&IrExpr]) -> bool {
+        let allowed: &[char] = match cmd {
+            "rm" => &['f', 'r', 'R', 'd'],
+            "mkdir" => &['p', 'v'],
+            _ => &[],
+        };
+        let mut end_opts = false;
+        for w in words {
+            if end_opts {
+                continue;
+            }
+            let IrExpr::Str(s, _) = w else {
+                // a dynamic word is an operand
+                continue;
+            };
+            if s == "--" {
+                end_opts = true;
+                continue;
+            }
+            if s.len() > 1 && s.starts_with('-') {
+                for c in s[1..].chars() {
+                    if !allowed.contains(&c) {
+                        return false;
+                    }
+                }
+            }
+        }
+        true
+    }
+
+    /// A word list as a `Vec<String>` argument expression, or `None` when a
+    /// word is not exactly ONE runtime string — a splat, array, brace group,
+    /// glob or capture expands to a different operand count than the fixed
+    /// argv this lowering passes.
+    fn fs_argv(&mut self, words: &[&IrExpr]) -> Option<String> {
+        let mut parts = Vec::new();
+        for w in words {
+            if Self::is_splat_word(w) {
+                return None;
+            }
+            match w {
+                IrExpr::Array(_) => return None,
+                IrExpr::Str(s, _) => {
+                    if s.starts_with(GLOB_SENTINEL)
+                        || s.contains('*')
+                        || s.contains('?')
+                        || s.contains('[')
+                        || s.starts_with('~')
+                    {
+                        return None;
+                    }
+                }
+                IrExpr::Call { func, .. }
+                    if matches!(func.as_str(), "brace" | "capture" | "glob" | "arrayItems") =>
+                {
+                    return None;
+                }
+                _ => {}
+            }
+            parts.push(self.expr_str(w));
+        }
+        Some(format!("vec![{}]", parts.join(", ")))
+    }
+
+    fn native_fs_stmt(&mut self, cmd: &str, words: &[&IrExpr]) -> Option<String> {
+        if !Self::fs_flags_ok(cmd, words) {
+            return None;
+        }
+        let argv = self.fs_argv(words)?;
+        self.add_helper(cmd);
+        Some(format!(
+            "__SH_RC.store(__sh_{cmd}(&{argv}), Ordering::Relaxed);"
+        ))
+    }
+
+    fn native_cat_stmt(&mut self, words: &[&IrExpr]) -> Option<String> {
+        if words.is_empty() || !Self::fs_flags_ok("cat", words) {
+            return None; // no operand: `cat` copies stdin
+        }
+        let argv = self.fs_argv(words)?;
+        self.add_helper("cat_stmt");
+        Some(format!(
+            "__SH_RC.store(__sh_cat_stmt(&{argv}), Ordering::Relaxed);"
+        ))
+    }
+
+    /// A `$(cmd args)` capture the renderer can compute without a shell.
+    /// `cat`/`basename`/`dirname`/`mktemp` are the corpus's capture-position
+    /// externals; everything else keeps its shell-out (refuse > guess).
+    fn native_capture_value(&mut self, stmts: &[IrStmt]) -> Option<String> {
+        let [IrStmt::Expr(IrExpr::Call { func, args })] = stmts else {
+            return None;
+        };
+        if !matches!(func.as_str(), "exec" | "builtin") || args.len() > 2 {
+            return None;
+        }
+        let cmd = str_arg(args, 0)?.to_string();
+        let empty: Vec<IrExpr> = Vec::new();
+        let items: &Vec<IrExpr> = match args.get(1) {
+            Some(IrExpr::Array(a)) => a,
+            None => &empty,
+            _ => return None,
+        };
+        let words: Vec<&IrExpr> = items.iter().collect();
+        if !Self::fs_flags_ok(&cmd, &words) {
+            // `mktemp -d` is the one flagged form this arm owns; -p/-t/-u
+            // keep the shell.
+            if !(cmd == "mktemp" && Self::mktemp_flags_ok(&words)) {
+                return None;
+            }
+        }
+        match cmd.as_str() {
+            "cat" => {
+                if words.is_empty() {
+                    return None;
+                }
+                let argv = self.fs_argv(&words)?;
+                self.add_helper("catf");
+                Some(format!(
+                    "{{ let __c = __sh_catf(&{argv}); __SH_RC.store(if __c.is_some() {{ 0 }} else {{ 1 }}, Ordering::Relaxed); __c.unwrap_or_default() }}"
+                ))
+            }
+            "basename" | "dirname" => {
+                if words.is_empty() {
+                    return None;
+                }
+                let argv = self.fs_argv(&words)?;
+                // `basename`/`dirname` already own a SINGLE-argument helper
+                // (`__sh_basename(&str)`, used by the word-level pathops
+                // lowering), so this argv form gets its own name.
+                self.add_helper(&format!("{cmd}_args"));
+                Some(format!(
+                    "{{ let __c = __sh_{cmd}_args(&{argv}); __SH_RC.store(0, Ordering::Relaxed); __c }}"
+                ))
+            }
+            "mktemp" => {
+                let mut dir = false;
+                let mut tmpl: Option<String> = None;
+                for w in &words {
+                    let s = str_arg(&[(*w).clone()], 0)?.to_string();
+                    if s == "-d" || s == "--directory" {
+                        dir = true;
+                    } else if s.starts_with('-') {
+                        return None;
+                    } else if tmpl.is_some() {
+                        return None;
+                    } else {
+                        tmpl = Some(s);
+                    }
+                }
+                let t = match &tmpl {
+                    // A template is a literal path with a run of trailing X's.
+                    Some(t) => Self::rust_str(t),
+                    None => Self::rust_str(""),
+                };
+                self.add_helper("mktemp");
+                Some(format!(
+                    "{{ let __c = __sh_mktemp({dir}, &{t}); __SH_RC.store(if __c.is_empty() {{ 1 }} else {{ 0 }}, Ordering::Relaxed); __c }}"
+                ))
+            }
+            _ => None,
+        }
+    }
+
+    /// `mktemp`'s flag set: `-d`/`--directory` only (the corpus form).
+    fn mktemp_flags_ok(words: &[&IrExpr]) -> bool {
+        let mut end_opts = false;
+        for w in words {
+            let IrExpr::Str(s, _) = w else { continue };
+            if end_opts {
+                continue;
+            }
+            if s == "--" {
+                end_opts = true;
+            } else if s.starts_with('-') && s != "-d" && s != "--directory" {
+                return false;
+            }
+        }
+        true
     }
 
     /// An `exec` call rendered as a bool expression (conditions).
@@ -6949,7 +7257,7 @@ impl Render {
             return self.fn_call_bool(cmd, &words);
         }
         match cmd {
-            "cd" => self.cd_expr(&words),
+            "cd" => self.cd_expr(&words, true),
             "read" => {
                 let ifs = env_ifs(&env);
                 self.read_expr(&words, ifs)
@@ -6962,10 +7270,10 @@ impl Render {
                     .join(" ");
                 let (e, is_bool) = self.let_expr_bool(&text);
                 if is_bool {
-                    format!("{{ let __b = {e}; __SH_RC.store(if __b {{ 0 }} else {{ 1 }}, Ordering::SeqCst); __b }}")
+                    format!("{{ let __b = {e}; __SH_RC.store(if __b {{ 0 }} else {{ 1 }}, Ordering::Relaxed); __b }}")
                 } else {
                     format!(
-                        "{{ let __v = {}; __SH_RC.store(if __v != 0 {{ 0 }} else {{ 1 }}, Ordering::SeqCst); __v != 0 }}",
+                        "{{ let __v = {}; __SH_RC.store(if __v != 0 {{ 0 }} else {{ 1 }}, Ordering::Relaxed); __v != 0 }}",
                         Self::let_value(&e)
                     )
                 }
@@ -6977,17 +7285,17 @@ impl Render {
                     .collect::<Vec<_>>()
                     .join(" ");
                 if let Some(c) = self.test_expr(&text, "[") {
-                    format!("{{ let __b = {}; __SH_RC.store(if __b {{ 0 }} else {{ 1 }}, Ordering::SeqCst); __b }}", Self::unparen(&c))
+                    format!("{{ let __b = {}; __SH_RC.store(if __b {{ 0 }} else {{ 1 }}, Ordering::Relaxed); __b }}", Self::unparen(&c))
                 } else {
                     self.mark_todo("test");
                     "true".to_string()
                 }
             }
             "true" | ":" => {
-                "({ __SH_RC.store(0, Ordering::SeqCst); true })".to_string()
+                "({ __SH_RC.store(0, Ordering::Relaxed); true })".to_string()
             }
             "false" => {
-                "({ __SH_RC.store(1, Ordering::SeqCst); false })".to_string()
+                "({ __SH_RC.store(1, Ordering::Relaxed); false })".to_string()
             }
             "sleep" => {
                 let v = match words.first() {
@@ -6995,7 +7303,7 @@ impl Render {
                     None => "\"0\"".to_string(),
                 };
                 self.add_helper("sleep");
-                format!("{{ __sh_sleep(&{v}); __SH_RC.store(0, Ordering::SeqCst); true }}")
+                format!("{{ __sh_sleep(&{v}); __SH_RC.store(0, Ordering::Relaxed); true }}")
             }
             "exit" => {
                 let code = match words.first() {
@@ -7006,13 +7314,14 @@ impl Render {
             }
             "echo" | "printf" | "export" | "local" | "declare" | "typeset" | "readonly"
             | "unset" | "set" | "shift" | "pwd" | "wait" | "eval" | "source" | "."
-            | "command" | "exec" | "break" | "continue" => {
+            | "command" | "exec" | "break" | "continue"
+            | "rm" | "mkdir" | "touch" | "cat" => {
                 // a builtin in a condition: run it, rc decides
                 let saved = std::mem::take(&mut self.out);
                 let old_depth = self.depth;
                 self.depth = 0;
                 self.exec_stmt(args);
-                self.emit("__SH_RC.load(Ordering::SeqCst) == 0");
+                self.emit("__SH_RC.load(Ordering::Relaxed) == 0");
                 let block = self.out.join("\n");
                 self.out = saved;
                 self.depth = old_depth;
@@ -7024,7 +7333,7 @@ impl Render {
                 all.extend(words.iter());
                 let text = self.cmd_text(&all, env.as_deref());
                 self.add_helper("run");
-                format!("{{ let __r = __sh_run(&{text}); __SH_RC.store(__r, Ordering::SeqCst); __r == 0 }}")
+                format!("{{ let __r = __sh_run(&{text}); __SH_RC.store(__r, Ordering::Relaxed); __r == 0 }}")
             }
         }
     }
@@ -7085,7 +7394,7 @@ impl Render {
     }
 
     /// bash `cd` — chdir + PWD sync; returns a bool block expr.
-    fn cd_expr(&mut self, words: &[&IrExpr]) -> String {
+    fn cd_expr(&mut self, words: &[&IrExpr], value: bool) -> String {
         // `cd -- dir` / `cd -` — skip the flag words
         let mut rest = words;
         while let Some(IrExpr::Str(f, _)) = rest.first().copied() {
@@ -7102,10 +7411,14 @@ impl Render {
                 "__sh_env(\"HOME\")".to_string()
             }
         };
+        // the tail is the boolean VALUE of `cd` (an `exec_bool` operand); a
+        // plain STATEMENT needs none, and omitting it there keeps the block
+        // free of a discarded `#[must_use]` result
+        let tail = if value { " __r.is_ok()" } else { "" };
         format!(
             "{{ let __d = {dir}; let __r = std::env::set_current_dir(&__d); \
              if __r.is_ok() {{ std::env::set_var(\"PWD\", std::env::current_dir().map(|p| p.display().to_string()).unwrap_or_default()); }} \
-             __SH_RC.store(if __r.is_ok() {{ 0 }} else {{ 1 }}, Ordering::SeqCst); __r.is_ok() }}"
+             __SH_RC.store(if __r.is_ok() {{ 0 }} else {{ 1 }}, Ordering::Relaxed);{tail} }}"
         )
     }
 
@@ -7527,7 +7840,7 @@ impl Render {
                 }
             }
         }
-        lines.push("__SH_RC.store(if __any { 0 } else { 1 }, Ordering::SeqCst);".to_string());
+        lines.push("__SH_RC.store(if __any { 0 } else { 1 }, Ordering::Relaxed);".to_string());
         lines.push("__any".to_string());
         format!("{{\n{}\n}}", lines.join("\n"))
     }
@@ -7542,7 +7855,7 @@ impl Render {
             }
             IrExpr::Call { func, args } if func == "setArray" || func == "setArrayAppend" => {
                 self.array_call_stmt_by_name(func, args);
-                self.emit("__SH_RC.store(0, Ordering::SeqCst);");
+                self.emit("__SH_RC.store(0, Ordering::Relaxed);");
             }
             IrExpr::Call { func, args } if func == "redirect" => {
                 let mut stmts: Vec<IrStmt> = Vec::new();
@@ -7561,7 +7874,7 @@ impl Render {
             }
             IrExpr::Call { func, args } if func == "whileLoop" => {
                 let b = self.whileloop_bool(args);
-                self.emit(&format!("let _ = {b};"));
+                self.emit_discard(&b);
             }
             IrExpr::Call { func, args } if func == "subshell" => {
                 let mut stmts: Vec<IrStmt> = Vec::new();
@@ -7572,7 +7885,7 @@ impl Render {
             }
             IrExpr::Call { func, args } if func == "test" => {
                 let b = self.test_call_bool(args);
-                self.emit(&format!("let _ = {b};"));
+                self.emit_discard(&b);
             }
             IrExpr::Call { func, args } if func == "grepMatches" => {
                 self.grepmatches_stmt(args);
@@ -7582,25 +7895,25 @@ impl Render {
             }
             IrExpr::Call { func, .. } if func == "break" => {
                 if self.loop_depth > 0 {
-                    self.emit("__SH_RC.store(0, Ordering::SeqCst);");
+                    self.emit("__SH_RC.store(0, Ordering::Relaxed);");
                     self.loop_capture_rc();
                     self.emit("break;");
                 }
             }
             IrExpr::Call { func, .. } if func == "continue" => {
                 if self.loop_depth > 0 {
-                    self.emit("__SH_RC.store(0, Ordering::SeqCst);");
+                    self.emit("__SH_RC.store(0, Ordering::Relaxed);");
                     self.loop_capture_rc();
                     self.emit_continue();
                 }
             }
             IrExpr::Call { func, .. } if func == "return" => {
-                self.emit("__SH_RC.store(0, Ordering::SeqCst); return;");
+                self.emit("__SH_RC.store(0, Ordering::Relaxed); return;");
             }
             _ => {
                 let x = self.expr_any(e);
-                self.emit(&format!("let _ = {x};"));
-                self.emit("__SH_RC.store(0, Ordering::SeqCst);");
+                self.emit_discard(&x);
+                self.emit("__SH_RC.store(0, Ordering::Relaxed);");
             }
         }
     }
@@ -7822,7 +8135,7 @@ impl Render {
                     })
                     .collect();
                 let ev = format!(
-                    "vec![{{ let __aw = ({e}).to_string(); if {} {{ __SH_ARITH_WORD_FAIL.store(true, Ordering::SeqCst); }} __aw }}]",
+                    "vec![{{ let __aw = ({e}).to_string(); if {} {{ __SH_ARITH_WORD_FAIL.store(true, Ordering::Relaxed); }} __aw }}]",
                     checks.join(" || ")
                 );
                 (ev, true)
@@ -8695,11 +9008,14 @@ impl Render {
                 // (skipped for KNOWN user-function calls — a bash -c
                 // child can't see the transpiled fn, so those run
                 // in-process via capture_block)
+                if let Some(v) = self.native_capture_value(stmts) {
+                    return v;
+                }
                 if !self.is_fn_capture(stmts) {
                     if let Some(text) = self.stage_text(stmts) {
                         self.add_helper("capture_rc");
                         return format!(
-                            "{{ let (__c, __r) = __sh_capture_rc(&{text}); __SH_RC.store(__r, Ordering::SeqCst); __c }}"
+                            "{{ let (__c, __r) = __sh_capture_rc(&{text}); __SH_RC.store(__r, Ordering::Relaxed); __c }}"
                         );
                     }
                 }
@@ -8716,11 +9032,14 @@ impl Render {
     fn capture_expr_single(&mut self, e: &IrExpr) -> String {
         if let IrExpr::Capture { expr, .. } = e {
             if let IrExpr::Arrow(stmts) = expr.as_ref() {
+                if let Some(v) = self.native_capture_value(stmts) {
+                    return v;
+                }
                 if !self.is_fn_capture(stmts) {
                     if let Some(text) = self.stage_text(stmts) {
                         self.add_helper("capture_rc");
                         return format!(
-                            "{{ let (__c, __r) = __sh_capture_rc(&{text}); __SH_RC.store(__r, Ordering::SeqCst); __c }}"
+                            "{{ let (__c, __r) = __sh_capture_rc(&{text}); __SH_RC.store(__r, Ordering::Relaxed); __c }}"
                         );
                     }
                 }
@@ -8803,7 +9122,7 @@ impl Render {
         if let Some(s) = str_arg(args, 0).map(|s| s.to_string()) {
             if let Some(c) = self.test_expr(&s, &style) {
                 return format!(
-                    "{{ let __b = {}; __SH_RC.store(if __b {{ 0 }} else {{ 1 }}, Ordering::SeqCst); __b }}", Self::unparen(&c)
+                    "{{ let __b = {}; __SH_RC.store(if __b {{ 0 }} else {{ 1 }}, Ordering::Relaxed); __b }}", Self::unparen(&c)
                 );
             }
         }
@@ -8861,11 +9180,11 @@ impl Render {
                     joined = format!("format!(\"{{}} | {{}}\", {joined}, {t})");
                 }
                 if j == n {
-                    self.emit(&format!("__SH_RC.store(__sh_spawn(&{joined}, Some(&{buf})), Ordering::SeqCst);"));
+                    self.emit(&format!("__SH_RC.store(__sh_spawn(&{joined}, Some(&{buf})), Ordering::Relaxed);"));
                 } else {
                     self.emit(&format!("{buf} = __sh_cap_bytes(&{joined}, Some(&{buf}));"));
                 }
-                self.emit("__SH_PIPESTATUS.lock().unwrap().push(__SH_RC.load(Ordering::SeqCst));");
+                self.emit("__SH_PIPESTATUS.lock().unwrap().push(__SH_RC.load(Ordering::Relaxed));");
                 idx = j;
                 continue;
             }
@@ -8874,11 +9193,11 @@ impl Render {
             if let Some(text) = self.stage_text(st) {
                 // shell stage
                 if last {
-                    self.emit(&format!("__SH_RC.store(__sh_spawn(&{text}, Some(&{buf})), Ordering::SeqCst);"));
+                    self.emit(&format!("__SH_RC.store(__sh_spawn(&{text}, Some(&{buf})), Ordering::Relaxed);"));
                 } else {
                     self.emit(&format!("{buf} = __sh_cap_bytes(&{text}, Some(&{buf}));"));
                 }
-                self.emit("__SH_PIPESTATUS.lock().unwrap().push(__SH_RC.load(Ordering::SeqCst));");
+                self.emit("__SH_PIPESTATUS.lock().unwrap().push(__SH_RC.load(Ordering::Relaxed));");
             } else {
                 // native stage
                 let saved = std::mem::take(&mut self.out);
@@ -8920,7 +9239,7 @@ impl Render {
                 if idx > 0 {
                     self.emit("*__SH_STDIN.lock().unwrap() = __oldin;");
                 }
-                self.emit("__SH_PIPESTATUS.lock().unwrap().push(__SH_RC.load(Ordering::SeqCst));");
+                self.emit("__SH_PIPESTATUS.lock().unwrap().push(__SH_RC.load(Ordering::Relaxed));");
                 let block = self.out.join("\n");
                 self.out = saved;
                 self.depth = old_depth;
@@ -8944,7 +9263,7 @@ impl Render {
         let old_depth = self.depth;
         self.depth = 0;
         self.pipeline_stmt(&stages);
-        self.emit("__SH_RC.load(Ordering::SeqCst) == 0");
+        self.emit("__SH_RC.load(Ordering::Relaxed) == 0");
         let block = self.out.join("\n");
         self.out = saved;
         self.depth = old_depth;
@@ -9008,14 +9327,14 @@ impl Render {
         }
         if track {
             self.loop_rc_last.pop();
-            self.emit(&format!("{last} = __SH_RC.load(Ordering::SeqCst);"));
+            self.emit(&format!("{last} = __SH_RC.load(Ordering::Relaxed);"));
         }
         self.depth -= 1;
         self.loop_depth -= 1;
         self.emit("}");
         if track {
             self.emit(&format!(
-                "if !{ran} {{ __SH_RC.store(0, Ordering::SeqCst); }} else {{ __SH_RC.store({last}, Ordering::SeqCst); }}"
+                "if !{ran} {{ __SH_RC.store(0, Ordering::Relaxed); }} else {{ __SH_RC.store({last}, Ordering::Relaxed); }}"
             ));
         }
         let block = self.out.join("\n");
@@ -9042,7 +9361,7 @@ impl Render {
         for s in stmts {
             self.stmt(s);
         }
-        self.emit("__SH_RC.load(Ordering::SeqCst) == 0");
+        self.emit("__SH_RC.load(Ordering::Relaxed) == 0");
         let block = self.out.join("\n");
         self.out = saved;
         self.depth = old_depth;
@@ -9080,7 +9399,7 @@ impl Render {
         let flags = args.get(2).map(|a| self.expr_str(a)).unwrap_or_default();
         self.emit(&format!("let (__m, __r) = __sh_grepmatches(&{text}, &{pat}, &{flags});"));
         self.emit("if !__m.is_empty() { __sh_print_words(&[vec![__m]], true, false); }");
-        self.emit("__SH_RC.store(__r, Ordering::SeqCst);");
+        self.emit("__SH_RC.store(__r, Ordering::Relaxed);");
     }
 
     /// and as a statement.
@@ -9088,7 +9407,7 @@ impl Render {
         let blocks = self.and_blocks(args);
         for (i, b) in blocks.iter().enumerate() {
             if i > 0 {
-                self.emit("if __SH_RC.load(Ordering::SeqCst) == 0 {");
+                self.emit("if __SH_RC.load(Ordering::Relaxed) == 0 {");
                 self.depth += 1;
             }
             for s in b {
@@ -9109,7 +9428,7 @@ impl Render {
         self.depth = 0;
         for (i, b) in blocks.iter().enumerate() {
             if i > 0 {
-                self.emit("if __SH_RC.load(Ordering::SeqCst) == 0 {");
+                self.emit("if __SH_RC.load(Ordering::Relaxed) == 0 {");
                 self.depth += 1;
             }
             for s in b {
@@ -9120,7 +9439,7 @@ impl Render {
                 self.emit("}");
             }
         }
-        self.emit("__SH_RC.load(Ordering::SeqCst) == 0");
+        self.emit("__SH_RC.load(Ordering::Relaxed) == 0");
         let block = self.out.join("\n");
         self.out = saved;
         self.depth = old_depth;
@@ -9152,7 +9471,7 @@ impl Render {
         let old_depth = self.depth;
         self.depth = 0;
         self.redirect_render(&stmts, &redirs);
-        self.emit("__SH_RC.load(Ordering::SeqCst) == 0");
+        self.emit("__SH_RC.load(Ordering::Relaxed) == 0");
         let block = self.out.join("\n");
         self.out = saved;
         self.depth = old_depth;
@@ -9169,7 +9488,7 @@ impl Render {
         let old_depth = self.depth;
         self.depth = 0;
         self.subshell_render(&stmts);
-        self.emit("__SH_RC.load(Ordering::SeqCst) == 0");
+        self.emit("__SH_RC.load(Ordering::Relaxed) == 0");
         let block = self.out.join("\n");
         self.out = saved;
         self.depth = old_depth;
@@ -9364,10 +9683,10 @@ impl Render {
                 self.add_helper("spawn");
                 if let Some(inp) = input {
                     self.emit(&format!(
-                        "__SH_RC.store(__sh_spawn(&{full}, Some({inp}.as_bytes())), Ordering::SeqCst);"
+                        "__SH_RC.store(__sh_spawn(&{full}, Some({inp}.as_bytes())), Ordering::Relaxed);"
                     ));
                 } else {
-                    self.emit(&format!("__SH_RC.store(__sh_spawn(&{full}, None), Ordering::SeqCst);"));
+                    self.emit(&format!("__SH_RC.store(__sh_spawn(&{full}, None), Ordering::Relaxed);"));
                 }
                 return;
             }
@@ -9938,12 +10257,12 @@ impl Render {
                 ws,
                 &sig,
                 true,
-                Some("__SH_RC.load(Ordering::SeqCst) == 0"),
+                Some("__SH_RC.load(Ordering::Relaxed) == 0"),
             );
         }
         self.add_helper("cat");
         format!(
-            "{{ let __old = __SH_ARGV.lock().unwrap().clone(); let __new = __sh_cat(&[{}]); *__SH_ARGV.lock().unwrap() = __new; {}(); *__SH_ARGV.lock().unwrap() = __old; __SH_RC.load(Ordering::SeqCst) == 0 }}",
+            "{{ let __old = __SH_ARGV.lock().unwrap().clone(); let __new = __sh_cat(&[{}]); *__SH_ARGV.lock().unwrap() = __new; {}(); *__SH_ARGV.lock().unwrap() = __old; __SH_RC.load(Ordering::Relaxed) == 0 }}",
             ws.join(", "),
             self.fn_ident(name)
         )
@@ -10028,7 +10347,7 @@ impl Render {
             self.depth -= 1;
             self.loop_depth -= 1;
             self.emit("}");
-            self.emit("__SH_RC.store(0, Ordering::SeqCst);");
+            self.emit("__SH_RC.store(0, Ordering::Relaxed);");
             return;
         }
         if self.is_assoc(name) {
@@ -10435,7 +10754,7 @@ impl Render {
                     self.add_helper("puts");
                     self.emit(&format!("__sh_puts({});", Self::rust_str(&text)));
                 }
-                self.emit("__SH_RC.store(0, Ordering::SeqCst);");
+                self.emit("__SH_RC.store(0, Ordering::Relaxed);");
                 return;
             }
         }
@@ -10458,10 +10777,10 @@ impl Render {
             // print only on success, and report rc 1 on failure (bash
             // suppresses the whole simple command)
             self.add_helper("cat");
-            self.emit("__SH_ARITH_WORD_FAIL.store(false, Ordering::SeqCst);");
+            self.emit("__SH_ARITH_WORD_FAIL.store(false, Ordering::Relaxed);");
             self.emit(&format!(
-                "{{ let __ws = __sh_cat(&[{}]); let __wf = __SH_ARITH_WORD_FAIL.swap(false, Ordering::SeqCst); \
-                 if !__wf {{ __sh_print_words(&[__ws], {}, {}); }} __SH_RC.store(if __wf {{ 1 }} else {{ 0 }}, Ordering::SeqCst); }}",
+                "{{ let __ws = __sh_cat(&[{}]); let __wf = __SH_ARITH_WORD_FAIL.swap(false, Ordering::Relaxed); \
+                 if !__wf {{ __sh_print_words(&[__ws], {}, {}); }} __SH_RC.store(if __wf {{ 1 }} else {{ 0 }}, Ordering::Relaxed); }}",
                 ws.join(", "), nl, esc
             ));
         } else {
@@ -10511,12 +10830,12 @@ impl Render {
                         .collect();
                     self.emit(&format!("{mac}({}, {});", Self::rust_str(&f), args.join(", ")));
                 }
-                self.emit("__SH_RC.store(0, Ordering::SeqCst);");
+                self.emit("__SH_RC.store(0, Ordering::Relaxed);");
                 return;
             }
             self.sink_check_needed = true;
             self.emit(&format!("__sh_print_words(&[{}], {}, {});", ws.join(", "), nl, esc));
-            self.emit("__SH_RC.store(0, Ordering::SeqCst);");
+            self.emit("__SH_RC.store(0, Ordering::Relaxed);");
         }
     }
 
@@ -10593,7 +10912,7 @@ impl Render {
             self.add_helper("print_words");
             self.emit(&format!("__sh_print_words(&[vec![{call}]], false, false);"));
         }
-        self.emit("__SH_RC.store(0, Ordering::SeqCst);");
+        self.emit("__SH_RC.store(0, Ordering::Relaxed);");
     }
 
     // ── param expansion ──────────────────────────────────────────────
@@ -10672,7 +10991,7 @@ impl Render {
             // bash BAD SUBSTITUTION: the whole command word fails
             if op == "slice" {
                 self.word_fail_guard = true;
-                return "{ __SH_ARITH_WORD_FAIL.store(true, Ordering::SeqCst); String::new() }".to_string();
+                return "{ __SH_ARITH_WORD_FAIL.store(true, Ordering::Relaxed); String::new() }".to_string();
             }
             let keys = array_base_name(keys);
             if !keys.is_empty() && (idx_at || name_at) {
@@ -10842,7 +11161,7 @@ impl Render {
                 // fails (the echo prints nothing)
                 if name.starts_with('!') {
                     self.word_fail_guard = true;
-                    return "{ __SH_ARITH_WORD_FAIL.store(true, Ordering::SeqCst); String::new() }".to_string();
+                    return "{ __SH_ARITH_WORD_FAIL.store(true, Ordering::Relaxed); String::new() }".to_string();
                 }
                 // `${arr[@]:off:len}` — an element slice; scalar strings
                 // get a char slice
@@ -10993,7 +11312,7 @@ impl Render {
                 let pat = args.get(1).map(|a| self.expr_str(a)).unwrap_or_default();
                 let flags = args.get(2).map(|a| self.expr_str(a)).unwrap_or_default();
                 format!(
-                    "{{ let (__m, __r) = __sh_grepmatches(&{text}, &{pat}, &{flags}); __SH_RC.store(__r, Ordering::SeqCst); __m }}"
+                    "{{ let (__m, __r) = __sh_grepmatches(&{text}, &{pat}, &{flags}); __SH_RC.store(__r, Ordering::Relaxed); __m }}"
                 )
             }
             "redirect" => {
@@ -11074,7 +11393,7 @@ impl Render {
             }
             "assign" => self.assign_call_str(args),
             "return" => {
-                "{ __SH_RC.store(0, Ordering::SeqCst); return; }".to_string()
+                "{ __SH_RC.store(0, Ordering::Relaxed); return; }".to_string()
             }
             "and" => {
                 let b = self.and_bool(args);
@@ -11228,7 +11547,7 @@ impl Render {
         let old_depth = self.depth;
         self.depth = 0;
         self.array_call_stmt_by_name(func, args);
-        self.emit("__SH_RC.store(0, Ordering::SeqCst); __SH_RC.load(Ordering::SeqCst) == 0");
+        self.emit("__SH_RC.store(0, Ordering::Relaxed); __SH_RC.load(Ordering::Relaxed) == 0");
         let block = self.out.join("\n");
         self.out = saved;
         self.depth = old_depth;
@@ -11398,8 +11717,70 @@ impl Render {
     /// The deferred-`let` owner set for one statement list: main, or one
     /// function body (each seeds its own — a body's first writes are its own
     /// declarations).
+    /// Emit a statement whose value is discarded. A BLOCK is already a
+    /// statement — `{ …; __SH_RC.store(…); __b };` — so `let _ = { … };`
+    /// only adds noise (the modellers for test/let/cd/arith all return
+    /// such a block). A `#[must_use]` call (io/fs/process/thread) still
+    /// needs the explicit discard, and a pure constructor left behind by a
+    /// folded capture (`String::new()`) is dropped outright.
+    fn emit_discard(&mut self, e: &str) {
+        let t = e.trim();
+        if t == "String::new()" {
+            return;
+        }
+        // Only a block whose TAIL is a bare carrier (`__b` / `__v` / `__n`)
+        // — or that has no tail at all — is a plain statement. One ending
+        // in a `#[must_use]` call (`__r.is_ok()`) still needs the discard:
+        // a `Result::is_ok` value dropped as a statement warns.
+        if t.starts_with('{') && t.ends_with('}') {
+            let inner = &t[1..t.len() - 1];
+            let tail = inner.rsplit(';').next().unwrap_or("").trim();
+            if tail.is_empty() || is_bare_ident(tail) {
+                self.emit(&format!("{t};"));
+                return;
+            }
+        }
+        self.emit(&format!("let _ = {t};"));
+    }
+
+    /// Declarations for the pass-2 locals of one scope whose first mention
+    /// is not a top-level write: the `let` cannot ride on the write, so it
+    /// sits at the top of the scope, initialised to bash's unset value
+    /// ("" for a string home, 0 for an integer home). Sorted for
+    /// deterministic output.
+    fn entry_decls(&mut self, scope: &crate::shir_passes::list_profile::Scope) -> Vec<String> {
+        let mut names: Vec<String> = self
+            .local_entry
+            .iter()
+            .filter(|n| self.local_vars.get(*n) == Some(scope))
+            .cloned()
+            .collect();
+        names.sort();
+        let mut out: Vec<String> = Vec::new();
+        for n in names {
+            let m = self.var_ident(&n);
+            let init = if self.is_num(&n) { "0i64" } else { "String::new()" };
+            let mut attr = String::new();
+            if self.local_dead_init.contains(&n) {
+                attr.push_str("#[allow(unused_assignments)] ");
+            }
+            if m.chars().any(|c| c.is_ascii_uppercase()) {
+                attr.push_str("#[allow(non_snake_case)] ");
+            }
+            out.push(format!("{attr}let mut {m} = {init};"));
+        }
+        out
+    }
+
     fn owned_inits(&self, stmts: &[IrStmt]) -> BTreeSet<String> {
-        let names: BTreeSet<String> = self.local_vars.keys().cloned().collect();
+        // entry-declared locals are declared at the top of the scope, so
+        // their first write must NOT emit a second `let`
+        let names: BTreeSet<String> = self
+            .local_vars
+            .keys()
+            .filter(|n| !self.local_entry.contains(*n))
+            .cloned()
+            .collect();
         let mut owned: BTreeSet<String> = BTreeSet::new();
         Self::mark_first_write(stmts, &names, &mut owned);
         owned
@@ -11411,13 +11792,13 @@ impl Render {
         // write sites are spread across the statement arms (exec/echo/
         // setVar/…), so strip the store from whatever the arm emitted —
         // exact, because the renderer only ever emits the literal
-        // `__SH_RC.store(0, Ordering::SeqCst);` line for a status write.
+        // `__SH_RC.store(0, Ordering::Relaxed);` line for a status write.
         if crate::shir::stmt_status_write_is_unread(s) {
             let mark = self.out.len();
             self.stmt_inner(s);
             let tail: Vec<String> = self.out.drain(mark..).collect();
             for l in tail {
-                if l.trim() == "__SH_RC.store(0, Ordering::SeqCst);" {
+                if l.trim() == "__SH_RC.store(0, Ordering::Relaxed);" {
                     continue;
                 }
                 // A blank line stranded between the removed store and a
@@ -11540,12 +11921,12 @@ impl Render {
                         let st = self.fn_call_stmt(name, &words);
                         self.emit(&st);
                     }
-                    self.emit("__SH_RC.store(0, Ordering::SeqCst);");
+                    self.emit("__SH_RC.store(0, Ordering::Relaxed);");
                 }
                 IrExpr::Call { func, args } if func == "exec" || func == "builtin" => self.exec_stmt(args),
                 IrExpr::Call { func, args } if func == "setArray" || func == "setArrayAppend" => {
                     self.array_call_stmt_by_name(func, args);
-                    self.emit("__SH_RC.store(0, Ordering::SeqCst);");
+                    self.emit("__SH_RC.store(0, Ordering::Relaxed);");
                 }
                 IrExpr::Call { func, args } if func == "assocSet" => {
                     // go-sh map literals — assocSet(name, key, val) per
@@ -11558,7 +11939,7 @@ impl Render {
                         let st = self.assoc_set(name, &key, &val);
                         self.emit(&st);
                     }
-                    self.emit("__SH_RC.store(0, Ordering::SeqCst);");
+                    self.emit("__SH_RC.store(0, Ordering::Relaxed);");
                 }
                 IrExpr::Call { func, args } if func == "pipeline" => {
                     let stages = pipeline_stages(args);
@@ -11581,7 +11962,7 @@ impl Render {
                 }
                 IrExpr::Call { func, args } if func == "whileLoop" => {
                     let b = self.whileloop_bool(args);
-                    self.emit(&format!("let _ = {b};"));
+                    self.emit_discard(&b);
                 }
                 IrExpr::Call { func, args } if func == "subshell" => {
                     let mut stmts: Vec<IrStmt> = Vec::new();
@@ -11609,7 +11990,7 @@ impl Render {
                         let unw = Self::unwrap_cond(&l);
                         let core = Self::unparen(&unw);
                         self.emit(&format!(
-                            "{{ let __b = {core}; __SH_RC.store(if __b {{ 0 }} else {{ 1 }}, Ordering::SeqCst); if __b {{"
+                            "{{ let __b = {core}; __SH_RC.store(if __b {{ 0 }} else {{ 1 }}, Ordering::Relaxed); if __b {{"
                         ));
                     }
                     self.depth += 1;
@@ -11634,7 +12015,7 @@ impl Render {
                         let unw = Self::unwrap_cond(&l);
                         let core = Self::unparen(&unw);
                         self.emit(&format!(
-                            "{{ let __b = {core}; __SH_RC.store(if __b {{ 0 }} else {{ 1 }}, Ordering::SeqCst); if !__b {{"
+                            "{{ let __b = {core}; __SH_RC.store(if __b {{ 0 }} else {{ 1 }}, Ordering::Relaxed); if !__b {{"
                         ));
                         self.depth += 1;
                         self.expr_stmt_value(rhs);
@@ -11645,7 +12026,7 @@ impl Render {
                 }
                 IrExpr::Call { func, args } if func == "test" => {
                     let b = self.test_call_bool(args);
-                    self.emit(&format!("let _ = {b};"));
+                    self.emit_discard(&b);
                 }
                 IrExpr::Call { func, args } if func == "grepMatches" => {
                     self.grepmatches_stmt(args);
@@ -11660,7 +12041,7 @@ impl Render {
                     let blocks = self.and_blocks(args);
                     for (i, b) in blocks.iter().enumerate() {
                         if i > 0 {
-                            self.emit("if __SH_RC.load(Ordering::SeqCst) != 0 {");                            self.depth += 1;
+                            self.emit("if __SH_RC.load(Ordering::Relaxed) != 0 {");                            self.depth += 1;
                         }
                         for s in b {
                             self.stmt(s);
@@ -11673,25 +12054,25 @@ impl Render {
                 }
                 IrExpr::Call { func, args: _ } if func == "break" => {
                     if self.loop_depth > 0 {
-                        self.emit("__SH_RC.store(0, Ordering::SeqCst);");
+                        self.emit("__SH_RC.store(0, Ordering::Relaxed);");
                         self.loop_capture_rc();
                         self.emit("break;");
                     }
                 }
                 IrExpr::Call { func, args: _ } if func == "continue" => {
                     if self.loop_depth > 0 {
-                        self.emit("__SH_RC.store(0, Ordering::SeqCst);");
+                        self.emit("__SH_RC.store(0, Ordering::Relaxed);");
                         self.loop_capture_rc();
                         self.emit("continue;");
                     }
                 }
                 IrExpr::Call { func, args: _ } if func == "return" => {
-                    self.emit("__SH_RC.store(0, Ordering::SeqCst); return;");
+                    self.emit("__SH_RC.store(0, Ordering::Relaxed); return;");
                 }
                 _ => {
                     let x = self.expr_any(e);
-                    self.emit(&format!("let _ = {x};"));
-                    self.emit("__SH_RC.store(0, Ordering::SeqCst);");
+                    self.emit_discard(&x);
+                    self.emit("__SH_RC.store(0, Ordering::Relaxed);");
                 }
             },
             IrStmt::Assign { targets, expr, asm } => {
@@ -11716,13 +12097,13 @@ impl Render {
                                     let m = self.ident_base(n);
                                     let mutkw = if self.local_array_mut.contains(n) { "let mut" } else { "let" };
                                     self.emit(&format!("{mutkw} {m} = [{}];", lits.join(", ")));
-                                    self.emit("__SH_RC.store(0, Ordering::SeqCst);");
+                                    self.emit("__SH_RC.store(0, Ordering::Relaxed);");
                                     return;
                                 }
                             }
                         }
                         self.array_call_stmt_by_name(func, args);
-                        self.emit("__SH_RC.store(0, Ordering::SeqCst);");
+                        self.emit("__SH_RC.store(0, Ordering::Relaxed);");
                         return;
                     }
                 }
@@ -11741,7 +12122,7 @@ impl Render {
                         self.mark_written(&t.var);
                         let m = self.ident_base(&t.var);
                         self.emit(&format!("let mut {m} = [{}];", lits.join(", ")));
-                        self.emit("__SH_RC.store(0, Ordering::SeqCst);");
+                        self.emit("__SH_RC.store(0, Ordering::Relaxed);");
                         return;
                     }
                 }
@@ -11831,14 +12212,14 @@ impl Render {
                         // hits an immutable rebind, E0384).
                         let nv = self.gensym("__n");
                         self.emit(&format!(
-                            "let {nv} = if __SH_ARITH_ERR.swap(false, Ordering::SeqCst) {{ 0 }} else {{ {v} }};"
+                            "let {nv} = if __SH_ARITH_ERR.swap(false, Ordering::Relaxed) {{ 0 }} else {{ {v} }};"
                         ));
                         self.emit(&format!(
-                            "__SH_RC.store(if {nv} != 0 {{ 0 }} else {{ 1 }}, Ordering::SeqCst);"
+                            "__SH_RC.store(if {nv} != 0 {{ 0 }} else {{ 1 }}, Ordering::Relaxed);"
                         ));
                     } else {
                         self.emit(&format!(
-                            "let _ = {{ let __v = {v}; let __n = __v.trim().parse::<i64>().unwrap_or(0); __SH_RC.store(if __n != 0 {{ 0 }} else {{ 1 }}, Ordering::SeqCst); __v }};"
+                            "{{ let __v = {v}; let __n = __v.trim().parse::<i64>().unwrap_or(0); __SH_RC.store(if __n != 0 {{ 0 }} else {{ 1 }}, Ordering::Relaxed); __v }};"
                         ));
                     }
                     return;
@@ -11857,8 +12238,8 @@ impl Render {
                         if tainted || huge {
                             let b = self.arith_bigint(a);
                                                 format!(
-                                "{{ let __v = ({b}).to_string(); let __e = __SH_ARITH_ERR.swap(false, Ordering::SeqCst); \
-                         __SH_RC.store(if __e {{ 1 }} else {{ 0 }}, Ordering::SeqCst); if __e {{ String::new() }} else {{ __v }} }}"
+                                "{{ let __v = ({b}).to_string(); let __e = __SH_ARITH_ERR.swap(false, Ordering::Relaxed); \
+                         __SH_RC.store(if __e {{ 1 }} else {{ 0 }}, Ordering::Relaxed); if __e {{ String::new() }} else {{ __v }} }}"
                             )
                         } else {
                     // `x=$((...))` — bash collapses the expansion to
@@ -11866,8 +12247,8 @@ impl Render {
                     // (division/modulo by zero); the checked div/mod
                     // helpers flag the error via __SH_ARITH_ERR.
                                 format!(
-                        "{{ let __v = ({}).to_string(); let __e = __SH_ARITH_ERR.swap(false, Ordering::SeqCst); \
-                         __SH_RC.store(if __e {{ 1 }} else {{ 0 }}, Ordering::SeqCst); if __e {{ String::new() }} else {{ __v }} }}",
+                        "{{ let __v = ({}).to_string(); let __e = __SH_ARITH_ERR.swap(false, Ordering::Relaxed); \
+                         __SH_RC.store(if __e {{ 1 }} else {{ 0 }}, Ordering::Relaxed); if __e {{ String::new() }} else {{ __v }} }}",
                         self.arith(a)
                     )
                         }
@@ -11892,7 +12273,7 @@ impl Render {
                             self.emit(&st);
                         }
                         if !has_capture {
-                            self.emit("__SH_RC.store(0, Ordering::SeqCst);");
+                            self.emit("__SH_RC.store(0, Ordering::Relaxed);");
                         }
                         return;
                     }
@@ -11907,7 +12288,7 @@ impl Render {
                             let st = self.array_elem_set(&t.var, &ks[0], &rhs);
                             self.emit(&st);
                             if !has_capture {
-                                self.emit("__SH_RC.store(0, Ordering::SeqCst);");
+                                self.emit("__SH_RC.store(0, Ordering::Relaxed);");
                             }
                             return;
                         }
@@ -11944,7 +12325,7 @@ impl Render {
                     self.emit(&st);
                 }
                 if !has_capture {
-                    self.emit("__SH_RC.store(0, Ordering::SeqCst);");
+                    self.emit("__SH_RC.store(0, Ordering::Relaxed);");
                 }
             }
             IrStmt::Declare { vars, init, .. } => {
@@ -11962,7 +12343,7 @@ impl Render {
                         }
                     }
                 }
-                self.emit("__SH_RC.store(0, Ordering::SeqCst);");
+                self.emit("__SH_RC.store(0, Ordering::Relaxed);");
             }
             IrStmt::DeclareArray { var, elements, .. } => {
                 self.mark_written(var);
@@ -11971,7 +12352,7 @@ impl Render {
                 self.add_helper("cat");
                 let st = self.write_arr(var, &format!("__sh_cat(&[{}])", items.join(", ")));
                 self.emit(&st);
-                self.emit("__SH_RC.store(0, Ordering::SeqCst);");
+                self.emit("__SH_RC.store(0, Ordering::Relaxed);");
             }
             IrStmt::Output { value, newline, target } => {
                 if target.is_some() {
@@ -12007,7 +12388,7 @@ impl Render {
                                 self.emit(&format!("print!({});", Self::rust_str(&text)));
                             }
                         }
-                        self.emit("__SH_RC.store(0, Ordering::SeqCst);");
+                        self.emit("__SH_RC.store(0, Ordering::Relaxed);");
                         return;
                     }
                 }
@@ -12029,13 +12410,13 @@ impl Render {
                     let v = self.expr_num(value);
                     let mac = if *newline { "println!" } else { "print!" };
                     self.emit(&format!("{mac}(\"{{}}\", {});", Self::drop_trailing_clone(&v)));
-                    self.emit("__SH_RC.store(0, Ordering::SeqCst);");
+                    self.emit("__SH_RC.store(0, Ordering::Relaxed);");
                     return;
                 }
                 let w = self.words_expr(value);
                 self.add_helper("print_words");
                 self.emit(&format!("__sh_print_words(&[{w}], {}, false);", newline));
-                self.emit("__SH_RC.store(0, Ordering::SeqCst);");
+                self.emit("__SH_RC.store(0, Ordering::Relaxed);");
             }
             IrStmt::WriteFile { path, content, append } => {
                 let p = self.expr_str(path);
@@ -12047,7 +12428,7 @@ impl Render {
                 } else {
                     self.emit(&format!("let _ = std::fs::write({p}, {c});"));
                 }
-                self.emit("__SH_RC.store(0, Ordering::SeqCst);");
+                self.emit("__SH_RC.store(0, Ordering::Relaxed);");
             }
             // A TERNARY: the frontends lower `a if c else b` to an `If` whose
             // branches each assign the same name. Render it as the binding it
@@ -12080,7 +12461,7 @@ impl Render {
                         );
                         let st = self.local_write_stmt(&name, &binding);
                         self.emit(&st);
-                        self.emit("__SH_RC.store(0, Ordering::SeqCst);");
+                        self.emit("__SH_RC.store(0, Ordering::Relaxed);");
                         return;
                     }
                     // A NUMERIC binding declares `: i64`, so the arms must BE
@@ -12104,7 +12485,7 @@ impl Render {
                         format!("if {} {{ {tc} }} else {{ {ec} }}", Self::unparen(&ce));
                     let st = self.local_write_stmt(&name, &binding);
                     self.emit(&st);
-                    self.emit("__SH_RC.store(0, Ordering::SeqCst);");
+                    self.emit("__SH_RC.store(0, Ordering::Relaxed);");
                     return;
                 }
             }
@@ -12155,7 +12536,7 @@ impl Render {
                         // the same status rule the empty-else arm applies.
                         if taken.is_empty() {
                             if !self.rc_disabled && !crate::shir::stmt_status_write_is_unread(s) {
-                                self.emit("__SH_RC.store(0, Ordering::SeqCst);");
+                                self.emit("__SH_RC.store(0, Ordering::Relaxed);");
                             }
                         } else {
                             self.inline_branch_block(taken);
@@ -12200,7 +12581,7 @@ impl Render {
                         {
                             self.emit("} else {");
                             self.depth += 1;
-                            self.emit("__SH_RC.store(0, Ordering::SeqCst);");
+                            self.emit("__SH_RC.store(0, Ordering::Relaxed);");
                             self.depth -= 1;
                         }
                     }
@@ -12237,7 +12618,7 @@ impl Render {
                         // `else { … }` is dropped.
                         self.emit("} else {");
                         self.depth += 1;
-                        self.emit("__SH_RC.store(0, Ordering::SeqCst);");
+                        self.emit("__SH_RC.store(0, Ordering::Relaxed);");
                         self.depth -= 1;
                     }
                 }
@@ -12304,7 +12685,7 @@ impl Render {
                 }
                 if track {
                     self.loop_rc_last.pop();
-                    self.emit(&format!("{last} = __SH_RC.load(Ordering::SeqCst);"));
+                    self.emit(&format!("{last} = __SH_RC.load(Ordering::Relaxed);"));
                 }
                 self.trim_trailing_blanks();
                 self.depth -= 1;
@@ -12312,7 +12693,7 @@ impl Render {
                 self.emit("}");
                 if track {
                     self.emit(&format!(
-                        "if !{ran} {{ __SH_RC.store(0, Ordering::SeqCst); }} else {{ __SH_RC.store({last}, Ordering::SeqCst); }}"
+                        "if !{ran} {{ __SH_RC.store(0, Ordering::Relaxed); }} else {{ __SH_RC.store({last}, Ordering::Relaxed); }}"
                     ));
                 }
             }
@@ -12341,7 +12722,7 @@ impl Render {
                 }
                 if track {
                     self.loop_rc_last.pop();
-                    self.emit(&format!("{last} = __SH_RC.load(Ordering::SeqCst);"));
+                    self.emit(&format!("{last} = __SH_RC.load(Ordering::Relaxed);"));
                 }
                 self.depth -= 1;
                 self.loop_depth -= 1;
@@ -12353,7 +12734,7 @@ impl Render {
                 }
                 self.emit("}");
                 if track {
-                    self.emit(&format!("__SH_RC.store({last}, Ordering::SeqCst);"));
+                    self.emit(&format!("__SH_RC.store({last}, Ordering::Relaxed);"));
                 }
             }
             IrStmt::For { var, iter, body } => {
@@ -12741,7 +13122,7 @@ impl Render {
                             // deadlock — polyfills brace/param)
                             self.add_helper("ret_rc");
                             self.emit(&format!(
-                                "let __v = {r}; *__SH_RET.lock().unwrap() = __v.clone(); __SH_RC.store(__sh_ret_rc(&__v), Ordering::SeqCst); return;"
+                                "let __v = {r}; *__SH_RET.lock().unwrap() = __v.clone(); __SH_RC.store(__sh_ret_rc(&__v), Ordering::Relaxed); return;"
                             ));
                         } else {
                             self.emit("return;");
@@ -12764,11 +13145,11 @@ impl Render {
                         self.add_helper("ret_rc");
                         if value_used {
                             self.emit(&format!(
-                                "let __v = {r}; *__SH_RET.lock().unwrap() = __v.clone(); __SH_RC.store(__sh_ret_rc(&__v), Ordering::SeqCst); return __v;"
+                                "let __v = {r}; *__SH_RET.lock().unwrap() = __v.clone(); __SH_RC.store(__sh_ret_rc(&__v), Ordering::Relaxed); return __v;"
                             ));
                         } else {
                             self.emit(&format!(
-                                "let __v = {r}; *__SH_RET.lock().unwrap() = __v.clone(); __SH_RC.store(__sh_ret_rc(&__v), Ordering::SeqCst); return;"
+                                "let __v = {r}; *__SH_RET.lock().unwrap() = __v.clone(); __SH_RC.store(__sh_ret_rc(&__v), Ordering::Relaxed); return;"
                             ));
                         }
                     } else {
@@ -12782,21 +13163,21 @@ impl Render {
                 }
                 if let Some(x) = e {
                     let n = self.expr_num(x);
-                    self.emit(&format!("__SH_RC.store({}, Ordering::SeqCst); return;", i32_arg(&n)));
+                    self.emit(&format!("__SH_RC.store({}, Ordering::Relaxed); return;", i32_arg(&n)));
                 } else {
                     self.emit("return;");
                 }
             }
             IrStmt::Continue => {
                 if self.loop_depth > 0 {
-                    self.emit("__SH_RC.store(0, Ordering::SeqCst);");
+                    self.emit("__SH_RC.store(0, Ordering::Relaxed);");
                     self.loop_capture_rc();
                     self.emit_continue();
                 }
             }
             IrStmt::Break => {
                 if self.loop_depth > 0 {
-                    self.emit("__SH_RC.store(0, Ordering::SeqCst);");
+                    self.emit("__SH_RC.store(0, Ordering::Relaxed);");
                     self.loop_capture_rc();
                     self.emit("break;");
                 }
@@ -12827,9 +13208,9 @@ impl Render {
                     // the save must sit immediately before the cleanup —
                     // it is the CONSUMER's status being preserved, so it
                     // is read after the consumer has run.
-                    self.emit("let __ps_saved_rc = __SH_RC.load(Ordering::SeqCst);");
+                    self.emit("let __ps_saved_rc = __SH_RC.load(Ordering::Relaxed);");
                     self.stmt(c);
-                    self.emit("__SH_RC.store(__ps_saved_rc, Ordering::SeqCst);");
+                    self.emit("__SH_RC.store(__ps_saved_rc, Ordering::Relaxed);");
                 }
             }
             IrStmt::Subshell(b) => self.subshell_render(b),
@@ -12936,7 +13317,7 @@ impl Render {
                     // no pattern matched — bash's case rc is 0
                     self.emit("} else {");
                     self.depth += 1;
-                    self.emit("__SH_RC.store(0, Ordering::SeqCst);");
+                    self.emit("__SH_RC.store(0, Ordering::Relaxed);");
                     self.depth -= 1;
                     self.emit("}");
                 }
@@ -12970,7 +13351,7 @@ impl Render {
                     }
                 }
                 self.add_helper("run");
-                self.emit(&format!("__SH_RC.store(__sh_run(&{full}), Ordering::SeqCst);"));
+                self.emit(&format!("__SH_RC.store(__sh_run(&{full}), Ordering::Relaxed);"));
             }
             IrStmt::Pipeline { stages, .. } => {
                 self.pipeline_stmt(stages);
@@ -12989,7 +13370,7 @@ impl Render {
                 for s in finally_body {
                     self.stmt(s);
                 }
-                self.emit("__SH_RC.store(0, Ordering::SeqCst);");
+                self.emit("__SH_RC.store(0, Ordering::Relaxed);");
             }
             IrStmt::Select { .. } => self.mark_todo("select"),
             IrStmt::Asm { .. } => self.mark_todo("asm"),
@@ -13023,7 +13404,7 @@ impl Render {
                     self.stmt(s);
                 }
                 self.loop_rc_last.pop();
-                self.emit(&format!("{last} = __SH_RC.load(Ordering::SeqCst);"));
+                self.emit(&format!("{last} = __SH_RC.load(Ordering::Relaxed);"));
                 self.depth -= 1;
                 self.loop_depth -= 1;
                 self.emit("if true {");
@@ -13042,7 +13423,7 @@ impl Render {
                 // `if !ran { } else { }` once the stores are stripped.
                 if !crate::shir::stmt_status_write_is_unread(s) {
                     self.emit(&format!(
-                        "if !{ran} {{ __SH_RC.store(0, Ordering::SeqCst); }} else {{ __SH_RC.store({last}, Ordering::SeqCst); }}"
+                        "if !{ran} {{ __SH_RC.store(0, Ordering::Relaxed); }} else {{ __SH_RC.store({last}, Ordering::Relaxed); }}"
                     ));
                 }
             }
@@ -13078,7 +13459,7 @@ impl Render {
                 self.emit("}");
                 self.depth -= 1;
                 self.emit("}");
-                self.emit("Err(_) => { __SH_RC.store(1, Ordering::SeqCst); }");
+                self.emit("Err(_) => { __SH_RC.store(1, Ordering::Relaxed); }");
                 self.depth -= 1;
                 self.emit("}");
             }
@@ -13188,7 +13569,7 @@ impl Render {
             if t.is_empty() {
                 continue;
             }
-            if t == "__SH_RC.store(0, Ordering::SeqCst);" {
+            if t == "__SH_RC.store(0, Ordering::Relaxed);" {
                 return true;
             }
             break;
@@ -13202,7 +13583,7 @@ impl Render {
                 continue;
             }
             saw_store = true;
-            if t != "__SH_RC.store(0, Ordering::SeqCst);" {
+            if t != "__SH_RC.store(0, Ordering::Relaxed);" {
                 return false;
             }
         }
@@ -13237,11 +13618,16 @@ impl Render {
         }
         // Pass 2: pick the pass-2 locals (scalar vars confined to one
         // non-risky scope) and the assigned set (drives `let`/`let mut`).
-        let (locals, local_mut, dead_init) =
+        let (locals, local_mut, dead_init, entry) =
             compute_local_vars(prog, &self.arrays, &self.assoc, &self.functions, &written);
         self.local_vars = locals;
         self.local_mut = local_mut;
         self.local_dead_init = dead_init;
+        self.local_entry = entry;
+        // an entry-declared local binds `String`/`i64` at the top of its
+        // scope, never a borrowed `&str` (the borrow verdict assumes the
+        // `let` IS the single assignment)
+        self.borrowable_vars.retain(|n| !self.local_entry.contains(n));
         // Deferred `let`s: pre-seed the statements that OWN each local's
         // declaration (its first write in render order, at any nesting
         // depth). Every other write of that name then renders as a plain
@@ -13466,7 +13852,7 @@ impl Render {
             // fast path emitting its own store).
             let no_rc_read = !self.out.iter().any(|l| l.contains("__SH_RC.load"));
             self.out.retain(|l| {
-                !(no_rc_read && l.trim() == "__SH_RC.store(0, Ordering::SeqCst);")
+                !(no_rc_read && l.trim() == "__SH_RC.store(0, Ordering::Relaxed);")
             });
             while let Some(last) = self.out.last() {
                 if last.trim().is_empty() {
@@ -13486,10 +13872,10 @@ impl Render {
             // still gets the epilogue — it leaves the exit code in the
             // register, and dropping the epilogue would change it to 0.
             if !body_already_exits {
-                self.emit("std::process::exit(__SH_RC.load(Ordering::SeqCst));");
+                self.emit("std::process::exit(__SH_RC.load(Ordering::Relaxed));");
             }
         } else {
-            self.emit("let __sh_final = __SH_RC.load(Ordering::SeqCst);");
+            self.emit("let __sh_final = __SH_RC.load(Ordering::Relaxed);");
             self.add_helper("run_traps");
             self.emit("__sh_run_traps();");
             if !body_already_exits {
@@ -13608,6 +13994,12 @@ impl Render {
             // restored so main's and sibling bodies' ownership lives on.
             let saved_body_init = std::mem::take(&mut self.local_init);
             self.local_init = self.owned_inits(body);
+            let decls = self.entry_decls(&crate::shir_passes::list_profile::Scope::Func(
+                name.clone(),
+            ));
+            for d in decls {
+                self.emit(&d);
+            }
             self.active_fn = sig.as_ref().map(|_| name.clone());
             self.body_fn = Some(name.clone());
             // arm the shift-offset rewrite for this body (the probe
@@ -13740,11 +14132,25 @@ impl Render {
         if seen_var {
             self.emit("#[allow(non_upper_case_globals)]");
             self.emit("fn main() {");
+            let decls = self.entry_decls(&crate::shir_passes::list_profile::Scope::Main);
+            // the body lines below are already rendered at depth 1
+            self.depth = 1;
+            for d in decls {
+                self.emit(&d);
+            }
+            self.depth = 0;
             self.out.extend(body_out.iter().cloned());
             self.emit("}");
         } else {
             self.depth = 0;
             self.emit("fn main() {");
+            let decls = self.entry_decls(&crate::shir_passes::list_profile::Scope::Main);
+            // the body lines below are already rendered at depth 1
+            self.depth = 1;
+            for d in decls {
+                self.emit(&d);
+            }
+            self.depth = 0;
             // the body was rendered at depth 1, which is exactly right
             // for statements inside `fn main() {` — splice it in as-is
             self.out.extend(body_out.into_iter());
@@ -13868,6 +14274,8 @@ const HELPER_ORDER: &[&str] = &[
     "mtime", "samefile", "fmode", "fowner", "fgroup", "fnewer", "wait_all", "bg",
     "fexists", "fdir", "freg", "fsym", "fread", "fwrite", "fexec", "fsize", "aindex",
     "div", "mod", "ret_rc", "capture", "run_traps", "lines",
+    "rm", "mkdir", "touch", "catf", "cat_stmt", "mktemp", "basename_args", "dirname_args",
+    "sink",
 ];
 
 /// `__sh_*` names that are NOT in `HELPER_ORDER` but still own an
@@ -13968,10 +14376,13 @@ fn glob_like(s: &str) -> bool {
 fn helper_deps(h: &str) -> &'static [&'static str] {
     match h {
         "wq" => &["q"],
-        "print_words" => &["echo_esc"],
+        "print_words" => &["echo_esc", "sink"],
         // the no-`esc` variant never calls __sh_echo_esc — the `-e`
         // support is compiled out of the helper when no echo used it
-        "print_words_noesc" => &[],
+        "print_words_noesc" => &["sink"],
+        "sink" => &[],
+        "spawn" => &["sink"],
+        "puts" => &["sink"],
         "lines" => &[],
         "printf" => &["q", "q_printf", "atoi", "atou", "atof"],
         // printf's `%b` unescape, split out so a `%s`-only printf does not
@@ -13980,6 +14391,7 @@ fn helper_deps(h: &str) -> &'static [&'static str] {
         "printf_b" => &["echo_esc"],
         "capture_rc" => &["cap_bytes"],
         "run" => &["spawn"],
+        "cat_stmt" => &["sink"],
         "run_traps" => &["spawn"],
         "strippre" | "stripsuf" | "replace" => &["fnmatch"],
         "glob" => &["cap_bytes"],
@@ -14056,10 +14468,10 @@ fn helper_source(h: &str) -> &'static str {
     r
 }"#,
         "div" => r#"fn __sh_div(a: i64, b: i64) -> i64 {
-    if b == 0 { __SH_ARITH_ERR.store(true, Ordering::SeqCst); 0 } else { a / b }
+    if b == 0 { __SH_ARITH_ERR.store(true, Ordering::Relaxed); 0 } else { a / b }
 }"#,
         "mod" => r#"fn __sh_mod(a: i64, b: i64) -> i64 {
-    if b == 0 { __SH_ARITH_ERR.store(true, Ordering::SeqCst); 0 } else { a % b }
+    if b == 0 { __SH_ARITH_ERR.store(true, Ordering::Relaxed); 0 } else { a % b }
 }"#,
         // bash `return N`: the function's STATUS is N (mod 256); a
         // non-numeric value is a bash error → 255. The value-model
@@ -14080,7 +14492,7 @@ fn helper_source(h: &str) -> &'static str {
     use num_bigint::BigInt;
     let av: BigInt = a.trim().parse().unwrap_or(BigInt::from(0));
     let bv: BigInt = b.trim().parse().unwrap_or(BigInt::from(0));
-    if bv == BigInt::from(0) { __SH_ARITH_ERR.store(true, Ordering::SeqCst); return false; }
+    if bv == BigInt::from(0) { __SH_ARITH_ERR.store(true, Ordering::Relaxed); return false; }
     (av % bv) == BigInt::from(0)
 }"#,
         // printf's `%b` conversion — the backslash-escape expansion.
@@ -14144,58 +14556,27 @@ fn helper_source(h: &str) -> &'static str {
     // a word's `$((…))` arith expansion FAILED (an empty positional
     // makes the expanded text a syntax error) — bash suppresses the
     // WHOLE simple command, not just the word
-    if __SH_ARITH_WORD_FAIL.swap(false, Ordering::SeqCst) { return; }
-    let mut s = String::new();
-    let mut first = true;
-    for w in ws {
-        for x in w {
-            if !first { s.push(' '); }
-            first = false;
-            s.push_str(x);
-        }
-    }
+    if __SH_ARITH_WORD_FAIL.swap(false, Ordering::Relaxed) { return; }
+    let mut s = ws.iter().flatten().map(String::as_str).collect::<Vec<_>>().join(" ");
     if esc { s = __sh_echo_esc(&s); }
     if nl { s.push('\n'); }
-    let mut used = false;
-    __SH_OUTFILE_TL.with(|v| { if let Some(f) = v.borrow_mut().as_mut() { let _ = std::io::Write::write_all(f, s.as_bytes()); used = true; } });
-    if used { return; }
-    if let Some(b) = __SH_OUT.lock().unwrap().as_mut() {
-        b.extend_from_slice(s.as_bytes());
-        return;
-    }
-    print!("{}", s);
+    __sh_sink(s.as_bytes());
 }"#,
         // Same signature and call sites as `print_words`, but with the
         // `-e` branch compiled out: emitted when no echo in the program
         // used `-e`, so the 19-line `__sh_echo_esc` need not be dragged
         // in. `esc` stays a parameter (call sites pass `false`) so the
         // two variants are drop-in interchangeable.
-        "print_words_noesc" => r#"fn __sh_print_words(ws: &[Vec<String>], nl: bool, esc: bool) {
+        "print_words_noesc" => r#"fn __sh_print_words(ws: &[Vec<String>], nl: bool, _esc: bool) {
     // no echo in this program used -e, so `esc` is always false — the
     // unescape arm (and its __sh_echo_esc dependency) is compiled out.
-    let _ = esc;
     // a word's `$((…))` arith expansion FAILED (an empty positional
     // makes the expanded text a syntax error) — bash suppresses the
     // WHOLE simple command, not just the word
-    if __SH_ARITH_WORD_FAIL.swap(false, Ordering::SeqCst) { return; }
-    let mut s = String::new();
-    let mut first = true;
-    for w in ws {
-        for x in w {
-            if !first { s.push(' '); }
-            first = false;
-            s.push_str(x);
-        }
-    }
+    if __SH_ARITH_WORD_FAIL.swap(false, Ordering::Relaxed) { return; }
+    let mut s = ws.iter().flatten().map(String::as_str).collect::<Vec<_>>().join(" ");
     if nl { s.push('\n'); }
-    let mut used = false;
-    __SH_OUTFILE_TL.with(|v| { if let Some(f) = v.borrow_mut().as_mut() { let _ = std::io::Write::write_all(f, s.as_bytes()); used = true; } });
-    if used { return; }
-    if let Some(b) = __SH_OUT.lock().unwrap().as_mut() {
-        b.extend_from_slice(s.as_bytes());
-        return;
-    }
-    print!("{}", s);
+    __sh_sink(s.as_bytes());
 }"#,
         "outbytes" => r#"fn __sh_out_bytes(s: &str) {
     // Byte-preserving stdout write — the twin of the const `print!(…)`
@@ -14214,20 +14595,218 @@ fn helper_source(h: &str) -> &'static str {
     let mut o = std::io::stdout().lock();
     let _ = o.write_all(&buf);
 }"#,
+        "sink" => r#"fn __sh_sink(b: &[u8]) {
+    let mut used = false;
+    __SH_OUTFILE_TL.with(|v| { if let Some(f) = v.borrow_mut().as_mut() { let _ = std::io::Write::write_all(f, b); used = true; } });
+    if used { return; }
+    if let Some(o) = __SH_OUT.lock().unwrap().as_mut() { o.extend_from_slice(b); return; }
+    let _ = std::io::Write::write_all(&mut std::io::stdout(), b);
+}"#,
+        "rm" => r#"fn __sh_rm(argv: &[String]) -> i32 {
+    let mut force = false;
+    let mut recursive = false;
+    let mut dir_ok = false;
+    let mut end_opts = false;
+    let mut ops: Vec<&String> = Vec::new();
+    for a in argv {
+        if !end_opts {
+            if a == "--" { end_opts = true; continue; }
+            if a.len() > 1 && a.starts_with('-') {
+                for c in a[1..].chars() {
+                    match c {
+                        'f' => force = true,
+                        'r' | 'R' => recursive = true,
+                        'd' => dir_ok = true,
+                        _ => { eprintln!("rm: invalid option -- '{}'", c); return 1; }
+                    }
+                }
+                continue;
+            }
+        }
+        ops.push(a);
+    }
+    if ops.is_empty() {
+        if force { return 0; }
+        eprintln!("rm: missing operand");
+        return 1;
+    }
+    let mut rc = 0;
+    for p in ops {
+        let path = std::path::Path::new(p);
+        let meta = match std::fs::symlink_metadata(path) {
+            Ok(m) => m,
+            Err(e) => {
+                if force && e.kind() == std::io::ErrorKind::NotFound { continue; }
+                eprintln!("rm: cannot remove '{}': {}", p, e);
+                rc = 1;
+                continue;
+            }
+        };
+        // symlink_metadata: a symlink is never a directory here, so `rm`
+        // unlinks the LINK and never descends into it (the GNU rule).
+        let is_dir = meta.is_dir();
+        if is_dir && !recursive && !dir_ok {
+            eprintln!("rm: cannot remove '{}': Is a directory", p);
+            rc = 1;
+            continue;
+        }
+        let res = if is_dir {
+            if recursive { std::fs::remove_dir_all(path) } else { std::fs::remove_dir(path) }
+        } else {
+            std::fs::remove_file(path)
+        };
+        if let Err(e) = res {
+            if force && e.kind() == std::io::ErrorKind::NotFound { continue; }
+            eprintln!("rm: cannot remove '{}': {}", p, e);
+            rc = 1;
+        }
+    }
+    rc
+}"#,
+        "mkdir" => r#"fn __sh_mkdir(argv: &[String]) -> i32 {
+    let mut parents = false;
+    let mut verbose = false;
+    let mut end_opts = false;
+    let mut ops: Vec<&String> = Vec::new();
+    for a in argv {
+        if !end_opts {
+            if a == "--" { end_opts = true; continue; }
+            if a.len() > 1 && a.starts_with('-') {
+                for c in a[1..].chars() {
+                    match c {
+                        'p' => parents = true,
+                        'v' => verbose = true,
+                        _ => { eprintln!("mkdir: invalid option -- '{}'", c); return 1; }
+                    }
+                }
+                continue;
+            }
+        }
+        ops.push(a);
+    }
+    if ops.is_empty() { eprintln!("mkdir: missing operand"); return 1; }
+    let mut rc = 0;
+    for p in ops {
+        let res = if parents { std::fs::create_dir_all(p) } else { std::fs::create_dir(p) };
+        match res {
+            Ok(_) => { if verbose { println!("mkdir: created directory '{}'", p); } }
+            Err(e) => { eprintln!("mkdir: cannot create directory '{}': {}", p, e); rc = 1; }
+        }
+    }
+    rc
+}"#,
+        "touch" => r#"fn __sh_touch(argv: &[String]) -> i32 {
+    let mut rc = 0;
+    let mut end_opts = false;
+    let mut ops: Vec<&String> = Vec::new();
+    for a in argv {
+        if !end_opts {
+            if a == "--" { end_opts = true; continue; }
+            if a.len() > 1 && a.starts_with('-') {
+                eprintln!("touch: unsupported option '{}'", a);
+                return 1;
+            }
+        }
+        ops.push(a);
+    }
+    if ops.is_empty() { eprintln!("touch: missing file operand"); return 1; }
+    for p in ops {
+        // append-open: creates when absent, NEVER truncates an existing
+        // file (File::create would), then bump mtime like touch(1).
+        match std::fs::OpenOptions::new().create(true).append(true).open(p) {
+            Ok(f) => { let _ = f.set_modified(std::time::SystemTime::now()); }
+            Err(e) => { eprintln!("touch: cannot touch '{}': {}", p, e); rc = 1; }
+        }
+    }
+    rc
+}"#,
+        "catf" => r#"fn __sh_catf(argv: &[String]) -> Option<String> {
+    let mut out = String::new();
+    for p in argv {
+        match std::fs::read(p) {
+            Ok(d) => out.push_str(&String::from_utf8_lossy(&d)),
+            Err(_) => return None,
+        }
+    }
+    // bash `$(…)` strips ALL trailing newlines
+    while out.ends_with('\n') { out.pop(); }
+    Some(out)
+}"#,
+        "cat_stmt" => r#"fn __sh_cat_stmt(argv: &[String]) -> i32 {
+    let mut rc = 0;
+    for p in argv {
+        match std::fs::read(p) {
+            Ok(d) => __sh_sink(&d),
+            Err(e) => { eprintln!("cat: {}: {}", p, e); rc = 1; }
+        }
+    }
+    rc
+}"#,
+        "basename_args" => r#"fn __sh_basename_args(argv: &[String]) -> String {
+    let p = match argv.first() { Some(p) => p.clone(), None => { eprintln!("basename: missing operand"); return String::new(); } };
+    let suffix = argv.get(1).cloned().unwrap_or_default();
+    let body = p.trim_end_matches('/');
+    let mut out = if body.is_empty() {
+        "/".to_string()
+    } else {
+        match body.rfind('/') { Some(i) => body[i + 1..].to_string(), None => body.to_string() }
+    };
+    if !suffix.is_empty() && out.len() > suffix.len() && out.ends_with(&suffix) {
+        out.truncate(out.len() - suffix.len());
+    }
+    out
+}"#,
+        "dirname_args" => r#"fn __sh_dirname_args(argv: &[String]) -> String {
+    let p = match argv.first() { Some(p) => p.clone(), None => { eprintln!("dirname: missing operand"); return String::new(); } };
+    let t = p.trim_end_matches('/');
+    if t.is_empty() { return "/".to_string(); }
+    match t.rfind('/') {
+        None => ".".to_string(),
+        Some(i) => {
+            let d = t[..i].trim_end_matches('/');
+            if d.is_empty() { "/".to_string() } else { d.to_string() }
+        }
+    }
+}"#,
+        "mktemp" => r#"fn __sh_mktemp(dir: bool, tmpl: &str) -> String {
+    let t = if tmpl.is_empty() {
+        let d = std::env::var("TMPDIR").ok().filter(|d| !d.is_empty()).unwrap_or_else(|| "/tmp".to_string());
+        format!("{}/tmp.XXXXXXXXXX", d.trim_end_matches('/'))
+    } else {
+        tmpl.to_string()
+    };
+    let base = t.trim_end_matches('X').to_string();
+    let nx = t.len() - base.len();
+    let nx = if nx == 0 { 10 } else { nx };
+    let cs: &[u8] = b"abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789";
+    for n in 0..100000u64 {
+        let seed = (std::process::id() as u64).wrapping_mul(1_000_003)
+            ^ n.wrapping_mul(7_919)
+            ^ std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.subsec_nanos() as u64)
+                .unwrap_or(0);
+        let mut x = seed | 1;
+        let mut s = base.clone();
+        for _ in 0..nx { s.push(cs[(x % 62) as usize] as char); x /= 62; }
+        // create_new / create_dir are atomic: an existing name fails and the
+        // loop draws another (the uniqueness mktemp(1) guarantees).
+        let ok = if dir {
+            std::fs::create_dir(&s).is_ok()
+        } else {
+            std::fs::OpenOptions::new().write(true).create_new(true).open(&s).is_ok()
+        };
+        if ok { return s; }
+    }
+    String::new()
+}"#,
         "puts" => r#"fn __sh_puts(s: &str) {
     // constant-echo path for a program that DOES use a redirect/capture
     // sink: the caller has already joined the words and applied -n/-e,
     // so this only routes to the active sink before stdout. (A
     // runtime-free program emits a bare print! instead and never calls
     // this.)
-    let mut used = false;
-    __SH_OUTFILE_TL.with(|v| { if let Some(f) = v.borrow_mut().as_mut() { let _ = std::io::Write::write_all(f, s.as_bytes()); used = true; } });
-    if used { return; }
-    if let Some(b) = __SH_OUT.lock().unwrap().as_mut() {
-        b.extend_from_slice(s.as_bytes());
-        return;
-    }
-    print!("{}", s);
+    __sh_sink(s.as_bytes());
 }"#,
         "printf" => r#"fn __sh_printf(fmt: &str, args: &[String]) -> String {
     let mut out = String::new();
@@ -14428,17 +15007,7 @@ fn helper_source(h: &str) -> &'static str {
         let _ = std::io::Read::read_to_end(&mut so, &mut out);
     }
     let rc = ch.wait().map(|s| s.code().unwrap_or(1)).unwrap_or(1);
-    if !out.is_empty() {
-        let mut used = false;
-        __SH_OUTFILE_TL.with(|v| { if let Some(f) = v.borrow_mut().as_mut() { let _ = std::io::Write::write_all(f, &out); used = true; } });
-        if !used {
-            if let Some(b) = __SH_OUT.lock().unwrap().as_mut() {
-                b.extend_from_slice(&out);
-            } else {
-                let _ = std::io::Write::write_all(&mut std::io::stdout(), &out);
-            }
-        }
-    }
+    if !out.is_empty() { __sh_sink(&out); }
     rc
 }"#,
         "run" => r#"fn __sh_run(cmd: &str) -> i32 {
@@ -14878,7 +15447,7 @@ fn helper_source(h: &str) -> &'static str {
     match c.spawn() {
         Ok(ch) => {
             let pid = ch.id();
-            __SH_BGPID.store(pid as i32, Ordering::SeqCst);
+            __SH_BGPID.store(pid as i32, Ordering::Relaxed);
             __SH_BG.lock().unwrap().push((pid, ch));
         }
         Err(_) => {}
@@ -17692,7 +18261,7 @@ fn collect_bigint_vars(stmts: &[IrStmt], subs: &[crate::ir::IrSub], out: &mut BT
                     | IrStmt::For { body, .. }
                     | IrStmt::Block(body)
                     | IrStmt::Subshell(body) => collect_targets(body, out),
-                    IrStmt::Expr(e) => {
+                    IrStmt::Expr(_) => {
                         // recurse for nested calls? has_huge_arg handles exprs;
                         // here just collect targets (no-op for Expr).
                     }
@@ -19029,32 +19598,78 @@ fn compute_local_vars(
     HashMap<String, crate::shir_passes::list_profile::Scope>,
     BTreeSet<String>,
     BTreeSet<String>,
+    BTreeSet<String>,
 ) {
     use crate::shir_passes::list_profile::{local_scope, use_scopes, Scope};
     let mut need_mut: BTreeSet<String> = BTreeSet::new();
     let mut dead_init: BTreeSet<String> = BTreeSet::new();
+    let mut entry_decl: BTreeSet<String> = BTreeSet::new();
     let Some(dyns) = dynamic_var_names(prog) else {
-        return (HashMap::new(), need_mut, dead_init);
+        return (HashMap::new(), need_mut, dead_init, entry_decl);
     };
     let mut out: HashMap<String, Scope> = HashMap::new();
+    // A `for` binding is not a mention: the walker skips binding
+    // positions, so a loop variable's first recorded mention is a read in
+    // the body. The pass-6 loop binding owns those names (it binds the
+    // element under the var's own name, and writes back only when the var
+    // escapes), so they must never become entry-declared locals.
+    let mut loop_bound: BTreeSet<String> = BTreeSet::new();
+    collect_for_vars(&prog.stmts, &mut loop_bound);
+    for sub in &prog.subs {
+        collect_for_vars(&sub.body, &mut loop_bound);
+    }
     for (name, us) in use_scopes(prog) {
         // *declared* vars only (an undeclared name reads the process
         // environment; a `let` would shadow it with ""), and only names
         // whose FIRST mention is a top-level write in the owning scope
         // (that is where the `let` lands) which is read at least once
         // (a never-read local would be dead-store dead weight).
-        if !declared.contains(&name)
-            || !us.first().map(|u| u.write && u.top).unwrap_or(false)
-            || !us.iter().any(|u| !u.write)
-            || is_special_var(&name)
-            || arrays.contains(&name)
-            || assoc.contains(&name)
-            || dyns.contains(&name)
-        {
+        let first_is_write = us.first().map(|u| u.write).unwrap_or(false);
+        let first_is_top_write = us.first().map(|u| u.write && u.top).unwrap_or(false);
+        // A first mention that is NOT a top-level write cannot carry the
+        // `let`; the name is instead declared at the top of its scope
+        // (bash reads an unset name as "", and as 0 in arithmetic).
+        let entry = !first_is_top_write;
+        let why: Option<&'static str> = if !declared.contains(&name) {
+            Some("undeclared")
+        } else if !us.iter().any(|u| !u.write) {
+            Some("never_read")
+        } else if is_special_var(&name) {
+            Some("special")
+        } else if arrays.contains(&name) {
+            Some("array")
+        } else if assoc.contains(&name) {
+            Some("assoc")
+        } else if dyns.contains(&name) {
+            Some("dyn")
+        } else if entry && loop_bound.contains(&name) {
+            Some("loop_bound")
+        } else {
+            None
+        };
+        if why.is_some() {
             continue;
         }
-        // a local is written more than once => needs `mut`
-        if us.iter().filter(|u| u.write).count() > 1 {
+        let scope = match local_scope(&us) {
+            Some(Scope::Main) => Some(Scope::Main),
+            Some(Scope::Func(f)) if functions.contains(&f) => Some(Scope::Func(f)),
+            // a scope that renders as no Rust function at all (inlined
+            // sub), or uses spread over several scopes: global storage is
+            // the only sound home, so no local verdict
+            _ => None,
+        };
+        let Some(scope) = scope else { continue };
+        if entry {
+            // the `let` sits at the top of the scope, so every write of
+            // the name is a plain assignment and the binding is `mut`
+            entry_decl.insert(name.clone());
+            need_mut.insert(name.clone());
+            if first_is_write {
+                // nothing reads the default before the first write
+                dead_init.insert(name.clone());
+            }
+        } else if us.iter().filter(|u| u.write).count() > 1 {
+            // a local is written more than once => needs `mut`
             need_mut.insert(name.clone());
             // first write dead when no read sits between it and the
             // second write (`x=1; x=2; echo $x`: the `1` is never read)
@@ -19075,17 +19690,64 @@ fn compute_local_vars(
                 dead_init.insert(name.clone());
             }
         }
-        match local_scope(&us) {
-            Some(Scope::Main) => {
-                out.insert(name, Scope::Main);
+        out.insert(name, scope);
+    }
+    (out, need_mut, dead_init, entry_decl)
+}
+
+/// Every name bound by a `for` statement, at any depth.
+fn collect_for_vars(list: &[IrStmt], out: &mut BTreeSet<String>) {
+    for s in list {
+        match s {
+            IrStmt::For { var, body, .. } => {
+                out.insert(var.clone());
+                collect_for_vars(body, out);
             }
-            Some(Scope::Func(f)) if functions.contains(&f) => {
-                out.insert(name, Scope::Func(f));
+            IrStmt::ForInit { init, step, body, .. } => {
+                collect_for_vars(init, out);
+                collect_for_vars(step, out);
+                collect_for_vars(body, out);
+            }
+            IrStmt::If { then, elsifs, else_, .. } => {
+                collect_for_vars(then, out);
+                for (_, b) in elsifs {
+                    collect_for_vars(b, out);
+                }
+                collect_for_vars(else_, out);
+            }
+            IrStmt::While { body, .. }
+            | IrStmt::DoWhile { body, .. }
+            | IrStmt::Block(body)
+            | IrStmt::Subshell(body)
+            | IrStmt::Background(body) => collect_for_vars(body, out),
+            IrStmt::Redirect { inner, .. } => collect_for_vars(inner, out),
+            IrStmt::Pipeline { stages, .. } => {
+                for st in stages {
+                    collect_for_vars(st, out);
+                }
+            }
+            IrStmt::Try { body, excepts, else_body, finally_body } => {
+                collect_for_vars(body, out);
+                for e in excepts {
+                    collect_for_vars(&e.body, out);
+                }
+                collect_for_vars(else_body, out);
+                collect_for_vars(finally_body, out);
+            }
+            IrStmt::Case { clauses, .. } => {
+                for c in clauses {
+                    collect_for_vars(&c.body, out);
+                }
+            }
+            IrStmt::Function { body, named_blocks, .. } => {
+                collect_for_vars(body, out);
+                for (_, b) in named_blocks {
+                    collect_for_vars(b, out);
+                }
             }
             _ => {}
         }
     }
-    (out, need_mut, dead_init)
 }
 
 /// Shell specials / positionals — never plain locals.
@@ -19330,8 +19992,6 @@ fn all_int_literal_arrays(
 /// counts) — a false positive only costs the optimization.
 fn function_reachable_vars(prog: &IrProgram) -> BTreeSet<String> {
     use crate::shir_passes::list_profile::scopes::{all_idents, dollar_vars};
-
-    let mut out: BTreeSet<String> = BTreeSet::new();
 
     fn expr(e: &IrExpr, out: &mut BTreeSet<String>) {
         match e {
@@ -20411,7 +21071,7 @@ mod tests {
 
     #[test]
     fn unwrap_cond_strips_every_top_level_wrapper() {
-        let w = |e: &str| format!("{{ let __b = {e}; __SH_RC.store(if __b {{ 0 }} else {{ 1 }}, Ordering::SeqCst); __b }}");
+        let w = |e: &str| format!("{{ let __b = {e}; __SH_RC.store(if __b {{ 0 }} else {{ 1 }}, Ordering::Relaxed); __b }}");
         // a whole-condition wrapper
         assert_eq!(Render::unwrap_cond(&w("x")), "x");
         // an `&&` tree: EACH operand is wrapped separately
@@ -20615,7 +21275,7 @@ mod tests {
         // only observable one: the earlier `echo`/assignment status
         // writes are provably unread and carry no `__SH_RC.store`.
         let out = render("x=1\necho hi\necho there\n");
-        let n = out.matches("__SH_RC.store(0, Ordering::SeqCst);").count();
+        let n = out.matches("__SH_RC.store(0, Ordering::Relaxed);").count();
         assert!(n <= 1, "dead status stores kept ({n}):\n{out}");
     }
 
@@ -20816,6 +21476,45 @@ mod tests {
             out.contains("__SHV_n.with(|v| *v.borrow_mut() = n.to_string())"),
             "escaping var lost its write-back:\n{out}"
         );
+    }
+
+    #[test]
+    fn read_before_write_local_gets_a_scope_entry_let() {
+        // bash reads an unset name as "", so a single-scope name whose
+        // FIRST mention is a read is still a plain local — declared at the
+        // top of main instead of at a write it does not have.
+        let out = render("echo \"[$x]\"\nx=hi\necho \"$x\"\n");
+        assert!(
+            out.contains("let mut x = String::new();"),
+            "no entry declaration:\n{out}"
+        );
+        assert!(!out.contains("__SHV_x"), "thread-local kept:\n{out}");
+        assert!(!out.contains("borrow()"), "borrow kept:\n{out}");
+    }
+
+    #[test]
+    fn nested_first_write_local_gets_a_scope_entry_let() {
+        // the first write sits inside a block, so the `let` cannot ride on
+        // it: it goes to the top of the owning scope and the block write
+        // is a plain assignment (never a second, shadowing `let`)
+        let out = render("{ n=1; }\necho \"$n\"\n");
+        assert!(
+            out.contains("let mut n = 0i64;"),
+            "no entry declaration:\n{out}"
+        );
+        assert!(!out.contains("__SHV_n"), "thread-local kept:\n{out}");
+        assert_eq!(out.matches("let mut n").count(), 1, "duplicate decl:\n{out}");
+    }
+
+    #[test]
+    fn numeric_read_first_local_initialises_to_zero() {
+        // an unset name in arithmetic is 0, not ""
+        let out = render("echo $((n + 1))\nn=5\necho \"$n\"\n");
+        assert!(
+            out.contains("let mut n = 0i64;"),
+            "no numeric entry declaration:\n{out}"
+        );
+        assert!(!out.contains("__SHV_n"), "thread-local kept:\n{out}");
     }
 
     #[test]
@@ -21263,11 +21962,11 @@ mod tests {
     fn special_var_echoes_print_their_integer_directly() {
         let out = render("sleep 0\necho \"rc=$?\"\necho \"$#\"\n");
         assert!(
-            out.contains("println!(\"rc={}\", __SH_RC.load(Ordering::SeqCst))"),
+            out.contains("println!(\"rc={}\", __SH_RC.load(Ordering::Relaxed))"),
             "{out}"
         );
         assert!(
-            !out.contains("__SH_RC.load(Ordering::SeqCst).to_string()"),
+            !out.contains("__SH_RC.load(Ordering::Relaxed).to_string()"),
             "status read stringified:\n{out}"
         );
         assert!(out.contains("len() as i64)"), "{out}");
@@ -21615,7 +22314,7 @@ mod tests {
         let dyn_out = render("if [ \"$1\" = x ]; then echo yes; fi\necho \"rc=$?\"\n");
         assert!(dyn_out.contains("} else {"), "status arm dropped:\n{dyn_out}");
         assert!(
-            dyn_out.contains("__SH_RC.store(0, Ordering::SeqCst);"),
+            dyn_out.contains("__SH_RC.store(0, Ordering::Relaxed);"),
             "{dyn_out}"
         );
     }
@@ -22274,6 +22973,34 @@ mod tok_tests {
         let e = p.parse_ternary();
         eprintln!("PARSE: {:?} pos={} len={}", e.is_some(), p.pos, toks.len());
         assert!(e.is_some() && p.pos == toks.len(), "arith parse failed");
+    }
+
+    #[test]
+    fn literal_divisor_skips_the_zero_guard_helper() {
+        // A non-zero LITERAL divisor cannot trip the zero-divisor guard, so
+        // the helper is dead weight: `count % 10` must emit the operator.
+        let out = render("count=7\nif [ $((count % 10)) -eq 0 ]; then echo z; fi\n");
+        assert!(out.contains(" % 10"), "direct modulo expected:\n{out}");
+        assert!(
+            !out.contains("__sh_mod("),
+            "guarded helper emitted for a literal divisor:\n{out}"
+        );
+        // ...and `0 / <literal>` folds outright (the const folder usually
+        // reaches it first — either way the guard must not be imported).
+        let z = render("echo $((0 / 3))\n");
+        assert!(!z.contains("__sh_div("), "0/3 must not call the guard:\n{z}");
+        // `0 / <variable>` KEEPS the guard: `0/0` is an observable arith
+        // error in bash ("division by 0"), not 0.
+        let v = render("n=$1\necho $((0 / n))\n");
+        assert!(v.contains("__sh_div("), "0/n must keep the guard:\n{v}");
+    }
+
+    #[test]
+    fn variable_divisor_keeps_the_zero_guard_helper() {
+        // `1/0` prints bash's "division by 0" diagnostic, so a divisor that
+        // can BE zero keeps the guarded helper.
+        let out = render("n=0\necho $((1 / n))\n");
+        assert!(out.contains("__sh_div("), "the guard must stay:\n{out}");
     }
 
     #[test]
