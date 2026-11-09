@@ -647,6 +647,419 @@ proof fn m3_free_no_null()
     assert(bash_elems(stale(), 0, 6) != bash_elems(scen(), 0, 6)) by (compute);
 }
 
+// ---------------------------------------------------------------------
+// The `=` / `:=` faces also WRITE (added 2026-11-05, second increment)
+// ---------------------------------------------------------------------
+// bash does not only return the default word — it ASSIGNS it into the
+// element. MEASURED (before this increment the C yielded the word and
+// stored nothing):
+//   a=();      echo "[${a[0]=z}]"; echo "n=${#a[@]} v=[${a[0]}]"
+//              bash `[z] n=1 v=[z]`   C `[z] n=0 v=[]`
+//   a=();      echo "[${a[2]=z}]"    bash stores at 2 (n=1) — the write
+//                                    needs CAPACITY index+1, which the
+//                                    generated table did not have (exit 127)
+//   a=('');    echo "[${a[0]=z}]"    bash `[]` (set: NOT overwritten)
+//   a=('');    echo "[${a[0]:=z}]"   bash `[z]` (the COLON form tests
+//                                    EMPTINESS, not set-ness — so it
+//                                    overwrites a present-but-empty slot)
+// The two faces therefore share a WRITE but not a TEST: `=` asks
+// `is_set`, `:=` asks `arr_get.len() == 0`.
+
+// `=` on an element: store when the slot is NOT an element.
+pub open spec fn assign_state(slots: Seq<Slot>, n: nat, i: int, w: Str) -> (Seq<Slot>, nat) {
+    if !is_set(slots, i, n) && i >= 0 && i < slots.len() as int {
+        // `arr_set` grows `len` to i+1 and leaves the gap [n, i) a hole
+        arr_set(slots, n, i as nat, w)
+    } else {
+        (slots, n)
+    }
+}
+
+// `:=` on an element: store when the VALUE is empty (hole OR set-to-empty)
+// — bash's contract, now that the store can overwrite safely. The replaced
+// block is handed to the TRASH list instead of being freed in place, so an
+// earlier expansion of the same statement that still points at it reads a
+// live object (`take_old` below); the flush happens at the statement
+// boundary (`_sh_flush_trash`).
+pub open spec fn colon_assign_state(slots: Seq<Slot>, n: nat, i: int, w: Str) -> (Seq<Slot>, nat) {
+    if i >= 0 && i < slots.len() as int && arr_get(slots, i, n).len() == 0 {
+        arr_set(slots, n, i as nat, w)
+    } else {
+        (slots, n)
+    }
+}
+
+// What the take-store hands to the trash: the slot it replaced, still a
+// live value (`None` when there was no slot). This is the property that
+// makes overwriting safe — the value is RETAINED, not freed in place.
+pub open spec fn take_old(slots: Seq<Slot>, i: int) -> Option<Str> {
+    if i >= 0 && i < slots.len() as int {
+        slots[i as int]
+    } else {
+        Option::None
+    }
+}
+
+// The colon face's VALUE denotation (the emptiness test).
+pub open spec fn f_assign_colon(slots: Seq<Slot>, i: int, n: nat, w: Str) -> Str {
+    if arr_get(slots, i, n).len() == 0 {
+        w
+    } else {
+        arr_get(slots, i, n)
+    }
+}
+
+pub open spec fn pe0() -> Seq<Slot> {
+    seq![Option::None]  // `a=()` — one slot of capacity, no element
+}
+
+// The word really lands in the store, and the count follows it.
+proof fn assign_writes_the_word()
+    ensures
+        bash_elems(assign_state(pe0(), 0, 0, s4_z()).0, 0, 1) == seq![s4_z()],
+        assign_state(pe0(), 0, 0, s4_z()).1 == 1,
+{
+    assert(assign_state(pe0(), 0, 0, s4_z()) == (seq![Option::Some(s4_z())], 1)) by (compute);
+    assert(bash_elems(seq![Option::Some(s4_z())], 0, 1) == seq![s4_z()]) by (compute);
+}
+
+// A SET element is not overwritten by `=` (bash `a=(''); ${a[0]=z}` → ``).
+proof fn assign_keeps_a_set_element()
+    ensures
+        assign_state(pe(), 1, 0, s4_z()).0 == pe(),
+        assign_state(pe(), 1, 0, s4_z()).1 == 1,
+{
+    assert(assign_state(pe(), 1, 0, s4_z()) == (pe(), 1)) by (compute);
+}
+
+// `=` keeps the element, `:=` overwrites it (bash `[z]`), and the VALUES
+// differ too — presence vs emptiness.
+proof fn colon_assign_overwrites_a_present_empty()
+    ensures
+        assign_state(pe(), 1, 0, s4_z()).0 == pe(),
+        colon_assign_state(pe(), 1, 0, s4_z()).0 == seq![Option::Some(s4_z())],
+        f_assign(pe(), 0, 1, s4_z()) == Seq::empty(),
+        f_assign_colon(pe(), 0, 1, s4_z()) == s4_z(),
+        // the replaced block is RETAINED for the trash, so a read earlier in
+        // the same statement still sees a live (empty) value
+        take_old(pe(), 0) == Option::Some(Seq::empty()),
+{
+    assert(colon_assign_state(pe(), 1, 0, s4_z()) == (seq![Option::Some(s4_z())], 1))
+        by (compute);
+    assert(f_assign(pe(), 0, 1, s4_z()) == Seq::empty()) by (compute);
+    assert(f_assign_colon(pe(), 0, 1, s4_z()) == s4_z()) by (compute);
+    assert(take_old(pe(), 0) == Option::Some(Seq::empty())) by (compute);
+}
+
+// M14: freeing the replaced block IN PLACE is the measured use-after-free
+// (`a=(''); echo "${a[0]}" "${a[0]:=z}"` printed freed memory). Modelled as
+// the difference between deferring the free and dropping the value now.
+proof fn m14_in_place_free_drops_the_read()
+    ensures
+        take_old(pe(), 0) != Option::None,
+{
+    assert(take_old(pe(), 0) == Option::Some(Seq::empty())) by (compute);
+}
+
+// …and on a HOLE both faces store (`a=(); ${a[0]:=z}` → bash `z`, n 1).
+proof fn colon_assign_writes_a_hole()
+    ensures
+        colon_assign_state(pe0(), 0, 0, s4_z()).0 == seq![Option::Some(s4_z())],
+        colon_assign_state(pe0(), 0, 0, s4_z()).1 == 1,
+{
+    assert(colon_assign_state(pe0(), 0, 0, s4_z()) == (seq![Option::Some(s4_z())], 1))
+        by (compute);
+}
+
+// The write also GROWS the array to the index (bash counts 1 for `${a[2]=z}`
+// on an empty array): capacity is the index, not the old length.
+proof fn assign_grows_to_the_index(slots: Seq<Slot>, n: nat, i: nat, w: Str)
+    requires
+        i < slots.len(),
+        i >= n,
+    ensures
+        assign_state(slots, n, i as int, w).1 == i + 1,
+{
+}
+
+// M11: the PRE-FIX face — yield the word, store nothing. The count says it:
+// bash leaves one element, the old arm left the array empty.
+proof fn m11_assign_without_the_store()
+    ensures
+        bash_elems(pe0(), 0, 0).len() == 0,
+        bash_elems(assign_state(pe0(), 0, 0, s4_z()).0, 0, 1).len() == 1,
+{
+    assert(bash_elems(pe0(), 0, 0).len() == 0) by (compute);
+    assert(bash_elems(assign_state(pe0(), 0, 0, s4_z()).0, 0, 1).len() == 1) by (compute);
+}
+
+// M12: using the PRESENCE test for `:=` (they disagree exactly on a
+// present-but-empty slot, the a6 row).
+proof fn m12_colon_is_emptiness_not_presence()
+    ensures
+        f_assign(pe(), 0, 1, s4_z()) != f_assign_colon(pe(), 0, 1, s4_z()),
+{
+    assert(f_assign(pe(), 0, 1, s4_z()) == Seq::empty()) by (compute);
+    assert(f_assign_colon(pe(), 0, 1, s4_z()) == s4_z()) by (compute);
+}
+
+// ---------------------------------------------------------------------
+// The NO-COLON SET-NESS faces on an ELEMENT (added 2026-11-05)
+// ---------------------------------------------------------------------
+// `${arr[i]-w}` / `${arr[i]+w}` / `${arr[i]=w}` / `${arr[i]?msg}` ask a
+// PREDICATE question — "is this index an element?" — not a value one.
+// In bash a set-but-EMPTY element IS set, so the predicate is
+// `slot.is_Some()`, and it is exactly what the presence marker records.
+//
+// MEASURED (2026-11-05, each against bash):
+//   a=(""); echo "[${a[0]-z}]"   bash `[]`   C `[z]`  (emptiness test)
+//   a=(""); echo "[${a[0]+z}]"   bash `[z]`  C `[]`
+//   a=(""); echo "[${a[0]=z}]"   bash `[]`   C `[z]`
+//   a=(""); echo "[${a[0]?b}]"   bash `[]`, rc 0   C aborted
+//   a=();   echo "[${a[0]-z}]"   bash `[z]`  (both sides agree)
+// The fix threads an explicit presence expression into the scalar arms
+// (`presence_override` in `param_call`) instead of the value's emptiness.
+
+// bash's predicate: is index i an ELEMENT?
+pub open spec fn is_set(slots: Seq<Slot>, i: int, n: nat) -> bool {
+    i >= 0 && i < n as int && i < slots.len() as int && slots[i as int].is_Some()
+}
+
+// The shipped test when the array has a presence marker: in range AND the
+// marker byte (`_sh_pres_a[i]`).
+pub open spec fn pres_test(pres: Seq<bool>, i: int, n: nat) -> bool {
+    i >= 0 && i < n as int && i < pres.len() as int && pres[i as int]
+}
+
+// The marker's meaning: it is written for every real element and never for
+// a hole (`array_index_read` sets it from the same store the writer filled).
+pub open spec fn pres_wf(slots: Seq<Slot>, pres: Seq<bool>, n: nat) -> bool {
+    pres.len() == slots.len() && n as int <= slots.len() as int && forall|i: nat|
+        i < n ==> pres[i as int] == slots[i as int].is_Some()
+}
+
+// VALUE storage (`long long a[]` / `mpz_t a[]`): no marker byte exists, and
+// every index below `len` holds a VALUE — so the range test alone is the
+// predicate there (the arm the generator emits when `dense_presence` is
+// false).
+pub open spec fn value_wf(slots: Seq<Slot>, n: nat) -> bool {
+    n as int <= slots.len() as int && forall|i: nat|
+        i < n ==> slots[i as int].is_Some()
+}
+
+// ── bash denotations ───────────────────────────────────────────────────
+pub open spec fn f_dash(slots: Seq<Slot>, i: int, n: nat, w: Str) -> Str {
+    if is_set(slots, i, n) {
+        arr_get(slots, i, n)
+    } else {
+        w
+    }
+}
+
+pub open spec fn f_plus(slots: Seq<Slot>, i: int, n: nat, w: Str) -> Str {
+    if is_set(slots, i, n) {
+        w
+    } else {
+        Seq::empty()
+    }
+}
+
+pub open spec fn f_assign(slots: Seq<Slot>, i: int, n: nat, w: Str) -> Str {
+    if is_set(slots, i, n) {
+        arr_get(slots, i, n)
+    } else {
+        w
+    }
+}
+
+pub open spec fn f_question(slots: Seq<Slot>, i: int, n: nat) -> bool {
+    is_set(slots, i, n)
+}
+
+// ── shipped C renderings ───────────────────────────────────────────────
+pub open spec fn c_dash_pres(
+    slots: Seq<Slot>,
+    pres: Seq<bool>,
+    i: int,
+    n: nat,
+    w: Str,
+) -> Str {
+    if pres_test(pres, i, n) {
+        arr_get(slots, i, n)
+    } else {
+        w
+    }
+}
+
+pub open spec fn c_plus_pres(pres: Seq<bool>, i: int, n: nat, w: Str) -> Str {
+    if pres_test(pres, i, n) {
+        w
+    } else {
+        Seq::empty()
+    }
+}
+
+pub open spec fn c_assign_pres(
+    slots: Seq<Slot>,
+    pres: Seq<bool>,
+    i: int,
+    n: nat,
+    w: Str,
+) -> Str {
+    if pres_test(pres, i, n) {
+        arr_get(slots, i, n)
+    } else {
+        w
+    }
+}
+
+pub open spec fn c_question_pres(pres: Seq<bool>, i: int, n: nat) -> bool {
+    pres_test(pres, i, n)
+}
+
+// the marker-less (value-storage) arms: range only
+pub open spec fn c_dash_range(slots: Seq<Slot>, i: int, n: nat, w: Str) -> Str {
+    if i >= 0 && i < n as int {
+        arr_get(slots, i, n)
+    } else {
+        w
+    }
+}
+
+// PRE-FIX: the scalar arms' EMPTINESS test, reused for the element.
+pub open spec fn c_dash_empty(slots: Seq<Slot>, i: int, n: nat, w: Str) -> Str {
+    if arr_get(slots, i, n).len() > 0 {
+        arr_get(slots, i, n)
+    } else {
+        w
+    }
+}
+
+// ── the four faces are exact under the marker invariant ────────────────
+proof fn setness_dash(slots: Seq<Slot>, pres: Seq<bool>, i: int, n: nat, w: Str)
+    requires
+        pres_wf(slots, pres, n),
+    ensures
+        c_dash_pres(slots, pres, i, n, w) == f_dash(slots, i, n, w),
+{
+    if pres_test(pres, i, n) {
+        assert(pres[i as int]);
+        assert(i < n as int);
+        assert(slots[i as int].is_Some());
+        assert(is_set(slots, i, n));
+    } else if is_set(slots, i, n) {
+        assert(slots[i as int].is_Some());
+        assert(pres[i as int] == slots[i as int].is_Some());
+        assert(i < pres.len() as int);
+        assert(pres_test(pres, i, n));
+    }
+}
+
+proof fn setness_plus(pres: Seq<bool>, slots: Seq<Slot>, i: int, n: nat, w: Str)
+    requires
+        pres_wf(slots, pres, n),
+    ensures
+        c_plus_pres(pres, i, n, w) == f_plus(slots, i, n, w),
+{
+    setness_dash(slots, pres, i, n, w);
+    if pres_test(pres, i, n) {
+        assert(is_set(slots, i, n));
+    } else if is_set(slots, i, n) {
+        assert(pres_test(pres, i, n));
+    }
+}
+
+proof fn setness_assign(slots: Seq<Slot>, pres: Seq<bool>, i: int, n: nat, w: Str)
+    requires
+        pres_wf(slots, pres, n),
+    ensures
+        c_assign_pres(slots, pres, i, n, w) == f_assign(slots, i, n, w),
+{
+    setness_dash(slots, pres, i, n, w);
+}
+
+proof fn setness_question(pres: Seq<bool>, slots: Seq<Slot>, i: int, n: nat)
+    requires
+        pres_wf(slots, pres, n),
+    ensures
+        c_question_pres(pres, i, n) == f_question(slots, i, n),
+{
+    setness_dash(slots, pres, i, n, Seq::empty());
+    if pres_test(pres, i, n) {
+        assert(is_set(slots, i, n));
+    } else if is_set(slots, i, n) {
+        assert(pres_test(pres, i, n));
+    }
+}
+
+// Value storage has no marker, and needs none: in range IS set.
+proof fn setness_dash_value_storage(slots: Seq<Slot>, i: int, n: nat, w: Str)
+    requires
+        value_wf(slots, n),
+    ensures
+        c_dash_range(slots, i, n, w) == f_dash(slots, i, n, w),
+{
+    if i >= 0 && i < n as int {
+        assert(i < slots.len() as int);
+        assert(slots[i as int].is_Some());
+        assert(is_set(slots, i, n));
+    } else if is_set(slots, i, n) {
+        assert(i >= 0 && i < n as int);
+    }
+}
+
+// ── the mutants the fix kills ──────────────────────────────────────────
+pub open spec fn pe() -> Seq<Slot> {
+    seq![Option::Some(Seq::empty())]  // `a=('')` — one element, set, EMPTY
+}
+
+// M4: the emptiness test is NOT the set-ness predicate (the measured row
+// `a=(''); ${a[0]-z}`: bash ``, the old arm `z`).
+proof fn m4_emptiness_is_not_setness()
+    ensures
+        c_dash_empty(pe(), 0, 1, s4_z()) != f_dash(pe(), 0, 1, s4_z()),
+{
+    assert(c_dash_empty(pe(), 0, 1, s4_z()) == s4_z()) by (compute);
+    assert(f_dash(pe(), 0, 1, s4_z()) == Seq::empty()) by (compute);
+}
+
+// M5: the marker is what carries it — drop the byte and the same store
+// answers `z`, which is the `a=()` row.
+proof fn m5_marker_is_the_difference()
+    ensures
+        c_dash_pres(pe(), seq![false], 0, 1, s4_z()) != f_dash(pe(), 0, 1, s4_z()),
+{
+    assert(c_dash_pres(pe(), seq![false], 0, 1, s4_z()) == s4_z()) by (compute);
+    assert(f_dash(pe(), 0, 1, s4_z()) == Seq::empty()) by (compute);
+    assert(s4_z() != Seq::empty()) by (compute);
+}
+
+// M6: a HIDDEN special case — the `+` arm flips on the same store.
+proof fn m6_plus_flips()
+    ensures
+        c_plus_pres(seq![false], 0, 1, s4_z()) != f_plus(pe(), 0, 1, s4_z()),
+        f_plus(pe(), 0, 1, s4_z()) == s4_z(),
+{
+    assert(c_plus_pres(seq![false], 0, 1, s4_z()) == Seq::empty()) by (compute);
+    assert(f_plus(pe(), 0, 1, s4_z()) == s4_z()) by (compute);
+    assert(s4_z() != Seq::empty()) by (compute);
+}
+
+// M7: the `?` arm aborts on a set-but-empty element (the `a=('')` row,
+// whose `get_outside`-style witness is the abort itself).
+proof fn m7_question_aborts_wrongly()
+    ensures
+        !c_question_pres(seq![false], 0, 1),
+        f_question(pe(), 0, 1),
+{
+    assert(!pres_test(seq![false], 0, 1)) by (compute);
+    assert(is_set(pe(), 0, 1)) by (compute);
+}
+
+pub open spec fn s4_z() -> Str {
+    seq!['z']
+}
+
 pub open spec fn stale() -> Seq<Slot> {
     seq![
         Option::Some(seq!['s']), // freed, NOT nulled (the old loops)

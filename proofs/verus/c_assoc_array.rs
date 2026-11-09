@@ -1243,6 +1243,273 @@ proof fn canonical_faces()
     assert(inter_ws(seq![v1(), v2(), v3()]) == seq!['1', ' ', '2', ' ', '3']) by (compute);
 }
 
+// ---------------------------------------------------------------------
+// KEY PRESENCE — the no-colon set-ness faces on an ASSOC element
+// (added 2026-11-05)
+// ---------------------------------------------------------------------
+// `${m[k]-w}` / `${m[k]+w}` / `${m[k]=w}` / `${m[k]?msg}` ask whether the
+// KEY is in the table. The value alone cannot answer: `_sh_assoc_get`
+// returns a NON-NULL "" for a MISSING key, so before this round the C arms
+// fell back to the value's emptiness and read a present-but-empty entry as
+// unset (and vice versa for `+`, which read it as absent).
+//
+// MEASURED (2026-11-05, each against bash):
+//   declare -A m; m[k]=; echo "[${m[k]-z}]"   bash `[]`   C `[z]`
+//   declare -A m; m[k]=; echo "[${m[k]+z}]"   bash `[z]`  C `[]`
+//   declare -A m;        echo "[${m[k]-z}]"   bash `[z]`  (both agree)
+//   declare -A m; m[k]=; echo "[${m[k]?b}]"   bash `[]`, rc 0   C aborted
+// The fix is `_sh_assoc_has(k, n, key)` — a scan of the KEY list, which is
+// what `dom(the_map)` already is — threaded into the scalar arms as the
+// presence expression.
+
+// The shipped helper: scan in order, return on the first key match.
+pub open spec fn has(k: Str, ks: Seq<Str>) -> bool
+    decreases ks.len(),
+{
+    if ks.len() == 0 {
+        false
+    } else if ks[0] == k {
+        true
+    } else {
+        has(k, ks.skip(1))
+    }
+}
+
+pub open spec fn ez() -> Str {
+    Seq::empty()
+}
+
+// ── bash denotations ───────────────────────────────────────────────────
+pub open spec fn f_dash_m(ks: Seq<Str>, vs: Seq<Str>, k: Str, w: Str) -> Str {
+    if has(k, ks) {
+        assoc_get(ks, vs, k)
+    } else {
+        w
+    }
+}
+
+pub open spec fn f_plus_m(ks: Seq<Str>, vs: Seq<Str>, k: Str, w: Str) -> Str {
+    if has(k, ks) {
+        w
+    } else {
+        ez()
+    }
+}
+
+pub open spec fn f_question_m(ks: Seq<Str>, k: Str) -> bool {
+    has(k, ks)
+}
+
+// ── shipped C renderings ───────────────────────────────────────────────
+pub open spec fn c_dash_has(ks: Seq<Str>, vs: Seq<Str>, k: Str, w: Str) -> Str {
+    if has(k, ks) {
+        assoc_get(ks, vs, k)
+    } else {
+        w
+    }
+}
+
+pub open spec fn c_plus_has(ks: Seq<Str>, vs: Seq<Str>, k: Str, w: Str) -> Str {
+    if has(k, ks) {
+        w
+    } else {
+        ez()
+    }
+}
+
+pub open spec fn c_question_has(ks: Seq<Str>, k: Str) -> bool {
+    has(k, ks)
+}
+
+// PRE-FIX: the emptiness of the VALUE, used as if it were key presence.
+pub open spec fn c_dash_nonempty(ks: Seq<Str>, vs: Seq<Str>, k: Str, w: Str) -> Str {
+    if assoc_get(ks, vs, k).len() > 0 {
+        assoc_get(ks, vs, k)
+    } else {
+        w
+    }
+}
+
+// ── the faces are exact ────────────────────────────────────────────────
+proof fn setness_dash_assoc(ks: Seq<Str>, vs: Seq<Str>, k: Str, w: Str)
+    ensures
+        c_dash_has(ks, vs, k, w) == f_dash_m(ks, vs, k, w),
+{
+}
+
+proof fn setness_plus_assoc(ks: Seq<Str>, vs: Seq<Str>, k: Str, w: Str)
+    ensures
+        c_plus_has(ks, vs, k, w) == f_plus_m(ks, vs, k, w),
+{
+}
+
+proof fn setness_question_assoc(ks: Seq<Str>, k: Str)
+    ensures
+        c_question_has(ks, k) == f_question_m(ks, k),
+{
+}
+
+// The scan is key membership, and the key SET the count/key-join faces
+// already use (`sset`) is the same thing — so presence and `dom` agree.
+proof fn has_is_dom(ks: Seq<Str>, k: Str)
+    ensures
+        has(k, ks) == sset(ks).contains(k),
+    decreases ks.len(),
+{
+    if ks.len() == 0 {
+    } else if ks[0] == k {
+        assert(sset(ks).contains(k)) by {
+            assert(ks[0] == k);
+        }
+    } else {
+        has_is_dom(ks.skip(1), k);
+        assert(sset(ks) =~= sset(ks.skip(1)).insert(ks[0]));
+    }
+}
+
+// ── the mutants the fix kills ──────────────────────────────────────────
+// M8: a present-but-EMPTY entry — the value says "" for both a missing key
+// and this one, so the emptiness test flips BOTH faces.
+proof fn m8_value_is_not_presence()
+    ensures
+        c_dash_nonempty(seq![ka()], seq![ez()], ka(), v1()) != f_dash_m(
+            seq![ka()],
+            seq![ez()],
+            ka(),
+            v1(),
+        ),
+        f_dash_m(seq![ka()], seq![ez()], ka(), v1()) == ez(),
+        // the same "" the ABSENT key yields
+        assoc_get(seq![ka()], seq![ez()], ka()) == assoc_get(seq![], seq![], kb()),
+{
+    assert(c_dash_nonempty(seq![ka()], seq![ez()], ka(), v1()) == v1()) by (compute);
+    assert(f_dash_m(seq![ka()], seq![ez()], ka(), v1()) == ez()) by (compute);
+    assert(assoc_get(seq![ka()], seq![ez()], ka()) == ez()) by (compute);
+    assert(assoc_get(seq![], seq![], kb()) == ez()) by (compute);
+}
+
+// M9: `+` on the same store: presence says `z`, the emptiness test says "".
+proof fn m9_plus_reads_presence()
+    ensures
+        has(ka(), seq![ka()]),
+        assoc_get(seq![ka()], seq![ez()], ka()).len() == 0,
+        f_plus_m(seq![ka()], seq![ez()], ka(), v1()) == v1(),
+{
+    assert(has(ka(), seq![ka()])) by (compute);
+    assert(assoc_get(seq![ka()], seq![ez()], ka()) == ez()) by (compute);
+    assert(f_plus_m(seq![ka()], seq![ez()], ka(), v1()) == v1()) by (compute);
+}
+
+// M10: `?` must NOT abort on a set-but-empty entry (the measured row with
+// rc 0 from bash).
+proof fn m10_question_is_presence()
+    ensures
+        f_question_m(seq![ka()], ka()),
+        !(assoc_get(seq![ka()], seq![ez()], ka()).len() > 0),
+{
+    assert(has(ka(), seq![ka()])) by (compute);
+    assert(assoc_get(seq![ka()], seq![ez()], ka()) == ez()) by (compute);
+}
+
+
+// ---------------------------------------------------------------------
+// The `=` / `:=` faces INSERT the key (added 2026-11-05)
+// ---------------------------------------------------------------------
+// The fourth face of the same family, and the one with a store side: bash
+// both returns the default and PUTS IT IN THE TABLE. MEASURED:
+//   declare -A m;        echo "[${m[k]=z}]"; echo "n=${#m[@]}"
+//                        bash `[z] n=1`   C (before) `[z] n=0`
+//   declare -A m; m[o]=1; echo "[${m[k]=z}]"   bash `n=2`, key k added
+//   declare -A m; m[k]=; echo "[${m[k]=z}]"    bash ``  (present: no write)
+//   declare -A m; m[k]=; echo "[${m[k]:=z}]"   bash `[z]` (colon = emptiness)
+// `assoc_set` is the insert the normal write arm already uses, so the model
+// reuses it: the face's post-state is `assoc_set(ks, vs, k, w)` when the
+// presence predicate says the key is absent (`:=`: when its value is "").
+
+pub open spec fn assign_table(
+    ks: Seq<Str>,
+    vs: Seq<Str>,
+    k: Str,
+    w: Str,
+) -> (Seq<Str>, Seq<Str>) {
+    if has(k, ks) {
+        (ks, vs)  // present: `=` writes nothing
+    } else {
+        assoc_set(ks, vs, k, w)
+    }
+}
+
+// The VALUE face tests emptiness and the INSERT overwrites a present-but-
+// empty entry — bash's contract, made safe by deferring the free of the
+// replaced value to the statement boundary (`_sh_assoc_take` →
+// `_sh_defer_free` → `_sh_flush_trash`).
+pub open spec fn colon_assign_table(
+    ks: Seq<Str>,
+    vs: Seq<Str>,
+    k: Str,
+    w: Str,
+) -> (Seq<Str>, Seq<Str>) {
+    if assoc_get(ks, vs, k).len() == 0 {
+        assoc_set(ks, vs, k, w)
+    } else {
+        (ks, vs)
+    }
+}
+
+// The key really lands, and the count follows (`{id}_n` == keys.len()).
+proof fn assign_inserts_the_key()
+    ensures
+        has(ka(), assign_table(seq![], seq![], ka(), v1()).0),
+        assign_table(seq![], seq![], ka(), v1()).0.len() == 1,
+        assign_table(seq![], seq![], ka(), v1()).1 == seq![v1()],
+{
+    assert(assign_table(seq![], seq![], ka(), v1()) == (seq![ka()], seq![v1()]))
+        by (compute);
+    assert(has(ka(), seq![ka()])) by (compute);
+}
+
+// A present key is left alone by `=`, even when its value is empty.
+proof fn assign_keeps_a_present_key()
+    ensures
+        assign_table(seq![ka()], seq![ez()], ka(), v1()) == (seq![ka()], seq![ez()]),
+{
+    assert(has(ka(), seq![ka()])) by (compute);
+}
+
+// …and `:=` OVERWRITES it (bash `v=[z]`), while `=` leaves it alone.
+proof fn colon_assign_overwrites_a_present_empty_key()
+    ensures
+        assign_table(seq![ka()], seq![ez()], ka(), v1()) == (seq![ka()], seq![ez()]),
+        colon_assign_table(seq![ka()], seq![ez()], ka(), v1()) == (seq![ka()], seq![v1()]),
+        f_plus_m(seq![ka()], seq![ez()], ka(), v1()) == v1(),
+{
+    assert(colon_assign_table(seq![ka()], seq![ez()], ka(), v1()) == (seq![ka()], seq![v1()]))
+        by (compute);
+    assert(f_plus_m(seq![ka()], seq![ez()], ka(), v1()) == v1()) by (compute);
+}
+
+// On an ABSENT key it inserts, like `=`.
+proof fn colon_assign_inserts_an_absent_key()
+    ensures
+        has(ka(), colon_assign_table(seq![], seq![], ka(), v1()).0),
+        colon_assign_table(seq![], seq![], ka(), v1()).1 == seq![v1()],
+{
+    assert(colon_assign_table(seq![], seq![], ka(), v1()) == (seq![ka()], seq![v1()]))
+        by (compute);
+    assert(has(ka(), seq![ka()])) by (compute);
+}
+
+// M13: the pre-fix face — yield the word, insert nothing. `has` is the
+// difference, and it is exactly what the count/key-join faces read.
+proof fn m13_assign_without_the_insert()
+    ensures
+        has(ka(), seq![]) == false,
+        has(ka(), assign_table(seq![], seq![], ka(), v1()).0),
+{
+    assert(has(ka(), seq![]) == false) by (compute);
+}
+
+
 } // verus!
 
 fn main() {}
