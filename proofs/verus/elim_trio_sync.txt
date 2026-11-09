@@ -1,5 +1,5 @@
 # verus-sync-coverage manifest: elim_trio
-# source sha: const_condition_elim=ba7bbd048b97 unreachable_after_exit=963151afa875 merge_init_assignments=5354c2b10fac  proof sha: dc635af79198
+# source sha: const_condition_elim=ba7bbd048b97 unreachable_after_exit=3adb4e485152 merge_init_assignments=5354c2b10fac  proof sha: dc635af79198
 
 [pins]
 pin pin_cce_dowhile_once -> UNMIRRORED (by design — see VERUS.md §(b).4)

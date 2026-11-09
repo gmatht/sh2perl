@@ -1,0 +1,31 @@
+# verus-sync-coverage manifest: test_folds
+# source sha: test_simplification=8642e5de32ff  proof sha: 187af7ad6f3e
+
+[pins]
+pin pin_false_ops -> UNMIRRORED (by design — see VERUS.md §(b).4)
+pin pin_lt_false_at_runtime -> UNMIRRORED (by design — see VERUS.md §(b).4)
+pin pin_streq_true_at_runtime -> UNMIRRORED (by design — see VERUS.md §(b).4)
+pin pin_true_ops -> UNMIRRORED (by design — see VERUS.md §(b).4)
+
+[guards]
+guard test-simplification op class: PRESENT
+guard test-simplification op class: PRESENT
+guard test-simplification identity precondition: PRESENT
+
+[counts]
+proof-fns: 6
+pins: 4
+# NOTE: proof-fns is a file-shape fact (change detector), NOT the
+# Verus obligation count — the gate asserts N verified separately.
+
+[exec]
+# Each MAPPED test above, EXECUTED against the live source (one
+# module-suite run per model; per-test verdicts grepped from output).
+# A mapped test that fails or vanishes from the run is drift — FATAL.
+# The checker RUNS each mapped test (one module-suite cargo test per
+# source file) and records the per-test PASS/FAIL verdict below.
+# all suites built; per-test verdicts below
+exec pin_false_ops: UNMIRRORED (not executed)
+exec pin_lt_false_at_runtime: UNMIRRORED (not executed)
+exec pin_streq_true_at_runtime: UNMIRRORED (not executed)
+exec pin_true_ops: UNMIRRORED (not executed)
