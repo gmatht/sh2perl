@@ -1,3 +1,12 @@
+// RETIRED (see VERUS.md §(d) P0(vi)): the modelled transform never became a
+// module of the crate, and `src/transforms/arr_load_fwd.rs` was deleted on
+// 2026-11-09 because it cannot compile against the current API — it imports
+// `super::READ_ONLY_CALLS` and `string_accumulator::{callee_write_sets, Cw}`,
+// none of which exist anywhere outside that file, and calls four helpers the
+// crate has since made private (`census`, `exported_names`,
+// `is_shell_implicit`, `expr_pure`). So no pin in here could ever execute.
+// Kept as a superseded-design record: the gate verifies it as a RETIRED entry
+// (RETIRED_MODELS), counted outside every total, exactly like `interval.rs`.
 // Standalone model of arr-load-fwd's substitution soundness
 // (sh2perl/src/transforms/arr_load_fwd.rs): a single-def element load
 // `v = arr[key]` folds its later same-list reads back to the element

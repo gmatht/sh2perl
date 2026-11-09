@@ -229,6 +229,15 @@ pub mod text_capture_fold; // constant `$(echo …)` in raw test/param/arith tex
 pub mod const_status_cond; // a `true`/`false`/`:` COMMAND in condition position → a constant cond + the command as the body's/branch's first statement (the `while true` fork-per-iteration, and the stale-`$CHILD_ERROR` condition it left behind)
 pub mod const_condition_elim;
 pub mod copy_propagation;
+// Both of these README their own offer (name/prereqs/invariant/scope) and
+// carry tests that pass, but neither is registered with any backend: adding
+// the module makes them compile and testable, it does NOT make them run.
+// Registration is the marketplace's call (PLAN §11), not a side effect of a
+// build fix. They were unreachable-and-untested until 2026-11-09 because the
+// `mod` lines were never written, which also meant their Verus models could
+// not execute a single pin.
+pub mod exec_call_fold; // OFFER core-requests: payload-free `Exec` in a command carrier → the `exec` call spelling
+pub mod interp_lit_merge; // OFFER core-requests: frozen-literal `Interpolate` part → `Lit`, adjacent `Lit`s merge
 pub mod counted_while_forinit;
 pub mod counted_arith_forinit; // structured-Arith counted while → ForInit (frontend shapes)
 pub mod append_to_store; // counted-loop `a = append(a,v)` → `a[i] = v` (frontend shapes)
