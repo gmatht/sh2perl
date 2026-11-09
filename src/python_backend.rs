@@ -96,6 +96,13 @@ pub struct Render {
     /// `mapfile`/`read` consume it; always restored after. None = real
     /// stdin (unchanged behavior).
     stdin_file: Option<String>,
+    /// needs the `__sh_elem` subscript reader (`${a[i]}` / `${m[key]}` on
+    /// a native list/dict: bounds- and type-tolerant, bash yields "")
+    need_elem: bool,
+    /// names declared with `declare -A` (associative arrays): their
+    /// subscripts are STRING keys, not arithmetic indices, so
+    /// `map[foo]=bar` writes `map["foo"]` and `${map[foo]}` reads it back.
+    assoc: HashSet<String>,
     /// counter for multi-statement command-substitution buffers
     /// (`$(stmt; stmt)` → a `StringIO` + `redirect_stdout` block)
     cap_counter: usize,
@@ -1201,6 +1208,210 @@ impl Render {
     /// ZERO words (it vanishes — it must NOT become one empty string:
     /// `set -- "$1" "${@:3}"` with no $3 has TWO positionals, not three
     /// — parse-at-slice-param.sh).
+    /// Rewrite the shell frontend's Call-dialect statement containers into
+    /// the IrStmt forms the native arms render: `whileLoop(cond, body)`, and
+    /// `redirect(Arrow([…]), [{fd, mode, target}])` — a pipeline stage keeps
+    /// these wrappers, so without the rewrite `while … done < f | sort`
+    /// loses the loop entirely (`sh2_arrow()` stub).
+    fn stage_dialect(&self, body: &[IrStmt]) -> Option<Vec<IrStmt>> {
+        let [IrStmt::Expr(IrExpr::Call { func, args })] = body else {
+            return None;
+        };
+        match func.as_str() {
+            "whileLoop" | "whileLoopSync" => {
+                let cond = match args.first()? {
+                    IrExpr::Arrow(c) => match c.as_slice() {
+                        [IrStmt::Expr(e)] => e.clone(),
+                        _ => return None,
+                    },
+                    _ => return None,
+                };
+                let inner = match args.get(1)? {
+                    IrExpr::Arrow(b) => b.clone(),
+                    _ => return None,
+                };
+                Some(vec![IrStmt::While {
+                    cond,
+                    body: self.stage_dialect_list(&inner)?,
+                }])
+            }
+            "redirect" => {
+                let inner = match args.first()? {
+                    IrExpr::Arrow(a) => a.clone(),
+                    _ => return None,
+                };
+                let mut redirects = Vec::new();
+                for spec in args.iter().skip(1) {
+                    let items: Vec<&IrExpr> = match spec {
+                        IrExpr::Array(el) => el.iter().collect(),
+                        o => vec![o],
+                    };
+                    for sp in items {
+                        let IrExpr::Object(kv) = sp else { return None };
+                        let mut fd = None;
+                        let mut mode = "w".to_string();
+                        let mut target = None;
+                        for (k, v) in kv {
+                            match (k.as_str(), v) {
+                                ("fd", IrExpr::Int(n)) => fd = Some(*n as i32),
+                                ("mode", IrExpr::Str(m, _)) => mode = m.clone(),
+                                ("target", t) => target = Some(t.clone()),
+                                _ => {}
+                            }
+                        }
+                        redirects.push(crate::ir::IrRedirect {
+                            fd,
+                            mode,
+                            target: target?,
+                            interpolate: false,
+                        });
+                    }
+                }
+                Some(vec![IrStmt::Redirect {
+                    inner: self.stage_dialect_list(&inner)?,
+                    redirects,
+                }])
+            }
+            _ => None,
+        }
+    }
+
+    /// Map [`stage_dialect`] over a statement list, rewriting the containers
+    /// it knows; other statements pass through unchanged.
+    fn stage_dialect_list(&self, body: &[IrStmt]) -> Option<Vec<IrStmt>> {
+        let mut out = Vec::new();
+        for st in body {
+            match self.stage_dialect(std::slice::from_ref(st)) {
+                Some(v) => out.extend(v),
+                None => out.push(st.clone()),
+            }
+        }
+        Some(out)
+    }
+
+    /// `while … done | sort` / `for … done | cmd`: the head's stdout is
+    /// python-level output (echo/printf/…) while the rest stages are shell
+    /// text, so run the head under a `redirect_stdout` buffer and pipe that
+    /// text into one `bash -c`. Emits the reconstruction; returns false
+    /// when the shape is not covered (the caller keeps the old fallback).
+    fn pipeline_native_head(&mut self, stages: &[Vec<IrStmt>]) -> Option<()> {
+        let [head, rest @ ..] = stages else {
+            return None;
+        };
+        if rest.is_empty() || head.is_empty() {
+            return None;
+        }
+        let rest_text = self.pipeline_rest_text(rest)?;
+        let n = self.cap_counter;
+        self.cap_counter += 1;
+        let mut scratch = Vec::new();
+        std::mem::swap(&mut self.out, &mut scratch);
+        self.depth += 1;
+        for st in head {
+            self.stmt(st);
+        }
+        self.depth -= 1;
+        std::mem::swap(&mut self.out, &mut scratch);
+        // A `redirect_stdout` buffer only captures python-level writes: a
+        // fork in the head writes straight to the process fd 1 and escapes
+        // it (the pipe would see nothing, and the output would land in the
+        // wrong place). Judge the RENDERED head rather than the IR — the
+        // frontend reaches here in several dialects (Call redirect/whileLoop
+        // wrappers included).
+        let forked = scratch.iter().any(|l| {
+            l.contains("__sh_exec(")
+                || l.contains("__sh_cap(")
+                || l.contains("__sh_bash")
+                || l.contains("subprocess")
+                || l.contains("sh2_arrow()")
+                || l.contains("sh2_pipeline(")
+                || l.contains("os.system(")
+        });
+        if forked {
+            return None;
+        }
+        self.need_subprocess = true;
+        let (env, pos) = (self.bash_env(), self.bash_pos());
+        self.emit("import io as _io, contextlib as _ctl");
+        self.emit(&format!("__sh_cb{n} = _io.StringIO()"));
+        self.emit(&format!("with _ctl.redirect_stdout(__sh_cb{n}):"));
+        self.out.extend(scratch);
+        self.emit(&format!(
+            "__sh_pr = __sh_bash_in({}, {pos}, {env}, __sh_cb{n}.getvalue())",
+            Self::py_str(&rest_text)
+        ));
+        self.emit("sys.stdout.write(__sh_pr.stdout.decode())");
+        self.emit("__sh_rc = __sh_pr.returncode");
+        Some(())
+    }
+
+    /// `${a[@]}` / `${a[*]}` / `arrayItems(a)` spliced into a python list
+    /// literal (`[*a]`): bash expands the whole array as separate words,
+    /// so `for x in "${a[@]}"` iterates the elements.
+    fn array_splice(&self, e: &IrExpr) -> Option<String> {
+        if let IrExpr::Call { func, args } = e {
+            match func.as_str() {
+                "arrayItems" => {
+                    if let Some(IrExpr::Str(n, _)) = args.first() {
+                        return Some(format!("*{}", self.py_ident(n)));
+                    }
+                }
+                // `"$@"` in a list context — the whole positional set spliced
+                // as separate words (inside a function they are its args).
+                "listVar" => {
+                    if let Some(IrExpr::Str(n, _)) = args.first() {
+                        if n == "@" || n == "*" {
+                            return Some(if self.in_function > 0 {
+                                "*_sh_args".to_string()
+                            } else {
+                                "*sys.argv[1:]".to_string()
+                            });
+                        }
+                    }
+                }
+                "param" => {
+                    if let Some(IrExpr::Str(name, _)) = args.get(1) {
+                        // two-arg form: `param("", "a[@]")`
+                        if let Some(lb) = name.find('[') {
+                            if name.ends_with(']') {
+                                let sub = &name[lb + 1..name.len() - 1];
+                                if sub == "@" || sub == "*" {
+                                    let base = &name[..lb];
+                                    if let Some(v) = base.strip_prefix('!') {
+                                        // `${!m[@]}` — keys/indices, not the
+                                        // elements.
+                                        let vb = self.py_ident(v);
+                                        return Some(format!(
+                                            "*({vb}.keys() if isinstance({vb}, dict) else range(len({vb})))"
+                                        ));
+                                    }
+                                    return Some(format!("*{}", self.py_ident(base)));
+                                }
+                            }
+                        }
+                        // four-arg form: `param("slice", "a", "@", "")`
+                        if matches!(args.first(), Some(IrExpr::Str(o, _)) if o == "slice") {
+                            if let Some(IrExpr::Str(sub, _)) = args.get(2) {
+                                if sub == "@" || sub == "*" {
+                                    if let Some(v) = name.strip_prefix('!') {
+                                        // `${!m[@]}` — keys/indices.
+                                        let vb = self.py_ident(v);
+                                        return Some(format!(
+                                            "*({vb}.keys() if isinstance({vb}, dict) else range(len({vb})))"
+                                        ));
+                                    }
+                                    return Some(format!("*{}", self.py_ident(name)));
+                                }
+                            }
+                        }
+                    }
+                }
+                _ => {}
+            }
+        }
+        None
+    }
+
     fn argv_slice_splice(&mut self, e: &IrExpr) -> Option<String> {
         if let IrExpr::Call { func, args } = e {
             if func == "param" {
@@ -1572,6 +1783,12 @@ impl Render {
             IrExpr::Array(items) => {
                 let mut elems: Vec<String> = Vec::new();
                 for e in items {
+                    // `${a[@]}` splices the array's elements into the
+                    // word list (`for x in "${a[@]}"` iterates items).
+                    if let Some(sp) = self.array_splice(e) {
+                        elems.push(sp);
+                        continue;
+                    }
                     // positional-slice splices (`for i in "${@:3}"`
                     // iterates the words, not one joined string).
                     if let Some(sp) = self.argv_slice_splice(e) {
@@ -3189,6 +3406,57 @@ impl Render {
                                 let r = Self::py_str(repl);
                                 let cnt = if op == "/" { "1" } else { "-1" };
                                 return format!("{v}.replace({p}, {r}, {cnt})");
+                            }
+                        }
+                    }
+                }
+                // `${a[i]}` / `${m[key]}` / `${a[*]}` — the frontend's
+                // two-arg form keeps the whole subscript in the name
+                // string. An associative array's key is a STRING; an
+                // indexed one's is arithmetic.
+                if let Some(IrExpr::Str(name, _)) = args.get(1) {
+                    let op_is_empty = matches!(args.first(), Some(IrExpr::Str(o, _)) if o.is_empty());
+                    if op_is_empty {
+                        if let Some(lb) = name.find('[') {
+                            if name.ends_with(']') {
+                                let base = &name[..lb];
+                                let sub = &name[lb + 1..name.len() - 1];
+                                let b = self.py_ident(base);
+                                if sub == "@" || sub == "*" {
+                                    return format!("\" \".join(str(_e) for _e in {b})");
+                                }
+                                if let Some(v) = base.strip_prefix('!') {
+                                    // `${!m[@]}` — the KEYS of an associative
+                                    // array (an indexed array's indices).
+                                    let vb = self.py_ident(v);
+                                    return format!(
+                                        "\" \".join(str(_k) for _k in ({vb}.keys() if isinstance({vb}, dict) else range(len({vb}))))"
+                                    );
+                                }
+                                let k = if let Some(v) = sub.strip_prefix('$') {
+                                    // `${m[$k]}` — the key is a variable.
+                                    self.py_ident(v)
+                                } else if self.assoc.contains(base) {
+                                    // an associative key is always a string
+                                    Self::py_str(sub)
+                                } else if !sub.is_empty()
+                                    && sub.chars().all(|c| c.is_ascii_digit())
+                                {
+                                    sub.to_string()
+                                } else if !sub.is_empty()
+                                    && sub
+                                        .chars()
+                                        .all(|c| c.is_alphanumeric() || c == '_')
+                                    && !sub.starts_with(|c: char| c.is_ascii_digit())
+                                {
+                                    // `${a[i]}` — an indexed subscript is an
+                                    // arithmetic variable name.
+                                    self.py_ident(sub)
+                                } else {
+                                    Self::py_str(sub)
+                                };
+                                self.need_elem = true;
+                                return format!("__sh_elem({b}, {k})");
                             }
                         }
                     }
@@ -5578,6 +5846,21 @@ impl Render {
             Some(IrExpr::Array(elems)) => elems.clone(),
             _ => return "None".into(),
         };
+        // `local -a files=("$@")` / `local -A m`: the initializer arrives as
+        // a setArray Call item and the kind as a flag, which the word
+        // splitter cannot see — that is the declare walker's shape.
+        let arrayish = items.iter().any(|it| match it {
+            IrExpr::Str(s, _) => s == "-a" || s == "-A",
+            IrExpr::Call { func, .. } => func == "setArray",
+            _ => false,
+        });
+        if arrayish {
+            let call = vec![
+                IrExpr::Str("local".into(), crate::ir::StrStyle::DoubleQuoted),
+                IrExpr::Array(items.clone()),
+            ];
+            return self.render_declare_call(&call);
+        }
         for (name, val) in self.split_assign_words(&items) {
             let name_py = self.py_ident(&name);
             self.written.insert(name.clone());
@@ -5592,6 +5875,28 @@ impl Render {
     /// `declare -i x=5`, `readonly r=3`, `typeset -i t=7` → native python
     /// assignments. Returns a value to use for the Expr statement (None —
     /// these builtins produce no stdout), emitting the assignments first.
+    /// The right-hand side of an array initializer: `name=(…)` and
+    /// `local -a name=(…)` / `declare -a name=(…)`. `"$@"` arrives as a
+    /// `listVar("@")` Call (the whole positional set), not an Array, so it
+    /// never reaches the Array arm's splice; render it as the call's own
+    /// `_sh_args` instead of the sh2.listVar stub.
+    fn array_init_expr(&mut self, e: &IrExpr) -> String {
+        if let IrExpr::Call { func, args } = e {
+            if func == "listVar" {
+                if let Some(IrExpr::Str(n, _)) = args.first() {
+                    if n == "@" || n == "*" {
+                        return if self.in_function > 0 {
+                            "_sh_args".to_string()
+                        } else {
+                            "sys.argv[1:]".to_string()
+                        };
+                    }
+                }
+            }
+        }
+        self.expr(e)
+    }
+
     fn render_declare_call(&mut self, args: &[IrExpr]) -> String {
         // args[0] = Str("declare"|"readonly"|"typeset")
         // args[1] = Array of Str items: ["-i", "x=5", ...]
@@ -5600,11 +5905,39 @@ impl Render {
             Some(IrExpr::Array(elems)) => elems,
             _ => return "None".into(),
         };
+        let mut is_assoc = false;
+        let mut is_array = false;
         for item in items {
+            // `declare -a arr=(a b)` keeps the initializer as a setArray
+            // Call item, not a `name=value` string: assign the list home
+            // (the same one `arr=(a b)` gets) instead of dropping it.
+            if let IrExpr::Call { func, args } = item {
+                if func == "setArray" {
+                    if let Some(IrExpr::Str(name, _)) = args.first() {
+                        let elems = args
+                            .get(1)
+                            .map(|a| self.array_init_expr(a))
+                            .unwrap_or_else(|| "[]".into());
+                        let name_py = self.py_ident(name);
+                        self.written.insert(name.to_string());
+                        if is_assoc {
+                            self.assoc.insert(name.to_string());
+                        }
+                        self.emit(&format!("{name_py} = list({elems})"));
+                    }
+                    continue;
+                }
+            }
             if let IrExpr::Str(s, _) = item {
                 if s == "-i" || s == "-r" || s == "-a" || s == "-A" {
                     if s == "-i" {
                         is_int = true;
+                    }
+                    if s == "-A" {
+                        is_assoc = true;
+                    }
+                    if s == "-a" {
+                        is_array = true;
                     }
                     continue;
                 }
@@ -5614,6 +5947,9 @@ impl Render {
                     if Self::is_plain_name(name) {
                         let name_py = self.py_ident(name);
                         self.written.insert(name.to_string());
+                        if is_assoc {
+                            self.assoc.insert(name.to_string());
+                        }
                         if is_int || self.is_num(name) {
                             if let Ok(n) = val.parse::<i64>() {
                                 self.emit(&format!("{name_py} = {n}"));
@@ -5624,6 +5960,19 @@ impl Render {
                         } else {
                             self.emit(&format!("{name_py} = {}", Self::py_str(val)));
                         }
+                    }
+                } else if Self::is_plain_name(s) {
+                    // bare `declare -A map` / `declare -a arr`: the binding
+                    // must exist before its subscripts are written.
+                    let name_py = self.py_ident(s);
+                    self.written.insert(s.to_string());
+                    if is_assoc {
+                        self.assoc.insert(s.to_string());
+                        self.emit(&format!("{name_py} = {{}}"));
+                    } else if is_array {
+                        self.emit(&format!("{name_py} = []"));
+                    } else if is_int {
+                        self.emit(&format!("{name_py} = 0"));
                     }
                 }
             }
@@ -6100,6 +6449,46 @@ impl Render {
                         if self.pipeline_while_read(args).is_some() {
                             return;
                         }
+                        // `while … done | cmd` / `for … done | cmd`: the
+                        // head is python-level output, the rest shell text
+                        // — buffer the head and pipe it (same path as the
+                        // statement-shaped Pipeline). A stage still wrapped
+                        // in the Call dialect (`redirect(Arrow([whileLoop
+                        // …]))`) is rewritten first, else the loop is
+                        // invisible to every helper.
+                        if let Some(IrExpr::Array(items)) = args.first() {
+                            let sv: Option<Vec<Vec<IrStmt>>> = items
+                                .iter()
+                                .map(|s| match s {
+                                    IrExpr::Arrow(b) => Some(b.clone()),
+                                    _ => None,
+                                })
+                                .collect();
+                            if let Some(sv) = sv {
+                                let conv: Vec<Vec<IrStmt>> = sv
+                                    .iter()
+                                    .map(|b| {
+                                        self.stage_dialect_list(b)
+                                            .unwrap_or_else(|| b.clone())
+                                    })
+                                    .collect();
+                                let arrows: Vec<IrExpr> = conv
+                                    .iter()
+                                    .map(|b| IrExpr::Arrow(b.clone()))
+                                    .collect();
+                                if let Some(run) =
+                                    self.pipeline_run(&[IrExpr::Array(arrows)])
+                                {
+                                    self.emit(&format!("__sh_pr = {run}"));
+                                    self.emit("sys.stdout.write(__sh_pr.stdout.decode())");
+                                    self.emit("__sh_rc = __sh_pr.returncode");
+                                    return;
+                                }
+                                if self.pipeline_native_head(&conv).is_some() {
+                                    return;
+                                }
+                            }
+                        }
                         let x2 = self.expr(e);
                         self.emit(&format!("sys.stdout.write({x2})"));
                         return;
@@ -6177,6 +6566,40 @@ impl Render {
                             self.rc_reset();
                             return;
                         }
+                        // associative array (`declare -A m`): the key is a
+                        // string; an indexed array's non-numeric subscript
+                        // is bash ARITHMETIC (an unset name is index 0).
+                        let m = self.py_ident(base);
+                        let known = self.written.contains(base);
+                        self.written.insert(base.to_string());
+                        let rhs = self.expr(expr);
+                        if self.assoc.contains(base) || k.starts_with('$') {
+                            let key = match k.strip_prefix('$') {
+                                Some(v) => format!("str({})", self.py_ident(v)),
+                                None => Self::py_str(k),
+                            };
+                            if !known {
+                                self.emit(&format!("{m} = {{}}"));
+                            }
+                            self.emit(&format!("{m}[{key}] = {rhs}"));
+                            self.rc_reset();
+                            return;
+                        }
+                        if k.is_empty() {
+                            return;
+                        }
+                        // a bare name subscript is bash ARITHMETIC (unset
+                        // name = 0), and an unwritten base starts empty.
+                        let idx = "0".to_string();
+                        if !known {
+                            self.emit(&format!("{m} = []"));
+                        }
+                        self.emit(&format!(
+                            "while len({m}) <= {idx}: {m}.append('')"
+                        ));
+                        self.emit(&format!("{m}[{idx}] = {rhs}"));
+                        self.rc_reset();
+                        return;
                     }
                 }
                 let name = self.py_ident(&t.var);
@@ -6772,6 +7195,17 @@ impl Render {
                 }
             }
             IrStmt::Pipeline { stages, .. } => {
+                // a stage may still carry the frontend's Call-dialect
+                // wrappers (`redirect(Arrow([whileLoop …]))`); rewrite them
+                // to IrStmt so the loop is not lost.
+                let conv: Vec<Vec<IrStmt>> = stages
+                    .iter()
+                    .map(|b| {
+                        self.stage_dialect_list(b)
+                            .unwrap_or_else(|| b.clone())
+                    })
+                    .collect();
+                let stages = &conv;
                 // idiom lift: `echo "$x" | grep -q P` → native substring
                 // check (no subprocess)
                 if let Some(rc) = self.grep_q_lift(stages) {
@@ -6791,6 +7225,7 @@ impl Render {
                     self.emit(&format!("__sh_pr = {run}"));
                     self.emit("sys.stdout.write(__sh_pr.stdout.decode())");
                     self.emit("__sh_rc = __sh_pr.returncode");
+                } else if self.pipeline_native_head(stages).is_some() {
                 } else {
                     // Fallback: render stages as sequential statements
                     for st in stages {
@@ -7313,6 +7748,20 @@ impl Render {
         if self.need_io {
             self.emit("import io");
             self.emit("__sh_bg = []");
+            self.emit("");
+        }
+        if self.need_elem {
+            self.emit("def __sh_elem(a, k):");
+            self.emit("    if isinstance(a, dict):");
+            self.emit("        return str(a.get(str(k), \"\"))");
+            self.emit("    try:");
+            self.emit("        i = int(k)");
+            self.emit("    except (TypeError, ValueError):");
+            self.emit("        return \"\"");
+            self.emit("    try:");
+            self.emit("        return str(a[i]) if -len(a) <= i < len(a) else \"\"");
+            self.emit("    except (TypeError, IndexError, KeyError):");
+            self.emit("        return \"\"");
             self.emit("");
         }
         if self.need_argv_slice {
