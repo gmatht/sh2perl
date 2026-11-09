@@ -31439,6 +31439,23 @@ fn param_copy_alias(
             }
             return;
         }
+        // THE CAP HYPOTHESIS, MADE OBSERVABLE. `array_fixed_caps` sizes a fixed
+        // table from this literal's bulk (`max_reset`), so the reset loop
+        // below writes exactly as many elements as the declaration holds. If
+        // the census ever misses a site, the emitted table is written past its
+        // end — silently, because the element stores are plain `a[_ai] = ...`
+        // with no per-store check. Debug builds therefore refuse to emit it.
+        // Exempt: vec arrays (they grow), and items whose element count is
+        // runtime (`"$@"` / split — their own guard, emitted against this same
+        // `acap`, bounds the write). Assoc arrays never reach here. Proof:
+        // proofs/verus/c_arr_cap.rs (`fixed_initializer_fits`).
+        let runtime_items = items.iter().any(|it| matches!(it,
+            IrExpr::Call { func, .. } if matches!(func.as_str(), "listVar" | "arrayItems" | "split")));
+        debug_assert!(
+            self.vec_arrays.contains(var) || runtime_items || items.len() <= acap,
+            "array `{var}`: {} statically-emitted elements exceed its declared capacity {acap}",
+            items.len()
+        );
         let ai = format!("_ai{}", self.temp_seq);
         self.temp_seq += 1;
         self.emit(&format!("size_t {ai} = 0;"));
@@ -31476,8 +31493,17 @@ fn param_copy_alias(
                     && matches!(Self::str_arg(args, 0).as_deref(), Some("@"))
                 {
                     // P1: the loop below writes {ai} + (argc-1) elements
-                    // into a fixed [ARR_CAP] array — refuse upfront.
-                    // Vec arrays grow instead (same stores either way).
+                    // into a fixed table — refuse upfront, against the
+                    // DECLARED capacity. This compared against `ARR_CAP`
+                    // until 2026-11-09, which is only the ceiling: a
+                    // proof-sized table (`a[3]`) passed a guard admitting
+                    // up to 1024 writes, i.e. the guard did not bound the
+                    // buffer it guards (and `array_cap`'s own doc says
+                    // "Decl and every fixed guard go through here so they
+                    // always agree"). Model: proofs/verus/c_arr_cap.rs
+                    // `guard_must_use_declared_cap` (the ARR_CAP guard
+                    // admits an overflowing write; the declared-cap guard
+                    // refuses it).
                     if self.vec_arrays.contains(var) {
                         let sfx = self.vec_grow_suffix(var);
                         self.emit(&format!(
@@ -31485,7 +31511,7 @@ fn param_copy_alias(
                         ));
                     } else {
                         self.emit(&format!(
-                            "if ({ai} + ((_sh_argc > 1) ? (size_t)(_sh_argc - 1) : 0) > {ARR_CAP}) {{ fprintf(stderr, \"sh2c: capacity exceeded: {id}\\n\"); exit(127); }}"
+                            "if ({ai} + ((_sh_argc > 1) ? (size_t)(_sh_argc - 1) : 0) > {acap}) {{ fprintf(stderr, \"sh2c: capacity exceeded: {id}\\n\"); exit(127); }}"
                         ));
                     }
                     self.emit(&format!(
@@ -48442,6 +48468,39 @@ mod tests {
         let mut r = Render::default();
         r.store.insert(name.to_string());
         r
+    }
+
+    /// THE ARR_CAP CLAIM, PINNED AT THE SIZING PREDICATE. A literal below
+    /// the ceiling gets a cap of exactly its bulk (`a[5]`); one that reaches
+    /// the ceiling is ROUTED to the growable vec instead of being declared as
+    /// a table too small to hold it. These are the two branches
+    /// `proofs/verus/c_arr_cap.rs` proves (`fixed_initializer_fits` and
+    /// `big_bulk_is_routed`); the `emit_set_array` debug_assert checks the
+    /// first on every render, and the corpus scan checks it over the whole
+    /// example set.
+    #[test]
+    fn array_cap_is_the_bulk_below_the_ceiling_and_a_vec_at_it() {
+        fn set_array(n: usize) -> IrStmt {
+            let items: Vec<IrExpr> = (0..n)
+                .map(|i| IrExpr::Str(i.to_string(), crate::ir::StrStyle::DoubleQuoted))
+                .collect();
+            IrStmt::Expr(IrExpr::Call {
+                func: "setArray".to_string(),
+                args: vec![
+                    IrExpr::Str("a".to_string(), crate::ir::StrStyle::DoubleQuoted),
+                    IrExpr::Array(items),
+                    IrExpr::Bool(false),
+                ],
+            })
+        }
+        let none = HashSet::new();
+        let (caps, routed) = array_fixed_caps(&prog_of(vec![set_array(5)]), &none);
+        assert_eq!(caps.get("a"), Some(&5), "a 5-element literal is a 5-slot table");
+        assert!(!routed.contains("a"));
+
+        let (caps, routed) = array_fixed_caps(&prog_of(vec![set_array(ARR_CAP)]), &none);
+        assert!(!caps.contains_key("a"), "a literal at the ceiling must not be a fixed table");
+        assert!(routed.contains("a"), "it must be routed to the growable vec");
     }
 
     #[test]
