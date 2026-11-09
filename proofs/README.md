@@ -288,3 +288,12 @@ workers run Isabelle concurrently — an aborted run is not a proof
 failure; retry. Also: the ROOT comment above BigIntRange claiming it
 "does not check" is stale as of this build — it builds green from
 source as IntervalFloor's parent under `quick_and_dirty = false`.
+
+Fixed 2026-11-09: the stale ROOT comment is gone and the `mod_bounds`
+failure it recorded is understood. It was the LEMMA SHAPE, not the goal:
+`mod_pos_bounds`/`mod_neg_bounds` carried their guard (`0 < r0`, `r1 < 0`)
+in the conclusion as a `\<Longrightarrow>`, so the call sites' third `OF` fact
+had no premise to unify with (`OF: no unifiers`). The guards are assumptions
+now and both goals state the bound over `v1 mod v2`, which `ev: v = v1 mod v2`
+transfers to `v`. Measured from source: BigIntRange 58 s, IntervalFloor
+5:16, both `quick_and_dirty = false`.

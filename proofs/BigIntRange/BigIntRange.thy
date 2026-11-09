@@ -461,12 +461,11 @@ text \<open>
 
 lemma mod_pos_bounds:
   fixes r0 r1 vr v :: int
-  assumes "r0 \<le> vr" "vr \<le> r1"
-  shows "0 < r0 \<Longrightarrow> 0 \<le> v mod vr \<and> v mod vr \<le> r1 - 1"
+  assumes "r0 \<le> vr" "vr \<le> r1" "0 < r0"
+  shows "0 \<le> v mod vr \<and> v mod vr \<le> r1 - 1"
 proof -
-  assume a: "0 < r0"
   have vr_pos: "0 < vr"
-    by (rule order_less_le_trans [OF a assms(1)])
+    by (rule order_less_le_trans [OF assms(3) assms(1)])
   have "0 \<le> v mod vr"
     by (rule pos_mod_sign [OF vr_pos])
   moreover have "v mod vr < vr"
@@ -481,12 +480,11 @@ qed
 
 lemma mod_neg_bounds:
   fixes r0 r1 vr v :: int
-  assumes "r0 \<le> vr" "vr \<le> r1"
-  shows "r1 < 0 \<Longrightarrow> r0 + 1 \<le> v mod vr \<and> v mod vr \<le> 0"
+  assumes "r0 \<le> vr" "vr \<le> r1" "r1 < 0"
+  shows "r0 + 1 \<le> v mod vr \<and> v mod vr \<le> 0"
 proof -
-  assume a: "r1 < 0"
   have vr_neg: "vr < 0"
-    using a assms(2) by linarith
+    using assms(3) assms(2) by linarith
   have "vr < v mod vr"
     by (rule neg_mod_bound [OF vr_neg])
   then have "vr + 1 \<le> v mod vr"
@@ -732,9 +730,8 @@ next
                         case True
                         from Bin.prems lr1 lr2 op np True have vals: "lo = 0 \<and> hi = r1 - 1" by simp
                         from Bin.prems(3) evl evr op have ev: "v = v1 mod v2" by (simp split: if_split_asm)
-                        from mod_pos_bounds [OF rb1 rb2 True] have mb: "0 \<le> v mod v2 \<and> v mod v2 \<le> r1 - 1" by blast
-                        from ev have "v mod v2 = v" by simp
-                        with mb have "0 \<le> v \<and> v \<le> r1 - 1" by simp
+                        from mod_pos_bounds [OF rb1 rb2 True] have mb: "0 \<le> v1 mod v2 \<and> v1 mod v2 \<le> r1 - 1" by blast
+                        have "0 \<le> v \<and> v \<le> r1 - 1" using mb ev by linarith
                         with vals show ?thesis by simp
                       next
                         case False
@@ -743,9 +740,8 @@ next
                           case True
                           from Bin.prems lr1 lr2 op np False True have vals: "lo = r0 + 1 \<and> hi = 0" by simp
                           from Bin.prems(3) evl evr op have ev: "v = v1 mod v2" by (simp split: if_split_asm)
-                          from mod_neg_bounds [OF rb1 rb2 True] have mb: "r0 + 1 \<le> v mod v2 \<and> v mod v2 \<le> 0" by blast
-                          from ev have "v mod v2 = v" by simp
-                          with mb have "r0 + 1 \<le> v \<and> v \<le> 0" by simp
+                          from mod_neg_bounds [OF rb1 rb2 True] have mb: "r0 + 1 \<le> v1 mod v2 \<and> v1 mod v2 \<le> 0" by blast
+                          have "r0 + 1 \<le> v \<and> v \<le> 0" using mb ev by linarith
                           with vals show ?thesis by simp
                         next
                           case nn: False

@@ -8,13 +8,14 @@ session I32Provable in I32Provable = HOL +
   theories
     I32Provable
 
-(* NOT in the default `-D proofs` build: as of 2026-10-23 it does not
-   check. `mod_bounds` at line 741 instantiates with `v := r0` but then
-   asserts the bound over `v mod v2` (`OF: no unifiers`), and the fix is a
-   one-line `v1 mod v2` in the goal — but the rest of the session was not
-   re-checked behind it, so it stays out until someone drives it green.
-   The `harness/transform-proofs.sh` gate reports this session as FAILED on
-   purpose: it is a claim the tree cannot back. *)
+(* CHECKED 2026-11-09 (BigIntRange 58 s, IntervalFloor 5:16, both
+   `quick_and_dirty = false`). The recorded `OF: no unifiers` was the LEMMA
+   SHAPE, not the goal: `mod_pos_bounds`/`mod_neg_bounds` carried their guard
+   (`0 < r0`, `r1 < 0`) in the conclusion as a `\<Longrightarrow>`, so the call
+   sites' third `OF` fact had no premise to unify with. The guards are real
+   assumptions now, and the two goals state the bound over `v1 mod v2` — the
+   dividend the lemma bounds — which `ev: v = v1 mod v2` then transfers to
+   `v`. *)
 session BigIntRange in BigIntRange = HOL +
   options [quick_and_dirty = false]
   theories
