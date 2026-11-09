@@ -1,0 +1,43 @@
+# verus-sync-coverage manifest: restructure
+# source sha: restructure=b503a1dcf5d9  proof sha: d72c42dc9a3c
+
+[pins]
+pin pin_backward_span -> test backward_goto_becomes_while: MAPPED
+pin pin_block_not_loop -> test nested_goto_through_block_wrapper_does_not_escape: MAPPED
+pin pin_empty_noop -> test empty_list_noop: MAPPED
+pin pin_flag_protocol -> test nested_goto_becomes_flag_break: MAPPED
+pin pin_forward_inversion -> test forward_goto_becomes_inverted_if: MAPPED
+pin pin_forward_skip_no_flag -> test goto_inside_a_switch_inside_the_loop_body_reaches_its_tail: MAPPED
+pin pin_shapes_agree -> UNMIRRORED (by design — see VERUS.md §(b).4)
+pin pin_tail_guarded -> test goto_out_of_a_top_level_loop_guards_the_tail: MAPPED
+
+[guards]
+guard bare-goto handler: PRESENT
+guard guarded-goto handler: PRESENT
+guard nested handler: PRESENT
+guard skip-site analysis: PRESENT
+guard flag freshness: PRESENT
+guard successor-exit fold: PRESENT
+guard ingress gate: PRESENT
+
+[counts]
+proof-fns: 15
+pins: 8
+# NOTE: proof-fns is a file-shape fact (change detector), NOT the
+# Verus obligation count — the gate asserts N verified separately.
+
+[exec]
+# Each MAPPED test above, EXECUTED against the live source (one
+# module-suite run per model; per-test verdicts grepped from output).
+# A mapped test that fails or vanishes from the run is drift — FATAL.
+# The checker RUNS each mapped test (one module-suite cargo test per
+# source file) and records the per-test PASS/FAIL verdict below.
+# all suites built; per-test verdicts below
+exec pin_backward_span (backward_goto_becomes_while): PASS
+exec pin_block_not_loop (nested_goto_through_block_wrapper_does_not_escape): PASS
+exec pin_empty_noop (empty_list_noop): PASS
+exec pin_flag_protocol (nested_goto_becomes_flag_break): PASS
+exec pin_forward_inversion (forward_goto_becomes_inverted_if): PASS
+exec pin_forward_skip_no_flag (goto_inside_a_switch_inside_the_loop_body_reaches_its_tail): PASS
+exec pin_shapes_agree: UNMIRRORED (not executed)
+exec pin_tail_guarded (goto_out_of_a_top_level_loop_guards_the_tail): PASS

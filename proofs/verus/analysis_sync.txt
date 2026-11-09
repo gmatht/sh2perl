@@ -1,0 +1,43 @@
+# verus-sync-coverage manifest: analysis
+# source sha: analysis=22a7b4a6d9b8  proof sha: d40b224375c3
+
+[pins]
+pin pin_capture_marks -> UNMIRRORED (by design — see VERUS.md §(b).4)
+pin pin_false_is_all_pure -> UNMIRRORED (by design — see VERUS.md §(b).4)
+pin pin_impure_call_marks -> UNMIRRORED (by design — see VERUS.md §(b).4)
+pin pin_pipeline_marks -> UNMIRRORED (by design — see VERUS.md §(b).4)
+pin pin_pure_calls_free -> UNMIRRORED (by design — see VERUS.md §(b).4)
+pin pin_pure_program_free -> UNMIRRORED (by design — see VERUS.md §(b).4)
+pin pin_redirect_marks -> UNMIRRORED (by design — see VERUS.md §(b).4)
+pin pin_true_claims_nothing -> UNMIRRORED (by design — see VERUS.md §(b).4)
+
+[guards]
+guard walk entry: PRESENT
+guard stmt walker: PRESENT
+guard expr walker: PRESENT
+guard arith walker: PRESENT
+guard pure-call table: PRESENT
+guard output-target rule: PRESENT
+guard fail-closed arm: PRESENT
+
+[counts]
+proof-fns: 16
+pins: 8
+# NOTE: proof-fns is a file-shape fact (change detector), NOT the
+# Verus obligation count — the gate asserts N verified separately.
+
+[exec]
+# Each MAPPED test above, EXECUTED against the live source (one
+# module-suite run per model; per-test verdicts grepped from output).
+# A mapped test that fails or vanishes from the run is drift — FATAL.
+# The checker RUNS each mapped test (one module-suite cargo test per
+# source file) and records the per-test PASS/FAIL verdict below.
+# all suites built; per-test verdicts below
+exec pin_capture_marks: UNMIRRORED (not executed)
+exec pin_false_is_all_pure: UNMIRRORED (not executed)
+exec pin_impure_call_marks: UNMIRRORED (not executed)
+exec pin_pipeline_marks: UNMIRRORED (not executed)
+exec pin_pure_calls_free: UNMIRRORED (not executed)
+exec pin_pure_program_free: UNMIRRORED (not executed)
+exec pin_redirect_marks: UNMIRRORED (not executed)
+exec pin_true_claims_nothing: UNMIRRORED (not executed)

@@ -1,0 +1,52 @@
+# verus-sync-coverage manifest: optimize
+# source sha: optimize=dd35475c5761  proof sha: c5dfeffffaf3
+
+[pins]
+pin pin_baked_index_keeps -> test dce_keeps_store_read_only_by_a_baked_index_name: MAPPED
+pin pin_baked_index_refs -> test index_name_refs_reads_baked_index_vars: MAPPED
+pin pin_const_gate_fires -> test const_prop_folds_straight_line_arith_read: MAPPED
+pin pin_const_gate_refuses -> test const_prop_folds_straight_line_arith_read: MAPPED
+pin pin_drop_agrees -> test dce_drops_never_read_store: MAPPED
+pin pin_export_guards -> test decl_guard_sees_both_shapes: MAPPED
+pin pin_let_arith_reads -> test dce_keeps_store_read_only_by_a_let_arith_string: MAPPED
+pin pin_param_reads -> test dce_keeps_param_read_store: MAPPED
+pin pin_redirect_target_reads -> test dce_keeps_redirect_target_read_store: MAPPED
+pin pin_star_join_reads_ifs -> test dce_keeps_ifs_store_read_by_a_star_join: MAPPED
+pin pin_unread_drops -> test dce_drops_never_read_store: MAPPED
+
+[guards]
+guard census expr entry: PRESENT
+guard census stmts entry: PRESENT
+guard census stmt entry: PRESENT
+guard baked-index arm: PRESENT
+guard star-join IFS rule: PRESENT
+guard bare-arith scan: PRESENT
+guard decl-guard: PRESENT
+guard drop gate: PRESENT
+guard const-prop entry: PRESENT
+guard dse entry: PRESENT
+
+[counts]
+proof-fns: 13
+pins: 11
+# NOTE: proof-fns is a file-shape fact (change detector), NOT the
+# Verus obligation count — the gate asserts N verified separately.
+
+[exec]
+# Each MAPPED test above, EXECUTED against the live source (one
+# module-suite run per model; per-test verdicts grepped from output).
+# A mapped test that fails or vanishes from the run is drift — FATAL.
+# The checker RUNS each mapped test (one module-suite cargo test per
+# source file) and records the per-test PASS/FAIL verdict below.
+# all suites built; per-test verdicts below
+exec pin_baked_index_keeps (dce_keeps_store_read_only_by_a_baked_index_name): PASS
+exec pin_baked_index_refs (index_name_refs_reads_baked_index_vars): PASS
+exec pin_const_gate_fires (const_prop_folds_straight_line_arith_read): PASS
+exec pin_const_gate_refuses (const_prop_folds_straight_line_arith_read): PASS
+exec pin_drop_agrees (dce_drops_never_read_store): PASS
+exec pin_export_guards (decl_guard_sees_both_shapes): PASS
+exec pin_let_arith_reads (dce_keeps_store_read_only_by_a_let_arith_string): PASS
+exec pin_param_reads (dce_keeps_param_read_store): PASS
+exec pin_redirect_target_reads (dce_keeps_redirect_target_read_store): PASS
+exec pin_star_join_reads_ifs (dce_keeps_ifs_store_read_by_a_star_join): PASS
+exec pin_unread_drops (dce_drops_never_read_store): PASS

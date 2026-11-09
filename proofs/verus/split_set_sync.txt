@@ -1,0 +1,35 @@
+# verus-sync-coverage manifest: split_set
+# source sha: split_set=d9984f00a00c  proof sha: ceb3d43444a6
+
+[pins]
+pin pin_dedup_within_partition -> test splits_set_into_two_partitions: MAPPED
+pin pin_gate_is_placement -> test disabled_by_default: MAPPED
+pin pin_iteration_out_of_scope -> test refuses_iterated_set: MAPPED
+pin pin_nonempty_init_refused -> test refuses_nonempty_init: MAPPED
+pin pin_routing_splits -> test splits_set_into_two_partitions: MAPPED
+pin pin_runs_agree_on_membership -> UNMIRRORED (by design — see VERUS.md §(b).4)
+
+[guards]
+guard isSmallInt routing: PRESENT
+guard join merge: PRESENT
+guard append-only whitelist: PRESENT
+
+[counts]
+proof-fns: 11
+pins: 6
+# NOTE: proof-fns is a file-shape fact (change detector), NOT the
+# Verus obligation count — the gate asserts N verified separately.
+
+[exec]
+# Each MAPPED test above, EXECUTED against the live source (one
+# module-suite run per model; per-test verdicts grepped from output).
+# A mapped test that fails or vanishes from the run is drift — FATAL.
+# The checker RUNS each mapped test (one module-suite cargo test per
+# source file) and records the per-test PASS/FAIL verdict below.
+# all suites built; per-test verdicts below
+exec pin_dedup_within_partition (splits_set_into_two_partitions): PASS
+exec pin_gate_is_placement (disabled_by_default): PASS
+exec pin_iteration_out_of_scope (refuses_iterated_set): PASS
+exec pin_nonempty_init_refused (refuses_nonempty_init): PASS
+exec pin_routing_splits (splits_set_into_two_partitions): PASS
+exec pin_runs_agree_on_membership: UNMIRRORED (not executed)

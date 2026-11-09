@@ -1,0 +1,45 @@
+# verus-sync-coverage manifest: append_store
+# source sha: append_to_store=1f1990ee0f72  proof sha: 4958f701e47a
+
+[pins]
+pin pin_all_guards_pass -> test append_in_counted_loop_becomes_store: MAPPED
+pin pin_break_refused -> test break_vetoes: MAPPED
+pin pin_counted_loop_rewrites -> test append_in_counted_loop_becomes_store: MAPPED
+pin pin_multi_element_refused -> UNMIRRORED (by design — see VERUS.md §(b).4)
+pin pin_nonempty_init_refused -> test nonempty_init_vetoes: MAPPED
+pin pin_other_write_refused -> test other_write_vetoes: MAPPED
+pin pin_rewritten_loop_agrees -> UNMIRRORED (by design — see VERUS.md §(b).4)
+pin pin_step2_refused -> test step2_vetoes: MAPPED
+pin pin_two_appends_refused -> test two_appends_veto: MAPPED
+pin pin_unknown_bound_refuses -> test append_with_unknown_bound_keeps_growable: MAPPED
+
+[guards]
+guard counted +1 header: PRESENT
+guard 0-init: PRESENT
+guard no-escapes veto: PRESENT
+guard exactly-one-append: PRESENT
+guard known-bound gate: PRESENT
+
+[counts]
+proof-fns: 17
+pins: 10
+# NOTE: proof-fns is a file-shape fact (change detector), NOT the
+# Verus obligation count — the gate asserts N verified separately.
+
+[exec]
+# Each MAPPED test above, EXECUTED against the live source (one
+# module-suite run per model; per-test verdicts grepped from output).
+# A mapped test that fails or vanishes from the run is drift — FATAL.
+# The checker RUNS each mapped test (one module-suite cargo test per
+# source file) and records the per-test PASS/FAIL verdict below.
+# all suites built; per-test verdicts below
+exec pin_all_guards_pass (append_in_counted_loop_becomes_store): PASS
+exec pin_break_refused (break_vetoes): PASS
+exec pin_counted_loop_rewrites (append_in_counted_loop_becomes_store): PASS
+exec pin_multi_element_refused: UNMIRRORED (not executed)
+exec pin_nonempty_init_refused (nonempty_init_vetoes): PASS
+exec pin_other_write_refused (other_write_vetoes): PASS
+exec pin_rewritten_loop_agrees: UNMIRRORED (not executed)
+exec pin_step2_refused (step2_vetoes): PASS
+exec pin_two_appends_refused (two_appends_veto): PASS
+exec pin_unknown_bound_refuses (append_with_unknown_bound_keeps_growable): PASS

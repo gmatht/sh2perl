@@ -1,0 +1,45 @@
+# verus-sync-coverage manifest: loop_opt
+# source sha: loop_opt=0c7903045472  proof sha: 707da4a51861
+
+[pins]
+pin pin_arith_hoists -> test invariant_arith_hoists_counter_arith_stays: MAPPED
+pin pin_clobber_blocked -> test clobbered_target_blocks_hoist: MAPPED
+pin pin_counter_derived_blocked -> test counter_dependent_derived_blocks_only_itself: MAPPED
+pin pin_escape_blocked -> test break_in_body_blocks_hoist: MAPPED
+pin pin_fixpoint_noop -> test fixpoint_is_idempotent: MAPPED
+pin pin_hoist_preserves_run -> test invariant_arith_hoists_counter_arith_stays: MAPPED
+pin pin_impure_blocked -> test echo_is_not_hoisted: MAPPED
+pin pin_pure_call_derived_hoists -> test pure_call_and_derived_hoist_out_of_inner_loop: MAPPED
+pin pin_zero_trip_diverges -> UNMIRRORED (by design — see VERUS.md §(b).4)
+
+[guards]
+guard hoist entry: PRESENT
+guard group worker: PRESENT
+guard purity gate: PRESENT
+guard escape veto: PRESENT
+guard clobber gate: PRESENT
+guard status veto: PRESENT
+guard strict-subset bound: PRESENT
+
+[counts]
+proof-fns: 14
+pins: 9
+# NOTE: proof-fns is a file-shape fact (change detector), NOT the
+# Verus obligation count — the gate asserts N verified separately.
+
+[exec]
+# Each MAPPED test above, EXECUTED against the live source (one
+# module-suite run per model; per-test verdicts grepped from output).
+# A mapped test that fails or vanishes from the run is drift — FATAL.
+# The checker RUNS each mapped test (one module-suite cargo test per
+# source file) and records the per-test PASS/FAIL verdict below.
+# all suites built; per-test verdicts below
+exec pin_arith_hoists (invariant_arith_hoists_counter_arith_stays): PASS
+exec pin_clobber_blocked (clobbered_target_blocks_hoist): PASS
+exec pin_counter_derived_blocked (counter_dependent_derived_blocks_only_itself): PASS
+exec pin_escape_blocked (break_in_body_blocks_hoist): PASS
+exec pin_fixpoint_noop (fixpoint_is_idempotent): PASS
+exec pin_hoist_preserves_run (invariant_arith_hoists_counter_arith_stays): PASS
+exec pin_impure_blocked (echo_is_not_hoisted): PASS
+exec pin_pure_call_derived_hoists (pure_call_and_derived_hoist_out_of_inner_loop): PASS
+exec pin_zero_trip_diverges: UNMIRRORED (not executed)

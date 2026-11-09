@@ -1,0 +1,44 @@
+# verus-sync-coverage manifest: hoist_loop_invariants
+# source sha: hoist_loop_invariants=a3b641d4478c  proof sha: 4191b8934984
+
+[pins]
+pin pin_accumulator_refused -> test refuses_accumulator: MAPPED
+pin pin_counter_read_refused -> test refuses_foreach_counter_read: MAPPED
+pin pin_fn_body_write_refused -> test refuses_when_a_called_fn_in_the_body_writes_the_read_var: MAPPED
+pin pin_fn_cond_write_refused -> test refuses_when_a_called_fn_in_the_condition_writes_the_read_var: MAPPED
+pin pin_hoist_preserves_run -> test hoists_invariant_from_body: MAPPED
+pin pin_independent_hoists -> test hoists_counter_independent_write: MAPPED
+pin pin_indexed_target_refuses -> test refuses_counter_indexed_target: MAPPED
+pin pin_invariant_hoists -> test hoists_invariant_from_body: MAPPED
+pin pin_read_before_refused -> test refuses_read_before_accumulator: MAPPED
+pin pin_zero_trip_diverges -> UNMIRRORED (by design — see VERUS.md §(b).4)
+
+[guards]
+guard hoist body: PRESENT
+guard split loop: PRESENT
+guard write census: PRESENT
+guard purity gate: PRESENT
+
+[counts]
+proof-fns: 15
+pins: 10
+# NOTE: proof-fns is a file-shape fact (change detector), NOT the
+# Verus obligation count — the gate asserts N verified separately.
+
+[exec]
+# Each MAPPED test above, EXECUTED against the live source (one
+# module-suite run per model; per-test verdicts grepped from output).
+# A mapped test that fails or vanishes from the run is drift — FATAL.
+# The checker RUNS each mapped test (one module-suite cargo test per
+# source file) and records the per-test PASS/FAIL verdict below.
+# all suites built; per-test verdicts below
+exec pin_accumulator_refused (refuses_accumulator): PASS
+exec pin_counter_read_refused (refuses_foreach_counter_read): PASS
+exec pin_fn_body_write_refused (refuses_when_a_called_fn_in_the_body_writes_the_read_var): PASS
+exec pin_fn_cond_write_refused (refuses_when_a_called_fn_in_the_condition_writes_the_read_var): PASS
+exec pin_hoist_preserves_run (hoists_invariant_from_body): PASS
+exec pin_independent_hoists (hoists_counter_independent_write): PASS
+exec pin_indexed_target_refuses (refuses_counter_indexed_target): PASS
+exec pin_invariant_hoists (hoists_invariant_from_body): PASS
+exec pin_read_before_refused (refuses_read_before_accumulator): PASS
+exec pin_zero_trip_diverges: UNMIRRORED (not executed)
