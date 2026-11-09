@@ -1214,6 +1214,13 @@ impl Render {
     /// these wrappers, so without the rewrite `while … done < f | sort`
     /// loses the loop entirely (`sh2_arrow()` stub).
     fn stage_dialect(&self, body: &[IrStmt]) -> Option<Vec<IrStmt>> {
+        // `( a; b )` as a pipeline stage: the body's stdout IS the stage's
+        // stdout, and this backend models shell vars as globals anyway, so
+        // the copy semantics change nothing observable here. Flatten it so
+        // `( … ) | cmd` keeps the commands instead of a `sh2_arrow()` stub.
+        if let [IrStmt::Subshell(inner)] = body {
+            return self.stage_dialect_list(inner);
+        }
         let [IrStmt::Expr(IrExpr::Call { func, args })] = body else {
             return None;
         };
@@ -1276,6 +1283,52 @@ impl Render {
         }
     }
 
+    /// Run a statement body under a `redirect_stdout` buffer and return the
+    /// `__sh_cv` expression holding its (newline-stripped) text. None when
+    /// any statement would fork — `redirect_stdout` cannot capture a child's
+    /// fd-1 (`$(echo one; echo two)`, `$( (a; b) )`, captureWords of the
+    /// same).
+    fn buffered_body_value(&mut self, body: &[IrStmt]) -> Option<String> {
+        if body.is_empty() || !Self::capture_body_is_native(body) {
+            return None;
+        }
+        let n = self.cap_counter;
+        self.cap_counter += 1;
+        let mut scratch = Vec::new();
+        std::mem::swap(&mut self.out, &mut scratch);
+        self.depth += 1;
+        for st in body {
+            self.stmt(st);
+        }
+        self.depth -= 1;
+        std::mem::swap(&mut self.out, &mut scratch);
+        self.emit("import io as _io, contextlib as _ctl");
+        self.emit(&format!("__sh_cb{n} = _io.StringIO()"));
+        self.emit(&format!("with _ctl.redirect_stdout(__sh_cb{n}):"));
+        self.out.extend(scratch);
+        // bash strips trailing newlines from `$( … )`
+        self.emit(&format!(
+            "__sh_cv{n} = __sh_cb{n}.getvalue().rstrip(\"\\n\")"
+        ));
+        Some(format!("__sh_cv{n}"))
+    }
+
+    /// Flatten `( … )` statement lists into their parent: a subshell's
+    /// stdout and exit status are its last statement's, and this backend
+    /// models shell vars as globals, so the copy semantics are not
+    /// observable here. Used wherever a body's statements are inspected
+    /// (`$( (a; b) )`, `captureWords(arrow[Subshell…])`).
+    fn flatten_subs(body: &[IrStmt]) -> Vec<IrStmt> {
+        let mut out = Vec::new();
+        for st in body {
+            match st {
+                IrStmt::Subshell(inner) => out.extend(Self::flatten_subs(inner)),
+                other => out.push(other.clone()),
+            }
+        }
+        out
+    }
+
     /// Map [`stage_dialect`] over a statement list, rewriting the containers
     /// it knows; other statements pass through unchanged.
     fn stage_dialect_list(&self, body: &[IrStmt]) -> Option<Vec<IrStmt>> {
@@ -1283,7 +1336,14 @@ impl Render {
         for st in body {
             match self.stage_dialect(std::slice::from_ref(st)) {
                 Some(v) => out.extend(v),
-                None => out.push(st.clone()),
+                None => match st {
+                    // a nested `( … )` among other statements in the same
+                    // stage is flattened the same way
+                    IrStmt::Subshell(inner) => {
+                        out.extend(self.stage_dialect_list(inner)?)
+                    }
+                    _ => out.push(st.clone()),
+                },
             }
         }
         Some(out)
@@ -1312,22 +1372,7 @@ impl Render {
         }
         self.depth -= 1;
         std::mem::swap(&mut self.out, &mut scratch);
-        // A `redirect_stdout` buffer only captures python-level writes: a
-        // fork in the head writes straight to the process fd 1 and escapes
-        // it (the pipe would see nothing, and the output would land in the
-        // wrong place). Judge the RENDERED head rather than the IR — the
-        // frontend reaches here in several dialects (Call redirect/whileLoop
-        // wrappers included).
-        let forked = scratch.iter().any(|l| {
-            l.contains("__sh_exec(")
-                || l.contains("__sh_cap(")
-                || l.contains("__sh_bash")
-                || l.contains("subprocess")
-                || l.contains("sh2_arrow()")
-                || l.contains("sh2_pipeline(")
-                || l.contains("os.system(")
-        });
-        if forked {
+        if Self::head_forks(&scratch) {
             return None;
         }
         self.need_subprocess = true;
@@ -1343,6 +1388,72 @@ impl Render {
         self.emit("sys.stdout.write(__sh_pr.stdout.decode())");
         self.emit("__sh_rc = __sh_pr.returncode");
         Some(())
+    }
+
+    /// A `redirect_stdout` buffer only captures python-level writes: a fork
+    /// in the head writes straight to the process fd 1 and escapes it (the
+    /// pipe would see nothing, and the output would land in the wrong
+    /// place). Judge the RENDERED head rather than the IR — the frontend
+    /// reaches the pipeline helpers in several dialects (Call redirect /
+    /// whileLoop wrappers included).
+    fn head_forks(scratch: &[String]) -> bool {
+        // `__sh_bash*` and `__sh_cap` are SAFE: they capture through a PIPE
+        // and the python side writes the text into the buffer. What escapes
+        // a `redirect_stdout` buffer is a child inheriting fd 1 (`__sh_exec`,
+        // `os.system`) or a stub that has no command data at all.
+        scratch.iter().any(|l| {
+            l.contains("__sh_exec(")
+                || l.contains("os.system(")
+                || l.contains("sh2_arrow()")
+                || l.contains("sh2_pipeline(")
+                || l.contains("__sh_spawn(")
+        })
+    }
+
+    /// The VALUE form of [`Self::pipeline_native_head`] (command
+    /// substitution): buffering the head's python-level output and feeding
+    /// it to one `bash -c` leaves the captured stdout as an expression, so
+    /// `r=$( (a; b) | tr … )` becomes a native value instead of a
+    /// `sh2_arrow()` stub.
+    fn pipeline_native_head_value(&mut self, stages: &[Vec<IrStmt>]) -> Option<String> {
+        let pv = self.pipeline_native_head_run(stages)?;
+        Some(format!("{pv}.stdout.decode().rstrip(\"\\n\")"))
+    }
+
+    /// The same run as a `CompletedProcess` binding: the caller reads
+    /// `.stdout` (value contexts) or `.returncode` (conditions).
+    fn pipeline_native_head_run(&mut self, stages: &[Vec<IrStmt>]) -> Option<String> {
+        let [head, rest @ ..] = stages else {
+            return None;
+        };
+        if rest.is_empty() || head.is_empty() {
+            return None;
+        }
+        let rest_text = self.pipeline_rest_text(rest)?;
+        let n = self.cap_counter;
+        self.cap_counter += 1;
+        let mut scratch = Vec::new();
+        std::mem::swap(&mut self.out, &mut scratch);
+        self.depth += 1;
+        for st in head {
+            self.stmt(st);
+        }
+        self.depth -= 1;
+        std::mem::swap(&mut self.out, &mut scratch);
+        if Self::head_forks(&scratch) {
+            return None;
+        }
+        self.need_subprocess = true;
+        let (env, pos) = (self.bash_env(), self.bash_pos());
+        self.emit("import io as _io, contextlib as _ctl");
+        self.emit(&format!("__sh_cb{n} = _io.StringIO()"));
+        self.emit(&format!("with _ctl.redirect_stdout(__sh_cb{n}):"));
+        self.out.extend(scratch);
+        self.emit(&format!(
+            "__sh_pv{n} = __sh_bash_in({}, {pos}, {env}, __sh_cb{n}.getvalue())",
+            Self::py_str(&rest_text)
+        ));
+        Some(format!("__sh_pv{n}"))
     }
 
     /// `${a[@]}` / `${a[*]}` / `arrayItems(a)` spliced into a python list
@@ -1593,8 +1704,25 @@ impl Render {
             }
             IrExpr::Interpolate(parts) => self.interp(parts),
             IrExpr::Capture { expr, .. } => {
+                // `$( (a; b) )`: a subshell body's stdout is the capture's
+                // (and this backend's vars are globals, so the copy semantics
+                // change nothing observable). Flatten it before the shape
+                // checks, else the whole capture falls to the stub.
+                let owned;
+                let expr: &IrExpr = match expr.as_ref() {
+                    IrExpr::Arrow(b) => {
+                        let flat = Self::flatten_subs(b);
+                        if flat.len() == b.len() {
+                            expr.as_ref()
+                        } else {
+                            owned = IrExpr::Arrow(flat);
+                            &owned
+                        }
+                    }
+                    other => other,
+                };
                 // `$(cmd args)` with a single exec body -> native capture
-                if let IrExpr::Arrow(body) = expr.as_ref() {
+                if let IrExpr::Arrow(body) = expr {
                     if let [IrStmt::Expr(e)] = body.as_slice() {
                         if let IrExpr::Call { func, args } = e {
                             if func == "exec" {
@@ -1634,7 +1762,7 @@ impl Render {
                 // The C frontend's outparam channel: capture(Arrow[
                 // fnCall(..)]) — the callee echoes its out-params, the
                 // caller captures STDOUT.
-                if let IrExpr::Arrow(body) = expr.as_ref() {
+                if let IrExpr::Arrow(body) = expr {
                     let mut call: Option<(String, Vec<String>)> = None;
                     for st in body.iter() {
                         if let IrStmt::Expr(IrExpr::Call { func, args })
@@ -1671,27 +1799,22 @@ impl Render {
                 // shape), run the body under a stdout redirect and take
                 // the buffer. Anything that would fork goes to the stub:
                 // `redirect_stdout` cannot capture a child's fd-1.
-                if let IrExpr::Arrow(body) = expr.as_ref() {
-                    if body.len() > 1 && Self::capture_body_is_native(body) {
-                        let n = self.cap_counter;
-                        self.cap_counter += 1;
-                        let mut scratch = Vec::new();
-                        std::mem::swap(&mut self.out, &mut scratch);
-                        self.depth += 1;
-                        for st in body {
-                            self.stmt(st);
-                        }
-                        self.depth -= 1;
-                        std::mem::swap(&mut self.out, &mut scratch);
-                        self.emit("import io as _io, contextlib as _ctl");
-                        self.emit(&format!("__sh_cb{n} = _io.StringIO()"));
-                        self.emit(&format!("with _ctl.redirect_stdout(__sh_cb{n}):"));
-                        self.out.extend(scratch);
-                        // bash strips trailing newlines from `$( … )`
-                        self.emit(&format!(
-                            "__sh_cv{n} = __sh_cb{n}.getvalue().rstrip(\"\\n\")"
-                        ));
-                        return format!("__sh_cv{n}");
+                if let IrExpr::Arrow(body) = expr {
+                    if let Some(v) = self.buffered_body_value(body) {
+                        return v;
+                    }
+                }
+                // last resort: the body's shell text through one `bash -c`
+                // (`$( (gzip …; gzip …) )` — forking statements that
+                // `redirect_stdout` cannot buffer).
+                if let IrExpr::Arrow(body) = expr {
+                    if let Some(text) = self.body_shell_text(body) {
+                        self.need_subprocess = true;
+                        let (env, pos) = (self.bash_env(), self.bash_pos());
+                        return format!(
+                            "(__sh_bash({}, {pos}, {env}).stdout.decode().rstrip(\"\\n\"))",
+                            Self::py_str(&text)
+                        );
                     }
                 }
                 self.sh2_stub("capture", &[], "capture")
@@ -1703,6 +1826,11 @@ impl Render {
                 "None".into()
             }
             IrExpr::Arrow(body) => {
+                // a `( … )` body contributes its statements directly
+                // (`captureWords(arrow[Subshell[echo a; echo b]])`); the
+                // flatten keeps the shape checks below working.
+                let flat = Self::flatten_subs(body);
+                let body = &flat;
                 // a command body as a value — bash -c capture fallback
                 if let Some(text) = self.body_shell_text(body) {
                     self.need_subprocess = true;
@@ -1721,6 +1849,14 @@ impl Render {
                         stages.iter().map(|s| IrExpr::Arrow(s.clone())).collect();
                     if let Some(run) = self.pipeline_run(&[IrExpr::Array(stages)]) {
                         return format!("({run}.stdout.decode().rstrip(\"\\n\"))");
+                    }
+                }
+                // a multi-statement body that renders to python-level output
+                // (`captureWords(arrow[Subshell[echo a; echo b]])`): buffer
+                // it instead of leaving the sh2_arrow() placeholder.
+                if body.len() > 1 {
+                    if let Some(v) = self.buffered_body_value(body) {
+                        return v;
                     }
                 }
                 // a single Exec as the body (the process-substitution
@@ -1794,6 +1930,14 @@ impl Render {
                     if let Some(sp) = self.argv_slice_splice(e) {
                         elems.push(sp);
                         continue;
+                    }
+                    // `arr=($( … ))`: bash field-splits the captured text
+                    // into separate elements, so splice the word list.
+                    if let IrExpr::Call { func, .. } = e {
+                        if func == "captureWords" {
+                            elems.push(format!("*{}", self.expr(e)));
+                            continue;
+                        }
                     }
                     // glob words splice (a `for i in *.sh` iterand holds
                     // one list entry per match).
@@ -3743,8 +3887,33 @@ impl Render {
                 // captured stdout (bash strips trailing newlines).
                 if let Some(run) = self.pipeline_run(args) {
                     return format!("({run}.stdout.decode().rstrip(\"\\n\"))");
+                }                // a native head (`(a; b) | tr` — a subshell, a loop, a
+                // printf) feeds the rest through one buffered `bash -c`.
+                if let Some(stages) = self.pipeline_stage_vecs(args) {
+                    if let Some(v) = self.pipeline_native_head_value(&stages) {
+                        return format!("({v})");
+                    }
                 }
                 self.sh2_stub("pipeline", args, "pipeline")
+            }
+            "captureWords" => {
+                // `$( … )` in word-list position: bash field-splits the
+                // captured text. A fenced run (`__sh_cap(...)` /
+                // `__sh_bash(...)`) is a CompletedProcess, so split its
+                // stdout instead of splitting the process repr.
+                let Some(a) = args.first() else {
+                    return self.sh2_stub("captureWords", args, "captureWords");
+                };
+                self.sh2_calls.insert("captureWords".into());
+                let v = self.expr(a);
+                // `__sh_cap` already yields the stripped text; a bare
+                // `__sh_bash(...)` yields the CompletedProcess. `__sh_bash_in`
+                // is always followed by a `.stdout.decode()…` in the expression
+                // that rendered it, so that form is text already.
+                if v.starts_with("__sh_bash(") && !v.contains(".stdout.decode(") {
+                    return format!("{v}.stdout.decode().split()");
+                }
+                format!("sh2_captureWords({v})")
             }
             _ => self.sh2_stub(func, args, func),
         }
@@ -3761,6 +3930,32 @@ impl Render {
         };
         if rest.is_empty() {
             return None;
+        }
+        // `cat <<EOF | cmd`: the heredoc body IS the head's stdout, so feed
+        // it straight through instead of buffering — a forked heredoc writes
+        // to the process fd and `redirect_stdout` would never see it. Only a
+        // literal body qualifies: an interpolating one needs `$var`
+        // expansion, which the fork path does properly.
+        if let [IrStmt::Redirect { inner, redirects }] = head.as_slice() {
+            if redirects.len() == 1 {
+                let r = &redirects[0];
+                let is_cat = matches!(inner.as_slice(),
+                    [IrStmt::Expr(IrExpr::Call { func, args })]
+                        if func == "exec"
+                            && matches!(args.first(), Some(IrExpr::Str(c, _)) if c == "cat")
+                            && matches!(args.get(1), Some(IrExpr::Array(w)) if w.is_empty()));
+                if is_cat
+                    && r.fd.unwrap_or(0) == 0
+                    && matches!(r.mode.as_str(), "heredoc" | "heredoc-tabs")
+                {
+                    if let IrExpr::Str(body, _) = &r.target {
+                        if !r.interpolate || !body.contains('$') {
+                            let rest_text = self.pipeline_rest_text(rest)?;
+                            return Some((Self::py_str(body), rest_text));
+                        }
+                    }
+                }
+            }
         }
         // `printf … | …`: the printf lift already computed the exact bytes
         // the head writes, and `newline` is printf's own verdict (it emits
@@ -3816,10 +4011,30 @@ impl Render {
     fn pipeline_rest_text(&self, rest: &[Vec<IrStmt>]) -> Option<String> {
         let mut parts = Vec::new();
         for stage in rest {
-            if let [IrStmt::Expr(IrExpr::Call { func, args })] = stage.as_slice() {
+            // a stage may carry redirects (`gzip > file`, `wc -c < f`): the
+            // shell text has to re-attach them, else the whole pipeline
+            // falls back to the stub.
+            let (call, redirs) = match stage.as_slice() {
+                [IrStmt::Expr(e)] => (e, None),
+                [IrStmt::Redirect {
+                    inner, redirects, ..
+                }] => match inner.as_slice() {
+                    [IrStmt::Expr(e)] => (e, Some(redirects)),
+                    _ => return None,
+                },
+                _ => return None,
+            };
+            if let IrExpr::Call { func, args } = call {
                 if func == "exec" || func == "builtin" {
                     if let Some(argv) = self.shell_argv(args) {
-                        parts.push(argv.join(" "));
+                        let mut text = argv.join(" ");
+                        if let Some(redirs) = redirs {
+                            for r in redirs {
+                                text.push(' ');
+                                text.push_str(&self.irredirect_text(r)?);
+                            }
+                        }
+                        parts.push(text);
                         continue;
                     }
                 }
@@ -3993,11 +4208,47 @@ impl Render {
     /// all-shell fast path and the native-echo-head mixed path (shared
     /// by the expression `"pipeline"` arm and the statement
     /// `IrStmt::Pipeline` arm).
+    /// Normalize pipeline stages for the shared helpers: flatten `( … )`
+    /// subshell wrappers (their stdout is the stage's) and rewrite the
+    /// frontend's Call-dialect containers, so every helper sees plain
+    /// statements instead of a `sh2_arrow()` stub.
+    /// The pipeline Call's stages as statement lists, with the subshell and
+    /// Call-dialect wrappers flattened. None when a stage is not an Arrow.
+    fn pipeline_stage_vecs(&self, args: &[IrExpr]) -> Option<Vec<Vec<IrStmt>>> {
+        let stages = match args.first() {
+            Some(IrExpr::Array(s)) => s,
+            _ => return None,
+        };
+        stages
+            .iter()
+            .map(|st| match st {
+                IrExpr::Arrow(b) => Some(
+                    self.stage_dialect_list(b).unwrap_or_else(|| b.clone()),
+                ),
+                _ => None,
+            })
+            .collect()
+    }
+
+    fn norm_stages(&self, stages: &[IrExpr]) -> Vec<IrExpr> {
+        stages
+            .iter()
+            .map(|st| match st {
+                IrExpr::Arrow(b) => IrExpr::Arrow(
+                    self.stage_dialect_list(b).unwrap_or_else(|| b.clone()),
+                ),
+                other => other.clone(),
+            })
+            .collect()
+    }
+
     fn pipeline_run(&mut self, args: &[IrExpr]) -> Option<String> {
         let stages = match args.first() {
             Some(IrExpr::Array(stages)) => stages,
             _ => return None,
         };
+        let norm = self.norm_stages(stages);
+        let stages = &norm;
         // fast path: every stage is shell-textable — one bash -c.
         // A stage may carry redirects (`wc -c < "$file"`): unwrap the
         // Redirect to its inner call and re-attach the redirect text.
@@ -4157,33 +4408,50 @@ impl Render {
             Some(IrExpr::Array(stages)) => stages,
             _ => return None,
         };
-        // shell-textable stages only (native-head mixing in conditions
-        // is rare — the value form covers captures; refuse > guess).
+        let norm = self.norm_stages(stages);
+        let stages = &norm;
+        // shell-textable stages only; a native head falls through to the
+        // buffered form below.
         let mut parts = Vec::new();
+        let mut all_shell = true;
         for stage in stages {
-            if let IrExpr::Arrow(body) = stage {
-                if let [IrStmt::Expr(e)] = body.as_slice() {
-                    if let IrExpr::Call { func, args } = e {
-                        if func == "exec" || func == "builtin" {
-                            if let Some(argv) = self.shell_argv(args) {
-                                parts.push(argv.join(" "));
-                                continue;
-                            }
-                        }
-                    }
+            let IrExpr::Arrow(body) = stage else {
+                all_shell = false;
+                break;
+            };
+            let [IrStmt::Expr(e)] = body.as_slice() else {
+                all_shell = false;
+                break;
+            };
+            let IrExpr::Call { func, args } = e else {
+                all_shell = false;
+                break;
+            };
+            if func != "exec" && func != "builtin" {
+                all_shell = false;
+                break;
+            }
+            match self.shell_argv(args) {
+                Some(argv) => parts.push(argv.join(" ")),
+                None => {
+                    all_shell = false;
+                    break;
                 }
             }
-            return None;
         }
-        if parts.is_empty() {
-            return None;
+        if all_shell && !parts.is_empty() {
+            self.need_subprocess = true;
+            let (env, pos) = (self.bash_env(), self.bash_pos());
+            return Some(format!(
+                "__sh_pipe_status({}, {pos}, {env})",
+                Self::py_str(&parts.join(" | "))
+            ));
         }
-        self.need_subprocess = true;
-        let (env, pos) = (self.bash_env(), self.bash_pos());
-        Some(format!(
-            "__sh_pipe_status({}, {pos}, {env})",
-            Self::py_str(&parts.join(" | "))
-        ))
+        // a native head (`(a; b) | grep -q a`) in condition position: the
+        // buffered head feeds one `bash -c`, and the verdict is its rc.
+        let stages = self.pipeline_stage_vecs(args)?;
+        let pv = self.pipeline_native_head_run(&stages)?;
+        Some(format!("({pv}.returncode == 0)"))
     }
     /// A condition expression as (prefix lines, test): externals yield
     /// an rc INT (`if __sh_exec(...)` would branch BACKWARDS — nonzero
@@ -4195,6 +4463,15 @@ impl Render {
     /// (interactive-test-minus-t.sh: `if test -t 1` took the wrong
     /// branch).
     fn cond_test(&mut self, e: &IrExpr) -> (Vec<String>, String) {
+        // a pipeline in condition position is rc-truth, not stdout-truth
+        // (`while (a; b) | grep -q a` has empty stdout on success).
+        if let IrExpr::Call { func, args } = e {
+            if func == "pipeline" {
+                if let Some(t) = self.pipeline_effect(args) {
+                    return (vec![], t);
+                }
+            }
+        }
         let c = self.expr(e);
         if c.starts_with("__sh_exec([") || Self::is_native_rc(&c) {
             return (vec![], format!("({c} == 0)"));
@@ -4318,6 +4595,18 @@ impl Render {
                         {
                             if let Some(IrExpr::Arrow(inner)) = args.first() {
                                 return self.body_shell_text(inner);
+                            }
+                        }
+                        // the frontend Call dialect spells `( … )` as
+                        // subshell(Arrow[body]) / the group wrapper: it is
+                        // shell text like any other compound body.
+                        if func == "subshell" || func == "group" {
+                            if let Some(IrExpr::Arrow(inner)) = args.first() {
+                                let flat = Self::flatten_subs(inner);
+                                if let Some(t) = self.body_shell_text(&flat) {
+                                    parts.push(format!("( {t} )"));
+                                    continue;
+                                }
                             }
                         }
                         if func == "exec" || func == "builtin" {
@@ -4493,6 +4782,21 @@ impl Render {
                     }
                     return None;
                 }
+                // General fallback: any other redirected body (`(cmd; cmd)
+                // 3>&- </dev/null`) is its inner statements' text plus the
+                // redirection text.
+                IrStmt::Redirect { inner, redirects } => {
+                    let mut text = self.body_shell_text(&Self::flatten_subs(inner))?;
+                    for r in redirects {
+                        let rt = self.irredirect_text(r)?;
+                        if !rt.is_empty() {
+                            text.push(' ');
+                            text.push_str(&rt);
+                        }
+                    }
+                    parts.push(text);
+                    continue;
+                }
                 _ => return None,
             }
         }
@@ -4504,8 +4808,26 @@ impl Render {
     /// (only Str / all-literal Interpolate / getVar, mirroring
     /// `redirect_shell_text`).
     fn irredirect_text(&self, r: &crate::ir::IrRedirect) -> Option<String> {
+        // `3>&-` / `5<&-` only CLOSE a descriptor (`( … ) 3>&- 5<&-`).
+        // Our child gets a fresh fd table with those descriptors shut, so
+        // the redirect is a no-op — render it as empty text instead of
+        // refusing the whole statement.
+        match &r.target {
+            IrExpr::Str(s, _) if s == "-" || (s.starts_with('&') && s.ends_with('-')) => {
+                return Some(String::new())
+            }
+            IrExpr::Var(n, _) if n == "-" => return Some(String::new()),
+            _ => {}
+        }
+        // double quotes; it only matters when a literal target holds a `$`
+        // that bash would expand (`sh_quote` would freeze it). Var/Interpolate
+        // targets render their expansion anyway.
         if r.interpolate {
-            return None;
+            if let IrExpr::Str(s, _) = &r.target {
+                if s.contains('$') {
+                    return None;
+                }
+            }
         }
         let sym = match r.mode.as_str() {
             "r" => "<",
@@ -4561,6 +4883,7 @@ impl Render {
         };
         let mut mode = "w".to_string();
         let mut target = None;
+        let mut fd: Option<String> = None;
         for (k, v) in props {
             match k.as_str() {
                 "mode" => {
@@ -4568,9 +4891,19 @@ impl Render {
                         mode = s.clone();
                     }
                 }
+                "fd" => {
+                    if let IrExpr::Int(n) = v {
+                        fd = Some(n.to_string());
+                    }
+                }
                 "target" => {
                     if let Some(lit) = Self::redirect_target_lit(v) {
-                        target = Some(Self::sh_quote(&lit));
+                        // `3>&-` / `5<&-`: a CLOSE, not a file named `-`
+                        target = Some(if lit == "-" {
+                            String::new()
+                        } else {
+                            Self::sh_quote(&lit)
+                        });
                     } else if let IrExpr::Call { func, args } = v {
                         if func == "getVar" {
                             if let Some(IrExpr::Str(n, _)) = args.first() {
@@ -4583,6 +4916,14 @@ impl Render {
             }
         }
         let t = target?;
+        if t.is_empty() {
+            // the descriptor-close forms (`3>&-`, `5<&-`)
+            let sym = if mode == "r" { "<&-" } else { ">&-" };
+            return Some(match &fd {
+                Some(n) => format!("{n}{sym}"),
+                None => sym.to_string(),
+            });
+        }
         Some(match mode.as_str() {
             "w" => format!(">{t}"),
             "a" => format!(">>{t}"),
@@ -4598,7 +4939,10 @@ impl Render {
         else {
             return None;
         };
-        let inner = self.body_shell_text(body)?;
+        // `$( (cmd; cmd) 3>&- )` — the body is a subshell whose own
+        // statements must be flattened before shell-texting.
+        let flat = Self::flatten_subs(body);
+        let inner = self.body_shell_text(&flat)?;
         let mut text = format!("( {inner} )");
         for r in redirs {
             text.push(' ');
@@ -6429,7 +6773,6 @@ impl Render {
                         return;
                     }
                 }
-                let x = self.expr(e);
                 // `pipeline` Call returns captured stdout — as a
                 // statement, bash prints it, so run once into __sh_pr,
                 // replay stdout, record the last stage's rc (bash pipes).
@@ -6494,6 +6837,11 @@ impl Render {
                         return;
                     }
                 }
+                // Rendered only after the pipeline branches: `self.expr` on
+                // a pipeline EMITS its run (`pipeline_native_head_value`
+                // buffers the head), so probing it first would execute the
+                // pipeline twice (091_while_pipe_var's `count` kept counting).
+                let x = self.expr(e);
                 // an external command's exit status is `$?`-visible (bash
                 // records every command's rc): `grep pat missing; echo $?`
                 // prints 2. Native statements reset it to 0 (bash: a
@@ -6655,7 +7003,17 @@ impl Render {
                 let rhs = if self.is_num(&t.var) {
                     self.expr_as_num(expr)
                 } else {
-                    self.expr(expr)
+                    // bash does NOT field-split a capture in an assignment
+                    // (`size=$(wc -c < f)` is the text, not a word list).
+                    match expr {
+                        IrExpr::Call { func, args } if func == "captureWords" => {
+                            match args.first() {
+                                Some(inner) => self.expr(inner),
+                                None => self.expr(expr),
+                            }
+                        }
+                        _ => self.expr(expr),
+                    }
                 };
                 // a STORE-resident target: the native binding is not the
                 // var's home — the store read (sh2_getVar) must observe
@@ -8137,6 +8495,10 @@ impl Render {
         if self.need_atoi {
             // printf %d/%i/%u args: parseInt(s, 10) || 0 semantics
             self.emit("def __sh_atoi(s):");
+            // a field-split capture in a scalar slot (`printf %d $(…)`)
+            // contributes its first word, as bash's unquoted expansion does.
+            self.emit("    if isinstance(s, (list, tuple)):");
+            self.emit("        s = s[0] if s else \"\"");
             self.emit("    try:");
             self.emit("        return int(str(s).strip(), 10)");
             self.emit("    except ValueError:");
