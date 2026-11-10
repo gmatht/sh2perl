@@ -11,8 +11,9 @@
 //!     (with -n/-e/-E), printf (full conversion spec), cd/export/local/
 //!     declare/unset/set/shift/read (IFS field split)/let/sleep/pwd/wait/
 //!     true/false/exit, `[ ... ]`/`[[ ... ]]` tests (file tests, numeric
-//!     compares, pattern match via a hand-rolled glob matcher, `=~` via
-//!     `bash -c '[[ $1 =~ $2 ]]'`), parameter expansion (`:-` `:=` `#` `%`
+//!     compares, pattern match via a hand-rolled glob matcher, `=~` via the
+//!     `regex` crate — or POSIX ERE via `revera` with `--regex-engine posix`),
+//!     parameter expansion (`:-` `:=` `#` `%`
 //!     `/` `//` slice case ops len basename dirname), command substitution
 //!     (native statement blocks captured via a runtime output buffer, or
 //!     `bash -c` for shell-out bodies), pipelines (mixed native/shell
@@ -2360,20 +2361,46 @@ fn inline_sh_substr(
     out
 }
 
+thread_local! {
+    /// Whether `__sh_regex` uses the POSIX engine for renders on this
+    /// thread. Thread-local rather than an env var: rendering is synchronous
+    /// and in-process, and harnesses render many programs in one process.
+    static REGEX_ENGINE_POSIX: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+/// Select POSIX ERE semantics for `=~` on this thread (`--regex-engine
+/// posix`). The engines answer the same yes/no question for patterns whose
+/// syntax means the same thing in both dialects; they differ where it does
+/// not (`\d`), and in which match is reported (leftmost-longest vs first).
+pub fn set_regex_engine_posix(on: bool) {
+    REGEX_ENGINE_POSIX.with(|c| c.set(on));
+}
+
+fn regex_engine_posix() -> bool {
+    REGEX_ENGINE_POSIX.with(|c| c.get())
+}
+
 /// A `Cargo.toml` for a rendered program.
 ///
 /// Generated programs are single files compiled directly by `rustc` — there
-/// is no manifest and therefore no way to link a crate. The one helper that
-/// reaches outside `std` is `__sh_regex`, so this returns a dependency-free
-/// manifest for the rest of the corpus and adds `regex = "1"` only when the
-/// rendered text actually references it. Callers (`--cargo-dir`) write it
-/// next to a `src/main.rs` to produce a buildable project.
+/// is no manifest and therefore no way to link a crate. Only `__sh_regex`
+/// reaches outside `std`, and the crate it needs depends on the engine the
+/// program was rendered with: `regex` for the default engine, `revera` for
+/// `--regex-engine posix`. Everything else stays dependency-free.
 pub fn cargo_manifest(rendered: &str) -> String {
     let mut m = String::from(
         "[package]\nname = \"sh2prog\"\nversion = \"0.1.0\"\nedition = \"2021\"\n",
     );
+    let mut deps = String::new();
     if rendered.contains("regex::Regex") {
-        m.push_str("\n[dependencies]\nregex = \"1\"\n");
+        deps.push_str("regex = \"1\"\n");
+    }
+    if rendered.contains("revera::") {
+        deps.push_str("revera = \"0.2\"\n");
+    }
+    if !deps.is_empty() {
+        m.push_str("\n[dependencies]\n");
+        m.push_str(&deps);
     }
     m
 }
@@ -14336,7 +14363,7 @@ const HELPER_ORDER: &[&str] = &[
     "q", "q_printf", "wq", "cat", "pow", "echo_esc", "printf_b", "atoi", "atou", "atof", "print_words", "print_words_noesc", "puts", "printf", "outbytes",
     "cap_bytes", "capture_rc", "spawn", "run", "readline", "read_fields", "split_ifs",
     "fnmatch", "globlike", "strippre", "stripsuf", "replace", "substr", "case", "len", "basename",
-    "dirname", "env", "arg", "glob", "brace", "sleep", "rand", "grepmatches", "regex",
+    "dirname", "env", "arg", "glob", "brace", "sleep", "rand", "grepmatches", "regex", "regex_posix",
     "mtime", "samefile", "fmode", "fowner", "fgroup", "fnewer", "wait_all", "bg",
     "fexists", "fdir", "freg", "fsym", "fread", "fwrite", "fexec", "fsize", "aindex",
     "div", "mod", "ret_rc", "capture", "run_traps", "lines",
@@ -15503,6 +15530,18 @@ fn helper_source(h: &str) -> &'static str {
     let pat = if flags.contains('i') { format!("(?i){}", pat) } else { pat.to_string() };
     match regex::Regex::new(&pat) {
         Ok(re) => re.is_match(text),
+        Err(_) => false,
+    }
+}"#,
+        // POSIX ERE engine (`--regex-engine posix`): leftmost-longest
+        // alternation, POSIX bracket classes, and no Perl escapes — so `\d`
+        // is the literal `d` that bash's `=~` sees, not the digit class
+        // Rust's engine reads. `flags` is unused because POSIX ERE has no
+        // inline flags; `nocasematch` is not expressible on this engine.
+        "regex_posix" => r#"fn __sh_regex(text: &str, pat: &str, flags: &str) -> bool {
+    let _ = flags;
+    match revera::Regex::new(pat) {
+        Ok(re) => matches!(re.is_match(text), Ok(true)),
         Err(_) => false,
     }
 }"#,
@@ -16811,7 +16850,14 @@ impl<'a, 'r> TestParser<'a, 'r> {
                 }
             }
             "=~" => {
-                self.render.add_helper("regex");
+                // One engine per program (`--regex-engine`); the helper name
+                // is what the manifest keys the dependency off.
+                let helper = if regex_engine_posix() {
+                    "regex_posix"
+                } else {
+                    "regex"
+                };
+                self.render.add_helper(helper);
                 format!("__sh_regex(&{lhs}, &{rhs}, \"\")")
             }
             "-nt" | "-ot" => {
@@ -21854,6 +21900,11 @@ mod tests {
         );
         let with = super::cargo_manifest("fn __sh_regex(t: &str) { regex::Regex::new(t); }");
         assert!(with.contains("regex = \"1\""), "{with}");
+        // the POSIX engine renders a different helper, so it needs a
+        // different crate — and only that crate
+        let posix = super::cargo_manifest("fn __sh_regex(t: &str) { revera::Regex::new(t); }");
+        assert!(posix.contains("revera = \"0.2\""), "{posix}");
+        assert!(!posix.contains("regex ="), "both engines declared:\n{posix}");
     }
 
     #[test]
