@@ -5195,13 +5195,18 @@ impl Render {
                     self.add_helper("rand");
                     "__sh_rand()".to_string()
                 }
-                "UID" | "EUID" => {
-                    self.add_helper("capture");
-                    "__sh_capture(\"id -u\")".to_string()
+                // no process: /proc carries all three
+                "UID" => {
+                    self.add_helper("uid");
+                    "__sh_uid().to_string()".to_string()
+                }
+                "EUID" => {
+                    self.add_helper("euid");
+                    "__sh_euid().to_string()".to_string()
                 }
                 "HOSTNAME" => {
-                    self.add_helper("capture");
-                    "__sh_capture(\"hostname\")".to_string()
+                    self.add_helper("hostname");
+                    "__sh_hostname()".to_string()
                 }
                 "-" => "\"hB\".to_string()".to_string(),
                 "LINENO" | "SECONDS" | "BASH_SOURCE" | "FUNCNAME"
@@ -14372,7 +14377,7 @@ const HELPER_ORDER: &[&str] = &[
     "q", "q_printf", "wq", "cat", "pow", "echo_esc", "printf_b", "atoi", "atou", "atof", "print_words", "print_words_noesc", "puts", "printf", "outbytes",
     "cap_bytes", "capture_rc", "spawn", "run", "readline", "read_fields", "split_ifs",
     "fnmatch", "globlike", "strippre", "stripsuf", "replace", "substr", "case", "len", "basename",
-    "dirname", "env", "arg", "glob", "brace", "sleep", "rand", "grepmatches", "regex", "regex_posix",
+    "dirname", "env", "arg", "glob", "brace", "sleep", "rand", "uid", "euid", "gid", "hostname", "grepmatches", "regex", "regex_posix",
     "mtime", "samefile", "fmode", "fowner", "fgroup", "fnewer", "wait_all", "bg",
     "fexists", "fdir", "freg", "fsym", "fread", "fwrite", "fexec", "fsize", "aindex",
     "div", "mod", "ret_rc", "capture", "run_traps", "lines",
@@ -14499,7 +14504,9 @@ fn helper_deps(h: &str) -> &'static [&'static str] {
         "glob" => &["cap_bytes"],
         "rand" => &["cap_bytes"],
         "capture" => &[],
-        "grepmatches" => &["cap_bytes"],
+        "grepmatches" => &["regex"],
+        "fowner" => &["uid"],
+        "fgroup" => &["gid"],
         _ => &[],
     }
 }
@@ -15484,17 +15491,37 @@ fn helper_source(h: &str) -> &'static str {
     use std::os::unix::fs::MetadataExt;
     std::fs::metadata(s).map(|m| (m.mode() & bits) == bits).unwrap_or(false)
 }"#,
+        "uid" => r#"fn __sh_uid() -> u32 {
+    std::fs::read_to_string("/proc/self/status").ok()
+        .and_then(|s| s.lines().find(|l| l.starts_with("Uid:"))
+            .and_then(|l| l.split_whitespace().nth(1)).and_then(|v| v.parse().ok()))
+        .unwrap_or(0)
+}"#,
+        "euid" => r#"fn __sh_euid() -> u32 {
+    std::fs::read_to_string("/proc/self/status").ok()
+        .and_then(|s| s.lines().find(|l| l.starts_with("Uid:"))
+            .and_then(|l| l.split_whitespace().nth(2)).and_then(|v| v.parse().ok()))
+        .unwrap_or(0)
+}"#,
+        "gid" => r#"fn __sh_gid() -> u32 {
+    std::fs::read_to_string("/proc/self/status").ok()
+        .and_then(|s| s.lines().find(|l| l.starts_with("Gid:"))
+            .and_then(|l| l.split_whitespace().nth(1)).and_then(|v| v.parse().ok()))
+        .unwrap_or(0)
+}"#,
+        "hostname" => r#"fn __sh_hostname() -> String {
+    std::fs::read_to_string("/proc/sys/kernel/hostname")
+        .map(|s| s.trim_end().to_string()).unwrap_or_default()
+}"#,
         "fowner" => r#"fn __sh_fowner(s: &str) -> bool {
     use std::os::unix::fs::MetadataExt;
-    let uid = std::process::Command::new("id").arg("-u").output()
-        .map(|o| String::from_utf8_lossy(&o.stdout).trim().to_string()).unwrap_or_default();
-    std::fs::metadata(s).map(|m| m.uid().to_string() == uid).unwrap_or(false)
+    let uid = __sh_uid();
+    std::fs::metadata(s).map(|m| m.uid() == uid).unwrap_or(false)
 }"#,
         "fgroup" => r#"fn __sh_fgroup(s: &str) -> bool {
     use std::os::unix::fs::MetadataExt;
-    let gid = std::process::Command::new("id").arg("-g").output()
-        .map(|o| String::from_utf8_lossy(&o.stdout).trim().to_string()).unwrap_or_default();
-    std::fs::metadata(s).map(|m| m.gid().to_string() == gid).unwrap_or(false)
+    let gid = __sh_gid();
+    std::fs::metadata(s).map(|m| m.gid() == gid).unwrap_or(false)
 }"#,
         "fnewer" => r#"fn __sh_fnewer(s: &str) -> bool {
     // -N: modified after last read — approximate with mtime > atime
@@ -15510,22 +15537,54 @@ fn helper_source(h: &str) -> &'static str {
     }
 }"#,
         "grepmatches" => r#"fn __sh_grepmatches(text: &str, pat: &str, flags: &str) -> (String, i32) {
-    let mut opts = String::from("-o");
-    if flags.contains('i') { opts.push('i'); }
-    if flags.contains('E') { opts.push('E'); }
-    let cmd = format!("printf '%s' \"$1\" | grep {opts} \"$2\"");
-    let mut c = std::process::Command::new("bash");
-    c.arg("-c").arg(&cmd).arg("sh").arg(text).arg(pat);
-    c.stdout(std::process::Stdio::piped());
-    let mut ch = match c.spawn() { Ok(x) => x, Err(_) => return (String::new(), 1) };
-    let mut out = Vec::new();
-    if let Some(mut so) = ch.stdout.take() {
-        let _ = std::io::Read::read_to_end(&mut so, &mut out);
+    // grep -o without spawning grep: the pattern is POSIX BRE by default
+    // (translated to ERE for the `regex` crate), `-E` passes through, `-i`
+    // folds. `(?m)` gives grep's per-line ^/$ anchors and find_iter advances
+    // exactly like grep -o, so each match becomes one output line.
+    fn bre_to_ere(p: &str) -> String {
+        let b: Vec<char> = p.chars().collect();
+        let mut out = String::new();
+        let mut i = 0;
+        while i < b.len() {
+            if b[i] == '\\' && i + 1 < b.len() {
+                let n = b[i + 1];
+                match n {
+                    '+' | '?' | '|' | '(' | ')' | '{' | '}' => out.push(n),
+                    _ => { out.push('\\'); out.push(n); }
+                }
+                i += 2;
+            } else if b[i] == '[' {
+                // a bracket expression is copied verbatim through its ']'
+                out.push('[');
+                i += 1;
+                if i < b.len() && (b[i] == '^' || b[i] == ']') { out.push(b[i]); i += 1; }
+                while i < b.len() {
+                    out.push(b[i]);
+                    let done = b[i] == ']';
+                    i += 1;
+                    if done { break; }
+                }
+            } else {
+                match b[i] {
+                    // ERE metacharacters that are LITERAL in BRE
+                    '(' | ')' | '{' | '}' | '|' | '+' | '?' => { out.push('\\'); out.push(b[i]); }
+                    c => out.push(c),
+                }
+                i += 1;
+            }
+        }
+        out
     }
-    let rc = ch.wait().map(|s| s.code().unwrap_or(1)).unwrap_or(1);
-    let mut s = String::from_utf8_lossy(&out).to_string();
-    while s.ends_with('\n') { s.pop(); }
-    (s, rc)
+    let ere = if flags.contains('E') { pat.to_string() } else { bre_to_ere(pat) };
+    let full = if flags.contains('i') { format!("(?mi){}", ere) } else { format!("(?m){}", ere) };
+    match regex::Regex::new(&full) {
+        Ok(re) => {
+            let hits: Vec<&str> = re.find_iter(text).map(|m| m.as_str()).collect();
+            if hits.is_empty() { (String::new(), 1) } else { (hits.join("\n"), 0) }
+        }
+        // grep exits 2 on an invalid pattern, with nothing on stdout
+        Err(_) => (String::new(), 2),
+    }
 }"#,
         // The `regex` crate (declared by `cargo_manifest` below): the old
         // body shelled out to `bash -c '[[ $1 =~ $2 ]]'` for EVERY match —
