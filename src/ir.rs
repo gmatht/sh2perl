@@ -983,19 +983,19 @@ fn stmt_uses_say(stmt: &IrStmt) -> bool {
     }
 }
 
-/// Convert an `IrProgram` to a Perl source string.
-///
-/// Style decisions (say vs print, parentheses style, indentation) are
-/// made here, not in the generator.
-///
-/// Role: this is the ShIR-consumer wrapper of the Perl backend — the
-/// sibling of `shir_to_estree`. The AST-side `Generator` (`src/generator/`)
-/// owns Perl text for constructs that have not yet migrated to the IR;
-/// `ast_to_ir` wraps that output in a single `RawText` blob via
-/// `IrProgram::from_raw_perl` (the migration bridge). As constructs
-/// migrate, the Generator emits real IR nodes and this renderer emits
-/// them as Perl; `from_raw_perl` becomes unnecessary when the Generator
-/// emits pure IR nodes. See PLAN.md §3 and `docs/ir-design.md`.
+// Convert an `IrProgram` to a Perl source string.
+//
+// Style decisions (say vs print, parentheses style, indentation) are
+// made here, not in the generator.
+//
+// Role: this is the ShIR-consumer wrapper of the Perl backend — the
+// sibling of `shir_to_estree`. The AST-side `Generator` (`src/generator/`)
+// owns Perl text for constructs that have not yet migrated to the IR;
+// `ast_to_ir` wraps that output in a single `RawText` blob via
+// `IrProgram::from_raw_perl` (the migration bridge). As constructs
+// migrate, the Generator emits real IR nodes and this renderer emits
+// them as Perl; `from_raw_perl` becomes unnecessary when the Generator
+// emits pure IR nodes. See PLAN.md §3 and `docs/ir-design.md`.
 thread_local! {
     /// True while rendering a program that MOVES the status through
     /// `$CHILD_ERROR` itself (the process-substitution save/restore). Only
@@ -4508,17 +4508,17 @@ fn split_indexed_var(name: &str) -> (&str, Option<&str>) {
     (name, None)
 }
 
-/// Env-style names that carry a PLAIN (non-export) assignment somewhere
-/// in the program. Bash keeps every variable in one store and publishes
-/// only the EXPORTED ones to children; routing env-style names straight
-/// to `%ENV` published `SHELL_VAR=\"Hello World\"` before any `export`
-/// ran, so a `perl -e` child saw it early (examples/045, ./fail's Group
-/// C / Bug A). The names in this set store to the perl SCALAR instead,
-/// and every write refreshes `%ENV` only when the name is ALREADY
-/// exported — at runtime `exists $ENV{N}` is exactly "bash would
-/// propagate this name" (an inherited name like PATH stays exported
-/// across a bare re-assignment; a fresh one does not appear until an
-/// `export` publishes it). `export` itself re-syncs from the scalar.
+// Env-style names that carry a PLAIN (non-export) assignment somewhere
+// in the program. Bash keeps every variable in one store and publishes
+// only the EXPORTED ones to children; routing env-style names straight
+// to `%ENV` published `SHELL_VAR=\"Hello World\"` before any `export`
+// ran, so a `perl -e` child saw it early (examples/045, ./fail's Group
+// C / Bug A). The names in this set store to the perl SCALAR instead,
+// and every write refreshes `%ENV` only when the name is ALREADY
+// exported — at runtime `exists $ENV{N}` is exactly "bash would
+// propagate this name" (an inherited name like PATH stays exported
+// across a bare re-assignment; a fresh one does not appear until an
+// `export` publishes it). `export` itself re-syncs from the scalar.
 thread_local! {
     static SCALAR_PHASE_VARS: std::cell::RefCell<std::collections::HashSet<String>> =
         std::cell::RefCell::new(std::collections::HashSet::new());
@@ -12437,39 +12437,6 @@ pub(crate) fn ir_expr_to_perl(expr: &IrExpr) -> String {
                         }
                         return capture_do_perl(&format!("{body};;"));
                     }
-                    // A PERL-SIDE capture: the C frontend's outparam
-                    // channel (setVar(cap, capture(Arrow[fnCall(..)]))) —
-                    // the callee ECHOES its out-param values and the
-                    // caller captures them. Redirect STDOUT into a string
-                    // buffer around the body statements.
-                    let has_calls = stmts.iter().any(|s| {
-                        matches!(s,
-                            IrStmt::Expr(IrExpr::Call { func, .. })
-                                if func == "$fn_call" || func == "exec" || func == "builtin")
-                    });
-                    if has_calls {
-                        let mut body = String::new();
-                        for st in stmts.iter() {
-                            emit_stmt(&mut body, st, 1);
-                        }
-                        return format!(
-                            "do {{ my $__cap = ''; open my $__fh, '>', \\$__cap or die; my $__old = select($__fh); {body}close $__fh; select($__old); $__cap }}"
-                        );
-                    }
-                    // Last resort: the body renders as Perl (`system(...)` /
-                    // `open('-|', …)`) but not as round-trippable shell text
-                    // (the `perl -e '…'` word is a plain variable read, so
-                    // the rebuilt `perl -e "$x"` would run the CONTENTS as
-                    // the program). Run the statements with fd 1 redirected
-                    // into a scalar — same capture without the shell.
-                    // (`die` here killed the whole generated program.)
-                    {
-                        let mut body = String::new();
-                        for st in stmts.iter() {
-                            emit_stmt(&mut body, st, 1);
-                        }
-                        return capture_do_perl(&format!("{body};;"));
-                    }
                 }
             }
             // A NATIVE capture whose Arrow body the native-pipeline fold
@@ -14319,7 +14286,7 @@ pub(crate) fn sh_split_simple_cmd(cmd: &str) -> Option<Vec<String>> {
                 }
                 quote = Some(c);
             }
-            (Some(q), c2) if Some(c2) == quote => {
+            (Some(_q), c2) if Some(c2) == quote => {
                 argv.push(std::mem::take(&mut cur));
                 quote = None;
             }
@@ -14351,12 +14318,12 @@ fn perl_word_literal(s: &str) -> String {
     format!("'{}'", s.replace('\\', "\\\\").replace('\'', "\\'"))
 }
 
-/// Whether command-substitution captures render through the `__sh_uu_*`
-/// external-command seam. The seam needs the standalone preamble helpers
-/// (`sub __sh_uu_capture` / `sub __sh_uu_run`); embed fragments are
-/// preamble-free and splice-clean, so the embed renderer disables it and
-/// uses the self-contained open-idiom instead (which also carries the
-/// `local $/` / `$!` / `chomp` markers the embed flag rewrites govern).
+// Whether command-substitution captures render through the `__sh_uu_*`
+// external-command seam. The seam needs the standalone preamble helpers
+// (`sub __sh_uu_capture` / `sub __sh_uu_run`); embed fragments are
+// preamble-free and splice-clean, so the embed renderer disables it and
+// uses the self-contained open-idiom instead (which also carries the
+// `local $/` / `$!` / `chomp` markers the embed flag rewrites govern).
 thread_local! {
     static UU_SEAM: std::cell::Cell<bool> = const { std::cell::Cell::new(true) };
     /// Variable names the program binds as ARRAYS (setArray / DeclareArray).

@@ -4145,7 +4145,7 @@ pub fn split_sets_enabled() -> bool {
 /// in cond+body is in the versionable subset; every read var is a lifted
 /// numeric binding (guard reads natively) or an exact slot.
 fn dual_version_while(
-    stmt: &IrStmt,
+    _stmt: &IrStmt,
     cond: &IrExpr,
     body: &[IrStmt],
     narrow: &Stmt,
@@ -6394,7 +6394,7 @@ fn param_lift_set(prog: &IrProgram) -> HashMap<String, usize> {
                 }
             }
             IrExpr::Call { func, args } => {
-                if (func == "exec" || func == "fnCall") {
+                if func == "exec" || func == "fnCall" {
                     if let Some(IrExpr::Str(n, _)) = args.first() {
                         if n == name {
                             // a static call site: must pass >= k args
@@ -7856,7 +7856,7 @@ pub fn ast_to_ir_pre_transforms(commands: &[Command], lines: &[usize]) -> IrProg
         }
     }
     let src: Vec<IrStmt> = origins.iter().map(|(_, s)| s.clone()).collect();
-    let mut stmts = crate::ir::optimize_stmts(&src);
+    let stmts = crate::ir::optimize_stmts(&src);
     // The lock moved to `ast_to_ir_transforms` (this function no longer
     // runs the transforms — see there).
     let after_optimize = stmts.clone();
@@ -7883,7 +7883,7 @@ pub fn ast_to_ir_pre_transforms(commands: &[Command], lines: &[usize]) -> IrProg
             stmt_lines.push((i, line));
         }
     }
-    let mut prog = IrProgram {
+    let prog = IrProgram {
         imports: vec![],
         requires: vec![],
         stmts,
@@ -7964,7 +7964,7 @@ pub fn ast_to_ir_transforms(prog: &mut IrProgram) {
     let to_pre = align_by_identity(&prog.stmts, &pre_transforms);
     for (j, via) in to_pre.iter().enumerate() {
         // stmts[j] -> pre_transforms[*via] -> the line that statement had.
-        let Some(b) = (*via) else { continue };
+        let Some(b) = *via else { continue };
         if let Some(&line) = line_of.get(&b) {
             stmt_lines.push((j, line));
         }
@@ -16258,7 +16258,7 @@ fn vars_in_opaque_text(text: &str, out: &mut HashSet<String>) {
                         // `1`. The candidates are WHOLE identifiers;
                         // `bare_name_at` judges each one's first char.
                         let mut ident = String::new();
-                        let mut flush = |ident: &mut String, out: &mut HashSet<String>| {
+                        let flush = |ident: &mut String, out: &mut HashSet<String>| {
                             if ident.is_empty() {
                                 return;
                             }
@@ -27250,7 +27250,7 @@ fn hoist_proven_nonzero_params(body: &[Stmt]) -> HashMap<String, HashSet<String>
 /// Disabled for `--library` (`SH2_LIBRARY`): exported functions accept
 /// external callers, so no call-site range is provable. `BigInt(p||0)`
 /// guards are out of scope (empty-string throws vs coerces — kept).
-fn strip_proven_nonzero_guard(mut program: Program) -> Program {
+fn strip_proven_nonzero_guard(program: Program) -> Program {
     strip_proven_nonzero_guard_inner(program, std::env::var("SH2_LIBRARY").is_ok())
 }
 
@@ -29533,7 +29533,7 @@ fn array_str_write(s: &str, name: &str) -> (bool, bool) {
             continue;
         }
         // Strip comparison ops (==, !=, <=, >=) — not writes.
-        let mut r = rest;
+        let r = rest;
         if r.starts_with("==") || r.starts_with("!=") || r.starts_with("<=") || r.starts_with(">=") {
             continue;
         }
@@ -30830,7 +30830,7 @@ fn array_rewrite_expr(e: &mut Expr, name: &str) {    // Post-order: rewrite the 
                     // `sortedJoinMerge(NAME, PARTNER)` → inline merge IIFE
                     // over the two native bindings (both migrated).
                     if func == "sortedJoinMerge"
-                        && matches!(arguments.as_slice(), [Expr::Literal { value: nm, .. }, Expr::Literal { value: partner, .. }]
+                        && matches!(arguments.as_slice(), [Expr::Literal { value: nm, .. }, Expr::Literal { value: _partner, .. }]
                             if nm.as_str() == Some(name))
                     {
                         if let [_, Expr::Literal { value: partner, .. }] = arguments.as_slice() {
@@ -32334,9 +32334,9 @@ fn temp_eval_pure(e: &Expr) -> bool {
     match e {
         Expr::Literal { .. } | Expr::Identifier { .. } => true,
         Expr::MemberExpression {
-            object,
-            property,
-            computed,
+            
+            
+            
             ..
         } => array_elem_pure(e),
         Expr::BinaryExpression { left, right, .. }
@@ -32642,7 +32642,7 @@ fn fold_temp_roundtrips(stmts: &mut Vec<Stmt>) {
             i += 1;
             continue;
         };
-        let (tv, read) = match next {
+        let (_tv, read) = match next {
             Stmt::ExpressionStatement { expression } => {
                 if let Expr::AssignmentExpression {
                     operator,
@@ -32782,7 +32782,7 @@ fn collect_number_bindings(stmts: &[Stmt]) -> (HashSet<String>, HashSet<String>)
         match e {
             Expr::Literal { value, .. } => is_num_lit(value),
             Expr::Identifier { name } => nums.contains(name),
-            Expr::CallExpression { callee, arguments, .. } => {
+            Expr::CallExpression { callee,  .. } => {
                 // `Number`/`parseInt`/`parseFloat` coerce ANY argument
                 // to a Number (or NaN) — always Number-producing.
                 // `Math.*` (except random) returns a Number. `isNaN`/
@@ -32926,7 +32926,7 @@ fn peephole_idiv(stmts: &mut Vec<Stmt>) {
         match e {
             Expr::Literal { value, .. } => value.as_i64().is_some() || value.as_f64().is_some(),
             Expr::Identifier { name } => nums.contains(name),
-            Expr::CallExpression { callee, arguments, .. } => {
+            Expr::CallExpression { callee,  .. } => {
                 // `Number`/`parseInt`/`parseFloat` coerce ANY argument
                 // to a Number (or NaN) — always Number-producing.
                 // `Math.*` (except random) returns a Number. `isNaN`/
@@ -32961,7 +32961,7 @@ fn peephole_idiv(stmts: &mut Vec<Stmt>) {
             _ => false,
         }
     }
-    fn is_nonzero(e: &Expr, nums: &HashSet<String>, nonzero: &HashSet<String>) -> bool {
+    fn is_nonzero(e: &Expr, _nums: &HashSet<String>, nonzero: &HashSet<String>) -> bool {
         match e {
             Expr::Literal { value, .. } => value.as_i64().map(|n| n != 0).unwrap_or(false),
             Expr::Identifier { name } => nonzero.contains(name),
@@ -33172,7 +33172,7 @@ fn peephole_idiv(stmts: &mut Vec<Stmt>) {
 /// finite result. Post-emission ESTree transform.
 fn peephole_arith_eval(stmts: &mut Vec<Stmt>) {
     let (nums, nonzero) = collect_number_bindings(stmts);
-    fn is_nonzero(e: &Expr, nums: &HashSet<String>, nonzero: &HashSet<String>) -> bool {
+    fn is_nonzero(e: &Expr, _nums: &HashSet<String>, nonzero: &HashSet<String>) -> bool {
         match e {
             Expr::Literal { value, .. } => value.as_i64().map(|n| n != 0).unwrap_or(false),
             Expr::Identifier { name } => nonzero.contains(name),
@@ -33906,7 +33906,7 @@ fn na_poison_call(func: &str, args: &[Expr]) -> bool {
         return true;
     }
     // `eval` / `source` run arbitrary text that may name the map.
-    if (func == "exec" || func == "builtin") {
+    if func == "exec" || func == "builtin" {
         match args.first() {
             Some(Expr::Literal { value, .. }) => {
                 if matches!(value.as_str(), Some("eval" | "source" | ".")) {
@@ -49922,7 +49922,7 @@ fn tr_class_body(set: &[u32]) -> String {
 fn tr_expand_set(s: &str) -> Option<Vec<u32>> {
     let chars: Vec<char> = s.chars().collect();
     let mut out: Vec<u32> = Vec::new();
-    let mut push = |v: u32, out: &mut Vec<u32>| {
+    let push = |v: u32, out: &mut Vec<u32>| {
         if v <= 255 {
             out.push(v);
         }

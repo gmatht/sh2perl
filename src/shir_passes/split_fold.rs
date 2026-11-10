@@ -1,5 +1,5 @@
 //! Trivial IFS word-split elimination: `split[e]` → `e` when `e` is
-//! PROVABLY free of IFS whitespace.
+//! PROVABLY free of IFS whitespace **and PROVABLY NON-EMPTY**.
 //!
 //! An unquoted expansion in bash yields the value's words; when the
 //! value provably contains no IFS whitespace (space/tab/newline — the
@@ -8,6 +8,27 @@
 //! semantics, not about any backend, which is why the rewrite lives in
 //! the shared shIR→shIR layer: every renderer (C, Perl, Go, Rust, the
 //! ESTree/JS path, …) inherits it without its own fold.
+//!
+//! **The non-emptiness half is not decoration.** `split(w)` = `w` holds
+//! for a no-space `w` only when `w` is NON-EMPTY: an unquoted EMPTY
+//! expansion is ZERO fields, while the bare word is ONE empty field. The
+//! pre-fix rule folded on whitespace-freedom alone, so it collapsed the
+//! two spellings bash tells apart — MEASURED 2026-11-05 as BYTE-IDENTICAL
+//! shIR before the fix:
+//!
+//! ```text
+//!     z="";  set -- $z        bash 0 words    IR  ["--", Str ""]
+//!     z="";  set -- "$z"      bash 1 word     IR  ["--", Str ""]
+//!     x="";  set -- $x a      bash 1 word     IR  ["--", Str "", Str "a"]
+//!            set -- "" a      bash 2 words    IR  ["--", Str "", Str "a"]
+//! ```
+//!
+//! With the fold gated on non-emptiness the `split` marker survives on the
+//! unquoted spelling and is absent from the quoted one, so the marker IS
+//! the quotedness bit the renderer needs (`c_expand_order.rs` §6: the
+//! collapse is an impossibility on the IR WITHOUT the marker, and exactness
+//! WITH it). Same fix in the `for w in $x` arm: a no-space variable that is
+//! empty at runtime iterates ZERO times, not once with an empty word.
 //!
 //! The ESTree renderer already folds this at render time from the same
 //! evidence (`expr_known_nospace` + the custom-IFS gate in
@@ -125,6 +146,40 @@ fn whitespace_free(s: &str) -> bool {
         .any(|c| c == ' ' || c == '\t' || c == '\n' || c == '\r')
 }
 
+/// Is `e`'s value provably NON-EMPTY?
+///
+/// This is the second half of the fold's licence. Every arm is a shape whose
+/// rendered value can never be the empty string:
+///   - a non-empty literal;
+///   - an integer / arithmetic result (canonical decimal text — the same
+///     `Int`-verdict family `expr_nospace` trusts for whitespace-freedom);
+///   - `${#x}`, a length, likewise decimal;
+///   - a template literal with at least one non-empty part;
+///   - `getVar(v)` of a var with an A2 `Int` verdict (canonical decimal).
+/// A nospace STRING variable is deliberately NOT here: the verdict proves its
+/// text has no blanks, never that it is non-empty — `z=""` is exactly that
+/// case, and folding it is the measured bug.
+fn expr_nonempty(e: &IrExpr, tagged: &HashSet<String>, int_vars: &HashSet<String>) -> bool {
+    match e {
+        IrExpr::Str(s, _) => !s.is_empty(),
+        IrExpr::Int(_) => true,
+        // Decimal text, never empty (an aborting arith yields no word list).
+        IrExpr::Arith(_) | IrExpr::BinOp { .. } => true,
+        IrExpr::Var(name, _) | IrExpr::Ident(name) => int_vars.contains(name),
+        IrExpr::Interpolate(parts) => parts.iter().any(|p| match p {
+            InterpPart::Lit(s) => !s.is_empty(),
+            InterpPart::Expr(x) => expr_nonempty(x, tagged, int_vars),
+        }),
+        IrExpr::Call { func, args } => match func.as_str() {
+            "getVar" => matches!(args.first(), Some(IrExpr::Str(n, _)) if int_vars.contains(n)),
+            "arith" => true,
+            "param" => matches!(args.first(), Some(IrExpr::Str(op, _)) if op == "len"),
+            _ => false,
+        },
+        _ => false,
+    }
+}
+
 /// Is `e`'s value provably free of IFS whitespace? (Local mirror of
 /// `shir.rs::expr_nospace`, keyed on this pass's tag set.)
 fn expr_nospace(e: &IrExpr, tagged: &HashSet<String>) -> bool {
@@ -180,7 +235,14 @@ fn fold_expr(e: &mut IrExpr, f: &mut Fold, elem_of: Option<&str>) {
             // other array keeps the split so its string-store evidence
             // — and its string-array slice rendering — survive.
             let elem_ok = elem_of.map(|n| f.int_vars.contains(n)).unwrap_or(true);
-            if func == "split" && elem_ok && args.len() == 1 && expr_nospace(&args[0], f.tagged) {
+            // BOTH halves of the licence: no IFS whitespace AND non-empty.
+            // Whitespace-freedom alone collapses an empty unquoted expansion
+            // (zero fields) onto a bare word (one empty field) — see the
+            // module doc's measured table.
+            let foldable = args.len() == 1
+                && expr_nospace(&args[0], f.tagged)
+                && expr_nonempty(&args[0], f.tagged, f.int_vars);
+            if func == "split" && elem_ok && foldable {
                 let inner = args.remove(0);
                 *e = inner;
                 f.changed = true;
@@ -464,10 +526,14 @@ mod tests {
         ));
     }
 
-    /// A pre-populated `var_nospace` verdict (the shared analysis's own
-    /// output) tags the var: non-Int numeric-text vars fold too.
+    /// A `var_nospace` verdict is NOT a licence on its own: the verdict says
+    /// the text has no blanks, never that it is non-empty, and an EMPTY
+    /// unquoted expansion is zero fields while the bare word is one. MEASURED
+    /// 2026-11-05 (`z=""; set -- $z` was C 1 word / bash 0 — and the quoted
+    /// `set -- "$z"` lowered byte-identically, so the fold destroyed the only
+    /// bit that told the spellings apart). The split must survive.
     #[test]
-    fn uses_var_nospace_verdict() {
+    fn nospace_is_not_nonempty() {
         let mut p = prog(&format!(r#"{HEAD}]}}"#));
         p.var_nospace.push(("seed_txt".to_string(), true));
         p.var_nospace.push(("plain_txt".to_string(), false));
@@ -478,15 +544,45 @@ mod tests {
                 args: vec![IrExpr::Str("seed_txt".to_string(), crate::ir::StrStyle::DoubleQuoted)],
             }],
         }));
-        assert!(fold_trivial_splits(&mut p));
+        assert!(
+            !fold_trivial_splits(&mut p),
+            "a nospace STRING var may be empty: its split is not a no-op"
+        );
+        assert!(matches!(
+            &p.stmts[0],
+            IrStmt::Expr(IrExpr::Call { func, .. }) if func == "split"
+        ));
+    }
+
+    /// An EMPTY literal keeps its split: `set -- $x` with `x=""` is ZERO
+    /// positionals, `set -- ""` is ONE (MEASURED 2026-11-05).
+    #[test]
+    fn keeps_split_of_empty_literal() {
+        let mut p = prog(&format!(r#"{HEAD}]}}"#));
         p.stmts.push(IrStmt::Expr(IrExpr::Call {
             func: "split".to_string(),
-            args: vec![IrExpr::Call {
-                func: "getVar".to_string(),
-                args: vec![IrExpr::Str("plain_txt".to_string(), crate::ir::StrStyle::DoubleQuoted)],
-            }],
+            args: vec![IrExpr::Str(String::new(), crate::ir::StrStyle::DoubleQuoted)],
         }));
         assert!(!fold_trivial_splits(&mut p));
+    }
+
+    /// A non-empty part PROVES the word non-empty: `"a$i"` never yields the
+    /// empty string, so its split is still a no-op.
+    #[test]
+    fn folds_split_with_a_nonempty_part() {
+        let mut p = prog(&format!(r#"{HEAD}]}}"#));
+        p.var_types.push(("i".to_string(), IrType::Int));
+        p.stmts.push(IrStmt::Expr(IrExpr::Call {
+            func: "split".to_string(),
+            args: vec![IrExpr::Interpolate(vec![
+                InterpPart::Lit("a".to_string()),
+                InterpPart::Expr(Box::new(IrExpr::Call {
+                    func: "getVar".to_string(),
+                    args: vec![IrExpr::Str("i".to_string(), crate::ir::StrStyle::DoubleQuoted)],
+                })),
+            ])],
+        }));
+        assert!(fold_trivial_splits(&mut p));
     }
 
     /// A program that may set a custom IFS never folds.
@@ -613,51 +709,53 @@ mod tests {
         ));
     }
 
-    /// End-to-end funnel wiring (the generalisation): until now the pass
-    /// had NO caller in this tree, so every backend received provably
-    /// no-op `split[e]` nodes. `ast_to_ir` — the single funnel all
-    /// backends share — now folds them, while raw lowering (the pinned
-    /// `F(S)_raw` boundary) still carries the marker untouched, and a
-    /// var with no whitespace-free verdict keeps its split.
+    /// End-to-end funnel wiring: `ast_to_ir` — the single funnel all
+    /// backends share — folds provably no-op splits, while raw lowering
+    /// (the pinned `F(S)_raw` boundary) still carries the marker untouched.
+    /// The FOLDING set is now the non-empty shapes only: a no-space STRING
+    /// var may still be empty, and its split is the marker that keeps
+    /// `set -- $x` (zero words) apart from `set -- "$x"` (one).
     #[test]
     fn ast_to_ir_folds_trivial_splits_at_the_shared_funnel() {
+        fn dump(prog: &IrProgram) -> String {
+            prog.stmts
+                .iter()
+                .map(|s| format!("{s:?}"))
+                .collect::<Vec<_>>()
+                .join("\n")
+        }
+
+        // (a) the marker exists before the fold
         let src = "x=abc\necho $x\n";
         let raw_cmds = crate::Parser::new(src).parse().expect("parse");
-        let raw = crate::shir::ast_to_ir_raw(&raw_cmds);
-        let raw_text = raw
-            .stmts
-            .iter()
-            .map(|s| format!("{s:?}"))
-            .collect::<Vec<_>>()
-            .join("\n");
+        let raw_text = dump(&crate::shir::ast_to_ir_raw(&raw_cmds));
         assert!(
             raw_text.contains("func: \"split\""),
             "sanity: the split marker must exist before the fold: {raw_text}"
         );
 
-        let cmds = crate::Parser::new(src).parse().expect("parse");
-        let prog = crate::shir::ast_to_ir(&cmds);
-        let text = prog
-            .stmts
-            .iter()
-            .map(|s| format!("{s:?}"))
-            .collect::<Vec<_>>()
-            .join("\n");
+        // (b) …and SURVIVES on the MEASURED shape: an unquoted expansion of
+        // an empty value, which is ZERO fields (the fold made it one, and
+        // the quoted `set -- "$x"` lowered identically, so no renderer could
+        // tell them apart).
+        let cmds = crate::Parser::new("x=\"\"\nset -- $x\n").parse().expect("parse");
+        let text = dump(&crate::shir::ast_to_ir(&cmds));
         assert!(
-            !text.contains("func: \"split\""),
-            "no-op split survived the ast_to_ir funnel: {text}"
+            text.contains("func: \"split\""),
+            "the split of a possibly-empty word was folded: {text}"
         );
 
-        // No verdict for a runtime var → the split must survive (the
-        // conservative direction the module doc promises).
+        // (c) a provably NON-EMPTY word still folds at the funnel
+        let cmds = crate::Parser::new("echo $((1+2))\n").parse().expect("parse");
+        let text = dump(&crate::shir::ast_to_ir(&cmds));
+        assert!(
+            !text.contains("func: \"split\""),
+            "a decimal arith word kept its no-op split: {text}"
+        );
+
+        // (d) no verdict for a runtime var → the split survives
         let cmds = crate::Parser::new("echo $x\n").parse().expect("parse");
-        let prog = crate::shir::ast_to_ir(&cmds);
-        let text = prog
-            .stmts
-            .iter()
-            .map(|s| format!("{s:?}"))
-            .collect::<Vec<_>>()
-            .join("\n");
+        let text = dump(&crate::shir::ast_to_ir(&cmds));
         assert!(
             text.contains("func: \"split\""),
             "an unprovable split was folded: {text}"
