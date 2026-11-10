@@ -13148,6 +13148,15 @@ impl Render {
                 let code = e.as_ref().map(|x| self.expr_num(x)).unwrap_or_else(|| "0".into());
                 self.emit(&format!("std::process::exit({});", i32_arg(&code)));
             }
+            IrStmt::Warn { expr, .. } => {
+                // `warn`/`carp` — the diagnostic channel. It was dropped as a
+                // TODO marker, so a lowered syntax error (the stray `)`/`}`
+                // transform emits Warn + exit 2) exited 2 with no message.
+                // bash also prefixes `$0: line N:` and echoes the offending
+                // line; the IR carries neither, so that part stays missing.
+                let m = self.expr_str(expr);
+                self.emit(&format!("eprintln!(\"{{}}\", {m});"));
+            }
             IrStmt::Return(e) => {
                 if self.in_function {
                     // user-function VALUE return (strings are the value
