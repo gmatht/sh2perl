@@ -8,14 +8,23 @@ session I32Provable in I32Provable = HOL +
   theories
     I32Provable
 
-(* CHECKED 2026-11-09 (BigIntRange 58 s, IntervalFloor 5:16, both
-   `quick_and_dirty = false`). The recorded `OF: no unifiers` was the LEMMA
-   SHAPE, not the goal: `mod_pos_bounds`/`mod_neg_bounds` carried their guard
-   (`0 < r0`, `r1 < 0`) in the conclusion as a `\<Longrightarrow>`, so the call
-   sites' third `OF` fact had no premise to unify with. The guards are real
-   assumptions now, and the two goals state the bound over `v1 mod v2` — the
-   dividend the lemma bounds — which `ev: v = v1 mod v2` then transfers to
-   `v`. *)
+(* CHECKED 2026-11-10, re-driven from source:
+
+     isabelle build -f -D . -b -o quick_and_dirty=false BigIntRange
+
+   (the `-f` matters: without it an up-to-date image makes the build a
+   no-op, which reads green without checking anything). BigIntRange 33 s,
+   IntervalFloor 4:07 on top of it, 19:30 wall including the Pure/HOL
+   parents — all `quick_and_dirty = false`. The 2026-11-09 run of the same
+   command took 58 s / 5:16; both dates are green, the difference is load.
+
+   History of the one red claim this session ever carried: the recorded
+   `OF: no unifiers` was the LEMMA SHAPE, not the goal. `mod_pos_bounds`/
+   `mod_neg_bounds` carried their guard (`0 < r0`, `r1 < 0`) in the
+   conclusion as a `\<Longrightarrow>`, so the call sites' third `OF` fact had
+   no premise to unify with. The guards are real assumptions now, and the
+   two goals state the bound over `v1 mod v2` — the dividend the lemma
+   bounds — which `ev: v = v1 mod v2` then transfers to `v`. *)
 session BigIntRange in BigIntRange = HOL +
   options [quick_and_dirty = false]
   theories

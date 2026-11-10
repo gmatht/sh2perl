@@ -297,3 +297,14 @@ had no premise to unify with (`OF: no unifiers`). The guards are assumptions
 now and both goals state the bound over `v1 mod v2`, which `ev: v = v1 mod v2`
 transfers to `v`. Measured from source: BigIntRange 58 s, IntervalFloor
 5:16, both `quick_and_dirty = false`.
+
+Re-driven 2026-11-10, `isabelle build -f -D . -b -o quick_and_dirty=false
+BigIntRange`: BigIntRange 33 s, IntervalFloor 4:07, 19:30 wall including
+Pure/HOL (`-f` is required — an up-to-date image turns the build into a
+no-op that reports nothing). Two things bit this run and are worth
+knowing: `ISABELLE_HEAPS` is a derived path in Isabelle2025 and setting it
+does **not** redirect a build (the writable knob is
+`ISABELLE_HEAPS_USER`), so the images below went to the shared
+`~/.isabelle` heaps as usual; and a concurrent worker rebuilding the same
+images aborts the run with `SQLITE_READONLY_DBMOVED` after `Pure` — the
+retry is not a proof failure. The session itself never failed.
