@@ -2027,10 +2027,116 @@ impl Render {
     }
 
     /// Native python arithmetic from ArithAst (the numeric path).
+    /// Bind the arith-string forms the AST has no node for before the text
+    /// is parsed: `$( … )` command substitutions become an atoi'd capture,
+    /// and `$N` positionals become a bound name. The general `$name`
+    /// normalization strips the `$`, which would silently turn `$1` into the
+    /// literal 1 and `$(wc -l < f)` into unparseable shell text.
+    fn arith_bind(&mut self, s: &str) -> String {
+        let b: Vec<char> = s.chars().collect();
+        let mut out = String::new();
+        let mut i = 0;
+        while i < b.len() {
+            if b[i] == '$' && i + 1 < b.len() {
+                let digit = b[i + 1].is_ascii_digit().then(|| b[i + 1]);
+                // `$( … )` — balanced scan (the body may nest parens)
+                if b[i + 1] == '(' {
+                    let mut depth = 0i32;
+                    let mut close = None;
+                    let mut j = i + 1;
+                    while j < b.len() {
+                        match b[j] {
+                            '(' => depth += 1,
+                            ')' => {
+                                depth -= 1;
+                                if depth == 0 {
+                                    close = Some(j);
+                                    break;
+                                }
+                            }
+                            _ => {}
+                        }
+                        j += 1;
+                    }
+                    if let Some(close) = close {
+                        let inner: String = b[i + 2..close].iter().collect();
+                        let name = format!("__sh_a{}", self.cap_counter);
+                        self.cap_counter += 1;
+                        self.written.insert(name.clone());
+                        self.need_subprocess = true;
+                        self.need_atoi = true;
+                        let ident = self.py_ident(&name);
+                        let (env, pos) = (self.bash_env(), self.bash_pos());
+                        // kept as TEXT: an EMPTY capture is an arithmetic
+                        // syntax error in bash (`$(( $(echo) + 1 ))`), not
+                        // the 0 an atoi'd binding would yield.
+                        self.emit(&format!(
+                            "{ident} = __sh_bash({}, {pos}, {env}).stdout.decode().strip()",
+                            Self::py_str(&inner)
+                        ));
+                        out.push_str(&name);
+                        i = close + 1;
+                        continue;
+                    }
+                }
+                // `$N` / `${N}` — a positional. bash reads ONE digit for
+                // the bare form (`$12` is `${1}2`).
+                let (num, skip) = match (digit, b[i + 1] == '{') {
+                    (Some(d), _) => (d.to_digit(10).unwrap() as usize, 2),
+                    (None, true) => {
+                        match b[i + 2..].iter().position(|&c| c == '}') {
+                            Some(off) => {
+                                let inner: String = b[i + 2..i + 2 + off].iter().collect();
+                                if !inner.is_empty()
+                                    && inner.chars().all(|c| c.is_ascii_digit())
+                                {
+                                    (inner.parse().unwrap_or(0), off + 3)
+                                } else {
+                                    (0, 0)
+                                }
+                            }
+                            None => (0, 0),
+                        }
+                    }
+                    _ => (0, 0),
+                };
+                if num > 0 {
+                    let name = format!("__sh_p{num}");
+                    if !self.written.contains(&name) {
+                        self.written.insert(name.clone());
+                        self.need_sys = true;
+                        let ident = self.py_ident(&name);
+                        let read = if self.in_function > 0 {
+                            let j = num - 1;
+                            format!("(_sh_args[{j}] if len(_sh_args) > {j} else \"\")")
+                        } else {
+                            format!("(sys.argv[{num}] if len(sys.argv) > {num} else \"\")")
+                        };
+                        self.emit(&format!("{ident} = {read}"));
+                    }
+                    out.push_str(&name);
+                    i += skip;
+                    continue;
+                }
+            }
+            out.push(b[i]);
+            i += 1;
+        }
+        out
+    }
+
     fn arith(&mut self, a: &ArithAst) -> String {
         match a {
             ArithAst::Num(n) => n.to_string(),
             ArithAst::Var(name) | ArithAst::Ident(name) => {
+                // a bound arithmetic operand (a positional or a capture
+                // bound by arith_bind): bash substitutes it TEXTUALLY, so
+                // an empty value leaves a syntax error (`$(( $1 + 0 ))`
+                // with no $1 is `+ 0`), which aborts the expansion.
+                if name.starts_with("__sh_p") || name.starts_with("__sh_a") {
+                    self.need_strict = true;
+                    return format!("__sh_arith_operand({})", self.py_ident(name));
+                }
                 // bash coerces arith operands to integers; python would
                 // string-repeat/double a str loop var, so wrap the read.
                 // (int() of an int-typed var is a no-op.) A positional
@@ -3610,7 +3716,8 @@ impl Render {
             // arith("$i") — the imperative frontends' arith-text reads; the
             // common `$name` form is a native int() read of the binding.
             "arith" => {
-                if let Some(IrExpr::Str(s, _)) = args.first() {
+                if let Some(IrExpr::Str(raw, _)) = args.first() {
+                    let s = &self.arith_bind(raw);
                     if let Some(name) = s.strip_prefix('$') {
                         if Self::is_plain_name(name) && !self.store_written.contains(name) {
                             return format!("int({})", self.py_ident(name));
@@ -4207,6 +4314,21 @@ impl Render {
     /// None when no path covers it (the caller stubs). Covers the
     /// all-shell fast path and the native-echo-head mixed path (shared
     /// by the expression `"pipeline"` arm and the statement
+    /// A scalar assignment RHS: the frontend's `captureWords` form (word
+    /// splicing) belongs to an unquoted command position, not to a target —
+    /// bash assigns the capture TEXT (`local size=`wc -c < f`` must not
+    /// become the one-element list `['161']` in "has $size bytes").
+    fn scalar_rhs(&mut self, e: &IrExpr) -> String {
+        if let IrExpr::Call { func, args } = e {
+            if func == "captureWords" {
+                if let Some(inner) = args.first() {
+                    return self.expr(inner);
+                }
+            }
+        }
+        self.expr(e)
+    }
+
     /// `IrStmt::Pipeline` arm).
     /// Normalize pipeline stages for the shared helpers: flatten `( … )`
     /// subshell wrappers (their stdout is the stage's) and rewrite the
@@ -4623,6 +4745,26 @@ impl Render {
                             continue;
                         }
                     }
+                    // a command chain: `$(stat -c%s f 2>/dev/null || wc -c
+                    // < f)` — each side is a plain command or a
+                    // redirect-wrapped one.
+                    if let IrExpr::BinOp { op, lhs, rhs } = e {
+                        let op_s = match op {
+                            crate::ir::BinOpKind::And => "&&",
+                            crate::ir::BinOpKind::Or => "||",
+                            _ => return None,
+                        };
+                        let l = self.body_shell_text(&[IrStmt::Expr((**lhs).clone())])?;
+                        let r = self.body_shell_text(&[IrStmt::Expr((**rhs).clone())])?;
+                        return Some(format!("{l} {op_s} {r}"));
+                    }
+                    // a redirect-wrapped command in the Call dialect
+                    // (`stat -c%s f 2>/dev/null`): rewrite it to the
+                    // statement shape the Redirect arm below texts.
+                    if matches!(e, IrExpr::Call { func, .. } if func == "redirect") {
+                        let conv = self.stage_dialect_list(std::slice::from_ref(st))?;
+                        return self.body_shell_text(&conv);
+                    }
                     return None;
                 }
                 IrStmt::Assign { targets, expr, .. } => {
@@ -4924,10 +5066,18 @@ impl Render {
                 None => sym.to_string(),
             });
         }
+        // keep the descriptor: `2>/dev/null` is stderr, not stdout —
+        // dropping the fd sends the child's diagnostics to the caller's
+        // stdout instead of discarding them (`dd … 2>/dev/null`).
+        let prefix = match (&fd, mode.as_str()) {
+            (Some(n), "w") | (Some(n), "a") if n != "1" => n.clone(),
+            (Some(n), "r") if n != "0" => n.clone(),
+            _ => String::new(),
+        };
         Some(match mode.as_str() {
-            "w" => format!(">{t}"),
-            "a" => format!(">>{t}"),
-            "r" => format!("<{t}"),
+            "w" => format!("{prefix}>{t}"),
+            "a" => format!("{prefix}>>{t}"),
+            "r" => format!("{prefix}<{t}"),
             "herestring" => format!("<<<{t}"),
             _ => return None,
         })
@@ -6130,7 +6280,13 @@ impl Render {
                     // guess would stub the whole statement; a stray word
                     // here is a core shape we do not model).
                     if cur_name.is_some() {
-                        cur_parts.push(self.expr(it));
+                        // declaration assignments do not field-split either:
+                        // `local size=`wc -c < f`` is the text, not a word
+                        // list (`local arr=($(…))` takes the array path).
+                        let is_decl_value = cur_name.is_some();
+                        if is_decl_value {
+                            cur_parts.push(self.scalar_rhs(it));
+                        }
                     }
                 }
             }
@@ -7003,10 +7159,11 @@ impl Render {
                 let rhs = if self.is_num(&t.var) {
                     self.expr_as_num(expr)
                 } else {
-                    // bash does NOT field-split a capture in an assignment
-                    // (`size=$(wc -c < f)` is the text, not a word list).
                     match expr {
                         IrExpr::Call { func, args } if func == "captureWords" => {
+                            // bash does NOT field-split a capture in an
+                            // assignment (`size=$(wc -c < f)` is the text,
+                            // not a word list).
                             match args.first() {
                                 Some(inner) => self.expr(inner),
                                 None => self.expr(expr),
@@ -7058,7 +7215,7 @@ impl Render {
                     .iter()
                     .filter(|d| !self.store_written.contains(&d.name))
                     .collect();
-                let init_expr = init.as_ref().map(|e| self.expr(e));
+                let init_expr = init.as_ref().map(|e| self.scalar_rhs(e));
                 if vars.len() > 1 && init_expr.is_some() {
                     let names: Vec<String> =
                         vars.iter().map(|d| self.py_ident(&d.name)).collect();
@@ -7908,10 +8065,18 @@ impl Render {
                         let mut rtexts = Vec::new();
                         let mut ok = true;
                         for r in redirects {
-                            let obj = IrExpr::Object(vec![
+                            // keep the descriptor: `2>/dev/null` discards
+                            // stderr, and without the fd it would become a
+                            // stdout redirect (`dd … 2>/dev/null` leaked its
+                            // record counts into stdout-as-captured output).
+                            let mut props = vec![
                                 ("mode".to_string(), IrExpr::Str(r.mode.clone(), crate::ir::StrStyle::DoubleQuoted)),
                                 ("target".to_string(), r.target.clone()),
-                            ]);
+                            ];
+                            if let Some(fd) = r.fd {
+                                props.push(("fd".to_string(), IrExpr::Int(fd as i64)));
+                            }
+                            let obj = IrExpr::Object(props);
                             match self.redirect_shell_text(&obj) {
                                 Some(t) => rtexts.push(t),
                                 None => {
@@ -8265,6 +8430,9 @@ impl Render {
             self.emit("def __sh_cap(argv, env):");
             self.emit("    import subprocess");
             self.emit("    global __sh_rc");
+            // shell words are STRINGS: an arithmetic-derived argument
+            // (`echo $(( $(wc -l < f) + 1 ))`) arrives as a python int.
+            self.emit("    argv = [str(a) for a in argv]");
             self.emit("    try:");
             self.emit("        out = subprocess.check_output(argv, env=env)");
             self.emit("        __sh_rc = 0");
@@ -8503,6 +8671,13 @@ impl Render {
             self.emit("        return int(str(s).strip(), 10)");
             self.emit("    except ValueError:");
             self.emit("        return 0");
+            self.emit("");
+            // an arithmetic operand ($1 / $( … ) inside `$(( ))`): empty is
+            // a syntax error there, not the 0 a bare name reads as.
+            self.emit("def __sh_arith_operand(s):");
+            self.emit("    if not str(s).strip():");
+            self.emit("        raise ValueError(\"operand expected\")");
+            self.emit("    return __sh_atoi(s)");
             self.emit("");
         }
         if self.need_echo_e {
