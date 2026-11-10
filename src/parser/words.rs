@@ -6050,3 +6050,133 @@ mod colon_operator_tests {
         }
     }
 }
+
+/// Regression pins for the `$$` distinguishability case the AST gate tracks
+/// (`harness/check_ast.pl`: `ast_dollardollar_arg_boundary` /
+/// `ast_dollardollar_word_internal`, and the behaviour cases
+/// `beh_dollardollar_spaced_pid` / `beh_dollardollar_internal`).
+///
+/// THE PROPERTY: `echo x $$` and `echo x$$` are DIFFERENT commands — bash
+/// prints `x 1234` and `x1234`. The difference is decided by the word-boundary
+/// rule alone (whitespace = boundary, byte-adjacency = one word), and the
+/// model of that rule with both mechanisms proved is
+/// `proofs/verus/word_boundary.rs` (14 obligations). These tests are the tie
+/// from the model to the live parser: the same counts, on the real AST.
+///
+/// The boundary was once decided by neither mechanism — `$$` was cut off the
+/// end of whatever word it was written in, so both sources arrived as
+/// `[Literal("x"), Variable("$")]` and the renderers had no way to print the
+/// right thing for both. These pin the fixed shape, so a regression there is a
+/// red test rather than a wrong program.
+#[cfg(test)]
+mod word_boundary_tests {
+    use crate::ast::{Command, StringPart, Word};
+    use crate::parser::commands::Parser;
+
+    fn args(src: &str) -> Vec<Word> {
+        match Parser::new(src).parse().expect("parses") {
+            mut cmds => {
+                assert_eq!(cmds.len(), 1, "{src}: one command");
+                match cmds.remove(0) {
+                    Command::Simple(sc) => sc.args,
+                    other => panic!("{src}: expected a simple command, got {other:?}"),
+                }
+            }
+        }
+    }
+
+    /// The pid expansion is `Variable("$")` as a PART of the word, in both
+    /// shapes — the difference is where the word ends.
+    fn pid_parts(w: &Word) -> Option<Vec<StringPart>> {
+        match w {
+            Word::StringInterpolation(interp, _) => Some(interp.parts.clone()),
+            _ => None,
+        }
+    }
+
+    /// THE case: one word vs two, and the two argument vectors differ.
+    #[test]
+    fn glued_and_spaced_pid_are_different_commands() {
+        let spaced = args("echo x $$");
+        assert_eq!(spaced.len(), 2, "`echo x $$` is two args: {spaced:?}");
+        assert_eq!(spaced[0], Word::Literal("x".to_string(), None));
+        assert!(
+            matches!(&spaced[1], Word::Variable(name, _, _) if name == "$"),
+            "the second arg is the PID expansion, got {:?}",
+            spaced[1]
+        );
+
+        let glued = args("echo x$$");
+        assert_eq!(glued.len(), 1, "`echo x$$` is ONE arg: {glued:?}");
+        let parts = pid_parts(&glued[0]).expect("the glued word is an interpolation");
+        assert_eq!(
+            parts,
+            vec![
+                StringPart::Literal("x".to_string()),
+                StringPart::Variable("$".to_string()),
+            ],
+            "the pid stays inside the word, after the literal"
+        );
+
+        // The claim the AST gate makes, stated as the parser's own output: the
+        // two sources cannot share an argument list.
+        assert_ne!(
+            spaced.len(),
+            glued.len(),
+            "`x $$` and `x$$` must not be indistinguishable"
+        );
+        let text = |v: &[Word]| v.iter().map(|w| w.to_string()).collect::<Vec<_>>().join(" ");
+        assert_ne!(text(&spaced), text(&glued), "nor may they print the same");
+    }
+
+    /// The boundary is whitespace, not one literal space byte: any run of
+    /// blanks separates the pid just as `$$`-glued keeps it.
+    #[test]
+    fn any_whitespace_separates_the_pid() {
+        for src in ["echo x  $$", "echo x\t$$", "echo x\t  $$"] {
+            let a = args(src);
+            assert_eq!(a.len(), 2, "{src} is two args: {a:?}");
+            assert!(matches!(&a[1], Word::Variable(name, _, _) if name == "$"));
+        }
+        // …and no whitespace at all is the fused form.
+        for src in ["echo x$$", "echo x$$/suffix"] {
+            let a = args(src);
+            assert_eq!(a.len(), 1, "{src} is ONE arg: {a:?}");
+            assert!(pid_parts(&a[0]).is_some(), "{src} is an interpolation: {a:?}");
+        }
+    }
+
+    /// The same rule governs a redirect TARGET: `/tmp/t.$$` is one word whose
+    /// tail is the pid, so no `Variable("$")` may escape into the args.
+    #[test]
+    fn a_pid_stays_inside_a_redirect_target() {
+        let cmds = Parser::new("echo hi > /tmp/t.$$").parse().expect("parses");
+        assert_eq!(cmds.len(), 1);
+        let (args, redirects) = match &cmds[0] {
+            Command::Redirect(rc) => {
+                let Command::Simple(sc) = rc.command.as_ref() else {
+                    panic!("expected a simple command inside the redirect: {:?}", cmds[0]);
+                };
+                (&sc.args, &rc.redirects)
+            }
+            Command::Simple(sc) => (&sc.args, &sc.redirects),
+            other => panic!("expected a redirect, got {other:?}"),
+        };
+        assert_eq!(args.len(), 1, "only `hi` is an argument: {args:?}");
+        assert!(
+            !args.iter().any(|w| matches!(w, Word::Variable(name, _, _) if name == "$")),
+            "the pid did not leak out of the target: {args:?}"
+        );
+        assert_eq!(redirects.len(), 1, "{redirects:?}");
+        let parts = pid_parts(&redirects[0].target)
+            .expect("the target is an interpolation, not a bare `$` arg");
+        assert_eq!(
+            parts,
+            vec![
+                StringPart::Literal("/tmp/t.".to_string()),
+                StringPart::Variable("$".to_string()),
+            ],
+            "the pid is the tail of the target"
+        );
+    }
+}
