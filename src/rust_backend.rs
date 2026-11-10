@@ -2764,6 +2764,27 @@ fn mentions_ident(line: &str, name: &str) -> bool {
 /// between a `fn __sh_*` signature and its closing brace at column 0, so
 /// no emitted statement can be touched; `// TODO(` is kept — it is the
 /// renderer's own signal, not prose.
+/// Every helper's RENDERED `fn` name, read out of the registry (`HELPER_ORDER`
+/// × `helper_source`) rather than out of generated text. The ONE derivation
+/// shared by [`prune_unused_helpers`] and the registry test: a helper shape the
+/// parse cannot read (`pub fn`, an attribute line, a non-`fn` body) is either
+/// pruned correctly or fails that test loudly — it can no longer be a silent
+/// miss, and pruning never has to guess from the emitted program.
+fn helper_rendered_names() -> Vec<String> {
+    HELPER_ORDER
+        .iter()
+        .filter_map(|h| {
+            let src = helper_source(h);
+            let name: String = src
+                .strip_prefix("fn ")?
+                .chars()
+                .take_while(|c| c.is_ascii_alphanumeric() || *c == '_')
+                .collect();
+            (!name.is_empty()).then_some(name)
+        })
+        .collect()
+}
+
 fn strip_helper_comments(text: String) -> String {
     let mut out: Vec<&str> = Vec::new();
     let mut in_helper = false;
@@ -2790,18 +2811,7 @@ fn prune_unused_helpers(text: String) -> String {
     // `helper_source` is empty (or whose name has no `fn __sh_` prefix)
     // is skipped; the two-word `print_words` variants both render
     // `__sh_print_words`, which the duplicate-tolerant scan handles.
-    let helper_names: Vec<String> = HELPER_ORDER
-        .iter()
-        .filter_map(|h| {
-            let src = helper_source(h);
-            let name: String = src
-                .strip_prefix("fn ")?
-                .chars()
-                .take_while(|c| c.is_ascii_alphanumeric() || *c == '_')
-                .collect();
-            (!name.is_empty()).then_some(name)
-        })
-        .collect();
+    let helper_names = helper_rendered_names();
     let helpers: Vec<&str> = helper_names.iter().map(|s| s.as_str()).collect();
     // multi-pass: a helper pruned in pass N may orphan another helper
     // whose only caller was the pruned one — pass N+1 picks it up.
@@ -22018,6 +22028,41 @@ mod tests {
     /// literal `add_helper("…")` and require it to be registered AND to have
     /// a body — neither half alone catches the trap.
     #[test]
+    /// The prune pass and the registry must agree on every rendered name:
+    /// a body the name parser cannot read would leave dead code in every
+    /// generated program (or, worse, prune a live one), and a new helper
+    /// shape used to be able to slip through silently.
+    #[test]
+    fn every_helper_body_parses_to_a_prunable_name() {
+        let names = super::helper_rendered_names();
+        assert!(
+            names.len() >= 60,
+            "only {} rendered helper names — the derivation regressed",
+            names.len()
+        );
+        for n in &names {
+            assert!(
+                n.starts_with("__sh_"),
+                "rendered helper name `{n}` is outside the __sh_ namespace"
+            );
+        }
+        // every KEY the backend requests must render exactly the name its
+        // call sites use: `add_helper("capture_rc")` calls `__sh_capture_rc`
+        for (at, _) in include_str!("rust_backend.rs").match_indices("add_helper(\"") {
+            let src = &include_str!("rust_backend.rs")[at..];
+            let rest = &src["add_helper(\"".len()..];
+            let Some(end) = rest.find('"') else { continue };
+            let key = &rest[..end];
+            if key.is_empty() || !key.chars().all(|c| c.is_ascii_lowercase() || c == '_') {
+                continue;
+            }
+            assert!(
+                names.iter().any(|n| n == &format!("__sh_{key}")),
+                "add_helper(\"{key}\") renders no `fn __sh_{key}` the prune pass can see"
+            );
+        }
+    }
+
     fn every_requested_helper_is_registered() {
         let src = include_str!("rust_backend.rs");
         let mut names = Vec::new();

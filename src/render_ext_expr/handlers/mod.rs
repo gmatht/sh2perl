@@ -7,6 +7,7 @@
     pub(crate) mod char_extract;
     pub(crate) mod char_translate;
     pub(crate) mod clone_deep;
+    pub(crate) mod cut_at;
     pub(crate) mod cutset_trim;
     pub(crate) mod field_extract;
     pub(crate) mod field_read;

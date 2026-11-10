@@ -1128,6 +1128,17 @@ fn fold_param_const(
             if !is_literal_pattern(&p) || r.contains('&') {
                 return None;
             }
+            // AN ANCHORED PATTERN IS NOT A PLAIN REPLACE: a leading `#`
+            // anchors the match at the start and a leading `%` at the end
+            // (both anchors are leading — verified against bash:
+            // `${s/%c/X}`, s=a-b-c, gives a-b-X; `${s/x%c/X}` is
+            // unchanged). `#`/`%` are then not pattern text, so
+            // `text.find("#pat")` misses and this fold would emit the
+            // value UNCHANGED — a silent wrong answer for every backend.
+            // Refuse; the anchor belongs to the renderer.
+            if p.starts_with('#') || p.starts_with('%') {
+                return None;
+            }
             if op == "/" {
                 if let Some(i) = text.find(&p) {
                     let mut out = text.clone();

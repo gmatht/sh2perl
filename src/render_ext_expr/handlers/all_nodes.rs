@@ -923,6 +923,46 @@ pub fn affix_strip(node: &AffixStrip, ctx: &ExprRenderCtx) -> Option<String> {
     }
 }
 
+// ── CutAt ───────────────────────────────────────────────────────────
+
+/// `CutAt(text, delim, head, first)` — cut at ONE occurrence of a
+/// magic-free literal delimiter, so the glob engine is never needed.
+///
+/// The four single-star strip identities (`shir_nodes/cut_at.node`):
+///
+/// ```text
+///   head,  first   ${v%%lit*}   head before the FIRST occurrence
+///   head, !first   ${v%lit*}    head before the LAST  occurrence
+///  !head, first    ${v#*lit}    tail after   the FIRST occurrence
+///  !head, !first   ${v##*lit}   tail after   the LAST  occurrence
+/// ```
+///
+/// A no-match leaves the text unchanged (bash's strip is a no-op then).
+/// Python is the second accepting backend (rust/c render their own arms);
+/// the fold's gate must list the target as well, so this arm is only ever
+/// reached once `cut_target_ok` accepts it.
+pub fn cut_at(node: &CutAt, ctx: &ExprRenderCtx) -> Option<String> {
+    match ctx.backend {
+        Backend::Python => {
+            let text = render_child(&node.text, ctx)?;
+            let delim = py_str_lit(&node.delim);
+            let finder = if node.first { "find" } else { "rfind" };
+            // find/rfind carry the empty-delimiter identities for free:
+            // find("") == 0 and rfind("") == len(text), which is exactly
+            // the C arm's `_dl == 0` special case (head/first table).
+            let slice = if node.head {
+                "_s[:_i]".to_string()
+            } else {
+                format!("_s[_i + len({delim}):]")
+            };
+            Some(format!(
+                "(lambda _s: {slice} if (_i := _s.{finder}({delim})) >= 0 else _s)(str({text}))"
+            ))
+        }
+        _ => None,
+    }
+}
+
 // ── RegexpFind ───────────────────────────────────────────────────────
 
 pub fn regexp_find(node: &RegexpFind, ctx: &ExprRenderCtx) -> Option<String> {

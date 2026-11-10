@@ -481,11 +481,13 @@ impl Render {
                 "            if fnmatch.fnmatch(v[i:], pat):\n",
                 "                n = i; break\n",
                 "        return v[:n]\n",
-                "    # 'S' longest suffix\n",
+                "    # 'S' longest suffix: the SMALLEST i whose tail matches\n",
+                "    # (no break — the descending scan must keep overwriting n;\n",
+                "    # breaking on the first hit is the SHORTEST suffix, i.e. '%')\n",
                 "    n = len(v)\n",
                 "    for i in range(len(v)-1, -1, -1):\n",
                 "        if fnmatch.fnmatch(v[i:], pat):\n",
-                "            n = i; break\n",
+                "            n = i\n",
                 "    return v[:n]\n",
             ),
         ),
@@ -3432,7 +3434,60 @@ impl Render {
                             return format!("str(len({}))", self.py_ident(name));
                         }
                     }
-                    // `${x:-default}` — the value if non-empty else the default
+                    // `param("", NAME)` — a plain braced READ. The parser
+                    // spells `${v}` this way, and so do the shared
+                    // transforms' node operands (`AffixStrip{text:
+                    // param("",v)}`, CutAt's `text`): without this arm the
+                    // nested operand fell through to the runtime stub and
+                    // the value arrived empty. Element/subscript reads keep
+                    // their own arm below.
+                    if op.is_empty() && args.len() == 2 {
+                        if let Some(IrExpr::Str(name, _)) = args.get(1) {
+                            if Self::is_plain_name(name) && !self.store_written.contains(name) {
+                                return self.call(
+                                    "getVar",
+                                    &[IrExpr::Str(
+                                        name.to_string(),
+                                        crate::ir::StrStyle::DoubleQuoted,
+                                    )],
+                                );
+                            }
+                        }
+                    }
+                    // `${x,}` / `${x^}` — the SINGLE-CHAR case ops arrive
+                    // with the operator folded into the NAME
+                    // (`param("", "x,")`) instead of the op slot that
+                    // `^^`/`,,`/`^` use. Recover the suffix here: a shell
+                    // identifier cannot contain `,`, and a `^` in the name
+                    // slot is only ever this shape, so the reading is
+                    // unambiguous. (The parser is core/single-owner; this
+                    // normalises an already-emitted IR shape rather than
+                    // changing it.)
+                    if op.is_empty() && args.len() == 2 {
+                        if let Some(IrExpr::Str(name, _)) = args.get(1) {
+                            let suffixed = if let Some(b) = name.strip_suffix(',') {
+                                Some((b, false))
+                            } else {
+                                name.strip_suffix('^').map(|b| (b, true))
+                            };
+                            if let Some((base, upper)) = suffixed {
+                                if !base.is_empty() && Self::is_plain_name(base) {
+                                    let v = self.call(
+                                        "getVar",
+                                        &[IrExpr::Str(
+                                            base.to_string(),
+                                            crate::ir::StrStyle::DoubleQuoted,
+                                        )],
+                                    );
+                                    return if upper {
+                                        format!("({v}[:1].upper() + {v}[1:] if {v} else \"\")")
+                                    } else {
+                                        format!("({v}[:1].lower() + {v}[1:] if {v} else \"\")")
+                                    };
+                                }
+                            }
+                        }
+                    }
                     // case conversion: ${x^^} / ${x,,} / ${x^} / ${x,}
                     if op == "^^" || op == ",," || op == "^" || op == "," {
                         if let Some(IrExpr::Str(name, _)) = args.get(1) {
@@ -3455,6 +3510,8 @@ impl Render {
                             }
                         }
                     }
+                    // `${x:-default}` — the value if non-empty else the
+                    // default.
                     // `${x-default}` (no colon = unset-only) rides the same
                     // arm as `:-` (unset-or-empty): the backend cannot
                     // observe "set-but-empty" vs "unset" for env/read
@@ -3652,6 +3709,30 @@ impl Render {
                                         crate::ir::StrStyle::DoubleQuoted,
                                     )],
                                 );
+                                // ANCHORED forms: a pattern BEGINNING with
+                                // `#` anchors at the START, one beginning
+                                // with `%` at the END (both anchors are
+                                // leading — verified against bash:
+                                // `${s/%c/X}` with s=a-b-c → a-b-X,
+                                // `${s/x%c/X}` → unchanged). They are
+                                // anchors, not pattern text, so a plain
+                                // replace of "#pat" would silently miss
+                                // (and `//` makes no difference: at most
+                                // one occurrence can sit at an anchor).
+                                if let Some(pfx) = pat.strip_prefix('#') {
+                                    let p = Self::py_str(pfx);
+                                    let r = Self::py_str(repl);
+                                    return format!(
+                                        "({r} + {v}[len({p}):] if {v}.startswith({p}) else {v})"
+                                    );
+                                }
+                                if let Some(sfx) = pat.strip_prefix('%') {
+                                    let p = Self::py_str(sfx);
+                                    let r = Self::py_str(repl);
+                                    return format!(
+                                        "({v}[:len({v})-len({p})] + {r} if {v}.endswith({p}) else {v})"
+                                    );
+                                }
                                 let p = Self::py_str(pat);
                                 let r = Self::py_str(repl);
                                 let cnt = if op == "/" { "1" } else { "-1" };
@@ -8978,7 +9059,29 @@ fn collect_vars_expr(e: &IrExpr, out: &mut BTreeSet<String>) {
                 collect_vars_expr(v, out);
             }
         }
-        IrExpr::Call { args, .. } => {
+        IrExpr::Call { func, args } => {
+            // `param(OP, NAME, …)` READS its name slot: a plain `${v}`
+            // arrives this way from the parser, and so does every shared
+            // transform's `param("", v)` text operand (`AffixStrip`,
+            // `CutAt`). Without recording it the name is never hoisted to
+            // its shell default, so a read that precedes the first store
+            // became a NameError instead of the shell's ""
+            // (parse-and-or-chain-with-assign).
+            if func == "param" {
+                if let Some(IrExpr::Str(n, _)) = args.get(1) {
+                    let base = n.split('[').next().unwrap_or(n);
+                    let base = base
+                        .strip_suffix(',')
+                        .or_else(|| base.strip_suffix('^'))
+                        .unwrap_or(base);
+                    if !base.is_empty()
+                        && base.chars().next().is_some_and(|c| c.is_ascii_alphabetic() || c == '_')
+                        && base.chars().all(|c| c.is_ascii_alphanumeric() || c == '_')
+                    {
+                        out.insert(base.to_string());
+                    }
+                }
+            }
             for a in args {
                 collect_vars_expr(a, out);
             }

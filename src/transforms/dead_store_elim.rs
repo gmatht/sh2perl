@@ -632,6 +632,25 @@ fn census_expr(
                 let idx = if func == "param" { 1 } else { 0 };
                 if let Some(IrExpr::Str(n, _)) = args.get(idx) {
                     reads.insert(n.clone());
+                    // A trailing SINGLE-CHAR case operator baked into
+                    // the name slot is still a read of the plain
+                    // variable: the parser spells `${v,}` / `${v^}` as
+                    // `param("", "v,")` (the `,` joins the name), so
+                    // without this the `v=...` store is judged unread,
+                    // culled, and the value reads back empty for EVERY
+                    // backend. Conservative: only adds a read.
+                    if func == "param" {
+                        let base = n
+                            .strip_suffix(',')
+                            .or_else(|| n.strip_suffix('^'))
+                            .unwrap_or("");
+                        if !base.is_empty()
+                            && base.chars().next().is_some_and(|c| c.is_ascii_alphabetic() || c == '_')
+                            && base.chars().all(|c| c.is_ascii_alphanumeric() || c == '_')
+                        {
+                            reads.insert(base.to_string());
+                        }
+                    }
                     // An ELEMENT read (`arr[1]` — the index baked into
                     // the name) also reads the array NAME (`arr`): the
                     // `arr=(...)` setArray/DeclareArray write is live

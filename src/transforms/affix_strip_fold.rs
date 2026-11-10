@@ -37,18 +37,21 @@
 //!   go's Ext path emits a `sh2.AffixStrip(...)` stub rather than routing
 //!   to the shared handler, so it is refused until that backend accepts
 //!   the node).
-//! scope: offered to rust, java (AffixStrip) and rust, c (CutAt) —
-//!   target-gated, end-to-end verified. estree/perl/python keep their own
-//!   inline literal render (already idiomatic); sh/zig/fish/zsh/glsl/go
+//! scope: offered to rust, java, python (AffixStrip) and rust, c, python
+//!   (CutAt) — target-gated, end-to-end verified. estree/perl keep their
+//!   own inline literal render (already idiomatic); sh/zig/fish/zsh/glsl/go
 //!   refuse (no verified render arm); c refuses the AffixStrip branch
 //!   only, having no AffixStrip arm.
-//!   The star-form CutAt branch is offered to rust AND c (c renders the
-//!   same single find/rfind cut into a vbuf — that arm is what retires
-//!   `_sh_strippre`/`fnmatch` for MIMEcroft's tokenizer, ~14% of the
-//!   run's executed lines); other backends accept by adding an arm and
-//!   their target (the FieldGrab offer pattern). The Affix-star shapes
-//!   (`#lit*`, `%*lit`) reuse the existing AffixStrip arms, so java
-//!   accepts those two as before and c still refuses them.
+//!   The star-form CutAt branch is offered to rust, c AND python (c
+//!   renders the same single find/rfind cut into a vbuf — that arm is
+//!   what retires `_sh_strippre`/`fnmatch` for MIMEcroft's tokenizer,
+//!   ~14% of the run's executed lines; python renders it through the
+//!   SHARED render_ext_expr handler added with this offer — see
+//!   `render_ext_expr/handlers/cut_at.rs`); other backends accept by
+//!   adding an arm and their target (the FieldGrab offer pattern). The
+//!   Affix-star shapes (`#lit*`, `%*lit`) reuse the existing AffixStrip
+//!   arms, so java and python accept those two too and c still refuses
+//!   them.
 //! updates: none (first offer)
 //!
 //! ## Need
@@ -133,9 +136,12 @@ pub fn transform(stmts: &mut Vec<IrStmt>) -> bool {
 ///   * rust — now renders `strip_prefix`/`strip_suffix` (this change),
 ///     retiring `__sh_strippre`/`__sh_fnmatch` for literal patterns;
 ///   * java — routes Ext through render_ext_expr → startsWith/substring;
-///   * estree/perl/python already inline literals natively
-///     (startsWith/slice, s{}//r, removeprefix) — folding is neutral, so
-///     they refuse (no shape churn for no gain).
+///   * python — routes Ext through render_ext_expr → removesuffix/
+///     removeprefix (the `AffixStrip` arm), so a literal strip no longer
+///     reaches its glob strip helper;
+///   * estree/perl already inline literals natively
+///     (startsWith/slice, s{}//r) — folding is neutral, so they refuse
+///     (no shape churn for no gain).
 /// go is NOT accepted yet: its `Ext` path emits a `sh2.AffixStrip(...)`
 /// STUB (not a refusal) because the Go backend doesn't route Ext to the
 /// shared handler — folding there would emit an unrunnable call. c/sh/zig
@@ -144,7 +150,7 @@ fn fold_target_ok() -> bool {
     match crate::transforms::target() {
         // c is NOT here: it has no AffixStrip arm, only the CutAt one
         // (cut_target_ok), so an Affix branch must still refuse on c.
-        Some(t) => matches!(t.as_str(), "rs" | "rust" | "java"),
+        Some(t) => matches!(t.as_str(), "rs" | "rust" | "java" | "py" | "python"),
         None => false,
     }
 }
@@ -525,14 +531,17 @@ fn single_star_shape(p: &str) -> Option<(&str, bool)> {
 
 /// Targets whose CutAt render is VERIFIED end-to-end (rust renders
 /// find/rfind + slicing; c renders the same single find/rfind cut into
-/// a vbuf — neither drags the glob engine) AND whose current star-strip
-/// render drags the glob helper. Other backends accept by adding a
-/// render arm and their target here (the FieldGrab offer pattern).
-/// Unset target (the shir embed path / non-CLI ingress) refuses — the
-/// fold is a render-quality optimisation, never a semantic requirement.
+/// a vbuf; python renders the same find/rfind through the SHARED
+/// render_ext_expr handler — `all_nodes::cut_at`'s Python arm, which
+/// reproduces c's empty-delimiter table for free) AND whose current
+/// star-strip render drags the glob helper. Other backends accept by
+/// adding a render arm and their target here (the FieldGrab offer
+/// pattern). Unset target (the shir embed path / non-CLI ingress)
+/// refuses — the fold is a render-quality optimisation, never a
+/// semantic requirement.
 fn cut_target_ok() -> bool {
     match crate::transforms::target() {
-        Some(t) => matches!(t.as_str(), "rs" | "rust" | "c"),
+        Some(t) => matches!(t.as_str(), "rs" | "rust" | "c" | "py" | "python"),
         None => false,
     }
 }
@@ -768,8 +777,9 @@ mod tests {
     #[test]
     fn cut_forms_are_accepted_only_where_an_arm_exists() {
         // CutAt is offered per backend as render arms land (rust first,
-        // then c); the AffixStrip shapes keep their own java acceptance.
-        for t in ["rs", "rust", "c"] {
+        // then c, then python through the shared handler); the AffixStrip
+        // shapes keep their own java/python acceptance.
+        for t in ["rs", "rust", "c", "py", "python"] {
             with_target(Some(t), || {
                 let mut e = strip("%", "path", "/*");
                 assert!(expr(&mut e), "target {t} renders CutAt, must fold");
@@ -851,14 +861,38 @@ mod tests {
 
     #[test]
     fn non_affix_target_is_refused() {
-        // estree/perl/python inline literals optimally; c/sh/zig have no
-        // AffixStrip arm. All refuse — nothing changes.
-        for t in ["js", "estree", "pl", "perl", "py", "python", "c", "sh", "zig", "go"] {
+        // estree/perl inline literals optimally; c/sh/zig/go have no
+        // AffixStrip arm. All refuse — nothing changes. (python accepted
+        // with the shared handler's AffixStrip arm — see the test below.)
+        for t in ["js", "estree", "pl", "perl", "c", "sh", "zig", "go"] {
             with_target(Some(t), || {
                 let mut e = strip("#", "v", "lit");
                 let before = format!("{e:?}");
                 assert!(!expr(&mut e), "target {t} must refuse the fold");
                 assert_eq!(format!("{e:?}"), before);
+            });
+        }
+    }
+
+    #[test]
+    fn python_accepts_both_replacements() {
+        // python renders AffixStrip (removeprefix/removesuffix) and now
+        // CutAt (find/rfind through all_nodes::cut_at), so both buckets
+        // fold there — the literal/affix-star shapes and the four
+        // find/rfind identities.
+        for t in ["py", "python"] {
+            with_target(Some(t), || {
+                let mut e = strip("#", "v", "lit");
+                assert!(expr(&mut e), "{t} renders AffixStrip, must fold");
+                assert!(is_affix(&e, true, "lit"));
+
+                let mut e = strip("#", "v", "git*");
+                assert!(expr(&mut e), "{t} folds the Affix star shape");
+                assert!(is_affix(&e, true, "git"));
+
+                let mut e = strip("%", "path", "/*");
+                assert!(expr(&mut e), "{t} renders CutAt, must fold");
+                assert!(is_cut(&e, true, false, "/"));
             });
         }
     }
