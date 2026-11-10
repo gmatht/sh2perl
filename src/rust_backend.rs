@@ -15526,23 +15526,26 @@ fn helper_source(h: &str) -> &'static str {
         // `nocasematch` folds to the `i` flag. An INVALID pattern is a
         // shell error (status 2, never a match), so failing to build the
         // regex is `false` here rather than a panic.
-        "regex" => r#"fn __sh_regex(text: &str, pat: &str, flags: &str) -> bool {
+        "regex" => r#"fn __sh_regex(text: &str, pat: &str, flags: &str) -> Option<bool> {
     let pat = if flags.contains('i') { format!("(?i){}", pat) } else { pat.to_string() };
     match regex::Regex::new(&pat) {
-        Ok(re) => re.is_match(text),
-        Err(_) => false,
+        Ok(re) => Some(re.is_match(text)),
+        Err(_) => None,
     }
 }"#,
         // POSIX ERE engine (`--regex-engine posix`): leftmost-longest
         // alternation, POSIX bracket classes, and no Perl escapes — so `\d`
         // is the literal `d` that bash's `=~` sees, not the digit class
-        // Rust's engine reads. `flags` is unused because POSIX ERE has no
-        // inline flags; `nocasematch` is not expressible on this engine.
-        "regex_posix" => r#"fn __sh_regex(text: &str, pat: &str, flags: &str) -> bool {
-    let _ = flags;
-    match revera::Regex::new(pat) {
-        Ok(re) => matches!(re.is_match(text), Ok(true)),
-        Err(_) => false,
+        // Rust's engine reads. `nocasematch` is `REG_ICASE`, which revera
+        // expresses directly (`case_insensitive`), so both engines fold
+        // exactly rather than one approximating.
+        "regex_posix" => r#"fn __sh_regex(text: &str, pat: &str, flags: &str) -> Option<bool> {
+    match revera::RegexBuilder::new(pat)
+        .case_insensitive(flags.contains('i'))
+        .build()
+    {
+        Ok(re) => Some(re.is_match(text).unwrap_or(false)),
+        Err(_) => None,
     }
 }"#,
         "wait_all" => r#"fn __sh_wait_all() {
@@ -15583,7 +15586,17 @@ fn helper_source(h: &str) -> &'static str {
         "aindex" => r#"fn __sh_aindex(v: &[String], k: i64) -> String {
     v.get(k as usize).cloned().unwrap_or_default()
 }"#,
-        _ => "fn __sh_unused() {}",
+        _ => {
+            // A name that is not registered here is dropped by the
+            // `HELPER_ORDER` walk while call sites still reference it, so the
+            // GENERATED program fails with E0425 far from the cause. Loud in
+            // tests and dev builds; the stub keeps release renders compiling.
+            debug_assert!(
+                false,
+                "helper `{h}` has no body: add it to helper_source and HELPER_ORDER"
+            );
+            "fn __sh_unused() {}"
+        }
     }
 }
 
@@ -16858,7 +16871,31 @@ impl<'a, 'r> TestParser<'a, 'r> {
                     "regex"
                 };
                 self.render.add_helper(helper);
-                format!("__sh_regex(&{lhs}, &{rhs}, \"\")")
+                // bash matches the STRING form, so a numeric operand
+                // (`t=3; [[ $t =~ 3 ]]`) must be stringified: `__sh_regex`
+                // takes `&str`, and `&t` on an `i32` does not compile.
+                // Unconditional, not gated on `lhs_num`: that flag marks a
+                // numeric LITERAL, and a variable's type is not visible here —
+                // `$t` rendered as `t` and broke the generated program with
+                // E0308 while `[[ 1 =~ 2 ]]` worked.
+                let l = format!("{lhs}.to_string()");
+                let r = format!("{rhs}.to_string()");
+                // `shopt -s nocasematch` is REG_ICASE (measured: `abc` matches
+                // `[[:upper:]]`). The regex engine folds with `(?i)`, revera
+                // with `case_insensitive`.
+                let flags = if self.render.nocasematch {
+                    "\"i\""
+                } else {
+                    "\"\""
+                };
+                // An invalid pattern is bash's status 2 and a FALSE test, with
+                // no diagnostic (measured; the message people remember comes
+                // from *literal* unbalanced patterns, which bash rejects while
+                // parsing). `None` carries the distinction out of the helper;
+                // `rc_strip` removes the store when the register is dead.
+                format!(
+                    "{{ let __m = __sh_regex(&{l}, &{r}, {flags}); match __m {{ Some(__m) => __m, None => {{ __SH_RC.store(2, Ordering::Relaxed); false }} }} }}"
+                )
             }
             "-nt" | "-ot" => {
                 self.render.add_helper("mtime");
@@ -21905,6 +21942,65 @@ mod tests {
         let posix = super::cargo_manifest("fn __sh_regex(t: &str) { revera::Regex::new(t); }");
         assert!(posix.contains("revera = \"0.2\""), "{posix}");
         assert!(!posix.contains("regex ="), "both engines declared:\n{posix}");
+    }
+
+    /// The `regex_posix` work found this the hard way: a helper name that is
+    /// requested but absent from `HELPER_ORDER` is silently dropped, and the
+    /// generated program fails with E0425. Scan our own source for every
+    /// literal `add_helper("…")` and require it to be registered AND to have
+    /// a body — neither half alone catches the trap.
+    #[test]
+    fn every_requested_helper_is_registered() {
+        let src = include_str!("rust_backend.rs");
+        let mut names = Vec::new();
+        for (at, _) in src.match_indices("add_helper(\"") {
+            let rest = &src[at + "add_helper(\"".len()..];
+            if let Some(end) = rest.find('"') {
+                let name = &rest[..end];
+                // prose in doc comments spells the placeholder as `…`; only
+                // identifier-shaped names are real call sites
+                if !name.is_empty() && name.chars().all(|c| c.is_ascii_lowercase() || c == '_') {
+                    names.push(name);
+                }
+            }
+        }
+        assert!(
+            names.len() > 20,
+            "scan found only {} add_helper sites — the pattern must have drifted",
+            names.len()
+        );
+        for n in names {
+            assert!(
+                super::HELPER_ORDER.contains(&n),
+                "add_helper(\"{n}\") is missing from HELPER_ORDER, so its body would be dropped"
+            );
+            assert!(
+                super::helper_source(n).starts_with("fn __sh_"),
+                "helper `{n}` has no body"
+            );
+        }
+        for h in super::HELPER_ORDER {
+            assert!(
+                super::helper_source(h).starts_with("fn __sh_"),
+                "HELPER_ORDER entry `{h}` has no body"
+            );
+        }
+    }
+
+    #[test]
+    fn regex_test_handles_numbers_case_folding_and_bad_patterns() {
+        // `t=3; [[ $t =~ 3 ]]` matched in bash before this rendered `&t` on an
+        // i32 and failed to compile: bash matches the STRING form.
+        let num = render("t=3\nif [[ $t =~ 3 ]]; then echo yes; fi\necho $?\n");
+        assert!(
+            num.contains("to_string()"),
+            "numeric operand not stringified:\n{num}"
+        );
+        // an invalid pattern is status 2, not a plain non-match
+        assert!(num.contains("store(2"), "bad-pattern status missing:\n{num}");
+        // `shopt -s nocasematch` was tracked for `==` but never reached `=~`
+        let ci = render("shopt -s nocasematch\nif [[ ABC =~ ^abc$ ]]; then echo yes; fi\n");
+        assert!(ci.contains("\"i\""), "nocasematch flag not passed:\n{ci}");
     }
 
     #[test]
