@@ -56,6 +56,7 @@ pub fn transform(stmts: &mut Vec<IrStmt>) -> bool {
             || body[..body.len() - 1]
                 .iter()
                 .any(|s| writes_or_escapes(s, &init))
+            || induction_guard(&cond, &stmts[i - 1], &step.1)
             || contains_status_read(&cond)
             || body[..body.len() - 1]
                 .iter()
@@ -124,6 +125,70 @@ fn counter_step(st: &IrStmt) -> Option<(String, IrStmt)> {
     } else {
         None
     }
+}
+
+/// `while BODY; i=i+1; done` runs BODY's own updates on the final, failing
+/// iteration; a `for` does not. For a loop-carried *induction* variable that
+/// difference is unobservable, but not when the "counter" is also the body's
+/// accumulator:
+///
+/// ```text
+/// s=0
+/// while ((v>1)); do ...; s=s+1; done   // s counts chain iterations
+/// ```
+///
+/// Accepting that would make `ForInit{init:s=0, step:s=s+1}` — the header of
+/// a degenerate `for`, not an induction variable. Consumers read `ForInit`'s
+/// counter as induction: `lane_private::classify_seq_chain` then sees a chain
+/// whose inits write the accumulated var, so collatz-style lane-nests stop
+/// classifying (`non-seq-body`), and `ForInit` candidacy would infer
+/// induction from an accumulator. A genuine counted loop's condition READS
+/// its counter (`i < N`), while here it reads the chain's `v`; so decline
+/// (refuse > guess) when the init and step share a variable the condition
+/// never mentions.
+fn induction_guard(cond: &IrExpr, init: &IrStmt, step: &IrStmt) -> bool {
+    let name = |s: &IrStmt| match s {
+        IrStmt::Assign { targets, .. } if targets.len() == 1 => Some(targets[0].var.clone()),
+        _ => None,
+    };
+    let (Some(a), Some(b)) = (name(init), name(step)) else {
+        return false;
+    };
+    // Same var, and the condition does not read it: an accumulator tally,
+    // not an induction variable.
+    a == b && !expr_mentions_text(cond, &a)
+}
+
+/// Does the condition text mention `name` as a word? Conditions arrive as
+/// `let` text (`v > 1`), arithmetic, or a `test` call; this is a
+/// conservative word-boundary scan over every string leaf, which errs
+/// toward "mentions" (keeping the `while`, the safe direction).
+fn expr_mentions_text(e: &IrExpr, name: &str) -> bool {
+    fn walk(e: &IrExpr, name: &str) -> bool {
+        match e {
+            IrExpr::Str(s, _) => word_contains(s, name),
+            IrExpr::Array(items) => items.iter().any(|i| walk(i, name)),
+            IrExpr::Call { args, .. } => args.iter().any(|a| walk(a, name)),
+            IrExpr::Arith(a) => arith_text_mentions(a, name),
+            _ => true,
+        }
+    }
+    fn word_contains(s: &str, name: &str) -> bool {
+        let is_word = |c: char| c.is_ascii_alphanumeric() || c == '_';
+        s.match_indices(name).any(|(i, _)| {
+            let before = s[..i].chars().next_back();
+            let after = s[i + name.len()..].chars().next();
+            !before.is_some_and(is_word) && !after.is_some_and(is_word)
+        })
+    }
+    fn arith_text_mentions(a: &ArithAst, name: &str) -> bool {
+        match a {
+            ArithAst::Var(v) | ArithAst::Ident(v) => v == name,
+            ArithAst::Num(_) | ArithAst::Sizeof(_) => false,
+            _ => true,
+        }
+    }
+    walk(e, name)
 }
 
 fn writes_or_escapes(st: &IrStmt, name: &str) -> bool {

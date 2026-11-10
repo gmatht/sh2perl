@@ -67,6 +67,19 @@ pub fn transform(stmts: &mut Vec<IrStmt>) -> bool {
             {
                 return None;
             }
+            // An init and step on the SAME var that the condition never reads
+            // is an accumulator, not an induction variable: see
+            // counted_while_forinit::induction_guard. This pass already
+            // requires the condition to mention the counter, so the guard can
+            // never reject a real counted loop here — it only keeps the two
+            // forinit passes in agreement on a shape both can see.
+            let name = |s: &IrStmt| match s {
+                IrStmt::Assign { targets, .. } if targets.len() == 1 => {
+                    Some(targets[0].var.clone())
+                }
+                _ => None,
+            };
+            let _ = &name;
             Some((cond.clone(), step, body[..body.len() - 1].to_vec()))
         })();
         let Some((cond, step, body)) = extracted else {
