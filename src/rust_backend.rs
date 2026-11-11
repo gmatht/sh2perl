@@ -22046,21 +22046,41 @@ mod tests {
                 "rendered helper name `{n}` is outside the __sh_ namespace"
             );
         }
-        // every KEY the backend requests must render exactly the name its
-        // call sites use: `add_helper("capture_rc")` calls `__sh_capture_rc`
-        for (at, _) in include_str!("rust_backend.rs").match_indices("add_helper(\"") {
-            let src = &include_str!("rust_backend.rs")[at..];
-            let rest = &src["add_helper(\"".len()..];
+        // Every KEY a call site requests must be a REGISTERED helper. The key
+        // need not equal the rendered name (`outbytes` renders `__sh_out_bytes`),
+        // so the requirement is membership in HELPER_ORDER — the risk this
+        // guards is an emit that requests a helper nobody registered, which
+        // would leave the call site dangling while prune sees nothing.
+        let src = include_str!("rust_backend.rs");
+        for (at, _) in src.match_indices("add_helper(\"") {
+            let rest = &src[at + "add_helper(\"".len()..];
             let Some(end) = rest.find('"') else { continue };
             let key = &rest[..end];
-            if key.is_empty() || !key.chars().all(|c| c.is_ascii_lowercase() || c == '_') {
+            // prose mentions the call shape (`add_helper("…")`), so only
+            // identifier-shaped keys are real call sites
+            if key.is_empty()
+                || !key
+                    .chars()
+                    .all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '_')
+            {
                 continue;
             }
             assert!(
-                names.iter().any(|n| n == &format!("__sh_{key}")),
-                "add_helper(\"{key}\") renders no `fn __sh_{key}` the prune pass can see"
+                HELPER_ORDER.contains(&key),
+                "add_helper(\"{key}\") is not in HELPER_ORDER: no body to render or prune"
             );
         }
+        // totality + injectivity: one rendered name per registry entry, and no
+        // two entries (or two bodies) collapsing onto the same name
+        assert_eq!(
+            names.len(),
+            HELPER_ORDER.len(),
+            "every HELPER_ORDER entry must parse to a rendered name"
+        );
+        let mut sorted = names.clone();
+        sorted.sort();
+        sorted.dedup();
+        assert_eq!(sorted.len(), names.len(), "two helpers render the same name");
     }
 
     fn every_requested_helper_is_registered() {
