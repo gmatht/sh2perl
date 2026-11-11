@@ -2331,15 +2331,23 @@ impl Render {
                     // (063_hard_to_parse).
                     self.need_atoi = true;
                     format!(
-                        "(int({l} / __sh_atoi({r})) if __sh_atoi({r}) != 0 else \"\")"
+                        "(int(__sh_atoi({l}) / __sh_atoi({r})) if __sh_atoi({r}) != 0 else \"\")"
                     )
                 } else if op == "%" {
                     // same zero-divisor rule as `/` (bash `%` by zero
                     // errors with an empty value).
                     self.need_atoi = true;
                     format!(
-                        "(({l} % __sh_atoi({r})) if __sh_atoi({r}) != 0 else \"\")"
+                        "((__sh_atoi({l}) % __sh_atoi({r})) if __sh_atoi({r}) != 0 else \"\")"
                     )
+                } else if matches!(op.as_str(), "+" | "-" | "*") {
+                    // every arith operand is a NUMBER in bash, whatever the
+                    // variable holds (`value` is the string "42" there);
+                    // a raw str operand raised TypeError or, worse, `%`
+                    // silently produced the wrong branch (058 printed
+                    // `Odd number: 42`).
+                    self.need_atoi = true;
+                    format!("(__sh_atoi({l}) {op} __sh_atoi({r}))")
                 } else if matches!(op.as_str(), "<" | ">" | "<=" | ">=" | "==" | "!=") {
                     // an arith comparison yields 0/1, never a python bool:
                     // `echo $(( x > 2 ))` printed `True`
@@ -7514,7 +7522,10 @@ impl Render {
                         if self.assoc.contains(base) || k.starts_with('$') {
                             let key = match k.strip_prefix('$') {
                                 Some(v) => format!("str({})", self.py_ident(v)),
-                                None => Self::py_str(k),
+                                // the shell quotes are KEY SYNTAX, not text:
+                                // `info["os"]=…` stored the literal key
+                                // `"os"` (064_22 printed info["arch"]=…)
+                                None => Self::py_str(&Self::strip_quotes(k)),
                             };
                             if !known {
                                 self.emit(&format!("{m} = {{}}"));
@@ -9830,7 +9841,11 @@ mod tests {
         // an UNDECLARED array reads through globals().get (bash treats it as
         // empty); mark it assigned so this asserts the normal path
         r.written.insert("a".to_string());
-        assert_eq!(r.arith(&ast), "(__sh_atoi(__sh_elem(a, 1)) + 1)");
+        // every arith operand is coerced (bash coerces its operands too)
+        assert_eq!(
+            r.arith(&ast),
+            "(__sh_atoi(__sh_atoi(__sh_elem(a, 1))) + __sh_atoi(1))"
+        );
         assert!(r.need_elem, "the `__sh_elem` helper must be emitted");
     }
 
