@@ -2770,7 +2770,7 @@ fn mentions_ident(line: &str, name: &str) -> bool {
 /// parse cannot read (`pub fn`, an attribute line, a non-`fn` body) is either
 /// pruned correctly or fails that test loudly — it can no longer be a silent
 /// miss, and pruning never has to guess from the emitted program.
-fn helper_rendered_names() -> Vec<String> {
+fn helper_rendered_pairs() -> Vec<(String, String)> {
     HELPER_ORDER
         .iter()
         .filter_map(|h| {
@@ -2780,8 +2780,15 @@ fn helper_rendered_names() -> Vec<String> {
                 .chars()
                 .take_while(|c| c.is_ascii_alphanumeric() || *c == '_')
                 .collect();
-            (!name.is_empty()).then_some(name)
+            (!name.is_empty()).then(|| (h.to_string(), name))
         })
+        .collect()
+}
+
+fn helper_rendered_names() -> Vec<String> {
+    helper_rendered_pairs()
+        .into_iter()
+        .map(|(_, name)| name)
         .collect()
 }
 
@@ -22070,17 +22077,44 @@ mod tests {
                 "add_helper(\"{key}\") is not in HELPER_ORDER: no body to render or prune"
             );
         }
-        // totality + injectivity: one rendered name per registry entry, and no
-        // two entries (or two bodies) collapsing onto the same name
+        // Totality: every registry entry renders a `fn __sh_` body, so prune
+        // sees it. (Names need not be unique — see the variant rule below.)
         assert_eq!(
             names.len(),
             HELPER_ORDER.len(),
-            "every HELPER_ORDER entry must parse to a rendered name"
+            "every HELPER_ORDER entry must render a `fn __sh_` body"
         );
-        let mut sorted = names.clone();
-        sorted.sort();
-        sorted.dedup();
-        assert_eq!(sorted.len(), names.len(), "two helpers render the same name");
+        // Variants SHARE a rendered name on purpose: `regex`/`regex_posix`
+        // differ only in the engine crate and `print_words`/`print_words_noesc`
+        // in whether the unescape arm exists, and exactly one of each pair is
+        // emitted per program. Any OTHER collision means two unrelated helpers
+        // could both be emitted under one name (a duplicate definition), so a
+        // new collision has to be declared here deliberately.
+        const VARIANTS: &[(&str, &str)] = &[
+            ("print_words", "print_words_noesc"),
+            ("regex", "regex_posix"),
+        ];
+        let mut groups: std::collections::BTreeMap<String, Vec<String>> = Default::default();
+        for (key, name) in super::helper_rendered_pairs() {
+            groups.entry(name).or_default().push(key);
+        }
+        for (name, keys) in &groups {
+            if keys.len() == 1 {
+                continue;
+            }
+            let mut got = keys.clone();
+            got.sort();
+            let declared = VARIANTS.iter().any(|(a, b)| {
+                let mut want = vec![a.to_string(), b.to_string()];
+                want.sort();
+                want == got
+            });
+            assert!(
+                declared,
+                "helpers {got:?} all render `{name}`: only declared variant pairs may share \
+                 a name (exactly one is emitted per program)"
+            );
+        }
     }
 
     fn every_requested_helper_is_registered() {
