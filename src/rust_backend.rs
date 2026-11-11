@@ -11841,7 +11841,13 @@ impl Render {
             if m.chars().any(|c| c.is_ascii_uppercase()) {
                 attr.push_str("#[allow(non_snake_case)] ");
             }
-            out.push(format!("{attr}let mut {m} = {init};"));
+            // `local_mut` is "written more than once" (the entry decl counts
+            // as the first write), so a name absent from it is never written
+            // again and must NOT be declared `mut` — rustc says
+            // `variable does not need to be mutable` otherwise (19 corpus-wide
+            // before this).
+            let kw = if self.local_mut.contains(&n) { "let mut" } else { "let" };
+            out.push(format!("{attr}{kw} {m} = {init};"));
         }
         out
     }
@@ -12251,7 +12257,16 @@ impl Render {
                             .collect();
                         self.mark_written(&t.var);
                         let m = self.ident_base(&t.var);
-                        self.emit(&format!("let mut {m} = [{}];", lits.join(", ")));
+                        // a shell array may be named in CAPS (`FilesystemOptions`):
+                        // the binding is a verbatim Rust ident, so it needs the
+                        // same non_snake_case waiver every other verbatim name
+                        // gets (`variable should have a snake case name`).
+                        let attr = if m.chars().any(|c| c.is_ascii_uppercase()) {
+                            "#[allow(non_snake_case)] "
+                        } else {
+                            ""
+                        };
+                        self.emit(&format!("{attr}let mut {m} = [{}];", lits.join(", ")));
                         self.emit("__SH_RC.store(0, Ordering::Relaxed);");
                         return;
                     }
@@ -18029,6 +18044,127 @@ fn collect_numeric_positionals(stmts: &[IrStmt], out: &mut BTreeSet<String>) {
     }
 }
 
+/// Names a BUILTIN writes into (`printf -v name`, `read a b`, `mapfile`).
+/// These are invisible to `use_scopes` (the name sits in an argument position
+/// the walker calls a read) and to a statement-level assignment count, and
+/// missing one turns a `let` into an E0384 "cannot assign twice".
+fn collect_builtin_writes(stmts: &[IrStmt], out: &mut BTreeSet<String>) {
+    for s in stmts {
+        match s {
+            IrStmt::Expr(IrExpr::Call { func, args }) => {
+                // The words of a builtin arrive as `[Str("printf"),
+                // Array([Str("-v"), Str("name"), …])]`: the flags and the
+                // name live INSIDE the array, so flatten both shapes before
+                // looking for a name position.
+                let mut words: Vec<&str> = Vec::new();
+                for a in args {
+                    match a {
+                        IrExpr::Str(w, _) => words.push(w.as_str()),
+                        IrExpr::Array(items) => {
+                            for it in items {
+                                if let IrExpr::Str(w, _) = it {
+                                    words.push(w.as_str());
+                                }
+                            }
+                        }
+                        _ => {}
+                    }
+                }
+                let write_name = |i: usize| -> Option<&str> {
+                    words.get(i).copied().filter(|n| is_ident(n))
+                };
+                if func == "builtin" {
+                    match words.first().copied() {
+                        // `printf -v NAME fmt …`
+                        Some("printf") => {
+                            for (i, w) in words.iter().enumerate() {
+                                if *w == "-v" {
+                                    if let Some(n) = write_name(i + 1) {
+                                        out.insert(n.to_string());
+                                    }
+                                }
+                            }
+                        }
+                        // `read [-r] NAME…` / `mapfile|readarray [-t] NAME`
+                        Some("read") | Some("mapfile") | Some("readarray") => {
+                            for i in 1..words.len() {
+                                if let Some(n) = write_name(i) {
+                                    out.insert(n.to_string());
+                                }
+                            }
+                        }
+                        _ => {}
+                    }
+                }
+            }
+            IrStmt::Assign { expr, .. } => collect_builtin_writes_expr(expr, out),
+            IrStmt::If { then, elsifs, else_, .. } => {
+                collect_builtin_writes(then, out);
+                for (_, b) in elsifs {
+                    collect_builtin_writes(b, out);
+                }
+                collect_builtin_writes(else_, out);
+            }
+            IrStmt::While { body, .. } | IrStmt::DoWhile { body, .. } => collect_builtin_writes(body, out),
+            IrStmt::For { body, .. } | IrStmt::ForInit { body, .. } => collect_builtin_writes(body, out),
+            IrStmt::Block(b) | IrStmt::Subshell(b) | IrStmt::Background(b) => collect_builtin_writes(b, out),
+            IrStmt::Redirect { inner, .. } => collect_builtin_writes(inner, out),
+            IrStmt::Pipeline { stages, .. } => {
+                for st in stages {
+                    collect_builtin_writes(st, out);
+                }
+            }
+            IrStmt::Case { clauses, .. } => {
+                for c in clauses {
+                    collect_builtin_writes(&c.body, out);
+                }
+            }
+            IrStmt::Select { clauses } => {
+                for c in clauses {
+                    collect_builtin_writes(&c.body, out);
+                }
+            }
+            IrStmt::Try { body, excepts, else_body, finally_body } => {
+                collect_builtin_writes(body, out);
+                for e in excepts {
+                    collect_builtin_writes(&e.body, out);
+                }
+                collect_builtin_writes(else_body, out);
+                collect_builtin_writes(finally_body, out);
+            }
+            IrStmt::Function { body, named_blocks, .. } => {
+                collect_builtin_writes(body, out);
+                for (_, b) in named_blocks {
+                    collect_builtin_writes(b, out);
+                }
+            }
+            _ => {}
+        }
+    }
+}
+
+fn collect_builtin_writes_expr(e: &IrExpr, out: &mut BTreeSet<String>) {
+    match e {
+        IrExpr::Call { args, .. } => {
+            for a in args {
+                collect_builtin_writes_expr(a, out);
+            }
+        }
+        IrExpr::BinOp { lhs, rhs, .. } => {
+            collect_builtin_writes_expr(lhs, out);
+            collect_builtin_writes_expr(rhs, out);
+        }
+        IrExpr::Interpolate(parts) => {
+            for p in parts {
+                if let crate::ir::InterpPart::Expr(x) = p {
+                    collect_builtin_writes_expr(x, out);
+                }
+            }
+        }
+        _ => {}
+    }
+}
+
 fn collect_written(stmts: &[IrStmt], out: &mut BTreeSet<String>) {
     for s in stmts {
         match s {
@@ -19739,6 +19875,11 @@ fn compute_local_vars(
     let Some(dyns) = dynamic_var_names(prog) else {
         return (HashMap::new(), need_mut, dead_init, entry_decl);
     };
+    let mut builtin_written: BTreeSet<String> = BTreeSet::new();
+    collect_builtin_writes(&prog.stmts, &mut builtin_written);
+    for sub in &prog.subs {
+        collect_builtin_writes(&sub.body, &mut builtin_written);
+    }
     let mut out: HashMap<String, Scope> = HashMap::new();
     // A `for` binding is not a mention: the walker skips binding
     // positions, so a loop variable's first recorded mention is a read in
@@ -19756,6 +19897,11 @@ fn compute_local_vars(
         // whose FIRST mention is a top-level write in the owning scope
         // (that is where the `let` lands) which is read at least once
         // (a never-read local would be dead-store dead weight).
+        // A builtin that writes into the name (`printf -v`, `read`) is a
+        // real second store even though `use_scopes` sees an argument.
+        let builtin_write = builtin_written.contains(&name);
+        let us_write_count = us.iter().filter(|u| u.write).count() + usize::from(builtin_write);
+        let us_writes = us_write_count > 0;
         let first_is_write = us.first().map(|u| u.write).unwrap_or(false);
         let first_is_top_write = us.first().map(|u| u.write && u.top).unwrap_or(false);
         // A DECLARATION carries its own `let`, at any nesting depth (the
@@ -19800,15 +19946,20 @@ fn compute_local_vars(
         };
         let Some(scope) = scope else { continue };
         if entry {
-            // the `let` sits at the top of the scope, so every write of
-            // the name is a plain assignment and the binding is `mut`
+            // the `let` sits at the top of the scope, so a later write is a
+            // plain assignment and needs `mut` — but a name with NO write at
+            // all is read-only (`x=$(((a + b) / (c + d)))` still declares
+            // a,b,c,d, which only ever read). Declaring those `mut` is
+            // `variable does not need to be mutable`, 19 of them corpus-wide.
             entry_decl.insert(name.clone());
-            need_mut.insert(name.clone());
+            if us_writes {
+                need_mut.insert(name.clone());
+            }
             if first_is_write {
                 // nothing reads the default before the first write
                 dead_init.insert(name.clone());
             }
-        } else if us.iter().filter(|u| u.write).count() > 1 {
+        } else if us_write_count > 1 {
             // a local is written more than once => needs `mut`
             need_mut.insert(name.clone());
             // first write dead when no read sits between it and the
