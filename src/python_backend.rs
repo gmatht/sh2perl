@@ -7038,7 +7038,7 @@ impl Render {
         };
         let mut is_assoc = false;
         let mut is_array = false;
-        for item in items {
+        for (i, item) in items.iter().enumerate() {
             // `declare -a arr=(a b)` keeps the initializer as a setArray
             // Call item, not a `name=value` string: assign the list home
             // (the same one `arr=(a b)` gets) instead of dropping it.
@@ -7057,6 +7057,36 @@ impl Render {
                         self.emit(&format!("{name_py} = list({elems})"));
                     }
                     continue;
+                }
+            }
+            // `typeset -r x="v"` / `declare -l y="V"` arrive SPLIT:
+            // ["-r", "x=", <value Interpolate>] — the value is the NEXT
+            // element, so the plain `x=` path assigned "" (typeset-cmdsub
+            // printed rovar='' for every `typeset` line). The `-l`/`-u`
+            // attributes fold the assigned text as bash does.
+            if let IrExpr::Str(s, _) = item {
+                if s.len() > 1 && s.ends_with('=') {
+                    let nm = &s[..s.len() - 1];
+                    if Self::is_plain_name(nm) {
+                        if let Some(next @ IrExpr::Interpolate(_)) = items.get(i + 1) {
+                            let name_py = self.py_ident(nm);
+                            self.written.insert(nm.to_string());
+                            let mut rhs = self.expr(next);
+                            let lower = items[..i].iter().any(|it| {
+                                matches!(it, IrExpr::Str(f, _) if f == "-l")
+                            });
+                            let upper = items[..i].iter().any(|it| {
+                                matches!(it, IrExpr::Str(f, _) if f == "-u")
+                            });
+                            if lower {
+                                rhs = format!("str({rhs}).lower()");
+                            } else if upper {
+                                rhs = format!("str({rhs}).upper()");
+                            }
+                            self.emit(&format!("{name_py} = {rhs}"));
+                            continue;
+                        }
+                    }
                 }
             }
             if let IrExpr::Str(s, _) = item {
