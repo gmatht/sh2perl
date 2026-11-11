@@ -6,4 +6,7 @@ tag "ArrayLen"
 kind expr
 # storage_class str_bounded
 field array: expr
-spec: none (unstated)
+spec: TextOps#array_len_split_is_word_count
+# Generic on the element type (array_len :: 'a list => nat), so the only
+# obligation that is about THIS node rather than about lists is the
+# composition law: ArrayLen(Split(t)) is the wc -w count of t.

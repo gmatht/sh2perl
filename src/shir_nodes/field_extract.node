@@ -13,4 +13,10 @@ field delimiter: string
 field fields: vec_field_range
 field suppress_no_delim: bool
 field output_delimiter: optional_string
-spec: none (unstated)
+spec: TextOps#cut_keeps_empty_field, TextOps#field_or_empty_out_of_range
+# Modelled as "the N-th field of a literal-delimiter split, or nothing", 1-based
+# like cut, keeping empty fields (a,,b with -f2 is the empty string). The
+# `fields: vec_field_range` RANGES (-fN-M, -fN, --complement) and the
+# `output_delimiter` splicing are NOT modelled yet — open targets in
+# sh2perl/docs/fm/README.md. The whitespace split is a different node's
+# meaning on purpose (ws_split_would_lose_empty_field).

@@ -1,13 +1,14 @@
 # shIR formal semantics — the text-ops slice
 
 `TextOps/` is a machine-checked denotational semantics for a first slice of
-shIR. It is split into three theories that build as one session:
+shIR. It is split into four theories that build as one session:
 
 | Theory | Covers |
 |---|---|
 | `ShIR_TextOps_Base` | the three EXPRESSION nodes the text reductions emit (`StrLen`, `WordCount`, `RegCount`), their `wc` lowering entry (`try_lower_wc` in `src/transforms/text_ops.rs`), and the plain-ASCII guard that entry uses. |
 | `ShIR_TextOps_Strip` | the newline strip of command substitution (`NewlineStrip`), on the reversed byte string. |
 | `ShIR_TextOps_SortUniq` | the two ordering nodes `SortLines` / `UniqLines` (`try_lower_sort` / `try_lower_uniq`), modelled over the list of lines. |
+| `ShIR_TextOps_Compose` | the composition nodes `Split` / `ArrayLen` / `FieldExtract`, the `ArrayLen(Split(...))` reading of `wc -w`, and `cut`'s delimiter split (which KEEPS empty fields). |
 
 ```
 isabelle build -D sh2perl/docs/fm/TextOps      # HOL only, no AFP, ~10 s
@@ -30,6 +31,10 @@ node contract — "this node means this value, in every renderer" — lives.
 | …and strips the WHOLE run, not one newline | `rev_drop_last_nl_idem` (via `arg_cong_nl`) | chomp-one vs strip-all: a second strip changes nothing. |
 | `sort` loses no line | `insert_length`, `isort_length` | the ordering step is a permutation of its input. |
 | `uniq -c` counts every line exactly once | `run_count_total` | the printed run lengths sum to the number of input lines. |
+| Composition: `ArrayLen(Split(t))` IS the word count | `array_len_split_is_word_count`, `lowered_wc_w_via_split` | The as-built `wc -w` reading. `split_ws` drops the empty fields a plain `split` would produce, `array_len` counts the rest, and `ws_scan` counts word starts — the three agree on every byte string, so obligation 4 above is a corollary rather than an independent model. |
+| …and the filtered split is the one that has to be filtered | `unfiltered_split_overcounts_leading`, `unfiltered_split_overcounts_trailing`, `filtered_split_counts_*` | Two negative controls: an unfiltered split of `" a"` returns two fields for one word, and the filtered idiom returns one. The drop-empty step is load-bearing, not cosmetic. |
+| A field is never empty and never contains whitespace | `split_ws_fields_clean`, `field_scan_no_empty`, `field_scan_ws_free` | Composition needs the shape, not just the count: `StrLen(FieldExtract(...))` downstream of a `Split` measures a word, not a run of whitespace. |
+| `cut -dD -fN` keeps the empty fields | `length_split_on`, `cut_keeps_empty_field`, `cut_empty_field_is_empty`, `cut_field_two` | `a,,b` with `-d, -f2` is the empty string, and it is NOT what the whitespace split would return (`ws_split_would_lose_empty_field`) — the two splits are deliberately different nodes' business. |
 
 ## Deliberate modelling choices
 
@@ -48,6 +53,16 @@ node contract — "this node means this value, in every renderer" — lives.
   `(mode, source text)`. The bug was a second newline invented inside the
   line arm; a shape that cannot be written that way is the shape the model
   rules out.
+- **Two splits, on purpose.** `split_ws` (whitespace, drops empties) and
+  `split_on` (literal delimiter, keeps them) are separate functions because
+  they are separate nodes' business: `wc -w` counts words, `cut -f2` picks a
+  column, and `cut` on `a,,b` must yield the empty field. Collapsing them
+  into one "split" would make the model disagree with `cut`.
+- **`FieldExtract` is modelled as "the N-th field, or nothing"**
+  (`field_or_empty`), 1-based like `cut`, with the past-the-end case
+  printing an empty line rather than erroring. The node's `fields` field is
+  a `vec_field_range` and its `output_delimiter` is not modelled yet (see
+  open targets).
 
 ## Open targets (stated, not yet proved)
 
@@ -64,6 +79,16 @@ never faked with `sorry` (the session is `quick_and_dirty = false`):
 - **`drop_runs_idem` / `drop_runs_no_adjacent_eq`**, and hence
   **`sort -u = uniq . sort`**: the run collapse is idempotent and invents
   nothing.
+- **`\s` is not POSIX space** (`ShIR_TextOps_Compose`): every Perl/Estree
+  renderer spells the word split `/\s+/`, which in those languages is
+  Unicode-space-aware, while the shell's `IFS` is the six ASCII bytes
+  `is_ws` lists. `nbsp_is_not_posix_space` and `nbsp_is_not_ascii` pin the
+  divergence; the semantics of the engines' class is not modelled, so the
+  gap is recorded rather than closed.
+- **`FieldExtract`'s ranges and `--output-delimiter`**: the model covers
+  `-fN` only. `-fN-M`, `-fN,`, `--complement` and `-o` splicing are
+  unmodelled, so `fields: vec_field_range` and `output_delimiter` carry no
+  obligation yet.
 
 ## Box-health note (why the proofs look odd in places)
 
@@ -84,7 +109,22 @@ What works, and is used throughout:
 - prove the congruence you need once (see `arg_cong_nl`) rather than
   rewriting under the function inside each induction step;
 - fetch an induction hypothesis with `by assumption` (or `Cons(1)` plus
-  `..`) — `using Cons(1) by simp` frequently fails here.
+  `..`) — `using Cons(1) by simp` frequently fails here;
+- never state a CONJUNCTION over a recursive function's output and induct on
+  both halves at once: `∀w ∈ set (field_scan …). w ≠ [] ∧ ws-free w` ran
+  >240 s without finishing (with `simp_all`, `auto` and the `fun` induction
+  rule alike), while the two halves as separate inductions close in ~6 s
+  (`field_scan_no_empty` + `field_scan_ws_free`, recombined in
+  `field_scan_fields_clean`). Carry a named predicate (`ws_free`) instead of
+  an inline `∀`, and pass the *unfolded* hypothesis to `simp`, not both the
+  hypothesis and its definition at once — `simp add: h ws_free_def` rewrites
+  the goal past the point where `h` can match, which reads as a 60 s hang.
+
+One parser trap, not a prover one: do not name a parameter `done`.
+`proof (induction cs arbitrary: cur done)` is an *outer syntax* error
+("keyword `)` expected, but end-of-input") because `done` terminates the
+method argument; the failure points at the following `case`, which is
+misleading. The accumulator here is called `acc`.
 
 `rev_drop_last_nl_idem` was blocked for hours until those three rules were
 applied; it now goes through with no `simp` on a cons/append shape at all.
@@ -95,9 +135,11 @@ with the `a = 10` repro, and worth remembering before blaming a definition.
 
 The natural next slices, in order of payoff per line of proof:
 
-1. **`Split`/`ArrayLen`/`FieldExtract`** — the composition nodes. `wc -w`'s
-   as-built lowering is `ArrayLen(Split(...))`, so a semantics for `Split`
-   plus the `ArrayLen` law turns obligation 4 above into a corollary.
+1. ~~**`Split`/`ArrayLen`/`FieldExtract`**~~ — done in `ShIR_TextOps_Compose`
+   (2026-11-11). `wc -w`'s as-built lowering is `ArrayLen(Split(...))`, and
+   `array_len_split_is_word_count` makes it a corollary of the word-count
+   obligation. What is left of this slice is the `-fN-M` range and the
+   output-delimiter splicing noted under open targets.
 2. **`StringTrim`/`StringAffix`/`AffixStrip`** — pure string algebra, no
    state; the same shape as this file, and the reductions that fire least
    (several are declared-but-unemitted, where a semantics would say whether

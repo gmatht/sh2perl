@@ -13,4 +13,9 @@ field is_regex: bool
 # split. C renders an in-place tokenizer on the var's own storage; GC'd
 # string languages ignore it (immutable strings — flag meaningless).
 field in_place: optional_bool
-spec: none (unstated)
+spec: TextOps#split_ws_len, TextOps#split_ws_fields_clean
+# The field LIST is the meaning; what is machine-checked is its count
+# (split_ws_len: dropping the empty fields is what makes the count equal the
+# ws -w count) and its shape (split_ws_fields_clean: no empty field, no
+# whitespace inside one). Per-field byte identity is not yet an obligation —
+# see sh2perl/docs/fm/README.md, open targets.
