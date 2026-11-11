@@ -13754,7 +13754,15 @@ impl Render {
         // bigint taint (t87 huge consts/propagations; needs prog.subs).
         {
             let mut big = BTreeSet::new();
-            collect_bigint_vars(&prog.stmts, &prog.subs, &mut big);            collect_huge_literal_assigns(&prog.stmts, &mut big);            if stmts_have_huge(&prog.stmts) { collect_all_assign_targets(&prog.stmts, &mut big); }            self.bigint_vars = big;
+            // BigInt scope is DATA FLOW, not "this program contains a huge
+            // value somewhere": the fixpoint below marks a var when a huge
+            // value can reach it (`x = 2**64+1` → x; `y = x + 1` → y) and
+            // the positional digits `$N` when a huge value is passed to a
+            // call. Marking every assignment target in main and every sub
+            // (the old rule) made whole programs BigInt for one huge literal.
+            collect_bigint_vars(&prog.stmts, &prog.subs, &mut big);
+            collect_huge_literal_assigns(&prog.stmts, &mut big);
+            self.bigint_vars = big;
         }
 
         // SHARED PARAMETER-BORROW VERDICT (shir::analyze_param_use): the
@@ -18314,90 +18322,6 @@ fn arith_uses_bigint(a: &ArithAst, big: &BTreeSet<String>) -> bool {
 /// Fixpoint (max 10 rounds; t87 converges in 1-2).
 /// Mark vars assigned huge literals (t90 `n = 2**64+1` as decimal
 /// text; mods/compares on them need BigInt, not i64).
-/// True if stmts contain any huge Arith/literal (for program-wide
-/// bigint marking; t91 set with 2**100 needs total as BigInt).
-fn stmts_have_huge(stmts: &[IrStmt]) -> bool {
-    use num_bigint::BigInt;
-    fn expr_huge(e: &IrExpr) -> bool {
-        match e {
-            IrExpr::Arith(a) => eval_arith_bigint(a)
-                .map(|v| {
-                    v > BigInt::from(i64::MAX) || v < BigInt::from(i64::MIN)
-                })
-                .unwrap_or(false),
-            IrExpr::Str(s, _) => {
-                let t = s.trim().trim_start_matches(['+', '-']);
-                if !t.is_empty() && t.chars().all(|c| c.is_ascii_digit()) {
-                    if let Ok(v) = t.parse::<BigInt>() {
-                        return v > BigInt::from(i64::MAX)
-                            || v < BigInt::from(i64::MIN);
-                    }
-                }
-                false
-            }
-            IrExpr::Call { args, .. } => args.iter().any(expr_huge),
-            IrExpr::Array(items) => items.iter().any(expr_huge),
-            IrExpr::Arrow(ss) => ss.iter().any(stmt_huge),
-            IrExpr::Interpolate(parts) => parts.iter().any(|p| {
-                matches!(p, crate::ir::InterpPart::Expr(x) if expr_huge(x))
-            }),
-            _ => false,
-        }
-    }
-    fn stmt_huge(s: &IrStmt) -> bool {
-        match s {
-            IrStmt::Assign { expr, .. } => expr_huge(expr),
-            IrStmt::Expr(e) | IrStmt::Output { value: e, .. } => expr_huge(e),
-            IrStmt::If { cond, then, elsifs, else_, .. } => {
-                expr_huge(cond)
-                    || stmts_have_huge(then)
-                    || elsifs.iter().any(|(c, b)| expr_huge(c) || stmts_have_huge(b))
-                    || stmts_have_huge(else_)
-            }
-            IrStmt::While { cond, body, .. } | IrStmt::DoWhile { cond, body, .. } => {
-                expr_huge(cond) || stmts_have_huge(body)
-            }
-            IrStmt::For { iter, body, .. } => expr_huge(iter) || stmts_have_huge(body),
-            IrStmt::Function { body, .. } => stmts_have_huge(body),
-            IrStmt::Block(b) | IrStmt::Subshell(b) => stmts_have_huge(b),
-            IrStmt::Redirect { inner, .. } => stmts_have_huge(inner),
-            IrStmt::Pipeline { stages, .. } => stages.iter().any(|st| stmts_have_huge(st)),
-            _ => false,
-        }
-    }
-    stmts.iter().any(stmt_huge)
-}
-
-/// Mark ALL assign targets as bigint when huge present (t91; sound,
-/// per-program so t86 unaffected).
-fn collect_all_assign_targets(stmts: &[IrStmt], out: &mut BTreeSet<String>) {
-    for s in stmts {
-        match s {
-            IrStmt::Assign { targets, .. } => {
-                for t in targets {
-                    if t.indices.is_empty() {
-                        out.insert(t.var.clone());
-                    }
-                }
-            }
-            IrStmt::Function { body, .. } => collect_all_assign_targets(body, out),
-            IrStmt::If { then, elsifs, else_, .. } => {
-                collect_all_assign_targets(then, out);
-                for (_, b) in elsifs {
-                    collect_all_assign_targets(b, out);
-                }
-                collect_all_assign_targets(else_, out);
-            }
-            IrStmt::While { body, .. }
-            | IrStmt::DoWhile { body, .. }
-            | IrStmt::For { body, .. }
-            | IrStmt::Block(body)
-            | IrStmt::Subshell(body) => collect_all_assign_targets(body, out),
-            _ => {}
-        }
-    }
-}
-
 fn collect_huge_literal_assigns(stmts: &[IrStmt], out: &mut BTreeSet<String>) {
     use num_bigint::BigInt;
     fn rhs_huge(e: &IrExpr) -> bool {
@@ -18453,108 +18377,12 @@ fn collect_huge_literal_assigns(stmts: &[IrStmt], out: &mut BTreeSet<String>) {
 }
 
 fn collect_bigint_vars(stmts: &[IrStmt], subs: &[crate::ir::IrSub], out: &mut BTreeSet<String>) {
-    // coarse: any huge const call arg ⇒ all assigned vars bigint (t89:
-    // `small_factors(2**64+1)`; callee params/vars must hold huge values).
-    // Sound (BigInt correct, slower); preserves t86 speed (no huge args).
-    // TODO: precise per-function mapping (needs param-position tracking).
-    {
-        use num_bigint::BigInt;
-        fn has_huge_arg(e: &IrExpr) -> bool {
-            match e {
-                IrExpr::Call { args, .. } => args.iter().any(|a| match a {
-                    IrExpr::Arith(x) => eval_arith_bigint(x)
-                        .map(|v| {
-                            v > BigInt::from(i64::MAX) || v < BigInt::from(i64::MIN)
-                        })
-                        .unwrap_or(false),
-                    _ => has_huge_arg(a),
-                }),
-                IrExpr::Array(items) => items.iter().any(has_huge_arg),
-                IrExpr::Arrow(ss) => ss.iter().any(|s| match s {
-                    IrStmt::Expr(x) => has_huge_arg(x),
-                    _ => false,
-                }),
-                _ => false,
-            }
-        }
-        fn collect_targets(ss: &[IrStmt], out: &mut BTreeSet<String>) {
-            for s in ss {
-                match s {
-                    IrStmt::Assign { targets, .. } => {
-                        for t in targets {
-                            if t.indices.is_empty() {
-                                out.insert(t.var.clone());
-                            }
-                        }
-                    }
-                    IrStmt::Function { body, .. } => collect_targets(body, out),
-                    IrStmt::If { then, elsifs, else_, .. } => {
-                        collect_targets(then, out);
-                        for (_, b) in elsifs {
-                            collect_targets(b, out);
-                        }
-                        collect_targets(else_, out);
-                    }
-                    IrStmt::While { body, .. }
-                    | IrStmt::DoWhile { body, .. }
-                    | IrStmt::For { body, .. }
-                    | IrStmt::Block(body)
-                    | IrStmt::Subshell(body) => collect_targets(body, out),
-                    IrStmt::Expr(_) => {
-                        // recurse for nested calls? has_huge_arg handles exprs;
-                        // here just collect targets (no-op for Expr).
-                    }
-                    _ => {}
-                }
-            }
-        }
-        fn has_huge_call(ss: &[IrStmt]) -> bool {
-            for s in ss {
-                match s {
-                    IrStmt::Expr(e) => {
-                        if has_huge_arg(e) {
-                            return true;
-                        }
-                    }
-                    IrStmt::Function { body, .. } => {
-                        if has_huge_call(body) {
-                            return true;
-                        }
-                    }
-                    IrStmt::If { then, elsifs, else_, .. } => {
-                        if has_huge_call(then) {
-                            return true;
-                        }
-                        for (_, b) in elsifs {
-                            if has_huge_call(b) {
-                                return true;
-                            }
-                        }
-                        if has_huge_call(else_) {
-                            return true;
-                        }
-                    }
-                    IrStmt::While { body, .. }
-                    | IrStmt::DoWhile { body, .. }
-                    | IrStmt::For { body, .. }
-                    | IrStmt::Block(body)
-                    | IrStmt::Subshell(body) => {
-                        if has_huge_call(body) {
-                            return true;
-                        }
-                    }
-                    _ => {}
-                }
-            }
-            false
-        }
-        if has_huge_call(stmts) {
-            collect_targets(stmts, out);
-            for sub in subs {
-                collect_targets(&sub.body, out);
-            }
-        }
-    }
+    // Param positions: a huge call argument taints the positional slot it
+    // lands in (`$N`), which `walk_bigint_expr` already records, and the
+    // fixpoint below propagates from there into that body's locals. The
+    // former rule marked EVERY assignment target in main and in every sub
+    // when any call had a huge argument — that is what made one
+    // `f 2**64+1` in a program turn unrelated variables into BigInt.
     for _ in 0..10 {
         let mut changed = false;
         walk_bigint_stmts(stmts, out, &mut changed);
@@ -21200,6 +21028,74 @@ mod tests {
         assert!(
             live.contains("__sh_dw_last"),
             "live $? lost its capture/restore:\n{live}"
+        );
+    }
+
+    /// D4: BigInt scope is DATA FLOW. A huge literal taints the variables it
+    /// can reach, not every assignment target in the program — the old rule
+    /// (`stmts_have_huge` ⇒ `collect_all_assign_targets`) turned an unrelated
+    /// `x = 1` into a BigInt for one `n = 2**64+1` elsewhere.
+    #[test]
+    fn bigint_scope_follows_data_flow_not_the_program() {
+        use crate::ir::{AssignTarget, IrExpr, IrProgram, IrStmt, StrStyle};
+        fn assign(var: &str, expr: IrExpr) -> IrStmt {
+            IrStmt::Assign {
+                targets: vec![AssignTarget { var: var.to_string(), sigil: None, indices: vec![] }],
+                expr,
+                asm: None,
+            }
+        }
+        let prog = IrProgram {
+            imports: vec![],
+            requires: vec![],
+            stmts: vec![
+                // 2**64+1 as decimal text: past i64, so `n` must be BigInt
+                assign("n", IrExpr::Str("18446744073709551617".to_string(), StrStyle::DoubleQuoted)),
+                // an ordinary small var in the SAME program
+                assign("x", IrExpr::Int(1)),
+                // arithmetic ON the huge var: this is the BigInt domain, and
+                // it must stay BigInt while `x` stays i64
+                IrStmt::Expr(IrExpr::Arith(Box::new(crate::ir::ArithAst::Bin {
+                    op: "+".to_string(),
+                    lhs: Box::new(crate::ir::ArithAst::Var("n".to_string())),
+                    rhs: Box::new(crate::ir::ArithAst::Num(1)),
+                }))),
+                IrStmt::Expr(IrExpr::Call {
+                    func: "echo".to_string(),
+                    args: vec![IrExpr::Var("x".to_string(), None)],
+                }),
+            ],
+            subs: vec![],
+            var_types: vec![],
+            stmt_lines: vec![],
+            var_lengths: vec![],
+            var_const: vec![],
+            var_lifetimes: vec![],
+            var_storage: vec![],
+            var_nospace: vec![],
+            var_bash_env: vec![],
+        };
+        let mut big = BTreeSet::new();
+        collect_bigint_vars(&prog.stmts, &prog.subs, &mut big);
+        collect_huge_literal_assigns(&prog.stmts, &mut big);
+        assert!(
+            big.contains("n"),
+            "the huge variable must be BigInt, got {big:?}"
+        );
+        assert!(
+            !big.contains("x"),
+            "an unrelated small variable was swept into BigInt: {big:?}"
+        );
+        // The rendered program must put the huge var's arithmetic in the
+        // BigInt domain and keep the unrelated small var on the i64 path.
+        let out = shir_to_rust(&prog);
+        assert!(
+            out.contains("num_bigint"),
+            "arith on the huge var lost its BigInt rendering:\n{out}"
+        );
+        assert!(
+            out.contains("__SHV_x: std::cell::Cell<i64>"),
+            "the unrelated small var left the i64 path:\n{out}"
         );
     }
 
