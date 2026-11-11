@@ -83,6 +83,8 @@ pub struct Render {
     need_indirect: bool,
     /// `unset` must clear all three homes (`__sh_unset`).
     need_unset: bool,
+    /// `$N` inside arithmetic (`__sh_pnum`).
+    need_pnum: bool,
     /// needs `import glob` + `__sh_glob` (sentinel-tagged glob words)
     need_glob: bool,
     /// needs the `__sh_echo_e` backslash-escape helper (`echo -e`)
@@ -1677,6 +1679,37 @@ impl Render {
             }
         }
         out.push_str(rest);
+        Self::rewrite_pos(&out)
+    }
+
+    /// `$1` / `$12` inside arithmetic text → `__sh_pnum1` / `__sh_pnum12`;
+    /// the walker renders that as a positional read whose UNSET value is 0
+    /// (bash `$(( $1 + 0 ))` with no arguments is 0 —
+    /// dollar-positional-arithmetic printed n=[]).
+    fn rewrite_pos(s: &str) -> String {
+        let mut out = String::with_capacity(s.len() + 4);
+        let mut it = s.chars().peekable();
+        while let Some(c) = it.next() {
+            if c != '$' {
+                out.push(c);
+                continue;
+            }
+            let mut digits = String::new();
+            while let Some(&d) = it.peek() {
+                if d.is_ascii_digit() {
+                    digits.push(d);
+                    it.next();
+                } else {
+                    break;
+                }
+            }
+            if digits.is_empty() {
+                out.push('$');
+            } else {
+                out.push_str("__sh_pnum");
+                out.push_str(&digits);
+            }
+        }
         out
     }
 
@@ -2307,6 +2340,14 @@ impl Render {
                 if let Some(rest) = name.strip_prefix("__sh_len_") {
                     let t = self.py_ident(rest);
                     return format!("len({t})");
+                }
+                // `$N` rewritten by expand_arith_plen (see rewrite_pos)
+                if let Some(rest) = name.strip_prefix("__sh_pnum") {
+                    if !rest.is_empty() && rest.chars().all(|c| c.is_ascii_digit()) {
+                        self.need_pnum = true;
+                        self.need_atoi = true;
+                        return format!("__sh_pnum({rest})");
+                    }
                 }
                 if name.starts_with("__sh_p") || name.starts_with("__sh_a") {
                     self.need_strict = true;
@@ -8945,6 +8986,18 @@ impl Render {
         if self.need_fnmatch {
             self.emit("import fnmatch");
         }
+        if self.need_pnum {
+            // `$N` in arithmetic: the positional's numeric value, and an
+            // unset positional is 0. `_sh_args` is the function-local
+            // parameter tuple; at module level it does not exist.
+            self.emit("def __sh_pnum(i):");
+            self.emit("    try:");
+            self.emit("        args = _sh_args");
+            self.emit("    except NameError:");
+            self.emit("        args = sys.argv[1:]");
+            self.emit("    return __sh_atoi(args[i - 1]) if len(args) >= i else 0");
+            self.emit("");
+        }
         if self.need_unset {
             // `unset v` — the store, the python binding and the env all
             // held a copy; clearing only the store left `${v:-d}` reading
@@ -8952,7 +9005,10 @@ impl Render {
             self.emit("def __sh_unset(shell_name, py_name):");
             self.emit("    import os");
             self.emit("    __sh_store.pop(shell_name, None)");
-            self.emit("    globals().pop(py_name, None)");
+            // BLANK the binding rather than deleting it: later reads emit
+            // the bare python name, and a deleted global is a NameError
+            // (064_20 died with no output at all).
+            self.emit("    globals()[py_name] = \"\"");
             self.emit("    os.environ.pop(shell_name, None)");
             self.emit("");
         }
@@ -9254,6 +9310,11 @@ impl Render {
             // (`basename $(pwd)` passed the list as one argv entry —
             // 000__04a, 999_pwd). Empty words vanish.
             self.emit("    argv = [str(_x) for _a in argv for _x in (_a if isinstance(_a, (list, tuple)) else [_a]) if str(_x) != \"\"]");
+            // a bare redirect (`>file`) has NO command word: bash succeeds
+            // having created the file, so an empty argv is status 0 (not
+            // an IndexError — parse-standalone-redirect).
+            self.emit("    if not argv:");
+            self.emit("        return 0");
             self.emit("    try:");
             self.emit("        return subprocess.call(argv)");
             self.emit("    except OSError:");
@@ -9348,6 +9409,10 @@ impl Render {
             // FIELD SPLITTING first (see __sh_exec): a captured word list
             // is several arguments, not one list-shaped string.
             self.emit("    argv = [str(_x) for _a in argv for _x in (_a if isinstance(_a, (list, tuple)) else [_a]) if str(_x) != \"\"]");
+            // no command word (`$(>file)`): nothing runs, status 0
+            self.emit("    if not argv:");
+            self.emit("        __sh_rc = 0");
+            self.emit("        return \"\"");
             self.emit("    try:");
             self.emit("        out = subprocess.check_output(argv, env=env)");
             self.emit("        __sh_rc = 0");
