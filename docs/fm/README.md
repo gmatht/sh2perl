@@ -1,7 +1,7 @@
 # shIR formal semantics — the text-ops slice
 
 `TextOps/` is a machine-checked denotational semantics for a first slice of
-shIR. It is split into four theories that build as one session:
+shIR. It is split into five theories that build as one session:
 
 | Theory | Covers |
 |---|---|
@@ -9,9 +9,10 @@ shIR. It is split into four theories that build as one session:
 | `ShIR_TextOps_Strip` | the newline strip of command substitution (`NewlineStrip`), on the reversed byte string. |
 | `ShIR_TextOps_SortUniq` | the two ordering nodes `SortLines` / `UniqLines` (`try_lower_sort` / `try_lower_uniq`), modelled over the list of lines. |
 | `ShIR_TextOps_Compose` | the composition nodes `Split` / `ArrayLen` / `FieldExtract`, the `ArrayLen(Split(...))` reading of `wc -w`, and `cut`'s delimiter split (which KEEPS empty fields). |
+| `ShIR_TextOps_Space` | each engine's measured `\s` class (`measure-space.sh` is the pin), the word count over an ARBITRARY class (`nwords_by`), and where the emitted word split diverges from `wc -w` — with proved witnesses and an ASCII-soundness result per engine. |
 
 ```
-isabelle build -D sh2perl/docs/fm/TextOps      # HOL only, no AFP, ~10 s
+isabelle build -D sh2perl/docs/fm/TextOps      # HOL only, no AFP, ~30 s
 ```
 
 Nothing here models shell state, streams or command execution. `wc` is a
@@ -35,6 +36,10 @@ node contract — "this node means this value, in every renderer" — lives.
 | …and the filtered split is the one that has to be filtered | `unfiltered_split_overcounts_leading`, `unfiltered_split_overcounts_trailing`, `filtered_split_counts_*` | Two negative controls: an unfiltered split of `" a"` returns two fields for one word, and the filtered idiom returns one. The drop-empty step is load-bearing, not cosmetic. |
 | A field is never empty and never contains whitespace | `split_ws_fields_clean`, `field_scan_no_empty`, `field_scan_ws_free` | Composition needs the shape, not just the count: `StrLen(FieldExtract(...))` downstream of a `Split` measures a word, not a run of whitespace. |
 | `cut -dD -fN` keeps the empty fields | `length_split_on`, `cut_keeps_empty_field`, `cut_empty_field_is_empty`, `cut_field_two` | `a,,b` with `-d, -f2` is the empty string, and it is NOT what the whitespace split would return (`ws_split_would_lose_empty_field`) — the two splits are deliberately different nodes' business. |
+| Every engine's class CONTAINS POSIX space, and each divergence is an equation | `posix_subset_all`, `js_extra_locus`, `py_extra_locus`, `perl_extra_locus`, `go_extra_locus`, `perl_bytes_extra_locus` | "Where the emit is wrong" is a proved predicate over every byte, not a paragraph. Every class is a SUPERSET of `is_ws`, so no renderer splits LESS than the shell: divergences are always over-counts. |
+| …and the differences are exactly the documented ones | `posix_is_the_ascii_part_of_unicode`, `perl_bytes_is_unicode_minus`, `js_is_unicode_plus_bom_minus_nel`, `py_is_unicode_plus_ascii_separators`, `go_measured_is_unicode`, `perl_unicode_measured_is_unicode` | JS carries U+FEFF and loses U+0085; Python adds 0x1C..0x1F BELOW 128; Perl's own class depends on whether the string is upgraded (a runtime property, not a codegen one) — the byte model loses NBSP and NEL. |
+| The emitted expression is NOT the node's value — proved, twice | `js_nbsp_rendering_is_not_the_model`, `python_separator_rendering_is_not_the_model` | NBSP in UTF-8 (0xC2 0xA0) is one word to `wc -w` and two to `\s`-splitting JS; 0x1C is one word to `wc -w` and two to Python's `str.split()`, and it is ASCII. |
+| An ASCII source is sufficient for three renderers and INSUFFICIENT for Python | `js_ascii_rendering_is_sound`, `go_ascii_rendering_is_sound`, `perl_unicode_ascii_rendering_is_sound`, `python_has_no_ascii_guard`, `rendering_is_sound_exactly_for_the_posix_classes` | The guard `lowered_wc` already applies to `StrLen` would fix JS/Go/Perl and cannot fix Python: `python_has_no_ascii_guard` refutes the guarded statement with an ASCII string. |
 
 ## Deliberate modelling choices
 
@@ -58,6 +63,13 @@ node contract — "this node means this value, in every renderer" — lives.
   they are separate nodes' business: `wc -w` counts words, `cut -f2` picks a
   column, and `cut` on `a,,b` must yield the empty field. Collapsing them
   into one "split" would make the model disagree with `cut`.
+- **The classes are MEASURED, and the measurement is committed.**
+  `TextOps/measure-space.sh` prints each engine's whitespace class over
+  U+0000..U+10FFFF with the version strings it ran against, so the
+  `*_ws_list` tables can be re-derived rather than trusted as a doc quote.
+  The lists are defined independently (not as "Unicode plus these"), which
+  makes every relation between them a proof (`*_extra_locus`,
+  `perl_bytes_is_unicode_minus`) instead of a re-definition.
 - **`FieldExtract` is modelled as "the N-th field, or nothing"**
   (`field_or_empty`), 1-based like `cut`, with the past-the-end case
   printing an empty line rather than erroring. The node's `fields` field is
@@ -79,16 +91,33 @@ never faked with `sorry` (the session is `quick_and_dirty = false`):
 - **`drop_runs_idem` / `drop_runs_no_adjacent_eq`**, and hence
   **`sort -u = uniq . sort`**: the run collapse is idempotent and invents
   nothing.
-- **`\s` is not POSIX space** (`ShIR_TextOps_Compose`): every Perl/Estree
-  renderer spells the word split `/\s+/`, which in those languages is
-  Unicode-space-aware, while the shell's `IFS` is the six ASCII bytes
-  `is_ws` lists. `nbsp_is_not_posix_space` and `nbsp_is_not_ascii` pin the
-  divergence; the semantics of the engines' class is not modelled, so the
-  gap is recorded rather than closed.
 - **`FieldExtract`'s ranges and `--output-delimiter`**: the model covers
   `-fN` only. `-fN-M`, `-fN,`, `--complement` and `-o` splicing are
   unmodelled, so `fields: vec_field_range` and `output_delimiter` carry no
   obligation yet.
+
+### Closed: `\s` is not POSIX space (2026-11-11)
+
+This was the first open target this list carried. `ShIR_TextOps_Space` closed it the
+way the entry said it had to be closed — by putting the engines' class in the
+model — and the answer is narrower and less comfortable than the prose was:
+
+- every measured class is a SUPERSET of POSIX space, so the divergence is
+  always an over-count, and the extra bytes are listed by `*_extra_locus`
+  as equations over all `c`;
+- the emit is refuted by two evaluated witnesses (NBSP over UTF-8 for JS,
+  0x1C for Python), and the ASCII-soundness result holds for JS, Go and Perl
+  (Unicode model) but not Python, where the counterexample is itself ASCII;
+- Perl's DEFAULT (byte) `\s` is a different set from its Unicode one, so the
+  class is a property of the run-time string, not of the emitted code —
+  `perl_bytes_is_unicode_minus`;
+- Java, C and Sh render `wc -w` through `shWcWords` / `_sh_wc_words`, not
+  through a regex split, so this gap is a property of the Perl/Estree/Go/
+  Rust/Python renderers only.
+
+What is deliberately NOT decided: whether the fix is to refuse `-w` on
+non-ASCII sources, to narrow each renderer to `[\t\n\v\f\r ]`, or to count
+bytes. Each needs the locus lists and none is a proof obligation.
 
 ## Box-health note (why the proofs look odd in places)
 

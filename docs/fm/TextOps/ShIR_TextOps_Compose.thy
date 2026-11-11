@@ -409,16 +409,21 @@ lemma ws_split_would_lose_empty_field:
   "split_ws [97, 44, 44, 98] = [[97, 44, 44, 98]]"
   by eval
 
-section \<open>Open target: `\\s` is not POSIX space\<close>
+section \<open>The `\\s` gap: taken up in `ShIR_TextOps_Space`\<close>
 
-text \<open>The renderers' whitespace class is the engine's `\\s`, and the model's
-  is POSIX `[:space:]`. They agree on ASCII bytes and differ on the
-  non-ASCII spaces JS and PCRE fold into `\\s` — U+00A0 (NBSP) above all.
-  `wc -w` counts NBSP as an ordinary byte, so a source containing one is
-  counted differently by `ArrayLen(Split t)` than by the node's meaning.
-  Proved: NBSP is not posix space. NOT proved, and recorded as the open
-  target: that the two disagree on such a source (it needs the engines'
-  `\\s` in the model, which this slice does not have).\<close>
+text \<open>The renderers' whitespace class is the engine's `\\s`; the model's is
+  POSIX `[:space:]`. This section used to record the difference as an open
+  target, because closing it needs the engines' class IN the model. That is
+  now the fifth theory of this session: `ShIR_TextOps_Space` transcribes each
+  engine's measured class, puts the word count over an arbitrary class
+  (`nwords_by`), proves the ASCII-agreement results, and proves two witnesses
+  that the emit is not the node's value — including a plain-ASCII one for
+  Python, which no source guard can exclude.
+
+  All that stays here is the byte-level fact the gap starts from: NBSP
+  (U+00A0) is not a POSIX space, and as a UTF-8 encoding it is not ASCII
+  either, so the guard `lowered_wc` uses for `StrLen` would not have covered
+  it.\<close>
 
 lemma nbsp_is_not_posix_space: "\<not> is_ws (160::nat)"
   unfolding is_ws_def by simp

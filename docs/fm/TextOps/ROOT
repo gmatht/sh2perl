@@ -5,3 +5,4 @@ session TextOps = HOL +
     ShIR_TextOps_Strip
     ShIR_TextOps_SortUniq
     ShIR_TextOps_Compose
+    ShIR_TextOps_Space
