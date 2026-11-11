@@ -77,6 +77,8 @@ pub struct Render {
     need_aset: bool,
     /// `${x:-d}` / `${x:=d}` / `${x:?m}` helpers (`__sh_param_or`).
     need_param_ops: bool,
+    /// `arr+=(items)` helper (`__sh_arr_add`).
+    need_arr: bool,
     /// needs `import glob` + `__sh_glob` (sentinel-tagged glob words)
     need_glob: bool,
     /// needs the `__sh_echo_e` backslash-escape helper (`echo -e`)
@@ -2338,6 +2340,11 @@ impl Render {
                     format!(
                         "(({l} % __sh_atoi({r})) if __sh_atoi({r}) != 0 else \"\")"
                     )
+                } else if matches!(op.as_str(), "<" | ">" | "<=" | ">=" | "==" | "!=") {
+                    // an arith comparison yields 0/1, never a python bool:
+                    // `echo $(( x > 2 ))` printed `True`
+                    // (redirect-in-arithmetic).
+                    format!("(1 if {l} {op} {r} else 0)")
                 } else {
                     format!("({l} {op} {r})")
                 }
@@ -4089,8 +4096,29 @@ impl Render {
             "arrayIndex" => {
                 if let Some(IrExpr::Str(name, _)) = args.first() {
                     // native list home with a bounds default (bash reads
-                    // an unset element as "")
-                    let m = self.py_ident(name);
+                    // an unset element as ""). An UNDECLARED array is empty
+                    // in bash, never a NameError (063_02's `${array[..]}`).
+                    let m = if self.written.contains(name)
+                        || self.var_types.contains_key(name)
+                        || self.assoc.contains(name)
+                    {
+                        self.py_ident(name)
+                    } else {
+                        format!("globals().get({}, [])", Self::py_str(name))
+                    };
+                    if self.assoc.contains(name) {
+                        // an associative key is TEXT, so `$i,$j` expands;
+                        // going through the arith walker read the literal
+                        // string "$i,$j" and raised KeyError (058).
+                        let key = match args.get(1) {
+                            Some(IrExpr::Str(s, _)) => self.expand_str(s),
+                            Some(a) => self.expr(a),
+                            None => Self::py_str(""),
+                        };
+                        return format!(
+                            "({m}.get({key}, '') if isinstance({m}, dict) else '')"
+                        );
+                    }
                     // the index may be an arithmetic STRING
                     // (`${arr[(2*$i)-1]}` arrives unparsed): normalize
                     // `$refs` and lower through the Arith walker.
@@ -4138,7 +4166,13 @@ impl Render {
                         }
                         None => "[]".to_string(),
                     };
-                    return format!("({m} + {elems})");
+                    // `arr+=(a b)` on an UNSET array: bash starts from an
+                    // empty array, python from "" — `z = (z + ["a", "b"])`
+                    // died with TypeError (051_primes). The helper also
+                    // keeps a scalar right-hand side as ONE element
+                    // (`z+=${arr[@]:0:1}` is a word, not its characters).
+                    self.need_arr = true;
+                    return format!("__sh_arr_add({m}, {elems})");
                 }
                 self.sh2_call("setArrayAppend", args)
             }
@@ -8669,6 +8703,20 @@ impl Render {
         }
         if self.need_fnmatch {
             self.emit("import fnmatch");
+        }
+        if self.need_arr {
+            // `arr+=(a b)` / `arr+=${other[@]:0:1}` — append keeps bash's
+            // "unset arrays are empty" rule and never splits a scalar.
+            self.emit("def __sh_arr_add(cur, items):");
+            self.emit("    base = cur if isinstance(cur, list) else ([] if cur == \"\" or cur is None else [cur])");
+            self.emit("    if isinstance(items, (list, tuple)):");
+            self.emit("        add = list(items)");
+            self.emit("    elif items == \"\" or items is None:");
+            self.emit("        add = []");
+            self.emit("    else:");
+            self.emit("        add = [items]");
+            self.emit("    return base + add");
+            self.emit("");
         }
         if self.need_param_ops {
             // bash's default-operator family. `__sh_scalar` is the array
