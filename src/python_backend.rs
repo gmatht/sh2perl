@@ -257,11 +257,27 @@ impl Render {
                 "    buf = io.StringIO()\n",
                 "    try:\n",
                 "        with contextlib.redirect_stdout(buf):\n",
-                "            fn(*(list(args or [])))\n",
+                "            res = fn(*(list(args or [])))\n",
                 "    except Exception:\n",
                 "        globals()[\"__sh_rc\"] = 1\n",
                 "        return \"\"\n",
-                "    return buf.getvalue().rstrip(\"\\n\")\n",
+                "    out = buf.getvalue()\n",
+                "    if out:\n",
+                "        return out.rstrip(\"\\n\")\n",
+                "    # a function whose body ends in `echo` lowers to\n",
+                "    # `return <text>` (the echo-as-value transform), so a\n",
+                "    # STATEMENT-level call produced no output at all while bash\n",
+                "    # printed the echo. The buffer still wins when the function\n",
+                "    # really wrote to stdout: bash output is the echoes, and the\n",
+                "    # return value is only a status.\n",
+                "    if isinstance(res, str):\n",
+                "        return res.rstrip(\"\\n\")\n",
+                "    # numeric echoes lower to the same `return <value>` shape\n",
+                "    # (`echo $((x * y))`); bool is excluded because a function\n",
+                "    # ending in a test does not print True in bash.\n",
+                "    if isinstance(res, (int, float)) and not isinstance(res, bool):\n",
+                "        return str(res)\n",
+                "    return \"\"\n",
             ),
         ),
         (
@@ -1583,6 +1599,20 @@ impl Render {
             || p.contains("!(")
     }
 
+    /// True when the operand is ONE fully quoted word (`"a*"`, `'a*'`).
+    /// bash keeps such an operand literal — quotes turn every metachar in
+    /// them into text — so `[[ $x == "a*" ]]` matches only the literal
+    /// two characters `a*`, even though `has_glob` sees a `*`.
+    fn fully_quoted(p: &str) -> bool {
+        let t = p.trim();
+        let b = t.as_bytes();
+        if b.len() < 2 || (b[0] != b'"' && b[0] != b'\'') || b[b.len() - 1] != b[0] {
+            return false;
+        }
+        let inner = &t[1..t.len() - 1];
+        !inner.contains(b[0] as char)
+    }
+
     // ── expressions ──────────────────────────────────────────────────
 
     fn expr(&mut self, e: &IrExpr) -> String {
@@ -2165,6 +2195,12 @@ impl Render {
                 // with no $1 is `+ 0`), which aborts the expansion.
                 if name.starts_with("__sh_p") || name.starts_with("__sh_a") {
                     self.need_strict = true;
+                    // the helper lives in the `need_atoi` prelude block: a
+                    // function body that uses a positional operand
+                    // (`f() { echo $(( $1 + $1 )); }`) referenced an
+                    // UNDEFINED `__sh_arith_operand` (NameError swallowed
+                    // into an empty echo — sync-loop-function-call).
+                    self.need_atoi = true;
                     return format!("__sh_arith_operand({})", self.py_ident(name));
                 }
                 // bash coerces arith operands to integers; python would
@@ -5210,11 +5246,60 @@ impl Render {
         // statements must be flattened before shell-texting.
         let flat = Self::flatten_subs(body);
         let inner = self.body_shell_text(&flat)?;
-        let mut text = format!("( {inner} )");
-        for r in redirs {
-            text.push(' ');
-            text.push_str(&self.redirect_shell_text(r)?);
-        }
+        // A heredoc body is NOT one-line shell text, so
+        // `redirect_shell_text` refuses it and the whole capture used to
+        // fall through to the stub: `result=$(cat <<'EOF' … EOF)` captured
+        // the empty string while bash captured the body (heredoc-apostrophe,
+        // heredoc-with-quotes, heredoc-python-fstring, parse-heredoc-tab).
+        // Build the command text here instead: the OPENING delimiter is
+        // quoted iff the body is literal, the closer is always bare.
+        let heredoc = redirs.iter().find_map(|r| {
+            let IrExpr::Object(props) = r else {
+                return None;
+            };
+            let mut mode = String::new();
+            let mut fd: Option<i64> = None;
+            let mut target: Option<&IrExpr> = None;
+            let mut interp = true;
+            for (k, v) in props {
+                match k.as_str() {
+                    "mode" => {
+                        if let IrExpr::Str(s, _) = v {
+                            mode = s.clone();
+                        }
+                    }
+                    "fd" => {
+                        if let IrExpr::Int(n) = v {
+                            fd = Some(*n);
+                        }
+                    }
+                    "target" => target = Some(v),
+                    "interpolate" => {
+                        if let IrExpr::Bool(b) = v {
+                            interp = *b;
+                        }
+                    }
+                    _ => {}
+                }
+            }
+            if fd != Some(0) || !(mode == "heredoc" || mode == "heredoc-tabs") {
+                return None;
+            }
+            let content = Self::redirect_target_lit(target?)?;
+            let open = if interp { "__HEREDOC__" } else { "'__HEREDOC__'" };
+            Some(format!("{inner} <<{open}\n{content}__HEREDOC__"))
+        });
+        let text = match heredoc {
+            Some(t) => t,
+            None => {
+                let mut t = format!("( {inner} )");
+                for r in redirs {
+                    t.push(' ');
+                    t.push_str(&self.redirect_shell_text(r)?);
+                }
+                t
+            }
+        };
         self.need_subprocess = true;
         let (env, pos) = (self.bash_env(), self.bash_pos());
         Some(format!(
@@ -5676,7 +5761,13 @@ impl Render {
                 if matches!(op.as_str(), "=" | "==" | "!=") {
                     let ag = Self::has_glob(a.trim().trim_matches('"').trim_start_matches('$'));
                     let bg = Self::has_glob(b.trim().trim_matches('"').trim_start_matches('$'));
-                    if dbl && ag != bg {
+                    // A fully quoted operand is a LITERAL string, never a
+                    // pattern, so it must not reach the glob matcher at all
+                    // (test-glob-rhs-fallback, test-literal-string-compare):
+                    // `has_glob` strips the quotes before testing, so the
+                    // raw token has to be consulted here.
+                    let quoted_pat = Self::fully_quoted(if ag { a } else { b });
+                    if dbl && ag != bg && !quoted_pat {
                         // one side is the pattern, the other the value —
                         // both render through test_value (var reads stay
                         // reads, literals stay literals).
@@ -6746,7 +6837,18 @@ impl Render {
     /// literal; a native-written name (a lifted temp) → ident; otherwise a
     /// quoted string.
     fn test_value(&mut self, t: &str) -> String {
-        let t = t.trim().trim_matches('"');
+        // A QUOTED operand is a string even when it looks like a number:
+        // bash `[ "10" = "010" ]` compares TEXT (distinct), so the numeric
+        // branch below must not fire for it — it parsed `010` to `10` and
+        // printed the `bad` arm (test-literal-string-compare).
+        let trimmed = t.trim();
+        let was_quoted = {
+            let b = trimmed.as_bytes();
+            b.len() >= 2
+                && (b[0] == b'"' || b[0] == b'\'')
+                && b[b.len() - 1] == b[0]
+        };
+        let t = trimmed.trim_matches(|c| c == '"' || c == '\'');
         // Whether the token came from a `$` read (vs a bare literal):
         // only a `$`-originated name may fall back to the environment —
         // a bare literal (`hello` in `[ "$x" = "hello" ]`) must stay a
@@ -6853,6 +6955,9 @@ impl Render {
             // in tests). Gated on was_dollar: a bare literal must stay
             // a literal (090's `"hello"` broke otherwise).
             format!("os.environ.get({}, \"\")", Self::py_str(t))
+        } else if was_quoted {
+            // quoted text: never a number (`"010"` is not 10)
+            Self::py_str(t)
         } else if let Ok(n) = t.parse::<i64>() {
             n.to_string()
         } else if t.starts_with("((") && t.ends_with("))") {
@@ -9460,6 +9565,63 @@ mod tests {
         let mut b = Render::default();
         let lit = b.test_render("$x = @(a|b)", false).expect("test");
         assert!(!lit.contains("__sh_glob_match"), "{lit}");
+    }
+
+    /// A quoted numeric operand stays TEXT: `[ "10" = "010" ]` is the
+    /// false branch, not `str(10) == str(10)`.
+    #[test]
+    fn quoted_numeric_test_operand_is_text() {
+        let mut r = Render::default();
+        let cond = r.test_render("\"10\" = \"010\"", false).expect("test");
+        assert!(cond.contains("\"010\""), "{cond}");
+        assert!(!cond.contains("str(10) == str(10)"), "{cond}");
+        // an UNQUOTED numeric still renders as a number
+        let mut n = Render::default();
+        let num = n.test_render("10 -eq 010", false).expect("test");
+        assert!(num.contains("__sh_atoi(10)"), "{num}");
+    }
+
+    /// `$(cat <<'EOF' … EOF)` captures the BODY, not the empty string the
+    /// refused one-line redirect used to leave behind.
+    #[test]
+    fn capture_heredoc_reads_body() {
+        let mut r = Render::default();
+        let obj = IrExpr::Object(vec![
+            ("fd".to_string(), IrExpr::Int(0)),
+            ("mode".to_string(), st("heredoc")),
+            ("target".to_string(), st("it's fine\n")),
+            ("interpolate".to_string(), IrExpr::Bool(false)),
+        ]);
+        let args = vec![
+            IrExpr::Arrow(vec![IrStmt::Expr(IrExpr::Call {
+                func: "exec".to_string(),
+                args: ex("cat", vec![]),
+            })]),
+            IrExpr::Array(vec![obj]),
+        ];
+        let out = r.capture_redirect(&args).expect("heredoc capture");
+        // literal body → quoted opening delimiter, bare closer
+        assert!(out.contains("<<'__HEREDOC__'" ), "{out}");
+        assert!(out.contains("it's fine"), "{out}");
+        assert!(r.need_subprocess, "the capture must run through the seam");
+    }
+
+    /// `[[ $x == "a*" ]]` — a FULLY quoted operand is literal text, never
+    /// a pattern, even though `has_glob` sees the `*` after stripping the
+    /// quotes (`test-glob-rhs-fallback`, `test-literal-string-compare`).
+    #[test]
+    fn quoted_operand_is_literal() {
+        assert!(Render::fully_quoted("\"a*\""));
+        assert!(Render::fully_quoted("'a*'"));
+        assert!(!Render::fully_quoted("a*"));
+        assert!(!Render::fully_quoted("\"a*'"));
+        assert!(!Render::fully_quoted("\"a\"*\""));
+        let mut q = Render::default();
+        let quoted = q.test_render("$x == \"a*\"", true).expect("test");
+        assert!(!quoted.contains("__sh_glob_match"), "{quoted}");
+        let mut u = Render::default();
+        let bare = u.test_render("$x == a*", true).expect("test");
+        assert!(bare.contains("__sh_glob_match"), "{bare}");
     }
 
     /// `mkdir -p` / `touch` / `sleep` lower to os/time.
