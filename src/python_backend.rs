@@ -73,6 +73,10 @@ pub struct Render {
     need_glob_match: bool,
     /// `[[ ]]` equality needs the same nocasematch fold (`__sh_str_eq`).
     need_str_eq: bool,
+    /// arith assignment/incdec store-back helpers (`__sh_aset`).
+    need_aset: bool,
+    /// `${x:-d}` / `${x:=d}` / `${x:?m}` helpers (`__sh_param_or`).
+    need_param_ops: bool,
     /// needs `import glob` + `__sh_glob` (sentinel-tagged glob words)
     need_glob: bool,
     /// needs the `__sh_echo_e` backslash-escape helper (`echo -e`)
@@ -1626,6 +1630,17 @@ impl Render {
     /// bash keeps such an operand literal — quotes turn every metachar in
     /// them into text — so `[[ $x == "a*" ]]` matches only the literal
     /// two characters `a*`, even though `has_glob` sees a `*`.
+    /// Strip ONE layer of surrounding shell quotes (`"add"` → `add`).
+    fn strip_quotes(p: &str) -> String {
+        let t = p.trim();
+        let b = t.as_bytes();
+        if b.len() >= 2 && (b[0] == b'"' || b[0] == b'\'') && b[b.len() - 1] == b[0] {
+            t[1..t.len() - 1].to_string()
+        } else {
+            t.to_string()
+        }
+    }
+
     fn fully_quoted(p: &str) -> bool {
         let t = p.trim();
         let b = t.as_bytes();
@@ -2282,7 +2297,15 @@ impl Render {
                 let k = self.arith(key);
                 self.need_elem = true;
                 self.need_atoi = true;
-                format!("__sh_atoi(__sh_elem({}, {}))", self.py_ident(var), k)
+                // an array the script never ASSIGNED is empty in bash, not
+                // a NameError (063_02 reads `${array[${index}]}` where
+                // `array` is undeclared).
+                let target = if self.written.contains(var) || self.var_types.contains_key(var) {
+                    self.py_ident(var)
+                } else {
+                    format!("globals().get({}, [])", Self::py_str(var))
+                };
+                format!("__sh_atoi(__sh_elem({}, {}))", target, k)
             }
             ArithAst::Bin { op, lhs, rhs } => {
                 let l = self.arith(lhs);
@@ -2300,12 +2323,21 @@ impl Render {
                     // bash `/` truncates toward zero; division by zero is
                     // an error with an EMPTY value (the assignment
                     // continues — parse-arithmetic-extra-paren.sh) — never
-                    // a python ZeroDivisionError.
-                    format!("(int({l} / {r}) if {r} != 0 else \"\")")
+                    // a python ZeroDivisionError. The divisor is coerced:
+                    // an EMPTY divisor is a str, and `int / str` raised
+                    // TypeError instead of taking the guard
+                    // (063_hard_to_parse).
+                    self.need_atoi = true;
+                    format!(
+                        "(int({l} / __sh_atoi({r})) if __sh_atoi({r}) != 0 else \"\")"
+                    )
                 } else if op == "%" {
                     // same zero-divisor rule as `/` (bash `%` by zero
                     // errors with an empty value).
-                    format!("(({l} % {r}) if {r} != 0 else \"\")")
+                    self.need_atoi = true;
+                    format!(
+                        "(({l} % __sh_atoi({r})) if __sh_atoi({r}) != 0 else \"\")"
+                    )
                 } else {
                     format!("({l} {op} {r})")
                 }
@@ -2323,10 +2355,33 @@ impl Render {
                 self.arith(test),
                 self.arith(else_)
             ),
-            ArithAst::Assign { .. } | ArithAst::IncDec { .. } => {
-                // runtime setVar semantics (x+=, x++) — sh2.arith stub
-                self.sh2_calls.insert("arith".into());
-                format!("sh2_arith()")
+            ArithAst::Assign { var, op, rhs } => {
+                // `(( x = 3 ))` / `x=$(( x += 2 ))`: bash stores the numeric
+                // result back into the variable and the EXPRESSION value is
+                // that result. A walrus cannot express the per-operator
+                // coercion, so the runtime helper does the store — through
+                // globals(), which is the variable's home (the renderer
+                // emits `global x` for every assigned name).
+                self.need_aset = true;
+                // the helper stores under the PYTHON name (`sorted` is
+                // `sorted_`), so the ident is passed, not the shell text
+                let target = self.py_ident(var);
+                format!(
+                    "__sh_aset({}, {}, {})",
+                    Self::py_str(&target),
+                    Self::py_str(op),
+                    self.arith(rhs)
+                )
+            }
+            ArithAst::IncDec { var, delta, prefix } => {
+                self.need_aset = true;
+                let target = self.py_ident(var);
+                format!(
+                    "__sh_incdec({}, {}, {})",
+                    Self::py_str(&target),
+                    delta,
+                    if *prefix { "False" } else { "True" }
+                )
             }
             ArithAst::Sizeof(ty) => ty.c_sizeof().unwrap_or(4).to_string(),
             ArithAst::Cast { arg, .. } => self.arith(arg),
@@ -3406,6 +3461,14 @@ impl Render {
                             self.need_rc = true;
                             return "str(__sh_rc)".into();
                         }
+                        // `$-` — the option flags of the running shell. A
+                        // non-interactive script executed as `bash <file>`
+                        // always has hashall (h) and braceexpand (B) on,
+                        // which is exactly what the corpus measures; there
+                        // is nothing else to observe from a python process.
+                        "-" => {
+                            return "\"hB\"".into();
+                        }
                         // `$0` — the script's own path. The gate exports
                         // SH2_ARGV0="$f" (the exact string `bash "$f"`
                         // sees, fish-arm precedent); standalone runs fall
@@ -3683,10 +3746,55 @@ impl Render {
                                 }
                                 _ => self.expr(def),
                             };
+                            if op == ":=" || op == "=" {
+                                // bash ASSIGNS the default when the value is
+                                // empty, and that assignment is observable
+                                // later (027: `${maybe:?error}` printed the
+                                // default only because `${maybe:=default}`
+                                // stored it).
+                                self.need_param_ops = true;
+                                let tgt = self.py_ident(name);
+                                return format!(
+                                    "__sh_param_set({}, {v}, {d})",
+                                    Self::py_str(&tgt)
+                                );
+                            }
+                            // `__sh_param_or` also flattens an ARRAY read to
+                            // its element 0, which is what `${arr:-}` means
+                            // (parse-array-plusassign printed a list repr).
+                            self.need_param_ops = true;
                             if op == ":-" || op == "-" {
-                                return format!("({v} if {v} != \"\" else {d})");
+                                return format!("__sh_param_or({v}, {d})");
                             }
                             return format!("({v} if {v} != \"\" else ({d}))");
+                        }
+                    }
+                    // `${x:?msg}` — the value, or a diagnostic that aborts
+                    // the shell; the stub printed nothing at all
+                    // (027_parameter_expansion_defaults).
+                    if op == ":?" || op == "?" {
+                        if let Some(IrExpr::Str(name, _)) = args.get(1) {
+                            let v = self.call("getVar", &[IrExpr::Str(
+                                name.to_string(),
+                                crate::ir::StrStyle::DoubleQuoted,
+                            )]);
+                            let d = match args.get(2) {
+                                Some(IrExpr::Str(s, _)) => {
+                                    let uq: &str = if s.starts_with('"')
+                                        && s.ends_with('"')
+                                        && s.len() >= 2
+                                    {
+                                        &s[1..s.len() - 1]
+                                    } else {
+                                        s.as_str()
+                                    };
+                                    Self::py_str(uq)
+                                }
+                                Some(other) => self.expr(other),
+                                None => Self::py_str(""),
+                            };
+                            self.need_param_ops = true;
+                            return format!("__sh_param_req({v}, {d})");
                         }
                     }
                     // \${s:off:len}` — substring slice
@@ -3847,7 +3955,18 @@ impl Render {
                             if name.ends_with(']') {
                                 let base = &name[..lb];
                                 let sub = &name[lb + 1..name.len() - 1];
-                                let b = self.py_ident(base);
+                                // an array the script never assigned is
+                                // EMPTY in bash — `case "${words[$c]}"` with
+                                // no `words` is a NameError in python
+                                // (parse-redirect-in-case-pattern, 063_02).
+                                let b = if self.written.contains(base)
+                                    || self.var_types.contains_key(base)
+                                    || self.assoc.contains(base)
+                                {
+                                    self.py_ident(base)
+                                } else {
+                                    format!("globals().get({}, [])", Self::py_str(base))
+                                };
                                 if sub == "@" || sub == "*" {
                                     return format!("\" \".join(str(_e) for _e in {b})");
                                 }
@@ -4083,9 +4202,15 @@ impl Render {
                     let (env, pos) = (self.bash_env(), self.bash_pos());
                     let is_dbl = matches!(args.get(1), Some(IrExpr::Str(b, _)) if b == "[[");
                     let (ob, cb) = if is_dbl { ("[[", "]]") } else { ("[", "]") };
+                    // Rebuild the test with SPACES between its words: the
+                    // stored text has dropped them (`$(uname -r)==5.4.*`),
+                    // and bash reads `[[ a==b ]]` as ONE non-empty word —
+                    // always TRUE, so test-expr-float printed `match` for
+                    // any kernel.
+                    let spaced = Self::test_tokens(s).join(" ");
                     return format!(
                         "(__sh_bash({}, {pos}, {env}).returncode == 0)",
-                        Self::py_str(&format!("{ob} {s} {cb}"))
+                        Self::py_str(&format!("{ob} {spaced} {cb}"))
                     );
                 }
                 self.sh2_stub        (
@@ -4126,7 +4251,16 @@ impl Render {
                         if op == "=" {
                             return format!("({m} := {v})");
                         }
-                        return format!("({m} {op} {v} or {m})");
+                        // a COMPOUND op cannot be a walrus: `({m} += v or
+                        // {m})` is a python SyntaxError (051_primes died
+                        // before its first print). The store helper does
+                        // the coercion and returns the new value.
+                        self.need_aset = true;
+                        return format!(
+                            "__sh_aset({}, {}, {v})",
+                            Self::py_str(&m),
+                            Self::py_str(&op)
+                        );
                     }
                 }
                 self.sh2_stub("assign", args, "assign")
@@ -4813,7 +4947,12 @@ impl Render {
             IrExpr::Int(i) => Some(i.to_string()),
             IrExpr::Call { func, args } if func == "getVar" => {
                 if let Some(IrExpr::Str(n, _)) = args.first() {
-                    Some(format!("${n}"))
+                    // QUOTED expansion: an unset `$A` must still be an
+                    // ARGUMENT (bash: `test "$A" -ef "$B"` passes two
+                    // empty words and is FALSE; the bare form made the
+                    // child see `test -ef`, one non-empty word and TRUE
+                    // — parse-ef-test-operator printed `same file`).
+                    Some(format!("\"${{{n}}}\"") )
                 } else {
                     None
                 }
@@ -7582,13 +7721,21 @@ impl Render {
                         .iter()
                         .filter(|p| p.as_str() != "*")
                         .map(|p| {
-                            if Self::has_glob(p) {
+                            // bash case patterns are ALWAYS patterns, even when
+                            // written quoted — the quotes only shield the text
+                            // from expansion (`case $op in "add")` matches
+                            // `add`). Leaving them in made every quoted arm
+                            // fall through to `*` (061 printed "Unknown
+                            // operation: add", parse-comment-in-brace took
+                            // its default arm for an empty subject).
+                            let p = Self::strip_quotes(p);
+                            if Self::has_glob(&p) {
                                 // case patterns are shopt-sensitive too
                                 // (nocasematch, extglob operators).
                                 self.need_glob_match = true;
-                                format!("__sh_glob_match({}, {})", d, Self::py_str(p))
+                                format!("__sh_glob_match({}, {})", d, Self::py_str(&p))
                             } else {
-                                format!("{d} == {}", Self::py_str(p))
+                                format!("{d} == {}", Self::py_str(&p))
                             }
                         })
                         .collect();
@@ -8522,6 +8669,68 @@ impl Render {
         }
         if self.need_fnmatch {
             self.emit("import fnmatch");
+        }
+        if self.need_param_ops {
+            // bash's default-operator family. `__sh_scalar` is the array
+            // rule: a bare `${arr}` / `${arr:-d}` names ELEMENT 0, never
+            // the list (a python list repr leaked into the output).
+            self.emit("def __sh_scalar(v):");
+            self.emit("    if isinstance(v, (list, tuple)):");
+            self.emit("        return v[0] if v else \"\"");
+            self.emit("    return v");
+            self.emit("");
+            self.emit("def __sh_param_or(v, d):");
+            self.emit("    v = __sh_scalar(v)");
+            self.emit("    return v if v != \"\" else d");
+            self.emit("");
+            self.emit("def __sh_param_set(name, v, d):");
+            self.emit("    v = __sh_scalar(v)");
+            self.emit("    if v == \"\":");
+            self.emit("        globals()[name] = d");
+            self.emit("        os.environ[name] = str(d)");
+            self.emit("        return d");
+            self.emit("    return v");
+            self.emit("");
+            self.emit("def __sh_param_req(v, msg):");
+            self.emit("    v = __sh_scalar(v)");
+            self.emit("    if v == \"\":");
+            self.emit("        sys.stderr.write(str(msg) + chr(10))");
+            self.emit("        sys.exit(2)");
+            self.emit("    return v");
+            self.emit("");
+        }
+        if self.need_aset {
+            // `(( x += 1 ))` / `(( x++ ))`: bash stores the numeric result
+            // back AND yields it (new value for prefix, old for postfix).
+            // globals() is the variable's home — see the arith Assign arm.
+            if !self.need_atoi {
+                self.need_atoi = true;
+            }
+            self.emit("def __sh_aset(name, op, value):");
+            self.emit("    cur = __sh_atoi(globals().get(name, 0))");
+            self.emit("    v = __sh_atoi(value)");
+            self.emit("    if op == \"=\":");
+            self.emit("        r = v");
+            self.emit("    elif op == \"+=\":");
+            self.emit("        r = cur + v");
+            self.emit("    elif op == \"-=\":");
+            self.emit("        r = cur - v");
+            self.emit("    elif op == \"*=\":");
+            self.emit("        r = cur * v");
+            self.emit("    elif op == \"/=\":");
+            self.emit("        r = int(cur / v) if v else 0");
+            self.emit("    elif op == \"%=\":");
+            self.emit("        r = (cur % v) if v else 0");
+            self.emit("    else:");
+            self.emit("        r = v");
+            self.emit("    globals()[name] = r");
+            self.emit("    return r");
+            self.emit("");
+            self.emit("def __sh_incdec(name, delta, post):");
+            self.emit("    cur = __sh_atoi(globals().get(name, 0))");
+            self.emit("    globals()[name] = cur + delta");
+            self.emit("    return cur if post else cur + delta");
+            self.emit("");
         }
         if self.need_str_eq {
             // `[[ a == b ]]` with no glob on either side is still subject
@@ -9570,6 +9779,9 @@ mod tests {
             }),
             rhs: Box::new(ArithAst::Num(1)),
         };
+        // an UNDECLARED array reads through globals().get (bash treats it as
+        // empty); mark it assigned so this asserts the normal path
+        r.written.insert("a".to_string());
         assert_eq!(r.arith(&ast), "(__sh_atoi(__sh_elem(a, 1)) + 1)");
         assert!(r.need_elem, "the `__sh_elem` helper must be emitted");
     }
