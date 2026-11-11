@@ -79,6 +79,8 @@ pub struct Render {
     need_param_ops: bool,
     /// `arr+=(items)` helper (`__sh_arr_add`).
     need_arr: bool,
+    /// `${!prefix*}` names helper (`__sh_names_matching`).
+    need_indirect: bool,
     /// needs `import glob` + `__sh_glob` (sentinel-tagged glob words)
     need_glob: bool,
     /// needs the `__sh_echo_e` backslash-escape helper (`echo -e`)
@@ -1632,6 +1634,47 @@ impl Render {
     /// bash keeps such an operand literal — quotes turn every metachar in
     /// them into text — so `[[ $x == "a*" ]]` matches only the literal
     /// two characters `a*`, even though `has_glob` sees a `*`.
+    /// Rewrite the length expansions bash allows INSIDE arithmetic
+    /// (`${#arr[@]}`, `${#arr[*]}`, `${#s}`) to `__sh_len_<name>` so the
+    /// arith parser sees an identifier; the Arith walker turns that into a
+    /// python `len(...)`. Without it `while (( i < ${#args[@]} ))` fell to
+    /// the `sh2_arith(...)` stub, whose None is falsy, so the loop never
+    /// ran (063_09 printed "Processed 0 options").
+    fn expand_arith_plen(s: &str) -> String {
+        let mut out = String::with_capacity(s.len() + 8);
+        let mut rest = s;
+        while let Some(pos) = rest.find("${#") {
+            out.push_str(&rest[..pos]);
+            let after = &rest[pos + 3..];
+            match after.find('}') {
+                Some(close) => {
+                    let inner = &after[..close];
+                    let name = inner
+                        .strip_suffix("[@]")
+                        .or_else(|| inner.strip_suffix("[*]"))
+                        .unwrap_or(inner);
+                    if !name.is_empty()
+                        && name
+                            .chars()
+                            .all(|c| c.is_ascii_alphanumeric() || c == '_')
+                    {
+                        out.push_str("__sh_len_");
+                        out.push_str(name);
+                    } else {
+                        out.push_str(&rest[pos..pos + 3 + close + 1]);
+                    }
+                    rest = &after[close + 1..];
+                }
+                None => {
+                    out.push_str(rest);
+                    rest = "";
+                }
+            }
+        }
+        out.push_str(rest);
+        out
+    }
+
     /// Undo ONE level of shell quoting inside a `${v//pat/repl}` operand:
     /// `\"` is a literal quote and `\\` a literal backslash. Without this
     /// `local p="${3//\"/\\\"}"` searched for a two-character `\"` and
@@ -2253,6 +2296,13 @@ impl Render {
                 // bound by arith_bind): bash substitutes it TEXTUALLY, so
                 // an empty value leaves a syntax error (`$(( $1 + 0 ))`
                 // with no $1 is `+ 0`), which aborts the expansion.
+                // `${#name[@]}` / `${#name[*]}` / `${#name}` inside arith
+                // text is rewritten to `__sh_len_<name>` before parsing
+                // (see expand_arith_plen); the length is a plain int.
+                if let Some(rest) = name.strip_prefix("__sh_len_") {
+                    let t = self.py_ident(rest);
+                    return format!("len({t})");
+                }
                 if name.starts_with("__sh_p") || name.starts_with("__sh_a") {
                     self.need_strict = true;
                     // the helper lives in the `need_atoi` prelude block: a
@@ -3182,13 +3232,55 @@ impl Render {
                     // variable (os.environ). No stdout output.
                     if cmd == "export" {
                         if let Some(IrExpr::Array(items)) = args.get(1) {
-                            for item in items {
-                                if let IrExpr::Str(v, _) = item {
-                                    if Self::is_plain_name(v) {
-                                        let name = self.py_ident(v);
-                                        self.emit(&format!("os.environ[{}] = str({})", Self::py_str(v), name));
+                            let mut idx = 0;
+                            while idx < items.len() {
+                                let head = match &items[idx] {
+                                    IrExpr::Str(v, _) => v.clone(),
+                                    other => {
+                                        // `export $(cmd)` — evaluate it for
+                                        // its side effect only
+                                        idx += 1;
+                                        let _ = self.expr(other);
+                                        continue;
                                     }
+                                };
+                                idx += 1;
+                                let (raw, inline) = match head.split_once('=') {
+                                    Some((n, v)) => (n.to_string(), Some(v.to_string())),
+                                    None => (head.clone(), None),
+                                };
+                                if !Self::is_plain_name(&raw) {
+                                    continue;
                                 }
+                                let name = self.py_ident(&raw);
+                                self.written.insert(raw.clone());
+                                // `export FOO=bar` is an ASSIGNMENT as well as
+                                // a mark; the value used to be dropped
+                                // entirely (064_20 read LOG_LEVEL as empty).
+                                // A dynamic value arrives as the NEXT
+                                // element after `FOO=`.
+                                let value = match inline {
+                                    Some(v) if !v.is_empty() => {
+                                        Some(self.expand_str(&Self::strip_quotes(&v)))
+                                    }
+                                    Some(_) => {
+                                        if idx < items.len() {
+                                            let v = self.expr(&items[idx]);
+                                            idx += 1;
+                                            Some(v)
+                                        } else {
+                                            Some(Self::py_str(""))
+                                        }
+                                    }
+                                    None => None,
+                                };
+                                if let Some(val) = value {
+                                    self.emit(&format!("{name} = {val}"));
+                                }
+                                self.emit(&format!(
+                                    "os.environ[{}] = str({name})",
+                                    Self::py_str(&raw)
+                                ));
                             }
                         }
                         return "None".into();
@@ -3939,6 +4031,29 @@ impl Render {
                             Some(IrExpr::Str(repl, _)),
                         ) = (args.get(1), args.get(2), args.get(3))
                         {
+                            // a pure BRACKET CLASS (`[^a-zA-Z0-9]`) is a
+                            // regex class: replace through re.sub. The
+                            // literal path refused it, so
+                            // `${input//[^a-z0-9]/_}` sanitized to "" (064_24).
+                            if pat.starts_with('[')
+                                && pat.ends_with(']')
+                                && !pat[1..pat.len() - 1].contains(']')
+                            {
+                                let v = self.call(
+                                    "getVar",
+                                    &[IrExpr::Str(
+                                        name.to_string(),
+                                        crate::ir::StrStyle::DoubleQuoted,
+                                    )],
+                                );
+                                self.need_re = true;
+                                let p = Self::py_str(&Self::unescape_shell(pat));
+                                let r = Self::py_str(&Self::unescape_shell(repl));
+                                let cnt = if op == "/" { "1" } else { "0" };
+                                return format!(
+                                    "re.sub({p}, {r}, str({v}), count={cnt})"
+                                );
+                            }
                             if !pat.contains('*') && !pat.contains('?') && !pat.contains('[') {
                                 let v = self.call(
                                     "getVar",
@@ -3983,6 +4098,20 @@ impl Render {
                 // two-arg form keeps the whole subscript in the name
                 // string. An associative array's key is a STRING; an
                 // indexed one's is arithmetic.
+                // `${!prefix*}` / `${!prefix@}` — the NAMES of variables
+                // matching the prefix (bash lists them space-separated; no
+                // match is empty, which is the corpus shape). The stub was
+                // `sh2_arrayItems("var")` (brace-expansion-fail).
+                if let Some(IrExpr::Str(name, _)) = args.get(1) {
+                    if let Some(pre) = name.strip_prefix('!') {
+                        if let Some(pre) =
+                            pre.strip_suffix('*').or_else(|| pre.strip_suffix('@'))
+                        {
+                            self.need_indirect = true;
+                            return format!("__sh_names_matching({})", Self::py_str(pre));
+                        }
+                    }
+                }
                 if let Some(IrExpr::Str(name, _)) = args.get(1) {
                     let op_is_empty = matches!(args.first(), Some(IrExpr::Str(o, _)) if o.is_empty());
                     if op_is_empty {
@@ -4056,6 +4185,8 @@ impl Render {
                     // a general arith STRING (`($x % 2)` — the C frontend's
                     // testArith/ternary-cond shape): normalize $refs to
                     // bare idents, parse, render via the Arith AST walker
+                    let s_pl = Self::expand_arith_plen(s);
+                    let s: &str = &s_pl;
                     let norm: String = s
                         .chars()
                         .enumerate()
@@ -7355,13 +7486,60 @@ impl Render {
                     // break/continue calls inside a loop lower natively
                     // (bash status verbs); outside a loop they keep the stub
                     if self.loop_depth > 0 {
+                        // `break`/`continue` are status 0 in bash; without
+                        // the reset the enclosing test's 1 survived
+                        // (`while …; do …; break; done; echo $?` printed 1).
                         if func == "break" {
+                            self.rc_reset();
                             self.emit("break");
                             return;
                         }
                         if func == "continue" {
+                            self.rc_reset();
                             self.emit("continue");
                             return;
+                        }
+                    }
+                }
+                // `[ … ] || continue` / `cmd && break` / `break || exit 1`
+                // — the status verb is a STATEMENT in bash, so the
+                // expression form (a `sh2_continue()` stub) never ran it and
+                // the loop body always executed (or-continue printed 1 2 3,
+                // parse-break-or died on the stub).
+                if let IrExpr::BinOp { op, lhs, rhs } = e {
+                    use crate::ir::BinOpKind;
+                    let verb_of = |x: &IrExpr| -> Option<String> {
+                        match x {
+                            IrExpr::Call { func, .. }
+                                if func == "break" || func == "continue" =>
+                            {
+                                Some(func.clone())
+                            }
+                            _ => None,
+                        }
+                    };
+                    if self.loop_depth > 0 {
+                        if let Some(verb) = verb_of(&**lhs) {
+                            // the verb never returns, so the right side is
+                            // unreachable (`break || exit 1`)
+                            self.rc_reset();
+                            self.emit(&verb);
+                            return;
+                        }
+                        if matches!(op, BinOpKind::Or | BinOpKind::And) {
+                            if let Some(verb) = verb_of(&**rhs) {
+                                let c = self.expr(lhs);
+                                if matches!(op, BinOpKind::Or) {
+                                    self.emit(&format!("if not ({c}):"));
+                                } else {
+                                    self.emit(&format!("if ({c}):"));
+                                }
+                                self.depth += 1;
+                                self.rc_reset();
+                                self.emit(&verb);
+                                self.depth -= 1;
+                                return;
+                            }
                         }
                     }
                 }
@@ -7766,6 +7944,15 @@ impl Render {
                 if !else_.is_empty() {
                     self.emit("else:");
                     self.block(else_);
+                } else {
+                    // bash: an `if` whose conditions all failed leaves `$?`
+                    // at 0, but our condition's own test had just set it to
+                    // 1 (`if ps …; then …; fi; echo $?` printed 1 —
+                    // ps-system-call, parse-multi-command-while-condition).
+                    self.emit("else:");
+                    self.depth += 1;
+                    self.rc_reset();
+                    self.depth -= 1;
                 }
             }
             IrStmt::Case {
@@ -8734,6 +8921,23 @@ impl Render {
         }
         if self.need_fnmatch {
             self.emit("import fnmatch");
+        }
+        if self.need_indirect {
+            // `${!prefix*}` — variable NAMES matching the prefix,
+            // space-separated (bash order is lexicographic).
+            self.emit("def __sh_names_matching(prefix):");
+            self.emit("    keys = set()");
+            self.emit("    _n = globals().get(\"__sh_names\")");
+            self.emit("    if isinstance(_n, dict):");
+            self.emit("        keys.update(str(_k) for _k in _n)");
+            self.emit("    import os");
+            self.emit("    keys.update(os.environ.keys())");
+            self.emit("    return \" \".join(sorted(_k for _k in keys if _k.startswith(prefix)))");
+            self.emit("");
+        }
+        if self.need_re {
+            // a `${v//[class]/repl}` substitution goes through re.sub
+            self.emit("import re");
         }
         if self.need_arr {
             // `arr+=(a b)` / `arr+=${other[@]:0:1}` — append keeps bash's
