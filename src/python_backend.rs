@@ -1632,6 +1632,26 @@ impl Render {
     /// bash keeps such an operand literal — quotes turn every metachar in
     /// them into text — so `[[ $x == "a*" ]]` matches only the literal
     /// two characters `a*`, even though `has_glob` sees a `*`.
+    /// Undo ONE level of shell quoting inside a `${v//pat/repl}` operand:
+    /// `\"` is a literal quote and `\\` a literal backslash. Without this
+    /// `local p="${3//\"/\\\"}"` searched for a two-character `\"` and
+    /// never matched (062_09 printed `third"param`).
+    fn unescape_shell(s: &str) -> String {
+        let mut out = String::with_capacity(s.len());
+        let mut it = s.chars();
+        while let Some(c) = it.next() {
+            if c == '\\' {
+                match it.next() {
+                    Some(n) => out.push(n),
+                    None => out.push('\\'),
+                }
+            } else {
+                out.push(c);
+            }
+        }
+        out
+    }
+
     /// Strip ONE layer of surrounding shell quotes (`"add"` → `add`).
     fn strip_quotes(p: &str) -> String {
         let t = p.trim();
@@ -3938,21 +3958,21 @@ impl Render {
                                 // (and `//` makes no difference: at most
                                 // one occurrence can sit at an anchor).
                                 if let Some(pfx) = pat.strip_prefix('#') {
-                                    let p = Self::py_str(pfx);
-                                    let r = Self::py_str(repl);
+                                    let p = Self::py_str(&Self::unescape_shell(pfx));
+                                    let r = Self::py_str(&Self::unescape_shell(repl));
                                     return format!(
                                         "({r} + {v}[len({p}):] if {v}.startswith({p}) else {v})"
                                     );
                                 }
                                 if let Some(sfx) = pat.strip_prefix('%') {
-                                    let p = Self::py_str(sfx);
-                                    let r = Self::py_str(repl);
+                                    let p = Self::py_str(&Self::unescape_shell(sfx));
+                                    let r = Self::py_str(&Self::unescape_shell(repl));
                                     return format!(
                                         "({v}[:len({v})-len({p})] + {r} if {v}.endswith({p}) else {v})"
                                     );
                                 }
-                                let p = Self::py_str(pat);
-                                let r = Self::py_str(repl);
+                                let p = Self::py_str(&Self::unescape_shell(pat));
+                                let r = Self::py_str(&Self::unescape_shell(repl));
                                 let cnt = if op == "/" { "1" } else { "-1" };
                                 return format!("{v}.replace({p}, {r}, {cnt})");
                             }
@@ -8991,6 +9011,11 @@ impl Render {
             // prints land AFTER the child's output (050's echo moved
             // after ls). Captures (__sh_cap) need none (piped).
             self.emit("    sys.stdout.flush()");
+            // bash FIELD SPLITTING: an unquoted `$( … )` / `$@` splice
+            // arrives as a LIST element and stands for several words
+            // (`basename $(pwd)` passed the list as one argv entry —
+            // 000__04a, 999_pwd). Empty words vanish.
+            self.emit("    argv = [str(_x) for _a in argv for _x in (_a if isinstance(_a, (list, tuple)) else [_a]) if str(_x) != \"\"]");
             self.emit("    try:");
             self.emit("        return subprocess.call(argv)");
             self.emit("    except OSError:");
@@ -9082,7 +9107,9 @@ impl Render {
             self.emit("    global __sh_rc");
             // shell words are STRINGS: an arithmetic-derived argument
             // (`echo $(( $(wc -l < f) + 1 ))`) arrives as a python int.
-            self.emit("    argv = [str(a) for a in argv]");
+            // FIELD SPLITTING first (see __sh_exec): a captured word list
+            // is several arguments, not one list-shaped string.
+            self.emit("    argv = [str(_x) for _a in argv for _x in (_a if isinstance(_a, (list, tuple)) else [_a]) if str(_x) != \"\"]");
             self.emit("    try:");
             self.emit("        out = subprocess.check_output(argv, env=env)");
             self.emit("        __sh_rc = 0");
