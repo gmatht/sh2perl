@@ -81,6 +81,8 @@ pub struct Render {
     need_arr: bool,
     /// `${!prefix*}` names helper (`__sh_names_matching`).
     need_indirect: bool,
+    /// `unset` must clear all three homes (`__sh_unset`).
+    need_unset: bool,
     /// needs `import glob` + `__sh_glob` (sentinel-tagged glob words)
     need_glob: bool,
     /// needs the `__sh_echo_e` backslash-escape helper (`echo -e`)
@@ -372,7 +374,10 @@ impl Render {
             "arrayItems",
             concat!(
                 "def sh2_arrayItems(name):\n",
-                "    return list(__sh_arrays.get(str(name), []))\n",
+                "    # `${name[*]}` in OUTPUT position: bash joins the words\n",
+                "    # with IFS (a space) and an unset array is EMPTY —\n",
+                "    # returning a list printed `[]` (brace-expansion-fail).\n",
+                "    return \" \".join(str(_e) for _e in __sh_arrays.get(str(name), []))\n",
             ),
         ),
         (
@@ -3174,13 +3179,19 @@ impl Render {
                         }
                     }
                     if cmd == "unset" {
-                        // `unset var` — remove from the store
+                        // `unset var` — remove from the store, the python
+                        // binding and the environment. Popping only the store
+                        // left the old value visible to `${v:-d}` / `$v`
+                        // (064_20's inner subshell printed DEBUG=1 after
+                        // `unset DEBUG`).
                         if let Some(IrExpr::Array(items)) = args.get(1) {
                             if let Some(IrExpr::Str(v, _)) = items.first() {
                                 self.sh2_calls.insert("setVar".into());
+                                self.need_unset = true;
                                 return format!(
-                                    "__sh_store.pop({}, None)",
-                                    Self::py_str(v)
+                                    "__sh_unset({}, {})",
+                                    Self::py_str(v),
+                                    Self::py_str(&Self::py_mangle(v))
                                 );
                             }
                         }
@@ -7301,9 +7312,21 @@ impl Render {
                 for op in [":-", "-"] {
                     if let Some((name, def)) = inner.split_once(op) {
                         if Self::is_plain_name(name) {
-                            let v = self.test_value(name);
+                            // READ the variable (env/unset fallback), not its
+                            // NAME: `[ "${ZSH_VERSION-}" ]` rendered the
+                            // literal string "ZSH_VERSION", which is non-empty
+                            // and so always TRUE (param-expand-default-operator
+                            // took the zsh branch under bash).
+                            let v = self.call(
+                                "getVar",
+                                &[IrExpr::Str(
+                                    name.to_string(),
+                                    crate::ir::StrStyle::DoubleQuoted,
+                                )],
+                            );
                             let d = self.expand_str(def.trim_matches('"').trim_matches('\''));
-                            return format!("({v} if {v} != \"\" else {d})");
+                            self.need_param_ops = true;
+                            return format!("__sh_param_or({v}, {d})");
                         }
                     }
                 }
@@ -8921,6 +8944,17 @@ impl Render {
         }
         if self.need_fnmatch {
             self.emit("import fnmatch");
+        }
+        if self.need_unset {
+            // `unset v` — the store, the python binding and the env all
+            // held a copy; clearing only the store left `${v:-d}` reading
+            // the stale value.
+            self.emit("def __sh_unset(shell_name, py_name):");
+            self.emit("    import os");
+            self.emit("    __sh_store.pop(shell_name, None)");
+            self.emit("    globals().pop(py_name, None)");
+            self.emit("    os.environ.pop(shell_name, None)");
+            self.emit("");
         }
         if self.need_indirect {
             // `${!prefix*}` — variable NAMES matching the prefix,
