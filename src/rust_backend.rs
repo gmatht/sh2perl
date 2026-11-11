@@ -13138,9 +13138,17 @@ impl Render {
                                     && self.ident_base(var) == *var
                                     && !self.local_vars.contains_key(var)
                                     && self.active_fn.is_none());
+                            // An underscore-prefixed binding is still an
+                            // ordinary binding: reads resolve through the
+                            // loop-bind stack to this same name, so a body
+                            // that does use the element keeps working. The
+                            // prefix only stops rustc reporting `unused
+                            // variable` for a shell var whose only "read"
+                            // was a literal `$var` inside a word (an env
+                            // lookup, not a use of the binding).
                             let binding = if native {
                                 Some(if own_name {
-                                    var.clone()
+                                    format!("_{var}")
                                 } else {
                                     self.gensym("__sh_lv")
                                 })
