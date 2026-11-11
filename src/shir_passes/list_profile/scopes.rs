@@ -42,6 +42,12 @@ pub struct Use {
     /// an if/loop/block/pipeline body). Pass-2 locals defer their `let`
     /// to the first write, which is only sound for a top-level write.
     pub top: bool,
+    /// The write IS a declaration's binding site (`local x=…`, `declare`,
+    /// the case lowerer's `__sh2_casesubj_N`). A declaration owns its own
+    /// `let` at ANY nesting depth — the backend defers an owned `let` to the
+    /// first write wherever it sits — so such a name needs no entry
+    /// declaration (and no unconditional `let mut`).
+    pub decl: bool,
 }
 
 /// All mentions per name (defs, reads, name-arg positions, `$` refs).
@@ -90,15 +96,20 @@ struct Walker<'a> {
 
 impl<'a> Walker<'a> {
     fn mention(&mut self, name: &str) {
-        self.push(name, false);
+        self.push(name, false, false);
     }
 
     /// A write mention (assignment target / capture / `VAR=x` word).
     fn mention_write(&mut self, name: &str) {
-        self.push(name, true);
+        self.push(name, true, false);
     }
 
-    fn push(&mut self, name: &str, write: bool) {
+    /// A declaration's binding site: a write that owns its `let`.
+    fn mention_decl(&mut self, name: &str) {
+        self.push(name, true, true);
+    }
+
+    fn push(&mut self, name: &str, write: bool, decl: bool) {
         // binding positions never reach here (callers skip them);
         // everything recorded is a genuine mention
         self.out.entry(name.to_string()).or_default().push(Use {
@@ -106,6 +117,7 @@ impl<'a> Walker<'a> {
             risky: self.risky,
             write,
             top: self.top,
+            decl,
         });
     }
 
@@ -270,8 +282,25 @@ impl<'a> Walker<'a> {
                 }
             }
             IrStmt::Declare { vars, init, .. } => {
-                // `vars` are bindings, not mentions — skip
-                let _ = vars;
+                // A declaration IS a write: it creates the binding, and in
+                // the backends it is where the `let` goes. Recording it is
+                // what lets the pass-2 verdict OWN that `let` — the case
+                // lowerer's `Declare` of `__sh2_casesubj_N` used to be
+                // invisible here, so its `let` was emitted from outside the
+                // declaration path and could never be decided `mut` (PLAN
+                // v153: two precise-mut attempts died on exactly this).
+                // A BARE `local x` (no init) emits no binding at all — bash
+                // leaves the name unset until it is assigned, and the
+                // backends emit nothing for it. Recording it as a write made
+                // the first mention a top-level write, so the deferred `let`
+                // was never emitted and `092_for_arith_func` failed to
+                // compile (E0425 on the for-init). Only a declaration WITH
+                // an initializer owns a `let`.
+                if init.is_some() {
+                    for v in vars {
+                        self.mention_decl(&v.name);
+                    }
+                }
                 if let Some(e) = init {
                     self.expr(e);
                 }
@@ -1163,8 +1192,8 @@ mod owner_tests {
     #[test]
     fn single_safe_function_scope_has_owner() {
         let uses = vec![
-            Use { scope: Scope::Func("f".to_string()), risky: false, write: false, top: true },
-            Use { scope: Scope::Func("f".to_string()), risky: false, write: false, top: true },
+            Use { scope: Scope::Func("f".to_string()), risky: false, write: false, top: true, decl: false },
+            Use { scope: Scope::Func("f".to_string()), risky: false, write: false, top: true, decl: false },
         ];
         assert_eq!(local_owner(&uses), Some("f".to_string()));
     }
@@ -1172,8 +1201,8 @@ mod owner_tests {
     #[test]
     fn risky_use_forces_global() {
         let uses = vec![
-            Use { scope: Scope::Func("f".to_string()), risky: false, write: false, top: true },
-            Use { scope: Scope::Func("f".to_string()), risky: true, write: false, top: true },
+            Use { scope: Scope::Func("f".to_string()), risky: false, write: false, top: true, decl: false },
+            Use { scope: Scope::Func("f".to_string()), risky: true, write: false, top: true, decl: false },
         ];
         assert_eq!(local_owner(&uses), None);
     }
@@ -1181,8 +1210,8 @@ mod owner_tests {
     #[test]
     fn local_scope_includes_main() {
         let uses = vec![
-            Use { scope: Scope::Main, risky: false, write: false, top: true },
-            Use { scope: Scope::Main, risky: false, write: false, top: true },
+            Use { scope: Scope::Main, risky: false, write: false, top: true, decl: false },
+            Use { scope: Scope::Main, risky: false, write: false, top: true, decl: false },
         ];
         assert_eq!(local_scope(&uses), Some(Scope::Main));
         assert_eq!(local_owner(&uses), None);
@@ -1190,7 +1219,7 @@ mod owner_tests {
 
     #[test]
     fn main_scope_stays_global() {
-        let uses = vec![Use { scope: Scope::Main, risky: false, write: false, top: true }];
+        let uses = vec![Use { scope: Scope::Main, risky: false, write: false, top: true, decl: false }];
         assert_eq!(local_owner(&uses), None);
     }
 }

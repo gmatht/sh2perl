@@ -6082,10 +6082,14 @@ impl Render {
             }
             IrExpr::Call { func, args: _ } if func == "break" => {
                 if self.loop_depth > 0 {
+                    // NO `false` tail: a block ending in `break;` has type
+                    // `!`, which coerces to the bool this expression slot
+                    // wants. The old tail made `break || exit 1` emit a
+                    // bool literal rustc flagged `unreachable expression`.
                     if let Some(v) = self.loop_rc_last.last() {
-                        format!("{{ __SH_RC.store(0, Ordering::Relaxed); {v} = __SH_RC.load(Ordering::Relaxed); break; false }}")
+                        format!("{{ __SH_RC.store(0, Ordering::Relaxed); {v} = __SH_RC.load(Ordering::Relaxed); break; }}")
                     } else {
-                        "{ __SH_RC.store(0, Ordering::Relaxed); break; false }".to_string()
+                        "{ __SH_RC.store(0, Ordering::Relaxed); break; }".to_string()
                     }
                 } else {
                     "false".to_string()
@@ -6094,9 +6098,9 @@ impl Render {
             IrExpr::Call { func, args: _ } if func == "continue" => {
                 if self.loop_depth > 0 {
                     if let Some(v) = self.loop_rc_last.last() {
-                        format!("{{ __SH_RC.store(0, Ordering::Relaxed); {v} = __SH_RC.load(Ordering::Relaxed); continue; false }}")
+                        format!("{{ __SH_RC.store(0, Ordering::Relaxed); {v} = __SH_RC.load(Ordering::Relaxed); continue; }}")
                     } else {
-                        "{ __SH_RC.store(0, Ordering::Relaxed); continue; false }".to_string()
+                        "{ __SH_RC.store(0, Ordering::Relaxed); continue; }".to_string()
                     }
                 } else {
                     "false".to_string()
@@ -9392,9 +9396,12 @@ impl Render {
         for s in &body {
             self.stmt(s);
         }
+        let diverges = body.last().map(Self::stmt_diverges).unwrap_or(false);
         if track {
             self.loop_rc_last.pop();
-            self.emit(&format!("{last} = __SH_RC.load(Ordering::Relaxed);"));
+            if !diverges {
+                self.emit(&format!("{last} = __SH_RC.load(Ordering::Relaxed);"));
+            }
         }
         self.depth -= 1;
         self.loop_depth -= 1;
@@ -11839,6 +11846,54 @@ impl Render {
         out
     }
 
+    /// Does this expression ALWAYS divert? `break`/`continue`/`return` are
+    /// IR calls here (`{"func":"break"}`), so the verdict is read from the
+    /// IR, not guessed from rendered text: the emitted block is wrapped and
+    /// parenthesised, which is exactly how a string test failed to match and
+    /// left a dead status wrapper after `break || exit 1`.
+    ///
+    /// Only used where a wrapper's value is tested — a diverging operand can
+    /// never reach that test, so its sibling and the wrapper are dead.
+    fn expr_diverges(e: &IrExpr) -> bool {
+        match e {
+            IrExpr::Call { func, .. } => {
+                matches!(func.as_str(), "break" | "continue" | "return" | "exit")
+            }
+            IrExpr::BinOp { lhs, .. } => Self::expr_diverges(lhs),
+            _ => false,
+        }
+    }
+
+    /// Does this statement ALWAYS divert, so nothing after it can run?
+    /// Used only to suppress synthesized code rustc would flag
+    /// `unreachable` — never to change a program's behaviour. `break`/
+    /// `continue` count because every caller here is a loop body or a
+    /// value tail, both of which have nothing left to do; `return`/`exit`
+    /// divert outright; an `if` diverts only when it has an `else` and
+    /// every branch diverts.
+    fn stmt_diverges(s: &IrStmt) -> bool {
+        match s {
+            IrStmt::Return(_) | IrStmt::Exit(_) | IrStmt::Die { .. } => true,
+            IrStmt::Break | IrStmt::Continue => true,
+            IrStmt::Block(b) | IrStmt::Subshell(b) => {
+                b.last().map(Self::stmt_diverges).unwrap_or(false)
+            }
+            // `break || exit 1` reaches here as an Expr statement whose
+            // operands are `break` calls; the wrapper collapses the operand,
+            // and this makes the enclosing loop's tail see the divergence.
+            IrStmt::Expr(e) => Self::expr_diverges(e),
+            IrStmt::If { then, elsifs, else_, .. } => {
+                !else_.is_empty()
+                    && then.last().map(Self::stmt_diverges).unwrap_or(false)
+                    && elsifs
+                        .iter()
+                        .all(|(_, b)| b.last().map(Self::stmt_diverges).unwrap_or(false))
+                    && else_.last().map(Self::stmt_diverges).unwrap_or(false)
+            }
+            _ => false,
+        }
+    }
+
     fn owned_inits(&self, stmts: &[IrStmt]) -> BTreeSet<String> {
         // entry-declared locals are declared at the top of the scope, so
         // their first write must NOT emit a second `let`
@@ -12081,14 +12136,22 @@ impl Render {
                     } else {
                         let unw = Self::unwrap_cond(&l);
                         let core = Self::unparen(&unw);
-                        self.emit(&format!(
-                            "{{ let __b = {core}; __SH_RC.store(if __b {{ 0 }} else {{ 1 }}, Ordering::Relaxed); if !__b {{"
-                        ));
-                        self.depth += 1;
-                        self.expr_stmt_value(rhs);
-                        self.depth -= 1;
-                        self.emit("}");
-                        self.emit("}");
+                        if Self::expr_diverges(lhs) {
+                            // `break || …`: the lhs cannot fall through, so
+                            // its status store, the `!__b` test and the rhs
+                            // are all unreachable — exactly what rustc
+                            // reported for parse-break-or.
+                            self.emit(&format!("{{ {core} }}"));
+                        } else {
+                            self.emit(&format!(
+                                "{{ let __b = {core}; __SH_RC.store(if __b {{ 0 }} else {{ 1 }}, Ordering::Relaxed); if !__b {{"
+                            ));
+                            self.depth += 1;
+                            self.expr_stmt_value(rhs);
+                            self.depth -= 1;
+                            self.emit("}");
+                            self.emit("}");
+                        }
                     }
                 }
                 IrExpr::Call { func, args } if func == "test" => {
@@ -12750,9 +12813,16 @@ impl Render {
                 for s in body {
                     self.stmt(s);
                 }
+                // A body whose tail always diverts (`break`, `return`) has
+                // nothing left for an rc save to read: emitting it put a
+                // dead `__sh_while_lastN = __SH_RC.load(…)` after the
+                // `break` (rustc `unreachable statement`, three examples).
+                let diverges = body.last().map(Self::stmt_diverges).unwrap_or(false);
                 if track {
                     self.loop_rc_last.pop();
-                    self.emit(&format!("{last} = __SH_RC.load(Ordering::Relaxed);"));
+                    if !diverges {
+                        self.emit(&format!("{last} = __SH_RC.load(Ordering::Relaxed);"));
+                    }
                 }
                 self.trim_trailing_blanks();
                 self.depth -= 1;
@@ -12787,9 +12857,16 @@ impl Render {
                 for s in body {
                     self.stmt(s);
                 }
+                // A body whose tail always diverts (`break`, `return`) has
+                // nothing left for an rc save to read: emitting it put a
+                // dead `__sh_while_lastN = __SH_RC.load(…)` after the
+                // `break` (rustc `unreachable statement`, three examples).
+                let diverges = body.last().map(Self::stmt_diverges).unwrap_or(false);
                 if track {
                     self.loop_rc_last.pop();
-                    self.emit(&format!("{last} = __SH_RC.load(Ordering::Relaxed);"));
+                    if !diverges {
+                        self.emit(&format!("{last} = __SH_RC.load(Ordering::Relaxed);"));
+                    }
                 }
                 self.depth -= 1;
                 self.loop_depth -= 1;
@@ -14181,10 +14258,7 @@ impl Render {
             // unconditional divert (rustc would flag it unreachable).
             if sig.is_some()
                 && value_used
-                && !matches!(
-                    body.last(),
-                    Some(IrStmt::Return(_)) | Some(IrStmt::Exit(_))
-                )
+                && !body.last().map(Self::stmt_diverges).unwrap_or(false)
             {
                 self.emit("__SH_RET.lock().unwrap().clone()");
             }
@@ -18401,24 +18475,15 @@ fn collect_bigint_vars(stmts: &[IrStmt], subs: &[crate::ir::IrSub], out: &mut BT
 fn walk_bigint_expr(e: &IrExpr, out: &mut BTreeSet<String>, changed: &mut bool) {
     use num_bigint::BigInt;
     match e {
-        // huge const Arith ANYWHERE (call args, echo args, ...) marks
-        // positional digits (callee $N may receive huge values; t89).
-        // Over-approx (marks 1-9 even if only one used) — sound (BigInt
-        // path correct, minor perf), preserves t86 speed (no huge lits).
-        IrExpr::Arith(a) => {
-            let huge = eval_arith_bigint(a)
-                .map(|v| v > BigInt::from(i64::MAX) || v < BigInt::from(i64::MIN))
-                .unwrap_or(false);
-            if huge {
-                for d in 1..=9 {
-                    let digit = d.to_string();
-                    if !out.contains(&digit) {
-                        out.insert(digit);
-                        *changed = true;
-                    }
-                }
-            }
-        }
+        // A huge constant is NOT itself a positional taint: `echo
+        // $((2**64))` never reaches a callee's `$N`. Positions are marked by
+        // the `fnCall`/`fnValue` arm below, at the index the value actually
+        // lands in — that exactness is what the deleted `has_huge_call`
+        // block was compensating for. The old blanket here marked `$1..$9`
+        // for any huge arithmetic anywhere in the program, so one
+        // `f $((2**64))` turned every positional read in every function
+        // into BigInt.
+        IrExpr::Arith(_) => {}
         IrExpr::Call { func, args } if func == "fnCall" || func == "fnValue" => {
             // args[0] = name, args[1] = Array of arg exprs? Or... check shape.
             // (Determine at runtime via debug? Assume [name, Array] like fn_call_stmt.)
@@ -19693,10 +19758,18 @@ fn compute_local_vars(
         // (a never-read local would be dead-store dead weight).
         let first_is_write = us.first().map(|u| u.write).unwrap_or(false);
         let first_is_top_write = us.first().map(|u| u.write && u.top).unwrap_or(false);
+        // A DECLARATION carries its own `let`, at any nesting depth (the
+        // backend's owned-init pass descends blocks to find it), so a name
+        // whose first mention is the declaration needs no entry declaration.
+        // Without this, the case lowerer's nested `Declare` fell back to the
+        // entry path, which emits `let mut x = String::new();` and then
+        // assigns — unnecessary `mut` plus a dead initializer (needless_mut
+        // 19 → 26 when variables were first recorded at their declaration).
+        let first_is_decl = us.first().map(|u| u.write && u.decl).unwrap_or(false);
         // A first mention that is NOT a top-level write cannot carry the
         // `let`; the name is instead declared at the top of its scope
         // (bash reads an unset name as "", and as 0 in arithmetic).
-        let entry = !first_is_top_write;
+        let entry = !first_is_top_write && !first_is_decl;
         let why: Option<&'static str> = if !declared.contains(&name) {
             Some("undeclared")
         } else if !us.iter().any(|u| !u.write) {
@@ -21096,6 +21169,50 @@ mod tests {
         assert!(
             out.contains("__SHV_x: std::cell::Cell<i64>"),
             "the unrelated small var left the i64 path:\n{out}"
+        );
+    }
+
+    /// D4b: the positional taint is POSITIONAL. A huge constant sets `$N`
+    /// only for the argument index it is passed at — `echo $((2**64))`
+    /// reaches no callee's positional at all, so it must not mark digits.
+    #[test]
+    fn bigint_digit_taint_is_positional_only() {
+        use crate::ir::{ArithAst, IrExpr, StrStyle};
+        fn huge(v: i64) -> IrExpr {
+            IrExpr::Arith(Box::new(ArithAst::Bin {
+                op: "**".to_string(),
+                lhs: Box::new(ArithAst::Num(2)),
+                rhs: Box::new(ArithAst::Num(v)),
+            }))
+        }
+        // `echo $((2**64))` — no call, so no positional can hold the value
+        let echo_only = IrExpr::Call {
+            func: "builtin".to_string(),
+            args: vec![
+                IrExpr::Str("echo".to_string(), StrStyle::DoubleQuoted),
+                IrExpr::Array(vec![huge(64)]),
+            ],
+        };
+        let mut out = BTreeSet::new();
+        let mut changed = false;
+        walk_bigint_expr(&echo_only, &mut out, &mut changed);
+        assert!(out.is_empty(), "a bare huge arith tainted positions: {out:?}");
+
+        // `f $((2**64)) 1` — only the argument index it lands in ($1)
+        let call = IrExpr::Call {
+            func: "fnValue".to_string(),
+            args: vec![
+                IrExpr::Str("f".to_string(), StrStyle::DoubleQuoted),
+                IrExpr::Array(vec![huge(64), IrExpr::Int(1)]),
+            ],
+        };
+        let mut out = BTreeSet::new();
+        let mut changed = false;
+        walk_bigint_expr(&call, &mut out, &mut changed);
+        assert_eq!(
+            out,
+            BTreeSet::from(["1".to_string()]),
+            "only the receiving positional may be tainted"
         );
     }
 
