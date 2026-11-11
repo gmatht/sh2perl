@@ -67,6 +67,10 @@ pub struct Render {
     fn_names: std::collections::HashSet<String>,
     /// needs `import fnmatch` (case-statement glob patterns)
     need_fnmatch: bool,
+    /// needs `__sh_glob_match` — bash anchored glob compare that reads
+    /// the `extglob`/`nocasematch` shopt state at the match site
+    /// (`[[ $f == !(*.min).js ]]`, `case` under nocasematch)
+    need_glob_match: bool,
     /// needs `import glob` + `__sh_glob` (sentinel-tagged glob words)
     need_glob: bool,
     /// needs the `__sh_echo_e` backslash-escape helper (`echo -e`)
@@ -1567,7 +1571,16 @@ impl Render {
 
     /// Returns true if a shell glob pattern contains metacharacters.
     fn has_glob(p: &str) -> bool {
-        p.contains('*') || p.contains('?') || p.contains('[')
+        // `*`/`?`/`[` cover plain globs; the extglob OPENERS `@(` `+(`
+        // `?( ` `*(` `!(` are patterns even without a metachar
+        // (`[[ $x == @(a|b) ]]`), so a pattern-only side is not mistaken
+        // for a literal string compare.
+        p.contains('*')
+            || p.contains('?')
+            || p.contains('[')
+            || p.contains("@(")
+            || p.contains("+(")
+            || p.contains("!(")
     }
 
     // ── expressions ──────────────────────────────────────────────────
@@ -2062,6 +2075,21 @@ impl Render {
                     }
                     if let Some(close) = close {
                         let inner: String = b[i + 2..close].iter().collect();
+                        // `$(( … ))` is nested ARITHMETIC, not a command
+                        // substitution: bash evaluates it in place, so
+                        // splice it as a parenthesized subexpression.
+                        // Shelling out ran the text as a COMMAND
+                        // (`bash -c "(2*3)"` → "2*3: command not found"),
+                        // so every nested `$(( ))` operand read as the
+                        // empty capture: `$(( 1 + $((2*3)) ))` printed
+                        // "1:" instead of 7.
+                        if i + 2 < b.len() && b[i + 2] == '(' {
+                            out.push('(');
+                            out.push_str(&inner);
+                            out.push(')');
+                            i = close + 1;
+                            continue;
+                        }
                         let name = format!("__sh_a{}", self.cap_counter);
                         self.cap_counter += 1;
                         self.written.insert(name.clone());
@@ -2185,9 +2213,17 @@ impl Render {
                     Self::py_str("")
                 )
             }
-            ArithAst::Index { .. } => {
-                self.mark_todo("arith Index");
-                "0".into()
+            ArithAst::Index { var, key } => {
+                // `$(( a[i] + 1 ))` — an array element as an arith
+                // operand. bash evaluates the SUBSCRIPT arithmetically
+                // (`a[i+1]`), reads the element, and coerces its TEXT
+                // like any other operand (absent / non-numeric → 0).
+                // Same `__sh_elem` reader `${a[i]}` uses, so an out-of-
+                // range index is "" → 0 rather than an IndexError.
+                let k = self.arith(key);
+                self.need_elem = true;
+                self.need_atoi = true;
+                format!("__sh_atoi(__sh_elem({}, {}))", self.py_ident(var), k)
             }
             ArithAst::Bin { op, lhs, rhs } => {
                 let l = self.arith(lhs);
@@ -5644,10 +5680,15 @@ impl Render {
                         // one side is the pattern, the other the value —
                         // both render through test_value (var reads stay
                         // reads, literals stay literals).
-                        self.need_fnmatch = true;
+                        // `[[ ]]` pattern matching is shopt-sensitive:
+                        // extglob turns `!(pat)`/`@(a|b)`/`+(..)`/`*(..)`/
+                        // `?(..)` into operators, nocasematch folds case.
+                        // `__sh_glob_match` is the one place that reads
+                        // that state (see the preamble block).
+                        self.need_glob_match = true;
                         let pv = self.test_value(if ag { b } else { a });
                         let pp = self.test_value(if ag { a } else { b });
-                        let m = format!("fnmatch.fnmatch(str({pv}), str({pp}))");
+                        let m = format!("__sh_glob_match({pv}, {pp})");
                         if op == "!=" {
                             return Some(format!("(not {m})"));
                         }
@@ -7403,8 +7444,10 @@ impl Render {
                         .filter(|p| p.as_str() != "*")
                         .map(|p| {
                             if Self::has_glob(p) {
-                                self.need_fnmatch = true;
-                                format!("fnmatch.fnmatch({}, {})", d, Self::py_str(p))
+                                // case patterns are shopt-sensitive too
+                                // (nocasematch, extglob operators).
+                                self.need_glob_match = true;
+                                format!("__sh_glob_match({}, {})", d, Self::py_str(p))
                             } else {
                                 format!("{d} == {}", Self::py_str(p))
                             }
@@ -8341,6 +8384,112 @@ impl Render {
         if self.need_fnmatch {
             self.emit("import fnmatch");
         }
+        if self.need_glob_match {
+            // bash `[[ s == pat ]]` / `case s in pat)` matching: ANCHORED,
+            // and sensitive to two shopt flags that take effect at the
+            // MATCH SITE (the pattern is a string by the time we render it):
+            //   extglob     — `!(pat)` `@(a|b)` `+(pat)` `*(pat)` `?(pat)`
+            //                 are grouping operators
+            //   nocasematch — case-insensitive
+            // A REGEX translation of extglob is wrong for a negated group
+            // with a tail: `!(pat).ext` must try every split of the subject,
+            // reject the pieces the group matches, and hand each remainder to
+            // `.ext`. `[[ app.min.js == !(*.min).js ]]` is NO match — a
+            // lookahead-anchored regex accepts it, because the tail decides
+            // the split and the negation is then checked too late. So this is
+            // a backtracking matcher, not a translator.
+
+            self.emit("def __sh_glob_alts(body):");
+            self.emit("    alts, cur, depth = [], \"\", 0");
+            self.emit("    for ch in body:");
+            self.emit("        if ch == \"(\":");
+            self.emit("            depth += 1");
+            self.emit("        elif ch == \")\":");
+            self.emit("            depth -= 1");
+            self.emit("        if ch == \"|\" and depth == 0:");
+            self.emit("            alts.append(cur)");
+            self.emit("            cur = \"\"");
+            self.emit("        else:");
+            self.emit("            cur += ch");
+            self.emit("    alts.append(cur)");
+            self.emit("    return alts");
+            self.emit("");
+            self.emit("def __sh_glob_group(pat):");
+            self.emit("    if pat[:1] in (\"@\", \"+\", \"*\", \"?\", \"!\") and pat[1:2] == \"(\":");
+            self.emit("        depth, j = 1, 2");
+            self.emit("        while j < len(pat) and depth:");
+            self.emit("            if pat[j] == \"(\":");
+            self.emit("                depth += 1");
+            self.emit("            elif pat[j] == \")\":");
+            self.emit("                depth -= 1");
+            self.emit("            j += 1");
+            self.emit("        return pat[0], __sh_glob_alts(pat[2:j - 1]), j");
+            self.emit("    return None, None, 0");
+            self.emit("");
+            self.emit("def __sh_glob_rep(alts, tail, s, lo, hi):");
+            self.emit("    cur, n = [s], 0");
+            self.emit("    while True:");
+            self.emit("        if n >= lo and any(__sh_glob_match_pat(tail, r) for r in cur):");
+            self.emit("            return True");
+            self.emit("        if (hi is not None and n >= hi) or not cur:");
+            self.emit("            return False");
+            self.emit("        nxt = []");
+            self.emit("        for r in cur:");
+            self.emit("            for k in range(1, len(r) + 1):");
+            self.emit("                if any(__sh_glob_match_pat(a, r[:k]) for a in alts):");
+            self.emit("                    nxt.append(r[k:])");
+            self.emit("        cur, n = nxt, n + 1");
+            self.emit("");
+            self.emit("def __sh_glob_match_pat(pat, s):");
+            self.emit("    if not pat:");
+            self.emit("        return s == \"\"");
+            self.emit("    op, alts, nxt = __sh_glob_group(pat)");
+            self.emit("    if op is not None:");
+            self.emit("        tail = pat[nxt:]");
+            self.emit("        if op == \"!\":");
+            self.emit("            for k in range(len(s) + 1):");
+            self.emit("                if any(__sh_glob_match_pat(a, s[:k]) for a in alts):");
+            self.emit("                    continue");
+            self.emit("                if __sh_glob_match_pat(tail, s[k:]):");
+            self.emit("                    return True");
+            self.emit("            return False");
+            self.emit("        lo, hi = {\"@\": (1, 1), \"+\": (1, None), \"*\": (0, None), \"?\": (0, 1)}[op]");
+            self.emit("        return __sh_glob_rep(alts, tail, s, lo, hi)");
+            self.emit("    c = pat[0]");
+            self.emit("    if c == \"*\":");
+            self.emit("        return __sh_glob_match_pat(pat[1:], s) or bool(s) and __sh_glob_match_pat(pat, s[1:])");
+            self.emit("    if c == \"?\":");
+            self.emit("        return bool(s) and __sh_glob_match_pat(pat[1:], s[1:])");
+            self.emit("    if c == \"[\":");
+            self.emit("        j = 1");
+            self.emit("        if pat[1:2] in (\"!\", \"^\"):");
+            self.emit("            j += 1");
+            self.emit("        if pat[j:j + 1] == \"]\":");
+            self.emit("            j += 1");
+            self.emit("        while j < len(pat) and pat[j] != \"]\":");
+            self.emit("            j += 1");
+            self.emit("        if j < len(pat) and s:");
+            self.emit("            if not __sh_glob_class(pat[1:j], s[0]):");
+            self.emit("                return False");
+            self.emit("            return __sh_glob_match_pat(pat[j + 1:], s[1:])");
+            self.emit("        return False");
+            self.emit("    return s[:1] == c and __sh_glob_match_pat(pat[1:], s[1:])");
+            self.emit("");
+            self.emit("def __sh_glob_class(cls, ch):");
+            self.emit("    import fnmatch");
+            self.emit("    return bool(fnmatch.fnmatchcase(ch, \"[\" + cls + \"]\"))");
+            self.emit("");
+            self.emit("def __sh_glob_match(text, pat):");
+            self.emit("    s, p = str(text), str(pat)");
+            self.emit("    st = globals().get(\"__sh_shopt_state\") or {}");
+            self.emit("    if st.get(\"nocasematch\"):");
+            self.emit("        s, p = s.lower(), p.lower()");
+            self.emit("    if st.get(\"extglob\"):");
+            self.emit("        return bool(__sh_glob_match_pat(p, s))");
+            self.emit("    import fnmatch");
+            self.emit("    return bool(fnmatch.fnmatchcase(s, p))");
+            self.emit("");
+        }
         if self.need_glob {
             self.emit("import glob");
             // nullglob-off expansion, sorted like bash
@@ -9253,6 +9402,64 @@ mod tests {
         // a glob operand must re-glob in the child, so it stays a fallback
         let mut r3 = Render::default();
         assert!(r3.native_exec(&ex("rm", vec![st("-f"), st("*.txt")])).is_none());
+    }
+
+    /// `$(( a[i] + 1 ))` reads the ELEMENT (bash evaluates the subscript
+    /// arithmetically and coerces the text) instead of the `0` a TODO
+    /// marker left behind.
+    #[test]
+    fn arith_index_reads_element() {
+        let mut r = Render::default();
+        let ast = ArithAst::Bin {
+            op: "+".into(),
+            lhs: Box::new(ArithAst::Index {
+                var: "a".into(),
+                key: Box::new(ArithAst::Num(1)),
+            }),
+            rhs: Box::new(ArithAst::Num(1)),
+        };
+        assert_eq!(r.arith(&ast), "(__sh_atoi(__sh_elem(a, 1)) + 1)");
+        assert!(r.need_elem, "the `__sh_elem` helper must be emitted");
+    }
+
+    /// A nested `$(( … ))` is ARITHMETIC: it is spliced inline as a
+    /// parenthesized subexpression, never shelled out to `bash -c`, which
+    /// ran the text as a command (`2*3: command not found`).
+    #[test]
+    fn nested_arith_splices_inline() {
+        let mut r = Render::default();
+        let bound = r.arith_bind("1 + $((2*3))");
+        assert!(!bound.contains("__sh_bash"), "shelled out: {bound}");
+        assert!(bound.contains("(2*3)"), "not spliced: {bound}");
+        // and it still renders natively as arithmetic (no shell-out)
+        let rendered = r.arith(&crate::shir::parse_arith(&bound).expect("parses"));
+        assert!(!rendered.contains("__sh_bash"), "shelled out: {rendered}");
+        // a real command substitution still binds a CAPTURE: the arith
+        // text carries only the bound name, the `__sh_bash(...)` call is
+        // emitted as a statement ahead of it
+        let mut c = Render::default();
+        let cap = c.arith_bind("$(wc -l < f) + 1");
+        assert!(c.need_subprocess, "capture lost: {cap}");
+        assert!(cap.starts_with("__sh_a"), "capture lost: {cap}");
+    }
+
+    /// extglob operators make a token a PATTERN even with no `*?[`
+    /// (`[[ $x == @(a|b) ]]`), and both pattern sites route through the
+    /// shopt-aware matcher instead of bare `fnmatch`.
+    #[test]
+    fn glob_patterns_are_shopt_aware() {
+        assert!(Render::has_glob("@(a|b)"));
+        assert!(Render::has_glob("+(ab)"));
+        assert!(Render::has_glob("!(*.min).js"));
+        assert!(!Render::has_glob("plain.txt"));
+        let mut r = Render::default();
+        let cond = r.test_render("$x == @(a|b)", true).expect("test");
+        assert!(cond.contains("__sh_glob_match"), "{cond}");
+        assert!(r.need_glob_match);
+        // `[ ]` never glob-matches, extglob or not
+        let mut b = Render::default();
+        let lit = b.test_render("$x = @(a|b)", false).expect("test");
+        assert!(!lit.contains("__sh_glob_match"), "{lit}");
     }
 
     /// `mkdir -p` / `touch` / `sleep` lower to os/time.
