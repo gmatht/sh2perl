@@ -1,7 +1,7 @@
 # shIR formal semantics — the text-ops slice
 
 `TextOps/` is a machine-checked denotational semantics for a first slice of
-shIR. It is split into five theories that build as one session:
+shIR. It is split into six theories that build as one session:
 
 | Theory | Covers |
 |---|---|
@@ -10,6 +10,7 @@ shIR. It is split into five theories that build as one session:
 | `ShIR_TextOps_SortUniq` | the two ordering nodes `SortLines` / `UniqLines` (`try_lower_sort` / `try_lower_uniq`), modelled over the list of lines. |
 | `ShIR_TextOps_Compose` | the composition nodes `Split` / `ArrayLen` / `FieldExtract`, the `ArrayLen(Split(...))` reading of `wc -w`, and `cut`'s delimiter split (which KEEPS empty fields). |
 | `ShIR_TextOps_Space` | each engine's measured `\s` class (`measure-space.sh` is the pin), the word count over an ARBITRARY class (`nwords_by`), and where the emitted word split diverges from `wc -w` — with proved witnesses and an ASCII-soundness result per engine. |
+| `ShIR_TextOps_Strings` | the string-algebra nodes `StringTrim` / `StringAffix` / `AffixStrip` over one generic run drop, and each renderer's measured TRIM class (`measure-trim.sh` is the pin) — the flag-blind arms, the four measured trim classes, and the Perl trailing-affix empty-pattern gap. |
 
 ```
 isabelle build -D sh2perl/docs/fm/TextOps      # HOL only, no AFP, ~30 s
@@ -40,6 +41,14 @@ node contract — "this node means this value, in every renderer" — lives.
 | …and the differences are exactly the documented ones | `posix_is_the_ascii_part_of_unicode`, `perl_bytes_is_unicode_minus`, `js_is_unicode_plus_bom_minus_nel`, `py_is_unicode_plus_ascii_separators`, `go_measured_is_unicode`, `perl_unicode_measured_is_unicode` | JS carries U+FEFF and loses U+0085; Python adds 0x1C..0x1F BELOW 128; Perl's own class depends on whether the string is upgraded (a runtime property, not a codegen one) — the byte model loses NBSP and NEL. |
 | The emitted expression is NOT the node's value — proved, twice | `js_nbsp_rendering_is_not_the_model`, `python_separator_rendering_is_not_the_model` | NBSP in UTF-8 (0xC2 0xA0) is one word to `wc -w` and two to `\s`-splitting JS; 0x1C is one word to `wc -w` and two to Python's `str.split()`, and it is ASCII. |
 | An ASCII source is sufficient for three renderers and INSUFFICIENT for Python | `js_ascii_rendering_is_sound`, `go_ascii_rendering_is_sound`, `perl_unicode_ascii_rendering_is_sound`, `python_has_no_ascii_guard`, `rendering_is_sound_exactly_for_the_posix_classes` | The guard `lowered_wc` already applies to `StrLen` would fix JS/Go/Perl and cannot fix Python: `python_has_no_ascii_guard` refutes the guarded statement with an ASCII string. |
+| A trim is a run drop, and it is a projection | `trim_by_idem_both`, `trim_by_idem_pre`, `trim_by_idem_suf`, `string_trim_idem`, `lead_drop_untouched`, `trail_drop_untouched`, `string_trim_interior_kept` | all four flag pairs are idempotent, and a trim removes a RUN from each end and nothing else — the interior survives byte for byte. |
+| The affix TEST is an existential, on both sides | `affix_pre_is_the_existential`, `affix_suf_is_the_existential`, `has_affix_too_long` | `take (length p) t = p` and `drop (length t - length p) t = p` are the existentials `startsWith`/`endsWith`/`strip_prefix` compute, with the empty pattern an affix of everything and a longer pattern never one. |
+| `AffixStrip` is that test plus a slice, ONCE | `affix_strip_shape_pre`, `affix_strip_shape_suf`, `affix_strip_strips_one_occurrence`, `affix_strip_is_not_idempotent`, `affix_strip_pre_length` | The emitted `if affix then slice else t` IS the node, so the Rust `strip_prefix(..).unwrap_or(t)` and ESTree `startsWith ? slice : t` shapes coincide; and one occurrence means it is not `trim_start_matches`. |
+| The Perl trailing-affix arm is right EXACTLY on non-empty patterns | `perl_suffix_test_is_the_model_for_nonempty_patterns`, `perl_suffix_test_differs_exactly_at_the_empty_pattern` | `substr($t, -length($p)) eq $p` equals the node for `p ≠ []` and is FALSE for `p = []`, where `endsWith("")` and the shell are true; the leading arm (`index($t,$p)==0`) has no such hole. |
+| The trim classes are measured, and one renderer's comment is wrong | `js_trim_measured_is_js_ws`, `py_trim_measured_is_py_ws`, `trim_measured_is_unicode`, `python_trim_class_is_not_its_source_comment` | JS `trim()` = `js_ws`; Python `strip()` = `py_ws` (`str.isspace()`, so 0x1C..0x1F and NBSP too); Rust and Go = Unicode White_Space. The source comment claiming a fixed six-byte ASCII set describes a different function from the one the line calls. |
+| Java and Zig are two more classes, neither with a guard | `java_is_unicode_minus_nonbreaking_plus_separators`, `zig_is_the_renderer_literal`, `java_trim_has_no_ascii_guard`, `zig_trim_is_not_sound_on_ascii` | Java's `strip()` adds 0x1C..0x1F (ASCII) and drops the non-breaking code points; Zig trims the literal `" \t\n"`, three of six POSIX bytes, so it misses a carriage return on plain ASCII. |
+| ASCII soundness per trim renderer | `estree_trim_ascii_is_sound`, `go_trim_ascii_is_sound`, `rust_trim_ascii_is_sound`, `perl_trim_ascii_is_sound`, `python_trim_has_no_ascii_guard` | The guard buys soundness for the four renderers at the flags they honour (Perl at EVERY flag pair, since it is the only arm that selects the primitive from the flags), and for none of Python, Java or Zig. |
+| Four arms ignore `leading`/`trailing` — a latent contract gap | `flag_blind_renderers_are_wrong_for_one_sided_trims`, `flag_blind_renderers_are_right_at_both_ends` | ESTree/Go/Rust/Zig call a both-ends primitive, so a one-sided `StringTrim` is mis-rendered by them; the only emitter today passes `(true, true)` (`src/transforms/text_ops.rs`), which is why the corpus is green. |
 
 ## Deliberate modelling choices
 
@@ -70,6 +79,17 @@ node contract — "this node means this value, in every renderer" — lives.
   The lists are defined independently (not as "Unicode plus these"), which
   makes every relation between them a proof (`*_extra_locus`,
   `perl_bytes_is_unicode_minus`) instead of a re-definition.
+- **The trim classes are measured by a SECOND script.**
+  `TextOps/measure-trim.sh` walks every code point through Perl's `s/^\s+//`
+  and `s/\s+$//`, JS `trim()`, Python `strip()`, Rust `trim()`, Go
+  `TrimSpace`, Java `strip()` and (as a set, since it is a literal in the
+  renderer) Zig's `" \t\n"`, and prints the version strings. The
+  `*_trim_list` tables are its transcription, defined independently of the
+  Space theory's `*_ws_list`, so the four coincidences are proved
+  (`js_trim_measured_is_js_ws`, `py_trim_measured_is_py_ws`,
+  `trim_measured_is_unicode`) rather than assumed — which is how the
+  renderer's own comment was caught claiming `is_ws` for Python's `strip()`
+  when the measurement is `py_ws`.
 - **`FieldExtract` is modelled as "the N-th field, or nothing"**
   (`field_or_empty`), 1-based like `cut`, with the past-the-end case
   printing an empty line rather than erroring. The node's `fields` field is
@@ -118,6 +138,34 @@ model — and the answer is narrower and less comfortable than the prose was:
 What is deliberately NOT decided: whether the fix is to refuse `-w` on
 non-ASCII sources, to narrow each renderer to `[\t\n\v\f\r ]`, or to count
 bytes. Each needs the locus lists and none is a proof obligation.
+
+### Closed: trim and affix (2026-11-12)
+
+Target 2 of the list below, discharged in `ShIR_TextOps_Strings`. The answers
+that were prose before:
+
+- `StringTrim`'s `leading`/`trailing` are part of the node, and FOUR of six
+  renderers do not implement them (ESTree, Go, Rust, Zig call a both-ends
+  primitive). The transform only ever emits `(true, true)` today, so the gap
+  is latent — and both halves are proved: those arms are wrong for one-sided
+  flags and right at the pair that is actually emitted.
+- The trim classes are a MEASURED property: JS = `js_ws`, Python = `py_ws`,
+  Rust = Go = Unicode White_Space, Java a fourth class (0x1C..0x1F in,
+  non-breaking points out), Zig a three-byte SUBSET of POSIX space. Python's
+  renderer comment is refuted by its own measurement, and every counterexample
+  (0x1C, CR) is ASCII, so an ASCII guard cannot rescue Python, Java or Zig.
+- The affix test is an existential and both the `startsWith`-style condition
+  and the `strip_prefix`-style option compute it, empty pattern included.
+- The one wrong arm is Perl's trailing `StringAffix`: `substr($t,
+  -length($p)) eq $p` is false for `p = []` where `endsWith("")` and the
+  shell are true. It is proved equal to the node exactly on non-empty
+  patterns, which is the premise a transform rule needs.
+
+What is deliberately NOT decided: whether to refuse `StringTrim` outside its
+measured class, to narrow each renderer to the target's byte set, or to add a
+byte-set node the lowering spells out per backend. Also unmodelled here:
+`StringAffix`/`AffixStrip` inside a loop (`${s#p}` under `read`), which needs
+the state tier.
 
 ## Box-health note (why the proofs look odd in places)
 
@@ -169,10 +217,11 @@ The natural next slices, in order of payoff per line of proof:
    `array_len_split_is_word_count` makes it a corollary of the word-count
    obligation. What is left of this slice is the `-fN-M` range and the
    output-delimiter splicing noted under open targets.
-2. **`StringTrim`/`StringAffix`/`AffixStrip`** — pure string algebra, no
-   state; the same shape as this file, and the reductions that fire least
-   (several are declared-but-unemitted, where a semantics would say whether
-   they are even worth emitting).
+2. ~~**`StringTrim`/`StringAffix`/`AffixStrip`**~~ — done in
+   `ShIR_TextOps_Strings` (2026-11-12). The nodes, their algebra, the six
+   measured trim classes and the divergences are proved there; what is left
+   of this slice is the design decision recorded under the closed target,
+   not an obligation.
 3. **`CaseTransform`/`CharTranslate`** — total functions on bytes given a
    mapping table; the interesting part is the `tr` SET semantics, which is
    the one place a shell's own definition (ranges, `[a-z]` vs locale) has to
