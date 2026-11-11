@@ -71,6 +71,8 @@ pub struct Render {
     /// the `extglob`/`nocasematch` shopt state at the match site
     /// (`[[ $f == !(*.min).js ]]`, `case` under nocasematch)
     need_glob_match: bool,
+    /// `[[ ]]` equality needs the same nocasematch fold (`__sh_str_eq`).
+    need_str_eq: bool,
     /// needs `import glob` + `__sh_glob` (sentinel-tagged glob words)
     need_glob: bool,
     /// needs the `__sh_echo_e` backslash-escape helper (`echo -e`)
@@ -5767,8 +5769,7 @@ impl Render {
                     // `has_glob` strips the quotes before testing, so the
                     // raw token has to be consulted here.
                     let quoted_pat = Self::fully_quoted(if ag { a } else { b });
-                    if dbl && ag != bg && !quoted_pat {
-                        // one side is the pattern, the other the value —
+                    if dbl && ag != bg && !quoted_pat {                        // one side is the pattern, the other the value —
                         // both render through test_value (var reads stay
                         // reads, literals stay literals).
                         // `[[ ]]` pattern matching is shopt-sensitive:
@@ -5784,6 +5785,18 @@ impl Render {
                             return Some(format!("(not {m})"));
                         }
                         return Some(format!("({m})"));
+                    }
+                    if dbl {
+                        // NO pattern on either side: a plain equality — but
+                        // bash applies `shopt -s nocasematch` to `[[ ]]`
+                        // string compares too (`[[ Foo == foo ]]` is true
+                        // with it on). ci-match vanished from 010/038 the
+                        // moment a quoted operand stopped reaching the
+                        // matcher, so the fold belongs on this path as well.
+                        self.need_str_eq = true;
+                        let (veq, w_eq) = (self.test_value(a), self.test_value(b));
+                        let neg = if op == "!=" { "not " } else { "" };
+                        return Some(format!("({neg}__sh_str_eq({veq}, {w_eq}))"));
                     }
                 }
                 let va = self.test_value(a);
@@ -8489,6 +8502,19 @@ impl Render {
         if self.need_fnmatch {
             self.emit("import fnmatch");
         }
+        if self.need_str_eq {
+            // `[[ a == b ]]` with no glob on either side is still subject
+            // to `shopt -s nocasematch` (bash folds case for EVERY `[[ ]]`
+            // string compare, not just the pattern ones).
+            self.emit("def __sh_str_eq(a, b):");
+            self.emit("    st = globals().get(\"__sh_shopt_state\") or {}");
+            self.emit("    a = str(a)");
+            self.emit("    b = str(b)");
+            self.emit("    if isinstance(st, dict) and st.get(\"nocasematch\"):");
+            self.emit("        return a.lower() == b.lower()");
+            self.emit("    return a == b");
+            self.emit("");
+        }
         if self.need_glob_match {
             // bash `[[ s == pat ]]` / `case s in pat)` matching: ANCHORED,
             // and sensitive to two shopt flags that take effect at the
@@ -9565,6 +9591,19 @@ mod tests {
         let mut b = Render::default();
         let lit = b.test_render("$x = @(a|b)", false).expect("test");
         assert!(!lit.contains("__sh_glob_match"), "{lit}");
+    }
+
+    /// `[[ $word == foo ]]` under `shopt -s nocasematch` matches `Foo`:
+    /// the no-pattern equality path folds case too, while `[ ]` does not.
+    #[test]
+    fn bracket_equality_is_nocasematch_aware() {
+        let mut r = Render::default();
+        let cond = r.test_render("$word == foo", true).expect("test");
+        assert!(cond.contains("__sh_str_eq"), "{cond}");
+        assert!(r.need_str_eq);
+        let mut b = Render::default();
+        let lit = b.test_render("$word == foo", false).expect("test");
+        assert!(!lit.contains("__sh_str_eq"), "{lit}");
     }
 
     /// A quoted numeric operand stays TEXT: `[ "10" = "010" ]` is the
