@@ -370,6 +370,10 @@ pub struct Render {
     /// helper (and its sink check) must survive. Cleared only when every
     /// print site proved sink-free.
     sink_check_needed: bool,
+    /// The statement just rendered was a subshell whose emitted tail is a
+    /// `std::process::exit(…)` — an inlined `( exit N )`. That exit ends the
+    /// SUBSHELL, not the script, so it must not truncate the caller's list.
+    subshell_exit_tail: bool,
     /// The functions whose RETURN VALUE is consumed (`fn_value_used`):
     /// only these get a `-> String` signature and the sticky `__SH_RET`
     /// tail. A function called only for its side effect returns `()`, so
@@ -13566,7 +13570,16 @@ impl Render {
                     self.emit("__SH_RC.store(__ps_saved_rc, Ordering::Relaxed);");
                 }
             }
-            IrStmt::Subshell(b) => self.subshell_render(b),
+            IrStmt::Subshell(b) => {
+                self.subshell_exit_tail = false;
+                self.subshell_render(b);
+                self.subshell_exit_tail = self
+                    .out
+                    .iter()
+                    .rev()
+                    .find(|l| !l.trim().is_empty())
+                    .is_some_and(|l| l.trim_start().starts_with("std::process::exit("));
+            }
             IrStmt::Background(b) => self.background_render(b),
             IrStmt::Case { discriminant, clauses } => {
                 let d = self.expr_str(discriminant);
@@ -14162,6 +14175,7 @@ impl Render {
         self.depth = 1;
         for s in &prog.stmts {
             let mark = self.out.len();
+            self.subshell_exit_tail = false;
             self.stmt(s);
             // Nothing after an unconditional `std::process::exit(…)` can run:
             // in Rust it is exactly as terminal as `exit` is in the script,
@@ -14169,7 +14183,14 @@ impl Render {
             // reported as an unreachable statement. Only a tail emitted at
             // THIS depth counts — a nested block ends with its own `}`, so an
             // `if c { exit; }` never matches here.
-            if self.out.len() > mark
+            // The IR models a top-level `exit` in more than one shape, so the
+            // decision is taken on what the statement actually EMITTED: a tail
+            // that ends in `std::process::exit(…)` never falls through, and
+            // the statements the script carries after it can never run (in
+            // bash they cannot either — `exit` ends the script). A nested
+            // block closes with its own `}`, so only an unbraced tail matches.
+            if !self.subshell_exit_tail
+                && self.out.len() > mark
                 && self
                     .out
                     .iter()
