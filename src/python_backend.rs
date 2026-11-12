@@ -83,6 +83,10 @@ pub struct Render {
     need_indirect: bool,
     /// `unset` must clear all three homes (`__sh_unset`).
     need_unset: bool,
+    /// fork-based capture of a COMPOUND `$( … )` body.
+    need_fork_capture: bool,
+    /// fork-based process substitution (`__sh_ps_spawn`).
+    need_ps_spawn: bool,
     /// `$N` inside arithmetic (`__sh_pnum`).
     need_pnum: bool,
     /// needs `import glob` + `__sh_glob` (sentinel-tagged glob words)
@@ -2003,6 +2007,17 @@ impl Render {
                         );
                     }
                 }
+                // a COMPOUND body (`$(cd "$d" && find . -name '*.sh' |
+                // sort)`, `$([ -f f ] && echo yes || echo no)`): run the
+                // body's own generated statements in a forked subshell —
+                // see __sh_fork_capture. Neither the python stdout buffer
+                // (blind to a child's fd 1) nor the `bash -c` text
+                // renderer (no `test`/`while`/pipeline statements) can.
+                if let IrExpr::Arrow(body) = expr {
+                    if let Some(v) = self.subcap_source_value(body) {
+                        return v;
+                    }
+                }
                 self.sh2_stub("capture", &[], "capture")
             },
             IrExpr::Regex { .. } => self.sh2_stub("regex", &[], "regex"),
@@ -3156,7 +3171,25 @@ impl Render {
                         // instead of an uncaught exception.
                         let dir = match args.get(1) {
                             Some(IrExpr::Array(items)) if !items.is_empty() => {
-                                self.expr(&items[0])
+                                // `cd -- "$dir"`: the `--` terminator (and
+                                // `-L`/`-P`/`-e`) is not the target. Taking
+                                // items[0] chdir'd to "--", so
+                                // `$(cd -- "$(dirname "$0")" && pwd)` came
+                                // back empty (qx-var-builtin-cd).
+                                let target = items
+                                    .iter()
+                                    .find(|it| match it {
+                                        IrExpr::Str(s, _) => {
+                                            !(s == "--"
+                                                || s == "-"
+                                                || s == "-L"
+                                                || s == "-P"
+                                                || s == "-e")
+                                        }
+                                        _ => true,
+                                    })
+                                    .unwrap_or(&items[items.len() - 1]);
+                                self.expr(target)
                             }
                             _ => "os.path.expanduser(\"~\")".to_string(),
                         };
@@ -3216,6 +3249,25 @@ impl Render {
                                     }
                                 }
                                 return "None".into();
+                            }
+                        }
+                    }
+                    if cmd == "declare" {
+                        // `declare -A map` reaches the renderer as a BUILTIN
+                        // call, not the `declare` func, so the attribute
+                        // path below never saw it: the assoc dict was never
+                        // created and the first `map[k]=` was a NameError
+                        // (063_02 lost all output).
+                        if let Some(items @ IrExpr::Array(_)) = args.get(1) {
+                            if matches!(items, IrExpr::Array(v) if !v.is_empty()) {
+                                let synth = vec![
+                                    IrExpr::Str(
+                                        cmd.to_string(),
+                                        crate::ir::StrStyle::DoubleQuoted,
+                                    ),
+                                    items.clone(),
+                                ];
+                                return self.render_declare_call(&synth);
                             }
                         }
                     }
@@ -3768,7 +3820,16 @@ impl Render {
                 if let Some(IrExpr::Str(op, _)) = args.first() {
                     if op == "len" {
                         if let Some(IrExpr::Str(name, _)) = args.get(1) {
-                            return format!("str(len({}))", self.py_ident(name));
+                            // `${#arr[@]}` on an array that was never
+                            // assigned: bash says 0, a bare `len(arr)` is a
+                            // NameError (063_02's `matrix[3,3]=${#array[@]}`)
+                            if self.written.contains(name) {
+                                return format!("str(len({}))", self.py_ident(name));
+                            }
+                            return format!(
+                                "str(len(globals().get({}, [])))",
+                                Self::py_str(name)
+                            );
                         }
                     }
                     // `param("", NAME)` — a plain braced READ. The parser
@@ -4392,6 +4453,15 @@ impl Render {
             "arrayLen" => {
                 if let Some(IrExpr::Str(name, _)) = args.first() {
                     if Self::is_plain_name(name) {
+                        // `${#arr[@]}` on an array the script never assigned:
+                        // bash says 0, a bare `len(arr)` is a NameError
+                        // (063_02's `matrix[3,3]=${#array[@]}`).
+                        if !self.written.contains(name) {
+                            return format!(
+                                "str(len(globals().get({}, [])))",
+                                Self::py_str(name)
+                            );
+                        }
                         let m = self.py_ident(name);
                         return format!("str(len({m}))");
                     }
@@ -7476,6 +7546,65 @@ impl Render {
     /// Render a statement list as an indented block, emitting `pass` when
     /// the body would otherwise be empty (python requires at least one
     /// statement after a `:`).
+    /// A python string literal for multi-line GENERATED SOURCE.
+    fn py_src_literal(s: &str) -> String {
+        let mut out = String::from("\"");
+        for c in s.chars() {
+            match c {
+                '\\' => out.push_str("\\\\"),
+                '"' => out.push_str("\\\""),
+                '\n' => out.push_str("\\n"),
+                '\t' => out.push_str("\\t"),
+                '\r' => out.push_str("\\r"),
+                _ => out.push(c),
+            }
+        }
+        out.push('"');
+        out
+    }
+
+    /// Render a compound body to python source and run it in a forked
+    /// subshell, returning the command-substitution value.
+    fn subcap_source_value(&mut self, body: &[IrStmt]) -> Option<String> {
+        let saved = std::mem::replace(&mut self.out, Vec::new());
+        let saved_depth = self.depth;
+        self.depth = 0;
+        // `block()` opens an indent level of its own; the generated source
+        // must start at column 0 or the child's `compile` raises
+        // IndentationError (and the capture silently came back empty).
+        for s in body {
+            self.stmt(s);
+        }
+        let src = self.out.join("\n");
+        self.out = saved;
+        self.depth = saved_depth;
+        if src.trim().is_empty() {
+            return None;
+        }
+        self.need_fork_capture = true;
+        Some(format!("__sh_fork_capture({})", Self::py_src_literal(&src)))
+    }
+
+    /// Render a process-substitution producer body to python source.
+    fn ps_body_source(&mut self, body: &[IrStmt]) -> Option<String> {
+        let saved = std::mem::replace(&mut self.out, Vec::new());
+        let saved_depth = self.depth;
+        self.depth = 0;
+        // `block()` opens an indent level of its own; the generated source
+        // must start at column 0 or the child's `compile` raises
+        // IndentationError (and the capture silently came back empty).
+        for s in body {
+            self.stmt(s);
+        }
+        let src = self.out.join("\n");
+        self.out = saved;
+        self.depth = saved_depth;
+        if src.trim().is_empty() {
+            return None;
+        }
+        Some(src)
+    }
+
     fn block(&mut self, stmts: &[IrStmt]) {
         let mut scratch = Vec::new();
         std::mem::swap(&mut self.out, &mut scratch);
@@ -8113,6 +8242,47 @@ impl Render {
             IrStmt::While { cond, body } => {
                 // rc discipline (see the For arm).
                 self.rc_reset();
+                // `while IFS= read -r line && [ -n "$line" ] && (( i < n ))`:
+                // `read` is only the FIRST conjunct. The read-loop scaffolding
+                // below used to require the whole condition to BE the read
+                // call, so a compound condition fell to the stub and the loop
+                // never ran (063_11 printed nothing). Split the left spine,
+                // keep `read` as the driver and re-check the rest per line.
+                let mut cond: &IrExpr = cond;
+                let mut cond_rest: Option<IrExpr> = None;
+                if let IrExpr::BinOp {
+                    op: crate::ir::BinOpKind::And,
+                    lhs,
+                    rhs,
+                } = cond
+                {
+                    let mut left: &IrExpr = lhs;
+                    let mut carriers: Vec<&IrExpr> = vec![rhs];
+                    while let IrExpr::BinOp {
+                        op: crate::ir::BinOpKind::And,
+                        lhs: l2,
+                        rhs: r2,
+                    } = left
+                    {
+                        carriers.push(r2);
+                        left = l2;
+                    }
+                    if matches!(left, IrExpr::Call { func, .. } if func == "read") {
+                        cond = left;
+                        let mut acc: Option<IrExpr> = None;
+                        for c in carriers.iter().rev() {
+                            acc = Some(match acc {
+                                None => (*c).clone(),
+                                Some(a) => IrExpr::BinOp {
+                                    op: crate::ir::BinOpKind::And,
+                                    lhs: Box::new(a),
+                                    rhs: Box::new((*c).clone()),
+                                },
+                            });
+                        }
+                        cond_rest = acc;
+                    }
+                }
                 // `while read [-r] v1 v2 rest; do …; done < src` — the
                 // line loop: iterate the hoisted stdin lines (or real
                 // stdin), splitting each across the names like the
@@ -8178,6 +8348,18 @@ impl Render {
                                                     "{m} = __sh_words[{i}] if len(__sh_words) > {i} else \"\""
                                                 ));
                                             }
+                                        }
+                                        // the rest of the `&&` chain,
+                                        // evaluated once the names are bound
+                                        if let Some(rest) = &cond_rest {
+                                            let (pre, c) = self.cond_test(rest);
+                                            for p in pre {
+                                                self.emit(&p);
+                                            }
+                                            self.emit(&format!("if not ({c}):"));
+                                            self.depth += 1;
+                                            self.emit("break");
+                                            self.depth -= 1;
                                         }
                                         self.loop_depth += 1;
                                         for s in body {
@@ -8866,6 +9048,21 @@ impl Render {
                 let r = file_reds[0];
                 let p = self.expr(&r.target);
                 let mode = if r.mode == "a" { "'a'" } else { "'w'" };
+                // process substitution (`producer > __ps_tmpN`): the
+                // producer runs CONCURRENTLY into a FIFO, like bash's
+                // /dev/fd path (see __sh_ps_spawn).
+                if let IrExpr::Var(name, _) = &r.target {
+                    if name.starts_with("__ps_tmp") {
+                        if let Some(src) = self.ps_body_source(inner) {
+                            self.need_ps_spawn = true;
+                            self.emit(&format!(
+                                "__sh_ps_spawn({p}, {})",
+                                Self::py_src_literal(&src)
+                            ));
+                            return;
+                        }
+                    }
+                }
                 self.emit(&format!("_f = open({p}, {mode})"));
                 self.emit("sys.stdout, _f_old = _f, sys.stdout");
                 for s in inner {
@@ -9026,6 +9223,98 @@ impl Render {
             self.emit("    except NameError:");
             self.emit("        args = sys.argv[1:]");
             self.emit("    return __sh_atoi(args[i - 1]) if len(args) >= i else 0");
+            self.emit("");
+        }
+        if self.need_fork_capture {
+            // `$(compound)`: the body's OWN generated statements, run in a
+            // forked child whose fd 1 is a pipe. Two other paths already
+            // exist and are preferred; this one covers what neither can:
+            // a python-level stdout buffer never sees a CHILD's fd 1, and
+            // the `bash -c` text path has no rendering for `test`/`while`/
+            // `case` bodies (`$(cd … && pwd)`, `$([ -f f ] && echo y)`).
+            // fork() also gives real subshell semantics for free: the
+            // child's variable and cwd changes die with it.
+            self.emit("import os");
+            self.emit("import sys");
+            self.emit("def __sh_fork_capture(src):");
+            self.emit("    r, w = os.pipe()");
+            self.emit("    pid = os.fork()");
+            self.emit("    if pid == 0:");
+            self.emit("        try:");
+            self.emit("            os.close(r)");
+            self.emit("            os.dup2(w, 1)");
+            self.emit("            os.close(w)");
+            self.emit("            sys.stdout = os.fdopen(1, \"w\", buffering=1, errors=\"surrogateescape\", closefd=False)");
+            self.emit("            exec(compile(src, \"<sh2-subshell>\", \"exec\"), dict(globals()))");
+            self.emit("        except BaseException:");
+            self.emit("            pass");
+            self.emit("        try:");
+            self.emit("            sys.stdout.flush()");
+            self.emit("        except BaseException:");
+            self.emit("            pass");
+            self.emit("        os._exit(0)");
+            self.emit("    os.close(w)");
+            self.emit("    data = b\"\"");
+            self.emit("    with os.fdopen(r, \"rb\") as f:");
+            self.emit("        while True:");
+            self.emit("            blk = f.read(65536)");
+            self.emit("            if not blk:");
+            self.emit("                break");
+            self.emit("            data += blk");
+            self.emit("    os.waitpid(pid, 0)");
+            self.emit("    return data.decode(errors=\"surrogateescape\").rstrip(\"\\n\")");
+            self.emit("");
+        }
+        if self.need_ps_spawn {
+            // `<( … )`: bash hands the consumer a PIPE. A temp FILE written
+            // synchronously is both wrong for a fast reader (it sees an
+            // empty file) and fatal for an endless producer
+            // (`head < <(while true; do echo .; sleep 1; done)` hung the
+            // whole example until the harness timeout). A FIFO plus a
+            // forked producer gives the same blocking/SIGPIPE behaviour.
+            self.emit("import os");
+            self.emit("import sys");
+            self.emit("__sh_ps_children = []");
+            self.emit("def __sh_ps_spawn(path, src):");
+            self.emit("    try:");
+            self.emit("        if os.path.exists(path):");
+            self.emit("            os.unlink(path)");
+            self.emit("        os.mkfifo(path, 0o600)");
+            self.emit("    except OSError:");
+            self.emit("        pass");
+            self.emit("    pid = os.fork()");
+            self.emit("    if pid == 0:");
+            self.emit("        try:");
+            self.emit("            _fd = os.open(path, os.O_WRONLY)");
+            self.emit("            os.dup2(_fd, 1)");
+            self.emit("            os.close(_fd)");
+            self.emit("            sys.stdout = os.fdopen(1, \"w\", buffering=1, errors=\"surrogateescape\", closefd=False)");
+            self.emit("            exec(compile(src, \"<sh2-procsub>\", \"exec\"), dict(globals()))");
+            self.emit("        except BaseException:");
+            self.emit("            pass");
+            self.emit("        try:");
+            self.emit("            sys.stdout.flush()");
+            self.emit("        except BaseException:");
+            self.emit("            pass");
+            self.emit("        os._exit(0)");
+            self.emit("    __sh_ps_children.append(pid)");
+            self.emit("    return pid");
+            self.emit("");
+            self.emit("def __sh_ps_finish():");
+            self.emit("    import time as _ps_t");
+            self.emit("    for _p in list(__sh_ps_children):");
+            self.emit("        try:");
+            self.emit("            for _ in range(200):");
+            self.emit("                if os.waitpid(_p, os.WNOHANG)[0]:");
+            self.emit("                    break");
+            self.emit("                _ps_t.sleep(0.005)");
+            self.emit("            else:");
+            self.emit("                os.kill(_p, 9)");
+            self.emit("                os.waitpid(_p, 0)");
+            self.emit("        except BaseException:");
+            self.emit("            pass");
+            self.emit("import atexit as _ps_atexit");
+            self.emit("_ps_atexit.register(__sh_ps_finish)");
             self.emit("");
         }
         if self.need_unset {
@@ -9265,6 +9554,18 @@ impl Render {
         if self.need_io {
             self.emit("import io");
             self.emit("__sh_bg = []");
+            // `(cmd)&` output is emitted in bash AFTER the foreground
+            // echo lines, when the child finally writes. The generated
+            // body runs synchronously into this buffer, so flush it at
+            // process exit — otherwise the output is dropped entirely
+            // (048_subprocess lost its `a`).
+            self.emit("def __sh_bg_flush():");
+            self.emit("    if __sh_bg:");
+            self.emit("        sys.stdout.write(\"\".join(__sh_bg))");
+            self.emit("        sys.stdout.flush()");
+            self.emit("        del __sh_bg[:]");
+            self.emit("import atexit as _bg_atexit");
+            self.emit("_bg_atexit.register(__sh_bg_flush)");
             self.emit("");
         }
         if self.need_elem {
@@ -10299,6 +10600,47 @@ mod tests {
         assert!(out.contains("<<'__HEREDOC__'" ), "{out}");
         assert!(out.contains("it's fine"), "{out}");
         assert!(r.need_subprocess, "the capture must run through the seam");
+    }
+
+    /// `$(compound)` — a body the `bash -c` TEXT path cannot render and a
+    /// python stdout buffer cannot capture must fork a subshell whose fd 1
+    /// is a pipe (parse-redirect-clobber: `$([ -f f ] && echo yes)`).
+    #[test]
+    fn compound_capture_forks_a_subshell() {
+        let mut r = Render::default();
+        let cap = IrExpr::Capture {
+            expr: Box::new(IrExpr::Arrow(vec![IrStmt::Expr(IrExpr::BinOp {
+                op: crate::ir::BinOpKind::And,
+                lhs: Box::new(IrExpr::Call {
+                    func: "test".to_string(),
+                    args: ex("-f /tmp/x", vec![]),
+                }),
+                rhs: Box::new(IrExpr::Call {
+                    func: "exec".to_string(),
+                    args: ex("echo", vec![st("yes")]),
+                }),
+            })])),
+            native: false,
+        };
+        let out = r.expr(&cap);
+        assert!(out.contains("__sh_fork_capture("), "{out}");
+        assert!(r.need_fork_capture, "the fork helper must be emitted");
+    }
+
+    /// A process-substitution producer's generated source must start at
+    /// column 0. `block()` opens an indent level of its own; an indented
+    /// body made the child's `compile` raise IndentationError, so every
+    /// `<( … )` silently produced an EMPTY stream (096_head_procsub).
+    #[test]
+    fn procsub_source_starts_at_column_zero() {
+        let mut r = Render::default();
+        let body = vec![IrStmt::Expr(IrExpr::Call {
+            func: "exec".to_string(),
+            args: ex("cat", vec![st("f")]),
+        })];
+        let src = r.ps_body_source(&body).expect("producer source");
+        assert!(!src.starts_with(' '), "body must start at column 0: {src}");
+        assert!(src.contains("__sh_exec"), "{src}");
     }
 
     /// `[[ $x == "a*" ]]` — a FULLY quoted operand is literal text, never
