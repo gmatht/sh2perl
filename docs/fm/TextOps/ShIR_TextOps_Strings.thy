@@ -1860,4 +1860,292 @@ lemma char_extract_utf8_witness:
   by eval
 
 
+section \<open>PathName: GNU `basename`/`dirname`, in bytes\<close>
+
+text \<open>`PathName` carries a `which` flag ("basename" or "dirname") and answers
+  the GNU COMMAND semantics, which is not the same as bash's parameter strip: the
+  renderer in `render_ext_expr/handlers/all_nodes.rs` is documented as "EXACT GNU
+  basename/dirname semantics, verified against bash on trailing-slash, all-slash,
+  no-slash and multi-slash inputs", and the transform notes record why the naive
+  forms are wrong (`s|.*/||` and `split("/").pop()` yield "" for `a/b/`, and
+  `split('/').slice(0,-1).join('/')` yields "" for a slashless word instead of
+  "."). The model below is that rule over bytes, separator 47 = "/": strip
+  trailing separators while more than one byte remains, an all-separator path is
+  "/", `basename` is what follows the last separator, and `dirname` is the prefix
+  before the last separator, re-stripped, with "" becoming "/" and a slashless
+  path becoming ".".
+
+  WHAT IS OUT OF MODEL, precisely. (1) One separator only: "/" (47). Windows
+  "\\" and drive letters, and host separator classes, are not modelled; the
+  node's `which` flag says nothing about platform. (2) No filesystem: this is the
+  pure string function, so newline stripping, `basename -a` multi-argument and
+  `basename -s` suffix removal are outside the node (the lowering passes one
+  word). (3) No `.`/`..` resolution and no symlink or existence semantics — GNU
+  basename/dirname do not resolve either, so the model is faithful rather than
+  incomplete, but it is stated because renderers built on `std::path` DO
+  normalise some of that (`Path::file_name` of "a/.." is None), which is why the
+  node does not promise a host path library. (4) The generic Ext lowering in
+  `shir.rs` renders `split('/').pop()` / `split('/').slice(0,-1).join('/')`,
+  which disagrees with this rule on trailing-slash and slashless inputs; the
+  handler is what is modelled here, and that mismatch is a lowering question,
+  not a semantic one.\<close>
+
+abbreviation sep :: nat where "sep \<equiv> 47"
+
+fun lead_strip :: "bytes \<Rightarrow> bytes" where
+  "lead_strip [] = []"
+| "lead_strip (c # cs) = (if c = sep then lead_strip cs else c # cs)"
+
+fun lead_until :: "bytes \<Rightarrow> bytes" where
+  "lead_until [] = []"
+| "lead_until (c # cs) = (if c = sep then [] else c # lead_until cs)"
+
+fun drop_thru :: "bytes \<Rightarrow> bytes" where
+  "drop_thru [] = []"
+| "drop_thru (c # cs) = (if c = sep then c # cs else drop_thru cs)"
+
+definition bname :: "bytes \<Rightarrow> bytes" where
+  "bname p = (let q = rev (lead_strip (rev p)) in
+     if q = [] then (if p = [] then [] else [sep])
+     else if q = [sep] then [sep]
+     else rev (lead_until (rev q)))"
+
+definition dname :: "bytes \<Rightarrow> bytes" where
+  "dname p = (if p \<noteq> [] \<and> set p \<subseteq> {sep} then [sep]
+     else let q = rev (lead_strip (rev p)) in
+       if sep \<notin> set q then [46]
+       else let d = rev (lead_strip (rev (rev (drop_thru (rev q))))) in
+         if d = [] then [sep] else d)"
+
+lemma lead_strip_nosep: "sep \<notin> set p \<Longrightarrow> lead_strip p = p"
+  by (induct p) auto
+
+lemma lead_strip_all: "set p \<subseteq> {sep} \<Longrightarrow> lead_strip p = []"
+  by (induct p) auto
+
+lemma lead_strip_empty: "lead_strip p = [] \<Longrightarrow> set p \<subseteq> {sep}"
+proof (induct p)
+  case Nil
+  then show ?case by simp
+next
+  case (Cons a p)
+  show ?case
+  proof (cases "a = sep")
+    case True
+    with Cons(2) have "lead_strip p = []" by simp
+    with Cons(1) have "set p \<subseteq> {sep}" by simp
+    with True show ?thesis by simp
+  next
+    case False
+    with Cons(2) have "a # p = []" by simp
+    then show ?thesis by simp
+  qed
+qed
+
+lemma lead_strip_subset: "set (lead_strip p) \<subseteq> set p"
+  by (induct p) auto
+
+lemma lead_until_nosep: "sep \<notin> set p \<Longrightarrow> lead_until p = p"
+  by (induct p) auto
+
+lemma lead_until_no_sep: "sep \<notin> set (lead_until p)"
+  by (induct p) auto
+
+lemma lead_until_subset: "set (lead_until p) \<subseteq> set p"
+  by (induct p) auto
+
+lemma drop_thru_subset: "set (drop_thru p) \<subseteq> set p"
+  by (induct p) auto
+
+lemma drop_thru_present: "sep \<in> set p \<Longrightarrow> drop_thru p \<noteq> [] \<and> hd (drop_thru p) = sep"
+  by (induct p) auto
+
+lemma all_sep_imp_mem: "p \<noteq> [] \<Longrightarrow> set p \<subseteq> {sep} \<Longrightarrow> sep \<in> set p"
+proof -
+  assume np: "p \<noteq> []" and sub: "set p \<subseteq> {sep}"
+  obtain a p' where hp: "p = a # p'" using np by (cases p) auto
+  with sub have "a = sep" by auto
+  with hp show ?thesis by simp
+qed
+
+lemma bname_nosep: "sep \<notin> set p \<Longrightarrow> bname p = p"
+proof -
+  assume h: "sep \<notin> set p"
+  have r: "sep \<notin> set (rev p)" using h by simp
+  have q2: "rev (lead_strip (rev p)) = p"
+    using r by (simp add: lead_strip_nosep)
+  have q3: "rev (lead_until (rev p)) = p"
+    using r by (simp add: lead_until_nosep)
+  show ?thesis
+  proof (cases "p = []")
+    case True
+    then show ?thesis by (simp add: bname_def)
+  next
+    case False
+    have ps: "p \<noteq> [sep]"
+    proof
+      assume "p = [sep]"
+      with h show False by simp
+    qed
+    have qne: "rev (lead_strip (rev p)) \<noteq> [sep]" using q2 ps by simp
+    have eq: "bname p = rev (lead_until (rev (rev (lead_strip (rev p)))))"
+      using False ps qne q2 by (simp add: bname_def)
+    show ?thesis using eq q2 q3 by simp
+  qed
+qed
+
+lemma bname_all_sep: "p \<noteq> [] \<Longrightarrow> set p \<subseteq> {sep} \<Longrightarrow> bname p = [sep]"
+proof -
+  assume np: "p \<noteq> []" and sub: "set p \<subseteq> {sep}"
+  have r: "set (rev p) \<subseteq> {sep}" using sub by simp
+  have "lead_strip (rev p) = []" using r by (rule lead_strip_all)
+  then have q0: "rev (lead_strip (rev p)) = []" by simp
+  then show ?thesis using np by (simp add: bname_def)
+qed
+
+lemma lead_until_subset_rev: "set (rev (lead_until (rev q))) \<subseteq> set q"
+proof -
+  have a: "set (rev (lead_until (rev q))) \<subseteq> set (rev q)"
+  proof (subst set_rev)
+    show "set (lead_until (rev q)) \<subseteq> set (rev q)" by (rule lead_until_subset)
+  qed
+  have b: "set (rev q) \<subseteq> set q" by simp
+  from a b show ?thesis by (rule subset_trans)
+qed
+
+lemma lead_strip_subset_rev: "set (rev (lead_strip (rev p))) \<subseteq> set p"
+proof -
+  have a: "set (rev (lead_strip (rev p))) \<subseteq> set (rev p)"
+  proof (subst set_rev)
+    show "set (lead_strip (rev p)) \<subseteq> set (rev p)" by (rule lead_strip_subset)
+  qed
+  have b: "set (rev p) \<subseteq> set p" by simp
+  from a b show ?thesis by (rule subset_trans)
+qed
+
+lemma bname_subset: "set (bname p) \<subseteq> set p"
+proof (cases "p = []")
+  case True
+  then show ?thesis by (simp add: bname_def)
+next
+  case False
+  note np = \<open>p \<noteq> []\<close>
+  show ?thesis
+  proof (cases "rev (lead_strip (rev p)) = []")
+    case True
+    then have z: "lead_strip (rev p) = []" by simp
+    have sub: "set (rev p) \<subseteq> {sep}" using z by (rule lead_strip_empty)
+    have sp: "set p \<subseteq> {sep}" using sub by simp
+    have "sep \<in> set p" using np sp by (rule all_sep_imp_mem)
+    then show ?thesis by (simp add: bname_def np True)
+  next
+    case False
+    note nq = \<open>rev (lead_strip (rev p)) \<noteq> []\<close>
+    show ?thesis
+    proof (cases "rev (lead_strip (rev p)) = [sep]")
+      case True
+      then have "sep \<in> set (rev (lead_strip (rev p)))" by simp
+      with lead_strip_subset_rev have "sep \<in> set p" by blast
+      then show ?thesis by (simp add: bname_def np True)
+    next
+      case False
+      note ns = \<open>rev (lead_strip (rev p)) \<noteq> [sep]\<close>
+      have inner: "set (rev (lead_until (rev (rev (lead_strip (rev p)))))) \<subseteq> set p"
+      proof (rule subset_trans[of _ "set (rev (lead_strip (rev p)))"])
+        show "set (rev (lead_until (rev (rev (lead_strip (rev p))))))
+              \<subseteq> set (rev (lead_strip (rev p)))"
+          by (rule lead_until_subset_rev)
+        show "set (rev (lead_strip (rev p))) \<subseteq> set p"
+          by (rule lead_strip_subset_rev)
+      qed
+      have hb: "bname p = rev (lead_until (rev (rev (lead_strip (rev p)))))"
+        using np nq ns by (simp add: bname_def)
+      then show ?thesis using inner by simp
+    qed
+  qed
+qed
+
+lemma dname_nosep: "sep \<notin> set p \<Longrightarrow> dname p = [46]"
+proof -
+  assume h: "sep \<notin> set p"
+  have r: "sep \<notin> set (rev p)" using h by simp
+  have q2: "rev (lead_strip (rev p)) = p"
+    using r by (simp add: lead_strip_nosep)
+  have ns: "sep \<notin> set (rev (lead_strip (rev p)))" using q2 h by simp
+  show ?thesis
+  proof (cases "p \<noteq> [] \<and> set p \<subseteq> {sep}")
+    case True
+    from True have np: "p \<noteq> []" and sp: "set p \<subseteq> {sep}" by simp_all
+    have "sep \<in> set p" using np sp by (rule all_sep_imp_mem)
+    with h show ?thesis by blast
+  next
+    case False
+    with ns show ?thesis by (simp add: dname_def)
+  qed
+qed
+
+lemma dname_all_sep: "p \<noteq> [] \<Longrightarrow> set p \<subseteq> {sep} \<Longrightarrow> dname p = [sep]"
+  by (simp add: dname_def)
+
+lemma dname_nonempty: "dname p \<noteq> []"
+proof (cases "p \<noteq> [] \<and> set p \<subseteq> {sep}")
+  case True
+  then show ?thesis by (simp add: dname_def)
+next
+  case False
+  show ?thesis
+  proof (cases "sep \<in> set (rev (lead_strip (rev p)))")
+    case True
+    then show ?thesis using False by (simp add: dname_def)
+  next
+    case False
+    then show ?thesis by (simp add: dname_def False)
+  qed
+qed
+
+theorem path_name_sound:
+  "(sep \<notin> set p \<longrightarrow> bname p = p) \<and>
+   (p \<noteq> [] \<and> set p \<subseteq> {sep} \<longrightarrow> bname p = [sep]) \<and>
+   set (bname p) \<subseteq> set p \<and>
+   (sep \<notin> set p \<longrightarrow> dname p = [46]) \<and>
+   (p \<noteq> [] \<and> set p \<subseteq> {sep} \<longrightarrow> dname p = [sep]) \<and>
+   dname p \<noteq> [] \<and>
+   dname [] = [46]"
+proof (intro conjI)
+  show "sep \<notin> set p \<longrightarrow> bname p = p" by (simp add: bname_nosep)
+  show "p \<noteq> [] \<and> set p \<subseteq> {sep} \<longrightarrow> bname p = [sep]"
+    by (auto intro: bname_all_sep)
+  show "set (bname p) \<subseteq> set p" by (rule bname_subset)
+  show "sep \<notin> set p \<longrightarrow> dname p = [46]" by (simp add: dname_nosep)
+  show "p \<noteq> [] \<and> set p \<subseteq> {sep} \<longrightarrow> dname p = [sep]"
+    by (auto intro: dname_all_sep)
+  show "dname p \<noteq> []" by (rule dname_nonempty)
+  show "dname [] = [46]" by (simp add: dname_def)
+qed
+
+lemma path_name_witness:
+  "bname [47, 117, 115, 114, 47, 98, 105, 110] = [98, 105, 110] \<and>
+   dname [47, 117, 115, 114, 47, 98, 105, 110] = [47, 117, 115, 114] \<and>
+   bname [97, 47, 98, 47] = [98] \<and>
+   dname [97, 47, 98] = [97] \<and>
+   bname [97, 98, 99] = [97, 98, 99] \<and>
+   dname [97, 98, 99] = [46]"
+  by eval
+
+lemma path_name_edge_witness:
+  "bname [] = [] \<and>
+   dname [] = [46] \<and>
+   bname [47, 47, 47] = [47] \<and>
+   dname [47, 47, 47] = [47] \<and>
+   bname [47] = [47] \<and>
+   dname [47] = [47] \<and>
+   bname [46, 98, 97, 115, 104, 114, 99] = [46, 98, 97, 115, 104, 114, 99] \<and>
+   dname [46, 98, 97, 115, 104, 114, 99] = [46]"
+  by eval
+
+lemma path_name_utf8_witness:
+  "bname [47, 195, 169] = [195, 169] \<and>
+   dname [47, 195, 169] = [47]"
+  by eval
+
 end

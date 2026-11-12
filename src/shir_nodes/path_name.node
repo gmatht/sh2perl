@@ -4,6 +4,21 @@
 #
 # Backends: Perl File::Basename, JS path.basename/dirname, C strrchr, Rust Path::file_name
 # Fallback: sh2.pathName(text, which)
+#
+# ShIR_TextOps_Strings proves `path_name_sound`, over GNU COMMAND semantics rather
+# than bash's string strip (the renderer in all_nodes.rs is documented as "EXACT GNU
+# basename/dirname semantics", verified against bash on trailing-slash, all-slash,
+# no-slash and multi-slash inputs): strip trailing separators, an all-separator path
+# is "/", `basename` is what follows the last separator, `dirname` is the prefix
+# before it re-stripped with "" becoming "/" and a slashless path becoming ".".
+# Laws: no separator ⟹ basename is the input and dirname is "."; all separators ⟹
+# "/" for both; `set (basename p) ⊆ set p`; dirname is never empty. OUT OF MODEL:
+# one separator only ("/", 47) — no "\", drive letters or host separator classes;
+# no filesystem (no newline stripping, `basename -a`/`-s`); no "."/".." resolution
+# or symlink semantics (GNU does not resolve either, but std::path-based renderers
+# do, so the node promises no host path library). Note the generic Ext lowering in
+# shir.rs renders split('/').pop() / split('/').slice(0,-1).join('/'), which is
+# wrong for "a/b/" and for slashless words — a lowering question, not the spec.
 
 node PathName
 tag "PathName"
@@ -11,4 +26,4 @@ kind expr
 # storage_class str_bounded
 field text: expr
 field which: string
-spec: none (unstated)
+spec: TextOps#path_name_sound
