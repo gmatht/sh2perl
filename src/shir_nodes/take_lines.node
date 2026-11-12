@@ -12,10 +12,14 @@ field text: expr
 field count: expr
 field from_end: bool
 field bytes: bool
-spec: none (unstated: TakeLines is head/tail over a real line splitter —
-# split on LF KEEPING empty fields (Perl split(/\n/,$t,-1), JS split('\n'), Java
-# split("\n",-1)), take N fields from the front or back, rejoin with LF and add no
-# terminator, so empty input is one empty line and "a\nb\n" is three. Stating that
-# honestly needs an inverse-pair lemma (split ∘ join = id on newline-free chunks)
-# plus a suffix law for the from-end arm; both were attempted in this session and
-# did not close, so no law is approximated here.)
+spec: none (unstated: the split-on-LF-keeping-empty-fields / take-N / rejoin-with-LF
+# reading is pinned, and it needs NO list inverse. Model it at the byte level as
+# `count_lf` (LF count) plus `cut n s` = "cut at the Nth LF and drop that LF", with
+# `nlines s = 1 + count_lf s`. That yields the truncation law (count_lf s < n gives
+# cut n s = s, otherwise s = cut n s @ LF # r), the count law (0 < n gives
+# nlines (cut n s) = min n (nlines s)), empty input is one empty line, and CR/CRLF/NUL
+# are ordinary bytes. What is missing is only the Isar plumbing, not the semantics:
+# `cut`'s recursion needs `if k = 0` on its budget, and every attempted proof shape
+# (cases on the schematic count; cases on the ⋀-bound count; induction on the count
+# with the text arbitrary plus `split: list.split if_split`) left the branch goal
+# unreduced, while ground instances evaluate fine. No law is approximated here.)

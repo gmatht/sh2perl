@@ -11,3 +11,4 @@ session TextOps = HOL +
     ShIR_TextOps_Field
     ShIR_TextOps_Cutset
     ShIR_TextOps_Substitute
+    ShIR_TextOps_Splice

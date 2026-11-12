@@ -37,4 +37,22 @@ field base: expr
 field start: expr
 field end: expr
 field repl: expr
-spec: none (unstated)
+# Spec: TextOps#str_splice_fold_sound (docs/fm/TextOps/ShIR_TextOps_Splice.thy,
+# now ROOT-included). Over byte lists, with int offsets clamped exactly as the
+# emission clamps them (`(_s < 0) ? bl + _s : _s`, then into [0,bl]), the
+# Interpolate this node is folded from — `${b:0:$start}${repl}${b:$end}` — denotes
+# exactly the node's meaning `take (pe b start) b @ repl @ drop (sb b end) b`.
+# The same theory pins the C fast path that consumes the node: the fused store
+# writes that meaning in place (fused_store_correct), the `strnlen(_slot,res)==res`
+# guard is exactly "the slot's allocation holds res+1 bytes" (guard_iff_fits,
+# guard_implies_in_bounds), a short slot is refused rather than overrun
+# (short_slot_refused), and dropping the disjointness invariant is refuted on a
+# concrete instance (aliasing_breaks_the_schedule), so neither hand check is a
+# comment any more.
+#
+# NOT modelled (stated, not assumed): the rest of the backend's eligibility
+# routing — array-kind checks, key shapes — whose every alternative is the
+# unchanged plain `_sh_arr_set` path, so it can only make the store NOT fire,
+# never fire wrongly; and the array's length bookkeeping, which that plain path
+# owns in both arms.
+spec: TextOps#str_splice_fold_sound

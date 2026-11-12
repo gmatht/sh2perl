@@ -15,6 +15,7 @@ shIR. It is split into six theories that build as one session:
 | `ShIR_TextOps_Field` | the field CURSOR family (`FieldStrip`, `FieldStripEnd`, `FieldGrab`): `field_grab_at_strip` (`drop off s = field_grab s off d @ d @ drop (field_strip s off d) s` — the grab and the advance are two readings of ONE cursor position), `field_strip_no_move_on_miss` and `field_strip_end_drains_on_miss` (the two advances' non-match laws, which are the whole difference between the nodes), the cursor bounds (`field_strip_le_length`, `field_strip_end_le_length`, `field_strip_gt_off_on_hit`, `field_strip_progress` — every hit consumes a byte, so the converted loop terminates), `field_strip_stuck_iff_miss` (the cursor holds exactly on a miss), the inverse reading (`field_strip_end_agrees_on_hit` / `field_strip_end_differs_on_miss`), the drained read (`field_grab_after_drain`), and the empty delimiter as the arms' non-empty guard (`field_grab_empty_delim_is_not_a_cut`). `off <= length s` is the transform's read law, stated as a hypothesis rather than assumed. |
 | `ShIR_TextOps_Cutset` | the `CutsetTrim` node: the trim class as DATA, plus two modelled ALTERNATIVE readings so the divergences are comparisons, not prose. General obligations: `cutset_trim_is_trim_by` (inherits idempotence and run-only removal from Strings), `cutset_trim_removes_only_a_run`, `cutset_side_three_valued`; accurate byte-granularity facts `cutset_trim_lead_is_bytewise` / `cutset_trim_trail_is_bytewise`, and `cutset_trim_depends_only_on_members` (member-set invariance — true of both readings, which is why it is not called `needs_quotemeta`). Divergences as two-reading theorems: `perl_cutset_needs_quotemeta` (a bracket-body syntax with closing `]`, leading `^` negation, escapes and `a-b` ranges vs the literal set, on `]`, `^`, `\\` and `a-c`), `go_trim_cutset_is_codepoints` and `rust_trim_matches_is_chars` (a two-byte-UTF-8 decoder with a char-wise trim vs the byte model, on the NBSP pair). Witness lemmas keep the concrete bytes. |
 | `ShIR_TextOps_Substitute` | the `Substitute` node: two fuel-bounded engines (`subst_all`, `subst_first`) over an abstract matcher — leftmost, non-overlapping, empty-match-advances-one-byte as the termination obligation, `&` as a function of the matched text. The regex syntax, the line split and `\N` are documented limitations. |
+| `ShIR_TextOps_Splice` | the `StrSplice` node and the C backend's capacity-guarded fused store that consumes it. `str_splice_fold_sound`: over byte lists, with `int` offsets clamped exactly as the emission clamps them (`(_s < 0) ? bl + _s : _s`, then into `[0,bl]`), the Interpolate the fold replaces — `${b:0:$start}${repl}${b:$end}` — denotes `take (pe b start) b @ repl @ drop (sb b end) b`, the node's meaning. The in-place store is pinned by `fused_store_correct` / `sched_prefix`, the `strnlen(_slot,res)==res` guard by `guard_iff_fits` / `guard_implies_in_bounds`, a short slot by `short_slot_refused`, and the disjointness invariant is proved load-bearing by `aliasing_breaks_the_schedule` (a concrete refutation with an aliased repl). Not modelled: the rest of the eligibility routing (every refusal is the unchanged plain path) and the array length bookkeeping.
 
 ```
 isabelle build -D sh2perl/docs/fm/TextOps      # HOL only, no AFP, ~30 s
@@ -200,7 +201,7 @@ three that did not — `newline_strip_sound`, `uniq_lines_sound`,
 (`sort_lines_sound`). `harness/check-node-specs.pl` (workspace `harness/`) makes
 "no dangling spec" a machine check: it collects every `theorem`/`lemma`/
 `definition`/`fun` under `docs/fm` and fails on a `spec:` naming one that does
-not exist. It reports 30 resolved, 18 unstated, 0 pending, 0 dangling.
+not exist. It reports 31 resolved, 17 unstated, 0 pending, 0 dangling.
 
 - `newline_strip_sound` (`ShIR_TextOps_Strip`): the node is the trailing-run
   removal, with the run length and the prefix equation.
@@ -235,9 +236,9 @@ deliberate no-obligation form. `--map` prints the node→theorem table below and
 `--selftest` runs the five negative controls (real theorem, definition, dangling
 name, wrong session prefix, unbuilt theory).
 
-Current inventory: **30 resolved, 18 unstated, 0 pending, 0 errors**.
+Current inventory: **31 resolved, 17 unstated, 0 pending, 0 errors**.
 
-The 30 resolved specs (28 distinct theorems; `lowered_wc_sound` covers three
+The 31 resolved specs (29 distinct theorems; `lowered_wc_sound` covers three
 nodes and `field_extract`, `split`, `substitute`, `uniq_lines` and
 `cutset_trim` cite two each):
 
@@ -261,6 +262,7 @@ nodes and `field_extract`, `split`, `substitute`, `uniq_lines` and
 | `sort_lines` | `sort_lines_sound` |
 | `split` | `split_ws_len`, `split_ws_fields_clean` |
 | `str_len` | `lowered_wc_sound` |
+| `str_splice` | `str_splice_fold_sound` |
 | `string_affix` | `string_affix_sound` |
 | `string_contains` | `string_contains_sound` |
 | `string_trim` | `string_trim_sound` |
@@ -269,11 +271,12 @@ nodes and `field_extract`, `split`, `substitute`, `uniq_lines` and
 | `uniq_lines` | `uniq_lines_sound`, `uniq_lines_skip_sound` |
 | `word_count` | `lowered_wc_sound` |
 
-`str_splice.node` is the case the checker was extended for: a theorem named
-`str_splice_fold_sound` does exist, but only in `ShIR_TextOps_Splice.thy`, which
-is another worker's untracked WIP and is not in `ROOT`. Its spec therefore stays
-`none (unstated)`, and citing that name would now fail as `OUTSIDE THE BUILD`
-rather than look resolved.
+`str_splice.node` is the case the checker was extended for, and it is now closed
+the right way. A theorem named `str_splice_fold_sound` existed, but only in
+`ShIR_TextOps_Splice.thy`, which was untracked WIP that no `ROOT` listed — citing
+it then would have been reported as `OUTSIDE THE BUILD`, not as proved. That
+theory is now tracked and listed in `ROOT` (it builds with zero errors), and the
+node cites `TextOps#str_splice_fold_sound`.
 
 ### The two obligations that were thinner than their names (2026-11-13)
 
