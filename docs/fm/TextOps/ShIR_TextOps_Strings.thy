@@ -2713,6 +2713,84 @@ lemma per_line_single:
   "(\<And>c. c \<in> set s \<Longrightarrow> c \<noteq> nl) \<Longrightarrow> per_line f s = f s"
   by (simp add: per_line_def lines_of_no_lf)
 
+text \<open>FOREACH_LINE's value side, proved rather than named: the reassembly roundtrip.
+  lines_of splits at every newline and keeps a final (possibly empty) line when the
+  input ends in one; join_lf re-inserts a newline BETWEEN lines. The roundtrip is a
+  property of the two definitions together and needs NO hypothesis on the input: the only
+  thing a proof must get right is split_lf's accumulator, which is what
+  split_lf_rebuild states — the string is rebuilt from the reversed completed lines,
+  the separator that belongs before the line still being built, and the unread remainder.\<close>
+
+lemma join_lf_snoc:
+  "join_lf (ls @ [l]) = join_lf ls @ (if ls = [] then [] else [nl]) @ l"
+  apply (induct ls)
+   apply simp
+  apply (rename_tac a ls)
+  apply (case_tac ls)
+   apply simp
+  apply (rename_tac b t)
+  apply (simp add: append_assoc)
+  done
+
+lemma split_lf_rebuild:
+  "join_lf (split_lf s cur acc) =
+     join_lf (rev acc) @ (if acc = [] then [] else [nl]) @ cur @ s"
+  apply (induct s arbitrary: cur acc)
+   apply (simp add: join_lf_snoc)
+  apply (case_tac "c = nl")
+   apply (simp add: join_lf_snoc append_assoc)
+  apply (simp add: join_lf_snoc append_assoc)
+  done
+
+theorem lines_of_join_sound: "join_lf (lines_of s) = s"
+proof -
+  have "join_lf (split_lf s [] []) =
+        join_lf (rev ([] :: bytes list)) @ (if ([] :: bytes list) = [] then [] else [nl])
+          @ [] @ s"
+    by (rule split_lf_rebuild)
+  then show ?thesis by (simp add: lines_of_def)
+qed
+
+text \<open>The split-once / append characterisation the node's semantics needs: appending a
+  newline to the input appends an empty line to the split, and joining that list re-appends
+  the newline. The empty string and the trailing-newline cases are therefore instances of the
+  same two facts, not special cases of the roundtrip.\<close>
+
+lemma split_lf_append_nl: "split_lf (s @ [nl]) cur acc = split_lf s cur acc @ [[]]"
+  apply (induct s arbitrary: cur acc)
+   apply simp
+  apply (rename_tac c cs cur acc)
+  apply (case_tac "c = nl")
+   apply simp
+  apply simp
+  done
+
+lemma lines_of_append_nl: "lines_of (s @ [nl]) = lines_of s @ [[]]"
+  by (simp add: lines_of_def split_lf_append_nl)
+
+lemma lines_of_nil [simp]: "lines_of [] = [[]]"
+  by (simp add: lines_of_def)
+
+lemma join_lf_of_append_nl: "join_lf (lines_of s @ [[]]) = s @ [nl]"
+proof -
+  have "lines_of s @ [[]] = lines_of (s @ [nl])" by (simp add: lines_of_append_nl)
+  with lines_of_join_sound [of "s @ [nl]"] show ?thesis by simp
+qed
+
+text \<open>Concrete, non-vacuous instances: a two-line string, the empty string, a single
+  newline (which splits into two empty lines), a trailing newline, and a LEADING newline.\<close>
+
+lemma lines_of_roundtrip_witnesses:
+  "lines_of [97, nl, 98] = [[97], [98]] \<and>
+   join_lf (lines_of [97, nl, 98]) = [97, nl, 98] \<and>
+   lines_of [] = [[]] \<and>
+   join_lf (lines_of []) = [] \<and>
+   lines_of [nl] = [[], []] \<and>
+   join_lf (lines_of [nl]) = [nl] \<and>
+   join_lf (lines_of [97, nl]) = [97, nl] \<and>
+   join_lf (lines_of [nl, 97]) = [nl, 97]"
+  by eval
+
 theorem reg_sub_sound:
   "rs_first m R s = (case m s of None \<Rightarrow> s | Some (p, v, q) \<Rightarrow> p @ R v @ q) \<and>
    rs_all m R 0 s = s \<and>
@@ -3346,6 +3424,159 @@ text \<open>Why the conjuncts bite, mechanically. Four deliberately defective wa
     satisfies it on that tree; @{thm up_breaks_root} is the same defect on the empty
     directory.
   The four are collected by @{thm walk_dir_defects_bite}.\<close>
+
+
+text \<open>INJECTIVITY, out of the tree invariant rather than an assumption. walk_dir_sound
+  pinned the visited set and the emission count; here the list itself is shown to have no
+  repeats, under wf_tree (distinct child names). Two facts carry it:
+  \<^item> walk_disjoint_children: two children with DIFFERENT names emit disjoint path sets,
+    because every path a child contributes is headed by that child's own name — so the heads
+    cannot agree unless the names do.
+  \<^item> distinct_walk_child: one child's own contribution is itself repeat-free, since a
+    child emits its own path once and nothing else at that depth (that is walk_nil_not:
+    no child emits the empty path, so its own path is never repeated by a descendant).
+  The hypothesis is load-bearing: walk_not_distinct_dup_names shows that a directory
+  with two children of the SAME name violates the conclusion, so this is not a free ride.\<close>
+
+lemma walk_disjoint_children:
+  assumes q1: "q1 \<in> set cs" and q2: "q2 \<in> set cs" and ne: "fst q1 \<noteq> fst q2"
+  shows "set (map ((#) (fst q1)) ([] # walk (snd q1))) \<inter>
+           set (map ((#) (fst q2)) ([] # walk (snd q2))) = {}"
+proof (rule equals0I)
+  fix p
+  assume pin: "p \<in> set (map ((#) (fst q1)) ([] # walk (snd q1))) \<inter>
+                 set (map ((#) (fst q2)) ([] # walk (snd q2)))"
+  then have p1: "p \<in> set (map ((#) (fst q1)) ([] # walk (snd q1)))" by simp
+  have p2: "p \<in> set (map ((#) (fst q2)) ([] # walk (snd q2)))" using pin by simp
+  obtain r1 where e1: "p = fst q1 # r1" using p1 by (auto simp: mem_child_part)
+  obtain r2 where e2: "p = fst q2 # r2" using p2 by (auto simp: mem_child_part)
+  from e1 e2 have "fst q1 = fst q2" by simp
+  with ne show False by simp
+qed
+
+lemma distinct_walk_child:
+  assumes d: "distinct (walk c)"
+  shows "distinct (map ((#) n) ([] # walk c))"
+proof -
+  have nil: "[] \<notin> set (walk c)" by (rule walk_nil_not)
+  have dt: "distinct (map ((#) n) (walk c))"
+    using d by (simp add: distinct_map inj_on_def)
+  have own: "[n] \<notin> set (map ((#) n) (walk c))"
+  proof
+    assume h: "[n] \<in> set (map ((#) n) (walk c))"
+    then obtain r where r: "r \<in> set (walk c)" and e: "[n] = n # r"
+      by (auto simp: set_map)
+    have "r = []" using e by simp
+    with r nil show False by simp
+  qed
+  show ?thesis using dt own by simp
+qed
+
+lemma distinct_concat_map:
+  assumes names: "distinct (map fst cs)"
+    and inner: "\<And>q. q \<in> set cs \<Longrightarrow> distinct (f q)"
+    and across: "\<And>q1 q2. q1 \<in> set cs \<Longrightarrow> q2 \<in> set cs \<Longrightarrow> fst q1 \<noteq> fst q2
+                     \<Longrightarrow> set (f q1) \<inter> set (f q2) = {}"
+  shows "distinct (concat (map f cs))"
+  using names inner across
+proof (induct cs)
+  case Nil
+  show ?case by simp
+next
+  case (Cons a cs)
+  have names': "distinct (map fst cs)" and na: "fst a \<notin> set (map fst cs)"
+    using Cons.prems(1) by simp_all
+  have inner': "\<And>q. q \<in> set cs \<Longrightarrow> distinct (f q)" using Cons.prems(2) by simp
+  have across': "\<And>q1 q2. q1 \<in> set cs \<Longrightarrow> q2 \<in> set cs \<Longrightarrow> fst q1 \<noteq> fst q2
+                        \<Longrightarrow> set (f q1) \<inter> set (f q2) = {}"
+  proof -
+    fix q1 q2
+    assume a1: "q1 \<in> set cs" and a2: "q2 \<in> set cs" and a3: "fst q1 \<noteq> fst q2"
+    have h1: "q1 \<in> set (a # cs)" using a1 by simp
+    have h2: "q2 \<in> set (a # cs)" using a2 by simp
+    show "set (f q1) \<inter> set (f q2) = {}"
+      using Cons.prems(3)[of q1 q2] h1 h2 a3 by blast
+  qed
+  have ih: "distinct (concat (map f cs))" using Cons.hyps names' inner' across' by blast
+  have da: "distinct (f a)" using Cons.prems(2) by simp
+  have dj: "set (f a) \<inter> set (concat (map f cs)) = {}"
+  proof (rule equals0I)
+    fix p
+    assume pin: "p \<in> set (f a) \<inter> set (concat (map f cs))"
+    then have pc: "p \<in> set (concat (map f cs))" by simp
+    obtain q where q: "q \<in> set cs" and pq: "p \<in> set (f q)"
+      using pc by (auto simp: set_concat set_map)
+    have ne: "fst a \<noteq> fst q"
+    proof
+      assume "fst a = fst q"
+      with q have "fst a \<in> set (map fst cs)" by simp
+      with na show False by simp
+    qed
+    have ha: "a \<in> set (a # cs)" by simp
+    have hq: "q \<in> set (a # cs)" using q by simp
+    have djq: "set (f a) \<inter> set (f q) = {}"
+      using Cons.prems(3)[of a q] ha hq ne by blast
+    with pin pq show False by auto
+  qed
+  have "concat (map f (a # cs)) = f a @ concat (map f cs)" by simp
+  with ih da dj show ?case by (simp add: distinct_append)
+qed
+
+theorem walk_distinct:
+  assumes wf: "wf_tree t"
+  shows "distinct (walk t)"
+  using wf
+proof (induct t rule: walk.induct)
+  case 1
+  show ?case by simp
+next
+  case (2 cs)
+  have names: "distinct (map fst cs)" and wfq: "\<forall>q \<in> set cs. wf_tree (snd q)"
+    using "2.prems" by simp_all
+  have inner: "\<And>q. q \<in> set cs \<Longrightarrow> distinct (map ((#) (fst q)) ([] # walk (snd q)))"
+  proof -
+    fix q
+    assume q: "q \<in> set cs"
+    have "wf_tree (snd q)" using wfq q by simp
+    from "2.hyps"[of q] q have dq: "distinct (walk (snd q))" using wfq by simp
+    show "distinct (map ((#) (fst q)) ([] # walk (snd q)))"
+      using distinct_walk_child [of "snd q" "fst q"] dq by simp
+  qed
+  have across: "\<And>q1 q2. q1 \<in> set cs \<Longrightarrow> q2 \<in> set cs \<Longrightarrow> fst q1 \<noteq> fst q2
+                   \<Longrightarrow> set (map ((#) (fst q1)) ([] # walk (snd q1))) \<inter>
+                       set (map ((#) (fst q2)) ([] # walk (snd q2))) = {}"
+    using walk_disjoint_children by blast
+  have "distinct (concat (map (\<lambda>q. map ((#) (fst q)) ([] # walk (snd q))) cs))"
+    by (rule distinct_concat_map [OF names inner across])
+  then show ?case by simp
+qed
+
+text \<open>Non-vacuity: the well-formedness hypothesis is load-bearing. On a directory with two
+  children of the SAME name the conclusion genuinely fails, so walk_distinct is not a
+  restatement of the traversal definition; on the witness trees it holds by
+  walk_distinct_nested.\<close>
+
+lemma walk_not_distinct_dup_names:
+  "\<not> distinct (walk (DDir [([100], DFile), ([100], DFile)]))"
+  by eval
+
+lemma walk_dup_names_not_wf:
+  "\<not> wf_tree (DDir [([100], DFile), ([100], DFile)])"
+  by eval
+
+lemma walk_distinct_nested:
+  "wf_tree w_nested \<and> distinct (walk w_nested) \<and>
+   wf_tree w_emptydir \<and> distinct (walk w_emptydir) \<and>
+   wf_tree w_root \<and> distinct (walk w_root)"
+proof -
+  have 1: "wf_tree w_nested" by (simp add: w_nested_def)
+  have 2: "distinct (walk w_nested)" by (rule walk_distinct [OF 1])
+  have 3: "wf_tree w_emptydir" by (simp add: w_emptydir_def)
+  have 4: "distinct (walk w_emptydir)" by (rule walk_distinct [OF 3])
+  have 5: "wf_tree w_root" by (simp add: w_root_def)
+  have 6: "distinct (walk w_root)" by (rule walk_distinct [OF 5])
+  from 1 2 3 4 5 6 show ?thesis by auto
+qed
 
 
 end

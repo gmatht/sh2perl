@@ -40,4 +40,9 @@ field maxdepth: optional_expr
 # CYCLES (a finite tree cannot represent them, so a real walker needs a visited-inode set
 # and a cycle policy); entry metadata, permissions, name encoding; IO errors; and laziness
 # (this fold materialises the list).
+# Supporting machine-checked facts (same theory, same section, all proved): TextOps#walk_distinct
+# (the injective form: distinct (walk t) under wf_tree, via TextOps#walk_disjoint_children and
+# TextOps#distinct_walk_child), TextOps#walk_not_distinct_dup_names (the wf_tree hypothesis is
+# load-bearing: two children of the same name do repeat an entry) and TextOps#walk_dir_defects_bite
+# (each conjunct falsified by its own defect walker and witness lemma).
 spec: TextOps#walk_dir_sound

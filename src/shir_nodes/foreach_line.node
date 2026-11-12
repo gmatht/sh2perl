@@ -36,3 +36,12 @@ field limit: optional_expr
 spec: none (unstated: missing model — stream and cost model: reader position, laziness and
 # the memory bound, early close at the limit, IO errors on a partial final line. Value side
 # is `lines_of`/`join_lf`, with the reassembly roundtrip left as an open refinement.)
+
+# Machine-checked VALUE-side facts for this node (theory TextOps, the split/join section):
+# TextOps#lines_of_join_sound (join_lf (lines_of s) = s), derived from TextOps#split_lf_rebuild
+# and TextOps#join_lf_snoc; TextOps#lines_of_append_nl and TextOps#join_lf_of_append_nl (the
+# split-once/append characterisation, covering the trailing-newline case); TextOps#lines_of_nil
+# (the empty-string case) and TextOps#lines_of_roundtrip_witnesses (concrete non-vacuous
+# instances, including a leading newline and a lone newline). The value side is therefore
+# machine-checked; the node stays unstated ONLY because of the stream and cost model named
+# above, which no byte-level law expresses.
