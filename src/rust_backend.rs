@@ -20468,7 +20468,6 @@ fn compute_local_vars(
         let builtin_write = builtin_written.contains(&name);
         let us_write_count = us.iter().filter(|u| u.write).count() + usize::from(builtin_write);
         let us_writes = us_write_count > 0;
-        let first_is_write = us.first().map(|u| u.write).unwrap_or(false);
         let first_is_top_write = us.first().map(|u| u.write && u.top).unwrap_or(false);
         // A DECLARATION carries its own `let`, at any nesting depth (the
         // backend's owned-init pass descends blocks to find it), so a name
@@ -20603,104 +20602,180 @@ fn compute_local_vars(
     (out, need_mut, dead_init, safe_deinit, entry_decl, dead_store)
 }
 
-/// How many stores to `var` live inside one statement (recursively).
-fn store_count(st: &IrStmt, var: &str) -> usize {
-    let base = match st {
-        IrStmt::Assign { targets, expr, .. } => {
-            usize::from(targets.iter().any(|t| t.var.split('[').next().unwrap_or(&t.var) == var))
-                + expr_store_count(expr, var)
-        }
-        IrStmt::Declare { vars, .. } => usize::from(vars.iter().any(|d| d.name == var)),
-        IrStmt::DeclareArray { var: v, .. } => usize::from(v == var),
-        IrStmt::Expr(e) => expr_store_count(e, var),
-        _ => 0,
-    };
-    base + match st {
-        IrStmt::If { then, elsifs, else_, .. } => {
-            then.iter().map(|s| store_count(s, var)).sum::<usize>()
-                + elsifs.iter().map(|(_, b)| b.iter().map(|s| store_count(s, var)).sum::<usize>()).sum::<usize>()
-                + else_.iter().map(|s| store_count(s, var)).sum::<usize>()
-        }
-        IrStmt::While { body, .. } | IrStmt::DoWhile { body, .. } | IrStmt::For { body, .. }
-        | IrStmt::ForInit { body, .. } | IrStmt::Function { body, .. } | IrStmt::Block(body)
-        | IrStmt::Subshell(body) | IrStmt::Background(body) => {
-            body.iter().map(|s| store_count(s, var)).sum()
-        }
-        IrStmt::Case { clauses, .. } => clauses
-            .iter()
-            .map(|c| c.body.iter().map(|s| store_count(s, var)).sum::<usize>())
-            .sum(),
-        IrStmt::Select { clauses } => clauses
-            .iter()
-            .map(|c| c.body.iter().map(|s| store_count(s, var)).sum::<usize>())
-            .sum(),
-        IrStmt::Try { body, excepts, else_body, finally_body } => {
-            body.iter().map(|s| store_count(s, var)).sum::<usize>()
-                + excepts.iter().map(|e| e.body.iter().map(|s| store_count(s, var)).sum::<usize>()).sum::<usize>()
-                + else_body.iter().map(|s| store_count(s, var)).sum::<usize>()
-                + finally_body.iter().map(|s| store_count(s, var)).sum::<usize>()
-        }
-        IrStmt::Redirect { inner, .. } => inner.iter().map(|s| store_count(s, var)).sum(),
-        IrStmt::Pipeline { stages, .. } => stages
-            .iter()
-            .map(|s2| s2.iter().map(|s| store_count(s, var)).sum::<usize>())
-            .sum(),
-        _ => 0,
+/// Ordered store/read walk. One program-order sequence for `var`: `true` for
+/// a store site, `false` for a read site of the name. Reads inside a store's
+/// own RHS are dropped, so a self-read (`i = i + 1`, `y = … y …`) never
+/// defeats the verdict -- only reads that come AFTER the store in program
+/// order count.
+fn scan_stmts(list: &[IrStmt], var: &str, ev: &mut Vec<bool>, muted: bool) {
+    for st in list {
+        scan_stmt(st, var, ev, muted);
     }
 }
 
-fn expr_store_count(e: &IrExpr, var: &str) -> usize {
+fn scan_stmt(st: &IrStmt, var: &str, ev: &mut Vec<bool>, muted: bool) {
+    match st {
+        IrStmt::Assign { targets, expr, .. } => {
+            let store = targets
+                .iter()
+                .any(|t| t.var.split('[').next().unwrap_or(&t.var) == var);
+            if store {
+                ev.push(true);
+            }
+            scan_expr(expr, var, ev, muted || store);
+        }
+        IrStmt::Declare { vars, .. } => {
+            if vars.iter().any(|d| d.name == var) {
+                ev.push(true);
+            }
+        }
+        IrStmt::DeclareArray { var: v, .. } => {
+            if v == var {
+                ev.push(true);
+            }
+        }
+        IrStmt::Expr(e) => scan_expr(e, var, ev, muted),
+        IrStmt::If { cond, then, elsifs, else_, .. } => {
+            scan_expr(cond, var, ev, muted);
+            scan_stmts(then, var, ev, muted);
+            for (c, b) in elsifs {
+                scan_expr(c, var, ev, muted);
+                scan_stmts(b, var, ev, muted);
+            }
+            scan_stmts(else_, var, ev, muted);
+        }
+        IrStmt::While { cond, body, .. } => {
+            scan_expr(cond, var, ev, muted);
+            scan_stmts(body, var, ev, muted);
+        }
+        IrStmt::DoWhile { body, cond, .. } => {
+            scan_stmts(body, var, ev, muted);
+            scan_expr(cond, var, ev, muted);
+        }
+        IrStmt::For { body, .. } => scan_stmts(body, var, ev, muted),
+        IrStmt::ForInit { init, body, .. } => {
+            for i in init {
+                scan_stmt(i, var, ev, muted);
+            }
+            scan_stmts(body, var, ev, muted);
+        }
+        IrStmt::Function { body, named_blocks, .. } => {
+            scan_stmts(body, var, ev, muted);
+            for (_, b) in named_blocks {
+                scan_stmts(b, var, ev, muted);
+            }
+        }
+        IrStmt::Block(body) | IrStmt::Subshell(body) | IrStmt::Background(body) => {
+            scan_stmts(body, var, ev, muted)
+        }
+        IrStmt::Redirect { inner, .. } => scan_stmts(inner, var, ev, muted),
+        IrStmt::Pipeline { stages, .. } => {
+            for sg in stages {
+                scan_stmts(sg, var, ev, muted);
+            }
+        }
+        IrStmt::Case { discriminant, clauses } => {
+            scan_expr(discriminant, var, ev, muted);
+            for c in clauses {
+                for p in &c.patterns {
+                    if p == var && !muted {
+                        ev.push(false);
+                    }
+                }
+                scan_stmts(&c.body, var, ev, muted);
+            }
+        }
+        IrStmt::Select { clauses } => {
+            for c in clauses {
+                scan_stmts(&c.body, var, ev, muted);
+            }
+        }
+        IrStmt::Try { body, excepts, else_body, finally_body } => {
+            scan_stmts(body, var, ev, muted);
+            for e in excepts {
+                scan_stmts(&e.body, var, ev, muted);
+            }
+            scan_stmts(else_body, var, ev, muted);
+            scan_stmts(finally_body, var, ev, muted);
+        }
+        _ => {}
+    }
+}
+
+fn scan_expr(e: &IrExpr, var: &str, ev: &mut Vec<bool>, muted: bool) {
     match e {
         IrExpr::Call { func, args } if func == "setVar" || func == "assign" => {
-            usize::from(matches!(args.first(), Some(IrExpr::Str(n, _)) if n == var))
+            let store = matches!(args.first(), Some(IrExpr::Str(n, _)) if n == var);
+            if store {
+                ev.push(true);
+            }
+            for a in args.iter().skip(usize::from(store)) {
+                scan_expr(a, var, ev, muted || store);
+            }
         }
-        IrExpr::Arrow(body) => body.iter().map(|s| store_count(s, var)).sum(),
-        IrExpr::BinOp { lhs, rhs, .. } => expr_store_count(lhs, var) + expr_store_count(rhs, var),
-        IrExpr::Call { args, .. } => args.iter().map(|a| expr_store_count(a, var)).sum(),
+        IrExpr::Var(name, _) | IrExpr::Ident(name) => {
+            if name == var && !muted {
+                ev.push(false);
+            }
+        }
+        IrExpr::Index { var: v, key } => {
+            if v == var && !muted {
+                ev.push(false);
+            }
+            scan_expr(key, var, ev, muted);
+        }
+        IrExpr::BinOp { lhs, rhs, .. } => {
+            scan_expr(lhs, var, ev, muted);
+            scan_expr(rhs, var, ev, muted);
+        }
+        IrExpr::Call { args, .. } => {
+            for a in args {
+                scan_expr(a, var, ev, muted);
+            }
+        }
         IrExpr::MethodCall { obj, args, .. } => {
-            expr_store_count(obj, var) + args.iter().map(|a| expr_store_count(a, var)).sum::<usize>()
+            scan_expr(obj, var, ev, muted);
+            for a in args {
+                scan_expr(a, var, ev, muted);
+            }
         }
         IrExpr::Ternary { cond, then, else_ } => {
-            expr_store_count(cond, var) + expr_store_count(then, var) + expr_store_count(else_, var)
+            scan_expr(cond, var, ev, muted);
+            scan_expr(then, var, ev, muted);
+            scan_expr(else_, var, ev, muted);
         }
-        IrExpr::DefinedOr { expr, default } => expr_store_count(expr, var) + expr_store_count(default, var),
-        IrExpr::Interpolate(parts) => parts
-            .iter()
-            .map(|pt| match pt {
-                InterpPart::Expr(x) => expr_store_count(x, var),
-                _ => 0,
-            })
-            .sum(),
-        IrExpr::Capture { expr, .. } => expr_store_count(expr, var),
-        IrExpr::Array(items) => items.iter().map(|i| expr_store_count(i, var)).sum(),
-        IrExpr::Index { key, .. } => expr_store_count(key, var),
-        _ => 0,
+        IrExpr::DefinedOr { expr, default } => {
+            scan_expr(expr, var, ev, muted);
+            scan_expr(default, var, ev, muted);
+        }
+        IrExpr::Interpolate(parts) => {
+            for pt in parts {
+                if let InterpPart::Expr(x) = pt {
+                    scan_expr(x, var, ev, muted);
+                }
+            }
+        }
+        IrExpr::Capture { expr, .. } => scan_expr(expr, var, ev, muted),
+        IrExpr::Arrow(body) => scan_stmts(body, var, ev, muted),
+        IrExpr::Array(items) => {
+            for i in items {
+                scan_expr(i, var, ev, muted);
+            }
+        }
+        _ => {}
     }
 }
 
-/// `(stores, last_store_is_dead)` for one scope body: scan the top-level
-/// statements, find the last one containing a store, and treat the store as
-/// dead when nothing in the tail reads the name. Only the tail is scanned, so
-/// reads inside the store's own RHS never count.
+/// `(stores_at_or_before_last_store, last_store_is_dead)` for one scope body,
+/// from the ordered walk: dead iff the truly last store site comes after every
+/// read site of the name.
 fn dead_store_scan(body: &[IrStmt], var: &str) -> Option<(usize, bool)> {
-    let mut total = 0usize;
-    let mut last = None;
-    for (i, st) in body.iter().enumerate() {
-        let c = store_count(st, var);
-        if c > 0 {
-            total += c;
-            last = Some(i);
-        }
-    }
-    let i = last?;
-    let tail_reads = body[i + 1..].iter().any(|s| stmt_reads_var(s, var));
-    Some((total, !tail_reads))
-}
-
-fn stmt_reads_var(st: &IrStmt, var: &str) -> bool {
-    let mut out = BTreeSet::new();
-    collect_reads(std::slice::from_ref(st), &mut out);
-    out.contains(var)
+    let mut ev: Vec<bool> = Vec::new();
+    scan_stmts(body, var, &mut ev, false);
+    let last_store = ev.iter().rposition(|is_store| *is_store)?;
+    let dead = !ev[last_store + 1..].iter().any(|is_store| !is_store);
+    let stores = ev[..=last_store].iter().filter(|is_store| **is_store).count();
+    Some((stores, dead))
 }
 
 /// Every name bound by a `for` statement, at any depth.
