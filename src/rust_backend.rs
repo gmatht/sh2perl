@@ -247,6 +247,9 @@ pub struct Render {
     /// (`x=1; x=2; echo $x`): the deferred `let` needs
     /// `#[allow(unused_assignments)]` so we stay warning-clean
     local_dead_init: BTreeSet<String>,
+    /// stores still to render before the DEAD one (IR-scanned): that store's
+    /// value is never read, so it is emitted as `let _ = rhs;`.
+    local_dead_store: HashMap<String, usize>,
     /// Locals whose first write is definitely reached and is not loop-carried:
     /// declared `let mut x: T;` and initialised by that write.
     local_safe_deinit: BTreeSet<String>,
@@ -4632,6 +4635,16 @@ impl Render {
     /// assignments. `mut` only when the var is written again later.
     fn local_write_stmt(&mut self, name: &str, e: &str) -> String {
         let m = self.var_ident(name);
+        // Rule 1: the store whose value is never read. Count down to it, keep
+        // the RHS for its side effects, drop only that store; the declaration
+        // is untouched. First, so the borrowable branch cannot bypass it.
+        if let Some(rem) = self.local_dead_store.get_mut(name) {
+            *rem -= 1;
+            if *rem == 0 {
+                self.local_dead_store.remove(name);
+                return format!("let _ = {};", Self::unparen(e));
+            }
+        }
         // A BORROWABLE local binds the value as a borrowed `&str`
         // (`shir::analyze_var_borrowable`): the single assignment's RHS is
         // rendered as a borrow (`"foo"` not `"foo".to_string()`, `x` not
@@ -14037,13 +14050,14 @@ impl Render {
         }
         // Pass 2: pick the pass-2 locals (scalar vars confined to one
         // non-risky scope) and the assigned set (drives `let`/`let mut`).
-        let (locals, local_mut, dead_init, safe_deinit, entry) =
+        let (locals, local_mut, dead_init, safe_deinit, entry, dead_store) =
             compute_local_vars(prog, &self.arrays, &self.assoc, &self.functions, &written);
         self.local_vars = locals;
         self.local_mut = local_mut;
         self.local_dead_init = dead_init;
         self.local_safe_deinit = safe_deinit;
         self.local_entry = entry;
+        self.local_dead_store = dead_store;
         // an entry-declared local binds `String`/`i64` at the top of its
         // scope, never a borrowed `&str` (the borrow verdict assumes the
         // `let` IS the single assignment)
@@ -20416,14 +20430,16 @@ fn compute_local_vars(
     BTreeSet<String>,
     BTreeSet<String>,
     BTreeSet<String>,
+    HashMap<String, usize>,
 ) {
     use crate::shir_passes::list_profile::{local_scope, use_scopes, Scope};
     let mut need_mut: BTreeSet<String> = BTreeSet::new();
     let mut dead_init: BTreeSet<String> = BTreeSet::new();
     let mut safe_deinit: BTreeSet<String> = BTreeSet::new();
     let mut entry_decl: BTreeSet<String> = BTreeSet::new();
+    let mut dead_store: HashMap<String, usize> = HashMap::new();
     let Some(dyns) = dynamic_var_names(prog) else {
-        return (HashMap::new(), need_mut, dead_init, safe_deinit, entry_decl);
+        return (HashMap::new(), need_mut, dead_init, safe_deinit, entry_decl, dead_store);
     };
     let mut builtin_written: BTreeSet<String> = BTreeSet::new();
     collect_builtin_writes(&prog.stmts, &mut builtin_written);
@@ -20497,6 +20513,22 @@ fn compute_local_vars(
             _ => None,
         };
         let Some(scope) = scope else { continue };
+        // IR scan: the LAST top-level statement of this scope's body that
+        // stores to the name is dead when nothing after it reads the name.
+        let scan_body: &[IrStmt] = match &scope {
+            Scope::Main => &prog.stmts,
+            Scope::Func(f) => prog
+                .subs
+                .iter()
+                .find(|sb| &sb.name == f)
+                .map(|sb| sb.body.as_slice())
+                .unwrap_or(&prog.stmts),
+        };
+        if let Some((stores, last_dead)) = dead_store_scan(scan_body, &name) {
+            if last_dead {
+                dead_store.insert(name.clone(), stores);
+            }
+        }
         if entry {
             // the `let` sits at the top of the scope, so a later write is a
             // plain assignment and needs `mut` — but a name with NO write at
@@ -20568,7 +20600,107 @@ fn compute_local_vars(
         }
         out.insert(name, scope);
     }
-    (out, need_mut, dead_init, safe_deinit, entry_decl)
+    (out, need_mut, dead_init, safe_deinit, entry_decl, dead_store)
+}
+
+/// How many stores to `var` live inside one statement (recursively).
+fn store_count(st: &IrStmt, var: &str) -> usize {
+    let base = match st {
+        IrStmt::Assign { targets, expr, .. } => {
+            usize::from(targets.iter().any(|t| t.var.split('[').next().unwrap_or(&t.var) == var))
+                + expr_store_count(expr, var)
+        }
+        IrStmt::Declare { vars, .. } => usize::from(vars.iter().any(|d| d.name == var)),
+        IrStmt::DeclareArray { var: v, .. } => usize::from(v == var),
+        IrStmt::Expr(e) => expr_store_count(e, var),
+        _ => 0,
+    };
+    base + match st {
+        IrStmt::If { then, elsifs, else_, .. } => {
+            then.iter().map(|s| store_count(s, var)).sum::<usize>()
+                + elsifs.iter().map(|(_, b)| b.iter().map(|s| store_count(s, var)).sum::<usize>()).sum::<usize>()
+                + else_.iter().map(|s| store_count(s, var)).sum::<usize>()
+        }
+        IrStmt::While { body, .. } | IrStmt::DoWhile { body, .. } | IrStmt::For { body, .. }
+        | IrStmt::ForInit { body, .. } | IrStmt::Function { body, .. } | IrStmt::Block(body)
+        | IrStmt::Subshell(body) | IrStmt::Background(body) => {
+            body.iter().map(|s| store_count(s, var)).sum()
+        }
+        IrStmt::Case { clauses, .. } => clauses
+            .iter()
+            .map(|c| c.body.iter().map(|s| store_count(s, var)).sum::<usize>())
+            .sum(),
+        IrStmt::Select { clauses } => clauses
+            .iter()
+            .map(|c| c.body.iter().map(|s| store_count(s, var)).sum::<usize>())
+            .sum(),
+        IrStmt::Try { body, excepts, else_body, finally_body } => {
+            body.iter().map(|s| store_count(s, var)).sum::<usize>()
+                + excepts.iter().map(|e| e.body.iter().map(|s| store_count(s, var)).sum::<usize>()).sum::<usize>()
+                + else_body.iter().map(|s| store_count(s, var)).sum::<usize>()
+                + finally_body.iter().map(|s| store_count(s, var)).sum::<usize>()
+        }
+        IrStmt::Redirect { inner, .. } => inner.iter().map(|s| store_count(s, var)).sum(),
+        IrStmt::Pipeline { stages, .. } => stages
+            .iter()
+            .map(|s2| s2.iter().map(|s| store_count(s, var)).sum::<usize>())
+            .sum(),
+        _ => 0,
+    }
+}
+
+fn expr_store_count(e: &IrExpr, var: &str) -> usize {
+    match e {
+        IrExpr::Call { func, args } if func == "setVar" || func == "assign" => {
+            usize::from(matches!(args.first(), Some(IrExpr::Str(n, _)) if n == var))
+        }
+        IrExpr::Arrow(body) => body.iter().map(|s| store_count(s, var)).sum(),
+        IrExpr::BinOp { lhs, rhs, .. } => expr_store_count(lhs, var) + expr_store_count(rhs, var),
+        IrExpr::Call { args, .. } => args.iter().map(|a| expr_store_count(a, var)).sum(),
+        IrExpr::MethodCall { obj, args, .. } => {
+            expr_store_count(obj, var) + args.iter().map(|a| expr_store_count(a, var)).sum::<usize>()
+        }
+        IrExpr::Ternary { cond, then, else_ } => {
+            expr_store_count(cond, var) + expr_store_count(then, var) + expr_store_count(else_, var)
+        }
+        IrExpr::DefinedOr { expr, default } => expr_store_count(expr, var) + expr_store_count(default, var),
+        IrExpr::Interpolate(parts) => parts
+            .iter()
+            .map(|pt| match pt {
+                InterpPart::Expr(x) => expr_store_count(x, var),
+                _ => 0,
+            })
+            .sum(),
+        IrExpr::Capture { expr, .. } => expr_store_count(expr, var),
+        IrExpr::Array(items) => items.iter().map(|i| expr_store_count(i, var)).sum(),
+        IrExpr::Index { key, .. } => expr_store_count(key, var),
+        _ => 0,
+    }
+}
+
+/// `(stores, last_store_is_dead)` for one scope body: scan the top-level
+/// statements, find the last one containing a store, and treat the store as
+/// dead when nothing in the tail reads the name. Only the tail is scanned, so
+/// reads inside the store's own RHS never count.
+fn dead_store_scan(body: &[IrStmt], var: &str) -> Option<(usize, bool)> {
+    let mut total = 0usize;
+    let mut last = None;
+    for (i, st) in body.iter().enumerate() {
+        let c = store_count(st, var);
+        if c > 0 {
+            total += c;
+            last = Some(i);
+        }
+    }
+    let i = last?;
+    let tail_reads = body[i + 1..].iter().any(|s| stmt_reads_var(s, var));
+    Some((total, !tail_reads))
+}
+
+fn stmt_reads_var(st: &IrStmt, var: &str) -> bool {
+    let mut out = BTreeSet::new();
+    collect_reads(std::slice::from_ref(st), &mut out);
+    out.contains(var)
 }
 
 /// Every name bound by a `for` statement, at any depth.
