@@ -2756,4 +2756,138 @@ lemma reg_sub_line_witness:
   by eval
 
 
+section \<open>ReadLine, ElementRead, FieldRead, TypeAssert: readback laws\<close>
+
+text \<open>Four nodes that looked like pure effects but each carry a real denotational
+  contract, and each contract is what a renderer has to preserve.
+
+  \<^bold>\<open>ReadLine\<close> (declared `effect: I/O`) is "one line from standard input, the
+  value WITHOUT its trailing newline, EOF gives the empty string". At the byte level
+  that is exactly the first feature of the LF model above: the value is the text cut
+  at the first LF with that LF dropped (@{term cut} at count 1), so it contains NO LF
+  at all — the chomp law, which is what a caller relies on when it compares or
+  re-terminates the line. A subject with no LF is read whole and unchanged (that is
+  the EOF case, since nothing was terminated), and a subject with an LF splits into
+  the value plus that terminator plus a remainder. What is NOT promised is anything
+  about the DEVICE: blocking, partial reads, a closed descriptor, the file pointer's
+  position, or a final line with no terminator being reported as EOF — those belong to
+  the runtime's stream, not to this function. Neither is any encoding, or `read` with
+  several variables (the subset reads one; IFS splitting belongs to a different
+  lowering).
+
+  \<^bold>\<open>ElementRead\<close> (`m["key"]` on a literal) and \<^bold>\<open>FieldRead\<close> (`p.x`)
+  both read one entry out of a composite VALUE, and the file for each says so: the key
+  "stringifies like the host object model", and a numeric field name is rendered as an
+  INDEX. So both land on the MapLiteral association list: an element read of a query
+  is @{term map_lookup} over the zipped entries, and a field read is the same thing
+  with the field name's bytes as the query — which makes the two nodes one function at
+  two spellings, proved below. The readback law that matters is that reading a key
+  that occurs LAST in a literal yields that last value, so a duplicate key reads back
+  last-wins exactly as the literal's own lookup does. What is NOT promised: the
+  stringification rule (abstract @{term st}, as for `map_literal`), the ORDER of
+  enumeration or of property storage (JS reorders integer-like names), indexing
+  ARITHMETIC on arrays (`arr[i]` as an offset, out-of-range behaviour), missing-key
+  policy beyond "no such entry" (`null` vs `undef` vs an error is the host's), and
+  tuple-index reads, which `field_read` says are not this node.
+
+  \<^bold>\<open>TypeAssert\<close> is documented as a CHECKED PASSTHROUGH: the value flows through
+  unchanged and `kind` only names the expected dynamic kind. The law is therefore that
+  the node's value is its operand for EVERY kind, and that two different kinds give the
+  same value — no coercion, which is the property a backend could most easily break.
+  What is NOT promised: that the check actually FIRES (the IR is dynamically typed, so
+  the assertion is the frontend's guard plus whatever a backend chooses to validate),
+  the comma-ok boolean (the frontend emits the `typeof` comparison itself), and the
+  `kind` vocabulary beyond the five pinned strings.\<close>
+
+definition rl_line :: "bytes \<Rightarrow> bytes" where
+  "rl_line s \<equiv> cut 1 s"
+
+lemma count_lf_snoc_nl: "count_lf (r @ [nl]) = Suc (count_lf r)"
+  by (induct r) simp_all
+
+lemma rl_line_clean: "count_lf (rl_line s) = 0"
+  by (simp add: rl_line_def cut_count)
+
+theorem read_line_sound:
+  "count_lf (rl_line s) = 0 \<and>
+   (count_lf s = 0 \<longrightarrow> rl_line s = s) \<and>
+   (0 < count_lf s \<longrightarrow> (\<exists>r. s = rl_line s @ nl # r))"
+proof (intro conjI)
+  show "count_lf (rl_line s) = 0" by (rule rl_line_clean)
+  show "count_lf s = 0 \<longrightarrow> rl_line s = s"
+    by (simp add: rl_line_def cut_all)
+  show "0 < count_lf s \<longrightarrow> (\<exists>r. s = rl_line s @ nl # r)"
+    by (simp add: rl_line_def cut_terminator)
+qed
+
+lemma read_line_witness:
+  "rl_line [97, 10, 98] = [97] \<and>
+   rl_line [97, 98] = [97, 98] \<and>
+   rl_line [] = [] \<and>
+   count_lf (rl_line [97, 10]) = 0"
+  by eval
+
+definition er_read ::
+  "(bytes \<Rightarrow> bytes) \<Rightarrow> bytes \<Rightarrow> bytes list \<Rightarrow> bytes list \<Rightarrow> bytes option" where
+  "er_read st q ks vs \<equiv> map_lookup st q (map_entries ks vs)"
+
+definition fr_read ::
+  "(bytes \<Rightarrow> bytes) \<Rightarrow> bytes \<Rightarrow> bytes list \<Rightarrow> bytes list \<Rightarrow> bytes option" where
+  "fr_read st name ks vs \<equiv> er_read st name ks vs"
+
+lemma er_read_last:
+  "length ks = length vs \<Longrightarrow> st k = st q \<Longrightarrow>
+     er_read st q (ks @ [k]) (vs @ [v]) = Some v"
+  by (simp add: er_read_def map_lookup_snoc)
+
+lemma fr_read_is_er: "fr_read st name ks vs = er_read st name ks vs"
+  by (simp add: fr_read_def)
+
+theorem element_read_sound:
+  "er_read st q ks vs = map_lookup st q (map_entries ks vs) \<and>
+   (length ks = length vs \<and> st k = st q \<longrightarrow>
+      er_read st q (ks @ [k]) (vs @ [v]) = Some v) \<and>
+   ((\<forall>p \<in> set (map_entries ks vs). st (fst p) \<noteq> st q) \<longrightarrow>
+      er_read st q ks vs = None)"
+proof (intro conjI)
+  show "er_read st q ks vs = map_lookup st q (map_entries ks vs)"
+    by (simp add: er_read_def)
+  show "length ks = length vs \<and> st k = st q \<longrightarrow>
+          er_read st q (ks @ [k]) (vs @ [v]) = Some v"
+    by (auto intro: er_read_last)
+  show "(\<forall>p \<in> set (map_entries ks vs). st (fst p) \<noteq> st q) \<longrightarrow>
+          er_read st q ks vs = None"
+    by (auto simp: er_read_def intro: map_lookup_miss)
+qed
+
+theorem field_read_sound:
+  "fr_read st name ks vs = er_read st name ks vs \<and>
+   (length ks = length vs \<and> st k = st name \<longrightarrow>
+      fr_read st name (ks @ [k]) (vs @ [v]) = Some v)"
+proof (intro conjI)
+  show "fr_read st name ks vs = er_read st name ks vs" by (rule fr_read_is_er)
+  show "length ks = length vs \<and> st k = st name \<longrightarrow>
+          fr_read st name (ks @ [k]) (vs @ [v]) = Some v"
+    by (simp add: fr_read_def er_read_def map_lookup_snoc)
+qed
+
+lemma element_read_witness:
+  "er_read id [107] [[107], [107]] [[49], [50]] = Some [50] \<and>
+   er_read id [107] [[107], [97]] [[49], [50]] = Some [49] \<and>
+   er_read id [122] [[107]] [[49]] = None"
+  by eval
+
+lemma field_read_witness:
+  "fr_read id [120] [[120]] [[49]] = Some [49] \<and>
+   fr_read id [120] [[120], [120]] [[49], [50]] = Some [50]"
+  by eval
+
+definition ta_val :: "bytes \<Rightarrow> bytes \<Rightarrow> bytes" where
+  "ta_val k v \<equiv> v"
+
+theorem type_assert_sound:
+  "ta_val k v = v \<and> ta_val k1 v = ta_val k2 v"
+  by (simp add: ta_val_def)
+
+
 end

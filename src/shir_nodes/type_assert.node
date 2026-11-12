@@ -18,4 +18,15 @@ kind expr
 # storage_class str_bounded
 field expr: expr
 field kind: string
-spec: none (effect: control flow)
+# Spec: TextOps#type_assert_sound (docs/fm/TextOps/ShIR_TextOps_Strings.thy, section
+# "ReadLine, ElementRead, FieldRead, TypeAssert: readback laws"). The node is a CHECKED
+# PASSTHROUGH, so the law is that its value is its operand for every kind, and that two
+# different kinds give the same value — no coercion, the property a backend could most
+# easily break by "helpfully" converting.
+#
+# NOT PROMISED (stated, not assumed): that the check FIRES — the IR is dynamically
+# typed, so the assertion is the frontend's guard plus whatever validation a backend
+# chooses; the comma-ok boolean, which the frontend emits itself as a typeof comparison;
+# and any `kind` beyond the five pinned strings ("string", "int", "float", "bool",
+# "array").
+spec: TextOps#type_assert_sound

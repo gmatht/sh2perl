@@ -10,4 +10,16 @@ node ReadLine
 tag "ReadLine"
 kind expr
 # storage_class str_bounded
-spec: none (effect: I/O)
+# Spec: TextOps#read_line_sound (docs/fm/TextOps/ShIR_TextOps_Strings.thy, section
+# "ReadLine, ElementRead, FieldRead, TypeAssert: readback laws"). The value is the LF
+# model's first feature: the text cut at its first LF with that LF DROPPED. Proved: the
+# value contains no LF at all (the chomp law a caller relies on when it compares or
+# re-terminates the line); a subject with no LF is read whole and unchanged (the EOF
+# case, nothing was terminated); and a subject with an LF splits into the value, that
+# terminator, and a remainder.
+#
+# NOT PROMISED (stated, not assumed): the DEVICE — blocking, partial reads, a closed
+# descriptor, the file pointer's position, or a final unterminated line being reported
+# as EOF belong to the runtime's stream, not this function; encoding; and multi-variable
+# `read` with IFS splitting, which is a different lowering.
+spec: TextOps#read_line_sound

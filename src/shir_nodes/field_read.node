@@ -17,4 +17,15 @@ kind expr
 # storage_class str_bounded
 field object: expr
 field name: string
-spec: none (effect: frontend shape)
+# Spec: TextOps#field_read_sound (docs/fm/TextOps/ShIR_TextOps_Strings.thy, section
+# "ReadLine, ElementRead, FieldRead, TypeAssert: readback laws"). A field read is an
+# element read with the field name's bytes as the query — the two nodes are one function
+# at two spellings, which is proved — so the readback law is the same: reading a name
+# that occurs LAST in a literal yields that last value (duplicates read back last-wins).
+#
+# NOT PROMISED (stated, not assumed): the key-stringification rule (abstract st);
+# property order; the renderer's rule that a NUMERIC name is an INDEX (`obj[0]`,
+# `$obj->[0]`) rather than a lookup, which is a rendering decision outside this law;
+# tuple-index reads, which this node explicitly does not cover; and the missing-key
+# policy.
+spec: TextOps#field_read_sound

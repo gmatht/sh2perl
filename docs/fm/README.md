@@ -201,7 +201,7 @@ three that did not — `newline_strip_sound`, `uniq_lines_sound`,
 (`sort_lines_sound`). `harness/check-node-specs.pl` (workspace `harness/`) makes
 "no dangling spec" a machine check: it collects every `theorem`/`lemma`/
 `definition`/`fun` under `docs/fm` and fails on a `spec:` naming one that does
-not exist. It reports 35 resolved, 13 unstated, 0 pending, 0 dangling.
+not exist. It reports 39 resolved, 9 unstated, 0 pending, 0 dangling.
 
 - `newline_strip_sound` (`ShIR_TextOps_Strip`): the node is the trailing-run
   removal, with the run length and the prefix equation.
@@ -236,9 +236,9 @@ deliberate no-obligation form. `--map` prints the node→theorem table below and
 `--selftest` runs the five negative controls (real theorem, definition, dangling
 name, wrong session prefix, unbuilt theory).
 
-Current inventory: **35 resolved, 13 unstated, 0 pending, 0 errors**.
+Current inventory: **39 resolved, 9 unstated, 0 pending, 0 errors**.
 
-The 35 resolved specs (33 distinct theorems; `lowered_wc_sound` covers three
+The 39 resolved specs (37 distinct theorems; `lowered_wc_sound` covers three
 nodes and `field_extract`, `split`, `substitute`, `uniq_lines` and
 `cutset_trim` cite two each):
 
@@ -255,6 +255,8 @@ nodes and `field_extract`, `split`, `substitute`, `uniq_lines` and
 | `field_strip_end` | `field_strip_end_drains_on_miss` |
 | `cutset_trim` | `cutset_trim_is_trim_by`, `cutset_trim_sound` |
 | `field_extract` | `cut_keeps_empty_field`, `field_or_empty_out_of_range` |
+| `element_read` | `element_read_sound` |
+| `field_read` | `field_read_sound` |
 | `map_literal` | `map_literal_sound` |
 | `path_name` | `path_name_sound` |
 | `newline_strip` | `newline_strip_sound` |
@@ -266,7 +268,9 @@ nodes and `field_extract`, `split`, `substitute`, `uniq_lines` and
 | `split` | `split_ws_len`, `split_ws_fields_clean` |
 | `str_len` | `lowered_wc_sound` |
 | `str_splice` | `str_splice_fold_sound` |
+| `read_line` | `read_line_sound` |
 | `take_lines` | `take_lines_sound` |
+| `type_assert` | `type_assert_sound` |
 | `string_affix` | `string_affix_sound` |
 | `string_contains` | `string_contains_sound` |
 | `string_trim` | `string_trim_sound` |
@@ -363,6 +367,29 @@ a deletion (empty replacement) and a per-line case. Scope notes in the theory an
 node: greediness/alternation/search order, the regex dialect, the replacement syntax
 (abstracted as `R`; `expand` is the concrete one), the engine-owned empty-match advance,
 the source trailing newline, and argument evaluation.
+
+### Four "effect" nodes that had a real contract (2026-11-13)
+
+The remaining `spec: none` reasons were mostly `effect: …`, but four of them carry a
+denotational contract worth pinning. `read_line` is the LF model's first feature — the
+value is the text cut at its first LF with that LF dropped — so
+`read_line_sound` proves the chomp law (the value has no LF at all), that an
+unterminated subject is read whole (the EOF case), and that a terminated one splits into
+value, terminator and remainder; the stream/device is scope. `element_read` and
+`field_read` read one entry out of a composite value, which lands on the MapLiteral
+association list: `element_read_sound` proves the read IS `map_lookup` over the zipped
+entries, that a key occurring LAST reads back its own value (so duplicates are last-wins,
+matching the literal), and the all-miss case; `field_read_sound` proves a field read is
+an element read with the name's bytes as the query, plus the same last-wins readback.
+`type_assert` is a checked passthrough, so `type_assert_sound` proves the value is its
+operand for every kind and that two kinds agree — no coercion; whether the check fires
+is the frontend's/backend's business. Witnesses cover the chomp (`"a\nb"` reads `"a"`,
+`"ab"` reads whole), a duplicate-key readback, a field read and its last-wins variant, all
+at byte level.
+
+Nine nodes remain `spec: none` and they are genuinely effect-only: `address_of`,
+`cgo_call`, `clone_deep`, `counted_for`, `deref`, `foreach_line`, `gpu_op`, `spread`,
+`walk_dir`.
 
 ### The two obligations that were thinner than their names (2026-11-13)
 

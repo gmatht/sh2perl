@@ -14,4 +14,17 @@ kind expr
 # storage_class str_bounded
 field coll: expr
 field key: expr
-spec: none (effect: frontend shape)
+# Spec: TextOps#element_read_sound (docs/fm/TextOps/ShIR_TextOps_Strings.thy, section
+# "ReadLine, ElementRead, FieldRead, TypeAssert: readback laws"). Reading one entry out
+# of a composite VALUE lands on the MapLiteral association list: the read is
+# `map_lookup` over the zipped entries with the query stringified by the abstract st.
+# Proved: the read IS that lookup; reading a key that occurs LAST in a literal yields
+# that last value (so a duplicate key reads back last-wins, exactly as the literal's own
+# lookup does); and a literal none of whose keys stringify to the query has no such
+# entry.
+#
+# NOT PROMISED (stated, not assumed): the stringification rule (abstract st, as for
+# map_literal); the order of enumeration or property storage (JS reorders integer-like
+# names); array INDEX arithmetic and out-of-range behaviour; the missing-key policy
+# beyond "no such entry" (null vs undef vs an error is the host's).
+spec: TextOps#element_read_sound
