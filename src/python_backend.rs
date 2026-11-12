@@ -5342,11 +5342,20 @@ impl Render {
         // function last printed — a non-empty string — whose truthiness is
         // always True, so `if is_prime($n)` accepted every candidate
         // (051_primes printed consecutive odds instead of primes).
-        if let IrExpr::Call { func, .. } = e {
-            if self.fn_names.contains(func.as_str()) {
-                self.need_ok_status = true;
-                return (vec![], format!("__sh_ok_status({c})"));
+        // The CALLEE may be the func field or the first argv word: a plain
+        // `is_prime $n` arrives as Call{exec, [Str("is_prime"), …]}, so only
+        // checking `func` left `if is_prime(candidate):` unwrapped.
+        let is_fn_call = match e {
+            IrExpr::Call { func, args } => {
+                self.fn_names.contains(func.as_str())
+                    || matches!(args.first(), Some(IrExpr::Str(n, _))
+                        if self.fn_names.contains(n.as_str()))
             }
+            _ => false,
+        };
+        if is_fn_call {
+            self.need_ok_status = true;
+            return (vec![], format!("__sh_ok_status({c})"));
         }
         (vec![], c)
     }
