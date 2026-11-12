@@ -9,8 +9,8 @@
     Go and Rust arms take sets of code points, and the witnesses below pin the
     point where the two readings differ.
 
-    WHAT IS PROVED. Five named obligations, each general over arbitrary `s` and
-    `cs`:
+    WHAT IS PROVED. The node's `spec:` is `cutset_trim_sound`; five further
+    obligations are named, each general over arbitrary `s` and `cs`:
 
       cutset_trim_is_trim_by        the node is `trim_by` at the membership test
       cutset_trim_removes_only_a_run what is removed is a run, got from Strings
@@ -219,17 +219,15 @@ lemma cutset_trim_hyphen_is_a_member_not_a_range:
   "cutset_trim C_both [97, 45, 99] [97, 99, 98, 97] = [98]"
   by eval
 
-text \<open>MEMBER-SET INVARIANCE (named `cutset_trim_depends_only_on_members`, which is
-  all it says). The next section models the UNQUOTED bracket reading and proves
-  the divergence proper, because invariance alone is true of any set-based
-  reading and would survive the quoting being dropped. The statement:
-  is that the arm is a function of the cutset as a SET and of nothing else: two
-  cutsets with the same members trim identically, whatever order or repetition
-  they were written with. That is precisely what `\Q..\E` is for — it makes the
-  compiled class denote the member set — and it is why an unquoted
-  interpolation of `]`, `^` or `\` is a different node, not a stylistic
-  variant. The bracketed witnesses below name the bytes where the readings
-  part.\<close>
+text \<open>MEMBER-SET INVARIANCE. The arm is a function of the cutset as a SET and of
+  nothing else: two cutsets with the same members trim identically, whatever
+  order or repetition they were written with. That is precisely what `\Q..\E`
+  is for — it makes the compiled class denote the member set — and it is why an
+  unquoted interpolation of `]`, `^` or `\` is a different node, not a
+  stylistic variant. This lemma states only the invariance, because invariance
+  on its own is true of ANY set-based reading (it would survive the quoting
+  being dropped); the divergence proper is proved by comparing against the
+  unquoted bracket reading in the next section.\<close>
 
 theorem cutset_trim_depends_only_on_members:
   "set cs = set cs' \<Longrightarrow> cutset_trim side cs s = cutset_trim side cs' s"
@@ -252,13 +250,13 @@ text \<open>Go's `strings.Trim(s, cutset)` and Rust's `trim_matches(|c|
   encoding of U+00A0 (and is not itself a character), so a byte-wise trim
   removes it and a codepoint-wise trim cannot.\<close>
 
-text \<open>BYTE GRANULARITY (named `cutset_trim_lead_is_bytewise`, which is all it
-  says). The codepoint comparison is proved in the next section. The statement:
-  the model decides one BYTE at a time: a member byte at the head is removed whatever follows it,
-  which is a rule `strings.Trim` (a set of code points) has no way to express
-  when the byte is the lead byte of a multi-byte character. The witness below
-  shows the model answering with a continuation byte and no lead byte — text a
-  codepoint trim cannot produce.\<close>
+text \<open>BYTE GRANULARITY. The model decides one BYTE at a time: a member byte at the
+  head is removed whatever follows it, which is a rule `strings.Trim` (a set of
+  code points) has no way to express when the byte is the lead byte of a
+  multi-byte character. This lemma is the general fact, named for what it says;
+  the codepoint comparison is proved with the decoder in the next section, where
+  the witness shows the model answering with a continuation byte and no lead
+  byte — text a codepoint trim cannot produce.\<close>
 
 theorem cutset_trim_lead_is_bytewise:
   "c \<in> set cs \<Longrightarrow> cutset_trim C_lead cs (c # s) = cutset_trim C_lead cs s"
@@ -271,10 +269,10 @@ proof -
   finally show ?thesis .
 qed
 
-text \<open>TRAILING BYTE GRANULARITY (named `cutset_trim_trail_is_bytewise`). The
-  same fact at the trailing end: `trim_matches(|c| cutset.contains(c))` asks about a `char`, while
-  the model asks about a byte, so a trailing member byte goes even when it is
-  half of a character.\<close>
+text \<open>TRAILING BYTE GRANULARITY, named `cutset_trim_trail_is_bytewise`. The same
+  fact at the trailing end: `trim_matches(|c| cutset.contains(c))` asks about a
+  `char`, while the model asks about a byte, so a trailing member byte goes even
+  when it is half of a character.\<close>
 
 theorem cutset_trim_trail_is_bytewise:
   "c \<in> set cs \<Longrightarrow> cutset_trim C_trail cs (s @ [c]) = cutset_trim C_trail cs s"
