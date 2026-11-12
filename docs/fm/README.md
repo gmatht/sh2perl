@@ -12,7 +12,7 @@ shIR. It is split into six theories that build as one session:
 | `ShIR_TextOps_Space` | each engine's measured `\s` class (`measure-space.sh` is the pin), the word count over an ARBITRARY class (`nwords_by`), and where the emitted word split diverges from `wc -w` — with proved witnesses and an ASCII-soundness result per engine. |
 | `ShIR_TextOps_Strings` | the string-algebra nodes `StringTrim` / `StringAffix` / `AffixStrip` over one generic run drop, and each renderer's measured TRIM class (`measure-trim.sh` is the pin) — the flag-blind arms, the four measured trim classes, and the Perl trailing-affix empty-pattern gap. |
 | `ShIR_TextOps_Cut` | the `CutAt` node: `find_first`/`rfind_last` as primitives (occurrence, no-match, leftmost/maximal), the four single-star cut forms with their no-match no-ops, the split identity, and `affix_strip_fold_sound`, which is general over every `s` and `n`: all four star shapes are the primitive's `take`/`drop` at the first/last occurrence with the text unchanged on `None`, and the plain branch is the `#` shape at a head literal. `cut_first_last_agree` is the general converse (the cuts coincide whenever the primitives do); the repeating-literal case lives in its own example lemma, `cut_star_first_is_not_last`. The glob engine itself is not modelled — that identification is stated, not proved. |
-| `ShIR_TextOps_Cutset` | the `CutsetTrim` node: the trim class as DATA (`trim_by` at a membership test), the three-valued side field, idempotence per side, and the witnesses where a renderer's reading of the cutset diverges (Perl's bracket metacharacters need `\Q..\E`; Go/Rust take code points, the model is bytes). |
+| `ShIR_TextOps_Cutset` | the `CutsetTrim` node: the trim class as DATA. Five named obligations, each general over arbitrary text and cutset — `cutset_trim_is_trim_by` (the node is `trim_by` at the membership test, so idempotence and run-only removal are inherited from Strings, not re-proved), `cutset_trim_removes_only_a_run`, `cutset_side_three_valued` (three sides, no fourth, and `(False,False)` unreachable), `perl_cutset_needs_quotemeta` (the arm is a function of the SET only — which is what `\Q..\E` preserves), and `go_trim_cutset_is_codepoints`/`rust_trim_matches_is_chars` (the model decides per BYTE, at each end). Witness lemmas name the bytes where the readings part: `]`, `^`, `\`, `-`, and the UTF-8 NBSP pair. |
 | `ShIR_TextOps_Substitute` | the `Substitute` node: two fuel-bounded engines (`subst_all`, `subst_first`) over an abstract matcher — leftmost, non-overlapping, empty-match-advances-one-byte as the termination obligation, `&` as a function of the matched text. The regex syntax, the line split and `\N` are documented limitations. |
 
 ```
@@ -191,6 +191,27 @@ not exist. It reports 16 resolved, 29 unstated, 0 dangling.
   adjacent-free, idempotent under re-sorting, and invents nothing.
 - `substitute_sound` (`ShIR_TextOps_Substitute`) and `cutset_trim_sound`
   (`ShIR_TextOps_Cutset`) — the two new theories.
+
+### Closed: CutsetTrim (2026-11-13)
+
+`cutset_trim.node`'s `spec:` is `TextOps#cutset_trim_sound`, a general theorem
+covering both ends and all three sides; the five obligations the node implies
+are theorems over arbitrary text and cutset, not `eval` restatements:
+`cutset_trim_is_trim_by` (definitional, and the reason the Strings library
+applies unchanged), `cutset_trim_removes_only_a_run` (suffix/prefix/non-member
+head, inherited from `lead_drop`/`trail_drop`), and `cutset_side_three_valued`
+(the three values, the three `(lead, trail)` pairs, and `(False, False)`
+unreachable). The three divergence claims are general too: the Perl arm is a
+function of the cutset as a set (`perl_cutset_needs_quotemeta`), and the model
+decides one byte at a time at each end (`go_trim_cutset_is_codepoints`,
+`rust_trim_matches_is_chars`). The witness lemmas are exactly the bytes where
+the readings part — `]`, `^`, `\`, `-` for the bracket reading, and the UTF-8
+NBSP pair for the codepoint reading, where the model answers `[160, 97]` (a
+continuation byte with no lead byte, i.e. not text) and a codepoint trim cannot.
+
+Assumed, not proved: the regex Perl's `s/^[\Q..\E]+//` compiles to, and UTF-8
+decoding. The witnesses are evaluations of the byte model, and no regex engine
+or decoder is formalised anywhere in this session.
 - Wired: `StringTrim`, `StringAffix`, `AffixStrip` and `CutsetTrim` now cite
   their theorems instead of `none (unstated)`.
 
