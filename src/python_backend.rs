@@ -3839,6 +3839,16 @@ impl Render {
                             },
                             _ => "1".to_string(),
                         };
+                        if self.in_function > 0 {
+                            // bash shifts the FUNCTION's positionals; inside
+                            // a python def those live in `_sh_args`, so
+                            // deleting from sys.argv left the function's own
+                            // `$*` unchanged (`capture "label" …` kept
+                            // printing the label — readonly-cmdsub,
+                            // id-cmdsub, tty-cmdsub, realpath-cmdsub).
+                            self.emit(&format!("_sh_args = _sh_args[{n}:]"));
+                            return "None".into();
+                        }
                         self.need_sys = true;
                         self.emit(&format!("del sys.argv[1:1+{n}]"));
                         return "None".into();
@@ -5076,7 +5086,8 @@ impl Render {
     fn isolated_body(&mut self, body: &[IrStmt], buffered: bool) {
         let saved = std::mem::take(&mut self.written);
         self.collect_writes(body);
-        let writes = std::mem::replace(&mut self.written, saved);
+        let mut writes = std::mem::replace(&mut self.written, saved);
+        Self::collect_builtin_mutations(body, &mut writes);
         let mut names: Vec<String> = writes
             .iter()
             .filter(|w| Self::is_plain_name(w))
@@ -5113,6 +5124,101 @@ impl Render {
                 self.emit(&format!("{v} = __sh_sub_save[{}]", Self::py_str(v)));
             }
         }
+    }
+
+    /// Names a body mutates through a BUILTIN (`unset X`, `export X=…`,
+    /// `local X=…`). `collect_writes` models the `setVar`/`unset` Call
+    /// dialects, but a shell-level `unset DEBUG` reaches the IR as
+    /// `Call{builtin,[Str("unset"), Array[…]]}` — invisible there. A
+    /// subshell that snapshotted only `written` therefore restored nothing
+    /// and its `unset` leaked into the parent (064_20: `Outer … DEBUG=`
+    /// instead of `DEBUG=1`, same flattening in 064_hard_to_generate).
+    /// Only used for the subshell save/restore set, never for the program
+    /// wide `written` set (which decides whether a read folds to "").
+    fn collect_builtin_mutations(
+        stmts: &[IrStmt],
+        out: &mut std::collections::HashSet<String>,
+    ) {
+        fn expr(e: &IrExpr, out: &mut std::collections::HashSet<String>) {
+            match e {
+                IrExpr::Call { func, args } => {
+                    if func == "builtin" {
+                        if let Some(IrExpr::Str(b, _)) = args.first() {
+                            if matches!(
+                                b.as_str(),
+                                "unset" | "export" | "readonly" | "local" | "declare" | "typeset"
+                            ) {
+                                if let Some(IrExpr::Array(items)) = args.get(1) {
+                                    for it in items {
+                                        if let IrExpr::Str(s, _) = it {
+                                            let nm = s.split('=').next().unwrap_or("").trim();
+                                            if !nm.is_empty() && Render::is_plain_name(nm) {
+                                                out.insert(nm.to_string());
+                                            }
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    }
+                    for a in args {
+                        expr(a, out);
+                    }
+                }
+                IrExpr::Array(items) => {
+                    for a in items {
+                        expr(a, out);
+                    }
+                }
+                IrExpr::BinOp { lhs, rhs, .. } => {
+                    expr(lhs, out);
+                    expr(rhs, out);
+                }
+                IrExpr::Arrow(b) => walk(b, out),
+                IrExpr::Interpolate(parts) => {
+                    for p in parts {
+                        if let InterpPart::Expr(x) = p {
+                            expr(x, out);
+                        }
+                    }
+                }
+                _ => {}
+            }
+        }
+        fn walk(stmts: &[IrStmt], out: &mut std::collections::HashSet<String>) {
+            for s in stmts {
+                match s {
+                    IrStmt::Expr(e) => expr(e, out),
+                    IrStmt::Subshell(b)
+                    | IrStmt::Block(b)
+                    | IrStmt::Background(b)
+                    | IrStmt::Redirect { inner: b, .. } => walk(b, out),
+                    IrStmt::Pipeline { stages, .. } => {
+                        for st in stages {
+                            walk(st, out);
+                        }
+                    }
+                    IrStmt::If { then, elsifs, else_, .. } => {
+                        walk(then, out);
+                        for (_, b) in elsifs {
+                            walk(b, out);
+                        }
+                        walk(else_, out);
+                    }
+                    IrStmt::While { body, .. }
+                    | IrStmt::DoWhile { body, .. }
+                    | IrStmt::For { body, .. }
+                    | IrStmt::ForInit { body, .. } => walk(body, out),
+                    IrStmt::Case { clauses, .. } => {
+                        for c in clauses {
+                            walk(&c.body, out);
+                        }
+                    }
+                    _ => {}
+                }
+            }
+        }
+        walk(stmts, out);
     }
 
     /// An array-index STRING as a python int expression: normalize
@@ -9792,6 +9898,13 @@ impl Render {
         if self.need_fnmatch {
             self.emit("import fnmatch");
         }
+        // bash defines BASH_VERSION for every script; a script tests it to
+        // detect bash (`[ "${BASH_VERSION-}" ] && echo bash`,
+        // param-expand-default-operator), so seed it before the body runs.
+        // A local alias keeps the program's own `os` import demand-driven.
+        self.emit("import os as _sh_os");
+        self.emit("_sh_os.environ.setdefault(\"BASH_VERSION\", \"5.2.15(1)-release\")");
+        self.emit("");
         if self.need_pnum {
             // `$N` in arithmetic: the positional's numeric value, and an
             // unset positional is 0. `_sh_args` is the function-local
