@@ -12,6 +12,7 @@ shIR. It is split into six theories that build as one session:
 | `ShIR_TextOps_Space` | each engine's measured `\s` class (`measure-space.sh` is the pin), the word count over an ARBITRARY class (`nwords_by`), and where the emitted word split diverges from `wc -w` — with proved witnesses and an ASCII-soundness result per engine. |
 | `ShIR_TextOps_Strings` | the string-algebra nodes `StringTrim` / `StringAffix` / `AffixStrip` over one generic run drop, and each renderer's measured TRIM class (`measure-trim.sh` is the pin) — the flag-blind arms, the four measured trim classes, and the Perl trailing-affix empty-pattern gap. |
 | `ShIR_TextOps_Cut` | the `CutAt` node: `find_first`/`rfind_last` as primitives (occurrence, no-match, leftmost/maximal), the four single-star cut forms with their no-match no-ops, the split identity, and `affix_strip_fold_sound`, which is general over every `s` and `n`: all four star shapes are the primitive's `take`/`drop` at the first/last occurrence with the text unchanged on `None`, and the plain branch at either end (`${v#lit*}` is AffixStrip's `strip_prefix`; `${v%*lit}` — the shape whose literal sits at the TAIL — is its `strip_suffix`, via `cut_head_last_at_trail`, whose non-empty-literal guard is exactly the empty body the fold special-cases). `cut_first_last_agree` is the general converse (the cuts coincide whenever the primitives do); the repeating-literal case lives in its own example lemma, `cut_star_first_is_not_last`. The glob engine itself is not modelled — that identification is stated, not proved. |
+| `ShIR_TextOps_Field` | the field CURSOR family (`FieldStrip`, `FieldStripEnd`, `FieldGrab`): `field_grab_at_strip` (`drop off s = field_grab s off d @ d @ drop (field_strip s off d) s` — the grab and the advance are two readings of ONE cursor position), `field_strip_no_move_on_miss` and `field_strip_end_drains_on_miss` (the two advances' non-match laws, which are the whole difference between the nodes), the cursor bounds (`field_strip_le_length`, `field_strip_end_le_length`, `field_strip_gt_off_on_hit`, `field_strip_progress` — every hit consumes a byte, so the converted loop terminates), `field_strip_stuck_iff_miss` (the cursor holds exactly on a miss), the inverse reading (`field_strip_end_agrees_on_hit` / `field_strip_end_differs_on_miss`), the drained read (`field_grab_after_drain`), and the empty delimiter as the arms' non-empty guard (`field_grab_empty_delim_is_not_a_cut`). `off <= length s` is the transform's read law, stated as a hypothesis rather than assumed. |
 | `ShIR_TextOps_Cutset` | the `CutsetTrim` node: the trim class as DATA, plus two modelled ALTERNATIVE readings so the divergences are comparisons, not prose. General obligations: `cutset_trim_is_trim_by` (inherits idempotence and run-only removal from Strings), `cutset_trim_removes_only_a_run`, `cutset_side_three_valued`; accurate byte-granularity facts `cutset_trim_lead_is_bytewise` / `cutset_trim_trail_is_bytewise`, and `cutset_trim_depends_only_on_members` (member-set invariance — true of both readings, which is why it is not called `needs_quotemeta`). Divergences as two-reading theorems: `perl_cutset_needs_quotemeta` (a bracket-body syntax with closing `]`, leading `^` negation, escapes and `a-b` ranges vs the literal set, on `]`, `^`, `\\` and `a-c`), `go_trim_cutset_is_codepoints` and `rust_trim_matches_is_chars` (a two-byte-UTF-8 decoder with a char-wise trim vs the byte model, on the NBSP pair). Witness lemmas keep the concrete bytes. |
 | `ShIR_TextOps_Substitute` | the `Substitute` node: two fuel-bounded engines (`subst_all`, `subst_first`) over an abstract matcher — leftmost, non-overlapping, empty-match-advances-one-byte as the termination obligation, `&` as a function of the matched text. The regex syntax, the line split and `\N` are documented limitations. |
 
@@ -244,6 +245,9 @@ nodes and `field_extract`/`split` cite two each):
 | `affix_strip` | `affix_strip_sound` |
 | `array_len` | `array_len_split_is_word_count` |
 | `cut_at` | `cut_at_sound` |
+| `field_grab` | `field_grab_at_strip` |
+| `field_strip` | `field_strip_no_move_on_miss` |
+| `field_strip_end` | `field_strip_end_drains_on_miss` |
 | `cutset_trim` | `cutset_trim_sound` |
 | `field_extract` | `cut_keeps_empty_field`, `field_or_empty_out_of_range` |
 | `newline_strip` | `newline_strip_sound` |
@@ -371,6 +375,52 @@ shows `first` is load-bearing, and `cut_at_sound` — the node's `spec:` — car
 all four forms with both a match arm (`take`/`drop` at the index) and a
 no-match arm (the text unchanged). The empty literal is the case where both primitives answer index 0
 (bash's `${v#*}` is the identity), and that is what the definitions do.
+
+### Closed: the field cursor (2026-11-13)
+
+`field_strip.node`, `field_strip_end.node` and `field_grab.node` no longer say
+`spec: none (unstated)`. `ShIR_TextOps_Field` (tenth theory) models the cursor
+exactly as the C arms render it and proves the three nodes' obligations over
+arbitrary byte strings, offsets and delimiters:
+
+- `field_grab_at_strip` — `field_hit s off d = Some k` gives
+  `drop off s = field_grab s off d @ d @ drop (field_strip s off d) s`. Both
+  nodes are read at the same `off`, and the advance lands exactly where the
+  delimiter that stopped the grab ends, so the pair composes: the next field is
+  the grab at the offset the previous strip reported.
+- `field_strip_no_move_on_miss` — `field_hit s off d = None` gives
+  `field_strip s off d = off` (bash's `${s#*D}` is a no-op on a non-match).
+- `field_strip_end_drains_on_miss` — the same miss gives
+  `field_strip_end s off d = length s`, the dropped `s=""` fallback arm; and
+  `field_grab_after_drain` says a grab from the drained offset reads `[]`, which
+  is what makes dropping the guard sound.
+
+Cursor arithmetic, all with `off <= length s`: `field_strip_le_length`,
+`field_strip_end_le_length`, `field_strip_ge_off`,
+`field_strip_gt_off_on_hit`, `field_strip_le_strip_end`,
+`field_strip_stuck_iff_miss` (holds exactly on a miss — the case a converted
+loop must not run on), `field_strip_progress` (the unconsumed tail strictly
+shrinks, the loop measure) and `field_strip_end_agrees_on_hit` /
+`field_strip_end_differs_on_miss` (the two advances agree exactly on a hit, so
+neither is derivable from the other — that is why there are three nodes).
+
+Position facts come from the `Cut` primitives rather than new inductions:
+`field_hit_occ` (a hit is a real occurrence), `field_hit_min` (it is the
+leftmost at or after the cursor) and `field_hit_none` (a miss is no occurrence
+anywhere after it), plus `field_grab_is_tail_prefix` (the grab invents nothing),
+`field_grab_at_end` (no more fields reads `""`) and `field_init_is_zero` (the
+first grab is the head field of the whole text).
+
+Two honest limits, both stated in the theory:
+
+- The arms do not clamp the offset (`strstr(text + off, d)`), so
+  `off <= length s` is a precondition of the transform's read law, not a
+  property of the node; it appears as an explicit hypothesis on the arithmetic
+  facts.
+- An empty delimiter is NOT the empty-literal cut. The arms guard the search
+  with a non-empty check, so an empty delimiter never matches —
+  `field_grab_empty_delim_is_not_a_cut` records that
+  `cut_head_first (drop off s) []` is `[]` while the node returns the tail.
 
 ## Box-health note (why the proofs look odd in places)
 

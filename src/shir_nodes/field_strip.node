@@ -6,6 +6,19 @@
 # channel every shell scalar number travels), consumed by the companion
 # FieldGrab reads of the same cursor var. Emitted by `str-chop-cursor`.
 #
+# Proved: docs/fm/TextOps/ShIR_TextOps_Field.thy.
+#   spec: field_strip_no_move_on_miss — a non-match leaves the cursor at `off`,
+#         and the paired grab then reads the whole remaining tail.
+#   With it: field_strip_gt_off_on_hit and field_strip_progress (every hit
+#   consumes at least one byte, so the converted loop terminates),
+#   field_strip_le_length (the new offset stays inside the text) and
+#   field_strip_stuck_iff_miss (the cursor does not move exactly on a miss —
+#   the case this node must not be looped on, which is what FieldStripEnd and
+#   the guarded pair exist for).
+#   The arm does not clamp `off`: `off <= strlen(text)` is the transform's
+#   read law (init 0, only these two nodes advance), stated as a hypothesis in
+#   the theory, not a property of the node.
+#
 # Backends: C (memchr-free strchr-at-offset; target-gated offer).
 # Fallback: sh2.fieldStrip(text, off, delim)
 
@@ -15,4 +28,4 @@ kind expr
 field text: expr
 field off: expr
 field delim: string
-spec: none (unstated)
+spec: TextOps#field_strip_no_move_on_miss

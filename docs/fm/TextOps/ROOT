@@ -8,5 +8,6 @@ session TextOps = HOL +
     ShIR_TextOps_Space
     ShIR_TextOps_Strings
     ShIR_TextOps_Cut
+    ShIR_TextOps_Field
     ShIR_TextOps_Cutset
     ShIR_TextOps_Substitute

@@ -6,6 +6,20 @@
 # together with FieldStrip; together they replace the quadratic
 # `x=${s%%D*}; s=${s#*D}` front-chop pair with an O(1) cursor.
 #
+# Proved: docs/fm/TextOps/ShIR_TextOps_Field.thy.
+#   spec: field_grab_at_strip — `drop off text = grab @ delim @ drop (strip)`,
+#         i.e. the grab and the advance are two readings of ONE cursor
+#         position, not two independent moves; the next field is the grab at
+#         the offset the previous strip reported.
+#   With it: field_hit_occ / field_hit_min / field_hit_none (the hit really is
+#   the leftmost occurrence, and a miss really is no occurrence anywhere after
+#   the cursor), field_grab_is_tail_prefix (the grab invents nothing),
+#   field_grab_at_end (no more fields reads ""), field_init_is_zero (the first
+#   grab is the head field) and field_grab_empty_delim_is_not_a_cut (an empty
+#   delimiter is NOT the empty-literal cut: the arm's non-empty guard is
+#   load-bearing).
+#   Same read-law caveat: `off <= strlen(text)` is assumed, not proved here.
+#
 # Backends: C (strchr-at-offset; target-gated offer — other backends
 # accept by adding a render arm and their target to the gate).
 # Fallback: sh2.fieldGrab(text, off, delim)
@@ -16,4 +30,4 @@ kind expr
 field text: expr
 field off: expr
 field delim: string
-spec: none (unstated)
+spec: TextOps#field_grab_at_strip

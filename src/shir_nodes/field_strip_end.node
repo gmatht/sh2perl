@@ -21,6 +21,17 @@
 # number travels), consumed by the companion FieldGrab reads of the same
 # cursor var. Emitted by `str-chop-cursor` only for a recognized guard.
 #
+# Proved: docs/fm/TextOps/ShIR_TextOps_Field.thy.
+#   spec: field_strip_end_drains_on_miss — a non-match advances to `length s`.
+#   With it: field_strip_end_agrees_on_hit (on a hit it is exactly FieldStrip)
+#   and field_strip_end_differs_on_miss (they differ exactly on a miss, so
+#   neither advance is derivable from the other — that is why the family has
+#   three nodes), field_strip_le_strip_end and field_strip_end_le_length, and
+#   field_grab_after_drain: a grab at the drained offset reads "" — the
+#   property that lets the guard be dropped, stated as a theorem rather than
+#   as a remark.
+#   Same read-law caveat as FieldStrip: `off <= strlen(text)` is assumed.
+#
 # Backends: C (strchr-at-offset + strlen-on-miss; target-gated offer —
 #   other backends accept by adding a render arm and their target to
 #   the gate, the FieldStrip offer pattern).
@@ -32,4 +43,4 @@ kind expr
 field text: expr
 field off: expr
 field delim: string
-spec: none (unstated)
+spec: TextOps#field_strip_end_drains_on_miss
