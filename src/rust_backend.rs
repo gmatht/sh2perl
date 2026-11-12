@@ -14088,7 +14088,24 @@ impl Render {
         std::mem::swap(&mut self.out, &mut body_out);
         self.depth = 1;
         for s in &prog.stmts {
+            let mark = self.out.len();
             self.stmt(s);
+            // Nothing after an unconditional `std::process::exit(…)` can run:
+            // in Rust it is exactly as terminal as `exit` is in the script,
+            // and the statements the IR still carries after it are what rustc
+            // reported as an unreachable statement. Only a tail emitted at
+            // THIS depth counts — a nested block ends with its own `}`, so an
+            // `if c { exit; }` never matches here.
+            if self.out.len() > mark
+                && self
+                    .out
+                    .iter()
+                    .rev()
+                    .find(|l| !l.trim().is_empty())
+                    .is_some_and(|l| l.trim_start().starts_with("std::process::exit("))
+            {
+                break;
+            }
         }
         // the script's exit code is the LAST statement's rc (bash's final
         // status = the last command's). `main` RETURNS it as an `ExitCode`
