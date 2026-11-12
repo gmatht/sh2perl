@@ -41,7 +41,10 @@ field numeric: bool
 field reverse: bool
 # uniq: what `sort -u` does — one line per equal-key run.
 field unique: bool
-# stable is always TRUE (sort_lines is defined as a stable order); recorded
-# so a renderer does not have to guess which sort the languages provide.
+# stable is always TRUE (sort_lines is defined as a stable order) and it is
+# PROVED, not asserted: `TextOps#isort_stable` in ShIR_TextOps_SortUniq shows that
+# the lines comparing equal to any key keep their input order in the output (the
+# filtered equal-key subsequence is unchanged), so a renderer may use any stable
+# sort and a `sort | uniq -c` pipeline counts the groups the shell counts.
 field ignore_case: bool
 spec: TextOps#sort_lines_sound

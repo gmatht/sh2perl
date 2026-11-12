@@ -1270,4 +1270,139 @@ theorem uniq_lines_skip_merges:
   by simp
 
 
+section \<open>Stability: equal keys keep their input order\<close>
+
+text \<open>`sort_lines.node` carries no `stable` flag because the node IS a stable
+  order; that promise was prose in the node comment until now. It is stated and
+  proved here without positions: for any line `w`, the lines that compare equal to
+  `w` (`le_eq le w`) appear in the output in the same order as in the input, i.e.
+  as the same filtered subsequence. Insertion sort is stable for a reason that
+  fits this form: it takes the HEAD of the input and inserts it into the sorted
+  tail, and `insert` stops at the first element the head is not below — every
+  element that compares equal to the head IS below it by transitivity, so the head
+  lands before all of its equals and the equal-key subsequence is unchanged.\<close>
+
+abbreviation le_eq :: "(line \<Rightarrow> line \<Rightarrow> bool) \<Rightarrow> line \<Rightarrow> line \<Rightarrow> bool" where
+  "le_eq le w y \<equiv> le y w \<and> le w y"
+
+text \<open>The two halves of insertion's effect on a filtered subsequence: an element
+  the filter rejects leaves the subsequence untouched wherever it lands, and an
+  element the filter accepts and that is below every accepted element lands at the
+  FRONT of the subsequence — which is what keeps the input order.\<close>
+
+lemma filter_insert_notP:
+  assumes hx: "\<not> P x"
+  shows "filter P (insert le x ys) = filter P ys"
+  using hx
+proof (induct ys)
+  case Nil
+  then show ?case by simp
+next
+  case (Cons y ys)
+  note IH = Cons(1)
+  note hx = Cons(2)
+  show ?case
+  proof (cases "le x y")
+    case True
+    then show ?thesis using hx by simp
+  next
+    case False
+    note nle = False
+    have e1: "insert le x (y # ys) = y # insert le x ys" using nle by simp
+    have e2: "filter P (insert le x ys) = filter P ys" using IH hx by blast
+    show ?thesis
+    proof (cases "P y")
+      case True
+      then show ?thesis using e1 e2 by simp
+    next
+      case False
+      then show ?thesis using e1 e2 by simp
+    qed
+  qed
+qed
+
+lemma filter_insert_eq:
+  assumes hx: "P x"
+    and habove: "\<And>y. P y \<Longrightarrow> le x y"
+  shows "filter P (insert le x ys) = x # filter P ys"
+  using hx habove
+proof (induct ys)
+  case Nil
+  then show ?case by simp
+next
+  case (Cons y ys)
+  note IH = Cons(1)
+  note hx = Cons(2)
+  note hab = Cons(3)
+  show ?case
+  proof (cases "le x y")
+    case True
+    then show ?thesis using hx by simp
+  next
+    case False
+    note nle = False
+    have e1: "insert le x (y # ys) = y # insert le x ys" using nle by simp
+    have nPy: "\<not> P y" using hab nle by blast
+    have e2: "filter P (insert le x ys) = x # filter P ys" using IH hx hab by blast
+    show ?thesis using e1 e2 nPy by simp
+  qed
+qed
+
+context sort_order
+begin
+
+text \<open>Stability of the sort itself. `le_trans` is the locale's preorder law, so
+  nothing about the order is assumed here beyond what the node already needs.\<close>
+
+theorem isort_stable:
+  "filter (le_eq le w) (isort le ls) = filter (le_eq le w) ls"
+proof (induct ls)
+  case Nil
+  then show ?case by simp
+next
+  case (Cons x xs)
+  note IH = Cons
+  show ?case
+  proof (cases "le_eq le w x")
+    case True
+    have hxw: "le x w" using True by simp
+    have hab: "\<And>y. le_eq le w y \<Longrightarrow> le x y"
+    proof -
+      fix y
+      assume hy: "le_eq le w y"
+      have hwy: "le w y" using hy by simp
+      show "le x y" using hxw hwy by (rule le_trans)
+    qed
+    have e1: "filter (le_eq le w) (isort le (x # xs)) =
+              filter (le_eq le w) (insert le x (isort le xs))" by simp
+    have e2: "filter (le_eq le w) (insert le x (isort le xs)) =
+              x # filter (le_eq le w) (isort le xs)"
+    proof (rule filter_insert_eq)
+      show "le_eq le w x" using True .
+    next
+      show "\<And>y. le_eq le w y \<Longrightarrow> le x y" by (rule hab)
+    qed
+    have e3: "filter (le_eq le w) (isort le xs) = filter (le_eq le w) xs" using IH .
+    have e4: "filter (le_eq le w) (x # xs) = x # filter (le_eq le w) xs"
+      using True by simp
+    show ?thesis using e1 e2 e3 e4 by simp
+  next
+    case False
+    have e1: "filter (le_eq le w) (isort le (x # xs)) =
+              filter (le_eq le w) (insert le x (isort le xs))" by simp
+    have e2: "filter (le_eq le w) (insert le x (isort le xs)) =
+              filter (le_eq le w) (isort le xs)"
+    proof (rule filter_insert_notP)
+      show "\<not> le_eq le w x" using False .
+    qed
+    have e3: "filter (le_eq le w) (isort le xs) = filter (le_eq le w) xs" using IH .
+    have e4: "filter (le_eq le w) (x # xs) = filter (le_eq le w) xs"
+      using False by simp
+    show ?thesis using e1 e2 e3 e4 by simp
+  qed
+qed
+
+end
+
+
 end
