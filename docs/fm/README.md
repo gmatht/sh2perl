@@ -201,7 +201,7 @@ three that did not — `newline_strip_sound`, `uniq_lines_sound`,
 (`sort_lines_sound`). `harness/check-node-specs.pl` (workspace `harness/`) makes
 "no dangling spec" a machine check: it collects every `theorem`/`lemma`/
 `definition`/`fun` under `docs/fm` and fails on a `spec:` naming one that does
-not exist. It reports 31 resolved, 17 unstated, 0 pending, 0 dangling.
+not exist. It reports 32 resolved, 16 unstated, 0 pending, 0 dangling.
 
 - `newline_strip_sound` (`ShIR_TextOps_Strip`): the node is the trailing-run
   removal, with the run length and the prefix equation.
@@ -236,9 +236,9 @@ deliberate no-obligation form. `--map` prints the node→theorem table below and
 `--selftest` runs the five negative controls (real theorem, definition, dangling
 name, wrong session prefix, unbuilt theory).
 
-Current inventory: **31 resolved, 17 unstated, 0 pending, 0 errors**.
+Current inventory: **32 resolved, 16 unstated, 0 pending, 0 errors**.
 
-The 31 resolved specs (29 distinct theorems; `lowered_wc_sound` covers three
+The 32 resolved specs (30 distinct theorems; `lowered_wc_sound` covers three
 nodes and `field_extract`, `split`, `substitute`, `uniq_lines` and
 `cutset_trim` cite two each):
 
@@ -263,6 +263,7 @@ nodes and `field_extract`, `split`, `substitute`, `uniq_lines` and
 | `split` | `split_ws_len`, `split_ws_fields_clean` |
 | `str_len` | `lowered_wc_sound` |
 | `str_splice` | `str_splice_fold_sound` |
+| `take_lines` | `take_lines_sound` |
 | `string_affix` | `string_affix_sound` |
 | `string_contains` | `string_contains_sound` |
 | `string_trim` | `string_trim_sound` |
@@ -277,6 +278,32 @@ the right way. A theorem named `str_splice_fold_sound` existed, but only in
 it then would have been reported as `OUTSIDE THE BUILD`, not as proved. That
 theory is now tracked and listed in `ROOT` (it builds with zero errors), and the
 node cites `TextOps#str_splice_fold_sound`.
+
+### `take_lines` closed by fixing the binding, not the model (2026-11-13)
+
+`take_lines` (the `head -n` / `tail -n` node) is stated at the BYTE level, which is
+why it needs no line-splitter inverse: `count_lf` counts LF bytes, `nlines s` is
+that plus one, and `cut n s` is "cut at the Nth LF and drop that LF" — the split on
+LF keeping empty fields, take, rejoin-with-LF, no-trailing-terminator reading the
+renderers implement, expressed without ever building a list of lines. The theorem
+`take_lines_sound` gives the truncation law (`s = cut n s` when the text has at most
+`n` lines, else `s = cut n s @ LF # r`), the prefix and length facts, the terminator
+count (`min (n - 1) (count_lf s)`, hence `nlines (cut n s) = min n (nlines s)` for
+`0 < n`), the one-line and two-line edge cases, the from-end count law
+(`count_lf (drop_lf k s) = count_lf s - k`) and the byte-mode slice, with three
+`eval` witnesses (an everyday three-line take, the empty/`N = 0`/missing-terminator
+edges, and CR/UTF-8/NUL pass-through).
+
+The earlier attempts failed on proof engineering and the diagnosis matters: the
+recursion's non-terminator branch recurses on the TEXT, so induction has to run on
+the text with the count abstract and split by `case_tac`, not the other way round;
+and `cases` will not substitute a ⋀-bound or schematic argument, which is why every
+attempt left `cut (Suc n) []` unreduced. The multi-pattern `fun` equations were the
+second half of the trap (`cut (Suc n) []` matches neither `cut (Suc 0) []` nor
+`cut (Suc (Suc k)) []` symbolically), so the definition uses a single `Suc` equation
+with nested `if`s. Two witness expectations were also wrong at first and the
+definitions caught them: `cut 2 [97, LF]` is `"a" LF`, not `"a"`, and the last line
+of `"a" LF "b" LF` is the empty one.
 
 ### The two obligations that were thinner than their names (2026-11-13)
 

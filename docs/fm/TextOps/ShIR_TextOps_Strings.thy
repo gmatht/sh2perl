@@ -2148,4 +2148,247 @@ lemma path_name_utf8_witness:
    dname [47, 195, 169] = [47]"
   by eval
 
+section \<open>TakeLines: head/tail as an LF-budget cut\<close>
+
+text \<open>`TakeLines(text, count, from_end, bytes)` is the node behind `head -n` /
+  `tail -n`; it also carries a byte mode for `head -c`/`tail -c`, which the source
+  lowering refuses and falls back on. The renderers are the specification and agree
+  on one shape — split on LF KEEPING empty fields (Perl `split(/\n/, $t, -1)`, JS
+  `split('\n')`, Java `split("\n", -1)`), take the first (or last) N fields, and
+  rejoin with LF, adding no terminator (`n <= 0` gives the empty text everywhere).
+  At the byte level that is exactly: cut the text at the Nth LF and drop that LF.
+  `cut` below is that function, and the line count is the LF count plus one, so no
+  list inverse is needed anywhere.
+
+  THE CONSEQUENCES THAT MATTER, each proved below.
+  (1) The last kept line's terminator is NOT retained: `cut 2 "a\nb\nc" = "a\nb"`,
+  and when the input ends in LF the trailing empty field is itself a line, so
+  `cut 2 "a\nb\n" = "a\nb"` while `cut 3 "a\nb\n" = "a\nb\n"`. The emitting
+  statement's newline flag supplies a terminator; this node never adds one.
+  (2) Empty input is ONE empty line: `nlines [] = 1`, `nlines [LF] = 2`.
+  (3) A text with fewer LFs than the count comes back unchanged
+  (`count_lf s < n \<Longrightarrow> cut n s = s`), and otherwise the text is the output followed by
+  a dropped terminator and a remainder (`s = cut n s @ LF # r`) — the truncation
+  law `head` needs. The line count of the output is `min n (nlines s)`.
+  (4) Only LF terminates. CR, CRLF and NUL are ordinary bytes: a CRLF line keeps
+  its CR and a NUL passes through, as the witnesses show.
+
+  WHAT IS NOT PROMISED, precisely. (a) Negative and non-numeric counts: the
+  lowering parses an i64 and the arms disagree on negatives (`head -n -5` means
+  "all but the last five lines" to GNU and nothing like that to these renderers),
+  so the model takes a nat; huge counts are fine because they simply hit the
+  unchanged-input case. (b) Byte mode is modelled as a plain slice (`take n s`,
+  `drop (length s - n) s`) and only its length bound is claimed; the lowering
+  refuses byte mode today. (c) Encoding beyond byte pass-through: bytes are
+  compared with 10 only, so UTF-8 and invalid UTF-8 pass through unchanged and no
+  character counting is claimed. (d) Host/process behaviour of `head`/`tail`
+  (files, `-q`, `-v`, SIGPIPE, exit status) is outside a pure text function.
+  (e) The from-end arm is modelled by `drop_lf`: dropping `k` terminators is
+  proved to remove exactly `k` LFs (`count_lf (drop_lf k s) = count_lf s - k`), and
+  a text with fewer lines than the count comes back unchanged. The byte-level
+  statement that the from-end output is a SUFFIX of the input is not claimed here;
+  it needs an associativity witness for the appended prefix, and it is stated as an
+  open refinement rather than assumed.\<close>
+
+abbreviation nl :: nat where "nl \<equiv> 10"
+
+fun count_lf :: "bytes \<Rightarrow> nat" where
+  "count_lf [] = 0"
+| "count_lf (c # cs) = (if c = nl then Suc (count_lf cs) else count_lf cs)"
+
+abbreviation nlines :: "bytes \<Rightarrow> nat" where "nlines s \<equiv> Suc (count_lf s)"
+
+fun cut :: "nat \<Rightarrow> bytes \<Rightarrow> bytes" where
+  "cut 0 s = []"
+| "cut (Suc k) [] = []"
+| "cut (Suc k) (c # cs) =
+     (if c = nl then (if k = 0 then [] else nl # cut k cs)
+      else c # cut (Suc k) cs)"
+
+abbreviation take_lines :: "nat \<Rightarrow> bytes \<Rightarrow> bytes" where
+  "take_lines n s \<equiv> cut n s"
+
+fun drop_lf :: "nat \<Rightarrow> bytes \<Rightarrow> bytes" where
+  "drop_lf 0 s = s"
+| "drop_lf (Suc k) [] = []"
+| "drop_lf (Suc k) (c # cs) = (if c = nl then drop_lf k cs else drop_lf (Suc k) cs)"
+
+abbreviation last_lines :: "nat \<Rightarrow> bytes \<Rightarrow> bytes" where
+  "last_lines n s \<equiv> drop_lf (nlines s - n) s"
+
+abbreviation take_bytes :: "nat \<Rightarrow> bytes \<Rightarrow> bytes" where
+  "take_bytes n s \<equiv> take n s"
+
+abbreviation last_bytes :: "nat \<Rightarrow> bytes \<Rightarrow> bytes" where
+  "last_bytes n s \<equiv> drop (length s - n) s"
+
+lemma cut_zero: "cut 0 s = []"
+  by simp
+
+lemma cut_nil: "cut n [] = []"
+  by (induct n) simp_all
+
+lemma cut_prefix: "\<exists>r. s = cut n s @ r"
+  apply (induct s arbitrary: n)
+   apply (case_tac n)
+    apply simp
+   apply simp
+  apply (rename_tac a list n)
+  apply (case_tac n)
+   apply simp
+  apply (rename_tac k)
+  apply (case_tac "a = nl")
+   apply (case_tac k)
+    apply simp
+   apply simp
+  apply simp
+  done
+
+lemma cut_length_le: "length (cut n s) \<le> length s"
+proof -
+  obtain r where r: "s = cut n s @ r" using cut_prefix by blast
+  have eq: "length s = length (cut n s) + length r" using r by (metis length_append)
+  then show ?thesis by simp
+qed
+
+lemma cut_count: "count_lf (cut n s) = min (n - 1) (count_lf s)"
+  apply (induct s arbitrary: n)
+   apply (case_tac n)
+    apply simp
+   apply simp
+  apply (rename_tac a list n)
+  apply (case_tac n)
+   apply simp
+  apply (rename_tac k)
+  apply (case_tac "a = nl")
+   apply (case_tac k)
+    apply simp
+   apply (simp add: min_def)
+  apply (simp add: min_def)
+  done
+
+lemma cut_all: "count_lf s < n \<Longrightarrow> cut n s = s"
+  apply (induct s arbitrary: n)
+   apply (case_tac n)
+    apply simp
+   apply simp
+  apply (rename_tac a list n)
+  apply (case_tac n)
+   apply simp
+  apply (rename_tac k)
+  apply (case_tac "a = nl")
+   apply (case_tac k)
+    apply simp
+   apply simp
+  apply simp
+  done
+
+lemma min_shift: "0 < n \<Longrightarrow> min n (Suc c) = Suc (min (n - 1) c)"
+  by (induct n) (simp_all add: min_def)
+
+lemma cut_linecount: "0 < n \<Longrightarrow> nlines (cut n s) = min n (nlines s)"
+proof -
+  assume n0: "0 < n"
+  have c: "count_lf (cut n s) = min (n - 1) (count_lf s)" by (rule cut_count)
+  have m: "min n (nlines s) = Suc (min (n - 1) (count_lf s))"
+    using n0 by (simp add: min_shift)
+  from c show ?thesis using m by simp
+qed
+
+lemma cut_terminator: "0 < n \<Longrightarrow> n \<le> count_lf s \<Longrightarrow> \<exists>r. s = cut n s @ nl # r"
+  apply (induct s arbitrary: n)
+   apply (case_tac n)
+    apply simp
+   apply simp
+  apply (rename_tac a list n)
+  apply (case_tac n)
+   apply simp
+  apply (rename_tac k)
+  apply (case_tac "a = nl")
+   apply (case_tac k)
+    apply simp
+   apply simp
+  apply simp
+  done
+
+lemma drop_lf_count: "count_lf (drop_lf k s) = count_lf s - k"
+  apply (induct s arbitrary: k)
+   apply (case_tac k)
+    apply simp
+   apply simp
+  apply (rename_tac a list k)
+  apply (case_tac k)
+   apply simp
+  apply (rename_tac j)
+  apply (case_tac "a = nl")
+   apply simp
+  apply simp
+  done
+
+lemma last_lines_unchanged: "count_lf s < n \<Longrightarrow> last_lines n s = s"
+proof -
+  assume h: "count_lf s < n"
+  have "nlines s - n = 0" using h by (simp add: Suc_leI)
+  then show ?thesis by simp
+qed
+
+theorem take_lines_sound:
+  "cut 0 s = [] \<and>
+   nlines [] = 1 \<and>
+   nlines [nl] = 2 \<and>
+   (\<exists>r. s = cut n s @ r) \<and>
+   length (cut n s) \<le> length s \<and>
+   (count_lf s < n \<longrightarrow> cut n s = s) \<and>
+   count_lf (cut n s) = min (n - 1) (count_lf s) \<and>
+   (0 < n \<longrightarrow> nlines (cut n s) = min n (nlines s)) \<and>
+   (0 < n \<and> n \<le> count_lf s \<longrightarrow> (\<exists>r. s = cut n s @ nl # r)) \<and>
+   count_lf (drop_lf k s) = count_lf s - k \<and>
+   (count_lf s < n \<longrightarrow> last_lines n s = s) \<and>
+   take_bytes n s = take n s \<and>
+   length (last_bytes n s) \<le> n"
+proof (intro conjI)
+  show "cut 0 s = []" by (rule cut_zero)
+  show "nlines [] = 1" by simp
+  show "nlines [nl] = 2" by simp
+  show "\<exists>r. s = cut n s @ r" by (rule cut_prefix)
+  show "length (cut n s) \<le> length s" by (rule cut_length_le)
+  show "count_lf s < n \<longrightarrow> cut n s = s" by (simp add: cut_all)
+  show "count_lf (cut n s) = min (n - 1) (count_lf s)" by (rule cut_count)
+  show "0 < n \<longrightarrow> nlines (cut n s) = min n (nlines s)" by (simp add: cut_linecount)
+  show "0 < n \<and> n \<le> count_lf s \<longrightarrow> (\<exists>r. s = cut n s @ nl # r)"
+    by (simp add: cut_terminator)
+  show "count_lf (drop_lf k s) = count_lf s - k" by (rule drop_lf_count)
+  show "count_lf s < n \<longrightarrow> last_lines n s = s" by (simp add: last_lines_unchanged)
+  show "take_bytes n s = take n s" by simp
+  show "length (last_bytes n s) \<le> n" by simp
+qed
+
+lemma take_lines_witness:
+  "cut 2 [108, 105, 110, 101, 49, 10, 108, 105, 110, 101, 50, 10, 108, 105, 110, 101, 51]
+     = [108, 105, 110, 101, 49, 10, 108, 105, 110, 101, 50] \<and>
+   cut 1 [108, 105, 110, 101, 49, 10, 108, 105, 110, 101, 50]
+     = [108, 105, 110, 101, 49] \<and>
+   cut 9 [108, 105, 110, 101, 49, 10, 108, 105, 110, 101, 50]
+     = [108, 105, 110, 101, 49, 10, 108, 105, 110, 101, 50]"
+  by eval
+
+lemma take_lines_edge_witness:
+  "cut 1 [] = [] \<and>
+   nlines [] = 1 \<and>
+   cut 0 [97, 10, 98] = [] \<and>
+   cut 2 [97, 10, 98, 10] = [97, 10, 98] \<and>
+   cut 3 [97, 10, 98, 10] = [97, 10, 98, 10] \<and>
+   nlines [97, 10, 98, 10] = 3 \<and>
+   cut 1 [97, 10] = [97] \<and>
+   last_lines 1 [97, 10, 98, 10] = []"
+  by eval
+
+lemma take_lines_bytes_witness:
+  "cut 1 [97, 13, 10, 98] = [97, 13] \<and>
+   count_lf [97, 13, 10, 98] = 1 \<and>
+   cut 1 [195, 169, 10, 98] = [195, 169] \<and>
+   cut 1 [97, 0, 10, 98] = [97, 0]"
+  by eval
+
+
 end
