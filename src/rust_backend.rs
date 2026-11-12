@@ -3235,7 +3235,7 @@ pub fn shir_to_rust(prog: &IrProgram) -> String {
         crate::shir_passes::echo_fold::EchoFold.run(&mut prog, &ctx);
     }
     r.program(&prog);
-    let text = cat_peephole(&Render::rename_single_use_bindings(&r.out.join("\n")));
+    let text = cat_peephole(&Render::rename_caps_bindings(&r.out.join("\n")));
     // Belt-and-braces: confirm in the rendered output that no sink was
     // ever written (a renderer bug or an under-approximated construct
     // shows up here and vetoes the edit).
@@ -11822,13 +11822,21 @@ impl Render {
     /// sits at the top of the scope, initialised to bash's unset value
     /// ("" for a string home, 0 for an integer home). Sorted for
     /// deterministic output.
-    /// A CAPS-named local binding whose identifier occurs exactly ONCE in the
-    /// whole emitted program is the binding itself and nothing else: rustc
-    /// reports it as `unused variable` and as a non-snake-case name. Renaming
-    /// it `_NAME` is behaviour-preserving BY CONSTRUCTION (there is no other
-    /// occurrence to rename), takes it out of both lints, and needs no
-    /// `#[allow]`. Occurrences inside string literals are not uses.
-    fn rename_single_use_bindings(src: &str) -> String {
+    /// Shell array variables keep their source spelling (`FilesystemOptions=(…)`),
+    /// which rustc reports as a non-snake-case name — the emitter otherwise
+    /// papers over it with `#[allow(non_snake_case)]`. A shell variable is only
+    /// ever a local binding in the emitted program, so its identifier can be
+    /// renamed consistently instead: the declaration of an array literal and
+    /// every identifier occurrence (subscripts included) are rewritten to the
+    /// snake-case form. Behaviour-preserving: the name is not observable.
+    ///
+    /// A CAPS binding whose identifier occurs exactly ONCE is covered by the
+    /// same rewrite: it has no use sites, so it becomes `_name` and drops out
+    /// of both `non_snake_case` and `unused_variables`.
+    fn rename_caps_bindings(src: &str) -> String {
+        fn is_ident_byte(b: u8) -> bool {
+            b.is_ascii_alphanumeric() || b == b'_'
+        }
         fn ident_uses(src: &str, name: &str) -> usize {
             let mut n = 0usize;
             for line in src.lines() {
@@ -11838,10 +11846,9 @@ impl Render {
                 let mut i = 0usize;
                 while i + nb.len() <= b.len() {
                     if &b[i..i + nb.len()] == nb {
-                        let before_ok = i == 0 || !(b[i - 1].is_ascii_alphanumeric() || b[i - 1] == b'_');
+                        let before_ok = i == 0 || !is_ident_byte(b[i - 1]);
                         let after = i + nb.len();
-                        let after_ok = after == b.len()
-                            || !(b[after].is_ascii_alphanumeric() || b[after] == b'_');
+                        let after_ok = after == b.len() || !is_ident_byte(b[after]);
                         if before_ok && after_ok && quotes % 2 == 0 {
                             n += 1;
                         }
@@ -11856,31 +11863,97 @@ impl Render {
             }
             n
         }
-        let mut out = String::with_capacity(src.len());
+        // Rewrite whole-identifier occurrences outside string literals.
+        fn rename_ident(line: &str, old: &str, new: &str) -> String {
+            let b = line.as_bytes();
+            let nb = old.as_bytes();
+            let mut out = String::with_capacity(line.len() + 8);
+            let mut quotes = 0usize;
+            let mut i = 0usize;
+            let mut last = 0usize;
+            while i + nb.len() <= b.len() {
+                if &b[i..i + nb.len()] == nb
+                    && (i == 0 || !is_ident_byte(b[i - 1]))
+                    && (i + nb.len() == b.len() || !is_ident_byte(b[i + nb.len()]))
+                    && quotes % 2 == 0
+                {
+                    out.push_str(&line[last..i]);
+                    out.push_str(new);
+                    i += nb.len();
+                    last = i;
+                    continue;
+                }
+                if b[i] == b'"' {
+                    quotes += 1;
+                }
+                i += 1;
+            }
+            out.push_str(&line[last..]);
+            out
+        }
+        fn to_snake(name: &str) -> String {
+            let mut out = String::with_capacity(name.len() + 4);
+            for (i, c) in name.chars().enumerate() {
+                if c.is_ascii_uppercase() {
+                    if i > 0 {
+                        out.push('_');
+                    }
+                    out.push(c.to_ascii_lowercase());
+                } else {
+                    out.push(c);
+                }
+            }
+            out
+        }
+        // Which CAPS bindings can be renamed, and to what.
+        let mut renames: Vec<(String, String)> = Vec::new();
         for line in src.lines() {
             let t = line.trim_start();
             let rest = t.strip_prefix("#[allow(non_snake_case)] ").unwrap_or(t);
-            if let Some(after) = rest.strip_prefix("let ") {
-                let after = after.strip_prefix("mut ").unwrap_or(after);
-                let name: String = after
-                    .chars()
-                    .take_while(|c| c.is_alphanumeric() || *c == '_')
-                    .collect();
-                let caps = name.chars().next().is_some_and(|c| c.is_ascii_uppercase())
-                    && !name.starts_with('_');
-                // `_IFS` is still non_snake_case to rustc; the renamed
-                // binding must also be lowercase, and must not collide with
-                // an identifier the program already uses.
-                let lowered = format!("_{}", name.to_lowercase());
-                if caps && ident_uses(src, &name) == 1 && ident_uses(src, &lowered) == 0 {
-                    let indent = &line[..line.len() - t.len()];
-                    out.push_str(indent);
-                    out.push_str(&rest.replacen(&name, &lowered, 1));
-                    out.push('\n');
-                    continue;
+            let Some(after) = rest.strip_prefix("let ") else { continue };
+            let after = after.strip_prefix("mut ").unwrap_or(after);
+            let name: String = after
+                .chars()
+                .take_while(|c| c.is_ascii_alphanumeric() || *c == '_')
+                .collect();
+            if !name.chars().next().is_some_and(|c| c.is_ascii_uppercase()) {
+                continue;
+            }
+            let tail = &after[name.len()..];
+            let array_literal = tail.trim_start().starts_with("= [");
+            let uses = ident_uses(src, &name);
+            let single_use = uses == 1;
+            if !array_literal && !single_use {
+                continue;
+            }
+            let snake = to_snake(&name);
+            let new = if uses == 1 {
+                format!("_{snake}")
+            } else {
+                snake
+            };
+            if ident_uses(src, &new) > 0 || renames.iter().any(|(o, _)| *o == name) {
+                continue;
+            }
+            renames.push((name, new));
+        }
+        if renames.is_empty() {
+            return src.to_string();
+        }
+        let mut out = String::with_capacity(src.len());
+        for line in src.lines() {
+            let mut l = line.to_string();
+            for (old, new) in &renames {
+                l = rename_ident(&l, old, new);
+            }
+            let t = l.trim_start();
+            if let Some(rest) = t.strip_prefix("#[allow(non_snake_case)] ") {
+                if renames.iter().any(|(_, n)| rest.starts_with(&format!("let {n} "))) {
+                    let indent = &l[..l.len() - t.len()];
+                    l = format!("{indent}{rest}");
                 }
             }
-            out.push_str(line);
+            out.push_str(&l);
             out.push('\n');
         }
         out
