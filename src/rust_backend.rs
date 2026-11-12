@@ -247,6 +247,9 @@ pub struct Render {
     /// (`x=1; x=2; echo $x`): the deferred `let` needs
     /// `#[allow(unused_assignments)]` so we stay warning-clean
     local_dead_init: BTreeSet<String>,
+    /// Locals whose first write is definitely reached and is not loop-carried:
+    /// declared `let mut x: T;` and initialised by that write.
+    local_safe_deinit: BTreeSet<String>,
     /// pass-3 signatures: fn name -> fixed-arity typed signature (filled
     /// by the probe loop before main renders, so call sites know them)
     fn_sigs: HashMap<String, FnSig>,
@@ -11987,8 +11990,12 @@ impl Render {
             let m = self.var_ident(&n);
             let init = if self.is_num(&n) { "0i64" } else { "String::new()" };
             let mut attr = String::new();
-            if self.local_dead_init.contains(&n) {
-                attr.push_str("#[allow(unused_assignments)] ");
+            if self.local_safe_deinit.contains(&n) {
+                // Proven definite assignment: the first write supplies the
+                // value, so no default is emitted and none can be read.
+                let ty = if self.is_num(&n) { "i64" } else { "String" };
+                out.push(format!("let mut {m}: {ty};"));
+                continue;
             }
             if m.chars().any(|c| c.is_ascii_uppercase()) {
                 attr.push_str("#[allow(non_snake_case)] ");
@@ -14033,11 +14040,12 @@ impl Render {
         }
         // Pass 2: pick the pass-2 locals (scalar vars confined to one
         // non-risky scope) and the assigned set (drives `let`/`let mut`).
-        let (locals, local_mut, dead_init, entry) =
+        let (locals, local_mut, dead_init, safe_deinit, entry) =
             compute_local_vars(prog, &self.arrays, &self.assoc, &self.functions, &written);
         self.local_vars = locals;
         self.local_mut = local_mut;
         self.local_dead_init = dead_init;
+        self.local_safe_deinit = safe_deinit;
         self.local_entry = entry;
         // an entry-declared local binds `String`/`i64` at the top of its
         // scope, never a borrowed `&str` (the borrow verdict assumes the
@@ -18402,6 +18410,222 @@ fn collect_builtin_writes_expr(e: &IrExpr, out: &mut BTreeSet<String>) {
     }
 }
 
+
+/// Does any path from the start of this statement list READ `var` before a
+/// write to it has definitely happened? Definite assignment: `let mut x;` is
+/// sound exactly when this is false. Mirrors `collect_reads`/`collect_written`
+/// for the IR's shapes, and is conservative wherever a construct can skip the
+/// body (while/for run zero times, case/select may fall through, try may take
+/// an except).
+fn reads_before_write(stmts: &[IrStmt], var: &str) -> bool {
+    fn is_write(st: &IrStmt, var: &str) -> bool {
+        match st {
+            IrStmt::Assign { targets, .. } => targets
+                .iter()
+                .any(|t| t.var.split('[').next().unwrap_or(&t.var) == var),
+            IrStmt::Declare { vars, .. } => vars.iter().any(|d| d.name == var),
+            IrStmt::DeclareArray { var: v, .. } => v == var,
+            _ => false,
+        }
+    }
+    fn stmt_reads(st: &IrStmt, var: &str) -> bool {
+        let mut out = BTreeSet::new();
+        collect_reads(std::slice::from_ref(st), &mut out);
+        out.contains(var)
+    }
+    fn all_paths_write(stmts: &[IrStmt], var: &str) -> bool {
+        let mut acc = false;
+        for st in stmts {
+            if is_write(st, var) {
+                acc = true;
+                continue;
+            }
+            match st {
+                IrStmt::If { cond, then, elsifs, else_ } => {
+                    let _ = cond;
+                    if all_paths_write(then, var)
+                        && !elsifs.is_empty()
+                        && elsifs.iter().all(|(_, b)| all_paths_write(b, var))
+                        && !else_.is_empty()
+                        && all_paths_write(else_, var)
+                    {
+                        acc = true;
+                    }
+                }
+                IrStmt::DoWhile { body, .. } | IrStmt::Block(body) => {
+                    if all_paths_write(body, var) {
+                        acc = true;
+                    }
+                }
+                IrStmt::Redirect { inner, .. } => {
+                    if all_paths_write(inner, var) {
+                        acc = true;
+                    }
+                }
+                IrStmt::Break
+                | IrStmt::Continue
+                | IrStmt::Exit(_)
+                | IrStmt::Die { .. }
+                | IrStmt::Return(_) => return acc,
+                _ => {}
+            }
+        }
+        acc
+    }
+    fn walk(stmts: &[IrStmt], var: &str, written: bool) -> bool {
+        let mut w = written;
+        let mut reads = false;
+        for st in stmts {
+            if is_write(st, var) {
+                w = true;
+                continue;
+            }
+            if stmt_reads(st, var) && !w {
+                reads = true;
+            }
+            match st {
+                IrStmt::If { cond, then, elsifs, else_ } => {
+                    let _ = cond;
+                    reads |= walk(then, var, w);
+                    for (_, b) in elsifs {
+                        reads |= walk(b, var, w);
+                    }
+                    reads |= walk(else_, var, w);
+                    if all_paths_write(std::slice::from_ref(st), var) {
+                        w = true;
+                    }
+                }
+                IrStmt::While { body, .. } | IrStmt::For { body, .. } => {
+                    reads |= walk(body, var, w);
+                }
+                IrStmt::DoWhile { body, .. } => {
+                    reads |= walk(body, var, w);
+                    if all_paths_write(body, var) {
+                        w = true;
+                    }
+                }
+                IrStmt::ForInit { init, step, body, .. } => {
+                    reads |= walk(init, var, w);
+                    reads |= walk(body, var, w);
+                    reads |= walk(step, var, w);
+                }
+                IrStmt::Case { clauses, .. } => {
+                    for c in clauses {
+                        reads |= walk(&c.body, var, w);
+                    }
+                    if all_paths_write(std::slice::from_ref(st), var) {
+                        w = true;
+                    }
+                }
+                IrStmt::Select { clauses } => {
+                    for c in clauses {
+                        reads |= walk(&c.body, var, w);
+                    }
+                }
+                IrStmt::Try { body, excepts, else_body, finally_body } => {
+                    reads |= walk(body, var, w);
+                    for e in excepts {
+                        reads |= walk(&e.body, var, w);
+                    }
+                    reads |= walk(else_body, var, w);
+                    reads |= walk(finally_body, var, w);
+                }
+                IrStmt::Block(b) => {
+                    reads |= walk(b, var, w);
+                    if all_paths_write(b, var) {
+                        w = true;
+                    }
+                }
+                IrStmt::Redirect { inner, .. } => {
+                    reads |= walk(inner, var, w);
+                }
+                IrStmt::Pipeline { stages, .. } => {
+                    for s2 in stages {
+                        reads |= walk(s2, var, w);
+                    }
+                }
+                IrStmt::Function { body, .. }
+                | IrStmt::Subshell(body)
+                | IrStmt::Background(body) => {
+                    reads |= walk(body, var, w);
+                }
+                IrStmt::Break
+                | IrStmt::Continue
+                | IrStmt::Exit(_)
+                | IrStmt::Die { .. }
+                | IrStmt::Return(_) => return reads,
+                _ => {}
+            }
+        }
+        reads
+    }
+    walk(stmts, var, false)
+}
+
+/// Does this body contain a loop? A write inside a loop body is reached on
+/// every iteration but the binding there is loop-carried, and the deferred
+/// declaration then belongs to a different emission scope than the loop's
+/// use sites. Those stay on the default-initialiser path.
+fn body_has_loop(stmts: &[IrStmt]) -> bool {
+    stmts.iter().any(|st| match st {
+        IrStmt::While { .. }
+        | IrStmt::DoWhile { .. }
+        | IrStmt::For { .. }
+        | IrStmt::ForInit { .. } => true,
+        IrStmt::If { then, elsifs, else_, .. } => {
+            body_has_loop(then)
+                || elsifs.iter().any(|(_, b)| body_has_loop(b))
+                || body_has_loop(else_)
+        }
+        IrStmt::Block(b) | IrStmt::Subshell(b) | IrStmt::Background(b) => body_has_loop(b),
+        IrStmt::Case { clauses, .. } => clauses.iter().any(|c| body_has_loop(&c.body)),
+        IrStmt::Select { clauses } => clauses.iter().any(|c| body_has_loop(&c.body)),
+        IrStmt::Try { body, excepts, else_body, finally_body } => {
+            body_has_loop(body)
+                || excepts.iter().any(|e| body_has_loop(&e.body))
+                || body_has_loop(else_body)
+                || body_has_loop(finally_body)
+        }
+        IrStmt::Redirect { inner, .. } => body_has_loop(inner),
+        IrStmt::Pipeline { stages, .. } => stages.iter().any(|s2| body_has_loop(s2)),
+        IrStmt::Function { body, .. } => body_has_loop(body),
+        _ => false,
+    })
+}
+
+/// Does this body carry its own `Declare` for `var` at any depth? That
+/// declaration emits the `let`, so hoisting an entry declaration as well
+/// would create a second, shadowed binding nothing reads.
+fn declares_var(stmts: &[IrStmt], var: &str) -> bool {
+    stmts.iter().any(|st| match st {
+        IrStmt::Declare { vars, .. } => vars.iter().any(|d| d.name == var),
+        IrStmt::If { then, elsifs, else_, .. } => {
+            declares_var(then, var)
+                || elsifs.iter().any(|(_, b)| declares_var(b, var))
+                || declares_var(else_, var)
+        }
+        IrStmt::While { body, .. }
+        | IrStmt::DoWhile { body, .. }
+        | IrStmt::For { body, .. }
+        | IrStmt::ForInit { body, .. }
+        | IrStmt::Function { body, .. }
+        | IrStmt::Block(body)
+        | IrStmt::Subshell(body)
+        | IrStmt::Background(body) => declares_var(body, var),
+        IrStmt::Case { clauses, .. } => clauses.iter().any(|c| declares_var(&c.body, var)),
+        IrStmt::Select { clauses } => clauses.iter().any(|c| declares_var(&c.body, var)),
+        IrStmt::Try { body, excepts, else_body, finally_body } => {
+            declares_var(body, var)
+                || excepts.iter().any(|e| declares_var(&e.body, var))
+                || declares_var(else_body, var)
+                || declares_var(finally_body, var)
+        }
+        IrStmt::Redirect { inner, .. } => declares_var(inner, var),
+        IrStmt::Pipeline { stages, .. } => stages.iter().any(|s2| declares_var(s2, var)),
+        _ => false,
+    })
+}
+
 fn collect_written(stmts: &[IrStmt], out: &mut BTreeSet<String>) {
     for s in stmts {
         match s {
@@ -20104,13 +20328,15 @@ fn compute_local_vars(
     BTreeSet<String>,
     BTreeSet<String>,
     BTreeSet<String>,
+    BTreeSet<String>,
 ) {
     use crate::shir_passes::list_profile::{local_scope, use_scopes, Scope};
     let mut need_mut: BTreeSet<String> = BTreeSet::new();
     let mut dead_init: BTreeSet<String> = BTreeSet::new();
+    let mut safe_deinit: BTreeSet<String> = BTreeSet::new();
     let mut entry_decl: BTreeSet<String> = BTreeSet::new();
     let Some(dyns) = dynamic_var_names(prog) else {
-        return (HashMap::new(), need_mut, dead_init, entry_decl);
+        return (HashMap::new(), need_mut, dead_init, safe_deinit, entry_decl);
     };
     let mut builtin_written: BTreeSet<String> = BTreeSet::new();
     collect_builtin_writes(&prog.stmts, &mut builtin_written);
@@ -20148,7 +20374,9 @@ fn compute_local_vars(
         // entry path, which emits `let mut x = String::new();` and then
         // assigns — unnecessary `mut` plus a dead initializer (needless_mut
         // 19 → 26 when variables were first recorded at their declaration).
-        let first_is_decl = us.first().map(|u| u.write && u.decl).unwrap_or(false);
+        let first_is_decl = us.first().map(|u| u.write && u.decl).unwrap_or(false)
+            // a `let` before the first read owns the binding wherever it sits
+            || us.iter().take_while(|u| u.write).any(|u| u.write && u.decl);
         // A first mention that is NOT a top-level write cannot carry the
         // `let`; the name is instead declared at the top of its scope
         // (bash reads an unset name as "", and as 0 in arithmetic).
@@ -20193,8 +20421,25 @@ fn compute_local_vars(
                 need_mut.insert(name.clone());
             }
             if first_is_write {
-                // nothing reads the default before the first write
-                dead_init.insert(name.clone());
+                let body: &[IrStmt] = match &scope {
+                    Scope::Main => &prog.stmts,
+                    Scope::Func(f) => prog
+                        .subs
+                        .iter()
+                        .find(|sb| &sb.name == f)
+                        .map(|sb| sb.body.as_slice())
+                        .unwrap_or(&prog.stmts),
+                };
+                // `let mut x;` is sound when no path reads before the first
+                // write AND that write is not loop-carried: a write inside a
+                // loop is reached on every iteration but the deferred
+                // declaration would have to be emitted in a different scope
+                // than the loop's use sites.
+                if reads_before_write(body, &name) {
+                    dead_init.insert(name.clone());
+                } else {
+                    safe_deinit.insert(name.clone());
+                }
             }
         } else if us_write_count > 1 {
             // a local is written more than once => needs `mut`
@@ -20220,7 +20465,7 @@ fn compute_local_vars(
         }
         out.insert(name, scope);
     }
-    (out, need_mut, dead_init, entry_decl)
+    (out, need_mut, dead_init, safe_deinit, entry_decl)
 }
 
 /// Every name bound by a `for` statement, at any depth.
