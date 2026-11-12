@@ -19,4 +19,20 @@ kind expr
 field text: expr
 field cutset: expr
 field side: optional_string
-spec: TextOps#cutset_trim_sound
+# The MODEL is a byte set (this session's bytes = nat list), which is what the
+# shell and Perl mean. The Go and Rust arms read sets of CODE POINTS instead
+# (strings.Trim over a cutset string; trim_matches over chars), so the readings
+# part on a byte that is half of a multi-byte character. ShIR_TextOps_Cutset
+# proves each of these rather than asserting them:
+#   cutset_trim_is_trim_by       node = trim_by (cutset_mem cs) (lead_of side)
+#                                (trail_of side), so run-only removal and
+#                                idempotence are inherited from Strings
+#   cutset_trim_sound            the same with the side field unfolded, all three
+#   cutset_side_three_valued     both/lead/trail, and (False, False) unreachable
+#   perl_cutset_needs_quotemeta  s/^[\Q..\E]+// is right ONLY because of \Q..\E:
+#                                unquoted, ']' closes the class, '^' negates and
+#                                '\' escapes, each changing the trimmed text
+#   go_trim_cutset_is_codepoints byte vs code point, witnessed on the UTF-8 pair
+#                                for U+00A0 (the byte model splits it)
+#   rust_trim_matches_is_chars   the same at the trailing end, via chars
+spec: TextOps#cutset_trim_is_trim_by, TextOps#cutset_trim_sound

@@ -9,8 +9,10 @@
     Go and Rust arms take sets of code points, and the witnesses below pin the
     point where the two readings differ.
 
-    WHAT IS PROVED. The node's `spec:` is `cutset_trim_sound`; five further
-    obligations are named, each general over arbitrary `s` and `cs`:
+    WHAT IS PROVED. The node's `spec:` is `cutset_trim_is_trim_by` (the node
+    IS the generic trim at the membership test) together with
+    `cutset_trim_sound` (the same identity with the side field unfolded); the
+    other obligations are general over arbitrary `s` and `cs`:
 
       cutset_trim_is_trim_by        the node is `trim_by` at the membership test
       cutset_trim_removes_only_a_run what is removed is a run, got from Strings

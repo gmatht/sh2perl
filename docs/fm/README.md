@@ -200,7 +200,7 @@ three that did not — `newline_strip_sound`, `uniq_lines_sound`,
 (`sort_lines_sound`). `harness/check-node-specs.pl` (workspace `harness/`) makes
 "no dangling spec" a machine check: it collects every `theorem`/`lemma`/
 `definition`/`fun` under `docs/fm` and fails on a `spec:` naming one that does
-not exist. It reports 16 resolved, 29 unstated, 0 dangling.
+not exist. It reports 23 resolved, 25 unstated, 0 pending, 0 dangling.
 
 - `newline_strip_sound` (`ShIR_TextOps_Strip`): the node is the trailing-run
   removal, with the run length and the prefix equation.
@@ -235,10 +235,11 @@ deliberate no-obligation form. `--map` prints the node→theorem table below and
 `--selftest` runs the five negative controls (real theorem, definition, dangling
 name, wrong session prefix, unbuilt theory).
 
-Current inventory: **17 resolved, 28 unstated, 0 pending, 0 errors**.
+Current inventory: **23 resolved, 25 unstated, 0 pending, 0 errors**.
 
-The 17 resolved specs (15 distinct theorems; `lowered_wc_sound` covers three
-nodes and `field_extract`/`split` cite two each):
+The 23 resolved specs (21 distinct theorems; `lowered_wc_sound` covers three
+nodes and `field_extract`, `split`, `substitute`, `uniq_lines` and
+`cutset_trim` cite two each):
 
 | node | theorem |
 | --- | --- |
@@ -248,7 +249,7 @@ nodes and `field_extract`/`split` cite two each):
 | `field_grab` | `field_grab_at_strip` |
 | `field_strip` | `field_strip_no_move_on_miss` |
 | `field_strip_end` | `field_strip_end_drains_on_miss` |
-| `cutset_trim` | `cutset_trim_sound` |
+| `cutset_trim` | `cutset_trim_is_trim_by`, `cutset_trim_sound` |
 | `field_extract` | `cut_keeps_empty_field`, `field_or_empty_out_of_range` |
 | `newline_strip` | `newline_strip_sound` |
 | `reg_count` | `lowered_wc_sound` |
@@ -257,8 +258,8 @@ nodes and `field_extract`/`split` cite two each):
 | `str_len` | `lowered_wc_sound` |
 | `string_affix` | `string_affix_sound` |
 | `string_trim` | `string_trim_sound` |
-| `substitute` | `substitute_sound` |
-| `uniq_lines` | `uniq_lines_sound` |
+| `substitute` | `substitute_sound`, `substitute_line_domain_sound` |
+| `uniq_lines` | `uniq_lines_sound`, `uniq_lines_skip_sound` |
 | `word_count` | `lowered_wc_sound` |
 
 `str_splice.node` is the case the checker was extended for: a theorem named
@@ -288,8 +289,9 @@ matcher's report, `\&` and `\\` the literals, an out-of-range escape copied
 through so the function stays total — and `substitute_expand_leftmost` /
 `substitute_expand_empty_match_advances` state the engine's two rules for it,
 for every matcher. What remains abstract is the matcher's REPORT (which captures
-a compiled regex produces); the node's LINE domain is declared open as
-`pending TextOps#substitute_line_domain_sound`.
+a compiled regex produces). The node's LINE domain is closed as well:
+`substitute_line_domain_sound` is proved and the node's second `spec:` cites it,
+so no obligation there is pending.
 
 **`uniq_lines_sound`** (`ShIR_TextOps_SortUniq`) was `drop_runs ls =
 collapse_prev ls None` — a real collapse statement, but silent about the `-c`
@@ -299,15 +301,17 @@ reconstruction `ls = concat (map (λ(n,x). replicate n x) (run_count ls))`, the
 printed lines being the collapse, every count at least one, the counts summing
 to the input length, and no equal neighbours surviving. The reconstruction is
 the conjunct with teeth: `[a,a,b]` with counts `(1,2)` reconstructs `[a,b,b]`,
-so the counts cannot be re-split. `uniq -s N` is declared open as
-`pending TextOps#uniq_lines_skip_sound`: it compares suffixes after dropping
-`skip` characters and keeps the FIRST line of the run, while `drop_runs` keeps
-the last, so it needs a partition under that relation rather than a corollary.
+so the counts cannot be re-split. `uniq -s N` is closed too: `uniq_lines_skip_sound` proves the suffix-comparing
+collapse — it compares after dropping `skip` characters and keeps the FIRST line
+of the run, while `drop_runs` keeps the last, so it is a partition under that
+relation rather than a corollary — and the node's second `spec:` cites it.
 
 ### Closed: CutsetTrim (2026-11-13)
 
-`cutset_trim.node`'s `spec:` is `TextOps#cutset_trim_sound`: the generic form plus
-all three sides, over arbitrary text and cutset. The other obligations are
+`cutset_trim.node`'s `spec:` is `TextOps#cutset_trim_is_trim_by` (the node IS
+`trim_by` at the cutset's membership test) together with
+`TextOps#cutset_trim_sound` (the same identity with the side field unfolded, for
+all three sides), over arbitrary text and cutset. The other obligations are
 general theorems too — `cutset_trim_is_trim_by`, `cutset_trim_removes_only_a_run`
 (suffix/prefix/non-member head, inherited from the Strings library),
 `cutset_side_three_valued` (three values, three `(lead, trail)` pairs,
