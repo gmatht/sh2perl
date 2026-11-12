@@ -87,6 +87,12 @@ pub struct Render {
     need_fork_capture: bool,
     /// `${a[@]:off:len}` array slicing (`__sh_aslice`).
     need_aslice: bool,
+    /// a function call in condition position is its STATUS (`__sh_ok_status`).
+    need_ok_status: bool,
+    /// `cmd <a >b` as an expression (`__sh_redirect_run`).
+    need_redirect_run: bool,
+    /// `${s:off:len}` in SUBSCRIPT position (`__sh_substr`).
+    need_substr: bool,
     /// fork-based process substitution (`__sh_ps_spawn`).
     need_ps_spawn: bool,
     /// `$N` inside arithmetic (`__sh_pnum`).
@@ -2117,7 +2123,23 @@ impl Render {
                         _ => {}
                     }
                 }
+                // NOTE: a fork-capture fallback here was tried and reverted:
+                // `IrStmt::Subshell` renders its body through this arm, and
+                // forking loses the subshell's STATUS (`( exit 7 )` must
+                // leave $? = 7 — zz_regression_idioms).
                 self.sh2_stub("arrow", &[], "arrow")
+            }
+            // `cmd <a >b` as a VALUE where the runtime has no entry point:
+            // lower the no-command form natively (`command <f`) so the
+            // redirections are attempted and a failed OPEN is status 1. Any
+            // other redirect shape keeps the generic path — intercepting it
+            // broke parse-error-block-in-pipeline, whose sh2_redirect call
+            // needs the `__sh_env` block that only need_subprocess emits.
+            IrExpr::Call { func, args } if func == "redirect" => {
+                if let Some(r) = self.redirect_expr(args) {
+                    return r;
+                }
+                self.sh2_call("redirect", args)
             }
             IrExpr::Array(items) => {
                 let mut elems: Vec<String> = Vec::new();
@@ -4298,6 +4320,10 @@ impl Render {
                                 }
                                 let k = if let Some(v) = sub.strip_prefix('$') {
                                     // `${m[$k]}` — the key is a variable.
+                                    // (A "0 when not in `written`" guess broke
+                                    // associative reads: LOOP variables are
+                                    // never in `written`, so `for k in …; do
+                                    // ${m[$k]}` lost every value.)
                                     self.py_ident(v)
                                 } else if self.assoc.contains(base) {
                                     // an associative key is always a string
@@ -4921,6 +4947,30 @@ impl Render {
     /// (directly) or a while-read loop (nested)? Gates the fd-0 hoist:
     /// only such code takes the `__sh_stdin` lines path; everything else
     /// keeps its real stdin for the general bash reconstruction.
+    /// Is this condition a stdin consumer (`read …`)? It arrives wrapped in
+    /// block(Arrow[env], Arrow[cond]) and chained with `&&`, so a direct
+    /// `func == "read"` test never saw it — the `< <(producer)` staging was
+    /// skipped and the loop read real (empty) stdin (063_11).
+    fn cond_reads_stdin(cond: &IrExpr) -> bool {
+        match cond {
+            IrExpr::Call { func, args } if func == "block" => args
+                .get(1)
+                .map(|a| match a {
+                    IrExpr::Arrow(b) => match b.as_slice() {
+                        [IrStmt::Expr(e)] => Self::cond_reads_stdin(e),
+                        _ => false,
+                    },
+                    other => Self::cond_reads_stdin(other),
+                })
+                .unwrap_or(false),
+            IrExpr::BinOp { lhs, .. } => Self::cond_reads_stdin(lhs),
+            IrExpr::Call { func, args } if func == "exec" || func == "builtin" => {
+                matches!(args.first(), Some(IrExpr::Str(c, _)) if c == "read")
+            }
+            _ => false,
+        }
+    }
+
     fn uses_stdin(stmts: &[IrStmt]) -> bool {
         for s in stmts {
             match s {
@@ -4934,14 +4984,8 @@ impl Render {
                     }
                 }
                 IrStmt::While { cond, body } => {
-                    if let IrExpr::Call { func, args } = cond {
-                        if func == "exec" || func == "builtin" {
-                            if let Some(IrExpr::Str(cmd, _)) = args.first() {
-                                if cmd == "read" {
-                                    return true;
-                                }
-                            }
-                        }
+                    if Self::cond_reads_stdin(cond) {
+                        return true;
                     }
                     if Self::uses_stdin(body) {
                         return true;
@@ -5272,6 +5316,37 @@ impl Render {
         }
         if c.starts_with("print(") || c.starts_with("sys.stdout.write(") {
             return (vec![], format!("({c} or True)"));
+        }
+        // `(( … ))` reaches the IR as `let <arith text>`. As a STATEMENT it
+        // sets __sh_rc, but in CONDITION position it is the arithmetic VALUE
+        // as a status — rendering the statement shape gave `while None:`,
+        // so the loop never ran (063_09 counted 0 options).
+        if let IrExpr::Call { func, args } = e {
+            if func == "builtin" || func == "exec" {
+                let is_let = matches!(args.first(), Some(IrExpr::Str(c, _)) if c == "let");
+                if is_let {
+                    if let Some(IrExpr::Array(items)) = args.get(1) {
+                        if let Some(IrExpr::Str(text, _)) = items.first() {
+                            let t = Self::expand_arith_plen(text);
+                            if let Some(ast) = crate::shir::parse_arith(&t) {
+                                let ex = self.arith(&ast);
+                                return (vec![], format!("(({ex}) != 0)"));
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        // a shell FUNCTION call in condition position is its EXIT STATUS,
+        // where 0 means true. The python body evaluates to whatever the
+        // function last printed — a non-empty string — whose truthiness is
+        // always True, so `if is_prime($n)` accepted every candidate
+        // (051_primes printed consecutive odds instead of primes).
+        if let IrExpr::Call { func, .. } = e {
+            if self.fn_names.contains(func.as_str()) {
+                self.need_ok_status = true;
+                return (vec![], format!("__sh_ok_status({c})"));
+            }
         }
         (vec![], c)
     }
@@ -7173,7 +7248,13 @@ impl Render {
                         if is_assoc {
                             self.assoc.insert(name.to_string());
                         }
-                        self.emit(&format!("{name_py} = list({elems})"));
+                        // `local -A m=()` is a DICT: a list made the first
+                        // `m[key]=v` a TypeError (063_09).
+                        if is_assoc && elems == "[]" {
+                            self.emit(&format!("{name_py} = {{}}"));
+                        } else {
+                            self.emit(&format!("{name_py} = list({elems})"));
+                        }
                     }
                     continue;
                 }
@@ -7612,6 +7693,110 @@ impl Render {
         out
     }
 
+    fn arith_name_or_lit(&mut self, t: &str) -> String {
+        if Self::is_plain_name(t) {
+            if self.written.contains(t) {
+                self.py_ident(t)
+            } else {
+                "0".to_string()
+            }
+        } else {
+            Self::py_str(t)
+        }
+    }
+
+    /// A `${…}` SUBSCRIPT as a python key expression: `${flags:j:1}` is a
+    /// substring of `flags`, `${name}` its value. `options["${flags:j:1}"]`
+    /// used to store the literal text, so the function counted 0 options
+    /// (063_09).
+    fn subscript_key(&mut self, k: &str) -> Option<String> {
+        let inner = k.strip_prefix("${")?.strip_suffix('}')?;
+        let (nm, off) = match inner.split_once(':') {
+            Some((n, o)) => (n, Some(o)),
+            None => (inner, None),
+        };
+        if !Self::is_plain_name(nm) {
+            return None;
+        }
+        let v = self.py_ident(nm);
+        let Some(off) = off else {
+            return Some(format!("str({v})"));
+        };
+        let (o, l) = match off.split_once(':') {
+            Some((o, l)) => (o, Some(l)),
+            None => (off, None),
+        };
+        let o = self.arith_name_or_lit(o.trim());
+        let l = match l {
+            Some(l) => self.arith_name_or_lit(l.trim()),
+            None => "\"\"".to_string(),
+        };
+        self.need_substr = true;
+        Some(format!("__sh_substr({v}, {o}, {l})"))
+    }
+
+    /// `cmd <a >b` as an expression: a native run whose redirections are
+    /// opened first, so a missing input file is status 1 like bash.
+    fn redirect_expr(&mut self, args: &[IrExpr]) -> Option<String> {
+        let inner = match args.first()? {
+            IrExpr::Arrow(a) => a.clone(),
+            _ => return None,
+        };
+        if inner.len() != 1 {
+            return None;
+        }
+        let IrStmt::Expr(cmd) = &inner[0] else {
+            return None;
+        };
+        let IrExpr::Call { func, args: cargs } = cmd else {
+            return None;
+        };
+        if func != "exec" && func != "builtin" {
+            return None;
+        }
+        // ONLY the no-command form (`command <f`) — an arbitrary redirect
+        // expression is left to the existing runtime path.
+        let no_cmd = match cargs.first() {
+            Some(IrExpr::Str(c, _)) => c == "command" || c.is_empty(),
+            None => true,
+            _ => false,
+        };
+        if !no_cmd {
+            return None;
+        }
+        let mut reds = Vec::new();
+        for spec in args.iter().skip(1) {
+            let items: Vec<&IrExpr> = match spec {
+                IrExpr::Array(el) => el.iter().collect(),
+                o => vec![o],
+            };
+            for sp in items {
+                let IrExpr::Object(kv) = sp else {
+                    return None;
+                };
+                let (mut fd, mut mode, mut target) = (0i32, "w".to_string(), None);
+                for (k, v) in kv {
+                    match (k.as_str(), v) {
+                        ("fd", IrExpr::Int(n)) => fd = *n as i32,
+                        ("mode", IrExpr::Str(m, _)) => mode = m.clone(),
+                        ("target", t) => target = Some(t.clone()),
+                        _ => {}
+                    }
+                }
+                let t = self.expr(target.as_ref()?);
+                reds.push(format!("({fd}, {}, {t})", Self::py_str(&mode)));
+            }
+        }
+        let argv = self.build_argv(cargs);
+        self.need_redirect_run = true;
+        self.need_subprocess = true;
+        Some(format!(
+            "(__sh_redirect_run([{}], [{}]) == 0)",
+            argv.join(", "),
+            reds.join(", ")
+        ))
+    }
+
     /// Render a compound body to python source and run it in a forked
     /// subshell, returning the command-substitution value.
     fn subcap_source_value(&mut self, body: &[IrStmt]) -> Option<String> {
@@ -7627,7 +7812,10 @@ impl Render {
         let src = self.out.join("\n");
         self.out = saved;
         self.depth = saved_depth;
-        if src.trim().is_empty() {
+        // a body we could not fully render (it holds a TODO stub) must NOT
+        // be forked: running the stub text only produced nested garbage
+        // (parse-error-block-in-pipeline).
+        if src.trim().is_empty() || src.contains("TODO(unsupported)") {
             return None;
         }
         self.need_fork_capture = true;
@@ -7995,12 +8183,15 @@ impl Render {
                         // the literal `$key` (063_09 counted 0 options).
                         let k_unq = Self::strip_quotes(k);
                         if self.assoc.contains(base) || k_unq.starts_with('$') {
-                            let key = match k_unq.strip_prefix('$') {
-                                Some(v) if Self::is_plain_name(v) => {
-                                    format!("str({})", self.py_ident(v))
+                            let key = if let Some(e) = self.subscript_key(&k_unq) {
+                                e
+                            } else {
+                                match k_unq.strip_prefix('$') {
+                                    Some(v) if Self::is_plain_name(v) => {
+                                        format!("str({})", self.py_ident(v))
+                                    }
+                                    _ => Self::py_str(&k_unq),
                                 }
-                                Some(_) => Self::py_str(&k_unq),
-                                None => Self::py_str(&k_unq),
                             };
                             if !known {
                                 self.emit(&format!("{m} = {{}}"));
@@ -9323,6 +9514,83 @@ impl Render {
             self.emit("    except NameError:");
             self.emit("        args = sys.argv[1:]");
             self.emit("    return __sh_atoi(args[i - 1]) if len(args) >= i else 0");
+            self.emit("");
+        }
+        if self.need_substr {
+            // `${s:off:len}`: bash substrings the VALUE, offsets are
+            // arithmetic and an empty length means "to the end".
+            self.emit("def __sh_substr(s, off, ln):");
+            self.emit("    s = str(s)");
+            self.emit("    try:");
+            self.emit("        o = int(str(off).strip() or 0)");
+            self.emit("    except (TypeError, ValueError):");
+            self.emit("        o = 0");
+            self.emit("    if o < 0:");
+            self.emit("        o = max(0, len(s) + o)");
+            self.emit("    if str(ln).strip() == \"\":");
+            self.emit("        return s[o:]");
+            self.emit("    try:");
+            self.emit("        n = int(str(ln).strip())");
+            self.emit("    except (TypeError, ValueError):");
+            self.emit("        n = 0");
+            self.emit("    return s[o:o + n]");
+            self.emit("");
+        }
+        if self.need_redirect_run {
+            // `cmd <a >b` in VALUE position: open the redirections FIRST so a
+            // missing input is status 1 like bash, then run the command with
+            // those streams.
+            self.emit("def __sh_redirect_run(argv, reds):");
+            self.emit("    import subprocess as _sp_rd");
+            self.emit("    stdin_b = None");
+            self.emit("    outs = []");
+            self.emit("    try:");
+            self.emit("        for _fd, _mode, _t in reds:");
+            self.emit("            _p = str(_t)");
+            self.emit("            if not _p:");
+            self.emit("                continue");
+            self.emit("            if _fd == 0:");
+            self.emit("                with open(_p, \"rb\") as _f:");
+            self.emit("                    stdin_b = _f.read()");
+            self.emit("            else:");
+            self.emit("                outs.append(open(_p, \"ab\" if _mode == \"a\" else \"wb\"))");
+            self.emit("    except OSError:");
+            self.emit("        for _f in outs:");
+            self.emit("            try:");
+            self.emit("                _f.close()");
+            self.emit("            except OSError:");
+            self.emit("                pass");
+            self.emit("        return 1");
+            self.emit("    try:");
+            self.emit("        _argv = [str(_x) for _x in (argv or []) if str(_x) != \"\"]");
+            self.emit("        if not _argv:");
+            self.emit("            return 0");
+            self.emit("        _p = _sp_rd.run(_argv, input=stdin_b, stdout=(outs[-1] if outs else None), env=__sh_env())");
+            self.emit("        return _p.returncode");
+            self.emit("    except OSError:");
+            self.emit("        return 127");
+            self.emit("    finally:");
+            self.emit("        for _f in outs:");
+            self.emit("            try:");
+            self.emit("                _f.close()");
+            self.emit("            except OSError:");
+            self.emit("                pass");
+            self.emit("");
+        }
+        if self.need_ok_status {
+            // A shell function's value is its EXIT STATUS: 0 is success.
+            // Its python body returns the last printed text, which is
+            // always truthy, so `if is_prime($n)` was always taken.
+            self.emit("def __sh_ok_status(v):");
+            self.emit("    if isinstance(v, bool):");
+            self.emit("        return v");
+            self.emit("    s = str(v).strip()");
+            self.emit("    if s == \"\":");
+            self.emit("        return True");
+            self.emit("    try:");
+            self.emit("        return int(s) == 0");
+            self.emit("    except ValueError:");
+            self.emit("        return True");
             self.emit("");
         }
         if self.need_aslice {
