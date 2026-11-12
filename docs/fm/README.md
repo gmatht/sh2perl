@@ -192,6 +192,56 @@ not exist. It reports 16 resolved, 29 unstated, 0 dangling.
 - `substitute_sound` (`ShIR_TextOps_Substitute`) and `cutset_trim_sound`
   (`ShIR_TextOps_Cutset`) — the two new theories.
 
+### The node map, and what `check-node-specs.pl` will and will not accept
+
+`harness/check-node-specs.pl` (workspace `harness/`) reads every `spec:` in
+`src/shir_nodes/*.node` and resolves it against the theories that a `ROOT`
+actually builds. Four verdicts, and only `proved` is silent success:
+
+- `proved` — a `theorem`/`lemma`/`corollary` of that name, in a theory belonging
+  to the session the spec names, and that theory is listed in a `ROOT`;
+- `NOT A THEOREM` — the name is a `definition`/`fun`; a definition cannot be an
+  obligation (this closed the "looks resolved" hole);
+- `OUTSIDE THE BUILD` — the name exists only in a theory no `ROOT` lists, e.g. an
+  untracked WIP file. It is deliberately NOT counted as proved;
+- `DANGLING` — no such name at all.
+
+`spec: pending TextOps#name` names an open obligation without letting it look
+proved: it is counted as pending, and if the name ever starts resolving the check
+fails and asks for the line to be promoted. `spec: none (<reason>)` is the
+deliberate no-obligation form. `--map` prints the node→theorem table below and
+`--selftest` runs the five negative controls (real theorem, definition, dangling
+name, wrong session prefix, unbuilt theory).
+
+Current inventory: **17 resolved, 28 unstated, 0 pending, 0 errors**.
+
+The 17 resolved specs (15 distinct theorems; `lowered_wc_sound` covers three
+nodes and `field_extract`/`split` cite two each):
+
+| node | theorem |
+| --- | --- |
+| `affix_strip` | `affix_strip_sound` |
+| `array_len` | `array_len_split_is_word_count` |
+| `cut_at` | `cut_at_sound` |
+| `cutset_trim` | `cutset_trim_sound` |
+| `field_extract` | `cut_keeps_empty_field`, `field_or_empty_out_of_range` |
+| `newline_strip` | `newline_strip_sound` |
+| `reg_count` | `lowered_wc_sound` |
+| `sort_lines` | `sort_lines_sound` |
+| `split` | `split_ws_len`, `split_ws_fields_clean` |
+| `str_len` | `lowered_wc_sound` |
+| `string_affix` | `string_affix_sound` |
+| `string_trim` | `string_trim_sound` |
+| `substitute` | `substitute_sound` |
+| `uniq_lines` | `uniq_lines_sound` |
+| `word_count` | `lowered_wc_sound` |
+
+`str_splice.node` is the case the checker was extended for: a theorem named
+`str_splice_fold_sound` does exist, but only in `ShIR_TextOps_Splice.thy`, which
+is another worker's untracked WIP and is not in `ROOT`. Its spec therefore stays
+`none (unstated)`, and citing that name would now fail as `OUTSIDE THE BUILD`
+rather than look resolved.
+
 ### Closed: CutsetTrim (2026-11-13)
 
 `cutset_trim.node`'s `spec:` is `TextOps#cutset_trim_sound`: the generic form plus

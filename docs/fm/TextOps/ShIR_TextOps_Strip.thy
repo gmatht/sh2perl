@@ -190,6 +190,37 @@ next
   with assms show ?thesis by simp
 qed
 
+lemma lead_nl_count_le: "lead_nl_count u \<le> length u"
+proof (induct u)
+  case Nil
+  then show ?case by simp
+next
+  case (Cons a u)
+  then show ?case by (cases "a = 10") simp_all
+qed
+
+text \<open>The bytes the count names really are the leading run: taking
+  `lead_nl_count u` bytes of `u` yields newlines only. This is the second
+  direction of the characterisation (the first is `rev_drop_last_nl_all_nl`,
+  which says an all-newline text drops entirely).\<close>
+
+lemma lead_nl_count_take_all_nl:
+  "\<forall>x \<in> set (take (lead_nl_count u) u). x = 10"
+proof (induct u)
+  case Nil
+  then show ?case by simp
+next
+  case (Cons a u)
+  show ?case
+  proof (cases "a = 10")
+    case True
+    with Cons(1) show ?thesis by simp
+  next
+    case False
+    then show ?thesis by simp
+  qed
+qed
+
 definition newline_strip :: "bytes \<Rightarrow> bytes" where
   "newline_strip s \<equiv> rev (rev_drop_last_nl (rev s))"
 
@@ -203,7 +234,7 @@ lemma newline_strip_append [simp]:
 text \<open>THE OBLIGATION the node file names: the node removes exactly the
   trailing newline run, and nothing else.\<close>
 
-theorem newline_strip_sound:
+lemma newline_strip_take:
   "newline_strip s = take (length s - lead_nl_count (rev s)) s"
 proof -
   have drop_eq: "rev_drop_last_nl (rev s) = drop (lead_nl_count (rev s)) (rev s)"
@@ -217,11 +248,11 @@ qed
 
 lemma newline_strip_length:
   "length (newline_strip s) = length s - lead_nl_count (rev s)"
-  using newline_strip_sound by simp
+  using newline_strip_take by simp
 
 lemma newline_strip_prefix:
   "\<exists>k. newline_strip s = take k s"
-  using newline_strip_sound by blast
+  using newline_strip_take by blast
 
 text \<open>The removal is a RUN: the last kept byte is not a newline (unless
   nothing is kept), which is what separates this node from a one-newline
@@ -262,6 +293,60 @@ next
     unfolding newline_strip_def by simp
   also have "\<dots> = rev (rev_drop_last_nl (rev s))" by (simp add: stable)
   finally show ?thesis unfolding newline_strip_def .
+qed
+
+
+text \<open>`newline_strip_sound` is the node-level obligation, general in the text:
+  the kept part is a `take` whose length is `length s` minus the trailing run's
+  size; its length is that quantity; what it drops is the trailing run, and
+  every dropped byte is a newline of the accounted length; and the kept text no
+  longer ends in one. The four conjuncts are the run characterisation, not one
+  equation with the rest in prose.\<close>
+
+lemma newline_strip_suffix:
+  "\<exists>r. s = newline_strip s @ r \<and> length r = lead_nl_count (rev s) \<and>
+       (\<forall>c \<in> set r. c = 10)"
+proof -
+  let ?k = "length s - lead_nl_count (rev s)"
+  have take_eq: "newline_strip s = take ?k s" by (rule newline_strip_take)
+  have le: "?k \<le> length s" by simp
+  have drop_rev: "drop ?k s = rev (take (lead_nl_count (rev s)) (rev s))"
+    by (simp add: rev_take)
+  have all_nl: "\<forall>c \<in> set (drop ?k s). c = 10"
+    using lead_nl_count_take_all_nl drop_rev by auto
+  show ?thesis
+  proof (intro exI conjI)
+    show "s = newline_strip s @ drop ?k s" using take_eq by simp
+    have bound: "lead_nl_count (rev s) \<le> length s"
+    proof -
+      have "lead_nl_count (rev s) \<le> length (rev s)" by (rule lead_nl_count_le)
+      then show ?thesis by simp
+    qed
+    show "length (drop ?k s) = lead_nl_count (rev s)" using bound by simp
+    show "\<forall>c \<in> set (drop ?k s). c = 10" by (rule all_nl)
+  qed
+qed
+
+theorem newline_strip_sound:
+  "newline_strip s = take (length s - lead_nl_count (rev s)) s \<and>
+   length (newline_strip s) = length s - lead_nl_count (rev s) \<and>
+   (\<exists>r. s = newline_strip s @ r \<and> length r = lead_nl_count (rev s) \<and>
+        (\<forall>c \<in> set r. c = 10)) \<and>
+   (newline_strip s \<noteq> [] \<longrightarrow> last (newline_strip s) \<noteq> 10)"
+proof (intro conjI)
+  show "newline_strip s = take (length s - lead_nl_count (rev s)) s"
+    by (rule newline_strip_take)
+  show "length (newline_strip s) = length s - lead_nl_count (rev s)"
+    by (rule newline_strip_length)
+  show "\<exists>r. s = newline_strip s @ r \<and> length r = lead_nl_count (rev s) \<and>
+          (\<forall>c \<in> set r. c = 10)"
+    by (rule newline_strip_suffix)
+  show "newline_strip s \<noteq> [] \<longrightarrow> last (newline_strip s) \<noteq> 10"
+  proof
+    assume h: "newline_strip s \<noteq> []"
+    have "newline_strip s = [] \<or> last (newline_strip s) \<noteq> 10" by (rule newline_strip_keep)
+    with h show "last (newline_strip s) \<noteq> 10" by blast
+  qed
 qed
 
 end
