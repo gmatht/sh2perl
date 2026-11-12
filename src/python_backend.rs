@@ -89,6 +89,12 @@ pub struct Render {
     need_aslice: bool,
     /// a function call in condition position is its STATUS (`__sh_ok_status`).
     need_ok_status: bool,
+    /// a statement-level `fnValue` call (`__sh_fn_stmt`).
+    need_fn_stmt: bool,
+    /// `${!a[@]}` dict keys / array indices (`__sh_keys`).
+    need_keys: bool,
+    /// `${a[*]}` joined with IFS's first character (`__sh_ifs_join`).
+    need_ifs_join: bool,
     /// `cmd <a >b` as an expression (`__sh_redirect_run`).
     need_redirect_run: bool,
     /// `${s:off:len}` in SUBSCRIPT position (`__sh_substr`).
@@ -1135,6 +1141,17 @@ impl Render {
                     self.collect_writes(finally_body);
                 }
                 IrStmt::Block(b) => self.collect_writes(b),
+                // A `case` arm body is ordinary code: without this arm every
+                // `local` inside a `case` was invisible to the function's
+                // churn of written names (063_09's `local j=0` never reached
+                // `written`, so `(( j < ${#flags} ))` read the environment
+                // and `${flags:j:1}` folded the offset to 0).
+                IrStmt::Case { clauses, .. } => {
+                    for cl in clauses {
+                        self.collect_writes(&cl.body);
+                    }
+                }
+                IrStmt::Subshell(b) | IrStmt::Background(b) => self.collect_writes(b),
                 IrStmt::Function { body, .. } => self.collect_writes(body),
                 IrStmt::Exec { cmd, args, capture, .. } => {
                     if let Some(v) = capture {
@@ -2123,10 +2140,25 @@ impl Render {
                         _ => {}
                     }
                 }
-                // NOTE: a fork-capture fallback here was tried and reverted:
-                // `IrStmt::Subshell` renders its body through this arm, and
-                // forking loses the subshell's STATUS (`( exit 7 )` must
-                // leave $? = 7 — zz_regression_idioms).
+                // A REDIRECT-shaped body the shell-text renderer refused
+                // because a WORD holds an array expansion
+                // (`sort <<<"${a[*]}"` — 064_07 lost the whole capture and
+                // `sorted=($(…))` stayed empty). The body's own statements
+                // DO render (the herestring/stdin lowering takes a python
+                // value), so run them in a forked subshell and take its
+                // output. Narrow on purpose: a general fallback here also
+                // catches `IrStmt::Subshell` bodies, whose STATUS must
+                // survive (`( exit 7 )`).
+                let redirectish = body.iter().any(|st| match st {
+                    IrStmt::Redirect { .. } => true,
+                    IrStmt::Expr(IrExpr::Call { func, .. }) => func == "redirect",
+                    _ => false,
+                });
+                if redirectish {
+                    if let Some(v) = self.subcap_source_value(body) {
+                        return v;
+                    }
+                }
                 self.sh2_stub("arrow", &[], "arrow")
             }
             // `cmd <a >b` as a VALUE where the runtime has no entry point:
@@ -4129,6 +4161,28 @@ impl Render {
                                     );
                                 }
                             }
+                            // `${!a[@]}` / `${!a[*]}` — the INDICES/dict
+                            // keys. The grouped form carries the subscript
+                            // in args[2], so it must be handled before the
+                            // OFFSET reading below, or the expansion became
+                            // `sh2_getVar("!aa")[0:]` and every key was lost
+                            // (070 printed no aa[…] lines).
+                            if let Some(base) = name.strip_prefix('!') {
+                                let grouped = matches!(args.get(2),
+                                    Some(IrExpr::Str(s, _)) if s == "@" || s == "*");
+                                if grouped && Self::is_plain_name(base) {
+                                    self.need_keys = true;
+                                    let src = if self.written.contains(base) {
+                                        self.py_ident(base)
+                                    } else {
+                                        format!(
+                                            "globals().get({}, [])",
+                                            Self::py_str(base)
+                                        )
+                                    };
+                                    return format!("\" \".join(__sh_keys({src}))");
+                                }
+                            }
                             let v = self.call("getVar", &[IrExpr::Str(name.to_string(), crate::ir::StrStyle::DoubleQuoted)]);
                             let o = self.expr_as_num(&args[2]);
                             // An EMPTY length means "to the end of the
@@ -4308,7 +4362,16 @@ impl Render {
                                     format!("globals().get({}, [])", Self::py_str(base))
                                 };
                                 if sub == "@" || sub == "*" {
-                                    return format!("\" \".join(str(_e) for _e in {b})");
+                                    // a DICT iterates its KEYS, and
+                                    // `${m[*]}` is the VALUES (064_07's
+                                    // sorted array held user/host/port).
+                                    // The separator is IFS's FIRST char —
+                                    // `IFS=$'\\n'` before the expansion is
+                                    // what makes `sort <<<"${m[*]}"` see one
+                                    // value per line (064_07 stayed unsorted
+                                    // with a hardcoded space).
+                                    self.need_ifs_join = true;
+                                    return format!("__sh_ifs_join({b})");
                                 }
                                 if let Some(v) = base.strip_prefix('!') {
                                     // `${!m[@]}` — the KEYS of an associative
@@ -4567,6 +4630,22 @@ impl Render {
                     return format!("(__sh_lines({})[{n}] if {} else '')", ve, ve.clone());
                 }
                 self.sh2_stub("line", args, "line")
+            }
+            // `fnValue(name, [args])` — a function call whose VALUE the
+            // frontend models as its captured stdout (a body ending in
+            // `echo` lowers to `return <text>`). At STATEMENT position bash
+            // prints those echoes; the runtime helper returns them, so the
+            // statement driver prints a non-empty result.
+            "fnValue" => {
+                // Statement-level call whose VALUE the frontend models as the
+                // callee's captured stdout. Driving the call through the
+                // runtime helper and printing a non-empty result makes
+                // 063_09 match, but it prints an EXTRA line in 13 corpus
+                // examples whose function body already printed its echoes
+                // (002_control_flow, mul_xy, the pattern-matching family) —
+                // their statement-level `fnValue` must stay silent, so the
+                // stub's shape is kept. See the note in the turn report.
+                self.sh2_stub("fnValue", args, "fnValue")
             }
             "test" => {
                 if let Some(IrExpr::Str(s, _)) = args.first() {
@@ -7382,12 +7461,26 @@ impl Render {
                         toks.push("=".into());
                     }
                 }
-                '!' if chars.peek() == Some(&'=') => {
-                    chars.next();
-                    if !word.is_empty() {
-                        toks.push(std::mem::take(&mut word));
+                // `[[ !-e /x ]]` arrives as ONE word: the negation must be
+                // its own token or the rebuilt test is a bash SYNTAX ERROR
+                // (070 printed `conditional binary operator expected`).
+                '!' => {
+                    if chars.peek() == Some(&'=') {
+                        chars.next();
+                        if !word.is_empty() {
+                            toks.push(std::mem::take(&mut word));
+                        }
+                        toks.push("!=".into());
+                    } else if word.is_empty() && chars.peek() == Some(&'-') {
+                        // ONLY a negated test flag (`!-e /x`) needs its own
+                        // token. Everywhere else the `!` belongs to the word:
+                        // `!(…)` is an EXTGLOB alternation and `[!0-9]` a
+                        // negated class — splitting those broke
+                        // 010_pattern_matching and 037_pattern_matching_extglob.
+                        toks.push("!".into());
+                    } else {
+                        word.push('!');
                     }
-                    toks.push("!=".into());
                 }
                 '<' | '>' => {
                     if !word.is_empty() {
@@ -7809,6 +7902,17 @@ impl Render {
     /// Render a compound body to python source and run it in a forked
     /// subshell, returning the command-substitution value.
     fn subcap_source_value(&mut self, body: &[IrStmt]) -> Option<String> {
+        // rewrite the Call-dialect containers first (`redirect(Arrow[…], …)`
+        // would otherwise reach the arrow stub and its TODO made the guard
+        // below refuse the whole body — 064_07's `sort <<<"${a[*]}"`)
+        let conv;
+        let body = match self.stage_dialect_list(body) {
+            Some(c) => {
+                conv = c;
+                conv.as_slice()
+            }
+            None => body,
+        };
         let saved = std::mem::replace(&mut self.out, Vec::new());
         let saved_depth = self.depth;
         self.depth = 0;
@@ -9280,8 +9384,24 @@ impl Render {
                         }
                     }
                     if has_dup && dup_ok {
-                        for s in inner {
-                            self.stmt(s);
+                        // `echo x >&2`: the inner's stdout IS the child's
+                        // stderr. Rendering it bare printed the text on the
+                        // compared stream (070's `err-to-stderr`).
+                        let to_stderr = redirects.iter().any(|r| {
+                            r.fd.unwrap_or(1) == 1
+                                && matches!(&r.target, IrExpr::Str(t, _) if t == "&2")
+                        });
+                        if to_stderr {
+                            self.need_sys = true;
+                            self.emit("sys.stdout, _sh_so = sys.stderr, sys.stdout");
+                            for s in inner {
+                                self.stmt(s);
+                            }
+                            self.emit("sys.stdout = _sh_so");
+                        } else {
+                            for s in inner {
+                                self.stmt(s);
+                            }
                         }
                         return;
                     }
@@ -9584,6 +9704,44 @@ impl Render {
             self.emit("                _f.close()");
             self.emit("            except OSError:");
             self.emit("                pass");
+            self.emit("");
+        }
+        if self.need_ifs_join {
+            // `${a[*]}` joins with the FIRST character of IFS (a dict
+            // contributes its values).
+            self.emit("def __sh_ifs_join(v):");
+            self.emit("    _ifs = globals().get(\"IFS\")");
+            self.emit("    sep = (str(_ifs)[:1] if _ifs else \" \")");
+            self.emit("    if not sep:");
+            self.emit("        sep = \"\"");
+            self.emit("    items = v.values() if isinstance(v, dict) else v");
+            self.emit("    try:");
+            self.emit("        return sep.join(str(_e) for _e in items)");
+            self.emit("    except TypeError:");
+            self.emit("        return \"\"");
+            self.emit("");
+        }
+        if self.need_keys {
+            // `${!a[@]}`: a dict yields its keys, an indexed array its
+            // indices (bash's hash order is not reproducible — examples
+            // sort, which is what the shell does too).
+            self.emit("def __sh_keys(v):");
+            self.emit("    if isinstance(v, dict):");
+            self.emit("        return [str(k) for k in v.keys()]");
+            self.emit("    try:");
+            self.emit("        return [str(i) for i in range(len(v))]");
+            self.emit("    except TypeError:");
+            self.emit("        return []");
+            self.emit("");
+        }
+        if self.need_fn_stmt {
+            // A statement-level `fnValue` call: the callee's body returns
+            // the text its `echo`s lowered to, so print it (an empty
+            // result must not print a blank line).
+            self.emit("def __sh_fn_stmt(name, args):");
+            self.emit("    t = sh2_fnValue(name, args)");
+            self.emit("    globals()[\"__sh_rc\"] = 0");
+            self.emit("    return (str(t) + \"\\n\") if t else \"\"");
             self.emit("");
         }
         if self.need_ok_status {
