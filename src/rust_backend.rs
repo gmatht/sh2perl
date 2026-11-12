@@ -20709,8 +20709,12 @@ fn scan_expr(e: &IrExpr, var: &str, ev: &mut Vec<bool>, muted: bool) {
             if store {
                 ev.push(true);
             }
+            // Mute the ENTIRE RHS subtree (Arrow/Capture/Call/BinOp alike): those
+            // reads observe the value from BEFORE this store, so counting them as
+            // later reads is what kept `y = ... y ... ` alive.
+            let rhs_muted = muted || store;
             for a in args.iter().skip(usize::from(store)) {
-                scan_expr(a, var, ev, muted || store);
+                scan_expr(a, var, ev, rhs_muted);
             }
         }
         IrExpr::Var(name, _) | IrExpr::Ident(name) => {
