@@ -4665,9 +4665,6 @@ impl Render {
         if self.local_init.remove(name) {
             let kw = if self.local_mut.contains(name) { "let mut" } else { "let" };
             let mut attr = String::new();
-            if self.local_dead_init.contains(name) {
-                attr.push_str("#[allow(unused_assignments)] ");
-            }
             if m.chars().any(|c| c.is_ascii_uppercase()) {
                 attr.push_str("#[allow(non_snake_case)] ");
             }
@@ -18426,12 +18423,32 @@ fn reads_before_write(stmts: &[IrStmt], var: &str) -> bool {
     /// initialiser survived and rustc reported a dead store.
     fn expr_write_target(e: &IrExpr, var: &str) -> bool {
         match e {
-            IrExpr::Call { func, args } if func == "setVar" => {
+            IrExpr::Call { func, args } if func == "setVar" || func == "assign" => {
                 matches!(args.first(), Some(IrExpr::Str(n, _)) if n == var)
+                    || args.iter().skip(1).any(|a| expr_write_target(a, var))
             }
-            IrExpr::Call { func, args } if func == "assign" => {
-                matches!(args.first(), Some(IrExpr::Str(n, _)) if n == var)
+            IrExpr::BinOp { lhs, rhs, .. } => {
+                expr_write_target(lhs, var) || expr_write_target(rhs, var)
             }
+            IrExpr::Call { args, .. } => args.iter().any(|a| expr_write_target(a, var)),
+            IrExpr::MethodCall { obj, args, .. } => {
+                expr_write_target(obj, var)
+                    || args.iter().any(|a| expr_write_target(a, var))
+            }
+            IrExpr::Ternary { then, else_, .. } => {
+                expr_write_target(then, var) || expr_write_target(else_, var)
+            }
+            IrExpr::DefinedOr { expr, default } => {
+                expr_write_target(expr, var) || expr_write_target(default, var)
+            }
+            IrExpr::Interpolate(parts) => parts.iter().any(|pt| match pt {
+                InterpPart::Expr(x) => expr_write_target(x, var),
+                _ => false,
+            }),
+            IrExpr::Capture { expr, .. } => expr_write_target(expr, var),
+            IrExpr::Array(items) => items.iter().any(|i| expr_write_target(i, var)),
+            IrExpr::Object(pairs) => pairs.iter().any(|(_, v)| expr_write_target(v, var)),
+            IrExpr::Index { key, .. } => expr_write_target(key, var),
             // A store nested in a block/sequence expression: the carrier is
             // `IrExpr::Arrow(Vec<IrStmt>)` (`{ let __v = …; r = …; __v }`).
             // It counts as a write only when the body WRITES before it reads:
