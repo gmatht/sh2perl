@@ -12211,7 +12211,12 @@ impl Render {
                             // its status store, the `!__b` test and the rhs
                             // are all unreachable — exactly what rustc
                             // reported for parse-break-or.
-                            self.emit(&format!("{{ {core} }}"));
+                            // This arm only ever runs from `expr_stmt_value`,
+                            // i.e. statement position, so the diverging core
+                            // is emitted as the statement it already is: the
+                            // `{ … }` around it were pure decoration and are
+                            // what rustc reported as unnecessary braces.
+                            self.emit(&core);
                         } else {
                             self.emit(&format!(
                                 "{{ let __b = {core}; __SH_RC.store(if __b {{ 0 }} else {{ 1 }}, Ordering::Relaxed); if !__b {{"
