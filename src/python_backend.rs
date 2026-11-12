@@ -957,7 +957,38 @@ pub fn shir_to_python(prog: &IrProgram) -> String {
     r.var_types = prog.var_types.iter().cloned().collect();
     r.collect_writes(&prog.stmts);
     r.program(&prog);
-    r.out.join("\n")
+    let src = r.out.join("\n");
+    // Non-UTF-8 source bytes ride as PUA markers (U+F800+byte — see
+    // otranspilerl's read_source, which cannot put a raw 0xE9 in a String).
+    // bash echoes the file's BYTES, so map each marker to a surrogate
+    // escape and let stdout write the original byte back
+    // (utf8-non-utf8-content's ISO-8859-1 `é`: the byte vanished entirely
+    // before — the marker char was re-encoded as UTF-8).
+    if src.chars().any(|c| ('\u{F800}'..='\u{F8FF}').contains(&c)) {
+        // NOTE: the replacement must be the ESCAPE TEXT `\udcXX`, not the
+        // surrogate char — `char::from_u32` rejects U+D800..=U+DFFF, so a
+        // char mapping silently kept the marker (the first attempt did).
+        let mapped: String = src
+            .chars()
+            .map(|c| {
+                let n = c as u32;
+                if (0xF800..=0xF8FF).contains(&n) {
+                    format!("\\udc{:02x}", n - 0xF800)
+                } else {
+                    c.to_string()
+                }
+            })
+            .collect();
+        return format!(
+            "import sys as _sys\n\
+             try:\n\
+             \x20   _sys.stdout.reconfigure(errors=\"surrogateescape\")\n\
+             \x20   _sys.stderr.reconfigure(errors=\"surrogateescape\")\n\
+             except Exception:\n\
+             \x20   pass\n{mapped}"
+        );
+    }
+    src
 }
 
 impl Render {
@@ -1198,6 +1229,17 @@ impl Render {
                     }
                     _ => {}
                 }
+                if matches!(func.as_str(), "redirect" | "run" | "exec") {
+                    // a redirect-wrapped command runs in THIS shell, so its
+                    // body's assignments are real writes (a `$( )` capture
+                    // is NOT — its body runs in a child, so the generic
+                    // arg recursion below deliberately ignores Arrow bodies).
+                    for a in args {
+                        if let IrExpr::Arrow(body) = a {
+                            self.collect_writes(body);
+                        }
+                    }
+                }
                 for a in args {
                     self.collect_writes_expr(a);
                 }
@@ -1302,6 +1344,38 @@ impl Render {
     /// `redirect(Arrow([…]), [{fd, mode, target}])` — a pipeline stage keeps
     /// these wrappers, so without the rewrite `while … done < f | sort`
     /// loses the loop entirely (`sh2_arrow()` stub).
+    /// `n=$(($1 + 0)) 2>/dev/null && test "$n" = "$1"` — a redirect-wrapped
+    /// command sitting in a `&&`/`||` operand is a STATEMENT, not a value.
+    /// Rendering it as `sh2_redirect(sh2_arrow(), …)` threw the assignment
+    /// away (dollar-positional-arithmetic printed `n=[]`). Emit the body's
+    /// statements here and use the shell status as the operand's truth.
+    fn redirect_operand_effect(&mut self, e: &IrExpr) -> Option<String> {
+        let IrExpr::Call { func, args } = e else {
+            return None;
+        };
+        if func != "redirect" {
+            return None;
+        }
+        let Some(IrExpr::Arrow(body)) = args.first() else {
+            return None;
+        };
+        // Only the single-assignment shape needs the statement lowering; a
+        // richer body (a process-substitution `and` of captures, say) keeps
+        // the VALUE form `sh2_redirect(…)` that the redirect renderer
+        // already produces — rendering it here turned `and` into an
+        // unsupported `sh2_and` call (012/042/083 process substitution).
+        if body.len() != 1 || !matches!(body[0], IrStmt::Assign { .. }) {
+            return None;
+        }
+        let body = self
+            .stage_dialect_list(body)
+            .unwrap_or_else(|| body.clone());
+        for st in &body {
+            self.stmt(st);
+        }
+        Some("(__sh_rc == 0)".to_string())
+    }
+
     fn stage_dialect(&self, body: &[IrStmt]) -> Option<Vec<IrStmt>> {
         // `( a; b )` as a pipeline stage: the body's stdout IS the stage's
         // stdout, and this backend models shell vars as globals anyway, so
@@ -1869,20 +1943,64 @@ impl Render {
                             reff = self.pipeline_effect(args);
                         }
                     }
+                    // `n=$(($1 + 0)) 2>/dev/null && test …`: a
+                    // redirect-wrapped command as a `&&`/`||` operand is a
+                    // STATEMENT, not a value — run its body here so the
+                    // assignment lands in this shell.
+                    if leff.is_none() {
+                        if let Some(v) = self.redirect_operand_effect(lhs) {
+                            leff = Some(v);
+                        }
+                    }
+                    if reff.is_none() {
+                        if let Some(v) = self.redirect_operand_effect(rhs) {
+                            reff = Some(v);
+                        }
+                    }
                     let need_rs = std::cell::Cell::new(false);
                     let wrap = |x: &IrExpr, s: String| -> String {
-                        if matches!(x, IrExpr::Call { func, .. } if func == "exec") {
+                        // `builtin` counts too: `mkdir -p d && …` arrives as
+                        // Call{builtin,["mkdir",…]} and its render
+                        // (`__sh_mkdir(…)`) returns 0, which a bare `and`
+                        // treats as failure — the redirect never ran
+                        // (018_grep_params).
+                        if matches!(x, IrExpr::Call { func, .. } if func == "exec" || func == "builtin") {
                             if s.starts_with("__sh_exec(") {
                                 need_rs.set(true);
                                 // keep "(" from the original call: slice
                                 // after __sh_exec, not after its paren
                                 format!("__sh_run_status{}", &s["__sh_exec".len()..])
-                            } else if s.starts_with("__sh_ok(") {
-                                // a fallible builtin's verdict — already a
-                                // bool, no truthy wrapper (which would
-                                // invert it: `False or 1` is truthy).
+                            } else if Self::is_native_rc(&s) {
+                                // an rc-valued native helper (`__sh_mkdir`
+                                // returns 0 on success): bash truth is a
+                                // ZERO rc, and python's `0 and …`
+                                // short-circuits, so compare explicitly
+                                // (018_grep_params: `mkdir -p d && echo > f`
+                                // never ran the redirect). `time.sleep`
+                                // renders None, so it takes the truthy wrap.
+                                if s.starts_with("(time.sleep(") {
+                                    format!("({s} or 1)")
+                                } else {
+                                    format!("({s} == 0)")
+                                }
+                            } else if s.starts_with("__sh_ok(")
+                                || s.starts_with("os.path.")
+                                || s.starts_with("__sh_glob_match(")
+                            {
+                                // a fallible builtin's verdict or a NATIVE
+                                // TEST — already a bool, no truthy wrapper
+                                // (which would invert it: `False or 1` is
+                                // truthy, so `test -f x || exit 0` never
+                                // exited — parse-dollar-keyword-var).
                                 s
                             } else {
+                                // any other helper/print render returns a
+                                // non-status python value (None, 0, a
+                                // CompletedProcess): the COMMAND succeeded,
+                                // so the operand is truthy. This default is
+                                // load-bearing: without it __sh_mkdir's 0
+                                // short-circuits the `and` and the following
+                                // redirect never runs (018_grep_params).
                                 format!("({s} or 1)")
                             }
                         } else {
@@ -7979,6 +8097,22 @@ impl Render {
     }
 
     fn stmt(&mut self, s: &IrStmt) {
+        // A redirect-wrapped command in the Call dialect (`cmd 2>/dev/null`,
+        // `cat <<EOF`, `n=$((…)) 2>/dev/null && …`) must become the real
+        // Redirect STATEMENT, whose heredoc/stdin/file arms can render it.
+        // Left as an expression it emitted `sh2_redirect(sh2_arrow(), …)`
+        // stubs: subshell-heredoc-close lost the heredoc body and
+        // dollar-positional-arithmetic lost the arithmetic.
+        if let IrStmt::Expr(IrExpr::Call { func, .. }) = s {
+            if func == "redirect" {
+                if let Some(conv) = self.stage_dialect(std::slice::from_ref(s)) {
+                    for c in &conv {
+                        self.stmt(c);
+                    }
+                    return;
+                }
+            }
+        }
         match s {
             IrStmt::Expr(e) => {
                 // statement-position arith: `i++` / `x += n` (the C-style
