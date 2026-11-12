@@ -461,27 +461,61 @@ text \<open>OBLIGATION \<open>cut_at_sound\<close>: the node is those four funct
   is a no-op when the pattern does not match".\<close>
 
 theorem cut_at_sound:
-  "cut_at True True s n = cut_head_first s n \<and>
+  "(\<forall>i. find_first s n = Some i \<longrightarrow> cut_at True True s n = take i s) \<and>
+   (\<forall>i. rfind_last s n = Some i \<longrightarrow> cut_at True False s n = take i s) \<and>
+   (\<forall>i. find_first s n = Some i \<longrightarrow> cut_at False True s n = drop (i + length n) s) \<and>
+   (\<forall>i. rfind_last s n = Some i \<longrightarrow> cut_at False False s n = drop (i + length n) s) \<and>
+   (find_first s n = None \<longrightarrow> cut_at True True s n = s \<and> cut_at False True s n = s) \<and>
+   (rfind_last s n = None \<longrightarrow> cut_at True False s n = s \<and> cut_at False False s n = s) \<and>
+   cut_at True True s n = cut_head_first s n \<and>
    cut_at True False s n = cut_head_last s n \<and>
    cut_at False True s n = cut_tail_first s n \<and>
-   cut_at False False s n = cut_tail_last s n \<and>
-   (find_first s n = None \<longrightarrow> cut_head_first s n = s) \<and>
-   (rfind_last s n = None \<longrightarrow> cut_head_last s n = s) \<and>
-   (find_first s n = None \<longrightarrow> cut_tail_first s n = s) \<and>
-   (rfind_last s n = None \<longrightarrow> cut_tail_last s n = s)"
-proof (intro conjI impI)
+   cut_at False False s n = cut_tail_last s n"
+proof (intro conjI)
+  show "\<forall>i. find_first s n = Some i \<longrightarrow> cut_at True True s n = take i s"
+  proof (intro allI impI)
+    fix i
+    assume h: "find_first s n = Some i"
+    then show "cut_at True True s n = take i s" by (rule cut_at_head_first_matched)
+  qed
+  show "\<forall>i. rfind_last s n = Some i \<longrightarrow> cut_at True False s n = take i s"
+  proof (intro allI impI)
+    fix i
+    assume h: "rfind_last s n = Some i"
+    then show "cut_at True False s n = take i s" by (rule cut_at_head_last_matched)
+  qed
+  show "\<forall>i. find_first s n = Some i \<longrightarrow> cut_at False True s n = drop (i + length n) s"
+  proof (intro allI impI)
+    fix i
+    assume h: "find_first s n = Some i"
+    then show "cut_at False True s n = drop (i + length n) s" by (rule cut_at_tail_first_matched)
+  qed
+  show "\<forall>i. rfind_last s n = Some i \<longrightarrow> cut_at False False s n = drop (i + length n) s"
+  proof (intro allI impI)
+    fix i
+    assume h: "rfind_last s n = Some i"
+    then show "cut_at False False s n = drop (i + length n) s" by (rule cut_at_tail_last_matched)
+  qed
+  show "find_first s n = None \<longrightarrow> cut_at True True s n = s \<and> cut_at False True s n = s"
+  proof (intro conjI impI)
+    assume h: "find_first s n = None"
+    then show "cut_at True True s n = s" by (rule cut_at_head_first_no_match)
+  next
+    assume h: "find_first s n = None"
+    then show "cut_at False True s n = s" by (rule cut_at_tail_first_no_match)
+  qed
+  show "rfind_last s n = None \<longrightarrow> cut_at True False s n = s \<and> cut_at False False s n = s"
+  proof (intro conjI impI)
+    assume h: "rfind_last s n = None"
+    then show "cut_at True False s n = s" by (rule cut_at_head_last_no_match)
+  next
+    assume h: "rfind_last s n = None"
+    then show "cut_at False False s n = s" by (rule cut_at_tail_last_no_match)
+  qed
   show "cut_at True True s n = cut_head_first s n" unfolding cut_at_def by simp
   show "cut_at True False s n = cut_head_last s n" unfolding cut_at_def by simp
   show "cut_at False True s n = cut_tail_first s n" unfolding cut_at_def by simp
   show "cut_at False False s n = cut_tail_last s n" unfolding cut_at_def by simp
-  show "find_first s n = None \<Longrightarrow> cut_head_first s n = s"
-    unfolding cut_head_first_def by simp
-  show "rfind_last s n = None \<Longrightarrow> cut_head_last s n = s"
-    unfolding cut_head_last_def by simp
-  show "find_first s n = None \<Longrightarrow> cut_tail_first s n = s"
-    unfolding cut_tail_first_def by simp
-  show "rfind_last s n = None \<Longrightarrow> cut_tail_last s n = s"
-    unfolding cut_tail_last_def by simp
 qed
 
 section \<open>The split identity: a successful cut divides the text\<close>
@@ -644,28 +678,50 @@ lemma is_magic_free_rejects_star:
   "\<not> is_magic_free [97, 42]" by eval
 
 theorem affix_strip_fold_sound:
-  "(is_magic_free n \<longrightarrow> cut_at False True s n = cut_tail_first s n) \<and>
-   (take (length n) s = n \<longrightarrow> cut_tail_first s n = affix_strip_node s n True) \<and>
-   (cut_tail_first [97, 98, 97, 98] [97, 98] = [97, 98]) \<and>
-   (cut_tail_last [97, 98, 97, 98] [97, 98] = []) \<and>
-   (find_first s n = rfind_last s n \<longrightarrow>
-      cut_tail_first s n = cut_tail_last s n)"
+  "is_magic_free n \<Longrightarrow>
+     (cut_at False True s n =
+        (case find_first s n of None \<Rightarrow> s | Some i \<Rightarrow> drop (i + length n) s)) \<and>
+     (cut_at False False s n =
+        (case rfind_last s n of None \<Rightarrow> s | Some i \<Rightarrow> drop (i + length n) s)) \<and>
+     (cut_at True True s n =
+        (case find_first s n of None \<Rightarrow> s | Some i \<Rightarrow> take i s)) \<and>
+     (cut_at True False s n =
+        (case rfind_last s n of None \<Rightarrow> s | Some i \<Rightarrow> take i s)) \<and>
+     (take (length n) s = n \<longrightarrow> cut_at False True s n = affix_strip_node s n True)"
 proof (intro conjI impI)
-  show "is_magic_free n \<Longrightarrow> cut_at False True s n = cut_tail_first s n"
-    unfolding cut_at_def by simp
-  show "take (length n) s = n \<Longrightarrow> cut_tail_first s n = affix_strip_node s n True"
-    by (rule cut_tail_first_at_head)
-  show "cut_tail_first [97, 98, 97, 98] [97, 98] = [97, 98]" by eval
-  show "cut_tail_last [97, 98, 97, 98] [97, 98] = []" by eval
-  show "find_first s n = rfind_last s n \<Longrightarrow>
-        cut_tail_first s n = cut_tail_last s n"
-    by (rule cut_first_last_agree[THEN conjunct2])
+  show "cut_at False True s n =
+        (case find_first s n of None \<Rightarrow> s | Some i \<Rightarrow> drop (i + length n) s)"
+    unfolding cut_at_def cut_tail_first_def by simp
+  show "cut_at False False s n =
+        (case rfind_last s n of None \<Rightarrow> s | Some i \<Rightarrow> drop (i + length n) s)"
+    unfolding cut_at_def cut_tail_last_def by simp
+  show "cut_at True True s n =
+        (case find_first s n of None \<Rightarrow> s | Some i \<Rightarrow> take i s)"
+    unfolding cut_at_def cut_head_first_def by simp
+  show "cut_at True False s n =
+        (case rfind_last s n of None \<Rightarrow> s | Some i \<Rightarrow> take i s)"
+    unfolding cut_at_def cut_head_last_def by simp
+  show "take (length n) s = n \<Longrightarrow> cut_at False True s n = affix_strip_node s n True"
+  proof -
+    assume h: "take (length n) s = n"
+    have "cut_at False True s n = cut_tail_first s n" unfolding cut_at_def by simp
+    also have "\<dots> = affix_strip_node s n True" using h by (rule cut_tail_first_at_head)
+    finally show ?thesis .
+  qed
 qed
 
-text \<open>The agreement conjunct is what makes the LAST side usable without a
-  second proof: where the two primitives coincide (`lit` occurs at most once),
-  `${v##lit*}` and `${v#*lit}` are the same function, so the fold's plain branch
-  and its star branch agree. Where they differ the witness above says so.\<close>
+text \<open>That is the fold's whole contract, for every `s` and `n`: the node in the
+  `#` shape is `drop` at the first occurrence, in the `##` shape `drop` at the
+  last, in the `%`/`%%` shapes `take` at the first/last — with the text
+  unchanged where the primitive returns `None` — and the plain (non-star) branch
+  is what the `#` shape becomes when the literal sits at the head, which is the
+  only case where `#` and `##` agree on a single literal.\<close>
+
+text \<open>The flag is load-bearing, as a separate EXAMPLE rather than a hypothesis:
+  on a repeating literal the two star shapes differ, so a fold that dropped
+  `first` would be wrong. `cut_first_last_agree` above is the general converse —
+  the two cuts coincide whenever the two primitives do — and it is a theorem
+  about arbitrary `s` and `n`, not a side condition of the fold lemma.\<close>
 
 text \<open>LIMITATION. The glob engine is not modelled: "the longest prefix
   matching `lit*`" is taken as "the suffix starting at the last occurrence of
