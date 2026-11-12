@@ -9,11 +9,22 @@
 #
 # No match leaves the text unchanged (bash's strip is a no-op when the
 # pattern does not match). `delim` is a magic-free literal (the fold
-# refuses `*`/`?`/`[`/`\` bodies), so the glob engine is never needed —
-# each identity follows from glob semantics: `*` matches the empty
-# string, shortest-vs-longest picks the cut point. Verified against bash
-# (match / no-match / empty-delim / multi-byte literal cases) before the
-# node was written; see transforms/affix_strip_fold.rs's module doc.
+# refuses `*`/`?`/`[`/`\` bodies): `is_magic_free`.
+#
+# The identities are THEOREMS, not an appeal to glob semantics:
+# docs/fm/TextOps/ShIR_TextOps_Cut.thy proves `find_first`/`rfind_last`
+# (a returned index is an occurrence, none means no occurrence anywhere,
+# leftmost/maximal) and, over arbitrary text and literal, `cut_at_sound`
+# (each form is take/drop at its own occurrence, text unchanged on no
+# match) and `affix_strip_fold_sound` (the fold's contract: all four star
+# shapes at those primitives, plus the plain branch at either end —
+# `#lit*` is AffixStrip's strip_prefix, `%*lit` its strip_suffix, the
+# latter via `cut_head_last_at_trail`). What is NOT modelled is the glob
+# engine itself: "shortest/longest match of `lit*`" is identified with the
+# first/last occurrence of the literal, and that identification is
+# assumed, not proved (docs/fm/README.md). The AST reading was checked
+# against bash before the node was written, but the identities now rest on
+# the theory rather than on that check.
 #
 # Emitted by the `affix-strip-fold` transform (the star-form branch; the
 # plain-literal branch keeps using AffixStrip).

@@ -16,9 +16,11 @@
     case), and minimality/maximality — then the four cut forms as functions of
     those primitives, with their no-match no-ops, and the split identity that
     says a successful cut splits the text into prefix, literal and remainder.
-    Finally `affix_strip_fold_sound`: the fold's star branch at a head literal
-    is the AffixStrip node, and first differs from last on a repeating literal
-    (which is why the node carries `first` at all).
+    Finally `affix_strip_fold_sound`: the fold's star branch is right at either
+    END — a literal at the head gives AffixStrip's `strip_prefix`, one at the
+    tail gives its `strip_suffix` — first differs from last on a repeating
+    literal (which is why the node carries `first` at all), and the suffix side
+    rests on `rfind_last_self` / `rfind_last_append_suf_end`.
 
     WHAT IS NOT MODELLED. The glob engine itself: "shortest-vs-longest match of
     `lit*`" is NOT formalised. What is proved is the literal reading the fold
@@ -365,6 +367,50 @@ next
   qed
 qed
 
+text \<open>PRIMITIVE, part 4: the two facts the SUFFIX-side fold shapes are stated
+  against, which `rfind_last_max` cannot give — it bounds an occurrence from
+  below, not where the rightmost one sits. First: a text that IS the needle has
+  its only possible occurrence at 0. Second: if the text is `r` followed by the
+  needle, the last occurrence is exactly the split point `length r`.
+  Neither is proved by case analysis on the text: the first contradicts
+  `rfind_last_none` at index 0, the second is an induction on the prefix.\<close>
+
+lemma rfind_last_self [simp]:
+  "rfind_last s s = Some 0"
+proof (cases "rfind_last s s")
+  case None
+  have no_occ: "\<And>i. i \<le> length s \<Longrightarrow> take (length s) (drop i s) \<noteq> s"
+    using rfind_last_none[OF None] by blast
+  have at0: "take (length s) (drop 0 s) = s" by (simp add: take_all)
+  show ?thesis using None no_occ[of 0] at0 by simp
+next
+  case (Some i)
+  have occ: "take (length s) (drop i s) = s" using rfind_last_occ[OF Some] by simp
+  have "length s = length (take (length s) (drop i s))" using occ by simp
+  also have "\<dots> = min (length s) (length (drop i s))" by (simp add: length_take)
+  also have "\<dots> = min (length s) (length s - i)" by simp
+  finally have eq: "length s = min (length s) (length s - i)" .
+  have le: "i \<le> length s" using rfind_last_occ[OF Some] by simp
+  have "i = 0"
+  proof (rule ccontr)
+    assume nz: "i \<noteq> 0"
+    then have "length s - i < length s" using le by arith
+    then show False using eq by (simp add: min_def)
+  qed
+  with Some show ?thesis by simp
+qed
+
+lemma rfind_last_append_suf_end:
+  "rfind_last (r @ n) n = Some (length r)"
+proof (induct r)
+  case Nil
+  then show ?case by (simp add: rfind_last_self)
+next
+  case (Cons b r)
+  note IH = Cons(1)
+  show ?case by (simp add: rfind_last_cons IH)
+qed
+
 section \<open>The four cut forms\<close>
 
 definition cut_head_first :: "bytes \<Rightarrow> bytes \<Rightarrow> bytes" where
@@ -625,6 +671,37 @@ proof -
   finally show ?thesis .
 qed
 
+text \<open>The mirror of `cut_tail_first_at_head`, and the reason the fold's
+  plain branch needs it: on the SUFFIX side, `${v%lit*}` is the longest suffix
+  matching `*lit`, which is `lit` itself when the literal sits at the tail — so
+  the value is AffixStrip's `strip_suffix`, not a cut. The non-empty-literal
+  guard is real: with `n = []` the cut is `take 0 s = []` while AffixStrip
+  leaves the text alone, which is why the fold special-cases the empty body
+  instead of emitting either node.\<close>
+
+theorem cut_head_last_at_trail:
+  assumes hn: "n \<noteq> []"
+  shows "cut_head_last (r @ n) n = affix_strip_node (r @ n) n False"
+proof -
+  have rf: "rfind_last (r @ n) n = Some (length r)"
+    by (rule rfind_last_append_suf_end)
+  have len: "length (r @ n) - length n = length r" by simp
+  have ch: "cut_head_last (r @ n) n = take (length r) (r @ n)"
+    unfolding cut_head_last_def using rf by simp
+  also have "\<dots> = r" by simp
+  also have "\<dots> = affix_strip_node (r @ n) n False"
+  proof -
+    have ha: "has_affix (r @ n) n False"
+      unfolding has_affix_def using len by simp
+    have "affix_strip_node (r @ n) n False =
+          take (length (r @ n) - length n) (r @ n)"
+      unfolding affix_strip_node_def using ha by simp
+    also have "\<dots> = r" using len by simp
+    finally show ?thesis by simp
+  qed
+  finally show ?thesis .
+qed
+
 lemma cut_first_last_agree:
   "find_first s n = rfind_last s n \<Longrightarrow>
      cut_head_first s n = cut_head_last s n \<and> cut_tail_first s n = cut_tail_last s n"
@@ -687,7 +764,9 @@ theorem affix_strip_fold_sound:
         (case find_first s n of None \<Rightarrow> s | Some i \<Rightarrow> take i s)) \<and>
      (cut_at True False s n =
         (case rfind_last s n of None \<Rightarrow> s | Some i \<Rightarrow> take i s)) \<and>
-     (take (length n) s = n \<longrightarrow> cut_at False True s n = affix_strip_node s n True)"
+     (take (length n) s = n \<longrightarrow> cut_at False True s n = affix_strip_node s n True) \<and>
+     (has_affix s n False \<longrightarrow> n \<noteq> [] \<longrightarrow>
+        cut_at True False s n = affix_strip_node s n False)"
 proof (intro conjI impI)
   show "cut_at False True s n =
         (case find_first s n of None \<Rightarrow> s | Some i \<Rightarrow> drop (i + length n) s)"
@@ -708,14 +787,36 @@ proof (intro conjI impI)
     also have "\<dots> = affix_strip_node s n True" using h by (rule cut_tail_first_at_head)
     finally show ?thesis .
   qed
+  show "has_affix s n False \<Longrightarrow> n \<noteq> [] \<Longrightarrow>
+        cut_at True False s n = affix_strip_node s n False"
+  proof -
+    assume ha: "has_affix s n False" and hn: "n \<noteq> []"
+    have hd: "drop (length s - length n) s = n"
+      using ha unfolding has_affix_def by simp
+    have split: "s = take (length s - length n) s @ n"
+    proof -
+      have "take (length s - length n) s @ drop (length s - length n) s = s"
+        by (rule append_take_drop_id)
+      then show ?thesis using hd by simp
+    qed
+    have tail_at:
+      "cut_head_last (take (length s - length n) s @ n) n =
+       affix_strip_node (take (length s - length n) s @ n) n False"
+      by (rule cut_head_last_at_trail[OF hn])
+    have "cut_at True False s n = cut_head_last s n" unfolding cut_at_def by simp
+    also have "\<dots> = affix_strip_node s n False" using split tail_at by simp
+    finally show ?thesis .
+  qed
 qed
 
 text \<open>That is the fold's whole contract, for every `s` and `n`: the node in the
   `#` shape is `drop` at the first occurrence, in the `##` shape `drop` at the
   last, in the `%`/`%%` shapes `take` at the first/last — with the text
   unchanged where the primitive returns `None` — and the plain (non-star) branch
-  is what the `#` shape becomes when the literal sits at the head, which is the
-  only case where `#` and `##` agree on a single literal.\<close>
+  is what the `#` shape becomes when the literal sits at the head, and the tail
+  case is what the `%` shape becomes when the literal sits at the END — the two
+  cases where the shortest and longest match of `lit*`/`*lit` coincide, which is
+  why the plain branch needs `AffixStrip` and not a cut at all.\<close>
 
 text \<open>The flag is load-bearing, as a separate EXAMPLE rather than a hypothesis:
   on a repeating literal the two star shapes differ, so a fold that dropped
