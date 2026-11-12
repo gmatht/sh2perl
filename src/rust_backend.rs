@@ -20562,7 +20562,14 @@ fn compute_local_vars(
                 // deferred use sites on an iteration where the write has not
                 // run yet (the first write is top-level but later paths are
                 // conditional), so it keeps the initialised declaration.
-                if reads_before_write(body, &name) || body_has_loop(body) {
+                // A loop only defeats deferral when some path can reach a
+                // read before the write. When the ordered walk's FIRST event
+                // is a store, every pass reaches that store before any read,
+                // so the default initialiser's value is dead and the
+                // declaration can be deferred even inside a loop.
+                if reads_before_write(body, &name)
+                    || (body_has_loop(body) && !entry_default_dead(body, &name))
+                {
                     dead_init.insert(name.clone());
                 } else {
                     safe_deinit.insert(name.clone());
@@ -20773,6 +20780,12 @@ fn scan_expr(e: &IrExpr, var: &str, ev: &mut Vec<bool>, muted: bool) {
 /// `(stores_at_or_before_last_store, last_store_is_dead)` for one scope body,
 /// from the ordered walk: dead iff the truly last store site comes after every
 /// read site of the name.
+fn entry_default_dead(body: &[IrStmt], var: &str) -> bool {
+    let mut ev: Vec<bool> = Vec::new();
+    scan_stmts(body, var, &mut ev, false);
+    matches!(ev.first(), Some(true))
+}
+
 fn dead_store_scan(body: &[IrStmt], var: &str) -> Option<(usize, bool)> {
     let mut ev: Vec<bool> = Vec::new();
     scan_stmts(body, var, &mut ev, false);
