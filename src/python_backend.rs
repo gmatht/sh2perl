@@ -4555,8 +4555,27 @@ impl Render {
                                     && !sub.starts_with(|c: char| c.is_ascii_digit())
                                 {
                                     // `${a[i]}` — an indexed subscript is an
-                                    // arithmetic variable name.
-                                    self.py_ident(sub)
+                                    // arithmetic variable name. An unwritten
+                                    // one is UNSET in bash, so it must not
+                                    // become a bare python name: bash reads
+                                    // it as 0 (parse-redirect-in-case-pattern
+                                    // never assigns `counter`, and the bare
+                                    // name raised NameError).
+                                    if self.written.contains(sub) {
+                                        self.py_ident(sub)
+                                    } else {
+                                        self.need_atoi = true;
+                                        format!(
+                                            "__sh_atoi({})",
+                                            self.call(
+                                                "getVar",
+                                                &[IrExpr::Str(
+                                                    sub.to_string(),
+                                                    crate::ir::StrStyle::DoubleQuoted,
+                                                )]
+                                            )
+                                        )
+                                    }
                                 } else {
                                     Self::py_str(sub)
                                 };
