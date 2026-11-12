@@ -104,20 +104,41 @@ node contract — "this node means this value, in every renderer" — lives.
 These are written out where they belong and left as explicit open targets —
 never faked with `sorry` (the session is `quick_and_dirty = false`):
 
-- **`rev_drop_last_nl_prefix`** (`ShIR_TextOps_Strip`): the bytes the strip
-  keeps are a prefix of the input. Everything reduces to one step —
-  `a # ((z # zs) @ w) = z # (zs @ (a # w))` with `a = 10` in scope, i.e.
-  associativity of `@` under a hypothesis — which no tactic in this build
-  discharges (see the box-health note below).
-- **`sorted_insert` / `isort_sorted`** (`ShIR_TextOps_SortUniq`): the model
-  sort's output is ordered and stable.
-- **`drop_runs_idem` / `drop_runs_no_adjacent_eq`**, and hence
-  **`sort -u = uniq . sort`**: the run collapse is idempotent and invents
-  nothing.
 - **`FieldExtract`'s ranges and `--output-delimiter`**: the model covers
   `-fN` only. `-fN-M`, `-fN,`, `--complement` and `-o` splicing are
   unmodelled, so `fields: vec_field_range` and `output_delimiter` carry no
   obligation yet.
+
+### Closed: the strip, sort and collapse targets (2026-11-13)
+
+The three targets this list used to carry are proved, and neither needed the
+cons/append rewrite the entries blamed:
+
+- **`rev_drop_last_nl_prefix`** (`ShIR_TextOps_Strip`) — stated in the take/drop
+  shape instead. `rev_drop_last_nl_is_a_drop` says the strip is exactly
+  `drop (lead_nl_count u) u` (so the old "associativity under a hypothesis"
+  step never had to be done), and the node-level equation
+  `rev_drop_last_nl_prefix` is `newline_strip s = take (length s - lead_nl_count
+  (rev s)) s`, the first conjunct of `newline_strip_sound`.
+- **`sorted_insert` / `isort_sorted`** (`ShIR_TextOps_SortUniq`) — now say what
+  the node promises: sorted, every line's OCCURRENCE COUNT unchanged (nothing
+  lost, nothing duplicated — the statement this session can make without
+  HOL-Library's `perm`), and the length unchanged. The sorted-only halves live
+  on as `sorted_insert_sorted` / `isort_sorted_sorted`.
+  ADJACENT-FREE is deliberately NOT among these conjuncts, because for plain
+  sort it is false: duplicates stay adjacent (`[a,b,a]` sorts to `[a,a,b]`).
+  Adjacent-free belongs to the `sort -u` value, and is proved there as
+  `drop_runs_no_adjacent_eq` / `drop_runs_adj_free`.
+- **`drop_runs_idem`, `drop_runs_no_adjacent_eq`, `sort -u = uniq . sort`** —
+  `drop_runs_idem` was already proved; the no-equal-neighbours fact is now
+  stated in index form (`drop_runs_no_adjacent_eq`: no `i` with
+  `drop_runs ls ! i = drop_runs ls ! Suc i`) as well as via `adj_free`, and the
+  composition is `sort_u_composition`: collapsing twice is collapsing once, the
+  collapse is already sorted so re-sorting it is the identity, and it is
+  sorted and adjacent-free. (The head-only form
+  `\<nexists>x y zs. xs = x # y # zs \<and> x = y` is NOT equivalent to
+  adjacent-free — it tests a single pair — which is why the index form is the
+  statement used.)
 
 ### Closed: `\s` is not POSIX space (2026-11-11)
 

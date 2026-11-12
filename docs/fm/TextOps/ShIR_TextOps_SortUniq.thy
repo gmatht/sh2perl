@@ -11,9 +11,9 @@
     Scope: this file models the two nodes over a LIST OF LINES and proves
     what the nodes promise:
 
-      * `insert_length`, `isort_length` — the model sort is a permutation of
-        its input (no line is lost or invented by the ordering step);
-        `sorted_insert`, `isort_sorted` — its output is ORDERED (in the
+      * `insert_length`, `isort_length` — the model sort preserves length;
+        `sorted_insert`, `isort_sorted` — its output is ORDERED and every
+        line's occurrence count is unchanged (no loss, no duplication; in the
         `sort_total` locale: a preorder is not enough for the second branch);
         `isort_sorted_id` — re-sorting a sorted list is the identity.
       * `run_count_total` — `uniq -c`'s counts add up to the input length;
@@ -73,6 +73,15 @@ fun isort :: "(line \<Rightarrow> line \<Rightarrow> bool) \<Rightarrow> line li
   "isort le [] = []"
 | "isort le (x # xs) = insert le x (isort le xs)"
 
+text \<open>Occurrence counting, because set equality plus length is NOT enough:
+  `[a,a,b]` and `[a,b,b]` share a set and a length. `List.perm` lives in
+  HOL-Library and this is a HOL-only session, so counts are the exact statement
+  available.\<close>
+
+fun count_of :: "line \<Rightarrow> line list \<Rightarrow> nat" where
+  "count_of w [] = 0"
+| "count_of w (x # xs) = (if w = x then Suc (count_of w xs) else count_of w xs)"
+
 definition sorted_by :: "(line \<Rightarrow> line \<Rightarrow> bool) \<Rightarrow> line list \<Rightarrow> bool" where
   "sorted_by le ls = (\<forall>i j. i < j \<and> j < length ls \<longrightarrow> le (ls ! i) (ls ! j))"
 
@@ -95,9 +104,11 @@ text \<open>OBLIGATION (stability): inserting into a sorted list keeps it sorted
   "equal elements keep their input order" half of what `sort -u` relies
   on.\<close>
 
-text \<open>OPEN TARGET (soundness of the node): the emission sorts the lines of
-  the text — the output is a permutation of the input AND is ordered.
-  What IS proved here is the permutation half.\<close>
+text \<open>OBLIGATION (soundness of the node), proved below: the emission sorts the
+  lines of the text — the output is ordered, every line's occurrence count is
+  unchanged (so nothing is lost or duplicated) and the length is unchanged.
+  `isort_length` is the permutation half; `isort_sorted` is the whole
+  obligation; `sorted_insert` is the single-insertion step it rests on.\<close>
 
 lemma insert_length: "length (insert le x ys) = Suc (length ys)"
 proof (induct ys)
@@ -145,8 +156,10 @@ fun run_count :: "line list \<Rightarrow> (nat \<times> line) list" where
         [] \<Rightarrow> [(1, x)]
       | (n, z) # rest \<Rightarrow> (if x = y then (n + 1, z) # rest else (1, x) # (n, z) # rest))"
 
-text \<open>OPEN TARGET (idempotence): collapsing runs twice is collapsing once, so
-  the node removes the WHOLE run (a `-c`-style re-run does not double).\<close>
+text \<open>OBLIGATION (idempotence), proved below as `drop_runs_idem`: collapsing runs
+  twice is collapsing once, so the node removes the WHOLE run (a `-c`-style
+  re-run does not double). `drop_runs_no_adjacent_eq` is the companion fact:
+  the output has no two equal neighbours.\<close>
 
 text \<open>OBLIGATION (`uniq -c`): the counts printed by the node add up to the
   number of input lines — the run walk sees every line exactly once.\<close>
@@ -171,14 +184,13 @@ qed
 
 section \<open>The composition the corpus writes\<close>
 
-text \<open>OPEN TARGET: `sort -u` is `uniq` over `sort`. In a sorted list the
-  equal-key lines are exactly the ADJACENT ones, so the run collapse of the
-  sorted list is the de-duplication `sort -u` performs — which is why the
-  pipeline \<open>sort -u\<close> lowers to a composition of the two nodes rather
-  than to a third node. The order half is \<open>sort_lines_sound\<close>; the collapse
-  half is \<open>drop_runs_idem\<close> and \<open>drop_runs_no_adjacent_eq\<close>: what remains
-  open is the "equal keys are adjacent in a sorted list" step, which is a
-  corollary of any correct order and is left as the open target.\<close>
+text \<open>OBLIGATION (the composition), proved as `sort_u_is_uniq_of_sort` and
+  `sort_u_composition` below: `sort -u` is `uniq` over `sort`. In a sorted list
+  the equal-key lines are the ADJACENT ones, so the run collapse of the sorted
+  list is the de-duplication `sort -u` performs — which is why the pipeline
+  `sort -u` lowers to a composition of the two nodes rather than to a third
+  node. The sort half is `isort_sorted`; the collapse half is `drop_runs_idem`
+  and `drop_runs_no_adjacent_eq`.\<close>
 
 section \<open>Closing the ordering and collapse obligations\<close>
 
@@ -241,7 +253,7 @@ text \<open>OBLIGATION \<open>sorted_insert\<close>: inserting into a sorted lis
   assumption — a preorder alone is not enough, which is why this lemma lives in
   \<open>sort_total\<close> and not in \<open>sort_order\<close>.\<close>
 
-lemma sorted_insert:
+lemma sorted_insert_sorted:
   assumes h: "sorted_wrt le ys"
   shows "sorted_wrt le (insert le x ys)"
   using h
@@ -299,13 +311,97 @@ next
   qed
 qed
 
-lemma isort_sorted: "sorted_wrt le (isort le ls)"
+lemma isort_sorted_sorted: "sorted_wrt le (isort le ls)"
 proof (induct ls)
   case Nil
   show ?case by simp
 next
   case (Cons x xs)
-  show ?case using Cons(1) Cons by (simp add: sorted_insert)
+  show ?case using Cons(1) Cons by (simp add: sorted_insert_sorted)
+qed
+
+text \<open>OBLIGATION \<open>sorted_insert\<close>, spelled out: insertion into a sorted list
+  stays sorted, and it changes exactly one line's occurrence count (the inserted
+  one), so nothing is lost and nothing is duplicated. Adjacent-free is NOT part
+  of this and cannot be: plain sort keeps duplicates, and `[a,b,a]` sorts to
+  `[a,a,b]`, which has equal neighbours. Adjacent-free is the `sort -u` value's
+  property, and is proved for `drop_runs` below.\<close>
+
+lemma count_of_insert:
+  "count_of w (insert le x ys) =
+     (if w = x then Suc (count_of w ys) else count_of w ys)"
+proof (induct ys)
+  case Nil
+  then show ?case by simp
+next
+  case (Cons y ys)
+  note ih = Cons(1)
+  show ?case
+  proof (cases "le x y")
+    case True
+    then show ?thesis by simp
+  next
+    case False
+    have step: "count_of w (insert le x (y # ys)) =
+          (if w = y then Suc (count_of w (insert le x ys)) else count_of w (insert le x ys))"
+      using False by simp
+    show ?thesis using step ih by (cases "w = x"; cases "w = y") simp_all
+  qed
+qed
+
+theorem sorted_insert:
+  assumes hys: "sorted_wrt le ys"
+  shows "sorted_wrt le (insert le x ys) \<and>
+     (\<forall>w. count_of w (insert le x ys) =
+            (if w = x then Suc (count_of w ys) else count_of w ys)) \<and>
+     length (insert le x ys) = Suc (length ys)"
+proof (intro conjI)
+  show "sorted_wrt le (insert le x ys)" using hys by (rule sorted_insert_sorted)
+  show "\<forall>w. count_of w (insert le x ys) =
+            (if w = x then Suc (count_of w ys) else count_of w ys)"
+  proof (rule allI)
+    fix w
+    show "count_of w (insert le x ys) =
+          (if w = x then Suc (count_of w ys) else count_of w ys)"
+      by (rule count_of_insert)
+  qed
+  show "length (insert le x ys) = Suc (length ys)" by (rule insert_length)
+qed
+
+text \<open>OBLIGATION \<open>isort_sorted\<close>, spelled out: the insertion sort's output is
+  sorted, every line's occurrence count is unchanged (no loss, no duplication),
+  and the length is unchanged. The element SET follows too (`set_isort`).\<close>
+
+lemma count_of_isort: "\<forall>w. count_of w (isort le ls) = count_of w ls"
+proof (induct ls)
+  case Nil
+  then show ?case by simp
+next
+  case (Cons x xs)
+  show ?case
+  proof (intro allI)
+    fix w
+    have step1: "count_of w (isort le (x # xs)) = count_of w (insert le x (isort le xs))"
+      by simp
+    have step2: "count_of w (insert le x (isort le xs)) =
+          (if w = x then Suc (count_of w (isort le xs)) else count_of w (isort le xs))"
+      by (rule count_of_insert)
+    have step3: "(if w = x then Suc (count_of w (isort le xs)) else count_of w (isort le xs)) =
+          (if w = x then Suc (count_of w xs) else count_of w xs)"
+      using Cons(1) by simp
+    show "count_of w (isort le (x # xs)) = count_of w (x # xs)"
+      using step1 step2 step3 by simp
+  qed
+qed
+
+theorem isort_sorted:
+  "sorted_wrt le (isort le ls) \<and>
+   (\<forall>w. count_of w (isort le ls) = count_of w ls) \<and>
+   length (isort le ls) = length ls"
+proof (intro conjI)
+  show "sorted_wrt le (isort le ls)" by (rule isort_sorted_sorted)
+  show "\<forall>w. count_of w (isort le ls) = count_of w ls" by (rule count_of_isort)
+  show "length (isort le ls) = length ls" by (rule isort_length)
 qed
 
 text \<open>Re-sorting a sorted list is the identity. This is what makes the
@@ -829,7 +925,7 @@ text \<open>THE COMPOSITION: `sort -u` is `uniq` over `sort`. A sorted list's eq
   of the two nodes rather than a third node.\<close>
 
 theorem sort_u_sorted: "sorted_wrt le (drop_runs (isort le ls))"
-  by (rule drop_runs_sorted) (rule isort_sorted)
+  by (rule drop_runs_sorted) (rule conjunct1[OF isort_sorted])
 
 theorem sort_u_adj_free: "adj_free (drop_runs (isort le ls))"
   by (rule drop_runs_adj_free)
@@ -875,6 +971,75 @@ proof (intro conjI)
   show "sorted_wrt le (drop_runs (isort le ls))" by (rule sort_u_sorted)
   show "adj_free (drop_runs (isort le ls))" by (rule sort_u_adj_free)
   show "set (drop_runs (isort le ls)) \<subseteq> set ls" by (rule sort_u_set)
+qed
+
+
+text \<open>Adjacent-free, in the syntax that says "no two equal neighbours" without
+  a recursive predicate: `drop_runs_no_adjacent_eq` is the OBLIGATION, and
+  `adj_free` is the same fact in the shape the earlier proofs use.\<close>
+
+text \<open>The pair can sit ANYWHERE, not just at the head: the head-only form
+  `\<nexists>x y zs. xs = x # y # zs \<and> x = y` is weaker than adjacent-free
+  (it tests one pair), so the statement below quantifies over a prefix.\<close>
+
+lemma adj_free_imp_nth:
+  "adj_free xs \<Longrightarrow> Suc i < length xs \<Longrightarrow> xs ! i \<noteq> xs ! Suc i"
+proof (induct xs arbitrary: i)
+  case Nil
+  then show ?case by simp
+next
+  case (Cons a xs)
+  note IH = Cons(1)
+  note hAdj = Cons(2)
+  note hLen = Cons(3)
+  show ?case
+  proof (cases xs)
+    case Nil
+    then show ?thesis using hLen by simp
+  next
+    case (Cons b bs)
+    note tail = this
+    show ?thesis
+    proof (cases i)
+      case 0
+      with hAdj tail show ?thesis by simp
+    next
+      case (Suc j)
+      have ha: "adj_free xs" using hAdj tail by simp
+      have hl: "Suc j < length xs" using hLen Suc by simp
+      have hres: "xs ! j \<noteq> xs ! Suc j" using IH[OF ha hl] .
+      show ?thesis using hres tail Suc by simp
+    qed
+  qed
+qed
+
+theorem drop_runs_no_adjacent_eq:
+  "\<And>i. Suc i < length (drop_runs ls) \<Longrightarrow>
+      drop_runs ls ! i \<noteq> drop_runs ls ! Suc i"
+  by (rule adj_free_imp_nth[OF drop_runs_adj_free])
+
+text \<open>OBLIGATION (the composition): `sort -u` is `uniq` over `sort`, stated as
+  the equation between the collapse of the sort and the collapse of that
+  collapse — collapsing twice is collapsing once — together with the fact that
+  the collapse is already sorted, so re-sorting it changes nothing. Both halves
+  are what makes the multi-node lowering sound rather than a third node.\<close>
+
+theorem sort_u_is_collapse_of_collapse:
+  "drop_runs (isort le ls) = drop_runs (drop_runs (isort le ls))"
+  by (rule drop_runs_idem[symmetric])
+
+theorem sort_u_composition:
+  "drop_runs (isort le ls) = drop_runs (drop_runs (isort le ls)) \<and>
+   drop_runs (isort le ls) = isort le (drop_runs (isort le ls)) \<and>
+   sorted_wrt le (drop_runs (isort le ls)) \<and>
+   adj_free (drop_runs (isort le ls))"
+proof (intro conjI)
+  show "drop_runs (isort le ls) = drop_runs (drop_runs (isort le ls))"
+    by (rule sort_u_is_collapse_of_collapse)
+  show "drop_runs (isort le ls) = isort le (drop_runs (isort le ls))"
+    by (rule sort_u_is_uniq_of_sort)
+  show "sorted_wrt le (drop_runs (isort le ls))" by (rule sort_u_sorted)
+  show "adj_free (drop_runs (isort le ls))" by (rule sort_u_adj_free)
 qed
 
 

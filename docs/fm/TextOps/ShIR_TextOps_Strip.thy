@@ -136,9 +136,28 @@ lemma lead_nl_count_cons [simp]:
 
 text \<open>One more defining fact about the reversal, which is where the count
   meets the function: stripping the leading run of `u` KEEPS a suffix of `u`,
-  of length `length u - lead_nl_count u`. (The open target that used to be
-  called `rev_drop_last_nl_prefix` is this equation — the name was about the
-  node keeping a PREFIX of its input, which is `newline_strip_prefix` below.)\<close>
+  of length `length u - lead_nl_count u` — i.e. it is exactly a `drop`. This is
+  the take/drop shape the old target `rev_drop_last_nl_prefix` was reaching for;
+  the statement below is `rev_drop_last_nl_is_a_drop`, and the node-level prefix
+  equation is `rev_drop_last_nl_prefix` at the end of this file. Both are
+  proved.\<close>
+
+lemma rev_drop_last_nl_is_a_drop:
+  "rev_drop_last_nl u = drop (lead_nl_count u) u"
+proof (induct u)
+  case Nil
+  then show ?case by simp
+next
+  case (Cons a u)
+  show ?case
+  proof (cases "a = 10")
+    case True
+    then show ?thesis using Cons by simp
+  next
+    case False
+    then show ?thesis by simp
+  qed
+qed
 
 lemma rev_drop_last_nl_length:
   "length (rev_drop_last_nl u) = length u - lead_nl_count u"
@@ -326,6 +345,15 @@ proof -
     show "\<forall>c \<in> set (drop ?k s). c = 10" by (rule all_nl)
   qed
 qed
+
+text \<open>The old target name, discharged: `rev_drop_last_nl_prefix` is the node's
+  prefix equation — the kept text is a PREFIX of the byte string, namely a
+  `take` — and it is the first conjunct of `newline_strip_sound` below. Stated
+  under its own name so the target is visibly closed rather than renamed away.\<close>
+
+theorem rev_drop_last_nl_prefix:
+  "newline_strip s = take (length s - lead_nl_count (rev s)) s"
+  by (rule newline_strip_take)
 
 theorem newline_strip_sound:
   "newline_strip s = take (length s - lead_nl_count (rev s)) s \<and>
