@@ -17,4 +17,8 @@ kind expr
 # storage_class str_bounded
 field keys: exprs
 field values: exprs
-spec: none (unstated)
+spec: none (unstated: MapLiteral is a dictionary literal over parallel key/value
+# lists, NOT a per-character map — the char-map laws (length, composition, identity)
+# do not apply to it. Its own obligation needs an association-list key model plus the
+# host's key-stringification rule, which this session does not model, so no law is
+# approximated here.)

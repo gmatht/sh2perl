@@ -3,6 +3,17 @@
 #
 # Backends: Perl substr(), JS slice(), C pointer arithmetic, Rust chars().skip()
 # Fallback: sh2.charExtract(text, positions, byte_mode)
+#
+# ShIR_TextOps_Strings proves `char_extract_sound`: one contiguous start/length
+# window over BYTES — the value is `take len (drop start s)`, never longer than
+# `len` or than the input, empty for a zero length or an offset at/past the end,
+# contiguous in the input (`s = r @ window @ z`) and invented from nothing
+# (`set` inclusion). OUT OF MODEL: (1) character semantics — `cut -c` counts
+# CHARACTERS, so with multi-byte UTF-8 the byte window differs and can return a
+# bare continuation byte (`[195, 169, 97]` at 1/1 is `[169]`); `byte_mode = false`
+# therefore needs a character-aware arm and is not promised by this model.
+# (2) `cut`'s -d, comma lists and open ranges are several nodes or a lowering
+# concern, not this one window. (3) negative offsets.
 
 node CharExtract
 tag "CharExtract"
@@ -10,4 +21,4 @@ kind expr
 # storage_class str_bounded
 field text: expr
 field byte_mode: bool
-spec: none (unstated)
+spec: TextOps#char_extract_sound

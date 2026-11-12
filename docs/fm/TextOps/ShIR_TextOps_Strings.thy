@@ -1755,4 +1755,109 @@ proof (intro conjI)
 qed
 
 
+section \<open>CharExtract: the `cut -c` window, in bytes\<close>
+
+text \<open>`CharExtract` is the positional node behind `cut -cN-M` / `cut -bN-M`
+  (and `${v:N:M}`-shaped windows). The node's window is modelled as start/length
+  over BYTES, which is what `cut -b` means and what `byte_mode = true` selects, and
+  it is the reading this session can decide: the value is the slice of the input
+  at that offset, so it is contiguous, it never invents a byte, and a window past
+  the end is empty. The laws below are the ones a renderer may rely on.
+
+  WHAT IS OUT OF MODEL, precisely. (1) `cut -c` counts CHARACTERS where this model
+  counts bytes: on multi-byte UTF-8 the two windows differ, and the byte window can
+  return a continuation byte with no lead byte (witness `[195, 169, 97]` at offset 1,
+  length 1 is `[169]`), which is not a character at all. A renderer is faithful to
+  `byte_mode = false` only with a character-aware arm, so the node documents the
+  flag rather than promising both. (2) `cut`'s FIELD and RANGE syntax — `-d`,
+  comma-separated lists (`-c1,3,5`), open ranges (`-c3-`) and disjoint selections —
+  belongs to the lowering, not to the node: this node is ONE contiguous window, and
+  a selection of several disjoint windows is several nodes. (3) Negative offsets
+  are not modelled either.\\<close>
+
+definition char_extract :: "bytes \<Rightarrow> nat \<Rightarrow> nat \<Rightarrow> bytes" where
+  "char_extract s start len = substr_extract s start len"
+
+lemma char_extract_is_window: "char_extract s start len = take len (drop start s)"
+  unfolding char_extract_def by (rule substr_extract_is_take_drop)
+
+lemma char_extract_contiguous: "\<exists>r z. s = r @ char_extract s start len @ z"
+proof -
+  have win: "char_extract s start len = take len (drop start s)"
+    by (rule char_extract_is_window)
+  have dflat: "drop len (drop start s) = drop (len + start) s"
+    by (simp add: drop_drop)
+  have flat: "drop (len + start) s = drop len (drop start s)"
+    using dflat by (rule sym)
+  have mid: "take len (drop start s) @ drop (len + start) s = drop start s"
+  proof -
+    have base: "take len (drop start s) @ drop len (drop start s) = drop start s"
+      by (rule append_take_drop_id)
+    show ?thesis
+    proof (subst flat)
+      show "take len (drop start s) @ drop len (drop start s) = drop start s"
+        by (rule base)
+    qed
+  qed
+  have eq: "s = take start s @ take len (drop start s) @ drop (len + start) s"
+    by (simp add: mid)
+  show ?thesis
+  proof (rule exI[where x = "take start s"], rule exI[where x = "drop (len + start) s"])
+    show "s = take start s @ char_extract s start len @ drop (len + start) s"
+    proof (subst char_extract_is_window)
+      show "s = take start s @ take len (drop start s) @ drop (len + start) s"
+        by (rule eq)
+    qed
+  qed
+qed
+
+lemma char_extract_subset: "set (char_extract s start len) \<subseteq> set s"
+proof -
+  have s1: "set (take len (drop start s)) \<subseteq> set (drop start s)"
+    by (rule set_take_subset)
+  have s2: "set (drop start s) \<subseteq> set s" by (rule set_drop_subset)
+  show ?thesis
+  proof (subst char_extract_is_window)
+    show "set (take len (drop start s)) \<subseteq> set s"
+      using s1 s2 by (rule subset_trans)
+  qed
+qed
+
+lemma char_extract_shift:
+  "char_extract s start len = char_extract (drop start s) 0 len"
+  by (simp add: char_extract_is_window)
+
+theorem char_extract_sound:
+  "char_extract s start len = take len (drop start s) \<and>
+   length (char_extract s start len) \<le> len \<and>
+   length (char_extract s start len) \<le> length s \<and>
+   (len = 0 \<longrightarrow> char_extract s start len = []) \<and>
+   (length s \<le> start \<longrightarrow> char_extract s start len = []) \<and>
+   (\<exists>r z. s = r @ char_extract s start len @ z) \<and>
+   set (char_extract s start len) \<subseteq> set s"
+proof (intro conjI)
+  show "char_extract s start len = take len (drop start s)"
+    by (rule char_extract_is_window)
+  show "length (char_extract s start len) \<le> len" by (simp add: char_extract_is_window)
+  show "length (char_extract s start len) \<le> length s" by (simp add: char_extract_is_window)
+  show "len = 0 \<longrightarrow> char_extract s start len = []" by (simp add: char_extract_is_window)
+  show "length s \<le> start \<longrightarrow> char_extract s start len = []"
+    by (simp add: char_extract_is_window)
+  show "\<exists>r z. s = r @ char_extract s start len @ z" by (rule char_extract_contiguous)
+  show "set (char_extract s start len) \<subseteq> set s" by (rule char_extract_subset)
+qed
+
+lemma char_extract_witness:
+  "char_extract [97, 98, 99, 100, 101] 1 3 = [98, 99, 100] \<and>
+   char_extract [97, 98, 99] 2 5 = [99] \<and>
+   char_extract [97, 98, 99] 9 2 = [] \<and>
+   char_extract [97, 98, 99] 1 0 = []"
+  by eval
+
+lemma char_extract_utf8_witness:
+  "char_extract [195, 169, 97] 1 1 = [169] \<and>
+   char_extract [195, 169, 97] 0 2 = [195, 169]"
+  by eval
+
+
 end
