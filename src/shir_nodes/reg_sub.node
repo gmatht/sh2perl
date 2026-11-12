@@ -13,4 +13,33 @@ field pattern: string
 field replacement: string
 field global: bool
 field line_mode: bool
-spec: none (unstated)
+# Spec: TextOps#reg_sub_sound (docs/fm/TextOps/ShIR_TextOps_Strings.thy, section
+# "RegSub: the substitution engine, non-global and global"). Stated over an ABSTRACT
+# matcher (leftmost match reported as a (prefix, matched, suffix) decomposition, or
+# None) plus an ABSTRACT replacement R of the matched text, which is where sed's
+# replacement language lives. Proved, for an arbitrary matcher and replacement:
+# non-global is the one-step fold (unmatched prefix, R of the match, suffix untouched)
+# and rs_all at fuel 1 is exactly it; global is the fuel-indexed fold over CONSECUTIVE
+# decompositions of the successive suffixes, with fuel 0 the identity; an unmatched
+# subject comes back byte-identical at any fuel, both arms; if the matcher reports
+# genuine decompositions and R is the identity the whole global fold is the identity
+# (the engine invents and loses nothing); and for a subject with no LF — exactly the
+# class the lowering admits — the per-line fold equals the whole-subject substitution.
+#
+# TWO TREE FACTS the spec is shaped around, both stated rather than assumed: the
+# lowering builds this node only for a provably SINGLE-LINE literal
+# (transforms/text_ops.rs, `single_line_literal`) because a whole-string application
+# would otherwise match across newlines; and `line_mode` is declared here and set by
+# the proposed lowering in the backend worktrees, but no renderer in this tree reads
+# it, so the per-line arm is modelled at the abstraction level and is not claimed to be
+# what any backend emits today.
+#
+# NOT PROMISED (stated, not assumed): greediness, alternation preference and search
+# order (the matcher hands back the leftmost match, and an engine that chose another is
+# not caught); the regex DIALECT (ERE/RE2 classes, anchors, quantifiers, groups), case
+# folding, locale and Unicode rules; the replacement SYNTAX itself (`&`, \N, \&, \n)
+# — R abstracts it, with `expand` in the Substitute theory as the concrete expansion;
+# the EMPTY-MATCH advance rule, which belongs to the engine's own find() after a match;
+# the source's TRAILING NEWLINE (the lowering's trailing_newline guard owns that); and
+# argument evaluation order, side effects, and anything beyond bytes.
+spec: TextOps#reg_sub_sound

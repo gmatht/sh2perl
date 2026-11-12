@@ -201,7 +201,7 @@ three that did not — `newline_strip_sound`, `uniq_lines_sound`,
 (`sort_lines_sound`). `harness/check-node-specs.pl` (workspace `harness/`) makes
 "no dangling spec" a machine check: it collects every `theorem`/`lemma`/
 `definition`/`fun` under `docs/fm` and fails on a `spec:` naming one that does
-not exist. It reports 34 resolved, 14 unstated, 0 pending, 0 dangling.
+not exist. It reports 35 resolved, 13 unstated, 0 pending, 0 dangling.
 
 - `newline_strip_sound` (`ShIR_TextOps_Strip`): the node is the trailing-run
   removal, with the run length and the prefix equation.
@@ -236,9 +236,9 @@ deliberate no-obligation form. `--map` prints the node→theorem table below and
 `--selftest` runs the five negative controls (real theorem, definition, dangling
 name, wrong session prefix, unbuilt theory).
 
-Current inventory: **34 resolved, 14 unstated, 0 pending, 0 errors**.
+Current inventory: **35 resolved, 13 unstated, 0 pending, 0 errors**.
 
-The 34 resolved specs (32 distinct theorems; `lowered_wc_sound` covers three
+The 35 resolved specs (33 distinct theorems; `lowered_wc_sound` covers three
 nodes and `field_extract`, `split`, `substitute`, `uniq_lines` and
 `cutset_trim` cite two each):
 
@@ -259,6 +259,7 @@ nodes and `field_extract`, `split`, `substitute`, `uniq_lines` and
 | `path_name` | `path_name_sound` |
 | `newline_strip` | `newline_strip_sound` |
 | `reg_count` | `lowered_wc_sound` |
+| `reg_sub` | `reg_sub_sound` |
 | `regexp_find` | `regexp_find_sound` |
 | `repeat_str` | `repeat_str_sound` |
 | `sort_lines` | `sort_lines_sound` |
@@ -339,9 +340,29 @@ subject (`s = p @ result @ q`), which is what makes a `take`/`drop` rendering so
 Leftmost-ness itself is the abstraction's premise, stated as scope rather than
 re-proved, along with the dialect, capture groups and evaluation order.
 
-`reg_sub` remains unstated on purpose: its obligation is the substitution ENGINE plus
-the per-line and global folds, which is `ShIR_TextOps_Substitute`'s subject; wiring it
-to a theorem that only mentions one rendering would say less than the node promises.
+### `reg_sub`: the substitution engine, non-global and global (2026-11-13)
+
+Two facts in the tree decide the shape of this spec. The lowering builds the node only
+for a provably SINGLE-LINE literal (`single_line_literal` in `transforms/text_ops.rs`),
+because a whole-string application would otherwise match across newlines — a different
+function; and `line_mode` is declared on the node and set by the proposed lowering in
+the backend worktrees, but no renderer in this tree reads it. So the statement is:
+an ABSTRACT matcher reporting a leftmost match as `(prefix, matched, suffix)` (or
+`None`), an ABSTRACT replacement `R` of the matched text (where sed's `&`/`\N`
+language lives), `rs_first` for the non-global arm, `rs_all` for the fuel-indexed
+global fold, and `per_line`/`lines_of`/`join_lf` for the line arm.
+
+`reg_sub_sound` proves: non-global is the one-step fold and `rs_all … 1` is exactly it;
+global folds over consecutive decompositions of the successive suffixes, fuel 0 being
+the identity; an unmatched subject is returned byte-identical at any fuel in both arms;
+a genuine matcher with the identity replacement makes the whole fold the identity; and
+on a subject with no LF the per-line fold equals the whole-subject substitution, so the
+two arms cannot disagree on the input class the lowering admits. Witnesses: a global
+substitution over three matches, the non-global single substitution, a no-match subject,
+a deletion (empty replacement) and a per-line case. Scope notes in the theory and the
+node: greediness/alternation/search order, the regex dialect, the replacement syntax
+(abstracted as `R`; `expand` is the concrete one), the engine-owned empty-match advance,
+the source trailing newline, and argument evaluation.
 
 ### The two obligations that were thinner than their names (2026-11-13)
 

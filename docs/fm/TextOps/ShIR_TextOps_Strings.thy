@@ -2585,4 +2585,175 @@ lemma regexp_find_witness:
   by simp
 
 
+section \<open>RegSub: the substitution engine, non-global and global\<close>
+
+text \<open>`RegSub{text, pattern, replacement, global, line_mode}` is `sed 's/p/r/'`:
+  the renderer (`src/render_ext_expr/handlers/all_nodes.rs`, arm `reg_sub`) emits one
+  substitution per line-shaped call — Perl `$t =~ s/p/r/` with the `g` modifier when
+  `global`, JS `replace` with `"g"`, Python `re.sub(..., count=1|0)`, and Java through
+  the `shRegSub`/`shRegSubAll` helper that expands sed's `&` and `\\N` itself.
+
+  TWO FACTS ABOUT THE TREE DECIDE WHAT CAN BE STATED HONESTLY.
+  (1) The lowering only builds this node for a subject that is a provably SINGLE-LINE
+  literal (`transforms/text_ops.rs`: `single_line_literal` requires a string literal
+  with no LF, because the node is a whole-string application and would otherwise match
+  across newlines — a different function). A variable or multi-line subject falls back
+  to the original command.
+  (2) `line_mode` is DECLARED in the node and set by the proposed lowering in the
+  backend worktrees, but NO renderer in this tree reads it. So the per-line arm is
+  modelled at the abstraction level below and is not claimed to be what any backend
+  emits today; the whole-text arms are.
+
+  The model is therefore: an abstract matcher @{term m} reporting a leftmost match as a
+  DECOMPOSITION `(prefix, matched, suffix)` or `None`, plus an abstract replacement
+  @{term R} applied to the matched text. `R` is where sed's replacement LANGUAGE lives
+  (`&` the match, `\N` a group), so the concrete syntax is the abstraction's contract
+  rather than a dialect's; the per-line arm is `per_line` = map over `lines_of` and
+  `join_lf`, the split keeping empty fields and the join re-inserting exactly one LF
+  between lines.
+
+  WHAT IS PROVED (each below, for an arbitrary matcher and replacement):
+  (1) non-global is the one-step fold — the unmatched prefix, then `R` of the match,
+  then the suffix untouched — and `rs_all ... 1` is exactly that;
+  (2) global is the fuel-indexed fold over CONSECUTIVE decompositions of the successive
+  suffixes, starting from 0 fuel at the identity;
+  (3) a subject the matcher cannot match comes back byte-identical, non-global and
+  global, at any fuel;
+  (4) if the matcher reports genuine decompositions and `R` is the identity, the whole
+  global fold is the identity — the engine invents and loses nothing;
+  (5) for a subject with no LF (exactly the class the lowering builds the node for) the per-line
+  fold equals the whole-subject substitution, so the two arms cannot disagree there.
+
+  NOT PROMISED, precisely. (a) Greediness, alternation preference and search order —
+  the matcher hands back the leftmost match, and an engine that chose a different one
+  is not caught. (b) The regex DIALECT (ERE/RE2 classes, anchors, quantifiers,
+  groups), case folding, locale and Unicode rules: `pattern` is a string the host
+  engine interprets. (c) The replacement syntax itself (`&`, `\N`, `\\&`, `\\n`):
+  `R` abstracts it, so a concrete expansion is not proved here — the Substitute theory
+  is where `expand` lives. (d) Empty-match advance: the emitted code advances by the
+  engine's own `find()` after a match, so a zero-length match's advance rule belongs to
+  the engine; the fold here consumes whatever suffix the matcher reports. (e) The
+  TRAILING NEWLINE of the source is the text's own business (the lowering's
+  `trailing_newline` guard); the model takes the bytes it is given. (f) Argument
+  evaluation order and side effects of `text`, and bytes-only encoding.\<close>
+
+type_synonym rmatcher = "bytes \<Rightarrow> (bytes \<times> bytes \<times> bytes) option"
+
+definition rs_first :: "rmatcher \<Rightarrow> (bytes \<Rightarrow> bytes) \<Rightarrow> bytes \<Rightarrow> bytes" where
+  "rs_first m R s \<equiv> (case m s of None \<Rightarrow> s | Some (p, v, q) \<Rightarrow> p @ R v @ q)"
+
+fun rs_all :: "rmatcher \<Rightarrow> (bytes \<Rightarrow> bytes) \<Rightarrow> nat \<Rightarrow> bytes \<Rightarrow> bytes" where
+  "rs_all m R 0 s = s"
+| "rs_all m R (Suc k) s =
+     (case m s of None \<Rightarrow> s | Some (p, v, q) \<Rightarrow> p @ R v @ rs_all m R k q)"
+
+lemma rs_first_miss: "m s = None \<Longrightarrow> rs_first m R s = s"
+  by (simp add: rs_first_def)
+
+lemma rs_first_hit: "m s = Some (p, v, q) \<Longrightarrow> rs_first m R s = p @ R v @ q"
+  by (simp add: rs_first_def)
+
+lemma rs_all_miss: "m s = None \<Longrightarrow> rs_all m R k s = s"
+  by (induct k) (simp_all split: prod.split)
+
+lemma rs_all_one: "rs_all m R (Suc 0) s = rs_first m R s"
+  by (cases "m s") (auto split: prod.split simp: rs_first_def)
+
+lemma rs_all_identity:
+  assumes gen: "\<And>t p v q. m t = Some (p, v, q) \<Longrightarrow> t = p @ v @ q"
+    and idR: "\<And>v. R v = v"
+  shows "rs_all m R k s = s"
+proof (induct k arbitrary: s)
+  case 0
+  then show ?case by simp
+next
+  case (Suc k)
+  show ?case
+  proof (cases "m s")
+    case None
+    then show ?thesis by (simp add: rs_all_miss)
+  next
+    case (Some z)
+    then obtain p v q where z: "z = (p, v, q)"
+      by (cases z) (auto split: prod.split)
+    have sz: "s = p @ v @ q" using Some z by (simp add: gen)
+    have ih: "rs_all m R k q = q" using Suc.hyps Some z by simp
+    have rv: "R v = v" using idR by simp
+    show ?thesis using Some z sz ih rv by simp
+  qed
+qed
+
+fun split_lf :: "bytes \<Rightarrow> bytes \<Rightarrow> bytes list \<Rightarrow> bytes list" where
+  "split_lf [] cur acc = rev (cur # acc)"
+| "split_lf (c # cs) cur acc =
+     (if c = nl then split_lf cs [] (cur # acc) else split_lf cs (cur @ [c]) acc)"
+
+definition lines_of :: "bytes \<Rightarrow> bytes list" where
+  "lines_of s \<equiv> split_lf s [] []"
+
+lemma split_lf_no_lf:
+  "(\<And>c. c \<in> set s \<Longrightarrow> c \<noteq> nl) \<Longrightarrow> split_lf s cur acc = rev acc @ [cur @ s]"
+  by (induct s arbitrary: cur acc) (simp_all add: append_assoc)
+
+lemma lines_of_no_lf:
+  "(\<And>c. c \<in> set s \<Longrightarrow> c \<noteq> nl) \<Longrightarrow> lines_of s = [s]"
+  by (simp add: lines_of_def split_lf_no_lf)
+
+fun join_lf :: "bytes list \<Rightarrow> bytes" where
+  "join_lf [] = []"
+| "join_lf (l # r) = l @ (case r of [] \<Rightarrow> [] | _ \<Rightarrow> nl # join_lf r)"
+
+lemma join_lf_single [simp]: "join_lf [l] = l"
+  by simp
+
+definition per_line :: "(bytes \<Rightarrow> bytes) \<Rightarrow> bytes \<Rightarrow> bytes" where
+  "per_line f s \<equiv> join_lf (map f (lines_of s))"
+
+lemma per_line_single:
+  "(\<And>c. c \<in> set s \<Longrightarrow> c \<noteq> nl) \<Longrightarrow> per_line f s = f s"
+  by (simp add: per_line_def lines_of_no_lf)
+
+theorem reg_sub_sound:
+  "rs_first m R s = (case m s of None \<Rightarrow> s | Some (p, v, q) \<Rightarrow> p @ R v @ q) \<and>
+   rs_all m R 0 s = s \<and>
+   rs_all m R (Suc k) s =
+     (case m s of None \<Rightarrow> s | Some (p, v, q) \<Rightarrow> p @ R v @ rs_all m R k q) \<and>
+   (m s = None \<longrightarrow> rs_first m R s = s \<and> rs_all m R k s = s) \<and>
+   rs_all m R (Suc 0) s = rs_first m R s \<and>
+   ((\<forall>t p v q. m t = Some (p, v, q) \<longrightarrow> t = p @ v @ q) \<and> (\<forall>v. R v = v)
+      \<longrightarrow> rs_all m R k s = s) \<and>
+   ((\<forall>c \<in> set s. c \<noteq> nl) \<longrightarrow> per_line f s = f s)"
+proof (intro conjI)
+  show "rs_first m R s = (case m s of None \<Rightarrow> s | Some (p, v, q) \<Rightarrow> p @ R v @ q)"
+    by (simp add: rs_first_def)
+  show "rs_all m R 0 s = s" by simp
+  show "rs_all m R (Suc k) s =
+          (case m s of None \<Rightarrow> s | Some (p, v, q) \<Rightarrow> p @ R v @ rs_all m R k q)"
+    by (cases "m s") (auto split: prod.split)
+  show "m s = None \<longrightarrow> rs_first m R s = s \<and> rs_all m R k s = s"
+    by (auto intro: rs_first_miss rs_all_miss)
+  show "rs_all m R (Suc 0) s = rs_first m R s" by (rule rs_all_one)
+  show "(\<forall>t p v q. m t = Some (p, v, q) \<longrightarrow> t = p @ v @ q) \<and> (\<forall>v. R v = v)
+          \<longrightarrow> rs_all m R k s = s"
+    by (auto intro: rs_all_identity)
+  show "(\<forall>c \<in> set s. c \<noteq> nl) \<longrightarrow> per_line f s = f s"
+    by (auto intro!: per_line_single)
+qed
+
+lemma reg_sub_witness:
+  "rs_all (\<lambda>s. case s of [] \<Rightarrow> None | (c # r) \<Rightarrow> Some ([], [c], r)) (\<lambda>v. [118]) 3 [97, 98, 99]
+     = [118, 118, 118] \<and>
+   rs_all (\<lambda>s. case s of [] \<Rightarrow> None | (c # r) \<Rightarrow> Some ([], [c], r)) (\<lambda>v. [118]) 1 [97, 98, 99]
+     = [118, 98, 99] \<and>
+   rs_first (\<lambda>s. None) (\<lambda>v. [118]) [97, 98] = [97, 98] \<and>
+   rs_all (\<lambda>s. None) (\<lambda>v. [118]) 5 [97, 98] = [97, 98] \<and>
+   rs_all (\<lambda>s. case s of [] \<Rightarrow> None | (c # r) \<Rightarrow> Some ([], [c], r)) (\<lambda>v. []) 2 [97, 98] = []"
+  by eval
+
+lemma reg_sub_line_witness:
+  "per_line (\<lambda>s. s @ [33]) [97, 98] = [97, 98, 33] \<and>
+   lines_of [97, 98] = [[97, 98]]"
+  by eval
+
+
 end
