@@ -591,6 +591,27 @@ proof -
   finally show ?thesis .
 qed
 
+lemma cut_first_last_agree:
+  "find_first s n = rfind_last s n \<Longrightarrow>
+     cut_head_first s n = cut_head_last s n \<and> cut_tail_first s n = cut_tail_last s n"
+proof -
+  assume h: "find_first s n = rfind_last s n"
+  show ?thesis
+  proof (cases "find_first s n")
+    case None
+    have "rfind_last s n = None" using h None by simp
+    then show ?thesis
+      unfolding cut_head_first_def cut_head_last_def cut_tail_first_def cut_tail_last_def
+      using None by simp
+  next
+    case (Some i)
+    have r: "rfind_last s n = Some i" using h Some by simp
+    then show ?thesis
+      unfolding cut_head_first_def cut_head_last_def cut_tail_first_def cut_tail_last_def
+      using Some by simp
+  qed
+qed
+
 text \<open>The four single-star identities, on a text where the literal repeats:
   `first` and `!first` give different answers, so a fold that dropped the flag
   would be wrong. These evaluate the node, they are not restatements.\<close>
@@ -626,7 +647,9 @@ theorem affix_strip_fold_sound:
   "(is_magic_free n \<longrightarrow> cut_at False True s n = cut_tail_first s n) \<and>
    (take (length n) s = n \<longrightarrow> cut_tail_first s n = affix_strip_node s n True) \<and>
    (cut_tail_first [97, 98, 97, 98] [97, 98] = [97, 98]) \<and>
-   (cut_tail_last [97, 98, 97, 98] [97, 98] = [])"
+   (cut_tail_last [97, 98, 97, 98] [97, 98] = []) \<and>
+   (find_first s n = rfind_last s n \<longrightarrow>
+      cut_tail_first s n = cut_tail_last s n)"
 proof (intro conjI impI)
   show "is_magic_free n \<Longrightarrow> cut_at False True s n = cut_tail_first s n"
     unfolding cut_at_def by simp
@@ -634,7 +657,15 @@ proof (intro conjI impI)
     by (rule cut_tail_first_at_head)
   show "cut_tail_first [97, 98, 97, 98] [97, 98] = [97, 98]" by eval
   show "cut_tail_last [97, 98, 97, 98] [97, 98] = []" by eval
+  show "find_first s n = rfind_last s n \<Longrightarrow>
+        cut_tail_first s n = cut_tail_last s n"
+    by (rule cut_first_last_agree[THEN conjunct2])
 qed
+
+text \<open>The agreement conjunct is what makes the LAST side usable without a
+  second proof: where the two primitives coincide (`lit` occurs at most once),
+  `${v##lit*}` and `${v#*lit}` are the same function, so the fold's plain branch
+  and its star branch agree. Where they differ the witness above says so.\<close>
 
 text \<open>LIMITATION. The glob engine is not modelled: "the longest prefix
   matching `lit*`" is taken as "the suffix starting at the last occurrence of

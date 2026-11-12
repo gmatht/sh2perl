@@ -11,7 +11,7 @@ shIR. It is split into six theories that build as one session:
 | `ShIR_TextOps_Compose` | the composition nodes `Split` / `ArrayLen` / `FieldExtract`, the `ArrayLen(Split(...))` reading of `wc -w`, and `cut`'s delimiter split (which KEEPS empty fields). |
 | `ShIR_TextOps_Space` | each engine's measured `\s` class (`measure-space.sh` is the pin), the word count over an ARBITRARY class (`nwords_by`), and where the emitted word split diverges from `wc -w` — with proved witnesses and an ASCII-soundness result per engine. |
 | `ShIR_TextOps_Strings` | the string-algebra nodes `StringTrim` / `StringAffix` / `AffixStrip` over one generic run drop, and each renderer's measured TRIM class (`measure-trim.sh` is the pin) — the flag-blind arms, the four measured trim classes, and the Perl trailing-affix empty-pattern gap. |
-| `ShIR_TextOps_Cut` | the `CutAt` node: `find_first`/`rfind_last` as primitives (occurrence, no-match, leftmost/maximal), the four single-star cut forms with their no-match no-ops, the split identity, and `affix_strip_fold_sound` (the star branch is AffixStrip at a head literal, and `first` matters when the literal repeats). The glob engine itself is not modelled — that identification is stated, not proved. |
+| `ShIR_TextOps_Cut` | the `CutAt` node: `find_first`/`rfind_last` as primitives (occurrence, no-match, leftmost/maximal), the four single-star cut forms with their no-match no-ops, the split identity, and `affix_strip_fold_sound` (the star branch is AffixStrip at a head literal; `first` matters when the literal repeats, and `cut_first_last_agree` says the two primitives give the same cut whenever they coincide). The glob engine itself is not modelled — that identification is stated, not proved. |
 | `ShIR_TextOps_Cutset` | the `CutsetTrim` node: the trim class as DATA (`trim_by` at a membership test), the three-valued side field, idempotence per side, and the witnesses where a renderer's reading of the cutset diverges (Perl's bracket metacharacters need `\Q..\E`; Go/Rust take code points, the model is bytes). |
 | `ShIR_TextOps_Substitute` | the `Substitute` node: two fuel-bounded engines (`subst_all`, `subst_first`) over an abstract matcher — leftmost, non-overlapping, empty-match-advances-one-byte as the termination obligation, `&` as a function of the matched text. The regex syntax, the line split and `\N` are documented limitations. |
 
@@ -212,7 +212,9 @@ identity follows from glob semantics" is NOT proved: shortest-vs-longest match
 of `lit*` is taken as "first / last occurrence of the literal", and the fold's
 magic-free refusal is tracked as `is_magic_free` (no `*`, `?`, `[`, `\`)
 rather than as a glob semantics. `is_magic_free` rejects `a*` and accepts `ab`
-by `eval`. The empty literal is the case where both primitives answer index 0
+by `eval`. Both sides of the star branch are covered, not just `first`:
+`cut_first_last_agree` proves the cuts agree whenever `find_first` and
+`rfind_last` do, and the repeating-literal witness proves they need not. The empty literal is the case where both primitives answer index 0
 (bash's `${v#*}` is the identity), and that is what the definitions do.
 
 ## Box-health note (why the proofs look odd in places)
