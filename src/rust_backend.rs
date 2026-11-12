@@ -20507,7 +20507,12 @@ fn compute_local_vars(
             if us_writes {
                 need_mut.insert(name.clone());
             }
-            if first_is_write {
+            // Soundness: defer only when the FIRST mention is a top-level
+            // write of this scope. A store discovered inside a conditional
+            // operand, or inside an IrExpr::Arrow nested in a conditional,
+            // does not prove the binding is assigned on every path — deferring
+            // those emitted `let mut x: T;` read before any write (E0381).
+            if first_is_top_write {
                 let body: &[IrStmt] = match &scope {
                     Scope::Main => &prog.stmts,
                     Scope::Func(f) => prog
