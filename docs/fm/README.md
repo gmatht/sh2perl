@@ -11,6 +11,7 @@ shIR. It is split into six theories that build as one session:
 | `ShIR_TextOps_Compose` | the composition nodes `Split` / `ArrayLen` / `FieldExtract`, the `ArrayLen(Split(...))` reading of `wc -w`, and `cut`'s delimiter split (which KEEPS empty fields). |
 | `ShIR_TextOps_Space` | each engine's measured `\s` class (`measure-space.sh` is the pin), the word count over an ARBITRARY class (`nwords_by`), and where the emitted word split diverges from `wc -w` — with proved witnesses and an ASCII-soundness result per engine. |
 | `ShIR_TextOps_Strings` | the string-algebra nodes `StringTrim` / `StringAffix` / `AffixStrip` over one generic run drop, and each renderer's measured TRIM class (`measure-trim.sh` is the pin) — the flag-blind arms, the four measured trim classes, and the Perl trailing-affix empty-pattern gap. |
+| `ShIR_TextOps_Cut` | the `CutAt` node: `find_first`/`rfind_last` as primitives (occurrence, no-match, leftmost/maximal), the four single-star cut forms with their no-match no-ops, the split identity, and `affix_strip_fold_sound` (the star branch is AffixStrip at a head literal, and `first` matters when the literal repeats). The glob engine itself is not modelled — that identification is stated, not proved. |
 | `ShIR_TextOps_Cutset` | the `CutsetTrim` node: the trim class as DATA (`trim_by` at a membership test), the three-valued side field, idempotence per side, and the witnesses where a renderer's reading of the cutset diverges (Perl's bracket metacharacters need `\Q..\E`; Go/Rust take code points, the model is bytes). |
 | `ShIR_TextOps_Substitute` | the `Substitute` node: two fuel-bounded engines (`subst_all`, `subst_first`) over an abstract matcher — leftmost, non-overlapping, empty-match-advances-one-byte as the termination obligation, `&` as a function of the matched text. The regex syntax, the line split and `\N` are documented limitations. |
 
@@ -192,6 +193,27 @@ not exist. It reports 16 resolved, 29 unstated, 0 dangling.
   (`ShIR_TextOps_Cutset`) — the two new theories.
 - Wired: `StringTrim`, `StringAffix`, `AffixStrip` and `CutsetTrim` now cite
   their theorems instead of `none (unstated)`.
+
+### Closed: CutAt (2026-11-13)
+
+`cut_at.node` no longer says `spec: none (unstated)`. `ShIR_TextOps_Cut` proves
+the two primitives (`find_first`, `rfind_last`: a returned index is a real
+occurrence, `None` means no occurrence at any index, and the index is
+leftmost/maximal), the four cut forms `${v%%lit*}`, `${v%lit*}`, `${v#*lit}`,
+`${v##*lit}` as functions of those primitives with their no-match no-ops
+(`cut_at_sound`), the split identity (a successful cut divides the text into
+prefix, literal, remainder), and `affix_strip_fold_sound`: at a head literal
+the star branch IS the `AffixStrip` node, and on a repeating literal `first`
+must be carried (`cut_tail_first [a,b,a,b] [a,b] = [a,b]` while
+`cut_tail_last` gives `[]`) — so the flag is load-bearing, not decorative.
+
+Two of the node's own comments are now theorems, and one is a limitation. "Each
+identity follows from glob semantics" is NOT proved: shortest-vs-longest match
+of `lit*` is taken as "first / last occurrence of the literal", and the fold's
+magic-free refusal is tracked as `is_magic_free` (no `*`, `?`, `[`, `\`)
+rather than as a glob semantics. `is_magic_free` rejects `a*` and accepts `ab`
+by `eval`. The empty literal is the case where both primitives answer index 0
+(bash's `${v#*}` is the identity), and that is what the definitions do.
 
 ## Box-health note (why the proofs look odd in places)
 

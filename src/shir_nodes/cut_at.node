@@ -32,4 +32,4 @@ field text: expr
 field delim: string
 field head: bool
 field first: bool
-spec: none (unstated)
+spec: TextOps#cut_at_sound
