@@ -85,6 +85,8 @@ pub struct Render {
     need_unset: bool,
     /// fork-based capture of a COMPOUND `$( … )` body.
     need_fork_capture: bool,
+    /// `${a[@]:off:len}` array slicing (`__sh_aslice`).
+    need_aslice: bool,
     /// fork-based process substitution (`__sh_ps_spawn`).
     need_ps_spawn: bool,
     /// `$N` inside arithmetic (`__sh_pnum`).
@@ -2319,6 +2321,13 @@ impl Render {
                 if num > 0 {
                     let name = format!("__sh_p{num}");
                     if !self.written.contains(&name) {
+                        // KEEP the raw text: bash substitutes a positional
+                        // TEXTUALLY, so an unset `$1` leaves an empty operand.
+                        // That is a syntax error when it IS the expression
+                        // (`$(( $1 ))` → empty) but 0 when it has a neighbour
+                        // (`$(( $1 + 0 ))` → 0). Binding a number threw both
+                        // cases together (parse-dollar-in-arithmetic,
+                        // sync-loop-function-call regressed).
                         self.written.insert(name.clone());
                         self.need_sys = true;
                         let ident = self.py_ident(&name);
@@ -3304,6 +3313,17 @@ impl Render {
                                 if let Some(c) = self.render_let_cond(text) {
                                     return c;
                                 }
+                                // anything else is still ARITHMETIC: `let
+                                // "value % 2 == 0"` is `(( … ))`'s status,
+                                // not a command. Forking a `let` binary got
+                                // 127, inverting the branch (058 printed
+                                // "Odd number: 42").
+                                let text_pl = Self::expand_arith_plen(text);
+                                if let Some(ast) = crate::shir::parse_arith(&text_pl) {
+                                    let e = self.arith(&ast);
+                                    self.emit(&format!("__sh_rc = 0 if ({e}) else 1"));
+                                    return "None".into();
+                                }
                             }
                         }
                     }
@@ -4065,6 +4085,27 @@ impl Render {
                                 return format!(
                                     "\" \".join(__sh_argv_slice({src}, {o}, {l}))"
                                 );
+                            }
+                            // `${a[@]:off:len}` / `${a[*]:off:len}` — an
+                            // ARRAY slice yields WORDS (051_primes read
+                            // `${primes[@]:0:1}` as a character slice and
+                            // collected consecutive odd numbers).
+                            if let Some(base) = name
+                                .strip_suffix("[@]")
+                                .or_else(|| name.strip_suffix("[*]"))
+                            {
+                                if Self::is_plain_name(base) {
+                                    let o = self.expr_as_num(&args[2]);
+                                    let l = match args.get(3) {
+                                        Some(a) => self.expr_as_num(a),
+                                        None => "\"\"".to_string(),
+                                    };
+                                    self.need_aslice = true;
+                                    return format!(
+                                        "__sh_aslice({}, {o}, {l})",
+                                        self.py_ident(base)
+                                    );
+                                }
                             }
                             let v = self.call("getVar", &[IrExpr::Str(name.to_string(), crate::ir::StrStyle::DoubleQuoted)]);
                             let o = self.expr_as_num(&args[2]);
@@ -5363,8 +5404,16 @@ impl Render {
                         }
                         if func == "exec" || func == "builtin" {
                             let mut one = Vec::new();
-                            if let Some(IrExpr::Str(cmd, _)) = args.first() {
-                                one.push(Self::sh_quote(cmd));
+                            // the command WORD can itself be an expansion
+                            // (`"$INTERP" -E - <<EOF`): dropping it left the
+                            // heredoc with no command at all
+                            // (heredoc-binary-data ran `'-E' '-'`).
+                            match args.first() {
+                                Some(IrExpr::Str(cmd, _)) => {
+                                    one.push(Self::sh_quote(cmd))
+                                }
+                                Some(other) => one.push(self.sh_arg(other)?),
+                                None => {}
                             }
                             if let Some(IrExpr::Array(items)) = args.get(1) {
                                 for it in items {
@@ -7940,13 +7989,18 @@ impl Render {
                         let known = self.written.contains(base);
                         self.written.insert(base.to_string());
                         let rhs = self.expr(expr);
-                        if self.assoc.contains(base) || k.starts_with('$') {
-                            let key = match k.strip_prefix('$') {
-                                Some(v) => format!("str({})", self.py_ident(v)),
-                                // the shell quotes are KEY SYNTAX, not text:
-                                // `info["os"]=…` stored the literal key
-                                // `"os"` (064_22 printed info["arch"]=…)
-                                None => Self::py_str(&Self::strip_quotes(k)),
+                        // the shell quotes are KEY SYNTAX, not text:
+                        // `info["os"]=…` stored the literal key `"os"`,
+                        // and a QUOTED expansion (`m["$key"]`) was stored as
+                        // the literal `$key` (063_09 counted 0 options).
+                        let k_unq = Self::strip_quotes(k);
+                        if self.assoc.contains(base) || k_unq.starts_with('$') {
+                            let key = match k_unq.strip_prefix('$') {
+                                Some(v) if Self::is_plain_name(v) => {
+                                    format!("str({})", self.py_ident(v))
+                                }
+                                Some(_) => Self::py_str(&k_unq),
+                                None => Self::py_str(&k_unq),
                             };
                             if !known {
                                 self.emit(&format!("{m} = {{}}"));
@@ -8248,6 +8302,37 @@ impl Render {
                 // call, so a compound condition fell to the stub and the loop
                 // never ran (063_11 printed nothing). Split the left spine,
                 // keep `read` as the driver and re-check the rest per line.
+                // `IFS= read -r line && …` wraps the condition in
+                // block(Arrow[<env true>], Arrow[<real cond>]): unwrap it,
+                // keeping the IFS for the line splitter. Without this the
+                // loop driver is invisible and the whole condition falls
+                // to the stub (063_11 printed nothing).
+                let mut cond_env_ifs: Option<String> = None;
+                let mut cond: &IrExpr = cond;
+                if let IrExpr::Call { func, args } = cond {
+                    if func == "block" {
+                        if let Some(IrExpr::Arrow(pre)) = args.first() {
+                            for pst in pre {
+                                if let IrStmt::Expr(IrExpr::Call { args: a2, .. }) = pst {
+                                    if let Some(IrExpr::Object(props)) = a2.get(2) {
+                                        for (k, v) in props {
+                                            if k == "IFS" {
+                                                if let IrExpr::Str(sv, _) = v {
+                                                    cond_env_ifs = Some(sv.clone());
+                                                }
+                                            }
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                        if let Some(IrExpr::Arrow(ab)) = args.get(1) {
+                            if let [IrStmt::Expr(e)] = ab.as_slice() {
+                                cond = e;
+                            }
+                        }
+                    }
+                }
                 let mut cond: &IrExpr = cond;
                 let mut cond_rest: Option<IrExpr> = None;
                 if let IrExpr::BinOp {
@@ -8307,7 +8392,9 @@ impl Render {
                                         })
                                         .collect();
                                     if !names.is_empty() {
-                                        let ifs = Self::read_ifs(args);
+                                        let ifs = cond_env_ifs
+                                            .clone()
+                                            .or_else(|| Self::read_ifs(args));
                                         let joiner = match &ifs {
                                             Some(s) if !s.is_empty() => Self::py_str(
                                                 &s.chars().next().unwrap_or(' ').to_string(),
@@ -8374,14 +8461,27 @@ impl Render {
                         }
                     }
                 }
+                let flag = format!("__sh_ran{}", self.cap_counter);
+                self.cap_counter += 1;
+                self.emit(&format!("{flag} = False"));
                 let (pre, c) = self.cond_test(cond);
                 for p in pre {
                     self.emit(&p);
                 }
                 self.emit(&format!("while {c}:"));
                 self.loop_depth += 1;
+                self.depth += 1;
+                self.emit(&format!("{flag} = True"));
+                self.depth -= 1;
                 self.block(body);
                 self.loop_depth -= 1;
+                // a loop whose body never ran leaves $? = 0 (bash); the
+                // condition's own status was 1
+                // (parse-multi-command-while-condition printed exit: 1).
+                self.emit(&format!("if not {flag}:"));
+                self.depth += 1;
+                self.emit("__sh_rc = 0");
+                self.depth -= 1;
             }
             // C-style `for (init; cond; step)` — the imperative frontends'
             // rich form (the shell path lowers it via strip_cfor). Render
@@ -9223,6 +9323,29 @@ impl Render {
             self.emit("    except NameError:");
             self.emit("        args = sys.argv[1:]");
             self.emit("    return __sh_atoi(args[i - 1]) if len(args) >= i else 0");
+            self.emit("");
+        }
+        if self.need_aslice {
+            // `${a[@]:off:len}`: slice the WORDS, not the characters, and
+            // join with IFS — a character slice turned `${primes[@]:0:1}`
+            // into consecutive odd numbers (051_primes).
+            self.emit("def __sh_aslice(v, off, ln):");
+            self.emit("    items = list(v) if isinstance(v, (list, tuple)) else [str(v)]");
+            self.emit("    try:");
+            self.emit("        o = int(str(off).strip() or 0)");
+            self.emit("    except (TypeError, ValueError):");
+            self.emit("        o = 0");
+            self.emit("    if o < 0:");
+            self.emit("        o = max(0, len(items) + o)");
+            self.emit("    if str(ln).strip() == \"\":");
+            self.emit("        sel = items[o:]");
+            self.emit("    else:");
+            self.emit("        try:");
+            self.emit("            n = int(str(ln).strip())");
+            self.emit("        except (TypeError, ValueError):");
+            self.emit("            n = 0");
+            self.emit("        sel = items[o:o + n] if n >= 0 else items[o:n]");
+            self.emit("    return \" \".join(str(_x) for _x in sel)");
             self.emit("");
         }
         if self.need_fork_capture {
