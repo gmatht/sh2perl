@@ -21,7 +21,7 @@
 #   walk, Rust dedup_by
 # Fallback: sh2.uniqLines(text, skip, count)
 #
-# Provenance: sh2perl/docs/fm/TextOps/UniqLines.thy
+# Provenance: sh2perl/docs/fm/TextOps/ShIR_TextOps_SortUniq.thy
 
 node UniqLines
 tag "UniqLines"
@@ -37,3 +37,7 @@ field skip: int
 # the same denotation.
 field count: bool
 spec: TextOps#uniq_lines_sound
+# `uniq -s N` (`skip`) is NOT covered: it compares lines after dropping `skip`
+# characters and keeps the FIRST of the run, while `drop_runs` drops the first.
+# That needs a partition under the skip relation, not a corollary.
+spec: pending TextOps#uniq_lines_skip_sound

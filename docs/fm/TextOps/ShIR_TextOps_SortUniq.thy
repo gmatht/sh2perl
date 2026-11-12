@@ -9,21 +9,24 @@
     `try_lower_uniq` (sh2perl/src/transforms/text_ops.rs).
 
     Scope: this file models the two nodes over a LIST OF LINES and proves
-    what closes in this Isabelle build:
+    what the nodes promise:
 
       * `insert_length`, `isort_length` — the model sort is a permutation of
-        its input (no line is lost or invented by the ordering step).
-      * `run_count_total`               — `uniq -c`'s counts add up to the
-        number of input lines: the run walk sees every line exactly once.
+        its input (no line is lost or invented by the ordering step);
+        `sorted_insert`, `isort_sorted` — its output is ORDERED (in the
+        `sort_total` locale: a preorder is not enough for the second branch);
+        `isort_sorted_id` — re-sorting a sorted list is the identity.
+      * `run_count_total` — `uniq -c`'s counts add up to the input length;
+        `uniq_lines_sound` — and they are the RUN LENGTHS: the input is exactly
+        the concatenation of `n` copies of each printed line, in order, and the
+        printed lines are the collapse.
+      * `drop_runs_idem`, `drop_runs_adj_free`, `sort_u_is_uniq_of_sort` —
+        the collapse is idempotent, invents nothing and leaves no equal
+        neighbours, so `sort -u` is `uniq . sort`.
 
-    NOT yet proved (kept as explicit open targets, not faked): that
-    `isort` output is ORDERED (`sorted_insert`/`isort_sorted`), that
-    `drop_runs` is idempotent and invents nothing (`drop_runs_idem`,
-    `drop_runs_no_adjacent_eq`), and hence `sort -u = uniq . sort`. The
-    statements are written out in the section texts below; each induction
-    step needs a cons/append normal-form step that this build's simplifier
-    does not discharge (the same failure that stops the strip's general
-    prefix lemma in ShIR_TextOps_Strip.thy).
+    The two nodes' own `spec:` lines name `sort_lines_sound` and
+    `uniq_lines_sound`; `uniq -s N` is declared open in the node as
+    `pending TextOps#uniq_lines_skip_sound` (see the file tail for why).
 
     What is NOT covered, and is REFUSED by the lowering rather than guessed:
     `-t X -kN` field keys, locale collation, `-V/-h/-M/-R`, and
@@ -347,7 +350,7 @@ text \<open>OBLIGATION \<open>uniq_lines_sound\<close>: the node's list collapse
   writes. The two readings are the two ways to say \<open>collapse every maximal run
   to its first element\<close>.\<close>
 
-theorem uniq_lines_sound: "drop_runs ls = collapse_prev ls None"
+lemma uniq_lines_collapse: "drop_runs ls = collapse_prev ls None"
 proof (induct ls rule: drop_runs.induct)
   case 1
   then show ?case by simp
@@ -560,6 +563,161 @@ next
     then show ?thesis using False by simp
   qed
 qed
+
+text \<open>The collapse above states the node's VALUE; it does not state what the
+  `-c` counts COUNT, and a model that reported the right survivor list with
+  wrongly split counts would satisfy a count total while printing the wrong
+  numbers. The reconstruction below is the statement with teeth: concatenating
+  `n` copies of each printed line, in the printed order, gives back the input
+  EXACTLY. Together with the survivor list being the collapse and every count
+  being at least one, that pins each count to its run length — a differently
+  split count list reconstructs a different text. (`[a,a,b]` is the witness: the
+  survivor list `[a,b]` with counts `(1,2)` would reconstruct `[a,b,b]`.)\<close>
+
+lemma run_count_nonempty [simp]: "run_count ls \<noteq> [] \<longleftrightarrow> ls \<noteq> []"
+proof (induct ls rule: run_count.induct)
+  case 1 then show ?case by simp
+next
+  case (2 x) then show ?case by simp
+next
+  case (3 x y ys)
+  show ?case
+  proof (cases "run_count (y # ys)")
+    case Nil then show ?thesis using 3 by simp
+  next
+    case (Cons p rest) then show ?thesis using 3 by (cases p) simp_all
+  qed
+qed
+
+lemma run_count_nil_eq_iff [simp]: "run_count ls = [] \<longleftrightarrow> ls = []"
+proof (cases "ls = []")
+  case True
+  then show ?thesis by simp
+next
+  case False
+  have "run_count ls \<noteq> []" using run_count_nonempty False by simp
+  with False show ?thesis by simp
+qed
+
+lemma map_snd_run_count: "map snd (run_count ls) = drop_runs ls"
+proof (induct ls rule: run_count.induct)
+  case 1 then show ?case by simp
+next
+  case (2 x) then show ?case by simp
+next
+  case (3 x y ys)
+  show ?case
+  proof (cases "run_count (y # ys)")
+    case Nil
+    then show ?thesis using 3 by simp_all
+  next
+    case (Cons p rest)
+    then show ?thesis using 3 by (cases p) simp_all
+  qed
+qed
+
+lemma run_count_pos: "\<forall>n \<in> set (map fst (run_count ls)). 1 \<le> n"
+proof (induct ls rule: run_count.induct)
+  case 1 then show ?case by simp
+next
+  case (2 x) then show ?case by simp
+next
+  case (3 x y ys)
+  show ?case
+  proof (cases "run_count (y # ys)")
+    case Nil
+    then show ?thesis using 3 by simp
+  next
+    case (Cons p rest)
+    then show ?thesis using 3 by (cases p) simp_all
+  qed
+qed
+
+text \<open>OBLIGATION (the reconstruction): the input is the concatenation of the
+  counted runs, in order. `run_count_pos` above keeps the counts from being
+  zero, which is what makes `replicate` faithful.\<close>
+
+lemma run_count_parts:
+  "ls = concat (map (\<lambda>p. replicate (fst p) (snd p)) (run_count ls))"
+proof (induct ls rule: run_count.induct)
+  case 1 then show ?case by simp
+next
+  case (2 x) then show ?case by simp
+next
+  case (3 x y ys)
+  show ?case
+  proof (cases "run_count (y # ys)")
+    case Nil
+    then show ?thesis using 3 by simp
+  next
+    case (Cons p rest)
+    obtain n z where pz: "p = (n, z)" by (cases p)
+    have ih: "y # ys = replicate n z @ concat (map (\<lambda>p. replicate (fst p) (snd p)) rest)"
+      using 3(1) Cons pz by simp
+    have mem: "(n, z) \<in> set (run_count (y # ys))" using Cons pz by simp
+    have memn: "n \<in> set (map fst (run_count (y # ys)))" using mem by force
+    have pos: "1 \<le> n" using run_count_pos memn by blast
+    show ?thesis
+    proof (cases "x = y")
+      case True
+      have yz: "y = z"
+      proof (cases n)
+        case 0
+        then show ?thesis using pos by simp
+      next
+        case (Suc k)
+        then show ?thesis using ih by simp
+      qed
+      have rc: "run_count (x # y # ys) = (n + 1, z) # rest"
+        using True Cons pz by simp
+      have lhs: "x # y # ys = z # replicate n z @ concat (map (\<lambda>p. replicate (fst p) (snd p)) rest)"
+        using True yz ih by simp
+      have rhs: "concat (map (\<lambda>p. replicate (fst p) (snd p)) (run_count (x # y # ys)))
+                   = z # replicate n z @ concat (map (\<lambda>p. replicate (fst p) (snd p)) rest)"
+        using rc by simp
+      show ?thesis using lhs rhs by simp
+    next
+      case False
+      have rc: "run_count (x # y # ys) = (1, x) # (n, z) # rest"
+        using False Cons pz by simp
+      have rhs: "concat (map (\<lambda>p. replicate (fst p) (snd p)) (run_count (x # y # ys)))
+                   = x # y # ys"
+        using rc ih by simp
+      show ?thesis using rhs by simp
+    qed
+  qed
+qed
+
+text \<open>OBLIGATION \<open>uniq_lines_sound\<close>, conjunct by conjunct: the collapse
+  equals the streaming filter a renderer writes (the value); the input is
+  exactly the counted runs concatenated (what the counts mean); the printed
+  lines are the collapse (which lines survive); every count is at least one; the
+  counts add up to the input length; and no equal neighbours survive.\<close>
+
+theorem uniq_lines_sound:
+  "drop_runs ls = collapse_prev ls None \<and>
+   ls = concat (map (\<lambda>p. replicate (fst p) (snd p)) (run_count ls)) \<and>
+   map snd (run_count ls) = drop_runs ls \<and>
+   (\<forall>n \<in> set (map fst (run_count ls)). 1 \<le> n) \<and>
+   sum_list (map fst (run_count ls)) = length ls \<and>
+   adj_free (drop_runs ls)"
+proof (intro conjI)
+  show "drop_runs ls = collapse_prev ls None" by (rule uniq_lines_collapse)
+  show "ls = concat (map (\<lambda>p. replicate (fst p) (snd p)) (run_count ls))"
+    by (rule run_count_parts)
+  show "map snd (run_count ls) = drop_runs ls" by (rule map_snd_run_count)
+  show "\<forall>n \<in> set (map fst (run_count ls)). 1 \<le> n" by (rule run_count_pos)
+  show "sum_list (map fst (run_count ls)) = length ls" by (rule run_count_total)
+  show "adj_free (drop_runs ls)" by (rule drop_runs_adj_free)
+qed
+
+text \<open>OPEN, and named: `uniq -s N` (`uniq_lines skip`). The node compares the
+  lines' suffixes after dropping `skip` characters and KEEPS THE FIRST line of
+  the run. A `drop_runs`-shaped model drops the first and keeps the last, which
+  agrees for exact equality but not for a skip relation (two lines that share a
+  suffix differ before it), so the skip case needs a partition under that
+  relation and a keep-first walk; it is not a corollary of the proofs above.
+  Recorded as \<open>pending TextOps#uniq_lines_skip_sound\<close> in the node.\<close>
 
 text \<open>Sortedness of the collapse: induction on the list with the head
   universally quantified, so the hypothesis can be instantiated at the

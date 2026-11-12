@@ -242,6 +242,43 @@ is another worker's untracked WIP and is not in `ROOT`. Its spec therefore stays
 `none (unstated)`, and citing that name would now fail as `OUTSIDE THE BUILD`
 rather than look resolved.
 
+### The two obligations that were thinner than their names (2026-11-13)
+
+A referee pass over the two nodes the previous slice reported as "proved" found
+both theorems narrower than the promises their node files make. Both are now
+brought up to the node, and the residue is named rather than implied.
+
+**`substitute_sound`** (`ShIR_TextOps_Substitute`) was, and still is, the engine
+theorem: (1) a zero-length match copies one byte and advances, (2) a match of
+length `Suc k` emits the replacement of the matched text and continues at
+`drop (Suc k) s` (leftmost, non-overlapping, never retried at the same
+position), (3) no match anywhere leaves the text unchanged. Termination is not
+assumed: `subst_all_extra`/`subst_first_extra` prove extra fuel never changes
+the answer, `substitute_*_fuel_suffices` turn that into "the text's length is
+enough fuel", and `substitute_empty_match_advances` states the advance rule on
+its own. What was missing was the REPLACEMENT LANGUAGE: `&` was only proved for
+the single replacement `[38]` and `\N` was not modelled at all. `expand` now
+parses sed's replacement string — `&` the matched text, `\N` capture `N` of the
+matcher's report, `\&` and `\\` the literals, an out-of-range escape copied
+through so the function stays total — and `substitute_expand_leftmost` /
+`substitute_expand_empty_match_advances` state the engine's two rules for it,
+for every matcher. What remains abstract is the matcher's REPORT (which captures
+a compiled regex produces); the node's LINE domain is declared open as
+`pending TextOps#substitute_line_domain_sound`.
+
+**`uniq_lines_sound`** (`ShIR_TextOps_SortUniq`) was `drop_runs ls =
+collapse_prev ls None` — a real collapse statement, but silent about the `-c`
+counts, so a model with correctly chosen survivors and wrongly split counts
+would have satisfied it. It is now six conjuncts: the streaming filter, the
+reconstruction `ls = concat (map (λ(n,x). replicate n x) (run_count ls))`, the
+printed lines being the collapse, every count at least one, the counts summing
+to the input length, and no equal neighbours surviving. The reconstruction is
+the conjunct with teeth: `[a,a,b]` with counts `(1,2)` reconstructs `[a,b,b]`,
+so the counts cannot be re-split. `uniq -s N` is declared open as
+`pending TextOps#uniq_lines_skip_sound`: it compares suffixes after dropping
+`skip` characters and keeps the FIRST line of the run, while `drop_runs` keeps
+the last, so it needs a partition under that relation rather than a corollary.
+
 ### Closed: CutsetTrim (2026-11-13)
 
 `cutset_trim.node`'s `spec:` is `TextOps#cutset_trim_sound`: the generic form plus

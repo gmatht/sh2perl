@@ -21,9 +21,16 @@
     bookkeeping (split at '\n', re-join, restore the final newline), and the
     `\N` back-reference. The matcher is an abstract parameter, so the engines
     are proved for EVERY matcher; compiling a BRE/ERE into one is out of scope
-    and is recorded as a limitation in docs/fm/README.md. The `&` of a
-    replacement is modelled as a function of the matched text (`amp_repl`),
-    which is enough to prove that `&` alone is the identity.
+    and is recorded as a limitation in docs/fm/README.md.
+
+    The REPLACEMENT language is modelled: `expand` reads sed's replacement
+    string, where `&` is the matched text, `\N` a capture from the matcher's
+    report, `\&` and `\\` the literals. Because the engines take the
+    replacement as an arbitrary function of the matched text, that language is
+    an INSTANCE, and `substitute_expand_leftmost` states the leftmost,
+    non-overlapping step for it. What stays abstract is the matcher's report —
+    which captures a compiled regex produces is a property of the compiler, not
+    of the engine.
 *)
 
 theory ShIR_TextOps_Substitute
@@ -437,11 +444,98 @@ corollary substitute_first_tail_is_untouched:
            r (take (Suc k) (c # cs)) @ drop (Suc k) (c # cs)"
   using assms by (simp add: subst_first_take)
 
-text \<open>LIMITATION, recorded rather than hidden. Not proved here: (a) that the
-  node's line split at '\n' commutes with these engines — the equivalence needs
-  a matcher that cannot cross a newline, a property of the compiled regex, not
-  of the engine; (b) the \<open>\\N\<close> back-reference, a different replacement
-  language; (c) the BRE/ERE syntax and its leftmost-longest rule. The engines
-  above are the part every renderer shares.\<close>
+section \<open>The replacement language: \<open>&\<close> and \<open>\N\<close>\<close>
+
+text \<open>sed's replacement string is parsed here rather than assumed: `&` becomes
+  the matched text, `\N` (a digit) becomes capture `N` of the matcher's report,
+  and `\&`, `\\` are the escaped literals. An out-of-range or unknown escape is
+  copied through unchanged, which is what keeps this a TOTAL function: no
+  replacement string can make the node undefined. Captures come from the same
+  abstract matcher that reports the match length — the engine never invents
+  one, so this does not assume a regex engine exists.\<close>
+
+fun expand :: "bytes \<Rightarrow> bytes list \<Rightarrow> bytes \<Rightarrow> bytes" where
+  "expand [] caps mt = []"
+| "expand (b # r) caps mt =
+     (if b = 38 then mt @ expand r caps mt
+      else if b = 92 then
+        (case r of
+           [] \<Rightarrow> [92]
+         | d # r' \<Rightarrow>
+             (if d = 92 then [92] @ expand r' caps mt
+              else if d = 38 then [92, 38] @ expand r' caps mt
+              else if 48 \<le> d \<and> d \<le> 57 \<and> d - 48 < length caps
+                then caps ! (d - 48) @ expand r' caps mt
+                else [92, d] @ expand r' caps mt))
+      else b # expand r caps mt)"
+
+lemma expand_amp [simp]: "expand [38] caps mt = mt"
+  by simp
+
+lemma expand_escaped_amp [simp]: "expand [92, 38] caps mt = [92, 38]"
+  by simp
+
+lemma expand_backslash [simp]: "expand [92, 92] caps mt = [92]"
+  by simp
+
+text \<open>`\N` is the Nth capture. Guarded by the report's length, so a
+  replacement that names a capture the matcher did not report copies the two
+  bytes through instead of indexing out of range.\<close>
+
+lemma expand_backref [simp]:
+  "48 \<le> d \<Longrightarrow> d \<le> 57 \<Longrightarrow> d - 48 < length caps \<Longrightarrow>
+     expand [92, d] caps mt = caps ! (d - 48)"
+  by simp
+
+theorem substitute_amp_replaces_only_amp:
+  assumes "clipped m (c # cs) = Suc k"
+  shows "subst_first m (amp_repl rep) (length (c # cs)) (c # cs) =
+           amp_repl rep (take (Suc k) (c # cs)) @ drop (Suc k) (c # cs)"
+  using assms by (simp add: subst_first_take)
+
+text \<open>OBLIGATION, engine side: the node's leftmost, non-overlapping step holds
+  for the sed replacement language, for every matcher and both flag values.
+  This is `substitute_sound`'s match conjunct instantiated at
+  \<open>r := expand rep caps\<close>; the empty-match advance and the fuel bound are the
+  same theorems, since neither mentions the replacement.\<close>
+
+theorem substitute_expand_leftmost:
+  "clipped m (c # cs) = Suc k \<Longrightarrow>
+     substitute m (expand rep caps) g (c # cs) =
+       expand rep caps (take (Suc k) (c # cs)) @
+       (if g then substitute m (expand rep caps) g (drop (Suc k) (c # cs))
+        else drop (Suc k) (c # cs))"
+  by (metis conjunct2[OF substitute_sound])
+
+corollary substitute_expand_empty_match_advances:
+  assumes "m (c # cs) = 0"
+  shows "substitute m (expand rep caps) g (c # cs) = c # substitute m (expand rep caps) g cs"
+proof (cases g)
+  case True
+  have "subst_all m (expand rep caps) (length (c # cs)) (c # cs)
+          = c # subst_all m (expand rep caps) (length cs) cs"
+    using assms by (simp add: clipped_zero_iff subst_all_advance)
+  then show ?thesis unfolding substitute_def using True by simp
+next
+  case False
+  have "subst_first m (expand rep caps) (length (c # cs)) (c # cs)
+          = c # subst_first m (expand rep caps) (length cs) cs"
+    using assms by (simp add: clipped_zero_iff subst_first_advance)
+  then show ?thesis unfolding substitute_def using False by simp
+qed
+
+text \<open>LIMITATION, recorded rather than hidden. (a) The node's LINE domain is
+  not modelled: the node substitutes each line of the text (split at '\n', the
+  empty tail after a final newline dropped, re-joined, final newline restored),
+  and nothing here mentions that split. Making it commute with the engine needs
+  a matcher that cannot cross a newline — a property of the compiled regex, not
+  of the engine — so it is recorded as
+  \<open>pending TextOps#substitute_line_domain_sound\<close> in the node rather than
+  assumed. (b) The BRE/ERE syntax and its leftmost-longest rule are not modelled;
+  the matcher reports a match length and a capture list, and WHICH regexes
+  produce which reports is the compiler's obligation. (c) The replacement
+  language IS modelled above (`&`, `\N`, `\&`, `\\`, with out-of-range escapes
+  copied through). The engines are the part every renderer shares; the two
+  absences are named, and neither is papered over.\<close>
 
 end

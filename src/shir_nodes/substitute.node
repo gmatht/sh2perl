@@ -25,7 +25,7 @@
 #   C regcomp/regexec
 # Fallback: sh2.substitute(text, pattern, repl, flags)
 #
-# Provenance: sh2perl/docs/fm/TextOps/Substitute.thy
+# Provenance: sh2perl/docs/fm/TextOps/ShIR_TextOps_Substitute.thy
 
 node Substitute
 tag "Substitute"
@@ -40,3 +40,8 @@ field global: bool
 # is built rather than carried here.
 field ignore_case: bool
 spec: TextOps#substitute_sound
+# The node substitutes the LINES of `text`; the theory models the engine on a
+# byte string and does not prove the line split/re-join commutes with it (that
+# needs a matcher that cannot cross a newline, i.e. a property of the compiled
+# regex). Named open, not silently folded into `none`.
+spec: pending TextOps#substitute_line_domain_sound
