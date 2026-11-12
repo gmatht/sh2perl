@@ -1224,4 +1224,99 @@ theorem affix_strip_sound:
   by simp
 
 
+section \<open>RepeatStr: repetition, and the slice\<close>
+
+text \<open>The `RepeatStr` node (emitted for the `yes X | head -n K` idiom) is a
+  repetition: the renderers spell it `"C" x N`, `.repeat(N)`, `repeat()`. It is
+  defined here the way a loop would compute it, and proved equal to the
+  library reading `concat (replicate n s)` — so the backends' three spellings
+  are the same value, and the node's length is arithmetic, not a guess.\<close>
+
+fun repeat_str_node :: "nat \<Rightarrow> bytes \<Rightarrow> bytes" where
+  "repeat_str_node 0 s = []"
+| "repeat_str_node (Suc k) s = s @ repeat_str_node k s"
+
+theorem repeat_str_is_concat:
+  "repeat_str_node n s = concat (replicate n s)"
+  by (induct n) simp_all
+
+theorem repeat_str_sound:
+  "repeat_str_node n s = concat (replicate n s) \<and>
+   length (repeat_str_node n s) = n * length s \<and>
+   repeat_str_node 0 s = [] \<and>
+   repeat_str_node 1 s = s \<and>
+   repeat_str_node n [] = []"
+proof (intro conjI)
+  show "repeat_str_node n s = concat (replicate n s)" by (rule repeat_str_is_concat)
+  show "length (repeat_str_node n s) = n * length s" by (induct n) simp_all
+  show "repeat_str_node 0 s = []" by simp
+  show "repeat_str_node 1 s = s" by simp
+  show "repeat_str_node n [] = []" by (induct n) simp_all
+qed
+
+text \<open>The `SubStrExtract` node (`expr substr`, `${var:N:M}`) reads a bounded
+  slice. The definition is the byte-at-a-time scan a C arm performs; the
+  theorem identifies it with `take len (drop off s)`, which is what the JS,
+  Perl and Rust arms compute, so the arms agree on the value and on the
+  clipping: a slice shorter than `len` is the whole tail, and an offset past
+  the end is the empty string. Negative offsets (bash's `${v: -3}`) are NOT
+  modelled here; only the non-negative index forms are.\<close>
+
+fun substr_extract :: "bytes \<Rightarrow> nat \<Rightarrow> nat \<Rightarrow> bytes" where
+  "substr_extract [] off len = []"
+| "substr_extract (c # cs) off len =
+     (if off = 0 then (if len = 0 then [] else c # substr_extract cs 0 (len - 1))
+      else substr_extract cs (off - 1) len)"
+
+theorem substr_extract_is_take_drop:
+  "substr_extract s off len = take len (drop off s)"
+proof (induct s arbitrary: off len)
+  case Nil
+  then show ?case by simp
+next
+  case (Cons c cs)
+  note IH = Cons(1)
+  show ?case
+  proof (cases off)
+    case 0
+    note off0 = this
+    show ?thesis
+    proof (cases len)
+      case 0
+      with off0 show ?thesis by simp
+    next
+      case (Suc m)
+      with off0 IH show ?thesis by simp
+    qed
+  next
+    case (Suc k)
+    with IH show ?thesis by simp
+  qed
+qed
+
+theorem substr_extract_sound:
+  "substr_extract s off len = take len (drop off s) \<and>
+   length (substr_extract s off len) \<le> len \<and>
+   substr_extract s off 0 = [] \<and>
+   substr_extract s 0 len = take len s \<and>
+   (length s \<le> off \<longrightarrow> substr_extract s off len = [])"
+proof (intro conjI)
+  show "substr_extract s off len = take len (drop off s)"
+    by (rule substr_extract_is_take_drop)
+  show "length (substr_extract s off len) \<le> len"
+    by (simp add: substr_extract_is_take_drop)
+  show "substr_extract s off 0 = []"
+    by (simp add: substr_extract_is_take_drop)
+  show "substr_extract s 0 len = take len s"
+    by (simp add: substr_extract_is_take_drop)
+  show "length s \<le> off \<longrightarrow> substr_extract s off len = []"
+  proof (intro impI)
+    assume h: "length s \<le> off"
+    have "drop off s = []" using h by simp
+    then show "substr_extract s off len = []"
+      by (simp add: substr_extract_is_take_drop)
+  qed
+qed
+
+
 end

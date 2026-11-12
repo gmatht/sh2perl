@@ -3,6 +3,12 @@
 #
 # Backends: Perl substr(), JS slice(), C strncpy, Rust &s[n..n+m]
 # Fallback: sh2.subStr(text, offset, length)
+#
+# ShIR_TextOps_Strings proves `substr_extract_sound`: the byte-at-a-time scan a
+# C arm performs equals `take length (drop offset text)`, which is what the JS,
+# Perl and Rust arms compute; the result is never longer than `length`, a zero
+# length is empty, and an offset past the end is the empty string. NOT modelled:
+# bash's negative offsets/lengths (`${v: -3}`, `${v:0:-2}`).
 
 node SubStrExtract
 tag "SubStrExtract"
@@ -11,4 +17,4 @@ kind expr
 field text: expr
 field offset: expr
 field length: optional_expr
-spec: none (unstated)
+spec: TextOps#substr_extract_sound

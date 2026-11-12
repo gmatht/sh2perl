@@ -850,4 +850,66 @@ text \<open>LIMITATION. The glob engine is not modelled: "the longest prefix
   `lit`", and that identification is assumed, not proved. The literal reading
   (find/rfind, no-match no-op, split) is proved. See docs/fm/README.md.\<close>
 
+section \<open>StringContains: the substring test\<close>
+
+text \<open>The `StringContains` node (emitted for `grep -q` and `case *P*)`) asks
+  only whether the literal occurs, so its obligation is the primitives' answer
+  read as a boolean, plus the semantic form a reviewer can check without
+  `find_first`: a needle occurs iff it appears as a slice of the text. The
+  empty needle occurs in every text (including the empty one), and that is the
+  only case where an empty TEXT can contain anything.\<close>
+
+definition string_contains :: "bytes \<Rightarrow> bytes \<Rightarrow> bool" where
+  "string_contains s p \<equiv> find_first s p \<noteq> None"
+
+theorem string_contains_sound:
+  "string_contains s p = (find_first s p \<noteq> None) \<and>
+   string_contains s p = (\<exists>i. i \<le> length s \<and> take (length p) (drop i s) = p) \<and>
+   string_contains s [] \<and>
+   (string_contains [] p \<longleftrightarrow> p = [])"
+proof (intro conjI)
+  show "string_contains s p = (find_first s p \<noteq> None)" by (simp add: string_contains_def)
+next
+  show "string_contains s p = (\<exists>i. i \<le> length s \<and> take (length p) (drop i s) = p)"
+  proof
+    assume h: "string_contains s p"
+    then have nf: "find_first s p \<noteq> None" by (simp add: string_contains_def)
+    then obtain i where fi: "find_first s p = Some i" by (cases "find_first s p") auto
+    have "i \<le> length s \<and> take (length p) (drop i s) = p"
+      using fi by (rule find_first_occ)
+    then show "\<exists>i. i \<le> length s \<and> take (length p) (drop i s) = p" by blast
+  next
+    assume h: "\<exists>i. i \<le> length s \<and> take (length p) (drop i s) = p"
+    then obtain i where hn: "i \<le> length s" and hocc: "take (length p) (drop i s) = p"
+      by blast
+    show "string_contains s p"
+    proof (cases "find_first s p")
+      case None
+      then have "\<forall>j. j \<le> length s \<longrightarrow> take (length p) (drop j s) \<noteq> p"
+        by (rule find_first_none)
+      with hn hocc show ?thesis by blast
+    next
+      case Some
+      then show ?thesis by (simp add: string_contains_def)
+    qed
+  qed
+next
+  show "string_contains s []"
+  proof -
+    have "find_first s [] = Some 0" by simp
+    then show ?thesis by (simp add: string_contains_def)
+  qed
+next
+  show "string_contains [] p \<longleftrightarrow> p = []"
+  proof (cases p)
+    case Nil
+    then show ?thesis by (simp add: string_contains_def)
+  next
+    case (Cons d ds)
+    then have "find_first [] (d # ds) = None" by simp
+    then show ?thesis using Cons by (simp add: string_contains_def)
+  qed
+qed
+
+
 end

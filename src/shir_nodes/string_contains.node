@@ -3,6 +3,12 @@
 #
 # Backends: Perl index()!=-1, JS .includes(), C strstr(), Rust .contains()
 # Fallback: sh2.contains(text, pattern)
+#
+# The test is the CUT primitives' answer as a boolean: ShIR_TextOps_Cut proves
+# `string_contains_sound` — the node is `find_first text pattern != None`, which
+# is equivalently "the pattern occurs as a slice of the text", with the empty
+# pattern occurring everywhere and the empty TEXT containing only the empty
+# pattern. Every backend arm above computes one of those three readings.
 
 node StringContains
 tag "StringContains"
@@ -10,4 +16,4 @@ kind expr
 # storage_class str_bounded
 field text: expr
 field pattern: expr
-spec: none (unstated)
+spec: TextOps#string_contains_sound

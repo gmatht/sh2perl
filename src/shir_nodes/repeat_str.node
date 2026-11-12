@@ -3,6 +3,11 @@
 #
 # Backends: Perl "C" x N, JS .repeat(), C memset, Rust repeat()
 # Fallback: sh2.repeatStr(text, count)
+#
+# ShIR_TextOps_Strings proves `repeat_str_sound`: the loop-shaped definition is
+# `concat (replicate count text)`, its length is `count * length text`, and the
+# zero/one/empty-text cases are the identities the arms rely on. Emitted for the
+# `yes X | head -n K` idiom, whose line terminator is part of `text`.
 
 node RepeatStr
 tag "RepeatStr"
@@ -10,4 +15,4 @@ kind expr
 # storage_class str_bounded
 field text: expr
 field count: expr
-spec: none (unstated)
+spec: TextOps#repeat_str_sound
