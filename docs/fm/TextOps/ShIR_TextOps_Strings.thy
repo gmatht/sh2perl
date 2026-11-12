@@ -3175,5 +3175,177 @@ lemma walk_dir_witness:
      = set (walk (DDir [([100], DFile), ([101], DDir [([102], DFile)])]))"
   by eval
 
+text \<open>The four defective traversals below are plausible implementation slips, not straw men:
+  copying an entry instead of the head element (dup), skipping subdirectories as if they were
+  unreadable (drop), prefixing only one level and concatenating deeper names (bare), and
+  reporting the containing directory before descending (up). Each is falsified below on the
+  same witness trees @{thm walk_dir_witness} is checked on, against the same definitions
+  (see the closing text block: "Why the conjuncts bite").\<close>
+
+definition w_nested :: dtree where
+  "w_nested \<equiv> DDir [([100], DFile), ([101], DDir [([102], DFile)])]"
+
+definition w_emptydir :: dtree where
+  "w_emptydir \<equiv> DDir [([100], DDir [])]"
+
+definition w_root :: dtree where
+  "w_root \<equiv> DDir []"
+
+fun child_names :: "dtree \<Rightarrow> bytes list" where
+  "child_names DFile = []"
+| "child_names (DDir cs) = map fst cs"
+
+fun is_file :: "dtree \<Rightarrow> bool" where
+  "is_file DFile = True"
+| "is_file (DDir _) = False"
+
+fun self_of :: "dtree \<Rightarrow> bytes list list" where
+  "self_of DFile = [[]]"
+| "self_of (DDir _) = []"
+
+fun walk_dup :: "dtree \<Rightarrow> bytes list list" where
+  "walk_dup DFile = []"
+| "walk_dup (DDir cs) = concat (map (\<lambda>q. map ((#) (fst q)) ([] # [] # walk_dup (snd q))) cs)"
+
+fun walk_drop :: "dtree \<Rightarrow> bytes list list" where
+  "walk_drop DFile = []"
+| "walk_drop (DDir cs) = concat (map (\<lambda>q. map ((#) (fst q)) (self_of (snd q))) cs)"
+
+fun walk_bare :: "dtree \<Rightarrow> bytes list list" where
+  "walk_bare DFile = []"
+| "walk_bare (DDir cs) = concat (map (\<lambda>q. (fst q # []) # walk_bare (snd q)) cs)"
+
+fun walk_up :: "dtree \<Rightarrow> bytes list list" where
+  "walk_up DFile = []"
+| "walk_up (DDir cs) = [] # concat (map (\<lambda>q. map ((#) (fst q)) ([] # walk_up (snd q))) cs)"
+
+text \<open>What the GOOD walker emits on the witness trees. Every defect witness below is stated
+  against these same lists and against the law's own counters, never against a bespoke one.\<close>
+
+lemma walk_nested_emits: "walk w_nested = [[[100]], [[101]], [[101], [102]]]"
+  by eval
+
+lemma walk_emptydir_emits: "walk w_emptydir = [[[100]]]"
+  by eval
+
+lemma walk_root_emits: "walk w_root = []"
+  by eval
+
+lemma entries_of_nested: "entries_of w_nested = 3"
+  by eval
+
+text \<open>(1) DUPLICATE EMITTER breaks conjunct (4), the emission count. The law's own
+  @{const entries_of} is the counter.\<close>
+
+lemma dup_breaks_count: "length (walk_dup w_nested) \<noteq> entries_of w_nested"
+  by eval
+
+lemma dup_breaks_count_shallow: "length (walk_dup w_emptydir) \<noteq> entries_of w_emptydir"
+  by eval
+
+text \<open>(2) DROPPING WALKER breaks conjunct (1), visited set = entry set. The missed entry is a
+  real entry of the subtree (the file inside the subdirectory), so it is an omission, not a
+  difference in presentation.\<close>
+
+lemma drop_breaks_entry:
+  "[[101], [102]] \<in> set (walk w_nested) \<and> [[101], [102]] \<notin> set (walk_drop w_nested)"
+proof
+  show "[[101], [102]] \<in> set (walk w_nested)" using walk_nested_emits by auto
+next
+  have d: "walk_drop w_nested = [[[100]]]" by eval
+  show "[[101], [102]] \<notin> set (walk_drop w_nested)" using d by auto
+qed
+
+lemma drop_breaks_set: "set (walk_drop w_nested) \<noteq> entries_set w_nested"
+proof -
+  have g: "[[101], [102]] \<in> set (walk w_nested)" using walk_nested_emits by auto
+  with walk_set have e: "[[101], [102]] \<in> entries_set w_nested" by auto
+  have n: "[[101], [102]] \<notin> set (walk_drop w_nested)" using drop_breaks_entry by blast
+  from e n show ?thesis by auto
+qed
+
+lemma drop_empties_subtree: "walk_drop w_emptydir = []"
+  by eval
+
+lemma drop_breaks_set_shallow: "set (walk_drop w_emptydir) \<noteq> entries_set w_emptydir"
+proof -
+  have g: "[[100]] \<in> set (walk w_emptydir)" using walk_emptydir_emits by auto
+  with walk_set have e: "[[100]] \<in> entries_set w_emptydir" by auto
+  have n: "[[100]] \<notin> set (walk_drop w_emptydir)" using drop_empties_subtree by auto
+  from e n show ?thesis by auto
+qed
+
+text \<open>(3) BARE-NAME WALKER breaks conjunct (3), declines-into-a-real-child. Its emitted
+  @{term "[[102]]"} does not start with a child name of the root. The same check PASSES for
+  the good walker on the same tree, which is what keeps this witness from being a property no
+  walker could satisfy.\<close>
+
+lemma walk_prefix_ok:
+  "\<forall>p \<in> set (walk w_nested). hd p \<in> set (child_names w_nested)"
+proof -
+  have c: "child_names w_nested = [[100], [101]]" by eval
+  show ?thesis using walk_nested_emits c by auto
+qed
+
+lemma bare_breaks_prefix:
+  "\<exists>p \<in> set (walk_bare w_nested). hd p \<notin> set (child_names w_nested)"
+proof -
+  have b: "walk_bare w_nested = [[[100]], [[101]], [[102]]]" by eval
+  have c: "child_names w_nested = [[100], [101]]" by eval
+  show ?thesis using b c by auto
+qed
+
+lemma bare_keeps_own_paths: "walk_bare w_emptydir = [[[100]]]"
+  by eval
+
+text \<open>(4) STEP-ABOVE-THE-ROOT WALKER breaks conjunct (2), no empty path: it also emits the
+  containing directory. The good walker satisfies that conjunct on the same tree.\<close>
+
+lemma up_breaks_no_empty:
+  "[] \<in> set (walk_up w_emptydir) \<and> [] \<notin> set (walk w_emptydir)"
+proof
+  have u: "walk_up w_emptydir = [[], [[100]], [[100]]]" by eval
+  show "[] \<in> set (walk_up w_emptydir)" using u by auto
+next
+  show "[] \<notin> set (walk w_emptydir)" using walk_emptydir_emits by auto
+qed
+
+lemma up_breaks_root: "[] \<in> set (walk_up w_root)"
+proof -
+  have u: "walk_up w_root = [[]]" by eval
+  show ?thesis using u by auto
+qed
+
+text \<open>The bundle: one theorem that names, per conjunct, the defect walker and the witness
+  that falsifies it.\<close>
+
+theorem walk_dir_defects_bite:
+  "length (walk_dup w_nested) \<noteq> entries_of w_nested \<and>
+   set (walk_drop w_nested) \<noteq> entries_set w_nested \<and>
+   (\<exists>p \<in> set (walk_bare w_nested). hd p \<notin> set (child_names w_nested)) \<and>
+   [] \<in> set (walk_up w_emptydir)"
+  using dup_breaks_count drop_breaks_set bare_breaks_prefix up_breaks_no_empty by auto
+
+text \<open>Why the conjuncts bite, mechanically. Four deliberately defective walkers sit next to
+  the good one, and for each a lemma falsifies a NAMED conjunct of the walk_dir_sound theorem
+  on the same concrete witness trees the good law is checked on, comparing against the very
+  definitions that law uses (entries_of, entries_set, walk, child_names) — so the separation
+  is not circular:
+  \<^item> @{const walk_dup} emits each entry twice. @{thm dup_breaks_count}: the emission-count
+    conjunct fails (6 emitted against @{term "entries_of w_nested"} = 3 on @{const w_nested}).
+  \<^item> @{const walk_drop} silently drops directory children. @{thm drop_breaks_set}: the entry
+    @{term "[[101], [102]]"} is never visited, so visited-set = entry-set fails;
+    @{thm drop_breaks_entry} records it against the good walker's own emission list, and
+    @{thm drop_breaks_set_shallow} is the same defect on @{const w_emptydir}.
+  \<^item> @{const walk_bare} root-prefixes a child's OWN path but emits its descendants bare.
+    @{thm bare_breaks_prefix} exhibits @{term "[[102]]"}, whose head is no child name of the
+    root, so declines-into-a-real-child fails; @{thm walk_prefix_ok} shows the good walker
+    passes that same check on that same tree.
+  \<^item> @{const walk_up} prepends the empty path — the parent of the root.
+    @{thm up_breaks_no_empty} shows no-empty-path fails for it while the good walker still
+    satisfies it on that tree; @{thm up_breaks_root} is the same defect on the empty
+    directory.
+  The four are collected by @{thm walk_dir_defects_bite}.\<close>
+
 
 end
