@@ -20527,7 +20527,11 @@ fn compute_local_vars(
                 // loop is reached on every iteration but the deferred
                 // declaration would have to be emitted in a different scope
                 // than the loop's use sites.
-                if reads_before_write(body, &name) {
+                // Soundness: a scope whose body contains a loop can reach the
+                // deferred use sites on an iteration where the write has not
+                // run yet (the first write is top-level but later paths are
+                // conditional), so it keeps the initialised declaration.
+                if reads_before_write(body, &name) || body_has_loop(body) {
                     dead_init.insert(name.clone());
                 } else {
                     safe_deinit.insert(name.clone());
