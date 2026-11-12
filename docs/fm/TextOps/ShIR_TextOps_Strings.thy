@@ -2391,4 +2391,130 @@ lemma take_lines_bytes_witness:
   by eval
 
 
+section \<open>MapLiteral: a dict literal over parallel key/value lists\<close>
+
+text \<open>`MapLiteral{keys, values}` is the anonymous dictionary VALUE in expression
+  position (`map[K]V{...}`, a JS object literal). The renderer
+  (`src/render_ext_estree/handlers/map_literal.rs`) is the specification: if
+  `length keys \<noteq> length values` it returns `None` and the `sh2.*` fallback runs;
+  otherwise it emits an ObjectExpression whose properties are the zipped pairs, in
+  order, with keys marked `computed` — i.e. each key expression's RUNTIME value is
+  stringified by the host object model before it becomes a property name.
+
+  So the model is an association list of (key bytes, value bytes) pairs, plus one
+  ABSTRACT function @{term st} standing for the host's key-stringification rule.
+  What the node means is @{term map_lookup}: the last value whose stringified key
+  equals the stringified query, and `None` when no key matches.
+
+  WHAT IS PROVED (each below, over byte lists and an arbitrary @{term st}):
+  (1) the entries ARE the zipped pairs, so the property list has `min` of the two
+  lengths — the renderer's guard turns that into "as many properties as there are
+  keys";
+  (2) the structural law: appending one pair either wins over everything before it
+  (when its stringified key matches the query) or leaves the earlier answer
+  untouched — so a DUPLICATE key is resolved last-wins, which is what a JS object
+  literal does, and a miss stays a miss;
+  (3) consequently a matching final key yields exactly its own value even when
+  earlier keys stringify identically, and a non-matching final key yields the
+  earlier lookup;
+  (4) a list none of whose keys stringify to the query answers `None`.
+
+  WHAT IS NOT PROMISED, precisely. (a) The stringification rule itself is abstract:
+  the host maps numbers to decimal text, `true`/`false`, `-0` to `"0"`, `NaN`,
+  arrays/objects to `"[object Object]"`-like text, and `st` may therefore map two
+  DISTINCT key expressions to the same property name — that collision is exactly why
+  (2) is stated, and the concrete rule is not modelled. (b) Property ORDER and
+  iteration are not promised: JS objects reorder integer-like property names, so the
+  laws here are about LOOKUP, never about "the i-th property". (c) Key and value
+  EXPRESSION evaluation order and side effects are outside a pure function; the model
+  takes already-evaluated byte values. (d) The length-mismatch refusal is the
+  renderer's guard, not a theorem here — it is a refuse>guess branch whose
+  alternative is the unchanged `sh2.*` fallback. (e) Bytes only: no Unicode
+  normalization or locale rules, so `st` is a byte function.\<close>
+
+type_synonym kv = "bytes \<times> bytes"
+
+abbreviation map_entries :: "bytes list \<Rightarrow> bytes list \<Rightarrow> kv list" where
+  "map_entries ks vs \<equiv> zip ks vs"
+
+fun map_lookup :: "(bytes \<Rightarrow> bytes) \<Rightarrow> bytes \<Rightarrow> kv list \<Rightarrow> bytes option" where
+  "map_lookup st q [] = None"
+| "map_lookup st q (p # r) =
+     (if st (fst p) = st q then
+        (case map_lookup st q r of None \<Rightarrow> Some (snd p) | Some w \<Rightarrow> Some w)
+      else map_lookup st q r)"
+
+lemma map_lookup_nil: "map_lookup st q [] = None"
+  by simp
+
+lemma map_lookup_snoc:
+  "map_lookup st q (ps @ [(k, v)]) = (if st k = st q then Some v else map_lookup st q ps)"
+  by (induct ps) (simp_all split: option.split)
+
+lemma map_lookup_miss:
+  "(\<And>p. p \<in> set ps \<Longrightarrow> st (fst p) \<noteq> st q) \<Longrightarrow> map_lookup st q ps = None"
+  by (induct ps) (simp_all split: option.split)
+
+lemma map_lookup_last_wins:
+  "length ks = length vs \<Longrightarrow> st k = st q \<Longrightarrow>
+     map_lookup st q (map_entries (ks @ [k]) (vs @ [v])) = Some v"
+proof -
+  assume len: "length ks = length vs"
+  assume hit: "st k = st q"
+  have zip: "map_entries (ks @ [k]) (vs @ [v]) = map_entries ks vs @ [(k, v)]"
+    using len by (simp add: zip_append)
+  show ?thesis using zip hit by (simp add: map_lookup_snoc)
+qed
+
+lemma map_lookup_passes:
+  "length ks = length vs \<Longrightarrow> st k \<noteq> st q \<Longrightarrow>
+     map_lookup st q (map_entries (ks @ [k]) (vs @ [v])) = map_lookup st q (map_entries ks vs)"
+proof -
+  assume len: "length ks = length vs"
+  assume miss: "st k \<noteq> st q"
+  have zip: "map_entries (ks @ [k]) (vs @ [v]) = map_entries ks vs @ [(k, v)]"
+    using len by (simp add: zip_append)
+  show ?thesis using zip miss by (simp add: map_lookup_snoc)
+qed
+
+theorem map_literal_sound:
+  "map_lookup st q [] = None \<and>
+   map_entries ks vs = zip ks vs \<and>
+   length (map_entries ks vs) = min (length ks) (length vs) \<and>
+   map_lookup st q (ps @ [(k, v)]) = (if st k = st q then Some v else map_lookup st q ps) \<and>
+   ((\<forall>p \<in> set ps. st (fst p) \<noteq> st q) \<longrightarrow> map_lookup st q ps = None) \<and>
+   (length ks = length vs \<and> st k = st q \<longrightarrow>
+      map_lookup st q (map_entries (ks @ [k]) (vs @ [v])) = Some v) \<and>
+   (length ks = length vs \<and> st k \<noteq> st q \<longrightarrow>
+      map_lookup st q (map_entries (ks @ [k]) (vs @ [v])) = map_lookup st q (map_entries ks vs))"
+proof (intro conjI)
+  show "map_lookup st q [] = None" by (rule map_lookup_nil)
+  show "map_entries ks vs = zip ks vs" by simp
+  show "length (map_entries ks vs) = min (length ks) (length vs)" by (simp add: length_zip)
+  show "map_lookup st q (ps @ [(k, v)]) = (if st k = st q then Some v else map_lookup st q ps)"
+    by (rule map_lookup_snoc)
+  show "(\<forall>p \<in> set ps. st (fst p) \<noteq> st q) \<longrightarrow> map_lookup st q ps = None"
+    by (auto simp: map_lookup_miss)
+  show "length ks = length vs \<and> st k = st q \<longrightarrow>
+          map_lookup st q (map_entries (ks @ [k]) (vs @ [v])) = Some v"
+    by (simp add: map_lookup_snoc)
+  show "length ks = length vs \<and> st k \<noteq> st q \<longrightarrow>
+          map_lookup st q (map_entries (ks @ [k]) (vs @ [v])) = map_lookup st q (map_entries ks vs)"
+    by (simp add: map_lookup_snoc)
+qed
+
+lemma map_literal_witness:
+  "map_lookup id [107] (map_entries [[107], [97]] [[49], [50]]) = Some [49] \<and>
+   map_lookup id [107] (map_entries [[107], [107]] [[49], [50]]) = Some [50] \<and>
+   map_lookup id [122] (map_entries [[107], [97]] [[49], [50]]) = None"
+  by eval
+
+lemma map_literal_collision_witness:
+  "map_lookup (\<lambda>b. if b = [107] then [75] else b) [107]
+     (map_entries [[107], [75]] [[49], [50]]) = Some [50] \<and>
+   map_lookup (\<lambda>b. if b = [107] then [75] else b) [107]
+     (map_entries [[75], [107]] [[49], [50]]) = Some [50]"
+  by eval
+
+
 end

@@ -201,7 +201,7 @@ three that did not — `newline_strip_sound`, `uniq_lines_sound`,
 (`sort_lines_sound`). `harness/check-node-specs.pl` (workspace `harness/`) makes
 "no dangling spec" a machine check: it collects every `theorem`/`lemma`/
 `definition`/`fun` under `docs/fm` and fails on a `spec:` naming one that does
-not exist. It reports 32 resolved, 16 unstated, 0 pending, 0 dangling.
+not exist. It reports 33 resolved, 15 unstated, 0 pending, 0 dangling.
 
 - `newline_strip_sound` (`ShIR_TextOps_Strip`): the node is the trailing-run
   removal, with the run length and the prefix equation.
@@ -236,9 +236,9 @@ deliberate no-obligation form. `--map` prints the node→theorem table below and
 `--selftest` runs the five negative controls (real theorem, definition, dangling
 name, wrong session prefix, unbuilt theory).
 
-Current inventory: **32 resolved, 16 unstated, 0 pending, 0 errors**.
+Current inventory: **33 resolved, 15 unstated, 0 pending, 0 errors**.
 
-The 32 resolved specs (30 distinct theorems; `lowered_wc_sound` covers three
+The 33 resolved specs (31 distinct theorems; `lowered_wc_sound` covers three
 nodes and `field_extract`, `split`, `substitute`, `uniq_lines` and
 `cutset_trim` cite two each):
 
@@ -255,6 +255,7 @@ nodes and `field_extract`, `split`, `substitute`, `uniq_lines` and
 | `field_strip_end` | `field_strip_end_drains_on_miss` |
 | `cutset_trim` | `cutset_trim_is_trim_by`, `cutset_trim_sound` |
 | `field_extract` | `cut_keeps_empty_field`, `field_or_empty_out_of_range` |
+| `map_literal` | `map_literal_sound` |
 | `path_name` | `path_name_sound` |
 | `newline_strip` | `newline_strip_sound` |
 | `reg_count` | `lowered_wc_sound` |
@@ -304,6 +305,24 @@ second half of the trap (`cut (Suc n) []` matches neither `cut (Suc 0) []` nor
 with nested `if`s. Two witness expectations were also wrong at first and the
 definitions caught them: `cut 2 [97, LF]` is `"a" LF`, not `"a"`, and the last line
 of `"a" LF "b" LF` is the empty one.
+
+### `map_literal` gets its assoc-list model (2026-11-13)
+
+`map_literal` was stuck behind "the char-map laws do not apply to it", which was
+true but not an obligation. The renderer settles what it means: with
+`length keys = length values` it emits an ObjectExpression of the zipped pairs in
+order with `computed` keys (runtime stringification by the host object model), and
+otherwise it refuses into the `sh2.*` fallback. So the obligation is about an
+association list plus one ABSTRACT stringifier `st`: `map_lookup st q` is "the last
+value whose stringified key equals the stringified query". `map_literal_sound` proves
+the entries are `zip keys values` (hence `min` of the lengths), the structural law
+`map_lookup st q (ps @ [(k, v)]) = (if st k = st q then Some v else map_lookup st q ps)`
+— which makes a DUPLICATE key last-wins, as a JS object literal is — the all-miss
+case, and both corollaries on `zip (ks @ [k]) (vs @ [v])`, with witnesses for a hit, a
+duplicate and a miss, plus a stringifier that collides two distinct keys. Explicitly
+not promised: the stringification rule itself, property ORDER/iteration (JS reorders
+integer-like names, so the laws are about lookup), expression evaluation order, the
+length-mismatch refusal, and anything beyond bytes.
 
 ### The two obligations that were thinner than their names (2026-11-13)
 

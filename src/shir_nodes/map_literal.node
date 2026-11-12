@@ -17,8 +17,26 @@ kind expr
 # storage_class str_bounded
 field keys: exprs
 field values: exprs
-spec: none (unstated: MapLiteral is a dictionary literal over parallel key/value
-# lists, NOT a per-character map — the char-map laws (length, composition, identity)
-# do not apply to it. Its own obligation needs an association-list key model plus the
-# host's key-stringification rule, which this session does not model, so no law is
-# approximated here.)
+# Spec: TextOps#map_literal_sound (docs/fm/TextOps/ShIR_TextOps_Strings.thy, section
+# "MapLiteral: a dict literal over parallel key/value lists"). The renderer is the
+# specification: with `length keys = length values` it emits an ObjectExpression of
+# the zipped pairs in order, keys `computed`; otherwise it refuses and the sh2.*
+# fallback runs. The theorem models the node as an association list of byte pairs plus
+# an ABSTRACT key-stringification `st` (one function standing for the host object
+# model, which stringifies at runtime), and proves, for every st and query q: the
+# entries are exactly `zip keys values` (so `min` of the two lengths); the structural
+# law `map_lookup st q (ps @ [(k, v)]) = (if st k = st q then Some v else map_lookup st
+# q ps)` — a DUPLICATE key is therefore last-wins, as a JS object literal is; a list
+# whose keys all stringify away from q answers `None`; and both corollaries on
+# `zip (ks @ [k]) (vs @ [v])`.
+#
+# NOT PROMISED (stated, not assumed): the stringification rule itself (numbers to
+# decimal text, `true`/`false`, `-0` to "0", `NaN`, objects to "[object Object]"-like
+# text) — so two DISTINCT key expressions may collide, which is why last-wins is
+# stated rather than "keys are unique"; property ORDER and iteration (JS reorders
+# integer-like property names, so the laws are about lookup, never "the i-th
+# property"); key/value expression evaluation order and side effects (the model takes
+# already-evaluated bytes); the length-mismatch refusal (the renderer's refuse>guess
+# guard whose alternative is the unchanged fallback); and encoding beyond bytes (no
+# Unicode normalization or locale rules).
+spec: TextOps#map_literal_sound
