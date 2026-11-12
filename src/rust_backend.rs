@@ -20534,7 +20534,16 @@ fn compute_local_vars(
             // all is read-only (`x=$(((a + b) / (c + d)))` still declares
             // a,b,c,d, which only ever read). Declaring those `mut` is
             // `variable does not need to be mutable`, 19 of them corpus-wide.
-            entry_decl.insert(name.clone());
+            // A builtin-written name (`printf -v`, `read`) whose first ordered
+            // event is the builtin store is initialised by that store: omitting
+            // it from `local_entry` puts it in `owned_inits`' candidate set, so
+            // the store is emitted as the binding's `let` instead of an
+            // assignment to a dead `String::new()` default. A name that can be
+            // read before that store keeps its initialised declaration.
+            let builtin_owns_decl = builtin_write && entry_default_dead(scan_body, &name);
+            if !builtin_owns_decl {
+                entry_decl.insert(name.clone());
+            }
             if us_writes {
                 need_mut.insert(name.clone());
             }
