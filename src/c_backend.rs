@@ -19790,8 +19790,89 @@ fn param_copy_alias(
     }
 
     fn emit_function(&mut self, name: &str, body: &[IrStmt], main_vars: &BTreeSet<String>) {
-        // Phase 1 (fb0): direct linear RFB_PIX present/dump (no xxd/hex rows) for regenerated builds.
+        // Fast rb_clear/rb_putrun for RFB_PIX linear framebuffer.
+        if name == "rb_clear" && (self.arrays.contains("RFB_PIX") || self.int_arrays.contains("RFB_PIX")) {
+            let sig = "static inline void rb_clear(long long rbc_a)";
+            self.fn_fwd_decls.push(format!("{sig};"));
+            self.emit(sig); self.emit("{"); self.depth += 1;
+            self.emit("long long _r=(rbc_a>>16)&255,_g=(rbc_a>>8)&255,_b=rbc_a&255;");
+            self.emit("long long _px=(_r<<16)|(_g<<8)|_b;");
+            self.emit("rb_pxval=_px;");
+            self.emit("long long _n=RFBW*RFBH; for(long long _i=0;_i<_n;_i++) RFB_PIX[_i]=_px;");
+            self.emit("if ((size_t)_n > RFB_PIX_len) RFB_PIX_len = (size_t)_n;");
+            self.depth -= 1; self.emit("}"); return;
+        }
+        if name == "rb_putrun" && (self.arrays.contains("RFB_PIX") || self.int_arrays.contains("RFB_PIX")) {
+            let sig = "static inline void rb_putrun(long long rbp_y, long long rbp_x0, long long rbp_n, long long rbp_p)";
+            self.fn_fwd_decls.push(format!("{sig};"));
+            self.emit(sig); self.emit("{"); self.depth += 1;
+            self.emit("if (rbp_n<=0 || rbp_y<0 || rbp_y>=RFBH) return;");
+            self.emit("if (rbp_x0<0) { rbp_n+=rbp_x0; rbp_x0=0; }");
+            self.emit("if (rbp_x0>=RFBW) return;");
+            self.emit("if (rbp_x0+rbp_n>RFBW) rbp_n=RFBW-rbp_x0;");
+            self.emit("if (rbp_n<=0) return;");
+            self.emit("long long _base = rbp_y*RFBW + rbp_x0;");
+            self.emit("for (long long _i=0; _i<rbp_n; _i++) RFB_PIX[_base+_i]=rbp_p;");
+            self.emit("if ((size_t)(_base+rbp_n) > RFB_PIX_len) RFB_PIX_len = (size_t)(_base+rbp_n);");
+            self.depth -= 1; self.emit("}"); return;
+        }
+
+        // Fast present: supports RFB_PIX (fb0 int array) or RFB_ROWS (hex rows).
         if name == "rb_present" {
+            let has_pix = self.arrays.contains("RFB_PIX") || self.int_arrays.contains("RFB_PIX");
+            let sig = "static inline void rb_present(void)";
+            self.fn_fwd_decls.push(format!("{sig};"));
+            self.emit(sig);
+            self.emit("{");
+            self.depth += 1;
+            self.emit("__attribute__((weak)) extern int fbwin_open_p(void);");
+            self.emit("__attribute__((weak)) extern int fbwin_present(const uint32_t *argb, int w, int h);");
+            self.emit("int _use_fbwin = (fbwin_open_p ? fbwin_open_p() : 0);");
+            self.emit("if ((!RFB_PATH || RFB_PATH[0] == '\\0') && !_use_fbwin) { _sh_rc = 1; return; }");
+            self.emit("long long _w = RFBW, _h = RFBH;");
+            self.emit("size_t _npix = (size_t)(_w * _h);");
+            self.emit("static uint32_t *_fbwin_buf = NULL;");
+            self.emit("static size_t _fbwin_cap = 0;");
+            self.emit("if (_fbwin_cap < _npix) { _fbwin_buf = (uint32_t*)realloc(_fbwin_buf, _npix * 4); _fbwin_cap = _npix; }");
+            if has_pix {
+                self.emit("if (_use_fbwin && _fbwin_buf) { for (size_t _i = 0; _i < _npix; _i++) _fbwin_buf[_i] = (uint32_t)RFB_PIX[_i]; }");
+                self.emit("if (_use_fbwin && _fbwin_buf && fbwin_present) { fbwin_present(_fbwin_buf, (int)_w, (int)_h); _sh_rc = 0; return; }");
+                self.emit("FILE *_f = fopen(RFB_PATH, \"wb\");");
+                self.emit("if (!_f) { _sh_rc = 1; return; }");
+                self.emit("for (size_t _i = 0; _i < _npix; _i++) { uint32_t pv = (uint32_t)RFB_PIX[_i]; unsigned char px[4]; px[0]=(unsigned char)(pv&255); px[1]=(unsigned char)((pv>>8)&255); px[2]=(unsigned char)((pv>>16)&255); px[3]=0; fwrite(px,1,4,_f); }");
+                self.emit("fclose(_f);");
+                self.emit("_sh_rc = 0;");
+            } else {
+                self.emit("FILE *_f = NULL;");
+                self.emit("if (!_use_fbwin && RFB_PATH && RFB_PATH[0]) _f = fopen(RFB_PATH, \"wb\");");
+                self.emit("if (!_use_fbwin && RFB_PATH && RFB_PATH[0] && !_f) { _sh_rc = 1; return; }");
+                self.emit("for (long long _y = 0; _y < _h; _y++) {");
+                self.depth += 1;
+                self.emit("const char *_row = _sh_arr_get(RFB_ROWS, RFB_ROWS_len, _y);");
+                self.emit("if (!_row) _row = \"\";");
+                self.emit("size_t _n = strlen(_row); unsigned char _out[4096]; size_t _oi = 0; size_t _pixbase = (size_t)_y * (size_t)_w;");
+                self.emit("for (size_t _i = 0, _bi = 0; _i + 1 < _n; _i += 2, _bi++) {");
+                self.depth += 1;
+                self.emit("unsigned char _c1 = (unsigned char)_row[_i], _c2 = (unsigned char)_row[_i+1];");
+                self.emit("unsigned char _v1 = (_c1 <= '9') ? (_c1 - '0') : ((_c1 <= 'F') ? (_c1 - 'A' + 10) : (_c1 - 'a' + 10));");
+                self.emit("unsigned char _v2 = (_c2 <= '9') ? (_c2 - '0') : ((_c2 <= 'F') ? (_c2 - 'A' + 10) : (_c2 - 'a' + 10));");
+                self.emit("unsigned char _b = (unsigned char)((_v1 << 4) | _v2);");
+                self.emit("if (_f) { _out[_oi++] = _b; if (_oi == sizeof(_out)) { fwrite(_out, 1, _oi, _f); _oi = 0; } }");
+                self.emit("if (_use_fbwin && _fbwin_buf) { size_t _pi = _pixbase + (_bi >> 2); if (_pi < _npix) { unsigned _shift = (unsigned)((_bi & 3) * 8); if ((_bi & 3) == 0) _fbwin_buf[_pi] = 0; _fbwin_buf[_pi] |= ((uint32_t)_b << _shift); } }");
+                self.depth -= 1;
+                self.emit("}");
+                self.emit("if (_f && _oi) fwrite(_out, 1, _oi, _f);");
+                self.depth -= 1;
+                self.emit("}");
+                self.emit("if (_f) fclose(_f);");
+                self.emit("if (_use_fbwin && _fbwin_buf && fbwin_present) fbwin_present(_fbwin_buf, (int)_w, (int)_h);");
+                self.emit("_sh_rc = 0;");
+            }
+            self.depth -= 1;
+            self.emit("}");
+            return;
+        }
+        if false && name == "rb_present" {
             let sig = "static inline void rb_present(void)";
             self.fn_fwd_decls.push(format!("{sig};"));
             self.emit(sig);
@@ -19809,7 +19890,7 @@ fn param_copy_alias(
             self.emit("}");
             return;
         }
-        if name == "rb_dump_ppm" {
+        if false && name == "rb_dump_ppm" {
             let sig = "static inline void rb_dump_ppm(void)";
             self.fn_fwd_decls.push(format!("{sig};"));
             self.emit(sig);
@@ -19821,7 +19902,7 @@ fn param_copy_alias(
             self.emit("}");
             return;
         }
-        if name == "_rb_write_bgrx" || name == "_rb_write_ppm" {
+        if false && (name == "_rb_write_bgrx" || name == "_rb_write_ppm") {
             let sig = if name == "_rb_write_bgrx" { "static inline void _rb_write_bgrx(char *_p1, long long _p2, long long _p3)" } else { "static inline void _rb_write_ppm(char *_p1, long long _p2, long long _p3)" };
             self.fn_fwd_decls.push(format!("{sig};"));
             self.emit(sig);
@@ -20677,6 +20758,9 @@ fn param_copy_alias(
     /// ARR_CAP when unbounded/unproven. Decl and every fixed guard go
     /// through here so they always agree.
     fn array_cap(&self, var: &str) -> usize {
+        if var == "RFB_PIX" {
+            return 4_194_304; // 2048x2048 max framebuffer
+        }
         self.array_caps.get(var).copied().unwrap_or(ARR_CAP)
     }
     fn reduce_array(&mut self, func: &str, name: &str) -> String {
