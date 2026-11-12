@@ -10824,8 +10824,19 @@ impl Render {
                         self.emit(&format!("__sh_out_bytes({});", Self::rust_str(&text)));
                     } else {
                         // `print!("…")` — the string is a Rust literal, so the
-                        // `{}` placeholder is unnecessary
-                        self.emit(&format!("print!({});", Self::rust_str(&text)));
+                        // `{}` placeholder is unnecessary. Text that contains
+                        // `{`/`}` (a JSON or C body, a heredoc) is NOT literal
+                        // to a format string, so it goes through `"{}"` rather
+                        // than being brace-escaped: same bytes, and the source
+                        // text stays recognisable in the emitted program.
+                        if text.contains('{') || text.contains('}') {
+                            self.emit(&format!(
+                                "print!(\"{{}}\", {});",
+                                Self::rust_str(&text)
+                            ));
+                        } else {
+                            self.emit(&format!("print!({});", Self::rust_str(&text)));
+                        }
                     }
                 } else {
                     self.sink_check_needed = true;
@@ -12675,6 +12686,14 @@ impl Render {
                                 // raw non-UTF-8 source byte — byte-exact write
                                 self.add_helper("outbytes");
                                 self.emit(&format!("__sh_out_bytes({});", Self::rust_str(&text)));
+                            } else if text.contains('{') || text.contains('}') {
+                                // braces are format syntax, not text: a body
+                                // that carries them (JSON, C, a heredoc) goes
+                                // through the `"{}"` placeholder instead
+                                self.emit(&format!(
+                                    "print!(\"{{}}\", {});",
+                                    Self::rust_str(&text)
+                                ));
                             } else {
                                 self.emit(&format!("print!({});", Self::rust_str(&text)));
                             }
