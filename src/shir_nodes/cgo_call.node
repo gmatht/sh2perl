@@ -24,4 +24,11 @@ kind expr
 # storage_class str_bounded
 field target: string
 field args: exprs
-spec: none (effect: C FFI)
+# Unstated — the missing component is FOREIGN-CALL MARSHALLING: the C ABI's type mapping,
+# ownership and lifetime of returned pointers, the error/errno channel, and the call's
+# side effects on process state. The node has no byte-level value contract; what would
+# need modelling is a foreign heap plus a marshalling relation, neither of which exists
+# here. Recorded as a named missing model rather than the bare word "effect".
+spec: none (unstated: missing model — foreign-call marshalling (C ABI types, ownership of
+# returned pointers, errno/error channel, process state); no byte-level value contract to
+# state, so nothing is approximated.)

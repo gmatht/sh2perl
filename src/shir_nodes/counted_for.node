@@ -12,4 +12,14 @@ field init: int
 field step: int
 field cond: expr
 field body: stmts
-spec: none (effect: control flow)
+# Spec: TextOps#counted_for_sound (docs/fm/TextOps/ShIR_TextOps_Strings.thy, section
+# "CountedFor, Spread, AddressOf/Deref, CloneDeep: value-level laws"). The loop
+# variable's sequence is arithmetic: `counted_vals init step k` has LENGTH k, its n-th
+# element is `init + n * step` (so the first value is the initializer and successive
+# values differ by exactly the step). Proved for every initializer, step and budget.
+#
+# NOT PROMISED (stated, not assumed): the BODY's effect (no store model is used), the
+# terminal condition's own evaluation cost, `break`/`continue` (the node does not carry
+# them), and machine overflow — the model is mathematical `int`, so a host integer width
+# and its wraparound are outside this law.
+spec: TextOps#counted_for_sound

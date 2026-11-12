@@ -16,4 +16,13 @@ field source: expr
 field var: string
 field body: stmts
 field limit: optional_expr
-spec: none (effect: control flow)
+# Unstated — the missing component is a STREAM AND COST MODEL: reader state and its
+# position, laziness (O(1) memory, O(limit) for early-exit heads), closing the reader at
+# the limit, and IO errors. The VALUE side is already available — the visited sequence is
+# `lines_of` from the take_lines/reg_sub model, and its truncation at `limit` is `take` —
+# but a law about it would restate those definitions rather than say anything about the
+# streaming behaviour this node exists for. Recorded as a named missing model rather than
+# the bare word "effect".
+spec: none (unstated: missing model — stream/cost model (reader position, laziness and
+# memory bound, early close at the limit, IO errors); the visited multiset is `lines_of`,
+# which carries no streaming claim.)

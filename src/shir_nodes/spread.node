@@ -17,4 +17,16 @@ tag "Spread"
 kind expr
 # storage_class str_bounded
 field expr: expr
-spec: none (effect: control flow)
+# Spec: TextOps#spread_sound (docs/fm/TextOps/ShIR_TextOps_Strings.thy, section
+# "CountedFor, Spread, AddressOf/Deref, CloneDeep: value-level laws"). Spread flattens
+# its operand into the argument/element vector. Proved: singletons flatten to themselves
+# (spreading one-element groups is the identity); the flattened LENGTH is the sum of the
+# parts' lengths; appending argument groups concatenates their flattened vectors, so order
+# is preserved up to where the spread sits and a mid-list spread does not reorder its
+# neighbours; and duplicate elements survive a flatten (a multiset property).
+#
+# NOT PROMISED (stated, not assumed): where a spread is LEGAL — ESTree's SpreadElement /
+# varargs position only, with a generator error elsewhere (refuse>guess at the emit
+# layer); the host's arity/type checking of the resulting call; and the evaluation order
+# of the operand expression.
+spec: TextOps#spread_sound

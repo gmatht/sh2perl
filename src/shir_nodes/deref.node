@@ -15,4 +15,14 @@ tag "Deref"
 kind expr
 # storage_class str_bounded
 field pointer: expr
-spec: none (effect: pointer)
+# Spec: TextOps#deref_sound (docs/fm/TextOps/ShIR_TextOps_Strings.thy, section
+# "CountedFor, Spread, AddressOf/Deref, CloneDeep: value-level laws"). The read half of
+# the pair contract: dereferencing an address yields the cell's stored bytes, so a write
+# through that address followed by a dereference yields the stored value; and writing a
+# DIFFERENT cell does not disturb this one. The same theorem carries the value-only
+# backends' arm (the operand passes through, snapshot semantics).
+#
+# NOT PROMISED (stated, not assumed): nil-dereference detection (the frontend's `p == nil`
+# guards own it); WRITES through a dereference, which this node deliberately has no form
+# for; allocation/freshness; aliasing; and lifetime/GC.
+spec: TextOps#deref_sound

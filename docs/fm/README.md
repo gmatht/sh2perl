@@ -201,7 +201,7 @@ three that did not — `newline_strip_sound`, `uniq_lines_sound`,
 (`sort_lines_sound`). `harness/check-node-specs.pl` (workspace `harness/`) makes
 "no dangling spec" a machine check: it collects every `theorem`/`lemma`/
 `definition`/`fun` under `docs/fm` and fails on a `spec:` naming one that does
-not exist. It reports 39 resolved, 9 unstated, 0 pending, 0 dangling.
+not exist. It reports 44 resolved, 4 unstated, 0 pending, 0 dangling.
 
 - `newline_strip_sound` (`ShIR_TextOps_Strip`): the node is the trailing-run
   removal, with the run length and the prefix equation.
@@ -236,9 +236,9 @@ deliberate no-obligation form. `--map` prints the node→theorem table below and
 `--selftest` runs the five negative controls (real theorem, definition, dangling
 name, wrong session prefix, unbuilt theory).
 
-Current inventory: **39 resolved, 9 unstated, 0 pending, 0 errors**.
+Current inventory: **44 resolved, 4 unstated, 0 pending, 0 errors**.
 
-The 39 resolved specs (37 distinct theorems; `lowered_wc_sound` covers three
+The 44 resolved specs (42 distinct theorems; `lowered_wc_sound` covers three
 nodes and `field_extract`, `split`, `substitute`, `uniq_lines` and
 `cutset_trim` cite two each):
 
@@ -255,6 +255,11 @@ nodes and `field_extract`, `split`, `substitute`, `uniq_lines` and
 | `field_strip_end` | `field_strip_end_drains_on_miss` |
 | `cutset_trim` | `cutset_trim_is_trim_by`, `cutset_trim_sound` |
 | `field_extract` | `cut_keeps_empty_field`, `field_or_empty_out_of_range` |
+| `address_of` | `address_of_sound` |
+| `clone_deep` | `clone_deep_sound` |
+| `counted_for` | `counted_for_sound` |
+| `deref` | `deref_sound` |
+| `spread` | `spread_sound` |
 | `element_read` | `element_read_sound` |
 | `field_read` | `field_read_sound` |
 | `map_literal` | `map_literal_sound` |
@@ -387,9 +392,32 @@ is the frontend's/backend's business. Witnesses cover the chomp (`"a\nb"` reads 
 `"ab"` reads whole), a duplicate-key readback, a field read and its last-wins variant, all
 at byte level.
 
-Nine nodes remain `spec: none` and they are genuinely effect-only: `address_of`,
-`cgo_call`, `clone_deep`, `counted_for`, `deref`, `foreach_line`, `gpu_op`, `spread`,
-`walk_dir`.
+### Five more value-level laws, and four named gaps (2026-11-13)
+
+Re-triaging the parked `effect: …` notes (rather than trusting them) found five nodes with
+a value-level contract the model here supports. `counted_for`: the loop variable's
+sequence has length = the budget, n-th value `init + n * step`, so first value and
+successive differences are pinned — an off-by-one or a dropped increment fails it.
+`spread`: flattening is the identity on one-element groups, its length is the sum of the
+parts, appending groups concatenates (order preserved where the spread sits), and
+duplicates survive. `address_of`/`deref`: over a minimal heap (address → bytes), a write
+then a read of the same address returns the stored bytes, writing back what was read is a
+no-op, and another cell's write does not disturb this one — the pair composes to identity
+on values, which is exactly what a backend rendering `&x`/`*p` as the value itself would
+break. `clone_deep`: the copy's value equals the source's (`hread b (clone_cell a b h) =
+hread a h`) and mutating the copy through a different address leaves the source unchanged
+— the independence law a shallow copy breaks. Witnesses at byte level for each, including
+`counted_vals 5 (-2) 3` (a descending step) and a clone-then-mutate.
+
+Four remain unstated, each now naming the missing model component instead of the bare word
+"effect": `cgo_call` needs foreign-call marshalling (C ABI types, ownership of returned
+pointers, errno channel, process state); `gpu_op` needs device memory and dispatch
+(buffers, transfers, workgroup geometry, async completion); `foreach_line` needs a
+stream/cost model (reader position, laziness and the memory bound, early close at the
+limit, IO errors) — its value side is `lines_of`, already proved; and `walk_dir` needs a
+directory tree with per-entry identity, a name→child map, traversal order freedom and a
+symlink/cycle policy. `clone_deep`'s "shares no path" for a NESTED structure likewise needs
+an alias/heap-identity model with per-cell provenance, which is stated in its node.
 
 ### The two obligations that were thinner than their names (2026-11-13)
 

@@ -15,4 +15,15 @@ tag "CloneDeep"
 kind expr
 # storage_class str_bounded
 field value: expr
-spec: none (effect: pointer)
+# Spec: TextOps#clone_deep_sound (docs/fm/TextOps/ShIR_TextOps_Strings.thy, section
+# "CountedFor, Spread, AddressOf/Deref, CloneDeep: value-level laws"). Proved: the copy's
+# VALUE equals the source's (`hread b (clone_cell a b h) = hread a h`), and mutating the
+# copy through a different address leaves the source's value unchanged — the independence
+# law a shallow copy breaks by aliasing the two addresses.
+#
+# MISSING MODEL, named rather than assumed: the address being DIFFERENT is a side
+# condition, not a theorem here. Minting a fresh address belongs to the allocator, and
+# proving "shares no path" for a NESTED structure needs an alias/heap-identity model with
+# per-cell provenance that this theory does not have; sharing inside the copy, cycle
+# handling and the GC/lifetime story are therefore unstated, not silently claimed.
+spec: TextOps#clone_deep_sound

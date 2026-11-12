@@ -16,4 +16,11 @@ field type_filter: optional_string
 # -name GLOB (basename glob match); renderers implement fnmatch-style
 field name_filter: optional_string
 field maxdepth: optional_expr
-spec: none (effect: filesystem)
+# Unstated — the missing component is a DIRECTORY TREE with per-entry identity: a
+# name→child map, entry metadata, order freedom for the traversal, and a symlink/cycle
+# policy. The intended law (the visited multiset equals the subtree's entries exactly
+# once, every path root-prefixed, none escaping the root) requires that tree model plus a
+# well-foundedness argument for cycles, neither of which exists in this theory.
+# Recorded as a named missing model rather than the bare word "effect".
+spec: none (unstated: missing model — directory tree with per-entry identity, name→child
+# map, traversal order freedom, symlink/cycle policy.)

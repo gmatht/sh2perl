@@ -2890,4 +2890,136 @@ theorem type_assert_sound:
   by (simp add: ta_val_def)
 
 
+section \<open>CountedFor, Spread, AddressOf/Deref, CloneDeep: value-level laws\<close>
+
+text \<open>Five more parked-as-effect nodes whose VALUE-level contract the model here can
+  state honestly. Each law below is one a plausible broken implementation violates.
+
+  \<^bold>\<open>CountedFor\<close> (declared `effect: control flow`) is a counted loop with an
+  initializer, a step and a terminal condition; the loop variable's sequence is
+  arithmetic and needs no model of the body's store effect. @{term counted_vals}
+  generates the values the loop variable takes, and the laws pin exactly what an
+  off-by-one or a dropped increment would break: the sequence's LENGTH is the iteration
+  budget, its n-th element is `init + n * step`, so the first value is the initializer
+  and successive values differ by the step. What is NOT promised: the body's effect (no
+  store model here), overflow and the host integer width (the model is mathematical
+  `int`), the terminal condition's own evaluation cost, and `break`/`continue`, which the
+  node does not carry.
+
+  \<^bold>\<open>Spread\<close> (`f(args...)`, `...arr`) flattens its operand into the argument or
+  element vector; @{term spread_seq} is that flattening. The laws are the ones a
+  broken flattening violates: singletons flatten to themselves (so spreading a list of
+  one-element groups is the identity), the flattened LENGTH is the sum of the parts'
+  lengths, appending argument groups concatenates their flattened vectors (so order is
+  preserved up to where the spread sits, and a spread in the middle does not reorder
+  its neighbours), and duplicate elements survive a flatten — a multiset property. What
+  is NOT promised: where a spread is LEGAL (`SpreadElement` / varargs position only — the
+  node says a frontend that emits it elsewhere gets a generator error), the host's
+  arity/type checking of the resulting call, and evaluation order of the operand.
+
+  \<^bold>\<open>AddressOf\<close> and \<^bold>\<open>Deref\<close> are the two halves of one contract: an address
+  denotes a CELL and a dereference reads it. A minimal heap (a total function from
+  address to bytes, with @{term hwrite} the functional update and @{term hread} the
+  application) is enough to state it, and the laws are the roundtrips a backend that
+  rendered `&x`/`*p` as the value itself would fail: a write through an address followed
+  by a read of that address yields exactly the stored bytes, writing back what was read
+  leaves the heap untouched, and writing a DIFFERENT cell does not disturb this one. The
+  node files say value-only backends pass the operand through instead (snapshot
+  semantics), which is the second half of `deref_sound`'s first conjunct. What is NOT
+  promised: allocation/freshness (addresses are given, not minted), aliasing freedom in
+  the source language, nil-dereference detection (the frontend's guards), and writes
+  THROUGH a dereference, which `deref`'s file says has no node by design.
+
+  \<^bold>\<open>CloneDeep\<close> copies a cell; the two laws are what a shallow copy breaks: the copy's
+  VALUE equals the source's, and mutating the copy through a different address leaves the
+  source's value unchanged. The address being different is a side condition here, not a
+  theorem, and that is the honest boundary: minting a fresh address is the allocator's
+  job, and a heap where two addresses could denote one cell would need an alias model
+  this theory does not have. What is NOT promised: sharing INSIDE the copy (a deep copy
+  of a nested structure sharing a sub-cell), cycle handling, and the lifetime/GC story.\<close>
+
+fun counted_vals :: "int \<Rightarrow> int \<Rightarrow> nat \<Rightarrow> int list" where
+  "counted_vals init step 0 = []"
+| "counted_vals init step (Suc k) = init # counted_vals (init + step) step k"
+
+lemma cv_length: "length (counted_vals init step k) = k"
+  by (induct k arbitrary: init) simp_all
+
+lemma cv_nth: "n < k \<Longrightarrow> nth (counted_vals init step k) n = init + of_nat n * step"
+  apply (induct k arbitrary: init n)
+   apply simp
+  apply (rename_tac k init n)
+  apply (case_tac n)
+   apply simp
+  apply (rename_tac m)
+  apply (simp add: algebra_simps)
+  done
+
+theorem counted_for_sound:
+  "length (counted_vals init step k) = k \<and>
+   (\<forall>n. n < k \<longrightarrow> nth (counted_vals init step k) n = init + of_nat n * step) \<and>
+   (\<forall>n. Suc n < k \<longrightarrow>
+      nth (counted_vals init step k) (Suc n) = nth (counted_vals init step k) n + step)"
+proof (intro conjI)
+  show "length (counted_vals init step k) = k" by (rule cv_length)
+  show "\<forall>n. n < k \<longrightarrow> nth (counted_vals init step k) n = init + of_nat n * step"
+    by (auto simp: cv_nth)
+  show "\<forall>n. Suc n < k \<longrightarrow>
+          nth (counted_vals init step k) (Suc n) = nth (counted_vals init step k) n + step"
+    by (auto simp: cv_nth algebra_simps)
+qed
+
+lemma counted_for_witness:
+  "counted_vals 1 2 4 = [1, 3, 5, 7] \<and>
+   nth (counted_vals 5 (- 2) 3) 2 = 1 \<and>
+   length (counted_vals 0 3 5) = 5"
+  by eval
+
+abbreviation spread_seq :: "'a list list \<Rightarrow> 'a list" where
+  "spread_seq ls \<equiv> concat ls"
+
+theorem spread_sound:
+  "spread_seq (map (\<lambda>x. [x]) xs) = xs \<and>
+   length (spread_seq ls) = sum_list (map length ls) \<and>
+   spread_seq (a @ b) = spread_seq a @ spread_seq b \<and>
+   spread_seq [[[49]], [[49]]] = [[49], [49]]"
+proof (intro conjI)
+  show "spread_seq (map (\<lambda>x. [x]) xs) = xs" by simp
+  show "length (spread_seq ls) = sum_list (map length ls)" by (induct ls) simp_all
+  show "spread_seq (a @ b) = spread_seq a @ spread_seq b" by simp
+  show "spread_seq [[[49]], [[49]]] = [[49], [49]]" by simp
+qed
+
+type_synonym heap = "nat \<Rightarrow> bytes"
+
+definition hread :: "nat \<Rightarrow> heap \<Rightarrow> bytes" where
+  "hread a h \<equiv> h a"
+
+definition hwrite :: "nat \<Rightarrow> bytes \<Rightarrow> heap \<Rightarrow> heap" where
+  "hwrite a v h \<equiv> h(a := v)"
+
+definition clone_cell :: "nat \<Rightarrow> nat \<Rightarrow> heap \<Rightarrow> heap" where
+  "clone_cell a b h \<equiv> h(b := h a)"
+
+theorem address_of_sound:
+  "hread a (hwrite a v h) = v \<and> hwrite a (hread a h) h = h"
+  by (simp add: hread_def hwrite_def)
+
+theorem deref_sound:
+  "hread a (hwrite a v h) = v \<and>
+   (b \<noteq> a \<longrightarrow> hread a (hwrite b v h) = hread a h)"
+  by (simp add: hread_def hwrite_def)
+
+theorem clone_deep_sound:
+  "hread b (clone_cell a b h) = hread a h \<and>
+   (b \<noteq> a \<longrightarrow> hread a (hwrite b v (clone_cell a b h)) = hread a h)"
+  by (simp add: hread_def hwrite_def clone_cell_def)
+
+lemma store_witness:
+  "hread 0 (hwrite 0 [49] (\<lambda>n. [])) = [49] \<and>
+   hread 1 (clone_cell 0 1 (\<lambda>n. if n = 0 then [49] else [])) = [49] \<and>
+   hread 0 (hwrite 1 [50] (clone_cell 0 1 (\<lambda>n. if n = 0 then [49] else []))) = [49]"
+  by eval
+
+
 end

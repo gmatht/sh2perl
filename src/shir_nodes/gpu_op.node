@@ -30,4 +30,9 @@ field verb: string
 field slot: string
 field payload: expr
 field id: string
-spec: none (effect: device)
+# Unstated — the missing component is DEVICE MEMORY AND DISPATCH: buffer allocation and
+# transfers, workgroup/thread geometry, synchronisation and async completion. No
+# byte-level value contract exists for a dispatch, and nothing here models a device heap.
+# Recorded as a named missing model rather than the bare word "effect".
+spec: none (unstated: missing model — device memory and dispatch (buffers, transfers,
+# workgroup geometry, async completion); no value-level law is claimed.)

@@ -15,4 +15,15 @@ tag "AddressOf"
 kind expr
 # storage_class str_bounded
 field operand: expr
-spec: none (effect: pointer)
+# Spec: TextOps#address_of_sound (docs/fm/TextOps/ShIR_TextOps_Strings.thy, section
+# "CountedFor, Spread, AddressOf/Deref, CloneDeep: value-level laws"). An address denotes
+# a CELL of a minimal heap (address → bytes). Proved: a write through an address followed
+# by a read of that address returns exactly the stored bytes, and writing back what was
+# read leaves the heap untouched — the roundtrips a backend that rendered `&x` as the
+# value itself would fail. This is the write half of the AddressOf/Deref pair contract.
+#
+# NOT PROMISED (stated, not assumed): allocation and freshness (addresses are GIVEN, not
+# minted — minting a fresh one is the allocator's job); aliasing freedom in the source
+# language (a heap where two addresses could denote one cell needs an alias model this
+# theory does not have); and lifetime/GC.
+spec: TextOps#address_of_sound
