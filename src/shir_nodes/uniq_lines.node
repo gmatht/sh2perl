@@ -37,7 +37,15 @@ field skip: int
 # the same denotation.
 field count: bool
 spec: TextOps#uniq_lines_sound
-# `uniq -s N` (`skip`) is NOT covered: it compares lines after dropping `skip`
-# characters and keeps the FIRST of the run, while `drop_runs` drops the first.
-# That needs a partition under the skip relation, not a corollary.
+# `uniq -s N` (`skip`) is NOT yet proved. The obligation is the same run collapse
+# with the run test `drop N x = drop N y` instead of `x = y`; it is not a corollary
+# of `uniq_lines_sound` because the test changes, so the collapse needs its own
+# induction. Two facts are already clear and are NOT yet stated as theorems: at
+# `N = 0` the two collapses coincide (`drop_runs` keeps the FIRST line of a run,
+# which corrects what an earlier version of this comment claimed), and at `N > 0`
+# they differ (skip 1 merges ["ab","xb"] into ["ab"], which `drop_runs` keeps
+# apart). Blocker: the `fun` recursion on `y # ys` needs the generated induction
+# rule, and the same shape with the relation as an extra argument binds its case
+# variables differently from `drop_runs.induct`, so the mirror proof does not go
+# through as written. Named open rather than claimed.
 spec: pending TextOps#uniq_lines_skip_sound
