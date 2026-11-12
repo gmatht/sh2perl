@@ -2517,4 +2517,72 @@ lemma map_literal_collision_witness:
   by eval
 
 
+section \<open>RegexpFind: the leftmost match, as a string\<close>
+
+text \<open>`RegexpFind{text, pattern}` is a leftmost regex match returned AS A STRING, and
+  the empty string when nothing matches (`sed`/`grep -o` family, Go's
+  `re.FindString`). Every backend renders it by extracting the match from whatever its
+  regex engine reports, so the obligation is stated over an ABSTRACT matcher rather
+  than over one engine's answers: @{term m} reports, for a subject, the leftmost
+  match's DECOMPOSITION `(prefix, matched text, suffix)`, or `None`.
+
+  The node's value is then the middle component (`\<lambda>(p, v, q). v`, and `[]` for
+  `None`), and the laws below are the ones a renderer actually relies on:
+  (1) no match yields the empty string;
+  (2) a reported match yields exactly the reported matched text — the node never
+  re-derives, re-encodes or normalises it;
+  (3) the empty string comes back exactly when there is no match OR the match is
+  empty, so "" is not ambiguous evidence of a miss;
+  (4) for any matcher that reports a GENUINE decomposition (`s = prefix @ match @
+  suffix`), the returned bytes occur in the subject — which is what makes any
+  `take`/`drop`-based rendering of the node sound.
+
+  NOT PROMISED, precisely. (a) LEFTMOST-ness itself: the abstraction hands back the
+  leftmost match, so a matcher that skipped an earlier match is not caught here; the
+  engine's search order, its alternation preference and its greediness are the
+  engine's contract, not this one. (b) The regex DIALECT (ERE/RE2-class char classes,
+  anchors, quantifiers, groups), case folding, locale and Unicode rules: `pattern` is
+  a string evaluated by the host engine and is not modelled. (c) Capture groups and
+  backreferences are not part of this node's value. (d) `text` is an expression, so
+  its evaluation (and any side effect) is outside a pure function; the model takes
+  already-evaluated bytes. (e) Bytes only: no encoding, no Unicode normalisation.\<close>
+
+abbreviation rf_val ::
+  "(bytes \<Rightarrow> (bytes \<times> bytes \<times> bytes) option) \<Rightarrow> bytes \<Rightarrow> bytes" where
+  "rf_val m s \<equiv> (case m s of None \<Rightarrow> [] | Some (p, v, q) \<Rightarrow> v)"
+
+abbreviation rf_genuine ::
+  "(bytes \<Rightarrow> (bytes \<times> bytes \<times> bytes) option) \<Rightarrow> bytes \<Rightarrow> bool" where
+  "rf_genuine m s \<equiv> (\<forall>p v q. m s = Some (p, v, q) \<longrightarrow> s = p @ v @ q)"
+
+lemma rf_no_match: "m s = None \<Longrightarrow> rf_val m s = []"
+  by simp
+
+lemma rf_match: "m s = Some (p, v, q) \<Longrightarrow> rf_val m s = v"
+  by simp
+
+lemma rf_empty_iff:
+  "rf_val m s = [] \<longleftrightarrow> m s = None \<or> (\<exists>p q. m s = Some (p, [], q))"
+  by (cases "m s") (auto split: prod.split)
+
+lemma rf_occurs:
+  "rf_genuine m s \<Longrightarrow> \<exists>p q. s = p @ rf_val m s @ q"
+  by (cases "m s") (auto split: prod.split)
+
+theorem regexp_find_sound:
+  "rf_genuine m s \<longrightarrow>
+     (m s = None \<longrightarrow> rf_val m s = []) \<and>
+     (\<forall>p v q. m s = Some (p, v, q) \<longrightarrow> rf_val m s = v) \<and>
+     (rf_val m s = [] \<longleftrightarrow> m s = None \<or> (\<exists>p q. m s = Some (p, [], q))) \<and>
+     (\<exists>p q. s = p @ rf_val m s @ q)"
+  by (intro impI conjI allI rf_occurs) (simp_all add: rf_empty_iff)
+
+lemma regexp_find_witness:
+  "rf_val (\<lambda>s. if s = [97, 98, 99] then Some ([], [98], [99]) else None) [97, 98, 99] = [98] \<and>
+   rf_val (\<lambda>s. if s = [97, 98, 99] then Some ([97], [98], [99]) else None) [97, 98, 99] = [98] \<and>
+   rf_val (\<lambda>s. None) [97, 98, 99] = [] \<and>
+   rf_val (\<lambda>s. Some ([], [], s)) [97] = []"
+  by simp
+
+
 end

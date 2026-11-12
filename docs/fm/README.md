@@ -201,7 +201,7 @@ three that did not — `newline_strip_sound`, `uniq_lines_sound`,
 (`sort_lines_sound`). `harness/check-node-specs.pl` (workspace `harness/`) makes
 "no dangling spec" a machine check: it collects every `theorem`/`lemma`/
 `definition`/`fun` under `docs/fm` and fails on a `spec:` naming one that does
-not exist. It reports 33 resolved, 15 unstated, 0 pending, 0 dangling.
+not exist. It reports 34 resolved, 14 unstated, 0 pending, 0 dangling.
 
 - `newline_strip_sound` (`ShIR_TextOps_Strip`): the node is the trailing-run
   removal, with the run length and the prefix equation.
@@ -236,9 +236,9 @@ deliberate no-obligation form. `--map` prints the node→theorem table below and
 `--selftest` runs the five negative controls (real theorem, definition, dangling
 name, wrong session prefix, unbuilt theory).
 
-Current inventory: **33 resolved, 15 unstated, 0 pending, 0 errors**.
+Current inventory: **34 resolved, 14 unstated, 0 pending, 0 errors**.
 
-The 33 resolved specs (31 distinct theorems; `lowered_wc_sound` covers three
+The 34 resolved specs (32 distinct theorems; `lowered_wc_sound` covers three
 nodes and `field_extract`, `split`, `substitute`, `uniq_lines` and
 `cutset_trim` cite two each):
 
@@ -259,6 +259,7 @@ nodes and `field_extract`, `split`, `substitute`, `uniq_lines` and
 | `path_name` | `path_name_sound` |
 | `newline_strip` | `newline_strip_sound` |
 | `reg_count` | `lowered_wc_sound` |
+| `regexp_find` | `regexp_find_sound` |
 | `repeat_str` | `repeat_str_sound` |
 | `sort_lines` | `sort_lines_sound` |
 | `split` | `split_ws_len`, `split_ws_fields_clean` |
@@ -323,6 +324,24 @@ duplicate and a miss, plus a stringifier that collides two distinct keys. Explic
 not promised: the stringification rule itself, property ORDER/iteration (JS reorders
 integer-like names, so the laws are about lookup), expression evaluation order, the
 length-mismatch refusal, and anything beyond bytes.
+
+### `regexp_find` over an abstract matcher (2026-11-13)
+
+`regexp_find` is the leftmost regex match as a string, `""` when nothing matches, and
+every backend renders it by extracting the match from what its engine reports — so the
+obligation is over an abstract matcher that reports a DECOMPOSITION
+`(prefix, matched, suffix)` or `None`, not over one dialect's answers.
+`regexp_find_sound` proves the four things a renderer relies on: no match gives `""`;
+a reported match gives exactly the reported bytes (no re-derivation, re-encoding or
+normalisation); `""` means no match OR an empty match, so `""` is not evidence of a
+miss; and a matcher reporting a genuine decomposition returns bytes that occur in the
+subject (`s = p @ result @ q`), which is what makes a `take`/`drop` rendering sound.
+Leftmost-ness itself is the abstraction's premise, stated as scope rather than
+re-proved, along with the dialect, capture groups and evaluation order.
+
+`reg_sub` remains unstated on purpose: its obligation is the substitution ENGINE plus
+the per-line and global folds, which is `ShIR_TextOps_Substitute`'s subject; wiring it
+to a theorem that only mentions one rendering would say less than the node promises.
 
 ### The two obligations that were thinner than their names (2026-11-13)
 

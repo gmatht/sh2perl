@@ -17,4 +17,21 @@ kind expr
 # storage_class str_bounded
 field text: expr
 field pattern: expr
-spec: none (unstated)
+# Spec: TextOps#regexp_find_sound (docs/fm/TextOps/ShIR_TextOps_Strings.thy, section
+# "RegexpFind: the leftmost match, as a string"). Stated over an ABSTRACT matcher that
+# reports the leftmost match's DECOMPOSITION (prefix, matched text, suffix), or None —
+# the node's value is that middle component, and [] for None. Proved: no match yields
+# ""; a reported match yields exactly the reported bytes (the node never re-derives,
+# re-encodes or normalises them); "" comes back exactly when there is no match or the
+# match is empty; and for any matcher reporting a GENUINE decomposition the returned
+# bytes occur in the subject (`s = p @ result @ q`), which is what makes a
+# take/drop-based rendering sound.
+#
+# NOT PROMISED (stated, not assumed): leftmost-ness itself (the abstraction hands back
+# the leftmost match, so an engine that skipped an earlier match is not caught — search
+# order, alternation preference and greediness are the engine's contract); the regex
+# DIALECT (ERE/RE2 classes, anchors, quantifiers, groups), case folding, locale and
+# Unicode rules; capture groups and backreferences, which are not this node's value;
+# evaluation of `text`/`pattern` (the model takes already-evaluated bytes); and bytes
+# only — no encoding or Unicode normalisation.
+spec: TextOps#regexp_find_sound
