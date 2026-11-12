@@ -12,4 +12,10 @@ field text: expr
 field count: expr
 field from_end: bool
 field bytes: bool
-spec: none (unstated)
+spec: none (unstated: TakeLines is head/tail over a real line splitter —
+# split on LF KEEPING empty fields (Perl split(/\n/,$t,-1), JS split('\n'), Java
+# split("\n",-1)), take N fields from the front or back, rejoin with LF and add no
+# terminator, so empty input is one empty line and "a\nb\n" is three. Stating that
+# honestly needs an inverse-pair lemma (split ∘ join = id on newline-free chunks)
+# plus a suffix law for the from-end arm; both were attempted in this session and
+# did not close, so no law is approximated here.)
