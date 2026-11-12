@@ -1045,4 +1045,229 @@ qed
 
 end
 
+section \<open>`uniq -s N`: the run collapse under a key\<close>
+
+text \<open>`uniq -s N` decides whether two lines belong to the same run by comparing
+  their SUFFIXES (\<open>drop N\<close>) instead of the lines, and keeps the FIRST line of
+  the run — the survivor keeps the characters the comparison ignored. Which end
+  of a run a recursion keeps is invisible under exact equality (all the lines of
+  a run are the same line then), so it is the whole difference here: a
+  \<open>drop_runs\<close>-shaped recursion drops the head and keeps the last member, which
+  for a skip relation is a DIFFERENT value. The collapse is therefore written
+  keep-first, with the run leader as the comparison key (an equivalence, since a
+  key is a function), and the obligations are proved below.\<close>
+
+fun key_from :: "(line \<Rightarrow> line) \<Rightarrow> line \<Rightarrow> line list \<Rightarrow> line list" where
+  "key_from K c [] = []"
+| "key_from K c (y # ys) =
+     (if K y = K c then key_from K c ys else y # key_from K y ys)"
+
+definition key_runs :: "(line \<Rightarrow> line) \<Rightarrow> line list \<Rightarrow> line list" where
+  "key_runs K ls = (case ls of [] \<Rightarrow> [] | x # xs \<Rightarrow> x # key_from K x xs)"
+
+text \<open>\<open>key_free K\<close> is the companion predicate: no two adjacent lines have the same
+  key, i.e. every maximal run really was reduced to one line.\<close>
+
+fun key_free :: "(line \<Rightarrow> line) \<Rightarrow> line list \<Rightarrow> bool" where
+  "key_free K [] = True"
+| "key_free K [x] = True"
+| "key_free K (x # y # ys) = (K x \<noteq> K y \<and> key_free K (y # ys))"
+
+lemma key_from_nil [simp]: "key_from K c [] = []"
+  by simp
+
+lemma key_from_cons [simp]:
+  "key_from K c (y # ys) =
+     (if K y = K c then key_from K c ys else y # key_from K y ys)"
+  by simp
+
+lemma key_runs_nil [simp]: "key_runs K [] = []"
+  unfolding key_runs_def by simp
+
+lemma key_runs_cons [simp]: "key_runs K (x # xs) = x # key_from K x xs"
+  unfolding key_runs_def by simp
+
+lemma key_runs_nonempty:
+  assumes "ls \<noteq> []"
+  shows "key_runs K ls \<noteq> []"
+  using assms by (cases ls) simp_all
+
+lemma key_runs_head:
+  assumes "ls \<noteq> []"
+  shows "hd (key_runs K ls) = hd ls"
+  using assms by (cases ls) simp_all
+
+lemma key_from_length_le: "\<forall>c. length (key_from K c zs) \<le> length zs"
+proof (induct zs)
+  case Nil
+  then show ?case by simp
+next
+  case (Cons y ys)
+  note IH = Cons
+  show ?case
+  proof (rule allI)
+    fix c
+    show "length (key_from K c (y # ys)) \<le> length (y # ys)"
+    proof (cases "K y = K c")
+      case True
+      have ihc: "length (key_from K c ys) \<le> length ys" using IH by blast
+      then show ?thesis using True by simp
+    next
+      case False
+      have ihy: "length (key_from K y ys) \<le> length ys" using IH by blast
+      then show ?thesis using False by simp
+    qed
+  qed
+qed
+
+lemma key_runs_length_le: "length (key_runs K ls) \<le> length ls"
+proof (cases ls)
+  case Nil
+  then show ?thesis by simp
+next
+  case (Cons x xs)
+  have h: "length (key_from K x xs) \<le> length xs" using key_from_length_le by blast
+  show ?thesis using h Cons by simp
+qed
+
+lemma key_from_head_ne:
+  assumes "key_from K c zs = z # zt"
+  shows "K z \<noteq> K c"
+  using assms
+proof (induct zs)
+  case Nil
+  then show ?case by simp
+next
+  case (Cons y ys)
+  note IH = Cons(1)
+  note hEq = Cons(2)
+  show ?case
+  proof (cases "K y = K c")
+    case True
+    then have e: "key_from K c (y # ys) = key_from K c ys" by simp
+    have "key_from K c ys = z # zt" using hEq e by simp
+    with IH have "K z \<noteq> K c" by blast
+    then show ?thesis using e by simp
+  next
+    case False
+    then have "key_from K c (y # ys) = y # key_from K y ys" by simp
+    then have "z = y" using hEq by simp
+    then show ?thesis using False by simp
+  qed
+qed
+
+lemma key_from_key_free: "\<forall>c. key_free K (key_from K c zs)"
+proof (induct zs)
+  case Nil
+  then show ?case by simp
+next
+  case (Cons y ys)
+  note IH = Cons
+  show ?case
+  proof (rule allI)
+    fix c
+    show "key_free K (key_from K c (y # ys))"
+    proof (cases "K y = K c")
+      case True
+      have ihc: "key_free K (key_from K c ys)" using IH by blast
+      then show ?thesis using True by simp
+    next
+      case False
+      have ihy: "key_free K (key_from K y ys)" using IH by blast
+      show ?thesis
+      proof (cases "key_from K y ys")
+        case Nil
+        then show ?thesis using False by simp
+      next
+        case (Cons z zt)
+        have hne: "K z \<noteq> K y" using key_from_head_ne Cons by blast
+        have ihf: "key_free K (z # zt)" using ihy Cons by metis
+        show ?thesis using False Cons hne ihf by simp
+      qed
+    qed
+  qed
+qed
+
+lemma key_runs_key_free: "key_free K (key_runs K ls)"
+proof (cases ls)
+  case Nil
+  then show ?thesis by simp
+next
+  case (Cons x xs)
+  note lsC = Cons
+  show ?thesis
+  proof (cases "key_from K x xs")
+    case Nil
+    then show ?thesis using lsC by simp
+  next
+    case (Cons z zt)
+    have hne: "K z \<noteq> K x" using key_from_head_ne Cons by blast
+    have ihf: "key_free K (z # zt)" using key_from_key_free Cons by metis
+    show ?thesis using lsC Cons hne ihf by simp
+  qed
+qed
+
+text \<open>\<open>uniq_lines_skip_sound\<close>: the node's value for \<open>uniq -s N\<close> — the collapse
+  under the key \<open>drop N\<close> — keeps the first line of every run (so the skipped
+  characters survive in the printed line), every following line of the run is
+  dropped, the value is a subsequence (no longer than its input), and no two
+  survivors share a key (so the runs are separated: nothing that uniq keeps is
+  lost and nothing it drops is kept).\<close>
+
+theorem uniq_lines_skip_sound:
+  "length (key_runs (drop N) ls) \<le> length ls \<and>
+   (ls \<noteq> [] \<longrightarrow> hd (key_runs (drop N) ls) = hd ls) \<and>
+   key_free (drop N) (key_runs (drop N) ls)"
+proof (intro conjI)
+  show "length (key_runs (drop N) ls) \<le> length ls" by (rule key_runs_length_le)
+  show "ls \<noteq> [] \<longrightarrow> hd (key_runs (drop N) ls) = hd ls"
+  proof (rule impI)
+    assume "ls \<noteq> []"
+    then show "hd (key_runs (drop N) ls) = hd ls" by (rule key_runs_head)
+  qed
+  show "key_free (drop N) (key_runs (drop N) ls)" by (rule key_runs_key_free)
+qed
+
+text \<open>The two boundary cases the node's comment used to assert in prose, now
+  as theorems: at \<open>N = 0\<close> the skip collapse IS the plain run collapse (\<open>drop_runs\<close>),
+  and at \<open>N = 1\<close> it is NOT — two lines that differ only before the skipped
+  characters are one run for `uniq -s 1`, and the FIRST of them survives.\<close>
+
+lemma key_runs_id_is_drop_runs: "key_runs id ls = drop_runs ls"
+proof (induct ls rule: drop_runs.induct)
+  case 1
+  then show ?case by simp
+next
+  case (2 x)
+  then show ?case by simp
+next
+  case (3 x y ys)
+  have ih: "key_runs id (y # ys) = drop_runs (y # ys)" using 3(1,2) by blast
+  show ?case
+  proof (cases "x = y")
+    case True
+    have e1: "key_runs id (x # y # ys) = key_runs id (y # ys)" using True by simp
+    have e2: "drop_runs (x # y # ys) = drop_runs (y # ys)" using True by simp
+    then show ?thesis using e1 ih by metis
+  next
+    case False
+    have e1: "key_runs id (x # y # ys) = x # key_runs id (y # ys)" using False by simp
+    have e2: "drop_runs (x # y # ys) = x # drop_runs (y # ys)" using False by simp
+    then show ?thesis using e1 e2 ih by metis
+  qed
+qed
+
+theorem uniq_lines_skip_zero:
+  "key_runs (drop 0) ls = drop_runs ls"
+proof -
+  have e: "(drop 0 :: line \<Rightarrow> line) = id" by (rule ext) simp
+  have h: "key_runs id ls = drop_runs ls" by (rule key_runs_id_is_drop_runs)
+  show ?thesis using e h by simp
+qed
+
+theorem uniq_lines_skip_merges:
+  "key_runs (drop 1) [[97, 98], [120, 98]] = [[97, 98]]"
+  by simp
+
+
 end

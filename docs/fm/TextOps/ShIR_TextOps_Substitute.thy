@@ -538,4 +538,164 @@ text \<open>LIMITATION, recorded rather than hidden. (a) The node's LINE domain 
   copied through). The engines are the part every renderer shares; the two
   absences are named, and neither is papered over.\<close>
 
+section \<open>The node's line domain\<close>
+
+text \<open>The node replaces matches in the LINES of a text, while the engine above
+  runs over one byte string. Splitting and re-joining the lines commutes with the
+  engine exactly when the compiled matcher neither CROSSES nor STARTS AT a
+  newline, which is what the two hypotheses of
+  \<open>substitute_line_domain_sound\<close> say: \<open>loc\<close> (a match found at the head of a
+  line boundary is the one found at the head of that line) and \<open>nonl\<close> (no
+  match starts at the newline itself). Both are properties of the compiled
+  pattern, not of the node, so they are hypotheses — and they are not vacuous:
+  \<open>one_byte_matcher\<close> below satisfies them for every byte list, which is
+  proved, not asserted.\<close>
+
+lemma take_beyond:
+  assumes h: "n \<le> length l"
+  shows "take n (l @ v) = take n l"
+proof -
+  from h have d: "n - length l = 0" by arith
+  show ?thesis by (simp add: take_append d)
+qed
+
+lemma drop_beyond:
+  assumes h: "n \<le> length l"
+  shows "drop n (l @ v) = drop n l @ v"
+proof -
+  from h have d: "n - length l = 0" by arith
+  show ?thesis by (simp add: drop_append d)
+qed
+
+text \<open>The law below is stated with the match position ABSTRACT
+  (\<open>clipped m (c # cs)\<close>), so no case split on it is needed: \<open>take_beyond\<close> /
+  \<open>drop_beyond\<close> peel the newline off the text once and for all, and the two
+  fuels are aligned with \<open>subst_all_any_fuel\<close> (the fuel is the text length, so
+  the tail is processed at the same fuel on both sides).\<close>
+
+theorem substitute_line_domain_sound:
+  assumes loc: "\<And>l u. clipped m (l @ 10 # u) = clipped m l"
+    and nonl: "\<And>u. clipped m (10 # u) = 0"
+  shows "\<And>l t. length (l @ 10 # t) \<le> n \<Longrightarrow>
+         subst_all m r n (l @ 10 # t) =
+         subst_all m r n l @ 10 # subst_all m r n t"
+proof (induct n)
+  case 0
+  show ?case by simp
+next
+  case (Suc n')
+  note ih = Suc(1)
+  fix l :: bytes and t :: bytes
+  assume fuel: "length (l @ 10 # t) \<le> Suc n'"
+  have fl: "length (l @ 10 # t) = Suc (length l + length t)" by simp
+  have ltX: "length l + length t \<le> n'" using fuel fl by arith
+  show "subst_all m r (Suc n') (l @ 10 # t) =
+        subst_all m r (Suc n') l @ 10 # subst_all m r (Suc n') t"
+  proof (cases l)
+    case Nil
+    have h0: "clipped m (10 # t) = 0" by (rule nonl)
+    have ltT: "length t \<le> n'" using ltX Nil by simp
+    have ltTS: "length t \<le> Suc n'" using ltT by arith
+    have a1: "subst_all m r n' t = subst_all m r (length t) t"
+      by (rule subst_all_any_fuel) (simp add: ltT)
+    have a2: "subst_all m r (Suc n') t = subst_all m r (length t) t"
+      by (rule subst_all_any_fuel) (simp add: ltTS)
+    show ?thesis using h0 a1 a2 Nil by simp
+  next
+    case (Cons c cs)
+    note lsC = Cons
+    have e1: "length (l @ 10 # t) = Suc (Suc (length cs + length t))" using lsC by simp
+    have ltX2: "Suc (length cs + length t) \<le> n'" using fuel e1 by arith
+    have ltT: "length t \<le> n'" using ltX2 by arith
+    have ltTS: "length t \<le> Suc n'" using ltT by arith
+    have a1: "subst_all m r n' t = subst_all m r (length t) t"
+      by (rule subst_all_any_fuel) (simp add: ltT)
+    have a2: "subst_all m r (Suc n') t = subst_all m r (length t) t"
+      by (rule subst_all_any_fuel) (simp add: ltTS)
+    show ?thesis
+    proof (cases "clipped m (c # cs) = 0")
+      case True
+      have ecs: "length (cs @ 10 # t) = Suc (length cs + length t)" by simp
+      have fcs2: "length (cs @ 10 # t) \<le> n'" using ltX2 ecs by arith
+      have ihcs: "subst_all m r n' (cs @ 10 # t) =
+                  subst_all m r n' cs @ 10 # subst_all m r n' t"
+        by (rule ih) (rule fcs2)
+      have kz: "clipped m ((c # cs) @ 10 # t) = 0"
+      proof -
+        have kk: "clipped m ((c # cs) @ 10 # t) = clipped m (c # cs)" by (rule loc)
+        show ?thesis using kk True by simp
+      qed
+      show ?thesis using True kz ihcs a1 a2 lsC by simp
+    next
+      case False
+      have kpos: "1 \<le> clipped m (c # cs)" using False by arith
+      have k: "clipped m ((c # cs) @ 10 # t) = clipped m (c # cs)" by (rule loc)
+      have tk: "take (clipped m (c # cs)) ((c # cs) @ 10 # t) =
+                take (clipped m (c # cs)) (c # cs)"
+        by (rule take_beyond[OF clipped_le])
+      have dr: "drop (clipped m (c # cs)) ((c # cs) @ 10 # t) =
+                drop (clipped m (c # cs)) (c # cs) @ (10 # t)"
+        by (rule drop_beyond[OF clipped_le])
+      have ld: "length (drop (clipped m (c # cs)) (c # cs)) =
+                length (c # cs) - clipped m (c # cs)" by (simp add: length_drop)
+      have ld2: "length (c # cs) = Suc (length cs)" by simp
+      have f2: "length (drop (clipped m (c # cs)) (c # cs)) \<le> length cs"
+        using ld ld2 kpos by arith
+      have f1: "length (drop (clipped m (c # cs)) (c # cs) @ 10 # t) =
+                Suc (length (drop (clipped m (c # cs)) (c # cs)) + length t)" by simp
+      have fu: "length (drop (clipped m (c # cs)) (c # cs) @ 10 # t) \<le> n'"
+        using f1 f2 ltX2 by arith
+      have ihx: "subst_all m r n' (drop (clipped m (c # cs)) (c # cs) @ 10 # t) =
+                 subst_all m r n' (drop (clipped m (c # cs)) (c # cs)) @
+                 10 # subst_all m r n' t"
+        by (rule ih) (rule fu)
+      show ?thesis using False k tk dr ihx a1 a2 lsC by simp
+    qed
+  qed
+qed
+
+corollary substitute_line_domain_global:
+  assumes loc: "\<And>l u. clipped m (l @ 10 # u) = clipped m l"
+    and nonl: "\<And>u. clipped m (10 # u) = 0"
+  shows "substitute m r True (l @ 10 # t) =
+         subst_all m r (length (l @ 10 # t)) l @ 10 #
+         subst_all m r (length (l @ 10 # t)) t"
+proof -
+  have step: "subst_all m r (length (l @ 10 # t)) (l @ 10 # t) =
+              subst_all m r (length (l @ 10 # t)) l @ 10 #
+              subst_all m r (length (l @ 10 # t)) t"
+    by (rule substitute_line_domain_sound[OF loc nonl]) simp
+  show ?thesis unfolding substitute_def using step by simp
+qed
+
+text \<open>The hypotheses are not vacuous: a matcher that recognises a single byte
+  at the head of the string satisfies both. proj: it matches byte 97 only when it
+  is the first byte, so nothing matches at a no-match state and no match can
+  reach across a newline.\<close>
+
+definition one_byte_matcher :: "bytes \<Rightarrow> nat" where
+  "one_byte_matcher s = (if s = [] then 0 else if hd s = 97 then 1 else 0)"
+
+lemma clipped_one_byte_loc:
+  "clipped one_byte_matcher (l @ 10 # u) = clipped one_byte_matcher l"
+proof (cases l)
+  case Nil
+  then show ?thesis unfolding clipped_def one_byte_matcher_def by simp
+next
+  case (Cons a as)
+  then show ?thesis unfolding clipped_def one_byte_matcher_def by simp
+qed
+
+lemma clipped_one_byte_nonl:
+  "clipped one_byte_matcher (10 # u) = 0"
+  unfolding clipped_def one_byte_matcher_def by simp
+
+theorem substitute_line_domain_sound_one_byte:
+  "length (l @ 10 # t) \<le> n \<Longrightarrow>
+   subst_all one_byte_matcher r n (l @ 10 # t) =
+   subst_all one_byte_matcher r n l @ 10 # subst_all one_byte_matcher r n t"
+  by (rule substitute_line_domain_sound)
+     (simp_all add: clipped_one_byte_loc clipped_one_byte_nonl)
+
+
 end

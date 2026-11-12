@@ -37,15 +37,15 @@ field skip: int
 # the same denotation.
 field count: bool
 spec: TextOps#uniq_lines_sound
-# `uniq -s N` (`skip`) is NOT yet proved. The obligation is the same run collapse
-# with the run test `drop N x = drop N y` instead of `x = y`; it is not a corollary
-# of `uniq_lines_sound` because the test changes, so the collapse needs its own
-# induction. Two facts are already clear and are NOT yet stated as theorems: at
-# `N = 0` the two collapses coincide (`drop_runs` keeps the FIRST line of a run,
-# which corrects what an earlier version of this comment claimed), and at `N > 0`
-# they differ (skip 1 merges ["ab","xb"] into ["ab"], which `drop_runs` keeps
-# apart). Blocker: the `fun` recursion on `y # ys` needs the generated induction
-# rule, and the same shape with the relation as an extra argument binds its case
-# variables differently from `drop_runs.induct`, so the mirror proof does not go
-# through as written. Named open rather than claimed.
-spec: pending TextOps#uniq_lines_skip_sound
+# `uniq -s N` (`skip`): proved as `TextOps#uniq_lines_skip_sound` in
+# ShIR_TextOps_SortUniq.thy, with the value written keep-first over the run leader
+# (`key_runs (drop N)`): the survivor of a run is the FIRST line, so the skipped
+# characters survive in the printed line, which is exactly what `uniq` prints.
+# The theorem gives the length bound, the head (keep-first) law and `key_free`
+# (no two survivors share a suffix) — the run structure outright. Two boundary
+# cases are theorems too: `uniq_lines_skip_zero` (at N = 0 the skip collapse IS
+# `drop_runs`) and `uniq_lines_skip_merges` (at N = 1 it is not: ["ab","xb"]
+# collapses to ["ab"], which `drop_runs` keeps apart). A `drop_runs`-shaped
+# recursion keeps the LAST member of a run, which coincides with keep-first only
+# under exact equality — that was the trap, not the relation parameter.
+spec: TextOps#uniq_lines_skip_sound

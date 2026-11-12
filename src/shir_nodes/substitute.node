@@ -40,8 +40,15 @@ field global: bool
 # is built rather than carried here.
 field ignore_case: bool
 spec: TextOps#substitute_sound
-# The node substitutes the LINES of `text`; the theory models the engine on a
-# byte string and does not prove the line split/re-join commutes with it (that
-# needs a matcher that cannot cross a newline, i.e. a property of the compiled
-# regex). Named open, not silently folded into `none`.
-spec: pending TextOps#substitute_line_domain_sound
+# The node substitutes the LINES of `text`; the engine in the theory runs on one
+# byte string. `TextOps#substitute_line_domain_sound` is the bridge, proved under
+# two explicit hypotheses on the COMPILED matcher (not on the node):
+#   loc:  `clipped m (l @ 10 # u) = clipped m l`  — no match crosses a newline,
+#   nonl: `clipped m (10 # u) = 0`                — no match starts at one.
+# Under them the engine at the node's fuel splits at a boundary:
+#   subst_all m r n (l @ 10 # t) = subst_all m r n l @ 10 # subst_all m r n t,
+# and `substitute_line_domain_global` states it for the node's own fuel. The
+# hypotheses are not vacuous: `substitute_line_domain_sound_one_byte` proves the
+# same law for a matcher that recognises a single byte at the head, whose `loc`
+# and `nonl` are themselves theorems (`clipped_one_byte_loc`, `clipped_one_byte_nonl`).
+spec: TextOps#substitute_line_domain_sound
