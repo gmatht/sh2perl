@@ -1319,4 +1319,440 @@ proof (intro conjI)
 qed
 
 
+section \<open>CaseTransform: casing as a byte table, and its ASCII guard\<close>
+
+text \<open>`CaseTransform` is emitted for `tr a-z A-Z`, `${var^}`, `${var^^}`,
+  `${var,}` and `${var,,}`, and rendered as `lc`/`uc`, `toLowerCase`, `tolower`.
+  The model here is the BYTE table, because this session's strings are bytes.
+  That is not a limitation of convenience: it is what the node means in the
+  shell, and it is where several renderers stop being faithful. The rules
+  proved below are exactly the ones a renderer may depend on for ASCII input;
+  what the model does NOT cover is stated at the end of the section, and the
+  node comment repeats it.\<close>
+
+definition up_byte :: "nat \<Rightarrow> nat" where
+  "up_byte c = (if 97 \<le> c \<and> c \<le> 122 then c - 32 else c)"
+
+definition down_byte :: "nat \<Rightarrow> nat" where
+  "down_byte c = (if 65 \<le> c \<and> c \<le> 90 then c + 32 else c)"
+
+definition case_map :: "bool \<Rightarrow> bytes \<Rightarrow> bytes" where
+  "case_map up s = map (if up then up_byte else down_byte) s"
+
+lemma up_byte_idem [simp]: "up_byte (up_byte c) = up_byte c"
+proof (cases "97 \<le> c \<and> c \<le> 122")
+  case True
+  have h1: "up_byte c = c - 32" using True by (simp add: up_byte_def; arith)
+  have h3: "\<not> (97 \<le> c - 32 \<and> c - 32 \<le> 122)" using True by arith
+  have h4: "up_byte (c - 32) = c - 32" using h3 by (simp add: up_byte_def; arith)
+  show ?thesis using h1 h4 by metis
+next
+  case False
+  have h1: "up_byte c = c" using False by (simp add: up_byte_def; arith)
+  then show ?thesis by simp
+qed
+
+lemma down_byte_idem [simp]: "down_byte (down_byte c) = down_byte c"
+proof (cases "65 \<le> c \<and> c \<le> 90")
+  case True
+  have h1: "down_byte c = c + 32" using True by (simp add: down_byte_def; arith)
+  have h3: "\<not> (65 \<le> c + 32 \<and> c + 32 \<le> 90)" using True by arith
+  have h4: "down_byte (c + 32) = c + 32" using h3 by (simp add: down_byte_def; arith)
+  show ?thesis using h1 h4 by metis
+next
+  case False
+  have h1: "down_byte c = c" using False by (simp add: down_byte_def; arith)
+  then show ?thesis by simp
+qed
+
+lemma up_then_down [simp]: "down_byte (up_byte c) = down_byte c"
+proof (cases "97 \<le> c \<and> c \<le> 122")
+  case True
+  have hu: "up_byte c = c - 32" using True by (simp add: up_byte_def; arith)
+  have nlow: "\<not> (65 \<le> c \<and> c \<le> 90)" using True by arith
+  have dc: "down_byte c = c" using nlow by (simp add: down_byte_def; arith)
+  have inr: "65 \<le> c - 32 \<and> c - 32 \<le> 90" using True by arith
+  have step: "down_byte (c - 32) = c"
+  proof -
+    have "down_byte (c - 32) = (c - 32) + 32" using inr by (simp add: down_byte_def)
+    then show ?thesis using True by arith
+  qed
+  show ?thesis using hu dc step by metis
+next
+  case False
+  have hu: "up_byte c = c" using False by (simp add: up_byte_def; arith)
+  then show ?thesis by simp
+qed
+
+lemma down_then_up [simp]: "up_byte (down_byte c) = up_byte c"
+proof (cases "65 \<le> c \<and> c \<le> 90")
+  case True
+  have hd: "down_byte c = c + 32" using True by (simp add: down_byte_def; arith)
+  have nup: "\<not> (97 \<le> c \<and> c \<le> 122)" using True by arith
+  have uc: "up_byte c = c" using nup by (simp add: up_byte_def; arith)
+  have inr: "97 \<le> c + 32 \<and> c + 32 \<le> 122" using True by arith
+  have step: "up_byte (c + 32) = c"
+  proof -
+    have "up_byte (c + 32) = (c + 32) - 32" using inr by (simp add: up_byte_def)
+    then show ?thesis using True by arith
+  qed
+  show ?thesis using hd uc step by metis
+next
+  case False
+  have hd: "down_byte c = c" using False by (simp add: down_byte_def; arith)
+  then show ?thesis by simp
+qed
+
+text \<open>Casing a text never changes its length, is idempotent, and the two
+  directions compose to the inner one — which is why a renderer may run `lc` and
+  `uc` in either order without inventing a third case. Non-ASCII bytes are FIXED
+  POINTS: that is the guard the arms rely on, and the divergence below.\<close>
+
+lemma case_map_length [simp]: "length (case_map up s) = length s"
+  by (simp add: case_map_def)
+
+lemma case_map_idem [simp]: "case_map up (case_map up s) = case_map up s"
+  by (induct s) (simp_all add: case_map_def)
+
+lemma case_map_down_of_up [simp]: "case_map False (case_map True s) = case_map False s"
+  by (induct s) (simp_all add: case_map_def)
+
+lemma case_map_up_of_down [simp]: "case_map True (case_map False s) = case_map True s"
+  by (induct s) (simp_all add: case_map_def)
+
+lemma case_map_non_ascii [simp]: "128 \<le> c \<Longrightarrow> case_map up [c] = [c]"
+proof -
+  assume h: "128 \<le> c"
+  have nlow: "\<not> (97 \<le> c \<and> c \<le> 122)" using h by arith
+  have nup: "\<not> (65 \<le> c \<and> c \<le> 90)" using h by arith
+  have u: "up_byte c = c" using nlow by (simp add: up_byte_def; arith)
+  have d: "down_byte c = c" using nup by (simp add: down_byte_def; arith)
+  show ?thesis using u d by (simp add: case_map_def)
+qed
+
+theorem case_transform_sound:
+  "length (case_map up s) = length s \<and>
+   case_map up (case_map up s) = case_map up s \<and>
+   case_map True (case_map False s) = case_map True s \<and>
+   case_map False (case_map True s) = case_map False s \<and>
+   (\<forall>c. 128 \<le> c \<longrightarrow> case_map up [c] = [c])"
+proof (intro conjI)
+  show "length (case_map up s) = length s" by simp
+  show "case_map up (case_map up s) = case_map up s" by simp
+  show "case_map True (case_map False s) = case_map True s" by simp
+  show "case_map False (case_map True s) = case_map False s" by simp
+  show "\<forall>c. 128 \<le> c \<longrightarrow> case_map up [c] = [c]" using case_map_non_ascii by blast
+qed
+
+lemma case_map_ascii_witness:
+  "case_map True [97, 122, 65, 32] = [65, 90, 65, 32] \<and>
+   case_map False [65, 90, 97, 126] = [97, 122, 97, 126]"
+  by eval
+
+lemma case_map_utf8_witness:
+  "case_map True [195, 169] = [195, 169] \<and>
+   case_map False [195, 137] = [195, 137]"
+  by eval
+
+text \<open>WHAT IS OUT OF MODEL, precisely. The model cases ASCII letters only, so
+  every byte above 127 is a fixed point: `case_map True [0xC3, 0xA9]` is the
+  UTF-8 form of U+00E9 (e-acute) and the model leaves it alone. Rust's
+  `to_uppercase`, JS `toUpperCase` and Perl's `uc` under `use utf8` case-map the
+  CODE POINT instead, and would return U+00C9 (`[0xC3, 0x89]`). The two readings
+  therefore differ on exactly the inputs where a multi-byte character carries a
+  case: an ASCII-guarded renderer is faithful, an unguarded one is not. Bash's
+  own `${var^^}` is locale-dependent in the same way, which is why the node does
+  not promise a language's full casing table. The byte-level laws above are what
+  a guarded renderer may assume.\<close>
+
+section \<open>CharTranslate: the `tr` node\<close>
+
+text \<open>`CharTranslate` covers `tr SET1 SET2` and its `-d` (delete) and `-s`
+  (squeeze) modes. The three modes are modelled separately and composed by the
+  node's flags: translation (SET2 supplied), deletion (no SET2, drop the SET1
+  bytes), and squeezing (collapse runs of the SET2 bytes). `tr`'s target rule is
+  the one that surprises people — if SET2 is SHORTER than SET1, its LAST member
+  is repeated — so the table is built by `tr_expand`, and the key law is that
+  equal-length sets make the whole thing a per-byte map, which is what the cheap
+  renderers assume. NOT modelled: `tr`'s range syntax `a-z`, character classes
+  (`[:upper:]`), escapes (`\n`, `\055`) and the complement `-c` — the node's
+  SET fields are already-expanded byte strings, and range expansion is the
+  lowering's job, not the node's.\<close>
+
+fun tr_expand :: "bytes \<Rightarrow> bytes \<Rightarrow> (nat \<times> nat) list" where
+  "tr_expand [] to = []"
+| "tr_expand (f # fs) [] = (f, f) # tr_expand fs []"
+| "tr_expand (f # fs) (t # ts) = (f, t) # tr_expand fs (if ts = [] then [t] else ts)"
+
+definition tr_translate :: "bytes \<Rightarrow> bytes \<Rightarrow> bytes \<Rightarrow> bytes" where
+  "tr_translate src to s =
+     map (\<lambda>c. case map_of (tr_expand src to) c of Some t \<Rightarrow> t | None \<Rightarrow> c) s"
+
+definition tr_delete :: "bytes \<Rightarrow> bytes \<Rightarrow> bytes" where
+  "tr_delete src s = filter (\<lambda>c. c \<notin> set src) s"
+
+fun squeeze_runs :: "(nat \<Rightarrow> bool) \<Rightarrow> bool \<Rightarrow> bytes \<Rightarrow> bytes" where
+  "squeeze_runs P prev [] = []"
+| "squeeze_runs P prev (c # cs) =
+     (if P c \<and> prev then squeeze_runs P prev cs
+      else c # squeeze_runs P (P c) cs)"
+
+definition squeeze :: "(nat \<Rightarrow> bool) \<Rightarrow> bytes \<Rightarrow> bytes" where
+  "squeeze P s = squeeze_runs P False s"
+
+lemma tr_expand_equal:
+  "length src = length to \<Longrightarrow> tr_expand src to = zip src to"
+proof (induct src arbitrary: to)
+  case Nil
+  then show ?case by (cases to) simp_all
+next
+  case (Cons f fs)
+  note IH = Cons(1)
+  note len0 = Cons(2)
+  show ?case
+  proof (cases to)
+    case Nil
+    then show ?thesis using len0 by simp
+  next
+    case (Cons t ts)
+    note to_case = this
+    have len: "length fs = length ts" using len0 to_case by simp
+    show ?thesis
+    proof (cases ts)
+      case Nil
+      then have fs_nil: "fs = []" using len by simp
+      then show ?thesis using to_case Nil by simp
+    next
+      case (Cons t' ts')
+      then show ?thesis using IH len to_case by simp
+    qed
+  qed
+qed
+
+lemma map_of_self_eq: "map_of (map (\<lambda>f. (f, f)) xs) c = Some t \<Longrightarrow> t = c"
+  by (induct xs) (auto split: if_split_asm)
+
+lemma tr_expand_nil_to [simp]: "tr_expand src [] = map (\<lambda>f. (f, f)) src"
+  by (induct src) simp_all
+
+lemma tr_translate_nil_to [simp]: "tr_translate src [] s = s"
+proof -
+  have id: "\<And>c. (case map_of (map (\<lambda>f. (f, f)) src) c of Some t \<Rightarrow> t | None \<Rightarrow> c) = c"
+  proof -
+    fix c
+    show "(case map_of (map (\<lambda>f. (f, f)) src) c of Some t \<Rightarrow> t | None \<Rightarrow> c) = c"
+    proof (cases "map_of (map (\<lambda>f. (f, f)) src) c")
+      case None
+      then show ?thesis by simp
+    next
+      case (Some t)
+      then have "t = c" by (rule map_of_self_eq)
+      then show ?thesis using Some by simp
+    qed
+  qed
+  show ?thesis by (simp add: tr_translate_def id)
+qed
+
+lemma tr_translate_length [simp]: "length (tr_translate src to s) = length s"
+  by (simp add: tr_translate_def)
+
+lemma tr_translate_nil_from [simp]: "tr_translate [] to s = s"
+  by (simp add: tr_translate_def)
+
+theorem tr_translate_is_byte_map:
+  "length src = length to \<Longrightarrow>
+     tr_translate src to s =
+       map (\<lambda>c. case map_of (zip src to) c of Some t \<Rightarrow> t | None \<Rightarrow> c) s"
+  unfolding tr_translate_def using tr_expand_equal by simp
+
+lemma tr_expand_short_target:
+  "tr_expand [97, 98, 99] [120, 121] = [(97, 120), (98, 121), (99, 121)]"
+  by eval
+
+lemma tr_delete_set: "set (tr_delete src s) = set s - set src"
+  by (auto simp: tr_delete_def)
+
+lemma tr_delete_length_le [simp]: "length (tr_delete src s) \<le> length s"
+  by (simp add: tr_delete_def)
+
+lemma tr_delete_nil_from [simp]: "tr_delete [] s = s"
+  by (simp add: tr_delete_def)
+
+lemma tr_delete_witness:
+  "tr_delete [97] [98, 97, 97, 99] = [98, 99] \<and>
+   tr_delete [] [97, 98] = [97, 98] \<and>
+   tr_delete [97, 98] [97, 98, 99] = [99]"
+  by eval
+
+lemma squeeze_runs_subset [simp]: "set (squeeze_runs P prev s) \<subseteq> set s"
+  by (induct s arbitrary: prev) (auto split: if_split)
+
+lemma squeeze_runs_length_le [simp]: "length (squeeze_runs P prev s) \<le> length s"
+proof (induct s arbitrary: prev)
+  case Nil
+  then show ?case by simp
+next
+  case (Cons c cs)
+  note IH = Cons(1)
+  show ?case
+  proof (cases "P c \<and> prev")
+    case True
+    have eq: "length (squeeze_runs P prev (c # cs)) = length (squeeze_runs P prev cs)"
+      using True by simp
+    have le1: "length (squeeze_runs P prev cs) \<le> length cs" using IH by metis
+    have "length (squeeze_runs P prev (c # cs)) \<le> length cs" using eq le1 by simp
+    then show ?thesis by simp
+  next
+    case False
+    have eq: "length (squeeze_runs P prev (c # cs)) =
+              Suc (length (squeeze_runs P (P c) cs))" using False by simp
+    have le1: "length (squeeze_runs P (P c) cs) \<le> length cs" using IH by metis
+    have "Suc (length (squeeze_runs P (P c) cs)) \<le> Suc (length cs)" using le1 by simp
+    then show ?thesis using eq by simp
+  qed
+qed
+
+lemma squeeze_head_nonmember:
+  "prev \<Longrightarrow> squeeze_runs P prev s = [] \<or>
+            (\<exists>x xs. squeeze_runs P prev s = x # xs \<and> \<not> P x)"
+proof (induct s arbitrary: prev)
+  case Nil
+  then show ?case by simp
+next
+  case (Cons c cs)
+  note IH = Cons(1)
+  note hprev = Cons(2)
+  show ?case
+  proof (cases "P c \<and> prev")
+    case True
+    then have eq: "squeeze_runs P prev (c # cs) = squeeze_runs P prev cs" by simp
+    have disj: "squeeze_runs P prev cs = [] \<or>
+          (\<exists>x xs. squeeze_runs P prev cs = x # xs \<and> \<not> P x)" using IH hprev by simp
+    then show ?thesis using eq by metis
+  next
+    case False
+    have np: "\<not> P c" using False hprev by blast
+    have keep: "squeeze_runs P prev (c # cs) = c # squeeze_runs P (P c) cs" using False by simp
+    have ex: "\<exists>x xs. squeeze_runs P prev (c # cs) = x # xs \<and> \<not> P x"
+      using keep np by blast
+    then show ?thesis by (rule disjI2)
+  qed
+qed
+
+fun no_run :: "(nat \<Rightarrow> bool) \<Rightarrow> bytes \<Rightarrow> bool" where
+  "no_run P [] = True"
+| "no_run P [_] = True"
+| "no_run P (x # y # zs) = (\<not> (P x \<and> P y) \<and> no_run P (y # zs))"
+
+lemma squeeze_no_run: "no_run P (squeeze_runs P prev s)"
+proof (induct s arbitrary: prev)
+  case Nil
+  then show ?case by simp
+next
+  case (Cons c cs)
+  note IH = Cons(1)
+  show ?case
+  proof (cases "P c \<and> prev")
+    case True
+    have eq: "squeeze_runs P prev (c # cs) = squeeze_runs P prev cs" using True by simp
+    then show ?thesis using IH by simp
+  next
+    case False
+    have keep: "squeeze_runs P prev (c # cs) = c # squeeze_runs P (P c) cs" using False by simp
+    have tail_ok: "no_run P (squeeze_runs P (P c) cs)" using IH by simp
+    show ?thesis
+    proof (cases "squeeze_runs P (P c) cs")
+      case Nil
+      then show ?thesis using keep by simp
+    next
+      case (Cons d ds)
+      note tail = this
+      have pc_imp: "P c \<Longrightarrow> \<not> P d"
+      proof -
+        assume pc: "P c"
+        have eq: "squeeze_runs P True cs = d # ds" using tail pc by simp
+        have hh: "squeeze_runs P True cs = [] \<or>
+                  (\<exists>x xs. squeeze_runs P True cs = x # xs \<and> \<not> P x)"
+          by (rule squeeze_head_nonmember) simp
+        have "\<not> P d"
+        proof (rule ccontr)
+          assume pd: "\<not> \<not> P d"
+          have ne: "squeeze_runs P True cs \<noteq> []" using eq by simp
+          with hh obtain x xs where cd: "squeeze_runs P True cs = x # xs"
+            and npx: "\<not> P x" by blast
+          have "x = d" using cd eq by simp
+          then show False using npx pd by simp
+        qed
+        then show "\<not> P d" .
+      qed
+      have h1: "\<not> (P c \<and> P d)" using pc_imp by blast
+      have h2: "no_run P (d # ds)" using tail tail_ok by simp
+      have ge: "squeeze_runs P prev (c # cs) = c # d # ds" using keep tail by simp
+      show ?thesis using ge h1 h2 by (simp add: no_run.simps)
+    qed
+  qed
+qed
+
+lemma squeeze_runs_replicate_member [simp]:
+  "P c \<Longrightarrow> squeeze_runs P prev (replicate n c) =
+     (if n = 0 then [] else if prev then [] else [c])"
+proof (induct n arbitrary: prev)
+  case 0
+  then show ?case by simp
+next
+  case (Suc m)
+  note IH = this
+  show ?case
+  proof (cases prev)
+    case True
+    then show ?thesis using IH by simp
+  next
+    case False
+    then show ?thesis using IH by simp
+  qed
+qed
+
+lemma squeeze_runs_replicate_nonmember [simp]:
+  "\<not> P c \<Longrightarrow> squeeze_runs P prev (replicate n c) = replicate n c"
+  by (induct n arbitrary: prev) simp_all
+
+lemma squeeze_witness:
+  "squeeze (\<lambda>c. c = 97) [97, 97, 97, 98, 97] = [97, 98, 97] \<and>
+   squeeze (\<lambda>c. c = 97) [98, 98] = [98, 98] \<and>
+   squeeze (\<lambda>c. c = 97) [] = [] \<and>
+   squeeze (\<lambda>c. c = 97) [97, 98, 97, 97] = [97, 98, 97]"
+  by eval
+
+theorem char_translate_sound:
+  "length (tr_translate src to s) = length s \<and>
+   (length src = length to \<longrightarrow>
+      tr_translate src to s =
+        map (\<lambda>c. case map_of (zip src to) c of Some t \<Rightarrow> t | None \<Rightarrow> c) s) \<and>
+   tr_translate [] to s = s \<and>
+   tr_translate src [] s = s \<and>
+   set (tr_delete src s) = set s - set src \<and>
+   length (tr_delete src s) \<le> length s \<and>
+   tr_delete [] s = s \<and>
+   set (squeeze (\<lambda>c. c \<in> set to) s) \<subseteq> set s \<and>
+   no_run (\<lambda>c. c \<in> set to) (squeeze (\<lambda>c. c \<in> set to) s) \<and>
+   length (squeeze (\<lambda>c. c \<in> set to) s) \<le> length s"
+proof (intro conjI)
+  show "length (tr_translate src to s) = length s" by simp
+  show "length src = length to \<longrightarrow>
+        tr_translate src to s =
+          map (\<lambda>c. case map_of (zip src to) c of Some t \<Rightarrow> t | None \<Rightarrow> c) s"
+    using tr_translate_is_byte_map by blast
+  show "tr_translate [] to s = s" by simp
+  show "tr_translate src [] s = s" by simp
+  show "set (tr_delete src s) = set s - set src" by (rule tr_delete_set)
+  show "length (tr_delete src s) \<le> length s" by simp
+  show "tr_delete [] s = s" by simp
+  show "set (squeeze (\<lambda>c. c \<in> set to) s) \<subseteq> set s"
+    by (simp add: squeeze_def)
+  show "no_run (\<lambda>c. c \<in> set to) (squeeze (\<lambda>c. c \<in> set to) s)"
+    by (simp add: squeeze_def squeeze_no_run)
+  show "length (squeeze (\<lambda>c. c \<in> set to) s) \<le> length s" by (simp add: squeeze_def)
+qed
+
+
 end

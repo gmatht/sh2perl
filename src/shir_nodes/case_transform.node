@@ -3,6 +3,14 @@
 #
 # Backends: Perl lc/uc, JS toLowerCase/toUpperCase, C tolower/toupper, Rust to_lowercase
 # Fallback: sh2.caseTransform(text, upper)
+#
+# ShIR_TextOps_Strings proves `case_transform_sound` over the BYTE table: length is
+# preserved, casing is idempotent, `uc` after `lc` is `uc` and vice versa, and every
+# byte above 127 is a fixed point. OUT OF MODEL: non-ASCII casing. The model cases
+# ASCII letters only, so `[0xC3, 0xA9]` (U+00E9) is left alone; Rust `to_uppercase`,
+# JS `toUpperCase` and Perl `uc` under `use utf8` case-map the CODE POINT and return
+# U+00C9. A renderer is faithful only with an ASCII guard, which is why the node does
+# not promise a language's full casing table (see the theory section's closing text).
 
 node CaseTransform
 tag "CaseTransform"
@@ -10,4 +18,4 @@ kind expr
 # storage_class str_bounded
 field text: expr
 field upper: bool
-spec: none (unstated)
+spec: TextOps#case_transform_sound

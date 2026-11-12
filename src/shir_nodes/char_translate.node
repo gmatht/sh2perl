@@ -3,6 +3,15 @@
 #
 # Backends: Perl tr///, JS regex/lookup, C ctype, Rust chars().map()
 # Fallback: sh2.translate(text, from, to, delete, squeeze)
+#
+# ShIR_TextOps_Strings proves `char_translate_sound`, one law per mode: translation
+# preserves length and, with equal-length sets, IS the per-byte map `map_of` over
+# `zip from to`; `tr`'s short-target rule (the last member of SET2 repeats) is visible
+# in `tr_expand`; delete mode removes exactly the SET1 bytes (`set s - set from`); and
+# squeeze collapses runs of SET2 to one byte, invents nothing and shrinks the text
+# (`no_run`, subset, length bound). OUT OF MODEL: `tr`'s range syntax `a-z`, character
+# classes, escapes and `-c` — `from`/`to` are already-expanded byte strings, and range
+# expansion is the lowering's job, not the node's.
 
 node CharTranslate
 tag "CharTranslate"
@@ -13,4 +22,4 @@ field from: string
 field to: string
 field delete: bool
 field squeeze: bool
-spec: none (unstated)
+spec: TextOps#char_translate_sound
