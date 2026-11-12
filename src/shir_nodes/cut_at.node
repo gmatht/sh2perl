@@ -24,7 +24,10 @@
 # first/last occurrence of the literal, and that identification is
 # assumed, not proved (docs/fm/README.md). The AST reading was checked
 # against bash before the node was written, but the identities now rest on
-# the theory rather than on that check.
+# the theory rather than on that check. An empty `delim` never reaches this
+# node — the fold special-cases it — and `cut_at_empty_pattern` proves why:
+# with `[]` the two primitives match at different indices, so the four arms
+# split ([] / s / s / []) and no single node describes the case.
 #
 # Emitted by the `affix-strip-fold` transform (the star-form branch; the
 # plain-literal branch keeps using AffixStrip).

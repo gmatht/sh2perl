@@ -679,6 +679,27 @@ text \<open>The mirror of `cut_tail_first_at_head`, and the reason the fold's
   leaves the text alone, which is why the fold special-cases the empty body
   instead of emitting either node.\<close>
 
+text \<open>That guard, as a theorem rather than the sentence above: with an EMPTY
+  literal both primitives match, but at different indices — \<open>find_first\<close>
+  answers 0 and \<open>rfind_last\<close> answers \<open>length s\<close> — so the four arms of the node
+  split: the head cuts give \<open>[]\<close> and \<open>s\<close>, the tail cuts \<open>s\<close> and \<open>[]\<close>. This is
+  exactly the disagreement `affix_strip_empty_pattern_is_identity` records on the
+  AffixStrip side, and it is why the fold emits neither node for an empty body.\<close>
+
+lemma find_first_empty_lit [simp]: "find_first s [] = Some 0"
+  by (induct s) simp_all
+
+lemma rfind_last_empty_lit [simp]: "rfind_last s [] = Some (length s)"
+  by (induct s) simp_all
+
+theorem cut_at_empty_pattern:
+  "cut_at True True s [] = [] \<and>
+   cut_at True False s [] = s \<and>
+   cut_at False True s [] = s \<and>
+   cut_at False False s [] = []"
+  by (simp add: cut_at_def cut_head_first_def cut_head_last_def
+                cut_tail_first_def cut_tail_last_def)
+
 theorem cut_head_last_at_trail:
   assumes hn: "n \<noteq> []"
   shows "cut_head_last (r @ n) n = affix_strip_node (r @ n) n False"

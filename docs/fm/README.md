@@ -377,8 +377,11 @@ Where the two primitives do coincide, `cut_first_last_agree` says the cuts
 agree; where they do not, the separate example `cut_star_first_is_not_last`
 shows `first` is load-bearing, and `cut_at_sound` — the node's `spec:` — carries
 all four forms with both a match arm (`take`/`drop` at the index) and a
-no-match arm (the text unchanged). The empty literal is the case where both primitives answer index 0
-(bash's `${v#*}` is the identity), and that is what the definitions do.
+no-match arm (the text unchanged). The empty literal is the case the fold special-cases, and not because both
+primitives answer 0 — they do not: `find_first s [] = Some 0` while
+`rfind_last s [] = Some (length s)`. `cut_at_empty_pattern` states the
+consequence, that the four arms split (`[]` / `s` / `s` / `[]`), which is why
+no single node describes the empty body.
 
 ### Closed: the field cursor (2026-11-13)
 
