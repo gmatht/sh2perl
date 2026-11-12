@@ -115,6 +115,10 @@ pub struct Render {
     /// empty stdin, instead of crashing)
     need_read_lines: bool,
 
+    /// `__sh_cap_fd`: capture a command's stdout with an optional stderr
+    /// file (`$( "${cmd[@]}" 2>err )`, realpath-cmdsub).
+    need_cap_fd: bool,
+
     /// fd aliases from bare-`exec` redirection statements (`exec 3>&1`
     /// aliases fd 3 to stdout for the rest of the program; `3>&-`
     /// closes). Values: "1"/"2" (stdout/stderr) or a file path expr.
@@ -3919,6 +3923,17 @@ impl Render {
                             self.need_rc = true;
                             return "str(__sh_rc)".into();
                         }
+                        // `$$` — the shell's pid. A script reads it mostly
+                        // to name a temp file, and the SAME value has to
+                        // come back out of a `bash -c` seam, so the child
+                        // gets `__SH2_PID` in its environment (see
+                        // `__sh_env`/`__sh_bash`) and the shell-text form
+                        // of `$$` is `${__SH2_PID}` (realpath-cmdsub wrote
+                        // `/tmp/realpath_stderr.$$` natively and then read
+                        // it through bash, where `$$` was the child's pid).
+                        "$" => {
+                            return "str(os.getpid())".into();
+                        }
                         // `$-` — the option flags of the running shell. A
                         // non-interactive script executed as `bash <file>`
                         // always has hashall (h) and braceexpand (B) on,
@@ -5734,6 +5749,10 @@ impl Render {
             IrExpr::Int(i) => Some(i.to_string()),
             IrExpr::Call { func, args } if func == "getVar" => {
                 if let Some(IrExpr::Str(n, _)) = args.first() {
+                    if n == "$" {
+                        // the pid has to be the SAME number in the child
+                        return Some(format!("\"${{__SH2_PID}}\""));
+                    }
                     // QUOTED expansion: an unset `$A` must still be an
                     // ARGUMENT (bash: `test "$A" -ef "$B"` passes two
                     // empty words and is FALSE; the bare form made the
@@ -6202,6 +6221,60 @@ impl Render {
         // `$( (cmd; cmd) 3>&- )` — the body is a subshell whose own
         // statements must be flattened before shell-texting.
         let flat = Self::flatten_subs(body);
+        // A body that is ONE dynamic command (`$( "${cmd[@]}" 2>err )`):
+        // shell text cannot carry a python LIST into a child bash (arrays
+        // are not exported, so `"${cmd[@]}"` would expand to nothing), so
+        // run the argv directly and point the redirected descriptor at the
+        // file (realpath-cmdsub captured an empty stdout and lost the
+        // command entirely).
+        if let [IrStmt::Expr(IrExpr::Call { func, args: eargs })] = flat.as_slice() {
+            if func == "exec" && !matches!(eargs.first(), Some(IrExpr::Str(..))) {
+                let mut err_target: Option<String> = None;
+                let mut supported = true;
+                for r in redirs {
+                    let IrExpr::Object(props) = r else {
+                        supported = false;
+                        break;
+                    };
+                    let mut fd: i64 = 1;
+                    let mut mode = String::new();
+                    let mut target: Option<&IrExpr> = None;
+                    for (k, v) in props {
+                        match k.as_str() {
+                            "fd" => {
+                                if let IrExpr::Int(n) = v {
+                                    fd = *n;
+                                }
+                            }
+                            "mode" => {
+                                if let IrExpr::Str(s, _) = v {
+                                    mode = s.clone();
+                                }
+                            }
+                            "target" => target = Some(v),
+                            _ => {}
+                        }
+                    }
+                    if fd == 2 && (mode == "w" || mode == "app" || mode == "a") {
+                        err_target = Some(self.expr(target.expect("redirect target")));
+                    } else {
+                        supported = false;
+                        break;
+                    }
+                }
+                if supported {
+                    let argv = self.build_argv(eargs);
+                    self.need_subprocess = true;
+                    self.need_cap_fd = true;
+                    let env = self.bash_env();
+                    let err = err_target.unwrap_or_else(|| "None".to_string());
+                    return Some(format!(
+                        "__sh_cap_fd([{}], {env}, {err})",
+                        argv.join(", ")
+                    ));
+                }
+            }
+        }
         let inner = self.body_shell_text(&flat)?;
         // A heredoc body is NOT one-line shell text, so
         // `redirect_shell_text` refuses it and the whole capture used to
@@ -6793,8 +6866,28 @@ impl Render {
     /// (`["cmd", "arg", …]`).
     fn build_argv(&mut self, args: &[IrExpr]) -> Vec<String> {
         let mut argv = Vec::new();
-        if let Some(IrExpr::Str(cmd, _)) = args.first() {
-            argv.push(Self::py_str(cmd));
+        match args.first() {
+            Some(IrExpr::Str(cmd, _)) => argv.push(Self::py_str(cmd)),
+            // A DYNAMIC command word: `"$@"` arrives as listVar("@"),
+            // `"${cmd[@]}"` as the array expansion. The whole command line
+            // is then a word LIST, and `__sh_exec` field-splits a list
+            // element — so pass the expression through as one word. Without
+            // this the argv came out EMPTY and nothing ran (`"$@" >"$out"`
+            // lowered to `__sh_exec([])`: readonly/id/tty/realpath-cmdsub).
+            Some(first) => {
+                // `"$@"` / `"${cmd[@]}"` splice as a word list; __sh_exec
+                // flattens a list ELEMENT, so the splice marker's `*` is
+                // dropped and the list itself becomes the single element.
+                let w = match self.argv_slice_splice(first) {
+                    Some(sp) => sp.trim_start_matches('*').to_string(),
+                    None => match self.array_splice(first) {
+                        Some(sp) => sp.trim_start_matches('*').to_string(),
+                        None => self.expr(first),
+                    },
+                };
+                argv.push(w);
+            }
+            None => {}
         }
         if let Some(IrExpr::Array(items)) = args.get(1) {
             for it in items {
@@ -7820,6 +7913,7 @@ impl Render {
     /// the Assign arm: a capture/external RHS owns the status itself).
     fn rc_reset_if_native(&mut self, rhs: &str) {
         if !rhs.contains("__sh_cap(")
+            && !rhs.contains("__sh_cap_fd(")
             && !rhs.contains("__sh_exec(")
             && !rhs.contains("__sh_bash(")
             && !rhs.contains("subprocess.")
@@ -9165,6 +9259,18 @@ impl Render {
                         self.emit(&format!("global {}", self.py_ident(w)));
                     }
                 }
+                // `$?` is process-wide in bash, and some helpers write the
+                // status through globals() (`__sh_cap_fd` sets it from
+                // subprocess.run's returncode). Without this the function's
+                // own `__sh_rc` binding shadows them and `$?` reads a stale
+                // 0 (realpath-cmdsub reported exit 0 for a failed command).
+                {
+                    let mut reads_rc = false;
+                    scan_rc(body, &mut reads_rc);
+                    if reads_rc {
+                        self.emit("global __sh_rc");
+                    }
+                }
                 for s in body {
                     self.stmt(s);
                 }
@@ -9690,6 +9796,58 @@ impl Render {
                         return;
                     }
                 }
+                // A real COMMAND with file redirects (`"$@" >out 2>err`):
+                // a subprocess writes to its OWN descriptors, so the
+                // sys.stdout swap below left the target empty and leaked
+                // the child's output into the compared stream
+                // (readonly/id/tty/realpath-cmdsub). Open the files and hand
+                // them to __sh_exec, which threads them into
+                // subprocess.call.
+                if let [IrStmt::Expr(IrExpr::Call { func, args })] = inner.as_slice() {
+                    if func == "exec" {
+                        let is_file = |r: &&crate::ir::IrRedirect| {
+                            matches!(r.mode.as_str(), "w" | "a" | "clobber")
+                        };
+                        let out_r = redirects
+                            .iter()
+                            .find(|r| r.fd.unwrap_or(1) == 1 && is_file(r));
+                        let err_r = redirects
+                            .iter()
+                            .find(|r| r.fd == Some(2) && is_file(r));
+                        if out_r.is_some() || err_r.is_some() {
+                            let rendered = self.call("exec", args);
+                            if rendered.starts_with("__sh_exec([") && rendered.ends_with("])") {
+                                let mut opened: Vec<String> = Vec::new();
+                                let mut out_h = "None".to_string();
+                                let mut err_h = "None".to_string();
+                                if let Some(r) = out_r {
+                                    let p = self.expr(&r.target);
+                                    let m = if r.mode == "a" { "'a'" } else { "'w'" };
+                                    let h = format!("_sh_r{}", opened.len());
+                                    self.emit(&format!("{h} = open({p}, {m})"));
+                                    opened.push(h.clone());
+                                    out_h = h;
+                                }
+                                if let Some(r) = err_r {
+                                    let p = self.expr(&r.target);
+                                    let m = if r.mode == "a" { "'a'" } else { "'w'" };
+                                    let h = format!("_sh_r{}", opened.len());
+                                    self.emit(&format!("{h} = open({p}, {m})"));
+                                    opened.push(h.clone());
+                                    err_h = h;
+                                }
+                                let list = &rendered["__sh_exec(".len()..rendered.len() - 1];
+                                self.emit(&format!(
+                                    "__sh_rc = __sh_exec({list}, {out_h}, {err_h})"
+                                ));
+                                for h in &opened {
+                                    self.emit(&format!("{h}.close()"));
+                                }
+                                return;
+                            }
+                        }
+                    }
+                }
                 // fd-1 write redirects (`> file` / `>> file`): open the file,
                 // redirect sys.stdout to it, run the inner statements, then
                 // restore stdout. Other redirect kinds fall through.
@@ -9697,6 +9855,39 @@ impl Render {
                     .iter()
                     .filter(|r| r.fd.unwrap_or(1) == 1 && (r.mode == "w" || r.mode == "a"))
                     .collect();
+                // `helper < file` on a USER FUNCTION: the redirect covers the
+                // function's whole body and its child commands inherit the
+                // descriptor. Swap sys.stdin (which __sh_exec hands to the
+                // child) instead of rebuilding the call through `bash -c`,
+                // where the shell function does not exist at all
+                // (tty-cmdsub: `bash: capture: command not found`).
+                if file_reds.is_empty() {
+                    // `<` carries no explicit fd in the IR (0 is implied)
+                    let stdin_r = redirects.iter().find(|r| {
+                        r.fd.unwrap_or(0) == 0 && matches!(r.mode.as_str(), "r" | "herestring")
+                    });
+                    if let (Some(r), [IrStmt::Expr(IrExpr::Call { func, args: cargs })]) =
+                        (stdin_r, inner.as_slice())
+                    {
+                        // a user function reaches the IR either as the call's
+                        // own func or, through the exec/builtin dialect, as
+                        // its first WORD (`capture …`)
+                        let is_fn = self.fn_names.contains(func)
+                            || matches!(cargs.first(), Some(IrExpr::Str(c, _)) if self.fn_names.contains(c));
+                        if is_fn && !Self::uses_stdin(inner) && r.mode == "r" {
+                            let p = self.expr(&r.target);
+                            self.need_sys = true;
+                            self.emit(&format!("_sh_i = open({p}, 'r')"));
+                            self.emit("sys.stdin, _sh_i_old = _sh_i, sys.stdin");
+                            for s in inner {
+                                self.stmt(s);
+                            }
+                            self.emit("sys.stdin = _sh_i_old");
+                            self.emit("_sh_i.close()");
+                            return;
+                        }
+                    }
+                }
                 if file_reds.is_empty() {
                     // general reconstruction: the whole `inner + redirects`
                     // as one bash -c program (fd-0 file reads, appends,
@@ -10383,6 +10574,30 @@ impl Render {
             self.emit("");
             self.emit("def __sh_glob_match(text, pat):");
             self.emit("    s, p = str(text), str(pat)");
+            // bash decodes ANSI-C quoting inside a pattern: `*$'\\x00'*` is
+            // the glob `**` (a shell value cannot hold a NUL — the escape
+            // truncates), which matches every non-empty string
+            // (realpath-cmdsub's NUL test). Decode `$'…'` segments here so
+            // every pattern path sees the text bash would have.
+            self.emit("    if \"$'\" in p:");
+            self.emit("        __o, __i = [], 0");
+            self.emit("        while __i < len(p):");
+            self.emit("            if p.startswith(\"$'\", __i):");
+            self.emit("                __j = p.find(\"'\", __i + 2)");
+            self.emit("                if __j < 0:");
+            self.emit("                    __j = len(p)");
+            self.emit("                __b = p[__i + 2:__j]");
+            self.emit("                try:");
+            self.emit("                    __v = bytes(__b, 'latin-1', 'backslashreplace').decode('unicode_escape')");
+            self.emit("                except Exception:");
+            self.emit("                    __v = __b");
+            self.emit("                __o.append(__v.split(chr(0))[0])");
+            self.emit("                __i = __j + 1");
+            self.emit("                continue");
+            self.emit("            __o.append(p[__i])");
+            self.emit("            __i += 1");
+            self.emit("        p = ''.join(__o)");
+            self.emit("    p = p.replace(chr(0), \"\")");
             self.emit("    st = globals().get(\"__sh_shopt_state\") or {}");
             self.emit("    if st.get(\"nocasematch\"):");
             self.emit("        s, p = s.lower(), p.lower()");
@@ -10445,6 +10660,22 @@ impl Render {
             self.emit("    return list(items[s:s + max(l, 0)])");
             self.emit("");
         }
+        if self.need_cap_fd {
+            self.emit("def __sh_cap_fd(argv, env, __err=None):");
+            self.emit("    import subprocess");
+            // same word-list flattening as __sh_exec (`"${cmd[@]}"`
+            // arrives as ONE list element standing for several words)
+            self.emit("    argv = [str(_x) for _a in argv for _x in (_a if isinstance(_a, (list, tuple)) else [_a]) if str(_x) != \"\"]");
+            self.emit("    __e = open(__err, 'w') if __err else None");
+            self.emit("    try:");
+            self.emit("        __r = subprocess.run(argv, env=env, stdout=subprocess.PIPE, stderr=__e)");
+            self.emit("    finally:");
+            self.emit("        if __e:");
+            self.emit("            __e.close()");
+            self.emit("    globals()[\"__sh_rc\"] = __r.returncode");
+            self.emit("    return __r.stdout.decode(errors='replace').rstrip(chr(10))");
+            self.emit("");
+        }
         if self.need_read_lines {
             self.emit("def __sh_read_lines(p):");
             self.emit("    try:");
@@ -10478,7 +10709,10 @@ impl Render {
                 }
             }
             self.emit(&format!("__sh_names = {{{}}}", pairs.join(", ")));
-            self.emit("def __sh_exec(argv):");
+            // optional descriptor targets: `"$@" >out 2>err` hands the
+            // open files here, because a subprocess writes to its OWN
+            // descriptors and a sys.stdout swap cannot redirect it.
+            self.emit("def __sh_exec(argv, __out=None, __err=None):");
             self.emit("    import subprocess, sys");
             // python block-buffers print() to a pipe while the child
             // writes the shared fd directly — flush first or earlier
@@ -10495,8 +10729,17 @@ impl Render {
             // an IndexError — parse-standalone-redirect).
             self.emit("    if not argv:");
             self.emit("        return 0");
+            // stdin follows python's sys.stdin: a `helper < file` on a user
+            // function swaps sys.stdin for the file, and the function's own
+            // child commands must inherit that descriptor (tty-cmdsub's
+            // `capture … <"$TTY_DEV"` runs `tty`, which must see the tty).
             self.emit("    try:");
-            self.emit("        return subprocess.call(argv)");
+            self.emit("        sys.stdin.fileno()");
+            self.emit("        __sin = sys.stdin");
+            self.emit("    except Exception:");
+            self.emit("        __sin = None");
+            self.emit("    try:");
+            self.emit("        return subprocess.call(argv, stdout=__out, stderr=__err, stdin=__sin)");
             self.emit("    except OSError:");
             self.emit("        return 127");
             // Environment for `bash -c` fallbacks (test/pipeline/arrow
@@ -10526,6 +10769,10 @@ impl Render {
             self.emit("    for _s, _p in __sh_names.items():");
             self.emit("        if _p in globals():");
             self.emit("            e[_s] = str(globals()[_p])");
+            // `$$` is this process; children see the same number so a
+            // `$$`-named temp file written natively can be read through a
+            // `bash -c` seam.
+            self.emit("    e.setdefault(\"__SH2_PID\", str(os.getpid()))");
             self.emit("    return e");
             // `bash -c` with shell positionals: `bash -c CMD` puts the
             // post-command words in $0, $1… — so `a() { echo $1; }` needs
@@ -10535,9 +10782,10 @@ impl Render {
             // ride `env`. Returns the CompletedProcess (callers read
             // .stdout / .returncode).
             self.emit("def __sh_bash(text, pos=(), env=None):");
-            self.emit("    import subprocess, shlex, sys");
+            self.emit("    import subprocess, shlex, sys, os");
             self.emit("    sys.stdout.flush()");
             self.emit("    e = dict(env or {})");
+            self.emit("    e.setdefault(\"__SH2_PID\", str(os.getpid()))");
             self.emit("    pre = \"\"");
             self.emit("    for _k in list(e.keys()):");
             self.emit("        if _k.startswith(\"__SH_ARR_\"):");
@@ -10548,9 +10796,10 @@ impl Render {
             self.emit("    full = pre + full");
             self.emit("    return subprocess.run([\"bash\", \"-c\", full], env=e, stdout=subprocess.PIPE)");
             self.emit("def __sh_bash_in(text, pos, env, data):");
-            self.emit("    import subprocess, shlex, sys");
+            self.emit("    import subprocess, shlex, sys, os");
             self.emit("    sys.stdout.flush()");
             self.emit("    e = dict(env or {})");
+            self.emit("    e.setdefault(\"__SH2_PID\", str(os.getpid()))");
             self.emit("    pre = \"\"");
             self.emit("    for _k in list(e.keys()):");
             self.emit("        if _k.startswith(\"__SH_ARR_\"):");
