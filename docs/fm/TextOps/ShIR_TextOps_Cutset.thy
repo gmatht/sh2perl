@@ -219,7 +219,10 @@ lemma cutset_trim_hyphen_is_a_member_not_a_range:
   "cutset_trim C_both [97, 45, 99] [97, 99, 98, 97] = [98]"
   by eval
 
-text \<open>OBLIGATION \<open>perl_cutset_needs_quotemeta\<close>. The general statement
+text \<open>MEMBER-SET INVARIANCE (named `cutset_trim_depends_only_on_members`, which is
+  all it says). The next section models the UNQUOTED bracket reading and proves
+  the divergence proper, because invariance alone is true of any set-based
+  reading and would survive the quoting being dropped. The statement:
   is that the arm is a function of the cutset as a SET and of nothing else: two
   cutsets with the same members trim identically, whatever order or repetition
   they were written with. That is precisely what `\Q..\E` is for — it makes the
@@ -228,7 +231,7 @@ text \<open>OBLIGATION \<open>perl_cutset_needs_quotemeta\<close>. The general s
   variant. The bracketed witnesses below name the bytes where the readings
   part.\<close>
 
-theorem perl_cutset_needs_quotemeta:
+theorem cutset_trim_depends_only_on_members:
   "set cs = set cs' \<Longrightarrow> cutset_trim side cs s = cutset_trim side cs' s"
 proof -
   assume h: "set cs = set cs'"
@@ -249,14 +252,15 @@ text \<open>Go's `strings.Trim(s, cutset)` and Rust's `trim_matches(|c|
   encoding of U+00A0 (and is not itself a character), so a byte-wise trim
   removes it and a codepoint-wise trim cannot.\<close>
 
-text \<open>OBLIGATION \<open>go_trim_cutset_is_codepoints\<close>. The model decides
-  one BYTE at a time: a member byte at the head is removed whatever follows it,
+text \<open>BYTE GRANULARITY (named `cutset_trim_lead_is_bytewise`, which is all it
+  says). The codepoint comparison is proved in the next section. The statement:
+  the model decides one BYTE at a time: a member byte at the head is removed whatever follows it,
   which is a rule `strings.Trim` (a set of code points) has no way to express
   when the byte is the lead byte of a multi-byte character. The witness below
   shows the model answering with a continuation byte and no lead byte — text a
   codepoint trim cannot produce.\<close>
 
-theorem go_trim_cutset_is_codepoints:
+theorem cutset_trim_lead_is_bytewise:
   "c \<in> set cs \<Longrightarrow> cutset_trim C_lead cs (c # s) = cutset_trim C_lead cs s"
 proof -
   assume h: "c \<in> set cs"
@@ -267,12 +271,12 @@ proof -
   finally show ?thesis .
 qed
 
-text \<open>OBLIGATION \<open>rust_trim_matches_is_chars\<close>. The same fact at the
-  trailing end: `trim_matches(|c| cutset.contains(c))` asks about a `char`, while
+text \<open>TRAILING BYTE GRANULARITY (named `cutset_trim_trail_is_bytewise`). The
+  same fact at the trailing end: `trim_matches(|c| cutset.contains(c))` asks about a `char`, while
   the model asks about a byte, so a trailing member byte goes even when it is
   half of a character.\<close>
 
-theorem rust_trim_matches_is_chars:
+theorem cutset_trim_trail_is_bytewise:
   "c \<in> set cs \<Longrightarrow> cutset_trim C_trail cs (s @ [c]) = cutset_trim C_trail cs s"
 proof -
   assume h: "c \<in> set cs"
@@ -306,5 +310,154 @@ text \<open>The second witness is the divergence in one line: the model answers
 lemma cutset_trim_ascii_agrees_with_the_model:
   "cutset_trim C_both [97, 98] [97, 98, 99, 98, 97] = [99]"
   by eval
+
+
+section \<open>The unquoted bracket reading: what \Q..\E is protecting\<close>
+
+text \<open>A toy but honest reading of a bracket BODY when the body is interpolated
+  WITHOUT `\Q..\E`. It is a syntax, not a trim: `]` closes the class, a leading
+  `^` negates it, a backslash escapes the next byte, and `a-b` is a RANGE. The
+  quoted reading is the byte set the node carries. The theorem at the end of
+  this section compares the two on named bodies.\<close>
+
+fun uq_body :: "bytes \<Rightarrow> bytes" where
+  "uq_body [] = []"
+| "uq_body (c # cs) =
+     (if c = 93 then []
+      else if c = 92 then (case cs of [] \<Rightarrow> [92] | d # ds \<Rightarrow> d # uq_body ds)
+      else c # uq_body cs)"
+
+fun uq_scan :: "bytes \<Rightarrow> nat \<Rightarrow> bool" where
+  "uq_scan [] c = False"
+| "uq_scan [x] c = (c = x)"
+| "uq_scan [x, y] c = (c = x \<or> c = y)"
+| "uq_scan (x # y # z # rest) c =
+     (if y = 45 then (c = x \<or> (x \<le> c \<and> c \<le> z) \<or> uq_scan rest c)
+      else (c = x \<or> uq_scan (y # z # rest) c))"
+
+definition uq_class :: "bytes \<Rightarrow> nat \<Rightarrow> bool" where
+  "uq_class body c \<equiv>
+     (case body of [] \<Rightarrow> False
+      | b0 # rest \<Rightarrow>
+          (if b0 = 94 then \<not> uq_scan (uq_body rest) c
+           else uq_scan (uq_body body) c))"
+
+definition uq_trim :: "bytes \<Rightarrow> bytes \<Rightarrow> bytes" where
+  "uq_trim body s \<equiv> trim_by (uq_class body) True True s"
+
+text \<open>The quoted arm's set is `set body`; the unquoted reading is `uq_class
+  body`. They differ on exactly the bytes the quoting exists to protect, and the
+  difference is visible in the trimmed text — so a rendering that dropped
+  `\Q..\E` would compute a different node, and this theorem would become false
+  if the two readings were identified.\<close>
+
+theorem perl_cutset_needs_quotemeta:
+  "((93::nat) \<in> set [93] \<and> \<not> uq_class [93] 93 \<and>
+     cutset_trim C_both [93] [93, 97] \<noteq> uq_trim [93] [93, 97]) \<and>
+   ((98::nat) \<notin> set [94, 97] \<and> uq_class [94, 97] 98 \<and>
+     cutset_trim C_both [94, 97] [98] \<noteq> uq_trim [94, 97] [98]) \<and>
+   ((92::nat) \<in> set [92, 93] \<and> \<not> uq_class [92, 93] 92 \<and>
+     cutset_trim C_both [92, 93] [92, 93, 97] \<noteq> uq_trim [92, 93] [92, 93, 97]) \<and>
+   ((98::nat) \<notin> set [97, 45, 99] \<and> uq_class [97, 45, 99] 98 \<and>
+     cutset_trim C_both [97, 45, 99] [98] \<noteq> uq_trim [97, 45, 99] [98])"
+  by (simp add: cutset_trim_def uq_trim_def uq_class_def
+                cutset_mem_def trim_by_def trail_drop_def)
+
+text \<open>Row by row: `]` closes the class immediately, so the unquoted reading
+  denotes the EMPTY set while the node's cutset contains `]`; `^` in first
+  position negates, so the unquoted class contains every byte except `a`; a
+  backslash escapes the `]`, so the unquoted class loses the backslash itself;
+  and `a-c` is a range, so `b` is in the class although it is not in the cutset.\<close>
+
+section \<open>The codepoint reading: a toy decoder and a char-wise trim\<close>
+
+text \<open>Go's `strings.Trim` and Rust's `trim_matches(|c| cutset.contains(c))`
+  quantify over CODE POINTS. This section models the two-byte subset of UTF-8
+  honestly (a lead byte 0xC2..0xDF followed by a continuation byte 0x80..0xBF)
+  and defines a trim over the decoded characters: a character is removable only
+  if ALL of its bytes are in the cutset. That is the reading the arms implement;
+  it is not the node's byte model.\<close>
+
+datatype uchar = UAscii nat | UPair nat nat
+
+fun decode2 :: "bytes \<Rightarrow> uchar list option" where
+  "decode2 [] = Some []"
+| "decode2 [a] = (if 128 \<le> a \<and> a \<le> 191 then None else Some [UAscii a])"
+| "decode2 (a # b # s) =
+     (if 194 \<le> a \<and> a \<le> 223 then
+        (if 128 \<le> b \<and> b \<le> 191
+         then (case decode2 s of None \<Rightarrow> None | Some us \<Rightarrow> Some (UPair a b # us))
+         else None)
+      else if 128 \<le> a \<and> a \<le> 191 then None
+      else (case decode2 (b # s) of None \<Rightarrow> None | Some us \<Rightarrow> Some (UAscii a # us)))"
+
+fun encode2 :: "uchar list \<Rightarrow> bytes" where
+  "encode2 [] = []"
+| "encode2 (UAscii a # us) = a # encode2 us"
+| "encode2 (UPair a b # us) = a # b # encode2 us"
+
+fun in_cutset :: "bytes \<Rightarrow> uchar \<Rightarrow> bool" where
+  "in_cutset cs (UAscii a) = (a \<in> set cs)"
+| "in_cutset cs (UPair a b) = (a \<in> set cs \<and> b \<in> set cs)"
+
+fun cp_drop :: "(uchar \<Rightarrow> bool) \<Rightarrow> uchar list \<Rightarrow> uchar list" where
+  "cp_drop P [] = []"
+| "cp_drop P (u # us) = (if P u then cp_drop P us else u # us)"
+
+definition cp_trim_lead :: "bytes \<Rightarrow> bytes \<Rightarrow> bytes" where
+  "cp_trim_lead cs s \<equiv>
+     (case decode2 s of None \<Rightarrow> s | Some us \<Rightarrow> encode2 (cp_drop (in_cutset cs) us))"
+
+definition cp_trim_trail :: "bytes \<Rightarrow> bytes \<Rightarrow> bytes" where
+  "cp_trim_trail cs s \<equiv>
+     (case decode2 s of None \<Rightarrow> s
+      | Some us \<Rightarrow> encode2 (rev (cp_drop (in_cutset cs) (rev us))))"
+
+text \<open>A char-wise trim returns a character sequence — that is the whole
+  difference from the byte model, and it is what makes the witnesses below
+  one-way.\<close>
+
+lemma cp_trim_lead_is_a_character_sequence:
+  "decode2 s = Some us \<Longrightarrow>
+     cp_trim_lead cs s = encode2 (cp_drop (in_cutset cs) us)"
+  unfolding cp_trim_lead_def by simp
+
+lemma cp_trim_trail_is_a_character_sequence:
+  "decode2 s = Some us \<Longrightarrow>
+     cp_trim_trail cs s = encode2 (rev (cp_drop (in_cutset cs) (rev us)))"
+  unfolding cp_trim_trail_def by simp
+
+text \<open>The cutset `{0xC2}` is half of U+00A0. The node's byte model removes that
+  lead byte and answers `[0xA0, 0x61]` — a continuation byte with no lead byte,
+  which does not decode at all — while the codepoint reading cannot remove half
+  a character and leaves the text intact. The two readings therefore disagree on
+  a concrete witness, and the theorem records both answers plus the fact that
+  the byte model's answer has no character sequence behind it.\<close>
+
+theorem go_trim_cutset_is_codepoints:
+  "decode2 [194, 160, 97] = Some [UPair 194 160, UAscii 97] \<and>
+   cutset_trim C_lead [194] [194, 160, 97] = [160, 97] \<and>
+   decode2 [160, 97] = None \<and>
+   cp_trim_lead [194] [194, 160, 97] = [194, 160, 97]"
+  by eval
+
+text \<open>The same at the trailing end, with the cutset `{0xA0}` — the
+  CONTINUATION byte of the same character. The byte model trims it and leaves
+  `[0x61, 0xC2]`; the codepoint reading cannot, and keeps the character.\<close>
+
+theorem rust_trim_matches_is_chars:
+  "decode2 [97, 194, 160] = Some [UAscii 97, UPair 194 160] \<and>
+   cutset_trim C_trail [160] [97, 194, 160] = [97, 194] \<and>
+   cp_trim_trail [160] [97, 194, 160] = [97, 194, 160]"
+  by eval
+
+text \<open>WHAT IS AND IS NOT MODELLED. Modelled: a bracket-body syntax (closing
+  `]`, leading `^` negation, backslash escape, `a-b` ranges) and the two-byte
+  subset of UTF-8 with a char-wise trim. Not modelled: Perl's real regex
+  compiler, the full UTF-8 repertoire (3- and 4-byte sequences), and the
+  renderers' own error behaviour on undecodable input — where `cp_trim_*` here
+  returns the argument unchanged, the real arms would treat the bytes as
+  replacement characters. The divergence theorems above are propositions about
+  the two models, and the assumptions are listed in docs/fm/README.md.\<close>
 
 end
