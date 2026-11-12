@@ -1196,4 +1196,32 @@ text \<open>Collected in the form a contract can quote.
   occurrence count interacts with the iteration — which needs a state tier and
   is not attempted here.\<close>
 
+section \<open>Node obligations: the three string-algebra nodes\<close>
+
+text \<open>These are the \<open>spec:\<close> targets the node files cite, named as the
+  nodes name them. Each restates an obligation proved above; the named form is
+  what makes a node's \<open>spec:\<close> line resolve to a theorem, which
+  harness/check-node-specs.pl checks mechanically.\<close>
+
+theorem string_trim_sound:
+  "string_trim pre suf s = trim_by is_ws pre suf s"
+  unfolding string_trim_def by simp
+
+theorem string_affix_sound:
+  "has_affix t p True = (take (length p) t = p) \<and>
+   has_affix t p False = (drop (length t - length p) t = p)"
+  by simp
+
+theorem affix_strip_sound:
+  "(affix_strip_node t p pre =
+     (if has_affix t p pre
+      then (if pre then drop (length p) t else take (length t - length p) t)
+      else t)) \<and>
+   (affix_strip_node t p pre =
+     (if pre then (if take (length p) t = p then drop (length p) t else t)
+      else (if drop (length t - length p) t = p
+            then take (length t - length p) t else t)))"
+  by simp
+
+
 end

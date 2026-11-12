@@ -11,6 +11,8 @@ shIR. It is split into six theories that build as one session:
 | `ShIR_TextOps_Compose` | the composition nodes `Split` / `ArrayLen` / `FieldExtract`, the `ArrayLen(Split(...))` reading of `wc -w`, and `cut`'s delimiter split (which KEEPS empty fields). |
 | `ShIR_TextOps_Space` | each engine's measured `\s` class (`measure-space.sh` is the pin), the word count over an ARBITRARY class (`nwords_by`), and where the emitted word split diverges from `wc -w` — with proved witnesses and an ASCII-soundness result per engine. |
 | `ShIR_TextOps_Strings` | the string-algebra nodes `StringTrim` / `StringAffix` / `AffixStrip` over one generic run drop, and each renderer's measured TRIM class (`measure-trim.sh` is the pin) — the flag-blind arms, the four measured trim classes, and the Perl trailing-affix empty-pattern gap. |
+| `ShIR_TextOps_Cutset` | the `CutsetTrim` node: the trim class as DATA (`trim_by` at a membership test), the three-valued side field, idempotence per side, and the witnesses where a renderer's reading of the cutset diverges (Perl's bracket metacharacters need `\Q..\E`; Go/Rust take code points, the model is bytes). |
+| `ShIR_TextOps_Substitute` | the `Substitute` node: two fuel-bounded engines (`subst_all`, `subst_first`) over an abstract matcher — leftmost, non-overlapping, empty-match-advances-one-byte as the termination obligation, `&` as a function of the matched text. The regex syntax, the line split and `\N` are documented limitations. |
 
 ```
 isabelle build -D sh2perl/docs/fm/TextOps      # HOL only, no AFP, ~30 s
@@ -166,6 +168,30 @@ measured class, to narrow each renderer to the target's byte set, or to add a
 byte-set node the lowering spells out per backend. Also unmodelled here:
 `StringAffix`/`AffixStrip` inside a loop (`${s#p}` under `read`), which needs
 the state tier.
+
+### Closed: the node-spec promises (2026-11-13)
+
+Every `spec:` line in `src/shir_nodes/*.node` now resolves to a theorem. The
+three that did not — `newline_strip_sound`, `uniq_lines_sound`,
+`substitute_sound` — are proved, and so is a fourth the new checker found
+(`sort_lines_sound`). `harness/check-node-specs.pl` (workspace `harness/`) makes
+"no dangling spec" a machine check: it collects every `theorem`/`lemma`/
+`definition`/`fun` under `docs/fm` and fails on a `spec:` naming one that does
+not exist. It reports 16 resolved, 29 unstated, 0 dangling.
+
+- `newline_strip_sound` (`ShIR_TextOps_Strip`): the node is the trailing-run
+  removal, with the run length and the prefix equation.
+- `uniq_lines_sound` (`ShIR_TextOps_SortUniq`): the collapse equals the
+  streaming "keep unless equal to the previous line" filter.
+- `sort_lines_sound`, and with it the open-target items
+  `rev_drop_last_nl_prefix` (as `newline_strip_sound`'s take/drop equation),
+  `sorted_insert` / `isort_sorted` / `drop_runs_idem` / `drop_runs_adj_free`:
+  `sort -u` is the run collapse of the sorted list, so it is sorted,
+  adjacent-free, idempotent under re-sorting, and invents nothing.
+- `substitute_sound` (`ShIR_TextOps_Substitute`) and `cutset_trim_sound`
+  (`ShIR_TextOps_Cutset`) — the two new theories.
+- Wired: `StringTrim`, `StringAffix`, `AffixStrip` and `CutsetTrim` now cite
+  their theorems instead of `none (unstated)`.
 
 ## Box-health note (why the proofs look odd in places)
 

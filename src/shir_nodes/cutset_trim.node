@@ -19,4 +19,4 @@ kind expr
 field text: expr
 field cutset: expr
 field side: optional_string
-spec: none (unstated)
+spec: TextOps#cutset_trim_sound

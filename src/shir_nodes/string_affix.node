@@ -11,4 +11,4 @@ kind expr
 field text: expr
 field pattern: expr
 field prefix: bool
-spec: none (unstated)
+spec: TextOps#string_affix_sound

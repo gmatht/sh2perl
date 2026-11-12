@@ -18,4 +18,4 @@ kind expr
 field text: expr
 field pattern: expr
 field prefix: bool
-spec: none (unstated)
+spec: TextOps#affix_strip_sound

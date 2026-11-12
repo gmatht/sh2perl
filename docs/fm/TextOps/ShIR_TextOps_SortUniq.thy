@@ -702,6 +702,24 @@ proof -
   then show ?thesis by simp
 qed
 
+
+text \<open>OBLIGATION \<open>sort_lines_sound\<close>: the `sort_lines` node's value is the
+  run collapse of the insertion sort at its key order. Both flags that change
+  the value are compositions of the two functions proved here — `unique` is the
+  collapse and `reverse` is `rev` of the same list — so the node inherits: the
+  output is sorted, has no equal neighbours, and invents no line.\<close>
+
+theorem sort_lines_sound:
+  "sorted_wrt le (drop_runs (isort le ls)) \<and>
+   adj_free (drop_runs (isort le ls)) \<and>
+   set (drop_runs (isort le ls)) \<subseteq> set ls"
+proof (intro conjI)
+  show "sorted_wrt le (drop_runs (isort le ls))" by (rule sort_u_sorted)
+  show "adj_free (drop_runs (isort le ls))" by (rule sort_u_adj_free)
+  show "set (drop_runs (isort le ls)) \<subseteq> set ls" by (rule sort_u_set)
+qed
+
+
 end
 
 end
