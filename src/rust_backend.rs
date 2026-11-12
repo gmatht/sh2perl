@@ -18432,8 +18432,54 @@ fn reads_before_write(stmts: &[IrStmt], var: &str) -> bool {
             IrExpr::Call { func, args } if func == "assign" => {
                 matches!(args.first(), Some(IrExpr::Str(n, _)) if n == var)
             }
+            // A store nested in a block/sequence expression: the carrier is
+            // `IrExpr::Arrow(Vec<IrStmt>)` (`{ let __v = …; r = …; __v }`).
+            // It counts as a write only when the body WRITES before it reads:
+            // a self-read (`{ let __o = i; i = i + 1; __o }`) means the value
+            // observed is the one from before the store, so deferring the
+            // declaration there would read an uninitialised binding.
+            IrExpr::Arrow(body) => {
+                var_any_write(body, var) && !reads_before_write(body, var)
+            }
             _ => false,
         }
+    }
+    fn var_any_write(stmts: &[IrStmt], var: &str) -> bool {
+        stmts.iter().any(|st| {
+            stmt_writes(st, var)
+                || match st {
+                    IrStmt::If { then, elsifs, else_, .. } => {
+                        var_any_write(then, var)
+                            || elsifs.iter().any(|(_, b)| var_any_write(b, var))
+                            || var_any_write(else_, var)
+                    }
+                    IrStmt::While { body, .. }
+                    | IrStmt::DoWhile { body, .. }
+                    | IrStmt::For { body, .. }
+                    | IrStmt::ForInit { body, .. }
+                    | IrStmt::Function { body, .. }
+                    | IrStmt::Block(body)
+                    | IrStmt::Subshell(body)
+                    | IrStmt::Background(body) => var_any_write(body, var),
+                    IrStmt::Case { clauses, .. } => {
+                        clauses.iter().any(|c| var_any_write(&c.body, var))
+                    }
+                    IrStmt::Select { clauses } => {
+                        clauses.iter().any(|c| var_any_write(&c.body, var))
+                    }
+                    IrStmt::Try { body, excepts, else_body, finally_body } => {
+                        var_any_write(body, var)
+                            || excepts.iter().any(|e| var_any_write(&e.body, var))
+                            || var_any_write(else_body, var)
+                            || var_any_write(finally_body, var)
+                    }
+                    IrStmt::Redirect { inner, .. } => var_any_write(inner, var),
+                    IrStmt::Pipeline { stages, .. } => {
+                        stages.iter().any(|s2| var_any_write(s2, var))
+                    }
+                    _ => false,
+                }
+        })
     }
     fn stmt_writes(st: &IrStmt, var: &str) -> bool {
         match st {
