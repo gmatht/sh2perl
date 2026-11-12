@@ -1364,7 +1364,25 @@ impl Render {
         // the VALUE form `sh2_redirect(…)` that the redirect renderer
         // already produces — rendering it here turned `and` into an
         // unsupported `sh2_and` call (012/042/083 process substitution).
-        if body.len() != 1 || !matches!(body[0], IrStmt::Assign { .. }) {
+        // The A1 spells `n=$(($1 + 0))` as Call{assign,[name,"=",value]} — a
+        // walrus when rendered as an EXPRESSION, which binds inside the
+        // enclosing lambda and leaves the shell variable empty. Assign
+        // outright instead.
+        if let [IrStmt::Expr(IrExpr::Call { func, args })] = body.as_slice() {
+            if func == "assign" || func == "setVar" {
+                let name = match args.first() {
+                    Some(IrExpr::Str(n, _)) => n.clone(),
+                    _ => return None,
+                };
+                let value = if func == "assign" { args.get(2) } else { args.get(1) };
+                let ex = self.expr(value?);
+                self.emit(&format!("{} = {}", self.py_ident(&name), ex));
+                self.emit("__sh_rc = 0");
+                return Some("(__sh_rc == 0)".to_string());
+            }
+            return None;
+        }
+        if !matches!(body.as_slice(), [IrStmt::Assign { .. }]) {
             return None;
         }
         let body = self
@@ -2552,6 +2570,13 @@ impl Render {
                     // (`f() { echo $(( $1 + $1 )); }`) referenced an
                     // UNDEFINED `__sh_arith_operand` (NameError swallowed
                     // into an empty echo — sync-loop-function-call).
+                    // NOTE: bash substitutes the parameter TEXT before it
+                    // parses, so an unset `$1` can still yield a valid
+                    // expression (`$(( + 0))` is unary plus) while
+                    // `$(( * 100 + ))` is a syntax error. That distinction
+                    // is lost once the IR holds a parsed expression, so the
+                    // strict helper stays (parse-dollar-in-arithmetic) and
+                    // dollar-positional-arithmetic stays a frontend gap.
                     self.need_atoi = true;
                     return format!("__sh_arith_operand({})", self.py_ident(name));
                 }
