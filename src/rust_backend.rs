@@ -18418,15 +18418,39 @@ fn collect_builtin_writes_expr(e: &IrExpr, out: &mut BTreeSet<String>) {
 /// body (while/for run zero times, case/select may fall through, try may take
 /// an except).
 fn reads_before_write(stmts: &[IrStmt], var: &str) -> bool {
-    fn is_write(st: &IrStmt, var: &str) -> bool {
-        match st {
-            IrStmt::Assign { targets, .. } => targets
-                .iter()
-                .any(|t| t.var.split('[').next().unwrap_or(&t.var) == var),
-            IrStmt::Declare { vars, .. } => vars.iter().any(|d| d.name == var),
-            IrStmt::DeclareArray { var: v, .. } => v == var,
+    /// A store can reach a variable three ways in this IR: a statement
+    /// `Assign`, a `Declare`, or an expression-level `setVar(name, …)` /
+    /// `assign(name, …)` — the last is how an assignment nested inside an
+    /// expression block (`{ let __o = i; i = i + 1; __o }`) is spelled, and
+    /// missing it made every such store look like a read, so the default
+    /// initialiser survived and rustc reported a dead store.
+    fn expr_write_target(e: &IrExpr, var: &str) -> bool {
+        match e {
+            IrExpr::Call { func, args } if func == "setVar" => {
+                matches!(args.first(), Some(IrExpr::Str(n, _)) if n == var)
+            }
+            IrExpr::Call { func, args } if func == "assign" => {
+                matches!(args.first(), Some(IrExpr::Str(n, _)) if n == var)
+            }
             _ => false,
         }
+    }
+    fn stmt_writes(st: &IrStmt, var: &str) -> bool {
+        match st {
+            IrStmt::Assign { targets, expr, .. } => {
+                targets
+                    .iter()
+                    .any(|t| t.var.split('[').next().unwrap_or(&t.var) == var)
+                    || expr_write_target(expr, var)
+            }
+            IrStmt::Declare { vars, .. } => vars.iter().any(|d| d.name == var),
+            IrStmt::DeclareArray { var: v, .. } => v == var,
+            IrStmt::Expr(e) => expr_write_target(e, var),
+            _ => false,
+        }
+    }
+    fn is_write(st: &IrStmt, var: &str) -> bool {
+        stmt_writes(st, var)
     }
     fn stmt_reads(st: &IrStmt, var: &str) -> bool {
         let mut out = BTreeSet::new();
