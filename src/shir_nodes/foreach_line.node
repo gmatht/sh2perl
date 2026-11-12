@@ -23,6 +23,16 @@ field limit: optional_expr
 # but a law about it would restate those definitions rather than say anything about the
 # streaming behaviour this node exists for. Recorded as a named missing model rather than
 # the bare word "effect".
-spec: none (unstated: missing model — stream/cost model (reader position, laziness and
-# memory bound, early close at the limit, IO errors); the visited multiset is `lines_of`,
-# which carries no streaming claim.)
+# LAW CANDIDATES, concretely: (i) `join_lf (lines_of s) = s` — the visited lines reassemble
+# the source byte for byte; (ii) with a limit k, `visited = take k (lines_of s)`. The value
+# side therefore EXISTS in the model (`lines_of`/`join_lf` in the take_lines/reg_sub
+# sections), and (ii) is available as `take`; what is not proved here is the reassembly
+# roundtrip (i), which needs split_lf's accumulator invariant carried through join_lf. The
+# reason it stays unstated rather than approximated is different, though: a law about the
+# VALUE does not express what this node exists for — that the source is never slurped (O(1)
+# memory, O(limit) for early-exit heads), that the reader is closed at the limit, and what
+# happens on IO errors and at a final unterminated line. That is a STREAM AND COST model,
+# named here, not a byte law.
+spec: none (unstated: missing model — stream and cost model: reader position, laziness and
+# the memory bound, early close at the limit, IO errors on a partial final line. Value side
+# is `lines_of`/`join_lf`, with the reassembly roundtrip left as an open refinement.)

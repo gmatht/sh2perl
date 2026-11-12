@@ -3022,4 +3022,158 @@ lemma store_witness:
   by eval
 
 
+section \<open>WalkDir: the visited path set\<close>
+
+text \<open>`WalkDir` visits a directory subtree. Its contract is not an effect: the visited
+  paths are a pure function of the tree, so the law is about WHICH paths appear. The model
+  is the minimal one that makes the traversal total without cheating — a tree is a leaf
+  (@{term DFile}) or a directory holding an ASSOCIATION LIST of (name, child) pairs, paths
+  are lists of names from the root (so there is no `..` component to step above the root
+  with and no absolute form to escape it), and the entry set is defined by a SET-LEVEL
+  recursion (@{term entries_set}) that never mentions the fold's order or its prefixing
+  mechanism.
+
+  THE LAW, and why each conjunct bites:
+  (1) THE VISITED SET IS THE ENTRY SET: @{term "set (walk t) = entries_set t"}. A walker
+  that DROPS a child fails it (the child's own path is missing); one that emits BARE NAMES
+  for descendants fails it (the entry set holds `n # r` for a real child `n`, so `c` is not
+  an entry of the root when `b/c` is); one that steps ABOVE the root — the empty path, or a
+  first name that is no child — fails it.
+  (2) NO EMPTY PATH IS VISITED: @{term "[] \<notin> set (walk t)"}, so neither the root itself
+  nor anything above it is ever emitted.
+  (3) EVERY ENTRY DECLINES INTO A REAL CHILD: an entry is `n # r` for a child `(n, t)` of the
+  directory, with `r` empty (the child itself) or an entry of that child — the "none escapes
+  the root" statement in structural form, since each step goes strictly deeper into an
+  existing child.
+  (4) THE EMISSION COUNT IS THE ENTRY COUNT (@{term entries_of}): together with (1) this is
+  what pins "exactly once each" at the value level — a duplicate emission raises the count
+  above the entry count, and by (1) every entry must still appear, so a duplicate necessarily
+  costs a dropped entry, which (1) then forbids.
+  (5) ORDER IS FREE, not unstated: the laws never mention order, and that is shown by
+  running the fold with the child list REVERSED (@{term walk_rev}) and proving the visited
+  set is unchanged. So a renderer may take any fold order over the same children.
+
+  OPEN REFINEMENT, named precisely. The INJECTIVE form @{term "distinct (walk t)"} — "each
+  entry emitted at most once" as a property of the list rather than via (1)+(4) — is not
+  proved here: it needs the per-child DISJOINTNESS lemma (paths from distinct child names
+  cannot coincide, which requires a `hd`-tagging argument over the child list) and its
+  well-formedness hypothesis @{term wf_tree} (distinct child names). The count-plus-set
+  pair above carries the practical content; the injective statement is the refinement.
+
+  NOT PROMISED. (a) The traversal ORDER itself (depth-first here) and the order of
+  `opendir` results. (b) Symlinks and CYCLES: this is a finite tree, so a cyclic filesystem
+  object cannot be represented at all; a real walker needs a visited-inode set and a
+  cycle policy, which are not modelled. (c) Metadata, permissions, entry name encoding, IO
+  errors, and laziness (this fold materialises the list).\<close>
+
+datatype dtree = DFile | DDir "(bytes \<times> dtree) list"
+
+fun wf_tree :: "dtree \<Rightarrow> bool" where
+  "wf_tree DFile = True"
+| "wf_tree (DDir cs) = (distinct (map fst cs) \<and> Ball (set cs) (\<lambda>q. wf_tree (snd q)))"
+
+fun walk :: "dtree \<Rightarrow> bytes list list" where
+  "walk DFile = []"
+| "walk (DDir cs) = concat (map (\<lambda>q. map ((#) (fst q)) ([] # walk (snd q))) cs)"
+
+fun walk_rev :: "dtree \<Rightarrow> bytes list list" where
+  "walk_rev DFile = []"
+| "walk_rev (DDir cs) = concat (map (\<lambda>q. map ((#) (fst q)) ([] # walk_rev (snd q))) (rev cs))"
+
+fun entries_set :: "dtree \<Rightarrow> bytes list set" where
+  "entries_set DFile = {}"
+| "entries_set (DDir cs) =
+     (\<Union>q \<in> set cs. insert (fst q # []) ((\<lambda>r. fst q # r) ` entries_set (snd q)))"
+
+fun entries_of :: "dtree \<Rightarrow> nat" where
+  "entries_of DFile = 0"
+| "entries_of (DDir cs) = length cs + sum_list (map (\<lambda>q. entries_of (snd q)) cs)"
+
+lemma len_concat_map: "length (concat (map g cs)) = sum_list (map (\<lambda>c. length (g c)) cs)"
+  by (induct cs) simp_all
+
+lemma sum_list_suc_map: "sum_list (map (\<lambda>c. Suc (f c)) cs) = length cs + sum_list (map f cs)"
+  by (induct cs) simp_all
+
+lemma sum_list_map_cong:
+  assumes h: "\<And>x. x \<in> set cs \<Longrightarrow> f x = g x"
+  shows "sum_list (map f cs) = sum_list (map g cs)"
+  using h by (induct cs) simp_all
+
+lemma sum_list_rev_map:
+  fixes f :: "'a \<Rightarrow> 'a :: comm_monoid_add"
+  shows "sum_list (map f (rev cs)) = sum_list (map f cs)"
+  by (induct cs) (simp_all add: ac_simps)
+
+lemma walk_length: "length (walk t) = entries_of t"
+  apply (induct t rule: walk.induct)
+   apply simp
+  apply (rename_tac cs)
+  apply (simp add: len_concat_map sum_list_suc_map)
+  apply (rule sum_list_map_cong)
+  apply (simp add: Ball_def)
+  done
+
+lemma mem_child_part:
+  "p \<in> set (map ((#) n) ([] # xs)) \<longleftrightarrow> (\<exists>r. p = n # r \<and> (r = [] \<or> r \<in> set xs))"
+  by (auto simp: set_map)
+
+lemma walk_set: "set (walk t) = entries_set t"
+  apply (induct t rule: walk.induct)
+   apply simp
+  apply (rename_tac cs)
+  apply (simp add: set_concat mem_child_part set_map)
+  done
+
+lemma entries_no_nil: "[] \<notin> entries_set t"
+  apply (induct t rule: walk.induct)
+   apply simp
+  apply (rename_tac cs)
+  apply auto
+  done
+
+lemma walk_nil_not: "[] \<notin> set (walk t)"
+  by (simp add: walk_set entries_no_nil)
+
+lemma entries_decline:
+  "p \<in> entries_set (DDir cs) \<Longrightarrow>
+     (\<exists>q \<in> set cs. \<exists>r. p = fst q # r \<and> (r = [] \<or> r \<in> entries_set (snd q)))"
+  by auto
+
+lemma walk_rev_set: "set (walk_rev t) = set (walk t)"
+  apply (induct t rule: walk.induct)
+   apply simp
+  apply (rename_tac cs)
+  apply (simp add: set_concat)
+  done
+
+theorem walk_dir_sound:
+  "set (walk t) = entries_set t \<and>
+   ([] \<notin> set (walk t)) \<and>
+   (\<forall>p \<in> entries_set (DDir cs).
+      (\<exists>q \<in> set cs. \<exists>r. p = fst q # r \<and> (r = [] \<or> r \<in> entries_set (snd q)))) \<and>
+   length (walk t) = entries_of t \<and>
+   set (walk_rev t) = set (walk t)"
+proof (intro conjI)
+  show "set (walk t) = entries_set t" by (rule walk_set)
+  show "[] \<notin> set (walk t)" by (rule walk_nil_not)
+  show "\<forall>p \<in> entries_set (DDir cs).
+          (\<exists>q \<in> set cs. \<exists>r. p = fst q # r \<and> (r = [] \<or> r \<in> entries_set (snd q)))"
+    by (auto intro: entries_decline)
+  show "length (walk t) = entries_of t" by (rule walk_length)
+  show "set (walk_rev t) = set (walk t)" by (rule walk_rev_set)
+qed
+
+(* a directory holding a file and a subdirectory, plus an empty directory *)
+lemma walk_dir_witness:
+  "walk (DDir [([100], DFile), ([101], DDir [([102], DFile)])])
+     = [[[100]], [[101]], [[101], [102]]] \<and>
+   walk (DDir [([100], DDir [])]) = [[[100]]] \<and>
+   walk (DDir []) = [] \<and>
+   entries_of (DDir [([100], DFile), ([101], DDir [([102], DFile)])]) = 3 \<and>
+   set (walk_rev (DDir [([100], DFile), ([101], DDir [([102], DFile)])]))
+     = set (walk (DDir [([100], DFile), ([101], DDir [([102], DFile)])]))"
+  by eval
+
+
 end

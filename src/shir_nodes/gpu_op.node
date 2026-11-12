@@ -34,5 +34,11 @@ field id: string
 # transfers, workgroup/thread geometry, synchronisation and async completion. No
 # byte-level value contract exists for a dispatch, and nothing here models a device heap.
 # Recorded as a named missing model rather than the bare word "effect".
-spec: none (unstated: missing model — device memory and dispatch (buffers, transfers,
-# workgroup geometry, async completion); no value-level law is claimed.)
+# LAW CANDIDATE: `after dispatch completes, out_buffer = kernel(in_buffer)`. That is the
+# KERNEL's property, not the node's: the node enqueues work, and its own observable value
+# is a completion handle, so the law would have to quantify over device buffers, transfer
+# direction, workgroup/thread geometry and async completion order. None of these can be
+# abstracted away without the law becoming vacuous (`out = out`), so the missing component
+# is device memory plus dispatch/completion semantics, named rather than called "effect".
+spec: none (unstated: missing model — device memory and dispatch: buffers and transfers,
+# workgroup geometry, synchronisation, async completion ordering.)

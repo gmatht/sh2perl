@@ -22,5 +22,22 @@ field maxdepth: optional_expr
 # once, every path root-prefixed, none escaping the root) requires that tree model plus a
 # well-foundedness argument for cycles, neither of which exists in this theory.
 # Recorded as a named missing model rather than the bare word "effect".
-spec: none (unstated: missing model — directory tree with per-entry identity, name→child
-# map, traversal order freedom, symlink/cycle policy.)
+# Spec: TextOps#walk_dir_sound (docs/fm/TextOps/ShIR_TextOps_Strings.thy, section
+# "WalkDir: the visited path set"). Model: a finite tree of name→child pairs, paths as
+# name lists from the root, an entry set defined by a set-level recursion, and a fold that
+# emits each child's own path and its descendants. Proved for any tree: the visited SET is
+# exactly the entry set; no empty path is visited (nothing at or above the root); every
+# entry declines into a real child (so none escapes the root); the emission COUNT equals
+# the entry count, which together with the set law pins "exactly once each" (a duplicate
+# would cost a dropped entry, which the set law forbids); and running the fold with the
+# child list REVERSED leaves the visited set unchanged, so order is free.
+#
+# OPEN REFINEMENT: the injective list form `distinct (walk t)` needs the per-child
+# disjointness lemma (paths from distinct child names cannot coincide) under the `wf_tree`
+# hypothesis that child names are distinct.
+#
+# NOT PROMISED: the traversal order itself and the order of opendir results; SYMLINKS AND
+# CYCLES (a finite tree cannot represent them, so a real walker needs a visited-inode set
+# and a cycle policy); entry metadata, permissions, name encoding; IO errors; and laziness
+# (this fold materialises the list).
+spec: TextOps#walk_dir_sound
