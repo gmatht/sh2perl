@@ -20442,8 +20442,15 @@ fn compute_local_vars(
                 }
             }
         } else if us_write_count > 1 {
-            // a local is written more than once => needs `mut`
-            need_mut.insert(name.clone());
+            // A local is written more than once => needs `mut` — measured on
+            // THIS binding's own writes: a name whose every write is its own
+            // declaration (a `local x=…` inside a branch, whose hoisted twin
+            // no longer exists) is bound once and never reassigned, so `mut`
+            // is decoration and rustc says so.
+            let only_decl_writes = us.iter().filter(|u| u.write).all(|u| u.decl);
+            if !only_decl_writes {
+                need_mut.insert(name.clone());
+            }
             // first write dead when no read sits between it and the
             // second write (`x=1; x=2; echo $x`: the `1` is never read)
             let mut seen_first = false;
