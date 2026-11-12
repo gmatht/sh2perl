@@ -13858,8 +13858,38 @@ impl Render {
         for p in pre {
             self.emit(&p);
         }
+        let body_mark = self.out.len();
         for s in body {
             self.stmt(s);
+        }
+        // A subshell's `exit` ends the SUBSHELL only: bash keeps running the
+        // enclosing script and leaves the status in `$?`. The `IrStmt::Exit`
+        // arm emits a `std::process::exit(…)`, which would end the program, so
+        // a trailing one is rewritten here into the status it stands for.
+        // (Only a trailing one: an `exit` in the middle of the body leaves
+        // the statements after it unreachable in bash too, and rewriting it
+        // would make them run.)
+        let added = self.out.len() - body_mark;
+        if let Some(last) = self
+            .out
+            .iter_mut()
+            .rev()
+            .take(added)
+            .find(|l| !l.trim().is_empty())
+        {
+            let t = last.trim();
+            let inner = t
+                .strip_prefix("std::process::exit(")
+                .and_then(|r| r.strip_suffix(");"));
+            if let Some(expr) = inner {
+                let indent = &last[..last.len() - last.trim_start().len()];
+                *last = if self.rc_disabled {
+                    // no `$?` can be observed: the subshell simply ends
+                    format!("{indent}let _ = {expr};")
+                } else {
+                    format!("{indent}__SH_RC.store({expr}, Ordering::Relaxed);")
+                };
+            }
         }
         for p in post {
             self.emit(&p);
