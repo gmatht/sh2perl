@@ -3235,7 +3235,7 @@ pub fn shir_to_rust(prog: &IrProgram) -> String {
         crate::shir_passes::echo_fold::EchoFold.run(&mut prog, &ctx);
     }
     r.program(&prog);
-    let text = cat_peephole(&r.out.join("\n"));
+    let text = cat_peephole(&Render::rename_single_use_bindings(&r.out.join("\n")));
     // Belt-and-braces: confirm in the rendered output that no sink was
     // ever written (a renderer bug or an under-approximated construct
     // shows up here and vetoes the edit).
@@ -11822,6 +11822,70 @@ impl Render {
     /// sits at the top of the scope, initialised to bash's unset value
     /// ("" for a string home, 0 for an integer home). Sorted for
     /// deterministic output.
+    /// A CAPS-named local binding whose identifier occurs exactly ONCE in the
+    /// whole emitted program is the binding itself and nothing else: rustc
+    /// reports it as `unused variable` and as a non-snake-case name. Renaming
+    /// it `_NAME` is behaviour-preserving BY CONSTRUCTION (there is no other
+    /// occurrence to rename), takes it out of both lints, and needs no
+    /// `#[allow]`. Occurrences inside string literals are not uses.
+    fn rename_single_use_bindings(src: &str) -> String {
+        fn ident_uses(src: &str, name: &str) -> usize {
+            let mut n = 0usize;
+            for line in src.lines() {
+                let b = line.as_bytes();
+                let nb = name.as_bytes();
+                let mut quotes = 0usize;
+                let mut i = 0usize;
+                while i + nb.len() <= b.len() {
+                    if &b[i..i + nb.len()] == nb {
+                        let before_ok = i == 0 || !(b[i - 1].is_ascii_alphanumeric() || b[i - 1] == b'_');
+                        let after = i + nb.len();
+                        let after_ok = after == b.len()
+                            || !(b[after].is_ascii_alphanumeric() || b[after] == b'_');
+                        if before_ok && after_ok && quotes % 2 == 0 {
+                            n += 1;
+                        }
+                        i += nb.len();
+                        continue;
+                    }
+                    if b[i] == b'"' {
+                        quotes += 1;
+                    }
+                    i += 1;
+                }
+            }
+            n
+        }
+        let mut out = String::with_capacity(src.len());
+        for line in src.lines() {
+            let t = line.trim_start();
+            let rest = t.strip_prefix("#[allow(non_snake_case)] ").unwrap_or(t);
+            if let Some(after) = rest.strip_prefix("let ") {
+                let after = after.strip_prefix("mut ").unwrap_or(after);
+                let name: String = after
+                    .chars()
+                    .take_while(|c| c.is_alphanumeric() || *c == '_')
+                    .collect();
+                let caps = name.chars().next().is_some_and(|c| c.is_ascii_uppercase())
+                    && !name.starts_with('_');
+                // `_IFS` is still non_snake_case to rustc; the renamed
+                // binding must also be lowercase, and must not collide with
+                // an identifier the program already uses.
+                let lowered = format!("_{}", name.to_lowercase());
+                if caps && ident_uses(src, &name) == 1 && ident_uses(src, &lowered) == 0 {
+                    let indent = &line[..line.len() - t.len()];
+                    out.push_str(indent);
+                    out.push_str(&rest.replacen(&name, &lowered, 1));
+                    out.push('\n');
+                    continue;
+                }
+            }
+            out.push_str(line);
+            out.push('\n');
+        }
+        out
+    }
+
     fn entry_decls(&mut self, scope: &crate::shir_passes::list_profile::Scope) -> Vec<String> {
         let mut names: Vec<String> = self
             .local_entry
