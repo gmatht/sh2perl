@@ -2231,7 +2231,6 @@ impl Render {
                 "None".into()
             }
             IrExpr::Arrow(body) => {
-                // a `( … )` body contributes its statements directly
                 // (`captureWords(arrow[Subshell[echo a; echo b]])`); the
                 // flatten keeps the shape checks below working.
                 let flat = Self::flatten_subs(body);
@@ -2351,6 +2350,16 @@ impl Render {
                         if let Some(v) = self.buffered_body_value(body) {
                             return v;
                         }
+                    }
+                }
+                // a single Output as the body: `printf 'p q'` had already
+                // been lowered to a no-newline write when the Arrow was
+                // built, so there is no Call left to inspect — buffer the
+                // write instead of leaving the arrow placeholder
+                // (zz_regression_idioms' `for c in $(printf …)`).
+                if let [IrStmt::Output { target: None, .. }] = body.as_slice() {
+                    if let Some(v) = self.buffered_body_value(body) {
+                        return v;
                     }
                 }
                 // the statement dialect of the same thing
@@ -7205,6 +7214,10 @@ impl Render {
                 "pipeline" => true,
                 _ => false,
             },
+            // a plain fd-1 write: `redirect_stdout` captures it, so a
+            // `$(printf …)` body (lowered to Output before the Arrow was
+            // built) is bufferable even though it holds no Call.
+            IrStmt::Output { target: None, .. } => true,
             // the statement dialect: `Exec{cmd, args}` for the same builtins
             IrStmt::Exec {
                 cmd: IrExpr::Str(c, _),
@@ -10529,6 +10542,14 @@ impl Render {
             self.emit("import subprocess");
         }
         self.emit("import sys");
+        // bash writes each line as it is produced, so a script's stdout and
+        // stderr interleave in program order. Python block-buffers stdout
+        // when it is not a tty, which lets every stderr line jump ahead of
+        // the stdout lines written before it (zz_regression_idioms'
+        // `echo "n=$1" >&2` landed above an earlier line).
+        self.emit("try:");
+        self.emit("    sys.stdout.reconfigure(line_buffering=True)");
+        self.emit("except Exception:\n    pass");
         if self.need_re {
             self.emit("import re");
         }
