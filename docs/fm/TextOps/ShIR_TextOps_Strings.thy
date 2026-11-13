@@ -1201,16 +1201,263 @@ section \<open>Node obligations: the three string-algebra nodes\<close>
 text \<open>These are the \<open>spec:\<close> targets the node files cite, named as the
   nodes name them. Each restates an obligation proved above; the named form is
   what makes a node's \<open>spec:\<close> line resolve to a theorem, which
-  harness/check-node-specs.pl checks mechanically.\<close>
+  harness/check-node-specs.pl checks mechanically. `string_trim_sound` is not a mere
+  restatement: see the referee note below it.\<close>
+
+text \<open>REFEREE NOTE. A spec that unfolds the node's own definition is a rename, not
+  an obligation: `string_trim pre suf s = trim_by is_ws pre suf s` is `refl`, so on its
+  own it would let the node look proved while nothing is known about what a trim DOES.
+  The node obligation below therefore carries the algebra as well, and the two general
+  laws it needs are proved here first: a trim never lengthens, and it removes exactly
+  the two END RUNS and nothing else (the interior is untouched).\<close>
+
+lemma lead_drop_length_le: "length (lead_drop P s) \<le> length s"
+  by (induction s) (auto split: if_splits)
+
+lemma trail_drop_length_le: "length (trail_drop P s) \<le> length s"
+proof -
+  have "length (trail_drop P s) = length (lead_drop P (rev s))"
+    unfolding trail_drop_def by simp
+  also have "\<dots> \<le> length (rev s)" by (rule lead_drop_length_le)
+  finally show ?thesis by simp
+qed
+
+lemma trail_lead_length_le: "length (trail_drop P (lead_drop P s)) \<le> length s"
+  by (rule le_trans [OF trail_drop_length_le lead_drop_length_le])
+
+lemma trim_by_length_le: "length (trim_by P pre suf s) \<le> length s"
+  by (cases pre; cases suf)
+     (simp_all add: trail_lead_length_le lead_drop_length_le trail_drop_length_le)
+
+lemma trail_drop_subset: "set (trail_drop P s) \<subseteq> set s"
+proof -
+  have a: "set (lead_drop P (rev s)) \<subseteq> set (rev s)" by (rule lead_drop_subset)
+  have b: "set (rev s) = set s" by simp
+  show ?thesis using a b unfolding trail_drop_def by simp
+qed
+
+lemma trail_lead_subset: "set (trail_drop P (lead_drop P s)) \<subseteq> set s"
+  by (rule subset_trans [OF trail_drop_subset lead_drop_subset])
+
+lemma trim_by_subset: "set (trim_by P pre suf s) \<subseteq> set s"
+  by (cases pre; cases suf)
+     (simp_all add: trail_lead_subset lead_drop_subset trail_drop_subset)
+
+text \<open>THE RUN LAW, in the form that says what a trim is not: the bytes it dropped
+  at each end are all in the class. This is what separates a trim from a filter (which
+  would also eat the interior) and from a one-byte strip.\<close>
+
+lemma lead_drop_prefix_all:
+  "\<exists>r. s = r @ lead_drop P s \<and> (\<forall>c \<in> set r. P c)"
+proof (induction s)
+  case Nil
+  show ?case by simp
+next
+  case (Cons a s)
+  show ?case
+  proof (cases "P a")
+    case True
+    from Cons.IH obtain r where r: "s = r @ lead_drop P s" "(\<forall>c \<in> set r. P c)"
+      by blast
+    have eq: "a # s = (a # r) @ lead_drop P (a # s)"
+    proof -
+      have l: "lead_drop P (a # s) = lead_drop P s" using True by simp
+      have "a # s = (a # r) @ lead_drop P s" using r by simp
+      thus ?thesis using l by simp
+    qed
+    moreover have "\<forall>c \<in> set (a # r). P c" using True r by simp
+    ultimately show ?thesis by blast
+  next
+    case False
+    have eq: "a # s = [] @ lead_drop P (a # s)" using False by simp
+    moreover have "\<forall>c \<in> set ([] :: bytes). P c" by simp
+    ultimately show ?thesis by blast
+  qed
+qed
+
+lemma trail_drop_suffix_all:
+  "\<exists>b. s = trail_drop P s @ b \<and> (\<forall>c \<in> set b. P c)"
+proof -
+  have ex: "\<exists>r. rev s = r @ lead_drop P (rev s) \<and> (\<forall>c \<in> set r. P c)"
+    by (rule lead_drop_prefix_all)
+  from ex obtain r where
+      r: "rev s = r @ lead_drop P (rev s)" and rP: "\<forall>c \<in> set r. P c"
+    by blast
+  have rs: "rev (rev s) = rev (r @ lead_drop P (rev s))" using r by (rule arg_cong)
+  have s_eq: "s = rev (lead_drop P (rev s)) @ rev r"
+  proof -
+    have "rev (rev s) = rev (lead_drop P (rev s)) @ rev r"
+    proof -
+      have "rev (r @ lead_drop P (rev s)) = rev (lead_drop P (rev s)) @ rev r"
+        by simp
+      with rs show ?thesis by simp
+    qed
+    thus ?thesis by simp
+  qed
+  moreover have "\<forall>c \<in> set (rev r). P c" using rP by simp
+  ultimately show ?thesis unfolding trail_drop_def by blast
+qed
+
+lemma string_trim_removes_runs:
+  "\<exists>a b. s = a @ string_trim True True s @ b
+        \<and> (\<forall>c \<in> set a. is_ws c) \<and> (\<forall>c \<in> set b. is_ws c)"
+proof -
+  have exa: "\<exists>a. s = a @ lead_drop is_ws s \<and> (\<forall>c \<in> set a. is_ws c)"
+    by (rule lead_drop_prefix_all)
+  from exa obtain a where
+      a: "s = a @ lead_drop is_ws s" and aP: "\<forall>c \<in> set a. is_ws c"
+    by blast
+  have exb: "\<exists>b. lead_drop is_ws s = trail_drop is_ws (lead_drop is_ws s) @ b
+                \<and> (\<forall>c \<in> set b. is_ws c)"
+    by (rule trail_drop_suffix_all)
+  from exb obtain b where
+      b: "lead_drop is_ws s = trail_drop is_ws (lead_drop is_ws s) @ b"
+      and bP: "\<forall>c \<in> set b. is_ws c"
+    by blast
+  have eq: "s = a @ string_trim True True s @ b"
+  proof -
+    have "string_trim True True s = trail_drop is_ws (lead_drop is_ws s)"
+      unfolding string_trim_def by simp
+    with a b show ?thesis by simp
+  qed
+  with aP bP show ?thesis by blast
+qed
+
+text \<open>The node's obligation, at the node's name: the definition link, the four flag
+  cases, idempotence (all three flag pairs that can be idempotent), that a trim invents
+  no byte and never lengthens, and that the only bytes it consumes are the two end runs.\<close>
 
 theorem string_trim_sound:
-  "string_trim pre suf s = trim_by is_ws pre suf s"
-  unfolding string_trim_def by simp
+  shows "string_trim pre suf s = trim_by is_ws pre suf s"
+    and "string_trim False False s = s"
+    and "string_trim True False s = lead_drop is_ws s"
+    and "string_trim False True s = trail_drop is_ws s"
+    and "string_trim True True s = trail_drop is_ws (lead_drop is_ws s)"
+    and "string_trim True True (string_trim True True s) = string_trim True True s"
+    and "string_trim True False (string_trim True False s) = string_trim True False s"
+    and "string_trim False True (string_trim False True s) = string_trim False True s"
+    and "set (string_trim pre suf s) \<subseteq> set s"
+    and "length (string_trim pre suf s) \<le> length s"
+    and "\<exists>a b. s = a @ string_trim True True s @ b
+           \<and> (\<forall>c \<in> set a. is_ws c) \<and> (\<forall>c \<in> set b. is_ws c)"
+proof -
+  show "string_trim pre suf s = trim_by is_ws pre suf s"
+    unfolding string_trim_def ..
+  show "string_trim False False s = s"
+    unfolding string_trim_def by simp
+  show "string_trim True False s = lead_drop is_ws s"
+    unfolding string_trim_def by simp
+  show "string_trim False True s = trail_drop is_ws s"
+    unfolding string_trim_def by simp
+  show "string_trim True True s = trail_drop is_ws (lead_drop is_ws s)"
+    unfolding string_trim_def by simp
+  show "string_trim True True (string_trim True True s) = string_trim True True s"
+    unfolding string_trim_def by (rule trim_by_idem_both)
+  show "string_trim True False (string_trim True False s) = string_trim True False s"
+    unfolding string_trim_def by (rule trim_by_idem_pre)
+  show "string_trim False True (string_trim False True s) = string_trim False True s"
+    unfolding string_trim_def by (rule trim_by_idem_suf)
+  show "set (string_trim pre suf s) \<subseteq> set s"
+    unfolding string_trim_def by (rule trim_by_subset)
+  show "length (string_trim pre suf s) \<le> length s"
+    unfolding string_trim_def by (rule trim_by_length_le)
+  show "\<exists>a b. s = a @ string_trim True True s @ b
+           \<and> (\<forall>c \<in> set a. is_ws c) \<and> (\<forall>c \<in> set b. is_ws c)"
+    by (rule string_trim_removes_runs)
+qed
+
+text \<open>NON-VACUITY: a run of two class bytes at each end, and a one-sided trim that
+  keeps the far end. `[32, 9, 97, 32]` is space, tab, `a`, space.\<close>
+
+lemma string_trim_witness:
+  "string_trim True True [32, 9, 97, 32] = [97]
+   \<and> string_trim True True [32, 32] = []
+   \<and> string_trim True False [32, 97, 32] = [97, 32]
+   \<and> string_trim False True [32, 97, 32] = [32, 97]
+   \<and> string_trim True True [97, 32, 98] = [97, 32, 98]"
+  by eval
+
+text \<open>REFUTED, first: a one-byte strip per side. It is the same function on strings
+  that do not start with a run, and it leaves a class byte where the node leaves none.\<close>
+
+definition trim_one :: "bool \<Rightarrow> bool \<Rightarrow> bytes \<Rightarrow> bytes" where
+  "trim_one pre suf s \<equiv>
+     (let t = (if pre \<and> s \<noteq> [] \<and> is_ws (hd s) then tl s else s)
+      in if suf \<and> t \<noteq> [] \<and> is_ws (last t) then butlast t else t)"
+
+theorem trim_one_is_not_the_node:
+  "trim_one True True [32, 32, 97] \<noteq> string_trim True True [32, 32, 97]"
+  by eval
+
+text \<open>REFUTED, second: "trim" as a FILTER of the class over the whole string. It
+  agrees at the ends and eats the interior, which is the reading that would break
+  `echo 'a b' | xargs`-style word joins.\<close>
+
+theorem filtering_is_not_trimming:
+  "filter (\<lambda>c. \<not> is_ws c) [97, 32, 98] \<noteq> string_trim True True [97, 32, 98]"
+  by eval
+
+text \<open>REFEREE NOTE. As with `StringTrim`, the two equations below are the
+  definition, so on their own they would be `refl`. The node's promise is the
+  \`\`pattern is a PREFIX/SUFFIX'' reading of `[[ $x == P* ]]` and `${x%P}`, and that is
+  the existential — proved above as `affix_pre_is_the_existential` /
+  `affix_suf_is_the_existential`, and carried here as the obligation.\<close>
 
 theorem string_affix_sound:
-  "has_affix t p True = (take (length p) t = p) \<and>
-   has_affix t p False = (drop (length t - length p) t = p)"
-  by simp
+  shows "has_affix t p True = (take (length p) t = p)"
+    and "has_affix t p False = (drop (length t - length p) t = p)"
+    and "has_affix t p True \<longleftrightarrow> (\<exists>r. t = p @ r)"
+    and "has_affix t p False \<longleftrightarrow> (\<exists>r. t = r @ p)"
+    and "has_affix t [] True \<and> has_affix t [] False"
+    and "has_affix [] p pre \<longleftrightarrow> p = []"
+    and "length t < length p \<Longrightarrow> \<not> has_affix t p pre"
+    and "has_affix t p True \<Longrightarrow> length p \<le> length t"
+proof -
+  show "has_affix t p True = (take (length p) t = p)" by simp
+  show "has_affix t p False = (drop (length t - length p) t = p)" by simp
+  show "has_affix t p True \<longleftrightarrow> (\<exists>r. t = p @ r)"
+    by (rule affix_pre_is_the_existential)
+  show "has_affix t p False \<longleftrightarrow> (\<exists>r. t = r @ p)"
+    by (rule affix_suf_is_the_existential)
+  show "has_affix t [] True \<and> has_affix t [] False" by (rule has_affix_empty_pattern_both)
+  show "has_affix [] p pre \<longleftrightarrow> p = []" by (rule has_affix_empty_text)
+  show "length t < length p \<Longrightarrow> \<not> has_affix t p pre" by (rule has_affix_too_long)
+  show "has_affix t p True \<Longrightarrow> length p \<le> length t"
+    by (rule has_affix_short_length)
+qed
+
+text \<open>NON-VACUITY: `[97, 98]` is `ab`. `a` is a prefix and `b` a suffix, `a` is NOT a
+  suffix, and the empty pattern affixes even the empty text.\<close>
+
+lemma string_affix_witness:
+  "has_affix [97, 98] [97] True
+   \<and> has_affix [97, 98] [98] False
+   \<and> \<not> has_affix [97, 98] [98] True
+   \<and> \<not> has_affix [97, 98] [97] False
+   \<and> has_affix [] [] False
+   \<and> has_affix [97, 98] [97, 98] True"
+  by eval
+
+text \<open>REFUTED, first: matching ANYWHERE (`Perl index() != -1`, the classic slip —
+  the prefix arm is `index() == 0`). It agrees whenever the pattern is a prefix and
+  fires on every interior or trailing occurrence.\<close>
+
+definition contains_anywhere :: "bytes \<Rightarrow> bytes \<Rightarrow> bool" where
+  "contains_anywhere t p \<equiv> (\<exists>i. i \<le> length t \<and> take (length p) (drop i t) = p)"
+
+theorem anywhere_is_not_the_affix:
+  "contains_anywhere [97, 98] [98] \<noteq> has_affix [97, 98] [98] True"
+  by eval
+
+text \<open>REFUTED, second: a LENGTH-ONLY test. It is the cheapest way to keep the
+  "no read past the end" property and it ignores the bytes entirely.\<close>
+
+definition fits_by_length :: "bytes \<Rightarrow> bytes \<Rightarrow> bool" where
+  "fits_by_length t p \<equiv> (length p \<le> length t)"
+
+theorem length_alone_is_not_the_affix:
+  "fits_by_length [97, 98] [99, 99] \<noteq> has_affix [97, 98] [99, 99] True"
+  by eval
 
 theorem affix_strip_sound:
   "(affix_strip_node t p pre =

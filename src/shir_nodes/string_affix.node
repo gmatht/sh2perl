@@ -11,4 +11,24 @@ kind expr
 field text: expr
 field pattern: expr
 field prefix: bool
+# RESOLVED — the value is "the pattern sits at the enabled END of the text": a prefix test
+# for `prefix: true`, a suffix test for `prefix: false`. TextOps#string_affix_sound carries
+# the whole contract (the bare take/drop equations are just the definition):
+#  * THE READING: `has_affix t p True ⟷ ∃r. t = p @ r` and
+#    `has_affix t p False ⟷ ∃r. t = r @ p` — this is what `[[ $x == P* ]]` and `case P*)`
+#    mean, and what `startsWith`/`endsWith`/`strncmp` compute;
+#  * ENDS: the empty pattern is an affix of everything on both sides (which is why
+#    `${s#}` with an empty literal pattern is the identity), the empty TEXT admits only the
+#    empty pattern, and a pattern longer than the text is never an affix;
+#  * BOUNDED: a prefix match implies `length p ≤ length t`, so the take/drop reads are
+#    always in range.
+# NON-VACUITY: TextOps#string_affix_witness — `a` prefixes `ab`, `b` suffixes it, each is
+# NOT an affix at the other end, the empty pattern affixes the empty text, and the whole
+# text is a prefix of itself.
+# REFUTED: matching anywhere (Perl `index() != -1` instead of `== 0`, the classic slip —
+# TextOps#anywhere_is_not_the_affix) and a length-only test
+# (TextOps#length_alone_is_not_the_affix).
+# NOT PROMISED (outside this model): the pattern is a LITERAL byte string, not a glob; the
+# shell pattern language (`*`, `?`, `[...]`, extglob) and the Perl trailing-arm empty-pattern
+# divergence (proved separately as a renderer gap in this theory) are out of model.
 spec: TextOps#string_affix_sound

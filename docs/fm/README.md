@@ -243,6 +243,31 @@ argument padding (`padding_breaks_the_size_law`), laying arguments out by size
 (`reordered_layout_differs`), dropping the last one (`dropping_an_argument_loses_its_bytes`)
 and treating the buffer alone as the argument list (`layout_alone_is_not_the_argument_list`).
 
+### Referee pass: two resolved specs were renames (2026-11-13)
+
+`check-node-specs.pl` proves that a `spec:` RESOLVES; it cannot tell a law from a
+definition unfolded. Two of the resolved specs were the node's own definition restated, so
+they would have proved nothing about behaviour:
+
+- `string_trim_sound` was `string_trim pre suf s = trim_by is_ws pre suf s` — `refl`. It
+  now carries the trim algebra at the node's name: the four flag cases, idempotence for the
+  three flag pairs that can be idempotent, `set ⊆ set`, `length ≤ length`, and the RUN law —
+  `∃a b. s = a @ string_trim True True s @ b` with every removed byte in the class, i.e. the
+  interior untouched. Two general laws were added for it (`lead_drop_length_le` /
+  `trail_drop_length_le` and the run laws `lead_drop_prefix_all` / `trail_drop_suffix_all`),
+  and the node refutes a one-byte strip (`trim_one_is_not_the_node`) and trim-as-filter
+  (`filtering_is_not_trimming`).
+- `string_affix_sound` was the two `take`/`drop` equations — the definition again. Its
+  promise is the `[[ $x == P* ]]` reading, so it carries `has_affix t p True ⟷
+  (∃r. t = p @ r)` and its suffix mirror, the empty-pattern / empty-text / too-long /
+  bounded laws, and it refutes MATCHING ANYWHERE (`anywhere_is_not_the_affix` — Perl
+  `index() != -1` where the prefix arm needs `== 0`) and a length-only test
+  (`length_alone_is_not_the_affix`).
+
+`type_assert_sound` is the one spec still definitional on purpose: its promise IS that the
+type tag is ignored (`ta_val k v = v`), so there is no behaviour left to state. The other
+44 keep their shape — each states a law about its node's value.
+
 ### The node map, and what `check-node-specs.pl` will and will not accept
 
 `harness/check-node-specs.pl` (workspace `harness/`) reads every `spec:` in

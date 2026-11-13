@@ -11,4 +11,27 @@ kind expr
 field text: expr
 field leading: bool
 field trailing: bool
+# RESOLVED — the value is a trim: drop ONE RUN of the measured whitespace class at each
+# enabled end, and nothing else. All of it is proved in TextOps#string_trim_sound (a
+# bundle; a bare "node = definition" equation would be `refl` and would prove nothing):
+#  * FLAGS: the four flag pairs are `s` (neither), `lead_drop` (leading only),
+#    `trail_drop` (trailing only) and `trail_drop ∘ lead_drop` (both) — the two ends are
+#    independent, which is what four of the six renderers get wrong;
+#  * IDEMPOTENT: trimming again changes nothing, for each flag pair that can be one
+#    (TextOps#trim_by_idem_both / _pre / _suf, at the node's name);
+#  * RUN, NOT FILTER: the bytes removed at each end are all IN the class and the interior
+#    is untouched — `∃a b. s = a @ string_trim True True s @ b` with every byte of `a` and
+#    of `b` in `is_ws` (TextOps#string_trim_removes_runs). A filter, or a one-byte strip,
+#    fails exactly here;
+#  * BOUNDED: a trim invents no byte (`set ⊆ set`) and never lengthens (`length ≤ length`).
+# NON-VACUITY: TextOps#string_trim_witness — space/tab/`a`/space trims to `a`, an
+# all-whitespace string to empty, each one-sided trim keeps the far end, and a string whose
+# ends are already outside the class is unchanged.
+# REFUTED: a one-byte strip per side (TextOps#trim_one_is_not_the_node) and "trim" as a
+# filter of the class over the whole string (TextOps#filtering_is_not_trimming).
+# NOT PROMISED (outside this model): the whitespace CLASS is not the node's — each
+# renderer's class is measured and tabulated in ShIR_TextOps_Space, so a renderer that uses
+# a different class denotes a different function (that is a renderer gap with its own
+# witnesses, not a gap in this obligation), and non-ASCII casing/whitespace beyond those
+# tables is out of model.
 spec: TextOps#string_trim_sound
