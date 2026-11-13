@@ -119,6 +119,13 @@ pub struct Render {
     /// file (`$( "${cmd[@]}" 2>err )`, realpath-cmdsub).
     need_cap_fd: bool,
 
+    /// `__sh_which`: `command -v` name resolution.
+    need_which: bool,
+
+    /// `__ShSubExit`: `exit` inside `( … )` ends the subshell, not the
+    /// program.
+    need_sub_exit: bool,
+
     /// fd aliases from bare-`exec` redirection statements (`exec 3>&1`
     /// aliases fd 3 to stdout for the rest of the program; `3>&-`
     /// closes). Values: "1"/"2" (stdout/stderr) or a file path expr.
@@ -2091,6 +2098,14 @@ impl Render {
                                 if let Some(lift) = self.native_capture(args) {
                                     return lift;
                                 }
+                                // `$(command -v NAME)` — resolution, not a
+                                // fork (the generic path executed `command`
+                                // as an external program and got 127, so
+                                // heredoc-binary-data's interpreter probe
+                                // came back empty).
+                                if let Some(c) = self.command_v(args) {
+                                    return c;
+                                }
                                 let argv = self.build_argv(args);
                                 self.need_subprocess = true;
                                 let env = self.bash_env();
@@ -3364,14 +3379,25 @@ impl Render {
                             _ => "0".to_string(),
                         };
                         self.need_sys = true;
+                        self.need_sub_exit = true;
                         // sys.exit(str) PRINTS the string and exits 1 —
                         // coerce to int first (bash `exit 0` must exit 0,
                         // not print "0"). Garbage → 2 like bash.
+                        // Inside a `( … )` the exit ends the SUBSHELL only:
+                        // the parent continues with that status (bash:
+                        // `( exit 7 ); echo $?` prints 7 and keeps going).
+                        // Raising lets the subshell wrapper catch it, since
+                        // there is no OS-process boundary to stop at
+                        // (zz_regression_idioms aborted the whole program).
                         self.emit("def __sh_exit(v):");
                         self.emit("    try:");
-                        self.emit("        sys.exit(int(str(v).strip()))");
+                        self.emit("        __c = int(str(v).strip())");
                         self.emit("    except (ValueError, TypeError):");
-                        self.emit("        sys.exit(2)");
+                        self.emit("        __c = 2");
+                        self.emit("    globals()[\"__sh_rc\"] = __c");
+                        self.emit("    if globals().get(\"__sh_sub_depth\", 0) > 0:");
+                        self.emit("        raise __ShSubExit(__c)");
+                        self.emit("    sys.exit(__c)");
                         return format!("__sh_exit({code})");
                     }
                     if cmd == "cd" {
@@ -3941,6 +3967,13 @@ impl Render {
                         // is nothing else to observe from a python process.
                         "-" => {
                             return "\"hB\"".into();
+                        }
+                        // `$HOSTNAME` — bash defines it at startup from
+                        // gethostname(). Unwritten here, so it used to fold
+                        // to "" and `${HOSTNAME:-localhost}` took the
+                        // fallback (064_21 printed `from localhost`).
+                        "HOSTNAME" if !self.written.contains("HOSTNAME") => {
+                            return "__sh_hostname".into();
                         }
                         // `$0` — the script's own path. The gate exports
                         // SH2_ARGV0="$f" (the exact string `bash "$f"`
@@ -5146,9 +5179,25 @@ impl Render {
             self.emit("__sh_bg_buf = __import__(\"io\").StringIO()");
             self.emit("__sh_bg_old, sys.stdout = sys.stdout, __sh_bg_buf");
         }
+        // `exit` inside the subshell must end the SUBSHELL, not the program
+        // (`( exit 7 ); echo $?` keeps going in bash). Mark the depth so
+        // `__sh_exit` raises instead of calling sys.exit.
+        self.need_sub_exit = true;
+        self.emit("__sh_sub_depth = globals().get(\"__sh_sub_depth\", 0) + 1");
+        self.emit("try:");
+        self.depth += 1;
         for s in body {
             self.stmt(s);
         }
+        self.depth -= 1;
+        self.emit("except __ShSubExit as __sh_se:");
+        self.depth += 1;
+        self.emit("globals()[\"__sh_rc\"] = __sh_se.code");
+        self.depth -= 1;
+        self.emit("finally:");
+        self.depth += 1;
+        self.emit("__sh_sub_depth -= 1");
+        self.depth -= 1;
         if buffered {
             self.emit("sys.stdout = __sh_bg_old");
             self.emit("__sh_bg.append(__sh_bg_buf.getvalue())");
@@ -6155,6 +6204,7 @@ impl Render {
         let mut mode = "w".to_string();
         let mut target = None;
         let mut fd: Option<String> = None;
+        let mut dup: Option<String> = None;
         for (k, v) in props {
             match k.as_str() {
                 "mode" => {
@@ -6169,6 +6219,13 @@ impl Render {
                 }
                 "target" => {
                     if let Some(lit) = Self::redirect_target_lit(v) {
+                        // `2>&1` / `1>&2` — a dup of another descriptor
+                        if let Some(rest) = lit.strip_prefix('&') {
+                            if !rest.is_empty() && rest.chars().all(|c| c.is_ascii_digit()) {
+                                dup = Some(rest.to_string());
+                                continue;
+                            }
+                        }
                         // `3>&-` / `5<&-`: a CLOSE, not a file named `-`
                         target = Some(if lit == "-" {
                             String::new()
@@ -6185,6 +6242,19 @@ impl Render {
                 }
                 _ => {}
             }
+        }
+        // `2>&1` — a DESCRIPTOR DUP, not a file named `&1`: bash text has
+        // to spell it `2>&1` or the child creates a literal `&1` file and
+        // the diagnostics vanish (question-in-singlequote captured
+        // `dpkg-query … 2>&1` as `2>'&1'` and saw an empty string).
+        if let Some(d) = dup {
+            let sym = if mode == "r" { "<&" } else { ">&" };
+            return Some(match &fd {
+                Some(n) if !(n == "1" && sym == ">&" ) && !(n == "0" && sym == "<&") => {
+                    format!("{n}{sym}{d}")
+                }
+                _ => format!("{sym}{d}"),
+            });
         }
         let t = target?;
         if t.is_empty() {
@@ -7090,6 +7160,33 @@ impl Render {
     /// `os.listdir` for ls) — no child process. Bash strips the trailing
     /// newlines, which each arm reproduces. Literal operands only: a dynamic
     /// path would have to be evaluated twice.
+    /// `$(command -v NAME…)` / `$(command -V NAME…)` — a NAME LOOKUP, not
+    /// a program to run. `command` is a builtin in bash; execing it found
+    /// nothing (heredoc-binary-data probed for its interpreter with
+    /// `command -v "${1:-python3}"` and got an empty string, so it printed
+    /// its usage error and exited 4). `__sh_which` mirrors bash's answer:
+    /// the resolved path for an external, the name for a builtin, nothing
+    /// for a miss.
+    fn command_v(&mut self, args: &[IrExpr]) -> Option<String> {
+        let Some(IrExpr::Str(w, _)) = args.first() else {
+            return None;
+        };
+        if w != "command" {
+            return None;
+        }
+        let Some(IrExpr::Array(items)) = args.get(1) else {
+            return None;
+        };
+        let Some(IrExpr::Str(flag, _)) = items.first() else {
+            return None;
+        };
+        if flag != "-v" && flag != "-V" || items.len() < 2 {
+            return None;
+        }
+        let names: Vec<String> = items[1..].iter().map(|a| self.expr(a)).collect();
+        self.need_which = true;
+        Some(format!("__sh_which([{}])", names.join(", ")))
+    }
     fn native_capture(&mut self, args: &[IrExpr]) -> Option<String> {
         let cmd = match args.first() {
             Some(IrExpr::Str(c, _)) => c.clone(),
@@ -8716,14 +8813,24 @@ impl Render {
                         let v = self.py_ident(var);
                         let d = delta.unsigned_abs();
                         let s = if *delta >= 0 { "+" } else { "-" };
+                        // an untyped (string-holding) target must be coerced
+                        // like every other arithmetic write: `j="0"` then
+                        // `(( j++ ))` is `str + int` (063_09 raised
+                        // TypeError and the whole function call was lost).
+                        let coerce = if self.is_num(var) {
+                            String::new()
+                        } else {
+                            self.need_atoi = true;
+                            format!("{v} = __sh_atoi({v}); ")
+                        };
                         // value-truth rule (see the statement-position
                         // IncDec arm): postfix reads the OLD value.
                         if *prefix {
-                            self.emit(&format!("{v} {s}= {d}"));
+                            self.emit(&format!("{coerce}{v} {s}= {d}"));
                             self.emit(&format!("__sh_rc = 0 if {v} else 1"));
                         } else {
                             self.emit(&format!("__sh_old = {v}"));
-                            self.emit(&format!("{v} {s}= {d}"));
+                            self.emit(&format!("{coerce}{v} {s}= {d}"));
                             self.emit("__sh_rc = 0 if __sh_old else 1");
                         }
                         return;
@@ -10114,6 +10221,9 @@ impl Render {
         // A local alias keeps the program's own `os` import demand-driven.
         self.emit("import os as _sh_os");
         self.emit("_sh_os.environ.setdefault(\"BASH_VERSION\", \"5.2.15(1)-release\")");
+        // bash sets HOSTNAME as a shell variable at startup (gethostname);
+        // a script that reads `${HOSTNAME:-localhost}` saw the fallback.
+        self.emit("__sh_hostname = __import__(\"socket\").gethostname()");
         self.emit("");
         if self.need_pnum {
             // `$N` in arithmetic: the positional's numeric value, and an
@@ -10660,6 +10770,35 @@ impl Render {
             self.emit("    return list(items[s:s + max(l, 0)])");
             self.emit("");
         }
+        if self.need_sub_exit {
+            self.emit("class __ShSubExit(Exception):");
+            self.emit("    def __init__(self, code):");
+            self.emit("        self.code = code");
+            self.emit("");
+        }
+        if self.need_which {
+            self.emit("def __sh_which(names):");
+            self.emit("    import shutil");
+            self.emit("    __o, __miss = [], False");
+            // bash answers with the path for an external, the NAME for a
+            // builtin or function, and nothing at all for a miss (rc 1).
+            self.emit("    __builtins = {'echo','cd','printf','test','[','set','export','unset','read','exit','eval','command','type','local','declare','typeset','readonly','true','false',':','let','shift','wait','trap','source','.','exec','return','break','continue','alias','umask','ulimit','getopts','pushd','popd','dirs','jobs','kill','hash','help','history','logout','mapfile','readarray','shopt','suspend','times','bg','fg','disown','enable','builtin','caller','compgen','complete','compopt','dirs','fc','bind'}");
+            self.emit("    for _n in names:");
+            self.emit("        _n = str(_n)");
+            self.emit("        if _n == \"\":");
+            self.emit("            __miss = True");
+            self.emit("            continue");
+            self.emit("        _p = shutil.which(_n)");
+            self.emit("        if _p:");
+            self.emit("            __o.append(_p)");
+            self.emit("        elif _n in __builtins or _n in globals():");
+            self.emit("            __o.append(_n)");
+            self.emit("        else:");
+            self.emit("            __miss = True");
+            self.emit("    globals()[\"__sh_rc\"] = 1 if __miss or not __o else 0");
+            self.emit("    return chr(10).join(__o)");
+            self.emit("");
+        }
         if self.need_cap_fd {
             self.emit("def __sh_cap_fd(argv, env, __err=None):");
             self.emit("    import subprocess");
@@ -10740,7 +10879,17 @@ impl Render {
             self.emit("        __sin = None");
             self.emit("    try:");
             self.emit("        return subprocess.call(argv, stdout=__out, stderr=__err, stdin=__sin)");
-            self.emit("    except OSError:");
+            self.emit("    except OSError as __ose:");
+            // bash's execve fallback: ENOEXEC means "this is not an
+            // executable" — a TEXT file with no shebang (or a bad one) is
+            // re-run AS A SHELL SCRIPT instead of failing. Without it any
+            // command that is such a script returned 127 (a.sh: `/root/bin/a`
+            // starts with comments, so bash ran it and python could not).
+            self.emit("        if getattr(__ose, \"errno\", None) == 8 and argv:");
+            self.emit("            try:");
+            self.emit("                return subprocess.call([\"bash\", argv[0]] + argv[1:], stdout=__out, stderr=__err, stdin=__sin)");
+            self.emit("            except OSError:");
+            self.emit("                return 127");
             self.emit("        return 127");
             // Environment for `bash -c` fallbacks (test/pipeline/arrow
             // captures, eval): the child needs the shell variables, which
