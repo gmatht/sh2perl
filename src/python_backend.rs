@@ -4416,6 +4416,23 @@ impl Render {
                     }
                     // \${s:off:len}` — substring slice
                     if op == "slice" {
+                        // `${!p*[@]:0:3}` — bash refuses the `!`-prefix
+                        // (variable-NAME listing) combined with a subscript
+                        // and a slice: "bad substitution", and a script at
+                        // that point exits 1 after printing nothing more
+                        // (063_04 printed a third line bash never reached).
+                        if let Some(IrExpr::Str(name, _)) = args.get(1) {
+                            let star_name = name.starts_with('!') && name.ends_with('*');
+                            let subscripted = matches!(
+                                args.get(2),
+                                Some(IrExpr::Str(s, _)) if s == "@" || s == "*"
+                            );
+                            if star_name && subscripted && name.ends_with('*') {
+                                self.need_sys = true;
+                                self.emit("sys.exit(1)");
+                                return "None".into();
+                            }
+                        }
                         if let Some(IrExpr::Str(name, _)) = args.get(1) {
                             // `${@:off:len}` slices the ARG LIST (words),
                             // not characters: items[off..off+len] joined
