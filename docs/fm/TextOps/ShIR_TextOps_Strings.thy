@@ -2791,6 +2791,267 @@ lemma lines_of_roundtrip_witnesses:
    join_lf (lines_of [nl, 97]) = [nl, 97]"
   by eval
 
+text \<open>FOREACH_LINE's STREAM POSITION AND COST MODEL, defined here as ordinary functions over
+  the same @{const lines_of} model the value side uses — no new framework. A source string s is
+  emitted as the sequence @{term "lines_of s"}; the reader's position when it hands out line k is
+  the number of characters already consumed, which is one newline per preceding line plus that
+  line's payload.\<close>
+
+definition line_count :: "bytes \<Rightarrow> nat" where
+  "line_count s \<equiv> length (lines_of s)"
+
+definition lines_len :: "bytes \<Rightarrow> nat" where
+  "lines_len s \<equiv> sum_list (map length (lines_of s))"
+
+definition line_pos :: "bytes list \<Rightarrow> nat \<Rightarrow> nat" where
+  "line_pos ls k \<equiv> sum_list (map (\<lambda>l. Suc (length l)) (take k ls))"
+
+definition line_start :: "bytes \<Rightarrow> nat \<Rightarrow> nat" where
+  "line_start s k \<equiv> line_pos (lines_of s) k"
+
+text \<open>The separator bookkeeping: joining a list pays one newline between entries, so the joined
+  length is one less than the sum of (\<open>length + 1\<close>) over the entries.\<close>
+
+lemma sum_list_suc_len:
+  "sum_list (map (\<lambda>l. Suc (length (l :: bytes))) ls) = sum_list (map length ls) + length ls"
+  by (induct ls) simp_all
+
+lemma join_lf_cost:
+  "ls \<noteq> [] \<Longrightarrow> length (join_lf ls) + 1 = sum_list (map (\<lambda>l. Suc (length l)) ls)"
+  apply (induct ls)
+   apply simp
+  apply (rename_tac l rest)
+  apply (case_tac rest)
+   apply simp
+  apply (rename_tac m more)
+  apply (simp add: ac_simps)
+  done
+
+text \<open>COST AND COVERAGE (not a set equality): the emitted lines and the newlines between them
+  account for the whole input, exactly once each. Because a line boundary consumes its own
+  trailing newline, the identity reads @{term "lines_len s + line_count s = length s + 1"}.\<close>
+
+lemma lines_of_ne: "lines_of s \<noteq> []"
+proof
+  assume ne: "lines_of s = []"
+  have "s = []"
+  proof -
+    have "join_lf (lines_of s) = s" by (rule lines_of_join_sound)
+    then show ?thesis using ne by simp
+  qed
+  then show False using ne by simp
+qed
+
+lemma lines_of_cost: "lines_len s + line_count s = length s + 1"
+proof -
+  have ne: "lines_of s \<noteq> []" by (rule lines_of_ne)
+  have h: "length (join_lf (lines_of s)) + 1 =
+            sum_list (map (\<lambda>l. Suc (length l)) (lines_of s))"
+    by (rule join_lf_cost [OF ne])
+  have r: "join_lf (lines_of s) = s" by (rule lines_of_join_sound)
+  have "lines_len s + line_count s =
+        sum_list (map (\<lambda>l. Suc (length l)) (lines_of s))"
+    by (simp add: lines_len_def line_count_def sum_list_suc_len)
+  also have "\<dots> = length s + 1" using h r by simp
+  finally show ?thesis .
+qed
+
+text \<open>POSITION. Splitting the line list at k splits the source at k's offset, so dropping the
+  bytes already consumed lands exactly on line k. The two lemmas below are what the induction
+  needs: how @{const join_lf} distributes over @{term "xs @ ys"}, and that taking k lines joins
+  to one byte less than the k-th start offset (the missing byte is the separator).\<close>
+
+lemma join_lf_append:
+  "join_lf (xs @ ys) = join_lf xs @ (if xs = [] \<or> ys = [] then [] else [nl]) @ join_lf ys"
+  apply (induct xs arbitrary: ys)
+   apply simp
+  apply (rename_tac x xs ys)
+  apply (case_tac ys)
+   apply simp
+  apply (rename_tac y ys2)
+  apply (case_tac xs)
+   apply simp
+  apply (rename_tac a b)
+  apply (simp add: append_assoc)
+  done
+
+lemma join_lf_take_drop:
+  "join_lf ls = join_lf (take k ls) @
+     (if take k ls = [] \<or> drop k ls = [] then [] else [nl]) @ join_lf (drop k ls)"
+proof -
+  have a: "join_lf (take k ls @ drop k ls) =
+      join_lf (take k ls) @
+        (if take k ls = [] \<or> drop k ls = [] then [] else [nl]) @ join_lf (drop k ls)"
+    by (rule join_lf_append)
+  have b: "take k ls @ drop k ls = ls" by simp
+  from a b show ?thesis by simp
+qed
+
+lemma take_nonempty:
+  assumes kpos: "0 < k" and kle: "k \<le> length ls"
+  shows "take k ls \<noteq> []"
+proof -
+  have minh: "min (length ls) k = k"
+  proof (cases "length ls \<le> k")
+    case True
+    with kle have "length ls = k" by arith
+    then show ?thesis by simp
+  next
+    case False
+    then show ?thesis by (simp add: min_def)
+  qed
+  have len: "length (take k ls) = k"
+  proof -
+    have "length (take k ls) = min (length ls) k" by (rule length_take)
+    with minh show ?thesis by simp
+  qed
+  show ?thesis
+  proof
+    assume h: "take k ls = []"
+    with len have "k = 0" by simp
+    with kpos show False by simp
+  qed
+qed
+
+lemma line_pos_join_take:
+  assumes kpos: "0 < k" and kle: "k \<le> length ls"
+  shows "length (join_lf (take k ls)) + 1 = line_pos ls k"
+proof -
+  have ne: "take k ls \<noteq> []" by (rule take_nonempty [OF kpos kle])
+  have h: "length (join_lf (take k ls)) + 1 =
+            sum_list (map (\<lambda>l. Suc (length l)) (take k ls))"
+    by (rule join_lf_cost [OF ne])
+  then show ?thesis by (simp add: line_pos_def)
+qed
+
+lemma line_start_Suc:
+  assumes k: "k < line_count s"
+  shows "line_start s (Suc k) = line_start s k + Suc (length ((lines_of s) ! k))"
+proof -
+  have len: "k < length (lines_of s)" using k by (simp add: line_count_def)
+  have tk: "take (Suc k) (lines_of s) = take k (lines_of s) @ [(lines_of s) ! k]"
+    by (rule take_Suc_conv_app_nth [OF len])
+  then show ?thesis by (simp add: line_start_def line_pos_def)
+qed
+
+lemma drop_suc_length_append: "drop (Suc (length p)) (p @ x # q) = q"
+  by (induct p) simp_all
+
+theorem lines_of_position:
+  assumes klt: "k < line_count s"
+  shows "drop (line_start s k) s = join_lf (drop k (lines_of s))"
+proof (cases "k = 0")
+  case True
+  then show ?thesis using klt
+    by (simp add: line_start_def line_pos_def lines_of_join_sound)
+next
+  case False
+  have kpos: "0 < k" using False by simp
+  have kle: "k \<le> length (lines_of s)" using klt by (simp add: line_count_def)
+  have klt': "k < length (lines_of s)" using klt by (simp add: line_count_def)
+  have J: "join_lf (lines_of s) =
+        join_lf (take k (lines_of s)) @
+          (if take k (lines_of s) = [] \<or> drop k (lines_of s) = [] then [] else [nl]) @
+          join_lf (drop k (lines_of s))"
+    by (rule join_lf_take_drop)
+  have take_ne: "take k (lines_of s) \<noteq> []" by (rule take_nonempty [OF kpos kle])
+  have drop_ne: "drop k (lines_of s) \<noteq> []"
+  proof
+    assume "drop k (lines_of s) = []"
+    then have "length (lines_of s) \<le> k" by simp
+    with klt' show False by simp
+  qed
+  have sep: "(if take k (lines_of s) = [] \<or> drop k (lines_of s) = [] then [] else [nl]) = [nl]"
+    using take_ne drop_ne by simp
+  have L0: "length (join_lf (take k (lines_of s))) + 1 = line_pos (lines_of s) k"
+    by (rule line_pos_join_take [OF kpos kle])
+  have L: "length (join_lf (take k (lines_of s))) + 1 = line_start s k"
+    using L0 by (simp add: line_start_def)
+  have s_eq: "s = join_lf (take k (lines_of s)) @ [nl] @ join_lf (drop k (lines_of s))"
+    using J sep lines_of_join_sound by simp
+  show ?thesis
+  proof -
+    have sP: "s = join_lf (take k (lines_of s)) @ nl # join_lf (drop k (lines_of s))"
+      using s_eq by simp
+    have inst: "drop (Suc (length (join_lf (take k (lines_of s)))))
+          (join_lf (take k (lines_of s)) @ nl # join_lf (drop k (lines_of s)))
+        = join_lf (drop k (lines_of s))"
+      by (rule drop_suc_length_append)
+    have "drop (Suc (length (join_lf (take k (lines_of s))))) s =
+          join_lf (drop k (lines_of s))"
+      using sP inst by simp
+    then show ?thesis using L [symmetric] by simp
+  qed
+qed
+
+theorem line_start_strict:
+  assumes k: "k < line_count s"
+  shows "line_start s k < line_start s (Suc k)"
+proof -
+  have "line_start s (Suc k) = line_start s k + Suc (length ((lines_of s) ! k))"
+    by (rule line_start_Suc [OF k])
+  then show ?thesis by simp
+qed
+
+text \<open>The node's complete contract: the value roundtrip, the cost/coverage identity, the
+  position law for every emitted line, and strictly increasing positions (so no line is emitted
+  twice and the segments tile the source).\<close>
+
+theorem foreach_line_sound:
+  "join_lf (lines_of s) = s \<and>
+   lines_len s + line_count s = length s + 1 \<and>
+   (\<forall>k < line_count s. drop (line_start s k) s = join_lf (drop k (lines_of s))) \<and>
+   (\<forall>k < line_count s. line_start s k < line_start s (Suc k))"
+proof (intro conjI)
+  show "join_lf (lines_of s) = s" by (rule lines_of_join_sound)
+  show "lines_len s + line_count s = length s + 1" by (rule lines_of_cost)
+  show "\<forall>k < line_count s. drop (line_start s k) s = join_lf (drop k (lines_of s))"
+    by (auto intro: lines_of_position)
+  show "\<forall>k < line_count s. line_start s k < line_start s (Suc k)"
+    by (auto intro: line_start_strict)
+qed
+
+text \<open>NON-VACUITY. A multi-line input with a blank line in the middle and a trailing newline
+  (so the last emitted line is empty) satisfies every conjunct concretely; and the contract is
+  not implied by weaker facts: a fold with the SAME emitted set but a wrong count, and a position
+  rule off by one, are both rejected, while the correct rule is accepted on the same input.\<close>
+
+lemma foreach_line_witness:
+  "lines_of [97, nl, nl, 98, nl] = [[97], [], [98], []] \<and>
+   line_count [97, nl, nl, 98, nl] = 4 \<and>
+   lines_len [97, nl, nl, 98, nl] = 2 \<and>
+   line_start [97, nl, nl, 98, nl] 0 = 0 \<and>
+   line_start [97, nl, nl, 98, nl] 1 = 2 \<and>
+   line_start [97, nl, nl, 98, nl] 2 = 3 \<and>
+   line_start [97, nl, nl, 98, nl] 3 = 5 \<and>
+   drop (line_start [97, nl, nl, 98, nl] 2) [97, nl, nl, 98, nl] = [98, nl] \<and>
+   join_lf (drop 2 (lines_of [97, nl, nl, 98, nl])) = [98, nl]"
+  by eval
+
+definition lines_dup_first :: "bytes \<Rightarrow> bytes list" where
+  "lines_dup_first s \<equiv> (case lines_of s of [] \<Rightarrow> [] | l # r \<Rightarrow> l # l # r)"
+
+lemma dup_lines_same_set_wrong_count:
+  "set (lines_dup_first [97, nl, 98]) = set (lines_of [97, nl, 98]) \<and>
+   length (lines_dup_first [97, nl, 98]) \<noteq> line_count [97, nl, 98]"
+  by eval
+
+definition line_start_shift :: "bytes \<Rightarrow> nat \<Rightarrow> nat" where
+  "line_start_shift s k \<equiv> Suc (line_start s k)"
+
+lemma shifted_position_rejected:
+  "drop (line_start_shift [97, nl, 98] 1) [97, nl, 98] \<noteq>
+     join_lf (drop 1 (lines_of [97, nl, 98]))"
+  by eval
+
+lemma position_accepted:
+  "drop (line_start [97, nl, 98] 1) [97, nl, 98] = join_lf (drop 1 (lines_of [97, nl, 98]))"
+proof -
+  have "1 < line_count [97, nl, 98]" by eval
+  then show ?thesis by (rule lines_of_position)
+qed
+
+
 theorem reg_sub_sound:
   "rs_first m R s = (case m s of None \<Rightarrow> s | Some (p, v, q) \<Rightarrow> p @ R v @ q) \<and>
    rs_all m R 0 s = s \<and>

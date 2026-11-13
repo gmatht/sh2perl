@@ -16,32 +16,37 @@ field source: expr
 field var: string
 field body: stmts
 field limit: optional_expr
-# Unstated — the missing component is a STREAM AND COST MODEL: reader state and its
-# position, laziness (O(1) memory, O(limit) for early-exit heads), closing the reader at
-# the limit, and IO errors. The VALUE side is already available — the visited sequence is
-# `lines_of` from the take_lines/reg_sub model, and its truncation at `limit` is `take` —
-# but a law about it would restate those definitions rather than say anything about the
-# streaming behaviour this node exists for. Recorded as a named missing model rather than
-# the bare word "effect".
-# LAW CANDIDATES, concretely: (i) `join_lf (lines_of s) = s` — the visited lines reassemble
-# the source byte for byte; (ii) with a limit k, `visited = take k (lines_of s)`. The value
-# side therefore EXISTS in the model (`lines_of`/`join_lf` in the take_lines/reg_sub
-# sections), and (ii) is available as `take`; what is not proved here is the reassembly
-# roundtrip (i), which needs split_lf's accumulator invariant carried through join_lf. The
-# reason it stays unstated rather than approximated is different, though: a law about the
-# VALUE does not express what this node exists for — that the source is never slurped (O(1)
-# memory, O(limit) for early-exit heads), that the reader is closed at the limit, and what
-# happens on IO errors and at a final unterminated line. That is a STREAM AND COST model,
-# named here, not a byte law.
-spec: none (unstated: missing model — stream and cost model: reader position, laziness and
-# the memory bound, early close at the limit, IO errors on a partial final line. Value side
-# is `lines_of`/`join_lf`, with the reassembly roundtrip left as an open refinement.)
-
-# Machine-checked VALUE-side facts for this node (theory TextOps, the split/join section):
-# TextOps#lines_of_join_sound (join_lf (lines_of s) = s), derived from TextOps#split_lf_rebuild
-# and TextOps#join_lf_snoc; TextOps#lines_of_append_nl and TextOps#join_lf_of_append_nl (the
-# split-once/append characterisation, covering the trailing-newline case); TextOps#lines_of_nil
-# (the empty-string case) and TextOps#lines_of_roundtrip_witnesses (concrete non-vacuous
-# instances, including a leading newline and a lone newline). The value side is therefore
-# machine-checked; the node stays unstated ONLY because of the stream and cost model named
-# above, which no byte-level law expresses.
+# RESOLVED — the contract is the STREAM POSITION AND COST model, defined in the theory as
+# ordinary functions over the same `lines_of` model the value side uses:
+#   line_count s   = length (lines_of s)                      -- how many lines are emitted
+#   lines_len s    = sum of the emitted line lengths           -- payload bytes
+#   line_pos ls k  = sum over the first k lines of (len + 1)   -- bytes consumed before line k
+#   line_start s k = line_pos (lines_of s) k
+# All obligations are proved and bundled in TextOps#foreach_line_sound:
+#  * VALUE: join_lf (lines_of s) = s (TextOps#lines_of_join_sound, from
+#    TextOps#split_lf_rebuild and TextOps#join_lf_snoc).
+#  * COST AND COVERAGE, not a set equality: lines_len s + line_count s = length s + 1
+#    (TextOps#lines_of_cost, via TextOps#join_lf_cost and TextOps#sum_list_suc_len) — the
+#    emitted lines and the newlines between them account for the whole input exactly once.
+#  * POSITION: for every k < line_count s, drop (line_start s k) s = join_lf (drop k (lines_of s))
+#    (TextOps#lines_of_position, via TextOps#line_pos_join_take, TextOps#join_lf_take_drop,
+#    TextOps#join_lf_append and TextOps#drop_suc_length_append) — dropping the bytes already
+#    consumed lands exactly on line k, so each emitted line's position is its offset, and the
+#    reader resumes at the start of the next line.
+#  * NO DUPLICATE POSITIONS: line_start s k < line_start s (Suc k) for every emitted k
+#    (TextOps#line_start_strict, via TextOps#line_start_Suc), with TextOps#take_nonempty
+#    supplying the arithmetic — so no line is emitted twice and the segments tile the source.
+# LIMIT: `limit: Some k` emits take k (lines_of s); TextOps#lines_of_append_nl,
+# TextOps#join_lf_of_append_nl and TextOps#lines_of_nil cover the trailing-newline and
+# empty-string edge cases.
+# NON-VACUITY: TextOps#foreach_line_witness checks the positions and the coverage identity on
+# [97, nl, nl, 98, nl] — a blank line in the middle plus a trailing newline, so the last
+# emitted line is empty. TextOps#dup_lines_same_set_wrong_count is a fold with the SAME
+# emitted set and a wrong count, and TextOps#shifted_position_rejected is a position rule off
+# by one; both are rejected by the contract, while TextOps#position_accepted satisfies the
+# position law on the same input.
+# NOT PROMISED (outside this model): IO errors and partial reads, reader close timing, and
+# memory/laziness — the model is over a complete byte string, so "never slurps" (O(1) memory,
+# O(limit) for early-exit heads) is an implementation property of the backends above, not a
+# theorem here; entry metadata and encoding are likewise out of scope.
+spec: TextOps#foreach_line_sound

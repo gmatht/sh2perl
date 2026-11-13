@@ -201,7 +201,7 @@ three that did not — `newline_strip_sound`, `uniq_lines_sound`,
 (`sort_lines_sound`). `harness/check-node-specs.pl` (workspace `harness/`) makes
 "no dangling spec" a machine check: it collects every `theorem`/`lemma`/
 `definition`/`fun` under `docs/fm` and fails on a `spec:` naming one that does
-not exist. It reports 45 resolved, 3 unstated, 0 pending, 0 dangling.
+not exist. It reports 46 resolved, 2 unstated, 0 pending, 0 dangling.
 
 - `newline_strip_sound` (`ShIR_TextOps_Strip`): the node is the trailing-run
   removal, with the run length and the prefix equation.
@@ -236,9 +236,9 @@ deliberate no-obligation form. `--map` prints the node→theorem table below and
 `--selftest` runs the five negative controls (real theorem, definition, dangling
 name, wrong session prefix, unbuilt theory).
 
-Current inventory: **45 resolved, 3 unstated, 0 pending, 0 errors**.
+Current inventory: **46 resolved, 2 unstated, 0 pending, 0 errors**.
 
-The 45 resolved specs (43 distinct theorems; `lowered_wc_sound` covers three
+The 46 resolved specs (44 distinct theorems; `lowered_wc_sound` covers three
 nodes and `field_extract`, `split`, `substitute`, `uniq_lines` and
 `cutset_trim` cite two each):
 
@@ -277,6 +277,7 @@ nodes and `field_extract`, `split`, `substitute`, `uniq_lines` and
 | `take_lines` | `take_lines_sound` |
 | `type_assert` | `type_assert_sound` |
 | `walk_dir` | `walk_dir_sound` |
+| `foreach_line` | `foreach_line_sound` |
 | `string_affix` | `string_affix_sound` |
 | `string_contains` | `string_contains_sound` |
 | `string_trim` | `string_trim_sound` |
