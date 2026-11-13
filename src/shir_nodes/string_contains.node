@@ -22,3 +22,14 @@
 # ranges, negation, extglob, brace alternation and quoting are outside the model. A
 # lowering whose pattern carries one of those is outside this node's contract.
 spec: TextOps#string_contains_sound, TextOps#glob_contains_sound
+
+node StringContains
+tag "StringContains"
+kind expr
+# the node body (fields + tag) was lost from this file at HEAD — a doc-only
+# copy of cut_at.node's header, so build.rs declared no node and the
+# renderer stopped compiling. Restored from the node's own doc contract:
+# `text` is the haystack, `pattern` the needle, both any string expression;
+# the value is the TEST (JS .includes / Perl index != -1 / rust .contains).
+field text: expr
+field pattern: expr

@@ -29,3 +29,16 @@
 # `p*`/`*p` shapes built from it). Classes, ranges, negation, extglob, brace alternation
 # and quoting are outside the model — no theorem here covers them.
 spec: TextOps#affix_strip_sound, TextOps#glob_strip_sound, TextOps#strip_pre_is_the_node, TextOps#strip_suf_is_the_node
+
+node AffixStrip
+tag "AffixStrip"
+kind expr
+# the node body (fields + tag) was lost from this file at HEAD — a doc-only
+# copy of cut_at.node's header, so build.rs declared no node and the
+# renderer stopped compiling. Restored from the node's own doc contract:
+# one occurrence of `pattern` is removed from one end of `text`
+# (prefix=true → leading affix, false → trailing); no match is the
+# identity.
+field text: expr
+field pattern: expr
+field prefix: bool
