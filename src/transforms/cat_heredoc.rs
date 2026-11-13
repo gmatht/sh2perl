@@ -47,9 +47,23 @@ pub fn transform(stmts: &mut Vec<IrStmt>) -> bool {
 }
 
 fn lift_stmt(st: &mut IrStmt) -> bool {
-    if let Some(body) = literal_cat_heredoc(st) {
+    if let Some((body, verbatim)) = literal_cat_heredoc(st) {
         *st = IrStmt::Output {
-            value: IrExpr::Str(body, StrStyle::DoubleQuoted),
+            // A QUOTED delimiter (`<<'EOF'`) suppresses every expansion in
+            // the body, and the style is the only channel that survives the
+            // redirect → Output rewrite: `SingleQuoted` means "this text is
+            // literal" to every consumer (copy-propagation, the estree
+            // template render, the backends). Emitting `DoubleQuoted` let
+            // copy-propagation inline `user=admin` into the body
+            // (058_advanced_bash_idioms printed `User: admin`).
+            value: IrExpr::Str(
+                body,
+                if verbatim {
+                    StrStyle::SingleQuoted
+                } else {
+                    StrStyle::DoubleQuoted
+                },
+            ),
             // The body carries its own trailing newline (bash's heredoc
             // terminator is not part of it), so print the bytes as-is;
             // output-line-fold turns that into `newline: true`.
@@ -123,7 +137,9 @@ fn lift_stmt(st: &mut IrStmt) -> bool {
 
 /// The literal body of a statement-position `cat <<EOF`, if this statement
 /// is that shape (see the module doc for the exact guards).
-fn literal_cat_heredoc(st: &IrStmt) -> Option<String> {
+/// Returns the body and whether it is VERBATIM (a quoted delimiter, so no
+/// `$` / backtick / backslash inside it expands).
+fn literal_cat_heredoc(st: &IrStmt) -> Option<(String, bool)> {
     let IrStmt::Redirect { inner, redirects } = st else {
         return None;
     };
@@ -152,7 +168,7 @@ fn literal_cat_heredoc(st: &IrStmt) -> Option<String> {
     if r.interpolate && body_has_expansion(body) {
         return None;
     }
-    Some(body.clone())
+    Some((body.clone(), !r.interpolate))
 }
 
 /// Would an interpolating heredoc need real work? `$` (variable/command),

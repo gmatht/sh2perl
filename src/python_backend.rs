@@ -8325,13 +8325,62 @@ impl Render {
         }
     }
 
+    /// One body statement as `declare -f` prints it — the SOURCE spelling.
+    /// `body_shell_text` cannot be reused: it quotes every word for a
+    /// `bash -c` payload (`'echo' 'Inside myfunc'`), while declare -f shows
+    /// `echo "Inside myfunc"`.
+    fn def_stmt_text(&self, st: &IrStmt) -> Option<String> {
+        match st {
+            IrStmt::Output {
+                value,
+                newline,
+                target: None,
+            } => Some(if *newline {
+                format!("echo {}", self.def_word(value)?)
+            } else {
+                format!("printf '%s' {}", self.def_word(value)?)
+            }),
+            IrStmt::Declare { vars, init, local } => {
+                let d = vars.first()?;
+                let mut one = if *local {
+                    format!("local {}", d.name)
+                } else {
+                    format!("declare {}", d.name)
+                };
+                if let Some(v) = init {
+                    one.push('=');
+                    one.push_str(&match v {
+                        IrExpr::Str(s, _) => s.clone(),
+                        other => self.def_word(other)?,
+                    });
+                }
+                Some(one)
+            }
+            IrStmt::Expr(IrExpr::Call { func, args }) if func == "exec" || func == "builtin" => {
+                let mut words = Vec::new();
+                match args.first() {
+                    Some(IrExpr::Str(c, _)) => words.push(c.clone()),
+                    Some(other) => words.push(self.def_word(other)?),
+                    None => {}
+                }
+                if let Some(IrExpr::Array(items)) = args.get(1) {
+                    for it in items {
+                        words.push(self.def_word(it)?);
+                    }
+                }
+                Some(words.join(" "))
+            }
+            other => self.body_shell_text(std::slice::from_ref(other)),
+        }
+    }
+
     /// `declare -f` output for a function: the body rendered back as shell
     /// source, one command per line, `;`-terminated except the last.
     fn func_definition_text(&mut self, name: &str, body: &[IrStmt]) -> Option<String> {
         let mut lines: Vec<String> = Vec::new();
         let n = body.len();
         for (i, st) in body.iter().enumerate() {
-            let t = self.body_shell_text(std::slice::from_ref(st))?;
+            let t = self.def_stmt_text(st)?;
             let t = t.trim_end_matches('\n');
             lines.push(if i + 1 < n {
                 format!("    {t};")

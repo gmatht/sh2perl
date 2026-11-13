@@ -853,7 +853,15 @@ fn fold_expr(
         // whole variable reference to the literal, quoting the VALUE the
         // way the word would (a `"` or `\` in the value is escaped, a
         // glob-active value stays inside the quotes).
-        IrExpr::Str(t, style) if foldable.iter().any(|n| t.contains(&format!("${n}"))) => {
+        // `SingleQuoted` / `Raw` text never expands (a quoted heredoc body,
+        // a `'…'` literal): folding a known value into it would print the
+        // value where bash prints the text (058_advanced_bash_idioms).
+        IrExpr::Str(t, style)
+            if !matches!(
+                style,
+                crate::ir::StrStyle::SingleQuoted | crate::ir::StrStyle::Raw
+            ) && foldable.iter().any(|n| t.contains(&format!("${n}")))
+        => {
             let mut text = t.clone();
             for n in foldable.iter() {
                 if let Some(rep) = resolved.get(n) {
