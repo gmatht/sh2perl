@@ -18,12 +18,20 @@
 # or symlink semantics (GNU does not resolve either, but std::path-based renderers
 # do, so the node promises no host path library).
 # GLOB BOUNDARY, exact: the shells' `${p##*/}` / `${p%/*}` spellings are LONGEST-match
-# strips, and ShIR_TextOps_Glob proves only the SHORTEST-match strip of the fragment
-# (TextOps#strip_pre_shortest); it also refutes equating the two
-# (TextOps#greedy_star_is_not_the_node). So this node is NOT derived from a glob law:
-# it promises the GNU command semantics above, which the theory proves directly, and a
-# lowering that implements it by a `##` glob strip must justify its own equivalence —
-# for "strip up to the last separator" that equivalence is not in this theory.
+# strips, and ShIR_TextOps_Glob proves that reading over its own matcher: the longest
+# strip of `*lit` is the LAST occurrence of the literal
+# (TextOps#strip_pre_long_star_lit — `strip_pre_long [PStar, PLit p] t` is drop after
+# the last occurrence, identity on a miss), so `${p##*/}` is "the tail after the last
+# separator". That is NOT the same function as GNU `basename`:
+# TextOps#shell_strip_is_not_gnu_basename exhibits a non-empty path ending in a
+# separator, where the glob strip is empty (the star absorbs the trailing separator)
+# while `basename` returns the last component, and the two coincide only when there is
+# no trailing separator. This node therefore promises the GNU command semantics above,
+# proved directly by `path_name_sound`, and a lowering that spells it `${p##*/}` must
+# promise the glob law instead; the theory keeps both and proves they are different
+# functions, so neither reading is smuggled in as the other. `${p%/*}` is the shortest
+# trailing `*lit` strip (strip_suf_short … from the last separator) and `${p%%/*}` the
+# longest (TextOps#strip_suf_long_lit_star, from the first).
 # Note the generic Ext lowering in
 # shir.rs renders split('/').pop() / split('/').slice(0,-1).join('/'), which is
 # wrong for "a/b/" and for slashless words — a lowering question, not the spec.
@@ -35,3 +43,5 @@ kind expr
 field text: expr
 field which: string
 spec: TextOps#path_name_sound
+spec: TextOps#strip_pre_long_star_lit
+spec: TextOps#shell_strip_is_not_gnu_basename

@@ -912,4 +912,853 @@ theorem star_test_is_every_string:
   "pmatch [PStar] [] \<and> pmatch [PStar] [97] \<and> pmatch [PStar] [97, 98, 99]"
   by (simp add: pmatch_star_only)
 
+
+section \<open>Longest match: `${s##p}` and `${s%%p}` over the same fragment\<close>
+
+text \<open>`${s#p}` keeps the SHORTEST matching prefix, `${s##p}` the LONGEST; `${s%p}` and
+  `${s%%p}` are the same pair at the trailing end. The fragment is unchanged — still
+  `PLit`/`PAny`/`PStar` — so the longest forms are the same relation with the other
+  extremum of the match set, and the two are proved to differ (never merely asserted to).
+
+  Occurrences are the shared currency: `occ_at p t j` is "the literal `p` starts at
+  position `j` of `t`", and `first_occ`/`last_occ` are the two extrema of that set. That
+  is what `${s#*lit}` and `${s##*lit}` reduce to, and it is what a backend's `find`/`rfind`
+  computes — so the reduction is a proof obligation, not an implementation detail.\<close>
+
+definition occ_at :: "bytes \<Rightarrow> bytes \<Rightarrow> nat \<Rightarrow> bool" where
+  "occ_at p t j \<equiv> (j + length p \<le> length t \<and> take (length p) (drop j t) = p)"
+
+lemma occ_at_le: "occ_at p t j \<Longrightarrow> j + length p \<le> length t"
+  unfolding occ_at_def by simp
+
+lemma occ_at_finite: "finite {j. occ_at p t j}"
+proof -
+  have "{j. occ_at p t j} \<subseteq> {..length t}" by (auto simp: occ_at_def)
+  thus ?thesis by (rule finite_subset) simp
+qed
+
+lemma occ_at_take:
+  assumes h: "occ_at p t j"
+  shows "take (j + length p) t = take j t @ p"
+proof -
+  have "take (j + length p) t = take j t @ take (length p) (drop j t)"
+    by (simp only: take_add)
+  also have "\<dots> = take j t @ p" using h unfolding occ_at_def by simp
+  finally show ?thesis .
+qed
+
+definition first_occ :: "bytes \<Rightarrow> bytes \<Rightarrow> nat" where
+  "first_occ p t \<equiv> (if (\<exists>j. occ_at p t j) then LEAST j. occ_at p t j else 0)"
+
+definition last_occ :: "bytes \<Rightarrow> bytes \<Rightarrow> nat" where
+  "last_occ p t \<equiv> (if (\<exists>j. occ_at p t j) then Max {j. occ_at p t j} else 0)"
+
+lemma first_occ_prop:
+  assumes ex: "\<exists>j. occ_at p t j"
+  shows "occ_at p t (first_occ p t)"
+proof -
+  have "first_occ p t = (LEAST j. occ_at p t j)" using ex unfolding first_occ_def by simp
+  thus ?thesis using ex by (simp add: LeastI_ex)
+qed
+
+lemma first_occ_min:
+  assumes h: "occ_at p t j"
+  shows "first_occ p t \<le> j"
+proof -
+  have ex: "\<exists>k. occ_at p t k" using h by blast
+  have eq: "first_occ p t = (LEAST k. occ_at p t k)" using ex unfolding first_occ_def by simp
+  have "occ_at p t j" using h .
+  thus ?thesis using eq by (metis Least_le)
+qed
+
+lemma last_occ_prop:
+  assumes ex: "\<exists>j. occ_at p t j"
+  shows "occ_at p t (last_occ p t)"
+proof -
+  have eq: "last_occ p t = Max {j. occ_at p t j}" using ex unfolding last_occ_def by simp
+  have fin: "finite {j. occ_at p t j}" by (rule occ_at_finite)
+  have ne: "{j. occ_at p t j} \<noteq> {}" using ex by blast
+  have "Max {j. occ_at p t j} \<in> {j. occ_at p t j}" using fin ne by (rule Max_in)
+  thus ?thesis using eq by simp
+qed
+
+lemma last_occ_max:
+  assumes h: "occ_at p t j"
+  shows "j \<le> last_occ p t"
+proof -
+  have ex: "\<exists>k. occ_at p t k" using h by blast
+  have eq: "last_occ p t = Max {k. occ_at p t k}" using ex unfolding last_occ_def by simp
+  have fin: "finite {k. occ_at p t k}" by (rule occ_at_finite)
+  have mem: "j \<in> {k. occ_at p t k}" using h by simp
+  have "j \<le> Max {k. occ_at p t k}" using fin mem by (rule Max_ge)
+  thus ?thesis using eq by simp
+qed
+
+text \<open>The match set of `*lit` as a PREFIX is exactly the set of positions where the
+  literal starts, shifted by its length. This is the bridge that turns "longest match"
+  into "last occurrence", in both directions.\<close>
+
+lemma pre_ok_star_litD:
+  assumes ok: "pre_ok [PStar, PLit p] t k"
+  shows "\<exists>j. occ_at p t j \<and> k = j + length p"
+proof -
+  have kl: "k \<le> length t" and m: "pmatch [PStar, PLit p] (take k t)"
+    using ok unfolding pre_ok_def by blast+
+  have "\<exists>r. take k t = r @ p" using m by (rule pmatch_star_lit[THEN iffD1])
+  then obtain r where r: "take k t = r @ p" by blast
+  have lk: "length (take k t) = k" by (simp add: length_take min_absorb2 kl)
+  have keq: "k = length r + length p" using r lk by simp
+  have d1: "drop (length r) (take k t) = p" using r by simp
+  have d2: "drop (length r) (take k t) = take (k - length r) (drop (length r) t)"
+    by (simp only: drop_take)
+  have "take (k - length r) (drop (length r) t) = p" using d1 d2 by simp
+  hence dt: "take (length p) (drop (length r) t) = p" using keq by simp
+  have "occ_at p t (length r)" using dt keq kl unfolding occ_at_def by simp
+  thus ?thesis using keq by blast
+qed
+
+lemma pre_ok_star_lit_occI:
+  assumes occ: "occ_at p t j"
+  shows "pre_ok [PStar, PLit p] t (j + length p)"
+proof -
+  have kl: "j + length p \<le> length t" using occ unfolding occ_at_def by simp
+  have tk: "take (j + length p) t = take j t @ p" using occ by (rule occ_at_take)
+  have exr: "\<exists>r. take (j + length p) t = r @ p"
+  proof (rule exI[where x = "take j t"])
+    show "take (j + length p) t = take j t @ p" using tk .
+  qed
+  have m: "pmatch [PStar, PLit p] (take (j + length p) t)"
+    using exr by (rule pmatch_star_lit[THEN iffD2])
+  show ?thesis using m kl unfolding pre_ok_def by simp
+qed
+
+lemma pre_ok_star_litI:
+  assumes occ: "occ_at p t j" and keq: "k = j + length p"
+  shows "pre_ok [PStar, PLit p] t k"
+proof -
+  have "pre_ok [PStar, PLit p] t (j + length p)" using occ by (rule pre_ok_star_lit_occI)
+  thus ?thesis using keq by simp
+qed
+
+lemma pre_ok_star_lit_iff:
+  "pre_ok [PStar, PLit p] t k = (\<exists>j. occ_at p t j \<and> k = j + length p)"
+  using pre_ok_star_litD pre_ok_star_litI by blast
+
+text \<open>`${s#*lit}` — the SHORTEST prefix matching `*lit` is the FIRST occurrence of
+  the literal, and the strip drops through it.\<close>
+
+lemma strip_pre_star_lit:
+  "strip_pre [PStar, PLit p] t
+     = (if \<exists>j. occ_at p t j then drop (first_occ p t + length p) t else t)"
+proof (cases "\<exists>j. occ_at p t j")
+  case True
+  have occ: "occ_at p t (first_occ p t)" using True by (rule first_occ_prop)
+  have ok: "pre_ok [PStar, PLit p] t (first_occ p t + length p)"
+    using occ by (rule pre_ok_star_lit_occI)
+  have min: "\<And>k. pre_ok [PStar, PLit p] t k \<Longrightarrow> first_occ p t + length p \<le> k"
+  proof -
+    fix k
+    assume okk: "pre_ok [PStar, PLit p] t k"
+    from okk obtain j where occj: "occ_at p t j" and keq: "k = j + length p"
+      using pre_ok_star_litD by blast
+    have le: "first_occ p t \<le> j" using occj by (rule first_occ_min)
+    show "first_occ p t + length p \<le> k" using le keq by arith
+  qed
+  have eq: "(LEAST k. pre_ok [PStar, PLit p] t k) = first_occ p t + length p"
+  proof (rule Least_equality)
+    show "pre_ok [PStar, PLit p] t (first_occ p t + length p)" using ok .
+  next
+    fix y
+    assume "pre_ok [PStar, PLit p] t y"
+    thus "first_occ p t + length p \<le> y" by (rule min)
+  qed
+  have ex: "\<exists>k. pre_ok [PStar, PLit p] t k" using ok by blast
+  have "strip_pre [PStar, PLit p] t = drop (LEAST k. pre_ok [PStar, PLit p] t k) t"
+    using ex by (rule strip_pre_some)
+  thus ?thesis using True eq by simp
+next
+  case False
+  have none: "\<not> (\<exists>k. pre_ok [PStar, PLit p] t k)"
+  proof
+    assume "\<exists>k. pre_ok [PStar, PLit p] t k"
+    then obtain k where okk: "pre_ok [PStar, PLit p] t k" by blast
+    from okk obtain j where "occ_at p t j" using pre_ok_star_litD by blast
+    with False show False by blast
+  qed
+  hence "strip_pre [PStar, PLit p] t = t" by (rule strip_pre_none)
+  thus ?thesis using False by simp
+qed
+
+text \<open>The longest-match strip, defined as the other extremum of the same match set.\<close>
+
+definition strip_pre_long :: "pseg list \<Rightarrow> bytes \<Rightarrow> bytes" where
+  "strip_pre_long ps t \<equiv>
+     (if (\<exists>k. pre_ok ps t k) then drop (Max {k. pre_ok ps t k}) t else t)"
+
+lemma pre_ok_finite: "finite {k. pre_ok ps t k}"
+proof -
+  have "{k. pre_ok ps t k} \<subseteq> {..length t}" by (auto simp: pre_ok_def)
+  thus ?thesis by (rule finite_subset) simp
+qed
+
+lemma strip_pre_long_some:
+  assumes "\<exists>k. pre_ok ps t k"
+  shows "strip_pre_long ps t = drop (Max {k. pre_ok ps t k}) t"
+  using assms unfolding strip_pre_long_def by simp
+
+lemma strip_pre_long_none:
+  assumes "\<not> (\<exists>k. pre_ok ps t k)"
+  shows "strip_pre_long ps t = t"
+  using assms unfolding strip_pre_long_def by simp
+
+lemma strip_pre_long_removed_matches:
+  assumes ex: "\<exists>k. pre_ok ps t k"
+  shows "\<exists>u. t = u @ strip_pre_long ps t \<and> pmatch ps u"
+proof (rule exI[where x = "take (Max {k. pre_ok ps t k}) t"])
+  have fin: "finite {k. pre_ok ps t k}" by (rule pre_ok_finite)
+  have ne: "{k. pre_ok ps t k} \<noteq> {}" using ex by blast
+  have mem: "Max {k. pre_ok ps t k} \<in> {k. pre_ok ps t k}" using fin ne by (rule Max_in)
+  hence m: "pmatch ps (take (Max {k. pre_ok ps t k}) t)"
+    unfolding pre_ok_def by blast
+  have sp: "strip_pre_long ps t = drop (Max {k. pre_ok ps t k}) t" using ex by (rule strip_pre_long_some)
+  have "take (Max {k. pre_ok ps t k}) t @ drop (Max {k. pre_ok ps t k}) t = t" by simp
+  thus "t = take (Max {k. pre_ok ps t k}) t @ strip_pre_long ps t \<and>
+        pmatch ps (take (Max {k. pre_ok ps t k}) t)"
+    using sp m by simp
+qed
+
+lemma strip_pre_long_length_le: "length (strip_pre_long ps t) \<le> length t"
+proof (cases "\<exists>k. pre_ok ps t k")
+  case True
+  have "strip_pre_long ps t = drop (Max {k. pre_ok ps t k}) t" using True by (rule strip_pre_long_some)
+  thus ?thesis by simp
+next
+  case False
+  hence "strip_pre_long ps t = t" by (rule strip_pre_long_none)
+  thus ?thesis by simp
+qed
+
+text \<open>LONGEST, the law that separates `${s##p}` from `${s#p}`: every matching prefix of
+  `s` leaves at least as much as the longest strip does. The shortest strip's law
+  (`strip_pre_shortest`) says the opposite inequality, so the two strips are proved to be
+  different functions, not assumed to be.\<close>
+
+lemma strip_pre_long_longest:
+  assumes m: "pmatch ps u" and s: "t = u @ v"
+  shows "length (strip_pre_long ps t) \<le> length v"
+proof -
+  have ok: "pre_ok ps t (length u)"
+  proof -
+    have "take (length u) t = u" using s by simp
+    moreover have "length u \<le> length t" using s by simp
+    ultimately show ?thesis using m unfolding pre_ok_def by simp
+  qed
+  hence ex: "\<exists>k. pre_ok ps t k" by blast
+  have fin: "finite {k. pre_ok ps t k}" by (rule pre_ok_finite)
+  have mem: "length u \<in> {k. pre_ok ps t k}" using ok by simp
+  have mle: "length u \<le> Max {k. pre_ok ps t k}" using fin mem by (rule Max_ge)
+  have len: "length (strip_pre_long ps t) = length t - Max {k. pre_ok ps t k}"
+  proof -
+    have "strip_pre_long ps t = drop (Max {k. pre_ok ps t k}) t" using ex by (rule strip_pre_long_some)
+    thus ?thesis by simp
+  qed
+  have tl: "length t = length u + length v" using s by simp
+  from mle len tl show ?thesis by arith
+qed
+
+lemma strip_pre_long_star: "strip_pre_long [PStar] t = []"
+proof -
+  have top: "pre_ok [PStar] t (length t)" unfolding pre_ok_def by simp
+  hence ex: "\<exists>k. pre_ok [PStar] t k" by blast
+  have eq: "Max {k. pre_ok [PStar] t k} = length t"
+  proof (rule Max_eqI)
+    show "finite {k. pre_ok [PStar] t k}" by (rule pre_ok_finite)
+  next
+    fix y
+    assume "y \<in> {k. pre_ok [PStar] t k}"
+    thus "y \<le> length t" unfolding pre_ok_def by simp
+  next
+    show "length t \<in> {k. pre_ok [PStar] t k}" using top by simp
+  qed
+  have "strip_pre_long [PStar] t = drop (Max {k. pre_ok [PStar] t k}) t" using ex by (rule strip_pre_long_some)
+  thus ?thesis using eq by simp
+qed
+
+text \<open>`${s##*lit}`: with a literal-then-star pattern the longest match is the WHOLE
+  string as soon as the literal prefixes it (a star can absorb everything), so the
+  longest strip is the empty string there and the identity on a miss. This is the
+  sharpest contrast with `${s#*lit}` over the same bytes.\<close>
+
+lemma strip_pre_long_lit_star:
+  "strip_pre_long [PLit p, PStar] t = (if take (length p) t = p then [] else t)"
+proof (cases "take (length p) t = p")
+  case True
+  have exr: "\<exists>r. t = p @ r"
+  proof (rule exI[where x = "drop (length p) t"])
+    show "t = p @ drop (length p) t" using True append_take_drop_id by metis
+  qed
+  have m: "pmatch [PLit p, PStar] t" using exr by (rule pmatch_lit_star[THEN iffD2])
+  have top: "pre_ok [PLit p, PStar] t (length t)" using m unfolding pre_ok_def by simp
+  hence ex: "\<exists>k. pre_ok [PLit p, PStar] t k" by blast
+  have eq: "Max {k. pre_ok [PLit p, PStar] t k} = length t"
+  proof (rule Max_eqI)
+    show "finite {k. pre_ok [PLit p, PStar] t k}" by (rule pre_ok_finite)
+  next
+    fix y
+    assume "y \<in> {k. pre_ok [PLit p, PStar] t k}"
+    thus "y \<le> length t" unfolding pre_ok_def by simp
+  next
+    show "length t \<in> {k. pre_ok [PLit p, PStar] t k}" using top by simp
+  qed
+  have "strip_pre_long [PLit p, PStar] t = drop (Max {k. pre_ok [PLit p, PStar] t k}) t"
+    using ex by (rule strip_pre_long_some)
+  thus ?thesis using True eq by simp
+next
+  case False
+  have none: "\<not> (\<exists>k. pre_ok [PLit p, PStar] t k)"
+  proof
+    assume "\<exists>k. pre_ok [PLit p, PStar] t k"
+    then obtain k where ok: "pre_ok [PLit p, PStar] t k" by blast
+    have h: "pmatch [PLit p, PStar] (take k t)" and kl: "k \<le> length t"
+      using ok unfolding pre_ok_def by blast+
+    have "\<exists>r. take k t = p @ r" using h by (rule pmatch_lit_star[THEN iffD1])
+    then obtain r where r: "take k t = p @ r" by blast
+    have "length (take k t) = length p + length r" using r by simp
+    hence le: "length p \<le> k" using kl by simp
+    have "take (length p) t = take (min (length p) k) t" using le by (simp add: min_def)
+    also have "\<dots> = take (length p) (take k t)" by (simp add: take_take)
+    also have "\<dots> = take (length p) (p @ r)" using r by simp
+    also have "\<dots> = p" by simp
+    finally have "take (length p) t = p" .
+    with False show False by blast
+  qed
+  hence "strip_pre_long [PLit p, PStar] t = t" by (rule strip_pre_long_none)
+  thus ?thesis using False by simp
+qed
+
+text \<open>`${s##*lit}` — the LONGEST prefix matching star-then-literal ends at the LAST
+  occurrence of the literal. This is the law a `${p##*/}` lowering has to meet, and it is
+  where `rfind` gets its meaning.\<close>
+
+lemma strip_pre_long_star_lit:
+  "strip_pre_long [PStar, PLit p] t
+     = (if \<exists>j. occ_at p t j then drop (last_occ p t + length p) t else t)"
+proof (cases "\<exists>j. occ_at p t j")
+  case True
+  have occ: "occ_at p t (last_occ p t)" using True by (rule last_occ_prop)
+  have ok: "pre_ok [PStar, PLit p] t (last_occ p t + length p)" using occ by (rule pre_ok_star_lit_occI)
+  hence ex: "\<exists>k. pre_ok [PStar, PLit p] t k" by blast
+  have top: "\<And>k. pre_ok [PStar, PLit p] t k \<Longrightarrow> k \<le> last_occ p t + length p"
+  proof -
+    fix k
+    assume okk: "pre_ok [PStar, PLit p] t k"
+    from okk obtain j where occj: "occ_at p t j" and keq: "k = j + length p"
+      using pre_ok_star_litD by blast
+    have "j \<le> last_occ p t" using occj by (rule last_occ_max)
+    thus "k \<le> last_occ p t + length p" using keq by arith
+  qed
+  have eq: "Max {k. pre_ok [PStar, PLit p] t k} = last_occ p t + length p"
+  proof (rule Max_eqI)
+    show "finite {k. pre_ok [PStar, PLit p] t k}" by (rule pre_ok_finite)
+  next
+    fix y
+    assume hy: "y \<in> {k. pre_ok [PStar, PLit p] t k}"
+    have py: "pre_ok [PStar, PLit p] t y" using hy by simp
+    show "y \<le> last_occ p t + length p" using py by (rule top)
+  next
+    show "last_occ p t + length p \<in> {k. pre_ok [PStar, PLit p] t k}" using ok by simp
+  qed
+  have "strip_pre_long [PStar, PLit p] t = drop (Max {k. pre_ok [PStar, PLit p] t k}) t"
+    using ex by (rule strip_pre_long_some)
+  thus ?thesis using True eq by simp
+next
+  case False
+  have none: "\<not> (\<exists>k. pre_ok [PStar, PLit p] t k)"
+  proof
+    assume "\<exists>k. pre_ok [PStar, PLit p] t k"
+    then obtain k where okk: "pre_ok [PStar, PLit p] t k" by blast
+    from okk obtain j where "occ_at p t j" using pre_ok_star_litD by blast
+    with False show False by blast
+  qed
+  hence "strip_pre_long [PStar, PLit p] t = t" by (rule strip_pre_long_none)
+  thus ?thesis using False by simp
+qed
+
+
+section \<open>The trailing pair: `${s%p}` and `${s%%p}`\<close>
+
+text \<open>The trailing forms are indexed by the START of the match rather than by its length:
+  a LONGER match starts EARLIER, so the longest strip takes the least start and the
+  shortest takes the greatest. `suf_at ps t j` is "the pattern matches the suffix starting
+  at `j`" — the same relation as `pre_ok`, read from the other end.\<close>
+
+definition suf_at :: "pseg list \<Rightarrow> bytes \<Rightarrow> nat \<Rightarrow> bool" where
+  "suf_at ps t j \<equiv> (j \<le> length t \<and> pmatch ps (drop j t))"
+
+lemma suf_at_finite: "finite {j. suf_at ps t j}"
+proof -
+  have "{j. suf_at ps t j} \<subseteq> {..length t}" by (auto simp: suf_at_def)
+  thus ?thesis by (rule finite_subset) simp
+qed
+
+text \<open>`strip_suf_long` removes the LONGEST matching suffix (smallest start: what
+  `${s%%p}` asks for), `strip_suf_short` the SHORTEST (greatest start: `${s%p}`).\<close>
+
+definition strip_suf_long :: "pseg list \<Rightarrow> bytes \<Rightarrow> bytes" where
+  "strip_suf_long ps t \<equiv>
+     (if (\<exists>j. suf_at ps t j) then take (LEAST j. suf_at ps t j) t else t)"
+
+definition strip_suf_short :: "pseg list \<Rightarrow> bytes \<Rightarrow> bytes" where
+  "strip_suf_short ps t \<equiv>
+     (if (\<exists>j. suf_at ps t j) then take (Max {j. suf_at ps t j}) t else t)"
+
+lemma strip_suf_long_some:
+  assumes "\<exists>j. suf_at ps t j"
+  shows "strip_suf_long ps t = take (LEAST j. suf_at ps t j) t"
+  using assms unfolding strip_suf_long_def by simp
+
+lemma strip_suf_long_none:
+  assumes "\<not> (\<exists>j. suf_at ps t j)"
+  shows "strip_suf_long ps t = t"
+  using assms unfolding strip_suf_long_def by simp
+
+lemma strip_suf_short_some:
+  assumes "\<exists>j. suf_at ps t j"
+  shows "strip_suf_short ps t = take (Max {j. suf_at ps t j}) t"
+  using assms unfolding strip_suf_short_def by simp
+
+lemma strip_suf_short_none:
+  assumes "\<not> (\<exists>j. suf_at ps t j)"
+  shows "strip_suf_short ps t = t"
+  using assms unfolding strip_suf_short_def by simp
+
+lemma strip_suf_long_suffix: "\<exists>u. strip_suf_long ps t @ u = t"
+proof (cases "\<exists>j. suf_at ps t j")
+  case True
+  have sp: "strip_suf_long ps t = take (LEAST j. suf_at ps t j) t" using True by (rule strip_suf_long_some)
+  show ?thesis
+  proof (rule exI[where x = "drop (LEAST j. suf_at ps t j) t"])
+    have "take (LEAST j. suf_at ps t j) t @ drop (LEAST j. suf_at ps t j) t = t"
+      by (rule append_take_drop_id)
+    thus "strip_suf_long ps t @ drop (LEAST j. suf_at ps t j) t = t" using sp by simp
+  qed
+next
+  case False
+  hence sp: "strip_suf_long ps t = t" by (rule strip_suf_long_none)
+  show ?thesis
+  proof (rule exI[where x = "[]"])
+    show "strip_suf_long ps t @ [] = t" using sp by simp
+  qed
+qed
+
+lemma strip_suf_long_removed_matches:
+  assumes ex: "\<exists>j. suf_at ps t j"
+  shows "\<exists>u. strip_suf_long ps t @ u = t \<and> pmatch ps u"
+proof (rule exI[where x = "drop (LEAST j. suf_at ps t j) t"])
+  have least: "suf_at ps t (LEAST j. suf_at ps t j)" using ex by (rule LeastI_ex)
+  hence m: "pmatch ps (drop (LEAST j. suf_at ps t j) t)" unfolding suf_at_def by blast
+  have sp: "strip_suf_long ps t = take (LEAST j. suf_at ps t j) t" using ex by (rule strip_suf_long_some)
+  have "take (LEAST j. suf_at ps t j) t @ drop (LEAST j. suf_at ps t j) t = t"
+    by (rule append_take_drop_id)
+  thus "strip_suf_long ps t @ drop (LEAST j. suf_at ps t j) t = t \<and>
+        pmatch ps (drop (LEAST j. suf_at ps t j) t)"
+    using sp m by simp
+qed
+
+lemma strip_suf_short_suffix: "\<exists>u. strip_suf_short ps t @ u = t"
+proof (cases "\<exists>j. suf_at ps t j")
+  case True
+  have sp: "strip_suf_short ps t = take (Max {j. suf_at ps t j}) t" using True by (rule strip_suf_short_some)
+  show ?thesis
+  proof (rule exI[where x = "drop (Max {j. suf_at ps t j}) t"])
+    have "take (Max {j. suf_at ps t j}) t @ drop (Max {j. suf_at ps t j}) t = t"
+      by (rule append_take_drop_id)
+    thus "strip_suf_short ps t @ drop (Max {j. suf_at ps t j}) t = t" using sp by simp
+  qed
+next
+  case False
+  hence sp: "strip_suf_short ps t = t" by (rule strip_suf_short_none)
+  show ?thesis
+  proof (rule exI[where x = "[]"])
+    show "strip_suf_short ps t @ [] = t" using sp by simp
+  qed
+qed
+
+text \<open>The two laws that separate `${s%%p}` from `${s%p}`, dual to the prefix pair: the
+  longest strip keeps at most what any matching suffix leaves, the shortest at least.\<close>
+
+lemma strip_suf_long_longest:
+  assumes m: "pmatch ps v" and s: "t = u @ v"
+  shows "length (strip_suf_long ps t) \<le> length u"
+proof -
+  have ok: "suf_at ps t (length u)"
+  proof -
+    have "drop (length u) t = v" using s by simp
+    moreover have "length u \<le> length t" using s by simp
+    ultimately show ?thesis using m unfolding suf_at_def by simp
+  qed
+  hence ex: "\<exists>j. suf_at ps t j" by blast
+  have mle: "(LEAST j. suf_at ps t j) \<le> length u" using ok by (rule Least_le)
+  have le_le: "(LEAST j. suf_at ps t j) \<le> length t"
+  proof -
+    have "suf_at ps t (LEAST j. suf_at ps t j)" using ex by (rule LeastI_ex)
+    thus ?thesis unfolding suf_at_def by simp
+  qed
+  have len: "length (strip_suf_long ps t) = (LEAST j. suf_at ps t j)"
+  proof -
+    have "strip_suf_long ps t = take (LEAST j. suf_at ps t j) t" using ex by (rule strip_suf_long_some)
+    thus ?thesis by (simp add: length_take min_absorb2 le_le)
+  qed
+  from mle len show ?thesis by simp
+qed
+
+lemma strip_suf_short_shortest:
+  assumes m: "pmatch ps v" and s: "t = u @ v"
+  shows "length u \<le> length (strip_suf_short ps t)"
+proof -
+  have ok: "suf_at ps t (length u)"
+  proof -
+    have "drop (length u) t = v" using s by simp
+    moreover have "length u \<le> length t" using s by simp
+    ultimately show ?thesis using m unfolding suf_at_def by simp
+  qed
+  hence ex: "\<exists>j. suf_at ps t j" by blast
+  have fin: "finite {j. suf_at ps t j}" by (rule suf_at_finite)
+  have mem: "length u \<in> {j. suf_at ps t j}" using ok by simp
+  have mge: "length u \<le> Max {j. suf_at ps t j}" using fin mem by (rule Max_ge)
+  have ne: "{j. suf_at ps t j} \<noteq> {}" using ex by blast
+  have top: "Max {j. suf_at ps t j} \<le> length t"
+  proof -
+    have "Max {j. suf_at ps t j} \<in> {j. suf_at ps t j}" using fin ne by (rule Max_in)
+    thus ?thesis unfolding suf_at_def by simp
+  qed
+  have len: "length (strip_suf_short ps t) = Max {j. suf_at ps t j}"
+  proof -
+    have "strip_suf_short ps t = take (Max {j. suf_at ps t j}) t" using ex by (rule strip_suf_short_some)
+    thus ?thesis using top by (simp add: length_take min_absorb2)
+  qed
+  from mge len show ?thesis by simp
+qed
+
+text \<open>`${s%%lit*}` and `${s%lit*}`: a suffix matching literal-then-star is exactly an
+  occurrence of the literal, and the two extrema of the occurrence set give the two
+  strips — the first occurrence for the longest, the last for the shortest. So the pair is
+  the mirror image of `${s#*lit}` / `${s##*lit}`, proved from the same `first_occ` /
+  `last_occ` facts rather than from a second theory of matching.\<close>
+
+lemma suf_at_lit_star_iff: "suf_at [PLit p, PStar] t j = occ_at p t j"
+proof (rule iffI)
+  assume h: "suf_at [PLit p, PStar] t j"
+  have jl: "j \<le> length t" and m: "pmatch [PLit p, PStar] (drop j t)"
+    using h unfolding suf_at_def by blast+
+  have "\<exists>r. drop j t = p @ r" using m by (rule pmatch_lit_star[THEN iffD1])
+  then obtain r where r: "drop j t = p @ r" by blast
+  have tk: "take (length p) (drop j t) = p" using r by simp
+  have split: "t = take j t @ p @ r"
+  proof -
+    have "take j t @ drop j t = t" by (rule append_take_drop_id)
+    thus ?thesis using r by simp
+  qed
+  have ld: "length (drop j t) = length t - j" by (simp add: length_drop)
+  have lp: "length (drop j t) = length p + length r" using r by simp
+  have len: "j + (length p + length r) = length t" using ld lp jl by arith
+  have bound: "j + length p \<le> length t" using len by arith
+  show "occ_at p t j" using tk bound unfolding occ_at_def by simp
+next
+  assume h: "occ_at p t j"
+  have jl: "j + length p \<le> length t" and tk: "take (length p) (drop j t) = p"
+    using h unfolding occ_at_def by blast+
+  have d: "drop j t = p @ drop (j + length p) t"
+  proof -
+    have "take (length p) (drop j t) @ drop (length p) (drop j t) = drop j t"
+      by (rule append_take_drop_id)
+    hence "p @ drop (length p) (drop j t) = drop j t" using tk by simp
+    moreover have "drop (length p) (drop j t) = drop (j + length p) t"
+      by (simp add: drop_drop add.commute)
+    ultimately show ?thesis by simp
+  qed
+  have exr: "\<exists>r. drop j t = p @ r" using d by blast
+  have m: "pmatch [PLit p, PStar] (drop j t)" using exr by (rule pmatch_lit_star[THEN iffD2])
+  have jlt: "j \<le> length t" using jl by arith
+  show "suf_at [PLit p, PStar] t j" using m jlt unfolding suf_at_def by simp
+qed
+
+lemma strip_suf_long_lit_star:
+  "strip_suf_long [PLit p, PStar] t
+     = (if \<exists>j. occ_at p t j then take (first_occ p t) t else t)"
+proof (cases "\<exists>j. occ_at p t j")
+  case True
+  have ex: "\<exists>j. suf_at [PLit p, PStar] t j" using True by (simp add: suf_at_lit_star_iff)
+  have occ: "occ_at p t (first_occ p t)" using True by (rule first_occ_prop)
+  have inS: "suf_at [PLit p, PStar] t (first_occ p t)" using occ by (simp add: suf_at_lit_star_iff)
+  have minJ: "\<And>j. suf_at [PLit p, PStar] t j \<Longrightarrow> first_occ p t \<le> j"
+  proof -
+    fix j
+    assume hj: "suf_at [PLit p, PStar] t j"
+    have "occ_at p t j" using hj by (simp add: suf_at_lit_star_iff)
+    thus "first_occ p t \<le> j" by (rule first_occ_min)
+  qed
+  have eq: "(LEAST j. suf_at [PLit p, PStar] t j) = first_occ p t"
+    using inS minJ by (rule Least_equality)
+  have "strip_suf_long [PLit p, PStar] t = take (LEAST j. suf_at [PLit p, PStar] t j) t"
+    using ex by (rule strip_suf_long_some)
+  thus ?thesis using True eq by simp
+next
+  case False
+  have none: "\<not> (\<exists>j. suf_at [PLit p, PStar] t j)"
+  proof
+    assume "\<exists>j. suf_at [PLit p, PStar] t j"
+    then obtain j where hj: "suf_at [PLit p, PStar] t j" by blast
+    hence "occ_at p t j" by (simp add: suf_at_lit_star_iff)
+    with False show False by blast
+  qed
+  hence "strip_suf_long [PLit p, PStar] t = t" by (rule strip_suf_long_none)
+  thus ?thesis using False by simp
+qed
+
+lemma strip_suf_short_lit_star:
+  "strip_suf_short [PLit p, PStar] t
+     = (if \<exists>j. occ_at p t j then take (last_occ p t) t else t)"
+proof (cases "\<exists>j. occ_at p t j")
+  case True
+  have ex: "\<exists>j. suf_at [PLit p, PStar] t j" using True by (simp add: suf_at_lit_star_iff)
+  have occ: "occ_at p t (last_occ p t)" using True by (rule last_occ_prop)
+  have inS: "last_occ p t \<in> {j. suf_at [PLit p, PStar] t j}"
+    using occ by (simp add: suf_at_lit_star_iff)
+  have topJ: "\<And>y. y \<in> {j. suf_at [PLit p, PStar] t j} \<Longrightarrow> y \<le> last_occ p t"
+  proof -
+    fix y
+    assume hy: "y \<in> {j. suf_at [PLit p, PStar] t j}"
+    have "occ_at p t y" using hy by (simp add: suf_at_lit_star_iff)
+    thus "y \<le> last_occ p t" by (rule last_occ_max)
+  qed
+  have eq: "Max {j. suf_at [PLit p, PStar] t j} = last_occ p t"
+  proof (rule Max_eqI)
+    show "finite {j. suf_at [PLit p, PStar] t j}" by (rule suf_at_finite)
+  next
+    fix y
+    assume hy: "y \<in> {j. suf_at [PLit p, PStar] t j}"
+    have "occ_at p t y" using hy by (simp add: suf_at_lit_star_iff)
+    thus "y \<le> last_occ p t" by (rule last_occ_max)
+  next
+    show "last_occ p t \<in> {j. suf_at [PLit p, PStar] t j}" using inS .
+  qed
+  have "strip_suf_short [PLit p, PStar] t = take (Max {j. suf_at [PLit p, PStar] t j}) t"
+    using ex by (rule strip_suf_short_some)
+  thus ?thesis using True eq by simp
+next
+  case False
+  have none: "\<not> (\<exists>j. suf_at [PLit p, PStar] t j)"
+  proof
+    assume "\<exists>j. suf_at [PLit p, PStar] t j"
+    then obtain j where hj: "suf_at [PLit p, PStar] t j" by blast
+    hence "occ_at p t j" by (simp add: suf_at_lit_star_iff)
+    with False show False by blast
+  qed
+  hence "strip_suf_short [PLit p, PStar] t = t" by (rule strip_suf_short_none)
+  thus ?thesis using False by simp
+qed
+
+text \<open>`${s%%*lit}`: a suffix matching star-then-literal can absorb everything before the
+  literal, so the longest match is the WHOLE string exactly when the text ends with the
+  literal — the trailing dual of `${s##lit*}`.\<close>
+
+lemma star_lit_mono:
+  assumes h: "pmatch [PStar, PLit p] x"
+  shows "pmatch [PStar, PLit p] (y @ x)"
+proof -
+  have "\<exists>r. x = r @ p" using h by (rule pmatch_star_lit[THEN iffD1])
+  then obtain r where r: "x = r @ p" by blast
+  have exr: "\<exists>s. y @ x = s @ p"
+    by (rule_tac x = "y @ r" in exI) (simp add: r)
+  thus ?thesis by (rule pmatch_star_lit[THEN iffD2])
+qed
+
+lemma strip_suf_long_star_lit:
+  "strip_suf_long [PStar, PLit p] t = (if pmatch [PStar, PLit p] t then [] else t)"
+proof (cases "pmatch [PStar, PLit p] t")
+  case True
+  have inS: "suf_at [PStar, PLit p] t 0" using True unfolding suf_at_def by simp
+  hence ex: "\<exists>j. suf_at [PStar, PLit p] t j" by blast
+  have eq: "(LEAST j. suf_at [PStar, PLit p] t j) = 0" using inS by (rule Least_equality) simp
+  have "strip_suf_long [PStar, PLit p] t = take (LEAST j. suf_at [PStar, PLit p] t j) t"
+    using ex by (rule strip_suf_long_some)
+  thus ?thesis using True eq by simp
+next
+  case False
+  have none: "\<not> (\<exists>j. suf_at [PStar, PLit p] t j)"
+  proof
+    assume "\<exists>j. suf_at [PStar, PLit p] t j"
+    then obtain j where hj: "suf_at [PStar, PLit p] t j" by blast
+    hence "pmatch [PStar, PLit p] (drop j t)" unfolding suf_at_def by blast
+    hence "pmatch [PStar, PLit p] (take j t @ drop j t)" by (rule star_lit_mono)
+    hence "pmatch [PStar, PLit p] t" by simp
+    with False show False by blast
+  qed
+  hence "strip_suf_long [PStar, PLit p] t = t" by (rule strip_suf_long_none)
+  thus ?thesis using False by simp
+qed
+
+section \<open>Witnesses: the longest strips are not vacuous\<close>
+
+text \<open>The whole-string case decides two of the longest laws: whenever the text itself
+  matches, the longest match IS the whole text, so the strip is empty. `${t##*lit}` is
+  empty exactly when `t` ends with the literal, and `${t%%lit*}` exactly when it starts
+  with it.\<close>
+
+lemma strip_pre_long_star_lit_whole:
+  assumes h: "pmatch [PStar, PLit p] t"
+  shows "strip_pre_long [PStar, PLit p] t = []"
+proof -
+  have top: "pre_ok [PStar, PLit p] t (length t)" using h unfolding pre_ok_def by simp
+  hence ex: "\<exists>k. pre_ok [PStar, PLit p] t k" by blast
+  have eq: "Max {k. pre_ok [PStar, PLit p] t k} = length t"
+  proof (rule Max_eqI)
+    show "finite {k. pre_ok [PStar, PLit p] t k}" by (rule pre_ok_finite)
+  next
+    fix y
+    assume hy: "y \<in> {k. pre_ok [PStar, PLit p] t k}"
+    thus "y \<le> length t" unfolding pre_ok_def by simp
+  next
+    show "length t \<in> {k. pre_ok [PStar, PLit p] t k}" using top by simp
+  qed
+  have "strip_pre_long [PStar, PLit p] t = drop (Max {k. pre_ok [PStar, PLit p] t k}) t"
+    using ex by (rule strip_pre_long_some)
+  thus ?thesis using eq by simp
+qed
+
+text \<open>The occurrence extrema at a single-byte text, where they are forced: the literal
+  starts at position zero and cannot start anywhere else.\<close>
+
+lemma occ_self: "occ_at [c] [c] 0"
+proof -
+  have "0 + length [c] \<le> length [c]" by simp
+  moreover have "take (length [c]) (drop 0 [c]) = [c]" by simp
+  ultimately show ?thesis unfolding occ_at_def by simp
+qed
+
+lemma occ_self_exists: "\<exists>j. occ_at [c] [c] j"
+  by (rule_tac x = 0 in exI) (rule occ_self)
+
+lemma last_occ_self: "last_occ [c] [c] = 0"
+proof -
+  have ex: "\<exists>j. occ_at [c] [c] j" by (rule occ_self_exists)
+  have eq: "Max {j. occ_at [c] [c] j} = 0"
+  proof (rule Max_eqI)
+    show "finite {j. occ_at [c] [c] j}" by (rule occ_at_finite)
+  next
+    fix y
+    assume hy: "y \<in> {j. occ_at [c] [c] j}"
+    hence "y + length [c] \<le> length [c]" unfolding occ_at_def by simp
+    thus "y \<le> 0" by arith
+  next
+    show "0 \<in> {j. occ_at [c] [c] j}" by (simp add: occ_self)
+  qed
+  thus ?thesis using ex unfolding last_occ_def by simp
+qed
+
+lemma first_occ_self: "first_occ [c] [c] = 0"
+proof -
+  have ex: "\<exists>j. occ_at [c] [c] j" by (rule occ_self_exists)
+  have minJ: "\<And>j. occ_at [c] [c] j \<Longrightarrow> 0 \<le> j" by simp
+  have eq: "(LEAST j. occ_at [c] [c] j) = 0" using occ_self minJ by (rule Least_equality)
+  have "first_occ [c] [c] = (LEAST j. occ_at [c] [c] j)" using ex unfolding first_occ_def by simp
+  thus ?thesis using eq by simp
+qed
+
+text \<open>Ground instances, each decided by a proved side condition and the closed form:\<close>
+
+theorem long_strip_witness:
+  "strip_pre_long [PLit [47], PStar] [47, 97] = [] \<and>
+   strip_pre_long [PLit [47], PStar] [97, 47] = [97, 47] \<and>
+   strip_pre_long [PStar] [97, 98] = []"
+  by (simp add: strip_pre_long_lit_star strip_pre_long_star)
+
+theorem last_occurrence_witness:
+  "strip_pre_long [PStar, PLit [47]] [47] = [] \<and>
+   strip_suf_long [PLit [47], PStar] [47] = []"
+proof -
+  have ex: "\<exists>j. occ_at [47] [47] j" by (rule occ_self_exists)
+  have lo: "last_occ [47] [47] = 0" by (rule last_occ_self)
+  have fo: "first_occ [47] [47] = 0" by (rule first_occ_self)
+  have sf: "\<exists>j. suf_at [PLit [47], PStar] [47] j" using ex by (simp add: suf_at_lit_star_iff)
+  show ?thesis
+    using ex lo fo sf
+    by (simp add: strip_pre_long_star_lit strip_suf_long_lit_star)
+qed
+
+text \<open>And the whole-string form of the trailing law, at concrete bytes:\<close>
+
+theorem trailing_whole_string_witness:
+  "strip_suf_long [PStar, PLit [47]] [97, 47] = []"
+proof -
+  have m1: "pmatch [PStar, PLit [47]] [97, 47]"
+  proof -
+    have exr: "\<exists>r. [97, 47] = r @ [47]" by (rule_tac x = "[97]" in exI) simp
+    show ?thesis using exr by (rule pmatch_star_lit[THEN iffD2])
+  qed
+  show ?thesis using m1 by (simp add: strip_suf_long_star_lit)
+qed
+
+section \<open>Refuted weaker models, by evaluation\<close>
+
+text \<open>The longest law is not implied by anything cheaper. First: the SHORTEST strip over
+  the same bytes does not satisfy it — `${s#p}` is not `${s##p}`. Both sides are computed
+  from their closed forms.\<close>
+
+theorem shortest_is_not_the_longest:
+  "strip_pre [PLit [47], PStar] [47, 97] \<noteq> strip_pre_long [PLit [47], PStar] [47, 97]"
+  by (simp add: strip_pre_lit_star strip_pre_long_lit_star)
+
+text \<open>Second: "a star strips everything" — the greedy reading. It agrees with the
+  longest strip only when the text really matches, and disagrees on a miss, where the node
+  is the identity.\<close>
+
+definition greedy_long_strip :: "bytes \<Rightarrow> bytes" where
+  "greedy_long_strip t \<equiv> []"
+
+theorem greedy_star_is_not_the_last_separator_strip:
+  "greedy_long_strip [97, 98] \<noteq> strip_pre_long [PLit [47], PStar] [97, 98]"
+  by (simp add: greedy_long_strip_def strip_pre_long_lit_star)
+
+text \<open>Third: the trailing pair. `${s%p}` (shortest, from the last occurrence) and
+  `${s%%p}` (longest, from the first) are separated at concrete bytes.\<close>
+
+theorem trailing_shortest_is_not_the_longest:
+  "strip_suf [PStar, PLit [47]] [97, 47]
+     \<noteq> strip_suf_long [PStar, PLit [47]] [97, 47]"
+proof -
+  have m1: "pmatch [PStar, PLit [47]] [97, 47]"
+  proof -
+    have exr: "\<exists>r. [97, 47] = r @ [47]" by (rule_tac x = "[97]" in exI) simp
+    show ?thesis using exr by (rule pmatch_star_lit[THEN iffD2])
+  qed
+  show ?thesis using m1 by (simp add: strip_suf_star_lit strip_suf_long_star_lit)
+qed
+
+text \<open>Finally, an exact boundary, checked: the shell's `${p##*/}` is NOT GNU `basename`.
+  When the text ends with a separator the glob match is the whole string (the star absorbs
+  it), so the strip is empty, while GNU `basename` returns the last component. `PathName`
+  promises the GNU rule; a `${p##*/}` lowering must promise the glob law below it, and the
+  two agree only when there is no trailing separator.\<close>
+
+text \<open>The witness is a single instance, which is all a disequality needs: a path that ends
+  with the separator, where the glob match is the whole string (the star absorbs the
+  separator) so the strip is empty, while `bname` returns the last component.\<close>
+
+theorem shell_strip_is_not_gnu_basename:
+  "strip_pre_long [PStar, PLit [47]] [97, 47, 98, 47] \<noteq> bname [97, 47, 98, 47]"
+proof -
+  have m: "pmatch [PStar, PLit [47]] [97, 47, 98, 47]"
+  proof -
+    have exr: "\<exists>r. [97, 47, 98, 47] = r @ [47]"
+      by (rule_tac x = "[97, 47, 98]" in exI) simp
+    show ?thesis using exr by (rule pmatch_star_lit[THEN iffD2])
+  qed
+  have "strip_pre_long [PStar, PLit [47]] [97, 47, 98, 47] = []"
+    using m by (rule strip_pre_long_star_lit_whole)
+  moreover have "bname [97, 47, 98, 47] = [98]" by eval
+  ultimately show ?thesis by simp
+qed
+
 end

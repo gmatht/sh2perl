@@ -26,18 +26,31 @@
 # literal (TextOps#strip_pre_lit_star: `strip_pre [PLit p, PStar] t` = drop at
 # the first occurrence, identity on a miss). So the `#*lit` arm's
 # "shortest match" is a theorem about a glob matcher, not a reading of bash.
-# BOUNDARY, exact: `strip_pre` is the SHORTEST-match strip by construction
-# (TextOps#strip_pre_shortest), so the LAST-occurrence arms (`##*lit`, `%lit*`
-# with a repeated delimiter) are computed here from `rfind_last` — a different
-# primitive — and the glob reading "longest match" is explicitly NOT modelled
-# (TextOps#greedy_star_is_not_the_node refutes equating the two). Character
-# classes, ranges, negation, extglob, brace alternation and quoting are outside
-# the fragment altogether (TextOps#fragment_is_three_constructors and the
-# one-byte tests); the fold refuses magic bodies, so no lowering reaches the
-# node with one. An empty `delim` never reaches this
-# node — the fold special-cases it — and `cut_at_empty_pattern` proves why:
-# with `[]` the two primitives match at different indices, so the four arms
-# split ([] / s / s / []) and no single node describes the case.
+# BOUNDARY, exact: both extrema are now modelled over the same `pseg` semantics, so the
+# longest arms are theorems, not an appeal to `rfind`. Over that matcher, for the four
+# star shapes of this node:
+#   ${v##*lit}  longest   = the tail after the LAST occurrence   strip_pre_long_star_lit
+#   ${v%%lit*}  longest   = the head before the FIRST occurrence strip_suf_long_lit_star
+#   ${v%lit*}   shortest  = the head before the LAST occurrence  strip_suf_short_lit_star
+#   ${v#*lit}   shortest  = the tail after the FIRST occurrence strip_pre_lit_star
+# each with the no-match arm the text unchanged, each (TextOps#-prefixed) over an
+# arbitrary text and literal. "Longest" and "shortest" are two extrema of ONE match set
+# (`pre_ok` / `suf_at`), not two primitives: TextOps#strip_pre_long_star_lit is the
+# `Max` of the prefix match positions and TextOps#strip_pre_lit_star its `Min`, and
+# TextOps#shortest_is_not_the_longest / TextOps#trailing_shortest_is_not_the_longest
+# refute collapsing them, while TextOps#greedy_star_is_not_the_last_separator_strip
+# refutes the greedy "a star strips everything" reading. The `lit*` prefix form is
+# decided separately because its longest match is the whole text:
+# TextOps#strip_pre_long_lit_star. The whole-text case is TextOps#strip_pre_long_star
+# and TextOps#strip_pre_long_star_lit_whole.
+# Character classes, ranges, negation, extglob, brace alternation and quoting are
+# outside the fragment altogether (TextOps#fragment_is_three_constructors and the
+# one-byte tests); the fold refuses magic bodies, so no lowering reaches the node with
+# one. An empty `delim` never reaches this node — the fold special-cases it — and
+# `cut_at_empty_pattern` proves why: with `[]` the two primitives match at different
+# indices, so the four arms split ([] / s / s / []) and no single node describes the
+# case. The empty-literal form is itself decided by the longest laws
+# (TextOps#last_occurrence_witness).
 #
 # Emitted by the `affix-strip-fold` transform (the star-form branch; the
 # plain-literal branch keeps using AffixStrip).
@@ -57,3 +70,7 @@ field delim: string
 field head: bool
 field first: bool
 spec: TextOps#cut_at_sound
+spec: TextOps#strip_pre_long_star_lit
+spec: TextOps#strip_pre_long_lit_star
+spec: TextOps#strip_suf_long_star_lit
+spec: TextOps#strip_suf_short_lit_star
