@@ -30,15 +30,42 @@ field verb: string
 field slot: string
 field payload: expr
 field id: string
-# Unstated — the missing component is DEVICE MEMORY AND DISPATCH: buffer allocation and
-# transfers, workgroup/thread geometry, synchronisation and async completion. No
-# byte-level value contract exists for a dispatch, and nothing here models a device heap.
-# Recorded as a named missing model rather than the bare word "effect".
-# LAW CANDIDATE: `after dispatch completes, out_buffer = kernel(in_buffer)`. That is the
-# KERNEL's property, not the node's: the node enqueues work, and its own observable value
-# is a completion handle, so the law would have to quantify over device buffers, transfer
-# direction, workgroup/thread geometry and async completion order. None of these can be
-# abstracted away without the law becoming vacuous (`out = out`), so the missing component
-# is device memory plus dispatch/completion semantics, named rather than called "effect".
-spec: none (unstated: missing model — device memory and dispatch: buffers and transfers,
-# workgroup geometry, synchronisation, async completion ordering.)
+# RESOLVED — what the node itself fixes is the DEVICE PATH and the LAUNCH GEOMETRY
+# of the write it lifts; both are ordinary functions in TextOps#gpu_op_sound:
+#  * PATH: path_join builds the written path as the device root, a slash, each slot
+#    segment followed by a slash, then the verb — `path_join (device # slot) verb =
+#    device @ [47] @ path_join slot verb` (TextOps#gpu_path_last_segment), so the LAST
+#    path segment is the verb, and the empty slot is the same statement at slot = [].
+#    The verb is TEXT at the tail: appending to it appends to the path
+#    (TextOps#gpu_path_verb_is_the_tail), so the device reads exactly the bytes the node
+#    was handed. TextOps#gpu_device_path_witness and
+#    TextOps#gpu_path_empty_slot_witness check `/dev/fb0` + `call` and the empty-slot
+#    `/dev/fb0` + `swap` byte for byte.
+#  * GEOMETRY: n work items on blocks of b threads are groups n b = (n + b - 1) div b
+#    groups, global thread ids gid b g t = g * b + t, and the work list TextOps#launch.
+#    Proved:
+#    - the group count COVERS the work, n ≤ groups n b * b (TextOps#groups_cover, from
+#      TextOps#groups_decomp), and adds at most a partial group,
+#      groups n b * b < n + b (TextOps#groups_tight) — ceil, not floor, and no
+#      gratuitous group;
+#    - the launch TILES the grid exactly: set (launch_of G b) = {..<G * b}
+#      (TextOps#launch_tiles, with TextOps#launch_length, TextOps#launch_bounds and
+#      TextOps#distinct_launch_of, whose disjointness comes from blocks being
+#      separated by magnitude — TextOps#block_ids_lt — so no modular arithmetic is
+#      involved);
+#    - consequently every work item i < n is dispatched (TextOps#launch_covers) and
+#      the dispatch list is duplicate-free (TextOps#launch_covers_exactly_once).
+# NON-VACUITY: TextOps#gpu_launch_witness checks a NON-DIVISIBLE launch (10 items, 4
+# threads: 3 groups of 4, the last one half empty) and
+# TextOps#gpu_launch_empty_and_single the empty, single-item and one-thread cases.
+# Three weaker models are REFUTED: floor rounding misses the tail
+# (TextOps#floor_rounding_is_not_a_launch), a block stride of b+1 leaves a hole
+# (TextOps#stride_hole_is_not_a_launch), and a launch that covers but repeats a thread
+# is not a launch (TextOps#covering_alone_is_not_enough) — coverage alone is not the
+# contract.
+# NOT PROMISED (outside this model): device memory — buffer allocation and transfers,
+# synchronisation, async completion ordering — and the kernel's own effect
+# (`out_buffer = kernel(in_buffer)` is the kernel's contract, not the node's). The
+# node enqueues work and its own observable value is a completion handle; a backend
+# without a GPU leg renders the original write, which is the correctness firewall.
+spec: TextOps#gpu_op_sound

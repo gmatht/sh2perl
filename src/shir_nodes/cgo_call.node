@@ -24,18 +24,37 @@ kind expr
 # storage_class str_bounded
 field target: string
 field args: exprs
-# Unstated — the missing component is FOREIGN-CALL MARSHALLING: the C ABI's type mapping,
-# ownership and lifetime of returned pointers, the error/errno channel, and the call's
-# side effects on process state. The node has no byte-level value contract; what would
-# need modelling is a foreign heap plus a marshalling relation, neither of which exists
-# here. Recorded as a named missing model rather than the bare word "effect".
-# LAW CANDIDATE: `result = marshal_out (C_fn (marshal_in args))`. Stated plainly, this is
-# NOT a law of the node: both sides are the FOREIGN function's contract (its return type,
-# its ownership rules, its errno channel), and the node only fixes that the call is made
-# with those arguments. Any candidate that does not mention the foreign function collapses
-# to `result = result`. So the missing component is concrete and named: the C ABI
-# MARSHALLING relation (type mapping, ownership/lifetime of returned pointers, the
-# errno/error channel) plus a foreign heap — none of which exists here — and no byte-level
-# law is claimed meanwhile.
-spec: none (unstated: missing model — foreign-call marshalling: C ABI type mapping,
-# ownership/lifetime of returned pointers, errno/error channel, foreign heap.)
+# RESOLVED — the provable half of the calling contract is the ARGUMENT LAYOUT: the
+# node passes its evaluated arguments positionally, each exactly once, each occupying
+# exactly its own bytes, in declaration order, with no padding and no overlap. All of
+# it is proved in TextOps#cgo_call_sound:
+#  * SIZE: layout args is the concatenation of the argument blobs, so its length is
+#    the sum of the blob lengths (TextOps#layout_length) — no padding, no rounding, no
+#    truncation;
+#  * POSITION: arg_offset args k is the offset of argument k (TextOps#arg_offset_cons),
+#    the buffer splits at that offset into the earlier and the later arguments
+#    (TextOps#layout_take_split); dropping those bytes
+#    leaves exactly the remaining arguments in order (TextOps#layout_drop_offset), and
+#    taking the blob's length at that offset returns that argument's blob
+#    (TextOps#layout_arg_window) — no argument's bytes are interleaved with another's;
+#  * ORDER: layout is concatenation, not a set, so declaration order is load-bearing
+#    (TextOps#reordered_layout_differs);
+#  * NOTHING DROPPED: an empty layout means every blob was empty
+#    (TextOps#layout_nil_all_blobs_nil).
+# NON-VACUITY: TextOps#cgo_layout_witness checks a three-argument layout containing a
+# ZERO-WIDTH argument — offsets 0, 2, 3, 3 — so a width-less argument keeps its
+# position while consuming no bytes, which is exactly what a packed-by-size layout
+# gets wrong; TextOps#cgo_layout_position_witness checks the window law there too.
+# Three weaker models are REFUTED: padding each argument breaks the size law
+# (TextOps#padding_breaks_the_size_law), laying arguments out by size reorders them
+# (TextOps#reordered_layout_differs), and dropping the last argument loses its bytes
+# (TextOps#dropping_an_argument_loses_its_bytes). And the layout ALONE is not the
+# argument list — the same bytes are two one-byte arguments or one two-byte argument
+# (TextOps#layout_alone_is_not_the_argument_list) — so the declared widths are part
+# of the contract, not decoration.
+# NOT PROMISED (outside this model): the C ABI type mapping beyond width, ownership
+# and lifetime of returned pointers, the errno/error channel, and the call's side
+# effects on process state. `result = marshal_out (C_fn (marshal_in args))` is the
+# foreign function's contract, not this node's; the node only fixes that the call is
+# made with those arguments, in that layout.
+spec: TextOps#cgo_call_sound

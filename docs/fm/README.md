@@ -15,6 +15,7 @@ shIR. It is split into six theories that build as one session:
 | `ShIR_TextOps_Field` | the field CURSOR family (`FieldStrip`, `FieldStripEnd`, `FieldGrab`): `field_grab_at_strip` (`drop off s = field_grab s off d @ d @ drop (field_strip s off d) s` — the grab and the advance are two readings of ONE cursor position), `field_strip_no_move_on_miss` and `field_strip_end_drains_on_miss` (the two advances' non-match laws, which are the whole difference between the nodes), the cursor bounds (`field_strip_le_length`, `field_strip_end_le_length`, `field_strip_gt_off_on_hit`, `field_strip_progress` — every hit consumes a byte, so the converted loop terminates), `field_strip_stuck_iff_miss` (the cursor holds exactly on a miss), the inverse reading (`field_strip_end_agrees_on_hit` / `field_strip_end_differs_on_miss`), the drained read (`field_grab_after_drain`), and the empty delimiter as the arms' non-empty guard (`field_grab_empty_delim_is_not_a_cut`). `off <= length s` is the transform's read law, stated as a hypothesis rather than assumed. |
 | `ShIR_TextOps_Cutset` | the `CutsetTrim` node: the trim class as DATA, plus two modelled ALTERNATIVE readings so the divergences are comparisons, not prose. General obligations: `cutset_trim_is_trim_by` (inherits idempotence and run-only removal from Strings), `cutset_trim_removes_only_a_run`, `cutset_side_three_valued`; accurate byte-granularity facts `cutset_trim_lead_is_bytewise` / `cutset_trim_trail_is_bytewise`, and `cutset_trim_depends_only_on_members` (member-set invariance — true of both readings, which is why it is not called `needs_quotemeta`). Divergences as two-reading theorems: `perl_cutset_needs_quotemeta` (a bracket-body syntax with closing `]`, leading `^` negation, escapes and `a-b` ranges vs the literal set, on `]`, `^`, `\\` and `a-c`), `go_trim_cutset_is_codepoints` and `rust_trim_matches_is_chars` (a two-byte-UTF-8 decoder with a char-wise trim vs the byte model, on the NBSP pair). Witness lemmas keep the concrete bytes. |
 | `ShIR_TextOps_Substitute` | the `Substitute` node: two fuel-bounded engines (`subst_all`, `subst_first`) over an abstract matcher — leftmost, non-overlapping, empty-match-advances-one-byte as the termination obligation, `&` as a function of the matched text. The regex syntax, the line split and `\N` are documented limitations. |
+| `ShIR_TextOps_Device` | the two DEVICE-shaped nodes: `GpuOp`'s path and launch geometry (`path_join`, `groups`, `gid`, `block_ids`, `launch` — the block tiling, its coverage and its duplicate-freedom) and `CgoCall`'s argument layout (`layout`, `arg_offset`, `declared_width` — exact size, positional offsets, the split/drop/window laws), with the weaker models this refuses on each side. |
 | `ShIR_TextOps_Splice` | the `StrSplice` node and the C backend's capacity-guarded fused store that consumes it. `str_splice_fold_sound`: over byte lists, with `int` offsets clamped exactly as the emission clamps them (`(_s < 0) ? bl + _s : _s`, then into `[0,bl]`), the Interpolate the fold replaces — `${b:0:$start}${repl}${b:$end}` — denotes `take (pe b start) b @ repl @ drop (sb b end) b`, the node's meaning. The in-place store is pinned by `fused_store_correct` / `sched_prefix`, the `strnlen(_slot,res)==res` guard by `guard_iff_fits` / `guard_implies_in_bounds`, a short slot by `short_slot_refused`, and the disjointness invariant is proved load-bearing by `aliasing_breaks_the_schedule` (a concrete refutation with an aliased repl). Not modelled: the rest of the eligibility routing (every refusal is the unchanged plain path) and the array length bookkeeping.
 
 ```
@@ -201,7 +202,7 @@ three that did not — `newline_strip_sound`, `uniq_lines_sound`,
 (`sort_lines_sound`). `harness/check-node-specs.pl` (workspace `harness/`) makes
 "no dangling spec" a machine check: it collects every `theorem`/`lemma`/
 `definition`/`fun` under `docs/fm` and fails on a `spec:` naming one that does
-not exist. It reports 46 resolved, 2 unstated, 0 pending, 0 dangling.
+not exist. It reports 48 resolved, 0 unstated, 0 pending, 0 dangling.
 
 - `newline_strip_sound` (`ShIR_TextOps_Strip`): the node is the trailing-run
   removal, with the run length and the prefix equation.
@@ -214,6 +215,33 @@ not exist. It reports 46 resolved, 2 unstated, 0 pending, 0 dangling.
   adjacent-free, idempotent under re-sorting, and invents nothing.
 - `substitute_sound` (`ShIR_TextOps_Substitute`) and `cutset_trim_sound`
   (`ShIR_TextOps_Cutset`) — the two new theories.
+
+### Closed: the last two specs, `cgo_call` and `gpu_op` (2026-11-13)
+
+Both nodes had the same shape of residue: their names promised an "effect" no model of
+bytes could carry, so the obligation was unstated. Each is now resolved on the part that
+IS provable without device memory or a C ABI, and the rest is named.
+
+`gpu_op` — `TextOps#gpu_op_sound` (`ShIR_TextOps_Device`) proves the DEVICE PATH (the
+kernel argument list is `path_join segs verb`, whose last segment is the verb and whose
+prefix is the directory) and the LAUNCH GEOMETRY: `groups n b` is the ceil block count,
+`launch n b` is the list of global thread ids, it has exactly `groups n b * b` entries
+(`launch_length`), none of them past the group's bound (`launch_bounds`), all distinct
+(`distinct_launch_of`) and together exactly the ids below `groups n b * b`
+(`launch_tiles`, `launch_covers_exactly_once`) — so every work item is dispatched once and
+none twice, which is what a `n / b` (floor) or a `b + 1` stride block does not do
+(`floor_rounding_is_not_a_launch`, `stride_hole_is_not_a_launch`, and
+`covering_alone_is_not_enough` for coverage without duplicate-freedom).
+
+`cgo_call` — `TextOps#cgo_call_sound` proves the ARGUMENT LAYOUT: the buffer is
+`layout args = concat (map snd args)` so its length is the sum of the blob lengths
+(`layout_length`); `arg_offset args k` is the sum of the earlier blobs and adds exactly one
+blob per step (`arg_offset_cons`); the buffer splits at that offset (`layout_take_split`),
+dropping it leaves exactly the later arguments in order (`layout_drop_offset`), and taking
+the blob's length there returns that argument's blob (`layout_arg_window`). Refuted: per
+argument padding (`padding_breaks_the_size_law`), laying arguments out by size
+(`reordered_layout_differs`), dropping the last one (`dropping_an_argument_loses_its_bytes`)
+and treating the buffer alone as the argument list (`layout_alone_is_not_the_argument_list`).
 
 ### The node map, and what `check-node-specs.pl` will and will not accept
 
@@ -236,9 +264,9 @@ deliberate no-obligation form. `--map` prints the node→theorem table below and
 `--selftest` runs the five negative controls (real theorem, definition, dangling
 name, wrong session prefix, unbuilt theory).
 
-Current inventory: **46 resolved, 2 unstated, 0 pending, 0 errors**.
+Current inventory: **48 resolved, 0 unstated, 0 pending, 0 errors**.
 
-The 46 resolved specs (44 distinct theorems; `lowered_wc_sound` covers three
+The 48 resolved specs (46 distinct theorems; `lowered_wc_sound` covers three
 nodes and `field_extract`, `split`, `substitute`, `uniq_lines` and
 `cutset_trim` cite two each):
 
@@ -277,7 +305,9 @@ nodes and `field_extract`, `split`, `substitute`, `uniq_lines` and
 | `take_lines` | `take_lines_sound` |
 | `type_assert` | `type_assert_sound` |
 | `walk_dir` | `walk_dir_sound` |
+| `cgo_call` | `cgo_call_sound` |
 | `foreach_line` | `foreach_line_sound` |
+| `gpu_op` | `gpu_op_sound` |
 | `string_affix` | `string_affix_sound` |
 | `string_contains` | `string_contains_sound` |
 | `string_trim` | `string_trim_sound` |
@@ -411,15 +441,19 @@ hread a h`) and mutating the copy through a different address leaves the source 
 — the independence law a shallow copy breaks. Witnesses at byte level for each, including
 `counted_vals 5 (-2) 3` (a descending step) and a clone-then-mutate.
 
-Four remain unstated, each now naming the missing model component instead of the bare word
-"effect": `cgo_call` needs foreign-call marshalling (C ABI types, ownership of returned
-pointers, errno channel, process state); `gpu_op` needs device memory and dispatch
-(buffers, transfers, workgroup geometry, async completion); `foreach_line` needs a
-stream/cost model (reader position, laziness and the memory bound, early close at the
-limit, IO errors) — its value side is `lines_of`, already proved; and `walk_dir` needs a
-directory tree with per-entry identity, a name→child map, traversal order freedom and a
-symlink/cycle policy. `clone_deep`'s "shares no path" for a NESTED structure likewise needs
-an alias/heap-identity model with per-cell provenance, which is stated in its node.
+Nothing is unstated any more; what a model this size cannot reach is named in the node
+that stops at it rather than left as the bare word "effect". `cgo_call` fixes the ARGUMENT
+LAYOUT (exact size, position, order) and says so: the C ABI type mapping beyond width,
+ownership and lifetime of returned pointers, the errno channel and the call's effect on
+process state are the foreign function's contract, not the node's. `gpu_op` fixes the
+DEVICE PATH and the LAUNCH GEOMETRY — the write's target path, the ceil block count, the
+grid's block ids, and the proof that the launch tiles its work exactly once — and says so:
+device memory (allocation, transfers, synchronisation, async completion ordering) and the
+kernel's own effect are outside it. `foreach_line` now carries a position/cost contract
+(`lines_of_cost`, `lines_of_position`) with the stream residue named; `walk_dir` carries
+its tree and traversal laws with the symlink/cycle policy named. `clone_deep`'s "shares no
+path" for a NESTED structure likewise needs an alias/heap-identity model with per-cell
+provenance, which is stated in its node.
 
 ### The two obligations that were thinner than their names (2026-11-13)
 
