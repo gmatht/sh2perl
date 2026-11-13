@@ -81,6 +81,17 @@ pub mod optimize; // const_prop + dead_store_elim (the A1 optimizer family)
 pub mod echo_fold;
 pub mod pattern;
 pub mod restructure;
+/// Frontend numeric typing: the A2 `Int` verdicts as a set (see the module doc).
+pub mod frontend_types;
+/// FrontendIntLift — a frontend-emitted numeric literal gets its INT node
+/// (see the module doc).
+pub mod frontend_int_lift;
+/// FrontendCaptureFold — a constant `echo` command substitution folds to
+/// its literal output before any renderer sees it (see the module doc).
+pub mod frontend_capture_fold;
+/// ScopedHoist — hoist a main-scope local that only a conditional TEST
+/// reads, so every renderer can bind it as a plain local (see the module doc).
+pub mod scoped_hoist;
 pub mod scc; // strongly-connected-component recognition over the call graph (mutual-recursion clusters)
 // split_inplace: ACTIVE, target-gated to C in transforms.rs (the
 // embed/Carp fragment tests run with the target unset, where this

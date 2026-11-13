@@ -171,7 +171,7 @@ fn arith_pass(a: &mut ArithAst) -> bool {
 ///     `printf` inside `$()` arrive as command calls before echo lowering);
 ///   * `Expr(BinOp { op: Or|And, lhs, rhs })` — a constant chain, via
 ///     [`chain_raw`] (which also proves the chain's exit status).
-fn fold_const_echo(expr: &IrExpr) -> Option<String> {
+pub fn fold_const_echo(expr: &IrExpr) -> Option<String> {
     let body = match expr {
         IrExpr::Arrow(body) => body,
         _ => return None,

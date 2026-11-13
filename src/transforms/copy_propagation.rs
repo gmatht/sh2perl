@@ -67,6 +67,7 @@ use std::collections::HashSet;
 use crate::ir::{ArithAst, IrExpr, IrStmt, StrStyle};
 use crate::shir_nodes::AffixStrip;
 use crate::transforms::affix_strip_fold::{is_literal_pattern, is_plain_ident};
+use crate::transforms::const_capture_fold;
 
 /// A foldable single-def literal value (`Int`/`Str`/`Bool`).
 #[derive(Clone)]
@@ -76,8 +77,18 @@ enum Def {
 
 /// Apply the transform. Returns whether anything changed.
 pub fn transform(stmts: &mut Vec<IrStmt>) -> bool {
+    transform_with_types(stmts, &HashSet::new())
+}
+
+/// Copy propagation with the A2 INT verdicts (`prog.var_types`) attached:
+/// the ingress (`otranspilerl`'s `ingress_normalize`) calls THIS one, so a
+/// frontend-emitted python literal (`Str("1")` whose name is `Int`-typed)
+/// folds to the `Int` literal. The plain `transform` entry keeps the
+/// historical shell reading (no numeric strings) so the bash pipeline's
+/// output is unchanged.
+pub fn transform_with_types(stmts: &mut Vec<IrStmt>, int_typed: &HashSet<String>) -> bool {
     // single-def table: var → its single def (if qualifies)
-    let defs = collect_defs(stmts);
+    let defs = collect_defs(stmts, int_typed);
     if defs.is_empty() {
         return false;
     }
@@ -115,7 +126,7 @@ pub fn transform(stmts: &mut Vec<IrStmt>) -> bool {
 /// writes included: any second write makes the value ambiguous) and that
 /// single write is a top-level literal/copy `Assign`/`Declare`. A
 /// dynamic `eval`/`source`/`.` anywhere disqualifies everything.
-fn collect_defs(stmts: &[IrStmt]) -> HashMap<String, Def> {
+fn collect_defs(stmts: &[IrStmt], int_typed: &HashSet<String>) -> HashMap<String, Def> {
     let mut counts: HashMap<String, usize> = HashMap::new();
     let mut values: HashMap<String, (IrExpr, bool)> = HashMap::new();
     let mut dynamic = false;
@@ -132,6 +143,21 @@ fn collect_defs(stmts: &[IrStmt]) -> HashMap<String, Def> {
                 return None; // nested/conditional/builtin write — not foldable
             }
             match e {
+                // A FRONTEND-NUMERIC literal. py-sh-go (and the other
+                // imperative frontends) emit a python literal as the string
+                // `"1"` with the A2 numeric verdict `var_types[x] = Int`.
+                // The value is exact and constant, so an INT-typed name
+                // folds to the `Int` literal: `x = 1 + 2; print(x)` becomes
+                // `print(3)` instead of `let _ = 1i64 + 2i64; println!("{}",
+                // x)` (a read of a name nothing declared). Only the INT
+                // domain — a float or bigint verdict keeps the global home,
+                // where the renderer's own arithmetic model decides the
+                // type — and only a spelling that IS an integer (a padded
+                // id, a date or a version string is left as text).
+                IrExpr::Str(text, style) if int_typed.contains(v.as_str()) => match text.trim().parse::<i64>() {
+                    Ok(n) => Some((v, Def::Literal(IrExpr::Int(n)))),
+                    Err(_) => Some((v, Def::Literal(IrExpr::Str(text.clone(), style.clone())))),
+                },
                 IrExpr::Int(_) | IrExpr::Str(_, _) | IrExpr::Bool(_) => {
                     Some((v, Def::Literal(e.clone())))
                 }
@@ -151,6 +177,47 @@ fn collect_defs(stmts: &[IrStmt]) -> HashMap<String, Def> {
                         .all(|p| matches!(p, crate::ir::InterpPart::Lit(_))) =>
                 {
                     Some((v, Def::Literal(e.clone())))
+                }
+                // A QUOTED string assignment (`s="a b"`, `s='x$y'`, `s=""`)
+                // lowers to an Interpolate whose parts are all literal text —
+                // the same constant value, spelled one layer deeper. Refusing
+                // it here left every quoted-literal assignment unfolded
+                // (measured: 886 surviving getVar reads across the corpus
+                // while the unquoted `s=abc` spelling of the same def folded
+                // fine), so the fold is keyed on the DEF's own node and the
+                // read is replaced by that node verbatim: the quoting style
+                // (and any `$`/`@` text a SingleQuoted def protects from
+                // Perl interpolation) travels with the value.
+                IrExpr::Interpolate(parts)
+                    if parts
+                        .iter()
+                        .all(|p| matches!(p, crate::ir::InterpPart::Lit(_))) =>
+                {
+                    Some((v, Def::Literal(e.clone())))
+                }
+                // A CONSTANT COMMAND SUBSTITUTION — `out = {"capture": {arrow:
+                // [exec(echo, [literal])]}}` is what every frontend emits for
+                // `out = $(echo hello)` / python's `subprocess.run(...,
+                // capture_output=True).stdout`; the frontends also spell it
+                // as the `capture` CALL form, which arrives here as an
+                // Interpolate/Arrow the earlier pass already folded. The
+                // verdict is the EXISTING transform's (`const_capture_fold`:
+                // one literal `echo` body, no flags/vars/redirects), applied
+                // without rewriting the IR, so `out` reaches its readers as
+                // the plain value and the renderer stops seeing a name whose
+                // only writer is a capture (the global-home path).
+                IrExpr::Capture { expr, native, .. } if !*native => {
+                    const_capture_fold::fold_const_echo(expr)
+                        .map(|t| (v, Def::Literal(IrExpr::Str(t, crate::ir::StrStyle::DoubleQuoted))))
+                }
+                // …and the CALL spelling the frontends actually emit:
+                // `Call { func: "capture", args: [Arrow([…])] }` (py-sh-go
+                // writes this for `subprocess.run(..., capture_output=True)`
+                // and for `$(…)`). Same verdict, same rule.
+                IrExpr::Call { func, args } if func == "capture" => {
+                    args.first()
+                        .and_then(const_capture_fold::fold_const_echo)
+                        .map(|t| (v, Def::Literal(IrExpr::Str(t, crate::ir::StrStyle::DoubleQuoted))))
                 }
                 // a copy def (x=y) isn't itself a literal — its reads stay
                 // unfolded (conservative; the RHS read-of-y still folds in
@@ -590,6 +657,16 @@ fn count_expr_assigns(
         IrExpr::Index { key, .. } | IrExpr::Capture { expr: key, .. } => {
             count_expr_assigns(key, counts, values, top, dynamic);
         }
+        // the frontends' CALL spelling of a command substitution —
+        // `capture(Arrow([…]))` (py-sh-go: subprocess.run(capture_output=True),
+        // `$(…)`). Left uncounted, `out = capture(…)` looked like a ZERO-write
+        // name, which `collect_defs`' single-def test (`count == 1`) then
+        // refused; the body is walked exactly like an `Arrow`'s.
+        IrExpr::Call { func, args, .. } if func == "capture" => {
+            for a in args {
+                count_expr_assigns(a, counts, values, false, dynamic);
+            }
+        }
         IrExpr::Interpolate(parts) => {
             for p in parts {
                 if let crate::ir::InterpPart::Expr(x) = p {
@@ -767,6 +844,35 @@ fn fold_expr(
         IrExpr::BinOp { lhs, rhs, .. } => {
             c |= fold_expr(lhs, defs, resolved, foldable);
             c |= fold_expr(rhs, defs, resolved, foldable);
+        }
+        // The frontends' shell TEST spelling: `test("-z \"$x\"")` — the
+        // operand is a `$`-reference inside the literal, so the generic
+        // string rule below (which only folds TEXTUAL literals) never saw
+        // it and a `test "-z \"$x\""` kept reading a name nothing
+        // declared. The quoted word is a shell double-quoted word: fold the
+        // whole variable reference to the literal, quoting the VALUE the
+        // way the word would (a `"` or `\` in the value is escaped, a
+        // glob-active value stays inside the quotes).
+        IrExpr::Str(t, style) if foldable.iter().any(|n| t.contains(&format!("${n}"))) => {
+            let mut text = t.clone();
+            for n in foldable.iter() {
+                if let Some(rep) = resolved.get(n) {
+                    let lit = match rep {
+                        IrExpr::Str(v, _) => v.clone(),
+                        IrExpr::Int(i) => i.to_string(),
+                        IrExpr::Bool(b) => b.to_string(),
+                        _ => continue,
+                    };
+                    let esc = lit.replace('\\', "\\\\").replace('"', "\\\"");
+                    text = text.replace(&format!("${{{n}}}"), &esc);
+                    text = text.replace(&format!("${n}"), &esc);
+                }
+            }
+            if text != *t {
+                *t = text;
+                let _ = style;
+                c = true;
+            }
         }
         IrExpr::Arith(a) => {
             c |= fold_arith(a, defs, resolved, foldable);
@@ -2009,5 +2115,117 @@ mod tests {
             }
             other => panic!("expected rebuilt AffixStrip node, got {:?}", other),
         }
+    }
+
+    /// The frontend (py-sh-go) spelling: a numeric literal arrives as a
+    /// STRING and the domain only in the A2 verdict — `x = "42"` with
+    /// `var_types[x] = Int`. With the verdict attached the read folds to
+    /// the INT literal (the plain `transform` keeps the shell reading).
+    #[test]
+    fn folds_an_int_typed_string_literal() {
+        let mut stmts = vec![assign("x", str_lit("42")), expr_stmt(getvar("x"))];
+        let ints: HashSet<String> = ["x".to_string()].into_iter().collect();
+        assert!(transform_with_types(&mut stmts, &ints));
+        assert_eq!(stmts[1], expr_stmt(int_lit(42)));
+    }
+
+    /// …and WITHOUT the verdict the same program keeps its string value:
+    /// a shell `x=42` is a string, and the renderers' own numeric homes
+    /// decide what an unquoted use means.
+    #[test]
+    fn a_string_literal_without_the_int_verdict_stays_a_string() {
+        let mut stmts = vec![assign("x", str_lit("42")), expr_stmt(getvar("x"))];
+        let ints: HashSet<String> = HashSet::new();
+        transform_with_types(&mut stmts, &ints);
+        assert_eq!(stmts[1], expr_stmt(str_lit("42")));
+    }
+
+    /// An INT-typed name whose value is not an integer spelling (a padded
+    /// id, a version) keeps its text: the verdict says the domain, not the
+    /// text.
+    #[test]
+    fn an_int_typed_name_with_a_non_numeric_value_keeps_text() {
+        let mut stmts = vec![assign("x", str_lit("0x10")), expr_stmt(getvar("x"))];
+        let ints: HashSet<String> = ["x".to_string()].into_iter().collect();
+        transform_with_types(&mut stmts, &ints);
+        assert_eq!(stmts[1], expr_stmt(str_lit("0x10")));
+    }
+
+    /// `test("-z \"$x\"")` — the frontends' shell-test spelling carries the
+    /// reference INSIDE the literal; the fold rewrites the reference to the
+    /// value, quoted the way the shell word quotes it.
+    #[test]
+    fn folds_a_dollar_reference_inside_a_test_word() {
+        let mut stmts = vec![
+            assign("x", str_lit("")),
+            expr_stmt(IrExpr::Call {
+                func: "test".to_string(),
+                args: vec![str_lit("-z \"$x\"")],
+            }),
+        ];
+        assert!(transform(&mut stmts));
+        assert_eq!(
+            stmts[1],
+            expr_stmt(IrExpr::Call {
+                func: "test".to_string(),
+                args: vec![str_lit("-z \"\"")],
+            })
+        );
+    }
+
+    /// …and a value that would break the word's quoting is escaped, so the
+    /// folded word parses to the same shell word the runtime read produced.
+    #[test]
+    fn folds_a_reference_with_quotes_in_the_value() {
+        let mut stmts = vec![
+            assign("x", str_lit("a\"b")),
+            expr_stmt(IrExpr::Call {
+                func: "test".to_string(),
+                args: vec![str_lit("-n \"$x\"")],
+            }),
+        ];
+        assert!(transform(&mut stmts));
+        assert_eq!(
+            stmts[1],
+            expr_stmt(IrExpr::Call {
+                func: "test".to_string(),
+                args: vec![str_lit("-n \"a\\\"b\"")],
+            })
+        );
+    }
+
+    /// A constant `echo` command substitution (the frontends' `capture`
+    /// CALL spelling) folds to the text the shell would capture —
+    /// `const_capture_fold`'s verdict, used without rewriting the IR.
+    #[test]
+    fn folds_a_constant_capture_call() {
+        let cap = IrExpr::Call {
+            func: "capture".to_string(),
+            args: vec![IrExpr::Arrow(vec![IrStmt::Expr(IrExpr::Call {
+                func: "exec".to_string(),
+                args: vec![
+                    str_lit("echo"),
+                    IrExpr::Array(vec![str_lit("hello")]),
+                ],
+            })])],
+        };
+        let mut stmts = vec![assign("out", cap), expr_stmt(getvar("out"))];
+        assert!(transform(&mut stmts));
+        assert_eq!(stmts[1], expr_stmt(str_lit("hello")));
+    }
+
+    /// A capture of a REAL command is not a constant: nothing folds.
+    #[test]
+    fn a_non_constant_capture_does_not_fold() {
+        let cap = IrExpr::Call {
+            func: "capture".to_string(),
+            args: vec![IrExpr::Arrow(vec![IrStmt::Expr(IrExpr::Call {
+                func: "exec".to_string(),
+                args: vec![str_lit("date"), IrExpr::Array(vec![])],
+            })])],
+        };
+        let mut stmts = vec![assign("out", cap), expr_stmt(getvar("out"))];
+        transform(&mut stmts);
+        assert!(matches!(&stmts[1], IrStmt::Expr(IrExpr::Call { func, .. }) if func == "getVar"));
     }
 }
