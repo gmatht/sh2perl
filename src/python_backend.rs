@@ -122,6 +122,13 @@ pub struct Render {
     /// `__sh_which`: `command -v` name resolution.
     need_which: bool,
 
+    /// `__sh_expand`: an unmodelled `${…}` expansion, evaluated by bash
+    need_expand: bool,
+
+    /// per-nesting save slot for `isolated_body` snapshots
+    sub_counter: usize,
+    sub_save: String,
+
     /// `__ShSubExit`: `exit` inside `( … )` ends the subshell, not the
     /// program.
     need_sub_exit: bool,
@@ -2331,6 +2338,27 @@ impl Render {
                         return v;
                     }
                 }
+                // a single BUILTIN-call body (`$(printf 'p q')`, the
+                // `for c in $(printf …)` iterand): the shell-text builder
+                // cannot spell it, but the statement renders natively —
+                // buffer its output instead of leaving an empty arrow
+                // placeholder (zz_regression_idioms lost the whole loop).
+                if let [IrStmt::Expr(IrExpr::Call { func, .. })] = body.as_slice() {
+                    if matches!(
+                        func.as_str(),
+                        "builtin" | "exec" | "echo" | "printf" | "true" | "false" | ":"
+                    ) {
+                        if let Some(v) = self.buffered_body_value(body) {
+                            return v;
+                        }
+                    }
+                }
+                // the statement dialect of the same thing
+                if let [IrStmt::Exec { .. }] = body.as_slice() {
+                    if let Some(v) = self.buffered_body_value(body) {
+                        return v;
+                    }
+                }
                 self.sh2_stub("arrow", &[], "arrow")
             }
             // `cmd <a >b` as a VALUE where the runtime has no entry point:
@@ -3262,6 +3290,25 @@ impl Render {
                     }
                 }
                 self.sh2_stub("capture", args, "capture")
+            }
+            // `for x in $(cmd)`: the captured TEXT is WORD-SPLIT into the
+            // iterand (bash field splitting), never one string and never
+            // a character walk.
+            "captureWords" => {
+                if let Some(IrExpr::Arrow(body)) = args.first() {
+                    let flat = Self::flatten_subs(body);
+                    let code = self.expr(&IrExpr::Arrow(flat));
+                    // `.split()` is bash field splitting: runs of IFS
+                    // whitespace separate words and produce no empty
+                    // fields.
+                    if code.starts_with("__sh_cap(")
+                        || code.starts_with("__sh_cv")
+                        || code.starts_with('(')
+                    {
+                        return format!("({code}).split()");
+                    }
+                }
+                self.sh2_stub("captureWords", args, "captureWords")
             }
             // `echo X | grep LIT >/dev/null` → contains(X, LIT): native
             // python `PAT in STR`.
@@ -5228,17 +5275,32 @@ impl Render {
             .collect();
         names.sort();
         names.dedup();
+        let mut save = String::new();
         if !names.is_empty() {
+            // a snapshot name may have NO binding yet (the subshell is
+            // where it is first exported) — that must read as "" instead
+            // of raising NameError (064_20 died on LOG_LEVEL).
             let snap: Vec<String> = names
                 .iter()
                 .map(|v| {
                     format!(
-                        "{}: (list({v}) if isinstance({v}, list) else {v})",
-                        Self::py_str(v)
+                        "{}: ((list({v}) if isinstance({v}, list) else {v}) if ({q} in dir() or {q} in globals()) else \"\")",
+                        Self::py_str(v),
+                        q = Self::py_str(v)
                     )
                 })
                 .collect();
-            self.emit(&format!("__sh_sub_save = {{{}}}", snap.join(", ")));
+            // NESTED subshells must not share the save slot: the inner
+            // one overwrote it and the outer restore raised KeyError
+            // (064_20's LOG_LEVEL).
+            let n = self.sub_counter;
+            self.sub_counter += 1;
+            self.sub_save = format!("__sh_sub_save{n}");
+            let sv = self.sub_save.clone();
+            self.emit(&format!("{sv} = {{{}}}", snap.join(", ")));
+            // remember OUR slot: the body may open (and overwrite the
+            // field with) a nested subshell's save slot
+            save = sv;
         }
         if buffered {
             self.need_io = true;
@@ -5270,7 +5332,7 @@ impl Render {
         }
         if !names.is_empty() {
             for v in &names {
-                self.emit(&format!("{v} = __sh_sub_save[{}]", Self::py_str(v)));
+                self.emit(&format!("{v} = {save}[{}]", Self::py_str(v)));
             }
         }
     }
@@ -5291,14 +5353,28 @@ impl Render {
         fn expr(e: &IrExpr, out: &mut std::collections::HashSet<String>) {
             match e {
                 IrExpr::Call { func, args } => {
-                    if func == "builtin" {
+                    // the backend input spells a statement builtin `exec`
+                    // (`Call{exec,[Str("export"), …]}`); the shIR dump
+                    // spells the same thing `builtin`. Both must count.
+                    if func == "builtin" || func == "exec" {
                         if let Some(IrExpr::Str(b, _)) = args.first() {
                             if matches!(
                                 b.as_str(),
                                 "unset" | "export" | "readonly" | "local" | "declare" | "typeset"
                             ) {
-                                if let Some(IrExpr::Array(items)) = args.get(1) {
-                                    for it in items {
+                                // the words arrive as an Array when there
+                                // are several and as ONE Str when there is
+                                // a single `export X=1` — missing the Str
+                                // shape lost the restore name entirely
+                                // (064_20's outer subshell snapshotted
+                                // `Y` but not the exported `DEBUG`).
+                                let words: Vec<&IrExpr> = match args.get(1) {
+                                    Some(IrExpr::Array(items)) => items.iter().collect(),
+                                    Some(one) => vec![one],
+                                    None => vec![],
+                                };
+                                {
+                                    for it in words {
                                         if let IrExpr::Str(s, _) = it {
                                             let nm = s.split('=').next().unwrap_or("").trim();
                                             if !nm.is_empty() && Render::is_plain_name(nm) {
@@ -5338,6 +5414,28 @@ impl Render {
             for s in stmts {
                 match s {
                     IrStmt::Expr(e) => expr(e, out),
+                    // a STATEMENT-position builtin reaches the IR as
+                    // `Exec{cmd: Str("export"), args: [Str("X=1")]}` — the
+                    // Call shape above is a different dialect. Handling
+                    // only one of them lost every export/unset name
+                    // (064_20's DEBUG was never restored).
+                    IrStmt::Exec {
+                        cmd: IrExpr::Str(b, _),
+                        args,
+                        ..
+                    } if matches!(
+                        b.as_str(),
+                        "unset" | "export" | "readonly" | "local" | "declare" | "typeset"
+                    ) => {
+                        for a in args {
+                            if let IrExpr::Str(s, _) = a {
+                                let nm = s.split('=').next().unwrap_or("").trim();
+                                if !nm.is_empty() && Render::is_plain_name(nm) {
+                                    out.insert(nm.to_string());
+                                }
+                            }
+                        }
+                    }
                     IrStmt::Subshell(b)
                     | IrStmt::Block(b)
                     | IrStmt::Background(b)
@@ -5862,6 +5960,20 @@ impl Render {
                 Some(Self::sh_quote(s))
             }
             IrExpr::Int(i) => Some(i.to_string()),
+            // `${name}` with no operator — the same expansion as `$name`
+            // in shell text. Without it a body holding one refused to
+            // text-render and fell through to a bare `__sh_exec` (a
+            // heredoc-fed interpreter never saw its body).
+            IrExpr::Call { func, args } if func == "param" => {
+                if let (Some(IrExpr::Str(op, _)), Some(IrExpr::Str(n, _))) =
+                    (args.first(), args.get(1))
+                {
+                    if (op == "" || op == ":{}") && Self::is_plain_name(n) {
+                        return Some(format!("\"${{{n}}}\""));
+                    }
+                }
+                None
+            }
             IrExpr::Call { func, args } if func == "getVar" => {
                 if let Some(IrExpr::Str(n, _)) = args.first() {
                     if n == "$" {
@@ -7064,14 +7176,29 @@ impl Render {
     fn capture_body_is_native(body: &[IrStmt]) -> bool {
         body.iter().all(|st| match st {
             IrStmt::Expr(IrExpr::Call { func, args }) => match func.as_str() {
-                "exec" => matches!(
+                // a builtin in the `builtin` dialect is the SAME statement
+                // (`$(printf 'p q')` arrived that way and was not captured)
+                "exec" | "builtin" => matches!(
                     args.first(),
                     Some(IrExpr::Str(c, _))
                         if matches!(c.as_str(), "echo" | "printf" | "true" | "false" | ":")
                 ),
+                // the call IS the builtin (`Call{printf,[…]}`)
+                "echo" | "printf" | "true" | "false" | ":" => true,
                 "pipeline" => true,
                 _ => false,
             },
+            // the statement dialect: `Exec{cmd, args}` for the same builtins
+            IrStmt::Exec {
+                cmd: IrExpr::Str(c, _),
+                redirects,
+                env,
+                ..
+            } => {
+                redirects.is_empty()
+                    && env.is_empty()
+                    && matches!(c.as_str(), "echo" | "printf" | "true" | "false" | ":")
+            }
             _ => false,
         })
     }
@@ -7576,14 +7703,92 @@ impl Render {
         while i < cs.len() {
             if cs[i] == '$' && i + 1 < cs.len() {
                 // parse the variable name after `$`
-                let name: Option<String> = if cs[i + 1] == '{' {
+                // `$( … )` — a command substitution inside the literal
+                // chunk (`${a:-$(echo x)}`). Captured through bash, which
+                // is the only exact rendering of arbitrary command text.
+                if cs[i + 1] == '(' {
                     let mut j = i + 2;
-                    while j < cs.len() && cs[j] != '}' {
+                    let mut depth = 1;
+                    while j < cs.len() {
+                        match cs[j] {
+                            '(' => depth += 1,
+                            ')' => {
+                                depth -= 1;
+                                if depth == 0 {
+                                    break;
+                                }
+                            }
+                            _ => {}
+                        }
+                        j += 1;
+                    }
+                    if j < cs.len() {
+                        let inner: String = cs[i + 2..j].iter().collect();
+                        i = j + 1;
+                        flush(&mut lit, &mut terms);
+                        self.need_subprocess = true;
+                        let env = self.bash_env();
+                        terms.push(format!(
+                            "__sh_cap([\"bash\", \"-c\", {}], {env})",
+                            Self::py_str(&inner)
+                        ));
+                        continue;
+                    }
+                }
+                let name: Option<String> = if cs[i + 1] == '{' {
+                    // MATCHING brace: the word may itself hold `${…}`
+                    // (`${a:-${b:-${c:-computed}}}`) or a `$( … )`
+                    let mut j = i + 2;
+                    let mut depth = 1;
+                    while j < cs.len() {
+                        match cs[j] {
+                            '{' => depth += 1,
+                            '}' => {
+                                depth -= 1;
+                                if depth == 0 {
+                                    break;
+                                }
+                            }
+                            _ => {}
+                        }
                         j += 1;
                     }
                     if j < cs.len() {
                         let n: String = cs[i + 2..j].iter().collect();
                         i = j + 1;
+                        // `${name:-word}` / `${name-word}` — the default
+                        // operator, with the word expanded RECURSIVELY
+                        // (063_04 was printing the raw text).
+                        let mut split = None;
+                        for opm in [":-", "-"] {
+                            if let Some(idx) = n.find(opm) {
+                                let (a, b) = n.split_at(idx);
+                                if Self::is_plain_name(a)
+                                    || (a.ends_with("[@]") || a.ends_with("[*]"))
+                                {
+                                    split = Some((a.to_string(), b[opm.len()..].to_string()));
+                                    break;
+                                }
+                            }
+                        }
+                        if let Some((nm, word)) = split {
+                            flush(&mut lit, &mut terms);
+                            let base = nm
+                                .trim_end_matches("[@]")
+                                .trim_end_matches("[*]")
+                                .to_string();
+                            let v = self.expr(&IrExpr::Call {
+                                func: "getVar".to_string(),
+                                args: vec![IrExpr::Str(
+                                    base,
+                                    crate::ir::StrStyle::DoubleQuoted,
+                                )],
+                            });
+                            let d = self.expand_str(&word);
+                            self.need_param_ops = true;
+                            terms.push(format!("__sh_param_or({v}, {d})"));
+                            continue;
+                        }
                         Some(n)
                     } else {
                         None
@@ -7617,8 +7822,24 @@ impl Render {
                                 || "?$#@*!".contains(c))
                         }) =>
                     {
-                        lit.push('$');
-                        lit.push_str(&n);
+                        // An expansion this renderer does not model
+                        // (`${arr[@]:0:2}`, `${!p*[@]:0:3}`): evaluate the
+                        // real thing in bash. The shell variables ride the
+                        // child's environment, so the answer is bash's, not
+                        // the literal text it used to print (063_04).
+                        if !n.contains('"') && !n.contains('\'') {
+                            flush(&mut lit, &mut terms);
+                            self.need_expand = true;
+                            self.need_subprocess = true;
+                            let env = self.bash_env();
+                            terms.push(format!(
+                                "__sh_expand({}, {env})",
+                                Self::py_str(&format!("${{{n}}}"))
+                            ));
+                        } else {
+                            lit.push('$');
+                            lit.push_str(&n);
+                        }
                     }
                     Some(n) if n == "$" => {
                         flush(&mut lit, &mut terms);
@@ -10193,6 +10414,17 @@ impl Render {
                 // native binding
                 continue;
             }
+            // Variables bash DEFINES itself (USER/HOSTNAME/HOME…) must not
+            // be hoisted as "": the child `bash -c` seam then read the
+            // empty binding instead of the real environment value
+            // (dqs-nested-dollar's `${USER}` came back empty).
+            if matches!(
+                v.as_str(),
+                "USER" | "LOGNAME" | "HOSTNAME" | "HOME" | "PWD" | "OLDPWD" | "SHELL"
+                    | "PATH" | "IFS" | "BASH_VERSION"
+            ) {
+                continue;
+            }
             let name = self.py_ident(v);
             if self.is_num(v) {
                 self.emit(&format!("{name} = 0"));
@@ -10298,6 +10530,11 @@ impl Render {
         // bash sets HOSTNAME as a shell variable at startup (gethostname);
         // a script that reads `${HOSTNAME:-localhost}` saw the fallback.
         self.emit("__sh_hostname = __import__(\"socket\").gethostname()");
+        // bash defines USER/LOGNAME at startup from the passwd entry; a
+        // child `bash -c` seam only sees the ENVIRONMENT, so they must be
+        // seeded there (dqs-nested-dollar ran `${USER}` through a pipe).
+        self.emit("_sh_os.environ.setdefault(\"USER\", __import__(\"pwd\").getpwuid(_sh_os.getuid()).pw_name)");
+        self.emit("_sh_os.environ.setdefault(\"LOGNAME\", _sh_os.environ[\"USER\"])");
         self.emit("");
         if self.need_pnum {
             // `$N` in arithmetic: the positional's numeric value, and an
@@ -10848,6 +11085,12 @@ impl Render {
             self.emit("class __ShSubExit(Exception):");
             self.emit("    def __init__(self, code):");
             self.emit("        self.code = code");
+            self.emit("");
+        }
+        if self.need_expand {
+            self.emit("def __sh_expand(text, env):");
+            self.emit("    import subprocess");
+            self.emit("    return subprocess.run([\"bash\", \"-c\", \"printf %s \" + text], env=env, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL).stdout.decode(errors='replace')");
             self.emit("");
         }
         if self.need_which {
