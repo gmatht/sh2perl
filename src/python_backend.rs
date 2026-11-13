@@ -507,6 +507,20 @@ impl Render {
                 "                    _stdin = chr(10).join(_l.lstrip(chr(9)) for _l in _t.split(chr(10)))\n",
                 "                elif _r.get('mode') == 'herestring':\n",
                 "                    _stdin = _t + chr(10)\n",
+                // `<$file` is a FILE, not text: bash fails the whole
+                // command with status 1 when it cannot be opened, and
+                // otherwise feeds its bytes to stdin. Ignoring the
+                // descriptor made `command <$DEST.new` succeed, so the
+                // `if ! …` arm never ran (lex-dot-in-var,
+                // parse-dot-after-var printed no `failed`).
+                "    _infile = None\n",
+                "    for _r in (redirects or []):\n",
+                "        if _r.get('fd') == 0 and _r.get('mode') == 'r':\n",
+                "            try:\n",
+                "                _infile = open(_r.get('target', ''), 'rb')\n",
+                "            except OSError:\n",
+                "                globals()['__sh_rc'] = 1\n",
+                "                return False\n",
                 "    if isinstance(cap, str):\n",
                 "        data = cap\n",
                 "    else:\n",
@@ -521,7 +535,10 @@ impl Render {
                 "            return __sh_rc == 0\n",
                 "        import subprocess as _sp\n",
                 "        try:\n",
-                "            p = _sp.run(cmd, env=__sh_env(), input=(None if _stdin is None else _stdin.encode()), stdout=_sp.PIPE, stderr=_sp.PIPE)\n",
+                "            if _infile is not None:\n",
+                "                p = _sp.run(cmd, env=__sh_env(), stdin=_infile, stdout=_sp.PIPE, stderr=_sp.PIPE)\n",
+                "            else:\n",
+                "                p = _sp.run(cmd, env=__sh_env(), input=(None if _stdin is None else _stdin.encode()), stdout=_sp.PIPE, stderr=_sp.PIPE)\n",
                 "        except OSError:\n",
                 "            __sh_rc = 127; return False\n",
                 "        __sh_rc = p.returncode\n",
@@ -3051,11 +3068,46 @@ impl Render {
     /// String interpolation: f-string when every expression part renders to
     /// a quote-free atom (the common `"a$x"` case); otherwise a safe
     /// `str()` concatenation.
+    /// One interpolated expansion, in bash's SCALAR view of a value.
+    ///
+    /// `"$arr"` names ELEMENT 0 — bash never prints an array's python
+    /// repr (zz_regression_idioms pinned `bare=ten`). And an UNBRACED
+    /// `$arr[0]` is `$arr` followed by the literal text `[0]`: the
+    /// subscript belongs to the name only when braced, which lowers as a
+    /// `param` call and keeps its element semantics.
+    fn interp_part(&mut self, x: &IrExpr) -> String {
+        match x {
+            IrExpr::Var(n, _) => {
+                self.need_param_ops = true;
+                format!("__sh_scalar({})", self.py_ident(n))
+            }
+            // `$name` reaches an interpolation as `getVar`, not `Var`
+            IrExpr::Call { func, .. } if func == "getVar" => {
+                self.need_param_ops = true;
+                format!("__sh_scalar({})", self.expr(x))
+            }
+            IrExpr::Index { var, key } => {
+                self.need_param_ops = true;
+                let k = self.expr(key);
+                format!(
+                    "(__sh_scalar({}) + chr(91) + str({k}) + chr(93))",
+                    self.py_ident(var)
+                )
+            }
+            other => self.expr(other),
+        }
+    }
+
     fn interp(&mut self, parts: &[InterpPart]) -> String {
-        if parts.iter().all(|p| match p {
+        let fstr_ok = parts.iter().all(|p| match p {
             InterpPart::Lit(_) => true,
-            InterpPart::Expr(x) => self.fstring_safe(x),
-        }) {
+            InterpPart::Expr(x) => {
+                !matches!(**x, IrExpr::Var(_, _) | IrExpr::Index { .. })
+                    && !matches!(**x, IrExpr::Call { ref func, .. } if func == "getVar")
+                    && self.fstring_safe(x)
+            }
+        });
+        if fstr_ok {
             let mut s = String::from("f\"");
             for p in parts {
                 match p {
@@ -3071,10 +3123,13 @@ impl Render {
             s
         } else {
             let mut bits = Vec::new();
-            for p in parts {
+            for p in parts.clone() {
                 match p {
-                    InterpPart::Lit(t) => bits.push(Self::py_str(t)),
-                    InterpPart::Expr(x) => bits.push(format!("str({})", self.expr(x))),
+                    InterpPart::Lit(t) => bits.push(Self::py_str(&t)),
+                    InterpPart::Expr(x) => {
+                        let code = self.interp_part(&x);
+                        bits.push(format!("str({code})"));
+                    }
                 }
             }
             format!("({})", bits.join(" + "))
@@ -4587,8 +4642,22 @@ impl Render {
                                     // (A "0 when not in `written`" guess broke
                                     // associative reads: LOOP variables are
                                     // never in `written`, so `for k in …; do
-                                    // ${m[$k]}` lost every value.)
-                                    self.py_ident(v)
+                                    // ${m[$k]}` lost every value.) The name
+                                    // can also be UNBOUND (`${words[$c]}` at
+                                    // top level raised NameError), so ask the
+                                    // running scope: a local (`dir()`) or a
+                                    // module global counts, anything else is
+                                    // bash's unset-arithmetic 0.
+                                    // NOT numerified: an associative key is
+                                    // text, and `__sh_atoi("name")` is 0
+                                    // (029_arrays_associative lost every
+                                    // value). `__sh_elem` handles a numeric
+                                    // index.
+                                    format!(
+                                        "({n} if ({q} in dir() or {q} in globals()) else 0)",
+                                        n = self.py_ident(v),
+                                        q = Self::py_str(v)
+                                    )
                                 } else if self.assoc.contains(base) {
                                     // an associative key is always a string
                                     Self::py_str(sub)
@@ -4609,21 +4678,18 @@ impl Render {
                                     // it as 0 (parse-redirect-in-case-pattern
                                     // never assigns `counter`, and the bare
                                     // name raised NameError).
-                                    if self.written.contains(sub) {
-                                        self.py_ident(sub)
-                                    } else {
-                                        self.need_atoi = true;
-                                        format!(
-                                            "__sh_atoi({})",
-                                            self.call(
-                                                "getVar",
-                                                &[IrExpr::Str(
-                                                    sub.to_string(),
-                                                    crate::ir::StrStyle::DoubleQuoted,
-                                                )]
-                                            )
-                                        )
-                                    }
+                                    // `written` is a STATIC guess and can
+                                    // name a variable this scope never bound
+                                    // (`${words[$counter]}` at top level read
+                                    // a bare `counter` and raised NameError).
+                                    // `dir()` asks the running scope instead:
+                                    // the binding if there is one, else 0.
+                                    self.need_atoi = true;
+                                    format!(
+                                        "(__sh_atoi({n}) if ({q} in dir() or {q} in globals()) else 0)",
+                                        n = self.py_ident(sub),
+                                        q = Self::py_str(sub)
+                                    )
                                 } else {
                                     Self::py_str(sub)
                                 };
@@ -9047,6 +9113,14 @@ impl Render {
                             // operation: add", parse-comment-in-brace took
                             // its default arm for an empty subject).
                             let p = Self::strip_quotes(p);
+                            // a pattern that is one VARIABLE (`$("${cmd[@]}")`
+                            // style case words) compares against its VALUE,
+                            // not the literal text `$name`
+                            if let Some(v) = p.strip_prefix('$') {
+                                if Self::is_plain_name(v) && !Self::has_glob(&p) {
+                                    return format!("{d} == str({})", self.py_ident(v));
+                                }
+                            }
                             if Self::has_glob(&p) {
                                 // case patterns are shopt-sensitive too
                                 // (nocasematch, extglob operators).
