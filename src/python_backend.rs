@@ -141,6 +141,11 @@ pub struct Render {
     fd_alias: std::collections::HashMap<i32, String>,
     /// needs the `__sh_argv_slice` positional-slice helper (`${@:o:l}`)
     need_argv_slice: bool,
+    /// an expansion in the statement being rendered was a bash "bad
+    /// substitution": bash drops the whole command, sets `$?` to 1 and
+    /// CARRIES ON (verified: `echo "${!p*[@]:0:3}"` prints nothing and the
+    /// next line still runs), so the statement's lines are dropped too
+    badsub_hit: bool,
     /// needs the `__sh_ok` fallible-builtin wrapper (`cd` to a missing
     /// dir raises; bash records rc 1 and continues)
     need_ok: bool,
@@ -4437,9 +4442,10 @@ impl Render {
                                 Some(IrExpr::Str(s, _)) if s == "@" || s == "*"
                             );
                             if star_name && subscripted && name.ends_with('*') {
-                                self.need_sys = true;
-                                self.emit("sys.exit(1)");
-                                return "None".into();
+                                // the command is skipped (see badsub_hit);
+                                // the word itself never materializes
+                                self.badsub_hit = true;
+                                return Self::py_str("");
                             }
                         }
                         if let Some(IrExpr::Str(name, _)) = args.get(1) {
@@ -10468,6 +10474,15 @@ impl Render {
         for (idx, s) in prog.stmts.iter().enumerate() {
             let before = self.out.len();
             self.stmt(s);
+            if self.badsub_hit {
+                // a bad substitution skips the WHOLE command: bash printed
+                // no third line for 063_04's `echo "${!prefix*[@]:0:3}"`
+                // but kept going in 063_hard_to_parse.
+                self.badsub_hit = false;
+                self.out.truncate(before);
+                self.emit("__sh_rc = 1");
+                continue;
+            }
             let line = prog.stmt_lines.iter().find(|(i, _)| *i == idx).map(|(_, l)| *l);
             if let Some(l) = line {
                 if let Some(first) = self.out.get_mut(before) {
