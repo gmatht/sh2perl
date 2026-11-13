@@ -45,4 +45,15 @@ field maxdepth: optional_expr
 # TextOps#distinct_walk_child), TextOps#walk_not_distinct_dup_names (the wf_tree hypothesis is
 # load-bearing: two children of the same name do repeat an entry) and TextOps#walk_dir_defects_bite
 # (each conjunct falsified by its own defect walker and witness lemma).
+# Order-freedom at VALUE level (all proved in the same theory and section): TextOps#walk_rev_length
+# (length (walk_rev t) = length (walk t)), TextOps#walk_rev_length_entries (the reversed fold
+# counts the tree's entries exactly), TextOps#walk_rev_child_length and TextOps#walk_rev_child_set
+# (the per-child recursion and the membership form the induction uses),
+# TextOps#sum_list_suc_map_cong (the pointwise step, a named lemma rather than an inlined chain of
+# simp facts), TextOps#walk_rev_distinct and TextOps#walk_rev_same_entries (same set, same count,
+# both repeat-free — i.e. the same paths with the same multiplicity), with instances
+# TextOps#walk_rev_instances on w_nested/w_emptydir/w_root, TextOps#dup_set_equal_length_differs
+# (set equality alone does not pin the traversal: same set, different count) and
+# TextOps#walk_rev_length_outside_wf (the length law is total, so wf_tree carries only the
+# repeat-freeness half).
 spec: TextOps#walk_dir_sound

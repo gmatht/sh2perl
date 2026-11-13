@@ -3179,7 +3179,7 @@ lemma sum_list_map_cong:
   using h by (induct cs) simp_all
 
 lemma sum_list_rev_map:
-  fixes f :: "'a \<Rightarrow> 'a :: comm_monoid_add"
+  fixes f :: "'b \<Rightarrow> 'a :: comm_monoid_add"
   shows "sum_list (map f (rev cs)) = sum_list (map f cs)"
   by (induct cs) (simp_all add: ac_simps)
 
@@ -3576,6 +3576,257 @@ proof -
   have 5: "wf_tree w_root" by (simp add: w_root_def)
   have 6: "distinct (walk w_root)" by (rule walk_distinct [OF 5])
   from 1 2 3 4 5 6 show ?thesis by auto
+qed
+
+
+text \<open>ORDER-FREEDOM AT VALUE LEVEL, not only as a set. The set equality
+  walk_rev_set cannot tell a traversal that drops or duplicates entries from the good
+  one — dup_set_equal_length_differs exhibits exactly that: a duplicate emitter with the
+  SAME visited set and a different length. What pins the reversed fold is the counting form,
+  proved below from the @{const walk_rev} definition itself:
+  \<^item> walk_rev_child_length: the per-child recursion of the reversed fold — its length
+    is the sum, over the REVERSED child list, of one plus the child's own count;
+  \<^item> walk_rev_child_set: the matching membership characterisation at a directory;
+  \<^item> sum_list_suc_map_cong: the pointwise-congruence step the induction needs, stated
+    as its own lemma rather than inlined in a chain of @{text simp} facts;
+  \<^item> walk_rev_length: @{term "length (walk_rev t) = length (walk t)"} — and with
+    walk_rev_length_entries the reversed fold counts the tree's entries exactly.
+  Together with the set equality, and with BOTH lists repeat-free
+  (walk_rev_distinct, walk_distinct), the two traversals emit the same paths with
+  the same multiplicity: same set, same length, no repeats on either side.
+  On the invariant: the LENGTH law needs no hypothesis on the tree at all
+  (walk_rev_length_outside_wf checks it on a tree that violates @{const wf_tree}), so
+  there is no tree on which the counting identity can break; @{const wf_tree} is load-bearing
+  for the REPEAT-FREENESS half only, which is where walk_not_distinct_dup_names bites.
+  Instances on all three witness trees are machine-checked in
+  walk_rev_instances.\<close>
+
+lemma sum_list_suc_map_cong:
+  assumes h: "\<And>x. x \<in> set cs \<Longrightarrow> f x = g x"
+  shows "sum_list (map (\<lambda>c. Suc (f c)) cs) = sum_list (map (\<lambda>c. Suc (g c)) cs)"
+  using h by (induct cs) simp_all
+
+lemma walk_rev_child_length:
+  "length (walk_rev (DDir cs)) =
+     sum_list (map (\<lambda>c. Suc (length (walk_rev (snd c)))) (rev cs))"
+  by (simp add: len_concat_map)
+
+lemma walk_rev_child_set:
+  "set (walk_rev (DDir cs))
+     = (\<Union>q \<in> set cs. set (map ((#) (fst q)) ([] # walk_rev (snd q))))"
+  by (simp add: set_concat set_map)
+
+lemma walk_rev_length_entries: "length (walk_rev t) = entries_of t"
+proof (induct t rule: walk_rev.induct)
+  case 1
+  show ?case by simp
+next
+  case (2 cs)
+  have ih: "\<And>c. c \<in> set cs \<Longrightarrow> length (walk_rev (snd c)) = entries_of (snd c)"
+  proof -
+    fix c
+    assume c: "c \<in> set cs"
+    have pc: "(fst c, snd c) \<in> set cs" using c by (metis surjective_pairing)
+    show "length (walk_rev (snd c)) = entries_of (snd c)"
+      using "2.hyps"[of c] c by simp
+  qed
+  have pointwise: "\<And>x. x \<in> set (rev cs) \<Longrightarrow>
+      length (walk_rev (snd x)) = entries_of (snd x)"
+  proof -
+    fix x
+    assume x: "x \<in> set (rev cs)"
+    have xc: "x \<in> set cs" using x by simp
+    show "length (walk_rev (snd x)) = entries_of (snd x)" using ih xc by simp
+  qed
+  have step1: "sum_list (map (\<lambda>c. Suc (length (walk_rev (snd c)))) (rev cs))
+             = sum_list (map (\<lambda>c. Suc (entries_of (snd c))) (rev cs))"
+    by (rule sum_list_suc_map_cong [OF pointwise])
+  have step2: "sum_list (map (\<lambda>c. Suc (entries_of (snd c))) (rev cs))
+             = sum_list (map (\<lambda>c. Suc (entries_of (snd c))) cs)"
+    by (rule sum_list_rev_map)
+  have step3: "sum_list (map (\<lambda>c. Suc (entries_of (snd c))) cs)
+             = length cs + sum_list (map (\<lambda>c. entries_of (snd c)) cs)"
+    by (simp add: sum_list_suc_map)
+  have calc: "length (walk_rev (DDir cs)) =
+        length cs + sum_list (map (\<lambda>c. entries_of (snd c)) cs)"
+  proof -
+    have "length (walk_rev (DDir cs)) =
+          sum_list (map (\<lambda>c. Suc (length (walk_rev (snd c)))) (rev cs))"
+      by (rule walk_rev_child_length)
+    also have "\<dots> = sum_list (map (\<lambda>c. Suc (entries_of (snd c))) (rev cs))"
+      using step1 by simp
+    also have "\<dots> = sum_list (map (\<lambda>c. Suc (entries_of (snd c))) cs)"
+      using step2 by simp
+    finally show ?thesis using step3 by simp
+  qed
+  from calc show ?case by simp
+qed
+
+theorem walk_rev_length: "length (walk_rev t) = length (walk t)"
+proof -
+  have a: "length (walk_rev t) = entries_of t" by (rule walk_rev_length_entries)
+  have b: "length (walk t) = entries_of t" by (rule walk_length)
+  from a b show ?thesis by simp
+qed
+
+text \<open>The repeat-freeness half for the reversed fold, by the same structural argument as
+  @{thm walk_distinct}: children of distinct names emit disjoint path sets in either order, and
+  one child's own path is never repeated by its descendants because no child emits the empty
+  path. So the two halves are not proved by assuming each other.\<close>
+
+lemma walk_rev_nil_not: "[] \<notin> set (walk_rev t)"
+  by (simp add: walk_rev_set walk_nil_not)
+
+lemma distinct_walk_rev_child:
+  assumes d: "distinct (walk_rev c)"
+  shows "distinct (map ((#) n) ([] # walk_rev c))"
+proof -
+  have nil: "[] \<notin> set (walk_rev c)" by (rule walk_rev_nil_not)
+  have dt: "distinct (map ((#) n) (walk_rev c))"
+    using d by (simp add: distinct_map inj_on_def)
+  have own: "[n] \<notin> set (map ((#) n) (walk_rev c))"
+  proof
+    assume h: "[n] \<in> set (map ((#) n) (walk_rev c))"
+    then obtain r where r: "r \<in> set (walk_rev c)" and e: "[n] = n # r"
+      by (auto simp: set_map)
+    have "r = []" using e by simp
+    with r nil show False by simp
+  qed
+  show ?thesis using dt own by simp
+qed
+
+lemma walk_rev_disjoint_children:
+  assumes ne: "fst q1 \<noteq> fst q2"
+  shows "set (map ((#) (fst q1)) ([] # walk_rev (snd q1))) \<inter>
+           set (map ((#) (fst q2)) ([] # walk_rev (snd q2))) = {}"
+proof (rule equals0I)
+  fix p
+  assume pin: "p \<in> set (map ((#) (fst q1)) ([] # walk_rev (snd q1))) \<inter>
+                 set (map ((#) (fst q2)) ([] # walk_rev (snd q2)))"
+  then have p1: "p \<in> set (map ((#) (fst q1)) ([] # walk_rev (snd q1)))" by simp
+  have p2: "p \<in> set (map ((#) (fst q2)) ([] # walk_rev (snd q2)))" using pin by simp
+  obtain r1 where e1: "p = fst q1 # r1" using p1 by (auto simp: mem_child_part)
+  obtain r2 where e2: "p = fst q2 # r2" using p2 by (auto simp: mem_child_part)
+  from e1 e2 have "fst q1 = fst q2" by simp
+  with ne show False by simp
+qed
+
+theorem walk_rev_distinct:
+  assumes wf: "wf_tree t"
+  shows "distinct (walk_rev t)"
+  using wf
+proof (induct t rule: walk_rev.induct)
+  case 1
+  show ?case by simp
+next
+  case (2 cs)
+  have names: "distinct (map fst cs)" and wfq: "\<forall>q \<in> set cs. wf_tree (snd q)"
+    using "2.prems" by simp_all
+  have inner: "\<And>q. q \<in> set cs \<Longrightarrow> distinct (map ((#) (fst q)) ([] # walk_rev (snd q)))"
+  proof -
+    fix q
+    assume q: "q \<in> set cs"
+    from "2.hyps"[of q] q have dq: "distinct (walk_rev (snd q))" using wfq by simp
+    show "distinct (map ((#) (fst q)) ([] # walk_rev (snd q)))"
+      using distinct_walk_rev_child [of "snd q" "fst q"] dq by simp
+  qed
+  have across: "\<And>q1 q2. q1 \<in> set cs \<Longrightarrow> q2 \<in> set cs \<Longrightarrow> fst q1 \<noteq> fst q2
+                   \<Longrightarrow> set (map ((#) (fst q1)) ([] # walk_rev (snd q1))) \<inter>
+                       set (map ((#) (fst q2)) ([] # walk_rev (snd q2))) = {}"
+    using walk_rev_disjoint_children by blast
+  have namesr: "distinct (map fst (rev cs))"
+  proof -
+    have "map fst (rev cs) = rev (map fst cs)" by (simp add: rev_map)
+    then show ?thesis using names by (simp add: distinct_rev)
+  qed
+  have innerr: "\<And>q. q \<in> set (rev cs) \<Longrightarrow> distinct (map ((#) (fst q)) ([] # walk_rev (snd q)))"
+  proof -
+    fix q
+    assume q: "q \<in> set (rev cs)"
+    have qs: "q \<in> set cs" using q by simp
+    show "distinct (map ((#) (fst q)) ([] # walk_rev (snd q)))"
+      using inner [of q] qs by blast
+  qed
+  have acrossr: "\<And>q1 q2. q1 \<in> set (rev cs) \<Longrightarrow> q2 \<in> set (rev cs) \<Longrightarrow> fst q1 \<noteq> fst q2
+                   \<Longrightarrow> set (map ((#) (fst q1)) ([] # walk_rev (snd q1))) \<inter>
+                       set (map ((#) (fst q2)) ([] # walk_rev (snd q2))) = {}"
+  proof -
+    fix q1 q2
+    assume a1: "q1 \<in> set (rev cs)" and a2: "q2 \<in> set (rev cs)" and a3: "fst q1 \<noteq> fst q2"
+    have h1: "q1 \<in> set cs" using a1 by simp
+    have h2: "q2 \<in> set cs" using a2 by simp
+    show "set (map ((#) (fst q1)) ([] # walk_rev (snd q1))) \<inter>
+            set (map ((#) (fst q2)) ([] # walk_rev (snd q2))) = {}"
+      using across [of q1 q2] h1 h2 a3 by blast
+  qed
+  have "distinct (concat (map (\<lambda>q. map ((#) (fst q)) ([] # walk_rev (snd q))) (rev cs)))"
+    by (rule distinct_concat_map [OF namesr innerr acrossr])
+  then show ?case by simp
+qed
+
+text \<open>The payoff: same set, same count, both repeat-free — i.e. the same paths with the same
+  multiplicity, for every well-formed tree.\<close>
+
+theorem walk_rev_same_entries:
+  assumes wf: "wf_tree t"
+  shows "set (walk_rev t) = set (walk t) \<and>
+         length (walk_rev t) = length (walk t) \<and>
+         distinct (walk_rev t) \<and>
+         distinct (walk t)"
+proof (intro conjI)
+  show "set (walk_rev t) = set (walk t)" by (rule walk_rev_set)
+  show "length (walk_rev t) = length (walk t)" by (rule walk_rev_length)
+  show "distinct (walk_rev t)" using wf by (rule walk_rev_distinct)
+  show "distinct (walk t)" using wf by (rule walk_distinct)
+qed
+
+text \<open>Non-vacuity, both directions. (i) A walker with the SAME visited set and a DIFFERENT
+  count shows the set equality alone does not pin the traversal — that is
+  dup_set_equal_length_differs, so the counting conjunct has independent content.
+  (ii) The LENGTH law holds outside @{const wf_tree} as well
+  (walk_rev_length_outside_wf): the identity is total, so no tree can falsify it, and
+  @{const wf_tree} is load-bearing only for the repeat-freeness half. (iii) All three witness
+  trees are machine-checked instances, in walk_rev_instances.\<close>
+
+lemma walk_dup_same_set:
+  "set (walk_dup w_nested) = set (walk w_nested)"
+  by eval
+
+lemma dup_set_equal_length_differs:
+  "set (walk_dup w_nested) = set (walk w_nested) \<and>
+   length (walk_dup w_nested) \<noteq> length (walk w_nested)"
+  using walk_dup_same_set dup_breaks_count walk_length [of w_nested] by simp
+
+lemma walk_rev_length_outside_wf:
+  "\<not> wf_tree (DDir [([100], DFile), ([100], DFile)]) \<and>
+   length (walk_rev (DDir [([100], DFile), ([100], DFile)]))
+     = length (walk (DDir [([100], DFile), ([100], DFile)]))"
+proof (intro conjI)
+  show "\<not> wf_tree (DDir [([100], DFile), ([100], DFile)])" by eval
+  show "length (walk_rev (DDir [([100], DFile), ([100], DFile)]))
+      = length (walk (DDir [([100], DFile), ([100], DFile)]))" by (rule walk_rev_length)
+qed
+
+lemma walk_rev_instances:
+  "wf_tree w_nested \<and> wf_tree w_emptydir \<and> wf_tree w_root \<and>
+   length (walk_rev w_nested) = length (walk w_nested) \<and>
+   length (walk_rev w_emptydir) = length (walk w_emptydir) \<and>
+   length (walk_rev w_root) = length (walk w_root) \<and>
+   set (walk_rev w_nested) = set (walk w_nested) \<and>
+   distinct (walk_rev w_nested) \<and> distinct (walk w_nested)"
+proof (intro conjI)
+  have n: "wf_tree w_nested" by (simp add: w_nested_def)
+  have e: "wf_tree w_emptydir" by (simp add: w_emptydir_def)
+  have r: "wf_tree w_root" by (simp add: w_root_def)
+  show "wf_tree w_nested" using n .
+  show "wf_tree w_emptydir" using e .
+  show "wf_tree w_root" using r .
+  show "length (walk_rev w_nested) = length (walk w_nested)" by (rule walk_rev_length)
+  show "length (walk_rev w_emptydir) = length (walk w_emptydir)" by (rule walk_rev_length)
+  show "length (walk_rev w_root) = length (walk w_root)" by (rule walk_rev_length)
+  show "set (walk_rev w_nested) = set (walk w_nested)" by (rule walk_rev_set)
+  show "distinct (walk_rev w_nested)" using n by (rule walk_rev_distinct)
+  show "distinct (walk w_nested)" using n by (rule walk_distinct)
 qed
 
 
