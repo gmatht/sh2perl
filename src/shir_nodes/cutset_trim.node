@@ -35,4 +35,12 @@ field side: optional_string
 #   go_trim_cutset_is_codepoints byte vs code point, witnessed on the UTF-8 pair
 #                                for U+00A0 (the byte model splits it)
 #   rust_trim_matches_is_chars   the same at the trailing end, via chars
+# GLOB BOUNDARY, exact: the shell spelling of this node is `${s###[cutset]}` — a pattern
+# whose `[cutset]` is a CHARACTER CLASS. ShIR_TextOps_Glob has exactly three pattern
+# constructors (PLit/PAny/PStar) and proves the fragment's one-byte tests are either
+# "this byte" or "every byte" (TextOps#fragment_is_three_constructors,
+# #literal_test_cannot_be_a_class, #any_test_is_every_byte, #star_test_is_every_string),
+# so a class is NOT expressible in the modelled fragment. The node is therefore stated
+# over the cutset SET (which is what Go's strings.Trim and the Perl \Q..\E arms mean),
+# not over a pattern, and no theorem here assumes class matching.
 spec: TextOps#cutset_trim_is_trim_by, TextOps#cutset_trim_sound

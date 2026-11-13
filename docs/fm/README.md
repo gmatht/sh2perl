@@ -16,6 +16,7 @@ shIR. It is split into six theories that build as one session:
 | `ShIR_TextOps_Cutset` | the `CutsetTrim` node: the trim class as DATA, plus two modelled ALTERNATIVE readings so the divergences are comparisons, not prose. General obligations: `cutset_trim_is_trim_by` (inherits idempotence and run-only removal from Strings), `cutset_trim_removes_only_a_run`, `cutset_side_three_valued`; accurate byte-granularity facts `cutset_trim_lead_is_bytewise` / `cutset_trim_trail_is_bytewise`, and `cutset_trim_depends_only_on_members` (member-set invariance — true of both readings, which is why it is not called `needs_quotemeta`). Divergences as two-reading theorems: `perl_cutset_needs_quotemeta` (a bracket-body syntax with closing `]`, leading `^` negation, escapes and `a-b` ranges vs the literal set, on `]`, `^`, `\\` and `a-c`), `go_trim_cutset_is_codepoints` and `rust_trim_matches_is_chars` (a two-byte-UTF-8 decoder with a char-wise trim vs the byte model, on the NBSP pair). Witness lemmas keep the concrete bytes. |
 | `ShIR_TextOps_Substitute` | the `Substitute` node: two fuel-bounded engines (`subst_all`, `subst_first`) over an abstract matcher — leftmost, non-overlapping, empty-match-advances-one-byte as the termination obligation, `&` as a function of the matched text. The regex syntax, the line split and `\N` are documented limitations. |
 | `ShIR_TextOps_Device` | the two DEVICE-shaped nodes: `GpuOp`'s path and launch geometry (`path_join`, `groups`, `gid`, `block_ids`, `launch` — the block tiling, its coverage and its duplicate-freedom) and `CgoCall`'s argument layout (`layout`, `arg_offset`, `declared_width` — exact size, positional offsets, the split/drop/window laws), with the weaker models this refuses on each side. |
+| `ShIR_TextOps_Glob` | the pattern-matching nodes: an in-theory shell-pattern fragment (`datatype pseg = PLit bytes | PAny | PStar`, matcher `pmatch`, recursion on the pattern, star as an existential split) and the laws that make the byte comparisons at `StringAffix` / `AffixStrip` / `StringContains` the pattern's special cases rather than names for it: the constructor laws (a literal matches exactly its bytes, one byte, everything), concatenation and `lit*` / `*lit` / `lit*lit` / `lit*lit*` decompositions, the BOUNDED law (a match only inspects a prefix), the shortest-match strips `strip_pre` / `strip_suf` over `Least` with their identity-on-miss, suffix/prefix decomposition, length bound and SHORTEST law, `pmatch`-shaped node bundles `glob_affix_sound`, `glob_strip_sound`, `glob_contains_sound` (so `${s#p}`, `${s%p}` and `*p*` are proved at the nodes' own byte tests), witnesses at concrete bytes, five refuted weaker models (whole-string match, greedy star, empty-matching star, `PAny` as a star, empty-on-miss strip) and the checked boundary: three constructors only, so classes, ranges, negation, extglob, brace alternation and quoting are outside the model. Already-proved parts stay untouched: the `Strings` affix bundle and the `Cut` find-primitive laws are cited, not re-derived. |
 | `ShIR_TextOps_Splice` | the `StrSplice` node and the C backend's capacity-guarded fused store that consumes it. `str_splice_fold_sound`: over byte lists, with `int` offsets clamped exactly as the emission clamps them (`(_s < 0) ? bl + _s : _s`, then into `[0,bl]`), the Interpolate the fold replaces — `${b:0:$start}${repl}${b:$end}` — denotes `take (pe b start) b @ repl @ drop (sb b end) b`, the node's meaning. The in-place store is pinned by `fused_store_correct` / `sched_prefix`, the `strnlen(_slot,res)==res` guard by `guard_iff_fits` / `guard_implies_in_bounds`, a short slot by `short_slot_refused`, and the disjointness invariant is proved load-bearing by `aliasing_breaks_the_schedule` (a concrete refutation with an aliased repl). Not modelled: the rest of the eligibility routing (every refusal is the unchanged plain path) and the array length bookkeeping.
 
 ```
@@ -202,7 +203,7 @@ three that did not — `newline_strip_sound`, `uniq_lines_sound`,
 (`sort_lines_sound`). `harness/check-node-specs.pl` (workspace `harness/`) makes
 "no dangling spec" a machine check: it collects every `theorem`/`lemma`/
 `definition`/`fun` under `docs/fm` and fails on a `spec:` naming one that does
-not exist. It reports 48 resolved, 0 unstated, 0 pending, 0 dangling.
+not exist. It reports 53 resolved, 0 unstated, 0 pending, 0 dangling.
 
 - `newline_strip_sound` (`ShIR_TextOps_Strip`): the node is the trailing-run
   removal, with the run length and the prefix equation.
@@ -289,15 +290,15 @@ deliberate no-obligation form. `--map` prints the node→theorem table below and
 `--selftest` runs the five negative controls (real theorem, definition, dangling
 name, wrong session prefix, unbuilt theory).
 
-Current inventory: **48 resolved, 0 unstated, 0 pending, 0 errors**.
+Current inventory: **53 resolved, 0 unstated, 0 pending, 0 errors**.
 
-The 48 resolved specs (46 distinct theorems; `lowered_wc_sound` covers three
+The 53 resolved specs (51 distinct theorems; `lowered_wc_sound` covers three
 nodes and `field_extract`, `split`, `substitute`, `uniq_lines` and
 `cutset_trim` cite two each):
 
 | node | theorem |
 | --- | --- |
-| `affix_strip` | `affix_strip_sound` |
+| `affix_strip` | `affix_strip_sound`, `glob_strip_sound`, `strip_pre_is_the_node`, `strip_suf_is_the_node` |
 | `array_len` | `array_len_split_is_word_count` |
 | `case_transform` | `case_transform_sound` |
 | `char_extract` | `char_extract_sound` |
@@ -333,8 +334,8 @@ nodes and `field_extract`, `split`, `substitute`, `uniq_lines` and
 | `cgo_call` | `cgo_call_sound` |
 | `foreach_line` | `foreach_line_sound` |
 | `gpu_op` | `gpu_op_sound` |
-| `string_affix` | `string_affix_sound` |
-| `string_contains` | `string_contains_sound` |
+| `string_affix` | `string_affix_sound`, `glob_affix_sound` |
+| `string_contains` | `string_contains_sound`, `glob_contains_sound` |
 | `string_trim` | `string_trim_sound` |
 | `substitute` | `substitute_sound`, `substitute_line_domain_sound` |
 | `substr_extract` | `substr_extract_sound` |
@@ -640,6 +641,55 @@ Two honest limits, both stated in the theory:
   with a non-empty check, so an empty delimiter never matches —
   `field_grab_empty_delim_is_not_a_cut` records that
   `cut_head_first (drop off s) []` is `[]` while the node returns the tail.
+
+### The pattern fragment, and what it does not cover (2026-11-13)
+
+Every pattern-matching node used to carry the same open note: "the pattern is a literal,
+not a glob". `ShIR_TextOps_Glob` makes that note checkable instead of prose.
+
+**The fragment.** `datatype pseg = PLit bytes | PAny | PStar`, matched by
+`pmatch :: pseg list => bytes => bool`, recursion on the PATTERN, a star splitting the
+subject existentially. `PAny` is exactly one byte and `PStar` any run — no classes, no
+ranges, no negation, no extglob, no braces, no quoting, and that omission is stated as a
+theorem, not a caveat: `fragment_is_three_constructors`, `literal_test_cannot_be_a_class`,
+`any_test_is_every_byte`, `star_test_is_every_string`. So the fragment's tests are "this
+byte" or "every byte"; a class is not expressible in it.
+
+**The laws.** The three constructor laws (`pmatch_lit_only`, `pmatch_any_only`,
+`pmatch_star_only`), the concatenation and `lit*` / `*lit` / `lit*lit` / `lit*lit*`
+decompositions, and `pmatch_bounded` (a match never looks past a bound computed from the
+pattern and the matched prefix — so matching cannot read past the end).
+
+**The strips.** `${s#p}` and `${s%p}` are modelled as the SHORTEST-match strips
+`strip_pre` / `strip_suf`, defined by `Least` over `pre_ok` / `suf_ok`, and each gets the
+full bundle: removed bytes are a match, the result is a suffix/prefix of the input, a
+shorter result is not possible (`strip_pre_shortest`, `strip_suf_shortest`), the length is
+bounded, and the miss arm is the identity (`strip_pre_none`, `strip_suf_none`). The
+literal forms the nodes actually emit are then equalities rather than readings:
+`strip_pre [PLit p, PStar] t = affix_strip_node t p True` and
+`strip_suf [PStar, PLit p] t = affix_strip_node t p False`.
+
+**At the nodes.** Three new bundles, each stated over the node model already proved in
+`ShIR_TextOps_Strings`: `glob_affix_sound` (`has_affix t p pre` = the `p*` / `*p` match),
+`glob_strip_sound` (`affix_strip_node` = the shortest strip), `glob_contains_sound`
+(`contains_anywhere t p` = `*p*`, both directions, via the offset-to-split bridge
+`contains_drop_split`). `AffixStrip` now cites all four of its laws, `StringAffix` and
+`StringContains` two each; the other pattern-carrying nodes (`CutAt`, `FieldStrip`,
+`FieldStripEnd`, `FieldGrab`, `PathName`, `CutsetTrim`) carry a precise boundary line —
+what their glob spelling would need and which part of it this fragment does not supply.
+
+**Refuted, not assumed away.** `whole_match_is_not_the_node` (match the pattern against the
+whole text), `greedy_star_is_not_the_node` (`#*` as "drop everything"),
+`optional_star_is_not_the_node` (a star that can only match the empty string),
+`any_is_not_a_star` (`PAny` read as a star), `miss_is_not_the_node` (an empty string on a
+miss instead of the identity) — each at concrete bytes.
+
+**What is deliberately still open.** The LONGEST-match forms (`${s##p}`, `${s%%p}`,
+`${p##*/}`) are not modelled: `strip_pre` is the shortest-match strip by construction, and
+`greedy_star_is_not_the_node` records that the two cannot be equated. `CutAt`'s
+last-occurrence arms therefore rest on the `rfind_last` primitive laws in
+`ShIR_TextOps_Cut`, and `PathName` on GNU basename/dirname semantics, not on a glob
+theorem. A longest-match strip over the same fragment is the natural next theorem.
 
 ## Box-health note (why the proofs look odd in places)
 

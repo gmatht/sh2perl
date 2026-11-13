@@ -19,12 +19,22 @@
 # match) and `affix_strip_fold_sound` (the fold's contract: all four star
 # shapes at those primitives, plus the plain branch at either end —
 # `#lit*` is AffixStrip's strip_prefix, `%*lit` its strip_suffix, the
-# latter via `cut_head_last_at_trail`). What is NOT modelled is the glob
-# engine itself: "shortest/longest match of `lit*`" is identified with the
-# first/last occurrence of the literal, and that identification is
-# assumed, not proved (docs/fm/README.md). The AST reading was checked
-# against bash before the node was written, but the identities now rest on
-# the theory rather than on that check. An empty `delim` never reaches this
+# latter via `cut_head_last_at_trail`).
+# PATTERN SIDE, now proved for the fragment: ShIR_TextOps_Glob models shell
+# patterns as PLit/PAny/PStar with matcher `pmatch`, and proves that the
+# shortest-match strip of `lit*` is exactly the FIRST occurrence of the
+# literal (TextOps#strip_pre_lit_star: `strip_pre [PLit p, PStar] t` = drop at
+# the first occurrence, identity on a miss). So the `#*lit` arm's
+# "shortest match" is a theorem about a glob matcher, not a reading of bash.
+# BOUNDARY, exact: `strip_pre` is the SHORTEST-match strip by construction
+# (TextOps#strip_pre_shortest), so the LAST-occurrence arms (`##*lit`, `%lit*`
+# with a repeated delimiter) are computed here from `rfind_last` — a different
+# primitive — and the glob reading "longest match" is explicitly NOT modelled
+# (TextOps#greedy_star_is_not_the_node refutes equating the two). Character
+# classes, ranges, negation, extglob, brace alternation and quoting are outside
+# the fragment altogether (TextOps#fragment_is_three_constructors and the
+# one-byte tests); the fold refuses magic bodies, so no lowering reaches the
+# node with one. An empty `delim` never reaches this
 # node — the fold special-cases it — and `cut_at_empty_pattern` proves why:
 # with `[]` the two primitives match at different indices, so the four arms
 # split ([] / s / s / []) and no single node describes the case.

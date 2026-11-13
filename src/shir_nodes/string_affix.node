@@ -28,7 +28,16 @@ field prefix: bool
 # REFUTED: matching anywhere (Perl `index() != -1` instead of `== 0`, the classic slip —
 # TextOps#anywhere_is_not_the_affix) and a length-only test
 # (TextOps#length_alone_is_not_the_affix).
-# NOT PROMISED (outside this model): the pattern is a LITERAL byte string, not a glob; the
-# shell pattern language (`*`, `?`, `[...]`, extglob) and the Perl trailing-arm empty-pattern
-# divergence (proved separately as a renderer gap in this theory) are out of model.
-spec: TextOps#string_affix_sound
+# PATTERN: TextOps#glob_affix_sound — the pattern this node lowers is the shell's
+# `LIT*` (prefix) / `*LIT` (suffix), and under the formal fragment of
+# ShIR_TextOps_Glob (constructors PLit/PAny/PStar, matcher `pmatch`) those patterns are
+# EXACTLY this node's test: `pmatch [PLit p, PStar] t ⟷ has_affix t p True` and
+# `pmatch [PStar, PLit p] t ⟷ has_affix t p False`. So the byte comparison is proved to
+# be the glob's literal special case, not merely named after it.
+# BOUNDARY (checked, TextOps#fragment_is_three_constructors with
+# #literal_test_cannot_be_a_class / #any_test_is_every_byte: the fragment's one-byte tests
+# are "this byte" or "every byte"): character classes (`[abc]`, ranges, negation),
+# extglob groups, brace alternation and backslash quoting are NOT in the model, so a
+# lowering whose pattern carries one is outside this node's contract. The Perl
+# trailing-arm empty-pattern divergence is proved separately as a renderer gap.
+spec: TextOps#string_affix_sound, TextOps#glob_affix_sound

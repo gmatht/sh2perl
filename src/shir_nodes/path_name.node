@@ -16,7 +16,15 @@
 # one separator only ("/", 47) — no "\", drive letters or host separator classes;
 # no filesystem (no newline stripping, `basename -a`/`-s`); no "."/".." resolution
 # or symlink semantics (GNU does not resolve either, but std::path-based renderers
-# do, so the node promises no host path library). Note the generic Ext lowering in
+# do, so the node promises no host path library).
+# GLOB BOUNDARY, exact: the shells' `${p##*/}` / `${p%/*}` spellings are LONGEST-match
+# strips, and ShIR_TextOps_Glob proves only the SHORTEST-match strip of the fragment
+# (TextOps#strip_pre_shortest); it also refutes equating the two
+# (TextOps#greedy_star_is_not_the_node). So this node is NOT derived from a glob law:
+# it promises the GNU command semantics above, which the theory proves directly, and a
+# lowering that implements it by a `##` glob strip must justify its own equivalence —
+# for "strip up to the last separator" that equivalence is not in this theory.
+# Note the generic Ext lowering in
 # shir.rs renders split('/').pop() / split('/').slice(0,-1).join('/'), which is
 # wrong for "a/b/" and for slashless words — a lowering question, not the spec.
 

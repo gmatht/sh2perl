@@ -10,10 +10,15 @@
 # pattern occurring everywhere and the empty TEXT containing only the empty
 # pattern. Every backend arm above computes one of those three readings.
 
-node StringContains
-tag "StringContains"
-kind expr
-# storage_class str_bounded
-field text: expr
-field pattern: expr
-spec: TextOps#string_contains_sound
+# PATTERN: TextOps#glob_contains_sound — the shell form this node lowers is `LIT*`-style
+# interior matching (`case *P*)`, `index() != -1`), which in the formal fragment of
+# ShIR_TextOps_Glob is `pmatch [PStar, PLit p, PStar]`. Proved: the node's scan and that
+# glob match are the same test — `contains_anywhere t p = pmatch [PStar, PLit p, PStar] t`,
+# both directions (TextOps#contains_is_a_glob_match / #glob_match_is_contained, via the
+# offset-to-split bridge #contains_drop_split).
+# BOUNDARY (checked in ShIR_TextOps_Glob: #fragment_is_three_constructors, and the
+# one-byte tests #literal_test_cannot_be_a_class / #any_test_is_every_byte /
+# #star_test_is_every_string): the fragment has exactly three constructors, so classes,
+# ranges, negation, extglob, brace alternation and quoting are outside the model. A
+# lowering whose pattern carries one of those is outside this node's contract.
+spec: TextOps#string_contains_sound, TextOps#glob_contains_sound

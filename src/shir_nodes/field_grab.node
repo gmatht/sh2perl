@@ -30,4 +30,10 @@ kind expr
 field text: expr
 field off: expr
 field delim: string
+# GLOB BOUNDARY: the shell spelling of this node is a `${s#*D}`-style strip with a
+# literal delimiter, whose SHORTEST-match form is proved in ShIR_TextOps_Glob
+# (TextOps#strip_pre_lit_star) and whose replacement reading is refuted when it is
+# not the identity on a miss (TextOps#miss_is_not_the_node). The byte-level laws above
+# are what the node promises; classes, ranges, negation, extglob, brace alternation
+# and quoting are outside the fragment (TextOps#fragment_is_three_constructors).
 spec: TextOps#field_grab_at_strip

@@ -11,11 +11,21 @@
 # Backends: Perl index()/substr(), JS startsWith/slice,
 #           C strncmp/memcmp loop, Rust strip_prefix/strip_suffix
 
-node AffixStrip
-tag "AffixStrip"
-kind expr
-# storage_class str_bounded
-field text: expr
-field pattern: expr
-field prefix: bool
-spec: TextOps#affix_strip_sound
+# RESOLVED — `affix_strip_sound` is the node's own contract: one occurrence is removed
+# when present (`has_affix`), the text flows through unchanged when not, the empty
+# pattern is the identity on both ends, and the removed bytes are exactly the pattern
+# (so the result is shorter by `length p` exactly when something was removed).
+# PREFIX ARM (`${s#p}`): TextOps#strip_pre_is_the_node — the node's drop-the-literal arm
+# IS the shortest-match strip of the glob `p*`, proved over the fragment matcher:
+# `strip_pre [PLit p, PStar] t = affix_strip_node t p True`, with the miss arm being the
+# identity (`${s#nomatch}` is `s`, not `[]`).
+# SUFFIX ARM (`${s%p}`): TextOps#strip_suf_is_the_node — the mirror law
+# `strip_suf [PStar, PLit p] t = affix_strip_node t p False`, the shortest matching suffix.
+# SHORTEST, not greedy: TextOps#strip_pre_shortest / #strip_suf_shortest — a longer match
+# never removes less, so `${s##p}` (the longest-match variant) is deliberately NOT this
+# node; TextOps#greedy_star_is_not_the_node refutes the `#*`-is-empty reading and
+# #whole_match_is_not_the_node refutes the pattern-must-match-the-whole-text reading.
+# BOUNDARY: the pattern is the literal fragment of ShIR_TextOps_Glob (PLit, and the
+# `p*`/`*p` shapes built from it). Classes, ranges, negation, extglob, brace alternation
+# and quoting are outside the model — no theorem here covers them.
+spec: TextOps#affix_strip_sound, TextOps#glob_strip_sound, TextOps#strip_pre_is_the_node, TextOps#strip_suf_is_the_node
