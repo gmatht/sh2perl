@@ -14,8 +14,16 @@ field is_regex: bool
 # string languages ignore it (immutable strings — flag meaningless).
 field in_place: optional_bool
 spec: TextOps#split_ws_len, TextOps#split_ws_fields_clean
-# The field LIST is the meaning; what is machine-checked is its count
+spec: TextOps#intercalate_split_on, TextOps#cut_keeps_trailing_empty_field
+# The field LIST is the meaning. What is machine-checked is its count
 # (split_ws_len: dropping the empty fields is what makes the count equal the
-# ws -w count) and its shape (split_ws_fields_clean: no empty field, no
-# whitespace inside one). Per-field byte identity is not yet an obligation —
-# see sh2perl/docs/fm/README.md, open targets.
+# ws -w count), its shape (split_ws_fields_clean: no empty field, no
+# whitespace inside one), and now its BYTES: `intercalate_split_on` says
+# joining the fields back with the delimiter recovers the input exactly, so no
+# byte is dropped, duplicated or reordered by the split — the per-field byte
+# identity this note used to list as an open target. `cut_keeps_trailing_empty_field`
+# pins the one case a lowering gets wrong: a trailing delimiter leaves a
+# trailing EMPTY field (unlike a whitespace split), which is why `cut -f2` on
+# "a," prints the empty line. Which FIELDS a later node takes is
+# FieldExtract's obligation (TextOps#select_subset and friends); a regex
+# delimiter is outside this model.

@@ -14,3 +14,4 @@ session TextOps = HOL +
     ShIR_TextOps_Splice
     ShIR_TextOps_Device
     ShIR_TextOps_Glob
+    ShIR_TextOps_Param

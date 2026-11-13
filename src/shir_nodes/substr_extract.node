@@ -7,8 +7,21 @@
 # ShIR_TextOps_Strings proves `substr_extract_sound`: the byte-at-a-time scan a
 # C arm performs equals `take length (drop offset text)`, which is what the JS,
 # Perl and Rust arms compute; the result is never longer than `length`, a zero
-# length is empty, and an offset past the end is the empty string. NOT modelled:
-# bash's negative offsets/lengths (`${v: -3}`, `${v:0:-2}`).
+# length is empty, and an offset past the end is the empty string.
+# NEGATIVE offsets and lengths (`${v: -3}`, `${v:0:-2}`) are modelled in
+# docs/fm/TextOps/ShIR_TextOps_Param.thy, where `start_of` / `stop_of` clamp
+# exactly as bash does: `slice_nonneg` recovers the non-negative law above, so
+# the negative forms EXTEND the proven model instead of sitting beside it;
+# `slice_from_last_n` is `${v: -n}` (the last n bytes, clamped to the whole
+# string), `slice_negative_length` is `${v:0:-n}` (drop the last n),
+# `slice_from_neg_clamps` / `slice_neg_len_clamps` are the past-the-end clamps,
+# and `negative_offset_is_not_zero` / `negative_length_is_not_ignored` /
+# `negative_length_is_not_a_prefix` REFUTE the three readings that treat a
+# negative argument as 0, as the whole string, or as a prefix length. What
+# remains outside: `${v:off:len}` with an offset expressed relative to the
+# END and a length counted FORWARD (`${v: -3:2}`) is the two-index form with
+# both arms negative, which `slice` covers by construction but only at the
+# shapes above; quoting and locale are outside the fragment altogether.
 
 node SubStrExtract
 tag "SubStrExtract"
@@ -18,3 +31,6 @@ field text: expr
 field offset: expr
 field length: optional_expr
 spec: TextOps#substr_extract_sound
+spec: TextOps#slice_nonneg, TextOps#slice_from_last_n
+spec: TextOps#slice_negative_length, TextOps#negative_offset_is_not_zero
+spec: TextOps#negative_length_is_not_ignored, TextOps#negative_length_is_not_a_prefix

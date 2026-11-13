@@ -18,6 +18,7 @@ shIR. It is split into six theories that build as one session:
 | `ShIR_TextOps_Device` | the two DEVICE-shaped nodes: `GpuOp`'s path and launch geometry (`path_join`, `groups`, `gid`, `block_ids`, `launch` — the block tiling, its coverage and its duplicate-freedom) and `CgoCall`'s argument layout (`layout`, `arg_offset`, `declared_width` — exact size, positional offsets, the split/drop/window laws), with the weaker models this refuses on each side. |
 | `ShIR_TextOps_Glob` | the pattern-matching nodes: an in-theory shell-pattern fragment (`datatype pseg = PLit bytes | PAny | PStar`, matcher `pmatch`, recursion on the pattern, star as an existential split) and the laws that make the byte comparisons at `StringAffix` / `AffixStrip` / `StringContains` the pattern's special cases rather than names for it: the constructor laws (a literal matches exactly its bytes, one byte, everything), concatenation and `lit*` / `*lit` / `lit*lit` / `lit*lit*` decompositions, the BOUNDED law (a match only inspects a prefix), the shortest-match strips `strip_pre` / `strip_suf` over `Least` with their identity-on-miss, suffix/prefix decomposition, length bound and SHORTEST law, and then the LONGEST-match strips over the SAME match sets (`Max` of the prefix positions, `Least` of the suffix start positions): `strip_pre_long` for `lit*` / `*lit` / `*` with its identity on a miss, the removed bytes matching, the prefix/suffix decomposition and the length bound, `strip_suf_long` / `strip_suf_short` for the trailing pair with their own suffix laws, the occurrence bridge `occ_at` / `first_occ` / `last_occ` that makes `*lit` exactly "the first / last occurrence" (`pre_ok_star_lit_iff`, `suf_at_lit_star_iff`), each longest law at concrete bytes, the two extrema proved different (`shortest_is_not_the_longest`, `trailing_shortest_is_not_the_longest`) and the exact boundary `shell_strip_is_not_gnu_basename`, `pmatch`-shaped node bundles `glob_affix_sound`, `glob_strip_sound`, `glob_contains_sound` (so `${s#p}`, `${s%p}` and `*p*` are proved at the nodes' own byte tests), witnesses at concrete bytes, five refuted weaker models (whole-string match, greedy star, empty-matching star, `PAny` as a star, empty-on-miss strip) and the checked boundary: three constructors only, so classes, ranges, negation, extglob, brace alternation and quoting are outside the model. Already-proved parts stay untouched: the `Strings` affix bundle and the `Cut` find-primitive laws are cited, not re-derived. |
 | `ShIR_TextOps_Splice` | the `StrSplice` node and the C backend's capacity-guarded fused store that consumes it. `str_splice_fold_sound`: over byte lists, with `int` offsets clamped exactly as the emission clamps them (`(_s < 0) ? bl + _s : _s`, then into `[0,bl]`), the Interpolate the fold replaces — `${b:0:$start}${repl}${b:$end}` — denotes `take (pe b start) b @ repl @ drop (sb b end) b`, the node's meaning. The in-place store is pinned by `fused_store_correct` / `sched_prefix`, the `strnlen(_slot,res)==res` guard by `guard_iff_fits` / `guard_implies_in_bounds`, a short slot by `short_slot_refused`, and the disjointness invariant is proved load-bearing by `aliasing_breaks_the_schedule` (a concrete refutation with an aliased repl). Not modelled: the rest of the eligibility routing (every refusal is the unchanged plain path) and the array length bookkeeping.
+| `ShIR_TextOps_Param` | the PARAMETER-EXPANSION shapes and `cut`'s field selection. `presence = Unset \| Present bytes` keeps "unset" and "set but empty" apart, and the colon shapes are exactly the ones that test nullness: `${v:-w}` / `${v:=w}` (`def_colon`, with `def_colon_empty_word` — `${v:-}` IS `${v}` — and `def_colon_idempotent`), `${v-w}` / `${v=w}` (`def_plain`), `${v:+w}` / `${v+w}` (`alt_colon` / `alt_plain`), each with its non-null/null case law (`colon_pair_on_value`, `colon_pair_on_null`), `${#v}` on the same distinction (`plen_zero_iff_null`) and the conflation REFUTED (`colon_minus_is_not_plain`, `plus_plain_is_not_plus_colon`). bash's negative slices are modelled with the clamping bash does: `start_of` / `stop_of` / `slice_from` / `slice`, with `slice_nonneg` recovering the proven `take len (drop off)` meaning, `slice_from_last_n` (`${v: -n}`), `slice_negative_length` (`${v:0:-n}`), both past-the-end clamps, and three refutations (`negative_offset_is_not_zero`, `negative_length_is_not_ignored`, `negative_length_is_not_a_prefix`). `cut`'s `-fN`, `-fN-M`, `-fN-`, `-f1,3`, `--complement` and `-o` are selectors over the field list: `select` filters the field INDICES (`select_subset`, `select_length_le`, `select_all_range`), `select_not` is the complement (`complement_lengths`), `intercalate` is the output delimiter (`splice_single`, `splice_three`), and the plausible-but-wrong readings are refuted (`order_is_input_not_argument`, `range_is_neither_first_nor_prefix`, `output_delimiter_is_not_appended`). `intercalate_split_on` is the per-field byte identity of `Split` and `cut_keeps_trailing_empty_field` the trailing-delimiter case. Witnesses at concrete bytes throughout; one delimiter byte, not an IFS character set, and quoting/locale stay outside. |
 
 ```
 isabelle build -D sh2perl/docs/fm/TextOps      # HOL only, no AFP, ~30 s
@@ -105,13 +106,20 @@ node contract — "this node means this value, in every renderer" — lives.
 
 ## Open targets (stated, not yet proved)
 
-These are written out where they belong and left as explicit open targets —
-never faked with `sorry` (the session is `quick_and_dirty = false`):
+This list is EMPTY for the text-ops slice as of 2026-11-13: the last entry —
+`FieldExtract`'s `-fN-M` / `-f1,3` / `--complement` / `--output-delimiter` —
+is now theory (`ShIR_TextOps_Param`). Nothing here is faked with a
+`quick_and_dirty` escape hatch; the session builds with `quick_and_dirty =
+false` and any new gap goes back on this list as a stated target rather than
+into the theory as an unproved step.
 
-- **`FieldExtract`'s ranges and `--output-delimiter`**: the model covers
-  `-fN` only. `-fN-M`, `-fN,`, `--complement` and `-o` splicing are
-  unmodelled, so `fields: vec_field_range` and `output_delimiter` carry no
-  obligation yet.
+What is deliberately NOT on this list, because it is outside the fragment and
+is proved to be outside (rather than merely unmentioned): character classes,
+ranges, negation, extglob, brace alternation and backslash quoting
+(`fragment_is_three_constructors` and the one-byte tests in
+`ShIR_TextOps_Glob`); locale whitespace (`ShIR_TextOps_Space`); IFS as a SET
+of characters, and quoting inside an expansion word (`ShIR_TextOps_Param`) —
+this session models one delimiter byte and the whitespace class.
 
 ### Closed: the strip, sort and collapse targets (2026-11-13)
 
@@ -203,7 +211,7 @@ three that did not — `newline_strip_sound`, `uniq_lines_sound`,
 (`sort_lines_sound`). `harness/check-node-specs.pl` (workspace `harness/`) makes
 "no dangling spec" a machine check: it collects every `theorem`/`lemma`/
 `definition`/`fun` under `docs/fm` and fails on a `spec:` naming one that does
-not exist. It reports 59 resolved, 0 unstated, 0 pending, 0 dangling.
+not exist. It reports 75 resolved, 0 unstated, 0 pending, 0 dangling.
 
 - `newline_strip_sound` (`ShIR_TextOps_Strip`): the node is the trailing-run
   removal, with the run length and the prefix equation.
@@ -290,12 +298,12 @@ deliberate no-obligation form. `--map` prints the node→theorem table below and
 `--selftest` runs the five negative controls (real theorem, definition, dangling
 name, wrong session prefix, unbuilt theory).
 
-Current inventory: **59 resolved, 0 unstated, 0 pending, 0 errors**.
+Current inventory: **75 resolved, 0 unstated, 0 pending, 0 errors**.
 
-The 59 resolved specs (56 distinct theorems; `lowered_wc_sound` covers three
+The 75 resolved specs (72 distinct theorems; `lowered_wc_sound` covers three
 nodes, `strip_pre_long_star_lit` two (`cut_at`, `path_name`), and
-`field_extract`, `split`, `substitute`, `uniq_lines`, `cutset_trim` and
-`cut_at` cite several each):
+`field_extract`, `split`, `substr_extract`, `substitute`, `uniq_lines`,
+`cutset_trim` and `cut_at` cite several each):
 
 | node | theorem |
 | --- | --- |
@@ -309,7 +317,7 @@ nodes, `strip_pre_long_star_lit` two (`cut_at`, `path_name`), and
 | `field_strip` | `field_strip_no_move_on_miss` |
 | `field_strip_end` | `field_strip_end_drains_on_miss` |
 | `cutset_trim` | `cutset_trim_is_trim_by`, `cutset_trim_sound` |
-| `field_extract` | `cut_keeps_empty_field`, `field_or_empty_out_of_range` |
+| `field_extract` | `cut_keeps_empty_field`, `field_or_empty_out_of_range`, `select_subset`, `complement_lengths`, `splice_single`, `splice_three`, `order_is_input_not_argument`, `range_is_neither_first_nor_prefix`, `output_delimiter_is_not_appended`, `select_all_keeps_every_field` |
 | `address_of` | `address_of_sound` |
 | `clone_deep` | `clone_deep_sound` |
 | `counted_for` | `counted_for_sound` |
@@ -325,7 +333,7 @@ nodes, `strip_pre_long_star_lit` two (`cut_at`, `path_name`), and
 | `regexp_find` | `regexp_find_sound` |
 | `repeat_str` | `repeat_str_sound` |
 | `sort_lines` | `sort_lines_sound` |
-| `split` | `split_ws_len`, `split_ws_fields_clean` |
+| `split` | `split_ws_len`, `split_ws_fields_clean`, `intercalate_split_on`, `cut_keeps_trailing_empty_field` |
 | `str_len` | `lowered_wc_sound` |
 | `str_splice` | `str_splice_fold_sound` |
 | `read_line` | `read_line_sound` |
@@ -339,7 +347,7 @@ nodes, `strip_pre_long_star_lit` two (`cut_at`, `path_name`), and
 | `string_contains` | `string_contains_sound`, `glob_contains_sound` |
 | `string_trim` | `string_trim_sound` |
 | `substitute` | `substitute_sound`, `substitute_line_domain_sound` |
-| `substr_extract` | `substr_extract_sound` |
+| `substr_extract` | `substr_extract_sound`, `slice_nonneg`, `slice_from_last_n`, `slice_negative_length`, `negative_offset_is_not_zero`, `negative_length_is_not_ignored`, `negative_length_is_not_a_prefix` |
 | `uniq_lines` | `uniq_lines_sound`, `uniq_lines_skip_sound` |
 | `word_count` | `lowered_wc_sound` |
 
@@ -637,6 +645,56 @@ not by adding a primitive: the longest strip is the other extremum of the SAME m
 - Still out of model, and checked so: classes, ranges, negation, extglob, brace
   alternation, quoting and locale whitespace (`fragment_is_three_constructors` and the
   one-byte tests). Both strips are total and agree on a miss (identity).
+
+### The parameter shapes, the negative slices and `cut`'s ranges (2026-11-13)
+
+The prose-only areas were: `${v:-w}`-style shapes, bash's negative slices, and
+`FieldExtract`'s ranges / `--output-delimiter`. All three are now
+`ShIR_TextOps_Param`, and the open-target list is empty.
+
+**Presence, not "empty".** `presence = Unset | Present bytes` makes "unset" a
+different value from "set to the empty string", and the colon shapes are
+exactly the ones that test nullness while the plain shapes test presence.
+`def_colon_empty_word` is the law the `default-empty-fold` transform argues
+from — `${v:-}` with an empty word IS `${v}` — `def_colon_idempotent` is what
+makes `${v:=w}` a fixed point once it has fired, and `colon_pair_on_value` /
+`colon_pair_on_null` are the partition that says a `:-`/`:+` pair covers both
+cases with no overlap. `colon_minus_is_not_plain` and
+`plus_plain_is_not_plus_colon` REFUTE the conflation at a set-but-empty value,
+which is the bug that would make a renderer skip a default. These laws belong
+to the transforms (`default_empty_fold`, `copy_propagation`) rather than to a
+node, because `${v:-w}` lowers to control flow and has no node of its own;
+`param_witness` is their non-vacuity check at concrete bytes.
+
+**Negative slices.** `start_of` / `stop_of` encode bash's clamping, and
+`slice_nonneg` recovers `take len (drop off)` — the meaning `substr_extract_sound`
+already proved — so the negative forms EXTEND that model. `slice_from_last_n`
+is `${v: -n}`, `slice_negative_length` is `${v:0:-n}`,
+`slice_from_neg_clamps` / `slice_neg_len_clamps` are the past-the-end clamps,
+and `negative_offset_is_not_zero` / `negative_length_is_not_ignored` /
+`negative_length_is_not_a_prefix` refute the three readings that treat a
+negative argument as zero, as the whole string, or as a prefix length.
+
+**`cut`'s fields.** `cut_keeps_empty_field` already said empty fields stay;
+what a selector MEANS was prose. `select` filters the field INDICES in
+increasing order (`select_subset`: only input fields, `select_length_le`,
+`select_all_range`: `FRange 0 None` keeps everything), which is why
+`order_is_input_not_argument` is a theorem — `-f3,1` prints field 1 first — and
+`range_is_neither_first_nor_prefix` refutes reading a range as a prefix.
+`select_not` is `--complement` and `complement_lengths` says the two arms add
+up to exactly the field count. `-o` is `intercalate`: `splice_single` is the
+one-field case (no delimiter at all) and `output_delimiter_is_not_appended`
+refutes the trailing separator a naive join emits. `intercalate_split_on` is
+the per-field byte identity `split.node` listed as missing — joining the
+fields recovers the text — and `cut_keeps_trailing_empty_field` is the case
+that tells a `cut` split from a whitespace split.
+
+**Every theorem cited.** The presence laws and the slice laws are cited in
+the node notes and here; everything the nodes claim is a `spec:` line the
+harness resolves (`75 resolved, 0 unstated, 0 pending, 0 errors`). No theorem
+in the new theory is left as decoration: the field and slice ones are node
+specs, the presence ones are the transform obligations named above, and the
+witnesses are named in this section.
 
 ### Closed: the field cursor (2026-11-13)
 

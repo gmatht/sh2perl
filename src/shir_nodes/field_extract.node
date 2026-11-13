@@ -14,9 +14,34 @@ field fields: vec_field_range
 field suppress_no_delim: bool
 field output_delimiter: optional_string
 spec: TextOps#cut_keeps_empty_field, TextOps#field_or_empty_out_of_range
+spec: TextOps#select_subset, TextOps#complement_lengths
+spec: TextOps#splice_single, TextOps#splice_three
+spec: TextOps#order_is_input_not_argument
+spec: TextOps#range_is_neither_first_nor_prefix
+spec: TextOps#output_delimiter_is_not_appended
+spec: TextOps#select_all_keeps_every_field
 # Modelled as "the N-th field of a literal-delimiter split, or nothing", 1-based
 # like cut, keeping empty fields (a,,b with -f2 is the empty string). The
-# `fields: vec_field_range` RANGES (-fN-M, -fN, --complement) and the
-# `output_delimiter` splicing are NOT modelled yet — open targets in
-# sh2perl/docs/fm/README.md. The whitespace split is a different node's
-# meaning on purpose (ws_split_would_lose_empty_field).
+# `fields: vec_field_range` RANGES and `--complement` are now modelled too, in
+# docs/fm/TextOps/ShIR_TextOps_Param.thy, over the field list `split_on` of
+# ShIR_TextOps_Compose: a selector is `FOne n` or `FRange a (Some b)` / `FRange a
+# None` (`-fN`, `-fN-M`, `-fN-`), a selector LIST is `-f1,3`, and the selection
+# is the filter of the field INDICES in increasing order, so
+#   * `select_subset` — every selected field is a field of the input (nothing is
+#     invented, nothing is duplicated);
+#   * `select_all_range` — `FRange 0 None` keeps every field, and
+#     `complement_lengths` — `--complement` (`select_not`) plus the selection
+#     accounts for EXACTLY the field count, so the two arms partition it;
+#   * `order_is_input_not_argument` REFUTES the reading that fields come out in
+#     the order the `-f` argument listed them (`-f3,1` prints field 1 first):
+#     the output follows the input, which is why the node is a filtered sublist
+#     and not a per-selector concatenation;
+#   * `select_is_not_a_take` refutes reading a range as a prefix of the fields.
+# `output_delimiter` is modelled as `intercalate`: the delimiter goes BETWEEN
+# the selected fields, so `splice_single` says a one-field selection carries no
+# delimiter at all (`output_delimiter_is_not_appended` refutes appending one) and
+# `splice_three` pins the interleaving. The whitespace split is a different
+# node's meaning on purpose (ws_split_would_lose_empty_field).
+# BOUNDARY, proved: this is ONE delimiter byte (`split_on` takes a `nat`), not an
+# IFS character SET, and the field text is taken literally — quoting, classes and
+# brace alternation are outside the fragment (TextOps#fragment_is_three_constructors).
