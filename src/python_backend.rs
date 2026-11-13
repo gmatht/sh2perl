@@ -146,6 +146,23 @@ pub struct Render {
     /// CARRIES ON (verified: `echo "${!p*[@]:0:3}"` prints nothing and the
     /// next line still runs), so the statement's lines are dropped too
     badsub_hit: bool,
+    /// `typeset -n ref=target` / `declare -n`: a nameref is an ALIAS, so
+    /// every read and write of `ref` lands on `target` (resolved in
+    /// [`Self::py_ident`]). Empty unless the script declares one.
+    namerefs: std::collections::HashMap<String, String>,
+    /// the program reads `PIPESTATUS`, so a pipeline must report every
+    /// stage's status, not just the last one (`bash -c` hides the rest).
+    need_pipestatus: bool,
+    /// emits `__sh_ps_run` (the PIPESTATUS-collecting seam)
+    need_pipestatus_run: bool,
+    /// emits `__sh_arith_dollar` (bash's TEXTUAL `$1` substitution inside
+    /// an arithmetic expression, where an unset positional leaves `+ 0`)
+    need_arith_dollar: bool,
+    /// function definitions seen so far, for `typeset -f NAME`
+    func_bodies: std::collections::HashMap<String, Vec<IrStmt>>,
+    /// attributes a name was declared with (`typeset -ir x` → "ir"), for
+    /// `typeset -p NAME` — bash prints them back as `declare -ir x="v"`
+    decl_flags: std::collections::HashMap<String, String>,
     /// needs the `__sh_ok` fallible-builtin wrapper (`cd` to a missing
     /// dir raises; bash records rc 1 and continues)
     need_ok: bool,
@@ -797,6 +814,11 @@ impl Render {
         ("__sh_bash", &[]),
         ("__sh_bash_in", &[]),
         ("__sh_pipe_status", &["__sh_bash"]),
+        // the PIPESTATUS-collecting seam and bash's textual `$1` arithmetic
+        // substitution both wrap `__sh_bash`, so the group is emitted only
+        // when one of them is referenced.
+        ("__sh_ps_run", &["__sh_bash"]),
+        ("__sh_arith_dollar", &["__sh_bash"]),
         ("__sh_cap", &[]),
         ("__sh_declare_parse", &[]),
         ("__sh_source", &["__sh_declare_parse"]),
@@ -1095,7 +1117,20 @@ impl Render {
     }
 
     fn py_ident(&self, name: &str) -> String {
-        Self::py_mangle(name)
+        // `typeset -n ref=target` makes `ref` an alias for `target`: bash
+        // reads AND writes through it, so resolve the indirection once,
+        // here, instead of at every read/write site (typeset-cmdsub's
+        // `ref="Changed via ref"` must land on `original`). Chained
+        // references are rare but legal (`-n a=b; -n b=c`); follow at
+        // most a few hops so a cycle cannot hang the renderer.
+        let mut cur = name;
+        for _ in 0..8 {
+            match self.namerefs.get(cur) {
+                Some(t) => cur = t.as_str(),
+                None => break,
+            }
+        }
+        Self::py_mangle(cur)
     }
 
     fn py_str(s: &str) -> String {
@@ -2616,6 +2651,34 @@ impl Render {
             i += 1;
         }
         out
+    }
+
+    /// True when an arithmetic source text reads a POSITIONAL parameter
+    /// (`$1`, `${12}`) and nothing else that needs the python side
+    /// (`$( … )` captures keep the native path — they are already lowered).
+    fn arith_mentions_positional(text: &str) -> bool {
+        let b: Vec<char> = text.chars().collect();
+        let mut i = 0;
+        while i + 1 < b.len() {
+            if b[i] == '$' {
+                if b[i + 1] == '(' {
+                    // a capture (or nested `$(( ))`) — leave it to the
+                    // native renderer
+                    return false;
+                }
+                if b[i + 1].is_ascii_digit() {
+                    return true;
+                }
+                if b[i + 1] == '{' {
+                    let rest: String = b[i + 2..].iter().take_while(|c| **c != '}').collect();
+                    if !rest.is_empty() && rest.chars().all(|c| c.is_ascii_digit()) {
+                        return true;
+                    }
+                }
+            }
+            i += 1;
+        }
+        false
     }
 
     fn arith(&mut self, a: &ArithAst) -> String {
@@ -4784,6 +4847,30 @@ impl Render {
             // common `$name` form is a native int() read of the binding.
             "arith" => {
                 if let Some(IrExpr::Str(raw, _)) = args.first() {
+                    // `$1` (or `${1}`) inside an arithmetic expression: bash
+                    // substitutes the parameter TEXT before parsing, so an
+                    // unset positional can leave `+ 0` (valid, 0) or
+                    // `* 100 +` (syntax error). Both halves are observable
+                    // and the parsed tree cannot tell them apart, so the
+                    // ORIGINAL text goes to bash (`n=$(($1 + 0))` is 0 with
+                    // no $1; `$(($1 * 100 + $2))` fails).
+                    if Self::arith_mentions_positional(raw) {
+                        self.need_arith_dollar = true;
+                        self.need_subprocess = true;
+                        // the helper raises `__ShExpandError`, which the
+                        // statement guard catches
+                        self.need_strict = true;
+                        let argv = if self.in_function > 0 {
+                            "list(_sh_args)"
+                        } else {
+                            "list(sys.argv[1:])"
+                        };
+                        self.need_sys = true;
+                        return format!(
+                            "__sh_arith_dollar({}, {argv})",
+                            Self::py_str(raw)
+                        );
+                    }
                     let s = &self.arith_bind(raw);
                     if let Some(name) = s.strip_prefix('$') {
                         if Self::is_plain_name(name) && !self.store_written.contains(name) {
@@ -5560,16 +5647,27 @@ impl Render {
     /// skipped and the loop read real (empty) stdin (063_11).
     fn cond_reads_stdin(cond: &IrExpr) -> bool {
         match cond {
-            IrExpr::Call { func, args } if func == "block" => args
-                .get(1)
-                .map(|a| match a {
+            IrExpr::Call { func, args } if func == "block" => {
+                // `block(Arrow[env, test])` (063_11's `IFS= read … && …`)
+                // keeps the test as the LAST statement of its single Arrow,
+                // so look there when there is no second argument.
+                let test = match (args.get(1), args.first()) {
+                    (Some(other), _) => Some(other),
+                    (None, Some(IrExpr::Arrow(b))) => match b.last() {
+                        Some(IrStmt::Expr(e)) => Some(e),
+                        _ => None,
+                    },
+                    _ => None,
+                };
+                test.map(|a| match a {
                     IrExpr::Arrow(b) => match b.as_slice() {
                         [IrStmt::Expr(e)] => Self::cond_reads_stdin(e),
                         _ => false,
                     },
                     other => Self::cond_reads_stdin(other),
                 })
-                .unwrap_or(false),
+                .unwrap_or(false)
+            }
             IrExpr::BinOp { lhs, .. } => Self::cond_reads_stdin(lhs),
             IrExpr::Call { func, args } if func == "exec" || func == "builtin" => {
                 matches!(args.first(), Some(IrExpr::Str(c, _)) if c == "read")
@@ -5748,10 +5846,14 @@ impl Render {
         if all_shell && !parts.is_empty() {
             self.need_subprocess = true;
             let (env, pos) = (self.bash_env(), self.bash_pos());
-            return Some(format!(
-                "__sh_bash({}, {pos}, {env})",
-                Self::py_str(&parts.join(" | "))
-            ));
+            let text = Self::py_str(&parts.join(" | "));
+            if self.need_pipestatus {
+                // the program reads PIPESTATUS: run the pipeline through the
+                // seam that also reports every stage's status
+                self.need_pipestatus_run = true;
+                return Some(format!("__sh_ps_run({text}, {pos}, {env})"));
+            }
+            return Some(format!("__sh_bash({text}, {pos}, {env})"));
         }
         // mixed path: a natively-renderable echo head feeds shell-textable
         // rest stages (062_05's `echo … | tr | grep`).
@@ -6154,6 +6256,37 @@ impl Render {
                         return self.body_shell_text(&conv);
                     }
                     return None;
+                }
+                // the lowered `echo …` / `printf '%s' …` form: shell text
+                // again, so a definition can be printed back
+                IrStmt::Output { value, newline, target } => {
+                    if target.is_some() {
+                        return None;
+                    }
+                    let w = self.def_word(value)?;
+                    if *newline {
+                        parts.push(format!("echo {w}"));
+                    } else {
+                        parts.push(format!("printf '%s' {w}"));
+                    }
+                }
+                // `local x=5` / `declare -i n=0` in a function body
+                IrStmt::Declare { vars, init, local } => {
+                    let d = vars.first()?;
+                    let mut one = if *local {
+                        format!("local {}", d.name)
+                    } else {
+                        format!("declare {}", d.name)
+                    };
+                    if let Some(v) = init {
+                        let rhs = match v {
+                            IrExpr::Str(s, _) => s.clone(),
+                            other => self.sh_arg(other)?,
+                        };
+                        one.push('=');
+                        one.push_str(&rhs);
+                    }
+                    parts.push(one);
                 }
                 IrStmt::Assign { targets, expr, .. } => {
                     let var = targets.first()?.var.clone();
@@ -7023,6 +7156,33 @@ impl Render {
         }
     }
 
+    /// Translate POSIX bracket-classes to their python equivalents so a
+    /// bash ERE means the same thing under `re`. Unknown classes are left
+    /// alone (a literal `[[:foo:]]` matches nothing in bash either).
+    fn posix_regex(pat: &str) -> String {
+        let mut out = pat.to_string();
+        // raw strings: no escape doubling, so the python pattern keeps a
+        // single backslash and the bracket classes stay valid ERE-ish text
+        let table: [(&str, &str); 12] = [
+            ("[:space:]", r"\s"),
+            ("[:blank:]", r"[ \t]"),
+            ("[:digit:]", r"\d"),
+            ("[:alpha:]", r"[A-Za-z]"),
+            ("[:alnum:]", r"[A-Za-z0-9]"),
+            ("[:upper:]", r"[A-Z]"),
+            ("[:lower:]", r"[a-z]"),
+            ("[:xdigit:]", r"[0-9A-Fa-f]"),
+            ("[:punct:]", r"[!-/:-@\[-`{-~]"),
+            ("[:cntrl:]", r"[\x00-\x1f\x7f]"),
+            ("[:print:]", r"[\x20-\x7e]"),
+            ("[:graph:]", r"[\x21-\x7e]"),
+        ];
+        for (posix, py) in table {
+            out = out.replace(posix, py);
+        }
+        out
+    }
+
     /// Mini `[ ... ]` evaluator for the common patterns; None → stub.
     /// Render a test string. `dbl` is whether the source was `[[ ]]`
     /// (only there does `==` glob-match; `[ ]` compares literally —
@@ -7050,7 +7210,13 @@ impl Render {
                 let va = self.test_value(a);
                 let pat = b.trim_matches('"');
                 self.need_re = true;
-                Some(format!("bool(re.search({}, str({va})))", Self::py_str(pat)))
+                // POSIX character classes are NOT python classes: `re`
+                // reads `[[:space:]]` as a set of literal characters
+                // (`:` `s` `p` …), so `[[ $line =~ ^[[:space:]]*# ]]`
+                // matched every line containing an `s` (063_11 skipped its
+                // whole input). Translate the classes bash defines.
+                let pat = Self::posix_regex(pat);
+                Some(format!("bool(re.search({}, str({va})))", Self::py_str(&pat)))
             }
             [a, op, b] => {
                 let py_op = match op.as_str() {
@@ -8074,6 +8240,108 @@ impl Render {
     /// `listVar("@")` Call (the whole positional set), not an Array, so it
     /// never reaches the Array arm's splice; render it as the call's own
     /// `_sh_args` instead of the sh2.listVar stub.
+    /// Is this statement a `read` (in any of the three spellings the
+    /// frontend uses for a builtin)?
+    fn stmt_is_read(st: &IrStmt) -> bool {
+        match st {
+            IrStmt::Expr(e) => Self::expr_is_read(e),
+            _ => false,
+        }
+    }
+
+    fn expr_is_read(e: &IrExpr) -> bool {
+        match e {
+            IrExpr::Call { func, args } => {
+                func == "read"
+                    || (matches!(func.as_str(), "exec" | "builtin")
+                        && matches!(args.first(), Some(IrExpr::Str(c, _)) if c == "read"))
+            }
+            // the condition arrives as the AND chain, `read` on its left
+            // spine (`IFS= read -r line && [ -n "$line" ] && (( … ))`)
+            IrExpr::BinOp {
+                op: crate::ir::BinOpKind::And,
+                lhs,
+                ..
+            } => Self::expr_is_read(lhs),
+            _ => false,
+        }
+    }
+
+    /// The attributes a declaration gives `name`, in bash's canonical
+    /// order, merged with whatever an earlier declaration recorded.
+    fn decl_attrs(&self, items: &[IrExpr], name: &str) -> String {
+        let mut fl: Vec<char> = items
+            .iter()
+            .filter_map(|it| match it {
+                IrExpr::Str(f, _) if f.starts_with('-') && f.len() > 1 => {
+                    Some(f.chars().skip(1).collect::<Vec<char>>())
+                }
+                _ => None,
+            })
+            .flatten()
+            .collect();
+        fl.sort();
+        fl.dedup();
+        let prev = self.decl_flags.get(name).cloned().unwrap_or_default();
+        "aAfFgilnrtux"
+            .chars()
+            .filter(|c| fl.contains(c) || prev.contains(*c))
+            .collect()
+    }
+
+    /// One word as `declare -f` prints it: the SOURCE spelling, so a
+    /// double-quoted string keeps its quotes and an interpolated word
+    /// stays `"x=$x"` rather than a shell-escaped concatenation.
+    fn def_word(&self, e: &IrExpr) -> Option<String> {
+        match e {
+            IrExpr::Str(s, st) => Some(match st {
+                crate::ir::StrStyle::DoubleQuoted => format!("\"{s}\""),
+                crate::ir::StrStyle::SingleQuoted => format!("'{s}'"),
+                _ => Self::sh_quote(s),
+            }),
+            IrExpr::Interpolate(parts) => {
+                let mut out = String::from("\"");
+                for part in parts {
+                    match part {
+                        InterpPart::Lit(t) => out.push_str(t),
+                        InterpPart::Expr(x) => match &**x {
+                            IrExpr::Call { func, args } if func == "getVar" => {
+                                match args.first() {
+                                    Some(IrExpr::Str(n, _)) => {
+                                        out.push('$');
+                                        out.push_str(n);
+                                    }
+                                    _ => out.push_str(&self.sh_arg(x)?),
+                                }
+                            }
+                            other => out.push_str(&self.sh_arg(other)?),
+                        },
+                    }
+                }
+                out.push('"');
+                Some(out)
+            }
+            other => self.sh_arg(other),
+        }
+    }
+
+    /// `declare -f` output for a function: the body rendered back as shell
+    /// source, one command per line, `;`-terminated except the last.
+    fn func_definition_text(&mut self, name: &str, body: &[IrStmt]) -> Option<String> {
+        let mut lines: Vec<String> = Vec::new();
+        let n = body.len();
+        for (i, st) in body.iter().enumerate() {
+            let t = self.body_shell_text(std::slice::from_ref(st))?;
+            let t = t.trim_end_matches('\n');
+            lines.push(if i + 1 < n {
+                format!("    {t};")
+            } else {
+                format!("    {t}")
+            });
+        }
+        Some(format!("{} () \n{{ \n{}\n}}", name, lines.join("\n")))
+    }
+
     fn array_init_expr(&mut self, e: &IrExpr) -> String {
         if let IrExpr::Call { func, args } = e {
             if func == "listVar" {
@@ -8099,8 +8367,51 @@ impl Render {
             Some(IrExpr::Array(elems)) => elems,
             _ => return "None".into(),
         };
+        // `typeset -f NAME` prints the definition, `-F NAME` just the name
+        // (bash's `declare -f` format: `name () ` / `{ ` / the body with
+        // each command but the last terminated by `;` / `}`).
+        if let Some(flag) = items.iter().find_map(|it| match it {
+            IrExpr::Str(s, _) if s == "-f" || s == "-F" => Some(s.clone()),
+            _ => None,
+        }) {
+            let target = items.iter().find_map(|it| match it {
+                IrExpr::Str(s, _) if Self::is_plain_name(s) => Some(s.clone()),
+                _ => None,
+            });
+            if let Some(nm) = target {
+                if let Some(body) = self.func_bodies.get(&nm).cloned() {
+                    if flag == "-F" {
+                        self.emit(&format!("print({})", Self::py_str(&nm)));
+                    } else if let Some(text) = self.func_definition_text(&nm, &body) {
+                        self.emit(&format!("print({})", Self::py_str(&text)));
+                    }
+                }
+            }
+            return "None".into();
+        }
+        // `typeset -p NAME` echoes the declaration bash holds, in its
+        // canonical attribute order (`declare -ir printtest="99"`).
+        if items.iter().any(|it| matches!(it, IrExpr::Str(s, _) if s == "-p")) {
+            if let Some(nm) = items.iter().find_map(|it| match it {
+                IrExpr::Str(s, _) if Self::is_plain_name(s) => Some(s.clone()),
+                _ => None,
+            }) {
+                let attrs = self.decl_flags.get(&nm).cloned().unwrap_or_default();
+                let py = self.py_ident(&nm);
+                self.emit(&format!(
+                    "print({} + chr(34) + str(globals().get({}, \"\")) + chr(34))",
+                    Self::py_str(&format!("declare -{attrs} {nm}=")),
+                    Self::py_str(&py)
+                ));
+            }
+            return "None".into();
+        }
         let mut is_assoc = false;
         let mut is_array = false;
+        // `typeset -n ref=target` — a NAME REFERENCE, not an assignment:
+        // record the alias so every later read/write of `ref` resolves to
+        // `target` (typeset-cmdsub writes through it).
+        let mut is_nameref = false;
         for (i, item) in items.iter().enumerate() {
             // `declare -a arr=(a b)` keeps the initializer as a setArray
             // Call item, not a `name=value` string: assign the list home
@@ -8121,6 +8432,42 @@ impl Render {
                         // `m[key]=v` a TypeError (063_09).
                         if is_assoc && elems == "[]" {
                             self.emit(&format!("{name_py} = {{}}"));
+                        } else if is_assoc {
+                            // `typeset -A a=([k]=v [k2]=v2)`: the words ARE
+                            // key/value pairs — keep the dict bash built
+                            // instead of dropping the keys into a list
+                            // (typeset-cmdsub read "" for every key).
+                            let mut pairs: Vec<String> = Vec::new();
+                            let mut pure = true;
+                            if let Some(IrExpr::Array(items)) = args.get(1) {
+                                for it in items {
+                                    match it {
+                                        IrExpr::Str(s, _) if s.starts_with('[') => {
+                                            if let Some(eq) = s.find("]=") {
+                                                pairs.push(format!(
+                                                    "{}: {}",
+                                                    Self::py_str(&s[1..eq]),
+                                                    Self::py_str(&s[eq + 2..])
+                                                ));
+                                            } else {
+                                                pure = false;
+                                                break;
+                                            }
+                                        }
+                                        _ => {
+                                            pure = false;
+                                            break;
+                                        }
+                                    }
+                                }
+                            } else {
+                                pure = false;
+                            }
+                            if pure {
+                                self.emit(&format!("{name_py} = {{{}}}", pairs.join(", ")));
+                            } else {
+                                self.emit(&format!("{name_py} = list({elems})"));
+                            }
                         } else {
                             self.emit(&format!("{name_py} = list({elems})"));
                         }
@@ -8152,13 +8499,31 @@ impl Render {
                             } else if upper {
                                 rhs = format!("str({rhs}).upper()");
                             }
-                            self.emit(&format!("{name_py} = {rhs}"));
+                            // `typeset -g x=v` inside a function declares a
+                            // GLOBAL: a plain assignment would bind a local
+                            // (`global_var` was a NameError outside
+                            // set_global).
+                            let is_global = items[..i].iter().any(|it| {
+                                matches!(it, IrExpr::Str(f, _) if f == "-g")
+                            });
+                            if is_global && self.in_function > 0 {
+                                self.emit(&format!(
+                                    "globals()[{}] = {rhs}",
+                                    Self::py_str(nm)
+                                ));
+                            } else {
+                                self.emit(&format!("{name_py} = {rhs}"));
+                            }
                             continue;
                         }
                     }
                 }
             }
             if let IrExpr::Str(s, _) = item {
+                if s == "-n" {
+                    is_nameref = true;
+                    continue;
+                }
                 if s == "-i" || s == "-r" || s == "-a" || s == "-A" {
                     if s == "-i" {
                         is_int = true;
@@ -8174,9 +8539,17 @@ impl Render {
                 if let Some(eq) = s.find('=') {
                     let name = &s[..eq];
                     let val = &s[eq + 1..];
+                    if is_nameref && Self::is_plain_name(name) && Self::is_plain_name(val) {
+                        // the value names the TARGET, it is not data
+                        self.namerefs.insert(name.to_string(), val.to_string());
+                        continue;
+                    }
                     if Self::is_plain_name(name) {
                         let name_py = self.py_ident(name);
                         self.written.insert(name.to_string());
+                        // remember the attributes for `typeset -p`
+                        let attrs = self.decl_attrs(items, name);
+                        self.decl_flags.insert(name.to_string(), attrs);
                         if is_assoc {
                             self.assoc.insert(name.to_string());
                         }
@@ -8196,6 +8569,10 @@ impl Render {
                     // must exist before its subscripts are written.
                     let name_py = self.py_ident(s);
                     self.written.insert(s.to_string());
+                    // `typeset -r name` adds an attribute to an existing
+                    // variable: `typeset -p` prints the union.
+                    let attrs = self.decl_attrs(items, s);
+                    self.decl_flags.insert(s.to_string(), attrs);
                     if is_assoc {
                         self.assoc.insert(s.to_string());
                         self.emit(&format!("{name_py} = {{}}"));
@@ -9029,7 +9406,7 @@ impl Render {
                 // a failed `$(( ))` expansion aborts the whole command
                 // (bash prints nothing, rc 1 — parse-dollar-in-arithmetic):
                 // guard the statement when it evaluates one.
-                if x.contains("__sh_strict(") {
+                if x.contains("__sh_strict(") || x.contains("__sh_arith_dollar(") {
                     self.emit("try:");
                     self.depth += 1;
                     self.emit(&x);
@@ -9431,24 +9808,55 @@ impl Render {
                 let mut cond: &IrExpr = cond;
                 if let IrExpr::Call { func, args } = cond {
                     if func == "block" {
-                        if let Some(IrExpr::Arrow(pre)) = args.first() {
-                            for pst in pre {
-                                if let IrStmt::Expr(IrExpr::Call { args: a2, .. }) = pst {
-                                    if let Some(IrExpr::Object(props)) = a2.get(2) {
-                                        for (k, v) in props {
-                                            if k == "IFS" {
-                                                if let IrExpr::Str(sv, _) = v {
-                                                    cond_env_ifs = Some(sv.clone());
-                                                }
+                        // `block(Arrow[env-carrier, test])` is the ONE-
+                        // argument spelling: 063_11's
+                        // `IFS= read -r line && [ … ] && (( … ))` puts the
+                        // env carrier and the test in a single Arrow, so
+                        // the last statement is the test and the rest are
+                        // carriers. `block(Arrow[pre], Arrow[test])` splits
+                        // them across two arguments.
+                        // Only a READ loop may unwrap the block: the last
+                        // statement is then the test and the rest are env
+                        // carriers. In any other multi-command condition
+                        // (`while echo checking…; test -f f; do`) the other
+                        // commands are side effects that run every
+                        // iteration, so unwrapping dropped them and the
+                        // loop printed nothing (parse-multi-command-while-
+                        // condition).
+                        let any_read = args.iter().any(|a| match a {
+                            IrExpr::Arrow(ab) => ab.iter().any(Self::stmt_is_read),
+                            _ => false,
+                        });
+                        let mut pres: Vec<&IrStmt> = Vec::new();
+                        if any_read {
+                            if let Some(IrExpr::Arrow(ab)) = args.first() {
+                                if args.len() >= 2 || ab.is_empty() {
+                                    pres.extend(ab.iter());
+                                } else {
+                                    let (last, init) = ab.split_last().unwrap();
+                                    pres.extend(init.iter());
+                                    if let IrStmt::Expr(e) = last {
+                                        cond = e;
+                                    }
+                                }
+                            }
+                            if let Some(IrExpr::Arrow(ab)) = args.get(1) {
+                                if let [IrStmt::Expr(e)] = ab.as_slice() {
+                                    cond = e;
+                                }
+                            }
+                        }
+                        for pst in pres {
+                            if let IrStmt::Expr(IrExpr::Call { args: a2, .. }) = pst {
+                                if let Some(IrExpr::Object(props)) = a2.get(2) {
+                                    for (k, v) in props {
+                                        if k == "IFS" {
+                                            if let IrExpr::Str(sv, _) = v {
+                                                cond_env_ifs = Some(sv.clone());
                                             }
                                         }
                                     }
                                 }
-                            }
-                        }
-                        if let Some(IrExpr::Arrow(ab)) = args.get(1) {
-                            if let [IrStmt::Expr(e)] = ab.as_slice() {
-                                cond = e;
                             }
                         }
                     }
@@ -9472,7 +9880,22 @@ impl Render {
                         carriers.push(r2);
                         left = l2;
                     }
-                    if matches!(left, IrExpr::Call { func, .. } if func == "read") {
+                    // the statement dialect spells a builtin `read` as
+                    // `Call{exec,"read"}` / `Call{builtin,"read"}`, so the
+                    // driver test must accept all three spellings
+                    // (063_11's `while IFS= read -r line && …`).
+                    let is_read = match left {
+                        IrExpr::Call { func, args } => {
+                            func == "read"
+                                || (matches!(func.as_str(), "exec" | "builtin")
+                                    && matches!(
+                                        args.first(),
+                                        Some(IrExpr::Str(c, _)) if c == "read"
+                                    ))
+                        }
+                        _ => false,
+                    };
+                    if is_read {
                         cond = left;
                         let mut acc: Option<IrExpr> = None;
                         for c in carriers.iter().rev() {
@@ -9672,6 +10095,10 @@ impl Render {
                 self.emit(&format!("sys.exit({code})"));
             }
             IrStmt::Function { name, body, .. } => {
+                // `typeset -f NAME` / `declare -f NAME` prints this body back
+                // as shell source, so remember it (bash only lists functions
+                // that are DEFINED at that point, and so does this map).
+                self.func_bodies.insert(name.clone(), body.clone());
                 let n = self.py_ident(name);
                 // bash functions take any number of args ($1…); python
                 // defs must declare for them — `*_sh_args` keeps arity
@@ -10424,6 +10851,51 @@ impl Render {
         // `def f(): ...` would rebind the function object and the later
         // `f(...)` call would hit the string. (py frontend t22 — the
         // `exec(f, [])` call registers as a var read of `f`.)
+        // PIPESTATUS has to be handled by the pipeline seam, which renders
+        // before the read can reveal the need: decide from the collected
+        // names (a bare `${PIPESTATUS[0]}` read lands here).
+        if vars.contains("PIPESTATUS") {
+            self.need_pipestatus = true;
+        }
+        // A `${PIPESTATUS[0]}` read never becomes a declared variable: the
+        // element reader takes the NAME and looks it up in the runtime
+        // globals, so `vars` does not carry it. The pipeline renders
+        // BEFORE that read can reveal the need, so look for the literal in
+        // the program's own text (a compile-time scan, not output).
+        if !self.need_pipestatus && format!("{:?}", prog.stmts).contains("PIPESTATUS") {
+            self.need_pipestatus = true;
+        }
+        // `typeset -f NAME` prints a definition that may be rendered AFTER
+        // the printing statement (functions emit into their own buffer), so
+        // collect every definition up front.
+        {
+            fn collect_fns(stmts: &[IrStmt], out: &mut std::collections::HashMap<String, Vec<IrStmt>>) {
+                for st in stmts {
+                    match st {
+                        IrStmt::Function { name, body, .. } => {
+                            out.insert(name.clone(), body.clone());
+                        }
+                        IrStmt::Block(b) | IrStmt::Subshell(b) => collect_fns(b, out),
+                        IrStmt::If { then, elsifs, else_, .. } => {
+                            collect_fns(then, out);
+                            for (_, b) in elsifs {
+                                collect_fns(b, out);
+                            }
+                            collect_fns(else_, out);
+                        }
+                        IrStmt::While { body, .. }
+                        | IrStmt::For { body, .. }
+                        | IrStmt::DoWhile { body, .. } => collect_fns(body, out),
+                        _ => {}
+                    }
+                }
+            }
+            collect_fns(&prog.stmts, &mut self.func_bodies);
+            // the shell frontend keeps definitions in `subs`, not stmts
+            for sub in &prog.subs {
+                self.func_bodies.insert(sub.name.clone(), sub.body.clone());
+            }
+        }
         let mut fn_names: BTreeSet<String> = BTreeSet::new();
         collect_fn_names(&prog.stmts, &mut fn_names);
         self.fn_names = fn_names.iter().cloned().collect();
@@ -11072,6 +11544,26 @@ impl Render {
             self.emit("            __i += 1");
             self.emit("        p = ''.join(__o)");
             self.emit("    p = p.replace(chr(0), \"\")");
+            // bash negates a bracket expression with `[^…]`; fnmatch
+            // spells that `[!…]`, so `[^}]` was read as "a `^` or a `}`"
+            // and every `${…}` pattern missed (063_11).
+            self.emit("    if \"[^\" in p:");
+            self.emit("        p = p.replace(\"[^\", \"[!\")");
+            // A backslash QUOTES the next character in a shell pattern
+            // (`*\(*` is a literal paren); fnmatch has no such escape, it
+            // would look for a backslash. Spell the quoted character as a
+            // one-element bracket expression, which fnmatch folds back to
+            // the literal (063_11's case patterns never matched).
+            self.emit("    if chr(92) in p:");
+            self.emit("        __o, __i = [], 0");
+            self.emit("        while __i < len(p):");
+            self.emit("            if p[__i] == chr(92) and __i + 1 < len(p) and p[__i + 1] not in ']-':");
+            self.emit("                __o.append('[' + p[__i + 1] + ']')");
+            self.emit("                __i += 2");
+            self.emit("                continue");
+            self.emit("            __o.append(p[__i])");
+            self.emit("            __i += 1");
+            self.emit("        p = ''.join(__o)");
             self.emit("    st = globals().get(\"__sh_shopt_state\") or {}");
             self.emit("    if st.get(\"nocasematch\"):");
             self.emit("        s, p = s.lower(), p.lower()");
@@ -11280,10 +11772,14 @@ impl Render {
             // The process-substitution temps (`__ps_tmpN`, the staged
             // paths `bash -c` seams read as `$__ps_tmpN`) are shell
             // variables too — same rule as `___tN` above.
-            self.emit("        if (_k.startswith(\"___\") or _k.startswith(\"__ps_tmp\") or not _k.startswith(\"__\")) and isinstance(_v, (str, int, float)):");
+            // PIPESTATUS is bash's own: a child that INHERITS the name
+            // stops updating it (measured: `PIPESTATUS= bash -c 'false |
+            // true; echo ${PIPESTATUS[*]}'` prints nothing), so the
+            // pipeline seam could never read the statuses back.
+            self.emit("        if _k != 'PIPESTATUS' and (_k.startswith(\"___\") or _k.startswith(\"__ps_tmp\") or not _k.startswith(\"__\")) and isinstance(_v, (str, int, float)):");
             self.emit("            e[_k] = str(_v)");
             self.emit("    for _k, _v in list(globals().items()):");
-            self.emit("        if not _k.startswith(\"_\") and isinstance(_v, list):");
+            self.emit("        if not _k.startswith(\"_\") and _k != 'PIPESTATUS' and isinstance(_v, list):");
             self.emit("            e[\"__SH_ARR_\" + _k] = \"\\x1f\".join(str(x) for x in _v)");
             self.emit("    for _s, _p in __sh_names.items():");
             self.emit("        if _p in globals():");
@@ -11314,6 +11810,48 @@ impl Render {
             self.emit("    full = text if not pos else \"set -- \" + \" \".join(shlex.quote(str(a)) for a in pos) + \"; \" + text");
             self.emit("    full = pre + full");
             self.emit("    return subprocess.run([\"bash\", \"-c\", full], env=e, stdout=subprocess.PIPE)");
+            if self.need_pipestatus_run {
+                // Every stage's status, not just the last one: the seam is a
+                // single `bash -c`, so only the child can see PIPESTATUS —
+                // append a dump of it to a temp file while the pipeline's
+                // status array is still live, then adopt it here.
+                self.emit("def __sh_ps_run(text, pos=(), env=None):");
+                self.emit("    import os, tempfile");
+                self.emit("    global PIPESTATUS");
+                self.emit("    _fd, _p = tempfile.mkstemp()");
+                self.emit("    os.close(_fd)");
+                self.emit("    try:");
+                self.emit("        _r = __sh_bash(text + chr(59) + ' printf ' + chr(39) + '%s' + chr(92) + 'n' + chr(39) + ' ' + chr(34) + '${PIPESTATUS[@]}' + chr(34) + ' > ' + chr(39) + _p + chr(39), pos, env)");
+                self.emit("        try:");
+                self.emit("            with open(_p) as _f:");
+                self.emit("                PIPESTATUS = [int(_x) for _x in _f.read().split()]");
+                self.emit("        except (OSError, ValueError):");
+                self.emit("            PIPESTATUS = []");
+                self.emit("    finally:");
+                self.emit("        try:");
+                self.emit("            os.unlink(_p)");
+                self.emit("        except OSError:");
+                self.emit("            pass");
+                self.emit("    return _r");
+            }
+            if self.need_arith_dollar {
+                // bash substitutes a positional into an arithmetic
+                // expression TEXTUALLY, so an unset `$1` disappears and
+                // leaves `+ 0` (0) or `* 100 +` (syntax error). The parsed
+                // tree cannot show that difference, so let bash evaluate
+                // the original text; a failed expansion yields "" like the
+                // failed `$( … )` it stands in for.
+                self.emit("def __sh_arith_dollar(text, argv=()):");
+                self.emit("    try:");
+                self.emit("        _r = __sh_bash('printf %s ' + chr(34) + '$(( ' + text + ' ))' + chr(34) + ' 2>/dev/null', tuple(argv))");
+                self.emit("    except OSError:");
+                self.emit("        return \"\"");
+                self.emit("    if _r.returncode != 0:");
+                // a failed `$(( ))` aborts the whole command, exactly like
+                // the strict-operand path (bash prints nothing, rc 1)
+                self.emit("        raise __ShExpandError()");
+                self.emit("    return _r.stdout.decode()");
+            }
             self.emit("def __sh_bash_in(text, pos, env, data):");
             self.emit("    import subprocess, shlex, sys, os");
             self.emit("    sys.stdout.flush()");
