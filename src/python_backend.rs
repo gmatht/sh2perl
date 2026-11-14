@@ -5812,31 +5812,111 @@ impl Render {
                     }
                 };
                 if let IrExpr::Call { func, args } = call {
-                    if func == "exec" || func == "builtin" {
-                        if let Some(argv) = self.shell_argv(args) {
-                            let mut text = argv.join(" ");
-                            if let Some(redirs) = redirs {
-                                let mut ok = true;
-                                for r in redirs {
-                                    match self.irredirect_text(r) {
-                                        Some(t) => {
-                                            text.push(' ');
-                                            text.push_str(&t);
+                    // A SUBSHELL stage keeps its own shell text: `( list )`.
+                    // Lowering it in-process lands on the unsupported-shape
+                    // stub (`sh2.subshell` → exit 2), while bash runs the
+                    // real thing — including the fd juggling that makes the
+                    // stage unlowerable in the first place
+                    // (arith-ambiguous-double-paren: `( … 4>&- ) 3>&- | cat`).
+                    let text_opt = if func == "exec" || func == "builtin" {
+                        self.shell_argv(args).map(|argv| argv.join(" "))
+                    } else if func == "subshell" {
+                        match args.first() {
+                            Some(IrExpr::Arrow(b)) => {
+                                self.body_shell_text(b).map(|t| format!("( {t} )"))
+                            }
+                            _ => None,
+                        }
+                    } else if func == "redirect" {
+                        // `redirect(Arrow[stage], [specs])` — the Call-dialect
+                        // spelling of a redirected stage (the IrStmt::Redirect
+                        // arm above covers the statement dialect).
+                        match args.first() {
+                            Some(IrExpr::Arrow(b)) => {
+                                let body = Self::flatten_subs(b);
+                                match self.body_shell_text(&body) {
+                                    Some(t) => {
+                                        let mut s = format!("( {t} )");
+                                        let mut ok = true;
+                                        if let Some(IrExpr::Array(specs)) = args.get(1) {
+                                            for sp in specs {
+                                                if let IrExpr::Object(props) = sp {
+                                                    let mut red = crate::ir::IrRedirect {
+                                                        fd: None,
+                                                        mode: "w".to_string(),
+                                                        target: IrExpr::Str(
+                                                            String::new(),
+                                                            crate::ir::StrStyle::DoubleQuoted,
+                                                        ),
+                                                        interpolate: false,
+                                                    };
+                                                    for (k, v) in props {
+                                                        match (k.as_str(), v) {
+                                                            ("fd", IrExpr::Int(i)) => {
+                                                                red.fd = Some(*i as i32)
+                                                            }
+                                                            ("mode", IrExpr::Str(m, _)) => {
+                                                                red.mode = m.clone()
+                                                            }
+                                                            ("target", tv) => {
+                                                                red.target = tv.clone()
+                                                            }
+                                                            ("interpolate", IrExpr::Bool(bb)) => {
+                                                                red.interpolate = *bb
+                                                            }
+                                                            _ => {}
+                                                        }
+                                                    }
+                                                    match self.irredirect_text(&red) {
+                                                        Some(rt) if rt.is_empty() => {}
+                                                        Some(rt) => {
+                                                            s.push(' ');
+                                                            s.push_str(&rt);
+                                                        }
+                                                        None => {
+                                                            ok = false;
+                                                            break;
+                                                        }
+                                                    }
+                                                }
+                                            }
                                         }
-                                        None => {
-                                            ok = false;
-                                            break;
+                                        if ok {
+                                            Some(s)
+                                        } else {
+                                            None
                                         }
                                     }
-                                }
-                                if !ok {
-                                    all_shell = false;
-                                    break;
+                                    None => None,
                                 }
                             }
-                            parts.push(text);
-                            continue;
+                            _ => None,
                         }
+                    } else {
+                        None
+                    };
+                    if let Some(mut text) = text_opt {
+                        if let Some(redirs) = redirs {
+                            let mut ok = true;
+                            for r in redirs {
+                                match self.irredirect_text(r) {
+                                    Some(t) => {
+                                        text.push(' ');
+                                        text.push_str(&t);
+                                    }
+                                    None => {
+                                        ok = false;
+                                        break;
+                                    }
+                                }
+                            }
+                            if !ok {
+                                all_shell = false;
+                                break;
+                            }
+                        }
+                        parts.push(text);
+                        continue;
                     }
                 }
             }
@@ -6124,6 +6204,11 @@ impl Render {
                     None
                 }
             }
+            // `split(x)` — the frontend's word-splitting wrapper around a
+            // word (an unquoted `$?` in `echo $? >&4`). Shell text splits
+            // exactly like that, so the operand IS the shell word; without
+            // this the whole subshell body refused to text-render.
+            IrExpr::Call { func, args } if func == "split" => self.sh_arg(args.first()?),
             // a bare variable in argv position (`diff $__ps_tmp3
             // $__ps_tmp4`): the scalar's value, quoted
             IrExpr::Var(n, _) => Some(format!("\"${n}\"")),
@@ -6481,6 +6566,30 @@ impl Render {
             }
             IrExpr::Var(n, _) if n == "-" => return Some(String::new()),
             _ => {}
+        }
+        // `>&N` / `<&N` — a DUP to another descriptor. Every caller of this
+        // helper builds text for a real bash child (a pipeline stage, a
+        // `bash -c` payload, a subshell body), where the dup is exactly what
+        // bash would do, so text is the faithful form. Refusing it made a
+        // whole `( … ) | cat` pipeline fall back to the unsupported-subshell
+        // stub (arith-ambiguous-double-paren exited 2 where bash exits 0).
+        if let IrExpr::Str(s, _) = &r.target {
+            if let Some(n) = s.strip_prefix('&') {
+                if !n.is_empty() && n.chars().all(|c| c.is_ascii_digit()) {
+                    let sym = match r.mode.as_str() {
+                        "r" => "<",
+                        "w" => ">",
+                        "a" => ">>",
+                        _ => return None,
+                    };
+                    return Some(match r.fd {
+                        Some(fd) if !(fd == 1 && sym == ">") && !(fd == 0 && sym == "<") => {
+                            format!("{fd}{sym}&{n}")
+                        }
+                        _ => format!("{sym}&{n}"),
+                    });
+                }
+            }
         }
         // double quotes; it only matters when a literal target holds a `$`
         // that bash would expand (`sh_quote` would freeze it). Var/Interpolate
@@ -9782,6 +9891,7 @@ impl Render {
                 // literal-pattern case is exact equality).
                 let d = self.expr(discriminant);
                 let mut emitted_any = false;
+                let mut has_default = false;
                 for cl in clauses {
                     let conds: Vec<String> = cl
                         .patterns
@@ -9815,6 +9925,9 @@ impl Render {
                         })
                         .collect();
                     let is_default = cl.patterns.iter().any(|p| p.as_str() == "*");
+                    if is_default {
+                        has_default = true;
+                    }
                     if conds.is_empty() && is_default {
                         self.emit("else:");
                         self.block(&cl.body);
@@ -9825,6 +9938,17 @@ impl Render {
                     self.emit(&format!("{kw} {}:", conds.join(" or ")));
                     self.block(&cl.body);
                     emitted_any = true;
+                }
+                // No pattern matched → the case statement itself succeeds
+                // (bash: `$?` is 0 after `esac` when nothing ran). Without
+                // this the DISCRIMINANT's status leaked out — a failing
+                // `$(…)` in the subject made the whole script exit 127
+                // (parse-case-dollarparen-pattern).
+                if emitted_any && !has_default {
+                    self.emit("else:");
+                    self.depth += 1;
+                    self.rc_reset();
+                    self.depth -= 1;
                 }
             }
             IrStmt::For { var, iter, body } => {
