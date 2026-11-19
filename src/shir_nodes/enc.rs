@@ -139,10 +139,33 @@ pub fn json_to_expr(v: &Value) -> Result<IrExpr, String> {
                 .iter().map(json_to_expr).collect::<Result<Vec<_>, _>>()?
         )),
         Some("BinOp") => {
+            // Every variant the ENCODER writes must decode: the encoder uses
+            // `{op:?}`, so a short list here turned a perfectly good A1 into
+            // `enc BinOp Some("Concat")` the moment a transform put a concat
+            // inside a node's payload (the `${v:0:2}` / `x=$(… | wc -l)`
+            // shapes text_ops now offers to Rust).
             let op = match v["op"].as_str() {
                 Some("Add") => crate::ir::BinOpKind::Add,
                 Some("Sub") => crate::ir::BinOpKind::Sub,
                 Some("Mul") => crate::ir::BinOpKind::Mul,
+                Some("Div") => crate::ir::BinOpKind::Div,
+                Some("Mod") => crate::ir::BinOpKind::Mod,
+                Some("Pow") => crate::ir::BinOpKind::Pow,
+                Some("Concat") => crate::ir::BinOpKind::Concat,
+                Some("Eq") => crate::ir::BinOpKind::Eq,
+                Some("Ne") => crate::ir::BinOpKind::Ne,
+                Some("Lt") => crate::ir::BinOpKind::Lt,
+                Some("Gt") => crate::ir::BinOpKind::Gt,
+                Some("Le") => crate::ir::BinOpKind::Le,
+                Some("Ge") => crate::ir::BinOpKind::Ge,
+                Some("And") => crate::ir::BinOpKind::And,
+                Some("Or") => crate::ir::BinOpKind::Or,
+                Some("Not") => crate::ir::BinOpKind::Not,
+                Some("BitAnd") => crate::ir::BinOpKind::BitAnd,
+                Some("BitOr") => crate::ir::BinOpKind::BitOr,
+                Some("BitXor") => crate::ir::BinOpKind::BitXor,
+                Some("ShiftL") => crate::ir::BinOpKind::ShiftL,
+                Some("ShiftR") => crate::ir::BinOpKind::ShiftR,
                 other => return Err(format!("enc BinOp {other:?}")),
             };
             Ok(IrExpr::BinOp {

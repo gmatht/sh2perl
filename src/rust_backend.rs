@@ -6428,7 +6428,19 @@ impl Render {
                         .expect("tag/type agree");
                     self.cut_at_str(x)
                 }
-                _ => "String::new()".into(),
+                // A node this target's manifest DOES declare (a count used
+                // where a string is wanted, `x=$(… | wc -l)`) must render
+                // its value here; silently emptying it was the bug this arm
+                // used to hide behind.
+                _ => {
+                    if let Some(s) = self.ext_std_str(n.as_ref()) {
+                        s
+                    } else if let Some(k) = self.ext_std_num(n.as_ref()) {
+                        format!("{}.to_string()", Self::atom_or_paren(&k))
+                    } else {
+                        "String::new()".into()
+                    }
+                }
             }
         }
     }
@@ -20993,6 +21005,9 @@ fn scan_stmt(st: &IrStmt, var: &str, ev: &mut Vec<bool>, muted: bool) {
             }
         }
         IrStmt::Expr(e) => scan_expr(e, var, ev, muted),
+        // An output statement READS its value: `echo "$x"` is
+        // Output(getVar("x")), and ignoring it made x's store look dead.
+        IrStmt::Output { value, .. } => scan_expr(value, var, ev, muted),
         IrStmt::If { cond, then, elsifs, else_, .. } => {
             scan_expr(cond, var, ev, muted);
             scan_stmts(then, var, ev, muted);
@@ -21062,6 +21077,16 @@ fn scan_stmt(st: &IrStmt, var: &str, ev: &mut Vec<bool>, muted: bool) {
 
 fn scan_expr(e: &IrExpr, var: &str, ev: &mut Vec<bool>, muted: bool) {
     match e {
+        // A transform-declared node is opaque to a plain `match`, but its
+        // children are ordinary reads: `${v:0:2}` becomes
+        // SubStrExtract(Var v), and `x=$(… | wc -l)` becomes RegCount(text).
+        // Not descending here makes the store that feeds the node look DEAD
+        // (`let _ = …`), so the node reads a binding that was never declared.
+        IrExpr::Ext(n) => {
+            for c in n.children() {
+                scan_expr(c, var, ev, muted);
+            }
+        }
         IrExpr::Call { func, args } if func == "setVar" || func == "assign" => {
             let store = matches!(args.first(), Some(IrExpr::Str(n, _)) if n == var);
             if store {
@@ -21090,7 +21115,41 @@ fn scan_expr(e: &IrExpr, var: &str, ev: &mut Vec<bool>, muted: bool) {
             scan_expr(lhs, var, ev, muted);
             scan_expr(rhs, var, ev, muted);
         }
-        IrExpr::Call { args, .. } => {
+        IrExpr::Call { func, args } => {
+            // A NAME ARGUMENT is a read: `getVar("x")` is `$x`, and
+            // `param("", "x")` is the variable READ a lowered `${x:0:2}`
+            // node is built on (the shIR passes the name, not a `Var`).
+            // Missing these made the store that feeds the node look dead,
+            // so it rendered as `let _ = …` and the read had no binding.
+            if matches!(
+                func.as_str(),
+                "getVar"
+                    | "setVar"
+                    | "param"
+                    | "join"
+                    | "arrayIndex"
+                    | "arrayLen"
+                    | "arrayItems"
+                    | "arrayKeys"
+                    | "listVar"
+                    | "split"
+                    | "assocGet"
+                    | "assocSet"
+                    | "capture"
+                    | "captureWords"
+                    | "setArray"
+                    | "setArrayAppend"
+                    | "arrayStore"
+            ) && !muted
+            {
+                for a in args {
+                    if let IrExpr::Str(n, _) = a {
+                        if n == var {
+                            ev.push(false);
+                        }
+                    }
+                }
+            }
             for a in args {
                 scan_expr(a, var, ev, muted);
             }
