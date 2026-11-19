@@ -265,6 +265,29 @@ fn lower_stmt(stmt: &mut IrStmt, emit: bool, arrays: &std::collections::HashSet<
                 }
             }
         }
+        // STRUCTURED pipeline statement — `IrStmt::Pipeline` is the shape the
+        // parser builds for a FINAL pipeline (`echo x | head -n 5` as the last
+        // line), and the arm above only knew the `Call{func:"pipeline"}` form.
+        // So a program ENDING in `| head`/`| tail`/`| tr`/`| wc`/`| sort` kept
+        // its bash spawn even though the SAME two stages reduce natively a few
+        // lines earlier. Same reductions, same proof, same allowlist.
+        //
+        // `capture`/`last_output` must be None: with either set the pipeline's
+        // stdout is consumed rather than printed, so it is not this arm's
+        // "print the reduced value" contract.
+        IrStmt::Pipeline { stages, capture: None, last_output: None, .. } if emit => {
+            if let [b1, b2] = stages.as_slice() {
+                if let Some((replacement, already_nl)) = try_lower_pipeline_bodies(b1, b2, true) {
+                    *stmt = with_status_zero(IrStmt::Output {
+                        value: replacement,
+                        newline: !already_nl,
+                        target: None,
+                    });
+                    LIFT_COUNT.fetch_add(1, Ordering::Relaxed);
+                    return;
+                }
+            }
+        }
         // Here-string/here-doc: `cmd <<< "text"` — the text is the fd-0
         // redirect target, the command is the inner stage.
         IrStmt::Redirect { inner, redirects } => {
@@ -697,7 +720,18 @@ fn try_lower_pipeline(stages: &[IrExpr], stmt_level: bool) -> Option<(IrExpr, bo
         IrExpr::Arrow(body) => body.as_slice(),
         _ => return None,
     };
+    try_lower_pipeline_bodies(stage1_body, stage2_body, stmt_level)
+}
 
+/// The reductions themselves, over the two stages' STATEMENT LISTS — the
+/// shared core of both pipeline shapes: the `Call { func: "pipeline" }`
+/// expression (mid-program) and the structured `IrStmt::Pipeline` (what the
+/// parser builds for a FINAL pipeline).
+fn try_lower_pipeline_bodies(
+    stage1_body: &[IrStmt],
+    stage2_body: &[IrStmt],
+    stmt_level: bool,
+) -> Option<(IrExpr, bool)> {
     // stage2 must be an exec/builtin call
     let (cmd_name, cmd_args) = match stage2_body {
         [IrStmt::Expr(IrExpr::Call { func, args })] if func == "exec" || func == "builtin" => {
@@ -1628,6 +1662,32 @@ mod tests {
         let rep = n.as_any().downcast_ref::<RepeatStr>().unwrap();
         assert_eq!(rep.count, IrExpr::Int(3));
         assert!(matches!(&rep.text, IrExpr::Str(s, _) if s == "Hi\n"));
+    }
+
+    /// A program's FINAL pipeline is the structured `IrStmt::Pipeline`, not the
+    /// `Call{func:"pipeline"}` the reductions knew: `echo abc | tail -n 1` as
+    /// the last line never reduced and kept spawning bash, while the same
+    /// pipeline mid-program did. Both shapes must reach the same node.
+    #[test]
+    fn final_pipeline_statement_reduces_like_a_mid_program_pipeline() {
+        crate::transforms::set_target(Some("rs"));
+        let commands = crate::parser::commands::parse_commands_from_text("echo abc | tail -n 1")
+            .expect("parse");
+        let mut prog = crate::shir::ast_to_ir_raw(&commands);
+        // `shir-pipeline-native` is the pass that turns a statement-position
+        // pipeline Call into the structured statement form (it precedes
+        // text-ops in the registry).
+        crate::transforms::shir_pipeline_native::transform(&mut prog.stmts);
+        assert!(
+            matches!(prog.stmts.as_slice(), [IrStmt::Pipeline { .. }]),
+            "expected the structured Pipeline statement, got {:?}",
+            prog.stmts
+        );
+        assert!(transform(&mut prog.stmts), "the final pipeline did not reduce");
+        let dbg = format!("{:?}", prog.stmts);
+        assert!(dbg.contains("TakeLines"), "no TakeLines node: {dbg}");
+        assert!(!dbg.contains("Pipeline"), "the pipeline survived: {dbg}");
+        crate::transforms::set_target(None);
     }
 
     // ── source helpers ───────────────────────────────────────────────
