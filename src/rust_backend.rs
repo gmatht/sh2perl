@@ -5996,12 +5996,9 @@ impl Render {
                 }
             }
             IrExpr::Call { func, args } if func == "grepMatches" => {
-                self.add_helper("grepmatches");
-                let text = args.first().map(|a| self.expr_str(a)).unwrap_or_default();
-                let pat = args.get(1).map(|a| self.expr_str(a)).unwrap_or_default();
-                let flags = args.get(2).map(|a| self.expr_str(a)).unwrap_or_default();
+                let call = self.grep_matches_expr(args.first(), args.get(1), args.get(2));
                 format!(
-                    "{{ let (__m, __r) = __sh_grepmatches(&{text}, &{pat}, &{flags}); __SH_RC.store(__r, Ordering::Relaxed); __r == 0 }}"
+                    "{{ let (__m, __r) = {call}; __SH_RC.store(__r, Ordering::Relaxed); __r == 0 }}"
                 )
             }
             IrExpr::Call { func, args } if func == "getVar" => {
@@ -9492,13 +9489,35 @@ impl Render {
 
     /// grepMatches as a statement — the `grep -o` lift: print each
     /// match on its own line, rc = 0 iff any match.
-    fn grepmatches_stmt(&mut self, args: &[IrExpr]) {
+    /// The `(matches, rc)` expression for a `grep -o` call. A literal
+    /// substring pattern (see `grep_literal_pat`) renders as a native scan —
+    /// one line per non-overlapping occurrence, rc 0 on a hit and 1 on none,
+    /// exactly `__sh_grepmatches`'s contract — so the 50-line matcher and its
+    /// `regex` dependency are not emitted. Everything else keeps the helper.
+    fn grep_matches_expr(
+        &mut self,
+        text: Option<&IrExpr>,
+        pat: Option<&IrExpr>,
+        flags: Option<&IrExpr>,
+    ) -> String {
+        if let Some(p) = pat.and_then(|p| grep_literal_pat(p, flags)) {
+            let t = text.map(|a| self.expr_str(a)).unwrap_or_default();
+            let lit = Self::rust_str(&p);
+            return format!(
+                "{{ let __t = &{t}; let __n = __t.matches({lit}).count(); (if __n == 0 {{ String::new() }} else {{ vec![{lit}; __n].join(\"\\n\") }}, if __n == 0 {{ 1 }} else {{ 0 }}) }}"
+            );
+        }
         self.add_helper("grepmatches");
+        let text = text.map(|a| self.expr_str(a)).unwrap_or_default();
+        let pat = pat.map(|a| self.expr_str(a)).unwrap_or_default();
+        let flags = flags.map(|a| self.expr_str(a)).unwrap_or_default();
+        format!("__sh_grepmatches(&{text}, &{pat}, &{flags})")
+    }
+
+    fn grepmatches_stmt(&mut self, args: &[IrExpr]) {
         self.add_helper("print_words");
-        let text = args.first().map(|a| self.expr_str(a)).unwrap_or_default();
-        let pat = args.get(1).map(|a| self.expr_str(a)).unwrap_or_default();
-        let flags = args.get(2).map(|a| self.expr_str(a)).unwrap_or_default();
-        self.emit(&format!("let (__m, __r) = __sh_grepmatches(&{text}, &{pat}, &{flags});"));
+        let call = self.grep_matches_expr(args.first(), args.get(1), args.get(2));
+        self.emit(&format!("let (__m, __r) = {call};"));
         self.emit("if !__m.is_empty() { __sh_print_words(&[vec![__m]], true, false); }");
         self.emit("__SH_RC.store(__r, Ordering::Relaxed);");
     }
@@ -11496,12 +11515,9 @@ impl Render {
             }
             "arrayItems" => self.array_items_str(args),
             "grepMatches" => {
-                self.add_helper("grepmatches");
-                let text = args.first().map(|a| self.expr_str(a)).unwrap_or_default();
-                let pat = args.get(1).map(|a| self.expr_str(a)).unwrap_or_default();
-                let flags = args.get(2).map(|a| self.expr_str(a)).unwrap_or_default();
+                let call = self.grep_matches_expr(args.first(), args.get(1), args.get(2));
                 format!(
-                    "{{ let (__m, __r) = __sh_grepmatches(&{text}, &{pat}, &{flags}); __SH_RC.store(__r, Ordering::Relaxed); __m }}"
+                    "{{ let (__m, __r) = {call}; __SH_RC.store(__r, Ordering::Relaxed); __m }}"
                 )
             }
             "redirect" => {
@@ -18370,6 +18386,30 @@ fn literal_strip_pat(raw: &str) -> Option<String> {
     Some(lit)
 }
 
+/// The pattern a `grep -o` call can render as a native substring scan: a
+/// string literal with no newline, no BRE metacharacter (`.`/`*`/`[`/`]`/
+/// `^`/`$`/`\`) and no flags (`-E` changes the dialect, `-i` folds case).
+/// For such a pattern the BRE→ERE→`regex` path is exactly "every
+/// non-overlapping occurrence", which `str::matches` also gives.
+/// REFUSE > GUESS: anything else keeps `__sh_grepmatches`.
+fn grep_literal_pat(pat: &IrExpr, flags: Option<&IrExpr>) -> Option<String> {
+    let IrExpr::Str(praw, _) = pat else { return None };
+    match flags {
+        None => {}
+        Some(IrExpr::Str(fraw, _)) if fraw.is_empty() => {}
+        _ => return None,
+    }
+    let p = Render::unescape_operand(praw);
+    if p.is_empty() || p.contains('\n') {
+        return None;
+    }
+    if p.chars()
+        .any(|c| matches!(c, '.' | '*' | '[' | ']' | '^' | '$' | '\\'))
+    {
+        return None;
+    }
+    Some(p)
+}
 
 fn is_ident(s: &str) -> bool {
     !s.is_empty()
@@ -23612,6 +23652,35 @@ mod tests {
             !out.contains("__sh_strippre(") || out.contains("__sh_fnmatch("),
             "a glob strip must not fold to strip_prefix:\n{out}"
         );
+    }
+
+    /// `grep -o` with a literal substring pattern and no flags is a native
+    /// `str::matches` scan — the 50-line matcher (and its `regex`
+    /// dependency) is not emitted for it.
+    #[test]
+    fn literal_grep_pattern_is_a_native_scan() {
+        let out = render_rs("grep -o pattern <<< \"some pattern here\"\n");
+        assert!(
+            !out.contains("__sh_grepmatches("),
+            "helper emitted:\n{out}"
+        );
+        assert!(out.contains("matches("), "no native scan:\n{out}");
+    }
+
+    /// A BRE metacharacter (`.`) or an `-i` fold changes what the pattern
+    /// means, so both keep `__sh_grepmatches`.
+    #[test]
+    fn grep_metachar_or_flag_pattern_keeps_the_matcher() {
+        for src in [
+            "grep -o 'pat.ern' <<< \"patxern\"\n",
+            "grep -oi pattern <<< \"some pattern here\"\n",
+        ] {
+            let out = render_rs(src);
+            assert!(
+                out.contains("fn __sh_grepmatches("),
+                "matcher dropped for {src}:\n{out}"
+            );
+        }
     }
 
     /// `CutAt` — the four single-star strip identities (`${v##*/}` and
