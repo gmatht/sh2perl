@@ -13,7 +13,7 @@ ShIR in-process (no JSON hop), renders a `.rs` crate, and its runtime
 shares the core's own type system (`IrType` maps to real Rust types).
 Its byte-string story is the cleanest of all backends (`Vec<u8>`
 natively — no NUL/UTF-16 issues), and it compiles to wasm natively (the
-shared wasm registry, Plan 12, is a first-class asset — a Rust runtime
+shared wasm registry is a first-class asset — a Rust runtime
 can *be* a wasm module). The honest caveat: Rust's borrow checker makes
 the runtime store's lifetime discipline real work (a `RefCell`/`Mutex`
 store, or an arena).
@@ -59,10 +59,28 @@ store is the only shared mutable state.
 
 ## 4. Purity ladder
 
-- `PureCpu` → inline Rust ops (native — the fastest).
+- `PureCpu` → inline Rust ops (native — the fastest). A **native `std` form at
+  the call site beats an emitted helper**: the helper registry costs every
+  program that touches the construct, whether or not the program uses the
+  hard half of it. So the rule is "emit `format!`/`strip_prefix`/
+  `to_uppercase`/`concat`, not `__sh_*`", and a helper body is kept only for
+  semantics `std` cannot spell (`printf` with flags/width/`%q`/`%b`, the bash
+  glob+extglob matcher, command emulation with GNU error text). See PLAN v156
+  for the pass, measured over the 548 corpus examples this tree renders
+  (555 `*.sh`, 7 skipped by `bash -n`): printf emitted in 9 → 0 programs,
+  `grep -o`'s matcher in 3 → 0 (a literal pattern is `str::matches`),
+  1,882,258 → 1,786,162 bytes and 1,382 → 1,315 helper definitions. Nothing
+  else folded: `regex` 16, `read_fields` 9, `split_ifs` 36, `substr` 8,
+  `replace` 2, `fnmatch` 30. The gates are unchanged by it: `harness/fail-rs`
+  run on unmodified HEAD and on the change gives the same
+  `pass=414 fail=134 skip=7` and the same per-example roster (restore
+  hash-verified, full lines including `bash_rc=/rust_rc=`), `./fail` is 553/555
+  on both sides with the same two Perl reds, the unit suite's 11 failures are
+  the same 11 at HEAD, and the warning census is 25 warned / 61 warnings on
+  both arms.
 - `Emulable` → the runtime crate (`sh2` module).
-- `Spawn` → `std::process::Command` (fork/exec via libc — C-level ✓ —
-  Rust's spawn is fast and exact).
+- `Spawn` → `std::process::Command` (fork/exec via libc — C-level ✓ — Rust's
+  spawn is fast and exact).
 
 ## 5. Contract guarantees
 
@@ -105,8 +123,9 @@ Rust's async is `async`/`await` with a runtime like tokio — opt-in).
 
 ## 6. The `sh2.*` namespace as data (A4)
 
-The 39-callee spec → the runtime crate's `pub fn` surface (generated
-from the spec). The spec's Rust form is the *canonical* one (the core
+The emitted `sh2.*` surface (74 distinct callees in
+`harness/estree-contract.json`) → the runtime crate's `pub fn` surface
+(generated from the spec). The spec's Rust form is the *canonical* one (the core
 already uses these names in `sh2_call`).
 
 ## 7. The runtime port
@@ -114,7 +133,7 @@ already uses these names in `sh2_call`).
 | sh2.* family | Rust implementation |
 |---|---|
 | `exec`/`pipeline`/`redirect`/`capture`/`subshell`/`background` | `std::process::Command` + `libc` fork/pipe/dup2 (exact POSIX) |
-| `builtin` | a table of ~30 functions |
+| `builtin` | a table of builtin functions |
 | `getVar`/`setVar`/`setArray`/... | a `HashMap` store behind a `RefCell`/`Mutex` (single-threaded: `RefCell` — same as sh2runtime's map) |
 | `param`/`caseMatch`/`test` | `regex`/`globset` crates + a test parser |
 | `arith`/`arithEval`/`idiv`/`imod` | `i64` + `wrapping_*` |
@@ -150,4 +169,4 @@ A1–A7 (shared) + Rust-specific:
 The reference static backend — Zig's sibling (same native semantics,
 comptime→types), C's successor (safety + the same POSIX model), and the
 author of the A1 serializer every other backend consumes. The wasm
-registry (Plan 12) is shared with JS/Zig/Lua/Java.
+registry is shared with JS/Zig/Lua/Java.
