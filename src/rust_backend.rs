@@ -23722,6 +23722,18 @@ mod tests {
 
     // ── the text nodes the `rs` manifest offers ──────────────────────
 
+    /// `local a=$1` keeps the parameter binding: the positional stays a
+    /// READ of the function's parameter (the shIR hands it over as the
+    /// literal "$1", which the Declare arm binds), so the function keeps
+    /// its arity and its call sites keep their arguments.
+    #[test]
+    fn local_positional_keeps_the_parameter_binding() {
+        let out = render_rs("f() {\n  local a=$1\n  echo \"a=$a\"\n}\nf hello\n");
+        assert!(!out.contains("a = \"$1\""), "positional lost:\n{out}");
+        assert!(out.contains("fn f(p0: String)"), "arity lost:\n{out}");
+        assert!(out.contains("f(\"hello\""), "call lost its argument:\n{out}");
+    }
+
     /// `${v:0:2}` is a char slice — no `__sh_substr`, no bash.
     #[test]
     fn substr_extract_is_a_native_char_slice() {
