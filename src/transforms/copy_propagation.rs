@@ -1091,50 +1091,6 @@ fn strip_affix(text: &str, pat: &str, prefix: bool) -> String {
     }
 }
 
-/// GNU basename on a literal — exact (verified: `a/b/`→`b`, `//`→`/`,
-/// `a//b`→`b`, empty→empty). The runtime `__sh_basename` rfind helper
-/// misses the trailing-slash forms; a literal fold must match bash, the
-/// equivalence oracle — not the helper.
-fn gnu_basename(s: &str) -> String {
-    if s.is_empty() {
-        return String::new();
-    }
-    let t = s.trim_end_matches('/');
-    if t.is_empty() {
-        // an all-slash name ("/", "//") — one directory
-        return "/".to_string();
-    }
-    match t.rfind('/') {
-        Some(i) => t[i + 1..].to_string(),
-        None => t.to_string(),
-    }
-}
-
-/// GNU dirname on a literal — exact (verified: `a/b/`→`a`, `a//b`→`a`,
-/// `//a`→`/`, `a///`→`.`, empty→`.`).
-fn gnu_dirname(s: &str) -> String {
-    if s.is_empty() {
-        return ".".to_string();
-    }
-    let t = s.trim_end_matches('/');
-    if t.is_empty() {
-        return "/".to_string();
-    }
-    match t.rfind('/') {
-        None => ".".to_string(),
-        Some(0) => "/".to_string(),
-        Some(i) => {
-            // the prefix may itself end in slashes (`a//b` → `a/` → `a`)
-            let prefix = t[..i].trim_end_matches('/');
-            if prefix.is_empty() {
-                "/".to_string()
-            } else {
-                prefix.to_string()
-            }
-        }
-    }
-}
-
 /// A literal non-negative index operand (`${v:1:2}` — the parser spells
 /// offsets as digit strings; Int accepted too).
 fn lit_index(e: &IrExpr) -> Option<usize> {
@@ -1278,9 +1234,23 @@ fn fold_param_const(
         // — fold it when the word is itself literal (a live word keeps
         // the call so its expansion still runs).
         (":-", 3) => literal_text(&args[2]).and_then(lit),
-        // GNU name helpers on the literal (see gnu_basename/gnu_dirname).
-        ("basename", 2) => lit(gnu_basename(&text)),
-        ("dirname", 2) => lit(gnu_dirname(&text)),
+        // `${v##*/}` / `${v%/*}` on a literal. These are AFFIX trims, NOT
+        // the GNU utilities (`shir_nodes/path_name.node`
+        // `TextOps#shell_strip_is_not_gnu_basename`): a slash-free value
+        // passes through UNCHANGED, the trailing slash of `/a/b/` survives
+        // into the dirname, and the basename of `/a/b/` is the EMPTY
+        // string. Folding through gnu_dirname turned `${v%%/*}` on
+        // "hello" into "." — and the `v = hello` assignment then vanished
+        // as dead, so the Perl render printed a bare "." (silent wrong
+        // answer; bash prints "hello").
+        ("basename", 2) => lit(match text.rfind('/') {
+            Some(i) => text[i + 1..].to_string(),
+            None => text.clone(),
+        }),
+        ("dirname", 2) => lit(match text.rfind('/') {
+            Some(i) => text[..i].to_string(),
+            None => text.clone(),
+        }),
         _ => None,
     }
 }
@@ -2023,7 +1993,9 @@ mod tests {
     }
 
     /// basename/dirname on a const path fold to the literal result with
-    /// GNU semantics (trailing slash and all-slash forms included).
+    /// BASH AFFIX semantics (not GNU helper semantics): the trailing slash
+    /// belongs to the dirname and a slash-free value is unchanged.
+    /// `${x##*/}` on `/a/b/` is empty in bash, `${x%/*}` is `/a/b`.
     #[test]
     fn folds_param_name_helpers() {
         let mut stmts = vec![
@@ -2032,8 +2004,18 @@ mod tests {
             expr_stmt(param("dirname", "x", &[])),
         ];
         assert!(transform(&mut stmts));
-        assert_eq!(stmts[1], expr_stmt(str_lit("b")));
-        assert_eq!(stmts[2], expr_stmt(str_lit("/a")));
+        assert_eq!(stmts[1], expr_stmt(str_lit("")));
+        assert_eq!(stmts[2], expr_stmt(str_lit("/a/b")));
+        // no slash at all: BOTH leave the value alone (GNU `dirname hello`
+        // prints `.`, which is why this used to be wrong)
+        let mut stmts = vec![
+            assign("y", str_lit("hello")),
+            expr_stmt(param("basename", "y", &[])),
+            expr_stmt(param("dirname", "y", &[])),
+        ];
+        assert!(transform(&mut stmts));
+        assert_eq!(stmts[1], expr_stmt(str_lit("hello")));
+        assert_eq!(stmts[2], expr_stmt(str_lit("hello")));
     }
 
     /// `${x:-word}` with a NON-EMPTY const never consults the word — folds

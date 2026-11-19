@@ -594,24 +594,80 @@ impl Render {
         (
             "strip",
             concat!(
+                "__SH_GLOB_RX = {}\n",
+                "def __sh_glob_rx(pat):\n",
+                "    import re\n",
+                "    cls_map = {'alnum': '0-9A-Za-z', 'alpha': 'A-Za-z',\n",
+                "               'blank': ' \\t', 'cntrl': '\\x00-\\x1f\\x7f',\n",
+                "               'digit': '0-9', 'graph': '!-~', 'lower': 'a-z',\n",
+                "               'print': ' -~', 'punct': r'!-/:-@\\[-`{-~',\n",
+                "               'space': r'\\s', 'upper': 'A-Z',\n",
+                "               'xdigit': '0-9A-Fa-f'}\n",
+                "    out = ['(?s)\\\\A']\n",
+                "    i = 0\n",
+                "    n = len(pat)\n",
+                "    while i < n:\n",
+                "        c = pat[i]\n",
+                "        if c == '*':\n",
+                "            out.append('.*'); i += 1\n",
+                "        elif c == '?':\n",
+                "            out.append('.'); i += 1\n",
+                "        elif c == '[':\n",
+                "            j = i + 1\n",
+                "            neg = False\n",
+                "            if j < n and pat[j] in '!^':\n",
+                "                neg = True; j += 1\n",
+                "            body = []\n",
+                "            first = True\n",
+                "            closed = False\n",
+                "            while j < n:\n",
+                "                if pat[j] == ']' and not first:\n",
+                "                    closed = True; j += 1; break\n",
+                "                if pat.startswith('[:', j):\n",
+                "                    k = pat.find(':]', j + 2)\n",
+                "                    if k != -1:\n",
+                "                        body.append(cls_map.get(pat[j+2:k], ''))\n",
+                "                        j = k + 2; first = False; continue\n",
+                "                body.append(re.escape(pat[j]))\n",
+                "                j += 1; first = False\n",
+                "            if closed:\n",
+                "                out.append('[' + ('^' if neg else '') + ''.join(body) + ']')\n",
+                "                i = j\n",
+                "            else:\n",
+                "                out.append('\\\\['); i += 1\n",
+                "        elif c == '\\\\' and i + 1 < n:\n",
+                "            out.append(re.escape(pat[i+1])); i += 2\n",
+                "        else:\n",
+                "            out.append(re.escape(c)); i += 1\n",
+                "    out.append('\\\\Z')\n",
+                "    return ''.join(out)\n",
+                "def __sh_glob_match(s, pat):\n",
+                "    # shell glob semantics, not fnmatch: `[!...]` negates and\n",
+                "    # `[[:space:]]` is a POSIX class (fnmatch reads both\n",
+                "    # literally, so `${v##*[![:space:]]}` never matched)\n",
+                "    rx = __SH_GLOB_RX.get(pat)\n",
+                "    if rx is None:\n",
+                "        import re\n",
+                "        rx = re.compile(__sh_glob_rx(pat))\n",
+                "        __SH_GLOB_RX[pat] = rx\n",
+                "    return rx.match(s) is not None\n",
                 "def sh2_strip(v, pat, which):\n",
-                "    import fnmatch\n",
                 "    if which == 'p':\n",
                 "        m = 0\n",
                 "        for i in range(1, len(v)+1):\n",
-                "            if fnmatch.fnmatch(v[:i], pat):\n",
+                "            if __sh_glob_match(v[:i], pat):\n",
                 "                m = i; break\n",
                 "        return v[m:]\n",
                 "    if which == 'P':\n",
                 "        m = 0\n",
                 "        for i in range(1, len(v)+1):\n",
-                "            if fnmatch.fnmatch(v[:i], pat):\n",
+                "            if __sh_glob_match(v[:i], pat):\n",
                 "                m = i\n",
                 "        return v[m:]\n",
                 "    if which == 's':\n",
                 "        n = len(v)\n",
                 "        for i in range(len(v)-1, -1, -1):\n",
-                "            if fnmatch.fnmatch(v[i:], pat):\n",
+                "            if __sh_glob_match(v[i:], pat):\n",
                 "                n = i; break\n",
                 "        return v[:n]\n",
                 "    # 'S' longest suffix: the SMALLEST i whose tail matches\n",
@@ -619,7 +675,7 @@ impl Render {
                 "    # breaking on the first hit is the SHORTEST suffix, i.e. '%')\n",
                 "    n = len(v)\n",
                 "    for i in range(len(v)-1, -1, -1):\n",
-                "        if fnmatch.fnmatch(v[i:], pat):\n",
+                "        if __sh_glob_match(v[i:], pat):\n",
                 "            n = i\n",
                 "    return v[:n]\n",
             ),
@@ -12795,6 +12851,66 @@ mod tests {
     }
     fn ex(cmd: &str, items: Vec<IrExpr>) -> Vec<IrExpr> {
         vec![st(cmd), IrExpr::Array(items)]
+    }
+
+    /// `${v#pat}` / `${v##pat}` / `${v%pat}` / `${v%%pat}` with `:`, `[`,
+    /// `]`, `!` and a POSIX class in the PATTERN, rendered through the `py`
+    /// target and compared to bash. The runtime matcher used `fnmatch`,
+    /// which has no POSIX classes and reads `[!…]` as a literal set, so
+    /// these forms disagreed with bash; it now goes through a glob→regex
+    /// translator. Slices and value substitutions are in the same program
+    /// because they must keep behaving exactly as before.
+    #[test]
+    fn parameter_trim_patterns_execute_like_bash() {
+        let src = "for v in \"  padded  \" \"x y\" \"abc\"; do\n\
+                   a=${v##*[![:space:]]}\n\
+                   b=${v%%[[:space:]]*}\n\
+                   c=${v#*[![:space:]]}\n\
+                   d=${v%[[:space:]]*}\n\
+                   echo \"[$a][$b][$c][$d]\"\n\
+                   done\n\
+                   s=\"a:b:c\"\n\
+                   echo \"[${s%%:*}][${s##*:}][${s#*:}][${s%:*}][${s##*/}][${s%/*}]\"\n\
+                   w=\"foo.tar.gz\"\n\
+                   echo \"[${w##*.}][${w%.*}][${w#*.}][${w%%.*}]\"\n\
+                   u=\"hello\"\n\
+                   echo \"[${u:-def}][${u:1}][${u:1:2}]\"\n\
+                   unset z\n\
+                   echo \"[${z:-fallback}][${z:+nope}]\"\n";
+        let mut p = crate::Parser::new(src);
+        let cmds = p.parse().expect("parse");
+        let prog = crate::shir::ast_to_ir(&cmds);
+        let py = shir_to_python(&prog);
+        assert!(
+            py.contains("sh2_strip(") && py.contains("__sh_glob_match"),
+            "the trim must render natively through the glob matcher:\n{py}"
+        );
+        let dir = std::env::temp_dir().join("pyb_trim_patterns");
+        std::fs::create_dir_all(&dir).expect("tmpdir");
+        let sh_path = dir.join("t.sh");
+        let py_path = dir.join("t.py");
+        std::fs::write(&sh_path, src).expect("write sh");
+        std::fs::write(&py_path, &py).expect("write py");
+        let sh = std::process::Command::new("bash")
+            .arg(&sh_path)
+            .output()
+            .expect("run bash");
+        let got = std::process::Command::new("python3")
+            .arg(&py_path)
+            .output()
+            .expect("run python3");
+        assert_eq!(
+            String::from_utf8_lossy(&got.stdout),
+            String::from_utf8_lossy(&sh.stdout),
+            "stdout differs; python stderr:\n{}\n--- py ---\n{py}",
+            String::from_utf8_lossy(&got.stderr)
+        );
+        assert_eq!(
+            got.status.code(),
+            sh.status.code(),
+            "exit status differs; python stderr:\n{}",
+            String::from_utf8_lossy(&got.stderr)
+        );
     }
 
     /// `rm -f F` is `shutil`/`os`, never a forked `rm`.

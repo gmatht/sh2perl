@@ -2387,6 +2387,15 @@ fn parse_variable_expansion_inner(lexer: &mut Lexer) -> Result<Word, ParserError
                 "DEBUG parse_variable_expansion: braced_content='{}'",
                 braced_content
             );
+            // PATTERN TRIMS FIRST: `${v#pat}`, `${v##pat}`, `${v%pat}`,
+            // `${v%%pat}`. Bash takes everything after the operator as the
+            // pattern, so a `:`/`[`/`]`/`!` inside it is pattern text — the
+            // colon-slice arm below used to claim `${v##*[![:space:]]}` first
+            // and emit a substring of a variable named `v##*[![`.
+            if let Some(pe) = trim_expansion(&braced_content) {
+                return Ok(Word::ParameterExpansion(pe, None));
+            }
+
             // Check if this is array syntax first
             if braced_content.starts_with('#')
                 && braced_content.contains('[')
@@ -3066,6 +3075,11 @@ fn parse_variable_expansion_inner(lexer: &mut Lexer) -> Result<Word, ParserError
                     lexer.next();
                 }
                 content.push_str(&rest);
+                // `${@##pat}` / `${*#pat}` — same name-first trim rule as the
+                // DollarBrace arm (a `:` in the pattern is pattern text).
+                if let Some(pe) = trim_expansion(&content) {
+                    return Ok(Word::ParameterExpansion(pe, None));
+                }
                 // Analyze the content using the same logic as the DollarBrace branch
                 // (inline analysis, same as lines ~1030-1275)
                 if let Some((var, op, operand)) = split_colon_operator(&content) {
@@ -4193,6 +4207,75 @@ fn split_zsh_subscript_flag(key: &str) -> Option<(String, String)> {
     Some((flag_text.to_string(), rest[close + 1..].to_string()))
 }
 
+/// Split a `${...}` BODY into the parameter name it names and the text that
+/// follows it. Bash parses the NAME first — a plain identifier, a positional
+/// number, or one of `@ * # ? $ ! -` — and only then the OPERATOR, so every
+/// character after the name belongs to the operator's operand/pattern.
+///
+/// The operator chains below instead scan the WHOLE body for operator
+/// characters, and that is what broke `${v##*[![:space:]]}`: the `:` of the
+/// POSIX class was read as a `${v:offset:length}` slice separator, so the
+/// body became `v##*[![` + `space` + `]]` and every backend emitted a
+/// substring call on a variable literally named `v##*[![`.
+///
+/// A `[...]` subscript is deliberately NOT consumed here: `${arr[@]#pat}`
+/// already has its own (element-wise) path, and this helper must not change
+/// it. `None` when the body has no name prefix at all.
+fn split_parameter_name(body: &str) -> Option<(&str, &str)> {
+    let b = body.as_bytes();
+    let first = *b.first()?;
+    let mut i = 0;
+    if matches!(first, b'@' | b'*' | b'#' | b'?' | b'$' | b'!' | b'-') {
+        i = 1;
+    } else {
+        while i < b.len() && (b[i].is_ascii_alphanumeric() || b[i] == b'_') {
+            i += 1;
+        }
+        if i == 0 {
+            return None;
+        }
+    }
+    Some((&body[..i], &body[i..]))
+}
+
+/// The four pattern-trim operators, recognised by NAME-FIRST parsing: a `:`,
+/// `[`, `]`, `!`, `*`, `?` or POSIX class inside the PATTERN is ordinary
+/// pattern text, never an operator.
+///
+/// Returns `(name, op, pattern)` for `${v#pat}` / `${v##pat}` / `${v%pat}` /
+/// `${v%%pat}`; `None` for every other body (slices, defaults, substitutions,
+/// lengths, subscripts …), which keep their existing paths.
+fn split_trim_operator(body: &str) -> Option<(&str, &'static str, &str)> {
+    let (name, rest) = split_parameter_name(body)?;
+    for op in ["##", "%%", "#", "%"] {
+        if let Some(pattern) = rest.strip_prefix(op) {
+            return Some((name, op, pattern));
+        }
+    }
+    None
+}
+
+/// Build the trim expansion for a `split_trim_operator` result. `##*/` and
+/// `%/*` keep the dedicated Basename/Dirname operators the heuristic chains
+/// assign them; everything else is the general trim.
+fn trim_expansion(body: &str) -> Option<ParameterExpansion> {
+    let (name, op, pattern) = split_trim_operator(body)?;
+    let operator = match (op, pattern) {
+        ("##", "*/") => ParameterExpansionOperator::Basename,
+        ("%", "/*") => ParameterExpansionOperator::Dirname,
+        ("##", p) => ParameterExpansionOperator::RemoveLongestPrefix(p.to_string()),
+        ("%%", p) => ParameterExpansionOperator::RemoveLongestSuffix(p.to_string()),
+        ("#", p) => ParameterExpansionOperator::RemoveShortestPrefix(p.to_string()),
+        ("%", p) => ParameterExpansionOperator::RemoveShortestSuffix(p.to_string()),
+        _ => return None,
+    };
+    Some(ParameterExpansion {
+        variable: name.to_string(),
+        operator,
+        is_mutable: true,
+    })
+}
+
 /// Recognise a `:`-prefixed operator (`:-`, `:=`, `:+`, `:?`) at the FIRST
 /// colon of the body only. Bash takes the variable name as the maximal
 /// plain-name prefix, so a colon later in the text belongs to the operand:
@@ -4264,6 +4347,13 @@ fn parse_parameter_expansion_content_inner(
                 is_mutable: true,
             });
         }
+    }
+
+    // PATTERN TRIMS FIRST — same rule as the unquoted parser: the operator
+    // is found by parsing the NAME, so a `:` inside the pattern is pattern
+    // text (`${v##*[![:space:]]}` must not become a `${v::len}` slice).
+    if let Some(pe) = trim_expansion(content) {
+        return Ok(pe);
     }
 
     // Check for array length: #arr[@]
@@ -5988,6 +6078,72 @@ mod colon_operator_tests {
             Op::DefaultValue(v) => assert_eq!(v, "y"),
             other => panic!("expected DefaultValue, got {other:?}"),
         }
+    }
+
+    /// The four pattern-trim forms are found by parsing the NAME, so a
+    /// `:`, `[`, `]`, `!`, `*` or POSIX class inside the PATTERN is pattern
+    /// text. The colon-slice heuristic used to fire first and split
+    /// `${v##*[![:space:]]}` into `v##*[![` + `space` + `]]`, i.e. a
+    /// `${v:offset:length}` slice of a variable that does not exist.
+    #[test]
+    fn trim_patterns_keep_colons_brackets_and_classes() {
+        for (body, name, op, pat) in [
+            ("v##*[![:space:]]", "v", "##", "*[![:space:]]"),
+            ("v%%[[:space:]]*", "v", "%%", "[[:space:]]*"),
+            ("v#*[!space]", "v", "#", "*[!space]"),
+            ("v%[[:space:]]*", "v", "%", "[[:space:]]*"),
+            ("s%%:*", "s", "%%", ":*"),
+            ("s##*:", "s", "##", "*:"),
+            ("s#*:", "s", "#", "*:"),
+            ("s%:*", "s", "%", ":*"),
+            ("w##*.", "w", "##", "*."),
+            ("w%%.*", "w", "%%", ".*"),
+        ] {
+            let pe = params(body);
+            assert_eq!(pe.variable, name, "${body}: wrong name");
+            let got = match pe.operator {
+                Op::RemoveLongestPrefix(p) => ("##", p),
+                Op::RemoveShortestPrefix(p) => ("#", p),
+                Op::RemoveLongestSuffix(p) => ("%%", p),
+                Op::RemoveShortestSuffix(p) => ("%", p),
+                other => panic!("${{{body}}}: expected a trim, got {other:?}"),
+            };
+            assert_eq!(got, (op, pat.to_string()), "${{{body}}}");
+        }
+        // The dedicated path idioms keep their ops ...
+        match params("v##*/").operator {
+            Op::Basename => {}
+            other => panic!("expected Basename, got {other:?}"),
+        }
+        match params("v%/*").operator {
+            Op::Dirname => {}
+            other => panic!("expected Dirname, got {other:?}"),
+        }
+        // ... and the slice / value forms are untouched by the trim rule.
+        match params("v:1:2").operator {
+            Op::ArraySlice(off, len) => {
+                assert_eq!(off, "1");
+                assert_eq!(len.as_deref(), Some("2"));
+            }
+            other => panic!("expected a slice, got {other:?}"),
+        }
+        match params("v:1").operator {
+            Op::ArraySlice(off, len) => {
+                assert_eq!(off, "1");
+                assert_eq!(len, None);
+            }
+            other => panic!("expected a slice, got {other:?}"),
+        }
+        match params("v:-d").operator {
+            Op::DefaultValue(d) => assert_eq!(d, "d"),
+            other => panic!("expected DefaultValue, got {other:?}"),
+        }
+        match params("v:+a").operator {
+            Op::UseAlternative(w, true) => assert_eq!(w, "a"),
+            other => panic!("expected `:+`, got {other:?}"),
+        }
+        // `${#v}` is a length, not a trim of a variable called `#`.
+        assert_eq!(params("#v").variable, "#v");
     }
 
     /// Only the FIRST colon can introduce a `:` operator. In `${s:1:-1}`

@@ -23818,6 +23818,52 @@ mod tests {
         );
     }
 
+    /// Parameter expansion, end to end. `${v#pat}` / `${v##pat}` / `${v%pat}`
+    /// / `${v%%pat}` whose PATTERN carries `:`, `[`, `]`, `!`, `*` or a POSIX
+    /// class must render natively and agree with bash; the slice and value
+    /// forms (`${v:off}`, `${v:off:len}` incl. a negative length, `${v:-d}`,
+    /// `${v:+a}`, an unset default) must keep behaving exactly as before.
+    ///
+    /// Before the parser split the operator by NAME, the `:` of
+    /// `${v##*[![:space:]]}` was read as the slice separator and every
+    /// backend emitted a substring of a variable named `v##*[![`.
+    #[test]
+    fn parameter_trim_patterns_execute_like_bash() {
+        let src = "for v in \"  padded  \" \"x y\" \"abc\"; do\n\
+                   a=${v##*[![:space:]]}\n\
+                   b=${v%%[[:space:]]*}\n\
+                   c=${v#*[![:space:]]}\n\
+                   d=${v%[[:space:]]*}\n\
+                   echo \"[$a][$b][$c][$d]\"\n\
+                   done\n\
+                   s=\"a:b:c\"\n\
+                   echo \"[${s%%:*}][${s##*:}][${s#*:}][${s%:*}][${s##*/}][${s%/*}]\"\n\
+                   w=\"foo.tar.gz\"\n\
+                   echo \"[${w##*.}][${w%.*}][${w#*.}][${w%%.*}]\"\n\
+                   u=\"hello\"\n\
+                   echo \"[${u:-def}][${u:+alt}][${u:1}][${u:1:2}][${u:1:-1}]\"\n\
+                   unset z\n\
+                   echo \"[${z:-fallback}][${z:+nope}]\"\n";
+        let prog = render_rs(src);
+        assert!(!prog.contains("__sh_spawn("), "still shells out:\n{prog}");
+        assert!(
+            prog.contains("__sh_fnmatch("),
+            "the pattern must go through the glob matcher:\n{prog}"
+        );
+        assert!(
+            !prog.contains("v##*[!["),
+            "the pattern leaked into the variable name:\n{prog}"
+        );
+        let (rs_out, rs_rc) = compile_and_run("ParamTrimPatterns", &prog);
+        let (sh_out, sh_rc) = run_bash(src);
+        assert_eq!(
+            String::from_utf8_lossy(&rs_out),
+            String::from_utf8_lossy(&sh_out),
+            "stdout differs (rust rc={rs_rc:?}, bash rc={sh_rc:?})"
+        );
+        assert_eq!(rs_rc, sh_rc, "exit status differs");
+    }
+
     /// A redirect ANYWHERE in the program used to make every constant
     /// echo pay the word-printing helper: the Output arm tested the
     /// whole-program `runtime_free` verdict, not the point-sensitive

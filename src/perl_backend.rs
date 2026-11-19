@@ -3029,10 +3029,21 @@ fn glob_to_regex(pat: &str, greedy: bool) -> String {
             '*' => out.push_str(star),
             '?' => out.push('.'),
             '[' => {
-                // character class: pass through; a lone `[` (no closing
-                // bracket) is a literal
+                // Character class: pass through, but parse it the way BASH
+                // does — `[!x]` is the negated class (Perl spells it `[^x]`),
+                // and a POSIX class `[[:space:]]` is one group inside the
+                // outer brackets, not its closing `]` (the old scanner ended
+                // the class at the inner `]` and emitted `[![:space:\]`,
+                // which is an UNMATCHED `[` at compile time — `${v##*[!
+                // [:space:]]}` died with "Unmatched [ in regex").
                 let mut j = i + 1;
                 let mut cls = String::from("[");
+                let mut negated = false;
+                if j < chars.len() && (chars[j] == '!' || chars[j] == '^') {
+                    negated = true;
+                    cls.push('^');
+                    j += 1;
+                }
                 let mut first = true;
                 let mut closed = false;
                 while j < chars.len() {
@@ -3040,7 +3051,33 @@ fn glob_to_regex(pat: &str, greedy: bool) -> String {
                     if cc == ']' && !first {
                         cls.push(']');
                         closed = true;
+                        // `j` stays ON the closing bracket: the outer loop's
+                        // `i = j; i += 1` must land on the character AFTER
+                        // it. Advancing here skipped a following `*` —
+                        // `[[:space:]]*` compiled to just `[[:space:]]`.
                         break;
+                    }
+                    // `[:name:]` / `[=c=]` / `[.c.]` group: copy through to
+                    // its own closing `]` so the outer scan does not end there.
+                    if cc == '['
+                        && j + 1 < chars.len()
+                        && matches!(chars[j + 1], ':' | '=' | '.')
+                    {
+                        let kind = chars[j + 1];
+                        let mut k = j + 2;
+                        while k + 1 < chars.len()
+                            && !(chars[k] == kind && chars[k + 1] == ']')
+                        {
+                            k += 1;
+                        }
+                        if k + 1 < chars.len() {
+                            for ch in &chars[j..=k + 1] {
+                                cls.push(*ch);
+                            }
+                            j = k + 2;
+                            first = false;
+                            continue;
+                        }
                     }
                     if cc == '\\' {
                         cls.push('\\');
@@ -3049,6 +3086,7 @@ fn glob_to_regex(pat: &str, greedy: bool) -> String {
                     first = false;
                     j += 1;
                 }
+                let _ = negated;
                 if closed {
                     out.push_str(&cls);
                     i = j;
@@ -3465,3 +3503,4 @@ mod escaping_tests {
         );
     }
 }
+

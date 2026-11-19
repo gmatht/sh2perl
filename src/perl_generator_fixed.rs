@@ -5882,6 +5882,67 @@ mod pgf_tests {
             );
         }
     }
+    /// The `${v#pat}` family with `:`, `[`, `]`, `!`, `*` and a POSIX class
+    /// in the PATTERN, rendered through the `pl` target's real entry point
+    /// and compared to bash. Two renderer bugs made this fail before: the
+    /// class scanner ended the bracket expression at the inner `]` of
+    /// `[:space:]` (emitting `[[:space:]\]`, an unmatched `[` that killed
+    /// the program at compile time), and `%` was rendered as a leftmost
+    /// regex match — i.e. as `%%` — so `${v%[[:space:]]*}` emptied the
+    /// string instead of trimming one trailing space.
+    #[test]
+    fn parameter_trim_patterns_execute_like_bash() {
+        let src = "for v in \"  padded  \" \"x y\" \"abc\"; do\n\
+                   a=${v##*[![:space:]]}\n\
+                   b=${v%%[[:space:]]*}\n\
+                   c=${v#*[![:space:]]}\n\
+                   d=${v%[[:space:]]*}\n\
+                   echo \"[$a][$b][$c][$d]\"\n\
+                   done\n\
+                   s=\"a:b:c\"\n\
+                   echo \"[${s%%:*}][${s##*:}][${s#*:}][${s%:*}][${s##*/}][${s%/*}]\"\n\
+                   w=\"foo.tar.gz\"\n\
+                   echo \"[${w##*.}][${w%.*}][${w#*.}][${w%%.*}]\"\n\
+                   u=\"hello\"\n\
+                   echo \"[${u:-def}][${u:+alt}][${u:1}][${u:1:2}][${u:1:-1}]\"\n\
+                   unset z\n\
+                   echo \"[${z:-fallback}][${z:+nope}]\"\n";
+        let mut p = crate::Parser::new(src);
+        let cmds = p.parse().expect("parse");
+        let prog = crate::shir::ast_to_ir(&cmds);
+        let pl = generate(&prog);
+        assert!(
+            !pl.contains("v##*[!["),
+            "the pattern leaked into the variable name:\n{pl}"
+        );
+        let dir = std::env::temp_dir().join("pgf_trim_patterns");
+        std::fs::create_dir_all(&dir).expect("tmpdir");
+        let sh_path = dir.join("t.sh");
+        let pl_path = dir.join("t.pl");
+        std::fs::write(&sh_path, src).expect("write sh");
+        std::fs::write(&pl_path, &pl).expect("write pl");
+        let sh = std::process::Command::new("bash")
+            .arg(&sh_path)
+            .output()
+            .expect("run bash");
+        let got = std::process::Command::new("perl")
+            .arg(&pl_path)
+            .output()
+            .expect("run perl");
+        assert_eq!(
+            String::from_utf8_lossy(&got.stdout),
+            String::from_utf8_lossy(&sh.stdout),
+            "stdout differs; perl stderr:\n{}\n--- perl ---\n{pl}",
+            String::from_utf8_lossy(&got.stderr)
+        );
+        assert_eq!(
+            got.status.code(),
+            sh.status.code(),
+            "exit status differs; perl stderr:\n{}",
+            String::from_utf8_lossy(&got.stderr)
+        );
+    }
+
     #[test]
     fn _dbg_dump_ir() {
         let src = "is_prime() { if [ $1 -eq 2 ]; then return 0; fi; return 1; }\nx=3; if is_prime $x; then echo yes; fi\n";

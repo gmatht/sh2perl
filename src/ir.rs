@@ -4821,6 +4821,28 @@ fn glob_to_regex(pat: &str) -> String {
     glob_to_regex_greedy(pat, true)
 }
 
+#[cfg(test)]
+mod glob_regex_tests {
+    use super::glob_to_regex_greedy;
+
+    /// A POSIX class inside a bracket expression is ONE member: the scanner
+    /// must not end the class at the inner `]`. Ending there emitted
+    /// `[[:space:]\]` (an unmatched `[`) for `${v##*[![:space:]]}`, which
+    /// took the whole Perl program down at compile time.
+    #[test]
+    fn posix_class_stays_inside_the_bracket_expression() {
+        assert_eq!(glob_to_regex_greedy("[![:space:]]", true), "[^[:space:]]");
+        assert_eq!(glob_to_regex_greedy("[[:space:]]*", true), "[[:space:]].*");
+        assert_eq!(
+            glob_to_regex_greedy("*[![:space:]]", true),
+            ".*[^[:space:]]"
+        );
+        // a plain class and a negated one keep working
+        assert_eq!(glob_to_regex_greedy("[abc]", true), "[abc]");
+        assert_eq!(glob_to_regex_greedy("[!abc]", true), "[^abc]");
+    }
+}
+
 /// `*` → `.*` when greedy, `.*?` when non-greedy (bash #/%% shortest vs
 /// ##/%% longest prefix/suffix removal).
 fn glob_to_regex_greedy(pat: &str, greedy: bool) -> String {
@@ -4928,6 +4950,32 @@ fn glob_to_regex_greedy(pat: &str, greedy: bool) -> String {
                     if d == ']' {
                         out.push(']');
                         break;
+                    }
+                    // A POSIX class group `[:name:]` (also `[=c=]`, `[.c.]`)
+                    // is ONE member of the enclosing bracket expression — its
+                    // own `]` does not close the outer class. Stopping there
+                    // emitted `[[:space:]\]` for `${v##*[![:space:]]}`, which
+                    // Perl rejects as an unmatched `[`, and the programme
+                    // died at compile time.
+                    if d == '[' {
+                        if let Some(&kind) = chars.peek() {
+                            if kind == ':' || kind == '=' || kind == '.' {
+                                out.push('[');
+                                out.push(kind);
+                                chars.next();
+                                while let Some(e) = chars.next() {
+                                    out.push(e);
+                                    if e == kind {
+                                        break;
+                                    }
+                                }
+                                if chars.peek() == Some(&']') {
+                                    out.push(']');
+                                    chars.next();
+                                }
+                                continue;
+                            }
+                        }
                     }
                     if d == '\\' {
                         if let Some(&e) = chars.peek() {
@@ -5573,7 +5621,7 @@ fn render_param(args: &[IrExpr]) -> String {
             let pat = args.get(2).and_then(call_arg_str).unwrap_or_default();
             if pat == ".*" {
                 if op == "%%" || op == "%%:" {
-                    strip_re(&var, "\\.*$")
+                    strip_re(&var, "\\..*$")
                 } else {
                     strip_re(&var, "\\.[^.]*$")
                 }
@@ -5588,9 +5636,26 @@ fn render_param(args: &[IrExpr]) -> String {
                 };
                 strip_re(&var, &format!("{}$", re))
             } else {
+                // General suffix: bash scans SUFFIX LENGTHS — `%` takes the
+                // shortest suffix the pattern matches (the empty suffix
+                // included, which is why `${v%*}` leaves v alone), `%%` the
+                // longest. `s{RE$}{}r` instead takes the LEFTMOST match, i.e.
+                // always the longest, so `${v%pat}` behaved as `${v%%pat}`:
+                // `${v%[[:space:]]*}` emptied the string instead of trimming
+                // one trailing space.
                 let greedy = matches!(op.as_str(), "%%" | "%%:");
-                let re = glob_to_regex_greedy(&pat, greedy);
-                strip_re(&var, &format!("{}$", re))
+                let re = glob_to_regex_greedy(&pat, true);
+                let (init, cond, step) = if greedy {
+                    ("0".to_string(), format!("<= length({var})"), "++")
+                } else {
+                    (format!("length({var})"), ">= 0".to_string(), "--")
+                };
+                format!(
+                    "do {{ my $__t = {var}; my $__r = $__t; \
+                     for (my $__i = {init}; $__i {cond}; $__i{step}) {{ \
+                     if (substr($__t, $__i) =~ /\\A(?:{re})\\z/) {{ \
+                     $__r = substr($__t, 0, $__i); last }} }} $__r }}"
+                )
             }
         }
         // Named idioms the IR maps: ##*/ → basename, %/* → dirname.
