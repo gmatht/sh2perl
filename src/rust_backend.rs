@@ -15827,6 +15827,26 @@ fn helper_source(h: &str) -> &'static str {
     let pat = pat.split('\0').next().unwrap_or(pat);
     let p: Vec<char> = pat.chars().collect();
     let t: Vec<char> = s.chars().collect();
+    // The POSIX class names glob(7)/bash accept. Unicode-aware like the rest
+    // of this runtime; `print`/`graph` are approximated over `char` (the
+    // frontend only admits ASCII text today).
+    fn class_pred(n: &str) -> Option<fn(char) -> bool> {
+        Some(match n {
+            "alnum" => |c: char| c.is_alphanumeric(),
+            "alpha" => |c: char| c.is_alphabetic(),
+            "blank" => |c: char| c == ' ' || c == '\t',
+            "cntrl" => |c: char| c.is_control(),
+            "digit" => |c: char| c.is_ascii_digit(),
+            "graph" => |c: char| !c.is_whitespace() && !c.is_control(),
+            "lower" => |c: char| c.is_lowercase(),
+            "print" => |c: char| !c.is_control(),
+            "punct" => |c: char| c.is_ascii_punctuation(),
+            "space" => |c: char| c.is_whitespace(),
+            "upper" => |c: char| c.is_uppercase(),
+            "xdigit" => |c: char| c.is_ascii_hexdigit(),
+            _ => return None,
+        })
+    }
     fn m(p: &[char], t: &[char]) -> bool {
         if p.is_empty() { return t.is_empty(); }
         match p[0] {
@@ -15844,6 +15864,20 @@ fn helper_source(h: &str) -> &'static str {
                 let mut first = true;
                 while j < p.len() && (p[j] != ']' || first) {
                     first = false;
+                    // POSIX character class inside the bracket list:
+                    // `[[:space:]]`, `[![:digit:]]`, … — bash (glob(7))
+                    // folds the same names. An unknown name is NOT a class:
+                    // it stays the literal `[` the old scan would match.
+                    if p[j] == '[' && j + 1 < p.len() && p[j + 1] == ':' {
+                        if let Some(rel) = p[j + 2..].windows(2).position(|w| w == [':', ']']) {
+                            let name: String = p[j + 2..j + 2 + rel].iter().collect();
+                            if let Some(pred) = class_pred(&name) {
+                                if pred(t[0]) { matched = true; }
+                                j += rel + 4;
+                                continue;
+                            }
+                        }
+                    }
                     if j + 2 < p.len() && p[j + 1] == '-' && p[j + 2] != ']' {
                         if t[0] >= p[j] && t[0] <= p[j + 2] { matched = true; }
                         j += 3;
@@ -16890,8 +16924,20 @@ fn test_tokens(s: &str) -> Option<Vec<TTok>> {
                     out.push(extglob_tok(&ch, &mut i));
                 } else {
                     let start = i;
+                    // A `[...]` bracket expression is ONE glob word: its `!`
+                    // (negation) is not the `!` operator and its `=`,`<`,`>`
+                    // are class members. `[[ $v == *[!space] ]]` used to
+                    // tokenize as `*[` `!` `space]` and fall out of the
+                    // parser (which then printed `true`).
+                    let mut in_bracket = false;
                     while i < ch.len() {
                         let c2 = ch[i];
+                        if in_bracket {
+                            if c2 == ']' { in_bracket = false; }
+                            i += 1;
+                            continue;
+                        }
+                        if c2 == '[' { in_bracket = true; i += 1; continue; }
                         if c2 == ' ' || c2 == '\t' || c2 == '\n' || c2 == '(' || c2 == ')'
                             || c2 == '!' || c2 == '=' || c2 == '<' || c2 == '>' || c2 == '"'
                             || c2 == '\''
@@ -17031,8 +17077,15 @@ fn test_tokens(s: &str) -> Option<Vec<TTok>> {
                 || c == '*' || c == '?' || c == '[' || c == ']' || c == '^' || c == '{'
                 || c == '}' || c == ':' || c == ',' || c == '#' || c == '@' || c == '%' => {
                 let start = i;
+                let mut in_bracket = false;
                 while i < ch.len() {
                     let c2 = ch[i];
+                    if in_bracket {
+                        if c2 == ']' { in_bracket = false; }
+                        i += 1;
+                        continue;
+                    }
+                    if c2 == '[' { in_bracket = true; i += 1; continue; }
                     if c2 == ' ' || c2 == '\t' || c2 == '\n' || c2 == '(' || c2 == ')'
                         || c2 == '!' || c2 == '=' || c2 == '<' || c2 == '>' || c2 == '"'
                         || c2 == '\''
@@ -23707,6 +23760,64 @@ mod tests {
         );
     }
 
+    /// Two shapes that still kept `bash -c` after the node renderers landed,
+    /// and that no spelling test could pin:
+    ///
+    /// 1. a program's FINAL pipeline is the structured `IrStmt::Pipeline` — a
+    ///    different statement shape from the `pipeline` Call used mid-program.
+    ///    The text-op reductions only knew the Call, so every script ENDING in
+    ///    `| head`/`| tail`/`| tr`/`| wc`/`| cut`/`| sort`/`| uniq`/`| xargs`
+    ///    kept spawning, even though the same stages reduced a line earlier;
+    /// 2. `[[:space:]]`-style POSIX classes inside a glob were read as the
+    ///    literal characters `[ : s p a c e : ]`, so a `case`/`[[ ]]` pattern
+    ///    selected the wrong words.
+    ///
+    /// Both are proven by EXECUTING against bash, like the node cases above:
+    /// no `__sh_spawn(` anywhere, and stdout/status byte-identical.
+    #[test]
+    fn final_pipelines_and_glob_classes_execute_like_bash() {
+        let cases: &[(&str, &str, Option<&str>)] = &[
+            ("FinalPipeHead", "echo abc | head -n 2\n", Some("__l[..__e].join")),
+            ("FinalPipeTail", "echo abc | tail -n 1\n", Some("__l[__s..].join")),
+            ("FinalPipeWc", "echo \"a b c\" | wc -w\n", None),
+            ("FinalPipeCut", "echo \"a,b,c\" | cut -d, -f2\n", None),
+            ("FinalPipeXargs", "echo \" a b \" | xargs\n", None),
+            (
+                "GlobClasses",
+                "for v in \"  x\" \"x  \" \"9ab\" \"abc\"; do\n  case \"$v\" in\n    [[:space:]]*) echo \"blank:$v\" ;;\n    [[:digit:]]*) echo \"digit:$v\" ;;\n    *) echo \"other:$v\" ;;\n  esac\ndone\nfor v in x \"  \" 9; do\n  if [[ \"$v\" == *[![:space:]] ]]; then echo \"nonblank:$v\"; else echo \"blankend:$v\"; fi\ndone\n",
+                Some("__sh_fnmatch("),
+            ),
+        ];
+        let mut bad: Vec<String> = Vec::new();
+        for (name, src, marker) in cases {
+            let prog = render_rs(src);
+            if let Some(marker) = marker {
+                if !prog.contains(marker) {
+                    bad.push(format!("{name}: expected {marker:?} in the render"));
+                    continue;
+                }
+            }
+            if prog.contains("__sh_spawn(") {
+                bad.push(format!("{name}: still shells out"));
+                continue;
+            }
+            let (rs_out, rs_rc) = compile_and_run(name, &prog);
+            let (sh_out, sh_rc) = run_bash(src);
+            if rs_out != sh_out || rs_rc != sh_rc {
+                bad.push(format!(
+                    "{name}: rust rc={rs_rc:?} out={:?} / bash rc={sh_rc:?} out={:?}",
+                    String::from_utf8_lossy(&rs_out),
+                    String::from_utf8_lossy(&sh_out)
+                ));
+            }
+        }
+        assert!(
+            bad.is_empty(),
+            "final pipelines / glob classes disagree with bash:\n{}",
+            bad.join("\n")
+        );
+    }
+
     /// A redirect ANYWHERE in the program used to make every constant
     /// echo pay the word-printing helper: the Output arm tested the
     /// whole-program `runtime_free` verdict, not the point-sensitive
@@ -23932,10 +24043,11 @@ mod tests {
         );
     }
 
-    /// `TakeLines` is offered but has no shell-source lowering shape today
-    /// (every `| head` arrives as a pipeline), so its VALUE is pinned by
-    /// building the node directly and executing it against the bash command it
-    /// models — `head -n`/`tail -n` — rather than only its spelling.
+    /// Source-driven coverage of `| head`/`| tail` lives in
+    /// `final_pipelines_and_glob_classes_execute_like_bash` below; this case
+    /// pins the NODE itself (an arbitrary line list, not an echo producer), so
+    /// its VALUE is pinned by building the node directly and executing it
+    /// against the bash command it models — `head -n`/`tail -n`.
     #[test]
     fn constructed_text_nodes_execute_like_bash() {
         use crate::shir_nodes::TakeLines;
