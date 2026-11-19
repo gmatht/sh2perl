@@ -11376,7 +11376,17 @@ impl Render {
                 self.add_helper("len");
                 format!("__sh_len(&{var_expr}).to_string()")
             }
-            "^^" | "^^:" | ",," | ",,:" | "^" | "^:" | "," | ",:" => {
+            "^^" | "^^:" | ",," | ",,:" => {
+                // Whole-string case modification is a `std` call — no helper.
+                // (`^`/`,` inside-truncated forms keep `__sh_case`.)
+                let mode = op.trim_end_matches(':');
+                if mode == "^^" {
+                    format!("{var_expr}.to_uppercase()")
+                } else {
+                    format!("{var_expr}.to_lowercase()")
+                }
+            }
+            "^" | "^:" | "," | ",:" => {
                 let mode = op.trim_end_matches(':');
                 self.add_helper("case");
                 format!("__sh_case(&{var_expr}, {})", Self::rust_str(mode))
@@ -13765,6 +13775,11 @@ impl Render {
                                     self.add_helper("fnmatch");
                                     format!("__sh_fnmatch(&({val}), &{dg})")
                                 }
+                            } else if !unquoted.contains('\\') && !glob_like(&unquoted) {
+                                // A pattern with no metachar AND no escape is
+                                // a plain string — `case x in abc)` needs no
+                                // matcher (the same fold `[[ ]]` already does).
+                                format!("({dg} == {})", Self::rust_str(&unquoted))
                             } else {
                                 self.add_helper("fnmatch");
                                 format!("__sh_fnmatch({}, &{dg})", Self::rust_str(&unquoted))
@@ -23551,6 +23566,29 @@ mod tests {
             let out = render_rs(src);
             assert!(out.contains("fn __sh_printf("), "engine dropped for {src}:\n{out}");
         }
+    }
+
+    // ── native `std` at the call site instead of a helper ────────────
+
+    /// Whole-string `${v^^}` / `${v,,}` are `std` calls, not `__sh_case`.
+    #[test]
+    fn case_modifiers_are_std_calls() {
+        for (src, m) in [
+            ("v=\"$1\"\necho \"${v^^}\"\n", "to_uppercase"),
+            ("v=\"$1\"\necho \"${v,,}\"\n", "to_lowercase"),
+        ] {
+            let out = render_rs(src);
+            assert!(out.contains(m), "no {m}:\n{out}");
+            assert!(!out.contains("fn __sh_case("), "helper emitted:\n{out}");
+        }
+    }
+
+    /// A case pattern with no metachar and no escape is a string compare —
+    /// the 117-line matcher is not dragged in for `case x in abc)`.
+    #[test]
+    fn metachar_free_case_pattern_is_a_compare() {
+        let out = render_rs("case abc in abc) echo yes;; esac\n");
+        assert!(!out.contains("fn __sh_fnmatch("), "matcher emitted:\n{out}");
     }
 
     /// A metachar-free literal `#`/`%` strip is `strip_prefix`/
