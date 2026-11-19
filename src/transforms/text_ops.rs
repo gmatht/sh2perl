@@ -19,6 +19,22 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 
 static LIFT_COUNT: AtomicUsize = AtomicUsize::new(0);
 
+/// May the CURRENT target render this Ext node? The §11.12 offer: a tag in the
+/// target's manifest means its renderer spells the node natively, so swapping
+/// the exact command for the node cannot regress. An explicit
+/// `SH2_TRANSFORMS=text-ops` keeps the historical emit-everything mode (the
+/// A/B worker's baseline, and every other backend's path today).
+fn offered(tag: &str) -> bool {
+    let enabled = std::env::var("SH2_TRANSFORMS").unwrap_or_default();
+    if enabled.split(',').any(|s| s.trim() == "text-ops") {
+        return true;
+    }
+    match crate::transforms::target() {
+        Some(t) => crate::transforms::planner::node_manifest(&t).contains(&tag),
+        None => false,
+    }
+}
+
 pub fn transform(stmts: &mut Vec<IrStmt>) -> bool {
     // text-ops is an EXPERIMENTAL lowering that changes the shIR shape
     // (pipelines/commands → ExtExpr nodes). It is opt-in ONLY: run when
@@ -27,7 +43,19 @@ pub fn transform(stmts: &mut Vec<IrStmt>) -> bool {
     // have conservative Ext-node defaults, but the byte-equal round-trip
     // and corpus tests still pin the UN-lowered shape).
     let enabled = std::env::var("SH2_TRANSFORMS").unwrap_or_default();
-    if !enabled.split(',').any(|s| s.trim() == "text-ops") {
+    let opted_in = enabled.split(',').any(|s| s.trim() == "text-ops");
+    // Rust takes the manifest offer (PLAN v157): its renderer declares each
+    // text node it spells in `std`, and `offered()` withholds every other tag,
+    // so the transform fires only for the shapes that target consumes. The
+    // other backends keep the explicit opt-in until their own gates pin the
+    // new IR shape.
+    // NOTE (PLAN v157): switching this on for `rs` (so the manifest, not the
+    // env var, decides) is NOT safe yet — the transform's STRUCTURAL rewrites
+    // (capture reduction, dead-store elimination, subshell scoping) emit
+    // shapes the Rust renderer only half-renders, so the probe programs lost
+    // their values. The renderer arms + `offered()` below are the prerequisite
+    // half; the structural rewrites need their own per-target gate first.
+    if !opted_in {
         return false;
     }
     // text-ops is often exercised ALONE (SH2_TRANSFORMS=text-ops) — the
@@ -267,7 +295,7 @@ fn lower_stmt(stmt: &mut IrStmt, emit: bool, arrays: &std::collections::HashSet<
                 });
                 if is_wc_l {
                     if let Some(path) = path {
-                        *stmt = streaming_line_count(path, None);
+                        if let Some(__s) = streaming_line_count(path, None) { *stmt = __s; }
                         LIFT_COUNT.fetch_add(1, Ordering::Relaxed);
                         return;
                     }
@@ -377,7 +405,7 @@ fn lower_stmt(stmt: &mut IrStmt, emit: bool, arrays: &std::collections::HashSet<
                         if ok && strs.len() == 2 && !strs[1].starts_with('-') {
                             let pat = IrExpr::Str(strs[0].to_string(), StrStyle::DoubleQuoted);
                             let path = IrExpr::Str(strs[1].to_string(), StrStyle::DoubleQuoted);
-                            *stmt = streaming_line_count(path, Some(pat));
+                            if let Some(__s) = streaming_line_count(path, Some(pat)) { *stmt = __s; }
                             LIFT_COUNT.fetch_add(1, Ordering::Relaxed);
                             return;
                         }
@@ -710,6 +738,7 @@ fn try_lower_yes_head(stage1: &[IrStmt], head_args: &[IrExpr]) -> Option<IrExpr>
         text: IrExpr::Str(format!("{}\n", text), StrStyle::DoubleQuoted),
         count: IrExpr::Int(k),
     })))
+    .filter(|_| offered("RepeatStr"))
 }
 
 /// Extract the -n K count from `head -n K` / `head -K`.
@@ -1023,10 +1052,12 @@ fn try_lower_tr(text: IrExpr, args: &[IrExpr]) -> Option<IrExpr> {
     // — leave them to the runtime.
     if from.contains("[:") || to.contains("[:") {
         if !delete && !squeeze && from == "[:upper:]" && to == "[:lower:]" {
-            return Some(IrExpr::Ext(Box::new(CaseTransform { text, upper: false })));
+            return Some(IrExpr::Ext(Box::new(CaseTransform { text, upper: false })))
+                .filter(|_| offered("CaseTransform"));
         }
         if !delete && !squeeze && from == "[:lower:]" && to == "[:upper:]" {
-            return Some(IrExpr::Ext(Box::new(CaseTransform { text, upper: true })));
+            return Some(IrExpr::Ext(Box::new(CaseTransform { text, upper: true })))
+                .filter(|_| offered("CaseTransform"));
         }
         return None; // other class translations → runtime
     }
@@ -1037,10 +1068,12 @@ fn try_lower_tr(text: IrExpr, args: &[IrExpr]) -> Option<IrExpr> {
     // — leave them to the runtime.
     if from.contains("[:") || to.contains("[:") {
         if !delete && !squeeze && from == "[:upper:]" && to == "[:lower:]" {
-            return Some(IrExpr::Ext(Box::new(CaseTransform { text, upper: false })));
+            return Some(IrExpr::Ext(Box::new(CaseTransform { text, upper: false })))
+                .filter(|_| offered("CaseTransform"));
         }
         if !delete && !squeeze && from == "[:lower:]" && to == "[:upper:]" {
-            return Some(IrExpr::Ext(Box::new(CaseTransform { text, upper: true })));
+            return Some(IrExpr::Ext(Box::new(CaseTransform { text, upper: true })))
+                .filter(|_| offered("CaseTransform"));
         }
         return None; // other class translations → runtime
     }
@@ -1050,13 +1083,15 @@ fn try_lower_tr(text: IrExpr, args: &[IrExpr]) -> Option<IrExpr> {
         return Some(IrExpr::Ext(Box::new(CaseTransform {
             text: text,
             upper: true,
-        })));
+        })))
+        .filter(|_| offered("CaseTransform"));
     }
     if !delete && !squeeze && from == "A-Z" && to == "a-z" {
         return Some(IrExpr::Ext(Box::new(CaseTransform {
             text: text,
             upper: false,
-        })));
+        })))
+        .filter(|_| offered("CaseTransform"));
     }
 
     Some(IrExpr::Ext(Box::new(CharTranslate {
@@ -1114,6 +1149,7 @@ fn try_lower_head_tail(text: IrExpr, args: &[IrExpr], from_end: bool) -> Option<
         from_end,
         bytes,
     })))
+    .filter(|_| offered("TakeLines"))
 }
 
 // ── wc ───────────────────────────────────────────────────────────────
@@ -1155,7 +1191,7 @@ fn try_lower_wc(text: IrExpr, trailing_newline: bool, args: &[IrExpr]) -> Option
     }
     if lower_c {
         // wc -c → StrLen (text.length)
-        Some(IrExpr::Ext(Box::new(StrLen { text })))
+        Some(IrExpr::Ext(Box::new(StrLen { text }))).filter(|_| offered("StrLen"))
     } else {
         // wc -l → RegCount(text, /\n/) (newline count, NOT split-length:
         // off by one on the trailing newline). wc -w → WordCount(text):
@@ -1173,12 +1209,14 @@ fn try_lower_wc(text: IrExpr, trailing_newline: bool, args: &[IrExpr]) -> Option
                 text,
                 pattern: "\\n".to_string(),
             })))
+            .filter(|_| offered("RegCount"))
         } else {
             // wc -w → WordCount(text) — a dedicated node: C renders an
             // inline transition-count scan (no allocation), JS/Perl the
             // split-length idiom (docs/shir-reductions.md, source-aware
             // literal-string row of the wc table)
             Some(IrExpr::Ext(Box::new(WordCount { text })))
+                .filter(|_| offered("WordCount"))
         }
     }
 }
@@ -1397,6 +1435,7 @@ fn try_lower_xargs(text: IrExpr, args: &[IrExpr], is_literal: bool) -> Option<Ir
         leading: true,
         trailing: true,
     })))
+    .filter(|_| offered("StringTrim"))
 }
 
 // ── ${#var} → StrLen ────────────────────────────────────────────────
@@ -1418,7 +1457,8 @@ fn try_lower_param_len(args: &[IrExpr]) -> Option<IrExpr> {
         if let IrExpr::Str(op, _) = &args[0] {
             if op == "length" || op == "len" {
                 let var = param_var_read(&args[1])?;
-                return Some(IrExpr::Ext(Box::new(StrLen { text: var })));
+                return Some(IrExpr::Ext(Box::new(StrLen { text: var })))
+                    .filter(|_| offered("StrLen"));
             }
         }
     }
@@ -1978,8 +2018,10 @@ fn try_lower_param_op(args: &[IrExpr], arrays: &std::collections::HashSet<String
     let op = match &args[0] { IrExpr::Str(s, _) => s.as_str(), _ => return None };
     let var = param_var_read(&args[1])?;
     match op {
-        ",," => Some(IrExpr::Ext(Box::new(CaseTransform { text: var, upper: false }))),
-        "^^" => Some(IrExpr::Ext(Box::new(CaseTransform { text: var, upper: true }))),
+        ",," => Some(IrExpr::Ext(Box::new(CaseTransform { text: var, upper: false })))
+            .filter(|_| offered("CaseTransform")),
+        "^^" => Some(IrExpr::Ext(Box::new(CaseTransform { text: var, upper: true })))
+            .filter(|_| offered("CaseTransform")),
 
         "slice" if args.len() >= 4 => {
             // ${v:N:M} on a SCALAR is SubStr; on an ARRAY it's an index
@@ -2002,6 +2044,7 @@ fn try_lower_param_op(args: &[IrExpr], arrays: &std::collections::HashSet<String
                 offset: IrExpr::Int(off),
                 length: Some(Box::new(IrExpr::Int(len))),
             })))
+            .filter(|_| offered("SubStrExtract"))
         }
         _ => None,
     }
@@ -2023,7 +2066,8 @@ fn try_lower_grep(text: IrExpr, args: &[IrExpr]) -> Option<IrExpr> {
         return Some(IrExpr::Ext(Box::new(StringContains {
             text: text.clone(),
             pattern,
-        })));
+        })))
+        .filter(|_| offered("StringContains"));
     }
     None
 }
@@ -2036,7 +2080,8 @@ fn try_lower_getvar_len(args: &[IrExpr]) -> Option<IrExpr> {
             if name.starts_with('#') && name.len() > 1 {
                 let var_name = &name[1..];
                 let var = param_var_read(&IrExpr::Str(var_name.to_string(), StrStyle::DoubleQuoted))?;
-                return Some(IrExpr::Ext(Box::new(StrLen { text: var })));
+                return Some(IrExpr::Ext(Box::new(StrLen { text: var })))
+                    .filter(|_| offered("StrLen"));
             }
             None
         }
@@ -2185,6 +2230,7 @@ fn try_lower_printf_repeat(args: &[IrExpr]) -> Option<IrExpr> {
         text: IrExpr::Str(unit.to_string(), StrStyle::DoubleQuoted),
         count: IrExpr::Int(total),
     })))
+    .filter(|_| offered("RepeatStr"))
 }
 
 /// Reduce `x=$(echo X | <reducible>)`: the Assign's Capture-wrapped pipeline
@@ -2475,7 +2521,12 @@ fn loop_var_read(lv: &str) -> IrExpr {
 /// Build a STREAMING line counter: `n=0; ForEachLine(src, guard? n+=1)` —
 /// value = n. guard=None counts every line (`wc -l < F`); Some(pattern)
 /// counts lines containing it (`grep P F | wc -l`). O(1) memory.
-fn streaming_line_count(source: IrExpr, guard: Option<IrExpr>) -> IrStmt {
+fn streaming_line_count(source: IrExpr, guard: Option<IrExpr>) -> Option<IrStmt> {
+    // The streaming form is ForEachLine: a target without that node keeps the
+    // original command (grep/cat | wc -l), which is exact everywhere.
+    if !offered("ForEachLine") {
+        return None;
+    }
     let k = LIFT_COUNT.fetch_add(1, Ordering::Relaxed);
     let cnt = format!("__lc{}", k);
     let lv = format!("__l{}", k);
@@ -2499,7 +2550,7 @@ fn streaming_line_count(source: IrExpr, guard: Option<IrExpr>) -> IrStmt {
         }
         None => body.push(incr),
     }
-    IrStmt::Block(vec![
+    Some(IrStmt::Block(vec![
         IrStmt::Assign {
             targets: vec![AssignTarget { var: cnt.clone(), sigil: None, indices: vec![] }],
             expr: IrExpr::Int(0),
@@ -2514,7 +2565,7 @@ fn streaming_line_count(source: IrExpr, guard: Option<IrExpr>) -> IrStmt {
             newline: true,
             target: None,
         },
-    ])
+    ]))
 }
 
 /// GNU find subset: [PATH] [-maxdepth N] [-type f|d]. Anything else
@@ -3125,7 +3176,7 @@ fn try_lower_grep_wc(stage1: &[IrStmt], stage2: &[IrStmt]) -> Option<IrStmt> {
     if strs.len() != 2 || strs[1].starts_with('-') { return None; }
     let pat = IrExpr::Str(strs[0].to_string(), StrStyle::DoubleQuoted);
     let path = IrExpr::Str(strs[1].to_string(), StrStyle::DoubleQuoted);
-    Some(streaming_line_count(path, Some(pat)))
+    streaming_line_count(path, Some(pat))
 }
 
 /// `grep P F | cut -dD -fN` → ForEachLine(F, if Contains(l,P) then
@@ -3243,7 +3294,7 @@ fn try_lower_cat_pipe(stage1: &[IrStmt], stage2: &[IrStmt]) -> Option<IrStmt> {
             if let [IrExpr::Str(n2, _), IrExpr::Array(wa)] = a2.as_slice() {
                 if n2 == "wc" && wa.len() == 1
                     && matches!(&wa[0], IrExpr::Str(f, _) if f.as_str() == "-l") {
-                    return Some(streaming_line_count(path, None));
+                    return streaming_line_count(path, None);
                 }
             }
         }
@@ -3306,7 +3357,7 @@ fn try_lower_grep_count(stage1: &[IrStmt], stage2: &[IrStmt]) -> Option<IrStmt> 
             IrExpr::Str(s.clone(), StrStyle::DoubleQuoted),
         _ => return None,
     };
-    Some(streaming_line_count(path, Some(pat)))
+    streaming_line_count(path, Some(pat))
 }
 
 /// `echo X | grep -q P` in EXPRESSION/CONDITION position → StringContains.

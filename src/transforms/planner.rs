@@ -222,11 +222,16 @@ pub fn node_manifest(target: &str) -> &'static [&'static str] {
             "StringTrim", "StringContains", "StringAffix", "AffixStrip", "RepeatStr",
             "SubStrExtract",
         ],
-        // Rust: only the string ops the Rust backend's own Ext arms render
-        // (StringContains/StrLen/CaseTransform/FieldExtract); the shared
-        // Rust arms for the rest are TODO markers.
+        // Rust: the text nodes `rust_backend`'s own Ext arms spell in `std`
+        // (StringContains/StrLen/CaseTransform/FieldExtract plus
+        // `ext_std_str`/`ext_std_num`/the `words_expr` Split arm). The regex
+        // nodes (RegSub, RegexpFind), `tr`'s character classes (CharTranslate)
+        // and PathName are NOT declared: `std` alone cannot spell them
+        // exactly, so the core keeps the original command (PLAN v157).
         "rs" | "rust" => &[
             "StringContains", "StrLen", "CaseTransform", "FieldExtract",
+            "WordCount", "RegCount", "TakeLines", "StringTrim",
+            "SubStrExtract", "RepeatStr", "Split", "ArrayLen",
         ],
         // Zig: the shared Zig arms are TODO for most nodes.
         "zig" => &["StrLen", "Split", "ArrayLen", "StringContains", "StringAffix", "StringTrim"],

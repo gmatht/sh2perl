@@ -5360,6 +5360,12 @@ impl Render {
     /// Render as an i64-typed expression.
     fn expr_num(&mut self, e: &IrExpr) -> String {
         match e {
+            IrExpr::Ext(n) => match self.ext_std_num(n.as_ref()) {
+                Some(s) => s,
+                // The pre-existing fallback for a numeric Ext node: render it
+                // as a string and parse. Unchanged for every other tag.
+                None => format!("{}.trim().parse::<i64>().unwrap_or(0)", self.expr_str(e)),
+            },
             IrExpr::Int(i) => int_lit(*i),
             IrExpr::Str(s, _) => {
                 if let Ok(n) = s.trim().parse::<i64>() {
@@ -5617,6 +5623,20 @@ impl Render {
                     "\"string\"".to_string()
                 }
             }
+            // The text nodes the rust manifest declares (`planner::node_manifest`):
+            // each has an exact `std` spelling, so no helper and no shell-out.
+            // `None` (a shape std cannot spell) leaves the node to the generic
+            // path below — `text_ops` withholds those shapes from this target.
+            IrExpr::Ext(n) => {
+                if let Some(s) = self.ext_std_str(n.as_ref()) {
+                    s
+                } else if let Some(k) = self.ext_std_num(n.as_ref()) {
+                    // a COUNT used where a string is wanted ("$x" of `wc -l`)
+                    format!("{}.to_string()", Self::atom_or_paren(&k))
+                } else {
+                    self.expr_any(e)
+                }
+            }
             IrExpr::Call { func, args: _ } if func == "arrayLen" => {
                 format!("{}.to_string()", Self::atom_or_paren(&self.expr_num(e)))
             }
@@ -5654,6 +5674,100 @@ impl Render {
                 }
             }
             other => self.expr_any(other),
+        }
+    }
+
+    /// Native `std` spelling for the STRING-valued text nodes Rust's
+    /// manifest declares. `None` when `std` alone cannot express the node
+    /// exactly (a regex `RegCount`, a `tr` range): the caller keeps its
+    /// previous rendering, and the transform never offers that shape here.
+    fn ext_std_str(&mut self, n: &dyn crate::shir_nodes::ExtExpr) -> Option<String> {
+        match n.tag() {
+            "StringTrim" => {
+                let x = n.as_any().downcast_ref::<crate::shir_nodes::StringTrim>()?;
+                let t = self.expr_str(&x.text);
+                Some(match (x.leading, x.trailing) {
+                    (true, true) => format!("{t}.trim().to_string()"),
+                    (true, false) => format!("{t}.trim_start().to_string()"),
+                    (false, true) => format!("{t}.trim_end().to_string()"),
+                    (false, false) => t,
+                })
+            }
+            "SubStrExtract" => {
+                let x = n.as_any().downcast_ref::<crate::shir_nodes::SubStrExtract>()?;
+                let t = self.expr_str(&x.text);
+                let off = self.expr_num(&x.offset);
+                Some(match &x.length {
+                    Some(l) => {
+                        let len = self.expr_num(l);
+                        format!(
+                            "{t}.chars().skip(({off}) as usize).take(({len}) as usize).collect::<String>()"
+                        )
+                    }
+                    None => {
+                        format!("{t}.chars().skip(({off}) as usize).collect::<String>()")
+                    }
+                })
+            }
+            "TakeLines" => {
+                let x = n.as_any().downcast_ref::<crate::shir_nodes::TakeLines>()?;
+                // `head -c`/`tail -c` are BYTES and the lowering refuses
+                // them today; a byte count here would slice lines.
+                if x.bytes {
+                    return None;
+                }
+                let t = self.expr_str(&x.text);
+                let c = self.expr_num(&x.count);
+                let tail = if x.from_end {
+                    "let __s = __k.saturating_sub(__n as usize); __l[__s..].join(\"\\n\")"
+                } else {
+                    "let __e = (__n as usize).min(__k); __l[..__e].join(\"\\n\")"
+                };
+                Some(format!(
+                    "{{ let __t: String = {t}; let __n: i64 = {c}; let __l: Vec<&str> = __t.split('\\n').collect(); let __k = __l.len(); if __n <= 0 {{ String::new() }} else {{ {tail} }} }}"
+                ))
+            }
+            "RepeatStr" => {
+                let x = n.as_any().downcast_ref::<crate::shir_nodes::RepeatStr>()?;
+                let t = self.expr_str(&x.text);
+                let c = self.expr_num(&x.count);
+                Some(format!(
+                    "{{ let __n: i64 = {c}; if __n <= 0 {{ String::new() }} else {{ {t}.repeat(__n as usize) }} }}"
+                ))
+            }
+            _ => None,
+        }
+    }
+
+    /// Native `std` spelling for the COUNT-valued text nodes Rust's manifest
+    /// declares (`ArrayLen`, `WordCount`, `RegCount`).
+    fn ext_std_num(&mut self, n: &dyn crate::shir_nodes::ExtExpr) -> Option<String> {
+        match n.tag() {
+            "ArrayLen" => {
+                let x = n.as_any().downcast_ref::<crate::shir_nodes::ArrayLen>()?;
+                Some(format!("({}.len() as i64)", self.words_expr(&x.array)))
+            }
+            "WordCount" => {
+                let x = n.as_any().downcast_ref::<crate::shir_nodes::WordCount>()?;
+                Some(format!(
+                    "({}.split_whitespace().count() as i64)",
+                    self.expr_str(&x.text)
+                ))
+            }
+            "RegCount" => {
+                let x = n.as_any().downcast_ref::<crate::shir_nodes::RegCount>()?;
+                let t = self.expr_str(&x.text);
+                if x.pattern == "\\n" {
+                    // `wc -l`: a newline count, not split().len().
+                    Some(format!("({t}.matches('\\n').count() as i64)"))
+                } else if !x.pattern.chars().any(|c| "\\^$.|?*+()[]{}".contains(c)) {
+                    // a literal pattern is an exact `matches` count
+                    Some(format!("({t}.matches({}).count() as i64)", Self::rust_str(&x.pattern)))
+                } else {
+                    None
+                }
+            }
+            _ => None,
         }
     }
 
@@ -8358,6 +8472,30 @@ impl Render {
                 }
             }
             IrExpr::Interpolate(parts) => format!("vec![{}]", self.interpolate(parts)),
+            // A text node in WORD position: `echo $(x | tr …)` — the node
+            // value is one word (bash does not field-split the result).
+            IrExpr::Ext(n) if n.tag() != "Split" => {
+                if let Some(s) = self.ext_std_str(n.as_ref()) {
+                    format!("vec![{s}]")
+                } else if let Some(k) = self.ext_std_num(n.as_ref()) {
+                    format!("vec![{}.to_string()]", Self::atom_or_paren(&k))
+                } else {
+                    format!("vec![{}]", self.expr_str(e))
+                }
+            }
+            // Split: the field list the node names (a literal delimiter —
+            // `text_ops` never offers this target a regex split).
+            IrExpr::Ext(n) if n.tag() == "Split" => {
+                let x = n
+                    .as_any()
+                    .downcast_ref::<crate::shir_nodes::Split>()
+                    .expect("tag/type agree");
+                format!(
+                    "{}.split({}).map(str::to_string).collect::<Vec<String>>()",
+                    self.expr_str(&x.text),
+                    Self::rust_str(&x.delim)
+                )
+            }
             IrExpr::Arith(a) => {
                 // BigInt domain (tainted/huge) → decimal string (t87).
                 let tainted = arith_uses_bigint(a, &self.bigint_vars);
@@ -12775,6 +12913,13 @@ impl Render {
                 let st = self.write_arr(var, &format!("__sh_cat(&[{}])", items.join(", ")));
                 self.emit(&st);
                 self.emit("__SH_RC.store(0, Ordering::Relaxed);");
+            }
+            // The status of the pipeline a reduction replaced: the allowlist
+            // only fires for commands that exit 0 on static input, so `$?` is
+            // exactly the recorded value (no child process runs).
+            IrStmt::SetChildError(e) => {
+                let v = self.expr_num(e);
+                self.emit(&format!("__SH_RC.store(({v}) as i32, Ordering::Relaxed);"));
             }
             IrStmt::Output { value, newline, target } => {
                 if target.is_some() {
