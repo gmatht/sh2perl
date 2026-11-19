@@ -224,10 +224,35 @@ pub fn node_manifest(target: &str) -> &'static [&'static str] {
         ],
         // Rust: the text nodes `rust_backend`'s own Ext arms spell in `std`
         // (StringContains/StrLen/CaseTransform/FieldExtract plus
-        // `ext_std_str`/`ext_std_num`/the `words_expr` Split arm). The regex
-        // nodes (RegSub, RegexpFind), `tr`'s character classes (CharTranslate)
-        // and PathName are NOT declared: `std` alone cannot spell them
-        // exactly, so the core keeps the original command (PLAN v157).
+        // `ext_std_str`/`ext_std_num`/the `words_expr` Split arm). Every node
+        // declared here is pinned by `offered_text_nodes_execute_like_bash`
+        // (or `constructed_text_nodes_execute_like_bash` for a node with no
+        // shell-source shape), which compiles the render with `rustc` and
+        // compares stdout + exit status with bash byte-for-byte.
+        //
+        // NOT declared, with the reason (each keeps its original command, so
+        // the existing path is untouched):
+        //  * RegSub, RegexpFind — `std` has no regex; a hand-rolled matcher
+        //    would not be exact.
+        //  * CharTranslate — `tr` takes ranges and character classes
+        //    (`a-z`, `[:upper:]`); a char-set spelling is not the same map.
+        //  * PathName — the node's source may be a GNU command or a bash
+        //    string, and those differ on trailing slashes.
+        //  * StringAffix — it is a prefix/suffix PREDICATE (`[[ $x == P* ]]`,
+        //    `case P*)`). No transform in this pipeline constructs it from
+        //    shell source, and those test shapes already render natively
+        //    (`.starts_with(…)`/`.ends_with(…)` via the test lowering), so
+        //    declaring it would add an unreachable second path.
+        //  * AffixStrip — `${v#p}`/`${v%s}` lower through the backend's own
+        //    strip helpers (`__sh_strippre`/`__sh_stripsuf` over
+        //    `__sh_fnmatch`), which accept ARBITRARY glob patterns; `std`'s
+        //    `strip_prefix`/`strip_suffix` are exact only for the literal
+        //    subset, so the node stays out and the shapes keep that path.
+        //  * CutsetTrim — the `${s##*[cutset]}`/`${s%%[cutset]*}` shapes are
+        //    character-CLASS patterns, and `trim_matches(|c| cut.contains(c))`
+        //    reads a set of CODE POINTS where the shell means a byte set
+        //    (the node spec records that divergence). No transform emits the
+        //    node from shell source here either.
         "rs" | "rust" => &[
             "StringContains", "StrLen", "CaseTransform", "FieldExtract",
             "WordCount", "RegCount", "TakeLines", "StringTrim",
