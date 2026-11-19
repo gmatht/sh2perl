@@ -189,6 +189,14 @@ pub fn manifest_for(target: &str) -> Capabilities {
 // (the command was exact; the node becomes a `sh2.*` stub or a hard
 // refusal). Gating the transform on this table is what makes the core
 // "lower to supported nodes" instead of emitting unsupported ones.
+/// Every target name [`node_manifest`] answers for. Kept as one list so a
+/// test can ENUMERATE the offering backends instead of hardcoding them:
+/// adding a target here (plus its manifest entry) automatically subjects
+/// it to `offering_backends_render_pattern_trims_natively`.
+pub const TARGETS: &[&str] = &[
+    "perl", "estree", "js", "python", "java", "c", "go", "rs", "zig",
+];
+
 pub fn node_manifest(target: &str) -> &'static [&'static str] {
     // Verified native on the shared registry + the backend's own Ext arms.
     // `ALL` = everything the shared handlers render for that backend.
@@ -500,6 +508,175 @@ mod tests {
                     known.contains(*node),
                     "{target}: manifest names {node}, which is not a declared expr node"
                 );
+            }
+        }
+    }
+
+    // ── the trim/affix render path, per offering backend ──────────────
+
+    /// The node family these four expansions lower through.
+    const TRIM_AFFIX_NODES: &[&str] = &["AffixStrip", "CutsetTrim", "StringTrim", "StringAffix"];
+
+    /// An offering backend whose `${v…}` channel is a documented sh2-runtime
+    /// STUB rather than a renderer. `zig` has no param rendering at all —
+    /// every expansion becomes `sh2Param()` with a `TODO(unsupported) `
+    /// marker — so its four forms are pinned to that gap (see the test) and
+    /// it is NOT claimed to render the native strip. When the zig param
+    /// channel lands, drop it from this list: the test then starts requiring
+    /// the native form there too.
+    const NO_NATIVE_TRIM: &[&str] = &["zig"];
+
+    /// Render an IR program through a backend named the way the MANIFEST
+    /// names it (`rs`/`js` are the manifest's spellings of `rust`/`estree`).
+    fn render_for(target: &str, prog: &crate::ir::IrProgram) -> Option<String> {
+        match target {
+            "perl" => Some(crate::perl_generator_fixed::generate(prog)),
+            "python" => Some(crate::python_backend::shir_to_python(prog)),
+            "go" => Some(crate::go_backend::shir_to_go(prog)),
+            "java" => crate::java_backend::shir_to_java(prog).ok(),
+            "rs" | "rust" => Some(crate::rust_backend::shir_to_rust(prog)),
+            "zig" => Some(crate::zig_backend::shir_to_zig(prog)),
+            "estree" | "js" => crate::shir::shir_to_estree_json(prog).ok(),
+            "c" => Some(crate::c_backend::shir_to_c(prog)),
+            _ => None,
+        }
+    }
+
+    /// The substrings that prove a backend took its NATIVE strip/strip-node
+    /// path for a pattern trim (rather than a stub, a slice, or a spawn).
+    /// A backend may spell a prefix and a suffix trim differently (perl
+    /// substitutes for `#`/`##` and scans suffix lengths for `%`/`%%`), so
+    /// each entry is a set: any member proves the native path.
+    ///
+    /// estree's native form IS the `sh2.param` contract op: the estree target
+    /// is a program over the shared sh2 runtime, and `harness/estree-contract.mjs`
+    /// checks that callee resolves.
+    fn native_strip_markers(target: &str) -> &'static [&'static str] {
+        match target {
+            "perl" => &["=~ s{", "/\\A(?:"],
+            "python" => &["sh2_strip("],
+            "go" => &["pExp("],
+            "java" => &["shStrip"],
+            "rs" | "rust" => &["__sh_strip"],
+            // Two native forms: a literal-delimiter trim renders inline as
+            // `String.prototype.indexOf/lastIndexOf` + `slice`, and a GLOB
+            // pattern goes to `sh2.param` (the runtime op this target calls;
+            // `harness/estree-contract.mjs` checks the name resolves).
+            "estree" | "js" => &[
+                "\"name\":\"param\"",
+                "\"name\":\"indexOf\"",
+                "\"name\":\"lastIndexOf\"",
+            ],
+            "c" => &["sh2_strip"],
+            _ => &[],
+        }
+    }
+
+    /// `${v#pat}` / `${v##pat}` / `${v%pat}` / `${v%%pat}` — with `:`, `[[`,
+    /// `]`, `!`, `*`, `?` and POSIX classes in the PATTERN — must render
+    /// through each offering backend's native strip path, with no shell
+    /// spawn. The `:` cases are the regression this whole family was fixed
+    /// for: the parser used to read the colon as a `:off:len` slice
+    /// separator and every backend took a substring of a variable named
+    /// `v##*[![`.
+    ///
+    /// The offering backends are ENUMERATED from the manifest, so a backend
+    /// that starts declaring a trim/affix node is covered with no edit here
+    /// (and a manifest target with no renderer wired fails loudly).
+    #[test]
+    fn offering_backends_render_pattern_trims_natively() {
+        // (op, pattern) — every listed character class and both colon shapes.
+        let forms: &[(&str, &str)] = &[
+            ("#", "*[![:space:]]"),
+            ("##", "*[![:space:]]"),
+            ("%", "[[:space:]]*"),
+            ("%%", "[[:space:]]*"),
+            ("#", "*:"),
+            ("##", "*:"),
+            ("%", ":*"),
+            ("%%", ":*"),
+            ("##", "[[:alpha:]]"),
+            ("%%", "[[:alpha:]]"),
+            ("#", "?"),
+            ("%", "?"),
+        ];
+        let offering: Vec<&str> = TARGETS
+            .iter()
+            .copied()
+            .filter(|t| {
+                TRIM_AFFIX_NODES
+                    .iter()
+                    .any(|n| node_manifest(t).contains(n))
+            })
+            .collect();
+        assert!(
+            offering.len() >= 6,
+            "the manifest table shrank — offering backends: {offering:?}"
+        );
+
+        for target in offering {
+            let markers = native_strip_markers(target);
+            if !NO_NATIVE_TRIM.contains(&target) {
+                assert!(
+                    !markers.is_empty(),
+                    "{target} offers a trim/affix node but this test has no native \
+                     strip marker for it — add one (or the renderer)"
+                );
+            }
+            for (op, pat) in forms {
+                let src = format!(
+                    "v=\"  padded  \"\nx=${{v{op}{pat}}}\necho \"$x\"\n"
+                );
+                let mut p = crate::Parser::new(&src);
+                let cmds = p.parse().expect("parse");
+                let prog = crate::shir::ast_to_ir(&cmds);
+                let out = render_for(target, &prog)
+                    .unwrap_or_else(|| panic!("{target}: no renderer wired in this test"));
+                assert!(
+                    !out.contains("__sh_spawn("),
+                    "{target}: ${{v{op}{pat}}} shells out:\n{out}"
+                );
+                assert!(
+                    !out.contains("bash -c"),
+                    "{target}: ${{v{op}{pat}}} spawns bash:\n{out}"
+                );
+                // The mis-parse's signature: the pattern's brackets glued
+                // onto the operator inside a VARIABLE NAME (the slice bug
+                // produced `v##*[[` + `space` + `]]`). A render that still
+                // does this is looking up a variable that does not exist.
+                for leak in ["v##[[", "v%%[[", "v#[[", "v%[["] {
+                    assert!(
+                        !out.contains(leak),
+                        "{target}: ${{v{op}{pat}}} leaked the pattern into the variable name ({leak}):\n{out}"
+                    );
+                }
+                // The glob-passing backends keep the PATTERN verbatim, so it
+                // must arrive whole and not truncated at a bracket or a
+                // colon. (perl converts it to a regex; estree lowers a
+                // literal pattern to a delimiter — `#*:` becomes an
+                // `indexOf(":")` slice, so the `*` is consumed by design.)
+                if !NO_NATIVE_TRIM.contains(&target)
+                    && !matches!(target, "perl" | "estree" | "js")
+                {
+                    assert!(
+                        out.contains(pat),
+                        "{target}: ${{v{op}{pat}}} dropped or mangled the pattern:\n{out}"
+                    );
+                }
+                if !markers.is_empty() {
+                    assert!(
+                        markers.iter().any(|m| out.contains(m)),
+                        "{target}: ${{v{op}{pat}}} took no native strip path (none of {markers:?}):\n{out}"
+                    );
+                } else {
+                    // The documented gap: the param channel is a stub, so
+                    // the program still PARSES to the right operator and
+                    // never spawns — it just cannot compute it yet.
+                    assert!(
+                        out.contains("TODO(unsupported)"),
+                        "{target}: ${{v{op}{pat}}} neither renders nor marks the gap:\n{out}"
+                    );
+                }
             }
         }
     }
