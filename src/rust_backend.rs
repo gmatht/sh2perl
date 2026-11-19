@@ -7462,13 +7462,23 @@ impl Render {
                 }
             }
             "printf" => {
-                let fmt = words.first().map(|w| self.expr_str(w)).unwrap_or_default();
-                let arg_exprs: Vec<String> =
-                    words.iter().skip(1).map(|w| self.expr_str(w)).collect();
-                self.add_helper("printf");
-                // see printf_stmt: __sh_printf always references __sh_printf_b
-                self.add_helper("printf_b");
-                format!("__sh_printf(&{fmt}, &[{}])", arg_exprs.join(", "))
+                // A literal format whose conversions are all plain `%s`/`%d`/
+                // `%i` is a `format!` — the 119-line runtime engine is only
+                // emitted for the shapes it is actually needed for.
+                let native = match words.split_first() {
+                    Some((f, rest)) => self.printf_native(*f, rest),
+                    None => None,
+                };
+                match native {
+                    Some(call) => call,
+                    None => {
+                        let fmt = words.first().map(|w| self.expr_str(w)).unwrap_or_default();
+                        let arg_exprs: Vec<String> =
+                            words.iter().skip(1).map(|w| self.expr_str(w)).collect();
+                        self.add_helper("printf");
+                        format!("__sh_printf(&{fmt}, &[{}])", arg_exprs.join(", "))
+                    }
+                }
             }
             _ => {
                 let cmd_word = IrExpr::Str(cmd.to_string(), crate::ir::StrStyle::DoubleQuoted);
@@ -10941,6 +10951,42 @@ impl Render {
         }
     }
 
+    /// A `printf` whose FORMAT is a literal and whose conversions are all
+    /// plain `%s`/`%d`/`%i` renders as a native `format!`; the 119-line
+    /// `__sh_printf` engine is only emitted for formats that need it.
+    /// REFUSE > GUESS: a word-list argument (which makes bash RE-APPLY the
+    /// format), an argument count that differs from the conversion count
+    /// (re-application, or `""` for a missing one), and any conversion the
+    /// template decoder refuses all keep the helper.
+    fn printf_native(&mut self, fmt: &IrExpr, args: &[&IrExpr]) -> Option<String> {
+        let IrExpr::Str(raw, _) = fmt else { return None };
+        let (tpl, convs) = printf_format_template(raw)?;
+        if convs.len() != args.len() {
+            return None;
+        }
+        if args.iter().any(|a| {
+            matches!(a, IrExpr::Call { func, .. } if func == "split" || func == "capture")
+        }) {
+            return None;
+        }
+        let mut rendered: Vec<String> = Vec::new();
+        for (a, numeric) in args.iter().zip(convs.iter()) {
+            let e = self.expr_str(a);
+            if *numeric {
+                // `%d` is bash's string→integer conversion (invalid is 0,
+                // `0x10` is 16) — `str::parse` is not the same function.
+                self.add_helper("atoi");
+                rendered.push(format!("__sh_atoi(&{e})"));
+            } else {
+                rendered.push(e);
+            }
+        }
+        if rendered.is_empty() {
+            return Some(Self::rust_str_expr(&tpl));
+        }
+        Some(format!("format!({}, {})", Self::rust_str(&tpl), rendered.join(", ")))
+    }
+
     fn printf_stmt(&mut self, words: &[&IrExpr]) {
         // `printf [-v var] format [args…]`
         let mut idx = 0;
@@ -10958,11 +11004,15 @@ impl Render {
         if words.len() <= idx {
             return;
         }
-        let fmt = self.expr_str(words[idx]);
+        // A literal format whose conversions are all plain `%s`/`%d`/`%i`
+        // renders as a native `format!` (see printf_native); every other
+        // shape keeps the runtime engine.
+        let native = self.printf_native(words[idx], &words[idx + 1..]);
+        let fmt = if native.is_none() { self.expr_str(words[idx]) } else { String::new() };
         // `split` args are field-split word LISTS — keep them as Vecs and
         // flatten, so the format RE-APPLIES per field (`printf "<%s>\\n"
         // $x` with x="a b" prints `<a>` and `<b>`, bash semantics).
-        let arg_exprs: Vec<String> = words
+        let arg_exprs: Vec<String> = if native.is_some() { Vec::new() } else { words
             .iter()
             .skip(idx + 1)
             .map(|w| match w {
@@ -10989,17 +11039,18 @@ impl Render {
                     }
                 }
             })
-            .collect();
-        self.add_helper("printf");
-        // `__sh_printf`'s body calls __sh_printf_b unconditionally (the
-        // `%b` arm is a runtime branch), so it must be emitted whenever
-        // printf is; when no printf survives, the helper prune drops it.
-        self.add_helper("printf_b");
-        self.add_helper("cat");
-        let call = if arg_exprs.is_empty() {
-            format!("__sh_printf(&{fmt}, &[])")
-        } else {
-            format!("__sh_printf(&{fmt}, &__sh_cat(&[{}]))", arg_exprs.join(", "))
+            .collect() };
+        let call = match native {
+            Some(c) => c,
+            None => {
+                self.add_helper("printf");
+                self.add_helper("cat");
+                if arg_exprs.is_empty() {
+                    format!("__sh_printf(&{fmt}, &[])")
+                } else {
+                    format!("__sh_printf(&{fmt}, &__sh_cat(&[{}]))", arg_exprs.join(", "))
+                }
+            }
         };
         if let Some(t) = target {
             self.mark_written(&t);
@@ -18190,6 +18241,80 @@ fn unescape_ansi_c(s: &str) -> String {
     out
 }
 
+/// Compile-time view of a bash `printf` FORMAT when it is a plain string
+/// literal and every conversion is `%s`, `%d`, `%i` or `%%` — no flags,
+/// width, precision or length modifier. Returns the `format!` template
+/// (each conversion becomes `{}`, `%%` stays `%`) and one flag per
+/// conversion saying whether it is numeric. `None` keeps the runtime
+/// engine.
+///
+/// The escape table is `unescape_ansi_c`'s (the `$'…'` decoder) — the same
+/// one bash's printf format decoder implements — minus the spellings that
+/// decoder cannot express: `\0NNN` octal, `\c` (which stops ALL output) and
+/// a bare `\x` with no hex digit. A literal `{`/`}` cannot live in a
+/// `format!` string either, so those refuse too. REFUSE > GUESS: anything
+/// uncertain keeps the helper, which is always correct.
+fn printf_format_template(raw: &str) -> Option<(String, Vec<bool>)> {
+    let ch: Vec<char> = raw.chars().collect();
+    let mut tpl = String::new();
+    let mut convs: Vec<bool> = Vec::new();
+    let mut i = 0;
+    while i < ch.len() {
+        let c = ch[i];
+        if c == '\\' && i + 1 < ch.len() {
+            let e = ch[i + 1];
+            match e {
+                '0'..='7' | 'c' => return None,
+                'x' => {
+                    let mut k = 0;
+                    while k < 2 && i + 2 + k < ch.len() && ch[i + 2 + k].is_ascii_hexdigit() {
+                        k += 1;
+                    }
+                    if k == 0 {
+                        return None;
+                    }
+                    let mut n = 0;
+                    for j in 0..k {
+                        n = n * 16 + ch[i + 2 + j].to_digit(16).unwrap();
+                    }
+                    tpl.push(char::from_u32(n).unwrap_or('\0'));
+                    i += 2 + k;
+                    continue;
+                }
+                _ => {}
+            }
+            let mut one = String::from("\\");
+            one.push(e);
+            tpl.push_str(&unescape_ansi_c(&one));
+            i += 2;
+            continue;
+        }
+        if c == '%' {
+            match *ch.get(i + 1)? {
+                's' => {
+                    convs.push(false);
+                    tpl.push_str("{}");
+                }
+                'd' | 'i' => {
+                    convs.push(true);
+                    tpl.push_str("{}");
+                }
+                '%' => tpl.push('%'),
+                _ => return None,
+            }
+            i += 2;
+            continue;
+        }
+        if c == '{' || c == '}' {
+            return None;
+        }
+        tpl.push(c);
+        i += 1;
+    }
+    Some((tpl, convs))
+}
+
+
 fn is_ident(s: &str) -> bool {
     !s.is_empty()
         && (s.chars().next().unwrap().is_alphabetic() || s.chars().next().unwrap() == '_')
@@ -23294,6 +23419,97 @@ mod tests {
         let out = render(src);
         crate::transforms::set_target(None);
         out
+    }
+
+    // ── printf: literal formats render natively ──────────────────────
+
+    /// `printf 'a\nb\n'` prints a constant — no 119-line engine, and the
+    /// format's backslash escapes are decoded at RENDER time (bash's printf
+    /// decodes the FORMAT, unlike echo).
+    #[test]
+    fn printf_literal_format_prints_a_constant() {
+        let out = render_rs("printf 'a\\nb\\n'\n");
+        assert!(!out.contains("fn __sh_printf("), "engine emitted:\n{out}");
+        assert!(out.contains("print!"), "no print:\n{out}");
+    }
+
+    /// `%s` against a literal format is a `format!` — the helper is gone.
+    /// (The argument is `$1`, not a literal: a fully-constant `printf` is
+    /// folded to a printed constant upstream, so a literal-arg test never
+    /// reaches this lowering at all.)
+    #[test]
+    fn printf_s_conversion_is_a_native_format() {
+        let out = render_rs("x=\"$1\"\nprintf 'v=%s\\n' \"$x\"\n");
+        assert!(!out.contains("__sh_printf("), "engine emitted:\n{out}");
+        // The template reaches the print macro directly: `print!("v={}\n", …)`
+        assert!(out.contains("v={}"), "no native format:\n{out}");
+        assert!(out.contains("print!"), "no print:\n{out}");
+    }
+
+    /// `%d` keeps bash's string→integer conversion (`__sh_atoi`: "abc" is 0,
+    /// "0x10" is 16) but not the format engine.
+    #[test]
+    fn printf_d_conversion_keeps_bash_atoi() {
+        let out = render_rs("n=\"$1\"\nprintf '%d\\n' \"$n\"\n");
+        assert!(!out.contains("__sh_printf("), "engine emitted:\n{out}");
+        assert!(out.contains("__sh_atoi("), "no atoi:\n{out}");
+    }
+
+    /// `%%` is a literal percent and needs no conversion at all.
+    #[test]
+    fn printf_percent_escape_is_a_literal() {
+        let out = render_rs("printf '100%%\\n'\n");
+        assert!(!out.contains("__sh_printf("), "engine emitted:\n{out}");
+        assert!(out.contains("100%"), "percent lost:\n{out}");
+    }
+
+    /// Width/flags/precision are runtime format-engine features: `%5s`
+    /// keeps `__sh_printf`.
+    #[test]
+    fn printf_width_keeps_the_engine() {
+        let out = render_rs("x=\"$1\"\nprintf '%5s|\\n' \"$x\"\n");
+        assert!(out.contains("fn __sh_printf("), "engine dropped:\n{out}");
+    }
+
+    /// `%q` (shell re-quoting) and `%b` (escape expansion of the ARGUMENT)
+    /// are engine-only conversions.
+    #[test]
+    fn printf_q_and_b_keep_the_engine() {
+        for src in [
+            "x=\"$1\"\nprintf '%q\\n' \"$x\"\n",
+            "x=\"$1\"\nprintf '%b\\n' \"$x\"\n",
+        ] {
+            let out = render_rs(src);
+            assert!(out.contains("fn __sh_printf("), "engine dropped for {src}:\n{out}");
+        }
+    }
+
+    /// A VARIABLE format is a runtime value — the engine cannot be elided.
+    #[test]
+    fn printf_variable_format_keeps_the_engine() {
+        let out = render_rs("f=\"$1\"\nprintf \"$f\" hi\n");
+        assert!(out.contains("fn __sh_printf("), "engine dropped:\n{out}");
+    }
+
+    /// bash RE-APPLIES the format while arguments remain, so an argument
+    /// count that differs from the conversion count keeps the engine.
+    #[test]
+    fn printf_format_reuse_keeps_the_engine() {
+        let out = render_rs("printf '%s\\n' \"$1\" \"$2\"\n");
+        assert!(out.contains("fn __sh_printf("), "engine dropped:\n{out}");
+    }
+
+    /// `\c` stops all output and `\0NNN` is octal — neither is expressible
+    /// as a Rust escape, so both keep the engine.
+    #[test]
+    fn printf_unrepresentable_escapes_keep_the_engine() {
+        for src in [
+            "printf 'a\\cb%s' \"$1\"\n",
+            "printf '\\0101%s\\n' \"$1\"\n",
+        ] {
+            let out = render_rs(src);
+            assert!(out.contains("fn __sh_printf("), "engine dropped for {src}:\n{out}");
+        }
     }
 
     /// `CutAt` — the four single-star strip identities (`${v##*/}` and
