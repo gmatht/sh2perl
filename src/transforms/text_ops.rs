@@ -2914,6 +2914,28 @@ fn collect_scalar_writes_expr(e: &IrExpr, out: &mut Vec<String>) -> bool {
 /// Construct normalisations for statement-level exec calls
 /// (docs/shir-reductions.md §Normalisation transforms).
 fn try_normalize_construct_stmt(stmt: &IrStmt) -> Option<IrStmt> {
+    // The `local`→assign normalisation is NOT offered to Rust. The Declare
+    // renderer binds an unsubstituted `$1` to the enclosing positional, types
+    // the binding from `local`'s own metadata (`local -A` stays a map, an int
+    // stays i64), and the pass-3 signature probe reads the declaration to
+    // decide the function's arity; flattening it produced `fn f()` with
+    // `a = "$1"`, a Vec where `declare -A` had built a map, and an int store
+    // where a string was declared (061_test_local_names_preserved,
+    // typeset-cmdsub, 064_22_function_returning_complex_data_structures).
+    if matches!(crate::transforms::target().as_deref(), Some("rs") | Some("rust")) {
+        if matches!(stmt, IrStmt::Declare { local: true, .. }) {
+            return None;
+        }
+        if let IrStmt::Expr(IrExpr::Call { func, args }) = stmt {
+            if matches!(func.as_str(), "exec" | "builtin") {
+                if let Some(IrExpr::Str(n, _)) = args.first() {
+                    if matches!(n.as_str(), "local" | "declare" | "typeset") {
+                        return None;
+                    }
+                }
+            }
+        }
+    }
     // `local v=…` / `local v` — the parser lowers these to Declare{local}
     // before transforms run. Our flat variable model has one scope per
     // program, so a local declaration IS an assignment (bash: the var is
