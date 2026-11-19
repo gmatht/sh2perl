@@ -77,12 +77,46 @@ pub fn transform(stmts: &mut Vec<IrStmt>) -> bool {
     collect_array_names(stmts, &mut arrays);
     let before = LIFT_COUNT.load(Ordering::Relaxed);
     for stmt in stmts.iter_mut() {
+        // The OFFER, enforced: a rewrite may build a node this target cannot
+        // render (every site is filtered by `offered()`, but a site can also
+        // emit a node indirectly, and a new site must not be able to slip
+        // one past). Keep a copy and restore it when the result holds an
+        // undeclared node — the original command is exact everywhere.
+        let keep = stmt.clone();
         lower_stmt(stmt, true, &arrays);
+        if let Some(tag) = first_unoffered(stmt) {
+            if std::env::var("SH2C_DEBUG").is_ok() {
+                eprintln!("text-ops: restoring the command, {tag} is not offered to this target");
+            }
+            *stmt = keep;
+        }
     }
     let after = LIFT_COUNT.load(Ordering::Relaxed);
     if after > before {
     }
     after > before
+}
+
+/// The first Ext-node tag in `stmt` that the current target does not
+/// declare, if any. Scanned from the Debug form: the IR has no uniform child
+/// accessor across `IrStmt`, and a false positive here costs exactly one
+/// refused rewrite (the exact original command is kept), never a wrong value.
+fn first_unoffered(stmt: &IrStmt) -> Option<String> {
+    let dbg = format!("{:?}", stmt);
+    for (i, _) in dbg.match_indices("Ext(") {
+        let rest = dbg[i + "Ext(".len()..].trim_start();
+        let name: String = rest
+            .chars()
+            .take_while(|c| c.is_alphanumeric() || *c == '_')
+            .collect();
+        if name.is_empty() {
+            continue;
+        }
+        if !offered(&name) {
+            return Some(name);
+        }
+    }
+    None
 }
 
 fn lower_stmt(stmt: &mut IrStmt, emit: bool, arrays: &std::collections::HashSet<String>) {
