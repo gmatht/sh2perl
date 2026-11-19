@@ -10951,6 +10951,19 @@ impl Render {
         }
     }
 
+    /// A metachar-free literal `#`/`%` strip is `str::strip_prefix` /
+    /// `str::strip_suffix` — the 117-line glob matcher is not dragged in
+    /// for `${v#"x"}`. `var` binds once so a complex read is not
+    /// evaluated twice; a no-match keeps the original string, exactly like
+    /// `__sh_strippre`/`__sh_stripsuf`.
+    fn strip_lit(var: &str, lit: &str, prefix: bool) -> String {
+        let m = if prefix { "strip_prefix" } else { "strip_suffix" };
+        format!(
+            "{{ let __v = {var}; __v.{m}({}).unwrap_or(&__v).to_string() }}",
+            Self::rust_str(lit)
+        )
+    }
+
     /// A `printf` whose FORMAT is a literal and whose conversions are all
     /// plain `%s`/`%d`/`%i` renders as a native `format!`; the 119-line
     /// `__sh_printf` engine is only emitted for formats that need it.
@@ -11190,14 +11203,21 @@ impl Render {
             if matches!(op, "#" | "##" | "%" | "%%" | "/" | "//") {
                 let var_expr = self.array_index_name(name);
                 let pat = str_arg(args, 2).unwrap_or("");
+                let lit_pat = literal_strip_pat(&pat);
                 let pat_expr = self.param_pattern_expr(&pat);
                 return match op {
                     "#" | "##" => {
+                        if let Some(lit) = &lit_pat {
+                            return Self::strip_lit(&var_expr, lit, true);
+                        }
                         let greedy = op == "##";
                         self.add_helper("strippre");
                         format!("__sh_strippre(&{var_expr}, {pat_expr}, {greedy})")
                     }
                     "%" | "%%" => {
+                        if let Some(lit) = &lit_pat {
+                            return Self::strip_lit(&var_expr, lit, false);
+                        }
                         let greedy = op == "%%";
                         self.add_helper("stripsuf");
                         format!("__sh_stripsuf(&{var_expr}, {pat_expr}, {greedy})")
@@ -11289,6 +11309,9 @@ impl Render {
             }
             "#" | "##" | "#:" | "##:" => {
                 let pat = str_arg(args, 2).unwrap_or("");
+                if let Some(lit) = literal_strip_pat(&pat) {
+                    return Self::strip_lit(&var_expr, &lit, true);
+                }
                 let pat_expr = self.param_pattern_expr(&pat);
                 let greedy = op.starts_with("##");
                 self.add_helper("strippre");
@@ -11296,6 +11319,9 @@ impl Render {
             }
             "%" | "%%" | "%:" | "%%:" => {
                 let pat = str_arg(args, 2).unwrap_or("");
+                if let Some(lit) = literal_strip_pat(&pat) {
+                    return Self::strip_lit(&var_expr, &lit, false);
+                }
                 let pat_expr = self.param_pattern_expr(&pat);
                 let greedy = op.starts_with("%%");
                 self.add_helper("stripsuf");
@@ -18314,6 +18340,21 @@ fn printf_format_template(raw: &str) -> Option<(String, Vec<bool>)> {
     Some((tpl, convs))
 }
 
+/// The pattern a `#`/`%` strip can fold to `strip_prefix`/`strip_suffix`
+/// with: a compile-time literal with no expansion and no glob metachar.
+/// Greedy vs non-greedy is irrelevant for such a pattern (only the whole
+/// string matches it), so both forms collapse to the same call.
+fn literal_strip_pat(raw: &str) -> Option<String> {
+    if raw.contains('$') {
+        return None;
+    }
+    let lit = Render::unescape_operand(raw);
+    if glob_like(&lit) {
+        return None;
+    }
+    Some(lit)
+}
+
 
 fn is_ident(s: &str) -> bool {
     !s.is_empty()
@@ -23510,6 +23551,29 @@ mod tests {
             let out = render_rs(src);
             assert!(out.contains("fn __sh_printf("), "engine dropped for {src}:\n{out}");
         }
+    }
+
+    /// A metachar-free literal `#`/`%` strip is `strip_prefix`/
+    /// `strip_suffix` — no matcher, and the no-match path keeps the value.
+    #[test]
+    fn literal_strip_pattern_uses_strip_prefix() {
+        let pre = render_rs("v=\"$1\"\necho \"${v#\"ab\"}\"\n");
+        assert!(pre.contains("strip_prefix("), "no strip_prefix:\n{pre}");
+        assert!(!pre.contains("__sh_strippre("), "helper emitted:\n{pre}");
+        let suf = render_rs("v=\"$1\"\necho \"${v%\"bc\"}\"\n");
+        assert!(suf.contains("strip_suffix("), "no strip_suffix:\n{suf}");
+        assert!(!suf.contains("__sh_stripsuf("), "helper emitted:\n{suf}");
+    }
+
+    /// A metachar-bearing literal still needs the matcher (a glob is not a
+    /// prefix compare).
+    #[test]
+    fn glob_strip_pattern_keeps_the_matcher() {
+        let out = render_rs("p=\"$1\"\necho \"${p##*/}\"\n");
+        assert!(
+            !out.contains("__sh_strippre(") || out.contains("__sh_fnmatch("),
+            "a glob strip must not fold to strip_prefix:\n{out}"
+        );
     }
 
     /// `CutAt` — the four single-star strip identities (`${v##*/}` and
