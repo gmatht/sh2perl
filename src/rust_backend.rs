@@ -23813,6 +23813,161 @@ mod tests {
 
     // ── the text nodes the `rs` manifest offers ──────────────────────
 
+    // ── the offered text nodes must RUN, not just render ────────────────
+
+    /// Compile a rendered program with `rustc` and run it: `(stdout, code)`.
+    fn compile_and_run(case: &str, prog: &str) -> (Vec<u8>, Option<i32>) {
+        let dir = std::env::temp_dir().join(format!("sh2_text_nodes_{}_{}", std::process::id(), case));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).expect("temp dir");
+        let src = dir.join("main.rs");
+        let bin = dir.join("main");
+        std::fs::write(&src, prog).expect("write render");
+        let build = std::process::Command::new("rustc")
+            .args(["--edition", "2021", "-A", "warnings", "-o"])
+            .arg(&bin)
+            .arg(&src)
+            .output()
+            .expect("rustc");
+        assert!(
+            build.status.success(),
+            "{case}: rustc rejected the render:\n{}\n--- program ---\n{prog}",
+            String::from_utf8_lossy(&build.stderr)
+        );
+        let run = std::process::Command::new(&bin)
+            .current_dir(&dir)
+            .output()
+            .expect("run render");
+        let _ = std::fs::remove_dir_all(&dir);
+        (run.stdout, run.status.code())
+    }
+
+    /// Run a shell snippet under bash: `(stdout, code)`.
+    fn run_bash(src: &str) -> (Vec<u8>, Option<i32>) {
+        let out = std::process::Command::new("bash")
+            .arg("-c")
+            .arg(src)
+            .output()
+            .expect("bash");
+        (out.stdout, out.status.code())
+    }
+
+    /// EVERY text node `rs` offers must be correct at RUNTIME, not merely in
+    /// spelling: the render is compiled with `rustc`, executed, and its stdout
+    /// and exit status compared BYTE-FOR-BYTE with bash running the original
+    /// snippet. The marker proves the node (not a helper, not `bash -c`)
+    /// produced the value — without it the test would pass on the `Exec`
+    /// fallback and pin nothing.
+    #[test]
+    fn offered_text_nodes_execute_like_bash() {
+        let cases: &[(&str, &str, &str)] = &[
+            ("SplitFieldExtract", ".split(\":\")", "echo \"a:b:c\" | cut -d: -f2\n"),
+            (
+                "WordCount",
+                "split_whitespace().count()",
+                "x=$(echo \"a b   c\" | wc -w)\necho \"w=$x\"\n",
+            ),
+            (
+                "RegCount",
+                ".matches('\\n').count()",
+                "x=$(echo hello | wc -l)\necho \"l=$x\"\n",
+            ),
+            ("RepeatStr", ".repeat(__n as usize)", "yes x | head -n 3\n"),
+            (
+                "SubStrExtract",
+                ".chars().skip(",
+                "v=abcdef\necho \"${v:1:3}\"\necho \"${v:2}\"\n",
+            ),
+            (
+                "StringTrim",
+                ".trim()",
+                "v=$(echo \"  a b  \" | xargs)\necho \"[$v]\"\n",
+            ),
+            (
+                "CaseTransform",
+                ".to_lowercase()",
+                "w=$(echo ABC | tr 'A-Z' 'a-z')\necho \"$w\"\n",
+            ),
+            (
+                "StringContains",
+                ".contains(\"ell\")",
+                "v=hello\nif [[ $v == *ell* ]]; then echo contains; fi\n",
+            ),
+            (
+                "StrLen",
+                "len() as i64",
+                "v=hello\necho \"len=${#v}\"\n",
+            ),
+            (
+                "ArrayLen",
+                "len() as i64",
+                "arr=(a bb ccc dddd)\necho \"len=${#arr[@]}\"\n",
+            ),
+        ];
+        let mut bad: Vec<String> = Vec::new();
+        for (name, marker, src) in cases {
+            let prog = render_rs(src);
+            if !prog.contains(marker) {
+                bad.push(format!("{name}: node not used (no {marker:?})"));
+                continue;
+            }
+            if prog.contains("__sh_spawn(") {
+                bad.push(format!("{name}: still shells out"));
+                continue;
+            }
+            let (rs_out, rs_rc) = compile_and_run(name, &prog);
+            let (sh_out, sh_rc) = run_bash(src);
+            if rs_out != sh_out || rs_rc != sh_rc {
+                bad.push(format!(
+                    "{name}: rust rc={rs_rc:?} out={:?} / bash rc={sh_rc:?} out={:?}",
+                    String::from_utf8_lossy(&rs_out),
+                    String::from_utf8_lossy(&sh_out)
+                ));
+            }
+        }
+        assert!(
+            bad.is_empty(),
+            "text nodes disagree with bash:\n{}",
+            bad.join("\n")
+        );
+    }
+
+    /// `TakeLines` is offered but has no shell-source lowering shape today
+    /// (every `| head` arrives as a pipeline), so its VALUE is pinned by
+    /// building the node directly and executing it against the bash command it
+    /// models — `head -n`/`tail -n` — rather than only its spelling.
+    #[test]
+    fn constructed_text_nodes_execute_like_bash() {
+        use crate::shir_nodes::TakeLines;
+        let mut bad: Vec<String> = Vec::new();
+        for (from_end, bash_src) in [
+            (false, "printf 'a\\nb\\nc\\n' | head -n 2\n"),
+            (true, "printf 'a\\nb\\nc\\n' | tail -n 2\n"),
+        ] {
+            let case = if from_end { "TakeLinesTail" } else { "TakeLinesHead" };
+            let prog = shir_to_rust(&print_program(IrExpr::Ext(Box::new(TakeLines {
+                text: s("a\nb\nc"),
+                count: IrExpr::Int(2),
+                from_end,
+                bytes: false,
+            }))));
+            let (rs_out, rs_rc) = compile_and_run(case, &prog);
+            let (sh_out, sh_rc) = run_bash(bash_src);
+            if rs_out != sh_out || rs_rc != sh_rc {
+                bad.push(format!(
+                    "{case}: rust rc={rs_rc:?} out={:?} / bash rc={sh_rc:?} out={:?}",
+                    String::from_utf8_lossy(&rs_out),
+                    String::from_utf8_lossy(&sh_out)
+                ));
+            }
+        }
+        assert!(
+            bad.is_empty(),
+            "constructed text nodes disagree with bash:\n{}",
+            bad.join("\n")
+        );
+    }
+
     /// A loop-carried self-update is NOT a dead store: the condition reads it
     /// again on the next iteration, so eliding `i=$((i+1))` into
     /// `let _ = i + 1;` makes the loop never terminate. The walk must also see
