@@ -14912,10 +14912,10 @@ fn helper_deps(h: &str) -> &'static [&'static str] {
         "spawn" => &["sink"],
         "puts" => &["sink"],
         "lines" => &[],
-        "printf" => &["q", "q_printf", "atoi", "atou", "atof"],
-        // printf's `%b` unescape, split out so a `%s`-only printf does not
-        // drag in __sh_echo_esc (the printf body then references only
-        // __sh_printf_b, which the helper prune can drop)
+        "printf" => &["q", "q_printf", "atoi", "atou", "atof", "echo_esc"],
+        // Kept as a registry entry (the `%b` arm used to route through it);
+        // `__sh_printf` now calls `__sh_echo_esc` directly, so the prune
+        // drops this one-line shim from every program.
         "printf_b" => &["echo_esc"],
         "capture_rc" => &["cap_bytes"],
         "run" => &["spawn"],
@@ -15026,9 +15026,9 @@ fn helper_source(h: &str) -> &'static str {
     (av % bv) == BigInt::from(0)
 }"#,
         // printf's `%b` conversion — the backslash-escape expansion.
-        // Split from __sh_printf so a `%s`-only printf need not carry
-        // __sh_echo_esc (the printf body calls __sh_printf_b, which the
-        // helper prune drops when unreferenced).
+        // Kept as a registry entry for name stability: since v156 the
+        // printf body calls __sh_echo_esc directly (the indirection is
+        // gone), so the helper prune drops this shim when nothing names it.
         "printf_b" => r#"fn __sh_printf_b(s: &str) -> String { __sh_echo_esc(s) }"#,
         "echo_esc" => r#"fn __sh_echo_esc(s: &str) -> String {
     let mut o = String::new();
@@ -15413,7 +15413,7 @@ fn helper_source(h: &str) -> &'static str {
                         if p >= 0 { t.chars().take(p as usize).collect() } else { t }
                     }
                     'b' => {
-                        let t = __sh_printf_b(&arg);
+                        let t = __sh_echo_esc(&arg);
                         if p >= 0 { t.chars().take(p as usize).collect() } else { t }
                     }
                     'q' => __sh_q_printf(&arg),
