@@ -30,8 +30,10 @@ fn offered(tag: &str) -> bool {
         return true;
     }
     match crate::transforms::target() {
+        // An UNSET target is the historical "every transform applies" (unit
+        // tests, the embed path): emit every node, as before.
+        None => true,
         Some(t) => crate::transforms::planner::node_manifest(&t).contains(&tag),
-        None => false,
     }
 }
 
@@ -49,13 +51,16 @@ pub fn transform(stmts: &mut Vec<IrStmt>) -> bool {
     // so the transform fires only for the shapes that target consumes. The
     // other backends keep the explicit opt-in until their own gates pin the
     // new IR shape.
-    // NOTE (PLAN v157): switching this on for `rs` (so the manifest, not the
-    // env var, decides) is NOT safe yet — the transform's STRUCTURAL rewrites
-    // (capture reduction, dead-store elimination, subshell scoping) emit
-    // shapes the Rust renderer only half-renders, so the probe programs lost
-    // their values. The renderer arms + `offered()` below are the prerequisite
-    // half; the structural rewrites need their own per-target gate first.
-    if !opted_in {
+    // Rust takes the manifest offer (PLAN v157): its renderer declares each
+    // text node it spells in `std`, and `offered()` withholds every other tag,
+    // so the transform fires only for the shapes that target consumes. The
+    // other backends keep the explicit opt-in until their own gates pin the
+    // new IR shape.
+    let manifest_offer = matches!(
+        crate::transforms::target().as_deref(),
+        Some("rs") | Some("rust")
+    );
+    if !opted_in && !manifest_offer {
         return false;
     }
     // text-ops is often exercised ALONE (SH2_TRANSFORMS=text-ops) — the
