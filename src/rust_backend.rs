@@ -14992,7 +14992,7 @@ fn helper_deps(h: &str) -> &'static [&'static str] {
 fn helper_source(h: &str) -> &'static str {
     match h {
         "lines" => r#"fn __sh_lines(s: &str) -> Vec<String> {
-    s.split('\n').map(|x| x.to_string()).collect()
+    s.split('\n').map(str::to_string).collect()
 }"#,
         "q" => r#"fn __sh_q(s: &str) -> String {
     let mut o = String::with_capacity(s.len() + 8);
@@ -15036,17 +15036,10 @@ fn helper_source(h: &str) -> &'static str {
     o
 }"#,
 "wq" => r#"fn __sh_wq(ws: &[String]) -> String {
-    let mut o = String::new();
-    for (i, w) in ws.iter().enumerate() {
-        if i > 0 { o.push(' '); }
-        o.push_str(&__sh_q(w));
-    }
-    o
+    ws.iter().map(|w| __sh_q(w)).collect::<Vec<_>>().join(" ")
 }"#,
         "cat" => r#"fn __sh_cat(ws: &[Vec<String>]) -> Vec<String> {
-    let mut o = Vec::new();
-    for w in ws { o.extend(w.iter().cloned()); }
-    o
+    ws.concat()
 }"#,
         "pow" => r#"fn __sh_pow(a: i64, b: i64) -> i64 {
     let mut r: i64 = 1;
@@ -15649,20 +15642,13 @@ fn helper_source(h: &str) -> &'static str {
 }"#,
         "split_ifs" => r#"fn __sh_split_ifs(s: &str, ifs: &str) -> Vec<String> {
     if ifs.is_empty() { return vec![s.to_string()]; }
-    let ws = ifs.chars().all(|c| c == ' ' || c == '\t' || c == '\n');
-    let ch: Vec<char> = s.chars().collect();
-    let is_sep = |c: char| ifs.contains(c);
-    let mut out = Vec::new();
-    let mut i = 0;
-    while i < ch.len() && is_sep(ch[i]) { i += 1; }
-    while i < ch.len() {
-        let start = i;
-        while i < ch.len() && !is_sep(ch[i]) { i += 1; }
-        out.push(ch[start..i].iter().collect());
-        if i >= ch.len() { break; }
-        i += 1;
-        if ws { while i < ch.len() && is_sep(ch[i]) { i += 1; } }
-    }
+    let sep = |c: char| ifs.contains(c);
+    let ws = ifs.chars().all(|c| matches!(c, ' ' | '\t' | '\n'));
+    let body = s.trim_start_matches(sep);
+    if body.is_empty() { return Vec::new(); }
+    let mut out: Vec<String> = body.split(sep).map(str::to_string).collect();
+    if ws { out.retain(|w| !w.is_empty()); }
+    else if out.last().map_or(false, |w| w.is_empty()) { out.pop(); }
     out
 }"#,
         // the sh2.* runtime's glob-metachar probe (evalTest's `=` fallback
@@ -15884,24 +15870,14 @@ fn helper_source(h: &str) -> &'static str {
     ch[o as usize..(o + l) as usize].iter().collect()
 }"#,
         "case" => r#"fn __sh_case(s: &str, mode: &str) -> String {
-    let ch: Vec<char> = s.chars().collect();
-    let mut out = String::new();
+    let mut it = s.chars();
     match mode {
-        "^^" => { for c in ch { for u in c.to_uppercase() { out.push(u); } } }
-        ",," => { for c in ch { for l in c.to_lowercase() { out.push(l); } } }
-        "^" => {
-            let mut it = ch.into_iter();
-            if let Some(c) = it.next() { for u in c.to_uppercase() { out.push(u); } }
-            for c in it { out.push(c); }
-        }
-        "," => {
-            let mut it = ch.into_iter();
-            if let Some(c) = it.next() { for l in c.to_lowercase() { out.push(l); } }
-            for c in it { out.push(c); }
-        }
-        _ => out = s.to_string(),
+        "^^" => s.to_uppercase(),
+        ",," => s.to_lowercase(),
+        "^" => it.next().map(|c| c.to_uppercase().collect::<String>() + it.as_str()).unwrap_or_default(),
+        "," => it.next().map(|c| c.to_lowercase().collect::<String>() + it.as_str()).unwrap_or_default(),
+        _ => s.to_string(),
     }
-    out
 }"#,
         "len" => r#"fn __sh_len(s: &str) -> i64 {
     s.chars().count() as i64
