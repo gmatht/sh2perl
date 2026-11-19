@@ -21017,20 +21017,47 @@ fn scan_stmt(st: &IrStmt, var: &str, ev: &mut Vec<bool>, muted: bool) {
             }
             scan_stmts(else_, var, ev, muted);
         }
+        // A LOOP-CARRIED value is read again after the body's store, on the
+        // next iteration — the ordered walk alone cannot see that, because
+        // the condition's read site comes BEFORE the store. Without this,
+        // `while [ $__n -lt 1000 ]; do __n=$((__n+1)); done` elided the
+        // update as a dead store (`let _ = __n + 1;`) and the loop never
+        // terminated (bench-count, bench-increment, hoist-loop-self-update,
+        // hot-scalar-accumulator-loop). Replaying the loop as READ-ONLY
+        // events marks a body store live whenever the loop itself reads the
+        // name, without counting the store twice.
         IrStmt::While { cond, body, .. } => {
+            let mark = ev.len();
             scan_expr(cond, var, ev, muted);
             scan_stmts(body, var, ev, muted);
+            replay_loop_reads(ev, mark, muted);
         }
         IrStmt::DoWhile { body, cond, .. } => {
+            let mark = ev.len();
             scan_stmts(body, var, ev, muted);
             scan_expr(cond, var, ev, muted);
+            replay_loop_reads(ev, mark, muted);
         }
-        IrStmt::For { body, .. } => scan_stmts(body, var, ev, muted),
-        IrStmt::ForInit { init, body, .. } => {
+        IrStmt::For { iter, body, .. } => {
+            let mark = ev.len();
+            scan_expr(iter, var, ev, muted);
+            scan_stmts(body, var, ev, muted);
+            replay_loop_reads(ev, mark, muted);
+        }
+        // For execution ORDER: init, condition, body, step. `step` was never
+        // walked, so a counter bumped only there (`__n=$((__n+1))`) read as
+        // an unwritten variable.
+        IrStmt::ForInit { init, cond, step, body, .. } => {
+            let mark = ev.len();
             for i in init {
                 scan_stmt(i, var, ev, muted);
             }
+            scan_expr(cond, var, ev, muted);
             scan_stmts(body, var, ev, muted);
+            for s in step {
+                scan_stmt(s, var, ev, muted);
+            }
+            replay_loop_reads(ev, mark, muted);
         }
         IrStmt::Function { body, named_blocks, .. } => {
             scan_stmts(body, var, ev, muted);
@@ -21075,8 +21102,56 @@ fn scan_stmt(st: &IrStmt, var: &str, ev: &mut Vec<bool>, muted: bool) {
     }
 }
 
+/// Reads and writes inside a parsed arithmetic node. `$((…))` / `((…))`
+/// carry their variable references in an AST, not in `Var` children — with
+/// only the `Ext` arm below, `while [ $__n -lt 1000 ]` and
+/// `__n=$((__n+1))` contributed NO events for `__n`, so the update looked
+/// like a dead store and the loop never terminated.
+fn scan_arith(a: &ArithAst, var: &str, ev: &mut Vec<bool>, muted: bool) {
+    match a {
+        ArithAst::Num(_) | ArithAst::Sizeof(_) => {}
+        ArithAst::Var(n) | ArithAst::Ident(n) => {
+            if n == var && !muted {
+                ev.push(false);
+            }
+        }
+        ArithAst::Index { var: v, key } => {
+            if v == var && !muted {
+                ev.push(false);
+            }
+            scan_arith(key, var, ev, muted);
+        }
+        ArithAst::Bin { lhs, rhs, .. } => {
+            scan_arith(lhs, var, ev, muted);
+            scan_arith(rhs, var, ev, muted);
+        }
+        ArithAst::Un { arg, .. } | ArithAst::Cast { arg, .. } => {
+            scan_arith(arg, var, ev, muted)
+        }
+        ArithAst::Cond { test, then, else_ } => {
+            scan_arith(test, var, ev, muted);
+            scan_arith(then, var, ev, muted);
+            scan_arith(else_, var, ev, muted);
+        }
+        ArithAst::Assign { var: v, rhs, .. } => {
+            let store = v == var && !muted;
+            if store {
+                ev.push(true);
+            }
+            scan_arith(rhs, var, ev, muted || store);
+        }
+        ArithAst::IncDec { var: v, .. } => {
+            if v == var && !muted {
+                ev.push(false);
+                ev.push(true);
+            }
+        }
+    }
+}
+
 fn scan_expr(e: &IrExpr, var: &str, ev: &mut Vec<bool>, muted: bool) {
     match e {
+        IrExpr::Arith(a) => scan_arith(a, var, ev, muted),
         // A transform-declared node is opaque to a plain `match`, but its
         // children are ordinary reads: `${v:0:2}` becomes
         // SubStrExtract(Var v), and `x=$(… | wc -l)` becomes RegCount(text).
@@ -21184,6 +21259,22 @@ fn scan_expr(e: &IrExpr, var: &str, ev: &mut Vec<bool>, muted: bool) {
             }
         }
         _ => {}
+    }
+}
+
+/// Model the next iteration of a loop whose events start at `mark`: if the
+/// body stored the name and anything in the loop reads it, that store is
+/// loop-carried, not dead. Pushes ONE read — stores are never echoed, so the
+/// per-name store count stays exactly the number of store sites.
+fn replay_loop_reads(ev: &mut Vec<bool>, mark: usize, muted: bool) {
+    if muted {
+        return;
+    }
+    let span = &ev[mark..];
+    let stored = span.iter().any(|s| *s);
+    let read = span.iter().any(|s| !*s);
+    if stored && read {
+        ev.push(false);
     }
 }
 
@@ -23721,6 +23812,22 @@ mod tests {
     }
 
     // ── the text nodes the `rs` manifest offers ──────────────────────
+
+    /// A loop-carried self-update is NOT a dead store: the condition reads it
+    /// again on the next iteration, so eliding `i=$((i+1))` into
+    /// `let _ = i + 1;` makes the loop never terminate. The walk must also see
+    /// the reads an `Arith` node carries (they are an AST, not `Var`
+    /// children) and a `ForInit`'s `step`.
+    #[test]
+    fn loop_carried_update_is_not_a_dead_store() {
+        // the counter walks `i=$((i+1))` / `__n=$((__n+1))` and its only
+        // later read is the loop condition's next evaluation
+        let out = render_rs(include_str!("../examples/bench-count.sh"));
+        assert!(!out.contains("let _ = __n + 1"), "update elided:\n{out}");
+        assert!(out.contains("__n = __n + 1;"), "counter dropped:\n{out}");
+        assert!(out.contains("i = i + 1;"), "accumulator dropped:\n{out}");
+        assert!(out.contains("while __n < 1000"), "condition not native:\n{out}");
+    }
 
     /// `local a=$1` keeps the parameter binding: the positional stays a
     /// READ of the function's parameter (the shIR hands it over as the
