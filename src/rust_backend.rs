@@ -23697,6 +23697,135 @@ mod tests {
         out
     }
 
+    /// Print `value` — one statement, so an arm's SPELLING can be asserted
+    /// without depending on which lowering happened to produce the node.
+    fn print_program(value: IrExpr) -> IrProgram {
+        IrProgram {
+            imports: vec![],
+            requires: vec![],
+            stmts: vec![IrStmt::Output { value, newline: true, target: None }],
+            subs: vec![],
+            var_types: vec![],
+            stmt_lines: vec![],
+            var_lengths: vec![],
+            var_const: vec![],
+            var_lifetimes: vec![],
+            var_storage: vec![],
+            var_nospace: vec![],
+            var_bash_env: vec![],
+        }
+    }
+
+    fn s(text: &str) -> IrExpr {
+        IrExpr::Str(text.to_string(), crate::ir::StrStyle::DoubleQuoted)
+    }
+
+    // ── the text nodes the `rs` manifest offers ──────────────────────
+
+    /// `${v:0:2}` is a char slice — no `__sh_substr`, no bash.
+    #[test]
+    fn substr_extract_is_a_native_char_slice() {
+        let out = render_rs("v=abcdef\necho \"x${v:0:2}y\"\n");
+        assert!(!out.contains("__sh_substr("), "helper emitted:\n{out}");
+        assert!(
+            out.contains(".chars().skip((0) as usize).take((2) as usize).collect::<String>()"),
+            "no native slice:\n{out}"
+        );
+        // and the store the node reads is still a real binding
+        assert!(out.contains("let v = \"abcdef\""), "dead-stored source:\n{out}");
+    }
+
+    /// `x=$(… | wc -l)` counts newlines in place and the assignment keeps
+    /// its value (the dead-store scan must see the read inside the node).
+    #[test]
+    fn reg_count_newline_is_a_matches_scan() {
+        let out = render_rs("x=$(echo hello | wc -l)\necho \"$x\"\n");
+        assert!(!out.contains("__sh_spawn("), "still shells out:\n{out}");
+        assert!(out.contains(".matches('\\n').count() as i64"), "no scan:\n{out}");
+        assert!(!out.contains("let _ ="), "store dropped as dead:\n{out}");
+    }
+
+    /// `wc -w` is a whitespace count.
+    #[test]
+    fn word_count_is_split_whitespace_count() {
+        let out = render_rs("x=$(echo hello world | wc -w)\necho \"$x\"\n");
+        assert!(!out.contains("__sh_spawn("), "still shells out:\n{out}");
+        assert!(out.contains(".split_whitespace().count() as i64"), "no count:\n{out}");
+    }
+
+    /// `xargs` on one static word is a trim.
+    #[test]
+    fn string_trim_is_a_native_trim() {
+        let out = render_rs("s=$(echo  x  | xargs)\necho \"$s\"\n");
+        assert!(!out.contains("__sh_spawn("), "still shells out:\n{out}");
+        assert!(out.contains(".trim().to_string()"), "no trim:\n{out}");
+    }
+
+    /// `cut -d: -f2` is a split + a bounds-checked field take.
+    #[test]
+    fn cut_is_a_native_split_and_field_take() {
+        let out = render_rs("v=$(echo a:b:c | cut -d: -f2)\necho \"$v\"\n");
+        assert!(!out.contains("__sh_spawn("), "still shells out:\n{out}");
+        assert!(out.contains(".split(\":\")"), "no split:\n{out}");
+        assert!(out.contains("__p[1].to_string()"), "no field take:\n{out}");
+    }
+
+    /// `yes x | head -n 3` is a repeat of the literal line.
+    #[test]
+    fn repeat_str_is_a_native_repeat() {
+        let out = render_rs("yes x | head -n 3\n");
+        assert!(!out.contains("__sh_spawn("), "still shells out:\n{out}");
+        assert!(out.contains(".repeat(__n as usize)"), "no repeat:\n{out}");
+    }
+
+    /// `tr A-Z a-z` is a case fold.
+    #[test]
+    fn tr_case_is_a_native_fold() {
+        let out = render_rs("w=$(echo ABC | tr 'A-Z' 'a-z')\necho \"$w\"\n");
+        assert!(!out.contains("__sh_spawn("), "still shells out:\n{out}");
+        assert!(out.contains(".to_lowercase()"), "no fold:\n{out}");
+    }
+
+    /// TakeLines has no lowering shape in today's text_ops (every `| head`
+    /// still arrives as a pipeline), so the arm is pinned directly: a line
+    /// slice, from either end, with a non-positive count empty.
+    #[test]
+    fn take_lines_renders_a_native_line_slice() {
+        use crate::shir_nodes::TakeLines;
+        for from_end in [false, true] {
+            let prog = print_program(IrExpr::Ext(Box::new(TakeLines {
+                text: s("a\nb\nc"),
+                count: IrExpr::Int(2),
+                from_end,
+                bytes: false,
+            })));
+            let out = shir_to_rust(&prog);
+            assert!(!out.contains("fn __sh_"), "helper emitted:\n{out}");
+            assert!(out.contains(".split('\\n')"), "no line split:\n{out}");
+            assert!(out.contains(".join(\"\\n\")"), "no rejoin:\n{out}");
+            assert!(out.contains("if __n <= 0 { String::new() }"), "no empty arm:\n{out}");
+        }
+    }
+
+    /// ArrayLen(Split(t, delim)) is a native `split().len()` — the wc -w
+    /// composition the planner offers a no-regex backend.
+    #[test]
+    fn array_len_of_a_split_is_a_native_len() {
+        use crate::shir_nodes::{ArrayLen, Split};
+        let prog = print_program(IrExpr::Ext(Box::new(ArrayLen {
+            array: IrExpr::Ext(Box::new(Split {
+                text: s("a b c"),
+                delim: " ".to_string(),
+                is_regex: false,
+                in_place: false,
+            })),
+        })));
+        let out = shir_to_rust(&prog);
+        assert!(!out.contains("fn __sh_"), "helper emitted:\n{out}");
+        assert!(out.contains(".split(\" \").map(str::to_string).collect::<Vec<String>>()"), "no split:\n{out}");
+        assert!(out.contains(".len() as i64"), "no len:\n{out}");
+    }
+
     // ── printf: literal formats render natively ──────────────────────
 
     /// `printf 'a\nb\n'` prints a constant — no 119-line engine, and the
