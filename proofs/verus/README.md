@@ -82,6 +82,37 @@ stage earlier — `arith("042") == 34` simplifies to `42 == 34` in a
 `compute_only` assert, so that mutant is rejected at simplification time and
 has no verified/error count.
 
+## capture_node_fold.rs — a carrier rename whose refusal is a bash fact (20)
+
+`transforms/capture_node_fold.rs`. `Call{"capture",[Arrow]}` becomes the
+first-class `Capture` node in value position; both render `$(…)`, but through
+different backend arms (the Perl `Capture` arm is the one with the native
+paths).
+
+- `fold_preserves_output` — the carrier law: for every expression, the folded
+  program's substitution bytes are unchanged. This is conditional on the two
+  arms agreeing in every target; that carrier contract is stated in-file, not
+  proved.
+- `words_position_fold_would_glue` — the load-bearing refusal, and a bash
+  fact: in WORD position bash splits a `$( )` result on IFS, so
+  `basename $(pwd)` passes one argument per word, while the non-splitting node
+  passes the whole output as ONE. `captureWords` is therefore never folded
+  (2 arguments vs 1 for `a b`).
+- `status_read_blocks_the_fold` — a body that reads `$?` keeps the call
+  spelling. The model proves the guard is structural and total
+  (`reads_status`), which is what lets the status-save arms keep the spelling
+  they key on; it does not claim the fold would change bash's `$?`.
+- `fold_leaves_no_foldable_call` — completeness: every value position is
+  reached (nested, interpolated, both children), so no foldable call survives.
+  `fold_preserves_guards` is the helper the surviving-call case needs.
+
+Mutants, measured: fold the word spelling too **18 verified, 2 errors**; drop
+the `$?` guard **18 verified, 2 errors**; drop the Arrow guard **18 verified,
+2 errors**; miss the second child of a two-position node **17 verified,
+3 errors**. Treating the non-splitting node as splitting is rejected at
+simplification (`2 == 1` in a `compute_only` assert). The source's six tests
+are mirrored as `pin_*` proofs.
+
 ## Running it
 
 Verus needs rust toolchain `1.99.1-x86_64-unknown-linux-gnu`
@@ -178,6 +209,37 @@ verified, 2 errors**. Accepting a leading zero in `strict_dec` is caught one
 stage earlier — `arith("042") == 34` simplifies to `42 == 34` in a
 `compute_only` assert, so that mutant is rejected at simplification time and
 has no verified/error count.
+
+## capture_node_fold.rs — a carrier rename whose refusal is a bash fact (20)
+
+`transforms/capture_node_fold.rs`. `Call{"capture",[Arrow]}` becomes the
+first-class `Capture` node in value position; both render `$(…)`, but through
+different backend arms (the Perl `Capture` arm is the one with the native
+paths).
+
+- `fold_preserves_output` — the carrier law: for every expression, the folded
+  program's substitution bytes are unchanged. This is conditional on the two
+  arms agreeing in every target; that carrier contract is stated in-file, not
+  proved.
+- `words_position_fold_would_glue` — the load-bearing refusal, and a bash
+  fact: in WORD position bash splits a `$( )` result on IFS, so
+  `basename $(pwd)` passes one argument per word, while the non-splitting node
+  passes the whole output as ONE. `captureWords` is therefore never folded
+  (2 arguments vs 1 for `a b`).
+- `status_read_blocks_the_fold` — a body that reads `$?` keeps the call
+  spelling. The model proves the guard is structural and total
+  (`reads_status`), which is what lets the status-save arms keep the spelling
+  they key on; it does not claim the fold would change bash's `$?`.
+- `fold_leaves_no_foldable_call` — completeness: every value position is
+  reached (nested, interpolated, both children), so no foldable call survives.
+  `fold_preserves_guards` is the helper the surviving-call case needs.
+
+Mutants, measured: fold the word spelling too **18 verified, 2 errors**; drop
+the `$?` guard **18 verified, 2 errors**; drop the Arrow guard **18 verified,
+2 errors**; miss the second child of a two-position node **17 verified,
+3 errors**. Treating the non-splitting node as splitting is rejected at
+simplification (`2 == 1` in a `compute_only` assert). The source's six tests
+are mirrored as `pin_*` proofs.
 
 ## Running it
 
@@ -280,6 +342,37 @@ verified, 2 errors**. Accepting a leading zero in `strict_dec` is caught one
 stage earlier — `arith("042") == 34` simplifies to `42 == 34` in a
 `compute_only` assert, so that mutant is rejected at simplification time and
 has no verified/error count.
+
+## capture_node_fold.rs — a carrier rename whose refusal is a bash fact (20)
+
+`transforms/capture_node_fold.rs`. `Call{"capture",[Arrow]}` becomes the
+first-class `Capture` node in value position; both render `$(…)`, but through
+different backend arms (the Perl `Capture` arm is the one with the native
+paths).
+
+- `fold_preserves_output` — the carrier law: for every expression, the folded
+  program's substitution bytes are unchanged. This is conditional on the two
+  arms agreeing in every target; that carrier contract is stated in-file, not
+  proved.
+- `words_position_fold_would_glue` — the load-bearing refusal, and a bash
+  fact: in WORD position bash splits a `$( )` result on IFS, so
+  `basename $(pwd)` passes one argument per word, while the non-splitting node
+  passes the whole output as ONE. `captureWords` is therefore never folded
+  (2 arguments vs 1 for `a b`).
+- `status_read_blocks_the_fold` — a body that reads `$?` keeps the call
+  spelling. The model proves the guard is structural and total
+  (`reads_status`), which is what lets the status-save arms keep the spelling
+  they key on; it does not claim the fold would change bash's `$?`.
+- `fold_leaves_no_foldable_call` — completeness: every value position is
+  reached (nested, interpolated, both children), so no foldable call survives.
+  `fold_preserves_guards` is the helper the surviving-call case needs.
+
+Mutants, measured: fold the word spelling too **18 verified, 2 errors**; drop
+the `$?` guard **18 verified, 2 errors**; drop the Arrow guard **18 verified,
+2 errors**; miss the second child of a two-position node **17 verified,
+3 errors**. Treating the non-splitting node as splitting is rejected at
+simplification (`2 == 1` in a `compute_only` assert). The source's six tests
+are mirrored as `pin_*` proofs.
 
 ## Running it
 
@@ -396,6 +489,37 @@ stage earlier — `arith("042") == 34` simplifies to `42 == 34` in a
 `compute_only` assert, so that mutant is rejected at simplification time and
 has no verified/error count.
 
+## capture_node_fold.rs — a carrier rename whose refusal is a bash fact (20)
+
+`transforms/capture_node_fold.rs`. `Call{"capture",[Arrow]}` becomes the
+first-class `Capture` node in value position; both render `$(…)`, but through
+different backend arms (the Perl `Capture` arm is the one with the native
+paths).
+
+- `fold_preserves_output` — the carrier law: for every expression, the folded
+  program's substitution bytes are unchanged. This is conditional on the two
+  arms agreeing in every target; that carrier contract is stated in-file, not
+  proved.
+- `words_position_fold_would_glue` — the load-bearing refusal, and a bash
+  fact: in WORD position bash splits a `$( )` result on IFS, so
+  `basename $(pwd)` passes one argument per word, while the non-splitting node
+  passes the whole output as ONE. `captureWords` is therefore never folded
+  (2 arguments vs 1 for `a b`).
+- `status_read_blocks_the_fold` — a body that reads `$?` keeps the call
+  spelling. The model proves the guard is structural and total
+  (`reads_status`), which is what lets the status-save arms keep the spelling
+  they key on; it does not claim the fold would change bash's `$?`.
+- `fold_leaves_no_foldable_call` — completeness: every value position is
+  reached (nested, interpolated, both children), so no foldable call survives.
+  `fold_preserves_guards` is the helper the surviving-call case needs.
+
+Mutants, measured: fold the word spelling too **18 verified, 2 errors**; drop
+the `$?` guard **18 verified, 2 errors**; drop the Arrow guard **18 verified,
+2 errors**; miss the second child of a two-position node **17 verified,
+3 errors**. Treating the non-splitting node as splitting is rejected at
+simplification (`2 == 1` in a `compute_only` assert). The source's six tests
+are mirrored as `pin_*` proofs.
+
 ## Running it
 
 Same toolchain as above:
@@ -491,6 +615,37 @@ verified, 2 errors**. Accepting a leading zero in `strict_dec` is caught one
 stage earlier — `arith("042") == 34` simplifies to `42 == 34` in a
 `compute_only` assert, so that mutant is rejected at simplification time and
 has no verified/error count.
+
+## capture_node_fold.rs — a carrier rename whose refusal is a bash fact (20)
+
+`transforms/capture_node_fold.rs`. `Call{"capture",[Arrow]}` becomes the
+first-class `Capture` node in value position; both render `$(…)`, but through
+different backend arms (the Perl `Capture` arm is the one with the native
+paths).
+
+- `fold_preserves_output` — the carrier law: for every expression, the folded
+  program's substitution bytes are unchanged. This is conditional on the two
+  arms agreeing in every target; that carrier contract is stated in-file, not
+  proved.
+- `words_position_fold_would_glue` — the load-bearing refusal, and a bash
+  fact: in WORD position bash splits a `$( )` result on IFS, so
+  `basename $(pwd)` passes one argument per word, while the non-splitting node
+  passes the whole output as ONE. `captureWords` is therefore never folded
+  (2 arguments vs 1 for `a b`).
+- `status_read_blocks_the_fold` — a body that reads `$?` keeps the call
+  spelling. The model proves the guard is structural and total
+  (`reads_status`), which is what lets the status-save arms keep the spelling
+  they key on; it does not claim the fold would change bash's `$?`.
+- `fold_leaves_no_foldable_call` — completeness: every value position is
+  reached (nested, interpolated, both children), so no foldable call survives.
+  `fold_preserves_guards` is the helper the surviving-call case needs.
+
+Mutants, measured: fold the word spelling too **18 verified, 2 errors**; drop
+the `$?` guard **18 verified, 2 errors**; drop the Arrow guard **18 verified,
+2 errors**; miss the second child of a two-position node **17 verified,
+3 errors**. Treating the non-splitting node as splitting is rejected at
+simplification (`2 == 1` in a `compute_only` assert). The source's six tests
+are mirrored as `pin_*` proofs.
 
 ## Running it
 
@@ -595,6 +750,37 @@ stage earlier — `arith("042") == 34` simplifies to `42 == 34` in a
 `compute_only` assert, so that mutant is rejected at simplification time and
 has no verified/error count.
 
+## capture_node_fold.rs — a carrier rename whose refusal is a bash fact (20)
+
+`transforms/capture_node_fold.rs`. `Call{"capture",[Arrow]}` becomes the
+first-class `Capture` node in value position; both render `$(…)`, but through
+different backend arms (the Perl `Capture` arm is the one with the native
+paths).
+
+- `fold_preserves_output` — the carrier law: for every expression, the folded
+  program's substitution bytes are unchanged. This is conditional on the two
+  arms agreeing in every target; that carrier contract is stated in-file, not
+  proved.
+- `words_position_fold_would_glue` — the load-bearing refusal, and a bash
+  fact: in WORD position bash splits a `$( )` result on IFS, so
+  `basename $(pwd)` passes one argument per word, while the non-splitting node
+  passes the whole output as ONE. `captureWords` is therefore never folded
+  (2 arguments vs 1 for `a b`).
+- `status_read_blocks_the_fold` — a body that reads `$?` keeps the call
+  spelling. The model proves the guard is structural and total
+  (`reads_status`), which is what lets the status-save arms keep the spelling
+  they key on; it does not claim the fold would change bash's `$?`.
+- `fold_leaves_no_foldable_call` — completeness: every value position is
+  reached (nested, interpolated, both children), so no foldable call survives.
+  `fold_preserves_guards` is the helper the surviving-call case needs.
+
+Mutants, measured: fold the word spelling too **18 verified, 2 errors**; drop
+the `$?` guard **18 verified, 2 errors**; drop the Arrow guard **18 verified,
+2 errors**; miss the second child of a two-position node **17 verified,
+3 errors**. Treating the non-splitting node as splitting is rejected at
+simplification (`2 == 1` in a `compute_only` assert). The source's six tests
+are mirrored as `pin_*` proofs.
+
 ## Running it
 
 Same toolchain as above:
@@ -688,6 +874,37 @@ stage earlier — `arith("042") == 34` simplifies to `42 == 34` in a
 `compute_only` assert, so that mutant is rejected at simplification time and
 has no verified/error count.
 
+## capture_node_fold.rs — a carrier rename whose refusal is a bash fact (20)
+
+`transforms/capture_node_fold.rs`. `Call{"capture",[Arrow]}` becomes the
+first-class `Capture` node in value position; both render `$(…)`, but through
+different backend arms (the Perl `Capture` arm is the one with the native
+paths).
+
+- `fold_preserves_output` — the carrier law: for every expression, the folded
+  program's substitution bytes are unchanged. This is conditional on the two
+  arms agreeing in every target; that carrier contract is stated in-file, not
+  proved.
+- `words_position_fold_would_glue` — the load-bearing refusal, and a bash
+  fact: in WORD position bash splits a `$( )` result on IFS, so
+  `basename $(pwd)` passes one argument per word, while the non-splitting node
+  passes the whole output as ONE. `captureWords` is therefore never folded
+  (2 arguments vs 1 for `a b`).
+- `status_read_blocks_the_fold` — a body that reads `$?` keeps the call
+  spelling. The model proves the guard is structural and total
+  (`reads_status`), which is what lets the status-save arms keep the spelling
+  they key on; it does not claim the fold would change bash's `$?`.
+- `fold_leaves_no_foldable_call` — completeness: every value position is
+  reached (nested, interpolated, both children), so no foldable call survives.
+  `fold_preserves_guards` is the helper the surviving-call case needs.
+
+Mutants, measured: fold the word spelling too **18 verified, 2 errors**; drop
+the `$?` guard **18 verified, 2 errors**; drop the Arrow guard **18 verified,
+2 errors**; miss the second child of a two-position node **17 verified,
+3 errors**. Treating the non-splitting node as splitting is rejected at
+simplification (`2 == 1` in a `compute_only` assert). The source's six tests
+are mirrored as `pin_*` proofs.
+
 ## Running it
 
 Same toolchain as above:
@@ -762,6 +979,37 @@ verified, 2 errors**. Accepting a leading zero in `strict_dec` is caught one
 stage earlier — `arith("042") == 34` simplifies to `42 == 34` in a
 `compute_only` assert, so that mutant is rejected at simplification time and
 has no verified/error count.
+
+## capture_node_fold.rs — a carrier rename whose refusal is a bash fact (20)
+
+`transforms/capture_node_fold.rs`. `Call{"capture",[Arrow]}` becomes the
+first-class `Capture` node in value position; both render `$(…)`, but through
+different backend arms (the Perl `Capture` arm is the one with the native
+paths).
+
+- `fold_preserves_output` — the carrier law: for every expression, the folded
+  program's substitution bytes are unchanged. This is conditional on the two
+  arms agreeing in every target; that carrier contract is stated in-file, not
+  proved.
+- `words_position_fold_would_glue` — the load-bearing refusal, and a bash
+  fact: in WORD position bash splits a `$( )` result on IFS, so
+  `basename $(pwd)` passes one argument per word, while the non-splitting node
+  passes the whole output as ONE. `captureWords` is therefore never folded
+  (2 arguments vs 1 for `a b`).
+- `status_read_blocks_the_fold` — a body that reads `$?` keeps the call
+  spelling. The model proves the guard is structural and total
+  (`reads_status`), which is what lets the status-save arms keep the spelling
+  they key on; it does not claim the fold would change bash's `$?`.
+- `fold_leaves_no_foldable_call` — completeness: every value position is
+  reached (nested, interpolated, both children), so no foldable call survives.
+  `fold_preserves_guards` is the helper the surviving-call case needs.
+
+Mutants, measured: fold the word spelling too **18 verified, 2 errors**; drop
+the `$?` guard **18 verified, 2 errors**; drop the Arrow guard **18 verified,
+2 errors**; miss the second child of a two-position node **17 verified,
+3 errors**. Treating the non-splitting node as splitting is rejected at
+simplification (`2 == 1` in a `compute_only` assert). The source's six tests
+are mirrored as `pin_*` proofs.
 
 ## Running it
 
@@ -962,6 +1210,37 @@ stage earlier — `arith("042") == 34` simplifies to `42 == 34` in a
 `compute_only` assert, so that mutant is rejected at simplification time and
 has no verified/error count.
 
+## capture_node_fold.rs — a carrier rename whose refusal is a bash fact (20)
+
+`transforms/capture_node_fold.rs`. `Call{"capture",[Arrow]}` becomes the
+first-class `Capture` node in value position; both render `$(…)`, but through
+different backend arms (the Perl `Capture` arm is the one with the native
+paths).
+
+- `fold_preserves_output` — the carrier law: for every expression, the folded
+  program's substitution bytes are unchanged. This is conditional on the two
+  arms agreeing in every target; that carrier contract is stated in-file, not
+  proved.
+- `words_position_fold_would_glue` — the load-bearing refusal, and a bash
+  fact: in WORD position bash splits a `$( )` result on IFS, so
+  `basename $(pwd)` passes one argument per word, while the non-splitting node
+  passes the whole output as ONE. `captureWords` is therefore never folded
+  (2 arguments vs 1 for `a b`).
+- `status_read_blocks_the_fold` — a body that reads `$?` keeps the call
+  spelling. The model proves the guard is structural and total
+  (`reads_status`), which is what lets the status-save arms keep the spelling
+  they key on; it does not claim the fold would change bash's `$?`.
+- `fold_leaves_no_foldable_call` — completeness: every value position is
+  reached (nested, interpolated, both children), so no foldable call survives.
+  `fold_preserves_guards` is the helper the surviving-call case needs.
+
+Mutants, measured: fold the word spelling too **18 verified, 2 errors**; drop
+the `$?` guard **18 verified, 2 errors**; drop the Arrow guard **18 verified,
+2 errors**; miss the second child of a two-position node **17 verified,
+3 errors**. Treating the non-splitting node as splitting is rejected at
+simplification (`2 == 1` in a `compute_only` assert). The source's six tests
+are mirrored as `pin_*` proofs.
+
 ## Running it (all six P6 files)
 
 Same toolchain as above, `--rlimit 40` each:
@@ -1041,6 +1320,37 @@ stage earlier — `arith("042") == 34` simplifies to `42 == 34` in a
 `compute_only` assert, so that mutant is rejected at simplification time and
 has no verified/error count.
 
+## capture_node_fold.rs — a carrier rename whose refusal is a bash fact (20)
+
+`transforms/capture_node_fold.rs`. `Call{"capture",[Arrow]}` becomes the
+first-class `Capture` node in value position; both render `$(…)`, but through
+different backend arms (the Perl `Capture` arm is the one with the native
+paths).
+
+- `fold_preserves_output` — the carrier law: for every expression, the folded
+  program's substitution bytes are unchanged. This is conditional on the two
+  arms agreeing in every target; that carrier contract is stated in-file, not
+  proved.
+- `words_position_fold_would_glue` — the load-bearing refusal, and a bash
+  fact: in WORD position bash splits a `$( )` result on IFS, so
+  `basename $(pwd)` passes one argument per word, while the non-splitting node
+  passes the whole output as ONE. `captureWords` is therefore never folded
+  (2 arguments vs 1 for `a b`).
+- `status_read_blocks_the_fold` — a body that reads `$?` keeps the call
+  spelling. The model proves the guard is structural and total
+  (`reads_status`), which is what lets the status-save arms keep the spelling
+  they key on; it does not claim the fold would change bash's `$?`.
+- `fold_leaves_no_foldable_call` — completeness: every value position is
+  reached (nested, interpolated, both children), so no foldable call survives.
+  `fold_preserves_guards` is the helper the surviving-call case needs.
+
+Mutants, measured: fold the word spelling too **18 verified, 2 errors**; drop
+the `$?` guard **18 verified, 2 errors**; drop the Arrow guard **18 verified,
+2 errors**; miss the second child of a two-position node **17 verified,
+3 errors**. Treating the non-splitting node as splitting is rejected at
+simplification (`2 == 1` in a `compute_only` assert). The source's six tests
+are mirrored as `pin_*` proofs.
+
 ## Running it
 
 Same toolchain as the P6 files (`--rlimit 40`).
@@ -1113,6 +1423,37 @@ verified, 2 errors**. Accepting a leading zero in `strict_dec` is caught one
 stage earlier — `arith("042") == 34` simplifies to `42 == 34` in a
 `compute_only` assert, so that mutant is rejected at simplification time and
 has no verified/error count.
+
+## capture_node_fold.rs — a carrier rename whose refusal is a bash fact (20)
+
+`transforms/capture_node_fold.rs`. `Call{"capture",[Arrow]}` becomes the
+first-class `Capture` node in value position; both render `$(…)`, but through
+different backend arms (the Perl `Capture` arm is the one with the native
+paths).
+
+- `fold_preserves_output` — the carrier law: for every expression, the folded
+  program's substitution bytes are unchanged. This is conditional on the two
+  arms agreeing in every target; that carrier contract is stated in-file, not
+  proved.
+- `words_position_fold_would_glue` — the load-bearing refusal, and a bash
+  fact: in WORD position bash splits a `$( )` result on IFS, so
+  `basename $(pwd)` passes one argument per word, while the non-splitting node
+  passes the whole output as ONE. `captureWords` is therefore never folded
+  (2 arguments vs 1 for `a b`).
+- `status_read_blocks_the_fold` — a body that reads `$?` keeps the call
+  spelling. The model proves the guard is structural and total
+  (`reads_status`), which is what lets the status-save arms keep the spelling
+  they key on; it does not claim the fold would change bash's `$?`.
+- `fold_leaves_no_foldable_call` — completeness: every value position is
+  reached (nested, interpolated, both children), so no foldable call survives.
+  `fold_preserves_guards` is the helper the surviving-call case needs.
+
+Mutants, measured: fold the word spelling too **18 verified, 2 errors**; drop
+the `$?` guard **18 verified, 2 errors**; drop the Arrow guard **18 verified,
+2 errors**; miss the second child of a two-position node **17 verified,
+3 errors**. Treating the non-splitting node as splitting is rejected at
+simplification (`2 == 1` in a `compute_only` assert). The source's six tests
+are mirrored as `pin_*` proofs.
 
 ## Running it
 
@@ -1228,6 +1569,37 @@ stage earlier — `arith("042") == 34` simplifies to `42 == 34` in a
 `compute_only` assert, so that mutant is rejected at simplification time and
 has no verified/error count.
 
+## capture_node_fold.rs — a carrier rename whose refusal is a bash fact (20)
+
+`transforms/capture_node_fold.rs`. `Call{"capture",[Arrow]}` becomes the
+first-class `Capture` node in value position; both render `$(…)`, but through
+different backend arms (the Perl `Capture` arm is the one with the native
+paths).
+
+- `fold_preserves_output` — the carrier law: for every expression, the folded
+  program's substitution bytes are unchanged. This is conditional on the two
+  arms agreeing in every target; that carrier contract is stated in-file, not
+  proved.
+- `words_position_fold_would_glue` — the load-bearing refusal, and a bash
+  fact: in WORD position bash splits a `$( )` result on IFS, so
+  `basename $(pwd)` passes one argument per word, while the non-splitting node
+  passes the whole output as ONE. `captureWords` is therefore never folded
+  (2 arguments vs 1 for `a b`).
+- `status_read_blocks_the_fold` — a body that reads `$?` keeps the call
+  spelling. The model proves the guard is structural and total
+  (`reads_status`), which is what lets the status-save arms keep the spelling
+  they key on; it does not claim the fold would change bash's `$?`.
+- `fold_leaves_no_foldable_call` — completeness: every value position is
+  reached (nested, interpolated, both children), so no foldable call survives.
+  `fold_preserves_guards` is the helper the surviving-call case needs.
+
+Mutants, measured: fold the word spelling too **18 verified, 2 errors**; drop
+the `$?` guard **18 verified, 2 errors**; drop the Arrow guard **18 verified,
+2 errors**; miss the second child of a two-position node **17 verified,
+3 errors**. Treating the non-splitting node as splitting is rejected at
+simplification (`2 == 1` in a `compute_only` assert). The source's six tests
+are mirrored as `pin_*` proofs.
+
 ## Running it
 
 Same toolchain as above (`--rlimit 80` for the shadow-induction
@@ -1323,6 +1695,37 @@ verified, 2 errors**. Accepting a leading zero in `strict_dec` is caught one
 stage earlier — `arith("042") == 34` simplifies to `42 == 34` in a
 `compute_only` assert, so that mutant is rejected at simplification time and
 has no verified/error count.
+
+## capture_node_fold.rs — a carrier rename whose refusal is a bash fact (20)
+
+`transforms/capture_node_fold.rs`. `Call{"capture",[Arrow]}` becomes the
+first-class `Capture` node in value position; both render `$(…)`, but through
+different backend arms (the Perl `Capture` arm is the one with the native
+paths).
+
+- `fold_preserves_output` — the carrier law: for every expression, the folded
+  program's substitution bytes are unchanged. This is conditional on the two
+  arms agreeing in every target; that carrier contract is stated in-file, not
+  proved.
+- `words_position_fold_would_glue` — the load-bearing refusal, and a bash
+  fact: in WORD position bash splits a `$( )` result on IFS, so
+  `basename $(pwd)` passes one argument per word, while the non-splitting node
+  passes the whole output as ONE. `captureWords` is therefore never folded
+  (2 arguments vs 1 for `a b`).
+- `status_read_blocks_the_fold` — a body that reads `$?` keeps the call
+  spelling. The model proves the guard is structural and total
+  (`reads_status`), which is what lets the status-save arms keep the spelling
+  they key on; it does not claim the fold would change bash's `$?`.
+- `fold_leaves_no_foldable_call` — completeness: every value position is
+  reached (nested, interpolated, both children), so no foldable call survives.
+  `fold_preserves_guards` is the helper the surviving-call case needs.
+
+Mutants, measured: fold the word spelling too **18 verified, 2 errors**; drop
+the `$?` guard **18 verified, 2 errors**; drop the Arrow guard **18 verified,
+2 errors**; miss the second child of a two-position node **17 verified,
+3 errors**. Treating the non-splitting node as splitting is rejected at
+simplification (`2 == 1` in a `compute_only` assert). The source's six tests
+are mirrored as `pin_*` proofs.
 
 ## Running it
 
@@ -1424,6 +1827,37 @@ stage earlier — `arith("042") == 34` simplifies to `42 == 34` in a
 `compute_only` assert, so that mutant is rejected at simplification time and
 has no verified/error count.
 
+## capture_node_fold.rs — a carrier rename whose refusal is a bash fact (20)
+
+`transforms/capture_node_fold.rs`. `Call{"capture",[Arrow]}` becomes the
+first-class `Capture` node in value position; both render `$(…)`, but through
+different backend arms (the Perl `Capture` arm is the one with the native
+paths).
+
+- `fold_preserves_output` — the carrier law: for every expression, the folded
+  program's substitution bytes are unchanged. This is conditional on the two
+  arms agreeing in every target; that carrier contract is stated in-file, not
+  proved.
+- `words_position_fold_would_glue` — the load-bearing refusal, and a bash
+  fact: in WORD position bash splits a `$( )` result on IFS, so
+  `basename $(pwd)` passes one argument per word, while the non-splitting node
+  passes the whole output as ONE. `captureWords` is therefore never folded
+  (2 arguments vs 1 for `a b`).
+- `status_read_blocks_the_fold` — a body that reads `$?` keeps the call
+  spelling. The model proves the guard is structural and total
+  (`reads_status`), which is what lets the status-save arms keep the spelling
+  they key on; it does not claim the fold would change bash's `$?`.
+- `fold_leaves_no_foldable_call` — completeness: every value position is
+  reached (nested, interpolated, both children), so no foldable call survives.
+  `fold_preserves_guards` is the helper the surviving-call case needs.
+
+Mutants, measured: fold the word spelling too **18 verified, 2 errors**; drop
+the `$?` guard **18 verified, 2 errors**; drop the Arrow guard **18 verified,
+2 errors**; miss the second child of a two-position node **17 verified,
+3 errors**. Treating the non-splitting node as splitting is rejected at
+simplification (`2 == 1` in a `compute_only` assert). The source's six tests
+are mirrored as `pin_*` proofs.
+
 ## Running it
 
 Same toolchain as above (`--rlimit 60` for the fuel/size induction):
@@ -1524,6 +1958,37 @@ stage earlier — `arith("042") == 34` simplifies to `42 == 34` in a
 `compute_only` assert, so that mutant is rejected at simplification time and
 has no verified/error count.
 
+## capture_node_fold.rs — a carrier rename whose refusal is a bash fact (20)
+
+`transforms/capture_node_fold.rs`. `Call{"capture",[Arrow]}` becomes the
+first-class `Capture` node in value position; both render `$(…)`, but through
+different backend arms (the Perl `Capture` arm is the one with the native
+paths).
+
+- `fold_preserves_output` — the carrier law: for every expression, the folded
+  program's substitution bytes are unchanged. This is conditional on the two
+  arms agreeing in every target; that carrier contract is stated in-file, not
+  proved.
+- `words_position_fold_would_glue` — the load-bearing refusal, and a bash
+  fact: in WORD position bash splits a `$( )` result on IFS, so
+  `basename $(pwd)` passes one argument per word, while the non-splitting node
+  passes the whole output as ONE. `captureWords` is therefore never folded
+  (2 arguments vs 1 for `a b`).
+- `status_read_blocks_the_fold` — a body that reads `$?` keeps the call
+  spelling. The model proves the guard is structural and total
+  (`reads_status`), which is what lets the status-save arms keep the spelling
+  they key on; it does not claim the fold would change bash's `$?`.
+- `fold_leaves_no_foldable_call` — completeness: every value position is
+  reached (nested, interpolated, both children), so no foldable call survives.
+  `fold_preserves_guards` is the helper the surviving-call case needs.
+
+Mutants, measured: fold the word spelling too **18 verified, 2 errors**; drop
+the `$?` guard **18 verified, 2 errors**; drop the Arrow guard **18 verified,
+2 errors**; miss the second child of a two-position node **17 verified,
+3 errors**. Treating the non-splitting node as splitting is rejected at
+simplification (`2 == 1` in a `compute_only` assert). The source's six tests
+are mirrored as `pin_*` proofs.
+
 ## Running it
 
 Same toolchain as the P6/P7/P8 files (`--rlimit 40`):
@@ -1605,6 +2070,37 @@ verified, 2 errors**. Accepting a leading zero in `strict_dec` is caught one
 stage earlier — `arith("042") == 34` simplifies to `42 == 34` in a
 `compute_only` assert, so that mutant is rejected at simplification time and
 has no verified/error count.
+
+## capture_node_fold.rs — a carrier rename whose refusal is a bash fact (20)
+
+`transforms/capture_node_fold.rs`. `Call{"capture",[Arrow]}` becomes the
+first-class `Capture` node in value position; both render `$(…)`, but through
+different backend arms (the Perl `Capture` arm is the one with the native
+paths).
+
+- `fold_preserves_output` — the carrier law: for every expression, the folded
+  program's substitution bytes are unchanged. This is conditional on the two
+  arms agreeing in every target; that carrier contract is stated in-file, not
+  proved.
+- `words_position_fold_would_glue` — the load-bearing refusal, and a bash
+  fact: in WORD position bash splits a `$( )` result on IFS, so
+  `basename $(pwd)` passes one argument per word, while the non-splitting node
+  passes the whole output as ONE. `captureWords` is therefore never folded
+  (2 arguments vs 1 for `a b`).
+- `status_read_blocks_the_fold` — a body that reads `$?` keeps the call
+  spelling. The model proves the guard is structural and total
+  (`reads_status`), which is what lets the status-save arms keep the spelling
+  they key on; it does not claim the fold would change bash's `$?`.
+- `fold_leaves_no_foldable_call` — completeness: every value position is
+  reached (nested, interpolated, both children), so no foldable call survives.
+  `fold_preserves_guards` is the helper the surviving-call case needs.
+
+Mutants, measured: fold the word spelling too **18 verified, 2 errors**; drop
+the `$?` guard **18 verified, 2 errors**; drop the Arrow guard **18 verified,
+2 errors**; miss the second child of a two-position node **17 verified,
+3 errors**. Treating the non-splitting node as splitting is rejected at
+simplification (`2 == 1` in a `compute_only` assert). The source's six tests
+are mirrored as `pin_*` proofs.
 
 ## Running it
 
@@ -1692,6 +2188,37 @@ stage earlier — `arith("042") == 34` simplifies to `42 == 34` in a
 `compute_only` assert, so that mutant is rejected at simplification time and
 has no verified/error count.
 
+## capture_node_fold.rs — a carrier rename whose refusal is a bash fact (20)
+
+`transforms/capture_node_fold.rs`. `Call{"capture",[Arrow]}` becomes the
+first-class `Capture` node in value position; both render `$(…)`, but through
+different backend arms (the Perl `Capture` arm is the one with the native
+paths).
+
+- `fold_preserves_output` — the carrier law: for every expression, the folded
+  program's substitution bytes are unchanged. This is conditional on the two
+  arms agreeing in every target; that carrier contract is stated in-file, not
+  proved.
+- `words_position_fold_would_glue` — the load-bearing refusal, and a bash
+  fact: in WORD position bash splits a `$( )` result on IFS, so
+  `basename $(pwd)` passes one argument per word, while the non-splitting node
+  passes the whole output as ONE. `captureWords` is therefore never folded
+  (2 arguments vs 1 for `a b`).
+- `status_read_blocks_the_fold` — a body that reads `$?` keeps the call
+  spelling. The model proves the guard is structural and total
+  (`reads_status`), which is what lets the status-save arms keep the spelling
+  they key on; it does not claim the fold would change bash's `$?`.
+- `fold_leaves_no_foldable_call` — completeness: every value position is
+  reached (nested, interpolated, both children), so no foldable call survives.
+  `fold_preserves_guards` is the helper the surviving-call case needs.
+
+Mutants, measured: fold the word spelling too **18 verified, 2 errors**; drop
+the `$?` guard **18 verified, 2 errors**; drop the Arrow guard **18 verified,
+2 errors**; miss the second child of a two-position node **17 verified,
+3 errors**. Treating the non-splitting node as splitting is rejected at
+simplification (`2 == 1` in a `compute_only` assert). The source's six tests
+are mirrored as `pin_*` proofs.
+
 ## Running it
 
 Same toolchain as the P6/P7/P8 files (`--rlimit 40`).
@@ -1768,6 +2295,37 @@ verified, 2 errors**. Accepting a leading zero in `strict_dec` is caught one
 stage earlier — `arith("042") == 34` simplifies to `42 == 34` in a
 `compute_only` assert, so that mutant is rejected at simplification time and
 has no verified/error count.
+
+## capture_node_fold.rs — a carrier rename whose refusal is a bash fact (20)
+
+`transforms/capture_node_fold.rs`. `Call{"capture",[Arrow]}` becomes the
+first-class `Capture` node in value position; both render `$(…)`, but through
+different backend arms (the Perl `Capture` arm is the one with the native
+paths).
+
+- `fold_preserves_output` — the carrier law: for every expression, the folded
+  program's substitution bytes are unchanged. This is conditional on the two
+  arms agreeing in every target; that carrier contract is stated in-file, not
+  proved.
+- `words_position_fold_would_glue` — the load-bearing refusal, and a bash
+  fact: in WORD position bash splits a `$( )` result on IFS, so
+  `basename $(pwd)` passes one argument per word, while the non-splitting node
+  passes the whole output as ONE. `captureWords` is therefore never folded
+  (2 arguments vs 1 for `a b`).
+- `status_read_blocks_the_fold` — a body that reads `$?` keeps the call
+  spelling. The model proves the guard is structural and total
+  (`reads_status`), which is what lets the status-save arms keep the spelling
+  they key on; it does not claim the fold would change bash's `$?`.
+- `fold_leaves_no_foldable_call` — completeness: every value position is
+  reached (nested, interpolated, both children), so no foldable call survives.
+  `fold_preserves_guards` is the helper the surviving-call case needs.
+
+Mutants, measured: fold the word spelling too **18 verified, 2 errors**; drop
+the `$?` guard **18 verified, 2 errors**; drop the Arrow guard **18 verified,
+2 errors**; miss the second child of a two-position node **17 verified,
+3 errors**. Treating the non-splitting node as splitting is rejected at
+simplification (`2 == 1` in a `compute_only` assert). The source's six tests
+are mirrored as `pin_*` proofs.
 
 ## Running it
 
@@ -1849,6 +2407,37 @@ stage earlier — `arith("042") == 34` simplifies to `42 == 34` in a
 `compute_only` assert, so that mutant is rejected at simplification time and
 has no verified/error count.
 
+## capture_node_fold.rs — a carrier rename whose refusal is a bash fact (20)
+
+`transforms/capture_node_fold.rs`. `Call{"capture",[Arrow]}` becomes the
+first-class `Capture` node in value position; both render `$(…)`, but through
+different backend arms (the Perl `Capture` arm is the one with the native
+paths).
+
+- `fold_preserves_output` — the carrier law: for every expression, the folded
+  program's substitution bytes are unchanged. This is conditional on the two
+  arms agreeing in every target; that carrier contract is stated in-file, not
+  proved.
+- `words_position_fold_would_glue` — the load-bearing refusal, and a bash
+  fact: in WORD position bash splits a `$( )` result on IFS, so
+  `basename $(pwd)` passes one argument per word, while the non-splitting node
+  passes the whole output as ONE. `captureWords` is therefore never folded
+  (2 arguments vs 1 for `a b`).
+- `status_read_blocks_the_fold` — a body that reads `$?` keeps the call
+  spelling. The model proves the guard is structural and total
+  (`reads_status`), which is what lets the status-save arms keep the spelling
+  they key on; it does not claim the fold would change bash's `$?`.
+- `fold_leaves_no_foldable_call` — completeness: every value position is
+  reached (nested, interpolated, both children), so no foldable call survives.
+  `fold_preserves_guards` is the helper the surviving-call case needs.
+
+Mutants, measured: fold the word spelling too **18 verified, 2 errors**; drop
+the `$?` guard **18 verified, 2 errors**; drop the Arrow guard **18 verified,
+2 errors**; miss the second child of a two-position node **17 verified,
+3 errors**. Treating the non-splitting node as splitting is rejected at
+simplification (`2 == 1` in a `compute_only` assert). The source's six tests
+are mirrored as `pin_*` proofs.
+
 ## Running it
 
 Same toolchain as the P6/P7/P8 files (`--rlimit 40`).
@@ -1929,6 +2518,37 @@ verified, 2 errors**. Accepting a leading zero in `strict_dec` is caught one
 stage earlier — `arith("042") == 34` simplifies to `42 == 34` in a
 `compute_only` assert, so that mutant is rejected at simplification time and
 has no verified/error count.
+
+## capture_node_fold.rs — a carrier rename whose refusal is a bash fact (20)
+
+`transforms/capture_node_fold.rs`. `Call{"capture",[Arrow]}` becomes the
+first-class `Capture` node in value position; both render `$(…)`, but through
+different backend arms (the Perl `Capture` arm is the one with the native
+paths).
+
+- `fold_preserves_output` — the carrier law: for every expression, the folded
+  program's substitution bytes are unchanged. This is conditional on the two
+  arms agreeing in every target; that carrier contract is stated in-file, not
+  proved.
+- `words_position_fold_would_glue` — the load-bearing refusal, and a bash
+  fact: in WORD position bash splits a `$( )` result on IFS, so
+  `basename $(pwd)` passes one argument per word, while the non-splitting node
+  passes the whole output as ONE. `captureWords` is therefore never folded
+  (2 arguments vs 1 for `a b`).
+- `status_read_blocks_the_fold` — a body that reads `$?` keeps the call
+  spelling. The model proves the guard is structural and total
+  (`reads_status`), which is what lets the status-save arms keep the spelling
+  they key on; it does not claim the fold would change bash's `$?`.
+- `fold_leaves_no_foldable_call` — completeness: every value position is
+  reached (nested, interpolated, both children), so no foldable call survives.
+  `fold_preserves_guards` is the helper the surviving-call case needs.
+
+Mutants, measured: fold the word spelling too **18 verified, 2 errors**; drop
+the `$?` guard **18 verified, 2 errors**; drop the Arrow guard **18 verified,
+2 errors**; miss the second child of a two-position node **17 verified,
+3 errors**. Treating the non-splitting node as splitting is rejected at
+simplification (`2 == 1` in a `compute_only` assert). The source's six tests
+are mirrored as `pin_*` proofs.
 
 ## Running it
 
@@ -2179,6 +2799,37 @@ verified, 2 errors**. Accepting a leading zero in `strict_dec` is caught one
 stage earlier — `arith("042") == 34` simplifies to `42 == 34` in a
 `compute_only` assert, so that mutant is rejected at simplification time and
 has no verified/error count.
+
+## capture_node_fold.rs — a carrier rename whose refusal is a bash fact (20)
+
+`transforms/capture_node_fold.rs`. `Call{"capture",[Arrow]}` becomes the
+first-class `Capture` node in value position; both render `$(…)`, but through
+different backend arms (the Perl `Capture` arm is the one with the native
+paths).
+
+- `fold_preserves_output` — the carrier law: for every expression, the folded
+  program's substitution bytes are unchanged. This is conditional on the two
+  arms agreeing in every target; that carrier contract is stated in-file, not
+  proved.
+- `words_position_fold_would_glue` — the load-bearing refusal, and a bash
+  fact: in WORD position bash splits a `$( )` result on IFS, so
+  `basename $(pwd)` passes one argument per word, while the non-splitting node
+  passes the whole output as ONE. `captureWords` is therefore never folded
+  (2 arguments vs 1 for `a b`).
+- `status_read_blocks_the_fold` — a body that reads `$?` keeps the call
+  spelling. The model proves the guard is structural and total
+  (`reads_status`), which is what lets the status-save arms keep the spelling
+  they key on; it does not claim the fold would change bash's `$?`.
+- `fold_leaves_no_foldable_call` — completeness: every value position is
+  reached (nested, interpolated, both children), so no foldable call survives.
+  `fold_preserves_guards` is the helper the surviving-call case needs.
+
+Mutants, measured: fold the word spelling too **18 verified, 2 errors**; drop
+the `$?` guard **18 verified, 2 errors**; drop the Arrow guard **18 verified,
+2 errors**; miss the second child of a two-position node **17 verified,
+3 errors**. Treating the non-splitting node as splitting is rejected at
+simplification (`2 == 1` in a `compute_only` assert). The source's six tests
+are mirrored as `pin_*` proofs.
 
 ## Running it
 
@@ -2482,6 +3133,37 @@ stage earlier — `arith("042") == 34` simplifies to `42 == 34` in a
 `compute_only` assert, so that mutant is rejected at simplification time and
 has no verified/error count.
 
+## capture_node_fold.rs — a carrier rename whose refusal is a bash fact (20)
+
+`transforms/capture_node_fold.rs`. `Call{"capture",[Arrow]}` becomes the
+first-class `Capture` node in value position; both render `$(…)`, but through
+different backend arms (the Perl `Capture` arm is the one with the native
+paths).
+
+- `fold_preserves_output` — the carrier law: for every expression, the folded
+  program's substitution bytes are unchanged. This is conditional on the two
+  arms agreeing in every target; that carrier contract is stated in-file, not
+  proved.
+- `words_position_fold_would_glue` — the load-bearing refusal, and a bash
+  fact: in WORD position bash splits a `$( )` result on IFS, so
+  `basename $(pwd)` passes one argument per word, while the non-splitting node
+  passes the whole output as ONE. `captureWords` is therefore never folded
+  (2 arguments vs 1 for `a b`).
+- `status_read_blocks_the_fold` — a body that reads `$?` keeps the call
+  spelling. The model proves the guard is structural and total
+  (`reads_status`), which is what lets the status-save arms keep the spelling
+  they key on; it does not claim the fold would change bash's `$?`.
+- `fold_leaves_no_foldable_call` — completeness: every value position is
+  reached (nested, interpolated, both children), so no foldable call survives.
+  `fold_preserves_guards` is the helper the surviving-call case needs.
+
+Mutants, measured: fold the word spelling too **18 verified, 2 errors**; drop
+the `$?` guard **18 verified, 2 errors**; drop the Arrow guard **18 verified,
+2 errors**; miss the second child of a two-position node **17 verified,
+3 errors**. Treating the non-splitting node as splitting is rejected at
+simplification (`2 == 1` in a `compute_only` assert). The source's six tests
+are mirrored as `pin_*` proofs.
+
 ## Running it
 
 Same toolchain as above (`--rlimit 40`).
@@ -2721,6 +3403,37 @@ stage earlier — `arith("042") == 34` simplifies to `42 == 34` in a
 `compute_only` assert, so that mutant is rejected at simplification time and
 has no verified/error count.
 
+## capture_node_fold.rs — a carrier rename whose refusal is a bash fact (20)
+
+`transforms/capture_node_fold.rs`. `Call{"capture",[Arrow]}` becomes the
+first-class `Capture` node in value position; both render `$(…)`, but through
+different backend arms (the Perl `Capture` arm is the one with the native
+paths).
+
+- `fold_preserves_output` — the carrier law: for every expression, the folded
+  program's substitution bytes are unchanged. This is conditional on the two
+  arms agreeing in every target; that carrier contract is stated in-file, not
+  proved.
+- `words_position_fold_would_glue` — the load-bearing refusal, and a bash
+  fact: in WORD position bash splits a `$( )` result on IFS, so
+  `basename $(pwd)` passes one argument per word, while the non-splitting node
+  passes the whole output as ONE. `captureWords` is therefore never folded
+  (2 arguments vs 1 for `a b`).
+- `status_read_blocks_the_fold` — a body that reads `$?` keeps the call
+  spelling. The model proves the guard is structural and total
+  (`reads_status`), which is what lets the status-save arms keep the spelling
+  they key on; it does not claim the fold would change bash's `$?`.
+- `fold_leaves_no_foldable_call` — completeness: every value position is
+  reached (nested, interpolated, both children), so no foldable call survives.
+  `fold_preserves_guards` is the helper the surviving-call case needs.
+
+Mutants, measured: fold the word spelling too **18 verified, 2 errors**; drop
+the `$?` guard **18 verified, 2 errors**; drop the Arrow guard **18 verified,
+2 errors**; miss the second child of a two-position node **17 verified,
+3 errors**. Treating the non-splitting node as splitting is rejected at
+simplification (`2 == 1` in a `compute_only` assert). The source's six tests
+are mirrored as `pin_*` proofs.
+
 ## Running it
 
 Same toolchain as above (`--rlimit 40`).
@@ -2946,6 +3659,37 @@ verified, 2 errors**. Accepting a leading zero in `strict_dec` is caught one
 stage earlier — `arith("042") == 34` simplifies to `42 == 34` in a
 `compute_only` assert, so that mutant is rejected at simplification time and
 has no verified/error count.
+
+## capture_node_fold.rs — a carrier rename whose refusal is a bash fact (20)
+
+`transforms/capture_node_fold.rs`. `Call{"capture",[Arrow]}` becomes the
+first-class `Capture` node in value position; both render `$(…)`, but through
+different backend arms (the Perl `Capture` arm is the one with the native
+paths).
+
+- `fold_preserves_output` — the carrier law: for every expression, the folded
+  program's substitution bytes are unchanged. This is conditional on the two
+  arms agreeing in every target; that carrier contract is stated in-file, not
+  proved.
+- `words_position_fold_would_glue` — the load-bearing refusal, and a bash
+  fact: in WORD position bash splits a `$( )` result on IFS, so
+  `basename $(pwd)` passes one argument per word, while the non-splitting node
+  passes the whole output as ONE. `captureWords` is therefore never folded
+  (2 arguments vs 1 for `a b`).
+- `status_read_blocks_the_fold` — a body that reads `$?` keeps the call
+  spelling. The model proves the guard is structural and total
+  (`reads_status`), which is what lets the status-save arms keep the spelling
+  they key on; it does not claim the fold would change bash's `$?`.
+- `fold_leaves_no_foldable_call` — completeness: every value position is
+  reached (nested, interpolated, both children), so no foldable call survives.
+  `fold_preserves_guards` is the helper the surviving-call case needs.
+
+Mutants, measured: fold the word spelling too **18 verified, 2 errors**; drop
+the `$?` guard **18 verified, 2 errors**; drop the Arrow guard **18 verified,
+2 errors**; miss the second child of a two-position node **17 verified,
+3 errors**. Treating the non-splitting node as splitting is rejected at
+simplification (`2 == 1` in a `compute_only` assert). The source's six tests
+are mirrored as `pin_*` proofs.
 
 ## Running it
 
