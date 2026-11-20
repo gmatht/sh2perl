@@ -3773,7 +3773,21 @@ fn loop_status_write_dead(stmt: &IrStmt) -> bool {
 /// harness — so these keep the runtime machinery. Pointer-keyed like
 /// [`LASTEXIT_DEAD`] (the IR tree is immutable during emission).
 fn compute_async_region_loops(prog: &IrProgram) -> HashSet<usize> {
-    fn stmt_walk(st: &IrStmt, in_async: bool, out: &mut HashSet<usize>) {
+    let (set, _) = compute_async_region_loops_full(prog);
+    set
+}
+
+/// As [`compute_async_region_loops`], plus the loop NODES themselves: producer
+/// bodies are CLONED into arrows before lowering, so the pointers recorded for
+/// the program's own nodes never match the copies — see
+/// [`ASYNC_REGION_LOOP_NODES`].
+fn compute_async_region_loops_full(prog: &IrProgram) -> (HashSet<usize>, Vec<IrStmt>) {
+    fn stmt_walk(
+        st: &IrStmt,
+        in_async: bool,
+        out: &mut HashSet<usize>,
+        nodes: &mut Vec<IrStmt>,
+    ) {
         match st {
             IrStmt::While { body, .. }
             | IrStmt::For { body, .. }
@@ -3788,28 +3802,29 @@ fn compute_async_region_loops(prog: &IrProgram) -> HashSet<usize> {
                 // path — zero runtime surface.
                 if in_async && !crate::transforms::sync_ok_loops::sync_ok(st) {
                     out.insert(st as *const IrStmt as usize);
+                    nodes.push(st.clone());
                 }
                 for b in body {
-                    stmt_walk(b, in_async, out);
+                    stmt_walk(b, in_async, out, nodes);
                 }
             }
             // subshell/background/redirect bodies run under the runtime's
             // fd/capture machinery (their output may be captured)
             IrStmt::Subshell(body) | IrStmt::Background(body) => {
                 for b in body {
-                    stmt_walk(b, true, out);
+                    stmt_walk(b, true, out, nodes);
                 }
             }
             IrStmt::Redirect { inner, .. } => {
                 for b in inner {
-                    stmt_walk(b, true, out);
+                    stmt_walk(b, true, out, nodes);
                 }
             }
             // every pipeline stage is a potential producer/consumer
             IrStmt::Pipeline { stages, .. } => {
                 for stage in stages {
                     for b in stage {
-                        stmt_walk(b, true, out);
+                        stmt_walk(b, true, out, nodes);
                     }
                 }
             }
@@ -3820,19 +3835,19 @@ fn compute_async_region_loops(prog: &IrProgram) -> HashSet<usize> {
                 ..
             } => {
                 for b in body {
-                    stmt_walk(b, true, out);
+                    stmt_walk(b, true, out, nodes);
                 }
                 // named blocks run inside the function — same producer
                 // reachability
                 for (_, nb) in named_blocks {
                     for b in nb {
-                        stmt_walk(b, true, out);
+                        stmt_walk(b, true, out, nodes);
                     }
                 }
             }
             IrStmt::Block(body) => {
                 for b in body {
-                    stmt_walk(b, in_async, out);
+                    stmt_walk(b, in_async, out, nodes);
                 }
             }
             IrStmt::If {
@@ -3842,33 +3857,33 @@ fn compute_async_region_loops(prog: &IrProgram) -> HashSet<usize> {
                 ..
             } => {
                 for b in then.iter().chain(else_) {
-                    stmt_walk(b, in_async, out);
+                    stmt_walk(b, in_async, out, nodes);
                 }
                 for (_, b) in elsifs {
                     for stm in b {
-                        stmt_walk(stm, in_async, out);
+                        stmt_walk(stm, in_async, out, nodes);
                     }
                 }
             }
             IrStmt::Exec { args, .. } => {
                 for a in args {
-                    expr_walk(a, in_async, out);
+                    expr_walk(a, in_async, out, nodes);
                 }
             }
-            IrStmt::Expr(e) => expr_walk(e, in_async, out),
-            IrStmt::Output { value, .. } => expr_walk(value, in_async, out),
-            IrStmt::Assign { expr, .. } => expr_walk(expr, in_async, out),
+            IrStmt::Expr(e) => expr_walk(e, in_async, out, nodes),
+            IrStmt::Output { value, .. } => expr_walk(value, in_async, out, nodes),
+            IrStmt::Assign { expr, .. } => expr_walk(expr, in_async, out, nodes),
             _ => {}
         }
     }
-    fn expr_walk(e: &IrExpr, in_async: bool, out: &mut HashSet<usize>) {
+    fn expr_walk(e: &IrExpr, in_async: bool, out: &mut HashSet<usize>, nodes: &mut Vec<IrStmt>) {
         match e {
             IrExpr::Arrow(stmts) => {
                 for st in stmts {
-                    stmt_walk(st, in_async, out);
+                    stmt_walk(st, in_async, out, nodes);
                 }
             }
-            IrExpr::Capture { expr, .. } => expr_walk(expr, true, out),
+            IrExpr::Capture { expr, .. } => expr_walk(expr, true, out, nodes),
             IrExpr::Call { func, args } => {
                 // the async runtime helpers run their arrow args under the
                 // runtime machinery (producer/capture contexts)
@@ -3885,54 +3900,63 @@ fn compute_async_region_loops(prog: &IrProgram) -> HashSet<usize> {
                             | "block"
                     );
                 for a in args {
-                    expr_walk(a, nested_async, out);
+                    expr_walk(a, nested_async, out, nodes);
                 }
             }
             IrExpr::BinOp { lhs, rhs, .. } => {
-                expr_walk(lhs, in_async, out);
-                expr_walk(rhs, in_async, out);
+                expr_walk(lhs, in_async, out, nodes);
+                expr_walk(rhs, in_async, out, nodes);
             }
             IrExpr::MethodCall { obj, args, .. } => {
-                expr_walk(obj, in_async, out);
+                expr_walk(obj, in_async, out, nodes);
                 for a in args {
-                    expr_walk(a, in_async, out);
+                    expr_walk(a, in_async, out, nodes);
                 }
             }
             IrExpr::Ternary {
                 cond, then, else_, ..
             } => {
-                expr_walk(cond, in_async, out);
-                expr_walk(then, in_async, out);
-                expr_walk(else_, in_async, out);
+                expr_walk(cond, in_async, out, nodes);
+                expr_walk(then, in_async, out, nodes);
+                expr_walk(else_, in_async, out, nodes);
             }
             IrExpr::DefinedOr { expr, default } => {
-                expr_walk(expr, in_async, out);
-                expr_walk(default, in_async, out);
+                expr_walk(expr, in_async, out, nodes);
+                expr_walk(default, in_async, out, nodes);
             }
             IrExpr::Interpolate(parts) => {
                 for p in parts {
                     if let InterpPart::Expr(e) = p {
-                        expr_walk(e, in_async, out);
+                        expr_walk(e, in_async, out, nodes);
                     }
                 }
             }
             IrExpr::Array(items) => {
                 for it in items {
-                    expr_walk(it, in_async, out);
+                    expr_walk(it, in_async, out, nodes);
                 }
             }
-            IrExpr::Index { key, .. } => expr_walk(key, in_async, out),
+            IrExpr::Index { key, .. } => expr_walk(key, in_async, out, nodes),
             _ => {}
         }
     }
     let mut out = HashSet::new();
+    let mut nodes = Vec::new();
     for st in &prog.stmts {
-        stmt_walk(st, false, &mut out);
+        stmt_walk(st, false, &mut out, &mut nodes);
     }
-    out
+    (out, nodes)
 }
 
 static ASYNC_REGION_LOOPS: Mutex<Option<HashSet<usize>>> = Mutex::new(None);
+/// The same loops as NODES. Producer bodies are cloned into arrows before
+/// they are lowered (`IrExpr::Arrow(stmts.clone())` in the Subshell /
+/// Background / capture arms), so the address a lowered copy carries is never
+/// the address recorded in [`ASYNC_REGION_LOOPS`] — the pointer lookup missed
+/// and a native loop (no yield, no runtime `_capExceeded` bound) was chosen
+/// inside a producer anyway. Matching the node by CONTENT closes that: an
+/// over-match only costs a runtime loop where a native one would have done.
+static ASYNC_REGION_LOOP_NODES: Mutex<Option<Vec<IrStmt>>> = Mutex::new(None);
 /// Top-level lowering depth (see [`top_stmt_to_estree`]): 1 while lowering
 /// a direct child of the program body. The native while loop's errexit
 /// check mirrors the top-level `sh2.guard` wrapper, which only wraps
@@ -3943,11 +3967,20 @@ fn is_top_level_stmt() -> bool {
     *TOP_LEVEL_DEPTH.lock().unwrap() == 1
 }
 fn loop_in_async_region(stmt: &IrStmt) -> bool {
-    ASYNC_REGION_LOOPS
+    let hit = ASYNC_REGION_LOOPS
         .lock()
         .unwrap()
         .as_ref()
         .map(|s| s.contains(&(stmt as *const IrStmt as usize)))
+        .unwrap_or(true);
+    if hit {
+        return true;
+    }
+    ASYNC_REGION_LOOP_NODES
+        .lock()
+        .unwrap()
+        .as_ref()
+        .map(|v| v.iter().any(|n| n == stmt))
         .unwrap_or(true)
 }
 
@@ -35500,7 +35533,9 @@ pub fn shir_to_estree(prog: &IrProgram) -> Program {
     if crate::transforms::transform_enabled("sync-ok-loops") {
         crate::transforms::sync_ok_loops::apply_to(&prog.stmts);
     }
-    *ASYNC_REGION_LOOPS.lock().unwrap() = Some(compute_async_region_loops(prog));
+    let (async_loops, async_loop_nodes) = compute_async_region_loops_full(prog);
+    *ASYNC_REGION_LOOPS.lock().unwrap() = Some(async_loops);
+    *ASYNC_REGION_LOOP_NODES.lock().unwrap() = Some(async_loop_nodes);
     let mut loop_status_dead = HashMap::new();
     if !errexit {
         let mut live: HashSet<usize> = HashSet::new();

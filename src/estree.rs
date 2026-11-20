@@ -7625,11 +7625,26 @@ mod tests {
         // body statement terminates THIS loop, and the native JS statement is
         // exactly what the runtime emulates; converting it earns the plain
         // `while` (no runtime call, no per-iteration closure, no try/catch).
-        let json = to_json("f() { while true; do echo x; break; done; }\nf");
+        // A top-level loop is not a producer region, so the jump conversion is
+        // what decides: the `break` earns the plain `while`.
+        let json = to_json("i=0; while [ \"$i\" -lt 3 ]; do i=$((i+1)); break; done");
         assert!(
             !json.contains("\"name\":\"whileLoopSync\""),
             "the runtime loop must be gone: {json}"
         );
+        // `while true; do echo x; break; done` cannot be proven finite, so the
+        // census refuses it and a function body (which may be CALLED from a
+        // producer) keeps the runtime loop: the native form has no
+        // `_capExceeded` bound. Before the async-region verdicts reached the
+        // CLONED function body this silently went native.
+        let guarded = to_json("f() { while true; do echo x; break; done; }\nf");
+        // (a function body is an async region: it may be CALLED from a
+        // producer, and the native form has no runtime `_capExceeded` bound)
+        assert!(
+            guarded.contains("\"name\":\"whileLoopSync\""),
+            "an unprovable loop in a function keeps the runtime form: {guarded}"
+        );
+        assert!(!guarded.contains("\"type\":\"WhileStatement\""), "{guarded}");
         assert!(
             json.contains("\"type\":\"WhileStatement\""),
             "a native while is expected: {json}"
@@ -7652,7 +7667,7 @@ mod tests {
         // the jump carries the `sh2.lastExit = 0` write the runtime loop's
         // `bodyLastExit = 0` reproduces (or-continue's exit status).
         let json = to_json(
-            "f() { for i in 1 2 3; do [ \"$i\" = 2 ] || continue; echo \"$i\"; done; }\nf",
+            "for i in 1 2 3; do [ \"$i\" = 2 ] || continue; echo \"$i\"; done",
         );
         assert!(
             !json.contains("\"name\":\"forLoopSync\""),
@@ -7811,6 +7826,45 @@ mod tests {
         // A FILE operand keeps the runtime: grepText has no multi-source form.
         let json3 = to_json("echo hi | grep hi file.txt");
         assert!(!json3.contains("\"name\":\"grepText\""));
+    }
+
+
+    /// The sync-ok-loops verdict decides the SCHEDULING of a loop inside a
+    /// producer: a native JS `while` has no yield and no runtime
+    /// `_capExceeded` bound, so an infinite loop that takes it freezes the
+    /// harness. Two holes made `( while (( 1 )); do :; done )` and its capture
+    /// twin render exactly that:
+    ///   1. `(( 1 ))` arrives as `exec "let" "1"`, which the census did not
+    ///      recognize as a constant-true condition — it was filed as
+    ///      data-dependent, hence finite, hence `sync_ok`;
+    ///   2. the producer body is CLONED into an arrow before lowering, so the
+    ///      pointer-keyed verdict set never matched the copy.
+    /// The loop must keep the runtime form (which caps an infinite producer).
+    #[test]
+    fn an_infinite_while_in_a_producer_keeps_the_runtime_loop() {
+        for src in [
+            "x=$(while (( 1 )); do :; done); echo $x",
+            "( while (( 1 )); do :; done )",
+            "x=$(while [ 1 ]; do :; done); echo $x",
+        ] {
+            let json = to_json(src);
+            assert!(
+                !json.contains("\"type\":\"WhileStatement\""),
+                "native while inside a producer: {src}\n{json}"
+            );
+            assert!(
+                json.contains("\"name\":\"whileLoop"),
+                "not the runtime loop: {src}\n{json}"
+            );
+        }
+        // the control: an output-free, data-dependent loop IS sync_ok, so its
+        // native form stays (the verdict must not become "never native")
+        let ctl = to_json("x=$(i=0; while [ \"$i\" -lt 3 ]; do i=$((i+1)); done; echo $i); echo $x");
+        assert!(
+            ctl.contains("\"type\":\"WhileStatement\""),
+            "cheap loop lost its native form: {ctl}"
+        );
+        assert!(!ctl.contains("\"name\":\"whileLoop"), "{ctl}");
     }
 
     #[test]

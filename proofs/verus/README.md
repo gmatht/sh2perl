@@ -325,6 +325,100 @@ redirect (`> file`) and `printf` halves of the pass are out of scope: they are
 separate laws over separate tables (`redirected_output_to_writefile`;
 `constant_printf`/`printf_s_fold`), not instances of this print law.
 
+## sync_ok_loops.rs — the schedule verdicts preserve the emitted bytes (24)
+
+```
+    verus --triggers-mode silent --rlimit 40 sync_ok_loops.rs
+    -> verification results:: 24 verified, 0 errors
+```
+
+**What is proved.** Standalone model of an ANALYSIS-ONLY pass: it never
+rewrites the IR, it publishes two pointer-keyed verdicts the ESTree renderer
+reads — `sync_ok` (run the loop as ONE sync chunk) and `batch_ok` (run it in
+chunks of `BATCH = 1024` with a yield between chunks). The only thing either
+verdict may change is the yield cadence, so the law is stated over the emitted
+bytes: `batch(b, i, n, k) == eager(b, i, n)` for every body `b`, every
+`i <= n` and every checkpoint factor `k >= 1`
+(`chunked_emission_preserves_order`, by induction on the chunk sequence with
+`eager_split` for the interior split). `k = 1` is the per-iteration await, `k
+= BATCH` the checkpointed form and `k >= n` one single chunk, so one equation
+covers all three strategies. The census claims are attributed one obligation
+each: `sync_ok_implies_finite` (a full-sync run cannot be interrupted, so it
+must never select a loop that may not terminate), `cheap_is_within_budget` and
+`sync_ok_implies_budget` (the whole run is inside the 200 ms budget by the
+uncapped pricing, per-iteration loop overhead included),
+`batch_ok_implies_sync_executable` (a chunk must not contain a blocking op or
+an unknown-cost call) and `batch_factor_is_a_power_of_two` (`BATCH == 1024`
+and `BATCH & (BATCH-1) == 0`, the runtime's bitmask checkpoint).
+
+**Hypothesis, stated not assumed in the law.** A while/do-while whose condition
+is data-dependent terminates (`Run::DataDep`) — the code's own stance ("the
+corpus has no infinite loops, and bash spins on them too"). A constant-true
+condition is NOT covered by it (`Run::Spins`) and is refused. The body is
+modelled as the census SUMMARY (priced statements, emitting statements,
+blocking ops, unknown-cost ops), which is what `iter_cost` /
+`body_output_free` / `batch_executable` compute; modelling the statement list
+would only re-derive the census.
+
+**Mutants, all red, no `E0xxx`, each attributing the rule it weakens.** identity
+(21v/3e: the completeness pins), flag-everything (18v/6e: finiteness, budget,
+the infinite-loop refusal), drop finiteness from the output-free branch
+(21v/3e: `sync_ok_implies_finite`), call a Spins loop finite (22v/2e: the
+infinite-loop refusal), drop the budget check (19v/5e:
+`cheap_is_within_budget`), loosen the budget x1000 (20v/4e: same), drop the
+per-iteration overhead (21v/3e: same), drop the sync-executable conjunct
+(21v/3e: `batch_ok_implies_sync_executable`), `BATCH` 1024 -> 1000 (22v/2e:
+`batch_factor_is_a_power_of_two`).
+
+**Three defects the model forced, all repaired.**
+
+1. `const_true_like` read only `Bool`/`Int`/`Str` conditions, but the parser
+   emits `while (( 1 ))` as `exec "let" <words>` and `while [ 1 ]` as
+   `test <words>`. Both are a constant TRUE that never changes; unrecognized,
+   they were filed as data-dependent (hence finite) and, with an output-free
+   body, marked `sync_ok` — an INFINITE loop running with no yield, precisely
+   the freeze the module's finiteness rule exists to prevent. Repaired: a
+   single integer-literal `let` word and a single operator-free `test` word
+   are constant truthiness (a variable or compound expression still claims
+   nothing). Tests `a_while_let_true_is_not_finite`,
+   `a_while_bracket_true_is_not_finite` (both red before the fix, on the REAL
+   parse).
+2. The verdict reached the renderer through a POINTER-keyed set, but a
+   producer body is CLONED into an arrow before it is lowered
+   (`IrExpr::Arrow(stmts.clone())`), so a loop inside `( … )` or `$( … )`
+   never matched its recorded address and kept the NATIVE form: no yield and
+   no runtime `_capExceeded` cap, i.e. an infinite loop inside a producer
+   froze the harness. Repaired in `shir.rs`: the async-region set carries the
+   loop NODES as well and `loop_in_async_region` falls back to content
+   equality (an over-match only costs a runtime loop where a native one would
+   have done). Test
+   `estree::an_infinite_while_in_a_producer_keeps_the_runtime_loop` — red
+   with EITHER repair reverted, green with both.
+3. `cheap_total` priced only the body statements, so `n * 0 <= 200000` held
+   for any trip count. Repaired with a per-iteration loop-overhead term, which
+   bounds the ITERATIONS too. Honest scope: every priced EMITTING statement
+   costs >= 3 µs, so a real emitting loop was already bounded; the hole was
+   reachable only for a zero-cost body (which the output-free branch accepts
+   anyway) — this tightens the census rather than changing a current verdict.
+   Test `a_huge_trip_trivial_body_is_not_cheap`.
+
+**Anchors.** 9 loop shapes (const-false and const-true while, a data-dependent
+while, a capture, a subshell and a pipeline producer, an output-free loop,
+glob/brace for loops, nested for loops): real bash stdout/exit status vs the
+compiled generated C under `MALLOC_PERTURB_=170` — 8/9 SAME. The one
+divergence (`x=$(while …; done; echo …)`) reproduces IDENTICALLY with the
+pass's changes stashed (verified against the baseline binary), so it is a
+pre-existing C-backend bug for a loop inside a command substitution, not a
+finding of this model; the same is true of `while (( 0 ))` emitting
+`char* 0 = NULL;`. The suite is analysis-only and has no C/Rust consumer, so
+the byte-identity of the C path is the expected result. The STATEGY law's real
+consumer is the ESTree path, which is anchored STRUCTURALLY (the generated
+estree JSON, above) and NOT executed end to end: no JS engine is installed on
+this machine (`node`/`bun`/`qjs`/`deno` absent), so "the batched run emits the
+same bytes" is proved, and its rendering is pinned, but the rendered program
+was not run.
+
+
 ## Running it
 
 Verus needs rust toolchain `1.99.1-x86_64-unknown-linux-gnu`
@@ -5578,11 +5672,12 @@ consumer. Coverage sync registered (`verus-sync-coverage.sh:f32_narrow`).
   standing rule (`docs/transform-verification.md`, VERUS.md §(d)
   "Explicitly deprioritized"): no bash-semantics model exists to state
   the obligation against.
-- `sync_ok_loops` — criterion 1 ("~200 ms confidence") is a wall-clock
-  heuristic with no bash fact to prove; criterion 2 (no observable
-  output) is a pure predicate but its verdict only selects a rendering
-  strategy, so the Tier-1 obligation is "the chosen form preserves the
-  output order", i.e. preservation of the run — out of Tier 1.
+- ~~`sync_ok_loops`~~ — DONE (`sync_ok_loops.rs`, 24): criterion 1 and 2 do
+  select a rendering strategy, and the Tier-1 obligation is exactly that the
+  chosen form preserves the emitted bytes — proved as
+  `chunked_emission_preserves_order` for every body, iteration count and
+  checkpoint factor, with the finiteness/budget/executability census claims
+  as separate obligations. See its section below.
 - `type_query` — the eval-time rewrite's obligation is
   "the answer equals what `type` would print", which needs bash's
   function-definition state at the splice point; the transform re-runs

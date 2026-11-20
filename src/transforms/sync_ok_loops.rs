@@ -65,7 +65,7 @@
 use std::collections::HashSet;
 use std::sync::Mutex;
 
-use crate::ir::{IrExpr, IrStmt};
+use crate::ir::{ArithAst, IrExpr, IrStmt};
 
 /// The checkpoint cadence — a POWER OF TWO (1024) so the runtime's
 /// per-iteration check is a bitmask `(i & (BATCH-1)) === 0` (or a plain
@@ -80,6 +80,12 @@ const BUDGET_US: u64 = 200_000;
 /// Per-statement upper-bound cost (µs): a sync builtin (echo/arith/
 /// setVar) in the runtime is a function call + string op ≈ 1-5µs.
 const STMT_COST_US: u64 = 3;
+/// The loop's OWN per-iteration cost (µs): the counter increment, the
+/// comparison and the jump. Pricing only the body made `n * 0 = 0` pass for
+/// any trip count, so `for i in {1..1000000000}; do :; done` was marked a
+/// ≤200ms sync chunk. With this floor the budget bounds the ITERATIONS too
+/// (200000 of them), which is what "about 200ms" means.
+const LOOP_OVERHEAD_US: u64 = 1;
 
 // ── Verdicts (pointer-keyed, mirroring ASYNC_REGION_LOOPS) ───────────
 // Set once per compilation by `transform` (ast_to_ir), read by the
@@ -453,7 +459,7 @@ fn cheap_total(st: &IrStmt) -> bool {
     let Some(cost) = loop_body_cost(st) else {
         return false;
     };
-    n.saturating_mul(cost) <= BUDGET_US
+    n.saturating_mul(cost.saturating_add(LOOP_OVERHEAD_US)) <= BUDGET_US
 }
 
 /// The per-iteration cost UPPER bound of a loop = the sum of its BODY's
@@ -705,13 +711,71 @@ fn const_true_like(e: &IrExpr) -> bool {
     match e {
         IrExpr::Bool(b) => *b,
         IrExpr::Int(i) => *i != 0,
+        // `while (( 1 ))` / `while (( 2 ))`: an arithmetic CONSTANT is a
+        // literal truthiness too, and it never changes, so the loop never
+        // ends. Missing this arm marked such a loop full-sync, which runs an
+        // infinite loop with NO yield — exactly the freeze the finiteness
+        // rule exists to prevent.
+        IrExpr::Arith(a) => matches!(**a, ArithAst::Num(n) if n != 0),
         IrExpr::Str(s, _) => matches!(s.as_str(), "true" | "1" | "yes"),
         IrExpr::Call { func, args, .. } if func == "exec" => match args.first() {
-            Some(IrExpr::Str(s, _)) => matches!(s.as_str(), "true" | "1" | ":"),
+            // `while :; do` / `while true; do`
+            Some(IrExpr::Str(s, _)) if matches!(s.as_str(), "true" | "1" | ":") => true,
+            // `while (( 1 ))` parses as `exec "let" <words>` — a single
+            // integer literal word decides the condition for good.
+            Some(IrExpr::Str(s, _)) if s == "let" => {
+                let_literal_truth(&args[1..]).unwrap_or(false)
+            }
+            _ => false,
+        },
+        // `while [ 1 ]`: a single literal word with no operator is a
+        // constant true (bash's test on a non-empty string). An operator or a
+        // quoted expansion leaves the condition data-dependent, so it is not
+        // claimed here.
+        IrExpr::Call { func, args, .. } if func == "test" => match args.first() {
+            Some(IrExpr::Str(s, _)) => {
+                let w = s.trim();
+                !w.is_empty() && !w.contains(char::is_whitespace) && !w.starts_with('-')
+            }
             _ => false,
         },
         _ => false,
     }
+}
+
+/// The `(( EXPR ))` condition of a while loop arrives as `exec "let"
+/// <words>`. `Some(true)` iff the words are exactly one integer literal that
+/// is nonzero (the loop never ends), `Some(false)` for the literal zero, and
+/// `None` when the text is anything else (a variable, a compound expression)
+/// — where no truth value may be claimed.
+fn let_literal_truth(words: &[IrExpr]) -> Option<bool> {
+    let mut only: Option<&str> = None;
+    for a in words {
+        match a {
+            IrExpr::Str(s, _) => {
+                if only.is_some() {
+                    return None;
+                }
+                only = Some(s.as_str());
+            }
+            IrExpr::Array(items) => {
+                for it in items {
+                    match it {
+                        IrExpr::Str(s, _) => {
+                            if only.is_some() {
+                                return None;
+                            }
+                            only = Some(s.as_str());
+                        }
+                        _ => return None,
+                    }
+                }
+            }
+            _ => return None,
+        }
+    }
+    only.and_then(|w| w.trim().parse::<i64>().ok())
+        .map(|n| n != 0)
 }
 
 /// Glob-free expression (a for-item that expands to exactly itself).
@@ -720,5 +784,120 @@ fn expr_glob_free(e: &IrExpr) -> bool {
         IrExpr::Str(s, _) => !s.contains(['*', '?', '[']),
         IrExpr::Int(_) => true,
         _ => false,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::ir::{ArithAst, IrExpr, IrStmt};
+
+    /// The IR a real parse of `src` produces (through the transform funnel), so
+    /// the census is exercised on the SHAPES THE PARSER ACTUALLY EMITS — a
+    /// hand-built `While { cond: Arith(Num(1)) }` never occurs in practice
+    /// (`(( 1 ))` arrives as `exec "let" "1"`).
+    fn ir_stmts(src: &str) -> Vec<IrStmt> {
+        let cmds = crate::Parser::new(src).parse().unwrap();
+        crate::shir::ast_to_ir(&cmds).stmts
+    }
+
+    fn first_loop(st: &IrStmt) -> Option<&IrStmt> {
+        match st {
+            IrStmt::While { .. } | IrStmt::For { .. } | IrStmt::DoWhile { .. } => Some(st),
+            IrStmt::If { then, elsifs, else_, .. } => {
+                then.iter().find_map(first_loop).or_else(|| {
+                    elsifs
+                        .iter()
+                        .find_map(|(_, b)| b.iter().find_map(first_loop))
+                        .or_else(|| else_.iter().find_map(first_loop))
+                })
+            }
+            IrStmt::Block(b) | IrStmt::Subshell(b) => b.iter().find_map(first_loop),
+            _ => None,
+        }
+    }
+
+    fn the_loop(src: &str) -> IrStmt {
+        ir_stmts(src).iter().find_map(first_loop).cloned().unwrap()
+    }
+
+    /// `while (( 1 ))` is true forever. It parses as `exec "let" "1"`, which the
+    /// census did not read as a constant: `loop_finite` said yes, so with an
+    /// output-free body the loop was marked full-sync — an INFINITE loop with
+    /// no yield, the one freeze this module's finiteness rule exists to stop.
+    #[test]
+    fn a_while_let_true_is_not_finite() {
+        for src in [
+            "while (( 1 )); do :; done",
+            "while (( 2 )); do :; done",
+            "while (( 1 )); do i=1; done",
+        ] {
+            let st = the_loop(src);
+            assert!(!loop_finite(&st), "`{src}` never terminates: must not be full-sync");
+        }
+    }
+
+    /// Control: `(( 0 ))` is false, so the loop runs zero times.
+    #[test]
+    fn a_while_let_zero_is_finite() {
+        let st = the_loop("while (( 0 )); do :; done");
+        assert!(loop_finite(&st), "`while (( 0 ))` terminates immediately");
+    }
+
+    /// `while [ 1 ]` is the same constant true through `test`.
+    #[test]
+    fn a_while_bracket_true_is_not_finite() {
+        let st = the_loop("while [ 1 ]; do :; done");
+        assert!(!loop_finite(&st), "`while [ 1 ]` never terminates");
+    }
+
+    /// A data-dependent condition is finite by the module's documented
+    /// hypothesis (bash spins on it too), so it keeps the OUTPUT-FREE branch.
+    #[test]
+    fn a_data_dependent_while_is_finite() {
+        let st = the_loop("while [ \"$i\" -lt 3 ]; do i=$((i+1)); done");
+        assert!(loop_finite(&st));
+    }
+
+    /// `(( i ))` is data-dependent: no truth value may be claimed for it.
+    #[test]
+    fn a_while_let_variable_is_data_dependent() {
+        let st = the_loop("while (( i )); do :; done");
+        assert!(loop_finite(&st), "a variable condition is not constant-true");
+    }
+
+    /// The budget prices only the BODY statements, so an empty body costs 0 and
+    /// `n * 0 = 0` passed for any trip count. The loop's own per-iteration
+    /// overhead is not free: the budget must bound the ITERATIONS.
+    #[test]
+    fn a_huge_trip_trivial_body_is_not_cheap() {
+        let st = IrStmt::For {
+            var: "i".into(),
+            iter: IrExpr::Range { start: 1, end: 1_000_000_000 },
+            body: vec![],
+        };
+        assert!(!cheap_total(&st), "a billion trivial iterations are not <=200ms");
+        // ... and the parsed shape of a big emitting loop is refused too
+        let big = the_loop("for i in {1..1000000}; do echo $i; done");
+        assert!(!cheap_total(&big));
+    }
+
+    /// The control: the same shape a thousand times IS cheap, and so is a
+    /// thousand emissions.
+    #[test]
+    fn a_small_trip_trivial_body_is_cheap() {
+        let small = the_loop("for i in {1..1000}; do :; done");
+        assert!(cheap_total(&small));
+        let emit = the_loop("for i in {1..1000}; do echo $i; done");
+        assert!(cheap_total(&emit), "a thousand emissions fit the budget");
+    }
+
+    /// The block-cost model: a body that blocks or calls is outside the pricing.
+    #[test]
+    fn a_blocking_body_is_not_cheap() {
+        let sleep = the_loop("for i in {1..3}; do sleep 1; done");
+        assert!(!cheap_total(&sleep));
+        let call = the_loop("for i in {1..3}; do f; done");
+        assert!(!cheap_total(&call));
     }
 }
