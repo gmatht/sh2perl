@@ -113,6 +113,36 @@ the `$?` guard **18 verified, 2 errors**; drop the Arrow guard **18 verified,
 simplification (`2 == 1` in a `compute_only` assert). The source's six tests
 are mirrored as `pin_*` proofs.
 
+## fbdev_gpu_elim.rs — a dead-on-the-corpus pass with a real law (21)
+
+`transforms/fbdev_gpu_elim.rs`. After `fbdev-gpu` lifts writes to `/dev/fb0`
+into `GpuOp` nodes, a `GpuOp` that is an EXACT, CONSECUTIVE duplicate of its
+predecessor is dropped. The pass fires 0 times on the 552-example corpus, but
+it is not dead code — it has a `transform`, 15 tests and a real law:
+
+- `elim_preserves_visible` — the states the program OBSERVES (every `Read`
+  plus the final state) are identical before and after the elimination. That
+  is why dropping a write is allowed: nothing observes it.
+- `non_consecutive_duplicate_is_load_bearing` — the naive alternative goes
+  red: for `Op(1); Op(2); Op(1); Read` the read sees 1 under the pass and 2
+  under "drop every write whose value was already written". The
+  consecutiveness guard is what makes the law true.
+- `elim_leaves_no_duplicates` + `pin_is_idempotent` — a second run changes
+  nothing (`is_idempotent`).
+- `Op(id)` uses one id for device+verb+slot+payload, so "different device /
+  verb / slot / payload" are all "different id" (`pin_keeps_different_ids`,
+  `duplicate_with_different_slot_is_kept`).
+
+Hypotheses in-file: observers are `Read` statements plus the final state
+(anything else that reads the device between two writes is exactly why only
+consecutive duplicates are removed); the model is one flat list and the pass's
+per-body recursion is the same theorem on a smaller list; registration order
+(`after fbdev-gpu` and `-batch`) and the 0/552 corpus coverage are not
+correctness claims.
+
+Mutants, measured: naive dedupe **13 verified, 8 errors**; dedupe ignoring the
+op identity **19 verified, 2 errors**; identity pass **17 verified, 4 errors**.
+
 ## Running it
 
 Verus needs rust toolchain `1.99.1-x86_64-unknown-linux-gnu`
@@ -240,6 +270,36 @@ the `$?` guard **18 verified, 2 errors**; drop the Arrow guard **18 verified,
 3 errors**. Treating the non-splitting node as splitting is rejected at
 simplification (`2 == 1` in a `compute_only` assert). The source's six tests
 are mirrored as `pin_*` proofs.
+
+## fbdev_gpu_elim.rs — a dead-on-the-corpus pass with a real law (21)
+
+`transforms/fbdev_gpu_elim.rs`. After `fbdev-gpu` lifts writes to `/dev/fb0`
+into `GpuOp` nodes, a `GpuOp` that is an EXACT, CONSECUTIVE duplicate of its
+predecessor is dropped. The pass fires 0 times on the 552-example corpus, but
+it is not dead code — it has a `transform`, 15 tests and a real law:
+
+- `elim_preserves_visible` — the states the program OBSERVES (every `Read`
+  plus the final state) are identical before and after the elimination. That
+  is why dropping a write is allowed: nothing observes it.
+- `non_consecutive_duplicate_is_load_bearing` — the naive alternative goes
+  red: for `Op(1); Op(2); Op(1); Read` the read sees 1 under the pass and 2
+  under "drop every write whose value was already written". The
+  consecutiveness guard is what makes the law true.
+- `elim_leaves_no_duplicates` + `pin_is_idempotent` — a second run changes
+  nothing (`is_idempotent`).
+- `Op(id)` uses one id for device+verb+slot+payload, so "different device /
+  verb / slot / payload" are all "different id" (`pin_keeps_different_ids`,
+  `duplicate_with_different_slot_is_kept`).
+
+Hypotheses in-file: observers are `Read` statements plus the final state
+(anything else that reads the device between two writes is exactly why only
+consecutive duplicates are removed); the model is one flat list and the pass's
+per-body recursion is the same theorem on a smaller list; registration order
+(`after fbdev-gpu` and `-batch`) and the 0/552 corpus coverage are not
+correctness claims.
+
+Mutants, measured: naive dedupe **13 verified, 8 errors**; dedupe ignoring the
+op identity **19 verified, 2 errors**; identity pass **17 verified, 4 errors**.
 
 ## Running it
 
@@ -373,6 +433,36 @@ the `$?` guard **18 verified, 2 errors**; drop the Arrow guard **18 verified,
 3 errors**. Treating the non-splitting node as splitting is rejected at
 simplification (`2 == 1` in a `compute_only` assert). The source's six tests
 are mirrored as `pin_*` proofs.
+
+## fbdev_gpu_elim.rs — a dead-on-the-corpus pass with a real law (21)
+
+`transforms/fbdev_gpu_elim.rs`. After `fbdev-gpu` lifts writes to `/dev/fb0`
+into `GpuOp` nodes, a `GpuOp` that is an EXACT, CONSECUTIVE duplicate of its
+predecessor is dropped. The pass fires 0 times on the 552-example corpus, but
+it is not dead code — it has a `transform`, 15 tests and a real law:
+
+- `elim_preserves_visible` — the states the program OBSERVES (every `Read`
+  plus the final state) are identical before and after the elimination. That
+  is why dropping a write is allowed: nothing observes it.
+- `non_consecutive_duplicate_is_load_bearing` — the naive alternative goes
+  red: for `Op(1); Op(2); Op(1); Read` the read sees 1 under the pass and 2
+  under "drop every write whose value was already written". The
+  consecutiveness guard is what makes the law true.
+- `elim_leaves_no_duplicates` + `pin_is_idempotent` — a second run changes
+  nothing (`is_idempotent`).
+- `Op(id)` uses one id for device+verb+slot+payload, so "different device /
+  verb / slot / payload" are all "different id" (`pin_keeps_different_ids`,
+  `duplicate_with_different_slot_is_kept`).
+
+Hypotheses in-file: observers are `Read` statements plus the final state
+(anything else that reads the device between two writes is exactly why only
+consecutive duplicates are removed); the model is one flat list and the pass's
+per-body recursion is the same theorem on a smaller list; registration order
+(`after fbdev-gpu` and `-batch`) and the 0/552 corpus coverage are not
+correctness claims.
+
+Mutants, measured: naive dedupe **13 verified, 8 errors**; dedupe ignoring the
+op identity **19 verified, 2 errors**; identity pass **17 verified, 4 errors**.
 
 ## Running it
 
@@ -520,6 +610,36 @@ the `$?` guard **18 verified, 2 errors**; drop the Arrow guard **18 verified,
 simplification (`2 == 1` in a `compute_only` assert). The source's six tests
 are mirrored as `pin_*` proofs.
 
+## fbdev_gpu_elim.rs — a dead-on-the-corpus pass with a real law (21)
+
+`transforms/fbdev_gpu_elim.rs`. After `fbdev-gpu` lifts writes to `/dev/fb0`
+into `GpuOp` nodes, a `GpuOp` that is an EXACT, CONSECUTIVE duplicate of its
+predecessor is dropped. The pass fires 0 times on the 552-example corpus, but
+it is not dead code — it has a `transform`, 15 tests and a real law:
+
+- `elim_preserves_visible` — the states the program OBSERVES (every `Read`
+  plus the final state) are identical before and after the elimination. That
+  is why dropping a write is allowed: nothing observes it.
+- `non_consecutive_duplicate_is_load_bearing` — the naive alternative goes
+  red: for `Op(1); Op(2); Op(1); Read` the read sees 1 under the pass and 2
+  under "drop every write whose value was already written". The
+  consecutiveness guard is what makes the law true.
+- `elim_leaves_no_duplicates` + `pin_is_idempotent` — a second run changes
+  nothing (`is_idempotent`).
+- `Op(id)` uses one id for device+verb+slot+payload, so "different device /
+  verb / slot / payload" are all "different id" (`pin_keeps_different_ids`,
+  `duplicate_with_different_slot_is_kept`).
+
+Hypotheses in-file: observers are `Read` statements plus the final state
+(anything else that reads the device between two writes is exactly why only
+consecutive duplicates are removed); the model is one flat list and the pass's
+per-body recursion is the same theorem on a smaller list; registration order
+(`after fbdev-gpu` and `-batch`) and the 0/552 corpus coverage are not
+correctness claims.
+
+Mutants, measured: naive dedupe **13 verified, 8 errors**; dedupe ignoring the
+op identity **19 verified, 2 errors**; identity pass **17 verified, 4 errors**.
+
 ## Running it
 
 Same toolchain as above:
@@ -646,6 +766,36 @@ the `$?` guard **18 verified, 2 errors**; drop the Arrow guard **18 verified,
 3 errors**. Treating the non-splitting node as splitting is rejected at
 simplification (`2 == 1` in a `compute_only` assert). The source's six tests
 are mirrored as `pin_*` proofs.
+
+## fbdev_gpu_elim.rs — a dead-on-the-corpus pass with a real law (21)
+
+`transforms/fbdev_gpu_elim.rs`. After `fbdev-gpu` lifts writes to `/dev/fb0`
+into `GpuOp` nodes, a `GpuOp` that is an EXACT, CONSECUTIVE duplicate of its
+predecessor is dropped. The pass fires 0 times on the 552-example corpus, but
+it is not dead code — it has a `transform`, 15 tests and a real law:
+
+- `elim_preserves_visible` — the states the program OBSERVES (every `Read`
+  plus the final state) are identical before and after the elimination. That
+  is why dropping a write is allowed: nothing observes it.
+- `non_consecutive_duplicate_is_load_bearing` — the naive alternative goes
+  red: for `Op(1); Op(2); Op(1); Read` the read sees 1 under the pass and 2
+  under "drop every write whose value was already written". The
+  consecutiveness guard is what makes the law true.
+- `elim_leaves_no_duplicates` + `pin_is_idempotent` — a second run changes
+  nothing (`is_idempotent`).
+- `Op(id)` uses one id for device+verb+slot+payload, so "different device /
+  verb / slot / payload" are all "different id" (`pin_keeps_different_ids`,
+  `duplicate_with_different_slot_is_kept`).
+
+Hypotheses in-file: observers are `Read` statements plus the final state
+(anything else that reads the device between two writes is exactly why only
+consecutive duplicates are removed); the model is one flat list and the pass's
+per-body recursion is the same theorem on a smaller list; registration order
+(`after fbdev-gpu` and `-batch`) and the 0/552 corpus coverage are not
+correctness claims.
+
+Mutants, measured: naive dedupe **13 verified, 8 errors**; dedupe ignoring the
+op identity **19 verified, 2 errors**; identity pass **17 verified, 4 errors**.
 
 ## Running it
 
@@ -781,6 +931,36 @@ the `$?` guard **18 verified, 2 errors**; drop the Arrow guard **18 verified,
 simplification (`2 == 1` in a `compute_only` assert). The source's six tests
 are mirrored as `pin_*` proofs.
 
+## fbdev_gpu_elim.rs — a dead-on-the-corpus pass with a real law (21)
+
+`transforms/fbdev_gpu_elim.rs`. After `fbdev-gpu` lifts writes to `/dev/fb0`
+into `GpuOp` nodes, a `GpuOp` that is an EXACT, CONSECUTIVE duplicate of its
+predecessor is dropped. The pass fires 0 times on the 552-example corpus, but
+it is not dead code — it has a `transform`, 15 tests and a real law:
+
+- `elim_preserves_visible` — the states the program OBSERVES (every `Read`
+  plus the final state) are identical before and after the elimination. That
+  is why dropping a write is allowed: nothing observes it.
+- `non_consecutive_duplicate_is_load_bearing` — the naive alternative goes
+  red: for `Op(1); Op(2); Op(1); Read` the read sees 1 under the pass and 2
+  under "drop every write whose value was already written". The
+  consecutiveness guard is what makes the law true.
+- `elim_leaves_no_duplicates` + `pin_is_idempotent` — a second run changes
+  nothing (`is_idempotent`).
+- `Op(id)` uses one id for device+verb+slot+payload, so "different device /
+  verb / slot / payload" are all "different id" (`pin_keeps_different_ids`,
+  `duplicate_with_different_slot_is_kept`).
+
+Hypotheses in-file: observers are `Read` statements plus the final state
+(anything else that reads the device between two writes is exactly why only
+consecutive duplicates are removed); the model is one flat list and the pass's
+per-body recursion is the same theorem on a smaller list; registration order
+(`after fbdev-gpu` and `-batch`) and the 0/552 corpus coverage are not
+correctness claims.
+
+Mutants, measured: naive dedupe **13 verified, 8 errors**; dedupe ignoring the
+op identity **19 verified, 2 errors**; identity pass **17 verified, 4 errors**.
+
 ## Running it
 
 Same toolchain as above:
@@ -905,6 +1085,36 @@ the `$?` guard **18 verified, 2 errors**; drop the Arrow guard **18 verified,
 simplification (`2 == 1` in a `compute_only` assert). The source's six tests
 are mirrored as `pin_*` proofs.
 
+## fbdev_gpu_elim.rs — a dead-on-the-corpus pass with a real law (21)
+
+`transforms/fbdev_gpu_elim.rs`. After `fbdev-gpu` lifts writes to `/dev/fb0`
+into `GpuOp` nodes, a `GpuOp` that is an EXACT, CONSECUTIVE duplicate of its
+predecessor is dropped. The pass fires 0 times on the 552-example corpus, but
+it is not dead code — it has a `transform`, 15 tests and a real law:
+
+- `elim_preserves_visible` — the states the program OBSERVES (every `Read`
+  plus the final state) are identical before and after the elimination. That
+  is why dropping a write is allowed: nothing observes it.
+- `non_consecutive_duplicate_is_load_bearing` — the naive alternative goes
+  red: for `Op(1); Op(2); Op(1); Read` the read sees 1 under the pass and 2
+  under "drop every write whose value was already written". The
+  consecutiveness guard is what makes the law true.
+- `elim_leaves_no_duplicates` + `pin_is_idempotent` — a second run changes
+  nothing (`is_idempotent`).
+- `Op(id)` uses one id for device+verb+slot+payload, so "different device /
+  verb / slot / payload" are all "different id" (`pin_keeps_different_ids`,
+  `duplicate_with_different_slot_is_kept`).
+
+Hypotheses in-file: observers are `Read` statements plus the final state
+(anything else that reads the device between two writes is exactly why only
+consecutive duplicates are removed); the model is one flat list and the pass's
+per-body recursion is the same theorem on a smaller list; registration order
+(`after fbdev-gpu` and `-batch`) and the 0/552 corpus coverage are not
+correctness claims.
+
+Mutants, measured: naive dedupe **13 verified, 8 errors**; dedupe ignoring the
+op identity **19 verified, 2 errors**; identity pass **17 verified, 4 errors**.
+
 ## Running it
 
 Same toolchain as above:
@@ -1010,6 +1220,36 @@ the `$?` guard **18 verified, 2 errors**; drop the Arrow guard **18 verified,
 3 errors**. Treating the non-splitting node as splitting is rejected at
 simplification (`2 == 1` in a `compute_only` assert). The source's six tests
 are mirrored as `pin_*` proofs.
+
+## fbdev_gpu_elim.rs — a dead-on-the-corpus pass with a real law (21)
+
+`transforms/fbdev_gpu_elim.rs`. After `fbdev-gpu` lifts writes to `/dev/fb0`
+into `GpuOp` nodes, a `GpuOp` that is an EXACT, CONSECUTIVE duplicate of its
+predecessor is dropped. The pass fires 0 times on the 552-example corpus, but
+it is not dead code — it has a `transform`, 15 tests and a real law:
+
+- `elim_preserves_visible` — the states the program OBSERVES (every `Read`
+  plus the final state) are identical before and after the elimination. That
+  is why dropping a write is allowed: nothing observes it.
+- `non_consecutive_duplicate_is_load_bearing` — the naive alternative goes
+  red: for `Op(1); Op(2); Op(1); Read` the read sees 1 under the pass and 2
+  under "drop every write whose value was already written". The
+  consecutiveness guard is what makes the law true.
+- `elim_leaves_no_duplicates` + `pin_is_idempotent` — a second run changes
+  nothing (`is_idempotent`).
+- `Op(id)` uses one id for device+verb+slot+payload, so "different device /
+  verb / slot / payload" are all "different id" (`pin_keeps_different_ids`,
+  `duplicate_with_different_slot_is_kept`).
+
+Hypotheses in-file: observers are `Read` statements plus the final state
+(anything else that reads the device between two writes is exactly why only
+consecutive duplicates are removed); the model is one flat list and the pass's
+per-body recursion is the same theorem on a smaller list; registration order
+(`after fbdev-gpu` and `-batch`) and the 0/552 corpus coverage are not
+correctness claims.
+
+Mutants, measured: naive dedupe **13 verified, 8 errors**; dedupe ignoring the
+op identity **19 verified, 2 errors**; identity pass **17 verified, 4 errors**.
 
 ## Running it
 
@@ -1241,6 +1481,36 @@ the `$?` guard **18 verified, 2 errors**; drop the Arrow guard **18 verified,
 simplification (`2 == 1` in a `compute_only` assert). The source's six tests
 are mirrored as `pin_*` proofs.
 
+## fbdev_gpu_elim.rs — a dead-on-the-corpus pass with a real law (21)
+
+`transforms/fbdev_gpu_elim.rs`. After `fbdev-gpu` lifts writes to `/dev/fb0`
+into `GpuOp` nodes, a `GpuOp` that is an EXACT, CONSECUTIVE duplicate of its
+predecessor is dropped. The pass fires 0 times on the 552-example corpus, but
+it is not dead code — it has a `transform`, 15 tests and a real law:
+
+- `elim_preserves_visible` — the states the program OBSERVES (every `Read`
+  plus the final state) are identical before and after the elimination. That
+  is why dropping a write is allowed: nothing observes it.
+- `non_consecutive_duplicate_is_load_bearing` — the naive alternative goes
+  red: for `Op(1); Op(2); Op(1); Read` the read sees 1 under the pass and 2
+  under "drop every write whose value was already written". The
+  consecutiveness guard is what makes the law true.
+- `elim_leaves_no_duplicates` + `pin_is_idempotent` — a second run changes
+  nothing (`is_idempotent`).
+- `Op(id)` uses one id for device+verb+slot+payload, so "different device /
+  verb / slot / payload" are all "different id" (`pin_keeps_different_ids`,
+  `duplicate_with_different_slot_is_kept`).
+
+Hypotheses in-file: observers are `Read` statements plus the final state
+(anything else that reads the device between two writes is exactly why only
+consecutive duplicates are removed); the model is one flat list and the pass's
+per-body recursion is the same theorem on a smaller list; registration order
+(`after fbdev-gpu` and `-batch`) and the 0/552 corpus coverage are not
+correctness claims.
+
+Mutants, measured: naive dedupe **13 verified, 8 errors**; dedupe ignoring the
+op identity **19 verified, 2 errors**; identity pass **17 verified, 4 errors**.
+
 ## Running it (all six P6 files)
 
 Same toolchain as above, `--rlimit 40` each:
@@ -1351,6 +1621,36 @@ the `$?` guard **18 verified, 2 errors**; drop the Arrow guard **18 verified,
 simplification (`2 == 1` in a `compute_only` assert). The source's six tests
 are mirrored as `pin_*` proofs.
 
+## fbdev_gpu_elim.rs — a dead-on-the-corpus pass with a real law (21)
+
+`transforms/fbdev_gpu_elim.rs`. After `fbdev-gpu` lifts writes to `/dev/fb0`
+into `GpuOp` nodes, a `GpuOp` that is an EXACT, CONSECUTIVE duplicate of its
+predecessor is dropped. The pass fires 0 times on the 552-example corpus, but
+it is not dead code — it has a `transform`, 15 tests and a real law:
+
+- `elim_preserves_visible` — the states the program OBSERVES (every `Read`
+  plus the final state) are identical before and after the elimination. That
+  is why dropping a write is allowed: nothing observes it.
+- `non_consecutive_duplicate_is_load_bearing` — the naive alternative goes
+  red: for `Op(1); Op(2); Op(1); Read` the read sees 1 under the pass and 2
+  under "drop every write whose value was already written". The
+  consecutiveness guard is what makes the law true.
+- `elim_leaves_no_duplicates` + `pin_is_idempotent` — a second run changes
+  nothing (`is_idempotent`).
+- `Op(id)` uses one id for device+verb+slot+payload, so "different device /
+  verb / slot / payload" are all "different id" (`pin_keeps_different_ids`,
+  `duplicate_with_different_slot_is_kept`).
+
+Hypotheses in-file: observers are `Read` statements plus the final state
+(anything else that reads the device between two writes is exactly why only
+consecutive duplicates are removed); the model is one flat list and the pass's
+per-body recursion is the same theorem on a smaller list; registration order
+(`after fbdev-gpu` and `-batch`) and the 0/552 corpus coverage are not
+correctness claims.
+
+Mutants, measured: naive dedupe **13 verified, 8 errors**; dedupe ignoring the
+op identity **19 verified, 2 errors**; identity pass **17 verified, 4 errors**.
+
 ## Running it
 
 Same toolchain as the P6 files (`--rlimit 40`).
@@ -1454,6 +1754,36 @@ the `$?` guard **18 verified, 2 errors**; drop the Arrow guard **18 verified,
 3 errors**. Treating the non-splitting node as splitting is rejected at
 simplification (`2 == 1` in a `compute_only` assert). The source's six tests
 are mirrored as `pin_*` proofs.
+
+## fbdev_gpu_elim.rs — a dead-on-the-corpus pass with a real law (21)
+
+`transforms/fbdev_gpu_elim.rs`. After `fbdev-gpu` lifts writes to `/dev/fb0`
+into `GpuOp` nodes, a `GpuOp` that is an EXACT, CONSECUTIVE duplicate of its
+predecessor is dropped. The pass fires 0 times on the 552-example corpus, but
+it is not dead code — it has a `transform`, 15 tests and a real law:
+
+- `elim_preserves_visible` — the states the program OBSERVES (every `Read`
+  plus the final state) are identical before and after the elimination. That
+  is why dropping a write is allowed: nothing observes it.
+- `non_consecutive_duplicate_is_load_bearing` — the naive alternative goes
+  red: for `Op(1); Op(2); Op(1); Read` the read sees 1 under the pass and 2
+  under "drop every write whose value was already written". The
+  consecutiveness guard is what makes the law true.
+- `elim_leaves_no_duplicates` + `pin_is_idempotent` — a second run changes
+  nothing (`is_idempotent`).
+- `Op(id)` uses one id for device+verb+slot+payload, so "different device /
+  verb / slot / payload" are all "different id" (`pin_keeps_different_ids`,
+  `duplicate_with_different_slot_is_kept`).
+
+Hypotheses in-file: observers are `Read` statements plus the final state
+(anything else that reads the device between two writes is exactly why only
+consecutive duplicates are removed); the model is one flat list and the pass's
+per-body recursion is the same theorem on a smaller list; registration order
+(`after fbdev-gpu` and `-batch`) and the 0/552 corpus coverage are not
+correctness claims.
+
+Mutants, measured: naive dedupe **13 verified, 8 errors**; dedupe ignoring the
+op identity **19 verified, 2 errors**; identity pass **17 verified, 4 errors**.
 
 ## Running it
 
@@ -1600,6 +1930,36 @@ the `$?` guard **18 verified, 2 errors**; drop the Arrow guard **18 verified,
 simplification (`2 == 1` in a `compute_only` assert). The source's six tests
 are mirrored as `pin_*` proofs.
 
+## fbdev_gpu_elim.rs — a dead-on-the-corpus pass with a real law (21)
+
+`transforms/fbdev_gpu_elim.rs`. After `fbdev-gpu` lifts writes to `/dev/fb0`
+into `GpuOp` nodes, a `GpuOp` that is an EXACT, CONSECUTIVE duplicate of its
+predecessor is dropped. The pass fires 0 times on the 552-example corpus, but
+it is not dead code — it has a `transform`, 15 tests and a real law:
+
+- `elim_preserves_visible` — the states the program OBSERVES (every `Read`
+  plus the final state) are identical before and after the elimination. That
+  is why dropping a write is allowed: nothing observes it.
+- `non_consecutive_duplicate_is_load_bearing` — the naive alternative goes
+  red: for `Op(1); Op(2); Op(1); Read` the read sees 1 under the pass and 2
+  under "drop every write whose value was already written". The
+  consecutiveness guard is what makes the law true.
+- `elim_leaves_no_duplicates` + `pin_is_idempotent` — a second run changes
+  nothing (`is_idempotent`).
+- `Op(id)` uses one id for device+verb+slot+payload, so "different device /
+  verb / slot / payload" are all "different id" (`pin_keeps_different_ids`,
+  `duplicate_with_different_slot_is_kept`).
+
+Hypotheses in-file: observers are `Read` statements plus the final state
+(anything else that reads the device between two writes is exactly why only
+consecutive duplicates are removed); the model is one flat list and the pass's
+per-body recursion is the same theorem on a smaller list; registration order
+(`after fbdev-gpu` and `-batch`) and the 0/552 corpus coverage are not
+correctness claims.
+
+Mutants, measured: naive dedupe **13 verified, 8 errors**; dedupe ignoring the
+op identity **19 verified, 2 errors**; identity pass **17 verified, 4 errors**.
+
 ## Running it
 
 Same toolchain as above (`--rlimit 80` for the shadow-induction
@@ -1726,6 +2086,36 @@ the `$?` guard **18 verified, 2 errors**; drop the Arrow guard **18 verified,
 3 errors**. Treating the non-splitting node as splitting is rejected at
 simplification (`2 == 1` in a `compute_only` assert). The source's six tests
 are mirrored as `pin_*` proofs.
+
+## fbdev_gpu_elim.rs — a dead-on-the-corpus pass with a real law (21)
+
+`transforms/fbdev_gpu_elim.rs`. After `fbdev-gpu` lifts writes to `/dev/fb0`
+into `GpuOp` nodes, a `GpuOp` that is an EXACT, CONSECUTIVE duplicate of its
+predecessor is dropped. The pass fires 0 times on the 552-example corpus, but
+it is not dead code — it has a `transform`, 15 tests and a real law:
+
+- `elim_preserves_visible` — the states the program OBSERVES (every `Read`
+  plus the final state) are identical before and after the elimination. That
+  is why dropping a write is allowed: nothing observes it.
+- `non_consecutive_duplicate_is_load_bearing` — the naive alternative goes
+  red: for `Op(1); Op(2); Op(1); Read` the read sees 1 under the pass and 2
+  under "drop every write whose value was already written". The
+  consecutiveness guard is what makes the law true.
+- `elim_leaves_no_duplicates` + `pin_is_idempotent` — a second run changes
+  nothing (`is_idempotent`).
+- `Op(id)` uses one id for device+verb+slot+payload, so "different device /
+  verb / slot / payload" are all "different id" (`pin_keeps_different_ids`,
+  `duplicate_with_different_slot_is_kept`).
+
+Hypotheses in-file: observers are `Read` statements plus the final state
+(anything else that reads the device between two writes is exactly why only
+consecutive duplicates are removed); the model is one flat list and the pass's
+per-body recursion is the same theorem on a smaller list; registration order
+(`after fbdev-gpu` and `-batch`) and the 0/552 corpus coverage are not
+correctness claims.
+
+Mutants, measured: naive dedupe **13 verified, 8 errors**; dedupe ignoring the
+op identity **19 verified, 2 errors**; identity pass **17 verified, 4 errors**.
 
 ## Running it
 
@@ -1858,6 +2248,36 @@ the `$?` guard **18 verified, 2 errors**; drop the Arrow guard **18 verified,
 simplification (`2 == 1` in a `compute_only` assert). The source's six tests
 are mirrored as `pin_*` proofs.
 
+## fbdev_gpu_elim.rs — a dead-on-the-corpus pass with a real law (21)
+
+`transforms/fbdev_gpu_elim.rs`. After `fbdev-gpu` lifts writes to `/dev/fb0`
+into `GpuOp` nodes, a `GpuOp` that is an EXACT, CONSECUTIVE duplicate of its
+predecessor is dropped. The pass fires 0 times on the 552-example corpus, but
+it is not dead code — it has a `transform`, 15 tests and a real law:
+
+- `elim_preserves_visible` — the states the program OBSERVES (every `Read`
+  plus the final state) are identical before and after the elimination. That
+  is why dropping a write is allowed: nothing observes it.
+- `non_consecutive_duplicate_is_load_bearing` — the naive alternative goes
+  red: for `Op(1); Op(2); Op(1); Read` the read sees 1 under the pass and 2
+  under "drop every write whose value was already written". The
+  consecutiveness guard is what makes the law true.
+- `elim_leaves_no_duplicates` + `pin_is_idempotent` — a second run changes
+  nothing (`is_idempotent`).
+- `Op(id)` uses one id for device+verb+slot+payload, so "different device /
+  verb / slot / payload" are all "different id" (`pin_keeps_different_ids`,
+  `duplicate_with_different_slot_is_kept`).
+
+Hypotheses in-file: observers are `Read` statements plus the final state
+(anything else that reads the device between two writes is exactly why only
+consecutive duplicates are removed); the model is one flat list and the pass's
+per-body recursion is the same theorem on a smaller list; registration order
+(`after fbdev-gpu` and `-batch`) and the 0/552 corpus coverage are not
+correctness claims.
+
+Mutants, measured: naive dedupe **13 verified, 8 errors**; dedupe ignoring the
+op identity **19 verified, 2 errors**; identity pass **17 verified, 4 errors**.
+
 ## Running it
 
 Same toolchain as above (`--rlimit 60` for the fuel/size induction):
@@ -1989,6 +2409,36 @@ the `$?` guard **18 verified, 2 errors**; drop the Arrow guard **18 verified,
 simplification (`2 == 1` in a `compute_only` assert). The source's six tests
 are mirrored as `pin_*` proofs.
 
+## fbdev_gpu_elim.rs — a dead-on-the-corpus pass with a real law (21)
+
+`transforms/fbdev_gpu_elim.rs`. After `fbdev-gpu` lifts writes to `/dev/fb0`
+into `GpuOp` nodes, a `GpuOp` that is an EXACT, CONSECUTIVE duplicate of its
+predecessor is dropped. The pass fires 0 times on the 552-example corpus, but
+it is not dead code — it has a `transform`, 15 tests and a real law:
+
+- `elim_preserves_visible` — the states the program OBSERVES (every `Read`
+  plus the final state) are identical before and after the elimination. That
+  is why dropping a write is allowed: nothing observes it.
+- `non_consecutive_duplicate_is_load_bearing` — the naive alternative goes
+  red: for `Op(1); Op(2); Op(1); Read` the read sees 1 under the pass and 2
+  under "drop every write whose value was already written". The
+  consecutiveness guard is what makes the law true.
+- `elim_leaves_no_duplicates` + `pin_is_idempotent` — a second run changes
+  nothing (`is_idempotent`).
+- `Op(id)` uses one id for device+verb+slot+payload, so "different device /
+  verb / slot / payload" are all "different id" (`pin_keeps_different_ids`,
+  `duplicate_with_different_slot_is_kept`).
+
+Hypotheses in-file: observers are `Read` statements plus the final state
+(anything else that reads the device between two writes is exactly why only
+consecutive duplicates are removed); the model is one flat list and the pass's
+per-body recursion is the same theorem on a smaller list; registration order
+(`after fbdev-gpu` and `-batch`) and the 0/552 corpus coverage are not
+correctness claims.
+
+Mutants, measured: naive dedupe **13 verified, 8 errors**; dedupe ignoring the
+op identity **19 verified, 2 errors**; identity pass **17 verified, 4 errors**.
+
 ## Running it
 
 Same toolchain as the P6/P7/P8 files (`--rlimit 40`):
@@ -2101,6 +2551,36 @@ the `$?` guard **18 verified, 2 errors**; drop the Arrow guard **18 verified,
 3 errors**. Treating the non-splitting node as splitting is rejected at
 simplification (`2 == 1` in a `compute_only` assert). The source's six tests
 are mirrored as `pin_*` proofs.
+
+## fbdev_gpu_elim.rs — a dead-on-the-corpus pass with a real law (21)
+
+`transforms/fbdev_gpu_elim.rs`. After `fbdev-gpu` lifts writes to `/dev/fb0`
+into `GpuOp` nodes, a `GpuOp` that is an EXACT, CONSECUTIVE duplicate of its
+predecessor is dropped. The pass fires 0 times on the 552-example corpus, but
+it is not dead code — it has a `transform`, 15 tests and a real law:
+
+- `elim_preserves_visible` — the states the program OBSERVES (every `Read`
+  plus the final state) are identical before and after the elimination. That
+  is why dropping a write is allowed: nothing observes it.
+- `non_consecutive_duplicate_is_load_bearing` — the naive alternative goes
+  red: for `Op(1); Op(2); Op(1); Read` the read sees 1 under the pass and 2
+  under "drop every write whose value was already written". The
+  consecutiveness guard is what makes the law true.
+- `elim_leaves_no_duplicates` + `pin_is_idempotent` — a second run changes
+  nothing (`is_idempotent`).
+- `Op(id)` uses one id for device+verb+slot+payload, so "different device /
+  verb / slot / payload" are all "different id" (`pin_keeps_different_ids`,
+  `duplicate_with_different_slot_is_kept`).
+
+Hypotheses in-file: observers are `Read` statements plus the final state
+(anything else that reads the device between two writes is exactly why only
+consecutive duplicates are removed); the model is one flat list and the pass's
+per-body recursion is the same theorem on a smaller list; registration order
+(`after fbdev-gpu` and `-batch`) and the 0/552 corpus coverage are not
+correctness claims.
+
+Mutants, measured: naive dedupe **13 verified, 8 errors**; dedupe ignoring the
+op identity **19 verified, 2 errors**; identity pass **17 verified, 4 errors**.
 
 ## Running it
 
@@ -2219,6 +2699,36 @@ the `$?` guard **18 verified, 2 errors**; drop the Arrow guard **18 verified,
 simplification (`2 == 1` in a `compute_only` assert). The source's six tests
 are mirrored as `pin_*` proofs.
 
+## fbdev_gpu_elim.rs — a dead-on-the-corpus pass with a real law (21)
+
+`transforms/fbdev_gpu_elim.rs`. After `fbdev-gpu` lifts writes to `/dev/fb0`
+into `GpuOp` nodes, a `GpuOp` that is an EXACT, CONSECUTIVE duplicate of its
+predecessor is dropped. The pass fires 0 times on the 552-example corpus, but
+it is not dead code — it has a `transform`, 15 tests and a real law:
+
+- `elim_preserves_visible` — the states the program OBSERVES (every `Read`
+  plus the final state) are identical before and after the elimination. That
+  is why dropping a write is allowed: nothing observes it.
+- `non_consecutive_duplicate_is_load_bearing` — the naive alternative goes
+  red: for `Op(1); Op(2); Op(1); Read` the read sees 1 under the pass and 2
+  under "drop every write whose value was already written". The
+  consecutiveness guard is what makes the law true.
+- `elim_leaves_no_duplicates` + `pin_is_idempotent` — a second run changes
+  nothing (`is_idempotent`).
+- `Op(id)` uses one id for device+verb+slot+payload, so "different device /
+  verb / slot / payload" are all "different id" (`pin_keeps_different_ids`,
+  `duplicate_with_different_slot_is_kept`).
+
+Hypotheses in-file: observers are `Read` statements plus the final state
+(anything else that reads the device between two writes is exactly why only
+consecutive duplicates are removed); the model is one flat list and the pass's
+per-body recursion is the same theorem on a smaller list; registration order
+(`after fbdev-gpu` and `-batch`) and the 0/552 corpus coverage are not
+correctness claims.
+
+Mutants, measured: naive dedupe **13 verified, 8 errors**; dedupe ignoring the
+op identity **19 verified, 2 errors**; identity pass **17 verified, 4 errors**.
+
 ## Running it
 
 Same toolchain as the P6/P7/P8 files (`--rlimit 40`).
@@ -2326,6 +2836,36 @@ the `$?` guard **18 verified, 2 errors**; drop the Arrow guard **18 verified,
 3 errors**. Treating the non-splitting node as splitting is rejected at
 simplification (`2 == 1` in a `compute_only` assert). The source's six tests
 are mirrored as `pin_*` proofs.
+
+## fbdev_gpu_elim.rs — a dead-on-the-corpus pass with a real law (21)
+
+`transforms/fbdev_gpu_elim.rs`. After `fbdev-gpu` lifts writes to `/dev/fb0`
+into `GpuOp` nodes, a `GpuOp` that is an EXACT, CONSECUTIVE duplicate of its
+predecessor is dropped. The pass fires 0 times on the 552-example corpus, but
+it is not dead code — it has a `transform`, 15 tests and a real law:
+
+- `elim_preserves_visible` — the states the program OBSERVES (every `Read`
+  plus the final state) are identical before and after the elimination. That
+  is why dropping a write is allowed: nothing observes it.
+- `non_consecutive_duplicate_is_load_bearing` — the naive alternative goes
+  red: for `Op(1); Op(2); Op(1); Read` the read sees 1 under the pass and 2
+  under "drop every write whose value was already written". The
+  consecutiveness guard is what makes the law true.
+- `elim_leaves_no_duplicates` + `pin_is_idempotent` — a second run changes
+  nothing (`is_idempotent`).
+- `Op(id)` uses one id for device+verb+slot+payload, so "different device /
+  verb / slot / payload" are all "different id" (`pin_keeps_different_ids`,
+  `duplicate_with_different_slot_is_kept`).
+
+Hypotheses in-file: observers are `Read` statements plus the final state
+(anything else that reads the device between two writes is exactly why only
+consecutive duplicates are removed); the model is one flat list and the pass's
+per-body recursion is the same theorem on a smaller list; registration order
+(`after fbdev-gpu` and `-batch`) and the 0/552 corpus coverage are not
+correctness claims.
+
+Mutants, measured: naive dedupe **13 verified, 8 errors**; dedupe ignoring the
+op identity **19 verified, 2 errors**; identity pass **17 verified, 4 errors**.
 
 ## Running it
 
@@ -2438,6 +2978,36 @@ the `$?` guard **18 verified, 2 errors**; drop the Arrow guard **18 verified,
 simplification (`2 == 1` in a `compute_only` assert). The source's six tests
 are mirrored as `pin_*` proofs.
 
+## fbdev_gpu_elim.rs — a dead-on-the-corpus pass with a real law (21)
+
+`transforms/fbdev_gpu_elim.rs`. After `fbdev-gpu` lifts writes to `/dev/fb0`
+into `GpuOp` nodes, a `GpuOp` that is an EXACT, CONSECUTIVE duplicate of its
+predecessor is dropped. The pass fires 0 times on the 552-example corpus, but
+it is not dead code — it has a `transform`, 15 tests and a real law:
+
+- `elim_preserves_visible` — the states the program OBSERVES (every `Read`
+  plus the final state) are identical before and after the elimination. That
+  is why dropping a write is allowed: nothing observes it.
+- `non_consecutive_duplicate_is_load_bearing` — the naive alternative goes
+  red: for `Op(1); Op(2); Op(1); Read` the read sees 1 under the pass and 2
+  under "drop every write whose value was already written". The
+  consecutiveness guard is what makes the law true.
+- `elim_leaves_no_duplicates` + `pin_is_idempotent` — a second run changes
+  nothing (`is_idempotent`).
+- `Op(id)` uses one id for device+verb+slot+payload, so "different device /
+  verb / slot / payload" are all "different id" (`pin_keeps_different_ids`,
+  `duplicate_with_different_slot_is_kept`).
+
+Hypotheses in-file: observers are `Read` statements plus the final state
+(anything else that reads the device between two writes is exactly why only
+consecutive duplicates are removed); the model is one flat list and the pass's
+per-body recursion is the same theorem on a smaller list; registration order
+(`after fbdev-gpu` and `-batch`) and the 0/552 corpus coverage are not
+correctness claims.
+
+Mutants, measured: naive dedupe **13 verified, 8 errors**; dedupe ignoring the
+op identity **19 verified, 2 errors**; identity pass **17 verified, 4 errors**.
+
 ## Running it
 
 Same toolchain as the P6/P7/P8 files (`--rlimit 40`).
@@ -2549,6 +3119,36 @@ the `$?` guard **18 verified, 2 errors**; drop the Arrow guard **18 verified,
 3 errors**. Treating the non-splitting node as splitting is rejected at
 simplification (`2 == 1` in a `compute_only` assert). The source's six tests
 are mirrored as `pin_*` proofs.
+
+## fbdev_gpu_elim.rs — a dead-on-the-corpus pass with a real law (21)
+
+`transforms/fbdev_gpu_elim.rs`. After `fbdev-gpu` lifts writes to `/dev/fb0`
+into `GpuOp` nodes, a `GpuOp` that is an EXACT, CONSECUTIVE duplicate of its
+predecessor is dropped. The pass fires 0 times on the 552-example corpus, but
+it is not dead code — it has a `transform`, 15 tests and a real law:
+
+- `elim_preserves_visible` — the states the program OBSERVES (every `Read`
+  plus the final state) are identical before and after the elimination. That
+  is why dropping a write is allowed: nothing observes it.
+- `non_consecutive_duplicate_is_load_bearing` — the naive alternative goes
+  red: for `Op(1); Op(2); Op(1); Read` the read sees 1 under the pass and 2
+  under "drop every write whose value was already written". The
+  consecutiveness guard is what makes the law true.
+- `elim_leaves_no_duplicates` + `pin_is_idempotent` — a second run changes
+  nothing (`is_idempotent`).
+- `Op(id)` uses one id for device+verb+slot+payload, so "different device /
+  verb / slot / payload" are all "different id" (`pin_keeps_different_ids`,
+  `duplicate_with_different_slot_is_kept`).
+
+Hypotheses in-file: observers are `Read` statements plus the final state
+(anything else that reads the device between two writes is exactly why only
+consecutive duplicates are removed); the model is one flat list and the pass's
+per-body recursion is the same theorem on a smaller list; registration order
+(`after fbdev-gpu` and `-batch`) and the 0/552 corpus coverage are not
+correctness claims.
+
+Mutants, measured: naive dedupe **13 verified, 8 errors**; dedupe ignoring the
+op identity **19 verified, 2 errors**; identity pass **17 verified, 4 errors**.
 
 ## Running it
 
@@ -2830,6 +3430,36 @@ the `$?` guard **18 verified, 2 errors**; drop the Arrow guard **18 verified,
 3 errors**. Treating the non-splitting node as splitting is rejected at
 simplification (`2 == 1` in a `compute_only` assert). The source's six tests
 are mirrored as `pin_*` proofs.
+
+## fbdev_gpu_elim.rs — a dead-on-the-corpus pass with a real law (21)
+
+`transforms/fbdev_gpu_elim.rs`. After `fbdev-gpu` lifts writes to `/dev/fb0`
+into `GpuOp` nodes, a `GpuOp` that is an EXACT, CONSECUTIVE duplicate of its
+predecessor is dropped. The pass fires 0 times on the 552-example corpus, but
+it is not dead code — it has a `transform`, 15 tests and a real law:
+
+- `elim_preserves_visible` — the states the program OBSERVES (every `Read`
+  plus the final state) are identical before and after the elimination. That
+  is why dropping a write is allowed: nothing observes it.
+- `non_consecutive_duplicate_is_load_bearing` — the naive alternative goes
+  red: for `Op(1); Op(2); Op(1); Read` the read sees 1 under the pass and 2
+  under "drop every write whose value was already written". The
+  consecutiveness guard is what makes the law true.
+- `elim_leaves_no_duplicates` + `pin_is_idempotent` — a second run changes
+  nothing (`is_idempotent`).
+- `Op(id)` uses one id for device+verb+slot+payload, so "different device /
+  verb / slot / payload" are all "different id" (`pin_keeps_different_ids`,
+  `duplicate_with_different_slot_is_kept`).
+
+Hypotheses in-file: observers are `Read` statements plus the final state
+(anything else that reads the device between two writes is exactly why only
+consecutive duplicates are removed); the model is one flat list and the pass's
+per-body recursion is the same theorem on a smaller list; registration order
+(`after fbdev-gpu` and `-batch`) and the 0/552 corpus coverage are not
+correctness claims.
+
+Mutants, measured: naive dedupe **13 verified, 8 errors**; dedupe ignoring the
+op identity **19 verified, 2 errors**; identity pass **17 verified, 4 errors**.
 
 ## Running it
 
@@ -3164,6 +3794,36 @@ the `$?` guard **18 verified, 2 errors**; drop the Arrow guard **18 verified,
 simplification (`2 == 1` in a `compute_only` assert). The source's six tests
 are mirrored as `pin_*` proofs.
 
+## fbdev_gpu_elim.rs — a dead-on-the-corpus pass with a real law (21)
+
+`transforms/fbdev_gpu_elim.rs`. After `fbdev-gpu` lifts writes to `/dev/fb0`
+into `GpuOp` nodes, a `GpuOp` that is an EXACT, CONSECUTIVE duplicate of its
+predecessor is dropped. The pass fires 0 times on the 552-example corpus, but
+it is not dead code — it has a `transform`, 15 tests and a real law:
+
+- `elim_preserves_visible` — the states the program OBSERVES (every `Read`
+  plus the final state) are identical before and after the elimination. That
+  is why dropping a write is allowed: nothing observes it.
+- `non_consecutive_duplicate_is_load_bearing` — the naive alternative goes
+  red: for `Op(1); Op(2); Op(1); Read` the read sees 1 under the pass and 2
+  under "drop every write whose value was already written". The
+  consecutiveness guard is what makes the law true.
+- `elim_leaves_no_duplicates` + `pin_is_idempotent` — a second run changes
+  nothing (`is_idempotent`).
+- `Op(id)` uses one id for device+verb+slot+payload, so "different device /
+  verb / slot / payload" are all "different id" (`pin_keeps_different_ids`,
+  `duplicate_with_different_slot_is_kept`).
+
+Hypotheses in-file: observers are `Read` statements plus the final state
+(anything else that reads the device between two writes is exactly why only
+consecutive duplicates are removed); the model is one flat list and the pass's
+per-body recursion is the same theorem on a smaller list; registration order
+(`after fbdev-gpu` and `-batch`) and the 0/552 corpus coverage are not
+correctness claims.
+
+Mutants, measured: naive dedupe **13 verified, 8 errors**; dedupe ignoring the
+op identity **19 verified, 2 errors**; identity pass **17 verified, 4 errors**.
+
 ## Running it
 
 Same toolchain as above (`--rlimit 40`).
@@ -3434,6 +4094,36 @@ the `$?` guard **18 verified, 2 errors**; drop the Arrow guard **18 verified,
 simplification (`2 == 1` in a `compute_only` assert). The source's six tests
 are mirrored as `pin_*` proofs.
 
+## fbdev_gpu_elim.rs — a dead-on-the-corpus pass with a real law (21)
+
+`transforms/fbdev_gpu_elim.rs`. After `fbdev-gpu` lifts writes to `/dev/fb0`
+into `GpuOp` nodes, a `GpuOp` that is an EXACT, CONSECUTIVE duplicate of its
+predecessor is dropped. The pass fires 0 times on the 552-example corpus, but
+it is not dead code — it has a `transform`, 15 tests and a real law:
+
+- `elim_preserves_visible` — the states the program OBSERVES (every `Read`
+  plus the final state) are identical before and after the elimination. That
+  is why dropping a write is allowed: nothing observes it.
+- `non_consecutive_duplicate_is_load_bearing` — the naive alternative goes
+  red: for `Op(1); Op(2); Op(1); Read` the read sees 1 under the pass and 2
+  under "drop every write whose value was already written". The
+  consecutiveness guard is what makes the law true.
+- `elim_leaves_no_duplicates` + `pin_is_idempotent` — a second run changes
+  nothing (`is_idempotent`).
+- `Op(id)` uses one id for device+verb+slot+payload, so "different device /
+  verb / slot / payload" are all "different id" (`pin_keeps_different_ids`,
+  `duplicate_with_different_slot_is_kept`).
+
+Hypotheses in-file: observers are `Read` statements plus the final state
+(anything else that reads the device between two writes is exactly why only
+consecutive duplicates are removed); the model is one flat list and the pass's
+per-body recursion is the same theorem on a smaller list; registration order
+(`after fbdev-gpu` and `-batch`) and the 0/552 corpus coverage are not
+correctness claims.
+
+Mutants, measured: naive dedupe **13 verified, 8 errors**; dedupe ignoring the
+op identity **19 verified, 2 errors**; identity pass **17 verified, 4 errors**.
+
 ## Running it
 
 Same toolchain as above (`--rlimit 40`).
@@ -3690,6 +4380,36 @@ the `$?` guard **18 verified, 2 errors**; drop the Arrow guard **18 verified,
 3 errors**. Treating the non-splitting node as splitting is rejected at
 simplification (`2 == 1` in a `compute_only` assert). The source's six tests
 are mirrored as `pin_*` proofs.
+
+## fbdev_gpu_elim.rs — a dead-on-the-corpus pass with a real law (21)
+
+`transforms/fbdev_gpu_elim.rs`. After `fbdev-gpu` lifts writes to `/dev/fb0`
+into `GpuOp` nodes, a `GpuOp` that is an EXACT, CONSECUTIVE duplicate of its
+predecessor is dropped. The pass fires 0 times on the 552-example corpus, but
+it is not dead code — it has a `transform`, 15 tests and a real law:
+
+- `elim_preserves_visible` — the states the program OBSERVES (every `Read`
+  plus the final state) are identical before and after the elimination. That
+  is why dropping a write is allowed: nothing observes it.
+- `non_consecutive_duplicate_is_load_bearing` — the naive alternative goes
+  red: for `Op(1); Op(2); Op(1); Read` the read sees 1 under the pass and 2
+  under "drop every write whose value was already written". The
+  consecutiveness guard is what makes the law true.
+- `elim_leaves_no_duplicates` + `pin_is_idempotent` — a second run changes
+  nothing (`is_idempotent`).
+- `Op(id)` uses one id for device+verb+slot+payload, so "different device /
+  verb / slot / payload" are all "different id" (`pin_keeps_different_ids`,
+  `duplicate_with_different_slot_is_kept`).
+
+Hypotheses in-file: observers are `Read` statements plus the final state
+(anything else that reads the device between two writes is exactly why only
+consecutive duplicates are removed); the model is one flat list and the pass's
+per-body recursion is the same theorem on a smaller list; registration order
+(`after fbdev-gpu` and `-batch`) and the 0/552 corpus coverage are not
+correctness claims.
+
+Mutants, measured: naive dedupe **13 verified, 8 errors**; dedupe ignoring the
+op identity **19 verified, 2 errors**; identity pass **17 verified, 4 errors**.
 
 ## Running it
 
