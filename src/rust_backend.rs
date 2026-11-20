@@ -1490,15 +1490,21 @@ fn parse_ident_to_paren(s: &str) -> Option<(&str, usize)> {
 /// double-quoted string literal, via the supplied `expand` closure.
 fn inline_str_arg_helper(text: &mut String, name: &str, expand: impl Fn(&str) -> String) {
     let pat = format!("{}(", name);
+    // Scan FORWARD past a non-literal occurrence instead of stopping: the
+    // helper's own `fn __sh_env(n: &str)` definition comes BEFORE the calls
+    // in the rendered text, and bailing there left the whole pass dead.
+    let mut from = 0usize;
     loop {
-        let at = match text.find(&pat) {
-            Some(a) => a,
+        let at = match text[from..].find(&pat) {
+            Some(a) => from + a,
             None => break,
         };
+        let arg_at = at + pat.len();
         // verify what follows the `(` is a string literal
-        let after = &text[at + pat.len()..];
+        let after = &text[arg_at..];
         if !after.starts_with('"') {
-            break;
+            from = arg_at;
+            continue;
         }
         // find the closing quote
         let mut j = 1;
@@ -1521,6 +1527,7 @@ fn inline_str_arg_helper(text: &mut String, name: &str, expand: impl Fn(&str) ->
         let replacement = expand(lit_str);
         let end = at + pat.len() + j + 1; // include the `)`
         text.replace_range(at..end, &replacement);
+        from = at + replacement.len();
     }
 }
 
