@@ -14846,6 +14846,28 @@ impl Render {
             self.emit("  }");
             self.emit("  if ((size_t)(i + 1) > *len) *len = (size_t)(i + 1);");
             self.emit("}");
+            // fbdev-gpu-hexrun's value form: `unit` repeated `count` times
+            // into `d` in ONE pass. The shell builder it replaces doubled a
+            // 256-copy block and appended the remainder one pixel at a
+            // time; this grows once and doubles a filled prefix, then
+            // finishes with copies — same bytes, O(log n) memcpys and no
+            // per-pixel realloc (the rasterizer's ~1GB/frame garbage).
+            // `count <= 0` (and an empty unit) is the empty string, exactly
+            // the builder's `[ "$n" -le 0 ] && return` arm.
+            self.emit("/* fbdev-gpu-hexrun: unit repeated count times */");
+            self.emit("static char *_sh_repeat_v(_sh_vbuf *d, const char *unit, long long count) {");
+            self.emit("  const char *u = unit ? unit : \"\"; size_t ul = strlen(u);");
+            self.emit("  if (count <= 0 || ul == 0) { _sh_vgrow(d, 1); d->p[0] = 0; return d->p; }");
+            self.emit("  size_t n = (size_t)count;");
+            self.emit("  if (n > (size_t)-1 / ul) { fprintf(stderr, \"sh2c: repeat too large\\n\"); exit(127); }");
+            self.emit("  size_t total = n * ul;");
+            self.emit("  _sh_vgrow(d, total + 1);");
+            self.emit("  char *w = d->p;");
+            self.emit("  memcpy(w, u, ul); size_t have = ul;");
+            self.emit("  while (have <= total / 2) { memcpy(w + have, w, have); have *= 2; }");
+            self.emit("  while (have < total) { size_t c = total - have < have ? total - have : have; memcpy(w + have, w, c); have += c; }");
+            self.emit("  w[total] = 0; return w;");
+            self.emit("}");
             self.emit("/* count whitespace-delimited words (WordCount) */");
             self.emit("static size_t _sh_wc_words(const char *s) {");
             self.emit("  size_t n = 0; int in = 0;");
@@ -20873,8 +20895,43 @@ fn param_copy_alias(
     /// a loud TODO (the C backend implements the primitives, not every
     /// Ext node). Sets `need_primitives` so the preamble emits the helpers.
     fn ext_value_c(&mut self, node: &dyn crate::shir_nodes::ExtExpr) -> String {
-        use crate::shir_nodes::{ArrayLen, CutAt, FieldGrab, FieldStrip, FieldStripEnd, RegCount, Split, StrLen, WordCount};
+        use crate::shir_nodes::{ArrayLen, CutAt, FieldGrab, FieldStrip, FieldStripEnd, RegCount, RepeatStr, Split, StrLen, WordCount};
         match node.tag() {
+            // ── fbdev-gpu-hexrun (transforms/fbdev_gpu_hexrun.rs) ────
+            // The rasterizer's run build (`unit` repeated `count` times)
+            // as ONE fill into a fresh buffer. The pre-lift shape was the
+            // shell builder's doubling loop: ~65 grow-and-append stores
+            // over a 2560-byte run (the ~1GB/frame garbage the rasterizer
+            // header measured). `_sh_repeat_v` grows once and doubles a
+            // filled prefix, so the result is byte-identical to
+            // `concat (replicate count text)` — TextOps#repeat_str_sound.
+            // `count <= 0` is "" (bash's `"x" x -1`, and the builder's
+            // own `-le 0` return), with no negative-size arithmetic.
+            "RepeatStr" => {
+                let r = node
+                    .as_any()
+                    .downcast_ref::<RepeatStr>()
+                    .expect("tag/type agree");
+                self.need_primitives = true;
+                let text_c = self.value_c(&r.text);
+                // NUMERIC CONTEXT: a raw `$n`-style text goes through the
+                // native resolver; any other word (a `getVar`/`split` read)
+                // is atoll'd from its C value WITHOUT an int temp — a
+                // truncated 2^31 count would be a wrong-length run, not an
+                // error.
+                let count_c = match &r.count {
+                    IrExpr::Str(..) => self.value_num_dollar(&r.count),
+                    other => {
+                        let v = self.value_c(other);
+                        format!("(long long)atoll({v})")
+                    }
+                };
+                let v = self.vbuf_temp();
+                self.emit(&format!(
+                    "_sh_repeat_v(&{v}, (char*)({text_c}), {count_c});"
+                ));
+                format!("{v}.p")
+            }
             // ── str-splice-fold (transforms/str_splice_fold.rs) ──────
             // VALUE-position form: ONE `_sh_splice_v` call into a fresh
             // buffer — `base[0..start) ++ repl ++ base[end..)`, clamped
@@ -40474,6 +40531,12 @@ fn chop_operands(n: &dyn crate::shir_nodes::ExtExpr) -> Option<Vec<&IrExpr>> {
         Some(vec![&f.text, &f.off])
     } else if let Some(c) = n.as_any().downcast_ref::<CutAt>() {
         Some(vec![&c.text])
+    } else if let Some(r) = n.as_any().downcast_ref::<crate::shir_nodes::RepeatStr>() {
+        // fbdev-gpu-hexrun's node: `unit` and its count are the operands of
+        // the run build it replaced (`${unit}` repeated `${count}` times) —
+        // no call surface beyond them, so the scans stay as permissive as
+        // the pre-lift function call was.
+        Some(vec![&r.text, &r.count])
     } else if let Some(sp) = n.as_any().downcast_ref::<crate::shir_nodes::StrSplice>() {
         // str-splice-fold's node: the four exprs ARE the operands of
         // the Interpolate it replaced (`join(slice(b,0,start)) ++

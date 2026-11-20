@@ -79,6 +79,11 @@ pub fn transform_applies(name: &str) -> bool {
                 // str-splice-fold EMITS StrSplice — C's capacity-guarded
                 // store arm consumes it today (same §11 offer).
                 "str-splice-fold" => matches!(t.as_str(), "c"),
+                // fbdev-gpu-hexrun EMITS the shared RepeatStr node. Every
+                // backend renders RepeatStr already; the C target is where
+                // the device-side `_sh_repeat_v` dispatch lives (and the
+                // only target whose rasterizer this pass was written for).
+                "fbdev-gpu-hexrun" => matches!(t.as_str(), "c"),
                 // not-identity-flip: rust only (the Perl Eq/Ne
                 // asymmetry — not_identity's module doc).
                 "not-identity-flip" => matches!(t.as_str(), "rs" | "rust"),
@@ -120,6 +125,11 @@ pub fn transform_applies(name: &str) -> bool {
         // file-write fallback. Explicit `c` target only — the
         // text-ops-planner precedent (bash-o4/src/pipeline.rs sets it).
         "fbdev-gpu-calls" => matches!(target().as_deref(), Some("c")),
+        // fbdev-gpu-hexrun rewrites the rasterizer's run build into the
+        // shared RepeatStr node. C-only (the "hexstring row generation"
+        // mission slice): the other backends keep the builder call
+        // verbatim, which is this pass's fallback.
+        "fbdev-gpu-hexrun" => matches!(target().as_deref(), Some("c")),
         // split-in-place emits Ext(Split{in_place}) — only the C backend
         // consumes the flag today (its for-in-split arm tokenizes the
         // var's own buffer instead of copying). Unset target must NOT run
@@ -259,6 +269,7 @@ pub mod fbdev_gpu; // device write → GPU op (the §4.2 stage ② "gpu-prep" pa
 pub mod fbdev_gpu_batch; // batch consecutive same-verb GpuOps into one dispatch
 pub mod fbdev_gpu_elim; // eliminate redundant GpuOps (exact duplicates)
 pub mod fbdev_gpu_calls; // GpuOp → the fb_* call it names (C target only)
+pub mod fbdev_gpu_hexrun; // run-builder call → RepeatStr (the hexstring row generation; C target only)
 
 
 pub fn all() -> Vec<(&'static str, TransformFn)> {
@@ -482,6 +493,12 @@ pub fn all() -> Vec<(&'static str, TransformFn)> {
         ("fbdev-gpu-batch", fbdev_gpu_batch::transform),
         ("fbdev-gpu-elim", fbdev_gpu_elim::transform),
         ("fbdev-gpu-calls", fbdev_gpu_calls::transform),
+        // fbdev-gpu-hexrun: a call of a VERIFIED run-builder (the closed
+        // doubling+remainder template) becomes `out = RepeatStr(unit, n)`,
+        // the node whose law TextOps#repeat_str_sound already proves. The
+        // C renderer dispatches it as one `_sh_repeat_v` fill instead of
+        // ~65 grow-and-append stores. SH2_NO_GPU_ROWS=1 for the A/B gate.
+        ("fbdev-gpu-hexrun", fbdev_gpu_hexrun::transform),
         // split-in-place: liveness-proven destructive buffer reuse for
         // `for w in $var` iteration — the source var's OWN buffer is
         // tokenized in place (delimiters stamped with NUL) instead of
