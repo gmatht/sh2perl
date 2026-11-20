@@ -49,6 +49,39 @@ file was restored and re-checked at **5 verified, 0 errors**.
   `is_i32()` is referenced only from `transforms.rs`), so this verdict
   currently changes no emitted byte.
 
+## typeset_attrs.rs — live attributes and the value bash stores (29)
+
+`transforms/typeset_attrs.rs`. `typeset -i n` / `-l s` are not one-shot: the
+attribute is LIVE, so every later assignment to that name is coerced. The
+model carries the attribute state machine (`scan` / `attrs_at`, order-aware)
+and proves the REWRITE LAW:
+
+- `rewrite_matches_bash` — for every attribute and every literal text, the
+  value the pass's expression produces equals the value bash stores. Discharged
+  by cases: canonical decimal folds to itself and bash's arithmetic agrees
+  (`int(arith(T))` otherwise, both reading a non-numeric word as 0), case
+  folding for `-l`/`-u`, and the `-il` composition where bash coerces to the
+  integer FIRST and folds the stored decimal (`fold_sees_the_coerced_value`).
+- `octal_fold_is_wrong` — `042` is 34 in bash arithmetic; a naive leading-zero
+  fold claims 42, so the pass's refusal is load-bearing (the model of the
+  refusal, `strict_dec`, is what makes the law true).
+- guards pinned: `-lu` recorded as nothing while either single fold would
+  change the value, `typeset -r` recording nothing, other names untouched, an
+  assignment BEFORE the declaration untouched, every declared name recorded.
+
+Hypotheses kept in-file: the backends' `arith` node implements bash's
+arithmetic for the full language, and `lc`/`uc` match bash per locale — the
+model only folds ASCII, exactly the pass's guard. Text is modelled as
+character codes; variables inside the arithmetic text are left to `arith`.
+The source's four state-machine tests are mirrored as `pin_*` proofs.
+
+Mutants, measured: order-ignoring `attrs_at` **28 verified, 1 error**; `-il`
+folded the wrong way **28 verified, 1 error**; no-attribute coercion **27
+verified, 2 errors**. Accepting a leading zero in `strict_dec` is caught one
+stage earlier — `arith("042") == 34` simplifies to `42 == 34` in a
+`compute_only` assert, so that mutant is rejected at simplification time and
+has no verified/error count.
+
 ## Running it
 
 Verus needs rust toolchain `1.99.1-x86_64-unknown-linux-gnu`
@@ -112,6 +145,39 @@ re-checked at **8 verified, 0 errors**.
   structurally and clones everything else, so it can neither create nor
   destroy a self-assign or a reference — its soundness is the separate
   constant-fold obligation.
+
+## typeset_attrs.rs — live attributes and the value bash stores (29)
+
+`transforms/typeset_attrs.rs`. `typeset -i n` / `-l s` are not one-shot: the
+attribute is LIVE, so every later assignment to that name is coerced. The
+model carries the attribute state machine (`scan` / `attrs_at`, order-aware)
+and proves the REWRITE LAW:
+
+- `rewrite_matches_bash` — for every attribute and every literal text, the
+  value the pass's expression produces equals the value bash stores. Discharged
+  by cases: canonical decimal folds to itself and bash's arithmetic agrees
+  (`int(arith(T))` otherwise, both reading a non-numeric word as 0), case
+  folding for `-l`/`-u`, and the `-il` composition where bash coerces to the
+  integer FIRST and folds the stored decimal (`fold_sees_the_coerced_value`).
+- `octal_fold_is_wrong` — `042` is 34 in bash arithmetic; a naive leading-zero
+  fold claims 42, so the pass's refusal is load-bearing (the model of the
+  refusal, `strict_dec`, is what makes the law true).
+- guards pinned: `-lu` recorded as nothing while either single fold would
+  change the value, `typeset -r` recording nothing, other names untouched, an
+  assignment BEFORE the declaration untouched, every declared name recorded.
+
+Hypotheses kept in-file: the backends' `arith` node implements bash's
+arithmetic for the full language, and `lc`/`uc` match bash per locale — the
+model only folds ASCII, exactly the pass's guard. Text is modelled as
+character codes; variables inside the arithmetic text are left to `arith`.
+The source's four state-machine tests are mirrored as `pin_*` proofs.
+
+Mutants, measured: order-ignoring `attrs_at` **28 verified, 1 error**; `-il`
+folded the wrong way **28 verified, 1 error**; no-attribute coercion **27
+verified, 2 errors**. Accepting a leading zero in `strict_dec` is caught one
+stage earlier — `arith("042") == 34` simplifies to `42 == 34` in a
+`compute_only` assert, so that mutant is rejected at simplification time and
+has no verified/error count.
 
 ## Running it
 
@@ -181,6 +247,39 @@ re-checked at **25 verified, 0 errors**.
 - Fidelity pins (`elim_pins`, mirroring `dead_fn_elim.rs`'s own
   tests): an uncalled fn is removed; a called or indirectly-referenced
   fn is kept.
+
+## typeset_attrs.rs — live attributes and the value bash stores (29)
+
+`transforms/typeset_attrs.rs`. `typeset -i n` / `-l s` are not one-shot: the
+attribute is LIVE, so every later assignment to that name is coerced. The
+model carries the attribute state machine (`scan` / `attrs_at`, order-aware)
+and proves the REWRITE LAW:
+
+- `rewrite_matches_bash` — for every attribute and every literal text, the
+  value the pass's expression produces equals the value bash stores. Discharged
+  by cases: canonical decimal folds to itself and bash's arithmetic agrees
+  (`int(arith(T))` otherwise, both reading a non-numeric word as 0), case
+  folding for `-l`/`-u`, and the `-il` composition where bash coerces to the
+  integer FIRST and folds the stored decimal (`fold_sees_the_coerced_value`).
+- `octal_fold_is_wrong` — `042` is 34 in bash arithmetic; a naive leading-zero
+  fold claims 42, so the pass's refusal is load-bearing (the model of the
+  refusal, `strict_dec`, is what makes the law true).
+- guards pinned: `-lu` recorded as nothing while either single fold would
+  change the value, `typeset -r` recording nothing, other names untouched, an
+  assignment BEFORE the declaration untouched, every declared name recorded.
+
+Hypotheses kept in-file: the backends' `arith` node implements bash's
+arithmetic for the full language, and `lc`/`uc` match bash per locale — the
+model only folds ASCII, exactly the pass's guard. Text is modelled as
+character codes; variables inside the arithmetic text are left to `arith`.
+The source's four state-machine tests are mirrored as `pin_*` proofs.
+
+Mutants, measured: order-ignoring `attrs_at` **28 verified, 1 error**; `-il`
+folded the wrong way **28 verified, 1 error**; no-attribute coercion **27
+verified, 2 errors**. Accepting a leading zero in `strict_dec` is caught one
+stage earlier — `arith("042") == 34` simplifies to `42 == 34` in a
+`compute_only` assert, so that mutant is rejected at simplification time and
+has no verified/error count.
 
 ## Running it
 
@@ -264,6 +363,39 @@ obligation is not vacuous. The file was restored and re-checked at
   `Assign` ignores target indices, so `x=5; arr[x]=1; x=6` drops a
   live store. Neither affects the modelled file.
 
+## typeset_attrs.rs — live attributes and the value bash stores (29)
+
+`transforms/typeset_attrs.rs`. `typeset -i n` / `-l s` are not one-shot: the
+attribute is LIVE, so every later assignment to that name is coerced. The
+model carries the attribute state machine (`scan` / `attrs_at`, order-aware)
+and proves the REWRITE LAW:
+
+- `rewrite_matches_bash` — for every attribute and every literal text, the
+  value the pass's expression produces equals the value bash stores. Discharged
+  by cases: canonical decimal folds to itself and bash's arithmetic agrees
+  (`int(arith(T))` otherwise, both reading a non-numeric word as 0), case
+  folding for `-l`/`-u`, and the `-il` composition where bash coerces to the
+  integer FIRST and folds the stored decimal (`fold_sees_the_coerced_value`).
+- `octal_fold_is_wrong` — `042` is 34 in bash arithmetic; a naive leading-zero
+  fold claims 42, so the pass's refusal is load-bearing (the model of the
+  refusal, `strict_dec`, is what makes the law true).
+- guards pinned: `-lu` recorded as nothing while either single fold would
+  change the value, `typeset -r` recording nothing, other names untouched, an
+  assignment BEFORE the declaration untouched, every declared name recorded.
+
+Hypotheses kept in-file: the backends' `arith` node implements bash's
+arithmetic for the full language, and `lc`/`uc` match bash per locale — the
+model only folds ASCII, exactly the pass's guard. Text is modelled as
+character codes; variables inside the arithmetic text are left to `arith`.
+The source's four state-machine tests are mirrored as `pin_*` proofs.
+
+Mutants, measured: order-ignoring `attrs_at` **28 verified, 1 error**; `-il`
+folded the wrong way **28 verified, 1 error**; no-attribute coercion **27
+verified, 2 errors**. Accepting a leading zero in `strict_dec` is caught one
+stage earlier — `arith("042") == 34` simplifies to `42 == 34` in a
+`compute_only` assert, so that mutant is rejected at simplification time and
+has no verified/error count.
+
 ## Running it
 
 Same toolchain as above:
@@ -326,6 +458,39 @@ re-checked at **27 verified, 0 errors**.
   same single-def/literal core; the extensions reuse this gate).
 - Flat statement sequences only; nested bodies are the same induction
   presented per straight-line list.
+
+## typeset_attrs.rs — live attributes and the value bash stores (29)
+
+`transforms/typeset_attrs.rs`. `typeset -i n` / `-l s` are not one-shot: the
+attribute is LIVE, so every later assignment to that name is coerced. The
+model carries the attribute state machine (`scan` / `attrs_at`, order-aware)
+and proves the REWRITE LAW:
+
+- `rewrite_matches_bash` — for every attribute and every literal text, the
+  value the pass's expression produces equals the value bash stores. Discharged
+  by cases: canonical decimal folds to itself and bash's arithmetic agrees
+  (`int(arith(T))` otherwise, both reading a non-numeric word as 0), case
+  folding for `-l`/`-u`, and the `-il` composition where bash coerces to the
+  integer FIRST and folds the stored decimal (`fold_sees_the_coerced_value`).
+- `octal_fold_is_wrong` — `042` is 34 in bash arithmetic; a naive leading-zero
+  fold claims 42, so the pass's refusal is load-bearing (the model of the
+  refusal, `strict_dec`, is what makes the law true).
+- guards pinned: `-lu` recorded as nothing while either single fold would
+  change the value, `typeset -r` recording nothing, other names untouched, an
+  assignment BEFORE the declaration untouched, every declared name recorded.
+
+Hypotheses kept in-file: the backends' `arith` node implements bash's
+arithmetic for the full language, and `lc`/`uc` match bash per locale — the
+model only folds ASCII, exactly the pass's guard. Text is modelled as
+character codes; variables inside the arithmetic text are left to `arith`.
+The source's four state-machine tests are mirrored as `pin_*` proofs.
+
+Mutants, measured: order-ignoring `attrs_at` **28 verified, 1 error**; `-il`
+folded the wrong way **28 verified, 1 error**; no-attribute coercion **27
+verified, 2 errors**. Accepting a leading zero in `strict_dec` is caught one
+stage earlier — `arith("042") == 34` simplifies to `42 == 34` in a
+`compute_only` assert, so that mutant is rejected at simplification time and
+has no verified/error count.
 
 ## Running it
 
@@ -397,6 +562,39 @@ conjuncts — the real unknown-callee default is Impure).
 - Flat function bodies; nested statement recursion is the same meet
   presented per straight-line list.
 
+## typeset_attrs.rs — live attributes and the value bash stores (29)
+
+`transforms/typeset_attrs.rs`. `typeset -i n` / `-l s` are not one-shot: the
+attribute is LIVE, so every later assignment to that name is coerced. The
+model carries the attribute state machine (`scan` / `attrs_at`, order-aware)
+and proves the REWRITE LAW:
+
+- `rewrite_matches_bash` — for every attribute and every literal text, the
+  value the pass's expression produces equals the value bash stores. Discharged
+  by cases: canonical decimal folds to itself and bash's arithmetic agrees
+  (`int(arith(T))` otherwise, both reading a non-numeric word as 0), case
+  folding for `-l`/`-u`, and the `-il` composition where bash coerces to the
+  integer FIRST and folds the stored decimal (`fold_sees_the_coerced_value`).
+- `octal_fold_is_wrong` — `042` is 34 in bash arithmetic; a naive leading-zero
+  fold claims 42, so the pass's refusal is load-bearing (the model of the
+  refusal, `strict_dec`, is what makes the law true).
+- guards pinned: `-lu` recorded as nothing while either single fold would
+  change the value, `typeset -r` recording nothing, other names untouched, an
+  assignment BEFORE the declaration untouched, every declared name recorded.
+
+Hypotheses kept in-file: the backends' `arith` node implements bash's
+arithmetic for the full language, and `lc`/`uc` match bash per locale — the
+model only folds ASCII, exactly the pass's guard. Text is modelled as
+character codes; variables inside the arithmetic text are left to `arith`.
+The source's four state-machine tests are mirrored as `pin_*` proofs.
+
+Mutants, measured: order-ignoring `attrs_at` **28 verified, 1 error**; `-il`
+folded the wrong way **28 verified, 1 error**; no-attribute coercion **27
+verified, 2 errors**. Accepting a leading zero in `strict_dec` is caught one
+stage earlier — `arith("042") == 34` simplifies to `42 == 34` in a
+`compute_only` assert, so that mutant is rejected at simplification time and
+has no verified/error count.
+
 ## Running it
 
 Same toolchain as above:
@@ -457,6 +655,39 @@ verified, 0 errors**.
 - Refusals are modelled as the operand `Option` being `None`: each
   lemma is total only over accepted shapes.
 
+## typeset_attrs.rs — live attributes and the value bash stores (29)
+
+`transforms/typeset_attrs.rs`. `typeset -i n` / `-l s` are not one-shot: the
+attribute is LIVE, so every later assignment to that name is coerced. The
+model carries the attribute state machine (`scan` / `attrs_at`, order-aware)
+and proves the REWRITE LAW:
+
+- `rewrite_matches_bash` — for every attribute and every literal text, the
+  value the pass's expression produces equals the value bash stores. Discharged
+  by cases: canonical decimal folds to itself and bash's arithmetic agrees
+  (`int(arith(T))` otherwise, both reading a non-numeric word as 0), case
+  folding for `-l`/`-u`, and the `-il` composition where bash coerces to the
+  integer FIRST and folds the stored decimal (`fold_sees_the_coerced_value`).
+- `octal_fold_is_wrong` — `042` is 34 in bash arithmetic; a naive leading-zero
+  fold claims 42, so the pass's refusal is load-bearing (the model of the
+  refusal, `strict_dec`, is what makes the law true).
+- guards pinned: `-lu` recorded as nothing while either single fold would
+  change the value, `typeset -r` recording nothing, other names untouched, an
+  assignment BEFORE the declaration untouched, every declared name recorded.
+
+Hypotheses kept in-file: the backends' `arith` node implements bash's
+arithmetic for the full language, and `lc`/`uc` match bash per locale — the
+model only folds ASCII, exactly the pass's guard. Text is modelled as
+character codes; variables inside the arithmetic text are left to `arith`.
+The source's four state-machine tests are mirrored as `pin_*` proofs.
+
+Mutants, measured: order-ignoring `attrs_at` **28 verified, 1 error**; `-il`
+folded the wrong way **28 verified, 1 error**; no-attribute coercion **27
+verified, 2 errors**. Accepting a leading zero in `strict_dec` is caught one
+stage earlier — `arith("042") == 34` simplifies to `42 == 34` in a
+`compute_only` assert, so that mutant is rejected at simplification time and
+has no verified/error count.
+
 ## Running it
 
 Same toolchain as above:
@@ -498,6 +729,39 @@ was restored and re-checked at **11 verified, 0 errors**.
   refusal (shape-preservation) is pinned as a refusal, not a value
   claim. The nounset scan and array census are parameters.
 - Coverage sync registered (`verus-sync-coverage.sh:string_folds`).
+
+## typeset_attrs.rs — live attributes and the value bash stores (29)
+
+`transforms/typeset_attrs.rs`. `typeset -i n` / `-l s` are not one-shot: the
+attribute is LIVE, so every later assignment to that name is coerced. The
+model carries the attribute state machine (`scan` / `attrs_at`, order-aware)
+and proves the REWRITE LAW:
+
+- `rewrite_matches_bash` — for every attribute and every literal text, the
+  value the pass's expression produces equals the value bash stores. Discharged
+  by cases: canonical decimal folds to itself and bash's arithmetic agrees
+  (`int(arith(T))` otherwise, both reading a non-numeric word as 0), case
+  folding for `-l`/`-u`, and the `-il` composition where bash coerces to the
+  integer FIRST and folds the stored decimal (`fold_sees_the_coerced_value`).
+- `octal_fold_is_wrong` — `042` is 34 in bash arithmetic; a naive leading-zero
+  fold claims 42, so the pass's refusal is load-bearing (the model of the
+  refusal, `strict_dec`, is what makes the law true).
+- guards pinned: `-lu` recorded as nothing while either single fold would
+  change the value, `typeset -r` recording nothing, other names untouched, an
+  assignment BEFORE the declaration untouched, every declared name recorded.
+
+Hypotheses kept in-file: the backends' `arith` node implements bash's
+arithmetic for the full language, and `lc`/`uc` match bash per locale — the
+model only folds ASCII, exactly the pass's guard. Text is modelled as
+character codes; variables inside the arithmetic text are left to `arith`.
+The source's four state-machine tests are mirrored as `pin_*` proofs.
+
+Mutants, measured: order-ignoring `attrs_at` **28 verified, 1 error**; `-il`
+folded the wrong way **28 verified, 1 error**; no-attribute coercion **27
+verified, 2 errors**. Accepting a leading zero in `strict_dec` is caught one
+stage earlier — `arith("042") == 34` simplifies to `42 == 34` in a
+`compute_only` assert, so that mutant is rejected at simplification time and
+has no verified/error count.
 
 ## Running it
 
@@ -665,6 +929,39 @@ Flipping the upper arm to lowercase makes the same command report
   scope; wc stays in Isabelle. Non-ASCII case out of scope.
 - Coverage sync registered (`verus-sync-coverage.sh:textop_folds`).
 
+## typeset_attrs.rs — live attributes and the value bash stores (29)
+
+`transforms/typeset_attrs.rs`. `typeset -i n` / `-l s` are not one-shot: the
+attribute is LIVE, so every later assignment to that name is coerced. The
+model carries the attribute state machine (`scan` / `attrs_at`, order-aware)
+and proves the REWRITE LAW:
+
+- `rewrite_matches_bash` — for every attribute and every literal text, the
+  value the pass's expression produces equals the value bash stores. Discharged
+  by cases: canonical decimal folds to itself and bash's arithmetic agrees
+  (`int(arith(T))` otherwise, both reading a non-numeric word as 0), case
+  folding for `-l`/`-u`, and the `-il` composition where bash coerces to the
+  integer FIRST and folds the stored decimal (`fold_sees_the_coerced_value`).
+- `octal_fold_is_wrong` — `042` is 34 in bash arithmetic; a naive leading-zero
+  fold claims 42, so the pass's refusal is load-bearing (the model of the
+  refusal, `strict_dec`, is what makes the law true).
+- guards pinned: `-lu` recorded as nothing while either single fold would
+  change the value, `typeset -r` recording nothing, other names untouched, an
+  assignment BEFORE the declaration untouched, every declared name recorded.
+
+Hypotheses kept in-file: the backends' `arith` node implements bash's
+arithmetic for the full language, and `lc`/`uc` match bash per locale — the
+model only folds ASCII, exactly the pass's guard. Text is modelled as
+character codes; variables inside the arithmetic text are left to `arith`.
+The source's four state-machine tests are mirrored as `pin_*` proofs.
+
+Mutants, measured: order-ignoring `attrs_at` **28 verified, 1 error**; `-il`
+folded the wrong way **28 verified, 1 error**; no-attribute coercion **27
+verified, 2 errors**. Accepting a leading zero in `strict_dec` is caught one
+stage earlier — `arith("042") == 34` simplifies to `42 == 34` in a
+`compute_only` assert, so that mutant is rejected at simplification time and
+has no verified/error count.
+
 ## Running it (all six P6 files)
 
 Same toolchain as above, `--rlimit 40` each:
@@ -711,6 +1008,39 @@ caught my own error before Verus did.)
 - `&&`/`||` De Morgan, quadruple-unwinding traversal out of scope.
 - Coverage sync registered (`verus-sync-coverage.sh:not_folds`).
 
+## typeset_attrs.rs — live attributes and the value bash stores (29)
+
+`transforms/typeset_attrs.rs`. `typeset -i n` / `-l s` are not one-shot: the
+attribute is LIVE, so every later assignment to that name is coerced. The
+model carries the attribute state machine (`scan` / `attrs_at`, order-aware)
+and proves the REWRITE LAW:
+
+- `rewrite_matches_bash` — for every attribute and every literal text, the
+  value the pass's expression produces equals the value bash stores. Discharged
+  by cases: canonical decimal folds to itself and bash's arithmetic agrees
+  (`int(arith(T))` otherwise, both reading a non-numeric word as 0), case
+  folding for `-l`/`-u`, and the `-il` composition where bash coerces to the
+  integer FIRST and folds the stored decimal (`fold_sees_the_coerced_value`).
+- `octal_fold_is_wrong` — `042` is 34 in bash arithmetic; a naive leading-zero
+  fold claims 42, so the pass's refusal is load-bearing (the model of the
+  refusal, `strict_dec`, is what makes the law true).
+- guards pinned: `-lu` recorded as nothing while either single fold would
+  change the value, `typeset -r` recording nothing, other names untouched, an
+  assignment BEFORE the declaration untouched, every declared name recorded.
+
+Hypotheses kept in-file: the backends' `arith` node implements bash's
+arithmetic for the full language, and `lc`/`uc` match bash per locale — the
+model only folds ASCII, exactly the pass's guard. Text is modelled as
+character codes; variables inside the arithmetic text are left to `arith`.
+The source's four state-machine tests are mirrored as `pin_*` proofs.
+
+Mutants, measured: order-ignoring `attrs_at` **28 verified, 1 error**; `-il`
+folded the wrong way **28 verified, 1 error**; no-attribute coercion **27
+verified, 2 errors**. Accepting a leading zero in `strict_dec` is caught one
+stage earlier — `arith("042") == 34` simplifies to `42 == 34` in a
+`compute_only` assert, so that mutant is rejected at simplification time and
+has no verified/error count.
+
 ## Running it
 
 Same toolchain as the P6 files (`--rlimit 40`).
@@ -750,6 +1080,39 @@ verified, 2 errors**. Restored and re-checked at **14 verified,
   RHS, claimed affix predicates all refuse (pinned as refusals).
   Traversal out of scope.
 - Coverage sync registered (`verus-sync-coverage.sh:const_cmp_folds`).
+
+## typeset_attrs.rs — live attributes and the value bash stores (29)
+
+`transforms/typeset_attrs.rs`. `typeset -i n` / `-l s` are not one-shot: the
+attribute is LIVE, so every later assignment to that name is coerced. The
+model carries the attribute state machine (`scan` / `attrs_at`, order-aware)
+and proves the REWRITE LAW:
+
+- `rewrite_matches_bash` — for every attribute and every literal text, the
+  value the pass's expression produces equals the value bash stores. Discharged
+  by cases: canonical decimal folds to itself and bash's arithmetic agrees
+  (`int(arith(T))` otherwise, both reading a non-numeric word as 0), case
+  folding for `-l`/`-u`, and the `-il` composition where bash coerces to the
+  integer FIRST and folds the stored decimal (`fold_sees_the_coerced_value`).
+- `octal_fold_is_wrong` — `042` is 34 in bash arithmetic; a naive leading-zero
+  fold claims 42, so the pass's refusal is load-bearing (the model of the
+  refusal, `strict_dec`, is what makes the law true).
+- guards pinned: `-lu` recorded as nothing while either single fold would
+  change the value, `typeset -r` recording nothing, other names untouched, an
+  assignment BEFORE the declaration untouched, every declared name recorded.
+
+Hypotheses kept in-file: the backends' `arith` node implements bash's
+arithmetic for the full language, and `lc`/`uc` match bash per locale — the
+model only folds ASCII, exactly the pass's guard. Text is modelled as
+character codes; variables inside the arithmetic text are left to `arith`.
+The source's four state-machine tests are mirrored as `pin_*` proofs.
+
+Mutants, measured: order-ignoring `attrs_at` **28 verified, 1 error**; `-il`
+folded the wrong way **28 verified, 1 error**; no-attribute coercion **27
+verified, 2 errors**. Accepting a leading zero in `strict_dec` is caught one
+stage earlier — `arith("042") == 34` simplifies to `42 == 34` in a
+`compute_only` assert, so that mutant is rejected at simplification time and
+has no verified/error count.
 
 ## Running it
 
@@ -832,6 +1195,39 @@ The file was restored and re-checked at **53 verified, 0 errors**.
   argument, including the justifier-cleanliness clause the scan's
   check order implies.
 
+## typeset_attrs.rs — live attributes and the value bash stores (29)
+
+`transforms/typeset_attrs.rs`. `typeset -i n` / `-l s` are not one-shot: the
+attribute is LIVE, so every later assignment to that name is coerced. The
+model carries the attribute state machine (`scan` / `attrs_at`, order-aware)
+and proves the REWRITE LAW:
+
+- `rewrite_matches_bash` — for every attribute and every literal text, the
+  value the pass's expression produces equals the value bash stores. Discharged
+  by cases: canonical decimal folds to itself and bash's arithmetic agrees
+  (`int(arith(T))` otherwise, both reading a non-numeric word as 0), case
+  folding for `-l`/`-u`, and the `-il` composition where bash coerces to the
+  integer FIRST and folds the stored decimal (`fold_sees_the_coerced_value`).
+- `octal_fold_is_wrong` — `042` is 34 in bash arithmetic; a naive leading-zero
+  fold claims 42, so the pass's refusal is load-bearing (the model of the
+  refusal, `strict_dec`, is what makes the law true).
+- guards pinned: `-lu` recorded as nothing while either single fold would
+  change the value, `typeset -r` recording nothing, other names untouched, an
+  assignment BEFORE the declaration untouched, every declared name recorded.
+
+Hypotheses kept in-file: the backends' `arith` node implements bash's
+arithmetic for the full language, and `lc`/`uc` match bash per locale — the
+model only folds ASCII, exactly the pass's guard. Text is modelled as
+character codes; variables inside the arithmetic text are left to `arith`.
+The source's four state-machine tests are mirrored as `pin_*` proofs.
+
+Mutants, measured: order-ignoring `attrs_at` **28 verified, 1 error**; `-il`
+folded the wrong way **28 verified, 1 error**; no-attribute coercion **27
+verified, 2 errors**. Accepting a leading zero in `strict_dec` is caught one
+stage earlier — `arith("042") == 34` simplifies to `42 == 34` in a
+`compute_only` assert, so that mutant is rejected at simplification time and
+has no verified/error count.
+
 ## Running it
 
 Same toolchain as above (`--rlimit 80` for the shadow-induction
@@ -894,6 +1290,39 @@ re-checked at **10 verified, 0 errors**.
   in-module tests (15 tests, including traversal and report-shape
   coverage); no `pin_mirrors.rs` addition was needed — the
   dead_fn_elim precedent (already exactly mirrored).
+
+## typeset_attrs.rs — live attributes and the value bash stores (29)
+
+`transforms/typeset_attrs.rs`. `typeset -i n` / `-l s` are not one-shot: the
+attribute is LIVE, so every later assignment to that name is coerced. The
+model carries the attribute state machine (`scan` / `attrs_at`, order-aware)
+and proves the REWRITE LAW:
+
+- `rewrite_matches_bash` — for every attribute and every literal text, the
+  value the pass's expression produces equals the value bash stores. Discharged
+  by cases: canonical decimal folds to itself and bash's arithmetic agrees
+  (`int(arith(T))` otherwise, both reading a non-numeric word as 0), case
+  folding for `-l`/`-u`, and the `-il` composition where bash coerces to the
+  integer FIRST and folds the stored decimal (`fold_sees_the_coerced_value`).
+- `octal_fold_is_wrong` — `042` is 34 in bash arithmetic; a naive leading-zero
+  fold claims 42, so the pass's refusal is load-bearing (the model of the
+  refusal, `strict_dec`, is what makes the law true).
+- guards pinned: `-lu` recorded as nothing while either single fold would
+  change the value, `typeset -r` recording nothing, other names untouched, an
+  assignment BEFORE the declaration untouched, every declared name recorded.
+
+Hypotheses kept in-file: the backends' `arith` node implements bash's
+arithmetic for the full language, and `lc`/`uc` match bash per locale — the
+model only folds ASCII, exactly the pass's guard. Text is modelled as
+character codes; variables inside the arithmetic text are left to `arith`.
+The source's four state-machine tests are mirrored as `pin_*` proofs.
+
+Mutants, measured: order-ignoring `attrs_at` **28 verified, 1 error**; `-il`
+folded the wrong way **28 verified, 1 error**; no-attribute coercion **27
+verified, 2 errors**. Accepting a leading zero in `strict_dec` is caught one
+stage earlier — `arith("042") == 34` simplifies to `42 == 34` in a
+`compute_only` assert, so that mutant is rejected at simplification time and
+has no verified/error count.
 
 ## Running it
 
@@ -962,6 +1391,39 @@ The file was restored and re-checked at **35 verified, 0 errors**.
   the fuel-2 behavior pin is model-internal. No `pin_mirrors.rs`
   addition was needed — the dead_fn_elim precedent.
 
+## typeset_attrs.rs — live attributes and the value bash stores (29)
+
+`transforms/typeset_attrs.rs`. `typeset -i n` / `-l s` are not one-shot: the
+attribute is LIVE, so every later assignment to that name is coerced. The
+model carries the attribute state machine (`scan` / `attrs_at`, order-aware)
+and proves the REWRITE LAW:
+
+- `rewrite_matches_bash` — for every attribute and every literal text, the
+  value the pass's expression produces equals the value bash stores. Discharged
+  by cases: canonical decimal folds to itself and bash's arithmetic agrees
+  (`int(arith(T))` otherwise, both reading a non-numeric word as 0), case
+  folding for `-l`/`-u`, and the `-il` composition where bash coerces to the
+  integer FIRST and folds the stored decimal (`fold_sees_the_coerced_value`).
+- `octal_fold_is_wrong` — `042` is 34 in bash arithmetic; a naive leading-zero
+  fold claims 42, so the pass's refusal is load-bearing (the model of the
+  refusal, `strict_dec`, is what makes the law true).
+- guards pinned: `-lu` recorded as nothing while either single fold would
+  change the value, `typeset -r` recording nothing, other names untouched, an
+  assignment BEFORE the declaration untouched, every declared name recorded.
+
+Hypotheses kept in-file: the backends' `arith` node implements bash's
+arithmetic for the full language, and `lc`/`uc` match bash per locale — the
+model only folds ASCII, exactly the pass's guard. Text is modelled as
+character codes; variables inside the arithmetic text are left to `arith`.
+The source's four state-machine tests are mirrored as `pin_*` proofs.
+
+Mutants, measured: order-ignoring `attrs_at` **28 verified, 1 error**; `-il`
+folded the wrong way **28 verified, 1 error**; no-attribute coercion **27
+verified, 2 errors**. Accepting a leading zero in `strict_dec` is caught one
+stage earlier — `arith("042") == 34` simplifies to `42 == 34` in a
+`compute_only` assert, so that mutant is rejected at simplification time and
+has no verified/error count.
+
 ## Running it
 
 Same toolchain as above (`--rlimit 60` for the fuel/size induction):
@@ -1029,6 +1491,39 @@ obligation is not vacuous. The file was restored and re-checked at
   recorded, not claimed).
 - Coverage sync registered (`verus-sync-coverage.sh:elim_trio`).
 
+## typeset_attrs.rs — live attributes and the value bash stores (29)
+
+`transforms/typeset_attrs.rs`. `typeset -i n` / `-l s` are not one-shot: the
+attribute is LIVE, so every later assignment to that name is coerced. The
+model carries the attribute state machine (`scan` / `attrs_at`, order-aware)
+and proves the REWRITE LAW:
+
+- `rewrite_matches_bash` — for every attribute and every literal text, the
+  value the pass's expression produces equals the value bash stores. Discharged
+  by cases: canonical decimal folds to itself and bash's arithmetic agrees
+  (`int(arith(T))` otherwise, both reading a non-numeric word as 0), case
+  folding for `-l`/`-u`, and the `-il` composition where bash coerces to the
+  integer FIRST and folds the stored decimal (`fold_sees_the_coerced_value`).
+- `octal_fold_is_wrong` — `042` is 34 in bash arithmetic; a naive leading-zero
+  fold claims 42, so the pass's refusal is load-bearing (the model of the
+  refusal, `strict_dec`, is what makes the law true).
+- guards pinned: `-lu` recorded as nothing while either single fold would
+  change the value, `typeset -r` recording nothing, other names untouched, an
+  assignment BEFORE the declaration untouched, every declared name recorded.
+
+Hypotheses kept in-file: the backends' `arith` node implements bash's
+arithmetic for the full language, and `lc`/`uc` match bash per locale — the
+model only folds ASCII, exactly the pass's guard. Text is modelled as
+character codes; variables inside the arithmetic text are left to `arith`.
+The source's four state-machine tests are mirrored as `pin_*` proofs.
+
+Mutants, measured: order-ignoring `attrs_at` **28 verified, 1 error**; `-il`
+folded the wrong way **28 verified, 1 error**; no-attribute coercion **27
+verified, 2 errors**. Accepting a leading zero in `strict_dec` is caught one
+stage earlier — `arith("042") == 34` simplifies to `42 == 34` in a
+`compute_only` assert, so that mutant is rejected at simplification time and
+has no verified/error count.
+
 ## Running it
 
 Same toolchain as the P6/P7/P8 files (`--rlimit 40`):
@@ -1077,6 +1572,39 @@ array-len-fold offset-guard shape.)
   FIRES on the 15 synthetic unit inputs (mechanics verified live, the
   test_folds precedent: 0/562 + synthetic firing witness).
 - Coverage sync registered (`verus-sync-coverage.sh:slice_identity`).
+
+## typeset_attrs.rs — live attributes and the value bash stores (29)
+
+`transforms/typeset_attrs.rs`. `typeset -i n` / `-l s` are not one-shot: the
+attribute is LIVE, so every later assignment to that name is coerced. The
+model carries the attribute state machine (`scan` / `attrs_at`, order-aware)
+and proves the REWRITE LAW:
+
+- `rewrite_matches_bash` — for every attribute and every literal text, the
+  value the pass's expression produces equals the value bash stores. Discharged
+  by cases: canonical decimal folds to itself and bash's arithmetic agrees
+  (`int(arith(T))` otherwise, both reading a non-numeric word as 0), case
+  folding for `-l`/`-u`, and the `-il` composition where bash coerces to the
+  integer FIRST and folds the stored decimal (`fold_sees_the_coerced_value`).
+- `octal_fold_is_wrong` — `042` is 34 in bash arithmetic; a naive leading-zero
+  fold claims 42, so the pass's refusal is load-bearing (the model of the
+  refusal, `strict_dec`, is what makes the law true).
+- guards pinned: `-lu` recorded as nothing while either single fold would
+  change the value, `typeset -r` recording nothing, other names untouched, an
+  assignment BEFORE the declaration untouched, every declared name recorded.
+
+Hypotheses kept in-file: the backends' `arith` node implements bash's
+arithmetic for the full language, and `lc`/`uc` match bash per locale — the
+model only folds ASCII, exactly the pass's guard. Text is modelled as
+character codes; variables inside the arithmetic text are left to `arith`.
+The source's four state-machine tests are mirrored as `pin_*` proofs.
+
+Mutants, measured: order-ignoring `attrs_at` **28 verified, 1 error**; `-il`
+folded the wrong way **28 verified, 1 error**; no-attribute coercion **27
+verified, 2 errors**. Accepting a leading zero in `strict_dec` is caught one
+stage earlier — `arith("042") == 34` simplifies to `42 == 34` in a
+`compute_only` assert, so that mutant is rejected at simplification time and
+has no verified/error count.
 
 ## Running it
 
@@ -1131,6 +1659,39 @@ command report **27 verified, 2 errors**. Restored and re-checked at
   it; measured, not assumed).
 - Coverage sync registered (`verus-sync-coverage.sh:case_lowering`).
 
+## typeset_attrs.rs — live attributes and the value bash stores (29)
+
+`transforms/typeset_attrs.rs`. `typeset -i n` / `-l s` are not one-shot: the
+attribute is LIVE, so every later assignment to that name is coerced. The
+model carries the attribute state machine (`scan` / `attrs_at`, order-aware)
+and proves the REWRITE LAW:
+
+- `rewrite_matches_bash` — for every attribute and every literal text, the
+  value the pass's expression produces equals the value bash stores. Discharged
+  by cases: canonical decimal folds to itself and bash's arithmetic agrees
+  (`int(arith(T))` otherwise, both reading a non-numeric word as 0), case
+  folding for `-l`/`-u`, and the `-il` composition where bash coerces to the
+  integer FIRST and folds the stored decimal (`fold_sees_the_coerced_value`).
+- `octal_fold_is_wrong` — `042` is 34 in bash arithmetic; a naive leading-zero
+  fold claims 42, so the pass's refusal is load-bearing (the model of the
+  refusal, `strict_dec`, is what makes the law true).
+- guards pinned: `-lu` recorded as nothing while either single fold would
+  change the value, `typeset -r` recording nothing, other names untouched, an
+  assignment BEFORE the declaration untouched, every declared name recorded.
+
+Hypotheses kept in-file: the backends' `arith` node implements bash's
+arithmetic for the full language, and `lc`/`uc` match bash per locale — the
+model only folds ASCII, exactly the pass's guard. Text is modelled as
+character codes; variables inside the arithmetic text are left to `arith`.
+The source's four state-machine tests are mirrored as `pin_*` proofs.
+
+Mutants, measured: order-ignoring `attrs_at` **28 verified, 1 error**; `-il`
+folded the wrong way **28 verified, 1 error**; no-attribute coercion **27
+verified, 2 errors**. Accepting a leading zero in `strict_dec` is caught one
+stage earlier — `arith("042") == 34` simplifies to `42 == 34` in a
+`compute_only` assert, so that mutant is rejected at simplification time and
+has no verified/error count.
+
 ## Running it
 
 Same toolchain as the P6/P7/P8 files (`--rlimit 40`).
@@ -1174,6 +1735,39 @@ forgetting `el2`) makes the same command report **18 verified,
 - Firing: 2/563 (`090_nested_if_else.sh`,
   `param-expand-default-operator.sh`) + the 4 synthetic unit inputs.
 - Coverage sync registered (`verus-sync-coverage.sh:elseif_flatten`).
+
+## typeset_attrs.rs — live attributes and the value bash stores (29)
+
+`transforms/typeset_attrs.rs`. `typeset -i n` / `-l s` are not one-shot: the
+attribute is LIVE, so every later assignment to that name is coerced. The
+model carries the attribute state machine (`scan` / `attrs_at`, order-aware)
+and proves the REWRITE LAW:
+
+- `rewrite_matches_bash` — for every attribute and every literal text, the
+  value the pass's expression produces equals the value bash stores. Discharged
+  by cases: canonical decimal folds to itself and bash's arithmetic agrees
+  (`int(arith(T))` otherwise, both reading a non-numeric word as 0), case
+  folding for `-l`/`-u`, and the `-il` composition where bash coerces to the
+  integer FIRST and folds the stored decimal (`fold_sees_the_coerced_value`).
+- `octal_fold_is_wrong` — `042` is 34 in bash arithmetic; a naive leading-zero
+  fold claims 42, so the pass's refusal is load-bearing (the model of the
+  refusal, `strict_dec`, is what makes the law true).
+- guards pinned: `-lu` recorded as nothing while either single fold would
+  change the value, `typeset -r` recording nothing, other names untouched, an
+  assignment BEFORE the declaration untouched, every declared name recorded.
+
+Hypotheses kept in-file: the backends' `arith` node implements bash's
+arithmetic for the full language, and `lc`/`uc` match bash per locale — the
+model only folds ASCII, exactly the pass's guard. Text is modelled as
+character codes; variables inside the arithmetic text are left to `arith`.
+The source's four state-machine tests are mirrored as `pin_*` proofs.
+
+Mutants, measured: order-ignoring `attrs_at` **28 verified, 1 error**; `-il`
+folded the wrong way **28 verified, 1 error**; no-attribute coercion **27
+verified, 2 errors**. Accepting a leading zero in `strict_dec` is caught one
+stage earlier — `arith("042") == 34` simplifies to `42 == 34` in a
+`compute_only` assert, so that mutant is rejected at simplification time and
+has no verified/error count.
 
 ## Running it
 
@@ -1222,6 +1816,39 @@ Restored and re-checked at **11 verified, 0 errors**.
   live, the test_folds precedent).
 - Coverage sync registered (`verus-sync-coverage.sh:seq_range`).
 
+## typeset_attrs.rs — live attributes and the value bash stores (29)
+
+`transforms/typeset_attrs.rs`. `typeset -i n` / `-l s` are not one-shot: the
+attribute is LIVE, so every later assignment to that name is coerced. The
+model carries the attribute state machine (`scan` / `attrs_at`, order-aware)
+and proves the REWRITE LAW:
+
+- `rewrite_matches_bash` — for every attribute and every literal text, the
+  value the pass's expression produces equals the value bash stores. Discharged
+  by cases: canonical decimal folds to itself and bash's arithmetic agrees
+  (`int(arith(T))` otherwise, both reading a non-numeric word as 0), case
+  folding for `-l`/`-u`, and the `-il` composition where bash coerces to the
+  integer FIRST and folds the stored decimal (`fold_sees_the_coerced_value`).
+- `octal_fold_is_wrong` — `042` is 34 in bash arithmetic; a naive leading-zero
+  fold claims 42, so the pass's refusal is load-bearing (the model of the
+  refusal, `strict_dec`, is what makes the law true).
+- guards pinned: `-lu` recorded as nothing while either single fold would
+  change the value, `typeset -r` recording nothing, other names untouched, an
+  assignment BEFORE the declaration untouched, every declared name recorded.
+
+Hypotheses kept in-file: the backends' `arith` node implements bash's
+arithmetic for the full language, and `lc`/`uc` match bash per locale — the
+model only folds ASCII, exactly the pass's guard. Text is modelled as
+character codes; variables inside the arithmetic text are left to `arith`.
+The source's four state-machine tests are mirrored as `pin_*` proofs.
+
+Mutants, measured: order-ignoring `attrs_at` **28 verified, 1 error**; `-il`
+folded the wrong way **28 verified, 1 error**; no-attribute coercion **27
+verified, 2 errors**. Accepting a leading zero in `strict_dec` is caught one
+stage earlier — `arith("042") == 34` simplifies to `42 == 34` in a
+`compute_only` assert, so that mutant is rejected at simplification time and
+has no verified/error count.
+
 ## Running it
 
 Same toolchain as the P6/P7/P8 files (`--rlimit 40`).
@@ -1269,6 +1896,39 @@ at **9 verified, 0 errors**.
   the SH2 registry) — 0/563 in-registry by construction; fires on
   C-frontend input.
 - Coverage sync registered (`verus-sync-coverage.sh:ternary_desugar`).
+
+## typeset_attrs.rs — live attributes and the value bash stores (29)
+
+`transforms/typeset_attrs.rs`. `typeset -i n` / `-l s` are not one-shot: the
+attribute is LIVE, so every later assignment to that name is coerced. The
+model carries the attribute state machine (`scan` / `attrs_at`, order-aware)
+and proves the REWRITE LAW:
+
+- `rewrite_matches_bash` — for every attribute and every literal text, the
+  value the pass's expression produces equals the value bash stores. Discharged
+  by cases: canonical decimal folds to itself and bash's arithmetic agrees
+  (`int(arith(T))` otherwise, both reading a non-numeric word as 0), case
+  folding for `-l`/`-u`, and the `-il` composition where bash coerces to the
+  integer FIRST and folds the stored decimal (`fold_sees_the_coerced_value`).
+- `octal_fold_is_wrong` — `042` is 34 in bash arithmetic; a naive leading-zero
+  fold claims 42, so the pass's refusal is load-bearing (the model of the
+  refusal, `strict_dec`, is what makes the law true).
+- guards pinned: `-lu` recorded as nothing while either single fold would
+  change the value, `typeset -r` recording nothing, other names untouched, an
+  assignment BEFORE the declaration untouched, every declared name recorded.
+
+Hypotheses kept in-file: the backends' `arith` node implements bash's
+arithmetic for the full language, and `lc`/`uc` match bash per locale — the
+model only folds ASCII, exactly the pass's guard. Text is modelled as
+character codes; variables inside the arithmetic text are left to `arith`.
+The source's four state-machine tests are mirrored as `pin_*` proofs.
+
+Mutants, measured: order-ignoring `attrs_at` **28 verified, 1 error**; `-il`
+folded the wrong way **28 verified, 1 error**; no-attribute coercion **27
+verified, 2 errors**. Accepting a leading zero in `strict_dec` is caught one
+stage earlier — `arith("042") == 34` simplifies to `42 == 34` in a
+`compute_only` assert, so that mutant is rejected at simplification time and
+has no verified/error count.
 
 ## Running it
 
@@ -1486,6 +2146,39 @@ splitting is bash's contract; the IR has no Close mode so `2>&-`/`2>-`
 render identically (`n2` pin). Gate-registered (`c_redirect.rs:46:40`);
 no sync baseline — the pin↔probe mapping (`/tmp/redprobe`) is its
 living tie.
+
+## typeset_attrs.rs — live attributes and the value bash stores (29)
+
+`transforms/typeset_attrs.rs`. `typeset -i n` / `-l s` are not one-shot: the
+attribute is LIVE, so every later assignment to that name is coerced. The
+model carries the attribute state machine (`scan` / `attrs_at`, order-aware)
+and proves the REWRITE LAW:
+
+- `rewrite_matches_bash` — for every attribute and every literal text, the
+  value the pass's expression produces equals the value bash stores. Discharged
+  by cases: canonical decimal folds to itself and bash's arithmetic agrees
+  (`int(arith(T))` otherwise, both reading a non-numeric word as 0), case
+  folding for `-l`/`-u`, and the `-il` composition where bash coerces to the
+  integer FIRST and folds the stored decimal (`fold_sees_the_coerced_value`).
+- `octal_fold_is_wrong` — `042` is 34 in bash arithmetic; a naive leading-zero
+  fold claims 42, so the pass's refusal is load-bearing (the model of the
+  refusal, `strict_dec`, is what makes the law true).
+- guards pinned: `-lu` recorded as nothing while either single fold would
+  change the value, `typeset -r` recording nothing, other names untouched, an
+  assignment BEFORE the declaration untouched, every declared name recorded.
+
+Hypotheses kept in-file: the backends' `arith` node implements bash's
+arithmetic for the full language, and `lc`/`uc` match bash per locale — the
+model only folds ASCII, exactly the pass's guard. Text is modelled as
+character codes; variables inside the arithmetic text are left to `arith`.
+The source's four state-machine tests are mirrored as `pin_*` proofs.
+
+Mutants, measured: order-ignoring `attrs_at` **28 verified, 1 error**; `-il`
+folded the wrong way **28 verified, 1 error**; no-attribute coercion **27
+verified, 2 errors**. Accepting a leading zero in `strict_dec` is caught one
+stage earlier — `arith("042") == 34` simplifies to `42 == 34` in a
+`compute_only` assert, so that mutant is rejected at simplification time and
+has no verified/error count.
 
 ## Running it
 
@@ -1756,6 +2449,39 @@ forgetting the `Nested` recursion arm is **11 verified, 1 error**
 matches the external binary — is the namespace contract, an assumption the
 model does not discharge.
 
+## typeset_attrs.rs — live attributes and the value bash stores (29)
+
+`transforms/typeset_attrs.rs`. `typeset -i n` / `-l s` are not one-shot: the
+attribute is LIVE, so every later assignment to that name is coerced. The
+model carries the attribute state machine (`scan` / `attrs_at`, order-aware)
+and proves the REWRITE LAW:
+
+- `rewrite_matches_bash` — for every attribute and every literal text, the
+  value the pass's expression produces equals the value bash stores. Discharged
+  by cases: canonical decimal folds to itself and bash's arithmetic agrees
+  (`int(arith(T))` otherwise, both reading a non-numeric word as 0), case
+  folding for `-l`/`-u`, and the `-il` composition where bash coerces to the
+  integer FIRST and folds the stored decimal (`fold_sees_the_coerced_value`).
+- `octal_fold_is_wrong` — `042` is 34 in bash arithmetic; a naive leading-zero
+  fold claims 42, so the pass's refusal is load-bearing (the model of the
+  refusal, `strict_dec`, is what makes the law true).
+- guards pinned: `-lu` recorded as nothing while either single fold would
+  change the value, `typeset -r` recording nothing, other names untouched, an
+  assignment BEFORE the declaration untouched, every declared name recorded.
+
+Hypotheses kept in-file: the backends' `arith` node implements bash's
+arithmetic for the full language, and `lc`/`uc` match bash per locale — the
+model only folds ASCII, exactly the pass's guard. Text is modelled as
+character codes; variables inside the arithmetic text are left to `arith`.
+The source's four state-machine tests are mirrored as `pin_*` proofs.
+
+Mutants, measured: order-ignoring `attrs_at` **28 verified, 1 error**; `-il`
+folded the wrong way **28 verified, 1 error**; no-attribute coercion **27
+verified, 2 errors**. Accepting a leading zero in `strict_dec` is caught one
+stage earlier — `arith("042") == 34` simplifies to `42 == 34` in a
+`compute_only` assert, so that mutant is rejected at simplification time and
+has no verified/error count.
+
 ## Running it
 
 Same toolchain as above (`--rlimit 40`).
@@ -1962,6 +2688,39 @@ forgetting the `Nested` recursion arm is **11 verified, 1 error**
 matches the external binary — is the namespace contract, an assumption the
 model does not discharge.
 
+## typeset_attrs.rs — live attributes and the value bash stores (29)
+
+`transforms/typeset_attrs.rs`. `typeset -i n` / `-l s` are not one-shot: the
+attribute is LIVE, so every later assignment to that name is coerced. The
+model carries the attribute state machine (`scan` / `attrs_at`, order-aware)
+and proves the REWRITE LAW:
+
+- `rewrite_matches_bash` — for every attribute and every literal text, the
+  value the pass's expression produces equals the value bash stores. Discharged
+  by cases: canonical decimal folds to itself and bash's arithmetic agrees
+  (`int(arith(T))` otherwise, both reading a non-numeric word as 0), case
+  folding for `-l`/`-u`, and the `-il` composition where bash coerces to the
+  integer FIRST and folds the stored decimal (`fold_sees_the_coerced_value`).
+- `octal_fold_is_wrong` — `042` is 34 in bash arithmetic; a naive leading-zero
+  fold claims 42, so the pass's refusal is load-bearing (the model of the
+  refusal, `strict_dec`, is what makes the law true).
+- guards pinned: `-lu` recorded as nothing while either single fold would
+  change the value, `typeset -r` recording nothing, other names untouched, an
+  assignment BEFORE the declaration untouched, every declared name recorded.
+
+Hypotheses kept in-file: the backends' `arith` node implements bash's
+arithmetic for the full language, and `lc`/`uc` match bash per locale — the
+model only folds ASCII, exactly the pass's guard. Text is modelled as
+character codes; variables inside the arithmetic text are left to `arith`.
+The source's four state-machine tests are mirrored as `pin_*` proofs.
+
+Mutants, measured: order-ignoring `attrs_at` **28 verified, 1 error**; `-il`
+folded the wrong way **28 verified, 1 error**; no-attribute coercion **27
+verified, 2 errors**. Accepting a leading zero in `strict_dec` is caught one
+stage earlier — `arith("042") == 34` simplifies to `42 == 34` in a
+`compute_only` assert, so that mutant is rejected at simplification time and
+has no verified/error count.
+
 ## Running it
 
 Same toolchain as above (`--rlimit 40`).
@@ -2154,6 +2913,39 @@ forgetting the `Nested` recursion arm is **11 verified, 1 error**
 (completeness). Stated in-file: the runtime half — a table name's native op
 matches the external binary — is the namespace contract, an assumption the
 model does not discharge.
+
+## typeset_attrs.rs — live attributes and the value bash stores (29)
+
+`transforms/typeset_attrs.rs`. `typeset -i n` / `-l s` are not one-shot: the
+attribute is LIVE, so every later assignment to that name is coerced. The
+model carries the attribute state machine (`scan` / `attrs_at`, order-aware)
+and proves the REWRITE LAW:
+
+- `rewrite_matches_bash` — for every attribute and every literal text, the
+  value the pass's expression produces equals the value bash stores. Discharged
+  by cases: canonical decimal folds to itself and bash's arithmetic agrees
+  (`int(arith(T))` otherwise, both reading a non-numeric word as 0), case
+  folding for `-l`/`-u`, and the `-il` composition where bash coerces to the
+  integer FIRST and folds the stored decimal (`fold_sees_the_coerced_value`).
+- `octal_fold_is_wrong` — `042` is 34 in bash arithmetic; a naive leading-zero
+  fold claims 42, so the pass's refusal is load-bearing (the model of the
+  refusal, `strict_dec`, is what makes the law true).
+- guards pinned: `-lu` recorded as nothing while either single fold would
+  change the value, `typeset -r` recording nothing, other names untouched, an
+  assignment BEFORE the declaration untouched, every declared name recorded.
+
+Hypotheses kept in-file: the backends' `arith` node implements bash's
+arithmetic for the full language, and `lc`/`uc` match bash per locale — the
+model only folds ASCII, exactly the pass's guard. Text is modelled as
+character codes; variables inside the arithmetic text are left to `arith`.
+The source's four state-machine tests are mirrored as `pin_*` proofs.
+
+Mutants, measured: order-ignoring `attrs_at` **28 verified, 1 error**; `-il`
+folded the wrong way **28 verified, 1 error**; no-attribute coercion **27
+verified, 2 errors**. Accepting a leading zero in `strict_dec` is caught one
+stage earlier — `arith("042") == 34` simplifies to `42 == 34` in a
+`compute_only` assert, so that mutant is rejected at simplification time and
+has no verified/error count.
 
 ## Running it
 
