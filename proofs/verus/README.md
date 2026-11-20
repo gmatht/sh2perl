@@ -1680,6 +1680,36 @@ Scope: the pair shape only — indexed assignment targets, `asm`, and the
 expression language rather than assumed; nested-body recursion is the same
 local step at each depth.
 
+
+## definedor_hoist.rs — one evaluation for `${a:-b}` (9)
+
+`shir_passes/definedor_hoist.rs` (the FIRST model of a `shir_passes/` pass
+that is not also a `transforms/` module). `x = ${a:-b}` arrives as
+`Assign(x, DefinedOr { expr: a, default: b })`, and a renderer with no
+`DefinedOr` case emits the subject twice — once for the test, once for the
+value — so `$(cmd)` or `$((i++))` runs twice. The pass binds it first:
+
+    __sh2_dor_0 = a;
+    x = ${__sh2_dor_0:-b};
+
+Proved (`hoist_matches_bash`): the hoisted pair writes the same `x` as
+bash's one-shot `${a:-b}` and performs the same number of evaluations
+(`temp_test_agrees` is the hinge: the temp holds exactly the value the
+test saw, so the second line's `:-` decision agrees with the first line's
+read). The temp is the only extra binding, and that is stated in the
+theorem rather than hidden: `[t] == eval(a)` and every other name
+(`y != t, y != x`) is unchanged.
+
+`naive_renderer_is_the_bug` keeps the disagreement as an obligation: the
+double-emitting renderer performs 2 evaluations where bash performs 1, with
+the same value — the exact cost the pass removes. Mutant, measured: binding
+the temp to `0` instead of the subject reports **7 verified, 2 errors**.
+
+Scope, stated in-file: freshness of `__sh2_dor_<n>` is a HYPOTHESIS — the
+numbering makes a collision unlikely, but a user variable with exactly that
+name would collide and the pass does not check. The `Declare`-init and
+leaf-subject refusals are pinned by predicate/test, not re-derived per node.
+
 ## Running it
 
 Same toolchain as above (`--rlimit 40`).
@@ -1810,6 +1840,36 @@ Scope: the pair shape only — indexed assignment targets, `asm`, and the
 expression language rather than assumed; nested-body recursion is the same
 local step at each depth.
 
+
+## definedor_hoist.rs — one evaluation for `${a:-b}` (9)
+
+`shir_passes/definedor_hoist.rs` (the FIRST model of a `shir_passes/` pass
+that is not also a `transforms/` module). `x = ${a:-b}` arrives as
+`Assign(x, DefinedOr { expr: a, default: b })`, and a renderer with no
+`DefinedOr` case emits the subject twice — once for the test, once for the
+value — so `$(cmd)` or `$((i++))` runs twice. The pass binds it first:
+
+    __sh2_dor_0 = a;
+    x = ${__sh2_dor_0:-b};
+
+Proved (`hoist_matches_bash`): the hoisted pair writes the same `x` as
+bash's one-shot `${a:-b}` and performs the same number of evaluations
+(`temp_test_agrees` is the hinge: the temp holds exactly the value the
+test saw, so the second line's `:-` decision agrees with the first line's
+read). The temp is the only extra binding, and that is stated in the
+theorem rather than hidden: `[t] == eval(a)` and every other name
+(`y != t, y != x`) is unchanged.
+
+`naive_renderer_is_the_bug` keeps the disagreement as an obligation: the
+double-emitting renderer performs 2 evaluations where bash performs 1, with
+the same value — the exact cost the pass removes. Mutant, measured: binding
+the temp to `0` instead of the subject reports **7 verified, 2 errors**.
+
+Scope, stated in-file: freshness of `__sh2_dor_<n>` is a HYPOTHESIS — the
+numbering makes a collision unlikely, but a user variable with exactly that
+name would collide and the pass does not check. The `Declare`-init and
+leaf-subject refusals are pinned by predicate/test, not re-derived per node.
+
 ## Running it
 
 Same toolchain as above (`--rlimit 40`).
@@ -1926,6 +1986,36 @@ Scope: the pair shape only — indexed assignment targets, `asm`, and the
 `pure` predicate's call/capture exclusions are absent from the model's
 expression language rather than assumed; nested-body recursion is the same
 local step at each depth.
+
+
+## definedor_hoist.rs — one evaluation for `${a:-b}` (9)
+
+`shir_passes/definedor_hoist.rs` (the FIRST model of a `shir_passes/` pass
+that is not also a `transforms/` module). `x = ${a:-b}` arrives as
+`Assign(x, DefinedOr { expr: a, default: b })`, and a renderer with no
+`DefinedOr` case emits the subject twice — once for the test, once for the
+value — so `$(cmd)` or `$((i++))` runs twice. The pass binds it first:
+
+    __sh2_dor_0 = a;
+    x = ${__sh2_dor_0:-b};
+
+Proved (`hoist_matches_bash`): the hoisted pair writes the same `x` as
+bash's one-shot `${a:-b}` and performs the same number of evaluations
+(`temp_test_agrees` is the hinge: the temp holds exactly the value the
+test saw, so the second line's `:-` decision agrees with the first line's
+read). The temp is the only extra binding, and that is stated in the
+theorem rather than hidden: `[t] == eval(a)` and every other name
+(`y != t, y != x`) is unchanged.
+
+`naive_renderer_is_the_bug` keeps the disagreement as an obligation: the
+double-emitting renderer performs 2 evaluations where bash performs 1, with
+the same value — the exact cost the pass removes. Mutant, measured: binding
+the temp to `0` instead of the subject reports **7 verified, 2 errors**.
+
+Scope, stated in-file: freshness of `__sh2_dor_<n>` is a HYPOTHESIS — the
+numbering makes a collision unlikely, but a user variable with exactly that
+name would collide and the pass does not check. The `Declare`-init and
+leaf-subject refusals are pinned by predicate/test, not re-derived per node.
 
 ## Running it
 
