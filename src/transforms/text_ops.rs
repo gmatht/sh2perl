@@ -1089,9 +1089,8 @@ fn parse_field_spec(spec: &str) -> Vec<FieldRange> {
 /// `\n`, `\012` and `[=c=]` have meanings this expansion does not own, so
 /// the original command is kept (exact everywhere) rather than guessed.
 fn expand_tr_set(s: &str) -> Option<String> {
-    if s.contains('\\') {
-        return None;
-    }
+    let decoded = decode_tr_escapes(s)?;
+    let s = decoded.as_str();
     let cs: Vec<char> = s.chars().collect();
     let mut out = String::new();
     let mut i = 0;
@@ -1121,6 +1120,33 @@ fn expand_tr_set(s: &str) -> Option<String> {
             out.push(cs[i]);
             i += 1;
         }
+    }
+    Some(out)
+}
+
+/// Decode the ESCAPE sequences POSIX `tr` defines for a set: `\n \t \r \a
+/// \b \f \v \\`. Anything else (octal `\101`, `\0`, a trailing `\`) REFUSES:
+/// the node's `from`/`to` are MEMBER CHARACTERS, so an escape this function
+/// cannot decode exactly must keep the runtime path instead of guessing.
+fn decode_tr_escapes(s: &str) -> Option<String> {
+    let mut out = String::new();
+    let mut it = s.chars();
+    while let Some(c) = it.next() {
+        if c != '\\' {
+            out.push(c);
+            continue;
+        }
+        out.push(match it.next()? {
+            'n' => '\n',
+            't' => '\t',
+            'r' => '\r',
+            'a' => '\u{7}',
+            'b' => '\u{8}',
+            'f' => '\u{c}',
+            'v' => '\u{b}',
+            '\\' => '\\',
+            _ => return None,
+        });
     }
     Some(out)
 }
@@ -2110,6 +2136,17 @@ mod tests {
             panic!("unexpected statement block shape: {stmt:?}");
         };
         assert!(n.as_any().downcast_ref::<RegCount>().is_some());
+    }
+
+    #[test]
+    fn tr_escapes_decode_before_the_node_is_built() {
+        assert_eq!(decode_tr_escapes(" \\n").as_deref(), Some(" \n"));
+        assert_eq!(decode_tr_escapes("a\\tb").as_deref(), Some("a\tb"));
+        assert_eq!(decode_tr_escapes("a\\\\b").as_deref(), Some("a\\b"));
+        // octal / unknown escapes refuse: the node's sets are MEMBERS, so an
+        // escape this cannot decode exactly must keep the runtime path.
+        assert!(decode_tr_escapes("\\101").is_none());
+        assert!(decode_tr_escapes("a\\").is_none());
     }
 
     #[test]
