@@ -176,34 +176,53 @@ pub open spec fn flags(ws: Seq<W>) -> (int, bool, bool) {
 
 // ---------- the shared `-e` table ----------
 
-pub open spec fn decode(s: Seq<int>) -> Seq<int>
+// Returns the decoded text AND `cut`: true when a `\c` ended the payload.
+// bash's `\c` stops ALL further output, so the CALLER's trailing newline is
+// part of the same decision — this is what `fold` and `echo_bytes` share.
+pub open spec fn decode_cut(s: Seq<int>) -> (Seq<int>, bool)
     decreases s.len(),
 {
     if s.len() == 0 {
-        Seq::empty()
+        (Seq::empty(), false)
     } else if s[0] == 92 && s.len() >= 2 {
         if s[1] == 110 {
             // \n
-            ch_nl() + decode(s.subrange(2, s.len() as int))
+            let r = decode_cut(s.subrange(2, s.len() as int));
+            (ch_nl() + r.0, r.1)
         } else if s[1] == 116 {
             // \t
-            seq![9] + decode(s.subrange(2, s.len() as int))
+            let r = decode_cut(s.subrange(2, s.len() as int));
+            (seq![9] + r.0, r.1)
         } else if s[1] == 114 {
             // \r
-            seq![13] + decode(s.subrange(2, s.len() as int))
+            let r = decode_cut(s.subrange(2, s.len() as int));
+            (seq![13] + r.0, r.1)
         } else if s[1] == 92 {
             // \\
-            ch_bs() + decode(s.subrange(2, s.len() as int))
+            let r = decode_cut(s.subrange(2, s.len() as int));
+            (ch_bs() + r.0, r.1)
         } else if s[1] == 99 {
-            // \c truncates the rest of the output
-            Seq::empty()
+            // \c truncates the rest of the output AND the newline
+            (Seq::empty(), true)
         } else {
             // an unknown escape keeps its backslash
-            seq![92, s[1]] + decode(s.subrange(2, s.len() as int))
+            let r = decode_cut(s.subrange(2, s.len() as int));
+            (seq![92, s[1]] + r.0, r.1)
         }
     } else {
-        seq![s[0]] + decode(s.subrange(1, s.len() as int))
+        let r = decode_cut(s.subrange(1, s.len() as int));
+        (seq![s[0]] + r.0, r.1)
     }
+}
+
+// The text alone (the escape-table pins read this).
+pub open spec fn decode(s: Seq<int>) -> Seq<int> {
+    decode_cut(s).0
+}
+
+// Did a `\c` stop the output?
+pub open spec fn cut(s: Seq<int>) -> bool {
+    decode_cut(s).1
 }
 
 // ---------- joining ----------
@@ -228,16 +247,17 @@ pub enum S {
 }
 
 // bash's `echo`: leading flags, the remaining words joined by one space,
-// backslash decoding when `-e` is on, then a newline unless `-n`.
+// backslash decoding when `-e` is on, then a newline unless `-n` OR a `\c`
+// already stopped the output (`echo -e 'a\cb'` prints `a` alone).
 pub open spec fn echo_bytes(ws: Seq<W>, env: Map<nat, Seq<int>>) -> Seq<int> {
     let f = flags(ws);
     let body = join(texts(ws, env).subrange(f.0, ws.len() as int));
-    let t = if f.2 {
-        decode(body)
+    let d = if f.2 {
+        decode_cut(body)
     } else {
-        body
+        (body, false)
     };
-    t + (if f.1 {
+    d.0 + (if f.1 && !d.1 {
         ch_nl()
     } else {
         Seq::empty()
@@ -245,17 +265,18 @@ pub open spec fn echo_bytes(ws: Seq<W>, env: Map<nat, Seq<int>>) -> Seq<int> {
 }
 
 // The fold: a constant echo becomes the native Output node. Its text holds the
-// joined (decoded) words and NOT the newline, which the flag carries.
+// joined (decoded) words and NOT the newline, which the flag carries — and a
+// `\c` in the text clears that flag, exactly as it stops bash's newline.
 pub open spec fn fold(ws: Seq<W>) -> S {
     if all_lit(ws) {
         let f = flags(ws);
         let body = join(lit_texts(ws).subrange(f.0, ws.len() as int));
-        let t = if f.2 {
-            decode(body)
+        let d = if f.2 {
+            decode_cut(body)
         } else {
-            body
+            (body, false)
         };
-        S::Out(t, f.1)
+        S::Out(d.0, f.1 && !d.1)
     } else {
         S::Echo(ws)
     }
@@ -320,6 +341,10 @@ proof fn fold_preserves_output(ws: Seq<W>, env: Map<nat, Seq<int>>)
         flags_acc_bounds(ws, true, false);
         assert(texts(ws, env).subrange(f.0, ws.len() as int)
             == lit_texts(ws).subrange(f.0, ws.len() as int));
+        // both sides decode the SAME payload with the SAME table, so the text
+        // and the `\c` cut agree term for term
+        assert(decode_cut(join(texts(ws, env).subrange(f.0, ws.len() as int)))
+            == decode_cut(join(lit_texts(ws).subrange(f.0, ws.len() as int))));
     }
 }
 
@@ -495,6 +520,23 @@ pub open spec fn fold_identity(ws: Seq<W>) -> S {
     S::Echo(ws)
 }
 
+// (9) keep the newline even when `\c` cut the payload — the pre-repair shape
+// (`fold_to_output` set `newline: nl` regardless of the unescaper's verdict).
+pub open spec fn fold_keep_newline_after_cut(ws: Seq<W>) -> S {
+    if all_lit(ws) {
+        let f = flags(ws);
+        let body = join(lit_texts(ws).subrange(f.0, ws.len() as int));
+        let d = if f.2 {
+            decode_cut(body)
+        } else {
+            (body, false)
+        };
+        S::Out(d.0, f.1)
+    } else {
+        S::Echo(ws)
+    }
+}
+
 proof fn newline_flag_is_load_bearing()
     ensures ({
         let ws = seq![W::Lit(w_n()), W::Lit(seq![104, 105])];
@@ -509,7 +551,7 @@ proof fn newline_flag_is_load_bearing()
     reveal_with_fuel(lit_texts, 4);
     reveal_with_fuel(texts, 4);
     reveal_with_fuel(join, 4);
-    reveal_with_fuel(decode, 4);
+    reveal_with_fuel(decode_cut, 4);
 }
 
 proof fn space_join_is_load_bearing()
@@ -527,7 +569,7 @@ proof fn space_join_is_load_bearing()
     reveal_with_fuel(texts, 4);
     reveal_with_fuel(join, 4);
     reveal_with_fuel(join_no_sep, 4);
-    reveal_with_fuel(decode, 4);
+    reveal_with_fuel(decode_cut, 4);
 }
 
 proof fn dash_e_is_load_bearing()
@@ -546,7 +588,7 @@ proof fn dash_e_is_load_bearing()
     reveal_with_fuel(lit_texts, 4);
     reveal_with_fuel(texts, 4);
     reveal_with_fuel(join, 4);
-    reveal_with_fuel(decode, 4);
+    reveal_with_fuel(decode_cut, 4);
 }
 
 proof fn dashdash_is_load_bearing()
@@ -567,7 +609,7 @@ proof fn dashdash_is_load_bearing()
     reveal_with_fuel(lit_texts, 4);
     reveal_with_fuel(texts, 4);
     reveal_with_fuel(join, 4);
-    reveal_with_fuel(decode, 4);
+    reveal_with_fuel(decode_cut, 4);
     assert(all_lit(seq![W::Lit(w_dashdash()), W::Lit(w_n())]));
     assert(flags(seq![W::Lit(w_dashdash()), W::Lit(w_n())]) == (1, true, false));
     assert(lit_texts(seq![W::Lit(w_dashdash()), W::Lit(w_n())]) == seq![w_dashdash(), w_n()]);
@@ -575,20 +617,19 @@ proof fn dashdash_is_load_bearing()
     assert(flags_past_dashdash(seq![W::Lit(w_dashdash()), W::Lit(w_n())]) == (2, false, false));
 }
 
-// HYPOTHESIS (bash `\c` and the trailing newline): bash's `\c` stops ALL
-// further output, including the trailing newline, so `echo -e 'a\cb'`
-// prints just `a`. The table in `echo_esc` (echo_fold.rs:1455) returns only
-// the truncated TEXT and `fold_to_output` (echo_fold.rs:1197) then sets
-// `newline: nl` unconditionally, so the folded node prints `a\n`. The model
-// below is the SHARED TABLE's contract (the contract the file documents for
-// the backends' unescapers), not bash's, for this one row.
+// `\c` ends the payload AND the newline — bash's measured bytes (`od -c` of
+// its stdout):
+//   echo -e 'a\cb'    -> 97                     (`a`, nothing else)
+//   echo -e 'ab\ccd'  -> 97 98                  (`ab`)
+//   echo -e 'ab\c'    -> 97 98                  (`ab`, no newline)
+//   echo -e 'a\cb\c'  -> 97                     (`a`)
+//   echo -e '\c'      -> (nothing at all)
 proof fn escape_c_truncation_is_load_bearing()
     ensures ({
         let ws = seq![W::Lit(w_e()), W::Lit(seq![97, 92, 99, 98])];
         let env = Map::<nat, Seq<int>>::empty();
-        // the table truncates the text; the flag still appends its newline
-        out_bytes(S::Echo(ws), env) == seq![97, 10]
-            && out_bytes(fold(ws), env) == seq![97, 10]
+        out_bytes(S::Echo(ws), env) == seq![97]
+            && out_bytes(fold(ws), env) == seq![97]
             && decode_keep_c(seq![97, 92, 99, 98]) == seq![97, 92, 99, 98]
             && decode_keep_c(seq![97, 92, 99, 98]) != decode(seq![97, 92, 99, 98])
     }),
@@ -597,12 +638,48 @@ proof fn escape_c_truncation_is_load_bearing()
     reveal_with_fuel(lit_texts, 4);
     reveal_with_fuel(texts, 4);
     reveal_with_fuel(join, 4);
-    reveal_with_fuel(decode, 4);
+    reveal_with_fuel(decode_cut, 4);
     reveal_with_fuel(decode_keep_c, 4);
     assert(all_lit(seq![W::Lit(w_e()), W::Lit(seq![97, 92, 99, 98])]));
     assert(flags(seq![W::Lit(w_e()), W::Lit(seq![97, 92, 99, 98])]) == (1, true, true));
     assert(decode(seq![97, 92, 99, 98]) == seq![97]);
+    assert(cut(seq![97, 92, 99, 98]));
     assert(decode_keep_c(seq![97, 92, 99, 98]) == seq![97, 92, 99, 98]);
+}
+
+// The four neighbouring shapes, each folding to exactly bash's bytes — the
+// cut position must not need a special case, so the same law covers them.
+proof fn dash_c_shapes_match_bash()
+    ensures ({
+        let env = Map::<nat, Seq<int>>::empty();
+        let e = W::Lit(w_e());
+        // 1. mid-text: `echo -e 'ab\ccd'` -> `ab`
+        out_bytes(fold(seq![e, W::Lit(seq![97, 98, 92, 99, 99, 100])]), env) == seq![97, 98]
+            // 2. the last escape: `echo -e 'ab\c'` -> `ab`
+            && out_bytes(fold(seq![e, W::Lit(seq![97, 98, 92, 99])]), env) == seq![97, 98]
+            // 3. after an already-truncated payload: `echo -e 'a\cb\c'` -> `a`
+            && out_bytes(fold(seq![e, W::Lit(seq![97, 92, 99, 98, 92, 99])]), env) == seq![97]
+            // 4. `\c` is the only escape: `echo -e '\c'` -> nothing at all
+            && out_bytes(fold(seq![e, W::Lit(seq![92, 99])]), env) == Seq::<int>::empty()
+            // control: the same payloads WITHOUT `\c` keep bash's newline
+            && out_bytes(fold(seq![e, W::Lit(seq![97, 98])]), env) == seq![97, 98, 10]
+            && out_bytes(fold(seq![W::Lit(seq![97, 98])]), env) == seq![97, 98, 10]
+    }),
+{
+    reveal_with_fuel(flags_acc, 6);
+    reveal_with_fuel(lit_texts, 6);
+    reveal_with_fuel(texts, 6);
+    reveal_with_fuel(join, 6);
+    reveal_with_fuel(decode_cut, 8);
+    assert(all_lit(seq![W::Lit(w_e()), W::Lit(seq![97, 98, 92, 99, 99, 100])]));
+    assert(all_lit(seq![W::Lit(w_e()), W::Lit(seq![97, 98, 92, 99])]));
+    assert(all_lit(seq![W::Lit(w_e()), W::Lit(seq![97, 92, 99, 98, 92, 99])]));
+    assert(all_lit(seq![W::Lit(w_e()), W::Lit(seq![92, 99])]));
+    assert(decode_cut(seq![97, 98, 92, 99, 99, 100]) == (seq![97, 98], true));
+    assert(decode_cut(seq![97, 98, 92, 99]) == (seq![97, 98], true));
+    assert(decode_cut(seq![97, 92, 99, 98, 92, 99]) == (seq![97], true));
+    assert(decode_cut(seq![92, 99]) == (Seq::<int>::empty(), true));
+    assert(decode_cut(seq![97, 98]) == (seq![97, 98], false));
 }
 
 proof fn unknown_escape_is_load_bearing()
@@ -620,7 +697,7 @@ proof fn unknown_escape_is_load_bearing()
     reveal_with_fuel(lit_texts, 4);
     reveal_with_fuel(texts, 4);
     reveal_with_fuel(join, 4);
-    reveal_with_fuel(decode, 4);
+    reveal_with_fuel(decode_cut, 4);
     reveal_with_fuel(decode_drop_bs, 4);
 }
 
@@ -639,7 +716,27 @@ proof fn runtime_word_is_load_bearing()
     reveal_with_fuel(lit_texts, 4);
     reveal_with_fuel(texts, 4);
     reveal_with_fuel(join, 4);
-    reveal_with_fuel(decode, 4);
+    reveal_with_fuel(decode_cut, 4);
+}
+
+// The newline after a cut is load-bearing: the mutant that keeps it writes
+// `a\n` where bash writes `a`, so `fold_preserves_output` refuses it.
+proof fn cut_newline_is_load_bearing()
+    ensures ({
+        let ws = seq![W::Lit(w_e()), W::Lit(seq![97, 92, 99, 98])];
+        let env = Map::<nat, Seq<int>>::empty();
+        out_bytes(fold(ws), env) == seq![97]
+            && out_bytes(fold_keep_newline_after_cut(ws), env) == seq![97, 10]
+            && out_bytes(fold_keep_newline_after_cut(ws), env) != out_bytes(S::Echo(ws), env)
+    }),
+{
+    reveal_with_fuel(flags_acc, 4);
+    reveal_with_fuel(lit_texts, 4);
+    reveal_with_fuel(texts, 4);
+    reveal_with_fuel(join, 4);
+    reveal_with_fuel(decode_cut, 4);
+    assert(decode_cut(seq![97, 92, 99, 98]) == (seq![97], true));
+    assert(flags(seq![W::Lit(w_e()), W::Lit(seq![97, 92, 99, 98])]) == (1, true, true));
 }
 
 proof fn identity_is_not_a_fold()
@@ -683,7 +780,7 @@ proof fn pin_dash_e_unescapes()
     reveal_with_fuel(flags_acc, 4);
     reveal_with_fuel(lit_texts, 4);
     reveal_with_fuel(join, 4);
-    reveal_with_fuel(decode, 4);
+    reveal_with_fuel(decode_cut, 4);
     assert(all_lit(seq![W::Lit(w_e()), W::Lit(seq![97, 92, 110, 98])]));
     assert(flags(seq![W::Lit(w_e()), W::Lit(seq![97, 92, 110, 98])]) == (1, true, true));
     assert(decode(seq![97, 92, 110, 98]) == seq![97, 10, 98]);
@@ -709,7 +806,7 @@ proof fn pin_output_without_newline()
     reveal_with_fuel(flags_acc, 4);
     reveal_with_fuel(lit_texts, 4);
     reveal_with_fuel(join, 4);
-    reveal_with_fuel(decode, 4);
+    reveal_with_fuel(decode_cut, 4);
 }
 
 // echo_esc_matches_bash_common_cases (the four rows the model decides).
@@ -717,9 +814,15 @@ proof fn pin_echo_esc_rows()
     ensures decode(seq![97, 92, 110, 98]) == seq![97, 10, 98]
         && decode(seq![97, 92, 116, 98]) == seq![97, 9, 98]
         && decode(seq![97, 92, 92, 98]) == seq![97, 92, 98]
-        && decode(seq![97, 92, 99, 98]) == seq![97],
+        && decode(seq![97, 92, 99, 98]) == seq![97]
+        // only `\c` cuts; the other rows leave the newline alone
+        && cut(seq![97, 92, 99, 98])
+        && !cut(seq![97, 92, 110, 98])
+        && !cut(seq![97, 92, 116, 98])
+        && !cut(seq![97, 92, 92, 98])
+        && !cut(Seq::<int>::empty()),
 {
-    reveal_with_fuel(decode, 6);
+    reveal_with_fuel(decode_cut, 6);
 }
 
 fn main() {}

@@ -10144,10 +10144,10 @@ fn emit_echo(out: &mut String, words: &[&IrExpr], indent: usize) {
             .map(|a| call_arg_str(a).unwrap_or_default())
             .collect::<Vec<_>>()
             .join(" ");
-        let joined = if escapes {
-            crate::shir_passes::echo_fold::echo_esc(&joined)
+        let (joined, cut) = if escapes {
+            crate::shir_passes::echo_fold::echo_esc_cut(&joined)
         } else {
-            joined
+            (joined, false)
         };
         let mut s = String::from("\"");
         for ch in joined.chars() {
@@ -10161,7 +10161,8 @@ fn emit_echo(out: &mut String, words: &[&IrExpr], indent: usize) {
                 _ => s.push(ch),
             }
         }
-        if newline {
+        // bash's `\c` stops all further output, the trailing newline included
+        if newline && !cut {
             s.push_str("\\n");
         }
         s.push('"');

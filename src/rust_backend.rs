@@ -7974,12 +7974,16 @@ while __sh_path.len() > 1 && __sh_path.ends_with('/') {{ __sh_path = &__sh_path[
                 self.add_helper("cat");
                 let joined = format!("__sh_cat(&[{}])", ws.join(", "));
                 if esc {
+                    // `\c` decides the trailing newline too, so this value
+                    // path goes through the same tuple: `echo_line` appends
+                    // the newline only when the payload was not cut.
                     self.add_helper("echo_esc");
-                    let mut s = format!("__sh_echo_esc(&{joined})");
                     if nl {
-                        s = format!("format!(\"{{}}\\n\", {s})");
+                        self.add_helper("echo_line");
+                        format!("__sh_echo_line(&{joined})")
+                    } else {
+                        format!("__sh_echo_esc(&{joined}).0")
                     }
-                    s
                 } else if nl {
                     format!("format!(\"{{}}\\n\", {joined})")
                 } else {
@@ -11212,10 +11216,14 @@ while __sh_path.len() > 1 && __sh_path.ends_with('/') {{ __sh_path = &__sh_path[
                 Part::Words(_) => return None,
             }
         }
+        let mut cut = false;
         if esc {
-            s = Self::echo_esc_lit(&s);
+            let (t, c) = Self::echo_esc_lit(&s);
+            s = t;
+            cut = c;
         }
-        if nl {
+        // bash's `\c` stops all further output, the trailing newline included
+        if nl && !cut {
             s.push('\n');
         }
         Some(s)
@@ -11224,8 +11232,8 @@ while __sh_path.len() > 1 && __sh_path.ends_with('/') {{ __sh_path = &__sh_path[
     /// Compile-time `-e` unescape — delegates to the SHARED definition
     /// ([`crate::shir_passes::echo_fold::echo_esc`]) so the renderer and
     /// the `--shir` contract can never drift.
-    fn echo_esc_lit(s: &str) -> String {
-        crate::shir_passes::echo_fold::echo_esc(s)
+    fn echo_esc_lit(s: &str) -> (String, bool) {
+        crate::shir_passes::echo_fold::echo_esc_cut(s)
     }
 
     /// Peel `vec![EXPR]` from a one-word `words_expr` result, returning
@@ -15411,7 +15419,7 @@ struct IrRedirectInfo {
 // ── helpers registry ─────────────────────────────────────────────────
 
 const HELPER_ORDER: &[&str] = &[
-    "q", "q_printf", "wq", "cat", "pow", "echo_esc", "printf_b", "atoi", "atou", "atof", "print_words", "print_words_noesc", "puts", "printf", "outbytes",
+    "q", "q_printf", "wq", "cat", "pow", "echo_esc", "echo_line", "printf_b",  "atoi", "atou", "atof", "print_words", "print_words_noesc", "puts", "printf", "outbytes",
     "cap_bytes", "capture_rc", "spawn", "run", "readline", "read_fields", "split_ifs",
     "fnmatch", "globlike", "strippre", "stripsuf", "replace", "substr", "case", "len", "basename",
     "dirname", "env", "arg", "glob", "brace", "sleep", "rand", "uid", "euid", "gid", "hostname", "grepmatches", "regex", "regex_posix",
@@ -15521,6 +15529,7 @@ fn helper_deps(h: &str) -> &'static [&'static str] {
     match h {
         "wq" => &["q"],
         "print_words" => &["echo_esc", "sink"],
+        "echo_line" => &["echo_esc"],
         // the no-`esc` variant never calls __sh_echo_esc — the `-e`
         // support is compiled out of the helper when no echo used it
         "print_words_noesc" => &["sink"],
@@ -15638,8 +15647,8 @@ fn helper_source(h: &str) -> &'static str {
         // Kept as a registry entry for name stability: since v156 the
         // printf body calls __sh_echo_esc directly (the indirection is
         // gone), so the helper prune drops this shim when nothing names it.
-        "printf_b" => r#"fn __sh_printf_b(s: &str) -> String { __sh_echo_esc(s) }"#,
-        "echo_esc" => r#"fn __sh_echo_esc(s: &str) -> String {
+        "printf_b" => r#"fn __sh_printf_b(s: &str) -> String { __sh_echo_esc(s).0 }"#,
+        "echo_esc" => r#"fn __sh_echo_esc(s: &str) -> (String, bool) {
     let mut o = String::new();
     let ch: Vec<char> = s.chars().collect();
     let mut i = 0;
@@ -15650,7 +15659,7 @@ fn helper_source(h: &str) -> &'static str {
                 'n' => o.push('\n'), 't' => o.push('\t'), 'r' => o.push('\r'),
                 'a' => o.push('\x07'), 'b' => o.push('\x08'), 'f' => o.push('\x0c'),
                 'v' => o.push('\x0b'), 'e' => o.push('\x1b'), '\\' => o.push('\\'),
-                'c' => return o,
+                'c' => return (o, true),
                 '0'..='7' => {
                     let mut n = 0; let mut k = 0;
                     while k < 3 && i + k < ch.len() && ch[i + k].is_ascii_digit() && ch[i + k] <= '7' {
@@ -15672,7 +15681,14 @@ fn helper_source(h: &str) -> &'static str {
             i += 1;
         } else { o.push(ch[i]); i += 1; }
     }
-    o
+    (o, false)
+}"#,
+        // The literal-word echo as a VALUE (`$(echo -e …)` through
+        // `exec_value`): decode, then append the newline only when no `\c`
+        // stopped the output.
+        "echo_line" => r#"fn __sh_echo_line(s: &str) -> String {
+    let (t, cut) = __sh_echo_esc(s);
+    if cut { t } else { format!("{}\n", t) }
 }"#,
         "atoi" => r#"fn __sh_atoi(s: &str) -> i64 {
     let t = s.trim();
@@ -15697,8 +15713,10 @@ fn helper_source(h: &str) -> &'static str {
     // WHOLE simple command, not just the word
     if __SH_ARITH_WORD_FAIL.swap(false, Ordering::Relaxed) { return; }
     let mut s = ws.iter().flatten().map(String::as_str).collect::<Vec<_>>().join(" ");
-    if esc { s = __sh_echo_esc(&s); }
-    if nl { s.push('\n'); }
+    let mut cut = false;
+    if esc { let (t, c) = __sh_echo_esc(&s); s = t; cut = c; }
+    // bash's `\c` stops all further output, the trailing newline included
+    if nl && !cut { s.push('\n'); }
     __sh_sink(s.as_bytes());
 }"#,
         // Same signature and call sites as `print_words`, but with the
@@ -16022,7 +16040,7 @@ fn helper_source(h: &str) -> &'static str {
                         if p >= 0 { t.chars().take(p as usize).collect() } else { t }
                     }
                     'b' => {
-                        let t = __sh_echo_esc(&arg);
+                        let (t, _) = __sh_echo_esc(&arg);
                         if p >= 0 { t.chars().take(p as usize).collect() } else { t }
                     }
                     'q' => __sh_q_printf(&arg),

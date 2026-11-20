@@ -275,7 +275,8 @@ out_bytes(fold(ws), env) == out_bytes(S::Echo(ws), env)
 (`echo_bytes`). The word list is `W::Lit(Seq<int>) | W::Dyn(nat)`, so a runtime
 word (an env read) is a distinct shape, not an empty string.
 
-The model's content, each pinned by a witness and measured red as a mutant:
+The model's content, each pinned by a witness and measured red as a mutant
+(counts are for the current, bash-faithful file):
 
 - **the newline is not in the text** — `echo -n hi` prints `hi`, and
   `echo hi` prints `hi\n` because the FLAG appends it. Baking `\n` into the
@@ -290,8 +291,15 @@ The model's content, each pinned by a witness and measured red as a mutant:
 - **a runtime word is not folded** — folding `Dyn` through the empty
   compile-time placeholder prints only the newline; one environment (`x`)
   disagrees (26v/3e).
-- **`\c` truncates** — `echo -e 'a\cb'` prints `a`; treating `\c` as an
-  unknown escape prints `a\cb` (27v/2e).
+- **`\c` truncates the text AND the newline** — `echo -e 'a\cb'` prints `a`
+  and nothing else; treating `\c` as an unknown escape prints `a\cb`
+  (27v/4e), and keeping the trailing newline (the pre-repair shape) prints
+  `a\n` (27v/4e, trapped by four named obligations). The four neighbouring
+  shapes are their own pins, each measured against bash's `od -c` bytes: the
+  `\c` mid-text (`'ab\ccd'` → `ab`), as the last escape (`'ab\c'` → `ab`),
+  after an already-truncated payload (`'a\cb\c'` → `a`) and as the only
+  escape (`'\c'` → nothing), plus the no-`\c` control that keeps its
+  newline.
 
 `fold_leaves_nothing` (every all-literal list is an `Output`) and
 `fold_is_idempotent` are separate obligations, so an identity pass cannot
@@ -304,12 +312,17 @@ Pins mirror the source's tests: `literal_echo_folds_to_output`,
 (the rows the model decides: `\n \t \\ \c`), plus the literal escape bytes
 (`"hi" = [104,105]`, `"a\nb" = [97,92,110,98]`, `"a\qb" = [97,92,113,98]`).
 
-Hypothesis in-file: bash's `\c` stops ALL output including the trailing
-newline, but `echo_esc` returns only the truncated TEXT and `fold_to_output`
-sets `newline: nl` unconditionally, so on that one row the model states the
-SHARED TABLE's contract (the one the file documents for the backends'
-unescapers), not bash's. The redirect (`> file`) and `printf` halves of the
-pass are out of scope and named as such.
+No hypothesis is carved out for `\c`: the speculative row is gone because the
+transform was repaired. `echo_esc_cut` (the shared unescaper) returns
+`(text, cut)`, and every newline-deciding consumer honours it —
+`fold_to_output`, the Perl renderer's literal-echo path (`ir.rs`), the Rust
+renderer's compile-time `const_echo_text`, and the emitted runtime
+`__sh_echo_esc` / `__sh_print_words` / `__sh_echo_line`. Measured end to end:
+the real pipeline's output is byte-identical to bash's for `echo -e 'a\cb'`,
+`'ab\ccd'`, `'ab\c'`, `'a\cb\c'`, `'\c'`, the no-`\c` control, a
+literal through a capture, and a runtime word (`echo -e "$MYV"`). The
+redirect (`> file`) and `printf` halves of the pass are out of scope and named
+as such.
 
 ## Running it
 

@@ -1189,16 +1189,20 @@ fn fold_to_output(words: &[IrExpr]) -> Option<IrStmt> {
         first = false;
         text.push_str(&t);
     }
+    let mut cut = false;
     if esc {
-        text = echo_esc(&text);
+        let (t, c) = echo_esc_cut(&text);
+        text = t;
+        cut = c;
     }
     // `Output.newline` carries the trailing newline (its documented
     // meaning — every backend appends it), so the folded text holds only
     // the joined words. Baking `\n` into the text AND setting the flag
-    // would double it.
+    // would double it. A `\c` stops ALL further output — bash prints `a`
+    // for `echo -e 'a\cb'` — so it clears the flag as well.
     Some(IrStmt::Output {
         value: IrExpr::Str(text, StrStyle::DoubleQuoted),
-        newline: nl,
+        newline: nl && !cut,
         target: None,
     })
 }
@@ -1436,7 +1440,13 @@ fn const_word_text(w: &IrExpr) -> Option<String> {
 /// semantics: the `--shir` contract and the backends' runtime
 /// unescapers must agree with it (`\c` truncates; an incomplete escape
 /// is left as-is).
-pub fn echo_esc(s: &str) -> String {
+///
+/// Returns the decoded text AND whether a `\c` ended the payload. bash's
+/// `\c` stops ALL further output, so the trailing newline a caller would
+/// append belongs to the same decision: `echo -e 'a\cb'` prints `a` and
+/// nothing else (no newline). [`echo_esc`] is the text-only view, for
+/// callers whose terminator is not the echo newline (`printf`'s `%b`).
+pub fn echo_esc_cut(s: &str) -> (String, bool) {
     let mut o = String::new();
     let ch: Vec<char> = s.chars().collect();
     let mut i = 0;
@@ -1453,7 +1463,7 @@ pub fn echo_esc(s: &str) -> String {
                 'v' => o.push('\x0b'),
                 'e' => o.push('\x1b'),
                 '\\' => o.push('\\'),
-                'c' => return o,
+                'c' => return (o, true),
                 '0'..='7' => {
                     let mut n = 0;
                     let mut k = 0;
@@ -1489,7 +1499,13 @@ pub fn echo_esc(s: &str) -> String {
             i += 1;
         }
     }
-    o
+    (o, false)
+}
+
+/// The `\c`-truncated text alone — for callers whose terminator is not the
+/// echo newline (`printf`'s `%b`, which owns its own).
+pub fn echo_esc(s: &str) -> String {
+    echo_esc_cut(s).0
 }
 
 #[cfg(test)]
@@ -1773,6 +1789,45 @@ mod tests {
         assert_eq!(value, IrExpr::Str("x\ty".to_string(), StrStyle::DoubleQuoted));
     }
 
+    /// bash's `\c` stops ALL further output, the trailing newline included.
+    /// Every row below was measured against bash (`od -c` of its stdout); the
+    /// fold must produce exactly those bytes, so the `Output` newline flag is
+    /// false whenever a `\c` fired — positional, last, repeated or alone.
+    #[test]
+    fn dash_c_stops_the_trailing_newline() {
+        // (words, bash stdout text, whether a trailing newline survives)
+        let rows: &[(&[&str], &str, bool)] = &[
+            (&["-e", "a\\cb"], "a", false),      // mid-text
+            (&["-e", "ab\\ccd"], "ab", false),   // mid-text, longer tail
+            (&["-e", "ab\\c"], "ab", false),     // the LAST escape
+            (&["-e", "a\\cb\\c"], "a", false), // second \c is unreachable
+            (&["-e", "\\c"], "", false),         // \c is the only escape
+            (&["-n", "-e", "a\\cb"], "a", false), // -n and \c agree
+            (&["-e", "ab"], "ab", true),          // control: no \c, newline stays
+        ];
+        for (ws, text, nl) in rows {
+            let st = IrStmt::Expr(IrExpr::Call {
+                func: "exec".to_string(),
+                args: vec![
+                    IrExpr::Str("echo".to_string(), StrStyle::DoubleQuoted),
+                    IrExpr::Array(words(ws)),
+                ],
+            });
+            let IrStmt::Output { value, newline, target } = constant_echo(&st)
+                .unwrap_or_else(|| panic!("{ws:?} must fold"))
+            else {
+                panic!("expected Output for {ws:?}")
+            };
+            assert_eq!(target, None, "target for {ws:?}");
+            assert_eq!(
+                value,
+                IrExpr::Str((*text).to_string(), StrStyle::DoubleQuoted),
+                "text for {ws:?}"
+            );
+            assert_eq!(newline, *nl, "newline for {ws:?}");
+        }
+    }
+
     #[test]
     fn expansion_word_does_not_fold() {
         // `echo "$x"` — the word is an Interpolate with an Expr part
@@ -1824,6 +1879,12 @@ mod tests {
         assert_eq!(echo_esc("a\\\\b"), "a\\b");
         assert_eq!(echo_esc("ab\\cde"), "ab"); // \c truncates
         assert_eq!(echo_esc("\\101"), "A"); // octal
+        // ...and reports the cut, because bash stops the newline too
+        assert_eq!(echo_esc_cut("ab\\cde"), ("ab".to_string(), true));
+        assert_eq!(echo_esc_cut("a\\cb"), ("a".to_string(), true));
+        assert_eq!(echo_esc_cut("\\c"), (String::new(), true));
+        assert_eq!(echo_esc_cut("ab"), ("ab".to_string(), false));
+        assert_eq!(echo_esc_cut("a\\nb"), ("a\nb".to_string(), false));
     }
 }
 
