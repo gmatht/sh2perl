@@ -24990,8 +24990,10 @@ mod tests {
     fn cut_is_a_native_split_and_field_take() {
         let out = render_rs("v=$(echo a:b:c | cut -d: -f2)\necho \"$v\"\n");
         assert!(!out.contains("__sh_spawn("), "still shells out:\n{out}");
-        assert!(out.contains(".split(\":\")"), "no split:\n{out}");
-        assert!(out.contains("__sh_fields[1].to_string()"), "no field take:\n{out}");
+        // ONE template for every selection: split on the delimiter, keep the
+        // indices the line has, join with the delimiter.
+        assert!(out.contains(".split(__sh_d)"), "no split:\n{out}");
+        assert!(out.contains("vec![1usize]"), "no field take:\n{out}");
     }
 
     /// `yes x | head -n 3` is a repeat of the literal line.
