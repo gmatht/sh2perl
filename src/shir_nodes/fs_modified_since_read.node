@@ -1,0 +1,15 @@
+# shir_nodes/fs_modified_since_read.node — the `-N` file predicate.
+#
+# `[ -N f ]` is true iff f's modification time is strictly later than its
+# access time ("modified since it was last read"). Both times come from one
+# stat(2); a path that does not stat, or whose timestamp is unreadable or not
+# representable as a SystemTime (pre-1970), is false — bash reports the same
+# answer for a missing file and prints no diagnostic for `-N`.
+#
+# Out of model: `noatime`/`relatime` mounts make atime systematically stale,
+# which changes the ANSWER, not the predicate — the node models the predicate.
+node FsModifiedSinceRead
+tag "FsModifiedSinceRead"
+kind expr
+field path: expr
+spec: FsSemantics#modified_since_read

@@ -1,0 +1,22 @@
+# shir_nodes/fs_newer_than.node — the `-nt` / `-ot` file predicates.
+#
+# Bash/GNU define these with a MISSING-OPERAND rule that is easy to get wrong:
+#   A -nt B  is true iff A exists and (B does not exist OR mtime(A) > mtime(B))
+#   A -ot B  is true iff B exists and (A does not exist OR mtime(A) < mtime(B))
+# so exactly one of the two is true for a pair of missing/existing files, and
+# neither is true when BOTH are missing.
+#
+# The comparison is over the FULL timestamp (nanoseconds on a modern fs). A
+# renderer that compares seconds turns a pair written in the same second into
+# "not newer" when bash says newer — a silently wrong answer, and the reason
+# this node exists instead of a `__sh_mtime() > __sh_mtime()` spelling.
+#
+# `newer = true` is `-nt`, `newer = false` is `-ot`; the missing-operand rule
+# is part of the node, not the renderer.
+node FsNewerThan
+tag "FsNewerThan"
+kind expr
+field left: expr
+field right: expr
+field newer: bool
+spec: FsSemantics#newer_than
