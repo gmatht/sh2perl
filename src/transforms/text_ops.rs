@@ -1080,6 +1080,50 @@ fn parse_field_spec(spec: &str) -> Vec<FieldRange> {
 
 // ── tr ───────────────────────────────────────────────────────────────
 
+/// Expand `tr`'s RANGE syntax into the literal member set the node's
+/// `from`/`to` fields promise (`tr_expand` in the node's theory). `a-z` is
+/// 26 members, `z-a` is the same range DESCENDING (GNU accepts it), and a
+/// dash with no character on either side is a literal dash (`-abc`, `abc-`,
+/// `a-c-e`). Refuses (None) on a backslash escape or a non-ASCII endpoint:
+/// `\n`, `\012` and `[=c=]` have meanings this expansion does not own, so
+/// the original command is kept (exact everywhere) rather than guessed.
+fn expand_tr_set(s: &str) -> Option<String> {
+    if s.contains('\\') {
+        return None;
+    }
+    let cs: Vec<char> = s.chars().collect();
+    let mut out = String::new();
+    let mut i = 0;
+    while i < cs.len() {
+        if i + 2 < cs.len() && cs[i + 1] == '-' {
+            let (a, b) = (cs[i], cs[i + 2]);
+            if !(a.is_ascii() && b.is_ascii()) {
+                return None;
+            }
+            let (lo, hi) = (a as u32, b as u32);
+            if lo <= hi {
+                for c in lo..=hi {
+                    out.push(char::from_u32(c)?);
+                }
+            } else {
+                let mut c = lo;
+                loop {
+                    out.push(char::from_u32(c)?);
+                    if c == hi {
+                        break;
+                    }
+                    c -= 1;
+                }
+            }
+            i += 3;
+        } else {
+            out.push(cs[i]);
+            i += 1;
+        }
+    }
+    Some(out)
+}
+
 fn try_lower_tr(text: IrExpr, args: &[IrExpr]) -> Option<IrExpr> {
     let args_str: Vec<&str> = args.iter().filter_map(|a| {
         match a {
@@ -1167,10 +1211,14 @@ fn try_lower_tr(text: IrExpr, args: &[IrExpr]) -> Option<IrExpr> {
         .filter(|_| offered("CaseTransform"));
     }
 
+    // The node's `from`/`to` are the EXPANDED member sets (ranges and
+    // classes are the lowering's job, not the renderer's).
+    let from = expand_tr_set(from)?;
+    let to = if to.is_empty() { String::new() } else { expand_tr_set(to)? };
     Some(IrExpr::Ext(Box::new(CharTranslate {
-        text: text,
-        from: from.to_string(),
-        to: to.to_string(),
+        text,
+        from,
+        to,
         delete,
         squeeze,
     })))
@@ -1739,6 +1787,28 @@ mod tests {
         assert_eq!(ct.from, "abc");
         assert_eq!(ct.to, "xyz");
         assert!(!ct.delete && !ct.squeeze);
+    }
+
+    #[test]
+    fn tr_ranges_expand_before_the_node_is_built() {
+        // The node promises the EXPANDED sets: `tr 'a-c' 'x'` is the map
+        // a→x, b→x, c→x (SET2's last member repeats), not three literal
+        // characters `a`, `-`, `c`.
+        let r = try_lower_tr(st("abc"), &[st("a-c"), st("x")]).unwrap();
+        let IrExpr::Ext(n) = &r else { panic!() };
+        let ct = n.as_any().downcast_ref::<CharTranslate>().unwrap();
+        assert_eq!(ct.from, "abc");
+        assert_eq!(ct.to, "x");
+        // A descending range is the same member set, reversed.
+        let r = try_lower_tr(st("abc"), &[st("c-a"), st("x")]).unwrap();
+        let IrExpr::Ext(n) = &r else { panic!() };
+        assert_eq!(n.as_any().downcast_ref::<CharTranslate>().unwrap().from, "cba");
+        // A leading/trailing dash is literal, not an incomplete range.
+        let r = try_lower_tr(st("abc"), &[st("a-c-e"), st("x")]).unwrap();
+        let IrExpr::Ext(n) = &r else { panic!() };
+        assert_eq!(n.as_any().downcast_ref::<CharTranslate>().unwrap().from, "abc-e");
+        // An escape means the runtime path (`\n`, `\012` are not ours).
+        assert!(try_lower_tr(st("a"), &[st("a-\\n"), st("x")]).is_none());
     }
 
     #[test]
