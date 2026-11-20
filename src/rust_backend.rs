@@ -1433,7 +1433,7 @@ fn inline_simple_helpers(
 
     // `format!(…).to_string()` → `format!(…)` — `format!` already yields
     // an owned `String`; the hop is a pointless full re-allocation (57
-    // sites corpus-wide, e.g. `let __v = format!("Processed {}", n).to_string()`).
+    // sites corpus-wide, e.g. `let __sh_value = format!("Processed {}", n).to_string()`).
     collapse_format_to_string(&mut out);
 
     out
@@ -1645,7 +1645,7 @@ fn inline_print_words(text: &mut String) {
 /// next non-blank is `,`, the closing `)`, or end). A direct format
 /// argument only needs `Display` and `&str`/`String` display identically.
 /// Anything looser is refused textually because the literal's TYPE may
-/// unify with a sibling `String`: `if … { "default" } else { __v.to_string() }`
+/// unify with a sibling `String`: `if … { "default" } else { __sh_value.to_string() }`
 /// and `f("hi".to_string())` with `fn f(String)` both broke compilation
 /// before this boundary rule (013/027 parameter-expansion regressions,
 /// `stored_params_stay_owned`). Scope matters too: a blanket rewrite
@@ -5748,7 +5748,7 @@ impl Render {
                     "let __e = (__n as usize).min(__k); __l[..__e].join(\"\\n\")"
                 };
                 Some(format!(
-                    "{{ let __t: String = {t}; let __n: i64 = {c}; let __l: Vec<&str> = __t.split('\\n').collect(); let __k = __l.len(); if __n <= 0 {{ String::new() }} else {{ {tail} }} }}"
+                    "{{ let __sh_text: String = {t}; let __n: i64 = {c}; let __l: Vec<&str> = __sh_text.split('\\n').collect(); let __k = __l.len(); if __n <= 0 {{ String::new() }} else {{ {tail} }} }}"
                 ))
             }
             "RepeatStr" => {
@@ -5813,10 +5813,10 @@ __l = __u;"
                     ""
                 };
                 Some(format!(
-                    "{{ let __t: String = {t}; \
-let mut __l: Vec<String> = if __t.is_empty() {{ Vec::new() }} else {{ \
-let mut __v: Vec<String> = __t.split('\\n').map(|__s| __s.to_string()).collect(); \
-if __t.ends_with('\\n') {{ __v.pop(); }} __v }}; \
+                    "{{ let __sh_text: String = {t}; \
+let mut __l: Vec<String> = if __sh_text.is_empty() {{ Vec::new() }} else {{ \
+let mut __sh_value: Vec<String> = __sh_text.split('\\n').map(|__s| __s.to_string()).collect(); \
+if __sh_text.ends_with('\\n') {{ __sh_value.pop(); }} __sh_value }}; \
 let __key = |__s: &String| -> String {{ {key} }}; \
 __l.sort_by(|__a, __b| {cmp}); {uniq} __l.join(\"\\n\") }}"
                 ))
@@ -5832,10 +5832,10 @@ __l.sort_by(|__a, __b| {cmp}); {uniq} __l.join(\"\\n\") }}"
                     "__l[__i].clone()".to_string()
                 };
                 Some(format!(
-                    "{{ let __t: String = {t}; \
-let mut __l: Vec<String> = if __t.is_empty() {{ Vec::new() }} else {{ \
-let mut __v: Vec<String> = __t.split('\\n').map(|__s| __s.to_string()).collect(); \
-if __t.ends_with('\\n') {{ __v.pop(); }} __v }}; \
+                    "{{ let __sh_text: String = {t}; \
+let mut __l: Vec<String> = if __sh_text.is_empty() {{ Vec::new() }} else {{ \
+let mut __sh_value: Vec<String> = __sh_text.split('\\n').map(|__s| __s.to_string()).collect(); \
+if __sh_text.ends_with('\\n') {{ __sh_value.pop(); }} __sh_value }}; \
 let __k = |__s: &String| -> String {{ __s.chars().skip({skip}).collect::<String>() }}; \
 let mut __out: Vec<String> = Vec::new(); let mut __i = 0; \
 while __i < __l.len() {{ let mut __j = __i + 1; \
@@ -5864,9 +5864,9 @@ __out.push({projected}); __i = __j; }} __out.join(\"\\n\") }}"
                 } else {
                     format!(
                         "{{ let __f: Vec<char> = {from}.chars().collect(); \
-let __v: Vec<char> = {to}.chars().collect(); \
+let __sh_value: Vec<char> = {to}.chars().collect(); \
 {t}.chars().map(|__c| match __f.iter().position(|&__x| __x == __c) {{ \
-Some(__i) => __v[__i.min(__v.len() - 1)], None => __c }}).collect::<String>() }}"
+Some(__i) => __sh_value[__i.min(__sh_value.len() - 1)], None => __c }}).collect::<String>() }}"
                     )
                 };
                 if !x.squeeze {
@@ -6036,7 +6036,7 @@ while __p.len() > 1 && __p.ends_with('/') {{ __p = &__p[..__p.len() - 1]; }} @TA
             }
         }
         format!(
-            "{{ let __v = ({}).to_string(); if __SH_ARITH_ERR.swap(false, Ordering::Relaxed) {{ String::new() }} else {{ __v }} }}",
+            "{{ let __sh_value = ({}).to_string(); if __SH_ARITH_ERR.swap(false, Ordering::Relaxed) {{ String::new() }} else {{ __sh_value }} }}",
             self.arith(a)
         )
     }
@@ -6372,7 +6372,7 @@ while __p.len() > 1 && __p.ends_with('/') {{ __p = &__p[..__p.len() - 1]; }} @TA
                 if let Some(e) = self.arith_text_bool(&text) {
                     format!("{{ let __b = ({e}); __SH_RC.store(if __b {{ 0 }} else {{ 1 }}, Ordering::Relaxed); __b }}")
                 } else if text.contains("$(") {
-                    format!("{{ let __v = {}; __SH_RC.store(if __v != 0 {{ 0 }} else {{ 1 }}, Ordering::Relaxed); __v != 0 }}", self.arith_text_unparsed(&text, true))
+                    format!("{{ let __sh_value = {}; __SH_RC.store(if __sh_value != 0 {{ 0 }} else {{ 1 }}, Ordering::Relaxed); __sh_value != 0 }}", self.arith_text_unparsed(&text, true))
                 } else {
                     "{{ __SH_RC.store(1, Ordering::Relaxed); false }}".to_string()
                 }
@@ -6397,7 +6397,7 @@ while __p.len() > 1 && __p.ends_with('/') {{ __p = &__p[..__p.len() - 1]; }} @TA
                     // deadlock — polyfills brace/param)
                     self.add_helper("ret_rc");
                     format!(
-                        "{{ let __v = {v}; *__SH_RET.lock().unwrap() = __v.clone(); __SH_RC.store(__sh_ret_rc(&__v), Ordering::Relaxed); return; }}"
+                        "{{ let __sh_value = {v}; *__SH_RET.lock().unwrap() = __sh_value.clone(); __SH_RC.store(__sh_ret_rc(&__sh_value), Ordering::Relaxed); return; }}"
                     )
                 } else {
                     // bare `return` = `return $?` — PROPAGATE the last
@@ -6957,9 +6957,9 @@ while __p.len() > 1 && __p.ends_with('/') {{ __p = &__p[..__p.len() - 1]; }} @TA
                 let cur = self.getvar_num(var);
                 match op.as_str() {
                     "=" => format!(
-                        "{{ let __v = {}; {} __v }}",
+                        "{{ let __sh_value = {}; {} __sh_value }}",
                         Self::let_value(&r),
-                        self.write_num_or_str(var, "__v")
+                        self.write_num_or_str(var, "__sh_value")
                     ),
                     _ => {
                         let aop = op.trim_end_matches('=');
@@ -7177,7 +7177,7 @@ while __p.len() > 1 && __p.ends_with('/') {{ __p = &__p[..__p.len() - 1]; }} @TA
                 // pass-3: rebinding argv poisons the signature verdict
                 self.probe_wild();
                 self.emit(&format!(
-                    "{{ let mut __v = __SH_ARGV.lock().unwrap(); let __n = ({n}).min(__v.len() as i64) as usize; __v.drain(0..__n); }}"
+                    "{{ let mut __sh_value = __SH_ARGV.lock().unwrap(); let __n = ({n}).min(__sh_value.len() as i64) as usize; __sh_value.drain(0..__n); }}"
                 ));
                 self.emit("__SH_RC.store(0, Ordering::Relaxed);");
             }
@@ -7225,10 +7225,10 @@ while __p.len() > 1 && __p.ends_with('/') {{ __p = &__p[..__p.len() - 1]; }} @TA
                     .collect::<Vec<_>>()
                     .join(" ");
                 if let Some(e) = self.let_expr(&text) {
-                    // the block IS the statement: its `__v` tail is the
+                    // the block IS the statement: its `__sh_value` tail is the
                     // value the shell discards, so no `let _ =` wrapper
                     self.emit(&format!(
-                        "{{ let __v = {}; __SH_RC.store(if __v != 0 {{ 0 }} else {{ 1 }}, Ordering::Relaxed); __v }};",
+                        "{{ let __sh_value = {}; __SH_RC.store(if __sh_value != 0 {{ 0 }} else {{ 1 }}, Ordering::Relaxed); __sh_value }};",
                         Self::let_value(&e)
                     ));
                 } else {
@@ -7409,13 +7409,13 @@ while __p.len() > 1 && __p.ends_with('/') {{ __p = &__p[..__p.len() - 1]; }} @TA
                     let m = self.tls(v);
                     let st = if self.is_num(v) {
                         format!(
-                            "{m}.with(|v| v.set(__v.trim().parse::<i64>().unwrap_or(0)))"
+                            "{m}.with(|v| v.set(__sh_value.trim().parse::<i64>().unwrap_or(0)))"
                         )
                     } else {
-                        format!("{m}.with(|v| *v.borrow_mut() = __v.trim().to_string())")
+                        format!("{m}.with(|v| *v.borrow_mut() = __sh_value.trim().to_string())")
                     };
                     assigns.push(format!(
-                        "if __n == {} {{ let __v = __val.trim_matches(|c| c == '\\'' || c == '\\\"'); {st}; }}",
+                        "if __n == {} {{ let __sh_value = __val.trim_matches(|c| c == '\\'' || c == '\\\"'); {st}; }}",
                         Self::rust_str(v)
                     ));
                 }
@@ -7804,14 +7804,14 @@ while __p.len() > 1 && __p.ends_with('/') {{ __p = &__p[..__p.len() - 1]; }} @TA
                 // caller's names.
                 let code = r#"{
     let __tmpl: &str = @TMPL@;
-    let __t = if __tmpl.is_empty() {
+    let __sh_text = if __tmpl.is_empty() {
         let __d = std::env::var("TMPDIR").ok().filter(|__d| !__d.is_empty()).unwrap_or_else(|| "/tmp".to_string());
         format!("{}/tmp.XXXXXXXXXX", __d.trim_end_matches('/'))
     } else {
         __tmpl.to_string()
     };
-    let __base = __t.trim_end_matches('X').to_string();
-    let __nx = { let __n = __t.len() - __base.len(); if __n == 0 { 10 } else { __n } };
+    let __base = __sh_text.trim_end_matches('X').to_string();
+    let __nx = { let __n = __sh_text.len() - __base.len(); if __n == 0 { 10 } else { __n } };
     let __cs: &[u8] = b"abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789";
     '__mk: {
         for __n in 0..100000u64 {
@@ -7885,7 +7885,7 @@ while __p.len() > 1 && __p.ends_with('/') {{ __p = &__p[..__p.len() - 1]; }} @TA
                     format!("{{ let __b = {e}; __SH_RC.store(if __b {{ 0 }} else {{ 1 }}, Ordering::Relaxed); __b }}")
                 } else {
                     format!(
-                        "{{ let __v = {}; __SH_RC.store(if __v != 0 {{ 0 }} else {{ 1 }}, Ordering::Relaxed); __v != 0 }}",
+                        "{{ let __sh_value = {}; __SH_RC.store(if __sh_value != 0 {{ 0 }} else {{ 1 }}, Ordering::Relaxed); __sh_value != 0 }}",
                         Self::let_value(&e)
                     )
                 }
@@ -9103,9 +9103,9 @@ while __p.len() > 1 && __p.ends_with('/') {{ __p = &__p[..__p.len() - 1]; }} @TA
                         let op = if func == "sum" {
                             "let mut __acc = num_bigint::BigInt::from(0); for __e in __vv.iter() { __acc += __e.trim().parse::<num_bigint::BigInt>().unwrap_or(num_bigint::BigInt::from(0)); } __acc.to_string()"
                         } else if func == "max" {
-                            "if __vv.is_empty() { String::new() } else { let mut __m = __vv[0].trim().parse::<num_bigint::BigInt>().unwrap_or(num_bigint::BigInt::from(0)); for __e in __vv.iter().skip(1) { let __v = __e.trim().parse::<num_bigint::BigInt>().unwrap_or(num_bigint::BigInt::from(0)); if __v > __m { __m = __v; } } __m.to_string() }"
+                            "if __vv.is_empty() { String::new() } else { let mut __m = __vv[0].trim().parse::<num_bigint::BigInt>().unwrap_or(num_bigint::BigInt::from(0)); for __e in __vv.iter().skip(1) { let __sh_value = __e.trim().parse::<num_bigint::BigInt>().unwrap_or(num_bigint::BigInt::from(0)); if __sh_value > __m { __m = __sh_value; } } __m.to_string() }"
                         } else {
-                            "if __vv.is_empty() { String::new() } else { let mut __m = __vv[0].trim().parse::<num_bigint::BigInt>().unwrap_or(num_bigint::BigInt::from(0)); for __e in __vv.iter().skip(1) { let __v = __e.trim().parse::<num_bigint::BigInt>().unwrap_or(num_bigint::BigInt::from(0)); if __v < __m { __m = __v; } } __m.to_string() }"
+                            "if __vv.is_empty() { String::new() } else { let mut __m = __vv[0].trim().parse::<num_bigint::BigInt>().unwrap_or(num_bigint::BigInt::from(0)); for __e in __vv.iter().skip(1) { let __sh_value = __e.trim().parse::<num_bigint::BigInt>().unwrap_or(num_bigint::BigInt::from(0)); if __sh_value < __m { __m = __sh_value; } } __m.to_string() }"
                         };
                         let mut s = String::from("vec![{ let __vv = ");
                         s.push_str(&m);
@@ -9228,20 +9228,20 @@ while __p.len() > 1 && __p.ends_with('/') {{ __p = &__p[..__p.len() - 1]; }} @TA
                         p.argv_read = true;
                     }
                     return format!(
-                        "{{ let __v = {b}; let __o = (({off} - 1).max(0) as usize).min(__v.len()); \
-                         let __l = if {len} < 0 {{ __v.len().saturating_sub(__o) as i64 }} else {{ {len} }}; \
-                         let __e = ((__o as i64 + __l).max(__o as i64)).min(__v.len() as i64) as usize; \
+                        "{{ let __sh_value = {b}; let __o = (({off} - 1).max(0) as usize).min(__sh_value.len()); \
+                         let __l = if {len} < 0 {{ __sh_value.len().saturating_sub(__o) as i64 }} else {{ {len} }}; \
+                         let __e = ((__o as i64 + __l).max(__o as i64)).min(__sh_value.len() as i64) as usize; \
                          let __e = __e.max(__o); \
-                         __v[__o..__e].to_vec() }}"
+                         __sh_value[__o..__e].to_vec() }}"
                     );
                 }
                 self.probe_wild();
                 return format!(
-                    "{{ let __v = __SH_ARGV.lock().unwrap().clone(); let __o = (({off} - 1).max(0) as usize).min(__v.len()); \
-                     let __l = if {len} < 0 {{ __v.len().saturating_sub(__o) as i64 }} else {{ {len} }}; \
-                     let __e = ((__o as i64 + __l).max(__o as i64)).min(__v.len() as i64) as usize; \
+                    "{{ let __sh_value = __SH_ARGV.lock().unwrap().clone(); let __o = (({off} - 1).max(0) as usize).min(__sh_value.len()); \
+                     let __l = if {len} < 0 {{ __sh_value.len().saturating_sub(__o) as i64 }} else {{ {len} }}; \
+                     let __e = ((__o as i64 + __l).max(__o as i64)).min(__sh_value.len() as i64) as usize; \
                      let __e = __e.max(__o); \
-                     __v[__o..__e].to_vec() }}"
+                     __sh_value[__o..__e].to_vec() }}"
                 );
             }
             self.probe_wild();
@@ -9263,7 +9263,7 @@ while __p.len() > 1 && __p.ends_with('/') {{ __p = &__p[..__p.len() - 1]; }} @TA
                     };
                     let arr = self.read_arr(var);
                     return format!(
-                        "{{ let __v = {arr}; let __o = if {off} < 0 {{ (__v.len() as i64 + {off}).max(0) }} else {{ {off} }} as usize; let __o = __o.min(__v.len()); let __l = if {len} < 0 {{ __v.len() as i64 - __o as i64 }} else {{ {len} }};                          let __s = __o.max(0) as usize; let __e = ((__s as i64 + __l).max(__s as i64)).min(__v.len() as i64) as usize; let __e = __e.max(__s);                          __v[__s..__e].to_vec() }}"
+                        "{{ let __sh_value = {arr}; let __o = if {off} < 0 {{ (__sh_value.len() as i64 + {off}).max(0) }} else {{ {off} }} as usize; let __o = __o.min(__sh_value.len()); let __l = if {len} < 0 {{ __sh_value.len() as i64 - __o as i64 }} else {{ {len} }};                          let __s = __o.max(0) as usize; let __e = ((__s as i64 + __l).max(__s as i64)).min(__sh_value.len() as i64) as usize; let __e = __e.max(__s);                          __sh_value[__s..__e].to_vec() }}"
                     );
                 }
                 return self.read_arr(var);
@@ -10056,7 +10056,7 @@ while __p.len() > 1 && __p.ends_with('/') {{ __p = &__p[..__p.len() - 1]; }} @TA
             let t = text.map(|a| self.expr_str(a)).unwrap_or_default();
             let lit = Self::rust_str(&p);
             return format!(
-                "{{ let __t = &{t}; let __n = __t.matches({lit}).count(); (if __n == 0 {{ String::new() }} else {{ vec![{lit}; __n].join(\"\\n\") }}, if __n == 0 {{ 1 }} else {{ 0 }}) }}"
+                "{{ let __sh_text = &{t}; let __n = __sh_text.matches({lit}).count(); (if __n == 0 {{ String::new() }} else {{ vec![{lit}; __n].join(\"\\n\") }}, if __n == 0 {{ 1 }} else {{ 0 }}) }}"
             );
         }
         self.add_helper("grepmatches");
@@ -11036,7 +11036,7 @@ while __p.len() > 1 && __p.ends_with('/') {{ __p = &__p[..__p.len() - 1]; }} @TA
                 "{{ let __words = __sh_cat(&[{}]); {m}.with(|v| {{ let mut __m = v.borrow_mut(); __m.clear(); \
                  for __w in __words {{ if let Some(rest) = __w.strip_prefix('[') {{ \
                  if let Some(eq) = rest.find(']') {{ let __k = rest[..eq].to_string(); \
-                 let __v = rest[eq + 2..].to_string(); __m.insert(__k, __v); }} }} }} }}); }}",
+                 let __sh_value = rest[eq + 2..].to_string(); __m.insert(__k, __sh_value); }} }} }} }}); }}",
                 items.join(", ")
             ));
             return;
@@ -11268,7 +11268,7 @@ while __p.len() > 1 && __p.ends_with('/') {{ __p = &__p[..__p.len() - 1]; }} @TA
     /// compound value for precedence is pure text here — rustc's
     /// `unused_parens` names the exact position ("unnecessary parentheses
     /// around assigned value", 10 corpus sites from the arith-capture
-    /// template alone: `let __v = (y + 2);`).
+    /// template alone: `let __sh_value = (y + 2);`).
     ///
     /// Refused when the pair does NOT enclose the whole value (depth returns
     /// to 0 early), when there is a top-level `,` (a tuple), or when the
@@ -11530,7 +11530,7 @@ while __p.len() > 1 && __p.ends_with('/') {{ __p = &__p[..__p.len() - 1]; }} @TA
     fn strip_lit(var: &str, lit: &str, prefix: bool) -> String {
         let m = if prefix { "strip_prefix" } else { "strip_suffix" };
         format!(
-            "{{ let __v = {var}; __v.{m}({}).unwrap_or(&__v).to_string() }}",
+            "{{ let __sh_value = {var}; __sh_value.{m}({}).unwrap_or(&__sh_value).to_string() }}",
             Self::rust_str(lit)
         )
     }
@@ -11846,14 +11846,14 @@ while __p.len() > 1 && __p.ends_with('/') {{ __p = &__p[..__p.len() - 1]; }} @TA
             ":" | "+" | ":+" => {
                 // `:+` — the default when non-empty (`+` ≈ `:+` in the
                 // store model — empty-vs-unset is not distinguished)
-                format!("{{ let __v = {var_expr}; if __v.is_empty() {{ String::new() }} else {{ {val} }} }}")
+                format!("{{ let __sh_value = {var_expr}; if __sh_value.is_empty() {{ String::new() }} else {{ {val} }} }}")
             }
             "-" | ":-" => {
                 // The two arms must agree in TYPE: a borrowable local reads
                 // as `&str` while `{val}` (a literal default) renders as an
                 // owned `String`, so stringify whichever arm wins.
                 format!(
-                    "{{ let __v = {var_expr}; if __v.is_empty() {{ {val} }} else {{ __v.to_string() }} }}"
+                    "{{ let __sh_value = {var_expr}; if __sh_value.is_empty() {{ {val} }} else {{ __sh_value.to_string() }} }}"
                 )
             }
             "=" | ":=" => {
@@ -11865,16 +11865,16 @@ while __p.len() > 1 && __p.ends_with('/') {{ __p = &__p[..__p.len() - 1]; }} @TA
                     && !self.is_array(name)
                 {
                     format!(
-                        "{{ let __v = {var_expr}; if __v.is_empty() {{ let __d = {val}; {} __d.clone() }} else {{ __v }} }}",
+                        "{{ let __sh_value = {var_expr}; if __sh_value.is_empty() {{ let __d = {val}; {} __d.clone() }} else {{ __sh_value }} }}",
                         self.write_str(name, "__d.clone()")
                     )
                 } else {
-                    format!("{{ let __v = {var_expr}; if __v.is_empty() {{ {val} }} else {{ __v }} }}")
+                    format!("{{ let __sh_value = {var_expr}; if __sh_value.is_empty() {{ {val} }} else {{ __sh_value }} }}")
                 }
             }
             ":?" => {
                 format!(
-                    "{{ let __v = {var_expr}; if __v.is_empty() {{ eprintln!(\"sh2: {{}}: {{}}\", {}, {val}); std::process::exit(1); }} __v }}",
+                    "{{ let __sh_value = {var_expr}; if __sh_value.is_empty() {{ eprintln!(\"sh2: {{}}: {{}}\", {}, {val}); std::process::exit(1); }} __sh_value }}",
                     Self::rust_str(name)
                 )
             }
@@ -11925,11 +11925,11 @@ while __p.len() > 1 && __p.ends_with('/') {{ __p = &__p[..__p.len() - 1]; }} @TA
                     // `${@:off:len}` — the positional params (1-based off)
                     self.probe_wild();
                     return format!(
-                        "{{ let __v = __SH_ARGV.lock().unwrap().clone(); let __o = (({off} - 1).max(0) as usize).min(__v.len()); \
-                         let __l = if {len} < 0 {{ __v.len().saturating_sub(__o) as i64 }} else {{ {len} }}; \
-                         let __e = ((__o as i64 + __l).max(__o as i64)).min(__v.len() as i64) as usize; \
+                        "{{ let __sh_value = __SH_ARGV.lock().unwrap().clone(); let __o = (({off} - 1).max(0) as usize).min(__sh_value.len()); \
+                         let __l = if {len} < 0 {{ __sh_value.len().saturating_sub(__o) as i64 }} else {{ {len} }}; \
+                         let __e = ((__o as i64 + __l).max(__o as i64)).min(__sh_value.len() as i64) as usize; \
                          let __e = __e.max(__o); \
-                         __v[__o..__e].join(\" \") }}"
+                         __sh_value[__o..__e].join(\" \") }}"
                     );
                 }
                 if !name.is_empty() && !name.starts_with('$')
@@ -11937,7 +11937,7 @@ while __p.len() > 1 && __p.ends_with('/') {{ __p = &__p[..__p.len() - 1]; }} @TA
                 {
                     let arr = self.read_arr(&name.to_string());
                     return format!(
-                        "{{ let __v = {arr}; let __o = if {off} < 0 {{ (__v.len() as i64 + {off}).max(0) }} else {{ {off} }} as usize; let __o = __o.min(__v.len()); let __l = if {len} < 0 {{ __v.len() as i64 - __o as i64 }} else {{ {len} }};                          let __s = __o.max(0) as usize; let __e = ((__s as i64 + __l).max(__s as i64)).min(__v.len() as i64) as usize; let __e = __e.max(__s);                          __v[__s..__e].join(\" \") }}"
+                        "{{ let __sh_value = {arr}; let __o = if {off} < 0 {{ (__sh_value.len() as i64 + {off}).max(0) }} else {{ {off} }} as usize; let __o = __o.min(__sh_value.len()); let __l = if {len} < 0 {{ __sh_value.len() as i64 - __o as i64 }} else {{ {len} }};                          let __s = __o.max(0) as usize; let __e = ((__s as i64 + __l).max(__s as i64)).min(__sh_value.len() as i64) as usize; let __e = __e.max(__s);                          __sh_value[__s..__e].join(\" \") }}"
                     );
                 }
                 self.add_helper("substr");
@@ -12266,11 +12266,11 @@ while __p.len() > 1 && __p.ends_with('/') {{ __p = &__p[..__p.len() - 1]; }} @TA
         } else if self.is_array(&name) {
             // an array var — the arith targets element 0
             let stmt = self.array_elem_set(&name, "0", &format!("({new}).to_string()"));
-            format!("{{ let __v = {new}; {stmt} __v }}")
+            format!("{{ let __sh_value = {new}; {stmt} __sh_value }}")
         } else {
             // a Str-typed var — the arith result written as a string
             let stmt = self.write_str(&name, &format!("({new}).to_string()"));
-            format!("{{ let __v = {new}; {stmt} __v }}")
+            format!("{{ let __sh_value = {new}; {stmt} __sh_value }}")
         }
     }
 
@@ -12291,10 +12291,10 @@ while __p.len() > 1 && __p.ends_with('/') {{ __p = &__p[..__p.len() - 1]; }} @TA
             format!("({n}).to_string()")
         } else if self.is_array(&name) {
             let stmt = self.array_elem_set(&name, "0", &val);
-            format!("{{ let __v = {val}; {stmt} __v }}")
+            format!("{{ let __sh_value = {val}; {stmt} __sh_value }}")
         } else {
             let stmt = self.write_str(&name, &val);
-            format!("{{ let __v = {val}; {stmt} __v }}")
+            format!("{{ let __sh_value = {val}; {stmt} __sh_value }}")
         }
     }
 
@@ -12485,7 +12485,7 @@ while __p.len() > 1 && __p.ends_with('/') {{ __p = &__p[..__p.len() - 1]; }} @TA
         if t == "String::new()" {
             return;
         }
-        // Only a block whose TAIL is a bare carrier (`__b` / `__v` / `__n`)
+        // Only a block whose TAIL is a bare carrier (`__b` / `__sh_value` / `__n`)
         // — or that has no tail at all — is a plain statement. One ending
         // in a `#[must_use]` call (`__r.is_ok()`) still needs the discard:
         // a `Result::is_ok` value dropped as a statement warns.
@@ -13161,7 +13161,7 @@ while __p.len() > 1 && __p.ends_with('/') {{ __p = &__p[..__p.len() - 1]; }} @TA
                     };
                     // ONE evaluation — the side-effecting arith must not
                     // run twice (the increments would double-apply)
-                    let v = self.gensym("__sh_arith_v");
+                    let v = self.gensym("__sh_arith_value");
                     self.emit(&format!("let {v} = {};", Self::let_value(&x)));
                     if arith_writes_target {
                         if let Some(t) = targets.first() {
@@ -13193,7 +13193,7 @@ while __p.len() > 1 && __p.ends_with('/') {{ __p = &__p[..__p.len() - 1]; }} @TA
                         ));
                     } else {
                         self.emit(&format!(
-                            "{{ let __v = {v}; let __n = __v.trim().parse::<i64>().unwrap_or(0); __SH_RC.store(if __n != 0 {{ 0 }} else {{ 1 }}, Ordering::Relaxed); __v }};"
+                            "{{ let __sh_value = {v}; let __n = __sh_value.trim().parse::<i64>().unwrap_or(0); __SH_RC.store(if __n != 0 {{ 0 }} else {{ 1 }}, Ordering::Relaxed); __sh_value }};"
                         ));
                     }
                     return;
@@ -13212,8 +13212,8 @@ while __p.len() > 1 && __p.ends_with('/') {{ __p = &__p[..__p.len() - 1]; }} @TA
                         if tainted || huge {
                             let b = self.arith_bigint(a);
                                                 format!(
-                                "{{ let __v = ({b}).to_string(); let __e = __SH_ARITH_ERR.swap(false, Ordering::Relaxed); \
-                         __SH_RC.store(if __e {{ 1 }} else {{ 0 }}, Ordering::Relaxed); if __e {{ String::new() }} else {{ __v }} }}"
+                                "{{ let __sh_value = ({b}).to_string(); let __e = __SH_ARITH_ERR.swap(false, Ordering::Relaxed); \
+                         __SH_RC.store(if __e {{ 1 }} else {{ 0 }}, Ordering::Relaxed); if __e {{ String::new() }} else {{ __sh_value }} }}"
                             )
                         } else {
                     // `x=$((...))` — bash collapses the expansion to
@@ -13221,8 +13221,8 @@ while __p.len() > 1 && __p.ends_with('/') {{ __p = &__p[..__p.len() - 1]; }} @TA
                     // (division/modulo by zero); the checked div/mod
                     // helpers flag the error via __SH_ARITH_ERR.
                                 format!(
-                        "{{ let __v = ({}).to_string(); let __e = __SH_ARITH_ERR.swap(false, Ordering::Relaxed); \
-                         __SH_RC.store(if __e {{ 1 }} else {{ 0 }}, Ordering::Relaxed); if __e {{ String::new() }} else {{ __v }} }}",
+                        "{{ let __sh_value = ({}).to_string(); let __e = __SH_ARITH_ERR.swap(false, Ordering::Relaxed); \
+                         __SH_RC.store(if __e {{ 1 }} else {{ 0 }}, Ordering::Relaxed); if __e {{ String::new() }} else {{ __sh_value }} }}",
                         self.arith(a)
                     )
                         }
@@ -14082,7 +14082,7 @@ while __p.len() > 1 && __p.ends_with('/') {{ __p = &__p[..__p.len() - 1]; }} @TA
                         }
                         let items = self.words_expr(other);
                         let items_g = self.gensym("__sh_items");
-                        let idx_g = self.gensym("__sh_i");
+                        let idx_g = self.gensym("__sh_index");
                         self.emit(&format!("let {items_g} = {items};"));
                         self.emit(&format!("let mut {idx_g}: usize = 0;"));
                         // `loop` so a body `continue` still runs the
@@ -14142,7 +14142,7 @@ while __p.len() > 1 && __p.ends_with('/') {{ __p = &__p[..__p.len() - 1]; }} @TA
                             // deadlock — polyfills brace/param)
                             self.add_helper("ret_rc");
                             self.emit(&format!(
-                                "let __v = {r}; *__SH_RET.lock().unwrap() = __v.clone(); __SH_RC.store(__sh_ret_rc(&__v), Ordering::Relaxed); return;"
+                                "let __sh_value = {r}; *__SH_RET.lock().unwrap() = __sh_value.clone(); __SH_RC.store(__sh_ret_rc(&__sh_value), Ordering::Relaxed); return;"
                             ));
                         } else {
                             self.emit("return;");
@@ -14154,7 +14154,7 @@ while __p.len() > 1 && __p.ends_with('/') {{ __p = &__p[..__p.len() - 1]; }} @TA
                     // still land in the cell, bare returns re-read it).
                     // When the value is UNUSED (`fn_value_used` false) the
                     // signature returns `()`: keep the store (observable
-                    // state) but return nothing — `return __v` against a
+                    // state) but return nothing — `return __sh_value` against a
                     // `()` signature is E0308.
                     let value_used = match self.active_fn.as_deref() {
                         Some(f) => self.fn_value_used.contains(f),
@@ -14165,11 +14165,11 @@ while __p.len() > 1 && __p.ends_with('/') {{ __p = &__p[..__p.len() - 1]; }} @TA
                         self.add_helper("ret_rc");
                         if value_used {
                             self.emit(&format!(
-                                "let __v = {r}; *__SH_RET.lock().unwrap() = __v.clone(); __SH_RC.store(__sh_ret_rc(&__v), Ordering::Relaxed); return __v;"
+                                "let __sh_value = {r}; *__SH_RET.lock().unwrap() = __sh_value.clone(); __SH_RC.store(__sh_ret_rc(&__sh_value), Ordering::Relaxed); return __sh_value;"
                             ));
                         } else {
                             self.emit(&format!(
-                                "let __v = {r}; *__SH_RET.lock().unwrap() = __v.clone(); __SH_RC.store(__sh_ret_rc(&__v), Ordering::Relaxed); return;"
+                                "let __sh_value = {r}; *__SH_RET.lock().unwrap() = __sh_value.clone(); __SH_RC.store(__sh_ret_rc(&__sh_value), Ordering::Relaxed); return;"
                             ));
                         }
                     } else {
@@ -19247,7 +19247,7 @@ fn reads_before_write(stmts: &[IrStmt], var: &str) -> bool {
             IrExpr::Object(pairs) => pairs.iter().any(|(_, v)| expr_write_target(v, var)),
             IrExpr::Index { key, .. } => expr_write_target(key, var),
             // A store nested in a block/sequence expression: the carrier is
-            // `IrExpr::Arrow(Vec<IrStmt>)` (`{ let __v = …; r = …; __v }`).
+            // `IrExpr::Arrow(Vec<IrStmt>)` (`{ let __sh_value = …; r = …; __sh_value }`).
             // It counts as a write only when the body WRITES before it reads:
             // a self-read (`{ let __o = i; i = i + 1; __o }`) means the value
             // observed is the one from before the store, so deferring the
@@ -25755,8 +25755,8 @@ mod tests {
             "__sh_glob(p)"
         );
         assert_eq!(
-            super::cat_peephole("__sh_cat(&[{ let __v = f(); __v }])"),
-            "{ let __v = f(); __v }"
+            super::cat_peephole("__sh_cat(&[{ let __sh_value = f(); __sh_value }])"),
+            "{ let __sh_value = f(); __sh_value }"
         );
         // brackets and commas inside strings belong to the element
         assert_eq!(
