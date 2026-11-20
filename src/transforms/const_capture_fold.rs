@@ -262,6 +262,26 @@ fn const_raw(e: &IrExpr) -> Option<String> {
     }
 }
 
+/// `printf FMT ARGS…` whose whole OUTPUT is known at IR time, in the exact
+/// bytes bash writes: `const_printf`'s acceptance (literal argv, no
+/// width/precision/flags, no `%c`/float, no format cycling, no surplus
+/// args). `-v` refuses here — it assigns to a variable instead of writing
+/// to stdout, so the words are not the command's output.
+///
+/// `text_ops` reuses this so `printf 'c\nb\na\n' | sort` reduces over the
+/// bytes bash actually wrote instead of re-deriving them from the raw
+/// format text (which is why `printf` used to be refused as a producer).
+pub(crate) fn const_printf_output(e: &IrExpr) -> Option<String> {
+    let (cmd, words) = literal_argv(e)?;
+    if cmd != "printf" {
+        return None;
+    }
+    if words.first().map_or(true, |w| w.starts_with('-')) {
+        return None;
+    }
+    const_printf(&cmd, words)
+}
+
 /// The KNOWN exit status of a literal command (`Some(false)` only for
 /// `false`). None = unknown (external/env-dependent, or a refused shape).
 fn const_ok(e: &IrExpr) -> Option<bool> {

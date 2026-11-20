@@ -986,14 +986,36 @@ struct TextSource {
 /// - a literal-only expression statement (a string / all-literal
 ///   interpolation) — NOT an arbitrary command; `paste | head` must not
 ///   reduce as if paste produced a literal string.
-/// - `printf` is REFUSED entirely: it adds NO trailing newline and its
-///   format string interprets `%` directives and backslash escapes, so
-///   treating the args as literal text mis-counts `printf x | wc -l`
-///   (bash: 0 — no newline; the naive lowering said 1).
+/// - `printf FMT ARGS…` when the whole invocation FOLDS to its bytes at IR
+///   time (`const_capture_fold::const_printf_output`: all-literal argv, no
+///   `-v`, no width/precision/flags, no `%c`/float, no format cycling). The
+///   escapes and conversions are already applied, so the consumer node sees
+///   exactly what bash wrote and the format's own trailing newline is
+///   recorded in `trailing_newline` — this is the guard the old blanket
+///   `printf` refusal stood in for (treating the ARGS as the output would
+///   mis-count `printf x | wc -l`, which is 0: no newline). Every `printf`
+///   whose bytes are NOT known at IR time is still refused.
 ///
 /// echo args may be literals OR variable reads (Var / param() / an
 /// interpolation) — `echo "$s" | cut` reduces with the read as the text.
 fn extract_text_from_stage(stmts: &[IrStmt]) -> Option<TextSource> {
+    // `printf FMT ARGS…` folded to its exact bytes (see this function's
+    // doc): a producer whose output is KNOWN, so the consumer's node
+    // reduces over what bash wrote. Sits ahead of the `echo` arm because
+    // `printf` is an exec call with the same shape but different output.
+    if let [IrStmt::Expr(e)] = stmts {
+        if let Some(raw) = crate::transforms::const_capture_fold::const_printf_output(e) {
+            let (text, trailing_newline) = match raw.strip_suffix('\n') {
+                Some(body) => (body.to_string(), true),
+                None => (raw, false),
+            };
+            return Some(TextSource {
+                text: IrExpr::Str(text, StrStyle::DoubleQuoted),
+                trailing_newline,
+                is_literal: true,
+            });
+        }
+    }
     match stmts {
         // echo ARGS → join args (with " ") as the text
         [IrStmt::Expr(IrExpr::Call { func, args })]
@@ -2128,14 +2150,44 @@ mod tests {
     }
 
     #[test]
-    fn printf_source_refused() {
-        // printf adds no trailing newline and interprets % directives:
-        // `printf x | wc -l` is 0 in bash — the old lowering said 1.
-        let stage = vec![IrStmt::Expr(IrExpr::Call {
-            func: "exec".to_string(),
-            args: vec![st("printf"), IrExpr::Array(vec![st("x")])],
-        })];
-        assert!(extract_text_from_stage(&stage).is_none());
+    fn printf_literal_formats_are_folded_bytes() {
+        // `printf 'a\nb\n'`'s BYTES are known at IR time (const_printf), so
+        // a consumer stage reduces over what bash actually wrote. This is
+        // the deliberate change from the earlier blanket refusal, whose
+        // objection was to treating the ARGS as the output (`printf x |\
+        // wc -l` is 0 in bash, the naive lowering said 1).
+        let stage = |args: Vec<IrExpr>| {
+            vec![IrStmt::Expr(IrExpr::Call {
+                func: "exec".to_string(),
+                args: vec![st("printf"), IrExpr::Array(args)],
+            })]
+        };
+        let src = extract_text_from_stage(&stage(vec![st("a\\nb\\n")])).unwrap();
+        assert!(src.trailing_newline);
+        assert!(src.is_literal);
+        assert!(matches!(&src.text, IrExpr::Str(t, _) if t == "a\nb"));
+        // The format's own newline is the only one: `printf x` writes none,
+        // so `printf x | wc -l` still counts 0.
+        let src = extract_text_from_stage(&stage(vec![st("x")])).unwrap();
+        assert!(!src.trailing_newline);
+        assert!(matches!(&src.text, IrExpr::Str(t, _) if t == "x"));
+    }
+
+    #[test]
+    fn printf_unmodelled_shapes_stay_commands() {
+        // Format cycling (`printf '%s\n' a b` prints a and b), `-v` (assigns
+        // instead of writing) and a non-literal format are NOT known at IR
+        // time — each keeps the original command rather than guessing.
+        let stage = |args: Vec<IrExpr>| {
+            vec![IrStmt::Expr(IrExpr::Call {
+                func: "exec".to_string(),
+                args: vec![st("printf"), IrExpr::Array(args)],
+            })]
+        };
+        assert!(extract_text_from_stage(&stage(vec![st("%s\\n"), st("a"), st("b")])).is_none());
+        assert!(extract_text_from_stage(&stage(vec![st("-v"), st("x"), st("hi")])).is_none());
+        let var = param_var_read(&st("f")).unwrap();
+        assert!(extract_text_from_stage(&stage(vec![var])).is_none());
     }
 
     #[test]
