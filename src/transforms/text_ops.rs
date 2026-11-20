@@ -657,7 +657,41 @@ fn lower_expr(expr: &mut IrExpr, arrays: &std::collections::HashSet<String>) {
         IrExpr::Arrow(body) => {
             for s in body.iter_mut() { lower_stmt(s, false, arrays); }
         }
-        IrExpr::Capture { expr: inner, .. } => lower_expr(inner, arrays),
+        // `$(echo … | cmd)` whose whole body is ONE pipeline: the node IS the
+        // captured value. `$(…)` strips trailing newlines and the fold's
+        // value already excludes the final one, so the subshell wrapper is
+        // dropped with it. Before this, a capture in a WORD position
+        // (`local y="$(…)"`, a case word, an echo operand) ran its body with
+        // emit=false, the statement-level pipeline arm never fired, and the
+        // whole capture stayed a `bash -c` spawn; a plain `x=$(…)` assignment
+        // only folded because its capture arrives without the Arrow wrapper.
+        IrExpr::Capture { expr: inner, .. } => {
+            if let IrExpr::Arrow(body) = inner.as_ref() {
+                if let [IrStmt::Expr(IrExpr::Call { func, args })] = body.as_slice() {
+                    if func == "pipeline" {
+                        if let [IrExpr::Array(stages)] = args.as_slice() {
+                            if stages.len() >= 2 {
+                                // `already_nl` marks a value that still ends in
+                                // its OWN final newline (RepeatStr, `yes | head`);
+                                // `$(…)` strips trailing newlines, so those keep
+                                // the capture (and its command) rather than
+                                // gaining a blank line at the consumer.
+                                if let Some((replacement, already_nl)) =
+                                    try_lower_pipeline(stages, false)
+                                {
+                                    if !already_nl {
+                                        *expr = replacement;
+                                        LIFT_COUNT.fetch_add(1, Ordering::Relaxed);
+                                        return;
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+            lower_expr(inner, arrays)
+        }
         IrExpr::Array(items) => { for i in items.iter_mut() { lower_expr(i, arrays); } }
         IrExpr::Interpolate(parts) => {
             for p in parts.iter_mut() {
@@ -2343,18 +2377,63 @@ mod tests {
     }
 
     #[test]
-    fn capture_body_pipeline_not_reduced() {
-        // Inside $(...) the body must remain the original COMMAND: the
-        // capture collects its stdout; reducing to a bare value breaks it.
-        // Arrow bodies lower with emit=false — the statement-level
-        // reduction must not fire.
-        let inner = stmt_pipeline(echo_stage(vec![st("x")]), wc_stage());
+    fn capture_body_pipeline_folds_to_the_value() {
+        // `$(echo … | tr …)` in WORD position (`local`, a case word, an echo
+        // operand): the fold's value IS what the capture collects — `$(…)`
+        // strips the trailing newline and the fold's value already excludes
+        // it. Arrow bodies lower with emit=false, so before this the
+        // statement-level reduction never fired and the capture kept
+        // spawning `bash -c`. (This replaces `capture_body_pipeline_not_
+        // reduced`, which pinned exactly that old behaviour.)
+        crate::transforms::set_target(Some("rs"));
+        let commands = crate::parser::commands::parse_commands_from_text(
+            "f() { local y=\"$(echo hi | tr a-z A-Z)\"; echo \"$y\"; }",
+        )
+        .expect("parse");
+        let mut prog = crate::shir::ast_to_ir_raw(&commands);
+        assert!(transform(&mut prog.stmts), "the capture did not fold");
+        let dbg = format!("{:?}", prog.stmts);
+        crate::transforms::set_target(None);
+        // `tr a-z A-Z` specializes to CaseTransform (the general map is
+        // CharTranslate); either way the CAPTURE and its command are gone.
+        assert!(
+            dbg.contains("CaseTransform") || dbg.contains("CharTranslate"),
+            "no case node: {dbg}"
+        );
+        assert!(!dbg.contains("Capture"), "the capture survived: {dbg}");
+    }
+
+    #[test]
+    fn capture_keeps_a_value_that_ends_in_its_own_newline() {
+        // `yes Hi | head -n 3` folds to RepeatStr, whose value still ends in
+        // "\n" (the statement path tracks that with `already_nl`). `$(…)`
+        // strips trailing newlines, so folding it into the capture would add
+        // a blank line at the consumer (000__04d_system_utilities) — that
+        // shape must keep the capture and its command.
+        crate::transforms::set_target(Some("rs"));
+        let stages = vec![
+            IrExpr::Arrow(vec![IrStmt::Expr(IrExpr::Call {
+                func: "exec".to_string(),
+                args: vec![st("yes"), IrExpr::Array(vec![st("Hi")])],
+            })]),
+            IrExpr::Arrow(vec![IrStmt::Expr(IrExpr::Call {
+                func: "exec".to_string(),
+                args: vec![st("head"), IrExpr::Array(vec![st("-n"), st("3")])],
+            })]),
+        ];
+        let inner = IrStmt::Expr(IrExpr::Call {
+            func: "pipeline".to_string(),
+            args: vec![IrExpr::Array(stages)],
+        });
         let mut cap = IrExpr::Capture {
             expr: Box::new(IrExpr::Arrow(vec![inner.clone()])),
             native: false,
         };
         lower_expr(&mut cap, &std::collections::HashSet::new());
-        let IrExpr::Capture { expr, .. } = &cap else { panic!() };
+        crate::transforms::set_target(None);
+        let IrExpr::Capture { expr, .. } = &cap else {
+            panic!("a capture whose value keeps its own newline must be kept")
+        };
         let IrExpr::Arrow(body) = expr.as_ref() else { panic!() };
         assert_eq!(&body[0], &inner, "capture body must keep the original pipeline");
     }
