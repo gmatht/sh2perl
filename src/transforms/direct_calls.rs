@@ -31,9 +31,18 @@
 //!   - that function's body is pure-output (Output + Assign/Declare
 //!     with pure exprs only — no Exec/Pipeline/WriteFile/Capture/
 //!     Background/Subshell/Return/Exit),
-//!   - the function is never redefined after this capture site (a
-//!     second `Function { name }` definition later = refuse).
+//!   - the function is never redefined (a second `Function { name }`
+//!     definition = refuse; bash resolves a call to the LAST definition,
+//!     so resolving to the first one would change what runs).
 //! Anything else is left untouched — refuse > guess.
+//!
+//! The redefinition rule is order-free: EVERY `Function` statement with the
+//! name counts, so it refuses whether the twin sits before or after the
+//! capture site. That is a superset of the old "never redefined after this
+//! site" wording, and it is the predicate the Verus model needs
+//! (`direct_calls.rs`, `no_later_def`). See BUGS_FOUND entry 11a — the rule
+//! was documented but unimplemented, and `fns.iter().find(..)` silently took
+//! the first definition.
 //!
 //! ## Placement
 //! Registered in `transforms.rs` (SH2_TRANSFORMS gated). The estree
@@ -177,11 +186,17 @@ fn is_defined_pure_function(call: &IrExpr, fns: &[(String, Vec<IrStmt>)]) -> boo
         IrExpr::Call { func, .. } => func,
         _ => return false,
     };
-    // a defined function with that name, pure-output body
-    let body = match fns.iter().find(|(n, _)| n == func) {
+    // a defined function with that name (EXACTLY one: bash's call resolves
+    // to the last definition, so picking the first out of several would
+    // resolve to the wrong body — BUGS_FOUND entry 11a)
+    let mut defs = fns.iter().filter(|(n, _)| n == func);
+    let body = match defs.next() {
         Some((_, b)) => b,
         None => return false,
     };
+    if defs.next().is_some() {
+        return false; // redefined: refuse, do not pick a definition
+    }
     body.iter().all(pure_output_stmt)
 }
 
@@ -242,6 +257,70 @@ fn arith_pure(a: &ArithAstRef) -> bool {
 
 // small alias so the arith walker above reads cleanly
 type ArithAstRef = crate::ir::ArithAst;
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::ir::AssignTarget;
+
+    /// `sq() { echo N; }` — one pure-output definition.
+    fn def(n: i64) -> IrStmt {
+        IrStmt::Function {
+            name: "sq".to_string(),
+            params: vec![],
+            body: vec![IrStmt::Output {
+                value: IrExpr::Int(n),
+                newline: true,
+                target: None,
+            }],
+            named_blocks: vec![],
+        }
+    }
+
+    /// `v=$(sq)`.
+    fn capture() -> IrStmt {
+        IrStmt::Assign {
+            targets: vec![AssignTarget {
+                var: "v".to_string(),
+                sigil: None,
+                indices: vec![],
+            }],
+            expr: IrExpr::Capture {
+                expr: Box::new(IrExpr::Arrow(vec![IrStmt::Expr(IrExpr::Call {
+                    func: "sq".to_string(),
+                    args: vec![],
+                })])),
+                native: false,
+            },
+            asm: None,
+        }
+    }
+
+    fn captured_call(st: &IrStmt) -> bool {
+        matches!(
+            st,
+            IrStmt::Assign { expr: IrExpr::Capture { expr, .. }, .. }
+                if matches!(&**expr, IrExpr::Call { func, .. } if func == "sq")
+        )
+    }
+
+    #[test]
+    fn resolves_a_single_definition() {
+        let mut stmts = vec![def(3), capture()];
+        assert!(transform(&mut stmts));
+        assert!(captured_call(&stmts[1]), "one definition resolves to a direct call");
+    }
+
+    /// BUGS_FOUND entry 11a: bash's `v=$(sq)` runs the LAST definition, so a
+    /// redefined name must be refused — resolving to the first body (what
+    /// `fns.iter().find` did) captures the wrong output.
+    #[test]
+    fn refuses_a_redefined_function() {
+        let mut stmts = vec![def(3), def(4), capture()];
+        assert!(!transform(&mut stmts), "a redefined name must not lift");
+        assert!(!captured_call(&stmts[2]));
+    }
+}
 
 // name: direct-calls
 // prereqs: [function_purity — the pure-output body test is the weak

@@ -1,0 +1,213 @@
+// GENERATED from sh2perl/src/ir.rs @ f68b2adfa407
+// DO NOT EDIT — run harness/verus-sync-pass05.sh
+// Region: optimize_stmts Pass 0.5 — the constant fold that runs on EVERY
+// program. The Verus model sh2perl/proofs/verus/optimize_pass05.rs
+// mirrors these six functions; this baseline is how the gate notices
+// that the code moved under it.
+// fold_bin_op arms in scope: % & && * ** + - / << >> ^ | ||
+
+// ---- fold_stmt ----
+fn fold_stmt(s: &IrStmt) -> IrStmt {
+    match s {
+        IrStmt::Expr(e) => IrStmt::Expr(fold_expr(e)),
+        // keep the declarator asm label through folding (the renderers
+        // see it; the estree no-op and the refuse arms depend on it)
+        IrStmt::Assign {
+            targets,
+            expr,
+            asm,
+        } => IrStmt::Assign {
+            targets: targets.clone(),
+            expr: fold_expr(expr),
+            asm: asm.clone(),
+        },
+        other => other.clone(),
+    }
+}
+
+// ---- fold_expr ----
+fn fold_expr(e: &IrExpr) -> IrExpr {
+    match e {
+        IrExpr::Call { func, args } if func == "arith" && args.len() == 1 => {
+            if let IrExpr::Str(expr, _) = &args[0] {
+                if let Some(v) = fold_arith_const(expr) {
+                    return IrExpr::Int(v);
+                }
+            }
+            IrExpr::Call {
+                func: func.clone(),
+                args: args.iter().map(fold_expr).collect(),
+            }
+        }
+        IrExpr::Call { func, args } => IrExpr::Call {
+            func: func.clone(),
+            args: args.iter().map(fold_expr).collect(),
+        },
+        IrExpr::BinOp {
+            op: BinOpKind::Add,
+            lhs,
+            rhs,
+        } => {
+            if let (IrExpr::Int(a), IrExpr::Int(b)) = (lhs.as_ref(), rhs.as_ref()) {
+                IrExpr::Int(a.wrapping_add(*b))
+            } else {
+                e.clone()
+            }
+        }
+        IrExpr::BinOp {
+            op: BinOpKind::Sub,
+            lhs,
+            rhs,
+        } => {
+            if let (IrExpr::Int(a), IrExpr::Int(b)) = (lhs.as_ref(), rhs.as_ref()) {
+                IrExpr::Int(a.wrapping_sub(*b))
+            } else {
+                e.clone()
+            }
+        }
+        IrExpr::BinOp {
+            op: BinOpKind::Mul,
+            lhs,
+            rhs,
+        } => {
+            if let (IrExpr::Int(a), IrExpr::Int(b)) = (lhs.as_ref(), rhs.as_ref()) {
+                IrExpr::Int(a.wrapping_mul(*b))
+            } else {
+                e.clone()
+            }
+        }
+        // The NEUTRAL arithmetic AST was never folded: Pass 0.5 only folds
+        // the `arith("…")` STRING spelling, so a fully literal `$((1000**7))`
+        // survived to the renderer and became a runtime helper call with an
+        // overflow branch (core request c-20261022-224500). Fold it here.
+        IrExpr::Arith(ast) => IrExpr::Arith(Box::new(fold_arith_ast(ast))),
+        _ => e.clone(),
+    }
+}
+
+// ---- pow_wrapping ----
+fn pow_wrapping(base: i64, exp: i64) -> i64 {
+    let mut acc: i64 = 1;
+    let mut b = base;
+    let mut e = exp;
+    while e > 0 {
+        if e & 1 == 1 {
+            acc = acc.wrapping_mul(b);
+        }
+        e >>= 1;
+        if e > 0 {
+            b = b.wrapping_mul(b);
+        }
+    }
+    acc
+}
+
+// ---- fold_bin_op ----
+fn fold_bin_op(op: &str, a: i64, b: i64) -> Option<i64> {
+    match op {
+        // bash arithmetic is int64 two's-complement — wrap like Rust does.
+        "+" => Some(a.wrapping_add(b)),
+        "-" => Some(a.wrapping_sub(b)),
+        "*" => Some(a.wrapping_mul(b)),
+        // `/` and `%` truncate toward zero (Rust's ops already do), but a
+        // zero divisor is a bash runtime ERROR (value stays unset) and
+        // `i64::MIN / -1` overflows — refuse both rather than invent one.
+        "/" if b != 0 && !(a == i64::MIN && b == -1) => Some(a / b),
+        "%" if b != 0 && !(a == i64::MIN && b == -1) => Some(a % b),
+        // bitwise — always exact on int64.
+        "&" => Some(a & b),
+        "|" => Some(a | b),
+        "^" => Some(a ^ b),
+        // `<<`/`>>`: bash on this platform (x86-64, the equivalence
+        // oracle) masks the shift count mod 64 and wraps the result in
+        // int64 two's-complement — `1 << 63` = i64::MIN, `1 << 64` = 1,
+        // `1 << -1` = i64::MIN, `8 >> 70` = 0 (measured against this
+        // box's bash). Rust's wrapping_shl/shr mask the count to 6 bits
+        // the same way, so the fold is byte-identical to the oracle —
+        // the same precedent pow_wrapping sets for `**`.
+        ">>" => Some(a.wrapping_shr(b as u32)),
+        "<<" => Some(a.wrapping_shl(b as u32)),
+        // arithmetic `&&`/`||` yield 1/0; both operands are literals here,
+        // so short-circuiting cannot skip a side effect.
+        "&&" => Some(((a != 0) && (b != 0)) as i64),
+        "||" => Some(((a != 0) || (b != 0)) as i64),
+        // bash `$((b ** e))` is int64 two's-complement (wraps, never
+        // errors) but a NEGATIVE exponent is a bash runtime ERROR, not a
+        // value — refuse to fold it rather than invent one.
+        "**" if b >= 0 => Some(pow_wrapping(a, b)),
+        _ => None,
+    }
+}
+
+// ---- fold_un_op ----
+fn fold_un_op(op: &str, a: i64) -> Option<i64> {
+    match op {
+        // bash `$((-x))` is two's-complement negation — wraps, no error.
+        "-" => Some(a.wrapping_neg()),
+        "+" => Some(a),
+        // logical not → 1/0; signed not: `~x == -x - 1`.
+        "!" => Some((a == 0) as i64),
+        "~" => Some(!a),
+        _ => None,
+    }
+}
+
+// ---- fold_arith_ast ----
+pub(crate) fn fold_arith_ast(ast: &ArithAst) -> ArithAst {
+    match ast {
+        ArithAst::Bin { op, lhs, rhs } => {
+            let l = fold_arith_ast(lhs);
+            let r = fold_arith_ast(rhs);
+            // Fully-literal operands fold to a single `Num` so EVERY backend
+            // emits the literal instead of re-deriving the arithmetic at
+            // runtime (`3i64 * 4i64` in Rust, a `__sh_div` polyfill for
+            // `10/2`, `int(a/b)` guards in Perl). REFUSE > GUESS: any op we
+            // cannot evaluate to bash's exact int64 answer (div-by-zero, an
+            // out-of-range shift, an overflow the renderer models
+            // differently) keeps its shape.
+            if let (ArithAst::Num(a), ArithAst::Num(b)) = (&l, &r) {
+                if let Some(v) = fold_bin_op(op, *a, *b) {
+                    return ArithAst::Num(v);
+                }
+            }
+            ArithAst::Bin {
+                op: op.clone(),
+                lhs: Box::new(l),
+                rhs: Box::new(r),
+            }
+        }
+        ArithAst::Un { op, arg } => {
+            let a = fold_arith_ast(arg);
+            // A fully-literal unary operand folds too (`$((-3))` → -3).
+            if let ArithAst::Num(n) = &a {
+                if let Some(v) = fold_un_op(op, *n) {
+                    return ArithAst::Num(v);
+                }
+            }
+            ArithAst::Un {
+                op: op.clone(),
+                arg: Box::new(a),
+            }
+        }
+        ArithAst::Cond { test, then, else_ } => ArithAst::Cond {
+            test: Box::new(fold_arith_ast(test)),
+            then: Box::new(fold_arith_ast(then)),
+            else_: Box::new(fold_arith_ast(else_)),
+        },
+        ArithAst::Index { var, key } => ArithAst::Index {
+            var: var.clone(),
+            key: Box::new(fold_arith_ast(key)),
+        },
+        ArithAst::Assign { var, op, rhs } => ArithAst::Assign {
+            var: var.clone(),
+            op: op.clone(),
+            rhs: Box::new(fold_arith_ast(rhs)),
+        },
+        ArithAst::Cast { ty, arg } => ArithAst::Cast {
+            ty: ty.clone(),
+            arg: Box::new(fold_arith_ast(arg)),
+        },
+        other => other.clone(),
+    }
+}
+

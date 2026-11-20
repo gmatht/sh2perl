@@ -3,15 +3,18 @@
 // maximal pure invariant run moves to the loop prologue. Proves the
 // hoist-preservation obligation:
 //
-//   hoist_sound (n >= 1): the hoisted loop and the original loop
-//   agree with the prologue state on every lookup.
+//   hoist_sound (ALL n, incl. n = 0): the hoisted loop and the
+//   original loop agree with the prologue state on every lookup.
 //
-// The proof found a REAL SOUNDNESS HOLE: at n = 0 the prologue runs
-// while the original runs nothing (verified live against the
-// transform: `while false; do y = 5; done` hoists `y = 5`
-// unconditionally). The theorem covers exactly the sound fragment
-// (n >= 1); the 0-trip divergence is pinned as
-// pin_zero_trip_diverges and recorded in BUGS_FOUND.md.
+// The proof found a REAL SOUNDNESS HOLE that has since been FIXED
+// (BUGS_FOUND entry 7): at n = 0 the prologue ran while the original
+// runs nothing (`while false; do y = 5; done` hoisted `y = 5`
+// unconditionally). The transform now emits the prologue under the
+// loop's own entry test — `if <cond>; then <run>; fi` before the loop —
+// so `run_hoisted` is guarded and the whole-loop induction no longer
+// needs an n >= 1 proviso. `run_hoisted_unguarded` is the pre-fix
+// emission: `pin_zero_trip_diverges` refutes THAT one, which is what
+// makes the guard load-bearing rather than decorative.
 //
 // Agreement is pointwise (the redundant_store_elim precedent —
 // agree_shadow over lookups, never whole-Map ==, which the solver
@@ -101,16 +104,27 @@ pub open spec fn run_trip(prefix: Seq<InvAssign>, suffix: Seq<Var>, s: Store) ->
     run_suffix(suffix, run_prefix(prefix, s))
 }
 
-// Whole hoisted loop (n >= 1): prologue once, then n suffix trips.
-// At n = 0 the prologue still runs (the code-faithful base) — the
-// 0-trip hole the model pins but does not bless.
+// Whole hoisted loop (the FIXED emission): the prologue is guarded by
+// the loop's entry test, so at n = 0 it does not run at all.
 pub open spec fn run_hoisted(prefix: Seq<InvAssign>, suffix: Seq<Var>, s: Store, n: nat) -> Store
+    decreases n,
+{
+    if n == 0 {
+        s
+    } else {
+        run_hoisted(prefix, suffix, run_suffix(suffix, run_prefix(prefix, s)), (n - 1) as nat)
+    }
+}
+
+// The PRE-FIX emission: prologue once, unconditionally, then n suffix
+// trips. Kept only as the negative control for the guard.
+pub open spec fn run_hoisted_unguarded(prefix: Seq<InvAssign>, suffix: Seq<Var>, s: Store, n: nat) -> Store
     decreases n,
 {
     if n == 0 {
         run_prefix(prefix, s)
     } else {
-        run_hoisted(prefix, suffix, run_suffix(suffix, run_prefix(prefix, s)), (n - 1) as nat)
+        run_hoisted_unguarded(prefix, suffix, run_suffix(suffix, run_prefix(prefix, s)), (n - 1) as nat)
     }
 }
 
@@ -319,8 +333,37 @@ proof fn prefix_fixed(prefix: Seq<InvAssign>, s: Store)
     }
 }
 
+// BEHAVIOUR PRESERVATION, ALL TRIP COUNTS (the fixed emission): the
+// guarded hoist and the original loop produce the same store at every
+// n, including n = 0. No gates are needed for this one — the two runs
+// are the same computation once the loop is entered.
+proof fn hoist_sound_all(prefix: Seq<InvAssign>, suffix: Seq<Var>, s: Store, n: nat)
+    ensures store_agree(run_hoisted(prefix, suffix, s, n), run_loop(prefix, suffix, s, n)),
+    decreases n,
+{
+    if n == 0 {
+        assert(run_hoisted(prefix, suffix, s, 0) == s) by {
+            reveal_with_fuel(run_hoisted, 3);
+        };
+        assert(run_loop(prefix, suffix, s, 0) == s) by {
+            reveal_with_fuel(run_loop, 3);
+        };
+    } else {
+        let s1 = run_suffix(suffix, run_prefix(prefix, s));
+        hoist_sound_all(prefix, suffix, s1, (n - 1) as nat);
+        assert(run_hoisted(prefix, suffix, s, n) == run_hoisted(prefix, suffix, s1, (n - 1) as nat)) by {
+            reveal_with_fuel(run_hoisted, 3);
+        };
+        assert(run_loop(prefix, suffix, s, n) == run_loop(prefix, suffix, s1, (n - 1) as nat)) by {
+            reveal_with_fuel(run_loop, 3);
+        };
+    }
+}
+
 // THE OBLIGATION (whole loop, n >= 1): both sides agree with the
-// prologue state on every lookup.
+// prologue state on every lookup. The n >= 1 proviso is not a hole —
+// hoist_sound_all above covers n = 0, where the guarded prologue does
+// not run and the "prologue state" is never reached by either side.
 proof fn hoist_sound(prefix: Seq<InvAssign>, suffix: Seq<Var>, s: Store, n: nat)
     requires all_invariant(prefix), single_write(prefix), n >= 1,
     ensures
@@ -329,17 +372,17 @@ proof fn hoist_sound(prefix: Seq<InvAssign>, suffix: Seq<Var>, s: Store, n: nat)
     decreases n,
 {
     if n == 1 {
-        assert(run_hoisted(prefix, suffix, s, 1) == run_prefix(prefix, run_suffix(suffix, run_prefix(prefix, s)))) by {
-            reveal_with_fuel(run_hoisted, 3);
+        // guarded emission: at n = 1 the prologue ran once and the single
+        // trip re-established the same state (the suffix is identity)
+        assert(run_hoisted(prefix, suffix, s, 1) == run_suffix(suffix, run_prefix(prefix, s))) by {
+            reveal_with_fuel(run_hoisted, 4);
         };
         assert(run_loop(prefix, suffix, s, 1) == run_trip(prefix, suffix, s)) by {
             reveal_with_fuel(run_loop, 3);
         };
         trip_agrees(prefix, suffix, s);
-        prefix_fixed(prefix, s);
         assert forall|v: Var| lookup(run_hoisted(prefix, suffix, s, 1), v) == lookup(run_prefix(prefix, s), v) by {
-            assert(lookup(run_hoisted(prefix, suffix, s, 1), v) == lookup(run_prefix(prefix, run_suffix(suffix, run_prefix(prefix, s))), v));
-            assert(lookup(run_prefix(prefix, run_suffix(suffix, run_prefix(prefix, s))), v) == lookup(run_prefix(prefix, s), v));
+            assert(lookup(run_hoisted(prefix, suffix, s, 1), v) == lookup(run_suffix(suffix, run_prefix(prefix, s)), v));
         };
         assert forall|v: Var| lookup(run_loop(prefix, suffix, s, 1), v) == lookup(run_prefix(prefix, s), v) by {
             assert(lookup(run_loop(prefix, suffix, s, 1), v) == lookup(run_trip(prefix, suffix, s), v));
@@ -389,18 +432,17 @@ proof fn pin_hoist_preserves_run()
     };
 }
 
-// The 0-trip hole, pinned pointwise: at n = 0 the hoisted prologue
-// sets y while the original leaves it unset — different lookups.
-// This pin is the negative control that proves the n >= 1 premise
-// load-bearing (and the failing-first shape for the transform owner).
+// THE GUARD IS LOAD-BEARING (negative control): the PRE-FIX emission
+// runs the prologue at n = 0, so it sets y where the original leaves it
+// unset. This is the defect BUGS_FOUND entry 7 recorded.
 proof fn pin_zero_trip_diverges(s: Store)
     requires !s.dom().contains(3nat),
-    ensures lookup(run_hoisted(seq![InvAssign { target: 3nat, value: 5 }], seq![], s, 0), 3nat)
+    ensures lookup(run_hoisted_unguarded(seq![InvAssign { target: 3nat, value: 5 }], seq![], s, 0), 3nat)
         != lookup(run_loop(seq![InvAssign { target: 3nat, value: 5 }], seq![], s, 0), 3nat),
 {
     let prefix = seq![InvAssign { target: 3nat, value: 5 }];
-    assert(run_hoisted(prefix, seq![], s, 0) == run_prefix(prefix, s)) by {
-        reveal_with_fuel(run_hoisted, 3);
+    assert(run_hoisted_unguarded(prefix, seq![], s, 0) == run_prefix(prefix, s)) by {
+        reveal_with_fuel(run_hoisted_unguarded, 3);
     };
     assert(run_loop(prefix, seq![], s, 0) == s) by {
         reveal_with_fuel(run_loop, 3);
@@ -410,6 +452,21 @@ proof fn pin_zero_trip_diverges(s: Store)
     };
     assert(lookup(s.insert(3nat, 5), 3nat) == 5);
     assert(lookup(s, 3nat) == 0);
+}
+
+// ... and the FIXED emission agrees at n = 0 (the positive control that
+// pairs with the refutation above).
+proof fn pin_guarded_zero_trip_agrees(s: Store)
+    ensures lookup(run_hoisted(seq![InvAssign { target: 3nat, value: 5 }], seq![], s, 0), 3nat)
+        == lookup(run_loop(seq![InvAssign { target: 3nat, value: 5 }], seq![], s, 0), 3nat),
+{
+    let prefix = seq![InvAssign { target: 3nat, value: 5 }];
+    assert(run_hoisted(prefix, seq![], s, 0) == s) by {
+        reveal_with_fuel(run_hoisted, 3);
+    };
+    assert(run_loop(prefix, seq![], s, 0) == s) by {
+        reveal_with_fuel(run_loop, 3);
+    };
 }
 
 fn main() {}

@@ -36,6 +36,26 @@
 //! `rand` (an LCG that advances a program var) is refused by the purity
 //! gate — a random value must never be hoisted.
 //!
+//! ## The trip guard (BUGS_FOUND entry 7)
+//! The gates above describe the leading invariant run of ONE trip. Hoisting
+//! it to a loop PREHEADER also needs the loop to run at least once: at 0
+//! trips the original runs nothing, so an unguarded prologue would assign
+//! vars bash leaves unset (`while false; do y=5; done`). Every prologue is
+//! therefore emitted as the loop's own entry test:
+//!
+//! ```text
+//! if <loop cond>; then <hoisted run>; fi   # runs iff the loop body runs
+//! while <loop cond>; do <rest>; done
+//! ```
+//!
+//! Duplicating the condition is faithful only when evaluating it has no
+//! effect beyond reading variables, so `while` bodies hoist only under a
+//! side-effect-free condition (`test`/`arith`/reads/literals); a condition
+//! that calls a function or runs a command refuses the hoist. A `for` loop
+//! has no re-evaluable test — it is guarded by a statically non-empty
+//! `Range` (`start < end`, the only iterable whose emptiness is known
+//! syntactically), and any other iterable refuses.
+//!
 //! ## Placement
 //! Registered in `transforms.rs` (SH2_TRANSFORMS gated). Prereq:
 //! function-purity (the pure-function call verdict; the conservative
@@ -72,12 +92,29 @@ pub fn transform(stmts: &mut Vec<IrStmt>) -> bool {
 /// If `st` is a loop with hoistable leading work, return (hoisted, new
 /// body); otherwise `(vec![], None)`.
 fn split_loop(st: &IrStmt, fns: &[(String, Vec<IrStmt>)]) -> (Vec<IrStmt>, Option<Vec<IrStmt>>) {
-    let (body, loop_vars): (&Vec<IrStmt>, Vec<String>) = match st {
-        IrStmt::While { body, .. } => (body, Vec::new()),
+    // `entry_guard` is the condition the prologue is wrapped in; `None`
+    // means the loop is known to run at least once (so no guard is
+    // needed). A loop whose guard cannot be built refuses the hoist.
+    let (body, loop_vars, entry_guard): (&Vec<IrStmt>, Vec<String>, Option<IrExpr>) = match st {
+        IrStmt::While { cond, body } => {
+            // re-evaluating the test before the loop is faithful only if
+            // the test cannot do anything but read (BUGS_FOUND entry 7:
+            // a 0-trip loop must not run the prologue).
+            if !guard_cond_pure(cond) {
+                return (Vec::new(), None);
+            }
+            (body, Vec::new(), Some(cond.clone()))
+        }
         // The foreach counter is loop-carried by construction: a body
         // write that reads it (RHS *or* an index embedded in the target
         // text like `a[$i]`) must never execute once before the loop.
-        IrStmt::For { body, var, .. } => (body, vec![var.clone()]),
+        // `for i in START..END` runs at least once exactly when
+        // START < END, which is checkable here; any other iterable may be
+        // empty (0 trips) and has no re-evaluable guard — refuse.
+        IrStmt::For { body, var, iter } => match iter {
+            IrExpr::Range { start, end } if start < end => (body, vec![var.clone()], None),
+            _ => return (Vec::new(), None),
+        },
         _ => return (Vec::new(), None),
     };
     let hoisted = hoist_body(body, fns, &loop_vars);
@@ -85,7 +122,61 @@ fn split_loop(st: &IrStmt, fns: &[(String, Vec<IrStmt>)]) -> (Vec<IrStmt>, Optio
         return (Vec::new(), None);
     }
     let kept: Vec<IrStmt> = body.iter().filter(|s| !hoisted.contains(*s)).cloned().collect();
-    (hoisted, Some(kept))
+    let prologue = match entry_guard {
+        Some(cond) => vec![IrStmt::If {
+            cond,
+            then: hoisted,
+            elsifs: Vec::new(),
+            else_: Vec::new(),
+        }],
+        None => hoisted,
+    };
+    (prologue, Some(kept))
+}
+
+/// May the loop's entry test be evaluated once before the loop in addition
+/// to the loop's own evaluations? Only if doing so is observationally
+/// inert: no command execution, no function call, no assignment inside an
+/// arithmetic tree, no capture/subshell. Reads are fine — they are what
+/// the loop itself does on every trip.
+fn guard_cond_pure(e: &IrExpr) -> bool {
+    match e {
+        IrExpr::Int(_) | IrExpr::Var(_, _) | IrExpr::Ident(_) | IrExpr::Str(_, _) => true,
+        IrExpr::BinOp { lhs, rhs, .. } => guard_cond_pure(lhs) && guard_cond_pure(rhs),
+        IrExpr::Arith(a) => arith_guard_pure(a),
+        IrExpr::Index { key, .. } => guard_cond_pure(key),
+        IrExpr::Ternary { cond, then, else_, .. } => {
+            guard_cond_pure(cond) && guard_cond_pure(then) && guard_cond_pure(else_)
+        }
+        IrExpr::DefinedOr { expr, default, .. } => {
+            guard_cond_pure(expr) && guard_cond_pure(default)
+        }
+        IrExpr::Call { func, args } => {
+            // `test`/`arith` evaluate a string; the reads below only look
+            // a variable up. Everything else (a user function, `exec`, a
+            // method call) can have an effect and must not be duplicated.
+            matches!(
+                func.as_str(),
+                "test" | "arith" | "getVar" | "arrayIndex" | "listVar" | "arrayItems" | "arrayLen"
+            ) && args.iter().all(guard_cond_pure)
+        }
+        _ => false,
+    }
+}
+
+fn arith_guard_pure(a: &ArithAst) -> bool {
+    match a {
+        ArithAst::Num(_) | ArithAst::Var(_) | ArithAst::Ident(_) => true,
+        ArithAst::Bin { lhs, rhs, .. } => arith_guard_pure(lhs) && arith_guard_pure(rhs),
+        ArithAst::Un { arg, .. } => arith_guard_pure(arg),
+        ArithAst::Cond { test, then, else_ } => {
+            arith_guard_pure(test) && arith_guard_pure(then) && arith_guard_pure(else_)
+        }
+        ArithAst::Index { key, .. } => arith_guard_pure(key),
+        ArithAst::Cast { arg, .. } => arith_guard_pure(arg),
+        // Assign / IncDec write: duplicating the test would duplicate a store.
+        _ => false,
+    }
 }
 
 fn set_loop_body(st: &IrStmt, body: Vec<IrStmt>) -> IrStmt {
@@ -948,27 +1039,92 @@ mod tests {
     }
 
     /// `x=5; while c; do y = x; done` — `y` reads only the invariant `x`;
-    /// `y` is written once, reads nothing loop-carried → hoisted.
+    /// `y` is written once, reads nothing loop-carried → hoisted, into the
+    /// loop's entry guard (`if c; then y=x; fi`) so a 0-trip loop leaves
+    /// `y` alone exactly as bash does.
     #[test]
     fn hoists_invariant_from_body() {
+        let cond = IrExpr::Call {
+            func: "test".to_string(),
+            args: vec![IrExpr::Str("$n -lt 10".into(), StrStyle::DoubleQuoted)],
+        };
         let mut stmts = vec![
             assign("x", IrExpr::Int(5)),
             IrStmt::While {
-                cond: IrExpr::Call {
-                    func: "test".to_string(),
-                    args: vec![IrExpr::Str("$n -lt 10".into(), StrStyle::DoubleQuoted)],
-                },
+                cond: cond.clone(),
                 body: vec![assign("y", IrExpr::Var("x".to_string(), None))],
             },
         ];
         assert!(transform(&mut stmts));
-        // the hoisted `y = x` lands just before the loop
-        assert_eq!(stmts[1], assign("y", IrExpr::Var("x".to_string(), None)));
+        // the hoisted `y = x` lands just before the loop, under its test
+        assert_eq!(
+            stmts[1],
+            IrStmt::If {
+                cond: cond.clone(),
+                then: vec![assign("y", IrExpr::Var("x".to_string(), None))],
+                elsifs: vec![],
+                else_: vec![],
+            }
+        );
         if let IrStmt::While { body, .. } = &stmts[2] {
             assert!(body.is_empty(), "invariant write removed from body");
         } else {
             panic!("expected While at index 2");
         }
+    }
+
+    /// BUGS_FOUND entry 7, the failing-first shape: `while false; do y = 5;
+    /// done` must NOT emit a bare `y = 5` before the loop — the prologue
+    /// has to run iff the loop body runs. Before the trip guard the
+    /// transform hoisted the assignment unconditionally and bash (`y`
+    /// unset) and the native (`y = 5`) disagreed.
+    #[test]
+    fn zero_trip_loop_never_runs_the_prologue() {
+        let mut stmts = vec![IrStmt::While {
+            cond: IrExpr::Call {
+                func: "test".to_string(),
+                args: vec![IrExpr::Str("$n -lt 0".into(), StrStyle::DoubleQuoted)],
+            },
+            body: vec![assign("y", IrExpr::Int(5))],
+        }];
+        transform(&mut stmts);
+        // the prologue is guarded: no unguarded `y = 5` may precede it
+        assert!(
+            matches!(&stmts[0], IrStmt::If { then, .. } if then == &vec![assign("y", IrExpr::Int(5))]),
+            "the hoisted run must sit under the loop's entry test, got {:?}",
+            stmts[0]
+        );
+    }
+
+    /// A condition with an effect (a function call) is not re-evaluable:
+    /// the hoist refuses rather than duplicate the call.
+    #[test]
+    fn refuses_to_duplicate_an_effectful_loop_condition() {
+        let mut stmts = vec![IrStmt::While {
+            cond: IrExpr::Call {
+                func: "next".to_string(),
+                args: vec![],
+            },
+            body: vec![assign("y", IrExpr::Int(5))],
+        }];
+        assert!(!transform(&mut stmts));
+        if let IrStmt::While { body, .. } = &stmts[0] {
+            assert_eq!(body.len(), 1, "an effectful test is never duplicated");
+        } else {
+            panic!("expected While");
+        }
+    }
+
+    /// A `for` over a statically EMPTY range is 0-trip: its prologue would
+    /// be observable, and there is no test to guard it with → refuse.
+    #[test]
+    fn refuses_empty_foreach_range() {
+        let mut stmts = vec![IrStmt::For {
+            var: "i".to_string(),
+            iter: IrExpr::Range { start: 7, end: 7 },
+            body: vec![assign("y", IrExpr::Int(5))],
+        }];
+        assert!(!transform(&mut stmts));
     }
 
     /// `while [ $x -lt 10 ]; do echo $x; x=x+1; done` — the echo reads x
