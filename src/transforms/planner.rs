@@ -242,11 +242,11 @@ pub fn node_manifest(target: &str) -> &'static [&'static str] {
         // the existing path is untouched):
         //  * RegSub, RegexpFind — `std` has no regex; a hand-rolled matcher
         //    would not be exact.
-        //  * StringAffix — it is a prefix/suffix PREDICATE (`[[ $x == P* ]]`,
-        //    `case P*)`). No transform in this pipeline constructs it from
-        //    shell source, and those test shapes already render natively
-        //    (`.starts_with(…)`/`.ends_with(…)` via the test lowering), so
-        //    declaring it would add an unreachable second path.
+        //  * StringAffix / CutsetTrim are DECLARED but, like SortLines and
+        //    TakeLines, no transform in this pipeline constructs them from
+        //    shell source (`[[ $x == P* ]]` renders as `.starts_with` in the
+        //    test lowering directly), so they are pinned by CONSTRUCTING
+        //    the node and running it against bash.
         //  * AffixStrip — `${v#p}`/`${v%s}` lower through the backend's own
         //    strip helpers (`__sh_strippre`/`__sh_stripsuf` over
         //    `__sh_fnmatch`), which accept ARBITRARY glob patterns; `std`'s
@@ -267,6 +267,9 @@ pub fn node_manifest(target: &str) -> &'static [&'static str] {
                 // are glob strips, which differ on a trailing slash — so
                 // the GNU rules the arm spells are the whole contract.
                 "PathName",
+                // The cutset trim: `trim_matches(|c| cutset.contains(c))`,
+                // with `left`/`right` selecting the one-sided form.
+                "CutsetTrim",
                 // `tr`'s general map: the lowering EXPANDS ranges and classes
                 // before the node is built, so `from`/`to` are the map and
                 // `chars().map(...)` is exact (delete and squeeze included).

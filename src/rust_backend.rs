@@ -5904,6 +5904,17 @@ while __p.len() > 1 && __p.ends_with('/') {{ __p = &__p[..__p.len() - 1]; }} @TA
                 .replace("@TAIL@", tail)
                 .replace("@T@", &t))
             }
+            "CutsetTrim" => {
+                let x = n.as_any().downcast_ref::<crate::shir_nodes::CutsetTrim>()?;
+                let t = self.expr_str(&x.text);
+                let c = self.expr_str(&x.cutset);
+                let m = match x.side.as_deref() {
+                    Some("left") => "trim_start_matches",
+                    Some("right") => "trim_end_matches",
+                    _ => "trim_matches",
+                };
+                Some(format!("{t}.{m}(|__c| {c}.contains(__c)).to_string()"))
+            }
             _ => None,
         }
     }
@@ -24534,7 +24545,7 @@ mod tests {
     /// against the bash command it models — `head -n`/`tail -n`.
     #[test]
     fn constructed_text_nodes_execute_like_bash() {
-        use crate::shir_nodes::{SortLines, TakeLines, UniqLines};
+        use crate::shir_nodes::{CutsetTrim, SortLines, TakeLines, UniqLines};
         let mut cases: Vec<(String, String, &str)> = Vec::new();
         for (from_end, bash_src) in [
             (false, "printf 'a\\nb\\nc\\n' | head -n 2\n"),
@@ -24603,6 +24614,34 @@ mod tests {
             "UniqLinesSkip".to_string(),
             uniq("x_a\ny_a\nz_b", 2, false),
             "printf 'x_a\\ny_a\\nz_b\\n' | uniq -s 2\n",
+        ));
+        // CutsetTrim: the same character-set strip `sed` spells, per side.
+        let cutset = |text: &str, cut: &str, side: Option<&str>| {
+            shir_to_rust(&print_program(IrExpr::Ext(Box::new(CutsetTrim {
+                text: s(text),
+                cutset: s(cut),
+                side: side.map(|s| s.to_string()),
+            }))))
+        };
+        cases.push((
+            "CutsetTrimBoth".to_string(),
+            cutset("xxabcxx", "x", None),
+            "printf '%s\\n' xxabcxx | sed 's/^x*//; s/x*$//'\n",
+        ));
+        cases.push((
+            "CutsetTrimLeft".to_string(),
+            cutset("xxabcxx", "x", Some("left")),
+            "printf '%s\\n' xxabcxx | sed 's/^x*//'\n",
+        ));
+        cases.push((
+            "CutsetTrimRight".to_string(),
+            cutset("xxabcxx", "x", Some("right")),
+            "printf '%s\\n' xxabcxx | sed 's/x*$//'\n",
+        ));
+        cases.push((
+            "CutsetTrimSet".to_string(),
+            cutset("--a.b--", "-.", None),
+            "printf '%s\\n' --a.b-- | sed 's/^[-.]*//; s/[-.]*$//'\n",
         ));
         let mut bad: Vec<String> = Vec::new();
         for (case, prog, bash_src) in cases {
