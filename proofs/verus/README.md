@@ -255,6 +255,62 @@ Mutants, measured: permissive parser **31 verified, 2 errors**; wrapping
 arithmetic **28 / 5**; folding a runtime-valued tree **31 / 2**; identity
 **27 / 6**.
 
+## `echo_fold_output.rs` — a constant `echo` prints what the `Output` node prints
+
+`echo_fold::fold_to_output` replaces `echo WORD…` with `IrStmt::Output` when
+every word is a compile-time constant: it scans the leading `-n`/`-e`/`-E`/`--`
+flags, joins the remaining words with one space, decodes the `-e` escapes, and
+carries the trailing newline in the node's `newline` flag rather than in the
+text.
+
+The file models the two ends and proves they print the same bytes, for every
+all-literal word list and every environment:
+
+```
+out_bytes(fold(ws), env) == out_bytes(S::Echo(ws), env)
+```
+
+`out_bytes` is the lowering law: an `Output(text, newline)` prints `text` plus
+`\n` when the flag is set, and a surviving `Echo` prints the bash model
+(`echo_bytes`). The word list is `W::Lit(Seq<int>) | W::Dyn(nat)`, so a runtime
+word (an env read) is a distinct shape, not an empty string.
+
+The model's content, each pinned by a witness and measured red as a mutant:
+
+- **the newline is not in the text** — `echo -n hi` prints `hi`, and
+  `echo hi` prints `hi\n` because the FLAG appends it. Baking `\n` into the
+  text while keeping the flag doubles it (18v/11e).
+- **the join is one space** — join with no separator gives `ab` for
+  `echo a b` (27v/2e).
+- **`-e` decodes through the shared table** — `echo -e 'a\nb'` prints a real
+  newline; ignoring `-e` leaves the two-character spelling (25v/4e).
+- **`--` ends the scan and is consumed** — with `echo -- -n` the `-n` is a
+  WORD, so the output is `-n\n`; letting the scan run past `--` swallows it and
+  drops the newline (27v/2e).
+- **a runtime word is not folded** — folding `Dyn` through the empty
+  compile-time placeholder prints only the newline; one environment (`x`)
+  disagrees (26v/3e).
+- **`\c` truncates** — `echo -e 'a\cb'` prints `a`; treating `\c` as an
+  unknown escape prints `a\cb` (27v/2e).
+
+`fold_leaves_nothing` (every all-literal list is an `Output`) and
+`fold_is_idempotent` are separate obligations, so an identity pass cannot
+satisfy the law.
+
+Pins mirror the source's tests: `literal_echo_folds_to_output`,
+`flags_and_join`, `dash_e_unescapes`, `expansion_word_does_not_fold`,
+`output_without_newline_stays_without_one`,
+`dynamic_output_keeps_the_expression`, and `echo_esc_matches_bash_common_cases`
+(the rows the model decides: `\n \t \\ \c`), plus the literal escape bytes
+(`"hi" = [104,105]`, `"a\nb" = [97,92,110,98]`, `"a\qb" = [97,92,113,98]`).
+
+Hypothesis in-file: bash's `\c` stops ALL output including the trailing
+newline, but `echo_esc` returns only the truncated TEXT and `fold_to_output`
+sets `newline: nl` unconditionally, so on that one row the model states the
+SHARED TABLE's contract (the one the file documents for the backends'
+unescapers), not bash's. The redirect (`> file`) and `printf` halves of the
+pass are out of scope and named as such.
+
 ## Running it
 
 Verus needs rust toolchain `1.99.1-x86_64-unknown-linux-gnu`
