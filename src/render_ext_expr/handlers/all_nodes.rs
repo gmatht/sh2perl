@@ -1363,3 +1363,78 @@ pub fn reg_count(node: &RegCount, ctx: &ExprRenderCtx) -> Option<String> {
         _ => None,
     }
 }
+
+// ── fs.* predicates (fs-lift) ─────────────────────────────────────────
+//
+// `[ A -ef B ]` and friends, spelled once here so the Rust backend's own
+// Ext arm and the shared handler registry cannot drift. Every other backend
+// returns None: the nodes are offered only where a renderer can name the
+// predicate exactly, which today is `std` on Unix.
+
+/// `-ef`: same device + inode over stat(2). BOTH operands must stat — GNU
+/// test says two missing paths are NOT the same file.
+pub(crate) fn fs_same_file_rust(left: &str, right: &str) -> String {
+    format!(
+        "{{ use std::os::unix::fs::MetadataExt; \
+         match (std::fs::metadata(&{left}), std::fs::metadata(&{right})) {{ \
+         (Ok(__sh_a), Ok(__sh_b)) => __sh_a.dev() == __sh_b.dev() && __sh_a.ino() == __sh_b.ino(), \
+         _ => false }} }}"
+    )
+}
+
+/// `-nt` / `-ot`: full-precision mtime comparison with bash's asymmetric
+/// MISSING-OPERAND rule (`-nt` is true when the RIGHT side is missing,
+/// `-ot` when the LEFT one is; two missing files are neither).
+pub(crate) fn fs_newer_than_rust(left: &str, right: &str, newer: bool) -> String {
+    let arms = if newer {
+        "(Some(__sh_a), Some(__sh_b)) => __sh_a > __sh_b, (Some(_), None) => true, _ => false"
+    } else {
+        "(Some(__sh_a), Some(__sh_b)) => __sh_a < __sh_b, (None, Some(_)) => true, _ => false"
+    };
+    format!(
+        "{{ let __sh_a = std::fs::metadata(&{left}).and_then(|m| m.modified()).ok(); \
+         let __sh_b = std::fs::metadata(&{right}).and_then(|m| m.modified()).ok(); \
+         match (__sh_a, __sh_b) {{ {arms} }} }}"
+    )
+}
+
+/// `-N`: one stat's mtime strictly later than its atime.
+pub(crate) fn fs_modified_since_read_rust(path: &str) -> String {
+    format!(
+        "{{ match std::fs::metadata(&{path}) {{ \
+         Ok(__sh_m) => match (__sh_m.modified(), __sh_m.accessed()) {{ \
+         (Ok(__sh_mt), Ok(__sh_at)) => __sh_mt > __sh_at, _ => false }}, \
+         Err(_) => false }} }}"
+    )
+}
+
+pub fn fs_same_file(node: &crate::shir_nodes::FsSameFile, ctx: &ExprRenderCtx) -> Option<String> {
+    match ctx.backend {
+        Backend::Rust => Some(fs_same_file_rust(
+            &render_child(&node.left, ctx)?,
+            &render_child(&node.right, ctx)?,
+        )),
+        _ => None,
+    }
+}
+
+pub fn fs_newer_than(node: &crate::shir_nodes::FsNewerThan, ctx: &ExprRenderCtx) -> Option<String> {
+    match ctx.backend {
+        Backend::Rust => Some(fs_newer_than_rust(
+            &render_child(&node.left, ctx)?,
+            &render_child(&node.right, ctx)?,
+            node.newer,
+        )),
+        _ => None,
+    }
+}
+
+pub fn fs_modified_since_read(
+    node: &crate::shir_nodes::FsModifiedSinceRead,
+    ctx: &ExprRenderCtx,
+) -> Option<String> {
+    match ctx.backend {
+        Backend::Rust => Some(fs_modified_since_read_rust(&render_child(&node.path, ctx)?)),
+        _ => None,
+    }
+}

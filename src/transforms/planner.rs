@@ -269,6 +269,10 @@ pub fn node_manifest(target: &str) -> &'static [&'static str] {
         // alone, `to_uppercase()` does not).
         "rs" | "rust" => &[
             "StringContains", "StrLen", "CaseTransform", "FieldExtract",
+            // fs-lift (class 5/6): the file predicates whose `std` reading is
+            // exact — dev+ino identity, full-precision mtime comparison with
+            // bash's missing-operand rule, and `-N` as mtime > atime.
+            "FsSameFile", "FsNewerThan", "FsModifiedSinceRead",
                 "WordCount", "RegCount", "TakeLines", "StringTrim",
                 "SubStrExtract", "RepeatStr", "Split", "ArrayLen",
                 // `basename`/`dirname` commands: text_ops builds PathName

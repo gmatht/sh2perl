@@ -5707,6 +5707,12 @@ impl Render {
     /// previous rendering, and the transform never offers that shape here.
     fn ext_std_str(&mut self, n: &dyn crate::shir_nodes::ExtExpr) -> Option<String> {
         match n.tag() {
+            // The fs predicates are BOOLEANS; a string-typed consumer (an
+            // assignment, an arithmetic operand) sees bash's "1"/"0".
+            "FsSameFile" | "FsNewerThan" | "FsModifiedSinceRead" => Some(format!(
+                "(if {} {{ \"1\" }} else {{ \"0\" }}).to_string()",
+                self.fs_pred_bool(n)
+            )),
             "StringTrim" => {
                 let x = n.as_any().downcast_ref::<crate::shir_nodes::StringTrim>()?;
                 let t = self.expr_str(&x.text);
@@ -5942,6 +5948,40 @@ while __sh_path.len() > 1 && __sh_path.ends_with('/') {{ __sh_path = &__sh_path[
         // and the pattern expression may be either — go through one binding.
         format!("{{ let __sh_pattern = String::from({p}); {t}.{m}(&__sh_pattern[..]) }}")
     }
+    /// The `fs.*` predicate family — bash's `-ef` / `-nt` / `-ot` / `-N` spelled
+    /// with `std` in one expression each. The NODE carries the semantics that
+    /// are easy to get wrong (the missing-operand rule, FULL-precision
+    /// timestamps, stat-not-lstat); the renderer only writes them down.
+    fn fs_pred_bool(&mut self, n: &dyn crate::shir_nodes::ExtExpr) -> String {
+        use crate::render_ext_expr::handlers::all_nodes as shared;
+        match n.tag() {
+            "FsSameFile" => {
+                let x = n
+                    .as_any()
+                    .downcast_ref::<crate::shir_nodes::FsSameFile>()
+                    .expect("tag/type agree");
+                let (l, r) = (self.expr_str(&x.left), self.expr_str(&x.right));
+                shared::fs_same_file_rust(&l, &r)
+            }
+            "FsNewerThan" => {
+                let x = n
+                    .as_any()
+                    .downcast_ref::<crate::shir_nodes::FsNewerThan>()
+                    .expect("tag/type agree");
+                let (l, r) = (self.expr_str(&x.left), self.expr_str(&x.right));
+                shared::fs_newer_than_rust(&l, &r, x.newer)
+            }
+            "FsModifiedSinceRead" => {
+                let x = n
+                    .as_any()
+                    .downcast_ref::<crate::shir_nodes::FsModifiedSinceRead>()
+                    .expect("tag/type agree");
+                shared::fs_modified_since_read_rust(&self.expr_str(&x.path))
+            }
+            other => panic!("fs_pred_bool: unknown tag {other}"),
+        }
+    }
+
 
     /// Native `std` spelling for the COUNT-valued text nodes Rust's manifest
     /// declares (`ArrayLen`, `WordCount`, `RegCount`).
@@ -6280,6 +6320,8 @@ while __sh_path.len() > 1 && __sh_path.ends_with('/') {{ __sh_path = &__sh_path[
                         .expect("tag/type agree");
                     self.affix_bool(x)
                 }
+                "FsSameFile" | "FsNewerThan" | "FsModifiedSinceRead" =>
+                    self.fs_pred_bool(n.as_ref()),
                 _other => format!("({} != 0)", self.expr_num(e)),
             },
             IrExpr::Arith(a) => self.arith_bool(a),
@@ -24722,6 +24764,43 @@ mod tests {
                 "__sh_squeeze",
                 "w=$(echo \"  a  b  \" | tr -s ' ')\necho \"$w\"\n",
             ),
+            // ── fs.* predicates (class 6) ────────────────────────────────
+            // `-ef` is dev+ino over stat(2), so a symlink and its target ARE
+            // the same file; two missing paths are not.
+            (
+                "FsSameFile",
+                "dev()",
+                "printf x > a\nprintf y > b\n[ a -ef b ] || echo diff\n[ a -ef a ] && echo same\n",
+            ),
+            (
+                "FsSameFileResolved",
+                "dev()",
+                "printf x > a\n[ a -ef ./a ] && echo dotpath\n[ /dev/null -ef /dev/null ] && echo devnull\n[ / -ef /dev ] || echo differ\n",
+            ),
+            (
+                "FsSameFileMissing",
+                "dev()",
+                "printf x > a\n[ a -ef nope ] || echo missing\n[ nope -ef nope ] || echo both_missing\n",
+            ),
+            // `-nt`/`-ot` carry bash's MISSING-OPERAND rule: the existing side
+            // wins, and two missing files are neither.
+            (
+                "FsNewerThan",
+                "__sh_a > __sh_b",
+                "printf x > a\nprintf y > b\n[ a -nt a ] || echo notnewer\n[ b -nt a ] && echo newer\n[ a -nt nope ] && echo beats_missing\n",
+            ),
+            (
+                "FsOlderThan",
+                "__sh_a < __sh_b",
+                "printf x > a\nprintf y > b\n[ a -ot b ] && echo older\n[ nope -ot b ] && echo missing_is_older\n[ a -ot nope ] || echo missing_right\n",
+            ),
+            // `-N` is one stat's mtime > atime — the same comparison bash
+            // makes, so any input agrees by construction.
+            (
+                "FsModifiedSinceRead",
+                "__sh_mt > __sh_at",
+                "printf x > f\nsleep 1\nprintf y >> f\n[ -N f ] && echo modified\n",
+            ),
         ];
         let mut bad: Vec<String> = Vec::new();
         for (name, marker, src) in cases {
@@ -24767,6 +24846,9 @@ mod tests {
             "RegCount", "TakeLines", "StringTrim", "SubStrExtract", "RepeatStr", "Split",
             "ArrayLen", "PathName", "CutsetTrim", "StringAffix", "CharTranslate",
             "SortLines", "UniqLines",
+            // fs-lift (class 5/6): the file predicates whose `std` reading is
+            // exact; every one is pinned by a compile-and-run case above.
+            "FsSameFile", "FsNewerThan", "FsModifiedSinceRead",
         ];
         // Refused in `node_manifest`'s `rs` arm, each with the reason written there.
         const REFUSED: &[&str] = &["RegSub", "RegexpFind", "AffixStrip"];
@@ -24794,6 +24876,45 @@ mod tests {
             assert!(
                 prog.contains("__sh_spawn("),
                 "a refused node was folded instead of spawned: {src:?}\n{prog}"
+            );
+        }
+    }
+
+    /// What `fs-lift` deliberately does NOT lift, with the reason it cannot:
+    /// `-O`/`-G` are EFFECTIVE-uid/gid predicates and `std` exposes neither
+    /// (the helper's `/proc/self/status` read is the REAL uid, which differs
+    /// under a setuid binary), so those keep the exact helper; a glob or
+    /// expansion in an operand moves the path's meaning to runtime, so the
+    /// `test` text keeps the shell's own tokenizer. Neither node may appear.
+    #[test]
+    fn fs_predicates_refuse_what_std_cannot_name() {
+        for (name, src, keep) in [
+            ("owner", "if [ -O /dev/null ]; then echo o; fi\n", "__sh_fowner("),
+            ("group", "if [ -G /dev/null ]; then echo g; fi\n", "__sh_fgroup("),
+            // A variable with a SUFFIX is not a plain path operand: the
+            // rendered value is a format!, which the node cannot take as a
+            // static literal — the exact `__sh_samefile` call stays.
+            (
+                "suffixed operand",
+                "if [ \"$d/x\" -ef b ]; then echo s; fi\n",
+                "__sh_samefile(",
+            ),
+            // A compound `-a` test keeps the shell's own parse of BOTH
+            // operands; lifting only the `-ef` half would change the shape.
+            (
+                "compound -a",
+                "if [ \"$A\" -ef \"$B\" -a -e c ]; then echo c; fi\n",
+                "__sh_samefile(",
+            ),
+        ] {
+            let prog = render_rs(src);
+            assert!(
+                !prog.contains("MetadataExt; match") && !prog.contains("__sh_mt > __sh_at"),
+                "{name}: lifted a shape it must refuse:\n{prog}"
+            );
+            assert!(
+                prog.contains(keep) || prog.contains("__sh_spawn(") || prog.contains("__sh_run("),
+                "{name}: the refused shape lost its exact rendering (no {keep:?}):\n{prog}"
             );
         }
     }
