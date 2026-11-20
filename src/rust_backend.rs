@@ -3527,6 +3527,15 @@ impl Render {
         None
     }
 
+    /// Emit a MULTI-LINE statement unit, one line at a time so every line
+    /// carries the current indent (a single `emit` prefixes only the first
+    /// line, which would leave a generated block's body flush left).
+    fn emit_block(&mut self, s: &str) {
+        for line in s.lines() {
+            self.emit(line);
+        }
+    }
+
     fn emit(&mut self, s: &str) {
         // `rc_strip` can reduce a whole unit to nothing — a status-store
         // line is exactly `__SH_RC.store(0, Ordering::Relaxed);`, and with
@@ -5735,6 +5744,43 @@ impl Render {
                     "{{ let __n: i64 = {c}; if __n <= 0 {{ String::new() }} else {{ {t}.repeat(__n as usize) }} }}"
                 ))
             }
+            "CharTranslate" => {
+                let x = n.as_any().downcast_ref::<crate::shir_nodes::CharTranslate>()?;
+                let t = self.expr_str(&x.text);
+                // The lowering has already EXPANDED the sets (ranges and
+                // `[:class:]` groups), so these are the byte/char map itself.
+                let from = Self::rust_str(&x.from);
+                let to = Self::rust_str(&x.to);
+                // `tr`'s three modes, each one `std`: -d drops SET1, a
+                // SHORTER SET2 repeats its last member (the rule that makes
+                // `tr 'a-c' 'x'` a x-x-x map), -s collapses runs of the
+                // OUTPUT set to one character (SET1 itself when there is no
+                // SET2, which is `tr -s SET`).
+                let mapped = if x.delete {
+                    format!(
+                        "{t}.chars().filter(|__c| !{from}.contains(*__c)).collect::<String>()"
+                    )
+                } else if x.to.is_empty() {
+                    t.clone()
+                } else {
+                    format!(
+                        "{{ let __f: Vec<char> = {from}.chars().collect(); \
+let __v: Vec<char> = {to}.chars().collect(); \
+{t}.chars().map(|__c| match __f.iter().position(|&__x| __x == __c) {{ \
+Some(__i) => __v[__i.min(__v.len() - 1)], None => __c }}).collect::<String>() }}"
+                    )
+                };
+                if !x.squeeze {
+                    Some(mapped)
+                } else {
+                    let sq = if x.to.is_empty() { from.clone() } else { to.clone() };
+                    Some(format!(
+                        "{{ let __m: String = {mapped}; let __sq: Vec<char> = {sq}.chars().collect(); \
+let mut __o = String::new(); for __c in __m.chars() {{ \
+if __o.chars().last() == Some(__c) && __sq.contains(&__c) {{ continue; }} __o.push(__c); }} __o }}"
+                    ))
+                }
+            }
             _ => None,
         }
     }
@@ -7078,12 +7124,16 @@ impl Render {
                 self.emit("__SH_RC.store(0, Ordering::Relaxed);");
             }
             "sleep" => {
+                // `std::thread::sleep` directly; bash accepts fractions, so
+                // the seconds string is parsed as f64 exactly like the old
+                // helper did (an unparseable word sleeps 0 and exits 0).
                 let v = match words.first() {
                     Some(w) => self.expr_str(w),
                     None => "\"0\"".to_string(),
                 };
-                self.add_helper("sleep");
-                self.emit(&format!("__sh_sleep(&{v});"));
+                self.emit(&format!(
+                    "std::thread::sleep(std::time::Duration::from_secs_f64(({v}).trim().parse::<f64>().unwrap_or(0.0).max(0.0)));"
+                ));
                 self.emit("__SH_RC.store(0, Ordering::Relaxed);");
             }
             "wait" => {
@@ -7239,8 +7289,11 @@ impl Render {
                 // corpus's ~100 literal forked sites; each of these is a
                 // std::fs call, so the child `/bin/bash -c` bought nothing
                 // (and lost the parent's view of a path).
+                // The helper (`__sh_rm` and friends) is GONE: the argv
+                // shape is static here, so the render bakes the flags in
+                // and spells the `std::fs` loop itself.
                 match self.native_fs_stmt(cmd, &words) {
-                    Some(st) => self.emit(&st),
+                    Some(st) => self.emit_block(&st),
                     None => self.shell_stmt(cmd, &words, env.as_deref()),
                 }
             }
@@ -7337,15 +7390,171 @@ impl Render {
         Some(format!("vec![{}]", parts.join(", ")))
     }
 
+    /// The static flag letters of an fs command's argv. `fs_flags_ok` has
+    /// already refused any word this lowering cannot read statically in flag
+    /// position, so collecting the letters here loses nothing.
+    fn fs_flags(words: &[&IrExpr]) -> std::collections::BTreeSet<char> {
+        let mut out = std::collections::BTreeSet::new();
+        let mut end_opts = false;
+        for w in words {
+            if end_opts {
+                continue;
+            }
+            if let IrExpr::Str(s, _) = w {
+                if s == "--" {
+                    end_opts = true;
+                    continue;
+                }
+                if s.len() > 1 && s.starts_with('-') {
+                    for c in s[1..].chars() {
+                        out.insert(c);
+                    }
+                }
+            }
+        }
+        out
+    }
+
+    /// The OPERAND words of an fs command: everything that is not a static
+    /// option, plus everything after a literal `--`. Splitting here (rather
+    /// than iterating argv in the render) is what lets the emitted loop work
+    /// on paths only.
+    fn fs_operands<'a>(words: &[&'a IrExpr]) -> Vec<&'a IrExpr> {
+        let mut out = Vec::new();
+        let mut end_opts = false;
+        for w in words {
+            if !end_opts {
+                if let IrExpr::Str(s, _) = w {
+                    if s == "--" {
+                        end_opts = true;
+                        continue;
+                    }
+                    if s.len() > 1 && s.starts_with('-') {
+                        continue;
+                    }
+                }
+            }
+            out.push(*w);
+        }
+        out
+    }
+
+    /// `rm`/`mkdir`/`touch` as a `std::fs` loop. The flags are BAKED IN
+    /// (they were static — a dynamic or unknown flag already refused the
+    /// native path), so no runtime option parser and no `__sh_*` helper is
+    /// emitted. Behaviour is the old helper's, byte for byte: same stderr
+    /// diagnostics, same exit status, same `-f` missing-file rule, same
+    /// symlink-is-never-a-directory rule, and `touch` still opens in append
+    /// mode (never truncating) and bumps mtime.
     fn native_fs_stmt(&mut self, cmd: &str, words: &[&IrExpr]) -> Option<String> {
         if !Self::fs_flags_ok(cmd, words) {
             return None;
         }
-        let argv = self.fs_argv(words)?;
-        self.add_helper(cmd);
-        Some(format!(
-            "__SH_RC.store(__sh_{cmd}(&{argv}), Ordering::Relaxed);"
-        ))
+        let flags = Self::fs_flags(words);
+        let operands = Self::fs_operands(words);
+        let argv = self.fs_argv(&operands)?;
+        if operands.is_empty() {
+            // No path to work on: `rm -f` is a silent success, the others
+            // keep the shell's own "missing operand" diagnostic.
+            if cmd != "rm" {
+                return None;
+            }
+            let force = flags.contains(&'f');
+            return Some(if force {
+                "__SH_RC.store(0, Ordering::Relaxed);".to_string()
+            } else {
+                "{ eprintln!(\"rm: missing operand\"); __SH_RC.store(1, Ordering::Relaxed); }".to_string()
+            });
+        }
+        let true_ = "true";
+        let false_ = "false";
+        let code = match cmd {
+            "rm" => {
+                let force = flags.contains(&'f');
+                let rec = flags.contains(&'r') || flags.contains(&'R');
+                let dir_ok = flags.contains(&'d');
+                // The directory rule is decided at RENDER time (the flags
+                // are static): recursive removes the tree, `-d` removes an
+                // empty directory, and neither given makes a directory an
+                // error — exactly the old helper's three cases, with no
+                // `if false` left behind in the emitted code.
+                let errsite = if force {
+                    "                    if __e.kind() == std::io::ErrorKind::NotFound { /* -f: a missing path is not an error */ } else {\n                        eprintln!(\"rm: cannot remove '{}': {}\", __p, __e);\n                        __rc = 1;\n                    }".to_string()
+                } else {
+                    "                    eprintln!(\"rm: cannot remove '{}': {}\", __p, __e);\n                    __rc = 1;".to_string()
+                };
+                let body = if rec {
+                    "        let __r = if __m.is_dir() {\n            std::fs::remove_dir_all(__p)\n        } else {\n            std::fs::remove_file(__p)\n        };".to_string()
+                } else if dir_ok {
+                    "        let __r = if __m.is_dir() {\n            std::fs::remove_dir(__p)\n        } else {\n            std::fs::remove_file(__p)\n        };".to_string()
+                } else {
+                    "        if __m.is_dir() {\n            eprintln!(\"rm: cannot remove '{}': Is a directory\", __p);\n            __rc = 1;\n            continue;\n        }\n        let __r = std::fs::remove_file(__p);".to_string()
+                };
+                r#"{
+    let mut __rc: i32 = 0;
+    for __p in &@ARGV@ {
+        match std::fs::symlink_metadata(__p) {
+            Ok(__m) => {
+@BODY@
+                if let Err(__e) = __r {
+@ERRSITE@
+                }
+            }
+            Err(__e) => {
+@ERRSITE@
+            }
+        }
+    }
+    __SH_RC.store(__rc, Ordering::Relaxed);
+}"#
+                .replace("@ARGV@", &argv)
+                .replace("@BODY@", &body)
+                .replace("@ERRSITE@", &errsite)
+                .replace("@FORCE@", if force { true_ } else { false_ })
+            }
+            "mkdir" => {
+                let parents = flags.contains(&'p');
+                let verbose = flags.contains(&'v');
+                r#"{
+    let mut __rc: i32 = 0;
+    for __p in &@ARGV@ {
+        let __r = if @PARENTS@ { std::fs::create_dir_all(__p) } else { std::fs::create_dir(__p) };
+        match __r {
+            Ok(_) => {
+                if @VERBOSE@ { println!("mkdir: created directory '{}'", __p); }
+            }
+            Err(__e) => {
+                eprintln!("mkdir: cannot create directory '{}': {}", __p, __e);
+                __rc = 1;
+            }
+        }
+    }
+    __SH_RC.store(__rc, Ordering::Relaxed);
+}"#
+                .replace("@ARGV@", &argv)
+                .replace("@PARENTS@", if parents { true_ } else { false_ })
+                .replace("@VERBOSE@", if verbose { true_ } else { false_ })
+            }
+            _ => {
+                // touch: append-open creates when absent and NEVER truncates
+                // an existing file, then mtime is bumped like touch(1).
+                r#"{
+    let mut __rc: i32 = 0;
+    for __p in &@ARGV@ {
+        match std::fs::OpenOptions::new().create(true).append(true).open(__p) {
+            Ok(__f) => { let _ = __f.set_modified(std::time::SystemTime::now()); }
+            Err(__e) => {
+                eprintln!("touch: cannot touch '{}': {}", __p, __e);
+                __rc = 1;
+            }
+        }
+    }
+    __SH_RC.store(__rc, Ordering::Relaxed);
+}"#
+                .replace("@ARGV@", &argv)
+            }
+        };
+        Some(code)
     }
 
     fn native_cat_stmt(&mut self, words: &[&IrExpr]) -> Option<String> {
@@ -7513,8 +7722,9 @@ impl Render {
                     Some(w) => self.expr_str(w),
                     None => "\"0\"".to_string(),
                 };
-                self.add_helper("sleep");
-                format!("{{ __sh_sleep(&{v}); __SH_RC.store(0, Ordering::Relaxed); true }}")
+                format!(
+                    "{{ std::thread::sleep(std::time::Duration::from_secs_f64(({v}).trim().parse::<f64>().unwrap_or(0.0).max(0.0))); __SH_RC.store(0, Ordering::Relaxed); true }}"
+                )
             }
             "exit" => {
                 let code = match words.first() {
@@ -17340,65 +17550,39 @@ impl<'a, 'r> TestParser<'a, 'r> {
         match op {
             "-n" => format!("(!{operand}.is_empty())"),
             "-z" => format!("({operand}.is_empty())"),
-            "-f" => {
-                self.render.add_helper("freg");
-                format!("__sh_freg(&{operand})")
-            }
-            "-d" => {
-                self.render.add_helper("fdir");
-                format!("__sh_fdir(&{operand})")
-            }
-            "-e" => {
-                self.render.add_helper("fexists");
-                format!("__sh_fexists(&{operand})")
-            }
-            "-r" => {
-                self.render.add_helper("fread");
-                format!("__sh_fread(&{operand})")
-            }
-            "-w" => {
-                self.render.add_helper("fwrite");
-                format!("__sh_fwrite(&{operand})")
-            }
-            "-x" => {
-                self.render.add_helper("fexec");
-                format!("__sh_fexec(&{operand})")
-            }
-            "-s" => {
-                self.render.add_helper("fsize");
-                format!("(__sh_fsize(&{operand}) > 0)")
-            }
-            "-L" | "-h" => {
-                self.render.add_helper("fsym");
-                format!("__sh_fsym(&{operand})")
-            }
-            "-p" => {
-                self.render.add_helper("fmode");
-                format!("__sh_fmode(&{operand}, 0o010000)")
-            }
-            "-S" => {
-                self.render.add_helper("fmode");
-                format!("__sh_fmode(&{operand}, 0o140000)")
-            }
-            "-b" => {
-                self.render.add_helper("fmode");
-                format!("__sh_fmode(&{operand}, 0o060000)")
-            }
-            "-c" => {
-                self.render.add_helper("fmode");
-                format!("__sh_fmode(&{operand}, 0o020000)")
-            }
-            "-u" => {
-                self.render.add_helper("fmode");
-                format!("__sh_fmode(&{operand}, 0o004000)")
-            }
-            "-g" => {
-                self.render.add_helper("fmode");
-                format!("__sh_fmode(&{operand}, 0o002000)")
-            }
-            "-k" => {
-                self.render.add_helper("fmode");
-                format!("__sh_fmode(&{operand}, 0o001000)")
+            // The stat predicates are one `std` call (or one short
+            // closure): no `__sh_f*` emulation helper, and no shell-out.
+            // Each spelling is the helper body specialised to the predicate
+            // (`add_helper` is not called, so the definition is not emitted).
+            "-f" => format!("std::path::Path::new(&{operand}).is_file()"),
+            "-d" => format!("std::path::Path::new(&{operand}).is_dir()"),
+            "-e" => format!("std::path::Path::new(&{operand}).exists()"),
+            "-r" => format!("std::fs::File::open(&{operand}).is_ok()"),
+            "-w" => format!(
+                "std::fs::OpenOptions::new().write(true).open(&{operand}).is_ok()"
+            ),
+            "-x" => format!(
+                "std::fs::metadata(&{operand}).map(|__m| {{ use std::os::unix::fs::PermissionsExt; __m.permissions().mode() & 0o111 != 0 }}).unwrap_or(false)"
+            ),
+            "-s" => format!(
+                "std::fs::metadata(&{operand}).map(|__m| __m.len() > 0).unwrap_or(false)"
+            ),
+            "-L" | "-h" => format!(
+                "std::fs::symlink_metadata(&{operand}).map(|__m| __m.file_type().is_symlink()).unwrap_or(false)"
+            ),
+            "-p" | "-S" | "-b" | "-c" | "-u" | "-g" | "-k" => {
+                let bits = match op {
+                    "-p" => "0o010000",
+                    "-S" => "0o140000",
+                    "-b" => "0o060000",
+                    "-c" => "0o020000",
+                    "-u" => "0o004000",
+                    "-g" => "0o002000",
+                    _ => "0o001000",
+                };
+                format!(
+                    "std::fs::metadata(&{operand}).map(|__m| {{ use std::os::unix::fs::MetadataExt; (__m.mode() & {bits}) == {bits} }}).unwrap_or(false)"
+                )
             }
             "-O" => {
                 self.render.add_helper("fowner");
@@ -23968,6 +24152,79 @@ mod tests {
         IrExpr::Str(text.to_string(), crate::ir::StrStyle::DoubleQuoted)
     }
 
+    // ── filesystem commands + stat predicates: no emulation helpers ────
+
+    /// The census's "command emulation" and "stat predicates" classes.
+    /// `rm`/`mkdir`/`touch`/`sleep` are `std::fs`/`std::thread` loops with the
+    /// static flags baked in, and `[ -f … ]`-style predicates are one `std`
+    /// call — so none of the `__sh_*` emulation helpers may be defined or
+    /// called. (`mktemp` is genuinely a runtime uniqueness loop and keeps its
+    /// helper; it is not in this list.)
+    #[test]
+    fn fs_commands_and_stat_predicates_render_natively() {
+        let cases: &[(&str, &str, &[&str])] = &[
+            (
+                "rm",
+                "rm -f a.txt b.txt\nrm -rf dir\n",
+                &["std::fs::remove_file", "std::fs::remove_dir_all"],
+            ),
+            ("mkdir", "mkdir sub\nmkdir -p a/b\n", &["std::fs::create_dir(", "std::fs::create_dir_all"]),
+            (
+                "touch",
+                "touch f\n",
+                &["create(true).append(true).open", "set_modified"],
+            ),
+            ("sleep", "sleep 0.01\n", &["std::thread::sleep"]),
+            (
+                "-f",
+                "f=a.txt\nif [ -f \"$f\" ]; then echo y; fi\n",
+                &[".is_file()"],
+            ),
+            (
+                "-d",
+                "f=a.txt\nif [ -d \"$f\" ]; then echo y; fi\n",
+                &[".is_dir()"],
+            ),
+            (
+                "-e",
+                "f=a.txt\nif [ -e \"$f\" ]; then echo y; fi\n",
+                &[".exists()"],
+            ),
+            (
+                "-L",
+                "f=a.txt\nif [ -L \"$f\" ]; then echo y; fi\n",
+                &["is_symlink()"],
+            ),
+            (
+                "-s",
+                "f=a.txt\nif [ -s \"$f\" ]; then echo y; fi\n",
+                &[".len() > 0"],
+            ),
+            (
+                "-x",
+                "f=a.txt\nif [ -x \"$f\" ]; then echo y; fi\n",
+                &["permissions().mode() & 0o111"],
+            ),
+        ];
+        let helpers = [
+            "__sh_rm(", "__sh_mkdir(", "__sh_touch(", "__sh_sleep(", "__sh_freg(", "__sh_fdir(",
+            "__sh_fexists(", "__sh_fsym(", "__sh_fsize(", "__sh_fread(", "__sh_fwrite(",
+            "__sh_fexec(", "__sh_fmode(",
+        ];
+        for (name, src, markers) in cases {
+            let out = render_rs(src);
+            for helper in helpers {
+                assert!(
+                    !out.contains(helper),
+                    "{name}: helper {helper} emitted:\n{out}"
+                );
+            }
+            for marker in *markers {
+                assert!(out.contains(marker), "{name}: missing {marker:?}:\n{out}");
+            }
+        }
+    }
+
     // ── the text nodes the `rs` manifest offers ──────────────────────
 
     // ── the offered text nodes must RUN, not just render ────────────────
@@ -24044,6 +24301,16 @@ mod tests {
                 "CaseTransform",
                 ".to_lowercase()",
                 "w=$(echo ABC | tr 'A-Z' 'a-z')\necho \"$w\"\n",
+            ),
+            (
+                "CharTranslate",
+                "position(|&__x|",
+                "w=$(echo abc-xyz | tr 'a-c' 'x')\necho \"$w\"\n",
+            ),
+            (
+                "CharTranslateDelete",
+                "filter(|__c|",
+                "w=$(echo abc-xyz | tr -d 'a-c')\necho \"$w\"\n",
             ),
             (
                 "StringContains",

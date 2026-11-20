@@ -242,8 +242,6 @@ pub fn node_manifest(target: &str) -> &'static [&'static str] {
         // the existing path is untouched):
         //  * RegSub, RegexpFind — `std` has no regex; a hand-rolled matcher
         //    would not be exact.
-        //  * CharTranslate — `tr` takes ranges and character classes
-        //    (`a-z`, `[:upper:]`); a char-set spelling is not the same map.
         //  * PathName — the node's source may be a GNU command or a bash
         //    string, and those differ on trailing slashes.
         //  * StringAffix — it is a prefix/suffix PREDICATE (`[[ $x == P* ]]`,
@@ -262,10 +260,14 @@ pub fn node_manifest(target: &str) -> &'static [&'static str] {
         //    (the node spec records that divergence). No transform emits the
         //    node from shell source here either.
         "rs" | "rust" => &[
-            "StringContains", "StrLen", "CaseTransform", "FieldExtract",
-            "WordCount", "RegCount", "TakeLines", "StringTrim",
-            "SubStrExtract", "RepeatStr", "Split", "ArrayLen",
-        ],
+                            "StringContains", "StrLen", "CaseTransform", "FieldExtract",
+                "WordCount", "RegCount", "TakeLines", "StringTrim",
+                "SubStrExtract", "RepeatStr", "Split", "ArrayLen",
+                // `tr`'s general map: the lowering EXPANDS ranges and classes
+                // before the node is built, so `from`/`to` are the map and
+                // `chars().map(...)` is exact (delete and squeeze included).
+                "CharTranslate",
+            ],
         // Zig: the shared Zig arms are TODO for most nodes.
         "zig" => &["StrLen", "Split", "ArrayLen", "StringContains", "StringAffix", "StringTrim"],
         // The shell-like targets: the ORIGINAL COMMAND is the native form
