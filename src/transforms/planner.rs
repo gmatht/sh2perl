@@ -240,25 +240,35 @@ pub fn node_manifest(target: &str) -> &'static [&'static str] {
         //
         // NOT declared, with the reason (each keeps its original command, so
         // the existing path is untouched):
-        //  * RegSub, RegexpFind — `std` has no regex; a hand-rolled matcher
-        //    would not be exact.
-        //  * StringAffix / CutsetTrim are DECLARED but, like SortLines and
-        //    TakeLines, no transform in this pipeline constructs them from
-        //    shell source (`[[ $x == P* ]]` renders as `.starts_with` in the
-        //    test lowering directly), so they are pinned by CONSTRUCTING
-        //    the node and running it against bash.
+        //  * RegSub, RegexpFind — `std` has no regex ENGINE: the nodes' specs
+        //    are over a COMPILED matcher (POSIX BRE/ERE with backreferences,
+        //    greedy `*`, character classes), and a hand-rolled matcher would
+        //    be exact only on a subset while rendering silently wrong on the
+        //    rest. `sed s///`, `grep -o RE` and `${v/pat/rep}` therefore keep
+        //    the command. (The regex the RENDERER does use comes from the
+        //    `regex` crate in the emitted Cargo project — that is not `std`,
+        //    so it does not license these nodes here.)
         //  * AffixStrip — `${v#p}`/`${v%s}` lower through the backend's own
         //    strip helpers (`__sh_strippre`/`__sh_stripsuf` over
         //    `__sh_fnmatch`), which accept ARBITRARY glob patterns; `std`'s
         //    `strip_prefix`/`strip_suffix` are exact only for the literal
         //    subset, so the node stays out and the shapes keep that path.
-        //  * CutsetTrim — the `${s##*[cutset]}`/`${s%%[cutset]*}` shapes are
-        //    character-CLASS patterns, and `trim_matches(|c| cut.contains(c))`
-        //    reads a set of CODE POINTS where the shell means a byte set
-        //    (the node spec records that divergence). No transform emits the
-        //    node from shell source here either.
+        //
+        // DECLARED but CONSTRUCT-ONLY (no transform in this pipeline builds
+        // them from shell source, so they are pinned by constructing the node
+        // and running it against bash, `constructed_text_nodes_execute_like_bash`):
+        // StringAffix and CutsetTrim (`[[ $x == P* ]]` renders `.starts_with`
+        // in the test lowering directly; the `${s##*[cutset]}` shapes stay
+        // shell-out), SortLines and UniqLines (no by-line filter lowering
+        // here yet), and RepeatStr outside `yes | head`.
+        //
+        // WHO OWNS WHAT, so a source never rides a node built for another:
+        // CaseTransform is the BASH PARAMETER casing (`${v,,}`/`${v^^}`), which
+        // case-maps CODE POINTS; `tr`'s case pairs are the BYTE map and lower to
+        // CharTranslate (measured: `tr '[:lower:]' '[:upper:]'` leaves `É`
+        // alone, `to_uppercase()` does not).
         "rs" | "rust" => &[
-                            "StringContains", "StrLen", "CaseTransform", "FieldExtract",
+            "StringContains", "StrLen", "CaseTransform", "FieldExtract",
                 "WordCount", "RegCount", "TakeLines", "StringTrim",
                 "SubStrExtract", "RepeatStr", "Split", "ArrayLen",
                 // `basename`/`dirname` commands: text_ops builds PathName

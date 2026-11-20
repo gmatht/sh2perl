@@ -24751,6 +24751,53 @@ mod tests {
         );
     }
 
+    /// The manifest and the renderer must not drift apart, in either
+    /// direction: every node Rust DECLARES is pinned by a compile-and-run case
+    /// (or by constructing the node and running it), every node it REFUSES has
+    /// its reason next to the manifest entry, and no tag is both. A node
+    /// declared without an arm is the silent-TODO this pass closes; a node
+    /// refused without a reason is how a wrong render gets shipped.
+    #[test]
+    fn rust_manifest_and_renderer_agree() {
+        use crate::transforms::planner::node_manifest;
+        // Pinned by `offered_text_nodes_execute_like_bash` (shell source) or
+        // `constructed_text_nodes_execute_like_bash` (no shell shape builds it).
+        const PINNED: &[&str] = &[
+            "StringContains", "StrLen", "CaseTransform", "FieldExtract", "WordCount",
+            "RegCount", "TakeLines", "StringTrim", "SubStrExtract", "RepeatStr", "Split",
+            "ArrayLen", "PathName", "CutsetTrim", "StringAffix", "CharTranslate",
+            "SortLines", "UniqLines",
+        ];
+        // Refused in `node_manifest`'s `rs` arm, each with the reason written there.
+        const REFUSED: &[&str] = &["RegSub", "RegexpFind", "AffixStrip"];
+
+        let mut declared: Vec<&str> = node_manifest("rs").to_vec();
+        let mut pinned: Vec<&str> = PINNED.to_vec();
+        declared.sort_unstable();
+        pinned.sort_unstable();
+        assert_eq!(
+            declared, pinned,
+            "every declared node needs a compile-and-run pin (and vice versa)"
+        );
+        for tag in REFUSED {
+            assert!(
+                !declared.contains(tag),
+                "{tag} is declared AND refused — one of the two is a lie"
+            );
+        }
+        // A refused node must leave the exact command in place.
+        for src in [
+            "echo a1b | sed 's/[0-9]/N/g'\n",
+            "echo abc | grep -E 'a(b|c)+'\n",
+        ] {
+            let prog = render_rs(src);
+            assert!(
+                prog.contains("__sh_spawn("),
+                "a refused node was folded instead of spawned: {src:?}\n{prog}"
+            );
+        }
+    }
+
     /// The other half of the field/flag work: every shape whose meaning the
     /// node does NOT cover must keep spawning the command, because that form is
     /// exact everywhere. Each entry is a site the census still lists on
