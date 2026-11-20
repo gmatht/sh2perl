@@ -177,6 +177,49 @@ source and outside the model), and corpus domain.
 Mutants, measured: identity **15 verified, 3 errors**; fold the printed bytes
 **14 / 4**; fold `-n` bodies **17 / 1**; fold runtime words **15 / 3**.
 
+## split_fold.rs — the licence, not the walk (41)
+
+`shir_passes/split_fold.rs`. An unquoted expansion yields the value's words;
+when the value is provably free of IFS whitespace the split produces exactly
+one field, so `split[e]` is a no-op and the pass replaces it with `e`.
+
+- `fold_preserves_fields` — the law: the expression observes the same word
+  list (and carries the same text) after the fold, for every expression and
+  every environment.
+- `words_nonsep` — the tokenizer obligation: a whitespace-free NON-EMPTY value
+  splits to exactly `[v]`.
+- `empty_is_zero_words` — `split("")` is ZERO fields while the bare word is
+  ONE empty field. The pre-fix rule folded on whitespace-freedom alone and
+  collapsed the two (measured 2026-11-05); the witness reconstructs it and the
+  mutant is red.
+- `whitespace_is_load_bearing` — `split("a b")` is two fields, so the
+  whitespace half is not decoration either.
+- `fold_leaves_nothing` / `fold_is_idempotent` — completeness and fixpoint, so
+  an identity pass cannot satisfy the law.
+- `pin_custom_ifs_gate` — with `IFS=:` the whitespace-free `a:b` splits into
+  two fields; the pass returns early on `program_may_custom_ifs`, which is why
+  the model keeps the separator set as a parameter.
+- `pin_element_carveout_keeps` — element stores into an array that is not
+  already int-homed keep their split (conservative: it protects the C ingest's
+  array homing, not the value).
+
+Pins mirror the source's tests: `folds_int_typed_var_read`,
+`keeps_unknown_var`, `keeps_whitespace_literal`, `folds_spaceless_literal`,
+`nospace_is_not_nonempty`, `keeps_split_of_empty_literal`,
+`folds_split_with_a_nonempty_part`, `custom_ifs_blocks_the_fold`,
+`nested_split_and_subs`, `keeps_element_split_of_non_int_array`,
+`folds_element_split_of_int_array`, and the funnel shapes.
+
+Hypotheses in-file: reachability/registration of the pass; the verdicts it
+consumes rather than computes (`analyze_var_nospace`'s bit — the `NSVar` node
+with `nospace_env_ok`; the A2 int verdict — the `Int` node with
+`int_env_ok`, canonical decimal being non-empty and whitespace-free); the
+custom-IFS gate; the element carve-out; corpus domain.
+
+Mutants, measured: drop the non-emptiness half **36 verified, 5 errors**; drop
+the whitespace half **38 / 3**; identity **33 / 8**; fold on either half
+**34 / 7**.
+
 ## Running it
 
 Verus needs rust toolchain `1.99.1-x86_64-unknown-linux-gnu`
@@ -368,6 +411,49 @@ source and outside the model), and corpus domain.
 
 Mutants, measured: identity **15 verified, 3 errors**; fold the printed bytes
 **14 / 4**; fold `-n` bodies **17 / 1**; fold runtime words **15 / 3**.
+
+## split_fold.rs — the licence, not the walk (41)
+
+`shir_passes/split_fold.rs`. An unquoted expansion yields the value's words;
+when the value is provably free of IFS whitespace the split produces exactly
+one field, so `split[e]` is a no-op and the pass replaces it with `e`.
+
+- `fold_preserves_fields` — the law: the expression observes the same word
+  list (and carries the same text) after the fold, for every expression and
+  every environment.
+- `words_nonsep` — the tokenizer obligation: a whitespace-free NON-EMPTY value
+  splits to exactly `[v]`.
+- `empty_is_zero_words` — `split("")` is ZERO fields while the bare word is
+  ONE empty field. The pre-fix rule folded on whitespace-freedom alone and
+  collapsed the two (measured 2026-11-05); the witness reconstructs it and the
+  mutant is red.
+- `whitespace_is_load_bearing` — `split("a b")` is two fields, so the
+  whitespace half is not decoration either.
+- `fold_leaves_nothing` / `fold_is_idempotent` — completeness and fixpoint, so
+  an identity pass cannot satisfy the law.
+- `pin_custom_ifs_gate` — with `IFS=:` the whitespace-free `a:b` splits into
+  two fields; the pass returns early on `program_may_custom_ifs`, which is why
+  the model keeps the separator set as a parameter.
+- `pin_element_carveout_keeps` — element stores into an array that is not
+  already int-homed keep their split (conservative: it protects the C ingest's
+  array homing, not the value).
+
+Pins mirror the source's tests: `folds_int_typed_var_read`,
+`keeps_unknown_var`, `keeps_whitespace_literal`, `folds_spaceless_literal`,
+`nospace_is_not_nonempty`, `keeps_split_of_empty_literal`,
+`folds_split_with_a_nonempty_part`, `custom_ifs_blocks_the_fold`,
+`nested_split_and_subs`, `keeps_element_split_of_non_int_array`,
+`folds_element_split_of_int_array`, and the funnel shapes.
+
+Hypotheses in-file: reachability/registration of the pass; the verdicts it
+consumes rather than computes (`analyze_var_nospace`'s bit — the `NSVar` node
+with `nospace_env_ok`; the A2 int verdict — the `Int` node with
+`int_env_ok`, canonical decimal being non-empty and whitespace-free); the
+custom-IFS gate; the element carve-out; corpus domain.
+
+Mutants, measured: drop the non-emptiness half **36 verified, 5 errors**; drop
+the whitespace half **38 / 3**; identity **33 / 8**; fold on either half
+**34 / 7**.
 
 ## Running it
 
@@ -565,6 +651,49 @@ source and outside the model), and corpus domain.
 
 Mutants, measured: identity **15 verified, 3 errors**; fold the printed bytes
 **14 / 4**; fold `-n` bodies **17 / 1**; fold runtime words **15 / 3**.
+
+## split_fold.rs — the licence, not the walk (41)
+
+`shir_passes/split_fold.rs`. An unquoted expansion yields the value's words;
+when the value is provably free of IFS whitespace the split produces exactly
+one field, so `split[e]` is a no-op and the pass replaces it with `e`.
+
+- `fold_preserves_fields` — the law: the expression observes the same word
+  list (and carries the same text) after the fold, for every expression and
+  every environment.
+- `words_nonsep` — the tokenizer obligation: a whitespace-free NON-EMPTY value
+  splits to exactly `[v]`.
+- `empty_is_zero_words` — `split("")` is ZERO fields while the bare word is
+  ONE empty field. The pre-fix rule folded on whitespace-freedom alone and
+  collapsed the two (measured 2026-11-05); the witness reconstructs it and the
+  mutant is red.
+- `whitespace_is_load_bearing` — `split("a b")` is two fields, so the
+  whitespace half is not decoration either.
+- `fold_leaves_nothing` / `fold_is_idempotent` — completeness and fixpoint, so
+  an identity pass cannot satisfy the law.
+- `pin_custom_ifs_gate` — with `IFS=:` the whitespace-free `a:b` splits into
+  two fields; the pass returns early on `program_may_custom_ifs`, which is why
+  the model keeps the separator set as a parameter.
+- `pin_element_carveout_keeps` — element stores into an array that is not
+  already int-homed keep their split (conservative: it protects the C ingest's
+  array homing, not the value).
+
+Pins mirror the source's tests: `folds_int_typed_var_read`,
+`keeps_unknown_var`, `keeps_whitespace_literal`, `folds_spaceless_literal`,
+`nospace_is_not_nonempty`, `keeps_split_of_empty_literal`,
+`folds_split_with_a_nonempty_part`, `custom_ifs_blocks_the_fold`,
+`nested_split_and_subs`, `keeps_element_split_of_non_int_array`,
+`folds_element_split_of_int_array`, and the funnel shapes.
+
+Hypotheses in-file: reachability/registration of the pass; the verdicts it
+consumes rather than computes (`analyze_var_nospace`'s bit — the `NSVar` node
+with `nospace_env_ok`; the A2 int verdict — the `Int` node with
+`int_env_ok`, canonical decimal being non-empty and whitespace-free); the
+custom-IFS gate; the element carve-out; corpus domain.
+
+Mutants, measured: drop the non-emptiness half **36 verified, 5 errors**; drop
+the whitespace half **38 / 3**; identity **33 / 8**; fold on either half
+**34 / 7**.
 
 ## Running it
 
@@ -776,6 +905,49 @@ source and outside the model), and corpus domain.
 Mutants, measured: identity **15 verified, 3 errors**; fold the printed bytes
 **14 / 4**; fold `-n` bodies **17 / 1**; fold runtime words **15 / 3**.
 
+## split_fold.rs — the licence, not the walk (41)
+
+`shir_passes/split_fold.rs`. An unquoted expansion yields the value's words;
+when the value is provably free of IFS whitespace the split produces exactly
+one field, so `split[e]` is a no-op and the pass replaces it with `e`.
+
+- `fold_preserves_fields` — the law: the expression observes the same word
+  list (and carries the same text) after the fold, for every expression and
+  every environment.
+- `words_nonsep` — the tokenizer obligation: a whitespace-free NON-EMPTY value
+  splits to exactly `[v]`.
+- `empty_is_zero_words` — `split("")` is ZERO fields while the bare word is
+  ONE empty field. The pre-fix rule folded on whitespace-freedom alone and
+  collapsed the two (measured 2026-11-05); the witness reconstructs it and the
+  mutant is red.
+- `whitespace_is_load_bearing` — `split("a b")` is two fields, so the
+  whitespace half is not decoration either.
+- `fold_leaves_nothing` / `fold_is_idempotent` — completeness and fixpoint, so
+  an identity pass cannot satisfy the law.
+- `pin_custom_ifs_gate` — with `IFS=:` the whitespace-free `a:b` splits into
+  two fields; the pass returns early on `program_may_custom_ifs`, which is why
+  the model keeps the separator set as a parameter.
+- `pin_element_carveout_keeps` — element stores into an array that is not
+  already int-homed keep their split (conservative: it protects the C ingest's
+  array homing, not the value).
+
+Pins mirror the source's tests: `folds_int_typed_var_read`,
+`keeps_unknown_var`, `keeps_whitespace_literal`, `folds_spaceless_literal`,
+`nospace_is_not_nonempty`, `keeps_split_of_empty_literal`,
+`folds_split_with_a_nonempty_part`, `custom_ifs_blocks_the_fold`,
+`nested_split_and_subs`, `keeps_element_split_of_non_int_array`,
+`folds_element_split_of_int_array`, and the funnel shapes.
+
+Hypotheses in-file: reachability/registration of the pass; the verdicts it
+consumes rather than computes (`analyze_var_nospace`'s bit — the `NSVar` node
+with `nospace_env_ok`; the A2 int verdict — the `Int` node with
+`int_env_ok`, canonical decimal being non-empty and whitespace-free); the
+custom-IFS gate; the element carve-out; corpus domain.
+
+Mutants, measured: drop the non-emptiness half **36 verified, 5 errors**; drop
+the whitespace half **38 / 3**; identity **33 / 8**; fold on either half
+**34 / 7**.
+
 ## Running it
 
 Same toolchain as above:
@@ -966,6 +1138,49 @@ source and outside the model), and corpus domain.
 
 Mutants, measured: identity **15 verified, 3 errors**; fold the printed bytes
 **14 / 4**; fold `-n` bodies **17 / 1**; fold runtime words **15 / 3**.
+
+## split_fold.rs — the licence, not the walk (41)
+
+`shir_passes/split_fold.rs`. An unquoted expansion yields the value's words;
+when the value is provably free of IFS whitespace the split produces exactly
+one field, so `split[e]` is a no-op and the pass replaces it with `e`.
+
+- `fold_preserves_fields` — the law: the expression observes the same word
+  list (and carries the same text) after the fold, for every expression and
+  every environment.
+- `words_nonsep` — the tokenizer obligation: a whitespace-free NON-EMPTY value
+  splits to exactly `[v]`.
+- `empty_is_zero_words` — `split("")` is ZERO fields while the bare word is
+  ONE empty field. The pre-fix rule folded on whitespace-freedom alone and
+  collapsed the two (measured 2026-11-05); the witness reconstructs it and the
+  mutant is red.
+- `whitespace_is_load_bearing` — `split("a b")` is two fields, so the
+  whitespace half is not decoration either.
+- `fold_leaves_nothing` / `fold_is_idempotent` — completeness and fixpoint, so
+  an identity pass cannot satisfy the law.
+- `pin_custom_ifs_gate` — with `IFS=:` the whitespace-free `a:b` splits into
+  two fields; the pass returns early on `program_may_custom_ifs`, which is why
+  the model keeps the separator set as a parameter.
+- `pin_element_carveout_keeps` — element stores into an array that is not
+  already int-homed keep their split (conservative: it protects the C ingest's
+  array homing, not the value).
+
+Pins mirror the source's tests: `folds_int_typed_var_read`,
+`keeps_unknown_var`, `keeps_whitespace_literal`, `folds_spaceless_literal`,
+`nospace_is_not_nonempty`, `keeps_split_of_empty_literal`,
+`folds_split_with_a_nonempty_part`, `custom_ifs_blocks_the_fold`,
+`nested_split_and_subs`, `keeps_element_split_of_non_int_array`,
+`folds_element_split_of_int_array`, and the funnel shapes.
+
+Hypotheses in-file: reachability/registration of the pass; the verdicts it
+consumes rather than computes (`analyze_var_nospace`'s bit — the `NSVar` node
+with `nospace_env_ok`; the A2 int verdict — the `Int` node with
+`int_env_ok`, canonical decimal being non-empty and whitespace-free); the
+custom-IFS gate; the element carve-out; corpus domain.
+
+Mutants, measured: drop the non-emptiness half **36 verified, 5 errors**; drop
+the whitespace half **38 / 3**; identity **33 / 8**; fold on either half
+**34 / 7**.
 
 ## Running it
 
@@ -1165,6 +1380,49 @@ source and outside the model), and corpus domain.
 Mutants, measured: identity **15 verified, 3 errors**; fold the printed bytes
 **14 / 4**; fold `-n` bodies **17 / 1**; fold runtime words **15 / 3**.
 
+## split_fold.rs — the licence, not the walk (41)
+
+`shir_passes/split_fold.rs`. An unquoted expansion yields the value's words;
+when the value is provably free of IFS whitespace the split produces exactly
+one field, so `split[e]` is a no-op and the pass replaces it with `e`.
+
+- `fold_preserves_fields` — the law: the expression observes the same word
+  list (and carries the same text) after the fold, for every expression and
+  every environment.
+- `words_nonsep` — the tokenizer obligation: a whitespace-free NON-EMPTY value
+  splits to exactly `[v]`.
+- `empty_is_zero_words` — `split("")` is ZERO fields while the bare word is
+  ONE empty field. The pre-fix rule folded on whitespace-freedom alone and
+  collapsed the two (measured 2026-11-05); the witness reconstructs it and the
+  mutant is red.
+- `whitespace_is_load_bearing` — `split("a b")` is two fields, so the
+  whitespace half is not decoration either.
+- `fold_leaves_nothing` / `fold_is_idempotent` — completeness and fixpoint, so
+  an identity pass cannot satisfy the law.
+- `pin_custom_ifs_gate` — with `IFS=:` the whitespace-free `a:b` splits into
+  two fields; the pass returns early on `program_may_custom_ifs`, which is why
+  the model keeps the separator set as a parameter.
+- `pin_element_carveout_keeps` — element stores into an array that is not
+  already int-homed keep their split (conservative: it protects the C ingest's
+  array homing, not the value).
+
+Pins mirror the source's tests: `folds_int_typed_var_read`,
+`keeps_unknown_var`, `keeps_whitespace_literal`, `folds_spaceless_literal`,
+`nospace_is_not_nonempty`, `keeps_split_of_empty_literal`,
+`folds_split_with_a_nonempty_part`, `custom_ifs_blocks_the_fold`,
+`nested_split_and_subs`, `keeps_element_split_of_non_int_array`,
+`folds_element_split_of_int_array`, and the funnel shapes.
+
+Hypotheses in-file: reachability/registration of the pass; the verdicts it
+consumes rather than computes (`analyze_var_nospace`'s bit — the `NSVar` node
+with `nospace_env_ok`; the A2 int verdict — the `Int` node with
+`int_env_ok`, canonical decimal being non-empty and whitespace-free); the
+custom-IFS gate; the element carve-out; corpus domain.
+
+Mutants, measured: drop the non-emptiness half **36 verified, 5 errors**; drop
+the whitespace half **38 / 3**; identity **33 / 8**; fold on either half
+**34 / 7**.
+
 ## Running it
 
 Same toolchain as above:
@@ -1353,6 +1611,49 @@ source and outside the model), and corpus domain.
 Mutants, measured: identity **15 verified, 3 errors**; fold the printed bytes
 **14 / 4**; fold `-n` bodies **17 / 1**; fold runtime words **15 / 3**.
 
+## split_fold.rs — the licence, not the walk (41)
+
+`shir_passes/split_fold.rs`. An unquoted expansion yields the value's words;
+when the value is provably free of IFS whitespace the split produces exactly
+one field, so `split[e]` is a no-op and the pass replaces it with `e`.
+
+- `fold_preserves_fields` — the law: the expression observes the same word
+  list (and carries the same text) after the fold, for every expression and
+  every environment.
+- `words_nonsep` — the tokenizer obligation: a whitespace-free NON-EMPTY value
+  splits to exactly `[v]`.
+- `empty_is_zero_words` — `split("")` is ZERO fields while the bare word is
+  ONE empty field. The pre-fix rule folded on whitespace-freedom alone and
+  collapsed the two (measured 2026-11-05); the witness reconstructs it and the
+  mutant is red.
+- `whitespace_is_load_bearing` — `split("a b")` is two fields, so the
+  whitespace half is not decoration either.
+- `fold_leaves_nothing` / `fold_is_idempotent` — completeness and fixpoint, so
+  an identity pass cannot satisfy the law.
+- `pin_custom_ifs_gate` — with `IFS=:` the whitespace-free `a:b` splits into
+  two fields; the pass returns early on `program_may_custom_ifs`, which is why
+  the model keeps the separator set as a parameter.
+- `pin_element_carveout_keeps` — element stores into an array that is not
+  already int-homed keep their split (conservative: it protects the C ingest's
+  array homing, not the value).
+
+Pins mirror the source's tests: `folds_int_typed_var_read`,
+`keeps_unknown_var`, `keeps_whitespace_literal`, `folds_spaceless_literal`,
+`nospace_is_not_nonempty`, `keeps_split_of_empty_literal`,
+`folds_split_with_a_nonempty_part`, `custom_ifs_blocks_the_fold`,
+`nested_split_and_subs`, `keeps_element_split_of_non_int_array`,
+`folds_element_split_of_int_array`, and the funnel shapes.
+
+Hypotheses in-file: reachability/registration of the pass; the verdicts it
+consumes rather than computes (`analyze_var_nospace`'s bit — the `NSVar` node
+with `nospace_env_ok`; the A2 int verdict — the `Int` node with
+`int_env_ok`, canonical decimal being non-empty and whitespace-free); the
+custom-IFS gate; the element carve-out; corpus domain.
+
+Mutants, measured: drop the non-emptiness half **36 verified, 5 errors**; drop
+the whitespace half **38 / 3**; identity **33 / 8**; fold on either half
+**34 / 7**.
+
 ## Running it
 
 Same toolchain as above:
@@ -1522,6 +1823,49 @@ source and outside the model), and corpus domain.
 
 Mutants, measured: identity **15 verified, 3 errors**; fold the printed bytes
 **14 / 4**; fold `-n` bodies **17 / 1**; fold runtime words **15 / 3**.
+
+## split_fold.rs — the licence, not the walk (41)
+
+`shir_passes/split_fold.rs`. An unquoted expansion yields the value's words;
+when the value is provably free of IFS whitespace the split produces exactly
+one field, so `split[e]` is a no-op and the pass replaces it with `e`.
+
+- `fold_preserves_fields` — the law: the expression observes the same word
+  list (and carries the same text) after the fold, for every expression and
+  every environment.
+- `words_nonsep` — the tokenizer obligation: a whitespace-free NON-EMPTY value
+  splits to exactly `[v]`.
+- `empty_is_zero_words` — `split("")` is ZERO fields while the bare word is
+  ONE empty field. The pre-fix rule folded on whitespace-freedom alone and
+  collapsed the two (measured 2026-11-05); the witness reconstructs it and the
+  mutant is red.
+- `whitespace_is_load_bearing` — `split("a b")` is two fields, so the
+  whitespace half is not decoration either.
+- `fold_leaves_nothing` / `fold_is_idempotent` — completeness and fixpoint, so
+  an identity pass cannot satisfy the law.
+- `pin_custom_ifs_gate` — with `IFS=:` the whitespace-free `a:b` splits into
+  two fields; the pass returns early on `program_may_custom_ifs`, which is why
+  the model keeps the separator set as a parameter.
+- `pin_element_carveout_keeps` — element stores into an array that is not
+  already int-homed keep their split (conservative: it protects the C ingest's
+  array homing, not the value).
+
+Pins mirror the source's tests: `folds_int_typed_var_read`,
+`keeps_unknown_var`, `keeps_whitespace_literal`, `folds_spaceless_literal`,
+`nospace_is_not_nonempty`, `keeps_split_of_empty_literal`,
+`folds_split_with_a_nonempty_part`, `custom_ifs_blocks_the_fold`,
+`nested_split_and_subs`, `keeps_element_split_of_non_int_array`,
+`folds_element_split_of_int_array`, and the funnel shapes.
+
+Hypotheses in-file: reachability/registration of the pass; the verdicts it
+consumes rather than computes (`analyze_var_nospace`'s bit — the `NSVar` node
+with `nospace_env_ok`; the A2 int verdict — the `Int` node with
+`int_env_ok`, canonical decimal being non-empty and whitespace-free); the
+custom-IFS gate; the element carve-out; corpus domain.
+
+Mutants, measured: drop the non-emptiness half **36 verified, 5 errors**; drop
+the whitespace half **38 / 3**; identity **33 / 8**; fold on either half
+**34 / 7**.
 
 ## Running it
 
@@ -1817,6 +2161,49 @@ source and outside the model), and corpus domain.
 Mutants, measured: identity **15 verified, 3 errors**; fold the printed bytes
 **14 / 4**; fold `-n` bodies **17 / 1**; fold runtime words **15 / 3**.
 
+## split_fold.rs — the licence, not the walk (41)
+
+`shir_passes/split_fold.rs`. An unquoted expansion yields the value's words;
+when the value is provably free of IFS whitespace the split produces exactly
+one field, so `split[e]` is a no-op and the pass replaces it with `e`.
+
+- `fold_preserves_fields` — the law: the expression observes the same word
+  list (and carries the same text) after the fold, for every expression and
+  every environment.
+- `words_nonsep` — the tokenizer obligation: a whitespace-free NON-EMPTY value
+  splits to exactly `[v]`.
+- `empty_is_zero_words` — `split("")` is ZERO fields while the bare word is
+  ONE empty field. The pre-fix rule folded on whitespace-freedom alone and
+  collapsed the two (measured 2026-11-05); the witness reconstructs it and the
+  mutant is red.
+- `whitespace_is_load_bearing` — `split("a b")` is two fields, so the
+  whitespace half is not decoration either.
+- `fold_leaves_nothing` / `fold_is_idempotent` — completeness and fixpoint, so
+  an identity pass cannot satisfy the law.
+- `pin_custom_ifs_gate` — with `IFS=:` the whitespace-free `a:b` splits into
+  two fields; the pass returns early on `program_may_custom_ifs`, which is why
+  the model keeps the separator set as a parameter.
+- `pin_element_carveout_keeps` — element stores into an array that is not
+  already int-homed keep their split (conservative: it protects the C ingest's
+  array homing, not the value).
+
+Pins mirror the source's tests: `folds_int_typed_var_read`,
+`keeps_unknown_var`, `keeps_whitespace_literal`, `folds_spaceless_literal`,
+`nospace_is_not_nonempty`, `keeps_split_of_empty_literal`,
+`folds_split_with_a_nonempty_part`, `custom_ifs_blocks_the_fold`,
+`nested_split_and_subs`, `keeps_element_split_of_non_int_array`,
+`folds_element_split_of_int_array`, and the funnel shapes.
+
+Hypotheses in-file: reachability/registration of the pass; the verdicts it
+consumes rather than computes (`analyze_var_nospace`'s bit — the `NSVar` node
+with `nospace_env_ok`; the A2 int verdict — the `Int` node with
+`int_env_ok`, canonical decimal being non-empty and whitespace-free); the
+custom-IFS gate; the element carve-out; corpus domain.
+
+Mutants, measured: drop the non-emptiness half **36 verified, 5 errors**; drop
+the whitespace half **38 / 3**; identity **33 / 8**; fold on either half
+**34 / 7**.
+
 ## Running it (all six P6 files)
 
 Same toolchain as above, `--rlimit 40` each:
@@ -1991,6 +2378,49 @@ source and outside the model), and corpus domain.
 Mutants, measured: identity **15 verified, 3 errors**; fold the printed bytes
 **14 / 4**; fold `-n` bodies **17 / 1**; fold runtime words **15 / 3**.
 
+## split_fold.rs — the licence, not the walk (41)
+
+`shir_passes/split_fold.rs`. An unquoted expansion yields the value's words;
+when the value is provably free of IFS whitespace the split produces exactly
+one field, so `split[e]` is a no-op and the pass replaces it with `e`.
+
+- `fold_preserves_fields` — the law: the expression observes the same word
+  list (and carries the same text) after the fold, for every expression and
+  every environment.
+- `words_nonsep` — the tokenizer obligation: a whitespace-free NON-EMPTY value
+  splits to exactly `[v]`.
+- `empty_is_zero_words` — `split("")` is ZERO fields while the bare word is
+  ONE empty field. The pre-fix rule folded on whitespace-freedom alone and
+  collapsed the two (measured 2026-11-05); the witness reconstructs it and the
+  mutant is red.
+- `whitespace_is_load_bearing` — `split("a b")` is two fields, so the
+  whitespace half is not decoration either.
+- `fold_leaves_nothing` / `fold_is_idempotent` — completeness and fixpoint, so
+  an identity pass cannot satisfy the law.
+- `pin_custom_ifs_gate` — with `IFS=:` the whitespace-free `a:b` splits into
+  two fields; the pass returns early on `program_may_custom_ifs`, which is why
+  the model keeps the separator set as a parameter.
+- `pin_element_carveout_keeps` — element stores into an array that is not
+  already int-homed keep their split (conservative: it protects the C ingest's
+  array homing, not the value).
+
+Pins mirror the source's tests: `folds_int_typed_var_read`,
+`keeps_unknown_var`, `keeps_whitespace_literal`, `folds_spaceless_literal`,
+`nospace_is_not_nonempty`, `keeps_split_of_empty_literal`,
+`folds_split_with_a_nonempty_part`, `custom_ifs_blocks_the_fold`,
+`nested_split_and_subs`, `keeps_element_split_of_non_int_array`,
+`folds_element_split_of_int_array`, and the funnel shapes.
+
+Hypotheses in-file: reachability/registration of the pass; the verdicts it
+consumes rather than computes (`analyze_var_nospace`'s bit — the `NSVar` node
+with `nospace_env_ok`; the A2 int verdict — the `Int` node with
+`int_env_ok`, canonical decimal being non-empty and whitespace-free); the
+custom-IFS gate; the element carve-out; corpus domain.
+
+Mutants, measured: drop the non-emptiness half **36 verified, 5 errors**; drop
+the whitespace half **38 / 3**; identity **33 / 8**; fold on either half
+**34 / 7**.
+
 ## Running it
 
 Same toolchain as the P6 files (`--rlimit 40`).
@@ -2158,6 +2588,49 @@ source and outside the model), and corpus domain.
 
 Mutants, measured: identity **15 verified, 3 errors**; fold the printed bytes
 **14 / 4**; fold `-n` bodies **17 / 1**; fold runtime words **15 / 3**.
+
+## split_fold.rs — the licence, not the walk (41)
+
+`shir_passes/split_fold.rs`. An unquoted expansion yields the value's words;
+when the value is provably free of IFS whitespace the split produces exactly
+one field, so `split[e]` is a no-op and the pass replaces it with `e`.
+
+- `fold_preserves_fields` — the law: the expression observes the same word
+  list (and carries the same text) after the fold, for every expression and
+  every environment.
+- `words_nonsep` — the tokenizer obligation: a whitespace-free NON-EMPTY value
+  splits to exactly `[v]`.
+- `empty_is_zero_words` — `split("")` is ZERO fields while the bare word is
+  ONE empty field. The pre-fix rule folded on whitespace-freedom alone and
+  collapsed the two (measured 2026-11-05); the witness reconstructs it and the
+  mutant is red.
+- `whitespace_is_load_bearing` — `split("a b")` is two fields, so the
+  whitespace half is not decoration either.
+- `fold_leaves_nothing` / `fold_is_idempotent` — completeness and fixpoint, so
+  an identity pass cannot satisfy the law.
+- `pin_custom_ifs_gate` — with `IFS=:` the whitespace-free `a:b` splits into
+  two fields; the pass returns early on `program_may_custom_ifs`, which is why
+  the model keeps the separator set as a parameter.
+- `pin_element_carveout_keeps` — element stores into an array that is not
+  already int-homed keep their split (conservative: it protects the C ingest's
+  array homing, not the value).
+
+Pins mirror the source's tests: `folds_int_typed_var_read`,
+`keeps_unknown_var`, `keeps_whitespace_literal`, `folds_spaceless_literal`,
+`nospace_is_not_nonempty`, `keeps_split_of_empty_literal`,
+`folds_split_with_a_nonempty_part`, `custom_ifs_blocks_the_fold`,
+`nested_split_and_subs`, `keeps_element_split_of_non_int_array`,
+`folds_element_split_of_int_array`, and the funnel shapes.
+
+Hypotheses in-file: reachability/registration of the pass; the verdicts it
+consumes rather than computes (`analyze_var_nospace`'s bit — the `NSVar` node
+with `nospace_env_ok`; the A2 int verdict — the `Int` node with
+`int_env_ok`, canonical decimal being non-empty and whitespace-free); the
+custom-IFS gate; the element carve-out; corpus domain.
+
+Mutants, measured: drop the non-emptiness half **36 verified, 5 errors**; drop
+the whitespace half **38 / 3**; identity **33 / 8**; fold on either half
+**34 / 7**.
 
 ## Running it
 
@@ -2368,6 +2841,49 @@ source and outside the model), and corpus domain.
 Mutants, measured: identity **15 verified, 3 errors**; fold the printed bytes
 **14 / 4**; fold `-n` bodies **17 / 1**; fold runtime words **15 / 3**.
 
+## split_fold.rs — the licence, not the walk (41)
+
+`shir_passes/split_fold.rs`. An unquoted expansion yields the value's words;
+when the value is provably free of IFS whitespace the split produces exactly
+one field, so `split[e]` is a no-op and the pass replaces it with `e`.
+
+- `fold_preserves_fields` — the law: the expression observes the same word
+  list (and carries the same text) after the fold, for every expression and
+  every environment.
+- `words_nonsep` — the tokenizer obligation: a whitespace-free NON-EMPTY value
+  splits to exactly `[v]`.
+- `empty_is_zero_words` — `split("")` is ZERO fields while the bare word is
+  ONE empty field. The pre-fix rule folded on whitespace-freedom alone and
+  collapsed the two (measured 2026-11-05); the witness reconstructs it and the
+  mutant is red.
+- `whitespace_is_load_bearing` — `split("a b")` is two fields, so the
+  whitespace half is not decoration either.
+- `fold_leaves_nothing` / `fold_is_idempotent` — completeness and fixpoint, so
+  an identity pass cannot satisfy the law.
+- `pin_custom_ifs_gate` — with `IFS=:` the whitespace-free `a:b` splits into
+  two fields; the pass returns early on `program_may_custom_ifs`, which is why
+  the model keeps the separator set as a parameter.
+- `pin_element_carveout_keeps` — element stores into an array that is not
+  already int-homed keep their split (conservative: it protects the C ingest's
+  array homing, not the value).
+
+Pins mirror the source's tests: `folds_int_typed_var_read`,
+`keeps_unknown_var`, `keeps_whitespace_literal`, `folds_spaceless_literal`,
+`nospace_is_not_nonempty`, `keeps_split_of_empty_literal`,
+`folds_split_with_a_nonempty_part`, `custom_ifs_blocks_the_fold`,
+`nested_split_and_subs`, `keeps_element_split_of_non_int_array`,
+`folds_element_split_of_int_array`, and the funnel shapes.
+
+Hypotheses in-file: reachability/registration of the pass; the verdicts it
+consumes rather than computes (`analyze_var_nospace`'s bit — the `NSVar` node
+with `nospace_env_ok`; the A2 int verdict — the `Int` node with
+`int_env_ok`, canonical decimal being non-empty and whitespace-free); the
+custom-IFS gate; the element carve-out; corpus domain.
+
+Mutants, measured: drop the non-emptiness half **36 verified, 5 errors**; drop
+the whitespace half **38 / 3**; identity **33 / 8**; fold on either half
+**34 / 7**.
+
 ## Running it
 
 Same toolchain as above (`--rlimit 80` for the shadow-induction
@@ -2558,6 +3074,49 @@ source and outside the model), and corpus domain.
 
 Mutants, measured: identity **15 verified, 3 errors**; fold the printed bytes
 **14 / 4**; fold `-n` bodies **17 / 1**; fold runtime words **15 / 3**.
+
+## split_fold.rs — the licence, not the walk (41)
+
+`shir_passes/split_fold.rs`. An unquoted expansion yields the value's words;
+when the value is provably free of IFS whitespace the split produces exactly
+one field, so `split[e]` is a no-op and the pass replaces it with `e`.
+
+- `fold_preserves_fields` — the law: the expression observes the same word
+  list (and carries the same text) after the fold, for every expression and
+  every environment.
+- `words_nonsep` — the tokenizer obligation: a whitespace-free NON-EMPTY value
+  splits to exactly `[v]`.
+- `empty_is_zero_words` — `split("")` is ZERO fields while the bare word is
+  ONE empty field. The pre-fix rule folded on whitespace-freedom alone and
+  collapsed the two (measured 2026-11-05); the witness reconstructs it and the
+  mutant is red.
+- `whitespace_is_load_bearing` — `split("a b")` is two fields, so the
+  whitespace half is not decoration either.
+- `fold_leaves_nothing` / `fold_is_idempotent` — completeness and fixpoint, so
+  an identity pass cannot satisfy the law.
+- `pin_custom_ifs_gate` — with `IFS=:` the whitespace-free `a:b` splits into
+  two fields; the pass returns early on `program_may_custom_ifs`, which is why
+  the model keeps the separator set as a parameter.
+- `pin_element_carveout_keeps` — element stores into an array that is not
+  already int-homed keep their split (conservative: it protects the C ingest's
+  array homing, not the value).
+
+Pins mirror the source's tests: `folds_int_typed_var_read`,
+`keeps_unknown_var`, `keeps_whitespace_literal`, `folds_spaceless_literal`,
+`nospace_is_not_nonempty`, `keeps_split_of_empty_literal`,
+`folds_split_with_a_nonempty_part`, `custom_ifs_blocks_the_fold`,
+`nested_split_and_subs`, `keeps_element_split_of_non_int_array`,
+`folds_element_split_of_int_array`, and the funnel shapes.
+
+Hypotheses in-file: reachability/registration of the pass; the verdicts it
+consumes rather than computes (`analyze_var_nospace`'s bit — the `NSVar` node
+with `nospace_env_ok`; the A2 int verdict — the `Int` node with
+`int_env_ok`, canonical decimal being non-empty and whitespace-free); the
+custom-IFS gate; the element carve-out; corpus domain.
+
+Mutants, measured: drop the non-emptiness half **36 verified, 5 errors**; drop
+the whitespace half **38 / 3**; identity **33 / 8**; fold on either half
+**34 / 7**.
 
 ## Running it
 
@@ -2754,6 +3313,49 @@ source and outside the model), and corpus domain.
 Mutants, measured: identity **15 verified, 3 errors**; fold the printed bytes
 **14 / 4**; fold `-n` bodies **17 / 1**; fold runtime words **15 / 3**.
 
+## split_fold.rs — the licence, not the walk (41)
+
+`shir_passes/split_fold.rs`. An unquoted expansion yields the value's words;
+when the value is provably free of IFS whitespace the split produces exactly
+one field, so `split[e]` is a no-op and the pass replaces it with `e`.
+
+- `fold_preserves_fields` — the law: the expression observes the same word
+  list (and carries the same text) after the fold, for every expression and
+  every environment.
+- `words_nonsep` — the tokenizer obligation: a whitespace-free NON-EMPTY value
+  splits to exactly `[v]`.
+- `empty_is_zero_words` — `split("")` is ZERO fields while the bare word is
+  ONE empty field. The pre-fix rule folded on whitespace-freedom alone and
+  collapsed the two (measured 2026-11-05); the witness reconstructs it and the
+  mutant is red.
+- `whitespace_is_load_bearing` — `split("a b")` is two fields, so the
+  whitespace half is not decoration either.
+- `fold_leaves_nothing` / `fold_is_idempotent` — completeness and fixpoint, so
+  an identity pass cannot satisfy the law.
+- `pin_custom_ifs_gate` — with `IFS=:` the whitespace-free `a:b` splits into
+  two fields; the pass returns early on `program_may_custom_ifs`, which is why
+  the model keeps the separator set as a parameter.
+- `pin_element_carveout_keeps` — element stores into an array that is not
+  already int-homed keep their split (conservative: it protects the C ingest's
+  array homing, not the value).
+
+Pins mirror the source's tests: `folds_int_typed_var_read`,
+`keeps_unknown_var`, `keeps_whitespace_literal`, `folds_spaceless_literal`,
+`nospace_is_not_nonempty`, `keeps_split_of_empty_literal`,
+`folds_split_with_a_nonempty_part`, `custom_ifs_blocks_the_fold`,
+`nested_split_and_subs`, `keeps_element_split_of_non_int_array`,
+`folds_element_split_of_int_array`, and the funnel shapes.
+
+Hypotheses in-file: reachability/registration of the pass; the verdicts it
+consumes rather than computes (`analyze_var_nospace`'s bit — the `NSVar` node
+with `nospace_env_ok`; the A2 int verdict — the `Int` node with
+`int_env_ok`, canonical decimal being non-empty and whitespace-free); the
+custom-IFS gate; the element carve-out; corpus domain.
+
+Mutants, measured: drop the non-emptiness half **36 verified, 5 errors**; drop
+the whitespace half **38 / 3**; identity **33 / 8**; fold on either half
+**34 / 7**.
+
 ## Running it
 
 Same toolchain as above (`--rlimit 60` for the fuel/size induction):
@@ -2949,6 +3551,49 @@ source and outside the model), and corpus domain.
 Mutants, measured: identity **15 verified, 3 errors**; fold the printed bytes
 **14 / 4**; fold `-n` bodies **17 / 1**; fold runtime words **15 / 3**.
 
+## split_fold.rs — the licence, not the walk (41)
+
+`shir_passes/split_fold.rs`. An unquoted expansion yields the value's words;
+when the value is provably free of IFS whitespace the split produces exactly
+one field, so `split[e]` is a no-op and the pass replaces it with `e`.
+
+- `fold_preserves_fields` — the law: the expression observes the same word
+  list (and carries the same text) after the fold, for every expression and
+  every environment.
+- `words_nonsep` — the tokenizer obligation: a whitespace-free NON-EMPTY value
+  splits to exactly `[v]`.
+- `empty_is_zero_words` — `split("")` is ZERO fields while the bare word is
+  ONE empty field. The pre-fix rule folded on whitespace-freedom alone and
+  collapsed the two (measured 2026-11-05); the witness reconstructs it and the
+  mutant is red.
+- `whitespace_is_load_bearing` — `split("a b")` is two fields, so the
+  whitespace half is not decoration either.
+- `fold_leaves_nothing` / `fold_is_idempotent` — completeness and fixpoint, so
+  an identity pass cannot satisfy the law.
+- `pin_custom_ifs_gate` — with `IFS=:` the whitespace-free `a:b` splits into
+  two fields; the pass returns early on `program_may_custom_ifs`, which is why
+  the model keeps the separator set as a parameter.
+- `pin_element_carveout_keeps` — element stores into an array that is not
+  already int-homed keep their split (conservative: it protects the C ingest's
+  array homing, not the value).
+
+Pins mirror the source's tests: `folds_int_typed_var_read`,
+`keeps_unknown_var`, `keeps_whitespace_literal`, `folds_spaceless_literal`,
+`nospace_is_not_nonempty`, `keeps_split_of_empty_literal`,
+`folds_split_with_a_nonempty_part`, `custom_ifs_blocks_the_fold`,
+`nested_split_and_subs`, `keeps_element_split_of_non_int_array`,
+`folds_element_split_of_int_array`, and the funnel shapes.
+
+Hypotheses in-file: reachability/registration of the pass; the verdicts it
+consumes rather than computes (`analyze_var_nospace`'s bit — the `NSVar` node
+with `nospace_env_ok`; the A2 int verdict — the `Int` node with
+`int_env_ok`, canonical decimal being non-empty and whitespace-free); the
+custom-IFS gate; the element carve-out; corpus domain.
+
+Mutants, measured: drop the non-emptiness half **36 verified, 5 errors**; drop
+the whitespace half **38 / 3**; identity **33 / 8**; fold on either half
+**34 / 7**.
+
 ## Running it
 
 Same toolchain as the P6/P7/P8 files (`--rlimit 40`):
@@ -3125,6 +3770,49 @@ source and outside the model), and corpus domain.
 
 Mutants, measured: identity **15 verified, 3 errors**; fold the printed bytes
 **14 / 4**; fold `-n` bodies **17 / 1**; fold runtime words **15 / 3**.
+
+## split_fold.rs — the licence, not the walk (41)
+
+`shir_passes/split_fold.rs`. An unquoted expansion yields the value's words;
+when the value is provably free of IFS whitespace the split produces exactly
+one field, so `split[e]` is a no-op and the pass replaces it with `e`.
+
+- `fold_preserves_fields` — the law: the expression observes the same word
+  list (and carries the same text) after the fold, for every expression and
+  every environment.
+- `words_nonsep` — the tokenizer obligation: a whitespace-free NON-EMPTY value
+  splits to exactly `[v]`.
+- `empty_is_zero_words` — `split("")` is ZERO fields while the bare word is
+  ONE empty field. The pre-fix rule folded on whitespace-freedom alone and
+  collapsed the two (measured 2026-11-05); the witness reconstructs it and the
+  mutant is red.
+- `whitespace_is_load_bearing` — `split("a b")` is two fields, so the
+  whitespace half is not decoration either.
+- `fold_leaves_nothing` / `fold_is_idempotent` — completeness and fixpoint, so
+  an identity pass cannot satisfy the law.
+- `pin_custom_ifs_gate` — with `IFS=:` the whitespace-free `a:b` splits into
+  two fields; the pass returns early on `program_may_custom_ifs`, which is why
+  the model keeps the separator set as a parameter.
+- `pin_element_carveout_keeps` — element stores into an array that is not
+  already int-homed keep their split (conservative: it protects the C ingest's
+  array homing, not the value).
+
+Pins mirror the source's tests: `folds_int_typed_var_read`,
+`keeps_unknown_var`, `keeps_whitespace_literal`, `folds_spaceless_literal`,
+`nospace_is_not_nonempty`, `keeps_split_of_empty_literal`,
+`folds_split_with_a_nonempty_part`, `custom_ifs_blocks_the_fold`,
+`nested_split_and_subs`, `keeps_element_split_of_non_int_array`,
+`folds_element_split_of_int_array`, and the funnel shapes.
+
+Hypotheses in-file: reachability/registration of the pass; the verdicts it
+consumes rather than computes (`analyze_var_nospace`'s bit — the `NSVar` node
+with `nospace_env_ok`; the A2 int verdict — the `Int` node with
+`int_env_ok`, canonical decimal being non-empty and whitespace-free); the
+custom-IFS gate; the element carve-out; corpus domain.
+
+Mutants, measured: drop the non-emptiness half **36 verified, 5 errors**; drop
+the whitespace half **38 / 3**; identity **33 / 8**; fold on either half
+**34 / 7**.
 
 ## Running it
 
@@ -3307,6 +3995,49 @@ source and outside the model), and corpus domain.
 Mutants, measured: identity **15 verified, 3 errors**; fold the printed bytes
 **14 / 4**; fold `-n` bodies **17 / 1**; fold runtime words **15 / 3**.
 
+## split_fold.rs — the licence, not the walk (41)
+
+`shir_passes/split_fold.rs`. An unquoted expansion yields the value's words;
+when the value is provably free of IFS whitespace the split produces exactly
+one field, so `split[e]` is a no-op and the pass replaces it with `e`.
+
+- `fold_preserves_fields` — the law: the expression observes the same word
+  list (and carries the same text) after the fold, for every expression and
+  every environment.
+- `words_nonsep` — the tokenizer obligation: a whitespace-free NON-EMPTY value
+  splits to exactly `[v]`.
+- `empty_is_zero_words` — `split("")` is ZERO fields while the bare word is
+  ONE empty field. The pre-fix rule folded on whitespace-freedom alone and
+  collapsed the two (measured 2026-11-05); the witness reconstructs it and the
+  mutant is red.
+- `whitespace_is_load_bearing` — `split("a b")` is two fields, so the
+  whitespace half is not decoration either.
+- `fold_leaves_nothing` / `fold_is_idempotent` — completeness and fixpoint, so
+  an identity pass cannot satisfy the law.
+- `pin_custom_ifs_gate` — with `IFS=:` the whitespace-free `a:b` splits into
+  two fields; the pass returns early on `program_may_custom_ifs`, which is why
+  the model keeps the separator set as a parameter.
+- `pin_element_carveout_keeps` — element stores into an array that is not
+  already int-homed keep their split (conservative: it protects the C ingest's
+  array homing, not the value).
+
+Pins mirror the source's tests: `folds_int_typed_var_read`,
+`keeps_unknown_var`, `keeps_whitespace_literal`, `folds_spaceless_literal`,
+`nospace_is_not_nonempty`, `keeps_split_of_empty_literal`,
+`folds_split_with_a_nonempty_part`, `custom_ifs_blocks_the_fold`,
+`nested_split_and_subs`, `keeps_element_split_of_non_int_array`,
+`folds_element_split_of_int_array`, and the funnel shapes.
+
+Hypotheses in-file: reachability/registration of the pass; the verdicts it
+consumes rather than computes (`analyze_var_nospace`'s bit — the `NSVar` node
+with `nospace_env_ok`; the A2 int verdict — the `Int` node with
+`int_env_ok`, canonical decimal being non-empty and whitespace-free); the
+custom-IFS gate; the element carve-out; corpus domain.
+
+Mutants, measured: drop the non-emptiness half **36 verified, 5 errors**; drop
+the whitespace half **38 / 3**; identity **33 / 8**; fold on either half
+**34 / 7**.
+
 ## Running it
 
 Same toolchain as the P6/P7/P8 files (`--rlimit 40`).
@@ -3478,6 +4209,49 @@ source and outside the model), and corpus domain.
 
 Mutants, measured: identity **15 verified, 3 errors**; fold the printed bytes
 **14 / 4**; fold `-n` bodies **17 / 1**; fold runtime words **15 / 3**.
+
+## split_fold.rs — the licence, not the walk (41)
+
+`shir_passes/split_fold.rs`. An unquoted expansion yields the value's words;
+when the value is provably free of IFS whitespace the split produces exactly
+one field, so `split[e]` is a no-op and the pass replaces it with `e`.
+
+- `fold_preserves_fields` — the law: the expression observes the same word
+  list (and carries the same text) after the fold, for every expression and
+  every environment.
+- `words_nonsep` — the tokenizer obligation: a whitespace-free NON-EMPTY value
+  splits to exactly `[v]`.
+- `empty_is_zero_words` — `split("")` is ZERO fields while the bare word is
+  ONE empty field. The pre-fix rule folded on whitespace-freedom alone and
+  collapsed the two (measured 2026-11-05); the witness reconstructs it and the
+  mutant is red.
+- `whitespace_is_load_bearing` — `split("a b")` is two fields, so the
+  whitespace half is not decoration either.
+- `fold_leaves_nothing` / `fold_is_idempotent` — completeness and fixpoint, so
+  an identity pass cannot satisfy the law.
+- `pin_custom_ifs_gate` — with `IFS=:` the whitespace-free `a:b` splits into
+  two fields; the pass returns early on `program_may_custom_ifs`, which is why
+  the model keeps the separator set as a parameter.
+- `pin_element_carveout_keeps` — element stores into an array that is not
+  already int-homed keep their split (conservative: it protects the C ingest's
+  array homing, not the value).
+
+Pins mirror the source's tests: `folds_int_typed_var_read`,
+`keeps_unknown_var`, `keeps_whitespace_literal`, `folds_spaceless_literal`,
+`nospace_is_not_nonempty`, `keeps_split_of_empty_literal`,
+`folds_split_with_a_nonempty_part`, `custom_ifs_blocks_the_fold`,
+`nested_split_and_subs`, `keeps_element_split_of_non_int_array`,
+`folds_element_split_of_int_array`, and the funnel shapes.
+
+Hypotheses in-file: reachability/registration of the pass; the verdicts it
+consumes rather than computes (`analyze_var_nospace`'s bit — the `NSVar` node
+with `nospace_env_ok`; the A2 int verdict — the `Int` node with
+`int_env_ok`, canonical decimal being non-empty and whitespace-free); the
+custom-IFS gate; the element carve-out; corpus domain.
+
+Mutants, measured: drop the non-emptiness half **36 verified, 5 errors**; drop
+the whitespace half **38 / 3**; identity **33 / 8**; fold on either half
+**34 / 7**.
 
 ## Running it
 
@@ -3654,6 +4428,49 @@ source and outside the model), and corpus domain.
 Mutants, measured: identity **15 verified, 3 errors**; fold the printed bytes
 **14 / 4**; fold `-n` bodies **17 / 1**; fold runtime words **15 / 3**.
 
+## split_fold.rs — the licence, not the walk (41)
+
+`shir_passes/split_fold.rs`. An unquoted expansion yields the value's words;
+when the value is provably free of IFS whitespace the split produces exactly
+one field, so `split[e]` is a no-op and the pass replaces it with `e`.
+
+- `fold_preserves_fields` — the law: the expression observes the same word
+  list (and carries the same text) after the fold, for every expression and
+  every environment.
+- `words_nonsep` — the tokenizer obligation: a whitespace-free NON-EMPTY value
+  splits to exactly `[v]`.
+- `empty_is_zero_words` — `split("")` is ZERO fields while the bare word is
+  ONE empty field. The pre-fix rule folded on whitespace-freedom alone and
+  collapsed the two (measured 2026-11-05); the witness reconstructs it and the
+  mutant is red.
+- `whitespace_is_load_bearing` — `split("a b")` is two fields, so the
+  whitespace half is not decoration either.
+- `fold_leaves_nothing` / `fold_is_idempotent` — completeness and fixpoint, so
+  an identity pass cannot satisfy the law.
+- `pin_custom_ifs_gate` — with `IFS=:` the whitespace-free `a:b` splits into
+  two fields; the pass returns early on `program_may_custom_ifs`, which is why
+  the model keeps the separator set as a parameter.
+- `pin_element_carveout_keeps` — element stores into an array that is not
+  already int-homed keep their split (conservative: it protects the C ingest's
+  array homing, not the value).
+
+Pins mirror the source's tests: `folds_int_typed_var_read`,
+`keeps_unknown_var`, `keeps_whitespace_literal`, `folds_spaceless_literal`,
+`nospace_is_not_nonempty`, `keeps_split_of_empty_literal`,
+`folds_split_with_a_nonempty_part`, `custom_ifs_blocks_the_fold`,
+`nested_split_and_subs`, `keeps_element_split_of_non_int_array`,
+`folds_element_split_of_int_array`, and the funnel shapes.
+
+Hypotheses in-file: reachability/registration of the pass; the verdicts it
+consumes rather than computes (`analyze_var_nospace`'s bit — the `NSVar` node
+with `nospace_env_ok`; the A2 int verdict — the `Int` node with
+`int_env_ok`, canonical decimal being non-empty and whitespace-free); the
+custom-IFS gate; the element carve-out; corpus domain.
+
+Mutants, measured: drop the non-emptiness half **36 verified, 5 errors**; drop
+the whitespace half **38 / 3**; identity **33 / 8**; fold on either half
+**34 / 7**.
+
 ## Running it
 
 Same toolchain as the P6/P7/P8 files (`--rlimit 40`).
@@ -3829,6 +4646,49 @@ source and outside the model), and corpus domain.
 
 Mutants, measured: identity **15 verified, 3 errors**; fold the printed bytes
 **14 / 4**; fold `-n` bodies **17 / 1**; fold runtime words **15 / 3**.
+
+## split_fold.rs — the licence, not the walk (41)
+
+`shir_passes/split_fold.rs`. An unquoted expansion yields the value's words;
+when the value is provably free of IFS whitespace the split produces exactly
+one field, so `split[e]` is a no-op and the pass replaces it with `e`.
+
+- `fold_preserves_fields` — the law: the expression observes the same word
+  list (and carries the same text) after the fold, for every expression and
+  every environment.
+- `words_nonsep` — the tokenizer obligation: a whitespace-free NON-EMPTY value
+  splits to exactly `[v]`.
+- `empty_is_zero_words` — `split("")` is ZERO fields while the bare word is
+  ONE empty field. The pre-fix rule folded on whitespace-freedom alone and
+  collapsed the two (measured 2026-11-05); the witness reconstructs it and the
+  mutant is red.
+- `whitespace_is_load_bearing` — `split("a b")` is two fields, so the
+  whitespace half is not decoration either.
+- `fold_leaves_nothing` / `fold_is_idempotent` — completeness and fixpoint, so
+  an identity pass cannot satisfy the law.
+- `pin_custom_ifs_gate` — with `IFS=:` the whitespace-free `a:b` splits into
+  two fields; the pass returns early on `program_may_custom_ifs`, which is why
+  the model keeps the separator set as a parameter.
+- `pin_element_carveout_keeps` — element stores into an array that is not
+  already int-homed keep their split (conservative: it protects the C ingest's
+  array homing, not the value).
+
+Pins mirror the source's tests: `folds_int_typed_var_read`,
+`keeps_unknown_var`, `keeps_whitespace_literal`, `folds_spaceless_literal`,
+`nospace_is_not_nonempty`, `keeps_split_of_empty_literal`,
+`folds_split_with_a_nonempty_part`, `custom_ifs_blocks_the_fold`,
+`nested_split_and_subs`, `keeps_element_split_of_non_int_array`,
+`folds_element_split_of_int_array`, and the funnel shapes.
+
+Hypotheses in-file: reachability/registration of the pass; the verdicts it
+consumes rather than computes (`analyze_var_nospace`'s bit — the `NSVar` node
+with `nospace_env_ok`; the A2 int verdict — the `Int` node with
+`int_env_ok`, canonical decimal being non-empty and whitespace-free); the
+custom-IFS gate; the element carve-out; corpus domain.
+
+Mutants, measured: drop the non-emptiness half **36 verified, 5 errors**; drop
+the whitespace half **38 / 3**; identity **33 / 8**; fold on either half
+**34 / 7**.
 
 ## Running it
 
@@ -4174,6 +5034,49 @@ source and outside the model), and corpus domain.
 
 Mutants, measured: identity **15 verified, 3 errors**; fold the printed bytes
 **14 / 4**; fold `-n` bodies **17 / 1**; fold runtime words **15 / 3**.
+
+## split_fold.rs — the licence, not the walk (41)
+
+`shir_passes/split_fold.rs`. An unquoted expansion yields the value's words;
+when the value is provably free of IFS whitespace the split produces exactly
+one field, so `split[e]` is a no-op and the pass replaces it with `e`.
+
+- `fold_preserves_fields` — the law: the expression observes the same word
+  list (and carries the same text) after the fold, for every expression and
+  every environment.
+- `words_nonsep` — the tokenizer obligation: a whitespace-free NON-EMPTY value
+  splits to exactly `[v]`.
+- `empty_is_zero_words` — `split("")` is ZERO fields while the bare word is
+  ONE empty field. The pre-fix rule folded on whitespace-freedom alone and
+  collapsed the two (measured 2026-11-05); the witness reconstructs it and the
+  mutant is red.
+- `whitespace_is_load_bearing` — `split("a b")` is two fields, so the
+  whitespace half is not decoration either.
+- `fold_leaves_nothing` / `fold_is_idempotent` — completeness and fixpoint, so
+  an identity pass cannot satisfy the law.
+- `pin_custom_ifs_gate` — with `IFS=:` the whitespace-free `a:b` splits into
+  two fields; the pass returns early on `program_may_custom_ifs`, which is why
+  the model keeps the separator set as a parameter.
+- `pin_element_carveout_keeps` — element stores into an array that is not
+  already int-homed keep their split (conservative: it protects the C ingest's
+  array homing, not the value).
+
+Pins mirror the source's tests: `folds_int_typed_var_read`,
+`keeps_unknown_var`, `keeps_whitespace_literal`, `folds_spaceless_literal`,
+`nospace_is_not_nonempty`, `keeps_split_of_empty_literal`,
+`folds_split_with_a_nonempty_part`, `custom_ifs_blocks_the_fold`,
+`nested_split_and_subs`, `keeps_element_split_of_non_int_array`,
+`folds_element_split_of_int_array`, and the funnel shapes.
+
+Hypotheses in-file: reachability/registration of the pass; the verdicts it
+consumes rather than computes (`analyze_var_nospace`'s bit — the `NSVar` node
+with `nospace_env_ok`; the A2 int verdict — the `Int` node with
+`int_env_ok`, canonical decimal being non-empty and whitespace-free); the
+custom-IFS gate; the element carve-out; corpus domain.
+
+Mutants, measured: drop the non-emptiness half **36 verified, 5 errors**; drop
+the whitespace half **38 / 3**; identity **33 / 8**; fold on either half
+**34 / 7**.
 
 ## Running it
 
@@ -4572,6 +5475,49 @@ source and outside the model), and corpus domain.
 Mutants, measured: identity **15 verified, 3 errors**; fold the printed bytes
 **14 / 4**; fold `-n` bodies **17 / 1**; fold runtime words **15 / 3**.
 
+## split_fold.rs — the licence, not the walk (41)
+
+`shir_passes/split_fold.rs`. An unquoted expansion yields the value's words;
+when the value is provably free of IFS whitespace the split produces exactly
+one field, so `split[e]` is a no-op and the pass replaces it with `e`.
+
+- `fold_preserves_fields` — the law: the expression observes the same word
+  list (and carries the same text) after the fold, for every expression and
+  every environment.
+- `words_nonsep` — the tokenizer obligation: a whitespace-free NON-EMPTY value
+  splits to exactly `[v]`.
+- `empty_is_zero_words` — `split("")` is ZERO fields while the bare word is
+  ONE empty field. The pre-fix rule folded on whitespace-freedom alone and
+  collapsed the two (measured 2026-11-05); the witness reconstructs it and the
+  mutant is red.
+- `whitespace_is_load_bearing` — `split("a b")` is two fields, so the
+  whitespace half is not decoration either.
+- `fold_leaves_nothing` / `fold_is_idempotent` — completeness and fixpoint, so
+  an identity pass cannot satisfy the law.
+- `pin_custom_ifs_gate` — with `IFS=:` the whitespace-free `a:b` splits into
+  two fields; the pass returns early on `program_may_custom_ifs`, which is why
+  the model keeps the separator set as a parameter.
+- `pin_element_carveout_keeps` — element stores into an array that is not
+  already int-homed keep their split (conservative: it protects the C ingest's
+  array homing, not the value).
+
+Pins mirror the source's tests: `folds_int_typed_var_read`,
+`keeps_unknown_var`, `keeps_whitespace_literal`, `folds_spaceless_literal`,
+`nospace_is_not_nonempty`, `keeps_split_of_empty_literal`,
+`folds_split_with_a_nonempty_part`, `custom_ifs_blocks_the_fold`,
+`nested_split_and_subs`, `keeps_element_split_of_non_int_array`,
+`folds_element_split_of_int_array`, and the funnel shapes.
+
+Hypotheses in-file: reachability/registration of the pass; the verdicts it
+consumes rather than computes (`analyze_var_nospace`'s bit — the `NSVar` node
+with `nospace_env_ok`; the A2 int verdict — the `Int` node with
+`int_env_ok`, canonical decimal being non-empty and whitespace-free); the
+custom-IFS gate; the element carve-out; corpus domain.
+
+Mutants, measured: drop the non-emptiness half **36 verified, 5 errors**; drop
+the whitespace half **38 / 3**; identity **33 / 8**; fold on either half
+**34 / 7**.
+
 ## Running it
 
 Same toolchain as above (`--rlimit 40`).
@@ -4906,6 +5852,49 @@ source and outside the model), and corpus domain.
 Mutants, measured: identity **15 verified, 3 errors**; fold the printed bytes
 **14 / 4**; fold `-n` bodies **17 / 1**; fold runtime words **15 / 3**.
 
+## split_fold.rs — the licence, not the walk (41)
+
+`shir_passes/split_fold.rs`. An unquoted expansion yields the value's words;
+when the value is provably free of IFS whitespace the split produces exactly
+one field, so `split[e]` is a no-op and the pass replaces it with `e`.
+
+- `fold_preserves_fields` — the law: the expression observes the same word
+  list (and carries the same text) after the fold, for every expression and
+  every environment.
+- `words_nonsep` — the tokenizer obligation: a whitespace-free NON-EMPTY value
+  splits to exactly `[v]`.
+- `empty_is_zero_words` — `split("")` is ZERO fields while the bare word is
+  ONE empty field. The pre-fix rule folded on whitespace-freedom alone and
+  collapsed the two (measured 2026-11-05); the witness reconstructs it and the
+  mutant is red.
+- `whitespace_is_load_bearing` — `split("a b")` is two fields, so the
+  whitespace half is not decoration either.
+- `fold_leaves_nothing` / `fold_is_idempotent` — completeness and fixpoint, so
+  an identity pass cannot satisfy the law.
+- `pin_custom_ifs_gate` — with `IFS=:` the whitespace-free `a:b` splits into
+  two fields; the pass returns early on `program_may_custom_ifs`, which is why
+  the model keeps the separator set as a parameter.
+- `pin_element_carveout_keeps` — element stores into an array that is not
+  already int-homed keep their split (conservative: it protects the C ingest's
+  array homing, not the value).
+
+Pins mirror the source's tests: `folds_int_typed_var_read`,
+`keeps_unknown_var`, `keeps_whitespace_literal`, `folds_spaceless_literal`,
+`nospace_is_not_nonempty`, `keeps_split_of_empty_literal`,
+`folds_split_with_a_nonempty_part`, `custom_ifs_blocks_the_fold`,
+`nested_split_and_subs`, `keeps_element_split_of_non_int_array`,
+`folds_element_split_of_int_array`, and the funnel shapes.
+
+Hypotheses in-file: reachability/registration of the pass; the verdicts it
+consumes rather than computes (`analyze_var_nospace`'s bit — the `NSVar` node
+with `nospace_env_ok`; the A2 int verdict — the `Int` node with
+`int_env_ok`, canonical decimal being non-empty and whitespace-free); the
+custom-IFS gate; the element carve-out; corpus domain.
+
+Mutants, measured: drop the non-emptiness half **36 verified, 5 errors**; drop
+the whitespace half **38 / 3**; identity **33 / 8**; fold on either half
+**34 / 7**.
+
 ## Running it
 
 Same toolchain as above (`--rlimit 40`).
@@ -5226,6 +6215,49 @@ source and outside the model), and corpus domain.
 
 Mutants, measured: identity **15 verified, 3 errors**; fold the printed bytes
 **14 / 4**; fold `-n` bodies **17 / 1**; fold runtime words **15 / 3**.
+
+## split_fold.rs — the licence, not the walk (41)
+
+`shir_passes/split_fold.rs`. An unquoted expansion yields the value's words;
+when the value is provably free of IFS whitespace the split produces exactly
+one field, so `split[e]` is a no-op and the pass replaces it with `e`.
+
+- `fold_preserves_fields` — the law: the expression observes the same word
+  list (and carries the same text) after the fold, for every expression and
+  every environment.
+- `words_nonsep` — the tokenizer obligation: a whitespace-free NON-EMPTY value
+  splits to exactly `[v]`.
+- `empty_is_zero_words` — `split("")` is ZERO fields while the bare word is
+  ONE empty field. The pre-fix rule folded on whitespace-freedom alone and
+  collapsed the two (measured 2026-11-05); the witness reconstructs it and the
+  mutant is red.
+- `whitespace_is_load_bearing` — `split("a b")` is two fields, so the
+  whitespace half is not decoration either.
+- `fold_leaves_nothing` / `fold_is_idempotent` — completeness and fixpoint, so
+  an identity pass cannot satisfy the law.
+- `pin_custom_ifs_gate` — with `IFS=:` the whitespace-free `a:b` splits into
+  two fields; the pass returns early on `program_may_custom_ifs`, which is why
+  the model keeps the separator set as a parameter.
+- `pin_element_carveout_keeps` — element stores into an array that is not
+  already int-homed keep their split (conservative: it protects the C ingest's
+  array homing, not the value).
+
+Pins mirror the source's tests: `folds_int_typed_var_read`,
+`keeps_unknown_var`, `keeps_whitespace_literal`, `folds_spaceless_literal`,
+`nospace_is_not_nonempty`, `keeps_split_of_empty_literal`,
+`folds_split_with_a_nonempty_part`, `custom_ifs_blocks_the_fold`,
+`nested_split_and_subs`, `keeps_element_split_of_non_int_array`,
+`folds_element_split_of_int_array`, and the funnel shapes.
+
+Hypotheses in-file: reachability/registration of the pass; the verdicts it
+consumes rather than computes (`analyze_var_nospace`'s bit — the `NSVar` node
+with `nospace_env_ok`; the A2 int verdict — the `Int` node with
+`int_env_ok`, canonical decimal being non-empty and whitespace-free); the
+custom-IFS gate; the element carve-out; corpus domain.
+
+Mutants, measured: drop the non-emptiness half **36 verified, 5 errors**; drop
+the whitespace half **38 / 3**; identity **33 / 8**; fold on either half
+**34 / 7**.
 
 ## Running it
 
