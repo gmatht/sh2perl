@@ -44522,7 +44522,23 @@ fn collect_fn_defs(
         match s {
             IrStmt::Function { name, body, .. } => {
                 names.insert(name.clone());
-                defs.push((name.clone(), body.clone()));
+                // ONE file-scope definition per name. bash makes a later
+                // `name()` REPLACE the body (calls resolve to the binding in
+                // force), so keep the LAST body; pushing both emitted
+                // `static void sq(void)` twice and `cc` refused the program
+                // with `error: redefinition of 'sq'` (BUGS_FOUND #11a(b)).
+                // Calls made BEFORE the redefinition therefore run the final
+                // body — the same limitation the perl renderer has
+                // (`sub sq` twice: perl installs the last one); keeping both
+                // is not an option in C and keeping the first would also
+                // break the post-redefinition calls. The transform-side
+                // refusal in `direct_calls` keeps captures of a redefined
+                // name off the inlined path.
+                if let Some(slot) = defs.iter_mut().find(|(n, _)| n == name) {
+                    slot.1 = body.clone();
+                } else {
+                    defs.push((name.clone(), body.clone()));
+                }
                 // NESTED definitions (`inner()` inside `outer(){}`) are
                 // also functions — bash defines them at CALL time, the C
                 // render hoists them file-scope (081_nested_functions:
@@ -51195,6 +51211,54 @@ mod tests {
             var_storage: vec![],
             var_bash_env: vec![],
         }
+    }
+
+    /// BUGS_FOUND #11a(b): a program that defines `sq` twice emitted TWO
+    /// `static void sq(void)` bodies, so `cc` refused it (`error:
+    /// redefinition of 'sq'`) while bash runs it fine. One definition is
+    /// emitted per name, carrying the LAST body (bash replaces the
+    /// binding; `$(sq)` after the redefinition prints 4, not 3).
+    #[test]
+    fn a_redefined_function_is_emitted_once_with_its_last_body() {
+        fn def(name: &str, marker: i64) -> IrStmt {
+            IrStmt::Function {
+                name: name.to_string(),
+                params: vec![],
+                body: vec![IrStmt::Output {
+                    value: IrExpr::Int(marker),
+                    newline: true,
+                    target: None,
+                }],
+                named_blocks: vec![],
+            }
+        }
+        let out = shir_to_c(&prog_of(vec![def("sq", 3), def("sq", 4), def("keep", 5)]));
+        let defs = out
+            .lines()
+            .filter(|l| {
+                l.trim_start().starts_with("static")
+                    && l.contains("sq(")
+                    && l.trim_end().ends_with('{')
+            })
+            .count();
+        assert_eq!(defs, 1, "one `static void sq`:\n{out}");
+        assert!(
+            out.contains("(long long)(4)"),
+            "the emitted body is the LAST definition (bash prints 4):\n{out}"
+        );
+        assert!(
+            !out.contains("(long long)(3)"),
+            "the replaced body must not be emitted at all:\n{out}"
+        );
+        let keep = out
+            .lines()
+            .filter(|l| {
+                l.trim_start().starts_with("static")
+                    && l.contains("keep(")
+                    && l.trim_end().ends_with('{')
+            })
+            .count();
+        assert_eq!(keep, 1, "unrelated functions are untouched:\n{out}");
     }
 
     /// Builtin call statement `name(args…)` — the words live in the
