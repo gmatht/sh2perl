@@ -280,17 +280,17 @@ The model's content, each pinned by a witness and measured red as a mutant
 
 - **the newline is not in the text** — `echo -n hi` prints `hi`, and
   `echo hi` prints `hi\n` because the FLAG appends it. Baking `\n` into the
-  text while keeping the flag doubles it (18v/11e).
+  text while keeping the flag doubles it (18v/13e).
 - **the join is one space** — join with no separator gives `ab` for
-  `echo a b` (27v/2e).
+  `echo a b` (29v/2e).
 - **`-e` decodes through the shared table** — `echo -e 'a\nb'` prints a real
-  newline; ignoring `-e` leaves the two-character spelling (25v/4e).
+  newline; ignoring `-e` leaves the two-character spelling (25v/6e).
 - **`--` ends the scan and is consumed** — with `echo -- -n` the `-n` is a
   WORD, so the output is `-n\n`; letting the scan run past `--` swallows it and
-  drops the newline (27v/2e).
+  drops the newline (29v/2e).
 - **a runtime word is not folded** — folding `Dyn` through the empty
   compile-time placeholder prints only the newline; one environment (`x`)
-  disagrees (26v/3e).
+  disagrees (28v/3e).
 - **`\c` truncates the text AND the newline** — `echo -e 'a\cb'` prints `a`
   and nothing else; treating `\c` as an unknown escape prints `a\cb`
   (27v/4e), and keeping the trailing newline (the pre-repair shape) prints
@@ -321,8 +321,9 @@ renderer's compile-time `const_echo_text`, and the emitted runtime
 the real pipeline's output is byte-identical to bash's for `echo -e 'a\cb'`,
 `'ab\ccd'`, `'ab\c'`, `'a\cb\c'`, `'\c'`, the no-`\c` control, a
 literal through a capture, and a runtime word (`echo -e "$MYV"`). The
-redirect (`> file`) and `printf` halves of the pass are out of scope and named
-as such.
+redirect (`> file`) and `printf` halves of the pass are out of scope: they are
+separate laws over separate tables (`redirected_output_to_writefile`;
+`constant_printf`/`printf_s_fold`), not instances of this print law.
 
 ## Running it
 

@@ -60,7 +60,7 @@
 //
 // Verus 0.2026.10.18.7d82994, rust 1.99.1:
 //   verus --triggers-mode silent --rlimit 40 echo_fold_output.rs
-//   -> verification results:: NN verified, 0 errors
+//   -> verification results:: 31 verified, 0 errors
 use vstd::prelude::*;
 
 verus! {
