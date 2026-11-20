@@ -48,6 +48,16 @@
 //     definition is not consulted at all). The model's premises —
 //     "defined", "the definition at that index is pure", "exactly one
 //     definition" — are that contract made explicit.
+//     UPDATED 2026-11-20 (BUGS_FOUND.md #11a): the premise is no longer
+//     an assumption only. The shipped transform now COUNTS definitions
+//     and drops every multiply-defined name from the lookup table, so
+//     "exactly one definition" is enforced by the code; the source test
+//     `refuses_capture_of_a_redefined_function` is the tripwire behind
+//     `pin_redefined_kept`, and `rewrites_capture_of_a_single_definition`
+//     covers the accepted side. What the proofs found was that the
+//     header promised this refusal while `find()` silently took the first
+//     definition; the C renderer's duplicate-`static void` arm is still
+//     open and is tracked separately in BUGS_FOUND.md.
 //   - Traversal: the real `transform_stmt`/`transform_expr` recurse
 //     through If/While/loops/Block/Subshell/Background/Redirect/
 //     Function bodies and bottom-up through BinOp/Call/Index/Ternary/

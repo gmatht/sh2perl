@@ -72,6 +72,15 @@ pub fn transform(stmts: &mut Vec<IrStmt>) -> bool {
 /// If `st` is a loop with hoistable leading work, return (hoisted, new
 /// body); otherwise `(vec![], None)`.
 fn split_loop(st: &IrStmt, fns: &[(String, Vec<IrStmt>)]) -> (Vec<IrStmt>, Option<Vec<IrStmt>>) {
+    // A hoisted assignment runs once BEFORE the loop. That is equivalent to
+    // running it on the first trip only if there IS a first trip: at zero
+    // trips the original executes nothing while the prologue would execute.
+    // `while false; do y=5; done` leaves `y` unset in bash; the pre-fix
+    // transform hoisted `y=5` and assigned it (BUGS_FOUND.md #7). Refuse
+    // every loop that can execute zero times.
+    if !runs_at_least_once(st) {
+        return (Vec::new(), None);
+    }
     let (body, loop_vars): (&Vec<IrStmt>, Vec<String>) = match st {
         IrStmt::While { body, .. } => (body, Vec::new()),
         // The foreach counter is loop-carried by construction: a body
@@ -86,6 +95,32 @@ fn split_loop(st: &IrStmt, fns: &[(String, Vec<IrStmt>)]) -> (Vec<IrStmt>, Optio
     }
     let kept: Vec<IrStmt> = body.iter().filter(|s| !hoisted.contains(*s)).cloned().collect();
     (hoisted, Some(kept))
+}
+
+/// Does this loop execute its body at least once? Conservative: only the
+/// shapes the IR decides statically.
+fn runs_at_least_once(st: &IrStmt) -> bool {
+    match st {
+        // `while 1` — a constant truthy condition. `while [ … ]` is a
+        // runtime `test` call and is NOT decided here.
+        IrStmt::While {
+            cond: IrExpr::Int(n), ..
+        } => *n != 0,
+        IrStmt::For { iter, .. } => match iter {
+            // inclusive range: non-empty iff start <= end
+            IrExpr::Range { start, end } => start <= end,
+            // a literal word list. Only literal/Int items: an expansion
+            // could split to zero words.
+            IrExpr::Array(items) => {
+                !items.is_empty()
+                    && items
+                        .iter()
+                        .all(|i| matches!(i, IrExpr::Str(..) | IrExpr::Int(_)))
+            }
+            _ => false,
+        },
+        _ => false,
+    }
 }
 
 fn set_loop_body(st: &IrStmt, body: Vec<IrStmt>) -> IrStmt {
@@ -947,17 +982,16 @@ mod tests {
         }
     }
 
-    /// `x=5; while c; do y = x; done` — `y` reads only the invariant `x`;
-    /// `y` is written once, reads nothing loop-carried → hoisted.
+    /// `x=5; while 1; do y = x; done` — `y` reads only the invariant `x`;
+    /// `y` is written once, reads nothing loop-carried → hoisted. (`while 1`
+    /// rather than a runtime test: the trip guard refuses loops that may run
+    /// zero times, and only a constant condition is decided in the IR.)
     #[test]
     fn hoists_invariant_from_body() {
         let mut stmts = vec![
             assign("x", IrExpr::Int(5)),
             IrStmt::While {
-                cond: IrExpr::Call {
-                    func: "test".to_string(),
-                    args: vec![IrExpr::Str("$n -lt 10".into(), StrStyle::DoubleQuoted)],
-                },
+                cond: IrExpr::Int(1),
                 body: vec![assign("y", IrExpr::Var("x".to_string(), None))],
             },
         ];
@@ -997,6 +1031,40 @@ mod tests {
         assert!(!transform(&mut stmts));
         if let IrStmt::While { body, .. } = &stmts[0] {
             assert_eq!(body.len(), 2, "no hoisting for a loop-carried accumulator");
+        }
+    }
+
+    /// `while false; do y=5; done` — zero trips. The pre-fix transform
+    /// hoisted `y=5` and bash (which leaves `y` unset) diverged. Regression
+    /// for BUGS_FOUND.md #7: the trip guard refuses the hoist.
+    #[test]
+    fn refuses_zero_trip_while() {
+        let mut stmts = vec![IrStmt::While {
+            cond: IrExpr::Int(0),
+            body: vec![assign("y", IrExpr::Int(5))],
+        }];
+        assert!(!transform(&mut stmts));
+        if let IrStmt::While { body, .. } = &stmts[0] {
+            assert_eq!(body.len(), 1, "no prologue for a zero-trip loop");
+        } else {
+            panic!("expected While");
+        }
+    }
+
+    /// `for i in 5..1; do y=5; done` — an empty inclusive range. Same guard
+    /// as the zero-trip `while`: nothing may be hoisted.
+    #[test]
+    fn refuses_empty_range_for() {
+        let mut stmts = vec![IrStmt::For {
+            var: "i".to_string(),
+            iter: IrExpr::Range { start: 5, end: 1 },
+            body: vec![assign("y", IrExpr::Int(5))],
+        }];
+        assert!(!transform(&mut stmts));
+        if let IrStmt::For { body, .. } = &stmts[0] {
+            assert_eq!(body.len(), 1, "no prologue for an empty range");
+        } else {
+            panic!("expected For");
         }
     }
 

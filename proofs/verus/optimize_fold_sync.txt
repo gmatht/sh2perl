@@ -1,0 +1,40 @@
+# optimize_fold table — GENERATED from sh2perl/src/ir.rs; do not edit.
+# Regenerate: OUT_TMP=<file> harness/fold-table-extract.sh >/dev/null
+
+[bin] fold_bin_op
+arm "+" => Some(a.wrapping_add(b))
+arm "-" => Some(a.wrapping_sub(b))
+arm "*" => Some(a.wrapping_mul(b))
+arm "/" if b != 0 && !(a == i64::MIN && b == -1) => Some(a / b)
+arm "%" if b != 0 && !(a == i64::MIN && b == -1) => Some(a % b)
+arm "&" => Some(a & b)
+arm "|" => Some(a | b)
+arm "^" => Some(a ^ b)
+arm ">>" => Some(a.wrapping_shr(b as u32))
+arm "<<" => Some(a.wrapping_shl(b as u32))
+arm "&&" => Some(((a != 0) && (b != 0)) as i64)
+arm "||" => Some(((a != 0) || (b != 0)) as i64)
+arm "**" if b >= 0 => Some(pow_wrapping(a, b))
+
+[un] fold_un_op
+arm "-" => Some(a.wrapping_neg())
+arm "+" => Some(a)
+arm "!" => Some((a == 0) as i64)
+arm "~" => Some(!a)
+
+[model] op -> arm (presence checked)
+op + -> Op::Add: present
+op - -> Op::Sub: present
+op * -> Op::Mul: present
+op / -> Op::Div: present
+op % -> Op::Mod: present
+op & -> Op::BitAnd: present
+op | -> Op::BitOr: present
+op ^ -> Op::BitXor: present
+op >> -> Op::Shr: present
+op << -> Op::Shl: present
+op && -> Op::And: present
+op || -> Op::Or: present
+op ** -> Op::Pow: present
+guard pow_wrapping squaring shape: PRESENT
+guard fold_arith_ast cond recursion: PRESENT

@@ -394,6 +394,44 @@ pub open spec fn param_gate(a: Seq<Expr>) -> Option<Name> {
     }
 }
 
+// ── expr-position `assign(NAME, op, value)` ────────────────────────
+// `A && x=v || y=w` lowers to a chain whose WRITE is an ARM of an
+// expression — no `Stmt::Assign` ever exists, so the statement arms
+// cannot see it. The source's `collect_assigned_expr` therefore has its
+// own `func == "assign"` arm: take args[0]'s BASE (an element write
+// `n[i]=v` hoists `n`), keep it when it is an identifier, and then walk
+// args — extraction AND recursion, the printf/let/param shape.
+pub open spec fn c_assign() -> Str {
+    seq!['a', 's', 's', 'i', 'g', 'n']
+}
+
+// the prefix before the first `[` (source: `n.split('[').next()`).
+pub open spec fn base_of(t: Str) -> Str
+    decreases t.len(),
+{
+    if t.len() == 0 {
+        Seq::empty()
+    } else if t[0] == '[' {
+        Seq::empty()
+    } else {
+        seq![t[0]].add(base_of(t.drop_first()))
+    }
+}
+
+pub open spec fn assign_target(a: Seq<Expr>) -> Option<Name> {
+    match arg_text(a, 0) {
+        Some(t) => {
+            let b = base_of(t);
+            if is_ident(b) {
+                Some(b)
+            } else {
+                None
+            }
+        }
+        None => None,
+    }
+}
+
 // ── word extraction (args[1..] with one-level Array splice) ─────────
 
 pub open spec fn flatten_words(a: Seq<Expr>, i: int) -> Seq<Expr>
@@ -744,6 +782,11 @@ pub open spec fn col_e(e: Expr, n: Name, m: Ch) -> bool
                     let_target(args) == Some(n) || col_x(args, n, m)
                 } else if func == c_param() {
                     param_gate(args) == Some(n) || col_x(args, n, m)
+                } else if func == c_assign() {
+                    // expr-position write: the base of args[0], PLUS the
+                    // generic walk (the source arm recurses after it
+                    // extracts).
+                    assign_target(args) == Some(n) || col_x(args, n, m)
                 } else {
                     col_x(args, n, m)
                 }
@@ -957,6 +1000,10 @@ pub open spec fn writes_e(e: Expr, n: Name) -> bool
                 let_target(args) == Some(n) || writes_x(args, n)
             } else if func == c_param() {
                 param_gate(args) == Some(n) || writes_x(args, n)
+            } else if func == c_assign() {
+                // `A && x=v || y=w`: the target is args[0]'s base, then
+                // the arm recurses (source extracts AND walks).
+                assign_target(args) == Some(n) || writes_x(args, n)
             } else {
                 writes_x(args, n)
             }
@@ -1560,6 +1607,8 @@ proof fn coverage_e(e: Expr, n: Name)
                     let_target(args) == Some(n) || writes_x(args, n)
                 } else if func == c_param() {
                     param_gate(args) == Some(n) || writes_x(args, n)
+                } else if func == c_assign() {
+                    assign_target(args) == Some(n) || writes_x(args, n)
                 } else {
                     writes_x(args, n)
                 }));
@@ -1573,6 +1622,8 @@ proof fn coverage_e(e: Expr, n: Name)
                     let_target(args) == Some(n) || col_x(args, n, Ch::Hoist)
                 } else if func == c_param() {
                     param_gate(args) == Some(n) || col_x(args, n, Ch::Hoist)
+                } else if func == c_assign() {
+                    assign_target(args) == Some(n) || col_x(args, n, Ch::Hoist)
                 } else {
                     col_x(args, n, Ch::Hoist)
                 }));
@@ -1598,6 +1649,18 @@ proof fn coverage_e(e: Expr, n: Name)
                     }
                 } else if func == c_param() {
                     if param_gate(args) == Some(n) {
+                    } else if writes_x(args, n) {
+                        let i = choose|i: int|
+                            0 <= i < args.len() && writes_e(args[i], n);
+                        coverage_e(args[i], n);
+                        assert(col_x(args, n, Ch::Hoist));
+                    }
+                } else if func == c_assign() {
+                    // extraction (`assign_target`) and recursion are two
+                    // DISJUNCTS on both sides, so the proof splits the
+                    // same way the source emits: either the base IS n, or
+                    // the write is somewhere in args.
+                    if assign_target(args) == Some(n) {
                     } else if writes_x(args, n) {
                         let i = choose|i: int|
                             0 <= i < args.len() && writes_e(args[i], n);
@@ -1980,6 +2043,14 @@ pub open spec fn exec_call(args: Seq<Expr>) -> Expr {
     Expr::Call { func: c_exec(), args }
 }
 
+pub open spec fn assign_call(name: Str, op: Str, val: Str) -> Expr {
+    Expr::Call {
+        func: c_assign(),
+        args: seq![Expr::Str { text: name, single: false },
+            Expr::Str { text: op, single: false }, Expr::Str { text: val, single: false }],
+    }
+}
+
 // t04/v10: the writing param arm — every walker collects it at the
 // expr level (the shape that produced `y` undeclared at cc).
 proof fn pin_t04_param()
@@ -2249,6 +2320,92 @@ proof fn pin_select_ch()
     assert(col_s(st, seq!['y'], Ch::Hoist));
     assert(col_s(st, seq!['y'], Ch::Veto));
     assert(!col_s(st, seq!['y'], Ch::Inv));
+}
+
+// raw_hits needs a `${`: a text shorter than three characters has no
+// index i with i + 2 < len, so the existential is EMPTY (not merely
+// unmatched). This is what lets the read walks over one-character words
+// be refuted structurally, without any search.
+proof fn raw_hits_needs_three(t: Str, n: Name)
+    requires t.len() < 3,
+    ensures !raw_hits(t, n),
+{
+    if raw_hits(t, n) {
+        let i = choose|i: int| raw_hit(t, n, i);
+        assert(i >= 0 && i + 2 < t.len());
+    }
+}
+
+// fix (2026-11-04): expr-position `assign` — measured on
+// `true && x=v || y=w` / `false && p=q || r=s`. The write is an ARM of a
+// chain EXPRESSION, so no `Stmt::Assign` exists and the statement arms
+// cannot see it; the read of `x` then routed to `_sh_env("x")` (the
+// ENVIRONMENT) while the write went to the C variable, and the program
+// echoed a value it had just assigned as empty. The pin asserts the
+// collector answers the way the source arm does: HOIST sees the target
+// (decls and read routing both fold over it), while the inventory and
+// veto walks do NOT — their arm sets are unchanged, because neither a
+// decl site nor a `${NAME:=…}` position can be an `assign` call, so
+// adding the arm here would be a false `declared`.
+proof fn pin_assign_chain()
+    ensures
+        writes_e(assign_call(seq!['x'], seq!['='], seq!['1']), seq!['x']),
+        col_e(assign_call(seq!['x'], seq!['='], seq!['1']), seq!['x'], Ch::Hoist),
+        !col_e(assign_call(seq!['x'], seq!['='], seq!['1']), seq!['x'], Ch::Inv),
+        !col_e(assign_call(seq!['x'], seq!['='], seq!['1']), seq!['x'], Ch::Veto),
+        // an ELEMENT write hoists the ARRAY's name (the base before `[`)
+        assign_target(seq![Expr::Str { text: seq!['n', '[', '2', ']'], single: false }])
+            == Some(seq!['n']),
+        col_e(assign_call(seq!['n', '[', '2', ']'], seq!['='], seq!['1']), seq!['n'],
+            Ch::Hoist),
+        // and a NON-identifier base extracts nothing (no phantom name)
+        assign_target(seq![Expr::Str { text: seq!['2', 'x'], single: false }]) == Option::None,
+{
+    // ── the chain's arm: extraction of args[0]'s base ──
+    assert(base_of(seq!['x']) == seq!['x']) by (compute);
+    assert(is_ident(seq!['x']));
+    let e = assign_call(seq!['x'], seq!['='], seq!['1']);
+    assert(assign_target(match e { Expr::Call { args, .. } => args, _ => Seq::empty() })
+        == Some(seq!['x']));
+    // HOIST sees it, and the denotation agrees (the measured case: after
+    // this arm the read of `x` is the C VARIABLE, not `_sh_env("x")`).
+    assert(col_e(e, seq!['x'], Ch::Hoist));
+    // ── an ELEMENT write hoists the ARRAY name ──
+    assert(base_of(seq!['n', '[', '2', ']']) == seq!['n']) by (compute);
+    assert(is_ident(seq!['n']));
+    assert(assign_target(seq![Expr::Str { text: seq!['n', '[', '2', ']'], single: false }])
+        == Some(seq!['n']));
+    // ── and a non-identifier base extracts NOTHING (no phantom name) ──
+    assert(base_of(seq!['2', 'x']) == seq!['2', 'x']) by (compute);
+    assert(!is_ident(seq!['2', 'x']));
+    assert(assign_target(seq![Expr::Str { text: seq!['2', 'x'], single: false }])
+        == Option::None);
+    // ── fidelity both ways: INV and VETO do not see it ──
+    // Neither walk has an `assign` arm in the source (the sync manifest
+    // lists it under collect_assigned_expr alone), and for these ARGS
+    // their generic walks are empty: acknowledging an assign call as a
+    // DECL site or a `${NAME:=…}` site would be a false `declared`.
+    let a0 = Expr::Str { text: seq!['x'], single: false };
+    let a1 = Expr::Str { text: seq!['='], single: false };
+    let a2 = Expr::Str { text: seq!['1'], single: false };
+    let args = seq![a0, a1, a2];
+    raw_hits_needs_three(seq!['x'], seq!['x']);
+    raw_hits_needs_three(seq!['='], seq!['x']);
+    raw_hits_needs_three(seq!['1'], seq!['x']);
+    assert(args.len() == 3);
+    assert(args[0] == a0);
+    assert(args[1] == a1);
+    assert(args[2] == a2);
+    assert(!col_e(a0, seq!['x'], Ch::Inv));
+    assert(!col_e(a1, seq!['x'], Ch::Inv));
+    assert(!col_e(a2, seq!['x'], Ch::Inv));
+    if col_x(args, seq!['x'], Ch::Inv) {
+        let i = choose|i: int| 0 <= i < args.len() && col_e(args[i], seq!['x'], Ch::Inv);
+        assert(i == 0 || i == 1 || i == 2);
+        assert(args[i] == a0 || args[i] == a1 || args[i] == a2);
+    }
+    assert(!col_x(args, seq!['x'], Ch::Inv));
+    assert(!col_x(args, seq!['x'], Ch::Veto));
 }
 
 } // verus!

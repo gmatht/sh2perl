@@ -8,10 +8,14 @@
 //
 // The proof found a REAL SOUNDNESS HOLE: at n = 0 the prologue runs
 // while the original runs nothing (verified live against the
-// transform: `while false; do y = 5; done` hoists `y = 5`
-// unconditionally). The theorem covers exactly the sound fragment
-// (n >= 1); the 0-trip divergence is pinned as
-// pin_zero_trip_diverges and recorded in BUGS_FOUND.md.
+// transform: `while false; do y = 5; done` hoisted `y = 5`
+// unconditionally). The transform now REFUSES every loop that may run
+// zero times (`runs_at_least_once` in the source, BUGS_FOUND.md #7), and
+// this file proves the two halves of that repair:
+//   guard_gives_a_trip:  runs_at_least_once(k) ==> trips(k) >= 1
+//   hoist_sound_gated:   under the guard, hoisted run == original run.
+// pin_zero_trip_diverges stays as the refutation of the UNGUARDED rule —
+// it is why the guard, not a stronger claim, is the fix.
 //
 // Agreement is pointwise (the redundant_store_elim precedent —
 // agree_shadow over lookups, never whole-Map ==, which the solver
@@ -58,6 +62,59 @@ pub open spec fn lookup(s: Store, v: Var) -> int {
 pub struct InvAssign {
     pub target: Var,
     pub value: int,
+}
+
+// ---- The trip guard (source: `runs_at_least_once`) ----
+// The transform decides only the shapes the IR decides statically;
+// every other loop is refused, which this model represents by having no
+// LoopKind for it (no kind, no theorem — the conservative rule).
+pub enum LoopKind {
+    // `while 1` / `while 0`
+    WhileConst(bool),
+    // inclusive `start..=end`
+    Range(int, int),
+    // a literal word list of length n
+    Words(nat),
+}
+
+pub open spec fn trips(k: LoopKind) -> nat {
+    match k {
+        LoopKind::WhileConst(b) => if b { 1nat } else { 0nat },
+        LoopKind::Range(start, end) => if start <= end { (end - start + 1) as nat } else { 0nat },
+        LoopKind::Words(n) => n,
+    }
+}
+
+pub open spec fn runs_at_least_once(k: LoopKind) -> bool {
+    match k {
+        LoopKind::WhileConst(b) => b,
+        LoopKind::Range(start, end) => start <= end,
+        LoopKind::Words(n) => n > 0,
+    }
+}
+
+// The guard is exactly the n >= 1 premise of hoist_sound.
+proof fn guard_gives_a_trip(k: LoopKind)
+    requires runs_at_least_once(k),
+    ensures trips(k) >= 1,
+{
+    match k {
+        LoopKind::WhileConst(b) => {}
+        LoopKind::Range(start, end) => {}
+        LoopKind::Words(n) => {}
+    }
+}
+
+// Pointwise agreement is transitive (the hoist_sound conclusion is stated
+// against the prologue state, so the gated theorem needs this join).
+proof fn store_agree_trans(s1: Store, s2: Store, s3: Store)
+    requires store_agree(s1, s2), store_agree(s2, s3),
+    ensures store_agree(s1, s3),
+{
+    assert forall|v: Var| lookup(s1, v) == lookup(s3, v) by {
+        assert(lookup(s1, v) == lookup(s2, v));
+        assert(lookup(s2, v) == lookup(s3, v));
+    };
 }
 
 // Loop-invariant premise: the value does not depend on the trip.
@@ -213,6 +270,32 @@ proof fn pin_fn_cond_write_refused()
 {
 }
 
+// ---- The trip guard's pins (mirror the two new source tests) ----
+proof fn pin_zero_trip_refused()
+    ensures !runs_at_least_once(LoopKind::WhileConst(false)),
+{
+}
+
+proof fn pin_const_true_hoists()
+    ensures runs_at_least_once(LoopKind::WhileConst(true)),
+{
+}
+
+proof fn pin_range_empty_refused()
+    ensures !runs_at_least_once(LoopKind::Range(5, 1)),
+{
+}
+
+proof fn pin_range_hoists()
+    ensures runs_at_least_once(LoopKind::Range(0, 7)),
+{
+}
+
+proof fn pin_words_nonempty_hoists()
+    ensures runs_at_least_once(LoopKind::Words(2)),
+{
+}
+
 // Per-trip agreement: the trip equals the prologue on every lookup
 // (definitional — the suffix is identity).
 proof fn trip_agrees(prefix: Seq<InvAssign>, suffix: Seq<Var>, s: Store)
@@ -365,6 +448,23 @@ proof fn hoist_sound(prefix: Seq<InvAssign>, suffix: Seq<Var>, s: Store, n: nat)
             assert(lookup(run_prefix(prefix, run_prefix(prefix, s)), v) == lookup(run_prefix(prefix, s), v));
         };
     }
+}
+
+// THE GATED OBLIGATION: the rule the transform now implements. Under the
+// trip guard, the hoisted loop and the original agree on every lookup for
+// the trip count the loop kind determines.
+proof fn hoist_sound_gated(k: LoopKind, prefix: Seq<InvAssign>, suffix: Seq<Var>, s: Store)
+    requires all_invariant(prefix), single_write(prefix), runs_at_least_once(k),
+    ensures store_agree(
+        run_hoisted(prefix, suffix, s, trips(k)),
+        run_loop(prefix, suffix, s, trips(k))),
+{
+    guard_gives_a_trip(k);
+    hoist_sound(prefix, suffix, s, trips(k));
+    store_agree_trans(
+        run_hoisted(prefix, suffix, s, trips(k)),
+        run_prefix(prefix, s),
+        run_loop(prefix, suffix, s, trips(k)));
 }
 
 proof fn pin_hoist_preserves_run()

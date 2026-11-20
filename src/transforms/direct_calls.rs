@@ -46,12 +46,23 @@ use crate::ir::{IrExpr, IrStmt};
 /// Apply the transform. Returns whether anything changed.
 pub fn transform(stmts: &mut Vec<IrStmt>) -> bool {
     // collect the defined function names + their bodies
-    let mut fns: Vec<(String, Vec<IrStmt>)> = Vec::new();
+    let mut defs: Vec<(String, Vec<IrStmt>)> = Vec::new();
     for st in stmts.iter() {
         if let IrStmt::Function { name, body, .. } = st {
-            fns.push((name.clone(), body.clone()));
+            defs.push((name.clone(), body.clone()));
         }
     }
+    // A redefined name cannot be resolved statically. bash resolves a call to
+    // the LAST definition, the backends emit one function per `Function`
+    // statement, and `find()` below is first-definition-wins — so the three
+    // disagree. Refuse the name entirely whenever it is defined more than
+    // once; this is the redefinition rule the header has always promised
+    // (BUGS_FOUND.md 11a, `sq(){ echo 3; }; sq(){ echo 4; }; v=$(sq)`).
+    let fns: Vec<(String, Vec<IrStmt>)> = defs
+        .iter()
+        .filter(|(n, _)| defs.iter().filter(|(m, _)| m == n).count() == 1)
+        .cloned()
+        .collect();
     let mut c = false;
     for st in stmts.iter_mut() {
         c |= transform_stmt(st, &fns);
@@ -242,6 +253,74 @@ fn arith_pure(a: &ArithAstRef) -> bool {
 
 // small alias so the arith walker above reads cleanly
 type ArithAstRef = crate::ir::ArithAst;
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::ir::{AssignTarget, StrStyle};
+
+    fn fn_def(name: &str, text: &str) -> IrStmt {
+        IrStmt::Function {
+            name: name.to_string(),
+            params: vec![],
+            body: vec![IrStmt::Output {
+                value: IrExpr::Str(text.to_string(), StrStyle::DoubleQuoted),
+                newline: true,
+                target: None,
+            }],
+            named_blocks: vec![],
+        }
+    }
+
+    fn capture_of(name: &str) -> IrStmt {
+        IrStmt::Assign {
+            targets: vec![AssignTarget {
+                var: "v".to_string(),
+                sigil: None,
+                indices: vec![],
+            }],
+            expr: IrExpr::Capture {
+                expr: Box::new(IrExpr::Arrow(vec![IrStmt::Expr(IrExpr::Call {
+                    func: name.to_string(),
+                    args: vec![],
+                })])),
+                native: false,
+            },
+            asm: None,
+        }
+    }
+
+    fn captured_func(st: &IrStmt) -> Option<&str> {
+        match st {
+            IrStmt::Assign {
+                expr: IrExpr::Capture { expr, .. },
+                ..
+            } => match &**expr {
+                IrExpr::Call { func, .. } => Some(func),
+                _ => None,
+            },
+            _ => None,
+        }
+    }
+
+    /// One definition: the capture becomes a direct in-process call.
+    #[test]
+    fn rewrites_capture_of_a_single_definition() {
+        let mut stmts = vec![fn_def("sq", "3"), capture_of("sq")];
+        assert!(transform(&mut stmts));
+        assert_eq!(captured_func(&stmts[1]), Some("sq"));
+    }
+
+    /// Redefinition: bash runs the LAST definition and the backends emit one
+    /// function per statement, so the first-definition-wins table would
+    /// resolve the wrong body. Regression for BUGS_FOUND.md 11a: refuse.
+    #[test]
+    fn refuses_capture_of_a_redefined_function() {
+        let mut stmts = vec![fn_def("sq", "3"), fn_def("sq", "4"), capture_of("sq")];
+        assert!(!transform(&mut stmts));
+        assert_eq!(captured_func(&stmts[2]), None, "capture left as an Arrow");
+    }
+}
 
 // name: direct-calls
 // prereqs: [function_purity — the pure-output body test is the weak
