@@ -2655,10 +2655,10 @@ fn golf_rust(text: &str) -> String {
     }
     names.sort_by(|a, b| b.len().cmp(&a.len()));
     // The pool must skip shorts already present in the source:
-    // renderer locals (`__sh_str`, `__sh_word`, `__sh_operand`, …) already spell short
+    // renderer locals (`__sh_str`, `__sh_word`, `__sh_left`, …) already spell short
     // `__`-names, and minting the same short for a helper would merge
     // two distinct bindings (t86: `__sh_fn_all_factors` vs local
-    // `__sh_operand` both becoming `__sh_part`).
+    // `__sh_operand` both becoming `__sh_key`).
     let taken: std::collections::HashSet<String> = names.iter().cloned().collect();
     let mut lo_n = 0usize;
     let mut hi_n = 0usize;
@@ -4823,7 +4823,7 @@ impl Render {
         // would otherwise deadlock the non-reentrant mutex).
         if var == "PIPESTATUS" {
             return format!(
-                "{{ let __sh_part = __SH_PIPESTATUS.lock().unwrap(); __sh_part.get({key} as usize).cloned().unwrap_or(0).to_string() }}"
+                "{{ let __sh_pipestatus = __SH_PIPESTATUS.lock().unwrap(); __sh_pipestatus.get({key} as usize).cloned().unwrap_or(0).to_string() }}"
             );
         }
         // LOCAL ARRAY: a fixed-size Rust array indexed in place. CPython
@@ -4935,14 +4935,14 @@ impl Render {
         if matches!(crate::shir::source_lang().as_deref(), Some("py")) {
             return if usize_key {
                 format!(
-                    "{{ let __sh_key = {key} as usize; let __sh_num = {m}.with(|v| v.borrow().len()); \
-                       if __sh_key >= __sh_num {{ std::process::exit(1); }} \
-                       {m}.with(|v| v.borrow()[__sh_key].clone()) }}"
+                    "{{ let __sh_idx = {key} as usize; let __sh_num = {m}.with(|v| v.borrow().len()); \
+                       if __sh_idx >= __sh_num {{ std::process::exit(1); }} \
+                       {m}.with(|v| v.borrow()[__sh_idx].clone()) }}"
                 )
             } else {
                 format!(
-                    "{{ let __sh_key = {key}; let __sh_num = {m}.with(|v| v.borrow().len()) as i64; \
-                       let __sh_pos = if __sh_key < 0 {{ __sh_num + __sh_key }} else {{ __sh_key }}; \
+                    "{{ let __sh_idx = {key}; let __sh_num = {m}.with(|v| v.borrow().len()) as i64; \
+                       let __sh_pos = if __sh_idx < 0 {{ __sh_num + __sh_idx }} else {{ __sh_idx }}; \
                        if __sh_pos < 0 || __sh_pos >= __sh_num {{ std::process::exit(1); }} \
                        {m}.with(|v| v.borrow()[__sh_pos as usize].clone()) }}"
                 )
@@ -4952,15 +4952,15 @@ impl Render {
             // key proven non-negative: no i64 temp, no negative-wrap, no
             // `as usize` cast at the index site.
             format!(
-                "{{ let __sh_key = {key} as usize; \
-                   {m}.with(|v| v.borrow().get(__sh_key).cloned().unwrap_or_default()) }}"
+                "{{ let __sh_idx = {key} as usize; \
+                   {m}.with(|v| v.borrow().get(__sh_idx).cloned().unwrap_or_default()) }}"
             )
         } else {
             // key is i64 expr (may be negative); len from Vec. In-range →
             // element, anything else → String::new() (bash empty).
             format!(
-                "{{ let __sh_key = {key}; let __sh_num = {m}.with(|v| v.borrow().len()) as i64; \
-                   let __sh_pos = if __sh_key < 0 {{ __sh_num + __sh_key }} else {{ __sh_key }}; \
+                "{{ let __sh_idx = {key}; let __sh_num = {m}.with(|v| v.borrow().len()) as i64; \
+                   let __sh_pos = if __sh_idx < 0 {{ __sh_num + __sh_idx }} else {{ __sh_idx }}; \
                    if __sh_pos >= 0 && __sh_pos < __sh_num {{ {m}.with(|v| v.borrow()[__sh_pos as usize].clone()) }} else {{ String::new() }} }}"
             )
         }
@@ -4996,15 +4996,15 @@ impl Render {
             // prior output standing (t95/t96: the lenient 0 printed a line
             // python never prints). Shell keeps the lenient arm below.
             return format!(
-                "{{ let __sh_key = {key}; let __sh_num = {m}.with(|v| v.borrow().len()) as i64; \
-                   let __sh_pos = if __sh_key < 0 {{ __sh_num + __sh_key }} else {{ __sh_key }}; \
+                "{{ let __sh_idx = {key}; let __sh_num = {m}.with(|v| v.borrow().len()) as i64; \
+                   let __sh_pos = if __sh_idx < 0 {{ __sh_num + __sh_idx }} else {{ __sh_idx }}; \
                    if __sh_pos < 0 || __sh_pos >= __sh_num {{ std::process::exit(1); }} \
                    {m}.with(|v| v.borrow()[__sh_pos as usize]) }}"
             );
         }
         format!(
-            "{{ let __sh_key = {key}; let __sh_num = {m}.with(|v| v.borrow().len()) as i64; \
-               let __sh_pos = if __sh_key < 0 {{ __sh_num + __sh_key }} else {{ __sh_key }}; \
+            "{{ let __sh_idx = {key}; let __sh_num = {m}.with(|v| v.borrow().len()) as i64; \
+               let __sh_pos = if __sh_idx < 0 {{ __sh_num + __sh_idx }} else {{ __sh_idx }}; \
                if __sh_pos >= 0 && __sh_pos < __sh_num {{ {m}.with(|v| v.borrow()[__sh_pos as usize]) }} else {{ 0 }} }}"
         )
     }
@@ -5015,7 +5015,7 @@ impl Render {
             // guard must be scoped (two reads in one expression would
             // otherwise deadlock the non-reentrant mutex)
             return format!(
-                "{{ let __sh_part = __SH_PIPESTATUS.lock().unwrap(); __sh_part.get({key} as usize).cloned().unwrap_or(0).to_string() }}"
+                "{{ let __sh_pipestatus = __SH_PIPESTATUS.lock().unwrap(); __sh_pipestatus.get({key} as usize).cloned().unwrap_or(0).to_string() }}"
             );
         }
         // LOCAL ARRAY: a fixed-size Rust array (`let a = [..]` in this
@@ -5039,8 +5039,8 @@ impl Render {
                 }
             }
             return format!(
-                "{{ let __sh_key = {key}; let __sh_num = {n}; \
-                   let __sh_begin = if __sh_key < 0 {{ __sh_num + __sh_key }} else {{ __sh_key }}; \
+                "{{ let __sh_idx = {key}; let __sh_num = {n}; \
+                   let __sh_begin = if __sh_idx < 0 {{ __sh_num + __sh_idx }} else {{ __sh_idx }}; \
                    if __sh_begin < 0 || __sh_begin >= __sh_num {{ std::process::exit(1); }} \
                    {m}[__sh_begin as usize]{sel} }}",
                 sel = if int_home { "" } else { ".clone()" }
@@ -5247,7 +5247,7 @@ impl Render {
                     // verbatim and rustc reported the doubled block
                     // ("unnecessary braces around block return value", 4
                     // corpus sites: `*v.borrow_mut() = {{ let __sh_part = … }}`).
-                    "{ let __sh_part = __SH_BGPID.load(Ordering::Relaxed); if __sh_part == 0 { String::new() } else { __sh_part.to_string() } }".to_string()
+                    "{ let __sh_bgpid = __SH_BGPID.load(Ordering::Relaxed); if __sh_bgpid == 0 { String::new() } else { __sh_bgpid.to_string() } }".to_string()
                 }
                 "RANDOM" => {
                     self.add_helper("rand");
@@ -5743,12 +5743,12 @@ impl Render {
                 let t = self.expr_str(&x.text);
                 let c = self.expr_num(&x.count);
                 let tail = if x.from_end {
-                    "let __sh_str = __sh_key.saturating_sub(__sh_num as usize); __sh_span[__sh_str..].join(\"\\n\")"
+                    "let __sh_start = __sh_count.saturating_sub(__sh_num as usize); __sh_lines[__sh_start..].join(\"\\n\")"
                 } else {
-                    "let __sh_item = (__sh_num as usize).min(__sh_key); __sh_span[..__sh_item].join(\"\\n\")"
+                    "let __sh_stop = (__sh_num as usize).min(__sh_count); __sh_lines[..__sh_stop].join(\"\\n\")"
                 };
                 Some(format!(
-                    "{{ let __sh_text: String = {t}; let __sh_num: i64 = {c}; let __sh_span: Vec<&str> = __sh_text.split('\\n').collect(); let __sh_key = __sh_span.len(); if __sh_num <= 0 {{ String::new() }} else {{ {tail} }} }}"
+                    "{{ let __sh_text: String = {t}; let __sh_num: i64 = {c}; let __sh_lines: Vec<&str> = __sh_text.split('\\n').collect(); let __sh_count = __sh_lines.len(); if __sh_num <= 0 {{ String::new() }} else {{ {tail} }} }}"
                 ))
             }
             "RepeatStr" => {
@@ -5777,14 +5777,14 @@ impl Render {
                 let key = match field {
                     None => {
                         if x.ignore_case {
-                            "__sh_str.to_lowercase()".to_string()
+                            "__sh_line.to_lowercase()".to_string()
                         } else {
-                            "__sh_str.clone()".to_string()
+                            "__sh_line.clone()".to_string()
                         }
                     }
                     Some((sep, n)) => {
                         let base = format!(
-                            "__sh_str.split({}).nth({}).unwrap_or(\"\").to_string()",
+                            "__sh_line.split({}).nth({}).unwrap_or(\"\").to_string()",
                             Self::rust_str(&sep.to_string()),
                             n - 1
                         );
@@ -5795,7 +5795,7 @@ impl Render {
                         }
                     }
                 };
-                let (ka, kb) = if x.reverse { ("__sh_buf", "__sh_operand") } else { ("__sh_operand", "__sh_buf") };
+                let (ka, kb) = if x.reverse { ("__sh_right", "__sh_left") } else { ("__sh_left", "__sh_right") };
                 let cmp = if x.numeric {
                     format!(
                         "{{ let (__sh_state, __sh_put) = (__sort_key({ka}).trim().parse::<f64>().unwrap_or(0.0), \
@@ -5807,18 +5807,18 @@ __sh_state.partial_cmp(&__sh_put).unwrap_or(std::cmp::Ordering::Equal) }}"
                 };
                 let uniq = if x.unique {
                     "let mut __sh_uniq: Vec<String> = Vec::new(); \
-for __sh_state in __sh_span.drain(..) { if __sh_uniq.last().map(|__sh_part| __sort_key(__sh_part) != __sort_key(&__sh_state)).unwrap_or(true) { __sh_uniq.push(__sh_state); } } \
-__sh_span = __sh_uniq;"
+for __sh_state in __sh_lines.drain(..) { if __sh_uniq.last().map(|__sh_last| __sort_key(__sh_last) != __sort_key(&__sh_state)).unwrap_or(true) { __sh_uniq.push(__sh_state); } } \
+__sh_lines = __sh_uniq;"
                 } else {
                     ""
                 };
                 Some(format!(
                     "{{ let __sh_text: String = {t}; \
-let mut __sh_span: Vec<String> = if __sh_text.is_empty() {{ Vec::new() }} else {{ \
-let mut __sh_value: Vec<String> = __sh_text.split('\\n').map(|__sh_str| __sh_str.to_string()).collect(); \
-if __sh_text.ends_with('\\n') {{ __sh_value.pop(); }} __sh_value }}; \
-let __sort_key = |__sh_str: &String| -> String {{ {key} }}; \
-__sh_span.sort_by(|__sh_operand, __sh_buf| {cmp}); {uniq} __sh_span.join(\"\\n\") }}"
+let mut __sh_lines: Vec<String> = if __sh_text.is_empty() {{ Vec::new() }} else {{ \
+let mut __sh_collected: Vec<String> = __sh_text.split('\\n').map(|__sh_line| __sh_line.to_string()).collect(); \
+if __sh_text.ends_with('\\n') {{ __sh_collected.pop(); }} __sh_collected }}; \
+let __sort_key = |__sh_line: &String| -> String {{ {key} }}; \
+__sh_lines.sort_by(|__sh_left, __sh_right| {cmp}); {uniq} __sh_lines.join(\"\\n\") }}"
                 ))
             }
             "UniqLines" => {
@@ -5827,19 +5827,19 @@ __sh_span.sort_by(|__sh_operand, __sh_buf| {cmp}); {uniq} __sh_span.join(\"\\n\"
                 let skip = x.skip.max(0) as usize;
                 let projected = if x.count {
                     // GNU `uniq -c` pads the run length to width 7.
-                    "format!(\"{:>7} {}\", __sh_end - __sh_begin, __sh_span[__sh_begin])".to_string()
+                    "format!(\"{:>7} {}\", __sh_end - __sh_begin, __sh_lines[__sh_begin])".to_string()
                 } else {
-                    "__sh_span[__sh_begin].clone()".to_string()
+                    "__sh_lines[__sh_begin].clone()".to_string()
                 };
                 Some(format!(
                     "{{ let __sh_text: String = {t}; \
-let mut __sh_span: Vec<String> = if __sh_text.is_empty() {{ Vec::new() }} else {{ \
-let mut __sh_value: Vec<String> = __sh_text.split('\\n').map(|__sh_str| __sh_str.to_string()).collect(); \
-if __sh_text.ends_with('\\n') {{ __sh_value.pop(); }} __sh_value }}; \
-let __sh_key = |__sh_str: &String| -> String {{ __sh_str.chars().skip({skip}).collect::<String>() }}; \
+let mut __sh_lines: Vec<String> = if __sh_text.is_empty() {{ Vec::new() }} else {{ \
+let mut __sh_collected: Vec<String> = __sh_text.split('\\n').map(|__sh_line| __sh_line.to_string()).collect(); \
+if __sh_text.ends_with('\\n') {{ __sh_collected.pop(); }} __sh_collected }}; \
+let __sh_key = |__sh_line: &String| -> String {{ __sh_line.chars().skip({skip}).collect::<String>() }}; \
 let mut __sh_output: Vec<String> = Vec::new(); let mut __sh_begin = 0; \
-while __sh_begin < __sh_span.len() {{ let mut __sh_end = __sh_begin + 1; \
-while __sh_end < __sh_span.len() && __sh_key(&__sh_span[__sh_end]) == __sh_key(&__sh_span[__sh_begin]) {{ __sh_end += 1; }} \
+while __sh_begin < __sh_lines.len() {{ let mut __sh_end = __sh_begin + 1; \
+while __sh_end < __sh_lines.len() && __sh_key(&__sh_lines[__sh_end]) == __sh_key(&__sh_lines[__sh_begin]) {{ __sh_end += 1; }} \
 __sh_output.push({projected}); __sh_begin = __sh_end; }} __sh_output.join(\"\\n\") }}"
                 ))
             }
@@ -5863,10 +5863,10 @@ __sh_output.push({projected}); __sh_begin = __sh_end; }} __sh_output.join(\"\\n\
                     t.clone()
                 } else {
                     format!(
-                        "{{ let __sh_field: Vec<char> = {from}.chars().collect(); \
-let __sh_value: Vec<char> = {to}.chars().collect(); \
-{t}.chars().map(|__sh_ch| match __sh_field.iter().position(|&__sh_state| __sh_state == __sh_ch) {{ \
-Some(__sh_begin) => __sh_value[__sh_begin.min(__sh_value.len() - 1)], None => __sh_ch }}).collect::<String>() }}"
+                        "{{ let __sh_from_set: Vec<char> = {from}.chars().collect(); \
+let __sh_to_set: Vec<char> = {to}.chars().collect(); \
+{t}.chars().map(|__sh_ch| match __sh_from_set.iter().position(|&__sh_from_ch| __sh_from_ch == __sh_ch) {{ \
+Some(__sh_begin) => __sh_to_set[__sh_begin.min(__sh_to_set.len() - 1)], None => __sh_ch }}).collect::<String>() }}"
                     )
                 };
                 if !x.squeeze {
@@ -5889,17 +5889,17 @@ if __sh_out.chars().last() == Some(__sh_ch) && __sh_squeeze.contains(&__sh_ch) {
                 // never reaches this node, so these rules are the whole
                 // contract.
                 let tail = if x.which == "dirname" {
-                    "match __sh_part.rfind('/') { None => String::from(\".\"), Some(__sh_begin) => { \
-let mut __sh_delim = &__sh_part[..__sh_begin]; \
-while __sh_delim.len() > 1 && __sh_delim.ends_with('/') { __sh_delim = &__sh_delim[..__sh_delim.len() - 1]; } \
-if __sh_delim.is_empty() { String::from(\"/\") } else { __sh_delim.to_string() } } }"
+                    "match __sh_path.rfind('/') { None => String::from(\".\"), Some(__sh_begin) => { \
+let mut __sh_dir = &__sh_path[..__sh_begin]; \
+while __sh_dir.len() > 1 && __sh_dir.ends_with('/') { __sh_dir = &__sh_dir[..__sh_dir.len() - 1]; } \
+if __sh_dir.is_empty() { String::from(\"/\") } else { __sh_dir.to_string() } } }"
                 } else {
-                    "if __sh_part == \"/\" { String::from(\"/\") } else { match __sh_part.rfind('/') { \
-Some(__sh_begin) => __sh_part[__sh_begin + 1..].to_string(), None => __sh_part.to_string() } }"
+                    "if __sh_path == \"/\" { String::from(\"/\") } else { match __sh_path.rfind('/') { \
+Some(__sh_begin) => __sh_path[__sh_begin + 1..].to_string(), None => __sh_path.to_string() } }"
                 };
                 Some(format!(
-                    "{{ let __sh_pat0 = format!(\"{{}}\", @T@); let mut __sh_part = __sh_pat0.as_str(); \
-while __sh_part.len() > 1 && __sh_part.ends_with('/') {{ __sh_part = &__sh_part[..__sh_part.len() - 1]; }} @TAIL@ }}"
+                    "{{ let __sh_path_text = format!(\"{{}}\", @T@); let mut __sh_path = __sh_path_text.as_str(); \
+while __sh_path.len() > 1 && __sh_path.ends_with('/') {{ __sh_path = &__sh_path[..__sh_path.len() - 1]; }} @TAIL@ }}"
                 )
                 .replace("@TAIL@", tail)
                 .replace("@T@", &t))
@@ -5930,7 +5930,7 @@ while __sh_part.len() > 1 && __sh_part.ends_with('/') {{ __sh_part = &__sh_part[
         let m = if x.prefix { "starts_with" } else { "ends_with" };
         // `Pattern` is implemented for `&str`, not for `String` or `&String`,
         // and the pattern expression may be either — go through one binding.
-        format!("{{ let __sh_part = String::from({p}); {t}.{m}(&__sh_part[..]) }}")
+        format!("{{ let __sh_pattern = String::from({p}); {t}.{m}(&__sh_pattern[..]) }}")
     }
 
     /// Native `std` spelling for the COUNT-valued text nodes Rust's manifest
@@ -6616,7 +6616,7 @@ while __sh_part.len() > 1 && __sh_part.ends_with('/') {{ __sh_part = &__sh_part[
                     if x.fields.len() == 1 {
                         if let crate::ir::FieldRange::Single(i) = x.fields[0] {
                             return format!(
-                                "{{ let __sh_str: String = {}; let __sh_part: Vec<&str> = __sh_str.split({}).collect(); if {}-1 < __sh_part.len() {{ __sh_part[{}].to_string() }} else {{ String::new() }} }}",
+                                "{{ let __sh_str: String = {}; let __sh_fields: Vec<&str> = __sh_str.split({}).collect(); if {}-1 < __sh_fields.len() {{ __sh_fields[{}].to_string() }} else {{ String::new() }} }}",
                                 self.expr_str(&x.text),
                                 Self::rust_str(&x.delimiter), i, i - 1);
                         }
@@ -6671,7 +6671,7 @@ while __sh_part.len() > 1 && __sh_part.ends_with('/') {{ __sh_part = &__sh_part[
             other => {
                 let p = self.expr_str(other);
                 format!(
-                    "{{ let __sh_str: String = {t}; let __sh_part: String = {p}; if let Some(__sh_res) = __sh_str.{op}(__sh_part.as_str()) {{ __sh_res.to_string() }} else {{ __sh_str }} }}"
+                    "{{ let __sh_str: String = {t}; let __sh_needle: String = {p}; if let Some(__sh_res) = __sh_str.{op}(__sh_needle.as_str()) {{ __sh_res.to_string() }} else {{ __sh_str }} }}"
                 )
             }
         }
@@ -7638,28 +7638,28 @@ while __sh_part.len() > 1 && __sh_part.ends_with('/') {{ __sh_part = &__sh_part[
                 // error — exactly the old helper's three cases, with no
                 // `if false` left behind in the emitted code.
                 let errsite = if force {
-                    "                    if __sh_item.kind() == std::io::ErrorKind::NotFound { /* -f: a missing path is not an error */ } else {\n                        eprintln!(\"rm: cannot remove '{}': {}\", __sh_part, __sh_item);\n                        __sh_status = 1;\n                    }".to_string()
+                    "                    if __sh_err.kind() == std::io::ErrorKind::NotFound { /* -f: a missing path is not an error */ } else {\n                        eprintln!(\"rm: cannot remove '{}': {}\", __sh_path, __sh_err);\n                        __sh_status = 1;\n                    }".to_string()
                 } else {
-                    "                    eprintln!(\"rm: cannot remove '{}': {}\", __sh_part, __sh_item);\n                    __sh_status = 1;".to_string()
+                    "                    eprintln!(\"rm: cannot remove '{}': {}\", __sh_path, __sh_err);\n                    __sh_status = 1;".to_string()
                 };
                 let body = if rec {
-                    "        let __sh_res = if __sh_mapped.is_dir() {\n            std::fs::remove_dir_all(__sh_part)\n        } else {\n            std::fs::remove_file(__sh_part)\n        };".to_string()
+                    "        let __sh_res = if __sh_mapped.is_dir() {\n            std::fs::remove_dir_all(__sh_path)\n        } else {\n            std::fs::remove_file(__sh_path)\n        };".to_string()
                 } else if dir_ok {
-                    "        let __sh_res = if __sh_mapped.is_dir() {\n            std::fs::remove_dir(__sh_part)\n        } else {\n            std::fs::remove_file(__sh_part)\n        };".to_string()
+                    "        let __sh_res = if __sh_mapped.is_dir() {\n            std::fs::remove_dir(__sh_path)\n        } else {\n            std::fs::remove_file(__sh_path)\n        };".to_string()
                 } else {
-                    "        if __sh_mapped.is_dir() {\n            eprintln!(\"rm: cannot remove '{}': Is a directory\", __sh_part);\n            __sh_status = 1;\n            continue;\n        }\n        let __sh_res = std::fs::remove_file(__sh_part);".to_string()
+                    "        if __sh_mapped.is_dir() {\n            eprintln!(\"rm: cannot remove '{}': Is a directory\", __sh_path);\n            __sh_status = 1;\n            continue;\n        }\n        let __sh_res = std::fs::remove_file(__sh_path);".to_string()
                 };
                 r#"{
     let mut __sh_status: i32 = 0;
-    for __sh_part in &@ARGV@ {
-        match std::fs::symlink_metadata(__sh_part) {
+    for __sh_path in &@ARGV@ {
+        match std::fs::symlink_metadata(__sh_path) {
             Ok(__sh_mapped) => {
 @BODY@
-                if let Err(__sh_item) = __sh_res {
+                if let Err(__sh_err) = __sh_res {
 @ERRSITE@
                 }
             }
-            Err(__sh_item) => {
+            Err(__sh_err) => {
 @ERRSITE@
             }
         }
@@ -7676,14 +7676,14 @@ while __sh_part.len() > 1 && __sh_part.ends_with('/') {{ __sh_part = &__sh_part[
                 let verbose = flags.contains(&'v');
                 r#"{
     let mut __sh_status: i32 = 0;
-    for __sh_part in &@ARGV@ {
-        let __sh_res = if @PARENTS@ { std::fs::create_dir_all(__sh_part) } else { std::fs::create_dir(__sh_part) };
+    for __sh_path in &@ARGV@ {
+        let __sh_res = if @PARENTS@ { std::fs::create_dir_all(__sh_path) } else { std::fs::create_dir(__sh_path) };
         match __sh_res {
             Ok(_) => {
-                if @VERBOSE@ { println!("mkdir: created directory '{}'", __sh_part); }
+                if @VERBOSE@ { println!("mkdir: created directory '{}'", __sh_path); }
             }
-            Err(__sh_item) => {
-                eprintln!("mkdir: cannot create directory '{}': {}", __sh_part, __sh_item);
+            Err(__sh_err) => {
+                eprintln!("mkdir: cannot create directory '{}': {}", __sh_path, __sh_err);
                 __sh_status = 1;
             }
         }
@@ -7699,11 +7699,11 @@ while __sh_part.len() > 1 && __sh_part.ends_with('/') {{ __sh_part = &__sh_part[
                 // an existing file, then mtime is bumped like touch(1).
                 r#"{
     let mut __sh_status: i32 = 0;
-    for __sh_part in &@ARGV@ {
-        match std::fs::OpenOptions::new().create(true).append(true).open(__sh_part) {
+    for __sh_path in &@ARGV@ {
+        match std::fs::OpenOptions::new().create(true).append(true).open(__sh_path) {
             Ok(__sh_field) => { let _ = __sh_field.set_modified(std::time::SystemTime::now()); }
-            Err(__sh_item) => {
-                eprintln!("touch: cannot touch '{}': {}", __sh_part, __sh_item);
+            Err(__sh_err) => {
+                eprintln!("touch: cannot touch '{}': {}", __sh_path, __sh_err);
                 __sh_status = 1;
             }
         }
@@ -7805,8 +7805,8 @@ while __sh_part.len() > 1 && __sh_part.ends_with('/') {{ __sh_part = &__sh_part[
                 let code = r#"{
     let __tmpl: &str = @TMPL@;
     let __sh_text = if __tmpl.is_empty() {
-        let __sh_delim = std::env::var("TMPDIR").ok().filter(|__sh_delim| !__sh_delim.is_empty()).unwrap_or_else(|| "/tmp".to_string());
-        format!("{}/tmp.XXXXXXXXXX", __sh_delim.trim_end_matches('/'))
+        let __sh_tmpdir = std::env::var("TMPDIR").ok().filter(|__sh_tmpdir| !__sh_tmpdir.is_empty()).unwrap_or_else(|| "/tmp".to_string());
+        format!("{}/tmp.XXXXXXXXXX", __sh_tmpdir.trim_end_matches('/'))
     } else {
         __tmpl.to_string()
     };
@@ -7817,12 +7817,12 @@ while __sh_part.len() > 1 && __sh_part.ends_with('/') {{ __sh_part = &__sh_part[
         for __sh_num in 0..100000u64 {
             let __seed = (std::process::id() as u64).wrapping_mul(1_000_003)
                 ^ __sh_num.wrapping_mul(7_919)
-                ^ std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map(|__sh_delim| __sh_delim.subsec_nanos() as u64).unwrap_or(0);
+                ^ std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map(|__sh_clock| __sh_clock.subsec_nanos() as u64).unwrap_or(0);
             let mut __sh_state = __seed | 1;
-            let mut __sh_str = __base.clone();
-            for _ in 0..__sh_suffix { __sh_str.push(__sh_alphabet[(__sh_state % 62) as usize] as char); __sh_state /= 62; }
-            let __sh_ok = if @DIR@ { std::fs::create_dir(&__sh_str).is_ok() } else { std::fs::OpenOptions::new().write(true).create_new(true).open(&__sh_str).is_ok() };
-            if __sh_ok { break '__sh_mkloop __sh_str; }
+            let mut __sh_path = __base.clone();
+            for _ in 0..__sh_suffix { __sh_path.push(__sh_alphabet[(__sh_state % 62) as usize] as char); __sh_state /= 62; }
+            let __sh_ok = if @DIR@ { std::fs::create_dir(&__sh_path).is_ok() } else { std::fs::OpenOptions::new().write(true).create_new(true).open(&__sh_path).is_ok() };
+            if __sh_ok { break '__sh_mkloop __sh_path; }
         }
         String::new()
     }
@@ -8039,7 +8039,7 @@ while __sh_part.len() > 1 && __sh_part.ends_with('/') {{ __sh_part = &__sh_part[
         // free of a discarded `#[must_use]` result
         let tail = if value { " __sh_res.is_ok()" } else { "" };
         format!(
-            "{{ let __sh_delim = {dir}; let __sh_res = std::env::set_current_dir(&__sh_delim); \
+            "{{ let __sh_dir = {dir}; let __sh_res = std::env::set_current_dir(&__sh_dir); \
              if __sh_res.is_ok() {{ std::env::set_var(\"PWD\", std::env::current_dir().map(|p| p.display().to_string()).unwrap_or_default()); }} \
              __SH_RC.store(if __sh_res.is_ok() {{ 0 }} else {{ 1 }}, Ordering::Relaxed);{tail} }}"
         )
@@ -8964,7 +8964,7 @@ while __sh_part.len() > 1 && __sh_part.ends_with('/') {{ __sh_part = &__sh_part[
                     if let crate::ir::FieldRange::Single(i) = x.fields[0] {
                         let t = self.expr_str(&x.text);
                         let d = Self::rust_str_expr(&x.delimiter);
-                        return format!("vec![{{ let __sh_str: String = {t}; let __sh_part: Vec<&str> = __sh_str.split({d}.as_str()).collect(); if {}-1 < __sh_part.len() {{ __sh_part[{}].to_string() }} else {{ String::new() }} }}]", i, i - 1);
+                        return format!("vec![{{ let __sh_str: String = {t}; let __sh_fields: Vec<&str> = __sh_str.split({d}.as_str()).collect(); if {}-1 < __sh_fields.len() {{ __sh_fields[{}].to_string() }} else {{ String::new() }} }}]", i, i - 1);
                     }
                 }
                 self.mark_todo("word FieldExtract (complex fields)");
@@ -9228,20 +9228,20 @@ while __sh_part.len() > 1 && __sh_part.ends_with('/') {{ __sh_part = &__sh_part[
                         p.argv_read = true;
                     }
                     return format!(
-                        "{{ let __sh_value = {b}; let __sh_out = (({off} - 1).max(0) as usize).min(__sh_value.len()); \
-                         let __sh_span = if {len} < 0 {{ __sh_value.len().saturating_sub(__sh_out) as i64 }} else {{ {len} }}; \
-                         let __sh_item = ((__sh_out as i64 + __sh_span).max(__sh_out as i64)).min(__sh_value.len() as i64) as usize; \
-                         let __sh_item = __sh_item.max(__sh_out); \
-                         __sh_value[__sh_out..__sh_item].to_vec() }}"
+                        "{{ let __sh_value = {b}; let __sh_offset = (({off} - 1).max(0) as usize).min(__sh_value.len()); \
+                         let __sh_len = if {len} < 0 {{ __sh_value.len().saturating_sub(__sh_offset) as i64 }} else {{ {len} }}; \
+                         let __sh_stop = ((__sh_offset as i64 + __sh_len).max(__sh_offset as i64)).min(__sh_value.len() as i64) as usize; \
+                         let __sh_stop = __sh_stop.max(__sh_offset); \
+                         __sh_value[__sh_offset..__sh_stop].to_vec() }}"
                     );
                 }
                 self.probe_wild();
                 return format!(
-                    "{{ let __sh_value = __SH_ARGV.lock().unwrap().clone(); let __sh_out = (({off} - 1).max(0) as usize).min(__sh_value.len()); \
-                     let __sh_span = if {len} < 0 {{ __sh_value.len().saturating_sub(__sh_out) as i64 }} else {{ {len} }}; \
-                     let __sh_item = ((__sh_out as i64 + __sh_span).max(__sh_out as i64)).min(__sh_value.len() as i64) as usize; \
-                     let __sh_item = __sh_item.max(__sh_out); \
-                     __sh_value[__sh_out..__sh_item].to_vec() }}"
+                    "{{ let __sh_value = __SH_ARGV.lock().unwrap().clone(); let __sh_offset = (({off} - 1).max(0) as usize).min(__sh_value.len()); \
+                     let __sh_len = if {len} < 0 {{ __sh_value.len().saturating_sub(__sh_offset) as i64 }} else {{ {len} }}; \
+                     let __sh_stop = ((__sh_offset as i64 + __sh_len).max(__sh_offset as i64)).min(__sh_value.len() as i64) as usize; \
+                     let __sh_stop = __sh_stop.max(__sh_offset); \
+                     __sh_value[__sh_offset..__sh_stop].to_vec() }}"
                 );
             }
             self.probe_wild();
@@ -9263,7 +9263,7 @@ while __sh_part.len() > 1 && __sh_part.ends_with('/') {{ __sh_part = &__sh_part[
                     };
                     let arr = self.read_arr(var);
                     return format!(
-                        "{{ let __sh_value = {arr}; let __sh_out = if {off} < 0 {{ (__sh_value.len() as i64 + {off}).max(0) }} else {{ {off} }} as usize; let __sh_out = __sh_out.min(__sh_value.len()); let __sh_span = if {len} < 0 {{ __sh_value.len() as i64 - __sh_out as i64 }} else {{ {len} }};                          let __sh_str = __sh_out.max(0) as usize; let __sh_item = ((__sh_str as i64 + __sh_span).max(__sh_str as i64)).min(__sh_value.len() as i64) as usize; let __sh_item = __sh_item.max(__sh_str);                          __sh_value[__sh_str..__sh_item].to_vec() }}"
+                        "{{ let __sh_value = {arr}; let __sh_offset = if {off} < 0 {{ (__sh_value.len() as i64 + {off}).max(0) }} else {{ {off} }} as usize; let __sh_offset = __sh_offset.min(__sh_value.len()); let __sh_len = if {len} < 0 {{ __sh_value.len() as i64 - __sh_offset as i64 }} else {{ {len} }};                          let __sh_start = __sh_offset.max(0) as usize; let __sh_stop = ((__sh_start as i64 + __sh_len).max(__sh_start as i64)).min(__sh_value.len() as i64) as usize; let __sh_stop = __sh_stop.max(__sh_start);                          __sh_value[__sh_start..__sh_stop].to_vec() }}"
                     );
                 }
                 return self.read_arr(var);
@@ -10532,7 +10532,7 @@ while __sh_part.len() > 1 && __sh_part.ends_with('/') {{ __sh_part = &__sh_part[
             let tmp = ps_tmp.unwrap();
             let te = self.expr_str(&IrExpr::Var(tmp.clone(), None));
             self.emit(&format!(
-                "{{ let __sh_part = {te}; let _ = std::fs::remove_file(&__sh_part); let _ = std::process::Command::new(\"mkfifo\").arg(&__sh_part).status(); }}"
+                "{{ let __sh_path = {te}; let _ = std::fs::remove_file(&__sh_path); let _ = std::process::Command::new(\"mkfifo\").arg(&__sh_path).status(); }}"
             ));
             self.emit(&format!("let __ps_tmp_loc = {te};"));
             let saved = std::mem::take(&mut self.out);
@@ -11865,8 +11865,8 @@ while __sh_part.len() > 1 && __sh_part.ends_with('/') {{ __sh_part = &__sh_part[
                     && !self.is_array(name)
                 {
                     format!(
-                        "{{ let __sh_value = {var_expr}; if __sh_value.is_empty() {{ let __sh_delim = {val}; {} __sh_delim.clone() }} else {{ __sh_value }} }}",
-                        self.write_str(name, "__sh_delim.clone()")
+                        "{{ let __sh_value = {var_expr}; if __sh_value.is_empty() {{ let __sh_default = {val}; {} __sh_default.clone() }} else {{ __sh_value }} }}",
+                        self.write_str(name, "__sh_default.clone()")
                     )
                 } else {
                     format!("{{ let __sh_value = {var_expr}; if __sh_value.is_empty() {{ {val} }} else {{ __sh_value }} }}")
@@ -11925,11 +11925,11 @@ while __sh_part.len() > 1 && __sh_part.ends_with('/') {{ __sh_part = &__sh_part[
                     // `${@:off:len}` — the positional params (1-based off)
                     self.probe_wild();
                     return format!(
-                        "{{ let __sh_value = __SH_ARGV.lock().unwrap().clone(); let __sh_out = (({off} - 1).max(0) as usize).min(__sh_value.len()); \
-                         let __sh_span = if {len} < 0 {{ __sh_value.len().saturating_sub(__sh_out) as i64 }} else {{ {len} }}; \
-                         let __sh_item = ((__sh_out as i64 + __sh_span).max(__sh_out as i64)).min(__sh_value.len() as i64) as usize; \
-                         let __sh_item = __sh_item.max(__sh_out); \
-                         __sh_value[__sh_out..__sh_item].join(\" \") }}"
+                        "{{ let __sh_value = __SH_ARGV.lock().unwrap().clone(); let __sh_offset = (({off} - 1).max(0) as usize).min(__sh_value.len()); \
+                         let __sh_len = if {len} < 0 {{ __sh_value.len().saturating_sub(__sh_offset) as i64 }} else {{ {len} }}; \
+                         let __sh_stop = ((__sh_offset as i64 + __sh_len).max(__sh_offset as i64)).min(__sh_value.len() as i64) as usize; \
+                         let __sh_stop = __sh_stop.max(__sh_offset); \
+                         __sh_value[__sh_offset..__sh_stop].join(\" \") }}"
                     );
                 }
                 if !name.is_empty() && !name.starts_with('$')
@@ -11937,7 +11937,7 @@ while __sh_part.len() > 1 && __sh_part.ends_with('/') {{ __sh_part = &__sh_part[
                 {
                     let arr = self.read_arr(&name.to_string());
                     return format!(
-                        "{{ let __sh_value = {arr}; let __sh_out = if {off} < 0 {{ (__sh_value.len() as i64 + {off}).max(0) }} else {{ {off} }} as usize; let __sh_out = __sh_out.min(__sh_value.len()); let __sh_span = if {len} < 0 {{ __sh_value.len() as i64 - __sh_out as i64 }} else {{ {len} }};                          let __sh_str = __sh_out.max(0) as usize; let __sh_item = ((__sh_str as i64 + __sh_span).max(__sh_str as i64)).min(__sh_value.len() as i64) as usize; let __sh_item = __sh_item.max(__sh_str);                          __sh_value[__sh_str..__sh_item].join(\" \") }}"
+                        "{{ let __sh_value = {arr}; let __sh_offset = if {off} < 0 {{ (__sh_value.len() as i64 + {off}).max(0) }} else {{ {off} }} as usize; let __sh_offset = __sh_offset.min(__sh_value.len()); let __sh_len = if {len} < 0 {{ __sh_value.len() as i64 - __sh_offset as i64 }} else {{ {len} }};                          let __sh_start = __sh_offset.max(0) as usize; let __sh_stop = ((__sh_start as i64 + __sh_len).max(__sh_start as i64)).min(__sh_value.len() as i64) as usize; let __sh_stop = __sh_stop.max(__sh_start);                          __sh_value[__sh_start..__sh_stop].join(\" \") }}"
                     );
                 }
                 self.add_helper("substr");
@@ -13212,8 +13212,8 @@ while __sh_part.len() > 1 && __sh_part.ends_with('/') {{ __sh_part = &__sh_part[
                         if tainted || huge {
                             let b = self.arith_bigint(a);
                                                 format!(
-                                "{{ let __sh_value = ({b}).to_string(); let __sh_item = __SH_ARITH_ERR.swap(false, Ordering::Relaxed); \
-                         __SH_RC.store(if __sh_item {{ 1 }} else {{ 0 }}, Ordering::Relaxed); if __sh_item {{ String::new() }} else {{ __sh_value }} }}"
+                                "{{ let __sh_value = ({b}).to_string(); let __sh_failed = __SH_ARITH_ERR.swap(false, Ordering::Relaxed); \
+                         __SH_RC.store(if __sh_failed {{ 1 }} else {{ 0 }}, Ordering::Relaxed); if __sh_failed {{ String::new() }} else {{ __sh_value }} }}"
                             )
                         } else {
                     // `x=$((...))` — bash collapses the expansion to
@@ -13221,8 +13221,8 @@ while __sh_part.len() > 1 && __sh_part.ends_with('/') {{ __sh_part = &__sh_part[
                     // (division/modulo by zero); the checked div/mod
                     // helpers flag the error via __SH_ARITH_ERR.
                                 format!(
-                        "{{ let __sh_value = ({}).to_string(); let __sh_item = __SH_ARITH_ERR.swap(false, Ordering::Relaxed); \
-                         __SH_RC.store(if __sh_item {{ 1 }} else {{ 0 }}, Ordering::Relaxed); if __sh_item {{ String::new() }} else {{ __sh_value }} }}",
+                        "{{ let __sh_value = ({}).to_string(); let __sh_failed = __SH_ARITH_ERR.swap(false, Ordering::Relaxed); \
+                         __SH_RC.store(if __sh_failed {{ 1 }} else {{ 0 }}, Ordering::Relaxed); if __sh_failed {{ String::new() }} else {{ __sh_value }} }}",
                         self.arith(a)
                     )
                         }
@@ -17964,9 +17964,9 @@ impl<'a, 'r> TestParser<'a, 'r> {
                             format!("{{ let __sh_res = {r}; if __sh_glob_like(&__sh_res) {{ !__sh_fnmatch(&__sh_res, &{l}) }} else {{ {l} != __sh_res }} }}")
                         }
                     } else if eq {
-                        format!("{{ let __sh_res = {r}; let __sh_span = {l}; if __sh_glob_like(&__sh_res) {{ __sh_fnmatch(&__sh_res, &__sh_span) }} else {{ __sh_span == __sh_res }} }}")
+                        format!("{{ let __sh_res = {r}; let __sh_pattern = {l}; if __sh_glob_like(&__sh_res) {{ __sh_fnmatch(&__sh_res, &__sh_pattern) }} else {{ __sh_pattern == __sh_res }} }}")
                     } else {
-                        format!("{{ let __sh_res = {r}; let __sh_span = {l}; if __sh_glob_like(&__sh_res) {{ !__sh_fnmatch(&__sh_res, &__sh_span) }} else {{ __sh_span != __sh_res }} }}")
+                        format!("{{ let __sh_res = {r}; let __sh_pattern = {l}; if __sh_glob_like(&__sh_res) {{ !__sh_fnmatch(&__sh_res, &__sh_pattern) }} else {{ __sh_pattern != __sh_res }} }}")
                     }
                 }
             }
@@ -23507,7 +23507,7 @@ mod tests {
         // t86: a renderer local already spelling a pool name (`__sh_operand`)
         // plus a helper the pool would shorten to the same spelling —
         // the pool must skip taken shorts so the two never merge (was:
-        // `fn __sh_fn_f` and `let __sh_operand` both becoming `__sh_part`).
+        // `fn __sh_fn_f` and `let __sh_operand` both becoming `__sh_key`).
         let out = super::golf_rust("fn __sh_fn_f(p0: i64) -> String { p0.to_string() }\nfn main() {\nlet __sh_operand: Vec<String> = vec![];\n__sh_fn_f(1);\n}\n");
         assert!(!out.contains("__sh_fn_f"), "helper not shortened:\n{out}");
         // count distinct `__`-spellings on the helper's decl + call:
@@ -24153,8 +24153,8 @@ mod tests {
     #[test]
     fn final_pipelines_and_glob_classes_execute_like_bash() {
         let cases: &[(&str, &str, Option<&str>)] = &[
-            ("FinalPipeHead", "echo abc | head -n 2\n", Some("__sh_span[..__sh_item].join")),
-            ("FinalPipeTail", "echo abc | tail -n 1\n", Some("__sh_span[__sh_str..].join")),
+            ("FinalPipeHead", "echo abc | head -n 2\n", Some("__sh_lines[..__sh_stop].join")),
+            ("FinalPipeTail", "echo abc | tail -n 1\n", Some("__sh_lines[__sh_start..].join")),
             ("FinalPipeWc", "echo \"a b c\" | wc -w\n", None),
             ("FinalPipeCut", "echo \"a,b,c\" | cut -d, -f2\n", None),
             ("FinalPipeXargs", "echo \" a b \" | xargs\n", None),
@@ -24395,7 +24395,7 @@ mod tests {
             (
                 "mktemp",
                 "d=$(mktemp -d)\nif [ -d \"$d\" ]; then echo y; fi\n",
-                &["create_new(true)", "TMPDIR", "create_dir(&__sh_str)"],
+                &["create_new(true)", "TMPDIR", "create_dir(&__sh_path)"],
             ),
             (
                 "-f",
@@ -24526,7 +24526,7 @@ mod tests {
             ),
             (
                 "CharTranslate",
-                "position(|&__sh_state|",
+                "position(|&__sh_from_ch|",
                 "w=$(echo abc-xyz | tr 'a-c' 'x')\necho \"$w\"\n",
             ),
 
@@ -24832,7 +24832,7 @@ mod tests {
         let out = render_rs("v=$(echo a:b:c | cut -d: -f2)\necho \"$v\"\n");
         assert!(!out.contains("__sh_spawn("), "still shells out:\n{out}");
         assert!(out.contains(".split(\":\")"), "no split:\n{out}");
-        assert!(out.contains("__sh_part[1].to_string()"), "no field take:\n{out}");
+        assert!(out.contains("__sh_fields[1].to_string()"), "no field take:\n{out}");
     }
 
     /// `yes x | head -n 3` is a repeat of the literal line.
