@@ -5880,6 +5880,30 @@ if __o.chars().last() == Some(__c) && __sq.contains(&__c) {{ continue; }} __o.pu
                     ))
                 }
             }
+            "PathName" => {
+                let x = n.as_any().downcast_ref::<crate::shir_nodes::PathName>()?;
+                let t = self.expr_str(&x.text);
+                // GNU `basename`/`dirname`, the rules `pathops` spells at
+                // compile time: strip TRAILING slashes (except for "/"),
+                // then cut at the last one. `${p##*/}` is a glob strip and
+                // never reaches this node, so these rules are the whole
+                // contract.
+                let tail = if x.which == "dirname" {
+                    "match __p.rfind('/') { None => String::from(\".\"), Some(__i) => { \
+let mut __d = &__p[..__i]; \
+while __d.len() > 1 && __d.ends_with('/') { __d = &__d[..__d.len() - 1]; } \
+if __d.is_empty() { String::from(\"/\") } else { __d.to_string() } } }"
+                } else {
+                    "if __p == \"/\" { String::from(\"/\") } else { match __p.rfind('/') { \
+Some(__i) => __p[__i + 1..].to_string(), None => __p.to_string() } }"
+                };
+                Some(format!(
+                    "{{ let __p0 = format!(\"{{}}\", @T@); let mut __p = __p0.as_str(); \
+while __p.len() > 1 && __p.ends_with('/') {{ __p = &__p[..__p.len() - 1]; }} @TAIL@ }}"
+                )
+                .replace("@TAIL@", tail)
+                .replace("@T@", &t))
+            }
             _ => None,
         }
     }
@@ -24464,6 +24488,16 @@ mod tests {
                 "len() as i64",
                 "arr=(a bb ccc dddd)\necho \"len=${#arr[@]}\"\n",
             ),
+            // PathName comes only from a REAL `basename`/`dirname` command;
+            // `${p##*/}` would be a glob strip (and is not lowered).
+            ("PathNameBase", "rfind('/')", "basename /a/b/c\n"),
+            ("PathNameBaseTrailing", "rfind('/')", "v=/x/y/\nbasename \"$v\"\n"),
+            ("PathNameBaseRoot", "rfind('/')", "basename /\n"),
+            ("PathNameBaseBare", "rfind('/')", "basename abc\n"),
+            ("PathNameDir", "rfind('/')", "dirname /a/b/c\n"),
+            ("PathNameDirBare", "rfind('/')", "dirname a\n"),
+            ("PathNameDirRoot", "rfind('/')", "dirname /\n"),
+            ("PathNameDirTrailing", "rfind('/')", "v=/a/b/\ndirname \"$v\"\n"),
         ];
         let mut bad: Vec<String> = Vec::new();
         for (name, marker, src) in cases {

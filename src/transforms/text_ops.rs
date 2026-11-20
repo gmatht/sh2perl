@@ -535,7 +535,7 @@ fn lower_stmt(stmt: &mut IrStmt, emit: bool, arrays: &std::collections::HashSet<
                 }
                 if emit && (cmd == "basename" || cmd == "dirname") && !cmd_args.is_empty() {
                     let which = if cmd == "dirname" { "dirname" } else { "basename" };
-                    if let Some(text) = arg_to_expr(&cmd_args[0]) {
+                    if let Some(text) = path_operand(cmd_args).and_then(arg_to_expr) {
                         *stmt = with_status_zero(IrStmt::Output {
                             value: IrExpr::Ext(Box::new(PathName { text, which: which.to_string() })),
                             newline: true,
@@ -614,12 +614,13 @@ fn lower_expr(expr: &mut IrExpr, arrays: &std::collections::HashSet<String>) {
                 LIFT_COUNT.fetch_add(1, Ordering::Relaxed);
                 return;
             }
-            // ${p##*/} → PathName(basename), ${p%/*} → PathName(dirname)
-            if let Some(replacement) = try_lower_param_path(args) {
-                *expr = replacement;
-                LIFT_COUNT.fetch_add(1, Ordering::Relaxed);
-                return;
-            }
+            // `${p##*/}` / `${p%/*}` deliberately do NOT become PathName:
+            // the two are GLOB STRIPS (a trailing slash matches `*/`, so
+            // `${p##*/}` of "a/b/" is empty) while PathName promises GNU
+            // `basename`/`dirname` ("a/b/" → "b"). They stay `param`
+            // reads, which every backend renders with its own strip path.
+            // PathName is built only from REAL basename/dirname commands
+            // below and in `lower_stmt`.
             // ${var,,} → Case(lower), ${var^^} → Case(upper),
             // ${var:2:3} → SubStr(var, 2, 3)
             if let Some(replacement) = try_lower_param_op(args, arrays) {
@@ -685,7 +686,7 @@ fn lower_expr(expr: &mut IrExpr, arrays: &std::collections::HashSet<String>) {
             if let [IrExpr::Str(cmd, _), IrExpr::Array(cmd_args)] = args.as_slice() {
                 if (cmd == "basename" || cmd == "dirname") && !cmd_args.is_empty() {
                     let which = if cmd == "dirname" { "dirname" } else { "basename" };
-                    if let Some(text) = arg_to_expr(&cmd_args[0]) {
+                    if let Some(text) = path_operand(cmd_args).and_then(arg_to_expr) {
                         *expr = IrExpr::Ext(Box::new(PathName {
                             text,
                             which: which.to_string(),
@@ -2043,14 +2044,40 @@ mod tests {
         assert!(try_lower_param_op(&[st("slice"), st("v"), st("1"), st("2")], &arrays).is_none());
     }
 
+    /// `${p##*/}` is a GLOB strip, not `basename`: for "a/b/" the strip is
+    /// empty and GNU basename is "b". Only a real `basename`/`dirname`
+    /// command may become PathName, and a FLAGGED call (`-s`, `-z`) never
+    /// does (the node has no flag fields).
     #[test]
-    fn param_path_ops_are_pathname() {
-        let r = try_lower_param_path(&[st("basename"), st("p")]).unwrap();
-        let IrExpr::Ext(n) = &r else { panic!() };
-        assert_eq!(n.as_any().downcast_ref::<PathName>().unwrap().which, "basename");
-        let r = try_lower_param_path(&[st("dirname"), st("p")]).unwrap();
-        let IrExpr::Ext(n) = &r else { panic!() };
-        assert_eq!(n.as_any().downcast_ref::<PathName>().unwrap().which, "dirname");
+    fn only_a_real_path_command_is_pathname() {
+        let mut glob_strip = IrExpr::Call {
+            func: "param".to_string(),
+            args: vec![st("basename"), st("p")],
+        };
+        lower_expr(&mut glob_strip, &std::collections::HashSet::new());
+        assert!(
+            matches!(&glob_strip, IrExpr::Call { func, .. } if func == "param"),
+            "`${{p##*/}}` became a PathName: {glob_strip:?}"
+        );
+
+        let base = |args: Vec<IrExpr>| {
+            let mut s = IrStmt::Expr(IrExpr::Call {
+                func: "exec".to_string(),
+                args: vec![st("basename"), IrExpr::Array(args)],
+            });
+            lower_stmt(&mut s, true, &std::collections::HashSet::new());
+            s
+        };
+        let plain = base(vec![st("/a/b/")]);
+        assert!(
+            format!("{plain:?}").contains("PathName"),
+            "basename command not lowered: {plain:?}"
+        );
+        let flagged = base(vec![st("-s"), st(".sh"), st("a.b.sh")]);
+        assert!(
+            !format!("{flagged:?}").contains("PathName"),
+            "basename -s became a PathName: {flagged:?}"
+        );
     }
 
     // ── statement/capture scope boundary ─────────────────────────────
@@ -2130,33 +2157,14 @@ fn try_lower_command(text: IrExpr, cmd_name: &str, cmd_args: &[IrExpr]) -> Optio
     }
 }
 
-/// `${p##*/}` → PathName(basename), `${p%/*}` → PathName(dirname)
-///
-/// The `param` call carries the operator name and the variable.
-fn try_lower_param_path(args: &[IrExpr]) -> Option<IrExpr> {
-    // Shape: param(op, name) — the shIR already lowers ${p##*/} → param("basename", p)
-    // and ${p%/*} → param("dirname", p).
-    if args.len() >= 2 {
-        if let IrExpr::Str(op, _) = &args[0] {
-            let var = param_var_read(&args[1])?;
-            match op.as_str() {
-                "basename" => {
-                    return Some(IrExpr::Ext(Box::new(PathName {
-                        text: var,
-                        which: "basename".to_string(),
-                    })));
-                }
-                "dirname" => {
-                    return Some(IrExpr::Ext(Box::new(PathName {
-                        text: var,
-                        which: "dirname".to_string(),
-                    })));
-                }
-                _ => {}
-            }
-        }
+/// The operand of a `basename`/`dirname` call, or None when the first word
+/// is a FLAG (`basename -s .sh p`, `dirname -z p`): the node models the
+/// plain GNU call only, so a flagged call keeps its original command.
+fn path_operand(cmd_args: &[IrExpr]) -> Option<&IrExpr> {
+    match cmd_args.first()? {
+        IrExpr::Str(s, _) if s.starts_with('-') => None,
+        a => Some(a),
     }
-    None
 }
 
 fn arg_to_expr(arg: &IrExpr) -> Option<IrExpr> {

@@ -242,8 +242,6 @@ pub fn node_manifest(target: &str) -> &'static [&'static str] {
         // the existing path is untouched):
         //  * RegSub, RegexpFind — `std` has no regex; a hand-rolled matcher
         //    would not be exact.
-        //  * PathName — the node's source may be a GNU command or a bash
-        //    string, and those differ on trailing slashes.
         //  * StringAffix — it is a prefix/suffix PREDICATE (`[[ $x == P* ]]`,
         //    `case P*)`). No transform in this pipeline constructs it from
         //    shell source, and those test shapes already render natively
@@ -263,6 +261,12 @@ pub fn node_manifest(target: &str) -> &'static [&'static str] {
                             "StringContains", "StrLen", "CaseTransform", "FieldExtract",
                 "WordCount", "RegCount", "TakeLines", "StringTrim",
                 "SubStrExtract", "RepeatStr", "Split", "ArrayLen",
+                // `basename`/`dirname` commands: text_ops builds PathName
+                // only from a real command (a FLAGGED call keeps its
+                // command form), never from `${p##*/}`/`${p%/*}` — those
+                // are glob strips, which differ on a trailing slash — so
+                // the GNU rules the arm spells are the whole contract.
+                "PathName",
                 // `tr`'s general map: the lowering EXPANDS ranges and classes
                 // before the node is built, so `from`/`to` are the map and
                 // `chars().map(...)` is exact (delete and squeeze included).
