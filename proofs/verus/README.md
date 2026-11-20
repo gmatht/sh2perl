@@ -220,6 +220,41 @@ Mutants, measured: drop the non-emptiness half **36 verified, 5 errors**; drop
 the whitespace half **38 / 3**; identity **33 / 8**; fold on either half
 **34 / 7**.
 
+## frontend_int_lift.rs — spelling vs node, and the pass's scope (33)
+
+`shir_passes/frontend_int_lift.rs`. A frontend spells a number as the string
+`"42"` and records only the A2 verdict `var_types[name] = Int`; renderers read
+the shell convention, so the pass rewrites the spelling to the node.
+
+- `fold_preserves_text` — the value law: the text the expression denotes is
+  unchanged.
+- `lift_preserves_text` — the scope law: `lift_stmt` rewrites only a
+  single-target `Assign` (or singleton `Declare`) of a name that is A2-`Int`
+  AND written exactly once; every other statement is not walked, so a
+  foldable value inside it survives (pinned).
+- `decimal_spelling_is_canonical` — the parser's answer is the canonical
+  spelling, so the replacement keeps the text. The permissive variant that
+  would also accept `"07"` is a red mutant.
+- `checked_is_exact` — `arith_eval` accepts only in-i64 intermediates, and an
+  accepted value IS the mathematical value; the wrapping mutant writes a
+  different integer for `i64::MAX + 1`.
+- `fold_leaves_nothing` / `fold_is_idempotent` — completeness and fixpoint; an
+  identity pass is red.
+
+Pins mirror the source's tests: `an_int_typed_literal_becomes_an_int_node`,
+`an_untyped_literal_is_untouched`, `a_literal_arithmetic_expression_folds_exactly`,
+`overflow_refuses`, `a_float_spelling_is_not_an_int`, plus the scope and
+whole-list pins.
+
+Hypotheses in-file: reachability/registration of the pass; the A2 int verdict
+(`frontend_types::int_names`) and the `count_writes` census, both taken as
+given; the parser's canonicity (`int_literal` refuses signs, floats, `0x`,
+underscores and leading zeros, and range-checks i64); corpus domain.
+
+Mutants, measured: permissive parser **31 verified, 2 errors**; wrapping
+arithmetic **28 / 5**; folding a runtime-valued tree **31 / 2**; identity
+**27 / 6**.
+
 ## Running it
 
 Verus needs rust toolchain `1.99.1-x86_64-unknown-linux-gnu`
@@ -454,6 +489,41 @@ custom-IFS gate; the element carve-out; corpus domain.
 Mutants, measured: drop the non-emptiness half **36 verified, 5 errors**; drop
 the whitespace half **38 / 3**; identity **33 / 8**; fold on either half
 **34 / 7**.
+
+## frontend_int_lift.rs — spelling vs node, and the pass's scope (33)
+
+`shir_passes/frontend_int_lift.rs`. A frontend spells a number as the string
+`"42"` and records only the A2 verdict `var_types[name] = Int`; renderers read
+the shell convention, so the pass rewrites the spelling to the node.
+
+- `fold_preserves_text` — the value law: the text the expression denotes is
+  unchanged.
+- `lift_preserves_text` — the scope law: `lift_stmt` rewrites only a
+  single-target `Assign` (or singleton `Declare`) of a name that is A2-`Int`
+  AND written exactly once; every other statement is not walked, so a
+  foldable value inside it survives (pinned).
+- `decimal_spelling_is_canonical` — the parser's answer is the canonical
+  spelling, so the replacement keeps the text. The permissive variant that
+  would also accept `"07"` is a red mutant.
+- `checked_is_exact` — `arith_eval` accepts only in-i64 intermediates, and an
+  accepted value IS the mathematical value; the wrapping mutant writes a
+  different integer for `i64::MAX + 1`.
+- `fold_leaves_nothing` / `fold_is_idempotent` — completeness and fixpoint; an
+  identity pass is red.
+
+Pins mirror the source's tests: `an_int_typed_literal_becomes_an_int_node`,
+`an_untyped_literal_is_untouched`, `a_literal_arithmetic_expression_folds_exactly`,
+`overflow_refuses`, `a_float_spelling_is_not_an_int`, plus the scope and
+whole-list pins.
+
+Hypotheses in-file: reachability/registration of the pass; the A2 int verdict
+(`frontend_types::int_names`) and the `count_writes` census, both taken as
+given; the parser's canonicity (`int_literal` refuses signs, floats, `0x`,
+underscores and leading zeros, and range-checks i64); corpus domain.
+
+Mutants, measured: permissive parser **31 verified, 2 errors**; wrapping
+arithmetic **28 / 5**; folding a runtime-valued tree **31 / 2**; identity
+**27 / 6**.
 
 ## Running it
 
@@ -694,6 +764,41 @@ custom-IFS gate; the element carve-out; corpus domain.
 Mutants, measured: drop the non-emptiness half **36 verified, 5 errors**; drop
 the whitespace half **38 / 3**; identity **33 / 8**; fold on either half
 **34 / 7**.
+
+## frontend_int_lift.rs — spelling vs node, and the pass's scope (33)
+
+`shir_passes/frontend_int_lift.rs`. A frontend spells a number as the string
+`"42"` and records only the A2 verdict `var_types[name] = Int`; renderers read
+the shell convention, so the pass rewrites the spelling to the node.
+
+- `fold_preserves_text` — the value law: the text the expression denotes is
+  unchanged.
+- `lift_preserves_text` — the scope law: `lift_stmt` rewrites only a
+  single-target `Assign` (or singleton `Declare`) of a name that is A2-`Int`
+  AND written exactly once; every other statement is not walked, so a
+  foldable value inside it survives (pinned).
+- `decimal_spelling_is_canonical` — the parser's answer is the canonical
+  spelling, so the replacement keeps the text. The permissive variant that
+  would also accept `"07"` is a red mutant.
+- `checked_is_exact` — `arith_eval` accepts only in-i64 intermediates, and an
+  accepted value IS the mathematical value; the wrapping mutant writes a
+  different integer for `i64::MAX + 1`.
+- `fold_leaves_nothing` / `fold_is_idempotent` — completeness and fixpoint; an
+  identity pass is red.
+
+Pins mirror the source's tests: `an_int_typed_literal_becomes_an_int_node`,
+`an_untyped_literal_is_untouched`, `a_literal_arithmetic_expression_folds_exactly`,
+`overflow_refuses`, `a_float_spelling_is_not_an_int`, plus the scope and
+whole-list pins.
+
+Hypotheses in-file: reachability/registration of the pass; the A2 int verdict
+(`frontend_types::int_names`) and the `count_writes` census, both taken as
+given; the parser's canonicity (`int_literal` refuses signs, floats, `0x`,
+underscores and leading zeros, and range-checks i64); corpus domain.
+
+Mutants, measured: permissive parser **31 verified, 2 errors**; wrapping
+arithmetic **28 / 5**; folding a runtime-valued tree **31 / 2**; identity
+**27 / 6**.
 
 ## Running it
 
@@ -948,6 +1053,41 @@ Mutants, measured: drop the non-emptiness half **36 verified, 5 errors**; drop
 the whitespace half **38 / 3**; identity **33 / 8**; fold on either half
 **34 / 7**.
 
+## frontend_int_lift.rs — spelling vs node, and the pass's scope (33)
+
+`shir_passes/frontend_int_lift.rs`. A frontend spells a number as the string
+`"42"` and records only the A2 verdict `var_types[name] = Int`; renderers read
+the shell convention, so the pass rewrites the spelling to the node.
+
+- `fold_preserves_text` — the value law: the text the expression denotes is
+  unchanged.
+- `lift_preserves_text` — the scope law: `lift_stmt` rewrites only a
+  single-target `Assign` (or singleton `Declare`) of a name that is A2-`Int`
+  AND written exactly once; every other statement is not walked, so a
+  foldable value inside it survives (pinned).
+- `decimal_spelling_is_canonical` — the parser's answer is the canonical
+  spelling, so the replacement keeps the text. The permissive variant that
+  would also accept `"07"` is a red mutant.
+- `checked_is_exact` — `arith_eval` accepts only in-i64 intermediates, and an
+  accepted value IS the mathematical value; the wrapping mutant writes a
+  different integer for `i64::MAX + 1`.
+- `fold_leaves_nothing` / `fold_is_idempotent` — completeness and fixpoint; an
+  identity pass is red.
+
+Pins mirror the source's tests: `an_int_typed_literal_becomes_an_int_node`,
+`an_untyped_literal_is_untouched`, `a_literal_arithmetic_expression_folds_exactly`,
+`overflow_refuses`, `a_float_spelling_is_not_an_int`, plus the scope and
+whole-list pins.
+
+Hypotheses in-file: reachability/registration of the pass; the A2 int verdict
+(`frontend_types::int_names`) and the `count_writes` census, both taken as
+given; the parser's canonicity (`int_literal` refuses signs, floats, `0x`,
+underscores and leading zeros, and range-checks i64); corpus domain.
+
+Mutants, measured: permissive parser **31 verified, 2 errors**; wrapping
+arithmetic **28 / 5**; folding a runtime-valued tree **31 / 2**; identity
+**27 / 6**.
+
 ## Running it
 
 Same toolchain as above:
@@ -1181,6 +1321,41 @@ custom-IFS gate; the element carve-out; corpus domain.
 Mutants, measured: drop the non-emptiness half **36 verified, 5 errors**; drop
 the whitespace half **38 / 3**; identity **33 / 8**; fold on either half
 **34 / 7**.
+
+## frontend_int_lift.rs — spelling vs node, and the pass's scope (33)
+
+`shir_passes/frontend_int_lift.rs`. A frontend spells a number as the string
+`"42"` and records only the A2 verdict `var_types[name] = Int`; renderers read
+the shell convention, so the pass rewrites the spelling to the node.
+
+- `fold_preserves_text` — the value law: the text the expression denotes is
+  unchanged.
+- `lift_preserves_text` — the scope law: `lift_stmt` rewrites only a
+  single-target `Assign` (or singleton `Declare`) of a name that is A2-`Int`
+  AND written exactly once; every other statement is not walked, so a
+  foldable value inside it survives (pinned).
+- `decimal_spelling_is_canonical` — the parser's answer is the canonical
+  spelling, so the replacement keeps the text. The permissive variant that
+  would also accept `"07"` is a red mutant.
+- `checked_is_exact` — `arith_eval` accepts only in-i64 intermediates, and an
+  accepted value IS the mathematical value; the wrapping mutant writes a
+  different integer for `i64::MAX + 1`.
+- `fold_leaves_nothing` / `fold_is_idempotent` — completeness and fixpoint; an
+  identity pass is red.
+
+Pins mirror the source's tests: `an_int_typed_literal_becomes_an_int_node`,
+`an_untyped_literal_is_untouched`, `a_literal_arithmetic_expression_folds_exactly`,
+`overflow_refuses`, `a_float_spelling_is_not_an_int`, plus the scope and
+whole-list pins.
+
+Hypotheses in-file: reachability/registration of the pass; the A2 int verdict
+(`frontend_types::int_names`) and the `count_writes` census, both taken as
+given; the parser's canonicity (`int_literal` refuses signs, floats, `0x`,
+underscores and leading zeros, and range-checks i64); corpus domain.
+
+Mutants, measured: permissive parser **31 verified, 2 errors**; wrapping
+arithmetic **28 / 5**; folding a runtime-valued tree **31 / 2**; identity
+**27 / 6**.
 
 ## Running it
 
@@ -1423,6 +1598,41 @@ Mutants, measured: drop the non-emptiness half **36 verified, 5 errors**; drop
 the whitespace half **38 / 3**; identity **33 / 8**; fold on either half
 **34 / 7**.
 
+## frontend_int_lift.rs — spelling vs node, and the pass's scope (33)
+
+`shir_passes/frontend_int_lift.rs`. A frontend spells a number as the string
+`"42"` and records only the A2 verdict `var_types[name] = Int`; renderers read
+the shell convention, so the pass rewrites the spelling to the node.
+
+- `fold_preserves_text` — the value law: the text the expression denotes is
+  unchanged.
+- `lift_preserves_text` — the scope law: `lift_stmt` rewrites only a
+  single-target `Assign` (or singleton `Declare`) of a name that is A2-`Int`
+  AND written exactly once; every other statement is not walked, so a
+  foldable value inside it survives (pinned).
+- `decimal_spelling_is_canonical` — the parser's answer is the canonical
+  spelling, so the replacement keeps the text. The permissive variant that
+  would also accept `"07"` is a red mutant.
+- `checked_is_exact` — `arith_eval` accepts only in-i64 intermediates, and an
+  accepted value IS the mathematical value; the wrapping mutant writes a
+  different integer for `i64::MAX + 1`.
+- `fold_leaves_nothing` / `fold_is_idempotent` — completeness and fixpoint; an
+  identity pass is red.
+
+Pins mirror the source's tests: `an_int_typed_literal_becomes_an_int_node`,
+`an_untyped_literal_is_untouched`, `a_literal_arithmetic_expression_folds_exactly`,
+`overflow_refuses`, `a_float_spelling_is_not_an_int`, plus the scope and
+whole-list pins.
+
+Hypotheses in-file: reachability/registration of the pass; the A2 int verdict
+(`frontend_types::int_names`) and the `count_writes` census, both taken as
+given; the parser's canonicity (`int_literal` refuses signs, floats, `0x`,
+underscores and leading zeros, and range-checks i64); corpus domain.
+
+Mutants, measured: permissive parser **31 verified, 2 errors**; wrapping
+arithmetic **28 / 5**; folding a runtime-valued tree **31 / 2**; identity
+**27 / 6**.
+
 ## Running it
 
 Same toolchain as above:
@@ -1654,6 +1864,41 @@ Mutants, measured: drop the non-emptiness half **36 verified, 5 errors**; drop
 the whitespace half **38 / 3**; identity **33 / 8**; fold on either half
 **34 / 7**.
 
+## frontend_int_lift.rs — spelling vs node, and the pass's scope (33)
+
+`shir_passes/frontend_int_lift.rs`. A frontend spells a number as the string
+`"42"` and records only the A2 verdict `var_types[name] = Int`; renderers read
+the shell convention, so the pass rewrites the spelling to the node.
+
+- `fold_preserves_text` — the value law: the text the expression denotes is
+  unchanged.
+- `lift_preserves_text` — the scope law: `lift_stmt` rewrites only a
+  single-target `Assign` (or singleton `Declare`) of a name that is A2-`Int`
+  AND written exactly once; every other statement is not walked, so a
+  foldable value inside it survives (pinned).
+- `decimal_spelling_is_canonical` — the parser's answer is the canonical
+  spelling, so the replacement keeps the text. The permissive variant that
+  would also accept `"07"` is a red mutant.
+- `checked_is_exact` — `arith_eval` accepts only in-i64 intermediates, and an
+  accepted value IS the mathematical value; the wrapping mutant writes a
+  different integer for `i64::MAX + 1`.
+- `fold_leaves_nothing` / `fold_is_idempotent` — completeness and fixpoint; an
+  identity pass is red.
+
+Pins mirror the source's tests: `an_int_typed_literal_becomes_an_int_node`,
+`an_untyped_literal_is_untouched`, `a_literal_arithmetic_expression_folds_exactly`,
+`overflow_refuses`, `a_float_spelling_is_not_an_int`, plus the scope and
+whole-list pins.
+
+Hypotheses in-file: reachability/registration of the pass; the A2 int verdict
+(`frontend_types::int_names`) and the `count_writes` census, both taken as
+given; the parser's canonicity (`int_literal` refuses signs, floats, `0x`,
+underscores and leading zeros, and range-checks i64); corpus domain.
+
+Mutants, measured: permissive parser **31 verified, 2 errors**; wrapping
+arithmetic **28 / 5**; folding a runtime-valued tree **31 / 2**; identity
+**27 / 6**.
+
 ## Running it
 
 Same toolchain as above:
@@ -1866,6 +2111,41 @@ custom-IFS gate; the element carve-out; corpus domain.
 Mutants, measured: drop the non-emptiness half **36 verified, 5 errors**; drop
 the whitespace half **38 / 3**; identity **33 / 8**; fold on either half
 **34 / 7**.
+
+## frontend_int_lift.rs — spelling vs node, and the pass's scope (33)
+
+`shir_passes/frontend_int_lift.rs`. A frontend spells a number as the string
+`"42"` and records only the A2 verdict `var_types[name] = Int`; renderers read
+the shell convention, so the pass rewrites the spelling to the node.
+
+- `fold_preserves_text` — the value law: the text the expression denotes is
+  unchanged.
+- `lift_preserves_text` — the scope law: `lift_stmt` rewrites only a
+  single-target `Assign` (or singleton `Declare`) of a name that is A2-`Int`
+  AND written exactly once; every other statement is not walked, so a
+  foldable value inside it survives (pinned).
+- `decimal_spelling_is_canonical` — the parser's answer is the canonical
+  spelling, so the replacement keeps the text. The permissive variant that
+  would also accept `"07"` is a red mutant.
+- `checked_is_exact` — `arith_eval` accepts only in-i64 intermediates, and an
+  accepted value IS the mathematical value; the wrapping mutant writes a
+  different integer for `i64::MAX + 1`.
+- `fold_leaves_nothing` / `fold_is_idempotent` — completeness and fixpoint; an
+  identity pass is red.
+
+Pins mirror the source's tests: `an_int_typed_literal_becomes_an_int_node`,
+`an_untyped_literal_is_untouched`, `a_literal_arithmetic_expression_folds_exactly`,
+`overflow_refuses`, `a_float_spelling_is_not_an_int`, plus the scope and
+whole-list pins.
+
+Hypotheses in-file: reachability/registration of the pass; the A2 int verdict
+(`frontend_types::int_names`) and the `count_writes` census, both taken as
+given; the parser's canonicity (`int_literal` refuses signs, floats, `0x`,
+underscores and leading zeros, and range-checks i64); corpus domain.
+
+Mutants, measured: permissive parser **31 verified, 2 errors**; wrapping
+arithmetic **28 / 5**; folding a runtime-valued tree **31 / 2**; identity
+**27 / 6**.
 
 ## Running it
 
@@ -2204,6 +2484,41 @@ Mutants, measured: drop the non-emptiness half **36 verified, 5 errors**; drop
 the whitespace half **38 / 3**; identity **33 / 8**; fold on either half
 **34 / 7**.
 
+## frontend_int_lift.rs — spelling vs node, and the pass's scope (33)
+
+`shir_passes/frontend_int_lift.rs`. A frontend spells a number as the string
+`"42"` and records only the A2 verdict `var_types[name] = Int`; renderers read
+the shell convention, so the pass rewrites the spelling to the node.
+
+- `fold_preserves_text` — the value law: the text the expression denotes is
+  unchanged.
+- `lift_preserves_text` — the scope law: `lift_stmt` rewrites only a
+  single-target `Assign` (or singleton `Declare`) of a name that is A2-`Int`
+  AND written exactly once; every other statement is not walked, so a
+  foldable value inside it survives (pinned).
+- `decimal_spelling_is_canonical` — the parser's answer is the canonical
+  spelling, so the replacement keeps the text. The permissive variant that
+  would also accept `"07"` is a red mutant.
+- `checked_is_exact` — `arith_eval` accepts only in-i64 intermediates, and an
+  accepted value IS the mathematical value; the wrapping mutant writes a
+  different integer for `i64::MAX + 1`.
+- `fold_leaves_nothing` / `fold_is_idempotent` — completeness and fixpoint; an
+  identity pass is red.
+
+Pins mirror the source's tests: `an_int_typed_literal_becomes_an_int_node`,
+`an_untyped_literal_is_untouched`, `a_literal_arithmetic_expression_folds_exactly`,
+`overflow_refuses`, `a_float_spelling_is_not_an_int`, plus the scope and
+whole-list pins.
+
+Hypotheses in-file: reachability/registration of the pass; the A2 int verdict
+(`frontend_types::int_names`) and the `count_writes` census, both taken as
+given; the parser's canonicity (`int_literal` refuses signs, floats, `0x`,
+underscores and leading zeros, and range-checks i64); corpus domain.
+
+Mutants, measured: permissive parser **31 verified, 2 errors**; wrapping
+arithmetic **28 / 5**; folding a runtime-valued tree **31 / 2**; identity
+**27 / 6**.
+
 ## Running it (all six P6 files)
 
 Same toolchain as above, `--rlimit 40` each:
@@ -2421,6 +2736,41 @@ Mutants, measured: drop the non-emptiness half **36 verified, 5 errors**; drop
 the whitespace half **38 / 3**; identity **33 / 8**; fold on either half
 **34 / 7**.
 
+## frontend_int_lift.rs — spelling vs node, and the pass's scope (33)
+
+`shir_passes/frontend_int_lift.rs`. A frontend spells a number as the string
+`"42"` and records only the A2 verdict `var_types[name] = Int`; renderers read
+the shell convention, so the pass rewrites the spelling to the node.
+
+- `fold_preserves_text` — the value law: the text the expression denotes is
+  unchanged.
+- `lift_preserves_text` — the scope law: `lift_stmt` rewrites only a
+  single-target `Assign` (or singleton `Declare`) of a name that is A2-`Int`
+  AND written exactly once; every other statement is not walked, so a
+  foldable value inside it survives (pinned).
+- `decimal_spelling_is_canonical` — the parser's answer is the canonical
+  spelling, so the replacement keeps the text. The permissive variant that
+  would also accept `"07"` is a red mutant.
+- `checked_is_exact` — `arith_eval` accepts only in-i64 intermediates, and an
+  accepted value IS the mathematical value; the wrapping mutant writes a
+  different integer for `i64::MAX + 1`.
+- `fold_leaves_nothing` / `fold_is_idempotent` — completeness and fixpoint; an
+  identity pass is red.
+
+Pins mirror the source's tests: `an_int_typed_literal_becomes_an_int_node`,
+`an_untyped_literal_is_untouched`, `a_literal_arithmetic_expression_folds_exactly`,
+`overflow_refuses`, `a_float_spelling_is_not_an_int`, plus the scope and
+whole-list pins.
+
+Hypotheses in-file: reachability/registration of the pass; the A2 int verdict
+(`frontend_types::int_names`) and the `count_writes` census, both taken as
+given; the parser's canonicity (`int_literal` refuses signs, floats, `0x`,
+underscores and leading zeros, and range-checks i64); corpus domain.
+
+Mutants, measured: permissive parser **31 verified, 2 errors**; wrapping
+arithmetic **28 / 5**; folding a runtime-valued tree **31 / 2**; identity
+**27 / 6**.
+
 ## Running it
 
 Same toolchain as the P6 files (`--rlimit 40`).
@@ -2631,6 +2981,41 @@ custom-IFS gate; the element carve-out; corpus domain.
 Mutants, measured: drop the non-emptiness half **36 verified, 5 errors**; drop
 the whitespace half **38 / 3**; identity **33 / 8**; fold on either half
 **34 / 7**.
+
+## frontend_int_lift.rs — spelling vs node, and the pass's scope (33)
+
+`shir_passes/frontend_int_lift.rs`. A frontend spells a number as the string
+`"42"` and records only the A2 verdict `var_types[name] = Int`; renderers read
+the shell convention, so the pass rewrites the spelling to the node.
+
+- `fold_preserves_text` — the value law: the text the expression denotes is
+  unchanged.
+- `lift_preserves_text` — the scope law: `lift_stmt` rewrites only a
+  single-target `Assign` (or singleton `Declare`) of a name that is A2-`Int`
+  AND written exactly once; every other statement is not walked, so a
+  foldable value inside it survives (pinned).
+- `decimal_spelling_is_canonical` — the parser's answer is the canonical
+  spelling, so the replacement keeps the text. The permissive variant that
+  would also accept `"07"` is a red mutant.
+- `checked_is_exact` — `arith_eval` accepts only in-i64 intermediates, and an
+  accepted value IS the mathematical value; the wrapping mutant writes a
+  different integer for `i64::MAX + 1`.
+- `fold_leaves_nothing` / `fold_is_idempotent` — completeness and fixpoint; an
+  identity pass is red.
+
+Pins mirror the source's tests: `an_int_typed_literal_becomes_an_int_node`,
+`an_untyped_literal_is_untouched`, `a_literal_arithmetic_expression_folds_exactly`,
+`overflow_refuses`, `a_float_spelling_is_not_an_int`, plus the scope and
+whole-list pins.
+
+Hypotheses in-file: reachability/registration of the pass; the A2 int verdict
+(`frontend_types::int_names`) and the `count_writes` census, both taken as
+given; the parser's canonicity (`int_literal` refuses signs, floats, `0x`,
+underscores and leading zeros, and range-checks i64); corpus domain.
+
+Mutants, measured: permissive parser **31 verified, 2 errors**; wrapping
+arithmetic **28 / 5**; folding a runtime-valued tree **31 / 2**; identity
+**27 / 6**.
 
 ## Running it
 
@@ -2884,6 +3269,41 @@ Mutants, measured: drop the non-emptiness half **36 verified, 5 errors**; drop
 the whitespace half **38 / 3**; identity **33 / 8**; fold on either half
 **34 / 7**.
 
+## frontend_int_lift.rs — spelling vs node, and the pass's scope (33)
+
+`shir_passes/frontend_int_lift.rs`. A frontend spells a number as the string
+`"42"` and records only the A2 verdict `var_types[name] = Int`; renderers read
+the shell convention, so the pass rewrites the spelling to the node.
+
+- `fold_preserves_text` — the value law: the text the expression denotes is
+  unchanged.
+- `lift_preserves_text` — the scope law: `lift_stmt` rewrites only a
+  single-target `Assign` (or singleton `Declare`) of a name that is A2-`Int`
+  AND written exactly once; every other statement is not walked, so a
+  foldable value inside it survives (pinned).
+- `decimal_spelling_is_canonical` — the parser's answer is the canonical
+  spelling, so the replacement keeps the text. The permissive variant that
+  would also accept `"07"` is a red mutant.
+- `checked_is_exact` — `arith_eval` accepts only in-i64 intermediates, and an
+  accepted value IS the mathematical value; the wrapping mutant writes a
+  different integer for `i64::MAX + 1`.
+- `fold_leaves_nothing` / `fold_is_idempotent` — completeness and fixpoint; an
+  identity pass is red.
+
+Pins mirror the source's tests: `an_int_typed_literal_becomes_an_int_node`,
+`an_untyped_literal_is_untouched`, `a_literal_arithmetic_expression_folds_exactly`,
+`overflow_refuses`, `a_float_spelling_is_not_an_int`, plus the scope and
+whole-list pins.
+
+Hypotheses in-file: reachability/registration of the pass; the A2 int verdict
+(`frontend_types::int_names`) and the `count_writes` census, both taken as
+given; the parser's canonicity (`int_literal` refuses signs, floats, `0x`,
+underscores and leading zeros, and range-checks i64); corpus domain.
+
+Mutants, measured: permissive parser **31 verified, 2 errors**; wrapping
+arithmetic **28 / 5**; folding a runtime-valued tree **31 / 2**; identity
+**27 / 6**.
+
 ## Running it
 
 Same toolchain as above (`--rlimit 80` for the shadow-induction
@@ -3117,6 +3537,41 @@ custom-IFS gate; the element carve-out; corpus domain.
 Mutants, measured: drop the non-emptiness half **36 verified, 5 errors**; drop
 the whitespace half **38 / 3**; identity **33 / 8**; fold on either half
 **34 / 7**.
+
+## frontend_int_lift.rs — spelling vs node, and the pass's scope (33)
+
+`shir_passes/frontend_int_lift.rs`. A frontend spells a number as the string
+`"42"` and records only the A2 verdict `var_types[name] = Int`; renderers read
+the shell convention, so the pass rewrites the spelling to the node.
+
+- `fold_preserves_text` — the value law: the text the expression denotes is
+  unchanged.
+- `lift_preserves_text` — the scope law: `lift_stmt` rewrites only a
+  single-target `Assign` (or singleton `Declare`) of a name that is A2-`Int`
+  AND written exactly once; every other statement is not walked, so a
+  foldable value inside it survives (pinned).
+- `decimal_spelling_is_canonical` — the parser's answer is the canonical
+  spelling, so the replacement keeps the text. The permissive variant that
+  would also accept `"07"` is a red mutant.
+- `checked_is_exact` — `arith_eval` accepts only in-i64 intermediates, and an
+  accepted value IS the mathematical value; the wrapping mutant writes a
+  different integer for `i64::MAX + 1`.
+- `fold_leaves_nothing` / `fold_is_idempotent` — completeness and fixpoint; an
+  identity pass is red.
+
+Pins mirror the source's tests: `an_int_typed_literal_becomes_an_int_node`,
+`an_untyped_literal_is_untouched`, `a_literal_arithmetic_expression_folds_exactly`,
+`overflow_refuses`, `a_float_spelling_is_not_an_int`, plus the scope and
+whole-list pins.
+
+Hypotheses in-file: reachability/registration of the pass; the A2 int verdict
+(`frontend_types::int_names`) and the `count_writes` census, both taken as
+given; the parser's canonicity (`int_literal` refuses signs, floats, `0x`,
+underscores and leading zeros, and range-checks i64); corpus domain.
+
+Mutants, measured: permissive parser **31 verified, 2 errors**; wrapping
+arithmetic **28 / 5**; folding a runtime-valued tree **31 / 2**; identity
+**27 / 6**.
 
 ## Running it
 
@@ -3356,6 +3811,41 @@ Mutants, measured: drop the non-emptiness half **36 verified, 5 errors**; drop
 the whitespace half **38 / 3**; identity **33 / 8**; fold on either half
 **34 / 7**.
 
+## frontend_int_lift.rs — spelling vs node, and the pass's scope (33)
+
+`shir_passes/frontend_int_lift.rs`. A frontend spells a number as the string
+`"42"` and records only the A2 verdict `var_types[name] = Int`; renderers read
+the shell convention, so the pass rewrites the spelling to the node.
+
+- `fold_preserves_text` — the value law: the text the expression denotes is
+  unchanged.
+- `lift_preserves_text` — the scope law: `lift_stmt` rewrites only a
+  single-target `Assign` (or singleton `Declare`) of a name that is A2-`Int`
+  AND written exactly once; every other statement is not walked, so a
+  foldable value inside it survives (pinned).
+- `decimal_spelling_is_canonical` — the parser's answer is the canonical
+  spelling, so the replacement keeps the text. The permissive variant that
+  would also accept `"07"` is a red mutant.
+- `checked_is_exact` — `arith_eval` accepts only in-i64 intermediates, and an
+  accepted value IS the mathematical value; the wrapping mutant writes a
+  different integer for `i64::MAX + 1`.
+- `fold_leaves_nothing` / `fold_is_idempotent` — completeness and fixpoint; an
+  identity pass is red.
+
+Pins mirror the source's tests: `an_int_typed_literal_becomes_an_int_node`,
+`an_untyped_literal_is_untouched`, `a_literal_arithmetic_expression_folds_exactly`,
+`overflow_refuses`, `a_float_spelling_is_not_an_int`, plus the scope and
+whole-list pins.
+
+Hypotheses in-file: reachability/registration of the pass; the A2 int verdict
+(`frontend_types::int_names`) and the `count_writes` census, both taken as
+given; the parser's canonicity (`int_literal` refuses signs, floats, `0x`,
+underscores and leading zeros, and range-checks i64); corpus domain.
+
+Mutants, measured: permissive parser **31 verified, 2 errors**; wrapping
+arithmetic **28 / 5**; folding a runtime-valued tree **31 / 2**; identity
+**27 / 6**.
+
 ## Running it
 
 Same toolchain as above (`--rlimit 60` for the fuel/size induction):
@@ -3594,6 +4084,41 @@ Mutants, measured: drop the non-emptiness half **36 verified, 5 errors**; drop
 the whitespace half **38 / 3**; identity **33 / 8**; fold on either half
 **34 / 7**.
 
+## frontend_int_lift.rs — spelling vs node, and the pass's scope (33)
+
+`shir_passes/frontend_int_lift.rs`. A frontend spells a number as the string
+`"42"` and records only the A2 verdict `var_types[name] = Int`; renderers read
+the shell convention, so the pass rewrites the spelling to the node.
+
+- `fold_preserves_text` — the value law: the text the expression denotes is
+  unchanged.
+- `lift_preserves_text` — the scope law: `lift_stmt` rewrites only a
+  single-target `Assign` (or singleton `Declare`) of a name that is A2-`Int`
+  AND written exactly once; every other statement is not walked, so a
+  foldable value inside it survives (pinned).
+- `decimal_spelling_is_canonical` — the parser's answer is the canonical
+  spelling, so the replacement keeps the text. The permissive variant that
+  would also accept `"07"` is a red mutant.
+- `checked_is_exact` — `arith_eval` accepts only in-i64 intermediates, and an
+  accepted value IS the mathematical value; the wrapping mutant writes a
+  different integer for `i64::MAX + 1`.
+- `fold_leaves_nothing` / `fold_is_idempotent` — completeness and fixpoint; an
+  identity pass is red.
+
+Pins mirror the source's tests: `an_int_typed_literal_becomes_an_int_node`,
+`an_untyped_literal_is_untouched`, `a_literal_arithmetic_expression_folds_exactly`,
+`overflow_refuses`, `a_float_spelling_is_not_an_int`, plus the scope and
+whole-list pins.
+
+Hypotheses in-file: reachability/registration of the pass; the A2 int verdict
+(`frontend_types::int_names`) and the `count_writes` census, both taken as
+given; the parser's canonicity (`int_literal` refuses signs, floats, `0x`,
+underscores and leading zeros, and range-checks i64); corpus domain.
+
+Mutants, measured: permissive parser **31 verified, 2 errors**; wrapping
+arithmetic **28 / 5**; folding a runtime-valued tree **31 / 2**; identity
+**27 / 6**.
+
 ## Running it
 
 Same toolchain as the P6/P7/P8 files (`--rlimit 40`):
@@ -3813,6 +4338,41 @@ custom-IFS gate; the element carve-out; corpus domain.
 Mutants, measured: drop the non-emptiness half **36 verified, 5 errors**; drop
 the whitespace half **38 / 3**; identity **33 / 8**; fold on either half
 **34 / 7**.
+
+## frontend_int_lift.rs — spelling vs node, and the pass's scope (33)
+
+`shir_passes/frontend_int_lift.rs`. A frontend spells a number as the string
+`"42"` and records only the A2 verdict `var_types[name] = Int`; renderers read
+the shell convention, so the pass rewrites the spelling to the node.
+
+- `fold_preserves_text` — the value law: the text the expression denotes is
+  unchanged.
+- `lift_preserves_text` — the scope law: `lift_stmt` rewrites only a
+  single-target `Assign` (or singleton `Declare`) of a name that is A2-`Int`
+  AND written exactly once; every other statement is not walked, so a
+  foldable value inside it survives (pinned).
+- `decimal_spelling_is_canonical` — the parser's answer is the canonical
+  spelling, so the replacement keeps the text. The permissive variant that
+  would also accept `"07"` is a red mutant.
+- `checked_is_exact` — `arith_eval` accepts only in-i64 intermediates, and an
+  accepted value IS the mathematical value; the wrapping mutant writes a
+  different integer for `i64::MAX + 1`.
+- `fold_leaves_nothing` / `fold_is_idempotent` — completeness and fixpoint; an
+  identity pass is red.
+
+Pins mirror the source's tests: `an_int_typed_literal_becomes_an_int_node`,
+`an_untyped_literal_is_untouched`, `a_literal_arithmetic_expression_folds_exactly`,
+`overflow_refuses`, `a_float_spelling_is_not_an_int`, plus the scope and
+whole-list pins.
+
+Hypotheses in-file: reachability/registration of the pass; the A2 int verdict
+(`frontend_types::int_names`) and the `count_writes` census, both taken as
+given; the parser's canonicity (`int_literal` refuses signs, floats, `0x`,
+underscores and leading zeros, and range-checks i64); corpus domain.
+
+Mutants, measured: permissive parser **31 verified, 2 errors**; wrapping
+arithmetic **28 / 5**; folding a runtime-valued tree **31 / 2**; identity
+**27 / 6**.
 
 ## Running it
 
@@ -4038,6 +4598,41 @@ Mutants, measured: drop the non-emptiness half **36 verified, 5 errors**; drop
 the whitespace half **38 / 3**; identity **33 / 8**; fold on either half
 **34 / 7**.
 
+## frontend_int_lift.rs — spelling vs node, and the pass's scope (33)
+
+`shir_passes/frontend_int_lift.rs`. A frontend spells a number as the string
+`"42"` and records only the A2 verdict `var_types[name] = Int`; renderers read
+the shell convention, so the pass rewrites the spelling to the node.
+
+- `fold_preserves_text` — the value law: the text the expression denotes is
+  unchanged.
+- `lift_preserves_text` — the scope law: `lift_stmt` rewrites only a
+  single-target `Assign` (or singleton `Declare`) of a name that is A2-`Int`
+  AND written exactly once; every other statement is not walked, so a
+  foldable value inside it survives (pinned).
+- `decimal_spelling_is_canonical` — the parser's answer is the canonical
+  spelling, so the replacement keeps the text. The permissive variant that
+  would also accept `"07"` is a red mutant.
+- `checked_is_exact` — `arith_eval` accepts only in-i64 intermediates, and an
+  accepted value IS the mathematical value; the wrapping mutant writes a
+  different integer for `i64::MAX + 1`.
+- `fold_leaves_nothing` / `fold_is_idempotent` — completeness and fixpoint; an
+  identity pass is red.
+
+Pins mirror the source's tests: `an_int_typed_literal_becomes_an_int_node`,
+`an_untyped_literal_is_untouched`, `a_literal_arithmetic_expression_folds_exactly`,
+`overflow_refuses`, `a_float_spelling_is_not_an_int`, plus the scope and
+whole-list pins.
+
+Hypotheses in-file: reachability/registration of the pass; the A2 int verdict
+(`frontend_types::int_names`) and the `count_writes` census, both taken as
+given; the parser's canonicity (`int_literal` refuses signs, floats, `0x`,
+underscores and leading zeros, and range-checks i64); corpus domain.
+
+Mutants, measured: permissive parser **31 verified, 2 errors**; wrapping
+arithmetic **28 / 5**; folding a runtime-valued tree **31 / 2**; identity
+**27 / 6**.
+
 ## Running it
 
 Same toolchain as the P6/P7/P8 files (`--rlimit 40`).
@@ -4252,6 +4847,41 @@ custom-IFS gate; the element carve-out; corpus domain.
 Mutants, measured: drop the non-emptiness half **36 verified, 5 errors**; drop
 the whitespace half **38 / 3**; identity **33 / 8**; fold on either half
 **34 / 7**.
+
+## frontend_int_lift.rs — spelling vs node, and the pass's scope (33)
+
+`shir_passes/frontend_int_lift.rs`. A frontend spells a number as the string
+`"42"` and records only the A2 verdict `var_types[name] = Int`; renderers read
+the shell convention, so the pass rewrites the spelling to the node.
+
+- `fold_preserves_text` — the value law: the text the expression denotes is
+  unchanged.
+- `lift_preserves_text` — the scope law: `lift_stmt` rewrites only a
+  single-target `Assign` (or singleton `Declare`) of a name that is A2-`Int`
+  AND written exactly once; every other statement is not walked, so a
+  foldable value inside it survives (pinned).
+- `decimal_spelling_is_canonical` — the parser's answer is the canonical
+  spelling, so the replacement keeps the text. The permissive variant that
+  would also accept `"07"` is a red mutant.
+- `checked_is_exact` — `arith_eval` accepts only in-i64 intermediates, and an
+  accepted value IS the mathematical value; the wrapping mutant writes a
+  different integer for `i64::MAX + 1`.
+- `fold_leaves_nothing` / `fold_is_idempotent` — completeness and fixpoint; an
+  identity pass is red.
+
+Pins mirror the source's tests: `an_int_typed_literal_becomes_an_int_node`,
+`an_untyped_literal_is_untouched`, `a_literal_arithmetic_expression_folds_exactly`,
+`overflow_refuses`, `a_float_spelling_is_not_an_int`, plus the scope and
+whole-list pins.
+
+Hypotheses in-file: reachability/registration of the pass; the A2 int verdict
+(`frontend_types::int_names`) and the `count_writes` census, both taken as
+given; the parser's canonicity (`int_literal` refuses signs, floats, `0x`,
+underscores and leading zeros, and range-checks i64); corpus domain.
+
+Mutants, measured: permissive parser **31 verified, 2 errors**; wrapping
+arithmetic **28 / 5**; folding a runtime-valued tree **31 / 2**; identity
+**27 / 6**.
 
 ## Running it
 
@@ -4471,6 +5101,41 @@ Mutants, measured: drop the non-emptiness half **36 verified, 5 errors**; drop
 the whitespace half **38 / 3**; identity **33 / 8**; fold on either half
 **34 / 7**.
 
+## frontend_int_lift.rs — spelling vs node, and the pass's scope (33)
+
+`shir_passes/frontend_int_lift.rs`. A frontend spells a number as the string
+`"42"` and records only the A2 verdict `var_types[name] = Int`; renderers read
+the shell convention, so the pass rewrites the spelling to the node.
+
+- `fold_preserves_text` — the value law: the text the expression denotes is
+  unchanged.
+- `lift_preserves_text` — the scope law: `lift_stmt` rewrites only a
+  single-target `Assign` (or singleton `Declare`) of a name that is A2-`Int`
+  AND written exactly once; every other statement is not walked, so a
+  foldable value inside it survives (pinned).
+- `decimal_spelling_is_canonical` — the parser's answer is the canonical
+  spelling, so the replacement keeps the text. The permissive variant that
+  would also accept `"07"` is a red mutant.
+- `checked_is_exact` — `arith_eval` accepts only in-i64 intermediates, and an
+  accepted value IS the mathematical value; the wrapping mutant writes a
+  different integer for `i64::MAX + 1`.
+- `fold_leaves_nothing` / `fold_is_idempotent` — completeness and fixpoint; an
+  identity pass is red.
+
+Pins mirror the source's tests: `an_int_typed_literal_becomes_an_int_node`,
+`an_untyped_literal_is_untouched`, `a_literal_arithmetic_expression_folds_exactly`,
+`overflow_refuses`, `a_float_spelling_is_not_an_int`, plus the scope and
+whole-list pins.
+
+Hypotheses in-file: reachability/registration of the pass; the A2 int verdict
+(`frontend_types::int_names`) and the `count_writes` census, both taken as
+given; the parser's canonicity (`int_literal` refuses signs, floats, `0x`,
+underscores and leading zeros, and range-checks i64); corpus domain.
+
+Mutants, measured: permissive parser **31 verified, 2 errors**; wrapping
+arithmetic **28 / 5**; folding a runtime-valued tree **31 / 2**; identity
+**27 / 6**.
+
 ## Running it
 
 Same toolchain as the P6/P7/P8 files (`--rlimit 40`).
@@ -4689,6 +5354,41 @@ custom-IFS gate; the element carve-out; corpus domain.
 Mutants, measured: drop the non-emptiness half **36 verified, 5 errors**; drop
 the whitespace half **38 / 3**; identity **33 / 8**; fold on either half
 **34 / 7**.
+
+## frontend_int_lift.rs — spelling vs node, and the pass's scope (33)
+
+`shir_passes/frontend_int_lift.rs`. A frontend spells a number as the string
+`"42"` and records only the A2 verdict `var_types[name] = Int`; renderers read
+the shell convention, so the pass rewrites the spelling to the node.
+
+- `fold_preserves_text` — the value law: the text the expression denotes is
+  unchanged.
+- `lift_preserves_text` — the scope law: `lift_stmt` rewrites only a
+  single-target `Assign` (or singleton `Declare`) of a name that is A2-`Int`
+  AND written exactly once; every other statement is not walked, so a
+  foldable value inside it survives (pinned).
+- `decimal_spelling_is_canonical` — the parser's answer is the canonical
+  spelling, so the replacement keeps the text. The permissive variant that
+  would also accept `"07"` is a red mutant.
+- `checked_is_exact` — `arith_eval` accepts only in-i64 intermediates, and an
+  accepted value IS the mathematical value; the wrapping mutant writes a
+  different integer for `i64::MAX + 1`.
+- `fold_leaves_nothing` / `fold_is_idempotent` — completeness and fixpoint; an
+  identity pass is red.
+
+Pins mirror the source's tests: `an_int_typed_literal_becomes_an_int_node`,
+`an_untyped_literal_is_untouched`, `a_literal_arithmetic_expression_folds_exactly`,
+`overflow_refuses`, `a_float_spelling_is_not_an_int`, plus the scope and
+whole-list pins.
+
+Hypotheses in-file: reachability/registration of the pass; the A2 int verdict
+(`frontend_types::int_names`) and the `count_writes` census, both taken as
+given; the parser's canonicity (`int_literal` refuses signs, floats, `0x`,
+underscores and leading zeros, and range-checks i64); corpus domain.
+
+Mutants, measured: permissive parser **31 verified, 2 errors**; wrapping
+arithmetic **28 / 5**; folding a runtime-valued tree **31 / 2**; identity
+**27 / 6**.
 
 ## Running it
 
@@ -5077,6 +5777,41 @@ custom-IFS gate; the element carve-out; corpus domain.
 Mutants, measured: drop the non-emptiness half **36 verified, 5 errors**; drop
 the whitespace half **38 / 3**; identity **33 / 8**; fold on either half
 **34 / 7**.
+
+## frontend_int_lift.rs — spelling vs node, and the pass's scope (33)
+
+`shir_passes/frontend_int_lift.rs`. A frontend spells a number as the string
+`"42"` and records only the A2 verdict `var_types[name] = Int`; renderers read
+the shell convention, so the pass rewrites the spelling to the node.
+
+- `fold_preserves_text` — the value law: the text the expression denotes is
+  unchanged.
+- `lift_preserves_text` — the scope law: `lift_stmt` rewrites only a
+  single-target `Assign` (or singleton `Declare`) of a name that is A2-`Int`
+  AND written exactly once; every other statement is not walked, so a
+  foldable value inside it survives (pinned).
+- `decimal_spelling_is_canonical` — the parser's answer is the canonical
+  spelling, so the replacement keeps the text. The permissive variant that
+  would also accept `"07"` is a red mutant.
+- `checked_is_exact` — `arith_eval` accepts only in-i64 intermediates, and an
+  accepted value IS the mathematical value; the wrapping mutant writes a
+  different integer for `i64::MAX + 1`.
+- `fold_leaves_nothing` / `fold_is_idempotent` — completeness and fixpoint; an
+  identity pass is red.
+
+Pins mirror the source's tests: `an_int_typed_literal_becomes_an_int_node`,
+`an_untyped_literal_is_untouched`, `a_literal_arithmetic_expression_folds_exactly`,
+`overflow_refuses`, `a_float_spelling_is_not_an_int`, plus the scope and
+whole-list pins.
+
+Hypotheses in-file: reachability/registration of the pass; the A2 int verdict
+(`frontend_types::int_names`) and the `count_writes` census, both taken as
+given; the parser's canonicity (`int_literal` refuses signs, floats, `0x`,
+underscores and leading zeros, and range-checks i64); corpus domain.
+
+Mutants, measured: permissive parser **31 verified, 2 errors**; wrapping
+arithmetic **28 / 5**; folding a runtime-valued tree **31 / 2**; identity
+**27 / 6**.
 
 ## Running it
 
@@ -5518,6 +6253,41 @@ Mutants, measured: drop the non-emptiness half **36 verified, 5 errors**; drop
 the whitespace half **38 / 3**; identity **33 / 8**; fold on either half
 **34 / 7**.
 
+## frontend_int_lift.rs — spelling vs node, and the pass's scope (33)
+
+`shir_passes/frontend_int_lift.rs`. A frontend spells a number as the string
+`"42"` and records only the A2 verdict `var_types[name] = Int`; renderers read
+the shell convention, so the pass rewrites the spelling to the node.
+
+- `fold_preserves_text` — the value law: the text the expression denotes is
+  unchanged.
+- `lift_preserves_text` — the scope law: `lift_stmt` rewrites only a
+  single-target `Assign` (or singleton `Declare`) of a name that is A2-`Int`
+  AND written exactly once; every other statement is not walked, so a
+  foldable value inside it survives (pinned).
+- `decimal_spelling_is_canonical` — the parser's answer is the canonical
+  spelling, so the replacement keeps the text. The permissive variant that
+  would also accept `"07"` is a red mutant.
+- `checked_is_exact` — `arith_eval` accepts only in-i64 intermediates, and an
+  accepted value IS the mathematical value; the wrapping mutant writes a
+  different integer for `i64::MAX + 1`.
+- `fold_leaves_nothing` / `fold_is_idempotent` — completeness and fixpoint; an
+  identity pass is red.
+
+Pins mirror the source's tests: `an_int_typed_literal_becomes_an_int_node`,
+`an_untyped_literal_is_untouched`, `a_literal_arithmetic_expression_folds_exactly`,
+`overflow_refuses`, `a_float_spelling_is_not_an_int`, plus the scope and
+whole-list pins.
+
+Hypotheses in-file: reachability/registration of the pass; the A2 int verdict
+(`frontend_types::int_names`) and the `count_writes` census, both taken as
+given; the parser's canonicity (`int_literal` refuses signs, floats, `0x`,
+underscores and leading zeros, and range-checks i64); corpus domain.
+
+Mutants, measured: permissive parser **31 verified, 2 errors**; wrapping
+arithmetic **28 / 5**; folding a runtime-valued tree **31 / 2**; identity
+**27 / 6**.
+
 ## Running it
 
 Same toolchain as above (`--rlimit 40`).
@@ -5895,6 +6665,41 @@ Mutants, measured: drop the non-emptiness half **36 verified, 5 errors**; drop
 the whitespace half **38 / 3**; identity **33 / 8**; fold on either half
 **34 / 7**.
 
+## frontend_int_lift.rs — spelling vs node, and the pass's scope (33)
+
+`shir_passes/frontend_int_lift.rs`. A frontend spells a number as the string
+`"42"` and records only the A2 verdict `var_types[name] = Int`; renderers read
+the shell convention, so the pass rewrites the spelling to the node.
+
+- `fold_preserves_text` — the value law: the text the expression denotes is
+  unchanged.
+- `lift_preserves_text` — the scope law: `lift_stmt` rewrites only a
+  single-target `Assign` (or singleton `Declare`) of a name that is A2-`Int`
+  AND written exactly once; every other statement is not walked, so a
+  foldable value inside it survives (pinned).
+- `decimal_spelling_is_canonical` — the parser's answer is the canonical
+  spelling, so the replacement keeps the text. The permissive variant that
+  would also accept `"07"` is a red mutant.
+- `checked_is_exact` — `arith_eval` accepts only in-i64 intermediates, and an
+  accepted value IS the mathematical value; the wrapping mutant writes a
+  different integer for `i64::MAX + 1`.
+- `fold_leaves_nothing` / `fold_is_idempotent` — completeness and fixpoint; an
+  identity pass is red.
+
+Pins mirror the source's tests: `an_int_typed_literal_becomes_an_int_node`,
+`an_untyped_literal_is_untouched`, `a_literal_arithmetic_expression_folds_exactly`,
+`overflow_refuses`, `a_float_spelling_is_not_an_int`, plus the scope and
+whole-list pins.
+
+Hypotheses in-file: reachability/registration of the pass; the A2 int verdict
+(`frontend_types::int_names`) and the `count_writes` census, both taken as
+given; the parser's canonicity (`int_literal` refuses signs, floats, `0x`,
+underscores and leading zeros, and range-checks i64); corpus domain.
+
+Mutants, measured: permissive parser **31 verified, 2 errors**; wrapping
+arithmetic **28 / 5**; folding a runtime-valued tree **31 / 2**; identity
+**27 / 6**.
+
 ## Running it
 
 Same toolchain as above (`--rlimit 40`).
@@ -6258,6 +7063,41 @@ custom-IFS gate; the element carve-out; corpus domain.
 Mutants, measured: drop the non-emptiness half **36 verified, 5 errors**; drop
 the whitespace half **38 / 3**; identity **33 / 8**; fold on either half
 **34 / 7**.
+
+## frontend_int_lift.rs — spelling vs node, and the pass's scope (33)
+
+`shir_passes/frontend_int_lift.rs`. A frontend spells a number as the string
+`"42"` and records only the A2 verdict `var_types[name] = Int`; renderers read
+the shell convention, so the pass rewrites the spelling to the node.
+
+- `fold_preserves_text` — the value law: the text the expression denotes is
+  unchanged.
+- `lift_preserves_text` — the scope law: `lift_stmt` rewrites only a
+  single-target `Assign` (or singleton `Declare`) of a name that is A2-`Int`
+  AND written exactly once; every other statement is not walked, so a
+  foldable value inside it survives (pinned).
+- `decimal_spelling_is_canonical` — the parser's answer is the canonical
+  spelling, so the replacement keeps the text. The permissive variant that
+  would also accept `"07"` is a red mutant.
+- `checked_is_exact` — `arith_eval` accepts only in-i64 intermediates, and an
+  accepted value IS the mathematical value; the wrapping mutant writes a
+  different integer for `i64::MAX + 1`.
+- `fold_leaves_nothing` / `fold_is_idempotent` — completeness and fixpoint; an
+  identity pass is red.
+
+Pins mirror the source's tests: `an_int_typed_literal_becomes_an_int_node`,
+`an_untyped_literal_is_untouched`, `a_literal_arithmetic_expression_folds_exactly`,
+`overflow_refuses`, `a_float_spelling_is_not_an_int`, plus the scope and
+whole-list pins.
+
+Hypotheses in-file: reachability/registration of the pass; the A2 int verdict
+(`frontend_types::int_names`) and the `count_writes` census, both taken as
+given; the parser's canonicity (`int_literal` refuses signs, floats, `0x`,
+underscores and leading zeros, and range-checks i64); corpus domain.
+
+Mutants, measured: permissive parser **31 verified, 2 errors**; wrapping
+arithmetic **28 / 5**; folding a runtime-valued tree **31 / 2**; identity
+**27 / 6**.
 
 ## Running it
 
