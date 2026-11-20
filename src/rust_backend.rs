@@ -5919,6 +5919,20 @@ while __p.len() > 1 && __p.ends_with('/') {{ __p = &__p[..__p.len() - 1]; }} @TA
         }
     }
 
+    /// The prefix/suffix PREDICATE (`[[ $x == P* ]]` / `[[ $x == *P ]]`).
+    /// The node's fragment is the LITERAL affix (`LIT*` / `*LIT`), so the
+    /// byte comparison `starts_with`/`ends_with` is the whole contract —
+    /// classes, extglobs and brace alternation are outside it and never
+    /// reach the node.
+    fn affix_bool(&mut self, x: &crate::shir_nodes::StringAffix) -> String {
+        let t = self.expr_str(&x.text);
+        let p = self.expr_str(&x.pattern);
+        let m = if x.prefix { "starts_with" } else { "ends_with" };
+        // `Pattern` is implemented for `&str`, not for `String` or `&String`,
+        // and the pattern expression may be either — go through one binding.
+        format!("{{ let __p = String::from({p}); {t}.{m}(&__p[..]) }}")
+    }
+
     /// Native `std` spelling for the COUNT-valued text nodes Rust's manifest
     /// declares (`ArrayLen`, `WordCount`, `RegCount`).
     fn ext_std_num(&mut self, n: &dyn crate::shir_nodes::ExtExpr) -> Option<String> {
@@ -6251,6 +6265,11 @@ while __p.len() > 1 && __p.ends_with('/') {{ __p = &__p[..__p.len() - 1]; }} @TA
                         "(if {}.contains({}.as_str()) {{ true }} else {{ false }})",
                         self.expr_str(&x.text), self.expr_str(&x.pattern))
                 }
+                "StringAffix" => {
+                    let x = n.as_any().downcast_ref::<crate::shir_nodes::StringAffix>()
+                        .expect("tag/type agree");
+                    self.affix_bool(x)
+                }
                 _other => format!("({} != 0)", self.expr_num(e)),
             },
             IrExpr::Arith(a) => self.arith_bool(a),
@@ -6572,6 +6591,12 @@ while __p.len() > 1 && __p.ends_with('/') {{ __p = &__p[..__p.len() - 1]; }} @TA
                     format!(
                         "(if {}.contains({}.as_str()) {{ 1i64 }} else {{ 0i64 }})",
                         self.expr_str(&x.text), self.expr_str(&x.pattern))
+                }
+                "StringAffix" => {
+                    let x = n.as_any().downcast_ref::<crate::shir_nodes::StringAffix>()
+                        .expect("tag/type agree");
+                    let b = self.affix_bool(x);
+                    format!("(if {b} {{ 1i64 }} else {{ 0i64 }})")
                 }
                 "StrLen" => {
                     let x = n.as_any().downcast_ref::<crate::shir_nodes::StrLen>()
@@ -24315,6 +24340,32 @@ mod tests {
         }
     }
 
+    /// `if COND; then <then>; else <else_>; fi` — the BOOL context a
+    /// predicate node renders in, built directly so an arm that no transform
+    /// reaches can still be executed.
+    fn if_program(cond: IrExpr, then: &str, else_: &str) -> IrProgram {
+        let out = |t: &str| IrStmt::Output { value: s(t), newline: true, target: None };
+        IrProgram {
+            imports: vec![],
+            requires: vec![],
+            stmts: vec![IrStmt::If {
+                cond,
+                then: vec![out(then)],
+                elsifs: vec![],
+                else_: vec![out(else_)],
+            }],
+            subs: vec![],
+            var_types: vec![],
+            stmt_lines: vec![],
+            var_lengths: vec![],
+            var_const: vec![],
+            var_lifetimes: vec![],
+            var_storage: vec![],
+            var_nospace: vec![],
+            var_bash_env: vec![],
+        }
+    }
+
     fn s(text: &str) -> IrExpr {
         IrExpr::Str(text.to_string(), crate::ir::StrStyle::DoubleQuoted)
     }
@@ -24545,7 +24596,7 @@ mod tests {
     /// against the bash command it models — `head -n`/`tail -n`.
     #[test]
     fn constructed_text_nodes_execute_like_bash() {
-        use crate::shir_nodes::{CutsetTrim, SortLines, TakeLines, UniqLines};
+        use crate::shir_nodes::{CutsetTrim, SortLines, StringAffix, TakeLines, UniqLines};
         let mut cases: Vec<(String, String, &str)> = Vec::new();
         for (from_end, bash_src) in [
             (false, "printf 'a\\nb\\nc\\n' | head -n 2\n"),
@@ -24614,6 +24665,39 @@ mod tests {
             "UniqLinesSkip".to_string(),
             uniq("x_a\ny_a\nz_b", 2, false),
             "printf 'x_a\\ny_a\\nz_b\\n' | uniq -s 2\n",
+        ));
+        // The predicate has no producing transform (the test lowering renders
+        // `[[ $x == P* ]]` itself), so it is built into an `if` and executed.
+        let affix = |text: &str, pat: &str, prefix: bool| {
+            shir_to_rust(&if_program(
+                IrExpr::Ext(Box::new(StringAffix {
+                    text: s(text),
+                    pattern: s(pat),
+                    prefix,
+                })),
+                "yes",
+                "no",
+            ))
+        };
+        cases.push((
+            "StringAffixPrefix".to_string(),
+            affix("abcd", "ab", true),
+            "if [[ abcd == ab* ]]; then echo yes; else echo no; fi\n",
+        ));
+        cases.push((
+            "StringAffixSuffix".to_string(),
+            affix("abcd", "cd", false),
+            "if [[ abcd == *cd ]]; then echo yes; else echo no; fi\n",
+        ));
+        cases.push((
+            "StringAffixMiss".to_string(),
+            affix("abcd", "cd", true),
+            "if [[ abcd == cd* ]]; then echo yes; else echo no; fi\n",
+        ));
+        cases.push((
+            "StringAffixEmpty".to_string(),
+            affix("abcd", "", false),
+            "if [[ abcd == * ]]; then echo yes; else echo no; fi\n",
         ));
         // CutsetTrim: the same character-set strip `sed` spells, per side.
         let cutset = |text: &str, cut: &str, side: Option<&str>| {

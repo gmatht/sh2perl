@@ -270,6 +270,10 @@ pub fn node_manifest(target: &str) -> &'static [&'static str] {
                 // The cutset trim: `trim_matches(|c| cutset.contains(c))`,
                 // with `left`/`right` selecting the one-sided form.
                 "CutsetTrim",
+                // The prefix/suffix PREDICATE: `.starts_with`/`.ends_with`
+                // over the node's LITERAL affix (in a bool context) and its
+                // 1/0 spelling in a string context.
+                "StringAffix",
                 // `tr`'s general map: the lowering EXPANDS ranges and classes
                 // before the node is built, so `from`/`to` are the map and
                 // `chars().map(...)` is exact (delete and squeeze included).
