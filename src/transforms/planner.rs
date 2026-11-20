@@ -267,6 +267,10 @@ pub fn node_manifest(target: &str) -> &'static [&'static str] {
                 // before the node is built, so `from`/`to` are the map and
                 // `chars().map(...)` is exact (delete and squeeze included).
                 "CharTranslate",
+                // The by-line filters: a stable `sort_by` over the lines
+                // (numeric or lexical key, reverse, `-u`) and a run walk for
+                // `uniq` (`-s` projection, `-c`'s width-7 prefix).
+                "SortLines", "UniqLines",
             ],
         // Zig: the shared Zig arms are TODO for most nodes.
         "zig" => &["StrLen", "Split", "ArrayLen", "StringContains", "StringAffix", "StringTrim"],

@@ -5752,6 +5752,90 @@ impl Render {
                     "{{ let __n: i64 = {c}; if __n <= 0 {{ String::new() }} else {{ {t}.repeat(__n as usize) }} }}"
                 ))
             }
+            "SortLines" => {
+                let x = n.as_any().downcast_ref::<crate::shir_nodes::SortLines>()?;
+                let t = self.expr_str(&x.text);
+                // `key` is "" (whole line) or "<sep><n>" (1-based field N).
+                let field: Option<(char, usize)> = if x.key.is_empty() {
+                    None
+                } else {
+                    let mut ch = x.key.chars();
+                    let sep = ch.next()?;
+                    let n: usize = ch.as_str().parse().ok()?;
+                    if n == 0 {
+                        return None;
+                    }
+                    Some((sep, n))
+                };
+                let key = match field {
+                    None => {
+                        if x.ignore_case {
+                            "__s.to_lowercase()".to_string()
+                        } else {
+                            "__s.clone()".to_string()
+                        }
+                    }
+                    Some((sep, n)) => {
+                        let base = format!(
+                            "__s.split({}).nth({}).unwrap_or(\"\").to_string()",
+                            Self::rust_str(&sep.to_string()),
+                            n - 1
+                        );
+                        if x.ignore_case {
+                            format!("{base}.to_lowercase()")
+                        } else {
+                            base
+                        }
+                    }
+                };
+                let (ka, kb) = if x.reverse { ("__b", "__a") } else { ("__a", "__b") };
+                let cmp = if x.numeric {
+                    format!(
+                        "{{ let (__x, __y) = (__key({ka}).trim().parse::<f64>().unwrap_or(0.0), \
+__key({kb}).trim().parse::<f64>().unwrap_or(0.0)); \
+__x.partial_cmp(&__y).unwrap_or(std::cmp::Ordering::Equal) }}"
+                    )
+                } else {
+                    format!("__key({ka}).cmp(&__key({kb}))")
+                };
+                let uniq = if x.unique {
+                    "let mut __u: Vec<String> = Vec::new(); \
+for __x in __l.drain(..) { if __u.last().map(|__p| __key(__p) != __key(&__x)).unwrap_or(true) { __u.push(__x); } } \
+__l = __u;"
+                } else {
+                    ""
+                };
+                Some(format!(
+                    "{{ let __t: String = {t}; \
+let mut __l: Vec<String> = if __t.is_empty() {{ Vec::new() }} else {{ \
+let mut __v: Vec<String> = __t.split('\\n').map(|__s| __s.to_string()).collect(); \
+if __t.ends_with('\\n') {{ __v.pop(); }} __v }}; \
+let __key = |__s: &String| -> String {{ {key} }}; \
+__l.sort_by(|__a, __b| {cmp}); {uniq} __l.join(\"\\n\") }}"
+                ))
+            }
+            "UniqLines" => {
+                let x = n.as_any().downcast_ref::<crate::shir_nodes::UniqLines>()?;
+                let t = self.expr_str(&x.text);
+                let skip = x.skip.max(0) as usize;
+                let projected = if x.count {
+                    // GNU `uniq -c` pads the run length to width 7.
+                    "format!(\"{:>7} {}\", __j - __i, __l[__i])".to_string()
+                } else {
+                    "__l[__i].clone()".to_string()
+                };
+                Some(format!(
+                    "{{ let __t: String = {t}; \
+let mut __l: Vec<String> = if __t.is_empty() {{ Vec::new() }} else {{ \
+let mut __v: Vec<String> = __t.split('\\n').map(|__s| __s.to_string()).collect(); \
+if __t.ends_with('\\n') {{ __v.pop(); }} __v }}; \
+let __k = |__s: &String| -> String {{ __s.chars().skip({skip}).collect::<String>() }}; \
+let mut __out: Vec<String> = Vec::new(); let mut __i = 0; \
+while __i < __l.len() {{ let mut __j = __i + 1; \
+while __j < __l.len() && __k(&__l[__j]) == __k(&__l[__i]) {{ __j += 1; }} \
+__out.push({projected}); __i = __j; }} __out.join(\"\\n\") }}"
+                ))
+            }
             "CharTranslate" => {
                 let x = n.as_any().downcast_ref::<crate::shir_nodes::CharTranslate>()?;
                 let t = self.expr_str(&x.text);
@@ -24352,6 +24436,7 @@ mod tests {
                 "position(|&__x|",
                 "w=$(echo abc-xyz | tr 'a-c' 'x')\necho \"$w\"\n",
             ),
+
             (
                 "CharTranslateDelete",
                 "filter(|__c|",
@@ -24408,8 +24493,8 @@ mod tests {
     /// against the bash command it models — `head -n`/`tail -n`.
     #[test]
     fn constructed_text_nodes_execute_like_bash() {
-        use crate::shir_nodes::TakeLines;
-        let mut bad: Vec<String> = Vec::new();
+        use crate::shir_nodes::{SortLines, TakeLines, UniqLines};
+        let mut cases: Vec<(String, String, &str)> = Vec::new();
         for (from_end, bash_src) in [
             (false, "printf 'a\\nb\\nc\\n' | head -n 2\n"),
             (true, "printf 'a\\nb\\nc\\n' | tail -n 2\n"),
@@ -24421,7 +24506,66 @@ mod tests {
                 from_end,
                 bytes: false,
             }))));
-            let (rs_out, rs_rc) = compile_and_run(case, &prog);
+            cases.push((case.to_string(), prog, bash_src));
+        }
+        // sort/uniq have no reliable shell-source shape in today's text_ops
+        // (their producers are captures, loops and files, not an `echo`
+        // stage), so the renderer is pinned by CONSTRUCTING the node.
+        let sort = |text: &str, numeric: bool, reverse: bool, unique: bool| {
+            shir_to_rust(&print_program(IrExpr::Ext(Box::new(SortLines {
+                text: s(text),
+                key: String::new(),
+                numeric,
+                reverse,
+                unique,
+                ignore_case: false,
+            }))))
+        };
+        cases.push((
+            "SortLines".to_string(),
+            sort("c\na\nb", false, false, false),
+            "printf 'c\\na\\nb\\n' | sort\n",
+        ));
+        cases.push((
+            "SortLinesNumeric".to_string(),
+            sort("10\n9\n2", true, false, false),
+            "printf '10\\n9\\n2\\n' | sort -n\n",
+        ));
+        cases.push((
+            "SortLinesReverse".to_string(),
+            sort("b\nc\na", false, true, false),
+            "printf 'b\\nc\\na\\n' | sort -r\n",
+        ));
+        cases.push((
+            "SortLinesUnique".to_string(),
+            sort("b\na\nb", false, false, true),
+            "printf 'b\\na\\nb\\n' | sort -u\n",
+        ));
+        let uniq = |text: &str, skip: i64, count: bool| {
+            shir_to_rust(&print_program(IrExpr::Ext(Box::new(UniqLines {
+                text: s(text),
+                skip,
+                count,
+            }))))
+        };
+        cases.push((
+            "UniqLines".to_string(),
+            uniq("a\na\nb", 0, false),
+            "printf 'a\\na\\nb\\n' | uniq\n",
+        ));
+        cases.push((
+            "UniqLinesCount".to_string(),
+            uniq("a\na\nb", 0, true),
+            "printf 'a\\na\\nb\\n' | uniq -c\n",
+        ));
+        cases.push((
+            "UniqLinesSkip".to_string(),
+            uniq("x_a\ny_a\nz_b", 2, false),
+            "printf 'x_a\\ny_a\\nz_b\\n' | uniq -s 2\n",
+        ));
+        let mut bad: Vec<String> = Vec::new();
+        for (case, prog, bash_src) in cases {
+            let (rs_out, rs_rc) = compile_and_run(&case, &prog);
             let (sh_out, sh_rc) = run_bash(bash_src);
             if rs_out != sh_out || rs_rc != sh_rc {
                 bad.push(format!(
