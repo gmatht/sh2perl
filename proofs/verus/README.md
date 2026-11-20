@@ -143,6 +143,40 @@ correctness claims.
 Mutants, measured: naive dedupe **13 verified, 8 errors**; dedupe ignoring the
 op identity **19 verified, 2 errors**; identity pass **17 verified, 4 errors**.
 
+## frontend_capture_fold.rs — the stripping rule, not the walk (18)
+
+`shir_passes/frontend_capture_fold.rs`. A frontend's A1 spells
+`v = $(echo hello)` as `Call{"capture",[Arrow([echo hello])]}` (or
+`Capture{native:false}`), which the shell pipeline would already have folded.
+The pass replaces it with the literal.
+
+- `fold_preserves_value` — the rewrite law: the folded program evaluates to
+  the same bytes, for every expression and every environment.
+- `newline_strip_is_load_bearing` — the bash fact that makes it true:
+  command substitution STRIPS trailing newlines, so `$(echo hello)` is
+  `hello`, not the printed `hello\n`. A fold emitting the printed bytes is a
+  different value (and the mutant is red).
+- `flag_refusal_is_load_bearing` — `echo -n x` prints no newline, so the
+  plain-echo verdict cannot serve it; the pass refuses flagged bodies.
+- `runtime_body_refusal_is_load_bearing` — `$(echo $x)` is runtime: two
+  environments disagree, so no literal can replace the capture.
+- `fold_leaves_no_foldable_capture` and `fold_is_idempotent` — completeness
+  over every value position and fixpoint, which is what keeps an identity
+  pass from satisfying the law.
+
+Pins mirror the source's four tests (`a_constant_echo_capture_folds_to_its_output`,
+`a_variable_word_keeps_the_capture`, `a_real_command_keeps_the_capture`,
+`an_echo_with_a_flag_keeps_the_capture`) plus a nested-capture pin.
+
+Hypotheses in-file: reachability/registration of the pass, the
+`fold_const_echo` verdict itself (modelled as three outcomes rather than
+re-derived), the `echo` stdout model (word + newline; `printf` formats,
+multi-statement bodies, redirects and `&&`/`||` chains are refused by the
+source and outside the model), and corpus domain.
+
+Mutants, measured: identity **15 verified, 3 errors**; fold the printed bytes
+**14 / 4**; fold `-n` bodies **17 / 1**; fold runtime words **15 / 3**.
+
 ## Running it
 
 Verus needs rust toolchain `1.99.1-x86_64-unknown-linux-gnu`
@@ -300,6 +334,40 @@ correctness claims.
 
 Mutants, measured: naive dedupe **13 verified, 8 errors**; dedupe ignoring the
 op identity **19 verified, 2 errors**; identity pass **17 verified, 4 errors**.
+
+## frontend_capture_fold.rs — the stripping rule, not the walk (18)
+
+`shir_passes/frontend_capture_fold.rs`. A frontend's A1 spells
+`v = $(echo hello)` as `Call{"capture",[Arrow([echo hello])]}` (or
+`Capture{native:false}`), which the shell pipeline would already have folded.
+The pass replaces it with the literal.
+
+- `fold_preserves_value` — the rewrite law: the folded program evaluates to
+  the same bytes, for every expression and every environment.
+- `newline_strip_is_load_bearing` — the bash fact that makes it true:
+  command substitution STRIPS trailing newlines, so `$(echo hello)` is
+  `hello`, not the printed `hello\n`. A fold emitting the printed bytes is a
+  different value (and the mutant is red).
+- `flag_refusal_is_load_bearing` — `echo -n x` prints no newline, so the
+  plain-echo verdict cannot serve it; the pass refuses flagged bodies.
+- `runtime_body_refusal_is_load_bearing` — `$(echo $x)` is runtime: two
+  environments disagree, so no literal can replace the capture.
+- `fold_leaves_no_foldable_capture` and `fold_is_idempotent` — completeness
+  over every value position and fixpoint, which is what keeps an identity
+  pass from satisfying the law.
+
+Pins mirror the source's four tests (`a_constant_echo_capture_folds_to_its_output`,
+`a_variable_word_keeps_the_capture`, `a_real_command_keeps_the_capture`,
+`an_echo_with_a_flag_keeps_the_capture`) plus a nested-capture pin.
+
+Hypotheses in-file: reachability/registration of the pass, the
+`fold_const_echo` verdict itself (modelled as three outcomes rather than
+re-derived), the `echo` stdout model (word + newline; `printf` formats,
+multi-statement bodies, redirects and `&&`/`||` chains are refused by the
+source and outside the model), and corpus domain.
+
+Mutants, measured: identity **15 verified, 3 errors**; fold the printed bytes
+**14 / 4**; fold `-n` bodies **17 / 1**; fold runtime words **15 / 3**.
 
 ## Running it
 
@@ -463,6 +531,40 @@ correctness claims.
 
 Mutants, measured: naive dedupe **13 verified, 8 errors**; dedupe ignoring the
 op identity **19 verified, 2 errors**; identity pass **17 verified, 4 errors**.
+
+## frontend_capture_fold.rs — the stripping rule, not the walk (18)
+
+`shir_passes/frontend_capture_fold.rs`. A frontend's A1 spells
+`v = $(echo hello)` as `Call{"capture",[Arrow([echo hello])]}` (or
+`Capture{native:false}`), which the shell pipeline would already have folded.
+The pass replaces it with the literal.
+
+- `fold_preserves_value` — the rewrite law: the folded program evaluates to
+  the same bytes, for every expression and every environment.
+- `newline_strip_is_load_bearing` — the bash fact that makes it true:
+  command substitution STRIPS trailing newlines, so `$(echo hello)` is
+  `hello`, not the printed `hello\n`. A fold emitting the printed bytes is a
+  different value (and the mutant is red).
+- `flag_refusal_is_load_bearing` — `echo -n x` prints no newline, so the
+  plain-echo verdict cannot serve it; the pass refuses flagged bodies.
+- `runtime_body_refusal_is_load_bearing` — `$(echo $x)` is runtime: two
+  environments disagree, so no literal can replace the capture.
+- `fold_leaves_no_foldable_capture` and `fold_is_idempotent` — completeness
+  over every value position and fixpoint, which is what keeps an identity
+  pass from satisfying the law.
+
+Pins mirror the source's four tests (`a_constant_echo_capture_folds_to_its_output`,
+`a_variable_word_keeps_the_capture`, `a_real_command_keeps_the_capture`,
+`an_echo_with_a_flag_keeps_the_capture`) plus a nested-capture pin.
+
+Hypotheses in-file: reachability/registration of the pass, the
+`fold_const_echo` verdict itself (modelled as three outcomes rather than
+re-derived), the `echo` stdout model (word + newline; `printf` formats,
+multi-statement bodies, redirects and `&&`/`||` chains are refused by the
+source and outside the model), and corpus domain.
+
+Mutants, measured: identity **15 verified, 3 errors**; fold the printed bytes
+**14 / 4**; fold `-n` bodies **17 / 1**; fold runtime words **15 / 3**.
 
 ## Running it
 
@@ -640,6 +742,40 @@ correctness claims.
 Mutants, measured: naive dedupe **13 verified, 8 errors**; dedupe ignoring the
 op identity **19 verified, 2 errors**; identity pass **17 verified, 4 errors**.
 
+## frontend_capture_fold.rs — the stripping rule, not the walk (18)
+
+`shir_passes/frontend_capture_fold.rs`. A frontend's A1 spells
+`v = $(echo hello)` as `Call{"capture",[Arrow([echo hello])]}` (or
+`Capture{native:false}`), which the shell pipeline would already have folded.
+The pass replaces it with the literal.
+
+- `fold_preserves_value` — the rewrite law: the folded program evaluates to
+  the same bytes, for every expression and every environment.
+- `newline_strip_is_load_bearing` — the bash fact that makes it true:
+  command substitution STRIPS trailing newlines, so `$(echo hello)` is
+  `hello`, not the printed `hello\n`. A fold emitting the printed bytes is a
+  different value (and the mutant is red).
+- `flag_refusal_is_load_bearing` — `echo -n x` prints no newline, so the
+  plain-echo verdict cannot serve it; the pass refuses flagged bodies.
+- `runtime_body_refusal_is_load_bearing` — `$(echo $x)` is runtime: two
+  environments disagree, so no literal can replace the capture.
+- `fold_leaves_no_foldable_capture` and `fold_is_idempotent` — completeness
+  over every value position and fixpoint, which is what keeps an identity
+  pass from satisfying the law.
+
+Pins mirror the source's four tests (`a_constant_echo_capture_folds_to_its_output`,
+`a_variable_word_keeps_the_capture`, `a_real_command_keeps_the_capture`,
+`an_echo_with_a_flag_keeps_the_capture`) plus a nested-capture pin.
+
+Hypotheses in-file: reachability/registration of the pass, the
+`fold_const_echo` verdict itself (modelled as three outcomes rather than
+re-derived), the `echo` stdout model (word + newline; `printf` formats,
+multi-statement bodies, redirects and `&&`/`||` chains are refused by the
+source and outside the model), and corpus domain.
+
+Mutants, measured: identity **15 verified, 3 errors**; fold the printed bytes
+**14 / 4**; fold `-n` bodies **17 / 1**; fold runtime words **15 / 3**.
+
 ## Running it
 
 Same toolchain as above:
@@ -796,6 +932,40 @@ correctness claims.
 
 Mutants, measured: naive dedupe **13 verified, 8 errors**; dedupe ignoring the
 op identity **19 verified, 2 errors**; identity pass **17 verified, 4 errors**.
+
+## frontend_capture_fold.rs — the stripping rule, not the walk (18)
+
+`shir_passes/frontend_capture_fold.rs`. A frontend's A1 spells
+`v = $(echo hello)` as `Call{"capture",[Arrow([echo hello])]}` (or
+`Capture{native:false}`), which the shell pipeline would already have folded.
+The pass replaces it with the literal.
+
+- `fold_preserves_value` — the rewrite law: the folded program evaluates to
+  the same bytes, for every expression and every environment.
+- `newline_strip_is_load_bearing` — the bash fact that makes it true:
+  command substitution STRIPS trailing newlines, so `$(echo hello)` is
+  `hello`, not the printed `hello\n`. A fold emitting the printed bytes is a
+  different value (and the mutant is red).
+- `flag_refusal_is_load_bearing` — `echo -n x` prints no newline, so the
+  plain-echo verdict cannot serve it; the pass refuses flagged bodies.
+- `runtime_body_refusal_is_load_bearing` — `$(echo $x)` is runtime: two
+  environments disagree, so no literal can replace the capture.
+- `fold_leaves_no_foldable_capture` and `fold_is_idempotent` — completeness
+  over every value position and fixpoint, which is what keeps an identity
+  pass from satisfying the law.
+
+Pins mirror the source's four tests (`a_constant_echo_capture_folds_to_its_output`,
+`a_variable_word_keeps_the_capture`, `a_real_command_keeps_the_capture`,
+`an_echo_with_a_flag_keeps_the_capture`) plus a nested-capture pin.
+
+Hypotheses in-file: reachability/registration of the pass, the
+`fold_const_echo` verdict itself (modelled as three outcomes rather than
+re-derived), the `echo` stdout model (word + newline; `printf` formats,
+multi-statement bodies, redirects and `&&`/`||` chains are refused by the
+source and outside the model), and corpus domain.
+
+Mutants, measured: identity **15 verified, 3 errors**; fold the printed bytes
+**14 / 4**; fold `-n` bodies **17 / 1**; fold runtime words **15 / 3**.
 
 ## Running it
 
@@ -961,6 +1131,40 @@ correctness claims.
 Mutants, measured: naive dedupe **13 verified, 8 errors**; dedupe ignoring the
 op identity **19 verified, 2 errors**; identity pass **17 verified, 4 errors**.
 
+## frontend_capture_fold.rs — the stripping rule, not the walk (18)
+
+`shir_passes/frontend_capture_fold.rs`. A frontend's A1 spells
+`v = $(echo hello)` as `Call{"capture",[Arrow([echo hello])]}` (or
+`Capture{native:false}`), which the shell pipeline would already have folded.
+The pass replaces it with the literal.
+
+- `fold_preserves_value` — the rewrite law: the folded program evaluates to
+  the same bytes, for every expression and every environment.
+- `newline_strip_is_load_bearing` — the bash fact that makes it true:
+  command substitution STRIPS trailing newlines, so `$(echo hello)` is
+  `hello`, not the printed `hello\n`. A fold emitting the printed bytes is a
+  different value (and the mutant is red).
+- `flag_refusal_is_load_bearing` — `echo -n x` prints no newline, so the
+  plain-echo verdict cannot serve it; the pass refuses flagged bodies.
+- `runtime_body_refusal_is_load_bearing` — `$(echo $x)` is runtime: two
+  environments disagree, so no literal can replace the capture.
+- `fold_leaves_no_foldable_capture` and `fold_is_idempotent` — completeness
+  over every value position and fixpoint, which is what keeps an identity
+  pass from satisfying the law.
+
+Pins mirror the source's four tests (`a_constant_echo_capture_folds_to_its_output`,
+`a_variable_word_keeps_the_capture`, `a_real_command_keeps_the_capture`,
+`an_echo_with_a_flag_keeps_the_capture`) plus a nested-capture pin.
+
+Hypotheses in-file: reachability/registration of the pass, the
+`fold_const_echo` verdict itself (modelled as three outcomes rather than
+re-derived), the `echo` stdout model (word + newline; `printf` formats,
+multi-statement bodies, redirects and `&&`/`||` chains are refused by the
+source and outside the model), and corpus domain.
+
+Mutants, measured: identity **15 verified, 3 errors**; fold the printed bytes
+**14 / 4**; fold `-n` bodies **17 / 1**; fold runtime words **15 / 3**.
+
 ## Running it
 
 Same toolchain as above:
@@ -1115,6 +1319,40 @@ correctness claims.
 Mutants, measured: naive dedupe **13 verified, 8 errors**; dedupe ignoring the
 op identity **19 verified, 2 errors**; identity pass **17 verified, 4 errors**.
 
+## frontend_capture_fold.rs — the stripping rule, not the walk (18)
+
+`shir_passes/frontend_capture_fold.rs`. A frontend's A1 spells
+`v = $(echo hello)` as `Call{"capture",[Arrow([echo hello])]}` (or
+`Capture{native:false}`), which the shell pipeline would already have folded.
+The pass replaces it with the literal.
+
+- `fold_preserves_value` — the rewrite law: the folded program evaluates to
+  the same bytes, for every expression and every environment.
+- `newline_strip_is_load_bearing` — the bash fact that makes it true:
+  command substitution STRIPS trailing newlines, so `$(echo hello)` is
+  `hello`, not the printed `hello\n`. A fold emitting the printed bytes is a
+  different value (and the mutant is red).
+- `flag_refusal_is_load_bearing` — `echo -n x` prints no newline, so the
+  plain-echo verdict cannot serve it; the pass refuses flagged bodies.
+- `runtime_body_refusal_is_load_bearing` — `$(echo $x)` is runtime: two
+  environments disagree, so no literal can replace the capture.
+- `fold_leaves_no_foldable_capture` and `fold_is_idempotent` — completeness
+  over every value position and fixpoint, which is what keeps an identity
+  pass from satisfying the law.
+
+Pins mirror the source's four tests (`a_constant_echo_capture_folds_to_its_output`,
+`a_variable_word_keeps_the_capture`, `a_real_command_keeps_the_capture`,
+`an_echo_with_a_flag_keeps_the_capture`) plus a nested-capture pin.
+
+Hypotheses in-file: reachability/registration of the pass, the
+`fold_const_echo` verdict itself (modelled as three outcomes rather than
+re-derived), the `echo` stdout model (word + newline; `printf` formats,
+multi-statement bodies, redirects and `&&`/`||` chains are refused by the
+source and outside the model), and corpus domain.
+
+Mutants, measured: identity **15 verified, 3 errors**; fold the printed bytes
+**14 / 4**; fold `-n` bodies **17 / 1**; fold runtime words **15 / 3**.
+
 ## Running it
 
 Same toolchain as above:
@@ -1250,6 +1488,40 @@ correctness claims.
 
 Mutants, measured: naive dedupe **13 verified, 8 errors**; dedupe ignoring the
 op identity **19 verified, 2 errors**; identity pass **17 verified, 4 errors**.
+
+## frontend_capture_fold.rs — the stripping rule, not the walk (18)
+
+`shir_passes/frontend_capture_fold.rs`. A frontend's A1 spells
+`v = $(echo hello)` as `Call{"capture",[Arrow([echo hello])]}` (or
+`Capture{native:false}`), which the shell pipeline would already have folded.
+The pass replaces it with the literal.
+
+- `fold_preserves_value` — the rewrite law: the folded program evaluates to
+  the same bytes, for every expression and every environment.
+- `newline_strip_is_load_bearing` — the bash fact that makes it true:
+  command substitution STRIPS trailing newlines, so `$(echo hello)` is
+  `hello`, not the printed `hello\n`. A fold emitting the printed bytes is a
+  different value (and the mutant is red).
+- `flag_refusal_is_load_bearing` — `echo -n x` prints no newline, so the
+  plain-echo verdict cannot serve it; the pass refuses flagged bodies.
+- `runtime_body_refusal_is_load_bearing` — `$(echo $x)` is runtime: two
+  environments disagree, so no literal can replace the capture.
+- `fold_leaves_no_foldable_capture` and `fold_is_idempotent` — completeness
+  over every value position and fixpoint, which is what keeps an identity
+  pass from satisfying the law.
+
+Pins mirror the source's four tests (`a_constant_echo_capture_folds_to_its_output`,
+`a_variable_word_keeps_the_capture`, `a_real_command_keeps_the_capture`,
+`an_echo_with_a_flag_keeps_the_capture`) plus a nested-capture pin.
+
+Hypotheses in-file: reachability/registration of the pass, the
+`fold_const_echo` verdict itself (modelled as three outcomes rather than
+re-derived), the `echo` stdout model (word + newline; `printf` formats,
+multi-statement bodies, redirects and `&&`/`||` chains are refused by the
+source and outside the model), and corpus domain.
+
+Mutants, measured: identity **15 verified, 3 errors**; fold the printed bytes
+**14 / 4**; fold `-n` bodies **17 / 1**; fold runtime words **15 / 3**.
 
 ## Running it
 
@@ -1511,6 +1783,40 @@ correctness claims.
 Mutants, measured: naive dedupe **13 verified, 8 errors**; dedupe ignoring the
 op identity **19 verified, 2 errors**; identity pass **17 verified, 4 errors**.
 
+## frontend_capture_fold.rs — the stripping rule, not the walk (18)
+
+`shir_passes/frontend_capture_fold.rs`. A frontend's A1 spells
+`v = $(echo hello)` as `Call{"capture",[Arrow([echo hello])]}` (or
+`Capture{native:false}`), which the shell pipeline would already have folded.
+The pass replaces it with the literal.
+
+- `fold_preserves_value` — the rewrite law: the folded program evaluates to
+  the same bytes, for every expression and every environment.
+- `newline_strip_is_load_bearing` — the bash fact that makes it true:
+  command substitution STRIPS trailing newlines, so `$(echo hello)` is
+  `hello`, not the printed `hello\n`. A fold emitting the printed bytes is a
+  different value (and the mutant is red).
+- `flag_refusal_is_load_bearing` — `echo -n x` prints no newline, so the
+  plain-echo verdict cannot serve it; the pass refuses flagged bodies.
+- `runtime_body_refusal_is_load_bearing` — `$(echo $x)` is runtime: two
+  environments disagree, so no literal can replace the capture.
+- `fold_leaves_no_foldable_capture` and `fold_is_idempotent` — completeness
+  over every value position and fixpoint, which is what keeps an identity
+  pass from satisfying the law.
+
+Pins mirror the source's four tests (`a_constant_echo_capture_folds_to_its_output`,
+`a_variable_word_keeps_the_capture`, `a_real_command_keeps_the_capture`,
+`an_echo_with_a_flag_keeps_the_capture`) plus a nested-capture pin.
+
+Hypotheses in-file: reachability/registration of the pass, the
+`fold_const_echo` verdict itself (modelled as three outcomes rather than
+re-derived), the `echo` stdout model (word + newline; `printf` formats,
+multi-statement bodies, redirects and `&&`/`||` chains are refused by the
+source and outside the model), and corpus domain.
+
+Mutants, measured: identity **15 verified, 3 errors**; fold the printed bytes
+**14 / 4**; fold `-n` bodies **17 / 1**; fold runtime words **15 / 3**.
+
 ## Running it (all six P6 files)
 
 Same toolchain as above, `--rlimit 40` each:
@@ -1651,6 +1957,40 @@ correctness claims.
 Mutants, measured: naive dedupe **13 verified, 8 errors**; dedupe ignoring the
 op identity **19 verified, 2 errors**; identity pass **17 verified, 4 errors**.
 
+## frontend_capture_fold.rs — the stripping rule, not the walk (18)
+
+`shir_passes/frontend_capture_fold.rs`. A frontend's A1 spells
+`v = $(echo hello)` as `Call{"capture",[Arrow([echo hello])]}` (or
+`Capture{native:false}`), which the shell pipeline would already have folded.
+The pass replaces it with the literal.
+
+- `fold_preserves_value` — the rewrite law: the folded program evaluates to
+  the same bytes, for every expression and every environment.
+- `newline_strip_is_load_bearing` — the bash fact that makes it true:
+  command substitution STRIPS trailing newlines, so `$(echo hello)` is
+  `hello`, not the printed `hello\n`. A fold emitting the printed bytes is a
+  different value (and the mutant is red).
+- `flag_refusal_is_load_bearing` — `echo -n x` prints no newline, so the
+  plain-echo verdict cannot serve it; the pass refuses flagged bodies.
+- `runtime_body_refusal_is_load_bearing` — `$(echo $x)` is runtime: two
+  environments disagree, so no literal can replace the capture.
+- `fold_leaves_no_foldable_capture` and `fold_is_idempotent` — completeness
+  over every value position and fixpoint, which is what keeps an identity
+  pass from satisfying the law.
+
+Pins mirror the source's four tests (`a_constant_echo_capture_folds_to_its_output`,
+`a_variable_word_keeps_the_capture`, `a_real_command_keeps_the_capture`,
+`an_echo_with_a_flag_keeps_the_capture`) plus a nested-capture pin.
+
+Hypotheses in-file: reachability/registration of the pass, the
+`fold_const_echo` verdict itself (modelled as three outcomes rather than
+re-derived), the `echo` stdout model (word + newline; `printf` formats,
+multi-statement bodies, redirects and `&&`/`||` chains are refused by the
+source and outside the model), and corpus domain.
+
+Mutants, measured: identity **15 verified, 3 errors**; fold the printed bytes
+**14 / 4**; fold `-n` bodies **17 / 1**; fold runtime words **15 / 3**.
+
 ## Running it
 
 Same toolchain as the P6 files (`--rlimit 40`).
@@ -1784,6 +2124,40 @@ correctness claims.
 
 Mutants, measured: naive dedupe **13 verified, 8 errors**; dedupe ignoring the
 op identity **19 verified, 2 errors**; identity pass **17 verified, 4 errors**.
+
+## frontend_capture_fold.rs — the stripping rule, not the walk (18)
+
+`shir_passes/frontend_capture_fold.rs`. A frontend's A1 spells
+`v = $(echo hello)` as `Call{"capture",[Arrow([echo hello])]}` (or
+`Capture{native:false}`), which the shell pipeline would already have folded.
+The pass replaces it with the literal.
+
+- `fold_preserves_value` — the rewrite law: the folded program evaluates to
+  the same bytes, for every expression and every environment.
+- `newline_strip_is_load_bearing` — the bash fact that makes it true:
+  command substitution STRIPS trailing newlines, so `$(echo hello)` is
+  `hello`, not the printed `hello\n`. A fold emitting the printed bytes is a
+  different value (and the mutant is red).
+- `flag_refusal_is_load_bearing` — `echo -n x` prints no newline, so the
+  plain-echo verdict cannot serve it; the pass refuses flagged bodies.
+- `runtime_body_refusal_is_load_bearing` — `$(echo $x)` is runtime: two
+  environments disagree, so no literal can replace the capture.
+- `fold_leaves_no_foldable_capture` and `fold_is_idempotent` — completeness
+  over every value position and fixpoint, which is what keeps an identity
+  pass from satisfying the law.
+
+Pins mirror the source's four tests (`a_constant_echo_capture_folds_to_its_output`,
+`a_variable_word_keeps_the_capture`, `a_real_command_keeps_the_capture`,
+`an_echo_with_a_flag_keeps_the_capture`) plus a nested-capture pin.
+
+Hypotheses in-file: reachability/registration of the pass, the
+`fold_const_echo` verdict itself (modelled as three outcomes rather than
+re-derived), the `echo` stdout model (word + newline; `printf` formats,
+multi-statement bodies, redirects and `&&`/`||` chains are refused by the
+source and outside the model), and corpus domain.
+
+Mutants, measured: identity **15 verified, 3 errors**; fold the printed bytes
+**14 / 4**; fold `-n` bodies **17 / 1**; fold runtime words **15 / 3**.
 
 ## Running it
 
@@ -1960,6 +2334,40 @@ correctness claims.
 Mutants, measured: naive dedupe **13 verified, 8 errors**; dedupe ignoring the
 op identity **19 verified, 2 errors**; identity pass **17 verified, 4 errors**.
 
+## frontend_capture_fold.rs — the stripping rule, not the walk (18)
+
+`shir_passes/frontend_capture_fold.rs`. A frontend's A1 spells
+`v = $(echo hello)` as `Call{"capture",[Arrow([echo hello])]}` (or
+`Capture{native:false}`), which the shell pipeline would already have folded.
+The pass replaces it with the literal.
+
+- `fold_preserves_value` — the rewrite law: the folded program evaluates to
+  the same bytes, for every expression and every environment.
+- `newline_strip_is_load_bearing` — the bash fact that makes it true:
+  command substitution STRIPS trailing newlines, so `$(echo hello)` is
+  `hello`, not the printed `hello\n`. A fold emitting the printed bytes is a
+  different value (and the mutant is red).
+- `flag_refusal_is_load_bearing` — `echo -n x` prints no newline, so the
+  plain-echo verdict cannot serve it; the pass refuses flagged bodies.
+- `runtime_body_refusal_is_load_bearing` — `$(echo $x)` is runtime: two
+  environments disagree, so no literal can replace the capture.
+- `fold_leaves_no_foldable_capture` and `fold_is_idempotent` — completeness
+  over every value position and fixpoint, which is what keeps an identity
+  pass from satisfying the law.
+
+Pins mirror the source's four tests (`a_constant_echo_capture_folds_to_its_output`,
+`a_variable_word_keeps_the_capture`, `a_real_command_keeps_the_capture`,
+`an_echo_with_a_flag_keeps_the_capture`) plus a nested-capture pin.
+
+Hypotheses in-file: reachability/registration of the pass, the
+`fold_const_echo` verdict itself (modelled as three outcomes rather than
+re-derived), the `echo` stdout model (word + newline; `printf` formats,
+multi-statement bodies, redirects and `&&`/`||` chains are refused by the
+source and outside the model), and corpus domain.
+
+Mutants, measured: identity **15 verified, 3 errors**; fold the printed bytes
+**14 / 4**; fold `-n` bodies **17 / 1**; fold runtime words **15 / 3**.
+
 ## Running it
 
 Same toolchain as above (`--rlimit 80` for the shadow-induction
@@ -2116,6 +2524,40 @@ correctness claims.
 
 Mutants, measured: naive dedupe **13 verified, 8 errors**; dedupe ignoring the
 op identity **19 verified, 2 errors**; identity pass **17 verified, 4 errors**.
+
+## frontend_capture_fold.rs — the stripping rule, not the walk (18)
+
+`shir_passes/frontend_capture_fold.rs`. A frontend's A1 spells
+`v = $(echo hello)` as `Call{"capture",[Arrow([echo hello])]}` (or
+`Capture{native:false}`), which the shell pipeline would already have folded.
+The pass replaces it with the literal.
+
+- `fold_preserves_value` — the rewrite law: the folded program evaluates to
+  the same bytes, for every expression and every environment.
+- `newline_strip_is_load_bearing` — the bash fact that makes it true:
+  command substitution STRIPS trailing newlines, so `$(echo hello)` is
+  `hello`, not the printed `hello\n`. A fold emitting the printed bytes is a
+  different value (and the mutant is red).
+- `flag_refusal_is_load_bearing` — `echo -n x` prints no newline, so the
+  plain-echo verdict cannot serve it; the pass refuses flagged bodies.
+- `runtime_body_refusal_is_load_bearing` — `$(echo $x)` is runtime: two
+  environments disagree, so no literal can replace the capture.
+- `fold_leaves_no_foldable_capture` and `fold_is_idempotent` — completeness
+  over every value position and fixpoint, which is what keeps an identity
+  pass from satisfying the law.
+
+Pins mirror the source's four tests (`a_constant_echo_capture_folds_to_its_output`,
+`a_variable_word_keeps_the_capture`, `a_real_command_keeps_the_capture`,
+`an_echo_with_a_flag_keeps_the_capture`) plus a nested-capture pin.
+
+Hypotheses in-file: reachability/registration of the pass, the
+`fold_const_echo` verdict itself (modelled as three outcomes rather than
+re-derived), the `echo` stdout model (word + newline; `printf` formats,
+multi-statement bodies, redirects and `&&`/`||` chains are refused by the
+source and outside the model), and corpus domain.
+
+Mutants, measured: identity **15 verified, 3 errors**; fold the printed bytes
+**14 / 4**; fold `-n` bodies **17 / 1**; fold runtime words **15 / 3**.
 
 ## Running it
 
@@ -2278,6 +2720,40 @@ correctness claims.
 Mutants, measured: naive dedupe **13 verified, 8 errors**; dedupe ignoring the
 op identity **19 verified, 2 errors**; identity pass **17 verified, 4 errors**.
 
+## frontend_capture_fold.rs — the stripping rule, not the walk (18)
+
+`shir_passes/frontend_capture_fold.rs`. A frontend's A1 spells
+`v = $(echo hello)` as `Call{"capture",[Arrow([echo hello])]}` (or
+`Capture{native:false}`), which the shell pipeline would already have folded.
+The pass replaces it with the literal.
+
+- `fold_preserves_value` — the rewrite law: the folded program evaluates to
+  the same bytes, for every expression and every environment.
+- `newline_strip_is_load_bearing` — the bash fact that makes it true:
+  command substitution STRIPS trailing newlines, so `$(echo hello)` is
+  `hello`, not the printed `hello\n`. A fold emitting the printed bytes is a
+  different value (and the mutant is red).
+- `flag_refusal_is_load_bearing` — `echo -n x` prints no newline, so the
+  plain-echo verdict cannot serve it; the pass refuses flagged bodies.
+- `runtime_body_refusal_is_load_bearing` — `$(echo $x)` is runtime: two
+  environments disagree, so no literal can replace the capture.
+- `fold_leaves_no_foldable_capture` and `fold_is_idempotent` — completeness
+  over every value position and fixpoint, which is what keeps an identity
+  pass from satisfying the law.
+
+Pins mirror the source's four tests (`a_constant_echo_capture_folds_to_its_output`,
+`a_variable_word_keeps_the_capture`, `a_real_command_keeps_the_capture`,
+`an_echo_with_a_flag_keeps_the_capture`) plus a nested-capture pin.
+
+Hypotheses in-file: reachability/registration of the pass, the
+`fold_const_echo` verdict itself (modelled as three outcomes rather than
+re-derived), the `echo` stdout model (word + newline; `printf` formats,
+multi-statement bodies, redirects and `&&`/`||` chains are refused by the
+source and outside the model), and corpus domain.
+
+Mutants, measured: identity **15 verified, 3 errors**; fold the printed bytes
+**14 / 4**; fold `-n` bodies **17 / 1**; fold runtime words **15 / 3**.
+
 ## Running it
 
 Same toolchain as above (`--rlimit 60` for the fuel/size induction):
@@ -2439,6 +2915,40 @@ correctness claims.
 Mutants, measured: naive dedupe **13 verified, 8 errors**; dedupe ignoring the
 op identity **19 verified, 2 errors**; identity pass **17 verified, 4 errors**.
 
+## frontend_capture_fold.rs — the stripping rule, not the walk (18)
+
+`shir_passes/frontend_capture_fold.rs`. A frontend's A1 spells
+`v = $(echo hello)` as `Call{"capture",[Arrow([echo hello])]}` (or
+`Capture{native:false}`), which the shell pipeline would already have folded.
+The pass replaces it with the literal.
+
+- `fold_preserves_value` — the rewrite law: the folded program evaluates to
+  the same bytes, for every expression and every environment.
+- `newline_strip_is_load_bearing` — the bash fact that makes it true:
+  command substitution STRIPS trailing newlines, so `$(echo hello)` is
+  `hello`, not the printed `hello\n`. A fold emitting the printed bytes is a
+  different value (and the mutant is red).
+- `flag_refusal_is_load_bearing` — `echo -n x` prints no newline, so the
+  plain-echo verdict cannot serve it; the pass refuses flagged bodies.
+- `runtime_body_refusal_is_load_bearing` — `$(echo $x)` is runtime: two
+  environments disagree, so no literal can replace the capture.
+- `fold_leaves_no_foldable_capture` and `fold_is_idempotent` — completeness
+  over every value position and fixpoint, which is what keeps an identity
+  pass from satisfying the law.
+
+Pins mirror the source's four tests (`a_constant_echo_capture_folds_to_its_output`,
+`a_variable_word_keeps_the_capture`, `a_real_command_keeps_the_capture`,
+`an_echo_with_a_flag_keeps_the_capture`) plus a nested-capture pin.
+
+Hypotheses in-file: reachability/registration of the pass, the
+`fold_const_echo` verdict itself (modelled as three outcomes rather than
+re-derived), the `echo` stdout model (word + newline; `printf` formats,
+multi-statement bodies, redirects and `&&`/`||` chains are refused by the
+source and outside the model), and corpus domain.
+
+Mutants, measured: identity **15 verified, 3 errors**; fold the printed bytes
+**14 / 4**; fold `-n` bodies **17 / 1**; fold runtime words **15 / 3**.
+
 ## Running it
 
 Same toolchain as the P6/P7/P8 files (`--rlimit 40`):
@@ -2581,6 +3091,40 @@ correctness claims.
 
 Mutants, measured: naive dedupe **13 verified, 8 errors**; dedupe ignoring the
 op identity **19 verified, 2 errors**; identity pass **17 verified, 4 errors**.
+
+## frontend_capture_fold.rs — the stripping rule, not the walk (18)
+
+`shir_passes/frontend_capture_fold.rs`. A frontend's A1 spells
+`v = $(echo hello)` as `Call{"capture",[Arrow([echo hello])]}` (or
+`Capture{native:false}`), which the shell pipeline would already have folded.
+The pass replaces it with the literal.
+
+- `fold_preserves_value` — the rewrite law: the folded program evaluates to
+  the same bytes, for every expression and every environment.
+- `newline_strip_is_load_bearing` — the bash fact that makes it true:
+  command substitution STRIPS trailing newlines, so `$(echo hello)` is
+  `hello`, not the printed `hello\n`. A fold emitting the printed bytes is a
+  different value (and the mutant is red).
+- `flag_refusal_is_load_bearing` — `echo -n x` prints no newline, so the
+  plain-echo verdict cannot serve it; the pass refuses flagged bodies.
+- `runtime_body_refusal_is_load_bearing` — `$(echo $x)` is runtime: two
+  environments disagree, so no literal can replace the capture.
+- `fold_leaves_no_foldable_capture` and `fold_is_idempotent` — completeness
+  over every value position and fixpoint, which is what keeps an identity
+  pass from satisfying the law.
+
+Pins mirror the source's four tests (`a_constant_echo_capture_folds_to_its_output`,
+`a_variable_word_keeps_the_capture`, `a_real_command_keeps_the_capture`,
+`an_echo_with_a_flag_keeps_the_capture`) plus a nested-capture pin.
+
+Hypotheses in-file: reachability/registration of the pass, the
+`fold_const_echo` verdict itself (modelled as three outcomes rather than
+re-derived), the `echo` stdout model (word + newline; `printf` formats,
+multi-statement bodies, redirects and `&&`/`||` chains are refused by the
+source and outside the model), and corpus domain.
+
+Mutants, measured: identity **15 verified, 3 errors**; fold the printed bytes
+**14 / 4**; fold `-n` bodies **17 / 1**; fold runtime words **15 / 3**.
 
 ## Running it
 
@@ -2729,6 +3273,40 @@ correctness claims.
 Mutants, measured: naive dedupe **13 verified, 8 errors**; dedupe ignoring the
 op identity **19 verified, 2 errors**; identity pass **17 verified, 4 errors**.
 
+## frontend_capture_fold.rs — the stripping rule, not the walk (18)
+
+`shir_passes/frontend_capture_fold.rs`. A frontend's A1 spells
+`v = $(echo hello)` as `Call{"capture",[Arrow([echo hello])]}` (or
+`Capture{native:false}`), which the shell pipeline would already have folded.
+The pass replaces it with the literal.
+
+- `fold_preserves_value` — the rewrite law: the folded program evaluates to
+  the same bytes, for every expression and every environment.
+- `newline_strip_is_load_bearing` — the bash fact that makes it true:
+  command substitution STRIPS trailing newlines, so `$(echo hello)` is
+  `hello`, not the printed `hello\n`. A fold emitting the printed bytes is a
+  different value (and the mutant is red).
+- `flag_refusal_is_load_bearing` — `echo -n x` prints no newline, so the
+  plain-echo verdict cannot serve it; the pass refuses flagged bodies.
+- `runtime_body_refusal_is_load_bearing` — `$(echo $x)` is runtime: two
+  environments disagree, so no literal can replace the capture.
+- `fold_leaves_no_foldable_capture` and `fold_is_idempotent` — completeness
+  over every value position and fixpoint, which is what keeps an identity
+  pass from satisfying the law.
+
+Pins mirror the source's four tests (`a_constant_echo_capture_folds_to_its_output`,
+`a_variable_word_keeps_the_capture`, `a_real_command_keeps_the_capture`,
+`an_echo_with_a_flag_keeps_the_capture`) plus a nested-capture pin.
+
+Hypotheses in-file: reachability/registration of the pass, the
+`fold_const_echo` verdict itself (modelled as three outcomes rather than
+re-derived), the `echo` stdout model (word + newline; `printf` formats,
+multi-statement bodies, redirects and `&&`/`||` chains are refused by the
+source and outside the model), and corpus domain.
+
+Mutants, measured: identity **15 verified, 3 errors**; fold the printed bytes
+**14 / 4**; fold `-n` bodies **17 / 1**; fold runtime words **15 / 3**.
+
 ## Running it
 
 Same toolchain as the P6/P7/P8 files (`--rlimit 40`).
@@ -2866,6 +3444,40 @@ correctness claims.
 
 Mutants, measured: naive dedupe **13 verified, 8 errors**; dedupe ignoring the
 op identity **19 verified, 2 errors**; identity pass **17 verified, 4 errors**.
+
+## frontend_capture_fold.rs — the stripping rule, not the walk (18)
+
+`shir_passes/frontend_capture_fold.rs`. A frontend's A1 spells
+`v = $(echo hello)` as `Call{"capture",[Arrow([echo hello])]}` (or
+`Capture{native:false}`), which the shell pipeline would already have folded.
+The pass replaces it with the literal.
+
+- `fold_preserves_value` — the rewrite law: the folded program evaluates to
+  the same bytes, for every expression and every environment.
+- `newline_strip_is_load_bearing` — the bash fact that makes it true:
+  command substitution STRIPS trailing newlines, so `$(echo hello)` is
+  `hello`, not the printed `hello\n`. A fold emitting the printed bytes is a
+  different value (and the mutant is red).
+- `flag_refusal_is_load_bearing` — `echo -n x` prints no newline, so the
+  plain-echo verdict cannot serve it; the pass refuses flagged bodies.
+- `runtime_body_refusal_is_load_bearing` — `$(echo $x)` is runtime: two
+  environments disagree, so no literal can replace the capture.
+- `fold_leaves_no_foldable_capture` and `fold_is_idempotent` — completeness
+  over every value position and fixpoint, which is what keeps an identity
+  pass from satisfying the law.
+
+Pins mirror the source's four tests (`a_constant_echo_capture_folds_to_its_output`,
+`a_variable_word_keeps_the_capture`, `a_real_command_keeps_the_capture`,
+`an_echo_with_a_flag_keeps_the_capture`) plus a nested-capture pin.
+
+Hypotheses in-file: reachability/registration of the pass, the
+`fold_const_echo` verdict itself (modelled as three outcomes rather than
+re-derived), the `echo` stdout model (word + newline; `printf` formats,
+multi-statement bodies, redirects and `&&`/`||` chains are refused by the
+source and outside the model), and corpus domain.
+
+Mutants, measured: identity **15 verified, 3 errors**; fold the printed bytes
+**14 / 4**; fold `-n` bodies **17 / 1**; fold runtime words **15 / 3**.
 
 ## Running it
 
@@ -3008,6 +3620,40 @@ correctness claims.
 Mutants, measured: naive dedupe **13 verified, 8 errors**; dedupe ignoring the
 op identity **19 verified, 2 errors**; identity pass **17 verified, 4 errors**.
 
+## frontend_capture_fold.rs — the stripping rule, not the walk (18)
+
+`shir_passes/frontend_capture_fold.rs`. A frontend's A1 spells
+`v = $(echo hello)` as `Call{"capture",[Arrow([echo hello])]}` (or
+`Capture{native:false}`), which the shell pipeline would already have folded.
+The pass replaces it with the literal.
+
+- `fold_preserves_value` — the rewrite law: the folded program evaluates to
+  the same bytes, for every expression and every environment.
+- `newline_strip_is_load_bearing` — the bash fact that makes it true:
+  command substitution STRIPS trailing newlines, so `$(echo hello)` is
+  `hello`, not the printed `hello\n`. A fold emitting the printed bytes is a
+  different value (and the mutant is red).
+- `flag_refusal_is_load_bearing` — `echo -n x` prints no newline, so the
+  plain-echo verdict cannot serve it; the pass refuses flagged bodies.
+- `runtime_body_refusal_is_load_bearing` — `$(echo $x)` is runtime: two
+  environments disagree, so no literal can replace the capture.
+- `fold_leaves_no_foldable_capture` and `fold_is_idempotent` — completeness
+  over every value position and fixpoint, which is what keeps an identity
+  pass from satisfying the law.
+
+Pins mirror the source's four tests (`a_constant_echo_capture_folds_to_its_output`,
+`a_variable_word_keeps_the_capture`, `a_real_command_keeps_the_capture`,
+`an_echo_with_a_flag_keeps_the_capture`) plus a nested-capture pin.
+
+Hypotheses in-file: reachability/registration of the pass, the
+`fold_const_echo` verdict itself (modelled as three outcomes rather than
+re-derived), the `echo` stdout model (word + newline; `printf` formats,
+multi-statement bodies, redirects and `&&`/`||` chains are refused by the
+source and outside the model), and corpus domain.
+
+Mutants, measured: identity **15 verified, 3 errors**; fold the printed bytes
+**14 / 4**; fold `-n` bodies **17 / 1**; fold runtime words **15 / 3**.
+
 ## Running it
 
 Same toolchain as the P6/P7/P8 files (`--rlimit 40`).
@@ -3149,6 +3795,40 @@ correctness claims.
 
 Mutants, measured: naive dedupe **13 verified, 8 errors**; dedupe ignoring the
 op identity **19 verified, 2 errors**; identity pass **17 verified, 4 errors**.
+
+## frontend_capture_fold.rs — the stripping rule, not the walk (18)
+
+`shir_passes/frontend_capture_fold.rs`. A frontend's A1 spells
+`v = $(echo hello)` as `Call{"capture",[Arrow([echo hello])]}` (or
+`Capture{native:false}`), which the shell pipeline would already have folded.
+The pass replaces it with the literal.
+
+- `fold_preserves_value` — the rewrite law: the folded program evaluates to
+  the same bytes, for every expression and every environment.
+- `newline_strip_is_load_bearing` — the bash fact that makes it true:
+  command substitution STRIPS trailing newlines, so `$(echo hello)` is
+  `hello`, not the printed `hello\n`. A fold emitting the printed bytes is a
+  different value (and the mutant is red).
+- `flag_refusal_is_load_bearing` — `echo -n x` prints no newline, so the
+  plain-echo verdict cannot serve it; the pass refuses flagged bodies.
+- `runtime_body_refusal_is_load_bearing` — `$(echo $x)` is runtime: two
+  environments disagree, so no literal can replace the capture.
+- `fold_leaves_no_foldable_capture` and `fold_is_idempotent` — completeness
+  over every value position and fixpoint, which is what keeps an identity
+  pass from satisfying the law.
+
+Pins mirror the source's four tests (`a_constant_echo_capture_folds_to_its_output`,
+`a_variable_word_keeps_the_capture`, `a_real_command_keeps_the_capture`,
+`an_echo_with_a_flag_keeps_the_capture`) plus a nested-capture pin.
+
+Hypotheses in-file: reachability/registration of the pass, the
+`fold_const_echo` verdict itself (modelled as three outcomes rather than
+re-derived), the `echo` stdout model (word + newline; `printf` formats,
+multi-statement bodies, redirects and `&&`/`||` chains are refused by the
+source and outside the model), and corpus domain.
+
+Mutants, measured: identity **15 verified, 3 errors**; fold the printed bytes
+**14 / 4**; fold `-n` bodies **17 / 1**; fold runtime words **15 / 3**.
 
 ## Running it
 
@@ -3460,6 +4140,40 @@ correctness claims.
 
 Mutants, measured: naive dedupe **13 verified, 8 errors**; dedupe ignoring the
 op identity **19 verified, 2 errors**; identity pass **17 verified, 4 errors**.
+
+## frontend_capture_fold.rs — the stripping rule, not the walk (18)
+
+`shir_passes/frontend_capture_fold.rs`. A frontend's A1 spells
+`v = $(echo hello)` as `Call{"capture",[Arrow([echo hello])]}` (or
+`Capture{native:false}`), which the shell pipeline would already have folded.
+The pass replaces it with the literal.
+
+- `fold_preserves_value` — the rewrite law: the folded program evaluates to
+  the same bytes, for every expression and every environment.
+- `newline_strip_is_load_bearing` — the bash fact that makes it true:
+  command substitution STRIPS trailing newlines, so `$(echo hello)` is
+  `hello`, not the printed `hello\n`. A fold emitting the printed bytes is a
+  different value (and the mutant is red).
+- `flag_refusal_is_load_bearing` — `echo -n x` prints no newline, so the
+  plain-echo verdict cannot serve it; the pass refuses flagged bodies.
+- `runtime_body_refusal_is_load_bearing` — `$(echo $x)` is runtime: two
+  environments disagree, so no literal can replace the capture.
+- `fold_leaves_no_foldable_capture` and `fold_is_idempotent` — completeness
+  over every value position and fixpoint, which is what keeps an identity
+  pass from satisfying the law.
+
+Pins mirror the source's four tests (`a_constant_echo_capture_folds_to_its_output`,
+`a_variable_word_keeps_the_capture`, `a_real_command_keeps_the_capture`,
+`an_echo_with_a_flag_keeps_the_capture`) plus a nested-capture pin.
+
+Hypotheses in-file: reachability/registration of the pass, the
+`fold_const_echo` verdict itself (modelled as three outcomes rather than
+re-derived), the `echo` stdout model (word + newline; `printf` formats,
+multi-statement bodies, redirects and `&&`/`||` chains are refused by the
+source and outside the model), and corpus domain.
+
+Mutants, measured: identity **15 verified, 3 errors**; fold the printed bytes
+**14 / 4**; fold `-n` bodies **17 / 1**; fold runtime words **15 / 3**.
 
 ## Running it
 
@@ -3824,6 +4538,40 @@ correctness claims.
 Mutants, measured: naive dedupe **13 verified, 8 errors**; dedupe ignoring the
 op identity **19 verified, 2 errors**; identity pass **17 verified, 4 errors**.
 
+## frontend_capture_fold.rs — the stripping rule, not the walk (18)
+
+`shir_passes/frontend_capture_fold.rs`. A frontend's A1 spells
+`v = $(echo hello)` as `Call{"capture",[Arrow([echo hello])]}` (or
+`Capture{native:false}`), which the shell pipeline would already have folded.
+The pass replaces it with the literal.
+
+- `fold_preserves_value` — the rewrite law: the folded program evaluates to
+  the same bytes, for every expression and every environment.
+- `newline_strip_is_load_bearing` — the bash fact that makes it true:
+  command substitution STRIPS trailing newlines, so `$(echo hello)` is
+  `hello`, not the printed `hello\n`. A fold emitting the printed bytes is a
+  different value (and the mutant is red).
+- `flag_refusal_is_load_bearing` — `echo -n x` prints no newline, so the
+  plain-echo verdict cannot serve it; the pass refuses flagged bodies.
+- `runtime_body_refusal_is_load_bearing` — `$(echo $x)` is runtime: two
+  environments disagree, so no literal can replace the capture.
+- `fold_leaves_no_foldable_capture` and `fold_is_idempotent` — completeness
+  over every value position and fixpoint, which is what keeps an identity
+  pass from satisfying the law.
+
+Pins mirror the source's four tests (`a_constant_echo_capture_folds_to_its_output`,
+`a_variable_word_keeps_the_capture`, `a_real_command_keeps_the_capture`,
+`an_echo_with_a_flag_keeps_the_capture`) plus a nested-capture pin.
+
+Hypotheses in-file: reachability/registration of the pass, the
+`fold_const_echo` verdict itself (modelled as three outcomes rather than
+re-derived), the `echo` stdout model (word + newline; `printf` formats,
+multi-statement bodies, redirects and `&&`/`||` chains are refused by the
+source and outside the model), and corpus domain.
+
+Mutants, measured: identity **15 verified, 3 errors**; fold the printed bytes
+**14 / 4**; fold `-n` bodies **17 / 1**; fold runtime words **15 / 3**.
+
 ## Running it
 
 Same toolchain as above (`--rlimit 40`).
@@ -4124,6 +4872,40 @@ correctness claims.
 Mutants, measured: naive dedupe **13 verified, 8 errors**; dedupe ignoring the
 op identity **19 verified, 2 errors**; identity pass **17 verified, 4 errors**.
 
+## frontend_capture_fold.rs — the stripping rule, not the walk (18)
+
+`shir_passes/frontend_capture_fold.rs`. A frontend's A1 spells
+`v = $(echo hello)` as `Call{"capture",[Arrow([echo hello])]}` (or
+`Capture{native:false}`), which the shell pipeline would already have folded.
+The pass replaces it with the literal.
+
+- `fold_preserves_value` — the rewrite law: the folded program evaluates to
+  the same bytes, for every expression and every environment.
+- `newline_strip_is_load_bearing` — the bash fact that makes it true:
+  command substitution STRIPS trailing newlines, so `$(echo hello)` is
+  `hello`, not the printed `hello\n`. A fold emitting the printed bytes is a
+  different value (and the mutant is red).
+- `flag_refusal_is_load_bearing` — `echo -n x` prints no newline, so the
+  plain-echo verdict cannot serve it; the pass refuses flagged bodies.
+- `runtime_body_refusal_is_load_bearing` — `$(echo $x)` is runtime: two
+  environments disagree, so no literal can replace the capture.
+- `fold_leaves_no_foldable_capture` and `fold_is_idempotent` — completeness
+  over every value position and fixpoint, which is what keeps an identity
+  pass from satisfying the law.
+
+Pins mirror the source's four tests (`a_constant_echo_capture_folds_to_its_output`,
+`a_variable_word_keeps_the_capture`, `a_real_command_keeps_the_capture`,
+`an_echo_with_a_flag_keeps_the_capture`) plus a nested-capture pin.
+
+Hypotheses in-file: reachability/registration of the pass, the
+`fold_const_echo` verdict itself (modelled as three outcomes rather than
+re-derived), the `echo` stdout model (word + newline; `printf` formats,
+multi-statement bodies, redirects and `&&`/`||` chains are refused by the
+source and outside the model), and corpus domain.
+
+Mutants, measured: identity **15 verified, 3 errors**; fold the printed bytes
+**14 / 4**; fold `-n` bodies **17 / 1**; fold runtime words **15 / 3**.
+
 ## Running it
 
 Same toolchain as above (`--rlimit 40`).
@@ -4410,6 +5192,40 @@ correctness claims.
 
 Mutants, measured: naive dedupe **13 verified, 8 errors**; dedupe ignoring the
 op identity **19 verified, 2 errors**; identity pass **17 verified, 4 errors**.
+
+## frontend_capture_fold.rs — the stripping rule, not the walk (18)
+
+`shir_passes/frontend_capture_fold.rs`. A frontend's A1 spells
+`v = $(echo hello)` as `Call{"capture",[Arrow([echo hello])]}` (or
+`Capture{native:false}`), which the shell pipeline would already have folded.
+The pass replaces it with the literal.
+
+- `fold_preserves_value` — the rewrite law: the folded program evaluates to
+  the same bytes, for every expression and every environment.
+- `newline_strip_is_load_bearing` — the bash fact that makes it true:
+  command substitution STRIPS trailing newlines, so `$(echo hello)` is
+  `hello`, not the printed `hello\n`. A fold emitting the printed bytes is a
+  different value (and the mutant is red).
+- `flag_refusal_is_load_bearing` — `echo -n x` prints no newline, so the
+  plain-echo verdict cannot serve it; the pass refuses flagged bodies.
+- `runtime_body_refusal_is_load_bearing` — `$(echo $x)` is runtime: two
+  environments disagree, so no literal can replace the capture.
+- `fold_leaves_no_foldable_capture` and `fold_is_idempotent` — completeness
+  over every value position and fixpoint, which is what keeps an identity
+  pass from satisfying the law.
+
+Pins mirror the source's four tests (`a_constant_echo_capture_folds_to_its_output`,
+`a_variable_word_keeps_the_capture`, `a_real_command_keeps_the_capture`,
+`an_echo_with_a_flag_keeps_the_capture`) plus a nested-capture pin.
+
+Hypotheses in-file: reachability/registration of the pass, the
+`fold_const_echo` verdict itself (modelled as three outcomes rather than
+re-derived), the `echo` stdout model (word + newline; `printf` formats,
+multi-statement bodies, redirects and `&&`/`||` chains are refused by the
+source and outside the model), and corpus domain.
+
+Mutants, measured: identity **15 verified, 3 errors**; fold the printed bytes
+**14 / 4**; fold `-n` bodies **17 / 1**; fold runtime words **15 / 3**.
 
 ## Running it
 
