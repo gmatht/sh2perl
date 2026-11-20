@@ -1683,8 +1683,8 @@ local step at each depth.
 
 ## definedor_hoist.rs — one evaluation for `${a:-b}` (9)
 
-`shir_passes/definedor_hoist.rs` (the FIRST model of a `shir_passes/` pass
-that is not also a `transforms/` module). `x = ${a:-b}` arrives as
+`shir_passes/definedor_hoist.rs` (a `shir_passes/` transform, not a
+`transforms/` module — the shIR passes had 13 of 26 modelled before this). `x = ${a:-b}` arrives as
 `Assign(x, DefinedOr { expr: a, default: b })`, and a renderer with no
 `DefinedOr` case emits the subject twice — once for the test, once for the
 value — so `$(cmd)` or `$((i++))` runs twice. The pass binds it first:
@@ -1843,8 +1843,8 @@ local step at each depth.
 
 ## definedor_hoist.rs — one evaluation for `${a:-b}` (9)
 
-`shir_passes/definedor_hoist.rs` (the FIRST model of a `shir_passes/` pass
-that is not also a `transforms/` module). `x = ${a:-b}` arrives as
+`shir_passes/definedor_hoist.rs` (a `shir_passes/` transform, not a
+`transforms/` module — the shIR passes had 13 of 26 modelled before this). `x = ${a:-b}` arrives as
 `Assign(x, DefinedOr { expr: a, default: b })`, and a renderer with no
 `DefinedOr` case emits the subject twice — once for the test, once for the
 value — so `$(cmd)` or `$((i++))` runs twice. The pass binds it first:
@@ -1990,8 +1990,8 @@ local step at each depth.
 
 ## definedor_hoist.rs — one evaluation for `${a:-b}` (9)
 
-`shir_passes/definedor_hoist.rs` (the FIRST model of a `shir_passes/` pass
-that is not also a `transforms/` module). `x = ${a:-b}` arrives as
+`shir_passes/definedor_hoist.rs` (a `shir_passes/` transform, not a
+`transforms/` module — the shIR passes had 13 of 26 modelled before this). `x = ${a:-b}` arrives as
 `Assign(x, DefinedOr { expr: a, default: b })`, and a renderer with no
 `DefinedOr` case emits the subject twice — once for the test, once for the
 value — so `$(cmd)` or `$((i++))` runs twice. The pass binds it first:
