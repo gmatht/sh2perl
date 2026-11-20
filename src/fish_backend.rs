@@ -10925,12 +10925,12 @@ mod tests {
     fn foreach_line_renders_a_native_read_loop() {
         let mk = |limit: Option<Box<IrExpr>>| crate::shir_nodes::ForEachLine {
             source: IrExpr::Str("f.txt".to_string(), StrStyle::DoubleQuoted),
-            var: "__cl1".to_string(),
+            var: "__cat_line1".to_string(),
             body: vec![IrStmt::Expr(IrExpr::Call {
                 func: "exec".to_string(),
                 args: vec![
                     IrExpr::Str("echo".to_string(), StrStyle::DoubleQuoted),
-                    IrExpr::Array(vec![IrExpr::Var("__cl1".to_string(), None)]),
+                    IrExpr::Array(vec![IrExpr::Var("__cat_line1".to_string(), None)]),
                 ],
             })],
             limit,
@@ -10939,7 +10939,7 @@ mod tests {
         let out = ext_node_to_fish(&mk(None))
             .unwrap()
             .expect("ForEachLine has a lowering");
-        assert!(out.starts_with("while read -l __cl1;"), "native read loop: {out}");
+        assert!(out.starts_with("while read -l __cat_line1;"), "native read loop: {out}");
         assert!(out.ends_with("end < f.txt"), "the path is READ, by redirect: {out}");
         assert!(
             !out.contains("f.txt | while"),
@@ -10950,7 +10950,7 @@ mod tests {
             .unwrap()
             .expect("ForEachLine has a lowering");
         assert!(
-            lim.starts_with("head -n 3 f.txt | while read -l __cl1;"),
+            lim.starts_with("head -n 3 f.txt | while read -l __cat_line1;"),
             "a limit is `head -n N` in the pipeline (streaming early exit): {lim}"
         );
         assert!(lim.ends_with("; end"), "the loop must still be closed: {lim}");

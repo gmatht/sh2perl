@@ -1422,7 +1422,7 @@ fn inline_simple_helpers(
         inline_print_words(&mut out);
     }
 
-    // Simplify `if { let __b = EXPR;  __b }` → `if EXPR`
+    // Simplify `if { let __sh_buf = EXPR;  __sh_buf }` → `if EXPR`
     // This wrapper is left behind by `rc_strip` after it removes the
     // `__SH_RC.store(...)` tail from conditionally-rendered expressions.
     out = simplify_let_b(out);
@@ -2099,8 +2099,8 @@ fn collapse_print_format(text: &mut String) {
         // owned copy for the CALLEE, not for Display (regression caught by
         // `stored_params_stay_owned` before this guard).
         //
-        // Bracket depth must ALSO be zero: `println!("{}", { let __a:
-        // Vec<String> = vec!["a".to_string(), "b".to_string()]; __a })` —
+        // Bracket depth must ALSO be zero: `println!("{}", { let __sh_operand:
+        // Vec<String> = vec!["a".to_string(), "b".to_string()]; __sh_operand })` —
         // the words-expr shape the native print path now exposes — has
         // comma-separated literals at paren depth 1 that are NOT macro
         // arguments; stripping them turns the Vec's elements into `&str`
@@ -2176,21 +2176,21 @@ fn collapse_print_format(text: &mut String) {
     }
 }
 
-/// Simplify `if { let __b = EXPR;  __b }` → `if EXPR` (and the `let _ =`
+/// Simplify `if { let __sh_buf = EXPR;  __sh_buf }` → `if EXPR` (and the `let _ =`
 /// variant).  After `rc_strip` removes the `__SH_RC.store(...)` tail from
 /// the renderer's status-wrapper, this pattern remains:
 ///
-///   `{ let __b = EXPR;  __b }`  (note: `rc_strip` leaves `;  __b }`
+///   `{ let __sh_buf = EXPR;  __sh_buf }`  (note: `rc_strip` leaves `;  __sh_buf }`
 ///                                — a `;` + the second `]` was *not* a
 ///                                thing; see the actual text below)
 ///
-/// This pass finds `{ let __b = `, scans with bracket-depth tracking
+/// This pass finds `{ let __sh_buf = `, scans with bracket-depth tracking
 /// (respecting string literals) to the matching `}`, verifies that the
-/// text just inside the `}` is `;  __b ` (or `; __b ` or a newline-
+/// text just inside the `}` is `;  __sh_buf ` (or `; __sh_buf ` or a newline-
 /// separated variant), and replaces the whole wrapper with the bare
 /// expression.
 fn simplify_let_b(mut text: String) -> String {
-    let prefix = "{ let __b = ";
+    let prefix = "{ let __sh_buf = ";
     let mut search_from = 0usize;
     loop {
         let at = match text[search_from..].find(prefix) {
@@ -2238,7 +2238,7 @@ fn simplify_let_b(mut text: String) -> String {
         };
         // Extract and validate the inner text before mutating.
         let inner = text[start..close].trim_end();
-        let stripped = match inner.strip_suffix("__b") {
+        let stripped = match inner.strip_suffix("__sh_buf") {
             Some(s) => s,
             None => {
                 // Not the wrapper shape — skip THIS occurrence and keep going
@@ -2261,21 +2261,21 @@ fn simplify_let_b(mut text: String) -> String {
         }
         // If the status store survived inside EXPR, the wrapper must
         // stay: the store sequences a LIVE `__SH_RC` write (statement
-        // position — `let _ = { let __b = …; STORE; __b };` exists
+        // position — `let _ = { let __sh_buf = …; STORE; __sh_buf };` exists
         // exactly to record the status), and stripping the binding
-        // would orphan its `__b` reference (a hard E0425) or, worse,
+        // would orphan its `__sh_buf` reference (a hard E0425) or, worse,
         // silently drop a status `$?` later reads. `rc_strip` already
         // removes the store wherever the register is unreachable, so a
         // surviving store is load-bearing by construction. Bail on
         // this occurrence (missed opt, never miscompile).
-        if expr.contains("__SH_RC.store(if __b") {
+        if expr.contains("__SH_RC.store(if __sh_buf") {
             search_from = at + prefix.len();
             continue;
         }
         // The binding is dead after this replacement, so a surviving
-        // bare `__b` reference anywhere else in EXPR would be orphaned
+        // bare `__sh_buf` reference anywhere else in EXPR would be orphaned
         // (same E0425 class) — bail then too.
-        if has_word(&expr, "__b") {
+        if has_word(&expr, "__sh_buf") {
             search_from = at + prefix.len();
             continue;
         }
@@ -2286,7 +2286,7 @@ fn simplify_let_b(mut text: String) -> String {
     text
 }
 
-/// Word-bounded `needle` search (`__b` must not match `__backup`).
+/// Word-bounded `needle` search (`__sh_buf` must not match `__backup`).
 fn has_word(hay: &str, needle: &str) -> bool {
     let mut rest = hay;
     while let Some(k) = rest.find(needle) {
@@ -2655,10 +2655,10 @@ fn golf_rust(text: &str) -> String {
     }
     names.sort_by(|a, b| b.len().cmp(&a.len()));
     // The pool must skip shorts already present in the source:
-    // renderer locals (`__s`, `__w`, `__a`, …) already spell short
+    // renderer locals (`__sh_str`, `__sh_word`, `__sh_operand`, …) already spell short
     // `__`-names, and minting the same short for a helper would merge
     // two distinct bindings (t86: `__sh_fn_all_factors` vs local
-    // `__a` both becoming `__p`).
+    // `__sh_operand` both becoming `__sh_part`).
     let taken: std::collections::HashSet<String> = names.iter().cloned().collect();
     let mut lo_n = 0usize;
     let mut hi_n = 0usize;
@@ -2669,7 +2669,7 @@ fn golf_rust(text: &str) -> String {
             let s = if lo_n < 26 {
                 format!("__{}", (b'a' + lo_n as u8) as char)
             } else {
-                format!("__a{}", lo_n - 26)
+                format!("__sh_operand{}", lo_n - 26)
             };
             lo_n += 1;
             if !taken.contains(&s) && minted.insert(s.clone()) {
@@ -3482,7 +3482,7 @@ impl Render {
                 }
                 // When the store was the ONLY content on its line, the
                 // removal leaves an empty line — a blank in the middle of a
-                // multi-line emit (`while { let __f = …; <store>; __any }`,
+                // multi-line emit (`while { let __sh_field = …; <store>; __sh_gotline }`,
                 // the py read-loop). Swallow the trailing newline too, but
                 // never a leading one: the line we are on must not merge
                 // with the line before it.
@@ -3599,7 +3599,7 @@ impl Render {
     /// Strip a redundant paren pair from a `let NAME = (EXPR);` initializer.
     ///
     /// Every template that interpolates a rendered value can end up with
-    /// `let __k = (i + 1);` — the value's OWN precedence parens, which a
+    /// `let __sh_key = (i + 1);` — the value's OWN precedence parens, which a
     /// `let` (which takes any expression) never needs; rustc calls it
     /// "unnecessary parentheses around assigned value". Doing it at the one
     /// choke point every statement passes through covers every template
@@ -3942,14 +3942,14 @@ impl Render {
     /// Strip one fully-enclosing matched `( … )` pair (safe in any
     /// function-argument or `if`/`while`-condition position, where the
     /// expression is delimited by the surrounding syntax).
-    /// Strip the `{ let __b = EXPR; __SH_RC.store(...); __b }` status
+    /// Strip the `{ let __sh_buf = EXPR; __SH_RC.store(...); __sh_buf }` status
     /// wrapper when the value is used as a BOOLEAN CONDITION: an
     /// `if`/`while`/`else if` resets `__SH_RC` itself, so the wrapper's
     /// store is dead and the expression reduces to `EXPR`.
     fn unwrap_cond(s: &str) -> String {
         // Strip EVERY status wrapper at this condition's top level, not just
         // a whole-condition one: in `A && B` each operand is wrapped
-        // separately (`{ let __b = A; store; __b } && { let __b = B; … }`),
+        // separately (`{ let __sh_buf = A; store; __sh_buf } && { let __sh_buf = B; … }`),
         // and both stores are dead because the `if` resets __SH_RC itself.
         // The parts are the top-level `&&`/`||` operands; each may carry its
         // own wrapper. A single part with no operator is just the whole
@@ -3976,7 +3976,7 @@ impl Render {
                     }
                 }
                 // no wrapper here: a parenthesised group may still hold one
-                // (`(x || { let __b = q; … })`), and `&&`/`||` inside a
+                // (`(x || { let __sh_buf = q; … })`), and `&&`/`||` inside a
                 // group are not top-level, so recurse when the whole piece
                 // is one balanced group
                 None => {
@@ -4000,17 +4000,17 @@ impl Render {
         if any { out } else { s.to_string() }
     }
 
-    /// Peel ONE leading `{ let __b = EXPR; __SH_RC.store(if __b { 0 } else
-    /// { 1 }, …); __b }` wrapper off `s`, returning `(EXPR, remainder)`.
+    /// Peel ONE leading `{ let __sh_buf = EXPR; __SH_RC.store(if __sh_buf { 0 } else
+    /// { 1 }, …); __sh_buf }` wrapper off `s`, returning `(EXPR, remainder)`.
     fn strip_one_wrapper(s: &str) -> Option<(String, &str)> {
         let t = s.trim_start();
-        let rest = t.strip_prefix("{ let __b = ")?;
+        let rest = t.strip_prefix("{ let __sh_buf = ")?;
         let marker = "; __SH_RC.store(";
         let (expr, after) = rest.split_once(marker)?;
-        // the store must be the `if __b { 0 } else { 1 }` status write …
-        let tail = after.strip_prefix("if __b { 0 } else { 1 }, Ordering::Relaxed); ")?;
+        // the store must be the `if __sh_buf { 0 } else { 1 }` status write …
+        let tail = after.strip_prefix("if __sh_buf { 0 } else { 1 }, Ordering::Relaxed); ")?;
         // … and the block must close right there
-        let rem = tail.strip_prefix("__b }")?;
+        let rem = tail.strip_prefix("__sh_buf }")?;
         Some((Self::unparen(expr.trim()).to_string(), rem))
     }
 
@@ -4823,7 +4823,7 @@ impl Render {
         // would otherwise deadlock the non-reentrant mutex).
         if var == "PIPESTATUS" {
             return format!(
-                "{{ let __p = __SH_PIPESTATUS.lock().unwrap(); __p.get({key} as usize).cloned().unwrap_or(0).to_string() }}"
+                "{{ let __sh_part = __SH_PIPESTATUS.lock().unwrap(); __sh_part.get({key} as usize).cloned().unwrap_or(0).to_string() }}"
             );
         }
         // LOCAL ARRAY: a fixed-size Rust array indexed in place. CPython
@@ -4935,16 +4935,16 @@ impl Render {
         if matches!(crate::shir::source_lang().as_deref(), Some("py")) {
             return if usize_key {
                 format!(
-                    "{{ let __k = {key} as usize; let __n = {m}.with(|v| v.borrow().len()); \
-                       if __k >= __n {{ std::process::exit(1); }} \
-                       {m}.with(|v| v.borrow()[__k].clone()) }}"
+                    "{{ let __sh_key = {key} as usize; let __sh_num = {m}.with(|v| v.borrow().len()); \
+                       if __sh_key >= __sh_num {{ std::process::exit(1); }} \
+                       {m}.with(|v| v.borrow()[__sh_key].clone()) }}"
                 )
             } else {
                 format!(
-                    "{{ let __k = {key}; let __n = {m}.with(|v| v.borrow().len()) as i64; \
-                       let __idx = if __k < 0 {{ __n + __k }} else {{ __k }}; \
-                       if __idx < 0 || __idx >= __n {{ std::process::exit(1); }} \
-                       {m}.with(|v| v.borrow()[__idx as usize].clone()) }}"
+                    "{{ let __sh_key = {key}; let __sh_num = {m}.with(|v| v.borrow().len()) as i64; \
+                       let __sh_pos = if __sh_key < 0 {{ __sh_num + __sh_key }} else {{ __sh_key }}; \
+                       if __sh_pos < 0 || __sh_pos >= __sh_num {{ std::process::exit(1); }} \
+                       {m}.with(|v| v.borrow()[__sh_pos as usize].clone()) }}"
                 )
             };
         }
@@ -4952,16 +4952,16 @@ impl Render {
             // key proven non-negative: no i64 temp, no negative-wrap, no
             // `as usize` cast at the index site.
             format!(
-                "{{ let __k = {key} as usize; \
-                   {m}.with(|v| v.borrow().get(__k).cloned().unwrap_or_default()) }}"
+                "{{ let __sh_key = {key} as usize; \
+                   {m}.with(|v| v.borrow().get(__sh_key).cloned().unwrap_or_default()) }}"
             )
         } else {
             // key is i64 expr (may be negative); len from Vec. In-range →
             // element, anything else → String::new() (bash empty).
             format!(
-                "{{ let __k = {key}; let __n = {m}.with(|v| v.borrow().len()) as i64; \
-                   let __idx = if __k < 0 {{ __n + __k }} else {{ __k }}; \
-                   if __idx >= 0 && __idx < __n {{ {m}.with(|v| v.borrow()[__idx as usize].clone()) }} else {{ String::new() }} }}"
+                "{{ let __sh_key = {key}; let __sh_num = {m}.with(|v| v.borrow().len()) as i64; \
+                   let __sh_pos = if __sh_key < 0 {{ __sh_num + __sh_key }} else {{ __sh_key }}; \
+                   if __sh_pos >= 0 && __sh_pos < __sh_num {{ {m}.with(|v| v.borrow()[__sh_pos as usize].clone()) }} else {{ String::new() }} }}"
             )
         }
     }
@@ -4996,16 +4996,16 @@ impl Render {
             // prior output standing (t95/t96: the lenient 0 printed a line
             // python never prints). Shell keeps the lenient arm below.
             return format!(
-                "{{ let __k = {key}; let __n = {m}.with(|v| v.borrow().len()) as i64; \
-                   let __idx = if __k < 0 {{ __n + __k }} else {{ __k }}; \
-                   if __idx < 0 || __idx >= __n {{ std::process::exit(1); }} \
-                   {m}.with(|v| v.borrow()[__idx as usize]) }}"
+                "{{ let __sh_key = {key}; let __sh_num = {m}.with(|v| v.borrow().len()) as i64; \
+                   let __sh_pos = if __sh_key < 0 {{ __sh_num + __sh_key }} else {{ __sh_key }}; \
+                   if __sh_pos < 0 || __sh_pos >= __sh_num {{ std::process::exit(1); }} \
+                   {m}.with(|v| v.borrow()[__sh_pos as usize]) }}"
             );
         }
         format!(
-            "{{ let __k = {key}; let __n = {m}.with(|v| v.borrow().len()) as i64; \
-               let __idx = if __k < 0 {{ __n + __k }} else {{ __k }}; \
-               if __idx >= 0 && __idx < __n {{ {m}.with(|v| v.borrow()[__idx as usize]) }} else {{ 0 }} }}"
+            "{{ let __sh_key = {key}; let __sh_num = {m}.with(|v| v.borrow().len()) as i64; \
+               let __sh_pos = if __sh_key < 0 {{ __sh_num + __sh_key }} else {{ __sh_key }}; \
+               if __sh_pos >= 0 && __sh_pos < __sh_num {{ {m}.with(|v| v.borrow()[__sh_pos as usize]) }} else {{ 0 }} }}"
         )
     }
 
@@ -5015,7 +5015,7 @@ impl Render {
             // guard must be scoped (two reads in one expression would
             // otherwise deadlock the non-reentrant mutex)
             return format!(
-                "{{ let __p = __SH_PIPESTATUS.lock().unwrap(); __p.get({key} as usize).cloned().unwrap_or(0).to_string() }}"
+                "{{ let __sh_part = __SH_PIPESTATUS.lock().unwrap(); __sh_part.get({key} as usize).cloned().unwrap_or(0).to_string() }}"
             );
         }
         // LOCAL ARRAY: a fixed-size Rust array (`let a = [..]` in this
@@ -5039,10 +5039,10 @@ impl Render {
                 }
             }
             return format!(
-                "{{ let __k = {key}; let __n = {n}; \
-                   let __i = if __k < 0 {{ __n + __k }} else {{ __k }}; \
-                   if __i < 0 || __i >= __n {{ std::process::exit(1); }} \
-                   {m}[__i as usize]{sel} }}",
+                "{{ let __sh_key = {key}; let __sh_num = {n}; \
+                   let __sh_begin = if __sh_key < 0 {{ __sh_num + __sh_key }} else {{ __sh_key }}; \
+                   if __sh_begin < 0 || __sh_begin >= __sh_num {{ std::process::exit(1); }} \
+                   {m}[__sh_begin as usize]{sel} }}",
                 sel = if int_home { "" } else { ".clone()" }
             );
         }
@@ -5088,13 +5088,13 @@ impl Render {
         let m = self.tls(name);
         if self.is_int_array(name) {
             return format!(
-                "{{ let __val = ({val}).trim().parse::<i64>().unwrap_or(0); {m}.with(|v| {{ let mut b = v.borrow_mut(); let i = {key} as usize; \
-                 if b.len() <= i {{ b.resize(i + 1, 0); }} b[i] = __val; }}); }}"
+                "{{ let __sh_piece = ({val}).trim().parse::<i64>().unwrap_or(0); {m}.with(|v| {{ let mut b = v.borrow_mut(); let i = {key} as usize; \
+                 if b.len() <= i {{ b.resize(i + 1, 0); }} b[i] = __sh_piece; }}); }}"
             );
         }
         format!(
-            "{{ let __val = {val}; {m}.with(|v| {{ let mut b = v.borrow_mut(); let i = {key} as usize; \
-             if b.len() <= i {{ b.resize(i + 1, String::new()); }} b[i] = __val; }}); }}"
+            "{{ let __sh_piece = {val}; {m}.with(|v| {{ let mut b = v.borrow_mut(); let i = {key} as usize; \
+             if b.len() <= i {{ b.resize(i + 1, String::new()); }} b[i] = __sh_piece; }}); }}"
         )
     }
 
@@ -5246,8 +5246,8 @@ impl Render {
                     // template of its own — so `{{`/`}}` were emitted
                     // verbatim and rustc reported the doubled block
                     // ("unnecessary braces around block return value", 4
-                    // corpus sites: `*v.borrow_mut() = {{ let __p = … }}`).
-                    "{ let __p = __SH_BGPID.load(Ordering::Relaxed); if __p == 0 { String::new() } else { __p.to_string() } }".to_string()
+                    // corpus sites: `*v.borrow_mut() = {{ let __sh_part = … }}`).
+                    "{ let __sh_part = __SH_BGPID.load(Ordering::Relaxed); if __sh_part == 0 { String::new() } else { __sh_part.to_string() } }".to_string()
                 }
                 "RANDOM" => {
                     self.add_helper("rand");
@@ -5497,19 +5497,19 @@ impl Render {
                         // parse (t92 `max(xs)` over a literal int list)
                         if self.is_int_array(name) {
                             if func == "sum" {
-                                return format!("{{ let __vv = {m}.with(|v| v.borrow().clone()); __vv.iter().copied().sum::<i64>() }}");
+                                return format!("{{ let __sh_vec = {m}.with(|v| v.borrow().clone()); __sh_vec.iter().copied().sum::<i64>() }}");
                             } else if func == "max" {
-                                return format!("{{ let __vv = {m}.with(|v| v.borrow().clone()); __vv.iter().copied().max().unwrap_or(0) }}");
+                                return format!("{{ let __sh_vec = {m}.with(|v| v.borrow().clone()); __sh_vec.iter().copied().max().unwrap_or(0) }}");
                             } else {
-                                return format!("{{ let __vv = {m}.with(|v| v.borrow().clone()); __vv.iter().copied().min().unwrap_or(0) }}");
+                                return format!("{{ let __sh_vec = {m}.with(|v| v.borrow().clone()); __sh_vec.iter().copied().min().unwrap_or(0) }}");
                             }
                         }
                         if func == "sum" {
-                            format!("{{ let __vv = {m}.with(|v| v.borrow().clone()); __vv.iter().map(|s| s.trim().parse::<i64>().unwrap_or(0)).sum::<i64>() }}")
+                            format!("{{ let __sh_vec = {m}.with(|v| v.borrow().clone()); __sh_vec.iter().map(|s| s.trim().parse::<i64>().unwrap_or(0)).sum::<i64>() }}")
                         } else if func == "max" {
-                            format!("{{ let __vv = {m}.with(|v| v.borrow().clone()); __vv.iter().map(|s| s.trim().parse::<i64>().unwrap_or(0)).max().unwrap_or(0) }}")
+                            format!("{{ let __sh_vec = {m}.with(|v| v.borrow().clone()); __sh_vec.iter().map(|s| s.trim().parse::<i64>().unwrap_or(0)).max().unwrap_or(0) }}")
                         } else {
-                            format!("{{ let __vv = {m}.with(|v| v.borrow().clone()); __vv.iter().map(|s| s.trim().parse::<i64>().unwrap_or(0)).min().unwrap_or(0) }}")
+                            format!("{{ let __sh_vec = {m}.with(|v| v.borrow().clone()); __sh_vec.iter().map(|s| s.trim().parse::<i64>().unwrap_or(0)).min().unwrap_or(0) }}")
                         }
                     }
                     None => "0".to_string(),
@@ -5743,12 +5743,12 @@ impl Render {
                 let t = self.expr_str(&x.text);
                 let c = self.expr_num(&x.count);
                 let tail = if x.from_end {
-                    "let __s = __k.saturating_sub(__n as usize); __l[__s..].join(\"\\n\")"
+                    "let __sh_str = __sh_key.saturating_sub(__sh_num as usize); __sh_span[__sh_str..].join(\"\\n\")"
                 } else {
-                    "let __e = (__n as usize).min(__k); __l[..__e].join(\"\\n\")"
+                    "let __sh_item = (__sh_num as usize).min(__sh_key); __sh_span[..__sh_item].join(\"\\n\")"
                 };
                 Some(format!(
-                    "{{ let __sh_text: String = {t}; let __n: i64 = {c}; let __l: Vec<&str> = __sh_text.split('\\n').collect(); let __k = __l.len(); if __n <= 0 {{ String::new() }} else {{ {tail} }} }}"
+                    "{{ let __sh_text: String = {t}; let __sh_num: i64 = {c}; let __sh_span: Vec<&str> = __sh_text.split('\\n').collect(); let __sh_key = __sh_span.len(); if __sh_num <= 0 {{ String::new() }} else {{ {tail} }} }}"
                 ))
             }
             "RepeatStr" => {
@@ -5756,7 +5756,7 @@ impl Render {
                 let t = self.expr_str(&x.text);
                 let c = self.expr_num(&x.count);
                 Some(format!(
-                    "{{ let __n: i64 = {c}; if __n <= 0 {{ String::new() }} else {{ {t}.repeat(__n as usize) }} }}"
+                    "{{ let __sh_num: i64 = {c}; if __sh_num <= 0 {{ String::new() }} else {{ {t}.repeat(__sh_num as usize) }} }}"
                 ))
             }
             "SortLines" => {
@@ -5777,14 +5777,14 @@ impl Render {
                 let key = match field {
                     None => {
                         if x.ignore_case {
-                            "__s.to_lowercase()".to_string()
+                            "__sh_str.to_lowercase()".to_string()
                         } else {
-                            "__s.clone()".to_string()
+                            "__sh_str.clone()".to_string()
                         }
                     }
                     Some((sep, n)) => {
                         let base = format!(
-                            "__s.split({}).nth({}).unwrap_or(\"\").to_string()",
+                            "__sh_str.split({}).nth({}).unwrap_or(\"\").to_string()",
                             Self::rust_str(&sep.to_string()),
                             n - 1
                         );
@@ -5795,30 +5795,30 @@ impl Render {
                         }
                     }
                 };
-                let (ka, kb) = if x.reverse { ("__b", "__a") } else { ("__a", "__b") };
+                let (ka, kb) = if x.reverse { ("__sh_buf", "__sh_operand") } else { ("__sh_operand", "__sh_buf") };
                 let cmp = if x.numeric {
                     format!(
-                        "{{ let (__x, __y) = (__key({ka}).trim().parse::<f64>().unwrap_or(0.0), \
-__key({kb}).trim().parse::<f64>().unwrap_or(0.0)); \
-__x.partial_cmp(&__y).unwrap_or(std::cmp::Ordering::Equal) }}"
+                        "{{ let (__sh_state, __sh_put) = (__sort_key({ka}).trim().parse::<f64>().unwrap_or(0.0), \
+__sort_key({kb}).trim().parse::<f64>().unwrap_or(0.0)); \
+__sh_state.partial_cmp(&__sh_put).unwrap_or(std::cmp::Ordering::Equal) }}"
                     )
                 } else {
-                    format!("__key({ka}).cmp(&__key({kb}))")
+                    format!("__sort_key({ka}).cmp(&__sort_key({kb}))")
                 };
                 let uniq = if x.unique {
-                    "let mut __u: Vec<String> = Vec::new(); \
-for __x in __l.drain(..) { if __u.last().map(|__p| __key(__p) != __key(&__x)).unwrap_or(true) { __u.push(__x); } } \
-__l = __u;"
+                    "let mut __sh_uniq: Vec<String> = Vec::new(); \
+for __sh_state in __sh_span.drain(..) { if __sh_uniq.last().map(|__sh_part| __sort_key(__sh_part) != __sort_key(&__sh_state)).unwrap_or(true) { __sh_uniq.push(__sh_state); } } \
+__sh_span = __sh_uniq;"
                 } else {
                     ""
                 };
                 Some(format!(
                     "{{ let __sh_text: String = {t}; \
-let mut __l: Vec<String> = if __sh_text.is_empty() {{ Vec::new() }} else {{ \
-let mut __sh_value: Vec<String> = __sh_text.split('\\n').map(|__s| __s.to_string()).collect(); \
+let mut __sh_span: Vec<String> = if __sh_text.is_empty() {{ Vec::new() }} else {{ \
+let mut __sh_value: Vec<String> = __sh_text.split('\\n').map(|__sh_str| __sh_str.to_string()).collect(); \
 if __sh_text.ends_with('\\n') {{ __sh_value.pop(); }} __sh_value }}; \
-let __key = |__s: &String| -> String {{ {key} }}; \
-__l.sort_by(|__a, __b| {cmp}); {uniq} __l.join(\"\\n\") }}"
+let __sort_key = |__sh_str: &String| -> String {{ {key} }}; \
+__sh_span.sort_by(|__sh_operand, __sh_buf| {cmp}); {uniq} __sh_span.join(\"\\n\") }}"
                 ))
             }
             "UniqLines" => {
@@ -5827,20 +5827,20 @@ __l.sort_by(|__a, __b| {cmp}); {uniq} __l.join(\"\\n\") }}"
                 let skip = x.skip.max(0) as usize;
                 let projected = if x.count {
                     // GNU `uniq -c` pads the run length to width 7.
-                    "format!(\"{:>7} {}\", __j - __i, __l[__i])".to_string()
+                    "format!(\"{:>7} {}\", __sh_end - __sh_begin, __sh_span[__sh_begin])".to_string()
                 } else {
-                    "__l[__i].clone()".to_string()
+                    "__sh_span[__sh_begin].clone()".to_string()
                 };
                 Some(format!(
                     "{{ let __sh_text: String = {t}; \
-let mut __l: Vec<String> = if __sh_text.is_empty() {{ Vec::new() }} else {{ \
-let mut __sh_value: Vec<String> = __sh_text.split('\\n').map(|__s| __s.to_string()).collect(); \
+let mut __sh_span: Vec<String> = if __sh_text.is_empty() {{ Vec::new() }} else {{ \
+let mut __sh_value: Vec<String> = __sh_text.split('\\n').map(|__sh_str| __sh_str.to_string()).collect(); \
 if __sh_text.ends_with('\\n') {{ __sh_value.pop(); }} __sh_value }}; \
-let __k = |__s: &String| -> String {{ __s.chars().skip({skip}).collect::<String>() }}; \
-let mut __out: Vec<String> = Vec::new(); let mut __i = 0; \
-while __i < __l.len() {{ let mut __j = __i + 1; \
-while __j < __l.len() && __k(&__l[__j]) == __k(&__l[__i]) {{ __j += 1; }} \
-__out.push({projected}); __i = __j; }} __out.join(\"\\n\") }}"
+let __sh_key = |__sh_str: &String| -> String {{ __sh_str.chars().skip({skip}).collect::<String>() }}; \
+let mut __sh_output: Vec<String> = Vec::new(); let mut __sh_begin = 0; \
+while __sh_begin < __sh_span.len() {{ let mut __sh_end = __sh_begin + 1; \
+while __sh_end < __sh_span.len() && __sh_key(&__sh_span[__sh_end]) == __sh_key(&__sh_span[__sh_begin]) {{ __sh_end += 1; }} \
+__sh_output.push({projected}); __sh_begin = __sh_end; }} __sh_output.join(\"\\n\") }}"
                 ))
             }
             "CharTranslate" => {
@@ -5857,16 +5857,16 @@ __out.push({projected}); __i = __j; }} __out.join(\"\\n\") }}"
                 // SET2, which is `tr -s SET`).
                 let mapped = if x.delete {
                     format!(
-                        "{t}.chars().filter(|__c| !{from}.contains(*__c)).collect::<String>()"
+                        "{t}.chars().filter(|__sh_ch| !{from}.contains(*__sh_ch)).collect::<String>()"
                     )
                 } else if x.to.is_empty() {
                     t.clone()
                 } else {
                     format!(
-                        "{{ let __f: Vec<char> = {from}.chars().collect(); \
+                        "{{ let __sh_field: Vec<char> = {from}.chars().collect(); \
 let __sh_value: Vec<char> = {to}.chars().collect(); \
-{t}.chars().map(|__c| match __f.iter().position(|&__x| __x == __c) {{ \
-Some(__i) => __sh_value[__i.min(__sh_value.len() - 1)], None => __c }}).collect::<String>() }}"
+{t}.chars().map(|__sh_ch| match __sh_field.iter().position(|&__sh_state| __sh_state == __sh_ch) {{ \
+Some(__sh_begin) => __sh_value[__sh_begin.min(__sh_value.len() - 1)], None => __sh_ch }}).collect::<String>() }}"
                     )
                 };
                 if !x.squeeze {
@@ -5874,9 +5874,9 @@ Some(__i) => __sh_value[__i.min(__sh_value.len() - 1)], None => __c }}).collect:
                 } else {
                     let sq = if x.to.is_empty() { from.clone() } else { to.clone() };
                     Some(format!(
-                        "{{ let __m: String = {mapped}; let __sq: Vec<char> = {sq}.chars().collect(); \
-let mut __o = String::new(); for __c in __m.chars() {{ \
-if __o.chars().last() == Some(__c) && __sq.contains(&__c) {{ continue; }} __o.push(__c); }} __o }}"
+                        "{{ let __sh_mapped: String = {mapped}; let __sh_squeeze: Vec<char> = {sq}.chars().collect(); \
+let mut __sh_out = String::new(); for __sh_ch in __sh_mapped.chars() {{ \
+if __sh_out.chars().last() == Some(__sh_ch) && __sh_squeeze.contains(&__sh_ch) {{ continue; }} __sh_out.push(__sh_ch); }} __sh_out }}"
                     ))
                 }
             }
@@ -5889,17 +5889,17 @@ if __o.chars().last() == Some(__c) && __sq.contains(&__c) {{ continue; }} __o.pu
                 // never reaches this node, so these rules are the whole
                 // contract.
                 let tail = if x.which == "dirname" {
-                    "match __p.rfind('/') { None => String::from(\".\"), Some(__i) => { \
-let mut __d = &__p[..__i]; \
-while __d.len() > 1 && __d.ends_with('/') { __d = &__d[..__d.len() - 1]; } \
-if __d.is_empty() { String::from(\"/\") } else { __d.to_string() } } }"
+                    "match __sh_part.rfind('/') { None => String::from(\".\"), Some(__sh_begin) => { \
+let mut __sh_delim = &__sh_part[..__sh_begin]; \
+while __sh_delim.len() > 1 && __sh_delim.ends_with('/') { __sh_delim = &__sh_delim[..__sh_delim.len() - 1]; } \
+if __sh_delim.is_empty() { String::from(\"/\") } else { __sh_delim.to_string() } } }"
                 } else {
-                    "if __p == \"/\" { String::from(\"/\") } else { match __p.rfind('/') { \
-Some(__i) => __p[__i + 1..].to_string(), None => __p.to_string() } }"
+                    "if __sh_part == \"/\" { String::from(\"/\") } else { match __sh_part.rfind('/') { \
+Some(__sh_begin) => __sh_part[__sh_begin + 1..].to_string(), None => __sh_part.to_string() } }"
                 };
                 Some(format!(
-                    "{{ let __p0 = format!(\"{{}}\", @T@); let mut __p = __p0.as_str(); \
-while __p.len() > 1 && __p.ends_with('/') {{ __p = &__p[..__p.len() - 1]; }} @TAIL@ }}"
+                    "{{ let __sh_pat0 = format!(\"{{}}\", @T@); let mut __sh_part = __sh_pat0.as_str(); \
+while __sh_part.len() > 1 && __sh_part.ends_with('/') {{ __sh_part = &__sh_part[..__sh_part.len() - 1]; }} @TAIL@ }}"
                 )
                 .replace("@TAIL@", tail)
                 .replace("@T@", &t))
@@ -5913,7 +5913,7 @@ while __p.len() > 1 && __p.ends_with('/') {{ __p = &__p[..__p.len() - 1]; }} @TA
                     Some("right") => "trim_end_matches",
                     _ => "trim_matches",
                 };
-                Some(format!("{t}.{m}(|__c| {c}.contains(__c)).to_string()"))
+                Some(format!("{t}.{m}(|__sh_ch| {c}.contains(__sh_ch)).to_string()"))
             }
             _ => None,
         }
@@ -5930,7 +5930,7 @@ while __p.len() > 1 && __p.ends_with('/') {{ __p = &__p[..__p.len() - 1]; }} @TA
         let m = if x.prefix { "starts_with" } else { "ends_with" };
         // `Pattern` is implemented for `&str`, not for `String` or `&String`,
         // and the pattern expression may be either — go through one binding.
-        format!("{{ let __p = String::from({p}); {t}.{m}(&__p[..]) }}")
+        format!("{{ let __sh_part = String::from({p}); {t}.{m}(&__sh_part[..]) }}")
     }
 
     /// Native `std` spelling for the COUNT-valued text nodes Rust's manifest
@@ -6156,7 +6156,7 @@ while __p.len() > 1 && __p.ends_with('/') {{ __p = &__p[..__p.len() - 1]; }} @TA
                             // (status write included, so unwrap_cond can
                             // strip it in condition position)
                             return format!(
-                                "{{ let __b = {}; __SH_RC.store(if __b {{ 0 }} else {{ 1 }}, Ordering::Relaxed); __b }}",
+                                "{{ let __sh_buf = {}; __SH_RC.store(if __sh_buf {{ 0 }} else {{ 1 }}, Ordering::Relaxed); __sh_buf }}",
                                 Self::unparen(&c)
                             );
                         }
@@ -6177,7 +6177,7 @@ while __p.len() > 1 && __p.ends_with('/') {{ __p = &__p[..__p.len() - 1]; }} @TA
                             // so `unwrap_cond` can strip it in condition
                             // position — same contract as `test_call_bool`.
                             return format!(
-                                "{{ let __b = {r};\n__SH_RC.store(if __b {{ 0 }} else {{ 1 }}, Ordering::Relaxed); __b }}"
+                                "{{ let __sh_buf = {r};\n__SH_RC.store(if __sh_buf {{ 0 }} else {{ 1 }}, Ordering::Relaxed); __sh_buf }}"
                             );
                         }
                     }
@@ -6311,7 +6311,7 @@ while __p.len() > 1 && __p.ends_with('/') {{ __p = &__p[..__p.len() - 1]; }} @TA
             IrExpr::Call { func, args } if func == "grepMatches" => {
                 let call = self.grep_matches_expr(args.first(), args.get(1), args.get(2));
                 format!(
-                    "{{ let (__m, __r) = {call}; __SH_RC.store(__r, Ordering::Relaxed); __r == 0 }}"
+                    "{{ let (__sh_mapped, __sh_res) = {call}; __SH_RC.store(__sh_res, Ordering::Relaxed); __sh_res == 0 }}"
                 )
             }
             IrExpr::Call { func, args } if func == "getVar" => {
@@ -6370,7 +6370,7 @@ while __p.len() > 1 && __p.ends_with('/') {{ __p = &__p[..__p.len() - 1]; }} @TA
             IrExpr::Call { func, args } if func == "arith" => {
                 let text = str_arg(args, 0).unwrap_or("").replace(GLOB_SENTINEL, "");
                 if let Some(e) = self.arith_text_bool(&text) {
-                    format!("{{ let __b = ({e}); __SH_RC.store(if __b {{ 0 }} else {{ 1 }}, Ordering::Relaxed); __b }}")
+                    format!("{{ let __sh_buf = ({e}); __SH_RC.store(if __sh_buf {{ 0 }} else {{ 1 }}, Ordering::Relaxed); __sh_buf }}")
                 } else if text.contains("$(") {
                     format!("{{ let __sh_value = {}; __SH_RC.store(if __sh_value != 0 {{ 0 }} else {{ 1 }}, Ordering::Relaxed); __sh_value != 0 }}", self.arith_text_unparsed(&text, true))
                 } else {
@@ -6616,7 +6616,7 @@ while __p.len() > 1 && __p.ends_with('/') {{ __p = &__p[..__p.len() - 1]; }} @TA
                     if x.fields.len() == 1 {
                         if let crate::ir::FieldRange::Single(i) = x.fields[0] {
                             return format!(
-                                "{{ let __s: String = {}; let __p: Vec<&str> = __s.split({}).collect(); if {}-1 < __p.len() {{ __p[{}].to_string() }} else {{ String::new() }} }}",
+                                "{{ let __sh_str: String = {}; let __sh_part: Vec<&str> = __sh_str.split({}).collect(); if {}-1 < __sh_part.len() {{ __sh_part[{}].to_string() }} else {{ String::new() }} }}",
                                 self.expr_str(&x.text),
                                 Self::rust_str(&x.delimiter), i, i - 1);
                         }
@@ -6665,13 +6665,13 @@ while __p.len() > 1 && __p.ends_with('/') {{ __p = &__p[..__p.len() - 1]; }} @TA
             IrExpr::Str(s, _) => {
                 let p = Self::rust_str(s);
                 format!(
-                    "{{ let __s: String = {t}; if let Some(__r) = __s.{op}({p}) {{ __r.to_string() }} else {{ __s }} }}"
+                    "{{ let __sh_str: String = {t}; if let Some(__sh_res) = __sh_str.{op}({p}) {{ __sh_res.to_string() }} else {{ __sh_str }} }}"
                 )
             }
             other => {
                 let p = self.expr_str(other);
                 format!(
-                    "{{ let __s: String = {t}; let __p: String = {p}; if let Some(__r) = __s.{op}(__p.as_str()) {{ __r.to_string() }} else {{ __s }} }}"
+                    "{{ let __sh_str: String = {t}; let __sh_part: String = {p}; if let Some(__sh_res) = __sh_str.{op}(__sh_part.as_str()) {{ __sh_res.to_string() }} else {{ __sh_str }} }}"
                 )
             }
         }
@@ -6698,14 +6698,14 @@ while __p.len() > 1 && __p.ends_with('/') {{ __p = &__p[..__p.len() - 1]; }} @TA
         let d = Self::rust_str(&x.delim);
         let finder = if x.first { "find" } else { "rfind" };
         // `head` keeps everything BEFORE the cut point; the tail form keeps
-        // everything AFTER the delimiter itself (`__i + __d.len()`).
+        // everything AFTER the delimiter itself (`__sh_begin + __sh_delim.len()`).
         let slice = if x.head {
-            "__s[..__i].to_string()"
+            "__sh_str[..__sh_begin].to_string()"
         } else {
-            "__s[__i + __d.len()..].to_string()"
+            "__sh_str[__sh_begin + __sh_delim.len()..].to_string()"
         };
         format!(
-            "{{ let __s: String = {t}; let __d: &str = {d}; match __s.{finder}(__d) {{ Some(__i) => {slice}, None => __s }} }}"
+            "{{ let __sh_str: String = {t}; let __sh_delim: &str = {d}; match __sh_str.{finder}(__sh_delim) {{ Some(__sh_begin) => {slice}, None => __sh_str }} }}"
         )
     }
 
@@ -6982,7 +6982,7 @@ while __p.len() > 1 && __p.ends_with('/') {{ __p = &__p[..__p.len() - 1]; }} @TA
                     let new = self.getvar_num(var);
                     format!("{{ {stmt} {new} }}")
                 } else {
-                    format!("{{ let __o = {cur}; {stmt} __o }}")
+                    format!("{{ let __sh_out = {cur}; {stmt} __sh_out }}")
                 }
             }
             ArithAst::Sizeof(ty) => ty.c_sizeof().unwrap_or(4).to_string(),
@@ -7177,7 +7177,7 @@ while __p.len() > 1 && __p.ends_with('/') {{ __p = &__p[..__p.len() - 1]; }} @TA
                 // pass-3: rebinding argv poisons the signature verdict
                 self.probe_wild();
                 self.emit(&format!(
-                    "{{ let mut __sh_value = __SH_ARGV.lock().unwrap(); let __n = ({n}).min(__sh_value.len() as i64) as usize; __sh_value.drain(0..__n); }}"
+                    "{{ let mut __sh_value = __SH_ARGV.lock().unwrap(); let __sh_num = ({n}).min(__sh_value.len() as i64) as usize; __sh_value.drain(0..__sh_num); }}"
                 ));
                 self.emit("__SH_RC.store(0, Ordering::Relaxed);");
             }
@@ -7208,11 +7208,11 @@ while __p.len() > 1 && __p.ends_with('/') {{ __p = &__p[..__p.len() - 1]; }} @TA
                     let m = self.tls(&var);
                     if strip_nl {
                         self.emit(&format!(
-                            "{{ let mut __lines: Vec<String> = Vec::new(); loop {{ let (__ln, __any) = __sh_readline(); if !__any {{ break; }} __lines.push(__ln); }} {m}.with(|v| *v.borrow_mut() = __lines); }}"
+                            "{{ let mut __lines: Vec<String> = Vec::new(); loop {{ let (__sh_line, __sh_gotline) = __sh_readline(); if !__sh_gotline {{ break; }} __lines.push(__sh_line); }} {m}.with(|v| *v.borrow_mut() = __lines); }}"
                         ));
                     } else {
                         self.emit(&format!(
-                            "{{ let mut __lines: Vec<String> = Vec::new(); loop {{ let (__ln, __any) = __sh_readline(); if !__any {{ break; }} __lines.push(format!(\"{{}}\\n\", __ln)); }} {m}.with(|v| *v.borrow_mut() = __lines); }}"
+                            "{{ let mut __lines: Vec<String> = Vec::new(); loop {{ let (__sh_line, __sh_gotline) = __sh_readline(); if !__sh_gotline {{ break; }} __lines.push(format!(\"{{}}\\n\", __sh_line)); }} {m}.with(|v| *v.borrow_mut() = __lines); }}"
                         ));
                     }
                 }
@@ -7324,7 +7324,7 @@ while __p.len() > 1 && __p.ends_with('/') {{ __p = &__p[..__p.len() - 1]; }} @TA
                     .join(" ");
                 if let Some(c) = self.test_expr(&text, "[") {
                     self.emit(&format!(
-                        "{{ let __b = {}; __SH_RC.store(if __b {{ 0 }} else {{ 1 }}, Ordering::Relaxed); __b }};", Self::unparen(&c)
+                        "{{ let __sh_buf = {}; __SH_RC.store(if __sh_buf {{ 0 }} else {{ 1 }}, Ordering::Relaxed); __sh_buf }};", Self::unparen(&c)
                     ));
                 } else {
                     self.mark_todo("test");
@@ -7415,17 +7415,17 @@ while __p.len() > 1 && __p.ends_with('/') {{ __p = &__p[..__p.len() - 1]; }} @TA
                         format!("{m}.with(|v| *v.borrow_mut() = __sh_value.trim().to_string())")
                     };
                     assigns.push(format!(
-                        "if __n == {} {{ let __sh_value = __val.trim_matches(|c| c == '\\'' || c == '\\\"'); {st}; }}",
+                        "if __sh_num == {} {{ let __sh_value = __sh_piece.trim_matches(|c| c == '\\'' || c == '\\\"'); {st}; }}",
                         Self::rust_str(v)
                     ));
                 }
                 self.emit(&format!(
-                    "{{ let __src = std::fs::read_to_string(&{path}).unwrap_or_default(); \
-                     for __line in __src.lines() {{ if let Some((__n, __val)) = __line.trim().split_once('=') {{ {} }} }} }}",
+                    "{{ let __sh_source = std::fs::read_to_string(&{path}).unwrap_or_default(); \
+                     for __line in __sh_source.lines() {{ if let Some((__sh_num, __sh_piece)) = __line.trim().split_once('=') {{ {} }} }} }}",
                     if assigns.is_empty() {
-                        "std::env::set_var(__n, __val.trim());".to_string()
+                        "std::env::set_var(__sh_num, __sh_piece.trim());".to_string()
                     } else {
-                        format!("{} else {{ std::env::set_var(__n, __val.trim()); }}", assigns.join(" else "))
+                        format!("{} else {{ std::env::set_var(__sh_num, __sh_piece.trim()); }}", assigns.join(" else "))
                     }
                 ));
                 self.emit("__SH_RC.store(0, Ordering::Relaxed);");
@@ -7638,33 +7638,33 @@ while __p.len() > 1 && __p.ends_with('/') {{ __p = &__p[..__p.len() - 1]; }} @TA
                 // error — exactly the old helper's three cases, with no
                 // `if false` left behind in the emitted code.
                 let errsite = if force {
-                    "                    if __e.kind() == std::io::ErrorKind::NotFound { /* -f: a missing path is not an error */ } else {\n                        eprintln!(\"rm: cannot remove '{}': {}\", __p, __e);\n                        __rc = 1;\n                    }".to_string()
+                    "                    if __sh_item.kind() == std::io::ErrorKind::NotFound { /* -f: a missing path is not an error */ } else {\n                        eprintln!(\"rm: cannot remove '{}': {}\", __sh_part, __sh_item);\n                        __sh_status = 1;\n                    }".to_string()
                 } else {
-                    "                    eprintln!(\"rm: cannot remove '{}': {}\", __p, __e);\n                    __rc = 1;".to_string()
+                    "                    eprintln!(\"rm: cannot remove '{}': {}\", __sh_part, __sh_item);\n                    __sh_status = 1;".to_string()
                 };
                 let body = if rec {
-                    "        let __r = if __m.is_dir() {\n            std::fs::remove_dir_all(__p)\n        } else {\n            std::fs::remove_file(__p)\n        };".to_string()
+                    "        let __sh_res = if __sh_mapped.is_dir() {\n            std::fs::remove_dir_all(__sh_part)\n        } else {\n            std::fs::remove_file(__sh_part)\n        };".to_string()
                 } else if dir_ok {
-                    "        let __r = if __m.is_dir() {\n            std::fs::remove_dir(__p)\n        } else {\n            std::fs::remove_file(__p)\n        };".to_string()
+                    "        let __sh_res = if __sh_mapped.is_dir() {\n            std::fs::remove_dir(__sh_part)\n        } else {\n            std::fs::remove_file(__sh_part)\n        };".to_string()
                 } else {
-                    "        if __m.is_dir() {\n            eprintln!(\"rm: cannot remove '{}': Is a directory\", __p);\n            __rc = 1;\n            continue;\n        }\n        let __r = std::fs::remove_file(__p);".to_string()
+                    "        if __sh_mapped.is_dir() {\n            eprintln!(\"rm: cannot remove '{}': Is a directory\", __sh_part);\n            __sh_status = 1;\n            continue;\n        }\n        let __sh_res = std::fs::remove_file(__sh_part);".to_string()
                 };
                 r#"{
-    let mut __rc: i32 = 0;
-    for __p in &@ARGV@ {
-        match std::fs::symlink_metadata(__p) {
-            Ok(__m) => {
+    let mut __sh_status: i32 = 0;
+    for __sh_part in &@ARGV@ {
+        match std::fs::symlink_metadata(__sh_part) {
+            Ok(__sh_mapped) => {
 @BODY@
-                if let Err(__e) = __r {
+                if let Err(__sh_item) = __sh_res {
 @ERRSITE@
                 }
             }
-            Err(__e) => {
+            Err(__sh_item) => {
 @ERRSITE@
             }
         }
     }
-    __SH_RC.store(__rc, Ordering::Relaxed);
+    __SH_RC.store(__sh_status, Ordering::Relaxed);
 }"#
                 .replace("@ARGV@", &argv)
                 .replace("@BODY@", &body)
@@ -7675,20 +7675,20 @@ while __p.len() > 1 && __p.ends_with('/') {{ __p = &__p[..__p.len() - 1]; }} @TA
                 let parents = flags.contains(&'p');
                 let verbose = flags.contains(&'v');
                 r#"{
-    let mut __rc: i32 = 0;
-    for __p in &@ARGV@ {
-        let __r = if @PARENTS@ { std::fs::create_dir_all(__p) } else { std::fs::create_dir(__p) };
-        match __r {
+    let mut __sh_status: i32 = 0;
+    for __sh_part in &@ARGV@ {
+        let __sh_res = if @PARENTS@ { std::fs::create_dir_all(__sh_part) } else { std::fs::create_dir(__sh_part) };
+        match __sh_res {
             Ok(_) => {
-                if @VERBOSE@ { println!("mkdir: created directory '{}'", __p); }
+                if @VERBOSE@ { println!("mkdir: created directory '{}'", __sh_part); }
             }
-            Err(__e) => {
-                eprintln!("mkdir: cannot create directory '{}': {}", __p, __e);
-                __rc = 1;
+            Err(__sh_item) => {
+                eprintln!("mkdir: cannot create directory '{}': {}", __sh_part, __sh_item);
+                __sh_status = 1;
             }
         }
     }
-    __SH_RC.store(__rc, Ordering::Relaxed);
+    __SH_RC.store(__sh_status, Ordering::Relaxed);
 }"#
                 .replace("@ARGV@", &argv)
                 .replace("@PARENTS@", if parents { true_ } else { false_ })
@@ -7698,17 +7698,17 @@ while __p.len() > 1 && __p.ends_with('/') {{ __p = &__p[..__p.len() - 1]; }} @TA
                 // touch: append-open creates when absent and NEVER truncates
                 // an existing file, then mtime is bumped like touch(1).
                 r#"{
-    let mut __rc: i32 = 0;
-    for __p in &@ARGV@ {
-        match std::fs::OpenOptions::new().create(true).append(true).open(__p) {
-            Ok(__f) => { let _ = __f.set_modified(std::time::SystemTime::now()); }
-            Err(__e) => {
-                eprintln!("touch: cannot touch '{}': {}", __p, __e);
-                __rc = 1;
+    let mut __sh_status: i32 = 0;
+    for __sh_part in &@ARGV@ {
+        match std::fs::OpenOptions::new().create(true).append(true).open(__sh_part) {
+            Ok(__sh_field) => { let _ = __sh_field.set_modified(std::time::SystemTime::now()); }
+            Err(__sh_item) => {
+                eprintln!("touch: cannot touch '{}': {}", __sh_part, __sh_item);
+                __sh_status = 1;
             }
         }
     }
-    __SH_RC.store(__rc, Ordering::Relaxed);
+    __SH_RC.store(__sh_status, Ordering::Relaxed);
 }"#
                 .replace("@ARGV@", &argv)
             }
@@ -7760,7 +7760,7 @@ while __p.len() > 1 && __p.ends_with('/') {{ __p = &__p[..__p.len() - 1]; }} @TA
                 let argv = self.fs_argv(&words)?;
                 self.add_helper("catf");
                 Some(format!(
-                    "{{ let __c = __sh_catf(&{argv}); __SH_RC.store(if __c.is_some() {{ 0 }} else {{ 1 }}, Ordering::Relaxed); __c.unwrap_or_default() }}"
+                    "{{ let __sh_ch = __sh_catf(&{argv}); __SH_RC.store(if __sh_ch.is_some() {{ 0 }} else {{ 1 }}, Ordering::Relaxed); __sh_ch.unwrap_or_default() }}"
                 ))
             }
             "basename" | "dirname" => {
@@ -7773,7 +7773,7 @@ while __p.len() > 1 && __p.ends_with('/') {{ __p = &__p[..__p.len() - 1]; }} @TA
                 // lowering), so this argv form gets its own name.
                 self.add_helper(&format!("{cmd}_args"));
                 Some(format!(
-                    "{{ let __c = __sh_{cmd}_args(&{argv}); __SH_RC.store(0, Ordering::Relaxed); __c }}"
+                    "{{ let __sh_ch = __sh_{cmd}_args(&{argv}); __SH_RC.store(0, Ordering::Relaxed); __sh_ch }}"
                 ))
             }
             "mktemp" => {
@@ -7805,24 +7805,24 @@ while __p.len() > 1 && __p.ends_with('/') {{ __p = &__p[..__p.len() - 1]; }} @TA
                 let code = r#"{
     let __tmpl: &str = @TMPL@;
     let __sh_text = if __tmpl.is_empty() {
-        let __d = std::env::var("TMPDIR").ok().filter(|__d| !__d.is_empty()).unwrap_or_else(|| "/tmp".to_string());
-        format!("{}/tmp.XXXXXXXXXX", __d.trim_end_matches('/'))
+        let __sh_delim = std::env::var("TMPDIR").ok().filter(|__sh_delim| !__sh_delim.is_empty()).unwrap_or_else(|| "/tmp".to_string());
+        format!("{}/tmp.XXXXXXXXXX", __sh_delim.trim_end_matches('/'))
     } else {
         __tmpl.to_string()
     };
     let __base = __sh_text.trim_end_matches('X').to_string();
-    let __nx = { let __n = __sh_text.len() - __base.len(); if __n == 0 { 10 } else { __n } };
-    let __cs: &[u8] = b"abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789";
-    '__mk: {
-        for __n in 0..100000u64 {
+    let __sh_suffix = { let __sh_num = __sh_text.len() - __base.len(); if __sh_num == 0 { 10 } else { __sh_num } };
+    let __sh_alphabet: &[u8] = b"abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789";
+    '__sh_mkloop: {
+        for __sh_num in 0..100000u64 {
             let __seed = (std::process::id() as u64).wrapping_mul(1_000_003)
-                ^ __n.wrapping_mul(7_919)
-                ^ std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map(|__d| __d.subsec_nanos() as u64).unwrap_or(0);
-            let mut __x = __seed | 1;
-            let mut __s = __base.clone();
-            for _ in 0..__nx { __s.push(__cs[(__x % 62) as usize] as char); __x /= 62; }
-            let __ok = if @DIR@ { std::fs::create_dir(&__s).is_ok() } else { std::fs::OpenOptions::new().write(true).create_new(true).open(&__s).is_ok() };
-            if __ok { break '__mk __s; }
+                ^ __sh_num.wrapping_mul(7_919)
+                ^ std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map(|__sh_delim| __sh_delim.subsec_nanos() as u64).unwrap_or(0);
+            let mut __sh_state = __seed | 1;
+            let mut __sh_str = __base.clone();
+            for _ in 0..__sh_suffix { __sh_str.push(__sh_alphabet[(__sh_state % 62) as usize] as char); __sh_state /= 62; }
+            let __sh_ok = if @DIR@ { std::fs::create_dir(&__sh_str).is_ok() } else { std::fs::OpenOptions::new().write(true).create_new(true).open(&__sh_str).is_ok() };
+            if __sh_ok { break '__sh_mkloop __sh_str; }
         }
         String::new()
     }
@@ -7830,7 +7830,7 @@ while __p.len() > 1 && __p.ends_with('/') {{ __p = &__p[..__p.len() - 1]; }} @TA
                 .replace("@TMPL@", &t)
                 .replace("@DIR@", if dir { "true" } else { "false" });
                 Some(format!(
-                    "{{ let __c = {}; __SH_RC.store(if __c.is_empty() {{ 1 }} else {{ 0 }}, Ordering::Relaxed); __c }}",
+                    "{{ let __sh_ch = {}; __SH_RC.store(if __sh_ch.is_empty() {{ 1 }} else {{ 0 }}, Ordering::Relaxed); __sh_ch }}",
                     self.indent_continuation(&code)
                 ))
             }
@@ -7882,7 +7882,7 @@ while __p.len() > 1 && __p.ends_with('/') {{ __p = &__p[..__p.len() - 1]; }} @TA
                     .join(" ");
                 let (e, is_bool) = self.let_expr_bool(&text);
                 if is_bool {
-                    format!("{{ let __b = {e}; __SH_RC.store(if __b {{ 0 }} else {{ 1 }}, Ordering::Relaxed); __b }}")
+                    format!("{{ let __sh_buf = {e}; __SH_RC.store(if __sh_buf {{ 0 }} else {{ 1 }}, Ordering::Relaxed); __sh_buf }}")
                 } else {
                     format!(
                         "{{ let __sh_value = {}; __SH_RC.store(if __sh_value != 0 {{ 0 }} else {{ 1 }}, Ordering::Relaxed); __sh_value != 0 }}",
@@ -7897,7 +7897,7 @@ while __p.len() > 1 && __p.ends_with('/') {{ __p = &__p[..__p.len() - 1]; }} @TA
                     .collect::<Vec<_>>()
                     .join(" ");
                 if let Some(c) = self.test_expr(&text, "[") {
-                    format!("{{ let __b = {}; __SH_RC.store(if __b {{ 0 }} else {{ 1 }}, Ordering::Relaxed); __b }}", Self::unparen(&c))
+                    format!("{{ let __sh_buf = {}; __SH_RC.store(if __sh_buf {{ 0 }} else {{ 1 }}, Ordering::Relaxed); __sh_buf }}", Self::unparen(&c))
                 } else {
                     self.mark_todo("test");
                     "true".to_string()
@@ -7946,7 +7946,7 @@ while __p.len() > 1 && __p.ends_with('/') {{ __p = &__p[..__p.len() - 1]; }} @TA
                 all.extend(words.iter());
                 let text = self.cmd_text(&all, env.as_deref());
                 self.add_helper("run");
-                format!("{{ let __r = __sh_run(&{text}); __SH_RC.store(__r, Ordering::Relaxed); __r == 0 }}")
+                format!("{{ let __sh_res = __sh_run(&{text}); __SH_RC.store(__sh_res, Ordering::Relaxed); __sh_res == 0 }}")
             }
         }
     }
@@ -8037,11 +8037,11 @@ while __p.len() > 1 && __p.ends_with('/') {{ __p = &__p[..__p.len() - 1]; }} @TA
         // the tail is the boolean VALUE of `cd` (an `exec_bool` operand); a
         // plain STATEMENT needs none, and omitting it there keeps the block
         // free of a discarded `#[must_use]` result
-        let tail = if value { " __r.is_ok()" } else { "" };
+        let tail = if value { " __sh_res.is_ok()" } else { "" };
         format!(
-            "{{ let __d = {dir}; let __r = std::env::set_current_dir(&__d); \
-             if __r.is_ok() {{ std::env::set_var(\"PWD\", std::env::current_dir().map(|p| p.display().to_string()).unwrap_or_default()); }} \
-             __SH_RC.store(if __r.is_ok() {{ 0 }} else {{ 1 }}, Ordering::Relaxed);{tail} }}"
+            "{{ let __sh_delim = {dir}; let __sh_res = std::env::set_current_dir(&__sh_delim); \
+             if __sh_res.is_ok() {{ std::env::set_var(\"PWD\", std::env::current_dir().map(|p| p.display().to_string()).unwrap_or_default()); }} \
+             __SH_RC.store(if __sh_res.is_ok() {{ 0 }} else {{ 1 }}, Ordering::Relaxed);{tail} }}"
         )
     }
 
@@ -8371,7 +8371,7 @@ while __p.len() > 1 && __p.ends_with('/') {{ __p = &__p[..__p.len() - 1]; }} @TA
                 // pass-3: `set --` rebinds argv — no signature
                 self.probe_wild();
                 self.emit(&format!(
-                    "let __new = __sh_cat(&[{}]); *__SH_ARGV.lock().unwrap() = __new;",
+                    "let __sh_newargv = __sh_cat(&[{}]); *__SH_ARGV.lock().unwrap() = __sh_newargv;",
                     ws.join(", ")
                 ));
                 return;
@@ -8408,9 +8408,9 @@ while __p.len() > 1 && __p.ends_with('/') {{ __p = &__p[..__p.len() - 1]; }} @TA
         let mut lines = Vec::new();
         self.add_helper("readline");
         self.add_helper("read_fields");
-        lines.push("let (__ln, __any) = __sh_readline();".to_string());
+        lines.push("let (__sh_line, __sh_gotline) = __sh_readline();".to_string());
         lines.push(format!(
-            "let __f = __sh_read_fields(&__ln, {}, {n});",
+            "let __sh_field = __sh_read_fields(&__sh_line, {}, {n});",
             Self::rust_str(ifs_lit)
         ));
         for (idx, t) in targets.iter().enumerate() {
@@ -8423,7 +8423,7 @@ while __p.len() > 1 && __p.ends_with('/') {{ __p = &__p[..__p.len() - 1]; }} @TA
                     // a map/array var can't take a read line — skip
                     continue;
                 }
-                let get = format!("__f.get({idx}).cloned().unwrap_or_default()");
+                let get = format!("__sh_field.get({idx}).cloned().unwrap_or_default()");
                 // A pure expression builder must not touch the output
                 // buffer: `write_str`/`write_num` call `emit`, which
                 // appends (depth-indented) to `self.out` AND can push a
@@ -8463,8 +8463,8 @@ while __p.len() > 1 && __p.ends_with('/') {{ __p = &__p[..__p.len() - 1]; }} @TA
                 }
             }
         }
-        lines.push("__SH_RC.store(if __any { 0 } else { 1 }, Ordering::Relaxed);".to_string());
-        lines.push("__any".to_string());
+        lines.push("__SH_RC.store(if __sh_gotline { 0 } else { 1 }, Ordering::Relaxed);".to_string());
+        lines.push("__sh_gotline".to_string());
         format!("{{\n{}\n}}", lines.join("\n"))
     }
 
@@ -8675,7 +8675,7 @@ while __p.len() > 1 && __p.ends_with('/') {{ __p = &__p[..__p.len() - 1]; }} @TA
             let new = self.getvar_num(name);
             format!("{{ {stmt} {new} }}")
         } else {
-            format!("{{ let __o = {cur}; {stmt} __o }}")
+            format!("{{ let __sh_out = {cur}; {stmt} __sh_out }}")
         }
     }
 
@@ -8758,7 +8758,7 @@ while __p.len() > 1 && __p.ends_with('/') {{ __p = &__p[..__p.len() - 1]; }} @TA
                     })
                     .collect();
                 let ev = format!(
-                    "vec![{{ let __aw = ({e}).to_string(); if {} {{ __SH_ARITH_WORD_FAIL.store(true, Ordering::Relaxed); }} __aw }}]",
+                    "vec![{{ let __sh_arith_word = ({e}).to_string(); if {} {{ __SH_ARITH_WORD_FAIL.store(true, Ordering::Relaxed); }} __sh_arith_word }}]",
                     checks.join(" || ")
                 );
                 (ev, true)
@@ -8964,7 +8964,7 @@ while __p.len() > 1 && __p.ends_with('/') {{ __p = &__p[..__p.len() - 1]; }} @TA
                     if let crate::ir::FieldRange::Single(i) = x.fields[0] {
                         let t = self.expr_str(&x.text);
                         let d = Self::rust_str_expr(&x.delimiter);
-                        return format!("vec![{{ let __s: String = {t}; let __p: Vec<&str> = __s.split({d}.as_str()).collect(); if {}-1 < __p.len() {{ __p[{}].to_string() }} else {{ String::new() }} }}]", i, i - 1);
+                        return format!("vec![{{ let __sh_str: String = {t}; let __sh_part: Vec<&str> = __sh_str.split({d}.as_str()).collect(); if {}-1 < __sh_part.len() {{ __sh_part[{}].to_string() }} else {{ String::new() }} }}]", i, i - 1);
                     }
                 }
                 self.mark_todo("word FieldExtract (complex fields)");
@@ -9066,7 +9066,7 @@ while __p.len() > 1 && __p.ends_with('/') {{ __p = &__p[..__p.len() - 1]; }} @TA
                         format!("vec![{}]", ws.join(", "))
                     };
                     format!(
-                        "vec![{{ let __old = __SH_ARGV.lock().unwrap().clone(); *__SH_ARGV.lock().unwrap() = {constr}; {}(); *__SH_ARGV.lock().unwrap() = __old; let __r = __SH_RET.lock().unwrap().clone(); __r }}]",
+                        "vec![{{ let __sh_savedout = __SH_ARGV.lock().unwrap().clone(); *__SH_ARGV.lock().unwrap() = {constr}; {}(); *__SH_ARGV.lock().unwrap() = __sh_savedout; let __sh_res = __SH_RET.lock().unwrap().clone(); __sh_res }}]",
                         m
                     )
                 } else {
@@ -9087,13 +9087,13 @@ while __p.len() > 1 && __p.ends_with('/') {{ __p = &__p[..__p.len() - 1]; }} @TA
                         let m = self.tls(name);
                         if self.is_int_array(name) {
                             let op = if func == "sum" {
-                                "__vv.iter().copied().sum::<i64>().to_string()"
+                                "__sh_vec.iter().copied().sum::<i64>().to_string()"
                             } else if func == "max" {
-                                "__vv.iter().copied().max().map(|v| v.to_string()).unwrap_or_default()"
+                                "__sh_vec.iter().copied().max().map(|v| v.to_string()).unwrap_or_default()"
                             } else {
-                                "__vv.iter().copied().min().map(|v| v.to_string()).unwrap_or_default()"
+                                "__sh_vec.iter().copied().min().map(|v| v.to_string()).unwrap_or_default()"
                             };
-                            let mut s = String::from("vec![{ let __vv = ");
+                            let mut s = String::from("vec![{ let __sh_vec = ");
                             s.push_str(&m);
                             s.push_str(".with(|v| v.borrow().clone()); ");
                             s.push_str(op);
@@ -9101,13 +9101,13 @@ while __p.len() > 1 && __p.ends_with('/') {{ __p = &__p[..__p.len() - 1]; }} @TA
                             return s;
                         }
                         let op = if func == "sum" {
-                            "let mut __acc = num_bigint::BigInt::from(0); for __e in __vv.iter() { __acc += __e.trim().parse::<num_bigint::BigInt>().unwrap_or(num_bigint::BigInt::from(0)); } __acc.to_string()"
+                            "let mut __sh_sum = num_bigint::BigInt::from(0); for __sh_item in __sh_vec.iter() { __sh_sum += __sh_item.trim().parse::<num_bigint::BigInt>().unwrap_or(num_bigint::BigInt::from(0)); } __sh_sum.to_string()"
                         } else if func == "max" {
-                            "if __vv.is_empty() { String::new() } else { let mut __m = __vv[0].trim().parse::<num_bigint::BigInt>().unwrap_or(num_bigint::BigInt::from(0)); for __e in __vv.iter().skip(1) { let __sh_value = __e.trim().parse::<num_bigint::BigInt>().unwrap_or(num_bigint::BigInt::from(0)); if __sh_value > __m { __m = __sh_value; } } __m.to_string() }"
+                            "if __sh_vec.is_empty() { String::new() } else { let mut __sh_mapped = __sh_vec[0].trim().parse::<num_bigint::BigInt>().unwrap_or(num_bigint::BigInt::from(0)); for __sh_item in __sh_vec.iter().skip(1) { let __sh_value = __sh_item.trim().parse::<num_bigint::BigInt>().unwrap_or(num_bigint::BigInt::from(0)); if __sh_value > __sh_mapped { __sh_mapped = __sh_value; } } __sh_mapped.to_string() }"
                         } else {
-                            "if __vv.is_empty() { String::new() } else { let mut __m = __vv[0].trim().parse::<num_bigint::BigInt>().unwrap_or(num_bigint::BigInt::from(0)); for __e in __vv.iter().skip(1) { let __sh_value = __e.trim().parse::<num_bigint::BigInt>().unwrap_or(num_bigint::BigInt::from(0)); if __sh_value < __m { __m = __sh_value; } } __m.to_string() }"
+                            "if __sh_vec.is_empty() { String::new() } else { let mut __sh_mapped = __sh_vec[0].trim().parse::<num_bigint::BigInt>().unwrap_or(num_bigint::BigInt::from(0)); for __sh_item in __sh_vec.iter().skip(1) { let __sh_value = __sh_item.trim().parse::<num_bigint::BigInt>().unwrap_or(num_bigint::BigInt::from(0)); if __sh_value < __sh_mapped { __sh_mapped = __sh_value; } } __sh_mapped.to_string() }"
                         };
-                        let mut s = String::from("vec![{ let __vv = ");
+                        let mut s = String::from("vec![{ let __sh_vec = ");
                         s.push_str(&m);
                         s.push_str(".with(|v| v.borrow().clone()); ");
                         s.push_str(op);
@@ -9129,24 +9129,24 @@ while __p.len() > 1 && __p.ends_with('/') {{ __p = &__p[..__p.len() - 1]; }} @TA
                 match str_arg(args, 0) {
                     Some(name) => {
                         let m = self.tls(name);
-                        // `vec![{ let mut __sv = VEC.clone(); sort; "[" + join + "]" }]`
+                        // `vec![{ let mut __sh_sorted = VEC.clone(); sort; "[" + join + "]" }]`
                         // (single expression returning Vec<String> with one
                         // formatted element, matching the print-words shape).
-                        let mut s = String::from("vec![{ let mut __sv = ");
+                        let mut s = String::from("vec![{ let mut __sh_sorted = ");
                         s.push_str(&m);
                         if self.is_int_array(name) {
                             s.push_str(".with(|v| v.borrow().clone()); ");
-                            s.push_str("__sv.sort_unstable(); ");
-                            s.push_str("__sv.dedup(); ");
-                            s.push_str("__sv.iter().map(|n| n.to_string()).collect::<Vec<String>>().join(\", \") }] ");
+                            s.push_str("__sh_sorted.sort_unstable(); ");
+                            s.push_str("__sh_sorted.dedup(); ");
+                            s.push_str("__sh_sorted.iter().map(|n| n.to_string()).collect::<Vec<String>>().join(\", \") }] ");
                             return s;
                         }
                         s.push_str(".with(|v| v.borrow().clone()); ");
-                        s.push_str("__sv.sort_by_key(|s| s.trim().parse::<i64>().unwrap_or(0)); ");
+                        s.push_str("__sh_sorted.sort_by_key(|s| s.trim().parse::<i64>().unwrap_or(0)); ");
                         // set semantics: dedupe (numeric equality; t88 sqrt
                         // pushes i and n//i twice when equal).
-                        s.push_str("__sv.dedup_by(|a, b| a.trim().parse::<i64>().unwrap_or(0) == b.trim().parse::<i64>().unwrap_or(0)); ");
-                        s.push_str("__sv.join(\", \") }] ");
+                        s.push_str("__sh_sorted.dedup_by(|a, b| a.trim().parse::<i64>().unwrap_or(0) == b.trim().parse::<i64>().unwrap_or(0)); ");
+                        s.push_str("__sh_sorted.join(\", \") }] ");
                         s
                     }
                     None => {
@@ -9162,12 +9162,12 @@ while __p.len() > 1 && __p.ends_with('/') {{ __p = &__p[..__p.len() - 1]; }} @TA
                 match str_arg(args, 0) {
                     Some(name) => {
                         let m = self.tls(name);
-                        let mut s = String::from("vec![{ let mut __sv = ");
+                        let mut s = String::from("vec![{ let mut __sh_sorted = ");
                         s.push_str(&m);
                         s.push_str(".with(|v| v.borrow().clone()); ");
-                        s.push_str("__sv.sort_by(|a, b| { let av: num_bigint::BigInt = a.trim().parse().unwrap_or(num_bigint::BigInt::from(0)); let bv: num_bigint::BigInt = b.trim().parse().unwrap_or(num_bigint::BigInt::from(0)); av.cmp(&bv) }); ");
-                        s.push_str("__sv.dedup_by(|a, b| { let av: num_bigint::BigInt = a.trim().parse().unwrap_or(num_bigint::BigInt::from(0)); let bv: num_bigint::BigInt = b.trim().parse().unwrap_or(num_bigint::BigInt::from(0)); av == bv }); ");
-                        s.push_str("__sv.join(\", \") }] ");
+                        s.push_str("__sh_sorted.sort_by(|a, b| { let av: num_bigint::BigInt = a.trim().parse().unwrap_or(num_bigint::BigInt::from(0)); let bv: num_bigint::BigInt = b.trim().parse().unwrap_or(num_bigint::BigInt::from(0)); av.cmp(&bv) }); ");
+                        s.push_str("__sh_sorted.dedup_by(|a, b| { let av: num_bigint::BigInt = a.trim().parse().unwrap_or(num_bigint::BigInt::from(0)); let bv: num_bigint::BigInt = b.trim().parse().unwrap_or(num_bigint::BigInt::from(0)); av == bv }); ");
+                        s.push_str("__sh_sorted.join(\", \") }] ");
                         s
                     }
                     None => {
@@ -9228,20 +9228,20 @@ while __p.len() > 1 && __p.ends_with('/') {{ __p = &__p[..__p.len() - 1]; }} @TA
                         p.argv_read = true;
                     }
                     return format!(
-                        "{{ let __sh_value = {b}; let __o = (({off} - 1).max(0) as usize).min(__sh_value.len()); \
-                         let __l = if {len} < 0 {{ __sh_value.len().saturating_sub(__o) as i64 }} else {{ {len} }}; \
-                         let __e = ((__o as i64 + __l).max(__o as i64)).min(__sh_value.len() as i64) as usize; \
-                         let __e = __e.max(__o); \
-                         __sh_value[__o..__e].to_vec() }}"
+                        "{{ let __sh_value = {b}; let __sh_out = (({off} - 1).max(0) as usize).min(__sh_value.len()); \
+                         let __sh_span = if {len} < 0 {{ __sh_value.len().saturating_sub(__sh_out) as i64 }} else {{ {len} }}; \
+                         let __sh_item = ((__sh_out as i64 + __sh_span).max(__sh_out as i64)).min(__sh_value.len() as i64) as usize; \
+                         let __sh_item = __sh_item.max(__sh_out); \
+                         __sh_value[__sh_out..__sh_item].to_vec() }}"
                     );
                 }
                 self.probe_wild();
                 return format!(
-                    "{{ let __sh_value = __SH_ARGV.lock().unwrap().clone(); let __o = (({off} - 1).max(0) as usize).min(__sh_value.len()); \
-                     let __l = if {len} < 0 {{ __sh_value.len().saturating_sub(__o) as i64 }} else {{ {len} }}; \
-                     let __e = ((__o as i64 + __l).max(__o as i64)).min(__sh_value.len() as i64) as usize; \
-                     let __e = __e.max(__o); \
-                     __sh_value[__o..__e].to_vec() }}"
+                    "{{ let __sh_value = __SH_ARGV.lock().unwrap().clone(); let __sh_out = (({off} - 1).max(0) as usize).min(__sh_value.len()); \
+                     let __sh_span = if {len} < 0 {{ __sh_value.len().saturating_sub(__sh_out) as i64 }} else {{ {len} }}; \
+                     let __sh_item = ((__sh_out as i64 + __sh_span).max(__sh_out as i64)).min(__sh_value.len() as i64) as usize; \
+                     let __sh_item = __sh_item.max(__sh_out); \
+                     __sh_value[__sh_out..__sh_item].to_vec() }}"
                 );
             }
             self.probe_wild();
@@ -9263,7 +9263,7 @@ while __p.len() > 1 && __p.ends_with('/') {{ __p = &__p[..__p.len() - 1]; }} @TA
                     };
                     let arr = self.read_arr(var);
                     return format!(
-                        "{{ let __sh_value = {arr}; let __o = if {off} < 0 {{ (__sh_value.len() as i64 + {off}).max(0) }} else {{ {off} }} as usize; let __o = __o.min(__sh_value.len()); let __l = if {len} < 0 {{ __sh_value.len() as i64 - __o as i64 }} else {{ {len} }};                          let __s = __o.max(0) as usize; let __e = ((__s as i64 + __l).max(__s as i64)).min(__sh_value.len() as i64) as usize; let __e = __e.max(__s);                          __sh_value[__s..__e].to_vec() }}"
+                        "{{ let __sh_value = {arr}; let __sh_out = if {off} < 0 {{ (__sh_value.len() as i64 + {off}).max(0) }} else {{ {off} }} as usize; let __sh_out = __sh_out.min(__sh_value.len()); let __sh_span = if {len} < 0 {{ __sh_value.len() as i64 - __sh_out as i64 }} else {{ {len} }};                          let __sh_str = __sh_out.max(0) as usize; let __sh_item = ((__sh_str as i64 + __sh_span).max(__sh_str as i64)).min(__sh_value.len() as i64) as usize; let __sh_item = __sh_item.max(__sh_str);                          __sh_value[__sh_str..__sh_item].to_vec() }}"
                     );
                 }
                 return self.read_arr(var);
@@ -9537,7 +9537,7 @@ while __p.len() > 1 && __p.ends_with('/') {{ __p = &__p[..__p.len() - 1]; }} @TA
         if glob {
             self.add_helper("glob");
             format!(
-                "{{ let __b = __sh_brace({}, {groups_lit}, {seps_lit}, {}).iter().map(|p| __sh_cat(&[__sh_glob(p)])).collect::<Vec<_>>(); __sh_cat(&__b) }}",
+                "{{ let __sh_buf = __sh_brace({}, {groups_lit}, {seps_lit}, {}).iter().map(|p| __sh_cat(&[__sh_glob(p)])).collect::<Vec<_>>(); __sh_cat(&__sh_buf) }}",
                 Self::rust_str(&pre),
                 Self::rust_str(&suf)
             )
@@ -9662,7 +9662,7 @@ while __p.len() > 1 && __p.ends_with('/') {{ __p = &__p[..__p.len() - 1]; }} @TA
                     if let Some(text) = self.stage_text(stmts) {
                         self.add_helper("capture_rc");
                         return format!(
-                            "{{ let (__c, __r) = __sh_capture_rc(&{text}); __SH_RC.store(__r, Ordering::Relaxed); __c }}"
+                            "{{ let (__sh_ch, __sh_res) = __sh_capture_rc(&{text}); __SH_RC.store(__sh_res, Ordering::Relaxed); __sh_ch }}"
                         );
                     }
                 }
@@ -9686,7 +9686,7 @@ while __p.len() > 1 && __p.ends_with('/') {{ __p = &__p[..__p.len() - 1]; }} @TA
                     if let Some(text) = self.stage_text(stmts) {
                         self.add_helper("capture_rc");
                         return format!(
-                            "{{ let (__c, __r) = __sh_capture_rc(&{text}); __SH_RC.store(__r, Ordering::Relaxed); __c }}"
+                            "{{ let (__sh_ch, __sh_res) = __sh_capture_rc(&{text}); __SH_RC.store(__sh_res, Ordering::Relaxed); __sh_ch }}"
                         );
                     }
                 }
@@ -9728,7 +9728,7 @@ while __p.len() > 1 && __p.ends_with('/') {{ __p = &__p[..__p.len() - 1]; }} @TA
         // captured output (the inner mktemp would write its path into
         // the outer producer's file)
         self.emit("let __cap_oldout = __SH_OUTFILE_TL.with(|v| v.borrow_mut().take());");
-        self.emit("let __old = __SH_OUT.lock().unwrap().take();");
+        self.emit("let __sh_savedout = __SH_OUT.lock().unwrap().take();");
         self.emit("*__SH_OUT.lock().unwrap() = Some(Vec::new());");
         // the captured commands must NOT consume the stage's stdin (a
         // nested mktemp would eat the pipeline buffer)
@@ -9739,12 +9739,12 @@ while __p.len() > 1 && __p.ends_with('/') {{ __p = &__p[..__p.len() - 1]; }} @TA
         }
         self.capture_depth -= 1;
         self.emit("*__SH_STDIN.lock().unwrap() = __cap_oldin;");
-        self.emit("let __cap = __SH_OUT.lock().unwrap().take().unwrap();");
-        self.emit("*__SH_OUT.lock().unwrap() = __old;");
+        self.emit("let __sh_captured = __SH_OUT.lock().unwrap().take().unwrap();");
+        self.emit("*__SH_OUT.lock().unwrap() = __sh_savedout;");
         self.emit("__SH_OUTFILE_TL.with(|v| *v.borrow_mut() = __cap_oldout);");
-        self.emit("let mut __s = String::from_utf8_lossy(&__cap).to_string();");
-        self.emit("while __s.ends_with('\\n') { __s.pop(); }");
-        self.emit("__s");
+        self.emit("let mut __sh_str = String::from_utf8_lossy(&__sh_captured).to_string();");
+        self.emit("while __sh_str.ends_with('\\n') { __sh_str.pop(); }");
+        self.emit("__sh_str");
         let block = self.out.join("\n");
         self.out = saved;
         self.depth = old_depth;
@@ -9769,7 +9769,7 @@ while __p.len() > 1 && __p.ends_with('/') {{ __p = &__p[..__p.len() - 1]; }} @TA
         if let Some(s) = str_arg(args, 0).map(|s| s.to_string()) {
             if let Some(c) = self.test_expr(&s, &style) {
                 return format!(
-                    "{{ let __b = {}; __SH_RC.store(if __b {{ 0 }} else {{ 1 }}, Ordering::Relaxed); __b }}", Self::unparen(&c)
+                    "{{ let __sh_buf = {}; __SH_RC.store(if __sh_buf {{ 0 }} else {{ 1 }}, Ordering::Relaxed); __sh_buf }}", Self::unparen(&c)
                 );
             }
         }
@@ -9865,7 +9865,7 @@ while __p.len() > 1 && __p.ends_with('/') {{ __p = &__p[..__p.len() - 1]; }} @TA
                     // OUTFILE away for the capture
                     let oldout = self.gensym("__sh_oldout");
                     self.emit(&format!("let {oldout} = __SH_OUTFILE_TL.with(|v| v.borrow_mut().take());"));
-                    self.emit("let __old = __SH_OUT.lock().unwrap().take();");
+                    self.emit("let __sh_savedout = __SH_OUT.lock().unwrap().take();");
                     self.emit("*__SH_OUT.lock().unwrap() = Some(Vec::new());");
                     let oldout2 = oldout.clone();
                     // sink region: prints in an intermediate stage land
@@ -9876,7 +9876,7 @@ while __p.len() > 1 && __p.ends_with('/') {{ __p = &__p[..__p.len() - 1]; }} @TA
                     }
                     self.capture_depth -= 1;
                     self.emit(&format!("{buf} = __SH_OUT.lock().unwrap().take().unwrap();"));
-                    self.emit("*__SH_OUT.lock().unwrap() = __old;");
+                    self.emit("*__SH_OUT.lock().unwrap() = __sh_savedout;");
                     self.emit(&format!("__SH_OUTFILE_TL.with(|v| *v.borrow_mut() = {oldout2});"));
                 } else {
                     for s in st {
@@ -10056,7 +10056,7 @@ while __p.len() > 1 && __p.ends_with('/') {{ __p = &__p[..__p.len() - 1]; }} @TA
             let t = text.map(|a| self.expr_str(a)).unwrap_or_default();
             let lit = Self::rust_str(&p);
             return format!(
-                "{{ let __sh_text = &{t}; let __n = __sh_text.matches({lit}).count(); (if __n == 0 {{ String::new() }} else {{ vec![{lit}; __n].join(\"\\n\") }}, if __n == 0 {{ 1 }} else {{ 0 }}) }}"
+                "{{ let __sh_text = &{t}; let __sh_num = __sh_text.matches({lit}).count(); (if __sh_num == 0 {{ String::new() }} else {{ vec![{lit}; __sh_num].join(\"\\n\") }}, if __sh_num == 0 {{ 1 }} else {{ 0 }}) }}"
             );
         }
         self.add_helper("grepmatches");
@@ -10069,9 +10069,9 @@ while __p.len() > 1 && __p.ends_with('/') {{ __p = &__p[..__p.len() - 1]; }} @TA
     fn grepmatches_stmt(&mut self, args: &[IrExpr]) {
         self.add_helper("print_words");
         let call = self.grep_matches_expr(args.first(), args.get(1), args.get(2));
-        self.emit(&format!("let (__m, __r) = {call};"));
-        self.emit("if !__m.is_empty() { __sh_print_words(&[vec![__m]], true, false); }");
-        self.emit("__SH_RC.store(__r, Ordering::Relaxed);");
+        self.emit(&format!("let (__sh_mapped, __sh_res) = {call};"));
+        self.emit("if !__sh_mapped.is_empty() { __sh_print_words(&[vec![__sh_mapped]], true, false); }");
+        self.emit("__SH_RC.store(__sh_res, Ordering::Relaxed);");
     }
 
     /// and as a statement.
@@ -10532,7 +10532,7 @@ while __p.len() > 1 && __p.ends_with('/') {{ __p = &__p[..__p.len() - 1]; }} @TA
             let tmp = ps_tmp.unwrap();
             let te = self.expr_str(&IrExpr::Var(tmp.clone(), None));
             self.emit(&format!(
-                "{{ let __p = {te}; let _ = std::fs::remove_file(&__p); let _ = std::process::Command::new(\"mkfifo\").arg(&__p).status(); }}"
+                "{{ let __sh_part = {te}; let _ = std::fs::remove_file(&__sh_part); let _ = std::process::Command::new(\"mkfifo\").arg(&__sh_part).status(); }}"
             ));
             self.emit(&format!("let __ps_tmp_loc = {te};"));
             let saved = std::mem::take(&mut self.out);
@@ -10668,7 +10668,7 @@ while __p.len() > 1 && __p.ends_with('/') {{ __p = &__p[..__p.len() - 1]; }} @TA
 
     // ── functions ────────────────────────────────────────────────────
 
-    /// Pass-3 direct call, value form: `f()` or `{ let __a..; f(..) }`
+    /// Pass-3 direct call, value form: `f()` or `{ let __sh_operand..; f(..) }`
     /// (evaluates to the function's `String` value). `cat` selects the
     /// argv construction (`__sh_cat(&[..])` for statement-shaped calls,
     /// `vec![..]` for value-shaped calls) — identical to what the legacy
@@ -10685,9 +10685,9 @@ while __p.len() > 1 && __p.ends_with('/') {{ __p = &__p[..__p.len() - 1]; }} @TA
         }
         // DIRECT-ARGS path: a fixed-arity signature with no rest/argv param
         // takes its words one per parameter, so the `Vec<String>` assembly
-        // and the `__a.get(i)…` unpack are a pure round trip — pass the
+        // and the `__sh_operand.get(i)…` unpack are a pure round trip — pass the
         // rendered words straight through (`f("hello".to_string())` rather
-        // than `{ let __a = vec![…]; f(__a.get(0)…unwrap_or_default()) }`).
+        // than `{ let __sh_operand = vec![…]; f(__sh_operand.get(0)…unwrap_or_default()) }`).
         // Only when EVERY word is a single-element vec (no splat: a splat's
         // words are a runtime-sized `Vec<String>` and cannot be spread
         // statically) and the arity matches the word count. The caller
@@ -10743,7 +10743,7 @@ while __p.len() > 1 && __p.ends_with('/') {{ __p = &__p[..__p.len() - 1]; }} @TA
         // flattens a `&[Vec<String>]` — always correct. The legacy `cat`
         // flag is now unused (kept as `_` at the top): a non-`vec![` word
         // is ALWAYS a splat here, since every other word arrives wrapped.
-        // `ws` is one `vec![word]` PER WORD, so the `__a` initializer
+        // `ws` is one `vec![word]` PER WORD, so the `__sh_operand` initializer
         // must FLATTEN them (`vec![w1, w2]` would build
         // `Vec<Vec<String>>`); `__sh_cat` does that flattening. Use it
         // whenever the words are not already a single flat list — i.e.
@@ -10759,10 +10759,10 @@ while __p.len() > 1 && __p.ends_with('/') {{ __p = &__p[..__p.len() - 1]; }} @TA
             ws[0].clone()
         };
         let args = Self::fn_call_args(sig);
-        format!("{{ let __a: Vec<String> = {constr}; {m}({args}) }}")
+        format!("{{ let __sh_operand: Vec<String> = {constr}; {m}({args}) }}")
     }
 
-    /// Pass-3 direct call, exec form: `{ [let __a..;] f(..); [tail] }`
+    /// Pass-3 direct call, exec form: `{ [let __sh_operand..;] f(..); [tail] }`
     /// (`tail` is the block's final expression; None discards).
     fn fn_call_exec(
         &mut self,
@@ -10775,7 +10775,7 @@ while __p.len() > 1 && __p.ends_with('/') {{ __p = &__p[..__p.len() - 1]; }} @TA
         let m = self.fn_ident(name);
         // DIRECT-ARGS path (see fn_call_value): a fixed-arity signature
         // with no rest/argv param takes one word per parameter, so the
-        // `Vec<String>` assembly + `__a.get(i)…` unpack is a pure round
+        // `Vec<String>` assembly + `__sh_operand.get(i)…` unpack is a pure round
         // trip. `cat` is irrelevant here: the path requires every word to
         // be a SINGLE-element vec, and `__sh_cat` only exists to flatten a
         // splat (a runtime-sized `Vec<String>` word), which this path
@@ -10833,7 +10833,7 @@ while __p.len() > 1 && __p.ends_with('/') {{ __p = &__p[..__p.len() - 1]; }} @TA
             } else {
                 format!("vec![{}]", ws.join(", "))
             };
-            inner.push_str(&format!("let __a: Vec<String> = {constr}; "));
+            inner.push_str(&format!("let __sh_operand: Vec<String> = {constr}; "));
         }
         match tail {
             Some(t) => format!("{{ {inner}{call}; {t} }}"),
@@ -10845,7 +10845,7 @@ while __p.len() > 1 && __p.ends_with('/') {{ __p = &__p[..__p.len() - 1]; }} @TA
     /// are the `__sh_arg` contract for missing positionals). With a
     /// shift-offset rest signature the caller's words are split: the first
     /// `arity` become the typed params and the remainder is passed as the
-    /// trailing `&[String]` slice — `__a` holds the caller words.
+    /// trailing `&[String]` slice — `__sh_operand` holds the caller words.
     fn fn_call_args(sig: &FnSig) -> String {
         let mut args: Vec<String> = (0..sig.arity)
             .map(|i| {
@@ -10853,15 +10853,15 @@ while __p.len() > 1 && __p.ends_with('/') {{ __p = &__p[..__p.len() - 1]; }} @TA
                 // caller passed nothing — the default an absent positional
                 // has at the call boundary)
                 if sig.param_is_borrowed(i) {
-                    return format!("__a.get({i}).map(|s| s.as_str()).unwrap_or(\"\")");
+                    return format!("__sh_operand.get({i}).map(|s| s.as_str()).unwrap_or(\"\")");
                 }
                 match sig.tys[i] {
-                    FnParamTy::Str => format!("__a.get({i}).cloned().unwrap_or_default()"),
+                    FnParamTy::Str => format!("__sh_operand.get({i}).cloned().unwrap_or_default()"),
                     FnParamTy::StrRef => {
-                        format!("__a.get({i}).map(|s| s.as_str()).unwrap_or(\"\")")
+                        format!("__sh_operand.get({i}).map(|s| s.as_str()).unwrap_or(\"\")")
                     }
                     FnParamTy::Num => format!(
-                        "__a.get({i}).map(|s| s.trim().parse::<i64>().unwrap_or(0)).unwrap_or(0)"
+                        "__sh_operand.get({i}).map(|s| s.trim().parse::<i64>().unwrap_or(0)).unwrap_or(0)"
                     ),
                 }
             })
@@ -10872,11 +10872,11 @@ while __p.len() > 1 && __p.ends_with('/') {{ __p = &__p[..__p.len() - 1]; }} @TA
             // `arity`: `arity` covers post-shift reads at `i + off`, so it
             // can exceed the offset (e.g. `$2` after `shift` ⇒ arity 3,
             // offset 1 ⇒ rest = caller words 1..).
-            args.push(format!("&__a[({off}).min(__a.len())..]"));
+            args.push(format!("&__sh_operand[({off}).min(__sh_operand.len())..]"));
         }
         if sig.argv {
             // whole-argv rewrite: the caller's words ARE the callee's argv
-            args.push("&__a".to_string());
+            args.push("&__sh_operand".to_string());
         }
         args.join(", ")
     }
@@ -10888,7 +10888,7 @@ while __p.len() > 1 && __p.ends_with('/') {{ __p = &__p[..__p.len() - 1]; }} @TA
         }
         self.add_helper("cat");
         format!(
-            "{{ let __old = __SH_ARGV.lock().unwrap().clone(); let __new = __sh_cat(&[{}]); *__SH_ARGV.lock().unwrap() = __new; {}(); *__SH_ARGV.lock().unwrap() = __old; }}",
+            "{{ let __sh_savedout = __SH_ARGV.lock().unwrap().clone(); let __sh_newargv = __sh_cat(&[{}]); *__SH_ARGV.lock().unwrap() = __sh_newargv; {}(); *__SH_ARGV.lock().unwrap() = __sh_savedout; }}",
             ws.join(", "),
             self.fn_ident(name)
         )
@@ -10898,7 +10898,7 @@ while __p.len() > 1 && __p.ends_with('/') {{ __p = &__p[..__p.len() - 1]; }} @TA
     /// `{ call; }` wrapper exists only so the expression form can carry a
     /// temporary or a trailing value. Unwrapping a bare `{ call; }` turns
     /// t41's `{ f(); }` into `f();`. A block that binds anything (the
-    /// argv-swap convention, a `let __a`) or holds more than one statement
+    /// argv-swap convention, a `let __sh_operand`) or holds more than one statement
     /// is left alone.
     fn stmt_unblock(s: &str) -> String {
         let t = s.trim();
@@ -10934,7 +10934,7 @@ while __p.len() > 1 && __p.ends_with('/') {{ __p = &__p[..__p.len() - 1]; }} @TA
         }
         self.add_helper("cat");
         format!(
-            "{{ let __old = __SH_ARGV.lock().unwrap().clone(); let __new = __sh_cat(&[{}]); *__SH_ARGV.lock().unwrap() = __new; {}(); *__SH_ARGV.lock().unwrap() = __old; __SH_RC.load(Ordering::Relaxed) == 0 }}",
+            "{{ let __sh_savedout = __SH_ARGV.lock().unwrap().clone(); let __sh_newargv = __sh_cat(&[{}]); *__SH_ARGV.lock().unwrap() = __sh_newargv; {}(); *__SH_ARGV.lock().unwrap() = __sh_savedout; __SH_RC.load(Ordering::Relaxed) == 0 }}",
             ws.join(", "),
             self.fn_ident(name)
         )
@@ -11033,10 +11033,10 @@ while __p.len() > 1 && __p.ends_with('/') {{ __p = &__p[..__p.len() - 1]; }} @TA
             self.add_helper("cat");
             let m = self.tls(name);
             self.emit(&format!(
-                "{{ let __words = __sh_cat(&[{}]); {m}.with(|v| {{ let mut __m = v.borrow_mut(); __m.clear(); \
-                 for __w in __words {{ if let Some(rest) = __w.strip_prefix('[') {{ \
-                 if let Some(eq) = rest.find(']') {{ let __k = rest[..eq].to_string(); \
-                 let __sh_value = rest[eq + 2..].to_string(); __m.insert(__k, __sh_value); }} }} }} }}); }}",
+                "{{ let __words = __sh_cat(&[{}]); {m}.with(|v| {{ let mut __sh_mapped = v.borrow_mut(); __sh_mapped.clear(); \
+                 for __sh_word in __words {{ if let Some(rest) = __sh_word.strip_prefix('[') {{ \
+                 if let Some(eq) = rest.find(']') {{ let __sh_key = rest[..eq].to_string(); \
+                 let __sh_value = rest[eq + 2..].to_string(); __sh_mapped.insert(__sh_key, __sh_value); }} }} }} }}); }}",
                 items.join(", ")
             ));
             return;
@@ -11112,13 +11112,13 @@ while __p.len() > 1 && __p.ends_with('/') {{ __p = &__p[..__p.len() - 1]; }} @TA
         if self.is_int_array(name) {
             // int home: parse each pushed word once, on the way in
             self.emit(&format!(
-                "{m}.with(|v| {{ let mut b = v.borrow_mut(); for __w in __sh_cat(&[{}]) {{ b.push(__w.trim().parse::<i64>().unwrap_or(0)); }} }});",
+                "{m}.with(|v| {{ let mut b = v.borrow_mut(); for __sh_word in __sh_cat(&[{}]) {{ b.push(__sh_word.trim().parse::<i64>().unwrap_or(0)); }} }});",
                 items.join(", ")
             ));
             return;
         }
         self.emit(&format!(
-            "{m}.with(|v| {{ let mut b = v.borrow_mut(); for __w in __sh_cat(&[{}]) {{ b.push(__w); }} }});",
+            "{m}.with(|v| {{ let mut b = v.borrow_mut(); for __sh_word in __sh_cat(&[{}]) {{ b.push(__sh_word); }} }});",
             items.join(", ")
         ));
     }
@@ -11442,7 +11442,7 @@ while __p.len() > 1 && __p.ends_with('/') {{ __p = &__p[..__p.len() - 1]; }} @TA
             }
         }
         // `call_words`' fnValue arm wraps the direct-form value in
-        // `vec![…]` ONLY when it is already a bare block (`{ let __a … }`
+        // `vec![…]` ONLY when it is already a bare block (`{ let __sh_operand … }`
         // is the word itself — wrapping again nests `vec![vec![…]]`,
         // E0308). Every other arm yields an UNwrapped word vec that
         // needs exactly one wrap here.
@@ -11462,8 +11462,8 @@ while __p.len() > 1 && __p.ends_with('/') {{ __p = &__p[..__p.len() - 1]; }} @TA
             self.add_helper("cat");
             self.emit("__SH_ARITH_WORD_FAIL.store(false, Ordering::Relaxed);");
             self.emit(&format!(
-                "{{ let __ws = __sh_cat(&[{}]); let __wf = __SH_ARITH_WORD_FAIL.swap(false, Ordering::Relaxed); \
-                 if !__wf {{ __sh_print_words(&[__ws], {}, {}); }} __SH_RC.store(if __wf {{ 1 }} else {{ 0 }}, Ordering::Relaxed); }}",
+                "{{ let __sh_wordlist = __sh_cat(&[{}]); let __sh_wordfail = __SH_ARITH_WORD_FAIL.swap(false, Ordering::Relaxed); \
+                 if !__sh_wordfail {{ __sh_print_words(&[__sh_wordlist], {}, {}); }} __SH_RC.store(if __sh_wordfail {{ 1 }} else {{ 0 }}, Ordering::Relaxed); }}",
                 ws.join(", "), nl, esc
             ));
         } else {
@@ -11763,7 +11763,7 @@ while __p.len() > 1 && __p.ends_with('/') {{ __p = &__p[..__p.len() - 1]; }} @TA
                 self.mark_written(&var);
                 if self.is_assoc(&var) {
                     let m = self.tls(&var);
-                    return format!("{m}.with(|v| {{ let mut __vs = v.borrow().values().cloned().collect::<Vec<String>>(); __vs.sort(); __vs.join(\" \") }})");
+                    return format!("{m}.with(|v| {{ let mut __sh_values = v.borrow().values().cloned().collect::<Vec<String>>(); __sh_values.sort(); __sh_values.join(\" \") }})");
                 }
                 if self.is_array(&var) {
                     return format!("{}.join(\" \")", self.read_arr(&var));
@@ -11813,7 +11813,7 @@ while __p.len() > 1 && __p.ends_with('/') {{ __p = &__p[..__p.len() - 1]; }} @TA
                 // `${map[@]}` / `${map[*]}` — the VALUES (bash); the
                 // `${!map[@]}` keys form is handled by the `!` branch
                 let m = self.tls(var);
-                return format!("{m}.with(|v| {{ let mut __vs = v.borrow().values().cloned().collect::<Vec<String>>(); __vs.sort(); __vs.join(\" \") }})");
+                return format!("{m}.with(|v| {{ let mut __sh_values = v.borrow().values().cloned().collect::<Vec<String>>(); __sh_values.sort(); __sh_values.join(\" \") }})");
             }
             if self.is_array(var) {
                 self.mark_written(var);
@@ -11865,8 +11865,8 @@ while __p.len() > 1 && __p.ends_with('/') {{ __p = &__p[..__p.len() - 1]; }} @TA
                     && !self.is_array(name)
                 {
                     format!(
-                        "{{ let __sh_value = {var_expr}; if __sh_value.is_empty() {{ let __d = {val}; {} __d.clone() }} else {{ __sh_value }} }}",
-                        self.write_str(name, "__d.clone()")
+                        "{{ let __sh_value = {var_expr}; if __sh_value.is_empty() {{ let __sh_delim = {val}; {} __sh_delim.clone() }} else {{ __sh_value }} }}",
+                        self.write_str(name, "__sh_delim.clone()")
                     )
                 } else {
                     format!("{{ let __sh_value = {var_expr}; if __sh_value.is_empty() {{ {val} }} else {{ __sh_value }} }}")
@@ -11925,11 +11925,11 @@ while __p.len() > 1 && __p.ends_with('/') {{ __p = &__p[..__p.len() - 1]; }} @TA
                     // `${@:off:len}` — the positional params (1-based off)
                     self.probe_wild();
                     return format!(
-                        "{{ let __sh_value = __SH_ARGV.lock().unwrap().clone(); let __o = (({off} - 1).max(0) as usize).min(__sh_value.len()); \
-                         let __l = if {len} < 0 {{ __sh_value.len().saturating_sub(__o) as i64 }} else {{ {len} }}; \
-                         let __e = ((__o as i64 + __l).max(__o as i64)).min(__sh_value.len() as i64) as usize; \
-                         let __e = __e.max(__o); \
-                         __sh_value[__o..__e].join(\" \") }}"
+                        "{{ let __sh_value = __SH_ARGV.lock().unwrap().clone(); let __sh_out = (({off} - 1).max(0) as usize).min(__sh_value.len()); \
+                         let __sh_span = if {len} < 0 {{ __sh_value.len().saturating_sub(__sh_out) as i64 }} else {{ {len} }}; \
+                         let __sh_item = ((__sh_out as i64 + __sh_span).max(__sh_out as i64)).min(__sh_value.len() as i64) as usize; \
+                         let __sh_item = __sh_item.max(__sh_out); \
+                         __sh_value[__sh_out..__sh_item].join(\" \") }}"
                     );
                 }
                 if !name.is_empty() && !name.starts_with('$')
@@ -11937,7 +11937,7 @@ while __p.len() > 1 && __p.ends_with('/') {{ __p = &__p[..__p.len() - 1]; }} @TA
                 {
                     let arr = self.read_arr(&name.to_string());
                     return format!(
-                        "{{ let __sh_value = {arr}; let __o = if {off} < 0 {{ (__sh_value.len() as i64 + {off}).max(0) }} else {{ {off} }} as usize; let __o = __o.min(__sh_value.len()); let __l = if {len} < 0 {{ __sh_value.len() as i64 - __o as i64 }} else {{ {len} }};                          let __s = __o.max(0) as usize; let __e = ((__s as i64 + __l).max(__s as i64)).min(__sh_value.len() as i64) as usize; let __e = __e.max(__s);                          __sh_value[__s..__e].join(\" \") }}"
+                        "{{ let __sh_value = {arr}; let __sh_out = if {off} < 0 {{ (__sh_value.len() as i64 + {off}).max(0) }} else {{ {off} }} as usize; let __sh_out = __sh_out.min(__sh_value.len()); let __sh_span = if {len} < 0 {{ __sh_value.len() as i64 - __sh_out as i64 }} else {{ {len} }};                          let __sh_str = __sh_out.max(0) as usize; let __sh_item = ((__sh_str as i64 + __sh_span).max(__sh_str as i64)).min(__sh_value.len() as i64) as usize; let __sh_item = __sh_item.max(__sh_str);                          __sh_value[__sh_str..__sh_item].join(\" \") }}"
                     );
                 }
                 self.add_helper("substr");
@@ -12003,7 +12003,7 @@ while __p.len() > 1 && __p.ends_with('/') {{ __p = &__p[..__p.len() - 1]; }} @TA
                         format!("vec![{}]", ws.join(", "))
                     };
                     return format!(
-                        "{{ let __old = __SH_ARGV.lock().unwrap().clone(); *__SH_ARGV.lock().unwrap() = {constr}; {}(); *__SH_ARGV.lock().unwrap() = __old; let __r = __SH_RET.lock().unwrap().clone(); __r }}",
+                        "{{ let __sh_savedout = __SH_ARGV.lock().unwrap().clone(); *__SH_ARGV.lock().unwrap() = {constr}; {}(); *__SH_ARGV.lock().unwrap() = __sh_savedout; let __sh_res = __SH_RET.lock().unwrap().clone(); __sh_res }}",
                         m
                     );
                 }
@@ -12069,7 +12069,7 @@ while __p.len() > 1 && __p.ends_with('/') {{ __p = &__p[..__p.len() - 1]; }} @TA
             "grepMatches" => {
                 let call = self.grep_matches_expr(args.first(), args.get(1), args.get(2));
                 format!(
-                    "{{ let (__m, __r) = {call}; __SH_RC.store(__r, Ordering::Relaxed); __m }}"
+                    "{{ let (__sh_mapped, __sh_res) = {call}; __SH_RC.store(__sh_res, Ordering::Relaxed); __sh_mapped }}"
                 )
             }
             "redirect" => {
@@ -12164,19 +12164,19 @@ while __p.len() > 1 && __p.ends_with('/') {{ __p = &__p[..__p.len() - 1]; }} @TA
                         let m = self.tls(name);
                         if self.is_int_array(name) {
                             if func == "sum" {
-                                return format!("{{ let __vv = {m}.with(|v| v.borrow().clone()); __vv.iter().copied().sum::<i64>().to_string() }}");
+                                return format!("{{ let __sh_vec = {m}.with(|v| v.borrow().clone()); __sh_vec.iter().copied().sum::<i64>().to_string() }}");
                             } else if func == "max" {
-                                return format!("{{ let __vv = {m}.with(|v| v.borrow().clone()); __vv.iter().copied().max().map(|v| v.to_string()).unwrap_or_default() }}");
+                                return format!("{{ let __sh_vec = {m}.with(|v| v.borrow().clone()); __sh_vec.iter().copied().max().map(|v| v.to_string()).unwrap_or_default() }}");
                             } else {
-                                return format!("{{ let __vv = {m}.with(|v| v.borrow().clone()); __vv.iter().copied().min().map(|v| v.to_string()).unwrap_or_default() }}");
+                                return format!("{{ let __sh_vec = {m}.with(|v| v.borrow().clone()); __sh_vec.iter().copied().min().map(|v| v.to_string()).unwrap_or_default() }}");
                             }
                         }
                         if func == "sum" {
-                            format!("{{ let __vv = {m}.with(|v| v.borrow().clone()); __vv.iter().map(|s| s.trim().parse::<i64>().unwrap_or(0)).sum::<i64>().to_string() }}")
+                            format!("{{ let __sh_vec = {m}.with(|v| v.borrow().clone()); __sh_vec.iter().map(|s| s.trim().parse::<i64>().unwrap_or(0)).sum::<i64>().to_string() }}")
                         } else if func == "max" {
-                            format!("{{ let __vv = {m}.with(|v| v.borrow().clone()); __vv.iter().map(|s| s.trim().parse::<i64>().unwrap_or(0)).max().map(|v| v.to_string()).unwrap_or_default() }}")
+                            format!("{{ let __sh_vec = {m}.with(|v| v.borrow().clone()); __sh_vec.iter().map(|s| s.trim().parse::<i64>().unwrap_or(0)).max().map(|v| v.to_string()).unwrap_or_default() }}")
                         } else {
-                            format!("{{ let __vv = {m}.with(|v| v.borrow().clone()); __vv.iter().map(|s| s.trim().parse::<i64>().unwrap_or(0)).min().map(|v| v.to_string()).unwrap_or_default() }}")
+                            format!("{{ let __sh_vec = {m}.with(|v| v.borrow().clone()); __sh_vec.iter().map(|s| s.trim().parse::<i64>().unwrap_or(0)).min().map(|v| v.to_string()).unwrap_or_default() }}")
                         }
                     }
                     None => "String::new()".to_string(),
@@ -12192,9 +12192,9 @@ while __p.len() > 1 && __p.ends_with('/') {{ __p = &__p[..__p.len() - 1]; }} @TA
                         // and stringify only for the join (t86 `sorted()`
                         // over an int-homed factor list)
                         if self.is_int_array(name) {
-                            return format!("{{ let mut __sv = {m}.with(|v| v.borrow().clone()); __sv.sort_unstable(); __sv.dedup(); __sv.iter().map(|n| n.to_string()).collect::<Vec<String>>().join(\", \") }}");
+                            return format!("{{ let mut __sh_sorted = {m}.with(|v| v.borrow().clone()); __sh_sorted.sort_unstable(); __sh_sorted.dedup(); __sh_sorted.iter().map(|n| n.to_string()).collect::<Vec<String>>().join(\", \") }}");
                         }
-                        format!("{{ let mut __sv = {m}.with(|v| v.borrow().clone()); __sv.sort_by_key(|s| s.trim().parse::<i64>().unwrap_or(0)); __sv.dedup_by(|a, b| a.trim().parse::<i64>().unwrap_or(0) == b.trim().parse::<i64>().unwrap_or(0));  __sv.join(\", \") }}")
+                        format!("{{ let mut __sh_sorted = {m}.with(|v| v.borrow().clone()); __sh_sorted.sort_by_key(|s| s.trim().parse::<i64>().unwrap_or(0)); __sh_sorted.dedup_by(|a, b| a.trim().parse::<i64>().unwrap_or(0) == b.trim().parse::<i64>().unwrap_or(0));  __sh_sorted.join(\", \") }}")
                     }
                     None => "String::new()".to_string(),
                 }
@@ -12203,7 +12203,7 @@ while __p.len() > 1 && __p.ends_with('/') {{ __p = &__p[..__p.len() - 1]; }} @TA
                 match str_arg(args, 0) {
                     Some(name) => {
                         let m = self.tls(name);
-                        format!("{{ let mut __sv = {m}.with(|v| v.borrow().clone()); __sv.sort_by(|a, b| {{ let av: num_bigint::BigInt = a.trim().parse().unwrap_or(num_bigint::BigInt::from(0)); let bv: num_bigint::BigInt = b.trim().parse().unwrap_or(num_bigint::BigInt::from(0)); av.cmp(&bv) }}); __sv.dedup_by(|a, b| {{ let av: num_bigint::BigInt = a.trim().parse().unwrap_or(num_bigint::BigInt::from(0)); let bv: num_bigint::BigInt = b.trim().parse().unwrap_or(num_bigint::BigInt::from(0)); av == bv }});  __sv.join(\", \") }}")
+                        format!("{{ let mut __sh_sorted = {m}.with(|v| v.borrow().clone()); __sh_sorted.sort_by(|a, b| {{ let av: num_bigint::BigInt = a.trim().parse().unwrap_or(num_bigint::BigInt::from(0)); let bv: num_bigint::BigInt = b.trim().parse().unwrap_or(num_bigint::BigInt::from(0)); av.cmp(&bv) }}); __sh_sorted.dedup_by(|a, b| {{ let av: num_bigint::BigInt = a.trim().parse().unwrap_or(num_bigint::BigInt::from(0)); let bv: num_bigint::BigInt = b.trim().parse().unwrap_or(num_bigint::BigInt::from(0)); av == bv }});  __sh_sorted.join(\", \") }}")
                     }
                     None => "String::new()".to_string(),
                 }
@@ -12475,7 +12475,7 @@ while __p.len() > 1 && __p.ends_with('/') {{ __p = &__p[..__p.len() - 1]; }} @TA
     /// function body (each seeds its own — a body's first writes are its own
     /// declarations).
     /// Emit a statement whose value is discarded. A BLOCK is already a
-    /// statement — `{ …; __SH_RC.store(…); __b };` — so `let _ = { … };`
+    /// statement — `{ …; __SH_RC.store(…); __sh_buf };` — so `let _ = { … };`
     /// only adds noise (the modellers for test/let/cd/arith all return
     /// such a block). A `#[must_use]` call (io/fs/process/thread) still
     /// needs the explicit discard, and a pure constructor left behind by a
@@ -12485,9 +12485,9 @@ while __p.len() > 1 && __p.ends_with('/') {{ __p = &__p[..__p.len() - 1]; }} @TA
         if t == "String::new()" {
             return;
         }
-        // Only a block whose TAIL is a bare carrier (`__b` / `__sh_value` / `__n`)
+        // Only a block whose TAIL is a bare carrier (`__sh_buf` / `__sh_value` / `__sh_num`)
         // — or that has no tail at all — is a plain statement. One ending
-        // in a `#[must_use]` call (`__r.is_ok()`) still needs the discard:
+        // in a `#[must_use]` call (`__sh_res.is_ok()`) still needs the discard:
         // a `Result::is_ok` value dropped as a statement warns.
         if t.starts_with('{') && t.ends_with('}') {
             let inner = &t[1..t.len() - 1];
@@ -12942,7 +12942,7 @@ while __p.len() > 1 && __p.ends_with('/') {{ __p = &__p[..__p.len() - 1]; }} @TA
                         let unw = Self::unwrap_cond(&l);
                         let core = Self::unparen(&unw);
                         self.emit(&format!(
-                            "{{ let __b = {core}; __SH_RC.store(if __b {{ 0 }} else {{ 1 }}, Ordering::Relaxed); if __b {{"
+                            "{{ let __sh_buf = {core}; __SH_RC.store(if __sh_buf {{ 0 }} else {{ 1 }}, Ordering::Relaxed); if __sh_buf {{"
                         ));
                     }
                     self.depth += 1;
@@ -12968,7 +12968,7 @@ while __p.len() > 1 && __p.ends_with('/') {{ __p = &__p[..__p.len() - 1]; }} @TA
                         let core = Self::unparen(&unw);
                         if Self::expr_diverges(lhs) {
                             // `break || …`: the lhs cannot fall through, so
-                            // its status store, the `!__b` test and the rhs
+                            // its status store, the `!__sh_buf` test and the rhs
                             // are all unreachable — exactly what rustc
                             // reported for parse-break-or.
                             // This arm only ever runs from `expr_stmt_value`,
@@ -12979,7 +12979,7 @@ while __p.len() > 1 && __p.ends_with('/') {{ __p = &__p[..__p.len() - 1]; }} @TA
                             self.emit(&core);
                         } else {
                             self.emit(&format!(
-                                "{{ let __b = {core}; __SH_RC.store(if __b {{ 0 }} else {{ 1 }}, Ordering::Relaxed); if !__b {{"
+                                "{{ let __sh_buf = {core}; __SH_RC.store(if __sh_buf {{ 0 }} else {{ 1 }}, Ordering::Relaxed); if !__sh_buf {{"
                             ));
                             self.depth += 1;
                             self.expr_stmt_value(rhs);
@@ -13180,11 +13180,11 @@ while __p.len() > 1 && __p.ends_with('/') {{ __p = &__p[..__p.len() - 1]; }} @TA
                         }
                     }
                     if is_i64 {
-                        // Gensymmed: `__n` is a plausible USER variable, and
+                        // Gensymmed: `__sh_num` is a plausible USER variable, and
                         // binding it here would shadow the real one for the
-                        // rest of the block (a later `__n = __n + 1` then
+                        // rest of the block (a later `__sh_num = __sh_num + 1` then
                         // hits an immutable rebind, E0384).
-                        let nv = self.gensym("__n");
+                        let nv = self.gensym("__sh_num");
                         self.emit(&format!(
                             "let {nv} = if __SH_ARITH_ERR.swap(false, Ordering::Relaxed) {{ 0 }} else {{ {v} }};"
                         ));
@@ -13193,7 +13193,7 @@ while __p.len() > 1 && __p.ends_with('/') {{ __p = &__p[..__p.len() - 1]; }} @TA
                         ));
                     } else {
                         self.emit(&format!(
-                            "{{ let __sh_value = {v}; let __n = __sh_value.trim().parse::<i64>().unwrap_or(0); __SH_RC.store(if __n != 0 {{ 0 }} else {{ 1 }}, Ordering::Relaxed); __sh_value }};"
+                            "{{ let __sh_value = {v}; let __sh_num = __sh_value.trim().parse::<i64>().unwrap_or(0); __SH_RC.store(if __sh_num != 0 {{ 0 }} else {{ 1 }}, Ordering::Relaxed); __sh_value }};"
                         ));
                     }
                     return;
@@ -13212,8 +13212,8 @@ while __p.len() > 1 && __p.ends_with('/') {{ __p = &__p[..__p.len() - 1]; }} @TA
                         if tainted || huge {
                             let b = self.arith_bigint(a);
                                                 format!(
-                                "{{ let __sh_value = ({b}).to_string(); let __e = __SH_ARITH_ERR.swap(false, Ordering::Relaxed); \
-                         __SH_RC.store(if __e {{ 1 }} else {{ 0 }}, Ordering::Relaxed); if __e {{ String::new() }} else {{ __sh_value }} }}"
+                                "{{ let __sh_value = ({b}).to_string(); let __sh_item = __SH_ARITH_ERR.swap(false, Ordering::Relaxed); \
+                         __SH_RC.store(if __sh_item {{ 1 }} else {{ 0 }}, Ordering::Relaxed); if __sh_item {{ String::new() }} else {{ __sh_value }} }}"
                             )
                         } else {
                     // `x=$((...))` — bash collapses the expansion to
@@ -13221,8 +13221,8 @@ while __p.len() > 1 && __p.ends_with('/') {{ __p = &__p[..__p.len() - 1]; }} @TA
                     // (division/modulo by zero); the checked div/mod
                     // helpers flag the error via __SH_ARITH_ERR.
                                 format!(
-                        "{{ let __sh_value = ({}).to_string(); let __e = __SH_ARITH_ERR.swap(false, Ordering::Relaxed); \
-                         __SH_RC.store(if __e {{ 1 }} else {{ 0 }}, Ordering::Relaxed); if __e {{ String::new() }} else {{ __sh_value }} }}",
+                        "{{ let __sh_value = ({}).to_string(); let __sh_item = __SH_ARITH_ERR.swap(false, Ordering::Relaxed); \
+                         __SH_RC.store(if __sh_item {{ 1 }} else {{ 0 }}, Ordering::Relaxed); if __sh_item {{ String::new() }} else {{ __sh_value }} }}",
                         self.arith(a)
                     )
                         }
@@ -13412,7 +13412,7 @@ while __p.len() > 1 && __p.ends_with('/') {{ __p = &__p[..__p.len() - 1]; }} @TA
                 let c = self.expr_str(content);
                 if *append {
                     self.emit(&format!(
-                        "{{ let mut __f = std::fs::OpenOptions::new().append(true).create(true).open(&{p}).unwrap_or_else(|_| {{ let f = std::fs::File::open(\"/dev/null\").unwrap(); f }}); use std::io::Write; let _ = __f.write_all({c}.as_bytes()); }}"
+                        "{{ let mut __sh_field = std::fs::OpenOptions::new().append(true).create(true).open(&{p}).unwrap_or_else(|_| {{ let f = std::fs::File::open(\"/dev/null\").unwrap(); f }}); use std::io::Write; let _ = __sh_field.write_all({c}.as_bytes()); }}"
                     ));
                 } else {
                     self.emit(&format!("let _ = std::fs::write({p}, {c});"));
@@ -13624,8 +13624,8 @@ while __p.len() > 1 && __p.ends_with('/') {{ __p = &__p[..__p.len() - 1]; }} @TA
                 }
             }
             IrStmt::While { cond, body } => {
-                // `expr_bool` wraps the condition in a `{ let __b = …;
-                // store; __b }` status wrapper — strip it like the `if`
+                // `expr_bool` wraps the condition in a `{ let __sh_buf = …;
+                // store; __sh_buf }` status wrapper — strip it like the `if`
                 // arms do (`unwrap_cond`): a bare `while COND; store`
                 // is a parse error, and the loop's own capture/restore
                 // apparatus owns the status here.
@@ -14011,7 +14011,7 @@ while __p.len() > 1 && __p.ends_with('/') {{ __p = &__p[..__p.len() - 1]; }} @TA
                                     self.emit(&format!("{attr}for {b} in {iter} {{"))
                                 }
                                 (Some(b), true) => self.emit(&format!(
-                                    "for {b} in {iter}.iter().map(|__s| __s.trim().parse::<i64>().unwrap_or(0)) {{"
+                                    "for {b} in {iter}.iter().map(|__sh_str| __sh_str.trim().parse::<i64>().unwrap_or(0)) {{"
                                 )),
                                 (Some(b), false) => {
                                     self.emit(&format!("{attr}for {b} in {iter} {{"))
@@ -14645,7 +14645,7 @@ while __p.len() > 1 && __p.ends_with('/') {{ __p = &__p[..__p.len() - 1]; }} @TA
         // tracked background thread — `wait` joins it (bash `{ ... } &`
         // + `wait` must observe the job's completion/ordering)
         self.emit(&format!(
-            "let __th = std::thread::spawn(move || {{\n{body_src}\n}});\n__SH_BGTHREADS.lock().unwrap().push(__th);"
+            "let __sh_bgthread = std::thread::spawn(move || {{\n{body_src}\n}});\n__SH_BGTHREADS.lock().unwrap().push(__sh_bgthread);"
         ));
     }
 
@@ -14660,7 +14660,7 @@ while __p.len() > 1 && __p.ends_with('/') {{ __p = &__p[..__p.len() - 1]; }} @TA
     /// fall back to scanning the WHOLE body: when every store is the
     /// literal `0` and nothing loads the register, the status is zero on
     /// every path. Stores that can be nonzero (`__SH_RC.store(1, …)`, a
-    /// `if cond {0} else {1}` arm, a captured `__r`, a shell-out) keep
+    /// `if cond {0} else {1}` arm, a captured `__sh_res`, a shell-out) keep
     /// the register so a data-dependent exit status survives.
     fn body_rc_is_zero(body_out: &[String]) -> bool {
         for line in body_out.iter().rev() {
@@ -17754,13 +17754,13 @@ impl<'a, 'r> TestParser<'a, 'r> {
                 "std::fs::OpenOptions::new().write(true).open(&{operand}).is_ok()"
             ),
             "-x" => format!(
-                "std::fs::metadata(&{operand}).map(|__m| {{ use std::os::unix::fs::PermissionsExt; __m.permissions().mode() & 0o111 != 0 }}).unwrap_or(false)"
+                "std::fs::metadata(&{operand}).map(|__sh_mapped| {{ use std::os::unix::fs::PermissionsExt; __sh_mapped.permissions().mode() & 0o111 != 0 }}).unwrap_or(false)"
             ),
             "-s" => format!(
-                "std::fs::metadata(&{operand}).map(|__m| __m.len() > 0).unwrap_or(false)"
+                "std::fs::metadata(&{operand}).map(|__sh_mapped| __sh_mapped.len() > 0).unwrap_or(false)"
             ),
             "-L" | "-h" => format!(
-                "std::fs::symlink_metadata(&{operand}).map(|__m| __m.file_type().is_symlink()).unwrap_or(false)"
+                "std::fs::symlink_metadata(&{operand}).map(|__sh_mapped| __sh_mapped.file_type().is_symlink()).unwrap_or(false)"
             ),
             "-p" | "-S" | "-b" | "-c" | "-u" | "-g" | "-k" => {
                 let bits = match op {
@@ -17773,7 +17773,7 @@ impl<'a, 'r> TestParser<'a, 'r> {
                     _ => "0o001000",
                 };
                 format!(
-                    "std::fs::metadata(&{operand}).map(|__m| {{ use std::os::unix::fs::MetadataExt; (__m.mode() & {bits}) == {bits} }}).unwrap_or(false)"
+                    "std::fs::metadata(&{operand}).map(|__sh_mapped| {{ use std::os::unix::fs::MetadataExt; (__sh_mapped.mode() & {bits}) == {bits} }}).unwrap_or(false)"
                 )
             }
             "-O" => {
@@ -17959,14 +17959,14 @@ impl<'a, 'r> TestParser<'a, 'r> {
                         && l.chars().all(|c| c.is_ascii_alphanumeric() || c == '_');
                     if l_ident {
                         if eq {
-                            format!("{{ let __r = {r}; if __sh_glob_like(&__r) {{ __sh_fnmatch(&__r, &{l}) }} else {{ {l} == __r }} }}")
+                            format!("{{ let __sh_res = {r}; if __sh_glob_like(&__sh_res) {{ __sh_fnmatch(&__sh_res, &{l}) }} else {{ {l} == __sh_res }} }}")
                         } else {
-                            format!("{{ let __r = {r}; if __sh_glob_like(&__r) {{ !__sh_fnmatch(&__r, &{l}) }} else {{ {l} != __r }} }}")
+                            format!("{{ let __sh_res = {r}; if __sh_glob_like(&__sh_res) {{ !__sh_fnmatch(&__sh_res, &{l}) }} else {{ {l} != __sh_res }} }}")
                         }
                     } else if eq {
-                        format!("{{ let __r = {r}; let __l = {l}; if __sh_glob_like(&__r) {{ __sh_fnmatch(&__r, &__l) }} else {{ __l == __r }} }}")
+                        format!("{{ let __sh_res = {r}; let __sh_span = {l}; if __sh_glob_like(&__sh_res) {{ __sh_fnmatch(&__sh_res, &__sh_span) }} else {{ __sh_span == __sh_res }} }}")
                     } else {
-                        format!("{{ let __r = {r}; let __l = {l}; if __sh_glob_like(&__r) {{ !__sh_fnmatch(&__r, &__l) }} else {{ __l != __r }} }}")
+                        format!("{{ let __sh_res = {r}; let __sh_span = {l}; if __sh_glob_like(&__sh_res) {{ !__sh_fnmatch(&__sh_res, &__sh_span) }} else {{ __sh_span != __sh_res }} }}")
                     }
                 }
             }
@@ -18002,7 +18002,7 @@ impl<'a, 'r> TestParser<'a, 'r> {
                 // parsing). `None` carries the distinction out of the helper;
                 // `rc_strip` removes the store when the register is dead.
                 format!(
-                    "{{ let __m = __sh_regex(&{l}, &{r}, {flags}); match __m {{ Some(__m) => __m, None => {{ __SH_RC.store(2, Ordering::Relaxed); false }} }} }}"
+                    "{{ let __sh_mapped = __sh_regex(&{l}, &{r}, {flags}); match __sh_mapped {{ Some(__sh_mapped) => __sh_mapped, None => {{ __SH_RC.store(2, Ordering::Relaxed); false }} }} }}"
                 )
             }
             "-nt" | "-ot" => {
@@ -19215,7 +19215,7 @@ fn reads_before_write(stmts: &[IrStmt], var: &str) -> bool {
     /// A store can reach a variable three ways in this IR: a statement
     /// `Assign`, a `Declare`, or an expression-level `setVar(name, …)` /
     /// `assign(name, …)` — the last is how an assignment nested inside an
-    /// expression block (`{ let __o = i; i = i + 1; __o }`) is spelled, and
+    /// expression block (`{ let __sh_out = i; i = i + 1; __sh_out }`) is spelled, and
     /// missing it made every such store look like a read, so the default
     /// initialiser survived and rustc reported a dead store.
     fn expr_write_target(e: &IrExpr, var: &str) -> bool {
@@ -19249,7 +19249,7 @@ fn reads_before_write(stmts: &[IrStmt], var: &str) -> bool {
             // A store nested in a block/sequence expression: the carrier is
             // `IrExpr::Arrow(Vec<IrStmt>)` (`{ let __sh_value = …; r = …; __sh_value }`).
             // It counts as a write only when the body WRITES before it reads:
-            // a self-read (`{ let __o = i; i = i + 1; __o }`) means the value
+            // a self-read (`{ let __sh_out = i; i = i + 1; __sh_out }`) means the value
             // observed is the one from before the store, so deferring the
             // declaration there would read an uninitialised binding.
             IrExpr::Arrow(body) => {
@@ -21449,8 +21449,8 @@ fn scan_stmt(st: &IrStmt, var: &str, ev: &mut Vec<bool>, muted: bool) {
         // A LOOP-CARRIED value is read again after the body's store, on the
         // next iteration — the ordered walk alone cannot see that, because
         // the condition's read site comes BEFORE the store. Without this,
-        // `while [ $__n -lt 1000 ]; do __n=$((__n+1)); done` elided the
-        // update as a dead store (`let _ = __n + 1;`) and the loop never
+        // `while [ $__sh_num -lt 1000 ]; do __sh_num=$((__sh_num+1)); done` elided the
+        // update as a dead store (`let _ = __sh_num + 1;`) and the loop never
         // terminated (bench-count, bench-increment, hoist-loop-self-update,
         // hot-scalar-accumulator-loop). Replaying the loop as READ-ONLY
         // events marks a body store live whenever the loop itself reads the
@@ -21474,7 +21474,7 @@ fn scan_stmt(st: &IrStmt, var: &str, ev: &mut Vec<bool>, muted: bool) {
             replay_loop_reads(ev, mark, muted);
         }
         // For execution ORDER: init, condition, body, step. `step` was never
-        // walked, so a counter bumped only there (`__n=$((__n+1))`) read as
+        // walked, so a counter bumped only there (`__sh_num=$((__sh_num+1))`) read as
         // an unwritten variable.
         IrStmt::ForInit { init, cond, step, body, .. } => {
             let mark = ev.len();
@@ -21533,8 +21533,8 @@ fn scan_stmt(st: &IrStmt, var: &str, ev: &mut Vec<bool>, muted: bool) {
 
 /// Reads and writes inside a parsed arithmetic node. `$((…))` / `((…))`
 /// carry their variable references in an AST, not in `Var` children — with
-/// only the `Ext` arm below, `while [ $__n -lt 1000 ]` and
-/// `__n=$((__n+1))` contributed NO events for `__n`, so the update looked
+/// only the `Ext` arm below, `while [ $__sh_num -lt 1000 ]` and
+/// `__sh_num=$((__sh_num+1))` contributed NO events for `__sh_num`, so the update looked
 /// like a dead store and the loop never terminated.
 fn scan_arith(a: &ArithAst, var: &str, ev: &mut Vec<bool>, muted: bool) {
     match a {
@@ -23213,7 +23213,7 @@ mod tests {
 
     #[test]
     fn unwrap_cond_strips_every_top_level_wrapper() {
-        let w = |e: &str| format!("{{ let __b = {e}; __SH_RC.store(if __b {{ 0 }} else {{ 1 }}, Ordering::Relaxed); __b }}");
+        let w = |e: &str| format!("{{ let __sh_buf = {e}; __SH_RC.store(if __sh_buf {{ 0 }} else {{ 1 }}, Ordering::Relaxed); __sh_buf }}");
         // a whole-condition wrapper
         assert_eq!(Render::unwrap_cond(&w("x")), "x");
         // an `&&` tree: EACH operand is wrapped separately
@@ -23300,7 +23300,7 @@ mod tests {
 
     #[test]
     fn status_wrapper_stripped_in_condition_position() {
-        // the `{ let __b = E; __SH_RC.store(..); __b }` wrapper exists to
+        // the `{ let __sh_buf = E; __SH_RC.store(..); __sh_buf }` wrapper exists to
         // land the test's status in `$?`; an `if` resets __SH_RC itself,
         // so in condition position the store is dead and the wrapper goes.
         let _szg = crate::shir::SIZE_OPT_TEST_LOCK
@@ -23308,7 +23308,7 @@ mod tests {
             .unwrap_or_else(|e| e.into_inner());
         crate::shir::set_size_opt(false);
         let out = render("if [ \"$x\" = \"hi\" ]; then echo y; fi\n");
-        assert!(!out.contains("let __b"), "dead status wrapper kept:\n{out}");
+        assert!(!out.contains("let __sh_buf"), "dead status wrapper kept:\n{out}");
         assert!(!out.contains("__SH_RC"), "dead rc register kept:\n{out}");
         // ...but the status IS observable after a bare test, so it stays.
         let out = render("[ \"a\" = \"b\" ]\necho \"$?\"\n");
@@ -23345,7 +23345,7 @@ mod tests {
 
     #[test]
     fn golf_keeps_string_contents() {
-        // `//` and `__x` lookalikes INSIDE string literals are data,
+        // `//` and `__sh_state` lookalikes INSIDE string literals are data,
         // not code — the golf pass must not touch them.
         let out = super::golf_rust("fn main() {\n    print!(\"a // b __sh_x\");\n}\n");
         assert!(out.contains("\"a // b __sh_x\""), "string literal altered:\n{out}");
@@ -23385,7 +23385,7 @@ mod tests {
         let out = render("f() { echo \"$#:$*\"; }\nf a b\n");
         assert!(out.contains("__argv: &[String]"), "argv param not emitted:\n{out}");
         assert!(
-            !out.contains("let __old = __SH_ARGV"),
+            !out.contains("let __sh_savedout = __SH_ARGV"),
             "legacy argv swap kept:\n{out}"
         );
         assert!(out.contains("__argv.len()"), "$# not the slice length:\n{out}");
@@ -23444,7 +23444,7 @@ mod tests {
             "rest param not emitted:\n{out}"
         );
         assert!(
-            !out.contains("let __old = __SH_ARGV"),
+            !out.contains("let __sh_savedout = __SH_ARGV"),
             "legacy argv dance kept:\n{out}"
         );
         assert!(
@@ -23464,7 +23464,7 @@ mod tests {
         let out = render("f() { shift; echo \"$1 $2\"; }\nf a b c\n");
         assert!(out.contains("__rest: &[String]"), "{out}");
         assert!(
-            out.contains("&__a[(1).min(__a.len())..]"),
+            out.contains("&__sh_operand[(1).min(__sh_operand.len())..]"),
             "rest slice must start at the shift offset:\n{out}"
         );
     }
@@ -23504,11 +23504,11 @@ mod tests {
 
     #[test]
     fn golf_never_merges_distinct_bindings() {
-        // t86: a renderer local already spelling a pool name (`__a`)
+        // t86: a renderer local already spelling a pool name (`__sh_operand`)
         // plus a helper the pool would shorten to the same spelling —
         // the pool must skip taken shorts so the two never merge (was:
-        // `fn __sh_fn_f` and `let __a` both becoming `__p`).
-        let out = super::golf_rust("fn __sh_fn_f(p0: i64) -> String { p0.to_string() }\nfn main() {\nlet __a: Vec<String> = vec![];\n__sh_fn_f(1);\n}\n");
+        // `fn __sh_fn_f` and `let __sh_operand` both becoming `__sh_part`).
+        let out = super::golf_rust("fn __sh_fn_f(p0: i64) -> String { p0.to_string() }\nfn main() {\nlet __sh_operand: Vec<String> = vec![];\n__sh_fn_f(1);\n}\n");
         assert!(!out.contains("__sh_fn_f"), "helper not shortened:\n{out}");
         // count distinct `__`-spellings on the helper's decl + call:
         // both must agree with each other and differ from the local
@@ -23516,7 +23516,7 @@ mod tests {
         let helper: String = decl.split(['(', ' ']).nth(1).unwrap_or("").to_string();
         assert!(helper.starts_with("__"), "no helper decl:\n{out}");
         assert!(out.contains(&format!("{helper}(1);")), "call site diverged:\n{out}");
-        assert_ne!(helper, "__a", "helper merged with the local:\n{out}");
+        assert_ne!(helper, "__sh_operand", "helper merged with the local:\n{out}");
     }
 
     #[test]
@@ -23784,7 +23784,7 @@ mod tests {
             "static kept for a local array:\n{out}"
         );
         assert!(
-            !out.contains(".borrow()[__idx as usize].clone()"),
+            !out.contains(".borrow()[__sh_pos as usize].clone()"),
             "string element read kept:\n{out}"
         );
     }
@@ -24153,8 +24153,8 @@ mod tests {
     #[test]
     fn final_pipelines_and_glob_classes_execute_like_bash() {
         let cases: &[(&str, &str, Option<&str>)] = &[
-            ("FinalPipeHead", "echo abc | head -n 2\n", Some("__l[..__e].join")),
-            ("FinalPipeTail", "echo abc | tail -n 1\n", Some("__l[__s..].join")),
+            ("FinalPipeHead", "echo abc | head -n 2\n", Some("__sh_span[..__sh_item].join")),
+            ("FinalPipeTail", "echo abc | tail -n 1\n", Some("__sh_span[__sh_str..].join")),
             ("FinalPipeWc", "echo \"a b c\" | wc -w\n", None),
             ("FinalPipeCut", "echo \"a,b,c\" | cut -d, -f2\n", None),
             ("FinalPipeXargs", "echo \" a b \" | xargs\n", None),
@@ -24395,7 +24395,7 @@ mod tests {
             (
                 "mktemp",
                 "d=$(mktemp -d)\nif [ -d \"$d\" ]; then echo y; fi\n",
-                &["create_new(true)", "TMPDIR", "create_dir(&__s)"],
+                &["create_new(true)", "TMPDIR", "create_dir(&__sh_str)"],
             ),
             (
                 "-f",
@@ -24508,7 +24508,7 @@ mod tests {
                 ".matches('\\n').count()",
                 "x=$(echo hello | wc -l)\necho \"l=$x\"\n",
             ),
-            ("RepeatStr", ".repeat(__n as usize)", "yes x | head -n 3\n"),
+            ("RepeatStr", ".repeat(__sh_num as usize)", "yes x | head -n 3\n"),
             (
                 "SubStrExtract",
                 ".chars().skip(",
@@ -24526,13 +24526,13 @@ mod tests {
             ),
             (
                 "CharTranslate",
-                "position(|&__x|",
+                "position(|&__sh_state|",
                 "w=$(echo abc-xyz | tr 'a-c' 'x')\necho \"$w\"\n",
             ),
 
             (
                 "CharTranslateDelete",
-                "filter(|__c|",
+                "filter(|__sh_ch|",
                 "w=$(echo abc-xyz | tr -d 'a-c')\necho \"$w\"\n",
             ),
             (
@@ -24832,7 +24832,7 @@ mod tests {
         let out = render_rs("v=$(echo a:b:c | cut -d: -f2)\necho \"$v\"\n");
         assert!(!out.contains("__sh_spawn("), "still shells out:\n{out}");
         assert!(out.contains(".split(\":\")"), "no split:\n{out}");
-        assert!(out.contains("__p[1].to_string()"), "no field take:\n{out}");
+        assert!(out.contains("__sh_part[1].to_string()"), "no field take:\n{out}");
     }
 
     /// `yes x | head -n 3` is a repeat of the literal line.
@@ -24840,7 +24840,7 @@ mod tests {
     fn repeat_str_is_a_native_repeat() {
         let out = render_rs("yes x | head -n 3\n");
         assert!(!out.contains("__sh_spawn("), "still shells out:\n{out}");
-        assert!(out.contains(".repeat(__n as usize)"), "no repeat:\n{out}");
+        assert!(out.contains(".repeat(__sh_num as usize)"), "no repeat:\n{out}");
     }
 
     /// `tr A-Z a-z` is a case fold.
@@ -24868,7 +24868,7 @@ mod tests {
             assert!(!out.contains("fn __sh_"), "helper emitted:\n{out}");
             assert!(out.contains(".split('\\n')"), "no line split:\n{out}");
             assert!(out.contains(".join(\"\\n\")"), "no rejoin:\n{out}");
-            assert!(out.contains("if __n <= 0 { String::new() }"), "no empty arm:\n{out}");
+            assert!(out.contains("if __sh_num <= 0 { String::new() }"), "no empty arm:\n{out}");
         }
     }
 
@@ -25070,20 +25070,20 @@ mod tests {
         let longest_tail = render_rs(&format!("{p}echo \"${{p##*/}}\"\n"));
         assert!(longest_tail.contains("rfind"), "{longest_tail}");
         assert!(
-            longest_tail.contains("__s[__i + __d.len()..]"),
+            longest_tail.contains("__sh_str[__sh_begin + __sh_delim.len()..]"),
             "{longest_tail}"
         );
         let shortest_tail = render_rs(&format!("{p}echo \"${{p#*/}}\"\n"));
         assert!(
-            shortest_tail.contains(".find(__d)"),
+            shortest_tail.contains(".find(__sh_delim)"),
             "shortest strip must use find:\n{shortest_tail}"
         );
         let longest_head = render_rs(&format!("{p}echo \"${{p%/*}}\"\n"));
         assert!(longest_head.contains("rfind"), "{longest_head}");
-        assert!(longest_head.contains("__s[..__i]"), "{longest_head}");
+        assert!(longest_head.contains("__sh_str[..__sh_begin]"), "{longest_head}");
         let shortest_head = render_rs(&format!("{p}echo \"${{p%%/*}}\"\n"));
         assert!(
-            shortest_head.contains(".find(__d)"),
+            shortest_head.contains(".find(__sh_delim)"),
             "{shortest_head}"
         );
         // Never a TODO, and never the glob engine this node exists to avoid.
@@ -25095,11 +25095,11 @@ mod tests {
 
     /// `strip_let_parens` runs at the ONE choke point every statement
     /// passes, so a template that interpolates a parenthesized value loses
-    /// the pair without hunting each emit site: `let __k = (i + 1);` →
-    /// `let __k = i + 1;`.
+    /// the pair without hunting each emit site: `let __sh_key = (i + 1);` →
+    /// `let __sh_key = i + 1;`.
     #[test]
     fn let_initializer_parens_are_stripped() {
-        assert_eq!(Render::strip_let_parens("let __k = (i + 1);"), "let __k = i + 1;");
+        assert_eq!(Render::strip_let_parens("let __sh_key = (i + 1);"), "let __sh_key = i + 1;");
         assert_eq!(
             Render::strip_let_parens("let mut x = (a * (b + c));"),
             "let mut x = a * (b + c);"
@@ -25333,11 +25333,11 @@ mod tests {
 
     /// The call site passes the words STRAIGHT to the parameters when the
     /// signature is fixed-arity: no `Vec<String>` round trip, no
-    /// `__a.get(i).cloned().unwrap_or_default()` unpack.
+    /// `__sh_operand.get(i).cloned().unwrap_or_default()` unpack.
     #[test]
     fn fixed_arity_call_skips_the_argv_round_trip() {
         let out = render("f() { local x=\"$1\"; echo \"$x\"; }\nf hi\n");
-        assert!(!out.contains("let __a: Vec<String>"), "{out}");
+        assert!(!out.contains("let __sh_operand: Vec<String>"), "{out}");
         assert!(!out.contains("__SH_ARGV"), "argv machinery kept:\n{out}");
         assert!(!out.contains("fn __sh_arg"), "arg helper kept:\n{out}");
     }
@@ -25464,7 +25464,7 @@ mod tests {
             .collect::<Vec<_>>()
             .join("\n");
         assert!(!main_body.contains("\n\n"), "stray blank in main:\n{out}");
-        assert!(main_body.contains("__any"), "cond value lost:\n{out}");
+        assert!(main_body.contains("__sh_gotline"), "cond value lost:\n{out}");
         assert!(!main_body.contains("__SH_RC"), "status kept:\n{out}");
     }
 
@@ -25553,7 +25553,7 @@ mod tests {
     #[test]
     fn print_span_keeps_vec_element_to_strings() {
         let mut t = String::from(
-            "println!(\"{}\", { let __a: Vec<String> = vec![\"a\".to_string(), \"b\".to_string()]; __a });",
+            "println!(\"{}\", { let __sh_operand: Vec<String> = vec![\"a\".to_string(), \"b\".to_string()]; __sh_operand });",
         );
         super::collapse_print_format(&mut t);
         assert!(t.contains("\"a\".to_string()"), "first element stripped:\n{t}");
@@ -25749,7 +25749,7 @@ mod tests {
         // MULTI-element mix with a non-vec part (an owned merge is not
         // free). A single arbitrary element DOES collapse: cat of one
         // iterable copies exactly that element's contents.
-        assert_eq!(super::cat_peephole("__sh_cat(&__b)"), "__sh_cat(&__b)");
+        assert_eq!(super::cat_peephole("__sh_cat(&__sh_buf)"), "__sh_cat(&__sh_buf)");
         assert_eq!(
             super::cat_peephole("__sh_cat(&[__sh_glob(p)])"),
             "__sh_glob(p)"

@@ -90,8 +90,8 @@ fn build_cat_replacement(args: &[IrExpr]) -> Option<IrStmt> {
     }
 
     let seq = SEQ.fetch_add(1, Ordering::Relaxed) + 1;
-    let line_var = format!("__cl{seq}");
-    let num_var = format!("__cn{seq}");
+    let line_var = format!("__cat_line{seq}");
+    let num_var = format!("__cat_num{seq}");
     let mut blocks: Vec<IrStmt> = Vec::new();
     for file in &files {
         if numbered {
