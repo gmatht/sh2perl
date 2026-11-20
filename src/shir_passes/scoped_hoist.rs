@@ -43,9 +43,14 @@
 //! * the FIRST mention of the name is that assignment (a read before it
 //!   sees the shell's unset empty string, which the global home models and
 //!   a hoisted `let` would not), and
-//! * at least one read sits in a conditional TEST — the shape this pass
-//!   exists for. Everything else is left exactly as it was, so no program
-//!   that lowers cleanly today changes shape.
+//! * at least one read sits in a conditional TEST **as an IR expression**
+//!   (`Var`/`getVar`), not merely as a `$name` inside a quoted shell word
+//!   — the shape this pass exists for, and the only shape every renderer
+//!   can bind. A word-text-only read is refused because the renderers'
+//!   binding census does not see it: the `Declare` then emits no `let`
+//!   while the read renders the bare identifier (measured E0425).
+//!   Everything else is left exactly as it was, so no program that lowers
+//!   cleanly today changes shape.
 //!
 //! The rewrite keeps the assignment at its own position (the `Declare`
 //! renders where the `Assign` was), so nothing can observe the binding
@@ -116,10 +121,16 @@ struct Census {
     read_in_cond: bool,
     /// A mention (read or write) precedes the top-level assignment.
     mention_before: bool,
-    /// The name is a plain `$name` / `name` operand inside a shell word (a
-    /// `test "-z \"$x\""` operand, a case pattern). Such a word is
-    /// EVALUATED by the renderer at its own position, so a hoisted `let`
-    /// is fine, but it is not a mention the IR walker can see.
+    /// The name is read ONLY through a shell word's TEXT (`$name` inside a
+    /// `test "-n \"$x\""` operand, an all-literal `Interpolate` part) —
+    /// not through an IR expression the renderers' use census sees. Such a
+    /// read does NOT license a hoist: every backend decides the binding
+    /// from IR-visible uses, so a name whose only read is word text gets a
+    /// `Declare` with NO emitted `let` and the read site still renders the
+    /// bare identifier — measured E0425 (`s` unbound) in the Rust renderer,
+    /// while the same program without the hoist compiles and prints bash's
+    /// bytes. Requiring an IR-visible condition read is therefore part of
+    /// soundness, not a convenience.
     word_read_in_cond: bool,
 }
 
@@ -152,6 +163,8 @@ fn write_other(out: &mut std::collections::HashMap<String, Census>, n: &str) {
     out.entry(n.to_string()).or_default().other_writes += 1;
 }
 
+/// An IR-VISIBLE read: `Var`/`Ident`, a `getVar` argument. Every renderer's
+/// binding census counts these, so only they may license a hoist.
 fn read(out: &mut std::collections::HashMap<String, Census>, n: &str, in_cond: bool) {
     if !ident_word(n) {
         return;
@@ -159,6 +172,25 @@ fn read(out: &mut std::collections::HashMap<String, Census>, n: &str, in_cond: b
     let c = out.entry(n.to_string()).or_default();
     c.read = true;
     c.read_in_cond |= in_cond;
+}
+
+/// A read that exists only as WORD TEXT (`$name` inside a quoted word). It
+/// is a real read of the shell variable (so it keeps `read` true and the
+/// name out of the "never read" bucket), but it must not satisfy
+/// `read_in_cond`: the renderers cannot bind a name they only see here.
+fn word_text_read(
+    out: &mut std::collections::HashMap<String, Census>,
+    n: &str,
+    in_cond: bool,
+) {
+    if !ident_word(n) {
+        return;
+    }
+    let c = out.entry(n.to_string()).or_default();
+    c.read = true;
+    if in_cond {
+        c.word_read_in_cond = true;
+    }
 }
 
 /// Record a word-level read: `$name`, `${name}`, or a bare `name` token.
@@ -370,9 +402,10 @@ fn walk_expr(
     match e {
         IrExpr::Var(n, _) | IrExpr::Ident(n) => read(out, n, in_cond),
         IrExpr::Str(s, _) => {
-            // a `$v` / `${v}` inside a double-quoted word is a read
+            // a `$v` / `${v}` inside a double-quoted word is a read, but a
+            // WORD-TEXT one: it does not license a hoist (see Census).
             for v in dollar_vars(s) {
-                read(out, &v, in_cond);
+                word_text_read(out, &v, in_cond);
             }
         }
         IrExpr::Call { func, args } => {
@@ -754,9 +787,12 @@ mod tests {
     }
 
     #[test]
-    fn a_shell_word_operand_read_is_a_condition_read() {
-        // The shell test spelling: the operand is one literal word carrying
-        // the reference (`test("-z \"$s\"")`), not a `getVar` call.
+    fn a_word_text_only_read_is_refused() {
+        // The shell test spelling puts the reference inside ONE literal
+        // word (`test("-z \"$s\"")`). That read is invisible to every
+        // renderer's binding census, so a hoist would emit a `Declare`
+        // with no `let` while the read renders `s` — measured E0425 in
+        // the Rust renderer. Refuse>guess: leave the program alone.
         let mut p = cond_read_program();
         if let IrStmt::If { cond, .. } = &mut p.stmts[1] {
             *cond = IrExpr::Call {
@@ -764,10 +800,27 @@ mod tests {
                 args: vec![str_("-z \"$s\"")],
             };
         }
+        let before = format!("{:?}", p.stmts);
+        ScopedHoist.run(&mut p, &PassContext::default());
+        assert_eq!(before, format!("{:?}", p.stmts));
+    }
+
+    #[test]
+    fn a_word_read_beside_an_ir_condition_read_still_hoists() {
+        // The shape that DOES lower: a word operand plus an IR-visible
+        // condition read (`not(getVar s)`), which gives the renderers the
+        // use that emits the binding.
+        let mut p = cond_read_program();
+        if let IrStmt::If { cond, .. } = &mut p.stmts[1] {
+            *cond = IrExpr::Call {
+                func: "not".to_string(),
+                args: vec![read("s")],
+            };
+        }
         ScopedHoist.run(&mut p, &PassContext::default());
         assert!(
             matches!(&p.stmts[0], IrStmt::Declare { vars, .. } if vars[0].name == "s"),
-            "word-operand read hoists the binding: {:?}",
+            "IR-visible condition read hoists: {:?}",
             p.stmts[0]
         );
     }
