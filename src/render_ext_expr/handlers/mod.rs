@@ -16,6 +16,7 @@
     pub(crate) mod reg_sub;
     pub(crate) mod regexp_find;
     pub(crate) mod repeat_str;
+    pub(crate) mod sort_lines;
     pub(crate) mod split;
     pub(crate) mod str_len;
     pub(crate) mod string_affix;
@@ -23,5 +24,6 @@
     pub(crate) mod string_trim;
     pub(crate) mod sub_str_extract;
     pub(crate) mod take_lines;
+    pub(crate) mod uniq_lines;
     pub(crate) mod word_count;
 
