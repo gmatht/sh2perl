@@ -24560,6 +24560,19 @@ mod tests {
             ("PathNameDirBare", "rfind('/')", "dirname a\n"),
             ("PathNameDirRoot", "rfind('/')", "dirname /\n"),
             ("PathNameDirTrailing", "rfind('/')", "v=/a/b/\ndirname \"$v\"\n"),
+            // A FOUR-stage pipeline: each stage reduced against the previous
+            // stage's value (`tr` decodes its `\n` escape too), so the whole
+            // pipeline is one nested value expression and no stage spawns.
+            (
+                "FourStagePipelineChain",
+                "sort_by(",
+                "echo \"b a\" | tr ' ' '\\n' | sort | head -2\n",
+            ),
+            (
+                "FiveStagePipelineChain",
+                "sort_by(",
+                "echo \"c:c b:b a:a\" | tr ' ' '\\n' | sort | tr ':' '/' | head -2\n",
+            ),
         ];
         let mut bad: Vec<String> = Vec::new();
         for (name, marker, src) in cases {

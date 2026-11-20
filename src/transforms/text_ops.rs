@@ -206,7 +206,7 @@ fn lower_stmt(stmt: &mut IrStmt, emit: bool, arrays: &std::collections::HashSet<
         // ShIR pipeline: IrExpr::Call { func: "pipeline", args: [Array(stages)] }
         IrStmt::Expr(IrExpr::Call { func, args }) if func == "pipeline" => {
             if let [IrExpr::Array(stages)] = args.as_slice() {
-                if stages.len() == 2 {
+                if stages.len() >= 2 {
                     // `cat F | <reducible>` — cat contributes a FILE source;
                     // rewrite stage1 body to the file-arg command shape so
                     // the file-source reductions below apply uniformly.
@@ -276,8 +276,8 @@ fn lower_stmt(stmt: &mut IrStmt, emit: bool, arrays: &std::collections::HashSet<
         // stdout is consumed rather than printed, so it is not this arm's
         // "print the reduced value" contract.
         IrStmt::Pipeline { stages, capture: None, last_output: None, .. } if emit => {
-            if let [b1, b2] = stages.as_slice() {
-                if let Some((replacement, already_nl)) = try_lower_pipeline_bodies(b1, b2, true) {
+            {
+                if let Some((replacement, already_nl)) = try_lower_chain(stages, true) {
                     *stmt = with_status_zero(IrStmt::Output {
                         value: replacement,
                         newline: !already_nl,
@@ -713,15 +713,82 @@ fn lower_expr(expr: &mut IrExpr, arrays: &std::collections::HashSet<String>) {
 /// original command.
 fn try_lower_pipeline(stages: &[IrExpr], stmt_level: bool) -> Option<(IrExpr, bool)> {
     // Each stage is an Arrow function: Arrow([Stmt])
-    let stage1_body = match &stages[0] {
-        IrExpr::Arrow(body) => body.as_slice(),
-        _ => return None,
-    };
-    let stage2_body = match &stages[1] {
-        IrExpr::Arrow(body) => body.as_slice(),
-        _ => return None,
-    };
-    try_lower_pipeline_bodies(stage1_body, stage2_body, stmt_level)
+    let mut bodies: Vec<Vec<IrStmt>> = Vec::with_capacity(stages.len());
+    for s in stages {
+        match s {
+            IrExpr::Arrow(body) => bodies.push(body.clone()),
+            _ => return None,
+        }
+    }
+    try_lower_chain(&bodies, stmt_level)
+}
+
+/// One pipeline stage's command, when the stage body is exactly a single
+/// exec/builtin call (`tr X Y`, `sort`, `head -n 2`, …).
+fn stage_cmd(body: &[IrStmt]) -> Option<(String, Vec<IrExpr>)> {
+    match body {
+        [IrStmt::Expr(IrExpr::Call { func, args })] if func == "exec" || func == "builtin" => {
+            if let [IrExpr::Str(name, _), IrExpr::Array(a)] = args.as_slice() {
+                Some((name.clone(), a.clone()))
+            } else {
+                None
+            }
+        }
+        _ => None,
+    }
+}
+
+/// Is `cmd` an intermediate stage whose VALUE is still text (so the next
+/// stage can take it as its input)? `wc` yields a COUNT and `grep -q` a
+/// status — neither is a text value, so a pipeline that goes through one is
+/// not chained (the original command stays, which is exact).
+fn stage_keeps_text(cmd: &str) -> bool {
+    matches!(cmd, "tr" | "sed" | "sort" | "uniq" | "head" | "tail" | "cut" | "xargs")
+}
+
+/// Fold a pipeline of ANY length left-to-right: stage 1 produces the text,
+/// and every later stage reduces against the PREVIOUS stage's value, so
+/// `echo | tr | sort | head` reaches the four nodes the two-stage rewrites
+/// already build instead of shelling out for the whole pipeline.
+///
+/// The intermediate value EXCLUDES the final newline (the same convention
+/// every two-stage reduction uses — the enclosing `Output` supplies it), and
+/// each stage keeps its own `trailing_newline`/`is_literal` rule: a
+/// line-structured command (sort/uniq/sed) gets the same forced-literal
+/// source the two-stage path gives it, so its per-line rules are unchanged.
+fn try_lower_chain(bodies: &[Vec<IrStmt>], stmt_level: bool) -> Option<(IrExpr, bool)> {
+    if bodies.len() < 2 {
+        return None;
+    }
+    if bodies.len() == 2 {
+        return try_lower_pipeline_bodies(&bodies[0], &bodies[1], stmt_level);
+    }
+    let n = bodies.len();
+    let mut src = extract_text_from_stage(&bodies[0])?;
+    for (i, body) in bodies.iter().enumerate().skip(1) {
+        let last = i + 1 == n;
+        let (cmd_name, cmd_args) = stage_cmd(body)?;
+        if !last && !stage_keeps_text(&cmd_name) {
+            return None;
+        }
+        let line_structured = matches!(cmd_name.as_str(), "sort" | "uniq")
+            || (cmd_name == "sed" && sed_is_line_structured(&cmd_args));
+        let source = TextSource {
+            text: src.text.clone(),
+            trailing_newline: src.trailing_newline,
+            is_literal: line_structured || src.is_literal,
+        };
+        let value = lower_text_cmd(source, &cmd_name, &cmd_args, last && stmt_level)?;
+        if last {
+            return Some((value, false));
+        }
+        src = TextSource {
+            text: value,
+            trailing_newline: src.trailing_newline,
+            is_literal: false,
+        };
+    }
+    None
 }
 
 /// The reductions themselves, over the two stages' STATEMENT LISTS — the
@@ -2136,6 +2203,51 @@ mod tests {
             panic!("unexpected statement block shape: {stmt:?}");
         };
         assert!(n.as_any().downcast_ref::<RegCount>().is_some());
+    }
+
+    /// A pipeline longer than two stages FOLDS left-to-right: each later
+    /// stage takes the value the previous reduction produced, so
+    /// `echo | tr | sort | head` reaches CharTranslate, SortLines and
+    /// TakeLines instead of shelling the whole pipeline out.
+    #[test]
+    fn a_long_pipeline_folds_through_the_text_nodes() {
+        let cmd = |name: &str, args: Vec<IrExpr>| {
+            IrStmt::Expr(IrExpr::Call {
+                func: "exec".to_string(),
+                args: vec![st(name), IrExpr::Array(args)],
+            })
+        };
+        let stages = vec![
+            IrExpr::Arrow(echo_stage(vec![st("b a")])),
+            IrExpr::Arrow(vec![cmd("tr", vec![st(" "), st("\\n")])]),
+            IrExpr::Arrow(vec![cmd("sort", vec![])]),
+            IrExpr::Arrow(vec![cmd("head", vec![st("-2")])]),
+        ];
+        let (value, already_nl) = try_lower_pipeline(&stages, true).expect("chain");
+        assert!(!already_nl);
+        let dbg = format!("{value:?}");
+        assert!(dbg.contains("CharTranslate"), "tr stage missing: {dbg}");
+        assert!(dbg.contains("SortLines"), "sort stage missing: {dbg}");
+        assert!(dbg.contains("TakeLines"), "head stage missing: {dbg}");
+    }
+
+    /// A COUNT in the middle of a pipeline is not text: `echo x | wc -l | tr`
+    /// feeds `tr` the digits, so the chain refuses and the original pipeline
+    /// (which is exact) stays.
+    #[test]
+    fn a_count_in_the_middle_breaks_the_chain() {
+        let cmd = |name: &str, args: Vec<IrExpr>| {
+            IrStmt::Expr(IrExpr::Call {
+                func: "exec".to_string(),
+                args: vec![st(name), IrExpr::Array(args)],
+            })
+        };
+        let stages = vec![
+            IrExpr::Arrow(echo_stage(vec![st("x")])),
+            IrExpr::Arrow(vec![cmd("wc", vec![st("-l")])]),
+            IrExpr::Arrow(vec![cmd("tr", vec![st("0"), st("o")])]),
+        ];
+        assert!(try_lower_pipeline(&stages, true).is_none());
     }
 
     #[test]
