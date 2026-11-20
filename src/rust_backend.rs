@@ -3536,6 +3536,14 @@ impl Render {
         }
     }
 
+    /// Indent a multi-line generated EXPRESSION's continuation lines to the
+    /// current statement depth. The first line is placed by whoever embeds
+    /// the expression (`let d = …`), and `emit` prefixes only that line.
+    fn indent_continuation(&self, s: &str) -> String {
+        let pad = "    ".repeat(self.depth);
+        s.replace('\n', &format!("\n{pad}"))
+    }
+
     fn emit(&mut self, s: &str) {
         // `rc_strip` can reduce a whole unit to nothing — a status-store
         // line is exactly `__SH_RC.store(0, Ordering::Relaxed);`, and with
@@ -7637,9 +7645,42 @@ if __o.chars().last() == Some(__c) && __sq.contains(&__c) {{ continue; }} __o.pu
                     Some(t) => Self::rust_str(t),
                     None => Self::rust_str(""),
                 };
-                self.add_helper("mktemp");
+                // The uniqueness loop IS the command, so it is spelled
+                // here (a generated program has no `tempfile` crate): O_EXCL
+                // / create_dir make a name atomic, and a collision draws
+                // another. `TMPDIR` and the trailing-X template are still
+                // honoured; the block is scoped, so it cannot shadow a
+                // caller's names.
+                let code = r#"{
+    let __tmpl: &str = @TMPL@;
+    let __t = if __tmpl.is_empty() {
+        let __d = std::env::var("TMPDIR").ok().filter(|__d| !__d.is_empty()).unwrap_or_else(|| "/tmp".to_string());
+        format!("{}/tmp.XXXXXXXXXX", __d.trim_end_matches('/'))
+    } else {
+        __tmpl.to_string()
+    };
+    let __base = __t.trim_end_matches('X').to_string();
+    let __nx = { let __n = __t.len() - __base.len(); if __n == 0 { 10 } else { __n } };
+    let __cs: &[u8] = b"abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789";
+    '__mk: {
+        for __n in 0..100000u64 {
+            let __seed = (std::process::id() as u64).wrapping_mul(1_000_003)
+                ^ __n.wrapping_mul(7_919)
+                ^ std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map(|__d| __d.subsec_nanos() as u64).unwrap_or(0);
+            let mut __x = __seed | 1;
+            let mut __s = __base.clone();
+            for _ in 0..__nx { __s.push(__cs[(__x % 62) as usize] as char); __x /= 62; }
+            let __ok = if @DIR@ { std::fs::create_dir(&__s).is_ok() } else { std::fs::OpenOptions::new().write(true).create_new(true).open(&__s).is_ok() };
+            if __ok { break '__mk __s; }
+        }
+        String::new()
+    }
+}"#
+                .replace("@TMPL@", &t)
+                .replace("@DIR@", if dir { "true" } else { "false" });
                 Some(format!(
-                    "{{ let __c = __sh_mktemp({dir}, &{t}); __SH_RC.store(if __c.is_empty() {{ 1 }} else {{ 0 }}, Ordering::Relaxed); __c }}"
+                    "{{ let __c = {}; __SH_RC.store(if __c.is_empty() {{ 1 }} else {{ 0 }}, Ordering::Relaxed); __c }}",
+                    self.indent_continuation(&code)
                 ))
             }
             _ => None,
@@ -24156,10 +24197,9 @@ mod tests {
 
     /// The census's "command emulation" and "stat predicates" classes.
     /// `rm`/`mkdir`/`touch`/`sleep` are `std::fs`/`std::thread` loops with the
-    /// static flags baked in, and `[ -f … ]`-style predicates are one `std`
-    /// call — so none of the `__sh_*` emulation helpers may be defined or
-    /// called. (`mktemp` is genuinely a runtime uniqueness loop and keeps its
-    /// helper; it is not in this list.)
+    /// static flags baked in, `mktemp` spells its atomic-create loop in place,
+    /// and `[ -f … ]`-style predicates are one `std` call — so none of the
+    /// `__sh_*` emulation helpers may be defined or called.
     #[test]
     fn fs_commands_and_stat_predicates_render_natively() {
         let cases: &[(&str, &str, &[&str])] = &[
@@ -24175,6 +24215,11 @@ mod tests {
                 &["create(true).append(true).open", "set_modified"],
             ),
             ("sleep", "sleep 0.01\n", &["std::thread::sleep"]),
+            (
+                "mktemp",
+                "d=$(mktemp -d)\nif [ -d \"$d\" ]; then echo y; fi\n",
+                &["create_new(true)", "TMPDIR", "create_dir(&__s)"],
+            ),
             (
                 "-f",
                 "f=a.txt\nif [ -f \"$f\" ]; then echo y; fi\n",
@@ -24209,7 +24254,7 @@ mod tests {
         let helpers = [
             "__sh_rm(", "__sh_mkdir(", "__sh_touch(", "__sh_sleep(", "__sh_freg(", "__sh_fdir(",
             "__sh_fexists(", "__sh_fsym(", "__sh_fsize(", "__sh_fread(", "__sh_fwrite(",
-            "__sh_fexec(", "__sh_fmode(",
+            "__sh_fexec(", "__sh_fmode(", "__sh_mktemp(",
         ];
         for (name, src, markers) in cases {
             let out = render_rs(src);
