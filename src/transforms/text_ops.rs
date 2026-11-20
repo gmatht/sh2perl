@@ -922,6 +922,27 @@ fn lower_text_cmd(source: TextSource, cmd_name: &str, cmd_args: &[IrExpr], stmt_
     // one regex application, no per-line loop), so they only fire when
     // the input is provably one line. cut/sed on a variable (or a
     // multi-line literal) fall back to the original command.
+    //
+    // RECORDED REFUSALS — the census still lists these programs as spawning,
+    // deliberately, because every alternative would change behaviour:
+    //  * `cut` with a DYNAMIC source — `echo "$s" | cut -d: -f1`
+    //    (examples/bench-cut.sh). `cut` splits EVERY line and extracts the
+    //    field per line; FieldExtract is one split-and-index over ONE line and
+    //    its spec proves only the single-line law. Rendering it for a
+    //    multi-line value would return the first line's fields and drop the
+    //    rest, so the dynamic shape stays refused instead of growing a
+    //    per-line contract the node does not have.
+    //  * `sed s///` — the Substitute node's `pattern` is a POSIX BRE (its spec
+    //    is over a COMPILED matcher, and no field records literalness), so an
+    //    arm cannot tell `s/=/:/` (examples/assign-in-args.sh) from
+    //    `s/[0-9]+/N/g` (examples/070_gnuisms_thorough.sh) at render time.
+    //    Rust has no regex engine in `std`, and an unrenderable node falls
+    //    through to the generic Ext path rather than back to the original
+    //    command, so Substitute stays UN-OFFERED for Rust: those programs keep
+    //    the exact `sed` instead of a mis-rendered subset.
+    //  * `head -c N` is a BYTE count while TakeLines is line-based (`bytes:
+    //    true` returns None in the renderer), which is why
+    //    070_gnuisms_thorough's `head -c 3` keeps its command.
     let single_line_literal = is_literal
         && matches!(&text, IrExpr::Str(t, _) if !t.contains('\n'));
     match cmd_name {
