@@ -1620,6 +1620,66 @@ The file was restored and re-checked at **19 verified, 0 errors**.
 - No `*_sync.txt` baseline: the source is suite-only and the model is a
   reduction, so pins are recorded rather than transcribed.
 
+
+## stray_reserved_word.rs — a stray `)` / `}` is a parse error (14)
+
+`transforms/stray_reserved_word.rs`. bash treats a bare `)`/`}` in command
+position as a grammar token, i.e. a parse error: the statements BEFORE it
+have run, then it exits 2 and discards the tail. The parser recovers it as
+an ordinary command, so every backend used to EXECUTE it — status 127, tail
+still running — which is what the corpus gate saw
+(`exit code (bash=2 perl=127)`).
+
+Proved (`lower_matches_bash`, every program and every fuel):
+
+    proof fn lower_matches_bash(p, fuel)
+      ensures run_ir(lower(p), fuel) == run_bash(p, fuel)
+
+where `run_bash` treats a stray as the abort and `run_ir` is the PRE-FIX
+runtime (stray exec'd as a command, tail continues). `lower` replaces the
+stray and everything after it with `Warn + Exit(2)`, keeping the prefix.
+`gap_witness` states the disagreement for `echo; ); echo` (127 with both
+traces vs status 2 with only the prefix) as an obligation of its own, so the
+theorem is not "the pass agrees with the pass". `abort_keeps_token` /
+`truncation_is_load_bearing` pin the diagnostic token and the one-element
+abort.
+
+Mutant, measured: keeping the tail after the abort is **12 verified,
+2 errors** on those two truncation pins, while execution equivalence still
+holds — an exit after the abort cannot run the tail either way. So
+truncation is recorded as a code-size claim, not a status one.
+Pins mirror the source's three tests (`pin_prefix_survives_and_exits_2`,
+`pin_quoted_arg_untouched`, `pin_ordinary_command_untouched`) plus the `}`
+token.
+
+## merge_init_assignments.rs — the pair, as a whole-program theorem (15)
+
+`transforms/merge_init_assignments.rs`. `elim_trio.rs` (c) already proved the
+single step, but with `pure` and `reads_self` as PARAMETERS. This file makes
+the guards structure of `lower` and quantifies over programs:
+
+    proof fn lower_sound(p, st)
+      ensures run(lower(p), st) == run(p, st)
+
+The local fact is `pair_equals_merged`: both the pair and the merged
+`Declare(x, e)` bind `x` to `eval(e, st)`, because the default is
+overwritten before anything reads it and `e` (which does not read `x`)
+evaluates the same before and after the default is installed
+(`eval_ignores_own_binding`, `insert_insert`).
+
+Both guards are load-bearing as theorems about the shipped rule: dropping
+`!reads` is **14 verified, 1 error** (`lower_sound` fails on the witness
+`x=5; Declare(x,0); x=x` → 0 unmerged vs 5 merged) and dropping the name
+check is **13 verified, 2 errors**. The adjacency guard has its own witness
+(`adjacency_guard_is_load_bearing`: an observation between the two statements
+would print the default `0`, not `7`) and `non_adjacent_pair_is_refused`
+proves the non-adjacent shape is left alone.
+
+Scope: the pair shape only — indexed assignment targets, `asm`, and the
+`pure` predicate's call/capture exclusions are absent from the model's
+expression language rather than assumed; nested-body recursion is the same
+local step at each depth.
+
 ## Running it
 
 Same toolchain as above (`--rlimit 40`).
@@ -1690,6 +1750,66 @@ was restored and re-checked at **23 verified, 0 errors**.
 - The tables have no unit suite, so all pins are `UNMIRRORED` by design
   (VERUS.md §(b).4).
 
+
+## stray_reserved_word.rs — a stray `)` / `}` is a parse error (14)
+
+`transforms/stray_reserved_word.rs`. bash treats a bare `)`/`}` in command
+position as a grammar token, i.e. a parse error: the statements BEFORE it
+have run, then it exits 2 and discards the tail. The parser recovers it as
+an ordinary command, so every backend used to EXECUTE it — status 127, tail
+still running — which is what the corpus gate saw
+(`exit code (bash=2 perl=127)`).
+
+Proved (`lower_matches_bash`, every program and every fuel):
+
+    proof fn lower_matches_bash(p, fuel)
+      ensures run_ir(lower(p), fuel) == run_bash(p, fuel)
+
+where `run_bash` treats a stray as the abort and `run_ir` is the PRE-FIX
+runtime (stray exec'd as a command, tail continues). `lower` replaces the
+stray and everything after it with `Warn + Exit(2)`, keeping the prefix.
+`gap_witness` states the disagreement for `echo; ); echo` (127 with both
+traces vs status 2 with only the prefix) as an obligation of its own, so the
+theorem is not "the pass agrees with the pass". `abort_keeps_token` /
+`truncation_is_load_bearing` pin the diagnostic token and the one-element
+abort.
+
+Mutant, measured: keeping the tail after the abort is **12 verified,
+2 errors** on those two truncation pins, while execution equivalence still
+holds — an exit after the abort cannot run the tail either way. So
+truncation is recorded as a code-size claim, not a status one.
+Pins mirror the source's three tests (`pin_prefix_survives_and_exits_2`,
+`pin_quoted_arg_untouched`, `pin_ordinary_command_untouched`) plus the `}`
+token.
+
+## merge_init_assignments.rs — the pair, as a whole-program theorem (15)
+
+`transforms/merge_init_assignments.rs`. `elim_trio.rs` (c) already proved the
+single step, but with `pure` and `reads_self` as PARAMETERS. This file makes
+the guards structure of `lower` and quantifies over programs:
+
+    proof fn lower_sound(p, st)
+      ensures run(lower(p), st) == run(p, st)
+
+The local fact is `pair_equals_merged`: both the pair and the merged
+`Declare(x, e)` bind `x` to `eval(e, st)`, because the default is
+overwritten before anything reads it and `e` (which does not read `x`)
+evaluates the same before and after the default is installed
+(`eval_ignores_own_binding`, `insert_insert`).
+
+Both guards are load-bearing as theorems about the shipped rule: dropping
+`!reads` is **14 verified, 1 error** (`lower_sound` fails on the witness
+`x=5; Declare(x,0); x=x` → 0 unmerged vs 5 merged) and dropping the name
+check is **13 verified, 2 errors**. The adjacency guard has its own witness
+(`adjacency_guard_is_load_bearing`: an observation between the two statements
+would print the default `0`, not `7`) and `non_adjacent_pair_is_refused`
+proves the non-adjacent shape is left alone.
+
+Scope: the pair shape only — indexed assignment targets, `asm`, and the
+`pure` predicate's call/capture exclusions are absent from the model's
+expression language rather than assumed; nested-body recursion is the same
+local step at each depth.
+
 ## Running it
 
 Same toolchain as above (`--rlimit 40`).
@@ -1746,6 +1866,66 @@ re-checked at **18 verified, 0 errors**.
   recurse; the Seq/If/While induction covers their shape.
 - No unit suite for the model; pins are `UNMIRRORED`, and the source
   tests named there exercise the refusal side, not the run theorem.
+
+
+## stray_reserved_word.rs — a stray `)` / `}` is a parse error (14)
+
+`transforms/stray_reserved_word.rs`. bash treats a bare `)`/`}` in command
+position as a grammar token, i.e. a parse error: the statements BEFORE it
+have run, then it exits 2 and discards the tail. The parser recovers it as
+an ordinary command, so every backend used to EXECUTE it — status 127, tail
+still running — which is what the corpus gate saw
+(`exit code (bash=2 perl=127)`).
+
+Proved (`lower_matches_bash`, every program and every fuel):
+
+    proof fn lower_matches_bash(p, fuel)
+      ensures run_ir(lower(p), fuel) == run_bash(p, fuel)
+
+where `run_bash` treats a stray as the abort and `run_ir` is the PRE-FIX
+runtime (stray exec'd as a command, tail continues). `lower` replaces the
+stray and everything after it with `Warn + Exit(2)`, keeping the prefix.
+`gap_witness` states the disagreement for `echo; ); echo` (127 with both
+traces vs status 2 with only the prefix) as an obligation of its own, so the
+theorem is not "the pass agrees with the pass". `abort_keeps_token` /
+`truncation_is_load_bearing` pin the diagnostic token and the one-element
+abort.
+
+Mutant, measured: keeping the tail after the abort is **12 verified,
+2 errors** on those two truncation pins, while execution equivalence still
+holds — an exit after the abort cannot run the tail either way. So
+truncation is recorded as a code-size claim, not a status one.
+Pins mirror the source's three tests (`pin_prefix_survives_and_exits_2`,
+`pin_quoted_arg_untouched`, `pin_ordinary_command_untouched`) plus the `}`
+token.
+
+## merge_init_assignments.rs — the pair, as a whole-program theorem (15)
+
+`transforms/merge_init_assignments.rs`. `elim_trio.rs` (c) already proved the
+single step, but with `pure` and `reads_self` as PARAMETERS. This file makes
+the guards structure of `lower` and quantifies over programs:
+
+    proof fn lower_sound(p, st)
+      ensures run(lower(p), st) == run(p, st)
+
+The local fact is `pair_equals_merged`: both the pair and the merged
+`Declare(x, e)` bind `x` to `eval(e, st)`, because the default is
+overwritten before anything reads it and `e` (which does not read `x`)
+evaluates the same before and after the default is installed
+(`eval_ignores_own_binding`, `insert_insert`).
+
+Both guards are load-bearing as theorems about the shipped rule: dropping
+`!reads` is **14 verified, 1 error** (`lower_sound` fails on the witness
+`x=5; Declare(x,0); x=x` → 0 unmerged vs 5 merged) and dropping the name
+check is **13 verified, 2 errors**. The adjacency guard has its own witness
+(`adjacency_guard_is_load_bearing`: an observation between the two statements
+would print the default `0`, not `7`) and `non_adjacent_pair_is_refused`
+proves the non-adjacent shape is left alone.
+
+Scope: the pair shape only — indexed assignment targets, `asm`, and the
+`pure` predicate's call/capture exclusions are absent from the model's
+expression language rather than assumed; nested-body recursion is the same
+local step at each depth.
 
 ## Running it
 
