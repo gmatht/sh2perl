@@ -1533,14 +1533,35 @@ fn parse_field_spec(spec: &str, count: Option<usize>) -> Option<Vec<FieldRange>>
 
 // ── tr ───────────────────────────────────────────────────────────────
 
+/// The ASCII members of a `tr` POSIX class (see `expand_tr_set`). `tr` classes are BYTE sets: glibc's
+/// `tr` does not expand them multibyte, so `[:upper:]` is exactly A-Z even in a
+/// UTF-8 locale (measured: `tr '[:lower:]' '[:upper:]'` leaves É untouched).
+/// A class this table does not carry — `[:space:]` (its members include the
+/// newline the fold cannot represent), `[:alpha:]`, `[:punct:]`, … — stays
+/// refused rather than being approximated.
+fn tr_class_members(s: &str) -> Option<&'static str> {
+    match s {
+        "[:lower:]" => Some("abcdefghijklmnopqrstuvwxyz"),
+        "[:upper:]" => Some("ABCDEFGHIJKLMNOPQRSTUVWXYZ"),
+        "[:digit:]" => Some("0123456789"),
+        _ => None,
+    }
+}
+
 /// Expand `tr`'s RANGE syntax into the literal member set the node's
 /// `from`/`to` fields promise (`tr_expand` in the node's theory). `a-z` is
 /// 26 members, `z-a` is the same range DESCENDING (GNU accepts it), and a
 /// dash with no character on either side is a literal dash (`-abc`, `abc-`,
-/// `a-c-e`). Refuses (None) on a backslash escape or a non-ASCII endpoint:
-/// `\n`, `\012` and `[=c=]` have meanings this expansion does not own, so
-/// the original command is kept (exact everywhere) rather than guessed.
+/// `a-c-e`). The C escapes this expansion owns are `\n \t \r \a \b \f \v`
+/// and `\\`; an escape it does not own (`\012` octal, `\xHH`, `[=c=]`) or a
+/// non-ASCII range endpoint refuses (None), so the original command is kept
+/// (exact everywhere) rather than guessed.
 fn expand_tr_set(s: &str) -> Option<String> {
+    if s.contains("[:") {
+        // Only a WHOLE-SET class is modelled; a class mixed into a larger set
+        // (`a[:digit:]`) is still refused.
+        return tr_class_members(s).map(|m| m.to_string());
+    }
     let decoded = decode_tr_escapes(s)?;
     // A RANGE endpoint that arrived as an escape (`tr 'a-\n' x`) is not a
     // member-set question any more — which side of the range the escape
@@ -1650,58 +1671,41 @@ fn try_lower_tr(text: IrExpr, args: &[IrExpr]) -> Option<IrExpr> {
         return None;
     }
 
-    // POSIX character classes: tr '[:upper:]' '[:lower:]' is a CASE
-    // transform, NOT a literal char map ("[:upper:]" is a class, not chars).
-    // Other classes ([:digit:], [:space:], ...) can't be a literal CharTranslate
-    // — leave them to the runtime.
-    if from.contains("[:") || to.contains("[:") {
-        if !delete && !squeeze && from == "[:upper:]" && to == "[:lower:]" {
-            return Some(IrExpr::Ext(Box::new(CaseTransform { text, upper: false })))
-                .filter(|_| offered("CaseTransform"));
-        }
-        if !delete && !squeeze && from == "[:lower:]" && to == "[:upper:]" {
-            return Some(IrExpr::Ext(Box::new(CaseTransform { text, upper: true })))
-                .filter(|_| offered("CaseTransform"));
-        }
-        return None; // other class translations → runtime
-    }
-
-    // POSIX character classes: tr '[:upper:]' '[:lower:]' is a CASE
-    // transform, NOT a literal char map ("[:upper:]" is a class, not chars).
-    // Other classes ([:digit:], [:space:], ...) can't be a literal CharTranslate
-    // — leave them to the runtime.
-    if from.contains("[:") || to.contains("[:") {
-        if !delete && !squeeze && from == "[:upper:]" && to == "[:lower:]" {
-            return Some(IrExpr::Ext(Box::new(CaseTransform { text, upper: false })))
-                .filter(|_| offered("CaseTransform"));
-        }
-        if !delete && !squeeze && from == "[:lower:]" && to == "[:upper:]" {
-            return Some(IrExpr::Ext(Box::new(CaseTransform { text, upper: true })))
-                .filter(|_| offered("CaseTransform"));
-        }
-        return None; // other class translations → runtime
-    }
-
-    // Special case: tr 'a-z' 'A-Z' (case transform)
-    if !delete && !squeeze && from == "a-z" && to == "A-Z" {
-        return Some(IrExpr::Ext(Box::new(CaseTransform {
-            text: text,
-            upper: true,
-        })))
-        .filter(|_| offered("CaseTransform"));
-    }
-    if !delete && !squeeze && from == "A-Z" && to == "a-z" {
-        return Some(IrExpr::Ext(Box::new(CaseTransform {
-            text: text,
-            upper: false,
-        })))
-        .filter(|_| offered("CaseTransform"));
-    }
+    // CASE PAIRS ARE NOT `CaseTransform`. `tr` is a BYTE map, always: measured
+    // against this box, `printf 'Éé Aa' | tr '[:lower:]' '[:upper:]'` leaves
+    // both É and é untouched (byte map, in a UTF-8 locale and in LC_ALL=C),
+    // while Rust's `to_uppercase()` maps the CODE POINT ("ÉÉ AA"). So `tr`
+    // case pairs — the `a-z`/`A-Z` ranges and the `[:lower:]`/`[:upper:]`
+    // classes alike — lower to the general CharTranslate, whose model IS the
+    // per-byte map (`tr_expand` + `map_of`, TextOps#char_translate_sound), and
+    // whose Rust arm spells `chars().map(..)`: for an ASCII from/to set every
+    // non-ASCII char is a fixed point, exactly as `tr` behaves.
+    // CaseTransform stays for the BASH PARAMETER ops `${v^^}`/`${v,,}`, which
+    // DO case-map code points — that is what the node's renderer (and bash)
+    // do, and why the two sources must not share a node.
 
     // The node's `from`/`to` are the EXPANDED member sets (ranges and
     // classes are the lowering's job, not the renderer's).
     let from = expand_tr_set(from)?;
     let to = if to.is_empty() { String::new() } else { expand_tr_set(to)? };
+
+    // A from-set that contains the NEWLINE is a newline-MAPPING `tr`, and the
+    // pipeline fold hands a stage its input WITHOUT the final newline (the
+    // enclosing `Output` supplies exactly one). That convention is exact only
+    // when the map leaves a newline a newline: `tr '\n' ' '` turns it into a
+    // SPACE that the enclosing newline does not replace — measured: bash gives
+    // `seq: 1 2 3 ` (trailing space, `$(\342\200\246)` strips newlines only)
+    // while the dropped newline gives `seq: 1 2 3`. So a map to some other
+    // char, and `-d`/`-s` (which change whether a newline survives at all),
+    // keep the command — the case is rare and the command is exact.
+    if from.contains('\n') {
+        let nl_is_fixed_point = !delete && !squeeze
+            && from.chars().position(|c| c == '\n')
+                .and_then(|at| to.chars().nth(at)) == Some('\n');
+        if !nl_is_fixed_point {
+            return None;
+        }
+    }
     Some(IrExpr::Ext(Box::new(CharTranslate {
         text,
         from,
@@ -2284,23 +2288,47 @@ mod tests {
     // ── tr compositions ──────────────────────────────────────────────
 
     #[test]
-    fn tr_range_upper_is_case_transform() {
+    // `tr`'s case pairs are a BYTE map, not `CaseTransform`: measured on this
+    // box, `printf 'Éé Aa' | tr '[:lower:]' '[:upper:]'` leaves É and é alone
+    // (and Rust's `to_uppercase()` gives "ÉÉ AA") — see the comment in
+    // `try_lower_tr`. Both sources lower to the general CharTranslate.
+    #[test]
+    fn tr_range_upper_is_a_byte_map() {
         let r = try_lower_tr(st("hi"), &[st("a-z"), st("A-Z")]).unwrap();
         let IrExpr::Ext(n) = &r else { panic!() };
-        assert!(n.as_any().downcast_ref::<CaseTransform>().unwrap().upper);
+        assert!(n.as_any().downcast_ref::<CaseTransform>().is_none(), "tr is not a case node");
+        let x = n.as_any().downcast_ref::<CharTranslate>().unwrap();
+        assert_eq!(x.from, "abcdefghijklmnopqrstuvwxyz");
+        assert_eq!(x.to, "ABCDEFGHIJKLMNOPQRSTUVWXYZ");
     }
 
     #[test]
-    fn tr_posix_class_case_transform() {
+    fn tr_posix_class_expands_to_ascii_members() {
         let r = try_lower_tr(st("hi"), &[st("[:lower:]"), st("[:upper:]")]).unwrap();
         let IrExpr::Ext(n) = &r else { panic!() };
-        assert!(n.as_any().downcast_ref::<CaseTransform>().unwrap().upper);
+        let x = n.as_any().downcast_ref::<CharTranslate>().unwrap();
+        assert_eq!(x.from, "abcdefghijklmnopqrstuvwxyz");
+        assert_eq!(x.to, "ABCDEFGHIJKLMNOPQRSTUVWXYZ");
     }
 
     #[test]
-    fn tr_other_posix_class_not_reduced() {
-        // [:digit:] is a class, not literal chars — falls back to the runtime.
-        assert!(try_lower_tr(st("hi"), &[st("[:digit:]"), st("x")]).is_none());
+    fn tr_digit_class_is_a_byte_map() {
+        let r = try_lower_tr(st("a1b"), &[st("[:digit:]"), st("x")]).unwrap();
+        let IrExpr::Ext(n) = &r else { panic!() };
+        let x = n.as_any().downcast_ref::<CharTranslate>().unwrap();
+        assert_eq!(x.from, "0123456789");
+        assert_eq!(x.to, "x");
+    }
+
+    #[test]
+    fn tr_unmodelled_posix_class_not_reduced() {
+        // [:alpha:] / [:space:] are locale sets this table does not own (and
+        // [:space:] contains the newline the fold cannot carry) — the command
+        // stays.
+        assert!(try_lower_tr(st("hi"), &[st("[:alpha:]"), st("x")]).is_none());
+        assert!(try_lower_tr(st("hi"), &[st("[:space:]"), st("_x")]).is_none());
+        // A class MIXED into a larger set is not modelled either.
+        assert!(try_lower_tr(st("hi"), &[st("a[:digit:]"), st("x")]).is_none());
     }
 
     #[test]
@@ -2498,7 +2526,22 @@ mod tests {
     fn tr_variable_source_reduces() {
         let r = lower_text_cmd(var_src(), "tr", &[st("a-z"), st("A-Z")], true).unwrap();
         let IrExpr::Ext(n) = &r else { panic!() };
-        assert!(n.as_any().downcast_ref::<CaseTransform>().is_some());
+        assert!(n.as_any().downcast_ref::<CharTranslate>().is_some());
+    }
+
+    #[test]
+    fn tr_newline_map_to_other_char_keeps_the_command() {
+        // The pipeline fold drops the source's final newline (the enclosing
+        // Output supplies one). `tr '\n' ' '` turns that newline into a SPACE
+        // which nothing replaces: bash `seq 1 3 | tr '\n' ' '` ends in a
+        // space, a folded CharTranslate would not. Keep the command.
+        assert!(try_lower_tr(st("hi"), &[st("\\n"), st(" ")]).is_none());
+        // `-d`/`-s` change whether a newline survives at all — same reason.
+        assert!(try_lower_tr(st("hi"), &[st("-d"), st("\\n")]).is_none());
+        assert!(try_lower_tr(st("hi"), &[st("-s"), st("\\n"), st(" ")]).is_none());
+        // Newline to newline IS a fixed point: the node is exact there.
+        let r = try_lower_tr(st("hi"), &[st("\\n"), st("\\n")]).unwrap();
+        assert!(matches!(&r, IrExpr::Ext(n) if n.as_any().downcast_ref::<CharTranslate>().is_some()));
     }
 
     #[test]

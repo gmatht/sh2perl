@@ -24781,6 +24781,12 @@ mod tests {
             // A heredoc BODY is expanded by the shell (`<<EOF` with $v in it),
             // so `cat` over one is not an identity on the IR text.
             ("heredoc body", "v=x\ncat <<EOF\n$v\nEOF\n"),
+            // `tr '\n' ' '` maps the newline the pipeline fold does not carry
+            // (the enclosing Output supplies exactly one), so the S P A C E it
+            // becomes would be lost: bash prints `seq: 1 2 3 ` — trailing
+            // space — and a folded CharTranslate prints `seq: 1 2 3`.
+            ("tr newline to space", "echo \"seq: $(seq 1 3 | tr '\\n' ' ')\"\n"),
+            ("tr -d newline", "x=$(printf 'a\nb\n' | tr -d '\\n')\necho \"[$x]\"\n"),
         ];
         let mut bad: Vec<String> = Vec::new();
         for (name, src) in refused {
@@ -25040,10 +25046,14 @@ mod tests {
 
     /// `tr A-Z a-z` is a case fold.
     #[test]
-    fn tr_case_is_a_native_fold() {
+    fn tr_case_pairs_are_a_byte_map() {
+        // NOT `.to_lowercase()`: `tr` maps BYTES, so `É` is a fixed point in
+        // bash while `to_lowercase()` would case-map the code point. The
+        // CharTranslate arm is a per-char lookup over the expanded ASCII sets.
         let out = render_rs("w=$(echo ABC | tr 'A-Z' 'a-z')\necho \"$w\"\n");
         assert!(!out.contains("__sh_spawn("), "still shells out:\n{out}");
-        assert!(out.contains(".to_lowercase()"), "no fold:\n{out}");
+        assert!(out.contains("position(|&__sh_from_ch|"), "no byte map:\n{out}");
+        assert!(!out.contains("to_lowercase()"), "a byte map, not a case fold:\n{out}");
     }
 
     /// TakeLines has no lowering shape in today's text_ops (every `| head`
