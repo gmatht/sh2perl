@@ -1710,6 +1710,52 @@ numbering makes a collision unlikely, but a user variable with exactly that
 name would collide and the pass does not check. The `Declare`-init and
 leaf-subject refusals are pinned by predicate/test, not re-derived per node.
 
+
+## inline_pure_fns.rs — substitution, and the check it does not do (15)
+
+`transforms/inline_pure_fns.rs` (parked offer: not in `transforms::all()`).
+A call to a single-expression pure leaf is replaced by the body with
+`getVar("N")` swapped for argument N. Proved (`inline_preserves`): value and
+effect count match the call under the pass's purity check PLUS a hypothesis
+the pass does not check — that no argument reads a name the body writes.
+
+`capture_witness` keeps the hazard: body `x=5; getVar(0)` called with `$x`
+returns the OLD value in bash (arguments are evaluated before the body) and
+the NEW one after inlining; `double_effect_witness` keeps the impure-argument
+double run (1 vs 2 evaluations). Mutants, measured: off-by-one substitution
+**10 verified, 5 errors**; dropping the purity conjunct **14 verified,
+1 error**. The positional-read model is one argument (a two-argument call is
+the same argument repeated), stated in-file.
+
+## cat_heredoc.rs — the bytes of a literal heredoc (13)
+
+`transforms/cat_heredoc.rs`. `cat <<EOF` with a literal body is a pure
+print; the pass rewrites it to `Output(body)`. `lift_matches_bash` proves the
+emitted bytes equal bash's for every environment whenever the pass fires,
+including the interpolating-but-expansion-free body
+(`expansion_free_is_text`). The other guards are pinned as facts about
+`lifts` (one redirect, fd 0, `heredoc` not `heredoc-tabs`, no operands), so
+dropping one is red even though the bytes theorem cannot see it.
+`expansion_guard_is_load_bearing` keeps the witness: `$x!` must not be
+printed raw. Mutants, measured: drop the expansion guard **10 verified,
+3 errors**; drop the mode check **12 verified, 1 error**. Pins mirror four of
+the source's eight tests (quoted lift, unquoted-no-expansion lift, expansion
+refusal, quoted `$5` text) plus the shape refusals.
+
+## builtin_lift.rs — a carrier rename with a table guard (12)
+
+`transforms/builtin-lift.rs`. `exec("cmd", args)` becomes
+`builtin("cmd", args)` for the shared namespace table. Two obligations:
+`lift_preserves` (the program's value is unchanged) and
+`lift_reaches_every_position` (every expression position is reached, so no
+spawn is left behind). Soundness depends exactly on the table check:
+`lifting_an_off_table_name_is_wrong` shows an off-table name whose native op
+differs, and the mutant that lifts everything is **9 verified, 3 errors**;
+forgetting the `Nested` recursion arm is **11 verified, 1 error**
+(completeness). Stated in-file: the runtime half — a table name's native op
+matches the external binary — is the namespace contract, an assumption the
+model does not discharge.
+
 ## Running it
 
 Same toolchain as above (`--rlimit 40`).
@@ -1870,6 +1916,52 @@ numbering makes a collision unlikely, but a user variable with exactly that
 name would collide and the pass does not check. The `Declare`-init and
 leaf-subject refusals are pinned by predicate/test, not re-derived per node.
 
+
+## inline_pure_fns.rs — substitution, and the check it does not do (15)
+
+`transforms/inline_pure_fns.rs` (parked offer: not in `transforms::all()`).
+A call to a single-expression pure leaf is replaced by the body with
+`getVar("N")` swapped for argument N. Proved (`inline_preserves`): value and
+effect count match the call under the pass's purity check PLUS a hypothesis
+the pass does not check — that no argument reads a name the body writes.
+
+`capture_witness` keeps the hazard: body `x=5; getVar(0)` called with `$x`
+returns the OLD value in bash (arguments are evaluated before the body) and
+the NEW one after inlining; `double_effect_witness` keeps the impure-argument
+double run (1 vs 2 evaluations). Mutants, measured: off-by-one substitution
+**10 verified, 5 errors**; dropping the purity conjunct **14 verified,
+1 error**. The positional-read model is one argument (a two-argument call is
+the same argument repeated), stated in-file.
+
+## cat_heredoc.rs — the bytes of a literal heredoc (13)
+
+`transforms/cat_heredoc.rs`. `cat <<EOF` with a literal body is a pure
+print; the pass rewrites it to `Output(body)`. `lift_matches_bash` proves the
+emitted bytes equal bash's for every environment whenever the pass fires,
+including the interpolating-but-expansion-free body
+(`expansion_free_is_text`). The other guards are pinned as facts about
+`lifts` (one redirect, fd 0, `heredoc` not `heredoc-tabs`, no operands), so
+dropping one is red even though the bytes theorem cannot see it.
+`expansion_guard_is_load_bearing` keeps the witness: `$x!` must not be
+printed raw. Mutants, measured: drop the expansion guard **10 verified,
+3 errors**; drop the mode check **12 verified, 1 error**. Pins mirror four of
+the source's eight tests (quoted lift, unquoted-no-expansion lift, expansion
+refusal, quoted `$5` text) plus the shape refusals.
+
+## builtin_lift.rs — a carrier rename with a table guard (12)
+
+`transforms/builtin-lift.rs`. `exec("cmd", args)` becomes
+`builtin("cmd", args)` for the shared namespace table. Two obligations:
+`lift_preserves` (the program's value is unchanged) and
+`lift_reaches_every_position` (every expression position is reached, so no
+spawn is left behind). Soundness depends exactly on the table check:
+`lifting_an_off_table_name_is_wrong` shows an off-table name whose native op
+differs, and the mutant that lifts everything is **9 verified, 3 errors**;
+forgetting the `Nested` recursion arm is **11 verified, 1 error**
+(completeness). Stated in-file: the runtime half — a table name's native op
+matches the external binary — is the namespace contract, an assumption the
+model does not discharge.
+
 ## Running it
 
 Same toolchain as above (`--rlimit 40`).
@@ -2016,6 +2108,52 @@ Scope, stated in-file: freshness of `__sh2_dor_<n>` is a HYPOTHESIS — the
 numbering makes a collision unlikely, but a user variable with exactly that
 name would collide and the pass does not check. The `Declare`-init and
 leaf-subject refusals are pinned by predicate/test, not re-derived per node.
+
+
+## inline_pure_fns.rs — substitution, and the check it does not do (15)
+
+`transforms/inline_pure_fns.rs` (parked offer: not in `transforms::all()`).
+A call to a single-expression pure leaf is replaced by the body with
+`getVar("N")` swapped for argument N. Proved (`inline_preserves`): value and
+effect count match the call under the pass's purity check PLUS a hypothesis
+the pass does not check — that no argument reads a name the body writes.
+
+`capture_witness` keeps the hazard: body `x=5; getVar(0)` called with `$x`
+returns the OLD value in bash (arguments are evaluated before the body) and
+the NEW one after inlining; `double_effect_witness` keeps the impure-argument
+double run (1 vs 2 evaluations). Mutants, measured: off-by-one substitution
+**10 verified, 5 errors**; dropping the purity conjunct **14 verified,
+1 error**. The positional-read model is one argument (a two-argument call is
+the same argument repeated), stated in-file.
+
+## cat_heredoc.rs — the bytes of a literal heredoc (13)
+
+`transforms/cat_heredoc.rs`. `cat <<EOF` with a literal body is a pure
+print; the pass rewrites it to `Output(body)`. `lift_matches_bash` proves the
+emitted bytes equal bash's for every environment whenever the pass fires,
+including the interpolating-but-expansion-free body
+(`expansion_free_is_text`). The other guards are pinned as facts about
+`lifts` (one redirect, fd 0, `heredoc` not `heredoc-tabs`, no operands), so
+dropping one is red even though the bytes theorem cannot see it.
+`expansion_guard_is_load_bearing` keeps the witness: `$x!` must not be
+printed raw. Mutants, measured: drop the expansion guard **10 verified,
+3 errors**; drop the mode check **12 verified, 1 error**. Pins mirror four of
+the source's eight tests (quoted lift, unquoted-no-expansion lift, expansion
+refusal, quoted `$5` text) plus the shape refusals.
+
+## builtin_lift.rs — a carrier rename with a table guard (12)
+
+`transforms/builtin-lift.rs`. `exec("cmd", args)` becomes
+`builtin("cmd", args)` for the shared namespace table. Two obligations:
+`lift_preserves` (the program's value is unchanged) and
+`lift_reaches_every_position` (every expression position is reached, so no
+spawn is left behind). Soundness depends exactly on the table check:
+`lifting_an_off_table_name_is_wrong` shows an off-table name whose native op
+differs, and the mutant that lifts everything is **9 verified, 3 errors**;
+forgetting the `Nested` recursion arm is **11 verified, 1 error**
+(completeness). Stated in-file: the runtime half — a table name's native op
+matches the external binary — is the namespace contract, an assumption the
+model does not discharge.
 
 ## Running it
 
