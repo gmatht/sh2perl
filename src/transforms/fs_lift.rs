@@ -211,71 +211,17 @@ pub fn lift_test(args: &[IrExpr]) -> Option<IrExpr> {
     }
 }
 
-/// The `test A -ef B` COMMAND spelling (`exec("test", [a, "-ef", b])`) — the
-/// same predicate in argv form, which the corpus also uses. Only three literal
-/// argv words are accepted; anything dynamic keeps the command.
-pub fn lift_exec(args: &[IrExpr]) -> Option<IrExpr> {
-    let mut it = args.iter();
-    let name = match it.next() {
-        Some(IrExpr::Str(s, _)) if s == "test" || s == "[" => s.clone(),
-        _ => return None,
-    };
-    let words: Vec<String> = match it.next() {
-        Some(IrExpr::Array(items)) => {
-            let mut v: Vec<String> = Vec::with_capacity(items.len());
-            for a in items {
-                v.push(exec_word(a)?);
-            }
-            v
-        }
-        _ => return None,
-    };
-    if it.next().is_some() {
-        return None;
-    }
-    // `[ a -ef b ]` carries the trailing `]`.
-    let words: Vec<String> = if name == "[" {
-        match words.as_slice() {
-            [.., close] if close == "]" => words[..words.len() - 1].to_vec(),
-            _ => return None,
-        }
-    } else {
-        words
-    };
-    let text = words.join(" ");
-    lift_test(&[IrExpr::Str(text, StrStyle::DoubleQuoted)])
-}
-
-/// One argv WORD of the `test` command form, as text the lift can parse.
-/// A literal stays itself; a `"$name"` word is the plain variable read the
-/// test-text spelling uses (`${name}`); anything else is refused.
-fn exec_word(e: &IrExpr) -> Option<String> {
-    match e {
-        IrExpr::Str(s, _) => Some(s.clone()),
-        // The exec-form words are bare variable READS (`getVar("A")`), not
-        // interpolations: that is how `test "$A" -ef "$B"` reaches the IR.
-        IrExpr::Call { func, args } if func == "getVar" => match args.as_slice() {
-            [IrExpr::Str(n, _)] => plain_name(n).map(|n| format!("\"${{{n}}}\"")),
-            _ => None,
-        },
-        IrExpr::Interpolate(parts) if parts.len() == 1 => match &parts[0] {
-            InterpPart::Lit(l) => Some(l.clone()),
-            InterpPart::Expr(x) => match x.as_ref() {
-                IrExpr::Call { func, args } if func == "param" => match args.as_slice() {
-                    [IrExpr::Str(_, _), IrExpr::Str(n, _)] => Some(format!("\"${{{n}}}\"")),
-                    _ => None,
-                },
-                _ => None,
-            },
-            _ => None,
-        },
-        _ => None,
-    }
-}
-
 /// Walk the program and lift every test predicate that [`lift_test`] accepts.
 /// The statement walker visits CONDITIONS too — `text_ops` lowers statement
 /// bodies only, so an `if [ a -nt b ]` would otherwise never reach the lift.
+///
+/// Only the `test`-function shape lifts. The COMMAND spelling
+/// (`exec("test", ["a", "-ef", "b"])`) is refused: its condition renderer
+/// runs the command for its exit status, and an Ext node in that position is
+/// evaluated as a string with the status write dropped — measured, it turned
+/// `parse-ef-test-operator` equivalence-red (`if test "$A" -ef "$B"` printed
+/// "same file" where bash printed nothing). A refused lift is better than a
+/// silently wrong program.
 pub fn transform(stmts: &mut Vec<IrStmt>) -> bool {
     let mut changed = false;
     for st in stmts.iter_mut() {
@@ -289,11 +235,6 @@ fn lift_expr(e: &mut IrExpr) -> bool {
         IrExpr::Call { func, args } => {
             if func == "test" {
                 if let Some(r) = lift_test(args) {
-                    *e = r;
-                    return true;
-                }
-            } else if func == "exec" || func == "builtin" {
-                if let Some(r) = lift_exec(args) {
                     *e = r;
                     return true;
                 }

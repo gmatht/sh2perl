@@ -24906,6 +24906,12 @@ mod tests {
                 "if [ \"$A\" -ef \"$B\" -a -e c ]; then echo c; fi\n",
                 "__sh_samefile(",
             ),
+            // The COMMAND spelling, not the `[ … ]` builtin: its condition
+            // renderer runs the command for its exit status, and an Ext node
+            // there is evaluated as a string with the status write dropped —
+            // lifting it made parse-ef-test-operator print "same file" where
+            // bash prints nothing. The helper is exact, so it stays.
+            ("command spelling", "if test a -ef b; then echo t; fi\n", "__sh_samefile("),
         ] {
             let prog = render_rs(src);
             assert!(
