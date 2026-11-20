@@ -5710,10 +5710,20 @@ impl Render {
             "StringTrim" => {
                 let x = n.as_any().downcast_ref::<crate::shir_nodes::StringTrim>()?;
                 let t = self.expr_str(&x.text);
+                // The class is `xargs`'s — the six POSIX isspace BYTES. Rust's
+                // `trim()` is Unicode-aware and would also eat NBSP, U+2000…,
+                // which `xargs` keeps (measured: `printf '\302\240x\302\240' |
+                // xargs` returns the NBSPs). `trim_matches` over the byte class
+                // is the node's own contract (string_trim.node: "the whitespace
+                // CLASS is not the node's — a renderer that uses a different
+                // class denotes a different function"), and it agrees with
+                // `.trim()` on every ASCII source, which is all the lowering
+                // folds.
+                let ws = "|c| c == ' ' || c == '\\t' || c == '\\n' || c == '\\r' || c == '\\u{0b}' || c == '\\u{0c}'";
                 Some(match (x.leading, x.trailing) {
-                    (true, true) => format!("{t}.trim().to_string()"),
-                    (true, false) => format!("{t}.trim_start().to_string()"),
-                    (false, true) => format!("{t}.trim_end().to_string()"),
+                    (true, true) => format!("{t}.trim_matches({ws}).to_string()"),
+                    (true, false) => format!("{t}.trim_start_matches({ws}).to_string()"),
+                    (false, true) => format!("{t}.trim_end_matches({ws}).to_string()"),
                     (false, false) => t,
                 })
             }
@@ -24571,13 +24581,34 @@ mod tests {
             ),
             (
                 "StringTrim",
-                ".trim()",
+                ".trim_matches(",
                 "v=$(echo \"  a b  \" | xargs)\necho \"[$v]\"\n",
             ),
+            // NBSP (U+00A0) is NOT in xargs's isspace class: `trim()` would
+            // eat it, `trim_matches` over the six isspace bytes leaves it.
+            (
+                "StringTrimKeepsNbsp",
+                ".trim_matches(",
+                "v=$(echo \" \u{a0}x \" | xargs)\necho \"[$v]\"\n",
+            ),
+            // CaseTransform now serves ONLY the bash parameter ops (`${v,,}`,
+            // `${v^^}`), which case-map CODE POINTS — `tr`'s byte map is
+            // CharTranslate (below).
             (
                 "CaseTransform",
                 ".to_lowercase()",
-                "w=$(echo ABC | tr 'A-Z' 'a-z')\necho \"$w\"\n",
+                "v=ABC\necho \"${v,,}\"\n",
+            ),
+            // The BYTE map, over non-ASCII input too: `tr` leaves É/é alone.
+            (
+                "CharTranslateNonAscii",
+                "position(|&__sh_from_ch|",
+                "w=$(echo \"Éé ABC\" | tr '[:upper:]' '[:lower:]')\necho \"$w\"\n",
+            ),
+            (
+                "CharTranslateDigitClass",
+                "position(|&__sh_from_ch|",
+                "w=$(echo a1b2c3 | tr '[:digit:]' 'x')\necho \"$w\"\n",
             ),
             (
                 "CharTranslate",
@@ -24982,7 +25013,10 @@ mod tests {
     fn string_trim_is_a_native_trim() {
         let out = render_rs("s=$(echo  x  | xargs)\necho \"$s\"\n");
         assert!(!out.contains("__sh_spawn("), "still shells out:\n{out}");
-        assert!(out.contains(".trim().to_string()"), "no trim:\n{out}");
+        // The class is `xargs`'s (the six isspace BYTES), not Rust's Unicode
+        // `trim()` — a NBSP is NOT trimmed by xargs.
+        assert!(out.contains(".trim_matches("), "no trim:\n{out}");
+        assert!(out.contains("c == ' ' ||"), "not the isspace class:\n{out}");
     }
 
     /// `cut -d: -f2` is a split + a bounds-checked field take.
