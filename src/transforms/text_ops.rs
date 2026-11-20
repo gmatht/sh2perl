@@ -97,6 +97,30 @@ pub fn transform(stmts: &mut Vec<IrStmt>) -> bool {
     after > before
 }
 
+/// The EXACT bytes of a compile-time literal: a plain string, or an
+/// interpolation whose every part is a literal (a here-string's target can
+/// arrive as `"x:y:z"`, one Lit part). A read — even of a variable that holds
+/// a constant — is not literal: its value is a runtime fact.
+fn literal_text(e: &IrExpr) -> Option<String> {
+    match e {
+        IrExpr::Str(s, _) => Some(s.clone()),
+        IrExpr::Interpolate(parts)
+            if !parts.is_empty() && parts.iter().all(|p| matches!(p, InterpPart::Lit(_))) =>
+        {
+            Some(
+                parts
+                    .iter()
+                    .map(|p| match p {
+                        InterpPart::Lit(s) => s.as_str(),
+                        _ => unreachable!(),
+                    })
+                    .collect(),
+            )
+        }
+        _ => None,
+    }
+}
+
 /// The first Ext-node tag in `stmt` that the current target does not
 /// declare, if any. Scanned from the Debug form: the IR has no uniform child
 /// accessor across `IrStmt`, and a false positive here costs exactly one
@@ -291,11 +315,28 @@ fn lower_stmt(stmt: &mut IrStmt, emit: bool, arrays: &std::collections::HashSet<
         // Here-string/here-doc: `cmd <<< "text"` — the text is the fd-0
         // redirect target, the command is the inner stage.
         IrStmt::Redirect { inner, redirects } => {
-            // Find a here-string / heredoc on fd 0 → the input text
-            if let Some(text_ir) = redirects.iter().find_map(|r| {
+            // The reductions below replace the whole STATEMENT with an
+            // Output (they print a value), so they only hold when the only
+            // redirect is the fd-0 here-text. `cat > f <<EOF` writes a FILE:
+            // printing its content instead lost the write.
+            let only_here_input = redirects.iter().all(|r| {
+                r.fd == Some(0) && (r.mode == "herestring" || r.mode == "heredoc")
+            });
+            // Find a here-string / heredoc on fd 0 → the input text (and
+            // whether it is a here-string: a heredoc body is only expanded by
+            // the shell, so a few folds must not treat it as literal bytes).
+            let here_mode = redirects.iter().find_map(|r| {
                 if r.fd == Some(0) && (r.mode == "herestring" || r.mode == "heredoc") {
-                    Some(r.target.clone())
+                    Some(r.mode.clone())
                 } else { None }
+            });
+            if only_here_input {
+            if let Some((text_ir, here_string)) = here_mode.and_then(|m| {
+                redirects.iter().find_map(|r| {
+                    if r.fd == Some(0) && r.mode == m {
+                        Some((r.target.clone(), m == "herestring"))
+                    } else { None }
+                })
             }) {
                 // Try to lower the inner command against the here-text
                 if let [IrStmt::Expr(IrExpr::Call { func, args })] = inner.as_slice() {
@@ -312,6 +353,7 @@ fn lower_stmt(stmt: &mut IrStmt, emit: bool, arrays: &std::collections::HashSet<
                         }
                     }
                 }
+            }
             }
             // `wc -l < F` → STREAMING count: O(1) memory line loop, never
             // a whole-file read (docs shir-primitives.md §ForEachLine).
@@ -684,6 +726,21 @@ fn lower_expr(expr: &mut IrExpr, arrays: &std::collections::HashSet<String>) {
                                         LIFT_COUNT.fetch_add(1, Ordering::Relaxed);
                                         return;
                                     }
+                                    // A value that ends in its own newline
+                                    // (`yes X | head -n K` → RepeatStr) still
+                                    // folds INTO a capture when the repeat is
+                                    // literal: `$(…)` strips exactly one
+                                    // trailing newline, so K copies of
+                                    // "X\n" minus that newline is the
+                                    // captured string. `$(yes Hi | head -n
+                                    // 3)` is "Hi\nHi\nHi" — the same fold
+                                    // the statement path already makes,
+                                    // without the trailing newline it keeps.
+                                    if let Some(trimmed) = capture_trim_one_newline(&replacement) {
+                                        *expr = trimmed;
+                                        LIFT_COUNT.fetch_add(1, Ordering::Relaxed);
+                                        return;
+                                    }
                                 }
                             }
                         }
@@ -975,8 +1032,15 @@ fn lower_text_cmd(source: TextSource, cmd_name: &str, cmd_args: &[IrExpr], stmt_
     //    command, so Substitute stays UN-OFFERED for Rust: those programs keep
     //    the exact `sed` instead of a mis-rendered subset.
     //  * `head -c N` is a BYTE count while TakeLines is line-based (`bytes:
-    //    true` returns None in the renderer), which is why
-    //    070_gnuisms_thorough's `head -c 3` keeps its command.
+    //    true` returns None in the renderer). Its bytes ARE reason-able about
+    //    when the source is a literal, so `try_lower_head_tail` folds the
+    //    exact slice and refuses when the slice would not end in '\n' (the
+    //    Output supplies that terminator): 070_gnuisms_thorough's
+    //    `printf 'abcdef' | head -c 3` writes "abc" with NO terminator, so it
+    //    keeps its command.
+    //  * `wc -L` counts the longest line's DISPLAY WIDTH (GNU: character
+    //    count under the locale), and no node models it — `try_lower_wc`
+    //    lowers only -c/-m/-l/-w, so `wc -L` keeps its command.
     let single_line_literal = is_literal
         && matches!(&text, IrExpr::Str(t, _) if !t.contains('\n'));
     match cmd_name {
@@ -984,8 +1048,8 @@ fn lower_text_cmd(source: TextSource, cmd_name: &str, cmd_args: &[IrExpr], stmt_
         // tr / wc / head / tail operate on the WHOLE text (char maps,
         // counts, line slices) — multi-line variable sources are safe.
         "tr" if trailing_newline => try_lower_tr(text, cmd_args),
-        "head" if trailing_newline => try_lower_head_tail(text, cmd_args, false),
-        "tail" if trailing_newline => try_lower_head_tail(text, cmd_args, true),
+        "head" if trailing_newline => try_lower_head_tail(text, trailing_newline, cmd_args, false),
+        "tail" if trailing_newline => try_lower_head_tail(text, trailing_newline, cmd_args, true),
         "wc" => try_lower_wc(text, trailing_newline, cmd_args),
         "sed" if single_line_literal => try_lower_sed(text, cmd_args),
         "grep" if !stmt_level => try_lower_grep(text, cmd_args),
@@ -1058,21 +1122,42 @@ fn extract_text_from_stage(stmts: &[IrStmt]) -> Option<TextSource> {
             if let [IrExpr::Str(name, _), IrExpr::Array(echo_args)] = args.as_slice() {
                 if name == "echo" {
                     let mut trailing_newline = true;
+                    let mut escapes = false;
                     let mut rest: &[IrExpr] = echo_args.as_slice();
                     // Leading flags: -n (no trailing newline), -E (default
-                    // escape behavior — a no-op), -e (REFUSE: would need
-                    // escape decoding to stay byte-exact).
+                    // escape behavior — a no-op), -e (INTERPRET escapes). The
+                    // last of -e/-E wins, as in bash.
                     while let Some(IrExpr::Str(flag, _)) = rest.first() {
                         match flag.as_str() {
                             "-n" => { trailing_newline = false; rest = &rest[1..]; }
-                            "-E" => { rest = &rest[1..]; }
-                            "-e" => return None,
+                            "-E" => { escapes = false; rest = &rest[1..]; }
+                            "-e" => { escapes = true; rest = &rest[1..]; }
                             _ => break,
                         }
                     }
-                    let text = join_echo_args(rest)?;
-                    let is_literal = matches!(text, IrExpr::Str(..));
+                    let mut text = join_echo_args(rest)?;
+                    let mut is_literal = matches!(text, IrExpr::Str(..));
+                    if escapes {
+                        // `echo -e` writes the DECODED bytes, so the escape
+                        // interpretation must happen here or the consumer
+                        // would see backslashes bash never wrote. Only an
+                        // all-literal argument list has known bytes; a
+                        // variable's content cannot be decoded at IR time.
+                        let raw = literal_text(&text)?;
+                        let decoded = decode_echo_escapes(&raw)?;
+                        text = IrExpr::Str(decoded, StrStyle::DoubleQuoted);
+                        is_literal = true;
+                    }
                     return Some(TextSource { text, trailing_newline, is_literal });
+                }
+                // `seq FIRST LAST [STEP]` (or `seq LAST`) with INTEGER
+                // literal operands: the exact lines it writes are known, so a
+                // downstream stage (`| head -3`, `| wc -l`, `| tr …`) reduces
+                // over them instead of spawning the producer. An empty range
+                // (`seq 1 0`) writes NOTHING — no trailing newline — which is
+                // exactly what `wc -l` must see.
+                if name == "seq" {
+                    return seq_text(echo_args);
                 }
             }
             None
@@ -1088,6 +1173,135 @@ fn extract_text_from_stage(stmts: &[IrStmt]) -> Option<TextSource> {
         },
         _ => None,
     }
+}
+
+/// `seq` with integer literal operands → the exact text it writes.
+///
+/// `seq LAST`, `seq FIRST LAST`, `seq FIRST STEP LAST` (GNU's positional
+/// forms; a STEP of 0 is an error, and a reversed range prints nothing).
+/// Refuses anything else — a non-integer operand (`seq 0.5 2` prints 0.5, 1.5
+/// with `%g` formatting this does not reproduce), a flag (`-s`, `-f`, `-w`,
+/// `--equal-width`), or a range longer than the constant budget.
+fn seq_text(args: &[IrExpr]) -> Option<TextSource> {
+    let mut nums: Vec<i64> = Vec::with_capacity(3);
+    for a in args {
+        let s = literal_text(a)?;
+        nums.push(s.trim().parse::<i64>().ok()?);
+    }
+    let (first, step, last) = match nums.as_slice() {
+        [last] => (1, 1, *last),
+        [first, last] => (*first, 1, *last),
+        [first, step, last] => (*first, *step, *last),
+        _ => return None,
+    };
+    if step == 0 {
+        return None;
+    }
+    const MAX_LINES: i64 = 4096;
+    let mut lines: Vec<String> = Vec::new();
+    let mut v = first;
+    while (step > 0 && v <= last) || (step < 0 && v >= last) {
+        if lines.len() as i64 >= MAX_LINES {
+            return None;
+        }
+        lines.push(v.to_string());
+        v = v.checked_add(step)?;
+    }
+    // An EMPTY range writes no bytes at all — not even a newline.
+    let trailing_newline = !lines.is_empty();
+    Some(TextSource {
+        text: IrExpr::Str(lines.join("\n"), StrStyle::DoubleQuoted),
+        trailing_newline,
+        is_literal: true,
+    })
+}
+
+/// bash's `echo -e` escape interpretation, over an all-literal argument list.
+///
+/// Handles the escapes that produce fixed bytes: `\\a \\b \\e \\E \\f \\n
+/// \\r \\t \\v \\\\`, octal `\\0nnn` (and `\\nnn`) and `\\xHH`. An UNKNOWN
+/// escape is passed through as a backslash and the character, which is what
+/// bash does (`echo -e '\\q'` prints `\q`).
+///
+/// REFUSED: `\\c` (it also SUPPRESSES the rest of the output and the trailing
+/// newline — a control-flow effect, not a byte), `\\uXXXX`/`\\UXXXXXXXX`
+/// (locale-dependent encoding), and NUL (`\\0` with no digits) which a Rust
+/// `String` cannot hold.
+fn decode_echo_escapes(s: &str) -> Option<String> {
+    let cs: Vec<char> = s.chars().collect();
+    let mut out = String::new();
+    let mut i = 0;
+    while i < cs.len() {
+        if cs[i] != '\\' {
+            out.push(cs[i]);
+            i += 1;
+            continue;
+        }
+        let c = *cs.get(i + 1)?;
+        i += 2;
+        match c {
+            'a' => out.push('\u{7}'),
+            'b' => out.push('\u{8}'),
+            'e' | 'E' => out.push('\u{1b}'),
+            'f' => out.push('\u{c}'),
+            'n' => out.push('\n'),
+            'r' => out.push('\r'),
+            't' => out.push('\t'),
+            'v' => out.push('\u{b}'),
+            '\\' => out.push('\\'),
+            '0'..='7' => {
+                // Up to three octal digits, including this one.
+                let mut val: u32 = c.to_digit(8)?;
+                let mut n = 0;
+                while n < 2 {
+                    match cs.get(i).and_then(|d| d.to_digit(8)) {
+                        Some(d) => {
+                            val = val * 8 + d;
+                            i += 1;
+                            n += 1;
+                        }
+                        None => break,
+                    }
+                }
+                if val == 0 {
+                    // A bare `\0` is a NUL byte: not representable.
+                    return None;
+                }
+                out.push(char::from_u32(val)?);
+            }
+            'x' => {
+                let mut val: u32 = 0;
+                let mut n = 0;
+                while n < 2 {
+                    match cs.get(i).and_then(|d| d.to_digit(16)) {
+                        Some(d) => {
+                            val = val * 16 + d;
+                            i += 1;
+                            n += 1;
+                        }
+                        None => break,
+                    }
+                }
+                if n == 0 {
+                    // `\\x` with no hex digit is a literal backslash-x.
+                    out.push_str("\\x");
+                } else {
+                    // A NUL byte cannot live in a Rust `String`, and a shell
+                    // variable cannot hold one either — refuse the shape.
+                    if val == 0 {
+                        return None;
+                    }
+                    out.push(char::from_u32(val)?);
+                }
+            }
+            'c' | 'u' | 'U' => return None,
+            other => {
+                out.push('\\');
+                out.push(other);
+            }
+        }
+    }
+    Some(out)
 }
 
 /// Join echo's args with single spaces into one text expression. Args may
@@ -1188,9 +1402,28 @@ fn try_lower_cut(text: IrExpr, args: &[IrExpr]) -> Option<IrExpr> {
     if fields_str.is_empty() {
         return None;
     }
+    // Refusals, kept where the ORIGINAL command stays exact:
+    //  * `-c`/`-b` select CHARACTER/BYTE positions — a different node
+    //    (SubStrExtract) and a different unit than a field (
+    //    `cut -c` counts characters, so on multibyte input it is not a byte
+    //    slice either);
+    //  * `--complement` is modelled in the node's theory but the node carries
+    //    no complement field, so it cannot be rendered faithfully.
+    if args_str.iter().any(|a| *a == "-c" || *a == "-b" || a.starts_with("--")) {
+        return None;
+    }
 
-    // Parse field spec: "1", "1,3", "1-3", "1-3,5"
-    let fields = parse_field_spec(fields_str);
+    // Parse field spec: "1", "1,3", "1-3", "2-", "-3". The field COUNT is
+    // known whenever the text is a literal (the only shape that reaches here),
+    // which is what makes an open range (`-f2-`) and the empty-selection
+    // refusal decidable.
+    let field_count = literal_text(&text).map(|t| t.split(delimiter.as_str()).count());
+    let fields = parse_field_spec(fields_str, field_count)?;
+    // No field to print means cut prints NOTHING for this line — not a blank
+    // line — and the Output wrapping the node always writes a newline.
+    if fields.is_empty() {
+        return None;
+    }
 
     let mut node = FieldExtract {
         text: text,
@@ -1210,17 +1443,92 @@ fn try_lower_cut(text: IrExpr, args: &[IrExpr]) -> Option<IrExpr> {
     Some(IrExpr::Ext(Box::new(node)))
 }
 
-fn parse_field_spec(spec: &str) -> Vec<FieldRange> {
-    spec.split(',').filter_map(|part| {
-        if let Some((start, end)) = part.split_once('-') {
-            let s: u32 = start.parse().ok()?;
-            let e: u32 = end.parse().ok()?;
-            Some(FieldRange::Range { start: s, end: e })
+/// `cut -f LIST` → the ascending, de-duplicated list of 1-based indices cut
+/// selects (GNU: the output follows the INPUT order, so `-f3,1` and `-f1,3`
+/// agree), clamped to the fields the line actually has.
+///
+/// `count` is the line's field count when the text is a literal. It turns an
+/// open range (`-f2-`) into its members and drops indices past the end; both
+/// are what GNU cut does (`cut -d: -f1-5` on `a:b` prints `a:b`).
+///
+/// Refuses (None) — the caller keeps the command — on anything whose meaning
+/// the node does not cover: a non-numeric part, field 0 (`cut -f0` is an
+/// error), or a reversed range (`-f4-2` is an error, not an empty set).
+/// A repeat node whose value is a KNOWN string of repetitions → the same
+/// value with ONE trailing newline removed (what `$(…)` does). None for any
+/// other node (an unknown count, a non-literal unit, a unit not ending in
+/// "\n").
+fn capture_trim_one_newline(e: &IrExpr) -> Option<IrExpr> {
+    let IrExpr::Ext(n) = e else { return None };
+    if n.tag() != "RepeatStr" {
+        return None;
+    }
+    let r = n.as_any().downcast_ref::<crate::shir_nodes::RepeatStr>()?;
+    let unit = literal_text(&r.text)?;
+    let body = unit.strip_suffix('\n')?;
+    let k: i64 = match &r.count {
+        IrExpr::Int(k) => *k,
+        _ => return None,
+    };
+    if k < 0 {
+        return None;
+    }
+    let mut out = String::new();
+    for i in 0..k {
+        if i + 1 < k {
+            out.push_str(&unit);
         } else {
-            let n: u32 = part.parse().ok()?;
-            Some(FieldRange::Single(n))
+            out.push_str(body);
         }
-    }).collect()
+    }
+    Some(IrExpr::Str(out, StrStyle::DoubleQuoted))
+}
+
+fn parse_field_spec(spec: &str, count: Option<usize>) -> Option<Vec<FieldRange>> {
+    let mut idx: Vec<u32> = Vec::new();
+    for part in spec.split(',') {
+        if part.is_empty() {
+            return None;
+        }
+        let (start, end) = match part.split_once('-') {
+            Some((a, b)) => {
+                let start: u32 = if a.is_empty() { 1 } else { a.parse().ok()? };
+                let end: u32 = if b.is_empty() {
+                    match count {
+                        Some(c) => c as u32,
+                        // An open range over an unknown length is not a
+                        // finite index list — leave it to the runtime.
+                        None => return None,
+                    }
+                } else {
+                    b.parse().ok()?
+                };
+                // `cut -f5-` over a 3-field line is VALID and selects
+                // nothing (unlike the reversed `-f4-2`, which is an error).
+                if b.is_empty() && start > end {
+                    continue;
+                }
+                (start, end)
+            }
+            None => {
+                let n: u32 = part.parse().ok()?;
+                (n, n)
+            }
+        };
+        if start == 0 || end == 0 || end < start {
+            return None;
+        }
+        for n in start..=end {
+            if !idx.contains(&n) {
+                idx.push(n);
+            }
+        }
+    }
+    idx.sort_unstable();
+    if let Some(c) = count {
+        idx.retain(|n| (*n as usize) <= c);
+    }
+    Some(idx.into_iter().map(FieldRange::Single).collect())
 }
 
 // ── tr ───────────────────────────────────────────────────────────────
@@ -1405,7 +1713,12 @@ fn try_lower_tr(text: IrExpr, args: &[IrExpr]) -> Option<IrExpr> {
 
 // ── head / tail ──────────────────────────────────────────────────────
 
-fn try_lower_head_tail(text: IrExpr, args: &[IrExpr], from_end: bool) -> Option<IrExpr> {
+fn try_lower_head_tail(
+    text: IrExpr,
+    source_trailing_newline: bool,
+    args: &[IrExpr],
+    from_end: bool,
+) -> Option<IrExpr> {
     let args_str: Vec<&str> = args.iter().filter_map(|a| {
         if let IrExpr::Str(s, _) = a { Some(s.as_str()) } else { None }
     }).collect();
@@ -1433,11 +1746,34 @@ fn try_lower_head_tail(text: IrExpr, args: &[IrExpr], from_end: bool) -> Option<
         i += 1;
     }
 
-    // `head -c` / `tail -c` take BYTES; the as-built TakeLines renderers
-    // slice LINES (split('\n')…join) — a byte count would mis-render, so
-    // it falls back to the original command.
+    // `head -c` / `tail -c` take BYTES; TakeLines slices LINES, so a byte
+    // count cannot ride the node (`bytes: true` has no render arm on any
+    // backend). A LITERAL source's bytes are known, though, so the slice is a
+    // constant — but only when the result can be spelled as a statement
+    // VALUE: `head -c`/`tail -c` print raw bytes with no terminator, while the
+    // Output wrapping the fold always appends '\n'. So the slice must end in
+    // '\n' (strip it; the Output restores it) and must land on a UTF-8
+    // boundary (the value is a `String`). `printf 'abcdef' | head -c 3`
+    // therefore keeps its command: bash writes "abc" with no newline.
     if bytes {
-        return None;
+        let n: i64 = count_str.parse().ok()?;
+        if n <= 0 {
+            return None;
+        }
+        let mut full = literal_text(&text)?;
+        if source_trailing_newline {
+            full.push('\n');
+        }
+        let all = full.as_bytes();
+        let n = n as usize;
+        let slice = if from_end {
+            &all[all.len().saturating_sub(n)..]
+        } else {
+            &all[..n.min(all.len())]
+        };
+        let slice = std::str::from_utf8(slice).ok()?;
+        let body = slice.strip_suffix('\n')?;
+        return Some(IrExpr::Str(body.to_string(), StrStyle::DoubleQuoted));
     }
 
     let count = count_str.parse::<i64>().ok().map(|n| IrExpr::Int(n))
@@ -1769,29 +2105,38 @@ fn try_lower_param_len(args: &[IrExpr]) -> Option<IrExpr> {
 mod tests {
     use super::*;
 
+    // The spec is now expanded to its FIELD INDICES (a range is the members the
+    // line has, in input order) — the shape the renderers emit — instead of
+    // keeping `Range` nodes. Same selection, one representation.
     #[test]
     fn parse_simple_field_spec() {
-        let fields = parse_field_spec("2");
+        let fields = parse_field_spec("2", None).unwrap();
         assert_eq!(fields, vec![FieldRange::Single(2)]);
     }
 
     #[test]
     fn parse_multi_field_spec() {
-        let fields = parse_field_spec("1,3");
+        let fields = parse_field_spec("1,3", None).unwrap();
         assert_eq!(fields, vec![FieldRange::Single(1), FieldRange::Single(3)]);
     }
 
     #[test]
     fn parse_range_field_spec() {
-        let fields = parse_field_spec("1-3");
-        assert_eq!(fields, vec![FieldRange::Range { start: 1, end: 3 }]);
+        let fields = parse_field_spec("1-3", None).unwrap();
+        assert_eq!(fields, vec![
+            FieldRange::Single(1),
+            FieldRange::Single(2),
+            FieldRange::Single(3),
+        ]);
     }
 
     #[test]
     fn parse_mixed_field_spec() {
-        let fields = parse_field_spec("1-3,5");
+        let fields = parse_field_spec("1-3,5", None).unwrap();
         assert_eq!(fields, vec![
-            FieldRange::Range { start: 1, end: 3 },
+            FieldRange::Single(1),
+            FieldRange::Single(2),
+            FieldRange::Single(3),
             FieldRange::Single(5),
         ]);
     }
@@ -2022,7 +2367,7 @@ mod tests {
 
     #[test]
     fn head_n_is_take_lines() {
-        let r = try_lower_head_tail(st("a\nb\nc"), &[st("-n"), st("2")], false).unwrap();
+        let r = try_lower_head_tail(st("a\nb\nc"), true, &[st("-n"), st("2")], false).unwrap();
         let IrExpr::Ext(n) = &r else { panic!() };
         let tl = n.as_any().downcast_ref::<TakeLines>().unwrap();
         assert_eq!(tl.count, IrExpr::Int(2));
@@ -2031,17 +2376,34 @@ mod tests {
 
     #[test]
     fn tail_n_is_take_lines_from_end() {
-        let r = try_lower_head_tail(st("a\nb"), &[st("-n"), st("1")], true).unwrap();
+        let r = try_lower_head_tail(st("a\nb"), true, &[st("-n"), st("1")], true).unwrap();
         let IrExpr::Ext(n) = &r else { panic!() };
         assert!(n.as_any().downcast_ref::<TakeLines>().unwrap().from_end);
     }
 
     #[test]
-    fn head_bytes_not_reduced() {
-        // head -c takes BYTES; the as-built TakeLines renderers slice
-        // LINES — a byte count must fall back (070_gnuisms: printf|head -c).
-        assert!(try_lower_head_tail(st("abcdef"), &[st("-c"), st("3")], false).is_none());
-        assert!(try_lower_head_tail(st("abcdef"), &[st("-c3")], true).is_none());
+    fn head_bytes_fold_only_when_the_slice_ends_in_a_newline() {
+        // `head -c`/`tail -c` write RAW bytes with no terminator, and the
+        // statement wrapper always appends '\n' — so only a slice that ends in
+        // '\n' (the wrapper restores it) can fold. A literal source's bytes are
+        // known, which is what makes the decision decidable.
+        let s = |v: &IrExpr| match v {
+            IrExpr::Str(t, _) => Some(t.clone()),
+            _ => None,
+        };
+        // Source "abc\ndef" + newline: the first 4 bytes are "abc\n".
+        let r = try_lower_head_tail(st("abc\ndef"), true, &[st("-c"), st("4")], false).unwrap();
+        assert_eq!(s(&r), Some("abc".to_string()));
+        // The last 2 bytes are "f\n".
+        let r = try_lower_head_tail(st("abc\ndef"), true, &[st("-c2")], true).unwrap();
+        assert_eq!(s(&r), Some("f".to_string()));
+        // `printf 'abcdef' | head -c 3` writes "abc" with NO terminator:
+        // refused (070_gnuisms keeps the command).
+        assert!(try_lower_head_tail(st("abcdef"), true, &[st("-c"), st("3")], false).is_none());
+        // The same, from a source that has no trailing newline at all.
+        assert!(try_lower_head_tail(st("abcdef"), false, &[st("-c3")], true).is_none());
+        // `-c 0` prints nothing; the empty slice has no '\n' to restore.
+        assert!(try_lower_head_tail(st("abc"), true, &[st("-c"), st("0")], false).is_none());
     }
 
     // ── wc trailing-newline semantics ────────────────────────────────
@@ -2176,11 +2538,112 @@ mod tests {
         assert!(matches!(&src.text, IrExpr::Str(s, _) if s == "x"), "-n is a flag, not text");
     }
 
+    // `-e` is no longer refused outright: the escape interpretation happens at
+    // IR time over an all-literal argument list, so the consumer stage sees the
+    // bytes bash wrote. A non-literal list still refuses (see
+    // `echo_e_with_a_variable_stays_a_command`).
     #[test]
-    fn echo_e_source_refused() {
-        // -e interprets escapes; treating the args as literal text would
-        // not be byte-exact.
-        assert!(extract_text_from_stage(&echo_stage(vec![st("-e"), st("a\\nb")])).is_none());
+    fn echo_e_source_is_decoded() {
+        let src = extract_text_from_stage(&echo_stage(vec![st("-e"), st("a\\nb")])).unwrap();
+        assert!(src.trailing_newline && src.is_literal);
+        assert!(matches!(&src.text, IrExpr::Str(t, _) if t == "a\nb"));
+    }
+
+    #[test]
+    fn echo_e_with_a_variable_stays_a_command() {
+        // `echo -e "$v"` interprets escapes inside the VARIABLE's value, which
+        // is a runtime fact — the args are not literal bytes any more.
+        let stage = vec![IrStmt::Expr(IrExpr::Call {
+            func: "exec".to_string(),
+            args: vec![
+                st("echo"),
+                IrExpr::Array(vec![st("-e"), IrExpr::Var("v".to_string(), None)]),
+            ],
+        })];
+        assert!(extract_text_from_stage(&stage).is_none());
+    }
+
+    #[test]
+    fn cut_specs_expand_to_ascending_field_indices() {
+        // `-f3,1` is the SAME selection as `-f1,3` (cut prints the line's
+        // fields in input order), `-f2-` runs to the last field the literal
+        // line has, and duplicates collapse.
+        assert_eq!(
+            parse_field_spec("3,1", Some(4)).unwrap(),
+            vec![FieldRange::Single(1), FieldRange::Single(3)]
+        );
+        assert_eq!(
+            parse_field_spec("2-", Some(4)).unwrap(),
+            vec![
+                FieldRange::Single(2),
+                FieldRange::Single(3),
+                FieldRange::Single(4)
+            ]
+        );
+        assert_eq!(
+            parse_field_spec("2,2-3", Some(3)).unwrap(),
+            vec![FieldRange::Single(2), FieldRange::Single(3)]
+        );
+        // `-f1-5` over a two-field line keeps the two it has.
+        assert_eq!(
+            parse_field_spec("1-5", Some(2)).unwrap(),
+            vec![FieldRange::Single(1), FieldRange::Single(2)]
+        );
+    }
+
+    #[test]
+    fn cut_spec_refusals() {
+        // A reversed range and field 0 are ERRORS in cut, so the command is
+        // kept (a wrong-but-silent empty selection must never be offered).
+        assert!(parse_field_spec("4-2", Some(4)).is_none());
+        assert!(parse_field_spec("0", Some(4)).is_none());
+        assert!(parse_field_spec("1,x", Some(4)).is_none());
+        // An open range over an UNKNOWN length is not a finite index list.
+        assert!(parse_field_spec("2-", None).is_none());
+        // A selection that hits no field of the literal line: cut prints
+        // NOTHING for the line, not a blank line — the caller must refuse.
+        assert_eq!(parse_field_spec("4", Some(3)).unwrap(), Vec::new());
+        assert_eq!(parse_field_spec("5-", Some(3)).unwrap(), Vec::new());
+    }
+
+    #[test]
+    fn provided_producers_are_known_bytes() {
+        // `seq` with integer operands: the exact lines it writes, with the
+        // trailing newline a non-empty range has.
+        let seq = |args: Vec<IrExpr>| {
+            extract_text_from_stage(&[IrStmt::Expr(IrExpr::Call {
+                func: "exec".to_string(),
+                args: vec![st("seq"), IrExpr::Array(args)],
+            })])
+        };
+        let src = seq(vec![st("1"), st("3")]).expect("seq 1 3");
+        assert!(src.is_literal && src.trailing_newline);
+        assert!(matches!(&src.text, IrExpr::Str(t, _) if t == "1\n2\n3"));
+        let src = seq(vec![st("5"), st("-1"), st("1")]).expect("seq 5 -1 1");
+        assert!(matches!(&src.text, IrExpr::Str(t, _) if t == "5\n4\n3\n2\n1"));
+        // An EMPTY range writes nothing at all — no trailing newline — which
+        // is what `seq 1 0 | wc -l` (0) must see.
+        let src = seq(vec![st("1"), st("0")]).expect("seq 1 0");
+        assert!(!src.trailing_newline);
+        assert!(matches!(&src.text, IrExpr::Str(t, _) if t.is_empty()));
+        // Refusals: a fractional operand (GNU %g formatting), a step of 0,
+        // and any extra operand.
+        assert!(seq(vec![st("0.5"), st("2")]).is_none());
+        assert!(seq(vec![st("1"), st("0"), st("5")]).is_none());
+        assert!(seq(vec![st("1"), st("2"), st("3"), st("4")]).is_none());
+    }
+
+    #[test]
+    fn echo_e_decodes_its_escapes() {
+        assert_eq!(decode_echo_escapes("a\\nb").unwrap(), "a\nb");
+        assert_eq!(decode_echo_escapes("x\\ty").unwrap(), "x\ty");
+        assert_eq!(decode_echo_escapes("\\101\\x42").unwrap(), "AB");
+        // An unknown escape keeps its backslash, as bash does.
+        assert_eq!(decode_echo_escapes("a\\qb").unwrap(), "a\\qb");
+        // `\c` also stops the output and drops the newline (control flow, not
+        // a byte), and a NUL cannot live in a Rust String.
+        assert!(decode_echo_escapes("a\\cb").is_none());
+        assert!(decode_echo_escapes("a\\0").is_none());
     }
 
     #[test]
@@ -2404,12 +2867,14 @@ mod tests {
     }
 
     #[test]
-    fn capture_keeps_a_value_that_ends_in_its_own_newline() {
+    fn capture_strips_one_newline_from_a_literal_repeat() {
         // `yes Hi | head -n 3` folds to RepeatStr, whose value still ends in
-        // "\n" (the statement path tracks that with `already_nl`). `$(…)`
-        // strips trailing newlines, so folding it into the capture would add
-        // a blank line at the consumer (000__04d_system_utilities) — that
-        // shape must keep the capture and its command.
+        // "\n" (the statement path tracks that with `already_nl`). In a
+        // CAPTURE that trailing newline does not exist: `$(…)` strips exactly
+        // one, so the captured value is "Hi\nHi\nHi" — a literal, when the
+        // count and the unit are literal. (This replaces
+        // `capture_keeps_a_value_that_ends_in_its_own_newline`, which pinned
+        // the refusal that made 000__04d/000__05 spawn `bash -c`.)
         crate::transforms::set_target(Some("rs"));
         let stages = vec![
             IrExpr::Arrow(vec![IrStmt::Expr(IrExpr::Call {
@@ -2431,11 +2896,11 @@ mod tests {
         };
         lower_expr(&mut cap, &std::collections::HashSet::new());
         crate::transforms::set_target(None);
-        let IrExpr::Capture { expr, .. } = &cap else {
-            panic!("a capture whose value keeps its own newline must be kept")
-        };
-        let IrExpr::Arrow(body) = expr.as_ref() else { panic!() };
-        assert_eq!(&body[0], &inner, "capture body must keep the original pipeline");
+        let _ = inner;
+        assert!(
+            matches!(cap, IrExpr::Str(ref t, _) if t == "Hi\nHi\nHi"),
+            "the capture did not become the trimmed repeat: {cap:?}"
+        );
     }
 }
 
@@ -2455,7 +2920,15 @@ fn try_lower_command(text: IrExpr, cmd_name: &str, cmd_args: &[IrExpr]) -> Optio
         // A here-string supplies "text\n" (bash appends the newline), and
         // this path is statement position (the caller Output-wraps).
         _ => {
-            let is_literal = matches!(text, IrExpr::Str(..));
+            // The here-string's target can arrive as an all-literal
+            // interpolation (`<<< "x:y:z"`) rather than a bare Str; its bytes
+            // are still known, so normalize it and treat it as literal — this
+            // is what lets `cut -d: -f2 <<< "x:y:z"` reduce instead of
+            // spawning the command for text it already holds.
+            let (text, is_literal) = match literal_text(&text) {
+                Some(s) => (IrExpr::Str(s, StrStyle::DoubleQuoted), true),
+                None => (text, false),
+            };
             lower_text_cmd(
                 TextSource { text, trailing_newline: true, is_literal },
                 cmd_name,
@@ -2818,6 +3291,7 @@ fn try_reduce_capture_assign(stmt: &IrStmt, _arrays: &std::collections::HashSet<
                         }
                         let mut stage_cmd: Option<(&str, &[IrExpr])> = None;
                         let mut heredoc_text: Option<&IrExpr> = None;
+                        let mut here_is_herestring = false;
                         if let Some(IrExpr::Arrow(stage)) = args.first() {
                             if let [IrStmt::Expr(IrExpr::Call { func: sf, args: sa })] =
                                 stage.as_slice()
@@ -2846,14 +3320,15 @@ fn try_reduce_capture_assign(stmt: &IrStmt, _arrays: &std::collections::HashSet<
                                                 }
                                             }
                                             "mode" => {
-                                                if matches!(
-                                                    v,
-                                                    IrExpr::Str(m, _)
-                                                        if m == "herestring"
-                                                            || m == "heredoc"
-                                                )
-                                                {
-                                                    is_herestring = true;
+                                                if let IrExpr::Str(m, _) = v {
+                                                    if m == "herestring" || m == "heredoc" {
+                                                        is_herestring = true;
+                                                        // A heredoc BODY is expanded
+                                                        // by the shell; only a
+                                                        // here-string's text is
+                                                        // literal bytes.
+                                                        here_is_herestring = m == "herestring";
+                                                    }
                                                 }
                                             }
                                             "target" => target = Some(v),

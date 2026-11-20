@@ -6613,15 +6613,7 @@ while __sh_path.len() > 1 && __sh_path.ends_with('/') {{ __sh_path = &__sh_path[
                 "FieldExtract" => {
                     let x = n.as_any().downcast_ref::<crate::shir_nodes::FieldExtract>()
                         .expect("tag/type agree");
-                    if x.fields.len() == 1 {
-                        if let crate::ir::FieldRange::Single(i) = x.fields[0] {
-                            return format!(
-                                "{{ let __sh_str: String = {}; let __sh_fields: Vec<&str> = __sh_str.split({}).collect(); if {}-1 < __sh_fields.len() {{ __sh_fields[{}].to_string() }} else {{ String::new() }} }}",
-                                self.expr_str(&x.text),
-                                Self::rust_str(&x.delimiter), i, i - 1);
-                        }
-                    }
-                    "String::new()".into()
+                    self.field_extract_str(x)
                 }
                 "AffixStrip" => {
                     let x = n.as_any().downcast_ref::<crate::shir_nodes::AffixStrip>()
@@ -6648,6 +6640,59 @@ while __sh_path.len() > 1 && __sh_path.ends_with('/') {{ __sh_path = &__sh_path[
                 }
             }
         }
+    }
+
+    /// `FieldExtract` — `cut -dD -fLIST` over ONE line, GNU semantics:
+    ///  * a line with NO delimiter prints WHOLE (and nothing at all under
+    ///    `-s`), whatever the field list says;
+    ///  * the selection is the line's fields in INPUT order (ascending), each
+    ///    once — `-f3,1` and `-f1,3` agree;
+    ///  * a selected field the line does not have contributes nothing
+    ///    (`cut -d: -f1-5` on `a:b` is `a:b`);
+    ///  * the output delimiter defaults to the input one.
+    ///
+    /// The lowering never builds a selection that is empty for its literal
+    /// source (cut prints nothing then, not a blank line), but an empty list
+    /// here still renders the empty string rather than a panic.
+    fn field_extract_str(&mut self, x: &crate::shir_nodes::FieldExtract) -> String {
+        let t = self.expr_str(&x.text);
+        let d = Self::rust_str(&x.delimiter);
+        let mut idx: Vec<u32> = Vec::new();
+        for f in &x.fields {
+            match f {
+                crate::ir::FieldRange::Single(i) => {
+                    if *i > 0 && !idx.contains(i) {
+                        idx.push(*i)
+                    }
+                }
+                crate::ir::FieldRange::Range { start, end } => {
+                    for i in *start..=*end {
+                        if i > 0 && !idx.contains(&i) {
+                            idx.push(i)
+                        }
+                    }
+                }
+            }
+        }
+        idx.sort_unstable();
+        if idx.is_empty() {
+            return "String::new()".to_string();
+        }
+        let zero: Vec<String> = idx.iter().map(|i| format!("{}usize", i - 1)).collect();
+        let od = match &x.output_delimiter {
+            Some(o) => Self::rust_str(o),
+            None => d.clone(),
+        };
+        let suppress = if x.suppress_no_delim { "true" } else { "false" };
+        format!(
+            "{{ let __sh_s: String = {t}; let __sh_d: &str = {d}; \
+             if !__sh_s.contains(__sh_d) {{ if {suppress} {{ String::new() }} else {{ __sh_s }} }} \
+             else {{ let __sh_f: Vec<&str> = __sh_s.split(__sh_d).collect(); \
+             vec![{}].iter().copied() \
+             .filter(|&__sh_i| __sh_i < __sh_f.len()) \
+             .map(|__sh_i| __sh_f[__sh_i]).collect::<Vec<&str>>().join({od}) }} }}",
+            zero.join(", ")
+        )
     }
 
     /// `AffixStrip(text, pat, prefix)` — strip at most ONE leading
@@ -8964,15 +9009,7 @@ while __sh_path.len() > 1 && __sh_path.ends_with('/') {{ __sh_path = &__sh_path[
             IrExpr::Ext(n) if n.tag() == "FieldExtract" => {
                 let x = n.as_any().downcast_ref::<crate::shir_nodes::FieldExtract>()
                     .expect("tag/type agree");
-                if x.fields.len() == 1 {
-                    if let crate::ir::FieldRange::Single(i) = x.fields[0] {
-                        let t = self.expr_str(&x.text);
-                        let d = Self::rust_str_expr(&x.delimiter);
-                        return format!("vec![{{ let __sh_str: String = {t}; let __sh_fields: Vec<&str> = __sh_str.split({d}.as_str()).collect(); if {}-1 < __sh_fields.len() {{ __sh_fields[{}].to_string() }} else {{ String::new() }} }}]", i, i - 1);
-                    }
-                }
-                self.mark_todo("word FieldExtract (complex fields)");
-                "vec![String::new()]".to_string()
+                format!("vec![{}]", self.field_extract_str(x))
             }
             IrExpr::Ext(n) if n.tag() == "AffixStrip" => {
                 let x = n.as_any().downcast_ref::<crate::shir_nodes::AffixStrip>()
@@ -24515,7 +24552,7 @@ mod tests {
     #[test]
     fn offered_text_nodes_execute_like_bash() {
         let cases: &[(&str, &str, &str)] = &[
-            ("SplitFieldExtract", ".split(\":\")", "echo \"a:b:c\" | cut -d: -f2\n"),
+            ("SplitFieldExtract", ".iter().copied()", "echo \"a:b:c\" | cut -d: -f2\n"),
             (
                 "WordCount",
                 "split_whitespace().count()",
@@ -24591,6 +24628,69 @@ mod tests {
                 "sort_by(",
                 "echo \"c:c b:b a:a\" | tr ' ' '\\n' | sort | tr ':' '/' | head -2\n",
             ),
+            // cut FIELD LISTS and RANGES (`-f1,3`, `-f3,1`, `-f2-`, `-f1-5`):
+            // the selection is the line's fields in INPUT order, each once,
+            // and a selected field the line lacks contributes nothing.
+            (
+                "FieldList",
+                ".iter().copied()",
+                "v=$(echo \"a:b:c:d\" | cut -d: -f1,3)\necho \"$v\"\n",
+            ),
+            (
+                "FieldListInputOrder",
+                ".iter().copied()",
+                "v=$(echo \"a:b:c:d\" | cut -d: -f3,1)\necho \"$v\"\n",
+            ),
+            (
+                "FieldListDuplicate",
+                ".iter().copied()",
+                "v=$(echo \"a:b:c\" | cut -d: -f2,2-3)\necho \"$v\"\n",
+            ),
+            (
+                "FieldOpenRange",
+                ".iter().copied()",
+                "v=$(echo \"a:b:c:d\" | cut -d: -f2-)\necho \"$v\"\n",
+            ),
+            (
+                "FieldRangePastEnd",
+                ".iter().copied()",
+                "v=$(echo \"a:b\" | cut -d: -f1-5)\necho \"$v\"\n",
+            ),
+            // COMMAND-PRODUCER pipelines: a producer whose exact bytes are
+            // known (`seq` with integer operands, `echo -e`'s decoded text)
+            // feeds the consumer stage instead of spawning bash.
+            (
+                "SeqProducerHead",
+                "__sh_stop",
+                "x=$(seq 1 5 | head -3)\necho \"$x\"\n",
+            ),
+            (
+                "EchoEProducerLineCount",
+                ".matches(",
+                "m=$(echo -e \"a\\nb\\nc\" | wc -l)\necho \"$m\"\n",
+            ),
+            // BYTE cuts on a literal source, folded to the exact slice.
+            (
+                "HeadByteCount",
+                "\"abc\".to_string()",
+                "u=$(printf 'abc\\ndef\\n' | head -c 4)\necho \"$u\"\n",
+            ),
+            (
+                "TailByteCount",
+                "\"f\".to_string()",
+                "t=$(printf 'abc\\ndef\\n' | tail -c 2)\necho \"$t\"\n",
+            ),
+            // `$(yes X | head -n K)` strips exactly one trailing newline.
+            (
+                "YesHeadCapture",
+                "Hi\\nHi\\nHi",
+                "r=$(yes Hi | head -n 3)\necho \"$r\"\n",
+            ),
+            (
+                "TrSqueeze",
+                "__sh_squeeze",
+                "w=$(echo \"  a  b  \" | tr -s ' ')\necho \"$w\"\n",
+            ),
         ];
         let mut bad: Vec<String> = Vec::new();
         for (name, marker, src) in cases {
@@ -24618,6 +24718,47 @@ mod tests {
             "text nodes disagree with bash:\n{}",
             bad.join("\n")
         );
+    }
+
+    /// The other half of the field/flag work: every shape whose meaning the
+    /// node does NOT cover must keep spawning the command, because that form is
+    /// exact everywhere. Each entry is a site the census still lists on
+    /// purpose.
+    #[test]
+    fn refused_text_shapes_keep_their_command() {
+        let refused: &[(&str, &str)] = &[
+            // `cut -c` counts CHARACTERS (multibyte-aware), not fields.
+            ("char positions", "echo abc | cut -c1\n"),
+            // The node has no complement field.
+            ("complement", "echo a:b | cut --complement -d: -f1\n"),
+            // No field selected: cut prints NOTHING for the line, while the
+            // statement wrapper would print a blank line.
+            ("empty selection", "echo a:b:c | cut -d: -f4\n"),
+            // A reversed range is an ERROR in cut, not an empty set.
+            ("reversed range", "echo a:b | cut -d: -f4-2\n"),
+            // `wc -L` is the longest line's DISPLAY WIDTH; no node models it.
+            ("longest line", "echo abc | wc -L\n"),
+            // A byte cut that does not end in '\n': head writes raw bytes and
+            // the statement wrapper would append a newline bash did not.
+            ("byte cut without terminator", "printf 'abcdef' | head -c 3\n"),
+            // `echo -e` over a VARIABLE: its bytes are unknown at IR time.
+            ("echo -e variable", "m=$(echo -e \"$y\" | wc -l)\necho \"$m\"\n"),
+            // A non-integer seq operand (GNU's %g formatting).
+            ("fractional seq", "seq 0.5 2\n"),
+            // An open range over a source of unknown length.
+            ("open range on a variable", "v=$(echo \"$s\" | cut -d: -f2-)\necho \"$v\"\n"),
+            // A heredoc BODY is expanded by the shell (`<<EOF` with $v in it),
+            // so `cat` over one is not an identity on the IR text.
+            ("heredoc body", "v=x\ncat <<EOF\n$v\nEOF\n"),
+        ];
+        let mut bad: Vec<String> = Vec::new();
+        for (name, src) in refused {
+            let prog = render_rs(src);
+            if !prog.contains("__sh_spawn(") {
+                bad.push(format!("{name}: folded a shape it must refuse:\n{prog}"));
+            }
+        }
+        assert!(bad.is_empty(), "refusals leaked:\n{}", bad.join("\n"));
     }
 
     /// Source-driven coverage of `| head`/`| tail` lives in
