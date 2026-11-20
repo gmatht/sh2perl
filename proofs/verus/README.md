@@ -7169,6 +7169,107 @@ Mutants, measured: permissive parser **31 verified, 2 errors**; wrapping
 arithmetic **28 / 5**; folding a runtime-valued tree **31 / 2**; identity
 **27 / 6**.
 
+## scoped_hoist.rs — a single-assignment local lives in a `let`, not a cell (21)
+
+`shir_passes/scoped_hoist.rs` decides where a main-scope name's VALUE is stored.
+When the name is written once, the write precedes every read, every read is in
+the main scope, and at least one of them is a condition read the IR carries, the
+value lives in a main-scope `let`; otherwise it stays in the renderer's global
+cell and every read goes through `getVar` (`__SHV_<name>`).
+
+The file models the two homes over an event sequence:
+
+```verus
+Ev = TopWrite | SelfWrite | SecondWrite | ReadMain | CondReadMain
+   | WordCondMain | ReadOther | WordReadOther | EnvRead | Dynamic
+Home = Global | Local
+```
+
+`go(evs, home, bind, cell, local)` is the observable projection: the bytes a
+program with that event sequence prints. The census (`is_main_read`,
+`only_main_reads`, `any_cond_ir`, `any_ir`, `first_is_top`, `tail`) is computed
+FROM the sequence, and `hoist(evs)` is `Local` exactly when the census licenses
+it. The law is hypothesis-free:
+
+```verus
+go(evs, hoist(evs), bindable(evs), empty(), empty())
+  == go(evs, Home::Global, bindable(evs), empty(), empty())
+```
+
+for every `evs: Seq<Ev>`. `bindable(evs)` is not a side condition on the
+program: it is the second parameter of the theorem — the renderers' binding
+census only sees IR reads (`Var`/`getVar`), so a program whose only "read" is a
+word text (`$s` inside `test -n "$s"`) gets no `let`. The law covers that shape
+too, in the `bind = false` instantiation, instead of asserting a fact the
+renderer does not provide.
+
+The content is the census, and every arm is pinned by a witness whose two homes
+print different bytes, then measured red as a mutant of the model:
+
+| mutant | result | obligations that go red |
+|---|---|---|
+| identity (`hoist` always `Global`) | 17 verified, 4 errors | `hoist_preserves_output`, `a_conditional_reader_is_hoisted` (x3), `eligible_implies_hoisted`, `word_read_beside_ir_read_is_hoisted` |
+| a read in ANOTHER scope counts as main | 19 / 2 | `main_reads_agree`, `law_holds_at_every_witness` |
+| an env read counts as main | 19 / 2 | `main_reads_agree`, `law_holds_at_every_witness` |
+| a second write counts as a read | 19 / 2 | `main_reads_agree`, `law_holds_at_every_witness` |
+| a dynamic store counts as a read | 19 / 2 | `main_reads_agree`, `law_holds_at_every_witness` |
+| no condition-read requirement | 16 / 5 | `hoist_preserves_output`, `a_plain_reader_is_not_hoisted`, `word_only_condition_read_is_load_bearing`, `permissive_hoist_is_not_a_law`, `law_holds_at_every_witness` |
+| no first-mention requirement | 17 / 4 | `hoist_preserves_output`, `read_before_write_is_load_bearing`, `self_reference_is_load_bearing`, `law_holds_at_every_witness` |
+| a self-referential RHS may hoist | 18 / 3 | `hoist_preserves_output`, `self_reference_is_load_bearing`, `law_holds_at_every_witness` |
+
+No mutant fails with `E0xxx` (no type or borrow error stands in for a wrong
+proof): every failure is `assertion failed` or `postcondition not satisfied`,
+attributed to the named obligation above. `law_holds_at_every_witness` is the
+law instantiated at each refusal shape with no lemma in between, so a widened
+census is refuted by the law itself and not only by the agreement lemma it
+consumes.
+
+Completeness obligations, stated separately so an identity pass cannot satisfy
+the law: `a_conditional_reader_is_hoisted` (an eligible program IS hoisted),
+`eligible_implies_hoisted`, `a_plain_reader_is_not_hoisted` (a reader with no
+condition read is NOT), and `word_read_beside_ir_read_is_hoisted`.
+
+The refusal pins, each carrying the two traces:
+`read_before_write_is_load_bearing` (a condition read before the assignment
+prints nothing under `Global` and the unbound marker under `Local`),
+`self_reference_is_load_bearing` (`s=$s` reads the cell before it is written),
+`nested_read_is_load_bearing`, `env_read_is_load_bearing`,
+`second_write_is_load_bearing`, `dynamic_store_is_load_bearing`,
+`word_only_condition_read_is_load_bearing` and
+`permissive_hoist_is_not_a_law` (both holding the PRE-REPAIR behaviour).
+
+Pins mirror the source's tests, 12 of which pass.
+
+### The repair the model forced
+
+The pass used to accept a word-text-only read (`$s` inside `test -n "$s"`) as
+satisfying `read_in_cond`. No renderer's binding census sees a word text, so the
+emitted Rust had no `let` and stopped compiling (`E0425: cannot find value s`);
+the C-shaped double declaration (`char* s = NULL; char* s = W;`) is the same
+defect. `word_text_read()` now sets `word_read_in_cond` only, and the `Str` arm
+of `walk_expr` uses it, so the pass refuses rather than guessing. The gap
+itself is in the RENDERERS (their census ignores word texts), which is out of
+this rung; the model states the refusal as a theorem (`bindable` as a
+parameter) instead of hiding it in an antecedent.
+
+### Execution anchors
+
+Real generated Rust vs real bash, `cmp` on stdout, `W` set to `""` and `x`:
+12 of 12 comparisons SAME — `s="$W"` with an IR condition read
+(`let s = std::env::var("W")...`), a second store, a read before the
+assignment, a read from a function body (`__SHV_s`), a self-referential RHS,
+and an uppercase `HOME` name. The boundary case — `test -n "$s"` as the ONLY
+read — transpiles to a program rustc rejects with exactly `E0425` and no
+duplicate declaration, which is the pre-existing renderer gap the pass now
+refuses; the anchor records it rather than claiming a pass.
+
+Hypotheses in-file: registration of the pass (it runs inside `frontend_ingress`
+for every non-estree target, including `.shir` input); the renderers' binding
+census (`compute_local_vars` sees IR reads only); the renderer's global-cell
+contract (a `Global` read of an uninitialised name is bash's empty string, and
+the cell survives the top-level store). None of these is an antecedent of the
+law.
+
 ## Running it
 
 Same toolchain as above (`--rlimit 40`).
