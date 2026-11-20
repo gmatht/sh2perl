@@ -1178,6 +1178,14 @@ fn parse_field_spec(spec: &str) -> Vec<FieldRange> {
 /// the original command is kept (exact everywhere) rather than guessed.
 fn expand_tr_set(s: &str) -> Option<String> {
     let decoded = decode_tr_escapes(s)?;
+    // A RANGE endpoint that arrived as an escape (`tr 'a-\n' x`) is not a
+    // member-set question any more — which side of the range the escape
+    // denotes, and whether a reversed range is even accepted, is the
+    // runtime's call. Dash-free sets (the `\n` translation that matters)
+    // still expand, so only that ambiguity stays refused.
+    if s.contains('\\') && decoded.contains('-') {
+        return None;
+    }
     let s = decoded.as_str();
     let cs: Vec<char> = s.chars().collect();
     let mut out = String::new();
