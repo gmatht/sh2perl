@@ -7270,6 +7270,110 @@ contract (a `Global` read of an uninitialised name is bash's empty string, and
 the cell survives the top-level store). None of these is an antecedent of the
 law.
 
+## split_inplace.rs — the buffer-reuse flag preserves the output (29)
+
+`shir_passes/split_inplace.rs` rewrites `for w in $X; do …; done` from the
+legacy `Call{"split", [Var X]}` iterator to `Ext(Split{in_place: true})`, which
+licenses the C renderer to tokenize the variable's OWN buffer (stamping the
+delimiters with NUL) instead of copying it into a scratch.
+
+The file models the two homes over an event sequence and proves they print the
+same bytes:
+
+```verus
+go(evs, inplace_ok(evs), w0(), delim(), false, false, 0)
+  == go(evs, false, w0(), delim(), false, false, 0)
+```
+
+for every `evs: Seq<Ev>`, where
+
+```verus
+Ev = SplitLoop | LoopReads | LoopWrites | ReadX | WriteX | ReadWord
+   | WildX | ExportX | FnX | Allexport | Other
+```
+
+`inplace_ok` is computed FROM the sequence (`has_loop`, `has_write`,
+`!has_hazard`, `!has_export`, `!has_fn`, `!has_allexport`, `suffix_ok(post)`),
+so the law has no antecedent on the shape: a refused program takes both sides
+with the flag `false`, and an accepted one earns the equality from the census.
+
+What the flag MEANS is the C renderer's contract, modelled as three facts:
+the loop prints the SAME words in both homes (in-place tokenization keeps the
+field boundaries); the buffer's BYTES change, so a later read, an export or a
+function mention sees `[1,0,2]` instead of `[1,32,2]`; and the word array
+points INTO that buffer, so a store after the loop destroys the words bash
+keeps as copies, while a store inside the loop frees the block under the
+iterator (a `fault` marker in the trace).
+
+### The two defects the model forced
+
+1. **The rewrite deleted the loop.** The C `for` lowering matched only
+   `IrExpr::Call{func=="split"}` and `render_ext_expr` returns `None` for
+   `Split` on C, so `Ext(Split)` fell through to the generic array path:
+   `for w in "$1"` emitted `/* TODO(unsupported): for item type */` and printed
+   NOTHING (bash: `a|b|c`). The arm now handles `Ext(Split)` — it splits the
+   variable's own heap buffer when `in_place` is set and keeps the copying form
+   otherwise.
+2. **A later store outlived the words.** The census allowed a store after the
+   loop because "no later read of the source exists", but the loop variable
+   points into the source buffer: `y=$1; for w in $y; …; done; y=<longer>;
+   echo "$w"` printed a stale byte (`last=\x05`) instead of `c`. A later store
+   is now only eligible when no later statement reads the loop variable (a
+   function body that mentions it counts). Measured both ways, including the
+   shorter-store `memmove` path.
+
+A third rule came out of the same reading: a source the program never stores
+is refused, because `_sh_sset` is what gives a variable a heap block — an
+unstored name is `getenv`/`argv` storage, which this pass must not stamp.
+
+### Mutants — each a real edit, each red, no `E0xxx`
+
+| mutant | result | obligations that go red |
+|---|---|---|
+| identity (`inplace_ok` false) | 27 verified, 2 errors | `an_eligible_loop_is_flagged`, `a_word_read_without_a_later_store_is_fine` |
+| allow a loop body that touches the source | 26 / 3 | `split_in_place_preserves_output` (precondition), `body_read_is_load_bearing`, `body_write_is_load_bearing` |
+| allow a later read of the source | 26 / 3 | `suffix_agrees`, `law_at_the_refusal_witnesses`, `later_read_is_load_bearing` |
+| drop the store-after-loop rule | 26 / 3 | `suffix_agrees`, `law_at_the_refusal_witnesses`, `a_store_that_outlives_a_word_read_is_load_bearing` |
+| allow an export | 26 / 3 | `split_in_place_preserves_output` (precondition), `law_at_the_refusal_witnesses`, `export_is_load_bearing` |
+| allow a function mention | 26 / 3 | `split_in_place_preserves_output` (precondition), `law_at_the_refusal_witnesses`, `fn_mention_is_load_bearing` |
+| drop the buffer-ownership rule | 28 / 1 | `an_unstored_source_is_refused` |
+| flag everything | 17 / 12 | the law (precondition), `law_at_the_refusal_witnesses`, `a_hazardous_loop_is_not_flagged`, `an_unstored_source_is_refused`, `allexport_is_refused`, and all seven two-trace pins |
+
+Every failure is `assertion failed`, `precondition not satisfied` or
+`postcondition not satisfied`; `grep -lE '^error\[E0[0-9]+\]'` over the eight
+logs finds nothing. `law_at_the_refusal_witnesses` is the law instantiated at
+each refusal shape with no lemma in between, so a widened census is refuted by
+the law itself, not only by the agreement lemma it consumes.
+
+### Completeness
+
+`an_eligible_loop_is_flagged` (a clean loop off a stored source IS flagged, so
+an identity pass is red), `a_hazardous_loop_is_not_flagged`,
+`an_unstored_source_is_refused`, `allexport_is_refused` (labelled
+conservative: the model cannot make `allexport` load-bearing, so it is stated
+as a refusal, not claimed as necessary), `a_word_read_without_a_later_store_is_fine`
+(the rule refuses the PAIR, not the read), and `law_at_the_simplest_witness`.
+
+### Execution anchors
+
+Real generated C vs real bash, `cmp` on stdout, `MALLOC_PERTURB_=170` so a
+use-after-free shows up: **50 of 50 comparisons SAME, 0 diffs, 0 build
+failures** — 10 programs × 5 arguments (`a b c`, `one`, empty,
+`  a  b `, `a<TAB>b`). The programs cover the eligible shape (in-place
+lowering present in the generated C), a store after the loop, a body read, a
+second store that outlives a word read (both the grow and the `memmove`
+paths), an export, a function mention, a loop variable equal to the source, an
+unstored source (`$HOME`), and a defining-only function. Before the repairs
+the first printed nothing (`TODO(unsupported)`) and the last two printed a
+stale byte.
+
+Hypotheses in-file: the pass's registration and its C-only gating; the C
+storage contract (`_sh_sset` gives every string variable a `_sh_xstrdup`/in-
+place heap block, so a program-stored name's buffer is writable and owned);
+`_sh_split`'s tokenization (`IFS` delimiters stamped with NUL, word pointers
+into the buffer); and that a `Str` literal source never reaches the flag (the
+pass matches `Var`/`getVar` only). None of these is an antecedent of the law.
+
 ## Running it
 
 Same toolchain as above (`--rlimit 40`).

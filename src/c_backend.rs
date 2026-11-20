@@ -37840,6 +37840,52 @@ fn param_copy_alias(
                             return;
                         }
                     }
+                    // split-in-place (`Ext(Split{in_place})`): the transform
+                    // proved the source var is never read or re-stored around
+                    // this loop, so `in_place` licenses tokenizing the var's
+                    // OWN buffer — it is always a `_sh_sset` heap block (the
+                    // store either grows a fresh `_sh_xstrdup` or memmoves
+                    // into the old one), never a literal or `getenv` string.
+                    // `_sh_split` stamps the delimiters with NUL; the word
+                    // pointers point INTO that buffer, which is why the
+                    // census refuses a mid-loop store (it would free the
+                    // block under the iterator) and any later read/export.
+                    if let IrExpr::Ext(node) = &items[0] {
+                        if node.tag() == "Split" {
+                            if let Some(sp) =
+                                node.as_any().downcast_ref::<crate::shir_nodes::Split>()
+                            {
+                                let v = self.value_c(&sp.text);
+                                let wn = format!("_wn_{}", self.temp_seq);
+                                self.temp_seq += 1;
+                                let ws = format!("_ws_{}", self.temp_seq);
+                                self.temp_seq += 1;
+                                if sp.in_place {
+                                    self.emit(&format!(
+                                        "static char **{ws} = 0; static size_t {ws}_cap = 0; size_t _wc_{wn} = _sh_split((char*)({v}), &{ws}, &{ws}_cap);"
+                                    ));
+                                } else {
+                                    // the unmarked node keeps the copying
+                                    // form of the legacy `split` call.
+                                    self.emit(&format!(
+                                        "static _sh_vbuf {wn} = {{0, 0}}; static char **{ws} = 0; static size_t {ws}_cap = 0; _sh_vgrow(&{wn}, strlen({v}) + 1); strcpy({wn}.p, {v}); size_t _wc_{wn} = _sh_split({wn}.p, &{ws}, &{ws}_cap);"
+                                    ));
+                                }
+                                let var_name = self.c_ident(var);
+                                self.emit(&format!(
+                                    "for (size_t _wi_{wn} = 0; _wi_{wn} < _wc_{wn}; _wi_{wn}++) {{"
+                                ));
+                                self.depth += 1;
+                                self.emit(&format!("{var_name} = {ws}[_wi_{wn}];"));
+                                for s in body {
+                                    self.stmt(s);
+                                }
+                                self.depth -= 1;
+                                self.emit("}");
+                                return;
+                            }
+                        }
+                    }
                 }
                 let n = items.len();
                 if n == 0 {

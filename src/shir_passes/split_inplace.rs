@@ -25,7 +25,10 @@
 //!   AFTER the loop stay eligible: the loop is over (the stale word
 //!   pointers are never re-read — the next split overwrites them) and a
 //!   later read is already refused above, so neither the free on
-//!   reassign nor a re-export can observe the stamped bytes. The loop
+//!   reassign nor a re-export can observe the stamped bytes — but a later
+//!   store DOES destroy the words, which bash keeps as copies, so a later
+//!   store is only eligible when no later statement reads the loop
+//!   variable (measured: `y=…; echo "$w"` printed a stale byte). The loop
 //!   variable itself is a write, so `for x in $x` refuses;
 //! - writes performed by FUNCTION bodies refuse the var outright
 //!   (call time unknown), as do reads — both walked over every top-level
@@ -590,7 +593,7 @@ pub fn transform(stmts: &mut Vec<IrStmt>) -> bool {
     let n = stmts.len();
     let mut changed = false;
     for (i, s) in stmts.iter_mut().enumerate() {
-        let IrStmt::For { iter, .. } = s else { continue };
+        let IrStmt::For { var: loopvar, iter, .. } = s else { continue };
         let IrExpr::Array(items) = &*iter else { continue };
         if items.len() != 1 {
             continue;
@@ -617,15 +620,38 @@ pub fn transform(stmts: &mut Vec<IrStmt>) -> bool {
         }
         let x = xv.clone();
         let cnt_i = reads.get(i).and_then(|m| m.get(&x)).copied().unwrap_or(0);
+        // The in-place arm splits the var's OWN buffer, so that buffer must
+        // be program storage: `_sh_sset` gives a variable a heap block, but
+        // a name the program never stores is whatever `getenv`/`argv` hands
+        // back (read-only or foreign memory — stamping it is a corrupt/segv
+        // on a value bash exposes as a string). A store anywhere in the
+        // program proves the heap home; the loop statement's own writes are
+        // refused above, so this is a write OUTSIDE the loop.
+        let wrote_elsewhere = (0..n).any(|j| j != i && writes[j].contains(&x));
         let wrote_i = wilds[i] || writes[i].contains(&x);
         // later READS refuse (the stamped bytes must be unobservable);
         // later WRITES do not — the loop is over, and no later read
         // exists, so the free-on-reassign cannot dangle and a re-export
         // cannot observe the stamped value (exported names refuse above).
         let later = (i + 1..n).any(|j| wilds[j] || reads[j].contains_key(&x));
+        // The in-place word array points INTO the source buffer, so a later
+        // store to the source (which either memmoves over those bytes or
+        // frees the block) destroys the words — while bash's `w` keeps its
+        // value, because its words are copies. A later store is therefore
+        // only safe when no later statement reads the loop variable (a
+        // function body that mentions it counts: call time is unknown).
+        // Measured before this rule: `y=$1; for w in $y; do …; done;
+        // y=<longer>; echo "$w"` printed the last word as a stale byte.
+        let later_x_write = (i + 1..n).any(|j| wilds[j] || writes[j].contains(&x));
+        let later_word_read = (i + 1..n).any(|j| wilds[j] || reads[j].contains_key(loopvar))
+            || fn_read_names.contains(loopvar)
+            || fn_wild;
+        let words_outlive = !(later_x_write && later_word_read);
         let ok = cnt_i == 1
+            && wrote_elsewhere
             && !wrote_i
             && !later
+            && words_outlive
             && !fn_read_names.contains(&x)
             && !fn_write_names.contains(&x)
             && !fn_wild
@@ -811,6 +837,24 @@ mod tests {
     }
 
     #[test]
+    fn a_never_stored_source_refuses() {
+        // `for w in $HOME`: the program never stores HOME, so the renderer
+        // hands back getenv/argv storage — not a buffer this pass may stamp.
+        let mut stmts = vec![split_for("HOME", vec![read("w")])];
+        assert!(!transform(&mut stmts));
+        assert_eq!(shape(&stmts), "call");
+    }
+
+    #[test]
+    fn a_source_stored_only_by_the_loop_refuses() {
+        // `for y in $y`-like: the only write is the loop's own, which is
+        // refused anyway; keep the two rules distinguishable.
+        let mut stmts = vec![split_for("y", vec![read("w")])];
+        assert!(!transform(&mut stmts));
+        assert_eq!(shape(&stmts), "call");
+    }
+
+    #[test]
     fn body_write_to_source_refuses() {
         let mut stmts = vec![
             assign("y", "a b c"),
@@ -871,6 +915,20 @@ mod tests {
         ];
         assert!(transform(&mut stmts));
         assert_eq!(shape(&stmts), "ext");
+    }
+
+    #[test]
+    fn a_later_store_that_outlives_a_word_read_refuses() {
+        // `for w in $y; …; done; y=longer; echo "$w"` — bash keeps `w`;
+        // in place the store frees/overwrites the buffer the word points at.
+        let mut stmts = vec![
+            assign("y", "a b c"),
+            split_for("y", vec![read("w")]),
+            assign("y", "a much longer replacement value"),
+            read("w"),
+        ];
+        assert!(!transform(&mut stmts));
+        assert_eq!(shape(&stmts), "call");
     }
 
     #[test]
