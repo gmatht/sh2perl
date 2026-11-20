@@ -755,8 +755,18 @@ fn body_reads_var_nonleading(body: &[IrStmt], var: &str) -> bool {
     let mut found = false;
     for s in body {
         match s {
+            // The ONE shape the structural lowering rewrites: a single
+            // scalar target named `var`. The exemption must use exactly this
+            // predicate — `lower` skips a multi-target or indexed assignment
+            // (it cannot express it), so exempting one here would accept an
+            // append that survives the lowering, and the single post-loop
+            // `concatItems` would then OVERWRITE its work (the segment is
+            // lost, and an array store through `v[i]=` is clobbered too).
             IrStmt::Assign { targets, expr, .. }
-                if targets.iter().any(|t| t.var == var) && is_self_append(var, expr) =>
+                if targets.len() == 1
+                    && targets[0].var == var
+                    && targets[0].indices.is_empty()
+                    && is_self_append(var, expr) =>
             {
                 if let IrExpr::Interpolate(parts) = expr {
                     for p in parts.iter().skip(1) {
@@ -1291,6 +1301,224 @@ mod tests {
             "no self-append assignment survives: {stmts:?}"
         );
         crate::transforms::set_target(None);
+    }
+
+    /// Recursively: does any self-append of `var` survive in this tree?
+    fn any_self_append(stmts: &[IrStmt], var: &str) -> bool {
+        stmts.iter().any(|s| match s {
+            IrStmt::Assign { targets, expr, .. } =>
+                targets.iter().any(|t| t.var == var) && is_self_append(var, expr),
+            IrStmt::While { body, .. } | IrStmt::For { body, .. } => any_self_append(body, var),
+            IrStmt::If { then, elsifs, else_, .. } => {
+                any_self_append(then, var)
+                    || elsifs.iter().any(|(_, b)| any_self_append(b, var))
+                    || any_self_append(else_, var)
+            }
+            _ => false,
+        })
+    }
+
+    fn append(var: &str, seg: &str) -> IrStmt {
+        assign(
+            var,
+            IrExpr::Interpolate(vec![
+                InterpPart::Expr(Box::new(get(var))),
+                InterpPart::Lit(seg.to_string()),
+            ]),
+        )
+    }
+
+    /// A self-append nested in an `if` branch is refused: the structural
+    /// lowering rewrites only the loop body's TOP-LEVEL appends, and
+    /// `body_reads_var_nonleading` sees the nested append's own leading read.
+    /// The dangerous pair is (accepted AND not rewritten) — the acceptance
+    /// side is the load-bearing one, so it must be empty.
+    #[test]
+    fn a_nested_self_append_refuses_the_verdict() {
+        let init = assign(
+            "blk",
+            IrExpr::Interpolate(vec![InterpPart::Lit(String::new())]),
+        );
+        let body = vec![
+            IrStmt::If {
+                cond: get("c"),
+                then: vec![append("blk", "A")],
+                elsifs: vec![],
+                else_: vec![],
+            },
+            append("blk", "B"),
+        ];
+        let stmts = vec![
+            init,
+            IrStmt::While { cond: IrExpr::Bool(true), body },
+            echo("blk"),
+        ];
+        assert!(
+            analyze(&stmts).is_empty(),
+            "a nested self-append must refuse the verdict (the lowering cannot rewrite it)"
+        );
+    }
+
+    /// `analyze` exempts a self-append from the mid-loop-read check whenever
+    /// the assignment has a target named `var`, but `lower` only rewrites an
+    /// assignment with EXACTLY ONE target and no indices. An
+    /// exempted-but-unrewritten append keeps re-concatenating `v`, and the
+    /// single post-loop `concatItems` then overwrites that work — the segment
+    /// is dropped. So the exemption must use the lowering's exact predicate.
+    #[test]
+    fn a_multi_target_self_append_refuses_the_verdict() {
+        let init = assign(
+            "blk",
+            IrExpr::Interpolate(vec![InterpPart::Lit(String::new())]),
+        );
+        let target = |var: &str| AssignTarget {
+            var: var.to_string(),
+            sigil: None,
+            indices: vec![],
+        };
+        let multi = IrStmt::Assign {
+            targets: vec![target("blk"), target("w")],
+            expr: IrExpr::Interpolate(vec![
+                InterpPart::Expr(Box::new(get("blk"))),
+                InterpPart::Lit("A".into()),
+            ]),
+            asm: None,
+        };
+        let stmts = vec![
+            init,
+            IrStmt::While { cond: IrExpr::Bool(true), body: vec![multi, append("blk", "B")] },
+            echo("blk"),
+        ];
+        assert!(
+            analyze(&stmts).is_empty(),
+            "a multi-target self-append must refuse the verdict (the lowering skips it)"
+        );
+    }
+
+    /// An INDEXED target (`v[i]="$v$x"`) writes the array `v`, not the scalar
+    /// the chunk array stands in for; the exemption must not treat it as a
+    /// rewritable append (the lowering requires empty indices).
+    #[test]
+    fn an_indexed_self_append_refuses_the_verdict() {
+        let init = assign(
+            "blk",
+            IrExpr::Interpolate(vec![InterpPart::Lit(String::new())]),
+        );
+        let indexed = IrStmt::Assign {
+            targets: vec![AssignTarget {
+                var: "blk".to_string(),
+                sigil: None,
+                indices: vec![IrExpr::Int(0)],
+            }],
+            expr: IrExpr::Interpolate(vec![
+                InterpPart::Expr(Box::new(get("blk"))),
+                InterpPart::Lit("A".into()),
+            ]),
+            asm: None,
+        };
+        let stmts = vec![
+            init,
+            IrStmt::While { cond: IrExpr::Bool(true), body: vec![indexed, append("blk", "B")] },
+            echo("blk"),
+        ];
+        assert!(
+            analyze(&stmts).is_empty(),
+            "an indexed self-append must refuse the verdict (the lowering skips it)"
+        );
+    }
+
+    /// The literal text of a segment expression (the shapes the lowering
+    /// leaves behind: `Str`, or an `Interpolate` of literals).
+    fn seg_text(e: &IrExpr) -> Option<String> {
+        match e {
+            IrExpr::Str(t, _) => Some(t.clone()),
+            IrExpr::Interpolate(parts) => {
+                let mut out = String::new();
+                for p in parts {
+                    match p {
+                        InterpPart::Lit(t) => out.push_str(t),
+                        InterpPart::Expr(_) => return None,
+                    }
+                }
+                Some(out)
+            }
+            _ => None,
+        }
+    }
+
+    /// Concatenate every chunk the lowered program pushes, in PROGRAM ORDER
+    /// (the seed's `setArray` items then each `setArrayAppend`), descending
+    /// into loop bodies.
+    fn lowered_chunks(stmts: &[IrStmt]) -> Option<String> {
+        let mut out = String::new();
+        for s in stmts {
+            match s {
+                IrStmt::Assign { expr: IrExpr::Call { func, args }, .. }
+                    if func == "setArray" || func == "setArrayAppend" =>
+                {
+                    match args.get(1) {
+                        Some(IrExpr::Array(items)) => {
+                            for i in items {
+                                out.push_str(&seg_text(i)?);
+                            }
+                        }
+                        _ => return None,
+                    }
+                }
+                IrStmt::While { body, .. } | IrStmt::For { body, .. } => {
+                    out.push_str(&lowered_chunks(body)?);
+                }
+                _ => {}
+            }
+        }
+        Some(out)
+    }
+
+    /// The reference semantics of the accepted shape: `init` followed by each
+    /// self-append's trailing parts, in order. This is what the deferred
+    /// chunk array must reproduce (associativity of concatenation, on the real
+    /// transform output rather than on the model).
+    #[test]
+    fn the_lowered_chunks_concatenate_to_the_eager_concatenation() {
+        let cases: Vec<(&str, Vec<&str>)> = vec![
+            ("", vec!["A", "B"]),
+            ("pre", vec!["-x-"]),
+            ("<", vec!["a\n", "b", ">"]),
+            ("", vec!["one"]),
+        ];
+        for (init, segs) in cases {
+            let mut body: Vec<IrStmt> = segs.iter().map(|seg| append("blk", seg)).collect();
+            body.push(assign("i", get("i"))); // a non-append statement in the loop
+            let mut stmts = vec![
+                assign(
+                    "blk",
+                    IrExpr::Interpolate(vec![InterpPart::Lit(init.to_string())]),
+                ),
+                IrStmt::While { cond: IrExpr::Bool(true), body },
+                echo("blk"),
+            ];
+            let accs = analyze(&stmts);
+            assert_eq!(accs.len(), 1, "shape accepted: {init:?} {segs:?}");
+            let eager: String = init.to_string() + &segs.concat();
+            assert!(lower(&mut stmts, &accs), "lowering fires: {init:?} {segs:?}");
+            assert_eq!(
+                lowered_chunks(&stmts),
+                Some(eager.clone()),
+                "the chunks concatenate to the eager concatenation: {init:?} {segs:?} in {stmts:?}"
+            );
+            // and the join assigns exactly that text to the accumulator
+            let mat = stmts.iter().find_map(|s| match s {
+                IrStmt::Assign { targets, expr: IrExpr::Call { func, .. }, .. }
+                    if targets.len() == 1
+                        && targets[0].var == "blk"
+                        && func == "concatItems" =>
+                {
+                    Some(())
+                }
+                _ => None,
+            });
+            assert!(mat.is_some(), "one materialization per accumulator");
+        }
     }
 
     /// A NON-JS renderer keeps the analysis verdict but never sees the

@@ -7374,6 +7374,103 @@ place heap block, so a program-stored name's buffer is writable and owned);
 into the buffer); and that a `Str` literal source never reaches the flag (the
 pass matches `Var`/`getVar` only). None of these is an antecedent of the law.
 
+## string_accumulator.rs — the chunk-array lowering preserves the output (22)
+
+`transforms/string_accumulator.rs` recognizes `v="$v$seg"` in a loop whose only
+writes to `v` are such self-appends, and (for the JS/ESTree renderer) rewrites
+it to a chunk array: `setArray` seeds it after the init, each append becomes
+`setArrayAppend`, and ONE `concatItems` materializes it right after the loop.
+The C renderer keeps the analysis and uses it for an `_alen_` length mirror.
+
+The file models the two strategies over a statement trace and proves they emit
+the same bytes:
+
+```verus
+go(evs, acc_ok(evs)) == go(evs, false)
+```
+
+for every `evs: Seq<Ev>`, where
+
+```verus
+Ev = Init(s) | InitOther(s) | Append(s) | AppendOther(s)
+   | LateWrite(s) | Read | Join
+```
+
+`eager` re-concatenates on every append; `chunked` DEFERS — it extends the
+chunk array's joined value and bumps the push count, leaving `v` stale — and
+`Join` sets `v` to the deferred concatenation. The observable is the list of
+values every read observed, in order.
+
+`acc_ok` is computed FROM the trace: at least one append, no non-literal init
+(no text to seed with), no append the lowering cannot rewrite, and no read
+taken while an append is outstanding. So a refused program takes both sides
+with the flag `false`; an accepted one earns the equality from the deferred-
+concatenation invariant `joined == eager_v`.
+
+### The two defects the model forced
+
+`body_reads_var_nonleading` exempted a self-append from the mid-loop-read check
+whenever ANY target of the assignment named the variable — but `lower` only
+rewrites an assignment with exactly one, non-indexed target. Two shapes were
+therefore ACCEPTED and never rewritten:
+
+1. a **multi-target** assignment `blk="$blk$x" w=…`: the append kept
+   re-concatenating `blk` inside the loop, and the single post-loop
+   `concatItems` then overwrote that work — the segment was lost;
+2. an **indexed** target `blk[i]="$blk$x"`: it writes the ARRAY `blk`, which
+   the join then clobbered.
+
+The exemption now uses the lowering's exact predicate. Both tests
+(`a_multi_target_self_append_refuses_the_verdict`,
+`an_indexed_self_append_refuses_the_verdict`) failed before the fix.
+
+### Mutants — each a real edit, each red, no `E0xxx`
+
+| mutant | result | obligations that go red |
+|---|---|---|
+| identity (`acc_ok` false) | 20 verified, 2 errors | `an_accumulator_is_flagged`, `a_read_before_the_loop_is_fine` |
+| allow a stale read | 19 / 3 | `agreement`, `a_stale_read_is_refused`, `law_at_the_refusal_witnesses` |
+| allow an unrewritable append | 19 / 3 | the law (precondition), `an_unrewritable_append_is_refused`, `law_at_the_refusal_witnesses` |
+| allow a non-literal init | 19 / 3 | the law (precondition), `a_nonliteral_init_is_refused`, `law_at_the_refusal_witnesses` |
+| drop `has_append` | 21 / 1 | `an_init_only_trace_is_not_flagged` |
+| flag everything | 16 / 6 | the law (precondition), the three refusals, `an_init_only_trace_is_not_flagged`, `law_at_the_refusal_witnesses` |
+| drop the init seed | 18 / 4 | `agreement`, `the_chunks_really_accumulate`, `an_unrewritable_append_would_differ`, `the_join_is_load_bearing` |
+| join by the stale value | 17 / 5 | `agreement`, `the_chunks_really_accumulate`, `an_unrewritable_append_would_differ`, `a_nonliteral_init_would_differ`, `the_join_is_load_bearing` |
+
+### Completeness and non-vacuity
+
+`an_accumulator_is_flagged` (an identity pass is red), `the_chunks_really_
+accumulate` (two appends became two pushes and the read sees the whole
+concatenation), `a_read_before_the_loop_is_fine` (a pre-loop read is not
+stale), `a_stale_read_is_refused`, `an_unrewritable_append_is_refused`,
+`a_nonliteral_init_is_refused`, `an_init_only_trace_is_not_flagged`, and the
+element-level pins that exhibit where each refusal's two strategies diverge
+(`a_stale_read_would_differ` reads `a` vs `a+x`, and so on).
+
+### Anchors
+
+Two, because the rewrite has two consumers:
+
+- **Real execution (C mirror):** 11 programs, bash stdout vs the compiled
+  generated C, `cmp`, `MALLOC_PERTURB_=170`: **11 of 11 SAME, 0 diffs, 0 build
+  failures** (`cc … -lgmp`). Five of them have the `_alen_` mirror active
+  (`SH2_DBG_ACC=1` reports "ACC tracked 1…2"), covering empty and non-empty
+  inits, two accumulators, a zero-iteration loop and a conditional append.
+- **The estree lowering (reference semantics):**
+  `the_lowered_chunks_concatenate_to_the_eager_concatenation` runs `analyze`
+  and `lower` on real IR and checks that the lowered chunk text (seed items +
+  every `setArrayAppend`, in program order) equals `init ++ segs` for four
+  shapes, and that exactly one `concatItems` materialization is emitted. No JS
+  engine is installed on this machine, so the estree program was not executed
+  end to end; the lowering's output is checked structurally and against the
+  model instead.
+
+Hypotheses in-file: the trigger census (`self_append_vars`, the
+last-write-before-the-loop init, `reads_after_loop`) — i.e. that the trace is
+complete; the segment's evaluation order (it stays in place); the renderers'
+`setArray`/`concatItems` contract; and, for C, that every store funnel updates
+the `_alen_` mirror. None is an antecedent of the law.
+
 ## Running it
 
 Same toolchain as above (`--rlimit 40`).
