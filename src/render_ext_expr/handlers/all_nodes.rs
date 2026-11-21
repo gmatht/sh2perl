@@ -1408,6 +1408,121 @@ pub(crate) fn fs_modified_since_read_rust(path: &str) -> String {
     )
 }
 
+/// A `TextFilter` node: the INPUT text (a literal, or the one `cat:` read the
+/// lift spells) run through the static filter chain, then printed.
+///
+/// The whole thing is ONE statement block because the shell pipeline's
+/// observable effect is its OUTPUT plus the LAST stage's status — nothing
+/// reads a pipeline value here (the lift refuses a `$(…)` capture), so the
+/// block prints and leaves `__SH_RC` at the last stage's status.
+pub(crate) fn text_filter_rust(src: &str, ops: &str) -> String {
+    let mut b = String::new();
+    b.push_str(&format!("let mut __sh_cur: String = ({src}).to_string();\n"));
+    b.push_str("let mut __sh_rc: i32 = 0i32;\n");
+    if ops.split(';').any(|o| o.starts_with("cat:")) {
+        // `strerror` text for the two reads/writes the node spells. The kinds a
+        // script can actually meet on a static path are the three named; the
+        // rest would need libc's table, so they fall back to the OS string
+        // (which no test path reaches, and which is never *claimed* to be
+        // bash's text).
+        b.push_str(
+            "let __sh_strerr = |__e: &std::io::Error| -> String { match __e.kind() { \
+             std::io::ErrorKind::NotFound => \"No such file or directory\".to_string(), \
+             std::io::ErrorKind::PermissionDenied => \"Permission denied\".to_string(), \
+             std::io::ErrorKind::IsADirectory => \"Is a directory\".to_string(), \
+             _ => format!(\"{}\", __e) } };\n",
+        );
+    }
+    for op in ops.split(';') {
+        if let Some(p) = op.strip_prefix("cat:") {
+            let lit = format!("{p:?}");
+            b.push_str(&format!(
+                "__sh_cur = match std::fs::read_to_string({lit}) {{ Ok(__s) => __s, \
+                 Err(__e) => {{ eprintln!(\"cat: {{}}: {{}}\", {lit}, __sh_strerr(&__e)); \
+                 String::new() }} }};\n"
+            ));
+        } else if op == "wc:l" {
+            b.push_str("__sh_cur = format!(\"{}\\n\", __sh_cur.matches('\\n').count());\n");
+        } else if op == "wc:c" {
+            b.push_str("__sh_cur = format!(\"{}\\n\", __sh_cur.len());\n");
+        } else if op == "wc:w" {
+            b.push_str(
+                "__sh_cur = format!(\"{}\\n\", __sh_cur.split(|c: char| c == ' ' || \
+                 c == '\\t' || c == '\\n' || c == '\\r' || c == '\\u{0b}' || c == '\\u{0c}') \
+                 .filter(|w| !w.is_empty()).count());\n",
+            );
+        } else if let Some(n) = op.strip_prefix("head:") {
+            b.push_str(&format!(
+                "__sh_cur = {{ let __src = __sh_cur.clone(); let mut __end = __src.len(); \
+                 let mut __n = 0usize; for (__i, __c) in __src.char_indices() {{ \
+                 if __c == '\\n' {{ __n += 1; if __n == {n} {{ __end = __i + 1; break; }} }} }} \
+                 __src[..__end].to_string() }};\n"
+            ));
+        } else if let Some(n) = op.strip_prefix("tail:") {
+            b.push_str(&format!(
+                "__sh_cur = {{ let __src = __sh_cur.clone(); \
+                 let (__body, __nl) = match __src.strip_suffix('\\n') {{ \
+                 Some(__b) => (__b.to_string(), true), None => (__src.clone(), false) }}; \
+                 let __bytes = __body.as_bytes(); let mut __start = 0usize; \
+                 let mut __count = 0usize; let mut __i = __body.len(); \
+                 while __i > 0 {{ __i -= 1; if __bytes[__i] == b'\\n' {{ __count += 1; \
+                 if __count == {n} {{ __start = __i + 1; break; }} }} }} \
+                 let mut __o = __body[__start..].to_string(); if __nl {{ __o.push('\\n'); }} __o }};\n"
+            ));
+        } else if op == "uniq" {
+            b.push_str(
+                "__sh_cur = { let __src = __sh_cur.clone(); let mut __o = String::new(); \
+                 if !__src.is_empty() { let __body = __src.strip_suffix('\\n') \
+                 .unwrap_or(&__src).to_string(); let mut __prev: Option<String> = None; \
+                 for __l in __body.split('\\n') { if __prev.as_deref() != Some(__l) { \
+                 __o.push_str(__l); __o.push('\\n'); __prev = Some(__l.to_string()); } } } __o };\n",
+            );
+        } else if let Some(rest) = op.strip_prefix("cut:") {
+            // `cut:D:FIELDS` — the LAST ':' separates the field list, so a ':'
+            // delimiter encodes as `cut:::2`.
+            let at = match rest.rfind(':') {
+                Some(i) => i,
+                None => return String::new(),
+            };
+            let (d, fields) = (&rest[..at], &rest[at + 1..]);
+            let dl = match d.chars().next() {
+                Some(c) => c,
+                None => return String::new(),
+            };
+            let nums: Vec<String> = fields
+                .split(',')
+                .filter(|f| !f.is_empty())
+                .map(|f| format!("{f}usize"))
+                .collect();
+            let vec_lit = format!("vec![{}]", nums.join(", "));
+            b.push_str(&format!(
+                "__sh_cur = {{ let __src = __sh_cur.clone(); \
+                 let __fields: Vec<usize> = {vec_lit}; \
+                 let __d: char = {dl:?}; let mut __o = String::new(); \
+                 if !__src.is_empty() {{ let __body = __src.strip_suffix('\\n') \
+                 .unwrap_or(&__src).to_string(); for __l in __body.split('\\n') {{ \
+                 if !__l.contains(__d) {{ __o.push_str(__l); }} else {{ \
+                 let __parts: Vec<&str> = __l.split(__d).collect(); let mut __first = true; \
+                 for __f in &__fields {{ if !__first {{ __o.push(__d); }} __first = false; \
+                 __o.push_str(if *__f >= 1 && *__f <= __parts.len() {{ __parts[*__f - 1] }} \
+                 else {{ \"\" }}); }} }} __o.push('\\n'); }} }} __o }};\n",
+                dl = dl,
+            ));
+        } else {
+            return String::new();
+        }
+    }
+    b.push_str("print!(\"{}\", __sh_cur);\n__SH_RC.store(__sh_rc, Ordering::Relaxed);");
+    format!("{{\n{b}}}")
+}
+
+pub fn text_filter(node: &crate::shir_nodes::TextFilter, ctx: &ExprRenderCtx) -> Option<String> {
+    match ctx.backend {
+        Backend::Rust => Some(text_filter_rust(&render_child(&node.src, ctx)?, &node.ops)),
+        _ => None,
+    }
+}
+
 pub fn fs_same_file(node: &crate::shir_nodes::FsSameFile, ctx: &ExprRenderCtx) -> Option<String> {
     match ctx.backend {
         Backend::Rust => Some(fs_same_file_rust(

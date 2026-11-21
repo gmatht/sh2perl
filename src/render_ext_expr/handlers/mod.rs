@@ -27,6 +27,7 @@
     pub(crate) mod string_trim;
     pub(crate) mod sub_str_extract;
     pub(crate) mod take_lines;
+    pub(crate) mod text_filter;
     pub(crate) mod uniq_lines;
     pub(crate) mod word_count;
 

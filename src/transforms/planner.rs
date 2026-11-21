@@ -273,6 +273,12 @@ pub fn node_manifest(target: &str) -> &'static [&'static str] {
             // exact — dev+ino identity, full-precision mtime comparison with
             // bash's missing-operand rule, and `-N` as mtime > atime.
             "FsSameFile", "FsNewerThan", "FsModifiedSinceRead",
+            // text-filter-lift (class 1/5): a pipeline of STATIC text filters
+            // (`echo|wc`, `seq|head`, `cat|uniq`, `echo|cut`, `echo|tee`) is
+            // one node; the arm prints the chain's output and leaves the last
+            // stage's status. Every flag/operand shape it cannot spell keeps
+            // spawning (see `text_filter_lift`'s refusal list).
+            "TextFilter",
                 "WordCount", "RegCount", "TakeLines", "StringTrim",
                 "SubStrExtract", "RepeatStr", "Split", "ArrayLen",
                 // `basename`/`dirname` commands: text_ops builds PathName

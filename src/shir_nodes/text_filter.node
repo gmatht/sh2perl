@@ -1,0 +1,32 @@
+# shir_nodes/text_filter.node — a pipeline of STATIC text filters.
+#
+# `echo -e "a\nb" | uniq`, `seq 1 10 | head -3`, `echo "x:y" | cut -d: -f2`,
+# `echo hi | tee out` are text TRANSFORMATIONS: the producer is a literal, the
+# filters are the small, fully specified ones, and `std` reproduces both
+# exactly. The node carries what is easy to get wrong and hard to relearn per
+# backend:
+#
+#  * `wc -l` counts NEWLINES (a final line without one is not counted); `-w`
+#    splits on the SIX POSIX isspace bytes (space, \t, \n, \r, \v, \f — NOT
+#    Unicode whitespace, so an NBSP is part of a word); `-c` is the byte count.
+#  * `head -N` emits the first N lines AS THEY ARE — it never adds a trailing
+#    newline and never truncates the last emitted line.
+#  * `tail -N` emits the last N lines, keeping a trailing newline if the input
+#    had one and NOT adding one if it did not (GNU treats a final partial line
+#    as a line).
+#  * `uniq` collapses ADJACENT equal lines and terminates every line it emits
+#    with a newline, including a final partial input line; empty input emits
+#    nothing.
+#  * `cut -d D -f N[,M…]` prints a line with no D UNCHANGED (GNU), selects
+#    1-based fields, prints an empty string for a field past the end, and
+#    always terminates the line.
+#  * `tee P` writes its input to P (truncating) and passes it through.
+#
+# The producer is either a literal TEXT (`src`) or a `cat:path` read; the op
+# list is `;`-separated so a renderer walks it left to right.
+node TextFilter
+tag "TextFilter"
+kind expr
+field src: expr
+field ops: string
+spec: TextSemantics#filter_chain

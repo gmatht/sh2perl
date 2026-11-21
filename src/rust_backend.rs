@@ -12973,6 +12973,20 @@ while __sh_path.len() > 1 && __sh_path.ends_with('/') {{ __sh_path = &__sh_path[
                     self.emit("__SH_RC.store(0, Ordering::Relaxed);");
                 }
                 IrExpr::Call { func, args } if func == "exec" || func == "builtin" => self.exec_stmt(args),
+                // A `TextFilter` STATEMENT: the node's block PRINTS the chain's
+                // output and stores the last stage's status itself, so the
+                // generic `let _ = <value>` arm would throw the output away
+                // (and its own status store would be the only one that ran).
+                IrExpr::Ext(n) if n.tag() == "TextFilter" => {
+                    let x = n
+                        .as_any()
+                        .downcast_ref::<crate::shir_nodes::TextFilter>()
+                        .expect("tag/type agree");
+                    use crate::render_ext_expr::handlers::all_nodes as shared;
+                    let block =
+                        shared::text_filter_rust(&self.expr_str(&x.src), &x.ops);
+                    self.emit(&block);
+                }
                 IrExpr::Call { func, args } if func == "setArray" || func == "setArrayAppend" => {
                     self.array_call_stmt_by_name(func, args);
                     self.emit("__SH_RC.store(0, Ordering::Relaxed);");
@@ -24260,8 +24274,13 @@ mod tests {
     #[test]
     fn final_pipelines_and_glob_classes_execute_like_bash() {
         let cases: &[(&str, &str, Option<&str>)] = &[
-            ("FinalPipeHead", "echo abc | head -n 2\n", Some("__sh_lines[..__sh_stop].join")),
-            ("FinalPipeTail", "echo abc | tail -n 1\n", Some("__sh_lines[__sh_start..].join")),
+            // A FINAL pipeline is the same `IrStmt::Pipeline` shape the
+            // mid-program text-filter lift handles, so since text-filter-lift
+            // these two render as one TextFilter block (`__sh_cur`) instead of
+            // a TakeLines expression; the compile-and-run below still holds
+            // them to bash's bytes.
+            ("FinalPipeHead", "echo abc | head -n 2\n", Some("__sh_cur")),
+            ("FinalPipeTail", "echo abc | tail -n 1\n", Some("__sh_cur")),
             ("FinalPipeWc", "echo \"a b c\" | wc -w\n", None),
             ("FinalPipeCut", "echo \"a,b,c\" | cut -d, -f2\n", None),
             ("FinalPipeXargs", "echo \" a b \" | xargs\n", None),
@@ -24672,7 +24691,14 @@ mod tests {
     #[test]
     fn offered_text_nodes_execute_like_bash() {
         let cases: &[(&str, &str, &str)] = &[
-            ("SplitFieldExtract", ".iter().copied()", "echo \"a:b:c\" | cut -d: -f2\n"),
+            // The pipeline form of this cut now renders as one TextFilter
+            // node; the CAPTURE form still lowers to Split+FieldExtract, which
+            // is the node this case pins.
+            (
+                "SplitFieldExtract",
+                ".iter().copied()",
+                "x=$(echo \"a:b:c\" | cut -d: -f2)\necho \"$x\"\n",
+            ),
             (
                 "WordCount",
                 "split_whitespace().count()",
@@ -24917,6 +24943,8 @@ mod tests {
             // fs-lift (class 5/6): the file predicates whose `std` reading is
             // exact; every one is pinned by a compile-and-run case above.
             "FsSameFile", "FsNewerThan", "FsModifiedSinceRead",
+            // text-filter-lift: a static text pipeline as one node.
+            "TextFilter",
         ];
         // Refused in `node_manifest`'s `rs` arm, each with the reason written there.
         const REFUSED: &[&str] = &["RegSub", "RegexpFind", "AffixStrip"];
@@ -24955,6 +24983,116 @@ mod tests {
     /// expansion in an operand moves the path's meaning to runtime, so the
     /// `test` text keeps the shell's own tokenizer. Neither node may appear.
     #[test]
+    /// Every pipeline `text-filter-lift` accepts must be correct at RUNTIME,
+    /// byte-for-byte against bash, with NO `bash -c` left in the program: the
+    /// compiled render's stdout and exit status are compared with the shell's,
+    /// and the absence of `__sh_spawn(` proves the node (not the fallback)
+    /// produced the bytes.
+    #[test]
+    fn text_filter_pipelines_execute_like_bash() {
+        let cases: &[(&str, &str)] = &[
+            ("wc-w", "echo \"Hello World\" | wc -w\n"),
+            ("wc-w-spaces", "echo \"a b   c\" | wc -w\n"),
+            ("wc-l", "printf \"a b\\nc\\n\" | wc -l\n"),
+            ("wc-l-no-final-newline", "printf \"x\" | wc -l\n"),
+            ("wc-c", "printf \"x\" | wc -c\n"),
+            ("head", "seq 1 10 | head -3\n"),
+            ("head-n", "seq 3 | head -n 2\n"),
+            ("head-partial-line", "printf \"a\\nb\" | head -1\n"),
+            ("head-more-than-lines", "echo hi | head -5\n"),
+            ("tail", "seq 1 10 | tail -3\n"),
+            ("tail-partial-line", "printf \"a\\nb\\nc\" | tail -2\n"),
+            ("tail-more-than-lines", "echo hi | tail -5\n"),
+            ("uniq", "echo -e \"a\\na\\nb\" | uniq\n"),
+            ("uniq-blank-runs", "echo -e \"a\\n\\n\\nb\" | uniq\n"),
+            ("cut", "echo \"apple:banana:cherry\" | cut -d: -f2\n"),
+            // A field past the end is selected but absent: GNU cut prints an
+            // EMPTY line for it (od -c: a single `\n`), so the block's blank
+            // line is the exact bytes, not a looser approximation.
+            ("cut-missing-field", "echo a:b:c | cut -d: -f4\n"),
+            ("cut-multi", "echo -e \"a:a\\nb\" | cut -d: -f1,2\n"),
+            ("cut-no-delimiter", "printf \"plain\\nx:y\" | cut -d: -f1\n"),
+            // The redirect IS the producer (`wc -l < file`), and `cat FILE` is
+            // the one read whose error text the node spells (main.rs exists in
+            // the compiled program's directory).
+            ("redirect-wc", "wc -l < Cargo.toml\n"),
+            ("cat-head", "cat Cargo.toml | head -1\n"),
+        ];
+        for (name, src) in cases {
+            // `cat FILE`/`< FILE` need a path both sides can read: the shell
+            // runs in the crate dir and the compiled program in a temp dir, so
+            // the case carries the ABSOLUTE crate path.
+            let src_owned = src.replace(
+                "Cargo.toml",
+                &format!("{}/Cargo.toml", env!("CARGO_MANIFEST_DIR")),
+            );
+            let src: &str = if src.contains("Cargo.toml") { &src_owned } else { src };
+            let prog = render_rs(src);
+            assert!(
+                !prog.contains("__sh_spawn("),
+                "{name}: still spawns a shell for a static text pipeline:\n{prog}"
+            );
+            assert!(
+                prog.contains("__sh_cur"),
+                "{name}: the TextFilter arm did not render:\n{prog}"
+            );
+            let (rust_out, rust_rc) = compile_and_run(name, &prog);
+            let (bash_out, bash_rc) = run_bash(src);
+            assert_eq!(
+                rust_out,
+                bash_out,
+                "{name}: stdout differs from bash\n--- bash ---\n{}\n--- rust ---\n{}",
+                String::from_utf8_lossy(&bash_out),
+                String::from_utf8_lossy(&rust_out)
+            );
+            assert_eq!(rust_rc, bash_rc, "{name}: exit status differs from bash");
+        }
+    }
+
+    /// The shapes `text-filter-lift` refuses, each still spawning `bash -c`:
+    /// multi-operand header forms, `tail -f`/`+N`, `cut -c`/ranges, `wc -L` and
+    /// the operand form, `uniq` flags, `tee` (its error text is the
+    /// environment's — measured), `cat` with no operand, and every interpreter
+    /// or collating filter the plan keeps out.
+    #[test]
+    fn text_filter_refuses_what_it_cannot_spell() {
+        for (name, src) in [
+            ("tail +N", "seq 1 3 | tail -n +2\n"),
+            ("cut -c", "echo ab | cut -c 1\n"),
+            // A range IS refused by the filter itself; a SINGLE-LINE literal
+            // producer still folds through the older FieldExtract path, so the
+            // multi-line producer is the witness that the range keeps its
+            // command.
+            ("cut range", "printf \"a:b\\nc:d\\n\" | cut -d: -f1-2\n"),
+            ("wc -L", "echo hi | wc -L\n"),
+            ("wc operand", "echo hi | wc -l f\n"),
+            // `uniq -c` is exactly the older UniqLines{count} node, so it is
+            // not a refusal witness; `-i` has no node field at all.
+            ("uniq -i", "echo a | uniq -i\n"),
+            ("tee", "echo a | tee /tmp/sh2_tee_refused\n"),
+            ("cat no operand", "cat | wc -l\n"),
+            // `sort`/`xargs`/`uniq -c` are NOT here: the older text-op path
+            // already renders them as SortLines/UniqLines/RepeatStr nodes on a
+            // literal producer, and those are pinned separately. The filter
+            // refuses their flags; the render that wins is the exact node.
+            ("grep", "echo b | grep b\n"),
+            ("awk", "echo b | awk '{print}'\n"),
+            ("sed", "echo b | sed 's/b/c/'\n"),
+            // A producer no stage models: the pipeline keeps the shell.
+            ("unknown producer", "ls | wc -l\n"),
+        ] {
+            let prog = render_rs(src);
+            assert!(
+                prog.contains("__sh_spawn("),
+                "{name}: folded a shape it must refuse:\n{prog}"
+            );
+            assert!(
+                !prog.contains("__sh_cur"),
+                "{name}: emitted the TextFilter block for a refused shape:\n{prog}"
+            );
+        }
+    }
+
     fn fs_predicates_refuse_what_std_cannot_name() {
         for (name, src, keep) in [
             ("owner", "if [ -O /dev/null ]; then echo o; fi\n", "__sh_fowner("),
@@ -25004,9 +25142,7 @@ mod tests {
             ("char positions", "echo abc | cut -c1\n"),
             // The node has no complement field.
             ("complement", "echo a:b | cut --complement -d: -f1\n"),
-            // No field selected: cut prints NOTHING for the line, while the
-            // statement wrapper would print a blank line.
-            ("empty selection", "echo a:b:c | cut -d: -f4\n"),
+
             // A reversed range is an ERROR in cut, not an empty set.
             ("reversed range", "echo a:b | cut -d: -f4-2\n"),
             // `wc -L` is the longest line's DISPLAY WIDTH; no node models it.
