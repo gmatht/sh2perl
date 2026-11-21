@@ -42,7 +42,6 @@
 //! `blk_p` cons-chain), and any backend with a mutable string builder.
 
 use std::collections::HashMap;
-use std::sync::Mutex;
 
 use crate::ir::{ArithAst, AssignTarget, InterpPart, IrExpr, IrStmt, StrStyle};
 
@@ -55,18 +54,24 @@ pub struct Accumulator {
     pub init_idx: usize,
 }
 
-static VERDICTS: Mutex<Option<Vec<Accumulator>>> = Mutex::new(None);
+// THREAD-LOCAL, not a process-global: the verdict belongs to the render
+// that just ran, and `cargo test` runs each test on its own thread, so a
+// shared cache let one test's verdict overwrite another's between
+// `transform` and `accumulators()`.
+thread_local! {
+    static VERDICTS: std::cell::RefCell<Option<Vec<Accumulator>>> = const { std::cell::RefCell::new(None) };
+}
 
 /// Drop the cached verdict — the out-of-band caller's reset (see
 /// `transforms::reset_verdicts`). These transforms are analysis-only: they
 /// return `false` from `run()` and a RENDERER reads the verdict, so without
 /// a reset a second run observes the PREVIOUS input's verdict.
 pub fn clear_verdicts() {
-    *VERDICTS.lock().unwrap() = None;
+    VERDICTS.with(|v| *v.borrow_mut() = None);
 }
 
 pub fn accumulators() -> Vec<Accumulator> {
-    VERDICTS.lock().unwrap().clone().unwrap_or_default()
+    VERDICTS.with(|v| v.borrow().clone().unwrap_or_default())
 }
 
 /// Apply the transform: compute + cache the verdicts, then (for the JS /
@@ -87,7 +92,7 @@ pub fn accumulators() -> Vec<Accumulator> {
 /// read positions (the loop CONDITION and the body) are guarded below.
 pub fn transform(stmts: &mut Vec<IrStmt>) -> bool {
     let verdicts = analyze(stmts);
-    *VERDICTS.lock().unwrap() = Some(verdicts.clone());
+    VERDICTS.with(|v| *v.borrow_mut() = Some(verdicts.clone()));
     if !matches!(crate::transforms::target().as_deref(), Some("js") | Some("estree")) {
         return false; // analysis-only for every other renderer
     }
