@@ -2555,7 +2555,10 @@ impl Render {
                 self.emit(&format!(
                     "    const _g: std.fs.File = std.fs.cwd().createFile({p}, .{{ .truncate = true }}) catch break :blk {{}};"));
                 self.emit("    defer _g.close();");
+                // The device line is `payload ++ "\n"`: the echo terminator is
+                // part of the bytes bash writes, so the fallback must emit it.
                 self.emit(&format!("    _g.writeAll({v}) catch {{}};"));
+                self.emit("    _g.writeAll(\"\\n\") catch {};");
                 self.emit("};");
             }
             IrStmt::Ext(_) => panic!("zig backend: Ext node unsupported"),

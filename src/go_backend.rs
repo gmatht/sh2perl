@@ -2774,7 +2774,10 @@ impl Render {
                     let p = g.payload.clone();
                     self.expr_any(&p)
                 };
-                    self.emit(&format!("_ = os.WriteFile({}, []byte({}), 0644)", Self::go_str(&path), payload));
+                    // The device line is `payload ++ "\n"` (echo's terminator);
+                    // writing the payload alone drops the last byte of every
+                    // lifted line — the same firewall defect the C fallback had.
+                    self.emit(&format!("_ = os.WriteFile({}, []byte({} + \"\\n\"), 0644)", Self::go_str(&path), payload));
                 } else {
                     panic!("go backend: Ext node {} unsupported", node.tag());
                 }

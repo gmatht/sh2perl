@@ -38890,8 +38890,15 @@ fn param_copy_alias(
                     };
                     let c = self.value_c(&g.payload);
                     let p = self.value_c(&IrExpr::Str(path, crate::ir::StrStyle::DoubleQuoted));
+                    // The lift only accepts an `echo` write (`payload_of`
+                    // refuses printf and echo-option words), and `echo`
+                    // terminates its line: the device bytes are
+                    // `payload + "\n"`. A fallback that writes the payload
+                    // alone drops the last byte of EVERY non-blocks verb
+                    // (measured: `echo "1" > /dev/fb0/depthmask` emitted
+                    // `fputs("1")` where bash writes `1\n`).
                     self.emit(&format!(
-                        "{{ FILE *_f = fopen({p}, \"w\"); if (_f) {{ fputs({c}, _f); fclose(_f); }} }}"
+                        "{{ FILE *_f = fopen({p}, \"w\"); if (_f) {{ fputs({c}, _f); fputc('\\n', _f); fclose(_f); }} }}"
                     ));
                 }
             }

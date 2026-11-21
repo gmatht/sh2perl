@@ -7862,3 +7862,78 @@ RUSTUP_HOME=$HOME/.rustup CARGO_HOME=$HOME/.cargo \
 python3 harness/mut-fbdev-batch.py          # 11/11 red
 bash harness/anchor-fbdev-batch.sh          # pass=8 fail=0
 ```
+
+## `fbdev_gpu.rs` — the device-write lift (17 obligations)
+
+The transform lifts `echo PAYLOAD > /dev/fb0/VERB` into
+`GpuOp{device, slot, verb, payload}`. A device write's observable is the pair
+**(path, bytes)**: the path `DEVICE/VERB` (or `DEVICE/SLOT/VERB`), and the
+bytes `payload ++ "\n"` — the echo line the device parses.
+
+- `path_of` and `wire` are the two halves: `a_top_level_verb_is_device_slash_verb`
+  and `a_slot_keeps_its_path` prove the path composition;
+  `the_line_keeps_its_terminator` and `the_line_is_not_empty` prove the line.
+- `the_lift_preserves_the_device_stream` is the driver law: for EVERY
+  statement list, the lifted list's (path, bytes) sequence equals the
+  original's (`go` vs `go_lifted`), with `the_lift_is_a_pointwise_image` as
+  the per-statement form — so an op that forgets a slot, a verb or adds a
+  terminator is red.
+
+Pinned pre-fix / naive facts (each a measured witness):
+
+| fact | measured defect |
+|---|---|
+| `the_naive_fallback_loses_the_line` | the shipped `fputs(payload)` fallback wrote `1` for `depthmask` where bash writes `1\n` |
+| `an_empty_write_is_still_a_line` | `echo "" > dev` is the one-byte line `\n` |
+| `an_empty_write_is_not_the_naive_fallback` | the pre-fix path dropped that line entirely |
+| `a_naive_slot_join_moves_the_write` | always spelling `device/slot/verb` gives `device//verb` for a top-level verb |
+| `a_printf_write_is_not_an_echo_write` | `printf 'x' > dev` writes `x` with no terminator |
+| `an_echo_option_is_not_a_payload` | `echo -n > dev` writes nothing |
+
+NOT MODELLED (stated in-file): the device's own parser (what a line means to
+`fb_blocks`), whether `fopen` succeeds, and the lift's recursion into nested
+bodies (a nested body is a statement list of the same shape, carried by the
+same `go`). `printf` and `echo -n` appear only as REFUSED shapes.
+
+### Repairs the model forced
+
+1. The GpuOp **fallback** in C, Perl, Go and Zig now writes the echo
+   terminator. Before: `fputs(payload)` / `print $fh payload` /
+   `os.WriteFile(…, []byte(payload))` / `writeAll(payload)` — every lifted
+   line on a verb with no `fb_*` primitive lost its last byte (default
+   transform set: `echo "1" > /dev/fb0/depthmask` emitted `1`).
+2. The lift refuses **printf** (both `printf 'x\n'` and `printf 'x'` were
+   byte-DIFF: `x\n\n` and `x\n`).
+3. The lift refuses a lone **echo option word**: it had been lifting `-n` as
+   the payload.
+4. An **empty payload** is lifted (it is one `\n` line), which closes the
+   defect the batch rung measured.
+
+### Mutants
+
+`harness/mut-fbdev-gpu.py` — 12 independent edits inside the named
+definitions (line terminator dropped/doubled, top-level path loses its slash,
+slotted path collapses, lift adds a terminator / forgets the verb / forgets
+the slot, stream reverses / drops the first statement, printf read as an
+echo, echo option read as a payload, naive slot join). Measured: **12/12
+RED**, each naming a failing obligation, none an `E0xxx`.
+
+### Anchor
+
+`harness/anchor-fbdev-gpu.sh` — **9/9**, really executed: 3 lifted through
+the C call (`fb_blocks` marker, including the empty payload), 2 lifted
+through the GpuOp fallback (`depthmask`, the slotted `uniform/1f/uCamYaw`;
+`fputc('\n', _f)` marker), 3 refused (printf, `echo -n`, an interpolated
+device path; no markers) and 1 transform-disabled fall-through. Device bytes,
+stdout and exit status are compared against bash on a FIFO-backed device, on
+C AND Perl.
+
+### Running it
+
+```sh
+RUSTUP_HOME=$HOME/.rustup CARGO_HOME=$HOME/.cargo \
+  ~/verus-0.2026.10.18.7d82994/verus --triggers-mode silent --rlimit 60 \
+  proofs/verus/fbdev_gpu.rs               # 17 verified, 0 errors
+python3 harness/mut-fbdev-gpu.py          # 12/12 red
+bash harness/anchor-fbdev-gpu.sh          # pass=9 fail=0
+```

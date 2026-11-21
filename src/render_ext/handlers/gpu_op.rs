@@ -4,7 +4,10 @@
 //! §4.2 stage ② "gpu-prep" pass). This backend has no GPU leg, so the
 //! CORRECTNESS FIREWALL applies: render the ORIGINAL write.
 //!
-//! `echo P > /dev/fb0/verb` opens the device path and prints the payload.
+//! `echo P > /dev/fb0/verb` opens the device path and prints the payload AND
+//! its `\n` terminator: the device bytes are `P ++ "\n"`, and a fallback
+//! that printed only `P` lost the last byte of every line (measured: the
+//! uniform/depthmask shapes came out `1` where bash wrote `1\n`).
 //! `open my $fh, '>', PATH` is the same syscall bash makes, so a run
 //! against a real `/dev/fb0` (or an absent one — this box has none)
 //! behaves identically to the untransformed shell, including the non-fatal
@@ -41,7 +44,7 @@ pub(crate) fn render(ctx: &mut RenderCtx, n: &GpuOp) -> bool {
     // status byte, so the gate sees the same code the shell does.
     ctx.out.push_str(&format!(
         "{{ my $__gfh; open $__gfh, '>', \"{p}\"; \
-         if ($__gfh) {{ print $__gfh {payload}; close $__gfh; }} \
+         if ($__gfh) {{ print $__gfh {payload}, \"\\n\"; close $__gfh; }} \
          else {{ $CHILD_ERROR = 2; }} }}\n"
     ));
     true

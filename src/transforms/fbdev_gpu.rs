@@ -57,8 +57,10 @@
 //! - Only the **fb0 / webgl draw devices**, never a generic path that merely
 //!   starts with `/dev/` (`/dev/null`, `/dev/fd/N`). The device set is a
 //!   closed list, so a new one is an explicit edit rather than an accident.
-//! - The payload must be present. `echo -n > /dev/fb0` writes nothing and is
-//!   left as-is rather than lifted into an op with no argument.
+//! - Only an **`echo` write**. A `printf` format is not the device line
+//!   (`printf 'x' > dev` writes `x` with no terminator) and an echo OPTION
+//!   word (`echo -n`) prints nothing, so both are refused. An EMPTY payload
+//!   IS lifted: `echo "" > dev` still puts one `\n` line on the device.
 //!
 //! ## Placement
 //!
@@ -111,10 +113,10 @@ fn build_op(root: &'static str, segs: &[String], payload: IrExpr) -> Option<IrSt
     // needs to name a slot. No verb at all (a write to the device root) is
     // not a drawing operation this pass can express.
     let verb = segs.last()?.clone();
-    // A payload is required: `echo -n > /dev/fb0/x` is not a draw.
-    if matches!(&payload, IrExpr::Str(t, _) if t.is_empty()) {
-        return None;
-    }
+    // An EMPTY payload is lifted, not refused: `echo "" > /dev/fb0/blocks`
+    // still puts one "\n" line on the device, and the op carries that line.
+    // (The pre-fix refusal left the write to the fallback, which then
+    // dropped the terminator.)
     let seq = SEQ.fetch_add(1, Ordering::Relaxed);
     Some(IrStmt::Ext(Box::new(GpuOp {
         device: root.to_string(),
@@ -221,7 +223,11 @@ fn payload_of(inner: &[IrStmt]) -> Option<IrExpr> {
     let [IrExpr::Str(cmd, _), IrExpr::Array(items)] = args.as_slice() else {
         return None;
     };
-    if cmd != "echo" && cmd != "printf" {
+    // ONLY `echo`. A `printf` format is not the device line: `printf 'x' >
+    // /dev/fb0/blocks` writes `x` with no terminator, while the op model is
+    // `payload ++ "\n"` (measured: lifting it produced `x\n` and `x\n\n`
+    // for the two printf spellings, both DIFF from bash).
+    if cmd != "echo" {
         return None;
     }
     // `echo "$x"` lowers to a one-element array. A multi-word echo
@@ -229,6 +235,17 @@ fn payload_of(inner: &[IrStmt]) -> Option<IrExpr> {
     // about spacing that the device would have to make.
     if items.len() != 1 {
         return None;
+    }
+    // `echo -n > device` writes NOTHING (measured: the plain path lifted it
+    // as the payload "-n" and wrote "-n\n"). A word that is an echo OPTION
+    // is not a payload, so the shape is refused rather than mis-read.
+    if let IrExpr::Str(w, _) = &items[0] {
+        let option = w.len() > 1
+            && w.starts_with('-')
+            && w[1..].chars().all(|c| c == 'n' || c == 'e' || c == 'E');
+        if option {
+            return None;
+        }
     }
     Some(items[0].clone())
 }
@@ -318,10 +335,41 @@ mod tests {
     }
 
     #[test]
-    fn refuses_an_empty_payload() {
-        // `echo -n > /dev/fb0/x` is not a draw.
+    fn lifts_an_empty_payload() {
+        // `echo "" > /dev/fb0/x` puts one "\n" line on the device, so the op
+        // is real: the pre-fix refusal handed it to a fallback that dropped
+        // the terminator.
         let mut stmts = vec![echo_redirect(s(""), "/dev/fb0/blocks")];
-        assert!(!transform(&mut stmts));
+        assert!(transform(&mut stmts));
+        let op = op_of(&stmts[0]).expect("an empty payload is still a draw");
+        assert!(matches!(&op.payload, IrExpr::Str(t, _) if t.is_empty()));
+    }
+
+    #[test]
+    fn refuses_a_printf_payload() {
+        // `printf 'x' > dev` writes `x` — the op model is `payload ++ "\n"`,
+        // so a printf format is not a device line this pass can name.
+        let mut stmts = vec![IrStmt::Redirect {
+            inner: vec![IrStmt::Expr(IrExpr::Call {
+                func: "exec".into(),
+                args: vec![s("printf"), IrExpr::Array(vec![s("x")])],
+            })],
+            redirects: vec![crate::ir::IrRedirect {
+                fd: Some(1),
+                mode: "w".into(),
+                target: s("/dev/fb0/blocks"),
+                interpolate: false,
+            }],
+        }];
+        assert!(!transform(&mut stmts), "printf must be refused");
+    }
+
+    #[test]
+    fn refuses_an_echo_option_word() {
+        // `echo -n > dev` writes NOTHING; lifting "-n" as the payload writes
+        // "-n\n" (the plain path's measured defect).
+        let mut stmts = vec![echo_redirect(s("-n"), "/dev/fb0/blocks")];
+        assert!(!transform(&mut stmts), "an echo option is not a payload");
     }
 
     #[test]
