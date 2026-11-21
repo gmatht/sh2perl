@@ -11,6 +11,7 @@
     pub(crate) mod cutset_trim;
     pub(crate) mod field_extract;
     pub(crate) mod field_read;
+    pub(crate) mod fs_command;
     pub(crate) mod fs_modified_since_read;
     pub(crate) mod fs_newer_than;
     pub(crate) mod fs_same_file;

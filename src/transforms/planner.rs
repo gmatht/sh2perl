@@ -276,6 +276,10 @@ pub fn node_manifest(target: &str) -> &'static [&'static str] {
             // exact — dev+ino identity, full-precision mtime comparison with
             // bash's missing-operand rule, and `-N` as mtime > atime.
             "FsSameFile", "FsNewerThan", "FsModifiedSinceRead",
+            // fs-cmd-lift (class 5): `rm`/`mkdir`/`touch` with plain literal
+            // words is one node; its Rust arm is the statement renderer that
+            // was already native, now carried by the node.
+            "FsCommand",
             // text-filter-lift (class 1/5): a pipeline of STATIC text filters
             // (`echo|wc`, `seq|head`, `cat|uniq`, `echo|cut`, `echo|tee`) is
             // one node; the arm prints the chain's output and leaves the last

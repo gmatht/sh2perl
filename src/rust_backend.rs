@@ -5713,6 +5713,25 @@ impl Render {
                 "(if {} {{ \"1\" }} else {{ \"0\" }}).to_string()",
                 self.fs_pred_bool(n)
             )),
+            // fs-cmd-lift: `rm`/`mkdir`/`touch`. The statement renderer IS the
+            // semantics (directory rule, `-f` missing-path rule, diagnostics,
+            // status aggregated over the operands); the node carries them so
+            // the next backend does not re-derive them. The producer refuses
+            // every shape this arm cannot spell, so `None` here is a producer
+            // bug — never a reason to shell out.
+            "FsCommand" => {
+                let x = n.as_any().downcast_ref::<crate::shir_nodes::FsCommand>()?;
+                let empty: Vec<IrExpr> = Vec::new();
+                let items: &Vec<IrExpr> = match &x.argv {
+                    IrExpr::Array(a) => a,
+                    _ => &empty,
+                };
+                let words: Vec<&IrExpr> = items.iter().collect();
+                let body = self.native_fs_stmt(&x.cmd, &words)?;
+                Some(format!(
+                    "{{ {body} __SH_RC.load(Ordering::Relaxed).to_string() }}"
+                ))
+            }
             "StringTrim" => {
                 let x = n.as_any().downcast_ref::<crate::shir_nodes::StringTrim>()?;
                 let t = self.expr_str(&x.text);
@@ -13061,6 +13080,21 @@ while __sh_path.len() > 1 && __sh_path.ends_with('/') {{ __sh_path = &__sh_path[
                     self.emit("__SH_RC.store(0, Ordering::Relaxed);");
                 }
                 IrExpr::Call { func, args } if func == "exec" || func == "builtin" => self.exec_stmt(args),
+                // An `FsCommand` STATEMENT: hand the node's words back to the
+                // `exec` statement renderer, which is the ONE spelling of the
+                // semantics (and the same emission path the un-lifted call
+                // took, so the rendered program is byte-identical either way).
+                IrExpr::Ext(n) if n.tag() == "FsCommand" => {
+                    let x = n
+                        .as_any()
+                        .downcast_ref::<crate::shir_nodes::FsCommand>()
+                        .expect("tag/type agree");
+                    let args = [
+                        IrExpr::Str(x.cmd.clone(), crate::ir::StrStyle::DoubleQuoted),
+                        x.argv.clone(),
+                    ];
+                    self.exec_stmt(&args);
+                }
                 // A `TextFilter` STATEMENT: the node's block PRINTS the chain's
                 // output and stores the last stage's status itself, so the
                 // generic `let _ = <value>` arm would throw the output away
@@ -25148,6 +25182,26 @@ mod tests {
             std::fs::write(root.join("ro").join("f.txt"), b"ro\n").expect("fixture ro file");
             std::fs::write(root.join("goner.txt"), b"gone\n").expect("fixture goner");
             std::fs::write(root.join("has.txt"), b"keep me\n").expect("fixture has");
+            std::fs::write(root.join("gone2.txt"), b"two\n").expect("fixture gone2");
+            std::fs::write(root.join("gone3.txt"), b"three\n").expect("fixture gone3");
+            std::fs::create_dir_all(root.join("tree").join("inner")).expect("fixture tree");
+            std::fs::write(root.join("tree").join("inner").join("leaf"), b"leaf\n")
+                .expect("fixture tree leaf");
+            // Deterministic mtimes: `touch old.txt` must lift it above
+            // `ref.txt`, or the witness cannot OBSERVE that touch updated the
+            // time (a touch that did nothing would print "older").
+            std::fs::write(root.join("old.txt"), b"old\n").expect("fixture old");
+            std::fs::write(root.join("ref.txt"), b"ref\n").expect("fixture ref");
+            let stamp = |n: &str, secs: u64| {
+                let f = std::fs::OpenOptions::new()
+                    .write(true)
+                    .open(root.join(n))
+                    .expect("stamp open");
+                f.set_modified(std::time::UNIX_EPOCH + std::time::Duration::from_secs(secs))
+                    .expect("stamp set");
+            };
+            stamp("old.txt", 1_000_000);
+            stamp("ref.txt", 2_000_000);
             std::fs::set_permissions(root.join("ro"), std::fs::Permissions::from_mode(0o555))
                 .expect("fixture ro mode");
         };
@@ -25155,6 +25209,12 @@ mod tests {
             ("fs-rm-file", format!("rm '{}'\n", p("goner.txt"))),
             ("fs-rm-missing", format!("rm '{}'\n", p("nope.txt"))),
             ("fs-rm-force-missing", format!("rm -f '{}'\n", p("nope.txt"))),
+            (
+                "fs-rm-multi",
+                format!("rm '{}' '{}'\n", p("gone2.txt"), p("gone3.txt")),
+            ),
+            ("fs-rm-dir-flag-file", format!("rm -d '{}'\n", p("has.txt"))),
+            ("fs-rm-recursive-tree", format!("rm -r '{}'\n", p("tree"))),
             ("fs-rm-no-operand", "rm\n".to_string()),
             ("fs-rm-directory", format!("rm '{}'\n", p("sub"))),
             ("fs-rm-recursive", format!("rm -r '{}'\n", p("sub"))),
@@ -25168,6 +25228,23 @@ mod tests {
             ("fs-mkdir-parents", format!("mkdir -p '{}/a/b'\n", p("deep"))),
             ("fs-mkdir-permission", format!("mkdir '{}/child'\n", p("ro"))),
             ("fs-mkdir-missing-parent", format!("mkdir '{}/child'\n", p("absent"))),
+            (
+                "fs-mkdir-parents-existing",
+                format!("mkdir -p '{}/a/b'\nmkdir -p '{}'\n", p("deep2"), p("existing")),
+            ),
+            (
+                "fs-touch-updates-mtime",
+                format!(
+                    "touch '{}'\nif [ '{}' -nt '{}' ]; then echo newer; else echo older; fi\n",
+                    p("old.txt"),
+                    p("old.txt"),
+                    p("ref.txt")
+                ),
+            ),
+            (
+                "fs-touch-multi",
+                format!("touch '{}' '{}'\n", p("t2a"), p("t2b")),
+            ),
             (
                 "fs-rm-through-file",
                 format!("rm '{}/x'\n", p("has.txt")),
@@ -25205,6 +25282,38 @@ mod tests {
         std::fs::set_permissions(root.join("ro"), std::fs::Permissions::from_mode(0o755))
             .expect("fixture chmod back");
         let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// The `fs.*` command family's REFUSALS, asserted where they matter: a
+    /// shape the node does not model must keep the route it had (a shell-out
+    /// that knows the flag), not fall into the arm and lose the flag. This is
+    /// the list the report carries, one line per reason:
+    ///
+    /// * `mkdir -m` / `touch -d` / `rm -i` — flags outside the renderer's
+    ///   contract (`mkdir`: p,v; `touch`: none; `rm`: f,r,R,d);
+    /// * `cat` beyond the two folds it already had — the heredoc/herestring
+    ///   body is a byte copy (pass 11) and `cat FILE | wc/cut/head/tee/uniq`
+    ///   folds into a `TextFilter` (result text); `cat f | sort` (a stage
+    ///   whose consumer is not foldable) and `cat *.txt` (a glob) keep
+    ///   spawning;
+    /// * `rm file_*.txt` — a glob word (one `Str` at IR time, N paths at
+    ///   runtime) is a refusal, never an arm that drops the statement.
+    #[test]
+    fn fs_shapes_outside_the_node_keep_their_shell() {
+        for src in [
+            "mkdir -m 700 newdir\n",
+            "touch -d '2020-01-01 00:00' f\n",
+            "rm -i f\n",
+            "cat 'f' | sort\n",
+            "cat *.txt\n",
+            "rm file_*.txt\n",
+        ] {
+            let prog = render_rs(src);
+            assert!(
+                prog.contains("__sh_spawn("),
+                "a refused fs shape lost its shell route: {src:?}\n{prog}"
+            );
+        }
     }
 
     /// The class-6 fixture tree: regular files across the permission bits
@@ -25898,6 +26007,10 @@ mod tests {
             "FsSameFile", "FsNewerThan", "FsModifiedSinceRead",
             // text-filter-lift: a static text pipeline as one node.
             "TextFilter",
+            // fs-cmd-lift: `rm`/`mkdir`/`touch` as one node, pinned by
+            // `fs_statements_report_bash_diagnostics` (compile-and-run, every
+            // error path included — the node path is the only path now).
+            "FsCommand",
         ];
         // Refused in `node_manifest`'s `rs` arm, each with the reason written there.
         // (AffixStrip left this list when its real arm was DECLARED: the fold

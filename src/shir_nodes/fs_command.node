@@ -1,0 +1,35 @@
+# shir_nodes/fs_command.node — a filesystem COMMAND as one semantic node.
+#
+# `rm -f a b`, `mkdir -p d`, `touch f` are the corpus's file-mutating
+# externals. Their renderer carries semantics that are easy to get wrong (the
+# directory rule, the `-f` missing-path rule, bash's diagnostic wording, the
+# status aggregated over several operands), so they belong in a node instead of
+# being re-derived by each backend.
+#
+# meaning: fs_command cmd argv == run `cmd argv...` in the enclosing shell,
+#   with `cmd` one of `rm`, `mkdir`, `touch`, leaving its status in `$?`.
+#
+# Domains this node deliberately does NOT cover (the producer refuses them, so
+# the command keeps whatever route it had):
+#   * a word that is not a plain literal at IR time (a variable, a
+#     substitution, a GLOB — `rm file_*.txt` is one `Str` at IR time and N
+#     paths at runtime, so it is a refusal and never an arm that drops it);
+#   * a flag the renderer does not model (`rm -i`, `mkdir -m`, `touch -d`, any
+#     `--long` form);
+#   * `rm`/`mkdir`/`touch` with no operand, or a lone `-` operand.
+#
+# Backends: Rust (its statement renderer spells the `std::fs` loop). Every
+# other backend refuses the tag in its manifest, so the producer never builds
+# it there.
+# Fallback: none — the node exists to replace the shell-out, not to keep it.
+#
+# Provenance: PLAN.md pass 9 (the fs arms) and pass 12 (this family).
+node FsCommand
+tag "FsCommand"
+kind expr
+# The command word: "rm" | "mkdir" | "touch".
+field cmd: string
+# The argv, as one Array expr of literal Str words (flags and operands in
+# shell order).
+field argv: expr
+spec: FsCommands#command_sound

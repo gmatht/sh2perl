@@ -1533,6 +1533,14 @@ pub fn text_filter(node: &crate::shir_nodes::TextFilter, ctx: &ExprRenderCtx) ->
     }
 }
 
+/// `FsCommand` is DECLARED by Rust only, and Rust renders it in its own
+/// statement slot (the `std::fs` loop with bash's diagnostics), so there is no
+/// shared spelling to add here. Every other backend refuses the tag in its
+/// manifest, which keeps this `None` from becoming a silent empty value.
+pub fn fs_command(_node: &crate::shir_nodes::FsCommand, _ctx: &ExprRenderCtx) -> Option<String> {
+    None
+}
+
 pub fn fs_same_file(node: &crate::shir_nodes::FsSameFile, ctx: &ExprRenderCtx) -> Option<String> {
     match ctx.backend {
         Backend::Rust => Some(fs_same_file_rust(
