@@ -547,9 +547,11 @@ fn single_star_shape(p: &str) -> Option<(&str, bool)> {
 /// pattern). Unset target (the shir embed path / non-CLI ingress)
 /// refuses — the fold is a render-quality optimisation, never a
 /// semantic requirement.
+const CUT_TARGETS: &[&str] = &["rs", "rust", "c", "py", "python"];
+
 fn cut_target_ok() -> bool {
     match crate::transforms::target() {
-        Some(t) => matches!(t.as_str(), "rs" | "rust" | "c" | "py" | "python"),
+        Some(t) => CUT_TARGETS.contains(&t.as_str()),
         None => false,
     }
 }
@@ -889,6 +891,34 @@ mod tests {
             assert!(
                 crate::transforms::planner::node_manifest(key).contains(&"AffixStrip"),
                 "{t} accepts the fold but its manifest does not declare AffixStrip"
+            );
+        }
+    }
+
+    /// CutAt is the AffixStrip situation **without** the lie: every target in
+    /// `CUT_TARGETS` renders the node (its own arm, pinned end-to-end — rust
+    /// by `constructed_text_nodes_execute_like_bash`'s CutAt cases) while NO
+    /// manifest lists it, and that is deliberate.
+    ///
+    /// MEASURED: adding `"CutAt"` to rust's manifest is not cost-free — it
+    /// re-routes `058_advanced_bash_idioms.rs`'s two echoes from a folded
+    /// `println!` to `__sh_print_words` + an `__SH_RC` store, because the
+    /// pipeline consults the manifest for more than the fold's own gate. The
+    /// node's offer is owned by `cut_target_ok`, so the lists stay as they
+    /// are and the RELATION is pinned here: accepted ⇒ rendered, and rendered
+    /// with a declaration would churn. Any manifest grown a CutAt entry must
+    /// re-run the renders and update this test with the measurement.
+    #[test]
+    fn cut_fold_targets_are_render_verified_not_declared() {
+        for t in CUT_TARGETS {
+            with_target(Some(t), || {
+                assert!(cut_target_ok(), "{t} must accept the CutAt fold");
+            });
+        }
+        for t in ["rs", "c", "python"] {
+            assert!(
+                !crate::transforms::planner::node_manifest(t).contains(&"CutAt"),
+                "{t} declares CutAt: re-run the rs/c/python renders and update this test"
             );
         }
     }

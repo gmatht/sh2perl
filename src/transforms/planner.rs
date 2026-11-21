@@ -248,10 +248,14 @@ pub fn node_manifest(target: &str) -> &'static [&'static str] {
         //    the command. (The regex the RENDERER does use comes from the
         //    `regex` crate in the emitted Cargo project — that is not `std`,
         //    so it does not license these nodes here.)
-        //  * CutAt — not a manifest node on any backend: rust/python render
-        //    their own arms and the fold's own gate (`cut_target_ok`) owns
-        //    the offer. Left out of scope here because the 13 armless tags do
-        //    not include it; see PLAN pass 8's "still open".
+        //  * CutAt — not a manifest node on any backend, and MEASURED to
+        //    stay that way on rust: adding it here re-routes
+        //    `058_advanced_bash_idioms.rs`'s two echoes from `println!` to
+        //    `__sh_print_words` (the manifest is consulted by the pipeline,
+        //    not just by the fold, so a declaration is not cost-free). The
+        //    fold's own gate (`cut_target_ok`) owns the offer; the
+        //    list↔manifest relation is pinned by
+        //    `cut_fold_targets_are_render_verified_not_declared`.
         //
         // DECLARED but CONSTRUCT-ONLY (no transform in this pipeline builds
         // them from shell source, so they are pinned by constructing the node

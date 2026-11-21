@@ -25597,7 +25597,7 @@ mod tests {
     /// against the bash command it models — `head -n`/`tail -n`.
     #[test]
     fn constructed_text_nodes_execute_like_bash() {
-        use crate::shir_nodes::{CutsetTrim, SortLines, StringAffix, TakeLines, UniqLines};
+        use crate::shir_nodes::{CutAt, CutsetTrim, SortLines, StringAffix, TakeLines, UniqLines};
         let mut cases: Vec<(String, String, &str)> = Vec::new();
         for (from_end, bash_src) in [
             (false, "printf 'a\\nb\\nc\\n' | head -n 2\n"),
@@ -25727,6 +25727,49 @@ mod tests {
             "CutsetTrimSet".to_string(),
             cutset("--a.b--", "-.", None),
             "printf '%s\\n' --a.b-- | sed 's/^[-.]*//; s/[-.]*$//'\n",
+        ));
+        // CutAt: the four find/rfind cuts behind the star-strip identities
+        // (`${v%%/*}`, `${v%/*}`, `${v#*/}`, `${v##*/}`). The fold's
+        // `cut_target_ok` builds the node; it is CONSTRUCTED here so all four
+        // orientations plus "delimiter absent" and the empty text are pinned
+        // against bash's own parameter expansion.
+        let cut = |text: &str, delim: &str, head: bool, first: bool| {
+            shir_to_rust(&print_program(IrExpr::Ext(Box::new(CutAt {
+                text: s(text),
+                delim: delim.to_string(),
+                head,
+                first,
+            }))))
+        };
+        cases.push((
+            "CutAtHeadFirst".to_string(),
+            cut("a/b/c", "/", true, true),
+            "v='a/b/c'; printf '%s\\n' \"${v%%/*}\"\n",
+        ));
+        cases.push((
+            "CutAtHeadLast".to_string(),
+            cut("a/b/c", "/", true, false),
+            "v='a/b/c'; printf '%s\\n' \"${v%/*}\"\n",
+        ));
+        cases.push((
+            "CutAtTailFirst".to_string(),
+            cut("a/b/c", "/", false, true),
+            "v='a/b/c'; printf '%s\\n' \"${v#*/}\"\n",
+        ));
+        cases.push((
+            "CutAtTailLast".to_string(),
+            cut("a/b/c", "/", false, false),
+            "v='a/b/c'; printf '%s\\n' \"${v##*/}\"\n",
+        ));
+        cases.push((
+            "CutAtAbsent".to_string(),
+            cut("abc", "/", false, true),
+            "v='abc'; printf '%s\\n' \"${v#*/}\"\n",
+        ));
+        cases.push((
+            "CutAtEmptyText".to_string(),
+            cut("", "/", true, false),
+            "v=''; printf '%s\\n' \"${v%/*}\"\n",
         ));
         let mut bad: Vec<String> = Vec::new();
         for (case, prog, bash_src) in cases {
