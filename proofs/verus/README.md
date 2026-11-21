@@ -8374,3 +8374,73 @@ cd sh2perl && RUSTUP_HOME=$HOME/.rustup CARGO_HOME=$HOME/.cargo \
 cd .. && python3 harness/mut-fs-cmd-lift.py  # 27/27 red
 bash harness/anchor-fs-cmd-lift.sh           # pass=19 fail=0
 ```
+
+## `fs_lift.rs` — the operand parse, the shape, and the GNU tables (26)
+
+`transforms/fs_lift.rs`. A `test` call whose text is exactly a file-predicate
+shape (`[ A -ef B ]`, `-nt`, `-ot`, `-N A`) becomes `FsSameFile` /
+`FsNewerThan` / `FsModifiedSinceRead`. The walk covers CONDITIONS as well as
+bodies (that is where these calls live), and the manifest gate is per node, so
+a backend without the arm keeps the `test` call.
+
+- **The operand parse is the content** (`classify`): an operand is a plain
+  variable read (`$name`/`${name}`, identifier names only) or a literal path
+  in one of the three static forms — unquoted with no hazard byte,
+  single-quoted verbatim (an inner `'` refuses), double-quoted with no `$`,
+  backtick, backslash or `"`. Pinned by `a_plain_name_is_an_identifier`,
+  `unquoted_operand_has_no_hazard`, `quoted_operand_is_literal`,
+  `single_quoted_operand_is_verbatim`, and by refusals for a glob, an indexed
+  read, `$1`, a prefixed expansion, a capture, a mid-word quote and a
+  backslash. `[ A -ef B ]` is ONE `Str` at IR time; bash would resolve those
+  characters at runtime, so this parse is what makes the node's path the
+  path bash would stat.
+- **The shape law**: the operands are carried IN ORDER (a swap is red), `-nt`
+  sets `newer = true` and `-ot` `false`, a two-token text that is not `-N` is
+  refused, and `-N` with two words is refused when the middle word is no
+  operator. Each of the three gates refuses without changing the call.
+- **The predicate meanings** are stated independently of the lift: `-ef`
+  needs both sides to exist with equal dev/ino; the missing-operand table says
+  exactly one ordering predicate holds when exactly one side exists and
+  neither when both are missing; `-N` is strict (`mt > at`, so equal
+  timestamps are not "modified") and needs existence; `ot_is_not_nt` keeps the
+  flag direction honest by a witness where the two disagree.
+
+Out of model (stated): the token split (`split_whitespace` is the pass's own,
+modelling it would prove the parser), `trim`, and the renderers' `stat(2)`
+agreement — the nodes' existing A1 contract, measured by the anchor. The
+`-O`/`-G` refusals are recorded with their reason (effective uid/gid are not
+exposed to the emitted program).
+
+### Mutants
+
+`harness/mut-fs-lift.py` — 24 independent edits inside the named definitions:
+the name start/tail, the hazard tables losing `*`, `$`, a quote or a
+backslash, the unquoted / double-quoted / single-quoted acceptance arms, the
+empty token, `-nt`/`-ot` swapped or forced, the operand order, `-N` arity, the
+four-token shape, the three gates, and the four predicate bodies (existence,
+strictness, and the missing-side rule). Measured: **24/24 RED**, each naming
+an obligation (`pin_*`, `the_*_table`, `minus_n_*`), none an `E0xxx`.
+
+### Anchor
+
+`harness/anchor-fs-lift.sh` — **19/19 shapes** (12 accepted, 7 refused). The
+controlled pair is `text-ops` (baseline) vs `text-ops,fs-lift` (test): the
+lift runs inside that walker, so "accepted" is measured as a CHANGED emission
+and "refused" as byte-identity, and the expected class is asserted per shape.
+Each lifted program is compiled and run against bash in a fresh fixture,
+comparing stdout and exit status. Recorded, not attributed to the lift:
+`variables`' pre-lift baseline does not build (the lift's inline path is what
+compiles it), `indexed`'s baseline already differs from bash, and
+`[ -N f g ]` reaches the lift joined as `-N fg` (a front-end text join that
+predates the pass — the model refuses the two-operand shape regardless). Go
+and Zig were not executed (`go=none zig=none`).
+
+### Running it
+
+```sh
+cd sh2perl && RUSTUP_HOME=$HOME/.rustup CARGO_HOME=$HOME/.cargo \
+  ~/verus-0.2026.10.18.7d82994/verus --triggers-mode silent --rlimit 60 \
+  proofs/verus/fs_lift.rs                   # 26 verified, 0 errors
+cd .. && python3 harness/mut-fs-lift.py       # 24/24 red
+bash harness/anchor-fs-lift.sh                # pass=19 fail=0
+```
