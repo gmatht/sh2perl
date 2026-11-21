@@ -1619,9 +1619,26 @@ fn inline_print_words(text: &mut String) {
             continue;
         };
         let expr = &text[start..close];
+        // Zero-line text ops print NO bytes: `println!("{}", "")` would
+        // emit a newline the shell never wrote. The two shapes below prove
+        // at render time that the block yields zero lines — `head -0`'s
+        // `if __sh_num <= 0 { String::new() }` (the node's own zero count)
+        // and a line filter over the empty literal producer (zero input
+        // lines, so zero output lines; `wc` over it renders through the
+        // TextFilter sink, not here). A filter over "\n" is NOT matched:
+        // that value is "" too, but the shell prints one empty line.
+        let zero_lines = mac == "println!"
+            && (expr.contains("let __sh_num: i64 = 0;")
+                || expr.contains("let __sh_text: String = \"\".to_string();"));
         // end = position after the `)` of the matched flags
         let end = bracket2_pos + 1 + j + flags.len();
-        let replacement = format!("{}(\"{{}}\", {})", mac, expr);
+        let replacement = if zero_lines {
+            format!(
+                "{{ let __sh_pv = {expr}; if !__sh_pv.is_empty() {{ println!(\"{{}}\", __sh_pv); }} }}"
+            )
+        } else {
+            format!("{}(\"{{}}\", {})", mac, expr)
+        };
         text.replace_range(at..end, &replacement);
         // The replacement may itself contain `pat`-adjacent text; resume the
         // scan at the end of what we just wrote so the loop always advances.
@@ -3592,8 +3609,28 @@ impl Render {
             self.out.push(String::new());
         } else {
             let s = Self::strip_let_parens(s);
+            // `let a = [];` has no element type for rustc to infer (E0282).
+            // A shell array DECLARED empty (`a=()`) reaches this point through
+            // several paths, so the rewrite lives at the one choke point
+            // instead of in each of them; `Vec<String>` keeps every later use
+            // (len, iter, index) exactly as the literal array did.
+            let s = Self::typed_empty_array_let(&s).unwrap_or(s);
             self.out.push(format!("{}{}", "    ".repeat(self.depth), &s));
         }
+    }
+
+    /// `let NAME = [];` → `let NAME: Vec<String> = Vec::new();`, else `None`.
+    fn typed_empty_array_let(s: &str) -> Option<String> {
+        let t = s.trim();
+        let rest = t.strip_prefix("let ")?;
+        let (name, tail) = rest.split_once(" = ")?;
+        if tail.trim() != "[];" {
+            return None;
+        }
+        if name.is_empty() || !name.chars().all(|c| c.is_alphanumeric() || c == '_') {
+            return None;
+        }
+        Some(format!("let {name}: Vec<String> = Vec::new();"))
     }
 
     /// Strip a redundant paren pair from a `let NAME = (EXPR);` initializer.
@@ -13328,7 +13365,16 @@ while __sh_path.len() > 1 && __sh_path.ends_with('/') {{ __sh_path = &__sh_path[
                         } else {
                             ""
                         };
-                        self.emit(&format!("{attr}let mut {m} = [{}];", lits.join(", ")));
+                        // An EMPTY literal array has no element type to
+                        // infer: `let mut a = [];` is a rustc error. The
+                        // node-parity witness found it (`a=(); ${#a[@]}`);
+                        // `Vec<String>` keeps every later use (len, iter,
+                        // index) exactly as the array did.
+                        if lits.is_empty() {
+                            self.emit(&format!("{attr}let mut {m}: Vec<String> = Vec::new();"));
+                        } else {
+                            self.emit(&format!("{attr}let mut {m} = [{}];", lits.join(", ")));
+                        }
                         self.emit("__SH_RC.store(0, Ordering::Relaxed);");
                         return;
                     }
