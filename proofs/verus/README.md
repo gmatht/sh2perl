@@ -8195,3 +8195,103 @@ RUSTUP_HOME=$HOME/.rustup CARGO_HOME=$HOME/.cargo \
 python3 harness/mut-shir-pipeline-native.py # 13/13 red
 bash harness/anchor-shir-pipeline-native.sh # pass=10 fail=0
 ```
+
+## `grep_pcre.rs` — the argv rewrite and the token table (47 obligations)
+
+`grep -P 'PCRE'` becomes `grep -E 'ERE'`: one call's argv is rewritten and the
+pattern is translated by a syntax-directed token table, or the pattern is
+refused and the call is left alone.
+
+| write | before | after |
+|---|---|---|
+| `grep -Pn '\d+' f.txt` | argv `[-Pn, \d+, f.txt]` | argv `[-En, [0-9]+, f.txt]` |
+| `grep -P -- -x f.txt` | argv `[-P, --, -x, f.txt]` | argv `[-E, --, -x, f.txt]` |
+| `grep -P 'a+?b' f.txt` | refused | unchanged |
+
+The model is split where the provable part ends:
+
+- **The argv** (structural, no regex semantics): `the_rewrite_keeps_the_operands`,
+  `the_rewrite_keeps_every_pass_through_flag`, `the_rewrite_makes_the_mode_extended`
+  (starts `-E`, exactly one `E`, no `P`), `the_rewrite_keeps_the_separator`.
+- **The pattern** (a fold `tr` over the per-token table `tr1`):
+  `a_literal_run_is_copied` (a run of literals emits its characters, in order),
+  the six exact-output class lemmas, `the_group_prefix_becomes_a_plain_group`,
+  `the_quantifier_marker_is_all_a_possessive_loses`,
+  `the_escaped_literal_keeps_its_backslash`, `the_copied_class_is_copied`,
+  `the_interval_text_is_kept`.
+- **The refusals**: `has_bad` is an existential over the token list;
+  `a_lazy_quantifier_is_refused`, `a_refused_escape_is_refused`, and
+  `an_accepted_pattern_has_no_bad_token` (the converse, by definition).
+- **The lookbehind**: `the_lookbehind_absorption_keeps_the_prefix` states
+  `(?<=X)Y` → `X` ++ Y with `X` recorded as the strip prefix.
+
+Pinned wrong rules: `the_ten_pass_through_flags_are_kept` (exactly
+`o v c q l n s w x i`; `P`/`E`/`-` not in it),
+`a_dash_pattern_without_a_separator_is_an_option`,
+`a_dropped_flag_is_not_the_same_call`,
+`a_dropped_operand_is_not_the_same_call`,
+`the_naive_keep_the_pc_classes_is_not_the_written_table`,
+`a_dropped_literal_breaks_the_pattern`,
+`an_atomic_group_is_not_a_plain_group_without_the_marker`, and the witness
+`law_at_the_witnesses`.
+
+### The repair the model forced
+
+The rebuilt argv dropped the source's `--` separator, so `grep -P -- -x`
+emitted `grep -E -x` — grep then reads the PATTERN as an option: usage error,
+exit 2, no output, where bash prints `-x` and exits 0. Measured on the
+compiled C and the generated Perl. The fix keeps `--` in front of the pattern
+when the source had one (`if after_dd { push Str("--") }`), pinned by
+`a_dash_pattern_keeps_the_separator` / `a_separator_is_not_invented` in the
+transform's tests, by A4 and `a_dash_pattern_without_a_separator_is_an_option`
+in the model, and by the anchor's `dash_pattern` shape.
+
+### Scope: what the model does NOT claim
+
+The PCRE↔ERE *language* equivalences the table relies on — `[0-9]` ≡ `\d`,
+`(X)` ≡ `(?>X)`, greedy ≡ possessive, `[[:alnum:]_]` ≡ `\w` under the C
+locale, absorbing a fixed lookbehind prefix changing only the bytes `-o`
+prints — are claims about a matcher, not about the rewrite. They are bounded
+here and measured by the anchor, which runs the real `grep -P` and the emitted
+program on the same inputs. Also not modelled: the scanner (where a class
+ends, which `(?` form a prefix is, whether `{` is a quantifier), the
+`$VAR` constant-map resolution, and the insertion point of the `sed` strip
+stage inside a capture pipeline (the unit tests pin the structure).
+
+### Mutants
+
+`harness/mut-grep-pcre.py` — 25 independent edits inside the named
+definitions: mode flag not extended / keeps `P`, the pass-through flag word
+dropped, the pass-through set losing `i` or `x` or admitting `P`, the
+separator dropped or invented, the operands dropped, the pattern slot lost or
+off by one, the option test ignoring the separator, the fold losing its first
+token, the digit/word class tables, the possessive marker kept, the group
+prefix kept, the group close dropped, a literal dropped, the escaped literal's
+backslash dropped, a copied class dropped, the interval text dropped, the two
+refusal arms accepted, the lookbehind prefix dropped. Measured: **25/25 RED**,
+each naming an obligation, none an `E0xxx`.
+
+### Anchor
+
+`harness/anchor-grep-pcre.sh` — **17/17 shapes** plus 2 emission checks,
+really executed on the compiled C and the generated Perl against bash
+(stdout and exit status). Accepted (12): `\d+` filter, `-o` with `\w+`, `\W`
+(no match), possessive `a*+`, atomic `(?>a)b`, `-c`, `-v`, `-i`, `-q`, the
+`--`-separated dash pattern, a `$pat` variable, and a non-matching pattern
+(exit 1). Refused (5): lookbehind under `-o` bare, a lazy quantifier, a
+back-reference, `\b`, and `-e` multi-pattern (exit 2 from grep, in both
+programs). For accepted shapes the emission's grep flag word carries `E` and
+no `P`, the pattern slot carries the translated text, and the `--` shape keeps
+its separator; refused shapes' C and Perl emissions are byte-identical to the
+no-transform ones. Not executed: Go and Zig (no toolchain on this machine:
+`go=none zig=none`).
+
+### Running it
+
+```sh
+cd sh2perl && RUSTUP_HOME=$HOME/.rustup CARGO_HOME=$HOME/.cargo \
+  ~/verus-0.2026.10.18.7d82994/verus --triggers-mode silent --rlimit 60 \
+  proofs/verus/grep_pcre.rs                  # 47 verified, 0 errors
+cd .. && python3 harness/mut-grep-pcre.py     # 25/25 red
+bash harness/anchor-grep-pcre.sh              # pass=19 fail=0
+```

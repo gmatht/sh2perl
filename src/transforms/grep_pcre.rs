@@ -577,10 +577,18 @@ fn rewrite_grep(func: &str, args: &mut Vec<IrExpr>, consts: &Consts, in_capture:
             fl.push(c);
         }
     }
-    let mut new_argv: Vec<IrExpr> = vec![
-        IrExpr::Str(fl, StrStyle::DoubleQuoted),
-        IrExpr::Str(ere, StrStyle::SingleQuoted),
-    ];
+    let mut new_argv: Vec<IrExpr> = vec![IrExpr::Str(fl, StrStyle::DoubleQuoted)];
+    // KEEP THE `--` SEPARATOR. A pattern can only begin with `-` when the
+    // source protected it (`grep -P -- -x`), and dropping the separator on
+    // the rebuild made the emitted `grep -E -x` parse the pattern as an
+    // OPTION: usage error on stderr, rc 2, no output, where bash prints the
+    // matching line and exits 0 (measured). Moving a separator that stood
+    // after the pattern to before it is equivalent: both stop grep treating
+    // the pattern as an option.
+    if after_dd {
+        new_argv.push(IrExpr::Str("--".to_string(), StrStyle::DoubleQuoted));
+    }
+    new_argv.push(IrExpr::Str(ere, StrStyle::SingleQuoted));
     for f in argv[pi + 1..].iter() {
         new_argv.push(f.clone());
     }
@@ -1246,6 +1254,25 @@ mod tests {
         let mut stmts = vec![exec_grep(vec![st("-P"), st("-z"), st("x")])];
         assert!(!transform(&mut stmts));
         assert_eq!(argv_of(&stmts), vec!["-P", "-z", "x"]);
+    }
+
+    #[test]
+    fn a_dash_pattern_keeps_the_separator() {
+        // `grep -P -- -x`: without `--` the emitted `grep -E -x` reads the
+        // PATTERN as an option (usage error, rc 2, no output) where bash
+        // prints the matching line. Measured on the anchor shape.
+        let mut stmts = vec![exec_grep(vec![st("-P"), st("--"), st("-x")])];
+        assert!(transform(&mut stmts));
+        assert_eq!(argv_of(&stmts), vec!["-E", "--", "-x"]);
+    }
+
+    #[test]
+    fn a_separator_is_not_invented() {
+        // no `--` in the source → none in the output (a pattern cannot start
+        // with `-` unless the source protected it)
+        let mut stmts = vec![exec_grep(vec![st("-nP"), st("\\d")])];
+        assert!(transform(&mut stmts));
+        assert_eq!(argv_of(&stmts), vec!["-En", "[0-9]"]);
     }
 
     #[test]
