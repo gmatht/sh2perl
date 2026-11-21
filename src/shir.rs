@@ -1578,6 +1578,12 @@ pub fn is_ps_tmp_cleanup(stmt: &IrStmt) -> bool {
     tmps > 0
 }
 
+/// Ext-node tags whose render arm stores `$?` itself. Kept next to
+/// [`ir_stmt_writes_lastexit`] because the two must agree: a tag that writes
+/// the register and is missing here makes the bookkeeping treat the write as
+/// absent and perturb neighbouring stores.
+pub(crate) const STATUS_WRITING_EXT_TAGS: &[&str] = &["FsCommand"];
+
 pub(crate) fn ir_stmt_writes_lastexit(stmt: &IrStmt) -> bool {
     match stmt {
         IrStmt::Exec {
@@ -1620,6 +1626,12 @@ pub(crate) fn ir_stmt_writes_lastexit(stmt: &IrStmt) -> bool {
         | IrStmt::Block(_)
         | IrStmt::Redirect { .. }
         | IrStmt::Pipeline { .. } => true,
+        // A transform-declared node whose arm STORES the status register is
+        // a `$?` writer, exactly like the `exec ...` call it replaced. Without
+        // this, the backward scan cannot see the write: a preceding
+        // statement's store stays "live" and unrelated programs gain a
+        // redundant `__SH_RC.store(0)` (measured: eight renders, pass 12).
+        IrStmt::Expr(IrExpr::Ext(n)) if STATUS_WRITING_EXT_TAGS.contains(&n.tag()) => true,
         // `setVar`-style expression statements (never lastExit writers)
         IrStmt::Expr(IrExpr::Call { func, .. }) => !matches!(
             func.as_str(),
