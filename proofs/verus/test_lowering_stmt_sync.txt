@@ -1,12 +1,18 @@
 # verus-sync-coverage manifest: test_lowering_stmt
-# source sha: test_lowering=b242686e9f48  proof sha: f6da2d4fa48b
+# source sha: test_lowering=b242686e9f48  proof sha: ab8fb5655331
 
 [pins]
 pin pin_branch_status_is_the_body_status -> UNMIRRORED (by design — see VERUS.md §(b).4)
+pin pin_chain_lowered_agrees -> UNMIRRORED (by design — see VERUS.md §(b).4)
+pin pin_chain_short_circuit_reports_the_value_status -> UNMIRRORED (by design — see VERUS.md §(b).4)
 pin pin_clean_run_list_is_blind -> UNMIRRORED (by design — see VERUS.md §(b).4)
 pin pin_dead_status_lowers_the_test -> test nonempty_tests_lower_to_string_ne: MAPPED
+pin pin_dowhile_lowered_agrees -> UNMIRRORED (by design — see VERUS.md §(b).4)
+pin pin_dowhile_runs_the_body_before_the_test -> UNMIRRORED (by design — see VERUS.md §(b).4)
 pin pin_elif_chain_agrees -> UNMIRRORED (by design — see VERUS.md §(b).4)
 pin pin_else_arm_is_unconditional -> UNMIRRORED (by design — see VERUS.md §(b).4)
+pin pin_forinit_lowered_agrees -> UNMIRRORED (by design — see VERUS.md §(b).4)
+pin pin_forinit_no_iteration_reports_zero -> UNMIRRORED (by design — see VERUS.md §(b).4)
 pin pin_guard_is_load_bearing -> test live_status_keeps_the_test: MAPPED
 pin pin_live_status_keeps_the_test -> test live_status_keeps_the_test: MAPPED
 pin pin_no_branch_taken_reports_zero -> UNMIRRORED (by design — see VERUS.md §(b).4)
@@ -22,8 +28,8 @@ guard status liveness scan: PRESENT
 guard cond rewrite site: PRESENT
 
 [counts]
-proof-fns: 23
-pins: 12
+proof-fns: 41
+pins: 18
 # NOTE: proof-fns is a file-shape fact (change detector), NOT the
 # Verus obligation count — the gate asserts N verified separately.
 
@@ -35,10 +41,16 @@ pins: 12
 # source file) and records the per-test PASS/FAIL verdict below.
 # all suites built; per-test verdicts below
 exec pin_branch_status_is_the_body_status: UNMIRRORED (not executed)
+exec pin_chain_lowered_agrees: UNMIRRORED (not executed)
+exec pin_chain_short_circuit_reports_the_value_status: UNMIRRORED (not executed)
 exec pin_clean_run_list_is_blind: UNMIRRORED (not executed)
 exec pin_dead_status_lowers_the_test (nonempty_tests_lower_to_string_ne): PASS
+exec pin_dowhile_lowered_agrees: UNMIRRORED (not executed)
+exec pin_dowhile_runs_the_body_before_the_test: UNMIRRORED (not executed)
 exec pin_elif_chain_agrees: UNMIRRORED (not executed)
 exec pin_else_arm_is_unconditional: UNMIRRORED (not executed)
+exec pin_forinit_lowered_agrees: UNMIRRORED (not executed)
+exec pin_forinit_no_iteration_reports_zero: UNMIRRORED (not executed)
 exec pin_guard_is_load_bearing (live_status_keeps_the_test): PASS
 exec pin_live_status_keeps_the_test (live_status_keeps_the_test): PASS
 exec pin_no_branch_taken_reports_zero: UNMIRRORED (not executed)

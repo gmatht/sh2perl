@@ -49,14 +49,33 @@
 //     the incoming status and then writes 0. Fuel bounds loop
 //     iterations exactly as const_status_cond does (the theorem holds at
 //     every fuel, hence for the unbounded runs the fuel approximates).
-//   - NOT modelled: statement-position `[[ … ]] && cmd` chains (a second
-//     rewrite site: the chain's value IS its status, so it needs the
-//     `is_pure_test_chain` shape rather than branch rules);
-//     `nocasematch` (guard 3) and self-recursion (guard 2), which refuse
-//     lifts and so only shrink the firing set; `DoWhile`/`ForInit` (the
-//     same condition exchange with a test-at-the-tail / init-and-step
-//     wrapper); nested `$?` reads inside conditions (no leaf arm
-//     produces one).
+//   - The other THREE rewrite sites are modelled too, each with its own
+//     bash status rule stated below:
+//       * `DoWhile` (`do { body } while (test)`) — the body runs once
+//         before the first test; the loop reports the last BODY status,
+//         so the test's write is never the loop's;
+//       * `ForInit` (`for (; test ;) { body; step }`) — the loop reports
+//         the last BODY status (bash's for/while rule), not the step's
+//         and not the test's; the step runs between iterations and the
+//         next test sees the step's status;
+//       * statement-position `[[ … ]] && cmd` / `|| cmd` — the chain's
+//         value IS its 0/1 status on BOTH faces: the perl renderer seeds
+//         `$main_exit_code = $CHILD_ERROR = $__sh_ok ? 0 : 1`
+//         (`control_chain_to_perl`, verified by reading that emitter), so
+//         the lowered leaf keeps the status write. That seeding is a
+//         RENDERER hypothesis: the C/estree chain arms render the And/Or
+//         value and branch on it, and this model assumes the same 0/1
+//         seed there — checked for perl only, not re-derived for C here.
+//         The only difference a `$?` reader could see is INSIDE the rhs
+//         (immediately after the leaf), which the transform's
+//         `ir_expr_reads_status` guard excludes and `clean_list(rhs)`
+//         encodes here.
+//   - NOT modelled: `nocasematch` (guard 3) and self-recursion (guard 2),
+//     which refuse lifts and so only shrink the firing set; `For`/`ForIn`
+//     (they carry no test condition to exchange); `until` negation (an
+//     orthogonal flip on both faces); other statement kinds the pass
+//     only recurses into without rewriting a condition of its own; nested
+//     `$?` reads inside conditions (no leaf arm produces one).
 use vstd::prelude::*;
 
 verus! {
@@ -85,10 +104,40 @@ pub enum Cond {
     Other,
 }
 
+pub enum ChainOp {
+    And,
+    Or,
+}
+
 pub enum Stmt {
     While {
         cond: Cond,
         body: Seq<Stmt>,
+    },
+    // `do { body } while (cond)` / `until (cond)`: the body runs once
+    // before the first test. The loop reports the last body status (the
+    // `while` rule the IR's own loop form uses), so the test's status
+    // write is never the loop's.
+    DoWhile {
+        cond: Cond,
+        body: Seq<Stmt>,
+    },
+    // `for (; cond ;) { body; step }` with the init list before it. The
+    // loop reports the last BODY status (bash's `for` rule), not the
+    // step's and not the test's.
+    ForInit {
+        init: Seq<Stmt>,
+        cond: Cond,
+        step: Seq<Stmt>,
+        body: Seq<Stmt>,
+    },
+    // A statement-position `[[ … ]] && cmd` / `|| cmd` chain: the
+    // chain's value IS its 0/1 status (the renderers seed it from the
+    // value), and a short-circuit reports 1 (And) / 0 (Or).
+    Chain {
+        op: ChainOp,
+        cond: Cond,
+        rhs: Seq<Stmt>,
     },
     // `if cond; then … else … fi`. An `elif` is a `Stmt::If` in the else
     // position: when the outer condition is false, bash evaluates the
@@ -125,7 +174,10 @@ pub open spec fn stmt_size(st: Stmt) -> nat
 {
     match st {
         Stmt::While { body, .. } => 1 + list_size(body),
+        Stmt::DoWhile { body, .. } => 1 + list_size(body),
+        Stmt::ForInit { init, step, body, .. } => 1 + list_size(init) + list_size(step) + list_size(body),
         Stmt::If { then_b, els_b, .. } => 1 + list_size(then_b) + list_size(els_b),
+        Stmt::Chain { rhs, .. } => 1 + list_size(rhs),
         Stmt::Run(_) => 1,
     }
 }
@@ -152,7 +204,10 @@ pub open spec fn wf_stmt(st: Stmt) -> bool
 {
     match st {
         Stmt::While { body, .. } => body.len() > 0 && wf_list(body),
+        Stmt::DoWhile { body, .. } => body.len() > 0 && wf_list(body),
+        Stmt::ForInit { init, step, body, .. } => body.len() > 0 && wf_list(init) && wf_list(step) && wf_list(body),
         Stmt::If { then_b, els_b, .. } => then_b.len() > 0 && wf_list(then_b) && wf_list(els_b),
+        Stmt::Chain { rhs, .. } => rhs.len() > 0 && wf_list(rhs),
         Stmt::Run(_) => true,
     }
 }
@@ -185,7 +240,15 @@ pub open spec fn clean_stmt(st: Stmt) -> bool
 {
     match st {
         Stmt::While { body, .. } => clean_list(body),
+        Stmt::DoWhile { body, .. } => clean_list(body),
+        Stmt::ForInit { init, step, body, .. } => clean_list(init) && clean_list(step) && clean_list(body),
         Stmt::If { then_b, els_b, .. } => clean_list(then_b) && clean_list(els_b),
+        // The chain guard: nothing in the chain may READ `$?` (the rhs
+        // runs after the leaf, so a read there would observe the test
+        // call's status write directly). The short-circuit status is the
+        // chain's value on both faces, which is why no further premise is
+        // needed here.
+        Stmt::Chain { rhs, .. } => clean_list(rhs),
         Stmt::Run(c) => clean_cmd(c),
     }
 }
@@ -222,6 +285,30 @@ pub open spec fn rewrite_stmt(st: Stmt) -> Stmt
                 Stmt::While { cond, body: rewrite_list(body) }
             }
         },
+        Stmt::DoWhile { cond, body } => {
+            if clean_list(body) {
+                Stmt::DoWhile { cond: rewrite_cond(cond), body: rewrite_list(body) }
+            } else {
+                Stmt::DoWhile { cond, body: rewrite_list(body) }
+            }
+        },
+        Stmt::ForInit { init, cond, step, body } => {
+            if clean_list(init) && clean_list(step) && clean_list(body) {
+                Stmt::ForInit {
+                    init: rewrite_list(init),
+                    cond: rewrite_cond(cond),
+                    step: rewrite_list(step),
+                    body: rewrite_list(body),
+                }
+            } else {
+                Stmt::ForInit {
+                    init: rewrite_list(init),
+                    cond,
+                    step: rewrite_list(step),
+                    body: rewrite_list(body),
+                }
+            }
+        },
         Stmt::If { cond, then_b, els_b } => {
             let c2 = if clean_list(then_b) && clean_list(els_b) {
                 rewrite_cond(cond)
@@ -229,6 +316,13 @@ pub open spec fn rewrite_stmt(st: Stmt) -> Stmt
                 cond
             };
             Stmt::If { cond: c2, then_b: rewrite_list(then_b), els_b: rewrite_list(els_b) }
+        },
+        Stmt::Chain { op, cond, rhs } => {
+            if clean_list(rhs) {
+                Stmt::Chain { op, cond: rewrite_cond(cond), rhs: rewrite_list(rhs) }
+            } else {
+                Stmt::Chain { op, cond, rhs: rewrite_list(rhs) }
+            }
         },
         Stmt::Run(c) => Stmt::Run(c),
     }
@@ -315,11 +409,135 @@ pub open spec fn exec_while(
     }
 }
 
+// `do { … } while (cond)`: the body runs once before the first test;
+// the loop reports the last body status (never the test's).
+pub open spec fn exec_dowhile(
+    c: Cond,
+    b: Seq<Stmt>,
+    s: int,
+    f: nat,
+) -> (int, Seq<Ev>)
+    decreases f, b,
+{
+    if f == 0 {
+        (0, Seq::empty())
+    } else {
+        let be = exec_list(b, s, (f - 1) as nat);
+        let ce = exec_cond(c, be.0);
+        if decide(c) {
+            let re = exec_dowhile(c, b, ce.0, (f - 1) as nat);
+            (re.0, be.1.add(ce.1).add(re.1))
+        } else {
+            (be.0, be.1.add(ce.1))
+        }
+    }
+}
+
+// `for (; cond ;) { body; step }`: `blast` is the last BODY status (the
+// reported value), `s` is what the next test sees (after the step).
+pub open spec fn exec_fori(
+    c: Cond,
+    b: Seq<Stmt>,
+    stp: Seq<Stmt>,
+    s: int,
+    blast: int,
+    ran: bool,
+    f: nat,
+) -> (int, Seq<Ev>)
+    decreases f, b, stp,
+{
+    if f == 0 {
+        ((if ran {
+            blast
+        } else {
+            0
+        }), Seq::empty())
+    } else {
+        let ce = exec_cond(c, s);
+        if decide(c) {
+            let be = exec_list(b, ce.0, (f - 1) as nat);
+            let se = exec_list(stp, be.0, (f - 1) as nat);
+            let re = exec_fori(c, b, stp, se.0, be.0, true, (f - 1) as nat);
+            (re.0, ce.1.add(be.1).add(se.1).add(re.1))
+        } else {
+            ((if ran {
+                blast
+            } else {
+                0
+            }), ce.1)
+        }
+    }
+}
+
+pub open spec fn exec_forinit(
+    init: Seq<Stmt>,
+    c: Cond,
+    stp: Seq<Stmt>,
+    b: Seq<Stmt>,
+    s: int,
+    f: nat,
+) -> (int, Seq<Ev>)
+    decreases f, init, b, stp,
+{
+    if f == 0 {
+        (0, Seq::empty())
+    } else {
+        let ie = exec_list(init, s, (f - 1) as nat);
+        // blast is the last BODY status; before any body ran it is unused
+        // (`ran` is false), so 0 keeps the loop blind to the init status.
+        let re = exec_fori(c, b, stp, ie.0, 0, false, (f - 1) as nat);
+        (re.0, ie.1.add(re.1))
+    }
+}
+
+// A statement-position `&&`/`||` chain. The renderers seed the status
+// from the chain VALUE (`$main_exit_code = $CHILD_ERROR = ok ? 0 : 1`),
+// so a short-circuit reports 1 (And) / 0 (Or) on BOTH faces — the
+// lowered leaf keeps that status write. The only observable difference
+// would be a `$?` read in the rhs (immediately after the leaf), which
+// `clean_list(rhs)` excludes.
+pub open spec fn exec_chain(
+    op: ChainOp,
+    c: Cond,
+    rhs: Seq<Stmt>,
+    s: int,
+    f: nat,
+) -> (int, Seq<Ev>)
+    decreases f, rhs,
+{
+    if f == 0 {
+        (0, Seq::empty())
+    } else {
+        let ce = exec_cond(c, s);
+        match op {
+            ChainOp::And => {
+                if decide(c) {
+                    let re = exec_list(rhs, ce.0, (f - 1) as nat);
+                    (re.0, ce.1.add(re.1))
+                } else {
+                    (1, ce.1)
+                }
+            },
+            ChainOp::Or => {
+                if decide(c) {
+                    (0, ce.1)
+                } else {
+                    let re = exec_list(rhs, ce.0, (f - 1) as nat);
+                    (re.0, ce.1.add(re.1))
+                }
+            },
+        }
+    }
+}
+
 pub open spec fn exec_stmt(st: Stmt, s: int, f: nat) -> (int, Seq<Ev>)
     decreases f, st,
 {
     match st {
         Stmt::While { cond, body } => exec_while(cond, body, s, s, false, f),
+        Stmt::DoWhile { cond, body } => exec_dowhile(cond, body, s, f),
+        Stmt::ForInit { init, cond, step, body } => exec_forinit(init, cond, step, body, s, f),
+        Stmt::Chain { op, cond, rhs } => exec_chain(op, cond, rhs, s, f),
         // bash: the taken branch's last status is the statement's, and
         // no branch taken reports 0 — not the condition's status.
         Stmt::If { cond, then_b, els_b } => {
@@ -400,6 +618,106 @@ proof fn unfold_while_full(c: Cond, b: Seq<Stmt>, s: int, bl: int, rn: bool, f: 
 {
 }
 
+proof fn unfold_dowhile_full(c: Cond, b: Seq<Stmt>, s: int, f: nat)
+    ensures exec_dowhile(c, b, s, f) == (if f == 0 {
+        (0, Seq::empty())
+    } else {
+        let be = exec_list(b, s, (f - 1) as nat);
+        let ce = exec_cond(c, be.0);
+        if decide(c) {
+            let re = exec_dowhile(c, b, ce.0, (f - 1) as nat);
+            (re.0, be.1.add(ce.1).add(re.1))
+        } else {
+            (be.0, be.1.add(ce.1))
+        }
+    }),
+{
+}
+
+proof fn unfold_fori_full(
+    c: Cond,
+    b: Seq<Stmt>,
+    stp: Seq<Stmt>,
+    s: int,
+    bl: int,
+    rn: bool,
+    f: nat,
+)
+    ensures exec_fori(c, b, stp, s, bl, rn, f) == (if f == 0 {
+        ((if rn {
+            bl
+        } else {
+            0
+        }), Seq::empty())
+    } else {
+        let ce = exec_cond(c, s);
+        if decide(c) {
+            let be = exec_list(b, ce.0, (f - 1) as nat);
+            let se = exec_list(stp, be.0, (f - 1) as nat);
+            let re = exec_fori(c, b, stp, se.0, be.0, true, (f - 1) as nat);
+            (re.0, ce.1.add(be.1).add(se.1).add(re.1))
+        } else {
+            ((if rn {
+                bl
+            } else {
+                0
+            }), ce.1)
+        }
+    }),
+{
+}
+
+proof fn unfold_forinit(
+    init: Seq<Stmt>,
+    c: Cond,
+    stp: Seq<Stmt>,
+    b: Seq<Stmt>,
+    s: int,
+    f: nat,
+)
+    ensures exec_forinit(init, c, stp, b, s, f) == (if f == 0 {
+        (0, Seq::empty())
+    } else {
+        let ie = exec_list(init, s, (f - 1) as nat);
+        let re = exec_fori(c, b, stp, ie.0, 0, false, (f - 1) as nat);
+        (re.0, ie.1.add(re.1))
+    }),
+{
+}
+
+proof fn unfold_chain(
+    op: ChainOp,
+    c: Cond,
+    rhs: Seq<Stmt>,
+    s: int,
+    f: nat,
+)
+    ensures exec_chain(op, c, rhs, s, f) == (if f == 0 {
+        (0, Seq::empty())
+    } else {
+        let ce = exec_cond(c, s);
+        match op {
+            ChainOp::And => {
+                if decide(c) {
+                    let re = exec_list(rhs, ce.0, (f - 1) as nat);
+                    (re.0, ce.1.add(re.1))
+                } else {
+                    (1, ce.1)
+                }
+            },
+            ChainOp::Or => {
+                if decide(c) {
+                    (0, ce.1)
+                } else {
+                    let re = exec_list(rhs, ce.0, (f - 1) as nat);
+                    (re.0, ce.1.add(re.1))
+                }
+            },
+        }
+    }),
+{
+}
+
 // ---- The guard's meaning: a clean, non-empty list is status-blind ----
 
 // Every command writes status except the excluded `$?` read, so a
@@ -461,6 +779,21 @@ proof fn clean_stmt_blind(st: Stmt, s1: int, s2: int, f: nat)
             assert(body.len() > 0);
             clean_while_blind(cond, body, s1, s2, 0, 0, false, f);
         },
+        Stmt::DoWhile { cond, body } => {
+            reveal_with_fuel(wf_stmt, 2);
+            assert(body.len() > 0);
+            dowhile_blind(cond, body, s1, s2, f);
+        },
+        Stmt::ForInit { init, cond, step, body } => {
+            reveal_with_fuel(wf_stmt, 2);
+            assert(body.len() > 0);
+            forinit_blind(init, cond, step, body, s1, s2, f);
+        },
+        Stmt::Chain { op, cond, rhs } => {
+            reveal_with_fuel(wf_stmt, 2);
+            assert(rhs.len() > 0);
+            chain_blind(op, cond, rhs, s1, s2, f);
+        },
     }
 }
 
@@ -494,6 +827,111 @@ proof fn clean_while_blind(
             assert(be1 == be2);
             clean_while_blind(c, b, be1.0, be1.0, be1.0, be1.0, true, (f - 1) as nat);
         }
+    }
+}
+
+proof fn dowhile_blind(c: Cond, b: Seq<Stmt>, s1: int, s2: int, f: nat)
+    requires clean_list(b), wf_list(b), b.len() > 0,
+    ensures exec_dowhile(c, b, s1, f) == exec_dowhile(c, b, s2, f),
+    decreases f, list_size(b),
+{
+    unfold_dowhile_full(c, b, s1, f);
+    unfold_dowhile_full(c, b, s2, f);
+    if f > 0 {
+        clean_list_blind(b, s1, s2, (f - 1) as nat);
+        let be1 = exec_list(b, s1, (f - 1) as nat);
+        let be2 = exec_list(b, s2, (f - 1) as nat);
+        assert(be1 == be2);
+        assert(exec_cond(c, be1.0) == exec_cond(c, be2.0));
+    }
+}
+
+proof fn chain_blind(op: ChainOp, c: Cond, rhs: Seq<Stmt>, s1: int, s2: int, f: nat)
+    requires clean_list(rhs), wf_list(rhs), rhs.len() > 0,
+    ensures exec_chain(op, c, rhs, s1, f) == exec_chain(op, c, rhs, s2, f),
+    decreases f, list_size(rhs),
+{
+    unfold_chain(op, c, rhs, s1, f);
+    unfold_chain(op, c, rhs, s2, f);
+    let ce1 = exec_cond(c, s1);
+    let ce2 = exec_cond(c, s2);
+    assert(ce1.1 == ce2.1);
+    if f > 0 {
+        clean_list_blind(rhs, ce1.0, ce2.0, (f - 1) as nat);
+    }
+}
+
+proof fn fori_blind(
+    c: Cond,
+    b: Seq<Stmt>,
+    stp: Seq<Stmt>,
+    s1: int,
+    s2: int,
+    bl: int,
+    rn: bool,
+    f: nat,
+)
+    requires
+        clean_list(b),
+        wf_list(b),
+        b.len() > 0,
+        clean_list(stp),
+        wf_list(stp),
+    ensures exec_fori(c, b, stp, s1, bl, rn, f) == exec_fori(c, b, stp, s2, bl, rn, f),
+    decreases f, list_size(b), list_size(stp),
+{
+    unfold_fori_full(c, b, stp, s1, bl, rn, f);
+    unfold_fori_full(c, b, stp, s2, bl, rn, f);
+    if f > 0 {
+        let ce1 = exec_cond(c, s1);
+        let ce2 = exec_cond(c, s2);
+        assert(ce1.1 == ce2.1);
+        if decide(c) {
+            clean_list_blind(b, ce1.0, ce2.0, (f - 1) as nat);
+            let be1 = exec_list(b, ce1.0, (f - 1) as nat);
+            let be2 = exec_list(b, ce2.0, (f - 1) as nat);
+            assert(be1 == be2);
+            if stp.len() > 0 {
+                clean_list_blind(stp, be1.0, be2.0, (f - 1) as nat);
+            }
+            let se1 = exec_list(stp, be1.0, (f - 1) as nat);
+            let se2 = exec_list(stp, be2.0, (f - 1) as nat);
+            assert(se1 == se2);
+            fori_blind(c, b, stp, se1.0, se2.0, be1.0, true, (f - 1) as nat);
+        }
+    }
+}
+
+proof fn forinit_blind(
+    init: Seq<Stmt>,
+    c: Cond,
+    stp: Seq<Stmt>,
+    b: Seq<Stmt>,
+    s1: int,
+    s2: int,
+    f: nat,
+)
+    requires
+        clean_list(init),
+        wf_list(init),
+        clean_list(stp),
+        wf_list(stp),
+        clean_list(b),
+        wf_list(b),
+        b.len() > 0,
+    ensures exec_forinit(init, c, stp, b, s1, f) == exec_forinit(init, c, stp, b, s2, f),
+    decreases f, list_size(init), list_size(b), list_size(stp),
+{
+    unfold_forinit(init, c, stp, b, s1, f);
+    unfold_forinit(init, c, stp, b, s2, f);
+    if f > 0 {
+        if init.len() > 0 {
+            clean_list_blind(init, s1, s2, (f - 1) as nat);
+        }
+        let ie1 = exec_list(init, s1, (f - 1) as nat);
+        let ie2 = exec_list(init, s2, (f - 1) as nat);
+        assert(ie1.1 == ie2.1);
+        fori_blind(c, b, stp, ie1.0, ie2.0, 0, false, (f - 1) as nat);
     }
 }
 
@@ -537,6 +975,152 @@ proof fn while_sound_gen(
     }
 }
 
+// `do { body } while (test)` → the same loop on the typed boolean. The
+// entries may differ (the test writes 0/1 on the source face and
+// nothing on the lowered one), which is why the statement is generalised
+// over both entry statuses: the body is clean, so it is blind to them.
+proof fn dowhile_sound_any(c: Cond, b: Seq<Stmt>, s1: int, s2: int, f: nat)
+    requires clean_list(b), wf_list(b), b.len() > 0,
+    ensures exec_dowhile(rewrite_cond(c), rewrite_list(b), s1, f) == exec_dowhile(c, b, s2, f),
+    decreases f, list_size(b),
+{
+    unfold_dowhile_full(rewrite_cond(c), rewrite_list(b), s1, f);
+    unfold_dowhile_full(c, b, s2, f);
+    if f > 0 {
+        exec_list_sound(b, s1, (f - 1) as nat);
+        clean_list_blind(b, s1, s2, (f - 1) as nat);
+        let be1 = exec_list(rewrite_list(b), s1, (f - 1) as nat);
+        let be2 = exec_list(b, s2, (f - 1) as nat);
+        assert(be1 == be2);
+        assert(decide(rewrite_cond(c)) == decide(c));
+        if decide(c) {
+            let ce1 = exec_cond(rewrite_cond(c), be1.0);
+            let ce2 = exec_cond(c, be2.0);
+            dowhile_sound_any(c, b, ce1.0, ce2.0, (f - 1) as nat);
+        }
+    }
+}
+
+// `for (; test ;) { body; step }` → typed test: the loop reports the
+// last BODY status (bash's `for`/`while` rule), never the test's and
+// never the step's, so the differing test-status writes are invisible
+// once the body and the step are clean (blind).
+proof fn fori_sound_any(
+    c: Cond,
+    b: Seq<Stmt>,
+    stp: Seq<Stmt>,
+    s1: int,
+    s2: int,
+    bl: int,
+    rn: bool,
+    f: nat,
+)
+    requires
+        clean_list(b),
+        wf_list(b),
+        b.len() > 0,
+        clean_list(stp),
+        wf_list(stp),
+    ensures exec_fori(rewrite_cond(c), rewrite_list(b), rewrite_list(stp), s1, bl, rn, f) == exec_fori(
+        c,
+        b,
+        stp,
+        s2,
+        bl,
+        rn,
+        f,
+    ),
+    decreases f, list_size(b), list_size(stp),
+{
+    unfold_fori_full(rewrite_cond(c), rewrite_list(b), rewrite_list(stp), s1, bl, rn, f);
+    unfold_fori_full(c, b, stp, s2, bl, rn, f);
+    if f > 0 {
+        let ce1 = exec_cond(rewrite_cond(c), s1);
+        let ce2 = exec_cond(c, s2);
+        assert(decide(rewrite_cond(c)) == decide(c));
+        if decide(c) {
+            exec_list_sound(b, ce1.0, (f - 1) as nat);
+            clean_list_blind(b, ce1.0, ce2.0, (f - 1) as nat);
+            let be1 = exec_list(rewrite_list(b), ce1.0, (f - 1) as nat);
+            let be2 = exec_list(b, ce2.0, (f - 1) as nat);
+            assert(be1 == be2);
+            exec_list_sound(stp, be1.0, (f - 1) as nat);
+            if stp.len() > 0 {
+                clean_list_blind(stp, be1.0, be2.0, (f - 1) as nat);
+            }
+            let se1 = exec_list(rewrite_list(stp), be1.0, (f - 1) as nat);
+            let se2 = exec_list(stp, be2.0, (f - 1) as nat);
+            assert(se1 == se2);
+            fori_sound_any(c, b, stp, se1.0, se2.0, be1.0, true, (f - 1) as nat);
+        }
+    }
+}
+
+proof fn forinit_sound_any(
+    init: Seq<Stmt>,
+    c: Cond,
+    stp: Seq<Stmt>,
+    b: Seq<Stmt>,
+    s1: int,
+    s2: int,
+    f: nat,
+)
+    requires
+        clean_list(init),
+        wf_list(init),
+        clean_list(stp),
+        wf_list(stp),
+        clean_list(b),
+        wf_list(b),
+        b.len() > 0,
+    ensures exec_forinit(rewrite_list(init), rewrite_cond(c), rewrite_list(stp), rewrite_list(b), s1, f)
+        == exec_forinit(init, c, stp, b, s2, f),
+    decreases f, list_size(init), list_size(b), list_size(stp),
+{
+    unfold_forinit(rewrite_list(init), rewrite_cond(c), rewrite_list(stp), rewrite_list(b), s1, f);
+    unfold_forinit(init, c, stp, b, s2, f);
+    if f > 0 {
+        exec_list_sound(init, s1, (f - 1) as nat);
+        if init.len() > 0 {
+            clean_list_blind(init, s1, s2, (f - 1) as nat);
+        }
+        let ie1 = exec_list(rewrite_list(init), s1, (f - 1) as nat);
+        let ie2 = exec_list(init, s2, (f - 1) as nat);
+        assert(ie1.1 == ie2.1);
+        fori_sound_any(c, b, stp, ie1.0, ie2.0, 0, false, (f - 1) as nat);
+    }
+}
+
+// Statement-position `&&`/`||`: both faces report the short-circuit
+// status (1 for a failed And lead, 0 for a succeeded Or lead) and the
+// rhs runs exactly when the value says. The only status visible to a
+// `$?` reader would be the lead's write inside the rhs, excluded by
+// `clean_list(rhs)` — the transform's `ir_expr_reads_status` guard.
+proof fn chain_sound(op: ChainOp, c: Cond, rhs: Seq<Stmt>, s: int, f: nat)
+    requires clean_list(rhs), wf_list(rhs), rhs.len() > 0,
+    ensures exec_chain(op, rewrite_cond(c), rewrite_list(rhs), s, f) == exec_chain(
+        op,
+        c,
+        rhs,
+        s,
+        f,
+    ),
+    decreases f, list_size(rhs),
+{
+    unfold_chain(op, rewrite_cond(c), rewrite_list(rhs), s, f);
+    unfold_chain(op, c, rhs, s, f);
+    if f > 0 {
+        let ce1 = exec_cond(rewrite_cond(c), s);
+        let ce2 = exec_cond(c, s);
+        assert(decide(rewrite_cond(c)) == decide(c));
+        assert(ce1.1 == ce2.1);
+        if (op == ChainOp::And && decide(c)) || (op == ChainOp::Or && !decide(c)) {
+            exec_list_sound(rhs, ce1.0, (f - 1) as nat);
+            clean_list_blind(rhs, ce1.0, ce2.0, (f - 1) as nat);
+        }
+    }
+}
+
 proof fn exec_stmt_sound(st: Stmt, s: int, f: nat)
     requires clean_stmt(st), wf_stmt(st),
     ensures exec_stmt(rewrite_stmt(st), s, f) == exec_stmt(st, s, f),
@@ -551,6 +1135,36 @@ proof fn exec_stmt_sound(st: Stmt, s: int, f: nat)
                 body: rewrite_list(body),
             });
             while_sound_gen(cond, body, s, s, false, f);
+        },
+        Stmt::DoWhile { cond, body } => {
+            assert(clean_list(body));
+            reveal_with_fuel(rewrite_stmt, 2);
+            assert(rewrite_stmt(st) == Stmt::DoWhile {
+                cond: rewrite_cond(cond),
+                body: rewrite_list(body),
+            });
+            dowhile_sound_any(cond, body, s, s, f);
+        },
+        Stmt::ForInit { init, cond, step, body } => {
+            assert(clean_list(init) && clean_list(step) && clean_list(body));
+            reveal_with_fuel(rewrite_stmt, 2);
+            assert(rewrite_stmt(st) == Stmt::ForInit {
+                init: rewrite_list(init),
+                cond: rewrite_cond(cond),
+                step: rewrite_list(step),
+                body: rewrite_list(body),
+            });
+            forinit_sound_any(init, cond, step, body, s, s, f);
+        },
+        Stmt::Chain { op, cond, rhs } => {
+            assert(clean_list(rhs));
+            reveal_with_fuel(rewrite_stmt, 2);
+            assert(rewrite_stmt(st) == Stmt::Chain {
+                op,
+                cond: rewrite_cond(cond),
+                rhs: rewrite_list(rhs),
+            });
+            chain_sound(op, cond, rhs, s, f);
         },
         // Branch soundness: Test(t) becomes Bool(t) (the value theorem),
         // and the arms are clean (the guard), so the taken branch
@@ -822,6 +1436,154 @@ proof fn pin_elif_chain_agrees()
 {
     reveal_with_fuel(exec_stmt, 10);
     reveal_with_fuel(exec_list, 10);
+}
+
+// `do { body } while (test)`: the body runs once, then the (false)
+// test ends the loop, and the loop reports the BODY status.
+proof fn pin_dowhile_runs_the_body_before_the_test()
+    ensures exec_stmt(Stmt::DoWhile {
+        cond: Cond::Test(false),
+        body: seq![Stmt::Run(Cmd::Run(1))],
+    }, 5, 4) == (0, seq![Ev::Print(1)]),
+{
+    reveal_with_fuel(exec_stmt, 8);
+    reveal_with_fuel(exec_dowhile, 8);
+    reveal_with_fuel(exec_list, 8);
+}
+
+// The do-while rewrite agrees on the same program.
+proof fn pin_dowhile_lowered_agrees()
+    ensures exec_stmt(Stmt::DoWhile {
+        cond: Cond::Test(false),
+        body: seq![Stmt::Run(Cmd::Run(1))],
+    }, 5, 4) == exec_stmt(Stmt::DoWhile {
+        cond: Cond::Bool(false),
+        body: seq![Stmt::Run(Cmd::Run(1))],
+    }, 5, 4),
+{
+    assert(clean_list(seq![Stmt::Run(Cmd::Run(1))])) by {
+        reveal_with_fuel(clean_list, 4);
+    };
+    assert(wf_list(seq![Stmt::Run(Cmd::Run(1))])) by {
+        reveal_with_fuel(wf_list, 4);
+    };
+    dowhile_sound_any(Cond::Test(false), seq![Stmt::Run(Cmd::Run(1))], 5, 5, 4);
+}
+
+// A `for (; test ;)` loop that never iterates reports 0 (bash's rule).
+proof fn pin_forinit_no_iteration_reports_zero()
+    ensures exec_stmt(Stmt::ForInit {
+        init: Seq::empty(),
+        cond: Cond::Test(false),
+        step: Seq::empty(),
+        body: seq![Stmt::Run(Cmd::Run(1))],
+    }, 9, 4) == (0, Seq::empty()),
+{
+    reveal_with_fuel(exec_stmt, 8);
+    reveal_with_fuel(exec_forinit, 8);
+    reveal_with_fuel(exec_fori, 8);
+}
+
+// `for (; test ;) { body; step }` agrees after the rewrite; the loop
+// reports the body status even though the step runs last.
+proof fn pin_forinit_lowered_agrees()
+    ensures exec_stmt(Stmt::ForInit {
+        init: seq![Stmt::Run(Cmd::Run(3))],
+        cond: Cond::Test(false),
+        step: seq![Stmt::Run(Cmd::Fail(4))],
+        body: seq![Stmt::Run(Cmd::Run(1))],
+    }, 5, 3) == exec_stmt(Stmt::ForInit {
+        init: seq![Stmt::Run(Cmd::Run(3))],
+        cond: Cond::Bool(false),
+        step: seq![Stmt::Run(Cmd::Fail(4))],
+        body: seq![Stmt::Run(Cmd::Run(1))],
+    }, 5, 3),
+{
+    assert(clean_list(seq![Stmt::Run(Cmd::Run(3))])) by {
+        reveal_with_fuel(clean_list, 4);
+    };
+    assert(wf_list(seq![Stmt::Run(Cmd::Run(3))])) by {
+        reveal_with_fuel(wf_list, 4);
+    };
+    assert(clean_list(seq![Stmt::Run(Cmd::Fail(4))])) by {
+        reveal_with_fuel(clean_list, 4);
+    };
+    assert(wf_list(seq![Stmt::Run(Cmd::Fail(4))])) by {
+        reveal_with_fuel(wf_list, 4);
+    };
+    assert(clean_list(seq![Stmt::Run(Cmd::Run(1))])) by {
+        reveal_with_fuel(clean_list, 4);
+    };
+    assert(wf_list(seq![Stmt::Run(Cmd::Run(1))])) by {
+        reveal_with_fuel(wf_list, 4);
+    };
+    forinit_sound_any(
+        seq![Stmt::Run(Cmd::Run(3))],
+        Cond::Test(false),
+        seq![Stmt::Run(Cmd::Fail(4))],
+        seq![Stmt::Run(Cmd::Run(1))],
+        5,
+        5,
+        3,
+    );
+    reveal_with_fuel(rewrite_stmt, 4);
+    reveal_with_fuel(exec_stmt, 4);
+}
+
+// `[[ false ]] && cmd` short-circuits and reports 1 — the value status,
+// NOT the incoming status.
+proof fn pin_chain_short_circuit_reports_the_value_status()
+    ensures exec_stmt(Stmt::Chain {
+        op: ChainOp::And,
+        cond: Cond::Test(false),
+        rhs: seq![Stmt::Run(Cmd::Run(1))],
+    }, 0, 3) == (1, Seq::empty()),
+{
+    reveal_with_fuel(exec_stmt, 6);
+    reveal_with_fuel(exec_chain, 6);
+}
+
+// A taken `&&` runs its rhs and reports the rhs status; a false `||`
+// runs its rhs too. Both faces of the rewrite agree on the trace.
+proof fn pin_chain_lowered_agrees()
+    ensures
+        exec_stmt(Stmt::Chain {
+            op: ChainOp::And,
+            cond: Cond::Test(true),
+            rhs: seq![Stmt::Run(Cmd::Fail(2))],
+        }, 5, 3) == exec_stmt(Stmt::Chain {
+            op: ChainOp::And,
+            cond: Cond::Bool(true),
+            rhs: seq![Stmt::Run(Cmd::Fail(2))],
+        }, 5, 3),
+        exec_stmt(Stmt::Chain {
+            op: ChainOp::Or,
+            cond: Cond::Test(false),
+            rhs: seq![Stmt::Run(Cmd::Run(2))],
+        }, 5, 3) == exec_stmt(Stmt::Chain {
+            op: ChainOp::Or,
+            cond: Cond::Bool(false),
+            rhs: seq![Stmt::Run(Cmd::Run(2))],
+        }, 5, 3),
+{
+    assert(clean_list(seq![Stmt::Run(Cmd::Fail(2))])) by {
+        reveal_with_fuel(clean_list, 4);
+    };
+    assert(wf_list(seq![Stmt::Run(Cmd::Fail(2))])) by {
+        reveal_with_fuel(wf_list, 4);
+    };
+    chain_sound(ChainOp::And, Cond::Test(true), seq![Stmt::Run(Cmd::Fail(2))], 5, 3);
+    reveal_with_fuel(rewrite_stmt, 4);
+    reveal_with_fuel(exec_stmt, 4);
+    assert(clean_list(seq![Stmt::Run(Cmd::Run(2))])) by {
+        reveal_with_fuel(clean_list, 4);
+    };
+    assert(wf_list(seq![Stmt::Run(Cmd::Run(2))])) by {
+        reveal_with_fuel(wf_list, 4);
+    };
+    chain_sound(ChainOp::Or, Cond::Test(false), seq![Stmt::Run(Cmd::Run(2))], 5, 3);
+    reveal_with_fuel(rewrite_stmt, 4);
+    reveal_with_fuel(exec_stmt, 4);
 }
 
 fn main() {}
