@@ -165,7 +165,11 @@ pub fn char_translate(node: &CharTranslate, ctx: &ExprRenderCtx) -> Option<Strin
             }
         }
         Backend::Go => Some(format!("/* TODO: CharTranslate Go */")),
-        Backend::Rust => Some(format!("/* TODO: CharTranslate Rust */")),
+        // Rust renders CharTranslate in rust_backend's own Ext arm (the
+        // `to_uppercase`-vs-byte-map distinction lives there). A TODO
+        // COMMENT here would land inside a Rust program as an empty
+        // expression, which is not a refusal — it is a silently wrong value.
+        Backend::Rust => None,
         Backend::C => None,
         Backend::Java => {
             // The three tr modes map to one shared helper each (translate
@@ -219,7 +223,9 @@ pub fn reg_sub(node: &RegSub, ctx: &ExprRenderCtx) -> Option<String> {
             Some(format!("{}.replace(/{}/{}, \"{}\")", text, node.pattern, flag, node.replacement.replace('\"', "\\\"")))
         }
         Backend::Go => Some(format!("/* TODO: RegSub Go */")),
-        Backend::Rust => Some(format!("/* TODO: RegSub Rust */")),
+        // No Rust arm: `std` has no regex engine (see planner's `rs`
+        // manifest). None keeps the command; a comment would not.
+        Backend::Rust => None,
         Backend::C => None,
         Backend::Python => {
             // `sed 's/x/y/'` replaces the LEFTMOST occurrence; the `global`
@@ -501,7 +507,9 @@ pub fn take_lines(node: &TakeLines, ctx: &ExprRenderCtx) -> Option<String> {
             }
         }
         Backend::Go => Some(format!("/* TODO: TakeLines Go */")),
-        Backend::Rust => Some(format!("/* TODO: TakeLines Rust */")),
+        // Rust renders TakeLines in rust_backend's own Ext arm; None here
+        // keeps a `TODO` comment out of a compiled program.
+        Backend::Rust => None,
         Backend::C => None,
         Backend::Python => {
             // Byte mode = a slice of the in-memory text; line mode splits on
@@ -570,7 +578,9 @@ pub fn substr_extract(node: &SubStrExtract, ctx: &ExprRenderCtx) -> Option<Strin
             }
         }
         Backend::Go => Some(format!("/* TODO: SubStrExtract Go */")),
-        Backend::Rust => Some(format!("/* TODO: SubStrExtract Rust */")),
+        // Rust renders SubStrExtract in rust_backend's own Ext arm; None here
+        // keeps a `TODO` comment out of a compiled program.
+        Backend::Rust => None,
         Backend::C => None,
         Backend::Python => {
             // python slicing: t[o:o+n]; an absent length is t[o:]

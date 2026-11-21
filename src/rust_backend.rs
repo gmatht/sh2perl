@@ -24729,6 +24729,49 @@ mod tests {
         }
     }
 
+    /// The two regex nodes have NO producer in this tree and no byte-exact
+    /// `std` rendering: `std` has no regex engine, and a hand-rolled matcher
+    /// would be exact on a subset while silently wrong on the rest (POSIX
+    /// BRE/ERE includes backreferences, greedy quantifiers and classes). So
+    /// the tag stays refused and the COMMAND keeps its exact meaning. The
+    /// witness compiles the render and compares stdout, STDERR and status
+    /// with bash, and rejects a `TODO` marker — the old shared handler's
+    /// Rust arm returned a COMMENT for these tags, which in a program is not
+    /// a refusal, it is a silently empty expression.
+    #[test]
+    fn refused_regex_nodes_keep_the_command() {
+        for (name, src) in [
+            ("sed-sub", "echo aaa | sed 's/a/b/'\n"),
+            ("sed-sub-global", "echo aaa | sed 's/a/b/g'\n"),
+            ("sed-on-file", "printf 'a:b\\n' > /tmp/sh2_reg_probe\nsed 's/:/,/' /tmp/sh2_reg_probe\n"),
+            ("grep-ere", "echo abc | grep -E 'a(b|c)+'\n"),
+            ("grep-only-matching", "echo abc | grep -o 'b'\n"),
+        ] {
+            let prog = render_rs(src);
+            assert!(
+                prog.contains("__sh_spawn("),
+                "{name}: a refused regex shape was folded:\n{prog}"
+            );
+            assert!(
+                !prog.contains("/* TODO"),
+                "{name}: a TODO marker reached the program:\n{prog}"
+            );
+            let (rs_out, rs_err, rs_rc) = compile_and_run_full(name, &prog);
+            let (sh_out, sh_err, sh_rc) = run_bash_full(src);
+            assert_eq!(
+                String::from_utf8_lossy(&rs_out),
+                String::from_utf8_lossy(&sh_out),
+                "{name}: stdout differs from bash"
+            );
+            assert_eq!(
+                String::from_utf8_lossy(&rs_err),
+                String::from_utf8_lossy(&sh_err),
+                "{name}: stderr differs from bash"
+            );
+            assert_eq!(rs_rc, sh_rc, "{name}: status differs from bash");
+        }
+    }
+
     /// The argv forms the old fold MIS-READ, each with the same witness as a
     /// node: the render keeps the command, and its stdout, STDERR and exit
     /// status are bash's byte-for-byte. `head -1 a b` used to take the LAST
