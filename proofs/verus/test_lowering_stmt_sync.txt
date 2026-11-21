@@ -1,9 +1,10 @@
 # verus-sync-coverage manifest: test_lowering_stmt
-# source sha: test_lowering=b242686e9f48  proof sha: ab8fb5655331
+# source sha: test_lowering=b242686e9f48  proof sha: de31ba0e647c
 
 [pins]
 pin pin_branch_status_is_the_body_status -> UNMIRRORED (by design — see VERUS.md §(b).4)
 pin pin_chain_lowered_agrees -> UNMIRRORED (by design — see VERUS.md §(b).4)
+pin pin_chain_seed_status_both_faces -> UNMIRRORED (by design — see VERUS.md §(b).4)
 pin pin_chain_short_circuit_reports_the_value_status -> UNMIRRORED (by design — see VERUS.md §(b).4)
 pin pin_clean_run_list_is_blind -> UNMIRRORED (by design — see VERUS.md §(b).4)
 pin pin_dead_status_lowers_the_test -> test nonempty_tests_lower_to_string_ne: MAPPED
@@ -26,10 +27,13 @@ guard dead-status cond_status_observable: PRESENT
 guard dead-status refusal: PRESENT
 guard status liveness scan: PRESENT
 guard cond rewrite site: PRESENT
+guard chain seed perl: PRESENT
+guard chain seed C: PRESENT
+guard chain seed estree: PRESENT
 
 [counts]
-proof-fns: 41
-pins: 18
+proof-fns: 42
+pins: 19
 # NOTE: proof-fns is a file-shape fact (change detector), NOT the
 # Verus obligation count — the gate asserts N verified separately.
 
@@ -42,6 +46,7 @@ pins: 18
 # all suites built; per-test verdicts below
 exec pin_branch_status_is_the_body_status: UNMIRRORED (not executed)
 exec pin_chain_lowered_agrees: UNMIRRORED (not executed)
+exec pin_chain_seed_status_both_faces: UNMIRRORED (not executed)
 exec pin_chain_short_circuit_reports_the_value_status: UNMIRRORED (not executed)
 exec pin_clean_run_list_is_blind: UNMIRRORED (not executed)
 exec pin_dead_status_lowers_the_test (nonempty_tests_lower_to_string_ne): PASS

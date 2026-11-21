@@ -59,13 +59,21 @@
 //         and not the test's; the step runs between iterations and the
 //         next test sees the step's status;
 //       * statement-position `[[ … ]] && cmd` / `|| cmd` — the chain's
-//         value IS its 0/1 status on BOTH faces: the perl renderer seeds
-//         `$main_exit_code = $CHILD_ERROR = $__sh_ok ? 0 : 1`
-//         (`control_chain_to_perl`, verified by reading that emitter), so
-//         the lowered leaf keeps the status write. That seeding is a
-//         RENDERER hypothesis: the C/estree chain arms render the And/Or
-//         value and branch on it, and this model assumes the same 0/1
-//         seed there — checked for perl only, not re-derived for C here.
+//         value IS its 0/1 status on BOTH faces, in all three renderers,
+//         each read from its emitter and each held by a gate guard in
+//         `harness/verus-sync-coverage.sh` (so a change to any emitter
+//         fails the gate):
+//           perl: `control_chain_to_perl` seeds
+//             `$main_exit_code = $CHILD_ERROR = $__sh_ok ? 0 : 1`;
+//           C: the statement-position And/Or arm (`c_backend.rs`, the
+//             `chain_lhs` block) emits `{ if ((l)) { _sh_rc = 0; … } else
+//             { _sh_rc = 1; } }` (Or swaps which arm runs the rhs);
+//           estree: every native test records
+//             `(sh2._g = t, sh2.lastExit = sh2._g ? 0 : 1, sh2._g)`
+//             (`shir::native_test_statused`), and the `&&`/`||` links
+//             branch on `lastExit` and only re-record the same value
+//             (`is_status_record_seq`), so the short-circuit keeps the
+//             lead's 0/1.
 //         The only difference a `$?` reader could see is INSIDE the rhs
 //         (immediately after the leaf), which the transform's
 //         `ir_expr_reads_status` guard excludes and `clean_list(rhs)`
@@ -1584,6 +1592,27 @@ proof fn pin_chain_lowered_agrees()
     chain_sound(ChainOp::Or, Cond::Test(false), seq![Stmt::Run(Cmd::Run(2))], 5, 3);
     reveal_with_fuel(rewrite_stmt, 4);
     reveal_with_fuel(exec_stmt, 4);
+}
+
+// Both faces of the seed: a satisfied `||` lead reports 0 without
+// running the rhs, and a satisfied `&&` lead runs the rhs and reports
+// the rhs status (the 0 seed is overwritten by the rhs). These are the
+// values the three emitters' status writes produce (see the header).
+proof fn pin_chain_seed_status_both_faces()
+    ensures
+        exec_stmt(Stmt::Chain {
+            op: ChainOp::Or,
+            cond: Cond::Test(true),
+            rhs: seq![Stmt::Run(Cmd::Fail(3))],
+        }, 7, 3) == (0, Seq::empty()),
+        exec_stmt(Stmt::Chain {
+            op: ChainOp::And,
+            cond: Cond::Test(true),
+            rhs: seq![Stmt::Run(Cmd::Fail(3))],
+        }, 7, 3) == (1, seq![Ev::Print(3)]),
+{
+    reveal_with_fuel(exec_stmt, 8);
+    reveal_with_fuel(exec_chain, 8);
 }
 
 fn main() {}
