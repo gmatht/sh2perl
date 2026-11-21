@@ -88,6 +88,18 @@ fn build_cat_replacement(args: &[IrExpr]) -> Option<IrStmt> {
     if files.is_empty() {
         return None; // bare `cat` reads stdin: keep exec
     }
+    // A plain `cat FILE` is a BYTE copy, and the by-line loop below is exact
+    // only for a newline-terminated valid-UTF-8 file: `lines()` drops the
+    // final newline (which the loop's output puts back) and silently drops
+    // lines it cannot decode, so a file that does not end in `\n` gains one
+    // and a binary file loses bytes. The Rust target therefore refuses the
+    // PLAIN form and keeps the command — its backend's `cat` statement arm
+    // reads `std::fs::read` bytes straight into the byte sink, which is
+    // bash's output for every input. `cat -n` still lowers: the numbering IS
+    // the transformation, and it has its own witnesses.
+    if !numbered && matches!(crate::transforms::target().as_deref(), Some("rs" | "rust")) {
+        return None;
+    }
 
     let seq = SEQ.fetch_add(1, Ordering::Relaxed) + 1;
     let line_var = format!("__cat_line{seq}");

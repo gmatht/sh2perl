@@ -7813,9 +7813,31 @@ while __sh_path.len() > 1 && __sh_path.ends_with('/') {{ __sh_path = &__sh_path[
         Some(code)
     }
 
+    /// Whether GNU `cat` prints this path RAW in its diagnostic: coreutils'
+    /// quotearg leaves a name alone only when it cannot trigger quoting, so
+    /// the arm accepts the conservative `[A-Za-z0-9/._-+:,@=~]` set.
+    fn cat_diag_plain(s: &str) -> bool {
+        !s.is_empty()
+            && s.chars()
+                .all(|c| c.is_ascii_alphanumeric() || "/._-+:,@=~".contains(c))
+    }
+
     fn native_cat_stmt(&mut self, words: &[&IrExpr]) -> Option<String> {
         if words.is_empty() || !Self::fs_flags_ok("cat", words) {
             return None; // no operand: `cat` copies stdin
+        }
+        // `cat`'s diagnostic is `cat: PATH: <strerror>` with the path
+        // QUOTED when coreutils' quotearg would quote it (an empty name,
+        // whitespace, a quote, a control byte…). The help arm below spells
+        // the UNQUOTED form only, and a runtime operand cannot be checked at
+        // render time — so both the byte arm and the quoting rule are pinned
+        // to a STATIC path whose characters cannot trigger quoting. A `-`
+        // operand (a stdin read between the files) is refused here too.
+        if !words.iter().all(|w| match w {
+            IrExpr::Str(s, _) => s != "-" && Self::cat_diag_plain(s),
+            _ => false,
+        }) {
+            return None;
         }
         let argv = self.fs_argv(words)?;
         self.add_helper("cat_stmt");
@@ -15997,7 +16019,21 @@ fn helper_source(h: &str) -> &'static str {
     for p in argv {
         match std::fs::read(p) {
             Ok(d) => __sh_sink(&d),
-            Err(e) => { eprintln!("cat: {}: {}", p, e); rc = 1; }
+            Err(e) => {
+                // bash's diagnostic is `cat: PATH: <strerror>`, not the
+                // io::Error Display (`... (os error 2)`). The three kinds a
+                // script can meet on a static path are named here; anything
+                // else falls back to the OS string and is not claimed to be
+                // bash's text (same rule as the TextFilter arm).
+                let m = match e.kind() {
+                    std::io::ErrorKind::NotFound => "No such file or directory".to_string(),
+                    std::io::ErrorKind::PermissionDenied => "Permission denied".to_string(),
+                    std::io::ErrorKind::IsADirectory => "Is a directory".to_string(),
+                    _ => format!("{}", e),
+                };
+                eprintln!("cat: {}: {}", p, m);
+                rc = 1;
+            }
         }
     }
     rc
@@ -24763,6 +24799,114 @@ mod tests {
                 String::from_utf8_lossy(&sh_out),
                 "{name}: stdout differs from bash"
             );
+            assert_eq!(
+                String::from_utf8_lossy(&rs_err),
+                String::from_utf8_lossy(&sh_err),
+                "{name}: stderr differs from bash"
+            );
+            assert_eq!(rs_rc, sh_rc, "{name}: status differs from bash");
+        }
+    }
+
+    /// `cat FILE` is a BYTE copy. The Rust statement arm reads the operands
+    /// with `std::fs::read` into the byte sink, so there is no line splitting,
+    /// no re-added final newline and no UTF-8 validation — and its diagnostic
+    /// is bash's `cat: PATH: <strerror>`, not the `io::Error` Display text.
+    ///
+    /// Every case runs the compiled program against bash on the same absolute
+    /// paths and compares stdout, STDERR and status: a newline-terminated
+    /// file, one whose last line has no `\n`, an empty file, binary bytes,
+    /// several operands, a missing operand (alone and followed by a good
+    /// one), a directory, an unreadable file and the empty filename.
+    ///
+    /// The two shapes the arm does not spell keep the command, and the
+    /// witness proves the spawn survives: a bare `cat` (stdin copy) and
+    /// `cat -` (a stdin read BETWEEN the operands).
+    #[cfg(unix)]
+    #[test]
+    fn cat_statement_copies_bytes_like_bash() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = std::env::temp_dir().join(format!("sh2_cat_stmt_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(dir.join("sub")).expect("fixture dir");
+        let write = |n: &str, b: &[u8]| std::fs::write(dir.join(n), b).expect("fixture write");
+        write("nl.txt", b"one\ntwo\n");
+        write("nonl.txt", b"one\ntwo");
+        write("empty.txt", b"");
+        write("bin.dat", &[0xff, 0xfe, 0x00, 0x41, 0x0a, 0x80]);
+        write("locked.txt", b"secret\n");
+        std::fs::set_permissions(dir.join("locked.txt"), std::fs::Permissions::from_mode(0o000))
+            .expect("fixture chmod");
+        let p = |n: &str| dir.join(n).to_string_lossy().into_owned();
+
+        let cases = [
+            ("cat-nl", format!("cat '{}'\n", p("nl.txt"))),
+            ("cat-no-final-newline", format!("cat '{}'\n", p("nonl.txt"))),
+            ("cat-empty-file", format!("cat '{}'\n", p("empty.txt"))),
+            ("cat-binary", format!("cat '{}'\n", p("bin.dat"))),
+            (
+                "cat-two-files",
+                format!("cat '{}' '{}'\n", p("nl.txt"), p("nonl.txt")),
+            ),
+            ("cat-missing", format!("cat '{}'\n", p("nope.txt"))),
+            (
+                "cat-missing-then-good",
+                format!("cat '{}' '{}'\n", p("nope.txt"), p("nl.txt")),
+            ),
+            ("cat-directory", format!("cat '{}'\n", p("sub"))),
+            ("cat-unreadable", format!("cat '{}'\n", p("locked.txt"))),
+        ];
+        for (name, src) in cases {
+            let prog = render_rs(&src);
+            assert!(
+                prog.contains("__sh_cat_stmt("),
+                "{name}: `cat FILE` did not take the byte arm:\n{prog}"
+            );
+            assert!(
+                !prog.contains("__sh_spawn(") && !prog.contains("__cat_line"),
+                "{name}: `cat FILE` still forks or still splits lines:\n{prog}"
+            );
+            assert!(!prog.contains("/* TODO"), "{name}: TODO in render:\n{prog}");
+            let (rs_out, rs_err, rs_rc) = compile_and_run_full(name, &prog);
+            let (sh_out, sh_err, sh_rc) = run_bash_full(&src);
+            assert_eq!(rs_out, sh_out, "{name}: stdout differs from bash");
+            assert_eq!(
+                String::from_utf8_lossy(&rs_err),
+                String::from_utf8_lossy(&sh_err),
+                "{name}: stderr differs from bash"
+            );
+            assert_eq!(rs_rc, sh_rc, "{name}: status differs from bash");
+        }
+
+        std::fs::set_permissions(dir.join("locked.txt"), std::fs::Permissions::from_mode(0o644))
+            .expect("fixture chmod back");
+        let _ = std::fs::remove_dir_all(&dir);
+
+        // Refused shapes: the command must still be the command. The empty
+        // filename and a name with a space are refused because GNU cat's
+        // diagnostic QUOTES them (`cat: '': …`, `cat: 'a b': …`) and the arm
+        // spells the unquoted form; a bare `cat` and `cat -` read stdin.
+        for (name, src) in [
+            ("cat-bare", "cat\n".to_string()),
+            ("cat-stdin-operand", format!("cat - '{}'\n", p("nl.txt"))),
+            ("cat-empty-name", "cat ''\n".to_string()),
+            (
+                "cat-quoted-name",
+                format!("cat '{}'\n", dir.join("no such.txt").to_string_lossy()),
+            ),
+        ] {
+            let prog = render_rs(&src);
+            assert!(
+                prog.contains("__sh_spawn("),
+                "{name}: a refused cat shape was folded:\n{prog}"
+            );
+            assert!(
+                !prog.contains("/* TODO") && !prog.contains("__sh_cat_stmt("),
+                "{name}: no placeholder may stand in for the command:\n{prog}"
+            );
+            let (rs_out, rs_err, rs_rc) = compile_and_run_full(name, &prog);
+            let (sh_out, sh_err, sh_rc) = run_bash_full(&src);
+            assert_eq!(rs_out, sh_out, "{name}: stdout differs from bash");
             assert_eq!(
                 String::from_utf8_lossy(&rs_err),
                 String::from_utf8_lossy(&sh_err),
