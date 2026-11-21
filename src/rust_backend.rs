@@ -7737,9 +7737,9 @@ while __sh_path.len() > 1 && __sh_path.ends_with('/') {{ __sh_path = &__sh_path[
                 // error — exactly the old helper's three cases, with no
                 // `if false` left behind in the emitted code.
                 let errsite = if force {
-                    "                    if __sh_err.kind() == std::io::ErrorKind::NotFound { /* -f: a missing path is not an error */ } else {\n                        eprintln!(\"rm: cannot remove '{}': {}\", __sh_path, __sh_strerr(&__sh_err));\n                        __sh_status = 1;\n                    }".to_string()
+                    "                    if __sh_err.kind() == std::io::ErrorKind::NotFound { /* -f: a missing path is not an error */ } else {\n                        eprintln!(\"rm: cannot remove '{}': {}\", __sh_path, err_text(&__sh_err));\n                        __sh_status = 1;\n                    }".to_string()
                 } else {
-                    "                    eprintln!(\"rm: cannot remove '{}': {}\", __sh_path, __sh_strerr(&__sh_err));\n                    __sh_status = 1;".to_string()
+                    "                    eprintln!(\"rm: cannot remove '{}': {}\", __sh_path, err_text(&__sh_err));\n                    __sh_status = 1;".to_string()
                 };
                 let body = if rec {
                     "        let __sh_res = if __sh_mapped.is_dir() {\n            std::fs::remove_dir_all(__sh_path)\n        } else {\n            std::fs::remove_file(__sh_path)\n        };".to_string()
@@ -7750,7 +7750,7 @@ while __sh_path.len() > 1 && __sh_path.ends_with('/') {{ __sh_path = &__sh_path[
                 };
                 r#"{
     let mut __sh_status: i32 = 0;
-    let __sh_strerr = |__e: &std::io::Error| -> String { match __e.kind() {
+    let err_text = |__e: &std::io::Error| -> String { match __e.kind() {
         std::io::ErrorKind::NotFound => "No such file or directory".to_string(),
         std::io::ErrorKind::PermissionDenied => "Permission denied".to_string(),
         std::io::ErrorKind::AlreadyExists => "File exists".to_string(),
@@ -7782,7 +7782,7 @@ while __sh_path.len() > 1 && __sh_path.ends_with('/') {{ __sh_path = &__sh_path[
                 let verbose = flags.contains(&'v');
                 r#"{
     let mut __sh_status: i32 = 0;
-    let __sh_strerr = |__e: &std::io::Error| -> String { match __e.kind() {
+    let err_text = |__e: &std::io::Error| -> String { match __e.kind() {
         std::io::ErrorKind::NotFound => "No such file or directory".to_string(),
         std::io::ErrorKind::PermissionDenied => "Permission denied".to_string(),
         std::io::ErrorKind::AlreadyExists => "File exists".to_string(),
@@ -7820,7 +7820,7 @@ while __sh_path.len() > 1 && __sh_path.ends_with('/') {{ __sh_path = &__sh_path[
                 // an existing file, then mtime is bumped like touch(1).
                 r#"{
     let mut __sh_status: i32 = 0;
-    let __sh_strerr = |__e: &std::io::Error| -> String { match __e.kind() {
+    let err_text = |__e: &std::io::Error| -> String { match __e.kind() {
         std::io::ErrorKind::NotFound => "No such file or directory".to_string(),
         std::io::ErrorKind::PermissionDenied => "Permission denied".to_string(),
         std::io::ErrorKind::AlreadyExists => "File exists".to_string(),
@@ -7838,13 +7838,13 @@ while __sh_path.len() > 1 && __sh_path.ends_with('/') {{ __sh_path = &__sh_path[
                 match std::fs::File::open(__sh_path) {
                     Ok(__sh_field) => { let _ = __sh_field.set_modified(std::time::SystemTime::now()); }
                     Err(__sh_err) => {
-                        eprintln!("touch: cannot touch '{}': {}", __sh_path, __sh_strerr(&__sh_err));
+                        eprintln!("touch: cannot touch '{}': {}", __sh_path, err_text(&__sh_err));
                         __sh_status = 1;
                     }
                 }
             }
             Err(__sh_err) => {
-                eprintln!("touch: cannot touch '{}': {}", __sh_path, __sh_strerr(&__sh_err));
+                eprintln!("touch: cannot touch '{}': {}", __sh_path, err_text(&__sh_err));
                 __sh_status = 1;
             }
         }
