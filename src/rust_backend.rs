@@ -15592,7 +15592,7 @@ const HELPER_ORDER: &[&str] = &[
     "cap_bytes", "capture_rc", "spawn", "run", "readline", "read_fields", "split_ifs",
     "fnmatch", "globlike", "strippre", "stripsuf", "replace", "substr", "case", "len", "basename",
     "dirname", "env", "arg", "glob", "brace", "sleep", "rand", "uid", "euid", "gid", "hostname", "grepmatches", "regex", "regex_posix",
-    "mtime", "samefile", "fmode", "fowner", "fgroup", "fnewer", "wait_all", "bg",
+    "mtime", "access", "samefile", "fmode", "fowner", "fgroup", "fnewer", "wait_all", "bg",
     "fexists", "fdir", "freg", "fsym", "fread", "fwrite", "fexec", "fsize", "aindex",
     "div", "mod", "ret_rc", "capture", "run_traps", "lines",
     "rm", "mkdir", "touch", "catf", "cat_stmt", "mktemp", "basename_args", "dirname_args",
@@ -15722,6 +15722,8 @@ fn helper_deps(h: &str) -> &'static [&'static str] {
         "grepmatches" => &["regex"],
         "fowner" => &["uid"],
         "fgroup" => &["gid"],
+        // access(2) needs the requesting process's identity, not the file's.
+        "access" => &["uid", "gid"],
         _ => &[],
     }
 }
@@ -16734,6 +16736,26 @@ fn helper_source(h: &str) -> &'static str {
     std::fs::metadata(s).and_then(|m| m.modified()).map(|t| {
         t.duration_since(std::time::UNIX_EPOCH).map(|d| d.as_secs() as i64).unwrap_or(0)
     }).unwrap_or(0)
+}"#,
+        "access" => r#"fn __sh_access(p: &str, want: u32) -> bool {
+    // `test -r/-w/-x` is access(2): the requesting process's permission
+    // CLASS, not `open()` — a directory is writable without being openable
+    // for write, and opening a FIFO would block forever.
+    use std::os::unix::fs::MetadataExt;
+    let md = match std::fs::metadata(p) { Ok(m) => m, Err(_) => return false };
+    if __sh_uid() == 0 {
+        // root: read/write always allowed; execute needs SOME execute bit.
+        return want & 1 == 0 || md.mode() & 0o111 != 0;
+    }
+    let mode = md.mode();
+    let bits = if md.uid() == __sh_uid() {
+        (mode >> 6) & 7
+    } else if md.gid() == __sh_gid() {
+        (mode >> 3) & 7
+    } else {
+        mode & 7
+    };
+    bits & want != 0
 }"#,
         "fmode" => r#"fn __sh_fmode(s: &str, bits: u32) -> bool {
     use std::os::unix::fs::MetadataExt;
@@ -17950,13 +17972,17 @@ impl<'a, 'r> TestParser<'a, 'r> {
             "-f" => format!("std::path::Path::new(&{operand}).is_file()"),
             "-d" => format!("std::path::Path::new(&{operand}).is_dir()"),
             "-e" => format!("std::path::Path::new(&{operand}).exists()"),
-            "-r" => format!("std::fs::File::open(&{operand}).is_ok()"),
-            "-w" => format!(
-                "std::fs::OpenOptions::new().write(true).open(&{operand}).is_ok()"
-            ),
-            "-x" => format!(
-                "std::fs::metadata(&{operand}).map(|__sh_mapped| {{ use std::os::unix::fs::PermissionsExt; __sh_mapped.permissions().mode() & 0o111 != 0 }}).unwrap_or(false)"
-            ),
+            // access(2) semantics, one helper for the three modes: the
+            // class bits of the CALLING process (see `__sh_access`).
+            "-r" | "-w" | "-x" => {
+                self.render.add_helper("access");
+                let want = match op {
+                    "-r" => 4,
+                    "-w" => 2,
+                    _ => 1,
+                };
+                format!("__sh_access(&{operand}, {want})")
+            }
             "-s" => format!(
                 "std::fs::metadata(&{operand}).map(|__sh_mapped| __sh_mapped.len() > 0).unwrap_or(false)"
             ),
@@ -25041,6 +25067,231 @@ mod tests {
         std::fs::set_permissions(root.join("ro"), std::fs::Permissions::from_mode(0o755))
             .expect("fixture chmod back");
         let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// The class-6 fixture tree: regular files across the permission bits
+    /// (including the setuid/setgid/sticky marks), directories whose modes
+    /// differ from the caller's, a FIFO, a valid and a dangling symlink, and
+    /// a hardlink to one file. Explicit timestamps make `-N` and the
+    /// sub-second `-nt` order deterministic, and the tree is REBUILT before
+    /// each side so bash and the render see the same inodes, modes and times.
+    #[cfg(unix)]
+    fn reset_stat_fixture(root: &std::path::Path) {
+        use std::os::unix::fs::{symlink, PermissionsExt};
+        use std::time::{Duration, UNIX_EPOCH};
+        for d in ["d500", "d300", "d755"] {
+            let _ = std::fs::set_permissions(root.join(d), std::fs::Permissions::from_mode(0o755));
+        }
+        let _ = std::fs::set_permissions(root.join("f000"), std::fs::Permissions::from_mode(0o644));
+        let _ = std::fs::remove_dir_all(root);
+        std::fs::create_dir_all(root).expect("fixture root");
+        let mk = |n: &str, mode: u32| {
+            std::fs::write(root.join(n), b"x").expect("fixture file");
+            std::fs::set_permissions(root.join(n), std::fs::Permissions::from_mode(mode))
+                .expect("fixture chmod");
+        };
+        mk("f644", 0o644);
+        mk("f000", 0o000);
+        mk("f400", 0o400);
+        mk("f555", 0o555);
+        mk("f4755", 0o4755);
+        mk("f2755", 0o2755);
+        mk("f1755", 0o1755);
+        for (d, mode) in [("d755", 0o755), ("d500", 0o500), ("d300", 0o300)] {
+            std::fs::create_dir_all(root.join(d)).expect("fixture dir");
+            std::fs::set_permissions(root.join(d), std::fs::Permissions::from_mode(mode))
+                .expect("fixture dir chmod");
+        }
+        assert!(
+            std::process::Command::new("mkfifo")
+                .arg(root.join("fifo1"))
+                .status()
+                .expect("mkfifo")
+                .success(),
+            "fixture: mkfifo failed"
+        );
+        symlink("f644", root.join("linkok")).expect("fixture symlink");
+        symlink("nowhere", root.join("linkbad")).expect("fixture dangling symlink");
+        std::fs::hard_link(root.join("f644"), root.join("hard")).expect("fixture hardlink");
+        // `-N`/`-nt` determinism: f644 was modified after it was read, f400
+        // was read after it was modified, and f555/f4755 are in the SAME
+        // second a nanosecond apart (bash orders those; a seconds compare
+        // would call it a tie).
+        let set = |n: &str, at: u64, mt: u64, mt_nanos: u32| {
+            let f = std::fs::OpenOptions::new()
+                .read(true)
+                .open(root.join(n))
+                .expect("fixture open");
+            f.set_times(
+                std::fs::FileTimes::new()
+                    .set_accessed(UNIX_EPOCH + Duration::from_secs(at))
+                    .set_modified(
+                        UNIX_EPOCH + Duration::from_secs(mt) + Duration::from_nanos(u64::from(mt_nanos)),
+                    ),
+            )
+            .expect("fixture times");
+        };
+        set("f644", 1000, 2000, 0);
+        set("f400", 3000, 1000, 0);
+        set("f555", 1000, 5000, 0);
+        set("f4755", 1000, 5000, 120_000_000);
+    }
+
+    #[cfg(unix)]
+    fn clear_stat_fixture(root: &std::path::Path) {
+        use std::os::unix::fs::PermissionsExt;
+        for d in ["d500", "d300", "d755"] {
+            let _ = std::fs::set_permissions(root.join(d), std::fs::Permissions::from_mode(0o755));
+        }
+        let _ = std::fs::set_permissions(root.join("f000"), std::fs::Permissions::from_mode(0o644));
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    /// `test -r/-w/-x` is access(2), not `open()`: the model is the CALLER's
+    /// permission class, so a 0755 directory is writable even though it cannot
+    /// be opened for write, a 0300 directory is not readable, a file's owner
+    /// class is used even when its `o+w` bit is clear, and a FIFO is probed
+    /// without opening it (which would block). Every one of those diverged
+    /// from bash before this arm used `__sh_access`.
+    #[cfg(unix)]
+    #[test]
+    fn permission_predicates_follow_access_semantics() {
+        let root = std::env::temp_dir().join(format!("sh2_perm_pred_{}", std::process::id()));
+        let p = |n: &str| root.join(n).to_string_lossy().into_owned();
+        let paths = [
+            "f644", "f000", "f400", "f555", "f4755", "f2755", "f1755", "d755", "d500", "d300",
+            "linkok", "linkbad",
+        ];
+        let mut src = String::new();
+        for (i, n) in paths.iter().enumerate() {
+            let full = p(n);
+            for (j, op) in ["-r", "-w", "-x"].iter().enumerate() {
+                src.push_str(&format!(
+                    "if [ {op} '{full}' ]; then echo '{i}.{j}=1'; else echo '{i}.{j}=0'; fi\n"
+                ));
+            }
+        }
+        for (i, full) in ["/dev/null".to_string(), p("nope"), String::new()].iter().enumerate() {
+            for (j, op) in ["-r", "-w", "-x"].iter().enumerate() {
+                src.push_str(&format!(
+                    "if [ {op} '{full}' ]; then echo 'x{i}.{j}=1'; else echo 'x{i}.{j}=0'; fi\n"
+                ));
+            }
+        }
+        let prog = render_rs(&src);
+        assert!(
+            !prog.contains("__sh_spawn(") && !prog.contains("/* TODO"),
+            "permission predicates did not render natively:\n{prog}"
+        );
+        reset_stat_fixture(&root);
+        let (sh_out, sh_err, sh_rc) = run_bash_full(&src);
+        reset_stat_fixture(&root);
+        let (rs_out, rs_err, rs_rc) = compile_and_run_full("perm-predicates", &prog);
+        clear_stat_fixture(&root);
+        assert_eq!(
+            String::from_utf8_lossy(&rs_out),
+            String::from_utf8_lossy(&sh_out),
+            "permission predicates: stdout differs from bash"
+        );
+        assert_eq!(
+            String::from_utf8_lossy(&rs_err),
+            String::from_utf8_lossy(&sh_err),
+            "permission predicates: stderr differs from bash"
+        );
+        assert_eq!(rs_rc, sh_rc, "permission predicates: status differs from bash");
+        // The matrix is not vacuous: bash says yes to some and no to others.
+        let text = String::from_utf8_lossy(&sh_out);
+        assert!(
+            text.lines().any(|l| l.ends_with("=1")) && text.lines().any(|l| l.ends_with("=0")),
+            "fixture produced no mixed answers:\n{text}"
+        );
+        assert!(
+            text.lines().filter(|l| l.ends_with("=1")).count() > 10,
+            "too few positive predicates to be a witness:\n{text}"
+        );
+    }
+
+    /// The remaining stat predicates are native `std` calls, so each has to
+    /// agree with bash's `test` on the whole matrix: present/missing/empty,
+    /// file-vs-directory, every mode bit, symlink follow (`-e`/`-f`/`-O`/`-G`)
+    /// vs no-follow (`-h`/`-L`), and the timestamp rules — `-N` is
+    /// mtime-after-atime, and `-nt`/`-ot` compare at NANOSECOND precision,
+    /// are false when both sides are missing, and treat a missing side
+    /// specially (`a -nt b` is true when only b is gone, `-ot` the mirror).
+    #[cfg(unix)]
+    #[test]
+    fn stat_predicates_execute_like_bash() {
+        let root = std::env::temp_dir().join(format!("sh2_stat_pred_{}", std::process::id()));
+        let p = |n: &str| root.join(n).to_string_lossy().into_owned();
+        let paths = [
+            "f644", "f000", "f400", "f555", "f4755", "f2755", "f1755", "d755", "d500", "d300",
+            "fifo1", "linkok", "linkbad", "hard",
+        ];
+        let ops = [
+            "-e", "-f", "-d", "-h", "-L", "-p", "-S", "-b", "-c", "-u", "-g", "-k", "-O", "-G",
+            "-N", "-s",
+        ];
+        let mut src = String::new();
+        for (i, n) in paths.iter().enumerate() {
+            let full = p(n);
+            for (j, op) in ops.iter().enumerate() {
+                src.push_str(&format!(
+                    "if [ {op} '{full}' ]; then echo '{i}.{j}=1'; else echo '{i}.{j}=0'; fi\n"
+                ));
+            }
+        }
+        for (i, (a, b)) in [
+            ("f644", "f400"),
+            ("f400", "f644"),
+            ("f555", "f4755"),
+            ("f4755", "f555"),
+            ("f644", "nope"),
+            ("nope", "f644"),
+            ("nope", "nope2"),
+            ("f644", "f644"),
+            ("f644", "hard"),
+            ("f644", "linkok"),
+            ("f644", "linkbad"),
+        ]
+        .iter()
+        .enumerate()
+        {
+            for op in ["-nt", "-ot", "-ef"] {
+                src.push_str(&format!(
+                    "if [ '{}' {op} '{}' ]; then echo 'b{i}{op}=1'; else echo 'b{i}{op}=0'; fi\n",
+                    p(a),
+                    p(b)
+                ));
+            }
+        }
+        for (i, full) in [String::new(), "/dev/null".to_string(), p("nope")].iter().enumerate() {
+            for (j, op) in ops.iter().enumerate() {
+                src.push_str(&format!(
+                    "if [ {op} '{full}' ]; then echo 'x{i}.{j}=1'; else echo 'x{i}.{j}=0'; fi\n"
+                ));
+            }
+        }
+        let prog = render_rs(&src);
+        assert!(
+            !prog.contains("__sh_spawn(") && !prog.contains("/* TODO"),
+            "stat predicates did not render natively:\n{prog}"
+        );
+        reset_stat_fixture(&root);
+        let (sh_out, sh_err, sh_rc) = run_bash_full(&src);
+        reset_stat_fixture(&root);
+        let (rs_out, rs_err, rs_rc) = compile_and_run_full("stat-predicates", &prog);
+        clear_stat_fixture(&root);
+        assert_eq!(
+            String::from_utf8_lossy(&rs_out),
+            String::from_utf8_lossy(&sh_out),
+            "stat predicates: stdout differs from bash"
+        );
+        assert_eq!(
+            String::from_utf8_lossy(&rs_err),
+            String::from_utf8_lossy(&sh_err),
+            "stat predicates: stderr differs from bash"
+        );
+        assert_eq!(rs_rc, sh_rc, "stat predicates: status differs from bash");
     }
 
     /// The argv forms the old fold MIS-READ, each with the same witness as a
