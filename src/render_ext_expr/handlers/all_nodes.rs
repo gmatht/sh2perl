@@ -165,7 +165,11 @@ pub fn char_translate(node: &CharTranslate, ctx: &ExprRenderCtx) -> Option<Strin
             }
         }
         Backend::Go => Some(format!("/* TODO: CharTranslate Go */")),
-        Backend::Rust => Some(format!("/* TODO: CharTranslate Rust */")),
+        // Rust renders CharTranslate in rust_backend's own Ext arm (the
+        // `to_uppercase`-vs-byte-map distinction lives there). A TODO
+        // COMMENT here would land inside a Rust program as an empty
+        // expression, which is not a refusal — it is a silently wrong value.
+        Backend::Rust => None,
         Backend::C => None,
         Backend::Java => {
             // The three tr modes map to one shared helper each (translate
@@ -219,7 +223,9 @@ pub fn reg_sub(node: &RegSub, ctx: &ExprRenderCtx) -> Option<String> {
             Some(format!("{}.replace(/{}/{}, \"{}\")", text, node.pattern, flag, node.replacement.replace('\"', "\\\"")))
         }
         Backend::Go => Some(format!("/* TODO: RegSub Go */")),
-        Backend::Rust => Some(format!("/* TODO: RegSub Rust */")),
+        // No Rust arm: `std` has no regex engine (see planner's `rs`
+        // manifest). None keeps the command; a comment would not.
+        Backend::Rust => None,
         Backend::C => None,
         Backend::Python => {
             // `sed 's/x/y/'` replaces the LEFTMOST occurrence; the `global`
@@ -501,7 +507,9 @@ pub fn take_lines(node: &TakeLines, ctx: &ExprRenderCtx) -> Option<String> {
             }
         }
         Backend::Go => Some(format!("/* TODO: TakeLines Go */")),
-        Backend::Rust => Some(format!("/* TODO: TakeLines Rust */")),
+        // Rust renders TakeLines in rust_backend's own Ext arm; None here
+        // keeps a `TODO` comment out of a compiled program.
+        Backend::Rust => None,
         Backend::C => None,
         Backend::Python => {
             // Byte mode = a slice of the in-memory text; line mode splits on
@@ -570,7 +578,9 @@ pub fn substr_extract(node: &SubStrExtract, ctx: &ExprRenderCtx) -> Option<Strin
             }
         }
         Backend::Go => Some(format!("/* TODO: SubStrExtract Go */")),
-        Backend::Rust => Some(format!("/* TODO: SubStrExtract Rust */")),
+        // Rust renders SubStrExtract in rust_backend's own Ext arm; None here
+        // keeps a `TODO` comment out of a compiled program.
+        Backend::Rust => None,
         Backend::C => None,
         Backend::Python => {
             // python slicing: t[o:o+n]; an absent length is t[o:]
@@ -1366,6 +1376,204 @@ pub fn reg_count(node: &RegCount, ctx: &ExprRenderCtx) -> Option<String> {
             "shRegCount(String.valueOf({}), {})", text, java_str_lit(&node.pattern))),
         Backend::Sh => None,
         Backend::Zig => Some(format!("/* TODO: RegCount Zig */")),
+        _ => None,
+    }
+}
+
+// ── fs.* predicates (fs-lift) ─────────────────────────────────────────
+//
+// `[ A -ef B ]` and friends, spelled once here so the Rust backend's own
+// Ext arm and the shared handler registry cannot drift. Every other backend
+// returns None: the nodes are offered only where a renderer can name the
+// predicate exactly, which today is `std` on Unix.
+
+/// `-ef`: same device + inode over stat(2). BOTH operands must stat — GNU
+/// test says two missing paths are NOT the same file.
+pub(crate) fn fs_same_file_rust(left: &str, right: &str) -> String {
+    format!(
+        "{{ use std::os::unix::fs::MetadataExt; \
+         match (std::fs::metadata(&{left}), std::fs::metadata(&{right})) {{ \
+         (Ok(__sh_a), Ok(__sh_b)) => __sh_a.dev() == __sh_b.dev() && __sh_a.ino() == __sh_b.ino(), \
+         _ => false }} }}"
+    )
+}
+
+/// `-nt` / `-ot`: full-precision mtime comparison with bash's asymmetric
+/// MISSING-OPERAND rule (`-nt` is true when the RIGHT side is missing,
+/// `-ot` when the LEFT one is; two missing files are neither).
+pub(crate) fn fs_newer_than_rust(left: &str, right: &str, newer: bool) -> String {
+    let arms = if newer {
+        "(Some(__sh_a), Some(__sh_b)) => __sh_a > __sh_b, (Some(_), None) => true, _ => false"
+    } else {
+        "(Some(__sh_a), Some(__sh_b)) => __sh_a < __sh_b, (None, Some(_)) => true, _ => false"
+    };
+    format!(
+        "{{ let __sh_a = std::fs::metadata(&{left}).and_then(|m| m.modified()).ok(); \
+         let __sh_b = std::fs::metadata(&{right}).and_then(|m| m.modified()).ok(); \
+         match (__sh_a, __sh_b) {{ {arms} }} }}"
+    )
+}
+
+/// `-N`: one stat's mtime strictly later than its atime.
+pub(crate) fn fs_modified_since_read_rust(path: &str) -> String {
+    format!(
+        "{{ match std::fs::metadata(&{path}) {{ \
+         Ok(__sh_m) => match (__sh_m.modified(), __sh_m.accessed()) {{ \
+         (Ok(__sh_mt), Ok(__sh_at)) => __sh_mt > __sh_at, _ => false }}, \
+         Err(_) => false }} }}"
+    )
+}
+
+/// A `TextFilter` node: the INPUT text (a literal, or the one `cat:` read the
+/// lift spells) run through the static filter chain, then printed.
+///
+/// The whole thing is ONE statement block because the shell pipeline's
+/// observable effect is its OUTPUT plus the LAST stage's status — nothing
+/// reads a pipeline value here (the lift refuses a `$(…)` capture), so the
+/// block prints and leaves `__SH_RC` at the last stage's status.
+pub(crate) fn text_filter_rust(src: &str, ops: &str) -> String {
+    let mut b = String::new();
+    b.push_str(&format!("let mut __sh_cur: String = ({src}).to_string();\n"));
+    b.push_str("let mut __sh_rc: i32 = 0i32;\n");
+    if ops.split(';').any(|o| o.starts_with("cat:")) {
+        // `strerror` text for the two reads/writes the node spells. The kinds a
+        // script can actually meet on a static path are the three named; the
+        // rest would need libc's table, so they fall back to the OS string
+        // (which no test path reaches, and which is never *claimed* to be
+        // bash's text).
+        b.push_str(
+            "let __sh_strerr = |__e: &std::io::Error| -> String { match __e.kind() { \
+             std::io::ErrorKind::NotFound => \"No such file or directory\".to_string(), \
+             std::io::ErrorKind::PermissionDenied => \"Permission denied\".to_string(), \
+             std::io::ErrorKind::IsADirectory => \"Is a directory\".to_string(), \
+             _ => format!(\"{}\", __e) } };\n",
+        );
+    }
+    for op in ops.split(';') {
+        if let Some(p) = op.strip_prefix("cat:") {
+            let lit = format!("{p:?}");
+            b.push_str(&format!(
+                "__sh_cur = match std::fs::read_to_string({lit}) {{ Ok(__s) => __s, \
+                 Err(__e) => {{ eprintln!(\"cat: {{}}: {{}}\", {lit}, __sh_strerr(&__e)); \
+                 String::new() }} }};\n"
+            ));
+        } else if op == "wc:l" {
+            b.push_str("__sh_cur = format!(\"{}\\n\", __sh_cur.matches('\\n').count());\n");
+        } else if op == "wc:c" {
+            b.push_str("__sh_cur = format!(\"{}\\n\", __sh_cur.len());\n");
+        } else if op == "wc:w" {
+            b.push_str(
+                "__sh_cur = format!(\"{}\\n\", __sh_cur.split(|c: char| c == ' ' || \
+                 c == '\\t' || c == '\\n' || c == '\\r' || c == '\\u{0b}' || c == '\\u{0c}') \
+                 .filter(|w| !w.is_empty()).count());\n",
+            );
+        } else if let Some(n) = op.strip_prefix("head:") {
+            b.push_str(&format!(
+                "__sh_cur = {{ let __src = __sh_cur.clone(); let mut __end = __src.len(); \
+                 let mut __n = 0usize; for (__i, __c) in __src.char_indices() {{ \
+                 if __c == '\\n' {{ __n += 1; if __n == {n} {{ __end = __i + 1; break; }} }} }} \
+                 __src[..__end].to_string() }};\n"
+            ));
+        } else if let Some(n) = op.strip_prefix("tail:") {
+            b.push_str(&format!(
+                "__sh_cur = {{ let __src = __sh_cur.clone(); \
+                 let (__body, __nl) = match __src.strip_suffix('\\n') {{ \
+                 Some(__b) => (__b.to_string(), true), None => (__src.clone(), false) }}; \
+                 let __bytes = __body.as_bytes(); let mut __start = 0usize; \
+                 let mut __count = 0usize; let mut __i = __body.len(); \
+                 while __i > 0 {{ __i -= 1; if __bytes[__i] == b'\\n' {{ __count += 1; \
+                 if __count == {n} {{ __start = __i + 1; break; }} }} }} \
+                 let mut __o = __body[__start..].to_string(); if __nl {{ __o.push('\\n'); }} __o }};\n"
+            ));
+        } else if op == "uniq" {
+            b.push_str(
+                "__sh_cur = { let __src = __sh_cur.clone(); let mut __o = String::new(); \
+                 if !__src.is_empty() { let __body = __src.strip_suffix('\\n') \
+                 .unwrap_or(&__src).to_string(); let mut __prev: Option<String> = None; \
+                 for __l in __body.split('\\n') { if __prev.as_deref() != Some(__l) { \
+                 __o.push_str(__l); __o.push('\\n'); __prev = Some(__l.to_string()); } } } __o };\n",
+            );
+        } else if let Some(rest) = op.strip_prefix("cut:") {
+            // `cut:D:FIELDS` — the LAST ':' separates the field list, so a ':'
+            // delimiter encodes as `cut:::2`.
+            let at = match rest.rfind(':') {
+                Some(i) => i,
+                None => return String::new(),
+            };
+            let (d, fields) = (&rest[..at], &rest[at + 1..]);
+            let dl = match d.chars().next() {
+                Some(c) => c,
+                None => return String::new(),
+            };
+            let nums: Vec<String> = fields
+                .split(',')
+                .filter(|f| !f.is_empty())
+                .map(|f| format!("{f}usize"))
+                .collect();
+            let vec_lit = format!("vec![{}]", nums.join(", "));
+            b.push_str(&format!(
+                "__sh_cur = {{ let __src = __sh_cur.clone(); \
+                 let __fields: Vec<usize> = {vec_lit}; \
+                 let __d: char = {dl:?}; let mut __o = String::new(); \
+                 if !__src.is_empty() {{ let __body = __src.strip_suffix('\\n') \
+                 .unwrap_or(&__src).to_string(); for __l in __body.split('\\n') {{ \
+                 if !__l.contains(__d) {{ __o.push_str(__l); }} else {{ \
+                 let __parts: Vec<&str> = __l.split(__d).collect(); let mut __first = true; \
+                 for __f in &__fields {{ if !__first {{ __o.push(__d); }} __first = false; \
+                 __o.push_str(if *__f >= 1 && *__f <= __parts.len() {{ __parts[*__f - 1] }} \
+                 else {{ \"\" }}); }} }} __o.push('\\n'); }} }} __o }};\n",
+                dl = dl,
+            ));
+        } else {
+            return String::new();
+        }
+    }
+    b.push_str("print!(\"{}\", __sh_cur);\n__SH_RC.store(__sh_rc, Ordering::Relaxed);");
+    format!("{{\n{b}}}")
+}
+
+pub fn text_filter(node: &crate::shir_nodes::TextFilter, ctx: &ExprRenderCtx) -> Option<String> {
+    match ctx.backend {
+        Backend::Rust => Some(text_filter_rust(&render_child(&node.src, ctx)?, &node.ops)),
+        _ => None,
+    }
+}
+
+/// `FsCommand` is DECLARED by Rust only, and Rust renders it in its own
+/// statement slot (the `std::fs` loop with bash's diagnostics), so there is no
+/// shared spelling to add here. Every other backend refuses the tag in its
+/// manifest, which keeps this `None` from becoming a silent empty value.
+pub fn fs_command(_node: &crate::shir_nodes::FsCommand, _ctx: &ExprRenderCtx) -> Option<String> {
+    None
+}
+
+pub fn fs_same_file(node: &crate::shir_nodes::FsSameFile, ctx: &ExprRenderCtx) -> Option<String> {
+    match ctx.backend {
+        Backend::Rust => Some(fs_same_file_rust(
+            &render_child(&node.left, ctx)?,
+            &render_child(&node.right, ctx)?,
+        )),
+        _ => None,
+    }
+}
+
+pub fn fs_newer_than(node: &crate::shir_nodes::FsNewerThan, ctx: &ExprRenderCtx) -> Option<String> {
+    match ctx.backend {
+        Backend::Rust => Some(fs_newer_than_rust(
+            &render_child(&node.left, ctx)?,
+            &render_child(&node.right, ctx)?,
+            node.newer,
+        )),
+        _ => None,
+    }
+}
+
+pub fn fs_modified_since_read(
+    node: &crate::shir_nodes::FsModifiedSinceRead,
+    ctx: &ExprRenderCtx,
+) -> Option<String> {
+    match ctx.backend {
+        Backend::Rust => Some(fs_modified_since_read_rust(&render_child(&node.path, ctx)?)),
         _ => None,
     }
 }

@@ -57,29 +57,39 @@
 //! mutation-verified (removing the sign test, accepting `Un{op:"-"}`, and
 //! dropping the `pow2` check each turn the suite red).
 
+use std::cell::RefCell;
 use std::collections::HashSet;
-use std::sync::Mutex;
 
 use crate::ir::{ArithAst, IrStmt};
 
-/// verdicts keyed by (fn-name, stmt index) — mirrors i32-provable.
-static VERDICTS: Mutex<Option<HashSet<(String, usize)>>> = Mutex::new(None);
+/// Verdicts keyed by (fn-name, stmt index) — mirrors i32-provable.
+///
+/// Per THREAD, not process-global: the compiler renders on one thread, but
+/// `cargo test` runs each test on its own thread and several of them call
+/// `transform` concurrently. A shared cache let one test's analysis land
+/// between another test's `transform`/`shiftable` pair, which surfaced as
+/// `fires_on_nonneg_dividend_by_pow2` failing ONLY in the full parallel suite
+/// (it passes alone and on a rerun). Thread-local keeps every render's
+/// analysis private without serialising the suite.
+thread_local! {
+    static VERDICTS: RefCell<Option<HashSet<(String, usize)>>> = const { RefCell::new(None) };
+}
 
 /// Drop the cached verdict — the out-of-band caller's reset (see
 /// `transforms::reset_verdicts`). These transforms are analysis-only: they
 /// return `false` from `run()` and a RENDERER reads the verdict, so without
 /// a reset a second run observes the PREVIOUS input's verdict.
 pub fn clear_verdicts() {
-    *VERDICTS.lock().unwrap() = None;
+    VERDICTS.with(|v| *v.borrow_mut() = None);
 }
 
 pub fn shiftable(fn_name: &str, stmt_idx: usize) -> bool {
-    VERDICTS
-        .lock()
-        .unwrap()
-        .as_ref()
-        .map(|s| s.contains(&(fn_name.to_string(), stmt_idx)))
-        .unwrap_or(false)
+    VERDICTS.with(|v| {
+        v.borrow()
+            .as_ref()
+            .map(|s| s.contains(&(fn_name.to_string(), stmt_idx)))
+            .unwrap_or(false)
+    })
 }
 
 /// Apply the transform (analysis-only — computes + caches the verdicts).
@@ -92,7 +102,7 @@ pub fn transform(stmts: &mut Vec<IrStmt>) -> bool {
             }
         }
     }
-    *VERDICTS.lock().unwrap() = Some(out);
+    VERDICTS.with(|v| *v.borrow_mut() = Some(out));
     false // analysis-only
 }
 

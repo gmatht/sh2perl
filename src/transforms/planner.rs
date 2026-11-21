@@ -250,11 +250,14 @@ pub fn node_manifest(target: &str) -> &'static [&'static str] {
         //    the command. (The regex the RENDERER does use comes from the
         //    `regex` crate in the emitted Cargo project — that is not `std`,
         //    so it does not license these nodes here.)
-        //  * AffixStrip — `${v#p}`/`${v%s}` lower through the backend's own
-        //    strip helpers (`__sh_strippre`/`__sh_stripsuf` over
-        //    `__sh_fnmatch`), which accept ARBITRARY glob patterns; `std`'s
-        //    `strip_prefix`/`strip_suffix` are exact only for the literal
-        //    subset, so the node stays out and the shapes keep that path.
+        //  * CutAt — not a manifest node on any backend, and MEASURED to
+        //    stay that way on rust: adding it here re-routes
+        //    `058_advanced_bash_idioms.rs`'s two echoes from `println!` to
+        //    `__sh_print_words` (the manifest is consulted by the pipeline,
+        //    not just by the fold, so a declaration is not cost-free). The
+        //    fold's own gate (`cut_target_ok`) owns the offer; the
+        //    list↔manifest relation is pinned by
+        //    `cut_fold_targets_are_render_verified_not_declared`.
         //
         // DECLARED but CONSTRUCT-ONLY (no transform in this pipeline builds
         // them from shell source, so they are pinned by constructing the node
@@ -271,6 +274,20 @@ pub fn node_manifest(target: &str) -> &'static [&'static str] {
         // alone, `to_uppercase()` does not).
         "rs" | "rust" => &[
             "StringContains", "StrLen", "CaseTransform", "FieldExtract",
+            // fs-lift (class 5/6): the file predicates whose `std` reading is
+            // exact — dev+ino identity, full-precision mtime comparison with
+            // bash's missing-operand rule, and `-N` as mtime > atime.
+            "FsSameFile", "FsNewerThan", "FsModifiedSinceRead",
+            // fs-cmd-lift (class 5): `rm`/`mkdir`/`touch` with plain literal
+            // words is one node; its Rust arm is the statement renderer that
+            // was already native, now carried by the node.
+            "FsCommand",
+            // text-filter-lift (class 1/5): a pipeline of STATIC text filters
+            // (`echo|wc`, `seq|head`, `cat|uniq`, `echo|cut`, `echo|tee`) is
+            // one node; the arm prints the chain's output and leaves the last
+            // stage's status. Every flag/operand shape it cannot spell keeps
+            // spawning (see `text_filter_lift`'s refusal list).
+            "TextFilter",
                 "WordCount", "RegCount", "TakeLines", "StringTrim",
                 "SubStrExtract", "RepeatStr", "Split", "ArrayLen",
                 // `basename`/`dirname` commands: text_ops builds PathName
@@ -286,6 +303,16 @@ pub fn node_manifest(target: &str) -> &'static [&'static str] {
                 // over the node's LITERAL affix (in a bool context) and its
                 // 1/0 spelling in a string context.
                 "StringAffix",
+                // The strip NODE (`${v#lit}`, `${v%lit}`, `${v##lit}`,
+                // `${v%%lit}`): `strip_prefix`/`strip_suffix` with the text
+                // passed through on no match. The node's pattern is an
+                // ARBITRARY affix, but its only producer, `affix_strip_fold`,
+                // emits it solely for a magic-free literal (a star at one end
+                // lowers to CutAt, `?`/`[`/`\` are refused), and the arm is
+                // byte-exact for every literal. Declared here because the
+                // backend was already RENDERING it while the manifest called
+                // it refused — a declaration that lied about the tree.
+                "AffixStrip",
                 // `tr`'s general map: the lowering EXPANDS ranges and classes
                 // before the node is built, so `from`/`to` are the map and
                 // `chars().map(...)` is exact (delete and squeeze included).

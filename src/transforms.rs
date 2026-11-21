@@ -205,6 +205,9 @@ pub mod shir_pipeline_native;
 pub mod brace_fold; // OFFER core-requests/transforms/offered/brace-fold.rs: literal brace call → its word LIST in list positions
 pub mod interp_fold; // `Interpolate([Lit(s)])` → `Str(s)` — canonical single-literal words for every backend
 pub mod dead_fn_elim; // generic: remove never-referenced shell functions
+pub mod fs_lift; // file PREDICATES (`-ef`/`-nt`/`-ot`/`-N`) → fs.* nodes
+pub mod text_filter_lift; // static text pipelines (`echo|wc`, `seq|head`, `cat|uniq`) → TextFilter
+pub mod fs_cmd_lift; // rm/mkdir/touch STATEMENTS → the shared FsCommand node
 pub mod text_ops; // common shell commands → semantic IR nodes (cut/tr/sed/head/tail/wc)
 pub mod type_query; // `type NAME` → the answer for program-defined functions / true builtins
 pub mod text_ops_planner; // the "solve" idea, observable: wc -l lowers per-backend by manifest (opt-in)
@@ -400,6 +403,19 @@ pub fn all() -> Vec<(&'static str, TransformFn)> {
         ("function-purity", function_purity::transform),
         ("i32-provable", i32_provable::transform),
         ("f32-narrow", f32_narrow::transform),
+        // fs-lift: `[ A -ef B ]` / `-nt` / `-ot` / `-N` → fs.* nodes. It
+        // walks CONDITIONS too (text-ops lowers bodies only), and each lift
+        // is gated on the target manifest.
+        ("fs-lift", fs_lift::transform),
+        // fs-cmd-lift: `rm`/`mkdir`/`touch` with plain literal words → ONE
+        // FsCommand node (the Rust statement renderer draws it; no spawn).
+        // Dynamic/glob words, unmodelled flags and empty operands keep the
+        // exec call.
+        ("fs-cmd-lift", fs_cmd_lift::transform),
+        // text-filter-lift: a pipeline of STATIC text filters (`echo|wc`,
+        // `seq|head`, `cat|uniq`, `echo|cut`, `echo|tee`) → one TextFilter
+        // node. Refuses every flag/operand shape the node cannot spell.
+        ("text-filter-lift", text_filter_lift::transform),
         ("text-ops", text_ops::transform),
         ("text-ops-planner", text_ops_planner::transform),
         // core-requests/transforms/done batch merge (12 orphaned submissions)

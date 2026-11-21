@@ -11,6 +11,10 @@
     pub(crate) mod cutset_trim;
     pub(crate) mod field_extract;
     pub(crate) mod field_read;
+    pub(crate) mod fs_command;
+    pub(crate) mod fs_modified_since_read;
+    pub(crate) mod fs_newer_than;
+    pub(crate) mod fs_same_file;
     pub(crate) mod path_name;
     pub(crate) mod reg_count;
     pub(crate) mod reg_sub;
@@ -24,6 +28,7 @@
     pub(crate) mod string_trim;
     pub(crate) mod sub_str_extract;
     pub(crate) mod take_lines;
+    pub(crate) mod text_filter;
     pub(crate) mod uniq_lines;
     pub(crate) mod word_count;
 

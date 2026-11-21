@@ -1619,9 +1619,26 @@ fn inline_print_words(text: &mut String) {
             continue;
         };
         let expr = &text[start..close];
+        // Zero-line text ops print NO bytes: `println!("{}", "")` would
+        // emit a newline the shell never wrote. The two shapes below prove
+        // at render time that the block yields zero lines — `head -0`'s
+        // `if __sh_num <= 0 { String::new() }` (the node's own zero count)
+        // and a line filter over the empty literal producer (zero input
+        // lines, so zero output lines; `wc` over it renders through the
+        // TextFilter sink, not here). A filter over "\n" is NOT matched:
+        // that value is "" too, but the shell prints one empty line.
+        let zero_lines = mac == "println!"
+            && (expr.contains("let __sh_num: i64 = 0;")
+                || expr.contains("let __sh_text: String = \"\".to_string();"));
         // end = position after the `)` of the matched flags
         let end = bracket2_pos + 1 + j + flags.len();
-        let replacement = format!("{}(\"{{}}\", {})", mac, expr);
+        let replacement = if zero_lines {
+            format!(
+                "{{ let __sh_pv = {expr}; if !__sh_pv.is_empty() {{ println!(\"{{}}\", __sh_pv); }} }}"
+            )
+        } else {
+            format!("{}(\"{{}}\", {})", mac, expr)
+        };
         text.replace_range(at..end, &replacement);
         // The replacement may itself contain `pat`-adjacent text; resume the
         // scan at the end of what we just wrote so the loop always advances.
@@ -3592,8 +3609,28 @@ impl Render {
             self.out.push(String::new());
         } else {
             let s = Self::strip_let_parens(s);
+            // `let a = [];` has no element type for rustc to infer (E0282).
+            // A shell array DECLARED empty (`a=()`) reaches this point through
+            // several paths, so the rewrite lives at the one choke point
+            // instead of in each of them; `Vec<String>` keeps every later use
+            // (len, iter, index) exactly as the literal array did.
+            let s = Self::typed_empty_array_let(&s).unwrap_or(s);
             self.out.push(format!("{}{}", "    ".repeat(self.depth), &s));
         }
+    }
+
+    /// `let NAME = [];` → `let NAME: Vec<String> = Vec::new();`, else `None`.
+    fn typed_empty_array_let(s: &str) -> Option<String> {
+        let t = s.trim();
+        let rest = t.strip_prefix("let ")?;
+        let (name, tail) = rest.split_once(" = ")?;
+        if tail.trim() != "[];" {
+            return None;
+        }
+        if name.is_empty() || !name.chars().all(|c| c.is_alphanumeric() || c == '_') {
+            return None;
+        }
+        Some(format!("let {name}: Vec<String> = Vec::new();"))
     }
 
     /// Strip a redundant paren pair from a `let NAME = (EXPR);` initializer.
@@ -5707,6 +5744,31 @@ impl Render {
     /// previous rendering, and the transform never offers that shape here.
     fn ext_std_str(&mut self, n: &dyn crate::shir_nodes::ExtExpr) -> Option<String> {
         match n.tag() {
+            // The fs predicates are BOOLEANS; a string-typed consumer (an
+            // assignment, an arithmetic operand) sees bash's "1"/"0".
+            "FsSameFile" | "FsNewerThan" | "FsModifiedSinceRead" => Some(format!(
+                "(if {} {{ \"1\" }} else {{ \"0\" }}).to_string()",
+                self.fs_pred_bool(n)
+            )),
+            // fs-cmd-lift: `rm`/`mkdir`/`touch`. The statement renderer IS the
+            // semantics (directory rule, `-f` missing-path rule, diagnostics,
+            // status aggregated over the operands); the node carries them so
+            // the next backend does not re-derive them. The producer refuses
+            // every shape this arm cannot spell, so `None` here is a producer
+            // bug — never a reason to shell out.
+            "FsCommand" => {
+                let x = n.as_any().downcast_ref::<crate::shir_nodes::FsCommand>()?;
+                let empty: Vec<IrExpr> = Vec::new();
+                let items: &Vec<IrExpr> = match &x.argv {
+                    IrExpr::Array(a) => a,
+                    _ => &empty,
+                };
+                let words: Vec<&IrExpr> = items.iter().collect();
+                let body = self.native_fs_stmt(&x.cmd, &words)?;
+                Some(format!(
+                    "{{ {body} __SH_RC.load(Ordering::Relaxed).to_string() }}"
+                ))
+            }
             "StringTrim" => {
                 let x = n.as_any().downcast_ref::<crate::shir_nodes::StringTrim>()?;
                 let t = self.expr_str(&x.text);
@@ -5942,6 +6004,40 @@ while __sh_path.len() > 1 && __sh_path.ends_with('/') {{ __sh_path = &__sh_path[
         // and the pattern expression may be either — go through one binding.
         format!("{{ let __sh_pattern = String::from({p}); {t}.{m}(&__sh_pattern[..]) }}")
     }
+    /// The `fs.*` predicate family — bash's `-ef` / `-nt` / `-ot` / `-N` spelled
+    /// with `std` in one expression each. The NODE carries the semantics that
+    /// are easy to get wrong (the missing-operand rule, FULL-precision
+    /// timestamps, stat-not-lstat); the renderer only writes them down.
+    fn fs_pred_bool(&mut self, n: &dyn crate::shir_nodes::ExtExpr) -> String {
+        use crate::render_ext_expr::handlers::all_nodes as shared;
+        match n.tag() {
+            "FsSameFile" => {
+                let x = n
+                    .as_any()
+                    .downcast_ref::<crate::shir_nodes::FsSameFile>()
+                    .expect("tag/type agree");
+                let (l, r) = (self.expr_str(&x.left), self.expr_str(&x.right));
+                shared::fs_same_file_rust(&l, &r)
+            }
+            "FsNewerThan" => {
+                let x = n
+                    .as_any()
+                    .downcast_ref::<crate::shir_nodes::FsNewerThan>()
+                    .expect("tag/type agree");
+                let (l, r) = (self.expr_str(&x.left), self.expr_str(&x.right));
+                shared::fs_newer_than_rust(&l, &r, x.newer)
+            }
+            "FsModifiedSinceRead" => {
+                let x = n
+                    .as_any()
+                    .downcast_ref::<crate::shir_nodes::FsModifiedSinceRead>()
+                    .expect("tag/type agree");
+                shared::fs_modified_since_read_rust(&self.expr_str(&x.path))
+            }
+            other => panic!("fs_pred_bool: unknown tag {other}"),
+        }
+    }
+
 
     /// Native `std` spelling for the COUNT-valued text nodes Rust's manifest
     /// declares (`ArrayLen`, `WordCount`, `RegCount`).
@@ -6280,6 +6376,8 @@ while __sh_path.len() > 1 && __sh_path.ends_with('/') {{ __sh_path = &__sh_path[
                         .expect("tag/type agree");
                     self.affix_bool(x)
                 }
+                "FsSameFile" | "FsNewerThan" | "FsModifiedSinceRead" =>
+                    self.fs_pred_bool(n.as_ref()),
                 _other => format!("({} != 0)", self.expr_num(e)),
             },
             IrExpr::Arith(a) => self.arith_bool(a),
@@ -7677,7 +7775,9 @@ while __sh_path.len() > 1 && __sh_path.ends_with('/') {{ __sh_path = &__sh_path[
             return Some(if force {
                 "__SH_RC.store(0, Ordering::Relaxed);".to_string()
             } else {
-                "{ eprintln!(\"rm: missing operand\"); __SH_RC.store(1, Ordering::Relaxed); }".to_string()
+                // GNU rm follows the diagnostic with its help hint; the
+                // witness compares it, so it is part of the arm.
+                "{ eprintln!(\"rm: missing operand\"); eprintln!(\"Try 'rm --help' for more information.\"); __SH_RC.store(1, Ordering::Relaxed); }".to_string()
             });
         }
         let true_ = "true";
@@ -7693,9 +7793,9 @@ while __sh_path.len() > 1 && __sh_path.ends_with('/') {{ __sh_path = &__sh_path[
                 // error — exactly the old helper's three cases, with no
                 // `if false` left behind in the emitted code.
                 let errsite = if force {
-                    "                    if __sh_err.kind() == std::io::ErrorKind::NotFound { /* -f: a missing path is not an error */ } else {\n                        eprintln!(\"rm: cannot remove '{}': {}\", __sh_path, __sh_err);\n                        __sh_status = 1;\n                    }".to_string()
+                    "                    if __sh_err.kind() == std::io::ErrorKind::NotFound { /* -f: a missing path is not an error */ } else {\n                        eprintln!(\"rm: cannot remove '{}': {}\", __sh_path, err_text(&__sh_err));\n                        __sh_status = 1;\n                    }".to_string()
                 } else {
-                    "                    eprintln!(\"rm: cannot remove '{}': {}\", __sh_path, __sh_err);\n                    __sh_status = 1;".to_string()
+                    "                    eprintln!(\"rm: cannot remove '{}': {}\", __sh_path, err_text(&__sh_err));\n                    __sh_status = 1;".to_string()
                 };
                 let body = if rec {
                     "        let __sh_res = if __sh_mapped.is_dir() {\n            std::fs::remove_dir_all(__sh_path)\n        } else {\n            std::fs::remove_file(__sh_path)\n        };".to_string()
@@ -7706,6 +7806,13 @@ while __sh_path.len() > 1 && __sh_path.ends_with('/') {{ __sh_path = &__sh_path[
                 };
                 r#"{
     let mut __sh_status: i32 = 0;
+    let err_text = |__e: &std::io::Error| -> String { match __e.kind() {
+        std::io::ErrorKind::NotFound => "No such file or directory".to_string(),
+        std::io::ErrorKind::PermissionDenied => "Permission denied".to_string(),
+        std::io::ErrorKind::AlreadyExists => "File exists".to_string(),
+        std::io::ErrorKind::IsADirectory => "Is a directory".to_string(),
+        std::io::ErrorKind::NotADirectory => "Not a directory".to_string(),
+        _ => format!("{}", __e) } };
     for __sh_path in &@ARGV@ {
         match std::fs::symlink_metadata(__sh_path) {
             Ok(__sh_mapped) => {
@@ -7731,6 +7838,13 @@ while __sh_path.len() > 1 && __sh_path.ends_with('/') {{ __sh_path = &__sh_path[
                 let verbose = flags.contains(&'v');
                 r#"{
     let mut __sh_status: i32 = 0;
+    let err_text = |__e: &std::io::Error| -> String { match __e.kind() {
+        std::io::ErrorKind::NotFound => "No such file or directory".to_string(),
+        std::io::ErrorKind::PermissionDenied => "Permission denied".to_string(),
+        std::io::ErrorKind::AlreadyExists => "File exists".to_string(),
+        std::io::ErrorKind::IsADirectory => "Is a directory".to_string(),
+        std::io::ErrorKind::NotADirectory => "Not a directory".to_string(),
+        _ => format!("{}", __e) } };
     for __sh_path in &@ARGV@ {
         let __sh_res = if @PARENTS@ { std::fs::create_dir_all(__sh_path) } else { std::fs::create_dir(__sh_path) };
         match __sh_res {
@@ -7738,7 +7852,15 @@ while __sh_path.len() > 1 && __sh_path.ends_with('/') {{ __sh_path = &__sh_path[
                 if @VERBOSE@ { println!("mkdir: created directory '{}'", __sh_path); }
             }
             Err(__sh_err) => {
-                eprintln!("mkdir: cannot create directory '{}': {}", __sh_path, __sh_err);
+                // MEASURED shapes, which are NOT one format: this host's
+                // mkdir names the path on `File exists` and omits it on
+                // `Permission denied` / `No such file or directory`.
+                match __sh_err.kind() {
+                    std::io::ErrorKind::AlreadyExists => eprintln!("mkdir: {}: File exists", __sh_path),
+                    std::io::ErrorKind::PermissionDenied => eprintln!("mkdir: Permission denied"),
+                    std::io::ErrorKind::NotFound => eprintln!("mkdir: No such file or directory"),
+                    _ => eprintln!("mkdir: {}: {}", __sh_path, __sh_err),
+                }
                 __sh_status = 1;
             }
         }
@@ -7754,11 +7876,31 @@ while __sh_path.len() > 1 && __sh_path.ends_with('/') {{ __sh_path = &__sh_path[
                 // an existing file, then mtime is bumped like touch(1).
                 r#"{
     let mut __sh_status: i32 = 0;
+    let err_text = |__e: &std::io::Error| -> String { match __e.kind() {
+        std::io::ErrorKind::NotFound => "No such file or directory".to_string(),
+        std::io::ErrorKind::PermissionDenied => "Permission denied".to_string(),
+        std::io::ErrorKind::AlreadyExists => "File exists".to_string(),
+        std::io::ErrorKind::IsADirectory => "Is a directory".to_string(),
+        std::io::ErrorKind::NotADirectory => "Not a directory".to_string(),
+        _ => format!("{}", __e) } };
     for __sh_path in &@ARGV@ {
         match std::fs::OpenOptions::new().create(true).append(true).open(__sh_path) {
             Ok(__sh_field) => { let _ = __sh_field.set_modified(std::time::SystemTime::now()); }
+            // `touch DIR` is a legal time update: append-open refuses a
+            // directory, so the directory is opened read-only for the same
+            // `set_modified` (bash succeeds here; without this the arm would
+            // print a diagnostic bash never prints).
+            Err(__sh_err) if __sh_err.kind() == std::io::ErrorKind::IsADirectory => {
+                match std::fs::File::open(__sh_path) {
+                    Ok(__sh_field) => { let _ = __sh_field.set_modified(std::time::SystemTime::now()); }
+                    Err(__sh_err) => {
+                        eprintln!("touch: cannot touch '{}': {}", __sh_path, err_text(&__sh_err));
+                        __sh_status = 1;
+                    }
+                }
+            }
             Err(__sh_err) => {
-                eprintln!("touch: cannot touch '{}': {}", __sh_path, __sh_err);
+                eprintln!("touch: cannot touch '{}': {}", __sh_path, err_text(&__sh_err));
                 __sh_status = 1;
             }
         }
@@ -7771,9 +7913,31 @@ while __sh_path.len() > 1 && __sh_path.ends_with('/') {{ __sh_path = &__sh_path[
         Some(code)
     }
 
+    /// Whether GNU `cat` prints this path RAW in its diagnostic: coreutils'
+    /// quotearg leaves a name alone only when it cannot trigger quoting, so
+    /// the arm accepts the conservative `[A-Za-z0-9/._-+:,@=~]` set.
+    fn cat_diag_plain(s: &str) -> bool {
+        !s.is_empty()
+            && s.chars()
+                .all(|c| c.is_ascii_alphanumeric() || "/._-+:,@=~".contains(c))
+    }
+
     fn native_cat_stmt(&mut self, words: &[&IrExpr]) -> Option<String> {
         if words.is_empty() || !Self::fs_flags_ok("cat", words) {
             return None; // no operand: `cat` copies stdin
+        }
+        // `cat`'s diagnostic is `cat: PATH: <strerror>` with the path
+        // QUOTED when coreutils' quotearg would quote it (an empty name,
+        // whitespace, a quote, a control byte…). The help arm below spells
+        // the UNQUOTED form only, and a runtime operand cannot be checked at
+        // render time — so both the byte arm and the quoting rule are pinned
+        // to a STATIC path whose characters cannot trigger quoting. A `-`
+        // operand (a stdin read between the files) is refused here too.
+        if !words.iter().all(|w| match w {
+            IrExpr::Str(s, _) => s != "-" && Self::cat_diag_plain(s),
+            _ => false,
+        }) {
+            return None;
         }
         let argv = self.fs_argv(words)?;
         self.add_helper("cat_stmt");
@@ -7827,8 +7991,11 @@ while __sh_path.len() > 1 && __sh_path.ends_with('/') {{ __sh_path = &__sh_path[
                 // (`__sh_basename(&str)`, used by the word-level pathops
                 // lowering), so this argv form gets its own name.
                 self.add_helper(&format!("{cmd}_args"));
+                // The helper reports its own failure (missing/extra
+                // operand): `None` keeps the same diagnostic and makes the
+                // command's status 1, exactly like the real command.
                 Some(format!(
-                    "{{ let __sh_ch = __sh_{cmd}_args(&{argv}); __SH_RC.store(0, Ordering::Relaxed); __sh_ch }}"
+                    "match __sh_{cmd}_args(&{argv}) {{ Some(__sh_ch) => {{ __SH_RC.store(0, Ordering::Relaxed); __sh_ch }} None => {{ __SH_RC.store(1, Ordering::Relaxed); String::new() }} }}"
                 ))
             }
             "mktemp" => {
@@ -10403,6 +10570,25 @@ while __sh_path.len() > 1 && __sh_path.ends_with('/') {{ __sh_path = &__sh_path[
                         }
                     }
                 }
+                // `cat` with NO operand copies stdin to stdout byte for
+                // byte. When that stdin is already an in-process expression
+                // (a heredoc/herestring body — bash would feed it to cat on
+                // a pipe) and nothing else is redirected, the child buys
+                // nothing: write the same bytes to the shell's stdout and
+                // leave status 0. A body carrying raw-byte markers has no
+                // `&str` writing path, so it keeps the spawn.
+                if let Some(inp) = &input {
+                    if redirs.iter().all(|r| r.fd == 0)
+                        && is_bare_exec(inner, "cat")
+                        && !has_byte_marker(inp)
+                    {
+                        self.add_helper("sink");
+                        self.emit(&format!(
+                            "{{ let __sh_c = {inp}; __sh_sink(__sh_c.as_bytes()); __SH_RC.store(0, Ordering::Relaxed); }}"
+                        ));
+                        return;
+                    }
+                }
                 self.add_helper("spawn");
                 if let Some(inp) = input {
                     self.emit(&format!(
@@ -12931,6 +13117,35 @@ while __sh_path.len() > 1 && __sh_path.ends_with('/') {{ __sh_path = &__sh_path[
                     self.emit("__SH_RC.store(0, Ordering::Relaxed);");
                 }
                 IrExpr::Call { func, args } if func == "exec" || func == "builtin" => self.exec_stmt(args),
+                // An `FsCommand` STATEMENT: hand the node's words back to the
+                // `exec` statement renderer, which is the ONE spelling of the
+                // semantics (and the same emission path the un-lifted call
+                // took, so the rendered program is byte-identical either way).
+                IrExpr::Ext(n) if n.tag() == "FsCommand" => {
+                    let x = n
+                        .as_any()
+                        .downcast_ref::<crate::shir_nodes::FsCommand>()
+                        .expect("tag/type agree");
+                    let args = [
+                        IrExpr::Str(x.cmd.clone(), crate::ir::StrStyle::DoubleQuoted),
+                        x.argv.clone(),
+                    ];
+                    self.exec_stmt(&args);
+                }
+                // A `TextFilter` STATEMENT: the node's block PRINTS the chain's
+                // output and stores the last stage's status itself, so the
+                // generic `let _ = <value>` arm would throw the output away
+                // (and its own status store would be the only one that ran).
+                IrExpr::Ext(n) if n.tag() == "TextFilter" => {
+                    let x = n
+                        .as_any()
+                        .downcast_ref::<crate::shir_nodes::TextFilter>()
+                        .expect("tag/type agree");
+                    use crate::render_ext_expr::handlers::all_nodes as shared;
+                    let block =
+                        shared::text_filter_rust(&self.expr_str(&x.src), &x.ops);
+                    self.emit(&block);
+                }
                 IrExpr::Call { func, args } if func == "setArray" || func == "setArrayAppend" => {
                     self.array_call_stmt_by_name(func, args);
                     self.emit("__SH_RC.store(0, Ordering::Relaxed);");
@@ -13150,7 +13365,16 @@ while __sh_path.len() > 1 && __sh_path.ends_with('/') {{ __sh_path = &__sh_path[
                         } else {
                             ""
                         };
-                        self.emit(&format!("{attr}let mut {m} = [{}];", lits.join(", ")));
+                        // An EMPTY literal array has no element type to
+                        // infer: `let mut a = [];` is a rustc error. The
+                        // node-parity witness found it (`a=(); ${#a[@]}`);
+                        // `Vec<String>` keeps every later use (len, iter,
+                        // index) exactly as the array did.
+                        if lits.is_empty() {
+                            self.emit(&format!("{attr}let mut {m}: Vec<String> = Vec::new();"));
+                        } else {
+                            self.emit(&format!("{attr}let mut {m} = [{}];", lits.join(", ")));
+                        }
                         self.emit("__SH_RC.store(0, Ordering::Relaxed);");
                         return;
                     }
@@ -15470,7 +15694,7 @@ const HELPER_ORDER: &[&str] = &[
     "cap_bytes", "capture_rc", "spawn", "run", "readline", "read_fields", "split_ifs",
     "fnmatch", "globlike", "strippre", "stripsuf", "replace", "substr", "case", "len", "basename",
     "dirname", "env", "arg", "glob", "brace", "sleep", "rand", "uid", "euid", "gid", "hostname", "grepmatches", "regex", "regex_posix",
-    "mtime", "samefile", "fmode", "fowner", "fgroup", "fnewer", "wait_all", "bg",
+    "mtime", "access", "samefile", "fmode", "fowner", "fgroup", "fnewer", "wait_all", "bg",
     "fexists", "fdir", "freg", "fsym", "fread", "fwrite", "fexec", "fsize", "aindex",
     "div", "mod", "ret_rc", "capture", "run_traps", "lines",
     "rm", "mkdir", "touch", "catf", "cat_stmt", "mktemp", "basename_args", "dirname_args",
@@ -15600,6 +15824,8 @@ fn helper_deps(h: &str) -> &'static [&'static str] {
         "grepmatches" => &["regex"],
         "fowner" => &["uid"],
         "fgroup" => &["gid"],
+        // access(2) needs the requesting process's identity, not the file's.
+        "access" => &["uid", "gid"],
         _ => &[],
     }
 }
@@ -15941,36 +16167,81 @@ fn helper_source(h: &str) -> &'static str {
     for p in argv {
         match std::fs::read(p) {
             Ok(d) => __sh_sink(&d),
-            Err(e) => { eprintln!("cat: {}: {}", p, e); rc = 1; }
+            Err(e) => {
+                // bash's diagnostic is `cat: PATH: <strerror>`, not the
+                // io::Error Display (`... (os error 2)`). The three kinds a
+                // script can meet on a static path are named here; anything
+                // else falls back to the OS string and is not claimed to be
+                // bash's text (same rule as the TextFilter arm).
+                let m = match e.kind() {
+                    std::io::ErrorKind::NotFound => "No such file or directory".to_string(),
+                    std::io::ErrorKind::PermissionDenied => "Permission denied".to_string(),
+                    std::io::ErrorKind::IsADirectory => "Is a directory".to_string(),
+                    _ => format!("{}", e),
+                };
+                eprintln!("cat: {}: {}", p, m);
+                rc = 1;
+            }
         }
     }
     rc
 }"#,
-        "basename_args" => r#"fn __sh_basename_args(argv: &[String]) -> String {
-    let p = match argv.first() { Some(p) => p.clone(), None => { eprintln!("basename: missing operand"); return String::new(); } };
-    let suffix = argv.get(1).cloned().unwrap_or_default();
+        // `basename`/`dirname` are pure string ops, so the argv helper has to
+        // be exact for EVERY argv the fold can hand it — including the empty
+        // operand (uutils prints an empty line / `.`, not `/`), the suffix
+        // operand (`basename p .txt`) and the error paths (missing/extra
+        // operand: one diagnostic, a `Try ...` hint and status 1). Measured
+        // against uutils coreutils 0.10.0 on this host.
+        "basename_args" => r#"fn __sh_basename_args(argv: &[String]) -> Option<String> {
+    if argv.is_empty() {
+        eprintln!("basename: missing operand\nTry 'basename --help' for more information.");
+        return None;
+    }
+    if argv.len() > 2 {
+        eprintln!("basename: extra operand '{}'\nTry 'basename --help' for more information.", argv[2]);
+        return None;
+    }
+    let p = &argv[0];
     let body = p.trim_end_matches('/');
-    let mut out = if body.is_empty() {
+    let mut out = if p.is_empty() {
+        String::new()
+    } else if body.is_empty() {
         "/".to_string()
     } else {
         match body.rfind('/') { Some(i) => body[i + 1..].to_string(), None => body.to_string() }
     };
-    if !suffix.is_empty() && out.len() > suffix.len() && out.ends_with(&suffix) {
-        out.truncate(out.len() - suffix.len());
-    }
-    out
-}"#,
-        "dirname_args" => r#"fn __sh_dirname_args(argv: &[String]) -> String {
-    let p = match argv.first() { Some(p) => p.clone(), None => { eprintln!("dirname: missing operand"); return String::new(); } };
-    let t = p.trim_end_matches('/');
-    if t.is_empty() { return "/".to_string(); }
-    match t.rfind('/') {
-        None => ".".to_string(),
-        Some(i) => {
-            let d = t[..i].trim_end_matches('/');
-            if d.is_empty() { "/".to_string() } else { d.to_string() }
+    if let Some(suffix) = argv.get(1) {
+        if !suffix.is_empty() && out.len() > suffix.len() && out.ends_with(suffix.as_str()) {
+            out.truncate(out.len() - suffix.len());
         }
     }
+    Some(out)
+}"#,
+        "dirname_args" => r#"fn __sh_dirname_args(argv: &[String]) -> Option<String> {
+    if argv.is_empty() {
+        eprintln!("dirname: missing operand\nTry 'dirname --help' for more information.");
+        return None;
+    }
+    let mut out: Vec<String> = Vec::new();
+    for p in argv {
+        if p.is_empty() {
+            out.push(".".to_string());
+            continue;
+        }
+        let t = p.trim_end_matches('/');
+        if t.is_empty() {
+            out.push("/".to_string());
+            continue;
+        }
+        out.push(match t.rfind('/') {
+            None => ".".to_string(),
+            Some(i) => {
+                let d = t[..i].trim_end_matches('/');
+                if d.is_empty() { "/".to_string() } else { d.to_string() }
+            }
+        });
+    }
+    Some(out.join("\n"))
 }"#,
         "mktemp" => r#"fn __sh_mktemp(dir: bool, tmpl: &str) -> String {
     let t = if tmpl.is_empty() {
@@ -16594,10 +16865,32 @@ fn helper_source(h: &str) -> &'static str {
         "rand" => r#"fn __sh_rand() -> String {
     String::from_utf8_lossy(&__sh_cap_bytes("echo $RANDOM", None)).trim().to_string()
 }"#,
-        "mtime" => r#"fn __sh_mtime(s: &str) -> i64 {
-    std::fs::metadata(s).and_then(|m| m.modified()).map(|t| {
-        t.duration_since(std::time::UNIX_EPOCH).map(|d| d.as_secs() as i64).unwrap_or(0)
-    }).unwrap_or(0)
+        // NANOSECONDS, and `None` for a path that cannot be stat'd: bash's
+        // `-nt`/`-ot` compare the full timestamp (two files created in the
+        // same second still order) and treat a MISSING side specially.
+        "mtime" => r#"fn __sh_mtime_ns(s: &str) -> Option<i128> {
+    let t = std::fs::metadata(s).ok()?.modified().ok()?;
+    Some(t.duration_since(std::time::UNIX_EPOCH).map(|d| d.as_nanos() as i128).unwrap_or(0))
+}"#,
+        "access" => r#"fn __sh_access(p: &str, want: u32) -> bool {
+    // `test -r/-w/-x` is access(2): the requesting process's permission
+    // CLASS, not `open()` — a directory is writable without being openable
+    // for write, and opening a FIFO would block forever.
+    use std::os::unix::fs::MetadataExt;
+    let md = match std::fs::metadata(p) { Ok(m) => m, Err(_) => return false };
+    if __sh_uid() == 0 {
+        // root: read/write always allowed; execute needs SOME execute bit.
+        return want & 1 == 0 || md.mode() & 0o111 != 0;
+    }
+    let mode = md.mode();
+    let bits = if md.uid() == __sh_uid() {
+        (mode >> 6) & 7
+    } else if md.gid() == __sh_gid() {
+        (mode >> 3) & 7
+    } else {
+        mode & 7
+    };
+    bits & want != 0
 }"#,
         "fmode" => r#"fn __sh_fmode(s: &str, bits: u32) -> bool {
     use std::os::unix::fs::MetadataExt;
@@ -16621,7 +16914,12 @@ fn helper_source(h: &str) -> &'static str {
             .and_then(|l| l.split_whitespace().nth(1)).and_then(|v| v.parse().ok()))
         .unwrap_or(0)
 }"#,
+        // `$HOSTNAME` is a shell VARIABLE bash initialises from the
+        // INHERITED environment (measured: `HOSTNAME=foo bash -c 'echo
+        // $HOSTNAME'` prints foo, and an empty value stays empty), falling
+        // back to the kernel name only when the variable is unset.
         "hostname" => r#"fn __sh_hostname() -> String {
+    if let Ok(h) = std::env::var("HOSTNAME") { return h; }
     std::fs::read_to_string("/proc/sys/kernel/hostname")
         .map(|s| s.trim_end().to_string()).unwrap_or_default()
 }"#,
@@ -17273,6 +17571,23 @@ fn fn_body_line_text(r: &mut Render, s: &IrStmt) -> String {
 /// Does the statement list contain a shell-out (needs text reconstruction)?
 /// Does the statement list call a shell FUNCTION? (a fn call shelling
 /// out would lose the body — render natively)
+/// `exec CMD` / `builtin CMD` with no words, alone in a statement list.
+fn is_bare_exec(stmts: &[IrStmt], cmd: &str) -> bool {
+    match stmts {
+        [IrStmt::Expr(IrExpr::Call { func, args })] if func == "exec" || func == "builtin" => {
+            if str_arg(args, 0) != Some(cmd) {
+                return false;
+            }
+            match args.get(1) {
+                None => true,
+                Some(IrExpr::Array(a)) => a.is_empty(),
+                Some(_) => false,
+            }
+        }
+        _ => false,
+    }
+}
+
 fn contains_fn_call(r: &Render, stmts: &[IrStmt]) -> bool {
     stmts.iter().any(|s| match s {
         IrStmt::Expr(IrExpr::Call { func, args }) if func == "exec" || func == "builtin" => {
@@ -17814,13 +18129,17 @@ impl<'a, 'r> TestParser<'a, 'r> {
             "-f" => format!("std::path::Path::new(&{operand}).is_file()"),
             "-d" => format!("std::path::Path::new(&{operand}).is_dir()"),
             "-e" => format!("std::path::Path::new(&{operand}).exists()"),
-            "-r" => format!("std::fs::File::open(&{operand}).is_ok()"),
-            "-w" => format!(
-                "std::fs::OpenOptions::new().write(true).open(&{operand}).is_ok()"
-            ),
-            "-x" => format!(
-                "std::fs::metadata(&{operand}).map(|__sh_mapped| {{ use std::os::unix::fs::PermissionsExt; __sh_mapped.permissions().mode() & 0o111 != 0 }}).unwrap_or(false)"
-            ),
+            // access(2) semantics, one helper for the three modes: the
+            // class bits of the CALLING process (see `__sh_access`).
+            "-r" | "-w" | "-x" => {
+                self.render.add_helper("access");
+                let want = match op {
+                    "-r" => 4,
+                    "-w" => 2,
+                    _ => 1,
+                };
+                format!("__sh_access(&{operand}, {want})")
+            }
             "-s" => format!(
                 "std::fs::metadata(&{operand}).map(|__sh_mapped| __sh_mapped.len() > 0).unwrap_or(false)"
             ),
@@ -18070,10 +18389,17 @@ impl<'a, 'r> TestParser<'a, 'r> {
                     "{{ let __sh_mapped = __sh_regex(&{l}, &{r}, {flags}); match __sh_mapped {{ Some(__sh_mapped) => __sh_mapped, None => {{ __SH_RC.store(2, Ordering::Relaxed); false }} }} }}"
                 )
             }
+            // bash's rules, not a numeric compare of two defaults: `a -nt
+            // b` is false when a is missing, TRUE when only b is missing,
+            // and compares at nanosecond precision otherwise (measured);
+            // `-ot` is the mirror image.
             "-nt" | "-ot" => {
                 self.render.add_helper("mtime");
-                let rs = if op == "-nt" { ">" } else { "<" };
-                format!("(__sh_mtime(&{lhs}) {rs} __sh_mtime(&{rhs}))")
+                let cmp = if op == "-nt" { ">" } else { "<" };
+                let only_known = if op == "-nt" { "(Some(_), None) => true" } else { "(None, Some(_)) => true" };
+                format!(
+                    "(match (__sh_mtime_ns(&{lhs}), __sh_mtime_ns(&{rhs})) {{ (Some(__sh_l), Some(__sh_r)) => __sh_l {cmp} __sh_r, {only_known}, _ => false }})"
+                )
             }
             "-ef" => {
                 self.render.add_helper("samefile");
@@ -24218,8 +24544,13 @@ mod tests {
     #[test]
     fn final_pipelines_and_glob_classes_execute_like_bash() {
         let cases: &[(&str, &str, Option<&str>)] = &[
-            ("FinalPipeHead", "echo abc | head -n 2\n", Some("__sh_lines[..__sh_stop].join")),
-            ("FinalPipeTail", "echo abc | tail -n 1\n", Some("__sh_lines[__sh_start..].join")),
+            // A FINAL pipeline is the same `IrStmt::Pipeline` shape the
+            // mid-program text-filter lift handles, so since text-filter-lift
+            // these two render as one TextFilter block (`__sh_cur`) instead of
+            // a TakeLines expression; the compile-and-run below still holds
+            // them to bash's bytes.
+            ("FinalPipeHead", "echo abc | head -n 2\n", Some("__sh_cur")),
+            ("FinalPipeTail", "echo abc | tail -n 1\n", Some("__sh_cur")),
             ("FinalPipeWc", "echo \"a b c\" | wc -w\n", None),
             ("FinalPipeCut", "echo \"a,b,c\" | cut -d, -f2\n", None),
             ("FinalPipeXargs", "echo \" a b \" | xargs\n", None),
@@ -24242,13 +24573,15 @@ mod tests {
                 bad.push(format!("{name}: still shells out"));
                 continue;
             }
-            let (rs_out, rs_rc) = compile_and_run(name, &prog);
-            let (sh_out, sh_rc) = run_bash(src);
-            if rs_out != sh_out || rs_rc != sh_rc {
+            let (rs_out, rs_err, rs_rc) = compile_and_run_full(name, &prog);
+            let (sh_out, sh_err, sh_rc) = run_bash_full(src);
+            if rs_out != sh_out || rs_err != sh_err || rs_rc != sh_rc {
                 bad.push(format!(
-                    "{name}: rust rc={rs_rc:?} out={:?} / bash rc={sh_rc:?} out={:?}",
+                    "{name}: rust rc={rs_rc:?} out={:?} err={:?} / bash rc={sh_rc:?} out={:?} err={:?}",
                     String::from_utf8_lossy(&rs_out),
-                    String::from_utf8_lossy(&sh_out)
+                    String::from_utf8_lossy(&rs_err),
+                    String::from_utf8_lossy(&sh_out),
+                    String::from_utf8_lossy(&sh_err)
                 ));
             }
         }
@@ -24490,7 +24823,7 @@ mod tests {
             (
                 "-x",
                 "f=a.txt\nif [ -x \"$f\" ]; then echo y; fi\n",
-                &["permissions().mode() & 0o111"],
+                &["__sh_access(", "0o111"],
             ),
         ];
         let helpers = [
@@ -24518,7 +24851,35 @@ mod tests {
 
     /// Compile a rendered program with `rustc` and run it: `(stdout, code)`.
     fn compile_and_run(case: &str, prog: &str) -> (Vec<u8>, Option<i32>) {
-        let dir = std::env::temp_dir().join(format!("sh2_text_nodes_{}_{}", std::process::id(), case));
+        let (out, _err, code) = compile_and_run_full(case, prog);
+        (out, code)
+    }
+
+    /// `compile_and_run` plus the child's STDERR, for the witnesses whose
+    /// refusal reason is an error MESSAGE (`head: cannot open 'a'`).
+    fn compile_and_run_full(case: &str, prog: &str) -> (Vec<u8>, Vec<u8>, Option<i32>) {
+        compile_and_run_full_args(case, prog, &[])
+    }
+
+    /// The same, with `argv` — a witness whose subject must stay a RUNTIME
+    /// value (`v="$1"`), so the lift cannot constant-fold the case away.
+    fn compile_and_run_full_args(
+        case: &str,
+        prog: &str,
+        argv: &[&str],
+    ) -> (Vec<u8>, Vec<u8>, Option<i32>) {
+        // Unique per INVOCATION: two witnesses (or a re-run of the same case)
+        // may hold the same `case` name concurrently, and the remove/create at
+        // the top would then delete the other's binary mid-run — which is what
+        // surfaced as `run render: NotFound`.
+        static SEQ: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+        let seq = SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        let dir = std::env::temp_dir().join(format!(
+            "sh2_text_nodes_{}_{}_{}",
+            std::process::id(),
+            case,
+            seq
+        ));
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).expect("temp dir");
         let src = dir.join("main.rs");
@@ -24536,21 +24897,1122 @@ mod tests {
             String::from_utf8_lossy(&build.stderr)
         );
         let run = std::process::Command::new(&bin)
+            .args(argv)
             .current_dir(&dir)
             .output()
             .expect("run render");
         let _ = std::fs::remove_dir_all(&dir);
-        (run.stdout, run.status.code())
+        (run.stdout, run.stderr, run.status.code())
+    }
+
+    /// `compile_and_run_full` with the child's ENVIRONMENT controlled, for
+    /// the identity variables (`$HOSTNAME`) whose value comes from the
+    /// inherited environment.
+    fn compile_and_run_full_env(
+        case: &str,
+        prog: &str,
+        envs: &[(&str, &str)],
+        unset: &[&str],
+    ) -> (Vec<u8>, Vec<u8>, Option<i32>) {
+        static SEQ: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+        let seq = SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        let dir = std::env::temp_dir().join(format!(
+            "sh2_text_nodes_env_{}_{}_{}",
+            std::process::id(),
+            case,
+            seq
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).expect("temp dir");
+        let src = dir.join("main.rs");
+        let bin = dir.join("main");
+        std::fs::write(&src, prog).expect("write render");
+        let build = std::process::Command::new("rustc")
+            .args(["--edition", "2021", "-A", "warnings", "-o"])
+            .arg(&bin)
+            .arg(&src)
+            .output()
+            .expect("rustc");
+        assert!(
+            build.status.success(),
+            "{case}: rustc rejected the render:\n{}",
+            String::from_utf8_lossy(&build.stderr)
+        );
+        let mut run_cmd = std::process::Command::new(&bin);
+        run_cmd.current_dir(&dir).envs(envs.iter().copied());
+        for k in unset {
+            run_cmd.env_remove(k);
+        }
+        let run = run_cmd.output().expect("run render");
+        let _ = std::fs::remove_dir_all(&dir);
+        (run.stdout, run.stderr, run.status.code())
+    }
+
+    /// `run_bash_full` with the child's ENVIRONMENT controlled.
+    fn run_bash_full_env(src: &str, envs: &[(&str, &str)], unset: &[&str]) -> (Vec<u8>, Vec<u8>, Option<i32>) {
+        let mut cmd = std::process::Command::new("bash");
+        cmd.arg("-c").arg(src).arg("sh").envs(envs.iter().copied());
+        for k in unset {
+            cmd.env_remove(k);
+        }
+        let out = cmd.output().expect("bash");
+        (out.stdout, out.stderr, out.status.code())
     }
 
     /// Run a shell snippet under bash: `(stdout, code)`.
     fn run_bash(src: &str) -> (Vec<u8>, Option<i32>) {
+        let (out, _err, code) = run_bash_full(src);
+        (out, code)
+    }
+
+    /// `run_bash` plus STDERR.
+    fn run_bash_full(src: &str) -> (Vec<u8>, Vec<u8>, Option<i32>) {
+        run_bash_full_args(src, &[])
+    }
+
+    /// The same, with the positional parameters `$1…` the compiled program
+    /// reads through `__sh_arg`. `sh` fills `$0`, matching a script invoked
+    /// as `bash script.sh a b`.
+    fn run_bash_full_args(src: &str, argv: &[&str]) -> (Vec<u8>, Vec<u8>, Option<i32>) {
         let out = std::process::Command::new("bash")
             .arg("-c")
             .arg(src)
+            .arg("sh")
+            .args(argv)
             .output()
             .expect("bash");
-        (out.stdout, out.status.code())
+        (out.stdout, out.stderr, out.status.code())
+    }
+
+    /// A LITERAL affix strip — the one pattern `affix_strip_fold` builds an
+    /// `AffixStrip` for — renders as `strip_prefix`/`strip_suffix` with the
+    /// text passed through on a miss, and matches bash on stdout, stderr and
+    /// status. The subject is `$1` (a runtime value, so the lift cannot
+    /// constant-fold the case away) and the values cover a hit, a miss, a
+    /// repeated pattern, a leading slash, an empty value and glob-literal
+    /// punctuation. `#`/`##` and `%`/`%%` coincide for a literal pattern: a
+    /// pattern without wildcards admits the same single match either way.
+    #[test]
+    fn affix_strip_literals_execute_like_bash() {
+        // The subject is built at RUNTIME (`v` is the value concatenated with
+        // an UNSET variable), so the lift cannot constant-fold the case away
+        // and the strip really runs on each value.
+        let cases: &[(&str, &str, &str)] = &[
+            ("prefix-hit", "#", "/a"),
+            ("prefix-miss", "#", "zz"),
+            ("prefix-twice", "#", "a"),
+            ("prefix-longest", "##", "a"),
+            ("suffix-hit", "%", "/c"),
+            ("suffix-miss", "%", "zz"),
+            ("suffix-twice", "%", "a"),
+            ("suffix-longest", "%%", "a"),
+            ("metachar-literal", "#", "a."),
+        ];
+        let values: &[&str] = &["/a/b/c", "aXa", "", "/", "a.b/c"];
+        for (name, op, pat) in cases {
+            for (i, v) in values.iter().enumerate() {
+                let src = format!(
+                    "v='{v}'\"$__sh_probe_unset\"\necho \"[${{v{op}{pat}}}]\"\n"
+                );
+                let prog = render_rs(&src);
+                // No `%` or `/` in the temp-dir name: rustc/lld reject some
+                // punctuation in an output path.
+                let opname = match *op {
+                    "#" => "hash",
+                    "##" => "hashhash",
+                    "%" => "pct",
+                    _ => "pctpct",
+                };
+                let case = format!("{name}-{i}-{opname}");
+                assert!(
+                    !prog.contains("__sh_spawn("),
+                    "{case}: a literal affix strip still spawns:\n{prog}"
+                );
+                assert!(
+                    !prog.contains("__sh_strippre(") && !prog.contains("__sh_stripsuf("),
+                    "{case}: kept the glob strip helper instead of the node:\n{prog}"
+                );
+                assert!(
+                    prog.contains("strip_prefix(") || prog.contains("strip_suffix("),
+                    "{case}: the AffixStrip arm did not render:\n{prog}"
+                );
+                let (rs_out, rs_err, rs_rc) = compile_and_run_full(&case, &prog);
+                let (sh_out, sh_err, sh_rc) = run_bash_full(&src);
+                assert_eq!(
+                    String::from_utf8_lossy(&rs_out),
+                    String::from_utf8_lossy(&sh_out),
+                    "{case}: stdout differs from bash for {v:?}\n--- rust ---\n{prog}"
+                );
+                assert_eq!(
+                    String::from_utf8_lossy(&rs_err),
+                    String::from_utf8_lossy(&sh_err),
+                    "{case}: stderr differs from bash for {v:?}"
+                );
+                assert_eq!(rs_rc, sh_rc, "{case}: status differs from bash for {v:?}");
+            }
+        }
+    }
+
+    /// The two regex nodes have NO producer in this tree and no byte-exact
+    /// `std` rendering: `std` has no regex engine, and a hand-rolled matcher
+    /// would be exact on a subset while silently wrong on the rest (POSIX
+    /// BRE/ERE includes backreferences, greedy quantifiers and classes). So
+    /// the tag stays refused and the COMMAND keeps its exact meaning. The
+    /// witness compiles the render and compares stdout, STDERR and status
+    /// with bash, and rejects a `TODO` marker — the old shared handler's
+    /// Rust arm returned a COMMENT for these tags, which in a program is not
+    /// a refusal, it is a silently empty expression.
+    #[test]
+    fn refused_regex_nodes_keep_the_command() {
+        for (name, src) in [
+            ("sed-sub", "echo aaa | sed 's/a/b/'\n"),
+            ("sed-sub-global", "echo aaa | sed 's/a/b/g'\n"),
+            ("sed-on-file", "printf 'a:b\\n' > /tmp/sh2_reg_probe\nsed 's/:/,/' /tmp/sh2_reg_probe\n"),
+            ("grep-ere", "echo abc | grep -E 'a(b|c)+'\n"),
+            ("grep-only-matching", "echo abc | grep -o 'b'\n"),
+        ] {
+            let prog = render_rs(src);
+            assert!(
+                prog.contains("__sh_spawn("),
+                "{name}: a refused regex shape was folded:\n{prog}"
+            );
+            assert!(
+                !prog.contains("/* TODO"),
+                "{name}: a TODO marker reached the program:\n{prog}"
+            );
+            let (rs_out, rs_err, rs_rc) = compile_and_run_full(name, &prog);
+            let (sh_out, sh_err, sh_rc) = run_bash_full(src);
+            assert_eq!(
+                String::from_utf8_lossy(&rs_out),
+                String::from_utf8_lossy(&sh_out),
+                "{name}: stdout differs from bash"
+            );
+            assert_eq!(
+                String::from_utf8_lossy(&rs_err),
+                String::from_utf8_lossy(&sh_err),
+                "{name}: stderr differs from bash"
+            );
+            assert_eq!(rs_rc, sh_rc, "{name}: status differs from bash");
+        }
+    }
+
+    /// `cat FILE` is a BYTE copy. The Rust statement arm reads the operands
+    /// with `std::fs::read` into the byte sink, so there is no line splitting,
+    /// no re-added final newline and no UTF-8 validation — and its diagnostic
+    /// is bash's `cat: PATH: <strerror>`, not the `io::Error` Display text.
+    ///
+    /// Every case runs the compiled program against bash on the same absolute
+    /// paths and compares stdout, STDERR and status: a newline-terminated
+    /// file, one whose last line has no `\n`, an empty file, binary bytes,
+    /// several operands, a missing operand (alone and followed by a good
+    /// one), a directory, an unreadable file and the empty filename.
+    ///
+    /// The two shapes the arm does not spell keep the command, and the
+    /// witness proves the spawn survives: a bare `cat` (stdin copy) and
+    /// `cat -` (a stdin read BETWEEN the operands).
+    #[cfg(unix)]
+    #[test]
+    fn cat_statement_copies_bytes_like_bash() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = std::env::temp_dir().join(format!("sh2_cat_stmt_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(dir.join("sub")).expect("fixture dir");
+        let write = |n: &str, b: &[u8]| std::fs::write(dir.join(n), b).expect("fixture write");
+        write("nl.txt", b"one\ntwo\n");
+        write("nonl.txt", b"one\ntwo");
+        write("empty.txt", b"");
+        write("bin.dat", &[0xff, 0xfe, 0x00, 0x41, 0x0a, 0x80]);
+        write("locked.txt", b"secret\n");
+        std::fs::set_permissions(dir.join("locked.txt"), std::fs::Permissions::from_mode(0o000))
+            .expect("fixture chmod");
+        let p = |n: &str| dir.join(n).to_string_lossy().into_owned();
+
+        let cases = [
+            ("cat-nl", format!("cat '{}'\n", p("nl.txt"))),
+            ("cat-no-final-newline", format!("cat '{}'\n", p("nonl.txt"))),
+            ("cat-empty-file", format!("cat '{}'\n", p("empty.txt"))),
+            ("cat-binary", format!("cat '{}'\n", p("bin.dat"))),
+            (
+                "cat-two-files",
+                format!("cat '{}' '{}'\n", p("nl.txt"), p("nonl.txt")),
+            ),
+            ("cat-missing", format!("cat '{}'\n", p("nope.txt"))),
+            (
+                "cat-missing-then-good",
+                format!("cat '{}' '{}'\n", p("nope.txt"), p("nl.txt")),
+            ),
+            ("cat-directory", format!("cat '{}'\n", p("sub"))),
+            ("cat-unreadable", format!("cat '{}'\n", p("locked.txt"))),
+        ];
+        for (name, src) in cases {
+            let prog = render_rs(&src);
+            assert!(
+                prog.contains("__sh_cat_stmt("),
+                "{name}: `cat FILE` did not take the byte arm:\n{prog}"
+            );
+            assert!(
+                !prog.contains("__sh_spawn(") && !prog.contains("__cat_line"),
+                "{name}: `cat FILE` still forks or still splits lines:\n{prog}"
+            );
+            assert!(!prog.contains("/* TODO"), "{name}: TODO in render:\n{prog}");
+            let (rs_out, rs_err, rs_rc) = compile_and_run_full(name, &prog);
+            let (sh_out, sh_err, sh_rc) = run_bash_full(&src);
+            assert_eq!(rs_out, sh_out, "{name}: stdout differs from bash");
+            assert_eq!(
+                String::from_utf8_lossy(&rs_err),
+                String::from_utf8_lossy(&sh_err),
+                "{name}: stderr differs from bash"
+            );
+            assert_eq!(rs_rc, sh_rc, "{name}: status differs from bash");
+        }
+
+        std::fs::set_permissions(dir.join("locked.txt"), std::fs::Permissions::from_mode(0o644))
+            .expect("fixture chmod back");
+        let _ = std::fs::remove_dir_all(&dir);
+
+        // Refused shapes: the command must still be the command. The empty
+        // filename and a name with a space are refused because GNU cat's
+        // diagnostic QUOTES them (`cat: '': …`, `cat: 'a b': …`) and the arm
+        // spells the unquoted form; a bare `cat` and `cat -` read stdin.
+        for (name, src) in [
+            ("cat-bare", "cat\n".to_string()),
+            ("cat-stdin-operand", format!("cat - '{}'\n", p("nl.txt"))),
+            ("cat-empty-name", "cat ''\n".to_string()),
+            (
+                "cat-quoted-name",
+                format!("cat '{}'\n", dir.join("no such.txt").to_string_lossy()),
+            ),
+        ] {
+            let prog = render_rs(&src);
+            assert!(
+                prog.contains("__sh_spawn("),
+                "{name}: a refused cat shape was folded:\n{prog}"
+            );
+            assert!(
+                !prog.contains("/* TODO") && !prog.contains("__sh_cat_stmt("),
+                "{name}: no placeholder may stand in for the command:\n{prog}"
+            );
+            let (rs_out, rs_err, rs_rc) = compile_and_run_full(name, &prog);
+            let (sh_out, sh_err, sh_rc) = run_bash_full(&src);
+            assert_eq!(rs_out, sh_out, "{name}: stdout differs from bash");
+            assert_eq!(
+                String::from_utf8_lossy(&rs_err),
+                String::from_utf8_lossy(&sh_err),
+                "{name}: stderr differs from bash"
+            );
+            assert_eq!(rs_rc, sh_rc, "{name}: status differs from bash");
+        }
+    }
+
+    /// `rm`, `mkdir` and `touch` are native `std::fs` statements — so their
+    /// DIAGNOSTICS have to be bash's (`rm: cannot remove 'p': No such file or
+    /// directory`), not `io::Error`'s Display (`… (os error 2)`). The matrix
+    /// runs the compiled program and bash over the SAME absolute paths, with
+    /// the fixture tree rebuilt before each side: present/missing/duplicate,
+    /// a directory operand, recursive and `-d` removal, an empty parent, and
+    /// a read-only directory (present/missing/no-permission, as applicable).
+    #[cfg(unix)]
+    #[test]
+    fn fs_statements_report_bash_diagnostics() {
+        use std::os::unix::fs::PermissionsExt;
+        let root = std::env::temp_dir().join(format!("sh2_fs_stmt_{}", std::process::id()));
+        let p = |n: &str| root.join(n).to_string_lossy().into_owned();
+        let reset = || {
+            let _ = std::fs::set_permissions(root.join("ro"), std::fs::Permissions::from_mode(0o755));
+            let _ = std::fs::remove_dir_all(&root);
+            std::fs::create_dir_all(root.join("sub")).expect("fixture sub");
+            std::fs::create_dir_all(root.join("existing")).expect("fixture existing");
+            std::fs::create_dir_all(root.join("emptyd")).expect("fixture emptyd");
+            std::fs::create_dir_all(root.join("ro")).expect("fixture ro");
+            std::fs::write(root.join("sub").join("f.txt"), b"sub\n").expect("fixture sub file");
+            std::fs::write(root.join("ro").join("f.txt"), b"ro\n").expect("fixture ro file");
+            std::fs::write(root.join("goner.txt"), b"gone\n").expect("fixture goner");
+            std::fs::write(root.join("has.txt"), b"keep me\n").expect("fixture has");
+            std::fs::write(root.join("gone2.txt"), b"two\n").expect("fixture gone2");
+            std::fs::write(root.join("gone3.txt"), b"three\n").expect("fixture gone3");
+            std::fs::create_dir_all(root.join("tree").join("inner")).expect("fixture tree");
+            std::fs::write(root.join("tree").join("inner").join("leaf"), b"leaf\n")
+                .expect("fixture tree leaf");
+            // Deterministic mtimes: `touch old.txt` must lift it above
+            // `ref.txt`, or the witness cannot OBSERVE that touch updated the
+            // time (a touch that did nothing would print "older").
+            std::fs::write(root.join("old.txt"), b"old\n").expect("fixture old");
+            std::fs::write(root.join("ref.txt"), b"ref\n").expect("fixture ref");
+            let stamp = |n: &str, secs: u64| {
+                let f = std::fs::OpenOptions::new()
+                    .write(true)
+                    .open(root.join(n))
+                    .expect("stamp open");
+                f.set_modified(std::time::UNIX_EPOCH + std::time::Duration::from_secs(secs))
+                    .expect("stamp set");
+            };
+            stamp("old.txt", 1_000_000);
+            stamp("ref.txt", 2_000_000);
+            std::fs::set_permissions(root.join("ro"), std::fs::Permissions::from_mode(0o555))
+                .expect("fixture ro mode");
+        };
+        let cases = [
+            ("fs-rm-file", format!("rm '{}'\n", p("goner.txt"))),
+            ("fs-rm-missing", format!("rm '{}'\n", p("nope.txt"))),
+            ("fs-rm-force-missing", format!("rm -f '{}'\n", p("nope.txt"))),
+            (
+                "fs-rm-multi",
+                format!("rm '{}' '{}'\n", p("gone2.txt"), p("gone3.txt")),
+            ),
+            ("fs-rm-dir-flag-file", format!("rm -d '{}'\n", p("has.txt"))),
+            ("fs-rm-recursive-tree", format!("rm -r '{}'\n", p("tree"))),
+            ("fs-rm-no-operand", "rm\n".to_string()),
+            ("fs-rm-directory", format!("rm '{}'\n", p("sub"))),
+            ("fs-rm-recursive", format!("rm -r '{}'\n", p("sub"))),
+            ("fs-rm-empty-dir-flag", format!("rm -d '{}'\n", p("emptyd"))),
+            (
+                "fs-rm-permission",
+                format!("rm '{}/f.txt'\n", p("ro")),
+            ),
+            ("fs-mkdir-new", format!("mkdir '{}'\n", p("made"))),
+            ("fs-mkdir-exists", format!("mkdir '{}'\n", p("existing"))),
+            ("fs-mkdir-parents", format!("mkdir -p '{}/a/b'\n", p("deep"))),
+            ("fs-mkdir-permission", format!("mkdir '{}/child'\n", p("ro"))),
+            ("fs-mkdir-missing-parent", format!("mkdir '{}/child'\n", p("absent"))),
+            (
+                "fs-mkdir-parents-existing",
+                format!("mkdir -p '{}/a/b'\nmkdir -p '{}'\n", p("deep2"), p("existing")),
+            ),
+            (
+                "fs-touch-updates-mtime",
+                format!(
+                    "touch '{}'\nif [ '{}' -nt '{}' ]; then echo newer; else echo older; fi\n",
+                    p("old.txt"),
+                    p("old.txt"),
+                    p("ref.txt")
+                ),
+            ),
+            (
+                "fs-touch-multi",
+                format!("touch '{}' '{}'\n", p("t2a"), p("t2b")),
+            ),
+            (
+                "fs-rm-through-file",
+                format!("rm '{}/x'\n", p("has.txt")),
+            ),
+            ("fs-touch-directory", format!("touch '{}'\n", p("existing"))),
+            ("fs-touch-new", format!("touch '{}'\n", p("touched.txt"))),
+            (
+                "fs-touch-keeps-content",
+                format!("touch '{}'\ncat '{}'\n", p("has.txt"), p("has.txt")),
+            ),
+            (
+                "fs-touch-missing-parent",
+                format!("touch '{}/x'\n", p("absent")),
+            ),
+            ("fs-touch-permission", format!("touch '{}/new'\n", p("ro"))),
+        ];
+        for (name, src) in cases {
+            let prog = render_rs(&src);
+            assert!(
+                !prog.contains("__sh_spawn(") && !prog.contains("/* TODO"),
+                "{name}: the fs command did not render natively:\n{prog}"
+            );
+            reset();
+            let (sh_out, sh_err, sh_rc) = run_bash_full(&src);
+            reset();
+            let (rs_out, rs_err, rs_rc) = compile_and_run_full(name, &prog);
+            assert_eq!(rs_out, sh_out, "{name}: stdout differs from bash");
+            assert_eq!(
+                String::from_utf8_lossy(&rs_err),
+                String::from_utf8_lossy(&sh_err),
+                "{name}: stderr differs from bash"
+            );
+            assert_eq!(rs_rc, sh_rc, "{name}: status differs from bash");
+        }
+        std::fs::set_permissions(root.join("ro"), std::fs::Permissions::from_mode(0o755))
+            .expect("fixture chmod back");
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    // ── node-family parity witnesses ──────────────────────────────────────
+    //
+    // ONE command runs every family that replaced a shell-out:
+    //
+    //     cargo test --lib node_parity_ -- --nocapture
+    //
+    // Each case renders the shell script to Rust, asserts the rendered
+    // program does NOT shell out, then runs the SAME script through `bash`
+    // and the generated binary over a fixture rebuilt for each side, and
+    // requires stdout, stderr AND exit status to match byte for byte. A
+    // vacuous case (no output, status 0) is a failure, and the suite
+    // requires more than ten successes and several failing cases so an arm
+    // that always takes one branch cannot pass.
+    //
+    // The comparison is not decoration: perturbing an arm's output (the
+    // `CaseTransform` arm emitting `to_uppercase` for `${v,,}`) makes this
+    // suite fail with the family's name and both byte streams.
+
+    /// Fixture for the parity witnesses: a readable file, an empty file, an
+    /// unreadable file and directory, and a path that never exists. Rebuilt
+    /// before each side so bash and the render see identical bytes/modes.
+    #[cfg(unix)]
+    fn parity_reset(root: &std::path::Path) {
+        use std::os::unix::fs::PermissionsExt;
+        let _ = std::fs::set_permissions(root.join("adir"), std::fs::Permissions::from_mode(0o755));
+        let _ = std::fs::set_permissions(root.join("f000"), std::fs::Permissions::from_mode(0o644));
+        let _ = std::fs::remove_dir_all(root);
+        std::fs::create_dir_all(root.join("adir")).expect("fixture adir");
+        std::fs::write(root.join("plain.txt"), b"one\ntwo\nthree\n").expect("fixture plain");
+        std::fs::write(root.join("empty.txt"), b"").expect("fixture empty");
+        std::fs::write(root.join("f000"), b"secret\n").expect("fixture f000");
+        std::fs::set_permissions(root.join("f000"), std::fs::Permissions::from_mode(0o000))
+            .expect("fixture f000 mode");
+        std::fs::set_permissions(root.join("adir"), std::fs::Permissions::from_mode(0o555))
+            .expect("fixture adir mode");
+    }
+
+    #[cfg(unix)]
+    fn parity_drop(root: &std::path::Path) {
+        use std::os::unix::fs::PermissionsExt;
+        let _ = std::fs::set_permissions(root.join("adir"), std::fs::Permissions::from_mode(0o755));
+        let _ = std::fs::set_permissions(root.join("f000"), std::fs::Permissions::from_mode(0o644));
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    /// Run one family table: render, no-spawn, then bash-vs-Rust bytes.
+    #[cfg(unix)]
+    fn run_node_parity(tag: &str, cases: &[(&str, String)]) -> (usize, usize) {
+        let root = std::env::temp_dir().join(format!("sh2_parity_{}_{}", tag, std::process::id()));
+        let mut bad: Vec<String> = Vec::new();
+        let (mut positives, mut failures) = (0, 0);
+        for (family, src) in cases {
+            let prog = render_rs(src);
+            if prog.contains("__sh_spawn(") {
+                bad.push(format!("{family}: still shells out:\n{prog}"));
+                continue;
+            }
+            parity_reset(&root);
+            let (sh_out, sh_err, sh_rc) = run_bash_full(src);
+            parity_reset(&root);
+            let (rs_out, rs_err, rs_rc) = compile_and_run_full(family, &prog);
+            if rs_out != sh_out || rs_err != sh_err || rs_rc != sh_rc {
+                bad.push(format!(
+                    "{family}: rust rc={rs_rc:?} out={:?} err={:?} / bash rc={sh_rc:?} out={:?} err={:?}",
+                    String::from_utf8_lossy(&rs_out),
+                    String::from_utf8_lossy(&rs_err),
+                    String::from_utf8_lossy(&sh_out),
+                    String::from_utf8_lossy(&sh_err)
+                ));
+                continue;
+            }
+            // Non-vacuity: the case must OBSERVE something (a byte or a status)
+            // — unless its name says the shell's correct answer IS the empty
+            // byte stream (`…@empty`). Those cases are not vacuous in the
+            // sense this check guards: the empty answer is exactly what a
+            // stray newline or a swallowed line breaks, and one did.
+            if sh_out.is_empty() && sh_err.is_empty() && sh_rc == Some(0) {
+                if !family.contains("@empty") {
+                    bad.push(format!(
+                        "{family}: vacuous (no output, status 0) — name it @empty if the empty stream is the point: {src:?}"
+                    ));
+                    continue;
+                }
+            }
+            if sh_rc == Some(0) {
+                positives += 1;
+            } else {
+                failures += 1;
+            }
+            println!("{family:24} ok  rc={sh_rc:?} out={:?}", String::from_utf8_lossy(&sh_out));
+        }
+        parity_drop(&root);
+        assert!(
+            bad.is_empty(),
+            "node-family parity disagreements:\n{}",
+            bad.join("\n")
+        );
+        assert!(
+            positives > 10,
+            "only {positives} positive cases: an always-failing arm could pass this"
+        );
+        (positives, failures)
+    }
+
+    /// Text filters and the string/split/affix family: every one of these used
+    /// to `bash -c`; the edge cases are the ones an arm gets wrong while the
+    /// happy path still looks right (empty input, a pattern that matches
+    /// nothing, a pattern that matches everything, no delimiter, extra
+    /// delimiters, a slice past the end, an empty variable).
+    #[cfg(unix)]
+    #[test]
+    fn node_parity_text_and_string_families() {
+        let cases: Vec<(&str, String)> = vec![
+            // CharTranslate: the byte map, a delete set, a squeeze, and a
+            // class over non-ASCII input (tr leaves É alone).
+            ("CharTranslate-range", "w=$(printf 'abc-xyz\\n' | tr 'a-c' 'x'); printf '%s\\n' \"$w\"\n".into()),
+            ("CharTranslate-delete", "w=$(printf 'a1b2\\n' | tr -d '0-9'); printf '%s\\n' \"$w\"\n".into()),
+            ("CharTranslate-class", "w=$(printf 'Éé ABC\\n' | tr '[:upper:]' '[:lower:]'); printf '%s\\n' \"$w\"\n".into()),
+            (
+                "CharTranslate-empty-line",
+                "w=$(printf '\\n' | tr 'a' 'b'); printf '[%s]\\n' \"$w\"\n".into(),
+            ),
+            // WordCount / TextFilter: POSIX isspace class, empty input, and
+            // a final line without a newline.
+            ("WordCount", "printf 'a b   c\\n' | wc -w\n".into()),
+            ("WordCount-empty", "printf '' | wc -w\n".into()),
+            ("TextFilter-wc-l", "printf 'a\\nb' | wc -l\n".into()),
+            // TakeLines: more lines than the input has, and zero lines.
+            ("TakeLines-short", "printf 'a\\nb\\nc\\n' | head -2\n".into()),
+            ("TakeLines-past-end", "printf 'a\\nb\\n' | head -9\n".into()),
+            (
+                "TakeLines-zero@empty",
+                "printf 'a\\nb\\n' | head -0\n".into(),
+            ),
+            // UniqLines: adjacent runs, all-equal input, empty input.
+            ("UniqLines-runs", "printf 'a\\na\\nb\\n' | uniq\n".into()),
+            ("UniqLines-all-equal", "printf 'x\\nx\\nx\\n' | uniq\n".into()),
+            ("UniqLines-empty@empty", "printf '' | uniq\n".into()),
+            // SortLines: lowercase input only — `sort` collates by locale and
+            // the render must not pretend to a different order.
+            ("SortLines", "printf 'b\\na\\nc\\n' | sort\n".into()),
+            ("SortLines-empty@empty", "printf '' | sort\n".into()),
+            // SubStrExtract: a bounded slice, an open slice, past the end.
+            ("SubStrExtract-3", "v=abcdef; printf '%s\\n' \"${v:1:3}\"\n".into()),
+            ("SubStrExtract-open", "v=abcdef; printf '%s\\n' \"${v:2}\"\n".into()),
+            ("SubStrExtract-past-end", "v=ab; printf '[%s]\\n' \"${v:5:2}\"\n".into()),
+            ("SubStrExtract-empty", "v=; printf '[%s]\\n' \"${v:0:3}\"\n".into()),
+            // StrLen / ArrayLen: empty and non-empty, empty and populated.
+            ("StrLen", "v=abc; printf '%s\\n' \"${#v}\"\n".into()),
+            ("StrLen-empty", "v=; printf '%s\\n' \"${#v}\"\n".into()),
+            ("ArrayLen", "a=(alpha beta gamma); printf '%s\\n' \"${#a[@]}\"\n".into()),
+            ("ArrayLen-empty", "a=(); printf '%s\\n' \"${#a[@]}\"\n".into()),
+            // AffixStrip: matching prefix, matching suffix, NO match (the
+            // text must pass through), and an empty value.
+            ("AffixStrip-prefix", "v=abcdef; printf '%s\\n' \"${v#abc}\"\n".into()),
+            ("AffixStrip-suffix", "v=abcdef; printf '%s\\n' \"${v%def}\"\n".into()),
+            ("AffixStrip-no-match", "v=abcdef; printf '%s\\n' \"${v#zzz}\"\n".into()),
+            ("AffixStrip-empty", "v=; printf '[%s]\\n' \"${v#a}\"\n".into()),
+            // CutsetTrim: one char of a cutset, a whole cutset, no match.
+            ("CutsetTrim-prefix", "v=xxaxx; printf '%s\\n' \"${v#x}\"\n".into()),
+            ("CutsetTrim-cutset", "v=abcba; printf '%s\\n' \"${v##[ab]}\"\n".into()),
+            ("CutsetTrim-no-match", "v=xyz; printf '%s\\n' \"${v#a}\"\n".into()),
+            // Split / FieldExtract: two fields, a single field (no
+            // delimiter), MORE delimiters than fields, and empty input.
+            ("FieldExtract", "IFS=: read -r a b <<< '1:2'; printf '%s|%s\\n' \"$a\" \"$b\"\n".into()),
+            ("Split-no-delimiter", "IFS=: read -r a b <<< 'only'; printf '%s|%s\\n' \"$a\" \"$b\"\n".into()),
+            ("Split-multi", "s='1:2:3:4'; IFS=: read -r a b c <<< \"$s\"; printf '%s|%s|%s\\n' \"$a\" \"$b\" \"$c\"\n".into()),
+            ("Split-empty", "IFS=: read -r a b <<< ''; printf '[%s]|[%s]\\n' \"$a\" \"$b\"\n".into()),
+            // StringAffix: a match, a non-match, and a pattern that matches
+            // EVERYTHING (`*`).
+            ("StringAffix-match", "v=abc; if [[ $v == a* ]]; then printf 'yes\\n'; else printf 'no\\n'; fi\n".into()),
+            ("StringAffix-no-match", "v=abc; if [[ $v == z* ]]; then printf 'yes\\n'; else printf 'no\\n'; fi\n".into()),
+            ("StringAffix-all", "v=abc; if [[ $v == * ]]; then printf 'yes\\n'; else printf 'no\\n'; fi\n".into()),
+            // CaseTransform: both maps, an empty value, and a non-ASCII one.
+            ("CaseTransform-lower", "v=AbC; printf '%s\\n' \"${v,,}\"\n".into()),
+            ("CaseTransform-upper", "v=AbC; printf '%s\\n' \"${v^^}\"\n".into()),
+            ("CaseTransform-empty", "v=; printf '[%s]\\n' \"${v^^}\"\n".into()),
+            // StringTrim: the POSIX isspace class, an all-blank value, and
+            // NBSP which xargs keeps and `trim()` would eat.
+            ("StringTrim", "v=$(printf '  a b  \\n' | xargs); printf '[%s]\\n' \"$v\"\n".into()),
+            ("StringTrim-all-blank", "v=$(printf '   \\n' | xargs); printf '[%s]\\n' \"$v\"\n".into()),
+            (
+                "StringTrim-nbsp",
+                "v=$(echo \" \u{a0}x \" | xargs)\nprintf '[%s]\\n' \"$v\"\n".into(),
+            ),
+            // PathName: a trailing slash, a bare name, the root, and an
+            // EMPTY operand (the one input basename/dirname do not stat).
+            ("PathName-basename", "basename /a/b/c\n".into()),
+            ("PathName-basename-slash", "basename /a/b/\n".into()),
+            ("PathName-dirname", "dirname /a/b/c\n".into()),
+            ("PathName-dirname-bare", "dirname rel\n".into()),
+            ("PathName-dirname-root", "dirname /\n".into()),
+            ("PathName-empty", "basename ''\n".into()),
+        ];
+        run_node_parity("text", &cases);
+    }
+
+    /// The filesystem families: the three predicates and the command node,
+    /// each over a real fixture including a nonexistent path, an unreadable
+    /// file and directory, a directory used as a file, and a missing operand.
+    #[cfg(unix)]
+    #[test]
+    fn node_parity_fs_families() {
+        let root = std::env::temp_dir().join(format!("sh2_parity_paths_{}", std::process::id()));
+        let p = |n: &str| root.join(n).to_string_lossy().into_owned();
+        let cases: Vec<(&str, String)> = vec![
+            ("FsSameFile-same", format!("[ '{}' -ef '{}' ] && printf 'same\\n'\n", p("plain.txt"), p("plain.txt"))),
+            ("FsSameFile-different", format!("[ '{}' -ef '{}' ] || printf 'differ\\n'\n", p("plain.txt"), p("empty.txt"))),
+            ("FsSameFile-missing", format!("[ '{}' -ef '{}' ] || printf 'missing\\n'\n", p("absent"), p("plain.txt"))),
+            ("FsNewerThan", format!("[ '{}' -nt '{}' ] && printf 'newer\\n' || printf 'older\\n'\n", p("f000"), p("plain.txt"))),
+            ("FsNewerThan-missing-right", format!("[ '{}' -nt '{}' ] && printf 'newer\\n' || printf 'older\\n'\n", p("plain.txt"), p("absent"))),
+            ("FsModifiedSinceRead", format!("[ -N '{}' ] && printf 'mod\\n' || printf 'nomod\\n'\n", p("plain.txt"))),
+            ("FsModifiedSinceRead-missing", format!("[ -N '{}' ] && printf 'mod\\n' || printf 'nomod\\n'\n", p("absent"))),
+            // The failing cases end on the command itself, so the script's
+            // exit status (and its stderr) is the command's: that is where an
+            // arm that always succeeds diverges.
+            ("FsCommand-rm-missing", format!("rm '{}'\n", p("absent"))),
+            ("FsCommand-rm-force", format!("rm -f '{}'\nprintf 'rc=%s\\n' \"$?\"\n", p("absent"))),
+            ("FsCommand-rm-unreadable", format!("rm '{}'\nprintf 'rc=%s\\n' \"$?\"\n", p("f000"))),
+            ("FsCommand-rm-dir-without-flag", format!("rm '{}'\n", p("adir"))),
+            ("FsCommand-mkdir-exists", format!("mkdir '{}'\n", p("adir"))),
+            ("FsCommand-mkdir-parents", format!("mkdir -p '{}/x/y'\nprintf 'rc=%s\\n' \"$?\"\n", p("adir"))),
+            ("FsCommand-touch", format!("touch '{}'\nprintf 'rc=%s\\n' \"$?\"\n", p("plain.txt"))),
+            ("FsCommand-touch-missing-parent", format!("touch '{}/x'\n", p("absent"))),
+        ];
+        let (positives, failures) = run_node_parity("paths", &cases);
+        // Mixed outcomes: these failing-status cases are the ones an arm that
+        // only ever succeeds would get wrong.
+        assert!(
+            failures >= 3,
+            "only {failures} failing cases (of {} total): an always-succeeding arm could pass this",
+            positives + failures
+        );
+    }
+
+    /// The `fs.*` command family's REFUSALS, asserted where they matter: a
+    /// shape the node does not model must keep the route it had (a shell-out
+    /// that knows the flag), not fall into the arm and lose the flag. This is
+    /// the list the report carries, one line per reason:
+    ///
+    /// * `mkdir -m` / `touch -d` / `rm -i` — flags outside the renderer's
+    ///   contract (`mkdir`: p,v; `touch`: none; `rm`: f,r,R,d);
+    /// * `cat` beyond the two folds it already had — the heredoc/herestring
+    ///   body is a byte copy (pass 11) and `cat FILE | wc/cut/head/tee/uniq`
+    ///   folds into a `TextFilter` (result text); `cat f | sort` (a stage
+    ///   whose consumer is not foldable) and `cat *.txt` (a glob) keep
+    ///   spawning;
+    /// * `rm file_*.txt` — a glob word (one `Str` at IR time, N paths at
+    ///   runtime) is a refusal, never an arm that drops the statement.
+    #[test]
+    fn fs_shapes_outside_the_node_keep_their_shell() {
+        for src in [
+            "mkdir -m 700 newdir\n",
+            "touch -d '2020-01-01 00:00' f\n",
+            "rm -i f\n",
+            "cat 'f' | sort\n",
+            "cat *.txt\n",
+            "rm file_*.txt\n",
+        ] {
+            let prog = render_rs(src);
+            assert!(
+                prog.contains("__sh_spawn("),
+                "a refused fs shape lost its shell route: {src:?}\n{prog}"
+            );
+        }
+    }
+
+    /// The class-6 fixture tree: regular files across the permission bits
+    /// (including the setuid/setgid/sticky marks), directories whose modes
+    /// differ from the caller's, a FIFO, a valid and a dangling symlink, and
+    /// a hardlink to one file. Explicit timestamps make `-N` and the
+    /// sub-second `-nt` order deterministic, and the tree is REBUILT before
+    /// each side so bash and the render see the same inodes, modes and times.
+    #[cfg(unix)]
+    fn reset_stat_fixture(root: &std::path::Path) {
+        use std::os::unix::fs::{symlink, PermissionsExt};
+        use std::time::{Duration, UNIX_EPOCH};
+        for d in ["d500", "d300", "d755"] {
+            let _ = std::fs::set_permissions(root.join(d), std::fs::Permissions::from_mode(0o755));
+        }
+        let _ = std::fs::set_permissions(root.join("f000"), std::fs::Permissions::from_mode(0o644));
+        let _ = std::fs::remove_dir_all(root);
+        std::fs::create_dir_all(root).expect("fixture root");
+        let mk = |n: &str, mode: u32| {
+            std::fs::write(root.join(n), b"x").expect("fixture file");
+            std::fs::set_permissions(root.join(n), std::fs::Permissions::from_mode(mode))
+                .expect("fixture chmod");
+        };
+        mk("f644", 0o644);
+        mk("f000", 0o000);
+        mk("f400", 0o400);
+        mk("f555", 0o555);
+        mk("f4755", 0o4755);
+        mk("f2755", 0o2755);
+        mk("f1755", 0o1755);
+        for (d, mode) in [("d755", 0o755), ("d500", 0o500), ("d300", 0o300)] {
+            std::fs::create_dir_all(root.join(d)).expect("fixture dir");
+            std::fs::set_permissions(root.join(d), std::fs::Permissions::from_mode(mode))
+                .expect("fixture dir chmod");
+        }
+        assert!(
+            std::process::Command::new("mkfifo")
+                .arg(root.join("fifo1"))
+                .status()
+                .expect("mkfifo")
+                .success(),
+            "fixture: mkfifo failed"
+        );
+        symlink("f644", root.join("linkok")).expect("fixture symlink");
+        symlink("nowhere", root.join("linkbad")).expect("fixture dangling symlink");
+        std::fs::hard_link(root.join("f644"), root.join("hard")).expect("fixture hardlink");
+        // `-N`/`-nt` determinism: f644 was modified after it was read, f400
+        // was read after it was modified, and f555/f4755 are in the SAME
+        // second a nanosecond apart (bash orders those; a seconds compare
+        // would call it a tie).
+        let set = |n: &str, at: u64, mt: u64, mt_nanos: u32| {
+            let f = std::fs::OpenOptions::new()
+                .read(true)
+                .open(root.join(n))
+                .expect("fixture open");
+            f.set_times(
+                std::fs::FileTimes::new()
+                    .set_accessed(UNIX_EPOCH + Duration::from_secs(at))
+                    .set_modified(
+                        UNIX_EPOCH + Duration::from_secs(mt) + Duration::from_nanos(u64::from(mt_nanos)),
+                    ),
+            )
+            .expect("fixture times");
+        };
+        set("f644", 1000, 2000, 0);
+        set("f400", 3000, 1000, 0);
+        set("f555", 1000, 5000, 0);
+        set("f4755", 1000, 5000, 120_000_000);
+    }
+
+    #[cfg(unix)]
+    fn clear_stat_fixture(root: &std::path::Path) {
+        use std::os::unix::fs::PermissionsExt;
+        for d in ["d500", "d300", "d755"] {
+            let _ = std::fs::set_permissions(root.join(d), std::fs::Permissions::from_mode(0o755));
+        }
+        let _ = std::fs::set_permissions(root.join("f000"), std::fs::Permissions::from_mode(0o644));
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    /// `test -r/-w/-x` is access(2), not `open()`: the model is the CALLER's
+    /// permission class, so a 0755 directory is writable even though it cannot
+    /// be opened for write, a 0300 directory is not readable, a file's owner
+    /// class is used even when its `o+w` bit is clear, and a FIFO is probed
+    /// without opening it (which would block). Every one of those diverged
+    /// from bash before this arm used `__sh_access`.
+    #[cfg(unix)]
+    #[test]
+    fn permission_predicates_follow_access_semantics() {
+        let root = std::env::temp_dir().join(format!("sh2_perm_pred_{}", std::process::id()));
+        let p = |n: &str| root.join(n).to_string_lossy().into_owned();
+        let paths = [
+            "f644", "f000", "f400", "f555", "f4755", "f2755", "f1755", "d755", "d500", "d300",
+            "linkok", "linkbad",
+        ];
+        let mut src = String::new();
+        for (i, n) in paths.iter().enumerate() {
+            let full = p(n);
+            for (j, op) in ["-r", "-w", "-x"].iter().enumerate() {
+                src.push_str(&format!(
+                    "if [ {op} '{full}' ]; then echo '{i}.{j}=1'; else echo '{i}.{j}=0'; fi\n"
+                ));
+            }
+        }
+        for (i, full) in ["/dev/null".to_string(), p("nope"), String::new()].iter().enumerate() {
+            for (j, op) in ["-r", "-w", "-x"].iter().enumerate() {
+                src.push_str(&format!(
+                    "if [ {op} '{full}' ]; then echo 'x{i}.{j}=1'; else echo 'x{i}.{j}=0'; fi\n"
+                ));
+            }
+        }
+        let prog = render_rs(&src);
+        assert!(
+            !prog.contains("__sh_spawn(") && !prog.contains("/* TODO"),
+            "permission predicates did not render natively:\n{prog}"
+        );
+        reset_stat_fixture(&root);
+        let (sh_out, sh_err, sh_rc) = run_bash_full(&src);
+        reset_stat_fixture(&root);
+        let (rs_out, rs_err, rs_rc) = compile_and_run_full("perm-predicates", &prog);
+        clear_stat_fixture(&root);
+        assert_eq!(
+            String::from_utf8_lossy(&rs_out),
+            String::from_utf8_lossy(&sh_out),
+            "permission predicates: stdout differs from bash"
+        );
+        assert_eq!(
+            String::from_utf8_lossy(&rs_err),
+            String::from_utf8_lossy(&sh_err),
+            "permission predicates: stderr differs from bash"
+        );
+        assert_eq!(rs_rc, sh_rc, "permission predicates: status differs from bash");
+        // The matrix is not vacuous: bash says yes to some and no to others.
+        let text = String::from_utf8_lossy(&sh_out);
+        assert!(
+            text.lines().any(|l| l.ends_with("=1")) && text.lines().any(|l| l.ends_with("=0")),
+            "fixture produced no mixed answers:\n{text}"
+        );
+        assert!(
+            text.lines().filter(|l| l.ends_with("=1")).count() > 10,
+            "too few positive predicates to be a witness:\n{text}"
+        );
+    }
+
+    /// The remaining stat predicates are native `std` calls, so each has to
+    /// agree with bash's `test` on the whole matrix: present/missing/empty,
+    /// file-vs-directory, every mode bit, symlink follow (`-e`/`-f`/`-O`/`-G`)
+    /// vs no-follow (`-h`/`-L`), and the timestamp rules — `-N` is
+    /// mtime-after-atime, and `-nt`/`-ot` compare at NANOSECOND precision,
+    /// are false when both sides are missing, and treat a missing side
+    /// specially (`a -nt b` is true when only b is gone, `-ot` the mirror).
+    #[cfg(unix)]
+    #[test]
+    fn stat_predicates_execute_like_bash() {
+        let root = std::env::temp_dir().join(format!("sh2_stat_pred_{}", std::process::id()));
+        let p = |n: &str| root.join(n).to_string_lossy().into_owned();
+        let paths = [
+            "f644", "f000", "f400", "f555", "f4755", "f2755", "f1755", "d755", "d500", "d300",
+            "fifo1", "linkok", "linkbad", "hard",
+        ];
+        let ops = [
+            "-e", "-f", "-d", "-h", "-L", "-p", "-S", "-b", "-c", "-u", "-g", "-k", "-O", "-G",
+            "-N", "-s",
+        ];
+        let mut src = String::new();
+        for (i, n) in paths.iter().enumerate() {
+            let full = p(n);
+            for (j, op) in ops.iter().enumerate() {
+                src.push_str(&format!(
+                    "if [ {op} '{full}' ]; then echo '{i}.{j}=1'; else echo '{i}.{j}=0'; fi\n"
+                ));
+            }
+        }
+        for (i, (a, b)) in [
+            ("f644", "f400"),
+            ("f400", "f644"),
+            ("f555", "f4755"),
+            ("f4755", "f555"),
+            ("f644", "nope"),
+            ("nope", "f644"),
+            ("nope", "nope2"),
+            ("f644", "f644"),
+            ("f644", "hard"),
+            ("f644", "linkok"),
+            ("f644", "linkbad"),
+        ]
+        .iter()
+        .enumerate()
+        {
+            for op in ["-nt", "-ot", "-ef"] {
+                src.push_str(&format!(
+                    "if [ '{}' {op} '{}' ]; then echo 'b{i}{op}=1'; else echo 'b{i}{op}=0'; fi\n",
+                    p(a),
+                    p(b)
+                ));
+            }
+        }
+        for (i, full) in [String::new(), "/dev/null".to_string(), p("nope")].iter().enumerate() {
+            for (j, op) in ops.iter().enumerate() {
+                src.push_str(&format!(
+                    "if [ {op} '{full}' ]; then echo 'x{i}.{j}=1'; else echo 'x{i}.{j}=0'; fi\n"
+                ));
+            }
+        }
+        // The VARIABLE spelling reaches the renderer's `binary_test` arm
+        // instead of the `FsNewerThan` node, so both routes are witnessed.
+        for (i, (a, b)) in [
+            ("f555", "f4755"),
+            ("f4755", "f555"),
+            ("f644", "nope"),
+            ("nope", "f644"),
+            ("nope", "nope2"),
+        ]
+        .iter()
+        .enumerate()
+        {
+            for op in ["-nt", "-ot", "-ef"] {
+                src.push_str(&format!(
+                    "v1='{}'; v2='{}'; if test \"$v1\" {op} \"$v2\"; then echo 'v{i}{op}=1'; else echo 'v{i}{op}=0'; fi\n",
+                    p(a),
+                    p(b)
+                ));
+            }
+        }
+        let prog = render_rs(&src);
+        assert!(
+            prog.contains("__sh_mtime_ns("),
+            "the `test` spelling did not reach the timestamp arm:\n{prog}"
+        );
+        assert!(
+            !prog.contains("__sh_spawn(") && !prog.contains("/* TODO"),
+            "stat predicates did not render natively:\n{prog}"
+        );
+        reset_stat_fixture(&root);
+        let (sh_out, sh_err, sh_rc) = run_bash_full(&src);
+        reset_stat_fixture(&root);
+        let (rs_out, rs_err, rs_rc) = compile_and_run_full("stat-predicates", &prog);
+        clear_stat_fixture(&root);
+        assert_eq!(
+            String::from_utf8_lossy(&rs_out),
+            String::from_utf8_lossy(&sh_out),
+            "stat predicates: stdout differs from bash"
+        );
+        assert_eq!(
+            String::from_utf8_lossy(&rs_err),
+            String::from_utf8_lossy(&sh_err),
+            "stat predicates: stderr differs from bash"
+        );
+        assert_eq!(rs_rc, sh_rc, "stat predicates: status differs from bash");
+    }
+
+    /// Class 6, the ARGV half: `basename`/`dirname` are pure string ops, so
+    /// each one's render must match uutils coreutils 0.10.0 (this host) for
+    /// every operand shape — the single operand the `PathName` node spells,
+    /// the suffix operand, several operands (one output line each), the EMPTY
+    /// operand (empty line / `.`, NOT `/`) and the error paths (one
+    /// diagnostic, a `Try ...` hint, status 1). Statement position and
+    /// `$( ... )` take different routes (node vs argv helper), so both are
+    /// witnessed, and the multi-operand statement covers the spawn fallback.
+    #[cfg(unix)]
+    #[test]
+    fn basename_dirname_operands_match_coreutils() {
+        let paths = [
+            "/", "//", "a", "a/", "a//b//", ".", "..", "", "/x", "a/b.txt", "a/.", "a/b/",
+        ];
+        let mut stmt = String::new();
+        let mut sub = String::new();
+        for p in paths {
+            stmt.push_str(&format!("basename '{p}'\ndirname '{p}'\n"));
+            stmt.push_str(&format!("basename '{p}' '.txt'\ndirname '{p}' '/x'\n"));
+            sub.push_str(&format!("v=$(basename '{p}'); echo \"b=[$v]\"\n"));
+            sub.push_str(&format!("v=$(dirname '{p}'); echo \"d=[$v]\"\n"));
+            sub.push_str(&format!("v=$(basename '{p}' '.txt'); echo \"bs=[$v]\"\n"));
+            sub.push_str(&format!("v=$(dirname '{p}' '/x'); echo \"dm=[$v]\"\n"));
+        }
+        stmt.push_str("echo done\n");
+        let errs = "basename; echo \"rc=$?\"\nbasename a b c; echo \"rc=$?\"\ndirname; echo \"rc=$?\"\nbasename a b; echo \"rc=$?\"\ndirname a; echo \"rc=$?\"\n\
+                    v=$(basename a b c); echo \"sub-extra=[$v] rc=$?\"\n\
+                    v=$(dirname); echo \"sub-missing=[$v] rc=$?\"\n\
+                    v=$(basename); echo \"sub-missing-b=[$v] rc=$?\"\n";
+        for (case, src) in [
+            ("basename-dirname-statements", stmt.as_str()),
+            ("basename-dirname-substitutions", sub.as_str()),
+            ("basename-dirname-errors", errs),
+        ] {
+            let prog = render_rs(src);
+            assert!(
+                !prog.contains("/* TODO"),
+                "{case}: placeholder in the render:\n{prog}"
+            );
+            let (rs_out, rs_err, rs_rc) = compile_and_run_full(case, &prog);
+            let (sh_out, sh_err, sh_rc) = run_bash_full(src);
+            assert_eq!(
+                String::from_utf8_lossy(&rs_out),
+                String::from_utf8_lossy(&sh_out),
+                "{case}: stdout differs from bash"
+            );
+            assert_eq!(
+                String::from_utf8_lossy(&rs_err),
+                String::from_utf8_lossy(&sh_err),
+                "{case}: stderr differs from bash"
+            );
+            assert_eq!(rs_rc, sh_rc, "{case}: status differs from bash");
+        }
+    }
+
+    /// Class 6, the IDENTITY half: `$UID`/`$EUID` (process identity) and
+    /// `$HOSTNAME` (a shell variable bash initialises from the INHERITED
+    /// environment, falling back to the kernel name only when it is unset —
+    /// measured on this host). The child's environment is controlled on both
+    /// sides, so the inherited / empty / unset cases are all covered.
+    #[cfg(unix)]
+    #[test]
+    fn identity_variables_execute_like_bash() {
+        let src = "echo \"[$HOSTNAME]\"\necho \"$UID $EUID\"\n";
+        let prog = render_rs(src);
+        assert!(!prog.contains("__sh_spawn(") && !prog.contains("/* TODO"), "identity variables did not render natively:\n{prog}");
+        for (case, envs, unset) in [
+            ("identity-inherited", &[("HOSTNAME", "probe.host")][..], &[][..]),
+            ("identity-empty", &[("HOSTNAME", "")][..], &[][..]),
+            ("identity-unset", &[][..], &["HOSTNAME"][..]),
+        ] {
+            let (rs_out, rs_err, rs_rc) = compile_and_run_full_env(case, &prog, envs, unset);
+            let (sh_out, sh_err, sh_rc) = run_bash_full_env(src, envs, unset);
+            assert_eq!(
+                String::from_utf8_lossy(&rs_out),
+                String::from_utf8_lossy(&sh_out),
+                "{case}: stdout differs from bash"
+            );
+            assert_eq!(
+                String::from_utf8_lossy(&rs_err),
+                String::from_utf8_lossy(&sh_err),
+                "{case}: stderr differs from bash"
+            );
+            assert_eq!(rs_rc, sh_rc, "{case}: status differs from bash");
+        }
+    }
+
+    /// `cat` with no operand is a byte copy of its stdin, so a heredoc or
+    /// herestring `cat` renders as one write of the body it already holds —
+    /// no child, no quoting. The bodies cover a QUOTED delimiter (no
+    /// expansion), an expanded variable, `<<-` tab stripping, a herestring,
+    /// an empty body and a body containing quotes/backslashes/dollars.
+    #[cfg(unix)]
+    #[test]
+    fn heredoc_cat_copies_the_body_without_a_child() {
+        let src = "cat <<'EOF'\nquoted $HOME and `date` and \\n\nEOF\n\
+                   var=world\n\
+                   cat <<EOF\nhello $var\nEOF\n\
+                   cat <<-EOF\n\ttabbed $var\n\tEOF\n\
+                   cat <<< \"herestring $var\"\n\
+                   cat <<EOF\nEOF\n\
+                   cat <<EOF\nhas 'single' and \"double\" quotes\nEOF\n";
+        let prog = render_rs(src);
+        assert!(
+            !prog.contains("__sh_spawn("),
+            "the heredoc cat still spawns:\n{prog}"
+        );
+        let (rs_out, rs_err, rs_rc) = compile_and_run_full("heredoc-cat", &prog);
+        let (sh_out, sh_err, sh_rc) = run_bash_full(src);
+        assert_eq!(
+            String::from_utf8_lossy(&rs_out),
+            String::from_utf8_lossy(&sh_out),
+            "heredoc cat: stdout differs from bash"
+        );
+        assert_eq!(
+            String::from_utf8_lossy(&rs_err),
+            String::from_utf8_lossy(&sh_err),
+            "heredoc cat: stderr differs from bash"
+        );
+        assert_eq!(rs_rc, sh_rc, "heredoc cat: status differs from bash");
+        // Non-vacuous: the body really printed (and the quoted one kept `$`).
+        let text = String::from_utf8_lossy(&rs_out);
+        assert!(text.contains("quoted $HOME") && text.contains("hello world"), "empty heredoc output:\n{text}");
+    }
+
+    /// The argv forms the old fold MIS-READ, each with the same witness as a
+    /// node: the render keeps the command, and its stdout, STDERR and exit
+    /// status are bash's byte-for-byte. `head -1 a b` used to take the LAST
+    /// word as the count (printing `1` where bash prints a per-file header and
+    /// an open error); `tail -n +2` used to parse `+2` as a signed integer and
+    /// fold "from line 2 on" to "the last 2 lines" — right on a 3-line input,
+    /// wrong on a 5-line one.
+    #[test]
+    fn misread_head_tail_argv_keep_the_command() {
+        for (name, src) in [
+            // Paths that exist in NEITHER the crate dir nor the render's temp
+            // dir, so both sides print the same open errors (a local `a`/`b`
+            // would make bash read files the compiled program cannot see).
+            (
+                "head-multi-operand",
+                "seq 1 3 | head -1 /nonexistent/sh2_a /nonexistent/sh2_b\n",
+            ),
+            ("tail-plus-n", "seq 1 5 | tail -n +2\n"),
+        ] {
+            let prog = render_rs(src);
+            assert!(
+                prog.contains("__sh_spawn("),
+                "{name}: the mis-read argv form was folded:\n{prog}"
+            );
+            assert!(
+                !prog.contains("__sh_cur"),
+                "{name}: emitted the TextFilter block:\n{prog}"
+            );
+            let (rs_out, rs_err, rs_rc) = compile_and_run_full(name, &prog);
+            let (sh_out, sh_err, sh_rc) = run_bash_full(src);
+            assert_eq!(
+                String::from_utf8_lossy(&rs_out),
+                String::from_utf8_lossy(&sh_out),
+                "{name}: stdout differs from bash"
+            );
+            assert_eq!(
+                String::from_utf8_lossy(&rs_err),
+                String::from_utf8_lossy(&sh_err),
+                "{name}: stderr differs from bash"
+            );
+            assert_eq!(rs_rc, sh_rc, "{name}: exit status differs from bash");
+        }
     }
 
     /// EVERY text node `rs` offers must be correct at RUNTIME, not merely in
@@ -24562,7 +26024,14 @@ mod tests {
     #[test]
     fn offered_text_nodes_execute_like_bash() {
         let cases: &[(&str, &str, &str)] = &[
-            ("SplitFieldExtract", ".iter().copied()", "echo \"a:b:c\" | cut -d: -f2\n"),
+            // The pipeline form of this cut now renders as one TextFilter
+            // node; the CAPTURE form still lowers to Split+FieldExtract, which
+            // is the node this case pins.
+            (
+                "SplitFieldExtract",
+                ".iter().copied()",
+                "x=$(echo \"a:b:c\" | cut -d: -f2)\necho \"$x\"\n",
+            ),
             (
                 "WordCount",
                 "split_whitespace().count()",
@@ -24723,8 +26192,53 @@ mod tests {
                 "w=$(echo \"  a  b  \" | tr -s ' ')\necho \"$w\"\n",
             ),
         ];
+        // The fs.* cases run against their OWN absolute directory: the render
+        // executes in its build dir while bash runs in the crate dir, so a
+        // relative `a`/`b` is a different file per side (and a parallel test
+        // touching `a`/`b` there would race the comparison).
+        let fsdir = std::env::temp_dir().join(format!("sh2_fs_nodes_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&fsdir);
+        std::fs::create_dir_all(&fsdir).expect("fs fixture");
+        let d = fsdir.display();
+        let fs_cases: Vec<(&str, &str, String)> = vec![
+            (
+                "FsSameFile",
+                "dev()",
+                format!("printf x > {d}/a\nprintf y > {d}/b\n[ {d}/a -ef {d}/b ] || echo diff\n[ {d}/a -ef {d}/a ] && echo same\n"),
+            ),
+            (
+                "FsSameFileResolved",
+                "dev()",
+                format!("printf x > {d}/a\n[ {d}/a -ef {d}/./a ] && echo dotpath\n[ /dev/null -ef /dev/null ] && echo devnull\n[ / -ef /dev ] || echo differ\n"),
+            ),
+            (
+                "FsSameFileMissing",
+                "dev()",
+                format!("[ {d}/a -ef {d}/nope ] || echo missing\n[ {d}/nope -ef {d}/nope ] || echo both_missing\n"),
+            ),
+            (
+                "FsNewerThan",
+                "__sh_a > __sh_b",
+                format!("printf x > {d}/a\nsleep 0.05\nprintf y > {d}/b\n[ {d}/a -nt {d}/a ] || echo notnewer\n[ {d}/b -nt {d}/a ] && echo newer\n[ {d}/a -nt {d}/nope ] && echo beats_missing\n"),
+            ),
+            (
+                "FsOlderThan",
+                "__sh_a < __sh_b",
+                format!("printf x > {d}/a\nsleep 0.05\nprintf y > {d}/b\n[ {d}/a -ot {d}/b ] && echo older\n[ {d}/nope -ot {d}/b ] && echo missing_is_older\n[ {d}/a -ot {d}/nope ] || echo missing_right\n"),
+            ),
+            (
+                "FsModifiedSinceRead",
+                "__sh_mt > __sh_at",
+                format!("printf x > {d}/f\nsleep 1\nprintf y >> {d}/f\n[ -N {d}/f ] && echo modified\n"),
+            ),
+        ];
         let mut bad: Vec<String> = Vec::new();
-        for (name, marker, src) in cases {
+        let all: Vec<(&str, &str, String)> = cases
+            .iter()
+            .map(|(name, marker, src)| (*name, *marker, (*src).to_string()))
+            .chain(fs_cases)
+            .collect();
+        for (name, marker, src) in &all {
             let prog = render_rs(src);
             if !prog.contains(marker) {
                 bad.push(format!("{name}: node not used (no {marker:?})"));
@@ -24734,13 +26248,15 @@ mod tests {
                 bad.push(format!("{name}: still shells out"));
                 continue;
             }
-            let (rs_out, rs_rc) = compile_and_run(name, &prog);
-            let (sh_out, sh_rc) = run_bash(src);
-            if rs_out != sh_out || rs_rc != sh_rc {
+            let (rs_out, rs_err, rs_rc) = compile_and_run_full(name, &prog);
+            let (sh_out, sh_err, sh_rc) = run_bash_full(src);
+            if rs_out != sh_out || rs_err != sh_err || rs_rc != sh_rc {
                 bad.push(format!(
-                    "{name}: rust rc={rs_rc:?} out={:?} / bash rc={sh_rc:?} out={:?}",
+                    "{name}: rust rc={rs_rc:?} out={:?} err={:?} / bash rc={sh_rc:?} out={:?} err={:?}",
                     String::from_utf8_lossy(&rs_out),
-                    String::from_utf8_lossy(&sh_out)
+                    String::from_utf8_lossy(&rs_err),
+                    String::from_utf8_lossy(&sh_out),
+                    String::from_utf8_lossy(&sh_err)
                 ));
             }
         }
@@ -24766,10 +26282,41 @@ mod tests {
             "StringContains", "StrLen", "CaseTransform", "FieldExtract", "WordCount",
             "RegCount", "TakeLines", "StringTrim", "SubStrExtract", "RepeatStr", "Split",
             "ArrayLen", "PathName", "CutsetTrim", "StringAffix", "CharTranslate",
-            "SortLines", "UniqLines",
+            "SortLines", "UniqLines", "AffixStrip",
+            // fs-lift (class 5/6): the file predicates whose `std` reading is
+            // exact; every one is pinned by a compile-and-run case above.
+            "FsSameFile", "FsNewerThan", "FsModifiedSinceRead",
+            // text-filter-lift: a static text pipeline as one node.
+            "TextFilter",
+            // fs-cmd-lift: `rm`/`mkdir`/`touch` as one node, pinned by
+            // `fs_statements_report_bash_diagnostics` (compile-and-run, every
+            // error path included — the node path is the only path now).
+            "FsCommand",
         ];
         // Refused in `node_manifest`'s `rs` arm, each with the reason written there.
-        const REFUSED: &[&str] = &["RegSub", "RegexpFind", "AffixStrip"];
+        // (AffixStrip left this list when its real arm was DECLARED: the fold
+        // already emitted the node and the backend already rendered it.)
+        //
+        // `RegSub`/`RegexpFind` are the two the plan calls irreducible without a
+        // regex engine: the emitted program has no POSIX BRE/ERE matcher, and a
+        // coreutils `sed 's///'` is not Rust's `regex` syntax (backreferences,
+        // `\1` in the pattern, BRE alternation), so an arm would be a lie.
+        // Those shapes keep their `bash -c`.
+        const REFUSED: &[&str] = &["RegSub", "RegexpFind"];
+        // Shared nodes Rust neither declares nor is ever OFFERED: each is
+        // produced only by a frontend/transform gated on another backend — the
+        // C frontend's address-of/deref/type-assert, the Cgo call, the Java/JS
+        // field+element accessors and string splice, the perl readline, the
+        // JS spread/map literal, the named-field strips and `charAt`. Listing
+        // them is the record the plan asks for: a NEW node cannot arrive
+        // undeclared and unreasoned, because the assert below requires these
+        // three sets to partition every node type the tree declares.
+        const NOT_OFFERED: &[&str] = &[
+            "AddressOf", "CgoCall", "CharExtract", "CloneDeep", "CutAt", "Deref",
+            "ElementRead", "FieldGrab", "FieldRead", "FieldStrip", "FieldStripEnd",
+            "MapLiteral", "NewlineStrip", "ReadLine", "Spread", "StrSplice",
+            "Substitute", "TypeAssert",
+        ];
 
         let mut declared: Vec<&str> = node_manifest("rs").to_vec();
         let mut pinned: Vec<&str> = PINNED.to_vec();
@@ -24785,6 +26332,19 @@ mod tests {
                 "{tag} is declared AND refused — one of the two is a lie"
             );
         }
+        // Every node type in the tree is either declared for Rust, refused with
+        // the reason above, or documented as never offered. A new node that is
+        // none of the three fails here until someone records which it is.
+        let refused: std::collections::HashSet<&str> = REFUSED.iter().copied().collect();
+        let offered: std::collections::HashSet<&str> = NOT_OFFERED.iter().copied().collect();
+        for (tag, _) in crate::shir_nodes::all_expr_nodes() {
+            assert!(
+                declared.iter().any(|d| *d == tag)
+                    || refused.contains(&*tag)
+                    || offered.contains(&*tag),
+                "{tag} is neither declared for Rust, refused with a reason, nor listed as never offered"
+            );
+        }
         // A refused node must leave the exact command in place.
         for src in [
             "echo a1b | sed 's/[0-9]/N/g'\n",
@@ -24794,6 +26354,166 @@ mod tests {
             assert!(
                 prog.contains("__sh_spawn("),
                 "a refused node was folded instead of spawned: {src:?}\n{prog}"
+            );
+        }
+    }
+
+    /// What `fs-lift` deliberately does NOT lift, with the reason it cannot:
+    /// `-O`/`-G` are EFFECTIVE-uid/gid predicates and `std` exposes neither
+    /// (the helper's `/proc/self/status` read is the REAL uid, which differs
+    /// under a setuid binary), so those keep the exact helper; a glob or
+    /// expansion in an operand moves the path's meaning to runtime, so the
+    /// `test` text keeps the shell's own tokenizer. Neither node may appear.
+    #[test]
+    /// Every pipeline `text-filter-lift` accepts must be correct at RUNTIME,
+    /// byte-for-byte against bash, with NO `bash -c` left in the program: the
+    /// compiled render's stdout and exit status are compared with the shell's,
+    /// and the absence of `__sh_spawn(` proves the node (not the fallback)
+    /// produced the bytes.
+    #[test]
+    fn text_filter_pipelines_execute_like_bash() {
+        let cases: &[(&str, &str)] = &[
+            ("wc-w", "echo \"Hello World\" | wc -w\n"),
+            ("wc-w-spaces", "echo \"a b   c\" | wc -w\n"),
+            ("wc-l", "printf \"a b\\nc\\n\" | wc -l\n"),
+            ("wc-l-no-final-newline", "printf \"x\" | wc -l\n"),
+            ("wc-c", "printf \"x\" | wc -c\n"),
+            ("head", "seq 1 10 | head -3\n"),
+            ("head-n", "seq 3 | head -n 2\n"),
+            ("head-partial-line", "printf \"a\\nb\" | head -1\n"),
+            ("head-more-than-lines", "echo hi | head -5\n"),
+            ("tail", "seq 1 10 | tail -3\n"),
+            ("tail-partial-line", "printf \"a\\nb\\nc\" | tail -2\n"),
+            ("tail-more-than-lines", "echo hi | tail -5\n"),
+            ("uniq", "echo -e \"a\\na\\nb\" | uniq\n"),
+            ("uniq-blank-runs", "echo -e \"a\\n\\n\\nb\" | uniq\n"),
+            ("cut", "echo \"apple:banana:cherry\" | cut -d: -f2\n"),
+            // A field past the end is selected but absent: GNU cut prints an
+            // EMPTY line for it (od -c: a single `\n`), so the block's blank
+            // line is the exact bytes, not a looser approximation.
+            ("cut-missing-field", "echo a:b:c | cut -d: -f4\n"),
+            ("cut-multi", "echo -e \"a:a\\nb\" | cut -d: -f1,2\n"),
+            ("cut-no-delimiter", "printf \"plain\\nx:y\" | cut -d: -f1\n"),
+            // The redirect IS the producer (`wc -l < file`), and `cat FILE` is
+            // the one read whose error text the node spells (main.rs exists in
+            // the compiled program's directory).
+            ("redirect-wc", "wc -l < Cargo.toml\n"),
+            ("cat-head", "cat Cargo.toml | head -1\n"),
+        ];
+        for (name, src) in cases {
+            // `cat FILE`/`< FILE` need a path both sides can read: the shell
+            // runs in the crate dir and the compiled program in a temp dir, so
+            // the case carries the ABSOLUTE crate path.
+            let src_owned = src.replace(
+                "Cargo.toml",
+                &format!("{}/Cargo.toml", env!("CARGO_MANIFEST_DIR")),
+            );
+            let src: &str = if src.contains("Cargo.toml") { &src_owned } else { src };
+            let prog = render_rs(src);
+            assert!(
+                !prog.contains("__sh_spawn("),
+                "{name}: still spawns a shell for a static text pipeline:\n{prog}"
+            );
+            assert!(
+                prog.contains("__sh_cur"),
+                "{name}: the TextFilter arm did not render:\n{prog}"
+            );
+            let (rust_out, rust_err, rust_rc) = compile_and_run_full(name, &prog);
+            let (bash_out, bash_err, bash_rc) = run_bash_full(src);
+            assert_eq!(
+                rust_out,
+                bash_out,
+                "{name}: stdout differs from bash\n--- bash ---\n{}\n--- rust ---\n{}",
+                String::from_utf8_lossy(&bash_out),
+                String::from_utf8_lossy(&rust_out)
+            );
+            assert_eq!(
+                String::from_utf8_lossy(&rust_err),
+                String::from_utf8_lossy(&bash_err),
+                "{name}: stderr differs from bash"
+            );
+            assert_eq!(rust_rc, bash_rc, "{name}: exit status differs from bash");
+        }
+    }
+
+    /// The shapes `text-filter-lift` refuses, each still spawning `bash -c`:
+    /// multi-operand header forms, `tail -f`/`+N`, `cut -c`/ranges, `wc -L` and
+    /// the operand form, `uniq` flags, `tee` (its error text is the
+    /// environment's — measured), `cat` with no operand, and every interpreter
+    /// or collating filter the plan keeps out.
+    #[test]
+    fn text_filter_refuses_what_it_cannot_spell() {
+        for (name, src) in [
+            ("tail +N", "seq 1 3 | tail -n +2\n"),
+            ("cut -c", "echo ab | cut -c 1\n"),
+            // A range IS refused by the filter itself; a SINGLE-LINE literal
+            // producer still folds through the older FieldExtract path, so the
+            // multi-line producer is the witness that the range keeps its
+            // command.
+            ("cut range", "printf \"a:b\\nc:d\\n\" | cut -d: -f1-2\n"),
+            ("wc -L", "echo hi | wc -L\n"),
+            ("wc operand", "echo hi | wc -l f\n"),
+            // `uniq -c` is exactly the older UniqLines{count} node, so it is
+            // not a refusal witness; `-i` has no node field at all.
+            ("uniq -i", "echo a | uniq -i\n"),
+            ("tee", "echo a | tee /tmp/sh2_tee_refused\n"),
+            ("cat no operand", "cat | wc -l\n"),
+            // `sort`/`xargs`/`uniq -c` are NOT here: the older text-op path
+            // already renders them as SortLines/UniqLines/RepeatStr nodes on a
+            // literal producer, and those are pinned separately. The filter
+            // refuses their flags; the render that wins is the exact node.
+            ("grep", "echo b | grep b\n"),
+            ("awk", "echo b | awk '{print}'\n"),
+            ("sed", "echo b | sed 's/b/c/'\n"),
+            // A producer no stage models: the pipeline keeps the shell.
+            ("unknown producer", "ls | wc -l\n"),
+        ] {
+            let prog = render_rs(src);
+            assert!(
+                prog.contains("__sh_spawn("),
+                "{name}: folded a shape it must refuse:\n{prog}"
+            );
+            assert!(
+                !prog.contains("__sh_cur"),
+                "{name}: emitted the TextFilter block for a refused shape:\n{prog}"
+            );
+        }
+    }
+
+    fn fs_predicates_refuse_what_std_cannot_name() {
+        for (name, src, keep) in [
+            ("owner", "if [ -O /dev/null ]; then echo o; fi\n", "__sh_fowner("),
+            ("group", "if [ -G /dev/null ]; then echo g; fi\n", "__sh_fgroup("),
+            // A variable with a SUFFIX is not a plain path operand: the
+            // rendered value is a format!, which the node cannot take as a
+            // static literal — the exact `__sh_samefile` call stays.
+            (
+                "suffixed operand",
+                "if [ \"$d/x\" -ef b ]; then echo s; fi\n",
+                "__sh_samefile(",
+            ),
+            // A compound `-a` test keeps the shell's own parse of BOTH
+            // operands; lifting only the `-ef` half would change the shape.
+            (
+                "compound -a",
+                "if [ \"$A\" -ef \"$B\" -a -e c ]; then echo c; fi\n",
+                "__sh_samefile(",
+            ),
+            // The COMMAND spelling, not the `[ … ]` builtin: its condition
+            // renderer runs the command for its exit status, and an Ext node
+            // there is evaluated as a string with the status write dropped —
+            // lifting it made parse-ef-test-operator print "same file" where
+            // bash prints nothing. The helper is exact, so it stays.
+            ("command spelling", "if test a -ef b; then echo t; fi\n", "__sh_samefile("),
+        ] {
+            let prog = render_rs(src);
+            assert!(
+                !prog.contains("MetadataExt; match") && !prog.contains("__sh_mt > __sh_at"),
+                "{name}: lifted a shape it must refuse:\n{prog}"
+            );
+            assert!(
+                prog.contains(keep) || prog.contains("__sh_spawn(") || prog.contains("__sh_run("),
+                "{name}: the refused shape lost its exact rendering (no {keep:?}):\n{prog}"
             );
         }
     }
@@ -24809,9 +26529,7 @@ mod tests {
             ("char positions", "echo abc | cut -c1\n"),
             // The node has no complement field.
             ("complement", "echo a:b | cut --complement -d: -f1\n"),
-            // No field selected: cut prints NOTHING for the line, while the
-            // statement wrapper would print a blank line.
-            ("empty selection", "echo a:b:c | cut -d: -f4\n"),
+
             // A reversed range is an ERROR in cut, not an empty set.
             ("reversed range", "echo a:b | cut -d: -f4-2\n"),
             // `wc -L` is the longest line's DISPLAY WIDTH; no node models it.
@@ -24825,9 +26543,11 @@ mod tests {
             ("fractional seq", "seq 0.5 2\n"),
             // An open range over a source of unknown length.
             ("open range on a variable", "v=$(echo \"$s\" | cut -d: -f2-)\necho \"$v\"\n"),
-            // A heredoc BODY is expanded by the shell (`<<EOF` with $v in it),
-            // so `cat` over one is not an identity on the IR text.
-            ("heredoc body", "v=x\ncat <<EOF\n$v\nEOF\n"),
+            // A heredoc `cat` IS lifted now — the body is an interpolated
+            // expression and `heredoc_cat_copies_the_body_without_a_child`
+            // pins the bytes — but a heredoc feeding a real FILTER still
+            // spawns: `wc -l` over a body has no node here.
+            ("heredoc into a filter", "cat <<EOF | wc -l\na\nb\nEOF\n"),
             // `tr '\n' ' '` maps the newline the pipeline fold does not carry
             // (the enclosing Output supplies exactly one), so the S P A C E it
             // becomes would be lost: bash prints `seq: 1 2 3 ` — trailing
@@ -24852,7 +26572,7 @@ mod tests {
     /// against the bash command it models — `head -n`/`tail -n`.
     #[test]
     fn constructed_text_nodes_execute_like_bash() {
-        use crate::shir_nodes::{CutsetTrim, SortLines, StringAffix, TakeLines, UniqLines};
+        use crate::shir_nodes::{CutAt, CutsetTrim, SortLines, StringAffix, TakeLines, UniqLines};
         let mut cases: Vec<(String, String, &str)> = Vec::new();
         for (from_end, bash_src) in [
             (false, "printf 'a\\nb\\nc\\n' | head -n 2\n"),
@@ -24982,6 +26702,49 @@ mod tests {
             "CutsetTrimSet".to_string(),
             cutset("--a.b--", "-.", None),
             "printf '%s\\n' --a.b-- | sed 's/^[-.]*//; s/[-.]*$//'\n",
+        ));
+        // CutAt: the four find/rfind cuts behind the star-strip identities
+        // (`${v%%/*}`, `${v%/*}`, `${v#*/}`, `${v##*/}`). The fold's
+        // `cut_target_ok` builds the node; it is CONSTRUCTED here so all four
+        // orientations plus "delimiter absent" and the empty text are pinned
+        // against bash's own parameter expansion.
+        let cut = |text: &str, delim: &str, head: bool, first: bool| {
+            shir_to_rust(&print_program(IrExpr::Ext(Box::new(CutAt {
+                text: s(text),
+                delim: delim.to_string(),
+                head,
+                first,
+            }))))
+        };
+        cases.push((
+            "CutAtHeadFirst".to_string(),
+            cut("a/b/c", "/", true, true),
+            "v='a/b/c'; printf '%s\\n' \"${v%%/*}\"\n",
+        ));
+        cases.push((
+            "CutAtHeadLast".to_string(),
+            cut("a/b/c", "/", true, false),
+            "v='a/b/c'; printf '%s\\n' \"${v%/*}\"\n",
+        ));
+        cases.push((
+            "CutAtTailFirst".to_string(),
+            cut("a/b/c", "/", false, true),
+            "v='a/b/c'; printf '%s\\n' \"${v#*/}\"\n",
+        ));
+        cases.push((
+            "CutAtTailLast".to_string(),
+            cut("a/b/c", "/", false, false),
+            "v='a/b/c'; printf '%s\\n' \"${v##*/}\"\n",
+        ));
+        cases.push((
+            "CutAtAbsent".to_string(),
+            cut("abc", "/", false, true),
+            "v='abc'; printf '%s\\n' \"${v#*/}\"\n",
+        ));
+        cases.push((
+            "CutAtEmptyText".to_string(),
+            cut("", "/", true, false),
+            "v=''; printf '%s\\n' \"${v%/*}\"\n",
         ));
         let mut bad: Vec<String> = Vec::new();
         for (case, prog, bash_src) in cases {

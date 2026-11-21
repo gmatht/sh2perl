@@ -1,0 +1,22 @@
+# shir_nodes/fs_same_file.node — the `-ef` file predicate.
+#
+# `[ A -ef B ]` / `[[ A -ef B ]]` / `test A -ef B` is true iff BOTH paths
+# resolve to the same device and inode. Both operands must stat: two MISSING
+# paths are NOT the same file (GNU test: "either operand missing ⇒ false"),
+# and a path that fails to stat for any reason (ENOENT, EACCES on a directory
+# component, ENOTDIR) makes the predicate false rather than an error.
+#
+# Node model: `same_file(left, right)` = exists(left) ∧ exists(right) ∧
+# dev(left)=dev(right) ∧ ino(left)=ino(right). Symlinks are FOLLOWED: the
+# predicate is defined over stat(2), not lstat(2), so a symlink and its target
+# are the same file (measured on this box: `ln -s f l; [ f -ef l ]` is true).
+#
+# Out of model: filesystems that report inode 0 for every file (some FUSE,
+# Windows) — the predicate then degrades to "same device", which is what the
+# kernel does too, so no renderer may special-case it.
+node FsSameFile
+tag "FsSameFile"
+kind expr
+field left: expr
+field right: expr
+spec: FsSemantics#same_file
