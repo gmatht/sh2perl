@@ -248,11 +248,10 @@ pub fn node_manifest(target: &str) -> &'static [&'static str] {
         //    the command. (The regex the RENDERER does use comes from the
         //    `regex` crate in the emitted Cargo project — that is not `std`,
         //    so it does not license these nodes here.)
-        //  * AffixStrip — `${v#p}`/`${v%s}` lower through the backend's own
-        //    strip helpers (`__sh_strippre`/`__sh_stripsuf` over
-        //    `__sh_fnmatch`), which accept ARBITRARY glob patterns; `std`'s
-        //    `strip_prefix`/`strip_suffix` are exact only for the literal
-        //    subset, so the node stays out and the shapes keep that path.
+        //  * CutAt — not a manifest node on any backend: rust/python render
+        //    their own arms and the fold's own gate (`cut_target_ok`) owns
+        //    the offer. Left out of scope here because the 13 armless tags do
+        //    not include it; see PLAN pass 8's "still open".
         //
         // DECLARED but CONSTRUCT-ONLY (no transform in this pipeline builds
         // them from shell source, so they are pinned by constructing the node
@@ -294,6 +293,16 @@ pub fn node_manifest(target: &str) -> &'static [&'static str] {
                 // over the node's LITERAL affix (in a bool context) and its
                 // 1/0 spelling in a string context.
                 "StringAffix",
+                // The strip NODE (`${v#lit}`, `${v%lit}`, `${v##lit}`,
+                // `${v%%lit}`): `strip_prefix`/`strip_suffix` with the text
+                // passed through on no match. The node's pattern is an
+                // ARBITRARY affix, but its only producer, `affix_strip_fold`,
+                // emits it solely for a magic-free literal (a star at one end
+                // lowers to CutAt, `?`/`[`/`\` are refused), and the arm is
+                // byte-exact for every literal. Declared here because the
+                // backend was already RENDERING it while the manifest called
+                // it refused — a declaration that lied about the tree.
+                "AffixStrip",
                 // `tr`'s general map: the lowering EXPANDS ranges and classes
                 // before the node is built, so `from`/`to` are the map and
                 // `chars().map(...)` is exact (delete and squeeze included).

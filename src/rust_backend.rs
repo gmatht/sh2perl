@@ -24303,13 +24303,15 @@ mod tests {
                 bad.push(format!("{name}: still shells out"));
                 continue;
             }
-            let (rs_out, rs_rc) = compile_and_run(name, &prog);
-            let (sh_out, sh_rc) = run_bash(src);
-            if rs_out != sh_out || rs_rc != sh_rc {
+            let (rs_out, rs_err, rs_rc) = compile_and_run_full(name, &prog);
+            let (sh_out, sh_err, sh_rc) = run_bash_full(src);
+            if rs_out != sh_out || rs_err != sh_err || rs_rc != sh_rc {
                 bad.push(format!(
-                    "{name}: rust rc={rs_rc:?} out={:?} / bash rc={sh_rc:?} out={:?}",
+                    "{name}: rust rc={rs_rc:?} out={:?} err={:?} / bash rc={sh_rc:?} out={:?} err={:?}",
                     String::from_utf8_lossy(&rs_out),
-                    String::from_utf8_lossy(&sh_out)
+                    String::from_utf8_lossy(&rs_err),
+                    String::from_utf8_lossy(&sh_out),
+                    String::from_utf8_lossy(&sh_err)
                 ));
             }
         }
@@ -24586,6 +24588,16 @@ mod tests {
     /// `compile_and_run` plus the child's STDERR, for the witnesses whose
     /// refusal reason is an error MESSAGE (`head: cannot open 'a'`).
     fn compile_and_run_full(case: &str, prog: &str) -> (Vec<u8>, Vec<u8>, Option<i32>) {
+        compile_and_run_full_args(case, prog, &[])
+    }
+
+    /// The same, with `argv` — a witness whose subject must stay a RUNTIME
+    /// value (`v="$1"`), so the lift cannot constant-fold the case away.
+    fn compile_and_run_full_args(
+        case: &str,
+        prog: &str,
+        argv: &[&str],
+    ) -> (Vec<u8>, Vec<u8>, Option<i32>) {
         // Unique per INVOCATION: two witnesses (or a re-run of the same case)
         // may hold the same `case` name concurrently, and the remove/create at
         // the top would then delete the other's binary mid-run — which is what
@@ -24615,6 +24627,7 @@ mod tests {
             String::from_utf8_lossy(&build.stderr)
         );
         let run = std::process::Command::new(&bin)
+            .args(argv)
             .current_dir(&dir)
             .output()
             .expect("run render");
@@ -24630,12 +24643,90 @@ mod tests {
 
     /// `run_bash` plus STDERR.
     fn run_bash_full(src: &str) -> (Vec<u8>, Vec<u8>, Option<i32>) {
+        run_bash_full_args(src, &[])
+    }
+
+    /// The same, with the positional parameters `$1…` the compiled program
+    /// reads through `__sh_arg`. `sh` fills `$0`, matching a script invoked
+    /// as `bash script.sh a b`.
+    fn run_bash_full_args(src: &str, argv: &[&str]) -> (Vec<u8>, Vec<u8>, Option<i32>) {
         let out = std::process::Command::new("bash")
             .arg("-c")
             .arg(src)
+            .arg("sh")
+            .args(argv)
             .output()
             .expect("bash");
         (out.stdout, out.stderr, out.status.code())
+    }
+
+    /// A LITERAL affix strip — the one pattern `affix_strip_fold` builds an
+    /// `AffixStrip` for — renders as `strip_prefix`/`strip_suffix` with the
+    /// text passed through on a miss, and matches bash on stdout, stderr and
+    /// status. The subject is `$1` (a runtime value, so the lift cannot
+    /// constant-fold the case away) and the values cover a hit, a miss, a
+    /// repeated pattern, a leading slash, an empty value and glob-literal
+    /// punctuation. `#`/`##` and `%`/`%%` coincide for a literal pattern: a
+    /// pattern without wildcards admits the same single match either way.
+    #[test]
+    fn affix_strip_literals_execute_like_bash() {
+        // The subject is built at RUNTIME (`v` is the value concatenated with
+        // an UNSET variable), so the lift cannot constant-fold the case away
+        // and the strip really runs on each value.
+        let cases: &[(&str, &str, &str)] = &[
+            ("prefix-hit", "#", "/a"),
+            ("prefix-miss", "#", "zz"),
+            ("prefix-twice", "#", "a"),
+            ("prefix-longest", "##", "a"),
+            ("suffix-hit", "%", "/c"),
+            ("suffix-miss", "%", "zz"),
+            ("suffix-twice", "%", "a"),
+            ("suffix-longest", "%%", "a"),
+            ("metachar-literal", "#", "a."),
+        ];
+        let values: &[&str] = &["/a/b/c", "aXa", "", "/", "a.b/c"];
+        for (name, op, pat) in cases {
+            for (i, v) in values.iter().enumerate() {
+                let src = format!(
+                    "v='{v}'\"$__sh_probe_unset\"\necho \"[${{v{op}{pat}}}]\"\n"
+                );
+                let prog = render_rs(&src);
+                // No `%` or `/` in the temp-dir name: rustc/lld reject some
+                // punctuation in an output path.
+                let opname = match *op {
+                    "#" => "hash",
+                    "##" => "hashhash",
+                    "%" => "pct",
+                    _ => "pctpct",
+                };
+                let case = format!("{name}-{i}-{opname}");
+                assert!(
+                    !prog.contains("__sh_spawn("),
+                    "{case}: a literal affix strip still spawns:\n{prog}"
+                );
+                assert!(
+                    !prog.contains("__sh_strippre(") && !prog.contains("__sh_stripsuf("),
+                    "{case}: kept the glob strip helper instead of the node:\n{prog}"
+                );
+                assert!(
+                    prog.contains("strip_prefix(") || prog.contains("strip_suffix("),
+                    "{case}: the AffixStrip arm did not render:\n{prog}"
+                );
+                let (rs_out, rs_err, rs_rc) = compile_and_run_full(&case, &prog);
+                let (sh_out, sh_err, sh_rc) = run_bash_full(&src);
+                assert_eq!(
+                    String::from_utf8_lossy(&rs_out),
+                    String::from_utf8_lossy(&sh_out),
+                    "{case}: stdout differs from bash for {v:?}\n--- rust ---\n{prog}"
+                );
+                assert_eq!(
+                    String::from_utf8_lossy(&rs_err),
+                    String::from_utf8_lossy(&sh_err),
+                    "{case}: stderr differs from bash for {v:?}"
+                );
+                assert_eq!(rs_rc, sh_rc, "{case}: status differs from bash for {v:?}");
+            }
+        }
     }
 
     /// The argv forms the old fold MIS-READ, each with the same witness as a
@@ -24907,13 +24998,15 @@ mod tests {
                 bad.push(format!("{name}: still shells out"));
                 continue;
             }
-            let (rs_out, rs_rc) = compile_and_run(name, &prog);
-            let (sh_out, sh_rc) = run_bash(src);
-            if rs_out != sh_out || rs_rc != sh_rc {
+            let (rs_out, rs_err, rs_rc) = compile_and_run_full(name, &prog);
+            let (sh_out, sh_err, sh_rc) = run_bash_full(src);
+            if rs_out != sh_out || rs_err != sh_err || rs_rc != sh_rc {
                 bad.push(format!(
-                    "{name}: rust rc={rs_rc:?} out={:?} / bash rc={sh_rc:?} out={:?}",
+                    "{name}: rust rc={rs_rc:?} out={:?} err={:?} / bash rc={sh_rc:?} out={:?} err={:?}",
                     String::from_utf8_lossy(&rs_out),
-                    String::from_utf8_lossy(&sh_out)
+                    String::from_utf8_lossy(&rs_err),
+                    String::from_utf8_lossy(&sh_out),
+                    String::from_utf8_lossy(&sh_err)
                 ));
             }
         }
@@ -24939,7 +25032,7 @@ mod tests {
             "StringContains", "StrLen", "CaseTransform", "FieldExtract", "WordCount",
             "RegCount", "TakeLines", "StringTrim", "SubStrExtract", "RepeatStr", "Split",
             "ArrayLen", "PathName", "CutsetTrim", "StringAffix", "CharTranslate",
-            "SortLines", "UniqLines",
+            "SortLines", "UniqLines", "AffixStrip",
             // fs-lift (class 5/6): the file predicates whose `std` reading is
             // exact; every one is pinned by a compile-and-run case above.
             "FsSameFile", "FsNewerThan", "FsModifiedSinceRead",
@@ -24947,7 +25040,9 @@ mod tests {
             "TextFilter",
         ];
         // Refused in `node_manifest`'s `rs` arm, each with the reason written there.
-        const REFUSED: &[&str] = &["RegSub", "RegexpFind", "AffixStrip"];
+        // (AffixStrip left this list when its real arm was DECLARED: the fold
+        // already emitted the node and the backend already rendered it.)
+        const REFUSED: &[&str] = &["RegSub", "RegexpFind"];
 
         let mut declared: Vec<&str> = node_manifest("rs").to_vec();
         let mut pinned: Vec<&str> = PINNED.to_vec();
@@ -25036,14 +25131,19 @@ mod tests {
                 prog.contains("__sh_cur"),
                 "{name}: the TextFilter arm did not render:\n{prog}"
             );
-            let (rust_out, rust_rc) = compile_and_run(name, &prog);
-            let (bash_out, bash_rc) = run_bash(src);
+            let (rust_out, rust_err, rust_rc) = compile_and_run_full(name, &prog);
+            let (bash_out, bash_err, bash_rc) = run_bash_full(src);
             assert_eq!(
                 rust_out,
                 bash_out,
                 "{name}: stdout differs from bash\n--- bash ---\n{}\n--- rust ---\n{}",
                 String::from_utf8_lossy(&bash_out),
                 String::from_utf8_lossy(&rust_out)
+            );
+            assert_eq!(
+                String::from_utf8_lossy(&rust_err),
+                String::from_utf8_lossy(&bash_err),
+                "{name}: stderr differs from bash"
             );
             assert_eq!(rust_rc, bash_rc, "{name}: exit status differs from bash");
         }

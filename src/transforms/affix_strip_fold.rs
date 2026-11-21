@@ -150,6 +150,14 @@ fn fold_target_ok() -> bool {
     match crate::transforms::target() {
         // c is NOT here: it has no AffixStrip arm, only the CutAt one
         // (cut_target_ok), so an Affix branch must still refuse on c.
+        // estree/perl are deliberately absent even though their manifests
+        // declare the tag: they already inline literal strips natively, so
+        // folding would churn their output for no gain. `go` is absent
+        // because its Ext fallback emits a stub, not a refusal.
+        // `affix_fold_targets_declare_the_node` pins that every target listed
+        // here DOES declare AffixStrip — that check is what this pass added,
+        // because the list had silently offered the node to Rust while the
+        // manifest called the tag refused.
         Some(t) => matches!(t.as_str(), "rs" | "rust" | "java" | "py" | "python"),
         None => false,
     }
@@ -860,6 +868,31 @@ mod tests {
     }
 
     #[test]
+    /// The accepting list and the manifests must agree. This pass found them
+    /// DISAGREEING: `fold_target_ok` offered AffixStrip to Rust while
+    /// `node_manifest("rs")` called the tag refused, so the backend rendered a
+    /// node its own manifest said it could not — a declaration that lied, with
+    /// no test to notice. estree/perl/go stay deliberately excluded for the
+    /// reasons in `fold_target_ok`; every target that CAN receive the node
+    /// must declare it.
+    #[test]
+    fn affix_fold_targets_declare_the_node() {
+        for t in ["rs", "rust", "java", "py", "python"] {
+            with_target(Some(t), || {
+                assert!(fold_target_ok(), "{t} must accept the fold");
+            });
+            let key = match t {
+                "rust" => "rs",
+                "py" => "python",
+                other => other,
+            };
+            assert!(
+                crate::transforms::planner::node_manifest(key).contains(&"AffixStrip"),
+                "{t} accepts the fold but its manifest does not declare AffixStrip"
+            );
+        }
+    }
+
     fn non_affix_target_is_refused() {
         // estree/perl inline literals optimally; c/sh/zig/go have no
         // AffixStrip arm. All refuse — nothing changes. (python accepted
