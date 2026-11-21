@@ -24,8 +24,8 @@
 //!   breaks the run.
 //! - The payloads are joined with `\n`, which is the device's line separator.
 //!   A backend that splits on `\n` recovers the original payloads exactly.
-//! - The `id` of the merged op is the `id` of the FIRST op in the run, so
-//!   the SPIR-V blob name stays stable.
+//! - The merged op gets a fresh `id` (`sh_gpu_batch_<n>`); the `id` names a
+//!   SPIR-V blob on the GPU path and is not part of the byte observable.
 //! - Non-`GpuOp` statements between two `GpuOp`s break the run — the
 //!   transform never reorders statements.
 //!

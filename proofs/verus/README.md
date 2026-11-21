@@ -7796,3 +7796,69 @@ the `_alen_` mirror. None is an antecedent of the law.
 ## Running it
 
 Same toolchain as above (`--rlimit 40`).
+
+## `fbdev_gpu_batch.rs` — the same-verb batch fold (36 obligations)
+
+The transform merges a maximal run of consecutive `GpuOp`s that share
+`device` + `verb` into one `GpuOp` whose payload is the run's payloads joined
+by a single `\n`. The observable is the device **byte stream**: a dispatch
+contributes `payload ++ "\n"` on its verb, an `Observe` contributes nothing.
+
+The law is a fold over one flat op list:
+
+- `run_bytes([d1..dk]) = payload_1 ++ "\n" ++ … ++ payload_k ++ "\n"`, and
+  `joined(payloads) ++ "\n"` is the same sequence — `joined`
+  (`the_join_preserves_the_run_bytes`) and `dispatched` (the byte-level fold)
+  are the two halves, proved together.
+- `go_bytes` lifts it over the pass: for EVERY list of ops, `bytes(batch(ops))
+  == bytes(ops)` (`the_batch_preserves_the_bytes`), with `go`'s three arms
+  (extend the run / flush and dispatch / flush and observe) each carrying its
+  own obligation and the identity (`flush([]) = []`, a run of one is left
+  alone) as lemmas.
+- `a_merged_dispatch_keeps_the_runs_verb`: every byte of the run stays on the
+  run's verb, so a join cannot send a payload to a call verb.
+
+Pinned pre-fix / naive facts: `a_naive_merge_of_a_call_verb_is_a_different_
+argument`, `the_pass_refuses_a_call_verb`, `an_empty_payload_still_contributes_
+its_line` (a join that skips empty payloads loses a terminator),
+`a_run_of_one_is_left_alone`, `the_wrong_separator_does_not_reproduce_the_
+stream`, and the measured anchor witnesses (`law_at_the_witnesses`).
+
+NOT claimed (stated in-file): a pass-level theorem that each `Observe` still
+sees the same byte prefix. The pass moves no statement — it replaces a run in
+place — so that property is structural; the `obs_*` lemmas that did verify say
+a dispatch-only run contributes no observation and observations concatenate,
+but the full induction did not close under this Verus's automation and is left
+out rather than asserted.
+
+### Mutants
+
+`harness/mut-fbdev-batch.py` applies 11 independent edits inside the named
+definitions: empty separator, doubled separator, skip an empty payload,
+first-only, reversed, merged op adds a terminator, run key ignores the verb,
+`starts_run` ignores the joinable set, `flush` drops a single op, the device
+dispatch loses its terminator, `flush` drops the pending run. Measured:
+**11/11 RED**, each naming a failing obligation, none an `E0xxx`.
+
+### Anchor
+
+`harness/anchor-fbdev-batch.sh` runs the emitted C for real against
+`harness/fbdev-soft` (a deterministic software device: payload+`\n` to a file
+or stdout; no X, no root, no framebuffer) and diffs its device bytes, stdout
+and exit status against bash, which runs the same program with the device root
+substituted to a FIFO-backed directory. Measured: **8/8** — 3 lifted shapes
+(one `fb_*` call carrying the run's lines; a value join on `$1`/`$2`; an
+embedded-newline payload), 3 refused shapes (a break, two verbs, a single
+write), and 2 fall-throughs (no match, `SH2_TRANSFORMS=dead-store-elim`) on
+both C and Perl. The Perl backend never lifts fb writes, which the
+fall-through arm asserts.
+
+### Running it
+
+```sh
+RUSTUP_HOME=$HOME/.rustup CARGO_HOME=$HOME/.cargo \
+  ~/verus-0.2026.10.18.7d82994/verus --triggers-mode silent --rlimit 60 \
+  proofs/verus/fbdev_gpu_batch.rs          # 36 verified, 0 errors
+python3 harness/mut-fbdev-batch.py          # 11/11 red
+bash harness/anchor-fbdev-batch.sh          # pass=8 fail=0
+```
