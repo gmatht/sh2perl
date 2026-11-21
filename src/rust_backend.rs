@@ -7719,7 +7719,9 @@ while __sh_path.len() > 1 && __sh_path.ends_with('/') {{ __sh_path = &__sh_path[
             return Some(if force {
                 "__SH_RC.store(0, Ordering::Relaxed);".to_string()
             } else {
-                "{ eprintln!(\"rm: missing operand\"); __SH_RC.store(1, Ordering::Relaxed); }".to_string()
+                // GNU rm follows the diagnostic with its help hint; the
+                // witness compares it, so it is part of the arm.
+                "{ eprintln!(\"rm: missing operand\"); eprintln!(\"Try 'rm --help' for more information.\"); __SH_RC.store(1, Ordering::Relaxed); }".to_string()
             });
         }
         let true_ = "true";
@@ -7735,9 +7737,9 @@ while __sh_path.len() > 1 && __sh_path.ends_with('/') {{ __sh_path = &__sh_path[
                 // error — exactly the old helper's three cases, with no
                 // `if false` left behind in the emitted code.
                 let errsite = if force {
-                    "                    if __sh_err.kind() == std::io::ErrorKind::NotFound { /* -f: a missing path is not an error */ } else {\n                        eprintln!(\"rm: cannot remove '{}': {}\", __sh_path, __sh_err);\n                        __sh_status = 1;\n                    }".to_string()
+                    "                    if __sh_err.kind() == std::io::ErrorKind::NotFound { /* -f: a missing path is not an error */ } else {\n                        eprintln!(\"rm: cannot remove '{}': {}\", __sh_path, __sh_strerr(&__sh_err));\n                        __sh_status = 1;\n                    }".to_string()
                 } else {
-                    "                    eprintln!(\"rm: cannot remove '{}': {}\", __sh_path, __sh_err);\n                    __sh_status = 1;".to_string()
+                    "                    eprintln!(\"rm: cannot remove '{}': {}\", __sh_path, __sh_strerr(&__sh_err));\n                    __sh_status = 1;".to_string()
                 };
                 let body = if rec {
                     "        let __sh_res = if __sh_mapped.is_dir() {\n            std::fs::remove_dir_all(__sh_path)\n        } else {\n            std::fs::remove_file(__sh_path)\n        };".to_string()
@@ -7748,6 +7750,13 @@ while __sh_path.len() > 1 && __sh_path.ends_with('/') {{ __sh_path = &__sh_path[
                 };
                 r#"{
     let mut __sh_status: i32 = 0;
+    let __sh_strerr = |__e: &std::io::Error| -> String { match __e.kind() {
+        std::io::ErrorKind::NotFound => "No such file or directory".to_string(),
+        std::io::ErrorKind::PermissionDenied => "Permission denied".to_string(),
+        std::io::ErrorKind::AlreadyExists => "File exists".to_string(),
+        std::io::ErrorKind::IsADirectory => "Is a directory".to_string(),
+        std::io::ErrorKind::NotADirectory => "Not a directory".to_string(),
+        _ => format!("{}", __e) } };
     for __sh_path in &@ARGV@ {
         match std::fs::symlink_metadata(__sh_path) {
             Ok(__sh_mapped) => {
@@ -7773,6 +7782,13 @@ while __sh_path.len() > 1 && __sh_path.ends_with('/') {{ __sh_path = &__sh_path[
                 let verbose = flags.contains(&'v');
                 r#"{
     let mut __sh_status: i32 = 0;
+    let __sh_strerr = |__e: &std::io::Error| -> String { match __e.kind() {
+        std::io::ErrorKind::NotFound => "No such file or directory".to_string(),
+        std::io::ErrorKind::PermissionDenied => "Permission denied".to_string(),
+        std::io::ErrorKind::AlreadyExists => "File exists".to_string(),
+        std::io::ErrorKind::IsADirectory => "Is a directory".to_string(),
+        std::io::ErrorKind::NotADirectory => "Not a directory".to_string(),
+        _ => format!("{}", __e) } };
     for __sh_path in &@ARGV@ {
         let __sh_res = if @PARENTS@ { std::fs::create_dir_all(__sh_path) } else { std::fs::create_dir(__sh_path) };
         match __sh_res {
@@ -7780,7 +7796,15 @@ while __sh_path.len() > 1 && __sh_path.ends_with('/') {{ __sh_path = &__sh_path[
                 if @VERBOSE@ { println!("mkdir: created directory '{}'", __sh_path); }
             }
             Err(__sh_err) => {
-                eprintln!("mkdir: cannot create directory '{}': {}", __sh_path, __sh_err);
+                // MEASURED shapes, which are NOT one format: this host's
+                // mkdir names the path on `File exists` and omits it on
+                // `Permission denied` / `No such file or directory`.
+                match __sh_err.kind() {
+                    std::io::ErrorKind::AlreadyExists => eprintln!("mkdir: {}: File exists", __sh_path),
+                    std::io::ErrorKind::PermissionDenied => eprintln!("mkdir: Permission denied"),
+                    std::io::ErrorKind::NotFound => eprintln!("mkdir: No such file or directory"),
+                    _ => eprintln!("mkdir: {}: {}", __sh_path, __sh_err),
+                }
                 __sh_status = 1;
             }
         }
@@ -7796,11 +7820,31 @@ while __sh_path.len() > 1 && __sh_path.ends_with('/') {{ __sh_path = &__sh_path[
                 // an existing file, then mtime is bumped like touch(1).
                 r#"{
     let mut __sh_status: i32 = 0;
+    let __sh_strerr = |__e: &std::io::Error| -> String { match __e.kind() {
+        std::io::ErrorKind::NotFound => "No such file or directory".to_string(),
+        std::io::ErrorKind::PermissionDenied => "Permission denied".to_string(),
+        std::io::ErrorKind::AlreadyExists => "File exists".to_string(),
+        std::io::ErrorKind::IsADirectory => "Is a directory".to_string(),
+        std::io::ErrorKind::NotADirectory => "Not a directory".to_string(),
+        _ => format!("{}", __e) } };
     for __sh_path in &@ARGV@ {
         match std::fs::OpenOptions::new().create(true).append(true).open(__sh_path) {
             Ok(__sh_field) => { let _ = __sh_field.set_modified(std::time::SystemTime::now()); }
+            // `touch DIR` is a legal time update: append-open refuses a
+            // directory, so the directory is opened read-only for the same
+            // `set_modified` (bash succeeds here; without this the arm would
+            // print a diagnostic bash never prints).
+            Err(__sh_err) if __sh_err.kind() == std::io::ErrorKind::IsADirectory => {
+                match std::fs::File::open(__sh_path) {
+                    Ok(__sh_field) => { let _ = __sh_field.set_modified(std::time::SystemTime::now()); }
+                    Err(__sh_err) => {
+                        eprintln!("touch: cannot touch '{}': {}", __sh_path, __sh_strerr(&__sh_err));
+                        __sh_status = 1;
+                    }
+                }
+            }
             Err(__sh_err) => {
-                eprintln!("touch: cannot touch '{}': {}", __sh_path, __sh_err);
+                eprintln!("touch: cannot touch '{}': {}", __sh_path, __sh_strerr(&__sh_err));
                 __sh_status = 1;
             }
         }
@@ -24914,6 +24958,89 @@ mod tests {
             );
             assert_eq!(rs_rc, sh_rc, "{name}: status differs from bash");
         }
+    }
+
+    /// `rm`, `mkdir` and `touch` are native `std::fs` statements — so their
+    /// DIAGNOSTICS have to be bash's (`rm: cannot remove 'p': No such file or
+    /// directory`), not `io::Error`'s Display (`… (os error 2)`). The matrix
+    /// runs the compiled program and bash over the SAME absolute paths, with
+    /// the fixture tree rebuilt before each side: present/missing/duplicate,
+    /// a directory operand, recursive and `-d` removal, an empty parent, and
+    /// a read-only directory (present/missing/no-permission, as applicable).
+    #[cfg(unix)]
+    #[test]
+    fn fs_statements_report_bash_diagnostics() {
+        use std::os::unix::fs::PermissionsExt;
+        let root = std::env::temp_dir().join(format!("sh2_fs_stmt_{}", std::process::id()));
+        let p = |n: &str| root.join(n).to_string_lossy().into_owned();
+        let reset = || {
+            let _ = std::fs::set_permissions(root.join("ro"), std::fs::Permissions::from_mode(0o755));
+            let _ = std::fs::remove_dir_all(&root);
+            std::fs::create_dir_all(root.join("sub")).expect("fixture sub");
+            std::fs::create_dir_all(root.join("existing")).expect("fixture existing");
+            std::fs::create_dir_all(root.join("emptyd")).expect("fixture emptyd");
+            std::fs::create_dir_all(root.join("ro")).expect("fixture ro");
+            std::fs::write(root.join("sub").join("f.txt"), b"sub\n").expect("fixture sub file");
+            std::fs::write(root.join("ro").join("f.txt"), b"ro\n").expect("fixture ro file");
+            std::fs::write(root.join("goner.txt"), b"gone\n").expect("fixture goner");
+            std::fs::write(root.join("has.txt"), b"keep me\n").expect("fixture has");
+            std::fs::set_permissions(root.join("ro"), std::fs::Permissions::from_mode(0o555))
+                .expect("fixture ro mode");
+        };
+        let cases = [
+            ("fs-rm-file", format!("rm '{}'\n", p("goner.txt"))),
+            ("fs-rm-missing", format!("rm '{}'\n", p("nope.txt"))),
+            ("fs-rm-force-missing", format!("rm -f '{}'\n", p("nope.txt"))),
+            ("fs-rm-no-operand", "rm\n".to_string()),
+            ("fs-rm-directory", format!("rm '{}'\n", p("sub"))),
+            ("fs-rm-recursive", format!("rm -r '{}'\n", p("sub"))),
+            ("fs-rm-empty-dir-flag", format!("rm -d '{}'\n", p("emptyd"))),
+            (
+                "fs-rm-permission",
+                format!("rm '{}/f.txt'\n", p("ro")),
+            ),
+            ("fs-mkdir-new", format!("mkdir '{}'\n", p("made"))),
+            ("fs-mkdir-exists", format!("mkdir '{}'\n", p("existing"))),
+            ("fs-mkdir-parents", format!("mkdir -p '{}/a/b'\n", p("deep"))),
+            ("fs-mkdir-permission", format!("mkdir '{}/child'\n", p("ro"))),
+            ("fs-mkdir-missing-parent", format!("mkdir '{}/child'\n", p("absent"))),
+            (
+                "fs-rm-through-file",
+                format!("rm '{}/x'\n", p("has.txt")),
+            ),
+            ("fs-touch-directory", format!("touch '{}'\n", p("existing"))),
+            ("fs-touch-new", format!("touch '{}'\n", p("touched.txt"))),
+            (
+                "fs-touch-keeps-content",
+                format!("touch '{}'\ncat '{}'\n", p("has.txt"), p("has.txt")),
+            ),
+            (
+                "fs-touch-missing-parent",
+                format!("touch '{}/x'\n", p("absent")),
+            ),
+            ("fs-touch-permission", format!("touch '{}/new'\n", p("ro"))),
+        ];
+        for (name, src) in cases {
+            let prog = render_rs(&src);
+            assert!(
+                !prog.contains("__sh_spawn(") && !prog.contains("/* TODO"),
+                "{name}: the fs command did not render natively:\n{prog}"
+            );
+            reset();
+            let (sh_out, sh_err, sh_rc) = run_bash_full(&src);
+            reset();
+            let (rs_out, rs_err, rs_rc) = compile_and_run_full(name, &prog);
+            assert_eq!(rs_out, sh_out, "{name}: stdout differs from bash");
+            assert_eq!(
+                String::from_utf8_lossy(&rs_err),
+                String::from_utf8_lossy(&sh_err),
+                "{name}: stderr differs from bash"
+            );
+            assert_eq!(rs_rc, sh_rc, "{name}: status differs from bash");
+        }
+        std::fs::set_permissions(root.join("ro"), std::fs::Permissions::from_mode(0o755))
+            .expect("fixture chmod back");
+        let _ = std::fs::remove_dir_all(&root);
     }
 
     /// The argv forms the old fold MIS-READ, each with the same witness as a
