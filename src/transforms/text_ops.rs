@@ -3023,9 +3023,14 @@ fn try_lower_command(text: IrExpr, cmd_name: &str, cmd_args: &[IrExpr]) -> Optio
 }
 
 /// The operand of a `basename`/`dirname` call, or None when the first word
-/// is a FLAG (`basename -s .sh p`, `dirname -z p`): the node models the
-/// plain GNU call only, so a flagged call keeps its original command.
+/// is a FLAG (`basename -s .sh p`, `dirname -z p`) or the call has more than
+/// one operand: the node models the plain, SINGLE-operand GNU call only, so a
+/// flagged call and `basename p .txt` / `dirname a b` keep their original
+/// command (they print MORE than one word — the node prints one).
 fn path_operand(cmd_args: &[IrExpr]) -> Option<&IrExpr> {
+    if cmd_args.len() != 1 {
+        return None;
+    }
     match cmd_args.first()? {
         IrExpr::Str(s, _) if s.starts_with('-') => None,
         a => Some(a),

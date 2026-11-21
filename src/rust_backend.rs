@@ -7935,8 +7935,11 @@ while __sh_path.len() > 1 && __sh_path.ends_with('/') {{ __sh_path = &__sh_path[
                 // (`__sh_basename(&str)`, used by the word-level pathops
                 // lowering), so this argv form gets its own name.
                 self.add_helper(&format!("{cmd}_args"));
+                // The helper reports its own failure (missing/extra
+                // operand): `None` keeps the same diagnostic and makes the
+                // command's status 1, exactly like the real command.
                 Some(format!(
-                    "{{ let __sh_ch = __sh_{cmd}_args(&{argv}); __SH_RC.store(0, Ordering::Relaxed); __sh_ch }}"
+                    "match __sh_{cmd}_args(&{argv}) {{ Some(__sh_ch) => {{ __SH_RC.store(0, Ordering::Relaxed); __sh_ch }} None => {{ __SH_RC.store(1, Ordering::Relaxed); String::new() }} }}"
                 ))
             }
             "mktemp" => {
@@ -16084,31 +16087,62 @@ fn helper_source(h: &str) -> &'static str {
     }
     rc
 }"#,
-        "basename_args" => r#"fn __sh_basename_args(argv: &[String]) -> String {
-    let p = match argv.first() { Some(p) => p.clone(), None => { eprintln!("basename: missing operand"); return String::new(); } };
-    let suffix = argv.get(1).cloned().unwrap_or_default();
+        // `basename`/`dirname` are pure string ops, so the argv helper has to
+        // be exact for EVERY argv the fold can hand it — including the empty
+        // operand (uutils prints an empty line / `.`, not `/`), the suffix
+        // operand (`basename p .txt`) and the error paths (missing/extra
+        // operand: one diagnostic, a `Try ...` hint and status 1). Measured
+        // against uutils coreutils 0.10.0 on this host.
+        "basename_args" => r#"fn __sh_basename_args(argv: &[String]) -> Option<String> {
+    if argv.is_empty() {
+        eprintln!("basename: missing operand\nTry 'basename --help' for more information.");
+        return None;
+    }
+    if argv.len() > 2 {
+        eprintln!("basename: extra operand '{}'\nTry 'basename --help' for more information.", argv[2]);
+        return None;
+    }
+    let p = &argv[0];
     let body = p.trim_end_matches('/');
-    let mut out = if body.is_empty() {
+    let mut out = if p.is_empty() {
+        String::new()
+    } else if body.is_empty() {
         "/".to_string()
     } else {
         match body.rfind('/') { Some(i) => body[i + 1..].to_string(), None => body.to_string() }
     };
-    if !suffix.is_empty() && out.len() > suffix.len() && out.ends_with(&suffix) {
-        out.truncate(out.len() - suffix.len());
-    }
-    out
-}"#,
-        "dirname_args" => r#"fn __sh_dirname_args(argv: &[String]) -> String {
-    let p = match argv.first() { Some(p) => p.clone(), None => { eprintln!("dirname: missing operand"); return String::new(); } };
-    let t = p.trim_end_matches('/');
-    if t.is_empty() { return "/".to_string(); }
-    match t.rfind('/') {
-        None => ".".to_string(),
-        Some(i) => {
-            let d = t[..i].trim_end_matches('/');
-            if d.is_empty() { "/".to_string() } else { d.to_string() }
+    if let Some(suffix) = argv.get(1) {
+        if !suffix.is_empty() && out.len() > suffix.len() && out.ends_with(suffix.as_str()) {
+            out.truncate(out.len() - suffix.len());
         }
     }
+    Some(out)
+}"#,
+        "dirname_args" => r#"fn __sh_dirname_args(argv: &[String]) -> Option<String> {
+    if argv.is_empty() {
+        eprintln!("dirname: missing operand\nTry 'dirname --help' for more information.");
+        return None;
+    }
+    let mut out: Vec<String> = Vec::new();
+    for p in argv {
+        if p.is_empty() {
+            out.push(".".to_string());
+            continue;
+        }
+        let t = p.trim_end_matches('/');
+        if t.is_empty() {
+            out.push("/".to_string());
+            continue;
+        }
+        out.push(match t.rfind('/') {
+            None => ".".to_string(),
+            Some(i) => {
+                let d = t[..i].trim_end_matches('/');
+                if d.is_empty() { "/".to_string() } else { d.to_string() }
+            }
+        });
+    }
+    Some(out.join("\n"))
 }"#,
         "mktemp" => r#"fn __sh_mktemp(dir: bool, tmpl: &str) -> String {
     let t = if tmpl.is_empty() {
@@ -25325,6 +25359,61 @@ mod tests {
             "stat predicates: stderr differs from bash"
         );
         assert_eq!(rs_rc, sh_rc, "stat predicates: status differs from bash");
+    }
+
+    /// Class 6, the ARGV half: `basename`/`dirname` are pure string ops, so
+    /// each one's render must match uutils coreutils 0.10.0 (this host) for
+    /// every operand shape — the single operand the `PathName` node spells,
+    /// the suffix operand, several operands (one output line each), the EMPTY
+    /// operand (empty line / `.`, NOT `/`) and the error paths (one
+    /// diagnostic, a `Try ...` hint, status 1). Statement position and
+    /// `$( ... )` take different routes (node vs argv helper), so both are
+    /// witnessed, and the multi-operand statement covers the spawn fallback.
+    #[cfg(unix)]
+    #[test]
+    fn basename_dirname_operands_match_coreutils() {
+        let paths = [
+            "/", "//", "a", "a/", "a//b//", ".", "..", "", "/x", "a/b.txt", "a/.", "a/b/",
+        ];
+        let mut stmt = String::new();
+        let mut sub = String::new();
+        for p in paths {
+            stmt.push_str(&format!("basename '{p}'\ndirname '{p}'\n"));
+            stmt.push_str(&format!("basename '{p}' '.txt'\ndirname '{p}' '/x'\n"));
+            sub.push_str(&format!("v=$(basename '{p}'); echo \"b=[$v]\"\n"));
+            sub.push_str(&format!("v=$(dirname '{p}'); echo \"d=[$v]\"\n"));
+            sub.push_str(&format!("v=$(basename '{p}' '.txt'); echo \"bs=[$v]\"\n"));
+            sub.push_str(&format!("v=$(dirname '{p}' '/x'); echo \"dm=[$v]\"\n"));
+        }
+        stmt.push_str("echo done\n");
+        let errs = "basename; echo \"rc=$?\"\nbasename a b c; echo \"rc=$?\"\ndirname; echo \"rc=$?\"\nbasename a b; echo \"rc=$?\"\ndirname a; echo \"rc=$?\"\n\
+                    v=$(basename a b c); echo \"sub-extra=[$v] rc=$?\"\n\
+                    v=$(dirname); echo \"sub-missing=[$v] rc=$?\"\n\
+                    v=$(basename); echo \"sub-missing-b=[$v] rc=$?\"\n";
+        for (case, src) in [
+            ("basename-dirname-statements", stmt.as_str()),
+            ("basename-dirname-substitutions", sub.as_str()),
+            ("basename-dirname-errors", errs),
+        ] {
+            let prog = render_rs(src);
+            assert!(
+                !prog.contains("/* TODO"),
+                "{case}: placeholder in the render:\n{prog}"
+            );
+            let (rs_out, rs_err, rs_rc) = compile_and_run_full(case, &prog);
+            let (sh_out, sh_err, sh_rc) = run_bash_full(src);
+            assert_eq!(
+                String::from_utf8_lossy(&rs_out),
+                String::from_utf8_lossy(&sh_out),
+                "{case}: stdout differs from bash"
+            );
+            assert_eq!(
+                String::from_utf8_lossy(&rs_err),
+                String::from_utf8_lossy(&sh_err),
+                "{case}: stderr differs from bash"
+            );
+            assert_eq!(rs_rc, sh_rc, "{case}: status differs from bash");
+        }
     }
 
     /// The argv forms the old fold MIS-READ, each with the same witness as a
