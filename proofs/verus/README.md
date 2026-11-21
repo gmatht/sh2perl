@@ -8295,3 +8295,82 @@ cd sh2perl && RUSTUP_HOME=$HOME/.rustup CARGO_HOME=$HOME/.cargo \
 cd .. && python3 harness/mut-grep-pcre.py     # 25/25 red
 bash harness/anchor-grep-pcre.sh              # pass=19 fail=0
 ```
+
+## `fs_cmd_lift.rs` — a tag-only lift whose refusal is the static-argv lemma (31)
+
+`transforms/fs_cmd_lift.rs`. A statement-position `exec rm|mkdir|touch …`
+whose words are all PLAIN literals becomes the shared `FsCommand` node. The
+node's Rust arm reuses the `native_fs_stmt` renderer that already handled the
+call, so the lift changes no emitted byte (`changed=0` over the 548 renders);
+the model proves that this is a CARRIER rewrite rather than a behaviour one.
+
+- **The static-argv guarantee** — `a_plain_word_has_no_hazard_char`: a word
+  built only from the plain set (`[A-Za-z0-9]` plus `/._-+:,@=~`) contains no
+  byte outside it, hence no `*`, `?`, `$`, space, quote, backslash or `;`.
+  bash would resolve those at runtime while the IR holds one `Str`, so the
+  refusal is exactly what keeps the node's argv equal to bash's argv; the six
+  hazard characters are each instantiated as a pin.
+- **The carrier law** — `the_walk_preserves_command_and_argv`: the sequence of
+  `(cmd, argv)` leaves, in order, is unchanged by the walk. A dropped,
+  renamed or reordered word is red.
+- **Completeness and legality** — `every_liftable_exec_is_a_node` (no liftable
+  exec survives anywhere in the tree) and `only_legal_nodes_are_built`
+  (nothing the renderer cannot spell becomes a node), with the `offered` gate
+  pinned in both directions (`gate-ignored` and `gate-always-off` are red).
+- **The acceptance table is the renderer's table** — `rm` allows `f r R d`,
+  `mkdir` `p v`, `touch` none; `--` is a separator that survives into argv, a
+  lone `-` is an operand and is refused, and a `--long` form is refused. Each
+  letter is its own pin, so widening one table is red.
+- **Refusals stay exec** — a dynamic word, a glob, an unmodelled flag, a
+  long flag, an empty argv, a lone `-`, and `sleep`/`mktemp`/`cat` (their
+  observable value is the RESULT, not a side effect).
+
+Scope: the model is about the LIFT — the same command and argv reach the
+renderer. The renderer's own job (bash's per-operand status aggregation, the
+`-f` missing-path rule, the diagnostics) is the node's pre-existing contract,
+measured end to end by the anchor. The filesystem is out of model, as is the
+`args.get(1)` absent-vs-empty distinction (both refuse).
+
+### Mutants
+
+`harness/mut-fs-cmd-lift.py` — 27 independent edits inside the named
+definitions: the punctuation set admitting `*` or space or losing `-`; the
+walk skipping the plain check; an empty word or a lone `-` accepted; the
+command table admitting `sleep`/`mktemp` or losing `touch`; `rm` losing `f` or
+admitting `i`; `mkdir` losing `v`; the letter table unchecked; `--long`
+accepted; the separator refused; the acceptance predicate dropping a word,
+the plain check or the flag check; the walk lifting refused shapes or
+reverting a node; the walk missing a block/while/function/else or the second
+statement; the offered gate ignored or always off. Measured: **27/27 RED**,
+each naming an obligation (`pin_*`, `skeleton_walk_leaf`,
+`every_liftable_exec_is_a_node`, `only_legal_nodes_are_built`), none an
+`E0xxx`.
+
+### Anchor
+
+`harness/anchor-fs-cmd-lift.sh` — **19/19 shapes** (10 accepted, 9 refused),
+compiled and run against bash in the same sandbox, comparing stdout and exit
+status. Accepted: `rm -f`, `rm -rf`, `rm -d`, a plain `rm`, `mkdir -p`/`-pv`/
+plain, `touch` with one and three operands, and the `--` separator. Refused: a
+glob, a variable operand, `rm -i`, `mkdir --parents`, no operand, a lone `-`,
+and the non-fs `sleep`/`mktemp`/`cat`. Two extra checks: the Rust emission
+with the lift is BYTE-IDENTICAL to the no-transform emission for every shape
+(the tag-only claim, measured), and on Perl — which does not declare the node
+— each lifted statement becomes the backend's "not yet supported" die while a
+refused shape's emission is unchanged, which is how the accepted/refused
+classification is observed at all. Recorded, not claimed fixed: two `mkdir`
+statements on an existing directory print the "File exists" diagnostic twice
+in the Rust output where bash prints it once, identically with and without
+the lift (a pre-existing renderer divergence; the anchor therefore compares
+stdout and status). Go and Zig were not executed (`go=none zig=none` on this
+host).
+
+### Running it
+
+```sh
+cd sh2perl && RUSTUP_HOME=$HOME/.rustup CARGO_HOME=$HOME/.cargo \
+  ~/verus-0.2026.10.18.7d82994/verus --triggers-mode silent --rlimit 60 \
+  proofs/verus/fs_cmd_lift.rs               # 31 verified, 0 errors
+cd .. && python3 harness/mut-fs-cmd-lift.py  # 27/27 red
+bash harness/anchor-fs-cmd-lift.sh           # pass=19 fail=0
+```
