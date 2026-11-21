@@ -1,5 +1,5 @@
 # verus-sync-coverage manifest: c_decl_coverage
-# source sha: c_backend-walkers=4047d414a29e  proof sha: 09018a3eb4a7
+# source sha: c_backend-walkers=840274f9b61b  proof sha: 09018a3eb4a7
 
 [pins]
 pin pin_array_elem -> UNMIRRORED (by design — see VERUS.md §(b).4)
@@ -75,6 +75,7 @@ fn collect_assigned_expr
   arm IrExpr::Call { args, .. } if is_printf_v_call(args) | calls: collect_assigned_expr
   arm IrExpr::Call { args, .. } if matches!(args.first(), Some(IrExpr::Str(c, _)) if c == "let") && matches!( args.get(1), Some(IrExpr::Array(items)) if matches!(items.first(), Some(IrExpr::Str(..))) ) | calls: collect_assigned_expr,let_var_name
   arm IrExpr::Call { func, args } if func == "param" | calls: collect_assigned_expr,param_write_target
+  arm IrExpr::Call { func, args } if func == "assign" | calls: collect_assigned_expr
   arm IrExpr::Call { args, .. } | calls: collect_assigned_expr
   arm IrExpr::BinOp { lhs, rhs, .. } | calls: collect_assigned_exprx2
   arm IrExpr::Interpolate(parts) | calls: collect_assigned_expr

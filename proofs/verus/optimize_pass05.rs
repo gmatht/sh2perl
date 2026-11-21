@@ -21,9 +21,11 @@
 //      returned values fit int64; `fold_pow_is_pow_wrapping` ties the `**`
 //      arm to §1.
 //
-//   §3 fold_arith_ast — the recursive driver. `fold_tree_value` proves a
-//      literal tree keeps its value through the fold; `fold_tree_shape`
-//      proves a refused node keeps its shape (nothing invented).
+//   §3 was the recursive driver, modelled by hand as a one-node reduction.
+//      It is GONE: the recursion is now proved over the generated text in
+//      `fold_arith_ast_pure.rs` (harness/verus-sync-foldarith.sh emits the
+//      shipped `enum ArithAst` + `fn fold_arith_ast` from src/ir.rs and the
+//      gate verifies that file), so no hand copy of the driver exists here.
 //
 // What is NOT modelled (listed so the gap is visible):
 //   - The string parse (`fold_arith_const`) and the `arith("…")` String
@@ -271,6 +273,9 @@ proof fn lemma_pow_rs_correct(b: int, e: nat, acc: int)
                 lemma_bits_range(pow_ref(b, 2 * e2));
             } else {
                 lemma_pow_ref_one(b);
+                // acc * b^(2e2+1) == (acc*b) * b^(2e2): commute the base past
+                // the power before associating (the exponent is odd).
+                lemma_wmul_comm(b, pow_ref(b, 2 * e2));
                 lemma_wmul_assoc(acc, b, pow_ref(b, 2 * e2));
             }
         }
@@ -482,66 +487,17 @@ proof fn pin_tdiv_is_truncating(a: int, b: int)
 }
 
 // ---------------------------------------------------------------------------
-// 3. fold_arith_ast: the recursive driver
+// 3. fold_arith_ast: MOVED to the generated module
 // ---------------------------------------------------------------------------
-
-/// The node shapes `fold_arith_ast` folds: a `Bin`/`Un` whose operands the
-/// recursion has already reduced to `Num`. A node whose operands are not
-/// literals is never folded, so one level IS the whole fold decision — the
-/// recursion only supplies the premise "the children are literals", which
-/// this model states on the node rather than re-deriving.
-pub enum Node {
-    Num(int),
-    Bin(Op, int, int),
-    Un(bool, int), // true = unary minus
-    Var(int),      // opaque non-literal leaf: never folds
-}
-
-/// int64 negation (bash `$((-x))` wraps; `-i64::MIN == i64::MIN`).
-pub open spec fn un_fold(neg: bool, a: int) -> int {
-    if neg { as_i64((0 - a) % m64()) } else { a }
-}
-
-pub open spec fn node_value(n: Node) -> int {
-    match n {
-        Node::Num(v) => v,
-        Node::Bin(op, a, b) => match fold_bin_op(op, a, b) {
-            Some(v) => v,
-            None => 0, // a bash runtime error the fold must refuse
-        },
-        Node::Un(neg, a) => un_fold(neg, a),
-        Node::Var(_) => 0,
-    }
-}
-
-/// `fold_arith_ast`'s decision on one node: replace it with a literal when
-/// the operands fold, otherwise keep it byte-for-byte.
-pub open spec fn node_fold(n: Node) -> Node {
-    match n {
-        Node::Num(v) => Node::Num(v),
-        Node::Bin(op, a, b) => match fold_bin_op(op, a, b) {
-            Some(v) => Node::Num(v),
-            None => Node::Bin(op, a, b),
-        },
-        Node::Un(neg, a) => Node::Num(un_fold(neg, a)),
-        Node::Var(v) => Node::Var(v),
-    }
-}
-
-/// THE DRIVER OBLIGATION: folding does not change a node's value.
-proof fn fold_node_value(n: Node)
-    ensures node_value(node_fold(n)) == node_value(n),
-{
-}
-
-/// ... and a REFUSAL is a no-op on the shape (nothing is invented for an
-/// expression bash aborts on). This is the failing-first shape for a fold
-/// that returned `Some(0)` on div-by-zero instead of refusing.
-proof fn fold_node_refusal(op: Op, a: int, b: int)
-    requires fold_bin_op(op, a, b) is None,
-    ensures node_fold(Node::Bin(op, a, b)) == Node::Bin(op, a, b),
-{
-}
+//
+// The recursive driver is no longer transcribed here. It is emitted from
+// src/ir.rs into `proofs/verus/fold_arith_ast_pure.rs` by
+// `harness/verus-sync-foldarith.sh`, and the gate verifies that file (plus
+// regenerates and diffs it, so the proved text IS the runnable text). The
+// theorem there is `fold_value` (a literal tree keeps its value through the
+// fold) plus `fold_identity` (a tree with no literal pair is unchanged —
+// the refusal property), both over the FULL recursion rather than one node.
+// The op table they call is this file's subject; §1/§2 above still prove it.
 
 // ---------------------------------------------------------------------------
 // Fidelity pins (concrete values measured against bash on this box)
