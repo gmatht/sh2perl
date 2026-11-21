@@ -500,6 +500,82 @@ declaration bug (`i = NULL` into a `uint8_t`) that reproduces with the
 transform inactive.
 
 
+## fuse_fill_consume.rs — the fill and the consumer are the same iteration (37)
+
+```
+    verus --triggers-mode silent --rlimit 40 fuse_fill_consume.rs
+    -> verification results:: 37 verified, 0 errors
+```
+
+**What is proved.** Standalone model of the transform that turns a fill loop
+
+    for ((i=0;i<n;i++)); do a[i]=F; done
+
+followed (possibly across statements) by a consumer loop
+
+    for ((i=0;i<n;i++)); do s=$((s+a[i])); done
+
+into one loop that evaluates `F` at the consumer's own iteration and drops the
+array. A `Trace` is the pair of loops as the transform sees them: for each of
+`n` iterations the fill's and the consumer's counter value, the store index and
+the read index, and whether the store executes; plus the fill RHS `rhs` (an
+expression over scalar slots and the counter), the scalar environment at fill
+time, the writes between the loops, and the values of any OTHER array reads.
+`the_fusion_preserves_the_observable` is the law for EVERY trace:
+`go(t, census(t)) == go(t, false)`, where the reference emits the array
+elements and the fused side emits `rhs` evaluated in the consumer's
+environment. `census` is computed FROM the trace, not from a shape antecedent.
+
+**One obligation per load-bearing rule.** The six census conjuncts are
+`all_stored` (a hole would leave `a[read]` at its initial zero),
+`affine_fill` (the store index IS the counter), `affine_read`, `same_header`
+(same trip count and phase), `stable` (no gap write touches a free name of
+`F`, which a forward that sees the gap would otherwise observe) and `alone`
+(no other array use observes the array). The value facts are separate:
+`the_read_value_is_preserved` (the read element equals the forward at every
+iteration), `a_stored_value_is_the_expression_at_its_iteration` (the last
+store wins and the affine key makes it THIS iteration's `F`) and
+`the_gap_does_not_change_the_expression`.
+
+**Not modelled, stated.** The recognition (which shapes are loops, how `a[i]`
+parses to an array/index pair) is what produces a trace; the law holds for
+every trace and the transform's own tests pin the recognition. `int` is
+unbounded here; 64-bit wrap is the shared renderer/bash contract. The array's
+initial zeros are the `MALLOC_PERTURB_`-independent state the generated C has.
+
+**Mutants, all red, no `E0xxx`, each naming the rule it weakens.** identity /
+no-fuse (the census must accept the clean witness), dropping each conjunct of
+`census` in turn (the law and that conjunct's witness), accept-everything,
+`arr_at` ignoring stores (the clean witness's words), `apply` ignoring the gap
+(the gap witness) and forwarding at the fill-time counter instead of the
+consumer's (the header witness).
+
+**One defect the model forced, repaired.** The census counted writes and
+`getVar` calls but not arithmetic EFFECTS, so a consumer body such as
+`tmp=$((x=7)); acc=$((acc+zzarr[i]))`, or a gap `k=$((x=7))`, was accepted
+while the fill had stored the OLD `x` (measured: bash `2 7`, generated C
+`7 7`). Repaired by collecting evaluation-time effects (`ArithAst::Assign`,
+`IncDec` and text that cannot be shown effect-free) and vetoing those that hit
+`F`'s free names, the counter, the bound or the condition names. Tests:
+`consumer_arith_effect_on_a_forwarded_var_vetoes`,
+`gap_arith_effect_on_a_forwarded_var_vetoes`,
+`consumer_arith_effect_on_the_counter_vetoes`,
+`consumer_arith_effect_on_the_bound_vetoes`,
+`consumer_text_arith_effect_vetoes`, plus
+`consumer_arith_effect_on_an_unread_scratch_still_fuses` as the precision control (all five go red with the two
+guard sites disabled).
+
+**Anchor.** 14 shell shapes: real bash stdout+exit vs the compiled generated C
+under `MALLOC_PERTURB_` 170 and 85 — 14/14 SAME. Four lifted shapes (canonical,
+variable bound, zero-trip, and one exiting 4) lose the array entirely (0
+`zzarr` references in the C); eight refused shapes (shifted read, extra
+mention, conditional fill, header mismatch, a consumer write to `F`'s free
+name, a consumer effect, a gap effect, and a refused shape exiting 5) keep it;
+two no-match fall-throughs (fill without consumer, consumer without fill) are
+byte-identical. The consumer/gap effect shapes are the ones the repair above
+fixed, and they still REFUSE (the array stays).
+
+
 ## Running it
 
 Verus needs rust toolchain `1.99.1-x86_64-unknown-linux-gnu`

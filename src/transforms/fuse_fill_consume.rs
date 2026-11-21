@@ -315,7 +315,7 @@ fn find_fusions(stmts: &[IrStmt]) -> Vec<Action> {
     let mut out = Vec::new();
     let mut i = 0;
     while i < stmts.len() {
-        let (fill, counter, bound, init, cond, step) = match &stmts[i] {
+        let (fill, counter, bound, init, cond, step, condvars) = match &stmts[i] {
             IrStmt::ForInit { init, cond, step, body } => {
                 let Some((counter, _)) = counter_of_init(init) else {
                     i += 1;
@@ -343,7 +343,16 @@ fn find_fusions(stmts: &[IrStmt]) -> Vec<Action> {
                 // affect the cond — unprovable → veto ANY gap write when
                 // the bound is unknown. Enforced in the gap loop below.)
                 let bound = bound_of_cond(cond, &counter);
-                (f, counter, bound, init, cond, step)
+                // Names the trip count may read: a gap write (directly or as
+                // an arithmetic effect) to one of them changes the consumer's
+                // trip count, so the gap discipline needs them too.
+                let mut condvars = BTreeSet::new();
+                collect_names_expr(cond, &mut condvars);
+                for t in cond_texts(cond) {
+                    lex_names(&t, &mut condvars);
+                }
+                condvars.remove(&counter);
+                (f, counter, bound, init, cond, step, condvars)
             }
             _ => {
                 i += 1;
@@ -362,7 +371,14 @@ fn find_fusions(stmts: &[IrStmt]) -> Vec<Action> {
                         // counts between the loops → veto.
                         break;
                     }
-                    if !gap_assign_ok(targets, expr, &counter, bound.as_deref(), &fill) {
+                    if !gap_assign_ok(
+                        targets,
+                        expr,
+                        &counter,
+                        bound.as_deref(),
+                        &fill,
+                        &condvars,
+                    ) {
                         break;
                     }
                     gap_writes.insert(targets[0].var.clone());
@@ -385,16 +401,9 @@ fn find_fusions(stmts: &[IrStmt]) -> Vec<Action> {
             i += 1;
             continue;
         };
-        // Names the trip count may read (over-approx): the consumer
-        // must not write them (self-modifying trips would diverge from
-        // the fill's coverage). The counter is excluded (step machinery
-        // owns it; body writes to it veto separately).
-        let mut condvars = BTreeSet::new();
-        collect_names_expr(cond, &mut condvars);
-        for t in cond_texts(cond) {
-            lex_names(&t, &mut condvars);
-        }
-        condvars.remove(&counter);
+        // The consumer must not write the names the trip count reads
+        // (self-modifying trips would diverge from the fill's coverage);
+        // `condvars` was computed above so the gap discipline can use it.
         let Some(new_body) =
             consume_shape(b2, &counter, bound.as_deref(), &condvars, &fill, &gap_writes)
         else {
@@ -961,6 +970,7 @@ fn gap_assign_ok(
     counter: &str,
     bound: Option<&str>,
     fill: &Fill,
+    condvars: &BTreeSet<String>,
 ) -> bool {
     let [t] = targets else { return false };
     if !t.indices.is_empty() || t.var.contains('[') {
@@ -981,7 +991,82 @@ fn gap_assign_ok(
     if expr_mentions_var(expr, counter) || fill.expr_hits(expr) {
         return false;
     }
+    // An arithmetic effect inside the RHS (`k=$((x=7))`) runs between the
+    // fill and the consumer even though the TARGET is innocent: it writes
+    // the name at evaluation time, so it is part of the gap's write set.
+    if eval_effect_hits(expr, counter, bound, fill, condvars) {
+        return false;
+    }
     true
+}
+
+/// The names an expression's arithmetic effects write AT EVALUATION TIME
+/// (`ArithAst::Assign`/`IncDec` nodes), and whether every effect could be
+/// attributed to a name. `$((x=7))` may arrive as an `arith` CALL whose text
+/// is the only witness; `let_text_pure` attributes it, or the caller vetoes
+/// on `false` (an effect we cannot read back).
+fn eval_effects(e: &IrExpr, out: &mut BTreeSet<String>) -> bool {
+    let mut ok = true;
+    match e {
+        IrExpr::Arith(a) => collect_arith_effects(a, out),
+        IrExpr::Call { func, args } if func == "arith" || func == "let" => {
+            for a in args {
+                let texts: Vec<&str> = match a {
+                    IrExpr::Str(s, _) => vec![s.as_str()],
+                    IrExpr::Array(els) => els
+                        .iter()
+                        .filter_map(|x| match x {
+                            IrExpr::Str(s, _) => Some(s.as_str()),
+                            _ => None,
+                        })
+                        .collect(),
+                    _ => Vec::new(),
+                };
+                ok &= texts.iter().all(|t| let_text_pure(t));
+            }
+        }
+        _ => {}
+    }
+    for k in expr_kids(e) {
+        ok &= eval_effects(k, out);
+    }
+    for st in expr_stmts(e) {
+        ok &= stmt_eval_effects(st, out);
+    }
+    ok
+}
+
+fn stmt_eval_effects(s: &IrStmt, out: &mut BTreeSet<String>) -> bool {
+    // A nested statement body is a closure value, not evaluated at the read;
+    // its Assigns are outside this transform's model either way — veto.
+    if matches!(s, IrStmt::Assign { .. }) {
+        return false;
+    }
+    stmt_kids(s).iter().all(|k| stmt_eval_effects(k, out))
+        && stmt_exprs(s).iter().all(|e| eval_effects(e, out))
+}
+
+/// Does evaluating `e` write a name the fusion depends on? The forwarded RHS
+/// is evaluated at this point, so an effect on its free vars, on the counter
+/// (the read index and the forwarded counter) or on a trip-count name
+/// (bound / condition vars) changes what the reference observed.
+fn eval_effect_hits(
+    e: &IrExpr,
+    counter: &str,
+    bound: Option<&str>,
+    fill: &Fill,
+    condvars: &BTreeSet<String>,
+) -> bool {
+    let mut eff = BTreeSet::new();
+    if !eval_effects(e, &mut eff) {
+        return true;
+    }
+    eff.iter().any(|v| {
+        fill.free.contains(v)
+            || v == counter
+            || bound.is_some_and(|b| v == b)
+            || condvars.contains(v)
+    })
 }
 
 /// Any Call/Capture/MethodCall or `$?` read (status-sensitive: the fill's
@@ -1103,6 +1188,12 @@ fn consume_shape(
         let IrStmt::Assign { expr, .. } = s else {
             return None;
         };
+        // An arithmetic effect inside this RHS runs at the read point: if it
+        // writes a name the forward depends on, the fused read sees a
+        // different value than the fill stored.
+        if eval_effect_hits(expr, counter, bound, fill, condvars) {
+            return None;
+        }
         let (new_expr, n) = substitute_reads(expr, fill, counter)?;
         forwarded += n;
         let mut s2 = s.clone();
@@ -2146,5 +2237,132 @@ mod tests {
             rhs: Box::new(ArithAst::Num(5)),
         });
         assert!(!transform(&mut prog), "literal bound + gap write must veto");
+    }
+
+    // ---- arithmetic EFFECTS at evaluation time ----
+    // `k=$((x=7))` writes x while evaluating an innocent-looking RHS. If the
+    // forward reads x, or the effect moves the counter/trip count, the fused
+    // read sees a value the fill never stored.
+    fn fill_ix() -> IrStmt {
+        for_init(vec![IrStmt::Assign {
+            targets: vec![scalar("a[$i]")],
+            expr: arith(ArithAst::Bin {
+                op: "*".to_string(),
+                lhs: Box::new(v("i")),
+                rhs: Box::new(v("x")),
+            }),
+            asm: None,
+        }])
+    }
+
+    fn acc_plus_a() -> ArithAst {
+        ArithAst::Bin {
+            op: "+".to_string(),
+            lhs: Box::new(v("acc")),
+            rhs: Box::new(ArithAst::Index {
+                var: "a".to_string(),
+                key: Box::new(v("i")),
+            }),
+        }
+    }
+
+    fn eff(var: &str, val: i64) -> ArithAst {
+        ArithAst::Assign {
+            var: var.to_string(),
+            op: "=".to_string(),
+            rhs: Box::new(ArithAst::Num(val)),
+        }
+    }
+
+    /// `tmp=$((x=7)); acc=$((acc+a[i]))` with F=`i*x`: the forward would read
+    /// 7 while the fill stored the old x.
+    #[test]
+    fn consumer_arith_effect_on_a_forwarded_var_vetoes() {
+        let mut prog = vec![
+            fill_ix(),
+            assign("acc", str_lit("0")),
+            for_init(vec![
+                assign("tmp", arith(eff("x", 7))),
+                assign("acc", arith(acc_plus_a())),
+            ]),
+        ];
+        assert!(!transform(&mut prog), "a consumer write to x must veto");
+        assert!(stmts_have_arr(&prog, "a"), "the fill must survive: {prog:?}");
+    }
+
+    /// The same effect in the GAP: `k=$((x=7))` between the loops.
+    #[test]
+    fn gap_arith_effect_on_a_forwarded_var_vetoes() {
+        let mut prog = vec![
+            fill_ix(),
+            assign("k", arith(eff("x", 7))),
+            assign("acc", str_lit("0")),
+            for_init(vec![assign("acc", arith(acc_plus_a()))]),
+        ];
+        assert!(!transform(&mut prog), "a gap write to x must veto");
+        assert!(stmts_have_arr(&prog, "a"));
+    }
+
+    /// An effect on the COUNTER moves the read index and the forwarded value.
+    #[test]
+    fn consumer_arith_effect_on_the_counter_vetoes() {
+        let mut prog = vec![
+            fill_ix(),
+            assign("acc", str_lit("0")),
+            for_init(vec![
+                assign("tmp", arith(eff("i", 9))),
+                assign("acc", arith(acc_plus_a())),
+            ]),
+        ];
+        assert!(!transform(&mut prog), "a consumer write to the counter must veto");
+    }
+
+    /// An effect on the BOUND moves the consumer's trip count.
+    #[test]
+    fn consumer_arith_effect_on_the_bound_vetoes() {
+        let mut prog = vec![
+            fill_ix(),
+            assign("acc", str_lit("0")),
+            for_init(vec![
+                assign("tmp", arith(eff("n", 0))),
+                assign("acc", arith(acc_plus_a())),
+            ]),
+        ];
+        assert!(!transform(&mut prog), "a consumer write to the bound must veto");
+    }
+
+    /// An effect that hides in TEXT (`$((x=7))` as an `arith` call) is
+    /// unattributable, so it vetoes rather than being guessed safe.
+    #[test]
+    fn consumer_text_arith_effect_vetoes() {
+        let text_eff = IrExpr::Call {
+            func: "arith".to_string(),
+            args: vec![str_lit("x=7")],
+        };
+        let mut prog = vec![
+            fill_ix(),
+            assign("acc", str_lit("0")),
+            for_init(vec![
+                assign("tmp", text_eff),
+                assign("acc", arith(acc_plus_a())),
+            ]),
+        ];
+        assert!(!transform(&mut prog), "an effect in inert text must veto");
+    }
+
+    /// PRECISION: an effect on a scratch name F does not read is harmless and
+    /// must not cost the fusion (the check is targeted, not a blanket veto).
+    #[test]
+    fn consumer_arith_effect_on_an_unread_scratch_still_fuses() {
+        let mut prog = vec![
+            fill_ix(),
+            assign("acc", str_lit("0")),
+            for_init(vec![
+                assign("tmp", arith(eff("scratch", 7))),
+                assign("acc", arith(acc_plus_a())),
+            ]),
+        ];
+        assert!(transform(&mut prog), "a scratch effect must not veto");
+        assert!(!stmts_have_arr(&prog, "a"), "the array must be gone");
     }
 }
