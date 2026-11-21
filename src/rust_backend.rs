@@ -24707,7 +24707,7 @@ mod tests {
             (
                 "-x",
                 "f=a.txt\nif [ -x \"$f\" ]; then echo y; fi\n",
-                &["permissions().mode() & 0o111"],
+                &["__sh_access(", "0o111"],
             ),
         ];
         let helpers = [
@@ -25727,46 +25727,54 @@ mod tests {
                 "__sh_squeeze",
                 "w=$(echo \"  a  b  \" | tr -s ' ')\necho \"$w\"\n",
             ),
-            // ── fs.* predicates (class 6) ────────────────────────────────
-            // `-ef` is dev+ino over stat(2), so a symlink and its target ARE
-            // the same file; two missing paths are not.
+        ];
+        // The fs.* cases run against their OWN absolute directory: the render
+        // executes in its build dir while bash runs in the crate dir, so a
+        // relative `a`/`b` is a different file per side (and a parallel test
+        // touching `a`/`b` there would race the comparison).
+        let fsdir = std::env::temp_dir().join(format!("sh2_fs_nodes_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&fsdir);
+        std::fs::create_dir_all(&fsdir).expect("fs fixture");
+        let d = fsdir.display();
+        let fs_cases: Vec<(&str, &str, String)> = vec![
             (
                 "FsSameFile",
                 "dev()",
-                "printf x > a\nprintf y > b\n[ a -ef b ] || echo diff\n[ a -ef a ] && echo same\n",
+                format!("printf x > {d}/a\nprintf y > {d}/b\n[ {d}/a -ef {d}/b ] || echo diff\n[ {d}/a -ef {d}/a ] && echo same\n"),
             ),
             (
                 "FsSameFileResolved",
                 "dev()",
-                "printf x > a\n[ a -ef ./a ] && echo dotpath\n[ /dev/null -ef /dev/null ] && echo devnull\n[ / -ef /dev ] || echo differ\n",
+                format!("printf x > {d}/a\n[ {d}/a -ef {d}/./a ] && echo dotpath\n[ /dev/null -ef /dev/null ] && echo devnull\n[ / -ef /dev ] || echo differ\n"),
             ),
             (
                 "FsSameFileMissing",
                 "dev()",
-                "printf x > a\n[ a -ef nope ] || echo missing\n[ nope -ef nope ] || echo both_missing\n",
+                format!("[ {d}/a -ef {d}/nope ] || echo missing\n[ {d}/nope -ef {d}/nope ] || echo both_missing\n"),
             ),
-            // `-nt`/`-ot` carry bash's MISSING-OPERAND rule: the existing side
-            // wins, and two missing files are neither.
             (
                 "FsNewerThan",
                 "__sh_a > __sh_b",
-                "printf x > a\nprintf y > b\n[ a -nt a ] || echo notnewer\n[ b -nt a ] && echo newer\n[ a -nt nope ] && echo beats_missing\n",
+                format!("printf x > {d}/a\nsleep 0.05\nprintf y > {d}/b\n[ {d}/a -nt {d}/a ] || echo notnewer\n[ {d}/b -nt {d}/a ] && echo newer\n[ {d}/a -nt {d}/nope ] && echo beats_missing\n"),
             ),
             (
                 "FsOlderThan",
                 "__sh_a < __sh_b",
-                "printf x > a\nprintf y > b\n[ a -ot b ] && echo older\n[ nope -ot b ] && echo missing_is_older\n[ a -ot nope ] || echo missing_right\n",
+                format!("printf x > {d}/a\nsleep 0.05\nprintf y > {d}/b\n[ {d}/a -ot {d}/b ] && echo older\n[ {d}/nope -ot {d}/b ] && echo missing_is_older\n[ {d}/a -ot {d}/nope ] || echo missing_right\n"),
             ),
-            // `-N` is one stat's mtime > atime — the same comparison bash
-            // makes, so any input agrees by construction.
             (
                 "FsModifiedSinceRead",
                 "__sh_mt > __sh_at",
-                "printf x > f\nsleep 1\nprintf y >> f\n[ -N f ] && echo modified\n",
+                format!("printf x > {d}/f\nsleep 1\nprintf y >> {d}/f\n[ -N {d}/f ] && echo modified\n"),
             ),
         ];
         let mut bad: Vec<String> = Vec::new();
-        for (name, marker, src) in cases {
+        let all: Vec<(&str, &str, String)> = cases
+            .iter()
+            .map(|(name, marker, src)| (*name, *marker, (*src).to_string()))
+            .chain(fs_cases)
+            .collect();
+        for (name, marker, src) in &all {
             let prog = render_rs(src);
             if !prog.contains(marker) {
                 bad.push(format!("{name}: node not used (no {marker:?})"));
