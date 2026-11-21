@@ -8113,3 +8113,85 @@ RUSTUP_HOME=$HOME/.rustup CARGO_HOME=$HOME/.cargo \
 python3 harness/mut-fbdev-gpu-calls.py    # 12/12 red
 bash harness/anchor-fbdev-gpu-calls.sh    # pass=10 fail=0
 ```
+
+## `shir_pipeline_native.rs` — the pipeline statement-shape rewrite (25 obligations)
+
+A statement-position `pipeline(…)` call whose every stage is one
+exec/builtin of a natively-emulable command becomes the structured
+`IrStmt::Pipeline`, carrying the same stages:
+
+| write | before | after |
+|---|---|---|
+| `cat f.txt \| wc -l` | `Expr(Call{pipeline, [Array(stages)]})` (one shell runner) | `Pipeline{stages}` (stages rendered in place) |
+
+The law is the stage list plus the runner:
+
+- `the_lowering_keeps_the_stages` (stronger reading: the sequence IS the
+  source sequence), with `the_lowering_keeps_the_stage_count`,
+  `the_lowering_keeps_a_stage_command`, `the_lowering_keeps_the_order` and
+  `the_lowering_keeps_the_producer` as per-index readings the mutant sweep
+  names.
+- `the_lowering_removes_the_shell_runner` — the call form costs one
+  `_sh_pipeline` runner, the statement form none; `the_call_form_costs_a_shell_runner`
+  is the negative half.
+- `the_lowering_is_the_identity_elsewhere` — non-pipeline statements and every
+  refused pipeline are unchanged.
+
+Refusals are obligations: `an_empty_pipeline_is_refused`,
+`a_non_native_stage_is_refused`, `a_multi_statement_stage_is_refused`,
+`a_refused_pipeline_keeps_the_shell_runner`.
+
+The stream law `the_stream_is_preserved` holds over every statement list, and
+`the_runners_left_are_the_refused_ones` says no accepted pipeline keeps a
+runner.
+
+Pinned wrong rules: `a_non_native_name_is_not_native` (`sed`),
+`the_naive_every_pipeline_lowering_keeps_a_runner`,
+`a_dropped_stage_is_a_lost_stage`, `reversed_stages_are_a_different_stream`,
+and the witness `law_at_the_witnesses`.
+
+### Scope: what the model does NOT claim
+
+The commands' semantics (that the native `grep` emulation is grep) — that is
+what the byte anchor measures, not the model. The Perl renderer still
+reconstructs the pipeline text (`__sh_pipe_run(q{…})`) for some accepted
+shapes, measured by the anchor and reported: the runner reduction is a C-side
+property, a Perl renderer gap rather than a transform rule. The source's
+first-stage re-check is redundant (the every-stage test implies it) — noted,
+not modelled.
+
+### Mutants
+
+`harness/mut-shir-pipeline-native.py` — 13 independent edits inside the named
+definitions: the table drops `grep`, the table admits everything, the
+stage-shape test is ignored, empty pipelines are accepted, the last stage goes
+unchecked, `lower` drops the first stage, `lower` reverses, `lower` keeps the
+call form, `lower` rewrites non-pipeline statements, the statement form keeps a
+runner, the call form costs none, `stages_of` loses the stages, `drop_first`
+becomes the identity. Measured: **13/13 RED**, each naming an obligation, none
+an `E0xxx`.
+
+### Anchor
+
+`harness/anchor-shir-pipeline-native.sh` — **10/10**, really executed on the
+compiled C and the generated Perl against bash (stdout and exit status): 7
+accepted shapes (`cat|wc`, `echo|cat`, `cat|grep`, `seq|tail`, a three-stage
+`tr` chain, a pipeline inside `if`, a pipeline inside a loop body) and 3
+refused (`echo|sed`, `cat|head`, a redirected pipeline). The rewrite is
+measured firing: the no-transform C carries `_sh_pipeline` and the transform C
+does not (3 → 0 for every accepted shape), and the refused shapes' C is
+byte-identical with an unchanged runner count. No shim is needed — these
+shapes use only files/stdout and the languages' own builtins, so every
+backend here is executed end to end. Not executed: Go and Zig (no toolchain on
+this machine); the transform is renderer-independent, so what it needs is a
+renderer that consumes `IrStmt::Pipeline`, and C and Perl both do.
+
+### Running it
+
+```sh
+RUSTUP_HOME=$HOME/.rustup CARGO_HOME=$HOME/.cargo \
+  ~/verus-0.2026.10.18.7d82994/verus --triggers-mode silent --rlimit 60 \
+  proofs/verus/shir_pipeline_native.rs      # 25 verified, 0 errors
+python3 harness/mut-shir-pipeline-native.py # 13/13 red
+bash harness/anchor-shir-pipeline-native.sh # pass=10 fail=0
+```
