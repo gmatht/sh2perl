@@ -19,16 +19,23 @@
 //!     GpuOp{verb: "blocks",        slot: ""}  →  fb_blocks(payload)
 //!     GpuOp{verb: "overlay",       slot: ""}  →  fb_overlay(payload)
 //!     GpuOp{verb: "overlay_flash", slot: ""}  →  fb_overlay_flash(payload)
+//!     GpuOp{verb: "call", payload: "swap"}    →  fb_present()
 //!
-//! ## Why ONLY these three (REFUSE > GUESS)
+//! ## Why ONLY these (REFUSE > GUESS)
 //!
-//! - All three take exactly one string payload and are declared `void` in
-//!   `runtime/fbdev.h` (`fb_is_void`), so the rewrite preserves statement
-//!   status exactly: neither the file-write fallback nor the bare call
-//!   touches `_sh_rc`.
-//! - `call`/`swap` maps to `fb_present()`, which is NOT void — its return
-//!   polarity (`(ret - 1)`) would set `_sh_rc` where the fallback sets
-//!   nothing. Refused.
+//! - The three single-payload verbs are declared `void` in
+//!   `runtime/fbdev.h` (`fb_is_void`); the emitted call stores the redirect's
+//!   status 0 (`(_sh_rc = (fb(...), 0), _sh_rc == 0)`), which is what the
+//!   file write leaves on success. The pre-fix value-position form emitted the
+//!   bare call, so `if fb_blocks …` did not even compile and a lifted write
+//!   left `_sh_rc` stale.
+//! - `echo swap > /dev/fb0/call` maps to `fb_present()`, which takes NO
+//!   argument, so it is lifted only for the ONE literal payload the device
+//!   names as the present command. Its status is the redirect's: the C
+//!   backend's pre-fix polarity (`(ret - 1)`, with runtime/fbdev.c returning
+//!   0) landed -1 — a NONZERO status for a successful present — so
+//!   `fb_status` now maps a non-negative return to 0 and a negative one to
+//!   the write-failure status.
 //! - `depthmask`, `uniform`, `texture`, `call/clear`, camera state: no
 //!   single-payload primitive names them. Refused — the fallback stays.
 //! - A non-empty `slot` names a register the call form cannot address.
@@ -74,6 +81,24 @@ fn primitive_for(device: &str, verb: &str, slot: &str) -> Option<&'static str> {
         "blocks" => Some("fb_blocks"),
         "overlay" => Some("fb_overlay"),
         "overlay_flash" => Some("fb_overlay_flash"),
+        _ => None,
+    }
+}
+
+/// `echo swap > /dev/fb0/call` is the shell spelling of `fb_present()`: the
+/// present primitive takes NO argument, so the rewrite is sound only for the
+/// ONE payload the device names as the present command. Any other payload
+/// (`clear`, `draw …`) is a different device command whose bytes the
+/// argumentless call would DROP, so it is refused and keeps the fallback.
+fn present_for(device: &str, verb: &str, slot: &str, payload: &IrExpr) -> Option<&'static str> {
+    if device != "/dev/fb0" && device != "/dev/webgl" {
+        return None;
+    }
+    if !slot.is_empty() || verb != "call" {
+        return None;
+    }
+    match payload {
+        IrExpr::Str(s, _) if s == "swap" => Some("fb_present"),
         _ => None,
     }
 }
@@ -131,24 +156,33 @@ fn calls_stmt(st: &mut IrStmt) -> bool {
             .as_any()
             .downcast_ref::<crate::shir_nodes::GpuOp>()
             .filter(|op| {
-                primitive_for(&op.device, &op.verb, &op.slot).is_some()
-                    && payload_direct_ok(&op.payload)
+                present_for(&op.device, &op.verb, &op.slot, &op.payload).is_some()
+                    || (primitive_for(&op.device, &op.verb, &op.slot).is_some()
+                        && payload_direct_ok(&op.payload))
             })
             .map(|op| {
-                let cmd = primitive_for(&op.device, &op.verb, &op.slot).unwrap();
-                (cmd.to_string(), op.payload.clone())
+                if let Some(cmd) = present_for(&op.device, &op.verb, &op.slot, &op.payload) {
+                    (cmd.to_string(), None)
+                } else {
+                    let cmd = primitive_for(&op.device, &op.verb, &op.slot).unwrap();
+                    (cmd.to_string(), Some(op.payload.clone()))
+                }
             }),
         _ => None,
     };
     if let Some((cmd, payload)) = rewrite {
-        // The exact node the parser builds for `fb_blocks "$p"`: the C
-        // backend routes it through `fb_call_opt` indistinguishably
-        // from a direct call.
+        // The exact node the parser builds for `fb_blocks "$p"` /
+        // `fb_present`: the C backend routes it through `fb_call_opt`
+        // indistinguishably from a direct call.
+        let words = match payload {
+            Some(p) => vec![p],
+            None => vec![],
+        };
         *st = IrStmt::Expr(IrExpr::Call {
             func: "exec".into(),
             args: vec![
                 IrExpr::Str(cmd, crate::ir::StrStyle::DoubleQuoted),
-                IrExpr::Array(vec![payload]),
+                IrExpr::Array(words),
             ],
         });
         return true;
@@ -258,6 +292,25 @@ mod tests {
     }
 
     // ── the refusals are the point (REFUSE > GUESS) ──────────────────
+
+    #[test]
+    fn rewrites_swap_to_fb_present() {
+        // `echo swap > /dev/fb0/call` is the shell spelling of the present
+        // primitive, and the call takes no argument.
+        let mut stmts = vec![gpu_op("/dev/fb0", "call", "", s("swap"))];
+        assert!(transform(&mut stmts), "call+swap should lift to fb_present");
+        let (cmd, words) = as_exec_call(&stmts[0]).expect("should be a Call node");
+        assert_eq!(cmd, "fb_present");
+        assert!(words.is_empty(), "fb_present takes no argument, got {words:?}");
+    }
+
+    #[test]
+    fn refuses_a_non_swap_call_payload() {
+        // `echo clear > /dev/fb0/call` is a different device command whose
+        // bytes an argumentless fb_present() would DROP.
+        let mut stmts = vec![gpu_op("/dev/fb0", "call", "", s("clear"))];
+        assert!(!transform(&mut stmts), "only the present payload may lift");
+    }
 
     #[test]
     fn refuses_unmapped_verbs() {

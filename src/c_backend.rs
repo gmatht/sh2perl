@@ -25893,7 +25893,14 @@ fn param_copy_alias(
                     // bare call — no register, nothing for the rc
                     // passes to strip.
                     if Self::fb_is_void(&fb) {
-                        format!("({fb})")
+                        // A DEVICE WRITE'S STATUS IS BASH'S: 0. The bare
+                        // call left `_sh_rc` at whatever the previous
+                        // command set, so `false; echo x > /dev/fb0/blocks;
+                        // echo $?` printed 1 in C where bash prints 0
+                        // (measured). The store keeps the call inside a
+                        // live expression, so the rc-cleanup passes cannot
+                        // delete the line and take the draw with it.
+                        format!("(_sh_rc = ({fb}, 0), _sh_rc == 0)")
                     } else {
                         let ok = Self::fb_status(&fb);
                         format!("(_sh_rc = {ok}, _sh_rc == 0)")
@@ -26035,8 +26042,14 @@ fn param_copy_alias(
         match name {
             // nonzero = the answer is "yes" -> a yes is a failure
             "fb_window_open" | "fb_window_closed" => format!("(({call}) == 0)"),
-            // nonzero = it worked -> status 1 means failure
-            "fb_present" => format!("(({call}) - 1)"),
+            // A PRESENT's status is bash's redirect status: 0. The device
+            // returns 0 whether or not a blit happened (runtime/fbdev.c), so
+            // the pre-fix `((call) - 1)` landed -1 — a NONZERO status for a
+            // successful present, i.e. `if fb_present` never took its then
+            // branch and a lifted `echo swap > /dev/fb0/call` set -1 where
+            // bash sets 0. Map any non-negative return to success and a
+            // negative one to the write-failure status.
+            "fb_present" => format!("((({call}) >= 0) ? 0 : 2)"),
             // 0-on-success primitives: pass the value through
             _ => format!("({call})"),
         }

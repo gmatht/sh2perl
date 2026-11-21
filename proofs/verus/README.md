@@ -7937,3 +7937,179 @@ RUSTUP_HOME=$HOME/.rustup CARGO_HOME=$HOME/.cargo \
 python3 harness/mut-fbdev-gpu.py          # 12/12 red
 bash harness/anchor-fbdev-gpu.sh          # pass=9 fail=0
 ```
+
+## `fbdev_gpu_calls.rs` — the call-emission rewrite (20 obligations)
+
+The transform replaces a lifted `GpuOp` with the in-process call the same
+program would make had it named the primitive directly:
+
+| write | call |
+|---|---|
+| `echo P > /dev/fb0/blocks` | `fb_blocks(P)` |
+| `echo P > /dev/fb0/overlay` | `fb_overlay(P)` |
+| `echo P > /dev/fb0/overlay_flash` | `fb_overlay_flash(P)` |
+| `echo swap > /dev/fb0/call` | `fb_present()` |
+
+`fb_present` takes NO argument, so the present mapping is sound for exactly
+the one literal payload the device names as a present; any other `call`
+payload (e.g. `clear`) is refused because the argumentless call would DROP it.
+This is the difference the batch rung could not state: the call table is
+closed, and the present's line is fixed.
+
+The laws:
+
+- `a_single_payload_call_keeps_the_path` / `a_present_keeps_the_path` — the
+  call addresses the write's own path (a slotted write sent to the bare verb
+  would land on another path).
+- `a_single_payload_call_keeps_the_line` / `a_present_keeps_the_line` — the
+  device line is `payload ++ "\n"`, and the present's is the fixed
+  `"swap" ++ "\n"`.
+- `the_emitted_call_is_the_redirect_status` — an emitted call leaves status 0
+  from any previous status. This is the statement-status law: the shell's
+  device write is a redirect (status 0), so the call must set it; the pre-fix
+  emitter left `_sh_rc` stale.
+- `the_stream_of_calls_keeps_the_device_stream` — for EVERY op list, the
+  emitted stream's lines equal the device-write stream's lines (`go` vs
+  `go_calls`).
+
+Refusals are obligations: `a_slotted_op_is_refused`,
+`a_foreign_device_is_refused`, `an_unmapped_verb_is_refused`.
+
+Pinned naive rules: `a_fallback_is_not_a_redirect_status` (the measured stale
+status), `the_pre_fix_present_polarity_is_not_the_redirect_status`
+(`ret - 1` at the device's actual 0 is -1), `a_call_payload_is_not_droppable`,
+`a_slotted_write_lands_on_another_path`,
+`an_unmapped_verb_is_not_a_device_call`, and the witness `law_at_the_witnesses`.
+
+### The repair the model forced
+
+The emitted `void` primitives carry no status, so the C backend left `_sh_rc`
+**stale** after them: `false; echo x > /dev/fb0/blocks; echo $?` printed 1
+where bash prints 0 (measured). The void call now stores the redirect's
+status — `(_sh_rc = ({fb}, 0), _sh_rc == 0)` — and `fb_status("fb_present")`
+maps a non-negative return to 0 (the pre-fix `ret - 1`, with
+`runtime/fbdev.c` returning 0, produced **-1** for a successful present).
+
+Out of model: the device's parser, the call's inability to fail, and the
+payload-expression census. The FALLBACK's status is still stale — measured for
+a plain file redirect too, so it is a pre-existing C-backend gap, reported
+rather than modelled.
+
+### Mutants
+
+`harness/mut-fbdev-gpu-calls.py` — 12 independent edits inside the named
+definitions: any call payload becomes a present, slotted ops/foreign
+devices/unmapped verbs become calls, `blocks` unmapped, the present lands on
+the wrong path, the wire call drops its terminator, the present writes
+nothing, either call leaves the old status, the stream reverses, the pre-fix
+polarity returns. Measured: **12/12 RED**, each naming an obligation, none an
+`E0xxx`.
+
+### Anchor
+
+`harness/anchor-fbdev-gpu-calls.sh` — **10/10**, really executed on C and
+Perl against `harness/fbdev-soft` (now declaring `fb_present()`, which writes
+`swap\n` to the sink, as `runtime/fbdev.c` does): 3 wire-call shapes, 2
+present shapes (`echo swap > …/call` → `fb_present()`, including after a
+failing command with `echo "rc=$?"` → 0, matching bash), 3 refused (a
+non-`swap` `call` payload, `depthmask`, a slotted write) and 1
+transform-disabled fall-through. Device bytes, stdout and exit status are
+compared against bash on a FIFO-backed device. Perl never lifts (C-target
+gated) and is checked for exactly that.
+
+### Running it
+
+```sh
+RUSTUP_HOME=$HOME/.rustup CARGO_HOME=$HOME/.cargo \
+  ~/verus-0.2026.10.18.7d82994/verus --triggers-mode silent --rlimit 60 \
+  proofs/verus/fbdev_gpu_calls.rs        # 20 verified, 0 errors
+python3 harness/mut-fbdev-gpu-calls.py    # 12/12 red
+bash harness/anchor-fbdev-gpu-calls.sh    # pass=10 fail=0
+```
+
+## `fbdev_gpu_calls.rs` — the call-emission rewrite (20 obligations)
+
+The transform replaces a lifted `GpuOp` with the in-process call the same
+program would make had it named the primitive directly:
+
+| write | call |
+|---|---|
+| `echo P > /dev/fb0/blocks` | `fb_blocks(P)` |
+| `echo P > /dev/fb0/overlay` | `fb_overlay(P)` |
+| `echo P > /dev/fb0/overlay_flash` | `fb_overlay_flash(P)` |
+| `echo swap > /dev/fb0/call` | `fb_present()` |
+
+`fb_present` takes NO argument, so the present mapping is sound for exactly
+the one literal payload the device names as a present; any other `call`
+payload (e.g. `clear`) is refused because the argumentless call would DROP it.
+
+The laws:
+
+- `a_single_payload_call_keeps_the_path` / `a_present_keeps_the_path` — the
+  call addresses the write's own path (a slotted write sent to the bare verb
+  would land on another path).
+- `a_single_payload_call_keeps_the_line` / `a_present_keeps_the_line` — the
+  device line is `payload ++ "\n"`, and the present's is the fixed
+  `"swap" ++ "\n"`.
+- `the_emitted_call_is_the_redirect_status` — an emitted call leaves status 0
+  from any previous status. This is the statement-status law: the shell's
+  device write is a redirect (status 0), so the call must set it; the pre-fix
+  emitter left `_sh_rc` stale.
+- `the_stream_of_calls_keeps_the_device_stream` — for EVERY op list, the
+  emitted stream's lines equal the device-write stream's lines (`go` vs
+  `go_calls`).
+
+Refusals are obligations: `a_slotted_op_is_refused`,
+`a_foreign_device_is_refused`, `an_unmapped_verb_is_refused`.
+
+Pinned naive rules: `a_fallback_is_not_a_redirect_status` (the measured stale
+status), `the_pre_fix_present_polarity_is_not_the_redirect_status`
+(`ret - 1` at the device's actual 0 is -1), `a_call_payload_is_not_droppable`,
+`a_slotted_write_lands_on_another_path`,
+`an_unmapped_verb_is_not_a_device_call`, and the witness `law_at_the_witnesses`.
+
+### The repair the model forced
+
+The emitted `void` primitives carry no status, so the C backend left `_sh_rc`
+**stale** after them: `false; echo x > /dev/fb0/blocks; echo $?` printed 1
+where bash prints 0 (measured). The void call now stores the redirect's
+status — `(_sh_rc = ({fb}, 0), _sh_rc == 0)` — and `fb_status("fb_present")`
+maps a non-negative return to 0 (the pre-fix `ret - 1`, with
+`runtime/fbdev.c` returning 0, produced **-1** for a successful present).
+
+Out of model: the device's parser, the call's inability to fail, and the
+payload-expression census. The FALLBACK's status is still stale — measured for
+a plain file redirect too, so it is a pre-existing C-backend gap, reported
+rather than modelled.
+
+### Mutants
+
+`harness/mut-fbdev-gpu-calls.py` — 12 independent edits inside the named
+definitions: any call payload becomes a present, slotted ops/foreign
+devices/unmapped verbs become calls, `blocks` unmapped, the present lands on
+the wrong path, the wire call drops its terminator, the present writes
+nothing, either call leaves the old status, the stream reverses, the pre-fix
+polarity returns. Measured: **12/12 RED**, each naming an obligation, none an
+`E0xxx`.
+
+### Anchor
+
+`harness/anchor-fbdev-gpu-calls.sh` — **10/10**, really executed on C and
+Perl against `harness/fbdev-soft` (now declaring `fb_present()`, which writes
+`swap\n` to the sink, as `runtime/fbdev.c` does): 3 wire-call shapes, 2
+present shapes (`echo swap > …/call` → `fb_present()`, including after a
+failing command with `echo "rc=$?"` → 0, matching bash), 3 refused (a
+non-`swap` `call` payload, `depthmask`, a slotted write) and 1
+transform-disabled fall-through. Device bytes, stdout and exit status are
+compared against bash on a FIFO-backed device. Perl never lifts (C-target
+gated) and is checked for exactly that.
+
+### Running it
+
+```sh
+RUSTUP_HOME=$HOME/.rustup CARGO_HOME=$HOME/.cargo \
+  ~/verus-0.2026.10.18.7d82994/verus --triggers-mode silent --rlimit 60 \
+  proofs/verus/fbdev_gpu_calls.rs        # 20 verified, 0 errors
+python3 harness/mut-fbdev-gpu-calls.py    # 12/12 red
+bash harness/anchor-fbdev-gpu-calls.sh    # pass=10 fail=0
+```
