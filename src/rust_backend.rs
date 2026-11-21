@@ -10514,6 +10514,25 @@ while __sh_path.len() > 1 && __sh_path.ends_with('/') {{ __sh_path = &__sh_path[
                         }
                     }
                 }
+                // `cat` with NO operand copies stdin to stdout byte for
+                // byte. When that stdin is already an in-process expression
+                // (a heredoc/herestring body — bash would feed it to cat on
+                // a pipe) and nothing else is redirected, the child buys
+                // nothing: write the same bytes to the shell's stdout and
+                // leave status 0. A body carrying raw-byte markers has no
+                // `&str` writing path, so it keeps the spawn.
+                if let Some(inp) = &input {
+                    if redirs.iter().all(|r| r.fd == 0)
+                        && is_bare_exec(inner, "cat")
+                        && !has_byte_marker(inp)
+                    {
+                        self.add_helper("sink");
+                        self.emit(&format!(
+                            "{{ let __sh_c = {inp}; __sh_sink(__sh_c.as_bytes()); __SH_RC.store(0, Ordering::Relaxed); }}"
+                        ));
+                        return;
+                    }
+                }
                 self.add_helper("spawn");
                 if let Some(inp) = input {
                     self.emit(&format!(
@@ -17472,6 +17491,23 @@ fn fn_body_line_text(r: &mut Render, s: &IrStmt) -> String {
 /// Does the statement list contain a shell-out (needs text reconstruction)?
 /// Does the statement list call a shell FUNCTION? (a fn call shelling
 /// out would lose the body — render natively)
+/// `exec CMD` / `builtin CMD` with no words, alone in a statement list.
+fn is_bare_exec(stmts: &[IrStmt], cmd: &str) -> bool {
+    match stmts {
+        [IrStmt::Expr(IrExpr::Call { func, args })] if func == "exec" || func == "builtin" => {
+            if str_arg(args, 0) != Some(cmd) {
+                return false;
+            }
+            match args.get(1) {
+                None => true,
+                Some(IrExpr::Array(a)) => a.is_empty(),
+                Some(_) => false,
+            }
+        }
+        _ => false,
+    }
+}
+
 fn contains_fn_call(r: &Render, stmts: &[IrStmt]) -> bool {
     stmts.iter().any(|s| match s {
         IrStmt::Expr(IrExpr::Call { func, args }) if func == "exec" || func == "builtin" => {
@@ -25507,6 +25543,44 @@ mod tests {
         }
     }
 
+    /// `cat` with no operand is a byte copy of its stdin, so a heredoc or
+    /// herestring `cat` renders as one write of the body it already holds —
+    /// no child, no quoting. The bodies cover a QUOTED delimiter (no
+    /// expansion), an expanded variable, `<<-` tab stripping, a herestring,
+    /// an empty body and a body containing quotes/backslashes/dollars.
+    #[cfg(unix)]
+    #[test]
+    fn heredoc_cat_copies_the_body_without_a_child() {
+        let src = "cat <<'EOF'\nquoted $HOME and `date` and \\n\nEOF\n\
+                   var=world\n\
+                   cat <<EOF\nhello $var\nEOF\n\
+                   cat <<-EOF\n\ttabbed $var\n\tEOF\n\
+                   cat <<< \"herestring $var\"\n\
+                   cat <<EOF\nEOF\n\
+                   cat <<EOF\nhas 'single' and \"double\" quotes\nEOF\n";
+        let prog = render_rs(src);
+        assert!(
+            !prog.contains("__sh_spawn("),
+            "the heredoc cat still spawns:\n{prog}"
+        );
+        let (rs_out, rs_err, rs_rc) = compile_and_run_full("heredoc-cat", &prog);
+        let (sh_out, sh_err, sh_rc) = run_bash_full(src);
+        assert_eq!(
+            String::from_utf8_lossy(&rs_out),
+            String::from_utf8_lossy(&sh_out),
+            "heredoc cat: stdout differs from bash"
+        );
+        assert_eq!(
+            String::from_utf8_lossy(&rs_err),
+            String::from_utf8_lossy(&sh_err),
+            "heredoc cat: stderr differs from bash"
+        );
+        assert_eq!(rs_rc, sh_rc, "heredoc cat: status differs from bash");
+        // Non-vacuous: the body really printed (and the quoted one kept `$`).
+        let text = String::from_utf8_lossy(&rs_out);
+        assert!(text.contains("quoted $HOME") && text.contains("hello world"), "empty heredoc output:\n{text}");
+    }
+
     /// The argv forms the old fold MIS-READ, each with the same witness as a
     /// node: the render keeps the command, and its stdout, STDERR and exit
     /// status are bash's byte-for-byte. `head -1 a b` used to take the LAST
@@ -26042,9 +26116,11 @@ mod tests {
             ("fractional seq", "seq 0.5 2\n"),
             // An open range over a source of unknown length.
             ("open range on a variable", "v=$(echo \"$s\" | cut -d: -f2-)\necho \"$v\"\n"),
-            // A heredoc BODY is expanded by the shell (`<<EOF` with $v in it),
-            // so `cat` over one is not an identity on the IR text.
-            ("heredoc body", "v=x\ncat <<EOF\n$v\nEOF\n"),
+            // A heredoc `cat` IS lifted now — the body is an interpolated
+            // expression and `heredoc_cat_copies_the_body_without_a_child`
+            // pins the bytes — but a heredoc feeding a real FILTER still
+            // spawns: `wc -l` over a body has no node here.
+            ("heredoc into a filter", "cat <<EOF | wc -l\na\nb\nEOF\n"),
             // `tr '\n' ' '` maps the newline the pipeline fold does not carry
             // (the enclosing Output supplies exactly one), so the S P A C E it
             // becomes would be lost: bash prints `seq: 1 2 3 ` — trailing
