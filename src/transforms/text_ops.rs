@@ -1726,6 +1726,12 @@ fn try_lower_head_tail(
     let args_str: Vec<&str> = args.iter().filter_map(|a| {
         if let IrExpr::Str(s, _) = a { Some(s.as_str()) } else { None }
     }).collect();
+    // Every argv word must be a LITERAL: a dynamic count (`head -n "$max"`)
+    // used to vanish from `args_str` and leave the default 10 in place, which
+    // folds to a fixed take of 10 lines — a silently wrong program.
+    if args_str.len() != args.len() {
+        return None;
+    }
 
     let mut count_str = "10"; // default
     let mut bytes = false;
@@ -1745,9 +1751,23 @@ fn try_lower_head_tail(
             if rest.starts_with('c') { bytes = true; count_str = &rest[1..]; }
             else { count_str = rest; }
         } else {
-            count_str = args_str[i];
+            // A BARE word here is an OPERAND (a file), never a count: `-n N`
+            // consumed its value above. `head -1 a b` is the multi-file header
+            // form — and the old code took its LAST word as the count, so it
+            // rendered `1` where bash prints a header per file plus errors.
+            // The operand forms keep their command.
+            return None;
         }
         i += 1;
+    }
+    // A count the node cannot express keeps the command. `TakeLines` counts
+    // lines from one end; `tail -n +2` counts from the START and `head -n -2`
+    // means all but the last two, so neither is that node. The check is
+    // PLAIN DIGITS on purpose: `str::parse::<i64>` accepts a sign, so `+2`
+    // parsed to 2 and folded `tail -n +2` to "last 2 lines" — right for a
+    // 3-line input and wrong for a 5-line one.
+    if count_str.is_empty() || !count_str.bytes().all(|b| b.is_ascii_digit()) {
+        return None;
     }
 
     // `head -c` / `tail -c` take BYTES; TakeLines slices LINES, so a byte
@@ -1800,6 +1820,26 @@ fn try_lower_wc(text: IrExpr, trailing_newline: bool, args: &[IrExpr]) -> Option
     //   wc -c / wc -m  → StrLen (text.length)
     //   wc -l          → LineCount (split('\n').length)
     //   wc -w          → WordCount (split(/\s+/).length)
+    // An OPERAND (`wc -l f`) makes wc read that FILE, not the text this lift
+    // hands the node — and the old flag filter silently DROPPED it, folding a
+    // per-file count to a count of the pipe (a silently wrong program). Every
+    // argv word must be a literal FLAG; any other word, literal or dynamic,
+    // keeps the command.
+    for a in args {
+        let word = match a {
+            IrExpr::Str(s, _) => Some(s.as_str()),
+            IrExpr::Interpolate(parts) if parts.len() == 1 => match &parts[0] {
+                InterpPart::Lit(s) => Some(s.as_str()),
+                _ => None,
+            },
+            _ => None,
+        };
+        match word {
+            Some(w) if w.starts_with('-') => {}
+            _ => return None,
+        }
+    }
+
     let flags: Vec<&str> = args.iter().filter_map(|a| {
         match a {
             IrExpr::Str(s, _) => Some(s.as_str()),

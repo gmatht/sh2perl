@@ -24560,7 +24560,25 @@ mod tests {
 
     /// Compile a rendered program with `rustc` and run it: `(stdout, code)`.
     fn compile_and_run(case: &str, prog: &str) -> (Vec<u8>, Option<i32>) {
-        let dir = std::env::temp_dir().join(format!("sh2_text_nodes_{}_{}", std::process::id(), case));
+        let (out, _err, code) = compile_and_run_full(case, prog);
+        (out, code)
+    }
+
+    /// `compile_and_run` plus the child's STDERR, for the witnesses whose
+    /// refusal reason is an error MESSAGE (`head: cannot open 'a'`).
+    fn compile_and_run_full(case: &str, prog: &str) -> (Vec<u8>, Vec<u8>, Option<i32>) {
+        // Unique per INVOCATION: two witnesses (or a re-run of the same case)
+        // may hold the same `case` name concurrently, and the remove/create at
+        // the top would then delete the other's binary mid-run — which is what
+        // surfaced as `run render: NotFound`.
+        static SEQ: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+        let seq = SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        let dir = std::env::temp_dir().join(format!(
+            "sh2_text_nodes_{}_{}_{}",
+            std::process::id(),
+            case,
+            seq
+        ));
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).expect("temp dir");
         let src = dir.join("main.rs");
@@ -24582,17 +24600,67 @@ mod tests {
             .output()
             .expect("run render");
         let _ = std::fs::remove_dir_all(&dir);
-        (run.stdout, run.status.code())
+        (run.stdout, run.stderr, run.status.code())
     }
 
     /// Run a shell snippet under bash: `(stdout, code)`.
     fn run_bash(src: &str) -> (Vec<u8>, Option<i32>) {
+        let (out, _err, code) = run_bash_full(src);
+        (out, code)
+    }
+
+    /// `run_bash` plus STDERR.
+    fn run_bash_full(src: &str) -> (Vec<u8>, Vec<u8>, Option<i32>) {
         let out = std::process::Command::new("bash")
             .arg("-c")
             .arg(src)
             .output()
             .expect("bash");
-        (out.stdout, out.status.code())
+        (out.stdout, out.stderr, out.status.code())
+    }
+
+    /// The argv forms the old fold MIS-READ, each with the same witness as a
+    /// node: the render keeps the command, and its stdout, STDERR and exit
+    /// status are bash's byte-for-byte. `head -1 a b` used to take the LAST
+    /// word as the count (printing `1` where bash prints a per-file header and
+    /// an open error); `tail -n +2` used to parse `+2` as a signed integer and
+    /// fold "from line 2 on" to "the last 2 lines" — right on a 3-line input,
+    /// wrong on a 5-line one.
+    #[test]
+    fn misread_head_tail_argv_keep_the_command() {
+        for (name, src) in [
+            // Paths that exist in NEITHER the crate dir nor the render's temp
+            // dir, so both sides print the same open errors (a local `a`/`b`
+            // would make bash read files the compiled program cannot see).
+            (
+                "head-multi-operand",
+                "seq 1 3 | head -1 /nonexistent/sh2_a /nonexistent/sh2_b\n",
+            ),
+            ("tail-plus-n", "seq 1 5 | tail -n +2\n"),
+        ] {
+            let prog = render_rs(src);
+            assert!(
+                prog.contains("__sh_spawn("),
+                "{name}: the mis-read argv form was folded:\n{prog}"
+            );
+            assert!(
+                !prog.contains("__sh_cur"),
+                "{name}: emitted the TextFilter block:\n{prog}"
+            );
+            let (rs_out, rs_err, rs_rc) = compile_and_run_full(name, &prog);
+            let (sh_out, sh_err, sh_rc) = run_bash_full(src);
+            assert_eq!(
+                String::from_utf8_lossy(&rs_out),
+                String::from_utf8_lossy(&sh_out),
+                "{name}: stdout differs from bash"
+            );
+            assert_eq!(
+                String::from_utf8_lossy(&rs_err),
+                String::from_utf8_lossy(&sh_err),
+                "{name}: stderr differs from bash"
+            );
+            assert_eq!(rs_rc, sh_rc, "{name}: exit status differs from bash");
+        }
     }
 
     /// EVERY text node `rs` offers must be correct at RUNTIME, not merely in
