@@ -25330,6 +25330,203 @@ mod tests {
         let _ = std::fs::remove_dir_all(&root);
     }
 
+    // ── node-family parity witnesses ──────────────────────────────────────
+    //
+    // ONE command runs every family that replaced a shell-out:
+    //
+    //     cargo test --lib node_parity_ -- --nocapture
+    //
+    // Each case renders the shell script to Rust, asserts the rendered
+    // program does NOT shell out, then runs the SAME script through `bash`
+    // and the generated binary over a fixture rebuilt for each side, and
+    // requires stdout, stderr AND exit status to match byte for byte. A
+    // vacuous case (no output, status 0) is a failure, and the suite
+    // requires more than ten successes and several failing cases so an arm
+    // that always takes one branch cannot pass.
+    //
+    // The comparison is not decoration: perturbing an arm's output (the
+    // `CaseTransform` arm emitting `to_uppercase` for `${v,,}`) makes this
+    // suite fail with the family's name and both byte streams.
+
+    /// Fixture for the parity witnesses: a readable file, an empty file, an
+    /// unreadable file and directory, and a path that never exists. Rebuilt
+    /// before each side so bash and the render see identical bytes/modes.
+    #[cfg(unix)]
+    fn parity_reset(root: &std::path::Path) {
+        use std::os::unix::fs::PermissionsExt;
+        let _ = std::fs::set_permissions(root.join("adir"), std::fs::Permissions::from_mode(0o755));
+        let _ = std::fs::set_permissions(root.join("f000"), std::fs::Permissions::from_mode(0o644));
+        let _ = std::fs::remove_dir_all(root);
+        std::fs::create_dir_all(root.join("adir")).expect("fixture adir");
+        std::fs::write(root.join("plain.txt"), b"one\ntwo\nthree\n").expect("fixture plain");
+        std::fs::write(root.join("empty.txt"), b"").expect("fixture empty");
+        std::fs::write(root.join("f000"), b"secret\n").expect("fixture f000");
+        std::fs::set_permissions(root.join("f000"), std::fs::Permissions::from_mode(0o000))
+            .expect("fixture f000 mode");
+        std::fs::set_permissions(root.join("adir"), std::fs::Permissions::from_mode(0o555))
+            .expect("fixture adir mode");
+    }
+
+    #[cfg(unix)]
+    fn parity_drop(root: &std::path::Path) {
+        use std::os::unix::fs::PermissionsExt;
+        let _ = std::fs::set_permissions(root.join("adir"), std::fs::Permissions::from_mode(0o755));
+        let _ = std::fs::set_permissions(root.join("f000"), std::fs::Permissions::from_mode(0o644));
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    /// Run one family table: render, no-spawn, then bash-vs-Rust bytes.
+    #[cfg(unix)]
+    fn run_node_parity(tag: &str, cases: &[(&str, String)]) -> (usize, usize) {
+        let root = std::env::temp_dir().join(format!("sh2_parity_{}_{}", tag, std::process::id()));
+        let mut bad: Vec<String> = Vec::new();
+        let (mut positives, mut failures) = (0, 0);
+        for (family, src) in cases {
+            let prog = render_rs(src);
+            if prog.contains("__sh_spawn(") {
+                bad.push(format!("{family}: still shells out:\n{prog}"));
+                continue;
+            }
+            parity_reset(&root);
+            let (sh_out, sh_err, sh_rc) = run_bash_full(src);
+            parity_reset(&root);
+            let (rs_out, rs_err, rs_rc) = compile_and_run_full(family, &prog);
+            if rs_out != sh_out || rs_err != sh_err || rs_rc != sh_rc {
+                bad.push(format!(
+                    "{family}: rust rc={rs_rc:?} out={:?} err={:?} / bash rc={sh_rc:?} out={:?} err={:?}",
+                    String::from_utf8_lossy(&rs_out),
+                    String::from_utf8_lossy(&rs_err),
+                    String::from_utf8_lossy(&sh_out),
+                    String::from_utf8_lossy(&sh_err)
+                ));
+                continue;
+            }
+            // Non-vacuity: the case must OBSERVE something (a byte or a status)
+            // — unless its name says the shell's correct answer IS the empty
+            // byte stream (`…@empty`). Those cases are not vacuous in the
+            // sense this check guards: the empty answer is exactly what a
+            // stray newline or a swallowed line breaks, and one did.
+            if sh_out.is_empty() && sh_err.is_empty() && sh_rc == Some(0) {
+                if !family.contains("@empty") {
+                    bad.push(format!(
+                        "{family}: vacuous (no output, status 0) — name it @empty if the empty stream is the point: {src:?}"
+                    ));
+                    continue;
+                }
+            }
+            if sh_rc == Some(0) {
+                positives += 1;
+            } else {
+                failures += 1;
+            }
+            println!("{family:24} ok  rc={sh_rc:?} out={:?}", String::from_utf8_lossy(&sh_out));
+        }
+        parity_drop(&root);
+        assert!(
+            bad.is_empty(),
+            "node-family parity disagreements:\n{}",
+            bad.join("\n")
+        );
+        assert!(
+            positives > 10,
+            "only {positives} positive cases: an always-failing arm could pass this"
+        );
+        (positives, failures)
+    }
+
+    /// Text filters and the string/split/affix family: every one of these used
+    /// to `bash -c`; the edge cases are the ones an arm gets wrong while the
+    /// happy path still looks right (empty input, a pattern that matches
+    /// nothing, a pattern that matches everything, no delimiter, extra
+    /// delimiters, a slice past the end, an empty variable).
+    #[cfg(unix)]
+    #[test]
+    fn node_parity_text_and_string_families() {
+        let cases: Vec<(&str, String)> = vec![
+            // CharTranslate: the byte map, a delete set, a squeeze, and a
+            // class over non-ASCII input (tr leaves É alone).
+            ("CharTranslate-range", "w=$(printf 'abc-xyz\\n' | tr 'a-c' 'x'); printf '%s\\n' \"$w\"\n".into()),
+            ("CharTranslate-delete", "w=$(printf 'a1b2\\n' | tr -d '0-9'); printf '%s\\n' \"$w\"\n".into()),
+            ("CharTranslate-class", "w=$(printf 'Éé ABC\\n' | tr '[:upper:]' '[:lower:]'); printf '%s\\n' \"$w\"\n".into()),
+            (
+                "CharTranslate-empty-line",
+                "w=$(printf '\\n' | tr 'a' 'b'); printf '[%s]\\n' \"$w\"\n".into(),
+            ),
+            // WordCount / TextFilter: POSIX isspace class, empty input, and
+            // a final line without a newline.
+            ("WordCount", "printf 'a b   c\\n' | wc -w\n".into()),
+            ("WordCount-empty", "printf '' | wc -w\n".into()),
+            ("TextFilter-wc-l", "printf 'a\\nb' | wc -l\n".into()),
+            // TakeLines: more lines than the input has, and zero lines.
+            ("TakeLines-short", "printf 'a\\nb\\nc\\n' | head -2\n".into()),
+            ("TakeLines-past-end", "printf 'a\\nb\\n' | head -9\n".into()),
+            (
+                "TakeLines-zero@empty",
+                "printf 'a\\nb\\n' | head -0\n".into(),
+            ),
+            // UniqLines: adjacent runs, all-equal input, empty input.
+            ("UniqLines-runs", "printf 'a\\na\\nb\\n' | uniq\n".into()),
+            ("UniqLines-all-equal", "printf 'x\\nx\\nx\\n' | uniq\n".into()),
+            ("UniqLines-empty@empty", "printf '' | uniq\n".into()),
+            // SortLines: lowercase input only — `sort` collates by locale and
+            // the render must not pretend to a different order.
+            ("SortLines", "printf 'b\\na\\nc\\n' | sort\n".into()),
+            ("SortLines-empty@empty", "printf '' | sort\n".into()),
+            // SubStrExtract: a bounded slice, an open slice, past the end.
+            ("SubStrExtract-3", "v=abcdef; printf '%s\\n' \"${v:1:3}\"\n".into()),
+            ("SubStrExtract-open", "v=abcdef; printf '%s\\n' \"${v:2}\"\n".into()),
+            ("SubStrExtract-past-end", "v=ab; printf '[%s]\\n' \"${v:5:2}\"\n".into()),
+            ("SubStrExtract-empty", "v=; printf '[%s]\\n' \"${v:0:3}\"\n".into()),
+            // StrLen / ArrayLen: empty and non-empty, empty and populated.
+            ("StrLen", "v=abc; printf '%s\\n' \"${#v}\"\n".into()),
+            ("StrLen-empty", "v=; printf '%s\\n' \"${#v}\"\n".into()),
+            ("ArrayLen", "a=(alpha beta gamma); printf '%s\\n' \"${#a[@]}\"\n".into()),
+            ("ArrayLen-empty", "a=(); printf '%s\\n' \"${#a[@]}\"\n".into()),
+            // AffixStrip: matching prefix, matching suffix, NO match (the
+            // text must pass through), and an empty value.
+            ("AffixStrip-prefix", "v=abcdef; printf '%s\\n' \"${v#abc}\"\n".into()),
+            ("AffixStrip-suffix", "v=abcdef; printf '%s\\n' \"${v%def}\"\n".into()),
+            ("AffixStrip-no-match", "v=abcdef; printf '%s\\n' \"${v#zzz}\"\n".into()),
+            ("AffixStrip-empty", "v=; printf '[%s]\\n' \"${v#a}\"\n".into()),
+            // CutsetTrim: one char of a cutset, a whole cutset, no match.
+            ("CutsetTrim-prefix", "v=xxaxx; printf '%s\\n' \"${v#x}\"\n".into()),
+            ("CutsetTrim-cutset", "v=abcba; printf '%s\\n' \"${v##[ab]}\"\n".into()),
+            ("CutsetTrim-no-match", "v=xyz; printf '%s\\n' \"${v#a}\"\n".into()),
+            // Split / FieldExtract: two fields, a single field (no
+            // delimiter), MORE delimiters than fields, and empty input.
+            ("FieldExtract", "IFS=: read -r a b <<< '1:2'; printf '%s|%s\\n' \"$a\" \"$b\"\n".into()),
+            ("Split-no-delimiter", "IFS=: read -r a b <<< 'only'; printf '%s|%s\\n' \"$a\" \"$b\"\n".into()),
+            ("Split-multi", "s='1:2:3:4'; IFS=: read -r a b c <<< \"$s\"; printf '%s|%s|%s\\n' \"$a\" \"$b\" \"$c\"\n".into()),
+            ("Split-empty", "IFS=: read -r a b <<< ''; printf '[%s]|[%s]\\n' \"$a\" \"$b\"\n".into()),
+            // StringAffix: a match, a non-match, and a pattern that matches
+            // EVERYTHING (`*`).
+            ("StringAffix-match", "v=abc; if [[ $v == a* ]]; then printf 'yes\\n'; else printf 'no\\n'; fi\n".into()),
+            ("StringAffix-no-match", "v=abc; if [[ $v == z* ]]; then printf 'yes\\n'; else printf 'no\\n'; fi\n".into()),
+            ("StringAffix-all", "v=abc; if [[ $v == * ]]; then printf 'yes\\n'; else printf 'no\\n'; fi\n".into()),
+            // CaseTransform: both maps, an empty value, and a non-ASCII one.
+            ("CaseTransform-lower", "v=AbC; printf '%s\\n' \"${v,,}\"\n".into()),
+            ("CaseTransform-upper", "v=AbC; printf '%s\\n' \"${v^^}\"\n".into()),
+            ("CaseTransform-empty", "v=; printf '[%s]\\n' \"${v^^}\"\n".into()),
+            // StringTrim: the POSIX isspace class, an all-blank value, and
+            // NBSP which xargs keeps and `trim()` would eat.
+            ("StringTrim", "v=$(printf '  a b  \\n' | xargs); printf '[%s]\\n' \"$v\"\n".into()),
+            ("StringTrim-all-blank", "v=$(printf '   \\n' | xargs); printf '[%s]\\n' \"$v\"\n".into()),
+            (
+                "StringTrim-nbsp",
+                "v=$(echo \" \u{a0}x \" | xargs)\nprintf '[%s]\\n' \"$v\"\n".into(),
+            ),
+            // PathName: a trailing slash, a bare name, the root, and an
+            // EMPTY operand (the one input basename/dirname do not stat).
+            ("PathName-basename", "basename /a/b/c\n".into()),
+            ("PathName-basename-slash", "basename /a/b/\n".into()),
+            ("PathName-dirname", "dirname /a/b/c\n".into()),
+            ("PathName-dirname-bare", "dirname rel\n".into()),
+            ("PathName-dirname-root", "dirname /\n".into()),
+            ("PathName-empty", "basename ''\n".into()),
+        ];
+        run_node_parity("text", &cases);
+    }
+
     /// The `fs.*` command family's REFUSALS, asserted where they matter: a
     /// shape the node does not model must keep the route it had (a shell-out
     /// that knows the flag), not fall into the arm and lose the flag. This is
