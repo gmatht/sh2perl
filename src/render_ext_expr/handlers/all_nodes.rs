@@ -1349,7 +1349,13 @@ pub fn array_len(node: &ArrayLen, ctx: &ExprRenderCtx) -> Option<String> {
 pub fn reg_count(node: &RegCount, ctx: &ExprRenderCtx) -> Option<String> {
     let text = render_child(&node.text, ctx)?;
     match ctx.backend {
-        Backend::Perl => Some(format!("() = ({} =~ /{}/g)", text, node.pattern)),
+        // `() = (...)`: the count comes from a LIST assignment, so force
+        // scalar context HERE, at the node. Left bare it is a list-context
+        // construct: an enclosing operator then evaluates the assignment in
+        // list context and takes the ELEMENT COUNT of a scalar RHS, i.e. 0
+        // (`print(() = ("a" =~ /\\n/g) + 1, "\\n")` printed nothing where
+        // `wc -l` prints 1).
+        Backend::Perl => Some(format!("scalar(() = ({} =~ /{}/g))", text, node.pattern)),
         Backend::Estree => Some(format!("({}.match(/{}/g) || []).length", text, node.pattern)),
         Backend::Go => Some(format!("len(regexp.MustCompile(\"{}\").FindAllStringIndex({}, -1))", node.pattern, text)),
         Backend::Rust => Some(format!("{}.match(/{}/g) /* TODO */", text, node.pattern)),

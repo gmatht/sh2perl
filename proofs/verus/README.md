@@ -576,6 +576,76 @@ byte-identical. The consumer/gap effect shapes are the ones the repair above
 fixed, and they still REFUSE (the array stays).
 
 
+## text_ops_planner.rs — `wc -l` counts the newline echo appends (11)
+
+```
+    verus --triggers-mode silent --rlimit 40 text_ops_planner.rs
+    -> verification results:: 11 verified, 0 errors
+```
+
+**What is proved.** The pipeline
+
+    echo TEXT | wc -l
+
+is rewritten to a direct count, using the composition the target backend's
+node manifest selects: `RegCount(TEXT, /\n/) + 1` on a regex backend
+(perl/js), `ArrayLen(Split(TEXT, "\n"))` on C. `the_rewrite_preserves_the_count`
+is the law for EVERY text, recognizer verdict and manifest: the printed count
+equals bash's `newlines(TEXT) + 1`. The recognizer's verdict is an input to
+`go`, so a refused shape (wrong flag, `printf`, multi-word echo, a dynamic
+value, three stages) takes the unchanged-pipeline branch — the law is the same
+statement on both sides, not a shape antecedent.
+
+**One obligation per composition.** `regex_candidate_counts_the_line` — the
+regex backend must ADD the terminator, because the argument is unterminated.
+`split_candidate_counts_the_line` — the split backend must NOT add one: the
+fields of the argument already include the terminator's line (`fields =
+newlines + 1`). The pre-fix counts are pinned separately
+(`the_pre_fix_regex_count_is_one_short` for every word,
+`the_pre_fix_split_drops_the_empty_line` for the empty word), so a change to
+the model that "fixes" history is red.
+
+**Not modelled, stated.** The recognizer (the two-stage `echo TEXT` / `wc -l`
+shape and its refusals) produces the text and the verdict; the transform's own
+tests pin it. Decimal formatting is the corpus printer's contract. The ESTree
+backend is proved but not executed: no JS engine is installed on this host.
+
+**Mutants, all red, no `E0xxx`, each naming the obligation it breaks.** drop
+the terminator, count it twice, the pre-fix empty split, `newlines + 2`, forget
+the final field, count byte 97 instead of the newline, revert the SPEC to the
+pre-fix meaning (`wc_l = newlines`, caught by the concrete pins), the split
+backend reusing the regex composition, and loosening the pre-fix pin. The two
+compositions are proved equal (`every_candidate_agrees`), so the manifest
+choice is routing, not correctness.
+
+**Four defects the model forced, all repaired.**
+
+1. `RegCount(TEXT)` counted the argument, so `echo a | wc -l` printed 0 where
+   bash prints 1 — one short for every word. The planner now adds the
+   terminator. Test `reg_candidate_adds_the_echo_terminator` (red with the
+   `+ 1` reverted).
+2. The Perl rendering of RegCount was a list assignment, `() = (TEXT =~ /\n/g)`;
+   with `+ 1` it was evaluated in list context and yielded the element count of
+   a scalar (0), so the program printed nothing. Scalar context is now forced
+   at the node (`scalar(() = (…))`).
+3. The C split primitive returned 0 fields for the empty word, so
+   `echo "" | wc -l` printed 0 (bash 1). It now returns one empty field.
+4. The C emitted for the rewritten program did not compile at all —
+   `unknown type name '_sh_vbuf'`: `_sh_splice_v` is emitted with the value
+   primitives, but the vbuf type was emitted only inside the shell-runtime
+   block, whose last user in this program the planner removes. The type is now
+   emitted for either block. 
+
+**Anchor.** 12 shapes: real bash stdout+exit vs the compiled generated C (under
+`MALLOC_PERTURB_` 170 and 85) and the generated Perl — 12/12 SAME. Four lifted
+literal words (`a`, empty, an embedded newline, a trailing newline; both lower
+markers present in the artifacts), six refused shapes (`wc -c`, `wc -w`,
+`printf`, a two-word echo, a dynamic `$v`, three stages; neither marker), and
+two transform-disabled fall-throughs. The pre-fix measurements are the
+failing-first evidence: Perl printed 0/1 where bash prints 1/2, C printed 0 for
+the empty word, and the C did not compile.
+
+
 ## Running it
 
 Verus needs rust toolchain `1.99.1-x86_64-unknown-linux-gnu`

@@ -15,12 +15,14 @@
 //! `text_ops` (and per-backend transform selection) is the follow-up.
 //!
 //! Correctness note: the candidate table and reductions here are the
-//! MECHANISM, not the final semantics. The off-by-one `Split+ArrayLen`
-//! `wc -l` candidate and the `RegCount → Split+ArrayLen` reduction are
-//! placeholders for the exact per-backend compositions (a char-loop count
-//! is exact; split+len is not). Each candidate must be corpus-proven
-//! byte-exact per backend before it is offered (the doc's extended
-//! guardrail).
+//! MECHANISM, not the final semantics. A char-loop count over the ARGUMENT
+//! (`RegCount`) is one short of `wc -l`, because `echo` appends the newline
+//! the count is meant to include; the `+ 1` in that candidate is exactly that
+//! terminator. `Split+ArrayLen` counts fields of the argument, which equals
+//! the echoed stream's newlines (`fields = newlines + 1`, the terminator's
+//! line is the final, possibly empty, field) — both compositions are exact.
+//! Each candidate must still be corpus-proven byte-exact per backend before
+//! it is offered (the doc's extended guardrail).
 
 use std::collections::HashSet;
 use std::io;
@@ -331,17 +333,26 @@ pub fn build_wc_l(text: IrExpr, cap: &Capabilities) -> Option<IrExpr> {
 
 fn build_candidate(name: &str, text: IrExpr, cap: &Capabilities) -> Option<IrExpr> {
     match name {
-        // Regex backend: RegCount(text, /\n/) — a newline count, exact.
+        // Regex backend: `wc -l` counts the newline `echo` APPENDS, so the
+        // argument's own count is one short (measured: `echo a | wc -l`
+        // prints 1; "a" has no newline). Add the terminator explicitly; the
+        // value is numeric, so `+ 1` is backend-agnostic.
         "RegCount" => {
             if cap.supports("RegCount") {
-                Some(IrExpr::Ext(Box::new(RegCount {
-                    text,
-                    pattern: "\\n".to_string(),
-                })))
+                Some(IrExpr::BinOp {
+                    lhs: Box::new(IrExpr::Ext(Box::new(RegCount {
+                        text,
+                        pattern: "\\n".to_string(),
+                    }))),
+                    op: crate::ir::BinOpKind::Add,
+                    rhs: Box::new(IrExpr::Int(1)),
+                })
             } else {
-                // Reached via recursion (no-regex backend): expand to the
-                // doc's Split+ArrayLen composition (off-by-one candidate,
-                // only offered to backends that accept it).
+                // Reached via recursion (no-regex backend): the SAME count
+                // as fields of the argument. Splitting on "\n" yields
+                // newlines + 1 fields (the echoed terminator contributes the
+                // final empty line), so this composition is exact — no
+                // fudge, and no off-by-one.
                 Some(IrExpr::Ext(Box::new(ArrayLen {
                     array: IrExpr::Ext(Box::new(Split {
                         text,
@@ -353,6 +364,9 @@ fn build_candidate(name: &str, text: IrExpr, cap: &Capabilities) -> Option<IrExp
             }
         }
         // No-regex backend, explicit candidate: ArrayLen(Split(text, "\n")).
+        // Exact: `fields = newlines + 1`, which is what `wc -l` sees on the
+        // echoed stream. (The C split primitive counts the empty argument as
+        // one field, so the composition is exact for every word.)
         "SplitArrayLen" => Some(IrExpr::Ext(Box::new(ArrayLen {
             array: IrExpr::Ext(Box::new(Split {
                 text,
@@ -706,5 +720,37 @@ mod tests {
                 }
             }
         }
+    }
+
+    /// `wc -l` counts the newline `echo` APPENDS. Measured before the fix:
+    /// `echo a | wc -l` is 1, but the RegCount candidate counted the argument
+    /// (no newline) and the program printed 0. The candidate must add it.
+    #[test]
+    fn reg_candidate_adds_the_echo_terminator() {
+        let js = cap("RegCount\n");
+        let ir = build_wc_l(
+            IrExpr::Str("a".to_string(), crate::ir::StrStyle::DoubleQuoted),
+            &js,
+        )
+        .expect("js builds the regex candidate");
+        let d = format!("{ir:?}");
+        assert!(d.contains("RegCount"), "the regex candidate: {d}");
+        assert!(d.contains("Add"), "the echo terminator must be added: {d}");
+    }
+
+    /// The split candidate needs no fudge: `ArrayLen(Split(arg))` counts the
+    /// argument's fields, and the echoed terminator's line is the final field
+    /// (`fields = newlines + 1`). So it carries no `+ 1` of its own.
+    #[test]
+    fn split_candidate_is_the_exact_line_count() {
+        let c = cap("Split\nArrayLen\n");
+        let ir = build_wc_l(
+            IrExpr::Str("a".to_string(), crate::ir::StrStyle::DoubleQuoted),
+            &c,
+        )
+        .expect("c builds the split candidate");
+        let d = format!("{ir:?}");
+        assert!(d.contains("ArrayLen"), "the split candidate: {d}");
+        assert!(!d.contains("Add"), "no fudge on the exact composition: {d}");
     }
 }

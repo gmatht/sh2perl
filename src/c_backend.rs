@@ -13155,6 +13155,25 @@ impl Render {
         // helper hard-coded them, which is why the decl could get away with
         // one space). `IFS[0]` is still ' ', so the join faces are unchanged.
         self.emit("char IFS[256] = \" \\t\\n\"; /* bash's startup IFS */");
+        // `_sh_vbuf`/`_sh_vgrow` are shared by the shell-runtime helpers
+        // (joins, captures, argv) and the pure-value primitives
+        // (`_sh_splice_v`). A program can need the primitives WITHOUT the
+        // runtime — the text-ops planner removes the pipeline that was the
+        // only need_sh user — so the type must be emitted whenever either
+        // block is; emitting it only inside `need_sh` left the primitives'
+        // C referring to an undeclared type (`unknown type name '_sh_vbuf'`).
+        if self.need_sh || self.need_primitives {
+            self.emit("typedef struct { char *p; size_t cap; } _sh_vbuf;");
+            self.emit("static inline char *_sh_vgrow(_sh_vbuf *b, size_t need) {");
+            self.emit("  if (need <= b->cap && b->p) return b->p;");
+            self.emit("  size_t ncap = b->cap ? b->cap : 256;");
+            self.emit("  while (ncap < need) ncap *= 2;");
+            self.emit("  char *np = (char*)realloc(b->p, ncap);");
+            self.emit("  if (!np) { fprintf(stderr, \"sh2c: out of memory\\n\"); exit(127); }");
+            self.emit("  b->p = np; b->cap = ncap;");
+            self.emit("  return np;");
+            self.emit("}");
+        }
         if self.need_sh {
             self.runtime_start = self.out.len();
             self.emit("/* sh2 runtime: exit-status register + shell-out helpers */");
@@ -13200,7 +13219,7 @@ impl Render {
             self.emit("  if (!np) { fprintf(stderr, \"sh2c: out of memory\\n\"); exit(127); }");
             self.emit("  *b = np;");
             self.emit("}");
-            // growable VALUE buffer: heap storage for values whose size
+            // Growable VALUE buffer: heap storage for values whose size
             // cannot be proven (captures, pipelines, fn returns, joins,
             // slices — the Python-origin unbounded case). Fixed statics
             // silently truncated past 64KB; a vbuf doubles until the
@@ -13208,16 +13227,8 @@ impl Render {
             // high-water mark with no per-call malloc after warmup, and
             // the same consume-immediately discipline as the old statics
             // (no ownership transfer, no frees, nothing to leak).
-            self.emit("typedef struct { char *p; size_t cap; } _sh_vbuf;");
-            self.emit("static inline char *_sh_vgrow(_sh_vbuf *b, size_t need) {");
-            self.emit("  if (need <= b->cap && b->p) return b->p;");
-            self.emit("  size_t ncap = b->cap ? b->cap : 256;");
-            self.emit("  while (ncap < need) ncap *= 2;");
-            self.emit("  char *np = (char*)realloc(b->p, ncap);");
-            self.emit("  if (!np) { fprintf(stderr, \"sh2c: out of memory\\n\"); exit(127); }");
-            self.emit("  b->p = np; b->cap = ncap;");
-            self.emit("  return np;");
-            self.emit("}");
+            // The type and `_sh_vgrow` are emitted above (need_sh ||
+            // need_primitives), because `_sh_splice_v` uses them too.
             self.emit("static inline void _sh_add(const char *s) {");
             self.emit("  size_t l = _sh_cmd ? strlen(_sh_cmd) : 0, n = strlen(s);");
             self.emit("  _sh_grow(&_sh_cmd, &_sh_cap, l + n + 1);");
@@ -14863,7 +14874,12 @@ impl Render {
             self.emit("}");
             self.emit("/* number of fields when splitting by a single char (ArrayLen(Split)) */");
             self.emit("static size_t _sh_split_count(const char *s, char delim) {");
-            self.emit("  if (!s || !*s) return 0;");
+            // Splitting the empty string yields ONE empty field, not zero:
+            // that field is what makes `ArrayLen(Split(arg, '\\n'))` equal
+            // `wc -l` for `echo "" | wc -l` (the echoed terminator is the
+            // line). Returning 0 made the planner's exact composition one
+            // short on the empty word.
+            self.emit("  if (!s || !*s) return 1;");
             self.emit("  size_t n = 1;");
             self.emit("  for (; *s; s++) if (*s == delim) n++;");
             self.emit("  return n;");

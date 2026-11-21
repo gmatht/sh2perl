@@ -14,9 +14,11 @@
 //! shell-like backends never see it — they keep the original command.
 //!
 //! This is a DEMONSTRATION of the mechanism, not the final semantics: it
-//! handles only the literal `echo TEXT | wc -l` shape, and the
-//! `ArrayLen(Split)` candidate is the doc's off-by-one composition (only
-//! offered to backends that accept it). The full `text_ops` recognition
+//! handles only the literal `echo TEXT | wc -l` shape. Whichever candidate
+//! the backend's manifest selects is exact over the ECHO ARGUMENT: `RegCount`
+//! counts the argument's newlines, so the planner adds the terminator `echo`
+//! appends (`+ 1`); `ArrayLen(Split(arg, "\n"))` already counts that
+//! terminator's line as its final field. The full `text_ops` recognition
 //! (streaming, grep-wc, find-wc, captures) is the follow-on.
 
 use crate::ir::*;
