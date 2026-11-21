@@ -26015,7 +26015,27 @@ mod tests {
         // Refused in `node_manifest`'s `rs` arm, each with the reason written there.
         // (AffixStrip left this list when its real arm was DECLARED: the fold
         // already emitted the node and the backend already rendered it.)
+        //
+        // `RegSub`/`RegexpFind` are the two the plan calls irreducible without a
+        // regex engine: the emitted program has no POSIX BRE/ERE matcher, and a
+        // coreutils `sed 's///'` is not Rust's `regex` syntax (backreferences,
+        // `\1` in the pattern, BRE alternation), so an arm would be a lie.
+        // Those shapes keep their `bash -c`.
         const REFUSED: &[&str] = &["RegSub", "RegexpFind"];
+        // Shared nodes Rust neither declares nor is ever OFFERED: each is
+        // produced only by a frontend/transform gated on another backend — the
+        // C frontend's address-of/deref/type-assert, the Cgo call, the Java/JS
+        // field+element accessors and string splice, the perl readline, the
+        // JS spread/map literal, the named-field strips and `charAt`. Listing
+        // them is the record the plan asks for: a NEW node cannot arrive
+        // undeclared and unreasoned, because the assert below requires these
+        // three sets to partition every node type the tree declares.
+        const NOT_OFFERED: &[&str] = &[
+            "AddressOf", "CgoCall", "CharExtract", "CloneDeep", "CutAt", "Deref",
+            "ElementRead", "FieldGrab", "FieldRead", "FieldStrip", "FieldStripEnd",
+            "MapLiteral", "NewlineStrip", "ReadLine", "Spread", "StrSplice",
+            "Substitute", "TypeAssert",
+        ];
 
         let mut declared: Vec<&str> = node_manifest("rs").to_vec();
         let mut pinned: Vec<&str> = PINNED.to_vec();
@@ -26029,6 +26049,19 @@ mod tests {
             assert!(
                 !declared.contains(tag),
                 "{tag} is declared AND refused — one of the two is a lie"
+            );
+        }
+        // Every node type in the tree is either declared for Rust, refused with
+        // the reason above, or documented as never offered. A new node that is
+        // none of the three fails here until someone records which it is.
+        let refused: std::collections::HashSet<&str> = REFUSED.iter().copied().collect();
+        let offered: std::collections::HashSet<&str> = NOT_OFFERED.iter().copied().collect();
+        for (tag, _) in crate::shir_nodes::all_expr_nodes() {
+            assert!(
+                declared.iter().any(|d| *d == tag)
+                    || refused.contains(&*tag)
+                    || offered.contains(&*tag),
+                "{tag} is neither declared for Rust, refused with a reason, nor listed as never offered"
             );
         }
         // A refused node must leave the exact command in place.
