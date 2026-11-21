@@ -16732,10 +16732,12 @@ fn helper_source(h: &str) -> &'static str {
         "rand" => r#"fn __sh_rand() -> String {
     String::from_utf8_lossy(&__sh_cap_bytes("echo $RANDOM", None)).trim().to_string()
 }"#,
-        "mtime" => r#"fn __sh_mtime(s: &str) -> i64 {
-    std::fs::metadata(s).and_then(|m| m.modified()).map(|t| {
-        t.duration_since(std::time::UNIX_EPOCH).map(|d| d.as_secs() as i64).unwrap_or(0)
-    }).unwrap_or(0)
+        // NANOSECONDS, and `None` for a path that cannot be stat'd: bash's
+        // `-nt`/`-ot` compare the full timestamp (two files created in the
+        // same second still order) and treat a MISSING side specially.
+        "mtime" => r#"fn __sh_mtime_ns(s: &str) -> Option<i128> {
+    let t = std::fs::metadata(s).ok()?.modified().ok()?;
+    Some(t.duration_since(std::time::UNIX_EPOCH).map(|d| d.as_nanos() as i128).unwrap_or(0))
 }"#,
         "access" => r#"fn __sh_access(p: &str, want: u32) -> bool {
     // `test -r/-w/-x` is access(2): the requesting process's permission
@@ -18232,10 +18234,17 @@ impl<'a, 'r> TestParser<'a, 'r> {
                     "{{ let __sh_mapped = __sh_regex(&{l}, &{r}, {flags}); match __sh_mapped {{ Some(__sh_mapped) => __sh_mapped, None => {{ __SH_RC.store(2, Ordering::Relaxed); false }} }} }}"
                 )
             }
+            // bash's rules, not a numeric compare of two defaults: `a -nt
+            // b` is false when a is missing, TRUE when only b is missing,
+            // and compares at nanosecond precision otherwise (measured);
+            // `-ot` is the mirror image.
             "-nt" | "-ot" => {
                 self.render.add_helper("mtime");
-                let rs = if op == "-nt" { ">" } else { "<" };
-                format!("(__sh_mtime(&{lhs}) {rs} __sh_mtime(&{rhs}))")
+                let cmp = if op == "-nt" { ">" } else { "<" };
+                let only_known = if op == "-nt" { "(Some(_), None) => true" } else { "(None, Some(_)) => true" };
+                format!(
+                    "(match (__sh_mtime_ns(&{lhs}), __sh_mtime_ns(&{rhs})) {{ (Some(__sh_l), Some(__sh_r)) => __sh_l {cmp} __sh_r, {only_known}, _ => false }})"
+                )
             }
             "-ef" => {
                 self.render.add_helper("samefile");
@@ -25271,7 +25280,31 @@ mod tests {
                 ));
             }
         }
+        // The VARIABLE spelling reaches the renderer's `binary_test` arm
+        // instead of the `FsNewerThan` node, so both routes are witnessed.
+        for (i, (a, b)) in [
+            ("f555", "f4755"),
+            ("f4755", "f555"),
+            ("f644", "nope"),
+            ("nope", "f644"),
+            ("nope", "nope2"),
+        ]
+        .iter()
+        .enumerate()
+        {
+            for op in ["-nt", "-ot", "-ef"] {
+                src.push_str(&format!(
+                    "v1='{}'; v2='{}'; if test \"$v1\" {op} \"$v2\"; then echo 'v{i}{op}=1'; else echo 'v{i}{op}=0'; fi\n",
+                    p(a),
+                    p(b)
+                ));
+            }
+        }
         let prog = render_rs(&src);
+        assert!(
+            prog.contains("__sh_mtime_ns("),
+            "the `test` spelling did not reach the timestamp arm:\n{prog}"
+        );
         assert!(
             !prog.contains("__sh_spawn(") && !prog.contains("/* TODO"),
             "stat predicates did not render natively:\n{prog}"
