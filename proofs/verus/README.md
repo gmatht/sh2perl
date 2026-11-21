@@ -419,6 +419,87 @@ same bytes" is proved, and its rendering is pinned, but the rendered program
 was not run.
 
 
+## loop_return_lift.rs — capture at the echo point, stop at the first match (22)
+
+```
+    verus --triggers-mode silent --rlimit 40 loop_return_lift.rs
+    -> verification results:: 22 verified, 0 errors
+```
+
+**What is proved.** Standalone model of the transform that turns
+
+    loop { if C; then echo "$v"; return; fi }   [post]
+
+into
+
+    local flag=0; local ret
+    loop { if C; then ret="$v"; flag=1; break; fi }
+    if (( flag == 1 )); then echo "$ret"; else [post]; fi
+
+Observing the emitted bytes, `the_lift_preserves_the_observable` is the law for
+EVERY iteration sequence (each iteration is `Iter { hit, val }`), every
+post-loop body `post`, every trailing body `tail` and every placement:
+`go(in_function, it, post, tail, census(in_function, tail)) == go(in_function,
+it, post, tail, false)` with `census(in_function, tail) = in_function &&
+tail.len() == 0` computed FROM the input — a refused program takes both sides
+unchanged, so there is no shape antecedent. The two halves of the placement are
+exactly what `break` costs relative to `return`: a `break` leaves only the
+loop, so trailing statements are not skipped (non-tail), and at top level a
+`return` is an error and the script continues (no function).
+
+**One obligation per load-bearing rule.** `captures_the_matching_iteration` —
+the printed value is `it[first_hit].val`, read at the echo point
+(`the_value_after_the_match_is_a_different_iteration` shows the loop variable
+after the break sits on the NEXT element). `stops_at_the_first_match` — the
+flag is set exactly when an iteration matched and the run stops there
+(`the_break_really_stops_the_loop` pins `ran == 2` for a hit at 1).
+`the_post_arm_runs_exactly_when_the_loop_completes` pins the two arms: the
+capture on a hit, the moved `post` on fall-through.
+
+**Not modelled, stated.** The trigger (the then arm is exactly
+`[echo "$v", return]` with a pure, quoted `$v`, and a silent else) is the
+recognition, not the law; the law holds for every value sequence the lift is
+applied to. The capture is a function-scoped local read only on the found path
+— a renderer contract. The C path is anchored byte-for-byte; the ESTree path is
+not executed (no JS engine on this host).
+
+**Mutants, all red, no `E0xxx`, each naming the rule it weakens.** identity /
+no-lift (20v/2e: the census must accept a tail function loop), drop `tail ==
+0` (17v/5e), drop `in_function` (19v/3e), accept everything (15v/7e), drop the
+flag/break stop rule (16v/6e), keep iterating with the first capture (20v/2e —
+the law stays true and only `the_break_really_stops_the_loop` sees it), capture
+the next element (17v/5e), drop the post arm (18v/4e).
+
+**Three defects the model forced, all repaired.**
+
+1. The echo value was re-evaluated AFTER the loop. In the matchers' `for f in
+   ...` shape the loop variable ends on the element after the match that broke
+   out, so the lifted program printed `found 3` where bash prints `found 2`.
+   Repaired by capturing into `ret` at the echo point. Test
+   `the_value_is_captured_at_the_matching_iteration` (the capture is the first
+   write, reads the echoed word, and the post-loop echo reads the capture).
+2. The lift fired on a loop that was not in tail position: the original
+   `return` skipped the statements after the enclosing block, the new `break`
+   did not (measured: an `echo unreachable` ran). Repaired with the `tail`
+   conjunct. Test `a_loop_that_is_not_in_tail_position_is_not_lifted`.
+3. The lift fired at the TOP LEVEL, where `local` is invalid and `return` does
+   not end the script; the generated C failed to build with `redefinition of
+   '__sh2_found'`. Repaired with the `in_function` conjunct. Test
+   `a_loop_outside_a_function_is_not_lifted`.
+
+**Anchors.** 6 loop/placement shapes (tail function loop, non-tail loop,
+nested loop, no-match fall-through, a herestring `while read` wrapped in a
+`Redirect`, a quoted non-loop-variable value): real bash stdout+exit vs the
+compiled generated C under `MALLOC_PERTURB_=170` — 6/6 SAME, with the lift
+firing in 3 and correctly refused in 3 (the herestring loop is refused because
+its post statements cannot move out of the redirect). A top-level `return`
+shape diverges (`2\nafter` vs `2`) with the pass a NO-OP there (0
+`__sh2_found`), so it is the C renderer's own top-level `return` lowering, not
+this model; and the multi-name `local i x` form trips a pre-existing C
+declaration bug (`i = NULL` into a `uint8_t`) that reproduces with the
+transform inactive.
+
+
 ## Running it
 
 Verus needs rust toolchain `1.99.1-x86_64-unknown-linux-gnu`
