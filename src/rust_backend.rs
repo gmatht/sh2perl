@@ -25527,6 +25527,44 @@ mod tests {
         run_node_parity("text", &cases);
     }
 
+    /// The filesystem families: the three predicates and the command node,
+    /// each over a real fixture including a nonexistent path, an unreadable
+    /// file and directory, a directory used as a file, and a missing operand.
+    #[cfg(unix)]
+    #[test]
+    fn node_parity_fs_families() {
+        let root = std::env::temp_dir().join(format!("sh2_parity_paths_{}", std::process::id()));
+        let p = |n: &str| root.join(n).to_string_lossy().into_owned();
+        let cases: Vec<(&str, String)> = vec![
+            ("FsSameFile-same", format!("[ '{}' -ef '{}' ] && printf 'same\\n'\n", p("plain.txt"), p("plain.txt"))),
+            ("FsSameFile-different", format!("[ '{}' -ef '{}' ] || printf 'differ\\n'\n", p("plain.txt"), p("empty.txt"))),
+            ("FsSameFile-missing", format!("[ '{}' -ef '{}' ] || printf 'missing\\n'\n", p("absent"), p("plain.txt"))),
+            ("FsNewerThan", format!("[ '{}' -nt '{}' ] && printf 'newer\\n' || printf 'older\\n'\n", p("f000"), p("plain.txt"))),
+            ("FsNewerThan-missing-right", format!("[ '{}' -nt '{}' ] && printf 'newer\\n' || printf 'older\\n'\n", p("plain.txt"), p("absent"))),
+            ("FsModifiedSinceRead", format!("[ -N '{}' ] && printf 'mod\\n' || printf 'nomod\\n'\n", p("plain.txt"))),
+            ("FsModifiedSinceRead-missing", format!("[ -N '{}' ] && printf 'mod\\n' || printf 'nomod\\n'\n", p("absent"))),
+            // The failing cases end on the command itself, so the script's
+            // exit status (and its stderr) is the command's: that is where an
+            // arm that always succeeds diverges.
+            ("FsCommand-rm-missing", format!("rm '{}'\n", p("absent"))),
+            ("FsCommand-rm-force", format!("rm -f '{}'\nprintf 'rc=%s\\n' \"$?\"\n", p("absent"))),
+            ("FsCommand-rm-unreadable", format!("rm '{}'\nprintf 'rc=%s\\n' \"$?\"\n", p("f000"))),
+            ("FsCommand-rm-dir-without-flag", format!("rm '{}'\n", p("adir"))),
+            ("FsCommand-mkdir-exists", format!("mkdir '{}'\n", p("adir"))),
+            ("FsCommand-mkdir-parents", format!("mkdir -p '{}/x/y'\nprintf 'rc=%s\\n' \"$?\"\n", p("adir"))),
+            ("FsCommand-touch", format!("touch '{}'\nprintf 'rc=%s\\n' \"$?\"\n", p("plain.txt"))),
+            ("FsCommand-touch-missing-parent", format!("touch '{}/x'\n", p("absent"))),
+        ];
+        let (positives, failures) = run_node_parity("paths", &cases);
+        // Mixed outcomes: these failing-status cases are the ones an arm that
+        // only ever succeeds would get wrong.
+        assert!(
+            failures >= 3,
+            "only {failures} failing cases (of {} total): an always-succeeding arm could pass this",
+            positives + failures
+        );
+    }
+
     /// The `fs.*` command family's REFUSALS, asserted where they matter: a
     /// shape the node does not model must keep the route it had (a shell-out
     /// that knows the flag), not fall into the arm and lose the flag. This is
