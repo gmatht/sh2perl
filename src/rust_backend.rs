@@ -16815,7 +16815,12 @@ fn helper_source(h: &str) -> &'static str {
             .and_then(|l| l.split_whitespace().nth(1)).and_then(|v| v.parse().ok()))
         .unwrap_or(0)
 }"#,
+        // `$HOSTNAME` is a shell VARIABLE bash initialises from the
+        // INHERITED environment (measured: `HOSTNAME=foo bash -c 'echo
+        // $HOSTNAME'` prints foo, and an empty value stays empty), falling
+        // back to the kernel name only when the variable is unset.
         "hostname" => r#"fn __sh_hostname() -> String {
+    if let Ok(h) = std::env::var("HOSTNAME") { return h; }
     std::fs::read_to_string("/proc/sys/kernel/hostname")
         .map(|s| s.trim_end().to_string()).unwrap_or_default()
 }"#,
@@ -24784,6 +24789,60 @@ mod tests {
         (run.stdout, run.stderr, run.status.code())
     }
 
+    /// `compile_and_run_full` with the child's ENVIRONMENT controlled, for
+    /// the identity variables (`$HOSTNAME`) whose value comes from the
+    /// inherited environment.
+    fn compile_and_run_full_env(
+        case: &str,
+        prog: &str,
+        envs: &[(&str, &str)],
+        unset: &[&str],
+    ) -> (Vec<u8>, Vec<u8>, Option<i32>) {
+        static SEQ: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+        let seq = SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        let dir = std::env::temp_dir().join(format!(
+            "sh2_text_nodes_env_{}_{}_{}",
+            std::process::id(),
+            case,
+            seq
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).expect("temp dir");
+        let src = dir.join("main.rs");
+        let bin = dir.join("main");
+        std::fs::write(&src, prog).expect("write render");
+        let build = std::process::Command::new("rustc")
+            .args(["--edition", "2021", "-A", "warnings", "-o"])
+            .arg(&bin)
+            .arg(&src)
+            .output()
+            .expect("rustc");
+        assert!(
+            build.status.success(),
+            "{case}: rustc rejected the render:\n{}",
+            String::from_utf8_lossy(&build.stderr)
+        );
+        let mut run_cmd = std::process::Command::new(&bin);
+        run_cmd.current_dir(&dir).envs(envs.iter().copied());
+        for k in unset {
+            run_cmd.env_remove(k);
+        }
+        let run = run_cmd.output().expect("run render");
+        let _ = std::fs::remove_dir_all(&dir);
+        (run.stdout, run.stderr, run.status.code())
+    }
+
+    /// `run_bash_full` with the child's ENVIRONMENT controlled.
+    fn run_bash_full_env(src: &str, envs: &[(&str, &str)], unset: &[&str]) -> (Vec<u8>, Vec<u8>, Option<i32>) {
+        let mut cmd = std::process::Command::new("bash");
+        cmd.arg("-c").arg(src).arg("sh").envs(envs.iter().copied());
+        for k in unset {
+            cmd.env_remove(k);
+        }
+        let out = cmd.output().expect("bash");
+        (out.stdout, out.stderr, out.status.code())
+    }
+
     /// Run a shell snippet under bash: `(stdout, code)`.
     fn run_bash(src: &str) -> (Vec<u8>, Option<i32>) {
         let (out, _err, code) = run_bash_full(src);
@@ -25402,6 +25461,38 @@ mod tests {
             );
             let (rs_out, rs_err, rs_rc) = compile_and_run_full(case, &prog);
             let (sh_out, sh_err, sh_rc) = run_bash_full(src);
+            assert_eq!(
+                String::from_utf8_lossy(&rs_out),
+                String::from_utf8_lossy(&sh_out),
+                "{case}: stdout differs from bash"
+            );
+            assert_eq!(
+                String::from_utf8_lossy(&rs_err),
+                String::from_utf8_lossy(&sh_err),
+                "{case}: stderr differs from bash"
+            );
+            assert_eq!(rs_rc, sh_rc, "{case}: status differs from bash");
+        }
+    }
+
+    /// Class 6, the IDENTITY half: `$UID`/`$EUID` (process identity) and
+    /// `$HOSTNAME` (a shell variable bash initialises from the INHERITED
+    /// environment, falling back to the kernel name only when it is unset —
+    /// measured on this host). The child's environment is controlled on both
+    /// sides, so the inherited / empty / unset cases are all covered.
+    #[cfg(unix)]
+    #[test]
+    fn identity_variables_execute_like_bash() {
+        let src = "echo \"[$HOSTNAME]\"\necho \"$UID $EUID\"\n";
+        let prog = render_rs(src);
+        assert!(!prog.contains("__sh_spawn(") && !prog.contains("/* TODO"), "identity variables did not render natively:\n{prog}");
+        for (case, envs, unset) in [
+            ("identity-inherited", &[("HOSTNAME", "probe.host")][..], &[][..]),
+            ("identity-empty", &[("HOSTNAME", "")][..], &[][..]),
+            ("identity-unset", &[][..], &["HOSTNAME"][..]),
+        ] {
+            let (rs_out, rs_err, rs_rc) = compile_and_run_full_env(case, &prog, envs, unset);
+            let (sh_out, sh_err, sh_rc) = run_bash_full_env(src, envs, unset);
             assert_eq!(
                 String::from_utf8_lossy(&rs_out),
                 String::from_utf8_lossy(&sh_out),
