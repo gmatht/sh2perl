@@ -7928,16 +7928,27 @@ while __sh_path.len() > 1 && __sh_path.ends_with('/') {{ __sh_path = &__sh_path[
         }
         // `cat`'s diagnostic is `cat: PATH: <strerror>` with the path
         // QUOTED when coreutils' quotearg would quote it (an empty name,
-        // whitespace, a quote, a control byte…). The help arm below spells
-        // the UNQUOTED form only, and a runtime operand cannot be checked at
-        // render time — so both the byte arm and the quoting rule are pinned
-        // to a STATIC path whose characters cannot trigger quoting. A `-`
-        // operand (a stdin read between the files) is refused here too.
-        if !words.iter().all(|w| match w {
-            IrExpr::Str(s, _) => s != "-" && Self::cat_diag_plain(s),
-            _ => false,
-        }) {
-            return None;
+        // whitespace, a quote, a control byte…). The arm spells the UNQUOTED
+        // form, so a STATIC operand is checked here: one whose characters
+        // cannot trigger quoting takes the byte arm, anything else keeps its
+        // command. A `-` operand (a stdin read between the files) is refused
+        // in both cases.
+        //
+        // A RUNTIME operand (a quoted expansion, `cat "$f"`) cannot be
+        // checked at render time, and refusing it buys nothing: the quoting
+        // decision for a name known only at runtime is coreutils' either way,
+        // so refusing only trades the byte arm for `bash -c` (measured:
+        // `pid_tempfile`'s `cat "$tmpf"` was the corpus's one program that
+        // GAINED a spawn when this arm started requiring a literal). It takes
+        // the same helper path it had before `cat` became a statement arm;
+        // `fs_argv` still refuses a splat/array/glob word, because those are
+        // not one path.
+        for w in words {
+            if let IrExpr::Str(s, _) = w {
+                if s == "-" || !Self::cat_diag_plain(s) {
+                    return None;
+                }
+            }
         }
         let argv = self.fs_argv(words)?;
         self.add_helper("cat_stmt");
@@ -25155,6 +25166,38 @@ mod tests {
                 "{name}: `cat FILE` still forks or still splits lines:\n{prog}"
             );
             assert!(!prog.contains("/* TODO"), "{name}: TODO in render:\n{prog}");
+            let (rs_out, rs_err, rs_rc) = compile_and_run_full(name, &prog);
+            let (sh_out, sh_err, sh_rc) = run_bash_full(&src);
+            assert_eq!(rs_out, sh_out, "{name}: stdout differs from bash");
+            assert_eq!(
+                String::from_utf8_lossy(&rs_err),
+                String::from_utf8_lossy(&sh_err),
+                "{name}: stderr differs from bash"
+            );
+            assert_eq!(rs_rc, sh_rc, "{name}: status differs from bash");
+        }
+
+        // A RUNTIME operand keeps the byte arm: `cat "$f"` is one path whose
+        // name is only known at run time, so the renderer cannot check
+        // coreutils' quotearg and refusing would only buy a `bash -c`
+        // (measured: `pid_tempfile` was the corpus's one program that gained
+        // a spawn when this arm required a literal).
+        for (name, src) in [
+            ("cat-dynamic", format!("f='{}'\ncat \"$f\"\n", p("nl.txt"))),
+            (
+                "cat-dynamic-missing",
+                format!("f='{}'\ncat \"$f\"\n", p("nope.txt")),
+            ),
+        ] {
+            let prog = render_rs(&src);
+            assert!(
+                prog.contains("__sh_cat_stmt("),
+                "{name}: `cat \"$f\"` did not take the byte arm:\n{prog}"
+            );
+            assert!(
+                !prog.contains("__sh_spawn("),
+                "{name}: `cat \"$f\"` still forks:\n{prog}"
+            );
             let (rs_out, rs_err, rs_rc) = compile_and_run_full(name, &prog);
             let (sh_out, sh_err, sh_rc) = run_bash_full(&src);
             assert_eq!(rs_out, sh_out, "{name}: stdout differs from bash");
