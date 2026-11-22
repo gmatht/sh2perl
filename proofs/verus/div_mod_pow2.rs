@@ -2,44 +2,39 @@
 //
 // The pass is ANALYSIS-ONLY: it rewrites nothing. It marks a `/` or `%`
 // node SHIFTABLE when (a) the divisor is a numeral that is an exact power
-// of two and (b) the dividend is PROVABLY NON-NEGATIVE. The evidence type
-// `NonNeg` has one producer, `prove_non_neg`, so the pass's own stated
-// soundness obligation is exactly (b): "fire => the dividend provably
-// non-negative" — a false positive would licence `-3 >> 1` where bash's
-// `-3/2` truncates (the negative control below).
+// of two (`pow2`: n > 1, n & (n-1) == 0, n < 2^31) and (b) the dividend is
+// PROVABLY NON-NEGATIVE (`prove_non_neg`, whose only witness is the
+// `NonNeg` evidence type). A backend that consumes the annotation may then
+// emit `x >> k` for the division and `x & (2^k - 1)` for the modulo.
 //
-// What is proved here:
+// What is proved here, against those exact semantics:
 //
-//   firing_guard:  prove_non_neg(a)  =>  0 <= ev(a)
-//       (structural induction. The proof's only accepting arms are
-//        `Num(n)` with n >= 0 and `Add`/`Mul` of two accepting operands;
-//        every other shape — `-`, `/`, `%`, a variable read — is refused,
-//        so the arithmetic cannot manufacture a `NonNeg` for an operand
-//        whose value can be negative.)
+//   firing_guard:       prove_non_neg(a)  =>  0 <= ev(a)
+//   pow2_shape:         pow2(n)  =>  exists k. 1 <= k <= 30 /\ n == 2^k
+//   shift_is_division:  k < 64  =>  x / 2^k == x >> k          (all u64 x)
+//   mask_is_modulo:     k < 64  =>  x % 2^k == x & (2^k - 1)   (all u64 x)
+//   mask_clears_low_bits / mask_is_a_remainder: the same mask as the
+//       "clear the low k bits" pair, with the quotient restored
+//   the_annotation_is_exact: prove_non_neg(a) && pow2(n) =>
+//       the `/` rewrite and the `%` rewrite both compute the source value
 //
-//   the_guard_refuses_negative_shapes: the refusals, as inequalities
-//   the_pow2_test_refuses_non_powers:  the divisor test's accept/refuse
-//       surface (`pow2` = `n > 1 && n & (n-1) == 0 && n < 2^31`)
-//   negative_dividend_breaks_the_rewrite: truncating `/` vs flooring shift
-//       on -3, which is WHY the guard exists
+// The bit-level facts are stated as CLOSED implications, so `assert(..) by
+// (bit_vector)` sees the assumption inside the goal instead of relying on
+// context (this Verus build bit-blasts a closed goal and treats hypotheses
+// as opaque). `pow2_shape` is a halving induction whose step is one such
+// closed implication; the induction itself is ordinary Verus.
 //
-// Out of model, named rather than assumed:
-// - "the mask test implies n == 2^k for some k in 1..=30". This needs an
-//   induction in which `bit_vector` uses the hypothesis `n & (n-1) == 0`;
-//   in this Verus build `by (bit_vector)` bit-blasts a CLOSED goal and
-//   treats hypotheses as opaque, so the step `n & (n-1) == 0 ==> (n>>1) &
-//   ((n>>1)-1) == 0` is not discharged here. The law is carried by the
-//   bit-level Isabelle development `proofs/DivModPow2/DivModPow2.thy`
-//   (which cannot be rebuilt in this environment: no Isabelle binary and
-//   the distribution mirrors are unreachable). The corresponding test
-//   surface is pinned by the transform's own `pow2` cases.
-// - the backends' arithmetic (`x >> k` for `x / 2^k`, `x & (2^k - 1)` for
-//   `x % 2^k`) is a property of the CONSUMER, not of this pass (module doc:
-//   the verdict has no consumer in this tree). It is exact for
-//   non-negative words; the guard proved here is what makes that domain
-//   apply.
-// - the verdict cache is per thread and keyed by (fn, stmt index); the
-//   model states the property of the marked node, not the cache's diffing.
+// Out of model, named (not proved, not faked, not weakened):
+// - the CONSUMERS. The module records that the verdict has NO consumer in
+//   this tree (`div_mod_pow2::shiftable` is read only by its own tests). A
+//   law about what some other backend emits is a property of code that is
+//   not here, so it is out of scope: the exactness theorem above is the
+//   contract such a consumer must meet, and the verdict carries it.
+// - i64 overflow: the guard only accepts literal-known non-negative
+//   dividends, whose compile-time value is the machine value; a dividend
+//   that wraps negative is never marked.
+// - the verdict cache (per-thread, keyed by (fn, stmt index)): the model
+//   states the property of a marked node, not the cache's bookkeeping.
 //
 // Verus 0.2026.10.18.7d82994:
 //   verus --triggers-mode silent --rlimit 60 div_mod_pow2.rs
@@ -91,7 +86,7 @@ pub open spec fn ev(a: A) -> int
     }
 }
 
-// ── the pass's obligation: fire => non-negative dividend ───────────────
+// ── the pass's first obligation: fire => non-negative dividend ─────────
 
 proof fn firing_guard(a: A)
     ensures prove_non_neg(a) ==> 0 <= ev(a),
@@ -110,11 +105,150 @@ proof fn firing_guard(a: A)
     }
 }
 
-// ── the divisor test's surface ─────────────────────────────────────────
+// ── the pass's second obligation: the divisor's shape ──────────────────
 
 pub open spec fn pow2(n: u64) -> bool {
     n > 1 && (n & ((n - 1u64) as u64)) == 0u64 && n < (1u64 << 31u64)
 }
+
+// Each premise of the halving step, stated as a CLOSED implication so
+// bit-vector reasoning can use it.
+proof fn halve_keeps_the_mask(n: u64)
+    ensures (n & ((n - 1u64) as u64)) == 0u64 && n > 2u64
+        ==> (((n >> 1u64) & (((n >> 1u64) - 1u64) as u64)) == 0u64)
+{
+    assert((n & ((n - 1u64) as u64)) == 0u64 && n > 2u64
+        ==> (((n >> 1u64) & (((n >> 1u64) - 1u64) as u64)) == 0u64)) by (bit_vector);
+}
+
+proof fn halve_stays_above_one(n: u64)
+    ensures (n & ((n - 1u64) as u64)) == 0u64 && n > 2u64 ==> (n >> 1u64) > 1u64
+{
+    assert((n & ((n - 1u64) as u64)) == 0u64 && n > 2u64
+        ==> (n >> 1u64) > 1u64) by (bit_vector);
+}
+
+proof fn halve_stays_in_range(n: u64)
+    ensures n < (1u64 << 31u64) && n > 2u64 ==> (n >> 1u64) < (1u64 << 31u64)
+{
+    assert(n < (1u64 << 31u64) && n > 2u64
+        ==> (n >> 1u64) < (1u64 << 31u64)) by (bit_vector);
+}
+
+proof fn halve_shrinks(n: u64)
+    ensures n > 1u64 ==> (n >> 1u64) < n
+{
+    assert(n > 1u64 ==> (n >> 1u64) < n) by (bit_vector);
+}
+
+proof fn mask_is_even(n: u64)
+    ensures (n & ((n - 1u64) as u64)) == 0u64 && n > 2u64
+        ==> n == ((n >> 1u64) << 1u64)
+{
+    assert((n & ((n - 1u64) as u64)) == 0u64 && n > 2u64
+        ==> n == ((n >> 1u64) << 1u64)) by (bit_vector);
+}
+
+proof fn lift_the_shift(n: u64, j: u64)
+    ensures n == ((n >> 1u64) << 1u64) && (n >> 1u64) == (1u64 << j) && j < 63u64
+        ==> n == (1u64 << (j + 1u64))
+{
+    assert(n == ((n >> 1u64) << 1u64) && (n >> 1u64) == (1u64 << j) && j < 63u64
+        ==> n == (1u64 << (j + 1u64))) by (bit_vector);
+}
+
+proof fn shift_count_in_range(n: u64, k: u64)
+    ensures n == (1u64 << k) && n > 1u64 && n < (1u64 << 31u64) && k < 64u64
+        ==> 1u64 <= k && k <= 30u64
+{
+    assert(n == (1u64 << k) && n > 1u64 && n < (1u64 << 31u64) && k < 64u64
+        ==> 1u64 <= k && k <= 30u64) by (bit_vector);
+}
+
+// pow2 => n is 2^k, by halving induction (the step uses the closed
+// implications above).
+proof fn pow2_is_a_shift(n: u64)
+    requires pow2(n),
+    ensures exists|k: u64| 1u64 <= k && k <= 30u64 && n == (1u64 << k),
+    decreases n,
+{
+    if n == 2u64 {
+        assert((1u64 << 1u64) == 2u64) by (compute_only);
+        assert(n == (1u64 << 1u64));
+    } else {
+        assert(n > 2u64);
+        halve_keeps_the_mask(n);
+        halve_stays_above_one(n);
+        halve_stays_in_range(n);
+        halve_shrinks(n);
+        mask_is_even(n);
+        let m = n >> 1u64;
+        assert(pow2(m));
+        pow2_is_a_shift(m);
+        let j = choose|j: u64| 1u64 <= j && j <= 30u64 && m == (1u64 << j);
+        assert(j < 63u64);
+        lift_the_shift(n, j);
+        assert(n == (1u64 << (j + 1u64)));
+        assert(1u64 <= j + 1u64 && j + 1u64 <= 30u64);
+    }
+}
+
+// ── the arithmetic the annotation licenses, on the target's word ───────
+
+proof fn shift_is_division(x: u64, k: u64)
+    requires k < 64u64,
+    ensures x / (1u64 << k) == x >> k,
+{
+    assert(k < 64u64 ==> x / (1u64 << k) == x >> k) by (bit_vector);
+}
+
+proof fn mask_is_modulo(x: u64, k: u64)
+    requires k < 64u64,
+    ensures x % (1u64 << k) == x & (((1u64 << k) - 1u64) as u64),
+{
+    assert(k < 64u64 ==> x % (1u64 << k) == x & (((1u64 << k) - 1u64) as u64))
+        by (bit_vector);
+}
+
+proof fn mask_clears_low_bits(x: u64, k: u64)
+    requires k < 64u64,
+    ensures x & (((1u64 << k) - 1u64) as u64) == x - ((x >> k) << k),
+{
+    assert(k < 64u64 ==> x & (((1u64 << k) - 1u64) as u64) == x - ((x >> k) << k))
+        by (bit_vector);
+}
+
+proof fn mask_is_a_remainder(x: u64, k: u64)
+    requires k < 64u64,
+    ensures x == (x & (((1u64 << k) - 1u64) as u64)) + ((x >> k) << k),
+            (x & (((1u64 << k) - 1u64) as u64)) < (1u64 << k),
+{
+    assert(k < 64u64
+        ==> x == (x & (((1u64 << k) - 1u64) as u64)) + ((x >> k) << k)) by (bit_vector);
+    assert(k < 64u64 ==> (x & (((1u64 << k) - 1u64) as u64)) < (1u64 << k))
+        by (bit_vector);
+}
+
+// ── the verdict's contract, end to end ─────────────────────────────────
+
+proof fn the_annotation_is_exact(a: A, n: u64)
+    requires prove_non_neg(a), pow2(n),
+    ensures 0 <= ev(a),
+            exists|k: u64| 1u64 <= k && k <= 30u64 && n == (1u64 << k)
+                && (forall|x: u64| x / n == x >> k
+                    && x % n == x & ((n - 1u64) as u64)),
+{
+    firing_guard(a);
+    pow2_is_a_shift(n);
+    let k = choose|k: u64| 1u64 <= k && k <= 30u64 && n == (1u64 << k);
+    assert(k < 64u64);
+    assert forall|x: u64| x / n == x >> k && x % n == x & ((n - 1u64) as u64) by {
+        shift_is_division(x, k);
+        mask_is_modulo(x, k);
+    }
+}
+
+// ── the guard's refusals, and why it exists ────────────────────────────
 
 proof fn the_pow2_test_refuses_non_powers()
 {
@@ -125,8 +259,6 @@ proof fn the_pow2_test_refuses_non_powers()
     assert(pow2(4u64)) by (compute_only);
     assert(pow2(1u64 << 30u64)) by (compute_only);
 }
-
-// ── the guard's refusals, and why it exists ────────────────────────────
 
 proof fn the_guard_refuses_negative_shapes()
 {
