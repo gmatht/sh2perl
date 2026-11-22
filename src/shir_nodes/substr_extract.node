@@ -31,6 +31,9 @@ field text: expr
 field offset: expr
 field length: optional_expr
 spec: TextOps#substr_extract_sound
-spec: TextOps#slice_nonneg, TextOps#slice_from_last_n
-spec: TextOps#slice_negative_length, TextOps#negative_offset_is_not_zero
-spec: TextOps#negative_length_is_not_ignored, TextOps#negative_length_is_not_a_prefix
+spec: TextOps#slice_nonneg
+spec: TextOps#slice_from_last_n
+spec: TextOps#slice_negative_length
+spec: TextOps#negative_offset_is_not_zero
+spec: TextOps#negative_length_is_not_ignored
+spec: TextOps#negative_length_is_not_a_prefix

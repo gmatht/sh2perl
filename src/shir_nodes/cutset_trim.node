@@ -43,4 +43,5 @@ field side: optional_string
 # so a class is NOT expressible in the modelled fragment. The node is therefore stated
 # over the cutset SET (which is what Go's strings.Trim and the Perl \Q..\E arms mean),
 # not over a pattern, and no theorem here assumes class matching.
-spec: TextOps#cutset_trim_is_trim_by, TextOps#cutset_trim_sound
+spec: TextOps#cutset_trim_is_trim_by
+spec: TextOps#cutset_trim_sound

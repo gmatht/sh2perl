@@ -21,7 +21,8 @@
 # #star_test_is_every_string): the fragment has exactly three constructors, so classes,
 # ranges, negation, extglob, brace alternation and quoting are outside the model. A
 # lowering whose pattern carries one of those is outside this node's contract.
-spec: TextOps#string_contains_sound, TextOps#glob_contains_sound
+spec: TextOps#string_contains_sound
+spec: TextOps#glob_contains_sound
 
 node StringContains
 tag "StringContains"

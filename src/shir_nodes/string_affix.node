@@ -40,4 +40,5 @@ field prefix: bool
 # extglob groups, brace alternation and backslash quoting are NOT in the model, so a
 # lowering whose pattern carries one is outside this node's contract. The Perl
 # trailing-arm empty-pattern divergence is proved separately as a renderer gap.
-spec: TextOps#string_affix_sound, TextOps#glob_affix_sound
+spec: TextOps#string_affix_sound
+spec: TextOps#glob_affix_sound

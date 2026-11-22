@@ -28,7 +28,10 @@
 # BOUNDARY: the pattern is the literal fragment of ShIR_TextOps_Glob (PLit, and the
 # `p*`/`*p` shapes built from it). Classes, ranges, negation, extglob, brace alternation
 # and quoting are outside the model — no theorem here covers them.
-spec: TextOps#affix_strip_sound, TextOps#glob_strip_sound, TextOps#strip_pre_is_the_node, TextOps#strip_suf_is_the_node
+spec: TextOps#affix_strip_sound
+spec: TextOps#glob_strip_sound
+spec: TextOps#strip_pre_is_the_node
+spec: TextOps#strip_suf_is_the_node
 
 node AffixStrip
 tag "AffixStrip"

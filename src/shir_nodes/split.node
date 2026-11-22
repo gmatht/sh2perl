@@ -13,8 +13,10 @@ field is_regex: bool
 # split. C renders an in-place tokenizer on the var's own storage; GC'd
 # string languages ignore it (immutable strings — flag meaningless).
 field in_place: optional_bool
-spec: TextOps#split_ws_len, TextOps#split_ws_fields_clean
-spec: TextOps#intercalate_split_on, TextOps#cut_keeps_trailing_empty_field
+spec: TextOps#split_ws_len
+spec: TextOps#split_ws_fields_clean
+spec: TextOps#intercalate_split_on
+spec: TextOps#cut_keeps_trailing_empty_field
 # The field LIST is the meaning. What is machine-checked is its count
 # (split_ws_len: dropping the empty fields is what makes the count equal the
 # ws -w count), its shape (split_ws_fields_clean: no empty field, no

@@ -13,9 +13,12 @@ field delimiter: string
 field fields: vec_field_range
 field suppress_no_delim: bool
 field output_delimiter: optional_string
-spec: TextOps#cut_keeps_empty_field, TextOps#field_or_empty_out_of_range
-spec: TextOps#select_subset, TextOps#complement_lengths
-spec: TextOps#splice_single, TextOps#splice_three
+spec: TextOps#cut_keeps_empty_field
+spec: TextOps#field_or_empty_out_of_range
+spec: TextOps#select_subset
+spec: TextOps#complement_lengths
+spec: TextOps#splice_single
+spec: TextOps#splice_three
 spec: TextOps#order_is_input_not_argument
 spec: TextOps#range_is_neither_first_nor_prefix
 spec: TextOps#output_delimiter_is_not_appended
