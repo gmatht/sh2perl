@@ -1,0 +1,4 @@
+session FsCommands = HOL +
+  options [quick_and_dirty = false]
+  theories
+    ShIR_FsCommands

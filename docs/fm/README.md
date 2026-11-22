@@ -24,6 +24,20 @@ shIR. It is split into six theories that build as one session:
 isabelle build -D sh2perl/docs/fm/TextOps      # HOL only, no AFP, ~30 s
 ```
 
+## The `TextSemantics`, `FsSemantics` and `FsCommands` sessions
+
+Three sessions back node specs whose subject is NOT a pure function of a byte
+string: a filter pipeline, three stat/identity predicates, and the file-mutating
+commands.  They are separate directories (and separate `isabelle build`
+invocations) because each imports only HOL, so none of them needs the `TextOps`
+heap; `harness/transform-proofs.sh` builds all four.
+
+| Session | Node `spec:` line it backs | The obligation |
+|---|---|---|
+| `TextSemantics/` (`ShIR_TextSemantics`) | `TextSemantics#filter_chain` (`text_filter.node`) | a `;`-separated `ops` list is FUNCTION COMPOSITION: `apply_chain (xs @ ys) t = apply_chain ys (apply_chain xs t)`, plus `uniq` idempotence (through `idem_aux`) that the `sort | uniq` fold relies on.  Each op's edge case is an executable `by eval` pin: `head`/`tail` over lines (a final partial line is a line), `uniq` collapsing ADJACENT lines only, `cut` printing a delimiter-free line unchanged and a past-the-end field as empty, `wc -l` counting NEWLINES (`'a\nb'` is 1), `wc -c` bytes.  `wc -w` is the six POSIX isspace bytes — with the MEASURED DIVERGENCE recorded in the theory: this box's `wc` is uutils 0.10.0, which splits at a UTF-8 NBSP (measured 2) where the documented model and GNU give 1. |
+| `FsSemantics/` (`ShIR_FsSemantics`) | `FsSemantics#same_file`, `#newer_than`, `#modified_since_read` | one abstract `stat(2)` state (`dev`, `ino`, `mtime`, `atime`) and the three predicates the nodes model: `-ef` is symmetric over present paths and FALSE for two missing ones; `-nt`/`-ot` are never both true, both false when both are missing, and compare FULL timestamps (a one-unit-newer file is `-nt`; equal timestamps are not); `-N` takes mtime and atime from ONE stat and is false on a missing path.  Pins are executable states, so the documented missing-operand rules are checked, not asserted. |
+| `FsCommands/` (`ShIR_FsCommands`) | `FsCommands#command_sound` (`fs_command.node`) | `snd (run c s ps) = 0 ↔ list_all (\<lambda>e. snd e = 0) (steps c s ps)` — a command exits 0 exactly when every operand's step did, so one failing operand fails the command even though the others took effect.  The per-command rules are pinned against the measured answers: `rm -f` on a missing path (0, no change), `rm` without `-f` (1), `mkdir` on an existing target (1), `mkdir` with a missing parent (1), `mkdir -p` creating every ancestor (0), `touch` creating and idempotent.  A state is a path LIST (insertion-ordered, duplicate-free), because `Set` has no code equations and a set-valued `by eval` pin would be an obligation nobody could discharge. |
+
 Nothing here models shell state, streams or command execution. `wc` is a
 function on the byte string it is handed, which is the level at which the
 node contract — "this node means this value, in every renderer" — lives.
