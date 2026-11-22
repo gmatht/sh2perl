@@ -8444,3 +8444,79 @@ cd sh2perl && RUSTUP_HOME=$HOME/.rustup CARGO_HOME=$HOME/.cargo \
 cd .. && python3 harness/mut-fs-lift.py       # 24/24 red
 bash harness/anchor-fs-lift.sh                # pass=19 fail=0
 ```
+
+## `text_filter_lift.rs` — the static text pipeline (30)
+
+`transforms/text_filter_lift.rs`. A pipeline whose stages are all statically
+known — a literal producer (`echo`, `printf`, `seq`, `cat PATH`) followed by
+`wc`, `head`, `tail`, `uniq` or `cut -d/-f` — becomes one `TextFilter` node.
+The model proves the acceptance decision and the emitted op list; the node's
+byte output is its pre-existing A1 contract, measured by the anchor.
+
+- **The shape**: every stage is exactly one `builtin`/`exec` call whose argv
+  is all literal `Str` words (`stage_ok`). A dynamic word and a two-statement
+  stage are refused by their own pins, and `the_second_stage_is_a_filter`
+  plus `a_one_stage_pipeline_is_refused` pin the pipeline arity.
+- **Producers**: `echo` scans the leading `-e/-n/-E` run only until the first
+  non-flag word (a later `-n` is a WORD), records the suppressed newline, and
+  under `-e` requires every escape to be one of `\n \t \r \\` (a lone
+  trailing backslash refuses). `printf` takes one format with no `%`.
+  `seq A B` needs positive integers with `B >= A`, and `head 3` / `head 13`
+  are the OPERAND form, not counts. `cat PATH` needs one non-empty,
+  non-dash, `;`-free path. Each rule has its refusal pin.
+- **Filters**: `wc -l|-w|-c` with no operand; `head/tail -N` or `-n N` with a
+  positive count and no `+`; bare `uniq`; `cut -d D -f LIST` in either flag
+  order, with a one-character non-`;` delimiter and a comma list of positive
+  fields (no empty, leading, trailing or zero field; no range).
+- **One op per stage, in order**: `filters_of_len` states the emitted list has
+  exactly as many entries as there are filter stages; the concrete pins show
+  the exact op for `echo hi | wc -l`, `seq 1 10 | head -3`,
+  `echo a:b | cut -d: -f2` and `cat f | uniq`.
+- **The `;` encoding is unambiguous**: the node joins its ops with `;`, so a
+  carried path or delimiter containing `;` refuses, as does a zero field.
+
+Out of model (stated): the renderer's A1 (producer bytes — `echo`'s join,
+newline and four decodes, `printf`'s format, `seq`'s range — the filter
+outputs and `cat`'s read-error text), the `format!` spelling of the op
+string, `parse::<i64>` overflow (a digit string is its mathematical value),
+and the statement walk (`finish` models the stage list each pipeline
+occurrence hands it).
+
+### Mutants
+
+`harness/mut-text-filter-lift.py` — 28 independent edits inside the named
+definitions: the stage flags, the echo prefix scan and its stop-at-a-word
+rule, the flag probe, the escape table and its lone-backslash case, the `-e`
+gate, `printf`'s `%`/arity/escape checks, `seq`'s order and positivity, the
+`cat` path's `;`, dash and emptiness rules, the cut delimiter length and `;`
+guard, the field list (zero, empty, skipped), the `-N`/`-n` count parse, the
+`wc` flag match, `uniq`'s arity, the op accumulation and the pipeline arity.
+Measured: **28/28 RED**, each naming an obligation (`pin_*`,
+`a_*_is_refused`, `the_second_stage_is_a_filter`, `filters_of_len`), none an
+`E0xxx`.
+
+### Anchor
+
+`harness/anchor-text-filter-lift.sh` — **24/24 shapes** (9 accepted, 15
+refused). The controlled pair is `text-ops` (baseline) vs
+`text-ops,text-filter-lift` (test): accepted is measured as a CHANGED
+emission and refused as byte-identity, with the expected class asserted per
+shape. Each lifted program is compiled and run against bash in a fresh
+fixture, comparing stdout and exit status. Accepted: `echo|wc`,
+`seq 1 10|head -3`, `echo a:b|cut -d: -f2`, the reversed cut flag order,
+`cat f|uniq`, `echo -n hi|wc -c`, `printf 'a\nb\n'|wc -l`, `seq 3|tail -1`,
+`echo a b c|wc -w`. Refused: `awk`, multi-file `head`, `tail -f`,
+`tail -n +2`, `head -c`, `cut -c`, a field range, a two-character
+delimiter, `wc -L`, the `wc` operand form, `uniq -c`, `tee`, `cat` with no
+operand, a one-stage pipeline and a dynamic word. Go and Zig were not
+executed (`go=none zig=none`).
+
+### Running it
+
+```sh
+cd sh2perl && RUSTUP_HOME=$HOME/.rustup CARGO_HOME=$HOME/.cargo \
+  ~/verus-0.2026.10.18.7d82994/verus --triggers-mode silent --rlimit 60 \
+  proofs/verus/text_filter_lift.rs           # 30 verified, 0 errors
+cd .. && python3 harness/mut-text-filter-lift.py  # 28/28 red
+bash harness/anchor-text-filter-lift.sh           # pass=24 fail=0
+```
