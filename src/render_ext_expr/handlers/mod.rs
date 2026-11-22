@@ -15,6 +15,7 @@
     pub(crate) mod fs_modified_since_read;
     pub(crate) mod fs_newer_than;
     pub(crate) mod fs_same_file;
+    pub(crate) mod newline_strip;
     pub(crate) mod path_name;
     pub(crate) mod reg_count;
     pub(crate) mod reg_sub;

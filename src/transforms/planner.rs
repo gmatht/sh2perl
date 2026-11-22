@@ -250,6 +250,12 @@ pub fn node_manifest(target: &str) -> &'static [&'static str] {
         //    the command. (The regex the RENDERER does use comes from the
         //    `regex` crate in the emitted Cargo project — that is not `std`,
         //    so it does not license these nodes here.)
+        //  * ReadLine — `read VAR` as a VALUE node. NOT declared on purpose:
+        //    the `read` builtin carries an exit status (1 at EOF) that the
+        //    node's denotation does not, so routing the builtin through the
+        //    node would drop `$?`; the renderer reads the line natively
+        //    inline for both the single-target and the `while read` shapes
+        //    instead, with the status kept where bash puts it.
         //  * CutAt — not a manifest node on any backend, and MEASURED to
         //    stay that way on rust: adding it here re-routes
         //    `058_advanced_bash_idioms.rs`'s two echoes from `println!` to
@@ -317,6 +323,13 @@ pub fn node_manifest(target: &str) -> &'static [&'static str] {
                 // before the node is built, so `from`/`to` are the map and
                 // `chars().map(...)` is exact (delete and squeeze included).
                 "CharTranslate",
+                // `$(cmd)`'s trailing-newline strip: `trim_end_matches('\n')`
+                // over the node's text, which is the node's whole denotation
+                // (`TextOps#newline_strip_sound`). text_ops builds it only in
+                // the `x=$(find …)` accumulator, whose `WalkDir` statement is
+                // not offered here — so declaring it costs the corpus nothing
+                // today and keeps the renderer honest if that producer widens.
+                "NewlineStrip",
                 // The by-line filters: a stable `sort_by` over the lines
                 // (numeric or lexical key, reverse, `-u`) and a run walk for
                 // `uniq` (`-s` projection, `-c`'s width-7 prefix).

@@ -5706,8 +5706,7 @@ impl Render {
             IrExpr::Call { func, args } if func == "listVar" => self.listvar_joined(args),
             IrExpr::Call { func, args } if func == "split" => {
                 let s = args.first().map(|a| self.expr_str(a)).unwrap_or_else(|| "String::new()".to_string());
-                self.add_helper("split_ifs");
-                format!("__sh_split_ifs(&{s}, \" \\t\\n\").join(\" \")")
+                format!("({}).join(\" \")", Self::split_ifs_inline(&s))
             }
             IrExpr::Call { func, args } if func == "brace" => {
                 let w = self.brace_words(args);
@@ -5768,6 +5767,12 @@ impl Render {
                 Some(format!(
                     "{{ {body} __SH_RC.load(Ordering::Relaxed).to_string() }}"
                 ))
+            }
+            // `$(cmd)` strips EVERY trailing newline (POSIX), which is the
+            // node's whole denotation (`TextOps#newline_strip_sound`).
+            "NewlineStrip" => {
+                let x = n.as_any().downcast_ref::<crate::shir_nodes::NewlineStrip>()?;
+                Some(format!("{}.trim_end_matches('\\n').to_string()", self.expr_str(&x.text)))
             }
             "StringTrim" => {
                 let x = n.as_any().downcast_ref::<crate::shir_nodes::StringTrim>()?;
@@ -7357,15 +7362,15 @@ while __sh_path.len() > 1 && __sh_path.ends_with('/') {{ __sh_path = &__sh_path[
                 if !var.is_empty() {
                     self.mark_written(&var);
                     self.arrays.insert(var.clone());
-                    self.add_helper("readline");
+                    let rl = Self::read_line_inline();
                     let m = self.tls(&var);
                     if strip_nl {
                         self.emit(&format!(
-                            "{{ let mut __lines: Vec<String> = Vec::new(); loop {{ let (__sh_line, __sh_gotline) = __sh_readline(); if !__sh_gotline {{ break; }} __lines.push(__sh_line); }} {m}.with(|v| *v.borrow_mut() = __lines); }}"
+                            "{{ let mut __lines: Vec<String> = Vec::new(); loop {{ let (__sh_line, __sh_gotline) = {rl}; if !__sh_gotline {{ break; }} __lines.push(__sh_line); }} {m}.with(|v| *v.borrow_mut() = __lines); }}"
                         ));
                     } else {
                         self.emit(&format!(
-                            "{{ let mut __lines: Vec<String> = Vec::new(); loop {{ let (__sh_line, __sh_gotline) = __sh_readline(); if !__sh_gotline {{ break; }} __lines.push(format!(\"{{}}\\n\", __sh_line)); }} {m}.with(|v| *v.borrow_mut() = __lines); }}"
+                            "{{ let mut __lines: Vec<String> = Vec::new(); loop {{ let (__sh_line, __sh_gotline) = {rl}; if !__sh_gotline {{ break; }} __lines.push(format!(\"{{}}\\n\", __sh_line)); }} {m}.with(|v| *v.borrow_mut() = __lines); }}"
                         ));
                     }
                 }
@@ -8643,13 +8648,21 @@ while __sh_path.len() > 1 && __sh_path.ends_with('/') {{ __sh_path = &__sh_path[
         let n = targets.len();
         let ifs_lit = ifs.unwrap_or(" \t\n");
         let mut lines = Vec::new();
-        self.add_helper("readline");
-        self.add_helper("read_fields");
-        lines.push("let (__sh_line, __sh_gotline) = __sh_readline();".to_string());
         lines.push(format!(
-            "let __sh_field = __sh_read_fields(&__sh_line, {}, {n});",
-            Self::rust_str(ifs_lit)
+            "let (__sh_line, __sh_gotline) = {};",
+            Self::read_line_inline()
         ));
+        if n == 1 {
+            // ONE target: the whole line is the field (the helper's own
+            // `n <= 1` rule), so no field splitter is emitted at all.
+            lines.push("let __sh_field: Vec<String> = vec![__sh_line.clone()];".to_string());
+        } else {
+            self.add_helper("read_fields");
+            lines.push(format!(
+                "let __sh_field = __sh_read_fields(&__sh_line, {}, {n});",
+                Self::rust_str(ifs_lit)
+            ));
+        }
         for (idx, t) in targets.iter().enumerate() {
             if let Some(name) = str_arg(&[(*t).clone()], 0) {
                 if name.starts_with('-') || name.is_empty() {
@@ -9173,8 +9186,7 @@ while __sh_path.len() > 1 && __sh_path.ends_with('/') {{ __sh_path = &__sh_path[
             IrExpr::Call { func, args } => self.call_words(func, args),
             IrExpr::Capture { .. } => {
                 let c = self.capture_expr_single(e);
-                self.add_helper("split_ifs");
-                format!("__sh_split_ifs(&{c}, \" \\t\\n\")")
+                Self::split_ifs_inline(&c)
             }
             IrExpr::Array(items) => {
                 // a word LIST (`echo {1..5}` — the brace call wrapped in
@@ -9236,14 +9248,12 @@ while __sh_path.len() > 1 && __sh_path.ends_with('/') {{ __sh_path = &__sh_path[
             }
             "split" => {
                 let s = args.first().map(|a| self.expr_str(a)).unwrap_or_default();
-                self.add_helper("split_ifs");
-                format!("__sh_split_ifs(&{s}, \" \\t\\n\")")
+                Self::split_ifs_inline(&s)
             }
             "brace" => self.brace_words(args),
             "capture" => {
                 let c = self.capture_expr(args);
-                self.add_helper("split_ifs");
-                format!("__sh_split_ifs(&{c}, \" \\t\\n\")")
+                Self::split_ifs_inline(&c)
             }
             "join" => format!("vec![{}]", self.join_str(args)),
             "arrayIndex" => format!("vec![{}]", self.array_index_str(args)),
@@ -9983,8 +9993,29 @@ while __sh_path.len() > 1 && __sh_path.ends_with('/') {{ __sh_path = &__sh_path[
     /// captureWords(Arrow) — the captured output split into words.
     fn capture_words_expr(&mut self, args: &[IrExpr]) -> String {
         let c = self.capture_expr(args);
-        self.add_helper("split_ifs");
-        format!("__sh_split_ifs(&{c}, \" \\t\\n\")")
+        Self::split_ifs_inline(&c)
+    }
+
+    /// Unquoted word splitting on the DEFAULT IFS — the `Split` node's Rust
+    /// value, spelled inline so the emitted program carries no
+    /// `__sh_split_ifs`. Every call site passes bash's default `" \t\n"`,
+    /// for which the helper's rule is exactly `split` at the class with the
+    /// empty runs dropped (that is also what trims the leading and trailing
+    /// separators).
+    fn split_ifs_inline(s: &str) -> String {
+        format!(
+            "{{ let __sh_split_s: String = {}; __sh_split_s.split(|__sh_ch: char| __sh_ch == ' ' || __sh_ch == '\\t' || __sh_ch == '\\n').filter(|__sh_w| !__sh_w.is_empty()).map(|__sh_w| __sh_w.to_string()).collect::<Vec<String>>() }}",
+            s
+        )
+    }
+
+    /// ONE line from stdin (`ReadLine`, and the `read` builtin that renders
+    /// through it) as an expression returning `(line, saw_something)`: the
+    /// helper's body verbatim, so the emitted program carries no
+    /// `__sh_readline`. `__SH_STDIN` is the slot a pipeline stage fills.
+    fn read_line_inline() -> String {
+        "{ let mut __sh_buf: Vec<u8> = Vec::new(); let mut __sh_one = [0u8; 1]; let mut __sh_any = false; let mut __sh_src: Box<dyn std::io::Read + Send> = match __SH_STDIN.lock().unwrap().take() { Some(__sh_r) => __sh_r, None => Box::new(std::io::stdin()) }; loop { match std::io::Read::read(&mut __sh_src, &mut __sh_one) { Ok(0) => break, Ok(_) => { __sh_any = true; if __sh_one[0] == b'\\n' { break; } __sh_buf.push(__sh_one[0]); }, Err(_) => break } } *__SH_STDIN.lock().unwrap() = Some(__sh_src); (String::from_utf8_lossy(&__sh_buf).to_string(), __sh_any) }"
+            .to_string()
     }
 
     // ── test `[ ... ]` / `[[ ... ]]` ─────────────────────────────────
@@ -11854,14 +11885,12 @@ while __sh_path.len() > 1 && __sh_path.ends_with('/') {{ __sh_path = &__sh_path[
             .map(|w| match w {
                 IrExpr::Call { func, args } if func == "split" => {
                     let s = args.first().map(|a| self.expr_str(a)).unwrap_or_default();
-                    self.add_helper("split_ifs");
-                    format!("__sh_split_ifs(&{s}, \" \\t\\n\")")
+                    Self::split_ifs_inline(&s)
                 }
                 IrExpr::Call { func, args } if func == "capture" => {
                     // an unquoted capture also field-splits
                     let c = self.capture_expr(args);
-                    self.add_helper("split_ifs");
-                    format!("__sh_split_ifs(&{c}, \" \\t\\n\")")
+                    Self::split_ifs_inline(&c)
                 }
                 // a bare-`&str` word (native loop binding, borrowable
                 // local) must be owned for the `Vec<String>` element
@@ -12309,8 +12338,7 @@ while __sh_path.len() > 1 && __sh_path.ends_with('/') {{ __sh_path = &__sh_path[
             "listVar" => self.listvar_joined(args),
             "split" => {
                 let s = args.first().map(|a| self.expr_str(a)).unwrap_or_default();
-                self.add_helper("split_ifs");
-                format!("__sh_split_ifs(&{s}, \" \\t\\n\").join(\" \")")
+                format!("({}).join(\" \")", Self::split_ifs_inline(&s))
             }
             "brace" => {
                 let w = self.brace_words(args);
@@ -26325,7 +26353,7 @@ mod tests {
             "StringContains", "StrLen", "CaseTransform", "FieldExtract", "WordCount",
             "RegCount", "TakeLines", "StringTrim", "SubStrExtract", "RepeatStr", "Split",
             "ArrayLen", "PathName", "CutsetTrim", "StringAffix", "CharTranslate",
-            "SortLines", "UniqLines", "AffixStrip",
+            "SortLines", "UniqLines", "AffixStrip", "NewlineStrip",
             // fs-lift (class 5/6): the file predicates whose `std` reading is
             // exact; every one is pinned by a compile-and-run case above.
             "FsSameFile", "FsNewerThan", "FsModifiedSinceRead",
@@ -26357,7 +26385,7 @@ mod tests {
         const NOT_OFFERED: &[&str] = &[
             "AddressOf", "CgoCall", "CharExtract", "CloneDeep", "CutAt", "Deref",
             "ElementRead", "FieldGrab", "FieldRead", "FieldStrip", "FieldStripEnd",
-            "MapLiteral", "NewlineStrip", "ReadLine", "Spread", "StrSplice",
+            "MapLiteral", "ReadLine", "Spread", "StrSplice",
             "Substitute", "TypeAssert",
         ];
 
@@ -26674,6 +26702,15 @@ mod tests {
             "UniqLines".to_string(),
             uniq("a\na\nb", 0, false),
             "printf 'a\\na\\nb\\n' | uniq\n",
+        ));
+        // `$(cmd)` drops EVERY trailing newline (POSIX), so the node is
+        // `trim_end_matches('\n')` and nothing else.
+        cases.push((
+            "NewlineStrip".to_string(),
+            shir_to_rust(&print_program(IrExpr::Ext(Box::new(
+                crate::shir_nodes::NewlineStrip { text: s("a\n\n\n") },
+            )))),
+            "printf '%s\\n' \"$(printf 'a\\n\\n\\n')\"\n",
         ));
         cases.push((
             "UniqLinesCount".to_string(),
@@ -27745,7 +27782,11 @@ mod tests {
         // genuine multi-element Vec — the join helper is needed
         let out = render("echo $x\n");
         assert!(out.contains("__sh_print_words("), "{out}");
-        assert!(out.contains("__sh_split_ifs("), "{out}");
+        // the split is spelled inline (`Split`'s Rust value), not by a helper
+        assert!(
+            out.contains("split(|__sh_ch: char|") && !out.contains("__sh_split_ifs("),
+            "{out}"
+        );
     }
 
     #[test]
