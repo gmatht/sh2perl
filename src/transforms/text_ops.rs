@@ -3898,6 +3898,16 @@ fn collect_scalar_writes_expr(e: &IrExpr, out: &mut Vec<String>) -> bool {
             if func == "setVar" || func == "setArray" || func == "setArrayAppend" {
                 return false; // dynamic/array stores — not snapshotted
             }
+            // `assign(name, op, val)` writes `name`: snapshot it so a
+            // subshell whose body is `x=2` (rendered as `assign`) gets the
+            // copy semantics below. Without this, written stayed empty and
+            // the subshell was lifted to a Block with NO save/restore —
+            // `x=1; (x=2); echo $x` leaked 2 instead of 1.
+            if func == "assign" {
+                if let Some(IrExpr::Str(name, _)) = args.first() {
+                    out.push(name.clone());
+                }
+            }
             args.iter().all(|a| collect_scalar_writes_expr(a, out))
         }
         IrExpr::Var(_, _) | IrExpr::Str(_, _) | IrExpr::Int(_) | IrExpr::Bool(_) => true,

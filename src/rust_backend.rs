@@ -15459,12 +15459,31 @@ while __sh_path.len() > 1 && __sh_path.ends_with('/') {{ __sh_path = &__sh_path[
     fn subshell_render(&mut self, body: &[IrStmt]) {
         let mut written: BTreeSet<String> = BTreeSet::new();
         collect_written(body, &mut written);
-        written.retain(|v| self.declared(v));
+        // bash's rule: a subshell is a COPY of the variable state. Every
+        // name the body writes is put back the way it was when the child
+        // ends -- including a pass-2 local, whose storage is a plain `let`
+        // in the enclosing scope rather than a `__SHV_` cell (before this,
+        // `x=1; (x=2); echo $x` printed 2: the local had no cell to save
+        // and the child's write landed in the parent's binding).
+        written.retain(|v| self.declared(v) || self.is_local(v));
         let mut pre = Vec::new();
         let mut post = Vec::new();
         for v in &written {
-            let m = self.tls(v);
             let sv = self.gensym("__sh_sv");
+            if self.is_local(v) {
+                if self.borrowable_vars.contains(v) {
+                    continue;
+                }
+                let ident = self.var_ident(v);
+                if self.is_num(v) {
+                    pre.push(format!("let {sv} = {ident};"));
+                } else {
+                    pre.push(format!("let {sv} = {ident}.clone();"));
+                }
+                post.push(format!("{ident} = {sv};"));
+                continue;
+            }
+            let m = self.tls(v);
             if self.is_num(v) {
                 pre.push(format!("let {sv} = {m}.with(|v| v.get());"));
                 post.push(format!("{m}.with(|v| v.set({sv}));"));
