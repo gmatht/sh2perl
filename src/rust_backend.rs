@@ -23560,6 +23560,19 @@ mod tests {
             "echo -n grew a newline:\n{quiet}"
         );
 
+        // a zero-word `echo` is just its newline (and nothing under `-n`)
+        let bare = render("echo\necho -n\n");
+        assert!(bare.contains("println!();"), "bare echo lost its newline:\n{bare}");
+
+        // `-e` keeps the helper: the escape decoder (and `\c`'s truncation)
+        // is a runtime function, not plumbing
+        let esc = render("a=one\necho -e \"v$a\\tw\"\n");
+        assert!(
+            esc.contains("__sh_print_words(…, true)") || esc.contains("__sh_print_words(&["),
+            "echo -e lost its decoder route:\n{esc}"
+        );
+        assert!(esc.contains("__sh_echo_esc"), "echo -e has no decoder:\n{esc}");
+
         // Inside `$(…)` the capture buffer IS the sink: a direct print would
         // leak to the terminal and store nothing.
         let cap = render("a=one\nx=$(echo \"v$a\" \"w$b\")\nprintf \"%s\\n\" \"$x\"\n");
