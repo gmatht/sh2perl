@@ -8675,16 +8675,15 @@ while __sh_path.len() > 1 && __sh_path.ends_with('/') {{ __sh_path = &__sh_path[
                  if __sh_n <= 1 || __sh_ifs.is_empty() {{ vec![__sh_l.to_string()] }} else {{ \
                  let __sh_ws = __sh_ifs.chars().all(|c| c == ' ' || c == '\\t' || c == '\\n'); \
                  let __sh_ch: Vec<char> = __sh_l.chars().collect(); \
-                 let __sh_sep = |c: char| __sh_ifs.contains(c); \
                  let mut __sh_f: Vec<String> = Vec::new(); let mut __sh_i = 0usize; \
-                 while __sh_i < __sh_ch.len() && __sh_sep(__sh_ch[__sh_i]) {{ __sh_i += 1; }} \
+                 while __sh_i < __sh_ch.len() && __sh_ifs.contains(__sh_ch[__sh_i]) {{ __sh_i += 1; }} \
                  while __sh_f.len() < __sh_n - 1 && __sh_i < __sh_ch.len() {{ \
                  let __sh_s = __sh_i; \
-                 while __sh_i < __sh_ch.len() && !__sh_sep(__sh_ch[__sh_i]) {{ __sh_i += 1; }} \
+                 while __sh_i < __sh_ch.len() && !__sh_ifs.contains(__sh_ch[__sh_i]) {{ __sh_i += 1; }} \
                  __sh_f.push(__sh_ch[__sh_s..__sh_i].iter().collect()); \
                  if __sh_i >= __sh_ch.len() {{ break; }} \
                  __sh_i += 1; \
-                 if __sh_ws {{ while __sh_i < __sh_ch.len() && __sh_sep(__sh_ch[__sh_i]) {{ __sh_i += 1; }} }} }} \
+                 if __sh_ws {{ while __sh_i < __sh_ch.len() && __sh_ifs.contains(__sh_ch[__sh_i]) {{ __sh_i += 1; }} }} }} \
                  __sh_f.push(__sh_ch[__sh_i.min(__sh_ch.len())..].iter().collect()); \
                  __sh_f }} }};",
                 ifs = Self::rust_str(ifs_lit),
