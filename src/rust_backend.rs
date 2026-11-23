@@ -25160,6 +25160,147 @@ mod tests {
         out
     }
 
+    // ── class 8: the structural idioms ─────────────────────────────────
+
+    /// (b) `__SH_RC`: the register is bash's status of the last command,
+    /// read only where the program asks (`$?`, `set -e`, traps,
+    /// `&&`/`||`, a pipeline join). Its store is dead only while no read
+    /// exists, so the pass that drops those stores must stop at the first
+    /// load. The three shapes below are the pass's whole contract.
+    #[test]
+    fn dead_status_stores_are_dropped_only_where_no_load_can_read_them() {
+        let none = "fn main() {\n    __SH_RC.store(1, Ordering::Relaxed);\n    println!(\"a\");\n    __SH_RC.store(0, Ordering::Relaxed);\n}\n";
+        let out = super::drop_dead_rc_stores(none.to_string());
+        assert!(!out.contains("__SH_RC.store"), "{out}");
+        assert!(out.contains("println!(\"a\");"), "the body survives: {out}");
+        // the exit read is the one load a status still has to reach: the
+        // last store before it must stay
+        let exit = "fn main() {\n    __SH_RC.store(3, Ordering::Relaxed);\n    println!(\"a\");\n    __SH_RC.store(7, Ordering::Relaxed);\n    return std::process::ExitCode::from(__SH_RC.load(Ordering::Relaxed) as u8);\n}\n";
+        let out = super::drop_dead_rc_stores(exit.to_string());
+        assert!(!out.contains("__SH_RC.store(3"), "{out}");
+        assert!(out.contains("__SH_RC.store(7"), "{out}");
+        // any second load may read any earlier store: nothing is dead
+        let read = "fn main() {\n    __SH_RC.store(1, Ordering::Relaxed);\n    if __SH_RC.load(Ordering::Relaxed) != 0 { __SH_RC.store(2, Ordering::Relaxed); }\n    if __SH_RC.load(Ordering::Relaxed) == 2 { __SH_RC.store(0, Ordering::Relaxed); }\n    __SH_RC.store(0, Ordering::Relaxed);\n}\n";
+        let out = super::drop_dead_rc_stores(read.to_string());
+        assert_eq!(out.matches("__SH_RC.store").count(), 4, "{out}");
+    }
+
+    /// (b) end to end: `$?` after a failure and after a function `return`
+    /// is the same status bash prints, and the register is still there.
+    #[test]
+    fn a_program_that_reads_status_keeps_the_register_and_matches_bash() {
+        let src = "false || true\nif true; then false; fi\necho \"rc=$?\"\nf() { return 3; }\nf\necho \"fn=$?\"\n";
+        let rs = render_rs(src);
+        assert!(rs.contains("__SH_RC.load"), "a read must survive: {rs}");
+        let bash = run_bash_full(src);
+        let rust = compile_and_run_full("rc-read", &rs);
+        assert_eq!(bash, rust);
+        assert_eq!(String::from_utf8_lossy(&rust.0), "rc=1\nfn=3\n");
+    }
+
+    /// (b) the other side: a program that never asks for a status emits no
+    /// store at all (nothing can observe one).
+    #[test]
+    fn a_program_that_never_reads_status_emits_no_status_stores() {
+        let src = "echo hello\nx=1\necho \"$x\"\n";
+        let rs = render_rs(src);
+        assert!(!rs.contains("__SH_RC.store"), "{rs}");
+        let bash = run_bash_full(src);
+        let rust = compile_and_run_full("rc-dead", &rs);
+        assert_eq!(bash, rust);
+    }
+
+    /// (a) the per-variable `__SHV_*` store is bash's GLOBAL variable cell,
+    /// not a convenience: a function assignment is visible to its caller
+    /// (bash has no `local` here), so a plain `let` inside the callee would
+    /// print `1`.
+    #[test]
+    fn a_function_assignment_is_a_global_write() {
+        let src = "x=1\nf() { x=2; }\nf\necho \"$x\"\n";
+        let rs = render_rs(src);
+        assert!(rs.contains("__SHV_") || rs.contains("let mut x"), "{rs}");
+        let bash = run_bash_full(src);
+        let rust = compile_and_run_full("fn-global", &rs);
+        assert_eq!(bash, rust);
+        assert_eq!(String::from_utf8_lossy(&rust.0), "2\n");
+    }
+
+    /// (a) ... and its counterpart rule: a SUBSHELL assignment is a copy.
+    /// The parent keeps its value, so the child's write must not land in
+    /// the parent's cell.
+    ///
+    /// KNOWN DIVERGENCE (pre-existing, not caused by the store model):
+    /// `x=1; (x=2); echo $x` renders the child inline as `{ x = 2; x }`
+    /// with no save/restore, so the render prints 2 where bash prints 1.
+    /// The store is a single cell either way, so localising or keeping it
+    /// changes nothing here; the fix belongs to the subshell lowering.
+    /// Ignored rather than deleted: it is the witness for that fix.
+    #[test]
+    #[ignore = "known divergence: a bare subshell statement does not copy its writes back"]
+    fn a_subshell_assignment_does_not_reach_the_parent() {
+        let src = "x=1\n(x=2)\necho \"$x\"\n";
+        let rs = render_rs(src);
+        let bash = run_bash_full(src);
+        let rust = compile_and_run_full("subshell-copy", &rs);
+        assert_eq!(bash, rust);
+        assert_eq!(String::from_utf8_lossy(&rust.0), "1\n");
+    }
+
+    /// (a) the same isolation for a command substitution, whose value is
+    /// the child's stdout and whose assignment is the parent's.
+    #[test]
+    fn a_command_substitution_assignment_is_isolated() {
+        let src = "x=1\ny=$(x=9; echo $x)\necho \"$x $y\"\n";
+        let rs = render_rs(src);
+        let bash = run_bash_full(src);
+        let rust = compile_and_run_full("capture-copy", &rs);
+        assert_eq!(bash, rust);
+        assert_eq!(String::from_utf8_lossy(&rust.0), "1 9\n");
+    }
+
+    /// (a) `local` is the scoped cell: it must not survive its function, so
+    /// the parent still reads the variable as unset (`${v-unset}`).
+    ///
+    /// KNOWN DIVERGENCE (pre-existing): `local v=5` writes the variable's
+    /// one cell and never restores the previous value, so the parent sees
+    /// 5. bash's rule is a binding stack for the dynamic extent of the
+    /// function (restore at every return). The idiom question is neutral:
+    /// a local cell and a global cell both need the restore. Ignored as
+    /// the witness for the `local` lowering.
+    #[test]
+    #[ignore = "known divergence: `local` does not restore the caller's value"]
+    fn a_local_does_not_escape_its_function() {
+        let src = "f() { local v=5; echo \"in=$v\"; }\nf\necho \"out=${v-unset}\"\n";
+        let rs = render_rs(src);
+        let bash = run_bash_full(src);
+        let rust = compile_and_run_full("local-scope", &rs);
+        assert_eq!(bash, rust);
+        assert_eq!(String::from_utf8_lossy(&rust.0), "in=5\nout=unset\n");
+    }
+
+    /// (d) golfed identifiers (`__v`, `__t`, `__sh_i1`, `__sh_arith_v0`)
+    /// belong to `-Oz`; a default render keeps names a reader can follow.
+    #[test]
+    fn default_renders_carry_no_golfed_identifiers() {
+        let src = "for i in 1 2 3; do echo $((i+1)); done\nx=5\nif [ \"$x\" -gt 2 ]; then echo big; fi\ny=$((x * 2 + 1))\necho \"$y\"\n";
+        let rs = render_rs(src);
+        for bad in ["__sh_i1", "__sh_arith_v0", "__v", "__t"] {
+            let mut from = 0;
+            while let Some(p) = rs[from..].find(bad) {
+                let at = from + p;
+                let before = rs[..at].chars().last();
+                let after = rs[at + bad.len()..].chars().next();
+                let word = |c: Option<char>| c.map(|c| c.is_ascii_alphanumeric() || c == '_').unwrap_or(false);
+                assert!(!(!word(before) && !word(after)), "`{bad}` in a default render:\n{rs}");
+                from = at + bad.len();
+            }
+        }
+        let bash = run_bash_full(src);
+        let rust = compile_and_run_full("no-golf", &rs);
+        assert_eq!(bash, rust);
+    }
+
+
     /// Print `value` — one statement, so an arm's SPELLING can be asserted
     /// without depending on which lowering happened to produce the node.
     fn print_program(value: IrExpr) -> IrProgram {
