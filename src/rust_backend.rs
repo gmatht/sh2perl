@@ -25745,7 +25745,6 @@ mod tests {
     /// a local cell and a global cell both need the restore. Ignored as
     /// the witness for the `local` lowering.
     #[test]
-    #[ignore = "known divergence: `local` does not restore the caller's value"]
     fn a_local_does_not_escape_its_function() {
         let src = "f() { local v=5; echo \"in=$v\"; }\nf\necho \"out=${v-unset}\"\n";
         let rs = render_rs(src);
