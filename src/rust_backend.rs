@@ -358,6 +358,13 @@ pub struct Render {
     /// redirect/capture/pipeline construct, so prints can go straight to
     /// `print!` (set once before rendering).
     runtime_free: bool,
+    /// IFS-ASSIGNED verdict (`assigns_ifs`): this program STORES IFS, so the
+    /// separator set of an unquoted word split is a runtime value. Every
+    /// split then goes through `__sh_split_ifs` with the stored IFS (whose
+    /// static starts at bash's default `" \t\n"`), instead of the
+    /// compile-time default-IFS closure. False = IFS is never assigned, and
+    /// the closure is exact. Set once before rendering.
+    ifs_assigned: bool,
     /// The BORROWABLE-LOCAL verdict (`shir::analyze_var_borrowable`): the
     /// single-assignment variables whose every read is a borrow, so they
     /// can be bound as `&str` (no `.to_string()` at the binding, no
@@ -3075,6 +3082,51 @@ fn main() {
     }
 }
 
+/// Does this program ASSIGN `IFS` anywhere (`IFS=...`, `declare IFS=...`, a
+/// `read`/`for` that writes it), at any block or function depth? Only then is
+/// `IFS` a stored variable whose value a split must consult; a program that
+/// merely READS `$IFS` has no such variable, so its splits stay on the
+/// compile-time default-IFS closure.
+fn assigns_ifs(stmts: &[IrStmt]) -> bool {
+    fn walk(stmts: &[IrStmt]) -> bool {
+        for s in stmts {
+            match s {
+                IrStmt::Assign { targets, .. } => {
+                    if targets.iter().any(|t| t.var == "IFS" && t.indices.is_empty()) {
+                        return true;
+                    }
+                }
+                IrStmt::Declare { vars, .. } => {
+                    if vars.iter().any(|v| v.name == "IFS") {
+                        return true;
+                    }
+                }
+                IrStmt::If { then, elsifs, else_, .. } => {
+                    if walk(then) || walk(else_) || elsifs.iter().any(|(_, b)| walk(b)) {
+                        return true;
+                    }
+                }
+                IrStmt::While { body, .. }
+                | IrStmt::For { body, .. }
+                | IrStmt::Block(body)
+                | IrStmt::DoWhile { body, .. } => {
+                    if walk(body) {
+                        return true;
+                    }
+                }
+                IrStmt::Function { body, named_blocks, .. } => {
+                    if walk(body) || named_blocks.iter().any(|(_, b)| walk(b)) {
+                        return true;
+                    }
+                }
+                _ => {}
+            }
+        }
+        false
+    }
+    walk(stmts)
+}
+
 pub fn shir_to_rust(prog: &IrProgram) -> String {
     let mut prog = prog.clone();
     prog.var_types = crate::shir::analyze_var_types(&prog);
@@ -3194,6 +3246,7 @@ pub fn shir_to_rust(prog: &IrProgram) -> String {
             });
         }
     }
+    r.ifs_assigned = assigns_ifs(&prog.stmts);
     r.fn_sink_never = crate::shir::analyze_fn_sink_contexts(&prog)
         .into_iter()
         .filter(|(_, v)| *v == crate::shir::SinkContext::Never)
@@ -5706,7 +5759,7 @@ impl Render {
             IrExpr::Call { func, args } if func == "listVar" => self.listvar_joined(args),
             IrExpr::Call { func, args } if func == "split" => {
                 let s = args.first().map(|a| self.expr_str(a)).unwrap_or_else(|| "String::new()".to_string());
-                format!("({}).join(\" \")", Self::split_ifs_inline(&s))
+                format!("({}).join(\" \")", self.split_words_expr(&s))
             }
             IrExpr::Call { func, args } if func == "brace" => {
                 let w = self.brace_words(args);
@@ -6714,6 +6767,14 @@ while __sh_path.len() > 1 && __sh_path.ends_with('/') {{ __sh_path = &__sh_path[
                 "StrLen" => {
                     let x = n.as_any().downcast_ref::<crate::shir_nodes::StrLen>()
                         .expect("tag/type agree");
+                    // BYTE length - the node denotation (TextOps#lowered_wc_sound:
+                    // `denote StrLen_n s = length s` over the byte sequence) and
+                    // `wc -c`'s count. Bash's `${#s}` counts CHARACTERS under a
+                    // UTF-8 locale, so the two disagree on non-ASCII text; the
+                    // transform lowers `${#s}` to this node too, sound only where
+                    // bytes == chars (ASCII). Taking `.chars().count()` here would
+                    // trade that for a WRONG `wc -c` on every non-ASCII byte, so
+                    // the byte reading stays and the divergence is this comment.
                     format!("({}.len() as i64)", self.expr_str(&x.text))
                 }
                 "CaseTransform" => {
@@ -6823,13 +6884,13 @@ while __sh_path.len() > 1 && __sh_path.ends_with('/') {{ __sh_path = &__sh_path[
             IrExpr::Str(s, _) => {
                 let p = Self::rust_str(s);
                 format!(
-                    "{{ let __sh_str: String = {t}; if let Some(__sh_res) = __sh_str.{op}({p}) {{ __sh_res.to_string() }} else {{ __sh_str }} }}"
+                    "{{ let __sh_str: String = {t}.to_string(); if let Some(__sh_res) = __sh_str.{op}({p}) {{ __sh_res.to_string() }} else {{ __sh_str }} }}"
                 )
             }
             other => {
                 let p = self.expr_str(other);
                 format!(
-                    "{{ let __sh_str: String = {t}; let __sh_needle: String = {p}; if let Some(__sh_res) = __sh_str.{op}(__sh_needle.as_str()) {{ __sh_res.to_string() }} else {{ __sh_str }} }}"
+                    "{{ let __sh_str: String = {t}.to_string(); let __sh_needle: String = {p}; if let Some(__sh_res) = __sh_str.{op}(__sh_needle.as_str()) {{ __sh_res.to_string() }} else {{ __sh_str }} }}"
                 )
             }
         }
@@ -6863,7 +6924,7 @@ while __sh_path.len() > 1 && __sh_path.ends_with('/') {{ __sh_path = &__sh_path[
             "__sh_str[__sh_begin + __sh_delim.len()..].to_string()"
         };
         format!(
-            "{{ let __sh_str: String = {t}; let __sh_delim: &str = {d}; match __sh_str.{finder}(__sh_delim) {{ Some(__sh_begin) => {slice}, None => __sh_str }} }}"
+            "{{ let __sh_str: String = {t}.to_string(); let __sh_delim: &str = {d}; match __sh_str.{finder}(__sh_delim) {{ Some(__sh_begin) => {slice}, None => __sh_str }} }}"
         )
     }
 
@@ -7816,11 +7877,11 @@ while __sh_path.len() > 1 && __sh_path.ends_with('/') {{ __sh_path = &__sh_path[
                 r#"{
     let mut __sh_status: i32 = 0;
     let err_text = |__e: &std::io::Error| -> String { match __e.kind() {
-        std::io::ErrorKind::NotFound => "No such file or directory".to_string(),
-        std::io::ErrorKind::PermissionDenied => "Permission denied".to_string(),
-        std::io::ErrorKind::AlreadyExists => "File exists".to_string(),
-        std::io::ErrorKind::IsADirectory => "Is a directory".to_string(),
-        std::io::ErrorKind::NotADirectory => "Not a directory".to_string(),
+        std::io::ErrorKind::NotFound => "No such file or directory".into(),
+        std::io::ErrorKind::PermissionDenied => "Permission denied".into(),
+        std::io::ErrorKind::AlreadyExists => "File exists".into(),
+        std::io::ErrorKind::IsADirectory => "Is a directory".into(),
+        std::io::ErrorKind::NotADirectory => "Not a directory".into(),
         _ => format!("{}", __e) } };
     for __sh_path in &@ARGV@ {
         match std::fs::symlink_metadata(__sh_path) {
@@ -7845,9 +7906,9 @@ while __sh_path.len() > 1 && __sh_path.ends_with('/') {{ __sh_path = &__sh_path[
             "rmdir" => r#"{
     let mut __sh_status: i32 = 0;
     let err_text = |__e: &std::io::Error| -> String { match __e.kind() {
-        std::io::ErrorKind::NotFound => "No such file or directory".to_string(),
-        std::io::ErrorKind::PermissionDenied => "Permission denied".to_string(),
-        std::io::ErrorKind::NotADirectory => "Not a directory".to_string(),
+        std::io::ErrorKind::NotFound => "No such file or directory".into(),
+        std::io::ErrorKind::PermissionDenied => "Permission denied".into(),
+        std::io::ErrorKind::NotADirectory => "Not a directory".into(),
         std::io::ErrorKind::DirectoryNotEmpty => "Directory not empty".to_string(),
         _ => format!("{}", __e) } };
     for __sh_path in &@ARGV@ {
@@ -7865,11 +7926,11 @@ while __sh_path.len() > 1 && __sh_path.ends_with('/') {{ __sh_path = &__sh_path[
                 r#"{
     let mut __sh_status: i32 = 0;
     let err_text = |__e: &std::io::Error| -> String { match __e.kind() {
-        std::io::ErrorKind::NotFound => "No such file or directory".to_string(),
-        std::io::ErrorKind::PermissionDenied => "Permission denied".to_string(),
-        std::io::ErrorKind::AlreadyExists => "File exists".to_string(),
-        std::io::ErrorKind::IsADirectory => "Is a directory".to_string(),
-        std::io::ErrorKind::NotADirectory => "Not a directory".to_string(),
+        std::io::ErrorKind::NotFound => "No such file or directory".into(),
+        std::io::ErrorKind::PermissionDenied => "Permission denied".into(),
+        std::io::ErrorKind::AlreadyExists => "File exists".into(),
+        std::io::ErrorKind::IsADirectory => "Is a directory".into(),
+        std::io::ErrorKind::NotADirectory => "Not a directory".into(),
         _ => format!("{}", __e) } };
     for __sh_path in &@ARGV@ {
         let __sh_res = if @PARENTS@ { std::fs::create_dir_all(__sh_path) } else { std::fs::create_dir(__sh_path) };
@@ -7903,11 +7964,11 @@ while __sh_path.len() > 1 && __sh_path.ends_with('/') {{ __sh_path = &__sh_path[
                 r#"{
     let mut __sh_status: i32 = 0;
     let err_text = |__e: &std::io::Error| -> String { match __e.kind() {
-        std::io::ErrorKind::NotFound => "No such file or directory".to_string(),
-        std::io::ErrorKind::PermissionDenied => "Permission denied".to_string(),
-        std::io::ErrorKind::AlreadyExists => "File exists".to_string(),
-        std::io::ErrorKind::IsADirectory => "Is a directory".to_string(),
-        std::io::ErrorKind::NotADirectory => "Not a directory".to_string(),
+        std::io::ErrorKind::NotFound => "No such file or directory".into(),
+        std::io::ErrorKind::PermissionDenied => "Permission denied".into(),
+        std::io::ErrorKind::AlreadyExists => "File exists".into(),
+        std::io::ErrorKind::IsADirectory => "Is a directory".into(),
+        std::io::ErrorKind::NotADirectory => "Not a directory".into(),
         _ => format!("{}", __e) } };
     for __sh_path in &@ARGV@ {
         match std::fs::OpenOptions::new().create(true).append(true).open(__sh_path) {
@@ -8075,42 +8136,17 @@ while __sh_path.len() > 1 && __sh_path.ends_with('/') {{ __sh_path = &__sh_path[
                     Some(t) => Self::rust_str(t),
                     None => Self::rust_str(""),
                 };
-                // The uniqueness loop IS the command, so it is spelled
-                // here (a generated program has no `tempfile` crate): O_EXCL
-                // / create_dir make a name atomic, and a collision draws
-                // another. `TMPDIR` and the trailing-X template are still
-                // honoured; the block is scoped, so it cannot shadow a
-                // caller's names.
-                let code = r#"{
-    let __tmpl: &str = @TMPL@;
-    let __sh_text = if __tmpl.is_empty() {
-        let __sh_tmpdir = std::env::var("TMPDIR").ok().filter(|__sh_tmpdir| !__sh_tmpdir.is_empty()).unwrap_or_else(|| "/tmp".to_string());
-        format!("{}/tmp.XXXXXXXXXX", __sh_tmpdir.trim_end_matches('/'))
-    } else {
-        __tmpl.to_string()
-    };
-    let __base = __sh_text.trim_end_matches('X').to_string();
-    let __sh_suffix = { let __sh_num = __sh_text.len() - __base.len(); if __sh_num == 0 { 10 } else { __sh_num } };
-    let __sh_alphabet: &[u8] = b"abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789";
-    '__sh_mkloop: {
-        for __sh_num in 0..100000u64 {
-            let __seed = (std::process::id() as u64).wrapping_mul(1_000_003)
-                ^ __sh_num.wrapping_mul(7_919)
-                ^ std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map(|__sh_clock| __sh_clock.subsec_nanos() as u64).unwrap_or(0);
-            let mut __sh_state = __seed | 1;
-            let mut __sh_path = __base.clone();
-            for _ in 0..__sh_suffix { __sh_path.push(__sh_alphabet[(__sh_state % 62) as usize] as char); __sh_state /= 62; }
-            let __sh_ok = if @DIR@ { std::fs::create_dir(&__sh_path).is_ok() } else { std::fs::OpenOptions::new().write(true).create_new(true).open(&__sh_path).is_ok() };
-            if __sh_ok { break '__sh_mkloop __sh_path; }
-        }
-        String::new()
-    }
-}"#
-                .replace("@TMPL@", &t)
-                .replace("@DIR@", if dir { "true" } else { "false" });
+                // The uniqueness loop lives ONCE, in the `mktemp` helper:
+                // spelling it inline here as well put a 30-line polyfill in
+                // the middle of every `main()` that called `mktemp` (166
+                // corpus sites), and two copies of one loop are two places
+                // to drift. The helper keeps the O_EXCL / create_dir
+                // atomicity and the trailing-X template.
+                self.add_helper("mktemp");
                 Some(format!(
-                    "{{ let __sh_ch = {}; __SH_RC.store(if __sh_ch.is_empty() {{ 1 }} else {{ 0 }}, Ordering::Relaxed); __sh_ch }}",
-                    self.indent_continuation(&code)
+                    "{{ let __sh_ch = __sh_mktemp({}, {}); __SH_RC.store(if __sh_ch.is_empty() {{ 1 }} else {{ 0 }}, Ordering::Relaxed); __sh_ch }}",
+                    if dir { "true" } else { "false" },
+                    t
                 ))
             }
             _ => None,
@@ -9281,7 +9317,7 @@ while __sh_path.len() > 1 && __sh_path.ends_with('/') {{ __sh_path = &__sh_path[
             IrExpr::Call { func, args } => self.call_words(func, args),
             IrExpr::Capture { .. } => {
                 let c = self.capture_expr_single(e);
-                Self::split_ifs_inline(&c)
+                self.split_words_expr(&c)
             }
             IrExpr::Array(items) => {
                 // a word LIST (`echo {1..5}` — the brace call wrapped in
@@ -9343,12 +9379,12 @@ while __sh_path.len() > 1 && __sh_path.ends_with('/') {{ __sh_path = &__sh_path[
             }
             "split" => {
                 let s = args.first().map(|a| self.expr_str(a)).unwrap_or_default();
-                Self::split_ifs_inline(&s)
+                self.split_words_expr(&s)
             }
             "brace" => self.brace_words(args),
             "capture" => {
                 let c = self.capture_expr(args);
-                Self::split_ifs_inline(&c)
+                self.split_words_expr(&c)
             }
             "join" => format!("vec![{}]", self.join_str(args)),
             "arrayIndex" => format!("vec![{}]", self.array_index_str(args)),
@@ -10088,7 +10124,7 @@ while __sh_path.len() > 1 && __sh_path.ends_with('/') {{ __sh_path = &__sh_path[
     /// captureWords(Arrow) — the captured output split into words.
     fn capture_words_expr(&mut self, args: &[IrExpr]) -> String {
         let c = self.capture_expr(args);
-        Self::split_ifs_inline(&c)
+        self.split_words_expr(&c)
     }
 
     /// Unquoted word splitting on the DEFAULT IFS — the `Split` node's Rust
@@ -10102,6 +10138,25 @@ while __sh_path.len() > 1 && __sh_path.ends_with('/') {{ __sh_path = &__sh_path[
             "{{ let __sh_split_s: String = {}; __sh_split_s.split(|__sh_ch: char| __sh_ch == ' ' || __sh_ch == '\\t' || __sh_ch == '\\n').filter(|__sh_w| !__sh_w.is_empty()).map(|__sh_w| __sh_w.to_string()).collect::<Vec<String>>() }}",
             s
         )
+    }
+
+    /// Unquoted word splitting, with the separator set the RUNTIME has.
+    /// The inline closure is exact for bash's DEFAULT IFS; when the program
+    /// assigns IFS, the set is a value only the program knows (`IFS=:`,
+    /// `IFS=$'\n'`, `IFS=` disabling splitting entirely), so the split goes
+    /// through `__sh_split_ifs`, the one implementation of bash's rule
+    /// (whitespace runs collapse, a non-whitespace separator yields an empty
+    /// field, `IFS=` yields one field). `__SHV_IFS` starts at `" \t\n"` in
+    /// `decl_stmt`, so a split rendered before the first assignment still
+    /// sees bash's default.
+    fn split_words_expr(&mut self, s: &str) -> String {
+        if self.ifs_assigned {
+            self.add_helper("split_ifs");
+            let ifs = self.read_str("IFS");
+            format!("__sh_split_ifs(&{}, &{})", s, ifs)
+        } else {
+            Self::split_ifs_inline(s)
+        }
     }
 
     /// ONE line from stdin (`ReadLine`, and the `read` builtin that renders
@@ -12004,12 +12059,12 @@ while __sh_path.len() > 1 && __sh_path.ends_with('/') {{ __sh_path = &__sh_path[
             .map(|w| match w {
                 IrExpr::Call { func, args } if func == "split" => {
                     let s = args.first().map(|a| self.expr_str(a)).unwrap_or_default();
-                    Self::split_ifs_inline(&s)
+                    self.split_words_expr(&s)
                 }
                 IrExpr::Call { func, args } if func == "capture" => {
                     // an unquoted capture also field-splits
                     let c = self.capture_expr(args);
-                    Self::split_ifs_inline(&c)
+                    self.split_words_expr(&c)
                 }
                 // a bare-`&str` word (native loop binding, borrowable
                 // local) must be owned for the `Vec<String>` element
@@ -12496,7 +12551,7 @@ while __sh_path.len() > 1 && __sh_path.ends_with('/') {{ __sh_path = &__sh_path[
             "listVar" => self.listvar_joined(args),
             "split" => {
                 let s = args.first().map(|a| self.expr_str(a)).unwrap_or_default();
-                format!("({}).join(\" \")", Self::split_ifs_inline(&s))
+                format!("({}).join(\" \")", self.split_words_expr(&s))
             }
             "brace" => {
                 let w = self.brace_words(args);
@@ -15843,6 +15898,15 @@ while __sh_path.len() > 1 && __sh_path.ends_with('/') {{ __sh_path = &__sh_path[
             format!(
                 "thread_local! {{ {a}static {m}: std::cell::Cell<i64> = const {{ std::cell::Cell::new(0) }}; }}"
             )
+        } else if v == "IFS" {
+            // IFS is the one variable whose INITIAL value a word split can
+            // observe: bash starts it at space/tab/newline, and a split that
+            // runs before the script's first `IFS=` assignment must still see
+            // that default (`__sh_split_ifs(s, "")` would disable splitting
+            // instead). Not a `const` block - `String::from` is not const.
+            format!(
+                "thread_local! {{ {a}static {m}: std::cell::RefCell<String> = std::cell::RefCell::new(\" \\t\\n\".to_string()); }}"
+            )
         } else {
             format!(
                 "thread_local! {{ {a}static {m}: std::cell::RefCell<String> = const {{ std::cell::RefCell::new(String::new()) }}; }}"
@@ -16049,13 +16113,7 @@ fn helper_source(h: &str) -> &'static str {
     s.split('\n').map(str::to_string).collect()
 }"#,
         "q" => r#"fn __sh_q(s: &str) -> String {
-    let mut o = String::with_capacity(s.len() + 8);
-    o.push('\'');
-    for c in s.chars() {
-        if c == '\'' { o.push_str("'\\''"); } else { o.push(c); }
-    }
-    o.push('\'');
-    o
+    format!("'{}'", s.replace('\'', "'\\''"))
 }"#,
         "q_printf" => r#"fn __sh_q_printf(s: &str) -> String {
     if s.is_empty() { return "''".to_string(); }
@@ -16095,11 +16153,14 @@ fn helper_source(h: &str) -> &'static str {
         "cat" => r#"fn __sh_cat(ws: &[Vec<String>]) -> Vec<String> {
     ws.concat()
 }"#,
+        // bash rejects a negative exponent (`2**-1` is an arithmetic
+        // error), and the old counting loop fell through to 1 — which is
+        // exactly what clamping to 0 gives on that arm, so the std form is
+        // the same answer on every input that can reach here. `clamp`
+        // rather than `u32::try_from`: the emitted files compile under
+        // rustc's DEFAULT edition, where `TryFrom` is not in the prelude.
         "pow" => r#"fn __sh_pow(a: i64, b: i64) -> i64 {
-    let mut r: i64 = 1;
-    let mut i = 0;
-    while i < b { r = r.wrapping_mul(a); i += 1; }
-    r
+    a.wrapping_pow(b.clamp(0, u32::MAX as i64) as u32)
 }"#,
         "div" => r#"fn __sh_div(a: i64, b: i64) -> i64 {
     if b == 0 { __SH_ARITH_ERR.store(true, Ordering::Relaxed); 0 } else { a / b }
@@ -16387,9 +16448,9 @@ fn helper_source(h: &str) -> &'static str {
                 // else falls back to the OS string and is not claimed to be
                 // bash's text (same rule as the TextFilter arm).
                 let m = match e.kind() {
-                    std::io::ErrorKind::NotFound => "No such file or directory".to_string(),
-                    std::io::ErrorKind::PermissionDenied => "Permission denied".to_string(),
-                    std::io::ErrorKind::IsADirectory => "Is a directory".to_string(),
+                    std::io::ErrorKind::NotFound => "No such file or directory".into(),
+                    std::io::ErrorKind::PermissionDenied => "Permission denied".into(),
+                    std::io::ErrorKind::IsADirectory => "Is a directory".into(),
                     _ => format!("{}", e),
                 };
                 eprintln!("cat: {}: {}", p, m);
@@ -16629,7 +16690,7 @@ fn helper_source(h: &str) -> &'static str {
     c.arg("-c").arg(cmd);
     c.stdout(std::process::Stdio::piped());
     if input.is_some() { c.stdin(std::process::Stdio::piped()); }
-    let mut ch = match c.spawn() { Ok(x) => x, Err(_) => return Vec::new() };
+    let Ok(mut ch) = c.spawn() else { return Vec::new() };
     if let Some(data) = input {
         if let Some(mut si) = ch.stdin.take() { let _ = std::io::Write::write_all(&mut si, data); }
     }
@@ -16645,7 +16706,7 @@ fn helper_source(h: &str) -> &'static str {
     c.arg("-c").arg(cmd);
     c.stdout(std::process::Stdio::piped());
     c.stdin(std::process::Stdio::inherit());
-    let mut ch = match c.spawn() { Ok(x) => x, Err(_) => return (String::new(), 1) };
+    let Ok(mut ch) = c.spawn() else { return (String::new(), 1) };
     let mut out = Vec::new();
     if let Some(mut so) = ch.stdout.take() {
         let _ = std::io::Read::read_to_end(&mut so, &mut out);
@@ -16686,7 +16747,7 @@ fn helper_source(h: &str) -> &'static str {
         }
     }
     if input.is_some() { c.stdin(std::process::Stdio::piped()); }
-    let mut ch = match c.spawn() { Ok(x) => x, Err(_) => return 1 };
+    let Ok(mut ch) = c.spawn() else { return 1 };
     if let Some(data) = input {
         if let Some(mut si) = ch.stdin.take() { let _ = std::io::Write::write_all(&mut si, &data); }
     }
@@ -16967,49 +17028,45 @@ fn helper_source(h: &str) -> &'static str {
     let anchored_s = pat0.starts_with('#');
     let anchored_e = pat0.starts_with('%');
     let pat = pat0.trim_start_matches('#').trim_start_matches('%');
-    let ch: Vec<char> = s.chars().collect();
+    // char boundaries, so every probe is a BORROWED slice: the scan still
+    // asks `__sh_fnmatch` O(n²) times, but it no longer allocates a String
+    // (and a throwaway Vec<char>) per probe.
+    let mut b: Vec<usize> = s.char_indices().map(|(k, _)| k).collect();
+    b.push(s.len());
+    let n = b.len() - 1;
     let mut out = String::new();
     let mut i = 0;
     let mut done = false;
-    while i <= ch.len() {
+    while i <= n {
         if anchored_s && i > 0 { break; }
-        let mut matched: Option<usize> = None;
-        let mut end = i;
-        while end <= ch.len() {
-            let sub: String = ch[i..end].iter().collect();
-            if __sh_fnmatch(pat, &sub) { matched = Some(end); break; }
-            end += 1;
-        }
-        if let Some(e) = matched {
-            if anchored_e && e != ch.len() { matched = None; }
-        }
-        if let Some(e) = matched {
-            out.push_str(repl);
-            i = e;
-            done = true;
-            if !all {
-                out.extend(ch[i..].iter());
-                break;
+        // the SHORTEST prefix that matches, then the `%`-anchored test
+        let hit = (i..=n).find(|&e| __sh_fnmatch(pat, &s[b[i]..b[e]]))
+            .filter(|&e| !anchored_e || e == n);
+        match hit {
+            Some(e) => {
+                out.push_str(repl);
+                i = e;
+                done = true;
+                if !all {
+                    out.push_str(&s[b[i]..]);
+                    break;
+                }
+                if i >= n { break; }
             }
-            if i >= ch.len() { break; }
-        } else {
-            if i < ch.len() { out.push(ch[i]); }
-            i += 1;
-            if anchored_s { break; }
+            None => {
+                if i < n { out.push_str(&s[b[i]..b[i + 1]]); }
+                i += 1;
+                if anchored_s { break; }
+            }
         }
     }
     if done { out } else { s.to_string() }
 }"#,
         "substr" => r#"fn __sh_substr(s: &str, off: i64, len: i64) -> String {
-    let ch: Vec<char> = s.chars().collect();
-    let n = ch.len() as i64;
-    let mut o = if off < 0 { n + off } else { off };
-    if o < 0 { o = 0; }
-    if o > n { return String::new(); }
-    let mut l = if len == i64::MIN { n - o } else if len < 0 { n + len - o } else { len };
-    if l < 0 { l = 0; }
-    if o + l > n { l = n - o; }
-    ch[o as usize..(o + l) as usize].iter().collect()
+    let n = s.chars().count() as i64;
+    let o = (if off < 0 { n + off } else { off }).clamp(0, n);
+    let l = if len == i64::MIN { n - o } else if len < 0 { n + len - o } else { len };
+    s.chars().skip(o as usize).take(l.clamp(0, n - o) as usize).collect()
 }"#,
         "case" => r#"fn __sh_case(s: &str, mode: &str) -> String {
     let mut it = s.chars();
@@ -25080,7 +25137,11 @@ mod tests {
             (
                 "mktemp",
                 "d=$(mktemp -d)\nif [ -d \"$d\" ]; then echo y; fi\n",
-                &["create_new(true)", "TMPDIR", "create_dir(&__sh_path)"],
+                // The uniqueness loop moved into the `mktemp` helper (it
+                // used to be spelled inline at every call site as well);
+                // what this case pins is that the primitives stay NATIVE —
+                // O_EXCL create / create_dir, never a `bash -c mktemp`.
+                &["create_new(true)", "TMPDIR", "create_dir(&s)"],
             ),
             (
                 "-f",
@@ -25116,7 +25177,7 @@ mod tests {
         let helpers = [
             "__sh_rm(", "__sh_mkdir(", "__sh_touch(", "__sh_sleep(", "__sh_freg(", "__sh_fdir(",
             "__sh_fexists(", "__sh_fsym(", "__sh_fsize(", "__sh_fread(", "__sh_fwrite(",
-            "__sh_fexec(", "__sh_fmode(", "__sh_mktemp(",
+            "__sh_fexec(", "__sh_fmode(",
         ];
         for (name, src, markers) in cases {
             let out = render_rs(src);
