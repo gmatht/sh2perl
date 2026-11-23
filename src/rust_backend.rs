@@ -241,6 +241,11 @@ pub struct Render {
     assigned: BTreeSet<String>,
     /// pass-2 locals whose deferred `let` has already been emitted
     local_init: BTreeSet<String>,
+    /// `local NAME` declarations inside the current function body that
+    /// back a static cell: NAME -> slot ident holding the value NAME had
+    /// when `local` ran (restored at every return and at function end).
+    /// Bash's rule: `local` is a dynamically-scoped save/restore.
+    local_slots: std::collections::BTreeMap<String, String>,
     /// pass-2 locals written more than once (need `mut`)
     local_mut: BTreeSet<String>,
     /// pass-2 locals whose FIRST write is overwritten before any read
@@ -3962,6 +3967,23 @@ impl Render {
     fn indent_continuation(&self, s: &str) -> String {
         let pad = "    ".repeat(self.depth);
         s.replace('\n', &format!("\n{pad}"))
+    }
+
+    fn emit_local_restores(&mut self) {
+        // Restore each `local` slot to its static cell. Idempotent:
+        // `.take()` yields None after the first restore, so a return
+        // followed by the function-end restore is a no-op the second time.
+        let slots: Vec<(String, String)> =
+            self.local_slots.iter().map(|(k, v)| (k.clone(), v.clone())).collect();
+        for (name, slot) in slots {
+            let tls = self.tls(&name);
+            let line = if self.is_num(&name) {
+                format!("match {slot}.take() {{ Some(__sh_loc) => {{ {tls}.with(|v| v.set(__sh_loc)); }} _ => {{}} }};")
+            } else {
+                format!("match {slot}.take() {{ Some(__sh_loc) => {{ {tls}.with(|v| *v.borrow_mut() = __sh_loc); }} _ => {{}} }};")
+            };
+            self.emit(&line);
+        }
     }
 
     fn emit(&mut self, s: &str) {
@@ -9246,6 +9268,9 @@ while __sh_path.len() > 1 && __sh_path.ends_with('/') {{ __sh_path = &__sh_path[
                 }
             }
             IrExpr::Call { func, .. } if func == "return" => {
+                if self.in_function && !self.local_slots.is_empty() {
+                    self.emit_local_restores();
+                }
                 self.emit("__SH_RC.store(0, Ordering::Relaxed); return;");
             }
             _ => {
@@ -13922,7 +13947,10 @@ while __sh_path.len() > 1 && __sh_path.ends_with('/') {{ __sh_path = &__sh_path[
                     }
                 }
                 IrExpr::Call { func, args: _ } if func == "return" => {
-                    self.emit("__SH_RC.store(0, Ordering::Relaxed); return;");
+                    if self.in_function && !self.local_slots.is_empty() {
+                    self.emit_local_restores();
+                }
+                self.emit("__SH_RC.store(0, Ordering::Relaxed); return;");
                 }
                 _ => {
                     let x = self.expr_any(e);
@@ -14201,9 +14229,26 @@ while __sh_path.len() > 1 && __sh_path.ends_with('/') {{ __sh_path = &__sh_path[
                     self.emit("__SH_RC.store(0, Ordering::Relaxed);");
                 }
             }
-            IrStmt::Declare { vars, init, .. } => {
+            IrStmt::Declare { vars, init, local } => {
                 for d in vars {
                     self.mark_written(&d.name);
+                    // bash's rule: `local NAME` saves the value NAME had
+                    // when `local` runs and restores it when the function
+                    // returns. Emit the save into the slot (once) before
+                    // the write, so a re-execution in a loop keeps the
+                    // FIRST value.
+                    if *local {
+                        if let Some(slot) = self.local_slots.get(&d.name).cloned() {
+                            let cur = if self.is_num(&d.name) {
+                                format!("Some({})", self.tls(&d.name).to_string() + ".with(|v| v.get())")
+                            } else {
+                                format!("Some({}.with(|v| v.borrow().clone()))", self.tls(&d.name))
+                            };
+                            self.emit(&format!(
+                                "if {slot}.borrow().is_none() {{ *{slot}.borrow_mut() = {cur}; }}"
+                            ));
+                        }
+                    }
                     if let Some(e) = init {
                         if self.is_num(&d.name) {
                             let n = self.expr_num(e);
@@ -15041,8 +15086,12 @@ while __sh_path.len() > 1 && __sh_path.ends_with('/') {{ __sh_path = &__sh_path[
                             // deadlock — polyfills brace/param)
                             self.add_helper("ret_rc");
                             self.emit(&format!(
-                                "let __sh_value = {r}; *__SH_RET.lock().unwrap() = __sh_value.clone(); __SH_RC.store(__sh_ret_rc(&__sh_value), Ordering::Relaxed); return;"
+                                "let __sh_value = {r}; *__SH_RET.lock().unwrap() = __sh_value.clone(); __SH_RC.store(__sh_ret_rc(&__sh_value), Ordering::Relaxed);"
                             ));
+                            if self.in_function && !self.local_slots.is_empty() {
+                                self.emit_local_restores();
+                            }
+                            self.emit("return;");
                         } else {
                             self.emit("return;");
                         }
@@ -15064,15 +15113,26 @@ while __sh_path.len() > 1 && __sh_path.ends_with('/') {{ __sh_path = &__sh_path[
                         self.add_helper("ret_rc");
                         if value_used {
                             self.emit(&format!(
-                                "let __sh_value = {r}; *__SH_RET.lock().unwrap() = __sh_value.clone(); __SH_RC.store(__sh_ret_rc(&__sh_value), Ordering::Relaxed); return __sh_value;"
+                                "let __sh_value = {r}; *__SH_RET.lock().unwrap() = __sh_value.clone(); __SH_RC.store(__sh_ret_rc(&__sh_value), Ordering::Relaxed);"
                             ));
+                            if self.in_function && !self.local_slots.is_empty() {
+                                self.emit_local_restores();
+                            }
+                            self.emit("return __sh_value;");
                         } else {
                             self.emit(&format!(
-                                "let __sh_value = {r}; *__SH_RET.lock().unwrap() = __sh_value.clone(); __SH_RC.store(__sh_ret_rc(&__sh_value), Ordering::Relaxed); return;"
+                                "let __sh_value = {r}; *__SH_RET.lock().unwrap() = __sh_value.clone(); __SH_RC.store(__sh_ret_rc(&__sh_value), Ordering::Relaxed);"
                             ));
+                            if self.in_function && !self.local_slots.is_empty() {
+                                self.emit_local_restores();
+                            }
+                            self.emit("return;");
                         }
                     } else {
                         if value_used {
+                            if self.in_function && !self.local_slots.is_empty() {
+                                self.emit_local_restores();
+                            }
                             self.emit("return __SH_RET.lock().unwrap().clone();");
                         } else {
                             self.emit("return;");
@@ -15094,11 +15154,17 @@ while __sh_path.len() > 1 && __sh_path.ends_with('/') {{ __sh_path = &__sh_path[
                 if self.in_closure > 0 {
                     if let Some(x) = e {
                         let n = self.expr_num(x);
+                        if self.in_function && !self.local_slots.is_empty() {
+                            self.emit_local_restores();
+                        }
                         self.emit(&format!(
                             "__SH_RC.store({}, Ordering::Relaxed); return;",
                             i32_arg(&n)
                         ));
                     } else {
+                        if self.in_function && !self.local_slots.is_empty() {
+                            self.emit_local_restores();
+                        }
                         self.emit("return;");
                     }
                 } else if self.rc_disabled {
@@ -16112,9 +16178,44 @@ while __sh_path.len() > 1 && __sh_path.ends_with('/') {{ __sh_path = &__sh_path[
                     ));
                 }
             }
+            // bash's rule: `local NAME` is a dynamically-scoped
+            // save/restore around the function body. For each name
+            // declared `local` here that backs a static cell (a pass-2
+            // local already has function scope and needs nothing), emit a
+            // slot holding the value NAME had when `local` ran, and
+            // restore it at every return and at function end.
+            self.local_slots.clear();
+            let mut locals: Vec<String> = Vec::new();
+            collect_local_names(body, &mut locals);
+            locals.sort();
+            locals.dedup();
+            for n in &locals {
+                if self.is_local(n) {
+                    continue;
+                }
+                if !self.declared(n) {
+                    continue;
+                }
+                let slot = format!("__sh_loc_{}", self.ident_base(n));
+                let ty = if self.is_assoc(n) {
+                    "std::collections::BTreeMap<String, String>".to_string()
+                } else if self.is_array(n) {
+                    "Vec<String>".to_string()
+                } else if self.is_num(n) {
+                    "i64".to_string()
+                } else {
+                    "String".to_string()
+                };
+                self.emit(&format!(
+                    "let {slot}: std::cell::RefCell<Option<{ty}>> = std::cell::RefCell::new(None);"
+                ));
+                self.local_slots.insert(n.clone(), slot);
+            }
             for st in body {
                 self.stmt(st);
             }
+            // restore any `local` slots (idempotent via take()).
+            self.emit_local_restores();
             self.num_param_cache.clear();
             self.active_fn = None;
             self.body_fn = None;
@@ -20581,6 +20682,51 @@ fn declares_var(stmts: &[IrStmt], var: &str) -> bool {
         IrStmt::Pipeline { stages, .. } => stages.iter().any(|s2| declares_var(s2, var)),
         _ => false,
     })
+}
+
+fn collect_local_names(stmts: &[IrStmt], out: &mut Vec<String>) {
+    for s in stmts {
+        match s {
+            IrStmt::Declare { vars, local: true, .. } => {
+                for d in vars {
+                    out.push(d.name.clone());
+                }
+            }
+            IrStmt::Expr(IrExpr::Call { func, args }) if func == "exec" || func == "builtin" => {
+                if let Some(IrExpr::Str(n, _)) = args.first() {
+                    if n == "local" {
+                        // `local v` / `local v=val` via the builtin form
+                        if let Some(IrExpr::Array(words)) = args.get(1) {
+                            for w in words {
+                                if let Some(s) = str_arg(&[w.clone()], 0) {
+                                    let name = s.split('=').next().unwrap_or(s).trim();
+                                    if !name.is_empty()
+                                        && name.chars().all(|c| c.is_ascii_alphanumeric() || c == '_')
+                                    {
+                                        out.push(name.to_string());
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+            IrStmt::Block(b) | IrStmt::Subshell(b) | IrStmt::Background(b) => collect_local_names(b, out),
+            IrStmt::If { then, elsifs, else_, .. } => {
+                collect_local_names(then, out);
+                for (_, b) in elsifs {
+                    collect_local_names(b, out);
+                }
+                collect_local_names(else_, out);
+            }
+            IrStmt::While { body, .. } | IrStmt::DoWhile { body, .. } | IrStmt::For { body, .. } => {
+                collect_local_names(body, out);
+            }
+            IrStmt::ForInit { body, .. } => collect_local_names(body, out),
+            IrStmt::Function { body, .. } => collect_local_names(body, out),
+            _ => {}
+        }
+    }
 }
 
 fn collect_written(stmts: &[IrStmt], out: &mut BTreeSet<String>) {
@@ -25568,7 +25714,6 @@ mod tests {
     /// changes nothing here; the fix belongs to the subshell lowering.
     /// Ignored rather than deleted: it is the witness for that fix.
     #[test]
-    #[ignore = "known divergence: a bare subshell statement does not copy its writes back"]
     fn a_subshell_assignment_does_not_reach_the_parent() {
         let src = "x=1\n(x=2)\necho \"$x\"\n";
         let rs = render_rs(src);
