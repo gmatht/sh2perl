@@ -13,7 +13,13 @@
 # the command keeps whatever route it had):
 #   * a word that is not a plain literal at IR time (a variable, a
 #     substitution, a GLOB — `rm file_*.txt` is one `Str` at IR time and N
-#     paths at runtime, so it is a refusal and never an arm that drops it);
+#     paths at runtime, so it is a refusal and never an arm that drops it).
+#     THE ONE EXCEPTION is `__ps_tmp*`: process substitution's own scratch
+#     reads, minted by the native mktemp block and therefore always exactly
+#     one literal path (never a glob, never several words, never empty). Its
+#     late-appended cleanup `rm -f $__ps_tmp0 …` is lifted (by
+#     `process_subst::rm_exec`, re-applying this transform) so that the
+#     transform deletes its own temp files natively instead of forking bash;
 #   * a flag the renderer does not model (`rm -i`, `mkdir -m`, `touch -d`, any
 #     `--long` form);
 #   * `rm`/`mkdir`/`touch` with no operand, or a lone `-` operand.

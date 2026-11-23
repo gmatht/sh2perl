@@ -149,16 +149,30 @@ fn producer_redirect(producer: Vec<IrStmt>, tmp: &IrExpr, mode: &str, fd: Option
 }
 
 /// `rm -f tmp…` — the cleanup exec.
+/// `rm -f tmp…` — the cleanup exec. LIFTED here, not by the registry:
+/// `fs-cmd-lift` has already run by the time this statement is appended, so
+/// the cleanup used to keep the bare `Exec` shape and every `<(…)` program
+/// shelled out `bash -c "rm -f …"` to delete the scratch files this very
+/// transform minted. Re-apply the lift to the single appended statement (the
+/// same late-append pattern `producer_redirect` uses for
+/// `shir-pipeline-native`); the lift's `__ps_tmp*` rule accepts our own
+/// scratch reads and still refuses a user variable. When the target backend
+/// does not declare `FsCommand`, `transform` is a no-op and the cleanup keeps
+/// its previous `Exec` route.
 fn rm_exec(tmps: &[IrExpr]) -> IrStmt {
     let mut args = vec![st("-f")];
     args.extend(tmps.iter().cloned());
-    IrStmt::Exec {
+    let mut stmts = vec![IrStmt::Exec {
         cmd: st("rm"),
         args,
         capture: None,
         redirects: vec![],
         env: vec![],
+    }];
+    if crate::transforms::transform_enabled("fs-cmd-lift") {
+        crate::transforms::fs_cmd_lift::transform(&mut stmts);
     }
+    stmts.pop().expect("rm_exec always pushes one statement")
 }
 
 /// Parse the producer's shell text (reconstructed by the core's

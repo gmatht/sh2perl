@@ -9130,6 +9130,33 @@ while __sh_path.len() > 1 && __sh_path.ends_with('/') {{ __sh_path = &__sh_path[
     /// A word that expands to MANY words: `"$@"`/`"$*"` (the word-level
     /// `listVar`/`getVar` lowering), `${arr[@]}` (a `listVar`/`arrayItems`
     /// call or an array name read). A plain word expands to one.
+    /// The trailing `rm -f $__ps_tmp…` that the process-substitution
+    /// transform appends, in EITHER of the shapes it can arrive in: the bare
+    /// `Exec` it builds, or the `FsCommand` node that `process_subst::rm_exec`
+    /// now lifts it into (so the deletion is a native `remove_file` and not
+    /// `bash -c "rm -f …"`). Both are the same subshell side effect and both
+    /// get the status save/restore below.
+    fn is_ps_cleanup(st: &IrStmt) -> bool {
+        let words: &[IrExpr] = match st {
+            IrStmt::Exec { cmd, args, .. } if matches!(cmd, IrExpr::Str(c, _) if c == "rm") => {
+                args
+            }
+            IrStmt::Expr(IrExpr::Ext(n)) if n.tag() == "FsCommand" => {
+                match n.as_any().downcast_ref::<crate::shir_nodes::FsCommand>() {
+                    Some(x) if x.cmd == "rm" => match &x.argv {
+                        IrExpr::Array(a) => a,
+                        _ => return false,
+                    },
+                    _ => return false,
+                }
+            }
+            _ => return false,
+        };
+        words.iter().any(|a| {
+            matches!(a, IrExpr::Var(n, _) | IrExpr::Ident(n) if n.starts_with("__ps_tmp"))
+        })
+    }
+
     fn is_splat_word(w: &IrExpr) -> bool {
         match w {
             IrExpr::Array(_) => true,
@@ -14649,15 +14676,7 @@ while __sh_path.len() > 1 && __sh_path.ends_with('/') {{ __sh_path = &__sh_path[
                 // (`diff <(echo one) <(echo two); echo $?`). Emit it
                 // last, behind a status save/restore.
                 let (body, cleanup) = match b.split_last() {
-                    Some((IrStmt::Exec { cmd, args, .. }, rest))
-                        if matches!(cmd, IrExpr::Str(c, _) if c == "rm")
-                            && args.iter().any(|a| {
-                                matches!(a, IrExpr::Var(n, _) | IrExpr::Ident(n)
-                                    if n.starts_with("__ps_tmp"))
-                            }) =>
-                    {
-                        (rest, Some(b.last().unwrap()))
-                    }
+                    Some((last, rest)) if Self::is_ps_cleanup(last) => (rest, Some(last)),
                     _ => (b.as_slice(), None),
                 };
                 for s in body {

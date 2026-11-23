@@ -23,6 +23,23 @@
 //! Anything else keeps the exec Call, whose renderer is unchanged (an
 //! unmodelled flag or a dynamic operand keeps its shell-out where it had one).
 //!
+//! ## The one variable operand this lift accepts: our own scratch paths
+//!
+//! Process substitution appends a cleanup `rm -f $__ps_tmp0 …` to the block,
+//! AFTER this transform has run in the registry, so the statement never
+//! reached here and the Rust side shelled out `bash -c "rm -f …"` to delete
+//! files the transform itself minted. `process_subst::rm_exec` therefore
+//! RE-APPLIES this lift to that single cleanup statement (the same pattern
+//! `producer_redirect` uses for late-appended `shir-pipeline-native` work),
+//! and the lift accepts a bare `IrStmt::Exec` whose ONLY dynamic operands are
+//! `__ps_tmp*` reads. That is sound by construction: those variables are
+//! assigned by the native `mktemp` block (`native_capture_value`), so each
+//! holds exactly one literal unique path — never a glob, never several words,
+//! never empty. A user-written `rm -f "$f"` is still REFUSED (`liftable` and
+//! `lift_cleanup` both only know plain literals or `__ps_tmp*`): `$f` may hold
+//! a glob, a word list or the empty string, and the renderer would treat it
+//! as one path.
+//!
 //! `mktemp` and `sleep` are NOT in this lift: their observable value is the
 //! result (the generated path, the elapsed time), not a statement side
 //! effect, and both already render natively in the capture/bool positions
@@ -89,6 +106,61 @@ fn liftable(cmd: &str, words: &[&IrExpr]) -> bool {
         && flags_ok(cmd, words)
 }
 
+/// A read of one of the process-substitution transform's own scratch paths.
+/// The name prefix is the transform's contract (`process_subst::tmp_var`);
+/// such a variable is only ever assigned the native `mktemp` result, i.e.
+/// exactly one literal path.
+fn ps_tmp_word(w: &IrExpr) -> bool {
+    matches!(w, IrExpr::Var(n, _) | IrExpr::Ident(n) if n.starts_with("__ps_tmp"))
+}
+
+/// The late-appended process-substitution cleanup, as a BARE `Exec` (the
+/// shape `process_subst::rm_exec` builds). `lift_stmt` only knows the
+/// statement-position exec CALL, so that shape fell through to the shell-text
+/// renderer. Every word must be a modelled `rm` flag or one of our own
+/// `__ps_tmp*` reads, and at least one such read must be present — an
+/// operand-less `rm -f` is already a no-op and is not worth a node.
+fn lift_cleanup(st: &mut IrStmt) -> bool {
+    let IrStmt::Exec { cmd, args, capture: None, redirects, env } = st else {
+        return false;
+    };
+    if !redirects.is_empty() || !env.is_empty() {
+        return false;
+    }
+    let IrExpr::Str(name, _) = cmd else {
+        return false;
+    };
+    if name != "rm" {
+        return false;
+    }
+    let mut saw_tmp = false;
+    for w in args.iter() {
+        match w {
+            IrExpr::Str(s, _) => {
+                if s == "--" {
+                    continue;
+                }
+                let Some(rest) = s.strip_prefix('-') else {
+                    return false; // a literal operand is the plain lift's business
+                };
+                if rest.is_empty() || !rest.chars().all(|c| "frRd".contains(c)) {
+                    return false;
+                }
+            }
+            other if ps_tmp_word(other) => saw_tmp = true,
+            _ => return false,
+        }
+    }
+    if !saw_tmp {
+        return false;
+    }
+    *st = IrStmt::Expr(IrExpr::Ext(Box::new(crate::shir_nodes::FsCommand {
+        cmd: name.clone(),
+        argv: IrExpr::Array(args.clone()),
+    })));
+    true
+}
+
 fn lift_stmt(st: &mut IrStmt) -> bool {
     let stmt = st.clone();
     let IrStmt::Expr(IrExpr::Call { func, args }) = stmt else {
@@ -126,7 +198,7 @@ fn walk_stmts(stmts: &mut Vec<IrStmt>) -> bool {
 }
 
 fn walk_stmt(st: &mut IrStmt) -> bool {
-    if lift_stmt(st) {
+    if lift_stmt(st) || lift_cleanup(st) {
         return true;
     }
     match st {
@@ -225,6 +297,58 @@ mod tests {
             assert!(transform(&mut stmts), "{cmd} {words:?} did not lift");
             assert!(has_node(&stmts), "{cmd} {words:?} produced no node");
         }
+        crate::transforms::set_target(None);
+    }
+
+    /// The process-subst cleanup is the only VARIABLE operand this lift
+    /// accepts, and only because the transform minted the variable itself.
+    #[test]
+    fn lifts_the_own_cleanup_but_not_a_user_variable() {
+        crate::transforms::set_target(Some("rs"));
+        let cleanup = IrStmt::Exec {
+            cmd: IrExpr::Str("rm".to_string(), StrStyle::DoubleQuoted),
+            args: vec![
+                IrExpr::Str("-f".to_string(), StrStyle::DoubleQuoted),
+                IrExpr::Var("__ps_tmp0".to_string(), None),
+                IrExpr::Var("__ps_tmp1".to_string(), None),
+            ],
+            capture: None,
+            redirects: vec![],
+            env: vec![],
+        };
+        let mut stmts = vec![cleanup];
+        assert!(transform(&mut stmts), "the scratch cleanup did not lift");
+        assert!(has_node(&stmts));
+
+        // A user variable may hold a glob, several words or "" — the node's
+        // renderer treats an operand as ONE path, so the shell keeps it.
+        let user = IrStmt::Exec {
+            cmd: IrExpr::Str("rm".to_string(), StrStyle::DoubleQuoted),
+            args: vec![
+                IrExpr::Str("-f".to_string(), StrStyle::DoubleQuoted),
+                IrExpr::Var("f".to_string(), None),
+            ],
+            capture: None,
+            redirects: vec![],
+            env: vec![],
+        };
+        let mut stmts = vec![user];
+        assert!(!transform(&mut stmts), "a user variable lifted");
+        assert!(!has_node(&stmts));
+
+        // An unmodelled flag on our own temp path is refused too.
+        let interactive = IrStmt::Exec {
+            cmd: IrExpr::Str("rm".to_string(), StrStyle::DoubleQuoted),
+            args: vec![
+                IrExpr::Str("-i".to_string(), StrStyle::DoubleQuoted),
+                IrExpr::Var("__ps_tmp0".to_string(), None),
+            ],
+            capture: None,
+            redirects: vec![],
+            env: vec![],
+        };
+        let mut stmts = vec![interactive];
+        assert!(!transform(&mut stmts), "rm -i lifted");
         crate::transforms::set_target(None);
     }
 
