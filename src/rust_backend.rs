@@ -2922,8 +2922,9 @@ fn prune_unused_helpers(text: String) -> String {
 /// `ERR`/`EXIT` traps, `&&`/`||`, a pipeline join — and every such read
 /// is an emitted `__SH_RC.load`. So a program whose rendered body holds
 /// no load at all never observes an intermediate value (drop every
-/// store), and one whose only load is the `std::process::ExitCode` read
-/// observes exactly the last status (keep the last store). Two or more
+/// store), and one with a single load observes exactly one status: the
+/// last store BEFORE that load (every other store is dead, before or
+/// after it). Two or more
 /// loads mean the program does read status somewhere, and every store
 /// stays: without flow analysis a store may feed any of those reads.
 ///
@@ -2959,8 +2960,13 @@ fn drop_dead_rc_stores(text: String) -> String {
         !arg.is_empty() && arg.chars().all(|c| c.is_ascii_digit() || " ()-".contains(c))
     }
     let lines: Vec<&str> = text.lines().collect();
+    // With one load, the value it observes is the LAST store BEFORE it —
+    // keeping "the last store in the file" instead dropped a store that fed
+    // the read (the `parse-crlf-shebang` snapshot: `print!`; store; load
+    // `$?`). Nothing after the read can be observed, so it goes.
     let keep = if loads == 1 {
-        lines.iter().rposition(|l| is_store(l))
+        let at = lines.iter().position(|l| l.contains("__SH_RC.load("));
+        at.and_then(|li| lines[..li].iter().rposition(|l| is_store(l)))
     } else {
         None
     };
@@ -25207,6 +25213,12 @@ mod tests {
         assert!(out.contains("__SH_RC.store(0"), "{out}");
         // a store whose ARGUMENT runs the command keeps its line: the run
         // (and its output) would go with it
+        // the single read observes the last store BEFORE it, even when
+        // more stores follow it
+        let late = "fn main() {\n    print!(\"a\");\n    __SH_RC.store(7, Ordering::Relaxed);\n    println!(\"{}\", __SH_RC.load(Ordering::Relaxed));\n    __SH_RC.store(0, Ordering::Relaxed);\n    return std::process::ExitCode::SUCCESS;\n}\n";
+        let out = super::drop_dead_rc_stores(late.to_string());
+        assert!(out.contains("__SH_RC.store(7"), "the feeding store must stay: {out}");
+        assert!(!out.contains("__SH_RC.store(0"), "the store after the read is dead: {out}");
         let runs = "fn main() {\n    __SH_RC.store(__sh_run(\"'basename\' \'/\'\"), Ordering::Relaxed);\n}\n";
         let out = super::drop_dead_rc_stores(runs.to_string());
         assert!(out.contains("__sh_run("), "{out}");
