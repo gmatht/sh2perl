@@ -1,5 +1,5 @@
 # verus-sync-coverage manifest: maskable
-# source sha: maskable=c6d2c8d22cc1  proof sha: 0871b3d05354
+# source sha: maskable=c6d2c8d22cc1  proof sha: 35597a0f1255
 
 [pins]
 pin pin_bare_inf -> test bare_is_inf: MAPPED
@@ -16,7 +16,7 @@ guard pow2 gate: PRESENT
 guard INF bound: PRESENT
 
 [counts]
-proof-fns: 11
+proof-fns: 44
 pins: 7
 # NOTE: proof-fns is a file-shape fact (change detector), NOT the
 # Verus obligation count — the gate asserts N verified separately.
