@@ -7601,7 +7601,7 @@ while __sh_path.len() > 1 && __sh_path.ends_with('/') {{ __sh_path = &__sh_path[
                 self.add_helper("run");
                 self.emit(&format!("std::process::exit(__sh_run(&{text}));"));
             }
-            "rm" | "mkdir" | "touch" => {
+            "rm" | "mkdir" | "touch" | "rmdir" => {
                 // Native filesystem commands. `rm` alone was 66 of the
                 // corpus's ~100 literal forked sites; each of these is a
                 // std::fs call, so the child `/bin/bash -c` bought nothing
@@ -7647,6 +7647,10 @@ while __sh_path.len() > 1 && __sh_path.ends_with('/') {{ __sh_path = &__sh_path[
         let allowed: &[char] = match cmd {
             "rm" => &['f', 'r', 'R', 'd'],
             "mkdir" => &['p', 'v'],
+            // `rmdir` has no flag this arm models: `-p` removes parents
+            // (several `remove_dir`s with a different status rule) and
+            // `--ignore-fail-on-non-empty` changes the status entirely.
+            "rmdir" => &[],
             _ => &[],
         };
         let mut end_opts = false;
@@ -7838,6 +7842,23 @@ while __sh_path.len() > 1 && __sh_path.ends_with('/') {{ __sh_path = &__sh_path[
                 .replace("@ERRSITE@", &errsite)
                 .replace("@FORCE@", if force { true_ } else { false_ })
             }
+            "rmdir" => r#"{
+    let mut __sh_status: i32 = 0;
+    let err_text = |__e: &std::io::Error| -> String { match __e.kind() {
+        std::io::ErrorKind::NotFound => "No such file or directory".to_string(),
+        std::io::ErrorKind::PermissionDenied => "Permission denied".to_string(),
+        std::io::ErrorKind::NotADirectory => "Not a directory".to_string(),
+        std::io::ErrorKind::DirectoryNotEmpty => "Directory not empty".to_string(),
+        _ => format!("{}", __e) } };
+    for __sh_path in &@ARGV@ {
+        if let Err(__sh_err) = std::fs::remove_dir(__sh_path) {
+            eprintln!("rmdir: failed to remove '{}': {}", __sh_path, err_text(&__sh_err));
+            __sh_status = 1;
+        }
+    }
+    __SH_RC.store(__sh_status, Ordering::Relaxed);
+}"#
+                .replace("@ARGV@", &argv),
             "mkdir" => {
                 let parents = flags.contains(&'p');
                 let verbose = flags.contains(&'v');
@@ -14819,7 +14840,31 @@ while __sh_path.len() > 1 && __sh_path.ends_with('/') {{ __sh_path = &__sh_path[
                 // definitions are emitted after main (see program())
                 let _ = (name, body);
             }
-            IrStmt::Exec { cmd, args, redirects, env, .. } => {
+            IrStmt::Exec { cmd, args, capture, redirects, env, .. } => {
+                // The ESTree-path exec carries the same commands as the
+                // `exec` CALL form, so an in-subset fs/stat command takes the
+                // same native arm here. Before this hook EVERY `rmdir` (no
+                // CALL form exists for it) forked bash, and so did every
+                // redirect-less `rm`/`mkdir`/`touch`/`cat` that arrived in
+                // this shape. A REDIRECT keeps the shell: the native arms
+                // write bash's diagnostics to stderr unconditionally and do
+                // not model `2>` (docs/fs-family.md, the redirect row).
+                if capture.is_none() && redirects.is_empty() && env.is_empty() {
+                    let name = match cmd {
+                        IrExpr::Str(n, _) => Some(n.clone()),
+                        _ => None,
+                    };
+                    if let Some(n) = name {
+                        let w: Vec<&IrExpr> = args.iter().collect();
+                        let native = self
+                            .native_fs_stmt(&n, &w)
+                            .or_else(|| self.native_cat_stmt(&w));
+                        if let Some(st) = native {
+                            self.emit_block(&st);
+                            return;
+                        }
+                    }
+                }
                 // ESTree-path exec: shell-out cmd + args (+ redirect text)
                 let mut words: Vec<IrExpr> = vec![cmd.clone()];
                 words.extend(args.clone());
@@ -23469,6 +23514,35 @@ mod tests {
     /// status-bookkeeping gate is pinned here: with no observable `$?`
     /// the capture/restore pair must go; a live `$?` reader after the
     /// loop must keep it.
+    /// `rmdir` has no statement-position CALL form in the corpus, so it
+    /// arrives as a bare `IrStmt::Exec`; the native hook in that arm must take
+    /// it, and must leave the two shapes the arm does not model on the shell
+    /// path (a flag, and a redirect).
+    #[test]
+    fn rmdir_lowers_natively_but_flagged_and_redirected_forms_do_not() {
+        let out = render("mkdir d\nrmdir d\n");
+        assert!(
+            out.contains("std::fs::remove_dir("),
+            "rmdir did not lower to remove_dir:\n{out}"
+        );
+        assert!(!out.contains("'rmdir'"), "rmdir still shells out:\n{out}");
+
+        let flagged = render("rmdir -p a/b\n");
+        assert!(
+            !flagged.contains("std::fs::remove_dir("),
+            "rmdir -p lowered (it removes parents, several removes):\n{flagged}"
+        );
+        assert!(flagged.contains("rmdir"), "rmdir -p lost the command:\n{flagged}");
+
+        // The native fs loops write bash's diagnostics to stderr
+        // unconditionally, so a `2>` redirect must keep the shell-out.
+        let redirected = render("mkdir d\nrm -r -f d 2>/dev/null\n");
+        assert!(
+            !redirected.contains("std::fs::remove_dir_all("),
+            "a redirected rm was lowered (its diagnostics would leak):\n{redirected}"
+        );
+    }
+
     #[test]
     fn do_while_status_bookkeeping_follows_liveness() {
         use crate::ir::{AssignTarget, IrExpr, IrProgram, IrStmt};
