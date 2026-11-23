@@ -11894,6 +11894,30 @@ while __sh_path.len() > 1 && __sh_path.ends_with('/') {{ __sh_path = &__sh_path[
                 self.emit("__SH_RC.store(0, Ordering::Relaxed);");
                 return;
             }
+            // The general word list (a splat/array part, or several parts
+            // that are not one-element vecs) is bash's `echo` output: the
+            // flattened words joined by ONE space, plus `echo`'s newline
+            // (which a zero-word `echo` also prints). With no sink able to
+            // be active here that is `concat().join(" ")` on `std` — no
+            // `Vec<Vec<String>>` helper, no shell string. `-e` stays on the
+            // helper: the escape decoder (`__sh_echo_esc`, incl. `\c`'s
+            // truncation) is a runtime function, not plumbing.
+            if !esc && self.sink_free_here() {
+                if ws.is_empty() {
+                    // `echo -n` with no words writes nothing at all.
+                    if nl {
+                        self.emit("println!();");
+                    }
+                } else {
+                    let joined = format!("[{}].concat()", ws.join(", "));
+                    self.emit(&format!(
+                        "{{ let __sh_w = {joined}; if !__sh_w.is_empty() {{ print!(\"{{}}\", __sh_w.join(\" \")); }}{} }}",
+                        if nl { " println!();" } else { "" }
+                    ));
+                }
+                self.emit("__SH_RC.store(0, Ordering::Relaxed);");
+                return;
+            }
             self.sink_check_needed = true;
             self.emit(&format!("__sh_print_words(&[{}], {}, {});", ws.join(", "), nl, esc));
             self.emit("__SH_RC.store(0, Ordering::Relaxed);");
@@ -23514,6 +23538,38 @@ mod tests {
     /// status-bookkeeping gate is pinned here: with no observable `$?`
     /// the capture/restore pair must go; a live `$?` reader after the
     /// loop must keep it.
+    /// Class 2 (the output sink): a sink-free `echo` whose words are a
+    /// splat/array part is bash's flattened-word join, spelled on `std`; a
+    /// capture makes its buffer the sink, so the helper must stay there.
+    #[test]
+    fn sink_free_multi_word_echo_is_inline_and_captures_keep_the_sink() {
+        let plain = render("arr=(a b)\necho \"pre\" \"${arr[@]}\"\n");
+        assert!(
+            plain.contains(".join(\" \")"),
+            "multi-word echo not inline:\n{plain}"
+        );
+        assert!(
+            !plain.contains("__sh_print_words"),
+            "sink-free echo used the helper:\n{plain}"
+        );
+
+        // `echo -n`: the same join, no newline.
+        let quiet = render("arr=(a b)\necho -n \"${arr[@]}\"\n");
+        assert!(
+            !quiet.contains("println!();"),
+            "echo -n grew a newline:\n{quiet}"
+        );
+
+        // Inside `$(…)` the capture buffer IS the sink: a direct print would
+        // leak to the terminal and store nothing.
+        let cap = render("a=one\nx=$(echo \"v$a\" \"w$b\")\nprintf \"%s\\n\" \"$x\"\n");
+        assert!(
+            cap.contains("__sh_print_words"),
+            "capture echo lost its sink:\n{cap}"
+        );
+        assert!(cap.contains("__sh_sink"), "capture has no sink route:\n{cap}");
+    }
+
     /// `rmdir` has no statement-position CALL form in the corpus, so it
     /// arrives as a bare `IrStmt::Exec`; the native hook in that arm must take
     /// it, and must leave the two shapes the arm does not model on the shell
