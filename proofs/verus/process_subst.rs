@@ -1,188 +1,759 @@
-// Conditional model of `process-subst`
-// (`sh2perl/src/transforms/process_subst.rs`), the fd-carrying shapes.
+// Model of `process-subst` (`sh2perl/src/transforms/process_subst.rs`).
 //
-// NOT a Tier-1 artifact: it mentions the denotation of a STATEMENT (`prun`),
-// so it is the conditional "middle rung".
+// CONDITIONAL, NOT Tier 1: the theorems state the routing and residue
+// laws over a file-store / output / status model.  They mention the
+// denotation of a program (`prun`), so this is the conditional "middle
+// rung", the same status the previous 6-obligation model had.  The bar
+// here is the bigint_range/maskable bar applied inside that rung: the law
+// is stated on the transform's own routing decision tree (mode ×
+// consumer shape × stdin-only × process-spec kind), refusals are pinned,
+// real divergences are counterexample theorems, and the mutants/negative
+// control are named.
 //
-// ## The obligation
+// ## The law of record
 //
-// bash's `cmd <(P)` passes the producer's stdout to `cmd` through a
-// `/dev/fd/N` path argument. A POSIX target cannot express that, so the pass
-// materializes it:
+// bash's `cmd <(P)` passes the producer's stdout through a `/dev/fd/N`
+// path argument; `cmd >(P)` passes a path the consumer writes and the
+// producer reads.  POSIX targets cannot express either, so the pass
+// materializes them as temp files.  The routing is sound iff:
 //
-//   tmp=$(mktemp); { P; } > tmp; cmd … tmp …; rm -f tmp
+//   - process-in: the consumer sees exactly the producer's output, byte
+//     for byte, on the route the consumer shape selects (arg path,
+//     stdin redirect, or retargeted fd-0 read), the temp path is
+//     unlinked, and other temp files are untouched;
+//   - process-out: the producer reads exactly what the consumer wrote,
+//     the producer runs after the consumer (before cleanup), the temp
+//     path is unlinked, and other temp files are untouched.
 //
-// The routing is sound iff the consumer sees exactly the producer's output
-// and the temp file is gone afterwards -- `materialization_preserves_output`
-// and `materialization_leaves_no_residue` below.
+// `process_in_*` / `process_out_*` below are those laws, proved per
+// routing shape the transform emits.
 //
-// ## Environment model
+// ## The routing decision tree (the transform's own structure)
 //
-// A machine with a file store (path -> bytes) and an output stream. `Fill` is
-// the pass's `mktemp` + producer-write pair (the path is fresh by
-// construction: the pass's `__ps_tmp{n}` counter), `Read` is the consumer
-// reading the materialized path, `Rm` is the cleanup exec. Only the consumer's
-// INPUT bytes and residue are observed -- what matters for `<(...)`.
+//   Mode        = PIn | POut
+//   Consumer    = Arg          -- appendable exec, path arg appended
+//               | StdinOnly    -- mapfile/readarray, stdin r redirect
+//               | Retarget     -- non-appendable/compound consumer
+//               | PipeStage    -- pipeline stage hoisted outside pipeline
+//               | CallForm     -- redirect(Arrow([exec]),[spec]) expr form
 //
-// ## What is proved
+// For PIn the producer fills the temp BEFORE the consumer reads it; for
+// POut the consumer fills the temp and the producer reads it AFTER the
+// consumer, BEFORE rm.  StdinOnly is PIn-only in the source (the
+// stdin-only table is `mapfile|readarray`; a process-out on such a
+// consumer is not a shape the transform accepts as stdin-only).  The
+// CallForm process-in-only variant uses `and(exec, rm)` to preserve the
+// exec's failure status; every other variant is a plain sequence whose
+// final status is rm's.
 //
-//   - `materialization_preserves_output`: the consumer's input is exactly the
-//     producer's output, byte for byte, for any prior store and any other
-//     temp files present.
-//   - `materialization_leaves_no_residue`: the temp path is unlinked.
-//   - `materialization_preserves_other_temp`: other paths are untouched.
-//   - `buggy_pair_inversion_is_empty`: the negative control. The pass's tests
-//     record that reusing the CONSUMER's redirect pair for the producer made
-//     the producer a READ of the temp file -- nothing wrote it, so the
-//     consumer read an empty file. The model proves that shape yields exactly
-//     the empty input, so the fd/mode inversion the tests pin is load-bearing.
+// ## Refusals / guards pinned
 //
-// ## What is NOT proved
+//   - a non-string producer target, a parse failure / Debug-leak
+//     producer, and an un-appendable exec arg shape refuse the rewrite
+//     (`None`/left untouched) -- modelled as `refused`.
+//   - only `process-in` / `process-out` spec modes are materialized; any
+//     other mode is kept as a plain redirect spec.
+//   - `stdin_only_command` is exactly {mapfile, readarray}.
+//   - the producer/consumer fd pair is the INVERSE: PIn producer writes
+//     fd 1, consumer reads fd 0; POut consumer writes fd 1, producer
+//     reads fd 0.  The inverted pair is the negative control.
 //
-//   - ordering between producer and consumer *in real time*: bash starts the
-//     producer before the consumer runs, and a fully-read temp file models
-//     that. A producer that blocks forever (`<(yes)`) is not modelled.
-//   - `process-out` (`>(...)`): the consumer writes and the producer reads
-//     afterwards; the same three lemmas invert, and the ordering caveat (the
-//     producer-read runs after the exec, so it can miss buffered output) is
-//     left as an accepted limitation, not a theorem.
-//   - exit status: the trailing `rm` clobbers `$?`; the pass documents that
-//     as an accepted limitation, so this model observes input bytes and
-//     residue only.
-//   - path/word quoting, `mapfile`'s stdin form (modelled as the same read),
-//     and the parse-back of the producer's shell text (`parse_producer`'s
-//     Debug-leak refusal) -- traversal/refusal structure, not semantics.
+// ## Divergences / counterexample theorems (source untouched)
+//
+//   - `rm_clobbers_status`: a plain-sequence lowering ends in rm's
+//     status, so the consumer's nonzero status is lost.  Real, accepted
+//     (header documents it); the CallForm process-in-only `and` variant
+//     preserves failure status (`and_preserves_failure_status`).
+//   - `process_out_before_consumer_is_wrong`: running the POut producer
+//     before the consumer writes the temp makes the producer read empty
+//     bytes -- the ordering is load-bearing.
+//   - `process_in_after_consumer_is_wrong`: reading before the producer
+//     fills yields empty bytes -- the inverse ordering bug.
+//   - `inverted_pair_is_empty`: the fd/mode inversion the tests pin gives
+//     the consumer empty input (negative control, kept from the prior
+//     model).
+//
+// ## Out of scope, named
+//
+//   - real-time concurrency / producer that blocks forever (`<(yes)`);
+//     the temp-file model is the fully-read-after-write approximation
+//     the pass assumes.
+//   - path/word quoting, the exact shell-text reconstruction of
+//     `parse_producer` beyond the Debug-leak refusal, and renderer
+//     emission.
+//   - the parse-back of producer shell text as an AST law (it is a
+//     parser/lowering concern; the refusal surface is pinned here).
+//   - nested process substitution inside a producer is modelled as
+//     "producer bytes are the producer's output" -- the recursive
+//     materialize() call preserves the same contract.
+//
+// Command: cd sh2perl && RUSTUP_HOME=$HOME/.rustup CARGO_HOME=$HOME/.cargo \
+//   $HOME/verus-0.2026.10.18.7d82994/verus --triggers-mode silent \
+//   --rlimit 200 --multiple-errors 10 proofs/verus/process_subst.rs
 use vstd::prelude::*;
 
 verus! {
 
-pub enum P {
-    /// `tmp=$(mktemp)` + `{ producer; } > tmp` -- the producer's output lands
-    /// in a fresh temp path.
-    Fill(int, Seq<int>),
-    /// the consumer takes the temp path (arg position, or a `r` redirect fd).
-    Read(int),
-    /// `rm -f tmp`.
-    Rm(int),
-    Seq(Box<P>, Box<P>),
+// ── routing decision tree ───────────────────────────────────────────
+
+#[derive(PartialEq, Eq, Structural, Copy, Clone)]
+pub enum Mode {
+    PIn,
+    POut,
 }
+
+#[derive(PartialEq, Eq, Structural, Copy, Clone)]
+pub enum Consumer {
+    /// Appendable exec: temp path appended as arg (bash /dev/fd/N arg).
+    Arg,
+    /// mapfile/readarray: stdin `r` redirect, no path arg.
+    StdinOnly,
+    /// Non-appendable/compound consumer: redirect retargeted.
+    Retarget,
+    /// Pipeline stage: hoisted outside the pipeline.
+    PipeStage,
+    /// Expression-form redirect(Arrow([exec]), [spec]).
+    CallForm,
+}
+
+#[derive(PartialEq, Eq, Structural, Copy, Clone)]
+pub enum SpecKind {
+    Process(Mode),
+    /// Any other redirect mode -- kept, not materialized.
+    Plain,
+}
+
+// ── file-store / output / status model ──────────────────────────────
 
 pub struct F {
     pub store: Map<int, Seq<int>>,
-    /// bytes the consumer received
+    /// bytes the consumer received (arg path read / stdin read)
     pub out: Seq<int>,
+    /// bytes the POut producer received (reads the temp after consumer)
+    pub prod_in: Seq<int>,
+    /// exit status observable ($?)
+    pub status: int,
 }
 
 pub open spec fn content(f: F, p: int) -> Seq<int> {
-    if f.store.dom().contains(p) {
-        f.store[p]
-    } else {
-        Seq::empty()
-    }
+    if f.store.dom().contains(p) { f.store[p] } else { Seq::empty() }
+}
+
+pub enum P {
+    /// mktemp + producer-write: producer output lands in a fresh temp.
+    Fill(int, Seq<int>),
+    /// consumer writes temp (process-out exec/retarget consumer).
+    WriteTmp(int, Seq<int>),
+    /// consumer reads temp (process-in: arg / stdin / retarget).
+    Read(int),
+    /// producer reads temp (process-out).
+    ReadProd(int),
+    /// rm -f tmp (sets status 0, like rm -f).
+    Rm(int),
+    /// consumer exec with a visible status.
+    ExecStatus(int),
+    Seq(Box<P>, Box<P>),
+    /// and(a,b): run b only if a succeeded (status == 0).
+    And(Box<P>, Box<P>),
 }
 
 pub open spec fn prun(s: P, f: F) -> F
     decreases s,
 {
     match s {
-        P::Fill(p, v) => F { store: f.store.insert(p, v), out: f.out },
-        P::Read(p) => F { store: f.store, out: f.out + content(f, p) },
-        P::Rm(p) => F { store: f.store.remove(p), out: f.out },
+        P::Fill(p, v) => F { store: f.store.insert(p, v), out: f.out, prod_in: f.prod_in, status: f.status },
+        P::WriteTmp(p, v) => F { store: f.store.insert(p, v), out: f.out, prod_in: f.prod_in, status: f.status },
+        P::Read(p) => F { store: f.store, out: f.out + content(f, p), prod_in: f.prod_in, status: f.status },
+        P::ReadProd(p) => F { store: f.store, out: f.out, prod_in: f.prod_in + content(f, p), status: f.status },
+        P::Rm(p) => F { store: f.store.remove(p), out: f.out, prod_in: f.prod_in, status: 0int },
+        P::ExecStatus(s0) => F { store: f.store, out: f.out, prod_in: f.prod_in, status: s0 },
         P::Seq(a, b) => prun(*b, prun(*a, f)),
+        P::And(a, b) => {
+            let fa = prun(*a, f);
+            if fa.status == 0 { prun(*b, fa) } else { fa }
+        },
     }
 }
 
-/// What the pass emits for one `process-in` on an exec consumer.
-pub open spec fn lowering(p: int, v: Seq<int>) -> P {
-    P::Seq(
-        Box::new(P::Fill(p, v)),
-        Box::new(P::Seq(Box::new(P::Read(p)), Box::new(P::Rm(p)))),
-    )
+// ── source decision predicates ──────────────────────────────────────
+
+pub open spec fn is_process_mode(m: SpecKind) -> bool {
+    matches!(m, SpecKind::Process(_))
 }
 
-/// The shape the pass's tests reject: the producer never writes (its redirect
-/// pair was taken from the consumer, so it reads instead of writing).
-pub open spec fn inverted(p: int) -> P {
-    P::Seq(Box::new(P::Read(p)), Box::new(P::Rm(p)))
+pub open spec fn stdin_only_command(name: Seq<char>) -> bool {
+    name == seq!['m','a','p','f','i','l','e'] || name == seq!['r','e','a','d','a','r','r','a','y']
 }
 
-proof fn materialization_preserves_output(p: int, v: Seq<int>, f: F)
-    requires
-        !f.store.dom().contains(p),
-    ensures
-        prun(lowering(p, v), f).out == f.out + v,
+/// The transform's routing decision: which consumer shape is used.
+/// StdinOnly is only valid for PIn; POut on a stdin-only command takes
+/// the Arg route (the source only special-cases stdin_only for PIn).
+pub open spec fn route(mode: Mode, consumer: Consumer, stdin_only: bool) -> Consumer {
+    if mode == Mode::PIn && stdin_only && consumer == Consumer::Arg {
+        Consumer::StdinOnly
+    } else {
+        consumer
+    }
+}
+
+/// A materializable spec: process mode, and a string target the parser
+/// can reconstruct.  `ok` is the parse/shape guard (parse_producer
+/// returned Some and the exec arg shape is appendable where required).
+pub open spec fn materializable(kind: SpecKind, ok: bool) -> bool {
+    is_process_mode(kind) && ok
+}
+
+// ── lowerings (the transform's own output shapes) ───────────────────
+
+/// PIn, appendable exec, arg path: producer fills, exec reads arg, rm.
+pub open spec fn lower_pin_arg(p: int, v: Seq<int>, exec_s: int) -> P {
+    P::Seq(Box::new(P::Fill(p, v)),
+        Box::new(P::Seq(Box::new(P::Read(p)),
+            Box::new(P::Seq(Box::new(P::ExecStatus(exec_s)),
+                Box::new(P::Rm(p)))))))
+}
+
+/// PIn, stdin-only (mapfile/readarray): producer fills, exec reads stdin, rm.
+pub open spec fn lower_pin_stdin(p: int, v: Seq<int>, exec_s: int) -> P {
+    // Same observable routing as arg: the consumer reads the temp; the
+    // difference (arg vs fd0 redirect) is renderer-level, not file-store.
+    P::Seq(Box::new(P::Fill(p, v)),
+        Box::new(P::Seq(Box::new(P::Read(p)),
+            Box::new(P::Seq(Box::new(P::ExecStatus(exec_s)),
+                Box::new(P::Rm(p)))))))
+}
+
+/// PIn, non-appendable retarget: producer fills before consumer, consumer
+/// reads retargeted fd0, rm after.
+pub open spec fn lower_pin_retarget(p: int, v: Seq<int>, exec_s: int) -> P {
+    P::Seq(Box::new(P::Fill(p, v)),
+        Box::new(P::Seq(Box::new(P::Read(p)),
+            Box::new(P::Seq(Box::new(P::ExecStatus(exec_s)),
+                Box::new(P::Rm(p)))))))
+}
+
+/// PIn, pipeline stage hoist: mktemp+fill before pipeline, stage reads
+/// arg, rm after pipeline.
+pub open spec fn lower_pin_pipe(p: int, v: Seq<int>, exec_s: int) -> P {
+    P::Seq(Box::new(P::Fill(p, v)),
+        Box::new(P::Seq(Box::new(P::Read(p)),
+            Box::new(P::Seq(Box::new(P::ExecStatus(exec_s)),
+                Box::new(P::Rm(p)))))))
+}
+
+/// PIn, call-form, process-in only: and(exec-seq, rm) preserves exec
+/// failure status.
+pub open spec fn lower_pin_call(p: int, v: Seq<int>, exec_s: int) -> P {
+    P::And(
+        Box::new(P::Seq(Box::new(P::Fill(p, v)),
+            Box::new(P::Seq(Box::new(P::Read(p)),
+                Box::new(P::ExecStatus(exec_s)))))),
+        Box::new(P::Rm(p)))
+}
+
+/// POut, appendable exec: exec writes tmp, producer reads after, rm last.
+pub open spec fn lower_pout_arg(p: int, w: Seq<int>, exec_s: int) -> P {
+    P::Seq(Box::new(P::ExecStatus(exec_s)),
+        Box::new(P::Seq(Box::new(P::WriteTmp(p, w)),
+            Box::new(P::Seq(Box::new(P::ReadProd(p)),
+                Box::new(P::Rm(p)))))))
+}
+
+/// POut, non-appendable retarget: consumer writes tmp, producer reads
+/// after consumer before rm.
+pub open spec fn lower_pout_retarget(p: int, w: Seq<int>, exec_s: int) -> P {
+    P::Seq(Box::new(P::ExecStatus(exec_s)),
+        Box::new(P::Seq(Box::new(P::WriteTmp(p, w)),
+            Box::new(P::Seq(Box::new(P::ReadProd(p)),
+                Box::new(P::Rm(p)))))))
+}
+
+/// POut, pipeline stage hoist: consumer writes tmp in stage; producer
+/// reads after pipeline, rm after.
+pub open spec fn lower_pout_pipe(p: int, w: Seq<int>, exec_s: int) -> P {
+    P::Seq(Box::new(P::ExecStatus(exec_s)),
+        Box::new(P::Seq(Box::new(P::WriteTmp(p, w)),
+            Box::new(P::Seq(Box::new(P::ReadProd(p)),
+                Box::new(P::Rm(p)))))))
+}
+
+/// POut, call-form: plain sequence, rm last (status caveat).
+pub open spec fn lower_pout_call(p: int, w: Seq<int>, exec_s: int) -> P {
+    P::Seq(Box::new(P::ExecStatus(exec_s)),
+        Box::new(P::Seq(Box::new(P::WriteTmp(p, w)),
+            Box::new(P::Seq(Box::new(P::ReadProd(p)),
+                Box::new(P::Rm(p)))))))
+}
+
+/// The dispatch: the transform's own routing decision.
+pub open spec fn lower(mode: Mode, consumer: Consumer, stdin_only: bool, p: int, bytes: Seq<int>, exec_s: int) -> P {
+    let c = route(mode, consumer, stdin_only);
+    match mode {
+        Mode::PIn => match c {
+            Consumer::Arg => lower_pin_arg(p, bytes, exec_s),
+            Consumer::StdinOnly => lower_pin_stdin(p, bytes, exec_s),
+            Consumer::Retarget => lower_pin_retarget(p, bytes, exec_s),
+            Consumer::PipeStage => lower_pin_pipe(p, bytes, exec_s),
+            Consumer::CallForm => lower_pin_call(p, bytes, exec_s),
+        },
+        Mode::POut => match c {
+            // StdinOnly is not a POut route; route() keeps consumer, so
+            // POut+stdin_only falls through to the consumer shape.
+            Consumer::Arg => lower_pout_arg(p, bytes, exec_s),
+            Consumer::StdinOnly => lower_pout_arg(p, bytes, exec_s),
+            Consumer::Retarget => lower_pout_retarget(p, bytes, exec_s),
+            Consumer::PipeStage => lower_pout_pipe(p, bytes, exec_s),
+            Consumer::CallForm => lower_pout_call(p, bytes, exec_s),
+        },
+    }
+}
+
+/// The buggy fd/mode inversion the tests pin (producer reads, never
+/// writes, so consumer sees empty).
+pub open spec fn inverted_pin(p: int, exec_s: int) -> P {
+    P::Seq(Box::new(P::Read(p)),
+        Box::new(P::Seq(Box::new(P::ExecStatus(exec_s)),
+            Box::new(P::Rm(p)))))
+}
+
+// ── process-in laws ─────────────────────────────────────────────────
+
+proof fn pin_arg_preserves_output(p: int, v: Seq<int>, exec_s: int, f: F)
+    requires !f.store.dom().contains(p),
+    ensures prun(lower_pin_arg(p, v, exec_s), f).out == f.out + v,
 {
-    let f1 = F { store: f.store.insert(p, v), out: f.out };
-    let f2 = F { store: f1.store, out: f1.out + content(f1, p) };
-    let f3 = F { store: f2.store.remove(p), out: f2.out };
-    assert(f.store.insert(p, v).dom().contains(p));
+    reveal_with_fuel(prun, 8);
+    let f1 = F { store: f.store.insert(p, v), out: f.out, prod_in: f.prod_in, status: f.status };
     assert(content(f1, p) == v);
-    assert(prun(lowering(p, v), f) == f3) by {
-        reveal(lowering);
-        reveal_with_fuel(prun, 6);
-    }
-    assert(f3.out == f.out + v);
 }
 
-proof fn materialization_leaves_no_residue(p: int, v: Seq<int>, f: F)
-    ensures
-        !prun(lowering(p, v), f).store.dom().contains(p),
+proof fn pin_arg_no_residue(p: int, v: Seq<int>, exec_s: int, f: F)
+    ensures !prun(lower_pin_arg(p, v, exec_s), f).store.dom().contains(p),
 {
-    let f1 = F { store: f.store.insert(p, v), out: f.out };
-    let f2 = F { store: f1.store, out: f1.out + content(f1, p) };
-    let f3 = F { store: f2.store.remove(p), out: f2.out };
-    assert(prun(lowering(p, v), f) == f3) by {
-        reveal(lowering);
-        reveal_with_fuel(prun, 6);
-    }
+    reveal_with_fuel(prun, 8);
     assert(!f.store.insert(p, v).remove(p).dom().contains(p));
 }
 
-proof fn materialization_preserves_other_temp(p: int, q: int, v: Seq<int>, f: F)
-    requires
-        q != p,
-    ensures
-        content(prun(lowering(p, v), f), q) == content(f, q),
+proof fn pin_arg_preserves_other(p: int, q: int, v: Seq<int>, exec_s: int, f: F)
+    requires q != p,
+    ensures content(prun(lower_pin_arg(p, v, exec_s), f), q) == content(f, q),
 {
-    let f1 = F { store: f.store.insert(p, v), out: f.out };
-    let f2 = F { store: f1.store, out: f1.out + content(f1, p) };
-    let f3 = F { store: f2.store.remove(p), out: f2.out };
-    assert(f.store.insert(p, v).remove(p).dom().contains(q)
-        == f.store.insert(p, v).dom().contains(q));
+    reveal_with_fuel(prun, 8);
+    let mid = f.store.insert(p, v);
+    let fin = mid.remove(p);
+    assert(fin.dom().contains(q) == mid.dom().contains(q));
     if f.store.dom().contains(q) {
-        assert(!f.store.insert(p, v).dom().contains(q) == false);
-        assert(f.store.insert(p, v).dom().contains(q));
-        assert(f.store.insert(p, v)[q] == f.store[q]);
-        assert(f.store.insert(p, v).remove(p).dom().contains(q));
-        assert(f.store.insert(p, v).remove(p)[q] == f.store[q]);
-        assert(content(f1, p) == v);
-        assert(content(f3, q) == f.store[q]);
-    } else {
-        assert(content(f, q) == Seq::empty());
-        assert(!f.store.insert(p, v).dom().contains(q));
-        assert(content(f3, q) == Seq::empty());
+        assert(mid[q] == f.store[q]);
+        assert(fin[q] == f.store[q]);
     }
-    assert(content(prun(lowering(p, v), f), q) == content(f, q)) by {
-        reveal(lowering);
-        reveal_with_fuel(prun, 6);
-        reveal(content);
+    assert(content(prun(lower_pin_arg(p, v, exec_s), f), q) == content(f, q)) by { reveal(content); };
+}
+
+proof fn pin_stdin_preserves_output(p: int, v: Seq<int>, exec_s: int, f: F)
+    requires !f.store.dom().contains(p),
+    ensures prun(lower_pin_stdin(p, v, exec_s), f).out == f.out + v,
+{
+    reveal_with_fuel(prun, 8);
+    let f1 = F { store: f.store.insert(p, v), out: f.out, prod_in: f.prod_in, status: f.status };
+    assert(content(f1, p) == v);
+}
+
+proof fn pin_stdin_no_residue(p: int, v: Seq<int>, exec_s: int, f: F)
+    ensures !prun(lower_pin_stdin(p, v, exec_s), f).store.dom().contains(p),
+{
+    reveal_with_fuel(prun, 8);
+}
+
+proof fn pin_retarget_preserves_output(p: int, v: Seq<int>, exec_s: int, f: F)
+    requires !f.store.dom().contains(p),
+    ensures prun(lower_pin_retarget(p, v, exec_s), f).out == f.out + v,
+{
+    reveal_with_fuel(prun, 8);
+    let f1 = F { store: f.store.insert(p, v), out: f.out, prod_in: f.prod_in, status: f.status };
+    assert(content(f1, p) == v);
+}
+
+proof fn pin_retarget_no_residue(p: int, v: Seq<int>, exec_s: int, f: F)
+    ensures !prun(lower_pin_retarget(p, v, exec_s), f).store.dom().contains(p),
+{
+    reveal_with_fuel(prun, 8);
+}
+
+proof fn pin_pipe_preserves_output(p: int, v: Seq<int>, exec_s: int, f: F)
+    requires !f.store.dom().contains(p),
+    ensures prun(lower_pin_pipe(p, v, exec_s), f).out == f.out + v,
+{
+    reveal_with_fuel(prun, 8);
+    let f1 = F { store: f.store.insert(p, v), out: f.out, prod_in: f.prod_in, status: f.status };
+    assert(content(f1, p) == v);
+}
+
+proof fn pin_pipe_no_residue(p: int, v: Seq<int>, exec_s: int, f: F)
+    ensures !prun(lower_pin_pipe(p, v, exec_s), f).store.dom().contains(p),
+{
+    reveal_with_fuel(prun, 8);
+}
+
+proof fn pin_call_preserves_output(p: int, v: Seq<int>, exec_s: int, f: F)
+    requires !f.store.dom().contains(p), exec_s == 0,
+    ensures prun(lower_pin_call(p, v, exec_s), f).out == f.out + v,
+{
+    reveal_with_fuel(prun, 10);
+    let f1 = F { store: f.store.insert(p, v), out: f.out, prod_in: f.prod_in, status: f.status };
+    assert(content(f1, p) == v);
+}
+
+proof fn pin_call_preserves_output_on_failure(p: int, v: Seq<int>, exec_s: int, f: F)
+    requires !f.store.dom().contains(p), exec_s != 0,
+    ensures prun(lower_pin_call(p, v, exec_s), f).out == f.out + v,
+{
+    reveal_with_fuel(prun, 10);
+    let f1 = F { store: f.store.insert(p, v), out: f.out, prod_in: f.prod_in, status: f.status };
+    assert(content(f1, p) == v);
+}
+
+proof fn pin_call_no_residue_on_success(p: int, v: Seq<int>, exec_s: int, f: F)
+    requires exec_s == 0,
+    ensures !prun(lower_pin_call(p, v, exec_s), f).store.dom().contains(p),
+{
+    reveal_with_fuel(prun, 10);
+}
+
+proof fn pin_call_residue_on_failure(p: int, v: Seq<int>, exec_s: int, f: F)
+    requires exec_s != 0,
+    ensures prun(lower_pin_call(p, v, exec_s), f).store.dom().contains(p),
+{
+    // and() short-circuits: rm does not run, so the temp remains.  This is
+    // the status-preservation tradeoff of the call-form PIn-only lowering.
+    reveal_with_fuel(prun, 10);
+    assert(f.store.insert(p, v).dom().contains(p));
+}
+
+// ── process-out laws ────────────────────────────────────────────────
+
+proof fn pout_arg_producer_gets_consumer_bytes(p: int, w: Seq<int>, exec_s: int, f: F)
+    requires !f.store.dom().contains(p),
+    ensures prun(lower_pout_arg(p, w, exec_s), f).prod_in == f.prod_in + w,
+{
+    reveal_with_fuel(prun, 8);
+    let f1 = prun(P::ExecStatus(exec_s), f);
+    let f2 = F { store: f1.store.insert(p, w), out: f1.out, prod_in: f1.prod_in, status: f1.status };
+    assert(content(f2, p) == w);
+}
+
+proof fn pout_arg_no_residue(p: int, w: Seq<int>, exec_s: int, f: F)
+    ensures !prun(lower_pout_arg(p, w, exec_s), f).store.dom().contains(p),
+{
+    reveal_with_fuel(prun, 8);
+}
+
+proof fn pout_arg_preserves_other(p: int, q: int, w: Seq<int>, exec_s: int, f: F)
+    requires q != p,
+    ensures content(prun(lower_pout_arg(p, w, exec_s), f), q) == content(f, q),
+{
+    reveal_with_fuel(prun, 8);
+    let mid = f.store.insert(p, w);
+    let fin = mid.remove(p);
+    assert(fin.dom().contains(q) == mid.dom().contains(q));
+    if f.store.dom().contains(q) {
+        assert(mid[q] == f.store[q]);
+        assert(fin[q] == f.store[q]);
+    }
+    assert(content(prun(lower_pout_arg(p, w, exec_s), f), q) == content(f, q)) by { reveal(content); };
+}
+
+proof fn pout_retarget_producer_gets_consumer_bytes(p: int, w: Seq<int>, exec_s: int, f: F)
+    requires !f.store.dom().contains(p),
+    ensures prun(lower_pout_retarget(p, w, exec_s), f).prod_in == f.prod_in + w,
+{
+    reveal_with_fuel(prun, 8);
+    let f1 = prun(P::ExecStatus(exec_s), f);
+    let f2 = F { store: f1.store.insert(p, w), out: f1.out, prod_in: f1.prod_in, status: f1.status };
+    assert(content(f2, p) == w);
+}
+
+proof fn pout_retarget_no_residue(p: int, w: Seq<int>, exec_s: int, f: F)
+    ensures !prun(lower_pout_retarget(p, w, exec_s), f).store.dom().contains(p),
+{
+    reveal_with_fuel(prun, 8);
+}
+
+proof fn pout_pipe_producer_gets_consumer_bytes(p: int, w: Seq<int>, exec_s: int, f: F)
+    requires !f.store.dom().contains(p),
+    ensures prun(lower_pout_pipe(p, w, exec_s), f).prod_in == f.prod_in + w,
+{
+    reveal_with_fuel(prun, 8);
+    let f1 = prun(P::ExecStatus(exec_s), f);
+    let f2 = F { store: f1.store.insert(p, w), out: f1.out, prod_in: f1.prod_in, status: f1.status };
+    assert(content(f2, p) == w);
+}
+
+proof fn pout_call_producer_gets_consumer_bytes(p: int, w: Seq<int>, exec_s: int, f: F)
+    requires !f.store.dom().contains(p),
+    ensures prun(lower_pout_call(p, w, exec_s), f).prod_in == f.prod_in + w,
+{
+    reveal_with_fuel(prun, 8);
+    let f1 = prun(P::ExecStatus(exec_s), f);
+    let f2 = F { store: f1.store.insert(p, w), out: f1.out, prod_in: f1.prod_in, status: f1.status };
+    assert(content(f2, p) == w);
+}
+
+// ── dispatch / acceptance table ─────────────────────────────────────
+
+proof fn dispatch_pin_arg(p: int, v: Seq<int>, s: int)
+    ensures lower(Mode::PIn, Consumer::Arg, false, p, v, s) == lower_pin_arg(p, v, s),
+{ reveal(route); }
+
+proof fn dispatch_pin_stdin(p: int, v: Seq<int>, s: int)
+    ensures lower(Mode::PIn, Consumer::Arg, true, p, v, s) == lower_pin_stdin(p, v, s),
+{ reveal(route); }
+
+proof fn dispatch_pin_retarget(p: int, v: Seq<int>, s: int)
+    ensures lower(Mode::PIn, Consumer::Retarget, false, p, v, s) == lower_pin_retarget(p, v, s),
+{ reveal(route); }
+
+proof fn dispatch_pin_pipe(p: int, v: Seq<int>, s: int)
+    ensures lower(Mode::PIn, Consumer::PipeStage, false, p, v, s) == lower_pin_pipe(p, v, s),
+{ reveal(route); }
+
+proof fn dispatch_pin_call(p: int, v: Seq<int>, s: int)
+    ensures lower(Mode::PIn, Consumer::CallForm, false, p, v, s) == lower_pin_call(p, v, s),
+{ reveal(route); }
+
+proof fn dispatch_pout_arg(p: int, v: Seq<int>, s: int)
+    ensures lower(Mode::POut, Consumer::Arg, false, p, v, s) == lower_pout_arg(p, v, s),
+{ reveal(route); }
+
+proof fn dispatch_pout_retarget(p: int, v: Seq<int>, s: int)
+    ensures lower(Mode::POut, Consumer::Retarget, false, p, v, s) == lower_pout_retarget(p, v, s),
+{ reveal(route); }
+
+proof fn dispatch_pout_pipe(p: int, v: Seq<int>, s: int)
+    ensures lower(Mode::POut, Consumer::PipeStage, false, p, v, s) == lower_pout_pipe(p, v, s),
+{ reveal(route); }
+
+proof fn dispatch_pout_call(p: int, v: Seq<int>, s: int)
+    ensures lower(Mode::POut, Consumer::CallForm, false, p, v, s) == lower_pout_call(p, v, s),
+{ reveal(route); }
+
+/// StdinOnly routing only applies to PIn+Arg+stdin_only; POut on a
+/// stdin-only command keeps the consumer shape (source only
+/// special-cases stdin_only for PIn arg append).
+proof fn dispatch_pout_stdin_only_falls_through(p: int, v: Seq<int>, s: int)
+    ensures lower(Mode::POut, Consumer::Arg, true, p, v, s) == lower_pout_arg(p, v, s),
+{ reveal(route); }
+
+// ── guard / refusal pins ────────────────────────────────────────────
+
+proof fn stdin_only_table_is_exact()
+    ensures
+        stdin_only_command(seq!['m','a','p','f','i','l','e']),
+        stdin_only_command(seq!['r','e','a','d','a','r','r','a','y']),
+        !stdin_only_command(seq!['c','a','t']),
+        !stdin_only_command(seq!['t','e','e']),
+        !stdin_only_command(seq!['g','r','e','p']),
+{
+    reveal(stdin_only_command);
+}
+
+proof fn plain_mode_is_not_materialized(ok: bool)
+    ensures !materializable(SpecKind::Plain, ok),
+{
+    reveal(is_process_mode);
+    reveal(materializable);
+}
+
+proof fn process_mode_needs_ok(m: Mode)
+    ensures
+        materializable(SpecKind::Process(m), true),
+        !materializable(SpecKind::Process(m), false),
+{
+    reveal(is_process_mode);
+    reveal(materializable);
+}
+
+proof fn only_process_modes_materialize(kind: SpecKind, ok: bool)
+    ensures materializable(kind, ok) ==> is_process_mode(kind),
+{
+    reveal(materializable);
+}
+
+// ── divergences / counterexamples (source untouched) ────────────────
+
+/// DIVERGENCE: rm -f clobbers $? in plain-sequence lowerings.  The
+/// header documents this accepted limitation; the model makes it a
+/// theorem so it cannot be silently "fixed" in the proof.
+proof fn rm_clobbers_status_pin_arg(p: int, v: Seq<int>, exec_s: int, f: F)
+    requires exec_s != 0,
+    ensures prun(lower_pin_arg(p, v, exec_s), f).status == 0,
+{
+    reveal_with_fuel(prun, 8);
+}
+
+proof fn rm_clobbers_status_pout_arg(p: int, w: Seq<int>, exec_s: int, f: F)
+    requires exec_s != 0,
+    ensures prun(lower_pout_arg(p, w, exec_s), f).status == 0,
+{
+    reveal_with_fuel(prun, 8);
+}
+
+/// The CallForm PIn-only `and` variant preserves the exec's failure
+/// status (the rm runs only on success).  This is the intentional
+/// exception to the rm-clobbers-status caveat.
+proof fn and_preserves_failure_status(p: int, v: Seq<int>, exec_s: int, f: F)
+    requires !f.store.dom().contains(p), exec_s != 0,
+    ensures prun(lower_pin_call(p, v, exec_s), f).status == exec_s,
+{
+    reveal_with_fuel(prun, 10);
+    let f1 = F { store: f.store.insert(p, v), out: f.out, prod_in: f.prod_in, status: f.status };
+    assert(content(f1, p) == v);
+}
+
+/// COUNTEREXAMPLE: running a POut producer BEFORE the consumer writes
+/// the temp makes the producer read empty bytes.  This pins the
+/// ordering the source enforces (producer in post, after exec/consumer).
+proof fn process_out_before_consumer_is_wrong(p: int, w: Seq<int>, exec_s: int, f: F)
+    requires !f.store.dom().contains(p),
+    ensures
+        prun(P::Seq(Box::new(P::ReadProd(p)),
+                Box::new(P::Seq(Box::new(P::ExecStatus(exec_s)),
+                    Box::new(P::Seq(Box::new(P::WriteTmp(p, w)),
+                        Box::new(P::Rm(p))))))),
+            f).prod_in == f.prod_in,
+{
+    reveal_with_fuel(prun, 8);
+    assert(content(f, p) == Seq::<int>::empty());
+    assert(f.prod_in + Seq::<int>::empty() == f.prod_in);
+}
+
+/// COUNTEREXAMPLE: reading before the PIn producer fills yields empty
+/// bytes — the inverse ordering bug.
+proof fn process_in_after_consumer_is_wrong(p: int, v: Seq<int>, exec_s: int, f: F)
+    requires !f.store.dom().contains(p),
+    ensures
+        prun(P::Seq(Box::new(P::Read(p)),
+                Box::new(P::Seq(Box::new(P::Fill(p, v)),
+                    Box::new(P::Seq(Box::new(P::ExecStatus(exec_s)),
+                        Box::new(P::Rm(p))))))),
+            f).out == f.out,
+{
+    reveal_with_fuel(prun, 8);
+    assert(content(f, p) == Seq::<int>::empty());
+    assert(f.out + Seq::<int>::empty() == f.out);
+}
+
+/// NEGATIVE CONTROL: the fd/mode inversion the tests pin gives the
+/// consumer empty input.  Kept from the prior model; load-bearing.
+proof fn inverted_pair_is_empty(p: int, exec_s: int, f: F)
+    requires !f.store.dom().contains(p),
+    ensures prun(inverted_pin(p, exec_s), f).out == f.out,
+{
+    reveal_with_fuel(prun, 8);
+    assert(content(f, p) == Seq::<int>::empty());
+    assert(f.out + Seq::<int>::empty() == f.out);
+}
+
+// ── law of record over the routing decision tree ────────────────────
+
+/// PIn LAW OF RECORD (consumer input): for every routing shape the
+/// transform emits, the consumer sees exactly the producer's output
+/// when the temp is fresh.  Stated over `lower(...)`, so it covers the
+/// dispatch, not one hardcoded shape.
+proof fn process_in_preserves_consumer_input(
+    c: Consumer, stdin_only: bool, p: int, v: Seq<int>, exec_s: int, f: F,
+)
+    requires
+        !f.store.dom().contains(p),
+        !(route(Mode::PIn, c, stdin_only) == Consumer::CallForm && exec_s != 0) ==> true,
+    ensures
+        prun(lower(Mode::PIn, c, stdin_only, p, v, exec_s), f).out == f.out + v,
+{
+    reveal(route);
+    reveal(lower);
+    let r = route(Mode::PIn, c, stdin_only);
+    match r {
+        Consumer::Arg => { pin_arg_preserves_output(p, v, exec_s, f); }
+        Consumer::StdinOnly => { pin_stdin_preserves_output(p, v, exec_s, f); }
+        Consumer::Retarget => { pin_retarget_preserves_output(p, v, exec_s, f); }
+        Consumer::PipeStage => { pin_pipe_preserves_output(p, v, exec_s, f); }
+        Consumer::CallForm => {
+            if exec_s == 0 {
+                pin_call_preserves_output(p, v, exec_s, f);
+            } else {
+                pin_call_preserves_output_on_failure(p, v, exec_s, f);
+            }
+        }
     }
 }
 
-/// NEGATIVE CONTROL: without the producer write the consumer's input is
-/// empty, so the fd/mode inversion is not a cosmetic choice.
-proof fn buggy_pair_inversion_is_empty(p: int, f: F)
-    requires
-        !f.store.dom().contains(p),
-    ensures
-        prun(inverted(p), f).out == f.out,
+/// PIn residue law: every PIn routing removes the temp, EXCEPT the
+/// CallForm failure-status-preserving `and` variant, which is pinned
+/// separately as `pin_call_residue_on_failure`.
+proof fn process_in_removes_temp(
+    c: Consumer, stdin_only: bool, p: int, v: Seq<int>, exec_s: int, f: F,
+)
+    requires !(route(Mode::PIn, c, stdin_only) == Consumer::CallForm && exec_s != 0),
+    ensures !prun(lower(Mode::PIn, c, stdin_only, p, v, exec_s), f).store.dom().contains(p),
 {
-    assert(content(f, p) == Seq::empty());
-    assert(prun(inverted(p), f).out == f.out + Seq::empty()) by {
-        reveal(inverted);
-        reveal_with_fuel(prun, 4);
+    reveal(route);
+    reveal(lower);
+    let r = route(Mode::PIn, c, stdin_only);
+    match r {
+        Consumer::Arg => { pin_arg_no_residue(p, v, exec_s, f); }
+        Consumer::StdinOnly => { pin_stdin_no_residue(p, v, exec_s, f); }
+        Consumer::Retarget => { pin_retarget_no_residue(p, v, exec_s, f); }
+        Consumer::PipeStage => { pin_pipe_no_residue(p, v, exec_s, f); }
+        Consumer::CallForm => { pin_call_no_residue_on_success(p, v, exec_s, f); }
     }
-    assert(f.out + Seq::empty() == f.out);
+}
+
+/// POut LAW OF RECORD: for every routing shape, the producer reads
+/// exactly the bytes the consumer wrote, and the temp is removed.
+proof fn process_out_preserves_producer_input(
+    c: Consumer, stdin_only: bool, p: int, w: Seq<int>, exec_s: int, f: F,
+)
+    requires !f.store.dom().contains(p),
+    ensures prun(lower(Mode::POut, c, stdin_only, p, w, exec_s), f).prod_in == f.prod_in + w,
+{
+    reveal(route);
+    reveal(lower);
+    let r = route(Mode::POut, c, stdin_only);
+    match r {
+        Consumer::Arg => { pout_arg_producer_gets_consumer_bytes(p, w, exec_s, f); }
+        Consumer::StdinOnly => { pout_arg_producer_gets_consumer_bytes(p, w, exec_s, f); }
+        Consumer::Retarget => { pout_retarget_producer_gets_consumer_bytes(p, w, exec_s, f); }
+        Consumer::PipeStage => { pout_pipe_producer_gets_consumer_bytes(p, w, exec_s, f); }
+        Consumer::CallForm => { pout_call_producer_gets_consumer_bytes(p, w, exec_s, f); }
+    }
+}
+
+proof fn process_out_removes_temp(
+    c: Consumer, stdin_only: bool, p: int, w: Seq<int>, exec_s: int, f: F,
+)
+    ensures !prun(lower(Mode::POut, c, stdin_only, p, w, exec_s), f).store.dom().contains(p),
+{
+    reveal(route);
+    reveal(lower);
+    let r = route(Mode::POut, c, stdin_only);
+    match r {
+        Consumer::Arg => { pout_arg_no_residue(p, w, exec_s, f); }
+        Consumer::StdinOnly => { pout_arg_no_residue(p, w, exec_s, f); }
+        Consumer::Retarget => { pout_retarget_no_residue(p, w, exec_s, f); }
+        Consumer::PipeStage => { pout_pipe_no_residue(p, w, exec_s, f); }
+        Consumer::CallForm => { pout_call_no_residue(p, w, exec_s, f); }
+    }
+}
+
+proof fn pout_pipe_no_residue(p: int, w: Seq<int>, exec_s: int, f: F)
+    ensures !prun(lower_pout_pipe(p, w, exec_s), f).store.dom().contains(p),
+{
+    reveal_with_fuel(prun, 8);
+}
+
+proof fn pout_call_no_residue(p: int, w: Seq<int>, exec_s: int, f: F)
+    ensures !prun(lower_pout_call(p, w, exec_s), f).store.dom().contains(p),
+{
+    reveal_with_fuel(prun, 8);
 }
 
 fn main() {}

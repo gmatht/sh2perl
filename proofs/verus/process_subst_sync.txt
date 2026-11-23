@@ -1,0 +1,52 @@
+# verus-sync-coverage manifest: process_subst
+# source sha: process_subst=1d2113f934ce  proof sha: bf00158e9bcd
+
+[pins]
+pin pin_arg_no_residue -> test process_in_materializes_to_temp_file: MAPPED
+pin pin_arg_preserves_other -> UNMIRRORED (by design — see VERUS.md §(b).4)
+pin pin_arg_preserves_output -> test process_in_materializes_to_temp_file: MAPPED
+pin pin_call_no_residue_on_success -> UNMIRRORED (by design — see VERUS.md §(b).4)
+pin pin_call_preserves_output -> test capture_context_is_materialized: MAPPED
+pin pin_call_preserves_output_on_failure -> UNMIRRORED (by design — see VERUS.md §(b).4)
+pin pin_call_residue_on_failure -> UNMIRRORED (by design — see VERUS.md §(b).4)
+pin pin_pipe_no_residue -> test pipeline_process_ins_hoist_outside_the_pipeline: MAPPED
+pin pin_pipe_preserves_output -> test pipeline_process_ins_hoist_outside_the_pipeline: MAPPED
+pin pin_retarget_no_residue -> test while_done_process_in_producer_writes_and_consumer_reads: MAPPED
+pin pin_retarget_preserves_output -> test while_done_process_in_producer_writes_and_consumer_reads: MAPPED
+pin pin_stdin_no_residue -> test mapfile_gets_stdin_redirect_not_arg: MAPPED
+pin pin_stdin_preserves_output -> test mapfile_gets_stdin_redirect_not_arg: MAPPED
+
+[guards]
+guard stmt redirect entry: PRESENT
+guard call-form redirect entry: PRESENT
+guard pipeline hoist entry: PRESENT
+guard stdin-only table: PRESENT
+guard process-in mode: PRESENT
+guard process-out mode: PRESENT
+
+[counts]
+proof-fns: 46
+pins: 13
+# NOTE: proof-fns is a file-shape fact (change detector), NOT the
+# Verus obligation count — the gate asserts N verified separately.
+
+[exec]
+# Each MAPPED test above, EXECUTED against the live source (one
+# module-suite run per model; per-test verdicts grepped from output).
+# A mapped test that fails or vanishes from the run is drift — FATAL.
+# The checker RUNS each mapped test (one module-suite cargo test per
+# source file) and records the per-test PASS/FAIL verdict below.
+# all suites built; per-test verdicts below
+exec pin_arg_no_residue (process_in_materializes_to_temp_file): PASS
+exec pin_arg_preserves_other: UNMIRRORED (not executed)
+exec pin_arg_preserves_output (process_in_materializes_to_temp_file): PASS
+exec pin_call_no_residue_on_success: UNMIRRORED (not executed)
+exec pin_call_preserves_output (capture_context_is_materialized): PASS
+exec pin_call_preserves_output_on_failure: UNMIRRORED (not executed)
+exec pin_call_residue_on_failure: UNMIRRORED (not executed)
+exec pin_pipe_no_residue (pipeline_process_ins_hoist_outside_the_pipeline): PASS
+exec pin_pipe_preserves_output (pipeline_process_ins_hoist_outside_the_pipeline): PASS
+exec pin_retarget_no_residue (while_done_process_in_producer_writes_and_consumer_reads): PASS
+exec pin_retarget_preserves_output (while_done_process_in_producer_writes_and_consumer_reads): PASS
+exec pin_stdin_no_residue (mapfile_gets_stdin_redirect_not_arg): PASS
+exec pin_stdin_preserves_output (mapfile_gets_stdin_redirect_not_arg): PASS
