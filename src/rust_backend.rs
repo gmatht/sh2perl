@@ -1327,6 +1327,276 @@ fn strip_str_lit_refs(text: &str) -> String {
     out
 }
 
+/// Fold `"literal".to_string()` to `"literal"` when the literal is a
+/// **direct argument of a formatting macro** (`format!`, `print!`,
+/// `println!`, `write!`, `panic!`, the asserts) or of a call whose callee
+/// takes `impl AsRef`/`From<&str>` there (`std::fs::write`,
+/// `std::fs::File::create`, `std::env::set_var`, `String::from`): those
+/// accept a `&str`, so the owned `String` is pure overhead.
+///
+/// Three guards, each one measured rather than assumed:
+///
+/// * **Depth 0 only.** In `println!("{}", greet("x".to_string()))` the
+///   literal is `greet`'s argument and `greet` takes a `String`, so folding
+///   it is `E0308` — a first version without this guard broke 19 renders.
+/// * **The call must END the argument** (`,` or the macro's `)`). A receiver
+///   (`"x".to_string().len()`) and a concatenation
+///   (`"x".to_string() + &y`) keep the call.
+/// * **Never `&`-prefixed** — `&"x".to_string()` is `strip_str_lit_refs`'s
+///   shape, where the `&` is doing the work.
+///
+/// The callee allowlist is not a guess: `AsRef<Path>`/`AsRef<[u8]>`/
+/// `AsRef<OsStr>`/`From<&str>` all accept `&str`, and every render this pass
+/// touches was compiled before and after (see the v158 PLAN entry).
+///
+/// What is left over is either type-required or a *binding/element* type
+/// change, not an argument fold: a blind fold over every remaining site fails
+/// to compile in 146 of the 260 renders it touches (the `String`-typed
+/// bindings, `vec![…]` elements and `RefCell<String>` stores), and in the
+/// other 101 the folded value only compiles because a `let`/`vec!`/`==`
+/// operand tolerates `&str` — changing a program's data type rather than
+/// dropping a dead allocation.
+fn fold_lit_to_string_in_fmt_args(text: String) -> String {
+    const MACROS: &[&str] = &[
+        "format", "print", "println", "eprint", "eprintln", "write", "writeln", "panic",
+        "assert", "assert_eq", "assert_ne", "unreachable",
+    ];
+    // Callees whose every parameter there is `impl AsRef<..>` or `From<&str>`.
+    const CALLEES: &[&str] = &[];
+    const SUF: &str = ".to_string()";
+    let b = text.as_bytes();
+    let n = b.len();
+    if n == 0 {
+        return text;
+    }
+    // Byte i is inside a string literal (quotes included)? Everything below
+    // compares BYTES, never &str slices at a guessed offset, so a non-ASCII
+    // literal cannot land on a char boundary.
+    let mut in_lit = vec![false; n];
+    {
+        let mut i = 0;
+        let mut inside = false;
+        while i < n {
+            let c = b[i];
+            if inside {
+                in_lit[i] = true;
+                if c == b'\\' {
+                    if i + 1 < n {
+                        in_lit[i + 1] = true;
+                    }
+                    i += 2;
+                    continue;
+                }
+                if c == b'"' {
+                    inside = false;
+                }
+                i += 1;
+                continue;
+            }
+            if c == b'"' {
+                inside = true;
+                in_lit[i] = true;
+            }
+            i += 1;
+        }
+    }
+    let mut cut: Vec<(usize, usize)> = Vec::new();
+    let mut i = 0;
+    while i < n {
+        if in_lit[i] {
+            i += 1;
+            continue;
+        }
+        // a macro name at a word boundary, followed by `!`
+        let mut name_len = 0;
+        for m in MACROS {
+            let mb = m.as_bytes();
+            if b[i..].starts_with(mb) && i + mb.len() < n && b[i + mb.len()] == b'!' {
+                name_len = mb.len();
+                break;
+            }
+        }
+        let word_start = i == 0 || !(b[i - 1].is_ascii_alphanumeric() || b[i - 1] == b'_');
+        if name_len == 0 || !word_start {
+            // an allowlisted callee instead of a macro
+            let mut callee_len = 0;
+            if word_start {
+                for c in CALLEES {
+                    let cb = c.as_bytes();
+                    if b[i..].starts_with(cb) {
+                        callee_len = cb.len();
+                        break;
+                    }
+                }
+            }
+            if callee_len == 0 {
+                i += 1;
+                continue;
+            }
+            let mut j = i + callee_len;
+            while j < n && (b[j] == b' ' || b[j] == b'\t') {
+                j += 1;
+            }
+            if j >= n || b[j] != b'(' {
+                i += 1;
+                continue;
+            }
+            // the callee's whole argument list, folded by the same depth-0 rule
+            let mut depth = 0usize;
+            let mut k = j;
+            let mut close = None;
+            while k < n {
+                if in_lit[k] {
+                    k += 1;
+                    continue;
+                }
+                if b[k] == b'(' {
+                    depth += 1;
+                } else if b[k] == b')' {
+                    depth -= 1;
+                    if depth == 0 {
+                        close = Some(k);
+                        break;
+                    }
+                }
+                k += 1;
+            }
+            let Some(close) = close else {
+                i = j;
+                continue;
+            };
+            let mut d = 0i32;
+            let mut p = j + 1;
+            while p < close {
+                let c = b[p];
+                if c == b'"' {
+                    let mut e = p + 1;
+                    while e < close {
+                        if b[e] == b'\\' {
+                            e += 2;
+                            continue;
+                        }
+                        if b[e] == b'"' {
+                            e += 1;
+                            break;
+                        }
+                        e += 1;
+                    }
+                    let borrowed = p > 0 && b[p - 1] == b'&';
+                    if d == 0 && !borrowed && e <= n && b[e.min(n)..].starts_with(SUF.as_bytes())
+                    {
+                        let after = e + SUF.len();
+                        let mut q = after;
+                        while q < n && (b[q] == b' ' || b[q] == b'\t') {
+                            q += 1;
+                        }
+                        if q == close || b[q] == b',' || b[q] == b')' {
+                            cut.push((e, after));
+                            p = after;
+                            continue;
+                        }
+                    }
+                    p = e;
+                    continue;
+                }
+                match c {
+                    b'(' | b'[' | b'{' => d += 1,
+                    b')' | b']' | b'}' => d -= 1,
+                    _ => {}
+                }
+                p += 1;
+            }
+            i = close + 1;
+            continue;
+        }
+        let mut j = i + name_len + 1;
+        while j < n && (b[j] == b' ' || b[j] == b'\t') {
+            j += 1;
+        }
+        if j >= n || b[j] != b'(' {
+            i += 1;
+            continue;
+        }
+        // matching `)`, skipping literal content
+        let mut depth = 0usize;
+        let mut k = j;
+        let mut close = None;
+        while k < n {
+            if in_lit[k] {
+                k += 1;
+                continue;
+            }
+            if b[k] == b'(' {
+                depth += 1;
+            } else if b[k] == b')' {
+                depth -= 1;
+                if depth == 0 {
+                    close = Some(k);
+                    break;
+                }
+            }
+            k += 1;
+        }
+        let Some(close) = close else {
+            i = j;
+            continue;
+        };
+        // the macro's OWN arguments: depth 0 within its parens
+        let mut d = 0i32;
+        let mut p = j + 1;
+        while p < close {
+            let c = b[p];
+            if c == b'"' {
+                let mut e = p + 1;
+                while e < close {
+                    if b[e] == b'\\' {
+                        e += 2;
+                        continue;
+                    }
+                    if b[e] == b'"' {
+                        e += 1;
+                        break;
+                    }
+                    e += 1;
+                }
+                let borrowed = p > 0 && b[p - 1] == b'&';
+                if d == 0 && !borrowed && e <= n && b[e.min(n)..].starts_with(SUF.as_bytes()) {
+                    let after = e + SUF.len();
+                    let mut q = after;
+                    while q < n && (b[q] == b' ' || b[q] == b'\t') {
+                        q += 1;
+                    }
+                    if q == close || b[q] == b',' || b[q] == b')' {
+                        cut.push((e, after));
+                        p = after;
+                        continue;
+                    }
+                }
+                p = e;
+                continue;
+            }
+            match c {
+                b'(' | b'[' | b'{' => d += 1,
+                b')' | b']' | b'}' => d -= 1,
+                _ => {}
+            }
+            p += 1;
+        }
+        i = close + 1;
+    }
+    if cut.is_empty() {
+        return text;
+    }
+    let mut out = String::with_capacity(text.len());
+    let mut last = 0;
+    for (s, e) in cut {
+        out.push_str(&text[last..s]);
+        last = e;
+    }
+    out.push_str(&text[last..]);
+    out
+}
+
 /// Inline shell runtime helpers that have a trivial idiomatic-Rust
 /// expansion.  Each rewrite is a pure textual peephole (no IR changes):
 ///
@@ -3404,6 +3674,11 @@ pub fn shir_to_rust(prog: &IrProgram) -> String {
     // Strip `&"literal".to_string()` → `"literal"`: a textual peephole that
     // is sound because the `&` is always used to feed a `&str` parameter.
     let text = strip_str_lit_refs(&text);
+    // `"lit".to_string()` as a DIRECT argument of a formatting macro is just
+    // `"lit"` — `format!`/`print!` accept any `Display`. Depth-0 arguments
+    // only: a nested call's argument may be typed `String` (see the note on
+    // the pass, which records the 19 renders the naive version broke).
+    let text = fold_lit_to_string_in_fmt_args(text);
     // Inline simple shell helpers that have a trivial idiomatic-Rust
     // expansion (`__sh_len`, `__sh_env`, `__sh_fexists`, `__sh_puts`,
     // `__sh_print_words`).  Only the `print_words` rewrite is gated on
@@ -16415,8 +16690,7 @@ fn helper_source(h: &str) -> &'static str {
         if (0xF800..=0xF8FF).contains(&u) { buf.push((u - 0xF800) as u8); }
         else { let mut b = [0u8; 4]; buf.extend_from_slice(c.encode_utf8(&mut b).as_bytes()); }
     }
-    let mut o = std::io::stdout().lock();
-    let _ = o.write_all(&buf);
+    let _ = std::io::stdout().lock().write_all(&buf);
 }"#,
         "sink" => r#"fn __sh_sink(b: &[u8]) {
     let mut used = false;
@@ -24977,7 +25251,7 @@ mod tests {
         // still does not matter to the program-wide verdict).
         let redir = render("f() { echo \"in-func\" > /tmp/sh2_fn_probe.txt; }\nf\n");
         assert!(
-            redir.contains(r#"std::fs::write("/tmp/sh2_fn_probe.txt".to_string(), "in-func\n".to_string())"#),
+            redir.contains(r#"std::fs::write("/tmp/sh2_fn_probe.txt", "in-func\n")"#),
             "{redir}"
         );
         // …but a body redirect whose PATH is only known at run time keeps
@@ -25396,6 +25670,50 @@ mod tests {
     /// static flags baked in, `mktemp` spells its atomic-create loop in place,
     /// and `[ -f … ]`-style predicates are one `std` call — so none of the
     /// `__sh_*` emulation helpers may be defined or called.
+    #[test]
+    fn lit_to_string_is_folded_only_in_flat_format_args() {
+        let f = |s: &str| super::fold_lit_to_string_in_fmt_args(s.to_string());
+        // a direct formatting argument: folded
+        assert!(f(r#"format!("{}", "x".to_string())"#).contains(r#"format!("{}", "x")"#));
+        // a nested CALL argument (`greet` takes String): kept
+        assert!(
+            f(r#"println!("{}", greet("x".to_string()))"#)
+                .contains(r#"greet("x".to_string())"#)
+        );
+        // a borrow — that is strip_str_lit_refs's shape, not this pass
+        assert!(f(r#"print!("{}", &"x".to_string())"#).contains(r#"&"x".to_string()"#));
+        // a receiver: the owned String is used, not merely displayed
+        assert!(f(r#"format!("{}", "xy".to_string().len())"#).contains(".to_string().len()"));
+        // outside any formatting macro
+        assert!(f(r#"let p = "x".to_string();"#).contains(r#""x".to_string()"#));
+        // vec! is not a formatting macro, so an element is untouched
+        assert!(f(r#"v = vec!["a".to_string()];"#).contains(r#""a".to_string()"#));
+        // both arguments of a two-arg format, inside the vec! wrapper
+        assert!(
+            f(r#"x(&[vec![format!("{} {}", "a".to_string(), "b".to_string())]], true, false);"#)
+                .contains(r#"format!("{} {}", "a", "b")"#)
+        );
+        // an allowlisted callee takes AsRef/&str on both parameters
+        assert!(
+            f(r#"std::fs::write("p".to_string(), "c".to_string());"#)
+                .contains(r#"std::fs::write("p", "c")"#)
+        );
+        assert!(
+            f(r#"std::env::set_var("A".to_string(), "1".to_string());"#)
+                .contains(r#"std::env::set_var("A", "1")"#)
+        );
+        // a callee that is NOT allowlisted (`__sh_sink` takes &[u8], and a
+        // user function may take String) keeps the call
+        assert!(
+            f(r#"__sh_sink("x".to_string());"#).contains(r#""x".to_string()"#)
+        );
+        // a nested call inside an allowlisted callee is still depth 1
+        assert!(
+            f(r#"std::fs::write(p, greet("x".to_string()));"#)
+                .contains(r#"greet("x".to_string())"#)
+        );
+    }
+
     #[test]
     fn fs_commands_and_stat_predicates_render_natively() {
         let cases: &[(&str, &str, &[&str])] = &[
@@ -27962,7 +28280,7 @@ mod tests {
         // path the pipeline emits the write itself (no sink runtime), so
         // the invariant is the write, not a helper call
         assert!(
-            out.contains(r#"std::fs::write("/tmp/sh2_probe_d.txt".to_string(), "data\n".to_string())"#)
+            out.contains(r#"std::fs::write("/tmp/sh2_probe_d.txt", "data\n")"#)
                 || out.contains("__sh_print_words(&[vec![\"data\""),
             "redirected echo lost its sink check:\n{out}"
         );
@@ -28331,7 +28649,7 @@ mod tests {
         // the file, not that a helper was called.
         let out = render("echo hi > /tmp/sh2_probe.txt\n");
         assert!(
-            out.contains(r#"std::fs::write("/tmp/sh2_probe.txt".to_string(), "hi\n".to_string())"#),
+            out.contains(r#"std::fs::write("/tmp/sh2_probe.txt", "hi\n")"#),
             "literal-path redirect is not a write:\n{out}"
         );
         assert!(
