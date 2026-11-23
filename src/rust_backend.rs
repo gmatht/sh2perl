@@ -2917,6 +2917,51 @@ fn prune_unused_helpers(text: String) -> String {
     }
 }
 
+/// `__SH_RC` is bash's implicit "status of the last command": nothing
+/// may read it except a construct that asks for it — `$?`, `set -e`,
+/// `ERR`/`EXIT` traps, `&&`/`||`, a pipeline join — and every such read
+/// is an emitted `__SH_RC.load`. So a program whose rendered body holds
+/// no load at all never observes an intermediate value (drop every
+/// store), and one whose only load is the `std::process::ExitCode` read
+/// observes exactly the last status (keep the last store). Two or more
+/// loads mean the program does read status somewhere, and every store
+/// stays: without flow analysis a store may feed any of those reads.
+///
+/// Only a standalone `__SH_RC.store(…);` line is a candidate — a line
+/// that loads, branches, runs a command or does anything else is left
+/// untouched, so a store that shares a line with a check survives.
+fn drop_dead_rc_stores(text: String) -> String {
+    if !text.contains("__SH_RC.store(") {
+        return text;
+    }
+    let loads = text.matches("__SH_RC.load(").count();
+    if loads > 1 {
+        return text;
+    }
+    fn is_store(l: &str) -> bool {
+        let t = l.trim();
+        t.starts_with("__SH_RC.store(") && t.ends_with(");") && !t.contains("load")
+    }
+    let lines: Vec<&str> = text.lines().collect();
+    let keep = if loads == 1 {
+        lines.iter().rposition(|l| is_store(l))
+    } else {
+        None
+    };
+    let mut out = String::with_capacity(text.len());
+    for (i, l) in lines.iter().enumerate() {
+        if is_store(l) && Some(i) != keep {
+            continue;
+        }
+        out.push_str(l);
+        out.push('\n');
+    }
+    if !text.ends_with('\n') {
+        out.pop();
+    }
+    out
+}
+
 /// Drop the module-level runtime statics a program never uses. The 14
 /// `__SH_*` statics are emitted unconditionally (some helper, function
 /// body or statement may need any of them), but for a program that
@@ -3346,6 +3391,7 @@ pub fn shir_to_rust(prog: &IrProgram) -> String {
     let text = strip_helper_comments(text);
     let text = prune_unused_helpers(text);
     let text = prune_unused_statics(text);
+    let text = drop_dead_rc_stores(text);
     // `-Oz` golf: strip comments/whitespace and shorten every
     // renderer-owned identifier. Runs LAST (after all pruning passes,
     // so only live names enter the short pool).
@@ -5485,7 +5531,11 @@ impl Render {
                 if let Ok(n) = s.trim().parse::<i64>() {
                     n.to_string()
                 } else {
-                    format!("{}.trim().parse::<i64>().unwrap_or(0)", Self::rust_str_expr(s))
+                    // A non-numeric literal has no runtime parts: bash's
+                    // arithmetic re-reads the text as an expression, where
+                    // an unknown bare name is 0 (and `""` is 0), which is
+                    // exactly what the emitted parse returned. Fold it.
+                    "0".to_string()
                 }
             }
             IrExpr::Var(name, _) | IrExpr::Ident(name) => {
@@ -9831,6 +9881,13 @@ while __sh_path.len() > 1 && __sh_path.ends_with('/') {{ __sh_path = &__sh_path[
             if let Some(e) = self.arith_text(k) {
                 return e;
             }
+            // Not a number and not an arithmetic name: bash's arithmetic
+            // context reads a bare name as a variable and an unset one is
+            // 0, so a literal such as `@` (the whole-array form) or `""`
+            // evaluates to 0. The generic fallback used to say that at run
+            // time with `"@".to_string().trim().parse::<i64>().unwrap_or(0)`;
+            // the value is identical, so compute it at render time.
+            return "0".to_string();
         }
         self.expr_num(x)
     }
