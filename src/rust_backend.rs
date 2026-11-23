@@ -4748,6 +4748,20 @@ impl Render {
         s
     }
 
+    /// Read a variable whose value is TEXT as an i64 — bash's arithmetic
+    /// conversion (class 8 (c)).
+    ///
+    /// The `.parse::<i64>()` is not an artefact of a string-typed
+    /// representation we could type away: bash's arithmetic re-reads the
+    /// VALUE of a variable as an expression every time it is used, so the
+    /// text is authoritative. Leading and trailing blanks are ignored
+    /// (`x=' 2 '; echo $((x+1))` prints 3), an empty or unset value is 0,
+    /// and a value naming nothing is 0 as well — hence `trim()` + a parse
+    /// that falls back to 0. A variable only becomes a native `Cell<i64>`
+    /// (`is_num`) when the analysis proves every write is a number, and
+    /// that is exactly the case where no conversion can be observed; the
+    /// remaining 64-program population is the one bash allows to change
+    /// shape mid-run (`x=1; x=two; x=3`) or to arrive from argv/`read`.
     fn read_num_of_str(&mut self, name: &str) -> String {
         // A TLS home parses INSIDE the borrow: the whole read is
         // `__SHV_x.with(|v| v.borrow().trim().parse::<i64>()…)`, so the
@@ -15914,6 +15928,32 @@ while __sh_path.len() > 1 && __sh_path.ends_with('/') {{ __sh_path = &__sh_path[
     }
 
     /// The thread_local declaration for one var.
+    /// Declare a shell variable's storage: one `thread_local!` cell per
+    /// variable (class 8 (a)).
+    ///
+    /// It is a cell, not a `let`, because bash's variables are one GLOBAL
+    /// namespace per shell process, and three rules make a lexical binding
+    /// observably wrong:
+    ///
+    /// * a function assignment writes the caller's variable (bash has no
+    ///   lexical capture; `f() { x=2; }; x=1; f; echo $x` prints 2), so the
+    ///   callee must reach the same cell the top level reads — the test
+    ///   `a_function_assignment_is_a_global_write` fails on a plain `let`;
+    /// * a subshell and a command substitution run in a COPY of the
+    ///   environment (`(x=2)` and `y=$(x=9)` leave `x` alone in the parent),
+    ///   which the renderer models by save/restore around the child — the
+    ///   cell must stay addressable across that boundary
+    ///   (`a_subshell_assignment_does_not_reach_the_parent`,
+    ///   `a_command_substitution_assignment_is_isolated`);
+    /// * `set -u`, `unset` and `trap` handlers observe a variable that may
+    ///   be read before any statement of the current scope ran, and a trap
+    ///   fires at an arbitrary command boundary, so there is no single
+    ///   declaration point that dominates its uses.
+    ///
+    /// Pass-2 locals (`self.local_vars`) are the licence to bind plainly:
+    /// the analysis proves the variable cannot be seen through any of those
+    /// boundaries, and its declaration is then emitted at the top of its
+    /// owning scope instead.
     fn decl_stmt(&mut self, v: &str) -> String {
         // pass-2 local: declared inline at the top of its owning scope
         if self.local_vars.contains_key(v) {
