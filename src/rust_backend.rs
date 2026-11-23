@@ -7966,17 +7966,37 @@ while __sh_path.len() > 1 && __sh_path.ends_with('/') {{ __sh_path = &__sh_path[
     /// `cat`/`basename`/`dirname`/`mktemp` are the corpus's capture-position
     /// externals; everything else keeps its shell-out (refuse > guess).
     fn native_capture_value(&mut self, stmts: &[IrStmt]) -> Option<String> {
-        let [IrStmt::Expr(IrExpr::Call { func, args })] = stmts else {
-            return None;
-        };
-        if !matches!(func.as_str(), "exec" | "builtin") || args.len() > 2 {
-            return None;
-        }
-        let cmd = str_arg(args, 0)?.to_string();
+        // `$(cmd args)` arrives in TWO IR shapes that denote the same
+        // command: an expression statement (the `exec`/`builtin` CALL the
+        // parser builds), and a bare `IrStmt::Exec` — which is what the
+        // process-substitution plumbing constructs (`process_subst.rs`
+        // `mktemp_assign`, and `ir.rs`'s Perl side already adapts it). The
+        // second shape used to fall through here, so EVERY `<(…)` in the
+        // corpus spawned `bash -c mktemp` just to get a scratch path. A
+        // redirect or command-scoped env still needs the shell-text rebuild
+        // downstream, so both are refused.
         let empty: Vec<IrExpr> = Vec::new();
-        let items: &Vec<IrExpr> = match args.get(1) {
-            Some(IrExpr::Array(a)) => a,
-            None => &empty,
+        let (cmd, items): (String, &Vec<IrExpr>) = match stmts {
+            [IrStmt::Expr(IrExpr::Call { func, args })]
+                if matches!(func.as_str(), "exec" | "builtin") && args.len() <= 2 =>
+            {
+                let cmd = str_arg(args, 0)?.to_string();
+                let items = match args.get(1) {
+                    Some(IrExpr::Array(a)) => a,
+                    None => &empty,
+                    _ => return None,
+                };
+                (cmd, items)
+            }
+            [IrStmt::Exec { cmd, args, capture: None, redirects, env }]
+                if redirects.is_empty() && env.is_empty() =>
+            {
+                let name = match cmd {
+                    IrExpr::Str(s, _) => s.clone(),
+                    _ => return None,
+                };
+                (name, args)
+            }
             _ => return None,
         };
         let words: Vec<&IrExpr> = items.iter().collect();
