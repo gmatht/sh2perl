@@ -7877,11 +7877,11 @@ while __sh_path.len() > 1 && __sh_path.ends_with('/') {{ __sh_path = &__sh_path[
                 r#"{
     let mut __sh_status: i32 = 0;
     let err_text = |__e: &std::io::Error| -> String { match __e.kind() {
-        std::io::ErrorKind::NotFound => "No such file or directory".into(),
-        std::io::ErrorKind::PermissionDenied => "Permission denied".into(),
-        std::io::ErrorKind::AlreadyExists => "File exists".into(),
-        std::io::ErrorKind::IsADirectory => "Is a directory".into(),
-        std::io::ErrorKind::NotADirectory => "Not a directory".into(),
+        std::io::ErrorKind::NotFound => "No such file or directory".to_string(),
+        std::io::ErrorKind::PermissionDenied => "Permission denied".to_string(),
+        std::io::ErrorKind::AlreadyExists => "File exists".to_string(),
+        std::io::ErrorKind::IsADirectory => "Is a directory".to_string(),
+        std::io::ErrorKind::NotADirectory => "Not a directory".to_string(),
         _ => format!("{}", __e) } };
     for __sh_path in &@ARGV@ {
         match std::fs::symlink_metadata(__sh_path) {
@@ -7906,9 +7906,9 @@ while __sh_path.len() > 1 && __sh_path.ends_with('/') {{ __sh_path = &__sh_path[
             "rmdir" => r#"{
     let mut __sh_status: i32 = 0;
     let err_text = |__e: &std::io::Error| -> String { match __e.kind() {
-        std::io::ErrorKind::NotFound => "No such file or directory".into(),
-        std::io::ErrorKind::PermissionDenied => "Permission denied".into(),
-        std::io::ErrorKind::NotADirectory => "Not a directory".into(),
+        std::io::ErrorKind::NotFound => "No such file or directory".to_string(),
+        std::io::ErrorKind::PermissionDenied => "Permission denied".to_string(),
+        std::io::ErrorKind::NotADirectory => "Not a directory".to_string(),
         std::io::ErrorKind::DirectoryNotEmpty => "Directory not empty".to_string(),
         _ => format!("{}", __e) } };
     for __sh_path in &@ARGV@ {
@@ -7926,11 +7926,11 @@ while __sh_path.len() > 1 && __sh_path.ends_with('/') {{ __sh_path = &__sh_path[
                 r#"{
     let mut __sh_status: i32 = 0;
     let err_text = |__e: &std::io::Error| -> String { match __e.kind() {
-        std::io::ErrorKind::NotFound => "No such file or directory".into(),
-        std::io::ErrorKind::PermissionDenied => "Permission denied".into(),
-        std::io::ErrorKind::AlreadyExists => "File exists".into(),
-        std::io::ErrorKind::IsADirectory => "Is a directory".into(),
-        std::io::ErrorKind::NotADirectory => "Not a directory".into(),
+        std::io::ErrorKind::NotFound => "No such file or directory".to_string(),
+        std::io::ErrorKind::PermissionDenied => "Permission denied".to_string(),
+        std::io::ErrorKind::AlreadyExists => "File exists".to_string(),
+        std::io::ErrorKind::IsADirectory => "Is a directory".to_string(),
+        std::io::ErrorKind::NotADirectory => "Not a directory".to_string(),
         _ => format!("{}", __e) } };
     for __sh_path in &@ARGV@ {
         let __sh_res = if @PARENTS@ { std::fs::create_dir_all(__sh_path) } else { std::fs::create_dir(__sh_path) };
@@ -7964,11 +7964,11 @@ while __sh_path.len() > 1 && __sh_path.ends_with('/') {{ __sh_path = &__sh_path[
                 r#"{
     let mut __sh_status: i32 = 0;
     let err_text = |__e: &std::io::Error| -> String { match __e.kind() {
-        std::io::ErrorKind::NotFound => "No such file or directory".into(),
-        std::io::ErrorKind::PermissionDenied => "Permission denied".into(),
-        std::io::ErrorKind::AlreadyExists => "File exists".into(),
-        std::io::ErrorKind::IsADirectory => "Is a directory".into(),
-        std::io::ErrorKind::NotADirectory => "Not a directory".into(),
+        std::io::ErrorKind::NotFound => "No such file or directory".to_string(),
+        std::io::ErrorKind::PermissionDenied => "Permission denied".to_string(),
+        std::io::ErrorKind::AlreadyExists => "File exists".to_string(),
+        std::io::ErrorKind::IsADirectory => "Is a directory".to_string(),
+        std::io::ErrorKind::NotADirectory => "Not a directory".to_string(),
         _ => format!("{}", __e) } };
     for __sh_path in &@ARGV@ {
         match std::fs::OpenOptions::new().create(true).append(true).open(__sh_path) {
@@ -8136,17 +8136,42 @@ while __sh_path.len() > 1 && __sh_path.ends_with('/') {{ __sh_path = &__sh_path[
                     Some(t) => Self::rust_str(t),
                     None => Self::rust_str(""),
                 };
-                // The uniqueness loop lives ONCE, in the `mktemp` helper:
-                // spelling it inline here as well put a 30-line polyfill in
-                // the middle of every `main()` that called `mktemp` (166
-                // corpus sites), and two copies of one loop are two places
-                // to drift. The helper keeps the O_EXCL / create_dir
-                // atomicity and the trailing-X template.
-                self.add_helper("mktemp");
+                // The uniqueness loop IS the command, so it is spelled
+                // here (a generated program has no `tempfile` crate): O_EXCL
+                // / create_dir make a name atomic, and a collision draws
+                // another. `TMPDIR` and the trailing-X template are still
+                // honoured; the block is scoped, so it cannot shadow a
+                // caller's names.
+                let code = r#"{
+    let __tmpl: &str = @TMPL@;
+    let __sh_text = if __tmpl.is_empty() {
+        let __sh_tmpdir = std::env::var("TMPDIR").ok().filter(|__sh_tmpdir| !__sh_tmpdir.is_empty()).unwrap_or_else(|| "/tmp".to_string());
+        format!("{}/tmp.XXXXXXXXXX", __sh_tmpdir.trim_end_matches('/'))
+    } else {
+        __tmpl.to_string()
+    };
+    let __base = __sh_text.trim_end_matches('X').to_string();
+    let __sh_suffix = { let __sh_num = __sh_text.len() - __base.len(); if __sh_num == 0 { 10 } else { __sh_num } };
+    let __sh_alphabet: &[u8] = b"abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789";
+    '__sh_mkloop: {
+        for __sh_num in 0..100000u64 {
+            let __seed = (std::process::id() as u64).wrapping_mul(1_000_003)
+                ^ __sh_num.wrapping_mul(7_919)
+                ^ std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map(|__sh_clock| __sh_clock.subsec_nanos() as u64).unwrap_or(0);
+            let mut __sh_state = __seed | 1;
+            let mut __sh_path = __base.clone();
+            for _ in 0..__sh_suffix { __sh_path.push(__sh_alphabet[(__sh_state % 62) as usize] as char); __sh_state /= 62; }
+            let __sh_ok = if @DIR@ { std::fs::create_dir(&__sh_path).is_ok() } else { std::fs::OpenOptions::new().write(true).create_new(true).open(&__sh_path).is_ok() };
+            if __sh_ok { break '__sh_mkloop __sh_path; }
+        }
+        String::new()
+    }
+}"#
+                .replace("@TMPL@", &t)
+                .replace("@DIR@", if dir { "true" } else { "false" });
                 Some(format!(
-                    "{{ let __sh_ch = __sh_mktemp({}, {}); __SH_RC.store(if __sh_ch.is_empty() {{ 1 }} else {{ 0 }}, Ordering::Relaxed); __sh_ch }}",
-                    if dir { "true" } else { "false" },
-                    t
+                    "{{ let __sh_ch = {}; __SH_RC.store(if __sh_ch.is_empty() {{ 1 }} else {{ 0 }}, Ordering::Relaxed); __sh_ch }}",
+                    self.indent_continuation(&code)
                 ))
             }
             _ => None,
@@ -16113,7 +16138,13 @@ fn helper_source(h: &str) -> &'static str {
     s.split('\n').map(str::to_string).collect()
 }"#,
         "q" => r#"fn __sh_q(s: &str) -> String {
-    format!("'{}'", s.replace('\'', "'\\''"))
+    let mut o = String::with_capacity(s.len() + 8);
+    o.push('\'');
+    for c in s.chars() {
+        if c == '\'' { o.push_str("'\\''"); } else { o.push(c); }
+    }
+    o.push('\'');
+    o
 }"#,
         "q_printf" => r#"fn __sh_q_printf(s: &str) -> String {
     if s.is_empty() { return "''".to_string(); }
@@ -16153,14 +16184,11 @@ fn helper_source(h: &str) -> &'static str {
         "cat" => r#"fn __sh_cat(ws: &[Vec<String>]) -> Vec<String> {
     ws.concat()
 }"#,
-        // bash rejects a negative exponent (`2**-1` is an arithmetic
-        // error), and the old counting loop fell through to 1 — which is
-        // exactly what clamping to 0 gives on that arm, so the std form is
-        // the same answer on every input that can reach here. `clamp`
-        // rather than `u32::try_from`: the emitted files compile under
-        // rustc's DEFAULT edition, where `TryFrom` is not in the prelude.
         "pow" => r#"fn __sh_pow(a: i64, b: i64) -> i64 {
-    a.wrapping_pow(b.clamp(0, u32::MAX as i64) as u32)
+    let mut r: i64 = 1;
+    let mut i = 0;
+    while i < b { r = r.wrapping_mul(a); i += 1; }
+    r
 }"#,
         "div" => r#"fn __sh_div(a: i64, b: i64) -> i64 {
     if b == 0 { __SH_ARITH_ERR.store(true, Ordering::Relaxed); 0 } else { a / b }
@@ -16448,9 +16476,9 @@ fn helper_source(h: &str) -> &'static str {
                 // else falls back to the OS string and is not claimed to be
                 // bash's text (same rule as the TextFilter arm).
                 let m = match e.kind() {
-                    std::io::ErrorKind::NotFound => "No such file or directory".into(),
-                    std::io::ErrorKind::PermissionDenied => "Permission denied".into(),
-                    std::io::ErrorKind::IsADirectory => "Is a directory".into(),
+                    std::io::ErrorKind::NotFound => "No such file or directory".to_string(),
+                    std::io::ErrorKind::PermissionDenied => "Permission denied".to_string(),
+                    std::io::ErrorKind::IsADirectory => "Is a directory".to_string(),
                     _ => format!("{}", e),
                 };
                 eprintln!("cat: {}: {}", p, m);
@@ -16690,7 +16718,7 @@ fn helper_source(h: &str) -> &'static str {
     c.arg("-c").arg(cmd);
     c.stdout(std::process::Stdio::piped());
     if input.is_some() { c.stdin(std::process::Stdio::piped()); }
-    let Ok(mut ch) = c.spawn() else { return Vec::new() };
+    let mut ch = match c.spawn() { Ok(x) => x, Err(_) => return Vec::new() };
     if let Some(data) = input {
         if let Some(mut si) = ch.stdin.take() { let _ = std::io::Write::write_all(&mut si, data); }
     }
@@ -16706,7 +16734,7 @@ fn helper_source(h: &str) -> &'static str {
     c.arg("-c").arg(cmd);
     c.stdout(std::process::Stdio::piped());
     c.stdin(std::process::Stdio::inherit());
-    let Ok(mut ch) = c.spawn() else { return (String::new(), 1) };
+    let mut ch = match c.spawn() { Ok(x) => x, Err(_) => return (String::new(), 1) };
     let mut out = Vec::new();
     if let Some(mut so) = ch.stdout.take() {
         let _ = std::io::Read::read_to_end(&mut so, &mut out);
@@ -16747,7 +16775,7 @@ fn helper_source(h: &str) -> &'static str {
         }
     }
     if input.is_some() { c.stdin(std::process::Stdio::piped()); }
-    let Ok(mut ch) = c.spawn() else { return 1 };
+    let mut ch = match c.spawn() { Ok(x) => x, Err(_) => return 1 };
     if let Some(data) = input {
         if let Some(mut si) = ch.stdin.take() { let _ = std::io::Write::write_all(&mut si, &data); }
     }
@@ -17028,45 +17056,49 @@ fn helper_source(h: &str) -> &'static str {
     let anchored_s = pat0.starts_with('#');
     let anchored_e = pat0.starts_with('%');
     let pat = pat0.trim_start_matches('#').trim_start_matches('%');
-    // char boundaries, so every probe is a BORROWED slice: the scan still
-    // asks `__sh_fnmatch` O(n²) times, but it no longer allocates a String
-    // (and a throwaway Vec<char>) per probe.
-    let mut b: Vec<usize> = s.char_indices().map(|(k, _)| k).collect();
-    b.push(s.len());
-    let n = b.len() - 1;
+    let ch: Vec<char> = s.chars().collect();
     let mut out = String::new();
     let mut i = 0;
     let mut done = false;
-    while i <= n {
+    while i <= ch.len() {
         if anchored_s && i > 0 { break; }
-        // the SHORTEST prefix that matches, then the `%`-anchored test
-        let hit = (i..=n).find(|&e| __sh_fnmatch(pat, &s[b[i]..b[e]]))
-            .filter(|&e| !anchored_e || e == n);
-        match hit {
-            Some(e) => {
-                out.push_str(repl);
-                i = e;
-                done = true;
-                if !all {
-                    out.push_str(&s[b[i]..]);
-                    break;
-                }
-                if i >= n { break; }
+        let mut matched: Option<usize> = None;
+        let mut end = i;
+        while end <= ch.len() {
+            let sub: String = ch[i..end].iter().collect();
+            if __sh_fnmatch(pat, &sub) { matched = Some(end); break; }
+            end += 1;
+        }
+        if let Some(e) = matched {
+            if anchored_e && e != ch.len() { matched = None; }
+        }
+        if let Some(e) = matched {
+            out.push_str(repl);
+            i = e;
+            done = true;
+            if !all {
+                out.extend(ch[i..].iter());
+                break;
             }
-            None => {
-                if i < n { out.push_str(&s[b[i]..b[i + 1]]); }
-                i += 1;
-                if anchored_s { break; }
-            }
+            if i >= ch.len() { break; }
+        } else {
+            if i < ch.len() { out.push(ch[i]); }
+            i += 1;
+            if anchored_s { break; }
         }
     }
     if done { out } else { s.to_string() }
 }"#,
         "substr" => r#"fn __sh_substr(s: &str, off: i64, len: i64) -> String {
-    let n = s.chars().count() as i64;
-    let o = (if off < 0 { n + off } else { off }).clamp(0, n);
-    let l = if len == i64::MIN { n - o } else if len < 0 { n + len - o } else { len };
-    s.chars().skip(o as usize).take(l.clamp(0, n - o) as usize).collect()
+    let ch: Vec<char> = s.chars().collect();
+    let n = ch.len() as i64;
+    let mut o = if off < 0 { n + off } else { off };
+    if o < 0 { o = 0; }
+    if o > n { return String::new(); }
+    let mut l = if len == i64::MIN { n - o } else if len < 0 { n + len - o } else { len };
+    if l < 0 { l = 0; }
+    if o + l > n { l = n - o; }
+    ch[o as usize..(o + l) as usize].iter().collect()
 }"#,
         "case" => r#"fn __sh_case(s: &str, mode: &str) -> String {
     let mut it = s.chars();
@@ -25137,11 +25169,7 @@ mod tests {
             (
                 "mktemp",
                 "d=$(mktemp -d)\nif [ -d \"$d\" ]; then echo y; fi\n",
-                // The uniqueness loop moved into the `mktemp` helper (it
-                // used to be spelled inline at every call site as well);
-                // what this case pins is that the primitives stay NATIVE —
-                // O_EXCL create / create_dir, never a `bash -c mktemp`.
-                &["create_new(true)", "TMPDIR", "create_dir(&s)"],
+                &["create_new(true)", "TMPDIR", "create_dir(&__sh_path)"],
             ),
             (
                 "-f",
@@ -25177,7 +25205,7 @@ mod tests {
         let helpers = [
             "__sh_rm(", "__sh_mkdir(", "__sh_touch(", "__sh_sleep(", "__sh_freg(", "__sh_fdir(",
             "__sh_fexists(", "__sh_fsym(", "__sh_fsize(", "__sh_fread(", "__sh_fwrite(",
-            "__sh_fexec(", "__sh_fmode(",
+            "__sh_fexec(", "__sh_fmode(", "__sh_mktemp(",
         ];
         for (name, src, markers) in cases {
             let out = render_rs(src);
@@ -26395,6 +26423,7 @@ mod tests {
         }
     }
 
+    #[test]
     /// EVERY text node `rs` offers must be correct at RUNTIME, not merely in
     /// spelling: the render is compiled with `rustc`, executed, and its stdout
     /// and exit status compared BYTE-FOR-BYTE with bash running the original
