@@ -2939,8 +2939,24 @@ fn drop_dead_rc_stores(text: String) -> String {
         return text;
     }
     fn is_store(l: &str) -> bool {
+        // ONE statement on the line: the renderer also emits shapes like
+        // `__SH_RC.store(0, Ordering::Relaxed); println!("…");`, and the
+        // store there is load-bearing in no way but the PRINT is the
+        // program's output — dropping the line dropped the output (the
+        // `basename` operand witness caught it).
         let t = l.trim();
-        t.starts_with("__SH_RC.store(") && t.ends_with(");") && !t.contains("load")
+        if !t.starts_with("__SH_RC.store(") || !t.ends_with(");") || t.matches(';').count() != 1 {
+            return false;
+        }
+        // and the STORED VALUE must be inert: the renderer also emits
+        // `__SH_RC.store(__sh_run("'basename' '/' '.txt'"), …)`, where the
+        // command — and its output — lives inside the store's argument, so
+        // dropping the line drops the program's output (the `basename`
+        // operand witness caught exactly that).
+        let arg = &t["__SH_RC.store(".len()..];
+        let arg = arg.split(',').next().unwrap_or("").trim();
+        let arg = arg.strip_suffix("as i32").map(str::trim).unwrap_or(arg);
+        !arg.is_empty() && arg.chars().all(|c| c.is_ascii_digit() || " ()-".contains(c))
     }
     let lines: Vec<&str> = text.lines().collect();
     let keep = if loads == 1 {
@@ -25183,6 +25199,17 @@ mod tests {
         let read = "fn main() {\n    __SH_RC.store(1, Ordering::Relaxed);\n    if __SH_RC.load(Ordering::Relaxed) != 0 { __SH_RC.store(2, Ordering::Relaxed); }\n    if __SH_RC.load(Ordering::Relaxed) == 2 { __SH_RC.store(0, Ordering::Relaxed); }\n    __SH_RC.store(0, Ordering::Relaxed);\n}\n";
         let out = super::drop_dead_rc_stores(read.to_string());
         assert_eq!(out.matches("__SH_RC.store").count(), 4, "{out}");
+        // a store that SHARES its line with a statement is not a standalone
+        // store: the line must survive intact (it carries the output)
+        let shared = "fn main() {\n    __SH_RC.store(0, Ordering::Relaxed); println!(\"kept\");\n}\n";
+        let out = super::drop_dead_rc_stores(shared.to_string());
+        assert!(out.contains("println!(\"kept\")"), "{out}");
+        assert!(out.contains("__SH_RC.store(0"), "{out}");
+        // a store whose ARGUMENT runs the command keeps its line: the run
+        // (and its output) would go with it
+        let runs = "fn main() {\n    __SH_RC.store(__sh_run(\"'basename\' \'/\'\"), Ordering::Relaxed);\n}\n";
+        let out = super::drop_dead_rc_stores(runs.to_string());
+        assert!(out.contains("__sh_run("), "{out}");
     }
 
     /// (b) end to end: `$?` after a failure and after a function `return`
