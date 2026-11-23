@@ -8657,10 +8657,38 @@ while __sh_path.len() > 1 && __sh_path.ends_with('/') {{ __sh_path = &__sh_path[
             // `n <= 1` rule), so no field splitter is emitted at all.
             lines.push("let __sh_field: Vec<String> = vec![__sh_line.clone()];".to_string());
         } else {
-            self.add_helper("read_fields");
+            // TWO OR MORE targets: bash fills n-1 fields and gives the LAST
+            // target everything left over, so the splitter is a small `std`
+            // walk over the line's chars. Emitted INLINE for the same reason
+            // the line read above is: the body is exact, and a named
+            // `__sh_*` function is the non-idiomatic form the census counts.
+            //
+            // The walk is the helper's, byte for byte: skip leading IFS
+            // chars; take `n-1` runs of non-separators; after each run skip
+            // ONE separator, plus the rest of a separator RUN when IFS is
+            // pure whitespace (that is the IFS whitespace rule the helper's
+            // `ws` flag implements); the remainder — separators included —
+            // is the last field.
             lines.push(format!(
-                "let __sh_field = __sh_read_fields(&__sh_line, {}, {n});",
-                Self::rust_str(ifs_lit)
+                "let __sh_field: Vec<String> = {{ \
+                 let __sh_ifs = {ifs}; let __sh_n = {n}usize; let __sh_l = &__sh_line; \
+                 if __sh_n <= 1 || __sh_ifs.is_empty() {{ vec![__sh_l.to_string()] }} else {{ \
+                 let __sh_ws = __sh_ifs.chars().all(|c| c == ' ' || c == '\\t' || c == '\\n'); \
+                 let __sh_ch: Vec<char> = __sh_l.chars().collect(); \
+                 let __sh_sep = |c: char| __sh_ifs.contains(c); \
+                 let mut __sh_f: Vec<String> = Vec::new(); let mut __sh_i = 0usize; \
+                 while __sh_i < __sh_ch.len() && __sh_sep(__sh_ch[__sh_i]) {{ __sh_i += 1; }} \
+                 while __sh_f.len() < __sh_n - 1 && __sh_i < __sh_ch.len() {{ \
+                 let __sh_s = __sh_i; \
+                 while __sh_i < __sh_ch.len() && !__sh_sep(__sh_ch[__sh_i]) {{ __sh_i += 1; }} \
+                 __sh_f.push(__sh_ch[__sh_s..__sh_i].iter().collect()); \
+                 if __sh_i >= __sh_ch.len() {{ break; }} \
+                 __sh_i += 1; \
+                 if __sh_ws {{ while __sh_i < __sh_ch.len() && __sh_sep(__sh_ch[__sh_i]) {{ __sh_i += 1; }} }} }} \
+                 __sh_f.push(__sh_ch[__sh_i.min(__sh_ch.len())..].iter().collect()); \
+                 __sh_f }} }};",
+                ifs = Self::rust_str(ifs_lit),
+                n = n
             ));
         }
         for (idx, t) in targets.iter().enumerate() {
