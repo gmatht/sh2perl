@@ -12249,8 +12249,47 @@ while __sh_path.len() > 1 && __sh_path.ends_with('/') {{ __sh_path = &__sh_path[
                         "{{ let __sh_value = {arr}; let __sh_offset = if {off} < 0 {{ (__sh_value.len() as i64 + {off}).max(0) }} else {{ {off} }} as usize; let __sh_offset = __sh_offset.min(__sh_value.len()); let __sh_len = if {len} < 0 {{ __sh_value.len() as i64 - __sh_offset as i64 }} else {{ {len} }};                          let __sh_start = __sh_offset.max(0) as usize; let __sh_stop = ((__sh_start as i64 + __sh_len).max(__sh_start as i64)).min(__sh_value.len() as i64) as usize; let __sh_stop = __sh_stop.max(__sh_start);                          __sh_value[__sh_start..__sh_stop].join(\" \") }}"
                     );
                 }
-                self.add_helper("substr");
-                format!("__sh_substr(&{var_expr}, {off}, {len})")
+                // `${v:off:len}` on a scalar is a CHAR slice with bash's
+                // clamps, and `std` spells every shape: a non-negative
+                // offset is `skip`, `${v: -N}` is the last N chars
+                // (`rev-take-rev`), the rest (a dynamic offset, a negative
+                // LENGTH, the `i64::MIN` "no length" sentinel) needs the
+                // count, so it is the clamped walk inline. No `__sh_substr`
+                // helper and no dead helper definition: the literal-pair
+                // post-pass this used to rely on is now a no-op for new
+                // renders.
+                let len_lit = if len == "i64::MIN" {
+                    Some(i64::MIN)
+                } else {
+                    len.parse::<i64>().ok()
+                };
+                match (off.parse::<i64>().ok(), len_lit) {
+                    (Some(o), Some(i64::MIN)) if o >= 0 => {
+                        format!("{v}.chars().skip({o}).collect::<String>()", v = var_expr, o = o)
+                    }
+                    (Some(o), Some(l)) if o >= 0 && l >= 0 => format!(
+                        "{v}.chars().skip({o}).take({l}).collect::<String>()",
+                        v = var_expr,
+                        o = o,
+                        l = l
+                    ),
+                    _ => format!(
+                        "{{ let __sh_s = &{v}; let __sh_o = {off}; let __sh_l = {len}; \
+                         let __sh_ch: Vec<char> = __sh_s.chars().collect(); \
+                         let __sh_n = __sh_ch.len() as i64; \
+                         let mut __sh_st = if __sh_o < 0 {{ __sh_n + __sh_o }} else {{ __sh_o }}; \
+                         if __sh_st < 0 {{ __sh_st = 0; }} \
+                         if __sh_st > __sh_n {{ String::new() }} else {{ \
+                         let mut __sh_cn = if __sh_l == i64::MIN {{ __sh_n - __sh_st }} \
+                         else if __sh_l < 0 {{ __sh_n + __sh_l - __sh_st }} else {{ __sh_l }}; \
+                         if __sh_cn < 0 {{ __sh_cn = 0; }} \
+                         if __sh_st + __sh_cn > __sh_n {{ __sh_cn = __sh_n - __sh_st; }} \
+                         __sh_ch[__sh_st as usize..(__sh_st + __sh_cn) as usize].iter().collect::<String>() }} }}",
+                        v = var_expr,
+                        off = off,
+                        len = len
+                    ),
+                }
             }
             "len" => {
                 self.add_helper("len");
