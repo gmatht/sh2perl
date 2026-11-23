@@ -28012,16 +28012,22 @@ mod tests {
 
     #[test]
     fn dynamic_echo_keeps_print_words() {
-        // a genuinely multi-word word (`$@` splits) keeps the join helper
-        // an UNQUOTED variable field-splits ($IFS), so its word is a
-        // genuine multi-element Vec — the join helper is needed
+        // an UNQUOTED variable field-splits ($IFS), so its word is a genuine
+        // multi-element Vec. Sink-free that is bash's flattened-word join,
+        // spelled `concat().join(" ")` on std — the join helper is NOT
+        // needed; under a capture the buffer is stdout and it IS.
         let out = render("echo $x\n");
-        assert!(out.contains("__sh_print_words("), "{out}");
+        assert!(out.contains(".join(\" \")"), "{out}");
+        assert!(!out.contains("__sh_print_words"), "{out}");
         // the split is spelled inline (`Split`'s Rust value), not by a helper
         assert!(
             out.contains("split(|__sh_ch: char|") && !out.contains("__sh_split_ifs("),
             "{out}"
         );
+
+        // the same word inside `$(…)`: the sink routes it, so the helper stays
+        let cap = render("y=$(echo $x \"v$b\")\nprintf \"%s\\n\" \"$y\"\n");
+        assert!(cap.contains("__sh_print_words("), "{cap}");
     }
 
     #[test]
