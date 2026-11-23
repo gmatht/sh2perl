@@ -25886,6 +25886,17 @@ mod tests {
             ("SubStrExtract-past-end", "v=ab; printf '[%s]\\n' \"${v:5:2}\"\n".into()),
             ("SubStrExtract-empty", "v=; printf '[%s]\\n' \"${v:0:3}\"\n".into()),
             // StrLen / ArrayLen: empty and non-empty, empty and populated.
+            // The strip arms on a BORROWED binder (`v` is a `&str` local
+            // when every read is a borrow): binding it into a `String` with a
+            // plain `= v` was an E0308, so this case pins compilation too.
+            ("AffixStrip-borrowed-binder", "v='one two three four'; printf '%s\\n' \"${v#* }\"; printf '%s\\n' \"${v%% *}\"\n".into()),
+            // Unquoted word splitting honours the IFS the program has: a
+            // non-whitespace separator keeps the empty field between two
+            // adjacent separators and drops nothing at the end, and an EMPTY
+            // IFS disables splitting entirely.
+            ("Split-ifs-nonwhitespace", "IFS=:; v='a::b:'; for w in $v; do printf '[%s]\\n' \"$w\"; done\n".into()),
+            ("Split-ifs-empty", "IFS=; v='a b'; for w in $v; do printf '[%s]\\n' \"$w\"; done\n".into()),
+            ("Split-ifs-whitespace-run", "IFS=' '; v='  a   b  '; for w in $v; do printf '[%s]\\n' \"$w\"; done\n".into()),
             ("StrLen", "v=abc; printf '%s\\n' \"${#v}\"\n".into()),
             ("StrLen-empty", "v=; printf '%s\\n' \"${#v}\"\n".into()),
             ("ArrayLen", "a=(alpha beta gamma); printf '%s\\n' \"${#a[@]}\"\n".into()),
@@ -26421,6 +26432,43 @@ mod tests {
             );
             assert_eq!(rs_rc, sh_rc, "{name}: exit status differs from bash");
         }
+    }
+
+    /// Class 3/7 renderer edge cases found by running the arms against bash:
+    /// a strip on a BORROWED binder must still type-check, and a split must
+    /// use the IFS the program actually has.
+    #[test]
+    fn text_node_arms_coerce_borrowed_binders_and_split_on_the_runtime_ifs() {
+        // The strip/cut arms once copied the text into a `String` binding
+        // with a plain `= v`, which is an E0308 when `v` is a borrowed
+        // `&str` local -- the rendered program did not compile at all. The
+        // parity table's `AffixStrip-borrowed-binder` case compiles it; here
+        // only the shape is pinned.
+        let strip = render("v='one two three four'\nprintf '%s\\n' \"${v#* }\"\nprintf '%s\\n' \"${v%% *}\"\n");
+        assert!(
+            !strip.contains("let __sh_str: String = v;"),
+            "borrowed binder assigned to String:\n{strip}"
+        );
+
+        // IFS assigned by the program: the separator set is a runtime value,
+        // so the split consults it (adjacent `::` keep an empty field, a
+        // trailing `:` adds none -- `__sh_split_ifs`'s rule).
+        let ifs = render("IFS=:\nv='a::b:'\nfor w in $v; do echo \"[$w]\"; done\n");
+        assert!(ifs.contains("__sh_split_ifs("), "assigned IFS not consulted:\n{ifs}");
+        assert!(ifs.contains("__SHV_IFS"), "{ifs}");
+        // bash's default is the static's INITIAL value, so a split rendered
+        // before the first assignment still splits
+        assert!(
+            ifs.contains("RefCell::new(\" \\t\\n\".to_string())"),
+            "{ifs}"
+        );
+
+        // no IFS assignment: the compile-time default closure, no helper
+        let plain = render("v='a b'\nfor w in $v; do echo \"[$w]\"; done\n");
+        assert!(
+            !plain.contains("__sh_split_ifs("),
+            "default-IFS split grew a helper:\n{plain}"
+        );
     }
 
     #[test]
