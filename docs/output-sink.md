@@ -51,6 +51,15 @@ marked **helper, by design** above: the new branch takes every site where
 sink that can be active at that site. There is no sink-printing site left
 that a render-time verdict could prove safe.
 
+Measured breakdown of the 274 remaining `__sh_print_words` call sites in the
+corpus: **221 are inside a function body** (a call site of that function may
+run under a redirect), the rest are inside `$(…)`/`<(…)`/a redirect at the
+site itself; **40 are `echo -n`** (`nl = false`, same join, no newline);
+**0 are `-e`** and **0 take the arith-guard form** — the corpus's 7
+`__sh_echo_esc` uses are helper-internal (the `echo_line`/`print_words`
+definitions), not call sites, so the `-e` route is exercised by the unit
+tests rather than the example set.
+
 Not lifted, and why:
 
 * **`printf` with `%q` / format reuse / `%b`** — `format!` cannot express
