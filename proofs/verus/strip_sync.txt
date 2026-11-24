@@ -1,5 +1,5 @@
 # verus-sync-coverage manifest: strip
-# source sha: strip=d4bd82411202  proof sha: 0a0ad7ab14b1
+# source sha: strip=d4bd82411202  proof sha: 931e9f69c9df
 
 [pins]
 pin pin_break_kept -> test forinit_lowers_to_while_with_step_and_continue_splice: MAPPED
@@ -16,9 +16,12 @@ guard continue splice: PRESENT
 guard continue verdict: PRESENT
 guard legacy-continue splice arm: PRESENT
 guard Block lowering shape: PRESENT
+guard law strip_preserves_run: PRESENT
+guard invariant splice_run_agrees: PRESENT
+guard law premise straight(step): PRESENT
 
 [counts]
-proof-fns: 6
+proof-fns: 30
 pins: 6
 # NOTE: proof-fns is a file-shape fact (change detector), NOT the
 # Verus obligation count — the gate asserts N verified separately.
