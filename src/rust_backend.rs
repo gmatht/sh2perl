@@ -8052,12 +8052,13 @@ while __sh_path.len() > 1 && __sh_path.ends_with('/') {{ __sh_path = &__sh_path[
                 // `exec cmd args` — run the command, then exit with its rc.
                 // `exec 3>&1` (redirects ONLY) just applies the redirects
                 // in a child — the process must NOT exit.
-                let text = self.cmd_text(&words, None);
                 if words.is_empty() {
+                    let text = self.cmd_text(&words, None);
                     self.add_helper("run");
                     self.emit(&format!("__SH_RC.store(__sh_run(&{text}), Ordering::Relaxed);"));
                     return;
                 }
+                let text = self.cmd_text(&words, None);
                 self.add_helper("run");
                 self.emit(&format!("std::process::exit(__sh_run(&{text}));"));
             }
@@ -8080,12 +8081,18 @@ while __sh_path.len() > 1 && __sh_path.ends_with('/') {{ __sh_path = &__sh_path[
             },
             _ => {
                 // unknown builtin or external command — bash -c shell-out
-                let cmd_word = IrExpr::Str(cmd.to_string(), crate::ir::StrStyle::DoubleQuoted);
-                let mut all: Vec<&IrExpr> = vec![&cmd_word];
-                all.extend(words.iter());
-                let text = self.cmd_text(&all, env.as_deref());
-                self.add_helper("run");
-                self.emit(&format!("__SH_RC.store(__sh_run(&{text}), Ordering::Relaxed);"));
+                if let Some(argv) = static_argv_words(cmd, &words, env.as_deref()) {
+                    self.add_helper("run_argv");
+                    let arr = argv.iter().map(|w| Self::rust_str(w)).collect::<Vec<_>>().join(", ");
+                    self.emit(&format!("__SH_RC.store(__sh_run_argv(&[{}]), Ordering::Relaxed);", arr));
+                } else {
+                    let cmd_word = IrExpr::Str(cmd.to_string(), crate::ir::StrStyle::DoubleQuoted);
+                    let mut all: Vec<&IrExpr> = vec![&cmd_word];
+                    all.extend(words.iter());
+                    let text = self.cmd_text(&all, env.as_deref());
+                    self.add_helper("run");
+                    self.emit(&format!("__SH_RC.store(__sh_run(&{text}), Ordering::Relaxed);"));
+                }
             }
         }
     }
@@ -10438,6 +10445,14 @@ while __sh_path.len() > 1 && __sh_path.ends_with('/') {{ __sh_path = &__sh_path[
                     return v;
                 }
                 if !self.is_fn_capture(stmts) {
+                    if let Some(argv) = self.stage_argv(stmts) {
+                        self.add_helper("capture_rc_argv");
+                        let arr = argv.iter().map(|w| Self::rust_str(w)).collect::<Vec<_>>().join(", ");
+                        return format!(
+                            "{{ let (__sh_ch, __sh_res) = __sh_capture_rc_argv(&[{}]); __SH_RC.store(__sh_res, Ordering::Relaxed); __sh_ch }}",
+                            arr
+                        );
+                    }
                     if let Some(text) = self.stage_text(stmts) {
                         self.add_helper("capture_rc");
                         return format!(
@@ -10462,6 +10477,14 @@ while __sh_path.len() > 1 && __sh_path.ends_with('/') {{ __sh_path = &__sh_path[
                     return v;
                 }
                 if !self.is_fn_capture(stmts) {
+                    if let Some(argv) = self.stage_argv(stmts) {
+                        self.add_helper("capture_rc_argv");
+                        let arr = argv.iter().map(|w| Self::rust_str(w)).collect::<Vec<_>>().join(", ");
+                        return format!(
+                            "{{ let (__sh_ch, __sh_res) = __sh_capture_rc_argv(&[{}]); __SH_RC.store(__sh_res, Ordering::Relaxed); __sh_ch }}",
+                            arr
+                        );
+                    }
                     if let Some(text) = self.stage_text(stmts) {
                         self.add_helper("capture_rc");
                         return format!(
@@ -10656,6 +10679,16 @@ while __sh_path.len() > 1 && __sh_path.ends_with('/') {{ __sh_path = &__sh_path[
             }
             let st = &stages[idx];
             let last = idx + 1 == n;
+            if last {
+                if let Some(argv) = self.stage_argv(st) {
+                    self.add_helper("spawn_argv");
+                    let arr = argv.iter().map(|w| Self::rust_str(w)).collect::<Vec<_>>().join(", ");
+                    self.emit(&format!("__SH_RC.store(__sh_spawn_argv(&[{}], Some(&{buf})), Ordering::Relaxed);", arr));
+                    self.emit("__SH_PIPESTATUS.lock().unwrap().push(__SH_RC.load(Ordering::Relaxed));");
+                    idx += 1;
+                    continue;
+                }
+            }
             if let Some(text) = self.stage_text(st) {
                 // shell stage
                 if last {
@@ -16498,7 +16531,7 @@ struct IrRedirectInfo {
 
 const HELPER_ORDER: &[&str] = &[
     "q", "q_printf", "wq", "cat", "pow", "echo_esc", "echo_line", "printf_b",  "atoi", "atou", "atof", "print_words", "print_words_noesc", "puts", "printf", "outbytes",
-    "cap_bytes", "capture_rc", "spawn", "run", "readline", "read_fields", "split_ifs",
+    "cap_bytes", "capture_rc", "capture_rc_argv", "spawn", "spawn_argv", "run", "run_argv", "readline", "read_fields", "split_ifs",
     "fnmatch", "globlike", "strippre", "stripsuf", "replace", "substr", "case", "len", "basename",
     "dirname", "env", "arg", "glob", "brace", "sleep", "rand", "uid", "euid", "gid", "hostname", "grepmatches", "regex", "regex_posix",
     "mtime", "access", "samefile", "fmode", "fowner", "fgroup", "fnewer", "wait_all", "bg",
@@ -16613,6 +16646,9 @@ fn helper_deps(h: &str) -> &'static [&'static str] {
         "print_words_noesc" => &["sink"],
         "sink" => &[],
         "spawn" => &["sink"],
+        "spawn_argv" => &["sink"],
+        "run_argv" => &["spawn_argv"],
+        "capture_rc_argv" => &["cap_bytes"],
         "puts" => &["sink"],
         "lines" => &[],
         "printf" => &["q", "q_printf", "atoi", "atou", "atof", "echo_esc"],
@@ -17233,6 +17269,63 @@ fn helper_source(h: &str) -> &'static str {
         "capture_rc" => r#"fn __sh_capture_rc(cmd: &str) -> (String, i32) {
     let mut c = std::process::Command::new("bash");
     c.arg("-c").arg(cmd);
+    c.stdout(std::process::Stdio::piped());
+    c.stdin(std::process::Stdio::inherit());
+    let Ok(mut ch) = c.spawn() else { return (String::new(), 1) };
+    let mut out = Vec::new();
+    if let Some(mut so) = ch.stdout.take() {
+        let _ = std::io::Read::read_to_end(&mut so, &mut out);
+    }
+    let rc = ch.wait().map(|s| s.code().unwrap_or(1)).unwrap_or(1);
+    let mut s = String::from_utf8_lossy(&out).to_string();
+    while s.ends_with('\n') { s.pop(); }
+    (s, rc)
+}"#,
+        "spawn_argv" => r#"fn __sh_spawn_argv(argv: &[&str], input: Option<&[u8]>) -> i32 {
+    if argv.is_empty() { return 0; }
+    let mut input = input.map(|d| d.to_vec());
+    let stdin_path = __SH_STDIN_PATH.lock().unwrap().clone();
+    if input.is_none() && stdin_path.is_none() {
+        if let Some(mut r) = __SH_STDIN.lock().unwrap().take() {
+            let mut d = Vec::new();
+            let _ = std::io::Read::read_to_end(&mut r, &mut d);
+            input = Some(d);
+        }
+    }
+    let want_out = __SH_OUT.lock().unwrap().is_some() || __SH_OUTFILE_TL.with(|v| v.borrow().is_some());
+    let mut c = std::process::Command::new(argv[0]);
+    c.args(&argv[1..]);
+    if !want_out {
+        let _ = std::io::Write::flush(&mut std::io::stdout());
+    }
+    if want_out { c.stdout(std::process::Stdio::piped()); }
+    if input.is_none() {
+        if let Some(p) = &stdin_path {
+            if let Ok(f) = std::fs::File::open(p) {
+                c.stdin(std::process::Stdio::from(f));
+            }
+        }
+    }
+    if input.is_some() { c.stdin(std::process::Stdio::piped()); }
+    let Ok(mut ch) = c.spawn() else { return 1 };
+    if let Some(data) = input {
+        if let Some(mut si) = ch.stdin.take() { let _ = std::io::Write::write_all(&mut si, &data); }
+    }
+    let mut out = Vec::new();
+    if let Some(mut so) = ch.stdout.take() {
+        let _ = std::io::Read::read_to_end(&mut so, &mut out);
+    }
+    let rc = ch.wait().map(|s| s.code().unwrap_or(1)).unwrap_or(1);
+    if !out.is_empty() { __sh_sink(&out); }
+    rc
+}"#,
+        "run_argv" => r#"fn __sh_run_argv(argv: &[&str]) -> i32 {
+    __sh_spawn_argv(argv, None)
+}"#,
+        "capture_rc_argv" => r#"fn __sh_capture_rc_argv(argv: &[&str]) -> (String, i32) {
+    if argv.is_empty() { return (String::new(), 0); }
+    let mut c = std::process::Command::new(argv[0]);
+    c.args(&argv[1..]);
     c.stdout(std::process::Stdio::piped());
     c.stdin(std::process::Stdio::inherit());
     let Ok(mut ch) = c.spawn() else { return (String::new(), 1) };
@@ -18076,6 +18169,57 @@ fn is_native_cmd(cmd: &str) -> bool {
 }
 
 /// A single shell-out exec as command text (String expr).
+/// Returns the argv words (cmd + args) when a single exec statement is a
+/// plain all-static non-interpreter command, suitable for argv-spawn.
+fn static_argv_words(cmd: &str, words: &[&IrExpr], env: Option<&[(String, IrExpr)]>) -> Option<Vec<String>> {
+    // argv-spawn is only for genuinely external commands: sh2 builtins,
+    // native commands, and the commands with dedicated render arms keep
+    // their own (non-forking or helper-based) route.
+    if matches!(cmd, "awk" | "perl" | "xargs" | "bc") {
+        return None;
+    }
+    if NATIVE_CMDS.contains(&cmd) {
+        return None;
+    }
+    if matches!(cmd, "basename" | "dirname" | "rm" | "mkdir" | "touch" | "rmdir" | "cat" | "mktemp" | "sleep") {
+        return None;
+    }
+    if env.map(|e| !e.is_empty()).unwrap_or(false) {
+        return None;
+    }
+    let mut out = vec![cmd.to_string()];
+    for w in words {
+        match w {
+            IrExpr::Str(s, _) => out.push(s.clone()),
+            _ => return None,
+        }
+    }
+    Some(out)
+}
+
+/// Like stage_text but returns argv words for argv-spawn (single exec only).
+impl Render {
+    fn stage_argv(&mut self, stmts: &[IrStmt]) -> Option<Vec<String>> {
+        match stmts {
+            [IrStmt::Expr(IrExpr::Call { func, args })] if func == "exec" || func == "builtin" => {
+                let cmd = str_arg(args, 0)?;
+                if is_native_cmd(cmd)
+                    || matches!(cmd, "basename" | "dirname" | "rm" | "mkdir" | "touch" | "rmdir" | "cat" | "mktemp" | "sleep" | "awk" | "perl" | "xargs" | "bc")
+                {
+                    return None;
+                }
+                let words: Vec<&IrExpr> = match args.get(1) {
+                    Some(IrExpr::Array(items)) => items.iter().collect(),
+                    _ => vec![],
+                };
+                let env = exec_env(args);
+                static_argv_words(cmd, &words, env.as_deref())
+            }
+            _ => None,
+        }
+    }
+}
+
 fn single_exec_text(r: &mut Render, e: &IrExpr) -> Option<String> {
     if let IrExpr::Call { func, args } = e {
         if func == "exec" || func == "builtin" {
@@ -25487,7 +25631,7 @@ mod tests {
                     continue;
                 }
             }
-            if prog.contains("__sh_spawn(") {
+            if prog.contains("__sh_spawn") {
                 bad.push(format!("{name}: still shells out"));
                 continue;
             }
@@ -26195,7 +26339,7 @@ mod tests {
         ] {
             let prog = render_rs(src);
             assert!(
-                prog.contains("__sh_spawn("),
+                prog.contains("__sh_spawn"),
                 "{name}: a refused regex shape was folded:\n{prog}"
             );
             assert!(
@@ -26339,7 +26483,7 @@ mod tests {
         ] {
             let prog = render_rs(&src);
             assert!(
-                prog.contains("__sh_spawn("),
+                prog.contains("__sh_spawn"),
                 "{name}: a refused cat shape was folded:\n{prog}"
             );
             assert!(
@@ -26537,7 +26681,7 @@ mod tests {
         let (mut positives, mut failures) = (0, 0);
         for (family, src) in cases {
             let prog = render_rs(src);
-            if prog.contains("__sh_spawn(") {
+            if prog.contains("__sh_spawn") {
                 bad.push(format!("{family}: still shells out:\n{prog}"));
                 continue;
             }
@@ -26756,7 +26900,7 @@ mod tests {
         ] {
             let prog = render_rs(src);
             assert!(
-                prog.contains("__sh_spawn("),
+                prog.contains("__sh_spawn"),
                 "a refused fs shape lost its shell route: {src:?}\n{prog}"
             );
         }
@@ -27447,7 +27591,7 @@ mod tests {
                 bad.push(format!("{name}: node not used (no {marker:?})"));
                 continue;
             }
-            if prog.contains("__sh_spawn(") {
+            if prog.contains("__sh_spawn") {
                 bad.push(format!("{name}: still shells out"));
                 continue;
             }
@@ -27555,7 +27699,7 @@ mod tests {
         ] {
             let prog = render_rs(src);
             assert!(
-                prog.contains("__sh_spawn("),
+                prog.contains("__sh_spawn"),
                 "a refused node was folded instead of spawned: {src:?}\n{prog}"
             );
         }
@@ -27673,7 +27817,7 @@ mod tests {
         ] {
             let prog = render_rs(src);
             assert!(
-                prog.contains("__sh_spawn("),
+                prog.contains("__sh_spawn"),
                 "{name}: folded a shape it must refuse:\n{prog}"
             );
             assert!(
@@ -27761,7 +27905,7 @@ mod tests {
         let mut bad: Vec<String> = Vec::new();
         for (name, src) in refused {
             let prog = render_rs(src);
-            if !prog.contains("__sh_spawn(") {
+            if !prog.contains("__sh_spawn") {
                 bad.push(format!("{name}: folded a shape it must refuse:\n{prog}"));
             }
         }
