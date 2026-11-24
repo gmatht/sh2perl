@@ -1,0 +1,53 @@
+# verus-sync-coverage manifest: loop_int_lift
+# source sha: loop_int_lift=842533ef6732  proof sha: 982d9818a489
+
+[pins]
+pin pin_all_canonical_lifts -> test lifts_int_typed_loop: MAPPED
+pin pin_arith_read_allowed -> test lifts_when_the_body_is_arithmetic: MAPPED
+pin pin_canonical_forms -> test lifts_int_typed_loop: MAPPED
+pin pin_empty_refused -> UNMIRRORED (by design — see VERUS.md §(b).4)
+pin pin_leading_zero_refused -> test refuses_leading_zero_and_non_decimal: MAPPED
+pin pin_lift_fires -> test lifts_int_typed_loop: MAPPED
+pin pin_minus_zero_refused -> test refuses_leading_zero_and_non_decimal: MAPPED
+pin pin_no_verdict_no_lift -> test refuses_without_verdict: MAPPED
+pin pin_non_digit_refused -> UNMIRRORED (by design — see VERUS.md §(b).4)
+pin pin_plain_zero_ok -> UNMIRRORED (by design — see VERUS.md §(b).4)
+pin pin_text_read_blocks -> test refuses_when_the_body_uses_the_var_as_text: MAPPED
+
+[guards]
+guard canonical-int gate: PRESENT
+guard text-mention walker: PRESENT
+guard expr text-read walker: PRESENT
+guard stmt text-read walker: PRESENT
+guard numeric-context arm: PRESENT
+guard verdict and body gate: PRESENT
+guard per-element lift: PRESENT
+guard law lift_sound: PRESENT
+guard invariant stmt_agrees: PRESENT
+guard invariant eval_agrees: PRESENT
+guard law premise !stmt_text_reads(body, var): PRESENT
+
+[counts]
+proof-fns: 17
+pins: 11
+# NOTE: proof-fns is a file-shape fact (change detector), NOT the
+# Verus obligation count — the gate asserts N verified separately.
+
+[exec]
+# Each MAPPED test above, EXECUTED against the live source (one
+# module-suite run per model; per-test verdicts grepped from output).
+# A mapped test that fails or vanishes from the run is drift — FATAL.
+# The checker RUNS each mapped test (one module-suite cargo test per
+# source file) and records the per-test PASS/FAIL verdict below.
+# all suites built; per-test verdicts below
+exec pin_all_canonical_lifts (lifts_int_typed_loop): PASS
+exec pin_arith_read_allowed (lifts_when_the_body_is_arithmetic): PASS
+exec pin_canonical_forms (lifts_int_typed_loop): PASS
+exec pin_empty_refused: UNMIRRORED (not executed)
+exec pin_leading_zero_refused (refuses_leading_zero_and_non_decimal): PASS
+exec pin_lift_fires (lifts_int_typed_loop): PASS
+exec pin_minus_zero_refused (refuses_leading_zero_and_non_decimal): PASS
+exec pin_no_verdict_no_lift (refuses_without_verdict): PASS
+exec pin_non_digit_refused: UNMIRRORED (not executed)
+exec pin_plain_zero_ok: UNMIRRORED (not executed)
+exec pin_text_read_blocks (refuses_when_the_body_uses_the_var_as_text): PASS
