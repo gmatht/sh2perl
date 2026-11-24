@@ -1,5 +1,5 @@
 # verus-sync-coverage manifest: process_subst
-# source sha: process_subst=1d2113f934ce  proof sha: f13d01d27b51
+# source sha: process_subst=1d2113f934ce  proof sha: eac1e96b12f0
 
 [pins]
 pin pin_call_no_residue_on_success -> UNMIRRORED (by design — see VERUS.md §(b).4)

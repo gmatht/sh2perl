@@ -25,8 +25,13 @@
 //     the producer runs after the consumer (before cleanup), the temp
 //     path is unlinked, and other temp files are untouched.
 //
-// `process_in_*` / `process_out_*` below are those laws, proved per
-// routing shape the transform emits.
+// `process_in_*` / `process_out_*` below are those laws.  The routes
+// the transform emits collapse to three distinct programs in this model:
+// one PIn sequence (Arg/StdinOnly/Retarget/PipeStage), the PIn CallForm
+// `and` shape, and one POut sequence (all POut routes).  The routing
+// table is covered by dispatch theorems, so the laws are stated over
+// `lower(...)` for every `Consumer` and not re-proved once per
+// identical shape.
 //
 // ## The routing decision tree (the transform's own structure)
 //
