@@ -1,5 +1,5 @@
 # verus-sync-coverage manifest: f32_narrow
-# source sha: f32_narrow=9fd0af2daa0d  proof sha: 7bbd44091f51
+# source sha: f32_narrow=9fd0af2daa0d  proof sha: 16c04355d630
 
 [pins]
 pin pin_general_mul_not_form -> UNMIRRORED (by design — see VERUS.md §(b).4)
@@ -19,9 +19,12 @@ guard form -0: PRESENT
 guard operand_exact int round-trip: PRESENT
 guard is_f32_var hook: PRESENT
 guard C consumer f32 arm: PRESENT
+guard law verdict_is_exact: PRESENT
+guard literal lane verdict_exact_lit: PRESENT
+guard combine_exact_nonlit premise: PRESENT
 
 [counts]
-proof-fns: 7
+proof-fns: 9
 pins: 7
 # NOTE: proof-fns is a file-shape fact (change detector), NOT the
 # Verus obligation count — the gate asserts N verified separately.

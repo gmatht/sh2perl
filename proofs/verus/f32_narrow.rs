@@ -21,21 +21,39 @@
 //      FORM table (`+0`/`-0`, `*±1`, `*±0`, `/±1`) with both operands
 //      exact (f32_narrow.rs `combine`)
 //
-// The model proves the table is complete in the only sense that
-// matters: every form it accepts preserves f32-exactness for EVERY
-// real operand pair, checked over all of `Seq<(real,real)>` with no
-// bit-level assumptions — the arithmetic is stated as rounding
-// obligations (`f32_round`) that a `real` model can carry, and the
-// proof goes through the algebraic laws of IEEE-754 rounding
-// (`round(x) = x` for exact x; round of x*1, x+0, x-0, x/1).
+// THEOREM OF RECORD (route 3, `verdict_is_exact`): every form the table
+// accepts preserves f32-exactness for EVERY concrete operand pair. Given
+// the operands' concrete values `x`,`y` are exact and the lattices
+// describe them (a constant-carrying side is that constant; a
+// variable-carrying side is arbitrary), an accepted form's computed
+// value `bin_val(op,x,y)` is `f32_exact` -- so `combine`'s `exact = true`
+// is a fact, which is exactly what the renderers home on. The proof is
+// a case analysis over the four arms of `form_ok`; the two facts it
+// cannot derive inside a `real` model are carried as HYPOTHESES and
+// named: zero is representable (`zero_is_exact`) and rounding commutes
+// with negation (`negation_is_exact`, needed by the `* -1` and `/ -1`
+// arms). Literal values are the other lane (`verdict_exact_lit`, exact
+// IS the round-trip of the constant), and the literal FOLD is a stated
+// contract (`combine_exact_lit`), not re-derived.
+//
+// Without those hypotheses the table would be unsound: accepting a
+// general `*` is exactly the `4097.0 * 4097.0` hazard, and the mutant
+// that widens `form_ok`'s `+` arm to every add makes this law fail
+// (measured: 9 verified, 1 error, on the assertion that extracts the
+// accepted form's zero; the file was restored and re-checked at 10/0).
 //
 // FIDELITY:
 //   - `combine`'s domain rule and the `exact` conjunction are modelled
 //     verbatim, including the `%`/`//`/`**` refusal (no arm).
-//   - `cval`/fold are modelled by `fold_exact`: the model does not
-//     reproduce `py_fmod`/`floor` (unbounded Python semantics in a
+//   - `cval`/fold are modelled by `combine_exact_lit`: the model does
+//     not reproduce `py_fmod`/`floor` (unbounded Python semantics in a
 //     `real`; out of scope), it states the CONTRACT the caller checks —
 //     an accepted fold value satisfies `f32_exact`.
+//   - the arith itself is stated in `real`. That loses nothing for the
+//     accepted forms: each computes one operand, its negation, or a
+//     zero, and the operand is f32-exact hence f64-exact, so the f64 the
+//     source runs equals the `real` value. Rounding of a general
+//     `+`/`-`/`*`/`/` is therefore never modelled -- the table refuses it.
 //   - The whole-program at-risk fixpoint (drop candidates whose inexact
 //     op may execute in f32) is modelled by its conclusion: the verdict
 //     table contains only names whose every definition has an exact
@@ -196,28 +214,162 @@ pub uninterp spec fn fold_val(x: real, y: real) -> real;
 
 // ---- THE SOUNDNESS THEOREM ----
 
-// Every pair of exact reals is preserved by each accepted form. These
-// are the four algebraic facts IEEE-754 rounding gives for free:
-// x + 0 = x, x - 0 = x, x * 1 = x, x * 0 = 0 (exact zero), x / 1 = x.
-// Stated as spec facts over `real` arithmetic; `f32_exact` closes each
-// because the rounded value equals the value.
-pub open spec fn plus_zero_preserves(x: real) -> bool {
-    f32_exact(x)
-}
-pub open spec fn mul_one_preserves(x: real) -> bool {
-    f32_exact(x)
+// The two facts about the ROUNDING FUNCTION the accepted forms rest on,
+// which a `real` model cannot derive: zero is representable, and
+// rounding commutes with negation (so the `* -1` and `/ -1` arms, which
+// the table accepts, keep exactness). Both are carried as HYPOTHESES of
+// the theorem below rather than assumed somewhere in the model.
+pub open spec fn zero_is_exact() -> bool {
+    f32_exact(0.0real)
 }
 
-// The `*0` arm: zero is binary32-exact (round(0) = 0 by the identity
-// law of the rounding function on representable values).
-pub open spec fn zero_exact() -> bool {
-    f32_exact(0.0real)
+pub open spec fn negation_is_exact(v: real) -> bool {
+    f32_exact(v) ==> f32_exact(0.0real - v)
+}
+
+// The lattice DESCRIBES a concrete operand value: a constant-carrying
+// value is that constant; a variable-carrying value (`has_cval` false)
+// describes any value -- its exactness is the induction hypothesis the
+// analysis's candidate set maintains.
+pub open spec fn denotes(fv: FVal, v: real) -> bool {
+    !fv.has_cval || fv.cval == v
+}
+
+// The value the binop computes (`op` as in `form_ok`; an op outside the
+// table never reaches the law). Modelled over `real`: every accepted
+// form computes one of the operands, its negation, or a zero, all of
+// which the f64 the source actually runs equals exactly, so nothing is
+// lost by stating the arithmetic in `real`.
+pub open spec fn bin_val(op: int, x: real, y: real) -> real {
+    if op == op_add() {
+        x + y
+    } else if op == op_sub() {
+        x - y
+    } else if op == op_mul() {
+        x * y
+    } else if op == op_div() {
+        x / y
+    } else {
+        0.0real
+    }
+}
+
+// The lattice value `combine` builds for a non-literal float binop
+// (f32_narrow.rs's final `FVal`): Float domain, `exact` from the form
+// table, no constant.
+pub open spec fn combine_nonlit(op: int, l: FVal, r: FVal) -> FVal {
+    FVal {
+        dom: dom_float(),
+        exact: combine_exact_nonlit(op, l, r),
+        has_cval: false,
+        cval: 0.0real,
+    }
 }
 
 // The soundness direction the renderers need, in the shape the verdict
 // is consumed: a value the analysis marks exact IS exact.
-pub open spec fn verdict_exact(fv: FVal) -> bool {
-    fv.dom == dom_float() && fv.exact ==> f32_exact(fv.cval) || !fv.has_cval
+pub open spec fn verdict_exact(fv: FVal, v: real) -> bool {
+    fv.dom == dom_float() && fv.exact ==> f32_exact(v)
+}
+
+// THEOREM OF RECORD (the header's `verdict_exact`, route 3). Every
+// accepted non-literal form preserves binary32-exactness for EVERY
+// concrete operand pair: if both operand values are exact and the form
+// table accepts the op, the value the op computes is exact -- so the
+// verdict `exact = true` is a fact the renderers may home in 32 bits,
+// not a guess. The `%`/`//`/`**` refusal is part of the table.
+pub proof fn verdict_is_exact(op: int, l: FVal, r: FVal, x: real, y: real)
+    requires
+        operand_exact(l),
+        operand_exact(r),
+        denotes(l, x),
+        denotes(r, y),
+        f32_exact(x),
+        f32_exact(y),
+        zero_is_exact(),
+        negation_is_exact(x),
+        negation_is_exact(y),
+        form_ok(op, l, r),
+    ensures
+        verdict_exact(combine_nonlit(op, l, r), bin_val(op, x, y)),
+{
+    if op == op_add() {
+        if is_zero(l) {
+            assert(l.has_cval && l.cval == 0.0real);
+            assert(x == 0.0real);
+            assert(bin_val(op, x, y) == y);
+        } else {
+            assert(is_zero(r));
+            assert(r.has_cval && r.cval == 0.0real);
+            assert(y == 0.0real);
+            assert(bin_val(op, x, y) == x);
+        }
+    } else if op == op_sub() {
+        assert(is_zero(r));
+        assert(r.has_cval && r.cval == 0.0real);
+        assert(y == 0.0real);
+        assert(bin_val(op, x, y) == x);
+    } else if op == op_mul() {
+        if is_one_or_zero(l) {
+            if is_zero(l) {
+                assert(x == 0.0real);
+                assert(bin_val(op, x, y) == 0.0real);
+                assert(f32_exact(0.0real));
+            } else {
+                assert(is_one(l));
+                assert(l.has_cval && (l.cval == 1.0real || l.cval == -1.0real));
+                assert(x == 1.0real || x == -1.0real);
+                if x == 1.0real {
+                    assert(bin_val(op, x, y) == y);
+                } else {
+                    assert(x == -1.0real);
+                    assert(bin_val(op, x, y) == 0.0real - y);
+                    assert(f32_exact(0.0real - y));
+                }
+            }
+        } else {
+            assert(is_one_or_zero(r));
+            if is_zero(r) {
+                assert(y == 0.0real);
+                assert(bin_val(op, x, y) == 0.0real);
+                assert(f32_exact(0.0real));
+            } else {
+                assert(is_one(r));
+                assert(r.has_cval && (r.cval == 1.0real || r.cval == -1.0real));
+                assert(y == 1.0real || y == -1.0real);
+                if y == 1.0real {
+                    assert(bin_val(op, x, y) == x);
+                } else {
+                    assert(y == -1.0real);
+                    assert(bin_val(op, x, y) == 0.0real - x);
+                    assert(f32_exact(0.0real - x));
+                }
+            }
+        }
+    } else {
+        assert(op == op_div());
+        assert(is_one(r));
+        assert(r.has_cval && (r.cval == 1.0real || r.cval == -1.0real));
+        assert(y == 1.0real || y == -1.0real);
+        if y == 1.0real {
+            assert(bin_val(op, x, y) == x);
+        } else {
+            assert(y == -1.0real);
+            assert(bin_val(op, x, y) == 0.0real - x);
+            assert(f32_exact(0.0real - x));
+        }
+    }
+}
+
+// The literal lane of the verdict: an accepted constant fold carries the
+// exactness contract `combine_exact_lit` (the fold's own computation --
+// `py_fmod`, `floor`, overflow -- is out of model and stated there).
+pub proof fn verdict_exact_lit(v: real)
+    requires
+        f32_exact(v),
+    ensures
+        verdict_exact(lit(v), v),
+{
 }
 
 // ---- the fixpoint's job, stated as the one step it performs ----
