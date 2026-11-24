@@ -655,6 +655,76 @@ fn lower_stmt(stmt: &mut IrStmt, emit: bool, arrays: &std::collections::HashSet<
                         }
                     }
                 }
+                // `uniq [flags] FILE` (single FILE source) → UniqLines over the
+                // file's contents read at runtime (Rust) / text (others).
+                if emit && cmd == "uniq" {
+                    let mut strs: Vec<String> = Vec::new();
+                    let mut all_str = true;
+                    for a in cmd_args.iter() {
+                        match a {
+                            IrExpr::Str(s, _) => strs.push(s.clone()),
+                            _ => { all_str = false; break; }
+                        }
+                    }
+                    if all_str {
+                        let mut files: Vec<String> = Vec::new();
+                        let mut flag_strs: Vec<String> = Vec::new();
+                        let mut bad = false;
+                        for s in &strs {
+                            if s.starts_with('-') {
+                                flag_strs.push(s.clone());
+                            } else {
+                                files.push(s.clone());
+                            }
+                        }
+                        if files.len() == 1 && !bad {
+                            let mut count = false;
+                            let mut skip: i64 = 0;
+                            let mut fi = 0;
+                            let fstrs = flag_strs.clone();
+                            while fi < fstrs.len() {
+                                let s = fstrs[fi].as_str();
+                                match s {
+                                    "-c" => count = true,
+                                    "-s" => {
+                                        if fi + 1 >= fstrs.len() { bad = true; break; }
+                                        let n = &fstrs[fi + 1];
+                                        match n.parse::<i64>() {
+                                            Ok(v) if v >= 0 => { skip = v; fi += 1; }
+                                            _ => { bad = true; break; }
+                                        }
+                                    }
+                                    _ if s.starts_with("-s") && s.len() > 2 => {
+                                        match s[2..].parse::<i64>() {
+                                            Ok(v) if v >= 0 => skip = v,
+                                            _ => { bad = true; break; }
+                                        }
+                                    }
+                                    _ if s.starts_with('-') && s.len() > 1 => {
+                                        // combined forms like -cs3 not accepted
+                                        bad = true; break;
+                                    }
+                                    _ => { bad = true; break; }
+                                }
+                                fi += 1;
+                            }
+                            if !bad && offered("UniqLines") {
+                                *stmt = with_status_zero(IrStmt::Output {
+                                    value: IrExpr::Ext(Box::new(UniqLines {
+                                        text: IrExpr::Str(String::new(), StrStyle::DoubleQuoted),
+                                        source: Some(files.remove(0)),
+                                        skip,
+                                        count,
+                                    })),
+                                    newline: false,
+                                    target: None,
+                                });
+                                LIFT_COUNT.fetch_add(1, Ordering::Relaxed);
+                                return;
+                            }
+                        }
+                    }
+                }
                 if emit && cmd == "find" {
                     // bare `find P [-maxdepth N] [-type f|d]` → WalkDir
                     // printing each entry path (streaming, no entry list).
@@ -2181,7 +2251,7 @@ fn try_lower_uniq(text: IrExpr, args: &[IrExpr]) -> Option<IrExpr> {
         }
         i += 1;
     }
-    Some(IrExpr::Ext(Box::new(UniqLines { text, skip, count })))
+    Some(IrExpr::Ext(Box::new(UniqLines { text, source: None, skip, count })))
 }
 
 // ── xargs (trim) ─────────────────────────────────────────────────────

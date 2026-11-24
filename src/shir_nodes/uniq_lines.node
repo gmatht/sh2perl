@@ -27,6 +27,8 @@ node UniqLines
 tag "UniqLines"
 kind expr
 field text: expr
+# source: optional path; when Some, read the file at runtime (standalone `uniq FILE`).
+field source: optional_string
 # skip: characters ignored at the START of each line when deciding whether
 # two lines are equal (`uniq -s N`). Values beyond a line's length make it
 # compare as the empty suffix, which is what uniq does.

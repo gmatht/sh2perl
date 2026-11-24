@@ -6349,7 +6349,10 @@ __sh_lines.sort_by(|__sh_left, __sh_right| {cmp}); {uniq} __sh_lines.join(\"\\n\
             }
             "UniqLines" => {
                 let x = n.as_any().downcast_ref::<crate::shir_nodes::UniqLines>()?;
-                let t = self.expr_str(&x.text);
+                let t = match &x.source {
+                    Some(src) => format!("std::fs::read_to_string({}).unwrap_or_default()", Self::rust_str(src)),
+                    None => self.expr_str(&x.text),
+                };
                 let skip = x.skip.max(0) as usize;
                 let projected = if x.count {
                     // GNU `uniq -c` pads the run length to width 7.
@@ -27824,6 +27827,7 @@ mod tests {
         let uniq = |text: &str, skip: i64, count: bool| {
             shir_to_rust(&print_program(IrExpr::Ext(Box::new(UniqLines {
                 text: s(text),
+                source: None,
                 skip,
                 count,
             }))))
