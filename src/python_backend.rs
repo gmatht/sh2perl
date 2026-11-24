@@ -182,6 +182,21 @@ pub struct Render {
     /// counter for multi-statement command-substitution buffers
     /// (`$(stmt; stmt)` → a `StringIO` + `redirect_stdout` block)
     cap_counter: usize,
+    /// Names bound as ARRAYS (`a=(…)`, `declare -a`). Interpolation may not
+    /// treat these as scalars: `${a}` names element 0, not the list.
+    array_names: HashSet<String>,
+    /// The program observes `$?` somewhere (shared `status_reads` verdict),
+    /// so every status store is observable.
+    status_read: bool,
+    /// No `$?` reader AND the last top-level statement is provably
+    /// successful: the only observable status is the process exit code,
+    /// which is 0. Statement-level status stores are then dead and skipped.
+    lazy_rc: bool,
+    /// TAIL mode: the index of the last top-level statement when it is the
+    /// only status writer the exit code can observe. None = every store
+    /// matters. `cur_stmt` tracks which top-level statement is rendering.
+    tail_rc: Option<usize>,
+    cur_stmt: Option<usize>,
 }
 
 impl Render {
@@ -1071,6 +1086,25 @@ pub fn shir_to_python(prog: &IrProgram) -> String {
     if prog.var_types.is_empty() {
         prog.var_types = crate::shir::analyze_var_types(&prog);
     }
+    // Typed shared rewrite (the loop-int-lift OFFER's first consumer): an
+    // Int-typed loop variable over a literal decimal list takes integer
+    // elements, so the renderer emits `for i in [1, 2, 3]` and no per-item
+    // conversion. The shared registry has no type verdicts at its stage, so
+    // this is the typed entry (see the module docs).
+    {
+        let int_typed: HashSet<String> = prog
+            .var_types
+            .iter()
+            .filter(|(_, t)| {
+                matches!(
+                    t,
+                    IrType::Int | IrType::Int32 | IrType::Int64 | IrType::UInt32 | IrType::UInt64
+                )
+            })
+            .map(|(n, _)| n.clone())
+            .collect();
+        crate::transforms::loop_int_lift::transform_with_types(&mut prog.stmts, &int_typed);
+    }
     let mut r = Render::default();
     r.var_types = prog.var_types.iter().cloned().collect();
     r.collect_writes(&prog.stmts);
@@ -1240,6 +1274,7 @@ impl Render {
                 }
                 IrStmt::DeclareArray { var, elements, .. } => {
                     self.written.insert(var.clone());
+                    self.array_names.insert(var.clone());
                     for e in elements {
                         self.collect_writes_expr(e);
                     }
@@ -2737,6 +2772,28 @@ impl Render {
         false
     }
 
+    /// Can this arithmetic rendering be the empty string? Only `/` and `%`
+    /// do that (a zero divisor yields ""), and the property propagates
+    /// through any node containing one.
+    fn arith_maybe_empty(a: &ArithAst) -> bool {
+        match a {
+            ArithAst::Bin { op, lhs, rhs } => {
+                op == "/"
+                    || op == "%"
+                    || Self::arith_maybe_empty(lhs)
+                    || Self::arith_maybe_empty(rhs)
+            }
+            ArithAst::Un { arg, .. } => Self::arith_maybe_empty(arg),
+            ArithAst::Cond { test, then, else_ } => {
+                Self::arith_maybe_empty(test)
+                    || Self::arith_maybe_empty(then)
+                    || Self::arith_maybe_empty(else_)
+            }
+            ArithAst::Cast { arg, .. } => Self::arith_maybe_empty(arg),
+            _ => false,
+        }
+    }
+
     fn arith(&mut self, a: &ArithAst) -> String {
         match a {
             ArithAst::Num(n) => n.to_string(),
@@ -2844,8 +2901,22 @@ impl Render {
                 format!("__sh_atoi(__sh_elem({}, {}))", target, k)
             }
             ArithAst::Bin { op, lhs, rhs } => {
-                let l = self.arith(lhs);
-                let r = self.arith(rhs);
+                // A `/` or `%` node evaluates to an int OR "" (zero divisor),
+                // so an operand THAT CONTAINS one must still be coerced before
+                // it feeds a numeric operator — `(a / (b % 0))` would divide
+                // by a str. Every other operand kind is numeric already.
+                let l0 = self.arith(lhs);
+                let r0 = self.arith(rhs);
+                let wrap = |s: String, need: bool, r: &mut Self| {
+                    if need {
+                        r.need_atoi = true;
+                        format!("__sh_atoi({s})")
+                    } else {
+                        s
+                    }
+                };
+                let l = wrap(l0, Self::arith_maybe_empty(lhs), self);
+                let r = wrap(r0, Self::arith_maybe_empty(rhs), self);
                 if *op == "**" {
                     format!("pow({l},{r})")
                 } else if op == "&&" {
@@ -2859,29 +2930,25 @@ impl Render {
                     // bash `/` truncates toward zero; division by zero is
                     // an error with an EMPTY value (the assignment
                     // continues — parse-arithmetic-extra-paren.sh) — never
-                    // a python ZeroDivisionError. The divisor is coerced:
-                    // an EMPTY divisor is a str, and `int / str` raised
-                    // TypeError instead of taking the guard
-                    // (063_hard_to_parse).
-                    self.need_atoi = true;
-                    format!(
-                        "(int(__sh_atoi({l}) / __sh_atoi({r})) if __sh_atoi({r}) != 0 else \"\")"
-                    )
+                    // a python ZeroDivisionError. EVERY arith rendering is
+                    // already numeric (a Var coerces through `__sh_atoi`/
+                    // `int()`, a nested Bin yields a number), so the operands
+                    // are used as-is: the old extra `__sh_atoi` wrap produced
+                    // `__sh_atoi(int(x))` and evaluated the divisor three
+                    // times. The divisor is still repeated in the guard, but
+                    // it is a bare ident or literal in the corpus.
+                    format!("(int({l} / {r}) if {r} != 0 else \"\")")
                 } else if op == "%" {
                     // same zero-divisor rule as `/` (bash `%` by zero
                     // errors with an empty value).
-                    self.need_atoi = true;
-                    format!(
-                        "((__sh_atoi({l}) % __sh_atoi({r})) if __sh_atoi({r}) != 0 else \"\")"
-                    )
+                    format!("(({l} % {r}) if {r} != 0 else \"\")")
                 } else if matches!(op.as_str(), "+" | "-" | "*") {
                     // every arith operand is a NUMBER in bash, whatever the
-                    // variable holds (`value` is the string "42" there);
-                    // a raw str operand raised TypeError or, worse, `%`
-                    // silently produced the wrong branch (058 printed
-                    // `Odd number: 42`).
-                    self.need_atoi = true;
-                    format!("(__sh_atoi({l}) {op} __sh_atoi({r}))")
+                    // variable holds (`value` is the string "42" there).
+                    // `arith()` already coerces each operand, so no second
+                    // `__sh_atoi` round (that was the `__sh_atoi(int(x))`
+                    // and `__sh_atoi(1)` residue).
+                    format!("({l} {op} {r})")
                 } else if matches!(op.as_str(), "<" | ">" | "<=" | ">=" | "==" | "!=") {
                     // an arith comparison yields 0/1, never a python bool:
                     // `echo $(( x > 2 ))` printed `True`
@@ -3244,8 +3311,15 @@ impl Render {
             }
             // `$name` reaches an interpolation as `getVar`, not `Var`
             IrExpr::Call { func, .. } if func == "getVar" => {
-                self.need_param_ops = true;
-                format!("__sh_scalar({})", self.expr(x))
+                // `$?`/`$$` render to a Python `str(...)`; the scalar
+                // rule (element 0 for arrays) cannot apply to them.
+                let v = self.expr(x);
+                if v.starts_with("str(") || v.starts_with("__sh_hostname") {
+                    v
+                } else {
+                    self.need_param_ops = true;
+                    format!("__sh_scalar({v})")
+                }
             }
             IrExpr::Index { var, key } => {
                 self.need_param_ops = true;
@@ -3260,13 +3334,14 @@ impl Render {
     }
 
     fn interp(&mut self, parts: &[InterpPart]) -> String {
+        // A plain scalar read is f-string-safe: `f"i={i}"` is the idiomatic
+        // spelling, and Python's implicit `str()` replaces both the
+        // `str(__sh_scalar(x))` wrapper and the `+` concatenation. Only a
+        // value that may be a LIST needs the scalar rule (`${arr}` = element
+        // 0), so array names stay on the concatenation path.
         let fstr_ok = parts.iter().all(|p| match p {
             InterpPart::Lit(_) => true,
-            InterpPart::Expr(x) => {
-                !matches!(**x, IrExpr::Var(_, _) | IrExpr::Index { .. })
-                    && !matches!(**x, IrExpr::Call { ref func, .. } if func == "getVar")
-                    && self.fstring_safe(x)
-            }
+            InterpPart::Expr(x) => self.fstring_safe(x) && self.interp_scalar(x),
         });
         if fstr_ok {
             let mut s = String::from("f\"");
@@ -3297,6 +3372,25 @@ impl Render {
         }
     }
 
+    /// May this interpolation part use the PLAIN value (no `__sh_scalar`)?
+    /// A name bound as an array names element 0 when read bare; everything
+    /// else is a scalar. Store-resident (dotted) names have no binding.
+    fn interp_scalar(&self, e: &IrExpr) -> bool {
+        match e {
+            IrExpr::Var(n, _) => {
+                !self.array_names.contains(n) && !self.store_written.contains(n)
+            }
+            IrExpr::Call { func, args } if func == "getVar" => match args.first() {
+                Some(IrExpr::Str(n, _)) => {
+                    matches!(n.as_str(), "?" | "$")
+                        || (!self.array_names.contains(n) && !self.store_written.contains(n))
+                }
+                _ => false,
+            },
+            _ => true,
+        }
+    }
+
     /// Can this expression be embedded in an f-string `{...}` (i.e. its
     /// rendering contains no `"` or backslash)?
     fn fstring_safe(&self, e: &IrExpr) -> bool {
@@ -3305,7 +3399,10 @@ impl Render {
             IrExpr::Arith(a) => self.arith_safe(a),
             IrExpr::Call { func, args } if func == "getVar" => {
                 // known vars render to bare idents; unknown → sh2_getVar("..")
-                matches!(args.first(), Some(IrExpr::Str(name, _)) if self.var_types.contains_key(name))
+                matches!(args.first(), Some(IrExpr::Str(name, _))
+                    if matches!(name.as_str(), "?" | "$")
+                        || self.var_types.contains_key(name)
+                        || (self.written.contains(name) && !self.store_written.contains(name)))
             }
             _ => false,
         }
@@ -7301,7 +7398,6 @@ impl Render {
                     "=" | "==" => Some(format!("(str({a}) == str({b}))")),
                     "!=" => Some(format!("(str({a}) != str({b}))")),
                     "-eq" | "-ne" | "-lt" | "-gt" | "-le" | "-ge" => {
-                        self.need_atoi = true;
                         let pyop = match op.as_str() {
                             "-eq" => "==",
                             "-ne" => "!=",
@@ -7310,9 +7406,10 @@ impl Render {
                             "-le" => "<=",
                             _ => ">=",
                         };
-                        Some(format!(
-                            "(__sh_atoi({a}) {pyop} __sh_atoi({b}))"
-                        ))
+                        // a numeric literal is already a python int
+                        let na = self.num_test_operand(&items[0], a);
+                        let nb = self.num_test_operand(&items[2], b);
+                        Some(format!("({na} {pyop} {nb})"))
                     }
                     _ => None,
                 }
@@ -7450,8 +7547,9 @@ impl Render {
                 // text (eq-string-num-var.sh — a bare `==` between a str
                 // var and the int literal 2 would always fail).
                 if matches!(op.as_str(), "-gt" | "-lt" | "-ge" | "-le" | "-eq" | "-ne") {
-                    self.need_atoi = true;
-                    Some(format!("(__sh_atoi({va}) {py_op} __sh_atoi({vb}))"))
+                    let na = self.num_text_operand(a, va);
+                    let nb = self.num_text_operand(b, vb);
+                    Some(format!("({na} {py_op} {nb})"))
                 } else {
                     Some(format!("(str({va}) {py_op} str({vb}))"))
                 }
@@ -8917,7 +9015,62 @@ impl Render {
     /// Unconditional: the program ends with `sys.exit(__sh_rc)`, so the
     /// register must be right even with no `$?` reader in the source.
     fn rc_reset(&mut self) {
+        if !self.rc_live() {
+            return;
+        }
         self.emit("__sh_rc = 0");
+    }
+
+    /// Is the register unobservable except through the process exit code?
+    /// True in lazy mode (no `$?` reader, provably-successful tail) and in
+    /// TAIL mode (no `$?` reader, and the LAST top-level statement writes
+    /// the register itself, so every earlier store is dead).
+    fn rc_dead(&self) -> bool {
+        self.lazy_rc || self.tail_rc.is_some()
+    }
+
+    /// Should a status store/effect be *recorded*? In tail mode only the
+    /// final top-level statement's own stores survive.
+    fn rc_live(&self) -> bool {
+        if self.lazy_rc {
+            return false;
+        }
+        match self.tail_rc {
+            None => true,
+            Some(t) => self.cur_stmt == Some(t),
+        }
+    }
+
+    /// Record a status store from a statement arm. Suppressed in lazy mode:
+    /// with no `$?` reader and a provably-successful last statement, nothing
+    /// observes it (the process exits 0).
+    fn rc_set(&mut self, line: &str) {
+        if self.rc_live() {
+            self.emit(line);
+        }
+    }
+
+    /// A statement whose EXPRESSION is the side effect (an external command,
+    /// a fallible builtin, a test used for its status). The status store and
+    /// the effect share one line in the classic form; in lazy mode the
+    /// effect must still run, so the bare expression is emitted.
+    fn rc_effect(&mut self, x: &str) {
+        if self.rc_live() {
+            self.emit(&format!("__sh_rc = {x}"));
+        } else {
+            self.emit(x);
+        }
+    }
+
+    /// A boolean-valued effect (a test, `&&`/`||` chain, fallible builtin):
+    /// shell status is `0` for true and `1` for false — NOT the truthy value
+    /// itself (which is `1` in Python and would invert the exit code).
+    fn rc_bool(&mut self, x: &str) {
+        if self.rc_live() {
+            self.emit(&format!("__sh_rc = 0 if ({x}) else 1"));
+        } else {
+            self.emit(x);
+        }
     }
 
     /// Reset `$?` after an assignment whose RHS is a native value (see
@@ -8959,6 +9112,41 @@ impl Render {
     /// A test operand: `"$y"`/`$y`/`y` (typed var) → ident; a number →
     /// literal; a native-written name (a lifted temp) → ident; otherwise a
     /// quoted string.
+    /// One side of a NUMERIC shell comparison: bash coerces the text, but a
+    /// literal is already a Python int, so the `__sh_atoi` call (and its
+    /// runtime lookup) is skipped for `5`, `-2`, `$(( 1 + 2 ))`.
+    /// Same for a shell-word operand that reaches this arm as TEXT (the
+    /// `[ 5 -gt 3 ]` form): a pure decimal needs no coercion.
+    fn num_text_operand(&mut self, t: &str, code: String) -> String {
+        let t = t.trim();
+        let digits = t.strip_prefix('-').unwrap_or(t);
+        // a leading zero is NOT a plain decimal (`010` is octal to bash's
+        // `-eq` coercion path), so only canonical digits skip the helper
+        let canonical = !digits.is_empty()
+            && digits.chars().all(|c| c.is_ascii_digit())
+            && (digits.len() == 1 || !digits.starts_with('0'));
+        if canonical {
+            code
+        } else {
+            self.need_atoi = true;
+            format!("__sh_atoi({code})")
+        }
+    }
+
+    fn num_test_operand(&mut self, e: &IrExpr, code: String) -> String {
+        let literal = match e {
+            IrExpr::Int(_) => true,
+            IrExpr::Arith(a) => matches!(a.as_ref(), ArithAst::Num(_)),
+            _ => false,
+        };
+        if literal {
+            code
+        } else {
+            self.need_atoi = true;
+            format!("__sh_atoi({code})")
+        }
+    }
+
     fn test_value(&mut self, t: &str) -> String {
         // A QUOTED operand is a string even when it looks like a number:
         // bash `[ "10" = "010" ]` compares TEXT (distinct), so the numeric
@@ -9400,11 +9588,11 @@ impl Render {
                         };
                         if *prefix {
                             self.emit(&format!("{coerce}{name} {py_op}= {rhs}"));
-                            self.emit(&format!("__sh_rc = 0 if {name} else 1"));
+                            self.rc_set(&format!("__sh_rc = 0 if {name} else 1"));
                         } else {
                             self.emit(&format!("__sh_old = {name}"));
                             self.emit(&format!("{coerce}{name} {py_op}= {rhs}"));
-                            self.emit("__sh_rc = 0 if __sh_old else 1");
+                            self.rc_set("__sh_rc = 0 if __sh_old else 1");
                         }
                         return;
                     }
@@ -9434,7 +9622,7 @@ impl Render {
                         }
                         // the assigned VALUE is the status (bash ((x = 0))
                         // is rc 1) — same rule as the IncDec arm above.
-                        self.emit(&format!("__sh_rc = 0 if {name} else 1"));
+                        self.rc_set(&format!("__sh_rc = 0 if {name} else 1"));
                         return;
                     }
                 }
@@ -9527,7 +9715,10 @@ impl Render {
                     };
                     if is_status {
                         let x = self.expr(e);
-                        self.emit(&format!("__sh_rc = 0 if ({x}) else 1"));
+                        // the test/false/&& chain may have side effects
+                        // (a function call, a grep), so lazy mode emits the
+                        // bare expression instead of dropping it.
+                        self.rc_bool(&x);
                         return;
                     }
                 }
@@ -9541,7 +9732,7 @@ impl Render {
                         if let Some(run) = self.pipeline_run(args) {
                             self.emit(&format!("__sh_pr = {run}"));
                             self.emit("sys.stdout.write(__sh_pr.stdout.decode())");
-                            self.emit("__sh_rc = __sh_pr.returncode");
+                            self.rc_set("__sh_rc = __sh_pr.returncode");
                             return;
                         }
                         // `producer | while read V; do … done`: replay the
@@ -9608,13 +9799,13 @@ impl Render {
                 if (x.starts_with("__sh_exec([") && x.ends_with("])"))
                     || Self::is_native_rc(&x)
                 {
-                    self.emit(&format!("__sh_rc = {x}"));
+                    self.rc_effect(&x);
                     return;
                 }
                 // a fallible builtin (`__sh_ok(os.chdir, …)` → bool):
                 // record rc 0/1 like the __sh_exec rule above.
                 if x.starts_with("__sh_ok(") {
-                    self.emit(&format!("__sh_rc = 0 if {x} else 1"));
+                    self.rc_bool(&x);
                     return;
                 }
                 // a failed `$(( ))` expansion aborts the whole command
@@ -9633,7 +9824,7 @@ impl Render {
                 }
                 self.emit(&format!("{x}"));
                 if Self::stmt_resets_rc(&x) {
-                    self.emit("__sh_rc = 0");
+                    self.rc_reset();
                 }
             }
             IrStmt::Assign { targets, expr, asm, .. } => {
@@ -9741,11 +9932,11 @@ impl Render {
                         // IncDec arm): postfix reads the OLD value.
                         if *prefix {
                             self.emit(&format!("{coerce}{v} {s}= {d}"));
-                            self.emit(&format!("__sh_rc = 0 if {v} else 1"));
+                            self.rc_set(&format!("__sh_rc = 0 if {v} else 1"));
                         } else {
                             self.emit(&format!("__sh_old = {v}"));
                             self.emit(&format!("{coerce}{v} {s}= {d}"));
-                            self.emit("__sh_rc = 0 if __sh_old else 1");
+                            self.rc_set("__sh_rc = 0 if __sh_old else 1");
                         }
                         return;
                     }
@@ -9774,7 +9965,7 @@ impl Render {
                             }
                             // the assigned VALUE is the status (bash
                             // ((x = 0)) is rc 1).
-                            self.emit(&format!("__sh_rc = 0 if {name} else 1"));
+                            self.rc_set(&format!("__sh_rc = 0 if {name} else 1"));
                             return;
                         }
                     }
@@ -10233,27 +10424,39 @@ impl Render {
                         }
                     }
                 }
-                let flag = format!("__sh_ran{}", self.cap_counter);
-                self.cap_counter += 1;
-                self.emit(&format!("{flag} = False"));
+                // The ran-flag only exists to set `$? = 0` when a loop body
+                // never executed. With no `$?` reader (lazy mode) the flag
+                // per iteration is pure overhead, so it is not emitted.
+                let flag = if self.rc_dead() {
+                    None
+                } else {
+                    let f = format!("__sh_ran{}", self.cap_counter);
+                    self.cap_counter += 1;
+                    self.emit(&format!("{f} = False"));
+                    Some(f)
+                };
                 let (pre, c) = self.cond_test(cond);
                 for p in pre {
                     self.emit(&p);
                 }
                 self.emit(&format!("while {c}:"));
                 self.loop_depth += 1;
-                self.depth += 1;
-                self.emit(&format!("{flag} = True"));
-                self.depth -= 1;
+                if let Some(f) = &flag {
+                    self.depth += 1;
+                    self.emit(&format!("{f} = True"));
+                    self.depth -= 1;
+                }
                 self.block(body);
                 self.loop_depth -= 1;
                 // a loop whose body never ran leaves $? = 0 (bash); the
                 // condition's own status was 1
                 // (parse-multi-command-while-condition printed exit: 1).
-                self.emit(&format!("if not {flag}:"));
-                self.depth += 1;
-                self.emit("__sh_rc = 0");
-                self.depth -= 1;
+                if let Some(f) = &flag {
+                    self.emit(&format!("if not {f}:"));
+                    self.depth += 1;
+                    self.emit("__sh_rc = 0");
+                    self.depth -= 1;
+                }
             }
             // C-style `for (init; cond; step)` — the imperative frontends'
             // rich form (the shell path lowers it via strip_cfor). Render
@@ -10565,7 +10768,7 @@ impl Render {
                 )]) {
                     self.emit(&format!("__sh_pr = {run}"));
                     self.emit("sys.stdout.write(__sh_pr.stdout.decode())");
-                    self.emit("__sh_rc = __sh_pr.returncode");
+                    self.rc_set("__sh_rc = __sh_pr.returncode");
                 } else if self.pipeline_native_head(stages).is_some() {
                 } else {
                     // Fallback: render stages as sequential statements
@@ -11025,7 +11228,7 @@ impl Render {
                                 Self::py_str(&text)
                             ));
                             self.emit("sys.stdout.write(__sh_pr.stdout.decode())");
-                            self.emit("__sh_rc = __sh_pr.returncode");
+                            self.rc_set("__sh_rc = __sh_pr.returncode");
                             return;
                         }
                     }
@@ -11075,6 +11278,29 @@ impl Render {
         for (n, _) in &prog.var_types {
             vars.insert(n.clone());
         }
+        // A name whose FIRST touch on the main path is a WRITE needs no
+        // hoisted default: Python binds it before the read can happen. The
+        // old unconditional hoist emitted dead initialisers (`i = 0` before
+        // `for i in …`, a second `__n = 0`). Only top-level, unconditional
+        // statements count; anything inside a branch/loop is a possible
+        // read and keeps its default (sound direction).
+        let unconditional_writes = first_touch_writes(&prog.stmts);
+        // Status liveness: with no `$?` reader and a provably-successful
+        // last statement, the only observable status is the exit code (0),
+        // so the per-statement register is dead. Programs that read `$?`
+        // keep the full discipline.
+        let status_read = crate::shir_passes::status_reads::program_reads_status(prog);
+        self.status_read = status_read;
+        self.lazy_rc = !status_read && last_stmt_is_quiet(&prog.stmts);
+        // TAIL mode: no `$?` reader, and the last statement is the only
+        // observable status writer (an external command, a test, a
+        // pipeline…). Its store stays; every earlier store and every
+        // success-reset is dead, so `sys.exit(__sh_rc)` is still exact.
+        self.tail_rc = if !status_read && !self.lazy_rc && !prog.stmts.is_empty() {
+            Some(prog.stmts.len() - 1)
+        } else {
+            None
+        };
         // A name that is BOTH a variable read and a function definition is
         // the function, not a variable: hoisting `f = ""` before
         // `def f(): ...` would rebind the function object and the later
@@ -11135,6 +11361,10 @@ impl Render {
         let mut body_out = Vec::new();
         std::mem::swap(&mut self.out, &mut body_out);
         for v in &vars {
+            // Bound before any read on the main path: no default owed.
+            if unconditional_writes.contains(v) {
+                continue;
+            }
             // positional/special names (`1`, `?` — the shell `$1` reads)
             // have no native binding: reads go through the argv idiom in
             // the getVar arm, and declaring them emits `1 = ""`, a
@@ -11174,7 +11404,9 @@ impl Render {
         }
         for (idx, s) in prog.stmts.iter().enumerate() {
             let before = self.out.len();
+            self.cur_stmt = Some(idx);
             self.stmt(s);
+            self.cur_stmt = None;
             if self.badsub_hit {
                 // a bad substitution skips the WHOLE command: bash printed
                 // no third line for 063_04's `echo "${!prefix*[@]:0:3}"`
@@ -11184,14 +11416,22 @@ impl Render {
                 self.emit("__sh_rc = 1");
                 continue;
             }
-            let line = prog.stmt_lines.iter().find(|(i, _)| *i == idx).map(|(_, l)| *l);
-            if let Some(l) = line {
-                if let Some(first) = self.out.get_mut(before) {
-                    *first = format!("{first} # line {l}");
+            // Source-line comments are a debugging aid, not idiom: they put
+            // `# line N` on 1,348 corpus lines (python-only; no gate reads
+            // them). Opt in with SH2_PY_LINE_COMMENTS=1 when triaging.
+            if std::env::var("SH2_PY_LINE_COMMENTS").as_deref() == Ok("1") {
+                let line = prog.stmt_lines.iter().find(|(i, _)| *i == idx).map(|(_, l)| *l);
+                if let Some(l) = line {
+                    if let Some(first) = self.out.get_mut(before) {
+                        *first = format!("{first} # line {l}");
+                    }
                 }
             }
         }
         std::mem::swap(&mut self.out, &mut body_out);
+        // A suppressed status store can leave a branch/loop header with no
+        // body (`else:` then a dedent). Insert `pass` where that happened.
+        ensure_nonempty_blocks(&mut body_out);
 
         // Subroutine definitions render BEFORE the preamble so their bodies
         // contribute helper-usage flags (they used to render after it, which
@@ -11211,6 +11451,7 @@ impl Render {
             self.emit("");
         }
         std::mem::swap(&mut self.out, &mut subs_out);
+        ensure_nonempty_blocks(&mut subs_out);
 
         // Which `__sh_*` subprocess helpers the rendered program actually
         // calls, plus their transitive deps. The block is ~120 lines of bash
@@ -11232,6 +11473,19 @@ impl Render {
         // Native-command helper usage, from the FINAL text (a speculative
         // render can return an expression it then discards).
         let fs_src = format!("{body_src}\n{subs_src}");
+        // Everything the PREAMBLE may reference: the body and the sub
+        // definitions (already rendered above, so the flags are known).
+        let preamble_uses = fs_src.clone();
+        // `__sh_scalar` is a DEPENDENCY of the param helpers (all three call
+        // it), so any of the four references needs the def.
+        let need_scalar = [
+            "__sh_scalar(",
+            "__sh_param_or(",
+            "__sh_param_set(",
+            "__sh_param_req(",
+        ]
+        .iter()
+        .any(|p| preamble_uses.contains(p));
         let use_rm = fs_src.contains("__sh_rm(");
         let use_mkdir = fs_src.contains("__sh_mkdir(");
         let use_touch = fs_src.contains("__sh_touch(");
@@ -11241,7 +11495,8 @@ impl Render {
             || used.contains("__sh_eval")
             || use_rm
             || use_mkdir
-            || use_touch;
+            || use_touch
+            || preamble_uses.contains("__sh_param_set(");
         let need_sp = body_src.contains("subprocess.") || subs_src.contains("subprocess.");
 
         // Preamble: shebang, imports, then the sh2.* stubs
@@ -11275,20 +11530,38 @@ impl Render {
         if self.need_fnmatch {
             self.emit("import fnmatch");
         }
-        // bash defines BASH_VERSION for every script; a script tests it to
-        // detect bash (`[ "${BASH_VERSION-}" ] && echo bash`,
-        // param-expand-default-operator), so seed it before the body runs.
-        // A local alias keeps the program's own `os` import demand-driven.
-        self.emit("import os as _sh_os");
-        self.emit("_sh_os.environ.setdefault(\"BASH_VERSION\", \"5.2.15(1)-release\")");
-        // bash sets HOSTNAME as a shell variable at startup (gethostname);
-        // a script that reads `${HOSTNAME:-localhost}` saw the fallback.
-        self.emit("__sh_hostname = __import__(\"socket\").gethostname()");
-        // bash defines USER/LOGNAME at startup from the passwd entry; a
-        // child `bash -c` seam only sees the ENVIRONMENT, so they must be
-        // seeded there (dqs-nested-dollar ran `${USER}` through a pipe).
-        self.emit("_sh_os.environ.setdefault(\"USER\", __import__(\"pwd\").getpwuid(_sh_os.getuid()).pw_name)");
-        self.emit("_sh_os.environ.setdefault(\"LOGNAME\", _sh_os.environ[\"USER\"])");
+        // Bash-identity variables are seeded ONLY when the program can
+        // observe them. The block used to run unconditionally: a gethostname
+        // syscall and two passwd lookups before every script, even when the
+        // script never mentions the names (+3.8 ms of an 11.4 ms startup,
+        // measured on this box).
+        let prog_text = format!("{:?}", prog.stmts);
+        let seed_bash_version = prog_text.contains("BASH_VERSION");
+        let seed_hostname = prog_text.contains("HOSTNAME");
+        let seed_user = prog_text.contains("USER") || prog_text.contains("LOGNAME");
+        if seed_bash_version || seed_user {
+            // A local alias keeps the program's own `os` import demand-driven.
+            self.emit("import os as _sh_os");
+            if seed_bash_version {
+                // bash defines BASH_VERSION for every script; a script tests
+                // it to detect bash (`[ "${BASH_VERSION-}" ] && echo bash`,
+                // param-expand-default-operator).
+                self.emit("_sh_os.environ.setdefault(\"BASH_VERSION\", \"5.2.15(1)-release\")");
+            }
+            if seed_user {
+                // bash defines USER/LOGNAME at startup from the passwd entry;
+                // a child `bash -c` seam only sees the ENVIRONMENT, so they
+                // must be seeded there (dqs-nested-dollar ran `${USER}`
+                // through a pipe).
+                self.emit("_sh_os.environ.setdefault(\"USER\", __import__(\"pwd\").getpwuid(_sh_os.getuid()).pw_name)");
+                self.emit("_sh_os.environ.setdefault(\"LOGNAME\", _sh_os.environ[\"USER\"])");
+            }
+        }
+        if seed_hostname {
+            // bash sets HOSTNAME as a shell variable at startup (gethostname);
+            // a script that reads `${HOSTNAME:-localhost}` saw the fallback.
+            self.emit("__sh_hostname = __import__(\"socket\").gethostname()");
+        }
         self.emit("");
         if self.need_pnum {
             // `$N` in arithmetic: the positional's numeric value, and an
@@ -11577,19 +11850,27 @@ impl Render {
             self.emit("    return base + add");
             self.emit("");
         }
-        if self.need_param_ops {
-            // bash's default-operator family. `__sh_scalar` is the array
-            // rule: a bare `${arr}` / `${arr:-d}` names ELEMENT 0, never
-            // the list (a python list repr leaked into the output).
+        // The param family is emitted PER HELPER, from the final text: an
+        // interpolated `${x}` needs only `__sh_scalar`, and emitting
+        // `__sh_param_or/set/req` beside it put three unused defs in front of
+        // every script that ever interpolated a variable.
+        if need_scalar {
+            // bash's array rule: a bare `${arr}` / `${arr:-d}` names
+            // ELEMENT 0, never the list (a python list repr leaked into the
+            // output).
             self.emit("def __sh_scalar(v):");
             self.emit("    if isinstance(v, (list, tuple)):");
             self.emit("        return v[0] if v else \"\"");
             self.emit("    return v");
             self.emit("");
+        }
+        if preamble_uses.contains("__sh_param_or(") {
             self.emit("def __sh_param_or(v, d):");
             self.emit("    v = __sh_scalar(v)");
             self.emit("    return v if v != \"\" else d");
             self.emit("");
+        }
+        if preamble_uses.contains("__sh_param_set(") {
             self.emit("def __sh_param_set(name, v, d):");
             self.emit("    v = __sh_scalar(v)");
             self.emit("    if v == \"\":");
@@ -11598,6 +11879,8 @@ impl Render {
             self.emit("        return d");
             self.emit("    return v");
             self.emit("");
+        }
+        if preamble_uses.contains("__sh_param_req(") {
             self.emit("def __sh_param_req(v, msg):");
             self.emit("    v = __sh_scalar(v)");
             self.emit("    if v == \"\":");
@@ -12484,8 +12767,13 @@ impl Render {
         // statement arms above precisely for this (and for `$?` reads);
         // without it every program would exit 0 and nonzero-by-design
         // scripts (usage errors, `exit 1`) could never pass the gate's
-        // exit-code verdict. Unconditional: the init below always exists.
-        self.emit("sys.exit(__sh_rc)");
+        // exit-code verdict. In lazy mode the last statement is provably
+        // successful, so the status is the literal 0.
+        if self.lazy_rc {
+            self.emit("sys.exit(0)");
+        } else {
+            self.emit("sys.exit(__sh_rc)");
+        }
     }
 }
 
@@ -12522,6 +12810,203 @@ fn collect_fn_names(stmts: &[IrStmt], out: &mut BTreeSet<String>) {
             }
             _ => {}
         }
+    }
+}
+
+/// Names whose FIRST touch on the main (unconditional) path is a WRITE.
+///
+/// Only the top-level statement list is walked. A name touched inside an
+/// `if`/loop/function is conservatively recorded as a READ, so it keeps its
+/// hoisted default (a branch may not execute). A `for` loop's variable is a
+/// write at entry; its iterable and body are reads of everything else.
+fn first_touch_writes(stmts: &[IrStmt]) -> std::collections::HashSet<String> {
+    let mut seen: std::collections::HashSet<String> = std::collections::HashSet::new();
+    let mut writes: std::collections::HashSet<String> = std::collections::HashSet::new();
+    fn reads(stmts: &[IrStmt], seen: &mut std::collections::HashSet<String>) {
+        let mut names = BTreeSet::new();
+        collect_vars(stmts, &mut names);
+        for n in names {
+            seen.insert(n);
+        }
+    }
+    fn reads_expr(e: &IrExpr, seen: &mut std::collections::HashSet<String>) {
+        reads(&[IrStmt::Expr(e.clone())], seen);
+    }
+    for s in stmts {
+        match s {
+            IrStmt::For { var, iter, body } => {
+                // A `for` var is bound at entry ONLY if the iterable is
+                // provably non-empty: `for z in <empty>` leaves z unset in
+                // bash (""), but Python never binds it — a later read would
+                // be a NameError, so those loop vars keep their default.
+                let non_empty = match iter {
+                    IrExpr::Array(items) => !items.is_empty(),
+                    IrExpr::Range { start, end } => end >= start,
+                    _ => false,
+                };
+                if non_empty && seen.insert(var.clone()) {
+                    writes.insert(var.clone());
+                } else {
+                    seen.insert(var.clone());
+                }
+                reads_expr(iter, &mut seen);
+                reads(body, &mut seen);
+            }
+            IrStmt::Assign { targets, expr, .. } => {
+                // The RHS is evaluated BEFORE the store: `z+=(a b)` is a
+                // read of z (an unset z contributes ""), so the read must
+                // be classified first or z loses its default.
+                for t in targets {
+                    for i in &t.indices {
+                        reads_expr(i, &mut seen);
+                    }
+                }
+                reads_expr(expr, &mut seen);
+                // A CALL RHS can read the target it stores into: the core
+                // spells read-modify-write as `assign("y", "+=", …)` /
+                // `setArrayAppend("z", …)` with the name in the ARG TEXT,
+                // not as a Var read. Those targets need the shell's ""
+                // default, so they are classified as reads, not writes.
+                let impure_rhs = matches!(expr, IrExpr::Call { .. } | IrExpr::MethodCall { .. });
+                for t in targets {
+                    if seen.insert(t.var.clone()) && !impure_rhs {
+                        writes.insert(t.var.clone());
+                    }
+                }
+            }
+            IrStmt::Declare { vars, init, .. } => {
+                // `local a=$a` reads the outer value first.
+                if let Some(i) = init {
+                    reads_expr(i, &mut seen);
+                }
+                for d in vars {
+                    if seen.insert(d.name.clone()) {
+                        writes.insert(d.name.clone());
+                    }
+                }
+            }
+            IrStmt::DeclareArray { var, elements, .. } => {
+                for e in elements {
+                    reads_expr(e, &mut seen);
+                }
+                if seen.insert(var.clone()) {
+                    writes.insert(var.clone());
+                }
+            }
+            // A recovered counted loop (`b=0; while [ $b -lt 3 ]`) arrives as
+            // ONE ForInit: its init runs unconditionally before the loop, so
+            // it is the main-path first touch; cond/step/body are reads.
+            IrStmt::ForInit { init, cond, step, body } => {
+                for n in first_touch_writes(init) {
+                    if seen.insert(n.clone()) {
+                        writes.insert(n);
+                    }
+                }
+                reads_expr(cond, &mut seen);
+                reads(step, &mut seen);
+                reads(body, &mut seen);
+            }
+            // A Block is not classified here: without a nested walk the
+            // first-touch evidence is unknown, and the sound direction is to
+            // treat its names as reads (they keep their hoisted default).
+            other => reads(std::slice::from_ref(other), &mut seen),
+        }
+    }
+    writes
+}
+
+/// Is the rendered last top-level statement provably status 0?
+///
+/// Conservative: only statement forms whose success cannot depend on a
+/// command are accepted. `if`/loops/redirects/pipelines and any statement
+/// holding a call are refused (the caller then keeps the full register).
+fn ensure_nonempty_blocks(lines: &mut Vec<String>) {
+    let mut i = 0;
+    while i < lines.len() {
+        let cur = &lines[i];
+        let trimmed = cur.trim_end();
+        let is_header = trimmed.ends_with(':')
+            && !trimmed.trim_start().starts_with('#')
+            && !trimmed.trim_start().starts_with('\"');
+        if is_header {
+            let indent = cur.len() - cur.trim_start().len();
+            let mut j = i + 1;
+            while j < lines.len() {
+                let t = lines[j].trim_start();
+                if t.is_empty() || t.starts_with('#') {
+                    j += 1;
+                    continue;
+                }
+                break;
+            }
+            let has_body = lines
+                .get(j)
+                .map(|n| n.len() - n.trim_start().len() > indent)
+                .unwrap_or(false);
+            if !has_body {
+                lines.insert(i + 1, format!("{}pass", " ".repeat(indent + 4)));
+                i += 1;
+            }
+        }
+        i += 1;
+    }
+}
+
+fn last_stmt_is_quiet(stmts: &[IrStmt]) -> bool {
+    fn expr_quiet(e: &IrExpr) -> bool {
+        match e {
+            IrExpr::Int(_)
+            | IrExpr::Str(_, _)
+            | IrExpr::Bool(_)
+            | IrExpr::Var(_, _)
+            | IrExpr::Ident(_)
+            | IrExpr::Arith(_)
+            | IrExpr::Range { .. } => true,
+            IrExpr::Call { func, .. } if func == "getVar" => true,
+            IrExpr::BinOp { lhs, rhs, .. } => expr_quiet(lhs) && expr_quiet(rhs),
+            IrExpr::Array(items) => items.iter().all(expr_quiet),
+            IrExpr::Interpolate(parts) => parts.iter().all(|p| match p {
+                crate::ir::InterpPart::Lit(_) => true,
+                crate::ir::InterpPart::Expr(x) => expr_quiet(x),
+            }),
+            _ => false,
+        }
+    }
+    // A loop's status is 0 when the body never ran, else its body's last
+    // command — so a quiet body tail makes the loop itself quiet (for both
+    // `for` and `while`; the condition's own status is discarded by bash).
+    // An if/elif chain with every branch tail quiet is likewise quiet, and
+    // so is a case with no matching clause (bash leaves $? = 0).
+    fn all_quiet(branches: &[&[IrStmt]]) -> bool {
+        branches.iter().all(|b| last_stmt_is_quiet(b))
+    }
+    match stmts.last() {
+        None => true,
+        Some(IrStmt::Output { .. }) => true,
+        Some(IrStmt::Declare { .. }) | Some(IrStmt::DeclareArray { .. }) => true,
+        Some(IrStmt::Function { .. }) => true,
+        Some(IrStmt::Assign { expr, .. }) => expr_quiet(expr),
+        Some(IrStmt::Block(b)) => last_stmt_is_quiet(b),
+        Some(IrStmt::For { body, .. }) | Some(IrStmt::While { body, .. }) => {
+            last_stmt_is_quiet(body)
+        }
+        Some(IrStmt::If { then, elsifs, else_, .. }) => {
+            let mut branches: Vec<&[IrStmt]> = vec![then, else_];
+            for (_, b) in elsifs {
+                branches.push(b);
+            }
+            all_quiet(&branches)
+        }
+        Some(IrStmt::Case { clauses, .. }) => {
+            clauses.iter().all(|c| last_stmt_is_quiet(&c.body))
+        }
+        // `echo` as a command CALL (the frontend spelling) is a successful
+        // builtin, same as the Output node.
+        Some(IrStmt::Expr(IrExpr::Call { func, args })) if func == "builtin" => matches!(
+            args.first(),
+            Some(IrExpr::Str(s, _)) if s == "echo" || s == "printf" || s == ":"
+        ),
+        _ => false,
     }
 }
 
@@ -12946,11 +13431,9 @@ mod tests {
         // an UNDECLARED array reads through globals().get (bash treats it as
         // empty); mark it assigned so this asserts the normal path
         r.written.insert("a".to_string());
-        // every arith operand is coerced (bash coerces its operands too)
-        assert_eq!(
-            r.arith(&ast),
-            "(__sh_atoi(__sh_atoi(__sh_elem(a, 1))) + __sh_atoi(1))"
-        );
+        // the element read is coerced (bash coerces its operands too), but a
+        // literal is already numeric and the coercion is not doubled.
+        assert_eq!(r.arith(&ast), "(__sh_atoi(__sh_elem(a, 1)) + 1)");
         assert!(r.need_elem, "the `__sh_elem` helper must be emitted");
     }
 

@@ -258,6 +258,7 @@ pub mod echo_return; // pure-output "echo a value and return" functions → fnVa
 pub mod loop_return_lift; // echo+return inside a loop → flag+break (makes strContainsAny/line_at echo-return-eligible)
 pub mod unreachable_after_exit; // PROVABLY-32-bit arith annotations
 pub mod split_set; // set[int] → small ∪ big partitions (runtime routing; speed-class, SH2_SPLIT_SETS)
+pub mod loop_int_lift; // OFFER: an Int-typed loop var over a literal decimal list takes Int elements (typed entry only)
 pub mod fbdev_gpu; // device write → GPU op (the §4.2 stage ② "gpu-prep" pass)
 pub mod fbdev_gpu_batch; // batch consecutive same-verb GpuOps into one dispatch
 pub mod fbdev_gpu_elim; // eliminate redundant GpuOps (exact duplicates)

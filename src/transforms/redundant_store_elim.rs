@@ -12,7 +12,10 @@
 //! A scalar store `x=A` at index `i` is dropped iff ALL of:
 //!   - `A` is PURE — no `Capture`, `Arrow`, `Call`, `MethodCall` (an
 //!     impure store's side effect must not be skipped),
-//!   - there is a LATER scalar store to the same `x` in the same block,
+//!   - there is a LATER scalar store to the same `x` in the same block —
+//!     an `Assign`, or a `for x in …` whose loop variable is `x` (the loop
+//!     BINDS x at entry; its iteration list is evaluated first, so a read
+//!     of x there still blocks the drop),
 //!   - NO read of `x` and NO "indirect observer" (a function `Call`,
 //!     `Capture`, `Subshell`, `Background`, `Exec`, `WriteFile`,
 //!     `setVar`) occurs strictly between `i` and that later store.
@@ -58,6 +61,18 @@ fn drop_redundant(stmts: &mut Vec<IrStmt>) -> bool {
         // to the same var makes store-i dead
         let mut j = i + 1;
         while j < n {
+            // `for x in LIST`: the loop binds x before its body runs, so a
+            // preceding pure store is dead — unless LIST reads x (bash
+            // evaluates the iterable first).
+            if let IrStmt::For { var: lv, iter, .. } = &stmts[j] {
+                if lv == &var {
+                    if expr_reads(iter, &var) {
+                        break;
+                    }
+                    remove[i] = true;
+                    break;
+                }
+            }
             if stmt_reads(&stmts[j], &var) || indirect_observer(&stmts[j]) {
                 break;
             }
@@ -495,5 +510,38 @@ mod tests {
         let mut plain = vec![assign("n", str_lit("1")), assign("n", str_lit("2"))];
         assert!(transform(&mut plain));
         assert_eq!(plain.len(), 1);
+    }
+
+    /// `i=0; for i in 1 2` — the loop BINDS i at entry, so the store is
+    /// redundant (the Python renderer's dead `i = 0` before `for i in …`).
+    #[test]
+    fn drops_store_overwritten_by_for_var() {
+        let mut stmts = vec![
+            assign("i", int_lit(0)),
+            IrStmt::For {
+                var: "i".to_string(),
+                iter: IrExpr::Array(vec![int_lit(1), int_lit(2)]),
+                body: vec![],
+            },
+        ];
+        assert!(transform(&mut stmts));
+        assert_eq!(stmts.len(), 1);
+        assert!(matches!(stmts[0], IrStmt::For { .. }));
+    }
+
+    /// `i=0; for i in $i` — the iterable is evaluated FIRST and reads i, so
+    /// the store must survive.
+    #[test]
+    fn keeps_store_read_by_for_iterable() {
+        let mut stmts = vec![
+            assign("i", int_lit(0)),
+            IrStmt::For {
+                var: "i".to_string(),
+                iter: getvar("i"),
+                body: vec![],
+            },
+        ];
+        assert!(!transform(&mut stmts));
+        assert_eq!(stmts.len(), 2);
     }
 }

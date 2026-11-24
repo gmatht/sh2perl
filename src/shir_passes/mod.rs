@@ -92,6 +92,9 @@ pub mod frontend_capture_fold;
 /// ScopedHoist — hoist a main-scope local that only a conditional TEST
 /// reads, so every renderer can bind it as a plain local (see the module doc).
 pub mod scoped_hoist;
+/// Status liveness (`$?` / lastStatus reads) — the shared verdict a
+/// backend consults before emitting (or skipping) its status register.
+pub mod status_reads;
 pub mod scc; // strongly-connected-component recognition over the call graph (mutual-recursion clusters)
 // split_inplace: ACTIVE, target-gated to C in transforms.rs (the
 // embed/Carp fragment tests run with the target unset, where this
