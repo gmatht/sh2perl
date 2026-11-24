@@ -30,6 +30,11 @@ node SortLines
 tag "SortLines"
 kind expr
 field text: expr
+# source: optional file path. When Some, the Rust backend reads the file's
+# contents at runtime (standalone `sort FILE`); None (default) means use
+# `text` (the piped/produced input). Other backends ignore it and keep
+# using `text` (they do not implement file-source sort yet).
+field source: optional_string
 # key: WholeLine (default), or one 1-based field of a delimiter-separated
 # line. `""` means WholeLine. Otherwise "<sep><n>" (e.g. ":\x32" is field 2
 # of a colon-separated line); a malformed value is REFUSED by the lowering,

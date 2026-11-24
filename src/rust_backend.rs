@@ -6274,7 +6274,14 @@ impl Render {
             }
             "SortLines" => {
                 let x = n.as_any().downcast_ref::<crate::shir_nodes::SortLines>()?;
-                let t = self.expr_str(&x.text);
+                // Standalone `sort FILE`: read the file's bytes at runtime
+                // instead of sorting a produced text. Other shapes keep
+                // using `text` (the piped/produced input).
+                let t = if let Some(src) = &x.source {
+                    format!("std::fs::read_to_string({}).unwrap_or_default()", Self::rust_str(src))
+                } else {
+                    self.expr_str(&x.text)
+                };
                 // `key` is "" (whole line) or "<sep><n>" (1-based field N).
                 let field: Option<(char, usize)> = if x.key.is_empty() {
                     None
@@ -6319,9 +6326,15 @@ __sh_state.partial_cmp(&__sh_put).unwrap_or(std::cmp::Ordering::Equal) }}"
                     format!("__sort_key({ka}).cmp(&__sort_key({kb}))")
                 };
                 let uniq = if x.unique {
-                    "let mut __sh_uniq: Vec<String> = Vec::new(); \
+                    if x.numeric {
+                        "let mut __sh_uniq: Vec<String> = Vec::new(); \
+for __sh_state in __sh_lines.drain(..) { if __sh_uniq.last().map(|__sh_last| __sort_key(__sh_last).trim().parse::<f64>().unwrap_or(0.0) != __sort_key(&__sh_state).trim().parse::<f64>().unwrap_or(0.0)).unwrap_or(true) { __sh_uniq.push(__sh_state); } } \
+__sh_lines = __sh_uniq;"
+                    } else {
+                        "let mut __sh_uniq: Vec<String> = Vec::new(); \
 for __sh_state in __sh_lines.drain(..) { if __sh_uniq.last().map(|__sh_last| __sort_key(__sh_last) != __sort_key(&__sh_state)).unwrap_or(true) { __sh_uniq.push(__sh_state); } } \
 __sh_lines = __sh_uniq;"
+                    }
                 } else {
                     ""
                 };
@@ -27780,6 +27793,7 @@ mod tests {
         let sort = |text: &str, numeric: bool, reverse: bool, unique: bool| {
             shir_to_rust(&print_program(IrExpr::Ext(Box::new(SortLines {
                 text: s(text),
+                source: None,
                 key: String::new(),
                 numeric,
                 reverse,

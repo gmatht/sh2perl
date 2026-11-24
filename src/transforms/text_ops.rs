@@ -558,6 +558,103 @@ fn lower_stmt(stmt: &mut IrStmt, emit: bool, arrays: &std::collections::HashSet<
                         return;
                     }
                 }
+                // `sort [flags] FILE` (single FILE source) → SortLines over the
+                // file's contents read at runtime (Rust) / text (others). This
+                // lifts the standalone form; the piped form already lowers via
+                // try_lower_sort.
+                if emit && cmd == "sort" {
+                    // split args into flags and a single file operand
+                    let mut strs: Vec<String> = Vec::new();
+                    let mut all_str = true;
+                    for a in cmd_args.iter() {
+                        match a {
+                            IrExpr::Str(s, _) => strs.push(s.clone()),
+                            _ => { all_str = false; break; }
+                        }
+                    }
+                    if all_str {
+                        let mut files: Vec<String> = Vec::new();
+                        let mut flag_strs: Vec<String> = Vec::new();
+                        let mut bad = false;
+                        for s in &strs {
+                            if s.starts_with('-') {
+                                flag_strs.push(s.clone());
+                            } else {
+                                files.push(s.clone());
+                            }
+                        }
+                        if files.len() == 1 && !bad {
+                            // parse flags using the same rules as try_lower_sort
+                            let mut numeric = false;
+                            let mut reverse = false;
+                            let mut unique = false;
+                            let mut ignore_case = false;
+                            let mut sep: Option<String> = None;
+                            let mut field: Option<u32> = None;
+                            let mut fi = 0;
+                            let fstrs = flag_strs.clone();
+                            while fi < fstrs.len() {
+                                let s = fstrs[fi].as_str();
+                                match s {
+                                    "-n" => numeric = true,
+                                    "-r" => reverse = true,
+                                    "-u" => unique = true,
+                                    "-f" => ignore_case = true,
+                                    "-t" if fi + 1 < fstrs.len() => {
+                                        let sepstr = &fstrs[fi + 1];
+                                        if sepstr.chars().count() != 1 { bad = true; break; }
+                                        sep = Some(sepstr.clone());
+                                        fi += 1;
+                                    }
+                                    _ if s.starts_with("-k") && s.len() > 2 => {
+                                        if s[2..].contains(|c: char| !c.is_ascii_digit()) { bad = true; break; }
+                                        field = s[2..].parse::<u32>().ok();
+                                        if field == Some(0) { bad = true; break; }
+                                    }
+                                    _ if s.starts_with('-') && s.len() > 1 => {
+                                        for c in s[1..].chars() {
+                                            match c {
+                                                'n' => numeric = true,
+                                                'r' => reverse = true,
+                                                'u' => unique = true,
+                                                'f' => ignore_case = true,
+                                                _ => { bad = true; break; }
+                                            }
+                                            if bad { break; }
+                                        }
+                                        if bad { break; }
+                                    }
+                                    _ => { bad = true; break; }
+                                }
+                                fi += 1;
+                            }
+                            if !bad {
+                                let key = match (field, sep) {
+                                    (None, _) => String::new(),
+                                    (Some(n), Some(sep)) => format!("{sep}{n}"),
+                                    (Some(_), None) => { bad = true; String::new() }
+                                };
+                                if !bad && offered("SortLines") {
+                                    *stmt = with_status_zero(IrStmt::Output {
+                                        value: IrExpr::Ext(Box::new(SortLines {
+                                            text: IrExpr::Str(String::new(), StrStyle::DoubleQuoted),
+                                            source: Some(files.remove(0)),
+                                            key,
+                                            numeric,
+                                            reverse,
+                                            unique,
+                                            ignore_case,
+                                        })),
+                                        newline: false,
+                                        target: None,
+                                    });
+                                    LIFT_COUNT.fetch_add(1, Ordering::Relaxed);
+                                    return;
+                                }
+                            }
+                        }
+                    }
+                }
                 if emit && cmd == "find" {
                     // bare `find P [-maxdepth N] [-type f|d]` → WalkDir
                     // printing each entry path (streaming, no entry list).
@@ -2044,6 +2141,7 @@ fn try_lower_sort(text: IrExpr, args: &[IrExpr]) -> Option<IrExpr> {
     };
     Some(IrExpr::Ext(Box::new(SortLines {
         text,
+        source: None,
         key,
         numeric,
         reverse,
