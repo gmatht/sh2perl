@@ -192,10 +192,54 @@ pub struct Render {
     /// successful: the only observable status is the process exit code,
     /// which is 0. Statement-level status stores are then dead and skipped.
     lazy_rc: bool,
-    /// TAIL mode: the index of the last top-level statement when it is the
-    /// only status writer the exit code can observe. None = every store
-    /// matters. `cur_stmt` tracks which top-level statement is rendering.
-    tail_rc: Option<usize>,
+    /// Per top-level statement: is its status store observable? The shared
+    /// `status_reads::status_store_liveness` fact — a store is dead when a
+    /// later store overwrites it before any `$?` read (or the exit code)
+    /// can see it. EMPTY = keep every store (the analysis could not
+    /// localise the reads; TAIL mode fills in only the last statement).
+    rc_live_stmt: Vec<bool>,
+    /// Per-function-body liveness (name → per-statement vector), so a body's
+    /// own `$?` reads localise there instead of arming the whole script. A
+    /// name missing here keeps every store.
+    rc_live_fns: HashMap<String, Vec<bool>>,
+    /// What a store is worth OUTSIDE a top-level statement (sub/function
+    /// bodies): dead in lazy/tail mode (no `$?` reader anywhere), live when
+    /// the program reads `$?` (a call's status is not modelled here).
+    rc_body_live: bool,
+    /// The register provably holds 0 on every path reaching here (the last
+    /// status write was `rc_reset`). A `$?` read then folds to the literal
+    /// 0, so the store itself is dropped — the reset never has to be
+    /// emitted at all.
+    rc_zero: bool,
+    /// May the fold above apply? False when the program calls the `block`
+    /// seam: its helper reads the Python global directly, so a dropped
+    /// store would leave it stale.
+    rc_fold: bool,
+    /// Does the final `sys.exit` use the literal 0 (the register provably
+    /// holds it and nothing else observes it)? Decided where the preamble is
+    /// emitted, so the initialiser and the exit always agree.
+    rc_exit_literal: bool,
+    /// `rc_zero` as the body and sub bodies last left it. Captured before the
+    /// helper definitions are emitted — those contain real `__sh_rc =` stores,
+    /// which invalidate the render-time claim without changing the program's
+    /// own final status.
+    rc_body_zero: bool,
+    /// Does some `$?` read (in the main list or a function body) run before
+    /// any store? Then the register's initial 0 is observable and has to be
+    /// written.
+    rc_init_observed: bool,
+    /// Does the last statement store a status unconditionally? When it does,
+    /// the `sys.exit` read cannot observe the initial value.
+    rc_last_stores: bool,
+    /// Indentation of the enclosing TOP-LEVEL statement: a reset only folds
+    /// at that depth. Inside a branch or loop body the store must be emitted
+    /// for real — its value has to survive the merge at the end of the
+    /// compound (a read after `if …; then echo; fi` reads the register).
+    rc_base_depth: usize,
+    /// >0 while rendering a statement (so a nested `stmt` call does not
+    /// reset `rc_base_depth` to the nesting level).
+    rc_in_stmt: bool,
+    /// which top-level statement is rendering (None = a sub body)
     cur_stmt: Option<usize>,
 }
 
@@ -1145,6 +1189,14 @@ pub fn shir_to_python(prog: &IrProgram) -> String {
 
 impl Render {
     fn emit(&mut self, s: &str) {
+        // Any write to the status register invalidates the "it provably
+        // holds 0" fact the `$?` reader folds against (see `rc_zero`).
+        // Detected here so a raw emit outside `rc_set`/`rc_effect`/
+        // `rc_bool` cannot leave a stale claim behind.
+        let t = s.trim_start();
+        if t.starts_with("__sh_rc =") || t.contains("\"__sh_rc\"] =") {
+            self.rc_zero = false;
+        }
         if s.is_empty() {
             self.out.push(String::new());
         } else {
@@ -4278,6 +4330,10 @@ impl Render {
                     // at top level they are the script's argv.
                     match name.as_str() {
                         "?" => {
+                            // the register is provably 0 here: fold the read
+                            if self.rc_zero {
+                                return "\"0\"".into();
+                            }
                             self.need_rc = true;
                             return "str(__sh_rc)".into();
                         }
@@ -9018,27 +9074,52 @@ impl Render {
         if !self.rc_live() {
             return;
         }
-        self.emit("__sh_rc = 0");
+        // Record the value instead of emitting the store: every `$?` read
+        // until the next status write folds to the literal 0 (identical
+        // semantics — the register really does hold 0 there), so a store no
+        // reader observes is never written in the first place. Only at the
+        // statement's own depth: a store inside a branch or loop body has to
+        // be real, because its value is read after the compound merges.
+        if self.rc_fold && self.depth == self.rc_base_depth {
+            self.rc_zero = true;
+        } else {
+            self.emit("__sh_rc = 0");
+        }
     }
 
-    /// Is the register unobservable except through the process exit code?
-    /// True in lazy mode (no `$?` reader, provably-successful tail) and in
-    /// TAIL mode (no `$?` reader, and the LAST top-level statement writes
-    /// the register itself, so every earlier store is dead).
+    /// Is the register unobservable from here — no `$?` read and no exit
+    /// code can reach this store before the next one overwrites it?
     fn rc_dead(&self) -> bool {
-        self.lazy_rc || self.tail_rc.is_some()
+        !self.rc_live()
     }
 
-    /// Should a status store/effect be *recorded*? In tail mode only the
-    /// final top-level statement's own stores survive.
+    /// Should a status store/effect be *recorded*? A store is live when a
+    /// later `$?` read (or the exit code) can observe it before the next
+    /// store (shared `status_store_liveness`). In lazy mode nothing is
+    /// recorded; in TAIL mode (no reader, unquiet last statement) only the
+    /// last top-level statement's own stores survive.
     fn rc_live(&self) -> bool {
-        if self.lazy_rc {
-            return false;
+        match self.cur_stmt {
+            Some(i) => self.rc_live_stmt.get(i).copied().unwrap_or(self.rc_body_live),
+            None => self.rc_body_live,
         }
-        match self.tail_rc {
-            None => true,
-            Some(t) => self.cur_stmt == Some(t),
+    }
+
+    /// `rc_reset`, but the store is committed immediately: a loop body runs
+    /// many times, so the "register is 0" claim only holds for the first
+    /// iteration — later ones observe the previous iteration's status.
+    fn rc_reset_now(&mut self) {
+        if !self.rc_live() {
+            self.rc_zero = false;
+            return;
         }
+        // The register already provably holds 0 on this path (the program
+        // starts at 0, or the previous statement recorded a reset): the
+        // committed store would write the value that is already there.
+        if self.rc_zero {
+            return;
+        }
+        self.emit("__sh_rc = 0");
     }
 
     /// Record a status store from a statement arm. Suppressed in lazy mode:
@@ -9083,6 +9164,10 @@ impl Render {
             && !rhs.contains("subprocess.")
         {
             self.rc_reset();
+        } else {
+            // The capture/external helper records the real rc itself (0 on
+            // success, the command's rc otherwise): nothing here proves 0.
+            self.rc_zero = false;
         }
     }
 
@@ -9173,7 +9258,11 @@ impl Render {
             // subset tracks no statement statuses; the runtime var defaults
             // to 0 (success) and statement-position test/and/or/true/false
             // expressions update it (bash-correct for the `cmd; [ $? -eq 0 ]`
-            // idiom — the corpus shape).
+            // idiom — the corpus shape). A provably-0 register folds to the
+            // literal (same int the reset would have stored).
+            if self.rc_zero {
+                return "0".into();
+            }
             self.need_rc = true;
             return "__sh_rc".into();
         }
@@ -9517,10 +9606,43 @@ impl Render {
     }
 
     fn block(&mut self, stmts: &[IrStmt]) {
+        self.block_inner(stmts, false);
+    }
+
+    /// `block` for a function BODY: its statements are indexed from 0 in
+    /// `cur_stmt` so the body's own liveness vector applies (a `local
+    /// ec=$?` localises to the body, not the enclosing script).
+    fn body_block(&mut self, stmts: &[IrStmt]) {
+        self.block_inner(stmts, true);
+    }
+
+    /// `block` for the body of a LIVE compound statement (`if`/`case`/loop),
+    /// whose arm has already cleared `$?`: the list's own reads and stores
+    /// localise, so a store inside it that nothing observes is dropped.
+    /// Everywhere else (lazy/tail mode, a dead statement) the enclosing
+    /// discipline applies unchanged.
+    fn live_block(&mut self, stmts: &[IrStmt]) {
+        if !self.rc_live() {
+            self.block(stmts);
+            return;
+        }
+        let live =
+            crate::shir_passes::status_reads::list_liveness(stmts).unwrap_or_default();
+        let saved_live = std::mem::replace(&mut self.rc_live_stmt, live);
+        let saved_cur = self.cur_stmt;
+        self.block_inner(stmts, true);
+        self.cur_stmt = saved_cur;
+        self.rc_live_stmt = saved_live;
+    }
+
+    fn block_inner(&mut self, stmts: &[IrStmt], indexed: bool) {
         let mut scratch = Vec::new();
         std::mem::swap(&mut self.out, &mut scratch);
         self.depth += 1;
-        for s in stmts {
+        for (i, s) in stmts.iter().enumerate() {
+            if indexed {
+                self.cur_stmt = Some(i);
+            }
             self.stmt(s);
         }
         self.depth -= 1;
@@ -9540,6 +9662,34 @@ impl Render {
     }
 
     fn stmt(&mut self, s: &IrStmt) {
+        let outer = self.rc_in_stmt;
+        if !outer {
+            self.rc_base_depth = self.depth;
+        }
+        self.rc_in_stmt = true;
+        self.stmt_inner(s);
+        self.rc_in_stmt = outer;
+        // A compound statement's status is path-dependent, and its arms'
+        // resets only hold on the path that took them: never claim the
+        // register still holds 0 after one.
+        if !matches!(
+            s,
+            IrStmt::Assign { .. }
+                | IrStmt::Declare { .. }
+                | IrStmt::DeclareArray { .. }
+                | IrStmt::Output { .. }
+                | IrStmt::WriteFile { .. }
+                | IrStmt::Expr(_)
+                | IrStmt::Exit(_)
+                // `{ … }` renders inline in the ENCLOSING list: no merge, so
+            // its last statement's claim still holds.
+            | IrStmt::Block(_)
+        ) {
+            self.rc_zero = false;
+        }
+    }
+
+    fn stmt_inner(&mut self, s: &IrStmt) {
         // A redirect-wrapped command in the Call dialect (`cmd 2>/dev/null`,
         // `cat <<EOF`, `n=$((…)) 2>/dev/null && …`) must become the real
         // Redirect STATEMENT, whose heredoc/stdin/file arms can render it.
@@ -10096,30 +10246,42 @@ impl Render {
             } => {
                 // rc discipline: clear stale status first — a false cond
                 // with no else leaves bash `$?` at 0, and a taken branch
-                // overwrites via its own last command.
-                self.rc_reset();
+                // overwrites via its own last command. Committed, so the
+                // branches' own (foldable) resets still leave a real 0
+                // behind for the read after the `if`. A condition that is
+                // itself a command already stores its status (bash keeps
+                // that one on the false path), so the reset is only for the
+                // native shapes (`(( … ))`, a bare expansion).
+                let lead_reset =
+                    !crate::shir_passes::status_reads::expr_definitely_stores_status(cond);
+                if lead_reset {
+                    self.rc_reset_now();
+                }
                 let (pre, c) = self.cond_test(cond);
                 for p in pre {
                     self.emit(&p);
                 }
                 self.emit(&format!("if {c}:"));
-                self.block(then);
+                self.live_block(then);
                 for (ec, body) in elsifs {
                     let (pre, ec) = self.cond_test(ec);
                     for p in pre {
                         self.emit(&p);
                     }
                     self.emit(&format!("elif {ec}:"));
-                    self.block(body);
+                    self.live_block(body);
                 }
                 if !else_.is_empty() {
                     self.emit("else:");
-                    self.block(else_);
+                    self.live_block(else_);
                 } else {
                     // bash: an `if` whose conditions all failed leaves `$?`
                     // at 0, but our condition's own test had just set it to
                     // 1 (`if ps …; then …; fi; echo $?` printed 1 —
                     // ps-system-call, parse-multi-command-while-condition).
+                    // The condition may itself have stored (its evaluation
+                    // runs a command or a capture), so the 0 has to be put
+                    // back on this path.
                     self.emit("else:");
                     self.depth += 1;
                     self.rc_reset();
@@ -10132,7 +10294,7 @@ impl Render {
             } => {
                 // rc discipline (see the If arm): a no-match case leaves
                 // bash `$?` at 0.
-                self.rc_reset();
+                self.rc_reset_now();
                 // shell `case D in pat) …;; esac` — if/elif chain on string
                 // equality (bash case is anchored glob match; the common
                 // literal-pattern case is exact equality).
@@ -10177,13 +10339,13 @@ impl Render {
                     }
                     if conds.is_empty() && is_default {
                         self.emit("else:");
-                        self.block(&cl.body);
+                        self.live_block(&cl.body);
                         emitted_any = true;
                         continue;
                     }
                     let kw = if emitted_any { "elif" } else { "if" };
                     self.emit(&format!("{kw} {}:", conds.join(" or ")));
-                    self.block(&cl.body);
+                    self.live_block(&cl.body);
                     emitted_any = true;
                 }
                 // No pattern matched → the case statement itself succeeds
@@ -10201,18 +10363,20 @@ impl Render {
             IrStmt::For { var, iter, body } => {
                 // rc discipline (see the If arm): a zero-trip loop leaves
                 // bash `$?` at 0; iterations overwrite via their own last
-                // command.
-                self.rc_reset();
+                // command. The store is committed: later iterations do not
+                // observe this reset.
+                self.rc_reset_now();
                 let v = self.py_ident(var);
                 let it = self.expr(iter);
                 self.emit(&format!("for {v} in {it}:"));
                 self.loop_depth += 1;
-                self.block(body);
+                self.live_block(body);
                 self.loop_depth -= 1;
             }
             IrStmt::While { cond, body } => {
-                // rc discipline (see the For arm).
-                self.rc_reset();
+                // rc discipline (see the For arm): committed for the same
+                // reason (a loop body runs many times).
+                self.rc_reset_now();
                 // `while IFS= read -r line && [ -n "$line" ] && (( i < n ))`:
                 // `read` is only the FIRST conjunct. The read-loop scaffolding
                 // below used to require the whole condition to BE the read
@@ -10446,7 +10610,7 @@ impl Render {
                     self.emit(&format!("{f} = True"));
                     self.depth -= 1;
                 }
-                self.block(body);
+                self.live_block(body);
                 self.loop_depth -= 1;
                 // a loop whose body never ran leaves $? = 0 (bash); the
                 // condition's own status was 1
@@ -10568,9 +10732,21 @@ impl Render {
                         self.emit("global __sh_rc");
                     }
                 }
-                for s in body {
+                // The body's own liveness vector (its `$?` reads localise
+                // to this statement list), restored for the enclosing one.
+                let body_live = self.rc_live_fns.get(name).cloned().unwrap_or_default();
+                let saved_live = std::mem::replace(&mut self.rc_live_stmt, body_live);
+                let saved_cur = self.cur_stmt;
+                // the body's first `$?` read observes the CALL status, which
+                // a caller-side zero claim cannot describe
+                self.rc_zero = false;
+                for (i, s) in body.iter().enumerate() {
+                    self.cur_stmt = Some(i);
                     self.stmt(s);
                 }
+                self.cur_stmt = saved_cur;
+                self.rc_live_stmt = saved_live;
+                self.rc_zero = false;
                 self.depth -= 1;
                 std::mem::swap(&mut self.out, &mut scratch);
                 let has_code = scratch.iter().any(|l| {
@@ -11292,15 +11468,52 @@ impl Render {
         let status_read = crate::shir_passes::status_reads::program_reads_status(prog);
         self.status_read = status_read;
         self.lazy_rc = !status_read && last_stmt_is_quiet(&prog.stmts);
-        // TAIL mode: no `$?` reader, and the last statement is the only
-        // observable status writer (an external command, a test, a
-        // pipeline…). Its store stays; every earlier store and every
-        // success-reset is dead, so `sys.exit(__sh_rc)` is still exact.
-        self.tail_rc = if !status_read && !self.lazy_rc && !prog.stmts.is_empty() {
-            Some(prog.stmts.len() - 1)
+        self.rc_body_live = status_read;
+        self.rc_fold = !format!("{:?}", prog).contains("\"block\"");
+        self.rc_live_stmt = if status_read {
+            // Per-statement liveness: a store is kept only when a later
+            // `$?` read — or the process exit — can reach it before the
+            // next store. Each function body gets its own vector. Empty
+            // when the analysis cannot localise the reads (a body reading
+            // the caller's status, the textual fallback): keep them all.
+            let lv = crate::shir_passes::status_reads::status_liveness(prog);
+            self.rc_init_observed = lv.init_observed;
+            self.rc_last_stores = prog
+                .stmts
+                .last()
+                .map(crate::shir_passes::status_reads::stmt_definitely_stores_status)
+                .unwrap_or(false);
+            for (name, v) in lv.bodies {
+                if let Some(v) = v {
+                    if self.rc_live_fns.contains_key(&name) {
+                        // the name is defined twice: no single vector applies
+                        self.rc_live_fns.insert(name, Vec::new());
+                    } else {
+                        self.rc_live_fns.insert(name, v);
+                    }
+                }
+            }
+            lv.main.unwrap_or_default()
+        } else if self.lazy_rc {
+            // No reader and a provably-successful tail: nothing is live.
+            vec![false; prog.stmts.len()]
         } else {
-            None
+            // TAIL mode: no `$?` reader, and the last statement is the only
+            // observable status writer (an external command, a test, a
+            // pipeline…). Its store stays; every earlier store and every
+            // success-reset is dead, so `sys.exit(__sh_rc)` is still exact.
+            let mut v = vec![false; prog.stmts.len()];
+            if let Some(last) = v.last_mut() {
+                *last = true;
+            }
+            v
         };
+        if std::env::var("SH2_RC_DEBUG").is_ok() {
+            eprintln!(
+                "[rc-render] status_read={} lazy={} init_obs={} live={:?}",
+                status_read, self.lazy_rc, self.rc_init_observed, self.rc_live_stmt
+            );
+        }
         // A name that is BOTH a variable read and a function definition is
         // the function, not a variable: hoisting `f = ""` before
         // `def f(): ...` would rebind the function object and the later
@@ -11402,6 +11615,10 @@ impl Render {
         if !vars.is_empty() {
             self.emit("");
         }
+        // A program starts with the status register reading 0 (bash's
+        // initial `$?`), so a `$?` read before any store folds to the
+        // literal instead of forcing a `__sh_rc = 0` initialiser.
+        self.rc_zero = true;
         for (idx, s) in prog.stmts.iter().enumerate() {
             let before = self.out.len();
             self.cur_stmt = Some(idx);
@@ -11446,12 +11663,20 @@ impl Render {
                 params.join(", ")
             ));
             self.in_function += 1;
-            self.block(&sub.body);
+            let sub_live = self.rc_live_fns.get(&sub.name).cloned().unwrap_or_default();
+            let saved_live = std::mem::replace(&mut self.rc_live_stmt, sub_live);
+            let saved_cur = self.cur_stmt;
+            self.rc_zero = false;
+            self.body_block(&sub.body);
+            self.cur_stmt = saved_cur;
+            self.rc_live_stmt = saved_live;
+            self.rc_zero = false;
             self.in_function -= 1;
             self.emit("");
         }
         std::mem::swap(&mut self.out, &mut subs_out);
         ensure_nonempty_blocks(&mut subs_out);
+        self.rc_body_zero = self.rc_zero;
 
         // Which `__sh_*` subprocess helpers the rendered program actually
         // calls, plus their transitive deps. The block is ~120 lines of bash
@@ -12407,12 +12632,11 @@ impl Render {
             // FIELD SPLITTING first (see __sh_exec): a captured word list
             // is several arguments, not one list-shaped string.
             self.emit("    argv = [str(_x) for _a in argv for _x in (_a if isinstance(_a, (list, tuple)) else [_a]) if str(_x) != \"\"]");
-            // no command word (`$(>file)`): nothing runs, status 0
-            self.emit("    if not argv:");
-            self.emit("        __sh_rc = 0");
-            self.emit("        return \"\"");
             self.emit("    try:");
-            self.emit("        out = subprocess.check_output(argv, env=env)");
+            // no command word (`$(>file)`): nothing runs, status 0 — the
+            // same success store covers it (two `__sh_rc = 0` lines per
+            // capture helper was pure noise)
+            self.emit("        out = subprocess.check_output(argv, env=env) if argv else b\"\"");
             self.emit("        __sh_rc = 0");
             self.emit("        return out.decode(errors=\"replace\").rstrip(\"\\n\")");
             self.emit("    except subprocess.CalledProcessError as e:");
@@ -12722,13 +12946,38 @@ impl Render {
             self.emit("        raise __ShExpandError()");
             self.emit("");
         }
-        // The exit-status register: always present (the program ends
-        // with `sys.exit(__sh_rc)`, so every render must define it).
-        // Statement arms maintain it (externals record their rc,
-        // native-success statements reset to 0, compound statements own
-        // it via their last command); defaults to 0 (success).
-        self.emit("__sh_rc = 0");
-        self.emit("");
+        // The exit-status register: the program ends with
+        // `sys.exit(__sh_rc)`, so a render that maintains a status must
+        // define it. Statement arms maintain it (externals record their
+        // rc, native-success statements reset to 0, compound statements
+        // own it via their last command); it defaults to 0 (success).
+        // The initialiser is dead when nothing reads the register at all
+        // (every `$?` read folded to a literal, no `sys.exit(__sh_rc)`),
+        // so decide from the RENDERED text: the body, the sub bodies and
+        // the helper defs already emitted above are the complete set of
+        // readers. A predicate over the IR would have to model every
+        // renderer arm; this cannot be wrong about what it emitted.
+        let rc_reader = |l: &String| {
+            let t = l.trim_start();
+            l.contains("__sh_rc")
+                && !t.starts_with("__sh_rc =")
+                && !t.starts_with("global __sh_rc")
+                && !t.contains("[\"__sh_rc\"] =")
+        };
+        let body_reads = |lines: &[String]| lines.iter().any(rc_reader);
+        let exit_reads = !self.lazy_rc && !self.rc_body_zero;
+        self.rc_exit_literal = !exit_reads;
+        // Reading the register is not the same as observing its INITIAL
+        // value: when every read is preceded by a live store (and the last
+        // statement always stores, so the `sys.exit` read is covered too),
+        // no path can see the 0 and the initialiser is dead.
+        let init_observable = self.rc_init_observed || (exit_reads && !self.rc_last_stores);
+        if init_observable
+            && (exit_reads || body_reads(&self.out) || body_reads(&body_out) || body_reads(&subs_out))
+        {
+            self.emit("__sh_rc = 0");
+            self.emit("");
+        }
         if self.need_strip {
             // `${var#/##/%%/% pattern}` prefix/suffix removal (bash pattern
             // removal; glob → regex at runtime). `#`/`%` remove the
@@ -12769,7 +13018,7 @@ impl Render {
         // scripts (usage errors, `exit 1`) could never pass the gate's
         // exit-code verdict. In lazy mode the last statement is provably
         // successful, so the status is the literal 0.
-        if self.lazy_rc {
+        if self.rc_exit_literal {
             self.emit("sys.exit(0)");
         } else {
             self.emit("sys.exit(__sh_rc)");
