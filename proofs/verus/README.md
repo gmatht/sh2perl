@@ -5848,11 +5848,11 @@ cross-scope name is refused), so the proof's value is the decision
 rule, not corpus coverage. Coverage sync registered
 (`verus-sync-coverage.sh:escape_classes`).
 
-### `f32_narrow.rs` — 8 obligations
+### `f32_narrow.rs` — 10 obligations
 
 ```
     verus --triggers-mode silent --rlimit 40 f32_narrow.rs
-    -> verification results:: 8 verified, 0 errors
+    -> verification results:: 10 verified, 0 errors
 ```
 
 **What is proved.** The verdict (`is_f32_var`, consumed by the C
@@ -5860,7 +5860,21 @@ renderer's `float` home and the estree `Math.fround` lowering) rests
 on the exactness-preserving form table in `combine`'s non-literal arm.
 The model states the lattice (`FVal { dom, exact, has_cval, cval }`),
 `operand_exact` (Float ⇒ `exact`; Int ⇒ the `cval` round-trip;
-Unknown ⇒ never) and `form_ok` verbatim, and pins:
+Unknown ⇒ never) and `form_ok` verbatim.
+
+The table itself is a THEOREM, not a pin set (2026-11-24).
+`verdict_exact(fv, v)` is the value-taking verdict ("dom = Float &&
+exact ⇒ `f32_exact(v)`"), `denotes`/`bin_val` give each lattice its
+concrete value and each op its `real` result, and `verdict_is_exact`
+proves: for exact operands `x`,`y` that the lattices denote and any
+`op`,`l`,`r` the table accepts, `combine_nonlit(op,l,r)` is exact and
+`bin_val(op,x,y)` round-trips through `f32`. So `combine`'s
+`exact = operand_exact(l) && operand_exact(r) && <table>` is a fact for
+every operand pair, not a table nobody checked. The two IEEE facts a
+`real` model cannot derive are CARRIED as named hypotheses:
+`zero_is_exact`, and `negation_is_exact` (rounding commutes with `-`,
+used by `* -1` and `/ -1`). `verdict_exact_lit` is the literal lane and
+`combine_exact_lit` the fold contract. Pins:
 
 - `pin_mod_refused`: `%`/`//`/`**` are never accepted (the table
   enumerates only `+`,`-`,`*`,`/`).
@@ -5875,11 +5889,22 @@ Unknown ⇒ never) and `form_ok` verbatim, and pins:
   `16777217`-style ints refusing.
 - `zero_exact`: `*±0` is accepted only because zero itself round-trips.
 
-UNMIRRORED — analysis-only source, no unit suite (recorded).
+The pins are UNMIRRORED by design — the sync manifest's pin scan sees
+`proof fn pin_*` only, so the two law symbols are guarded BY NAME there
+instead (`guard law verdict_is_exact`, `guard literal lane
+verdict_exact_lit`) along with the premise the model shares with the
+source (`let exact = operand_exact(l)`). The source is not
+analysis-only in fact: it carries a 21-test unit suite
+(`exact_literal_narrows`, `structured_plus_zero_narrows`, …), but no
+pin is mapped onto it.
 
 **It can fail (checked).** Dropping the `*` arm from `form_ok` (the
 exactness-preserving product rule) reports **7 verified, 1 error**
-(`pin_mul_one_form`). Restored and re-checked at **8 verified, 0 errors**.
+(`pin_mul_one_form`). Widening `form_ok`'s `+` arm to EVERY add
+(`(op == op_add())`) — the mutant the new law is about — reports
+**9 verified, 1 error**, on the `assert(is_zero(r))` in
+`verdict_is_exact` that extracts the accepted form's zero. Both
+restored and re-checked at **10 verified, 0 errors**.
 
 **Scope.** The model is a `real`-valued abstraction: `f32_round` is
 uninterpreted with the idempotence law `f32_exact` spells, and
