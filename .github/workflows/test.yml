@@ -52,6 +52,19 @@ jobs:
           set -o pipefail
           python3 proofs/verus/check_sync.py 2>&1 | tee verus_manifest_check.txt
 
+      - name: Check the Verus manifest checker's own detectors
+        # check_sync.py is the gate that keeps *_sync.txt honest, so ITS
+        # detectors must be tested too — otherwise a detector could stop
+        # firing and every manifest would read green regardless. The selftest
+        # mutates one manifest per failure class (phantom pin, stale sha with
+        # and without a STALE note, wrong proof-fns, a MAPPED row with no
+        # exec, a test that does not exist, a test that FAILED), asserts each
+        # yields exit 1 with that kind, and restores every file byte-
+        # identically (sha256-checked), so it cannot leave a tree modified.
+        run: |
+          set -o pipefail
+          python3 proofs/verus/check_sync_selftest.py 2>&1 | tee verus_manifest_selftest.txt
+
       - name: Run purify tests
         run: |
           perl test_purify.pl --all 2>&1 | tee purify_output.txt || true
