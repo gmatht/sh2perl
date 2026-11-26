@@ -63,6 +63,10 @@ else
         examples/012_test_const_read.sh
         # really reads stdin (`cat -`), fed from tests/stdin/
         examples/cat-dash-stdin.sh
+        # loop exit status: zero iterations, last body command, break,
+        # continue, and each condition form (test, external, natively
+        # lowered builtin, compound) for both while and until
+        tests/loop-status/*.sh
     )
 fi
 
@@ -147,6 +151,23 @@ for f in "${examples[@]}"; do
         echo "FAIL $name: exit $(cat "$tmp/$name.b/work/rc") vs $(cat "$tmp/$name.p/work/rc")"
         fail=1
         continue
+    fi
+
+    # Loop-status fixtures assert a loop's EXIT STATUS, so stderr is part of
+    # the contract. bash prefixes builtin diagnostics with "<script>: line
+    # N: ", which differs by invocation path even between two bash runs, and
+    # the Perl runtime may print a local uu-ffi availability notice; strip
+    # both and compare the message itself.
+    if [ "${f#tests/loop-status/}" != "$f" ]; then
+        sed -E 's/^.*: line [0-9]+: //' "$tmp/$name.b/work/err" >"$tmp/$name.b.nerr"
+        sed -E 's/^.*: line [0-9]+: //' "$tmp/$name.p/work/err" \
+            | grep -v '^sh2perl: uu-ffi ' >"$tmp/$name.p.nerr"
+        if ! diff -q "$tmp/$name.b.nerr" "$tmp/$name.p.nerr" >/dev/null; then
+            echo "FAIL $name: stderr differs"
+            diff -u "$tmp/$name.b.nerr" "$tmp/$name.p.nerr" | sed -n '1,12p'
+            fail=1
+            continue
+        fi
     fi
     echo "ok   $name"
 done

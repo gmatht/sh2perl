@@ -1015,6 +1015,8 @@ pub fn set_childe_error_carrier(v: bool) {
 }
 
 pub fn shir_to_perl(prog: &IrProgram) -> String {
+    // Stable per-render loop-status names (golden snapshots pin the text).
+    LOOP_STATUS_SEQ.with(|c| c.set(0));
     let mut out = String::new();
 
     // Shebang
@@ -1606,6 +1608,7 @@ pub struct EmbedResult {
 /// (the legacy `Generator`'s HashSet iteration was 30/30 flaky across
 /// processes).
 pub fn shir_to_perl_embed(prog: &IrProgram, ctx: &EmbedCtx) -> EmbedResult {
+    LOOP_STATUS_SEQ.with(|c| c.set(0));
     let mut result = EmbedResult::default();
 
     // Embed fragments are preamble-free: disable the `__sh_uu_*` seam
@@ -2011,6 +2014,29 @@ fn rc_stripped(rendered: &str) -> String {
         i += ch.len_utf8();
     }
     out
+}
+
+thread_local! {
+    /// Status variables of the loops currently being emitted, innermost
+    /// last. `break`/`continue` themselves have status 0 in bash, so they
+    /// must publish that to the enclosing loop before jumping rather than
+    /// leaving the previous command's status behind.
+    static LOOP_STATUS_VARS: std::cell::RefCell<Vec<String>> =
+        const { std::cell::RefCell::new(Vec::new()) };
+}
+
+thread_local! {
+    // Per-render counter so the variable names in a render are stable (the
+    // golden snapshots pin the emitted text, and tests run in parallel).
+    static LOOP_STATUS_SEQ: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
+fn next_loop_status_var() -> String {
+    LOOP_STATUS_SEQ.with(|c| {
+        let n = c.get();
+        c.set(n + 1);
+        format!("__sh_loop_rc{n}")
+    })
 }
 
 pub(crate) fn emit_stmt(out: &mut String, stmt: &IrStmt, indent: usize) {
@@ -4007,6 +4033,20 @@ fn emit_stmt_owned(out: &mut String, stmt: &IrStmt, indent: usize) {
         }
 
         IrStmt::While { cond, body } => {
+            // bash's loop status is the last command executed in the BODY,
+            // or 0 when the body never ran. Inheriting the condition's
+            // status made `while cd /no/such; do :; done; echo $?` print 1
+            // where bash prints 0. Track it whenever the program can
+            // observe `$?` (rc_unread() == false); otherwise the render is
+            // byte-identical to before.
+            let loop_rc = if rc_unread() { None } else { Some(next_loop_status_var()) };
+            if let Some(v) = &loop_rc {
+                emit_indent(out, indent);
+                out.push_str(&format!("my ${v} = 0;\n"));
+            }
+            if let Some(v) = &loop_rc {
+                LOOP_STATUS_VARS.with(|s| s.borrow_mut().push(v.clone()));
+            }
             // A multi-command condition (`while read -r l && [ -n "$l" ]
             // && (( n < 2 )); do …; done`) arrives as
             // `Call{block, [Arrow[stmts…]]}`. Rendering it through
@@ -4029,6 +4069,10 @@ fn emit_stmt_owned(out: &mut String, stmt: &IrStmt, indent: usize) {
                 for s in body.iter() {
                     emit_stmt(out, s, indent + 1);
                 }
+                if let Some(v) = &loop_rc {
+                    emit_indent(out, indent + 1);
+                    out.push_str(&format!("${v} = $? >> 8;\n"));
+                }
                 emit_indent(out, indent);
                 out.push_str("}\n");
             } else {
@@ -4038,8 +4082,24 @@ fn emit_stmt_owned(out: &mut String, stmt: &IrStmt, indent: usize) {
                 for s in body.iter() {
                     emit_stmt(out, s, indent + 1);
                 }
+                if let Some(v) = &loop_rc {
+                    emit_indent(out, indent + 1);
+                    out.push_str(&format!("${v} = $? >> 8;\n"));
+                }
                 emit_indent(out, indent);
                 out.push_str("}\n");
+            }
+            if loop_rc.is_some() {
+                LOOP_STATUS_VARS.with(|s| s.borrow_mut().pop());
+            }
+            if let Some(v) = &loop_rc {
+                let w = rc_write(&format!("$main_exit_code = $CHILD_ERROR = ${v};"));
+                if !w.is_empty() {
+                    out.push_str(&w);
+                    if !w.ends_with('\n') {
+                        out.push('\n');
+                    }
+                }
             }
         }
         IrStmt::ForInit { init, cond, step, body } => {
@@ -4060,10 +4120,20 @@ fn emit_stmt_owned(out: &mut String, stmt: &IrStmt, indent: usize) {
         }
         IrStmt::Continue => {
             emit_indent(out, indent);
+            // `continue` has status 0; a loop whose last iteration ended
+            // here reports 0, not the status of the command before it.
+            if let Some(v) = LOOP_STATUS_VARS.with(|s| s.borrow().last().cloned()) {
+                out.push_str(&format!("${v} = 0; "));
+            }
             out.push_str("next;\n");
         }
         IrStmt::Break => {
             emit_indent(out, indent);
+            // `break` has status 0: bash reports the loop as successful
+            // even when the command before the break failed.
+            if let Some(v) = LOOP_STATUS_VARS.with(|s| s.borrow().last().cloned()) {
+                out.push_str(&format!("${v} = 0; "));
+            }
             out.push_str("last;\n");
         }
         IrStmt::Die { expr, carp } => {
@@ -4394,13 +4464,36 @@ fn emit_stmt_owned(out: &mut String, stmt: &IrStmt, indent: usize) {
         IrStmt::DoWhile { body, cond, until } => {
             let kw = if *until { "until" } else { "while" };
             let cond_str = ir_expr_to_perl(cond);
+            // Same status rule as `while`: last body command, 0 if none.
+            let loop_rc = if rc_unread() { None } else { Some(next_loop_status_var()) };
+            if let Some(v) = &loop_rc {
+                emit_indent(out, indent);
+                out.push_str(&format!("my ${v} = 0;\n"));
+                LOOP_STATUS_VARS.with(|s| s.borrow_mut().push(v.clone()));
+            }
             emit_indent(out, indent);
             out.push_str("do {\n");
             for s in body.iter() {
                 emit_stmt(out, s, indent + 1);
             }
+            if let Some(v) = &loop_rc {
+                emit_indent(out, indent + 1);
+                out.push_str(&format!("${v} = $? >> 8;\n"));
+            }
             emit_indent(out, indent);
             out.push_str(&format!("}} {} ({});\n", kw, cond_str));
+            if loop_rc.is_some() {
+                LOOP_STATUS_VARS.with(|s| s.borrow_mut().pop());
+            }
+            if let Some(v) = &loop_rc {
+                let w = rc_write(&format!("$main_exit_code = $CHILD_ERROR = ${v};"));
+                if !w.is_empty() {
+                    out.push_str(&w);
+                    if !w.ends_with('\n') {
+                        out.push('\n');
+                    }
+                }
+            }
         }
     }
 }
@@ -5981,7 +6074,13 @@ fn cd_chain_to_perl(expr: &IrExpr) -> Option<String> {
                                             .first()
                                             .map(|w| render_word(w))
                                             .unwrap_or_else(|| "1".to_string());
-                                        return Some(format!("chdir({}) or exit {};", dir, code));
+                                        // bash still reports the failed
+                                        // chdir before honouring the exit.
+                                        return Some(format!(
+                                            "chdir({dir}) or do {{ warn \"cd: \" . {dir} . \": $!\\n\"; exit {code}; }};",
+                                            dir = dir,
+                                            code = code
+                                        ));
                                     }
                                 }
                                 // `cd D || <anything else>` — bash runs <rhs>
@@ -5991,7 +6090,11 @@ fn cd_chain_to_perl(expr: &IrExpr) -> Option<String> {
                                 // update $CHILD_ERROR for follow-up `$?`.
                                 let mut rhs_str = String::new();
                                 emit_stmt(&mut rhs_str, &IrStmt::Expr((**rhs).clone()), 0);
-                                Some(format!("chdir({}) or do {{ {} }};", dir, rhs_str.trim_end()))
+                                Some(format!(
+                                    "chdir({dir}) or do {{ warn \"cd: \" . {dir} . \": $!\\n\"; {rhs} }};",
+                                    dir = dir,
+                                    rhs = rhs_str.trim_end()
+                                ))
                             }
                             BinOpKind::And => {
                                 // Native tail first — `cd D && pwd` must not
@@ -6008,7 +6111,7 @@ fn cd_chain_to_perl(expr: &IrExpr) -> Option<String> {
                                 // as bash runs `cd D && tail`.
                                 if let Some(body) = chain_operand_native(rhs) {
                                     return Some(format!(
-                                        "if (chdir({dir})) {{ {body} }} else {{ warn \"cd: $!\\n\"; $main_exit_code = $CHILD_ERROR = 1; }}",
+                                        "if (chdir({dir})) {{ {body} }} else {{ warn \"cd: \" . {dir} . \": $!\\n\"; $main_exit_code = $CHILD_ERROR = 1; }}",
                                         dir = dir
                                     ));
                                 }
@@ -6036,14 +6139,14 @@ fn cd_chain_to_perl(expr: &IrExpr) -> Option<String> {
                                         // SUCCEEDED, and a failed cd must
                                         // not abort the script.
                                         Some(format!(
-                                            "{x}chdir({dir}) ? do {{ system('bash', '-c', {q}); $main_exit_code = $CHILD_ERROR = $? >> 8; }} : do {{ warn \"cd: $!\\n\"; $main_exit_code = $CHILD_ERROR = 1; }}",
+                                            "{x}chdir({dir}) ? do {{ system('bash', '-c', {q}); $main_exit_code = $CHILD_ERROR = $? >> 8; }} : do {{ warn \"cd: \" . {dir} . \": $!\\n\"; $main_exit_code = $CHILD_ERROR = 1; }}",
                                             x = var_exports_str(&t),
                                             dir = dir,
                                             q = q
                                         ))
                                     }
                                     None => Some(format!(
-                                        "chdir({dir}) or do {{ warn \"cd: $!\\n\"; $main_exit_code = $CHILD_ERROR = 1; }};"
+                                        "chdir({dir}) or do {{ warn \"cd: \" . {dir} . \": $!\\n\"; $main_exit_code = $CHILD_ERROR = 1; }};"
                                     )),
                                 }
                             }
@@ -9585,7 +9688,7 @@ fn emit_exec_call(out: &mut String, call: &IrExpr, indent: usize) {
             emit_indent(out, indent);
             out.push_str("} else {\n");
             emit_indent(out, indent + 1);
-            out.push_str("warn \"cd: $!\\n\";\n");
+            out.push_str(&format!("warn \"cd: \" . {dir} . \": $!\\n\";\n"));
             emit_indent(out, indent + 1);
             out.push_str(&rc_write(" $main_exit_code = $CHILD_ERROR = 1;"));
             out.push('\n');
@@ -17797,7 +17900,7 @@ mod perl_render_tests {
     fn native_cd_records_status_and_continues() {
         let out = render("cd /no/such/dir\nif [ $? -eq 0 ]; then echo ok; else echo bad; fi\n");
         assert!(!out.contains("or die \"cd"), "{out}");
-        assert!(out.contains("warn \"cd: $!\\n\""), "{out}");
+        assert!(out.contains("warn \"cd: \" ."), "{out}");
         assert!(out.contains("$? = 1 << 8"), "{out}");
         assert!(out.contains("$? >> 8"), "{out}");
     }
@@ -17809,6 +17912,21 @@ mod perl_render_tests {
         let out = render("false && echo hi\n");
         assert!(!out.contains("system(\"echo"), "{out}");
         assert!(!out.contains("system(\"false"), "{out}");
+    }
+
+    /// bash reports a loop's status from the BODY, not from the condition
+    /// that ended it: zero iterations is success, otherwise the last body
+    /// command decides. The render snapshots that per iteration instead of
+    /// inheriting the failing condition's `system()` status.
+    #[test]
+    fn loop_status_comes_from_the_body() {
+        let out = render("while cd /no/such; do :; done\necho $?\n");
+        assert!(out.contains("my $__sh_loop_rc"), "{out}");
+        assert!(out.contains("= $? >> 8;"), "{out}");
+        assert!(out.contains("<< 8;"), "{out}");
+        // `break` is success even when the command before it failed.
+        let b = render("while true; do false; break; done\necho $?\n");
+        assert!(b.contains("= 0; last;"), "{b}");
     }
 
     /// Golden text for a dozen representative programs, plus `perl -w -c`

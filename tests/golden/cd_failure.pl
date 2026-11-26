@@ -5,7 +5,7 @@ use warnings;
 if (chdir("/no/such/dir")) {
     $? = 0 << 8;
 } else {
-    warn "cd: $!\n";
+    warn "cd: " . "/no/such/dir" . ": $!\n";
     $? = 1 << 8;
 }
 if ((0+($? >> 8)) == (0+'0')) {
