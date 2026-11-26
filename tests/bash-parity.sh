@@ -8,7 +8,8 @@
 # `diff`, not by a test. This script is that hand-check, automated.
 #
 # For each example it:
-#   1. renders it with perl_backend (the single emitter, ir::shir_to_perl),
+#   1. renders it the way the CLI does (`perl_backend --fixed` =
+#      perl_generator_fixed::generate over the single emitter ir::shir_to_perl),
 #      requiring `perl -w -c` to accept it;
 #   2. runs bash and each Perl in identically-named working directories
 #      (so `pwd`/`usage: $0`-style output is comparable);
@@ -22,6 +23,7 @@
 #
 # Usage:
 #   bash tests/bash-parity.sh                     # curated default list
+#   bash tests/bash-parity.sh --all               # every examples/*.sh
 #   bash tests/bash-parity.sh examples/foo.sh …   # explicit list
 set -uo pipefail
 
@@ -31,7 +33,10 @@ cd "$root"
 tmp=$(mktemp -d)
 trap 'rm -rf "$tmp"' EXIT
 
-if [ "$#" -gt 0 ]; then
+if [ "${1:-}" = "--all" ]; then
+    shopt -s nullglob
+    examples=(examples/*.sh)
+elif [ "$#" -gt 0 ]; then
     examples=("$@")
 else
     # Curated: deterministic, self-contained examples that currently match
@@ -65,7 +70,11 @@ for f in "${examples[@]}"; do
     for emitter in perl; do
         bin=perl_backend
         pl="$tmp/$name.$emitter.pl"
-        if ! cargo run --quiet --bin "$bin" -- "$f" >"$pl" 2>"$tmp/render.err"; then
+        # `--fixed` is the shipped `--target pl` path
+        # (`perl_generator_fixed::generate`): the single renderer plus the
+        # IR/text fixups the CLI applies. Testing bare `shir_to_perl` here
+        # would gate a pipeline no user gets.
+        if ! cargo run --quiet --bin "$bin" -- --fixed "$f" >"$pl" 2>"$tmp/render.err"; then
             echo "FAIL $name [$emitter]: render failed"; sed -n '1,5p' "$tmp/render.err"; fail=1; continue
         fi
         if ! perl -w -c "$pl" >/dev/null 2>"$tmp/perl-c.err"; then

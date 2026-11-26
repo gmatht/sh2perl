@@ -18,3 +18,17 @@
 # No example exists where the retired renderer matched bash and the survivor
 # does not, so nothing needed porting. Every one of the ten curated examples
 # now passes through tests/bash-parity.sh; the list below is therefore empty.
+
+# Full-corpus sweep (2026-11-26, shipped `perl_backend --fixed` path, i.e.
+# perl_generator_fixed::generate): 496 of 555 `examples/*.sh` matched bash on
+# stdout AND exit status with warning-free `perl -w -c`. The remaining 59 were
+# not curated into the gate; they cluster in:
+#   - process substitution / here-strings and complex parameter expansion
+#     (30 stdout mismatches, e.g. 011_brace_expansion, 042_process_substitution_advanced);
+#   - inputs the parser deliberately rejects (5 render failures, parse-error-*);
+#   - renders `perl -w -c` rejects (23 perl-c, e.g. 063_hard_to_parse, 064_hard_to_generate);
+#   - 1 warning-only case (test-expression-backslash-continuation).
+# None of these is a per-example regression against the retired renderer: the
+# retired renderer was only compared on the curated ten above, where it lost
+# on every one. They are corpus coverage, not a hidden pass. Run them all with
+#   bash tests/bash-parity.sh --all

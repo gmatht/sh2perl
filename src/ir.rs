@@ -17821,4 +17821,64 @@ mod perl_render_tests {
         assert!(out.contains("$? = 1 << 8"), "{out}");
         assert!(out.contains("$? >> 8"), "{out}");
     }
+
+    /// Golden text for a dozen representative programs, plus `perl -w -c`
+    /// on every render. The text pins escaping and idiom choices that a
+    /// behavioural test would miss; the compile check pins that no render
+    /// ships a syntax error or a `Useless use…`/`uninitialized` warning.
+    /// Regenerate a `.pl` with
+    /// `target/debug/perl_backend tests/golden/<name>.sh > <name>.pl`
+    /// after an intentional emitter change.
+    #[test]
+    fn golden_snapshots_compile_without_warnings() {
+        const CASES: &[&str] = &[
+            "if_grep",
+            "elif_grep",
+            "while_grep",
+            "nested_capture",
+            "cd_failure",
+            "cd_and",
+            "false_and",
+            "capture_dynamic",
+            "literal_backslash",
+            "rm_status",
+            "echo_n",
+            "func_local",
+        ];
+        let dir = concat!(env!("CARGO_MANIFEST_DIR"), "/tests/golden");
+        let have_perl = std::process::Command::new("perl")
+            .arg("-v")
+            .output()
+            .map(|o| o.status.success())
+            .unwrap_or(false);
+        for name in CASES {
+            let src = std::fs::read_to_string(format!("{dir}/{name}.sh"))
+                .unwrap_or_else(|e| panic!("read {name}.sh: {e}"));
+            let expected = std::fs::read_to_string(format!("{dir}/{name}.pl"))
+                .unwrap_or_else(|e| panic!("read {name}.pl: {e}"));
+            let got = render(&src);
+            assert_eq!(got, expected, "golden drift for {name}");
+            if !have_perl {
+                continue;
+            }
+            let path = std::env::temp_dir().join(format!(
+                "sh2perl-golden-{name}-{}.pl",
+                std::process::id()
+            ));
+            std::fs::write(&path, &got).expect("write temp render");
+            let out = std::process::Command::new("perl")
+                .arg("-w")
+                .arg("-c")
+                .arg(&path)
+                .output()
+                .expect("run perl");
+            let _ = std::fs::remove_file(&path);
+            let err = String::from_utf8_lossy(&out.stderr);
+            assert!(out.status.success(), "{name}: perl -w -c failed: {err}");
+            assert!(
+                !err.contains("Useless use") && !err.contains("uninitialized"),
+                "{name}: perl -w warnings: {err}"
+            );
+        }
+    }
 }
