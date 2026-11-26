@@ -11,8 +11,9 @@
 //!     (with -n/-e/-E), printf (full conversion spec), cd/export/local/
 //!     declare/unset/set/shift/read (IFS field split)/let/sleep/pwd/wait/
 //!     true/false/exit, `[ ... ]`/`[[ ... ]]` tests (file tests, numeric
-//!     compares, pattern match via a hand-rolled glob matcher, `=~` via
-//!     `bash -c '[[ $1 =~ $2 ]]'`), parameter expansion (`:-` `:=` `#` `%`
+//!     compares, pattern match via a hand-rolled glob matcher, `=~` via a
+//!     native ERE matcher — `bash -c '[[ $1 =~ $2 ]]'` only for patterns
+//!     outside that subset), parameter expansion (`:-` `:=` `#` `%`
 //!     `/` `//` slice case ops len basename dirname), command substitution
 //!     (native statement blocks captured via a runtime output buffer, or
 //!     `bash -c` for shell-out bodies), pipelines (mixed native/shell
@@ -921,6 +922,46 @@ fn cat_peephole(text: &str) -> String {
                 i += "__sh_cat(&[])".len();
                 changed = true;
                 continue;
+            }
+            // multi-part flatten: `__sh_cat(&[vec![..], vec![..]])` →
+            // `vec![.., ..]`. `__sh_cat` is pure concatenation and each
+            // part is a statically known word list, so the call has
+            // nothing left to do at runtime. Falls through to the
+            // single-part shape below when a part is not a `vec![..]`.
+            if s[i..].starts_with("__sh_cat(&[") {
+                let lb = i + "__sh_cat(&[".len() - 1;
+                if let Some(rb) = scan_matching(s, lb) {
+                    if s[rb..].starts_with("])") {
+                        let inner = &s[lb + 1..rb];
+                        let parts = top_comma_ranges(inner);
+                        if parts.len() >= 2 {
+                            let mut xs: Vec<&str> = Vec::new();
+                            for &(a, e) in &parts {
+                                let p = inner[a..e].trim();
+                                if p.starts_with("vec![") && p.ends_with(']') {
+                                    xs.push(&p["vec![".len()..p.len() - 1]);
+                                } else {
+                                    xs.clear();
+                                    break;
+                                }
+                            }
+                            if !xs.is_empty() {
+                                let mut r = String::from("vec![");
+                                for (n, x) in xs.iter().enumerate() {
+                                    if n > 0 {
+                                        r.push_str(", ");
+                                    }
+                                    r.push_str(x);
+                                }
+                                r.push(']');
+                                out.push_str(&r);
+                                i = rb + 2;
+                                changed = true;
+                                continue;
+                            }
+                        }
+                    }
+                }
             }
             if s[i..].starts_with("__sh_cat(&[vec![") {
                 // scan the vec's [...] with depth, skipping literals
@@ -2024,6 +2065,715 @@ fn prune_unused_statics(text: String) -> String {
     out
 }
 
+// ── idiom pass ───────────────────────────────────────────────────────
+//
+// Everything above this line is about *semantics*: which Rust statements
+// reproduce a shell statement. This pass is about *shape* — the same
+// semantics, written the way a Rust programmer would write it.
+//
+// Every rewrite below fires only on an exact textual shape and leaves
+// anything it does not fully understand alone (a missed optimisation,
+// never a miscompile), in the style of `cat_peephole` /
+// `strip_str_lit_refs`. It runs last among the shaping passes (after
+// `inline_simple_helpers`, which is what turns `print_words` into
+// `println!`) and before the pruning passes, which clean up after it.
+fn idiom_peephole(text: &str) -> String {
+    let mut t = text.to_string();
+    t = inline_format_wrappers(t);
+    t = strip_macro_to_string(&t);
+    t = compound_assign(&t);
+    t = drop_dead_ret_register(&t);
+    t = collapse_double_parens(&t);
+    t = drop_single_use_clones(&t);
+    t = drop_redundant_mut(&t);
+    t
+}
+
+/// Index of the delimiter matching the one at `start` (`(`, `[` or `{`),
+/// skipping over `"…"` and `'…'` literals. `None` when unbalanced.
+fn scan_matching(s: &str, start: usize) -> Option<usize> {
+    let b = s.as_bytes();
+    let open = *b.get(start)?;
+    let close = match open {
+        b'(' => b')',
+        b'[' => b']',
+        b'{' => b'}',
+        _ => return None,
+    };
+    let mut depth = 0usize;
+    let mut i = start;
+    while i < b.len() {
+        match b[i] {
+            b'"' => {
+                i += 1;
+                while i < b.len() {
+                    if b[i] == b'\\' {
+                        i += 2;
+                    } else if b[i] == b'"' {
+                        i += 1;
+                        break;
+                    } else {
+                        i += 1;
+                    }
+                }
+            }
+            b'\'' => {
+                // only exact char shapes; a lifetime `'a` would desync
+                let rb = &b[i..];
+                if rb.len() > 2 && rb[2] == b'\'' {
+                    i += 3;
+                } else if rb.len() > 3 && rb[1] == b'\\' && rb[3] == b'\'' {
+                    i += 4;
+                } else {
+                    i += 1;
+                }
+            }
+            c if c == open => {
+                depth += 1;
+                i += 1;
+            }
+            c if c == close => {
+                depth -= 1;
+                if depth == 0 {
+                    return Some(i);
+                }
+                i += 1;
+            }
+            _ => i += 1,
+        }
+    }
+    None
+}
+
+/// `,`-separated argument ranges of `s` at nesting depth 0 (literals
+/// skipped). Always at least one range, so a single argument is `[(0,len)]`.
+fn top_comma_ranges(s: &str) -> Vec<(usize, usize)> {
+    let b = s.as_bytes();
+    let mut out: Vec<(usize, usize)> = Vec::new();
+    let mut depth = 0i32;
+    let mut last = 0usize;
+    let mut i = 0;
+    while i < b.len() {
+        match b[i] {
+            b'"' => {
+                i += 1;
+                while i < b.len() {
+                    if b[i] == b'\\' {
+                        i += 2;
+                    } else if b[i] == b'"' {
+                        i += 1;
+                        break;
+                    } else {
+                        i += 1;
+                    }
+                }
+            }
+            b'\'' => {
+                let rb = &b[i..];
+                if rb.len() > 2 && rb[2] == b'\'' {
+                    i += 3;
+                } else if rb.len() > 3 && rb[1] == b'\\' && rb[3] == b'\'' {
+                    i += 4;
+                } else {
+                    i += 1;
+                }
+            }
+            b'(' | b'[' | b'{' => {
+                depth += 1;
+                i += 1;
+            }
+            b')' | b']' | b'}' => {
+                depth -= 1;
+                i += 1;
+            }
+            b',' if depth == 0 => {
+                out.push((last, i));
+                last = i + 1;
+                i += 1;
+            }
+            _ => i += 1,
+        }
+    }
+    out.push((last, s.len()));
+    out
+}
+
+/// Byte ranges of `for` / `while` / `loop` bodies. Used to veto rewrites
+/// that would move a value on an iteration boundary.
+fn loop_body_ranges(s: &str) -> Vec<(usize, usize)> {
+    let b = s.as_bytes();
+    let mut out: Vec<(usize, usize)> = Vec::new();
+    let mut i = 0;
+    while i < b.len() {
+        match b[i] {
+            b'"' => {
+                i += 1;
+                while i < b.len() {
+                    if b[i] == b'\\' {
+                        i += 2;
+                    } else if b[i] == b'"' {
+                        i += 1;
+                        break;
+                    } else {
+                        i += 1;
+                    }
+                }
+            }
+            b'\'' => {
+                let rb = &b[i..];
+                if rb.len() > 2 && rb[2] == b'\'' {
+                    i += 3;
+                } else if rb.len() > 3 && rb[1] == b'\\' && rb[3] == b'\'' {
+                    i += 4;
+                } else {
+                    i += 1;
+                }
+            }
+            _ => {
+                // keep `i` on a UTF-8 boundary: `s[i..]` below would
+                // otherwise panic inside a multi-byte comment char
+                if b[i] & 0x80 != 0 {
+                    i += s[i..].chars().next().map(|c| c.len_utf8()).unwrap_or(1);
+                    continue;
+                }
+                let boundary =
+                    i == 0 || !(b[i - 1].is_ascii_alphanumeric() || b[i - 1] == b'_');
+                let hdr = boundary
+                    && (s[i..].starts_with("for ")
+                        || s[i..].starts_with("while ")
+                        || s[i..].starts_with("loop {"));
+                if hdr {
+                    if let Some(brace) = s[i..].find('{').map(|r| i + r) {
+                        if let Some(end) = scan_matching(s, brace) {
+                            out.push((brace, end));
+                            i = end;
+                            continue;
+                        }
+                    }
+                }
+                i += 1;
+            }
+        }
+    }
+    out
+}
+
+/// `println!("{}", format!(..))` → `println!(..)`.
+///
+/// Sound because `println!("{}", x)` prints exactly `x` and `format!`
+/// already produced the finished string: one macro call, one argument
+/// list, one format parse instead of two. Vetoed when the inner format
+/// already ends in `\n` (the outer `println!` would add a second).
+fn inline_format_wrappers(mut t: String) -> String {
+    for mac in ["println!", "print!"] {
+        loop {
+            let mut edit: Option<(usize, usize, String)> = None;
+            let mut from = 0usize;
+            while let Some(rel) = t[from..].find(mac) {
+                let at = from + rel;
+                let open = at + mac.len();
+                if !t[open..].starts_with('(') {
+                    from = open;
+                    continue;
+                }
+                let Some(end) = scan_matching(&t, open) else {
+                    break;
+                };
+                if let Some(inner) = format_wrapper_inner(&t, open, end) {
+                    edit = Some((at, end + 1, format!("{mac}({inner})")));
+                    break;
+                }
+                from = open + 1;
+            }
+            match edit {
+                Some((s, e, r)) => t.replace_range(s..e, &r),
+                None => break,
+            }
+        }
+    }
+    t
+}
+
+/// The inner argument list of the wrapped `format!`, when `t[open..=end]`
+/// is exactly `("{}", format!(..))`.
+fn format_wrapper_inner(t: &str, open: usize, end: usize) -> Option<String> {
+    let region = &t[open + 1..end];
+    let ranges = top_comma_ranges(region);
+    if ranges.len() != 2 {
+        return None;
+    }
+    if region[ranges[0].0..ranges[0].1].trim() != "\"{}\"" {
+        return None;
+    }
+    let (s1, e1) = ranges[1];
+    let raw = &region[s1..e1];
+    let lead = raw.len() - raw.trim_start().len();
+    let arg = raw.trim();
+    let a1 = open + 1 + s1 + lead;
+    if !arg.starts_with("format!(") {
+        return None;
+    }
+    let fparen = a1 + "format!".len();
+    let fend = scan_matching(t, fparen)?;
+    if fend + 1 != a1 + arg.len() {
+        return None;
+    }
+    let fargs = &t[fparen + 1..fend];
+    let fr = top_comma_ranges(fargs);
+    let fmt = fargs[fr[0].0..fr[0].1].trim();
+    if fmt.ends_with("\\n\"") {
+        return None;
+    }
+    Some(fargs.to_string())
+}
+
+/// `format!("{}", n.to_string())` → `format!("{}", n)`.
+///
+/// `{}` goes through `Display`, so an argument that renders the same
+/// through `String` renders the same without it. Vetoed for any format
+/// string that carries a format spec (`{:` — `{:?}` of a `String` is
+/// quoted, `{:x}` needs the integer), where the conversion is load-bearing.
+fn strip_macro_to_string(t: &str) -> String {
+    let mut s = t.to_string();
+    loop {
+        let mut edits: Vec<(usize, usize)> = Vec::new();
+        for mac in ["format!(", "println!(", "print!("] {
+            let mut from = 0usize;
+            while let Some(rel) = s[from..].find(mac) {
+                let at = from + rel;
+                let open = at + mac.len() - 1;
+                let Some(end) = scan_matching(&s, open) else {
+                    break;
+                };
+                let region = &s[open + 1..end];
+                let ranges = top_comma_ranges(region);
+                if ranges.len() >= 2 {
+                    let fmt = region[ranges[0].0..ranges[0].1].trim();
+                    if !fmt.contains("{:") {
+                        for &(a, b) in &ranges[1..] {
+                            let raw = &region[a..b];
+                            let trimmed = raw.trim_end();
+                            if let Some(cut) = trimmed.strip_suffix(".to_string()") {
+                                // keep the argument, drop only the conversion
+                                let keep = open + 1 + a + cut.len();
+                                let end = open + 1 + a + trimmed.len();
+                                if end > keep {
+                                    edits.push((keep, end));
+                                }
+                            }
+                        }
+                    }
+                }
+                from = open + 1;
+            }
+        }
+        if edits.is_empty() {
+            return s;
+        }
+        edits.sort();
+        edits.dedup();
+        for &(a, b) in edits.iter().rev() {
+            s.replace_range(a..b, "");
+        }
+    }
+}
+
+/// `x = x + n;` → `x += n;` (likewise `-`, `*`, `/`, `%`).
+///
+/// Requires the RHS to *start* with the very same binding, so it is the
+/// same object being updated — no evaluation-order or aliasing change.
+fn compound_assign(t: &str) -> String {
+    let b = t.as_bytes();
+    let mut edits: Vec<(usize, usize, char)> = Vec::new();
+    let mut i = 0usize;
+    while let Some(rel) = t[i..].find(" = ") {
+        let at = i + rel;
+        i = at + 3;
+        let mut ls = at;
+        while ls > 0 && (b[ls - 1].is_ascii_alphanumeric() || b[ls - 1] == b'_') {
+            ls -= 1;
+        }
+        if ls == at {
+            continue;
+        }
+        if ls > 0 && (b[ls - 1] == b'.' || b[ls - 1] == b':') {
+            continue; // a field/path tail, not the binding itself
+        }
+        let lhs = &t[ls..at];
+        let rest = &t[at + 3..];
+        if !rest.starts_with(lhs) {
+            continue;
+        }
+        let ab = rest[lhs.len()..].as_bytes();
+        if ab.len() < 3 || ab[0] != b' ' || ab[2] != b' ' {
+            continue;
+        }
+        let op = ab[1];
+        if !matches!(op, b'+' | b'-' | b'*' | b'/' | b'%') {
+            continue;
+        }
+        edits.push((at, at + 3 + lhs.len() + 3, op as char));
+    }
+    if edits.is_empty() {
+        return t.to_string();
+    }
+    let mut s = t.to_string();
+    for (a, e, op) in edits.iter().rev() {
+        s.replace_range(*a..*e, &format!(" {op}= "));
+    }
+    s
+}
+
+/// Drop the `__SH_RET` return register when nothing ever reads it.
+///
+/// `__SH_RET` is the value home for `return expr`; when the renderer can
+/// resolve every caller to the return expression itself, the register is
+/// written and never read — a `static Mutex<String>` plus a lock and a
+/// clone per return. Only runs when every mention of the register is a
+/// store (`refs == writes`), so no read can be lost. A `return` landing at
+/// the end of its function becomes the tail expression; one that does not
+/// keeps its `return`.
+fn drop_dead_ret_register(t: &str) -> String {
+    let refs = t.matches("__SH_RET.lock().unwrap()").count();
+    let writes = t.matches("*__SH_RET.lock().unwrap() =").count();
+    if writes == 0 || refs != writes {
+        return t.to_string();
+    }
+    let clone_store = "*__SH_RET.lock().unwrap() = __v.clone();";
+    let plain_store = "*__SH_RET.lock().unwrap() = __v;";
+    let rc_store = "__SH_RC.store(0, Ordering::SeqCst); return;";
+    let loops = loop_body_ranges(t);
+    let mut s = t.to_string();
+    let mut from = 0usize;
+    while let Some(rel) = s[from..].find("*__SH_RET.lock().unwrap() = __v") {
+        let at = from + rel;
+        let after_store = if s[at..].starts_with(clone_store) {
+            at + clone_store.len()
+        } else if s[at..].starts_with(plain_store) {
+            at + plain_store.len()
+        } else {
+            from = at + 1;
+            continue;
+        };
+        let Some(lat) = s[..at].rfind("let __v = ") else {
+            from = at + 1;
+            continue;
+        };
+        if loops.iter().any(|&(s0, e0)| at > s0 && at < e0) {
+            from = at + 1;
+            continue;
+        }
+        let expr = s[lat + "let __v = ".len()..at]
+            .trim_end()
+            .trim_end_matches(';')
+            .trim_end()
+            .to_string();
+        if expr.is_empty() {
+            from = at + 1;
+            continue;
+        }
+        let tail = s[after_store..].trim_start();
+        let lead = s[after_store..].len() - tail.len();
+        if tail.starts_with("return __v;") {
+            let consumed = after_store + lead + "return __v;".len();
+            let at_tail = s[consumed..]
+                .chars()
+                .all(|c| c == '}' || c == '\n' || c == ' ' || c == '\t');
+            let repl = if at_tail {
+                expr
+            } else {
+                format!("return {expr};")
+            };
+            let adv = lat + repl.len();
+            s.replace_range(lat..consumed, &repl);
+            from = adv;
+        } else if tail.starts_with(rc_store) {
+            let end = after_store + lead + rc_store.len();
+            let repl = format!("__SH_RC.store(0, Ordering::SeqCst); let _ = {expr}; return;");
+            let adv = lat + repl.len();
+            s.replace_range(lat..end, &repl);
+            from = adv;
+        } else {
+            from = at + 1;
+        }
+    }
+    s
+}
+
+/// `((expr)).to_string()` → `(expr).to_string()`.
+///
+/// The arith-to-string wrap and the caller's grouping wrap both land on
+/// the same expression, which reads as noise. Only the exact shape
+/// `((..)).to_string()` fires, so an intentional `((a) && (b))` is safe.
+fn collapse_double_parens(t: &str) -> String {
+    let mut s = t.to_string();
+    let mut from = 0usize;
+    while let Some(rel) = s[from..].find("((") {
+        let at = from + rel;
+        let Some(close) = scan_matching(&s, at) else {
+            break;
+        };
+        if s[close + 1..].starts_with(".to_string()") {
+            s.replace_range(close..close + 1, "");
+            s.replace_range(at..at + 1, "");
+        }
+        from = at + 1;
+    }
+    s
+}
+
+/// Byte range of the function body containing `at` (generated functions
+/// start at column 0, so the nearest preceding `\nfn ` opens the one `at`
+/// sits in).
+fn enclosing_fn_range(t: &str, at: usize) -> (usize, usize) {
+    let start = t[..at].rfind("\nfn ").map(|i| i + 1).unwrap_or(0);
+    let open = t[start..].find('{').map(|i| start + i).unwrap_or(start);
+    let end = scan_matching(t, open).unwrap_or(t.len());
+    (start, end)
+}
+
+/// Count whole-identifier occurrences of `name` in `t`.
+fn count_ident(t: &str, name: &str) -> usize {
+    let b = t.as_bytes();
+    let mut n = 0usize;
+    for (i, _) in t.match_indices(name) {
+        let before_ok = i == 0 || !(b[i - 1].is_ascii_alphanumeric() || b[i - 1] == b'_');
+        let after = b.get(i + name.len()).copied().unwrap_or(b' ');
+        let after_ok = !(after.is_ascii_alphanumeric() || after == b'_');
+        if before_ok && after_ok {
+            n += 1;
+        }
+    }
+    n
+}
+
+/// `x.clone()` → `x` when `x` is mentioned exactly twice in the whole
+/// program — at its binding and at this one use.
+///
+/// Two mentions means there is no second read to keep the clone for and
+/// no later use to invalidate the move, so the clone is pure allocation.
+/// Vetoed inside loop bodies (a move there would be observed on the next
+/// iteration) and for anything but a plain identifier.
+fn drop_single_use_clones(t: &str) -> String {
+    let b = t.as_bytes();
+    let loops = loop_body_ranges(t);
+    let mut edits: Vec<(usize, usize)> = Vec::new();
+    let mut from = 0usize;
+    while let Some(rel) = t[from..].find(".clone()") {
+        let at = from + rel;
+        from = at + ".clone()".len();
+        let mut ls = at;
+        while ls > 0 && (b[ls - 1].is_ascii_alphanumeric() || b[ls - 1] == b'_') {
+            ls -= 1;
+        }
+        if ls == at {
+            continue;
+        }
+        let name = &t[ls..at];
+        if name.as_bytes()[0].is_ascii_digit() {
+            continue;
+        }
+        if loops.iter().any(|&(s0, e0)| at > s0 && at < e0) {
+            continue;
+        }
+        // Count only inside the enclosing function: a same-named binding
+        // in a runtime helper (`for x in w` in `__sh_print_words`) says
+        // nothing about this one.
+        let (fs, fe) = enclosing_fn_range(t, at);
+        if count_ident(&t[fs..fe], name) != 2 {
+            continue;
+        }
+        edits.push((at, at + ".clone()".len()));
+    }
+    if edits.is_empty() {
+        return t.to_string();
+    }
+    let mut s = t.to_string();
+    for &(a, e) in edits.iter().rev() {
+        s.replace_range(a..e, "");
+    }
+    s
+}
+
+/// Is `name` ever mutated after its `let`? Conservative: any assignment,
+/// compound assignment, `&mut` borrow, index or known mutating method
+/// counts as mutation, so a false answer can only be a missed `mut`.
+fn ident_is_mutated(t: &str, name: &str) -> bool {
+    const METHODS: &[&str] = &[
+        "push(", "push_str(", "clear()", "extend(", "insert(", "remove(", "pop()", "truncate(",
+        "retain(", "reserve(", "append(", "set(", "borrow_mut()", "sort", "dedup", "drain(",
+        "swap(", "fill(", "write_all(", "split_off(", "splice(", "reverse()", "rotate_",
+        "replace_range(", "resize(",
+    ];
+    if t.contains(&format!("&mut {name}")) {
+        return true;
+    }
+    let b = t.as_bytes();
+    for (i, _) in t.match_indices(name) {
+        let before_ok = i == 0 || !(b[i - 1].is_ascii_alphanumeric() || b[i - 1] == b'_');
+        if !before_ok {
+            continue;
+        }
+        let after = &t[i + name.len()..];
+        if let Some(r) = after.strip_prefix(" =") {
+            if !r.starts_with("==") {
+                return true;
+            }
+        }
+        if after.starts_with(" +=")
+            || after.starts_with(" -=")
+            || after.starts_with(" *=")
+            || after.starts_with(" /=")
+            || after.starts_with(" %=")
+        {
+            return true;
+        }
+        if let Some(r) = after.strip_prefix('.') {
+            if METHODS.iter().any(|m| r.starts_with(m)) {
+                return true;
+            }
+        }
+        if after.starts_with('[') {
+            return true;
+        }
+    }
+    false
+}
+
+/// `let mut x` → `let x` for bindings that are never mutated. `mut` on an
+/// untouched binding is not just noise, it is a `rustc` warning, so
+/// generated code cannot be warning-clean while the renderer guesses
+/// `mut` for every imperative-looking binding.
+fn drop_redundant_mut(t: &str) -> String {
+    let b = t.as_bytes();
+    let mut edits: Vec<(usize, usize)> = Vec::new();
+    let mut from = 0usize;
+    while let Some(rel) = t[from..].find("let mut ") {
+        let at = from + rel;
+        from = at + "let mut ".len();
+        let ns = at + "let mut ".len();
+        let mut ne = ns;
+        while ne < b.len() && (b[ne].is_ascii_alphanumeric() || b[ne] == b'_') {
+            ne += 1;
+        }
+        if ne == ns {
+            continue;
+        }
+        let name = &t[ns..ne];
+        if ident_is_mutated(t, name) {
+            continue;
+        }
+        edits.push((at + "let ".len(), ns));
+    }
+    if edits.is_empty() {
+        return t.to_string();
+    }
+    let mut s = t.to_string();
+    for &(a, e) in edits.iter().rev() {
+        s.replace_range(a..e, "");
+    }
+    s
+}
+
+/// Drop `let name = <literal>;` bindings the rest of the program never
+/// mentions.
+///
+/// When the renderer folds a variable that only ever held a constant, the
+/// declaration can be left behind: dead weight, and an `unused_variables`
+/// warning. Only a literal right-hand side qualifies, so nothing with a
+/// call or a borrow (i.e. anything that could have an effect) is dropped.
+fn drop_dead_literal_lets(t: &str) -> String {
+    fn literal(rhs: &str) -> bool {
+        let r = rhs.trim().trim_end_matches(';').trim();
+        let r = r.strip_suffix(".to_string()").unwrap_or(r);
+        (r.len() > 1 && r.starts_with('"') && r.ends_with('"'))
+            || r == "true"
+            || r == "false"
+            || r.starts_with("vec![")
+            || (!r.is_empty() && r.chars().all(|c| c.is_ascii_digit() || c == '-' || c == '_'))
+    }
+    let mut out: Vec<&str> = Vec::new();
+    let mut changed = false;
+    for line in t.lines() {
+        let trimmed = line.trim_start();
+        let mut dead = false;
+        if let Some(rest) = trimmed.strip_prefix("let ") {
+            let rest = rest.strip_prefix("mut ").unwrap_or(rest);
+            let name: String = rest
+                .chars()
+                .take_while(|c| c.is_ascii_alphanumeric() || *c == '_')
+                .collect();
+            if !name.is_empty() && !name.as_bytes()[0].is_ascii_digit() {
+                if let Some(eq) = rest.find(" = ") {
+                    let rhs = rest[eq + 3..].trim_end();
+                    let between = rest[name.len()..eq].trim_start();
+                    let typed_ok = between.is_empty() || between.starts_with(':');
+                    if typed_ok && rhs.ends_with(';') && literal(rhs) && count_ident(t, &name) == 1 {
+                        dead = true;
+                    }
+                }
+            }
+        }
+        if dead {
+            changed = true;
+        } else {
+            out.push(line);
+        }
+    }
+    if !changed {
+        return t.to_string();
+    }
+    let mut s = out.join("\n");
+    if t.ends_with('\n') {
+        s.push('\n');
+    }
+    s
+}
+
+/// Does the native ERE matcher cover this pattern? The subset is the
+/// POSIX ERE core — literals, `.`, `[...]` with ranges/negation, `^`, `$`,
+/// `*`, `+`, `?`, `|`, `( )`, `\`-escapes. Anything else (interval
+/// expressions `{m,n}`, POSIX classes `[[:alpha:]]`, back-references,
+/// GNU `\b`/`\w`) keeps the `bash -c` path so semantics remain bash's.
+fn ere_supported(pat: &str) -> bool {
+    if pat.contains('{') || pat.contains('}') || pat.contains("[:") || pat.contains("(?") {
+        return false;
+    }
+    let b: Vec<char> = pat.chars().collect();
+    let mut i = 0;
+    while i < b.len() {
+        if b[i] == '\\' {
+            match b.get(i + 1) {
+                Some(c)
+                    if c.is_ascii_digit()
+                        || matches!(c, 'b' | 'B' | '<' | '>' | 'w' | 'W' | 's' | 'S') =>
+                {
+                    return false
+                }
+                Some(_) => {
+                    i += 2;
+                    continue;
+                }
+                None => return false,
+            }
+        }
+        i += 1;
+    }
+    true
+}
+
+/// The pattern text of a rendered static string argument
+/// (`"^[0-9]+$".to_string()` → `^[0-9]+$`), if it is one.
+fn rhs_lit_text(rendered: &str) -> Option<&str> {
+    let r = rendered.trim();
+    let body = r.strip_suffix(".to_string()")?;
+    if body.len() > 2 && body.starts_with('"') && body.ends_with('"') {
+        Some(&body[1..body.len() - 1])
+    } else {
+        None
+    }
+}
+
 pub fn shir_to_rust(prog: &IrProgram) -> String {
     let mut prog = prog.clone();
     prog.var_types = crate::shir::analyze_var_types(&prog);
@@ -2228,8 +2978,18 @@ pub fn shir_to_rust(prog: &IrProgram) -> String {
     // the sinks being dead — the redirect-aware `print_words` variant
     // is left untouched.
     let text = inline_simple_helpers(&text, r.runtime_free, &r.var_types);
+    // Shape pass: same semantics, written the way a Rust programmer writes
+    // it (`x += 1`, no dead `__SH_RET`, no single-use `.clone()`). After
+    // `inline_simple_helpers` (which creates the `println!` shapes it
+    // folds) and before the pruning passes (which then see the reduced set
+    // of references).
+    let text = idiom_peephole(&text);
     let text = prune_unused_helpers(text);
     let text = prune_unused_statics(text);
+    // Dead `let x = <literal>;` bindings are only recognisable once the
+    // runtime statics they shadow (`__SHV_x`, still referenced by a
+    // closure parameter until the prune above) are out of the text.
+    let text = drop_dead_literal_lets(&text);
     // `-Oz` golf: strip comments/whitespace and shorten every
     // renderer-owned identifier. Runs LAST (after all pruning passes,
     // so only live names enter the short pool).
@@ -11878,7 +12638,7 @@ const HELPER_ORDER: &[&str] = &[
     "q", "q_printf", "wq", "cat", "pow", "echo_esc", "printf_b", "atoi", "atou", "atof", "print_words", "print_words_noesc", "puts", "printf",
     "cap_bytes", "capture_rc", "spawn", "run", "readline", "read_fields", "split_ifs",
     "fnmatch", "globlike", "strippre", "stripsuf", "replace", "substr", "case", "len", "basename",
-    "dirname", "env", "arg", "glob", "brace", "sleep", "rand", "grepmatches", "regex",
+    "dirname", "env", "arg", "glob", "brace", "sleep", "rand", "grepmatches", "regex", "re_ere",
     "mtime", "samefile", "fmode", "fowner", "fgroup", "fnewer", "wait_all", "bg",
     "fexists", "fdir", "freg", "fsym", "fread", "fwrite", "fexec", "fsize", "aindex",
     "div", "mod", "capture", "run_traps", "lines",
@@ -12056,7 +12816,7 @@ fn helper_source(h: &str) -> &'static str {
     o
 }"#,
         "pow" => r#"fn __sh_pow(a: i64, b: i64) -> i64 {
-    let mut r = 1;
+    let mut r: i64 = 1;
     let mut i = 0;
     while i < b { r = r.wrapping_mul(a); i += 1; }
     r
@@ -12271,7 +13031,7 @@ fn helper_source(h: &str) -> &'static str {
                 let left = flags.contains('-');
                 let zero = flags.contains('0');
                 let p = prec.as_ref().map(|s| s.parse().unwrap_or(0)).unwrap_or(-1);
-                let mut piece = String::new();
+                let mut piece;
                 match conv {
                     's' => {
                         piece = arg.clone();
@@ -12839,6 +13599,163 @@ fn helper_source(h: &str) -> &'static str {
     let mut c = std::process::Command::new("bash");
     c.arg("-c").arg(cmd).arg("sh").arg(text).arg(pat);
     c.status().map(|s| s.success()).unwrap_or(false)
+}"#,
+        "re_ere" => r#"fn __sh_re_ere(text: &str, pat: &str, ci: bool) -> bool {
+    // Native ERE matcher for the subset `ere_supported` accepts: no child
+    // shell, no dependency (`regex` is not in the generated program's
+    // manifest, and this backend must not add one). Backtracking over a
+    // parsed tree; `?`/`*`/`+` are `Rep` with min/max, `|` is `Alt`.
+    #[allow(dead_code)]
+    enum N {
+        Chr(char),
+        Any,
+        Cls(bool, Vec<(char, char)>),
+        Bol,
+        Eol,
+        Rep(Box<N>, usize, usize),
+        Cat(Vec<N>),
+        Alt(Vec<N>),
+    }
+
+    fn cls(p: &[char], i: &mut usize) -> N {
+        let mut neg = false;
+        if *i < p.len() && p[*i] == '^' { neg = true; *i += 1; }
+        let mut rs: Vec<(char, char)> = Vec::new();
+        let mut first = true;
+        while *i < p.len() {
+            let c = p[*i];
+            if c == ']' && !first { *i += 1; break; }
+            first = false;
+            let lo = if c == '\\' && *i + 1 < p.len() { *i += 1; p[*i] } else { c };
+            *i += 1;
+            if *i + 1 < p.len() && p[*i] == '-' && p[*i + 1] != ']' {
+                *i += 1;
+                let hi = p[*i];
+                *i += 1;
+                rs.push((lo, hi));
+            } else {
+                rs.push((lo, lo));
+            }
+        }
+        N::Cls(neg, rs)
+    }
+
+    fn seq(p: &[char], i: &mut usize) -> N {
+        let mut v: Vec<N> = Vec::new();
+        while *i < p.len() {
+            let c = p[*i];
+            if c == ')' || c == '|' { break; }
+            *i += 1;
+            let atom = match c {
+                '(' => {
+                    let inner = alt(p, i);
+                    if *i < p.len() && p[*i] == ')' { *i += 1; }
+                    inner
+                }
+                '^' => N::Bol,
+                '$' => N::Eol,
+                '.' => N::Any,
+                '[' => cls(p, i),
+                '\\' => {
+                    let mut ch = '\\';
+                    if *i < p.len() { ch = p[*i]; *i += 1; }
+                    N::Chr(ch)
+                }
+                _ => N::Chr(c),
+            };
+            let mut node = atom;
+            while *i < p.len() {
+                match p[*i] {
+                    '*' => { *i += 1; node = N::Rep(Box::new(node), 0, usize::MAX); }
+                    '+' => { *i += 1; node = N::Rep(Box::new(node), 1, usize::MAX); }
+                    '?' => { *i += 1; node = N::Rep(Box::new(node), 0, 1); }
+                    _ => break,
+                }
+            }
+            v.push(node);
+        }
+        N::Cat(v)
+    }
+
+    fn alt(p: &[char], i: &mut usize) -> N {
+        let mut v = vec![seq(p, i)];
+        while *i < p.len() && p[*i] == '|' {
+            *i += 1;
+            v.push(seq(p, i));
+        }
+        if v.len() == 1 { v.pop().unwrap_or(N::Cat(Vec::new())) } else { N::Alt(v) }
+    }
+
+    fn cat(v: &[N], t: &[char], i: usize, k: &mut dyn FnMut(usize) -> bool) -> bool {
+        if v.is_empty() { return k(i); }
+        let (head, rest) = v.split_first().unwrap();
+        m(head, t, i, &mut |j| cat(rest, t, j, &mut *k))
+    }
+
+    fn m(n: &N, t: &[char], i: usize, k: &mut dyn FnMut(usize) -> bool) -> bool {
+        match n {
+            N::Chr(c) => i < t.len() && t[i] == *c && k(i + 1),
+            N::Any => i < t.len() && k(i + 1),
+            N::Bol => i == 0 && k(i),
+            N::Eol => i == t.len() && k(i),
+            N::Cls(neg, rs) => {
+                if i >= t.len() { return false; }
+                let c = t[i];
+                let mut hit = false;
+                for (lo, hi) in rs {
+                    if c >= *lo && c <= *hi { hit = true; }
+                }
+                (hit != *neg) && k(i + 1)
+            }
+            N::Cat(v) => cat(v, t, i, k),
+            N::Alt(v) => {
+                for a in v {
+                    if m(a, t, i, &mut *k) { return true; }
+                }
+                false
+            }
+            N::Rep(inner, min, max) => {
+                let mut pos = vec![i];
+                let mut cur = i;
+                while pos.len() - 1 < *max {
+                    let mut next: Option<usize> = None;
+                    m(inner, t, cur, &mut |j| {
+                        if j > cur && next.is_none() { next = Some(j); }
+                        false
+                    });
+                    match next {
+                        Some(j) => { pos.push(j); cur = j; }
+                        None => break,
+                    }
+                }
+                let mut at = pos.len() - 1;
+                loop {
+                    if at < *min { return false; }
+                    if k(pos[at]) { return true; }
+                    if at == 0 { return false; }
+                    at -= 1;
+                }
+            }
+        }
+    }
+
+    let p: Vec<char> = if ci {
+        pat.chars().flat_map(|c| c.to_lowercase()).collect()
+    } else {
+        pat.chars().collect()
+    };
+    let t: Vec<char> = if ci {
+        text.chars().flat_map(|c| c.to_lowercase()).collect()
+    } else {
+        text.chars().collect()
+    };
+    let mut i = 0usize;
+    let re = alt(&p, &mut i);
+    // bash's `=~` is an unanchored search: try every start position.
+    for s in 0..=t.len() {
+        if m(&re, &t, s, &mut |_| true) { return true; }
+    }
+    false
 }"#,
         "wait_all" => r#"fn __sh_wait_all() {
     let hs = std::mem::take(&mut *__SH_BG.lock().unwrap());
@@ -14050,8 +14967,21 @@ impl<'a, 'r> TestParser<'a, 'r> {
                 }
             }
             "=~" => {
-                self.render.add_helper("regex");
-                format!("__sh_regex(&{lhs}, &{rhs}, \"\")")
+                // A static pattern that the native matcher covers needs no
+                // child shell: emit `__sh_re_ere` (std-only ERE subset)
+                // instead of `bash -c '[[ $1 =~ $2 ]]'`. Anything outside
+                // the subset keeps the shell path, so semantics stay bash's.
+                let native = match rhs_lit_text(&rhs) {
+                    Some(lit) => ere_supported(lit),
+                    None => false,
+                };
+                if native {
+                    self.render.add_helper("re_ere");
+                    format!("__sh_re_ere(&{lhs}, &{rhs}, false)")
+                } else {
+                    self.render.add_helper("regex");
+                    format!("__sh_regex(&{lhs}, &{rhs}, \"\")")
+                }
             }
             "-nt" | "-ot" => {
                 self.render.add_helper("mtime");
@@ -19053,9 +19983,14 @@ mod tests {
         let out = render("f() { echo \"a\"; echo \"b\"; }\nf\n");
         assert!(!out.contains("__SH_RET"), "value home kept:\n{out}");
         assert!(!out.contains("-> String"), "value return kept:\n{out}");
-        // …the value-consumed shape keeps it
+        // …and a caller that consumes the value binds the function's
+        // return directly (`let x = f();`), so no register is needed there
+        // either. The register is only the shared home for callers the
+        // renderer cannot resolve to a binding.
         let used = render("f() { echo a; }\nx=$(f)\necho \"$x\"\n");
-        assert!(used.contains("__SH_RET"), "value home dropped:\n{used}");
+        assert!(used.contains("let x = f();"), "{used}");
+        assert!(used.contains("-> String"), "value return dropped:\n{used}");
+        assert!(!used.contains("__SH_RET"), "unneeded value home:\n{used}");
     }
 
     #[test]
@@ -19190,7 +20125,7 @@ mod tests {
             super::cat_peephole("__sh_cat(&[vec![format!(\"[{}]\", x)]])"),
             "vec![format!(\"[{}]\", x)]"
         );
-        // untouched: variables, calls, multi-part
+        // untouched: variables, calls
         assert_eq!(super::cat_peephole("__sh_cat(&__b)"), "__sh_cat(&__b)");
         assert_eq!(
             super::cat_peephole("__sh_cat(&[__sh_glob(p)])"),
@@ -19198,7 +20133,13 @@ mod tests {
         );
         assert_eq!(
             super::cat_peephole("__sh_cat(&[vec![a], vec![b]])"),
-            "__sh_cat(&[vec![a], vec![b]])"
+            "vec![a, b]"
+        );
+        // ...but a part that is not a `vec![..]` may be used later, so the
+        // call has to stay
+        assert_eq!(
+            super::cat_peephole("__sh_cat(&[vec![a], __b])"),
+            "__sh_cat(&[vec![a], __b])"
         );
         // UTF-8 passes through unsplit
         assert_eq!(super::cat_peephole("x = \"caf\u{e9}\";"), "x = \"caf\u{e9}\";");
@@ -19227,7 +20168,10 @@ mod tests {
         // x is numerically typed here (assigned 5), so `{}` takes it
         // directly rather than through a .to_string() copy
         assert!(out.contains("println!(\"{}\", x)"), "{out}");
-        assert!(out.contains("format!(\"x is {}\", "), "{out}");
+        // `echo "x is $x"` prints the interpolation directly: no
+        // `println!("{}", format!(..))` wrapper around it
+        assert!(out.contains("println!(\"x is {}\", x)"), "{out}");
+        assert!(!out.contains("format!(\"x is {}\""), "{out}");
     }
 
     #[test]

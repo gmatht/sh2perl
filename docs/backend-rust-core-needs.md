@@ -74,12 +74,26 @@ NUL rule applies). The contract's marker format is directly consumable.
 
 ### 5.2 Arithmetic
 Rust `/` and `%` truncate toward zero + sign-follow-dividend ✓ — matches
-bash exactly. Overflow: Rust's *debug builds panic* on overflow — the
-renderer MUST use `wrapping_add`/`wrapping_sub`/etc. (or `+%`-style
-ops) to match bash's silent 64-bit wrap — the arith contract (A5a) must
-pin this (Rust-specific: the wrapping ops are a *requirement*, not an
-option — a plain `+` in debug tests would panic). Right-assoc `**` →
-`i64::pow` (overflow → wrapping semantics per the contract). NaN guard →
+bash exactly. Overflow: Rust's *release* builds wrap two's-complement on
+overflow — exactly bash's 64-bit wrap — while *debug* builds panic.
+The renderer therefore emits plain `+ - * /` for source arithmetic (what
+a Rust programmer writes) and reserves `wrapping_*` for arithmetic it
+emits as an explicit loop, where the wrap is the loop's semantics rather
+than an accident: `__sh_pow` uses `wrapping_mul` for that reason.
+Consequence worth stating plainly: generated programs are expected to be
+built in release mode (as the `-O` pipeline does); a generated program
+compiled with `-C debug-assertions=on` will panic on an overflow that
+bash would have wrapped. `wrapping_*` on every expression was the
+earlier rule here; it was dropped because it is both unreadable and not
+what `rustc` needs in the shipped artifact. An overflow that no size
+analysis can bound is instead handled where it is *observable* — a
+constant-folded arithmetic expression that cannot fit an `i64` is
+rendered through `num_bigint`, producing the exact mathematical value
+(`9223372036854775807 + 1` → `9223372036854775808`) where bash would
+print the wrapped `-9223372036854775808`. That is a known, deliberate
+divergence for constants that overflow at render time; it is the one
+shape in `fixtures/rust_idiom/` whose output is not bash-identical.
+Right-assoc `**` → `__sh_pow` (wrapping semantics). NaN guard →
 `str::parse::<i64>()` error → the whole test is false ✓.
 
 ### 5.3 Hygiene + hoisting
@@ -117,7 +131,7 @@ already uses these names in `sh2_call`).
 | `builtin` | a table of ~30 functions |
 | `getVar`/`setVar`/`setArray`/... | a `HashMap` store behind a `RefCell`/`Mutex` (single-threaded: `RefCell` — same as sh2runtime's map) |
 | `param`/`caseMatch`/`test` | `regex`/`globset` crates + a test parser |
-| `arith`/`arithEval`/`idiv`/`imod` | `i64` + `wrapping_*` |
+| `arith`/`arithEval`/`idiv`/`imod` | `i64` with plain ops (`wrapping_*` only in the emitted `__sh_pow` loop — see §5.2) |
 | `bc*` | the SHARED wasm module (a Rust runtime loads `bcwasm.wasm` via `wasmtime`/`wasmer` — or compiles the same `number.rs` in — it's the same crate!) |
 | `fs.*` | `std::fs` |
 | `positional`/`lastExit`/`functions.set`/`shoptState.set` | module-level statics |
@@ -125,9 +139,12 @@ already uses these names in `sh2_call`).
 ## 8. Ask list
 
 A1–A7 (shared) + Rust-specific:
-- **R1**: the arith contract must make the **wrapping ops mandatory**
-  (Rust debug panics on overflow — a plain `+` is a latent test
-  failure).
+- **R1**: the arith contract must say *which* overflow semantics the
+  target owes. For Rust the answer is the native one: release builds wrap
+  exactly as bash does (§5.2), so the emitted code uses plain operators;
+  `wrapping_*` is applied only where the renderer itself writes the loop
+  (`__sh_pow`). Generated programs are release-mode artifacts; a debug
+  build of one may panic where bash wraps.
 - **R2**: A6's hygiene list includes Rust's keywords; the raw-identifier
   escape (`r#name`) is the preferred fix.
 - **R3**: the A1 serializer (`shir_to_shir_json`) is *the* Rust
@@ -140,7 +157,10 @@ A1–A7 (shared) + Rust-specific:
   wasm-native, the same language as the core.
 - Hard: the borrow checker's lifetime discipline for the store (a
   `RefCell`-wrapped map with careful borrow scopes); compile times;
-  the wrapping-op discipline (§5.2).
+  keeping emitted *shape* idiomatic (dead `__SH_RET` stores, single-use
+  `.clone()`, `println!("{}", format!(..))`) — the `idiom_peephole` pass
+  plus the checked-in fixtures in `fixtures/rust_idiom/` are the guard
+  against that regressing.
 - The wasm angle: a Rust backend's runtime can compile to
   `wasm32-unknown-unknown` and *be* a module in the shared registry —
   the strongest wasm story of the static backends.
