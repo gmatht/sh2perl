@@ -147,12 +147,28 @@ the emitted text. What stays stored is documented in
 
 ### 5.2c Post-render specialization and the emitted-code contract
 
-- A `printf` whose format is a literal template of text, `%s` and `%%` is
-  turned into a `format!` at the call site, which retires the `__sh_printf`
-  interpreter (and its `atoi`/`atof`/`printf_b` cluster) from programs that
-  only ever format literals: `07_redirect.rs` went from 261 emitted lines to
-  44. Computed formats and the conversions the pass does not model (`%d`,
-  widths, `%b`, `%q`, `%c`) keep the interpreter.
+- A `printf` whose format is a literal is CLASSIFIED at render time
+  (`classify_printf_format`) and only decomposed when the whole call is
+  provably equivalent to the interpreter: literal text (with `{`/`}`
+  doubled — a brace is not a format specifier), `%%`, and `%s` consuming one
+  argument. Everything else returns a reason and keeps `__sh_printf`:
+  `%d`/`%i`/`%u`/`%o`/`%x`/`%c`/`%q` (argument conversion), `%b` (escapes
+  come from the argument at run time), flags/width/precision/`*`, `\c`,
+  a no-slot format with arguments (bash re-applies the format per argument
+  group), an `%s` with no argument or the wrong count (the interpreter pads
+  or repeats), and any non-literal format. The fallback stays complete:
+  `20_printf_dynamic.sh` builds its format at run time and keeps both the
+  interpreter and its call. Census over the fixtures: 5 specialized sites /
+  1 interpreted call / 115 interpreter lines (all 115 in the dynamic
+  fixture; the 18 pre-existing fixtures carried 0 interpreted calls and the
+  count was previously unmeasured). Two real bugs fell out of making the
+  rule explicit: a no-slot literal format with an empty argument list used
+  to fall back (`printf '100%%'` shipped the interpreter), and a literal
+  brace in a format produced an invalid `format!` string.
+- No `echo -e` in a program means the `esc` parameter is not emitted at all:
+  the two-argument `print_words_noesc` helper is chosen and `drop_esc_arg`
+  removes the literal `false` argument from every call site (07 used to pass
+  `, true, false` to a helper that did `let _ = esc;`).
 - Generated code carries no bare `.unwrap()` and no blanket `#[allow(...)]`
   for the codegen-noise lints (`dead_code`, `non_upper_case_globals`,
   `unused_variables`/`_parameters`/`_imports`, `unused_mut`, needless

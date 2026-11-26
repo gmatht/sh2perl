@@ -48,6 +48,17 @@ use std::process::Command;
 // ── render paths ─────────────────────────────────────────────────────────
 
 /// Render a shell source exactly as the fixture pipeline does.
+/// Lines an emitted `fn __sh_<name>(` body occupies (0 when absent): the
+/// interpreter's cost is what the specialization is supposed to remove.
+fn helper_body_lines(code: &str, name: &str) -> usize {
+    let needle = format!("\nfn __sh_{name}(");
+    let Some(p) = code.find(&needle) else {
+        return 0;
+    };
+    let body = &code[p + 1..];
+    body.lines().take_while(|l| *l != "}").count() + 1
+}
+
 fn prepare(src: &str) -> debashl::ir::IrProgram {
     let cmds =
         debashl::parser::commands::parse_commands_from_text(src).expect("fixture failed to parse");
@@ -56,10 +67,6 @@ fn prepare(src: &str) -> debashl::ir::IrProgram {
     debashl::shir_passes::restructure_goto_only(&mut prog);
     debashl::shir_passes::strip_cfor(&mut prog);
     prog
-}
-
-fn render(src: &str) -> String {
-    debashl::rust_backend::shir_to_rust(&prepare(src))
 }
 
 /// Render through the A1-JSON ingress `shir_render --target rust` uses: IR →
@@ -93,6 +100,12 @@ struct Census {
     promoted: usize,
     /// vars still declared as a `thread_local!` static
     stored: usize,
+    /// printf call sites the renderer decomposed at render time
+    printf_specialized: usize,
+    /// printf call sites left on the `__sh_printf` interpreter
+    printf_interpreted: usize,
+    /// lines the emitted `__sh_printf` interpreter body costs (0 = absent)
+    printf_lines: usize,
     allows: usize,
     /// `.unwrap()` / `.expect(` / `panic!` / `unreachable!` left in the
     /// emitted text. A generated program must never abort: every helper is
@@ -114,6 +127,9 @@ impl Census {
             to_strings: count(".to_string()"),
             promoted: 0,
             stored: 0,
+            printf_specialized: 0,
+            printf_interpreted: 0,
+            printf_lines: 0,
             allows: count("#[allow("),
             panics: count(".unwrap()") + count(".expect(") + count("panic!(") + count("unreachable!("),
             bash_spawns: count("Command::new(\"bash\")"),
@@ -129,6 +145,9 @@ impl Census {
         self.to_strings += o.to_strings;
         self.promoted += o.promoted;
         self.stored += o.stored;
+        self.printf_specialized += o.printf_specialized;
+        self.printf_interpreted += o.printf_interpreted;
+        self.printf_lines += o.printf_lines;
         self.allows += o.allows;
         self.panics += o.panics;
         self.bash_spawns += o.bash_spawns;
@@ -344,9 +363,9 @@ fn main() {
         }
     }
     println!(
-        "{:<20} {:>5} {:>5} {:>5} {:>5} {:>5} {:>5} {:>5} {:>5} {:>5} {:>7}",
-        "fixture", "lines", "let", "store", "clone", "to_str", "allow", "abort", "bash",
-        "help", "status"
+        "{:<20} {:>5} {:>5} {:>5} {:>4} {:>4} {:>4} {:>5} {:>5} {:>5} {:>5} {:>5} {:>5} {:>7}",
+        "fixture", "lines", "let", "store", "pfx", "pfi", "pfl", "clone", "to_str", "allow",
+        "abort", "bash", "help", "status"
     );
 
     let mut failures = 0usize;
@@ -354,9 +373,13 @@ fn main() {
     for f in &files {
         let name = f.file_stem().unwrap().to_string_lossy().to_string();
         let src = std::fs::read_to_string(f).expect("read fixture");
-        let code = render(&src);
+        let emit = debashl::rust_backend::shir_to_rust_with_census(&prepare(&src));
+        let code = emit.code.clone();
         let out = out_dir.join(format!("{name}.rs"));
         let mut c = Census::of(&code);
+        c.printf_specialized = emit.printf_specialized;
+        c.printf_interpreted = emit.printf_interpreted;
+        c.printf_lines = helper_body_lines(&code, "printf");
         // The promoted-vs-stored split, from the SAME verdict the renderer
         // uses, plus a proof per promoted name that a bare `let` binding
         // carrying it is really in the emitted text.
@@ -521,15 +544,16 @@ fn main() {
             }
         }
         println!(
-            "{name:<20} {:>5} {:>5} {:>5} {:>5} {:>5} {:>5} {:>5} {:>5} {:>5}  {status}",
-            c.lines, c.promoted, c.stored, c.clones, c.to_strings, c.allows, c.panics,
-            c.bash_spawns, c.helpers
+            "{name:<20} {:>5} {:>5} {:>5} {:>4} {:>4} {:>4} {:>5} {:>5} {:>5} {:>5} {:>5} {:>5}  {status}",
+            c.lines, c.promoted, c.stored, c.printf_specialized, c.printf_interpreted,
+            c.printf_lines, c.clones, c.to_strings, c.allows, c.panics, c.bash_spawns, c.helpers
         );
     }
 
     println!(
-        "\n{:<20} {:>5} {:>5} {:>5} {:>5} {:>5} {:>5} {:>5} {:>5} {:>5}",
-        "TOTAL", total.lines, total.promoted, total.stored, total.clones, total.to_strings,
+        "\n{:<20} {:>5} {:>5} {:>5} {:>4} {:>4} {:>4} {:>5} {:>5} {:>5} {:>5} {:>5} {:>5}",
+        "TOTAL", total.lines, total.promoted, total.stored, total.printf_specialized,
+        total.printf_interpreted, total.printf_lines, total.clones, total.to_strings,
         total.allows, total.panics, total.bash_spawns, total.helpers
     );
     if let Some(e) = &clippy_err {

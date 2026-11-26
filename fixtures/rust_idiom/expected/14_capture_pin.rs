@@ -11,10 +11,9 @@ static __SH_ARITH_WORD_FAIL: std::sync::atomic::AtomicBool = std::sync::atomic::
 
 thread_local! { static __SHV_N: std::cell::Cell<i64> = const { std::cell::Cell::new(0) }; }
 
-fn __sh_print_words(ws: &[Vec<Word>], nl: bool, esc: bool) {
-    // no echo in this program used -e, so `esc` is always false — the
-    // unescape arm (and its __sh_echo_esc dependency) is compiled out.
-    let _ = esc;
+fn __sh_print_words(ws: &[Vec<Word>], nl: bool) {
+    // no echo in this program used -e: there is no unescape arm and no
+    // `__sh_echo_esc` dependency, and no argument to pass for one.
     // a word's `$((…))` arith expansion FAILED (an empty positional
     // makes the expanded text a syntax error) — bash suppresses the
     // WHOLE simple command, not just the word
@@ -47,7 +46,7 @@ fn main() {
     *__SH_OUT.lock().unwrap_or_else(|e| e.into_inner()) = Some(Vec::new());
     let __cap_oldin = __SH_STDIN.lock().unwrap_or_else(|e| e.into_inner()).take();
     __SHV_N.with(|v| v.set(__SHV_N.with(|v| v.get()) + 1));
-    __sh_print_words(&[vec![__SHV_N.with(|v| v.get()).to_string().into()]], true, false);
+    __sh_print_words(&[vec![__SHV_N.with(|v| v.get()).to_string().into()]], true);
     __SH_RC.store(0, Ordering::SeqCst);
     *__SH_STDIN.lock().unwrap_or_else(|e| e.into_inner()) = __cap_oldin;
     let __cap = __SH_OUT.lock().unwrap_or_else(|e| e.into_inner()).take().unwrap_or_default();
@@ -57,5 +56,5 @@ fn main() {
     while __s.ends_with('\n') { __s.pop(); }
     __s
 };
-    __sh_print_words(&[vec![format!("{} {}", out, "0").into()]], true, false);
+    __sh_print_words(&[vec![format!("{} {}", out, "0").into()]], true);
 }

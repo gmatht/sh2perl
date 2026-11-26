@@ -362,6 +362,9 @@ pub struct Render {
     /// some echo used `-e`, so `__sh_print_words` must keep its `esc`
     /// branch (and its `__sh_echo_esc` dependency). Set by `echo_parts`.
     print_words_esc: bool,
+    /// `print_words_noesc` was chosen, so the always-`false` `esc` argument
+    /// is dropped from every call site (`drop_esc_arg`).
+    esc_args_dropped: bool,
     /// the shared `RuntimeFootprint` verdict: this program uses no
     /// redirect/capture/pipeline construct, so prints can go straight to
     /// `print!` (set once before rendering).
@@ -2430,6 +2433,71 @@ fn printf_unescape(fmt: &str) -> Option<String> {
     Some(out)
 }
 
+/// Why a printf call site still needs the interpreter.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum PrintfFallback {
+    /// not a Rust string literal — the format is built at run time
+    NotLiteral,
+    /// a conversion or flag the specializer does not model exactly
+    /// (`%d`, `%i`, `%u`, `%c`, `%q`, widths, precision, `*`)
+    Unsupported,
+    /// `%b` re-expands backslash escapes from the ARGUMENT at run time
+    BackslashB,
+    /// `\\c` terminates the output and drops everything after it
+    StopOutput,
+    /// the number of arguments does not match the number of `%s` slots
+    Arity,
+}
+
+/// The decompose-at-render-time plan for one literal printf format.
+#[derive(Debug, PartialEq, Eq)]
+struct PrintfPlan {
+    /// the `format!` template (`{`/`}` doubled, `%s` → `{}`)
+    fmt_src: String,
+    /// the exact output when the format takes no arguments
+    text: String,
+    /// how many arguments the format consumes (`%s` slots)
+    args: usize,
+}
+
+/// DECIDE, don't spot-fix: what a literal printf format decomposes into,
+/// or why it cannot. Only what is provably identical to the interpreter is
+/// accepted — the literal text, `%%` and `%s` (bash pads, truncates and
+/// quotes neither), with `%s` → `{}` and the format's own backslash and
+/// brace handling done here. Everything else returns a reason and the call
+/// site keeps `__sh_printf`.
+fn classify_printf_format(fmt: &str) -> Result<PrintfPlan, PrintfFallback> {
+    let mut fmt_src = String::new();
+    let mut text = String::new();
+    let mut args = 0usize;
+    let mut it = fmt.chars().peekable();
+    while let Some(c) = it.next() {
+        if c != '%' {
+            text.push(c);
+            match c {
+                // a literal brace is not a format specifier: double it
+                '{' => fmt_src.push_str("{{"),
+                '}' => fmt_src.push_str("}}"),
+                _ => fmt_src.push(c),
+            }
+            continue;
+        }
+        match it.next().ok_or(PrintfFallback::Unsupported)? {
+            '%' => {
+                text.push('%');
+                fmt_src.push('%');
+            }
+            's' => {
+                args += 1;
+                fmt_src.push_str("{}");
+            }
+            'b' => return Err(PrintfFallback::BackslashB),
+            _ => return Err(PrintfFallback::Unsupported),
+        }
+    }
+    Ok(PrintfPlan { fmt_src, text, args })
+}
+
 /// Constant-argument specialization: `__sh_printf("<literal fmt>", &[…])`
 /// whose format needs nothing but text, `%s` and `%%` becomes a `format!`
 /// at the call site.
@@ -2440,9 +2508,11 @@ fn printf_unescape(fmt: &str) -> Option<String> {
 /// with its `atoi`/`atou`/`atof`/`printf_b`/`q_printf` dependencies. The
 /// interpreter stays for computed formats and for the conversions this does
 /// not model (`%d`, widths, `%b`, `%q`, `%c`).
-fn specialize_literal_printf(t: &str) -> String {
+/// Returns the rewritten text and how many call sites it specialized.
+fn specialize_literal_printf(t: &str) -> (String, usize) {
     let mut out = String::new();
     let mut i = 0usize;
+    let mut specialized = 0usize;
     const NEEDLE: &str = "__sh_printf(";
     while let Some(p) = t[i..].find(NEEDLE) {
         let at = i + p;
@@ -2452,13 +2522,16 @@ fn specialize_literal_printf(t: &str) -> String {
         };
         out.push_str(&t[i..at]);
         match literal_printf_replacement(&t[open + 1..close]) {
-            Some(repl) => out.push_str(&repl),
+            Some(repl) => {
+                specialized += 1;
+                out.push_str(&repl);
+            }
             None => out.push_str(&t[at..=close]),
         }
         i = close + 1;
     }
     out.push_str(&t[i..]);
-    out
+    (out, specialized)
 }
 
 /// `"fmt", &args` → the `format!` that computes the same string, when the
@@ -2470,30 +2543,28 @@ fn literal_printf_replacement(inner: &str) -> Option<String> {
     }
     let fmt_lit = &inner[ranges[0].0..ranges[0].1];
     let fmt = printf_unescape(&parse_rust_str_lit(fmt_lit)?)?;
-    // walk the format: text, `%%`, `%s` only
-    let mut chunks: Vec<String> = vec![String::new()];
-    let mut ns = 0usize;
-    let mut it = fmt.chars().peekable();
-    while let Some(c) = it.next() {
-        if c != '%' {
-            chunks.last_mut()?.push(c);
-            continue;
-        }
-        match it.next()? {
-            '%' => chunks.last_mut()?.push('%'),
-            's' => {
-                ns += 1;
-                chunks.push(String::new());
-            }
-            // any flag/width/conversion this pass does not model
-            _ => return None,
-        }
+    // The classification IS the rule: text, `%%` and `%s` decompose
+    // exactly; anything else keeps the interpreter.
+    let plan = classify_printf_format(&fmt).ok()?;
+    // A format with no `%s` slot prints its literal text once — but bash
+    // RE-APPLIES the format for each argument group, so a call that passes
+    // arguments is not a single string (`&[]` is an empty list, not an
+    // argument).
+    if plan.args == 0 {
+        let no_args = ranges.len() == 1
+            || matches!(
+                inner[ranges[1].0..ranges[1].1].trim(),
+                "&[]" | "[]" | "&vec![]" | "vec![]"
+            );
+        return if no_args {
+            Some(format!("{}.to_string()", rust_str_lit(&plan.text)))
+        } else {
+            None
+        };
     }
+    // `%s` with no argument: the interpreter pads with empties
     if ranges.len() == 1 {
-        if ns != 0 {
-            return None;
-        }
-        return Some(format!("{}.to_string()", rust_str_lit(&chunks.concat())));
+        return None;
     }
     let args_src = inner[ranges[1].0..ranges[1].1].trim();
     let args = args_src
@@ -2504,18 +2575,11 @@ fn literal_printf_replacement(inner: &str) -> Option<String> {
         return None;
     }
     let arg_ranges = top_comma_ranges(args);
-    if arg_ranges.len() != ns {
+    if arg_ranges.len() != plan.args {
         return None;
     }
-    // "<chunk0>{}<chunk1>{}…", a, b
-    let mut fmt_src = String::new();
-    for (i, c) in chunks.iter().enumerate() {
-        if i > 0 {
-            fmt_src.push_str("{}");
-        }
-        fmt_src.push_str(c);
-    }
-    let mut out = format!("format!({}", rust_str_lit(&fmt_src));
+    // the format template is the classified one (braces doubled, `%s` → `{}`)
+    let mut out = format!("format!({}", rust_str_lit(&plan.fmt_src));
     for r in &arg_ranges {
         out.push_str(", ");
         out.push_str(strip_word_coercion(args[r.0..r.1].trim()));
@@ -2534,6 +2598,37 @@ fn unwrap_policy(t: &str) -> String {
     s = s.replace(".take().unwrap()", ".take().unwrap_or_default()");
     s = s.replace(".to_digit(16).unwrap()", ".to_digit(16).unwrap_or(0)");
     s
+}
+
+/// Drop the literal `false` `esc` argument from `__sh_print_words` calls.
+///
+/// Only used when the program contains no `echo -e`, i.e. when the renderer
+/// chose the two-argument `print_words_noesc` helper — a function that would
+/// otherwise carry a parameter it ignores on every call.
+fn drop_esc_arg(t: &str) -> String {
+    let mut out = String::new();
+    let mut i = 0usize;
+    const NEEDLE: &str = "__sh_print_words(";
+    while let Some(p) = t[i..].find(NEEDLE) {
+        let at = i + p;
+        let open = at + NEEDLE.len() - 1;
+        let Some(close) = scan_matching(t, open) else {
+            break;
+        };
+        out.push_str(&t[i..at]);
+        let inner = &t[open + 1..close];
+        match inner.trim_end().strip_suffix(", false") {
+            Some(short) => {
+                out.push_str(NEEDLE);
+                out.push_str(short);
+                out.push(')');
+            }
+            None => out.push_str(&t[at..=close]),
+        }
+        i = close + 1;
+    }
+    out.push_str(&t[i..]);
+    out
 }
 
 fn idiom_peephole(text: &str) -> String {
@@ -3265,7 +3360,22 @@ pub fn promoted_names(prog: &IrProgram) -> Vec<String> {
     promoted
 }
 
+/// A rendered program plus the printf census the fixture harness reports:
+/// call sites the literal-format specialization decomposed at render time,
+/// and call sites left on the `__sh_printf` interpreter (the count of
+/// surviving calls, so the interpreter cannot be dropped silently while a
+/// site still needs it).
+pub struct RustEmit {
+    pub code: String,
+    pub printf_specialized: usize,
+    pub printf_interpreted: usize,
+}
+
 pub fn shir_to_rust(prog: &IrProgram) -> String {
+    shir_to_rust_with_census(prog).code
+}
+
+pub fn shir_to_rust_with_census(prog: &IrProgram) -> RustEmit {
     let mut prog = prog.clone();
     prog.var_types = crate::shir::analyze_var_types(&prog);
     let mut r = Render::default();
@@ -3467,7 +3577,7 @@ pub fn shir_to_rust(prog: &IrProgram) -> String {
     // a literal template of text/`%s`/`%%` becomes a `format!` here, which
     // lets the whole interpreter (and its `atoi`/`atof`/`printf_b` cluster)
     // fall out of the program in `prune_unused_helpers` below.
-    let text = specialize_literal_printf(&text);
+    let (text, printf_specialized) = specialize_literal_printf(&text);
     // (`unwrap_policy` runs at the END: `inline_simple_helpers` matches the
     // sink-check text `__SH_OUT.lock().unwrap()` exactly, and rewriting it
     // early made a capture look sink-dead — which turned a captured echo
@@ -3484,6 +3594,17 @@ pub fn shir_to_rust(prog: &IrProgram) -> String {
     // folds) and before the pruning passes (which then see the reduced set
     // of references).
     let text = idiom_peephole(&text);
+    // No `echo -e` anywhere: every surviving `__sh_print_words(…, false)`
+    // call passes the literal `false` for `esc`, so the argument goes and
+    // the two-argument `print_words_noesc` helper is the one emitted. Runs
+    // after every fold that matches the 3-argument shape (`inline_print_words`,
+    // `inline_simple_helpers`) and before the helper prune, which then sees
+    // the two-argument calls.
+    let text = if r.esc_args_dropped {
+        drop_esc_arg(&text)
+    } else {
+        text
+    };
     let text = prune_unused_helpers(text);
     let text = prune_unused_statics(text);
     // The statics/helpers above may have been the only `Ordering` users; an
@@ -3532,7 +3653,12 @@ pub fn shir_to_rust(prog: &IrProgram) -> String {
             );
         }
     }
-    text
+    let defined = if text.contains("\nfn __sh_printf(") { 1 } else { 0 };
+    RustEmit {
+        printf_interpreted: text.matches("__sh_printf(").count().saturating_sub(defined),
+        printf_specialized,
+        code: text,
+    }
 }
 
 impl Render {
@@ -13108,6 +13234,7 @@ impl Render {
             // skip the `print_words` entry (so the 19-line unescaper is
             // not dragged in).
             if *h == "print_words" && self.helpers.contains("print_words") && !self.print_words_esc {
+                self.esc_args_dropped = true;
                 let src = helper_source("print_words_noesc");
                 self.emit(src);
                 self.emit("");
@@ -13543,10 +13670,9 @@ fn helper_source(h: &str) -> &'static str {
         // used `-e`, so the 19-line `__sh_echo_esc` need not be dragged
         // in. `esc` stays a parameter (call sites pass `false`) so the
         // two variants are drop-in interchangeable.
-        "print_words_noesc" => r#"fn __sh_print_words(ws: &[Vec<Word>], nl: bool, esc: bool) {
-    // no echo in this program used -e, so `esc` is always false — the
-    // unescape arm (and its __sh_echo_esc dependency) is compiled out.
-    let _ = esc;
+        "print_words_noesc" => r#"fn __sh_print_words(ws: &[Vec<Word>], nl: bool) {
+    // no echo in this program used -e: there is no unescape arm and no
+    // `__sh_echo_esc` dependency, and no argument to pass for one.
     // a word's `$((…))` arith expansion FAILED (an empty positional
     // makes the expanded text a syntax error) — bash suppresses the
     // WHOLE simple command, not just the word
@@ -19916,6 +20042,54 @@ mod tests {
     }
 
     #[test]
+    fn printf_literal_specialization_is_conservative() {
+        // text / `%%` / `%s` decompose exactly
+        assert_eq!(
+            literal_printf_replacement("\"name=%s\", &[vec![\"a\".into()]]").as_deref(),
+            Some("format!(\"name={}\", vec![\"a\".into()])")
+        );
+        // a literal brace is not a format specifier
+        assert_eq!(
+            literal_printf_replacement("\"a{b}\", &[]").as_deref(),
+            Some("\"a{b}\".to_string()")
+        );
+        // `%%` is one literal percent, and no-slot text with no args is a
+        // single string
+        assert_eq!(
+            literal_printf_replacement("\"100%%\", &[]").as_deref(),
+            Some("\"100%\".to_string()")
+        );
+        // everything else keeps the interpreter
+        assert_eq!(literal_printf_replacement("\"%d\", &[vec![\"1\".into()]]"), None);
+        assert_eq!(literal_printf_replacement("\"%b\", &[vec![\"x\".into()]]"), None);
+        assert_eq!(literal_printf_replacement("\"%5s\", &[vec![\"x\".into()]]"), None);
+        // `%s` with no argument, or with the wrong number of arguments
+        assert_eq!(literal_printf_replacement("\"%s\", &[]"), None);
+        assert_eq!(
+            literal_printf_replacement("\"%s\", &[vec![\"a\".into()], vec![\"b\".into()]]"),
+            None
+        );
+        // a no-slot format WITH arguments is re-applied per argument group
+        assert_eq!(
+            literal_printf_replacement("\"x\", &[vec![\"a\".into()]]"),
+            None
+        );
+        // a computed format is never a literal
+        assert_eq!(literal_printf_replacement("&fmt, &[]"), None);
+    }
+
+    #[test]
+    fn printf_classification_names_the_fallback() {
+        assert_eq!(classify_printf_format("a%s\n").unwrap().args, 1);
+        assert_eq!(classify_printf_format("100%%\n").unwrap().args, 0);
+        // a single `%` before a conversion is an invalid directive in bash
+        assert_eq!(classify_printf_format("100%\n"), Err(PrintfFallback::Unsupported));
+        assert_eq!(classify_printf_format("{a}%s").unwrap().fmt_src, "{{a}}{}");
+        assert_eq!(classify_printf_format("%d"), Err(PrintfFallback::Unsupported));
+        assert_eq!(classify_printf_format("%b"), Err(PrintfFallback::BackslashB));
+    }
+
+    #[test]
     fn const_string_test_folds_only_with_size_opt() {
         // `[ "a" = "a" ]` is decidable at render time: the constant RHS
         // cannot carry glob metachars, so the sh2 `=`-fallback pattern
@@ -20839,7 +21013,7 @@ mod tests {
         assert!(out.contains("__SH_OUTFILE_TL"), "{out}");
         assert!(out.contains("let mut used = false"), "{out}");
         assert!(
-            out.contains("__sh_print_words(&[vec![\"hi\".into()]], true, false)"),
+            out.contains("__sh_print_words(&[vec![\"hi\".into()]], true)"),
             "{out}"
         );
     }

@@ -58,19 +58,39 @@ fn generate(rng: &mut Rng) -> (String, Vec<String>) {
     let mut want: Vec<String> = Vec::new();
     let n = 3 + rng.below(6);
     for _ in 0..n {
-        match rng.below(12) {
+        match rng.below(13) {
             0 => s.push_str(&format!("a=$((a + {}))\n", 1 + rng.below(5))),
             1 => s.push_str("c=$((c - 1))\n"),
             2 => s.push_str("echo \"b=$b\"\n"),
             3 => s.push_str("echo \"$a\"\n"),
             4 => {
-                let f = rng.pick(&["%s\\n", "%s %s\\n", "[%s]\\n", "%s"]);
-                let a = rng.pick(&["$b", "$d", "$a"]);
+                // literal formats: the specializable shapes (text, `%%`,
+                // `%s`, a literal brace) and ones that must FALL BACK to
+                // the interpreter (`%d` with a numeric argument)
+                let f = rng.pick(&[
+                    "%s\\n",
+                    "%s %s\\n",
+                    "[%s]\\n",
+                    "%s",
+                    "100%%\\n",
+                    "{a}%s\\n",
+                    "%d\\n",
+                ]);
+                let a = if f.starts_with("%d") {
+                    "$a"
+                } else {
+                    rng.pick(&["$b", "$d", "$a"])
+                };
                 if f.matches("%s").count() == 2 {
                     s.push_str(&format!("printf '{f}' {a} \"$a\"\n"));
                 } else {
                     s.push_str(&format!("printf '{f}' {a}\n"));
                 }
+            }
+            12 => {
+                // a format assembled at run time: the fallback path
+                s.push_str("fmt=\"%s/%s\\n\"\n");
+                s.push_str("printf \"$fmt\" \"$b\" \"$d\"\n");
             }
             5 => s.push_str(&format!(
                 "if [ \"$a\" -gt {} ]; then echo big; else echo small; fi\n",

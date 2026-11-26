@@ -42,7 +42,8 @@ Re-render after a backend change, then look at the diff:
    **hard gap**, not a skip: the summary prints `HARD GAP: clippy did not
    run` and the gate exits 2. (`rustup component add clippy`.)
 6. **census** — the idiom counters (`let` bindings and `thread_local!`
-   store statics — the promoted-vs-stored split — `.clone()`,
+   store statics — the promoted-vs-stored split — `pfx`/`pfi` specialized
+   vs interpreted printf sites, `pfl` interpreter lines, `.clone()`,
    `.to_string()`, `#[allow(`, `abort`, `Command::new("bash")`, emitted
    `__sh_*` helpers, lines) are printed per fixture and totalled.
    "Idiomatic" is a number that has to keep moving down, not a claim in a
@@ -190,6 +191,54 @@ Still stored, and the next widening if it ever happens: a variable whose
 only write sits inside a branch (`if c; then x=1; fi; echo "$x"`) stays in
 the store — a `let` there would need a hoisted default initializer, which
 rustc flags as an unused assignment for the path that always writes first.
+
+## printf: decomposing a literal format
+
+A `printf` whose format is a literal is decided at render time
+(`classify_printf_format` in `src/rust_backend.rs`) and emitted as
+`format!` at the call site, so the ~115-line `__sh_printf` interpreter and
+its `atoi`/`atou`/`atof`/`printf_b` cluster fall out of the program. The
+decision is a classification with a reason, not a spot fix:
+
+| format | plan |
+|---|---|
+| literal text | `format!` text (a literal `{`/`}` is doubled — a brace is **not** a format specifier) |
+| `%%` | one `%` |
+| `%s` | one `{}`, consuming one argument (bash pads, truncates and quotes nothing) |
+| `%d`/`%i`/`%u`/`%o`/`%x`/`%c`/`%q` | **fallback** — the argument's numeric/char conversion is the interpreter's job |
+| `%b` | **fallback** — backslash escapes come from the *argument*, at run time |
+| flags/width/precision (`%5s`, `%.2f`, `*`) | **fallback** |
+| `\c` in the format | **fallback** (it truncates the output) |
+| a format with no `%s` but with arguments | **fallback** — bash re-applies the format per argument group |
+| `%s` with no argument, or a different number of arguments | **fallback** — the interpreter pads/repeats |
+| a non-literal format (variable, interpolation, capture) | **fallback** — nothing to decompose |
+| anything unparsable | **fallback** |
+
+The fallback is complete, not deleted: `20_printf_dynamic.sh` builds the
+format at run time and must keep *and call* the interpreter, so an
+over-eager specialization fails the gate instead of changing output.
+
+Measured (`pfx` = specialized sites, `pfi` = calls left on the
+interpreter, `pfl` = interpreter lines in the emitted file):
+
+| fixture | pfx | pfi | pfl |
+|---|---|---|---|
+| 07_redirect (`printf '%s\n' "a b" > out.txt`) | 1 | 0 | 0 |
+| 19_printf_literal (4 literal formats, `%%`, braces) | 4 | 0 | 0 |
+| 20_printf_dynamic (format from a variable) | 0 | 1 | 115 |
+| all other fixtures | 0 | 0 | 0 |
+| **TOTAL** | **5** | **1** | **115** |
+
+Before this pass the census could not see any of it: 0 sites were counted,
+the interpreter cost 0 emitted lines only because nothing measured it, and
+07 passed a literal `false` for an `esc` parameter the helper ignored
+(`let _ = esc;`). Now no `echo -e` in a program means the two-argument
+`print_words_noesc` is emitted and `drop_esc_arg` removes the argument
+from every call site, so 07 reads `__sh_print_words(&[…], false)`.
+
+`rust_fuzz` renders literal formats of every class above (`%%`, a literal
+brace, `%d`, a run-time-assembled format), so the classification is
+exercised on scripts nobody hand-wrote.
 
 ## Naming, lints and aborts
 

@@ -25,10 +25,9 @@ fn __sh_wq(ws: &[Word]) -> String {
     o
 }
 
-fn __sh_print_words(ws: &[Vec<Word>], nl: bool, esc: bool) {
-    // no echo in this program used -e, so `esc` is always false — the
-    // unescape arm (and its __sh_echo_esc dependency) is compiled out.
-    let _ = esc;
+fn __sh_print_words(ws: &[Vec<Word>], nl: bool) {
+    // no echo in this program used -e: there is no unescape arm and no
+    // `__sh_echo_esc` dependency, and no argument to pass for one.
     // a word's `$((…))` arith expansion FAILED (an empty positional
     // makes the expanded text a syntax error) — bash suppresses the
     // WHOLE simple command, not just the word
@@ -125,6 +124,6 @@ fn main() {
     while __s.ends_with('\n') { __s.pop(); }
     __s
 };
-    __sh_print_words(&[vec![format!("count={}", files).into()]], true, false);
+    __sh_print_words(&[vec![format!("count={}", files).into()]], true);
     __SH_RC.store(0, Ordering::SeqCst);
 }
