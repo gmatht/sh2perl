@@ -1,5 +1,5 @@
 # verus-sync-coverage manifest: elim_trio
-# source sha: const_condition_elim=ba7bbd048b97 unreachable_after_exit=3adb4e485152 merge_init_assignments=5354c2b10fac  proof sha: dc635af79198
+# source sha: const_condition_elim=ba7bbd048b97 unreachable_after_exit=3adb4e485152 merge_init_assignments=5354c2b10fac  proof sha: 553b87ab8b91
 
 [pins]
 pin pin_cce_dowhile_once -> UNMIRRORED (by design — see the proof-campaign plan §(b).4)
@@ -15,7 +15,7 @@ pin pin_uae_truncates -> UNMIRRORED (by design — see the proof-campaign plan �
 guard const-condition-elim eval_cond: PRESENT
 guard const-condition-elim is_bare_literal gate: PRESENT
 guard unreachable-after-exit Exit trigger: PRESENT
-guard unreachable-after-exit Return trigger: PRESENT
+guard unreachable-after-exit DIRECT-Exit trigger only: PRESENT
 guard merge-init is_literal gate: PRESENT
 guard merge-init pure gate: PRESENT
 guard merge-init reads_var gate: PRESENT

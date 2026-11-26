@@ -8860,8 +8860,9 @@ truncation sound in general.
 - **`loop_without_escape_never_falls_through`**: a break-free constant-true
   loop contributes nothing after it; `terminates_stops` supplies the step
   that says so, via `no_escape_no_brk`.
-- **`return_truncates_only_a_function_body`**, and the three
-  `*_truncates_its_own_list` instances.
+- **`return_truncates_only_a_function_body`**, and the three signal
+  instances `break_truncates_its_own_list` /
+  `continue_truncates_its_own_list` / `exit_truncates_its_own_list`.
 
 ### The refusals, proved as pins
 
@@ -8879,14 +8880,17 @@ loop-escapability decisions; the first two of those mirror the source's own
 
 ### Mutants, measured
 
-Counted: truncating after an `if`-nested terminator gives **29 verified,
-1 error**; treating a top-level `Return` as a terminator **28 verified,
-2 errors**; pruning after a `case`-nested `Exit` **29 verified, 1 error**.
-Refuted at simplification by a concrete pin: counting a nested loop's
-`break` as escaping, dropping the terminator from the kept prefix, letting a
-`case` break fall through instead of ending the loop, and running past a
-non-None signal. Restored byte-identically after each run (sha256 in
-`uae_terminators_sync.txt`).
+Counted: truncating after an `if`-nested terminator gives **30 verified,
+1 error** (`trunc_sound`); treating a top-level `Return` as a terminator
+**29 verified, 2 errors** (`trunc_sound` and
+`return_truncates_only_a_function_body`); pruning after a `case`-nested
+`Exit` **30 verified, 1 error** (`trunc_sound`). Refuted at simplification
+by a concrete pin: counting a nested loop's `break` as escaping
+(`pin_nested_break_does_not_escape`), dropping the terminator from the kept
+prefix (`pin_trunc_shapes`), letting a `case` break fall through instead of
+ending the loop (`pin_case_break_escapes`), and running past a non-None
+signal (`pin_break_stops_the_list`). Restored byte-identically after each
+run (sha256 in `uae_terminators_sync.txt`).
 
 ### Scope (read this before quoting it)
 

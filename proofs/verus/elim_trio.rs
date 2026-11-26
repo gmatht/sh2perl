@@ -4,8 +4,11 @@
 //       branch (or first-true elsif / else); `While(false)` drops;
 //       `DoWhile(false)` becomes its body (runs exactly once);
 //   (b) unreachable-after-exit (`sh2perl/src/transforms/unreachable_after_exit.rs`):
-//       statements after a DIRECT unconditional `Exit` (or `Return`
-//       inside a function body) in the same list are dropped;
+//       statements after a DIRECT unconditional `Exit` in the same list are
+//       dropped. This model proves THAT arm only (`uae_trunc` stops at
+//       `Stmt::Exit`); the transform's other four terminator kinds —
+//       `Break`, `Continue`, `Return` inside a function body, and a
+//       break-free constant-true loop — are `proofs/verus/uae_terminators.rs`;
 //   (c) merge-init-assignments (`sh2perl/src/transforms/merge_init_assignments.rs`):
 //       an adjacent `Declare x = <literal>` + `x = <pure rhs>` pair folds
 //       to `Declare x = <rhs>` (the later store overwrites the default
@@ -28,9 +31,11 @@
 //     is a PARAMETER (a const boolean input) — proving `"1 -eq 1"` is
 //     string parsing, not the pruning obligation. Nested-pass recursion
 //     and elsifs-pruning of the unknown-cond case are the same induction.
-//   - unreachable-after-exit: the direct-Exit/Return trigger and the
-//     conditional-nesting refusal (nested Exit does NOT deaden the outer
-//     list). FIRING: no producer in the shell pipeline constructs
+//   - unreachable-after-exit: the DIRECT-`Exit` trigger only (`uae_trunc`
+//     stops at `Stmt::Exit`; the other four terminator kinds are
+//     `uae_terminators.rs`) and the conditional-nesting refusal (nested
+//     Exit does NOT deaden the outer list). FIRING: no producer in the
+//     shell pipeline constructs
 //     `IrStmt::Exit`/`Return` today (`exit 1` lowers to `Expr(builtin)`)
 //     — same dead-path class as for-recovery. The per-node rule is still
 //     proved (a true theorem about the rule the pass implements); the

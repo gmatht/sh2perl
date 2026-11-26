@@ -59,14 +59,18 @@
 //     `stmt_terminates` consumers (they read the same verdict, so a verdict
 //     change is the same theorem); `Die`, which this model folds into Exit.
 //
-//  ── measured mutants (all restored byte-identically; sha in the sync file) ──
+//  ── measured mutants (2026-11-26; all restored byte-identically, sha in the
+//     sync file) ──
 //
 //  baseline 31 verified, 0 errors
 //
-//  counted (verification failures after the mutation compiles):
-//    m2  truncate after a terminator nested in an `if`      29 verified, 1 error
-//    m3  treat a top-level `Return` as a terminator         28 verified, 2 errors
-//    m4  truncate after a `case`-nested `Exit`              29 verified, 1 error
+//  counted (a verification failure, after the mutation compiles):
+//    m2  truncate after a terminator nested in an `if`      30 verified, 1 error
+//        (`trunc_sound`)
+//    m3  treat a top-level `Return` as a terminator         29 verified, 2 errors
+//        (`trunc_sound`, `return_truncates_only_a_function_body`)
+//    m4  truncate after a `case`-nested `Exit`              30 verified, 1 error
+//        (`trunc_sound`)
 //
 //  refuted one stage EARLIER, at simplification, by a concrete pin (the
 //  computed value is false, so the mutated model never reaches a proof):
