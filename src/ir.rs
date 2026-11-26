@@ -5957,8 +5957,9 @@ fn build_shell_cmd(cmd: &str, words: &[&IrExpr]) -> String {
 }
 
 /// `cd` must affect the Perl process (chdir), so chains starting with it
-/// render natively: `cd D || exit N` → `chdir(D) or exit N;` and
-/// `cd D && cmd` → `chdir(D) or die;` + shell-out of the tail.
+/// render natively. `cd D || exit N` becomes `chdir(D) or exit N;`, and
+/// `cd D && cmd` becomes a guarded tail: bash runs the tail only when the
+/// cd SUCCEEDED, and a failed cd warns, sets status 1 and keeps going.
 fn cd_chain_to_perl(expr: &IrExpr) -> Option<String> {
     if let IrExpr::BinOp { lhs, op, rhs } = expr {
         if let IrExpr::Call { func, args } = lhs.as_ref() {
@@ -17777,22 +17778,28 @@ mod perl_render_tests {
         assert!(out.to_lowercase().contains("basename"), "{out}");
     }
 
-    /// Shell truthiness is exit-status 0. `if (system(...))` is inverted,
-    /// because Perl treats 0 as false.
+    /// Shell truthiness is exit-status 0, for both `if` and `while`.
+    /// `if (system(...))` is inverted, because Perl treats 0 as false.
     #[test]
-    fn command_condition_tests_status() {
+    fn command_conditions_test_status() {
         let out = render("if grep -q x f; then echo y; fi\n");
         assert!(!out.contains("if (system("), "{out}");
         assert!(out.contains("> 0"), "{out}");
+        let w = render("while grep -q x f; do echo x; done\n");
+        assert!(!w.contains("while (system("), "{w}");
+        assert!(w.contains("while ("), "{w}");
     }
 
-    /// bash's `cd` failure sets `$?` and continues; it does not abort.
+    /// bash's `cd` failure sets `$?` and continues; it does not abort. The
+    /// write uses the WAIT encoding (`code << 8`) and the follow-up test
+    /// reads it back through `$? >> 8`.
     #[test]
     fn native_cd_records_status_and_continues() {
         let out = render("cd /no/such/dir\nif [ $? -eq 0 ]; then echo ok; else echo bad; fi\n");
         assert!(!out.contains("or die \"cd"), "{out}");
         assert!(out.contains("warn \"cd: $!\\n\""), "{out}");
         assert!(out.contains("$? = 1 << 8"), "{out}");
+        assert!(out.contains("$? >> 8"), "{out}");
     }
 
     /// Builtins in compound position lower natively: no fork, and no
@@ -17802,24 +17809,6 @@ mod perl_render_tests {
         let out = render("false && echo hi\n");
         assert!(!out.contains("system(\"echo"), "{out}");
         assert!(!out.contains("system(\"false"), "{out}");
-    }
-
-    /// `while cmd` is the same truthiness rule as `if cmd`.
-    #[test]
-    fn while_condition_tests_status() {
-        let out = render("while grep -q x f; do echo x; done\n");
-        assert!(out.contains("while ("), "{out}");
-        assert!(!out.contains("while (system("), "{out}");
-    }
-
-    /// A native builtin's status is readable through `$?`, which the
-    /// renderer encodes as a WAIT status (`code << 8`) and reads back with
-    /// `>> 8`.
-    #[test]
-    fn native_builtin_status_is_readable_through_dollar_question() {
-        let out = render("false\nif [ $? -eq 0 ]; then echo ok; fi\n");
-        assert!(out.contains("$? = 1 << 8"), "{out}");
-        assert!(out.contains("$? >> 8"), "{out}");
     }
 
     /// Golden text for a dozen representative programs, plus `perl -w -c`

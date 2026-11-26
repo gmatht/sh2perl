@@ -16,8 +16,11 @@
 #   examples/012_test_const_read               stdout differs     matches
 #
 # No example exists where the retired renderer matched bash and the survivor
-# does not, so nothing needed porting. Every one of the ten curated examples
-# now passes through tests/bash-parity.sh; the list below is therefore empty.
+# does not, so nothing needed porting. Every curated example passes through
+# tests/bash-parity.sh; the list below is therefore empty. 000__05 and
+# 000__06 were dropped from the curated set afterwards: 05 is a strict
+# subset of 000__04d and 06 is 000__04c with a different input file, so they
+# cost runtime without adding signal.
 
 # Full-corpus sweep (2026-11-26, shipped `perl_backend --fixed` path, i.e.
 # perl_generator_fixed::generate): 496 of 555 `examples/*.sh` matched bash on
