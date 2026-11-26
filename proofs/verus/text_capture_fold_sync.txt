@@ -1,5 +1,5 @@
 # verus-sync-coverage manifest: text_capture_fold
-# source sha: text_capture_fold=f76d26e31190  proof sha: a1120fac1bba
+# source sha: text_capture_fold=f76d26e31190  proof sha: 72e022116f2b
 
 [pins]
 pin pin_quoted_test_operand -> test folds_quoted_test_operand: MAPPED

@@ -55,6 +55,8 @@
 //
 //  ── measured mutants (all restored byte-identically; sha in the sync file) ──
 //
+//  baseline 29 verified, 0 errors
+//
 //  counted:
 //    m2  `is_prefix` made strict (`<`)                26 verified, 3 errors
 //    m7  the suffix scan ignores the literal           27 verified, 2 errors

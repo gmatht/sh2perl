@@ -63,6 +63,8 @@
 //
 //  ── measured mutants (all restored byte-identically; sha in the sync file) ──
 //
+//  baseline 31 verified, 0 errors
+//
 //  counted (the mutation compiles and the proof goes red):
 //    m1  the gate accepts a syntax character               30 verified, 1 error
 //    m2  the substitution's space becomes a literal char    30 verified, 1 error

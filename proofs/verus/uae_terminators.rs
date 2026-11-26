@@ -61,6 +61,8 @@
 //
 //  ── measured mutants (all restored byte-identically; sha in the sync file) ──
 //
+//  baseline 31 verified, 0 errors
+//
 //  counted (verification failures after the mutation compiles):
 //    m2  truncate after a terminator nested in an `if`      29 verified, 1 error
 //    m3  treat a top-level `Return` as a terminator         28 verified, 2 errors
