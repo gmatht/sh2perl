@@ -8952,3 +8952,29 @@ sha256 re-checked (see `bc_float_clean_sync.txt`).
 - The analysed module has **no `#[cfg(test)]` block** (measured:
   `grep -c 'cfg(test)'` → 0), so every pin row in the manifest is
   UNMIRRORED and no `[exec]` PASS row exists for this proof.
+
+## `shir_native_stmt.rs` — no single law; a decomposition plan
+
+    proofs/verus/shir_native_stmt_plan.md
+
+Measured this turn: 7140 lines, 105 top-level `fn`s, **60 fold entry points**
+dispatched from `transform_stmt` (44 distinct in the `Expr` arm alone, 18 in
+`Redirect`), and only **8 tests** in its `#[cfg(test)]` module — so 52 folds
+have no source test and their pins will be model-level. The file is a union
+of sixty independent rewrites over the whitelist command set; the ⇒ law that
+the last five proofs share has no single instance here, only sixty, and one
+of them (`record_file_write` → `native_cat_file_pipeline`) depends on
+CROSS-STATEMENT state (`files: HashMap<String, String>`) that nothing
+currently states.
+
+The plan splits it into ten stages, each in the established shape (an
+independent semantic side, the ⇒ law, load-bearing refusals as pins, measured
+mutants, a `*_sync.txt`, a section here): C empty herestring → status first
+(18–24 obligations, reuses `uae_terminators`' `run_abort`), then H the
+quoting laws, E echo/printf bytes, B redirect writes plus the `files`
+soundness invariant, D1–D3 the `test` renderer and chains, F1 tr/sort/wc,
+F2 a declared BRE subset for grep, G the status/identity folds, F3 find/ls,
+F4 xargs/comm/diff, and A the dispatch-coverage and `files` invariant as the
+closing structural stage. Each stage's out-of-model list (renderers, the
+`./fail-shir` metric, the whitelist itself, `lower_printf`, locales and
+permissions, stderr) is in the plan and repeats in the stage's own section.
