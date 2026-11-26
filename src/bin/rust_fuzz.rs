@@ -110,7 +110,7 @@ fn generate(rng: &mut Rng) -> String {
     let mut s = String::from(PRELUDE);
     let n = 3 + rng.below(6);
     for _ in 0..n {
-        match rng.below(34) {
+        match rng.below(36) {
             0 => s.push_str(&format!("a=$((a + {}))\n", 1 + rng.below(5))),
             1 => s.push_str("c=$((c - 1))\n"),
             2 => s.push_str("echo \"b=$b\"\n"),
@@ -237,6 +237,27 @@ fn generate(rng: &mut Rng) -> String {
                 s.push_str("printf '%s\\n' \"$b\" > pf.txt\n");
                 s.push_str("grep -h . pf.txt > pj.txt | wc -c\n");
                 s.push_str("wc -l < pj.txt\n");
+            }
+            // THE VARIABLE STORE: an exported name is re-synced into the
+            // child environment on every LATER write (the flag lives in the
+            // store, a one-shot `set_var` would hand the child a stale
+            // value), and `unset` takes the entry back out.
+            34 => {
+                s.push_str("export E=\"$b\"\n");
+                s.push_str("E=\"$E!\"\n");
+                s.push_str("bash -c 'echo \"child=$E\"'\n");
+                if rng.chance(2) {
+                    s.push_str("unset E\necho \"e=[$E]\"\n");
+                }
+            }
+            // dynamic scope through the store: a name written in a function
+            // body and in main is one entry, read across the call boundary
+            // (bash's dynamic scoping is what keeps it out of a `let`)
+            35 => {
+                if !s.contains("h() {") {
+                    s.push_str("h() { H=\"fn-$b\"; }\n");
+                }
+                s.push_str("H=\"$b\"\nh\necho \"h=$H\"\n");
             }
             // an arithmetic word inside a printed expansion
             _ => s.push_str("echo \"n=$((c + 1))\"\n"),

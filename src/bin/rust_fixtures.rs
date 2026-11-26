@@ -85,6 +85,23 @@ fn render_via_a1(src: &str) -> Result<String, String> {
     Ok(debashl::rust_backend::shir_to_rust(&prog))
 }
 
+/// Call sites that reach the variable store with a literal key:
+/// `__sh_v_s("name")`, `__sh_v_set_i("name", …)`, `__sh_vw_w("name", |v| …)`.
+/// A helper definition takes `name: &str`, so helper bodies never count.
+fn store_accesses(code: &str) -> usize {
+    let mut n = 0usize;
+    for (i, _) in code.match_indices("__sh_v") {
+        let rest = &code[i..];
+        let end = rest
+            .find(|c: char| !(c.is_ascii_alphanumeric() || c == '_'))
+            .unwrap_or(rest.len());
+        if rest[end..].starts_with("(\"") {
+            n += 1;
+        }
+    }
+    n
+}
+
 // ── the idiom census ─────────────────────────────────────────────────────
 
 /// Counted shapes. Every field is something the backend previously got wrong;
@@ -92,13 +109,14 @@ fn render_via_a1(src: &str) -> Result<String, String> {
 #[derive(Default, Clone, Copy)]
 struct Census {
     lines: usize,
-    /// per-variable `thread_local!` statics still in the store
+    /// per-variable `thread_local!` statics in the emitted program — the
+    /// shape the ONE store replaced, so any non-zero count is a failure
     statics: usize,
     clones: usize,
     to_strings: usize,
     /// vars emitted as a bare `let` (promoted out of the store)
     promoted: usize,
-    /// vars still declared as a `thread_local!` static
+    /// store accesses in the emitted body: call sites that name a store key
     stored: usize,
     /// printf call sites the renderer decomposed at render time
     printf_specialized: usize,
@@ -385,8 +403,12 @@ fn main() {
         // carrying it is really in the emitted text.
         let promoted = debashl::rust_backend::promoted_names(&prepare(&src));
         c.promoted = promoted.len();
-        // store traffic as emitted: one `thread_local!` static per name
-        c.stored = code.matches("static __SHV_").count();
+        // The store: one `__SH_VARS` per program that needs it, no
+        // per-variable static of any kind, and the number of accesses that
+        // name a key (a helper BODY takes `name: &str`, so it does not
+        // count — this is call traffic, not helper size).
+        c.statics = code.matches("static __SHV_").count();
+        c.stored = store_accesses(&code);
         total.add(c);
         for name in &promoted {
             let ident: String = {
@@ -425,6 +447,18 @@ fn main() {
             println!(
                 "{name:<20} {:>5} {:>7}  PANIC PATH: {} `.unwrap()`/`.expect()`/`panic!`/`unreachable!` in generated code — a helper must be infallible by construction or a documented abort",
                 c.lines, c.statics, c.panics
+            );
+            failures += 1;
+        }
+
+        // The ONE store replaced one `thread_local!` per unpromoted name, so
+        // a per-variable store static coming back is a regression whatever
+        // the behaviour says: every unpromoted name lives in `__SH_VARS`.
+        let per_var = code.matches("static __SHV_").count();
+        if per_var > 0 {
+            println!(
+                "{name:<20} {:>5}  PER-VARIABLE STORE STATIC: {per_var} `static __SHV_…` in generated code — unpromoted variables share the ONE `__SH_VARS` store",
+                c.lines
             );
             failures += 1;
         }

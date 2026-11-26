@@ -9,10 +9,9 @@ static __SH_STDIN: std::sync::Mutex<Option<Box<dyn std::io::Read + Send>>> = std
 static __SH_STDIN_PATH: std::sync::Mutex<Option<std::path::PathBuf>> = std::sync::Mutex::new(None);
 
 static __SH_PIPESTATUS: std::sync::Mutex<Vec<i32>> = std::sync::Mutex::new(Vec::new());
+thread_local! { static __SH_VARS: std::cell::RefCell<__ShStore> = const { std::cell::RefCell::new(__ShStore { vars: std::collections::BTreeMap::new(), ro_trip: false }) }; }
 
 static __SH_ARITH_WORD_FAIL: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
-
-thread_local! { static __SHV_TWO: std::cell::RefCell<String> = const { std::cell::RefCell::new(String::new()) }; }
 
 fn __sh_q(s: &str) -> String {
     let mut o = String::with_capacity(s.len() + 8);
@@ -418,6 +417,155 @@ fn __sh_pipe(stages: &[Vec<Word>], input: Option<&[u8]>, sink: Option<&mut Vec<u
     statuses.last().copied().unwrap_or(0)
 }
 
+/// One stored value: the shell-visible text plus whichever typed payload
+/// the renderer chose for the name. `text` reads every payload, so the value
+/// type is complete in every program without a dead field.
+#[derive(Clone, Default)]
+struct __ShVal {
+    s: String,
+    int: Option<i64>,
+    words: Option<Vec<Word>>,
+    ints: Option<Vec<i64>>,
+    assoc: Option<std::collections::BTreeMap<String, String>>,
+}
+impl __ShVal {
+    fn text(&self) -> String {
+        if let Some(n) = self.int { return n.to_string(); }
+        if let Some(v) = &self.ints { return v.first().map(|n| n.to_string()).unwrap_or_default(); }
+        if let Some(w) = &self.words { return w.first().map(|x| x.to_string()).unwrap_or_default(); }
+        if let Some(m) = &self.assoc { return m.get("0").cloned().unwrap_or_default(); }
+        self.s.clone()
+    }
+}
+
+/// One store entry: the value plus the two attributes a shell keeps per
+/// name (exported, readonly). The store is the ONE home of every variable
+/// the promotion slice could not turn into a `let`.
+#[derive(Clone)]
+struct __ShVar {
+    val: __ShVal,
+    exported: bool,
+    readonly: bool,
+}
+impl __ShVar {
+    fn empty() -> __ShVar {
+        __ShVar { val: __ShVal::default(), exported: false, readonly: false }
+    }
+}
+
+/// The store itself: every unpromoted name plus the one piece of `$?`-adjacent
+/// state a refused write leaves behind. `ro_trip` is consumed by the next
+/// status write, so `$?` is 1 exactly until the next command runs — what bash
+/// reports for a failed assignment (`x=1` on a readonly name).
+struct __ShStore {
+    vars: std::collections::BTreeMap<String, __ShVar>,
+    ro_trip: bool,
+}
+fn __sh_v_rc_trip() -> bool {
+    __SH_VARS.with(|s| std::mem::replace(&mut s.borrow_mut().ro_trip, false))
+}
+
+fn __sh_v_get(name: &str) -> Option<__ShVar> {
+    __SH_VARS.with(|s| s.borrow().vars.get(name).cloned())
+}
+
+/// Write one value through the store. A readonly name keeps its value and
+/// fails the way bash fails (`<name>: readonly variable`, status 1); an
+/// exported name re-syncs the process environment so children inherit the
+/// new value.
+fn __sh_v_put(name: &str, val: __ShVal) {
+    let mut denied = false;
+    __SH_VARS.with(|s| {
+        let mut s = s.borrow_mut();
+        let st = &mut *s;
+        let e = st.vars.entry(name.to_string()).or_insert_with(__ShVar::empty);
+        if e.readonly {
+            st.ro_trip = true;
+            denied = true;
+            return;
+        }
+        e.val = val;
+        if e.exported {
+            let t = e.val.text();
+            std::env::set_var(name, t);
+        }
+    });
+    if denied {
+        eprintln!("bash: {}: readonly variable", name);
+        __SH_RC.store(1, Ordering::SeqCst);
+    }
+}
+
+/// Save one name's whole entry (value plus flags) for a scope that must put
+/// it back afterwards — a subshell, a background capture, a dynamic scope.
+fn __sh_v_save(name: &str) -> Option<__ShVar> {
+    __sh_v_get(name)
+}
+fn __sh_v_restore_one(name: &str, saved: Option<__ShVar>) {
+    __SH_VARS.with(|s| {
+        let mut s = s.borrow_mut();
+        match saved {
+            Some(v) => { s.vars.insert(name.to_string(), v); }
+            None => { s.vars.remove(name); }
+        }
+    });
+}
+
+/// `unset NAME` — a readonly name keeps its entry and fails like bash.
+fn __sh_v_unset(name: &str) {
+    let mut denied = false;
+    __SH_VARS.with(|s| {
+        let mut s = s.borrow_mut();
+        let st = &mut *s;
+        match st.vars.get(name) {
+            Some(e) if e.readonly => {
+                st.ro_trip = true;
+                denied = true;
+            }
+            Some(_) => { st.vars.remove(name); }
+            None => {}
+        }
+    });
+    if denied {
+        eprintln!("bash: {}: readonly variable", name);
+        __SH_RC.store(1, Ordering::SeqCst);
+    }
+}
+
+/// `export NAME` — the flag lives in the store, so every later write keeps
+/// the child environment in sync.
+fn __sh_v_export(name: &str) {
+    let mut val = None;
+    __SH_VARS.with(|s| {
+        let mut s = s.borrow_mut();
+        let e = s.vars.entry(name.to_string()).or_insert_with(__ShVar::empty);
+        e.exported = true;
+        val = Some(e.val.text());
+    });
+    if let Some(v) = val { std::env::set_var(name, v); }
+}
+
+/// `readonly NAME` / `declare -r` — refusal happens on every later write.
+fn __sh_v_mark_readonly(name: &str) {
+    __SH_VARS.with(|s| {
+        let mut s = s.borrow_mut();
+        s.vars.entry(name.to_string()).or_insert_with(__ShVar::empty).readonly = true;
+    });
+}
+
+fn __sh_v_s(name: &str) -> String {
+    match __sh_v_get(name) { Some(v) => v.val.text(), None => String::new() }
+}
+fn __sh_v_set_s<T: ToString>(name: &str, v: T) {
+    __sh_v_put(name, __ShVal { s: v.to_string(), ..__ShVal::default() });
+}
+fn __sh_vw_s<R>(name: &str, f: impl FnOnce(&std::cell::RefCell<String>) -> R) -> R {
+    let tmp = std::cell::RefCell::new(__sh_v_s(name));
+    let r = f(&tmp);
+    __sh_v_set_s(name, tmp.into_inner());
+    r
+}
+
 fn main() {
     __sh_print_words(&[vec!["start:".to_string().into()]], false);
     __SH_PIPESTATUS.lock().unwrap_or_else(|e| e.into_inner()).clear();
@@ -440,7 +588,7 @@ fn main() {
     __sh_print_words(&[vec!["glob:".to_string().into()]], false);
     __SH_PIPESTATUS.lock().unwrap_or_else(|e| e.into_inner()).clear();
     __SH_RC.store(__sh_pipe(&[vec!["wc".into(), "-l".into(), "alpha.txt".into(), "beta.txt".into(), "gamma.txt".into()], vec!["grep".into(), "total".into()]], None, None), Ordering::SeqCst);
-    __SHV_TWO.with(|v| *v.borrow_mut() = {
+    __sh_v_set_s("two", {
     let __cap_oldout = __SH_OUTFILE_TL.with(|v| v.borrow_mut().take());
     let __old = __SH_OUT.lock().unwrap_or_else(|e| e.into_inner()).take();
     *__SH_OUT.lock().unwrap_or_else(|e| e.into_inner()) = Some(Vec::new());
@@ -467,7 +615,7 @@ fn main() {
     while __s.ends_with('\n') { __s.pop(); }
     __s
 });
-    __sh_print_words(&[vec![format!("two={}", __SHV_TWO.with(|v| v.borrow().clone())).into()]], true);
+    __sh_print_words(&[vec![format!("two={}", __sh_v_s("two")).into()]], true);
     __sh_print_words(&[vec![format!("head:{}", {
     let __cap_oldout = __SH_OUTFILE_TL.with(|v| v.borrow_mut().take());
     let __old = __SH_OUT.lock().unwrap_or_else(|e| e.into_inner()).take();
@@ -520,5 +668,5 @@ fn main() {
     __SH_PIPESTATUS.lock().unwrap_or_else(|e| e.into_inner()).push(__SH_RC.load(Ordering::SeqCst));
     __SH_RC.store(__sh_spawn(&format!("{} < {}", __sh_wq(&["wc".into(), "-l".into()]), __sh_q("joined.txt")), None), Ordering::SeqCst);
     __sh_print_words(&[vec!["end\n".to_string().into()]], false);
-    __SH_RC.store(0, Ordering::SeqCst);
+    __SH_RC.store(if __sh_v_rc_trip() { 1 } else { 0 }, Ordering::SeqCst);
 }

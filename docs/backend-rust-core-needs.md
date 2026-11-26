@@ -96,9 +96,10 @@ shape in `fixtures/rust_idiom/` whose output is not bash-identical.
 Right-assoc `**` → `__sh_pow` (wrapping semantics). NaN guard →
 `str::parse::<i64>()` error → the whole test is false ✓.
 
-### 5.2b Variable storage: `let` where provable, the store elsewhere
+### 5.2b Variable storage: `let` where provable, ONE store elsewhere
 
-The store is the fallback, not the rule. A scalar becomes a plain Rust binding
+The store is the fallback, not the rule — and it is exactly one store, not one
+`thread_local!` per name (see §5.2b-i). A scalar becomes a plain Rust binding
 when all of these hold:
 
 - every mention sits in ONE scope (`main`, or one user function);
@@ -118,15 +119,60 @@ this renderer splices every read inline. `Use::pin` is the half that applies.
 That is what makes the emitted shapes match what a Rust programmer writes:
 
 ```rust
-let mut count = 0;          // was: __SHV_count.with(|v| v.set(0))
-count += 1;                 // was: __SHV_count.with(|v| v.set(v.get() + 1))
+let mut count = 0;          // was: __sh_vw_i("count", |v| v.set(0))
+count += 1;                 // was: __sh_vw_i("count", |v| v.set(v.get() + 1))
 let name = "world".to_string();
 ```
 
 and what keeps it sound where bash's dynamic scoping or a subshell would be
-violated: `value=1; show() { echo "$value"; }` keeps the static, and so does
-`$( n=$((n+1)); … )`. Fixtures 11–16 in `fixtures/rust_idiom/` pin both
-directions.
+violated: `value=1; show() { echo "$value"; }` keeps the store entry, and so
+does `$( n=$((n+1)); … )`. Fixtures 11–16 in `fixtures/rust_idiom/` pin both
+directions, and `22_vars_store` pins the store itself.
+
+#### 5.2b-i The one store
+
+Every unpromoted name lives in `__SH_VARS`, a `thread_local!`
+`RefCell<__ShStore>`:
+
+```rust
+struct __ShStore { vars: BTreeMap<String, __ShVar>, ro_trip: bool }
+struct __ShVar   { val: __ShVal, exported: bool, readonly: bool }
+struct __ShVal   { s: String, int: Option<i64>, words: Option<Vec<Word>>,
+                   ints: Option<Vec<i64>>, assoc: Option<BTreeMap<String, String>> }
+```
+
+- The key is the **shell name as a string literal** (`__sh_v_s("COUNT")`), so
+  a call site the conversion missed fails to compile (identifier where `&str`
+  is required) — the fixture gate catches it instead of a silent rebinding.
+- One accessor per storage class, named the way the call site reads:
+  `__sh_v_i/_s/_w/_n/_m`, `__sh_v_set_i/_s/_w/_n/_m`, the in-place
+  `__sh_vw_i/_s/_w/_n/_m` (materialize → body → write back through
+  `__sh_v_put`), `__sh_v_len`, `__sh_v_w_at/_n_at`, `__sh_v_m_get/_set/
+  _remove/_keys/_values`.
+- `__ShVar` carries the two attributes a shell keeps per name, so `export`
+  (`__sh_v_export` — the flag makes every later write re-sync `std::env`, which
+  a one-shot `set_var` did not), `readonly` (`__sh_v_mark_readonly` — a later
+  write is refused with bash's message + status 1) and `unset`
+  (`__sh_v_unset`, refusing a readonly name) are store operations, not renderer
+  bookkeeping.
+- `ro_trip` is the `$?`-adjacent half: a refused write sets it and the next
+  status write consumes it (`__SH_RC.store(if __sh_v_rc_trip() { 1 } else { 0 } …)`),
+  so `$?` is 1 for the failed statement and 0 after the next command, like
+  bash.
+- A scope saves the **entry** (`__sh_v_save` / `__sh_v_restore_one`), so a
+  subshell restores value *and* flags in one place.
+- The helper is sliced (`vars` core + `vars_i/_s/_w/_n/_m/_len`) and pruned per
+  program; `__SH_VARS` is emitted only when a store call exists. That keeps the
+  `-D warnings` build clean without a `#[allow(dead_code)]`: a fixed monolithic
+  helper would carry unused variants/methods, which rustc rejects as dead code.
+
+Measured over the fixture set (`fixtures/rust_idiom/expected/*.rs`): per-
+variable `static __SHV_…` **6 → 0**, store call sites naming a key
+**21 → 46**, programs carrying the store **7 of 22** (one `__SH_VARS` each).
+The cost is helper lines: ~180 per program that uses it, so emitted lines went
+**1371 → 2364** over the 21 pre-existing fixtures. The per-variable static it
+replaced was one line each, so this is a shape/robustness win, not a line-count
+one; the census prints both numbers so the trade stays visible.
 
 #### Promotion is a refusal, not a heuristic
 
@@ -140,10 +186,11 @@ computed at run time) and any non-literal `getVar`/`setVar` name; the
 per-name poisons are `export`/`readonly`/`declare -g`/`unset`/`read`/
 `mapfile`/`getopts`/`set`/`trap`/`printf -v NAME`/`let` and the `NAME=value`
 words those take. The harness reports the promoted-vs-stored split per
-fixture (22 promoted / 5 stored over 18 fixtures) from the same verdict the
-renderer uses, and fails a fixture when a promoted name has no binding in
-the emitted text. What stays stored is documented in
-`fixtures/rust_idiom/README.md` with the reason per name.
+fixture (24 promoted / 46 store accesses over 22 fixtures) from the same
+verdict the renderer uses, and fails a fixture when a promoted name has no
+binding in the emitted text or when a per-variable `static __SHV_…`
+reappears. What stays stored is documented in `fixtures/rust_idiom/README.md`
+with the reason per name.
 
 ### 5.2c Post-render specialization and the emitted-code contract
 
@@ -213,12 +260,13 @@ the emitted text. What stays stored is documented in
   `non_upper_case_globals` 8 → 0, `dead_code` 1 → 0, `.unwrap()` 2 → 0,
   `.expect(`/`panic!`/`unreachable!` 0 → 0, emitted lines 553 → 547. The
   *decided dispositions*:
-  - Storage globals are emitted under **uppercase** names
-    (`static_ident`: `__SHV_` + the mangled base uppercased, `_2`/`_3`
-    suffix on a case-only collision), so `non_upper_case_globals` never
-    fires and the declaration reads like hand-written Rust. The name is
-    derived in one place, so `tls`, the declaration, the post-render leak
-    guard and `-Oz` golf all agree.
+  - Unpromoted variables are **store keys, not statics** — `__sh_v_s("COUNT")`
+    takes the shell name as a string literal, so there is no `static`
+    identifier that could need `non_upper_case_globals` and no per-name
+    declaration at all. A promoted local keeps the shell spelling (one name →
+    one storage class, which the post-render leak guard and `-Oz` golf rely
+    on); the store key is derived in one place (`tls`), so every accessor and
+    the body agree.
   - A poisoned lock still yields its data
     (`unwrap_or_else(|e| e.into_inner())`), the capture slot defaults to the
     empty buffer, and a non-hex digit reads as 0 (`unwrap_policy`).

@@ -5,10 +5,11 @@
 //! Lowering model (mirrors the proven C backend, `backends/c/src/c_backend.rs`):
 //!   - storage: a scalar that is provably confined to ONE scope becomes a
 //!     plain Rust `let` (`let mut count = 0; count += 1` — pass-2 promotion),
-//!     and everything else becomes a `thread_local!` static (Cell<i64> for
-//!     A2-Int vars, RefCell<String> for Str/Any, RefCell<Vec<String>> for
-//!     index arrays, RefCell<BTreeMap<String,String>> for assoc arrays) so
-//!     function bodies can read/write the same globals as main. Promotion is
+//!     and every other variable lives in ONE `__SH_VARS` store — a
+//!     `thread_local!` `RefCell<__ShStore>` keyed by the shell name, its
+//!     entry carrying the typed value plus the `exported`/`readonly` flags, so
+//!     function bodies, subshells and dynamic scopes read and write the same
+//!     entries as main. Promotion is
 //!     refused for any name a closure or process boundary reaches (a `pin`),
 //!     for arrays/assoc, for shell specials, and for anything a dynamic-name
 //!     builtin can reach (`eval`/`source` bail the analysis; `export`,
@@ -2647,14 +2648,14 @@ fn drop_esc_arg(t: &str) -> String {
     out
 }
 
-fn idiom_peephole(text: &str) -> String {
+fn idiom_peephole(text: &str, promoted_locals: &[String]) -> String {
     let mut t = text.to_string();
     t = inline_format_wrappers(t);
     t = strip_macro_to_string(&t);
     t = compound_assign(&t);
     t = drop_dead_ret_register(&t);
     t = collapse_double_parens(&t);
-    t = drop_single_use_clones(&t);
+    t = drop_single_use_clones(&t, promoted_locals);
     t = drop_redundant_mut(&t);
     t
 }
@@ -3127,7 +3128,13 @@ fn count_ident(t: &str, name: &str) -> usize {
 /// no later use to invalidate the move, so the clone is pure allocation.
 /// Vetoed inside loop bodies (a move there would be observed on the next
 /// iteration) and for anything but a plain identifier.
-fn drop_single_use_clones(t: &str) -> String {
+/// `p0`, `p1`, … — a function's positional parameter, emitted as a binding.
+fn is_positional_ident(name: &str) -> bool {
+    let mut chars = name.chars();
+    chars.next() == Some('p') && chars.clone().next().is_some() && chars.all(|c| c.is_ascii_digit())
+}
+
+fn drop_single_use_clones(t: &str, promoted_locals: &[String]) -> String {
     let b = t.as_bytes();
     let loops = loop_body_ranges(t);
     let mut edits: Vec<(usize, usize)> = Vec::new();
@@ -3144,6 +3151,14 @@ fn drop_single_use_clones(t: &str) -> String {
         }
         let name = &t[ls..at];
         if name.as_bytes()[0].is_ascii_digit() {
+            continue;
+        }
+        // Only a real single-use BINDING qualifies: a promoted local, or a
+        // positional parameter (`p0`, `p1`, …) of the enclosing function —
+        // both are bound exactly once. A store accessor's parameter, a helper
+        // local or a match-arm binding is not, and rewriting one of those
+        // (the pass only counts identifier occurrences) miscompiles.
+        if !promoted_locals.iter().any(|n| n == name) && !is_positional_ident(name) {
             continue;
         }
         if loops.iter().any(|&(s0, e0)| at > s0 && at < e0) {
@@ -3609,7 +3624,18 @@ pub fn shir_to_rust_with_census(prog: &IrProgram) -> RustEmit {
     // `inline_simple_helpers` (which creates the `println!` shapes it
     // folds) and before the pruning passes (which then see the reduced set
     // of references).
-    let text = idiom_peephole(&text);
+    // The `.clone()` dropper may only touch a PROMOTED LOCAL: it decides by
+    // counting identifier occurrences, and a helper-internal match arm
+    // (`__ShVal::Words(w) => w.clone()`) binds the same name twice without
+    // being a single-use binding, so the allowlist is what keeps the pass
+    // from rewriting storage/helper code it does not understand.
+    let local_idents: Vec<String> = r
+        .mangle
+        .iter()
+        .filter(|(name, _)| r.local_vars.contains_key(name.as_str()))
+        .map(|(_, base)| base.clone())
+        .collect();
+    let text = idiom_peephole(&text, &local_idents);
     // No `echo -e` anywhere: every surviving `__sh_print_words(…, false)`
     // call passes the literal `false` for `esc`, so the argument goes and
     // the two-argument `print_words_noesc` helper is the one emitted. Runs
@@ -4674,11 +4700,84 @@ impl Render {
 
     /// The thread_local static name for a var — a nameref redirects to
     /// its target's static.
+    /// The store KEY of a var, as a Rust string literal: every access to a
+    /// variable the promotion slice left alone goes through `__sh_v_*` with
+    /// this key, so the whole population lives in ONE store
+    /// (`__SH_VARS`) instead of a `thread_local!` per name. A site that
+    /// still renders the key as an identifier is a compile error in the
+    /// generated program, not a silent miss.
     fn tls(&mut self, name: &str) -> String {
         if let Some(t) = self.namerefs.get(name).cloned() {
             return self.tls(&t);
         }
-        self.rust_ident(name)
+        self.add_helper("vars");
+        let cls = self.var_class(name);
+        self.add_helper(&format!("vars_{cls}"));
+        Self::rust_str(name)
+    }
+
+    /// The storage class a variable keeps inside the store. Same order as
+    /// the old per-name `thread_local!` declaration (which no longer
+    /// exists), so every accessor call and every value read agree.
+    fn var_class(&self, name: &str) -> &'static str {
+        if self.is_assoc(name) {
+            "m"
+        } else if self.is_int_array(name) {
+            "n"
+        } else if self.is_array(name) {
+            "w"
+        } else if self.is_num(name) {
+            "i"
+        } else {
+            "s"
+        }
+    }
+
+    /// The closure accessor for a var's class: `<key>.with(|v| BODY)`
+    /// became `__sh_vw_<class>("NAME", |v| BODY)`.
+    fn vw(&mut self, name: &str, body: &str) -> String {
+        let k = self.tls(name);
+        let f = self.var_class(name);
+        self.add_helper(&format!("vars_{f}"));
+        format!("__sh_vw_{f}({k}, |v| {body})")
+    }
+
+    /// Plain getters (no closure, no write-back): one per stored class.
+    fn v_i(&mut self, name: &str) -> String {
+        self.add_helper("vars_i");
+        let k = self.tls(name);
+        format!("__sh_v_i({k})")
+    }
+    fn v_s(&mut self, name: &str) -> String {
+        self.add_helper("vars_s");
+        let k = self.tls(name);
+        format!("__sh_v_s({k})")
+    }
+    fn v_w(&mut self, name: &str) -> String {
+        self.add_helper("vars_w");
+        let k = self.tls(name);
+        format!("__sh_v_w({k})")
+    }
+    fn v_n(&mut self, name: &str) -> String {
+        self.add_helper("vars_n");
+        let k = self.tls(name);
+        format!("__sh_v_n({k})")
+    }
+    fn v_m(&mut self, name: &str) -> String {
+        self.add_helper("vars_m");
+        let k = self.tls(name);
+        format!("__sh_v_m({k})")
+    }
+    fn v_len(&mut self, name: &str) -> String {
+        self.add_helper("vars_len");
+        let k = self.tls(name);
+        format!("__sh_v_len({k})")
+    }
+    /// Store a whole value of the given class.
+    fn v_store(&mut self, name: &str, cls: &str, e: &str) -> String {
+        self.add_helper(&format!("vars_{cls}"));
+        let k = self.tls(name);
+        format!("__sh_v_set_{cls}({k}, {});", Self::unparen(e))
     }
 
     /// Pass-2: does this name render as a plain Rust local?
@@ -4730,8 +4829,7 @@ impl Render {
         if self.local_vars.contains_key(name) {
             return self.var_ident(name);
         }
-        let m = self.tls(name);
-        format!("{m}.with(|v| v.get())")
+        self.v_i(name)
     }
 
     fn read_str(&mut self, name: &str) -> String {
@@ -4777,8 +4875,7 @@ impl Render {
             }
             return format!("{}.clone()", self.var_ident(name));
         }
-        let m = self.tls(name);
-        format!("{m}.with(|v| v.borrow().clone())")
+        self.v_s(name)
     }
 
     /// A string read where an OWNED `String` is required (a `Vec<String>`
@@ -4818,10 +4915,7 @@ impl Render {
             && !name.chars().all(|c| c.is_ascii_digit())
             && !matches!(name, "?" | "#" | "@" | "*" | "$" | "!" | "-")
         {
-            let m = self.tls(name);
-            return format!(
-                "{m}.with(|v| v.borrow().trim().parse::<i64>().unwrap_or(0))"
-            );
+            return self.v_i(name);
         }
         format!("{}.trim().parse::<i64>().unwrap_or(0)", self.read_str(name))
     }
@@ -4833,15 +4927,9 @@ impl Render {
             let m = self.ident_base(name);
             return format!("{m}.to_vec()");
         }
-        let m = self.tls(name);
-        // an int home read into a `Vec<String>` context stringifies per
-        // element (keeps every word-list consumer compiling); the verdict
-        // guarantees no such consumer exists for a homed array, so this
-        // is dead-defensive, never live.
-        if self.is_int_array(name) {
-            return format!("{m}.with(|v| v.borrow().iter().map(|n| Word::Owned(n.to_string())).collect::<Vec<Word>>())");
-        }
-        format!("{m}.with(|v| v.borrow().clone())")
+        // the store's word view stringifies an int home per element, so ONE
+        // getter serves both array classes
+        self.v_w(name)
     }
 
     /// A pass-2 local write: the FIRST write *is* the `let` (so there is
@@ -4920,16 +5008,14 @@ impl Render {
         if self.local_vars.contains_key(name) {
             return self.local_write_stmt(name, e);
         }
-        let m = self.tls(name);
-        format!("{m}.with(|v| v.set({}));", Self::unparen(e))
+        self.v_store(name, "i", e)
     }
 
     fn write_str(&mut self, name: &str, e: &str) -> String {
         if self.local_vars.contains_key(name) {
             return self.local_write_stmt(name, e);
         }
-        let m = self.tls(name);
-        format!("{m}.with(|v| *v.borrow_mut() = {});", Self::unparen(e))
+        self.v_store(name, "s", e)
     }
 
     /// Bind a string loop variable from a STATIC word list: the element
@@ -4947,8 +5033,7 @@ impl Render {
             let m = self.ident_base(name);
             return format!("{m} = {};", Self::unparen(e));
         }
-        let m = self.tls(name);
-        format!("{m}.with(|v| *v.borrow_mut() = {});", Self::unparen(e))
+        self.v_store(name, "w", e)
     }
 
     fn push_arr(&mut self, name: &str, e: &str) -> String {
@@ -4958,23 +5043,22 @@ impl Render {
             !self.is_local_array(name),
             "rust_backend: append to constant-length array `{name}`"
         );
-        let m = self.tls(name);
         if self.is_int_array(name) {
-            return format!(
-                "{m}.with(|v| v.borrow_mut().push(({}).trim().parse::<i64>().unwrap_or(0)));",
+            let body = format!(
+                "v.borrow_mut().push(({}).trim().parse::<i64>().unwrap_or(0));",
                 Self::unparen(e)
             );
+            return self.vw(name, &body);
         }
-        format!("{m}.with(|v| v.borrow_mut().push(({}).into()));", Self::unparen(e))
+        let body = format!("v.borrow_mut().push(({}).into());", Self::unparen(e));
+        self.vw(name, &body)
     }
 
     fn clear_var(&mut self, name: &str) -> String {
         if self.is_assoc(name) {
-            let m = self.tls(name);
-            format!("{m}.with(|v| v.borrow_mut().clear());")
+            self.vw(name, "v.borrow_mut().clear();")
         } else if self.is_array(name) {
-            let m = self.tls(name);
-            format!("{m}.with(|v| v.borrow_mut().clear());")
+            self.vw(name, "v.borrow_mut().clear();")
         } else if self.is_num(name) {
             self.write_num(name, "0")
         } else {
@@ -5089,17 +5173,17 @@ impl Render {
             // key proven non-negative: render with usize — no i64 temp,
             // no negative-wrap, no `as usize` cast at the index site.
             format!(
-                "{{ let __k = {key} as usize; let __n = {m}.with(|v| v.borrow().len()); \
+                "{{ let __k = {key} as usize; let __n = __sh_v_len({m}) as usize; \
                    if __k >= __n {{ std::process::exit(1); }} \
-                   {m}.with(|v| v.borrow()[__k].clone()) }}"
+                   __sh_v_w_at({m}, __k) }}"
             )
         } else {
             // key is i64 expr (may be negative); len from Vec.
             format!(
-                "{{ let __k = {key}; let __n = {m}.with(|v| v.borrow().len()) as i64; \
+                "{{ let __k = {key}; let __n = __sh_v_len({m}) as i64; \
                    let __idx = if __k < 0 {{ __n + __k }} else {{ __k }}; \
                    if __idx < 0 || __idx >= __n {{ std::process::exit(1); }} \
-                   {m}.with(|v| v.borrow()[__idx as usize].clone()) }}"
+                   __sh_v_w_at({m}, __idx as usize) }}"
             )
         }
     }
@@ -5127,10 +5211,10 @@ impl Render {
         }
         let m = self.tls(var);
         format!(
-            "{{ let __k = {key}; let __n = {m}.with(|v| v.borrow().len()) as i64; \
+            "{{ let __k = {key}; let __n = __sh_v_len({m}) as i64; \
                let __idx = if __k < 0 {{ __n + __k }} else {{ __k }}; \
                if __idx < 0 || __idx >= __n {{ std::process::exit(1); }} \
-               {m}.with(|v| v.borrow()[__idx as usize]) }}"
+               __sh_v_n_at({m}, __idx as usize) }}"
         )
     }
 
@@ -5144,7 +5228,7 @@ impl Render {
             );
         }
         let m = self.tls(name);
-        format!("{m}.with(|v| v.borrow().get({key} as usize).map(|w| w.to_string()).unwrap_or_default())")
+        format!("__sh_v_w_at({m}, {key} as usize).to_string()")
     }
 
     /// Array element write (index arrays; grows as needed). The value is
@@ -5185,12 +5269,12 @@ impl Render {
         let m = self.tls(name);
         if self.is_int_array(name) {
             return format!(
-                "{{ let __val = ({val}).trim().parse::<i64>().unwrap_or(0); {m}.with(|v| {{ let mut b = v.borrow_mut(); let i = {key} as usize; \
+                "{{ let __val = ({val}).trim().parse::<i64>().unwrap_or(0); __sh_vw_n({m}, |v| {{ let mut b = v.borrow_mut(); let i = {key} as usize; \
                  if b.len() <= i {{ b.resize(i + 1, 0); }} b[i] = __val; }}); }}"
             );
         }
         format!(
-            "{{ let __val = {val}; {m}.with(|v| {{ let mut b = v.borrow_mut(); let i = {key} as usize; \
+            "{{ let __val = {val}; __sh_vw_n({m}, |v| {{ let mut b = v.borrow_mut(); let i = {key} as usize; \
              if b.len() <= i {{ b.resize(i + 1, Word::Borrowed(\"\")); }} b[i] = __val.into(); }}); }}"
         )
     }
@@ -5198,18 +5282,18 @@ impl Render {
     /// Assoc-map read.
     fn assoc_get(&mut self, name: &str, key: &str) -> String {
         let m = self.tls(name);
-        format!("{m}.with(|v| v.borrow().get(&{key}).cloned().unwrap_or_default())")
+        format!("__sh_v_m_get({m}, &{key})")
     }
 
     fn assoc_set(&mut self, name: &str, key: &str, val: &str) -> String {
         let m = self.tls(name);
-        format!("{m}.with(|v| {{ v.borrow_mut().insert({key}, {val}); }});")
+        format!("__sh_v_m_set({m}, &{key}, &{val});")
     }
 
     /// `${!map[@]}` keys.
     fn assoc_keys(&mut self, name: &str) -> String {
         let m = self.tls(name);
-        format!("{m}.with(|v| v.borrow().keys().cloned().collect::<Vec<String>>())")
+        format!("__sh_v_m_keys({m})")
     }
 
     fn array_len(&mut self, name: &str) -> String {
@@ -5219,7 +5303,7 @@ impl Render {
             return format!("{n}i64");
         }
         let m = self.tls(name);
-        format!("{m}.with(|v| v.borrow().len() as i64)")
+        format!("__sh_v_len({m})")
     }
 
     /// Declare an array var with the given element expressions.
@@ -5476,7 +5560,7 @@ impl Render {
                 if let Some(IrExpr::Str(name, _)) = args.first() {
                     if self.is_assoc(name) {
                         let m = self.tls(name);
-                        format!("{m}.with(|v| v.borrow().len() as i64)")
+                        format!("__sh_v_len({m})")
                     } else {
                         self.array_len(name)
                     }
@@ -5513,19 +5597,19 @@ impl Render {
                         // parse (t92 `max(xs)` over a literal int list)
                         if self.is_int_array(name) {
                             if func == "sum" {
-                                return format!("{{ let __vv = {m}.with(|v| v.borrow().clone()); __vv.iter().copied().sum::<i64>() }}");
+                                return format!("{{ let __vv = __sh_v_n({m}); __vv.iter().copied().sum::<i64>() }}");
                             } else if func == "max" {
-                                return format!("{{ let __vv = {m}.with(|v| v.borrow().clone()); __vv.iter().copied().max().unwrap_or(0) }}");
+                                return format!("{{ let __vv = __sh_v_n({m}); __vv.iter().copied().max().unwrap_or(0) }}");
                             } else {
-                                return format!("{{ let __vv = {m}.with(|v| v.borrow().clone()); __vv.iter().copied().min().unwrap_or(0) }}");
+                                return format!("{{ let __vv = __sh_v_n({m}); __vv.iter().copied().min().unwrap_or(0) }}");
                             }
                         }
                         if func == "sum" {
-                            format!("{{ let __vv = {m}.with(|v| v.borrow().clone()); __vv.iter().map(|s| s.trim().parse::<i64>().unwrap_or(0)).sum::<i64>() }}")
+                            format!("{{ let __vv = __sh_v_w({m}); __vv.iter().map(|s| s.trim().parse::<i64>().unwrap_or(0)).sum::<i64>() }}")
                         } else if func == "max" {
-                            format!("{{ let __vv = {m}.with(|v| v.borrow().clone()); __vv.iter().map(|s| s.trim().parse::<i64>().unwrap_or(0)).max().unwrap_or(0) }}")
+                            format!("{{ let __vv = __sh_v_w({m}); __vv.iter().map(|s| s.trim().parse::<i64>().unwrap_or(0)).max().unwrap_or(0) }}")
                         } else {
-                            format!("{{ let __vv = {m}.with(|v| v.borrow().clone()); __vv.iter().map(|s| s.trim().parse::<i64>().unwrap_or(0)).min().unwrap_or(0) }}")
+                            format!("{{ let __vv = __sh_v_w({m}); __vv.iter().map(|s| s.trim().parse::<i64>().unwrap_or(0)).min().unwrap_or(0) }}")
                         }
                     }
                     None => "0".to_string(),
@@ -6639,8 +6723,12 @@ impl Render {
                         }
                     }
                 }
-                let exported = matches!(cmd, "export" | "readonly");
-                self.decl_words(&words, exported);
+                let exported = matches!(cmd, "export");
+                // `readonly NAME[=v]` / `declare -r`: the attribute lives in
+                // the store, and it is marked AFTER the value is written
+                // (bash sets the value, then makes the name readonly).
+                let is_readonly_cmd = cmd == "readonly";
+                self.decl_words(&words, exported, is_readonly_cmd);
                 self.emit("__SH_RC.store(0, Ordering::SeqCst);");
             }
             "unset" => {
@@ -6703,11 +6791,11 @@ impl Render {
                     let m = self.tls(&var);
                     if strip_nl {
                         self.emit(&format!(
-                            "{{ let mut __lines: Vec<String> = Vec::new(); loop {{ let (__ln, __any) = __sh_readline(); if !__any {{ break; }} __lines.push(__ln); }} {m}.with(|v| *v.borrow_mut() = __lines); }}"
+                            "{{ let mut __lines: Vec<String> = Vec::new(); loop {{ let (__ln, __any) = __sh_readline(); if !__any {{ break; }} __lines.push(__ln); }} __sh_v_set_w({m}, __lines.into_iter().map(Word::Owned).collect()); }}"
                         ));
                     } else {
                         self.emit(&format!(
-                            "{{ let mut __lines: Vec<String> = Vec::new(); loop {{ let (__ln, __any) = __sh_readline(); if !__any {{ break; }} __lines.push(format!(\"{{}}\\n\", __ln)); }} {m}.with(|v| *v.borrow_mut() = __lines); }}"
+                            "{{ let mut __lines: Vec<String> = Vec::new(); loop {{ let (__ln, __any) = __sh_readline(); if !__any {{ break; }} __lines.push(format!(\"{{}}\\n\", __ln)); }} __sh_v_set_w({m}, __lines.into_iter().map(Word::Owned).collect()); }}"
                         ));
                     }
                 }
@@ -6897,10 +6985,10 @@ impl Render {
                     let m = self.tls(v);
                     let st = if self.is_num(v) {
                         format!(
-                            "{m}.with(|v| v.set(__v.trim().parse::<i64>().unwrap_or(0)))"
+                            "__sh_v_set_i({m}, __v.trim().parse::<i64>().unwrap_or(0))"
                         )
                     } else {
-                        format!("{m}.with(|v| *v.borrow_mut() = __v.trim().to_string())")
+                        format!("__sh_v_set_s({m}, __v.trim().to_string())")
                     };
                     assigns.push(format!(
                         "if __n == {} {{ let __v = __val.trim_matches(|c| c == '\\'' || c == '\\\"'); {st}; }}",
@@ -7204,12 +7292,16 @@ impl Render {
         self.mark_written(&name.to_string());
     }
 
-    fn decl_words(&mut self, words: &[&IrExpr], exported: bool) {
+    fn decl_words(&mut self, words: &[&IrExpr], exported: bool, readonly_cmd: bool) {
         let mut i = 0;
         // `typeset -x name=val` — the -x flag exports the name;
         // `typeset -n ref=target` — a nameref (no own storage)
         let mut xflag = false;
         let mut nflag = false;
+        // `readonly NAME[=v]` names to mark once the whole decl is written
+        // (bash writes the value first, then makes the name readonly)
+        let mut mark_ro: Vec<String> = Vec::new();
+        let is_readonly_cmd = readonly_cmd;
         while i < words.len() {
             // `local -a args=(...)` — the core nests the whole setArray
             // call as ONE word (not a "setArray" Str + trailing args)
@@ -7269,7 +7361,10 @@ impl Render {
                                     'i' => { self.int_vars.insert(n.clone()); }
                                     'l' => { self.lower_vars.insert(n.clone()); }
                                     'u' => { self.upper_vars.insert(n.clone()); }
-                                    'r' => { self.readonly_vars.insert(n.clone()); }
+                                    'r' => {
+                                        self.readonly_vars.insert(n.clone());
+                                        mark_ro.push(n.clone());
+                                    }
                                     _ => {}
                                 }
                             }
@@ -7362,17 +7457,20 @@ impl Render {
                         self.emit(&stmt);
                         self.mark_written(&name.to_string());
                         if exported || xflag {
-                            // export: the value must reach bash -c children
-                            let ve = if let Some(e) = value_expr {
-                                self.expr_any(e)
-                            } else {
-                                Self::rust_str_expr(val)
-                            };
-                            self.emit(&format!(
-                                "std::env::set_var({}, &{ve});",
-                                Self::rust_str(&name)
-                            ));
+                            // export: the flag lives in the store, so every
+                            // later write keeps the child environment in
+                            // sync (a one-shot `set_var` here would hand a
+                            // child the value this name had at export time)
+                            let m = self.tls(&name);
+                            self.emit(&format!("__sh_v_export({m});"));
                             xflag = false;
+                            if is_readonly_cmd {
+                                self.readonly_vars.insert(name.to_string());
+                                mark_ro.push(name.to_string());
+                            }
+                        } else if is_readonly_cmd {
+                            self.readonly_vars.insert(name.to_string());
+                            mark_ro.push(name.to_string());
                         }
                     }
                 } else if ws.contains('[') {
@@ -7383,17 +7481,22 @@ impl Render {
                     // a bare name — already declared by the hoist
                     self.mark_written(ws);
                     if exported || xflag {
-                        // `export NAME` — push the current value out
-                        let cur = self.read_str(ws);
-                        self.emit(&format!(
-                            "std::env::set_var({}, &{cur});",
-                            Self::rust_str(ws)
-                        ));
+                        // `export NAME` — flag it in the store and push the
+                        // value it currently holds into the environment
+                        let m = self.tls(ws);
+                        self.emit(&format!("__sh_v_export({m});"));
                         xflag = false;
+                    } else if is_readonly_cmd {
+                        self.readonly_vars.insert(ws.to_string());
+                        mark_ro.push(ws.to_string());
                     }
                 }
             }
             i += 1;
+        }
+        for n in mark_ro {
+            let m = self.tls(&n);
+            self.emit(&format!("__sh_v_mark_readonly({m});"));
         }
     }
 
@@ -7409,13 +7512,13 @@ impl Render {
                         if self.is_assoc(&var) {
                             let k = self.assoc_key_expr(&key);
                             let m = self.tls(&var);
-                            let st = format!("{m}.with(|v| {{ v.borrow_mut().remove(&{k}); }});");
+                            let st = format!("__sh_v_m_remove({m}, &{k});");
                             self.emit(&st);
                         } else if self.is_array(&var) {
                             let m = self.tls(&var);
                             let ki = self.key_num_expr(&key);
                             let st = format!(
-                                "{m}.with(|v| {{ let mut b = v.borrow_mut(); let i = {ki} as usize; if i < b.len() {{ b[i] = String::new(); }} }});"
+                                "__sh_vw_w({m}, |v| {{ let mut b = v.borrow_mut(); let i = {ki} as usize; if i < b.len() {{ b[i] = Word::Borrowed(\"\"); }} }});"
                             );
                             self.emit(&st);
                         }
@@ -7426,8 +7529,14 @@ impl Render {
                     continue;
                 }
                 self.mark_written(name);
-                let st = self.clear_var(name);
-                self.emit(&st);
+                if self.is_local(name) {
+                    let st = self.clear_var(name);
+                    self.emit(&st);
+                } else {
+                    // the store's own unset: a readonly name refuses
+                    let m = self.tls(name);
+                    self.emit(&format!("__sh_v_unset({m});"));
+                }
                 std::env::remove_var(name);
             }
         }
@@ -7501,7 +7610,12 @@ impl Render {
                 // `__f` is a `Vec<Word>`: `.to_string()` materializes the
                 // value for the String/binding targets below, and the
                 // numeric arms still parse through `str`
-                let get = format!("__f.get({idx}).cloned().unwrap_or_default().to_string()");
+                let at = if idx == 0 {
+                    "__f.first()".to_string()
+                } else {
+                    format!("__f.get({idx})")
+                };
+                let get = format!("{at}.cloned().unwrap_or_default().to_string()");
                 // A pure expression builder must not touch the output
                 // buffer: `write_str`/`write_num` call `emit`, which
                 // appends (depth-indented) to `self.out` AND can push a
@@ -7540,11 +7654,11 @@ impl Render {
                 } else if self.is_num(name) {
                     let m = self.tls(name);
                     lines.push(format!(
-                        "{m}.with(|v| v.set({get}.trim().parse::<i64>().unwrap_or(0)));"
+                        "__sh_v_set_i({m}, {get}.trim().parse::<i64>().unwrap_or(0));"
                     ));
                 } else {
                     let m = self.tls(name);
-                    lines.push(format!("{m}.with(|v| *v.borrow_mut() = {get});"));
+                    lines.push(format!("__sh_v_set_s({m}, {get});"));
                 }
             }
         }
@@ -8170,8 +8284,7 @@ impl Render {
                                 "__vv.iter().copied().min().map(|v| v.to_string()).unwrap_or_default()"
                             };
                             let mut s = String::from("vec![{ let __vv = ");
-                            s.push_str(&m);
-                            s.push_str(".with(|v| v.borrow().clone()); ");
+                            s.push_str(&self.v_n(name));
                             s.push_str(op);
                             s.push_str(" }] ");
                             return s;
@@ -8184,8 +8297,7 @@ impl Render {
                             "if __vv.is_empty() { String::new() } else { let mut __m = __vv[0].trim().parse::<num_bigint::BigInt>().unwrap_or(num_bigint::BigInt::from(0)); for __e in __vv.iter().skip(1) { let __v = __e.trim().parse::<num_bigint::BigInt>().unwrap_or(num_bigint::BigInt::from(0)); if __v < __m { __m = __v; } } __m.to_string() }"
                         };
                         let mut s = String::from("vec![{ let __vv = ");
-                        s.push_str(&m);
-                        s.push_str(".with(|v| v.borrow().clone()); ");
+                        s.push_str(&self.v_n(name));
                         s.push_str(op);
                         s.push_str(" }] ");
                         s
@@ -8239,8 +8351,7 @@ impl Render {
                     Some(name) => {
                         let m = self.tls(name);
                         let mut s = String::from("vec![{ let mut __sv = ");
-                        s.push_str(&m);
-                        s.push_str(".with(|v| v.borrow().clone()); ");
+                        s.push_str(&self.v_n(name));
                         s.push_str("__sv.sort_by(|a, b| { let av: num_bigint::BigInt = a.trim().parse().unwrap_or(num_bigint::BigInt::from(0)); let bv: num_bigint::BigInt = b.trim().parse().unwrap_or(num_bigint::BigInt::from(0)); av.cmp(&bv) }); ");
                         s.push_str("__sv.dedup_by(|a, b| { let av: num_bigint::BigInt = a.trim().parse().unwrap_or(num_bigint::BigInt::from(0)); let bv: num_bigint::BigInt = b.trim().parse().unwrap_or(num_bigint::BigInt::from(0)); av == bv }); ");
                         s.push_str("__sv.join(\", \") }] ");
@@ -8284,7 +8395,7 @@ impl Render {
                 self.mark_written(len_name);
                 let l = if self.is_assoc(len_name) {
                     let m = self.tls(len_name);
-                    format!("{m}.with(|v| v.borrow().len() as i64)")
+                    format!("__sh_v_len({m})")
                 } else {
                     self.array_len(len_name)
                 };
@@ -10016,7 +10127,7 @@ impl Render {
             };
             // clear target
             let m = self.tls(name);
-            self.emit(&format!("{m}.with(|v| v.borrow_mut().clear());"));
+            self.emit(&format!("__sh_v_set_w({m}, Vec::new());"));
             // literal items vec (strings; numeric text preserved)
             let mut lit_parts = Vec::new();
             for it in &items {
@@ -10051,7 +10162,7 @@ impl Render {
             }
             // push elem
             let ev = self.expr_str(elem);
-            self.emit(&format!("{m}.with(|v| v.borrow_mut().push({ev}));"));
+            self.emit(&format!("__sh_vw_w({m}, |v| v.borrow_mut().push(Word::Owned({ev})));"));
             if cond.is_some() {
                 self.depth -= 1;
                 self.emit("}");
@@ -10074,7 +10185,7 @@ impl Render {
             self.add_helper("cat");
             let m = self.tls(name);
             self.emit(&format!(
-                "{{ let __words = __sh_cat(&[{}]); {m}.with(|v| {{ let mut __m = v.borrow_mut(); __m.clear(); \
+                "{{ let __words = __sh_cat(&[{}]); __sh_vw_m({m}, |v| {{ let mut __m = v.borrow_mut(); __m.clear(); \
                  for __w in __words {{ if let Some(rest) = __w.strip_prefix('[') {{ \
                  if let Some(eq) = rest.find(']') {{ let __k = rest[..eq].to_string(); \
                  let __v = rest[eq + 2..].to_string(); __m.insert(__k, __v); }} }} }} }}); }}",
@@ -10153,13 +10264,13 @@ impl Render {
         if self.is_int_array(name) {
             // int home: parse each pushed word once, on the way in
             self.emit(&format!(
-                "{m}.with(|v| {{ let mut b = v.borrow_mut(); for __w in __sh_cat(&[{}]) {{ b.push(__w.trim().parse::<i64>().unwrap_or(0)); }} }});",
+                "__sh_vw_n({m}, |v| {{ let mut b = v.borrow_mut(); for __w in __sh_cat(&[{}]) {{ b.push(__w.trim().parse::<i64>().unwrap_or(0)); }} }});",
                 items.join(", ")
             ));
             return;
         }
         self.emit(&format!(
-            "{m}.with(|v| {{ let mut b = v.borrow_mut(); for __w in __sh_cat(&[{}]) {{ b.push(__w); }} }});",
+            "__sh_vw_w({m}, |v| {{ let mut b = v.borrow_mut(); for __w in __sh_cat(&[{}]) {{ b.push(__w); }} }});",
             items.join(", ")
         ));
     }
@@ -10613,7 +10724,7 @@ impl Render {
                 self.mark_written(len_name);
                 let l = if self.is_assoc(len_name) {
                     let m = self.tls(len_name);
-                    format!("{m}.with(|v| v.borrow().len() as i64)")
+                    format!("__sh_v_len({m})")
                 } else {
                     self.array_len(len_name)
                 };
@@ -10631,7 +10742,7 @@ impl Render {
                 self.mark_written(&var);
                 if self.is_assoc(&var) {
                     let m = self.tls(&var);
-                    return format!("{m}.with(|v| {{ let mut __vs = v.borrow().values().cloned().collect::<Vec<String>>(); __vs.sort(); __vs.join(\" \") }})");
+                    return format!("{{ let mut __vs = __sh_v_m_values({m}); __vs.sort(); __vs.join(\" \") }}");
                 }
                 if self.is_array(&var) {
                     return format!("{}.join(\" \")", self.read_arr(&var));
@@ -10674,7 +10785,7 @@ impl Render {
                 // `${map[@]}` / `${map[*]}` — the VALUES (bash); the
                 // `${!map[@]}` keys form is handled by the `!` branch
                 let m = self.tls(var);
-                return format!("{m}.with(|v| {{ let mut __vs = v.borrow().values().cloned().collect::<Vec<String>>(); __vs.sort(); __vs.join(\" \") }})");
+                return format!("{{ let mut __vs = __sh_v_m_values({m}); __vs.sort(); __vs.join(\" \") }}");
             }
             if self.is_array(var) {
                 self.mark_written(var);
@@ -10993,19 +11104,19 @@ impl Render {
                         let m = self.tls(name);
                         if self.is_int_array(name) {
                             if func == "sum" {
-                                return format!("{{ let __vv = {m}.with(|v| v.borrow().clone()); __vv.iter().copied().sum::<i64>().to_string() }}");
+                                return format!("{{ let __vv = __sh_v_n({m}); __vv.iter().copied().sum::<i64>().to_string() }}");
                             } else if func == "max" {
-                                return format!("{{ let __vv = {m}.with(|v| v.borrow().clone()); __vv.iter().copied().max().map(|v| v.to_string()).unwrap_or_default() }}");
+                                return format!("{{ let __vv = __sh_v_n({m}); __vv.iter().copied().max().map(|v| v.to_string()).unwrap_or_default() }}");
                             } else {
-                                return format!("{{ let __vv = {m}.with(|v| v.borrow().clone()); __vv.iter().copied().min().map(|v| v.to_string()).unwrap_or_default() }}");
+                                return format!("{{ let __vv = __sh_v_n({m}); __vv.iter().copied().min().map(|v| v.to_string()).unwrap_or_default() }}");
                             }
                         }
                         if func == "sum" {
-                            format!("{{ let __vv = {m}.with(|v| v.borrow().clone()); __vv.iter().map(|s| s.trim().parse::<i64>().unwrap_or(0)).sum::<i64>().to_string() }}")
+                            format!("{{ let __vv = __sh_v_w({m}); __vv.iter().map(|s| s.trim().parse::<i64>().unwrap_or(0)).sum::<i64>().to_string() }}")
                         } else if func == "max" {
-                            format!("{{ let __vv = {m}.with(|v| v.borrow().clone()); __vv.iter().map(|s| s.trim().parse::<i64>().unwrap_or(0)).max().map(|v| v.to_string()).unwrap_or_default() }}")
+                            format!("{{ let __vv = __sh_v_w({m}); __vv.iter().map(|s| s.trim().parse::<i64>().unwrap_or(0)).max().map(|v| v.to_string()).unwrap_or_default() }}")
                         } else {
-                            format!("{{ let __vv = {m}.with(|v| v.borrow().clone()); __vv.iter().map(|s| s.trim().parse::<i64>().unwrap_or(0)).min().map(|v| v.to_string()).unwrap_or_default() }}")
+                            format!("{{ let __vv = __sh_v_w({m}); __vv.iter().map(|s| s.trim().parse::<i64>().unwrap_or(0)).min().map(|v| v.to_string()).unwrap_or_default() }}")
                         }
                     }
                     None => "String::new()".to_string(),
@@ -11021,9 +11132,9 @@ impl Render {
                         // and stringify only for the join (t86 `sorted()`
                         // over an int-homed factor list)
                         if self.is_int_array(name) {
-                            return format!("{{ let mut __sv = {m}.with(|v| v.borrow().clone()); __sv.sort_unstable(); __sv.dedup(); __sv.iter().map(|n| n.to_string()).collect::<Vec<String>>().join(\", \") }}");
+                            return format!("{{ let mut __sv = __sh_v_n({m}); __sv.sort_unstable(); __sv.dedup(); __sv.iter().map(|n| n.to_string()).collect::<Vec<String>>().join(\", \") }}");
                         }
-                        format!("{{ let mut __sv = {m}.with(|v| v.borrow().clone()); __sv.sort_by_key(|s| s.trim().parse::<i64>().unwrap_or(0)); __sv.dedup_by(|a, b| a.trim().parse::<i64>().unwrap_or(0) == b.trim().parse::<i64>().unwrap_or(0));  __sv.join(\", \") }}")
+                        format!("{{ let mut __sv = __sh_v_w({m}); __sv.sort_by_key(|s| s.trim().parse::<i64>().unwrap_or(0)); __sv.dedup_by(|a, b| a.trim().parse::<i64>().unwrap_or(0) == b.trim().parse::<i64>().unwrap_or(0));  __sv.join(\", \") }}")
                     }
                     None => "String::new()".to_string(),
                 }
@@ -11032,7 +11143,7 @@ impl Render {
                 match str_arg(args, 0) {
                     Some(name) => {
                         let m = self.tls(name);
-                        format!("{{ let mut __sv = {m}.with(|v| v.borrow().clone()); __sv.sort_by(|a, b| {{ let av: num_bigint::BigInt = a.trim().parse().unwrap_or(num_bigint::BigInt::from(0)); let bv: num_bigint::BigInt = b.trim().parse().unwrap_or(num_bigint::BigInt::from(0)); av.cmp(&bv) }}); __sv.dedup_by(|a, b| {{ let av: num_bigint::BigInt = a.trim().parse().unwrap_or(num_bigint::BigInt::from(0)); let bv: num_bigint::BigInt = b.trim().parse().unwrap_or(num_bigint::BigInt::from(0)); av == bv }});  __sv.join(\", \") }}")
+                        format!("{{ let mut __sv = __sh_v_w({m}); __sv.sort_by(|a, b| {{ let av: num_bigint::BigInt = a.trim().parse().unwrap_or(num_bigint::BigInt::from(0)); let bv: num_bigint::BigInt = b.trim().parse().unwrap_or(num_bigint::BigInt::from(0)); av.cmp(&bv) }}); __sv.dedup_by(|a, b| {{ let av: num_bigint::BigInt = a.trim().parse().unwrap_or(num_bigint::BigInt::from(0)); let bv: num_bigint::BigInt = b.trim().parse().unwrap_or(num_bigint::BigInt::from(0)); av == bv }});  __sv.join(\", \") }}")
                     }
                     None => "String::new()".to_string(),
                 }
@@ -12740,8 +12851,8 @@ impl Render {
                     .expect("tag/type agree");
                 self.var_types.insert(fl.var.clone(), IrType::Str);
                 self.mark_written(&fl.var);
-                let m = self.rust_ident(&fl.var);
                 let src = self.expr_str(&fl.source);
+                let m = self.tls(&fl.var);
                 let iter = match &fl.limit {
                     Some(lim) => {
                         let lim_r = self.expr_num(lim);
@@ -12755,7 +12866,9 @@ impl Render {
                 self.depth += 1;
                 self.emit(&format!("for {} in {}.flatten() {{", fl.var, iter));
                 self.depth += 1;
-                self.emit(&format!("{}.with(|v| *v.borrow_mut() = {}.clone());", m, fl.var));
+                // the loop name lives in the ONE store like every other
+                // unpromoted variable
+                self.emit(&format!("__sh_v_set_s({m}, {}.clone());", fl.var));
                 for b in &fl.body {
                     self.stmt(b);
                 }
@@ -12785,13 +12898,10 @@ impl Render {
         for v in &written {
             let m = self.tls(v);
             let sv = self.gensym("__sh_sv");
-            if self.is_num(v) {
-                pre.push(format!("let {sv} = {m}.with(|v| v.get());"));
-                post.push(format!("{m}.with(|v| v.set({sv}));"));
-            } else {
-                pre.push(format!("let {sv} = {m}.with(|v| v.borrow().clone());"));
-                post.push(format!("{m}.with(|v| *v.borrow_mut() = {sv});"));
-            }
+            // the WHOLE entry (value plus exported/readonly) is what a
+            // subshell saves and puts back
+            pre.push(format!("let {sv} = __sh_v_save({m});"));
+            post.push(format!("__sh_v_restore_one({m}, {sv});"));
         }
         for p in pre {
             self.emit(&p);
@@ -12825,9 +12935,9 @@ impl Render {
             let m = self.tls(v);
             let cap = self.gensym("__sh_cap");
             if self.is_num(v) {
-                pre.push(format!("let mut {cap} = {m}.with(|v| v.get());"));
+                pre.push(format!("let mut {cap} = __sh_v_i({m});"));
             } else {
-                pre.push(format!("let mut {cap} = {m}.with(|v| v.borrow().clone());"));
+                pre.push(format!("let mut {cap} = __sh_v_s({m});"));
             }
             captured.insert(v.clone(), cap.clone());
         }
@@ -13156,6 +13266,20 @@ impl Render {
             self.emit("std::process::exit(__sh_final);");
         }
         std::mem::swap(&mut self.out, &mut body_out);
+        // A store write can be refused (`readonly`), and bash reports that as
+        // the assignment's status — but every statement writes its own status
+        // after it runs. In a program with a store, the status write asks the
+        // store whether the write immediately before it was refused.
+        if self.helpers.contains("vars") {
+            for line in body_out.iter_mut() {
+                if line.trim() == "__SH_RC.store(0, Ordering::SeqCst);" {
+                    *line = line.replace(
+                        "__SH_RC.store(0, Ordering::SeqCst);",
+                        "__SH_RC.store(if __sh_v_rc_trip() { 1 } else { 0 }, Ordering::SeqCst);",
+                    );
+                }
+            }
+        }
         self.depth = 0;
 
         // The thread_local var declarations are MODULE-level statics (the
@@ -13345,6 +13469,13 @@ impl Render {
         self.emit("static __SH_BG: std::sync::Mutex<Vec<(u32, std::process::Child)>> = std::sync::Mutex::new(Vec::new());");
         self.emit("static __SH_BGTHREADS: std::sync::Mutex<Vec<std::thread::JoinHandle<()>>> = std::sync::Mutex::new(Vec::new());");
         self.emit("static __SH_PIPESTATUS: std::sync::Mutex<Vec<i32>> = std::sync::Mutex::new(Vec::new());");
+        // the ONE home of every variable the promotion slice leaves alone —
+        // emitted only when the store is actually used (the `vars` helper
+        // carries `__ShVar`/`__ShVal`, and a program with no unpromoted
+        // variable must not carry a dead static)
+        if self.helpers.contains("vars") {
+            self.emit("thread_local! { static __SH_VARS: std::cell::RefCell<__ShStore> = const { std::cell::RefCell::new(__ShStore { vars: std::collections::BTreeMap::new(), ro_trip: false }) }; }");
+        }
         self.emit("static __SH_TRAPS: std::sync::Mutex<Vec<String>> = std::sync::Mutex::new(Vec::new());");
         self.emit("static __SH_BGPID: std::sync::atomic::AtomicI32 = std::sync::atomic::AtomicI32::new(0);");
         self.emit("static __SH_ARITH_ERR: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);");
@@ -13352,6 +13483,37 @@ impl Render {
     self.emit("static __SH_RET: std::sync::Mutex<String> = std::sync::Mutex::new(String::new());");
         self.emit("");
         self.out.extend(decl_out.iter().cloned());
+        // Any store accessor the rendered body names directly pulls in its
+        // own helper slice: the accessor methods cover the call sites that go
+        // through the API, this covers the raw format strings (an indexed
+        // read, an assoc key list, a reduction over a stored array).
+        {
+            let body_text = body_out.join("\n");
+            for (pat, h) in [
+                ("__sh_v_i(", "vars_i"),
+                ("__sh_v_set_i(", "vars_i"),
+                ("__sh_v_s(", "vars_s"),
+                ("__sh_v_set_s(", "vars_s"),
+                ("__sh_v_w(", "vars_w"),
+                ("__sh_v_set_w(", "vars_w"),
+                ("__sh_v_w_at(", "vars_w"),
+                ("__sh_v_n(", "vars_n"),
+                ("__sh_v_set_n(", "vars_n"),
+                ("__sh_v_n_at(", "vars_n"),
+                ("__sh_v_m(", "vars_m"),
+                ("__sh_v_set_m(", "vars_m"),
+                ("__sh_v_m_get(", "vars_m"),
+                ("__sh_v_m_set(", "vars_m"),
+                ("__sh_v_m_keys(", "vars_m"),
+                ("__sh_v_m_values(", "vars_m"),
+                ("__sh_v_m_remove(", "vars_m"),
+                ("__sh_v_len(", "vars_len"),
+            ] {
+                if body_text.contains(pat) {
+                    self.add_helper(h);
+                }
+            }
+        }
         for h in HELPER_ORDER {
             // `print_words` has a no-`esc` twin: when no echo used `-e`,
             // emit the variant that never references __sh_echo_esc and
@@ -13406,46 +13568,14 @@ impl Render {
 
     /// The thread_local declaration for one var.
     fn decl_stmt(&mut self, v: &str) -> String {
-        // pass-2 local: declared inline at the top of its owning scope
-        if self.local_vars.contains_key(v) {
-            return String::new();
-        }
-        // a nameref's own static is still declared (dead but harmless) —
-        // `unset ref` etc. may reference it before the binding renders
-        // The storage name is uppercase (`static_ident`), so the
-        // declaration is lint-clean without a `#[allow]`.
-        let m = self.rust_ident(v);
-        let a = "";
-        if self.is_assoc(v) {
-            format!(
-                "thread_local! {{ {a}static {m}: std::cell::RefCell<std::collections::BTreeMap<String, String>> = const {{ std::cell::RefCell::new(std::collections::BTreeMap::new()) }}; }}"
-            )
-        } else if self.is_int_array(v) {
-            // int-homed index array (all-integer writes, int-safe reads
-            // only): native `Vec<i64>` storage, no string round-trip
-            format!(
-                "thread_local! {{ {a}static {m}: std::cell::RefCell<Vec<i64>> = const {{ std::cell::RefCell::new(Vec::new()) }}; }}"
-            )
-        } else if self.is_array(v) {
-            format!(
-                "thread_local! {{ {a}static {m}: std::cell::RefCell<Vec<Word>> = const {{ std::cell::RefCell::new(Vec::new()) }}; }}"
-            )
-        } else if self.bigint_vars.contains(v) {
-            // BigInt-tainted: decimal string holder (ops parse per use;
-            // tier-0 string-BigInt). Looks like Str (RefCell<String>).
-            format!(
-                "thread_local! {{ {a}static {m}: std::cell::RefCell<String> = const {{ std::cell::RefCell::new(String::new()) }}; }}"
-            )
-        } else if self.is_num(v) {
-            format!(
-                "thread_local! {{ {a}static {m}: std::cell::Cell<i64> = const {{ std::cell::Cell::new(0) }}; }}"
-            )
-        } else {
-            format!(
-                "thread_local! {{ {a}static {m}: std::cell::RefCell<String> = const {{ std::cell::RefCell::new(String::new()) }}; }}"
-            )
-        }
+        // NO per-name storage declaration exists any more: a promoted local
+        // is declared inline at its first write, and every other variable
+        // lives in the ONE `__SH_VARS` store, created on first write
+        // (`__sh_v_put`). Nothing to emit.
+        let _ = v;
+        return String::new();
     }
+
 }
 
 impl Render {
@@ -13507,6 +13637,7 @@ const HELPER_ORDER: &[&str] = &[
     "mtime", "samefile", "fmode", "fowner", "fgroup", "fnewer", "wait_all", "bg",
     "fexists", "fdir", "freg", "fsym", "fread", "fwrite", "fexec", "fsize", "aindex",
     "div", "mod", "capture", "run_traps", "lines",
+    "vars", "vars_i", "vars_s", "vars_w", "vars_n", "vars_m", "vars_len",
 ];
 
 /// `__sh_*` names that are NOT in `HELPER_ORDER` but still own an
@@ -13616,6 +13747,9 @@ fn helper_deps(h: &str) -> &'static [&'static str] {
         "glob" => &["cap_bytes"],
         "rand" => &["cap_bytes"],
         "capture" => &[],
+        "vars" => &[],
+        "vars_i" | "vars_s" | "vars_w" | "vars_m" | "vars_len" => &["vars"],
+        "vars_n" => &["vars", "vars_w"],
         "grepmatches" => &["cap_bytes"],
         _ => &[],
     }
@@ -13988,6 +14122,283 @@ fn helper_source(h: &str) -> &'static str {
     let mut s = String::from_utf8_lossy(&out).to_string();
     while s.ends_with('\n') { s.pop(); }
     (s, rc)
+}"#,
+        // ── the ONE variable store ──────────────────────────────────
+        // Every variable the promotion slice leaves alone lives in
+        // `__SH_VARS`. The value type is the same in every program; the
+        // accessors are split per class so the helper pruner drops the ones a
+        // script does not use (an unused variant or method would be a
+        // dead-code error in the `-D warnings` build).
+        "vars" => r#"/// One stored value: the shell-visible text plus whichever typed payload
+/// the renderer chose for the name. `text` reads every payload, so the value
+/// type is complete in every program without a dead field.
+#[derive(Clone, Default)]
+struct __ShVal {
+    s: String,
+    int: Option<i64>,
+    words: Option<Vec<Word>>,
+    ints: Option<Vec<i64>>,
+    assoc: Option<std::collections::BTreeMap<String, String>>,
+}
+impl __ShVal {
+    fn text(&self) -> String {
+        if let Some(n) = self.int { return n.to_string(); }
+        if let Some(v) = &self.ints { return v.first().map(|n| n.to_string()).unwrap_or_default(); }
+        if let Some(w) = &self.words { return w.first().map(|x| x.to_string()).unwrap_or_default(); }
+        if let Some(m) = &self.assoc { return m.get("0").cloned().unwrap_or_default(); }
+        self.s.clone()
+    }
+}
+
+/// One store entry: the value plus the two attributes a shell keeps per
+/// name (exported, readonly). The store is the ONE home of every variable
+/// the promotion slice could not turn into a `let`.
+#[derive(Clone)]
+struct __ShVar {
+    val: __ShVal,
+    exported: bool,
+    readonly: bool,
+}
+impl __ShVar {
+    fn empty() -> __ShVar {
+        __ShVar { val: __ShVal::default(), exported: false, readonly: false }
+    }
+}
+
+/// The store itself: every unpromoted name plus the one piece of `$?`-adjacent
+/// state a refused write leaves behind. `ro_trip` is consumed by the next
+/// status write, so `$?` is 1 exactly until the next command runs — what bash
+/// reports for a failed assignment (`x=1` on a readonly name).
+struct __ShStore {
+    vars: std::collections::BTreeMap<String, __ShVar>,
+    ro_trip: bool,
+}
+fn __sh_v_rc_trip() -> bool {
+    __SH_VARS.with(|s| std::mem::replace(&mut s.borrow_mut().ro_trip, false))
+}
+
+fn __sh_v_get(name: &str) -> Option<__ShVar> {
+    __SH_VARS.with(|s| s.borrow().vars.get(name).cloned())
+}
+
+/// Write one value through the store. A readonly name keeps its value and
+/// fails the way bash fails (`<name>: readonly variable`, status 1); an
+/// exported name re-syncs the process environment so children inherit the
+/// new value.
+fn __sh_v_put(name: &str, val: __ShVal) {
+    let mut denied = false;
+    __SH_VARS.with(|s| {
+        let mut s = s.borrow_mut();
+        let st = &mut *s;
+        let e = st.vars.entry(name.to_string()).or_insert_with(__ShVar::empty);
+        if e.readonly {
+            st.ro_trip = true;
+            denied = true;
+            return;
+        }
+        e.val = val;
+        if e.exported {
+            let t = e.val.text();
+            std::env::set_var(name, t);
+        }
+    });
+    if denied {
+        eprintln!("bash: {}: readonly variable", name);
+        __SH_RC.store(1, Ordering::SeqCst);
+    }
+}
+
+/// Save one name's whole entry (value plus flags) for a scope that must put
+/// it back afterwards — a subshell, a background capture, a dynamic scope.
+fn __sh_v_save(name: &str) -> Option<__ShVar> {
+    __sh_v_get(name)
+}
+fn __sh_v_restore_one(name: &str, saved: Option<__ShVar>) {
+    __SH_VARS.with(|s| {
+        let mut s = s.borrow_mut();
+        match saved {
+            Some(v) => { s.vars.insert(name.to_string(), v); }
+            None => { s.vars.remove(name); }
+        }
+    });
+}
+
+/// `unset NAME` — a readonly name keeps its entry and fails like bash.
+fn __sh_v_unset(name: &str) {
+    let mut denied = false;
+    __SH_VARS.with(|s| {
+        let mut s = s.borrow_mut();
+        let st = &mut *s;
+        match st.vars.get(name) {
+            Some(e) if e.readonly => {
+                st.ro_trip = true;
+                denied = true;
+            }
+            Some(_) => { st.vars.remove(name); }
+            None => {}
+        }
+    });
+    if denied {
+        eprintln!("bash: {}: readonly variable", name);
+        __SH_RC.store(1, Ordering::SeqCst);
+    }
+}
+
+/// `export NAME` — the flag lives in the store, so every later write keeps
+/// the child environment in sync.
+fn __sh_v_export(name: &str) {
+    let mut val = None;
+    __SH_VARS.with(|s| {
+        let mut s = s.borrow_mut();
+        let e = s.vars.entry(name.to_string()).or_insert_with(__ShVar::empty);
+        e.exported = true;
+        val = Some(e.val.text());
+    });
+    if let Some(v) = val { std::env::set_var(name, v); }
+}
+
+/// `readonly NAME` / `declare -r` — refusal happens on every later write.
+fn __sh_v_mark_readonly(name: &str) {
+    __SH_VARS.with(|s| {
+        let mut s = s.borrow_mut();
+        s.vars.entry(name.to_string()).or_insert_with(__ShVar::empty).readonly = true;
+    });
+}"#,
+        "vars_i" => r#"fn __sh_v_i(name: &str) -> i64 {
+    match __sh_v_get(name) {
+        Some(v) => match v.val.int {
+            Some(n) => n,
+            None => v.val.text().trim().parse::<i64>().unwrap_or(0),
+        },
+        None => 0,
+    }
+}
+fn __sh_v_set_i(name: &str, v: i64) {
+    __sh_v_put(name, __ShVal { int: Some(v), ..__ShVal::default() });
+}
+/// In-place mutation of an int home: the store materializes the value, runs
+/// the body, and writes it back through `__sh_v_put` (readonly/export apply).
+fn __sh_vw_i<R>(name: &str, f: impl FnOnce(&std::cell::Cell<i64>) -> R) -> R {
+    let tmp = std::cell::Cell::new(__sh_v_i(name));
+    let r = f(&tmp);
+    __sh_v_set_i(name, tmp.get());
+    r
+}"#,
+        "vars_s" => r#"fn __sh_v_s(name: &str) -> String {
+    match __sh_v_get(name) { Some(v) => v.val.text(), None => String::new() }
+}
+fn __sh_v_set_s<T: ToString>(name: &str, v: T) {
+    __sh_v_put(name, __ShVal { s: v.to_string(), ..__ShVal::default() });
+}
+fn __sh_vw_s<R>(name: &str, f: impl FnOnce(&std::cell::RefCell<String>) -> R) -> R {
+    let tmp = std::cell::RefCell::new(__sh_v_s(name));
+    let r = f(&tmp);
+    __sh_v_set_s(name, tmp.into_inner());
+    r
+}"#,
+        "vars_w" => r#"fn __sh_v_w(name: &str) -> Vec<Word> {
+    match __sh_v_get(name) {
+        Some(v) => {
+            if let Some(w) = v.val.words { return w; }
+            if let Some(n) = v.val.ints {
+                return n.iter().map(|i| Word::Owned(i.to_string())).collect();
+            }
+            if let Some(m) = v.val.assoc {
+                return m.values().map(|x| Word::Owned(x.clone())).collect();
+            }
+            vec![Word::Owned(v.val.text())]
+        }
+        None => Vec::new(),
+    }
+}
+fn __sh_v_set_w(name: &str, v: Vec<Word>) {
+    __sh_v_put(name, __ShVal { words: Some(v), ..__ShVal::default() });
+}
+/// One indexed element (`${a[i]}`): the caller has already applied bash's
+/// bounds rule, so an out-of-range read is the empty word, never a panic.
+fn __sh_v_w_at(name: &str, i: usize) -> Word {
+    __sh_v_w(name).into_iter().nth(i).unwrap_or_else(|| Word::Owned(String::new()))
+}
+fn __sh_vw_w<R>(name: &str, f: impl FnOnce(&std::cell::RefCell<Vec<Word>>) -> R) -> R {
+    let tmp = std::cell::RefCell::new(__sh_v_w(name));
+    let r = f(&tmp);
+    __sh_v_set_w(name, tmp.into_inner());
+    r
+}"#,
+        "vars_n" => r#"fn __sh_v_n(name: &str) -> Vec<i64> {
+    match __sh_v_get(name) {
+        Some(v) => {
+            if let Some(n) = v.val.ints { return n; }
+            if let Some(i) = v.val.int { return vec![i]; }
+            __sh_v_w(name).iter().map(|w| w.trim().parse::<i64>().unwrap_or(0)).collect()
+        }
+        None => Vec::new(),
+    }
+}
+fn __sh_v_set_n(name: &str, v: Vec<i64>) {
+    __sh_v_put(name, __ShVal { ints: Some(v), ..__ShVal::default() });
+}
+fn __sh_v_n_at(name: &str, i: usize) -> i64 {
+    __sh_v_n(name).get(i).copied().unwrap_or(0)
+}
+fn __sh_vw_n<R>(name: &str, f: impl FnOnce(&std::cell::RefCell<Vec<i64>>) -> R) -> R {
+    let tmp = std::cell::RefCell::new(__sh_v_n(name));
+    let r = f(&tmp);
+    __sh_v_set_n(name, tmp.into_inner());
+    r
+}"#,
+        "vars_m" => r#"fn __sh_v_m(name: &str) -> std::collections::BTreeMap<String, String> {
+    match __sh_v_get(name) {
+        Some(v) => match v.val.assoc {
+            Some(m) => m,
+            None => {
+                let mut m = std::collections::BTreeMap::new();
+                m.insert("0".to_string(), v.val.text());
+                m
+            }
+        },
+        None => std::collections::BTreeMap::new(),
+    }
+}
+fn __sh_v_set_m(name: &str, v: std::collections::BTreeMap<String, String>) {
+    __sh_v_put(name, __ShVal { assoc: Some(v), ..__ShVal::default() });
+}
+fn __sh_v_m_get(name: &str, key: &str) -> String {
+    __sh_v_m(name).get(key).cloned().unwrap_or_default()
+}
+fn __sh_v_m_set(name: &str, key: &str, val: &str) {
+    let mut m = __sh_v_m(name);
+    m.insert(key.to_string(), val.to_string());
+    __sh_v_set_m(name, m);
+}
+fn __sh_v_m_remove(name: &str, key: &str) {
+    let mut m = __sh_v_m(name);
+    m.remove(key);
+    __sh_v_set_m(name, m);
+}
+fn __sh_v_m_keys(name: &str) -> Vec<String> {
+    __sh_v_m(name).keys().cloned().collect()
+}
+fn __sh_v_m_values(name: &str) -> Vec<String> {
+    __sh_v_m(name).values().cloned().collect()
+}
+fn __sh_vw_m<R>(name: &str, f: impl FnOnce(&std::cell::RefCell<std::collections::BTreeMap<String, String>>) -> R) -> R {
+    let tmp = std::cell::RefCell::new(__sh_v_m(name));
+    let r = f(&tmp);
+    __sh_v_set_m(name, tmp.into_inner());
+    r
+}"#,
+        "vars_len" => r#"/// `${#name}`: text length for a scalar, element count for an array or map.
+fn __sh_v_len(name: &str) -> i64 {
+    match __sh_v_get(name) {
+        Some(v) => {
+            if let Some(w) = &v.val.words { return w.len() as i64; }
+            if let Some(n) = &v.val.ints { return n.len() as i64; }
+            if let Some(m) = &v.val.assoc { return m.len() as i64; }
+            v.val.text().len() as i64
+        }
+        None => 0,
+    }
 }"#,
         "pipe" => r#"fn __sh_pipe(stages: &[Vec<Word>], input: Option<&[u8]>, sink: Option<&mut Vec<u8>>) -> i32 {
     // The emitted program owns the pipeline: every stage is spawned right
@@ -16757,7 +17168,7 @@ impl<'a, 'r> ArithParser<'a, 'r> {
                 self.pos += 1;
                 if self.render.is_assoc(inner) {
                     let m = self.render.tls(inner);
-                    Some(format!("{m}.with(|v| v.borrow().len() as i64)"))
+                    Some(format!("__sh_v_len({m})"))
                 } else if self.render.is_array(inner) {
                     Some(self.render.array_len(inner))
                 } else {
@@ -20737,7 +21148,7 @@ mod tests {
         // vetoes the elision.
         let out = render("for n in a b c; do echo \"$n\"; done\necho \"last=$n\"\n");
         assert!(
-            out.contains("__SHV_N.with(|v| *v.borrow_mut() = n.to_string()"),
+            out.contains("__sh_v_set_s(\"n\", n.to_string())"),
             "escaping var lost its write-back:\n{out}"
         );
     }
@@ -21395,7 +21806,7 @@ mod tests {
         // an own-flow write of the loop var keeps the legacy scheme
         let out = render("for i in $(seq 1 3)\ndo\n  i=9\n  echo $i\ndone\n");
         assert!(!out.contains("for __sh_lv"), "{out}");
-        assert!(out.contains("__SHV_I"), "{out}");
+        assert!(out.contains("__sh_v_set_s(\"i\""), "{out}");
     }
 
     #[test]

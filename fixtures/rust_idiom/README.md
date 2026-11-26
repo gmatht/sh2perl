@@ -41,15 +41,16 @@ Re-render after a backend change, then look at the diff:
    came out of it and are fixed in the emitter now. A missing component is a
    **hard gap**, not a skip: the summary prints `HARD GAP: clippy did not
    run` and the gate exits 2. (`rustup component add clippy`.)
-6. **census** — the idiom counters (`let` bindings and `thread_local!`
-   store statics — the promoted-vs-stored split — `pfx`/`pfi` specialized
+6. **census** — the idiom counters (`let` bindings and store accesses —
+   the promoted-vs-stored split — `pfx`/`pfi` specialized
    vs interpreted printf sites, `pfl` interpreter lines, `.clone()`,
    `.to_string()`, `#[allow(`, `abort`, `Command::new("bash")`, emitted
    `__sh_*` helpers, lines) are printed per fixture and totalled.
    "Idiomatic" is a number that has to keep moving down, not a claim in a
    comment. A non-zero `abort` count is a hard failure in every mode: a
    generated program may not contain `.unwrap()`, `.expect(`, `panic!` or
-   `unreachable!`.
+   `unreachable!`, and a per-variable `static __SHV_…` fails the fixture on
+   its own: unpromoted variables share the ONE `__SH_VARS` store.
 
 ## The word vector type
 
@@ -66,18 +67,30 @@ and stays *borrowed* (`Cow::Borrowed`) with no allocation and no
 integer read) is adopted as `Cow::Owned` from the `String` it already built.
 The alias is pruned from programs that use no word list.
 
-What still carries `.to_string()`, and why — the census total went **21 → 11**
-across the fixtures (13 → 11 in this round), and none of the 11 is a
-word-vector element or a numeric comparison operand:
+What still carries `.to_string()`, and why. The counter covers the WHOLE
+emitted file, helpers included, so it is two numbers. Over the 21 fixtures
+that existed before the store consolidation it is **39 → 85**, and the split
+is the story: program **body 31 → 31** (unchanged), **helper 8 → 54**. The
+difference is the one store helper, emitted once per program that needs it
+instead of one `thread_local!` + `.with(...)` plumbing per name; no
+program-body conversion was added. (`.clone()` behaves the same way: 12 → 16,
+helper 9 → 16, body 3 → 0.)
 
-| where | n | why it must own |
-|---|---|---|
-| literal bound to a `String` local (`let name = "world".to_string()`) | 3 | `analyze_var_borrowable` withheld, so the binding's home is `String` — a promoted-binding question, not a word-list one |
-| literal passed to a `String` parameter (`greet("there".to_string())`) | 2 | the parameter type comes from the function's `FnSig`, which is `String` |
-| `String::from_utf8_lossy(&cap).to_string()` | 2 | the text is borrowed from a temporary capture buffer; it must be owned before the buffer drops |
-| BigInt → decimal (`08_bigint`) | 1 | an out-of-`i64` value has no text form other than this |
-| a numeric value entering a word list (`n.to_string().into()`) | 1 | the value is an `i64`; text is the semantic conversion bash performs at that boundary |
-| the `String` home of an export-poisoned variable (`15_export_poison`) | 2 | the store is `RefCell<String>`; `export` reaches the name, so the binding cannot be a typed `let` |
+Where the program-body conversions sit:
+
+| where | why it must own |
+|---|---|
+| a literal bound to a `String` local (`let name = "world".to_string()`) | `analyze_var_borrowable` withheld, so the binding's home is `String` — a promoted-binding question, not a word-list one |
+| a literal passed to a `String` parameter (`greet("there".to_string())`) | the parameter type comes from the function's `FnSig`, which is `String` |
+| `String::from_utf8_lossy(&cap).to_string()` | the text is borrowed from a temporary capture buffer; it must be owned before the buffer drops |
+| BigInt → decimal (`08_bigint`) | an out-of-`i64` value has no text form other than this |
+| a numeric value entering a word list (`n.to_string().into()`) | the value is an `i64`; text is the semantic conversion bash performs at that boundary |
+| a store read crossing into text (`__sh_v_s`, `__sh_v_m_*`) | the store hands out owned text, so a read never borrows the store across a write |
+
+Inside the store helper the same conversions appear once (`int.to_string()`,
+`Word`→`String`, assoc value→`String`, the shell name as a key) — that is the
+54 above, and it is the price of the consolidation, paid once per program
+instead of once per variable.
 
 ## Numeric text round-trips
 
@@ -90,22 +103,22 @@ in the emitted program. Two shapes were leaking it:
   parser now resolves a numeric-comparison operand (`-eq … -ge`) to the
   number when the home is already `i64` (`TestParser::operand_numeric`), so
   `16_while_loop` / `17_overflow` are `while { let __b = c > 0; … }`.
-* **text homes parsed for arithmetic** — `read_num_of_str` copied the
-  `String` out of the store only to throw it away. It now parses inside the
-  borrow (`__SHV_X.with(|v| v.borrow().trim().parse::<i64>().unwrap_or(0))`)
-  or in place for a promoted `String` local; only capture slots, loop
-  bindings and borrowable `&str` locals keep the owned read.
+* **text homes parsed for arithmetic** — `read_num_of_str` copies the stored
+  text only to parse it, so the store's own numeric read does the parse inside
+  the entry (`__sh_v_i("X")` → `__sh_v_get(name)` then `.trim().parse()`), and
+  a promoted `String` local parses in place. Only capture slots, loop bindings
+  and borrowable `&str` locals keep the owned read.
 
 Census, measured from the committed `expected/*.rs` (before = this round's
 starting HEAD):
 
-| counter | before | after |
-|---|---|---|
-| `.to_string()` | 13 | **11** |
-| `.clone()` | 5 | **4** |
-| `trim().parse::<i64>()` | 4 | **2** |
-| `__sh_atoi(` | 0 | 0 |
-| `borrow().len() as i64` | 1 | 1 |
+| counter | before | after | note |
+|---|---|---|---|
+| `.to_string()` | 39 | 85 | body 31 → 31; the 54 new ones are the store helper |
+| `.clone()` | 12 | 16 | body 3 → 0 |
+| `trim().parse::<i64>()` | 4 | 5 | one more: the store's numeric read parses stored text (`__sh_v_i`) |
+| `__sh_atoi(` | 4 | 4 | bigint/`%d` paths |
+| `borrow().len() as i64` | 1 | 0 | the per-variable `RefCell` read is gone (`__sh_v_len`) |
 
 Per fixture, `to_string`/`clone`/`parse` (`05`, `15`, `16`, `17` are the ones
 that moved): `01 1/0/0`, `02 1/0/0`, `03 1/1/0`, `04 1/0/0`, `05 0/0/1`,
@@ -119,16 +132,68 @@ The two surviving parses, and the one surviving `len() as i64`:
   array (`["1", "2", "3"]`). The element is a `&str` by construction and
   bash's `$((sum + x))` accepts any numeric *text*; parsing is the semantic
   operation, not a detour through a number that already existed.
-* `15_export_poison` — `__SHV_COUNT.with(|v| v.borrow().trim().parse::<i64>())`.
-  `export COUNT` reaches the name as a string, so the home is
-  `RefCell<String>`; there is no `i64` to carry.
-* `05_array` — `__SHV_arr.with(|v| v.borrow().len() as i64)` is already the
-  numeric length (`Vec::len()` promoted once); it is the fixed point of the
-  array-length read, not a stringify-reparse.
+* `15_export_poison` — `__sh_v_i("COUNT")`. `export COUNT` reaches the name
+  as a string, so the entry is a text payload; the store's numeric read parses
+  it once instead of copying the `String` out and parsing that.
+* `05_array` — `__sh_v_len("arr")` is already the numeric length (the payload
+  is `Vec<Word>`); it is the fixed point of the array-length read, not a
+  stringify-reparse, and no `borrow().len() as i64` survives.
+
+## The ONE variable store
+
+Every variable the promotion slice leaves alone lives in one place, not in one
+`thread_local!` per name:
+
+```rust
+thread_local! { static __SH_VARS: RefCell<__ShStore> = ... }
+
+struct __ShStore { vars: BTreeMap<String, __ShVar>, ro_trip: bool }
+struct __ShVar   { val: __ShVal, exported: bool, readonly: bool }
+struct __ShVal   { s: String, int: Option<i64>, words: Option<Vec<Word>>,
+                   ints: Option<Vec<i64>>, assoc: Option<BTreeMap<String, String>> }
+```
+
+- **The key is the shell name as a string literal** (`__sh_v_s("COUNT")`), so
+  the emitted text names variables the way the script does. A call site the
+  conversion missed renders a bare identifier where `&str` is required, which
+  is a compile error in the generated program — caught by the fixture gate,
+  never a silent rebinding.
+- **One accessor per storage class** keeps the call sites recognisable:
+  `__sh_v_i/_s/_w/_n/_m` (read), `__sh_v_set_i/_s/_w/_n/_m` (whole value),
+  `__sh_vw_i/_s/_w/_n/_m` (in-place mutation, materialize → body → write
+  back), `__sh_v_len`, `__sh_v_w_at/_n_at`, the `__sh_v_m_*` assoc family.
+  The value type is one struct with optional typed payloads, so `text()` reads
+  every payload and no program carries a dead variant.
+- **The entry, not the value, is what a scope saves**: `__sh_v_save(name)` /
+  `__sh_v_restore_one(name, saved)` restore value *and* flags, which is what a
+  subshell and a dynamic-scope save actually need.
+- **`export` / `readonly` / `unset` are store operations.** `export` sets the
+  flag (`__sh_v_export`) and every later write re-syncs `std::env`, so a child
+  sees the current value, not the one the name had at export time. `readonly`
+  marks the entry (`__sh_v_mark_readonly`) and `__sh_v_put` refuses a later
+  write with bash's `<name>: readonly variable` + status 1; `unset` goes
+  through `__sh_v_unset`, which refuses a readonly name the same way. The
+  refusal is remembered in `ro_trip` and consumed by the next status write, so
+  `$?` is 1 exactly for the failed statement.
+- **The helper is sliced, and pruned.** `vars` (types, get/put/export/
+  readonly/unset/save) plus `vars_i/_s/_w/_n/_m/_len` are separate helpers, so
+  a program that only ever reads a scalar does not drag in the assoc-map code;
+  the body's own store calls (`__sh_v_n("a")` in a sum, `__sh_v_m_keys("m")`)
+  pull in their slice by name. `__SH_VARS` itself is emitted only when some
+  store call exists.
+
+Measured over the fixture set (before = `5a41d43a0`, after = this tree):
+per-variable `static __SHV_…` **6 → 0**; programs carrying the store: **7**
+(one `__SH_VARS` each, `05`, `13`, `14`, `15`, `18`, `21`, `22`); store call
+sites naming a key **21 → 46**. The store helper costs ~180 lines per
+program that uses it, so emitted lines went **1371 → 2364** over the 21
+pre-existing fixtures: that is the trade — one shared, documented,
+flag-carrying store instead of a static plus its `.with(...)` plumbing per
+name.
 
 ## Promotion: the safe slice
 
-Most variables are a bare Rust binding, not a `thread_local!` static. The
+Most variables are a bare Rust binding, not a store entry. The
 decision is a structural verdict (`compute_local_vars` in
 `src/rust_backend.rs`), never a heuristic, and every rule is a refusal:
 
@@ -164,28 +229,31 @@ Measured per fixture (`cargo run --bin rust_fixtures`), `let` / `store`:
 | fixture | let | store | the stored names, and why |
 |---|---|---|---|
 | 01, 02, 04, 06, 08, 09, 10, 11, 12, 16, 17 | 2,1,1,3,1,1,1,3,2,1,3 | 0 | — |
-| 03_capture | 1 | 0 | — |
-| 05_array | 1 | 1 | `arr` is an array (`Vec<Word>` store) |
+| 03_capture, 19_printf_literal | 1,0 | 0 | — |
 | 07_redirect | 0 | 0 | no variables |
-| 13_dynamic_scope | 0 | 1 | `value` is written in `main` and read in `show` — two scopes |
-| 14_capture_pin | 1 | 1 | `n` is written inside `$( … )` (a subshell) |
-| 15_export_poison | 0 | 1 | `COUNT` is exported (reachable by name from a child) |
-| 18_eval_poison | 0 | 1 | `eval` can reach `n` at run time |
-| **TOTAL** | **22** | **5** | |
+| 20_printf_dynamic | 1 | 0 | — |
+| 05_array | 1 | 2 | `arr` is an array (`Vec<Word>` payload) |
+| 13_dynamic_scope | 0 | 3 | `value` is written in `main` and read in `show` — two scopes |
+| 14_capture_pin | 1 | 4 | `n` is written inside `$( … )` (a subshell) |
+| 15_export_poison | 0 | 5 | `COUNT` is exported (reachable by name from a child) |
+| 18_eval_poison | 0 | 6 | `eval` can reach `n` at run time |
+| 21_pipeline_interleave | 1 | 2 | the stage variables of the pipeline/pin paths |
+| 22_vars_store | 0 | 24 | `GREETING` (export + unset), `LIMIT` (readonly), `n` (function + main), `w` (pipeline `read`) |
+| **TOTAL** | **24** | **46** | |
 
 11_promote and 18_eval_poison are the two halves of the boundary written
 down as programs: `count`, `name`, `total` and `n` in 11 become `let`
 bindings (`let mut count = 0;`, `for n in [1, 2, 3]`), while 18's
-`n=0; n=$((n + 1)); eval 'n=$((n + 10))'; echo "$n"` keeps `__SHV_N` and
+`n=0; n=$((n + 1)); eval 'n=$((n + 10))'; echo "$n"` keeps `n` in the store and
 prints the same `11` as bash. Loosening the slice must fail 18, not change
 what it prints.
 
 The numbers are measured, not asserted: the harness asks the renderer for
-`promoted_names` (the same `compute_local_vars` call the emission makes) and
-counts `static __SHV_` declarations in the emitted text, then **fails the
-fixture** if a promoted name has no `let`/`let mut`/`for … in` binding in
-that text (skipped for fixtures that carry a `TODO(unsupported)` marker,
-where the construct was not lowered at all).
+`promoted_names` (the same `compute_local_vars` call the emission makes),
+counts the store calls that name a key, and **fails the fixture** if a
+promoted name has no `let`/`let mut`/`for … in` binding in that text (skipped
+for fixtures that carry a `TODO(unsupported)` marker, where the construct was
+not lowered at all), or if a per-variable `static __SHV_…` reappears.
 
 Still stored, and the next widening if it ever happens: a variable whose
 only write sits inside a branch (`if c; then x=1; fi; echo "$x"`) stays in
@@ -261,8 +329,9 @@ the emitted file). From `cargo run --bin rust_fixtures`:
 | 07_redirect | 44 | 1 | 0 | 0 |
 | 19_printf_literal | 31 | 4 | 0 | 0 |
 | 20_printf_dynamic | 235 | 0 | 1 | 114 |
+| 21_pipeline_interleave | 672 | 4 | 3 | 114 |
 | the other 18 fixtures | — | 0 | 0 | 0 |
-| **TOTAL (21 fixtures)** | **1371** | **5** | **1** | **114** |
+| **TOTAL (22 fixtures)** | **2774** | **9** | **4** | **228** |
 
 Before/after, measured rather than remembered:
 
@@ -300,14 +369,14 @@ tree):
 
 The rules behind the zeros:
 
-- **Storage names are uppercase.** A user-var `thread_local!` is
-  `__SHV_COUNT`, not `__SHV_value`, so the declaration needs no
-  `non_upper_case_globals` allow. The name is still derived from the mangled
-  base (`static_ident`, case-collision suffix `_2`, `_3` when `a` and `A`
-  both exist), so the leak guard and `-Oz` golf see the same identifier the
-  uses do. The stray `#[allow(non_upper_case_globals)]` that used to sit in
-  front of `fn main()` (where the lint cannot even apply) is gone with the
-  `attrs_ok` flag that threaded it.
+- **Unpromoted names are store keys, not statics.** `__sh_v_s("COUNT")` is a
+  string literal, so there is no `static` whose identifier could need a
+  `non_upper_case_globals` allow, and no per-name declaration at all. A
+  promoted local still keeps the shell spelling for the whole program (one
+  name → one storage class, which the leak guard and `-Oz` golf rely on), and
+  that is the only place a lint can appear. The stray
+  `#[allow(non_upper_case_globals)]` that used to sit in front of `fn main()`
+  (where the lint cannot even apply) is gone with the `attrs_ok` flag.
 - **A lone string literal is its own format string.** `__sh_print_words`
   folded to a print call on a constant word emits `println!("done")`, not
   `println!("{}", "done")` (`clippy::print_literal`); a trailing `\n` in the
@@ -342,7 +411,7 @@ emission site in `src/rust_backend.rs` and absent from all 17 fixtures
 | `02_regex` | `=~` lowered to the native ERE matcher |
 | `03_capture` | `$( … )` capture block whose `ls -1 \| wc -l` is wired by the emitted program (`__sh_pipe`), no `bash -c`; word lists are `Cow`/`Word` (`vec!["ls".into()]`) |
 | `04_function` | user function with a parameter |
-| `05_array` | array in the thread-local store (arrays are not promoted) |
+| `05_array` | array in the ONE store (`Vec<Word>` payload; arrays are not promoted) |
 | `06_arith_i64` | integer arithmetic, pow helper |
 | `07_redirect` | redirect + a literal-`printf` site decomposed to `format!`: the emitted file calls no part of the 115-line `__sh_printf` interpreter |
 | `08_bigint` | `num_bigint` lowering for out-of-`i64` constants |
@@ -354,9 +423,10 @@ emission site in `src/rust_backend.rs` and absent from all 17 fixtures
 | `15_export_poison` | **must stay in the store**: `export COUNT=…` reaches the name by word, so a `let` would drop the export |
 | `16_while_loop` | a `while [ … ]` condition whose status write keeps a block expression |
 | `17_overflow` | the documented debug/`-O` divergence: bash wraps, a debug build panics (`# debug-overflow:` marker) |
-| `18_eval_poison` | **must stay in the store**: `eval` reaches `__SHV_N` by text, so no promotion |
+| `18_eval_poison` | **must stay in the store**: `eval` reaches `n` by text, so no promotion |
 | `19_printf_literal` | **pins the specialized path**: four literal formats (`%s`, `%%`, literal braces) render as `format!`, zero `__sh_printf` in the file |
 | `20_printf_dynamic` | **pins the fallback**: a format assembled at run time must keep *and call* the 115-line interpreter |
+| `22_vars_store` | **pins the ONE store**: `export GREETING=…` then a later write, with the child (`bash -c`) seeing the new value; `readonly LIMIT=3` then `LIMIT=9` (refused, `$?`=1, value kept); `unset GREETING`; `n` written in `grow` and in main (dynamic scope) plus subshell isolation `( n=11; … )`; and the stored `n` read inside a pipeline `while` stage |
 | `21_pipeline_interleave` | **pins the process/IO path**: pipelines spawned by the emitted program (`cat … \| tr … \| wc -l`, `printf … \| sort \| head`, a chain into `$()` and into a word), shell output interleaved with a child's inherited fd 1, and the one named `bash -c` fallback (a stage carrying a redirection) |
 
 Fixtures 13–15 are the negative half of the promotion work and are as
@@ -365,7 +435,7 @@ name from another scope or from another process.
 
 ## Promotion rules (what may become a `let`)
 
-A scalar keeps `thread_local!` storage unless ALL of:
+A scalar stays in the ONE store unless ALL of:
 
 * every mention sits in ONE scope (`main`, or one user function);
 * its first mention is a top-level write in that scope (that is where the
@@ -434,7 +504,10 @@ capture, **pipelines** — an all-external multi-stage chain, a
 a stage carrying a redirection (the named `bash -c` fallback) — **shell output
 interleaved with a child's inherited fd 1** (`printf 'pre-'` with no newline,
 then an external command, then more shell output), single-use string
-variables, repeated literals — and
+variables, repeated literals, **the variable store** (an exported name
+re-synced into a `bash -c` child after a later write, `unset` taking the entry
+back out, and a name written in a function body and in main so dynamic scoping
+keeps it out of a `let`) — and
 `printf` sites of every class the specializer classifies: literal formats with
 0/1/N `%s` slots, `%%`, escapes, `\c`, literal braces, `%d`, `%c`, both arity
 mismatches, a slotless format that still passes an argument, and a format
@@ -442,7 +515,11 @@ assembled at run time (the interpreter fallback).
 
 Documented seeds: **1** (the default, and what a gate run uses) plus 7,
 424242 and 20261126 for a wider sweep — all four ran clean (60 programs at
-seed 1, 100 at each of the others).
+seed 1, 100 at each of the others). After the store consolidation a
+150-program `--keep` sweep at seed 1 also ran clean in both profiles, and the
+grammar provably reached the new shapes: 18 programs contained the exported
+store name, 26 the dynamic-scope case, and 108 emitted programs carried
+`__SH_VARS`.
 
 Divergences this net found, each fixed in `src/rust_backend.rs`:
 
