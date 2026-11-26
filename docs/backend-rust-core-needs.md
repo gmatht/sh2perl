@@ -181,7 +181,7 @@ the emitted text. What stays stored is documented in
   = specialized sites, `pfi` = calls left on `__sh_printf`, `pfl` =
   interpreter body lines): `07_redirect` 44 lines / 1 / 0 / 0,
   `19_printf_literal` 31 lines / 4 / 0 / 0, `20_printf_dynamic` 235 lines /
-  0 / 1 / 114, the other 17 fixtures 0 / 0 / 0 — **TOTAL 20 fixtures, 823
+  0 / 1 / 114, the other 18 fixtures 0 / 0 / 0 — **TOTAL 21 fixtures, 1371
   lines, pfx 5, pfi 1, pfl 114**. Before/after, measured rather than
   remembered: before this pass (commit `e4fe8c187`) the census had no printf
   columns, 0 of 18 fixtures called `__sh_printf` (`git grep -c` over the
@@ -281,13 +281,52 @@ the emitted text. What stays stored is documented in
   text in one unquoted word (`x=$(cmd)z`, `x=z$(cmd)`, `x=$(cmd)-$(cmd)`) —
   the shape whose parsing dropped the literal until `append_plain_text` /
   `merge_expansion_into_word` learned to turn any single-expansion word into
-  interpolation parts. Clippy is a
+  interpolation parts. It also generates **pipelines** (an all-external
+  multi-stage chain, a `builtin | external…` chain, a chain into `$()` and into
+  a word, and the one redirection-stage fallback) and **shell output
+  interleaved with a child's inherited fd 1**, which is the shape that keeps
+  the flush discipline honest. Clippy is a
   required check, not an optional extra: if the component is missing the gate
   prints `HARD GAP: clippy did not run` and exits non-zero. It already pays
   for itself — `clippy::print_with_newline`, `clippy::format_in_format_args`
   and `clippy::useless_vec` were all live in the emitted code and are now
   fixed in the emitter (`println!("x")` instead of `print!("x\n")`, one
   `format!` instead of a nested pair, `&[a, b]` instead of `&vec![a, b]`).
+
+### 5.2d Pipelines and stdout: the emitted program owns the process wiring
+
+A pipeline used to be reconstructed as command text and handed to
+`bash -c`. Every stage whose argv this renderer can spell is now spawned by
+the emitted program itself and connected with real OS pipes (`__sh_pipe`):
+`a | b`, a multi-stage chain, a stage with arguments/globs it expands, and a
+chain feeding `$()` or a following word. Real pipes — not a byte buffer
+between stages — are what keeps SIGPIPE working (`yes | head`), `__SH_PIPESTATUS`
+gets one entry per stage, and `$?` stays the last stage's status, as in bash.
+
+The fallback is kept for the shapes whose argv cannot be spelled at render
+time, and the emitter names them: a stage carrying a redirection or heredoc, a
+subshell or `&&`/`||` stage, an exec whose command word is not a plain literal
+(`"$cmd" …` could name a builtin), and one carrying per-command env
+assignments. Those still become one `bash -c` pipeline, because there the
+shell text *is* the command. `21_pipeline_interleave` is the fixture that pins
+both halves: `03_capture`, `cat … | tr … | wc -l`, `printf … | sort | head`
+and pipeline-into-`$()` shapes render with no `bash -c`, while the
+redirection-stage shape still does and still matches bash byte-for-byte.
+
+Interleaving discipline: shell output goes out through `print!`/`println!`
+(Rust's line-buffered stdout), so a child that inherits fd 1 is preceded by an
+explicit flush — `printf 'pre-'` without a newline sits in the buffer, and
+without the flush the child's bytes would come out first, which bash never
+does. Both `__sh_spawn` and `__sh_pipe` flush before spawning when the child
+inherits fd 1; the fixture fails if that flush is removed (verified by removing
+it).
+
+The widening also exposed a real bug in the emitter's own text passes: the
+`pass-4` dead-status-store collapse removed the previous line whenever it held
+a `__SH_RC.store(...)`, on the assumption that the payload was side-effect
+free. It is not for `__SH_RC.store(__sh_pipe(…))` — collapsing it deleted the
+pipeline itself. The collapse now requires a call-free payload
+(`rc_store_payload_pure`).
 
 ### 5.3 Hygiene + hoisting
 Rust keywords: `fn/let/mut/if/else/while/for/loop/match/struct/enum/
@@ -320,7 +359,7 @@ already uses these names in `sh2_call`).
 
 | sh2.* family | Rust implementation |
 |---|---|
-| `exec`/`pipeline`/`redirect`/`capture`/`subshell`/`background` | `std::process::Command` + `libc` fork/pipe/dup2 (exact POSIX) |
+| `exec`/`pipeline`/`redirect`/`capture`/`subshell`/`background` | `std::process::Command` + real OS pipes: a pipeline the renderer can spell is spawned stage by stage in the emitted program itself (`__sh_pipe`, no `bash -c`), the rest keep the shell-text fallback |
 | `builtin` | a table of ~30 functions |
 | `getVar`/`setVar`/`setArray`/... | a `HashMap` store behind a `RefCell`/`Mutex` (single-threaded: `RefCell` — same as sh2runtime's map) |
 | `param`/`caseMatch`/`test` | `regex`/`globset` crates + a test parser |

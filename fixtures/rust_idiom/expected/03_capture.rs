@@ -12,19 +12,6 @@ static __SH_PIPESTATUS: std::sync::Mutex<Vec<i32>> = std::sync::Mutex::new(Vec::
 
 static __SH_ARITH_WORD_FAIL: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
 
-fn __sh_wq(ws: &[Word]) -> String {
-    let mut o = String::new();
-    for (i, w) in ws.iter().enumerate() {
-        if i > 0 { o.push(' '); }
-        o.push('\'');
-        for c in w.chars() {
-            if c == '\'' { o.push_str("'\\''"); } else { o.push(c); }
-        }
-        o.push('\'');
-    }
-    o
-}
-
 fn __sh_print_words(ws: &[Vec<Word>], nl: bool) {
     // no echo in this program used -e: there is no unescape arm and no
     // `__sh_echo_esc` dependency, and no argument to pass for one.
@@ -52,9 +39,13 @@ fn __sh_print_words(ws: &[Vec<Word>], nl: bool) {
     print!("{}", s);
 }
 
-fn __sh_spawn(cmd: &str, input: Option<&[u8]>) -> i32 {
-    // a shell-out inside a native stage inherits the stage's stdin
-    // (`echo x | grep -f <(…)` — the grep reads the echo's buffer)
+fn __sh_pipe(stages: &[Vec<Word>], input: Option<&[u8]>, sink: Option<&mut Vec<u8>>) -> i32 {
+    // The emitted program owns the pipeline: every stage is spawned right
+    // here and the stages are connected with REAL OS pipes, so nothing is
+    // handed back to `bash -c`. SIGPIPE works because the kernel closes the
+    // read end — buffering a stage's bytes in a Vec between stages would
+    // deadlock `yes | head`.
+    if stages.is_empty() { return 0; }
     let mut input = input.map(|d| d.to_vec());
     let stdin_path = __SH_STDIN_PATH.lock().unwrap_or_else(|e| e.into_inner()).clone();
     if input.is_none() && stdin_path.is_none() {
@@ -64,37 +55,72 @@ fn __sh_spawn(cmd: &str, input: Option<&[u8]>) -> i32 {
             input = Some(d);
         }
     }
-    let want_out = __SH_OUT.lock().unwrap_or_else(|e| e.into_inner()).is_some() || __SH_OUTFILE_TL.with(|v| v.borrow().is_some());
-    let mut c = std::process::Command::new("bash");
-    c.arg("-c").arg(cmd);
-    if !want_out {
-        // the child inherits fd 1 raw — flush Rust's buffered stdout
-        // first so prints BEFORE the child hit the pipe first
+    let mut sink = sink;
+    let want_out = sink.is_some()
+        || __SH_OUT.lock().unwrap_or_else(|e| e.into_inner()).is_some()
+        || __SH_OUTFILE_TL.with(|v| v.borrow().is_some());
+    let last = stages.len() - 1;
+    if sink.is_none() && !want_out {
+        // the final stage inherits fd 1 raw: flush Rust's buffered stdout
+        // BEFORE spawning, so a `print!` written before the pipeline (no
+        // trailing newline, so the LineWriter still holds it) reaches fd 1
+        // ahead of the child's bytes, exactly as bash interleaves them
         let _ = std::io::Write::flush(&mut std::io::stdout());
     }
-    if want_out { c.stdout(std::process::Stdio::piped()); }
-    if input.is_none() {
-        if let Some(p) = &stdin_path {
-            // the child must see the REAL device fd (`tty < /dev/pts/5`
-            // needs isatty, which a byte pipe lacks)
-            if let Ok(f) = std::fs::File::open(p) {
-                c.stdin(std::process::Stdio::from(f));
+    let mut prev: Option<std::process::ChildStdout> = None;
+    let mut children: Vec<std::process::Child> = Vec::new();
+    let mut spawn_err = false;
+    for (i, argv) in stages.iter().enumerate() {
+        let Some(prog) = argv.first() else { spawn_err = true; break; };
+        let mut c = std::process::Command::new(prog.as_ref());
+        for a in &argv[1..] { c.arg(a.as_ref()); }
+        if i == 0 {
+            if input.is_some() {
+                c.stdin(std::process::Stdio::piped());
+            } else if let Some(p) = &stdin_path {
+                // the child must see the REAL device fd (`tty < /dev/pts/5`
+                // needs isatty, which a byte pipe lacks)
+                if let Ok(f) = std::fs::File::open(p) { c.stdin(std::process::Stdio::from(f)); }
+            }
+        } else if let Some(p) = prev.take() {
+            // the previous stage's write end moves into this child, so our
+            // own copy is dropped and the reader sees EOF
+            c.stdin(std::process::Stdio::from(p));
+        }
+        if i < last || sink.is_some() || want_out { c.stdout(std::process::Stdio::piped()); }
+        let mut ch = match c.spawn() { Ok(x) => x, Err(_) => { spawn_err = true; break; } };
+        if i == 0 {
+            if let Some(data) = input.take() {
+                if let Some(mut si) = ch.stdin.take() { let _ = std::io::Write::write_all(&mut si, &data); }
             }
         }
-    }
-    if input.is_some() { c.stdin(std::process::Stdio::piped()); }
-    let mut ch = match c.spawn() { Ok(x) => x, Err(_) => return 1 };
-    if let Some(data) = input {
-        if let Some(mut si) = ch.stdin.take() { let _ = std::io::Write::write_all(&mut si, &data); }
+        if i < last { prev = ch.stdout.take(); }
+        children.push(ch);
     }
     let mut out = Vec::new();
-    if let Some(mut so) = ch.stdout.take() {
-        let _ = std::io::Read::read_to_end(&mut so, &mut out);
+    if sink.is_some() || want_out {
+        // read the tail BEFORE waiting: a stage that keeps writing would
+        // block on a full pipe otherwise
+        if let Some(mut so) = children.last_mut().and_then(|c| c.stdout.take()) {
+            let _ = std::io::Read::read_to_end(&mut so, &mut out);
+        }
     }
-    let rc = ch.wait().map(|s| s.code().unwrap_or(1)).unwrap_or(1);
+    // bash gives PIPESTATUS one entry per stage; the last stage's status is
+    // the pipeline's `$?`
+    let mut statuses: Vec<i32> = Vec::new();
+    for ch in children.iter_mut() {
+        statuses.push(ch.wait().map(|s| s.code().unwrap_or(1)).unwrap_or(1));
+    }
+    {
+        let mut ps = __SH_PIPESTATUS.lock().unwrap_or_else(|e| e.into_inner());
+        for st in &statuses { ps.push(*st); }
+    }
     if !out.is_empty() {
         let mut used = false;
-        __SH_OUTFILE_TL.with(|v| { if let Some(f) = v.borrow_mut().as_mut() { let _ = std::io::Write::write_all(f, &out); used = true; } });
+        if let Some(b) = sink.as_mut() { b.extend_from_slice(&out); used = true; }
+        if !used {
+            __SH_OUTFILE_TL.with(|v| { if let Some(f) = v.borrow_mut().as_mut() { let _ = std::io::Write::write_all(f, &out); used = true; } });
+        }
         if !used {
             if let Some(b) = __SH_OUT.lock().unwrap_or_else(|e| e.into_inner()).as_mut() {
                 b.extend_from_slice(&out);
@@ -103,7 +129,8 @@ fn __sh_spawn(cmd: &str, input: Option<&[u8]>) -> i32 {
             }
         }
     }
-    rc
+    if spawn_err { return 1; }
+    statuses.last().copied().unwrap_or(0)
 }
 
 fn main() {
@@ -112,10 +139,8 @@ fn main() {
     let __old = __SH_OUT.lock().unwrap_or_else(|e| e.into_inner()).take();
     *__SH_OUT.lock().unwrap_or_else(|e| e.into_inner()) = Some(Vec::new());
     let __cap_oldin = __SH_STDIN.lock().unwrap_or_else(|e| e.into_inner()).take();
-    let __sh_pbuf0: Vec<u8> = Vec::new();
     __SH_PIPESTATUS.lock().unwrap_or_else(|e| e.into_inner()).clear();
-    __SH_RC.store(__sh_spawn(&format!("{} | {}", __sh_wq(&["ls".into(), "-1".into()]), __sh_wq(&["wc".into(), "-l".into()])), Some(&__sh_pbuf0)), Ordering::SeqCst);
-    __SH_PIPESTATUS.lock().unwrap_or_else(|e| e.into_inner()).push(__SH_RC.load(Ordering::SeqCst));
+    __SH_RC.store(__sh_pipe(&[vec!["ls".into(), "-1".into()], vec!["wc".into(), "-l".into()]], None, None), Ordering::SeqCst);
     *__SH_STDIN.lock().unwrap_or_else(|e| e.into_inner()) = __cap_oldin;
     let __cap = __SH_OUT.lock().unwrap_or_else(|e| e.into_inner()).take().unwrap_or_default();
     *__SH_OUT.lock().unwrap_or_else(|e| e.into_inner()) = __old;
@@ -125,5 +150,4 @@ fn main() {
     __s
 };
     __sh_print_words(&[vec![format!("count={}", files).into()]], true);
-    __SH_RC.store(0, Ordering::SeqCst);
 }

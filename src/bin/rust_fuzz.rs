@@ -110,7 +110,7 @@ fn generate(rng: &mut Rng) -> String {
     let mut s = String::from(PRELUDE);
     let n = 3 + rng.below(6);
     for _ in 0..n {
-        match rng.below(31) {
+        match rng.below(34) {
             0 => s.push_str(&format!("a=$((a + {}))\n", 1 + rng.below(5))),
             1 => s.push_str("c=$((c - 1))\n"),
             2 => s.push_str("echo \"b=$b\"\n"),
@@ -199,6 +199,44 @@ fn generate(rng: &mut Rng) -> String {
                     s.push_str("g() { local u=\"$2\"; echo \"u=$u\"; }\n");
                 }
                 s.push_str("g \"$b\" \"$d\"\n");
+            }
+            // NATIVE pipelines: an all-external multi-stage chain, a
+            // `builtin | external…` chain, a chain feeding `$()`, and one
+            // feeding a word. The emitted program spawns the stages itself and
+            // wires them with real pipes — a `bash -c` here would show up as a
+            // divergence the moment the status or the bytes disagree.
+            31 => {
+                s.push_str("printf '%s\\n' \"$b\" \"$d\" > pa.txt\n");
+                s.push_str("printf '%s\\n' zz \"$b\" > pb.txt\n");
+                match rng.below(4) {
+                    0 => s.push_str("cat pa.txt pb.txt | tr a-z A-Z | wc -l\n"),
+                    1 => s.push_str("printf '%s\\n' \"$b\" \"$d\" | sort | wc -l\n"),
+                    2 => s.push_str("n=$(cat pa.txt pb.txt | wc -l)\necho \"n=$n\"\n"),
+                    _ => s.push_str("echo \"s:$(cat pa.txt pb.txt | sort | head -1)\"\n"),
+                }
+            }
+            // shell output INTERLEAVED with a child's inherited fd 1: the
+            // `printf` has no trailing newline, so Rust's line buffer must be
+            // flushed before the child writes or the bytes come out in the
+            // wrong order
+            32 => {
+                s.push_str("printf '%s\\n' \"$b\" \"$d\" > pi.txt\n");
+                s.push_str("printf 'pre-'");
+                if rng.below(2) == 0 {
+                    s.push_str("\ncat pi.txt\n");
+                } else {
+                    s.push_str("\ncat pi.txt | tr a-z A-Z\n");
+                }
+                s.push_str("printf 'post'\n");
+                s.push_str("echo -interleave\n");
+            }
+            // a pipeline stage carrying a redirection cannot be spelled as an
+            // argv: it keeps the documented `bash -c` fallback and must still
+            // agree with bash byte for byte
+            33 => {
+                s.push_str("printf '%s\\n' \"$b\" > pf.txt\n");
+                s.push_str("grep -h . pf.txt > pj.txt | wc -c\n");
+                s.push_str("wc -l < pj.txt\n");
             }
             // an arithmetic word inside a printed expansion
             _ => s.push_str("echo \"n=$((c + 1))\"\n"),

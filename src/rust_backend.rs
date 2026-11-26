@@ -3697,6 +3697,25 @@ impl Render {
         }
     }
 
+    /// Does this line store a value whose evaluation has NO side effect? Only
+    /// such a store is droppable: a `__SH_RC.store(__sh_pipe(…))` carries the
+    /// whole statement inside its argument (the pipeline, the shell-out, the
+    /// capture), so collapsing it would delete the work, not just the status
+    /// write. A payload is pure when it contains no call — a literal, a
+    /// variable, a cast (`x as i32`); ternaries already fail `rc_plain`.
+    fn rc_store_payload_pure(&self, line: &str) -> bool {
+        let Some(at) = line.find("__SH_RC.store(") else {
+            return false;
+        };
+        let start = at + "__SH_RC.store(".len();
+        let Some(end) = Self::match_paren(line, start - 1) else {
+            return false;
+        };
+        let payload = &line[start..end.saturating_sub(1)];
+        let payload = payload.split(", Ordering::").next().unwrap_or(payload);
+        !payload.contains('(') && !payload.contains('[')
+    }
+
     fn rc_plain(&self, line: &str) -> bool {
         if line.contains("__SH_RC.load")
             || line.contains('{')
@@ -3862,7 +3881,7 @@ impl Render {
                 idx -= 1;
                 let prev = self.out[idx].as_str();
                 if prev.contains("__SH_RC.store(") {
-                    if self.rc_plain(prev) {
+                    if self.rc_plain(prev) && self.rc_store_payload_pure(prev) {
                         self.out.remove(idx);
                     }
                     break;
@@ -3876,6 +3895,15 @@ impl Render {
             self.out.push(String::new());
         } else {
             self.out.push(format!("{}{}", "    ".repeat(self.depth), s));
+        }
+    }
+
+    /// Emit `let mut <name>: Vec<u8> = Vec::new();` the first time a pipeline
+    /// stage needs the upstream-byte buffer.
+    fn decl_pbuf(&mut self, name: &str, declared: &mut bool) {
+        if !*declared {
+            self.emit(&format!("let mut {name}: Vec<u8> = Vec::new();"));
+            *declared = true;
         }
     }
 
@@ -8838,17 +8866,72 @@ impl Render {
         }
         self.add_helper("spawn");
         self.add_helper("cap_bytes");
+        self.add_helper("pipe");
         let buf = self.gensym("__sh_pbuf");
-        self.emit(&format!("let mut {buf}: Vec<u8> = Vec::new();"));
+        // The upstream-byte buffer is declared the first time a stage needs it:
+        // a buffer no stage ever reads would be an unused-variable error in the
+        // emitted program, which is compiled with `-D warnings`.
+        let mut buf_declared = false;
         self.emit("__SH_PIPESTATUS.lock().unwrap().clear();");
         let mut idx = 0;
         while idx < n {
-            // consecutive shell stages are joined into ONE `bash -c`
-            // pipeline — bash's pipe plumbing (SIGPIPE closing, e.g.
-            // `yes | head`) only works inside a single process group;
-            // per-stage captures would block forever on infinite
-            // producers.
+            // NATIVE FIRST: a run of consecutive stages whose argv this
+            // renderer can spell is spawned by the emitted program itself and
+            // connected with real OS pipes (`__sh_pipe`). That covers `a | b`,
+            // multi-stage chains, stages with arguments and globs, and a chain
+            // feeding `$()` or a following word — no `bash -c` anywhere on
+            // that path. `__sh_pipe` flushes Rust's buffered stdout before the
+            // first child, so interleaving with an inherited fd 1 matches bash.
+            let mut argv_stages: Vec<String> = Vec::new();
+            let mut j = idx;
+            while j < n {
+                match self.native_stage_argv(&stages[j]) {
+                    Some(a) => {
+                        argv_stages.push(a);
+                        j += 1;
+                    }
+                    None => break,
+                }
+            }
+            if !argv_stages.is_empty() {
+                if idx > 0 || j < n {
+                    self.decl_pbuf(&buf, &mut buf_declared);
+                }
+                let input = if idx > 0 {
+                    format!("Some(&{buf})")
+                } else {
+                    "None".to_string()
+                };
+                let arr = format!("&[{}]", argv_stages.join(", "));
+                if j == n {
+                    // the run ends the pipeline: its last stage writes to fd 1
+                    // (or the active `$(…)`/redirect sink, which `__sh_pipe`
+                    // picks up), and it already recorded PIPESTATUS
+                    self.emit(&format!(
+                        "__SH_RC.store(__sh_pipe({arr}, {input}, None), Ordering::SeqCst);"
+                    ));
+                } else {
+                    // later stages still need these bytes as their stdin
+                    let tmp = self.gensym("__sh_pout");
+                    self.emit(&format!("let mut {tmp}: Vec<u8> = Vec::new();"));
+                    self.emit(&format!(
+                        "__SH_RC.store(__sh_pipe({arr}, {input}, Some(&mut {tmp})), Ordering::SeqCst);"
+                    ));
+                    self.emit(&format!("{buf} = {tmp};"));
+                }
+                idx = j;
+                continue;
+            }
+            // FALLBACK: consecutive `stage_text` stages are joined into ONE
+            // `bash -c` pipeline. Only shapes the renderer cannot spell as an
+            // argv reach this: a stage with a redirection/heredoc, a subshell
+            // or `&&`/`||` stage, an exec whose command word is not a plain
+            // literal (`"$cmd" …`), or one carrying env assignments — there the
+            // shell text IS the command, and bash's pipe plumbing only works
+            // inside a single process group (per-stage captures would block
+            // forever on infinite producers like `yes | head`).
             let mut run: Vec<String> = Vec::new();
+            self.decl_pbuf(&buf, &mut buf_declared);
             let mut j = idx;
             while j < n {
                 if let Some(text) = self.stage_text(&stages[j]) {
@@ -8863,10 +8946,23 @@ impl Render {
             }
             if run.len() > 1 {
                 // join as a runtime format! — the stages are String
-                // EXPRESSIONS, not bash text (no `|` operator on String)
-                let mut joined = run[0].clone();
-                for t in &run[1..] {
-                    joined = format!("format!(\"{{}} | {{}}\", {joined}, {t})");
+                // EXPRESSIONS, not bash text (no `|` operator on String).
+                // Each piece lands in its own `let` first: nesting the
+                // `format!`s would trip clippy's format_in_format_args under
+                // `-D warnings` in the emitted program.
+                let mut names: Vec<String> = Vec::new();
+                for t in &run {
+                    let n = self.gensym("__sh_stg");
+                    self.emit(&format!("let {n}: String = {t};"));
+                    names.push(n);
+                }
+                let mut joined = names[0].clone();
+                for n in &names[1..] {
+                    let t = self.gensym("__sh_stg");
+                    self.emit(&format!(
+                        "let {t}: String = format!(\"{{}} | {{}}\", {joined}, {n});"
+                    ));
+                    joined = t;
                 }
                 if j == n {
                     self.emit(&format!("__SH_RC.store(__sh_spawn(&{joined}, Some(&{buf})), Ordering::SeqCst);"));
@@ -13405,7 +13501,7 @@ struct IrRedirectInfo {
 
 const HELPER_ORDER: &[&str] = &[
     "q", "q_printf", "wq", "cat", "pow", "echo_esc", "printf_b", "atoi", "atou", "atof", "print_words", "print_words_noesc", "puts", "printf",
-    "cap_bytes", "capture_rc", "spawn", "run", "readline", "read_fields", "split_ifs",
+    "cap_bytes", "capture_rc", "spawn", "pipe", "run", "readline", "read_fields", "split_ifs",
     "fnmatch", "globlike", "strippre", "stripsuf", "replace", "substr", "case", "len", "basename",
     "dirname", "env", "arg", "glob", "brace", "sleep", "rand", "grepmatches", "regex", "re_ere",
     "mtime", "samefile", "fmode", "fowner", "fgroup", "fnewer", "wait_all", "bg",
@@ -13892,6 +13988,99 @@ fn helper_source(h: &str) -> &'static str {
     let mut s = String::from_utf8_lossy(&out).to_string();
     while s.ends_with('\n') { s.pop(); }
     (s, rc)
+}"#,
+        "pipe" => r#"fn __sh_pipe(stages: &[Vec<Word>], input: Option<&[u8]>, sink: Option<&mut Vec<u8>>) -> i32 {
+    // The emitted program owns the pipeline: every stage is spawned right
+    // here and the stages are connected with REAL OS pipes, so nothing is
+    // handed back to `bash -c`. SIGPIPE works because the kernel closes the
+    // read end — buffering a stage's bytes in a Vec between stages would
+    // deadlock `yes | head`.
+    if stages.is_empty() { return 0; }
+    let mut input = input.map(|d| d.to_vec());
+    let stdin_path = __SH_STDIN_PATH.lock().unwrap_or_else(|e| e.into_inner()).clone();
+    if input.is_none() && stdin_path.is_none() {
+        if let Some(mut r) = __SH_STDIN.lock().unwrap_or_else(|e| e.into_inner()).take() {
+            let mut d = Vec::new();
+            let _ = std::io::Read::read_to_end(&mut r, &mut d);
+            input = Some(d);
+        }
+    }
+    let mut sink = sink;
+    let want_out = sink.is_some()
+        || __SH_OUT.lock().unwrap_or_else(|e| e.into_inner()).is_some()
+        || __SH_OUTFILE_TL.with(|v| v.borrow().is_some());
+    let last = stages.len() - 1;
+    if sink.is_none() && !want_out {
+        // the final stage inherits fd 1 raw: flush Rust's buffered stdout
+        // BEFORE spawning, so a `print!` written before the pipeline (no
+        // trailing newline, so the LineWriter still holds it) reaches fd 1
+        // ahead of the child's bytes, exactly as bash interleaves them
+        let _ = std::io::Write::flush(&mut std::io::stdout());
+    }
+    let mut prev: Option<std::process::ChildStdout> = None;
+    let mut children: Vec<std::process::Child> = Vec::new();
+    let mut spawn_err = false;
+    for (i, argv) in stages.iter().enumerate() {
+        let Some(prog) = argv.first() else { spawn_err = true; break; };
+        let mut c = std::process::Command::new(prog.as_ref());
+        for a in &argv[1..] { c.arg(a.as_ref()); }
+        if i == 0 {
+            if input.is_some() {
+                c.stdin(std::process::Stdio::piped());
+            } else if let Some(p) = &stdin_path {
+                // the child must see the REAL device fd (`tty < /dev/pts/5`
+                // needs isatty, which a byte pipe lacks)
+                if let Ok(f) = std::fs::File::open(p) { c.stdin(std::process::Stdio::from(f)); }
+            }
+        } else if let Some(p) = prev.take() {
+            // the previous stage's write end moves into this child, so our
+            // own copy is dropped and the reader sees EOF
+            c.stdin(std::process::Stdio::from(p));
+        }
+        if i < last || sink.is_some() || want_out { c.stdout(std::process::Stdio::piped()); }
+        let mut ch = match c.spawn() { Ok(x) => x, Err(_) => { spawn_err = true; break; } };
+        if i == 0 {
+            if let Some(data) = input.take() {
+                if let Some(mut si) = ch.stdin.take() { let _ = std::io::Write::write_all(&mut si, &data); }
+            }
+        }
+        if i < last { prev = ch.stdout.take(); }
+        children.push(ch);
+    }
+    let mut out = Vec::new();
+    if sink.is_some() || want_out {
+        // read the tail BEFORE waiting: a stage that keeps writing would
+        // block on a full pipe otherwise
+        if let Some(mut so) = children.last_mut().and_then(|c| c.stdout.take()) {
+            let _ = std::io::Read::read_to_end(&mut so, &mut out);
+        }
+    }
+    // bash gives PIPESTATUS one entry per stage; the last stage's status is
+    // the pipeline's `$?`
+    let mut statuses: Vec<i32> = Vec::new();
+    for ch in children.iter_mut() {
+        statuses.push(ch.wait().map(|s| s.code().unwrap_or(1)).unwrap_or(1));
+    }
+    {
+        let mut ps = __SH_PIPESTATUS.lock().unwrap_or_else(|e| e.into_inner());
+        for st in &statuses { ps.push(*st); }
+    }
+    if !out.is_empty() {
+        let mut used = false;
+        if let Some(b) = sink.as_mut() { b.extend_from_slice(&out); used = true; }
+        if !used {
+            __SH_OUTFILE_TL.with(|v| { if let Some(f) = v.borrow_mut().as_mut() { let _ = std::io::Write::write_all(f, &out); used = true; } });
+        }
+        if !used {
+            if let Some(b) = __SH_OUT.lock().unwrap_or_else(|e| e.into_inner()).as_mut() {
+                b.extend_from_slice(&out);
+            } else {
+                let _ = std::io::Write::write_all(&mut std::io::stdout(), &out);
+            }
+        }
+    }
+    if spawn_err { return 1; }
+    statuses.last().copied().unwrap_or(0)
 }"#,
         "spawn" => r#"fn __sh_spawn(cmd: &str, input: Option<&[u8]>) -> i32 {
     // a shell-out inside a native stage inherits the stage's stdin
@@ -14786,6 +14975,47 @@ fn single_exec_text(r: &mut Render, e: &IrExpr) -> Option<String> {
 }
 
 impl Render {
+    /// The argv of a pipeline stage the emitted program can spawn itself: a
+    /// plain external simple command (`name word…`) whose words the renderer
+    /// already expands into a runtime `Vec<Word>`. `None` means "keep this
+    /// stage on the `bash -c` fallback", and the reasons are the shapes whose
+    /// argv cannot be spelled here:
+    ///   - a native builtin (`echo`, `read`, `cd`, …) must run in-process or
+    ///     its store / `$?` / variable effects would land in a child;
+    ///   - the command word is not a literal (`"$cmd" -x …`): it could name a
+    ///     builtin, so it cannot be spawned blindly;
+    ///   - the stage carries per-command env assignments (`FOO=1 cmd`) — the
+    ///     argv would need `.envs()` wiring this path does not do yet;
+    ///   - anything that is not a bare exec: a redirection / heredoc stage, a
+    ///     subshell, an `&&`/`||` stage, a loop.
+    fn native_stage_argv(&mut self, stmts: &[IrStmt]) -> Option<String> {
+        let [IrStmt::Expr(IrExpr::Call { func, args })] = stmts else {
+            return None;
+        };
+        if func != "exec" && func != "builtin" {
+            return None;
+        }
+        if args.len() > 2 || exec_env(args).is_some() {
+            return None;
+        }
+        let cmd = str_arg(args, 0)?;
+        if cmd.is_empty() || is_native_cmd(cmd) {
+            return None;
+        }
+        let arg_items: &[IrExpr] = match args.get(1) {
+            None => &[],
+            Some(IrExpr::Array(items)) => items,
+            Some(_) => return None,
+        };
+        self.add_helper("cat");
+        let mut words: Vec<String> = Vec::new();
+        words.push(self.words_expr(&args[0]));
+        for it in arg_items {
+            words.push(self.words_expr(it));
+        }
+        Some(format!("__sh_cat(&[{}])", words.join(", ")))
+    }
+
     /// Reconstruct a stage (or whole statement list) as bash command text.
     fn stage_text(&mut self, stmts: &[IrStmt]) -> Option<String> {
         match stmts {

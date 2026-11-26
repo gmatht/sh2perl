@@ -261,8 +261,8 @@ the emitted file). From `cargo run --bin rust_fixtures`:
 | 07_redirect | 44 | 1 | 0 | 0 |
 | 19_printf_literal | 31 | 4 | 0 | 0 |
 | 20_printf_dynamic | 235 | 0 | 1 | 114 |
-| the other 17 fixtures | — | 0 | 0 | 0 |
-| **TOTAL (20 fixtures)** | **823** | **5** | **1** | **114** |
+| the other 18 fixtures | — | 0 | 0 | 0 |
+| **TOTAL (21 fixtures)** | **1371** | **5** | **1** | **114** |
 
 Before/after, measured rather than remembered:
 
@@ -340,7 +340,7 @@ emission site in `src/rust_backend.rs` and absent from all 17 fixtures
 |---|---|
 | `01_assign` | plain scalar assignment, arithmetic |
 | `02_regex` | `=~` lowered to the native ERE matcher |
-| `03_capture` | `$( … )` capture block (still a `bash -c` pipeline inside); word lists are `Cow`/`Word` (`vec!["ls".into()]`) |
+| `03_capture` | `$( … )` capture block whose `ls -1 \| wc -l` is wired by the emitted program (`__sh_pipe`), no `bash -c`; word lists are `Cow`/`Word` (`vec!["ls".into()]`) |
 | `04_function` | user function with a parameter |
 | `05_array` | array in the thread-local store (arrays are not promoted) |
 | `06_arith_i64` | integer arithmetic, pow helper |
@@ -357,6 +357,7 @@ emission site in `src/rust_backend.rs` and absent from all 17 fixtures
 | `18_eval_poison` | **must stay in the store**: `eval` reaches `__SHV_N` by text, so no promotion |
 | `19_printf_literal` | **pins the specialized path**: four literal formats (`%s`, `%%`, literal braces) render as `format!`, zero `__sh_printf` in the file |
 | `20_printf_dynamic` | **pins the fallback**: a format assembled at run time must keep *and call* the 115-line interpreter |
+| `21_pipeline_interleave` | **pins the process/IO path**: pipelines spawned by the emitted program (`cat … \| tr … \| wc -l`, `printf … \| sort \| head`, a chain into `$()` and into a word), shell output interleaved with a child's inherited fd 1, and the one named `bash -c` fallback (a stage carrying a redirection) |
 
 Fixtures 13–15 are the negative half of the promotion work and are as
 important as 11–12: promotion is only sound where no construct can reach the
@@ -428,7 +429,12 @@ literal text inside one word** (`x=$(cmd)z`, `x=z$(cmd)`,
 `x=$(cmd)-$(cmd)`, quoted and unquoted) — `$var` in
 arithmetic and in `[ ]` comparisons, positional parameters and loop variables,
 `case`, `$?`, `false || …`, redirects (`>` and `>>`) read back through a
-capture, a pipeline, single-use string variables, repeated literals — and
+capture, **pipelines** — an all-external multi-stage chain, a
+`builtin | external…` chain, a chain feeding `$()` and one feeding a word, and
+a stage carrying a redirection (the named `bash -c` fallback) — **shell output
+interleaved with a child's inherited fd 1** (`printf 'pre-'` with no newline,
+then an external command, then more shell output), single-use string
+variables, repeated literals — and
 `printf` sites of every class the specializer classifies: literal formats with
 0/1/N `%s` slots, `%%`, escapes, `\c`, literal braces, `%d`, `%c`, both arity
 mismatches, a slotless format that still passes an argument, and a format
@@ -460,3 +466,10 @@ Divergences this net found, each fixed in `src/rust_backend.rs`:
   after `lexer.next()`). Both helpers now turn ANY single-expansion word into
   interpolation parts through `expansion_into_parts`, so the word keeps every
   part — unquoted or quoted, with a prefix, a suffix or several fragments.
+- the dead-status-store collapse in `emit` deleted the **previous line** when
+  it stored `__SH_RC`, assuming the payload had no effect. Native pipelines
+  made that visible: `__SH_RC.store(__sh_pipe(…))` carries the whole pipeline
+  in its argument, so collapsing it silently dropped the command (bash printed
+  `1`, the emitted program printed nothing). The collapse now requires a
+  call-free payload (`rc_store_payload_pure`); a store of a helper call is
+  kept.
