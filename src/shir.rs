@@ -1621,6 +1621,8 @@ pub(crate) fn ir_stmt_writes_lastexit(stmt: &IrStmt) -> bool {
         | IrStmt::DoWhile { .. }
         | IrStmt::For { .. }
         | IrStmt::If { .. }
+        | IrStmt::Case { .. }
+        | IrStmt::Select { .. }
         | IrStmt::Subshell(_)
         | IrStmt::Background(_)
         | IrStmt::Block(_)

@@ -2212,6 +2212,17 @@ fn emit_stmt_owned(out: &mut String, stmt: &IrStmt, indent: usize) {
             // regex-translated glob patterns (bash case is anchored glob
             // matching on the value).
             let d = ir_expr_to_perl(discriminant);
+            // bash's case status is the matched arm's last command, or 0
+            // when no arm matched. Clear to 0 up front; a taken arm
+            // overwrites it with its own final status.
+            let w = rc_write("$main_exit_code = $CHILD_ERROR = 0;");
+            if !w.is_empty() {
+                emit_indent(out, indent);
+                out.push_str(&w);
+                if !w.ends_with('\n') {
+                    out.push('\n');
+                }
+            }
             let mut any_emitted = false;
             for (i, clause) in clauses.iter().enumerate() {
                 let has_default = clause.patterns.iter().any(|p| p == "*");
@@ -2934,12 +2945,11 @@ fn emit_stmt_owned(out: &mut String, stmt: &IrStmt, indent: usize) {
                         let words = exec_word_args(args);
                         let rest: Vec<String> = words.iter().map(|w| render_word_list(w)).collect();
                         emit_indent(out, indent);
-                        out.push_str(&format!(
-                            "{}({});{}\n",
-                            name,
-                            rest.join(", "),
-                            rc_write(" $main_exit_code = $CHILD_ERROR = 0;")
-                        ));
+                        // NO status write here: bash leaves the call's status
+                        // in `$?` (the body's last command, or a `return N`).
+                        // The old `$? = 0 << 8` clobbered `f(){ false; }` and
+                        // `f(){ cd /no/such; }` back to success.
+                        out.push_str(&format!("{}({});\n", name, rest.join(", ")));
                     }
                     "fnValue" => {
                         // VALUE-returning function call (the echo-return
@@ -4337,6 +4347,27 @@ fn emit_stmt_owned(out: &mut String, stmt: &IrStmt, indent: usize) {
 
         IrStmt::Return(Some(expr)) => {
             let e = ir_expr_to_perl(expr);
+            // bash's `return N` sets `$? = N` as well as leaving the body.
+            // Only a NUMERIC return is a status: the value-returning shape
+            // the echo-fold passes synthesize (`echo $x` → `return $x`, so
+            // a caller may `say f(...)`) must not shift a string into `$?`.
+            let numeric = match expr {
+                IrExpr::Int(_) => true,
+                IrExpr::Str(s, _) => !s.trim().is_empty() && s.trim().parse::<i64>().is_ok(),
+                _ => false,
+            };
+            let w = if numeric {
+                rc_write(&format!("$main_exit_code = $CHILD_ERROR = {e};"))
+            } else {
+                String::new()
+            };
+            if !w.is_empty() {
+                emit_indent(out, indent);
+                out.push_str(&w);
+                if !w.ends_with('\n') {
+                    out.push('\n');
+                }
+            }
             emit_indent(out, indent);
             out.push_str(&format!("return {};\n", e));
         }
@@ -17927,6 +17958,29 @@ mod perl_render_tests {
         // `break` is success even when the command before it failed.
         let b = render("while true; do false; break; done\necho $?\n");
         assert!(b.contains("= 0; last;"), "{b}");
+    }
+
+    /// A function call leaves the BODY's status in `$?`; the old call-site
+    /// success write erased `f(){ false; }` and `f(){ cd /no/such; }`.
+    #[test]
+    fn function_call_keeps_body_status() {
+        let out = render("f(){ false; }; f; echo $?\n");
+        assert!(out.contains("$? = 1 << 8;"), "{out}");
+        assert!(!out.contains("f();$? = 0"), "{out}");
+        let r = render("f(){ return 7; }; f; echo $?\n");
+        assert!(
+            r.contains("$? = 7 << 8;") || r.contains("$? = (\"7\") << 8;"),
+            "{r}"
+        );
+    }
+
+    /// A case's status is the matched arm's last command, 0 if none matched.
+    #[test]
+    fn case_arm_status_survives() {
+        let out = render("case x in x) false;; esac; echo $?\n");
+        assert!(out.contains("$? = 1 << 8;"), "{out}");
+        // The unmatched case clears the status before the arm chain.
+        assert!(out.contains("$? = 0 << 8;"), "{out}");
     }
 
     /// Golden text for a dozen representative programs, plus `perl -w -c`

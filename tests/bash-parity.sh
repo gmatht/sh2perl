@@ -67,6 +67,9 @@ else
         # continue, and each condition form (test, external, natively
         # lowered builtin, compound) for both while and until
         tests/loop-status/*.sh
+        # function-call and case exit status, in statement, &&/||, if and
+        # $?-read positions
+        tests/status/*.sh
     )
 fi
 
@@ -158,7 +161,11 @@ for f in "${examples[@]}"; do
     # N: ", which differs by invocation path even between two bash runs, and
     # the Perl runtime may print a local uu-ffi availability notice; strip
     # both and compare the message itself.
-    if [ "${f#tests/loop-status/}" != "$f" ]; then
+    case "$f" in
+    tests/loop-status/* | tests/status/*) strict_stderr=1 ;;
+    *) strict_stderr=0 ;;
+    esac
+    if [ "$strict_stderr" = 1 ]; then
         sed -E 's/^.*: line [0-9]+: //' "$tmp/$name.b/work/err" >"$tmp/$name.b.nerr"
         sed -E 's/^.*: line [0-9]+: //' "$tmp/$name.p/work/err" \
             | grep -v '^sh2perl: uu-ffi ' >"$tmp/$name.p.nerr"
