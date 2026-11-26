@@ -41,6 +41,17 @@ jobs:
           set -o pipefail
           cargo test 2>&1 | tee cargo_test_output.txt || true
 
+      - name: Check the Verus proof manifests
+        # proofs/verus/*_sync.txt is EVIDENCE: each manifest claims its proof
+        # models a given source, that its pins exist, and that its `exec` rows
+        # were really executed. This step recomputes every recorded sha, checks
+        # each `pin` names a real proof fn, and runs the test behind every
+        # `exec …: PASS` row, so a stale or unrun manifest fails the job
+        # instead of reading as proof.
+        run: |
+          set -o pipefail
+          python3 proofs/verus/check_sync.py 2>&1 | tee verus_manifest_check.txt
+
       - name: Run purify tests
         run: |
           perl test_purify.pl --all 2>&1 | tee purify_output.txt || true

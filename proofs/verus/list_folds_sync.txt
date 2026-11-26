@@ -1,5 +1,5 @@
 # verus-sync-coverage manifest: list_folds
-# source sha: brace_fold=3cbc85981aa1 affix_strip_fold=62e557c7454a  proof sha: 0098be0a40b9
+# source sha: brace_fold=3cbc85981aa1 affix_strip_fold=62e557c7454a STALE (sha matches no revision of the file in history)  proof sha: 0098be0a40b9
 
 [pins]
 pin pin_brace_empty_group -> test empty_expansion_is_refused: MAPPED

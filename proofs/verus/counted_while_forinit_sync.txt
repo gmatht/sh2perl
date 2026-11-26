@@ -1,5 +1,5 @@
 # verus-sync-coverage manifest: counted_while_forinit
-# source sha: counted_while_forinit=4308a4459399  proof sha: a41102c5a409
+# source sha: counted_while_forinit=4308a4459399 STALE (analysis gained induction_guard, an extra refusal the model lacks)  proof sha: a41102c5a409
 
 [pins]
 pin pin_arith_step_folds -> test arith_wrapped_step_folds: MAPPED

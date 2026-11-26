@@ -1,7 +1,9 @@
 # verus-sync-coverage manifest: uae_terminators
-# source sha: shir=0267b2d61be5 (git blob of src/shir.rs at HEAD; the WORKTREE copy has
-#   other workers' uncommitted edits, so its sha256 is deliberately not recorded)
+# source sha: shir=801da0be2a82 (git blob of src/shir.rs at HEAD; audited: since
+#   0267b2d61be5 only the ESTree lowering changed -- stmt_to_estree,
+#   expr_to_estree, store_rhs_string -- not the terminator region this models)
 # uae=3adb4e485152 (sha256 of src/transforms/unreachable_after_exit.rs)
+# proof sha: ad4861da41d3
 
 [pins]
 pin pin_trunc_shapes -> test tail_after_an_infinite_loop_is_dropped: MAPPED

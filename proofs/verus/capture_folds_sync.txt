@@ -1,5 +1,5 @@
 # verus-sync-coverage manifest: capture_folds
-# source sha: const_capture_fold=7f4b0d0dfb10 text_capture_fold=f76d26e31190  proof sha: b2c4c1df6296
+# source sha: const_capture_fold=7f4b0d0dfb10 STALE (source gained const_printf_output, a fold this proof does not model) text_capture_fold=f76d26e31190  proof sha: b2c4c1df6296
 
 [pins]
 pin pin_and_chain_status_refuses -> test chain_status_loss_refuses: MAPPED

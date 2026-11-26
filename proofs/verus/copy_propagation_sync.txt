@@ -1,5 +1,5 @@
 # verus-sync-coverage manifest: copy_propagation
-# source sha: copy_propagation=2bce47b3f3b3  proof sha: bab6ad48bf1b
+# source sha: copy_propagation=2bce47b3f3b3 STALE (sha matches no revision of the file in history)  proof sha: bab6ad48bf1b
 
 [pins]
 pin pin_copy_def_not_folded -> test folds_copy_rhs: MAPPED

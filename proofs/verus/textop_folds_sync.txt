@@ -1,5 +1,5 @@
 # verus-sync-coverage manifest: textop_folds
-# source sha: text_ops=68bfaa6813fb  proof sha: 4f885f265c26
+# source sha: text_ops=68bfaa6813fb STALE (sha matches no revision of the file in history)  proof sha: 4f885f265c26
 
 [pins]
 pin pin_basename_interior_slashes -> UNMIRRORED (by design — see the proof-campaign plan §(b).4)

@@ -1,5 +1,7 @@
 # verus-sync-coverage manifest: counted_arith_forinit
-# source sha: counted_arith_forinit=9e961939f940  proof sha: c9ef6ba6071e
+# source sha: counted_arith_forinit=8d6b31a5219d  proof sha: c9ef6ba6071e
+# refreshed 2026-11-26: the only change since the recorded revision is a
+# comment block in `transform`; the modelled code is unchanged.
 
 [pins]
 pin pin_continue_body_refuses -> test continue_in_body_vetoes: MAPPED

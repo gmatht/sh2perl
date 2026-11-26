@@ -1,5 +1,5 @@
 # verus-sync-coverage manifest: c_decl_coverage
-# source sha: c_backend-walkers=840274f9b61b  proof sha: 70d63fefe961
+# source sha: c_backend-walkers=840274f9b61b STALE (region key; sha matches no revision of src/c_backend.rs)  proof sha: 70d63fefe961
 
 [pins]
 pin pin_array_elem -> UNMIRRORED (by design — see the proof-campaign plan §(b).4)

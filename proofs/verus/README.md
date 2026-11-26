@@ -32,6 +32,48 @@ Why keep the names: they are provenance for measurements actually made, and
 deleting them would hide where the evidence came from. Why not link them:
 this repo's CI must stay self-contained.
 
+## Manifest checker — `check_sync.py`
+
+    python3 proofs/verus/check_sync.py            # everything, and runs the tests
+    python3 proofs/verus/check_sync.py --no-tests # shas + pins + parity only
+    python3 proofs/verus/check_sync.py -m status_reads -v
+    python3 proofs/verus/check_sync.py --list
+
+A `*_sync.txt` manifest is a claim that this proof models THAT source, that its
+pins exist, and that these rows were executed. The checker fails the claim
+when it rots:
+
+| failure | what it means |
+|---|---|
+| `stale-source` | a recorded `# source sha:` no longer matches the file (sha256 or, for a `shir`-style pin, HEAD's git blob). The fix is to re-audit the proof against the new source, not to bump the sha. |
+| `sha` | the recorded `proof sha:` no longer matches the `.rs`, or the line is missing. |
+| `phantom-pin` | a `pin <name>` row names no `fn <name>(` in the sibling `.rs`. |
+| `unrun` | a `pin … : MAPPED` row has no `exec …: PASS` row, or its named test did not run. |
+| `bogus-exec` | an `exec …: PASS` row has no `MAPPED` pin row behind it. |
+| `parity` | `exec <pin>: UNMIRRORED` contradicts `pin <pin>: MAPPED`. |
+| `counts` | `[counts]` claims errors, or its `proof-fns:`/`pins:` numbers disagree with the file. |
+
+The tests are the point of `exec …: PASS`, so the checker runs `cargo test
+--lib` once and looks up every named test's own verdict: a `PASS` row whose
+test does not run, or runs `FAILED` (or `ignored`), fails the manifest.
+`--no-tests` skips that and says so in the summary — a run without the tests
+is not evidence of execution.
+
+Two dialects are accepted, because the directory has two generations:
+`[counts]` as `N verified, M errors` (with `M == 0`), or as the older
+file-shape fact `proof-fns: N` / `pins: M`, whose numbers are checked against
+the `.rs` (`proof fn` declarations) and the `[pins]` table.
+
+**Admitted staleness.** A source row may be marked `…=<sha> STALE (<reason>)`
+when the proof has NOT been re-audited against the current source, or when
+the recorded sha matches no revision in history. The checker then prints a
+`WARN` naming the drift instead of failing — the row can no longer be misread
+as evidence, and the drift is visible on every run. Unmarked drift is a
+failure. `optimize_fold_sync.txt` is a generated fold table, not a manifest,
+and is reported as `SKIP`.
+
+Exit status is 1 if anything failed.
+
 ## What is proved
 
 `interval.rs` is a standalone model of the interval rewrite of
