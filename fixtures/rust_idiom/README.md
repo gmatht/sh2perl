@@ -17,7 +17,7 @@ Re-render after a backend change, then look at the diff:
     cargo run --bin rust_fixtures -- --check
     cargo run --bin rust_fuzz -- --cases 150 --seed 1
 
-`--check` runs five checks per fixture, in this order:
+`--check` runs six checks per fixture, in this order:
 
 1. **stale** — the fresh render equals the checked-in `expected/*.rs`.
 2. **A1 parity** — the same source rendered through the A1-JSON ingress that
@@ -33,28 +33,49 @@ Re-render after a backend change, then look at the diff:
 4. **behaviour** — each build runs in a scratch directory seeded with the same
    three files the `bash` run sees, and stdout, exit status and every file it
    creates must equal `bash <fixture>`.
-5. **census** — the idiom counters (per-variable statics, `.clone()`,
+5. **clippy** — every built fixture is linted (`cargo clippy` in a one-file
+   scratch package) in BOTH the debug and the `-O` profile with
+   `-D warnings`; any finding fails the fixture. This is the half of the
+   metric that catches families nobody named by hand —
+   `clippy::print_with_newline`, `format_in_format_args`, `useless_vec` all
+   came out of it and are fixed in the emitter now. A missing component is a
+   **hard gap**, not a skip: the summary prints `HARD GAP: clippy did not
+   run` and the gate exits 2. (`rustup component add clippy`.)
+6. **census** — the idiom counters (per-variable statics, `.clone()`,
    `.to_string()`, `#[allow(`, `Command::new("bash")`, emitted `__sh_*`
    helpers, lines) are printed per fixture and totalled. "Idiomatic" is a
    number that has to keep moving down, not a claim in a comment.
 
-Clippy is used as an extra lint source when `cargo clippy` is installed; when
-it is not, the gate prints `clippy: unavailable` rather than pretending the
-check passed.
+## The word vector type
 
-Every fixture is compiled except those whose output legitimately needs a
-third-party crate in the *generated* program's own manifest. Those are
-reported as `NEEDS-CRATE <name>`:
+Every word list — `__sh_print_words`, `__sh_wq`, `__sh_cat`, `__sh_split_ifs`,
+`__sh_lines`, `__sh_read_fields`, `__sh_glob`, `__sh_brace`, `__sh_aindex`,
+`__sh_printf`'s arguments, and the text-array store — carries `Word`, a
+`std::borrow::Cow<'static, str>` alias emitted once in the prelude:
 
-* `08_bigint.sh` — `$((9223372036854775807 + 1))` cannot be an `i64`, so the
-  renderer emits `num_bigint::BigInt` (already a dependency of this crate).
-  It compiles clean in a crate that has `num-bigint` (verified), but its
-  output is *not* bash-identical: bash wraps to `-9223372036854775808`,
-  the BigInt lowering prints the exact `9223372036854775808`. This fixture
-  pins the render shape, not behavioural equality.
+    type Word = std::borrow::Cow<'static, str>;
 
-Adding a fixture: drop `NN_something.sh` in `src/`, run the harness without
-`--check`, commit both files.
+so a word that is a compile-time literal is emitted as `vec!["done".into()]`
+and stays *borrowed* (`Cow::Borrowed`) with no allocation and no
+`.to_string()`, while a runtime value (a capture, an interpolation, an
+integer read) is adopted as `Cow::Owned` from the `String` it already built.
+The alias is pruned from programs that use no word list.
+
+What still carries `.to_string()`, and why — the census total went **21 → 13**
+across the fixtures, and none of the 13 is a word-vector element any more:
+
+| where | n | why it must own |
+|---|---|---|
+| literal bound to a `String` local (`let name = "world".to_string()`) | 3 | `analyze_var_borrowable` withheld, so the binding's home is `String` — a promoted-binding question, not a word-list one |
+| literal passed to a `String` parameter (`greet("there".to_string())`) | 2 | the parameter type comes from the function's `FnSig`, which is `String` |
+| `String::from_utf8_lossy(&cap).to_string()` | 2 | the text is borrowed from a temporary capture buffer; it must be owned before the buffer drops |
+| BigInt → decimal (`08_bigint`) | 1 | an out-of-`i64` value has no text form other than this |
+| `String` store of an export-poisoned variable (`15_export_poison`) | 1 | the store is `RefCell<String>`; the name cannot be a `let` |
+| `n.to_string().trim().parse::<i64>()` round-trips (`16`, `17`, `15`) | 4 | the numeric test/compare path stringifies an `i64` and re-parses it — the "numeric type inference" item, not the word plumbing |
+
+The word path itself now converts in exactly one place: an integer read that
+lands in a word list (`vec![n.to_string().into()]`), because the value is an
+`i64` at run time and text is the semantic conversion.
 
 ## What each fixture pins
 
@@ -62,7 +83,7 @@ Adding a fixture: drop `NN_something.sh` in `src/`, run the harness without
 |---|---|
 | `01_assign` | plain scalar assignment, arithmetic |
 | `02_regex` | `=~` lowered to the native ERE matcher |
-| `03_capture` | `$( … )` capture block (still a `bash -c` pipeline inside) |
+| `03_capture` | `$( … )` capture block (still a `bash -c` pipeline inside); word lists are `Cow`/`Word` (`vec!["ls".into()]`) |
 | `04_function` | user function with a parameter |
 | `05_array` | array in the thread-local store (arrays are not promoted) |
 | `06_arith_i64` | integer arithmetic, pow helper |

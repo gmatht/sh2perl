@@ -174,9 +174,26 @@ fn expr_rhs_key(e: &IrExpr) -> String {
     }
 }
 
+/// Strip the single-word coercion tail from a rendered expression:
+/// `.to_string()` (an owned `String` — a numeric read, a capture) or
+/// `.into()` (a value adopted by the `Word` element type: a literal
+/// stays borrowed, an owned `String` moves in). Everything that pattern-
+/// matches a rendered word goes through this, so the two spellings are
+/// interchangeable.
+fn trim_word_tail(t: &str) -> &str {
+    strip_word_coercion(t)
+}
+
+fn strip_word_coercion(t: &str) -> &str {
+    let t = t.trim_end();
+    match t.strip_suffix(".to_string()").or_else(|| t.strip_suffix(".into()")) {
+        Some(r) => r.trim_end(),
+        None => t,
+    }
+}
+
 fn string_literal_word(w: &str) -> Option<&str> {
-    let t = w.trim();
-    let base = t.strip_suffix(".to_string()")?.trim();
+    let base = strip_word_coercion(w.trim());
     (base.len() >= 2 && base.starts_with('"') && base.ends_with('"')).then_some(base)
 }
 
@@ -924,6 +941,22 @@ fn cat_peephole(text: &str) -> String {
         *i += ch.len_utf8();
     }
 
+    /// Emit a flattened word list. A `&vec![..]` is the one shape clippy
+    /// rejects (`useless_vec`) — and every `&` here is a slice parameter —
+    /// so the borrow form drops straight to `&[..]`.
+    fn emit_list(out: &mut String, inner: &str) {
+        if out.ends_with('&') && !out.ends_with("&&") {
+            out.pop();
+            out.push_str("&[");
+            out.push_str(inner);
+            out.push(']');
+        } else {
+            out.push_str("vec![");
+            out.push_str(inner);
+            out.push(']');
+        }
+    }
+
     fn one_pass(s: &str) -> (String, bool) {
         let mut out = String::with_capacity(s.len());
         let b = s.as_bytes();
@@ -964,15 +997,14 @@ fn cat_peephole(text: &str) -> String {
                                 }
                             }
                             if !xs.is_empty() {
-                                let mut r = String::from("vec![");
+                                let mut r = String::new();
                                 for (n, x) in xs.iter().enumerate() {
                                     if n > 0 {
                                         r.push_str(", ");
                                     }
                                     r.push_str(x);
                                 }
-                                r.push(']');
-                                out.push_str(&r);
+                                emit_list(&mut out, &r);
                                 i = rb + 2;
                                 changed = true;
                                 continue;
@@ -1036,9 +1068,7 @@ fn cat_peephole(text: &str) -> String {
                     if inner.trim().is_empty() {
                         out.push_str("Vec::<String>::new()");
                     } else {
-                        out.push_str("vec![");
-                        out.push_str(inner);
-                        out.push(']');
+                        emit_list(&mut out, inner);
                     }
                     i = j + 2;
                     changed = true;
@@ -1192,12 +1222,19 @@ fn inline_simple_helpers(
                 let end = at + pat.len() + end_rel;
                 // Check for a trailing `.to_string()`
                 let after = &out[end..];
-                if after.starts_with(".to_string()") {
+                let tail = if after.starts_with(".to_string()") {
+                    ".to_string()"
+                } else if after.starts_with(".into()") {
+                    ".into()"
+                } else {
+                    ""
+                };
+                if !tail.is_empty() {
                     let replacement = format!(
                         "{}.chars().count().to_string()",
                         var_expr
                     );
-                    let full_end = end + ".to_string()".len();
+                    let full_end = end + tail.len();
                     out.replace_range(at..full_end, &replacement);
                     continue;
                 }
@@ -1407,10 +1444,17 @@ fn inline_print_words(text: &mut String) {
             search_from = at + pat.len();
             continue;
         }
-        let expr = &text[start..close];
+        // the word vector's element carries a coercion tail (`.into()`)
+        // that the `println!` form must not inherit
+        let expr = strip_word_coercion(&text[start..close]);
         // end = position after the `)` of `, true, false)`
         let end = bracket2_pos + 1 + j + ", true, false)".len();
-        let replacement = format!("println!(\"{{}}\", {})", expr);
+        // `println!("{}", format!(..))` is just `println!(..)` — clippy's
+        // `format_in_format_args`, and one whole allocation saved
+        let replacement = match expr.strip_prefix("format!(").and_then(|r| r.strip_suffix(')')) {
+            Some(args) => format!("println!({args})"),
+            None => format!("println!(\"{{}}\", {expr})"),
+        };
         text.replace_range(at..end, &replacement);
         // The replacement may itself contain `pat`-adjacent text; resume the
         // scan at the end of what we just wrote so the loop always advances.
@@ -2168,6 +2212,11 @@ fn prune_unused_statics(text: String) -> String {
     while out.contains("\n\n\n") {
         out = out.replace("\n\n\n", "\n\n");
     }
+    // the Word alias is only needed when a word list/array is used
+    if !out.replace("type Word = std::borrow::Cow<'static, str>;", "").contains("Word") {
+        out = out.replace("type Word = std::borrow::Cow<'static, str>;\n\n", "");
+        out = out.replace("type Word = std::borrow::Cow<'static, str>;\n", "");
+    }
     // the Ordering import is only needed when an atomic is used
     if !out.replace("use std::sync::atomic::Ordering;", "").contains("Ordering::") {
         out = out.replace("use std::sync::atomic::Ordering;\n\n", "");
@@ -2450,7 +2499,7 @@ fn literal_printf_replacement(inner: &str) -> Option<String> {
     let mut out = format!("format!({}", rust_str_lit(&fmt_src));
     for r in &arg_ranges {
         out.push_str(", ");
-        out.push_str(args[r.0..r.1].trim());
+        out.push_str(strip_word_coercion(args[r.0..r.1].trim()));
     }
     out.push(')');
     Some(out)
@@ -2744,7 +2793,7 @@ fn strip_macro_to_string(t: &str) -> String {
                         for &(a, b) in &ranges[1..] {
                             let raw = &region[a..b];
                             let trimmed = raw.trim_end();
-                            if let Some(cut) = trimmed.strip_suffix(".to_string()") {
+                            if let Some(cut) = Some(trim_word_tail(trimmed)).filter(|c| c.len() != trimmed.len()) {
                                 // keep the argument, drop only the conversion
                                 let keep = open + 1 + a + cut.len();
                                 let end = open + 1 + a + trimmed.len();
@@ -2904,7 +2953,10 @@ fn collapse_double_parens(t: &str) -> String {
         let Some(close) = scan_matching(&s, at) else {
             break;
         };
-        if s[close + 1..].starts_with(".to_string()") {
+        let tail = [".to_string()", ".into()"]
+            .into_iter()
+            .find(|t| s[close + 1..].starts_with(*t));
+        if tail.is_some() {
             s.replace_range(close..close + 1, "");
             s.replace_range(at..at + 1, "");
         }
@@ -3076,7 +3128,7 @@ fn drop_redundant_mut(t: &str) -> String {
 fn drop_dead_literal_lets(t: &str) -> String {
     fn literal(rhs: &str) -> bool {
         let r = rhs.trim().trim_end_matches(';').trim();
-        let r = r.strip_suffix(".to_string()").unwrap_or(r);
+        let r = strip_word_coercion(r);
         (r.len() > 1 && r.starts_with('"') && r.ends_with('"'))
             || r == "true"
             || r == "false"
@@ -3157,7 +3209,7 @@ fn ere_supported(pat: &str) -> bool {
 /// (`"^[0-9]+$".to_string()` → `^[0-9]+$`), if it is one.
 fn rhs_lit_text(rendered: &str) -> Option<&str> {
     let r = rendered.trim();
-    let body = r.strip_suffix(".to_string()")?;
+    let body = Some(strip_word_coercion(r)).filter(|b| b.len() != r.len())?;
     if body.len() > 2 && body.starts_with('"') && body.ends_with('"') {
         Some(&body[1..body.len() - 1])
     } else {
@@ -4516,7 +4568,7 @@ impl Render {
         // guarantees no such consumer exists for a homed array, so this
         // is dead-defensive, never live.
         if self.is_int_array(name) {
-            return format!("{m}.with(|v| v.borrow().iter().map(|n| n.to_string()).collect::<Vec<String>>())");
+            return format!("{m}.with(|v| v.borrow().iter().map(|n| Word::Owned(n.to_string())).collect::<Vec<Word>>())");
         }
         format!("{m}.with(|v| v.borrow().clone())")
     }
@@ -4632,7 +4684,7 @@ impl Render {
                 Self::unparen(e)
             );
         }
-        format!("{m}.with(|v| v.borrow_mut().push({}));", Self::unparen(e))
+        format!("{m}.with(|v| v.borrow_mut().push(({}).into()));", Self::unparen(e))
     }
 
     fn clear_var(&mut self, name: &str) -> String {
@@ -4811,7 +4863,7 @@ impl Render {
             );
         }
         let m = self.tls(name);
-        format!("{m}.with(|v| v.borrow().get({key} as usize).cloned().unwrap_or_default())")
+        format!("{m}.with(|v| v.borrow().get({key} as usize).map(|w| w.to_string()).unwrap_or_default())")
     }
 
     /// Array element write (index arrays; grows as needed). The value is
@@ -4839,7 +4891,7 @@ impl Render {
                             "{{ let v = ({val}).trim().parse::<i64>().unwrap_or(0); {m}[{idx}] = v; }}"
                         );
                     }
-                    return format!("{m}[{idx}] = {val};");
+                    return format!("{m}[{idx}] = ({val}).into();");
                 }
             }
             if self.local_array_is_int(name) {
@@ -4847,7 +4899,7 @@ impl Render {
                     "{{ let v = ({val}).trim().parse::<i64>().unwrap_or(0); let i: usize = {key} as usize; {m}[i] = v; }}"
                 );
             }
-            return format!("{{ let i: usize = {key} as usize; {m}[i] = {val}; }}");
+            return format!("{{ let i: usize = {key} as usize; {m}[i] = ({val}).into(); }}");
         }
         let m = self.tls(name);
         if self.is_int_array(name) {
@@ -4858,7 +4910,7 @@ impl Render {
         }
         format!(
             "{{ let __val = {val}; {m}.with(|v| {{ let mut b = v.borrow_mut(); let i = {key} as usize; \
-             if b.len() <= i {{ b.resize(i + 1, String::new()); }} b[i] = __val; }}); }}"
+             if b.len() <= i {{ b.resize(i + 1, Word::Borrowed(\"\")); }} b[i] = __val.into(); }}); }}"
         )
     }
 
@@ -6420,7 +6472,7 @@ impl Render {
                         if self.functions.contains(n) {
                             self.add_helper("print_words");
                             self.emit(&format!(
-                                "__sh_print_words(&[vec![format!(\"{{}} is a function\", {})]], true, false);",
+                                "__sh_print_words(&[vec![format!(\"{{}} is a function\", {}).into()]], true, false);",
                                 Self::rust_str(n)
                             ));
                         }
@@ -6437,7 +6489,7 @@ impl Render {
             "pwd" => {
                 self.add_helper("print_words");
                 self.emit(&format!(
-                    "__sh_print_words(&[vec![std::env::current_dir().map(|p| p.display().to_string()).unwrap_or_default()]], true, false);"
+                    "__sh_print_words(&[vec![std::env::current_dir().map(|p| p.display().to_string()).unwrap_or_default().into()]], true, false);"
                 ));
                 self.emit("__SH_RC.store(0, Ordering::SeqCst);");
             }
@@ -6738,8 +6790,11 @@ impl Render {
             }
             "printf" => {
                 let fmt = words.first().map(|w| self.expr_str(w)).unwrap_or_default();
-                let arg_exprs: Vec<String> =
-                    words.iter().skip(1).map(|w| self.expr_str(w)).collect();
+                let arg_exprs: Vec<String> = words
+                    .iter()
+                    .skip(1)
+                    .map(|w| format!("{}.into()", self.expr_str(w)))
+                    .collect();
                 self.add_helper("printf");
                 // see printf_stmt: __sh_printf always references __sh_printf_b
                 self.add_helper("printf_b");
@@ -6811,7 +6866,7 @@ impl Render {
         };
         self.add_helper("print_words");
         self.emit(&format!(
-            "__sh_print_words(&[vec![format!(\"{tag} {name}=\\\"{{}}\\\"\", {v})]], true, false);"
+            "__sh_print_words(&[vec![format!(\"{tag} {name}=\\\"{{}}\\\"\", {v}).into()]], true, false);"
         ));
     }
 
@@ -6821,7 +6876,7 @@ impl Render {
         if names_only {
             self.add_helper("print_words");
             self.emit(&format!(
-                "__sh_print_words(&[vec![{}]], true, false);",
+                "__sh_print_words(&[vec![{}.into()]], true, false);",
                 Self::rust_str_expr(name)
             ));
             return;
@@ -6854,7 +6909,7 @@ impl Render {
         text.push('}');
         self.add_helper("print_words");
         self.emit(&format!(
-            "__sh_print_words(&[vec![{}]], true, false);",
+            "__sh_print_words(&[vec![{}.into()]], true, false);",
             Self::rust_str_expr(&text)
         ));
     }
@@ -7603,13 +7658,39 @@ impl Render {
     }
 
     fn words_expr(&mut self, e: &IrExpr) -> String {
+        let s = self.words_expr_raw(e);
+        Self::word_vec(s)
+    }
+
+    /// Coerce a single-element word list to the `Word` element type: the
+    /// element keeps its own type and `.into()` resolves it (a `&'static
+    /// str` literal stays borrowed, an owned `String` is adopted). A
+    /// multi-word helper result (`__sh_cat`, `__sh_split_ifs`, a stored
+    /// array) is already `Vec<Word>` and passes through.
+    fn word_vec(s: String) -> String {
+        let t = s.trim_end();
+        if t == "Vec::new()" || t.ends_with(".into()]") {
+            return s;
+        }
+        if let Some(inner) = t.strip_prefix("vec![").and_then(|r| r.strip_suffix(']')) {
+            if inner.trim().is_empty() {
+                return s;
+            }
+            return format!("vec![{inner}.into()]");
+        }
+        s
+    }
+
+    fn words_expr_raw(&mut self, e: &IrExpr) -> String {
         match e {
             IrExpr::Str(s, _) => {
                 if let Some(pat) = s.strip_prefix(GLOB_SENTINEL) {
                     self.add_helper("glob");
                     format!("__sh_glob({})", Self::rust_str(pat))
                 } else {
-                    format!("vec![{}]", Self::rust_str_expr(s))
+                    // a bare `&'static str`: the element type adopts it as
+                    // `Word::Borrowed` and nothing is allocated
+                    format!("vec![{}]", Self::rust_str(s))
                 }
             }
             IrExpr::Int(i) => format!("vec![{}.to_string()]", Self::atom_or_paren(&int_lit(*i))),
@@ -7620,9 +7701,9 @@ impl Render {
                     } else if self.is_array(name) {
                         self.read_arr(name)
                     } else {
-                        // a `Vec<String>` element: an owned String, so a
-                        // borrowable local's `&str` is stringified here
-                        format!("vec![{}]", self.read_str_owned(name))
+                        // a word element: a borrowable local's `&str` is
+                        // adopted directly, a stored String moves in
+                        format!("vec![{}]", self.read_str(name))
                     }
                 } else {
                     format!("vec![{}]", self.getvar_str(name))
@@ -8729,7 +8810,7 @@ impl Render {
         let pat = args.get(1).map(|a| self.expr_str(a)).unwrap_or_default();
         let flags = args.get(2).map(|a| self.expr_str(a)).unwrap_or_default();
         self.emit(&format!("let (__m, __r) = __sh_grepmatches(&{text}, &{pat}, &{flags});"));
-        self.emit("if !__m.is_empty() { __sh_print_words(&[vec![__m]], true, false); }");
+        self.emit("if !__m.is_empty() { __sh_print_words(&[vec![__m.into()]], true, false); }");
         self.emit("__SH_RC.store(__r, Ordering::SeqCst);");
     }
 
@@ -9685,7 +9766,7 @@ impl Render {
             // `__sh_cat` field-list machinery.
             let lits: Vec<String> = texts
                 .iter()
-                .map(|t| format!("{}.to_string()", Self::rust_str(t)))
+                .map(|t| format!("{}.into()", Self::rust_str(t)))
                 .collect();
             self.add_helper("cat");
             let stmt = self.write_arr(name, &format!("vec![{}]", lits.join(", ")));
@@ -9802,6 +9883,39 @@ impl Render {
     /// unescape (via [`Self::echo_esc_lit`], a Rust twin of the runtime
     /// `__sh_echo_esc`) + trailing newline. `None` when any word is not
     /// a literal (so the caller keeps the general path).
+    /// One print call for already-joined arguments. A lone `format!(..)`
+    /// argument is inlined into the enclosing macro rather than nested —
+    /// `println!("{}", format!(..))` is `println!(..)` (clippy's
+    /// `format_in_format_args`, and one format parse instead of two).
+    fn print_macro_stmt(mac: &str, args: &[String]) -> String {
+        if args.len() == 1 {
+            // the word element carries its coercion tail (`.into()`); the
+            // print form must not inherit it
+            let a0 = strip_word_coercion(args[0].trim());
+            if let Some(inner) = a0.strip_prefix("format!(").and_then(|r| r.strip_suffix(')')) {
+                return format!("{mac}({inner});");
+            }
+            return format!("{mac}(\"{{}}\", {});", args[0]);
+        }
+        let f: String = (0..args.len())
+            .map(|i| if i == 0 { "{}".to_string() } else { " {}".to_string() })
+            .collect();
+        format!("{mac}({}, {});", Self::rust_str(&f), args.join(", "))
+    }
+
+    /// A constant echo as one print call: a literal that ends in a newline
+    /// is `println!` without it (`clippy::print_with_newline`), anything
+    /// else stays `print!`. Same stdout path, same bytes.
+    fn print_literal_stmt(text: &str) -> String {
+        match text.strip_suffix('\n') {
+            Some(rest) if rest.is_empty() => "println!();".to_string(),
+            Some(rest) if !rest.ends_with('\r') => {
+                format!("println!({});", Self::rust_str(rest))
+            }
+            _ => format!("print!({});", Self::rust_str(text)),
+        }
+    }
+
     fn const_echo_text(parts: &[Part], nl: bool, esc: bool) -> Option<String> {
         let mut s = String::new();
         let mut first = true;
@@ -9948,9 +10062,8 @@ impl Render {
         if !self.word_fail_guard {
             if let Some(text) = Self::const_echo_text(&parts, nl, esc) {
                 if self.sink_free_here() {
-                    // `print!("…")` — the string is a Rust literal, so the
-                    // `{}` placeholder is unnecessary
-                    self.emit(&format!("print!({});", Self::rust_str(&text)));
+                    // the string is a Rust literal, so no `{}` placeholder
+                    self.emit(&Self::print_literal_stmt(&text));
                 } else {
                     self.sink_check_needed = true;
                     self.add_helper("puts");
@@ -10017,16 +10130,7 @@ impl Render {
                     // clone that is not the whole argument, is left alone.
                     args.push(Self::drop_trailing_clone(&rendered));
                 }
-                if args.len() == 1 {
-                    self.emit(&format!("{mac}(\"{{}}\", {});", args[0]));
-                } else {
-                    let f: String = args
-                        .iter()
-                        .enumerate()
-                        .map(|(i, _)| if i == 0 { "{}".to_string() } else { " {}".to_string() })
-                        .collect();
-                    self.emit(&format!("{mac}({}, {});", Self::rust_str(&f), args.join(", ")));
-                }
+                self.emit(&Self::print_macro_stmt(mac, &args));
                 self.emit("__SH_RC.store(0, Ordering::SeqCst);");
                 return;
             }
@@ -10072,7 +10176,7 @@ impl Render {
                     self.add_helper("split_ifs");
                     format!("__sh_split_ifs(&{c}, \" \\t\\n\")")
                 }
-                w => format!("vec![{}]", self.expr_str(w)),
+                w => format!("vec![{}.into()]", self.expr_str(w)),
             })
             .collect();
         self.add_helper("printf");
@@ -10097,7 +10201,7 @@ impl Render {
             }
         } else {
             self.add_helper("print_words");
-            self.emit(&format!("__sh_print_words(&[vec![{call}]], false, false);"));
+            self.emit(&format!("__sh_print_words(&[vec![{call}.into()]], false, false);"));
         }
         self.emit("__SH_RC.store(0, Ordering::SeqCst);");
     }
@@ -11361,10 +11465,10 @@ impl Render {
                 if let IrExpr::Str(s, _) = value {
                     if self.runtime_free {
                         // `Output.newline` carries the trailing newline
-                        self.emit(&format!(
-                            "print!({});",
-                            Self::rust_str(&format!("{s}{}", if *newline { "\n" } else { "" }))
-                        ));
+                        self.emit(&Self::print_literal_stmt(&format!(
+                            "{s}{}",
+                            if *newline { "\n" } else { "" }
+                        )));
                         self.emit("__SH_RC.store(0, Ordering::SeqCst);");
                         return;
                     }
@@ -12869,6 +12973,11 @@ impl Render {
         // called fully-qualified), so unused items would be a real bug
         // that rustc can flag.
         self.emit("use std::sync::atomic::Ordering;");
+        // the element type of every word list and text array: a literal
+        // stays borrowed (no allocation, no `.to_string()`), a runtime
+        // value owns its text. One alias keeps every helper signature and
+        // every call site spelled the same way.
+        self.emit("type Word = std::borrow::Cow<'static, str>;");
         self.emit("");
         if !self.rc_disabled {
             self.emit("static __SH_RC: std::sync::atomic::AtomicI32 = std::sync::atomic::AtomicI32::new(0);");
@@ -12970,7 +13079,7 @@ impl Render {
             )
         } else if self.is_array(v) {
             format!(
-                "thread_local! {{ {a}static {m}: std::cell::RefCell<Vec<String>> = const {{ std::cell::RefCell::new(Vec::new()) }}; }}"
+                "thread_local! {{ {a}static {m}: std::cell::RefCell<Vec<Word>> = const {{ std::cell::RefCell::new(Vec::new()) }}; }}"
             )
         } else if self.bigint_vars.contains(v) {
             // BigInt-tainted: decimal string holder (ops parse per use;
@@ -13140,7 +13249,7 @@ fn glob_like(s: &str) -> bool {
 
 fn helper_deps(h: &str) -> &'static [&'static str] {
     match h {
-        "wq" => &["q"],
+
         "print_words" => &["echo_esc"],
         // the no-`esc` variant never calls __sh_echo_esc — the `-e`
         // support is compiled out of the helper when no echo used it
@@ -13165,8 +13274,8 @@ fn helper_deps(h: &str) -> &'static [&'static str] {
 
 fn helper_source(h: &str) -> &'static str {
     match h {
-        "lines" => r#"fn __sh_lines(s: &str) -> Vec<String> {
-    s.split('\n').map(|x| x.to_string()).collect()
+        "lines" => r#"fn __sh_lines(s: &str) -> Vec<Word> {
+    s.split('\n').map(|x| Word::Owned(x.to_string())).collect()
 }"#,
         "q" => r#"fn __sh_q(s: &str) -> String {
     let mut o = String::with_capacity(s.len() + 8);
@@ -13209,15 +13318,19 @@ fn helper_source(h: &str) -> &'static str {
     }
     o
 }"#,
-"wq" => r#"fn __sh_wq(ws: &[String]) -> String {
+"wq" => r#"fn __sh_wq(ws: &[Word]) -> String {
     let mut o = String::new();
     for (i, w) in ws.iter().enumerate() {
         if i > 0 { o.push(' '); }
-        o.push_str(&__sh_q(w));
+        o.push('\'');
+        for c in w.chars() {
+            if c == '\'' { o.push_str("'\\''"); } else { o.push(c); }
+        }
+        o.push('\'');
     }
     o
 }"#,
-        "cat" => r#"fn __sh_cat(ws: &[Vec<String>]) -> Vec<String> {
+        "cat" => r#"fn __sh_cat(ws: &[Vec<Word>]) -> Vec<Word> {
     let mut o = Vec::new();
     for w in ws { o.extend(w.iter().cloned()); }
     o
@@ -13302,7 +13415,7 @@ fn helper_source(h: &str) -> &'static str {
         "atof" => r#"fn __sh_atof(s: &str) -> f64 {
     s.trim().parse().unwrap_or(0.0)
 }"#,
-        "print_words" => r#"fn __sh_print_words(ws: &[Vec<String>], nl: bool, esc: bool) {
+        "print_words" => r#"fn __sh_print_words(ws: &[Vec<Word>], nl: bool, esc: bool) {
     // a word's `$((…))` arith expansion FAILED (an empty positional
     // makes the expanded text a syntax error) — bash suppresses the
     // WHOLE simple command, not just the word
@@ -13332,7 +13445,7 @@ fn helper_source(h: &str) -> &'static str {
         // used `-e`, so the 19-line `__sh_echo_esc` need not be dragged
         // in. `esc` stays a parameter (call sites pass `false`) so the
         // two variants are drop-in interchangeable.
-        "print_words_noesc" => r#"fn __sh_print_words(ws: &[Vec<String>], nl: bool, esc: bool) {
+        "print_words_noesc" => r#"fn __sh_print_words(ws: &[Vec<Word>], nl: bool, esc: bool) {
     // no echo in this program used -e, so `esc` is always false — the
     // unescape arm (and its __sh_echo_esc dependency) is compiled out.
     let _ = esc;
@@ -13374,7 +13487,7 @@ fn helper_source(h: &str) -> &'static str {
     }
     print!("{}", s);
 }"#,
-        "printf" => r#"fn __sh_printf(fmt: &str, args: &[String]) -> String {
+        "printf" => r#"fn __sh_printf(fmt: &str, args: &[Word]) -> String {
     let mut out = String::new();
     let mut ai = 0usize;
     loop {
@@ -13432,7 +13545,7 @@ fn helper_source(h: &str) -> &'static str {
                 let conv = ch[j];
                 i = j + 1;
                 if conv == '%' { out.push('%'); continue; }
-                let arg = args.get(ai).cloned().unwrap_or_default();
+                let arg = args.get(ai).map(|w| w.to_string()).unwrap_or_default();
                 ai += 1;
                 let w: usize = width.parse().unwrap_or(0);
                 let left = flags.contains('-');
@@ -13612,28 +13725,28 @@ fn helper_source(h: &str) -> &'static str {
     *__SH_STDIN.lock().unwrap() = Some(r);
     (String::from_utf8_lossy(&buf).to_string(), any)
 }"#,
-        "read_fields" => r#"fn __sh_read_fields(line: &str, ifs: &str, n: usize) -> Vec<String> {
-    if n <= 1 || ifs.is_empty() { return vec![line.to_string()]; }
+        "read_fields" => r#"fn __sh_read_fields(line: &str, ifs: &str, n: usize) -> Vec<Word> {
+    if n <= 1 || ifs.is_empty() { return vec![Word::Owned(line.to_string())]; }
     let ws = ifs.chars().all(|c| c == ' ' || c == '\t' || c == '\n');
     let ch: Vec<char> = line.chars().collect();
     let is_sep = |c: char| ifs.contains(c);
-    let mut fields: Vec<String> = Vec::new();
+    let mut fields: Vec<Word> = Vec::new();
     let mut i = 0;
     while i < ch.len() && is_sep(ch[i]) { i += 1; }
     while fields.len() < n - 1 && i < ch.len() {
         let start = i;
         while i < ch.len() && !is_sep(ch[i]) { i += 1; }
-        fields.push(ch[start..i].iter().collect());
+        fields.push(Word::Owned(ch[start..i].iter().collect()));
         if i >= ch.len() { break; }
         i += 1;
         if ws { while i < ch.len() && is_sep(ch[i]) { i += 1; } }
     }
     let rest: String = ch[i.min(ch.len())..].iter().collect();
-    fields.push(rest);
+    fields.push(Word::Owned(rest));
     fields
 }"#,
-        "split_ifs" => r#"fn __sh_split_ifs(s: &str, ifs: &str) -> Vec<String> {
-    if ifs.is_empty() { return vec![s.to_string()]; }
+        "split_ifs" => r#"fn __sh_split_ifs(s: &str, ifs: &str) -> Vec<Word> {
+    if ifs.is_empty() { return vec![Word::Owned(s.to_string())]; }
     let ws = ifs.chars().all(|c| c == ' ' || c == '\t' || c == '\n');
     let ch: Vec<char> = s.chars().collect();
     let is_sep = |c: char| ifs.contains(c);
@@ -13643,7 +13756,7 @@ fn helper_source(h: &str) -> &'static str {
     while i < ch.len() {
         let start = i;
         while i < ch.len() && !is_sep(ch[i]) { i += 1; }
-        out.push(ch[start..i].iter().collect());
+        out.push(Word::Owned(ch[start..i].iter().collect()));
         if i >= ch.len() { break; }
         i += 1;
         if ws { while i < ch.len() && is_sep(ch[i]) { i += 1; } }
@@ -13907,20 +14020,20 @@ fn helper_source(h: &str) -> &'static str {
         "arg" => r#"fn __sh_arg(i: usize) -> String {
     __SH_ARGV.lock().unwrap().get(i).cloned().unwrap_or_default()
 }"#,
-        "glob" => r#"fn __sh_glob(pat: &str) -> Vec<String> {
+        "glob" => r#"fn __sh_glob(pat: &str) -> Vec<Word> {
     let cmd = format!("printf '%s\\n' {}", pat);
     let out = __sh_cap_bytes(&cmd, None);
     let s = String::from_utf8_lossy(&out);
-    let v: Vec<String> = s.lines().map(|x| x.to_string()).collect();
-    if v.is_empty() { vec![pat.to_string()] } else { v }
+    let v: Vec<Word> = s.lines().map(|x| Word::Owned(x.to_string())).collect();
+    if v.is_empty() { vec![Word::Owned(pat.to_string())] } else { v }
 }"#,
-        "brace" => r#"fn __sh_brace(pre: &str, groups: &[&[&str]], seps: &[&str], suf: &str) -> Vec<String> {
-    let mut out: Vec<String> = vec![pre.to_string()];
+        "brace" => r#"fn __sh_brace(pre: &str, groups: &[&[&str]], seps: &[&str], suf: &str) -> Vec<Word> {
+    let mut out: Vec<Word> = vec![Word::Owned(pre.to_string())];
     for (gi, g) in groups.iter().enumerate() {
         let mut next = Vec::new();
         for o in &out {
             for item in *g {
-                next.push(format!("{}{}", o, item));
+                next.push(Word::Owned(format!("{}{}", o, item)));
             }
         }
         out = next;
@@ -13928,13 +14041,13 @@ fn helper_source(h: &str) -> &'static str {
             let sep = seps[gi];
             if !sep.is_empty() {
                 for o in out.iter_mut() {
-                    o.push_str(sep);
+                    o.to_mut().push_str(sep);
                 }
             }
         }
     }
     for o in out.iter_mut() {
-        o.push_str(suf);
+        o.to_mut().push_str(suf);
     }
     out
 }"#,
@@ -14199,8 +14312,8 @@ fn helper_source(h: &str) -> &'static str {
         "fsize" => r#"fn __sh_fsize(s: &str) -> i64 {
     std::fs::metadata(s).map(|m| m.len() as i64).unwrap_or(0)
 }"#,
-        "aindex" => r#"fn __sh_aindex(v: &[String], k: i64) -> String {
-    v.get(k as usize).cloned().unwrap_or_default()
+        "aindex" => r#"fn __sh_aindex(v: &[Word], k: i64) -> String {
+    v.get(k as usize).map(|w| w.to_string()).unwrap_or_default()
 }"#,
         _ => "fn __sh_unused() {}",
     }
@@ -19608,8 +19721,8 @@ mod tests {
         // a literal-only echo in a runtime-free program is folded to a
         // single precomputed string and emitted as a bare print!
         let out = render("echo \"s1\"\necho one two three\n");
-        assert!(out.contains("print!(\"s1\\n\")"), "{out}");
-        assert!(out.contains("print!(\"one two three\\n\")"), "{out}");
+        assert!(out.contains("println!(\"s1\")"), "{out}");
+        assert!(out.contains("println!(\"one two three\")"), "{out}");
         assert!(!out.contains("__sh_puts"), "no runtime helper needed:\n{out}");
         assert!(!out.contains("__sh_print_words(&[vec![\"s1\""), "{out}");
     }
@@ -19620,7 +19733,7 @@ mod tests {
         // the runtime __sh_echo_esc)
         let out = render("echo -n \"a\"\necho -e \"x\\ty\"\n");
         assert!(out.contains("print!(\"a\")"), "{out}");
-        assert!(out.contains("print!(\"x\\ty\\n\")"), "{out}");
+        assert!(out.contains("println!(\"x\\ty\")"), "{out}");
     }
 
     #[test]
@@ -19672,14 +19785,14 @@ mod tests {
         // The whole `if` is gone: the branch runs inline, so at -Os the
         // program is literally the body of the taken branch.
         assert!(!out.contains("if "), "constant `if` not elided at -Os:\n{out}");
-        assert!(out.contains("print!(\"same\\n\")"), "{out}");
+        assert!(out.contains("println!(\"same\")"), "{out}");
         assert!(!out.contains("to_string()"), "no String allocation:\n{out}");
         let out = render("if [ \"a\" = \"b\" ]; then echo x; fi\n");
-        assert!(!out.contains("if ") && !out.contains("print!"), "dead branch kept:\n{out}");
+        assert!(!out.contains("if ") && !out.contains("println!"), "dead branch kept:\n{out}");
         // a constant false with an else keeps only the else body
         let out = render("if [ \"a\" = \"b\" ]; then echo x; else echo y; fi\n");
         assert!(!out.contains("if "), "constant `if` not elided:\n{out}");
-        assert!(out.contains("print!(\"y\\n\")") && !out.contains("print!(\"x\\n\")"), "{out}");
+        assert!(out.contains("println!(\"y\")") && !out.contains("println!(\"x\")"), "{out}");
         }
     }
 
@@ -20229,7 +20342,7 @@ mod tests {
         assert!(!out.contains("__SH_OUTFILE_TL"), "{out}");
         assert!(!out.contains("let mut used = false"), "{out}");
         assert!(!out.contains("__sh_puts"), "{out}");
-        assert!(out.contains("print!(\"hi\\n\")"), "{out}");
+        assert!(out.contains("println!(\"hi\")"), "{out}");
     }
 
     #[test]
@@ -20317,7 +20430,7 @@ mod tests {
         assert!(!out.contains("__sh_puts"), "sink helper kept:\n{out}");
         assert!(!out.contains("__SH_OUT"), "sink statics kept:\n{out}");
         assert!(
-            out.contains("print!("),
+            out.contains("println!(") || out.contains("print!("),
             "the body did not print natively:\n{out}"
         );
     }
@@ -20403,7 +20516,7 @@ mod tests {
         crate::shir::set_source_lang(None);
         assert!(!out.contains("else"), "empty else manufactured:\n{out}");
         assert!(!out.contains("__SH_RC"), "status kept:\n{out}");
-        assert!(out.contains("print!("), "body lost:\n{out}");
+        assert!(out.contains("println!(") || out.contains("print!("), "body lost:\n{out}");
         assert!(out.contains("yes"), "body lost:\n{out}");
         assert!(!out.contains("\n\n    }"), "stray blank before the brace:\n{out}");
     }
@@ -20565,7 +20678,7 @@ mod tests {
         assert!(out.contains("__SH_OUTFILE_TL"), "{out}");
         assert!(out.contains("let mut used = false"), "{out}");
         assert!(
-            out.contains("__sh_print_words(&[vec![\"hi\".to_string()]], true, false)"),
+            out.contains("__sh_print_words(&[vec![\"hi\".into()]], true, false)"),
             "{out}"
         );
     }
@@ -20578,7 +20691,7 @@ mod tests {
         // body must still print idiomatically.
         let out = render("f() { echo a; echo b; }\nf\n{ echo g; } > /tmp/sh2_nf_probe.txt\n");
         assert!(
-            out.contains("fn f()") && out.contains("print!(\"a\\n\")"),
+            out.contains("fn f()") && out.contains("println!(\"a\")"),
             "never-redirected body not idiomatic:\n{out}"
         );
         assert!(

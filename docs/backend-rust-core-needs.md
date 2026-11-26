@@ -139,10 +139,25 @@ directions.
 - Generated code carries no bare `.unwrap()`: a poisoned lock still yields its
   data (`unwrap_or_else(|e| e.into_inner())`), the capture slot defaults to
   the empty buffer, and a non-hex digit reads as 0.
+- Every word list (the `__sh_print_words` argument, `__sh_wq`, `__sh_cat`,
+  `__sh_split_ifs`, `__sh_lines`, `__sh_read_fields`, `__sh_glob`,
+  `__sh_brace`, `__sh_aindex`, `__sh_printf`'s arguments) and the text-array
+  store carry `Word = std::borrow::Cow<'static, str>`, emitted once in the
+  prelude and pruned when unused. A literal word is `vec!["done".into()]` and
+  stays `Cow::Borrowed` (no allocation, no `.to_string()`); a runtime value is
+  adopted from the `String` it already built. The alias is what lets one call
+  site hold both: a bare `&str` element and an owned `String` element cannot
+  live in the same `&[Vec<S>]` under a generic `S`.
 - The gate for all of this is `cargo run --bin rust_fixtures -- --check`
   (stale check, A1-ingress parity, `rustc -D warnings` in debug *and* `-O`,
-  behaviour vs `bash`, idiom census) plus the differential net
-  `cargo run --bin rust_fuzz`.
+  behaviour vs `bash`, **clippy `-D warnings` in debug *and* `-O`**, idiom
+  census) plus the differential net `cargo run --bin rust_fuzz`. Clippy is a
+  required check, not an optional extra: if the component is missing the gate
+  prints `HARD GAP: clippy did not run` and exits non-zero. It already pays
+  for itself — `clippy::print_with_newline`, `clippy::format_in_format_args`
+  and `clippy::useless_vec` were all live in the emitted code and are now
+  fixed in the emitter (`println!("x")` instead of `print!("x\n")`, one
+  `format!` instead of a nested pair, `&[a, b]` instead of `&vec![a, b]`).
 
 ### 5.3 Hygiene + hoisting
 Rust keywords: `fn/let/mut/if/else/while/for/loop/match/struct/enum/

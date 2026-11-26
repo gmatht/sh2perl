@@ -1,5 +1,4 @@
 use std::sync::atomic::Ordering;
-
 static __SH_ARITH_ERR: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
 
 fn __sh_pow(a: i64, b: i64) -> i64 {

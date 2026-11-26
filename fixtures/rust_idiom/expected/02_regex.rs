@@ -159,8 +159,8 @@ fn __sh_re_ere(text: &str, pat: &str, ci: bool) -> bool {
 fn main() {
     let id = "abc123".to_string();
     if __sh_re_ere(&id, "^[a-z]+[0-9]+$", false) {
-        print!("matched\n");
+        println!("matched");
     } else {
-        print!("no\n");
+        println!("no");
     }
 }

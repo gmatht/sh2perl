@@ -1,4 +1,5 @@
 use std::sync::atomic::Ordering;
+type Word = std::borrow::Cow<'static, str>;
 
 static __SH_RC: std::sync::atomic::AtomicI32 = std::sync::atomic::AtomicI32::new(0);
 
@@ -11,26 +12,20 @@ static __SH_PIPESTATUS: std::sync::Mutex<Vec<i32>> = std::sync::Mutex::new(Vec::
 
 static __SH_ARITH_WORD_FAIL: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
 
-fn __sh_q(s: &str) -> String {
-    let mut o = String::with_capacity(s.len() + 8);
-    o.push('\'');
-    for c in s.chars() {
-        if c == '\'' { o.push_str("'\\''"); } else { o.push(c); }
-    }
-    o.push('\'');
-    o
-}
-
-fn __sh_wq(ws: &[String]) -> String {
+fn __sh_wq(ws: &[Word]) -> String {
     let mut o = String::new();
     for (i, w) in ws.iter().enumerate() {
         if i > 0 { o.push(' '); }
-        o.push_str(&__sh_q(w));
+        o.push('\'');
+        for c in w.chars() {
+            if c == '\'' { o.push_str("'\\''"); } else { o.push(c); }
+        }
+        o.push('\'');
     }
     o
 }
 
-fn __sh_print_words(ws: &[Vec<String>], nl: bool, esc: bool) {
+fn __sh_print_words(ws: &[Vec<Word>], nl: bool, esc: bool) {
     // no echo in this program used -e, so `esc` is always false — the
     // unescape arm (and its __sh_echo_esc dependency) is compiled out.
     let _ = esc;
@@ -120,7 +115,7 @@ fn main() {
     let __cap_oldin = __SH_STDIN.lock().unwrap_or_else(|e| e.into_inner()).take();
     let __sh_pbuf0: Vec<u8> = Vec::new();
     __SH_PIPESTATUS.lock().unwrap_or_else(|e| e.into_inner()).clear();
-    __SH_RC.store(__sh_spawn(&format!("{} | {}", __sh_wq(&vec!["ls".to_string(), "-1".to_string()]), __sh_wq(&vec!["wc".to_string(), "-l".to_string()])), Some(&__sh_pbuf0)), Ordering::SeqCst);
+    __SH_RC.store(__sh_spawn(&format!("{} | {}", __sh_wq(&["ls".into(), "-1".into()]), __sh_wq(&["wc".into(), "-l".into()])), Some(&__sh_pbuf0)), Ordering::SeqCst);
     __SH_PIPESTATUS.lock().unwrap_or_else(|e| e.into_inner()).push(__SH_RC.load(Ordering::SeqCst));
     *__SH_STDIN.lock().unwrap_or_else(|e| e.into_inner()) = __cap_oldin;
     let __cap = __SH_OUT.lock().unwrap_or_else(|e| e.into_inner()).take().unwrap_or_default();
@@ -130,6 +125,6 @@ fn main() {
     while __s.ends_with('\n') { __s.pop(); }
     __s
 };
-    __sh_print_words(&[vec![format!("count={}", files)]], true, false);
+    __sh_print_words(&[vec![format!("count={}", files).into()]], true, false);
     __SH_RC.store(0, Ordering::SeqCst);
 }

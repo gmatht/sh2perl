@@ -26,8 +26,11 @@
 //! 5. **census**: the idiom counters below are printed and totalled, so
 //!    "idiomatic" is a number that moves rather than a prose claim.
 //!
-//! Clippy is used as an extra lint source when `cargo clippy` is installed
-//! (`clippy: unavailable` is reported, never treated as a pass).
+//! Clippy is a REQUIRED check: every built fixture is linted in both the
+//! debug and the `-O` profile with `-D warnings`, and a single finding fails
+//! the fixture. If the component is missing the gate does not pass — it
+//! prints a HARD GAP line and exits non-zero, because a lint source that
+//! silently disappears turns "idiomatic" back into a prose claim.
 //!
 //! ## Debug builds and overflow
 //!
@@ -224,14 +227,73 @@ fn build(code: &str, dir: &Path, optimised: bool) -> Build {
 
 // ── clippy ───────────────────────────────────────────────────────────────
 
-/// Is `cargo clippy` usable? Checked once; a missing component is reported,
-/// never counted as a pass.
-fn clippy_available() -> bool {
-    Command::new("cargo")
-        .args(["clippy", "--version"])
-        .output()
-        .map(|o| o.status.success())
-        .unwrap_or(false)
+/// Probe `cargo clippy` once. `Err` is a HARD GAP: the gate refuses to call
+/// itself green without a lint source.
+fn clippy_probe() -> Result<(), String> {
+    match Command::new("cargo").args(["clippy", "--version"]).output() {
+        Ok(o) if o.status.success() => Ok(()),
+        Ok(o) => {
+            let msg = String::from_utf8_lossy(&o.stderr).trim().to_string();
+            Err(if msg.is_empty() { format!("exit {:?}", o.status.code()) } else { msg })
+        }
+        Err(e) => Err(e.to_string()),
+    }
+}
+
+/// Lint one rendered program with `cargo clippy -D warnings`. Clippy needs a
+/// manifest, so the program is materialised as a one-file package in the
+/// scratch tree; `--offline` keeps it hermetic (a fixture with a real
+/// external dependency is skipped before it reaches here).
+///
+/// Returns the findings (first lines only) so the caller can print them; an
+/// empty `Ok` means the program is clean.
+fn clippy_lints(code: &str, name: &str, dir: &Path, optimised: bool) -> Result<(), String> {
+    let src_dir = dir.join("src");
+    std::fs::create_dir_all(&src_dir).expect("clippy src dir");
+    let pkg = name.replace(|c: char| !c.is_ascii_alphanumeric(), "_");
+    let manifest = format!(
+        "[package]\nname = \"fx_{pkg}\"\nversion = \"0.0.0\"\nedition = \"2021\"\n\n\
+         [[bin]]\nname = \"fx\"\npath = \"src/main.rs\"\n"
+    );
+    std::fs::write(dir.join("Cargo.toml"), manifest).expect("clippy manifest");
+    std::fs::write(src_dir.join("main.rs"), code).expect("clippy main.rs");
+    let mut c = Command::new("cargo");
+    c.arg("clippy")
+        .arg("--offline")
+        .arg("-q")
+        .arg("--manifest-path")
+        .arg(dir.join("Cargo.toml"))
+        .arg("--target-dir")
+        .arg(dir.join("target"));
+    if optimised {
+        c.arg("--release");
+    }
+    c.args(["--", "-D", "warnings"]);
+    let res = c.output().expect("run cargo clippy");
+    if res.status.success() && res.stderr.is_empty() {
+        return Ok(());
+    }
+    let text = String::from_utf8_lossy(&res.stderr).to_string();
+    // keep the lint headlines and their source line, drop cargo's framing
+    let mut keep: Vec<&str> = text
+        .lines()
+        .filter(|l| {
+            let t = l.trim_start();
+            t.starts_with("error")
+                || t.starts_with("warning")
+                || t.starts_with("--> ")
+                || t.starts_with("note: `#[deny")
+        })
+        .collect();
+    if keep.is_empty() {
+        keep.push(text.trim());
+    }
+    keep.truncate(24);
+    Err(format!(
+        "clippy ({}) failed:\n{}",
+        if optimised { "-O" } else { "debug" },
+        keep.join("\n")
+    ))
 }
 
 // ── main ─────────────────────────────────────────────────────────────────
@@ -253,11 +315,15 @@ fn main() {
     files.sort();
 
     let scratch = std::env::temp_dir().join("rust_idiom_gate");
-    let clippy = clippy_available();
-    if !clippy {
-        println!("note  cargo clippy is not installed — lint source disabled");
-    } else {
-        println!("note  clippy available: generated programs are linted too");
+    let clippy_err = clippy_probe().err();
+    match &clippy_err {
+        None => println!(
+            "note  clippy available: every built fixture is linted (debug and -O, -D warnings)"
+        ),
+        Some(e) => {
+            println!("note  HARD GAP: cargo clippy is unavailable — no fixture can be linted");
+            println!("      {e}");
+        }
     }
     println!(
         "{:<20} {:>5} {:>7} {:>5} {:>5} {:>5} {:>5} {:>5} {:>7}",
@@ -313,6 +379,20 @@ fn main() {
                 println!();
                 print!("{}", rel.stderr);
             } else {
+                // ── 3b. clippy, debug and -O ──────────────────────────
+                let mut lint_msgs: Vec<String> = Vec::new();
+                if clippy_err.is_none() {
+                    for optimised in [false, true] {
+                        let lint_dir = scratch.join(&name).join(if optimised {
+                            "lint_rel"
+                        } else {
+                            "lint_dbg"
+                        });
+                        if let Err(m) = clippy_lints(&code, &name, &lint_dir, optimised) {
+                            lint_msgs.push(m);
+                        }
+                    }
+                }
                 let want = run_bash(f, &scratch.join(&name).join("bash"));
                 let got_d = run_bin(&dbg_dir.join("main"), &scratch.join(&name).join("run_dbg"));
                 let got_r = run_bin(&rel_dir.join("main"), &scratch.join(&name).join("run_rel"));
@@ -351,9 +431,16 @@ fn main() {
                     bad = true;
                     bits.push("A1-PARITY-DIFF");
                 }
+                if !lint_msgs.is_empty() {
+                    bad = true;
+                    bits.push("CLIPPY");
+                }
                 if bad {
                     failures += 1;
                     status = bits.join(" ");
+                    for m in &lint_msgs {
+                        println!("\n{name}: {m}");
+                    }
                     if !got_d.eq(&want) && declared_overflow.is_none() {
                         println!("\n{name}: bash → {:?} rc={} files={:?}", want.stdout, want.code, want.files.keys().collect::<Vec<_>>());
                         println!("{name}: dbg  → {:?} rc={} files={:?}", got_d.stdout, got_d.code, got_d.files.keys().collect::<Vec<_>>());
@@ -378,12 +465,19 @@ fn main() {
         "TOTAL", total.lines, total.statics, total.clones, total.to_strings, total.allows,
         total.bash_spawns, total.helpers
     );
+    if let Some(e) = &clippy_err {
+        eprintln!(
+            "\nHARD GAP: clippy did not run, so the idiomatic metric is incomplete ({e})"
+        );
+        eprintln!("install it with `rustup component add clippy` and re-run");
+        std::process::exit(2);
+    }
     if failures > 0 {
         eprintln!("\n{failures} fixture(s) failed");
         std::process::exit(1);
     }
     println!(
-        "\n{} fixtures: render unchanged, A1 parity ok, rustc clean (debug + -O), behaviour matches bash",
+        "\n{} fixtures: render unchanged, A1 parity ok, rustc+clippy clean (debug + -O, -D warnings), behaviour matches bash",
         files.len()
     );
 }

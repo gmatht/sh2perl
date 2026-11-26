@@ -1,5 +1,5 @@
 fn main() {
     // TODO(unsupported): test
-        print!("semver\n");
+        println!("semver");
 }
 // 1 construct(s) lowered to TODO markers
