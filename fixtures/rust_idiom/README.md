@@ -194,51 +194,92 @@ rustc flags as an unused assignment for the path that always writes first.
 
 ## printf: decomposing a literal format
 
-A `printf` whose format is a literal is decided at render time
-(`classify_printf_format` in `src/rust_backend.rs`) and emitted as
-`format!` at the call site, so the ~115-line `__sh_printf` interpreter and
-its `atoi`/`atou`/`atof`/`printf_b` cluster fall out of the program. The
-decision is a classification with a reason, not a spot fix:
+A `printf` call site is decided at **render** time. `classify_printf_format`
+(in `src/rust_backend.rs`) turns the format literal into
+`PrintfPlan { fmt_src, text, args }`, and `literal_printf_replacement`
+emits a `format!` at the call site only when the whole call is provably
+equivalent to the interpreter:
 
-| format | plan |
+- the format is a Rust string literal the renderer already produced (so the
+  site's format is known statically, not built at run time);
+- its **escape conversions** happen at render time (`\n`, `\t`, `\\`,
+  `\NNN` … — `printf_unescape`), `%%` becomes one literal `%`, and a literal
+  `{`/`}` is doubled in `fmt_src` — a brace is *not* a format specifier, and
+  an undoubled one would emit an invalid `format!` string;
+- every `%s` becomes one `{}`, and the number of `%s` slots equals the number
+  of arguments the site actually passes (bash pads, truncates and quotes
+  nothing for `%s`);
+- a format with no `%s` is only collapsed to a single string when the site
+  passes **no** arguments (`&[]` is an empty list, not an argument) — bash
+  re-applies a slotless format once per argument group.
+
+Anything else FALLS BACK to `__sh_printf`, and the interpreter is then still
+emitted in that program. The reasons are named in `PrintfFallback`, so a
+refusal is a decision the census can count, not a silent miss:
+
+| condition | `PrintfFallback` |
 |---|---|
-| literal text | `format!` text (a literal `{`/`}` is doubled — a brace is **not** a format specifier) |
-| `%%` | one `%` |
-| `%s` | one `{}`, consuming one argument (bash pads, truncates and quotes nothing) |
-| `%d`/`%i`/`%u`/`%o`/`%x`/`%c`/`%q` | **fallback** — the argument's numeric/char conversion is the interpreter's job |
-| `%b` | **fallback** — backslash escapes come from the *argument*, at run time |
-| flags/width/precision (`%5s`, `%.2f`, `*`) | **fallback** |
-| `\c` in the format | **fallback** (it truncates the output) |
-| a format with no `%s` but with arguments | **fallback** — bash re-applies the format per argument group |
-| `%s` with no argument, or a different number of arguments | **fallback** — the interpreter pads/repeats |
-| a non-literal format (variable, interpolation, capture) | **fallback** — nothing to decompose |
-| anything unparsable | **fallback** |
+| the format is not a literal (a variable, an interpolation, a capture, anything computed) | `NotLiteral` |
+| a conversion or flag the specializer does not model exactly: `%d`/`%i`/`%u`/`%o`/`%x`/`%c`/`%q`, widths, precision, `*` (the argument's numeric/char conversion is the interpreter's job) | `Unsupported` |
+| `%b` — backslash escapes come from the *argument* at run time, so they cannot be resolved at render time even for a literal format | `BackslashB` |
+| `\c` in the format — it truncates the output and drops everything after it | `StopOutput` |
+| arity mismatch: more/fewer arguments than `%s` slots (the interpreter pads with empties or repeats the format) | `Arity` |
+| an unparsable format (a lone `%` before a non-conversion) | `Unsupported` |
 
-The fallback is complete, not deleted: `20_printf_dynamic.sh` builds the
-format at run time and must keep *and call* the interpreter, so an
-over-eager specialization fails the gate instead of changing output.
+When in doubt the site falls back; a wrong specialization is a semantic
+regression, so the accepted set stays narrow and the guard conservative.
+The fallback interpreter is kept whole (not deleted) precisely because these
+shapes still need it: `%d`/`%u`/`%c` conversions, `%b`'s run-time escape
+expansion, widths/precision/flags, `\c`, arity padding/repetition, and any
+format only known at run time. `__sh_printf`'s dependencies
+(`__sh_atoi`, `__sh_atou`, `__sh_atof`, `__sh_printf_b`, `__sh_q_printf`)
+are pruned per program, so a program that never falls back carries none of
+them.
 
-Measured (`pfx` = specialized sites, `pfi` = calls left on the
-interpreter, `pfl` = interpreter lines in the emitted file):
+### Pinned by fixtures
 
-| fixture | pfx | pfi | pfl |
-|---|---|---|---|
-| 07_redirect (`printf '%s\n' "a b" > out.txt`) | 1 | 0 | 0 |
-| 19_printf_literal (4 literal formats, `%%`, braces) | 4 | 0 | 0 |
-| 20_printf_dynamic (format from a variable) | 0 | 1 | 115 |
-| all other fixtures | 0 | 0 | 0 |
-| **TOTAL** | **5** | **1** | **115** |
+- `19_printf_literal.sh` — four literal sites (`'name=%s\n'`, `'%s-%s\t%s\n'`,
+  `'100%%\n'`, `'braces {a} and {b} stay literal\n'`). The emitted file has
+  **no** `__sh_printf` and no interpreter helper at all, and prints exactly
+  what bash prints.
+- `20_printf_dynamic.sh` — the format is assembled at run time
+  (`fmt="$piece/$piece\n"`); the site must keep **and call** the
+  interpreter, so an over-eager specialization fails the gate instead of
+  silently changing output.
+- `07_redirect.sh` — one literal site inside a redirect. It no longer carries
+  the always-false `esc` bool: the helper is `fn __sh_print_words(ws, nl)`
+  and the call reads `__sh_print_words(&[…], false)`.
 
-Before this pass the census could not see any of it: 0 sites were counted,
-the interpreter cost 0 emitted lines only because nothing measured it, and
-07 passed a literal `false` for an `esc` parameter the helper ignored
-(`let _ = esc;`). Now no `echo -e` in a program means the two-argument
-`print_words_noesc` is emitted and `drop_esc_arg` removes the argument
-from every call site, so 07 reads `__sh_print_words(&[…], false)`.
+### Measured
+
+The census prints, per fixture and in total, `pfx` (sites specialized),
+`pfi` (call sites left on `__sh_printf`), `pfl` (lines of interpreter body in
+the emitted file). From `cargo run --bin rust_fixtures`:
+
+| fixture | lines | pfx | pfi | pfl |
+|---|---|---|---|---|
+| 07_redirect | 44 | 1 | 0 | 0 |
+| 19_printf_literal | 31 | 4 | 0 | 0 |
+| 20_printf_dynamic | 236 | 0 | 1 | 115 |
+| the other 17 fixtures | — | 0 | 0 | 0 |
+| **TOTAL (20 fixtures)** | **824** | **5** | **1** | **115** |
+
+Before/after, measured rather than remembered:
+
+| | before this pass (`e4fe8c187`) | after (fresh run) |
+|---|---|---|
+| census columns | none (the split was unmeasured) | `pfx` 5 / `pfi` 1 / `pfl` 115 |
+| fixtures calling `__sh_printf` | 0 of 18 (`git grep -c` over the expected files) | 1 of 20 (`20_printf_dynamic`) |
+| interpreter lines emitted, total | 0 measured — and reachable by any literal-format site that fell back, e.g. a slotless `printf '100%%\n'`, which used to keep the 115-line body | 115, all in `20` |
+| 07_redirect | 44 lines, `__sh_print_words(&[…], nl, esc)` called with `false, false` | 44 lines, `__sh_print_words(&[…], nl)` |
+| 19_printf_literal | did not exist | 31 lines, 4 specialized, 0 interpreter lines |
+
+The cost of keeping the interpreter is visible in the same table: `20` is
+236 lines to `19`'s 31, and 115 of those lines are the interpreter body.
 
 `rust_fuzz` renders literal formats of every class above (`%%`, a literal
-brace, `%d`, a run-time-assembled format), so the classification is
-exercised on scripts nobody hand-wrote.
+brace, `%d` with a numeric argument, and a format assembled at run time), so
+the classification is exercised on scripts nobody hand-wrote.
 
 ## Naming, lints and aborts
 
@@ -303,7 +344,7 @@ emission site in `src/rust_backend.rs` and absent from all 17 fixtures
 | `04_function` | user function with a parameter |
 | `05_array` | array in the thread-local store (arrays are not promoted) |
 | `06_arith_i64` | integer arithmetic, pow helper |
-| `07_redirect` | redirect + literal-`printf` specialization: the 261-line `__sh_printf` interpreter is *gone* from the output |
+| `07_redirect` | redirect + a literal-`printf` site decomposed to `format!`: the emitted file calls no part of the 115-line `__sh_printf` interpreter |
 | `08_bigint` | `num_bigint` lowering for out-of-`i64` constants |
 | `09_regex_group`, `10_regex_alt` | best-effort `[[ =~ ]]` (see below) |
 | `11_promote` | promoted scalars: `let mut count = 0; count += 1;` |
@@ -313,6 +354,9 @@ emission site in `src/rust_backend.rs` and absent from all 17 fixtures
 | `15_export_poison` | **must stay in the store**: `export COUNT=…` reaches the name by word, so a `let` would drop the export |
 | `16_while_loop` | a `while [ … ]` condition whose status write keeps a block expression |
 | `17_overflow` | the documented debug/`-O` divergence: bash wraps, a debug build panics (`# debug-overflow:` marker) |
+| `18_eval_poison` | **must stay in the store**: `eval` reaches `__SHV_N` by text, so no promotion |
+| `19_printf_literal` | **pins the specialized path**: four literal formats (`%s`, `%%`, literal braces) render as `format!`, zero `__sh_printf` in the file |
+| `20_printf_dynamic` | **pins the fallback**: a format assembled at run time must keep *and call* the 115-line interpreter |
 
 Fixtures 13–15 are the negative half of the promotion work and are as
 important as 11–12: promotion is only sound where no construct can reach the

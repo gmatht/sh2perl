@@ -147,28 +147,65 @@ the emitted text. What stays stored is documented in
 
 ### 5.2c Post-render specialization and the emitted-code contract
 
-- A `printf` whose format is a literal is CLASSIFIED at render time
-  (`classify_printf_format`) and only decomposed when the whole call is
-  provably equivalent to the interpreter: literal text (with `{`/`}`
-  doubled — a brace is not a format specifier), `%%`, and `%s` consuming one
-  argument. Everything else returns a reason and keeps `__sh_printf`:
-  `%d`/`%i`/`%u`/`%o`/`%x`/`%c`/`%q` (argument conversion), `%b` (escapes
-  come from the argument at run time), flags/width/precision/`*`, `\c`,
-  a no-slot format with arguments (bash re-applies the format per argument
-  group), an `%s` with no argument or the wrong count (the interpreter pads
-  or repeats), and any non-literal format. The fallback stays complete:
-  `20_printf_dynamic.sh` builds its format at run time and keeps both the
-  interpreter and its call. Census over the fixtures: 5 specialized sites /
-  1 interpreted call / 115 interpreter lines (all 115 in the dynamic
-  fixture; the 18 pre-existing fixtures carried 0 interpreted calls and the
-  count was previously unmeasured). Two real bugs fell out of making the
-  rule explicit: a no-slot literal format with an empty argument list used
-  to fall back (`printf '100%%'` shipped the interpreter), and a literal
-  brace in a format produced an invalid `format!` string.
-- No `echo -e` in a program means the `esc` parameter is not emitted at all:
-  the two-argument `print_words_noesc` helper is chosen and `drop_esc_arg`
-  removes the literal `false` argument from every call site (07 used to pass
-  `, true, false` to a helper that did `let _ = esc;`).
+- **printf specialization is a classification, not a spot fix.** A call
+  site's format is classified at render time by `classify_printf_format`
+  (`PrintfPlan { fmt_src, text, args }`) and decomposed by
+  `literal_printf_replacement` only when the whole call is provably
+  equivalent to the interpreter: a literal format, its escape conversions
+  resolved at render time (`printf_unescape`), `%%` → one `%`, a literal
+  `{`/`}` doubled (a brace is not a format specifier; an undoubled one would
+  emit an invalid `format!` string), and every `%s` → one `{}` **matched
+  one-for-one with the arguments the site actually passes** (bash pads,
+  truncates and quotes nothing for `%s`). A slotless format collapses to a
+  single string only when the site passes no arguments at all (`&[]` is an
+  empty list, not an argument) — bash re-applies a slotless format once per
+  argument group.
+- **The fallback conditions are named in `PrintfFallback`** so a refusal is
+  a decision the census counts: `NotLiteral` (a variable, an interpolation,
+  a capture — nothing to decompose), `Unsupported` (`%d`/`%i`/`%u`/`%o`/
+  `%x`/`%c`/`%q`, widths, precision, `*`, a lone `%`), `BackslashB` (`%b`
+  escapes come from the argument at run time), `StopOutput` (`\c` truncates
+  the output), and `Arity` (fewer/more arguments than `%s` slots — the
+  interpreter pads with empties or repeats the format). When in doubt the
+  site falls back; a wrong specialization is a semantic regression, so the
+  accepted set stays narrow and the guard conservative.
+- **The interpreter is kept, not deleted**, because those shapes still need
+  it: `%d`/`%u`/`%c` conversion, `%b`'s run-time escape expansion,
+  widths/precision/flags, `\c`, arity padding/repetition, and any format
+  only known at run time. Its dependency cluster
+  (`__sh_printf`, `__sh_printf_b`, `__sh_atoi`, `__sh_atou`, `__sh_atof`,
+  `__sh_echo_esc`, `__sh_q_printf`) is pruned per program: `19_printf_literal`
+  emits none of them (only `__sh_print_words`), while `20_printf_dynamic`
+  emits all seven.
+- **Census, per fixture and total** (`cargo run --bin rust_fixtures`; `pfx`
+  = specialized sites, `pfi` = calls left on `__sh_printf`, `pfl` =
+  interpreter body lines): `07_redirect` 44 lines / 1 / 0 / 0,
+  `19_printf_literal` 31 lines / 4 / 0 / 0, `20_printf_dynamic` 236 lines /
+  0 / 1 / 115, the other 17 fixtures 0 / 0 / 0 — **TOTAL 20 fixtures, 824
+  lines, pfx 5, pfi 1, pfl 115**. Before/after, measured rather than
+  remembered: before this pass (commit `e4fe8c187`) the census had no printf
+  columns, 0 of 18 fixtures called `__sh_printf` (`git grep -c` over the
+  expected files) and 0 interpreter lines were measured — yet the 115-line
+  body was still reachable by any literal-format site that fell back (a
+  slotless `printf '100%%\n'` used to). After: 5 specialized / 1 interpreted
+  / 115 lines, all 115 in the dynamic fixture; `20` (236 lines) versus `19`
+  (31 lines) is what keeping the interpreter costs.
+- **Fixtures pin both sides**: `19_printf_literal` is the specialized path
+  (four literal sites including `%%` and literal braces; zero
+  `__sh_printf`, identical output), `20_printf_dynamic` is the fallback (a
+  run-time-assembled format must keep *and call* the interpreter, so an
+  over-eager specialization fails the gate instead of changing output).
+  `rust_fuzz` renders every class (`%%`, a literal brace, `%d`, a run-time
+  format), so the classification is exercised on scripts nobody hand-wrote.
+  Two real bugs fell out of making the rule explicit: a slotless literal
+  format with an empty argument list used to fall back (`printf '100%%'`
+  shipped the interpreter), and a literal brace in a format produced an
+  invalid `format!` string.
+- **No `echo -e` means no `esc` parameter**: the two-argument
+  `print_words_noesc` helper is emitted and `drop_esc_arg` removes the
+  literal `false` from every call site. `07_redirect` used to pass
+  `, true, false` to a helper that did `let _ = esc;`; it now reads
+  `__sh_print_words(&[…], false)` and still emits 44 lines.
 - Generated code carries no bare `.unwrap()` and no blanket `#[allow(...)]`
   for the codegen-noise lints (`dead_code`, `non_upper_case_globals`,
   `unused_variables`/`_parameters`/`_imports`, `unused_mut`, needless
