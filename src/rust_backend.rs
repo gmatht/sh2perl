@@ -4552,6 +4552,34 @@ impl Render {
     }
 
     fn read_num_of_str(&mut self, name: &str) -> String {
+        // A text home parsed to a number must not copy the text first:
+        // `borrow().clone()).trim().parse()` copies a String only to throw
+        // it away. Parse inside the borrow (a stored var) or in place (a
+        // promoted `String` local). Capture slots, loop bindings and
+        // borrowable `&str` locals keep the general path below.
+        let plain_local = self.local_vars.contains_key(name)
+            && !self.borrowable_vars.contains(name)
+            && !self.active_loop.iter().any(|(v, _, k)| v == name && *k == LoopBind::Str);
+        if plain_local {
+            return format!(
+                "{}.trim().parse::<i64>().unwrap_or(0)",
+                self.var_ident(name)
+            );
+        }
+        // a loop binding is a plain Rust binding, not a store — `read_str`
+        // hands it over bare, so it must not take the thread-local path
+        if !self.active_loop.iter().any(|(v, _, _)| v == name)
+            && !self.captured.contains_key(name)
+            && !self.local_vars.contains_key(name)
+            && !name.is_empty()
+            && !name.chars().all(|c| c.is_ascii_digit())
+            && !matches!(name, "?" | "#" | "@" | "*" | "$" | "!" | "-")
+        {
+            let m = self.tls(name);
+            return format!(
+                "{m}.with(|v| v.borrow().trim().parse::<i64>().unwrap_or(0))"
+            );
+        }
         format!("{}.trim().parse::<i64>().unwrap_or(0)", self.read_str(name))
     }
 
@@ -15194,6 +15222,42 @@ impl<'a, 'r> TestParser<'a, 'r> {
         self.parse_primary()
     }
 
+    /// A numeric-COMPARISON operand (`-eq … -ge`): a bare `$var` whose home
+    /// is already `i64` reads as the number. Without this the operand comes
+    /// back as its `String` form — `c.to_string()` — and `binary_test`
+    /// appends `.trim().parse::<i64>()`, i.e. an i64 is stringified and
+    /// reparsed just to compare it. Quoting does not change a single test
+    /// operand's value (the test builtin never field-splits one), so `"$n"`
+    /// qualifies like `$n`. Unary tests are untouched: `-z "$n"` still asks
+    /// for the TEXT of `n`.
+    fn operand_numeric(&mut self, text: &str, rendered: (String, bool)) -> (String, bool) {
+        let (e, num) = rendered;
+        if num {
+            return (e, true);
+        }
+        let t = text.trim();
+        let inner = if t.len() >= 2
+            && ((t.starts_with('"') && t.ends_with('"'))
+                || (t.starts_with('\'') && t.ends_with('\'')))
+        {
+            &t[1..t.len() - 1]
+        } else {
+            t
+        };
+        let Some(rest) = inner.strip_prefix('$') else {
+            return (e, num);
+        };
+        let name = rest
+            .strip_prefix('{')
+            .and_then(|s| s.strip_suffix('}'))
+            .unwrap_or(rest);
+        let bare = !name.is_empty() && name.chars().all(|c| c.is_alphanumeric() || c == '_');
+        if bare && self.render.is_num(name) {
+            return (self.render.read_num(name), true);
+        }
+        (e, num)
+    }
+
     fn parse_primary(&mut self) -> Option<String> {
         let tok = self.toks.get(self.pos)?.clone();
         match tok {
@@ -15202,7 +15266,7 @@ impl<'a, 'r> TestParser<'a, 'r> {
                 let (operand, _) = self.operand()?;
                 Some(self.unary_test(&op, &operand))
             }
-            TTok::Operand(_) => {
+            TTok::Operand(text) => {
                 // the CONSTANT texts (when literal) drive the fold in
                 // `binary_test`: a comparison against a literal RHS that
                 // cannot glob is decidable as a plain string compare
@@ -15210,8 +15274,27 @@ impl<'a, 'r> TestParser<'a, 'r> {
                 let (lhs, lhs_num) = self.operand()?;
                 if let Some(TTok::Bin(op)) = self.toks.get(self.pos).cloned() {
                     self.pos += 1;
+                    let rhs_text = match self.toks.get(self.pos) {
+                        Some(TTok::Operand(t)) => t.clone(),
+                        _ => String::new(),
+                    };
                     let rhs_lit = self.operand_literal();
                     let (rhs, rhs_num) = self.operand()?;
+                    // a numeric comparison asks for a NUMBER, so an operand
+                    // whose home already is one is read as that i64 instead
+                    // of being stringified for `binary_test` to reparse
+                    let numeric =
+                        matches!(op.as_str(), "-eq" | "-ne" | "-lt" | "-le" | "-gt" | "-ge");
+                    let (lhs, lhs_num) = if numeric {
+                        self.operand_numeric(&text, (lhs, lhs_num))
+                    } else {
+                        (lhs, lhs_num)
+                    };
+                    let (rhs, rhs_num) = if numeric {
+                        self.operand_numeric(&rhs_text, (rhs, rhs_num))
+                    } else {
+                        (rhs, rhs_num)
+                    };
                     Some(self.binary_test_lit(
                         &op, &lhs, lhs_num, lhs_lit.as_deref(), &rhs, rhs_num, rhs_lit.as_deref(),
                     ))

@@ -148,6 +148,19 @@ directions.
   adopted from the `String` it already built. The alias is what lets one call
   site hold both: a bare `&str` element and an owned `String` element cannot
   live in the same `&[Vec<S>]` under a generic `S`.
+- Numbers stay numbers. A value the source compares or does arithmetic with
+  is carried as `i64` in the emitted program: a numeric-comparison operand
+  (`[ "$c" -gt 0 ]`, `-eq … -ge`) resolves to the number when its home is
+  already `i64` (`TestParser::operand_numeric`), instead of being stringified
+  into `c.to_string().trim().parse::<i64>()`. `read_num_of_str` parses a text
+  home *inside* the borrow (no `borrow().clone()` copy) or in place for a
+  promoted `String` local. The remaining text→number conversions are
+  semantic, not detours: an element of a text array read by `$((sum + x))`
+  (`05_array`), and the `RefCell<String>` home of an `export`-poisoned name
+  (`15_export_poison`) — `export` reaches the name as a string, so there is no
+  `i64` to carry. `__sh_atoi` is not emitted by the shell renderer at all
+  (census 0), and `borrow().len() as i64` is the array length read, already
+  numeric.
 - The gate for all of this is `cargo run --bin rust_fixtures -- --check`
   (stale check, A1-ingress parity, `rustc -D warnings` in debug *and* `-O`,
   behaviour vs `bash`, **clippy `-D warnings` in debug *and* `-O`**, idiom

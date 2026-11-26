@@ -61,8 +61,9 @@ and stays *borrowed* (`Cow::Borrowed`) with no allocation and no
 integer read) is adopted as `Cow::Owned` from the `String` it already built.
 The alias is pruned from programs that use no word list.
 
-What still carries `.to_string()`, and why — the census total went **21 → 13**
-across the fixtures, and none of the 13 is a word-vector element any more:
+What still carries `.to_string()`, and why — the census total went **21 → 11**
+across the fixtures (13 → 11 in this round), and none of the 11 is a
+word-vector element or a numeric comparison operand:
 
 | where | n | why it must own |
 |---|---|---|
@@ -70,12 +71,55 @@ across the fixtures, and none of the 13 is a word-vector element any more:
 | literal passed to a `String` parameter (`greet("there".to_string())`) | 2 | the parameter type comes from the function's `FnSig`, which is `String` |
 | `String::from_utf8_lossy(&cap).to_string()` | 2 | the text is borrowed from a temporary capture buffer; it must be owned before the buffer drops |
 | BigInt → decimal (`08_bigint`) | 1 | an out-of-`i64` value has no text form other than this |
-| `String` store of an export-poisoned variable (`15_export_poison`) | 1 | the store is `RefCell<String>`; the name cannot be a `let` |
-| `n.to_string().trim().parse::<i64>()` round-trips (`16`, `17`, `15`) | 4 | the numeric test/compare path stringifies an `i64` and re-parses it — the "numeric type inference" item, not the word plumbing |
+| a numeric value entering a word list (`n.to_string().into()`) | 1 | the value is an `i64`; text is the semantic conversion bash performs at that boundary |
+| the `String` home of an export-poisoned variable (`15_export_poison`) | 2 | the store is `RefCell<String>`; `export` reaches the name, so the binding cannot be a typed `let` |
 
-The word path itself now converts in exactly one place: an integer read that
-lands in a word list (`vec![n.to_string().into()]`), because the value is an
-`i64` at run time and text is the semantic conversion.
+## Numeric text round-trips
+
+A value that the shell compares or does arithmetic with must stay *numeric*
+in the emitted program. Two shapes were leaking it:
+
+* **comparison operands** — `[ "$c" -gt 0 ]` rendered the operand through its
+  `String` form and then appended `.trim().parse::<i64>()`:
+  `c.to_string().trim().parse::<i64>() > 0` for a `let mut c: i64`. The test
+  parser now resolves a numeric-comparison operand (`-eq … -ge`) to the
+  number when the home is already `i64` (`TestParser::operand_numeric`), so
+  `16_while_loop` / `17_overflow` are `while { let __b = c > 0; … }`.
+* **text homes parsed for arithmetic** — `read_num_of_str` copied the
+  `String` out of the store only to throw it away. It now parses inside the
+  borrow (`__SHV_X.with(|v| v.borrow().trim().parse::<i64>().unwrap_or(0))`)
+  or in place for a promoted `String` local; only capture slots, loop
+  bindings and borrowable `&str` locals keep the owned read.
+
+Census, measured from the committed `expected/*.rs` (before = this round's
+starting HEAD):
+
+| counter | before | after |
+|---|---|---|
+| `.to_string()` | 13 | **11** |
+| `.clone()` | 5 | **4** |
+| `trim().parse::<i64>()` | 4 | **2** |
+| `__sh_atoi(` | 0 | 0 |
+| `borrow().len() as i64` | 1 | 1 |
+
+Per fixture, `to_string`/`clone`/`parse` (`05`, `15`, `16`, `17` are the ones
+that moved): `01 1/0/0`, `02 1/0/0`, `03 1/1/0`, `04 1/0/0`, `05 0/0/1`,
+`06 0/0/0`, `07 0/0/0`, `08 1/0/0`, `09 0/0/0`, `10 0/0/0`, `11 1/2/0`,
+`12 1/0/0`, `13 0/0/0`, `14 2/0/0`, `15 2/1/1`, `16 0/0/0` (was `1/0/1`),
+`17 0/0/0` (was `1/0/1`).
+
+The two surviving parses, and the one surviving `len() as i64`:
+
+* `05_array` — `sum += x.trim().parse::<i64>()` where `x` iterates a *text*
+  array (`["1", "2", "3"]`). The element is a `&str` by construction and
+  bash's `$((sum + x))` accepts any numeric *text*; parsing is the semantic
+  operation, not a detour through a number that already existed.
+* `15_export_poison` — `__SHV_COUNT.with(|v| v.borrow().trim().parse::<i64>())`.
+  `export COUNT` reaches the name as a string, so the home is
+  `RefCell<String>`; there is no `i64` to carry.
+* `05_array` — `__SHV_arr.with(|v| v.borrow().len() as i64)` is already the
+  numeric length (`Vec::len()` promoted once); it is the fixed point of the
+  array-length read, not a stringify-reparse.
 
 ## What each fixture pins
 
