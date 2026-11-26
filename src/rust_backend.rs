@@ -2189,6 +2189,45 @@ fn prune_unused_statics(text: String) -> String {
 // `inline_simple_helpers`, which is what turns `print_words` into
 // `println!`) and before the pruning passes, which clean up after it.
 
+/// Does rendered Rust `e` contain an integer literal that does not fit
+/// `i32`? An unannotated `let x = 4000000000;` is inferred as `i32` and does
+/// not compile, so such a binding needs the explicit `: i64`.
+fn has_wide_int_literal(e: &str) -> bool {
+    let b = e.as_bytes();
+    let mut i = 0usize;
+    while i < b.len() {
+        if b[i] == b'"' {
+            i += 1;
+            while i < b.len() {
+                if b[i] == b'\\' {
+                    i += 2;
+                } else if b[i] == b'"' {
+                    i += 1;
+                    break;
+                } else {
+                    i += 1;
+                }
+            }
+            continue;
+        }
+        if b[i].is_ascii_digit() {
+            let start = i;
+            while i < b.len() && (b[i].is_ascii_digit() || b[i] == b'_') {
+                i += 1;
+            }
+            let txt: String = e[start..i].chars().filter(|c| *c != '_').collect();
+            if let Ok(n) = txt.parse::<i128>() {
+                if n > i32::MAX as i128 {
+                    return true;
+                }
+            }
+            continue;
+        }
+        i += 1;
+    }
+    false
+}
+
 /// Escape text as a Rust string literal (`"a\nb"`). No lossy-marker
 /// handling: callers that can see the raw-byte markers must go through
 /// `Render::rust_str` first.
@@ -4532,7 +4571,13 @@ impl Render {
             // the arith renderer had to suffix each literal operand. Pinning
             // the type here lets those suffixes go, and is what makes
             // `x = x + 1` compile whether or not a store widened it first.
-            let ty = if self.is_num(name) && !self.i64_omittable.contains(name) { "" } else { "" };
+            let ty = if self.is_num(name)
+                && (!self.i64_omittable.contains(name) || has_wide_int_literal(&e))
+            {
+                ": i64"
+            } else {
+                ""
+            };
             return format!("{attr}{kw} {m}{ty} = {e};");
         }
         format!("{m} = {e};")
@@ -7126,7 +7171,14 @@ impl Render {
                     // exactly as `local_write_stmt` does (without emit)
                     if self.local_init.remove(name) {
                         let kw = if self.local_mut.contains(name) { "let mut" } else { "let" };
-                        let ty = if self.is_num(name) && !self.i64_omittable.contains(name) { "" } else { "" };
+                        // (this path's value is a `parse::<i64>()`, so the
+                        // binding is i64-typed by construction and only the
+                        // shared omittable verdict matters)
+                        let ty = if self.is_num(name) && !self.i64_omittable.contains(name) {
+                            ": i64"
+                        } else {
+                            ""
+                        };
                         let m = self.var_ident(name);
                         let val = if self.is_num(name) {
                             format!("{get}.trim().parse::<i64>().unwrap_or(0)")

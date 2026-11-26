@@ -75,6 +75,7 @@ Adding a fixture: drop `NN_something.sh` in `src/`, run the harness without
 | `14_capture_pin` | **must stay in the store**: a variable written inside `$( … )` is pinned by the closure/process boundary |
 | `15_export_poison` | **must stay in the store**: `export COUNT=…` reaches the name by word, so a `let` would drop the export |
 | `16_while_loop` | a `while [ … ]` condition whose status write keeps a block expression |
+| `17_overflow` | the documented debug/`-O` divergence: bash wraps, a debug build panics (`# debug-overflow:` marker) |
 
 Fixtures 13–15 are the negative half of the promotion work and are as
 important as 11–12: promotion is only sound where no construct can reach the
