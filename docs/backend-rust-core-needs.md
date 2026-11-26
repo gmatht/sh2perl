@@ -200,7 +200,10 @@ struct __ShVal   { s: String, int: Option<i64>, words: Option<Vec<Word>>,
   again in a function body, an `if`, a `for` and a subshell, plus `unset` in a
   body — and the net compares the `(stdout, stderr, rc)` triple for every
   program; at seed 1 it lands in **14 of 60** programs (reported as
-  `readonly_case=14` in the summary) with `diverged=0`.
+  `readonly_case=14` in the summary) with `diverged=0`, and a fresh clone of
+  the commit re-ran neighbouring seeds 0, 1, 2, 3 and 7 at 60 programs each
+  (both profiles) with `diverged=0` and the case present at every seed
+  (`readonly_case` 6, 14, 12, 6, 8).
   **A refused assignment unwinds its enclosing compounds**, which is the
   control-flow shape bash has: an error abandons the enclosing compound command
   — function body, `if` body, loop body, brace group — and every compound

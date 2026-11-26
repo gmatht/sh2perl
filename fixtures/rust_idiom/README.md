@@ -596,8 +596,20 @@ still reports `matched=60 diverged=0`; the summary carries that count
 (`readonly_case=14`) so a collapse in its coverage is as visible as a
 divergence.
 
+Re-measured from a fresh clone of the commit — nothing carried over from the
+session that wrote it — across neighbouring seeds **0, 1, 2, 3 and 7**, 60
+programs each in both profiles: `diverged=0` everywhere, with the
+refused-write case present at every seed (`readonly_case` 6, 14, 12, 6, 8).
+
 Divergences this net found, each fixed at its cause:
 
+- **the readonly case could define its function twice in one program** (fixed
+  in `src/bin/rust_fuzz.rs`). The case can be drawn more than once, and bash
+  lets a script redefine a function while the renderer emits one `fn` per name,
+  so seeds 0 and 3 each produced a program with `fn rn` twice that rustc
+  rejected (`E0428: the name 'rn' is defined multiple times`) — the net could
+  not compare those programs at all. The definition is now guarded the way the
+  other function cases already are, and the call stays unconditional.
 - **an unwound function still printed its empty value and cleared `$?`**
   (fixed in `src/rust_backend.rs`). A refused write with statements after it
   inside a function body made the frame return `String::new()`, which the
