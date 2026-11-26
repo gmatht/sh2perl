@@ -6324,18 +6324,28 @@ pub fn ast_to_ir_with_lines(commands: &[Command], lines: &[usize]) -> IrProgram 
     // dead-assignment elimination) benefit both consumers of the IR.
     // Then apply worker-submitted transforms (gated by SH2_TRANSFORMS;
     // the estree worker compiles them in + bisects on the corpus).
-    let mut stmt_lines: Vec<(usize, usize)> = Vec::new();
-    let mut stmts: Vec<IrStmt> = Vec::new();
+    // One entry per LOWERED statement, kept beside the statement itself:
+    // the index in `stmt_lines` is only meaningful before the optimization
+    // and transform passes run (they DELETE statements — dead-assignment
+    // elimination — which renumbers everything after the deletion), so the
+    // keys are re-derived from the survivors below.
+    let want_lines = !lines.is_empty();
+    let mut lowered: Vec<(IrStmt, usize)> = Vec::new();
+    let mut plain: Vec<IrStmt> = Vec::new();
     for (i, cmd) in commands.iter().enumerate() {
         if let Some(st) = stmt_for_command(cmd) {
-            if let Some(&l) = lines.get(i) {
-                if l > 0 {
-                    stmt_lines.push((stmts.len(), l));
-                }
+            if want_lines {
+                lowered.push((st, lines.get(i).copied().unwrap_or(0)));
+            } else {
+                plain.push(st);
             }
-            stmts.push(st);
         }
     }
+    let stmts: Vec<IrStmt> = if want_lines {
+        lowered.iter().map(|(s, _)| s.clone()).collect()
+    } else {
+        plain
+    };
     let mut stmts = crate::ir::optimize_stmts(&stmts);
     // Serialize against the shir_to_estree compile lock: the
     // sync-ok-loops transform stores per-compilation POINTER-keyed
@@ -6345,6 +6355,30 @@ pub fn ast_to_ir_with_lines(commands: &[Command], lines: &[usize]) -> IrProgram 
     // call ast_to_ir and ast_to_ir does not call shir_to_estree.
     let _compile_guard = COMPILE_LOCK.lock().unwrap();
     crate::transforms::apply(&mut stmts);
+    // Re-key the markup onto the surviving statements: what the passes leave
+    // is a subsequence of the lowered list, so the k-th survivor is the next
+    // lowered statement equal to it. A statement the passes REWROTE (not just
+    // dropped) has no pre-image and carries no line — a backend that needs a
+    // source location for it must then fall back (the Rust backend prints the
+    // bare `<prog>:` prefix rather than a wrong line).
+    let mut stmt_lines: Vec<(usize, usize)> = Vec::new();
+    if want_lines {
+        let mut j = 0;
+        for (i, s) in stmts.iter().enumerate() {
+            // Look ahead for the next survivor equal to this statement. A
+            // statement the passes re-DROPPED just is not there; a statement
+            // they rewrote is not there either, and must not swallow the
+            // remaining candidates (so a miss leaves the cursor where it is).
+            let found = lowered[j..].iter().position(|(t, _)| t == s);
+            if let Some(k) = found {
+                let l = lowered[j + k].1;
+                j += k + 1;
+                if l > 0 {
+                    stmt_lines.push((i, l));
+                }
+            }
+        }
+    }
     IrProgram {
         imports: vec![],
         requires: vec![],

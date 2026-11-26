@@ -7,7 +7,7 @@ static __SH_OUT: std::sync::Mutex<Option<Vec<u8>>> = std::sync::Mutex::new(None)
 thread_local! { static __SH_OUTFILE_TL: std::cell::RefCell<Option<std::fs::File>> = const { std::cell::RefCell::new(None) }; }
 static __SH_STDIN: std::sync::Mutex<Option<Box<dyn std::io::Read + Send>>> = std::sync::Mutex::new(None);
 
-thread_local! { static __SH_VARS: std::cell::RefCell<__ShStore> = const { std::cell::RefCell::new(__ShStore { vars: std::collections::BTreeMap::new(), ro_trip: false }) }; }
+thread_local! { static __SH_VARS: std::cell::RefCell<__ShStore> = const { std::cell::RefCell::new(__ShStore { vars: std::collections::BTreeMap::new(), ro_trip: false, at_line: 0 }) }; }
 
 static __SH_ARITH_WORD_FAIL: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
 
@@ -81,9 +81,34 @@ impl __ShVar {
 struct __ShStore {
     vars: std::collections::BTreeMap<String, __ShVar>,
     ro_trip: bool,
+    /// source line of the statement being executed (`__sh_v_at`), which is
+    /// what bash prefixes a refused write's diagnostic with
+    at_line: u32,
 }
 fn __sh_v_rc_trip() -> bool {
     __SH_VARS.with(|s| std::mem::replace(&mut s.borrow_mut().ro_trip, false))
+}
+
+/// The diagnostic prefix a shell diagnostic carries: bash prints `$0`, and
+/// the emitted program's `$0` is its own argv[0].
+fn __sh_prog() -> String {
+    std::env::args().next().unwrap_or_default()
+}
+/// Record the source line of the statement whose store write can be refused
+/// (`readonly`). Bash's message is `<prog>: line N: <name>: …`; the renderer
+/// knows N and hands it here, so no accessor formats a location itself.
+fn __sh_v_at(line: u32) {
+    __SH_VARS.with(|s| s.borrow_mut().at_line = line);
+}
+fn __sh_v_where() -> String {
+    let line = __SH_VARS.with(|s| s.borrow().at_line);
+    if line == 0 {
+        // no source line in the IR for this statement: print the bare prefix
+        // rather than a wrong one (a nested statement in the current markup)
+        __sh_prog()
+    } else {
+        format!("{}: line {}", __sh_prog(), line)
+    }
 }
 
 fn __sh_v_get(name: &str) -> Option<__ShVar> {
@@ -112,7 +137,7 @@ fn __sh_v_put(name: &str, val: __ShVal) {
         }
     });
     if denied {
-        eprintln!("bash: {}: readonly variable", name);
+        eprintln!("{}: {}: readonly variable", __sh_v_where(), name);
         __SH_RC.store(1, Ordering::SeqCst);
     }
 }
@@ -148,7 +173,11 @@ fn __sh_v_unset(name: &str) {
         }
     });
     if denied {
-        eprintln!("bash: {}: readonly variable", name);
+        eprintln!(
+            "{}: unset: {}: cannot unset: readonly variable",
+            __sh_v_where(),
+            name
+        );
         __SH_RC.store(1, Ordering::SeqCst);
     }
 }

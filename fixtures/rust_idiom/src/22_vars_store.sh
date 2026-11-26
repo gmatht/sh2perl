@@ -4,6 +4,8 @@
 # stored value read inside a pipeline stage. Every name here is deliberately
 # unpromotable (`export`/`readonly`/`unset` poison it, `n` is written in a
 # function and read in main), so the whole script runs out of `__SH_VARS`.
+# stderr-exact: bash's readonly diagnostics (`<script>: line N: …`) and the
+# `$?` after them must match byte for byte, not just stdout and status.
 export GREETING=hello
 GREETING="$GREETING world"
 echo "greeting=$GREETING"
@@ -12,6 +14,8 @@ bash -c 'echo "child=$GREETING"'
 readonly LIMIT=3
 LIMIT=9
 echo "limit=$LIMIT rc=$?"
+unset LIMIT
+echo "unset-ro=$LIMIT rc=$?"
 
 unset GREETING
 echo "unset=[$GREETING]"

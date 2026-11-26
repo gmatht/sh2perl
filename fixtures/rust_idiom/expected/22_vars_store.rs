@@ -9,7 +9,7 @@ static __SH_STDIN: std::sync::Mutex<Option<Box<dyn std::io::Read + Send>>> = std
 static __SH_STDIN_PATH: std::sync::Mutex<Option<std::path::PathBuf>> = std::sync::Mutex::new(None);
 
 static __SH_PIPESTATUS: std::sync::Mutex<Vec<i32>> = std::sync::Mutex::new(Vec::new());
-thread_local! { static __SH_VARS: std::cell::RefCell<__ShStore> = const { std::cell::RefCell::new(__ShStore { vars: std::collections::BTreeMap::new(), ro_trip: false }) }; }
+thread_local! { static __SH_VARS: std::cell::RefCell<__ShStore> = const { std::cell::RefCell::new(__ShStore { vars: std::collections::BTreeMap::new(), ro_trip: false, at_line: 0 }) }; }
 
 static __SH_ARITH_WORD_FAIL: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
 
@@ -215,9 +215,34 @@ impl __ShVar {
 struct __ShStore {
     vars: std::collections::BTreeMap<String, __ShVar>,
     ro_trip: bool,
+    /// source line of the statement being executed (`__sh_v_at`), which is
+    /// what bash prefixes a refused write's diagnostic with
+    at_line: u32,
 }
 fn __sh_v_rc_trip() -> bool {
     __SH_VARS.with(|s| std::mem::replace(&mut s.borrow_mut().ro_trip, false))
+}
+
+/// The diagnostic prefix a shell diagnostic carries: bash prints `$0`, and
+/// the emitted program's `$0` is its own argv[0].
+fn __sh_prog() -> String {
+    std::env::args().next().unwrap_or_default()
+}
+/// Record the source line of the statement whose store write can be refused
+/// (`readonly`). Bash's message is `<prog>: line N: <name>: …`; the renderer
+/// knows N and hands it here, so no accessor formats a location itself.
+fn __sh_v_at(line: u32) {
+    __SH_VARS.with(|s| s.borrow_mut().at_line = line);
+}
+fn __sh_v_where() -> String {
+    let line = __SH_VARS.with(|s| s.borrow().at_line);
+    if line == 0 {
+        // no source line in the IR for this statement: print the bare prefix
+        // rather than a wrong one (a nested statement in the current markup)
+        __sh_prog()
+    } else {
+        format!("{}: line {}", __sh_prog(), line)
+    }
 }
 
 fn __sh_v_get(name: &str) -> Option<__ShVar> {
@@ -246,7 +271,7 @@ fn __sh_v_put(name: &str, val: __ShVal) {
         }
     });
     if denied {
-        eprintln!("bash: {}: readonly variable", name);
+        eprintln!("{}: {}: readonly variable", __sh_v_where(), name);
         __SH_RC.store(1, Ordering::SeqCst);
     }
 }
@@ -282,7 +307,11 @@ fn __sh_v_unset(name: &str) {
         }
     });
     if denied {
-        eprintln!("bash: {}: readonly variable", name);
+        eprintln!(
+            "{}: unset: {}: cannot unset: readonly variable",
+            __sh_v_where(),
+            name
+        );
         __SH_RC.store(1, Ordering::SeqCst);
     }
 }
@@ -308,27 +337,6 @@ fn __sh_v_mark_readonly(name: &str) {
     });
 }
 
-fn __sh_v_i(name: &str) -> i64 {
-    match __sh_v_get(name) {
-        Some(v) => match v.val.int {
-            Some(n) => n,
-            None => v.val.text().trim().parse::<i64>().unwrap_or(0),
-        },
-        None => 0,
-    }
-}
-fn __sh_v_set_i(name: &str, v: i64) {
-    __sh_v_put(name, __ShVal { int: Some(v), ..__ShVal::default() });
-}
-/// In-place mutation of an int home: the store materializes the value, runs
-/// the body, and writes it back through `__sh_v_put` (readonly/export apply).
-fn __sh_vw_i<R>(name: &str, f: impl FnOnce(&std::cell::Cell<i64>) -> R) -> R {
-    let tmp = std::cell::Cell::new(__sh_v_i(name));
-    let r = f(&tmp);
-    __sh_v_set_i(name, tmp.get());
-    r
-}
-
 fn __sh_v_s(name: &str) -> String {
     match __sh_v_get(name) { Some(v) => v.val.text(), None => String::new() }
 }
@@ -349,22 +357,31 @@ fn main() {
     __SH_RC.store(if __sh_v_rc_trip() { 1 } else { 0 }, Ordering::SeqCst);
     __sh_print_words(&[vec![format!("greeting={}", __sh_v_s("GREETING")).into()]], true);
     __SH_RC.store(__sh_run(&__sh_wq(&["bash".into(), "-c".into(), "echo \"child=$GREETING\"".into()])), Ordering::SeqCst);
-    __sh_v_set_i("LIMIT", 3);
+    __sh_v_set_s("LIMIT", "3".to_string());
     __sh_v_mark_readonly("LIMIT");
-    __sh_v_set_i("LIMIT", 9);
+    __sh_v_at(15);
+    __sh_v_set_s("LIMIT", "9".to_string());
     __SH_RC.store(if __sh_v_rc_trip() { 1 } else { 0 }, Ordering::SeqCst);
-    __sh_print_words(&[vec![format!("limit={} rc={}", __sh_v_i("LIMIT"), __SH_RC.load(Ordering::SeqCst)).into()]], true);
+    __sh_print_words(&[vec![format!("limit={} rc={}", __sh_v_s("LIMIT"), __SH_RC.load(Ordering::SeqCst)).into()]], true);
+    __sh_v_at(17);
+    __sh_v_unset("LIMIT");
+    __SH_RC.store(if __sh_v_rc_trip() { 1 } else { 0 }, Ordering::SeqCst);
+    __sh_print_words(&[vec![format!("unset-ro={} rc={}", __sh_v_s("LIMIT"), __SH_RC.load(Ordering::SeqCst)).into()]], true);
+    __sh_v_at(20);
     __sh_v_unset("GREETING");
     __sh_print_words(&[vec![format!("unset=[{}]", __sh_v_s("GREETING")).into()]], true);
+    __sh_v_at(23);
     __sh_v_set_s("n", "5".to_string());
     __SH_RC.store(if __sh_v_rc_trip() { 1 } else { 0 }, Ordering::SeqCst);
     __sh_print_words(&[vec![grow().into()]], true);
     __sh_print_words(&[vec![format!("afterfn={}", __sh_v_s("n")).into()]], true);
+    __sh_v_at(31);
     let __sh_sv0 = __sh_v_save("n");
     __sh_v_set_s("n", "11".to_string());
     __sh_print_words(&[vec![format!("sub={}", __sh_v_s("n")).into()]], true);
     __sh_v_restore_one("n", __sh_sv0);
     __sh_print_words(&[vec![format!("aftersub={}", __sh_v_s("n")).into()]], true);
+    __sh_v_at(34);
     __SH_PIPESTATUS.lock().unwrap_or_else(|e| e.into_inner()).clear();
     let mut __sh_pbuf1: Vec<u8> = Vec::new();
     {

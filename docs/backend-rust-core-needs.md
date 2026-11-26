@@ -135,7 +135,7 @@ Every unpromoted name lives in `__SH_VARS`, a `thread_local!`
 `RefCell<__ShStore>`:
 
 ```rust
-struct __ShStore { vars: BTreeMap<String, __ShVar>, ro_trip: bool }
+struct __ShStore { vars: BTreeMap<String, __ShVar>, ro_trip: bool, at_line: u32 }
 struct __ShVar   { val: __ShVal, exported: bool, readonly: bool }
 struct __ShVal   { s: String, int: Option<i64>, words: Option<Vec<Word>>,
                    ints: Option<Vec<i64>>, assoc: Option<BTreeMap<String, String>> }
@@ -152,9 +152,36 @@ struct __ShVal   { s: String, int: Option<i64>, words: Option<Vec<Word>>,
 - `__ShVar` carries the two attributes a shell keeps per name, so `export`
   (`__sh_v_export` — the flag makes every later write re-sync `std::env`, which
   a one-shot `set_var` did not), `readonly` (`__sh_v_mark_readonly` — a later
-  write is refused with bash's message + status 1) and `unset`
-  (`__sh_v_unset`, refusing a readonly name) are store operations, not renderer
-  bookkeeping.
+  write is refused) and `unset` (`__sh_v_unset`, refusing a readonly name) are
+  store operations, not renderer bookkeeping.
+- **A refusal prints bash's diagnostic, and its location is threaded in, not
+  post-processed.** Bash writes `<prog>: line N: <name>: readonly variable`
+  (and `<prog>: line N: unset: <name>: cannot unset: readonly variable`); the
+  store writes exactly that. `<prog>` is `__sh_prog()` =
+  `std::env::args().next()`, which is the same expression `$0` renders to, so
+  the compiled program's `$0` and its diagnostic prefix are the same string by
+  construction. `N` is `__sh_v_at(N)`, a marker the renderer emits at the head
+  of a top-level statement whose text contains a checked store write, taken
+  from the IR's `stmt_lines` markup; `__sh_v_where()` reads it back when a
+  refusal fires (0 = unknown, and the message falls back to the bare
+  `<prog>:` prefix rather than a wrong line). The marker is anchored at the
+  statement's head because emitting a statement can collapse a dead
+  `__SH_RC.store` below its start, which would invalidate a splice index
+  computed before the emission. The accessor API and the store shape are
+  otherwise untouched.
+- **Coverage of that diagnostic.** `22_vars_store` marks itself
+  `# stderr-exact:` and the harness then compares stderr byte for byte (and
+  runs the Rust binary with argv[0] = the fixture path, which is the string
+  bash's `$0` is) in both the debug and the `-O` build, alongside the
+  `$?`-after-refusal check. The fuzz grammar has the same case (readonly write
+  + `unset`) and the net compares the `(stdout, stderr, rc)` triple for every
+  program, at seed 1 in 13 of 60 programs. **Not matched:** `stmt_lines` marks
+  top-level commands only, so a refusal inside a function body, an
+  `if`/`for`/`while` body or a subshell command list prints the bare
+  `<prog>:` prefix (or an enclosing statement's line, if its marker already
+  ran) where bash prints the nested statement's line. Closing that needs
+  per-command line markup from the parser, which this pass does not touch;
+  what remains is a *location*, not a message or a status.
 - `ro_trip` is the `$?`-adjacent half: a refused write sets it and the next
   status write consumes it (`__SH_RC.store(if __sh_v_rc_trip() { 1 } else { 0 } …)`),
   so `$?` is 1 for the failed statement and 0 after the next command, like
@@ -168,9 +195,11 @@ struct __ShVal   { s: String, int: Option<i64>, words: Option<Vec<Word>>,
 
 Measured over the fixture set (`fixtures/rust_idiom/expected/*.rs`): per-
 variable `static __SHV_…` **6 → 0**, store call sites naming a key
-**21 → 46**, programs carrying the store **7 of 22** (one `__SH_VARS` each).
-The cost is helper lines: ~180 per program that uses it, so emitted lines went
-**1371 → 2364** over the 21 pre-existing fixtures. The per-variable static it
+**21 → 48**, programs carrying the store **7 of 22** (one `__SH_VARS` each),
+emitted lines **2965** over all 22 fixtures (`22_vars_store`: 425 lines, 26
+store call sites). The cost is helper lines: ~210 per program that uses it
+(the `$0`/line plumbing for the refusal diagnostic is inside that budget), so
+emitted lines went **1371 → 2364** over the 21 pre-existing fixtures. The per-variable static it
 replaced was one line each, so this is a shape/robustness win, not a line-count
 one; the census prints both numbers so the trade stays visible.
 
@@ -331,9 +360,11 @@ with the reason per name.
   `merge_expansion_into_word` learned to turn any single-expansion word into
   interpolation parts. It also generates **pipelines** (an all-external
   multi-stage chain, a `builtin | external…` chain, a chain into `$()` and into
-  a word, and the one redirection-stage fallback) and **shell output
+  a word, and the one redirection-stage fallback), **shell output
   interleaved with a child's inherited fd 1**, which is the shape that keeps
-  the flush discipline honest. Clippy is a
+  the flush discipline honest, and a **refused readonly write** (`readonly
+  R="$b"`, then `R="$b-x"` and `unset R`, compared including stderr, with
+  argv[0] aligned to bash's `$0`). Clippy is a
   required check, not an optional extra: if the component is missing the gate
   prints `HARD GAP: clippy did not run` and exits non-zero. It already pays
   for itself — `clippy::print_with_newline`, `clippy::format_in_format_args`

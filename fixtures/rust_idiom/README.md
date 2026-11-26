@@ -32,7 +32,14 @@ Re-render after a backend change, then look at the diff:
    `# debug-overflow: <reason>`; any other debug panic is a failure.
 4. **behaviour** — each build runs in a scratch directory seeded with the same
    three files the `bash` run sees, and stdout, exit status and every file it
-   creates must equal `bash <fixture>`.
+   creates must equal `bash <fixture>`. A fixture may additionally opt into a
+   **byte-for-byte stderr diff** with a `# stderr-exact: <why>` line in its own
+   source; the Rust side is then run with argv[0] set to the fixture path, so
+   the program's `$0` is the string bash's `$0` is, and a diagnostic carrying
+   `$0` can be compared at all. The comparison is opt-in on purpose: most
+   fixtures use constructs whose stderr is not part of the contract, and a
+   global diff would fail on unrelated pre-existing formats. Today exactly
+   `22_vars_store` opts in — the `readonly` refusals it pins.
 5. **clippy** — every built fixture is linted (`cargo clippy` in a one-file
    scratch package) in BOTH the debug and the `-O` profile with
    `-D warnings`; any finding fails the fixture. This is the half of the
@@ -171,10 +178,35 @@ struct __ShVal   { s: String, int: Option<i64>, words: Option<Vec<Word>>,
   flag (`__sh_v_export`) and every later write re-syncs `std::env`, so a child
   sees the current value, not the one the name had at export time. `readonly`
   marks the entry (`__sh_v_mark_readonly`) and `__sh_v_put` refuses a later
-  write with bash's `<name>: readonly variable` + status 1; `unset` goes
-  through `__sh_v_unset`, which refuses a readonly name the same way. The
+  write with bash's `<prog>: line N: <name>: readonly variable` + status 1;
+  `unset` goes through `__sh_v_unset`, which refuses a readonly name with
+  bash's `<prog>: line N: unset: <name>: cannot unset: readonly variable`. The
   refusal is remembered in `ro_trip` and consumed by the next status write, so
   `$?` is 1 exactly for the failed statement.
+- **The refusal's location comes from the renderer, not from the message.**
+  Bash prefixes a diagnostic with `$0` and the line of the offending
+  statement, and so does the store: `__sh_prog()` is the program's own
+  `std::env::args().next()` — the same expression `$0` renders to, so the
+  emitted program's `$0` *is* its argv[0] — and `__sh_v_where()` formats
+  `<prog>: line N:` from `__sh_v_at(N)`, which the renderer emits at the head
+  of a top-level statement that contains a checked store write. N comes from
+  the IR's `stmt_lines` markup, re-keyed in `ast_to_ir_with_lines` onto the
+  statements that survive the optimization/transform passes (that markup is
+  pushed per lowered statement and those passes DELETE statements, so the keys
+  are re-derived by matching survivors against the lowered list). The marker is
+  anchored at the statement's head rather than spliced in afterwards, because
+  emitting a statement can collapse a dead `__SH_RC` store below its start and
+  shift every later index. Only programs with a `readonly` name carry any
+  marker, and a statement that turns out to write nothing the store can refuse
+  has its marker removed again (`05` is the fixture: `__SH_VARS` with no
+  `__sh_v_at` at all).
+  **What cannot be matched:** `stmt_lines` marks top-level commands only, so a
+  refusal inside a function body, an `if`/`for`/`while` body or a subshell's
+  command list prints the bare `<prog>:` prefix (or, when an enclosing
+  top-level statement's marker ran first, that enclosing line) where bash
+  prints the line of the nested statement. Matching it needs per-command line
+  markup from the parser, which this pass does not touch; the fixture and the
+  fuzz grammar therefore pin refusals at top level, where the line is exact.
 - **The helper is sliced, and pruned.** `vars` (types, get/put/export/
   readonly/unset/save) plus `vars_i/_s/_w/_n/_m/_len` are separate helpers, so
   a program that only ever reads a scalar does not drag in the assoc-map code;
@@ -185,11 +217,12 @@ struct __ShVal   { s: String, int: Option<i64>, words: Option<Vec<Word>>,
 Measured over the fixture set (before = `5a41d43a0`, after = this tree):
 per-variable `static __SHV_…` **6 → 0**; programs carrying the store: **7**
 (one `__SH_VARS` each, `05`, `13`, `14`, `15`, `18`, `21`, `22`); store call
-sites naming a key **21 → 46**. The store helper costs ~180 lines per
-program that uses it, so emitted lines went **1371 → 2364** over the 21
-pre-existing fixtures: that is the trade — one shared, documented,
-flag-carrying store instead of a static plus its `.with(...)` plumbing per
-name.
+sites naming a key **21 → 48**; emitted lines over all 22 fixtures **2965**
+(`22_vars_store` alone: 425 lines, 26 store call sites). The store helper costs
+~210 lines per program that uses it — the location plumbing
+(`__sh_prog`/`__sh_v_at`/`__sh_v_where`) is part of that budget — and that is
+the trade: one shared, documented, flag-carrying store instead of a static plus
+its `.with(...)` plumbing per name.
 
 ## Promotion: the safe slice
 
@@ -426,7 +459,7 @@ emission site in `src/rust_backend.rs` and absent from all 17 fixtures
 | `18_eval_poison` | **must stay in the store**: `eval` reaches `n` by text, so no promotion |
 | `19_printf_literal` | **pins the specialized path**: four literal formats (`%s`, `%%`, literal braces) render as `format!`, zero `__sh_printf` in the file |
 | `20_printf_dynamic` | **pins the fallback**: a format assembled at run time must keep *and call* the 115-line interpreter |
-| `22_vars_store` | **pins the ONE store**: `export GREETING=…` then a later write, with the child (`bash -c`) seeing the new value; `readonly LIMIT=3` then `LIMIT=9` (refused, `$?`=1, value kept); `unset GREETING`; `n` written in `grow` and in main (dynamic scope) plus subshell isolation `( n=11; … )`; and the stored `n` read inside a pipeline `while` stage |
+| `22_vars_store` | **pins the ONE store**: `export GREETING=…` then a later write, with the child (`bash -c`) seeing the new value; `readonly LIMIT=3` then `LIMIT=9` (refused with bash's `<prog>: line 15: LIMIT: readonly variable`, `$?`=1, value kept) and `unset LIMIT` (refused with `<prog>: line 17: unset: LIMIT: cannot unset: readonly variable`, `$?`=1) — this is the `# stderr-exact:` fixture, so stderr is diffed byte for byte too; `unset GREETING`; `n` written in `grow` and in main (dynamic scope) plus subshell isolation `( n=11; … )`; and the stored `n` read inside a pipeline `while` stage |
 | `21_pipeline_interleave` | **pins the process/IO path**: pipelines spawned by the emitted program (`cat … \| tr … \| wc -l`, `printf … \| sort \| head`, a chain into `$()` and into a word), shell output interleaved with a child's inherited fd 1, and the one named `bash -c` fallback (a stage carrying a redirection) |
 
 Fixtures 13–15 are the negative half of the promotion work and are as
@@ -506,12 +539,21 @@ interleaved with a child's inherited fd 1** (`printf 'pre-'` with no newline,
 then an external command, then more shell output), single-use string
 variables, repeated literals, **the variable store** (an exported name
 re-synced into a `bash -c` child after a later write, `unset` taking the entry
-back out, and a name written in a function body and in main so dynamic scoping
-keeps it out of a `let`) — and
+back out, a name written in a function body and in main so dynamic scoping
+keeps it out of a `let`, and **a refused write** — `readonly R="$b"`, then
+`R="$b-x"` and `unset R`, which must print bash's `<prog>: line N:` lines and
+return `$?`=1) — and
 `printf` sites of every class the specializer classifies: literal formats with
 0/1/N `%s` slots, `%%`, escapes, `\c`, literal braces, `%d`, `%c`, both arity
 mismatches, a slotless format that still passes an argument, and a format
 assembled at run time (the interpreter fallback).
+
+A refused store write is only comparable if `$0` matches: bash was handed the
+script path as `$0`, and a compiled program's `$0` is its argv[0], so the net
+runs the Rust binary with argv[0] set to the same path. That is what lets the
+readonly case be compared on **stderr as well** — which the net does for every
+case, not only that one: each side is compared as the `(stdout, stderr, exit
+status)` triple.
 
 Documented seeds: **1** (the default, and what a gate run uses) plus 7,
 424242 and 20261126 for a wider sweep — all four ran clean (60 programs at
@@ -519,10 +561,28 @@ seed 1, 100 at each of the others). After the store consolidation a
 150-program `--keep` sweep at seed 1 also ran clean in both profiles, and the
 grammar provably reached the new shapes: 18 programs contained the exported
 store name, 26 the dynamic-scope case, and 108 emitted programs carried
-`__SH_VARS`.
+`__SH_VARS`. With the refused-write case back in the grammar, the seed-1 run
+puts it in **13 of 60** programs (every one of them compared on stderr) and
+still reports `matched=60 diverged=0`.
 
-Divergences this net found, each fixed in `src/rust_backend.rs`:
+Divergences this net found, each fixed at its cause:
 
+- **`readonly R="$b"` was silently DROPPED** (fixed in `src/rust_backend.rs`).
+  A declaration whose `NAME=value` arrives as one interpolated word
+  (`Interpolate([Lit("R="), <value>])`) — any non-literal value, quoted or not
+  — matched neither the `Str("NAME=")` + value-word path nor the bare-name
+  path in `decl_words`, so the emitted program had no write AND no readonly
+  attribute: a later write was not refused, and the value was missing. The
+  declaration now takes an `Interpolate` branch that rebuilds the value
+  expression and applies the export/readonly attribute like the literal form.
+- **the statement→line markup drifted whenever a pass deleted a statement**
+  (fixed in `ast_to_ir_with_lines`). `stmt_lines` is keyed by statement index
+  and was filled before `optimize_stmts` (dead-assignment elimination) and the
+  transform passes ran, so one dropped statement shifted every later key by
+  one — the refusal diagnostic then printed the *previous* statement's line.
+  The keys are now re-derived after the passes by matching surviving
+  statements against the lowered list (a pass-rewritten statement has no
+  pre-image and simply carries no line).
 - three `Cow`/`String` type mismatches left by the `Word = Cow` change — a
   `for` item read out of a `Vec<Word>`, a `read` target, and a folded constant
   echo word (`vec!["0".to_string()]` where a `Word` was required). No fixture

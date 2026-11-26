@@ -320,6 +320,11 @@ pub struct Render {
     upper_vars: BTreeSet<String>,
     /// `typeset -r` vars (readonly attribute — `typeset -p` shows it)
     readonly_vars: BTreeSet<String>,
+    /// Source line of the statement being rendered (from the IR's
+    /// `stmt_lines` markup). Threaded into the store so a REFUSED write
+    /// prints the same `<prog>: line N:` prefix bash prints; `None` for a
+    /// statement the IR carries no line for (see the store's refusal note).
+    cur_line: Option<usize>,
     /// function definitions (name, body stmts) — for `typeset -f`
     fn_defs: Vec<(String, Vec<IrStmt>, bool)>,
     /// var -> captured local (background-thread bodies)
@@ -7316,6 +7321,65 @@ impl Render {
                     continue;
                 }
             }
+            // `readonly R="$b"` / `readonly R=$b` — the whole `NAME=value`
+            // arrives as ONE interpolated word (`Interpolate([Lit("R="),
+            // <value>])`), where the literal form is `Str("R=")` plus a value
+            // word. Without this the declaration was DROPPED: no write, no
+            // attribute, so a later write to the name was not refused.
+            if str_arg(&[(*words[i]).clone()], 0).is_none() {
+                if let IrExpr::Interpolate(parts) = words[i] {
+                    if let Some(crate::ir::InterpPart::Lit(first)) = parts.first() {
+                        if let Some((name, rest)) = first.split_once('=') {
+                            let ok = !name.is_empty()
+                                && name
+                                    .chars()
+                                    .all(|c| c.is_ascii_alphanumeric() || c == '_');
+                            if ok {
+                                let mut tail: Vec<crate::ir::InterpPart> = Vec::new();
+                                if !rest.is_empty() {
+                                    tail.push(crate::ir::InterpPart::Lit(rest.to_string()));
+                                }
+                                tail.extend(parts.iter().skip(1).cloned());
+                                let value = match tail.as_slice() {
+                                    [crate::ir::InterpPart::Expr(e)] => (**e).clone(),
+                                    _ => IrExpr::Interpolate(tail),
+                                };
+                                if self.is_local(name) {
+                                    let m = self.ident_base(name);
+                                    let init = self.expr_any(&value);
+                                    self.mark_written(&name.to_string());
+                                    let kw = if self.local_mut.contains(name) {
+                                        "let mut"
+                                    } else {
+                                        "let"
+                                    };
+                                    self.local_init.remove(name);
+                                    self.emit(&format!("{kw} {m} = {init};"));
+                                } else {
+                                    let stmt =
+                                        self.assign_stmt_for(&name.to_string(), &value);
+                                    self.emit(&stmt);
+                                    self.mark_written(&name.to_string());
+                                }
+                                if exported || xflag {
+                                    let m = self.tls(name);
+                                    self.emit(&format!("__sh_v_export({m});"));
+                                    xflag = false;
+                                    if is_readonly_cmd {
+                                        self.readonly_vars.insert(name.to_string());
+                                        mark_ro.push(name.to_string());
+                                    }
+                                } else if is_readonly_cmd {
+                                    self.readonly_vars.insert(name.to_string());
+                                    mark_ro.push(name.to_string());
+                                }
+                                i += 1;
+                                continue;
+                            }
+                        }
+                    }
+                }
+            }
             if let Some(ws) = str_arg(&[(*words[i]).clone()], 0) {
                 if ws.starts_with('-') {
                     // -a / -A / -x / -r / -i / -l / -u / -n — the
@@ -11391,6 +11455,47 @@ impl Render {
         owned
     }
 
+    /// Store writes can be refused (`readonly`), and bash prints
+    /// `<prog>: line N: NAME: readonly variable`, where N is the source line
+    /// of the statement whose write was refused. The store formats that line;
+    /// this hands it the location of the statement it is about to emit, as
+    /// `__sh_v_at(N);` at the statement's head — anchored there rather than
+    /// spliced in afterwards because emitting a statement can collapse a dead
+    /// `__SH_RC` store below its start (pass-4), which shifts every later
+    /// index. The marker is dropped again when the statement turns out to
+    /// write nothing the store can refuse, so programs that never declare a
+    /// readonly name (and statements that cannot be refused) carry none.
+    fn store_line_marker(&mut self, s: &IrStmt) {
+        let Some(line) = self.cur_line else {
+            self.stmt(s);
+            return;
+        };
+        if self.readonly_vars.is_empty() {
+            self.stmt(s);
+            return;
+        }
+        let writes = |out: &Vec<String>| {
+            const WRITES: &[&str] = &[
+                "__sh_v_set_",
+                "__sh_vw_",
+                "__sh_v_put(",
+                "__sh_v_unset(",
+            ];
+            out.iter()
+                .filter(|l| WRITES.iter().any(|p| l.contains(*p)))
+                .count()
+        };
+        let before = writes(&self.out);
+        let marker = format!("    __sh_v_at({line});");
+        self.out.push(marker.clone());
+        self.stmt(s);
+        if writes(&self.out) == before {
+            if let Some(pos) = self.out.iter().rposition(|l| *l == marker) {
+                self.out.remove(pos);
+            }
+        }
+    }
+
     fn stmt(&mut self, s: &IrStmt) {
         // PLAN-4 STATUS LIVENESS: a statement whose status write the shared
         // verdict marks unread contributes no `__SH_RC.store(0, …)`. The
@@ -13208,9 +13313,17 @@ impl Render {
         let mut body_out = Vec::new();
         std::mem::swap(&mut self.out, &mut body_out);
         self.depth = 1;
-        for s in &prog.stmts {
-            self.stmt(s);
+        // The IR carries the 1-based source line per TOP-LEVEL statement
+        // (`ast_to_ir_with_lines`); a refusal diagnostic prints the line of
+        // the statement whose store write it refused, so the renderer hands
+        // the store the line of the statement it is currently emitting.
+        let line_of: std::collections::HashMap<usize, usize> =
+            prog.stmt_lines.iter().cloned().collect();
+        for (i, s) in prog.stmts.iter().enumerate() {
+            self.cur_line = line_of.get(&i).copied();
+            self.store_line_marker(s);
         }
+        self.cur_line = None;
         // the script's exit code is the LAST statement's rc (bash's final
         // status = the last command's). When the final status is
         // statically 0 (the body ends in a `__SH_RC.store(0, …)`), the
@@ -13474,7 +13587,7 @@ impl Render {
         // carries `__ShVar`/`__ShVal`, and a program with no unpromoted
         // variable must not carry a dead static)
         if self.helpers.contains("vars") {
-            self.emit("thread_local! { static __SH_VARS: std::cell::RefCell<__ShStore> = const { std::cell::RefCell::new(__ShStore { vars: std::collections::BTreeMap::new(), ro_trip: false }) }; }");
+            self.emit("thread_local! { static __SH_VARS: std::cell::RefCell<__ShStore> = const { std::cell::RefCell::new(__ShStore { vars: std::collections::BTreeMap::new(), ro_trip: false, at_line: 0 }) }; }");
         }
         self.emit("static __SH_TRAPS: std::sync::Mutex<Vec<String>> = std::sync::Mutex::new(Vec::new());");
         self.emit("static __SH_BGPID: std::sync::atomic::AtomicI32 = std::sync::atomic::AtomicI32::new(0);");
@@ -14172,9 +14285,34 @@ impl __ShVar {
 struct __ShStore {
     vars: std::collections::BTreeMap<String, __ShVar>,
     ro_trip: bool,
+    /// source line of the statement being executed (`__sh_v_at`), which is
+    /// what bash prefixes a refused write's diagnostic with
+    at_line: u32,
 }
 fn __sh_v_rc_trip() -> bool {
     __SH_VARS.with(|s| std::mem::replace(&mut s.borrow_mut().ro_trip, false))
+}
+
+/// The diagnostic prefix a shell diagnostic carries: bash prints `$0`, and
+/// the emitted program's `$0` is its own argv[0].
+fn __sh_prog() -> String {
+    std::env::args().next().unwrap_or_default()
+}
+/// Record the source line of the statement whose store write can be refused
+/// (`readonly`). Bash's message is `<prog>: line N: <name>: …`; the renderer
+/// knows N and hands it here, so no accessor formats a location itself.
+fn __sh_v_at(line: u32) {
+    __SH_VARS.with(|s| s.borrow_mut().at_line = line);
+}
+fn __sh_v_where() -> String {
+    let line = __SH_VARS.with(|s| s.borrow().at_line);
+    if line == 0 {
+        // no source line in the IR for this statement: print the bare prefix
+        // rather than a wrong one (a nested statement in the current markup)
+        __sh_prog()
+    } else {
+        format!("{}: line {}", __sh_prog(), line)
+    }
 }
 
 fn __sh_v_get(name: &str) -> Option<__ShVar> {
@@ -14203,7 +14341,7 @@ fn __sh_v_put(name: &str, val: __ShVal) {
         }
     });
     if denied {
-        eprintln!("bash: {}: readonly variable", name);
+        eprintln!("{}: {}: readonly variable", __sh_v_where(), name);
         __SH_RC.store(1, Ordering::SeqCst);
     }
 }
@@ -14239,7 +14377,11 @@ fn __sh_v_unset(name: &str) {
         }
     });
     if denied {
-        eprintln!("bash: {}: readonly variable", name);
+        eprintln!(
+            "{}: unset: {}: cannot unset: readonly variable",
+            __sh_v_where(),
+            name
+        );
         __SH_RC.store(1, Ordering::SeqCst);
     }
 }
@@ -22328,3 +22470,7 @@ mod size_opt_scope_regression {
             "global -Og no longer keeps the unfolded sum:\n{plain}");
     }
 }
+
+
+
+

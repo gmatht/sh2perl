@@ -60,9 +60,12 @@ fn helper_body_lines(code: &str, name: &str) -> usize {
 }
 
 fn prepare(src: &str) -> debashl::ir::IrProgram {
-    let cmds =
-        debashl::parser::commands::parse_commands_from_text(src).expect("fixture failed to parse");
-    let mut prog = debashl::shir::ast_to_ir(&cmds);
+    // `parse_with_lines` + `ast_to_ir_with_lines`, exactly as the CLI's shell
+    // ingress does: the IR's `stmt_lines` markup is what lets a rendered
+    // statement print the source line bash prints in a refusal diagnostic.
+    let mut parser = debashl::parser::commands::Parser::new(src);
+    let (cmds, lines) = parser.parse_with_lines().expect("fixture failed to parse");
+    let mut prog = debashl::shir::ast_to_ir_with_lines(&cmds, &lines);
     debashl::transforms::apply(&mut prog.stmts);
     debashl::shir_passes::restructure_goto_only(&mut prog);
     debashl::shir_passes::strip_cfor(&mut prog);
@@ -74,9 +77,9 @@ fn prepare(src: &str) -> debashl::ir::IrProgram {
 /// difference from [`render`] means the harness mirror and the CLI have
 /// drifted (or the JSON round-trip is lossy) — either way, it must be known.
 fn render_via_a1(src: &str) -> Result<String, String> {
-    let cmds = debashl::parser::commands::parse_commands_from_text(src)
-        .map_err(|e| format!("parse: {e}"))?;
-    let prog = debashl::shir::ast_to_ir(&cmds);
+    let mut parser = debashl::parser::commands::Parser::new(src);
+    let (cmds, lines) = parser.parse_with_lines().map_err(|e| format!("parse: {e}"))?;
+    let prog = debashl::shir::ast_to_ir_with_lines(&cmds, &lines);
     let json = debashl::shir_json::shir_to_shir_json(&prog);
     let mut prog = debashl::shir_json_in::shir_json_to_ir(&json)?;
     debashl::transforms::apply(&mut prog.stmts);
@@ -204,12 +207,31 @@ fn seed(dir: &Path) {
     }
 }
 
-#[derive(PartialEq, Eq, Debug)]
+#[derive(Debug)]
 struct RunOut {
     stdout: String,
+    /// Captured for every run, but compared only by a fixture that marks
+    /// itself `# stderr-exact:` — most fixtures use constructs whose
+    /// diagnostics are not part of the contract, and a global stderr diff
+    /// would fail on unrelated pre-existing formats.
+    stderr: String,
     code: i32,
     /// every file in the directory that is not a seed (name → bytes)
     files: BTreeMap<String, Vec<u8>>,
+}
+
+impl PartialEq for RunOut {
+    fn eq(&self, o: &Self) -> bool {
+        self.stdout == o.stdout && self.code == o.code && self.files == o.files
+    }
+}
+impl Eq for RunOut {}
+
+impl RunOut {
+    /// Byte-for-byte stderr equality — the `# stderr-exact:` fixtures.
+    fn stderr_eq(&self, o: &Self) -> bool {
+        self.stderr == o.stderr
+    }
 }
 
 fn snapshot(dir: &Path) -> BTreeMap<String, Vec<u8>> {
@@ -238,16 +260,32 @@ fn run_bash(fixture: &Path, dir: &Path) -> RunOut {
         .expect("run bash");
     RunOut {
         stdout: String::from_utf8_lossy(&out.stdout).to_string(),
+        stderr: String::from_utf8_lossy(&out.stderr).to_string(),
         code: out.status.code().unwrap_or(-1),
         files: snapshot(dir),
     }
 }
 
-fn run_bin(bin: &Path, dir: &Path) -> RunOut {
+/// `argv0` makes the generated program's `$0` equal the string bash got as
+/// `$0` — which is what a byte-comparison of a `$0`-prefixed diagnostic
+/// (`<prog>: line N: NAME: readonly variable`) needs. Bash's `$0` for
+/// `bash script` IS the path it was handed; a compiled replacement's `$0` is
+/// its argv[0], so the two are the same variable once the harness aligns it.
+fn run_bin(bin: &Path, dir: &Path, argv0: Option<&Path>) -> RunOut {
     seed(dir);
-    let out = Command::new(bin).current_dir(dir).output().expect("run bin");
+    let mut c = Command::new(bin);
+    c.current_dir(dir);
+    #[cfg(unix)]
+    if let Some(a) = argv0 {
+        use std::os::unix::process::CommandExt;
+        c.arg0(a);
+    }
+    #[cfg(not(unix))]
+    let _ = argv0;
+    let out = c.output().expect("run bin");
     RunOut {
         stdout: String::from_utf8_lossy(&out.stdout).to_string(),
+        stderr: String::from_utf8_lossy(&out.stderr).to_string(),
         code: out.status.code().unwrap_or(-1),
         files: snapshot(dir),
     }
@@ -516,9 +554,23 @@ fn main() {
                         }
                     }
                 }
+                // A fixture that says `# stderr-exact:` opts into a
+                // byte-for-byte stderr diff (with `$0` aligned to bash's).
+                let stderr_exact = src
+                    .lines()
+                    .any(|l| l.trim().starts_with("# stderr-exact:"));
+                let argv0: Option<&Path> = if stderr_exact { Some(f) } else { None };
                 let want = run_bash(f, &scratch.join(&name).join("bash"));
-                let got_d = run_bin(&dbg_dir.join("main"), &scratch.join(&name).join("run_dbg"));
-                let got_r = run_bin(&rel_dir.join("main"), &scratch.join(&name).join("run_rel"));
+                let got_d = run_bin(
+                    &dbg_dir.join("main"),
+                    &scratch.join(&name).join("run_dbg"),
+                    argv0,
+                );
+                let got_r = run_bin(
+                    &rel_dir.join("main"),
+                    &scratch.join(&name).join("run_rel"),
+                    argv0,
+                );
                 let declared_overflow = src
                     .lines()
                     .find_map(|l| l.trim().strip_prefix("# debug-overflow:"))
@@ -550,6 +602,16 @@ fn main() {
                         }
                     }
                 }
+                if stderr_exact {
+                    if !got_d.stderr_eq(&want) {
+                        bad = true;
+                        bits.push("DEBUG-STDERR!=bash");
+                    }
+                    if !got_r.stderr_eq(&want) {
+                        bad = true;
+                        bits.push("RELEASE-STDERR!=bash");
+                    }
+                }
                 if !parity_ok {
                     bad = true;
                     bits.push("A1-PARITY-DIFF");
@@ -571,6 +633,14 @@ fn main() {
                     if !got_r.eq(&want) {
                         println!("\n{name}: bash → {:?} rc={}", want.stdout, want.code);
                         println!("{name}: rel  → {:?} rc={}", got_r.stdout, got_r.code);
+                    }
+                    if stderr_exact && !got_d.stderr_eq(&want) {
+                        println!("\n{name}: bash stderr → {:?}", want.stderr);
+                        println!("{name}: dbg stderr  → {:?}", got_d.stderr);
+                    }
+                    if stderr_exact && !got_r.stderr_eq(&want) {
+                        println!("\n{name}: bash stderr → {:?}", want.stderr);
+                        println!("{name}: rel stderr  → {:?}", got_r.stderr);
                     }
                 } else {
                     status = format!("{} a1=ok", bits.join(" "));

@@ -110,7 +110,7 @@ fn generate(rng: &mut Rng) -> String {
     let mut s = String::from(PRELUDE);
     let n = 3 + rng.below(6);
     for _ in 0..n {
-        match rng.below(36) {
+        match rng.below(37) {
             0 => s.push_str(&format!("a=$((a + {}))\n", 1 + rng.below(5))),
             1 => s.push_str("c=$((c - 1))\n"),
             2 => s.push_str("echo \"b=$b\"\n"),
@@ -259,6 +259,17 @@ fn generate(rng: &mut Rng) -> String {
                 }
                 s.push_str("H=\"$b\"\nh\necho \"h=$H\"\n");
             }
+            // a REFUSED write to a `readonly` name, and `unset` of it: the
+            // store prints bash's `<prog>: line N: …` diagnostic, so stderr is
+            // part of the comparison for this case (the Rust run gets the
+            // script path as argv[0], which is bash's `$0`).
+            36 => {
+                if !s.contains("readonly R=") {
+                    s.push_str("readonly R=\"$b\"\n");
+                }
+                s.push_str("R=\"$b-x\"\necho \"r=$R rc=$?\"\n");
+                s.push_str("unset R\necho \"ru=$R rc=$?\"\n");
+            }
             // an arithmetic word inside a printed expansion
             _ => s.push_str("echo \"n=$((c + 1))\"\n"),
         }
@@ -268,9 +279,11 @@ fn generate(rng: &mut Rng) -> String {
 }
 
 fn render(src: &str) -> Result<String, String> {
-    let cmds = debashl::parser::commands::parse_commands_from_text(src)
-        .map_err(|e| format!("parse: {e}"))?;
-    let mut prog = debashl::shir::ast_to_ir(&cmds);
+    // with lines: a refused store write prints bash's source line, so the IR
+    // markup has to carry one (the CLI's shell ingress does the same)
+    let mut parser = debashl::parser::commands::Parser::new(src);
+    let (cmds, lines) = parser.parse_with_lines().map_err(|e| format!("parse: {e}"))?;
+    let mut prog = debashl::shir::ast_to_ir_with_lines(&cmds, &lines);
     debashl::transforms::apply(&mut prog.stmts);
     debashl::shir_passes::restructure_goto_only(&mut prog);
     debashl::shir_passes::strip_cfor(&mut prog);
@@ -278,14 +291,28 @@ fn render(src: &str) -> Result<String, String> {
 }
 
 /// Run `prog` in `dir` (with an optional single argument); return
-/// (stdout, stderr, exit code).
-fn run(dir: &Path, prog: &Path, arg: Option<&Path>) -> (String, String, i32) {
+/// (stdout, stderr, exit code). `argv0` sets the child's `$0` — a compiled
+/// program's `$0` is its argv[0], and a `<prog>: line N:` diagnostic can only
+/// be compared with bash's when both sides see the same string.
+fn run(
+    dir: &Path,
+    prog: &Path,
+    arg: Option<&Path>,
+    argv0: Option<&Path>,
+) -> (String, String, i32) {
     let _ = std::fs::remove_dir_all(dir);
     std::fs::create_dir_all(dir).ok();
     let mut cmd = Command::new(prog);
     if let Some(a) = arg {
         cmd.arg(a);
     }
+    #[cfg(unix)]
+    if let Some(a) = argv0 {
+        use std::os::unix::process::CommandExt;
+        cmd.arg0(a);
+    }
+    #[cfg(not(unix))]
+    let _ = argv0;
     let out = cmd.current_dir(dir).output().expect("spawn");
     (
         String::from_utf8_lossy(&out.stdout).to_string(),
@@ -318,7 +345,7 @@ fn check_one(src: &str, dir: &Path, profiles: &[&'static str]) -> Outcome {
     std::fs::write(&rs, &code).expect("write main.rs");
     // the bash side once: same bytes, its own scratch directory
     let bash_dir = dir.join("run_bash");
-    let (b_out, b_err, b_rc) = run(&bash_dir, Path::new("bash"), Some(&sh));
+    let (b_out, b_err, b_rc) = run(&bash_dir, Path::new("bash"), Some(&sh), None);
     for profile in profiles {
         let bin = dir.join(format!("main_{profile}"));
         let mut cmd = Command::new("rustc");
@@ -330,7 +357,8 @@ fn check_one(src: &str, dir: &Path, profiles: &[&'static str]) -> Outcome {
         if !built.status.success() {
             return Outcome::RustcFail(String::from_utf8_lossy(&built.stderr).to_string());
         }
-        let (r_out, r_err, r_rc) = run(&dir.join(format!("run_rust_{profile}")), &bin, None);
+        let (r_out, r_err, r_rc) =
+            run(&dir.join(format!("run_rust_{profile}")), &bin, None, Some(&sh));
         let bash = (b_out.clone(), b_err.clone(), b_rc);
         let rust = (r_out, r_err, r_rc);
         if bash != rust {
