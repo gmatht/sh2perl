@@ -828,35 +828,49 @@ impl Render {
                     let k = self.fh_counter;
                     self.fh_counter += 1;
                     return format!(
-                        "do {{ my $__qx{k} = {}; $__qx{k} =~ s/\\n+$//; $__qx{k} }}",
+                        "do {{ my $__qx{k} = {}; $__qx{k} =~ s/\\n+\\z//; $__qx{k} }}",
                         self.qx(&cmd)
                     );
                 }
-                // NATIVE capture (no fork/exec): redirect STDOUT into an
-                // IN-MEMORY scalar, run the body's OWN statements, restore,
-                // strip trailing newlines ($() semantics). The body renders
-                // into a TEMP BUFFER so the whole capture becomes one
-                // do{…} BLOCK EXPRESSION usable in value position.
+                // NATIVE capture (no fork/exec): swap the STDOUT glob for a
+                // scalar-backed handle — the canonical capture idiom this
+                // repo already uses (ir::capture_do_perl) — run the body's
+                // OWN statements, then strip trailing newlines ($()
+                // semantics). `local` restores the glob when the block exits
+                // (including on `die`), so the manual select() save/restore
+                // dance is unnecessary. Scalar-backed STDOUT captures
+                // Perl-level prints only, which is exactly this path: a
+                // body that spawns a child fails capture_body_is_native()
+                // and takes the qx fallback above.
+                //
+                // The body renders into a TEMP BUFFER at depth 0 and is
+                // indented one block level (mirroring arrow_expr) so the
+                // capture reads as ordinary Perl in value position.
                 let k = self.fh_counter;
                 self.fh_counter += 1;
-                let saved = std::mem::take(&mut self.out);
+                let saved_out = std::mem::take(&mut self.out);
+                let saved_depth = self.depth;
+                self.depth = 0;
                 for s in stmts {
                     self.stmt(s);
                 }
-                let body_lines = std::mem::take(&mut self.out);
-                self.out = saved;
+                let body = self.out.join("\n");
+                self.out = saved_out;
+                self.depth = saved_depth;
                 let mut blk = String::from("do {\n");
-                blk.push_str(&format!("my $__cap{k} = '';\n"));
-                blk.push_str(&format!("open(my $__mem{k}, '>', \\$__cap{k}) or die;\n"));
-                blk.push_str(&format!("my $__sel{k} = select($__mem{k});\n"));
-                for l in &body_lines {
-                    blk.push_str(l);
+                blk.push_str(&format!("    my $__cap{k} = '';\n"));
+                blk.push_str("    {\n");
+                blk.push_str("        local *STDOUT;\n");
+                blk.push_str(&format!(
+                    "        open(STDOUT, '>', \\$__cap{k}) or die \"capture: $!\\n\";\n"
+                ));
+                if !body.is_empty() {
+                    blk.push_str(&indent_block(&body, 2));
                     blk.push('\n');
                 }
-                blk.push_str(&format!("close($__mem{k});\n"));
-                blk.push_str(&format!("select($__sel{k});\n"));
-                blk.push_str(&format!("$__cap{k} =~ s/\\n+$//;\n"));
-                blk.push_str(&format!("$__cap{k}\n"));
+                blk.push_str("    }\n");
+                blk.push_str(&format!("    $__cap{k} =~ s/\\n+\\z//;\n"));
+                blk.push_str(&format!("    $__cap{k}\n"));
                 blk.push('}');
                 blk
             }
