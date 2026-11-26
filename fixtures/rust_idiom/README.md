@@ -20,11 +20,16 @@ Re-render after a backend change, then look at the diff:
 `--check` runs six checks per fixture, in this order:
 
 1. **stale** — the fresh render equals the checked-in `expected/*.rs`.
-2. **A1 parity** — the same source rendered through the A1-JSON ingress that
-   `shir_render --target rust` uses (`ast_to_ir` → A1 JSON → IR → shared
-   transforms → structuring passes → renderer) produces the *same text*. This
-   is what keeps the harness's mirror of the render path honest: a backend
-   change the mirror missed would otherwise leave the gate green.
+2. **render mirror** — every fixture is also rendered by the REAL
+   `shir_render --target rust` binary. The harness builds that sibling binary
+   itself (always, so a stale one cannot disagree), writes the same A1 JSON the
+   CLI ingests, feeds it in, and requires byte-for-byte equality with the text
+   it measures; a difference names the fixture and the first differing line.
+   This is what keeps the harness's mirror of the render path honest: a
+   backend change the mirror missed would otherwise leave the gate green. The
+   run prints `render mirror: 22/22 fixtures byte-identical to shir_render
+   --target rust`, and an unavailable renderer is a **hard gap** (exit 2), not
+   a skip.
 3. **rustc** — the program compiles under `rustc --edition 2021 -D warnings`
    in BOTH a debug and a `-O` build. Debug matters: generated arithmetic uses
    plain operators (release wraps like bash, debug panics on overflow), so a
@@ -48,16 +53,28 @@ Re-render after a backend change, then look at the diff:
    came out of it and are fixed in the emitter now. A missing component is a
    **hard gap**, not a skip: the summary prints `HARD GAP: clippy did not
    run` and the gate exits 2. (`rustup component add clippy`.)
-6. **census** — the idiom counters (`let` bindings and store accesses —
-   the promoted-vs-stored split — `pfx`/`pfi` specialized
-   vs interpreted printf sites, `pfl` interpreter lines, `.clone()`,
-   `.to_string()`, `#[allow(`, `abort`, `Command::new("bash")`, emitted
-   `__sh_*` helpers, lines) are printed per fixture and totalled.
-   "Idiomatic" is a number that has to keep moving down, not a claim in a
-   comment. A non-zero `abort` count is a hard failure in every mode: a
-   generated program may not contain `.unwrap()`, `.expect(`, `panic!` or
-   `unreachable!`, and a per-variable `static __SHV_…` fails the fixture on
-   its own: unpromoted variables share the ONE `__SH_VARS` store.
+6. **the idiom metric** — "idiomatic" is a number, and the number is
+   clippy's: every `clippy::*` diagnostic the `pedantic` group raises over the
+   GENERATED program is counted BY LINT NAME and ratcheted against the
+   measured `IDIOM_BASELINE` in the harness. A family that grows, or one that
+   is not in the baseline at all, fails the gate and prints every offending
+   `fixture:line: message`. Because the families are clippy's catalog rather
+   than a list we wrote, an idiom nobody has named yet is measured by the same
+   number — of the current 243 findings, 43 are `clippy::bool_to_int_with_if`
+   (the `if b { 1 } else { 0 }` status shape) and 11
+   `clippy::many_single_char_names`, neither of which any hand-written counter
+   here looked at. `cargo run --bin rust_fixtures -- --idiom-only` runs the
+   render, census, metric and mirror check without the rustc/behaviour passes.
+
+   The gate still prints the structural census per fixture — `lines`, `let`
+   bindings and store accesses (the promoted-vs-stored split), `pfx`/`pfi`
+   specialized vs interpreted printf sites, `pfl` interpreter lines — but the
+   hand-written idiom families (`.clone()`, `.to_string()`, `#[allow(`,
+   abort, `Command::new("bash")`, emitted `__sh_*` helpers) are GONE from it:
+   they are now whatever clippy says. What was a hard gate in them stays a hard
+   gate: any `#[allow(` in generated code fails the fixture, so does
+   `.unwrap()`/`.expect(`/`panic!`/`unreachable!`, and so does a per-variable
+   `static __SHV_…` (unpromoted variables share the ONE `__SH_VARS` store).
 
 ## The word vector type
 
@@ -126,6 +143,15 @@ starting HEAD):
 | `trim().parse::<i64>()` | 4 | 5 | one more: the store's numeric read parses stored text (`__sh_v_i`) |
 | `__sh_atoi(` | 4 | 4 | bigint/`%d` paths |
 | `borrow().len() as i64` | 1 | 0 | the per-variable `RefCell` read is gone (`__sh_v_len`) |
+
+Those text counters are history: the gate no longer counts `.to_string()` or
+`.clone()` itself — the idiomatic score is the clippy metric (item 6 above).
+The hand-written families that metric replaced summed, over the 22 fixtures, to
+`.clone()` 19, `.to_string()` 115, `#[allow(` 0, `abort` 0,
+`Command::new("bash")` 2 — four of those five numbers were zero or trivial
+while 43 `if b { 1 } else { 0 }` status conversions and 118 redundant closures
+sat unmeasured. The replacement is **243** findings over the same 22 generated
+programs, in 16 clippy families, ratcheted per family.
 
 Per fixture, `to_string`/`clone`/`parse` (`05`, `15`, `16`, `17` are the ones
 that moved): `01 1/0/0`, `02 1/0/0`, `03 1/1/0`, `04 1/0/0`, `05 0/0/1`,
@@ -454,8 +480,8 @@ The rules behind the zeros:
   spelling, so nothing inlines a live sink away.
 
 Remaining `#[allow]` shapes the emitter can still produce, recorded at the
-emission site in `src/rust_backend.rs` and absent from all 17 fixtures
-(census 0):
+emission site in `src/rust_backend.rs` and absent from all 17 fixtures (the
+gate asserts zero):
 
 | lint | when | why the emission cannot avoid it |
 |---|---|---|

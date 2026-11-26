@@ -13,9 +13,10 @@
 //! `--check` runs five checks per fixture:
 //!
 //! 1. **stale**: the fresh render equals the checked-in `expected/*.rs`.
-//! 2. **parity**: the same source rendered through the A1-JSON ingress that
-//!    `shir_render --target rust` uses produces the same text — the harness's
-//!    own mirror of the render path cannot silently drift.
+//! 2. **render mirror**: the REAL `shir_render --target rust` binary (built
+//!    on demand, fed the same A1 JSON) renders every fixture to the same
+//!    bytes the harness measured — the metric cannot drift from the renderer
+//!    users get.
 //! 3. **rustc**: the program compiles under `rustc --edition 2021
 //!    -D warnings` in BOTH a debug and a `-O` build. A fixture that needs a
 //!    third-party crate is reported as NEEDS-CRATE (with the crate name),
@@ -23,8 +24,17 @@
 //! 4. **behaviour**: each build runs in a scratch directory seeded with the
 //!    same three files the `bash` run sees, and its stdout, exit status and
 //!    every file it creates must match `bash <fixture>`.
-//! 5. **census**: the idiom counters below are printed and totalled, so
-//!    "idiomatic" is a number that moves rather than a prose claim.
+//! 5. **idiom metric**: the idiomatic score is CLIPPY'S OWN CATALOG over the
+//!    generated program — every `clippy::*` diagnostic the `pedantic` group
+//!    raises, counted by lint name — not a list of shapes we thought to grep
+//!    for. The totals are printed per run and ratcheted against
+//!    [`IDIOM_BASELINE`]: a lint that grows, or a family that appears, fails
+//!    the gate and names every offending site. Because the lint set comes
+//!    from clippy, a non-idiomatic shape nobody has named yet is caught by
+//!    the same number.
+//!
+//! `--idiom-only` runs the render + census + idiom metric + mirror check
+//! without the rustc/behaviour passes — the ratchet's own fast loop.
 //!
 //! Clippy is a REQUIRED check: every built fixture is linted in both the
 //! debug and the `-O` profile with `-D warnings`, and a single finding fails
@@ -72,20 +82,216 @@ fn prepare(src: &str) -> debashl::ir::IrProgram {
     prog
 }
 
-/// Render through the A1-JSON ingress `shir_render --target rust` uses: IR →
-/// A1 JSON → IR → shared transforms → structuring passes → renderer. Any
-/// difference from [`render`] means the harness mirror and the CLI have
-/// drifted (or the JSON round-trip is lossy) — either way, it must be known.
-fn render_via_a1(src: &str) -> Result<String, String> {
+/// The REAL renderer, built on demand so a fresh clone can run the whole
+/// gate with one command: `shir_render` is a sibling binary of this harness,
+/// and the process's own profile (debug/release) is the one to build.
+fn shir_render_bin() -> Result<PathBuf, String> {
+    let exe = std::env::current_exe().map_err(|e| format!("current_exe: {e}"))?;
+    let dir = exe
+        .parent()
+        .ok_or_else(|| "current_exe has no parent".to_string())?
+        .to_path_buf();
+    let name = if cfg!(windows) { "shir_render.exe" } else { "shir_render" };
+    let bin = dir.join(name);
+    // ALWAYS build it: a `shir_render` left over from an earlier tree would
+    // disagree with the current renderer and the mirror would report a
+    // difference that no longer exists (or hide one that does). The build is
+    // incremental, so this is a no-op when it is already current.
+    let release = dir
+        .components()
+        .any(|c| c.as_os_str() == "release");
+    let mut c = Command::new("cargo");
+    c.current_dir(env!("CARGO_MANIFEST_DIR")).arg("build").arg("-q");
+    if release {
+        c.arg("--release");
+    }
+    c.args(["--bin", "shir_render"]);
+    let out = c.output().map_err(|e| format!("cargo build: {e}"))?;
+    if !out.status.success() {
+        return Err(format!(
+            "cargo build --bin shir_render failed: {}",
+            String::from_utf8_lossy(&out.stderr).trim()
+        ));
+    }
+    if bin.is_file() {
+        Ok(bin)
+    } else {
+        Err(format!("built, but {} is missing", bin.display()))
+    }
+}
+
+/// Render one fixture through the REAL `shir_render --target rust` binary,
+/// fed the A1 JSON the CLI ingests. This is the equivalence check: the text
+/// the harness measures must be the text the renderer produces.
+fn mirror_render(bin: &Path, src: &str, dir: &Path) -> Result<String, String> {
     let mut parser = debashl::parser::commands::Parser::new(src);
     let (cmds, lines) = parser.parse_with_lines().map_err(|e| format!("parse: {e}"))?;
     let prog = debashl::shir::ast_to_ir_with_lines(&cmds, &lines);
     let json = debashl::shir_json::shir_to_shir_json(&prog);
-    let mut prog = debashl::shir_json_in::shir_json_to_ir(&json)?;
-    debashl::transforms::apply(&mut prog.stmts);
-    debashl::shir_passes::restructure_goto_only(&mut prog);
-    debashl::shir_passes::strip_cfor(&mut prog);
-    Ok(debashl::rust_backend::shir_to_rust(&prog))
+    std::fs::create_dir_all(dir).map_err(|e| format!("mirror dir: {e}"))?;
+    let path = dir.join("a1.json");
+    std::fs::write(&path, json).map_err(|e| format!("write a1.json: {e}"))?;
+    let out = Command::new(bin)
+        .arg("--target")
+        .arg("rust")
+        .arg(&path)
+        .output()
+        .map_err(|e| format!("run shir_render: {e}"))?;
+    if !out.status.success() {
+        return Err(format!(
+            "shir_render exited {:?}: {}",
+            out.status.code(),
+            String::from_utf8_lossy(&out.stderr).trim()
+        ));
+    }
+    Ok(String::from_utf8_lossy(&out.stdout).to_string())
+}
+
+// ── the idiom metric: clippy's catalog, not a list of patterns ────────────
+
+/// One clippy finding over one generated program.
+struct IdiomSite {
+    lint: String,
+    fixture: String,
+    line: usize,
+    message: String,
+}
+
+/// The idiomatic score. Every `clippy::*` diagnostic the `pedantic` group
+/// raises over the GENERATED program is counted by LINT NAME — the families
+/// come from clippy's own catalog, so a non-idiomatic shape nobody has
+/// thought of is measured by the same number.
+#[derive(Default)]
+struct Idioms {
+    by_lint: BTreeMap<String, usize>,
+    sites: Vec<IdiomSite>,
+}
+
+impl Idioms {
+    fn total(&self) -> usize {
+        self.by_lint.values().sum()
+    }
+
+    fn add(&mut self, o: Idioms) {
+        for (lint, n) in o.by_lint {
+            *self.by_lint.entry(lint).or_insert(0) += n;
+        }
+        self.sites.extend(o.sites);
+    }
+
+    /// `clippy::a=3, clippy::b=1` — highest count first, then by name.
+    fn breakdown(&self) -> String {
+        let mut v: Vec<(&String, &usize)> = self.by_lint.iter().collect();
+        v.sort_by(|a, b| b.1.cmp(a.1).then(a.0.cmp(b.0)));
+        v.iter()
+            .map(|(l, n)| format!("{l}={n}"))
+            .collect::<Vec<_>>()
+            .join(", ")
+    }
+}
+
+/// The ratchet: the measured per-lint counts for this tree. A lint that grows
+/// — or one that is not here at all — fails the gate and names its sites; a
+/// lint that drops is reported so the baseline comes down with it.
+/// Measured on this tree, `cargo run --bin rust_fixtures -- --idiom-only`:
+/// 243 findings over the 22 generated programs. Note the families a
+/// hand-written list would never have named — `bool_to_int_with_if` (the
+/// `if b { 1 } else { 0 }` status shape) and `many_single_char_names` are
+/// clippy's observations, not ours.
+const IDIOM_BASELINE: &[(&str, usize)] = &[
+    ("clippy::bool_to_int_with_if", 43),
+    ("clippy::cast_possible_wrap", 4),
+    ("clippy::cast_sign_loss", 10),
+    ("clippy::explicit_iter_loop", 2),
+    ("clippy::format_push_string", 2),
+    ("clippy::if_not_else", 5),
+    ("clippy::manual_let_else", 4),
+    ("clippy::many_single_char_names", 11),
+    ("clippy::map_unwrap_or", 2),
+    ("clippy::match_same_arms", 3),
+    ("clippy::needless_pass_by_value", 4),
+    ("clippy::redundant_closure_for_method_calls", 118),
+    ("clippy::single_match_else", 2),
+    ("clippy::too_many_lines", 5),
+    ("clippy::uninlined_format_args", 26),
+    ("clippy::unreadable_literal", 2),
+];
+
+/// Run clippy over one generated program with clippy's `pedantic` group and
+/// collect its diagnostics. Nothing is suppressed and nothing is filtered but
+/// the diagnostic envelope: every lint clippy names is a data point.
+fn clippy_idioms(code: &str, fixture: &str, dir: &Path) -> Result<Idioms, String> {
+    let src_dir = dir.join("src");
+    std::fs::create_dir_all(&src_dir).map_err(|e| format!("idiom src dir: {e}"))?;
+    let pkg = fixture.replace(|c: char| !c.is_ascii_alphanumeric(), "_");
+    let manifest = format!(
+        "[package]\nname = \"fx_{pkg}\"\nversion = \"0.0.0\"\nedition = \"2021\"\n\n\
+         [[bin]]\nname = \"fx\"\npath = \"src/main.rs\"\n"
+    );
+    std::fs::write(dir.join("Cargo.toml"), manifest).map_err(|e| format!("idiom manifest: {e}"))?;
+    std::fs::write(src_dir.join("main.rs"), code).map_err(|e| format!("idiom main.rs: {e}"))?;
+    let mut c = Command::new("cargo");
+    c.arg("clippy")
+        .arg("--offline")
+        .arg("--message-format=json")
+        .arg("--manifest-path")
+        .arg(dir.join("Cargo.toml"))
+        .arg("--target-dir")
+        .arg(dir.join("target"))
+        .args(["--", "-W", "clippy::pedantic"]);
+    let res = c.output().map_err(|e| format!("run cargo clippy: {e}"))?;
+    let text = String::from_utf8_lossy(&res.stdout);
+    let mut out = Idioms::default();
+    for line in text.lines() {
+        let line = line.trim();
+        if !line.starts_with('{') {
+            continue;
+        }
+        let Ok(v) = serde_json::from_str::<serde_json::Value>(line) else {
+            continue;
+        };
+        if v.get("reason").and_then(|r| r.as_str()) != Some("compiler-message") {
+            continue;
+        }
+        let Some(msg) = v.get("message") else { continue };
+        let Some(lint) = msg
+            .get("code")
+            .and_then(|c| c.get("code"))
+            .and_then(|c| c.as_str())
+            .filter(|c| c.starts_with("clippy::"))
+        else {
+            continue;
+        };
+        let line_no = msg
+            .get("spans")
+            .and_then(|s| s.as_array())
+            .and_then(|a| a.iter().find(|s| s.get("is_primary") == Some(&serde_json::Value::Bool(true))))
+            .and_then(|s| s.get("line_start"))
+            .and_then(|l| l.as_u64())
+            .unwrap_or(0) as usize;
+        let text = msg
+            .get("message")
+            .and_then(|m| m.as_str())
+            .unwrap_or("")
+            .lines()
+            .next()
+            .unwrap_or("")
+            .to_string();
+        *out.by_lint.entry(lint.to_string()).or_insert(0) += 1;
+        out.sites.push(IdiomSite {
+            lint: lint.to_string(),
+            fixture: fixture.to_string(),
+            line: line_no,
+            message: text,
+        });
+    }
+    if !res.status.success() && out.total() == 0 {
+        return Err(format!(
+            "clippy could not analyse the generated program: {}",
+            String::from_utf8_lossy(&res.stderr).trim()
+        ));
+    }
+    Ok(out)
 }
 
 /// Call sites that reach the variable store with a literal key:
@@ -107,16 +313,16 @@ fn store_accesses(code: &str) -> usize {
 
 // ── the idiom census ─────────────────────────────────────────────────────
 
-/// Counted shapes. Every field is something the backend previously got wrong;
-/// the totals are the regression metric (they may only go down).
+/// Structural shape of the emitted program. These are facts about the
+/// translation (how many lines, how many `let` bindings, how many store
+/// accesses, how much of `__sh_printf` survives) — the IDIOMATIC score is
+/// [`Idioms`], computed from clippy, not counted here.
 #[derive(Default, Clone, Copy)]
 struct Census {
     lines: usize,
     /// per-variable `thread_local!` statics in the emitted program — the
     /// shape the ONE store replaced, so any non-zero count is a failure
     statics: usize,
-    clones: usize,
-    to_strings: usize,
     /// vars emitted as a bare `let` (promoted out of the store)
     promoted: usize,
     /// store accesses in the emitted body: call sites that name a store key
@@ -127,15 +333,6 @@ struct Census {
     printf_interpreted: usize,
     /// lines the emitted `__sh_printf` interpreter body costs (0 = absent)
     printf_lines: usize,
-    allows: usize,
-    /// `.unwrap()` / `.expect(` / `panic!` / `unreachable!` left in the
-    /// emitted text. A generated program must never abort: every helper is
-    /// either infallible by construction or rewritten by `unwrap_policy`.
-    panics: usize,
-    bash_spawns: usize,
-    /// `__sh_*` runtime helpers emitted into this program
-    helpers: usize,
-    wrapping: usize,
 }
 
 impl Census {
@@ -144,36 +341,22 @@ impl Census {
         Census {
             lines: code.lines().count(),
             statics: count("thread_local! { ") + count("static __SHV_"),
-            clones: count(".clone()"),
-            to_strings: count(".to_string()"),
             promoted: 0,
             stored: 0,
             printf_specialized: 0,
             printf_interpreted: 0,
             printf_lines: 0,
-            allows: count("#[allow("),
-            panics: count(".unwrap()") + count(".expect(") + count("panic!(") + count("unreachable!("),
-            bash_spawns: count("Command::new(\"bash\")"),
-            helpers: count("\nfn __sh_"),
-            wrapping: count("wrapping_"),
         }
     }
 
     fn add(&mut self, o: Census) {
         self.lines += o.lines;
         self.statics += o.statics;
-        self.clones += o.clones;
-        self.to_strings += o.to_strings;
         self.promoted += o.promoted;
         self.stored += o.stored;
         self.printf_specialized += o.printf_specialized;
         self.printf_interpreted += o.printf_interpreted;
         self.printf_lines += o.printf_lines;
-        self.allows += o.allows;
-        self.panics += o.panics;
-        self.bash_spawns += o.bash_spawns;
-        self.helpers += o.helpers;
-        self.wrapping += o.wrapping;
     }
 }
 
@@ -396,6 +579,8 @@ fn main() {
     let src_dir = root.join("src");
     let out_dir = root.join("expected");
     let check = std::env::args().any(|a| a == "--check");
+    // render + census + idiom metric + mirror check, no rustc/behaviour passes
+    let idiom_only = std::env::args().any(|a| a == "--idiom-only");
     if !check {
         std::fs::create_dir_all(&out_dir).expect("expected/");
     }
@@ -418,11 +603,25 @@ fn main() {
             println!("      {e}");
         }
     }
+    // The render-path mirror needs the REAL renderer; build it on demand so a
+    // fresh clone can run the whole gate with one command.
+    let shir_bin = match shir_render_bin() {
+        Ok(b) => {
+            println!("note  render mirror: {}", b.display());
+            Ok(b)
+        }
+        Err(e) => {
+            println!("note  HARD GAP: shir_render is unavailable — the mirror check cannot run");
+            println!("      {e}");
+            Err(e)
+        }
+    };
     println!(
-        "{:<20} {:>5} {:>5} {:>5} {:>4} {:>4} {:>4} {:>5} {:>5} {:>5} {:>5} {:>5} {:>5} {:>7}",
-        "fixture", "lines", "let", "store", "pfx", "pfi", "pfl", "clone", "to_str", "allow",
-        "abort", "bash", "help", "status"
+        "{:<20} {:>5} {:>5} {:>5} {:>4} {:>4} {:>4} {:>6} {:>7}",
+        "fixture", "lines", "let", "store", "pfx", "pfi", "pfl", "idiom", "status"
     );
+    let mut idiom_total = Idioms::default();
+    let mut mirror_ok = 0usize;
 
     let mut failures = 0usize;
     let mut total = Census::default();
@@ -448,6 +647,15 @@ fn main() {
         c.statics = code.matches("static __SHV_").count();
         c.stored = store_accesses(&code);
         total.add(c);
+        // ── 5. the idiomatic metric: clippy's own catalog over the emitted
+        // program. The count IS the score — no hand-written pattern list.
+        match clippy_idioms(&code, &name, &scratch.join(&name).join("idiom")) {
+            Ok(i) => idiom_total.add(i),
+            Err(m) => {
+                println!("{name:<20} IDIOM-UNAVAILABLE: {m}");
+                failures += 1;
+            }
+        }
         for name in &promoted {
             let ident: String = {
                 let mut s = String::new();
@@ -480,11 +688,26 @@ fn main() {
             }
         }
         // An abort in generated code is a generator bug, not a fixture
-        // behaviour: fail the gate whatever the mode.
-        if c.panics > 0 {
+        // behaviour: fail the gate whatever the mode. (Kept as a targeted
+        // assertion rather than a family count — the metric is clippy's.)
+        let panics = code.matches(".unwrap()").count()
+            + code.matches(".expect(").count()
+            + code.matches("panic!(").count()
+            + code.matches("unreachable!(").count();
+        if panics > 0 {
             println!(
-                "{name:<20} {:>5} {:>7}  PANIC PATH: {} `.unwrap()`/`.expect()`/`panic!`/`unreachable!` in generated code — a helper must be infallible by construction or a documented abort",
-                c.lines, c.statics, c.panics
+                "{name:<20} {:>5}  PANIC PATH: {panics} `.unwrap()`/`.expect()`/`panic!`/`unreachable!` in generated code — a helper must be infallible by construction or a documented abort",
+                c.lines
+            );
+            failures += 1;
+        }
+        // The output must compile on its own terms: one `#[allow]` would be a
+        // warning silenced instead of a shape fixed.
+        let allows = code.matches("#[allow(").count();
+        if allows > 0 {
+            println!(
+                "{name:<20} {:>5}  ALLOW ATTRIBUTE: {allows} `#[allow(…)]` in generated code — the output must compile with zero",
+                c.lines
             );
             failures += 1;
         }
@@ -501,7 +724,9 @@ fn main() {
             failures += 1;
         }
 
-        if check {
+        if idiom_only {
+            // the ratchet's fast loop: no goldens, no builds
+        } else if check {
             match std::fs::read_to_string(&out) {
                 Ok(want) if want == code => {}
                 _ => {
@@ -514,15 +739,39 @@ fn main() {
             std::fs::write(&out, &code).expect("write expected");
         }
 
-        // ── 2. A1-JSON ingress parity ──────────────────────────────────
-        let parity_ok = match render_via_a1(&src) {
-            Ok(v) => v == code,
+        // ── 2. render-path mirror: the REAL `shir_render --target rust` ──
+        let parity_ok = match &shir_bin {
+            Ok(bin) => match mirror_render(bin, &src, &scratch.join(&name).join("mirror")) {
+                Ok(v) => {
+                    if v == code {
+                        mirror_ok += 1;
+                        true
+                    } else {
+                        let first = v
+                            .lines()
+                            .zip(code.lines())
+                            .position(|(a, b)| a != b)
+                            .map(|i| i + 1)
+                            .unwrap_or_else(|| v.lines().count().min(code.lines().count()) + 1);
+                        println!(
+                            "\n{name}: MIRROR-DIFF at line {first} — shir_render --target rust and the harness render disagree"
+                        );
+                        false
+                    }
+                }
+                Err(m) => {
+                    println!("\n{name}: MIRROR-ERROR: {m}");
+                    false
+                }
+            },
             Err(_) => false,
         };
 
         // ── 3/4. compile + behaviour ───────────────────────────────────
-        let mut status = String::new();
-        if let Some(krate) = needed_crate(&code) {
+        let mut status;
+        if idiom_only {
+            status = "render-only".into();
+        } else if let Some(krate) = needed_crate(&code) {
             status = format!("NEEDS-CRATE {krate}");
         } else {
             let dbg_dir = scratch.join(&name).join("dbg");
@@ -647,19 +896,72 @@ fn main() {
                 }
             }
         }
+        let own_idioms = idiom_total
+            .sites
+            .iter()
+            .filter(|s| s.fixture == name)
+            .count();
         println!(
-            "{name:<20} {:>5} {:>5} {:>5} {:>4} {:>4} {:>4} {:>5} {:>5} {:>5} {:>5} {:>5} {:>5}  {status}",
+            "{name:<20} {:>5} {:>5} {:>5} {:>4} {:>4} {:>4} {:>6}  {status}",
             c.lines, c.promoted, c.stored, c.printf_specialized, c.printf_interpreted,
-            c.printf_lines, c.clones, c.to_strings, c.allows, c.panics, c.bash_spawns, c.helpers
+            c.printf_lines, own_idioms
         );
     }
 
     println!(
-        "\n{:<20} {:>5} {:>5} {:>5} {:>4} {:>4} {:>4} {:>5} {:>5} {:>5} {:>5} {:>5} {:>5}",
+        "\n{:<20} {:>5} {:>5} {:>5} {:>4} {:>4} {:>4} {:>6}",
         "TOTAL", total.lines, total.promoted, total.stored, total.printf_specialized,
-        total.printf_interpreted, total.printf_lines, total.clones, total.to_strings,
-        total.allows, total.panics, total.bash_spawns, total.helpers
+        total.printf_interpreted, total.printf_lines, idiom_total.total()
     );
+
+    // ── the metric: clippy's per-lint counts against the measured baseline ──
+    let base: BTreeMap<&str, usize> = IDIOM_BASELINE.iter().copied().collect();
+    let mut over = 0usize;
+    for (lint, n) in &idiom_total.by_lint {
+        let want = base.get(lint.as_str()).copied().unwrap_or(0);
+        if *n > want {
+            over += 1;
+            println!("IDIOM: {lint}: {n} finding(s), baseline {want}");
+            for site in idiom_total.sites.iter().filter(|s| &s.lint == lint).take(8) {
+                println!("        {}:{}: {}", site.fixture, site.line, site.message);
+            }
+        }
+    }
+    for (lint, want) in &base {
+        let got = idiom_total.by_lint.get(*lint).copied().unwrap_or(0);
+        if got < *want {
+            println!("note  idiom lower: {lint}: {got} < baseline {want} — lower the baseline");
+        }
+    }
+    if over > 0 {
+        failures += 1;
+    }
+    println!(
+        "idiomatic: {} clippy findings over {} generated programs (baseline {}); {}",
+        idiom_total.total(),
+        files.len(),
+        base.values().sum::<usize>(),
+        if idiom_total.by_lint.is_empty() {
+            "no lint fired".to_string()
+        } else {
+            idiom_total.breakdown()
+        }
+    );
+    match &shir_bin {
+        Ok(_) if mirror_ok == files.len() => println!(
+            "render mirror: {}/{} fixtures byte-identical to shir_render --target rust",
+            mirror_ok,
+            files.len()
+        ),
+        _ => {
+            println!(
+                "render mirror: {}/{} fixtures byte-identical to shir_render --target rust — FAILED",
+                mirror_ok,
+                files.len()
+            );
+            failures += 1;
+        }
+    }
     if let Some(e) = &clippy_err {
         eprintln!(
             "\nHARD GAP: clippy did not run, so the idiomatic metric is incomplete ({e})"
@@ -667,12 +969,16 @@ fn main() {
         eprintln!("install it with `rustup component add clippy` and re-run");
         std::process::exit(2);
     }
+    if let Err(e) = &shir_bin {
+        eprintln!("\nHARD GAP: shir_render did not run, so the render mirror is unverified ({e})");
+        std::process::exit(2);
+    }
     if failures > 0 {
         eprintln!("\n{failures} fixture(s) failed");
         std::process::exit(1);
     }
     println!(
-        "\n{} fixtures: render unchanged, A1 parity ok, rustc+clippy clean (debug + -O, -D warnings), behaviour matches bash",
+        "\n{} fixtures: render unchanged, mirror == shir_render --target rust, rustc+clippy clean (debug + -O, -D warnings), behaviour matches bash, idiomatic metric within baseline",
         files.len()
     );
 }

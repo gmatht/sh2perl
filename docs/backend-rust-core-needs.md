@@ -387,10 +387,22 @@ with the reason per name.
   (census 0), and `borrow().len() as i64` is the array length read, already
   numeric.
 - The gate for all of this is `cargo run --bin rust_fixtures -- --check`
-  (stale check, A1-ingress parity, `rustc -D warnings` in debug *and* `-O`,
-  behaviour vs `bash`, **clippy `-D warnings` in debug *and* `-O`**, idiom
-  census, which now also counts `abort`s and fails the gate on a single
-  generated `.unwrap()`/`.expect()`/`panic!`/`unreachable!`) plus the
+  (stale check; the **render mirror** — the real `shir_render --target rust`
+  binary, built and run by the harness, must reproduce every fixture
+  byte-for-byte or the gate names the fixture and the first differing line;
+  `rustc -D warnings` in debug *and* `-O`; behaviour vs `bash` in both
+  profiles; **clippy `-D warnings` in debug *and* `-O`**, which must be
+  EMPTY; and the **idiom metric**: every `clippy::*` diagnostic the `pedantic`
+  group raises over the generated program, counted by lint name and ratcheted
+  against the measured `IDIOM_BASELINE` — **243 findings in 16 families** on
+  this tree, and a family that grows or is not in the baseline fails the gate
+  and prints every `fixture:line: message`. Nothing is a hand-written pattern
+  list, so an idiom nobody classified is measured by the same number:
+  `clippy::bool_to_int_with_if` (43) and `clippy::many_single_char_names` (11)
+  only appeared when the metric was made clippy-derived. The targeted
+  assertions survive as hard failures — zero `#[allow(`, zero
+  `.unwrap()`/`.expect(`/`panic!`/`unreachable!`, zero per-variable store
+  static) plus the
   differential net `cargo run --bin rust_fuzz` (seeded; 60 generated programs
   by default, each run under `bash` and under the rendered+compiled Rust in
   BOTH a debug and a `-O` build, comparing stdout, stderr and the exit status;
