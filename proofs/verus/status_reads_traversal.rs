@@ -82,6 +82,10 @@
 //        simplification (`pin_nested_redirect_reads_before_store`)
 //    (e) nested walk drops the Case clauses ........ rejected at
 //        simplification (`pin_case_clause_is_scanned_and_body_is_not`)
+//    (j) the `If` arm called a must-store while `emit_s` stops writing the
+//        register for an `If` fragment ............ rejected at
+//        simplification (`pin_control_flow_stores` computes false) — the
+//        arm is only sound because the renderer writes `$?` on every path
 //
 //  The simplification rejections are the repo's usual class (typeset_attrs
 //  records the same for its leading-zero mutant): the concrete pins are

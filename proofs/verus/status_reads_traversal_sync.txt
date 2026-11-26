@@ -1,5 +1,5 @@
 # verus-sync-coverage manifest: status_reads_traversal
-# source sha: status_reads=32b0936fb8b7  proof sha: d6a661499c6f
+# source sha: status_reads=32b0936fb8b7  proof sha: 3bfa0ecd6c10
 
 [pins]
 pin pin_test_operand_is_a_read -> test detects_test_operand_status: MAPPED
@@ -32,8 +32,9 @@ guard X children carried as Seq (layout / structural order): PRESENT
 [counts]
 68 verified, 0 errors (verus --triggers-mode silent --rlimit 40 status_reads_traversal.rs)
 mutants: Cap 67v/1e, Try 67v/1e, ForInit-step 67v/1e, DoWhile-body 67v/1e,
-  MethodCall-children 67v/1e; literal-text, capture-guard, Redirect and
-  Case-clause mutants rejected at simplification by their pins.
+  MethodCall-children 67v/1e; literal-text, capture-guard, Redirect,
+  Case-clause and If-must-store (emit_s drops the If fragment's register
+  write) mutants rejected at simplification by their pins.
 [exec]
 # Every MAPPED row above was EXECUTED against the source in this tree:
 #   cargo test --lib          (full lib suite; per-test verdicts below)

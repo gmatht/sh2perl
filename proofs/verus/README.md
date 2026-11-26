@@ -8730,13 +8730,16 @@ renderer writes (`emit_s`), or orders the events a nested list produces
 
 Five are counted: dropping the `Cap` arm, the `Try` bodies, the `ForInit`
 step list, the `DoWhile` body, or the `MethodCall` children each gives
-**67 verified, 1 error**. Four more are refuted one stage earlier, at
+**67 verified, 1 error**. Five more are refuted one stage earlier, at
 simplification, by the concrete pins: a literal text that is never a read
 (`pin_test_operand_is_a_read`), the assign arm ignoring its capture guard
 (`pin_capture_assign_does_not_store`), the nested walk dropping `Redirect`
-(`pin_nested_redirect_reads_before_store`) and dropping the `case` clauses
-(`pin_case_clause_is_scanned_and_body_is_not`) — the same rejection class the
-README records for typeset_attrs' leading-zero mutant. Restored
+(`pin_nested_redirect_reads_before_store`), dropping the `case` clauses
+(`pin_case_clause_is_scanned_and_body_is_not`) and calling `If` a must-store
+while `emit_s` stops writing the register for an `If` fragment
+(`pin_control_flow_stores`), which is the check that the arm rests on the
+renderer's placement rather than on the analysis alone — the same rejection
+class the README records for typeset_attrs' leading-zero mutant. Restored
 byte-identically after each run (sha256 in
 `status_reads_traversal_sync.txt`).
 
