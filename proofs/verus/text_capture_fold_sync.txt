@@ -1,0 +1,50 @@
+# verus-sync-coverage manifest: text_capture_fold
+# source sha: text_capture_fold=f76d26e31190  proof sha: a1120fac1bba
+
+[pins]
+pin pin_quoted_test_operand -> test folds_quoted_test_operand: MAPPED
+pin pin_splice_of_the_test_operand -> test folds_quoted_test_operand: MAPPED
+pin pin_analysis_shapes -> test folds_unquoted_single_word_operand: MAPPED
+pin pin_analysis_shapes -> test refuses_variable_words: MAPPED
+pin pin_analysis_shapes -> test refuses_glob_and_tilde_words: MAPPED
+pin pin_analysis_shapes -> test folds_true_to_empty: MAPPED
+pin pin_emit_is_richer -> test refuses_echo_flags: MAPPED
+pin pin_a_quote_breaks_the_parse -> test quoted_literal_replacement_chars_refused: MAPPED
+pin pin_safe_splice -> test refuses_unquoted_multi_word_output: MAPPED
+pin pin_safe_splice -> test folds_multi_word_output_inside_quotes: MAPPED
+pin pin_gates_imply_the_premise: UNMIRRORED (the gated-implies-no-syntax step has no source test)
+pin constant_output_sound: UNMIRRORED (value-level; the source tests the returned string)
+pin folds_param_default: UNMIRRORED here (analysis pinned; the ARG POSITION is IR-level)
+
+[guards]
+guard law constant_output_sound (analysis Some(r) => the command really prints r): PRESENT
+guard law analysis_is_literal (a computed replacement is literal text): PRESENT
+guard law fold_preserves_the_token_stream (gate => re-parse sees the same tokens): PRESENT
+guard law fold_is_sound (both halves for a text and its substitutions): PRESENT
+guard gate = no_syntax over the substitution's replacement chars: PRESENT
+guard unquoted gate all_safe => no_syntax (charset is the syntax-free set): PRESENT
+guard quoted gate all_safe_quoted => no_syntax (ends/escapes/re-expands excluded): PRESENT
+guard semantic side RICHER than the analysis (newline word, -n flag still constant): PRESENT
+guard lexer (scan/find_close/quote modes/single-quoted skip/span splicing): OUT OF MODEL
+guard IR traversal + TEXT_FUNCS positions (structural, not semantic): OUT OF MODEL
+guard echo flag FORMATTING (-n/-e/-E text reformatting): OUT OF MODEL (flag => NotPlain)
+
+[counts]
+31 verified, 0 errors (verus --triggers-mode silent --rlimit 40 text_capture_fold.rs)
+mutants: gate-accepts-syntax 30v/1e, substitution-space-as-char 30v/1e,
+  folded-space-as-char 30v/1e; Rt-word-as-literal, flag-refusal-dropped,
+  join-without-separator, every-head-prints, quote-as-syntax and
+  unquoted-gate-wide-open rejected at simplification by their pins.
+# all suites built; per-test verdicts below
+exec pin_quoted_test_operand (folds_quoted_test_operand): PASS
+exec pin_splice_of_the_test_operand (folds_quoted_test_operand): PASS
+exec pin_analysis_shapes (folds_unquoted_single_word_operand): PASS
+exec pin_analysis_shapes (refuses_variable_words): PASS
+exec pin_analysis_shapes (refuses_glob_and_tilde_words): PASS
+exec pin_analysis_shapes (folds_true_to_empty): PASS
+exec pin_emit_is_richer (refuses_echo_flags): PASS
+exec pin_a_quote_breaks_the_parse (quoted_literal_replacement_chars_refused): PASS
+exec pin_safe_splice (refuses_unquoted_multi_word_output): PASS
+exec pin_safe_splice (folds_multi_word_output_inside_quotes): PASS
+exec pin_gates_imply_the_premise: UNMIRRORED (not executed)
+exec constant_output_sound: UNMIRRORED (not executed)

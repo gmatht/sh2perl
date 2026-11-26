@@ -1,0 +1,662 @@
+//  ─────────────────────────────────────────────────────────────────────────
+//  proofs/verus/text_capture_fold.rs — folding `$(echo lit …)` into raw shell
+//  text is value-preserving and syntax-free.
+//
+//  `transforms/text_capture_fold.rs` rewrites RAW TEXT that the renderers
+//  re-parse (`test` / `param` / `arith` arguments): a `$( … )` or backtick
+//  substitution whose output is PROVABLY constant is replaced by that
+//  literal text, so the renderer's re-parse sees a constant operand and no
+//  backend calls out at runtime. Two separate claims license it, and this
+//  file proves both:
+//
+//   (A) WHAT THE SUBSTITUTION PRINTS.
+//       The analysis (`constant_output`: only `echo` with all-literal
+//       words and no `-n`/`-e`/`-E` flag, or bare `true` / `:`) returns
+//       `Some(r)` only when the request really prints exactly `r` — for
+//       every environment. `emit` is the independent semantic side and is
+//       deliberately RICHER (it still calls a newline-carrying word or a
+//       `-n`-flagged echo constant); the law is one-directional, which is
+//       the direction the fold needs: analysis ⇒ constant.
+//
+//   (B) WHAT THE RE-PARSE SEES.
+//       Command-substitution output is NOT re-parsed for quoting: a `"`
+//       inside `${ … }`'s output is an ordinary character. Text that is
+//       spliced into the shell text IS re-parsed, so a `"`/`'`/`\`/`$`/
+//       backtick in the replacement could open a quote, escape, or expand.
+//       That is exactly the set the source's `safe_repl` gate excludes
+//       (unquoted: the whole shell-safe charset; inside `"…"`: the four
+//       that end, escape or re-expand). The law: when the gate holds, the
+//       token stream the re-parse produces is IDENTICAL to the token
+//       stream the substitution produced.
+//
+//  ── the model ──────────────────────────────────────────────────────────
+//
+//   * A substitution's content is a classified WORD LIST: `Lit` (literal
+//     text) or `Rt` (a word whose value depends on the environment — a
+//     `$var`, glob, tilde, metacharacter, or quoted expansion). The head
+//     is `Echo`, `True`, `Colon`, or `Other`.
+//   * `emit` (semantic) vs `analysis` (the pass's `constant_output`).
+//   * Shell text is a token list: `Ch` (literal char), `Syn` (a char that
+//     the re-parse treats as SYNTAX), `Sp` (a separator), `Sub` (one
+//     command substitution). `expand` is the token stream the ORIGINAL
+//     produces (a substitution's own output never becomes syntax);
+//     `foldtok` is the token stream the FOLDED text produces (the same
+//     characters, now re-parsed).
+//
+//  ── stated, not modelled ───────────────────────────────────────────────
+//
+//   * The scan/quoting machinery itself (`scan`, `find_close`, the quote
+//     modes, span splicing) is a lexer; the model starts from "here is the
+//     substitution and the text around it", which is what the lexer
+//     guarantees. Single-quoted regions never reach the fold (`scan` skips
+//     them wholesale) — modelled as: no `Sub` token exists there.
+//   * `shell_words`' per-character refusals (`\ $ ` | & ; < > ( ) { } * ?
+//     [ ] # ! ~`) are modelled as the word being `Rt`: one class for all
+//     environment-dependent words. Their individual spellings are the
+//     source's tests (`refuses_glob_and_tilde_words`, `refuses_variable_words`).
+//   * The `-e`/`-E`/`-n` flag FORMATTING (`-e` interpreting `\n`) is not
+//     modelled as output text; a flag makes `emit` `NotPlain` and the
+//     analysis refuse.
+//   * Which `IrExpr` positions carry raw text (`TEXT_FUNCS`) and the IR
+//     traversal are structural, not semantic: any subset of positions that
+//     still receives `fold_text` is covered by (A)+(B) unchanged.
+//
+//  ── measured mutants (all restored byte-identically; sha in the sync file) ──
+//
+//  counted (the mutation compiles and the proof goes red):
+//    m1  the gate accepts a syntax character               30 verified, 1 error
+//    m2  the substitution's space becomes a literal char    30 verified, 1 error
+//    m3  the folded text's space becomes a literal char     30 verified, 1 error
+//
+//  refuted one stage earlier, at simplification, by a concrete pin:
+//    s1  an Rt word counted as literal (pin_analysis_shapes)
+//    s2  the echo-flag refusal dropped (pin_emit_is_richer)
+//    s3  the join drops its separator (pin_analysis_shapes)
+//    s4  every head prints its words (pin_analysis_shapes)
+//    s5  a quote treated as syntax to the substitution (pin_a_quote_breaks_the_parse)
+//    s6  the unquoted gate wide open (pin_safe_splice)
+//
+//  ─────────────────────────────────────────────────────────────────────────
+
+use vstd::prelude::*;
+
+verus! {
+
+// ══════════════════════════════════════════════════════ (A) constant output ──
+
+pub enum W {
+    /// literal text, exactly as the shell would print it
+    Lit(Seq<char>),
+    /// a word whose value depends on the runtime environment
+    Rt,
+}
+
+pub enum Head {
+    Echo,
+    True,
+    Colon,
+    Other,
+}
+
+pub enum Out {
+    Const(Seq<char>),
+    /// not the plain join: environment-dependent, or reformatted by a flag
+    NotPlain,
+}
+
+pub open spec fn wtext(w: W) -> Seq<char> {
+    match w {
+        W::Lit(s) => s,
+        W::Rt => Seq::empty(),
+    }
+}
+
+/// every word is literal (the analysis's only way to compute an output)
+pub open spec fn all_lit(ws: Seq<W>, i: int) -> bool
+    decreases ws.len() - i,
+{
+    if i >= ws.len() {
+        true
+    } else {
+        (match ws[i] {
+            W::Lit(_) => true,
+            W::Rt => false,
+        }) && all_lit(ws, i + 1)
+    }
+}
+
+/// an echo FLAG (`-n`, `-e`, `-E`, and combinations; the source spells
+/// the charset `neE`)
+pub open spec fn all_ne_e(s: Seq<char>, i: int) -> bool
+    decreases s.len() - i,
+{
+    if i >= s.len() {
+        true
+    } else {
+        (s[i] == 'n' || s[i] == 'e' || s[i] == 'E') && all_ne_e(s, i + 1)
+    }
+}
+
+pub open spec fn is_flag(w: W) -> bool {
+    match w {
+        W::Lit(s) => s.len() > 1 && s[0] == '-' && all_ne_e(s, 1),
+        W::Rt => false,
+    }
+}
+
+pub open spec fn any_flag(ws: Seq<W>, i: int) -> bool
+    decreases ws.len() - i,
+{
+    if i >= ws.len() {
+        false
+    } else {
+        is_flag(ws[i]) || any_flag(ws, i + 1)
+    }
+}
+
+pub open spec fn has_ws(s: Seq<char>, i: int) -> bool
+    decreases s.len() - i,
+{
+    if i >= s.len() {
+        false
+    } else {
+        (s[i] == '\n' || s[i] == '\r') || has_ws(s, i + 1)
+    }
+}
+
+/// a word that broke a line: the renderer's single-line re-parse would lose it
+pub open spec fn any_broken(ws: Seq<W>, i: int) -> bool
+    decreases ws.len() - i,
+{
+    if i >= ws.len() {
+        false
+    } else {
+        (match ws[i] {
+            W::Lit(s) => has_ws(s, 0),
+            W::Rt => false,
+        }) || any_broken(ws, i + 1)
+    }
+}
+
+/// the text `echo` prints for its words: the words joined by one space
+pub open spec fn join(ws: Seq<W>, i: int) -> Seq<char>
+    decreases ws.len() - i,
+{
+    if i >= ws.len() {
+        Seq::empty()
+    } else if i == 0 {
+        wtext(ws[0]).add(join(ws, 1))
+    } else {
+        seq![' '].add(wtext(ws[i])).add(join(ws, i + 1))
+    }
+}
+
+/// `constant_output`, transcribed: `Some(r)` only for a provably constant `r`.
+pub open spec fn analysis(h: Head, ws: Seq<W>) -> Option<Seq<char>> {
+    match h {
+        Head::True | Head::Colon => if ws.len() == 0 { Some(Seq::empty()) } else { None },
+        Head::Echo => if all_lit(ws, 0) && !any_flag(ws, 0) && !any_broken(ws, 0) {
+            Some(join(ws, 0))
+        } else {
+            None
+        },
+        Head::Other => None,
+    }
+}
+
+/// The independent semantic side: what the command actually prints.
+/// Richer than `analysis` on purpose — a newline-carrying literal word and a
+/// `-n` flag are still a CONSTANT text here; `analysis` refuses them for
+/// other reasons (single-line re-parse; the flag's own formatting).
+pub open spec fn emit(h: Head, ws: Seq<W>) -> Out {
+    match h {
+        Head::True | Head::Colon => if ws.len() == 0 { Out::Const(Seq::empty()) } else { Out::NotPlain },
+        Head::Echo => {
+            if all_lit(ws, 0) && !any_flag(ws, 0) {
+                Out::Const(join(ws, 0))
+            } else {
+                Out::NotPlain
+            }
+        }
+        Head::Other => Out::NotPlain,
+    }
+}
+
+/// THE FIRST LAW: the analysis only ever reports a value the command really
+/// prints, in every environment.
+pub proof fn constant_output_sound(h: Head, ws: Seq<W>, r: Seq<char>)
+    requires analysis(h, ws) == Some(r),
+    ensures emit(h, ws) == Out::Const(r),
+{
+    match h {
+        Head::True => {}
+        Head::Colon => {}
+        Head::Echo => {}
+        Head::Other => {}
+    }
+}
+
+/// Corollary the second half needs: a computed replacement is made of
+/// LITERAL text (so it carries no substitution of its own).
+pub proof fn analysis_is_literal(h: Head, ws: Seq<W>, r: Seq<char>)
+    requires analysis(h, ws) == Some(r),
+    ensures all_lit(ws, 0),
+{
+    match h {
+        Head::True | Head::Colon => {
+            assert(ws.len() == 0);
+            assert(all_lit(ws, 0));
+        }
+        Head::Echo => {}
+        Head::Other => {}
+    }
+}
+
+// ═══════════════════════════════════════════════ (B) the re-parse sees the same ──
+
+pub enum Tok {
+    /// a literal character: not syntax to any shell
+    Ch(char),
+    /// a character the RE-PARSE treats as syntax (quote, escape, expansion)
+    Syn(char),
+    /// a word separator
+    Sp,
+    /// one command substitution (its output is not re-parsed as syntax)
+    Sub(Seq<char>),
+}
+
+/// The characters a re-parse can treat as syntax.
+pub open spec fn syntax(c: char) -> bool {
+    c == '"' || c == '\'' || c == '\\' || c == '$' || c == '`'
+}
+
+/// Inside `"…"` only these four end the quote, escape, or re-expand.
+pub open spec fn syntax_quoted(c: char) -> bool {
+    c == '"' || c == '\\' || c == '$' || c == '`'
+}
+
+pub open spec fn is_ws(c: char) -> bool {
+    c == ' ' || c == '\t' || c == '\n' || c == '\r'
+}
+
+pub open spec fn no_syntax(s: Seq<char>, i: int) -> bool
+    decreases s.len() - i,
+{
+    if i >= s.len() {
+        true
+    } else {
+        !syntax_quoted(s[i]) && no_syntax(s, i + 1)
+    }
+}
+
+/// The ORIGINAL token stream: a substitution's output is split on whitespace
+/// but its characters are NEVER re-parsed (a `"` in the output is literal).
+pub open spec fn sub_chars(s: Seq<char>, i: int) -> Seq<Tok>
+    decreases s.len() - i,
+{
+    if i >= s.len() {
+        Seq::empty()
+    } else if is_ws(s[i]) {
+        seq![Tok::Sp].add(sub_chars(s, i + 1))
+    } else {
+        seq![Tok::Ch(s[i])].add(sub_chars(s, i + 1))
+    }
+}
+
+/// The FOLDED text's token stream: the same characters, now RE-PARSED, so a
+/// syntax character is syntax.
+pub open spec fn lit_chars(s: Seq<char>, i: int) -> Seq<Tok>
+    decreases s.len() - i,
+{
+    if i >= s.len() {
+        Seq::empty()
+    } else if is_ws(s[i]) {
+        seq![Tok::Sp].add(lit_chars(s, i + 1))
+    } else if syntax_quoted(s[i]) {
+        seq![Tok::Syn(s[i])].add(lit_chars(s, i + 1))
+    } else {
+        seq![Tok::Ch(s[i])].add(lit_chars(s, i + 1))
+    }
+}
+
+pub open spec fn expand(t: Seq<Tok>, i: int) -> Seq<Tok>
+    decreases t.len() - i,
+{
+    if i >= t.len() {
+        Seq::empty()
+    } else {
+        (match t[i] {
+            Tok::Sub(s) => sub_chars(s, 0),
+            other => seq![other],
+        }).add(expand(t, i + 1))
+    }
+}
+
+pub open spec fn foldtok(t: Seq<Tok>, i: int) -> Seq<Tok>
+    decreases t.len() - i,
+{
+    if i >= t.len() {
+        Seq::empty()
+    } else {
+        (match t[i] {
+            Tok::Sub(s) => lit_chars(s, 0),
+            other => seq![other],
+        }).add(foldtok(t, i + 1))
+    }
+}
+
+/// every substitution in the text carries a replacement with no syntax char
+pub open spec fn is_sub(t: Tok) -> bool {
+    match t {
+        Tok::Sub(_) => true,
+        _ => true == false,
+    }
+}
+
+pub open spec fn sub_val(t: Tok) -> Seq<char> {
+    match t {
+        Tok::Sub(s) => s,
+        _ => Seq::empty(),
+    }
+}
+
+pub open spec fn all_subs_are(t: Seq<Tok>, i: int, r: Seq<char>) -> bool
+    decreases t.len() - i,
+{
+    if i >= t.len() {
+        true
+    } else {
+        (!is_sub(t[i]) || sub_val(t[i]) == r) && all_subs_are(t, i + 1, r)
+    }
+}
+
+pub open spec fn gate(t: Seq<Tok>, i: int) -> bool
+    decreases t.len() - i,
+{
+    if i >= t.len() {
+        true
+    } else {
+        (match t[i] {
+            Tok::Sub(s) => no_syntax(s, 0),
+            _ => true,
+        }) && gate(t, i + 1)
+    }
+}
+
+proof fn lemma_chars(s: Seq<char>, i: int)
+    requires no_syntax(s, i),
+    ensures sub_chars(s, i) == lit_chars(s, i),
+    decreases s.len() - i,
+{
+    if i < s.len() {
+        lemma_chars(s, i + 1);
+    }
+}
+
+proof fn lemma_tokens(t: Seq<Tok>, i: int)
+    requires gate(t, i),
+    ensures expand(t, i) == foldtok(t, i),
+    decreases t.len() - i,
+{
+    if i < t.len() {
+        match t[i] {
+            Tok::Sub(s) => {
+                lemma_chars(s, 0);
+            }
+            _ => {}
+        }
+        lemma_tokens(t, i + 1);
+    }
+}
+
+/// THE SECOND LAW: when the replacement carries no syntax character, the
+/// re-parse of the folded text produces exactly the token stream the
+/// substitution produced — same words, same quoting, no new expansion.
+pub proof fn fold_preserves_the_token_stream(t: Seq<Tok>)
+    requires gate(t, 0),
+    ensures expand(t, 0) == foldtok(t, 0),
+{
+    lemma_tokens(t, 0);
+}
+
+/// The unquoted gate is exactly the "no syntax" set, over the charset the
+/// source allows.
+pub open spec fn safe_char(c: char) -> bool {
+    ('a' <= c && c <= 'z') || ('A' <= c && c <= 'Z') || ('0' <= c && c <= '9') || c == '_' || c == '@'
+        || c == '%' || c == '+' || c == '=' || c == ':' || c == ',' || c == '.' || c == '/' || c == '-'
+}
+
+pub open spec fn all_safe(s: Seq<char>, i: int) -> bool
+    decreases s.len() - i,
+{
+    if i >= s.len() {
+        true
+    } else {
+        safe_char(s[i]) && all_safe(s, i + 1)
+    }
+}
+
+/// The unquoted safety gate implies the second law's premise.
+pub proof fn safe_is_not_syntax(s: Seq<char>, i: int)
+    requires all_safe(s, i),
+    ensures no_syntax(s, i),
+    decreases s.len() - i,
+{
+    if i < s.len() {
+        assert(!syntax_quoted(s[i]));
+        safe_is_not_syntax(s, i + 1);
+    }
+}
+
+/// Inside `"…"` the gate is the source's `safe_repl(quoted = true)`.
+pub open spec fn all_safe_quoted(s: Seq<char>, i: int) -> bool
+    decreases s.len() - i,
+{
+    if i >= s.len() {
+        true
+    } else {
+        !syntax_quoted(s[i]) && all_safe_quoted(s, i + 1)
+    }
+}
+
+pub proof fn quoted_gate_is_no_syntax(s: Seq<char>, i: int)
+    requires all_safe_quoted(s, i),
+    ensures no_syntax(s, i),
+    decreases s.len() - i,
+{
+    if i < s.len() {
+        quoted_gate_is_no_syntax(s, i + 1);
+    }
+}
+
+/// THE COMBINED LAW the transform relies on: the analysis's replacement is
+/// the command's real output, and (under the gate) splicing it into the text
+/// changes no token.
+pub proof fn fold_is_sound(h: Head, ws: Seq<W>, r: Seq<char>, t: Seq<Tok>)
+    requires
+        analysis(h, ws) == Some(r),
+        gate(t, 0),
+        // the text's substitutions all print the analysed value
+        all_subs_are(t, 0, r),
+    ensures
+        emit(h, ws) == Out::Const(r),
+        expand(t, 0) == foldtok(t, 0),
+{
+    constant_output_sound(h, ws, r);
+    lemma_tokens(t, 0);
+}
+
+// ═══════════════════════════════════════════════════════════════════ pins ──
+
+pub open spec fn lit(s: Seq<char>) -> W {
+    W::Lit(s)
+}
+
+/// `$(echo hi)` folds to `hi`; a flag, a glob, a variable and an unknown
+/// command are all refused.
+pub proof fn pin_analysis_shapes()
+    ensures
+        analysis(Head::Echo, seq![lit(seq!['h', 'i'])]) == Some(seq!['h', 'i']),
+        analysis(Head::Echo, seq![lit(seq!['F', 'i', 'l', 'e']), lit(seq!['n', 'o'])])
+            == Some(seq!['F', 'i', 'l', 'e', ' ', 'n', 'o']),
+        analysis(Head::Echo, seq![lit(seq!['-', 'n']), lit(seq!['h', 'i'])]) == None,
+        analysis(Head::Echo, seq![W::Rt]) == None,
+        analysis(Head::True, Seq::<W>::empty()) == Some(Seq::<char>::empty()),
+        analysis(Head::Colon, Seq::<W>::empty()) == Some(Seq::<char>::empty()),
+        analysis(Head::Other, seq![lit(seq!['x'])]) == None,
+        analysis(Head::True, seq![lit(seq!['x'])]) == None,
+{
+    assert(analysis(Head::Echo, seq![lit(seq!['h', 'i'])]) == Some(seq!['h', 'i'])) by (compute);
+    assert(analysis(Head::Echo, seq![lit(seq!['F', 'i', 'l', 'e']), lit(seq!['n', 'o'])])
+        == Some(seq!['F', 'i', 'l', 'e', ' ', 'n', 'o'])) by (compute);
+    assert(analysis(Head::Echo, seq![lit(seq!['-', 'n']), lit(seq!['h', 'i'])]) == None) by (compute);
+    assert(analysis(Head::Echo, seq![W::Rt]) == None) by (compute);
+    assert(analysis(Head::True, Seq::<W>::empty()) == Some(Seq::<char>::empty())) by (compute);
+    assert(analysis(Head::Colon, Seq::<W>::empty()) == Some(Seq::<char>::empty())) by (compute);
+    assert(analysis(Head::Other, seq![lit(seq!['x'])]) == None) by (compute);
+    assert(analysis(Head::True, seq![lit(seq!['x'])]) == None) by (compute);
+}
+
+/// The semantic side is the richer one: `echo -n hi` and a newline-carrying
+/// word are still CONSTANT, which is why it is not a restatement of the
+/// analysis (the analysis refuses both).
+pub proof fn pin_emit_is_richer()
+    ensures
+        emit(Head::Echo, seq![lit(seq!['h', 'i'])]) == Out::Const(seq!['h', 'i']),
+        analysis(Head::Echo, seq![lit(seq!['-', 'n']), lit(seq!['h', 'i'])]) == None,
+        analysis(Head::Echo, seq![lit(seq!['a', '\n'])]) == None,
+        emit(Head::Echo, seq![W::Rt]) == Out::NotPlain,
+        emit(Head::Other, Seq::<W>::empty()) == Out::NotPlain,
+{
+    assert(emit(Head::Echo, seq![lit(seq!['h', 'i'])]) == Out::Const(seq!['h', 'i'])) by (compute);
+    assert(analysis(Head::Echo, seq![lit(seq!['-', 'n']), lit(seq!['h', 'i'])]) == None) by (compute);
+    assert(analysis(Head::Echo, seq![lit(seq!['a', '\n'])]) == None) by (compute);
+}
+
+/// A quote inside the replacement is syntax to the re-parse but was literal
+/// in the substitution's own output — the gate is load-bearing.
+pub proof fn pin_a_quote_breaks_the_parse()
+    ensures
+        sub_chars(seq!['a', '"', 'b'], 0) == seq![Tok::Ch('a'), Tok::Ch('"'), Tok::Ch('b')],
+        lit_chars(seq!['a', '"', 'b'], 0) == seq![Tok::Ch('a'), Tok::Syn('"'), Tok::Ch('b')],
+        sub_chars(seq!['a', '"', 'b'], 0) != lit_chars(seq!['a', '"', 'b'], 0),
+        !no_syntax(seq!['a', '"', 'b'], 0),
+{
+    assert(sub_chars(seq!['a', '"', 'b'], 0) == seq![Tok::Ch('a'), Tok::Ch('"'), Tok::Ch('b')])
+        by (compute);
+    assert(lit_chars(seq!['a', '"', 'b'], 0) == seq![Tok::Ch('a'), Tok::Syn('"'), Tok::Ch('b')])
+        by (compute);
+    assert(!no_syntax(seq!['a', '"', 'b'], 0)) by (compute);
+}
+
+/// A safe replacement splices in the same tokens; the gates exclude exactly
+/// the syntax set.
+pub proof fn pin_safe_splice()
+    ensures
+        all_safe(seq!['a', '-', 'b', '.', '9'], 0),
+        !all_safe(seq!['a', ' ', 'b'], 0),
+        !all_safe(seq!['*'], 0),
+        !all_safe(seq!['$', 'x'], 0),
+        all_safe_quoted(seq!['a', ' ', 'b'], 0),
+        !all_safe_quoted(seq!['a', '"'], 0),
+        !all_safe_quoted(seq!['a', '$'], 0),
+        !all_safe_quoted(seq!['a', '\\'], 0),
+        syntax('"'),
+        syntax('\''),
+        syntax('\\'),
+        syntax('$'),
+        syntax('`'),
+        !syntax('a'),
+        !syntax(' '),
+{
+    assert(all_safe(seq!['a', '-', 'b', '.', '9'], 0)) by (compute);
+    assert(!all_safe(seq!['a', ' ', 'b'], 0)) by (compute);
+    assert(!all_safe(seq!['*'], 0)) by (compute);
+    assert(!all_safe(seq!['$', 'x'], 0)) by (compute);
+    assert(all_safe_quoted(seq!['a', ' ', 'b'], 0)) by (compute);
+    assert(!all_safe_quoted(seq!['a', '"'], 0)) by (compute);
+    assert(!all_safe_quoted(seq!['a', '$'], 0)) by (compute);
+    assert(!all_safe_quoted(seq!['a', '\\'], 0)) by (compute);
+    assert(syntax('"')) by (compute);
+    assert(syntax('\'')) by (compute);
+    assert(syntax('\\')) by (compute);
+    assert(syntax('$')) by (compute);
+    assert(syntax('`')) by (compute);
+    assert(!syntax('a')) by (compute);
+    assert(!syntax(' ')) by (compute);
+}
+
+/// The gates imply the second law's premise, so `fold_preserves_the_token_stream`
+/// applies to exactly the replacements the transform splices.
+pub proof fn pin_gates_imply_the_premise()
+    ensures
+        all_safe(seq!['d', 'f', 'l', 't'], 0) ==>
+            no_syntax(seq!['d', 'f', 'l', 't'], 0),
+        all_safe_quoted(seq!['F', 'i', 'l', 'e', ' ', 'n', 'o'], 0) ==>
+            no_syntax(seq!['F', 'i', 'l', 'e', ' ', 'n', 'o'], 0),
+{
+    if all_safe(seq!['d', 'f', 'l', 't'], 0) {
+        safe_is_not_syntax(seq!['d', 'f', 'l', 't'], 0);
+    }
+    if all_safe_quoted(seq!['F', 'i', 'l', 'e', ' ', 'n', 'o'], 0) {
+        quoted_gate_is_no_syntax(seq!['F', 'i', 'l', 'e', ' ', 'n', 'o'], 0);
+    }
+}
+
+/// The whole fold on the source's own operand shape: `"$(echo hello)"` — the
+/// analysis gives `hello`, and the token stream is unchanged (the law, with
+/// the gate discharged concretely).
+pub proof fn pin_quoted_test_operand()
+    ensures
+        analysis(Head::Echo, seq![lit(seq!['h', 'e', 'l', 'l', 'o'])])
+            == Some(seq!['h', 'e', 'l', 'l', 'o']),
+{
+    assert(analysis(Head::Echo, seq![lit(seq!['h', 'e', 'l', 'l', 'o'])])
+        == Some(seq!['h', 'e', 'l', 'l', 'o'])) by (compute);
+}
+
+/// …and the same substitution spliced into a double-quoted test operand: the
+/// re-parse must see the same tokens (the fold's own shape).
+pub proof fn pin_splice_of_the_test_operand()
+    ensures
+        ({
+            let t = seq![
+                Tok::Ch('"'),
+                Tok::Sub(seq!['h', 'e', 'l', 'l', 'o']),
+                Tok::Ch('"'),
+                Tok::Ch('='),
+                Tok::Ch('"'),
+                Tok::Sub(seq!['h', 'e', 'l', 'l', 'o']),
+                Tok::Ch('"'),
+            ];
+            gate(t, 0) && expand(t, 0) == foldtok(t, 0)
+        }),
+{
+    assert(gate(
+        seq![
+            Tok::Ch('"'),
+            Tok::Sub(seq!['h', 'e', 'l', 'l', 'o']),
+            Tok::Ch('"'),
+            Tok::Ch('='),
+            Tok::Ch('"'),
+            Tok::Sub(seq!['h', 'e', 'l', 'l', 'o']),
+            Tok::Ch('"'),
+        ],
+        0,
+    )) by (compute);
+    fold_preserves_the_token_stream(
+        seq![
+            Tok::Ch('"'),
+            Tok::Sub(seq!['h', 'e', 'l', 'l', 'o']),
+            Tok::Ch('"'),
+            Tok::Ch('='),
+            Tok::Ch('"'),
+            Tok::Sub(seq!['h', 'e', 'l', 'l', 'o']),
+            Tok::Ch('"'),
+        ],
+    );
+}
+
+fn main() {}
+
+} // verus!

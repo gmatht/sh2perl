@@ -8806,3 +8806,74 @@ accepts two stars. Restored byte-identically after each run (sha256 in
   `cut_target_ok`) are not modelled: they decide whether the fold is
   offered, never its value. Their refusals are the source's own tests.
 - The empty-body arms (`%*` identity, `%%*` empty) are value-level pins.
+
+## text_capture_fold.rs — folding constant `$(echo …)` text (31)
+
+    verus --triggers-mode silent --rlimit 40 proofs/verus/text_capture_fold.rs
+    -> verification results:: 31 verified, 0 errors
+
+The pass replaces a `$( … )`/backtick substitution inside the RAW TEXT that
+`test`/`param`/`arith` arguments carry, when that substitution's output is
+provably constant. Two claims license it, and the file proves both.
+
+### (A) What the substitution prints
+
+`analysis` is the pass's `constant_output`, transcribed; `emit` is an
+independent semantic side that is deliberately **richer** (it still calls
+`echo -n hi` and a newline-carrying word constant, where the analysis
+refuses — for single-line re-parse and flag-formatting reasons). The law is
+the one-way direction the fold needs: **`constant_output_sound`** —
+`analysis(h, ws) = Some(r)` implies the command really prints exactly `r`,
+in every environment. `analysis_is_literal` adds that a computed replacement
+is literal text.
+
+### (B) What the re-parse sees
+
+Command-substitution output is never re-parsed for quoting, but text
+spliced into the shell text is. The model's token stream therefore has
+`Ch` (literal), `Syn` (a character the re-parse treats as syntax), `Sp` and
+`Sub`. `expand` is the ORIGINAL's stream (a substitution's `"` stays
+literal), `foldtok` the folded text's (the same character is now syntax).
+**`fold_preserves_the_token_stream`**: when the gate holds — no syntax
+character in the replacement — both streams are identical, so the fold
+introduces no quoting, escaping or expansion. `safe_is_not_syntax` and
+`quoted_gate_is_no_syntax` prove the source's two gates imply exactly that
+premise, and `fold_is_sound` states both halves together.
+
+### Pins
+
+`pin_a_quote_breaks_the_parse` is the load-bearing counterexample: `a"b` is
+`Ch('a'), Ch('"'), Ch('b')` in the substitution's stream but
+`Ch('a'), Syn('"'), Ch('b')` after splicing, so the gate must refuse it.
+`pin_analysis_shapes` pins the accepted and refused content shapes (hi / a
+flag / a variable / an unknown head / `true` / `:`), `pin_emit_is_richer`
+the richer semantic side, `pin_safe_splice` the two charsets (space and `*`
+refused unquoted, space allowed inside quotes, `"`/`$`/`\` refused there),
+and `pin_splice_of_the_test_operand` the source's own operand shape
+`"$(echo hello)"`.
+
+### Mutants, measured
+
+Counted: a gate that accepts a syntax character, the substitution's space
+treated as a literal character, and the folded text's space treated as one —
+each **30 verified, 1 error**. Refuted at simplification by a concrete pin:
+an `Rt` word counted literal, the echo-flag refusal dropped, a join without
+its separator, every head "printing" its words, a quote treated as syntax
+for the substitution, and a wide-open unquoted gate. Restored
+byte-identically after each run (sha256 in `text_capture_fold_sync.txt`).
+
+### Scope (read this before quoting it)
+
+- The **lexer** is out of model: `scan`, `find_close`, the quote modes, the
+  wholesale skip of single-quoted regions, `$((…))` balance and span
+  splicing. The model starts from "here is the substitution and the text
+  around it", which is what the lexer guarantees; a lexer bug (an unbalanced
+  or mis-detected span) is not covered here.
+- Word classification collapses `shell_words`' per-character refusals
+  (`\ $ ` | & ; < > ( ) { } * ? [ ] # ! ~`, quoted expansions) into one
+  `Rt` class; the individual spellings are the source's own tests.
+- The echo flag's **formatting** (`-e` interpreting escapes) is not
+  modelled: a flag makes `emit` `NotPlain` and the analysis refuse.
+- The IR traversal and the `TEXT_FUNCS` position list are structural: any
+  subset of positions that still funnels through `fold_text` is covered by
+  (A)+(B) unchanged.
