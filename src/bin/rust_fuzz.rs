@@ -279,7 +279,14 @@ fn generate(rng: &mut Rng) -> String {
                     s.push_str("readonly R=\"$b\"\n");
                 }
                 s.push_str("R=\"$b-x\"\necho \"r=$R rc=$?\"\n");
-                s.push_str("rn() {\n  R=\"$b-y\"\n  echo \"rn-after\"\n}\nrn\necho \"rn=$R rc=$?\"\n");
+                // the function is DEFINED once per program: bash lets a
+                // script redefine one, the renderer emits one `fn` per name,
+                // and the two cases can be drawn twice (the same guard the
+                // other function cases use)
+                if !s.contains("rn() {") {
+                    s.push_str("rn() {\n  R=\"$b-y\"\n  echo \"rn-after\"\n}\n");
+                }
+                s.push_str("rn\necho \"rn=$R rc=$?\"\n");
                 s.push_str("if [ -n \"${b}x\" ]; then\n  R=\"$b-z\"\n  echo \"ri-after\"\nfi\necho \"ri=$R rc=$?\"\n");
                 s.push_str(
                     "for w in \"$b\" \"$c\"; do\n  R=\"$b-w\"\n  echo \"rf-after\"\ndone\necho \"rf=$R rc=$?\"\n",
