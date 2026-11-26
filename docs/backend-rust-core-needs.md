@@ -96,6 +96,54 @@ shape in `fixtures/rust_idiom/` whose output is not bash-identical.
 Right-assoc `**` → `__sh_pow` (wrapping semantics). NaN guard →
 `str::parse::<i64>()` error → the whole test is false ✓.
 
+### 5.2b Variable storage: `let` where provable, the store elsewhere
+
+The store is the fallback, not the rule. A scalar becomes a plain Rust binding
+when all of these hold:
+
+- every mention sits in ONE scope (`main`, or one user function);
+- its first mention is a top-level write in that scope (that is where the
+  `let` lands) and it is read at least once;
+- no mention is *pinned*: a closure body (`Capture`/`Lambda`/`Arrow`), a
+  separate-process construct (`( )`, `&`, a pipeline) or opaque asm;
+- no construct can reach the name dynamically: `eval`/`source` bail the whole
+  analysis; `export`/`readonly`/`unset`/`read`/`mapfile`/`getopts`/`set`/
+  `trap`/`printf -v` poison the name; `declare -n`/`-g` bail it; arrays,
+  assoc arrays and shell specials never promote.
+
+The shared `Use::risky` bit is deliberately not consulted — it models a
+renderer that lowers an argument through a *capturing* file-scope helper, and
+this renderer splices every read inline. `Use::pin` is the half that applies.
+
+That is what makes the emitted shapes match what a Rust programmer writes:
+
+```rust
+let mut count = 0;          // was: __SHV_count.with(|v| v.set(0))
+count += 1;                 // was: __SHV_count.with(|v| v.set(v.get() + 1))
+let name = "world".to_string();
+```
+
+and what keeps it sound where bash's dynamic scoping or a subshell would be
+violated: `value=1; show() { echo "$value"; }` keeps the static, and so does
+`$( n=$((n+1)); … )`. Fixtures 11–16 in `fixtures/rust_idiom/` pin both
+directions.
+
+### 5.2c Post-render specialization and the emitted-code contract
+
+- A `printf` whose format is a literal template of text, `%s` and `%%` is
+  turned into a `format!` at the call site, which retires the `__sh_printf`
+  interpreter (and its `atoi`/`atof`/`printf_b` cluster) from programs that
+  only ever format literals: `07_redirect.rs` went from 261 emitted lines to
+  44. Computed formats and the conversions the pass does not model (`%d`,
+  widths, `%b`, `%q`, `%c`) keep the interpreter.
+- Generated code carries no bare `.unwrap()`: a poisoned lock still yields its
+  data (`unwrap_or_else(|e| e.into_inner())`), the capture slot defaults to
+  the empty buffer, and a non-hex digit reads as 0.
+- The gate for all of this is `cargo run --bin rust_fixtures -- --check`
+  (stale check, A1-ingress parity, `rustc -D warnings` in debug *and* `-O`,
+  behaviour vs `bash`, idiom census) plus the differential net
+  `cargo run --bin rust_fuzz`.
+
 ### 5.3 Hygiene + hoisting
 Rust keywords: `fn/let/mut/if/else/while/for/loop/match/struct/enum/
 impl/trait/return/...` — A6 extends the hygiene pass. Rust also has

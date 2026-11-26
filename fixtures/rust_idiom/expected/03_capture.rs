@@ -51,7 +51,7 @@ fn __sh_print_words(ws: &[Vec<String>], nl: bool, esc: bool) {
     let mut used = false;
     __SH_OUTFILE_TL.with(|v| { if let Some(f) = v.borrow_mut().as_mut() { let _ = std::io::Write::write_all(f, s.as_bytes()); used = true; } });
     if used { return; }
-    if let Some(b) = __SH_OUT.lock().unwrap().as_mut() {
+    if let Some(b) = __SH_OUT.lock().unwrap_or_else(|e| e.into_inner()).as_mut() {
         b.extend_from_slice(s.as_bytes());
         return;
     }
@@ -62,15 +62,15 @@ fn __sh_spawn(cmd: &str, input: Option<&[u8]>) -> i32 {
     // a shell-out inside a native stage inherits the stage's stdin
     // (`echo x | grep -f <(…)` — the grep reads the echo's buffer)
     let mut input = input.map(|d| d.to_vec());
-    let stdin_path = __SH_STDIN_PATH.lock().unwrap().clone();
+    let stdin_path = __SH_STDIN_PATH.lock().unwrap_or_else(|e| e.into_inner()).clone();
     if input.is_none() && stdin_path.is_none() {
-        if let Some(mut r) = __SH_STDIN.lock().unwrap().take() {
+        if let Some(mut r) = __SH_STDIN.lock().unwrap_or_else(|e| e.into_inner()).take() {
             let mut d = Vec::new();
             let _ = std::io::Read::read_to_end(&mut r, &mut d);
             input = Some(d);
         }
     }
-    let want_out = __SH_OUT.lock().unwrap().is_some() || __SH_OUTFILE_TL.with(|v| v.borrow().is_some());
+    let want_out = __SH_OUT.lock().unwrap_or_else(|e| e.into_inner()).is_some() || __SH_OUTFILE_TL.with(|v| v.borrow().is_some());
     let mut c = std::process::Command::new("bash");
     c.arg("-c").arg(cmd);
     if !want_out {
@@ -102,7 +102,7 @@ fn __sh_spawn(cmd: &str, input: Option<&[u8]>) -> i32 {
         let mut used = false;
         __SH_OUTFILE_TL.with(|v| { if let Some(f) = v.borrow_mut().as_mut() { let _ = std::io::Write::write_all(f, &out); used = true; } });
         if !used {
-            if let Some(b) = __SH_OUT.lock().unwrap().as_mut() {
+            if let Some(b) = __SH_OUT.lock().unwrap_or_else(|e| e.into_inner()).as_mut() {
                 b.extend_from_slice(&out);
             } else {
                 let _ = std::io::Write::write_all(&mut std::io::stdout(), &out);
@@ -115,16 +115,16 @@ fn __sh_spawn(cmd: &str, input: Option<&[u8]>) -> i32 {
 fn main() {
     let files = {
     let __cap_oldout = __SH_OUTFILE_TL.with(|v| v.borrow_mut().take());
-    let __old = __SH_OUT.lock().unwrap().take();
-    *__SH_OUT.lock().unwrap() = Some(Vec::new());
-    let __cap_oldin = __SH_STDIN.lock().unwrap().take();
+    let __old = __SH_OUT.lock().unwrap_or_else(|e| e.into_inner()).take();
+    *__SH_OUT.lock().unwrap_or_else(|e| e.into_inner()) = Some(Vec::new());
+    let __cap_oldin = __SH_STDIN.lock().unwrap_or_else(|e| e.into_inner()).take();
     let __sh_pbuf0: Vec<u8> = Vec::new();
-    __SH_PIPESTATUS.lock().unwrap().clear();
+    __SH_PIPESTATUS.lock().unwrap_or_else(|e| e.into_inner()).clear();
     __SH_RC.store(__sh_spawn(&format!("{} | {}", __sh_wq(&vec!["ls".to_string(), "-1".to_string()]), __sh_wq(&vec!["wc".to_string(), "-l".to_string()])), Some(&__sh_pbuf0)), Ordering::SeqCst);
-    __SH_PIPESTATUS.lock().unwrap().push(__SH_RC.load(Ordering::SeqCst));
-    *__SH_STDIN.lock().unwrap() = __cap_oldin;
-    let __cap = __SH_OUT.lock().unwrap().take().unwrap();
-    *__SH_OUT.lock().unwrap() = __old;
+    __SH_PIPESTATUS.lock().unwrap_or_else(|e| e.into_inner()).push(__SH_RC.load(Ordering::SeqCst));
+    *__SH_STDIN.lock().unwrap_or_else(|e| e.into_inner()) = __cap_oldin;
+    let __cap = __SH_OUT.lock().unwrap_or_else(|e| e.into_inner()).take().unwrap_or_default();
+    *__SH_OUT.lock().unwrap_or_else(|e| e.into_inner()) = __old;
     __SH_OUTFILE_TL.with(|v| *v.borrow_mut() = __cap_oldout);
     let mut __s = String::from_utf8_lossy(&__cap).to_string();
     while __s.ends_with('\n') { __s.pop(); }

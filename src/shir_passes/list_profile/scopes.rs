@@ -35,6 +35,15 @@ pub enum Scope {
 pub struct Use {
     pub scope: Scope,
     pub risky: bool,
+    /// The mention sits where a host-language LOCAL cannot serve it: a
+    /// closure body (`Capture`/`Lambda`/`Arrow`, which a renderer may lower
+    /// to a capturing closure), a construct that runs in a separate process
+    /// (`Subshell`/`Background`/`Pipeline`), or opaque inline asm.
+    ///
+    /// Distinct from [`Use::risky`], which ALSO covers positions a renderer
+    /// merely embeds through a file-scope helper: a backend that splices
+    /// reads inline may ignore `risky`, but must honour `pin`.
+    pub pin: bool,
     /// The mention is a *write* (an assignment target / capture target /
     /// `VAR=x` envar / builtin `name=value` head) rather than a read.
     pub write: bool,
@@ -61,6 +70,7 @@ pub fn use_scopes(prog: &IrProgram) -> HashMap<String, Vec<Use>> {
         defined: &defined,
         scope: Scope::Main,
         risky: false,
+        pin: false,
         top: true,
     };
     for st in &prog.stmts {
@@ -85,6 +95,7 @@ struct Walker<'a> {
     defined: &'a HashSet<String>,
     scope: Scope,
     risky: bool,
+    pin: bool,
     top: bool,
 }
 
@@ -104,6 +115,7 @@ impl<'a> Walker<'a> {
         self.out.entry(name.to_string()).or_default().push(Use {
             scope: self.scope.clone(),
             risky: self.risky,
+            pin: self.pin,
             write,
             top: self.top,
         });
@@ -173,6 +185,16 @@ impl<'a> Walker<'a> {
         self.risky = true;
         body(self);
         self.risky = save;
+    }
+
+    /// Enter a construct that a host-language local binding cannot serve even
+    /// when reads are spliced inline (a closure body, a separate-process
+    /// construct, opaque asm). Implies `risky`.
+    fn with_pin(&mut self, body: impl FnOnce(&mut Self)) {
+        let save = self.pin;
+        self.pin = true;
+        self.with_risky(body);
+        self.pin = save;
     }
 
     /// A nested statement (inside an if/loop/block/…): mentions are not
@@ -404,7 +426,7 @@ impl<'a> Walker<'a> {
                 }
             }
             IrStmt::Pipeline { stages, .. } => {
-                self.with_risky(|w| {
+                self.with_pin(|w| {
                     for stage in stages {
                         for b in stage {
                             w.stmt(b);
@@ -459,7 +481,7 @@ impl<'a> Walker<'a> {
                 });
             }
             IrStmt::Subshell(body) | IrStmt::Background(body) => {
-                self.with_risky(|w| {
+                self.with_pin(|w| {
                     for b in body {
                         w.stmt(b);
                     }
@@ -491,7 +513,7 @@ impl<'a> Walker<'a> {
                 // inline asm operands: opaque codegen — risky mentions
                 // of nothing attributable (constraint strings are not
                 // var reads); still walk the operand exprs
-                self.with_risky(|w| {
+                self.with_pin(|w| {
                     for (_, e) in outputs.iter().chain(inputs) {
                         w.expr(e);
                     }
@@ -602,7 +624,7 @@ impl<'a> Walker<'a> {
                 }
             }
             IrExpr::Capture { expr, .. } => {
-                self.with_risky(|w| w.expr(expr));
+                self.with_pin(|w| w.expr(expr));
             }
             IrExpr::Regex { .. } => {}
             IrExpr::RawExpr(s) => {
@@ -612,7 +634,7 @@ impl<'a> Walker<'a> {
                 }
             }
             IrExpr::Arrow(body) => {
-                self.with_risky(|w| {
+                self.with_pin(|w| {
                     for b in body {
                         w.stmt(b);
                     }
@@ -626,7 +648,7 @@ impl<'a> Walker<'a> {
             IrExpr::ArrayComp { iter, elem, cond, .. } => {
                 // comp var is a binding — skip; the comprehension
                 // desugars to a loop (inline), but treat conservatively
-                self.with_risky(|w| {
+                self.with_pin(|w| {
                     w.expr(iter);
                     w.expr(elem);
                     if let Some(c) = cond {
@@ -636,7 +658,7 @@ impl<'a> Walker<'a> {
             }
             IrExpr::Lambda { body, .. } => {
                 // params are bindings — skip; body is a closure
-                self.with_risky(|w| {
+                self.with_pin(|w| {
                     for b in body {
                         w.stmt(b);
                     }
@@ -1055,8 +1077,8 @@ mod owner_tests {
     #[test]
     fn single_safe_function_scope_has_owner() {
         let uses = vec![
-            Use { scope: Scope::Func("f".to_string()), risky: false, write: false, top: true },
-            Use { scope: Scope::Func("f".to_string()), risky: false, write: false, top: true },
+            Use { scope: Scope::Func("f".to_string()), risky: false, pin: false, write: false, top: true },
+            Use { scope: Scope::Func("f".to_string()), risky: false, pin: false, write: false, top: true },
         ];
         assert_eq!(local_owner(&uses), Some("f".to_string()));
     }
@@ -1064,8 +1086,8 @@ mod owner_tests {
     #[test]
     fn risky_use_forces_global() {
         let uses = vec![
-            Use { scope: Scope::Func("f".to_string()), risky: false, write: false, top: true },
-            Use { scope: Scope::Func("f".to_string()), risky: true, write: false, top: true },
+            Use { scope: Scope::Func("f".to_string()), risky: false, pin: false, write: false, top: true },
+            Use { scope: Scope::Func("f".to_string()), risky: true, pin: false, write: false, top: true },
         ];
         assert_eq!(local_owner(&uses), None);
     }
@@ -1073,8 +1095,8 @@ mod owner_tests {
     #[test]
     fn local_scope_includes_main() {
         let uses = vec![
-            Use { scope: Scope::Main, risky: false, write: false, top: true },
-            Use { scope: Scope::Main, risky: false, write: false, top: true },
+            Use { scope: Scope::Main, risky: false, pin: false, write: false, top: true },
+            Use { scope: Scope::Main, risky: false, pin: false, write: false, top: true },
         ];
         assert_eq!(local_scope(&uses), Some(Scope::Main));
         assert_eq!(local_owner(&uses), None);
@@ -1082,7 +1104,7 @@ mod owner_tests {
 
     #[test]
     fn main_scope_stays_global() {
-        let uses = vec![Use { scope: Scope::Main, risky: false, write: false, top: true }];
+        let uses = vec![Use { scope: Scope::Main, risky: false, pin: false, write: false, top: true }];
         assert_eq!(local_owner(&uses), None);
     }
 }

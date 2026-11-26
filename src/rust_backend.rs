@@ -3,10 +3,17 @@
 //! `shir_to_rust(&IrProgram) -> String`.
 //!
 //! Lowering model (mirrors the proven C backend, `backends/c/src/c_backend.rs`):
-//!   - every shell variable becomes a `thread_local!` static (Cell<i64> for
+//!   - storage: a scalar that is provably confined to ONE scope becomes a
+//!     plain Rust `let` (`let mut count = 0; count += 1` — pass-2 promotion),
+//!     and everything else becomes a `thread_local!` static (Cell<i64> for
 //!     A2-Int vars, RefCell<String> for Str/Any, RefCell<Vec<String>> for
 //!     index arrays, RefCell<BTreeMap<String,String>> for assoc arrays) so
-//!     function bodies can read/write the same globals as main;
+//!     function bodies can read/write the same globals as main. Promotion is
+//!     refused for any name a closure or process boundary reaches (a `pin`),
+//!     for arrays/assoc, for shell specials, and for anything a dynamic-name
+//!     builtin can reach (`eval`/`source` bail the analysis; `export`,
+//!     `read`, `unset`, `printf -v`, `declare -n`/`-g`, `trap`, … poison the
+//!     name). See `compute_local_vars` and `fixtures/rust_idiom/README.md`;
 //!   - native lowering for the builtins the corpus actually uses: echo
 //!     (with -n/-e/-E), printf (full conversion spec), cd/export/local/
 //!     declare/unset/set/shift/read (IFS field split)/let/sleep/pwd/wait/
@@ -25,6 +32,17 @@
 //!     child processes for text-reconstructable bodies, threads otherwise);
 //!   - everything outside the lowable subset emits a `// TODO(unsupported)`
 //!     marker — the output ALWAYS compiles with bare `rustc`.
+//!
+//!   - the finished text then goes through post-render passes that can only
+//!     rewrite what they recognise (so they cannot miscompile): `cat_peephole`,
+//!     `strip_str_lit_refs`, `specialize_literal_printf` (a literal format
+//!     template becomes a `format!`, which retires the `__sh_printf`
+//!     interpreter for programs that only ever format literals),
+//!     `inline_simple_helpers`, `idiom_peephole` (compound assignment, no
+//!     single-use `.clone()`, no dead `__SH_RET` register), `prune_unused_helpers`
+//!     (identifier-bounded), `prune_unused_statics`, `unwrap_policy` (no bare
+//!     `.unwrap()` in generated code). The differential net for these passes is
+//!     `cargo run --bin rust_fuzz`.
 //!
 //! Shell-outs run through `bash -c` (the reference shell — the corpus gate
 //! diffs against bash) with word-quoting applied at runtime
@@ -1413,6 +1431,36 @@ fn inline_print_words(text: &mut String) {
 /// text just inside the `}` is `;  __b ` (or `; __b ` or a newline-
 /// separated variant), and replaces the whole wrapper with the bare
 /// expression.
+/// Does `s` contain a `;` outside any bracket/paren/brace and outside a
+/// string literal? (i.e. more than one Rust statement)
+fn has_top_level_semi(s: &str) -> bool {
+    let b = s.as_bytes();
+    let mut depth = 0i32;
+    let mut i = 0usize;
+    while i < b.len() {
+        match b[i] {
+            b'"' => {
+                i += 1;
+                while i < b.len() {
+                    if b[i] == b'\\' {
+                        i += 2;
+                    } else if b[i] == b'"' {
+                        break;
+                    } else {
+                        i += 1;
+                    }
+                }
+            }
+            b'(' | b'[' | b'{' => depth += 1,
+            b')' | b']' | b'}' => depth -= 1,
+            b';' if depth == 0 => return true,
+            _ => {}
+        }
+        i += 1;
+    }
+    false
+}
+
 fn simplify_let_b(mut text: String) -> String {
     let prefix = "{ let __b = ";
     let mut search_from = 0usize;
@@ -1480,6 +1528,16 @@ fn simplify_let_b(mut text: String) -> String {
             }
         };
         if expr.is_empty() {
+            search_from = at + prefix.len();
+            continue;
+        }
+        // A MULTI-statement block (`{ let __b = A; __SH_RC.store(…); __b }`,
+        // the shape a status-tracking loop condition keeps) is NOT an
+        // expression wrapper: inlining it spliced `__SH_RC.store(…)` straight
+        // into the `while`/`if` condition — `while cond; store(…) {`, invalid
+        // Rust (found by `cargo run --bin rust_fuzz`). The block is already a
+        // valid expression, so leave it alone.
+        if has_top_level_semi(expr) {
             search_from = at + prefix.len();
             continue;
         }
@@ -1896,6 +1954,55 @@ fn golf_rust(text: &str) -> String {
 /// A helper is "called" when its name appears on a line OTHER than its
 /// own signature line. Comments mentioning the name don't count, so the
 /// definition's doc/comments are ignored.
+/// Is `name` mentioned in `line` as a whole identifier (`__sh_q` does not
+/// match inside `__sh_q_printf`)?
+fn mentions_ident(line: &str, name: &str) -> bool {
+    let mut from = 0usize;
+    while let Some(k) = line[from..].find(name) {
+        let at = from + k;
+        let before_ok = at == 0
+            || !(line.as_bytes()[at - 1].is_ascii_alphanumeric() || line.as_bytes()[at - 1] == b'_');
+        let after = line[at + name.len()..].chars().next();
+        let after_ok = !after
+            .map(|c| c.is_ascii_alphanumeric() || c == '_')
+            .unwrap_or(false);
+        if before_ok && after_ok {
+            return true;
+        }
+        from = at + name.len();
+    }
+    false
+}
+
+/// Drop `use std::sync::atomic::Ordering;` when nothing else mentions
+/// `Ordering` (a helper/static prune can orphan it, and the emitted program
+/// is compiled with `-D warnings`).
+fn prune_unused_ordering_import(text: String) -> String {
+    const USE: &str = "use std::sync::atomic::Ordering;";
+    if !text.contains(USE) {
+        return text;
+    }
+    let uses = text.matches("Ordering").count();
+    if uses > 1 {
+        return text;
+    }
+    let mut out: Vec<&str> = Vec::new();
+    let mut dropped = false;
+    for line in text.lines() {
+        if !dropped && line.trim() == USE {
+            dropped = true;
+            continue;
+        }
+        out.push(line);
+    }
+    // collapse the blank line the import left behind at the top
+    let mut s = out.join("\n");
+    while s.starts_with("\n\n") {
+        s.remove(0);
+    }
+    s
+}
+
 fn prune_unused_helpers(text: String) -> String {
     // EVERY registered helper, by its RENDERED `fn __sh_*` name — derived
     // from the registry itself (`HELPER_ORDER` × `helper_source`), so a
@@ -1928,6 +2035,10 @@ fn prune_unused_helpers(text: String) -> String {
                 continue;
             };
             // is the name mentioned on any other non-comment line?
+            // IDENTIFIER boundaries, not substring: `__sh_printf_b`'s own
+            // definition otherwise counts as a call of `__sh_printf` (and
+            // `__sh_q_printf` as a call of `__sh_q`), so a helper whose every
+            // caller was pruned kept its whole cluster alive.
             let called = lines.iter().enumerate().any(|(j, l)| {
                 if j == i {
                     return false;
@@ -1936,7 +2047,7 @@ fn prune_unused_helpers(text: String) -> String {
                 if lt.starts_with("//") {
                     return false;
                 }
-                l.contains(*name)
+                mentions_ident(l, name)
             });
             if !called {
                 // drop the whole definition: the signature line + body until
@@ -2077,6 +2188,247 @@ fn prune_unused_statics(text: String) -> String {
 // `strip_str_lit_refs`. It runs last among the shaping passes (after
 // `inline_simple_helpers`, which is what turns `print_words` into
 // `println!`) and before the pruning passes, which clean up after it.
+
+/// Escape text as a Rust string literal (`"a\nb"`). No lossy-marker
+/// handling: callers that can see the raw-byte markers must go through
+/// `Render::rust_str` first.
+fn rust_str_lit(s: &str) -> String {
+    let mut out = String::new();
+    out.push('"');
+    for c in s.chars() {
+        match c {
+            '\\' => out.push_str("\\\\"),
+            '"' => out.push_str("\\\""),
+            '\n' => out.push_str("\\n"),
+            '\t' => out.push_str("\\t"),
+            '\r' => out.push_str("\\r"),
+            c if (c as u32) < 32 => out.push_str(&format!("\\x{:02x}", c as u32)),
+            c => out.push(c),
+        }
+    }
+    out.push('"');
+    out
+}
+
+/// Decode the body of a Rust string literal that the renderer emitted
+/// (`"a\nb"` → `a<NL>b`). `None` for anything else (an interpolated or
+/// non-literal argument).
+fn parse_rust_str_lit(lit: &str) -> Option<String> {
+    let lit = lit.trim();
+    if !lit.starts_with('"') || !lit.ends_with('"') || lit.len() < 2 {
+        return None;
+    }
+    let mut out = String::new();
+    let mut it = lit[1..lit.len() - 1].chars().peekable();
+    while let Some(c) = it.next() {
+        if c != '\\' {
+            out.push(c);
+            continue;
+        }
+        match it.next()? {
+            'n' => out.push('\n'),
+            't' => out.push('\t'),
+            'r' => out.push('\r'),
+            '0' => out.push('\0'),
+            '\\' => out.push('\\'),
+            '"' => out.push('"'),
+            '\'' => out.push('\''),
+            'x' => {
+                let h: String = [it.next()?, it.next()?].iter().collect();
+                out.push(u8::from_str_radix(&h, 16).ok()? as char);
+            }
+            'u' => {
+                if it.next()? != '{' {
+                    return None;
+                }
+                let mut h = String::new();
+                for c in it.by_ref() {
+                    if c == '}' {
+                        break;
+                    }
+                    h.push(c);
+                }
+                out.push(char::from_u32(u32::from_str_radix(&h, 16).ok()?)?);
+            }
+            other => {
+                out.push('\\');
+                out.push(other);
+            }
+        }
+    }
+    Some(out)
+}
+
+/// Apply printf's OWN backslash escapes to a literal format string.
+/// `None` on `%c` (truncates) or an unterminated escape — the interpreter
+/// keeps those.
+fn printf_unescape(fmt: &str) -> Option<String> {
+    let mut out = String::new();
+    let mut ch = fmt.chars().peekable();
+    while let Some(c) = ch.next() {
+        if c != '\\' {
+            out.push(c);
+            continue;
+        }
+        match ch.next()? {
+            'n' => out.push('\n'),
+            't' => out.push('\t'),
+            'r' => out.push('\r'),
+            'a' => out.push('\x07'),
+            'b' => out.push('\x08'),
+            'f' => out.push('\x0c'),
+            'v' => out.push('\x0b'),
+            'e' => out.push('\x1b'),
+            '\\' => out.push('\\'),
+            '"' => out.push('"'),
+            '\'' => out.push('\''),
+            'c' => return None,
+            '0'..='7' => {
+                let mut n = c.to_digit(8)?;
+                for _ in 0..2 {
+                    match ch.peek() {
+                        Some(d) if ('0'..='7').contains(d) => {
+                            n = n * 8 + ch.next()?.to_digit(8)?;
+                        }
+                        _ => break,
+                    }
+                }
+                out.push(char::from_u32(n & 0xff)?);
+            }
+            'x' => {
+                let mut n = 0u32;
+                let mut k = 0;
+                while k < 2 {
+                    match ch.peek().and_then(|d| d.to_digit(16)) {
+                        Some(d) => {
+                            n = n * 16 + d;
+                            ch.next();
+                            k += 1;
+                        }
+                        None => break,
+                    }
+                }
+                if k == 0 {
+                    out.push('x');
+                } else {
+                    out.push(char::from_u32(n)?);
+                }
+            }
+            other => {
+                out.push('\\');
+                out.push(other);
+            }
+        }
+    }
+    Some(out)
+}
+
+/// Constant-argument specialization: `__sh_printf("<literal fmt>", &[…])`
+/// whose format needs nothing but text, `%s` and `%%` becomes a `format!`
+/// at the call site.
+///
+/// That is what retires the ~260-line `__sh_printf` interpreter: a program
+/// that only ever formats a literal template (`printf '%s\n' "$x"`) never
+/// needs the interpreter, and `prune_unused_helpers` then drops it together
+/// with its `atoi`/`atou`/`atof`/`printf_b`/`q_printf` dependencies. The
+/// interpreter stays for computed formats and for the conversions this does
+/// not model (`%d`, widths, `%b`, `%q`, `%c`).
+fn specialize_literal_printf(t: &str) -> String {
+    let mut out = String::new();
+    let mut i = 0usize;
+    const NEEDLE: &str = "__sh_printf(";
+    while let Some(p) = t[i..].find(NEEDLE) {
+        let at = i + p;
+        let open = at + NEEDLE.len() - 1;
+        let Some(close) = scan_matching(t, open) else {
+            break;
+        };
+        out.push_str(&t[i..at]);
+        match literal_printf_replacement(&t[open + 1..close]) {
+            Some(repl) => out.push_str(&repl),
+            None => out.push_str(&t[at..=close]),
+        }
+        i = close + 1;
+    }
+    out.push_str(&t[i..]);
+    out
+}
+
+/// `"fmt", &args` → the `format!` that computes the same string, when the
+/// shape is fully static. See [`specialize_literal_printf`].
+fn literal_printf_replacement(inner: &str) -> Option<String> {
+    let ranges = top_comma_ranges(inner);
+    if ranges.is_empty() || ranges.len() > 2 {
+        return None;
+    }
+    let fmt_lit = &inner[ranges[0].0..ranges[0].1];
+    let fmt = printf_unescape(&parse_rust_str_lit(fmt_lit)?)?;
+    // walk the format: text, `%%`, `%s` only
+    let mut chunks: Vec<String> = vec![String::new()];
+    let mut ns = 0usize;
+    let mut it = fmt.chars().peekable();
+    while let Some(c) = it.next() {
+        if c != '%' {
+            chunks.last_mut()?.push(c);
+            continue;
+        }
+        match it.next()? {
+            '%' => chunks.last_mut()?.push('%'),
+            's' => {
+                ns += 1;
+                chunks.push(String::new());
+            }
+            // any flag/width/conversion this pass does not model
+            _ => return None,
+        }
+    }
+    if ranges.len() == 1 {
+        if ns != 0 {
+            return None;
+        }
+        return Some(format!("{}.to_string()", rust_str_lit(&chunks.concat())));
+    }
+    let args_src = inner[ranges[1].0..ranges[1].1].trim();
+    let args = args_src
+        .strip_prefix("&vec![")
+        .and_then(|r| r.strip_suffix(']'))
+        .or_else(|| args_src.strip_prefix('&').and_then(|r| r.strip_prefix('[')).and_then(|r| r.strip_suffix(']')))?;
+    if args.trim().is_empty() {
+        return None;
+    }
+    let arg_ranges = top_comma_ranges(args);
+    if arg_ranges.len() != ns {
+        return None;
+    }
+    // "<chunk0>{}<chunk1>{}…", a, b
+    let mut fmt_src = String::new();
+    for (i, c) in chunks.iter().enumerate() {
+        if i > 0 {
+            fmt_src.push_str("{}");
+        }
+        fmt_src.push_str(c);
+    }
+    let mut out = format!("format!({}", rust_str_lit(&fmt_src));
+    for r in &arg_ranges {
+        out.push_str(", ");
+        out.push_str(args[r.0..r.1].trim());
+    }
+    out.push(')');
+    Some(out)
+}
+
+/// No bare `.unwrap()` in emitted code — a generated program must not abort
+/// on a poisoned lock or a malformed digit. A poisoned mutex still hands
+/// back its data (the shell has no notion of poisoning), `Option::take()`
+/// of the capture slot defaults to the empty buffer, and a non-hex digit
+/// reads as 0 (the byte loop has already checked `is_ascii_hexdigit`).
+fn unwrap_policy(t: &str) -> String {
+    let mut s = t.replace(".lock().unwrap()", ".lock().unwrap_or_else(|e| e.into_inner())");
+    s = s.replace(".take().unwrap()", ".take().unwrap_or_default()");
+    s = s.replace(".to_digit(16).unwrap()", ".to_digit(16).unwrap_or(0)");
+    s
+}
+
 fn idiom_peephole(text: &str) -> String {
     let mut t = text.to_string();
     t = inline_format_wrappers(t);
@@ -2972,6 +3324,15 @@ pub fn shir_to_rust(prog: &IrProgram) -> String {
     // Strip `&"literal".to_string()` → `"literal"`: a textual peephole that
     // is sound because the `&` is always used to feed a `&str` parameter.
     let text = strip_str_lit_refs(&text);
+    // Constant-argument specialization: a `__sh_printf` call whose format is
+    // a literal template of text/`%s`/`%%` becomes a `format!` here, which
+    // lets the whole interpreter (and its `atoi`/`atof`/`printf_b` cluster)
+    // fall out of the program in `prune_unused_helpers` below.
+    let text = specialize_literal_printf(&text);
+    // (`unwrap_policy` runs at the END: `inline_simple_helpers` matches the
+    // sink-check text `__SH_OUT.lock().unwrap()` exactly, and rewriting it
+    // early made a capture look sink-dead — which turned a captured echo
+    // into a direct `println!` that escaped the capture.)
     // Inline simple shell helpers that have a trivial idiomatic-Rust
     // expansion (`__sh_len`, `__sh_env`, `__sh_fexists`, `__sh_puts`,
     // `__sh_print_words`).  Only the `print_words` rewrite is gated on
@@ -2986,10 +3347,18 @@ pub fn shir_to_rust(prog: &IrProgram) -> String {
     let text = idiom_peephole(&text);
     let text = prune_unused_helpers(text);
     let text = prune_unused_statics(text);
+    // The statics/helpers above may have been the only `Ordering` users; an
+    // unused import is a `-D warnings` failure in the generated program.
+    let text = prune_unused_ordering_import(text);
     // Dead `let x = <literal>;` bindings are only recognisable once the
     // runtime statics they shadow (`__SHV_x`, still referenced by a
     // closure parameter until the prune above) are out of the text.
     let text = drop_dead_literal_lets(&text);
+    // Cosmetic, so it runs after every structural pass: generated code never
+    // carries a bare `.unwrap()` (a poisoned lock still hands back its data,
+    // the capture slot defaults to the empty buffer, a non-hex digit is 0 —
+    // the byte loop already checked `is_ascii_hexdigit`).
+    let text = unwrap_policy(&text);
     // `-Oz` golf: strip comments/whitespace and shorten every
     // renderer-owned identifier. Runs LAST (after all pruning passes,
     // so only live names enter the short pool).
@@ -3777,21 +4146,7 @@ impl Render {
             out.push_str("]) })");
             return out;
         }
-        let mut out = String::new();
-        out.push('"');
-        for c in s.chars() {
-            match c {
-                '\\' => out.push_str("\\\\"),
-                '"' => out.push_str("\\\""),
-                '\n' => out.push_str("\\n"),
-                '\t' => out.push_str("\\t"),
-                '\r' => out.push_str("\\r"),
-                c if (c as u32) < 32 => out.push_str(&format!("\\x{:02x}", c as u32)),
-                c => out.push(c),
-            }
-        }
-        out.push('"');
-        out
+        rust_str_lit(s)
     }
 
     fn rust_str_expr(s: &str) -> String {
@@ -17193,6 +17548,99 @@ fn ident_tokens(s: &str) -> Vec<String> {
 /// or a `source` that can write anything).
 fn dynamic_var_names(prog: &IrProgram) -> Option<BTreeSet<String>> {
     let mut out = BTreeSet::new();
+    /// Walk the words of a command whose HEAD is a name-taking builtin.
+    ///
+    /// `true` = keep going. `false` = a construct can reach a name the walk
+    /// cannot see, so the whole verdict bails. Name words (`NAME`, `NAME=v`)
+    /// are poisoned: a promoted `let` would lose the `export`/`read`/`unset`
+    /// side of the name.
+    ///
+    /// `local`/`declare`/`typeset` do NOT poison (a function-local binding is
+    /// exactly what pass-2 promotion renders as a `let`) — but `-n`
+    /// (nameref) and `-g` (write the global) make the name dynamic and bail.
+    fn head_poison(head: &str, args: &[IrExpr], out: &mut BTreeSet<String>) -> bool {
+        // the exec argv shape nests the words in ONE `Array`
+        let flat: Vec<&IrExpr> = args
+            .iter()
+            .flat_map(|a| match a {
+                IrExpr::Array(items) => items.iter().collect(),
+                other => vec![other],
+            })
+            .collect();
+        let args: &[&IrExpr] = &flat;
+        match head {
+            // can write any name at all
+            "." | "source" | "eval" => return false,
+            "let" => {
+                for a in args {
+                    if let IrExpr::Str(t, _) = *a {
+                        for v in ident_tokens(t) {
+                            out.insert(v);
+                        }
+                    } else if !walk_expr(*a, out) {
+                        return false;
+                    }
+                }
+                return true;
+            }
+            "unset" | "read" | "mapfile" | "readarray" | "getopts" | "set" | "trap"
+            | "export" | "readonly" => {
+                for a in args {
+                    if let IrExpr::Str(t, _) = *a {
+                        if let Some(h) = assign_word_head(t) {
+                            out.insert(h.to_string());
+                        } else if is_ident_word(t) {
+                            out.insert(t.clone());
+                        }
+                    } else if !walk_expr(*a, out) {
+                        return false;
+                    }
+                }
+                return true;
+            }
+            "printf" => {
+                // `printf -v NAME fmt …` writes NAME
+                let mut prev_v = false;
+                for a in args {
+                    if let IrExpr::Str(t, _) = *a {
+                        if prev_v {
+                            if let Some(h) = assign_word_head(t) {
+                                out.insert(h.to_string());
+                            } else if is_ident_word(t) {
+                                out.insert(t.clone());
+                            }
+                            prev_v = false;
+                        } else if t == "-v" || t == "-vT" {
+                            prev_v = true;
+                        }
+                    } else if !walk_expr(*a, out) {
+                        return false;
+                    }
+                }
+                return true;
+            }
+            "local" | "declare" | "typeset" => {
+                for a in args {
+                    if let IrExpr::Str(t, _) = *a {
+                        if t == "-n" || t == "-g" || t.starts_with("-n") || t.starts_with("-g") {
+                            return false;
+                        }
+                    } else if !walk_expr(*a, out) {
+                        return false;
+                    }
+                }
+                return true;
+            }
+            _ => {}
+        }
+        for a in args {
+            if !walk_expr(*a, out) {
+                return false;
+            }
+        }
+        true
+    }
+
     fn walk_expr(e: &IrExpr, out: &mut BTreeSet<String>) -> bool {
         match e {
             IrExpr::Call { func, args } => {
@@ -17210,9 +17658,14 @@ fn dynamic_var_names(prog: &IrProgram) -> Option<BTreeSet<String>> {
                 // become a pass-2 local (then the post-render guard trips).
                 if matches!(func.as_str(), "builtin" | "exec" | "callDirect") {
                     if let Some(IrExpr::Str(head, _)) = args.first() {
-                        if matches!(head.as_str(), "." | "source" | "eval") {
+                        // the decl/name family reaches names by WORD: same
+                        // verdict the Exec arm applies (`export COUNT=1`
+                        // arrives in this Call shape, and skipping it let a
+                        // promoted `let` silently drop the export)
+                        if !head_poison(head, &args[1..], out) {
                             return false;
                         }
+                        return true;
                     }
                 }
                 for a in args {
@@ -17246,64 +17699,13 @@ fn dynamic_var_names(prog: &IrProgram) -> Option<BTreeSet<String>> {
                     }
                 };
                 match head {
-                    // can write any name at all
-                    Some("source") | Some(".") => return false,
-                    Some(c) if matches!(c, "eval" | "let") => {
-                        for a in args {
-                            if let IrExpr::Str(t, _) = a {
-                                for v in ident_tokens(t) {
-                                    out.insert(v);
-                                }
-                            } else if !walk_expr(a, out) {
-                                return false;
-                            }
+                    // Name-taking builtin: poison the names it reaches.
+                    Some(h) => {
+                        if !head_poison(h, args, out) {
+                            return false;
                         }
                     }
-                    Some(c)
-                        if matches!(
-                            c,
-                            "unset" | "read" | "mapfile" | "readarray" | "getopts" | "set"
-                                | "declare" | "typeset" | "local" | "export" | "readonly"
-                                | "trap"
-                        ) =>
-                    {
-                        let mut printf_v = false;
-                        for a in args {
-                            if let IrExpr::Str(t, _) = a {
-                                if c == "printf" {
-                                    printf_v = t == "-v";
-                                } else if let Some(h) = assign_word_head(t) {
-                                    out.insert(h.to_string());
-                                } else if is_ident_word(t) {
-                                    out.insert(t.clone());
-                                }
-                            } else if !walk_expr(a, out) {
-                                return false;
-                            }
-                        }
-                        let _ = printf_v;
-                    }
-                    Some("printf") => {
-                        // `printf -v NAME fmt …` writes NAME
-                        let mut prev_v = false;
-                        for a in args {
-                            if let IrExpr::Str(t, _) = a {
-                                if prev_v {
-                                    if let Some(h) = assign_word_head(t) {
-                                        out.insert(h.to_string());
-                                    } else if is_ident_word(t) {
-                                        out.insert(t.clone());
-                                    }
-                                    prev_v = false;
-                                } else if t == "-v" || t == "-vT" {
-                                    prev_v = true;
-                                }
-                            } else if !walk_expr(a, out) {
-                                return false;
-                            }
-                        }
-                    }
-                    _ => {
+                    None => {
                         for a in args {
                             if !walk_expr(a, out) {
                                 return false;
@@ -17815,10 +18217,21 @@ fn loop_var_scan_arith(a: &ArithAst, var: &str, u: &mut LoopVarUse) {
     }
 }
 
-/// Pass-2 locals: scalar vars whose every mention sits in a single
-/// non-risky scope (main or one user function). Arrays/assoc keep global
-/// storage (the list lowering owns them), and anything a dynamic-name
-/// builtin can reach stays global too.
+/// Pass-2 locals: scalar vars whose every mention sits in a single scope
+/// (main, or one user function) and none of whose mentions is PINNED. Arrays
+/// and assoc keep global storage (the list lowering owns them), and anything
+/// a dynamic-name builtin can reach (`export`, `read`, `unset`,
+/// `printf -v`, `trap`, `eval`/`source`, … — see `dynamic_var_names`) stays
+/// global too.
+///
+/// The shared [`crate::shir_passes::list_profile::local_scope`] also refuses
+/// a name with any `risky` mention. That bit models a renderer that lowers an
+/// argument through a FILE-SCOPE helper which captures the value; this
+/// renderer splices every read inline (`read_str`/`read_num` hand back
+/// `self.tls(name)`), so `s="x"; if [[ "$s" == *x* ]]` can be a plain `let`.
+/// What still cannot be a local is a PINNED mention — a closure body, a
+/// separate-process construct (`( )`, `&`, a pipeline) or opaque asm; those
+/// keep the whole name global.
 fn compute_local_vars(
     prog: &IrProgram,
     arrays: &BTreeSet<String>,
@@ -17830,12 +18243,19 @@ fn compute_local_vars(
     BTreeSet<String>,
     BTreeSet<String>,
 ) {
-    use crate::shir_passes::list_profile::{local_scope, use_scopes, Scope};
+    use crate::shir_passes::list_profile::{use_scopes, Scope};
     let mut need_mut: BTreeSet<String> = BTreeSet::new();
     let mut dead_init: BTreeSet<String> = BTreeSet::new();
     let Some(dyns) = dynamic_var_names(prog) else {
         return (HashMap::new(), need_mut, dead_init);
     };
+    // A nameref (`declare -n ref=target`) aliases storage by RUNTIME name and
+    // can be retargeted (`ref=other`), so no name in such a program is
+    // provably local. Refusing the whole program is the sound answer and
+    // costs nothing on real scripts.
+    if program_binds_nameref(prog) {
+        return (HashMap::new(), need_mut, dead_init);
+    }
     let mut out: HashMap<String, Scope> = HashMap::new();
     for (name, us) in use_scopes(prog) {
         // *declared* vars only (an undeclared name reads the process
@@ -17875,7 +18295,22 @@ fn compute_local_vars(
                 dead_init.insert(name.clone());
             }
         }
-        match local_scope(&us) {
+        // PINNED (closure body / separate process / asm): a `let` cannot
+        // serve the mention, so the name keeps global storage.
+        if us.iter().any(|u| u.pin) {
+            continue;
+        }
+        // ONE scope, `risky` ignored (see this function's doc). `local_scope`
+        // is the shared verdict used by the C backend, which does capture
+        // through helpers; this renderer answers the narrower question.
+        let mut scopes: BTreeSet<Scope> = BTreeSet::new();
+        for u in &us {
+            scopes.insert(u.scope.clone());
+        }
+        if scopes.len() != 1 {
+            continue;
+        }
+        match scopes.into_iter().next() {
             Some(Scope::Main) => {
                 out.insert(name, Scope::Main);
             }
@@ -17886,6 +18321,83 @@ fn compute_local_vars(
         }
     }
     (out, need_mut, dead_init)
+}
+
+/// Does the program declare a nameref (`declare -n` / `typeset -n` /
+/// `local -n`)? Detected on the IR word shapes both frontends produce: a
+/// `-n` flag word in a `Declare` or in an `Exec`/decl-family call.
+fn program_binds_nameref(prog: &IrProgram) -> bool {
+    fn flags_n(args: &[IrExpr]) -> bool {
+        args.iter().any(|a| match a {
+            IrExpr::Str(w, _) => w == "-n" || (w.starts_with("-n") && !w.starts_with("--")),
+            IrExpr::Array(items) => flags_n(items),
+            _ => false,
+        })
+    }
+    fn walk(stmts: &[IrStmt]) -> bool {
+        for s in stmts {
+            match s {
+                IrStmt::Declare { .. } => {}
+                IrStmt::Exec { args, .. } => {
+                    if flags_n(args) {
+                        return true;
+                    }
+                }
+                IrStmt::Expr(IrExpr::Call { func, args })
+                    if matches!(func.as_str(), "exec" | "builtin" | "callDirect" | "fnCall")
+                        && flags_n(args) =>
+                {
+                    return true
+                }
+                IrStmt::If { then, elsifs, else_, .. } => {
+                    if walk(then)
+                        || elsifs.iter().any(|(_, b)| walk(b))
+                        || walk(else_)
+                    {
+                        return true;
+                    }
+                }
+                IrStmt::While { body, .. }
+                | IrStmt::DoWhile { body, .. }
+                | IrStmt::For { body, .. }
+                | IrStmt::ForInit { body, .. }
+                | IrStmt::Block(body)
+                | IrStmt::Subshell(body)
+                | IrStmt::Background(body) => {
+                    if walk(body) {
+                        return true;
+                    }
+                }
+                IrStmt::Function { body, named_blocks, .. } => {
+                    if walk(body) || named_blocks.iter().any(|(_, b)| walk(b)) {
+                        return true;
+                    }
+                }
+                IrStmt::Case { clauses, .. } => {
+                    if clauses.iter().any(|c| walk(&c.body)) {
+                        return true;
+                    }
+                }
+                IrStmt::Redirect { inner, .. } => {
+                    if walk(inner) {
+                        return true;
+                    }
+                }
+                IrStmt::Try { body, excepts, else_body, finally_body } => {
+                    if walk(body)
+                        || excepts.iter().any(|e| walk(&e.body))
+                        || walk(else_body)
+                        || walk(finally_body)
+                    {
+                        return true;
+                    }
+                }
+                _ => {}
+            }
+        }
+        false
+    }
+    walk(&prog.stmts) || prog.subs.iter().any(|s| walk(&s.body))
 }
 
 /// Shell specials / positionals — never plain locals.
