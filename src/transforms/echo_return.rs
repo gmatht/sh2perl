@@ -238,9 +238,14 @@ fn parse_stmt(
             }
             Some(out)
         }
+        // `return N` is a STATUS return, not a value channel: folding the
+        // function would drop it and the caller would report 0 (measured:
+        // `f(){ echo hi; return 3; }; f; echo $?` printed 3 in bash, 0 in
+        // the folded render). Refuse the body.
+        IrStmt::Return(Some(_)) => return None,
         // A bare `return` — only legal AFTER the path echoed (a no-output
         // return path emits nothing — the value channel would lose it).
-        IrStmt::Return(_) => {
+        IrStmt::Return(None) => {
             if states.iter().any(|s| *s == EchoState::Need) {
                 return None;
             }
