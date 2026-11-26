@@ -2986,14 +2986,17 @@ const PERL_RESERVED_SUB: &[&str] = &[
 ];
 
 /// Shell single-quote a literal (no Perl interpolation in the qx string).
+///
+/// Only the SHELL layer is escaped here: everything inside `'…'` is literal
+/// to the shell, so `$`, `@` and `\` need no quoting. `qx()` owns the Perl
+/// layer (it rewrites `$`, `@`, `\`, `{`, `}` for `qx{…}`); escaping those
+/// here too would double them, e.g. a `\n` argument would reach the child
+/// as a literal backslash-n instead of a newline.
 fn shell_squote(s: &str) -> String {
     let mut out = String::from("'");
     for c in s.chars() {
         match c {
             '\'' => out.push_str("'\\''"),
-            '$' => out.push_str("\\$"),
-            '@' => out.push_str("\\@"),
-            '\\' => out.push_str("\\\\"),
             c => out.push(c),
         }
     }
