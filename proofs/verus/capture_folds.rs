@@ -18,6 +18,10 @@
 //   the reachable arm(s), with exit status 0 as the fold requires.
 //   text_span_sound: replacing a constant `$(echo …)` span with its
 //   output preserves the surrounding text's denoted string.
+//   printf_fold_is_the_whole_output: a printf capture's folded text is the
+//   WHOLE of bash's output — the flag guard (`printf -v` writes no stdout)
+//   and the arg-count refusal (bash cycles the format over surplus args)
+//   are load-bearing, not cosmetic.
 //
 // Strings are Seq<char>. Newline stripping is a recursive spec over the
 // sequence (no stdlib trim dependency in the model).
@@ -35,9 +39,23 @@
 //     word scan); unquoted requires the shell-safe charset. The word
 //     scanner (escapes/metachars) is out of scope — the model takes
 //     validated words.
-//   - printf format evaluation, flag detection, redirect/multiple-statement
-//     refusals: out of scope (same refusal class; the extensions reuse
-//     this core).
+//   - printf (`const_printf_output`): modelled as one pass over the DECODED
+//     format with `%s`/`%%`/literals, plus the arg-consuming CONVERSION
+//     COUNT that bash cycles on and the flag-word guard. Numeric
+//     conversions consume an arg in that count but their rendering is out
+//     of scope, so the model refuses them (a strict subset of the source's
+//     accepted set; `pin_printf_numeric_out_of_scope` makes the limit a
+//     proved fact). Redirect/multiple-statement refusals: out of scope
+//     (same refusal class; the extensions reuse this core).
+//
+// MUTANTS (both checked red against the printf obligation, file restored
+// byte-identically): dropping `printf_fold`'s flag guard and dropping its
+// `convs != args` refusal each make the same command report 24 verified,
+// 2 errors (the law and the matching pin).
+//
+// Verus 0.2026.10.18.7d82994, rust toolchain 1.99.1:
+//   verus --triggers-mode silent --rlimit 40 capture_folds.rs
+//   -> verification results:: 26 verified, 0 errors
 use vstd::prelude::*;
 
 verus! {
@@ -214,6 +232,221 @@ proof fn chain_sound(c: Chain)
     }
 }
 
+// ---- printf captures (const_printf_output) ----
+//
+// `const_printf_output` is the printf entry of the capture fold (also reused
+// by `text_ops`): `$(printf FMT ARGS…)` folds to the text bash writes when
+// the argv is literal and two EXTRA conditions hold that the echo arm does
+// not have —
+//   (i) the first word is not a flag: `printf -v OUT FMT` assigns to a
+//       variable and writes nothing to stdout, so the words are not the
+//       command's output;
+//   (ii) the format's arg-consuming conversions number exactly the args:
+//       with fewer/none bash fills defaults, with MORE it CYCLES the format
+//       and writes it again (`printf '%s' a b` → "ab"), so a one-pass text
+//       would be the wrong literal.
+// The obligation below is that a fold's text is the WHOLE of bash's output.
+
+pub open spec fn is_flag_word(w: Str) -> bool {
+    w.len() > 0 && w[0] == '-'
+}
+
+// bash printf's escapes IN THE FORMAT (`decode_fmt_escapes`); an unknown
+// escape is implementation-defined, so the source refuses it.
+pub open spec fn esc_char(e: char) -> Option<char> {
+    if e == 'a' {
+        Some('\u{7}')
+    } else if e == 'b' {
+        Some('\u{8}')
+    } else if e == 'e' {
+        Some('\u{1b}')
+    } else if e == 'f' {
+        Some('\u{c}')
+    } else if e == 'n' {
+        Some('\n')
+    } else if e == 'r' {
+        Some('\r')
+    } else if e == 't' {
+        Some('\t')
+    } else if e == 'v' {
+        Some('\u{b}')
+    } else if e == '\\' {
+        Some('\\')
+    } else if e == '"' {
+        Some('"')
+    } else {
+        None
+    }
+}
+
+pub open spec fn decode_escapes(f: Str, i: int) -> Option<Str>
+    decreases f.len() - i,
+{
+    if i >= f.len() {
+        Some(Seq::empty())
+    } else if f[i] != '\\' {
+        match decode_escapes(f, i + 1) {
+            None => None,
+            Some(r) => Some(seq![f[i]].add(r)),
+        }
+    } else if i + 1 >= f.len() {
+        None
+    } else {
+        match esc_char(f[i + 1]) {
+            None => None,
+            Some(c) => match decode_escapes(f, i + 2) {
+                None => None,
+                Some(r) => Some(seq![c].add(r)),
+            },
+        }
+    }
+}
+
+// Conversions that CONSUME an argument in a decoded format (`%%` does not).
+// This is the count bash cycles the format on, and the count the source
+// compares against the argv length.
+pub open spec fn convs(f: Str, i: int) -> int
+    decreases f.len() - i,
+{
+    if i >= f.len() {
+        0
+    } else if f[i] != '%' {
+        convs(f, i + 1)
+    } else if i + 1 >= f.len() {
+        0
+    } else if f[i + 1] == '%' {
+        convs(f, i + 2)
+    } else {
+        1 + convs(f, i + 2)
+    }
+}
+
+// ONE pass over a decoded format: literals copy, `%%` is a percent, `%s`
+// prints its arg verbatim. The numeric conversions (`%d %i %u %x %X %o`)
+// consume an arg in `convs` but their RENDERING is out of scope, so this
+// model refuses them — the accepted set is a strict subset of the source's
+// and the law below is therefore only ever about text the source really
+// emits (`pin_printf_numeric_out_of_scope`).
+pub open spec fn one_pass(f: Str, args: Seq<Str>, i: int, ai: int) -> Option<Str>
+    decreases f.len() - i,
+{
+    if i >= f.len() {
+        Some(Seq::empty())
+    } else if f[i] != '%' {
+        match one_pass(f, args, i + 1, ai) {
+            None => None,
+            Some(r) => Some(seq![f[i]].add(r)),
+        }
+    } else if i + 1 >= f.len() {
+        None
+    } else if f[i + 1] == '%' {
+        match one_pass(f, args, i + 2, ai) {
+            None => None,
+            Some(r) => Some(seq!['%'].add(r)),
+        }
+    } else if f[i + 1] == 's' {
+        if ai < args.len() {
+            match one_pass(f, args, i + 2, ai + 1) {
+                None => None,
+                Some(r) => Some(args[ai].add(r)),
+            }
+        } else {
+            None
+        }
+    } else {
+        None
+    }
+}
+
+// How many times bash runs the format: once for the first `conv` args, then
+// the format CYCLES while args remain. `conv <= 0` with args left prints the
+// format once and warns (no cycling), which is why 1 is the floor.
+pub open spec fn passes(conv: int, args: int) -> int
+    decreases if args > 0 { args } else { 0 },
+{
+    if conv <= 0 {
+        1
+    } else if args <= conv {
+        1
+    } else {
+        1 + passes(conv, args - conv)
+    }
+}
+
+// bash's printf, as (one-pass text, number of passes). None = the command
+// writes no stdout text (a flag word: `-v` assigns) or cannot be evaluated.
+pub open spec fn bash_printf(words: Seq<Str>) -> Option<(Str, int)> {
+    if words.len() == 0 {
+        None
+    } else if is_flag_word(words[0]) {
+        None
+    } else {
+        match decode_escapes(words[0], 0) {
+            None => None,
+            Some(f) => match one_pass(f, words.subrange(1, words.len() as int), 0, 0) {
+                None => None,
+                Some(t) => Some((t, passes(convs(f, 0), (words.len() - 1) as int))),
+            },
+        }
+    }
+}
+
+// The source's fold (`const_printf_output` → `const_printf`): the same flag
+// guard, the `ai != argv.len()` refusal, then exactly one pass.
+pub open spec fn printf_fold(words: Seq<Str>) -> Option<(Str, int)> {
+    if words.len() == 0 {
+        None
+    } else if is_flag_word(words[0]) {
+        None
+    } else {
+        match decode_escapes(words[0], 0) {
+            None => None,
+            Some(f) => {
+                if convs(f, 0) != (words.len() - 1) as int {
+                    None
+                } else {
+                    match one_pass(f, words.subrange(1, words.len() as int), 0, 0) {
+                        None => None,
+                        Some(t) => Some((t, 1)),
+                    }
+                }
+            },
+        }
+    }
+}
+
+// THE OBLIGATION (a4): when the fold fires, its text IS bash's whole output.
+// The flag guard makes the `-v` case (no stdout) unrepresentable, and the
+// arg-count refusal is exactly what rules out a cycling format: accepted
+// implies `convs == args`, hence `passes` is 1 and the emitted pass is the
+// complete output. Drop either guard and this goes red.
+pub proof fn printf_fold_is_the_whole_output(words: Seq<Str>)
+    ensures printf_fold(words).is_some() ==> printf_fold(words) == bash_printf(words),
+{
+    if words.len() == 0 {
+    } else if is_flag_word(words[0]) {
+    } else {
+        match decode_escapes(words[0], 0) {
+            None => {},
+            Some(f) => {
+                let args = words.subrange(1, words.len() as int);
+                let conv = convs(f, 0);
+                if conv != (words.len() - 1) as int {
+                    // the fold refuses: the implication is vacuous
+                } else {
+                    assert(args.len() == conv);
+                    if conv <= 0 {
+                        assert(passes(conv, args.len() as int) == 1);
+                    } else {
+                        assert(args.len() as int <= conv);
+                        assert(passes(conv, args.len() as int) == 1);
+                    }
+                }
+            },
+        }
+    }
+}
+
 // ---- Text spans (text-capture-fold) ----
 
 // Is an ASCII alphanumeric (spec-safe: explicit ranges, no std call).
@@ -333,6 +566,55 @@ proof fn pin_and_chain_status_refuses()
 // An unknown command refuses everywhere.
 proof fn pin_unknown_refuses()
     ensures !cmd_status_known(RawOut::Unknown),
+{
+}
+
+// `printf -v OUT …` never folds: the flag word is the guard, and bash writes
+// nothing to stdout.
+pub proof fn pin_printf_flag_refuses()
+    ensures printf_fold(seq![seq!['-', 'v'], seq!['%', 's'], seq!['x']]) == None,
+{
+}
+
+// `printf '%s' a b` refuses: one conversion, two args — bash would cycle the
+// format and write "ab".
+pub proof fn pin_printf_surplus_args_refuses()
+    ensures printf_fold(seq![seq!['%', 's'], seq!['a'], seq!['b']]) == None,
+{
+    assert(convs(seq!['%', 's'], 0) == 1) by {
+        reveal_with_fuel(convs, 3);
+    }
+    assert(decode_escapes(seq!['%', 's'], 0) == Some(seq!['%', 's'])) by {
+        reveal_with_fuel(decode_escapes, 3);
+    }
+}
+
+// bash really does write more than one pass there, which is why the refusal
+// above is load-bearing rather than cosmetic.
+pub proof fn pin_printf_passes_cycle()
+    ensures passes(1, 2) == 2 && passes(1, 1) == 1,
+{
+    reveal_with_fuel(passes, 3);
+}
+
+// `%%` consumes no argument, so it must not shift the arg count.
+pub proof fn pin_printf_percent_escape()
+    ensures convs(seq!['%', '%'], 0) == 0 && convs(seq!['a', '%', 's', 'b'], 0) == 1,
+{
+    reveal_with_fuel(convs, 4);
+}
+
+// A format with no conversions prints itself.
+pub proof fn pin_printf_literal_format()
+    ensures one_pass(seq!['h', 'i'], Seq::<Str>::empty(), 0, 0) == Some(seq!['h', 'i']),
+{
+    reveal_with_fuel(one_pass, 3);
+}
+
+// The stated fidelity limit: numeric conversions consume an arg for the
+// cycling count but are not rendered by this model, so it refuses them.
+pub proof fn pin_printf_numeric_out_of_scope()
+    ensures one_pass(seq!['%', 'd'], Seq::<Str>::empty(), 0, 0) == None,
 {
 }
 

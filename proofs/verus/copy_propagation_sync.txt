@@ -1,5 +1,16 @@
 # verus-sync-coverage manifest: copy_propagation
-# source sha: copy_propagation=2bce47b3f3b3 STALE (sha matches no revision of the file in history)  proof sha: bab6ad48bf1b
+# source sha: copy_propagation=eb5a02ad209f  proof sha: bab6ad48bf1b
+# re-pinned 2026-11-26: the recorded 2bce47b3f3b3 names no revision of
+# src/transforms/copy_propagation.rs (all 17 versions checked, as sha256 and
+# as git blob), so the row is re-derived from the current file. Region audited:
+# `collect_defs` still gates on the single-write census (`*c == 1`), on
+# top-level writes only (`if !*top` refuses nested/conditional/builtin), on the
+# `dynamic` refusal, and on the opaque kinds — exactly this manifest's four
+# [guards]. The foldable RHS spellings have since grown (Int-typed Str,
+# all-lit Interpolate, constant Capture and the `capture` call); each still
+# yields a literal Def, which is the model's `Def::Literal` premise (the
+# capture spelling's verdict is `const_capture_fold::fold_const_echo`, proved
+# in capture_folds.rs). The six mapped tests below pass.
 
 [pins]
 pin pin_copy_def_not_folded -> test folds_copy_rhs: MAPPED

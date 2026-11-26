@@ -1,11 +1,28 @@
 # verus-sync-coverage manifest: capture_folds
-# source sha: const_capture_fold=7f4b0d0dfb10 STALE (source gained const_printf_output, a fold this proof does not model) text_capture_fold=f76d26e31190  proof sha: b2c4c1df6296
+# source sha: const_capture_fold=b9bc2cba1f8d  text_capture_fold=f76d26e31190  proof sha: 8766a37293b0
+# re-pinned 2026-11-26: const_capture_fold gained `const_printf_output`, the
+# printf entry `text_ops` also reuses, which this proof did not model. It now
+# does: `printf_fold_is_the_whole_output` proves a folded printf's text is the
+# WHOLE of bash's output — the flag guard (`printf -v` writes no stdout) and
+# the arg-count refusal (bash cycles the format over surplus args) are each
+# load-bearing (dropping either reports 24 verified, 2 errors) — over one pass
+# of the decoded format. The recorded 7f4b0d0dfb10 names no revision of the
+# file (all 7 versions checked, sha256 and git blob), so the row is re-derived
+# from the current source. Numeric conversions consume an arg in the count but
+# are not rendered by the model, which refuses them
+# (`pin_printf_numeric_out_of_scope` makes that limit a proved fact).
 
 [pins]
 pin pin_and_chain_status_refuses -> test chain_status_loss_refuses: MAPPED
 pin pin_echo_joins_space -> test multi_word_echo_joins_with_a_space: MAPPED
 pin pin_echo_newline_stripped -> test frontend_constant_echo_capture_folds: MAPPED
 pin pin_or_chain_reachable -> test or_chain_folds_to_reachable_arm: MAPPED
+pin pin_printf_flag_refuses -> UNMIRRORED (by design — the `-v` guard has no source test; proved by printf_fold_is_the_whole_output)
+pin pin_printf_literal_format -> test printf_literal_folds_via_format: MAPPED
+pin pin_printf_numeric_out_of_scope -> UNMIRRORED (by design — model fidelity limit, proved)
+pin pin_printf_passes_cycle -> UNMIRRORED (by design — bash's cycling count, no source test)
+pin pin_printf_percent_escape -> UNMIRRORED (by design — conversion counting, no source test)
+pin pin_printf_surplus_args_refuses -> test printf_unsupported_shapes_refuse: MAPPED
 pin pin_true_empty -> test folds_true_to_empty: MAPPED
 pin pin_unknown_refuses -> test other_command_refuses: MAPPED
 
@@ -16,21 +33,27 @@ guard text-capture TEXT_FUNCS gate: PRESENT
 guard text-capture safe_repl: PRESENT
 
 [counts]
-proof-fns: 10
-pins: 6
+proof-fns: 17
+pins: 12
 # NOTE: proof-fns is a file-shape fact (change detector), NOT the
 # Verus obligation count — the gate asserts N verified separately.
 
 [exec]
-# Each MAPPED test above, EXECUTED against the live source (one
-# module-suite run per model; per-test verdicts grepped from output).
 # A mapped test that fails or vanishes from the run is drift — FATAL.
+# Each MAPPED test above, EXECUTED against the live source (one
 # The checker RUNS each mapped test (one module-suite cargo test per
-# source file) and records the per-test PASS/FAIL verdict below.
 # all suites built; per-test verdicts below
+# module-suite run per model; per-test verdicts grepped from output).
 exec pin_and_chain_status_refuses (chain_status_loss_refuses): PASS
 exec pin_echo_joins_space (multi_word_echo_joins_with_a_space): PASS
 exec pin_echo_newline_stripped (frontend_constant_echo_capture_folds): PASS
 exec pin_or_chain_reachable (or_chain_folds_to_reachable_arm): PASS
+exec pin_printf_flag_refuses: UNMIRRORED (not executed)
+exec pin_printf_literal_format (printf_literal_folds_via_format): PASS
+exec pin_printf_numeric_out_of_scope: UNMIRRORED (not executed)
+exec pin_printf_passes_cycle: UNMIRRORED (not executed)
+exec pin_printf_percent_escape: UNMIRRORED (not executed)
+exec pin_printf_surplus_args_refuses (printf_unsupported_shapes_refuse): PASS
 exec pin_true_empty (folds_true_to_empty): PASS
 exec pin_unknown_refuses (other_command_refuses): PASS
+# source file) and records the per-test PASS/FAIL verdict below.

@@ -8,6 +8,9 @@ checker fails on each:
   1. SHA DRIFT — the recorded `# source sha:` / `proof sha:` no longer match
      the files on disk. A stale source sha means the proof was written
      against a different source; it is NOT repaired here, it is reported.
+     A `STALE (…)` annotation on the row is deliberately NOT honoured — an
+     annotated row fails exactly like a bare one, because a manifest that no
+     longer matches its source must never read as evidence.
   2. PHANTOM PINS — a `pin <name>` row whose proof fn no longer exists in the
      sibling `.rs` (renamed, deleted, or typo'd).
   3. UNRUN EVIDENCE — an `exec <pin> (<test>): PASS` row whose test either no
@@ -80,7 +83,6 @@ class Manifest:
     standard: bool                  # has [pins]/[counts]/[exec]
     proof_sha: str | None = None
     source_shas: dict[str, str] = field(default_factory=dict)
-    admitted_stale: set[str] = field(default_factory=set)   # keys marked STALE
     pins: dict[str, str] = field(default_factory=dict)      # pin -> MAPPED/UNMIRRORED
     pin_tests: dict[str, str] = field(default_factory=dict)  # pin -> test name
     execs: dict[str, str] = field(default_factory=dict)     # pin -> PASS/UNMIRRORED/…
@@ -108,15 +110,11 @@ def parse_manifest(path: str) -> Manifest:
                 if ps:
                     m.proof_sha = ps.group(1)
                 hits = list(KEY_SHA.finditer(stripped))
-                for i, hit in enumerate(hits):
+                for hit in hits:
                     key, sha = hit.group(1), hit.group(2)
                     if key == "proof":
                         continue
                     m.source_shas[key] = sha
-                    # a STALE marker applies to the key it directly follows
-                    tail = stripped[hit.end() : hits[i + 1].start() if i + 1 < len(hits) else len(stripped)]
-                    if "STALE" in tail:
-                        m.admitted_stale.add(key)
             continue
         pm = PIN_ROW.match(stripped)
         if pm:
@@ -241,7 +239,6 @@ def run_lib_tests(jobs: int) -> tuple[dict[str, list[str]], str | None]:
 
 
 skipped: list[tuple[str, str]] = []
-warnings: list[tuple[str, str]] = []
 
 
 def check(m: Manifest, verdicts: dict[str, list[str]] | None, verbose: bool) -> list[Failure]:
@@ -290,18 +287,13 @@ def check(m: Manifest, verdicts: dict[str, list[str]] | None, verbose: bool) -> 
             if verbose:
                 print(f"  {m.name}: {key} ok ({blob} = git blob of {rel} at HEAD)")
             continue
-        if key in m.admitted_stale:
-            warnings.append(
-                (m.name, f"{key}={recorded} is STALE-MARKED: {rel} is now "
-                         f"sha256 {actual}; the row was not re-audited")
-            )
-            continue
         bad(
             "stale-source",
             f"{key}={recorded}: {rel} is sha256 {actual}"
             + (f" / blob {blob}" if blob else "")
             + " — the proof was written against a different source; re-audit it, "
-              "do not just bump the sha",
+              "do not just bump the sha (an annotation on the row changes nothing: "
+              "there is no admitted-staleness escape hatch)",
         )
 
     # 2. pins exist as proof fns
@@ -417,8 +409,6 @@ def main() -> int:
         failures.extend(check(m, verdicts, args.verbose))
 
     print()
-    for name, why in warnings:
-        print(f"WARN {name}: {why}")
     for name, why in skipped:
         print(f"SKIP {name}: {why}")
     for f in failures:
@@ -426,7 +416,7 @@ def main() -> int:
     mode = "WITHOUT the test run (not evidence of execution)" if verdicts is None else "with the test run"
     print(
         f"\n{len(manifests)} manifests checked {mode}: "
-        f"{len(failures)} failure(s), {len(warnings)} warning(s), {len(skipped)} skipped"
+        f"{len(failures)} failure(s), {len(skipped)} skipped"
     )
     return 1 if failures else 0
 

@@ -1,5 +1,14 @@
 # verus-sync-coverage manifest: list_folds
-# source sha: brace_fold=3cbc85981aa1 affix_strip_fold=62e557c7454a STALE (sha matches no revision of the file in history)  proof sha: 0098be0a40b9
+# source sha: brace_fold=3cbc85981aa1 affix_strip_fold=929ebbee6785  proof sha: fc05a3a21991
+# re-pinned 2026-11-26: the recorded affix_strip_fold=62e557c7454a names no
+# revision of src/transforms/affix_strip_fold.rs (all 6 versions checked,
+# sha256 and git blob). Region audited against the current file:
+# `is_literal_pattern` (non-empty, no `* ? [ \\`) is what licenses the
+# single-occurrence strip the model states, `single_star_shape` is the one-star
+# `lit*`/`*lit` form, and `fold_target_ok` keeps the list-position gate. The two
+# affix laws used to be vacuous restatements (`f(t,p) == f(t,p)`); they now
+# PROVE the general strip — `#pat` on `pat·rest` is `rest`, `%pat` on `rest·pat`
+# is `rest` — with the concrete `/usr/bin` pins unchanged.
 
 [pins]
 pin pin_brace_empty_group -> test empty_expansion_is_refused: MAPPED

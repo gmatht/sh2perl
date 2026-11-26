@@ -104,22 +104,27 @@ pub open spec fn strip_suffix_once(text: Str, pat: Str) -> Str {
     }
 }
 
-// THE OBLIGATION (b1): `#lit*` ≡ `#lit` — matching `lit·X` as a prefix
-// pattern strips exactly `lit` (the shortest prefix matching `lit·X` is
-// `lit` itself; the trailing star can only match MORE, which longest-
-// match would extend — but on a literal prefix the glob engine still
-// strips exactly the literal when the star matches empty... the pass's
-// documented identity; the model states the operative claim: the
-// single-strip function IS the `#lit` shape's denotation).
-proof fn affix_prefix_sound(text: Str, pat: Str)
-    ensures strip_prefix_once(text, pat) == strip_prefix_once(text, pat),
+// THE OBLIGATION (b1): a magic-free literal pattern matches exactly ONCE,
+// so `#lit` on `lit·rest` is `rest` — one occurrence, no shortened variant
+// left behind (`lit·lit·rest` strips only the first `lit`, which is what
+// bash's `#` does for a literal and what the fold's AffixStrip renders).
+proof fn affix_prefix_sound(rest: Str, pat: Str)
+    ensures strip_prefix_once(pat.add(rest), pat) == rest,
 {
+    assert(pat.add(rest).len() == pat.len() + rest.len());
+    assert(pat.add(rest).subrange(0, pat.len() as int) == pat) by {
+        assert(pat.add(rest).subrange(0, pat.len() as int) =~= pat);
+    };
 }
 
-// THE OBLIGATION (b2): suffix symmetric.
-proof fn affix_suffix_sound(text: Str, pat: Str)
-    ensures strip_suffix_once(text, pat) == strip_suffix_once(text, pat),
+// THE OBLIGATION (b2): suffix symmetric — `%lit` on `rest·lit` is `rest`.
+proof fn affix_suffix_sound(rest: Str, pat: Str)
+    ensures strip_suffix_once(rest.add(pat), pat) == rest,
 {
+    assert(rest.add(pat).len() == rest.len() + pat.len());
+    assert(rest.add(pat).subrange(rest.len() as int, rest.add(pat).len() as int) == pat) by {
+        assert(rest.add(pat).subrange(rest.len() as int, rest.add(pat).len() as int) =~= pat);
+    };
 }
 
 // Concrete subrange equality by extensionality (the automation does

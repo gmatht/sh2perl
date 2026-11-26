@@ -1,5 +1,14 @@
 # verus-sync-coverage manifest: textop_folds
-# source sha: text_ops=68bfaa6813fb STALE (sha matches no revision of the file in history)  proof sha: 4f885f265c26
+# source sha: text_ops=6acd2701983d  proof sha: 4f885f265c26
+# re-pinned 2026-11-26: the recorded 68bfaa6813fb names no revision of
+# src/transforms/text_ops.rs (all 78 versions checked, sha256 and git blob).
+# Re-derived from the current file after auditing the four nodes the pins
+# name: StrLen (`${#v}`, `wc -c`/`-m` on a literal, `param("length", …)`),
+# CaseTransform (`${v^^}`/`${v,,}` only — `tr` stays a BYTE map and is
+# deliberately not one), SubStr (`${v:2:3}`, array slices excluded) and
+# PathName (built only from real basename/dirname, never from `${p##*/}`,
+# whose trailing-slash semantics differ). The model's ascii case map, slice
+# containment and GNU basename still match those arms; the mapped tests pass.
 
 [pins]
 pin pin_basename_interior_slashes -> UNMIRRORED (by design — see the proof-campaign plan §(b).4)

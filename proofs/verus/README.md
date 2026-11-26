@@ -38,6 +38,7 @@ this repo's CI must stay self-contained.
     python3 proofs/verus/check_sync.py --no-tests # shas + pins + parity only
     python3 proofs/verus/check_sync.py -m status_reads -v
     python3 proofs/verus/check_sync.py --list
+    python3 proofs/verus/check_sync_selftest.py  # the checker's own self-test
 
 A `*_sync.txt` manifest is a claim that this proof models THAT source, that its
 pins exist, and that these rows were executed. The checker fails the claim
@@ -45,7 +46,7 @@ when it rots:
 
 | failure | what it means |
 |---|---|
-| `stale-source` | a recorded `# source sha:` no longer matches the file (sha256 or, for a `shir`-style pin, HEAD's git blob). The fix is to re-audit the proof against the new source, not to bump the sha. |
+| `stale-source` | a recorded `# source sha:` no longer matches the file (sha256 or, for a `shir`-style pin, HEAD's git blob). The fix is to re-audit the proof against the new source and record it, not to bump the sha; a `STALE (…)` annotation does not soften the failure. |
 | `sha` | the recorded `proof sha:` no longer matches the `.rs`, or the line is missing. |
 | `phantom-pin` | a `pin <name>` row names no `fn <name>(` in the sibling `.rs`. |
 | `unrun` | a `pin … : MAPPED` row has no `exec …: PASS` row, or its named test did not run. |
@@ -64,13 +65,22 @@ Two dialects are accepted, because the directory has two generations:
 file-shape fact `proof-fns: N` / `pins: M`, whose numbers are checked against
 the `.rs` (`proof fn` declarations) and the `[pins]` table.
 
-**Admitted staleness.** A source row may be marked `…=<sha> STALE (<reason>)`
-when the proof has NOT been re-audited against the current source, or when
-the recorded sha matches no revision in history. The checker then prints a
-`WARN` naming the drift instead of failing — the row can no longer be misread
-as evidence, and the drift is visible on every run. Unmarked drift is a
-failure. `optimize_fold_sync.txt` is a generated fold table, not a manifest,
-and is reported as `SKIP`.
+**No stale rows.** There is no admitted-staleness escape hatch: a source row
+whose sha does not match the file fails the manifest, annotated (`…=<sha>
+STALE (reason)`) or not, because a manifest that no longer matches its source
+must never read as evidence. An audit that finds the drift harmless re-pins
+the row to the current file and writes the audit into the manifest, the way
+`counted_arith_forinit`, `test_lowering`, `capture_folds`,
+`counted_while_forinit`, `copy_propagation`, `textop_folds`, `list_folds` and
+`c_decl_coverage` record theirs. `optimize_fold_sync.txt` is a generated fold
+table, not a manifest, and is reported as `SKIP`.
+
+`check_sync_selftest.py` proves the checker itself: it mutates one manifest
+per failure class — phantom pin, bare stale sha, a stale sha carrying a
+`STALE (…)` note, a wrong `proof-fns:`, a `MAPPED` row with no `exec`, a test
+name that does not exist, and a test that exists but `FAILED` — asserts each
+produces exit 1 with that kind, and restores every file byte-identically
+(checked by sha256).
 
 Exit status is 1 if anything failed.
 

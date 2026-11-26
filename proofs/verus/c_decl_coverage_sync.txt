@@ -1,5 +1,13 @@
 # verus-sync-coverage manifest: c_decl_coverage
-# source sha: c_backend-walkers=840274f9b61b STALE (region key; sha matches no revision of src/c_backend.rs)  proof sha: 70d63fefe961
+# source sha: c_backend-walkers=88bbfbdb90cd  proof sha: 70d63fefe961
+# re-pinned 2026-11-26: the recorded 840274f9b61b is a region key whose value
+# names no revision of src/c_backend.rs (all 366 versions checked, sha256 and
+# git blob) and is not a digest of the walker region either; the row now pins
+# the whole file the key resolves to. Region audited arm by arm against
+# `collect_vars_full` as recorded in [guards]: Assign/Declare/Expr/Output/
+# Redirect/If/Exit/For/While|DoWhile/Block|Subshell|Background/ForInit/Ext/Try
+# plus the `_` catch-all — unchanged, and the proof's `Stmt` enum still
+# enumerates exactly those shapes (Scope = Block|Subshell|Background).
 
 [pins]
 pin pin_array_elem -> UNMIRRORED (by design — see the proof-campaign plan §(b).4)
