@@ -17,7 +17,14 @@
 #   4. enforces the source's own
 #        # PERL_MUST_NOT_CONTAIN <text>
 #      directives (default: no backtick-`echo`/`printf`, i.e. those captures
-#      must not become a qx fork).
+#      must not become a qx fork);
+#   5. when the source declares `# expected (bash): <text>`, requires bash's
+#      own stdout to be exactly that line. Without this a broken bash run
+#      (e.g. a missing stdin) and an equally empty Perl run "match" while
+#      proving nothing.
+#
+# An example that needs input gets tests/stdin/<example-name>.stdin; both
+# interpreters receive it (and /dev/null otherwise, so runs are deterministic).
 # Output is one line per (example, emitter); the exit status is non-zero if
 # any comparison fails.
 #
@@ -53,6 +60,8 @@ else
         examples/000__05_system_utilities.sh
         examples/000__06_text_processing_commands.sh
         examples/012_test_const_read.sh
+        # really reads stdin (`cat -`), fed from tests/stdin/
+        examples/cat-dash-stdin.sh
     )
 fi
 
@@ -105,10 +114,24 @@ for f in "${examples[@]}"; do
         fi
 
         # same basename for both trees: `/…/b/work` vs `/…/p/work`
+        stdin_file="$root/tests/stdin/$name.stdin"
+        [ -f "$stdin_file" ] || stdin_file=/dev/null
         rm -rf "$tmp/$name.b" "$tmp/$name.p"
         mkdir -p "$tmp/$name.b/work" "$tmp/$name.p/work"
-        ( cd "$tmp/$name.b/work" && bash "$root/$f" >out 2>err; echo $? >rc )
-        ( cd "$tmp/$name.p/work" && perl "$pl"      >out 2>err; echo $? >rc )
+        ( cd "$tmp/$name.b/work" && bash "$root/$f" <"$stdin_file" >out 2>err; echo $? >rc )
+        ( cd "$tmp/$name.p/work" && perl "$pl"        <"$stdin_file" >out 2>err; echo $? >rc )
+        # A declared expectation makes the comparison prove the DOCUMENTED
+        # behaviour, not merely that two runs agree with each other.
+        expected=$(sed -n 's/^# expected (bash): //p' "$f" | head -1)
+        if [ -n "$expected" ]; then
+            printf '%s\n' "$expected" >"$tmp/$name.expected"
+            if ! diff -q "$tmp/$name.expected" "$tmp/$name.b/work/out" >/dev/null; then
+                echo "FAIL $name [$emitter]: bash stdout differs from the declared expectation"
+                diff -u "$tmp/$name.expected" "$tmp/$name.b/work/out" | sed -n '1,12p'
+                fail=1
+                continue
+            fi
+        fi
         if ! diff -q "$tmp/$name.b/work/out" "$tmp/$name.p/work/out" >/dev/null; then
             echo "FAIL $name [$emitter]: stdout differs"
             diff -u "$tmp/$name.b/work/out" "$tmp/$name.p/work/out" | sed -n '1,12p'
