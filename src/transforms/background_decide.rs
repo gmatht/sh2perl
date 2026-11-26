@@ -412,7 +412,7 @@ fn arith_reads(a: &crate::ir::ArithAst, reads: &mut HashSet<String>) {
 //   match inside the renderer (the first wiring attempt was inert for
 //   exactly that reason). A body the table does not hold is FORK —
 //   including when the transform never ran, which is the default a
-//   consumer gets from `is_thread_body`. Proof: VERUS.md /
+//   consumer gets from `is_thread_body`. Proof: the model in
 //   proofs/verus/background_decide.rs (`classify_thread_sound`,
 //   `route_thread_is_sound`, `unclassified_stays_fork`).
 // scope: offered to estree (owner — supersedes backgroundDecide), c,

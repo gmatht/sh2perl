@@ -1,12 +1,13 @@
 //! pin_mirrors.rs — regression tests mirroring the Verus fidelity pins.
 //!
 //! Each test below asserts on the REAL transform the behavior the
-//! corresponding `*_pins` lemma pins on the MODEL (see VERUS.md §(b) and
-//! `sh2perl/proofs/verus/*.rs`). The models are hand-duplicates that can
-//! drift; these tests are the living half of the tie — if model and code
-//! disagree, these fail. Added 2026-10-24 (the DFE pins were already
-//! mirrored by `dead_fn_elim.rs`'s own tests; the optimize and DSE pins
-//! were not).
+//! corresponding `*_pins` lemma pins on the MODEL (see
+//! `proofs/verus/README.md` § "Manifest checker — `check_sync.py`" for what a
+//! `pin … : MAPPED` row claims, and `proofs/verus/*.rs`). The models are
+//! hand-duplicates that can drift; these tests are the living half of the
+//! tie — if model and code disagree, these fail. Added 2026-10-24 (the DFE
+//! pins were already mirrored by `dead_fn_elim.rs`'s own tests; the
+//! optimize and DSE pins were not).
 
 use debashl::ir::{AsmSpec, AssignTarget, Decl, IrExpr, IrStmt, StrStyle, optimize_stmts};
 use debashl::transforms::dead_store_elim;
