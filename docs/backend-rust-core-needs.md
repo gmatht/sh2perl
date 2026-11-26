@@ -128,6 +128,23 @@ violated: `value=1; show() { echo "$value"; }` keeps the static, and so does
 `$( n=$((n+1)); … )`. Fixtures 11–16 in `fixtures/rust_idiom/` pin both
 directions.
 
+#### Promotion is a refusal, not a heuristic
+
+`compute_local_vars` promotes a name only when every one of these fails to
+fire: undeclared (env read), first mention not a top-level write, never
+read, mentions in more than one scope (dynamic scoping), a pinned mention
+(capture/subprocess/thread), an array/assoc store, a shell special. The
+whole-program poison list is `eval`, `.`/`source`, `declare -n` (nameref),
+`${!name}` indirection (a `!`-prefixed name — indirection reads a name
+computed at run time) and any non-literal `getVar`/`setVar` name; the
+per-name poisons are `export`/`readonly`/`declare -g`/`unset`/`read`/
+`mapfile`/`getopts`/`set`/`trap`/`printf -v NAME`/`let` and the `NAME=value`
+words those take. The harness reports the promoted-vs-stored split per
+fixture (22 promoted / 5 stored over 18 fixtures) from the same verdict the
+renderer uses, and fails a fixture when a promoted name has no binding in
+the emitted text. What stays stored is documented in
+`fixtures/rust_idiom/README.md` with the reason per name.
+
 ### 5.2c Post-render specialization and the emitted-code contract
 
 - A `printf` whose format is a literal template of text, `%s` and `%%` is

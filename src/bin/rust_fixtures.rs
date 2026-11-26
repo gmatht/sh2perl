@@ -48,14 +48,18 @@ use std::process::Command;
 // ── render paths ─────────────────────────────────────────────────────────
 
 /// Render a shell source exactly as the fixture pipeline does.
-fn render(src: &str) -> String {
+fn prepare(src: &str) -> debashl::ir::IrProgram {
     let cmds =
         debashl::parser::commands::parse_commands_from_text(src).expect("fixture failed to parse");
     let mut prog = debashl::shir::ast_to_ir(&cmds);
     debashl::transforms::apply(&mut prog.stmts);
     debashl::shir_passes::restructure_goto_only(&mut prog);
     debashl::shir_passes::strip_cfor(&mut prog);
-    debashl::rust_backend::shir_to_rust(&prog)
+    prog
+}
+
+fn render(src: &str) -> String {
+    debashl::rust_backend::shir_to_rust(&prepare(src))
 }
 
 /// Render through the A1-JSON ingress `shir_render --target rust` uses: IR →
@@ -85,6 +89,10 @@ struct Census {
     statics: usize,
     clones: usize,
     to_strings: usize,
+    /// vars emitted as a bare `let` (promoted out of the store)
+    promoted: usize,
+    /// vars still declared as a `thread_local!` static
+    stored: usize,
     allows: usize,
     /// `.unwrap()` / `.expect(` / `panic!` / `unreachable!` left in the
     /// emitted text. A generated program must never abort: every helper is
@@ -104,6 +112,8 @@ impl Census {
             statics: count("thread_local! { ") + count("static __SHV_"),
             clones: count(".clone()"),
             to_strings: count(".to_string()"),
+            promoted: 0,
+            stored: 0,
             allows: count("#[allow("),
             panics: count(".unwrap()") + count(".expect(") + count("panic!(") + count("unreachable!("),
             bash_spawns: count("Command::new(\"bash\")"),
@@ -117,6 +127,8 @@ impl Census {
         self.statics += o.statics;
         self.clones += o.clones;
         self.to_strings += o.to_strings;
+        self.promoted += o.promoted;
+        self.stored += o.stored;
         self.allows += o.allows;
         self.panics += o.panics;
         self.bash_spawns += o.bash_spawns;
@@ -332,9 +344,9 @@ fn main() {
         }
     }
     println!(
-        "{:<20} {:>5} {:>7} {:>5} {:>5} {:>5} {:>5} {:>5} {:>5} {:>7}",
-        "fixture", "lines", "statics", "clone", "to_str", "allow", "abort", "bash", "help",
-        "status"
+        "{:<20} {:>5} {:>5} {:>5} {:>5} {:>5} {:>5} {:>5} {:>5} {:>5} {:>7}",
+        "fixture", "lines", "let", "store", "clone", "to_str", "allow", "abort", "bash",
+        "help", "status"
     );
 
     let mut failures = 0usize;
@@ -344,8 +356,46 @@ fn main() {
         let src = std::fs::read_to_string(f).expect("read fixture");
         let code = render(&src);
         let out = out_dir.join(format!("{name}.rs"));
-        let c = Census::of(&code);
+        let mut c = Census::of(&code);
+        // The promoted-vs-stored split, from the SAME verdict the renderer
+        // uses, plus a proof per promoted name that a bare `let` binding
+        // carrying it is really in the emitted text.
+        let promoted = debashl::rust_backend::promoted_names(&prepare(&src));
+        c.promoted = promoted.len();
+        // store traffic as emitted: one `thread_local!` static per name
+        c.stored = code.matches("static __SHV_").count();
         total.add(c);
+        for name in &promoted {
+            let ident: String = {
+                let mut s = String::new();
+                for ch in name.chars() {
+                    if ch.is_ascii_alphanumeric() || ch == '_' {
+                        s.push(ch);
+                    } else {
+                        s.push('_');
+                    }
+                }
+                if s.is_empty() || s.starts_with(|c: char| c.is_ascii_digit()) {
+                    s.insert_str(0, "v_");
+                }
+                s
+            };
+            // a promoted name binds either as a `let`/`let mut` or as the
+            // per-iteration binding of a `for … in` loop
+            let bound = code.contains(&format!("let {ident}"))
+                || code.contains(&format!("let mut {ident}"))
+                || code.contains(&format!("for {ident} in "));
+            // A construct the renderer could not lower emits a TODO marker
+            // instead of its statements, so a promoted name may have no
+            // binding to find; the check only binds where the emission is
+            // complete.
+            if !bound && !code.contains("TODO(unsupported)") {
+                println!(
+                    "{name:<20} PROMOTED-NOT-BOUND: `{name}` is promoted but no `let {ident}` binding is in the emitted text"
+                );
+                failures += 1;
+            }
+        }
         // An abort in generated code is a generator bug, not a fixture
         // behaviour: fail the gate whatever the mode.
         if c.panics > 0 {
@@ -471,16 +521,16 @@ fn main() {
             }
         }
         println!(
-            "{name:<20} {:>5} {:>7} {:>5} {:>5} {:>5} {:>5} {:>5} {:>5}  {status}",
-            c.lines, c.statics, c.clones, c.to_strings, c.allows, c.panics, c.bash_spawns,
-            c.helpers
+            "{name:<20} {:>5} {:>5} {:>5} {:>5} {:>5} {:>5} {:>5} {:>5} {:>5}  {status}",
+            c.lines, c.promoted, c.stored, c.clones, c.to_strings, c.allows, c.panics,
+            c.bash_spawns, c.helpers
         );
     }
 
     println!(
-        "\n{:<20} {:>5} {:>7} {:>5} {:>5} {:>5} {:>5} {:>5} {:>5}",
-        "TOTAL", total.lines, total.statics, total.clones, total.to_strings, total.allows,
-        total.panics, total.bash_spawns, total.helpers
+        "\n{:<20} {:>5} {:>5} {:>5} {:>5} {:>5} {:>5} {:>5} {:>5} {:>5}",
+        "TOTAL", total.lines, total.promoted, total.stored, total.clones, total.to_strings,
+        total.allows, total.panics, total.bash_spawns, total.helpers
     );
     if let Some(e) = &clippy_err {
         eprintln!(

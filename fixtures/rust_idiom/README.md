@@ -41,7 +41,8 @@ Re-render after a backend change, then look at the diff:
    came out of it and are fixed in the emitter now. A missing component is a
    **hard gap**, not a skip: the summary prints `HARD GAP: clippy did not
    run` and the gate exits 2. (`rustup component add clippy`.)
-6. **census** — the idiom counters (per-variable statics, `.clone()`,
+6. **census** — the idiom counters (`let` bindings and `thread_local!`
+   store statics — the promoted-vs-stored split — `.clone()`,
    `.to_string()`, `#[allow(`, `abort`, `Command::new("bash")`, emitted
    `__sh_*` helpers, lines) are printed per fixture and totalled.
    "Idiomatic" is a number that has to keep moving down, not a claim in a
@@ -123,6 +124,72 @@ The two surviving parses, and the one surviving `len() as i64`:
 * `05_array` — `__SHV_arr.with(|v| v.borrow().len() as i64)` is already the
   numeric length (`Vec::len()` promoted once); it is the fixed point of the
   array-length read, not a stringify-reparse.
+
+## Promotion: the safe slice
+
+Most variables are a bare Rust binding, not a `thread_local!` static. The
+decision is a structural verdict (`compute_local_vars` in
+`src/rust_backend.rs`), never a heuristic, and every rule is a refusal:
+
+A name is promoted only when ALL hold:
+
+1. it is *declared* (a write exists — an undeclared name reads the process
+   environment, and a `let` would shadow it with `""`);
+2. its first mention is a top-level write in the owning scope (that is where
+   the `let` lands) and it is read at least once;
+3. every mention — read or write — lives in ONE scope: `main`, or one
+   function body. Two scopes means bash's dynamic scoping can connect them,
+   so it stays in the store;
+4. no mention is *pinned* (a capture block, a separate process, a thread);
+5. it is not an array or an assoc array (their storage is a `Vec`/map);
+6. it is not a shell special (`$?`, `$#`, `$@`, `$$`, …).
+
+Whole-program vetoes (every name keeps its store) — the poison list:
+
+| construct | why |
+|---|---|
+| `eval`, `.`/`source` | can read and write any name at run time |
+| `declare -n` / nameref | aliases storage by RUNTIME name and can be retargeted |
+| `${!name}` | indirection reads a name computed at run time |
+| any `getVar`/`setVar` whose name argument is not a literal | the name is computed |
+
+Per-name poisons (that name keeps its store, the rest of the program may
+still promote): `export`, `readonly`, `declare -g`, `unset`, `read`,
+`mapfile`/`readarray`, `getopts`, `set`, `trap`, `printf -v NAME`, `let`,
+and any `NAME=value` word handed to those builtins.
+
+Measured per fixture (`cargo run --bin rust_fixtures`), `let` / `store`:
+
+| fixture | let | store | the stored names, and why |
+|---|---|---|---|
+| 01, 02, 04, 06, 08, 09, 10, 11, 12, 16, 17 | 2,1,1,3,1,1,1,3,2,1,3 | 0 | — |
+| 03_capture | 1 | 0 | — |
+| 05_array | 1 | 1 | `arr` is an array (`Vec<Word>` store) |
+| 07_redirect | 0 | 0 | no variables |
+| 13_dynamic_scope | 0 | 1 | `value` is written in `main` and read in `show` — two scopes |
+| 14_capture_pin | 1 | 1 | `n` is written inside `$( … )` (a subshell) |
+| 15_export_poison | 0 | 1 | `COUNT` is exported (reachable by name from a child) |
+| 18_eval_poison | 0 | 1 | `eval` can reach `n` at run time |
+| **TOTAL** | **22** | **5** | |
+
+11_promote and 18_eval_poison are the two halves of the boundary written
+down as programs: `count`, `name`, `total` and `n` in 11 become `let`
+bindings (`let mut count = 0;`, `for n in [1, 2, 3]`), while 18's
+`n=0; n=$((n + 1)); eval 'n=$((n + 10))'; echo "$n"` keeps `__SHV_N` and
+prints the same `11` as bash. Loosening the slice must fail 18, not change
+what it prints.
+
+The numbers are measured, not asserted: the harness asks the renderer for
+`promoted_names` (the same `compute_local_vars` call the emission makes) and
+counts `static __SHV_` declarations in the emitted text, then **fails the
+fixture** if a promoted name has no `let`/`let mut`/`for … in` binding in
+that text (skipped for fixtures that carry a `TODO(unsupported)` marker,
+where the construct was not lowered at all).
+
+Still stored, and the next widening if it ever happens: a variable whose
+only write sits inside a branch (`if c; then x=1; fi; echo "$x"`) stays in
+the store — a `let` there would need a hoisted default initializer, which
+rustc flags as an unused assignment for the path that always writes first.
 
 ## Naming, lints and aborts
 

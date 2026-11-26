@@ -3236,6 +3236,35 @@ fn rhs_lit_text(rendered: &str) -> Option<&str> {
     }
 }
 
+/// The names this program promotes out of the store (a bare `let` or a
+/// `for … in` binding). This is the same pass-1/pass-2 the renderer runs
+/// (`compute_local_vars` is the same call), so the harness reports a
+/// number that cannot drift from the emission — and it checks each
+/// promoted name really appears as a binding in the emitted text.
+pub fn promoted_names(prog: &IrProgram) -> Vec<String> {
+    let mut prog = prog.clone();
+    prog.var_types = crate::shir::analyze_var_types(&prog);
+    let mut written: BTreeSet<String> = BTreeSet::new();
+    collect_written(&prog.stmts, &mut written);
+    let mut arrays: BTreeSet<String> = BTreeSet::new();
+    let mut assoc: BTreeSet<String> = BTreeSet::new();
+    collect_arrays(&prog.stmts, &mut arrays, &mut assoc);
+    let mut functions: BTreeSet<String> = BTreeSet::new();
+    collect_functions(&prog.stmts, &mut functions);
+    for (name, _) in &prog.var_types {
+        if !name.is_empty() && name.chars().all(|c| c.is_ascii_digit()) {
+            continue;
+        }
+        written.insert(name.clone());
+    }
+    written.extend(arrays.iter().cloned());
+    written.extend(assoc.iter().cloned());
+    let (locals, _, _) = compute_local_vars(&prog, &arrays, &assoc, &functions, &written);
+    let mut promoted: Vec<String> = locals.keys().cloned().collect();
+    promoted.sort();
+    promoted
+}
+
 pub fn shir_to_rust(prog: &IrProgram) -> String {
     let mut prog = prog.clone();
     prog.var_types = crate::shir::analyze_var_types(&prog);
@@ -17936,6 +17965,16 @@ fn dynamic_var_names(prog: &IrProgram) -> Option<BTreeSet<String>> {
                     && !matches!(args.first(), Some(IrExpr::Str(_, _)))
                 {
                     return false;
+                }
+                // `${!name}` arrives as a `!`-prefixed name: indirection
+                // reads a name computed at run time, which a `let` cannot
+                // serve, so the whole program keeps its store.
+                if func == "getVar" || func == "setVar" {
+                    if let Some(IrExpr::Str(name, _)) = args.first() {
+                        if name.starts_with('!') {
+                            return false;
+                        }
+                    }
                 }
                 // The `builtin`/`exec` CALL form carries the command name as
                 // its first Str arg — the same shapes the Exec arm handles.
