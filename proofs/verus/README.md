@@ -8609,3 +8609,78 @@ leading-zero mutant. The file was restored byte-identically after each run
   `last_statement_store_is_live_without_a_reader`, `bare_exit_reads_the_status`);
   the body-localisation and `program_reads_status` tests belong to the
   companion models.
+
+## status_reads_traversal.rs — the owed `$?`-traversal law, discharged (68)
+
+    verus --triggers-mode silent --rlimit 40 proofs/verus/status_reads_traversal.rs
+    -> verification results:: 68 verified, 0 errors
+
+`status_reads.rs` proves the store-liveness law **under** three per-statement
+facts it takes as given (`reads`, `stores`, `nested`) and says so in its
+header: "that `stmt_reads_status_in` is a may-over-approximation of the `$?`
+occurrences … is a syntax-traversal property over ~30 `IrStmt`/`IrExpr`
+variants … an argument, not a proof." This file is that proof, over a grammar
+with one constructor per source arm, and **two independent recursions**: the
+analysis transcribed from the source, and a semantic side that collects what
+the walk must visit (`flat_*` into a sequence of atoms), emits what the
+renderer writes (`emit_s`), or orders the events a nested list produces
+(`evs_l`).
+
+### What is proved
+
+- **`reads_exact_s` / `reads_exact_x`** (and the list/clause helpers): the
+  analysis's answer EQUALS the atom collection, so both directions are
+  caught — a forgotten arm (false negative) and an over-claim. Corollary
+  `reads_complete_s` is the plan's `reads_is_may_approx`.
+- **`stores_is_must`**: `stmt_definitely_stores_status(s)` implies the
+  statement's own emitted fragment writes the register. The right-hand side
+  is written from the renderer's placement, so this is the arm where the
+  command-substitution assign is load-bearing: it renders through
+  `__sh_bash` and leaves the register alone, which is exactly why the
+  analysis must not trust it. The control-flow constructs pass because
+  bash's `if`/`while`/`for`/`case` set `$?` on every path (0 when no branch
+  runs) — that fact is in `emit_s`, not in the analysis.
+- **`nested_complete`**: a nested list that reads `$?` before its own first
+  definite store implies `stmt_nested_reads_before_store(s)`. One-way on
+  purpose: the source also counts a condition read there, so it may
+  over-claim (keep more stores), never miss. The bridge
+  `starts_read(evs_l(l)) == rbs_l(l)` is the induction that makes the event
+  ordering and the source's list predicate the same verdict.
+- **`facts_sound`**: all three, in one statement, for the consumer.
+
+### Mutants, measured
+
+Five are counted: dropping the `Cap` arm, the `Try` bodies, the `ForInit`
+step list, the `DoWhile` body, or the `MethodCall` children each gives
+**67 verified, 1 error**. Four more are refuted one stage earlier, at
+simplification, by the concrete pins: a literal text that is never a read
+(`pin_test_operand_is_a_read`), the assign arm ignoring its capture guard
+(`pin_capture_assign_does_not_store`), the nested walk dropping `Redirect`
+(`pin_nested_redirect_reads_before_store`) and dropping the `case` clauses
+(`pin_case_clause_is_scanned_and_body_is_not`) — the same rejection class the
+README records for typeset_attrs' leading-zero mutant. Restored
+byte-identically after each run (sha256 in
+`status_reads_traversal_sync.txt`).
+
+### Scope (read this before quoting it)
+
+- One constructor per source arm, but an expression's children are carried as
+  a `Seq` (Rust layout; the structural order is the sequence's). `Interp`
+  carries literal parts with their `$?` bit and expression parts; `Call`
+  classifies the function (status-named, `block`, `getVar("?")`, a capture
+  spelling, the four non-storing print arms, plain).
+- TEXT is atomic: `StrQ(q)` / `LitQ(q)` mean "this text contains `$?`". The
+  model does not re-derive `str::contains`; it states the property the
+  analysis keys on, which `program_reads_status`'s Debug fallback provides
+  in practice.
+- `emit_s` is a model of the RENDERER's register placement, not a proof of
+  it; that the backends emit those instructions is a renderer contract,
+  anchored end-to-end, not proved here.
+- Out of model, stated: the call-site machine for bodies (the per-body
+  vector is the same scan, see `status_reads.rs`), and the variants the
+  source's own `_ => false` arm declines to analyse — the model carries
+  `OtherX`/`OtherS` for those and analyses them as nothing, exactly as the
+  source does.
+- The source's `a_sub_body_localises_its_own_reads` and
+  `a_body_read_of_the_callers_status_keeps_everything` are the body-machine
+  tests and are not this file's.
