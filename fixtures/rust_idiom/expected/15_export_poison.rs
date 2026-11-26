@@ -3,7 +3,7 @@ type Word = std::borrow::Cow<'static, str>;
 
 static __SH_RC: std::sync::atomic::AtomicI32 = std::sync::atomic::AtomicI32::new(0);
 
-thread_local! { static __SH_VARS: std::cell::RefCell<__ShStore> = const { std::cell::RefCell::new(__ShStore { vars: std::collections::BTreeMap::new(), ro_trip: false, at_line: 0 }) }; }
+thread_local! { static __SH_VARS: std::cell::RefCell<__ShStore> = const { std::cell::RefCell::new(__ShStore { vars: std::collections::BTreeMap::new(), ro_trip: false, unwind: false, at_line: 0 }) }; }
 
 static __SH_ARITH_ERR: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
 
@@ -50,12 +50,35 @@ impl __ShVar {
 struct __ShStore {
     vars: std::collections::BTreeMap<String, __ShVar>,
     ro_trip: bool,
+    /// set by a REFUSED ASSIGNMENT: bash answers one by unwinding every
+    /// enclosing compound command back to the top level (the shell keeps
+    /// running, the statement's status is 1). Cleared at the top level, so a
+    /// refused `unset` — which bash fails without unwinding — never sets it.
+    unwind: bool,
     /// source line of the statement being executed (`__sh_v_at`), which is
     /// what bash prefixes a refused write's diagnostic with
     at_line: u32,
 }
 fn __sh_v_rc_trip() -> bool {
     __SH_VARS.with(|s| std::mem::replace(&mut s.borrow_mut().ro_trip, false))
+}
+
+/// A refused assignment unwinds the enclosing compound commands: the body it
+/// happened in, then every body around it, up to the top-level statement list.
+/// Each emitted body asks this at the end of every statement and leaves itself
+/// when it is set; the top level clears it, so the shell carries on with the
+/// refused assignment's status — exactly what bash does.
+fn __sh_v_unwind_pending() -> bool {
+    __SH_VARS.with(|s| s.borrow().unwind)
+}
+fn __sh_v_unwind_clear() {
+    __SH_VARS.with(|s| s.borrow_mut().unwind = false);
+}
+/// Re-arm the status trip as the function returns to its caller: bash's
+/// function ended on the refused assignment, so the CALL's status is 1 and
+/// the caller's own status write reads it from here.
+fn __sh_v_unwind_trip() {
+    __SH_VARS.with(|s| s.borrow_mut().ro_trip = true);
 }
 
 /// The diagnostic prefix a shell diagnostic carries: bash prints `$0`, and
@@ -96,6 +119,7 @@ fn __sh_v_put(name: &str, val: __ShVal) {
         let e = st.vars.entry(name.to_string()).or_insert_with(__ShVar::empty);
         if e.readonly {
             st.ro_trip = true;
+            st.unwind = true;
             denied = true;
             return;
         }

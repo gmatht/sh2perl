@@ -333,6 +333,18 @@ pub struct Render {
     /// store write prints bash's line wherever it sits — function, loop,
     /// subshell body — not just at top level.
     stmt_lines_by_addr: std::collections::HashMap<usize, usize>,
+    /// Does the program declare a readonly name ANYWHERE (pre-pass over the
+    /// IR)? The unwind guards exist only for a refused assignment, so a
+    /// program without one emits exactly the text it always did.
+    program_readonly: bool,
+    /// While a function body renders: how it leaves on a refused assignment
+    /// (`return;`, or `return <value>` in a value-returning function).
+    unwind_fn_ret: Option<String>,
+    /// Labels of the labeled blocks currently open for the unwind, innermost
+    /// last. A compound-command body opens one (`'unwind`, `'unwind1`, … —
+    /// unique per depth, so a nested body does not shadow its parent), and
+    /// `stmt` emits the leave-guard only while the stack is non-empty.
+    unwind_labels: Vec<String>,
     /// function definitions (name, body stmts) — for `typeset -f`
     fn_defs: Vec<(String, Vec<IrStmt>, bool)>,
     /// var -> captured local (background-thread bodies)
@@ -9023,9 +9035,11 @@ impl Render {
         // the captured commands must NOT consume the stage's stdin (a
         // nested mktemp would eat the pipeline buffer)
         self.emit("let __cap_oldin = __SH_STDIN.lock().unwrap().take();");
+        self.unwind_begin();
         for s in stmts {
             self.stmt(s);
         }
+        self.unwind_end();
         self.emit("*__SH_STDIN.lock().unwrap() = __cap_oldin;");
         self.emit("let __cap = __SH_OUT.lock().unwrap().take().unwrap();");
         self.emit("*__SH_OUT.lock().unwrap() = __old;");
@@ -9224,16 +9238,20 @@ impl Render {
                     self.emit("let __old = __SH_OUT.lock().unwrap().take();");
                     self.emit("*__SH_OUT.lock().unwrap() = Some(Vec::new());");
                     let oldout2 = oldout.clone();
+                    self.unwind_begin();
                     for s in st {
                         self.stmt(s);
                     }
+                    self.unwind_end();
                     self.emit(&format!("{buf} = __SH_OUT.lock().unwrap().take().unwrap();"));
                     self.emit("*__SH_OUT.lock().unwrap() = __old;");
                     self.emit(&format!("__SH_OUTFILE_TL.with(|v| *v.borrow_mut() = {oldout2});"));
                 } else {
+                    self.unwind_begin();
                     for s in st {
                         self.stmt(s);
                     }
+                    self.unwind_end();
                 }
                 if idx > 0 {
                     self.emit("*__SH_STDIN.lock().unwrap() = __oldin;");
@@ -9316,6 +9334,7 @@ impl Render {
         }
         self.loop_rc_last.pop();
         self.emit(&format!("{last} = __SH_RC.load(Ordering::SeqCst);"));
+        self.unwind_loop_end();
         self.depth -= 1;
         self.loop_depth -= 1;
         self.emit("}");
@@ -9343,9 +9362,11 @@ impl Render {
         let saved = std::mem::take(&mut self.out);
         let old_depth = self.depth;
         self.depth = 0;
+        self.unwind_begin();
         for s in stmts {
             self.stmt(s);
         }
+        self.unwind_end();
         self.emit("__SH_RC.load(Ordering::SeqCst) == 0");
         let block = self.out.join("\n");
         self.out = saved;
@@ -9395,9 +9416,11 @@ impl Render {
                 self.emit("if __SH_RC.load(Ordering::SeqCst) == 0 {");
                 self.depth += 1;
             }
+            self.unwind_begin();
             for s in b {
                 self.stmt(s);
             }
+            self.unwind_end();
             if i > 0 {
                 self.depth -= 1;
                 self.emit("}");
@@ -9416,9 +9439,11 @@ impl Render {
                 self.emit("if __SH_RC.load(Ordering::SeqCst) == 0 {");
                 self.depth += 1;
             }
+            self.unwind_begin();
             for s in b {
                 self.stmt(s);
             }
+            self.unwind_end();
             if i > 0 {
                 self.depth -= 1;
                 self.emit("}");
@@ -9839,9 +9864,11 @@ impl Render {
                 self.emit(&p.replace(&format!("&{te}"), "&__ps_tmp_loc"));
             }
             self.in_closure += 1;
+            self.unwind_begin();
             for s in inner {
                 self.stmt(s);
             }
+            self.unwind_end();
             self.in_closure -= 1;
             for p in &post {
                 self.emit(&p.replace(&format!("&{te}"), "&__ps_tmp_loc"));
@@ -9860,9 +9887,11 @@ impl Render {
         for p in pre {
             self.emit(&p);
         }
+        self.unwind_begin();
         for s in inner {
             self.stmt(s);
         }
+        self.unwind_end();
         for p in post {
             self.emit(&p);
         }
@@ -10275,6 +10304,7 @@ impl Render {
                 self.emit("}");
             }
             self.emit(&format!("{idx_g} += 1;"));
+            self.unwind_loop_end();
             self.depth -= 1;
             self.loop_depth -= 1;
             self.emit("}");
@@ -10656,6 +10686,31 @@ impl Render {
                 Part::Words(w) => w,
             })
             .collect();
+        // A printed word list that CALLS a user function prints the callee's
+        // echo text — but a refused assignment inside the callee abandons its
+        // body, so bash's echo never ran and the line must not be printed at
+        // all (the value is still computed first; the status comes from the
+        // refusal through `__sh_v_rc_trip`).
+        if self.unwind_active() && !self.word_fail_guard {
+            let fns: Vec<String> = self.functions.iter().cloned().collect();
+            let mut calls_fn = false;
+            for f in &fns {
+                let m = self.fn_ident(f);
+                if ws.iter().any(|w| w.contains(&format!("{m}("))) {
+                    calls_fn = true;
+                }
+            }
+            if calls_fn {
+                self.add_helper("print_words");
+                self.emit(&format!("let __shv_p = &[{}];", ws.join(", ")));
+                self.emit(&format!(
+                    "if !__sh_v_unwind_pending() {{ __sh_print_words(__shv_p, {}, {}); }}",
+                    nl, esc
+                ));
+                self.emit("__SH_RC.store(0, Ordering::SeqCst);");
+                return;
+            }
+        }
         self.add_helper("print_words");
         if self.word_fail_guard {
             // a guarded word may raise the fail flag while its args
@@ -11560,27 +11615,95 @@ impl Render {
         }
     }
 
+    /// Guards, labels and the unwind flag are only meaningful in a program
+    /// that can refuse a store write at all.
+    fn unwind_active(&self) -> bool {
+        self.program_readonly
+    }
+
+    /// Open the body of a compound command (`if`/`elif`/`else`, a loop body,
+    /// a `{ }` block, a subshell list, a function body) as a labeled block:
+    /// bash answers a REFUSED ASSIGNMENT by abandoning the body it happened
+    /// in and then every body around it, and `break 'unwind` is exactly one
+    /// of those steps. Only emitted when the program carries a readonly
+    /// declaration, so every other program's text is unchanged.
+    fn unwind_begin(&mut self) {
+        if !self.unwind_active() {
+            return;
+        }
+        let label = if self.unwind_labels.is_empty() {
+            "'unwind".to_string()
+        } else {
+            format!("'unwind{}", self.unwind_labels.len())
+        };
+        self.emit(&format!("{label}: {{"));
+        self.depth += 1;
+        self.unwind_labels.push(label);
+    }
+
+    fn unwind_end(&mut self) {
+        if !self.unwind_active() {
+            return;
+        }
+        self.unwind_labels.pop();
+        self.depth -= 1;
+        self.emit("}");
+    }
+
+    /// One step of the unwind: leave the rest of this body when a refused
+    /// assignment happened in it (or in a compound nested inside it).
+    /// One step of the unwind, emitted BEFORE a statement: after a refused
+    /// assignment bash runs nothing else in the body it happened in or in any
+    /// body around it (up to the top-level list), so every later statement of
+    /// every open body starts with this test. Emitting it ahead of the
+    /// statement — rather than behind it — keeps the body's LAST statement the
+    /// value expression it has always been (no stranded `return` at the end of
+    /// a value-returning function) and can never land after a diverting
+    /// statement.
+    fn unwind_guard(&mut self) {
+        if !self.unwind_active() {
+            return;
+        }
+        if let Some(label) = self.unwind_labels.last().cloned() {
+            self.emit(&format!("if __sh_v_unwind_pending() {{ break {label}; }}"));
+        } else if let Some(ret) = self.unwind_fn_ret.clone() {
+            self.emit(&format!(
+                "if __sh_v_unwind_pending() {{ __sh_v_unwind_trip(); {ret} }}"
+            ));
+        }
+    }
+
+    /// End of a loop body: the body's own labeled block already left the
+    /// rest of the iteration, and `break` is the loop's step of the unwind
+    /// (bash abandons the whole loop, not just the iteration).
+    fn unwind_loop_end(&mut self) {
+        if self.unwind_active() {
+            self.emit("if __sh_v_unwind_pending() { break; }");
+        }
+    }
+
     /// Render one statement. The line comes from the address-keyed map built
     /// at render start, so the anchor is emitted for a statement at ANY depth
     /// — a refusal inside a function/loop/subshell body names the line bash
     /// names, not the top-level statement's. `cur_line` is saved/restored
     /// across the statement so a sibling without markup does not inherit it.
     fn stmt(&mut self, s: &IrStmt) {
+        self.unwind_guard();
         if self.readonly_vars.is_empty() {
             self.stmt_body(s);
-            return;
-        }
-        match self
-            .stmt_lines_by_addr
-            .get(&(s as *const IrStmt as usize))
-            .copied()
-        {
-            Some(line) => {
-                let saved = self.cur_line.replace(line);
-                self.store_line_marker(s, line);
-                self.cur_line = saved;
+        } else {
+            match self
+                .stmt_lines_by_addr
+                .get(&(s as *const IrStmt as usize))
+                .copied()
+            {
+                Some(line) => {
+                    let saved = self.cur_line.replace(line);
+                    self.store_line_marker(s, line);
+                    self.cur_line = saved;
+                }
+                None => self.stmt_body(s),
             }
-            None => self.stmt_body(s),
         }
     }
 
@@ -11646,9 +11769,11 @@ impl Render {
         // Render through a buffer and shift the whole block back.
         let mark = self.out.len();
         self.depth += 1;
+        self.unwind_begin();
         for s in stmts {
             self.stmt(s);
         }
+        self.unwind_end();
         self.depth -= 1;
         let body: Vec<String> = self.out.drain(mark..).collect();
         // The body ended with its own `}` line — the elided `if cond {`
@@ -11804,9 +11929,11 @@ impl Render {
                         if i > 0 {
                             self.emit("if __SH_RC.load(Ordering::SeqCst) != 0 {");                            self.depth += 1;
                         }
+                        self.unwind_begin();
                         for s in b {
                             self.stmt(s);
                         }
+                        self.unwind_end();
                         if i > 0 {
                             self.depth -= 1;
                             self.emit("}");
@@ -12283,25 +12410,31 @@ impl Render {
                     } else {
                         self.emit(&format!("if {} {{", Self::unparen(&c)));
                         self.depth += 1;
+                        self.unwind_begin();
                         for s in then {
                             self.stmt(s);
                         }
+                        self.unwind_end();
                         self.depth -= 1;
                         for (ec, body) in elsifs {
                             let ec = Self::unwrap_cond(&self.expr_bool(ec));
                             self.emit(&format!("}} else if {} {{", Self::unparen(&ec)));
                             self.depth += 1;
+                            self.unwind_begin();
                             for s in body {
                                 self.stmt(s);
                             }
+                            self.unwind_end();
                             self.depth -= 1;
                         }
                         if !else_.is_empty() {
                             self.emit("} else {");
                             self.depth += 1;
+                            self.unwind_begin();
                             for s in else_ {
                                 self.stmt(s);
                             }
+                            self.unwind_end();
                             self.depth -= 1;
                         } else if !self.rc_disabled
                             && !crate::shir::stmt_status_write_is_unread(s)
@@ -12315,25 +12448,31 @@ impl Render {
                 } else {
                     self.emit(&format!("if {} {{", Self::unparen(&c)));
                     self.depth += 1;
+                    self.unwind_begin();
                     for s in then {
                         self.stmt(s);
                     }
+                    self.unwind_end();
                     self.depth -= 1;
                     for (ec, body) in elsifs {
                         let ec = Self::unwrap_cond(&self.expr_bool(ec));
                         self.emit(&format!("}} else if {} {{", Self::unparen(&ec)));
                         self.depth += 1;
+                        self.unwind_begin();
                         for s in body {
                             self.stmt(s);
                         }
+                        self.unwind_end();
                         self.depth -= 1;
                     }
                     if !else_.is_empty() {
                         self.emit("} else {");
                         self.depth += 1;
+                        self.unwind_begin();
                         for s in else_ {
                             self.stmt(s);
                         }
+                        self.unwind_end();
                         self.depth -= 1;
                     } else if !self.rc_disabled && !crate::shir::stmt_status_write_is_unread(s) {
                         // No branch ran ⇒ bash's `$?` is 0, so the if
@@ -12393,14 +12532,17 @@ impl Render {
                     self.emit(&format!("{ran} = true;"));
                     self.loop_rc_last.push(last.clone());
                 }
+                self.unwind_begin();
                 for s in body {
                     self.stmt(s);
                 }
+                self.unwind_end();
                 if track {
                     self.loop_rc_last.pop();
                     self.emit(&format!("{last} = __SH_RC.load(Ordering::SeqCst);"));
                 }
                 self.trim_trailing_blanks();
+                self.unwind_loop_end();
                 self.depth -= 1;
                 self.loop_depth -= 1;
                 self.emit("}");
@@ -12419,11 +12561,14 @@ impl Render {
                 self.loop_depth += 1;
                 self.depth += 1;
                 self.loop_rc_last.push(last.clone());
+                self.unwind_begin();
                 for s in body {
                     self.stmt(s);
                 }
+                self.unwind_end();
                 self.loop_rc_last.pop();
                 self.emit(&format!("{last} = __SH_RC.load(Ordering::SeqCst);"));
+                self.unwind_loop_end();
                 self.depth -= 1;
                 self.loop_depth -= 1;
                 let c = self.expr_bool(cond);
@@ -12523,10 +12668,13 @@ impl Render {
                                 self.emit(&format!("{wb};"));
                             }
                             self.active_loop.push((var.to_string(), binding, LoopBind::Num));
+                            self.unwind_begin();
                             for s in body {
                                 self.stmt(s);
                             }
+                            self.unwind_end();
                             self.active_loop.pop();
+                            self.unwind_loop_end();
                             self.depth -= 1;
                             self.loop_depth -= 1;
                             self.emit("}");
@@ -12542,9 +12690,12 @@ impl Render {
                         self.emit(&format!("loop {{ if !({cond} <= {end}) {{ break; }}"));
                         self.loop_depth += 1;
                         self.depth += 1;
+                        self.unwind_begin();
                         for s in body {
                             self.stmt(s);
                         }
+                        self.unwind_end();
+                        self.unwind_loop_end();
                         self.depth -= 1;
                         self.loop_depth -= 1;
                         let cur = self.read_num(var);
@@ -12766,12 +12917,15 @@ impl Render {
                             if let Some(b) = b {
                                 self.active_loop.push((var.to_string(), b, kind));
                             }
+                            self.unwind_begin();
                             for s in body {
                                 self.stmt(s);
                             }
+                            self.unwind_end();
                             if pushed {
                                 self.active_loop.pop();
                             }
+                            self.unwind_loop_end();
                             self.depth -= 1;
                             self.loop_depth -= 1;
                             self.emit("}");
@@ -12803,10 +12957,13 @@ impl Render {
                             self.emit(&st);
                         }
                         let old_for = self.for_index.replace(idx_g.clone());
+                        self.unwind_begin();
                         for s in body {
                             self.stmt(s);
                         }
+                        self.unwind_end();
                         self.for_index = old_for;
+                        self.unwind_loop_end();
                         self.depth -= 1;
                         self.loop_depth -= 1;
                         self.emit(&format!("{idx_g} += 1;"));
@@ -12878,9 +13035,11 @@ impl Render {
                 }
             }
             IrStmt::Block(b) => {
+                self.unwind_begin();
                 for s in b {
                     self.stmt(s);
                 }
+                self.unwind_end();
             }
             IrStmt::Subshell(b) => self.subshell_render(b),
             IrStmt::Background(b) => self.background_render(b),
@@ -12995,23 +13154,31 @@ impl Render {
             // Except clauses skipped (no error to catch — t78). Early
             // return/break inside skips finally (documented gap).
             IrStmt::Try { body, else_body, finally_body, .. } => {
+                self.unwind_begin();
                 for s in body {
                     self.stmt(s);
                 }
+                self.unwind_end();
+                self.unwind_begin();
                 for s in else_body {
                     self.stmt(s);
                 }
+                self.unwind_end();
+                self.unwind_begin();
                 for s in finally_body {
                     self.stmt(s);
                 }
+                self.unwind_end();
                 self.emit("__SH_RC.store(0, Ordering::SeqCst);");
             }
             IrStmt::Select { .. } => self.mark_todo("select"),
             IrStmt::Asm { .. } => self.mark_todo("asm"),
             IrStmt::ForInit { init, cond, step, body } => {
+                self.unwind_begin();
                 for s in init {
                     self.stmt(s);
                 }
+                self.unwind_end();
                 let c = self.expr_bool(cond);
                 // c-style for: rc = the last BODY command's rc (bash) — the
                 // cond eval clobbers __SH_RC each iteration, so capture the
@@ -13025,18 +13192,23 @@ impl Render {
                 self.depth += 1;
                 self.emit(&format!("{ran} = true;"));
                 self.loop_rc_last.push(last.clone());
+                self.unwind_begin();
                 for s in body {
                     self.stmt(s);
                 }
+                self.unwind_end();
                 self.loop_rc_last.pop();
                 self.emit(&format!("{last} = __SH_RC.load(Ordering::SeqCst);"));
+                self.unwind_loop_end();
                 self.depth -= 1;
                 self.loop_depth -= 1;
                 self.emit("if true {");
                 self.depth += 1;
+                self.unwind_begin();
                 for s in step {
                     self.stmt(s);
                 }
+                self.unwind_end();
                 self.depth -= 1;
                 self.emit("}");
                 self.emit("}");
@@ -13116,11 +13288,21 @@ impl Render {
         for p in pre {
             self.emit(&p);
         }
+        self.unwind_begin();
         for s in body {
             self.stmt(s);
         }
+        self.unwind_end();
         for p in post {
             self.emit(&p);
+        }
+        // A subshell is its own shell: bash unwinds its command list, keeps
+        // the list's status (the refusal's 1) as the subshell's own, and the
+        // enclosing shell never learns about it — so the flag dies here.
+        if self.unwind_active() {
+            self.emit(
+                "if __sh_v_unwind_pending() { __SH_RC.store(1, Ordering::SeqCst); __sh_v_unwind_clear(); }",
+            );
         }
     }
 
@@ -13156,9 +13338,11 @@ impl Render {
         self.depth = 1;
         let old_captured = std::mem::replace(&mut self.captured, captured);
         self.in_closure += 1;
+        self.unwind_begin();
         for s in body {
             self.stmt(s);
         }
+        self.unwind_end();
         self.in_closure -= 1;
         let body_src = self.out.join("\n");
         self.captured = old_captured;
@@ -13215,6 +13399,7 @@ impl Render {
     }
 
     fn program(&mut self, prog: &IrProgram) {
+        self.program_readonly = program_declares_readonly(&prog.stmts);
         // Statement address -> source line, from the IR markup, BEFORE any
         // rendering: the hoisted function bodies are rendered (probe + commit)
         // out of CLONES staged further down, so each phase re-stages the map
@@ -13336,9 +13521,11 @@ impl Render {
                     collect_numeric_positionals(body, &mut cached);
                     self.num_param_cache = cached;
                 }
+                self.unwind_begin();
                 for st in body {
                     self.stmt(st);
                 }
+                self.unwind_end();
                 self.num_param_cache.clear();
                 self.in_function = false;
                 self.active_shift = None;
@@ -13434,6 +13621,12 @@ impl Render {
         // clones are gone by now).
         self.stmt_lines_by_addr = Self::stmt_line_map(prog);
         for s in prog.stmts.iter() {
+            // A refused assignment unwound every compound up to here; bash
+            // keeps running, so the top-level list clears the flag and the
+            // next statement executes with the refusal's status (1) intact.
+            if self.unwind_active() {
+                self.emit("__sh_v_unwind_clear();");
+            }
             self.stmt(s);
         }
         self.cur_line = None;
@@ -13627,9 +13820,31 @@ impl Render {
                     ));
                 }
             }
+            // A refused assignment abandons the function body: bash returns
+            // from the function with the refused assignment's status (1), and
+            // the caller carries on (the call itself is unwound next if it
+            // sits in a compound body). The body is NOT a labeled block: a
+            // function frame leaves with `return`, so the value tail below
+            // stays exactly where it was.
+            self.unwind_fn_ret = if self.unwind_active() {
+                // a value-returning function leaves with an empty value: the
+                // register holds whatever the abandoned body last stored, and
+                // READING it here would keep the `__SH_RET` drop-off pass from
+                // turning the body's tail into its value expression. The status
+                // is the refusal's (1), which is what the caller observes.
+                Some(if sig.is_some() && value_used {
+                    "return String::new();"
+                } else {
+                    "return;"
+                }
+                .to_string())
+            } else {
+                None
+            };
             for st in body {
                 self.stmt(st);
             }
+            self.unwind_fn_ret = None;
             self.num_param_cache.clear();
             self.active_fn = None;
             self.active_shift = None;
@@ -13700,7 +13915,7 @@ impl Render {
         // carries `__ShVar`/`__ShVal`, and a program with no unpromoted
         // variable must not carry a dead static)
         if self.helpers.contains("vars") {
-            self.emit("thread_local! { static __SH_VARS: std::cell::RefCell<__ShStore> = const { std::cell::RefCell::new(__ShStore { vars: std::collections::BTreeMap::new(), ro_trip: false, at_line: 0 }) }; }");
+            self.emit("thread_local! { static __SH_VARS: std::cell::RefCell<__ShStore> = const { std::cell::RefCell::new(__ShStore { vars: std::collections::BTreeMap::new(), ro_trip: false, unwind: false, at_line: 0 }) }; }");
         }
         self.emit("static __SH_TRAPS: std::sync::Mutex<Vec<String>> = std::sync::Mutex::new(Vec::new());");
         self.emit("static __SH_BGPID: std::sync::atomic::AtomicI32 = std::sync::atomic::AtomicI32::new(0);");
@@ -14398,12 +14613,35 @@ impl __ShVar {
 struct __ShStore {
     vars: std::collections::BTreeMap<String, __ShVar>,
     ro_trip: bool,
+    /// set by a REFUSED ASSIGNMENT: bash answers one by unwinding every
+    /// enclosing compound command back to the top level (the shell keeps
+    /// running, the statement's status is 1). Cleared at the top level, so a
+    /// refused `unset` — which bash fails without unwinding — never sets it.
+    unwind: bool,
     /// source line of the statement being executed (`__sh_v_at`), which is
     /// what bash prefixes a refused write's diagnostic with
     at_line: u32,
 }
 fn __sh_v_rc_trip() -> bool {
     __SH_VARS.with(|s| std::mem::replace(&mut s.borrow_mut().ro_trip, false))
+}
+
+/// A refused assignment unwinds the enclosing compound commands: the body it
+/// happened in, then every body around it, up to the top-level statement list.
+/// Each emitted body asks this at the end of every statement and leaves itself
+/// when it is set; the top level clears it, so the shell carries on with the
+/// refused assignment's status — exactly what bash does.
+fn __sh_v_unwind_pending() -> bool {
+    __SH_VARS.with(|s| s.borrow().unwind)
+}
+fn __sh_v_unwind_clear() {
+    __SH_VARS.with(|s| s.borrow_mut().unwind = false);
+}
+/// Re-arm the status trip as the function returns to its caller: bash's
+/// function ended on the refused assignment, so the CALL's status is 1 and
+/// the caller's own status write reads it from here.
+fn __sh_v_unwind_trip() {
+    __SH_VARS.with(|s| s.borrow_mut().ro_trip = true);
 }
 
 /// The diagnostic prefix a shell diagnostic carries: bash prints `$0`, and
@@ -14444,6 +14682,7 @@ fn __sh_v_put(name: &str, val: __ShVal) {
         let e = st.vars.entry(name.to_string()).or_insert_with(__ShVar::empty);
         if e.readonly {
             st.ro_trip = true;
+            st.unwind = true;
             denied = true;
             return;
         }
@@ -18028,6 +18267,43 @@ fn arith_uses_bigint(a: &ArithAst, big: &BTreeSet<String>) -> bool {
 /// text; mods/compares on them need BigInt, not i64).
 /// True if stmts contain any huge Arith/literal (for program-wide
 /// bigint marking; t91 set with 2**100 needs total as BigInt).
+/// Does any statement in the tree DECLARE a readonly name (`readonly`,
+/// `declare -r`, `typeset -r`, `local -r`)? Only then can a store write be
+/// refused, and only then does the emitter spend the unwind guards. A
+/// pre-pass because main renders before the hoisted function bodies: the
+/// render-time `readonly_vars` set is not yet complete when a compound in
+/// main is emitted.
+fn program_declares_readonly(stmts: &[IrStmt]) -> bool {
+    stmts.iter().any(|s| {
+        // the declaration builtin is args[0] of the exec/builtin call (the
+        // call's `func` is the executor), its names/flags the array after it
+        let declares = match s {
+            IrStmt::Expr(IrExpr::Call { func, args }) => {
+                let head = match args.first() {
+                    Some(IrExpr::Str(h, _)) => h.as_str(),
+                    _ => func.as_str(),
+                };
+                let ro_flag = args.iter().any(|a| match a {
+                    IrExpr::Str(t, _) => t.starts_with('-') && t.contains('r'),
+                    IrExpr::Array(elems) => elems.iter().any(|e| {
+                        matches!(e, IrExpr::Str(t, _)
+                            if t.starts_with('-') && t.contains('r'))
+                    }),
+                    _ => false,
+                });
+                head == "readonly"
+                    || (ro_flag
+                        && matches!(head, "declare" | "typeset" | "local"))
+            }
+            _ => false,
+        };
+        declares
+            || crate::ir::stmt_child_vecs(s)
+                .iter()
+                .any(|v| program_declares_readonly(v))
+    })
+}
+
 fn stmts_have_huge(stmts: &[IrStmt]) -> bool {
     use num_bigint::BigInt;
     fn expr_huge(e: &IrExpr) -> bool {

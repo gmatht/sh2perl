@@ -266,21 +266,29 @@ fn generate(rng: &mut Rng) -> String {
             // repeated NESTED — a function body, an `if` and a `for` body, a
             // subshell — because the line bash names is the OFFENDING
             // statement's, not the enclosing compound's, and because the status
-            // it leaves in `$?` is the one the refused statement set (bash
-            // aborts a body on a refused assignment, so each body below holds
-            // exactly one, and `$?` is read after the compound where both
-            // shells still agree; a refused `unset` only fails its command).
+            // it leaves in `$?` is the one the refused statement set. Each body
+            // carries a statement AFTER the refusal: bash abandons the body it
+            // happened in and every body around it (a loop stops, a function
+            // returns, the shell's own list carries on), so that statement must
+            // NOT run and the status read after the compound must be 1 — the
+            // whole (stdout, stderr, rc) triple has to match. A refused `unset`
+            // fails only its own command, so those bodies do run to the end and
+            // read `$?` right there.
             36 => {
                 if !s.contains("readonly R=") {
                     s.push_str("readonly R=\"$b\"\n");
                 }
                 s.push_str("R=\"$b-x\"\necho \"r=$R rc=$?\"\n");
-                s.push_str("rn() {\n  R=\"$b-y\"\n}\nrn\necho \"rn=$R rc=$?\"\n");
-                s.push_str("if [ -n \"${b}x\" ]; then\n  R=\"$b-z\"\nfi\necho \"ri=$R rc=$?\"\n");
-                s.push_str("for w in \"$b\"; do\n  R=\"$b-w\"\ndone\necho \"rf=$R rc=$?\"\n");
-                s.push_str("( R=\"$b-s\" )\necho \"rs=$R rc=$?\"\n");
+                s.push_str("rn() {\n  R=\"$b-y\"\n  echo \"rn-after\"\n}\nrn\necho \"rn=$R rc=$?\"\n");
+                s.push_str("if [ -n \"${b}x\" ]; then\n  R=\"$b-z\"\n  echo \"ri-after\"\nfi\necho \"ri=$R rc=$?\"\n");
+                s.push_str(
+                    "for w in \"$b\" \"$c\"; do\n  R=\"$b-w\"\n  echo \"rf-after\"\ndone\necho \"rf=$R rc=$?\"\n",
+                );
+                s.push_str("( R=\"$b-s\"; echo \"rs-after\" )\necho \"rs=$R rc=$?\"\n");
                 if rng.chance(2) {
-                    s.push_str("if [ -n \"${b}x\" ]; then\n  unset R\nfi\necho \"rui=$R rc=$?\"\n");
+                    s.push_str(
+                        "if [ -n \"${b}x\" ]; then\n  unset R\n  echo \"rui-after rc=$?\"\nfi\necho \"rui=$R rc=$?\"\n",
+                    );
                 }
                 s.push_str("unset R\necho \"ru=$R rc=$?\"\n");
             }

@@ -34,53 +34,79 @@ echo "aftersub=$n"
 echo alpha | while read -r w; do echo "pipe=$w n=$n"; done
 echo "after=$n"
 
-# ── nested refusals name the OFFENDING statement's line ──
-# bash aborts the enclosing compound BODY when an assignment is refused (the
-# failing statement is the last one that runs in that body), while a refused
-# `unset` fails only that command and the body continues — so each shape below
-# carries exactly one refusal and `$?` is observed after the compound, which is
-# where both shells still agree.
-in_fn() {
-  LIMIT=21
+# ── refused writes and `unset`s in NESTED statements ──
+# bash answers a refused ASSIGNMENT by abandoning the body it happened in AND
+# every body around it (function, if, loop, then the shell's own statement
+# list), so the statements after it never run, the enclosing command reports 1
+# and the top-level list CARRIES ON — it does not exit. A refused `unset` fails
+# only its own command, so those bodies run to the end. Both paths are here,
+# and stdout, stderr and the status are all compared.
+LIMIT=31
+echo "refuse-top rc=$? after=$LIMIT"
+
+refuse_fn() {
+  LIMIT=32
+  echo "fn-after-refusal"
+  echo "fn-after-rc=$?"
 }
-in_fn
+refuse_fn
 echo "refuse-fn rc=$?"
+
 if [ -n "${LIMIT}x" ]; then
-  LIMIT=22
+  LIMIT=33
+  echo "if-after-refusal"
 fi
 echo "refuse-if rc=$?"
-for i in a; do
-  LIMIT=23
+
+for i in a b; do
+  LIMIT=34
+  echo "for-after-refusal"
 done
 echo "refuse-for rc=$?"
+
 while read -r w; do
-  LIMIT=24
+  LIMIT=35
+  echo "while-after-refusal"
 done <<EOF
-once
+line1
+line2
 EOF
 echo "refuse-while rc=$?"
-( LIMIT=25 )
+
+{ LIMIT=36; echo "block-after-refusal"; }
+echo "refuse-block rc=$?"
+
+( LIMIT=37; echo "sub-after-refusal" )
 echo "refuse-sub rc=$?"
 
-unset_fn() {
+unset_refuse_fn() {
   unset LIMIT
+  echo "unset-fn-after rc=$?"
 }
-unset_fn
+unset_refuse_fn
 echo "unset-fn rc=$?"
+
 if [ -n "${LIMIT}x" ]; then
   unset LIMIT
+  echo "unset-if-after rc=$?"
 fi
 echo "unset-if rc=$?"
+
 for i in a b; do
   unset LIMIT
+  echo "unset-for-after rc=$?"
 done
 echo "unset-for rc=$?"
+
 while read -r w; do
   unset LIMIT
+  echo "unset-while-after rc=$?"
 done <<EOF
-once
+line1
+line2
 EOF
 echo "unset-while rc=$?"
-( unset LIMIT )
+
+( unset LIMIT; echo "unset-sub-after rc=$?" )
 echo "unset-sub rc=$?"
 echo "limit=$LIMIT"

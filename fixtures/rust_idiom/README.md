@@ -213,17 +213,26 @@ struct __ShVal   { s: String, int: Option<i64>, words: Option<Vec<Word>>,
   Only programs with a `readonly` name carry any marker, and a statement that
   turns out to write nothing the store can refuse has its marker removed again
   (`05` is the fixture: `__SH_VARS` with no `__sh_v_at` at all).
-  **What cannot be reproduced:** a compound body with statements AFTER a
-  refused ASSIGNMENT. Bash treats a failed assignment as an error that aborts
-  the enclosing compound command — function body, `if` body, loop — so the rest
-  of that body never runs, while the emitted program continues in it; the
-  diagnostic's line and the status agree, but the later statements of the body
-  execute here and not in bash. The fixture and the fuzz grammar therefore put
-  exactly one refusal per body and read `$?` after the compound, where both
-  shells agree; bash's own bytes for the divergent shape are in
-  `docs/backend-rust-core-needs.md`. A refused `unset` is unaffected (bash
-  fails only that command and the body continues), so those bodies do run to
-  the end.
+  **A refused assignment unwinds its enclosing compounds, as bash does.** Bash
+  answers a failed assignment with an error that abandons the enclosing
+  compound command — function body, `if` body, loop body, brace group — and
+  every compound around it up to the top level; the top-level list itself keeps
+  running, and each abandoned compound leaves status 1. The store therefore
+  carries an `unwind` flag that only `__sh_v_put`'s refused path raises (a
+  refused `unset` fails just its own command, so `__sh_v_unset` never does),
+  and every compound body is a labeled block (`'unwind`, `'unwind1`, … one
+  label per nesting depth) with
+  `if __sh_v_unwind_pending() { break 'unwindN; }` emitted BEFORE each
+  statement, plus an `if … { break; }` closing a loop body. A function frame
+  returns instead of breaking (`return;` for a unit function,
+  `return String::new()` for a value-returning one so its value tail stays
+  intact) and re-arms the status trip (`__sh_v_unwind_trip`), which makes the
+  CALL's status 1; a caller also skips printing an abandoned function's echo
+  value, because bash's `echo` never ran either. A subshell clears the flag —
+  it is its own shell, which bash does not unwind — and `main` clears it before
+  each top-level statement, because bash's top level continues. Guards and
+  labels are emitted only for a program that declares a `readonly` name, so no
+  other fixture's text moves.
 - **The helper is sliced, and pruned.** `vars` (types, get/put/export/
   readonly/unset/save) plus `vars_i/_s/_w/_n/_m/_len` are separate helpers, so
   a program that only ever reads a scalar does not drag in the assoc-map code;
@@ -234,9 +243,9 @@ struct __ShVal   { s: String, int: Option<i64>, words: Option<Vec<Word>>,
 Measured over the fixture set (before = `5a41d43a0`, after = this tree):
 per-variable `static __SHV_…` **6 → 0**; programs carrying the store: **7**
 (one `__SH_VARS` each, `05`, `13`, `14`, `15`, `18`, `21`, `22`); store call
-sites naming a key **21 → 69**; emitted lines over all 22 fixtures **3076**
-(`22_vars_store` alone: 538 lines, 47 store call sites). The store helper costs
-~210 lines per program that uses it — the location plumbing
+sites naming a key **21 → 72**; emitted lines over all 22 fixtures **3399**
+(`22_vars_store` alone: 717 lines, 50 store call sites). The store helper costs
+~200 lines per program that uses it — the location plumbing
 (`__sh_prog`/`__sh_v_at`/`__sh_v_where`) is part of that budget — and that is
 the trade: one shared, documented, flag-carrying store instead of a static plus
 its `.with(...)` plumbing per name.
@@ -288,8 +297,8 @@ Measured per fixture (`cargo run --bin rust_fixtures`), `let` / `store`:
 | 15_export_poison | 0 | 5 | `COUNT` is exported (reachable by name from a child) |
 | 18_eval_poison | 0 | 6 | `eval` can reach `n` at run time |
 | 21_pipeline_interleave | 1 | 2 | the stage variables of the pipeline/pin paths |
-| 22_vars_store | 0 | 47 | `GREETING` (export + unset), `LIMIT` (readonly), `n` (function + main), `w` (pipeline `read`) |
-| **TOTAL** | **24** | **69** | |
+| 22_vars_store | 0 | 50 | `GREETING` (export + unset), `LIMIT` (readonly), `n` (function + main), `w` (pipeline `read`) |
+| **TOTAL** | **24** | **72** | |
 
 11_promote and 18_eval_poison are the two halves of the boundary written
 down as programs: `count`, `name`, `total` and `n` in 11 become `let`
@@ -559,8 +568,10 @@ re-synced into a `bash -c` child after a later write, `unset` taking the entry
 back out, a name written in a function body and in main so dynamic scoping
 keeps it out of a `let`, and **a refused write** — `readonly R="$b"`, then
 `R="$b-x"` at top level and again inside a function body, an `if` body, a
-`for` body and a subshell, plus `unset R` (also inside a body), all of which
-must print bash's `<prog>: line N:` lines and return `$?`=1) — and
+`for` body, a `while` body, a brace group and a subshell, plus `unset R` (also
+inside a body) — **every refusal followed by a statement and by a `$?` read**,
+so a body that bash abandons must print neither and must leave status 1, and
+all of it compared on bash's `<prog>: line N:` stderr line too) — and
 `printf` sites of every class the specializer classifies: literal formats with
 0/1/N `%s` slots, `%%`, escapes, `\c`, literal braces, `%d`, `%c`, both arity
 mismatches, a slotless format that still passes an argument, and a format
@@ -587,6 +598,14 @@ divergence.
 
 Divergences this net found, each fixed at its cause:
 
+- **an unwound function still printed its empty value and cleared `$?`**
+  (fixed in `src/rust_backend.rs`). A refused write with statements after it
+  inside a function body made the frame return `String::new()`, which the
+  caller printed as `""` — a blank line bash does not print, because its `echo`
+  never ran — and then stored the status of that empty string (`rc=0` where
+  bash has 1). The abort now re-arms the status trip so the CALL's status is 1,
+  and a print whose words call a user function evaluates them into a local and
+  skips the print while the unwind flag is set.
 - **`readonly R="$b"` was silently DROPPED** (fixed in `src/rust_backend.rs`).
   A declaration whose `NAME=value` arrives as one interpolated word
   (`Interpolate([Lit("R="), <value>])`) — any non-literal value, quoted or not

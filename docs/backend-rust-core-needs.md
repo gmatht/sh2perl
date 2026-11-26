@@ -188,29 +188,38 @@ struct __ShVal   { s: String, int: Option<i64>, words: Option<Vec<Word>>,
   bash's `$0` is) in both the debug and the `-O` build, alongside the
   `$?`-after-refusal check. Its second half puts the same refused `LIMIT=…`
   inside a **function body, an `if` body, a `for` body, a `while` body and a
-  subshell**, and a refused `unset` inside each of those: 14 refusals, each
-  printing the offending statement's own line, with `$?` read right after the
-  compound. The comparison is demonstrably live: emitting `line + 1` instead
-  makes the fixture report `DEBUG-STDERR!=bash` / `RELEASE-STDERR!=bash` (and
-  the fuzz replay the same file diverges), so the bytes are really compared.
+  subshell** (and a brace group at top level), plus a refused `unset` inside
+  each of those: 15 refusals, each printing the offending statement's own line,
+  each followed by a statement that a body bash ABANDONS must not print, with
+  `$?` read immediately after the refusal and again after the compound. The
+  comparison is demonstrably live: emitting `line + 1` instead makes the replay
+  of the same file report `diverged=1` (the harness then reports
+  `DEBUG-STDERR!=bash` / `RELEASE-STDERR!=bash`), so the bytes are really
+  compared.
   The fuzz grammar has the same case — the readonly write at top level and
   again in a function body, an `if`, a `for` and a subshell, plus `unset` in a
   body — and the net compares the `(stdout, stderr, rc)` triple for every
   program; at seed 1 it lands in **14 of 60** programs (reported as
   `readonly_case=14` in the summary) with `diverged=0`.
-  **Not matched:** a compound body with statements AFTER a refused
-  *assignment*. Bash treats a failed assignment as an error that aborts the
-  enclosing compound command, so those statements never run there; the emitted
-  program keeps going in that body. The diagnostic itself is identical — for
-  `readonly R=1` then `f() { R=2; echo "after rc=$?"; }`, `f`, `echo "rc=$?"`
-  bash prints stderr `<prog>: line 3: R: readonly variable` and stdout `rc=1`,
-  while the emitted program prints the same stderr line and `after rc=1` /
-  `rc=0`. The fixture and the grammar therefore place one refusal per body and
-  read `$?` after the compound, which is the state both shells agree on. A
-  refused `unset` is unaffected (bash fails only that command), which is why
-  the `unset` shapes do run their bodies to the end. Closing the gap needs the
-  emitted control flow to leave a compound body on a refused assignment — a
-  code-shape change, not a location one.
+  **A refused assignment unwinds its enclosing compounds**, which is the
+  control-flow shape bash has: an error abandons the enclosing compound command
+  — function body, `if` body, loop body, brace group — and every compound
+  around it up to the top level, while the top-level list keeps running; each
+  abandoned compound leaves status 1. The store carries an `unwind` flag raised
+  only by `__sh_v_put`'s refused path (`__sh_v_unset` never raises it: bash
+  fails just that command), and every compound body is a labeled block
+  (`'unwind`, `'unwind1`, … one per nesting depth) whose statements are guarded
+  by `if __sh_v_unwind_pending() { break 'unwindN; }` emitted before the
+  statement, with an extra `if … { break; }` at the end of a loop body. A
+  function frame returns (`return;` / `return String::new()`) and re-arms the
+  status trip so the call's status is 1; a caller skips printing an abandoned
+  function's echo value, because bash's `echo` never ran. A subshell clears the
+  flag — it is its own shell, and bash does not unwind it — and `main` clears
+  it before each top-level statement. So `readonly R=1; f() { R=2; echo "after
+  rc=$?"; }; f; echo "rc=$?"` prints stderr `<prog>: line 3: R: readonly
+  variable` and stdout `rc=1` in both shells, with no `after rc=1` line.
+  Guards and labels exist only in a program that declares a `readonly` name,
+  so no other fixture's text moves.
 - `ro_trip` is the `$?`-adjacent half: a refused write sets it and the next
   status write consumes it (`__SH_RC.store(if __sh_v_rc_trip() { 1 } else { 0 } …)`),
   so `$?` is 1 for the failed statement and 0 after the next command, like
@@ -224,11 +233,11 @@ struct __ShVal   { s: String, int: Option<i64>, words: Option<Vec<Word>>,
 
 Measured over the fixture set (`fixtures/rust_idiom/expected/*.rs`): per-
 variable `static __SHV_…` **6 → 0**, store call sites naming a key
-**21 → 69**, programs carrying the store **7 of 22** (one `__SH_VARS` each),
-emitted lines **3076** over all 22 fixtures (`22_vars_store`: 538 lines, 47
+**21 → 72**, programs carrying the store **7 of 22** (one `__SH_VARS` each),
+emitted lines **3399** over all 22 fixtures (`22_vars_store`: 717 lines, 50
 store call sites). The cost is helper lines: ~210 per program that uses it
 (the `$0`/line plumbing for the refusal diagnostic is inside that budget), so
-emitted lines went **1371 → 2364** over the 21 pre-existing fixtures. The per-variable static it
+emitted lines went **1371 → 2682** over the 21 pre-existing fixtures. The per-variable static it
 replaced was one line each, so this is a shape/robustness win, not a line-count
 one; the census prints both numbers so the trade stays visible.
 

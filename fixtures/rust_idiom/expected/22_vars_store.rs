@@ -9,7 +9,7 @@ static __SH_STDIN: std::sync::Mutex<Option<Box<dyn std::io::Read + Send>>> = std
 static __SH_STDIN_PATH: std::sync::Mutex<Option<std::path::PathBuf>> = std::sync::Mutex::new(None);
 
 static __SH_PIPESTATUS: std::sync::Mutex<Vec<i32>> = std::sync::Mutex::new(Vec::new());
-thread_local! { static __SH_VARS: std::cell::RefCell<__ShStore> = const { std::cell::RefCell::new(__ShStore { vars: std::collections::BTreeMap::new(), ro_trip: false, at_line: 0 }) }; }
+thread_local! { static __SH_VARS: std::cell::RefCell<__ShStore> = const { std::cell::RefCell::new(__ShStore { vars: std::collections::BTreeMap::new(), ro_trip: false, unwind: false, at_line: 0 }) }; }
 
 static __SH_ARITH_WORD_FAIL: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
 
@@ -215,12 +215,35 @@ impl __ShVar {
 struct __ShStore {
     vars: std::collections::BTreeMap<String, __ShVar>,
     ro_trip: bool,
+    /// set by a REFUSED ASSIGNMENT: bash answers one by unwinding every
+    /// enclosing compound command back to the top level (the shell keeps
+    /// running, the statement's status is 1). Cleared at the top level, so a
+    /// refused `unset` — which bash fails without unwinding — never sets it.
+    unwind: bool,
     /// source line of the statement being executed (`__sh_v_at`), which is
     /// what bash prefixes a refused write's diagnostic with
     at_line: u32,
 }
 fn __sh_v_rc_trip() -> bool {
     __SH_VARS.with(|s| std::mem::replace(&mut s.borrow_mut().ro_trip, false))
+}
+
+/// A refused assignment unwinds the enclosing compound commands: the body it
+/// happened in, then every body around it, up to the top-level statement list.
+/// Each emitted body asks this at the end of every statement and leaves itself
+/// when it is set; the top level clears it, so the shell carries on with the
+/// refused assignment's status — exactly what bash does.
+fn __sh_v_unwind_pending() -> bool {
+    __SH_VARS.with(|s| s.borrow().unwind)
+}
+fn __sh_v_unwind_clear() {
+    __SH_VARS.with(|s| s.borrow_mut().unwind = false);
+}
+/// Re-arm the status trip as the function returns to its caller: bash's
+/// function ended on the refused assignment, so the CALL's status is 1 and
+/// the caller's own status write reads it from here.
+fn __sh_v_unwind_trip() {
+    __SH_VARS.with(|s| s.borrow_mut().ro_trip = true);
 }
 
 /// The diagnostic prefix a shell diagnostic carries: bash prints `$0`, and
@@ -261,6 +284,7 @@ fn __sh_v_put(name: &str, val: __ShVal) {
         let e = st.vars.entry(name.to_string()).or_insert_with(__ShVar::empty);
         if e.readonly {
             st.ro_trip = true;
+            st.unwind = true;
             denied = true;
             return;
         }
@@ -351,37 +375,61 @@ fn __sh_vw_s<R>(name: &str, f: impl FnOnce(&std::cell::RefCell<String>) -> R) ->
 }
 
 fn main() {
+    __sh_v_unwind_clear();
     __sh_v_set_s("GREETING", "hello".to_string());
     __sh_v_export("GREETING");
+    __sh_v_unwind_clear();
     __sh_v_set_s("GREETING", format!("{} world", __sh_v_s("GREETING")));
     __SH_RC.store(if __sh_v_rc_trip() { 1 } else { 0 }, Ordering::SeqCst);
+    __sh_v_unwind_clear();
     __sh_print_words(&[vec![format!("greeting={}", __sh_v_s("GREETING")).into()]], true);
+    __sh_v_unwind_clear();
     __SH_RC.store(__sh_run(&__sh_wq(&["bash".into(), "-c".into(), "echo \"child=$GREETING\"".into()])), Ordering::SeqCst);
+    __sh_v_unwind_clear();
     __sh_v_set_s("LIMIT", "3".to_string());
     __sh_v_mark_readonly("LIMIT");
+    __sh_v_unwind_clear();
     __sh_v_at(15);
     __sh_v_set_s("LIMIT", "9".to_string());
     __SH_RC.store(if __sh_v_rc_trip() { 1 } else { 0 }, Ordering::SeqCst);
+    __sh_v_unwind_clear();
     __sh_print_words(&[vec![format!("limit={} rc={}", __sh_v_s("LIMIT"), __SH_RC.load(Ordering::SeqCst)).into()]], true);
+    __sh_v_unwind_clear();
     __sh_v_at(17);
     __sh_v_unset("LIMIT");
     __SH_RC.store(if __sh_v_rc_trip() { 1 } else { 0 }, Ordering::SeqCst);
+    __sh_v_unwind_clear();
     __sh_print_words(&[vec![format!("unset-ro={} rc={}", __sh_v_s("LIMIT"), __SH_RC.load(Ordering::SeqCst)).into()]], true);
+    __sh_v_unwind_clear();
     __sh_v_at(20);
     __sh_v_unset("GREETING");
+    __sh_v_unwind_clear();
     __sh_print_words(&[vec![format!("unset=[{}]", __sh_v_s("GREETING")).into()]], true);
+    __sh_v_unwind_clear();
     __sh_v_at(23);
     __sh_v_set_s("n", "5".to_string());
     __SH_RC.store(if __sh_v_rc_trip() { 1 } else { 0 }, Ordering::SeqCst);
-    __sh_print_words(&[vec![grow().into()]], true);
+    __sh_v_unwind_clear();
+    __sh_v_unwind_clear();
+    let __shv_p = &[vec![grow().into()]];
+    if !__sh_v_unwind_pending() { __sh_print_words(__shv_p, true); }
+    __sh_v_unwind_clear();
     __sh_print_words(&[vec![format!("afterfn={}", __sh_v_s("n")).into()]], true);
+    __sh_v_unwind_clear();
     __sh_v_at(31);
     let __sh_sv0 = __sh_v_save("n");
+    'unwind: {
+        if __sh_v_unwind_pending() { break 'unwind; }
     __sh_v_at(31);
-    __sh_v_set_s("n", "11".to_string());
-    __sh_print_words(&[vec![format!("sub={}", __sh_v_s("n")).into()]], true);
+        __sh_v_set_s("n", "11".to_string());
+        if __sh_v_unwind_pending() { break 'unwind; }
+        __sh_print_words(&[vec![format!("sub={}", __sh_v_s("n")).into()]], true);
+    }
     __sh_v_restore_one("n", __sh_sv0);
+    if __sh_v_unwind_pending() { __SH_RC.store(1, Ordering::SeqCst); __sh_v_unwind_clear(); }
+    __sh_v_unwind_clear();
     __sh_print_words(&[vec![format!("aftersub={}", __sh_v_s("n")).into()]], true);
+    __sh_v_unwind_clear();
     __sh_v_at(34);
     __SH_PIPESTATUS.lock().unwrap_or_else(|e| e.into_inner()).clear();
     let mut __sh_pbuf1: Vec<u8> = Vec::new();
@@ -389,8 +437,11 @@ fn main() {
     let __sh_oldout2 = __SH_OUTFILE_TL.with(|v| v.borrow_mut().take());
     let __old = __SH_OUT.lock().unwrap_or_else(|e| e.into_inner()).take();
     *__SH_OUT.lock().unwrap_or_else(|e| e.into_inner()) = Some(Vec::new());
-    __sh_puts("alpha\n");
-    __SH_RC.store(0, Ordering::SeqCst);
+    'unwind: {
+        if __sh_v_unwind_pending() { break 'unwind; }
+        __sh_puts("alpha\n");
+        __SH_RC.store(0, Ordering::SeqCst);
+    }
     __sh_pbuf1 = __SH_OUT.lock().unwrap_or_else(|e| e.into_inner()).take().unwrap_or_default();
     *__SH_OUT.lock().unwrap_or_else(|e| e.into_inner()) = __old;
     __SH_OUTFILE_TL.with(|v| *v.borrow_mut() = __sh_oldout2);
@@ -399,140 +450,268 @@ fn main() {
     {
     let __oldin = __SH_STDIN.lock().unwrap_or_else(|e| e.into_inner()).take();
     *__SH_STDIN.lock().unwrap_or_else(|e| e.into_inner()) = Some(Box::new(std::io::Cursor::new(__sh_pbuf1.clone())));
-    let mut __sh_while_ran3 = false;
-    let mut __sh_while_last4 = 0;
-    while {
+    'unwind: {
+        if __sh_v_unwind_pending() { break 'unwind; }
+        let mut __sh_while_ran3 = false;
+        let mut __sh_while_last4 = 0;
+        while {
 let (__ln, __any) = __sh_readline();
 let __f = __sh_read_fields(&__ln, " \t\n", 1);
 __sh_v_set_s("w", __f.first().cloned().unwrap_or_default().to_string());
 __SH_RC.store(if __any { 0 } else { 1 }, Ordering::SeqCst);
 __any
 } {
-        __sh_while_ran3 = true;
-        __sh_print_words(&[vec![format!("pipe={} n={}", __sh_v_s("w"), __sh_v_s("n")).into()]], true);
-        __SH_RC.store(0, Ordering::SeqCst);
-        __sh_while_last4 = __SH_RC.load(Ordering::SeqCst);
+            __sh_while_ran3 = true;
+            'unwind1: {
+                if __sh_v_unwind_pending() { break 'unwind1; }
+                __sh_print_words(&[vec![format!("pipe={} n={}", __sh_v_s("w"), __sh_v_s("n")).into()]], true);
+                __SH_RC.store(0, Ordering::SeqCst);
+            }
+            __sh_while_last4 = __SH_RC.load(Ordering::SeqCst);
+            if __sh_v_unwind_pending() { break; }
+        }
+        if !__sh_while_ran3 { __SH_RC.store(0, Ordering::SeqCst); } else { __SH_RC.store(__sh_while_last4, Ordering::SeqCst); }
     }
-    if !__sh_while_ran3 { __SH_RC.store(0, Ordering::SeqCst); } else { __SH_RC.store(__sh_while_last4, Ordering::SeqCst); }
     *__SH_STDIN.lock().unwrap_or_else(|e| e.into_inner()) = __oldin;
     __SH_PIPESTATUS.lock().unwrap_or_else(|e| e.into_inner()).push(__SH_RC.load(Ordering::SeqCst));
 }
+    __sh_v_unwind_clear();
     __sh_print_words(&[vec![format!("after={}", __sh_v_s("n")).into()]], true);
-    in_fn();
+    __sh_v_unwind_clear();
+    __sh_v_at(44);
+    __sh_v_set_s("LIMIT", "31".to_string());
+    __SH_RC.store(if __sh_v_rc_trip() { 1 } else { 0 }, Ordering::SeqCst);
+    __sh_v_unwind_clear();
+    __sh_print_words(&[vec![format!("refuse-top rc={} after={}", __SH_RC.load(Ordering::SeqCst), __sh_v_s("LIMIT")).into()]], true);
+    __SH_RC.store(if __sh_v_rc_trip() { 1 } else { 0 }, Ordering::SeqCst);
+    __sh_v_unwind_clear();
+    __sh_v_unwind_clear();
+    refuse_fn();
+    __sh_v_unwind_clear();
     __sh_print_words(&[vec![format!("refuse-fn rc={}", __SH_RC.load(Ordering::SeqCst)).into()]], true);
-    __sh_v_at(48);
+    __sh_v_unwind_clear();
+    __sh_v_at(55);
     if !format!("{}x", __sh_v_s("LIMIT")).is_empty() {
-    __sh_v_at(49);
-        __sh_v_set_s("LIMIT", "22".to_string());
-        __SH_RC.store(if __sh_v_rc_trip() { 1 } else { 0 }, Ordering::SeqCst);
+        'unwind: {
+            if __sh_v_unwind_pending() { break 'unwind; }
+    __sh_v_at(56);
+            __sh_v_set_s("LIMIT", "33".to_string());
+            __SH_RC.store(if __sh_v_rc_trip() { 1 } else { 0 }, Ordering::SeqCst);
+            if __sh_v_unwind_pending() { break 'unwind; }
+            __sh_print_words(&[vec!["if-after-refusal".into()]], true);
+            __SH_RC.store(if __sh_v_rc_trip() { 1 } else { 0 }, Ordering::SeqCst);
+        }
     } else {
         __SH_RC.store(if __sh_v_rc_trip() { 1 } else { 0 }, Ordering::SeqCst);
     }
+    __sh_v_unwind_clear();
     __sh_print_words(&[vec![format!("refuse-if rc={}", __SH_RC.load(Ordering::SeqCst)).into()]], true);
-    __sh_v_at(52);
-    for __sh_w5 in std::iter::once("a") {
+    __sh_v_unwind_clear();
+    __sh_v_at(61);
+    for __sh_w5 in ["a", "b"] {
         __sh_v_set_s("i", __sh_w5.to_string());
-    __sh_v_at(53);
-        __sh_v_set_s("LIMIT", "23".to_string());
-        __SH_RC.store(if __sh_v_rc_trip() { 1 } else { 0 }, Ordering::SeqCst);
+        'unwind: {
+            if __sh_v_unwind_pending() { break 'unwind; }
+    __sh_v_at(62);
+            __sh_v_set_s("LIMIT", "34".to_string());
+            __SH_RC.store(if __sh_v_rc_trip() { 1 } else { 0 }, Ordering::SeqCst);
+            if __sh_v_unwind_pending() { break 'unwind; }
+            __sh_print_words(&[vec!["for-after-refusal".into()]], true);
+            __SH_RC.store(if __sh_v_rc_trip() { 1 } else { 0 }, Ordering::SeqCst);
+        }
+        if __sh_v_unwind_pending() { break; }
     }
+    __sh_v_unwind_clear();
     __sh_print_words(&[vec![format!("refuse-for rc={}", __SH_RC.load(Ordering::SeqCst)).into()]], true);
-    __sh_v_at(56);
+    __sh_v_unwind_clear();
+    __sh_v_at(67);
     {
         let __oldin = __SH_STDIN.lock().unwrap_or_else(|e| e.into_inner()).take();
-        *__SH_STDIN.lock().unwrap_or_else(|e| e.into_inner()) = Some(Box::new(std::io::Cursor::new("once\n".to_string().into_bytes())));
-        let mut __sh_while_ran6 = false;
-        let mut __sh_while_last7 = 0;
-        while {
+        *__SH_STDIN.lock().unwrap_or_else(|e| e.into_inner()) = Some(Box::new(std::io::Cursor::new("line1\nline2\n".to_string().into_bytes())));
+        'unwind: {
+            if __sh_v_unwind_pending() { break 'unwind; }
+            let mut __sh_while_ran6 = false;
+            let mut __sh_while_last7 = 0;
+            while {
 let (__ln, __any) = __sh_readline();
 let __f = __sh_read_fields(&__ln, " \t\n", 1);
 __sh_v_set_s("w", __f.first().cloned().unwrap_or_default().to_string());
 __SH_RC.store(if __any { 0 } else { 1 }, Ordering::SeqCst);
 __any
 } {
-            __sh_while_ran6 = true;
-    __sh_v_at(57);
-            __sh_v_set_s("LIMIT", "24".to_string());
-            __SH_RC.store(if __sh_v_rc_trip() { 1 } else { 0 }, Ordering::SeqCst);
-            __sh_while_last7 = __SH_RC.load(Ordering::SeqCst);
+                __sh_while_ran6 = true;
+                'unwind1: {
+                    if __sh_v_unwind_pending() { break 'unwind1; }
+    __sh_v_at(68);
+                    __sh_v_set_s("LIMIT", "35".to_string());
+                    __SH_RC.store(if __sh_v_rc_trip() { 1 } else { 0 }, Ordering::SeqCst);
+                    if __sh_v_unwind_pending() { break 'unwind1; }
+                    __sh_print_words(&[vec!["while-after-refusal".into()]], true);
+                    __SH_RC.store(if __sh_v_rc_trip() { 1 } else { 0 }, Ordering::SeqCst);
+                }
+                __sh_while_last7 = __SH_RC.load(Ordering::SeqCst);
+                if __sh_v_unwind_pending() { break; }
+            }
+            if !__sh_while_ran6 { __SH_RC.store(0, Ordering::SeqCst); } else { __SH_RC.store(__sh_while_last7, Ordering::SeqCst); }
         }
-        if !__sh_while_ran6 { __SH_RC.store(0, Ordering::SeqCst); } else { __SH_RC.store(__sh_while_last7, Ordering::SeqCst); }
         *__SH_STDIN.lock().unwrap_or_else(|e| e.into_inner()) = __oldin;
     }
+    __sh_v_unwind_clear();
     __sh_print_words(&[vec![format!("refuse-while rc={}", __SH_RC.load(Ordering::SeqCst)).into()]], true);
-    __sh_v_at(62);
-    let __sh_sv8 = __sh_v_save("LIMIT");
-    let _ = { let __v = "25".to_string(); __sh_v_set_s("LIMIT", "25".to_string()); __v };
-    __SH_RC.store(if __sh_v_rc_trip() { 1 } else { 0 }, Ordering::SeqCst);
-    __sh_v_restore_one("LIMIT", __sh_sv8);
-    __sh_print_words(&[vec![format!("refuse-sub rc={}", __SH_RC.load(Ordering::SeqCst)).into()]], true);
-    unset_fn();
-    __sh_print_words(&[vec![format!("unset-fn rc={}", __SH_RC.load(Ordering::SeqCst)).into()]], true);
-    __sh_v_at(70);
-    if !format!("{}x", __sh_v_s("LIMIT")).is_empty() {
-    __sh_v_at(71);
-        __sh_v_unset("LIMIT");
+    __sh_v_unwind_clear();
+    __sh_v_at(76);
+    'unwind: {
+        if __sh_v_unwind_pending() { break 'unwind; }
+    __sh_v_at(76);
+        __sh_v_set_s("LIMIT", "36".to_string());
         __SH_RC.store(if __sh_v_rc_trip() { 1 } else { 0 }, Ordering::SeqCst);
-    } else {
+        if __sh_v_unwind_pending() { break 'unwind; }
+        __sh_print_words(&[vec!["block-after-refusal".into()]], true);
         __SH_RC.store(if __sh_v_rc_trip() { 1 } else { 0 }, Ordering::SeqCst);
     }
-    __sh_print_words(&[vec![format!("unset-if rc={}", __SH_RC.load(Ordering::SeqCst)).into()]], true);
-    __sh_v_at(74);
-    for __sh_w9 in ["a", "b"] {
-        __sh_v_set_s("i", __sh_w9.to_string());
-    __sh_v_at(75);
-        __sh_v_unset("LIMIT");
-        __SH_RC.store(if __sh_v_rc_trip() { 1 } else { 0 }, Ordering::SeqCst);
-    }
-    __sh_print_words(&[vec![format!("unset-for rc={}", __SH_RC.load(Ordering::SeqCst)).into()]], true);
-    __sh_v_at(78);
-    {
-        let __oldin = __SH_STDIN.lock().unwrap_or_else(|e| e.into_inner()).take();
-        *__SH_STDIN.lock().unwrap_or_else(|e| e.into_inner()) = Some(Box::new(std::io::Cursor::new("once\n".to_string().into_bytes())));
-        let mut __sh_while_ran10 = false;
-        let mut __sh_while_last11 = 0;
-        while {
-let (__ln, __any) = __sh_readline();
-let __f = __sh_read_fields(&__ln, " \t\n", 1);
-__sh_v_set_s("w", __f.first().cloned().unwrap_or_default().to_string());
-__SH_RC.store(if __any { 0 } else { 1 }, Ordering::SeqCst);
-__any
-} {
-            __sh_while_ran10 = true;
+    __sh_v_unwind_clear();
+    __sh_print_words(&[vec![format!("refuse-block rc={}", __SH_RC.load(Ordering::SeqCst)).into()]], true);
+    __sh_v_unwind_clear();
     __sh_v_at(79);
+    let __sh_sv8 = __sh_v_save("LIMIT");
+    'unwind: {
+        if __sh_v_unwind_pending() { break 'unwind; }
+    __sh_v_at(79);
+        __sh_v_set_s("LIMIT", "37".to_string());
+        __SH_RC.store(if __sh_v_rc_trip() { 1 } else { 0 }, Ordering::SeqCst);
+        if __sh_v_unwind_pending() { break 'unwind; }
+        __sh_puts("sub-after-refusal\n");
+        __SH_RC.store(if __sh_v_rc_trip() { 1 } else { 0 }, Ordering::SeqCst);
+    }
+    __sh_v_restore_one("LIMIT", __sh_sv8);
+    if __sh_v_unwind_pending() { __SH_RC.store(1, Ordering::SeqCst); __sh_v_unwind_clear(); }
+    __sh_v_unwind_clear();
+    __sh_print_words(&[vec![format!("refuse-sub rc={}", __SH_RC.load(Ordering::SeqCst)).into()]], true);
+    __SH_RC.store(if __sh_v_rc_trip() { 1 } else { 0 }, Ordering::SeqCst);
+    __sh_v_unwind_clear();
+    __sh_v_unwind_clear();
+    unset_refuse_fn();
+    __sh_v_unwind_clear();
+    __sh_print_words(&[vec![format!("unset-fn rc={}", __SH_RC.load(Ordering::SeqCst)).into()]], true);
+    __sh_v_unwind_clear();
+    __sh_v_at(89);
+    if !format!("{}x", __sh_v_s("LIMIT")).is_empty() {
+        'unwind: {
+            if __sh_v_unwind_pending() { break 'unwind; }
+    __sh_v_at(90);
             __sh_v_unset("LIMIT");
             __SH_RC.store(if __sh_v_rc_trip() { 1 } else { 0 }, Ordering::SeqCst);
-            __sh_while_last11 = __SH_RC.load(Ordering::SeqCst);
+            if __sh_v_unwind_pending() { break 'unwind; }
+            __sh_print_words(&[vec![format!("unset-if-after rc={}", __SH_RC.load(Ordering::SeqCst)).into()]], true);
+            __SH_RC.store(if __sh_v_rc_trip() { 1 } else { 0 }, Ordering::SeqCst);
         }
-        if !__sh_while_ran10 { __SH_RC.store(0, Ordering::SeqCst); } else { __SH_RC.store(__sh_while_last11, Ordering::SeqCst); }
+    } else {
+        __SH_RC.store(if __sh_v_rc_trip() { 1 } else { 0 }, Ordering::SeqCst);
+    }
+    __sh_v_unwind_clear();
+    __sh_print_words(&[vec![format!("unset-if rc={}", __SH_RC.load(Ordering::SeqCst)).into()]], true);
+    __sh_v_unwind_clear();
+    __sh_v_at(95);
+    for __sh_w9 in ["a", "b"] {
+        __sh_v_set_s("i", __sh_w9.to_string());
+        'unwind: {
+            if __sh_v_unwind_pending() { break 'unwind; }
+    __sh_v_at(96);
+            __sh_v_unset("LIMIT");
+            __SH_RC.store(if __sh_v_rc_trip() { 1 } else { 0 }, Ordering::SeqCst);
+            if __sh_v_unwind_pending() { break 'unwind; }
+            __sh_print_words(&[vec![format!("unset-for-after rc={}", __SH_RC.load(Ordering::SeqCst)).into()]], true);
+            __SH_RC.store(if __sh_v_rc_trip() { 1 } else { 0 }, Ordering::SeqCst);
+        }
+        if __sh_v_unwind_pending() { break; }
+    }
+    __sh_v_unwind_clear();
+    __sh_print_words(&[vec![format!("unset-for rc={}", __SH_RC.load(Ordering::SeqCst)).into()]], true);
+    __sh_v_unwind_clear();
+    __sh_v_at(101);
+    {
+        let __oldin = __SH_STDIN.lock().unwrap_or_else(|e| e.into_inner()).take();
+        *__SH_STDIN.lock().unwrap_or_else(|e| e.into_inner()) = Some(Box::new(std::io::Cursor::new("line1\nline2\n".to_string().into_bytes())));
+        'unwind: {
+            if __sh_v_unwind_pending() { break 'unwind; }
+            let mut __sh_while_ran10 = false;
+            let mut __sh_while_last11 = 0;
+            while {
+let (__ln, __any) = __sh_readline();
+let __f = __sh_read_fields(&__ln, " \t\n", 1);
+__sh_v_set_s("w", __f.first().cloned().unwrap_or_default().to_string());
+__SH_RC.store(if __any { 0 } else { 1 }, Ordering::SeqCst);
+__any
+} {
+                __sh_while_ran10 = true;
+                'unwind1: {
+                    if __sh_v_unwind_pending() { break 'unwind1; }
+    __sh_v_at(102);
+                    __sh_v_unset("LIMIT");
+                    __SH_RC.store(if __sh_v_rc_trip() { 1 } else { 0 }, Ordering::SeqCst);
+                    if __sh_v_unwind_pending() { break 'unwind1; }
+                    __sh_print_words(&[vec![format!("unset-while-after rc={}", __SH_RC.load(Ordering::SeqCst)).into()]], true);
+                    __SH_RC.store(if __sh_v_rc_trip() { 1 } else { 0 }, Ordering::SeqCst);
+                }
+                __sh_while_last11 = __SH_RC.load(Ordering::SeqCst);
+                if __sh_v_unwind_pending() { break; }
+            }
+            if !__sh_while_ran10 { __SH_RC.store(0, Ordering::SeqCst); } else { __SH_RC.store(__sh_while_last11, Ordering::SeqCst); }
+        }
         *__SH_STDIN.lock().unwrap_or_else(|e| e.into_inner()) = __oldin;
     }
+    __sh_v_unwind_clear();
     __sh_print_words(&[vec![format!("unset-while rc={}", __SH_RC.load(Ordering::SeqCst)).into()]], true);
-    __sh_v_at(84);
-    let __sh_sv12 = __sh_v_save("LIMIT");
-    __sh_v_unset("LIMIT");
     __SH_RC.store(if __sh_v_rc_trip() { 1 } else { 0 }, Ordering::SeqCst);
+    __sh_v_unwind_clear();
+    __sh_v_at(110);
+    let __sh_sv12 = __sh_v_save("LIMIT");
+    'unwind: {
+        if __sh_v_unwind_pending() { break 'unwind; }
+    __sh_v_at(110);
+        __sh_v_unset("LIMIT");
+        __SH_RC.store(if __sh_v_rc_trip() { 1 } else { 0 }, Ordering::SeqCst);
+        if __sh_v_unwind_pending() { break 'unwind; }
+        __sh_print_words(&[vec![format!("unset-sub-after rc={}", __SH_RC.load(Ordering::SeqCst)).into()]], true);
+        __SH_RC.store(if __sh_v_rc_trip() { 1 } else { 0 }, Ordering::SeqCst);
+    }
     __sh_v_restore_one("LIMIT", __sh_sv12);
+    if __sh_v_unwind_pending() { __SH_RC.store(1, Ordering::SeqCst); __sh_v_unwind_clear(); }
+    __sh_v_unwind_clear();
     __sh_print_words(&[vec![format!("unset-sub rc={}", __SH_RC.load(Ordering::SeqCst)).into()]], true);
+    __sh_v_unwind_clear();
     __sh_print_words(&[vec![format!("limit={}", __sh_v_s("LIMIT")).into()]], true);
     __SH_RC.store(if __sh_v_rc_trip() { 1 } else { 0 }, Ordering::SeqCst);
 }
 
 fn grow() -> String {
+    if __sh_v_unwind_pending() { __sh_v_unwind_trip(); return String::new(); }
     __sh_v_at(25);
     __sh_v_set_s("n", "7".to_string());
     __SH_RC.store(if __sh_v_rc_trip() { 1 } else { 0 }, Ordering::SeqCst);
+    if __sh_v_unwind_pending() { __sh_v_unwind_trip(); return String::new(); }
     format!("infn={}", __sh_v_s("n"))
 }
 
-fn in_fn() {
-    __sh_v_at(44);
-    __sh_v_set_s("LIMIT", "21".to_string());
+fn refuse_fn() {
+    if __sh_v_unwind_pending() { __sh_v_unwind_trip(); return; }
+    __sh_v_at(48);
+    __sh_v_set_s("LIMIT", "32".to_string());
+    __SH_RC.store(if __sh_v_rc_trip() { 1 } else { 0 }, Ordering::SeqCst);
+    if __sh_v_unwind_pending() { __sh_v_unwind_trip(); return; }
+    println!("fn-after-refusal");
+    __SH_RC.store(if __sh_v_rc_trip() { 1 } else { 0 }, Ordering::SeqCst);
+    if __sh_v_unwind_pending() { __sh_v_unwind_trip(); return; }
+    println!("fn-after-rc={}", __SH_RC.load(Ordering::SeqCst));
     __SH_RC.store(if __sh_v_rc_trip() { 1 } else { 0 }, Ordering::SeqCst);
 }
 
-fn unset_fn() {
-    __sh_v_at(66);
+fn unset_refuse_fn() {
+    if __sh_v_unwind_pending() { __sh_v_unwind_trip(); return; }
+    __sh_v_at(83);
     __sh_v_unset("LIMIT");
+    __SH_RC.store(if __sh_v_rc_trip() { 1 } else { 0 }, Ordering::SeqCst);
+    if __sh_v_unwind_pending() { __sh_v_unwind_trip(); return; }
+    println!("unset-fn-after rc={}", __SH_RC.load(Ordering::SeqCst));
     __SH_RC.store(if __sh_v_rc_trip() { 1 } else { 0 }, Ordering::SeqCst);
 }
