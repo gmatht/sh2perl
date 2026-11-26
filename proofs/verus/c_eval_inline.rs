@@ -10,7 +10,7 @@
 // and anything the census cannot see is a program that either fails to
 // compile or reads the wrong storage.
 //
-// MEASURED 2026-11-04 (`sh2perl/examples/063_12_complex_eval.sh`):
+// MEASURED 2026-11-04 (`examples/063_12_complex_eval.sh`):
 //     eval "result=\$(( ${var:-0} + ${array[${index:-0}]:-0} ))"
 //     echo "Eval result: $result"
 // rendered to

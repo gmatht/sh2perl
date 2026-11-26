@@ -662,7 +662,7 @@ pub open spec fn shift_idx(ix: Seq<int>) -> Seq<int> {
 }
 
 // ---------------------------------------------------------------------
-// Measured scenarios (the 29-case probe battery, /tmp/probe_ifs/run.sh)
+// Measured scenarios (the 29-case probe battery, <workspace>/tmp/probe_ifs/run.sh)
 // ---------------------------------------------------------------------
 
 pub open spec fn startup() -> Str { seq![' '] }

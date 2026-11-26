@@ -8568,7 +8568,7 @@ executed (`go=none zig=none`).
 cd sh2perl && RUSTUP_HOME=$HOME/.rustup CARGO_HOME=$HOME/.cargo \
   ~/verus-0.2026.10.18.7d82994/verus --triggers-mode silent --rlimit 60 \
   proofs/verus/text_filter_lift.rs           # 30 verified, 0 errors
-cd .. && python3 <workspace>/harness/mut-text-filter-lift.py  # 28/28 red
+python3 <workspace>/harness/mut-text-filter-lift.py  # 28/28 red
 bash <workspace>/harness/anchor-text-filter-lift.sh           # pass=24 fail=0
 ```
 
