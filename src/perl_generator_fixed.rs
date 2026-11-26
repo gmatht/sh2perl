@@ -59,8 +59,11 @@ pub fn generate(prog: &IrProgram) -> String {
     // Does the SOURCE test a status (`if cmd; then`, `[ "$?" = 0 ]`)? Then
     // the register is read directly and must not be clobbered by a body
     // statement's write.
-    let read_carrier = crate::perl_backend::stmts_read_status(&fixed.stmts)
-        || fixed.subs.iter().any(|sb| crate::perl_backend::stmts_read_status(&sb.body));
+    let read_carrier = crate::shir::ir_stmts_read_status(&fixed.stmts)
+        || fixed
+            .subs
+            .iter()
+            .any(|sb| crate::shir::ir_stmts_read_status(&sb.body));
     // The verdict cannot come from the IR alone: the process-substitution
     // materialisation is a TEXT template, so its `$__ps_statusN =
     // $CHILD_ERROR` save exists only after rendering. Render once with the

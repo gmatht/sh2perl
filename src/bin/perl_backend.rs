@@ -1,7 +1,9 @@
-//! Perl backend CLI — LIBRARY path (branch `backend/perl`).
+//! Perl backend CLI — LIBRARY path.
 //!
-//! Compiles the Perl renderer IN (debashl::perl_backend) and drives it
-//! directly from the parsed ShIR — no `--shir` JSON round-trip. Usage:
+//! Drives the ONE Perl renderer (`debashl::ir::shir_to_perl`, the same
+//! implementation the library, `shir_render --target perl`, the wasi API
+//! and `perl_generator_fixed` use) directly from the parsed ShIR — no
+//! `--shir` JSON round-trip. Usage:
 //!
 //!     perl_backend foo.sh                # this: library path, in-process
 //!     otranspilerl-cli --source-lang shir --target perl - < foo.json  # the JSON contract path (core)
@@ -32,5 +34,5 @@ fn main() {
         }
     };
     let prog = debashl::shir::ast_to_ir(&commands);
-    print!("{}", debashl::perl_backend::shir_to_perl(&prog));
+    print!("{}", debashl::ir::shir_to_perl(&prog));
 }

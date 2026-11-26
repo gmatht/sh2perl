@@ -1,0 +1,20 @@
+# Examples the differential gate does NOT compare, with the reason and the
+# emitters that were tried. Keep this list shrinking: each line is a known
+# wrong-output gap, not a pass. Delete the line when the example matches.
+#
+# Triage 2026-11-26 — the retired renderer (git HEAD:src/perl_backend.rs,
+# 3.5k lines) was rebuilt in a throwaway module and run side by side with the
+# surviving ir::shir_to_perl on every gap example, with bash as reference:
+#
+#   example                                     retired renderer   survivor
+#   examples/000__03_file_manipulation…         stdout differs     matches
+#   examples/000__04b_file_directory…           stdout+exit differ matches
+#   examples/000__04c_text_processing…          stdout differs     matches
+#   examples/000__04h_complex_examples          stdout differs     matches
+#   examples/000__05_system_utilities          (already compared) matches
+#   examples/000__06_text_processing…           stdout differs     matches
+#   examples/012_test_const_read               stdout differs     matches
+#
+# No example exists where the retired renderer matched bash and the survivor
+# does not, so nothing needed porting. Every one of the ten curated examples
+# now passes through tests/bash-parity.sh; the list below is therefore empty.

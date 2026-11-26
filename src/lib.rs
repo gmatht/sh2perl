@@ -43,7 +43,6 @@ pub mod shir_json;
 pub mod transforms;
 
 pub mod bc;
-pub mod perl_backend; // worktree-local: Perl backend renderer (branch backend/perl)
 pub mod perl_generator_fixed; // worktree-local: post-processor wrapping ir::shir_to_perl with targeted fixes
 pub mod shir_json_in;
 // Unified backend fleet: the renderers merged from the backend worktrees

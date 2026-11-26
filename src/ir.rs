@@ -6031,14 +6031,19 @@ fn cd_chain_to_perl(expr: &IrExpr) -> Option<String> {
                                         } else {
                                             safe_perl_q_string(&t)
                                         };
+                                        // bash runs the tail only when cd
+                                        // SUCCEEDED, and a failed cd must
+                                        // not abort the script.
                                         Some(format!(
-                                            "{x}chdir({dir}) or die \"cd: $!\\n\"; system('bash', '-c', {q}); $main_exit_code = $CHILD_ERROR = $? >> 8;",
+                                            "{x}chdir({dir}) ? do {{ system('bash', '-c', {q}); $main_exit_code = $CHILD_ERROR = $? >> 8; }} : do {{ warn \"cd: $!\\n\"; $main_exit_code = $CHILD_ERROR = 1; }}",
                                             x = var_exports_str(&t),
                                             dir = dir,
                                             q = q
                                         ))
                                     }
-                                    None => Some(format!("chdir({}) or die \"cd: $!\\n\";", dir)),
+                                    None => Some(format!(
+                                        "chdir({dir}) or do {{ warn \"cd: $!\\n\"; $main_exit_code = $CHILD_ERROR = 1; }};"
+                                    )),
                                 }
                             }
                             _ => None,
@@ -9567,12 +9572,24 @@ fn emit_exec_call(out: &mut String, call: &IrExpr, indent: usize) {
                 .first()
                 .map(|w| render_word(w))
                 .unwrap_or_else(|| "$ENV{HOME}".to_string());
+            // bash's `cd` FAILS by setting $? — the script continues. The
+            // old `chdir(...) or die` aborted the program and still wrote a
+            // success status, so `cd /no/such; if [ $? -eq 0 ]` took the
+            // wrong branch (and the failure path exited outright).
             emit_indent(out, indent);
-            out.push_str(&format!(
-                "chdir({}) or die \"cd: $!\\n\";{}\n",
-                dir,
-                rc_write(" $main_exit_code = $CHILD_ERROR = 0;")
-            ));
+            out.push_str(&format!("if (chdir({dir})) {{\n"));
+            emit_indent(out, indent + 1);
+            out.push_str(&rc_write(" $main_exit_code = $CHILD_ERROR = 0;"));
+            out.push('\n');
+            emit_indent(out, indent);
+            out.push_str("} else {\n");
+            emit_indent(out, indent + 1);
+            out.push_str("warn \"cd: $!\\n\";\n");
+            emit_indent(out, indent + 1);
+            out.push_str(&rc_write(" $main_exit_code = $CHILD_ERROR = 1;"));
+            out.push('\n');
+            emit_indent(out, indent);
+            out.push_str("}\n");
         }
         "export" => {
             // The parser's SPLIT form: `export N=<word>` (quoted or
@@ -17708,5 +17725,100 @@ mod chain_or_true_fold_tests {
         let e = or_chain(exec("ls", vec![]), exec("true", vec![IrExpr::Str("x".into(), StrStyle::DoubleQuoted)]));
         let got = chain_or_capture(&e).expect("expressible");
         assert!(got.contains("if ($CHILD_ERROR != 0)"), "generic arm: {got}");
+    }
+}
+
+// ── Perl renderer regression tests ───────────────────────────────────
+//
+// `ir::shir_to_perl` is the ONE Perl emitter: the library, the
+// `perl_backend`/`scan_backend`/`shir_render` CLIs, the wasi API and the
+// `perl_generator_fixed` post-pass all route through it. These tests run the
+// real pipeline (Parser → ShIR → Perl) and pin the behaviours the
+// differential gate (`tests/bash-parity.sh`) checks against bash, so a
+// text-level regression fails `cargo test --lib` instead of only showing up
+// as wrong output in a rendered example.
+#[cfg(test)]
+mod perl_render_tests {
+    use super::shir_to_perl;
+
+    fn render(src: &str) -> String {
+        let cmds = crate::Parser::new(src).parse().expect("parse");
+        let prog = crate::shir::ast_to_ir(&cmds);
+        shir_to_perl(&prog)
+    }
+
+    /// 000__02's captures are constant-folded, so only a dynamic body
+    /// reaches the native-capture branch. It must use `local *STDOUT` and
+    /// the `\z` trailing-newline strip — never the old `select()` dance.
+    #[test]
+    fn native_capture_uses_local_stdout() {
+        let out = render("z=`echo $y`\n");
+        assert!(out.contains("local *STDOUT"), "{out}");
+        assert!(out.contains("s/\\n+\\z//"), "{out}");
+        assert!(!out.contains("select("), "{out}");
+    }
+
+    /// A literal argument's backslash survives exactly once: shell
+    /// `echo 'a\nb'` prints a backslash and an `n`.
+    #[test]
+    fn literal_backslash_is_not_doubled() {
+        let out = render("x=`/bin/echo 'a\\nb'`\n");
+        assert!(out.contains(r#""a\\nb\n""#), "{out}");
+        assert!(!out.contains(r#""a\\\\nb\n""#), "{out}");
+    }
+
+    /// Nested `$(…)` inside a captured command must not become a Perl
+    /// `qx{…}`: the outer capture runs a shell, and `qx{'pwd'}` inside it
+    /// was executed as a command named `qx` (basename got no operand).
+    #[test]
+    fn nested_substitution_is_not_a_nested_qx() {
+        let out = render("x=`basename $(pwd)`\n");
+        assert_eq!(out.matches("qx{").count(), 0, "{out}");
+        assert!(out.to_lowercase().contains("basename"), "{out}");
+    }
+
+    /// Shell truthiness is exit-status 0. `if (system(...))` is inverted,
+    /// because Perl treats 0 as false.
+    #[test]
+    fn command_condition_tests_status() {
+        let out = render("if grep -q x f; then echo y; fi\n");
+        assert!(!out.contains("if (system("), "{out}");
+        assert!(out.contains("> 0"), "{out}");
+    }
+
+    /// bash's `cd` failure sets `$?` and continues; it does not abort.
+    #[test]
+    fn native_cd_records_status_and_continues() {
+        let out = render("cd /no/such/dir\nif [ $? -eq 0 ]; then echo ok; else echo bad; fi\n");
+        assert!(!out.contains("or die \"cd"), "{out}");
+        assert!(out.contains("warn \"cd: $!\\n\""), "{out}");
+        assert!(out.contains("$? = 1 << 8"), "{out}");
+    }
+
+    /// Builtins in compound position lower natively: no fork, and no
+    /// `(system(…)) == 0` in void context for Perl to warn about.
+    #[test]
+    fn compound_builtin_does_not_fork() {
+        let out = render("false && echo hi\n");
+        assert!(!out.contains("system(\"echo"), "{out}");
+        assert!(!out.contains("system(\"false"), "{out}");
+    }
+
+    /// `while cmd` is the same truthiness rule as `if cmd`.
+    #[test]
+    fn while_condition_tests_status() {
+        let out = render("while grep -q x f; do echo x; done\n");
+        assert!(out.contains("while ("), "{out}");
+        assert!(!out.contains("while (system("), "{out}");
+    }
+
+    /// A native builtin's status is readable through `$?`, which the
+    /// renderer encodes as a WAIT status (`code << 8`) and reads back with
+    /// `>> 8`.
+    #[test]
+    fn native_builtin_status_is_readable_through_dollar_question() {
+        let out = render("false\nif [ $? -eq 0 ]; then echo ok; fi\n");
+        assert!(out.contains("$? = 1 << 8"), "{out}");
+        assert!(out.contains("$? >> 8"), "{out}");
     }
 }

@@ -23,7 +23,7 @@ fn render(backend: &str, content: &str) -> Option<String> {
         "zig" => Some(debashl::zig_backend::shir_to_zig(&prog)),
         "c" => Some(debashl::c_backend::shir_to_c(&prog)),
         "sh" => debashl::sh_backend::shir_to_sh(&prog).ok(),
-        "perl" => Some(debashl::perl_backend::shir_to_perl(&prog)),
+        "perl" => Some(debashl::ir::shir_to_perl(&prog)),
         "glsl" => Some(debashl::glsl_backend::shir_to_glsl(&prog)),
         _ => None,
     }
