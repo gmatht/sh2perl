@@ -62,27 +62,30 @@
 //    behaviour of `IrStmt`/`IrExpr` variants the source's `_ => false` arm
 //    already declines to analyse (the model has `OtherX` / `OtherS` for
 //    them, analysed as "nothing" exactly as the source does).
+//  * KNOWN DIVERGENCE, reported rather than smoothed over: the `Function`
+//    arm. The model scans the body AND its named blocks (`an_ss(b) ||
+//    an_sss(named)`, and `flat_s` likewise), while the source's
+//    `stmts_read_status_in` matches `IrStmt::Function { body, .. }` — the
+//    named blocks are dropped by the `..`. That is the safe direction for
+//    the liveness consumer (the model never calls a body with a reading
+//    named block "status-free"), but it is NOT arm-for-arm: the shipped
+//    analysis can miss a `$?` read inside a named block, and only
+//    `program_reads_status`'s `$?`-in-Debug fallback catches that in
+//    practice.
 //
 //  Run: verus --triggers-mode silent --rlimit 40 proofs/verus/status_reads_traversal.rs
 // ─────────────────────────────────────────────────────────────────────────
 
-//  ── measured mutants (68 verified, 0 errors baseline) ───────────────────
+//  ── measured mutants (2026-11-27 revision: 70 verified, 0 errors baseline) ──
 //
 //    run: verus --triggers-mode silent --rlimit 40 proofs/verus/status_reads_traversal.rs
-//    (a) read walk drops the Cap arm ............... 67v/1e
-//    (f) read walk drops the Try bodies ............ 67v/1e
-//    (g) nested walk drops the ForInit step list ... 67v/1e
-//    (h) read walk drops the DoWhile body .......... 67v/1e
-//    (i) read walk drops the MethodCall children ... 67v/1e
-//    (b) "a literal text is never a read" .......... rejected at
-//        simplification (`pin_test_operand_is_a_read` computes false)
-//    (c) the assign arm ignores the capture guard .. rejected at
-//        simplification (`pin_capture_assign_does_not_store`)
-//    (d) nested walk drops Redirect ................ rejected at
+//    (a) read walk drops the Cap/backtick arm ..... 69v/1e, at `reads_exact_x`
+//    (b) "a literal text is never a read" ......... rejected at
+//        simplification (`pin_bodies_are_localised` computes false: the
+//        test-operand shape stops being a read at all)
+//    (c) nested walk drops Redirect ................ rejected at
 //        simplification (`pin_nested_redirect_reads_before_store`)
-//    (e) nested walk drops the Case clauses ........ rejected at
-//        simplification (`pin_case_clause_is_scanned_and_body_is_not`)
-//    (j) the `If` arm called a must-store while `emit_s` stops writing the
+//    (d) the `If` arm called a must-store while `emit_s` stops writing the
 //        register for an `If` fragment ............ rejected at
 //        simplification (`pin_control_flow_stores` computes false) — the
 //        arm is only sound because the renderer writes `$?` on every path
@@ -743,6 +746,16 @@ pub proof fn reads_complete_ss(l: Seq<S>, fns: bool)
     reads_exact_ss(l, fns);
 }
 
+/// The traversal plan's name for the read law: the analysis's "no reader" is
+/// a may-over-approximation of the semantic read set, so `!analysis ⇒ !may`.
+/// (It is the same obligation as `reads_complete_s`; this is the entry point
+/// the consumer and the plan cite.)
+pub proof fn reads_is_may_approx(s: S, fns: bool)
+    ensures !an_s(s, fns) ==> !may_s(s, fns),
+{
+    reads_complete_s(s, fns);
+}
+
 // ──────────────────────────────── has_cap: `expr_has_capture` ───────────────
 
 pub open spec fn has_cap_x(x: X) -> bool
@@ -1377,6 +1390,16 @@ pub proof fn els_bridge(l: Seq<(X, Seq<S>)>, fns: bool)
     }
 }
 
+/// The traversal plan's name for the nested law: a semantic nested
+/// read-before-store implies the analysis's predicate — one-way on purpose,
+/// because the source also counts CONDITION reads there (it may over-claim,
+/// never miss). Same obligation as `nested_complete`, cited by this name.
+pub proof fn nested_is_may_approx(s: S, fns: bool)
+    ensures nested_sem(s, fns) ==> an_nested(s, fns),
+{
+    nested_complete(s, fns);
+}
+
 // ────────────────────────────────── the three facts, in one statement ───────
 
 /// The consumer of `status_reads.rs` gets all three facts from this model.
@@ -1386,9 +1409,9 @@ pub proof fn facts_sound(s: S, fns: bool)
         (an_stores(s) ==> own_rc(s)),
         (nested_sem(s, fns) ==> an_nested(s, fns)),
 {
-    reads_exact_s(s, fns);
+    reads_is_may_approx(s, fns);
     stores_is_must(s);
-    nested_complete(s, fns);
+    nested_is_may_approx(s, fns);
 }
 
 // ───────────────────────────────────────────────────────── the pins ───────

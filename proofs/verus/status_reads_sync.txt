@@ -1,5 +1,5 @@
 # verus-sync-coverage manifest: status_reads
-# source sha: status_reads=32b0936fb8b7  proof sha: 74148aa06a9e
+# source sha: status_reads=32b0936fb8b7  proof sha: 467f5b75b0c5
 
 [pins]
 pin pin_bare_exit_reads_the_status -> test bare_exit_reads_the_status: MAPPED

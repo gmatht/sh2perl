@@ -46,10 +46,12 @@
 //  * The three facts are taken as given: that `stmt_reads_status_in` is a
 //    may-over-approximation of the `$?` occurrences in a statement (so its
 //    `false` really means "no reader") is a syntax-traversal property over
-//    ~30 `IrStmt`/`IrExpr` variants. THIS file does not prove it — it is the
-//    obligation of the companion model, and the direction that matters is
-//    only total in practice because `program_reads_status` has a `$?`-in-Debug
-//    fallback, which is an argument, not a proof. See the README section
+//    ~30 `IrStmt`/`IrExpr` variants. THIS file does not prove it — the
+//    companion `proofs/verus/status_reads_traversal.rs` does, as
+//    `reads_is_may_approx` / `stores_is_must` / `nested_is_may_approx`
+//    (all three together in `facts_sound`) over two independent recursions;
+//    `program_reads_status`'s `$?`-in-Debug fallback makes the direction
+//    total in practice as well. See the README section
 //    "status_reads_traversal.rs".
 //  * Statement bodies: `body_store_liveness` localises a function/sub body
 //    into its own vector, and `escaped` (a body whose first read precedes

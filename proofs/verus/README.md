@@ -8760,17 +8760,18 @@ leading-zero mutant. The file was restored byte-identically after each run
   the body-localisation and `program_reads_status` tests belong to the
   companion models.
 
-## status_reads_traversal.rs — the owed `$?`-traversal law, discharged (68)
+## status_reads_traversal.rs — the owed `$?`-traversal law, discharged (70)
 
     verus --triggers-mode silent --rlimit 40 proofs/verus/status_reads_traversal.rs
-    -> verification results:: 68 verified, 0 errors
+    -> verification results:: 70 verified, 0 errors
 
 `status_reads.rs` proves the store-liveness law **under** three per-statement
 facts it takes as given (`reads`, `stores`, `nested`) and says so in its
 header: "that `stmt_reads_status_in` is a may-over-approximation of the `$?`
 occurrences … is a syntax-traversal property over ~30 `IrStmt`/`IrExpr`
 variants … an argument, not a proof." This file is that proof, over a grammar
-with one constructor per source arm, and **two independent recursions**: the
+with one constructor per source arm (one divergence is reported in Scope),
+and **two independent recursions**: the
 analysis transcribed from the source, and a semantic side that collects what
 the walk must visit (`flat_*` into a sequence of atoms), emits what the
 renderer writes (`emit_s`), or orders the events a nested list produces
@@ -8781,7 +8782,8 @@ renderer writes (`emit_s`), or orders the events a nested list produces
 - **`reads_exact_s` / `reads_exact_x`** (and the list/clause helpers): the
   analysis's answer EQUALS the atom collection, so both directions are
   caught — a forgotten arm (false negative) and an over-claim. Corollary
-  `reads_complete_s` is the plan's `reads_is_may_approx`.
+  `reads_complete_s` is the plan's `reads_is_may_approx`, which exists under
+  that name for the consumer.
 - **`stores_is_must`**: `stmt_definitely_stores_status(s)` implies the
   statement's own emitted fragment writes the register. The right-hand side
   is written from the renderer's placement, so this is the arm where the
@@ -8790,7 +8792,8 @@ renderer writes (`emit_s`), or orders the events a nested list produces
   analysis must not trust it. The control-flow constructs pass because
   bash's `if`/`while`/`for`/`case` set `$?` on every path (0 when no branch
   runs) — that fact is in `emit_s`, not in the analysis.
-- **`nested_complete`**: a nested list that reads `$?` before its own first
+- **`nested_complete`** (exposed as the plan's `nested_is_may_approx`): a
+  nested list that reads `$?` before its own first
   definite store implies `stmt_nested_reads_before_store(s)`. One-way on
   purpose: the source also counts a condition read there, so it may
   over-claim (keep more stores), never miss. The bridge
@@ -8800,14 +8803,12 @@ renderer writes (`emit_s`), or orders the events a nested list produces
 
 ### Mutants, measured
 
-Five are counted: dropping the `Cap` arm, the `Try` bodies, the `ForInit`
-step list, the `DoWhile` body, or the `MethodCall` children each gives
-**67 verified, 1 error**. Five more are refuted one stage earlier, at
-simplification, by the concrete pins: a literal text that is never a read
-(`pin_test_operand_is_a_read`), the assign arm ignoring its capture guard
-(`pin_capture_assign_does_not_store`), the nested walk dropping `Redirect`
-(`pin_nested_redirect_reads_before_store`), dropping the `case` clauses
-(`pin_case_clause_is_scanned_and_body_is_not`) and calling `If` a must-store
+Counted: dropping the `Cap`/backtick arm gives **69 verified, 1 error**, at
+`reads_exact_x`. Refuted one stage earlier, at simplification, by the
+concrete pins: a literal text that is never a read
+(`pin_bodies_are_localised` — the test-operand shape stops being a read),
+the nested walk dropping `Redirect`
+(`pin_nested_redirect_reads_before_store`), and calling `If` a must-store
 while `emit_s` stops writing the register for an `If` fragment
 (`pin_control_flow_stores`), which is the check that the arm rests on the
 renderer's placement rather than on the analysis alone — the same rejection
@@ -8826,6 +8827,13 @@ byte-identically after each run (sha256 in
   model does not re-derive `str::contains`; it states the property the
   analysis keys on, which `program_reads_status`'s Debug fallback provides
   in practice.
+- KNOWN DIVERGENCE, stated rather than smoothed over: the `Function` arm.
+  The model scans the body *and* its named blocks; the source's
+  `stmts_read_status_in` matches `IrStmt::Function { body, .. }`, dropping
+  them. That is the safe direction for liveness (the model never calls such a
+  body status-free), but it is not arm-for-arm: a `$?` read inside a named
+  block is missed by the shipped analysis, and only
+  `program_reads_status`'s `$?`-in-Debug fallback catches it.
 - `emit_s` is a model of the RENDERER's register placement, not a proof of
   it; that the backends emit those instructions is a renderer contract,
   anchored end-to-end, not proved here.

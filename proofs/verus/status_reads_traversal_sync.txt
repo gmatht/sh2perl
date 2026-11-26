@@ -1,5 +1,5 @@
 # verus-sync-coverage manifest: status_reads_traversal
-# source sha: status_reads=32b0936fb8b7  proof sha: 3bfa0ecd6c10
+# source sha: status_reads=32b0936fb8b7  proof sha: dff0d2f529a1
 
 [pins]
 pin pin_test_operand_is_a_read -> test detects_test_operand_status: MAPPED
@@ -18,9 +18,9 @@ pin pin_case_clause_is_scanned_and_body_is_not: UNMIRRORED (same)
 pin pin_facts_on_a_capture_assign: UNMIRRORED (conjunction of the three facts)
 
 [guards]
-guard law reads (exact equality, direction reads_complete_s): PRESENT
-guard law stores (an_stores implies the renderer's own register write): PRESENT
-guard law nested (nested_sem implies the analysis's predicate): PRESENT
+guard law reads (exact equality; reads_is_may_approx == reads_complete_s): PRESENT
+guard law stores (stores_is_must: an_stores implies the renderer's own register write): PRESENT
+guard law nested (nested_is_may_approx == nested_complete: nested_sem implies an_nested): PRESENT
 guard facts_sound (all three for the liveness consumer): PRESENT
 guard fns flag (bodies localised when false): PRESENT
 guard has_cap through Arrow bodies (expr_has_capture is textual): PRESENT
@@ -30,11 +30,12 @@ guard els_bridge (rbs_els implies an_els_nested): PRESENT
 guard X children carried as Seq (layout / structural order): PRESENT
 
 [counts]
-68 verified, 0 errors (verus --triggers-mode silent --rlimit 40 status_reads_traversal.rs)
-mutants: Cap 67v/1e, Try 67v/1e, ForInit-step 67v/1e, DoWhile-body 67v/1e,
-  MethodCall-children 67v/1e; literal-text, capture-guard, Redirect,
-  Case-clause and If-must-store (emit_s drops the If fragment's register
-  write) mutants rejected at simplification by their pins.
+70 verified, 0 errors (verus --triggers-mode silent --rlimit 40 status_reads_traversal.rs)
+mutants (measured 2026-11-27, each restored byte-identically to this proof
+  sha): Cap/backtick arm dropped 69v/1e (reads_exact_x); literal-text,
+  Redirect-nested and If-must-store (emit_s drops the If fragment's register
+  write) mutants rejected at simplification by pin_bodies_are_localised,
+  pin_nested_redirect_reads_before_store and pin_control_flow_stores.
 [exec]
 # Every MAPPED row above was EXECUTED against the source in this tree:
 #   cargo test --lib          (full lib suite; per-test verdicts below)
