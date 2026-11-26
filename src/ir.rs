@@ -13568,16 +13568,39 @@ pub(crate) fn ir_expr_to_perl(expr: &IrExpr) -> String {
                     // bash -c and test THAT status (rendering the command
                     // word directly as `system('bash','-c', …)` would hand
                     // bash the Perl expression's SOURCE TEXT instead of its
-                    // value). Only the single-word form is handled; extra
-                    // operands keep the previous unbuildable fallback.
+                    // value). Literal operands are appended to the expanded
+                    // command word; non-literal ones keep the previous
+                    // unbuildable fallback (REFUSE > GUESS).
                     if let Some(IrExpr::Call { func: cf, .. }) = args.first() {
-                        if (cf == "capture" || cf == "captureWords")
-                            && exec_word_args(args).is_empty()
-                        {
+                        if cf == "capture" || cf == "captureWords" {
                             let value = ir_expr_to_perl(args.first().unwrap());
-                            return format!(
-                                "(do {{ my $__cw = {value}; system('bash', '-c', $__cw) == 0 }})"
-                            );
+                            // Literal operands append to the expanded command
+                            // word (bash runs `$(echo false) x` as `false x`).
+                            let mut tail = String::new();
+                            let mut literal = true;
+                            for w in exec_word_args(args) {
+                                match w {
+                                    IrExpr::Str(s, _) => {
+                                        tail.push_str(&format!(" {}", shell_word_text(s)))
+                                    }
+                                    _ => {
+                                        literal = false;
+                                        break;
+                                    }
+                                }
+                            }
+                            if literal {
+                                return if tail.is_empty() {
+                                    format!(
+                                        "(do {{ my $__cw = {value}; system('bash', '-c', $__cw) == 0 }})"
+                                    )
+                                } else {
+                                    format!(
+                                        "(do {{ my $__cw = {value}; system('bash', '-c', $__cw . {}) == 0 }})",
+                                        safe_perl_q_string(&tail)
+                                    )
+                                };
+                            }
                         }
                     }
                     // Native file-contains: `grep -q PAT FILE` (quiet — no
@@ -15408,6 +15431,21 @@ pub(crate) fn cmd_str_to_open_perl_stripped(cmd: &str) -> String {
 
 /// Pick a safe Perl `q<delim>...<delim>` delimiter for a string that may
 /// contain arbitrary characters.  Returns a properly delimited Perl literal.
+/// Quote one LITERAL shell word back into shell text for a `bash -c`
+/// payload (a command-substitution command word with literal operands).
+fn shell_word_text(s: &str) -> String {
+    if !s.is_empty()
+        && s.chars().all(|c| {
+            c.is_ascii_alphanumeric()
+                || matches!(c, '-' | '_' | '.' | '/' | '=' | ':' | ',' | '+' | '@' | '%')
+        })
+    {
+        s.to_string()
+    } else {
+        format!("'{}'", s.replace('\'', "'\\''"))
+    }
+}
+
 pub(crate) fn safe_perl_q_string(s: &str) -> String {
     // Empty string -> q{} is compact and safe
     if s.is_empty() {
