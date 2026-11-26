@@ -32,6 +32,15 @@ mutants: strict is_prefix 26v/3e, suffix scan ignores the literal 27v/2e;
   strip-removes-nothing, scan off-by-one, '*' not magic, cut head keeps tail,
   first-cut-uses-rfind and two-stars-accepted rejected at simplification by
   their pins.
+[exec]
+# Every MAPPED row above was EXECUTED against the source in this tree:
+#   cargo test --lib          (full lib suite; per-test verdicts below)
+# Each verdict below is grepped from that run's own
+# `test <module>::<name> ... ok` line, for the module this proof pins.
+# A mapped test that fails or vanishes from the run is drift — FATAL.
+# context: that run reported 1970 passed, 67 failed, 5 ignored; every failure
+# is in an unrelated backend / estree / shir_json module, none in the modules
+# these rows pin.
 # all suites built; per-test verdicts below
 exec literal_shortest_eq_longest (greedy_and_shortest_are_identical_for_a_literal): PASS
 exec fold_preserves_value (literal_prefix_strip_folds_on_rust): PASS

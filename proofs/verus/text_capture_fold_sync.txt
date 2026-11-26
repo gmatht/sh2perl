@@ -14,7 +14,6 @@ pin pin_safe_splice -> test refuses_unquoted_multi_word_output: MAPPED
 pin pin_safe_splice -> test folds_multi_word_output_inside_quotes: MAPPED
 pin pin_gates_imply_the_premise: UNMIRRORED (the gated-implies-no-syntax step has no source test)
 pin constant_output_sound: UNMIRRORED (value-level; the source tests the returned string)
-pin folds_param_default: UNMIRRORED here (analysis pinned; the ARG POSITION is IR-level)
 
 [guards]
 guard law constant_output_sound (analysis Some(r) => the command really prints r): PRESENT
@@ -35,6 +34,17 @@ mutants: gate-accepts-syntax 30v/1e, substitution-space-as-char 30v/1e,
   folded-space-as-char 30v/1e; Rt-word-as-literal, flag-refusal-dropped,
   join-without-separator, every-head-prints, quote-as-syntax and
   unquoted-gate-wide-open rejected at simplification by their pins.
+[exec]
+# Every MAPPED row above was EXECUTED against the source in this tree:
+#   cargo test --lib          (full lib suite; per-test verdicts below)
+# Each verdict below is grepped from that run's own
+# `test <module>::<name> ... ok` line, for the module this proof pins.
+# A mapped test that fails or vanishes from the run is drift — FATAL.
+# context: that run reported 1970 passed, 67 failed, 5 ignored; every failure
+# is in an unrelated backend / estree / shir_json module, none in the modules
+# these rows pin.
+# source test folds_param_default (the param-default operand) also ran: PASS;
+# no proof fn mirrors it — the ARG POSITION is IR-level, not semantic.
 # all suites built; per-test verdicts below
 exec pin_quoted_test_operand (folds_quoted_test_operand): PASS
 exec pin_splice_of_the_test_operand (folds_quoted_test_operand): PASS

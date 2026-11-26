@@ -1,5 +1,5 @@
 # verus-sync-coverage manifest: uae_terminators
-# source sha: shir=9bddd78b30c0  uae=3adb4e485152  proof sha: e908c57c295c
+# source sha: shir=9bddd78b30c0 (committed HEAD blob)  uae=3adb4e485152  proof sha: e908c57c295c
 
 [pins]
 pin pin_trunc_shapes -> test tail_after_an_infinite_loop_is_dropped: MAPPED
@@ -30,6 +30,15 @@ mutants: if-nested terminator truncates 29v/1e, top-level Return 28v/2e,
   case-nested Exit prunes 29v/1e; nested-break-escapes, trunc-drops-terminator,
   case-break-falls-through and run-ignores-signal rejected at simplification by
   their pins.
+[exec]
+# Every MAPPED row above was EXECUTED against the source in this tree:
+#   cargo test --lib          (full lib suite; per-test verdicts below)
+# Each verdict below is grepped from that run's own
+# `test <module>::<name> ... ok` line, for the module this proof pins.
+# A mapped test that fails or vanishes from the run is drift — FATAL.
+# context: that run reported 1970 passed, 67 failed, 5 ignored; every failure
+# is in an unrelated backend / estree / shir_json module, none in the modules
+# these rows pin.
 # all suites built; per-test verdicts below
 exec pin_trunc_shapes (tail_after_an_infinite_loop_is_dropped): PASS
 exec pin_escapable_loop_keeps_the_tail (an_escapable_loop_keeps_the_tail): PASS

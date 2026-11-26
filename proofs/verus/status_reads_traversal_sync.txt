@@ -34,6 +34,15 @@ guard X children carried as Seq (layout / structural order): PRESENT
 mutants: Cap 67v/1e, Try 67v/1e, ForInit-step 67v/1e, DoWhile-body 67v/1e,
   MethodCall-children 67v/1e; literal-text, capture-guard, Redirect and
   Case-clause mutants rejected at simplification by their pins.
+[exec]
+# Every MAPPED row above was EXECUTED against the source in this tree:
+#   cargo test --lib          (full lib suite; per-test verdicts below)
+# Each verdict below is grepped from that run's own
+# `test <module>::<name> ... ok` line, for the module this proof pins.
+# A mapped test that fails or vanishes from the run is drift — FATAL.
+# context: that run reported 1970 passed, 67 failed, 5 ignored; every failure
+# is in an unrelated backend / estree / shir_json module, none in the modules
+# these rows pin.
 # all suites built; per-test verdicts below
 exec pin_test_operand_is_a_read (detects_test_operand_status): PASS
 exec pin_getvar_status_is_a_read (detects_getvar_status): PASS
