@@ -64,28 +64,26 @@
 //
 //    run: verus --triggers-mode silent --rlimit 40 proofs/verus/status_reads.rs
 //    baseline 28 verified, 0 errors
-//    (a) `dead_store_law`'s premise `!live(list)[i]` deleted … 27v/1e, and
-//        the failure lands INSIDE the law (the `live_agrees` consequence is
-//        the hypothesis being dropped) — the mutant of record.
+//    (a) `dead_store_law`'s premise `!live(list)[i]` deleted … 27 verified,
+//        1 error — the law's postcondition fails; the liveness premise is
+//        load-bearing, not decorative.
 //    (b) `live_step`: a definite store no longer resets `need`
-//        (`if later_needs && st.stores { false }` → `later_needs`) … caught
-//        one stage earlier, at simplification:
+//        (`if need && st.stores { false } else { need }` → `need`) … caught
+//        at simplification:
 //        `pin_stores_before_the_nearest_read_are_dropped` computes
-//        `[true, true, true] == [false, true, true]`, so the mutant carries
-//        no verified/error count — the rejection class the README records
-//        for typeset_attrs' leading-zero mutant.
-//    (c) `live_step`: the `!st.stores && st.nested` term deleted
-//        (`live[i] = need`) … caught at simplification by
-//        `pin_nested_after_write_keeps_the_store` (`[true, false, true] ==
-//        [true, true, true]`): the read that can follow the statement's own
-//        store observes a store the analysis dropped.
-//    (d) `observed_after`: `else if rds(list, i + 1) { true }` deleted (a
-//        read stops anchoring the previous store) … 25v/3e, red on
-//        `live_step`'s read case via `pin_each_read_keeps_the_store_it_observes`.
+//        `[true, true, true] == [false, true, true]`. No verified/error
+//        count (rejected before the proof obligations run).
+//    (c) `live_step`: the `!st.stores && st.nested` self-observation term
+//        deleted (`(need || (!st.stores && st.nested), true)` → `(need, true)`)
+//        … caught at simplification by `pin_nested_after_write_keeps_the_store`
+//        (`[true, false, true] == [true, true, true]`): a nested read that can
+//        follow the statement's own store would see a dropped store.
+//    (d) `observed_after`: the read anchor `else if rds(list, i + 1) { true }`
+//        deleted … 25 verified, 3 errors; the read-anchoring premise is
+//        load-bearing.
 //
-//  Restored byte-identically after every run (the sha256 of the verified
-//  file and of the source are recorded in `status_reads_sync.txt`). See the
-//  README section for this file.
+//  Restored byte-identically after every run (sha256 of the verified file
+//  recorded in `status_reads_sync.txt`).
 // ─────────────────────────────────────────────────────────────────────────
 
 use vstd::prelude::*;
