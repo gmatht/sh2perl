@@ -58,6 +58,26 @@ self-contained).
   failed (fixed K)" when running the suite; describe the fix otherwise.
 - `.cursorrules` holds additional conventions for other harnesses.
 
+## Commit & push policy (freebuff agents)
+
+- **Every change is committed and pushed**, as soon as it is complete and its
+  checks pass — do not leave verified work sitting uncommitted at the end of a
+  turn. One logical change per commit; don't bundle unrelated edits.
+- Commit only after the relevant check passes (`cargo build` + `cargo test
+  --lib` for library code, or the narrower check a typo/docs-only change
+  needs). If a check fails, fix it first; never commit known-broken output or
+  weaken a test to make the commit possible.
+- Stage explicit paths (`git add <path> …`). The `git add .` ban above still
+  applies — scratch files and quoted-name artifacts live at the repo root.
+- Push to the current branch's upstream right after committing. Never
+  force-push, never push to a different remote/branch than the checked-out
+  one, and don't rewrite history that is already pushed.
+- Do not commit the per-run state files (`.last_trusted_count`,
+  `.max_tests_passed`) or build artifacts; if a `backends/sh` submodule file
+  was rewritten by `build.rs` codegen, revert it rather than committing it.
+- If the push fails (no upstream, auth, non-fast-forward), report the failure
+  with the command output instead of silently leaving the work local.
+
 ## Backend worktree discipline (2026-08-25 policy — binding)
 
 Each `backends/<lang>/` worktree owns its renderer, but everything below
