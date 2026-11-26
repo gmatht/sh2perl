@@ -5998,10 +5998,12 @@ consumer. Coverage sync registered (`f32_narrow`).
 
 ### Not attempted from the same batch (recorded, not proved)
 
-- `background_decide` — process/exec classification is **Tier-3** by the
-  standing rule (`the workspace's transform-verification notes`, the proof-campaign plan §(d)
-  "Explicitly deprioritized"): no bash-semantics model exists to state
-  the obligation against.
+- ~~`background_decide`~~ — DONE (`background_decide.rs`, 27): the THREAD
+  verdict is proved observationally equal to FORK for every body the ordered
+  rule accepts, and the shipped set-comparison check is proved UNSOUND on a
+  concrete witness. It stays the conditional "middle rung" (the routing's
+  environment model is stated, not proved) and `is_thread_body` still has no
+  callers outside its own file. See its section below.
 - ~~`sync_ok_loops`~~ — DONE (`sync_ok_loops.rs`, 24): criterion 1 and 2 do
   select a rendering strategy, and the Tier-1 obligation is exactly that the
   chosen form preserves the emitted bytes — proved as
@@ -6012,6 +6014,76 @@ consumer. Coverage sync registered (`f32_narrow`).
   "the answer equals what `type` would print", which needs bash's
   function-definition state at the splice point; the transform re-runs
   after `perl_generator_fixed::fixups`, which Tier-1 does not model.
+
+## background_decide.rs — a THREAD verdict prints what FORK prints (27)
+
+    verus --triggers-mode silent --rlimit 40 proofs/verus/background_decide.rs
+    -> verification results:: 27 verified, 0 errors
+
+`transforms/background_decide.rs` is analysis-only: for each `cmd &` body it
+stores a verdict, THREAD (a worker with a FRESH runtime may run the body) or
+FORK (bash's own subshell, on the current chain). The routing is sound iff a
+THREAD body prints the bytes FORK would, and that is what the model states
+and proves (`thread_equals_fork`): `intended_ok(s, {})` implies
+`as_fork(s, m) == as_thread(s, m)` for every inherited environment `m`.
+
+What is proved:
+
+- **`thread_equals_fork`** — the equivalence above, under the ordered rule
+the module's own doc states ("a variable the body itself assigns first …
+before it is read"). `IfRead` requires its condition's name to be bound, and
+`defined_after` keeps only what BOTH arms bind, because bash cannot know
+which one ran; `agree_lemma` carries "the two environments agree on every
+name the body needs" through the `if`.
+- **`intended_implies_shipped`** — the ordered rule is at least as strict as
+the shipped SET comparison, so fixing the check would refuse nothing the
+pass accepts today.
+- **`shipped_check_is_unsound`** — the negative control, and the reason this
+file exists. `is_self_contained_stmt` collects reads and assigns into two
+HashSets and compares them as sets, so it accepts
+`if [ -n "$x" ]; then x=1; echo 7; fi`: the subshell inherits `x=1` and
+prints `7`, a fresh runtime prints nothing. The lemma proves all four halves
+of that witness (the shipped check accepts, the ordered rule refuses, FORK
+prints one value, THREAD prints none).
+- **`classify_thread_sound`** / **`route_thread_is_sound`** — the verdict end
+to end over the SHIPPED walk (`walk_self_contained` accepts ⇒
+`intended_ok`) and then over the shipped predicate `is_thread_body`, whose
+table can hold only accepted bodies (`table_entry_is_accepted`).
+`walk_ok_implies_intended` is the bridge, and it needs
+`walk_after_dominated` (the walk keeps straight-line binds only, the rule
+also keeps what both arms bind) plus `walk_ok_mono`.
+- **`unclassified_stays_fork`, `absent_table_routes_fork`** — the refusal
+direction: an absent table (transform never ran) or a body with no entry
+routes FORK. **`side_effect_stays_fork`** — a file write or a control
+transfer is never accepted (`side_effect_never_accepted`), so it can never
+enter the table.
+
+**It can fail (checked).** Accepting any read in the shipped walk
+(`walk_ok`'s `OutRead` arm ⇒ `true`) reports **25 verified, 2 errors**, both
+in the bridge (`walk_ok_implies_intended`, `walk_ok_mono`); making the
+ORDERED rule accept any read (`intended_ok`'s `OutRead` arm ⇒ `true`)
+reports **25 verified, 2 errors**, in `agree_lemma` and
+`intended_implies_shipped`. The file was restored byte-identically after
+each run (sha256 `d026993f6882…`) and re-checked at **27 verified, 0
+errors**.
+
+**Scope (read this before quoting it).** This is the conditional "middle
+rung": it mentions the denotation of a statement (`run`), so the
+equivalence holds under a stated environment model — reads inherit the
+parent's bindings, writes die with the subshell, stdout is shared — not for
+arbitrary bash. Not modelled: concurrency and scheduling, signals, exit
+codes, fd state, PATH resolution, `Exec` subprocess effects, the
+per-statement `body.iter().all(…)` loop, and the pointer-keyed verdict
+cache. The table's key is the body's `Debug` text (`body_key`); "equal text
+⇒ equal body" is an assumption about the derived `Debug`, not a proved
+injectivity lemma. And `is_thread_body` has NO call sites outside its own
+file, so no emitted program depends on the verdict yet: the proof makes it
+usable and gateable, not wired.
+
+There is no `background_decide_sync.txt` and no `pin_*` fidelity obligation
+(18 `proof fn`s, 27 verified obligations), so there are no rows for
+`check_sync.py` to run; the concrete evidence is in-file, in
+`shipped_check_is_unsound`'s witness.
 
 ---
 

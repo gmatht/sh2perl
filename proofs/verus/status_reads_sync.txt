@@ -3,14 +3,14 @@
 
 [pins]
 pin pin_bare_exit_reads_the_status -> test bare_exit_reads_the_status: MAPPED
-pin pin_dead_store_is_unobservable -> UNMIRRORED (by design — see VERUS.md §(b).4)
+pin pin_dead_store_is_unobservable -> UNMIRRORED (by design — see the proof-campaign plan §(b).4)
 pin pin_each_read_keeps_the_store_it_observes -> test each_read_keeps_the_store_it_observes: MAPPED
-pin pin_empty_list -> UNMIRRORED (by design — see VERUS.md §(b).4)
-pin pin_exit_observes_the_kept_store -> UNMIRRORED (by design — see VERUS.md §(b).4)
-pin pin_init_read_needs_the_initialiser -> UNMIRRORED (by design — see VERUS.md §(b).4)
+pin pin_empty_list -> UNMIRRORED (by design — see the proof-campaign plan §(b).4)
+pin pin_exit_observes_the_kept_store -> UNMIRRORED (by design — see the proof-campaign plan §(b).4)
+pin pin_init_read_needs_the_initialiser -> UNMIRRORED (by design — see the proof-campaign plan §(b).4)
 pin pin_last_statement_store_is_live_without_a_reader -> test last_statement_store_is_live_without_a_reader: MAPPED
-pin pin_nested_after_write_keeps_the_store -> UNMIRRORED (by design — see VERUS.md §(b).4)
-pin pin_single_read_is_live -> UNMIRRORED (by design — see VERUS.md §(b).4)
+pin pin_nested_after_write_keeps_the_store -> UNMIRRORED (by design — see the proof-campaign plan §(b).4)
+pin pin_single_read_is_live -> UNMIRRORED (by design — see the proof-campaign plan §(b).4)
 pin pin_stores_after_the_last_read_keep_only_the_exit_store -> test stores_after_the_last_read_keep_only_the_exit_store: MAPPED
 pin pin_stores_before_the_nearest_read_are_dropped -> test stores_before_the_nearest_read_are_dropped: MAPPED
 
