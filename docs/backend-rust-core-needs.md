@@ -180,15 +180,15 @@ the emitted text. What stays stored is documented in
 - **Census, per fixture and total** (`cargo run --bin rust_fixtures`; `pfx`
   = specialized sites, `pfi` = calls left on `__sh_printf`, `pfl` =
   interpreter body lines): `07_redirect` 44 lines / 1 / 0 / 0,
-  `19_printf_literal` 31 lines / 4 / 0 / 0, `20_printf_dynamic` 236 lines /
-  0 / 1 / 115, the other 17 fixtures 0 / 0 / 0 — **TOTAL 20 fixtures, 824
-  lines, pfx 5, pfi 1, pfl 115**. Before/after, measured rather than
+  `19_printf_literal` 31 lines / 4 / 0 / 0, `20_printf_dynamic` 235 lines /
+  0 / 1 / 114, the other 17 fixtures 0 / 0 / 0 — **TOTAL 20 fixtures, 823
+  lines, pfx 5, pfi 1, pfl 114**. Before/after, measured rather than
   remembered: before this pass (commit `e4fe8c187`) the census had no printf
   columns, 0 of 18 fixtures called `__sh_printf` (`git grep -c` over the
-  expected files) and 0 interpreter lines were measured — yet the 115-line
+  expected files) and 0 interpreter lines were measured — yet the 114-line
   body was still reachable by any literal-format site that fell back (a
   slotless `printf '100%%\n'` used to). After: 5 specialized / 1 interpreted
-  / 115 lines, all 115 in the dynamic fixture; `20` (236 lines) versus `19`
+  / 114 lines, all 114 in the dynamic fixture; `20` (235 lines) versus `19`
   (31 lines) is what keeping the interpreter costs.
 - **Fixtures pin both sides**: `19_printf_literal` is the specialized path
   (four literal sites including `%%` and literal braces; zero
@@ -273,7 +273,11 @@ the emitted text. What stays stored is documented in
   behaviour vs `bash`, **clippy `-D warnings` in debug *and* `-O`**, idiom
   census, which now also counts `abort`s and fails the gate on a single
   generated `.unwrap()`/`.expect()`/`panic!`/`unreachable!`) plus the
-  differential net `cargo run --bin rust_fuzz`. Clippy is a
+  differential net `cargo run --bin rust_fuzz` (seeded; 60 generated programs
+  by default, each run under `bash` and under the rendered+compiled Rust in
+  BOTH a debug and a `-O` build, comparing stdout, stderr and the exit status;
+  `--script` replays a minimized case and the summary line reports
+  seed/programs/divergences). Clippy is a
   required check, not an optional extra: if the component is missing the gate
   prints `HARD GAP: clippy did not run` and exits non-zero. It already pays
   for itself — `clippy::print_with_newline`, `clippy::format_in_format_args`

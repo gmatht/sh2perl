@@ -2392,7 +2392,13 @@ fn printf_unescape(fmt: &str) -> Option<String> {
             '\\' => out.push('\\'),
             '"' => out.push('"'),
             '\'' => out.push('\''),
-            'c' => return None,
+            // `\c` is NOT special in a printf FORMAT (bash keeps the
+            // backslash; it only truncates inside a `%b` argument), so it
+            // stays text here — which also lets the site specialize
+            'c' => {
+                out.push('\\');
+                out.push('c');
+            }
             '0'..='7' => {
                 let mut n = c.to_digit(8)?;
                 for _ in 0..2 {
@@ -2443,8 +2449,6 @@ enum PrintfFallback {
     Unsupported,
     /// `%b` re-expands backslash escapes from the ARGUMENT at run time
     BackslashB,
-    /// `\\c` terminates the output and drops everything after it
-    StopOutput,
     /// the number of arguments does not match the number of `%s` slots
     Arity,
 }
@@ -2611,19 +2615,31 @@ fn drop_esc_arg(t: &str) -> String {
     const NEEDLE: &str = "__sh_print_words(";
     while let Some(p) = t[i..].find(NEEDLE) {
         let at = i + p;
+        out.push_str(&t[i..at]);
         let open = at + NEEDLE.len() - 1;
         let Some(close) = scan_matching(t, open) else {
-            break;
+            // not a call (or a shape we cannot delimit): copy the needle and
+            // keep scanning, so one odd occurrence cannot skip the rest
+            out.push_str(&t[at..at + NEEDLE.len()]);
+            i = at + NEEDLE.len();
+            continue;
         };
-        out.push_str(&t[i..at]);
-        let inner = &t[open + 1..close];
+        // a call's word list can itself contain a `__sh_print_words` call
+        // (a capture block printing through a print word), so the arguments
+        // are rewritten first — otherwise a nested 3-argument call would be
+        // copied verbatim and never visited
+        let inner = drop_esc_arg(&t[open + 1..close]);
         match inner.trim_end().strip_suffix(", false") {
             Some(short) => {
                 out.push_str(NEEDLE);
                 out.push_str(short);
                 out.push(')');
             }
-            None => out.push_str(&t[at..=close]),
+            None => {
+                out.push_str(&t[at..open + 1]);
+                out.push_str(&inner);
+                out.push(')');
+            }
         }
         i = close + 1;
     }
@@ -7006,7 +7022,10 @@ impl Render {
                 let ws = parts
                     .into_iter()
                     .map(|p| match p {
-                        Part::Lit(t) => format!("vec![{}]", Self::rust_str_expr(&t)),
+                        // a literal part is a WORD element: coerce it to `Word`
+                // exactly like `words_expr` does (a folded constant is an
+                // owned `String`, a borrowed literal an `&'static str`)
+                Part::Lit(t) => Self::word_vec(format!("vec![{}]", Self::rust_str_expr(&t))),
                         Part::Words(w) => w,
                     })
                     .collect::<Vec<_>>();
@@ -7451,7 +7470,10 @@ impl Render {
                     // a map/array var can't take a read line — skip
                     continue;
                 }
-                let get = format!("__f.get({idx}).cloned().unwrap_or_default()");
+                // `__f` is a `Vec<Word>`: `.to_string()` materializes the
+                // value for the String/binding targets below, and the
+                // numeric arms still parse through `str`
+                let get = format!("__f.get({idx}).cloned().unwrap_or_default().to_string()");
                 // A pure expression builder must not touch the output
                 // buffer: `write_str`/`write_num` call `emit`, which
                 // appends (depth-indented) to `self.out` AND can push a
@@ -10313,7 +10335,10 @@ impl Render {
         let ws: Vec<String> = parts
             .into_iter()
             .map(|p| match p {
-                Part::Lit(t) => format!("vec![{}]", Self::rust_str_expr(&t)),
+                // a literal part is a WORD element: coerce it to `Word`
+                // exactly like `words_expr` does (a folded constant is an
+                // owned `String`, a borrowed literal an `&'static str`)
+                Part::Lit(t) => Self::word_vec(format!("vec![{}]", Self::rust_str_expr(&t))),
                 Part::Words(w) => w,
             })
             .collect();
@@ -12354,7 +12379,10 @@ impl Render {
                             let st = self.write_num(var, &format!("{items_g}[{idx_g}].trim().parse::<i64>().unwrap_or(0)"));
                             self.emit(&st);
                         } else {
-                            let st = self.write_str(var, &format!("{items_g}[{idx_g}].clone()"));
+                            // the item list is `Vec<Word>`; the loop variable is
+                            // a `String` slot (store or promoted local), so the
+                            // element is materialized, not merely cloned
+                            let st = self.write_str(var, &format!("{items_g}[{idx_g}].to_string()"));
                             self.emit(&st);
                         }
                         let old_for = self.for_index.replace(idx_g.clone());
@@ -13726,7 +13754,6 @@ fn helper_source(h: &str) -> &'static str {
                     'n' => out.push('\n'), 't' => out.push('\t'), 'r' => out.push('\r'),
                     'a' => out.push('\x07'), 'b' => out.push('\x08'), 'f' => out.push('\x0c'),
                     'v' => out.push('\x0b'), 'e' => out.push('\x1b'), '\\' => out.push('\\'),
-                    'c' => return out,
                     '0'..='7' => {
                         let mut n = 0; let mut k = 0;
                         while k < 3 && i + k < ch.len() && ch[i + k].is_ascii_digit() && ch[i + k] <= '7' {
@@ -20076,6 +20103,17 @@ mod tests {
         );
         // a computed format is never a literal
         assert_eq!(literal_printf_replacement("&fmt, &[]"), None);
+    }
+
+    #[test]
+    fn drop_esc_arg_handles_nested_calls() {
+        // the esc argument sits after a word list that may itself contain a
+        // call (`__sh_printf(...)`) — the paren scan must not stop early
+        let s = "__sh_print_words(&[vec![__sh_printf(\"%s\", &[\"hi\".to_string().into()]).into()]], false, false);";
+        assert_eq!(
+            drop_esc_arg(s),
+            "__sh_print_words(&[vec![__sh_printf(\"%s\", &[\"hi\".to_string().into()]).into()]], false);"
+        );
     }
 
     #[test]

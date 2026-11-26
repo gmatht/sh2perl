@@ -129,7 +129,6 @@ fn __sh_printf(fmt: &str, args: &[Word]) -> String {
                     'n' => out.push('\n'), 't' => out.push('\t'), 'r' => out.push('\r'),
                     'a' => out.push('\x07'), 'b' => out.push('\x08'), 'f' => out.push('\x0c'),
                     'v' => out.push('\x0b'), 'e' => out.push('\x1b'), '\\' => out.push('\\'),
-                    'c' => return out,
                     '0'..='7' => {
                         let mut n = 0; let mut k = 0;
                         while k < 3 && i + k < ch.len() && ch[i + k].is_ascii_digit() && ch[i + k] <= '7' {

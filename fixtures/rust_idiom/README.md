@@ -15,7 +15,7 @@ Re-render after a backend change, then look at the diff:
 ## The gate
 
     cargo run --bin rust_fixtures -- --check
-    cargo run --bin rust_fuzz -- --cases 150 --seed 1
+    cargo run --bin rust_fuzz              # 60 programs, seed 1, debug + release
 
 `--check` runs six checks per fixture, in this order:
 
@@ -260,22 +260,22 @@ the emitted file). From `cargo run --bin rust_fixtures`:
 |---|---|---|---|---|
 | 07_redirect | 44 | 1 | 0 | 0 |
 | 19_printf_literal | 31 | 4 | 0 | 0 |
-| 20_printf_dynamic | 236 | 0 | 1 | 115 |
+| 20_printf_dynamic | 235 | 0 | 1 | 114 |
 | the other 17 fixtures | — | 0 | 0 | 0 |
-| **TOTAL (20 fixtures)** | **824** | **5** | **1** | **115** |
+| **TOTAL (20 fixtures)** | **823** | **5** | **1** | **114** |
 
 Before/after, measured rather than remembered:
 
 | | before this pass (`e4fe8c187`) | after (fresh run) |
 |---|---|---|
-| census columns | none (the split was unmeasured) | `pfx` 5 / `pfi` 1 / `pfl` 115 |
+| census columns | none (the split was unmeasured) | `pfx` 5 / `pfi` 1 / `pfl` 114 |
 | fixtures calling `__sh_printf` | 0 of 18 (`git grep -c` over the expected files) | 1 of 20 (`20_printf_dynamic`) |
-| interpreter lines emitted, total | 0 measured — and reachable by any literal-format site that fell back, e.g. a slotless `printf '100%%\n'`, which used to keep the 115-line body | 115, all in `20` |
+| interpreter lines emitted, total | 0 measured — and reachable by any literal-format site that fell back, e.g. a slotless `printf '100%%\n'`, which used to keep the 114-line body | 114, all in `20` |
 | 07_redirect | 44 lines, `__sh_print_words(&[…], nl, esc)` called with `false, false` | 44 lines, `__sh_print_words(&[…], nl)` |
 | 19_printf_literal | did not exist | 31 lines, 4 specialized, 0 interpreter lines |
 
 The cost of keeping the interpreter is visible in the same table: `20` is
-236 lines to `19`'s 31, and 115 of those lines are the interpreter body.
+235 lines to `19`'s 31, and 114 of those lines are the interpreter body.
 
 `rust_fuzz` renders literal formats of every class above (`%%`, a literal
 brace, `%d` with a numeric argument, and a format assembled at run time), so
@@ -391,18 +391,72 @@ they pin two things: the native ERE matcher is *not* reached for them (they
 must therefore still compile), and the dead `let` left behind by the
 unsupported construct is removed rather than warned about.
 
-## The fuzz net
+## The differential fuzz net
 
-    cargo run --bin rust_fuzz -- --cases 150 --seed 1 [--keep]
+    cargo run --bin rust_fuzz                       # 60 programs, seed 1, both profiles
+    cargo run --bin rust_fuzz -- --cases 300 --seed 7
+    cargo run --bin rust_fuzz -- --script case.sh   # replay one program
+    cargo run --bin rust_fuzz -- --cases 20 --keep  # keep every scratch dir
 
-Renders seeded random programs from the supported subset, compiles each with
-`rustc -O -D warnings`, and diffs stdout + exit status against `bash` on the
-same script in identical scratch directories. It exists because most of the
-idiom work is done by TEXT passes (`compound_assign`,
-`drop_single_use_clones`, the `__sh_cat` flattening,
-`specialize_literal_printf`, the helper pruner): a text pass can only be
-trusted if it is shown not to change meaning on shapes nobody hand-wrote.
-The net found two real codegen bugs on its first run — a three-statement
-`{ let __b = …; __SH_RC.store(…); __b }` wrapper being inlined into a `while`
-condition (invalid Rust), and an orphaned `use …::Ordering` (a `-D warnings`
-failure) — both now fixed and pinned by `16_while_loop`.
+Each generated program is run twice on the same bytes — under `bash` and under
+the freshly rendered + compiled Rust — and **stdout, stderr and the exit
+status** must all match. Every program is built in BOTH profiles (plain
+`rustc`, which keeps overflow checks on, and `rustc -O`), so a
+resolved-to-plain-operator arithmetic path that wraps in bash but panics in a
+debug build is a divergence, not a crash to ignore: a generated-code panic
+writes to stderr and exits 101, which the diff catches like any other
+divergence. The net exists because most of the idiom work is done by TEXT
+passes (`compound_assign`, `drop_single_use_clones`, the `__sh_cat`
+flattening, `specialize_literal_printf`, `drop_esc_arg`, the helper pruner)
+and several of them decide a rewrite by classifying or counting identifiers in
+a string: a pass like that can only be trusted if it is shown not to change
+meaning on shapes nobody hand-wrote.
+
+The generator is a seeded LCG and the seed is a first-class input, so any
+failure is one command away from reproducing: the failing case stays in its
+scratch directory and the run prints
+`--script <dir>/case.sh --seed <seed>`. One summary line reports seed,
+profiles, programs and divergences, so a regression — or a quiet collapse in
+coverage — is visible at a glance:
+
+    rust_fuzz: seed=1 profile=debug+release programs=60 matched=60 diverged=0 render_fail=0 rustc_fail=0
+
+The grammar reaches the seams the recent passes work on: quoted vs unquoted
+expansion of a value with a space, multi-word `echo`/`printf` argument lists,
+command substitution (nested, and word-split in a `for` list), `$var` in
+arithmetic and in `[ ]` comparisons, positional parameters and loop variables,
+`case`, `$?`, `false || …`, redirects (`>` and `>>`) read back through a
+capture, a pipeline, single-use string variables, repeated literals — and
+`printf` sites of every class the specializer classifies: literal formats with
+0/1/N `%s` slots, `%%`, escapes, `\c`, literal braces, `%d`, `%c`, both arity
+mismatches, a slotless format that still passes an argument, and a format
+assembled at run time (the interpreter fallback).
+
+Documented seeds: **1** (the default, and what a gate run uses) plus 7,
+424242 and 20261126 for a wider sweep — all four ran clean (60 programs at
+seed 1, 100 at each of the others).
+
+Divergences this net found, each fixed in `src/rust_backend.rs`:
+
+- three `Cow`/`String` type mismatches left by the `Word = Cow` change — a
+  `for` item read out of a `Vec<Word>`, a `read` target, and a folded constant
+  echo word (`vec!["0".to_string()]` where a `Word` was required). No fixture
+  had any of the shapes; all three were `-D warnings` build failures in the
+  generated program.
+- `drop_esc_arg` skipped a nested `__sh_print_words(…)` call *inside* another
+  call's word list, leaving a 3-argument call against the 2-argument helper
+  (E0061). The pass now rewrites the arguments recursively and never abandons
+  the scan on a shape it cannot delimit.
+- a semantic bug in the `printf` interpreter: bash keeps `\c` in a **format**
+  literally — it only truncates in a `%b` **argument** — while the render-time
+  unescape and the interpreter both stopped the output. Both now match bash.
+
+Known gap, upstream of this backend and reported rather than papered over:
+`x=$(cmd)z` — a capture with a literal suffix inside an **unquoted**
+assignment word — loses the `z` before the renderer runs (`ast_to_ir` builds
+`Assign { expr: Capture … }` with no literal part, verified by printing the
+IR). `src/shir.rs` is core-owned, so the generator uses the quoted form
+(`x="$(cmd)"`) and the construct stays out of the net until the front end
+keeps the suffix. Reproducer: `printf 'x=$(printf %%s hi)z\necho "x=$x"\n' >
+/tmp/c.sh && bash /tmp/c.sh` prints `x=hiz`, while the emitted Rust prints
+`x=hi`.
