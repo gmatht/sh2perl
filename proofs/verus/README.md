@@ -8748,3 +8748,61 @@ non-None signal. Restored byte-identically after each run (sha256 in
 - Not modelled, stated: the pass's `changed` bookkeeping and named-block
   rebuilding, and the other consumers of the verdict (they read the same
   functions, so a verdict change is the same theorem).
+
+## affix_strip_fold.rs — `${v#lit}` is one `strip_prefix` (29)
+
+    verus --triggers-mode silent --rlimit 40 proofs/verus/affix_strip_fold.rs
+    -> verification results:: 29 verified, 0 errors
+
+The fold turns `param("#"|"##"|"%"|"%%", NAME, PAT)` into one `AffixStrip`
+node when `PAT` is a magic-free literal. That is only sound because bash's
+`#`/`##` (and `%`/`%%`) agree for such a pattern: exactly one prefix can be
+the literal, so shortest ≡ longest and the strip removes at most one
+occurrence. This file proves that against a scanner that ENUMERATES the
+matching prefixes (lengths upward for shortest, downward for longest)
+instead of assuming the closed form.
+
+### What is proved
+
+- **`literal_shortest_eq_longest`**: the two scans return the same cut (the
+  literal's own length) or both find nothing.
+- **`fold_preserves_value`** and its suffix mirror: bash's `${v#lit}` and
+  `${v##lit}` are both the node's `strip_prefix(lit)` value — likewise
+  `${v%lit}`/`${v%%lit}` and `strip_suffix(lit)`.
+- **`literal_strip_is_one_occurrence`**: the result is `v`, or `v` minus
+  exactly one leading (resp. trailing) occurrence.
+- **`star_forms_preserve_value`**: `#lit*` ≡ `#lit` and `%*lit` ≡ `%lit` —
+  the shortest matching prefix/suffix of a one-star pattern is the body
+  itself — which is exactly the two `AffixStrip` star arms.
+
+### The pins
+
+`pin_double_star_differs` is the table's negative control: on `a/x/b/x`,
+`${v#*x}` is `/b/x` while `${v##*x}` is empty. `pin_dirname_basename` pins
+`${p%/*}` / `${p##*/}`; `pin_no_occurrence_is_the_value` the no-match rule;
+`pin_empty_body_star` the `%*` identity; `pin_magic_is_refused` and
+`pin_star_shape` the two refusals (`*`/`?`/`[`/`\`, and a middle star, a
+second star, or no star at all).
+
+### Mutants, measured
+
+Counted: making `is_prefix` strict gives **26 verified, 3 errors**; a
+suffix scan that ignores the literal **27 verified, 2 errors**. Refuted at
+simplification by a concrete pin: a strip that removes nothing, an
+off-by-one shortest scan, `*` treated as magic, `cut_at`'s head branch
+keeping the tail, the "first" cut using `rfind`, and a shape gate that
+accepts two stars. Restored byte-identically after each run (sha256 in
+`affix_strip_fold_sync.txt`).
+
+### Scope (read this before quoting it)
+
+- The four `find`/`rfind` Cut identities (`%lit*`, `%%lit*`, `#*lit`,
+  `##*lit`) are modelled as the `CutAt` node's value and pinned on concrete
+  inputs, but the step from the shortest/longest SCAN to `find`/`rfind`
+  (that the matched prefix ends exactly at the occurrence) is **stated, not
+  proved** — the same table the source states.
+- Strings are `Seq<char>`; the NAME-slot lexical gate (`is_plain_ident` /
+  `is_text_operand_name`) and the target gates (`fold_target_ok` /
+  `cut_target_ok`) are not modelled: they decide whether the fold is
+  offered, never its value. Their refusals are the source's own tests.
+- The empty-body arms (`%*` identity, `%%*` empty) are value-level pins.

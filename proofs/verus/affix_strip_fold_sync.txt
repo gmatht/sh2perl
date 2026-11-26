@@ -1,0 +1,47 @@
+# verus-sync-coverage manifest: affix_strip_fold
+# source sha: affix_strip_fold=929ebbee6785  proof sha: eb8ff5966697
+
+[pins]
+pin literal_shortest_eq_longest -> test greedy_and_shortest_are_identical_for_a_literal: MAPPED
+pin fold_preserves_value -> test literal_prefix_strip_folds_on_rust: MAPPED
+pin fold_preserves_value_suffix -> test literal_suffix_strip_folds_on_java: MAPPED
+pin star_forms_preserve_value -> test star_forms_fold_to_the_four_cuts_on_rust: MAPPED
+pin pin_double_star_differs -> test star_forms_fold_to_the_four_cuts_on_rust: MAPPED
+pin pin_dirname_basename -> test path_strip_param_shapes_fold_to_cuts: MAPPED
+pin pin_empty_body_star -> test star_alone_is_the_identity_family_and_folds: MAPPED
+pin pin_literal_one_length -> test literal_prefix_strip_folds_on_rust: MAPPED
+pin pin_magic_is_refused -> test glob_magic_pattern_is_kept: MAPPED
+pin pin_star_shape -> test conditional_star_forms_are_refused: MAPPED
+pin pin_no_occurrence_is_the_value: UNMIRRORED (no source test for the no-match value)
+pin literal_strip_is_one_occurrence: UNMIRRORED (value-level; the source tests the node shape)
+
+[guards]
+guard law literal_shortest_eq_longest (shortest == longest for a literal): PRESENT
+guard law fold_preserves_value (AffixStrip == bash strip, both ops): PRESENT
+guard law literal_strip_is_one_occurrence (at most one occurrence): PRESENT
+guard law star_forms_preserve_value (#lit* == #lit, %*lit == %lit): PRESENT
+guard scan enumerates prefixes/suffixes rather than assuming the closed form: PRESENT
+guard star SHAPE gate (one star, at an end): PRESENT
+guard magic set (*, ?, [, backslash) as lit_free: PRESENT
+guard Cut table (the four find/rfind identities): STATED, not proved (pinned on v())
+guard NAME-slot lexical gate / target gates (always-registry, value-free): OUT OF MODEL
+
+[counts]
+29 verified, 0 errors (verus --triggers-mode silent --rlimit 40 affix_strip_fold.rs)
+mutants: strict is_prefix 26v/3e, suffix scan ignores the literal 27v/2e;
+  strip-removes-nothing, scan off-by-one, '*' not magic, cut head keeps tail,
+  first-cut-uses-rfind and two-stars-accepted rejected at simplification by
+  their pins.
+# all suites built; per-test verdicts below
+exec literal_shortest_eq_longest (greedy_and_shortest_are_identical_for_a_literal): PASS
+exec fold_preserves_value (literal_prefix_strip_folds_on_rust): PASS
+exec fold_preserves_value_suffix (literal_suffix_strip_folds_on_java): PASS
+exec star_forms_preserve_value (star_forms_fold_to_the_four_cuts_on_rust): PASS
+exec pin_double_star_differs (star_forms_fold_to_the_four_cuts_on_rust): PASS
+exec pin_dirname_basename (path_strip_param_shapes_fold_to_cuts): PASS
+exec pin_empty_body_star (star_alone_is_the_identity_family_and_folds): PASS
+exec pin_literal_one_length (literal_prefix_strip_folds_on_rust): PASS
+exec pin_magic_is_refused (glob_magic_pattern_is_kept): PASS
+exec pin_star_shape (conditional_star_forms_are_refused): PASS
+exec pin_no_occurrence_is_the_value: UNMIRRORED (not executed)
+exec literal_strip_is_one_occurrence: UNMIRRORED (not executed)
