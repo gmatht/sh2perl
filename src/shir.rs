@@ -39546,7 +39546,8 @@ fn stmt_to_estree(stmt: &IrStmt) -> Option<Stmt> {
                     }
                     let native = target.indices.is_empty()
                         && native_store_write_ok(&target.var)
-                        && store_rhs_plain_value(&ve);
+                        && store_rhs_plain_value(&ve)
+                        && !store_rhs_needs_runtime(&ve);
                     let rhs = if native && !store_rhs_string(&ve) {
                         Expr::CallExpression {
                             callee: Box::new(Expr::Identifier {
@@ -61273,6 +61274,42 @@ fn store_rhs_string(e: &Expr) -> bool {
     )
 }
 
+/// Is this expression a RAW store read (`sh2.vars.<name>` / its `?? ""`
+/// spelling / a `sh2.getVar` call)? Such a read can carry a RECORD or an
+/// ARRAY, which the runtime `setVar` preserves; the native inlined write
+/// String()-coerces every non-string/non-literal value, so a copy through
+/// it would destroy the value (enum/struct payloads, map values). Those
+/// copies take the runtime `setVar` instead — exact for every value kind.
+fn store_rhs_needs_runtime(e: &Expr) -> bool {
+    fn vars_member(e: &Expr) -> bool {
+        matches!(
+            e,
+            Expr::MemberExpression { object, property, computed: false, .. }
+                if is_sh2_member(object, "vars")
+                    && matches!(property.as_ref(), Expr::Identifier { .. })
+        )
+    }
+    match e {
+        Expr::LogicalExpression { operator, left, right } if operator == "??" => {
+            vars_member(left)
+                && matches!(
+                    right.as_ref(),
+                    Expr::Literal { value: serde_json::Value::String(s), .. } if s.is_empty()
+                )
+        }
+        // ANY member read may carry a record/array (a struct field, a
+        // map value): route the copy through the runtime setVar.
+        Expr::MemberExpression { .. } => true,
+        Expr::CallExpression { callee, .. } => is_sh2_member(callee, "getVar"),
+        // An array value must reach the runtime setVar: it registers the
+        // native array (arrayIndex/arrayLen read `this.arrays`) as well as
+        // the scalar view. The inlined property write would only do the
+        // latter (and would String() the elements).
+        Expr::ArrayExpression { .. } => true,
+        _ => false,
+    }
+}
+
 /// Render a setArray/setArrayAppend argument: Str elements with lifted
 /// `$var` references become template literals with the values inlined (the
 /// runtime would otherwise read them from the STORE, which lifted vars are
@@ -61896,7 +61933,7 @@ fn expr_to_estree(e: &IrExpr) -> Expr {
                 if let [IrExpr::Str(name, _), e] = args.as_slice() {
                     if native_store_write_ok(name) {
                         let ve = expr_to_estree(e);
-                        if store_rhs_plain_value(&ve) {
+                        if store_rhs_plain_value(&ve) && !store_rhs_needs_runtime(&ve) {
                             let rhs = if store_rhs_string(&ve) {
                                 ve
                             } else {
