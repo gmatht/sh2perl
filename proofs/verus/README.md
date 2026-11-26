@@ -46,7 +46,7 @@ when it rots:
 
 | failure | what it means |
 |---|---|
-| `stale-source` | a recorded `# source sha:` no longer matches the file (sha256 or, for a `shir`-style pin, HEAD's git blob). The fix is to re-audit the proof against the new source and record it, not to bump the sha; a `STALE (…)` annotation does not soften the failure. |
+| `stale-source` | a recorded `# source sha:` is not the leading 12 hex of that file's sha256 (or its full digest). One rule only: no alternate digest, no shortened stub, no annotation. The fix is to re-audit the proof against the new source and record the audit, not to bump the sha; a `STALE (…)` annotation does not soften the failure. |
 | `sha` | the recorded `proof sha:` no longer matches the `.rs`, or the line is missing. |
 | `phantom-pin` | a `pin <name>` row names no `fn <name>(` in the sibling `.rs`. |
 | `unrun` | a `pin … : MAPPED` row has no `exec …: PASS` row, or its named test did not run. |

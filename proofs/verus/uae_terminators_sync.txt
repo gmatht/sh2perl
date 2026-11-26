@@ -1,7 +1,9 @@
 # verus-sync-coverage manifest: uae_terminators
-# source sha: shir=801da0be2a82 (git blob of src/shir.rs at HEAD; audited: since
+# source sha: shir=10e2eaec7a19 (sha256 of src/shir.rs; audited: since
 #   0267b2d61be5 only the ESTree lowering changed -- stmt_to_estree,
-#   expr_to_estree, store_rhs_string -- not the terminator region this models)
+#   expr_to_estree, store_rhs_string -- not the terminator region this models.
+#   The row used to record HEAD's git blob; it now records the content digest,
+#   because the checker has exactly one rule and no alternate digest.)
 # uae=3adb4e485152 (sha256 of src/transforms/unreachable_after_exit.rs)
 # proof sha: ad4861da41d3
 

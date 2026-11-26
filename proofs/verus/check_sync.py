@@ -150,22 +150,32 @@ def parse_manifest(path: str) -> Manifest:
     return m
 
 
-def sha256_prefix(path: str, n: int = 12) -> str:
+SHA_LEN = 12
+
+
+def sha256_full(path: str) -> str:
     h = hashlib.sha256()
     with open(path, "rb") as fh:
         for chunk in iter(lambda: fh.read(1 << 20), b""):
             h.update(chunk)
-    return h.hexdigest()[:n]
+    return h.hexdigest()
 
 
-def head_blob_prefix(path: str, n: int = 12) -> str | None:
-    rel = os.path.relpath(path, REPO)
-    r = subprocess.run(
-        ["git", "rev-parse", f"HEAD:{rel}"], cwd=REPO, capture_output=True, text=True
-    )
-    if r.returncode != 0:
-        return None
-    return r.stdout.strip()[:n]
+def sha256_prefix(path: str, n: int = SHA_LEN) -> str:
+    return sha256_full(path)[:n]
+
+
+def digest_matches(recorded: str, path: str) -> bool:
+    """The ONE way a recorded sha matches: it must be the leading 12+ hex
+    characters of THIS file's sha256 (or the full 64-char digest).
+
+    There is deliberately no second rule: no alternate digest of the same
+    file, no shortened stub, no annotation, nothing that could let a row
+    that no longer describes the file read as a match.
+    """
+    if not re.fullmatch(r"[0-9a-f]{12,64}", recorded or ""):
+        return False
+    return sha256_full(path).startswith(recorded)
 
 
 def resolve_source(key: str) -> str | None:
@@ -265,7 +275,7 @@ def check(m: Manifest, verdicts: dict[str, list[str]] | None, verbose: bool) -> 
         bad("sha", "no `proof sha:` line")
     else:
         actual = sha256_prefix(m.proof)
-        if not actual.startswith(m.proof_sha[:12]) and not m.proof_sha.startswith(actual):
+        if not digest_matches(m.proof_sha, m.proof):
             bad("sha", f"proof sha {m.proof_sha} != sha256 {actual} of {os.path.basename(m.proof)}")
         elif verbose:
             print(f"  {m.name}: proof sha ok ({actual})")
@@ -278,22 +288,21 @@ def check(m: Manifest, verdicts: dict[str, list[str]] | None, verbose: bool) -> 
             continue
         actual = sha256_prefix(src)
         rel = os.path.relpath(src, REPO)
-        if recorded.startswith(actual) or actual.startswith(recorded):
+        if digest_matches(recorded, src):
             if verbose:
                 print(f"  {m.name}: {key} ok ({actual} = sha256 of {rel})")
             continue
-        blob = head_blob_prefix(src, len(recorded))
-        if blob and (recorded.startswith(blob) or blob.startswith(recorded)):
-            if verbose:
-                print(f"  {m.name}: {key} ok ({blob} = git blob of {rel} at HEAD)")
-            continue
+        shape = (
+            ""
+            if re.fullmatch(r"[0-9a-f]{12,64}", recorded)
+            else " (and the recorded value is not a 12+ hex digest)"
+        )
         bad(
             "stale-source",
-            f"{key}={recorded}: {rel} is sha256 {actual}"
-            + (f" / blob {blob}" if blob else "")
-            + " — the proof was written against a different source; re-audit it, "
-              "do not just bump the sha (an annotation on the row changes nothing: "
-              "there is no admitted-staleness escape hatch)",
+            f"{key}={recorded}: {rel} is sha256 {actual}{shape}"
+            " — the proof was written against a different source; re-audit it, "
+            "do not just bump the sha (an annotation on the row changes nothing: "
+            "there is no admitted-staleness escape hatch)",
         )
 
     # 2. pins exist as proof fns
