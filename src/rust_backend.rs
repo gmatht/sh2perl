@@ -20106,6 +20106,24 @@ mod tests {
     }
 
     #[test]
+    fn capture_glued_to_literal_keeps_every_part() {
+        // `x=$(cmd)z` is ONE word with two parts: the substitution and the
+        // literal `z`. The parser used to consume the `z` and drop it, so the
+        // IR only carried the capture and the value lost its suffix.
+        for (src, frag) in [
+            ("x=$(printf %s hi)z\n", "z"),
+            ("x=z$(printf %s hi)\n", "z"),
+            ("x=$(printf %s hi)-$(printf %s yo)\n", "-"),
+        ] {
+            let cmds = crate::parser::commands::parse_commands_from_text(src).unwrap();
+            let ir = format!("{:?}", crate::shir::ast_to_ir(&cmds));
+            // `ast_to_ir` lowers the substitution to a first-class `Capture`
+            assert!(ir.contains("Capture"), "{src}: {ir}");
+            assert!(ir.contains(&format!("Lit(\"{frag}\")")), "{src}: {ir}");
+        }
+    }
+
+    #[test]
     fn drop_esc_arg_handles_nested_calls() {
         // the esc argument sits after a word list that may itself contain a
         // call (`__sh_printf(...)`) — the paren scan must not stop early

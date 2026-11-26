@@ -423,7 +423,9 @@ coverage — is visible at a glance:
 
 The grammar reaches the seams the recent passes work on: quoted vs unquoted
 expansion of a value with a space, multi-word `echo`/`printf` argument lists,
-command substitution (nested, and word-split in a `for` list), `$var` in
+command substitution — nested, word-split in a `for` list, and **glued to
+literal text inside one word** (`x=$(cmd)z`, `x=z$(cmd)`,
+`x=$(cmd)-$(cmd)`, quoted and unquoted) — `$var` in
 arithmetic and in `[ ]` comparisons, positional parameters and loop variables,
 `case`, `$?`, `false || …`, redirects (`>` and `>>`) read back through a
 capture, a pipeline, single-use string variables, repeated literals — and
@@ -450,13 +452,11 @@ Divergences this net found, each fixed in `src/rust_backend.rs`:
 - a semantic bug in the `printf` interpreter: bash keeps `\c` in a **format**
   literally — it only truncates in a `%b` **argument** — while the render-time
   unescape and the interpreter both stopped the output. Both now match bash.
-
-Known gap, upstream of this backend and reported rather than papered over:
-`x=$(cmd)z` — a capture with a literal suffix inside an **unquoted**
-assignment word — loses the `z` before the renderer runs (`ast_to_ir` builds
-`Assign { expr: Capture … }` with no literal part, verified by printing the
-IR). `src/shir.rs` is core-owned, so the generator uses the quoted form
-(`x="$(cmd)"`) and the construct stays out of the net until the front end
-keeps the suffix. Reproducer: `printf 'x=$(printf %%s hi)z\necho "x=$x"\n' >
-/tmp/c.sh && bash /tmp/c.sh` prints `x=hiz`, while the emitted Rust prints
-`x=hi`.
+- a capture glued to literal text lost the literal (`x=$(cmd)z` rendered as
+  `x=hi`). The word parser's continuation path (`append_plain_text` /
+  `merge_expansion_into_word` in `src/parser/words.rs`) could only extend a
+  `Literal`, a `Variable` or an existing interpolation, so a fragment after a
+  bare `CommandSubstitution` was consumed and then discarded (`_ => false`
+  after `lexer.next()`). Both helpers now turn ANY single-expansion word into
+  interpolation parts through `expansion_into_parts`, so the word keeps every
+  part — unquoted or quoted, with a prefix, a suffix or several fragments.

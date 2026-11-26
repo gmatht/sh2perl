@@ -179,12 +179,20 @@ fn generate(rng: &mut Rng) -> String {
             )),
             // an append redirect, read back through a capture
             27 => s.push_str("printf '%s\\n' \"$b\" >> r.txt\necho \"a=$(cat r.txt)\"\n"),
-            // a nested capture. QUOTED on purpose: `x=$(...)z` (a capture
-            // with a literal suffix in an UNQUOTED assignment word) loses
-            // the suffix in the shared IR (`ast_to_ir` drops the literal
-            // part), which is upstream of this backend — see the note in
-            // fixtures/rust_idiom/README.md.
-            28 => s.push_str("x=\"$(printf '%s' \"$(printf '%s' hi)\")\"\necho \"x=$x\"\n"),
+            // a capture glued to literal text in ONE word — unquoted prefix,
+            // unquoted suffix, several fragments, a quoted form, and a
+            // capture next to another capture. All of them must keep every
+            // part (`x=$(cmd)z` is `hiz`, not `hi`).
+            28 => {
+                let w = match rng.below(5) {
+                    0 => "x=$(printf %s \"$b\")z",
+                    1 => "x=z$(printf %s \"$b\")",
+                    2 => "x=$(printf %s \"$b\")-$(printf %s \"$d\")",
+                    3 => "x=\"$(printf %s \"$b\")z\"",
+                    _ => "x=$(printf %s \"$(printf %s hi)\")",
+                };
+                s.push_str(&format!("{w}\necho \"x=$x\"\n"));
+            }
             // two positional parameters in a function
             29 => {
                 if !s.contains("g() {") {

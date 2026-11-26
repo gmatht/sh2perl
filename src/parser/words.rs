@@ -54,7 +54,7 @@ fn append_plain_text(word: &mut Word, fragment: &str) -> bool {
     match word {
         Word::Literal(text, _) => {
             text.push_str(fragment);
-            true
+            return true;
         }
         Word::StringInterpolation(interp, _) => {
             if let Some(StringPart::Literal(last)) = interp.parts.last_mut() {
@@ -62,16 +62,21 @@ fn append_plain_text(word: &mut Word, fragment: &str) -> bool {
             } else {
                 interp.parts.push(StringPart::Literal(fragment.to_string()));
             }
-            true
+            return true;
         }
-        Word::Variable(var_name, _, _) => {
-            let mut parts = vec![StringPart::Variable(var_name.clone())];
-            parts.push(StringPart::Literal(fragment.to_string()));
-            *word = Word::StringInterpolation(StringInterpolation { parts }, None);
-            true
-        }
-        _ => false,
+        _ => {}
     }
+    // A word that is a single expansion (`$(cmd)`, `$var`, `${x}`, `$((…))`)
+    // becomes a one-part interpolation so the glued fragment is not lost:
+    // `x=$(cmd)z` is the two-part word `[CommandSubstitution, Literal("z")]`.
+    // Every expansion shape maps through `expansion_into_parts`, so a missed
+    // one shows up as a false (caller breaks) instead of a silent drop.
+    let Some(mut parts) = expansion_into_parts(word.clone()) else {
+        return false;
+    };
+    parts.push(StringPart::Literal(fragment.to_string()));
+    *word = Word::StringInterpolation(StringInterpolation { parts }, None);
+    true
 }
 
 /// Convert a parsed `$`-expansion word into interpolation parts. Every shape
@@ -111,9 +116,21 @@ fn merge_expansion_into_word(word: &mut Word, expansion: Word) -> bool {
             *word = Word::StringInterpolation(StringInterpolation { parts: new_parts }, None);
             true
         }
-        Word::Variable(name, _, _) => {
-            let mut new_parts = vec![StringPart::Variable(name.clone())];
-            new_parts.extend(parts);
+        // any other single-expansion word (a command substitution, an
+        // arithmetic result, …) becomes a one-part interpolation first, so
+        // `x=$(cmd)$var` keeps both parts
+        _ => {
+            let Some(mut new_parts) = expansion_into_parts(word.clone()) else {
+                return false;
+            };
+            if let (Some(StringPart::Literal(last)), Some(StringPart::Literal(first))) =
+                (new_parts.last_mut(), parts.first())
+            {
+                last.push_str(first);
+                new_parts.extend(parts.into_iter().skip(1));
+            } else {
+                new_parts.extend(parts);
+            }
             *word = Word::StringInterpolation(StringInterpolation { parts: new_parts }, None);
             true
         }

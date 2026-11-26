@@ -277,7 +277,11 @@ the emitted text. What stays stored is documented in
   by default, each run under `bash` and under the rendered+compiled Rust in
   BOTH a debug and a `-O` build, comparing stdout, stderr and the exit status;
   `--script` replays a minimized case and the summary line reports
-  seed/programs/divergences). Clippy is a
+  seed/programs/divergences). Its grammar includes a capture glued to literal
+  text in one unquoted word (`x=$(cmd)z`, `x=z$(cmd)`, `x=$(cmd)-$(cmd)`) —
+  the shape whose parsing dropped the literal until `append_plain_text` /
+  `merge_expansion_into_word` learned to turn any single-expansion word into
+  interpolation parts. Clippy is a
   required check, not an optional extra: if the component is missing the gate
   prints `HARD GAP: clippy did not run` and exits non-zero. It already pays
   for itself — `clippy::print_with_newline`, `clippy::format_in_format_args`

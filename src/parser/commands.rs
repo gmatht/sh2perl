@@ -1839,7 +1839,9 @@ impl Parser {
             //
             // Only activate the merge loop when the next adjacent token is a
             // continuation (Escape, bare SingleQuote, or another quoted string)
-            // rather than a separator (Newline, Space).
+            // rather than a separator (Newline, Space). (Adjacent expansions and
+            // literals are merged in `parse_word` itself, which appends them as
+            // interpolation parts — see `merge_contiguous_quoted_fragments`.)
             let should_merge = match self.lexer.peek() {
                 Some(Token::Escape) => true,
                 Some(Token::EscapedSingleQuote) => true,
