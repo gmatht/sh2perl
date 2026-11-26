@@ -179,6 +179,7 @@ pub fn transform(stmts: &mut Vec<IrStmt>) -> bool {
         var_nospace: vec![],
         var_storage: vec![],
         var_bash_env: vec![],
+        stmt_line_seq: vec![],
     })
     .into_iter()
     .filter(|(_, k)| matches!(k, crate::ir::VarKind::Const))

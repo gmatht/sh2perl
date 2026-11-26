@@ -109,6 +109,10 @@ fn program_json(p: &IrProgram, contract_version: u32) -> Value {
         "requires": p.requires,
         "var_types": p.var_types.iter().map(|(n, t)| json!({"name": n, "type": t})).collect::<Vec<_>>(),
         "stmt_lines": p.stmt_lines.iter().map(|(i, l)| json!({"stmt": i, "line": l})).collect::<Vec<_>>(),
+        // Per-statement source line, nested statements included (see
+        // IrProgram::stmt_line_seq). Additive to the contract: a consumer that
+        // does not read it is unaffected, and an empty array means "no markup".
+        "stmt_line_seq": p.stmt_line_seq,
         "var_lengths": p.var_lengths.iter().map(|(n, l)| json!({"name": n, "max_len": l})).collect::<Vec<_>>(),
         "var_const": p.var_const.iter().map(|(n, k)| json!({"name": n, "kind": k})).collect::<Vec<_>>(),
         "var_lifetimes": p.var_lifetimes.iter().map(|(n, l)| json!({"name": n, "first": l.first, "last": l.last, "escapes": l.escapes})).collect::<Vec<_>>(),

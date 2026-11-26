@@ -616,6 +616,8 @@ pub fn parse_while_loop(parser: &mut Parser) -> Result<Command, ParserError> {
             env_vars: BTreeMap::new(),
             stdout_used: true,
             stderr_used: true,
+        
+            line: 0,
         }))
     } else if condition_commands.len() == 1 {
         Box::new(condition_commands.remove(0))
@@ -753,6 +755,8 @@ pub fn parse_until_loop(parser: &mut Parser) -> Result<Command, ParserError> {
             env_vars: BTreeMap::new(),
             stdout_used: true,
             stderr_used: true,
+        
+            line: 0,
         }))
     } else if condition_commands.len() == 1 {
         Box::new(condition_commands.remove(0))
@@ -1824,6 +1828,8 @@ pub fn parse_simple_command(parser: &mut Parser) -> Result<Command, ParserError>
         env_vars,
         stdout_used: true,
         stderr_used: true,
+    
+        line: parser.lexer.current_line(),
     }))
 }
 
@@ -2244,5 +2250,7 @@ fn parse_assignment(parser: &mut Parser) -> Result<Command, ParserError> {
         env_vars,
         stdout_used: true,
         stderr_used: true,
+    
+        line: parser.lexer.current_line(),
     }))
 }

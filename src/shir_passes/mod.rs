@@ -400,6 +400,7 @@ mod tests {
             var_lengths: vec![],
             var_const: vec![],
             var_lifetimes: vec![],
+            stmt_line_seq: vec![],
         };
         let (ctx, out, metric) = Pipeline::canonical().run(&prog);
         // Stage 0: analyses are stubs that return defaults (ConstVar is
@@ -437,6 +438,7 @@ mod tests {
             var_lengths: vec![],
             var_const: vec![],
             var_lifetimes: vec![],
+            stmt_line_seq: vec![],
         };
         let (ctx1, out1, m1) = Pipeline::canonical().run(&prog);
         let (ctx2, out2, m2) = Pipeline::canonical().run(&prog);
@@ -476,6 +478,7 @@ mod tests {
             var_lengths: vec![],
             var_const: vec![],
             var_lifetimes: vec![],
+            stmt_line_seq: vec![],
         };
         let (_ctx, _out, metric) = Pipeline::canonical().run(&prog);
         assert_eq!(metric.total(), 1);
@@ -508,6 +511,7 @@ mod tests {
             var_lengths: vec![],
             var_const: vec![],
             var_lifetimes: vec![],
+            stmt_line_seq: vec![],
         };
         let (ctx, out, _metric) = Pipeline::canonical().run(&prog);
         assert!(ctx.is_const("answer"));
@@ -538,6 +542,7 @@ mod tests {
                 var_lengths: vec![],
                 var_const: vec![],
                 var_lifetimes: vec![],
+                stmt_line_seq: vec![],
             }
         }
         // `echo "hi"` — builtin with a literal arg array
@@ -595,6 +600,7 @@ mod tests {
                 var_lengths: vec![],
                 var_const: vec![],
                 var_lifetimes: vec![],
+                stmt_line_seq: vec![],
             }
         }
         fn echo_hi() -> IrStmt {
@@ -700,6 +706,7 @@ mod tests {
             var_lengths: vec![],
             var_const: vec![],
             var_lifetimes: vec![],
+            stmt_line_seq: vec![],
         };
         let (_ctx, out, _m) = Pipeline::canonical().run(&prog);
         match &out.stmts[0] {

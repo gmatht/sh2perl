@@ -1525,6 +1525,7 @@ mod tests {
             var_nospace: vec![],
             var_storage: vec![],
             var_bash_env: vec![],
+            stmt_line_seq: vec![],
         }
     }
 

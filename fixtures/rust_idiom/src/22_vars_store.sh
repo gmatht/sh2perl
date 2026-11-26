@@ -33,3 +33,54 @@ echo "aftersub=$n"
 
 echo alpha | while read -r w; do echo "pipe=$w n=$n"; done
 echo "after=$n"
+
+# ── nested refusals name the OFFENDING statement's line ──
+# bash aborts the enclosing compound BODY when an assignment is refused (the
+# failing statement is the last one that runs in that body), while a refused
+# `unset` fails only that command and the body continues — so each shape below
+# carries exactly one refusal and `$?` is observed after the compound, which is
+# where both shells still agree.
+in_fn() {
+  LIMIT=21
+}
+in_fn
+echo "refuse-fn rc=$?"
+if [ -n "${LIMIT}x" ]; then
+  LIMIT=22
+fi
+echo "refuse-if rc=$?"
+for i in a; do
+  LIMIT=23
+done
+echo "refuse-for rc=$?"
+while read -r w; do
+  LIMIT=24
+done <<EOF
+once
+EOF
+echo "refuse-while rc=$?"
+( LIMIT=25 )
+echo "refuse-sub rc=$?"
+
+unset_fn() {
+  unset LIMIT
+}
+unset_fn
+echo "unset-fn rc=$?"
+if [ -n "${LIMIT}x" ]; then
+  unset LIMIT
+fi
+echo "unset-if rc=$?"
+for i in a b; do
+  unset LIMIT
+done
+echo "unset-for rc=$?"
+while read -r w; do
+  unset LIMIT
+done <<EOF
+once
+EOF
+echo "unset-while rc=$?"
+( unset LIMIT )
+echo "unset-sub rc=$?"
+echo "limit=$LIMIT"

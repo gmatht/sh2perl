@@ -262,6 +262,7 @@ mod tests {
         let mut prog = IrProgram { imports: vec![], requires: vec![], stmts: vec![],
             subs: vec![], var_types: vec![], stmt_lines: vec![], var_const: vec![],
             var_lengths: vec![], var_lifetimes: vec![], var_bash_env: vec![], var_nospace: vec![],
+            stmt_line_seq: vec![],
             var_storage: vec![] };
         prog.stmts = vec![IrStmt::ForInit {
             init: vec![IrStmt::Assign {

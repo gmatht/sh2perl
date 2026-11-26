@@ -161,27 +161,56 @@ struct __ShVal   { s: String, int: Option<i64>, words: Option<Vec<Word>>,
   `std::env::args().next()`, which is the same expression `$0` renders to, so
   the compiled program's `$0` and its diagnostic prefix are the same string by
   construction. `N` is `__sh_v_at(N)`, a marker the renderer emits at the head
-  of a top-level statement whose text contains a checked store write, taken
-  from the IR's `stmt_lines` markup; `__sh_v_where()` reads it back when a
+  of a statement whose text contains a checked store write — at ANY depth —
+  taken from per-statement IR markup; `__sh_v_where()` reads it back when a
   refusal fires (0 = unknown, and the message falls back to the bare
   `<prog>:` prefix rather than a wrong line). The marker is anchored at the
   statement's head because emitting a statement can collapse a dead
   `__SH_RC.store` below its start, which would invalidate a splice index
   computed before the emission. The accessor API and the store shape are
   otherwise untouched.
+  The markup itself is `IrProgram::stmt_line_seq` (one line per statement of a
+  pre-order walk, `ir::walk_stmt_preorder`), produced by `ast_to_ir_with_lines`:
+  the parser records a line on each leaf command it builds (`ast::command_line`
+  reads it back through the wrappers), the lowering appends
+  `(statement, line)` as each statement completes, and the pairs are matched to
+  the lowered tree in post-order and then re-keyed onto the survivors of the
+  optimization/transform passes. Carrying the STATEMENT with the line is what
+  keeps the markup honest: a lowering arm may synthesize statements of its own
+  (subshell save/restore, loop init/step) and an index-keyed pairing shifts
+  every line after the first one. `stmt_lines` (top level only) is the fallback
+  for a program without the per-statement markup, and the renderer keys the
+  markup by statement address (re-staging it onto the cloned bodies of hoisted
+  functions, which are rendered out of `fn_defs`).
 - **Coverage of that diagnostic.** `22_vars_store` marks itself
   `# stderr-exact:` and the harness then compares stderr byte for byte (and
   runs the Rust binary with argv[0] = the fixture path, which is the string
   bash's `$0` is) in both the debug and the `-O` build, alongside the
-  `$?`-after-refusal check. The fuzz grammar has the same case (readonly write
-  + `unset`) and the net compares the `(stdout, stderr, rc)` triple for every
-  program, at seed 1 in 13 of 60 programs. **Not matched:** `stmt_lines` marks
-  top-level commands only, so a refusal inside a function body, an
-  `if`/`for`/`while` body or a subshell command list prints the bare
-  `<prog>:` prefix (or an enclosing statement's line, if its marker already
-  ran) where bash prints the nested statement's line. Closing that needs
-  per-command line markup from the parser, which this pass does not touch;
-  what remains is a *location*, not a message or a status.
+  `$?`-after-refusal check. Its second half puts the same refused `LIMIT=…`
+  inside a **function body, an `if` body, a `for` body, a `while` body and a
+  subshell**, and a refused `unset` inside each of those: 14 refusals, each
+  printing the offending statement's own line, with `$?` read right after the
+  compound. The comparison is demonstrably live: emitting `line + 1` instead
+  makes the fixture report `DEBUG-STDERR!=bash` / `RELEASE-STDERR!=bash` (and
+  the fuzz replay the same file diverges), so the bytes are really compared.
+  The fuzz grammar has the same case — the readonly write at top level and
+  again in a function body, an `if`, a `for` and a subshell, plus `unset` in a
+  body — and the net compares the `(stdout, stderr, rc)` triple for every
+  program; at seed 1 it lands in **14 of 60** programs (reported as
+  `readonly_case=14` in the summary) with `diverged=0`.
+  **Not matched:** a compound body with statements AFTER a refused
+  *assignment*. Bash treats a failed assignment as an error that aborts the
+  enclosing compound command, so those statements never run there; the emitted
+  program keeps going in that body. The diagnostic itself is identical — for
+  `readonly R=1` then `f() { R=2; echo "after rc=$?"; }`, `f`, `echo "rc=$?"`
+  bash prints stderr `<prog>: line 3: R: readonly variable` and stdout `rc=1`,
+  while the emitted program prints the same stderr line and `after rc=1` /
+  `rc=0`. The fixture and the grammar therefore place one refusal per body and
+  read `$?` after the compound, which is the state both shells agree on. A
+  refused `unset` is unaffected (bash fails only that command), which is why
+  the `unset` shapes do run their bodies to the end. Closing the gap needs the
+  emitted control flow to leave a compound body on a refused assignment — a
+  code-shape change, not a location one.
 - `ro_trip` is the `$?`-adjacent half: a refused write sets it and the next
   status write consumes it (`__SH_RC.store(if __sh_v_rc_trip() { 1 } else { 0 } …)`),
   so `$?` is 1 for the failed statement and 0 after the next command, like
@@ -195,8 +224,8 @@ struct __ShVal   { s: String, int: Option<i64>, words: Option<Vec<Word>>,
 
 Measured over the fixture set (`fixtures/rust_idiom/expected/*.rs`): per-
 variable `static __SHV_…` **6 → 0**, store call sites naming a key
-**21 → 48**, programs carrying the store **7 of 22** (one `__SH_VARS` each),
-emitted lines **2965** over all 22 fixtures (`22_vars_store`: 425 lines, 26
+**21 → 69**, programs carrying the store **7 of 22** (one `__SH_VARS` each),
+emitted lines **3076** over all 22 fixtures (`22_vars_store`: 538 lines, 47
 store call sites). The cost is helper lines: ~210 per program that uses it
 (the `$0`/line plumbing for the refusal diagnostic is inside that budget), so
 emitted lines went **1371 → 2364** over the 21 pre-existing fixtures. The per-variable static it
@@ -363,8 +392,9 @@ with the reason per name.
   a word, and the one redirection-stage fallback), **shell output
   interleaved with a child's inherited fd 1**, which is the shape that keeps
   the flush discipline honest, and a **refused readonly write** (`readonly
-  R="$b"`, then `R="$b-x"` and `unset R`, compared including stderr, with
-  argv[0] aligned to bash's `$0`). Clippy is a
+  R="$b"`, then `R="$b-x"` at top level and again inside a function body, an
+  `if` body, a `for` body and a subshell, plus `unset R` in a body, compared
+  including stderr, with argv[0] aligned to bash's `$0`). Clippy is a
   required check, not an optional extra: if the component is missing the gate
   prints `HARD GAP: clippy did not run` and exits non-zero. It already pays
   for itself — `clippy::print_with_newline`, `clippy::format_in_format_args`

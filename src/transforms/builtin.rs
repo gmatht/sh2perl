@@ -575,6 +575,7 @@ mod tests {
             var_lengths: vec![],
             var_const: vec![],
             var_lifetimes: vec![],
+            stmt_line_seq: vec![],
         };
         fallback_builtin_to_exec(&mut prog);
         match &prog.stmts[0] {
@@ -600,6 +601,7 @@ mod tests {
             var_lengths: vec![],
             var_const: vec![],
             var_lifetimes: vec![],
+            stmt_line_seq: vec![],
         };
         fallback_builtin_to_exec(&mut prog);
         match &prog.stmts[0] {

@@ -3297,6 +3297,8 @@ pub fn parse_variable_expansion(lexer: &mut Lexer) -> Result<Word, ParserError> 
                             env_vars: BTreeMap::new(),
                             stdout_used: true,
                             stderr_used: true,
+                        
+                            line: 0,
                         });
                         Ok(Word::CommandSubstitution(Box::new(placeholder_cmd), None))
                     } else if commands.len() == 1 {
@@ -3324,6 +3326,8 @@ pub fn parse_variable_expansion(lexer: &mut Lexer) -> Result<Word, ParserError> 
                         env_vars: BTreeMap::new(),
                         stdout_used: true,
                         stderr_used: true,
+                    
+                        line: 0,
                     });
                     Ok(Word::CommandSubstitution(Box::new(placeholder_cmd), None))
                 }
@@ -3534,6 +3538,8 @@ fn scan_interpolation_parts(content: &str) -> Result<Vec<StringPart>, ParserErro
                                 env_vars: BTreeMap::new(),
                                 stdout_used: true,
                                 stderr_used: true,
+                            
+                                line: 0,
                             });
                             parts.push(StringPart::CommandSubstitution(Box::new(placeholder_cmd)));
                         } else {
@@ -5377,6 +5383,8 @@ fn parse_backtick_command_substitution(lexer: &mut Lexer) -> Result<Word, Parser
                         env_vars: BTreeMap::new(),
                         stdout_used: true,
                         stderr_used: true,
+                    
+                        line: 0,
                     });
                     Ok(Word::CommandSubstitution(Box::new(placeholder_cmd), None))
                 } else {
@@ -5594,6 +5602,8 @@ fn parse_simple_command_from_text(text: &str) -> Result<Command, ParserError> {
         env_vars: BTreeMap::new(),
         stdout_used: true,
         stderr_used: true,
+    
+        line: 0,
     });
 
     Ok(cmd)

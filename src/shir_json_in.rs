@@ -113,6 +113,13 @@ fn program_from_value(v: &Value) -> Result<IrProgram, String> {
             .collect(),
         _ => vec![],
     };
+    let stmt_line_seq = match obj.get("stmt_line_seq") {
+        Some(Value::Array(arr)) => arr
+            .iter()
+            .map(|v| v.as_u64().unwrap_or(0) as usize)
+            .collect(),
+        _ => vec![],
+    };
     let var_lengths = match obj.get("var_lengths") {
         Some(Value::Array(arr)) => arr
             .iter()
@@ -151,12 +158,14 @@ fn program_from_value(v: &Value) -> Result<IrProgram, String> {
         subs,
         var_types,
         stmt_lines,
+        stmt_line_seq,
         var_lengths,
         var_const,
         var_lifetimes,
         var_nospace,
         var_bash_env,
         var_storage: Vec::new(),
+        
     })
 }
 
@@ -1460,6 +1469,7 @@ mod tests {
             var_nospace: vec![],
             var_storage: vec![],
             var_bash_env: vec![],
+            stmt_line_seq: vec![],
         };
         let json = crate::shir_json::shir_to_shir_json_raw(&prog);
         assert!(json.contains("\"kind\":\"Float\""), "json: {json}");
@@ -1506,6 +1516,7 @@ mod tests {
                 var_nospace: vec![],
                 var_storage: vec![],
                 var_bash_env: vec![],
+                stmt_line_seq: vec![],
             };
             let json = crate::shir_json::shir_to_shir_json_raw(&prog);
             assert!(
@@ -1584,6 +1595,7 @@ mod tests {
             var_nospace: vec![],
             var_storage: vec![],
             var_bash_env: vec![],
+            stmt_line_seq: vec![],
         };
         let json = crate::shir_json::shir_to_shir_json_raw(&prog);
         assert!(json.contains("\"type\":\"ForInit\""), "json: {json}");
@@ -1728,6 +1740,7 @@ mod tests {
             var_nospace: vec![],
             var_storage: vec![],
             var_bash_env: vec![],
+            stmt_line_seq: vec![],
         };
         let json = shir_to_shir_json(&prog);
         // valid
@@ -1815,6 +1828,7 @@ mod tests {
                 var_nospace: vec![],
                 var_storage: vec![],
                 var_bash_env: vec![],
+                stmt_line_seq: vec![],
             }
         }
         let json = crate::shir_json::shir_to_shir_json_raw(&mk());
@@ -1998,6 +2012,7 @@ mod tests {
             var_nospace: vec![],
             var_storage: vec![],
             var_bash_env: vec![],
+            stmt_line_seq: vec![],
         };
         let json = crate::shir_json::shir_to_shir_json_raw(&prog);
         assert!(json.contains("\"type\":\"Asm\""), "json: {json}");
@@ -2062,6 +2077,7 @@ mod tests {
             var_nospace: vec![],
             var_storage: vec![],
             var_bash_env: vec![],
+            stmt_line_seq: vec![],
         };
         let json = crate::shir_json::shir_to_shir_json_raw(&prog);
         assert!(json.contains("\"asm\":{\"clobbers\":[],\"inputs\":[],\"outputs\":[],\"template\":\"myx\""), "json: {json}");

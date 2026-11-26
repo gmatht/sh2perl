@@ -21,6 +21,29 @@ impl SourceSpan {
     }
 }
 
+/// The 1-based source line of the command that can carry a refusal
+/// diagnostic — the leaf command (`NAME=value`, or a simple/builtin command
+/// such as `readonly`/`unset`), reached through the wrappers the parser builds
+/// around it (`( … )`, `{ … }`, `cmd &`, `! cmd`, `a && b`, a pipeline, a
+/// redirect). `None` when the parser had no line for it (synthesized commands)
+/// — the caller then prints no location rather than a wrong one.
+pub fn command_line(cmd: &Command) -> Option<usize> {
+    let line = match cmd {
+        Command::Simple(c) => Some(c.line),
+        Command::BuiltinCommand(c) => Some(c.line),
+        Command::Assignment(a) => Some(a.line),
+        Command::Redirect(r) => return command_line(&r.command),
+        Command::Background(c) | Command::Not(c) | Command::Subshell(c) => {
+            return command_line(c)
+        }
+        Command::Block(b) => return b.commands.iter().find_map(command_line),
+        Command::And(l, r) | Command::Or(l, r) => return command_line(l).or_else(|| command_line(r)),
+        Command::Pipeline(p) => return p.commands.iter().find_map(command_line),
+        _ => None,
+    };
+    line.filter(|l| *l > 0)
+}
+
 #[derive(Debug, Clone, PartialEq, serde::Serialize)]
 pub enum Command {
     Simple(SimpleCommand),
@@ -48,7 +71,7 @@ pub enum Command {
     BlankLine,
 }
 
-#[derive(Debug, Clone, PartialEq, serde::Serialize)]
+#[derive(Debug, Clone, serde::Serialize)]
 pub struct SimpleCommand {
     pub name: Word,
     pub args: Vec<Word>,
@@ -56,9 +79,27 @@ pub struct SimpleCommand {
     pub env_vars: BTreeMap<String, Word>,
     pub stdout_used: bool, // true if stdout is not redirected to /dev/null
     pub stderr_used: bool, // true if stderr is not redirected to /dev/null
+    /// 1-based source line the command starts on (0 = unknown). Markup for
+    /// diagnostics that name a location (`readonly` refusals print bash's
+    /// `line N`), NOT part of the command's identity: `PartialEq` ignores it
+    /// and the A1 JSON does not carry it, so no consumer of the AST sees a
+    /// different tree than before.
+    #[serde(skip)]
+    pub line: usize,
 }
 
-#[derive(Debug, Clone, PartialEq, serde::Serialize)]
+impl PartialEq for SimpleCommand {
+    fn eq(&self, o: &Self) -> bool {
+        self.name == o.name
+            && self.args == o.args
+            && self.redirects == o.redirects
+            && self.env_vars == o.env_vars
+            && self.stdout_used == o.stdout_used
+            && self.stderr_used == o.stderr_used
+    }
+}
+
+#[derive(Debug, Clone, serde::Serialize)]
 pub struct BuiltinCommand {
     pub name: String,
     pub args: Vec<Word>,
@@ -66,6 +107,20 @@ pub struct BuiltinCommand {
     pub env_vars: BTreeMap<String, Word>,
     pub stdout_used: bool, // true if stdout is not redirected to /dev/null
     pub stderr_used: bool, // true if stderr is not redirected to /dev/null
+    /// 1-based source line (0 = unknown); see `SimpleCommand::line`.
+    #[serde(skip)]
+    pub line: usize,
+}
+
+impl PartialEq for BuiltinCommand {
+    fn eq(&self, o: &Self) -> bool {
+        self.name == o.name
+            && self.args == o.args
+            && self.redirects == o.redirects
+            && self.env_vars == o.env_vars
+            && self.stdout_used == o.stdout_used
+            && self.stderr_used == o.stderr_used
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, serde::Serialize)]
@@ -140,11 +195,20 @@ pub struct RedirectCommand {
     pub redirects: Vec<Redirect>,
 }
 
-#[derive(Debug, Clone, PartialEq, serde::Serialize)]
+#[derive(Debug, Clone, serde::Serialize)]
 pub struct Assignment {
     pub variable: String,
     pub value: Word,
     pub operator: AssignmentOperator,
+    /// 1-based source line (0 = unknown); see `SimpleCommand::line`.
+    #[serde(skip)]
+    pub line: usize,
+}
+
+impl PartialEq for Assignment {
+    fn eq(&self, o: &Self) -> bool {
+        self.variable == o.variable && self.value == o.value && self.operator == o.operator
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, serde::Serialize)]

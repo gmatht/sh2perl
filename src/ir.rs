@@ -588,6 +588,81 @@ pub struct AsmSpec {
     pub clobbers: Vec<String>,
 }
 
+/// The statement-bearing child vectors of `s`, in the canonical order the IR
+/// nesting is BUILT (the lowering fills the fields in this order) and
+/// RENDERED. One place defines "which statement comes where" so the pre-order
+/// walk that pairs [`IrProgram::stmt_line_seq`] with statements agrees with
+/// the backend that consumes it.
+pub fn stmt_child_vecs<'a>(s: &'a IrStmt) -> Vec<&'a Vec<IrStmt>> {
+    match s {
+        IrStmt::If {
+            then, elsifs, else_, ..
+        } => {
+            let mut v: Vec<&Vec<IrStmt>> = vec![then];
+            v.extend(elsifs.iter().map(|(_, body)| body));
+            v.push(else_);
+            v
+        }
+        IrStmt::Try {
+            body,
+            excepts,
+            else_body,
+            finally_body,
+        } => {
+            let mut v: Vec<&Vec<IrStmt>> = vec![body];
+            v.extend(excepts.iter().map(|e| &e.body));
+            v.push(else_body);
+            v.push(finally_body);
+            v
+        }
+        IrStmt::For { body, .. } => vec![body],
+        IrStmt::ForInit {
+            init, step, body, ..
+        } => vec![init, step, body],
+        IrStmt::While { body, .. } => vec![body],
+        IrStmt::DoWhile { body, .. } => vec![body],
+        IrStmt::Pipeline { stages, .. } => stages.iter().collect(),
+        IrStmt::Redirect { inner, .. } => vec![inner],
+        IrStmt::Function {
+            body,
+            named_blocks,
+            ..
+        } => {
+            let mut v: Vec<&Vec<IrStmt>> = vec![body];
+            v.extend(named_blocks.iter().map(|(_, b)| b));
+            v
+        }
+        IrStmt::Subshell(v) | IrStmt::Background(v) | IrStmt::Block(v) => vec![v],
+        IrStmt::Select { clauses } => clauses.iter().map(|c| &c.body).collect(),
+        IrStmt::Shaderize { body, .. } => vec![body],
+        _ => vec![],
+    }
+}
+
+/// Pre-order walk over a statement list and every statement nested in it,
+/// using [`stmt_child_vecs`] for the nesting. The visit order is the order
+/// [`IrProgram::stmt_line_seq`] is indexed by.
+/// Post-order walk (children before the statement that contains them), the
+/// order the lowering RECORDS statements in — see
+/// `shir::ast_to_ir_with_lines`.
+pub fn walk_stmt_postorder<'a>(stmts: &'a [IrStmt], f: &mut dyn FnMut(&'a IrStmt)) {
+    for s in stmts {
+        for cv in stmt_child_vecs(s) {
+            walk_stmt_postorder(cv, f);
+        }
+        f(s);
+    }
+}
+
+pub fn walk_stmt_preorder<'a>(stmts: &'a [IrStmt], f: &mut dyn FnMut(&'a IrStmt)) {
+    for s in stmts {
+        f(s);
+        for cv in stmt_child_vecs(s) {
+            walk_stmt_preorder(cv, f);
+        }
+    }
+}
+
 #[derive(Debug, Clone, PartialEq)]
 pub enum IrStmt {
     /// A transform-declared node (shir_nodes): the extensible slot of the
@@ -859,6 +934,16 @@ pub struct IrProgram {
     /// `--output-lineno` option); the shell path leaves it empty. The
     /// Perl renderer appends ` # line N` comments when present.
     pub stmt_lines: Vec<(usize, usize)>,
+    /// Source line per statement, NESTED ones included: entry `i` is the line
+    /// of the statement at position `i` of a PRE-ORDER walk of `stmts` (see
+    /// [`walk_stmt_preorder`]); 0 = unknown. Filled by the shell frontend's
+    /// `ast_to_ir_with_lines` (the shell path records a line per leaf command
+    /// as the parser builds it). This is what lets a backend name the source
+    /// location of a statement inside a function/loop/subshell body — e.g.
+    /// bash's `<prog>: line N:` prefix on a `readonly` refusal — which the
+    /// top-level-only `stmt_lines` cannot. Additive: backends that do not
+    /// read it are unaffected, and an empty vector means "no markup".
+    pub stmt_line_seq: Vec<usize>,
     /// Conservative max-string-length annotations (a transform sibling of
     /// the A2 verdicts): per variable, the provable upper bound on the
     /// string's byte length (None = unbounded — captures, loops, runtime
@@ -11553,6 +11638,7 @@ impl IrProgram {
             var_nospace: vec![],
             var_storage: vec![],
             var_bash_env: vec![],
+            stmt_line_seq: vec![],
         }
     }
 }
@@ -11803,6 +11889,7 @@ mod tests {
             var_nospace: vec![],
             var_storage: vec![],
             var_bash_env: vec![],
+            stmt_line_seq: vec![],
         };
         let perl = shir_to_perl(&prog);
         assert!(perl.contains("use Carp;"), "{perl}");

@@ -197,6 +197,7 @@ mod tests {
             var_lifetimes: vec![],
             var_nospace: vec![],
             var_bash_env: vec![],
+            stmt_line_seq: vec![],
         };
         let json = crate::shir_json::shir_to_shir_json(&prog);
         let back = crate::shir_json_in::shir_json_to_ir(&json).expect("re-import");
@@ -249,6 +250,7 @@ mod tests {
             var_lifetimes: vec![],
             var_nospace: vec![],
             var_bash_env: vec![],
+            stmt_line_seq: vec![],
         };
         let perl = crate::ir::shir_to_perl(&prog);
         assert!(

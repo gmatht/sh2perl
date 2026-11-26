@@ -933,6 +933,7 @@ mod tests {
             var_lengths: vec![],
             var_const: vec![],
             var_lifetimes: vec![],
+            stmt_line_seq: vec![],
         }
     }
 

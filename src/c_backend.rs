@@ -38819,6 +38819,7 @@ mod tests {
             var_nospace: vec![],
             var_storage: vec![],
             var_bash_env: vec![],
+            stmt_line_seq: vec![],
         };
         let out = shir_to_c(&prog);
         for pat in [
@@ -38860,6 +38861,7 @@ mod tests {
             var_nospace: vec![],
             var_storage: vec![],
             var_bash_env: vec![],
+            stmt_line_seq: vec![],
         };
         let out = shir_to_c(&prog);
         for name in ["tfn_a", "tfn_b"] {
@@ -38901,6 +38903,7 @@ mod tests {
             var_nospace: vec![],
             var_storage: vec![],
             var_bash_env: vec![],
+            stmt_line_seq: vec![],
         }
     }
 
@@ -39086,6 +39089,7 @@ mod tests {
             var_nospace: vec![],
             var_storage: vec![],
             var_bash_env: vec![],
+            stmt_line_seq: vec![],
         };
         let out = shir_to_c(&prog);
         // tfn_a is defined FIRST here, so even the mention needs no
@@ -39204,6 +39208,7 @@ mod tests {
             var_nospace: vec![],
             var_storage: vec![],
             var_bash_env: vec![],
+            stmt_line_seq: vec![],
         }
     }
 
@@ -39900,6 +39905,7 @@ mod tests {
             var_nospace: vec![],
             var_storage: vec![],
             var_bash_env: vec![],
+            stmt_line_seq: vec![],
         };
         let out = shir_to_c(&prog);
         assert!(
@@ -39971,6 +39977,7 @@ mod tests {
             var_nospace: vec![],
             var_storage: vec![],
             var_bash_env: vec![],
+            stmt_line_seq: vec![],
         };
         let out = shir_to_c(&prog);
         assert!(
@@ -40052,6 +40059,7 @@ mod tests {
             var_nospace: vec![],
             var_storage: vec![],
             var_bash_env: vec![],
+            stmt_line_seq: vec![],
         };
         let out = shir_to_c(&prog);
         assert!(
@@ -40132,6 +40140,7 @@ mod tests {
             var_nospace: vec![],
             var_storage: vec![],
             var_bash_env: vec![],
+            stmt_line_seq: vec![],
         };
         let out = shir_to_c(&prog);
         assert!(out.contains("mpz_add"), "X+1 must stay an add:\n{out}");
@@ -40179,6 +40188,7 @@ mod tests {
             var_nospace: vec![],
             var_storage: vec![],
             var_bash_env: vec![],
+            stmt_line_seq: vec![],
         };
         let out = shir_to_c(&prog);
         assert!(
@@ -40231,6 +40241,7 @@ mod tests {
             var_nospace: vec![],
             var_storage: vec![],
             var_bash_env: vec![],
+            stmt_line_seq: vec![],
         };
         let out = shir_to_c(&prog);
         assert!(out.contains("_sh_mpz_str"), "helper trimmed while referenced:\n{out}");
@@ -40292,6 +40303,7 @@ mod tests {
                 var_nospace: vec![],
                 var_storage: vec![],
                 var_bash_env: vec![],
+                stmt_line_seq: vec![],
             };
             let out = shir_to_c(&prog);
             let helper = if want_mpz {
@@ -40357,6 +40369,7 @@ mod tests {
             var_nospace: vec![],
             var_storage: vec![],
             var_bash_env: vec![],
+            stmt_line_seq: vec![],
         };
         let out = shir_to_c(&prog);
         assert!(out.contains("uint8_t a["), "int array not narrowed uint8_t[]:\n{out}");
@@ -40423,6 +40436,7 @@ mod tests {
             var_nospace: vec![],
             var_storage: vec![],
             var_bash_env: vec![],
+            stmt_line_seq: vec![],
         };
         let out = shir_to_c(&prog);
         assert!(out.contains("char *a["), "bigint array not char*[]:\n{out}");
@@ -40475,6 +40489,7 @@ mod tests {
             var_nospace: vec![],
             var_storage: vec![],
             var_bash_env: vec![],
+            stmt_line_seq: vec![],
         };
         let out = shir_to_c(&prog);
         assert!(out.contains("fnmatch("), "caseMatch not native:\n{out}");
@@ -40533,6 +40548,7 @@ mod tests {
             var_nospace: vec![],
             var_storage: vec![],
             var_bash_env: vec![],
+            stmt_line_seq: vec![],
         };
         let out = shir_to_c(&prog);
         assert!(out.contains("x[x_len++]"), "ArrayComp no append:\n{out}");
@@ -40572,6 +40588,7 @@ mod tests {
             var_nospace: vec![],
             var_storage: vec![],
             var_bash_env: vec![],
+            stmt_line_seq: vec![],
         };
         let out = shir_to_c(&prog);
         assert!(
@@ -40644,6 +40661,7 @@ mod tests {
             var_nospace: vec![],
             var_storage: vec![],
             var_bash_env: vec![],
+            stmt_line_seq: vec![],
         };
         let out = shir_to_c(&prog);
         assert!(out.contains("long long n"), "n not homed numeric:\n{out}");
@@ -40722,6 +40740,7 @@ mod tests {
             var_nospace: vec![],
             var_storage: vec![],
             var_bash_env: vec![],
+            stmt_line_seq: vec![],
         };
         fold_hoist_pairs(&mut prog);
         assert_eq!(prog.stmts.len(), 3, "pair folded despite extra read");
@@ -40793,6 +40812,7 @@ mod tests {
             var_nospace: vec![],
             var_storage: vec![],
             var_bash_env: vec![],
+            stmt_line_seq: vec![],
         }
     }
 
@@ -40965,6 +40985,7 @@ mod tests {
             var_nospace: vec![],
             var_storage: vec![],
             var_bash_env: vec![],
+            stmt_line_seq: vec![],
         }
     }
 
@@ -41088,6 +41109,7 @@ mod tests {
             var_nospace: vec![],
             var_storage: vec![],
             var_bash_env: vec![],
+            stmt_line_seq: vec![],
         };
         let out = shir_to_c(&prog);
         assert!(
@@ -41172,6 +41194,7 @@ mod tests {
             var_nospace: vec![],
             var_storage: vec![],
             var_bash_env: vec![],
+            stmt_line_seq: vec![],
         };
         let native = analyze_native_num_fns(&prog);
         assert!(native.contains("add"), "add not native-numeric: {native:?}");
@@ -41233,6 +41256,7 @@ mod tests {
             var_nospace: vec![],
             var_storage: vec![],
             var_bash_env: vec![],
+            stmt_line_seq: vec![],
         };
         let big = analyze_bigint_param_fns(&prog);
         assert!(big.contains("f"), "f not bigint-param: {big:?}");
@@ -41296,6 +41320,7 @@ mod tests {
             var_nospace: vec![],
             var_storage: vec![],
             var_bash_env: vec![],
+            stmt_line_seq: vec![],
         };
         let arr = analyze_array_return_fns(&prog);
         assert_eq!(arr.get("f").map(|s| s.as_str()), Some("f"), "f not array-return: {arr:?}");
@@ -41351,6 +41376,7 @@ mod tests {
             var_nospace: vec![],
             var_storage: vec![],
             var_bash_env: vec![],
+            stmt_line_seq: vec![],
         };
         // the array must exist as a plain array for the trigger
         // (registered via setArray assigns, like the frontend emits)
@@ -41511,6 +41537,7 @@ mod tests {
             var_nospace: vec![],
             var_storage: vec![],
             var_bash_env: vec![],
+            stmt_line_seq: vec![],
         };
         let out = shir_to_c(&prog);
         assert!(out.contains("uint32_t _hv"), "bound temp not narrowed:\n{out}");
@@ -41593,6 +41620,7 @@ mod tests {
                 var_nospace: vec![],
                 var_storage: vec![],
                 var_bash_env: vec![],
+                stmt_line_seq: vec![],
             }
         }
         // positive: isqrt bound + init/step only → uint32_t i.
@@ -41668,6 +41696,7 @@ mod tests {
             var_nospace: vec![],
             var_storage: vec![],
             var_bash_env: vec![],
+            stmt_line_seq: vec![],
         };
         let out = shir_to_c(&prog);
         assert!(out.contains("uint16_t xs["), "len() forced string storage:\n{out}");
@@ -41731,6 +41760,7 @@ mod tests {
                 var_nospace: vec![],
                 var_storage: vec![],
                 var_bash_env: vec![],
+                stmt_line_seq: vec![],
             }
         }
         let out = shir_to_c(&prog_of(vec![
@@ -41826,6 +41856,7 @@ mod tests {
             var_nospace: vec![],
             var_storage: vec![],
             var_bash_env: vec![],
+            stmt_line_seq: vec![],
         };
         let out = shir_to_c(&prog);
         assert!(
@@ -41879,6 +41910,7 @@ mod tests {
             var_nospace: vec![],
             var_storage: vec![],
             var_bash_env: vec![],
+            stmt_line_seq: vec![],
         };
         let out = shir_to_c(&prog);
         // indexed store in either form: the legacy `_sh_arr_set` string
@@ -41933,6 +41965,7 @@ mod tests {
             var_nospace: vec![],
             var_storage: vec![],
             var_bash_env: vec![],
+            stmt_line_seq: vec![],
         };
         let out = shir_to_c(&prog);
         assert!(
@@ -41978,6 +42011,7 @@ mod tests {
             var_nospace: vec![],
             var_storage: vec![],
             var_bash_env: vec![],
+            stmt_line_seq: vec![],
         }
     }
 
@@ -42211,6 +42245,7 @@ mod tests {
             var_nospace: vec![],
             var_storage: vec![],
             var_bash_env: vec![],
+            stmt_line_seq: vec![],
         }
     }
 
@@ -42856,6 +42891,7 @@ mod tests {
             var_nospace: vec![],
             var_storage: vec![],
             var_bash_env: vec![],
+            stmt_line_seq: vec![],
         }
     }
 
@@ -43176,6 +43212,7 @@ mod tests {
                 var_nospace: vec![],
                 var_storage: vec![],
                 var_bash_env: vec![],
+                stmt_line_seq: vec![],
             }
         }
         // _t assigned+read only at top level → main local. (Two
@@ -43244,6 +43281,7 @@ mod tests {
                 var_nospace: vec![],
                 var_storage: vec![],
                 var_bash_env: vec![],
+                stmt_line_seq: vec![],
             }
         }
         let out = shir_to_c(&prog_of(test_call("-f somefile")));
@@ -43365,6 +43403,7 @@ mod tests {
                 var_nospace: vec![],
                 var_storage: vec![],
                 var_bash_env: vec![],
+                stmt_line_seq: vec![],
             }
         }
         let out = shir_to_c(&prog_of(
@@ -43671,6 +43710,7 @@ mod tests {
             var_nospace: vec![],
             var_storage: vec![],
             var_bash_env: vec![],
+            stmt_line_seq: vec![],
         };
         let vt = HashMap::new();
         let big = BTreeSet::new();
@@ -43741,6 +43781,7 @@ mod tests {
                 var_nospace: vec![],
                 var_storage: vec![],
                 var_bash_env: vec![],
+                stmt_line_seq: vec![],
             }
         }
         // three STRING literals, no appends → exact small decl (not
@@ -43847,6 +43888,7 @@ mod tests {
                 var_nospace: vec![],
                 var_storage: vec![],
                 var_bash_env: vec![],
+                stmt_line_seq: vec![],
             }
         }
         fn echo_expr(e: IrExpr) -> IrStmt {
@@ -44007,6 +44049,7 @@ mod tests {
             var_nospace: vec![],
             var_storage: vec![],
             var_bash_env: vec![],
+            stmt_line_seq: vec![],
         };
         let out = shir_to_c(&prog);
         assert!(out.contains("capacity exceeded: big"), "no cap refusal:\n{out}");
@@ -44136,6 +44179,7 @@ mod tests {
                 var_nospace: vec![],
                 var_storage: vec![],
                 var_bash_env: vec![],
+                stmt_line_seq: vec![],
             }
         }
         // proven literal assign → guard dropped.
@@ -44408,6 +44452,7 @@ mod tests {
                 var_nospace: vec![],
                 var_storage: vec![],
                 var_bash_env: vec![],
+                stmt_line_seq: vec![],
             };
             let out = shir_to_c(&prog);
             assert!(

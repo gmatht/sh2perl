@@ -2170,6 +2170,7 @@ mod tests {
             var_lengths: vec![],
             var_const: vec![],
             var_lifetimes: vec![],
+            stmt_line_seq: vec![],
         };
         assert!(fold_arith_literals(&mut prog));
         let IrStmt::Assign { expr, .. } = &prog.stmts[0] else {
@@ -2206,6 +2207,7 @@ mod tests {
             var_lengths: vec![],
             var_const: vec![],
             var_lifetimes: vec![],
+            stmt_line_seq: vec![],
         };
         assert!(!fold_arith_literals(&mut prog));
         let IrStmt::Assign { expr, .. } = &prog.stmts[0] else {
@@ -2246,6 +2248,7 @@ mod tests {
             var_lengths: vec![],
             var_const: vec![],
             var_lifetimes: vec![],
+            stmt_line_seq: vec![],
         };
         assert!(fold_arith_literals(&mut prog));
         let IrStmt::Assign { expr, .. } = &prog.stmts[0] else {
@@ -2277,6 +2280,7 @@ mod tests {
             var_lengths: vec![],
             var_const: vec![("x".to_string(), VarKind::Const)],
             var_lifetimes: vec![],
+            stmt_line_seq: vec![],
         }
     }
 

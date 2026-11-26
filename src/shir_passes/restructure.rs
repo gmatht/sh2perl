@@ -721,6 +721,7 @@ mod tests {
             var_lifetimes: vec![],
             var_nospace: vec![],
             var_bash_env: vec![],
+            stmt_line_seq: vec![],
         }
     }
 

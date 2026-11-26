@@ -496,6 +496,7 @@ mod tests {
             var_lengths: vec![],
             var_const: vec![],
             var_lifetimes: vec![],
+            stmt_line_seq: vec![],
         }
     }
 
@@ -560,6 +561,7 @@ mod tests {
             var_lengths: vec![],
             var_const: vec![],
             var_lifetimes: vec![],
+            stmt_line_seq: vec![],
         };
         ConstMarkup.run(&mut prog, &ctx);
         // sorted by name: x before z

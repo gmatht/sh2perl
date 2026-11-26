@@ -262,12 +262,26 @@ fn generate(rng: &mut Rng) -> String {
             // a REFUSED write to a `readonly` name, and `unset` of it: the
             // store prints bash's `<prog>: line N: …` diagnostic, so stderr is
             // part of the comparison for this case (the Rust run gets the
-            // script path as argv[0], which is bash's `$0`).
+            // script path as argv[0], which is bash's `$0`). The refusals are
+            // repeated NESTED — a function body, an `if` and a `for` body, a
+            // subshell — because the line bash names is the OFFENDING
+            // statement's, not the enclosing compound's, and because the status
+            // it leaves in `$?` is the one the refused statement set (bash
+            // aborts a body on a refused assignment, so each body below holds
+            // exactly one, and `$?` is read after the compound where both
+            // shells still agree; a refused `unset` only fails its command).
             36 => {
                 if !s.contains("readonly R=") {
                     s.push_str("readonly R=\"$b\"\n");
                 }
                 s.push_str("R=\"$b-x\"\necho \"r=$R rc=$?\"\n");
+                s.push_str("rn() {\n  R=\"$b-y\"\n}\nrn\necho \"rn=$R rc=$?\"\n");
+                s.push_str("if [ -n \"${b}x\" ]; then\n  R=\"$b-z\"\nfi\necho \"ri=$R rc=$?\"\n");
+                s.push_str("for w in \"$b\"; do\n  R=\"$b-w\"\ndone\necho \"rf=$R rc=$?\"\n");
+                s.push_str("( R=\"$b-s\" )\necho \"rs=$R rc=$?\"\n");
+                if rng.chance(2) {
+                    s.push_str("if [ -n \"${b}x\" ]; then\n  unset R\nfi\necho \"rui=$R rc=$?\"\n");
+                }
                 s.push_str("unset R\necho \"ru=$R rc=$?\"\n");
             }
             // an arithmetic word inside a printed expansion
@@ -483,9 +497,15 @@ fn main() {
 
     let mut rng = Rng(seed);
     let (mut matched, mut diverged, mut render_fail, mut rustc_fail) = (0u64, 0u64, 0u64, 0u64);
+    // how many generated programs carry the readonly/unset case (its refused
+    // writes are the only ones whose `<prog>: line N:` stderr is compared)
+    let mut readonly_case = 0u64;
 
     for case in 0..cases {
         let src = generate(&mut rng);
+        if src.contains("readonly R=") {
+            readonly_case += 1;
+        }
         let dir = scratch.join(format!("case{case:04}"));
         let outcome = check_one(&src, &dir, &profiles);
         match outcome {
@@ -508,7 +528,8 @@ fn main() {
 
     println!(
         "rust_fuzz: seed={seed} profile={profile_label} programs={cases} matched={matched} \
-         diverged={diverged} render_fail={render_fail} rustc_fail={rustc_fail}"
+         diverged={diverged} render_fail={render_fail} rustc_fail={rustc_fail} \
+         readonly_case={readonly_case}"
     );
     if diverged + render_fail + rustc_fail > 0 {
         std::process::exit(1);

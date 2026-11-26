@@ -377,6 +377,7 @@ fn main() {
     __sh_print_words(&[vec![format!("afterfn={}", __sh_v_s("n")).into()]], true);
     __sh_v_at(31);
     let __sh_sv0 = __sh_v_save("n");
+    __sh_v_at(31);
     __sh_v_set_s("n", "11".to_string());
     __sh_print_words(&[vec![format!("sub={}", __sh_v_s("n")).into()]], true);
     __sh_v_restore_one("n", __sh_sv0);
@@ -417,11 +418,121 @@ __any
     __SH_PIPESTATUS.lock().unwrap_or_else(|e| e.into_inner()).push(__SH_RC.load(Ordering::SeqCst));
 }
     __sh_print_words(&[vec![format!("after={}", __sh_v_s("n")).into()]], true);
+    in_fn();
+    __sh_print_words(&[vec![format!("refuse-fn rc={}", __SH_RC.load(Ordering::SeqCst)).into()]], true);
+    __sh_v_at(48);
+    if !format!("{}x", __sh_v_s("LIMIT")).is_empty() {
+    __sh_v_at(49);
+        __sh_v_set_s("LIMIT", "22".to_string());
+        __SH_RC.store(if __sh_v_rc_trip() { 1 } else { 0 }, Ordering::SeqCst);
+    } else {
+        __SH_RC.store(if __sh_v_rc_trip() { 1 } else { 0 }, Ordering::SeqCst);
+    }
+    __sh_print_words(&[vec![format!("refuse-if rc={}", __SH_RC.load(Ordering::SeqCst)).into()]], true);
+    __sh_v_at(52);
+    for __sh_w5 in std::iter::once("a") {
+        __sh_v_set_s("i", __sh_w5.to_string());
+    __sh_v_at(53);
+        __sh_v_set_s("LIMIT", "23".to_string());
+        __SH_RC.store(if __sh_v_rc_trip() { 1 } else { 0 }, Ordering::SeqCst);
+    }
+    __sh_print_words(&[vec![format!("refuse-for rc={}", __SH_RC.load(Ordering::SeqCst)).into()]], true);
+    __sh_v_at(56);
+    {
+        let __oldin = __SH_STDIN.lock().unwrap_or_else(|e| e.into_inner()).take();
+        *__SH_STDIN.lock().unwrap_or_else(|e| e.into_inner()) = Some(Box::new(std::io::Cursor::new("once\n".to_string().into_bytes())));
+        let mut __sh_while_ran6 = false;
+        let mut __sh_while_last7 = 0;
+        while {
+let (__ln, __any) = __sh_readline();
+let __f = __sh_read_fields(&__ln, " \t\n", 1);
+__sh_v_set_s("w", __f.first().cloned().unwrap_or_default().to_string());
+__SH_RC.store(if __any { 0 } else { 1 }, Ordering::SeqCst);
+__any
+} {
+            __sh_while_ran6 = true;
+    __sh_v_at(57);
+            __sh_v_set_s("LIMIT", "24".to_string());
+            __SH_RC.store(if __sh_v_rc_trip() { 1 } else { 0 }, Ordering::SeqCst);
+            __sh_while_last7 = __SH_RC.load(Ordering::SeqCst);
+        }
+        if !__sh_while_ran6 { __SH_RC.store(0, Ordering::SeqCst); } else { __SH_RC.store(__sh_while_last7, Ordering::SeqCst); }
+        *__SH_STDIN.lock().unwrap_or_else(|e| e.into_inner()) = __oldin;
+    }
+    __sh_print_words(&[vec![format!("refuse-while rc={}", __SH_RC.load(Ordering::SeqCst)).into()]], true);
+    __sh_v_at(62);
+    let __sh_sv8 = __sh_v_save("LIMIT");
+    let _ = { let __v = "25".to_string(); __sh_v_set_s("LIMIT", "25".to_string()); __v };
+    __SH_RC.store(if __sh_v_rc_trip() { 1 } else { 0 }, Ordering::SeqCst);
+    __sh_v_restore_one("LIMIT", __sh_sv8);
+    __sh_print_words(&[vec![format!("refuse-sub rc={}", __SH_RC.load(Ordering::SeqCst)).into()]], true);
+    unset_fn();
+    __sh_print_words(&[vec![format!("unset-fn rc={}", __SH_RC.load(Ordering::SeqCst)).into()]], true);
+    __sh_v_at(70);
+    if !format!("{}x", __sh_v_s("LIMIT")).is_empty() {
+    __sh_v_at(71);
+        __sh_v_unset("LIMIT");
+        __SH_RC.store(if __sh_v_rc_trip() { 1 } else { 0 }, Ordering::SeqCst);
+    } else {
+        __SH_RC.store(if __sh_v_rc_trip() { 1 } else { 0 }, Ordering::SeqCst);
+    }
+    __sh_print_words(&[vec![format!("unset-if rc={}", __SH_RC.load(Ordering::SeqCst)).into()]], true);
+    __sh_v_at(74);
+    for __sh_w9 in ["a", "b"] {
+        __sh_v_set_s("i", __sh_w9.to_string());
+    __sh_v_at(75);
+        __sh_v_unset("LIMIT");
+        __SH_RC.store(if __sh_v_rc_trip() { 1 } else { 0 }, Ordering::SeqCst);
+    }
+    __sh_print_words(&[vec![format!("unset-for rc={}", __SH_RC.load(Ordering::SeqCst)).into()]], true);
+    __sh_v_at(78);
+    {
+        let __oldin = __SH_STDIN.lock().unwrap_or_else(|e| e.into_inner()).take();
+        *__SH_STDIN.lock().unwrap_or_else(|e| e.into_inner()) = Some(Box::new(std::io::Cursor::new("once\n".to_string().into_bytes())));
+        let mut __sh_while_ran10 = false;
+        let mut __sh_while_last11 = 0;
+        while {
+let (__ln, __any) = __sh_readline();
+let __f = __sh_read_fields(&__ln, " \t\n", 1);
+__sh_v_set_s("w", __f.first().cloned().unwrap_or_default().to_string());
+__SH_RC.store(if __any { 0 } else { 1 }, Ordering::SeqCst);
+__any
+} {
+            __sh_while_ran10 = true;
+    __sh_v_at(79);
+            __sh_v_unset("LIMIT");
+            __SH_RC.store(if __sh_v_rc_trip() { 1 } else { 0 }, Ordering::SeqCst);
+            __sh_while_last11 = __SH_RC.load(Ordering::SeqCst);
+        }
+        if !__sh_while_ran10 { __SH_RC.store(0, Ordering::SeqCst); } else { __SH_RC.store(__sh_while_last11, Ordering::SeqCst); }
+        *__SH_STDIN.lock().unwrap_or_else(|e| e.into_inner()) = __oldin;
+    }
+    __sh_print_words(&[vec![format!("unset-while rc={}", __SH_RC.load(Ordering::SeqCst)).into()]], true);
+    __sh_v_at(84);
+    let __sh_sv12 = __sh_v_save("LIMIT");
+    __sh_v_unset("LIMIT");
+    __SH_RC.store(if __sh_v_rc_trip() { 1 } else { 0 }, Ordering::SeqCst);
+    __sh_v_restore_one("LIMIT", __sh_sv12);
+    __sh_print_words(&[vec![format!("unset-sub rc={}", __SH_RC.load(Ordering::SeqCst)).into()]], true);
+    __sh_print_words(&[vec![format!("limit={}", __sh_v_s("LIMIT")).into()]], true);
     __SH_RC.store(if __sh_v_rc_trip() { 1 } else { 0 }, Ordering::SeqCst);
 }
 
 fn grow() -> String {
+    __sh_v_at(25);
     __sh_v_set_s("n", "7".to_string());
-    __SH_RC.store(0, Ordering::SeqCst);
+    __SH_RC.store(if __sh_v_rc_trip() { 1 } else { 0 }, Ordering::SeqCst);
     format!("infn={}", __sh_v_s("n"))
+}
+
+fn in_fn() {
+    __sh_v_at(44);
+    __sh_v_set_s("LIMIT", "21".to_string());
+    __SH_RC.store(if __sh_v_rc_trip() { 1 } else { 0 }, Ordering::SeqCst);
+}
+
+fn unset_fn() {
+    __sh_v_at(66);
+    __sh_v_unset("LIMIT");
+    __SH_RC.store(if __sh_v_rc_trip() { 1 } else { 0 }, Ordering::SeqCst);
 }

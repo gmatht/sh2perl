@@ -6309,6 +6309,32 @@ fn st_single(s: &str) -> IrExpr {
 
 // ── AST → IR ─────────────────────────────────────────────────────────
 
+// Per-statement source lines, recorded while the lowering builds a tree:
+// `stmt_for_command` appends the statement it just built together with the
+// line of the command it came from, so the record is a POST-order of the
+// statements the lowering produced (children complete before their parent).
+// The statement is carried, not just the line, because a lowering arm may also
+// SYNTHESIZE statements of its own (save/restore pairs, loop init/step); those
+// carry no source command-turn line and are simply not in the record, and
+// pairing by statement identity keeps that from shifting every later line.
+// How a nested statement's line reaches the IR without threading a line
+// argument through every lowering arm — see `ast_to_ir_with_lines`.
+// Thread-local because unit tests lower on parallel threads; `None` (the
+// default) means "not recording" (the raw/no-lines paths), so the pushes cost
+// nothing there.
+thread_local! {
+    static STMT_LINE_REC: std::cell::RefCell<Option<Vec<(IrStmt, usize)>>> =
+        const { std::cell::RefCell::new(None) };
+}
+
+fn stmt_line_rec_begin() {
+    STMT_LINE_REC.with(|c| *c.borrow_mut() = Some(Vec::new()));
+}
+
+fn stmt_line_rec_take() -> Vec<(IrStmt, usize)> {
+    STMT_LINE_REC.with(|c| c.borrow_mut().take().unwrap_or_default())
+}
+
 pub fn ast_to_ir(commands: &[Command]) -> IrProgram {
     ast_to_ir_with_lines(commands, &[])
 }
@@ -6330,6 +6356,9 @@ pub fn ast_to_ir_with_lines(commands: &[Command], lines: &[usize]) -> IrProgram 
     // elimination — which renumbers everything after the deletion), so the
     // keys are re-derived from the survivors below.
     let want_lines = !lines.is_empty();
+    if want_lines {
+        stmt_line_rec_begin();
+    }
     let mut lowered: Vec<(IrStmt, usize)> = Vec::new();
     let mut plain: Vec<IrStmt> = Vec::new();
     for (i, cmd) in commands.iter().enumerate() {
@@ -6345,6 +6374,15 @@ pub fn ast_to_ir_with_lines(commands: &[Command], lines: &[usize]) -> IrProgram 
         lowered.iter().map(|(s, _)| s.clone()).collect()
     } else {
         plain
+    };
+    // The lowered tree, before the passes touch it: `stmt_line_seq` is derived
+    // from what the lowering RECORDED here and then re-keyed onto the
+    // survivors below (same rule as `stmt_lines`).
+    let pre_stmts = if want_lines { Some(stmts.clone()) } else { None };
+    let pre_lines = if want_lines {
+        Some(stmt_line_rec_take())
+    } else {
+        None
     };
     let mut stmts = crate::ir::optimize_stmts(&stmts);
     // Serialize against the shir_to_estree compile lock: the
@@ -6379,6 +6417,63 @@ pub fn ast_to_ir_with_lines(commands: &[Command], lines: &[usize]) -> IrProgram 
             }
         }
     }
+    // Per-statement lines, nested statements included: pair the recorded lines
+    // with the lowered tree in pre-order (the order the lowering recorded
+    // them), then re-key onto the survivors. The counts must agree EXACTLY —
+    // if a lowering arm synthesized or dropped a statement they do not, and
+    // the markup is refused wholesale (all zeroes) rather than shifted by one,
+    // because a shifted line would name the wrong source line.
+    let mut stmt_line_seq: Vec<usize> = Vec::new();
+    if let (Some(pre_stmts), Some(record)) = (&pre_stmts, pre_lines) {
+        // Pair the record with the lowered tree: both are POST-orders of the
+        // same statements (the lowering appends a statement after its body,
+        // and the tree is walked the same way), so a two-pointer pass over them
+        // gives every recorded statement its line. A tree statement the record
+        // does not contain (`stmt_for_command` never saw it: a synthesized
+        // save/restore, a loop's step stmt) is skipped without consuming a
+        // record entry, and duplicate statements pair in order, so a line never
+        // lands on the wrong statement.
+        let mut lines_by_addr: std::collections::HashMap<usize, usize> =
+            std::collections::HashMap::new();
+        {
+            let mut j = 0usize;
+            let mut post: Vec<&IrStmt> = Vec::new();
+            crate::ir::walk_stmt_postorder(pre_stmts, &mut |s| post.push(s));
+            for st in post {
+                if let Some(k) = record[j..].iter().position(|(r, _)| r == st) {
+                    let line = record[j + k].1;
+                    if line > 0 {
+                        lines_by_addr.insert(st as *const IrStmt as usize, line);
+                    }
+                    j += k + 1;
+                }
+            }
+        }
+        let mut pre_order: Vec<&IrStmt> = Vec::new();
+        crate::ir::walk_stmt_preorder(pre_stmts, &mut |s| pre_order.push(s));
+        let pre_seq: Vec<usize> = pre_order
+            .iter()
+            .map(|st| {
+                lines_by_addr
+                    .get(&(*st as *const IrStmt as usize))
+                    .copied()
+                    .unwrap_or(0)
+            })
+            .collect();
+        let mut after_order: Vec<&IrStmt> = Vec::new();
+        crate::ir::walk_stmt_preorder(&stmts, &mut |s| after_order.push(s));
+        let mut j = 0;
+        for s in &after_order {
+            let found = pre_order[j..].iter().position(|t| t == s);
+            match found {
+                Some(k) => {
+                    stmt_line_seq.push(pre_seq[j + k]);
+                    j += k + 1;
+                }
+                None => stmt_line_seq.push(0),
+            }
+        }
+    }
     IrProgram {
         imports: vec![],
         requires: vec![],
@@ -6386,12 +6481,14 @@ pub fn ast_to_ir_with_lines(commands: &[Command], lines: &[usize]) -> IrProgram 
         subs: vec![],
         var_types: vec![],
         stmt_lines,
+        stmt_line_seq,
         var_lengths: vec![],
         var_const: vec![],
         var_lifetimes: vec![],
         var_nospace: vec![],
         var_storage: vec![],
         var_bash_env: vec![],
+        
     }
 }
 
@@ -6417,6 +6514,7 @@ pub fn ast_to_ir_raw(commands: &[Command]) -> IrProgram {
         var_nospace: vec![],
         var_storage: vec![],
         var_bash_env: vec![],
+        stmt_line_seq: vec![],
     }
 }
 
@@ -16875,7 +16973,23 @@ pub(crate) fn arith_write_names(a: &ArithAst, out: &mut HashSet<String>) {
     }
 }
 
+/// Lower one command to a statement, recording the statement and its source
+/// line for the nested-line markup when recording is on (after its body has
+/// been lowered, so the record is a post-order).
 pub(crate) fn stmt_for_command(cmd: &Command) -> Option<IrStmt> {
+    let lowered = stmt_for_command_inner(cmd);
+    if let Some(st) = &lowered {
+        let line = crate::ast::command_line(cmd).unwrap_or(0);
+        STMT_LINE_REC.with(|c| {
+            if let Some(v) = c.borrow_mut().as_mut() {
+                v.push((st.clone(), line));
+            }
+        });
+    }
+    lowered
+}
+
+fn stmt_for_command_inner(cmd: &Command) -> Option<IrStmt> {
     Some(match cmd {
         Command::BlankLine => return None,
         Command::TestExpression(t) => {
@@ -57272,6 +57386,7 @@ if printf "%s\n" "$x" | grep world > /dev/null; then echo yes; fi"#;
             var_lifetimes: vec![],
             var_nospace: vec![],
             var_bash_env: vec![],
+            stmt_line_seq: vec![],
         };
         // bare try/except: TryStatement + CatchClause + instanceof ladder
         // + signal guard + rethrow
@@ -57365,6 +57480,7 @@ if printf "%s\n" "$x" | grep world > /dev/null; then echo yes; fi"#;
             var_lifetimes: vec![],
             var_nospace: vec![],
             var_bash_env: vec![],
+            stmt_line_seq: vec![],
         };
         let json = serde_json::to_string(&shir_to_estree(&prog)).unwrap();
         assert!(json.contains("\"name\":\"mye\""), "as-binding read kept: {json}");
@@ -57524,6 +57640,7 @@ if printf "%s\n" "$x" | grep world > /dev/null; then echo yes; fi"#;
             var_nospace: vec![],
             var_storage: vec![],
             var_bash_env: vec![],
+            stmt_line_seq: vec![],
         };
         let r = analyze_var_ranges(&prog);
         assert!(!r.contains_key("flag"));
@@ -58015,6 +58132,7 @@ mod sink_context_tests {
             var_nospace: vec![],
             var_storage: vec![],
             var_bash_env: vec![],
+            stmt_line_seq: vec![],
         };
         assert_eq!(
             analyze_fn_sink_contexts(&prog).get("f").copied(),
@@ -58053,6 +58171,7 @@ mod sink_context_tests {
             var_nospace: vec![],
             var_storage: vec![],
             var_bash_env: vec![],
+            stmt_line_seq: vec![],
         };
         assert_eq!(
             analyze_fn_sink_contexts(&prog).get("f").copied(),
@@ -58324,6 +58443,7 @@ mod bigint_hoist_tests {
             var_nospace: vec![],
             var_storage: vec![],
             var_bash_env: vec![],
+            stmt_line_seq: vec![],
         }
     }
 
@@ -59156,6 +59276,7 @@ mod static_word_list_tests {
                 var_nospace: vec![],
                 var_storage: vec![],
                 var_bash_env: vec![],
+                stmt_line_seq: vec![],
             }
         };
         let v = analyze_loop_var_escapes(&mk(vec![]));
@@ -59217,6 +59338,7 @@ mod static_word_list_tests {
             var_nospace: vec![],
             var_storage: vec![],
             var_bash_env: vec![],
+            stmt_line_seq: vec![],
         };
         let v = analyze_static_arrays(&prog);
         assert_eq!(
@@ -59261,6 +59383,7 @@ mod static_word_list_tests {
             var_nospace: vec![],
             var_storage: vec![],
             var_bash_env: vec![],
+            stmt_line_seq: vec![],
         };
         let v = analyze_static_arrays(&prog);
         assert!(v.get("xs").is_none(), "appended array marked static: {v:?}");
@@ -59293,6 +59416,7 @@ mod static_word_list_tests {
             var_nospace: vec![],
             var_storage: vec![],
             var_bash_env: vec![],
+            stmt_line_seq: vec![],
         };
         // the old position-keyed verdict is gone; a For over a NAMED
         // static array is covered by analyze_static_arrays (below). This
@@ -59328,6 +59452,7 @@ mod const_len_array_tests {
             var_nospace: vec![],
             var_storage: vec![],
             var_bash_env: vec![],
+            stmt_line_seq: vec![],
         }
     }
 
@@ -59523,6 +59648,7 @@ mod unread_status_tests {
             var_nospace: vec![],
             var_storage: vec![],
             var_bash_env: vec![],
+            stmt_line_seq: vec![],
         }
     }
 
@@ -59599,6 +59725,7 @@ mod whole_argv_tests {
             var_nospace: vec![],
             var_storage: vec![],
             var_bash_env: vec![],
+            stmt_line_seq: vec![],
         }
     }
 
@@ -59689,6 +59816,7 @@ mod shift_offset_tests {
             var_nospace: vec![],
             var_storage: vec![],
             var_bash_env: vec![],
+            stmt_line_seq: vec![],
         }
     }
 

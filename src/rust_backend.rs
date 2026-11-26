@@ -325,6 +325,14 @@ pub struct Render {
     /// prints the same `<prog>: line N:` prefix bash prints; `None` for a
     /// statement the IR carries no line for (see the store's refusal note).
     cur_line: Option<usize>,
+    /// Address of every statement the IR carries a source line for ->
+    /// that line (`IrProgram::stmt_line_seq`, NESTED statements included;
+    /// keyed by address because the renderer walks the borrowed tree and
+    /// addresses are the only stable per-statement key it has). Built once
+    /// at render start. `stmt` anchors `__sh_v_at` from it, so a refused
+    /// store write prints bash's line wherever it sits — function, loop,
+    /// subshell body — not just at top level.
+    stmt_lines_by_addr: std::collections::HashMap<usize, usize>,
     /// function definitions (name, body stmts) — for `typeset -f`
     fn_defs: Vec<(String, Vec<IrStmt>, bool)>,
     /// var -> captured local (background-thread bodies)
@@ -3052,9 +3060,28 @@ fn drop_dead_ret_register(t: &str) -> String {
         let lead = s[after_store..].len() - tail.len();
         if tail.starts_with("return __v;") {
             let consumed = after_store + lead + "return __v;".len();
-            let at_tail = s[consumed..]
-                .chars()
-                .all(|c| c == '}' || c == '\n' || c == ' ' || c == '\t');
+            // The `return` is the ENCLOSING FUNCTION's value when nothing but
+            // whitespace follows it up to the function's terminator `}` (the
+            // renderer writes that brace at column 0; a nested block's is
+            // indented). Checking "the rest of the PROGRAM is braces" would
+            // only fire for the last emitted function and leave every earlier
+            // one with an `unneeded return` clippy rejects.
+            let at_tail = {
+                let mut tail_ok = true;
+                let mut closed = false;
+                for line in s[consumed..].lines() {
+                    let t = line.trim();
+                    if t == "}" && !line.starts_with([' ', '\t']) {
+                        closed = true;
+                        break;
+                    }
+                    if !t.is_empty() {
+                        tail_ok = false;
+                        break;
+                    }
+                }
+                tail_ok && closed
+            };
             let repl = if at_tail {
                 expr
             } else {
@@ -3801,6 +3828,22 @@ impl Render {
             return;
         }
         self.emit("__SH_RC.store(0, Ordering::SeqCst);");
+    }
+
+    /// Rewrite a plain status write to one that reports a refused store write
+    /// immediately before it (`__sh_v_rc_trip`), so the statement's status is
+    /// bash's 1 for a refused assignment. One unit at a time — the emitted
+    /// body of main, or one function body — because the rewrite happens after
+    /// the unit is rendered.
+    fn rc_trip_reword(lines: &mut [String]) {
+        for line in lines.iter_mut() {
+            if line.trim() == "__SH_RC.store(0, Ordering::SeqCst);" {
+                *line = line.replace(
+                    "__SH_RC.store(0, Ordering::SeqCst);",
+                    "__SH_RC.store(if __sh_v_rc_trip() { 1 } else { 0 }, Ordering::SeqCst);",
+                );
+            }
+        }
     }
 
     fn rc_strip(&self, s: &str) -> String {
@@ -11465,13 +11508,34 @@ impl Render {
     /// index. The marker is dropped again when the statement turns out to
     /// write nothing the store can refuse, so programs that never declare a
     /// readonly name (and statements that cannot be refused) carry none.
-    fn store_line_marker(&mut self, s: &IrStmt) {
-        let Some(line) = self.cur_line else {
-            self.stmt(s);
-            return;
-        };
+    /// Statement address -> source line, for every statement the IR marks.
+    /// `stmt_line_seq` is per statement of a pre-order walk of `prog.stmts`
+    /// (see `ir::walk_stmt_preorder`), which is what the lowering recorded;
+    /// `stmt_lines` (top-level only, and the only markup older frontends
+    /// supply) fills in anything the sequence does not cover, so a program
+    /// with no per-statement markup behaves exactly as before.
+    fn stmt_line_map(prog: &IrProgram) -> std::collections::HashMap<usize, usize> {
+        let mut map = std::collections::HashMap::new();
+        let mut i = 0usize;
+        crate::ir::walk_stmt_preorder(&prog.stmts, &mut |st| {
+            if let Some(&line) = prog.stmt_line_seq.get(i) {
+                if line > 0 {
+                    map.insert(st as *const IrStmt as usize, line);
+                }
+            }
+            i += 1;
+        });
+        for (idx, line) in prog.stmt_lines.iter() {
+            if let Some(st) = prog.stmts.get(*idx) {
+                map.entry(st as *const IrStmt as usize).or_insert(*line);
+            }
+        }
+        map
+    }
+
+    fn store_line_marker(&mut self, s: &IrStmt, line: usize) {
         if self.readonly_vars.is_empty() {
-            self.stmt(s);
+            self.stmt_body(s);
             return;
         }
         let writes = |out: &Vec<String>| {
@@ -11488,7 +11552,7 @@ impl Render {
         let before = writes(&self.out);
         let marker = format!("    __sh_v_at({line});");
         self.out.push(marker.clone());
-        self.stmt(s);
+        self.stmt_body(s);
         if writes(&self.out) == before {
             if let Some(pos) = self.out.iter().rposition(|l| *l == marker) {
                 self.out.remove(pos);
@@ -11496,7 +11560,31 @@ impl Render {
         }
     }
 
+    /// Render one statement. The line comes from the address-keyed map built
+    /// at render start, so the anchor is emitted for a statement at ANY depth
+    /// — a refusal inside a function/loop/subshell body names the line bash
+    /// names, not the top-level statement's. `cur_line` is saved/restored
+    /// across the statement so a sibling without markup does not inherit it.
     fn stmt(&mut self, s: &IrStmt) {
+        if self.readonly_vars.is_empty() {
+            self.stmt_body(s);
+            return;
+        }
+        match self
+            .stmt_lines_by_addr
+            .get(&(s as *const IrStmt as usize))
+            .copied()
+        {
+            Some(line) => {
+                let saved = self.cur_line.replace(line);
+                self.store_line_marker(s, line);
+                self.cur_line = saved;
+            }
+            None => self.stmt_body(s),
+        }
+    }
+
+    fn stmt_body(&mut self, s: &IrStmt) {
         // PLAN-4 STATUS LIVENESS: a statement whose status write the shared
         // verdict marks unread contributes no `__SH_RC.store(0, …)`. The
         // write sites are spread across the statement arms (exec/echo/
@@ -12522,13 +12610,26 @@ impl Render {
                                         .iter()
                                         .map(|t| int_lit(t.trim().parse::<i64>().unwrap()))
                                         .collect();
-                                    format!("[{}]", ints.join(", "))
+                                    // A ONE-element list is spelled
+                                    // `std::iter::once(x)`: `[x]` reads the same
+                                    // but clippy rejects a `for` over a
+                                    // single-element list, and the emitted code is
+                                    // lint-gated (`-D warnings`).
+                                    if ints.len() == 1 {
+                                        format!("std::iter::once({})", ints[0])
+                                    } else {
+                                        format!("[{}]", ints.join(", "))
+                                    }
                                 }
                                 None => {
                                     let lits: Vec<String> =
                                         texts.iter().map(|t| Self::rust_str(t)).collect();
                                     if lits.is_empty() {
                                         "[] as [&str; 0]".to_string()
+                                    } else if lits.len() == 1 {
+                                        // see the int_list arm: no single-element
+                                        // list literal in a `for`
+                                        format!("std::iter::once({})", lits[0])
                                     } else {
                                         format!("[{}]", lits.join(", "))
                                     }
@@ -12679,7 +12780,11 @@ impl Render {
                         let items = self.words_expr(other);
                         let items_g = self.gensym("__sh_items");
                         let idx_g = self.gensym("__sh_i");
-                        self.emit(&format!("let {items_g} = {items};"));
+                        // The list type is stated, not inferred: an item that is
+                        // already a `Word` rides in as `.into()`, and a
+                        // one-element list of those has no other hint (rustc:
+                        // "type annotations needed for `Vec<_>`").
+                        self.emit(&format!("let {items_g}: Vec<Word> = {items};"));
                         self.emit(&format!("let mut {idx_g}: usize = 0;"));
                         // `loop` so a body `continue` still runs the
                         // index increment (bash's for-iteration)
@@ -13110,6 +13215,11 @@ impl Render {
     }
 
     fn program(&mut self, prog: &IrProgram) {
+        // Statement address -> source line, from the IR markup, BEFORE any
+        // rendering: the hoisted function bodies are rendered (probe + commit)
+        // out of CLONES staged further down, so each phase re-stages the map
+        // onto its own copies.
+        self.stmt_lines_by_addr = Self::stmt_line_map(prog);
         // Pass 1: collect written vars + arrays + assoc + functions
         let mut written: BTreeSet<String> = BTreeSet::new();
         collect_written(&prog.stmts, &mut written);
@@ -13119,6 +13229,11 @@ impl Render {
         let mut defs = Vec::new();
         collect_fn_defs(&prog.stmts, &mut defs);
         self.fn_defs = defs;
+        {
+            let defs = std::mem::take(&mut self.fn_defs);
+            stage_stmt_lines(&mut self.stmt_lines_by_addr, prog, &defs);
+            self.fn_defs = defs;
+        }
         for (n, _) in &prog.var_types {
             // positional params ($1, $2, ...) read from argv (never
             // declared as thread-locals; cf. getvar_str/num digit arms).
@@ -13184,6 +13299,7 @@ impl Render {
         {
             let mut pfns: Vec<(String, Vec<IrStmt>, bool)> = Vec::new();
             collect_fn_defs(&prog.stmts, &mut pfns);
+            stage_stmt_lines(&mut self.stmt_lines_by_addr, prog, &pfns);
             // shared shIR verdict: fn name -> constant argv shift offset
             // (present only for the narrow qualifying shapes)
             let shift_offsets = crate::shir::analyze_shift_offsets(prog);
@@ -13313,15 +13429,12 @@ impl Render {
         let mut body_out = Vec::new();
         std::mem::swap(&mut self.out, &mut body_out);
         self.depth = 1;
-        // The IR carries the 1-based source line per TOP-LEVEL statement
-        // (`ast_to_ir_with_lines`); a refusal diagnostic prints the line of
-        // the statement whose store write it refused, so the renderer hands
-        // the store the line of the statement it is currently emitting.
-        let line_of: std::collections::HashMap<usize, usize> =
-            prog.stmt_lines.iter().cloned().collect();
-        for (i, s) in prog.stmts.iter().enumerate() {
-            self.cur_line = line_of.get(&i).copied();
-            self.store_line_marker(s);
+        // `stmt` anchors every statement the IR carries a line for, at any
+        // depth. The map is rebuilt here for main's own body (the pass-3a
+        // clones are gone by now).
+        self.stmt_lines_by_addr = Self::stmt_line_map(prog);
+        for s in prog.stmts.iter() {
+            self.stmt(s);
         }
         self.cur_line = None;
         // the script's exit code is the LAST statement's rc (bash's final
@@ -13382,16 +13495,12 @@ impl Render {
         // A store write can be refused (`readonly`), and bash reports that as
         // the assignment's status — but every statement writes its own status
         // after it runs. In a program with a store, the status write asks the
-        // store whether the write immediately before it was refused.
+        // store whether the write immediately before it was refused. Applied to
+        // main's body and to every function body (below), because a refusal in
+        // a function body is the FUNCTION's status, which `$?` after the call
+        // observes — a plain `store(0)` there would swallow it.
         if self.helpers.contains("vars") {
-            for line in body_out.iter_mut() {
-                if line.trim() == "__SH_RC.store(0, Ordering::SeqCst);" {
-                    *line = line.replace(
-                        "__SH_RC.store(0, Ordering::SeqCst);",
-                        "__SH_RC.store(if __sh_v_rc_trip() { 1 } else { 0 }, Ordering::SeqCst);",
-                    );
-                }
-            }
+            Self::rc_trip_reword(&mut body_out);
         }
         self.depth = 0;
 
@@ -13425,6 +13534,7 @@ impl Render {
         // collected from the whole tree and emitted at module level.
         let mut fns: Vec<(String, Vec<IrStmt>, bool)> = Vec::new();
         collect_fn_defs(&prog.stmts, &mut fns);
+        stage_stmt_lines(&mut self.stmt_lines_by_addr, prog, &fns);
         let mut fn_out = Vec::new();
         std::mem::swap(&mut self.out, &mut fn_out);
         self.depth = 0;
@@ -13557,6 +13667,9 @@ impl Render {
             self.emit("");
         }
         std::mem::swap(&mut self.out, &mut fn_out);
+        if self.helpers.contains("vars") {
+            Self::rc_trip_reword(&mut fn_out);
+        }
         self.depth = 0;
 
         // Preamble: statics + helpers, then main with the rendered body.
@@ -20614,6 +20727,71 @@ fn fn_value_used(prog: &IrProgram) -> std::collections::HashSet<String> {
     used
 }
 
+/// Copy the line markup onto a CLONE of the statements it was recorded for.
+/// `self.fn_defs` and the pass-3a probe list stage hoisted function bodies as
+/// clones, so their addresses are not the ones the IR map was keyed by; the
+/// clone holds the same statements in the same order, so pairing them by
+/// equality (a pass may have dropped a statement from either side) recovers
+/// the lines for the staged copy. Anything the pair does not explain simply
+/// keeps no line.
+fn align_stmt_lines(
+    src: &[IrStmt],
+    dst: &[IrStmt],
+    map: &mut std::collections::HashMap<usize, usize>,
+) {
+    let mut src_order: Vec<&IrStmt> = Vec::new();
+    crate::ir::walk_stmt_preorder(src, &mut |s| src_order.push(s));
+    let mut dst_order: Vec<&IrStmt> = Vec::new();
+    crate::ir::walk_stmt_preorder(dst, &mut |s| dst_order.push(s));
+    let mut j = 0;
+    for d in &dst_order {
+        let Some(k) = src_order[j..].iter().position(|t| t == d) else {
+            continue;
+        };
+        let line = map
+            .get(&(src_order[j + k] as *const IrStmt as usize))
+            .copied();
+        if let Some(line) = line {
+            map.insert(*d as *const IrStmt as usize, line);
+        }
+        j += k + 1;
+    }
+}
+
+/// Rebuild the address -> line map for a render phase and extend it onto the
+/// function-body clones that phase stages. It is REBUILT rather than patched
+/// because a staged clone dies with its phase and a later clone can land on
+/// that freed address: a stale entry would then hand a statement another
+/// statement's line.
+fn stage_stmt_lines(
+    map: &mut std::collections::HashMap<usize, usize>,
+    prog: &IrProgram,
+    bodies: &[(String, Vec<IrStmt>, bool)],
+) {
+    *map = Render::stmt_line_map(prog);
+    for (name, body, _) in bodies {
+        if let Some(ir_body) = find_fn_body(&prog.stmts, name) {
+            align_stmt_lines(ir_body, body, map);
+        }
+    }
+}
+
+/// The IR body of the (first) function definition called `name`, wherever it
+/// is nested.
+fn find_fn_body<'a>(stmts: &'a [IrStmt], name: &str) -> Option<&'a Vec<IrStmt>> {
+    let mut found: Option<&Vec<IrStmt>> = None;
+    crate::ir::walk_stmt_preorder(stmts, &mut |s| {
+        if found.is_none() {
+            if let IrStmt::Function { name: n, body, .. } = s {
+                if n == name {
+                    found = Some(body);
+                }
+            }
+        }
+    });
+    found
+}
+
 /// Collect every function DEFINITION (top-level and nested).
 fn collect_fn_defs(stmts: &[IrStmt], out: &mut Vec<(String, Vec<IrStmt>, bool)>) {
     for s in stmts {
@@ -21250,6 +21428,7 @@ mod tests {
             var_nospace: vec![],
             var_storage: vec![],
             var_bash_env: vec![],
+            stmt_line_seq: vec![],
         };
         let out = shir_to_rust(&prog);
         assert!(!out.contains("__SH_RC"), "dead rc kept:\n{out}");
@@ -21401,6 +21580,7 @@ mod tests {
             var_nospace: vec![],
             var_storage: vec![],
             var_bash_env: vec![],
+            stmt_line_seq: vec![],
         };
         let out = shir_to_rust(&prog);
         // A runtime-free program (setArray + direct output) lowers the
@@ -21469,6 +21649,7 @@ mod tests {
             var_nospace: vec![],
             var_storage: vec![],
             var_bash_env: vec![],
+            stmt_line_seq: vec![],
         };
         let out = shir_to_rust(&prog);
         assert!(
@@ -21599,6 +21780,7 @@ mod tests {
             var_nospace: vec![],
             var_storage: vec![],
             var_bash_env: vec![],
+            stmt_line_seq: vec![],
         };
         let out = shir_to_rust(&prog);
         assert!(!out.contains("__sh_puts"), "sink helper kept:\n{out}");

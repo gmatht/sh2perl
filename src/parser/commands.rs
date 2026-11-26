@@ -185,6 +185,8 @@ impl Parser {
                             env_vars: BTreeMap::new(),
                             stdout_used: true,
                             stderr_used: true,
+                        
+                            line: 0,
                         }));
                         return Ok((commands, lines));
                     }
@@ -388,6 +390,8 @@ impl Parser {
                                 env_vars: BTreeMap::new(),
                                 stdout_used: true,
                                 stderr_used: true,
+                            
+                                line: 0,
                             })),
                             redirects,
                         })
@@ -460,6 +464,8 @@ impl Parser {
                             env_vars: BTreeMap::new(),
                             stdout_used: true,
                             stderr_used: true,
+                        
+                            line: 0,
                         })
                     }
                     Some(Token::Semicolon) | Some(Token::DoubleSemicolon) => {
@@ -482,6 +488,8 @@ impl Parser {
                                 env_vars: BTreeMap::new(),
                                 stdout_used: true,
                                 stderr_used: true,
+                            
+                                line: 0,
                             }));
                         }
                         self.parse_pipeline_segment()?
@@ -497,6 +505,8 @@ impl Parser {
                             env_vars: BTreeMap::new(),
                             stdout_used: true,
                             stderr_used: true,
+                        
+                            line: 0,
                         }));
                     }
                     _ => self.parse_pipeline()?,
@@ -834,6 +844,8 @@ impl Parser {
                         env_vars: BTreeMap::new(),
                         stdout_used: true,
                         stderr_used: true,
+                    
+                        line: 0,
                     })),
                     redirects,
                 }))
@@ -1247,6 +1259,8 @@ impl Parser {
                             variable: var_name,
                             value,
                             operator: AssignmentOperator::Assign,
+                        
+                            line: self.lexer.current_line(),
                         }));
                     }
                     commands.push(func);
@@ -1325,6 +1339,8 @@ impl Parser {
                             variable,
                             value,
                             operator: AssignmentOperator::Assign,
+                        
+                            line: self.lexer.current_line(),
                         })
                     })
                     .collect();
@@ -1536,6 +1552,8 @@ impl Parser {
                         env_vars,
                         stdout_used: true,
                         stderr_used: true,
+                    
+                        line: self.lexer.current_line(),
                     }));
                 }
 
@@ -1618,6 +1636,8 @@ impl Parser {
                     env_vars,
                     stdout_used: true,
                     stderr_used: true,
+                
+                    line: self.lexer.current_line(),
                 }));
             }
         }
@@ -1781,6 +1801,8 @@ impl Parser {
             env_vars,
             stdout_used: true,
             stderr_used: true,
+        
+            line: self.lexer.current_line(),
         }))
     }
 
@@ -2195,6 +2217,8 @@ impl Parser {
                         env_vars: env_cmd_vars,
                         stdout_used: true,
                         stderr_used: true,
+                    
+                        line: self.lexer.current_line(),
                     });
 
                     Ok(Command::Block(Block {
@@ -2215,6 +2239,8 @@ impl Parser {
                         variable,
                         value,
                         operator,
+                    
+                        line: self.lexer.current_line(),
                     })
                 })
                 .collect();
@@ -2383,6 +2409,8 @@ impl Parser {
                 env_vars: BTreeMap::new(),
                 stdout_used: true,
                 stderr_used: true,
+            
+                line: 0,
             }));
         }
 
@@ -2402,6 +2430,8 @@ impl Parser {
                         None,
                     ),
                     operator: AssignmentOperator::Assign,
+                
+                    line: 0,
                 }));
             } else {
                 // For non-assignment expressions like ((i++)),
@@ -2413,6 +2443,8 @@ impl Parser {
                     env_vars: BTreeMap::new(),
                     stdout_used: true,
                     stderr_used: true,
+                
+                    line: 0,
                 }));
             }
         }
@@ -2435,6 +2467,8 @@ impl Parser {
                         None,
                     ),
                     operator: AssignmentOperator::Assign,
+                
+                    line: 0,
                 }));
             } else {
                 commands.push(Command::Simple(SimpleCommand {
@@ -2444,6 +2478,8 @@ impl Parser {
                     env_vars: BTreeMap::new(),
                     stdout_used: true,
                     stderr_used: true,
+                
+                    line: 0,
                 }));
             }
         }
@@ -2456,6 +2492,8 @@ impl Parser {
                 env_vars: BTreeMap::new(),
                 stdout_used: true,
                 stderr_used: true,
+            
+                line: 0,
             }));
         }
 
