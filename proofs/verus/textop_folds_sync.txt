@@ -2,12 +2,12 @@
 # source sha: text_ops=68bfaa6813fb  proof sha: 4f885f265c26
 
 [pins]
-pin pin_basename_interior_slashes -> UNMIRRORED (by design — see VERUS.md §(b).4)
-pin pin_basename_trailing_slash -> UNMIRRORED (by design — see VERUS.md §(b).4)
+pin pin_basename_interior_slashes -> UNMIRRORED (by design — see the proof-campaign plan §(b).4)
+pin pin_basename_trailing_slash -> UNMIRRORED (by design — see the proof-campaign plan §(b).4)
 pin pin_case_lower -> test param_case_lower: MAPPED
 pin pin_case_upper -> test param_case_upper: MAPPED
 pin pin_strlen_literal -> test wc_c_is_strlen: MAPPED
-pin pin_substr_slice -> UNMIRRORED (by design — see VERUS.md §(b).4)
+pin pin_substr_slice -> UNMIRRORED (by design — see the proof-campaign plan §(b).4)
 
 [guards]
 guard text-op node StrLen: PRESENT

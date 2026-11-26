@@ -26,7 +26,7 @@
 // into tmp[64], then sign + reversed digits + NUL with capacity grown
 // to n+neg+1.
 //
-// WHY THIS EXISTS. C_UB_PROOF.md §2a names all three as render-layer
+// WHY THIS EXISTS. the C UB proof notes §2a names all three as render-layer
 // obligations ("_sh_isint31 … a predicate that must be proven to imply
 // what its callers assume", "the __int128-to-decimal helper (a
 // small-int sum past i64)", "need_isqrt (exact integer sqrt for every

@@ -10,7 +10,7 @@ pin pin_impure_binds_once -> test impure_discriminant_binds_once: MAPPED
 pin pin_leading_catchall_refuses -> test leading_catchall_refuses: MAPPED
 pin pin_literal_affix_dispatch -> test literal_and_affix_clauses_lower_to_native_tests: MAPPED
 pin pin_nocasematch_refuses -> test nocasematch_mention_refuses_the_whole_program: MAPPED
-pin pin_post_catchall_dropped -> UNMIRRORED (by design — see VERUS.md §(b).4)
+pin pin_post_catchall_dropped -> UNMIRRORED (by design — see the proof-campaign plan §(b).4)
 pin pin_pure_subject_lowers_unbound -> test optimizer_getvar_subject_lowers: MAPPED
 pin pin_quoted_star_is_literal -> test quoted_star_is_a_literal_not_the_catchall: MAPPED
 pin pin_refused_pattern_refuses -> test dynamic_and_partial_quote_patterns_refuse: MAPPED

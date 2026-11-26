@@ -7,7 +7,7 @@ pin pin_gate_is_placement -> test disabled_by_default: MAPPED
 pin pin_iteration_out_of_scope -> test refuses_iterated_set: MAPPED
 pin pin_nonempty_init_refused -> test refuses_nonempty_init: MAPPED
 pin pin_routing_splits -> test splits_set_into_two_partitions: MAPPED
-pin pin_runs_agree_on_membership -> UNMIRRORED (by design — see VERUS.md §(b).4)
+pin pin_runs_agree_on_membership -> UNMIRRORED (by design — see the proof-campaign plan §(b).4)
 
 [guards]
 guard isSmallInt routing: PRESENT

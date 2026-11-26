@@ -8,8 +8,8 @@ pin pin_incdec_step_folds -> test prefix_incdec_step_recovers: MAPPED
 pin pin_non_counter_cond_refuses -> test cond_not_reading_counter_vetoes: MAPPED
 pin pin_plus_one_step_folds -> test plus_one_assign_recovers: MAPPED
 pin pin_text_cond_refuses -> test shell_text_cond_left_alone: MAPPED
-pin pin_trace_agrees -> UNMIRRORED (by design — see VERUS.md §(b).4)
-pin pin_unit_gate_load_bearing -> UNMIRRORED (by design — see VERUS.md §(b).4)
+pin pin_trace_agrees -> UNMIRRORED (by design — see the proof-campaign plan §(b).4)
+pin pin_unit_gate_load_bearing -> UNMIRRORED (by design — see the proof-campaign plan §(b).4)
 
 [guards]
 guard step gate: PRESENT

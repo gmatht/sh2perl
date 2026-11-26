@@ -2,13 +2,13 @@
 # source sha: function_purity=1954d11b0d8a  proof sha: 0b29a19253dd
 
 [pins]
-pin pin_impure_arg_taints -> UNMIRRORED (by design — see VERUS.md §(b).4)
-pin pin_other_body_impure -> UNMIRRORED (by design — see VERUS.md §(b).4)
-pin pin_output_body_emulable -> UNMIRRORED (by design — see VERUS.md §(b).4)
-pin pin_pure_assign_body -> UNMIRRORED (by design — see VERUS.md §(b).4)
-pin pin_pure_call_pure -> UNMIRRORED (by design — see VERUS.md §(b).4)
-pin pin_pure_runs_silent -> UNMIRRORED (by design — see VERUS.md §(b).4)
-pin pin_unknown_callee_impure -> UNMIRRORED (by design — see VERUS.md §(b).4)
+pin pin_impure_arg_taints -> UNMIRRORED (by design — see the proof-campaign plan §(b).4)
+pin pin_other_body_impure -> UNMIRRORED (by design — see the proof-campaign plan §(b).4)
+pin pin_output_body_emulable -> UNMIRRORED (by design — see the proof-campaign plan §(b).4)
+pin pin_pure_assign_body -> UNMIRRORED (by design — see the proof-campaign plan §(b).4)
+pin pin_pure_call_pure -> UNMIRRORED (by design — see the proof-campaign plan §(b).4)
+pin pin_pure_runs_silent -> UNMIRRORED (by design — see the proof-campaign plan §(b).4)
+pin pin_unknown_callee_impure -> UNMIRRORED (by design — see the proof-campaign plan §(b).4)
 
 [guards]
 guard lattice Impure/Emulable/Pure: PRESENT

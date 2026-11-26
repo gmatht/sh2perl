@@ -38,7 +38,7 @@
 // and its residue form. It does NOT pin Rust's `i64::wrapping_mul`
 // chain to that residue: `wrapping_mul` is exec-only (no spec), so the
 // tie from "the loop's i64 state" to "the product mod 2^64" is not a
-// theorem here. That is the residual gap, recorded in VERUS.md.
+// theorem here. That is the residual gap, recorded in the proof-campaign plan.
 //
 // ## Scope (read before quoting)
 //
@@ -60,7 +60,7 @@
 //   recurses into them and the induction is the same at the child; their
 //   denotations are state-dependent and out of this Tier-1 fragment.
 // - Fidelity: the source has no unit suite for these tables, so every
-//   pin is UNMIRRORED by design (recorded in VERUS.md §(b).4).
+//   pin is UNMIRRORED by design (recorded in the proof-campaign plan §(b).4).
 //
 // ## Mutant (checked)
 //

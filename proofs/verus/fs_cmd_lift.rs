@@ -33,7 +33,7 @@
 // is about the LIFT (the same command and argv reach that renderer); the
 // renderer's own job — reproducing bash's status aggregation, the `-f`
 // missing-path rule and the diagnostics — is the node's pre-existing contract
-// and is measured end to end by `harness/anchor-fs-cmd-lift.sh` (bash vs the
+// and is measured end to end by `<workspace>/harness/anchor-fs-cmd-lift.sh` (bash vs the
 // generated C and Perl, byte for byte and status for status). No part of this
 // model claims to prove std::fs equals rm(1).
 //
@@ -56,7 +56,7 @@
 //   verus --triggers-mode silent --rlimit 60 fs_cmd_lift.rs
 //   -> verification results:: 30 verified, 0 errors
 //
-// Mutants (checked, measured on copies by harness/mut-fs-cmd-lift.py):
+// Mutants (checked, measured on copies by <workspace>/harness/mut-fs-cmd-lift.py):
 //   see the harness output; every mutant is red on a named obligation here.
 use vstd::prelude::*;
 

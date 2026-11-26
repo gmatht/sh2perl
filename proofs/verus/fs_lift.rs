@@ -45,14 +45,14 @@
 //   its header, not proved here).
 // - The node RENDERERS' agreement with `stat(2)` (stat not lstat, full
 //   nanosecond precision) is the nodes' existing contract (A1), measured by
-//   `harness/anchor-fs-lift.sh` executing bash vs the generated Rust.
+//   `<workspace>/harness/anchor-fs-lift.sh` executing bash vs the generated Rust.
 // - The `offered` manifest gate is an input flag; both directions pinned.
 //
 // Verus 0.2026.10.18.7d82994, rust 1.99.1:
 //   verus --triggers-mode silent --rlimit 60 fs_lift.rs
 //   -> verification results:: 26 verified, 0 errors
 //
-// Mutants: harness/mut-fs-lift.py (see its output for the measured set).
+// Mutants: <workspace>/harness/mut-fs-lift.py (see its output for the measured set).
 use vstd::prelude::*;
 
 verus! {

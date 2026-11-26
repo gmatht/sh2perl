@@ -8,8 +8,8 @@ pin pin_body_write_refuses -> test body_write_refuses: MAPPED
 pin pin_declare_refuses -> test declare_in_body_refuses: MAPPED
 pin pin_dynamic_step_refuses -> test dynamic_arith_step_refuses: MAPPED
 pin pin_plain_while_untouched -> test plain_while_is_untouched: MAPPED
-pin pin_step_gate_load_bearing -> UNMIRRORED (by design — see VERUS.md §(b).4)
-pin pin_trace_agrees -> UNMIRRORED (by design — see VERUS.md §(b).4)
+pin pin_step_gate_load_bearing -> UNMIRRORED (by design — see the proof-campaign plan §(b).4)
+pin pin_trace_agrees -> UNMIRRORED (by design — see the proof-campaign plan §(b).4)
 pin pin_zero_step_refuses -> test zero_arith_step_refuses: MAPPED
 
 [guards]

@@ -75,7 +75,7 @@
 //       sign rules, which `mod_pos_sound`/`mod_neg_sound` prove sound.
 //   negative_floordiv_divisors_are_refused_though_sound
 //       The `//` guard is CONSERVATIVE in the negative half: an exhaustive
-//       probe (recorded in VERUS.md) found no counterexample for a wholly
+//       probe (recorded in the proof-campaign plan) found no counterexample for a wholly
 //       negative divisor interval, yet the analysis refuses it.  Precision
 //       loss, not unsoundness.
 //   the_mod_interval_is_an_over_approximation
@@ -740,7 +740,7 @@ pub proof fn the_corner_table_for_mod_is_unsound_for_negative_divisors()
 
 // (D3) The `//` guard is CONSERVATIVE in the negative half: a wholly
 // negative divisor interval is safe for the corner table (the exhaustive
-// probe in VERUS.md found no counterexample), but the analysis refuses it.
+// probe in the proof-campaign plan found no counterexample), but the analysis refuses it.
 // Precision loss, not unsoundness: the refusal is proved, and the corner
 // rule is proved sound above for positive divisors only.
 pub proof fn negative_floordiv_divisors_are_refused_though_sound()

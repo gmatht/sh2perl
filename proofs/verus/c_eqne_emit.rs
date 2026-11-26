@@ -29,7 +29,7 @@
 // literal was text, so the decision took the RAW arm and emitted
 // `i != "2"` — a pointer/integer comparison. Exactly 2 of 564 renders
 // carried the gcc warning (or-continue, eq-string-num-var — both from
-// this lift), and the C gate (harness/c_gate_main.sh) failed 5 files
+// this lift), and the C gate (<workspace>/harness/c_gate_main.sh) failed 5 files
 // whose transforms-ON output diverged from bash while transforms-OFF
 // matched: or-continue (silent — no line printed), func-after-test-or
 // (rc=134, abort on UB — a sibling defect, the chain arm's unowned

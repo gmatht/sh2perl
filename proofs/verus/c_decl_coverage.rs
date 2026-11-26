@@ -58,7 +58,7 @@
 //              ways).
 //
 // WHAT IS MODELLED (fidelity, checked against the source arm-by-arm;
-// MECHANICALLY since 2026-10-29 — harness/declcov-extract.py extracts
+// MECHANICALLY since 2026-10-29 — <workspace>/harness/declcov-extract.py extracts
 // these walkers' arm chains from the live c_backend.rs and the gate
 // diffs them against the committed c_decl_coverage_sync.txt, so a
 // dropped arm or loosened guard fails loudly — see v19):
@@ -82,9 +82,9 @@
 //     sides of every theorem (they cancel).
 //
 // FIXES THIS MODEL'S AUDIT PRODUCED IN SOURCE (2026-10-28, verified by
-// the probe battery + C gate, recorded in C_UB_PROOF.md v11b; that
+// the probe battery + C gate, recorded in the C UB proof notes v11b; that
 // working tree was later lost and RE-LANDED from this file in 2026-10-
-// 29 — C_UB_PROOF.md v18, which also adds the `:=`-default `_sh_xstrdup`
+// 29 — the C UB proof notes v18, which also adds the `:=`-default `_sh_xstrdup`
 // render fix the probe battery forced):
 //   (0) Try arms in BOTH decl censuses (the veto already walked Try;
 //       the C backend renders Try via setjmp/longjmp — a write there
@@ -109,7 +109,7 @@
 //     them for shell input (measured: shell input lowers to
 //     Call/Str/Interp/Array/BinOp/Var/Arith/Arrow); a frontend that
 //     emits one carries the obligation in its own node spec
-//     (harness/node-spec-check). Excluded from the AST entirely
+//     (<workspace>/harness/node-spec-check). Excluded from the AST entirely
 //     rather than asserted about.
 //   - nested `ArithAst::Assign` under Bin/Un/Cond: representable in
 //     the type but not produced by any frontend — the shell parser

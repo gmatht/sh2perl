@@ -1,5 +1,5 @@
 // GENERATED from sh2perl/src/transforms/i32_provable.rs @ 172be07162a2
-// DO NOT EDIT — run harness/verus-sync.sh
+// DO NOT EDIT — run <workspace>/harness/verus-sync.sh
 // Region: the two abs-bound consts (hoisted), fn arith_abs_bound,
 // fn arith_is_i32 — the LIVE estimator (target retargeted 2026-11-08).
 // Rewrites: match-on-&str -> if-chains; (pred).then_some(e) -> explicit if.

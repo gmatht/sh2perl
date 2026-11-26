@@ -48,7 +48,7 @@
 //     definition is not consulted at all). The model's premises —
 //     "defined", "the definition at that index is pure", "exactly one
 //     definition" — are that contract made explicit.
-//     UPDATED 2026-11-20 (BUGS_FOUND.md #11a): the premise is no longer
+//     UPDATED 2026-11-20 (the backend bug log #11a): the premise is no longer
 //     an assumption only. The shipped transform now COUNTS definitions
 //     and drops every multiply-defined name from the lookup table, so
 //     "exactly one definition" is enforced by the code; the source test
@@ -57,7 +57,7 @@
 //     covers the accepted side. What the proofs found was that the
 //     header promised this refusal while `find()` silently took the first
 //     definition; the C renderer's duplicate-`static void` arm is still
-//     open and is tracked separately in BUGS_FOUND.md.
+//     open and is tracked separately in the backend bug log.
 //   - Traversal: the real `transform_stmt`/`transform_expr` recurse
 //     through If/While/loops/Block/Subshell/Background/Redirect/
 //     Function bodies and bottom-up through BinOp/Call/Index/Ternary/
@@ -316,7 +316,7 @@ proof fn call_sound(defs: Seq<Def>, e: Expr)
 // ---- Negative controls: the two premises, dropped one at a time, make
 // the rewrite UNSOUND. Each mutant below states the same value identity
 // for a program the model refuses, and is expected to FAIL (recorded in
-// VERUS.md §(b).3 with its exact red count). ----
+// the proof-campaign plan §(b).3 with its exact red count). ----
 
 // M1 — drop the purity premise. An IMPURE body — one whose observable
 // effect is not its output (`OtherStmt`: a write, an exec) — is one the
@@ -352,7 +352,7 @@ proof fn mutant_drop_redefinition_guard() {
 }
 
 // ---- Fidelity pins (mirror direct_calls.rs; the source is suites-less
-// on 2026-10-29 — see VERUS.md §(b).4, UNMIRRORED-by-design until a unit
+// on 2026-10-29 — see the proof-campaign plan §(b).4, UNMIRRORED-by-design until a unit
 // suite lands) ----
 
 pub open spec fn sq_pure() -> Seq<Def> {

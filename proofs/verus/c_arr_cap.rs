@@ -3,7 +3,7 @@
 // `array_cap()` → the decl sites at the `array_decls` loop → the reset
 // emitter `emit_set_array` and its `"$@"` spread guard).
 //
-// THE CLAIM (C_UB_PROOF.md §2b, "array_caps is the unproven bound"):
+// THE CLAIM (the C UB proof notes §2b, "array_caps is the unproven bound"):
 // every array the renderer emits as a FIXED table is declared large enough
 // for the elements the renderer itself writes into it, and an array whose
 // literal bulk reaches `ARR_CAP` (1024) is never emitted as a fixed table at

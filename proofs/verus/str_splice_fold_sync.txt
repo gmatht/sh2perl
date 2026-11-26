@@ -10,7 +10,7 @@ pin pin_prefix_zero -> test refuses_prefix_not_starting_at_zero: MAPPED
 pin pin_reaches_functions -> test reaches_function_bodies: MAPPED
 pin pin_splice_folds -> test folds_the_mimecroft_splice_shape: MAPPED
 pin pin_suffix_open -> test refuses_bounded_suffix: MAPPED
-pin pin_value_identity -> UNMIRRORED (by design — see VERUS.md §(b).4)
+pin pin_value_identity -> UNMIRRORED (by design — see the proof-campaign plan §(b).4)
 
 [guards]
 guard fold fn: PRESENT

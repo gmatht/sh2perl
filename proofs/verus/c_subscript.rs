@@ -3,7 +3,7 @@
 // `Assign{ targets: [{ var: "n[$((i*2))]" }] }`, with `indices` EMPTY).
 //
 // One text, three consumers, and they disagreed in BOTH directions
-// (all measured against bash 2026-11-04, `harness/ifs-probe.sh` 59x):
+// (all measured against bash 2026-11-04, `<workspace>/harness/ifs-probe.sh` 59x):
 //
 //   * the DECLARATION census (`collect_assoc_names`, drives
 //     `long long n[]` vs `n_k/n_v/n_n`) called `i*2` a STRING KEY, so an

@@ -35,7 +35,7 @@
 // - A1: the node renderer reproduces GNU `wc`/`head`/`tail`/`uniq`/`cut` for
 //   the accepted flag subset, `cat`'s read-error text, and the PRODUCER BYTES
 //   (`echo`'s one-space join, its newline, its four decodes; `printf`'s
-//   format; `seq`'s decimal range). `harness/anchor-text-filter-lift.sh`
+//   format; `seq`'s decimal range). `<workspace>/harness/anchor-text-filter-lift.sh`
 //   executes bash vs the generated Rust for every accepted shape.
 // - The exact `format!` spelling of the op string: the model keeps the typed
 //   op list, the anchor checks the emitted text.

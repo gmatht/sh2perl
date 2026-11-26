@@ -257,7 +257,7 @@ proof fn lemma_plain_loop(files: Seq<File>, c: nat)
 }
 
 // ---- Load-bearing guards: each refusal is a shape the lift must not
-// take (the mutant targets, recorded in VERUS.md §(b).3) ----
+// take (the mutant targets, recorded in the proof-campaign plan §(b).3) ----
 
 // A DYNAMIC operand (`cat "$f"`): the ForEachLine source must be a static
 // path; the real `_ => return None` arm refuses.

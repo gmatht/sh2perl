@@ -23,13 +23,13 @@
 //     store line, so the overflowing store never commits and the replay
 //     discards the partial fast state from the loop-entry snapshots.
 //
-// WHY THIS EXISTS. C_UB_PROOF.md §2a names this as the first
+// WHY THIS EXISTS. the C UB proof notes §2a names this as the first
 // render-discipline obligation to mechanize, verbatim: "the theorem is
 // 'the ov flag is set exactly when the exact result leaves long long',
 // i.e. the tier's escape hatch to GMP is only taken when needed *and*
 // always taken when needed". The backend relies on it in informal
 // comments and in no proof. An underestimated width is the one failure
-// C_UB_PROOF.md §1 marks as SILENT (no guard, no exit code); this tier
+// the C UB proof notes §1 marks as SILENT (no guard, no exit code); this tier
 // is the guarded counterpart, and the guard is the `ov` flag.
 //
 // WHAT IS PROVED (all unconditional — the model's leaves are the
@@ -75,7 +75,7 @@
 // assumed exact — that is GMP's contract, not the renderer's); the
 // operand renderers (a leaf's C read is its shadow VALUE, supplied by
 // the store); width NARROWING upstream (var_types/arith_range_local
-// choosing int32_t mirrors — C_UB_PROOF.md's separate "proving
+// choosing int32_t mirrors — the C UB proof notes's separate "proving
 // passes" layer); ArithAst::Cast, which both spec_rhs_ok and
 // tiered_i64_expr traverse transparently (the model's trees are
 // post-Cast); `/` `%` by DYNAMIC divisors, which the tier refuses

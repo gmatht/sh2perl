@@ -2,12 +2,12 @@
 # source sha: process_subst=1d2113f934ce  proof sha: eac1e96b12f0
 
 [pins]
-pin pin_call_no_residue_on_success -> UNMIRRORED (by design — see VERUS.md §(b).4)
+pin pin_call_no_residue_on_success -> UNMIRRORED (by design — see the proof-campaign plan §(b).4)
 pin pin_call_preserves_output -> test capture_context_is_materialized: MAPPED
-pin pin_call_preserves_output_on_failure -> UNMIRRORED (by design — see VERUS.md §(b).4)
-pin pin_call_residue_on_failure -> UNMIRRORED (by design — see VERUS.md §(b).4)
+pin pin_call_preserves_output_on_failure -> UNMIRRORED (by design — see the proof-campaign plan §(b).4)
+pin pin_call_residue_on_failure -> UNMIRRORED (by design — see the proof-campaign plan §(b).4)
 pin pin_seq_no_residue -> test process_in_materializes_to_temp_file: MAPPED
-pin pin_seq_preserves_other -> UNMIRRORED (by design — see VERUS.md §(b).4)
+pin pin_seq_preserves_other -> UNMIRRORED (by design — see the proof-campaign plan §(b).4)
 pin pin_seq_preserves_output -> test process_in_materializes_to_temp_file: MAPPED
 
 [guards]

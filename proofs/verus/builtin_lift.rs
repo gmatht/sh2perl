@@ -2,7 +2,7 @@
 // (sh2perl/src/transforms/builtin-lift.rs).
 //
 // The pass rewrites `exec("cmd", args)` to `builtin("cmd", args)` for every
-// command in the shared namespace contract (`harness/builtins.json`), so the
+// command in the shared namespace contract (`<workspace>/harness/builtins.json`), so the
 // native-vs-spawn decision moves from each renderer into the A1. Two things
 // can go wrong, and they are different obligations:
 //
@@ -33,7 +33,7 @@
 //   recursion structurally.
 // - The runtime counterpart is an ASSUMPTION, stated: the native op for a
 //   table name must match the external binary's observable behaviour. The
-//   corpus gates and the contract check (`node harness/estree-contract.mjs`)
+//   corpus gates and the contract check (`node <workspace>/harness/estree-contract.mjs`)
 //   are what discharge it outside Verus.
 //
 // Verus 0.2026.10.18.7d82994, rust 1.99.1:

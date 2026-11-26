@@ -2,12 +2,12 @@
 # source sha: ternary_desugar=e60db32621f3  proof sha: f29f77d029a0
 
 [pins]
-pin pin_arithstr_becomes_arith -> UNMIRRORED (by design — see VERUS.md §(b).4)
-pin pin_branch_preserved -> UNMIRRORED (by design — see VERUS.md §(b).4)
-pin pin_calls_pass_through -> UNMIRRORED (by design — see VERUS.md §(b).4)
-pin pin_other_refuses -> UNMIRRORED (by design — see VERUS.md §(b).4)
-pin pin_testarith_normalizes -> UNMIRRORED (by design — see VERUS.md §(b).4)
-pin pin_teststr_becomes_test -> UNMIRRORED (by design — see VERUS.md §(b).4)
+pin pin_arithstr_becomes_arith -> UNMIRRORED (by design — see the proof-campaign plan §(b).4)
+pin pin_branch_preserved -> UNMIRRORED (by design — see the proof-campaign plan §(b).4)
+pin pin_calls_pass_through -> UNMIRRORED (by design — see the proof-campaign plan §(b).4)
+pin pin_other_refuses -> UNMIRRORED (by design — see the proof-campaign plan §(b).4)
+pin pin_testarith_normalizes -> UNMIRRORED (by design — see the proof-campaign plan §(b).4)
+pin pin_teststr_becomes_test -> UNMIRRORED (by design — see the proof-campaign plan §(b).4)
 
 [guards]
 guard ternary-desugar ternary match: PRESENT

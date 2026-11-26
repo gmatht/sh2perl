@@ -56,7 +56,7 @@
 //   - The emitted targets are not modelled: the obligation is that the
 //     rewrite preserves the shell run, not that a renderer's `break`
 //     arm emits the right bytes (renderer obligations live in
-//     C_UB_PROOF.md and the per-backend models).
+//     the C UB proof notes and the per-backend models).
 //   - `ran` distinguishes "this run emitted/decided something" from an
 //     empty tail, so a list's final status is its last real step's.
 //

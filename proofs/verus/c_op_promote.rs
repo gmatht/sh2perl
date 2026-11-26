@@ -42,7 +42,7 @@
 // `unsigned_red_sound`; this file proves the PREMISE side (the gate
 // admits exactly the shapes the soundness needs).
 //
-// WHY THIS EXISTS. C_UB_PROOF.md §2a lists "the operator/promotion
+// WHY THIS EXISTS. the C UB proof notes §2a lists "the operator/promotion
 // rules" as the last unmechanized render-layer obligation. Each rule
 // is a silent-wrong-value shape (a folded `/` aborts at compile time
 // instead of runtime; a missing LL truncates a product; an unsigned

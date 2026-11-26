@@ -53,7 +53,7 @@
 // off-by-one in the b/e clamp reads past the NUL (UB); a wrong sign
 // convention silently returns the wrong substring (no sanitizer
 // catches a wrong value); a glob-strip mismatch silently keeps or
-// drops characters. `C_UB_PROOF.md` §2b names the write sites; these
+// drops characters. the C UB proof notes §2b names the write sites; these
 // are the compute sites feeding them.
 //
 // WHAT IS PROVED (indices are hypotheses where the analysis feeds
@@ -503,7 +503,7 @@ pub open spec fn argv_out(argv: Seq<Str>, off: int, len: int, sep: Option<char>)
 }
 
 // ── the SLICE face's joiner (MEASURED 2026-11-04) ────────────────────
-// `harness/ifs-probe.sh` cases 32-38, real bash, `set -- p q r s`:
+// `<workspace>/harness/ifs-probe.sh` cases 32-38, real bash, `set -- p q r s`:
 //   IFS=:   ${*:2:2}=`q:r`  ${@:2:2}=`q:r`
 //   IFS=""  ${*:2:2}=`qr`   ${@:2:2}=`q r`
 //   default ${*:2:2}=`q r`  ${@:2:2}=`q r`
@@ -1264,7 +1264,7 @@ proof fn pin_replace_aa_step1()
 // `set -- p q r s` is argv = [$0, p, q, r, s] in the model, so bash's
 // `${*:2:2}` = `q r` is argv indices 2..4 — the same b/e the emitted
 // helper computes. Every value below was measured with real bash
-// (`harness/ifs-probe.sh` cases 32-38).
+// (`<workspace>/harness/ifs-probe.sh` cases 32-38).
 pub open spec fn pos5() -> Seq<Str> {
     seq![seq!['b', 'a', 's', 'h'], seq!['p'], seq!['q'], seq!['r'], seq!['s']]
 }
@@ -1376,10 +1376,10 @@ proof fn f14_empty_value_is_zero_fields()
 // f15: …and the rendering the C `for` lowering produces for an EMPTY
 // UNQUOTED word — a ONE-element list holding the empty string — is
 // observably different from that field list. This is the divergence
-// `harness/ifs-probe.sh` case 52 pins as an xfail; the fix needs the shIR
+// `<workspace>/harness/ifs-probe.sh` case 52 pins as an xfail; the fix needs the shIR
 // to carry the word's ORIGIN (a `StrStyle::Unquoted` on the folded
 // `Str("")`), which is a core change and is filed as
-// `core-requests/c-20261104-unquoted-empty-word.md`. `ifs_fields` here is
+// the core-requests item c-20261104-unquoted-empty-word. `ifs_fields` here is
 // the contract the renderer must meet, not an implementation of it.
 proof fn f15_empty_unquoted_word_is_not_a_field()
     ensures seq![Seq::<char>::empty()] != ifs_fields(Seq::empty(), ifs_startup()),
@@ -1809,7 +1809,7 @@ proof fn fields_saturated(s: Str, ifs: Str, i: int, k: int)
     }
 }
 
-// ── the measured pins (harness/ifs-probe.sh 41-50) ───────────────────
+// ── the measured pins (<workspace>/harness/ifs-probe.sh 41-50) ───────────────────
 pub open spec fn ifs_sp_colon() -> Str { seq![' ', ':'] }
 pub open spec fn ifs_sp_comma() -> Str { seq![' ', ','] }
 pub open spec fn ifs_startup() -> Str { seq![' ', '\t', '\n'] }

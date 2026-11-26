@@ -4,13 +4,13 @@
 [pins]
 pin pin_capture_edge -> test capture_is_a_call_edge: MAPPED
 pin pin_chain_singletons -> test acyclic_chain_is_singletons: MAPPED
-pin pin_condensation_acyclic -> UNMIRRORED (by design — see VERUS.md §(b).4)
+pin pin_condensation_acyclic -> UNMIRRORED (by design — see the proof-campaign plan §(b).4)
 pin pin_leaf_singleton -> test self_recursion_is_scc_of_one: MAPPED
 pin pin_matcher_triple -> test matcher_cycle_is_one_scc: MAPPED
 pin pin_mutual_pair -> test mutual_recursion_is_one_scc: MAPPED
 pin pin_parser_cluster -> test test_parser_cluster_is_one_scc: MAPPED
 pin pin_self_loop -> test self_recursion_is_scc_of_one: MAPPED
-pin pin_singleton_leaf -> UNMIRRORED (by design — see VERUS.md §(b).4)
+pin pin_singleton_leaf -> UNMIRRORED (by design — see the proof-campaign plan §(b).4)
 
 [guards]
 guard call-graph builder: PRESENT

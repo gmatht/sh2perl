@@ -1,16 +1,16 @@
 # verus-sync-coverage manifest: c_decl_coverage
-# source sha: c_backend-walkers=840274f9b61b  proof sha: b7aab46b8f06
+# source sha: c_backend-walkers=840274f9b61b  proof sha: 70d63fefe961
 
 [pins]
-pin pin_array_elem -> UNMIRRORED (by design — see VERUS.md §(b).4)
+pin pin_array_elem -> UNMIRRORED (by design — see the proof-campaign plan §(b).4)
 pin pin_assign_chain -> test expr_position_assign_routes_to_the_variable: MAPPED
-pin pin_elsif_cond -> UNMIRRORED (by design — see VERUS.md §(b).4)
-pin pin_printf_nested -> UNMIRRORED (by design — see VERUS.md §(b).4)
-pin pin_raw_nested -> UNMIRRORED (by design — see VERUS.md §(b).4)
-pin pin_return_fn3 -> UNMIRRORED (by design — see VERUS.md §(b).4)
-pin pin_select_ch -> UNMIRRORED (by design — see VERUS.md §(b).4)
-pin pin_t04_param -> UNMIRRORED (by design — see VERUS.md §(b).4)
-pin pin_while_cond -> UNMIRRORED (by design — see VERUS.md §(b).4)
+pin pin_elsif_cond -> UNMIRRORED (by design — see the proof-campaign plan §(b).4)
+pin pin_printf_nested -> UNMIRRORED (by design — see the proof-campaign plan §(b).4)
+pin pin_raw_nested -> UNMIRRORED (by design — see the proof-campaign plan §(b).4)
+pin pin_return_fn3 -> UNMIRRORED (by design — see the proof-campaign plan §(b).4)
+pin pin_select_ch -> UNMIRRORED (by design — see the proof-campaign plan §(b).4)
+pin pin_t04_param -> UNMIRRORED (by design — see the proof-campaign plan §(b).4)
+pin pin_while_cond -> UNMIRRORED (by design — see the proof-campaign plan §(b).4)
 
 [guards]
 fn collect_vars_full

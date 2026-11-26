@@ -3,9 +3,9 @@
 
 [pins]
 pin pin_break_kept -> test forinit_lowers_to_while_with_step_and_continue_splice: MAPPED
-pin pin_continue_verdict -> UNMIRRORED (by design — see VERUS.md §(b).4)
-pin pin_if_arm_continue_spliced -> UNMIRRORED (by design — see VERUS.md §(b).4)
-pin pin_nested_opaque -> UNMIRRORED (by design — see VERUS.md §(b).4)
+pin pin_continue_verdict -> UNMIRRORED (by design — see the proof-campaign plan §(b).4)
+pin pin_if_arm_continue_spliced -> UNMIRRORED (by design — see the proof-campaign plan §(b).4)
+pin pin_nested_opaque -> UNMIRRORED (by design — see the proof-campaign plan §(b).4)
 pin pin_normal_path_runs_step -> test forinit_lowers_to_while_with_step_and_continue_splice: MAPPED
 pin pin_top_continue_spliced -> test forinit_lowers_to_while_with_step_and_continue_splice: MAPPED
 

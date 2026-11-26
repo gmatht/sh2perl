@@ -1,4 +1,4 @@
-// RETIRED (see VERUS.md §(d) P0(iv)): the modelled `arith_bounds` never
+// RETIRED (see the proof-campaign plan §(d) P0(iv)): the modelled `arith_bounds` never
 // landed — the live estimator is `arith_abs_bound`, proved in Isabelle
 // (`I32Provable.thy`). Kept as a superseded-design record; the gate
 // verifies it as a RETIRED entry (see RETIRED_MODELS), counted outside

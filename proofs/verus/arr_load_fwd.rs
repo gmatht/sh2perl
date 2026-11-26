@@ -1,4 +1,4 @@
-// RETIRED (see VERUS.md §(d) P0(vi)): the modelled transform never became a
+// RETIRED (see the proof-campaign plan §(d) P0(vi)): the modelled transform never became a
 // module of the crate, and `src/transforms/arr_load_fwd.rs` was deleted on
 // 2026-11-09 because it cannot compile against the current API — it imports
 // `super::READ_ONLY_CALLS` and `string_accumulator::{callee_write_sets, Cw}`,

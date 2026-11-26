@@ -1,9 +1,9 @@
 # verus-sync-coverage manifest: maskable
-# source sha: maskable=c6d2c8d22cc1  proof sha: 35597a0f1255
+# source sha: maskable=c6d2c8d22cc1  proof sha: 5e23868281a2
 
 [pins]
 pin pin_bare_inf -> test bare_is_inf: MAPPED
-pin pin_bound_sound -> UNMIRRORED (by design — see VERUS.md §(b).4)
+pin pin_bound_sound -> UNMIRRORED (by design — see the proof-campaign plan §(b).4)
 pin pin_const_folds -> test const_dividends: MAPPED
 pin pin_linear_math -> test linear_threshold_math: MAPPED
 pin pin_pow2_table -> test pow2_lit: MAPPED

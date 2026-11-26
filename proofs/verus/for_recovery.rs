@@ -66,7 +66,7 @@
 //   trace a consumer must reproduce. What each printer emits is not in this
 //   model.
 // - whether the pass FIRES on shell input at all: the audit's own note
-//   (VERUS.md) records that the parser hands the lowered comparison
+//   (the proof-campaign plan) records that the parser hands the lowered comparison
 //   operands wrapped in `Arith`, so `loop_cond`'s `Var/Int` match never
 //   sees them and the transform is dormant on the corpus. That is a
 //   reachability fact about the front end, measured there, not a law this

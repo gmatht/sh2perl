@@ -10,7 +10,7 @@ pin pin_hash_isolates -> test hash_isolates: MAPPED
 pin pin_multi_use_blocks -> test multi_use_temp_blocks: MAPPED
 pin pin_nonacc_tail_blocks -> test nonacc_tail_blocks: MAPPED
 pin pin_status_blocks -> test status_temp_blocks: MAPPED
-pin pin_subst_agrees -> UNMIRRORED (by design — see VERUS.md §(b).4)
+pin pin_subst_agrees -> UNMIRRORED (by design — see the proof-campaign plan §(b).4)
 
 [guards]
 guard body isolation: PRESENT

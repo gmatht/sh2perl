@@ -1,6 +1,6 @@
 // Standalone model of the C backend's GROWTH-HELPER FAMILY — the
 // emitted runtime's dynamic-buffer protocol that two gated models
-// listed as an ASSUMPTION ("vbuf growth assumed"): C_UB_PROOF.md §20
+// listed as an ASSUMPTION ("vbuf growth assumed"): the C UB proof notes §20
 // (c_str_helpers) and §21 (c_capture_wrap) both discharge their
 // capacity claims to it. Every helper below is transcribed in shape
 // from sh2perl/src/c_backend.rs:
@@ -99,7 +99,7 @@
 // NUL lands one past the allocation); M2 `grow_str_mut` deletes the
 // zero-fill; M3 `mutant_reserve_unguarded` drops the guard
 // (2^61 × 8 wraps to 0). Source-level tie: the C gate and
-// `harness/c_gate_ubsan.sh` — the family is what those sanitizer
+// `<workspace>/harness/c_gate_ubsan.sh` — the family is what those sanitizer
 // sweeps run under.
 use vstd::prelude::*;
 

@@ -38,9 +38,9 @@
 //     const_var_analysis_populates_verdicts (ConstVar only). No
 //     footprint test exists to map to, so the living tie is the
 //     guarded consumer/table below (same adjudication as
-//     escape_classes/f32_narrow, VERUS.md P12 — analysis-only
+//     escape_classes/f32_narrow, the proof-campaign plan P12 — analysis-only
 //     source, no unit suite).
-//   - Guards (verus-sync-coverage.sh `analysis` arms):
+//   - Guards (`analysis` arms):
 //       needs_runtime entry -> guard walk entry
 //       stmt_needs/expr_needs/arith_needs walkers -> guard walkers
 //       pure-call table ("builtin"|"exec"|"test"|…) -> guard pure table

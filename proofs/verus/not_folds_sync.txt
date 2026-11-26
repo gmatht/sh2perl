@@ -8,7 +8,7 @@ pin pin_flip_lt_to_ge -> test flips_ordering_comparisons: MAPPED
 pin pin_flip_ne_to_eq -> test flips_negated_comparison: MAPPED
 pin pin_fold_invisible_at_runtime -> test folds_double_not: MAPPED
 pin pin_inconsistent_inner_refuses -> test unbalanced_inner_not_is_refused: MAPPED
-pin pin_inconsistent_outer_refuses -> UNMIRRORED (by design — see VERUS.md §(b).4)
+pin pin_inconsistent_outer_refuses -> UNMIRRORED (by design — see the proof-campaign plan §(b).4)
 pin pin_single_not_untouched -> test single_not_is_untouched: MAPPED
 
 [guards]

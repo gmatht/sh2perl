@@ -4,7 +4,7 @@
 [pins]
 pin pin_arrow_body_folds -> test arrow_body_exec_folds_to_the_call_form: MAPPED
 pin pin_capture_kept -> test payload_bearing_exec_refuses: MAPPED
-pin pin_fold_invisible_at_runtime -> UNMIRRORED (by design — see VERUS.md §(b).4)
+pin pin_fold_invisible_at_runtime -> UNMIRRORED (by design — see the proof-campaign plan §(b).4)
 pin pin_ps_tmp_cleanup_kept -> test ps_tmp_cleanup_keeps_its_carrier: MAPPED
 pin pin_statement_position_kept -> test statement_position_exec_is_left_alone: MAPPED
 

@@ -2,13 +2,13 @@
 # source sha: escape_classes=b1298e8ba779  proof sha: 95fdc0ba09c7
 
 [pins]
-pin pin_acc_ok_matches_consumer -> UNMIRRORED (by design — see VERUS.md §(b).4)
-pin pin_dynamic_key_store -> UNMIRRORED (by design — see VERUS.md §(b).4)
-pin pin_dynamic_key_store_array -> UNMIRRORED (by design — see VERUS.md §(b).4)
-pin pin_local_accepted_without_store_ok -> UNMIRRORED (by design — see VERUS.md §(b).4)
-pin pin_native_array -> UNMIRRORED (by design — see VERUS.md §(b).4)
-pin pin_plain_scalar_local -> UNMIRRORED (by design — see VERUS.md §(b).4)
-pin pin_two_scopes_store -> UNMIRRORED (by design — see VERUS.md §(b).4)
+pin pin_acc_ok_matches_consumer -> UNMIRRORED (by design — see the proof-campaign plan §(b).4)
+pin pin_dynamic_key_store -> UNMIRRORED (by design — see the proof-campaign plan §(b).4)
+pin pin_dynamic_key_store_array -> UNMIRRORED (by design — see the proof-campaign plan §(b).4)
+pin pin_local_accepted_without_store_ok -> UNMIRRORED (by design — see the proof-campaign plan §(b).4)
+pin pin_native_array -> UNMIRRORED (by design — see the proof-campaign plan §(b).4)
+pin pin_plain_scalar_local -> UNMIRRORED (by design — see the proof-campaign plan §(b).4)
+pin pin_two_scopes_store -> UNMIRRORED (by design — see the proof-campaign plan §(b).4)
 
 [guards]
 guard multi-scope criterion: PRESENT

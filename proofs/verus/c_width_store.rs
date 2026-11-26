@@ -20,7 +20,7 @@
 //     side-effect roots (`Assign`, `IncDec`): comparisons only read
 //     (C promotes; cannot wrap) and a written var's RANGE governs.
 //
-// WHY THIS EXISTS. C_UB_PROOF.md §1 marks the width failure SILENT (no
+// WHY THIS EXISTS. the C UB proof notes §1 marks the width failure SILENT (no
 // guard, no exit code): an underestimated range produces `uint8_t`
 // arithmetic that wraps where `long long` would not. §7 measured the
 // live shape: 10 gcc `-Wconversion` truncating stores in 9 corpus files
@@ -343,7 +343,7 @@ proof fn narrow_sound(lo: int, hi: int, v: int)
 
 // The ordering pin: (0,100) fits I8's interval too, but the chain names
 // U8 — this first-match is why the corpus has no signed narrow sites
-// for UBSan to fire on (C_UB_PROOF.md §7).
+// for UBSan to fire on (the C UB proof notes §7).
 proof fn narrow_u8_first()
     ensures narrow(0int, 100int) == Width::U8
 {
@@ -495,7 +495,7 @@ proof fn store_safe_conditional(
 }
 
 // The TRUNC direction: outside the declared interval is not admitted —
-// the property the 10 gcc-visible stores violate (C_UB_PROOF.md §7).
+// the property the 10 gcc-visible stores violate (the C UB proof notes §7).
 proof fn outside_not_admitted_u8(v: int)
     requires v < 0int || 255int < v
     ensures !fits(v, Width::U8)
@@ -510,7 +510,7 @@ proof fn outside_not_admitted_i8(v: int)
 
 // No proof, no narrowing: an unknown (None) contributor widens the
 // fold toward I64 — the arm the `for i in …` table-element stores
-// SHOULD have taken (C_UB_PROOF.md §7 shape 1).
+// SHOULD have taken (the C UB proof notes §7 shape 1).
 proof fn unknown_forces_i64(acc: Width)
     ensures widen(acc, contrib_width(Option::None)) == Width::I64 || rank(widen(acc, contrib_width(Option::None))) >= rank(acc)
 {

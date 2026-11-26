@@ -47,7 +47,7 @@
 //     body_inside_if_goto_loop carries NO pin: the test is
 //     print-only (no asserts), so there is nothing to mirror —
 //     recorded, not silently skipped.
-//   - Guards (verus-sync-coverage.sh `restructure` arms):
+//   - Guards (`restructure` arms):
 //       handle_bare_goto / handle_guarded_goto / handle_nested /
 //       forward_skip_site / fresh_flag / convert_successor_exits /
 //       program_has_goto.

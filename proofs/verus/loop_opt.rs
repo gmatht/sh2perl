@@ -19,7 +19,7 @@
 // The proof inherits the twin's REAL SOUNDNESS HOLE: at n = 0 the
 // prologue runs while the original runs nothing (loop_opt's pass()
 // splices the group before the loop with no trip-count guard — the
-// same unconditional-splice shape as BUGS_FOUND.md 7, in different
+// same unconditional-splice shape as the backend bug log 7, in different
 // code). The theorem covers exactly the sound fragment (n >= 1);
 // the 0-trip divergence is pinned as pin_zero_trip_diverges.
 //

@@ -57,7 +57,7 @@
 //       decl_guard_sees_both_shapes -> pin_export_guards
 //     The three fold_arith_literals_* tests carry no pin (mechanics
 //     proved in arith_folds.rs — recorded, not silently skipped).
-//   - Guards (verus-sync-coverage.sh `optimize` arms):
+//   - Guards (`optimize` arms):
 //       census entries (expr_reads/stmts_read/stmt_reads),
 //       baked-index arm (index_name_refs), star-join IFS rule,
 //       bare-arith-ident scan, decl-guard entries, drop gate,

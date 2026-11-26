@@ -43,7 +43,7 @@
 //! ## What is NOT modelled
 //!
 //! - the C lexer/parser (the missing `;` after `strcpy` was a *syntax* bug, and
-//!   it is recorded in the source comment and in C_UB_PROOF.md §24, not proved
+//!   it is recorded in the source comment and in the C UB proof notes §24, not proved
 //!   here);
 //! - pointers. The narrow-storage divergence (`uint8_t x` receiving a `char*`)
 //!   is a MEASUREMENT (`176 != 9`), stated as `narrow_witness_is_not_the_value`
@@ -234,7 +234,7 @@ pub proof fn int_store_faithful_iff_canonical(text: Str)
 /// The measured narrow case (`x=5; let x=x+1; printf -v x '%d' 9` printed 176
 /// where bash prints 9): a width-narrowed int received the POINTER's low bits,
 /// not `atoll("9")`. Not derivable here (no address space in the model) — this
-/// pins the numbers so the claim in C_UB_PROOF.md §24 is checkable.
+/// pins the numbers so the claim in the C UB proof notes §24 is checkable.
 pub proof fn narrow_witness_is_not_the_value()
     ensures
         176int != atoll(seq!['9']),

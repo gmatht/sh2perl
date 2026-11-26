@@ -2,13 +2,13 @@
 # source sha: f32_narrow=9fd0af2daa0d  proof sha: 16c04355d630
 
 [pins]
-pin pin_general_mul_not_form -> UNMIRRORED (by design — see VERUS.md §(b).4)
-pin pin_int_operand_uses_roundtrip -> UNMIRRORED (by design — see VERUS.md §(b).4)
-pin pin_lit_pair_contract -> UNMIRRORED (by design — see VERUS.md §(b).4)
-pin pin_mod_refused -> UNMIRRORED (by design — see VERUS.md §(b).4)
-pin pin_mul_one_form -> UNMIRRORED (by design — see VERUS.md §(b).4)
-pin pin_unknown_not_exact -> UNMIRRORED (by design — see VERUS.md §(b).4)
-pin pin_var_lattice -> UNMIRRORED (by design — see VERUS.md §(b).4)
+pin pin_general_mul_not_form -> UNMIRRORED (by design — see the proof-campaign plan §(b).4)
+pin pin_int_operand_uses_roundtrip -> UNMIRRORED (by design — see the proof-campaign plan §(b).4)
+pin pin_lit_pair_contract -> UNMIRRORED (by design — see the proof-campaign plan §(b).4)
+pin pin_mod_refused -> UNMIRRORED (by design — see the proof-campaign plan §(b).4)
+pin pin_mul_one_form -> UNMIRRORED (by design — see the proof-campaign plan §(b).4)
+pin pin_unknown_not_exact -> UNMIRRORED (by design — see the proof-campaign plan §(b).4)
+pin pin_var_lattice -> UNMIRRORED (by design — see the proof-campaign plan §(b).4)
 
 [guards]
 guard f32_exact round-trip: PRESENT

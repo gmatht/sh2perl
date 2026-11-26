@@ -2,10 +2,10 @@
 # source sha: test_simplification=8642e5de32ff  proof sha: 187af7ad6f3e
 
 [pins]
-pin pin_false_ops -> UNMIRRORED (by design — see VERUS.md §(b).4)
-pin pin_lt_false_at_runtime -> UNMIRRORED (by design — see VERUS.md §(b).4)
-pin pin_streq_true_at_runtime -> UNMIRRORED (by design — see VERUS.md §(b).4)
-pin pin_true_ops -> UNMIRRORED (by design — see VERUS.md §(b).4)
+pin pin_false_ops -> UNMIRRORED (by design — see the proof-campaign plan §(b).4)
+pin pin_lt_false_at_runtime -> UNMIRRORED (by design — see the proof-campaign plan §(b).4)
+pin pin_streq_true_at_runtime -> UNMIRRORED (by design — see the proof-campaign plan §(b).4)
+pin pin_true_ops -> UNMIRRORED (by design — see the proof-campaign plan §(b).4)
 
 [guards]
 guard test-simplification op class: PRESENT

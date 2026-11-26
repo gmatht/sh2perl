@@ -9,8 +9,8 @@ pin pin_no_escape_exec -> test exec_args_are_uses_not_escapes: MAPPED
 pin pin_retained_needs_escape -> test return_escapes: MAPPED
 pin pin_single_access_degenerate -> test live_span_covers_def_to_use: MAPPED
 pin pin_span_covers_all -> test live_span_covers_def_to_use: MAPPED
-pin pin_span_ordering -> UNMIRRORED (by design — see VERUS.md §(b).4)
-pin pin_spurious_escape_ok -> UNMIRRORED (by design — see VERUS.md §(b).4)
+pin pin_span_ordering -> UNMIRRORED (by design — see the proof-campaign plan §(b).4)
+pin pin_spurious_escape_ok -> UNMIRRORED (by design — see the proof-campaign plan §(b).4)
 pin pin_use_needs_liveness -> test live_span_covers_def_to_use: MAPPED
 
 [guards]

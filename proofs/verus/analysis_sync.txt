@@ -1,15 +1,15 @@
 # verus-sync-coverage manifest: analysis
-# source sha: analysis=22a7b4a6d9b8  proof sha: d40b224375c3
+# source sha: analysis=22a7b4a6d9b8  proof sha: 82b2ede271c5
 
 [pins]
-pin pin_capture_marks -> UNMIRRORED (by design — see VERUS.md §(b).4)
-pin pin_false_is_all_pure -> UNMIRRORED (by design — see VERUS.md §(b).4)
-pin pin_impure_call_marks -> UNMIRRORED (by design — see VERUS.md §(b).4)
-pin pin_pipeline_marks -> UNMIRRORED (by design — see VERUS.md §(b).4)
-pin pin_pure_calls_free -> UNMIRRORED (by design — see VERUS.md §(b).4)
-pin pin_pure_program_free -> UNMIRRORED (by design — see VERUS.md §(b).4)
-pin pin_redirect_marks -> UNMIRRORED (by design — see VERUS.md §(b).4)
-pin pin_true_claims_nothing -> UNMIRRORED (by design — see VERUS.md §(b).4)
+pin pin_capture_marks -> UNMIRRORED (by design — see the proof-campaign plan §(b).4)
+pin pin_false_is_all_pure -> UNMIRRORED (by design — see the proof-campaign plan §(b).4)
+pin pin_impure_call_marks -> UNMIRRORED (by design — see the proof-campaign plan §(b).4)
+pin pin_pipeline_marks -> UNMIRRORED (by design — see the proof-campaign plan §(b).4)
+pin pin_pure_calls_free -> UNMIRRORED (by design — see the proof-campaign plan §(b).4)
+pin pin_pure_program_free -> UNMIRRORED (by design — see the proof-campaign plan §(b).4)
+pin pin_redirect_marks -> UNMIRRORED (by design — see the proof-campaign plan §(b).4)
+pin pin_true_claims_nothing -> UNMIRRORED (by design — see the proof-campaign plan §(b).4)
 
 [guards]
 guard walk entry: PRESENT

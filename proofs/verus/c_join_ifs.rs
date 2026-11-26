@@ -13,7 +13,7 @@
 // star slice needed a shape the `sep` dispatch could tell apart from
 // the `[@]` one — without the suffix both faces rendered the space
 // join and probe c05 (`IFS=:; ${a[*]:1:2}` → `y:z`) stayed red.
-// `harness/ifs-probe.sh` checks every face against real bash.
+// `<workspace>/harness/ifs-probe.sh` checks every face against real bash.
 //
 // THE DENOTATIONAL EXTENSION (this file): bash's scalar `${a[*]}` is
 // ONE word built by joining the array's ELEMENTS with a separator

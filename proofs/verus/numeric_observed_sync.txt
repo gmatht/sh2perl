@@ -3,11 +3,11 @@
 
 [pins]
 pin pin_array_chain_veto -> test array_chain_reaches_downstream_scalars: MAPPED
-pin pin_empty_uses_marked -> UNMIRRORED (by design — see VERUS.md §(b).4)
+pin pin_empty_uses_marked -> UNMIRRORED (by design — see the proof-campaign plan §(b).4)
 pin pin_param_slot_sound -> test numeric_sink_param_is_numeric: MAPPED
 pin pin_scalar_all_numeric -> test atoll_only_scalar_is_numeric: MAPPED
 pin pin_text_use_vetoes -> test echo_observed_scalar_is_not_numeric: MAPPED
-pin pin_unmarked_no_claim -> UNMIRRORED (by design — see VERUS.md §(b).4)
+pin pin_unmarked_no_claim -> UNMIRRORED (by design — see the proof-campaign plan §(b).4)
 
 [guards]
 guard analysis entry: PRESENT

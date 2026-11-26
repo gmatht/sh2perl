@@ -1,5 +1,5 @@
 # verus-sync-coverage manifest: hoist_loop_invariants
-# source sha: hoist_loop_invariants=afc4c7ea9d54  proof sha: 1c98ef2ba978
+# source sha: hoist_loop_invariants=afc4c7ea9d54  proof sha: f4a133738fe9
 
 [pins]
 pin pin_accumulator_refused -> test refuses_accumulator: MAPPED
@@ -15,7 +15,7 @@ pin pin_range_empty_refused -> test refuses_empty_range_for: MAPPED
 pin pin_range_hoists -> test hoists_counter_independent_write: MAPPED
 pin pin_read_before_refused -> test refuses_read_before_accumulator: MAPPED
 pin pin_words_nonempty_hoists -> test hoists_counter_independent_write: MAPPED
-pin pin_zero_trip_diverges -> UNMIRRORED (by design — see VERUS.md §(b).4)
+pin pin_zero_trip_diverges -> UNMIRRORED (by design — see the proof-campaign plan §(b).4)
 pin pin_zero_trip_refused -> test refuses_zero_trip_while: MAPPED
 
 [guards]

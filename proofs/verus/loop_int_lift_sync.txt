@@ -5,13 +5,13 @@
 pin pin_all_canonical_lifts -> test lifts_int_typed_loop: MAPPED
 pin pin_arith_read_allowed -> test lifts_when_the_body_is_arithmetic: MAPPED
 pin pin_canonical_forms -> test lifts_int_typed_loop: MAPPED
-pin pin_empty_refused -> UNMIRRORED (by design — see VERUS.md §(b).4)
+pin pin_empty_refused -> UNMIRRORED (by design — see the proof-campaign plan §(b).4)
 pin pin_leading_zero_refused -> test refuses_leading_zero_and_non_decimal: MAPPED
 pin pin_lift_fires -> test lifts_int_typed_loop: MAPPED
 pin pin_minus_zero_refused -> test refuses_leading_zero_and_non_decimal: MAPPED
 pin pin_no_verdict_no_lift -> test refuses_without_verdict: MAPPED
-pin pin_non_digit_refused -> UNMIRRORED (by design — see VERUS.md §(b).4)
-pin pin_plain_zero_ok -> UNMIRRORED (by design — see VERUS.md §(b).4)
+pin pin_non_digit_refused -> UNMIRRORED (by design — see the proof-campaign plan §(b).4)
+pin pin_plain_zero_ok -> UNMIRRORED (by design — see the proof-campaign plan §(b).4)
 pin pin_text_read_blocks -> test refuses_when_the_body_uses_the_var_as_text: MAPPED
 
 [guards]

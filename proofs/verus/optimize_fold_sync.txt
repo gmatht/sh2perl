@@ -1,5 +1,5 @@
 # optimize_fold table — GENERATED from sh2perl/src/ir.rs; do not edit.
-# Regenerate: OUT_TMP=<file> harness/fold-table-extract.sh >/dev/null
+# Regenerate: OUT_TMP=<file> <workspace>/harness/fold-table-extract.sh >/dev/null
 
 [bin] fold_bin_op
 arm "+" => Some(a.wrapping_add(b))

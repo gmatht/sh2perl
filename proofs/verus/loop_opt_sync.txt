@@ -1,5 +1,5 @@
 # verus-sync-coverage manifest: loop_opt
-# source sha: loop_opt=0c7903045472  proof sha: 707da4a51861
+# source sha: loop_opt=0c7903045472  proof sha: 246708486f86
 
 [pins]
 pin pin_arith_hoists -> test invariant_arith_hoists_counter_arith_stays: MAPPED
@@ -10,7 +10,7 @@ pin pin_fixpoint_noop -> test fixpoint_is_idempotent: MAPPED
 pin pin_hoist_preserves_run -> test invariant_arith_hoists_counter_arith_stays: MAPPED
 pin pin_impure_blocked -> test echo_is_not_hoisted: MAPPED
 pin pin_pure_call_derived_hoists -> test pure_call_and_derived_hoist_out_of_inner_loop: MAPPED
-pin pin_zero_trip_diverges -> UNMIRRORED (by design — see VERUS.md §(b).4)
+pin pin_zero_trip_diverges -> UNMIRRORED (by design — see the proof-campaign plan §(b).4)
 
 [guards]
 guard hoist entry: PRESENT

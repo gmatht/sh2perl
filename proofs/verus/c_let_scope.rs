@@ -57,7 +57,7 @@
 //! - a divisor that is zero only at RUN time: `detects(None)` is false, so the
 //!   store still fires with the rendered 0 where bash aborts. Proved as the
 //!   INCOMPLETENESS obligation (`detection_is_incomplete`) and pinned in
-//!   C_UB_PROOF.md §33, not papered over;
+//!   the C UB proof notes §33, not papered over;
 //! - `u=$(( u/0 ))`, which is FATALLY fatal in bash (the shell exits and
 //!   nothing after it runs) — the store is now skipped, the abort is not;
 //! - the `${#arr[@]}` shape (an Interpolate word rather than a `Str`), which
@@ -347,7 +347,7 @@ pub proof fn detection_is_sound(l: int)
 {
 }
 
-/// INCOMPLETENESS — the pinned-open half (C_UB_PROOF.md §33). A divisor that
+/// INCOMPLETENESS — the pinned-open half (the C UB proof notes §33). A divisor that
 /// is zero only at RUN time is `None` to the detector, so the store still
 /// fires with the rendered 0 while bash aborts. No state is assumed here:
 /// the claim is that the detector's input cannot tell `Some(0)` from `None`

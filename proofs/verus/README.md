@@ -6,6 +6,32 @@ STATUS: **checked.** Verus `0.2026.10.18.7d82994`, rust toolchain
     verus --triggers-mode silent --rlimit 40 interval.rs
     -> verification results:: 5 verified, 0 errors
 
+## Path notes — files cited from this directory that are not here
+
+This repo is standalone (AGENTS.md), so every citation under `proofs/verus/`
+either names a file that exists in this tree or names material maintained
+OUTSIDE it, which no path here can resolve. The 2026-11 sweep replaced the
+bare filenames with descriptions, so no reader is sent to a missing path:
+
+- **the proof-campaign plan** — the planning document behind this proof
+  directory. Older headers and manifests cite it as `§(b).3`, `§(b).4`,
+  `§(d)` or `P12`; those are historical labels for its findings, not
+  headings of this README.
+- **the C UB proof notes** — the C backend's UB survey (`§1`, `§2a`, `§2b`,
+  `§24`, `§33` in the `c_*.rs` headers).
+- **the backend bug log** — the `#7` / `#11a` entries the loop and
+  `direct_calls` proofs refer to.
+- **the workspace harness probes** — the bash-behaviour probes, cited as
+  `<workspace>/harness/*.sh`; `<workspace>` is a placeholder, not a path in
+  this repo.
+- **the retired coverage script** — formerly used as a key prefix in the
+  README's "Coverage sync registered" lines; only the key survives.
+- **the core-requests item** `c-20261104-unquoted-empty-word`.
+
+Why keep the names: they are provenance for measurements actually made, and
+deleting them would hide where the evidence came from. Why not link them:
+this repo's CI must stay self-contained.
+
 ## What is proved
 
 `interval.rs` is a standalone model of the interval rewrite of
@@ -44,7 +70,7 @@ file was restored and re-checked at **5 verified, 0 errors**.
   needs the crate to build under Verus (see below), not a copy.
 - It says nothing about the emitted C: "the value is in i32" is a
   mathematical statement; that the target does not wrap on the way there
-  is the separate obligation in `C_UB_PROOF.md`.
+  is the separate obligation in the C UB proof notes.
 - `i32_provable` has no renderer consumer in the tree today (checked:
   `is_i32()` is referenced only from `transforms.rs`), so this verdict
   currently changes no emitted byte.
@@ -2330,7 +2356,7 @@ was restored and re-checked at **11 verified, 0 errors**.
 - Model, not code (same caveat as the files above). The assign-head
   refusal (shape-preservation) is pinned as a refusal, not a value
   claim. The nounset scan and array census are parameters.
-- Coverage sync registered (`verus-sync-coverage.sh:string_folds`).
+- Coverage sync registered (`string_folds`).
 
 ## typeset_attrs.rs — live attributes and the value bash stores (29)
 
@@ -2576,7 +2602,7 @@ at **11 verified, 0 errors**.
 
 - Model, not code. `/`, `%`, `**` are uninterpreted (refuse-on-doubt,
   exactly as the pass treats them). NaN/infinity out of scope.
-- Coverage sync registered (`verus-sync-coverage.sh:arith_folds`);
+- Coverage sync registered (`arith_folds`);
   pins UNMIRRORED (no unit suites in either source — recorded).
 
 ---
@@ -2607,7 +2633,7 @@ Folding `-le` to false makes the same command report **4 verified,
 
 - Model, not code. Parens/arithmetic operands out of scope (the pass
   refuses them). Pins UNMIRRORED (no unit suite — recorded).
-- Coverage sync registered (`verus-sync-coverage.sh:test_folds`).
+- Coverage sync registered (`test_folds`).
 
 ---
 
@@ -2639,7 +2665,7 @@ re-checked at **15 verified, 0 errors**.
 
 - Model, not code. printf format evaluation, flag detection,
   redirect/multi-statement refusals out of scope (same refusal class).
-- Coverage sync registered (`verus-sync-coverage.sh:capture_folds`).
+- Coverage sync registered (`capture_folds`).
 
 ---
 
@@ -2671,7 +2697,7 @@ Dropping the prefix in the expansion makes the same command report
 
 - Model, not code. Sequence/range braces, nested braces, Json middles,
   glob-magic patterns out of scope (non-literal refuses in the pass).
-- Coverage sync registered (`verus-sync-coverage.sh:list_folds`).
+- Coverage sync registered (`list_folds`).
 
 ---
 
@@ -2702,7 +2728,7 @@ Flipping the upper arm to lowercase makes the same command report
 
 - Model, not code. Field specs, tr sets, sed/sort/uniq programs out of
   scope; wc stays in Isabelle. Non-ASCII case out of scope.
-- Coverage sync registered (`verus-sync-coverage.sh:textop_folds`).
+- Coverage sync registered (`textop_folds`).
 
 ## typeset_attrs.rs — live attributes and the value bash stores (29)
 
@@ -2954,7 +2980,7 @@ caught my own error before Verus did.)
   documented counterexample for why the flip needs its hypothesis;
   non-Perl backends with unverified op pairs are out of scope (refuse).
 - `&&`/`||` De Morgan, quadruple-unwinding traversal out of scope.
-- Coverage sync registered (`verus-sync-coverage.sh:not_folds`).
+- Coverage sync registered (`not_folds`).
 
 ## typeset_attrs.rs — live attributes and the value bash stores (29)
 
@@ -3200,7 +3226,7 @@ verified, 2 errors**. Restored and re-checked at **14 verified,
 - Model, not code. Mixed Int/Str, non-literals, command styles, glob
   RHS, claimed affix predicates all refuse (pinned as refusals).
   Traversal out of scope.
-- Coverage sync registered (`verus-sync-coverage.sh:const_cmp_folds`).
+- Coverage sync registered (`const_cmp_folds`).
 
 ## typeset_attrs.rs — live attributes and the value bash stores (29)
 
@@ -4302,7 +4328,7 @@ obligation is not vacuous. The file was restored and re-checked at
   the gate-visible half is the coverage-sync guard set.
 - Pins UNMIRRORED (no per-rule unit tests in the three sources —
   recorded, not claimed).
-- Coverage sync registered (`verus-sync-coverage.sh:elim_trio`).
+- Coverage sync registered (`elim_trio`).
 
 ## typeset_attrs.rs — live attributes and the value bash stores (29)
 
@@ -4557,7 +4583,7 @@ array-len-fold offset-guard shape.)
 - Firing: 0/563 on the shell corpus (no `${v:0}`/`${v:}` shapes occur) —
   FIRES on the 15 synthetic unit inputs (mechanics verified live, the
   test_folds precedent: 0/562 + synthetic firing witness).
-- Coverage sync registered (`verus-sync-coverage.sh:slice_identity`).
+- Coverage sync registered (`slice_identity`).
 
 ## typeset_attrs.rs — live attributes and the value bash stores (29)
 
@@ -4816,7 +4842,7 @@ command report **27 verified, 2 errors**. Restored and re-checked at
   0/563 on `--target pl` by target-gating — the registry gate names
   `perl` while the CLI passes `pl`, so the perl pipeline never enables
   it; measured, not assumed).
-- Coverage sync registered (`verus-sync-coverage.sh:case_lowering`).
+- Coverage sync registered (`case_lowering`).
 
 ## typeset_attrs.rs — live attributes and the value bash stores (29)
 
@@ -5066,7 +5092,7 @@ forgetting `el2`) makes the same command report **18 verified,
   induction per site (traversal out of scope).
 - Firing: 2/563 (`090_nested_if_else.sh`,
   `param-expand-default-operator.sh`) + the 4 synthetic unit inputs.
-- Coverage sync registered (`verus-sync-coverage.sh:elseif_flatten`).
+- Coverage sync registered (`elseif_flatten`).
 
 ## typeset_attrs.rs — live attributes and the value bash stores (29)
 
@@ -5319,7 +5345,7 @@ Restored and re-checked at **11 verified, 0 errors**.
 - Firing: 0/563 on the shell corpus (`for i in $(seq …)` shapes do not
   occur) — FIRES on the 8 synthetic unit inputs (mechanics verified
   live, the test_folds precedent).
-- Coverage sync registered (`verus-sync-coverage.sh:seq_range`).
+- Coverage sync registered (`seq_range`).
 
 ## typeset_attrs.rs — live attributes and the value bash stores (29)
 
@@ -5573,7 +5599,7 @@ at **9 verified, 0 errors**.
 - Firing: ingress-only (runs at A1 ingress for `--shir-in-*`, not in
   the SH2 registry) — 0/563 in-registry by construction; fires on
   C-frontend input.
-- Coverage sync registered (`verus-sync-coverage.sh:ternary_desugar`).
+- Coverage sync registered (`ternary_desugar`).
 
 ## typeset_attrs.rs — live attributes and the value bash stores (29)
 
@@ -5846,7 +5872,7 @@ Firing: the verdict fires on 1 of 563 corpus files (measured with
 the analysis is narrow by construction (every array, `local`, or
 cross-scope name is refused), so the proof's value is the decision
 rule, not corpus coverage. Coverage sync registered
-(`verus-sync-coverage.sh:escape_classes`).
+(`escape_classes`).
 
 ### `f32_narrow.rs` — 10 obligations
 
@@ -5916,12 +5942,12 @@ states its premise as the lattice-level rule it preserves
 (`cand_subset`: candidates are only removed). Firing: on shell input
 the verdict set is EMPTY by construction (`f32_narrow.rs` header: shell
 A1 has no float-domain defs) — the proof is for the Python-frontend
-consumer. Coverage sync registered (`verus-sync-coverage.sh:f32_narrow`).
+consumer. Coverage sync registered (`f32_narrow`).
 
 ### Not attempted from the same batch (recorded, not proved)
 
 - `background_decide` — process/exec classification is **Tier-3** by the
-  standing rule (`docs/transform-verification.md`, VERUS.md §(d)
+  standing rule (`the workspace's transform-verification notes`, the proof-campaign plan §(d)
   "Explicitly deprioritized"): no bash-semantics model exists to state
   the obligation against.
 - ~~`sync_ok_loops`~~ — DONE (`sync_ok_loops.rs`, 24): criterion 1 and 2 do
@@ -5980,8 +6006,8 @@ source-charset assumptions (UTF-8 default). Unknown escapes are refused
 (fail-closed: `cstr` never emits one). Gate-registered
 (`c_str_lit.rs:19:40`). The `c_*` models are C-generator emission
 decisions, not shIR→shIR passes, so they carry no
-`verus-sync-coverage.sh` baseline — their living tie is the pin↔probe
-mapping, as in `C_UB_PROOF.md`.
+the retired coverage script baseline — their living tie is the pin↔probe
+mapping, as in the C UB proof notes.
 
 ## The C-generator redirect reorder + quoter — `c_redirect.rs` (46 obligations)
 
@@ -6353,7 +6379,7 @@ The file was restored and re-checked at **19 verified, 0 errors**.
   traversal recursion adds no obligation.
 - The emitted targets are not modelled: the obligation is that the
   rewrite preserves the shell run, not that a renderer's `break` arm
-  emits the right bytes (those are C_UB_PROOF.md / per-backend
+  emits the right bytes (those are the C UB proof notes / per-backend
   obligations).
 - `ran` distinguishes "some step happened" from an empty tail, so a
   list's final status is its last real step's (`[Fail]` stays 1).
@@ -6756,7 +6782,7 @@ was restored and re-checked at **23 verified, 0 errors**.
 
 - It is a proof about a MODEL: the arms of `fold_bin` are transcribed by
   hand. `optimize_fold_sync.txt`
-  is generated by `harness/fold-table-extract.sh` from `src/ir.rs` and
+  is generated by `<workspace>/harness/fold-table-extract.sh` from `src/ir.rs` and
   carries every source arm's op/guard/body plus the model arm each op
   maps to, so a new arm, a changed guard or a dropped model arm fails
   the gate. That is drift detection, not generation: Rust's
@@ -6773,7 +6799,7 @@ was restored and re-checked at **23 verified, 0 errors**.
 - `fold_arith_const` (the arithmetic string parser) is an oracle: the
   model starts from a parsed tree.
 - The tables have no unit suite, so all pins are `UNMIRRORED` by design
-  (VERUS.md §(b).4).
+  (the proof-campaign plan §(b).4).
 
 
 ## stray_reserved_word.rs — a stray `)` / `}` is a parse error (14)
@@ -7858,7 +7884,7 @@ out rather than asserted.
 
 ### Mutants
 
-`harness/mut-fbdev-batch.py` applies 11 independent edits inside the named
+`<workspace>/harness/mut-fbdev-batch.py` applies 11 independent edits inside the named
 definitions: empty separator, doubled separator, skip an empty payload,
 first-only, reversed, merged op adds a terminator, run key ignores the verb,
 `starts_run` ignores the joinable set, `flush` drops a single op, the device
@@ -7867,8 +7893,8 @@ dispatch loses its terminator, `flush` drops the pending run. Measured:
 
 ### Anchor
 
-`harness/anchor-fbdev-batch.sh` runs the emitted C for real against
-`harness/fbdev-soft` (a deterministic software device: payload+`\n` to a file
+`<workspace>/harness/anchor-fbdev-batch.sh` runs the emitted C for real against
+`<workspace>/harness/fbdev-soft` (a deterministic software device: payload+`\n` to a file
 or stdout; no X, no root, no framebuffer) and diffs its device bytes, stdout
 and exit status against bash, which runs the same program with the device root
 substituted to a FIFO-backed directory. Measured: **8/8** — 3 lifted shapes
@@ -7884,8 +7910,8 @@ fall-through arm asserts.
 RUSTUP_HOME=$HOME/.rustup CARGO_HOME=$HOME/.cargo \
   ~/verus-0.2026.10.18.7d82994/verus --triggers-mode silent --rlimit 60 \
   proofs/verus/fbdev_gpu_batch.rs          # 36 verified, 0 errors
-python3 harness/mut-fbdev-batch.py          # 11/11 red
-bash harness/anchor-fbdev-batch.sh          # pass=8 fail=0
+python3 <workspace>/harness/mut-fbdev-batch.py          # 11/11 red
+bash <workspace>/harness/anchor-fbdev-batch.sh          # pass=8 fail=0
 ```
 
 ## `fbdev_gpu.rs` — the device-write lift (17 obligations)
@@ -7936,7 +7962,7 @@ same `go`). `printf` and `echo -n` appear only as REFUSED shapes.
 
 ### Mutants
 
-`harness/mut-fbdev-gpu.py` — 12 independent edits inside the named
+`<workspace>/harness/mut-fbdev-gpu.py` — 12 independent edits inside the named
 definitions (line terminator dropped/doubled, top-level path loses its slash,
 slotted path collapses, lift adds a terminator / forgets the verb / forgets
 the slot, stream reverses / drops the first statement, printf read as an
@@ -7945,7 +7971,7 @@ RED**, each naming a failing obligation, none an `E0xxx`.
 
 ### Anchor
 
-`harness/anchor-fbdev-gpu.sh` — **9/9**, really executed: 3 lifted through
+`<workspace>/harness/anchor-fbdev-gpu.sh` — **9/9**, really executed: 3 lifted through
 the C call (`fb_blocks` marker, including the empty payload), 2 lifted
 through the GpuOp fallback (`depthmask`, the slotted `uniform/1f/uCamYaw`;
 `fputc('\n', _f)` marker), 3 refused (printf, `echo -n`, an interpolated
@@ -7959,8 +7985,8 @@ C AND Perl.
 RUSTUP_HOME=$HOME/.rustup CARGO_HOME=$HOME/.cargo \
   ~/verus-0.2026.10.18.7d82994/verus --triggers-mode silent --rlimit 60 \
   proofs/verus/fbdev_gpu.rs               # 17 verified, 0 errors
-python3 harness/mut-fbdev-gpu.py          # 12/12 red
-bash harness/anchor-fbdev-gpu.sh          # pass=9 fail=0
+python3 <workspace>/harness/mut-fbdev-gpu.py          # 12/12 red
+bash <workspace>/harness/anchor-fbdev-gpu.sh          # pass=9 fail=0
 ```
 
 ## `fbdev_gpu_calls.rs` — the call-emission rewrite (20 obligations)
@@ -8022,7 +8048,7 @@ rather than modelled.
 
 ### Mutants
 
-`harness/mut-fbdev-gpu-calls.py` — 12 independent edits inside the named
+`<workspace>/harness/mut-fbdev-gpu-calls.py` — 12 independent edits inside the named
 definitions: any call payload becomes a present, slotted ops/foreign
 devices/unmapped verbs become calls, `blocks` unmapped, the present lands on
 the wrong path, the wire call drops its terminator, the present writes
@@ -8032,8 +8058,8 @@ polarity returns. Measured: **12/12 RED**, each naming an obligation, none an
 
 ### Anchor
 
-`harness/anchor-fbdev-gpu-calls.sh` — **10/10**, really executed on C and
-Perl against `harness/fbdev-soft` (now declaring `fb_present()`, which writes
+`<workspace>/harness/anchor-fbdev-gpu-calls.sh` — **10/10**, really executed on C and
+Perl against `<workspace>/harness/fbdev-soft` (now declaring `fb_present()`, which writes
 `swap\n` to the sink, as `runtime/fbdev.c` does): 3 wire-call shapes, 2
 present shapes (`echo swap > …/call` → `fb_present()`, including after a
 failing command with `echo "rc=$?"` → 0, matching bash), 3 refused (a
@@ -8048,8 +8074,8 @@ gated) and is checked for exactly that.
 RUSTUP_HOME=$HOME/.rustup CARGO_HOME=$HOME/.cargo \
   ~/verus-0.2026.10.18.7d82994/verus --triggers-mode silent --rlimit 60 \
   proofs/verus/fbdev_gpu_calls.rs        # 20 verified, 0 errors
-python3 harness/mut-fbdev-gpu-calls.py    # 12/12 red
-bash harness/anchor-fbdev-gpu-calls.sh    # pass=10 fail=0
+python3 <workspace>/harness/mut-fbdev-gpu-calls.py    # 12/12 red
+bash <workspace>/harness/anchor-fbdev-gpu-calls.sh    # pass=10 fail=0
 ```
 
 ## `fbdev_gpu_calls.rs` — the call-emission rewrite (20 obligations)
@@ -8109,7 +8135,7 @@ rather than modelled.
 
 ### Mutants
 
-`harness/mut-fbdev-gpu-calls.py` — 12 independent edits inside the named
+`<workspace>/harness/mut-fbdev-gpu-calls.py` — 12 independent edits inside the named
 definitions: any call payload becomes a present, slotted ops/foreign
 devices/unmapped verbs become calls, `blocks` unmapped, the present lands on
 the wrong path, the wire call drops its terminator, the present writes
@@ -8119,8 +8145,8 @@ polarity returns. Measured: **12/12 RED**, each naming an obligation, none an
 
 ### Anchor
 
-`harness/anchor-fbdev-gpu-calls.sh` — **10/10**, really executed on C and
-Perl against `harness/fbdev-soft` (now declaring `fb_present()`, which writes
+`<workspace>/harness/anchor-fbdev-gpu-calls.sh` — **10/10**, really executed on C and
+Perl against `<workspace>/harness/fbdev-soft` (now declaring `fb_present()`, which writes
 `swap\n` to the sink, as `runtime/fbdev.c` does): 3 wire-call shapes, 2
 present shapes (`echo swap > …/call` → `fb_present()`, including after a
 failing command with `echo "rc=$?"` → 0, matching bash), 3 refused (a
@@ -8135,8 +8161,8 @@ gated) and is checked for exactly that.
 RUSTUP_HOME=$HOME/.rustup CARGO_HOME=$HOME/.cargo \
   ~/verus-0.2026.10.18.7d82994/verus --triggers-mode silent --rlimit 60 \
   proofs/verus/fbdev_gpu_calls.rs        # 20 verified, 0 errors
-python3 harness/mut-fbdev-gpu-calls.py    # 12/12 red
-bash harness/anchor-fbdev-gpu-calls.sh    # pass=10 fail=0
+python3 <workspace>/harness/mut-fbdev-gpu-calls.py    # 12/12 red
+bash <workspace>/harness/anchor-fbdev-gpu-calls.sh    # pass=10 fail=0
 ```
 
 ## `shir_pipeline_native.rs` — the pipeline statement-shape rewrite (25 obligations)
@@ -8187,7 +8213,7 @@ not modelled.
 
 ### Mutants
 
-`harness/mut-shir-pipeline-native.py` — 13 independent edits inside the named
+`<workspace>/harness/mut-shir-pipeline-native.py` — 13 independent edits inside the named
 definitions: the table drops `grep`, the table admits everything, the
 stage-shape test is ignored, empty pipelines are accepted, the last stage goes
 unchecked, `lower` drops the first stage, `lower` reverses, `lower` keeps the
@@ -8198,7 +8224,7 @@ an `E0xxx`.
 
 ### Anchor
 
-`harness/anchor-shir-pipeline-native.sh` — **10/10**, really executed on the
+`<workspace>/harness/anchor-shir-pipeline-native.sh` — **10/10**, really executed on the
 compiled C and the generated Perl against bash (stdout and exit status): 7
 accepted shapes (`cat|wc`, `echo|cat`, `cat|grep`, `seq|tail`, a three-stage
 `tr` chain, a pipeline inside `if`, a pipeline inside a loop body) and 3
@@ -8217,8 +8243,8 @@ renderer that consumes `IrStmt::Pipeline`, and C and Perl both do.
 RUSTUP_HOME=$HOME/.rustup CARGO_HOME=$HOME/.cargo \
   ~/verus-0.2026.10.18.7d82994/verus --triggers-mode silent --rlimit 60 \
   proofs/verus/shir_pipeline_native.rs      # 25 verified, 0 errors
-python3 harness/mut-shir-pipeline-native.py # 13/13 red
-bash harness/anchor-shir-pipeline-native.sh # pass=10 fail=0
+python3 <workspace>/harness/mut-shir-pipeline-native.py # 13/13 red
+bash <workspace>/harness/anchor-shir-pipeline-native.sh # pass=10 fail=0
 ```
 
 ## `grep_pcre.rs` — the argv rewrite and the token table (47 obligations)
@@ -8285,7 +8311,7 @@ stage inside a capture pipeline (the unit tests pin the structure).
 
 ### Mutants
 
-`harness/mut-grep-pcre.py` — 25 independent edits inside the named
+`<workspace>/harness/mut-grep-pcre.py` — 25 independent edits inside the named
 definitions: mode flag not extended / keeps `P`, the pass-through flag word
 dropped, the pass-through set losing `i` or `x` or admitting `P`, the
 separator dropped or invented, the operands dropped, the pattern slot lost or
@@ -8298,7 +8324,7 @@ each naming an obligation, none an `E0xxx`.
 
 ### Anchor
 
-`harness/anchor-grep-pcre.sh` — **17/17 shapes** plus 2 emission checks,
+`<workspace>/harness/anchor-grep-pcre.sh` — **17/17 shapes** plus 2 emission checks,
 really executed on the compiled C and the generated Perl against bash
 (stdout and exit status). Accepted (12): `\d+` filter, `-o` with `\w+`, `\W`
 (no match), possessive `a*+`, atomic `(?>a)b`, `-c`, `-v`, `-i`, `-q`, the
@@ -8317,8 +8343,8 @@ no-transform ones. Not executed: Go and Zig (no toolchain on this machine:
 cd sh2perl && RUSTUP_HOME=$HOME/.rustup CARGO_HOME=$HOME/.cargo \
   ~/verus-0.2026.10.18.7d82994/verus --triggers-mode silent --rlimit 60 \
   proofs/verus/grep_pcre.rs                  # 47 verified, 0 errors
-cd .. && python3 harness/mut-grep-pcre.py     # 25/25 red
-bash harness/anchor-grep-pcre.sh              # pass=19 fail=0
+python3 <workspace>/harness/mut-grep-pcre.py     # 25/25 red
+bash <workspace>/harness/anchor-grep-pcre.sh              # pass=19 fail=0
 ```
 
 ## `fs_cmd_lift.rs` — a tag-only lift whose refusal is the static-argv lemma (31)
@@ -8358,7 +8384,7 @@ measured end to end by the anchor. The filesystem is out of model, as is the
 
 ### Mutants
 
-`harness/mut-fs-cmd-lift.py` — 27 independent edits inside the named
+`<workspace>/harness/mut-fs-cmd-lift.py` — 27 independent edits inside the named
 definitions: the punctuation set admitting `*` or space or losing `-`; the
 walk skipping the plain check; an empty word or a lone `-` accepted; the
 command table admitting `sleep`/`mktemp` or losing `touch`; `rm` losing `f` or
@@ -8373,7 +8399,7 @@ each naming an obligation (`pin_*`, `skeleton_walk_leaf`,
 
 ### Anchor
 
-`harness/anchor-fs-cmd-lift.sh` — **19/19 shapes** (10 accepted, 9 refused),
+`<workspace>/harness/anchor-fs-cmd-lift.sh` — **19/19 shapes** (10 accepted, 9 refused),
 compiled and run against bash in the same sandbox, comparing stdout and exit
 status. Accepted: `rm -f`, `rm -rf`, `rm -d`, a plain `rm`, `mkdir -p`/`-pv`/
 plain, `touch` with one and three operands, and the `--` separator. Refused: a
@@ -8396,8 +8422,8 @@ host).
 cd sh2perl && RUSTUP_HOME=$HOME/.rustup CARGO_HOME=$HOME/.cargo \
   ~/verus-0.2026.10.18.7d82994/verus --triggers-mode silent --rlimit 60 \
   proofs/verus/fs_cmd_lift.rs               # 31 verified, 0 errors
-cd .. && python3 harness/mut-fs-cmd-lift.py  # 27/27 red
-bash harness/anchor-fs-cmd-lift.sh           # pass=19 fail=0
+cd .. && python3 <workspace>/harness/mut-fs-cmd-lift.py  # 27/27 red
+bash <workspace>/harness/anchor-fs-cmd-lift.sh           # pass=19 fail=0
 ```
 
 ## `fs_lift.rs` — the operand parse, the shape, and the GNU tables (26)
@@ -8438,7 +8464,7 @@ exposed to the emitted program).
 
 ### Mutants
 
-`harness/mut-fs-lift.py` — 24 independent edits inside the named definitions:
+`<workspace>/harness/mut-fs-lift.py` — 24 independent edits inside the named definitions:
 the name start/tail, the hazard tables losing `*`, `$`, a quote or a
 backslash, the unquoted / double-quoted / single-quoted acceptance arms, the
 empty token, `-nt`/`-ot` swapped or forced, the operand order, `-N` arity, the
@@ -8448,7 +8474,7 @@ an obligation (`pin_*`, `the_*_table`, `minus_n_*`), none an `E0xxx`.
 
 ### Anchor
 
-`harness/anchor-fs-lift.sh` — **19/19 shapes** (12 accepted, 7 refused). The
+`<workspace>/harness/anchor-fs-lift.sh` — **19/19 shapes** (12 accepted, 7 refused). The
 controlled pair is `text-ops` (baseline) vs `text-ops,fs-lift` (test): the
 lift runs inside that walker, so "accepted" is measured as a CHANGED emission
 and "refused" as byte-identity, and the expected class is asserted per shape.
@@ -8466,8 +8492,8 @@ and Zig were not executed (`go=none zig=none`).
 cd sh2perl && RUSTUP_HOME=$HOME/.rustup CARGO_HOME=$HOME/.cargo \
   ~/verus-0.2026.10.18.7d82994/verus --triggers-mode silent --rlimit 60 \
   proofs/verus/fs_lift.rs                   # 26 verified, 0 errors
-cd .. && python3 harness/mut-fs-lift.py       # 24/24 red
-bash harness/anchor-fs-lift.sh                # pass=19 fail=0
+cd .. && python3 <workspace>/harness/mut-fs-lift.py       # 24/24 red
+bash <workspace>/harness/anchor-fs-lift.sh                # pass=19 fail=0
 ```
 
 ## `text_filter_lift.rs` — the static text pipeline (30)
@@ -8509,7 +8535,7 @@ occurrence hands it).
 
 ### Mutants
 
-`harness/mut-text-filter-lift.py` — 28 independent edits inside the named
+`<workspace>/harness/mut-text-filter-lift.py` — 28 independent edits inside the named
 definitions: the stage flags, the echo prefix scan and its stop-at-a-word
 rule, the flag probe, the escape table and its lone-backslash case, the `-e`
 gate, `printf`'s `%`/arity/escape checks, `seq`'s order and positivity, the
@@ -8522,7 +8548,7 @@ Measured: **28/28 RED**, each naming an obligation (`pin_*`,
 
 ### Anchor
 
-`harness/anchor-text-filter-lift.sh` — **24/24 shapes** (9 accepted, 15
+`<workspace>/harness/anchor-text-filter-lift.sh` — **24/24 shapes** (9 accepted, 15
 refused). The controlled pair is `text-ops` (baseline) vs
 `text-ops,text-filter-lift` (test): accepted is measured as a CHANGED
 emission and refused as byte-identity, with the expected class asserted per
@@ -8542,8 +8568,8 @@ executed (`go=none zig=none`).
 cd sh2perl && RUSTUP_HOME=$HOME/.rustup CARGO_HOME=$HOME/.cargo \
   ~/verus-0.2026.10.18.7d82994/verus --triggers-mode silent --rlimit 60 \
   proofs/verus/text_filter_lift.rs           # 30 verified, 0 errors
-cd .. && python3 harness/mut-text-filter-lift.py  # 28/28 red
-bash harness/anchor-text-filter-lift.sh           # pass=24 fail=0
+cd .. && python3 <workspace>/harness/mut-text-filter-lift.py  # 28/28 red
+bash <workspace>/harness/anchor-text-filter-lift.sh           # pass=24 fail=0
 ```
 
 ## status_reads.rs — the `$?` register liveness law (28)

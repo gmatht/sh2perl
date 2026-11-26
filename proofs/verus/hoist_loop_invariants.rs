@@ -10,7 +10,7 @@
 // while the original runs nothing (verified live against the
 // transform: `while false; do y = 5; done` hoisted `y = 5`
 // unconditionally). The transform now REFUSES every loop that may run
-// zero times (`runs_at_least_once` in the source, BUGS_FOUND.md #7), and
+// zero times (`runs_at_least_once` in the source, the backend bug log #7), and
 // this file proves the two halves of that repair:
 //   guard_gives_a_trip:  runs_at_least_once(k) ==> trips(k) >= 1
 //   hoist_sound_gated:   under the guard, hoisted run == original run.

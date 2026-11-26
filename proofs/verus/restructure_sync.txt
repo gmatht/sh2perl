@@ -1,5 +1,5 @@
 # verus-sync-coverage manifest: restructure
-# source sha: restructure=b503a1dcf5d9  proof sha: d72c42dc9a3c
+# source sha: restructure=b503a1dcf5d9  proof sha: 1cbe741977c0
 
 [pins]
 pin pin_backward_span -> test backward_goto_becomes_while: MAPPED
@@ -8,7 +8,7 @@ pin pin_empty_noop -> test empty_list_noop: MAPPED
 pin pin_flag_protocol -> test nested_goto_becomes_flag_break: MAPPED
 pin pin_forward_inversion -> test forward_goto_becomes_inverted_if: MAPPED
 pin pin_forward_skip_no_flag -> test goto_inside_a_switch_inside_the_loop_body_reaches_its_tail: MAPPED
-pin pin_shapes_agree -> UNMIRRORED (by design — see VERUS.md §(b).4)
+pin pin_shapes_agree -> UNMIRRORED (by design — see the proof-campaign plan §(b).4)
 pin pin_tail_guarded -> test goto_out_of_a_top_level_loop_guards_the_tail: MAPPED
 
 [guards]

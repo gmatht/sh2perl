@@ -11,7 +11,7 @@ pin pin_never_defined_warns -> test function_body_read_of_never_assigned_warns: 
 pin pin_read_before_def_warns -> test straight_line_use_before_decl: MAPPED
 pin pin_sequential_defs_accumulate -> test defined_before_use_is_clean: MAPPED
 pin pin_straight_def_no_warn -> test defined_before_use_is_clean: MAPPED
-pin pin_subshell_no_propagate -> UNMIRRORED (by design — see VERUS.md §(b).4)
+pin pin_subshell_no_propagate -> UNMIRRORED (by design — see the proof-campaign plan §(b).4)
 
 [guards]
 guard analysis entry: PRESENT

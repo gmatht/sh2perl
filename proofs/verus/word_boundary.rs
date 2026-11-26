@@ -1,7 +1,7 @@
 // THE WORD-BOUNDARY MODEL — `echo x $$` vs `echo x$$`, reduced to the rule
 // that decides where one shell word ends and the next begins.
 //
-// THE CLAIM (the one harness/check_ast.pl pins as
+// THE CLAIM (the one <workspace>/harness/check_ast.pl pins as
 // `ast_dollardollar_arg_boundary` / `ast_dollardollar_word_internal`): the
 // two sources must produce DIFFERENT argument vectors. `x $$` is two words
 // (the literal `x`, then the PID expansion); `x$$` is ONE word (the literal

@@ -28,7 +28,7 @@
 //   B: "a decimal string in a bounded static (size_t ≤ 20 digits + NUL
 //       ≤ 24)"
 //
-// C_UB_PROOF.md §2a names exactly this class as an obligation of the
+// the C UB proof notes §2a names exactly this class as an obligation of the
 // backend's own fast arms ("not trivially in range"), and §2b names the
 // second half: a write site is safe only if `strlen ≤ cap` is proved, not
 // assumed. A hand-rolled itoa is the tightest such site in the file —

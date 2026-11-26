@@ -31,7 +31,7 @@
 //      statement's op (no statement is dropped, added or reordered).
 //
 // PINNED pre-fix / naive facts (each is a measured witness, see the anchor in
-// harness/anchor-fbdev-gpu.sh):
+// <workspace>/harness/anchor-fbdev-gpu.sh):
 //
 //   P1 the_naive_fallback_loses_the_line — `wire_naive(o) = payload` differs
 //      from `wire(o)` for EVERY op (the pre-fix `fputs(payload)`; measured:

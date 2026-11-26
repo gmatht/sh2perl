@@ -1,5 +1,5 @@
 # verus-sync-coverage manifest: optimize
-# source sha: optimize=dd35475c5761  proof sha: c5dfeffffaf3
+# source sha: optimize=dd35475c5761  proof sha: 0d6ebdc7d85d
 
 [pins]
 pin pin_baked_index_keeps -> test dce_keeps_store_read_only_by_a_baked_index_name: MAPPED

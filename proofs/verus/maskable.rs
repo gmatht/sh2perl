@@ -71,7 +71,7 @@
 //   pin_square_brackets, linear_threshold_math -> pin_linear_math,
 //   refuses -> pin_refusals, const_dividends -> pin_const_folds,
 //   pow2_lit -> pin_pow2_table.  pin_bound_sound is UNMIRRORED by design
-//   (VERUS.md (b).4).
+//   (the proof-campaign plan (b).4).
 //
 // MUTANTS (checked red, then restored): (1) `lin_t` accepting a negative
 // coefficient, (2) `jmin` taking the max instead of the min, (3) the

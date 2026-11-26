@@ -5,10 +5,10 @@
 pin pin_all_guards_pass -> test append_in_counted_loop_becomes_store: MAPPED
 pin pin_break_refused -> test break_vetoes: MAPPED
 pin pin_counted_loop_rewrites -> test append_in_counted_loop_becomes_store: MAPPED
-pin pin_multi_element_refused -> UNMIRRORED (by design — see VERUS.md §(b).4)
+pin pin_multi_element_refused -> UNMIRRORED (by design — see the proof-campaign plan §(b).4)
 pin pin_nonempty_init_refused -> test nonempty_init_vetoes: MAPPED
 pin pin_other_write_refused -> test other_write_vetoes: MAPPED
-pin pin_rewritten_loop_agrees -> UNMIRRORED (by design — see VERUS.md §(b).4)
+pin pin_rewritten_loop_agrees -> UNMIRRORED (by design — see the proof-campaign plan §(b).4)
 pin pin_step2_refused -> test step2_vetoes: MAPPED
 pin pin_two_appends_refused -> test two_appends_veto: MAPPED
 pin pin_unknown_bound_refuses -> test append_with_unknown_bound_keeps_growable: MAPPED

@@ -511,7 +511,7 @@ proof fn grep_o_sound(s: Shape, e: Expr)
 
 // ---- Load-bearing guards: each refusal is a shape that WOULD change
 // the output if the lift fired (the mutant targets, recorded in
-// VERUS.md §(b).3) ----
+// the proof-campaign plan §(b).3) ----
 
 // A DYNAMIC input text: the echo stage is not static, so there is no
 // text for the op to substitute — the lift must not fire (and the
