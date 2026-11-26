@@ -1,5 +1,5 @@
 # verus-sync-coverage manifest: affix_strip_fold
-# source sha: affix_strip_fold=929ebbee6785  proof sha: 01a40709a22c
+# source sha: affix_strip_fold=929ebbee6785  proof sha: 402308d8cd04
 
 [pins]
 pin literal_shortest_eq_longest -> test greedy_and_shortest_are_identical_for_a_literal: MAPPED
@@ -20,6 +20,8 @@ guard law literal_shortest_eq_longest (shortest == longest for a literal): PRESE
 guard law fold_preserves_value (AffixStrip == bash strip, both ops): PRESENT
 guard law literal_strip_is_one_occurrence (at most one occurrence): PRESENT
 guard law star_forms_preserve_value (#lit* == #lit, %*lit == %lit): PRESENT
+guard law fold_is_idempotent (a second visit is the identity): PRESENT
+guard law fold_rules_are_exclusive (literal vs star branches disjoint): PRESENT
 guard scan enumerates prefixes/suffixes rather than assuming the closed form: PRESENT
 guard star SHAPE gate (one star, at an end): PRESENT
 guard magic set (*, ?, [, backslash) as lit_free: PRESENT
@@ -27,11 +29,12 @@ guard Cut table (the four find/rfind identities): STATED, not proved (pinned on 
 guard NAME-slot lexical gate / target gates (always-registry, value-free): OUT OF MODEL
 
 [counts]
-29 verified, 0 errors (verus --triggers-mode silent --rlimit 40 affix_strip_fold.rs)
-mutants: strict is_prefix 26v/3e, suffix scan ignores the literal 27v/2e;
-  strip-removes-nothing, scan off-by-one, '*' not magic, cut head keeps tail,
-  first-cut-uses-rfind and two-stars-accepted rejected at simplification by
-  their pins.
+32 verified, 0 errors (verus --triggers-mode silent --rlimit 40 affix_strip_fold.rs)
+mutants (measured 2026-11-26, each restored byte-identically to this proof
+  sha): a fold output that re-enters the rewritable class 31v/1e
+  (fold_is_idempotent); strip-without-presence-check, over-strip-one-past
+  (pin_literal_one_length) and '*' not magic (pin_magic_is_refused) rejected
+  at simplification by their pins.
 [exec]
 # Every MAPPED row above was EXECUTED against the source in this tree:
 #   cargo test --lib          (full lib suite; per-test verdicts below)

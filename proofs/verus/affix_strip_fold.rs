@@ -28,6 +28,10 @@
 //                                       leading/trailing occurrence
 //    star_forms_preserve_value          `#lit*` ≡ `#lit`, `%*lit` ≡ `%lit`
 //                                       (the two AffixStrip star arms)
+//    fold_is_idempotent                 a second visit changes nothing (the
+//                                       fold's output is a NODE, not a call)
+//    fold_rules_are_exclusive           the literal and star branches cannot
+//                                       both claim one pattern (a star is magic)
 //
 //  ── the star-form table (the Cut arms) ──────────────────────────────────
 //
@@ -52,22 +56,32 @@
 //     source's own tests (`non_affix_target_is_refused`, `go_is_refused_…`).
 //   * `%*` (empty body, identity) and `%%*` (empty result) are value-level
 //     pins; the general empty-body handling is the source's.
+//   * The TRAVERSAL is not modelled: `transform` is ONE bottom-up visit of
+//     the statement list with no fixpoint loop, so `fold_is_idempotent` is
+//     the convergence fact — there is no loop that could fail to terminate,
+//     and the fold's output never re-enters its own rewrite class.
+//   * The OP × SHAPE table is not modelled: `fold_rule` keys on the PATTERN,
+//     because the two replacement families are value-equal wherever they
+//     apply. Which of the eight op/shape pairs the source REFUSES (`## lit*`
+//     and `%% *lit` with a non-empty body) decides only whether the fold
+//     fires, never the value — those refusals are the source's own and are
+//     NOT counted as proved here.
 //
-//  ── measured mutants (all restored byte-identically; sha in the sync file) ──
+//  ── measured mutants (2026-11-26 revision; all restored byte-identically,
+//     sha in the sync file) ──
 //
-//  baseline 29 verified, 0 errors
+//  baseline 32 verified, 0 errors
 //
 //  counted:
-//    m2  `is_prefix` made strict (`<`)                26 verified, 3 errors
-//    m7  the suffix scan ignores the literal           27 verified, 2 errors
+//    m4  the fold's output re-enters the rewritable class  31 verified, 1 error
+//        (`fold_is_idempotent`)
 //
 //  refuted one stage earlier, at simplification, by a concrete pin:
-//    m1  the strip removes nothing (pin_literal_one_length)
-//    m3  the shortest scan returns k+1 (pin_literal_one_length)
-//    m4  `*` is not glob magic (pin_magic_is_refused)
-//    m5  cut_at's head branch keeps the tail (pin_dirname_basename)
-//    m6  the "first" cut uses rfind (pin_double_star_differs)
-//    m8  two stars accepted by the shape gate (pin_star_shape)
+//    m1  strip the affix without checking it is present
+//        (pin_literal_one_length)
+//    m2  over-strip one char past the declared affix
+//        (pin_literal_one_length)
+//    m3  `*` no longer counted as glob magic (pin_magic_is_refused)
 //
 //  ─────────────────────────────────────────────────────────────────────────
 
@@ -544,6 +558,91 @@ pub open spec fn single_star_shape(p: Seq<char>) -> bool {
 
 pub open spec fn star_is_first(p: Seq<char>) -> bool {
     p.len() > 0 && p[0] == '*'
+}
+
+// ──────────────────────────────────────────────── convergence (one visit) ──
+
+/// The branch `transform` takes on a pattern: 0 = leave the call alone,
+/// 1 = `AffixStrip`, 2 = the star family's `CutAt`/`AffixStrip` rule.
+/// The literal test comes FIRST (the source's order), so the value below is
+/// the rule choice, not a re-run of the match.
+pub open spec fn fold_rule(p: Seq<char>) -> int {
+    if 0 < p.len() && lit_free(p) {
+        1
+    } else if single_star_shape(p) {
+        2
+    } else {
+        0
+    }
+}
+
+/// A term of the fold: the `param(op, PAT)` call it can rewrite, a node it
+/// has already produced (`Node`), or anything else (`Other`).
+pub enum Term {
+    Param(int, Seq<char>),
+    Node,
+    Other,
+}
+
+/// ONE bottom-up visit of the fold. The source's `transform` iterates the
+/// statement list once and recurses per node — there is no fixpoint loop, so
+/// "does it converge" is the question of whether a second visit can change
+/// what the first produced.
+pub open spec fn fold_t(t: Term) -> Term {
+    match t {
+        Term::Param(op, p) => if fold_rule(p) == 0 { Term::Param(op, p) } else { Term::Node },
+        Term::Node => Term::Node,
+        Term::Other => Term::Other,
+    }
+}
+
+/// CONVERGENCE: a second visit is the identity. The reason is structural —
+/// the fold produces a NODE, the node is not a `param(…)` call, so `fold_rule`
+/// is never consulted for the fold's own output and the rewrite cannot
+/// oscillate between shapes.
+pub proof fn fold_is_idempotent(t: Term)
+    ensures
+        fold_t(fold_t(t)) == fold_t(t),
+{
+    match t {
+        Term::Param(_op, _p) => {}
+        Term::Node => {}
+        Term::Other => {}
+    }
+}
+
+/// `lit_free` is exactly "no `*`", which is what makes the rule choice
+/// exclusive below (and mirrors `is_literal_pattern`'s `!p.contains('*')`).
+proof fn lemma_lit_free_no_star(p: Seq<char>)
+    requires
+        lit_free(p),
+    ensures
+        count_star(p) == 0,
+    decreases p.len(),
+{
+    reveal_with_fuel(lit_free, 2);
+    reveal_with_fuel(count_star, 2);
+    if p.len() > 0 {
+        // `*` is glob magic, so `lit_free` rules it out at the head
+        assert(!magic(p[0]));
+        assert(p[0] != '*');
+        lemma_lit_free_no_star(p.skip(1));
+    }
+}
+
+/// The two branches cannot both claim one pattern: a star is magic, so a
+/// pattern is either a magic-free literal or a one-star shape, never both.
+/// That is why the rule choice is a function of the pattern and not of the
+/// order the branches are tried in.
+pub proof fn fold_rules_are_exclusive(p: Seq<char>)
+    ensures
+        !(0 < p.len() && lit_free(p) && single_star_shape(p)),
+{
+    if 0 < p.len() && lit_free(p) {
+        lemma_lit_free_no_star(p);
+        assert(count_star(p) == 0);
+        assert(!single_star_shape(p));
+    }
 }
 
 // ───────────────────────────────────────────────────────────────────── pins ──

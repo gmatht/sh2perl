@@ -8906,10 +8906,10 @@ run (sha256 in `uae_terminators_sync.txt`).
   rebuilding, and the other consumers of the verdict (they read the same
   functions, so a verdict change is the same theorem).
 
-## affix_strip_fold.rs — `${v#lit}` is one `strip_prefix` (29)
+## affix_strip_fold.rs — `${v#lit}` is one `strip_prefix` (32)
 
     verus --triggers-mode silent --rlimit 40 proofs/verus/affix_strip_fold.rs
-    -> verification results:: 29 verified, 0 errors
+    -> verification results:: 32 verified, 0 errors
 
 The fold turns `param("#"|"##"|"%"|"%%", NAME, PAT)` into one `AffixStrip`
 node when `PAT` is a magic-free literal. That is only sound because bash's
@@ -8931,6 +8931,12 @@ instead of assuming the closed form.
 - **`star_forms_preserve_value`**: `#lit*` ≡ `#lit` and `%*lit` ≡ `%lit` —
   the shortest matching prefix/suffix of a one-star pattern is the body
   itself — which is exactly the two `AffixStrip` star arms.
+- **`fold_is_idempotent`** (convergence): a second visit is the identity,
+  because the fold's output is a NODE and not a `param(…)` call, so the
+  one-shot rewrite can never re-enter its own rule.
+  **`fold_rules_are_exclusive`** backs it up: a star is glob magic, so the
+  literal branch and the star branch cannot both claim one pattern and the
+  rule choice is a function of the pattern, not of visit order.
 
 ### The pins
 
@@ -8943,12 +8949,13 @@ second star, or no star at all).
 
 ### Mutants, measured
 
-Counted: making `is_prefix` strict gives **26 verified, 3 errors**; a
-suffix scan that ignores the literal **27 verified, 2 errors**. Refuted at
-simplification by a concrete pin: a strip that removes nothing, an
-off-by-one shortest scan, `*` treated as magic, `cut_at`'s head branch
-keeping the tail, the "first" cut using `rfind`, and a shape gate that
-accepts two stars. Restored byte-identically after each run (sha256 in
+Counted: making the fold's output re-enter the rewritable class (a `Node`
+that is itself a `param(…)` call) gives **31 verified, 1 error**, in
+`fold_is_idempotent` — the convergence law is load-bearing. Refuted at
+simplification by a concrete pin: stripping the affix without checking it is
+present and over-stripping one character past it
+(`pin_literal_one_length`), and `*` no longer counted as glob magic
+(`pin_magic_is_refused`). Restored byte-identically after each run (sha256 in
 `affix_strip_fold_sync.txt`).
 
 ### Scope (read this before quoting it)
@@ -8963,6 +8970,15 @@ accepts two stars. Restored byte-identically after each run (sha256 in
   `cut_target_ok`) are not modelled: they decide whether the fold is
   offered, never its value. Their refusals are the source's own tests.
 - The empty-body arms (`%*` identity, `%%*` empty) are value-level pins.
+- The traversal is not modelled: `transform` is ONE bottom-up visit with no
+  fixpoint loop, so convergence is `fold_is_idempotent` (a second visit is
+  the identity) rather than a termination proof of a loop that does not
+  exist.
+- The op × shape table is not modelled: `fold_rule` keys on the pattern,
+  because both replacement families are value-equal wherever they apply.
+  Which of the eight op/shape pairs the source refuses (`## lit*`, `%% *lit`
+  with a non-empty body) decides only whether the fold fires, never the
+  value — those refusals are not counted as proved here.
 
 ## text_capture_fold.rs — folding constant `$(echo …)` text (31)
 
