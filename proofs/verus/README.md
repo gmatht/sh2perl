@@ -8545,3 +8545,67 @@ cd sh2perl && RUSTUP_HOME=$HOME/.rustup CARGO_HOME=$HOME/.cargo \
 cd .. && python3 harness/mut-text-filter-lift.py  # 28/28 red
 bash harness/anchor-text-filter-lift.sh           # pass=24 fail=0
 ```
+
+## status_reads.rs — the `$?` register liveness law (28)
+
+    verus --triggers-mode silent --rlimit 40 proofs/verus/status_reads.rs
+    -> verification results:: 28 verified, 0 errors
+
+`shir_passes/status_reads.rs` rewrites nothing, so it is easy to file away as
+"nothing to prove". It owes two laws, and they are the only reason the Python
+backend may drop a `__sh_rc = …` line:
+
+- **STORE LIVENESS** (`dead_store_law`): a store the analysis marks dead
+  (`!live[i]`) is observed by nothing — no `$?` read sees it before the next
+  definite store overwrites it, and the process exit does not see it. The
+  closed form `observed_after` (the exit, or a later read before any store)
+  is proved equal to the backward scan (`live_agrees`), so the scan's `need`
+  carry is not merely an approximation of itself.
+- **REGISTER SOUNDNESS** (`no_reader_keeps_only_the_exit_store`): with no
+  `$?` reader anywhere, every store but the last is dead and the last is live,
+  so `sys.exit(__sh_rc)` is exact; and a read with no live store before it
+  observes the register's INITIAL value (`first_read_observes_init`), so the
+  initialiser cannot be dropped (`pin_init_read_needs_the_initialiser`).
+
+The third term the source adds to `live[i]` — a statement that does not
+*definitely* store but whose nested list reads `$?` before its own first store
+— is load-bearing, not decoration: without it the analysis drops a store its
+own nested read can observe (`pin_nested_after_write_keeps_the_store`).
+
+### Mutants, measured
+
+(a) `dead_store_law`'s `!live(list)[i]` premise deleted — **27 verified,
+1 error**, landing inside the law; (d) `observed_after`'s later-read arm
+deleted — **25 verified, 3 errors**. (b) `live_step`'s store-reset disabled
+and (c) its nested term deleted are caught one stage earlier, at
+simplification, by the concrete pins
+`pin_stores_before_the_nearest_read_are_dropped` (`[true,true,true] ==
+[false,true,true]`) and `pin_nested_after_write_keeps_the_store`
+(`[true,false,true] == [true,true,true]`), so they carry no verified/error
+count — the same rejection class the README records for typeset_attrs'
+leading-zero mutant. The file was restored byte-identically after each run
+(sha256 in `status_reads_sync.txt`).
+
+### Scope (read this before quoting it)
+
+- The three facts the machine consumes (`reads`, `stores`, `nested`) are
+  **taken as given**: that `stmt_reads_status_in` really is a
+  may-over-approximation of the `$?` occurrences (over ~30 `IrStmt`/`IrExpr`
+  variants) is a separate traversal obligation, proved in
+  `status_reads_traversal.rs`. `program_reads_status`'s `$?`-in-Debug fallback
+  makes the direction that matters total in practice, but that is an
+  argument, not a proof, and this file does not discharge it.
+- Bodies: `body_store_liveness` localises a function/sub body into its own
+  per-statement vector, and `escaped` (a body whose first read precedes its
+  own first store) turns localisation off. Both are sound by construction —
+  a per-body vector is the same scan over a shorter list, and "off" means keep
+  every store — but the call-site machine (which body runs where, with which
+  caller status) is out of this model. So is the `None`-means-keep-everything
+  default.
+- Pins mirror the source's own tests
+  (`stores_before_the_nearest_read_are_dropped`,
+  `stores_after_the_last_read_keep_only_the_exit_store`,
+  `each_read_keeps_the_store_it_observes`,
+  `last_statement_store_is_live_without_a_reader`, `bare_exit_reads_the_status`);
+  the body-localisation and `program_reads_status` tests belong to the
+  companion models.

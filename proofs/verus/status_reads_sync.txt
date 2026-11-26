@@ -1,0 +1,42 @@
+# verus-sync-coverage manifest: status_reads
+# source sha: status_reads=32b0936fb8b7  proof sha: 4ce84f0547e0
+
+[pins]
+pin pin_stores_before_the_nearest_read_are_dropped -> test stores_before_the_nearest_read_are_dropped: MAPPED
+pin pin_stores_after_the_last_read_keep_only_the_exit_store -> test stores_after_the_last_read_keep_only_the_exit_store: MAPPED
+pin pin_each_read_keeps_the_store_it_observes -> test each_read_keeps_the_store_it_observes: MAPPED
+pin pin_last_statement_store_is_live_without_a_reader -> test last_statement_store_is_live_without_a_reader: MAPPED
+pin pin_bare_exit_reads_the_status -> test bare_exit_reads_the_status: MAPPED
+pin pin_dead_store_is_unobservable -> test last_statement_store_is_live_without_a_reader: MAPPED
+pin pin_exit_observes_the_kept_store -> test last_statement_store_is_live_without_a_reader: MAPPED
+pin pin_init_read_needs_the_initialiser -> test each_read_keeps_the_store_it_observes: MAPPED
+pin pin_nested_after_write_keeps_the_store: UNMIRRORED (no source test for the nested-list shape; modelled from the `!stores && nested` term)
+pin pin_empty_list: UNMIRRORED (the source returns None for an empty list before scanning)
+pin pin_single_read_is_live: UNMIRRORED (smallest instance of the read case)
+
+[guards]
+guard backward scan live_step (read/store/nested): PRESENT
+guard need starts true (the exit observes the last store): PRESENT
+guard closed form observed_after: PRESENT
+guard law store liveness dead_store_law: PRESENT
+guard law reader_sees_live_store (every read observes a live store): PRESENT
+guard law register soundness no_reader_keeps_only_the_exit_store: PRESENT
+guard law init observation first_read_observes_init: PRESENT
+guard initial value init() = -1 and its bound lemmas: PRESENT
+guard premise !live(list)[i] (mutant a): PRESENT
+guard nested-read term (mutant c): PRESENT
+
+[counts]
+28 verified, 0 errors (verus --triggers-mode silent --rlimit 40 status_reads.rs)
+# all suites built; per-test verdicts below
+exec pin_stores_before_the_nearest_read_are_dropped (stores_before_the_nearest_read_are_dropped): PASS
+exec pin_stores_after_the_last_read_keep_only_the_exit_store (stores_after_the_last_read_keep_only_the_exit_store): PASS
+exec pin_each_read_keeps_the_store_it_observes (each_read_keeps_the_store_it_observes): PASS
+exec pin_last_statement_store_is_live_without_a_reader (last_statement_store_is_live_without_a_reader): PASS
+exec pin_bare_exit_reads_the_status (bare_exit_reads_the_status): PASS
+exec pin_dead_store_is_unobservable (last_statement_store_is_live_without_a_reader): PASS
+exec pin_exit_observes_the_kept_store (last_statement_store_is_live_without_a_reader): PASS
+exec pin_init_read_needs_the_initialiser (each_read_keeps_the_store_it_observes): PASS
+exec pin_nested_after_write_keeps_the_store: UNMIRRORED (not executed)
+exec pin_empty_list: UNMIRRORED (not executed)
+exec pin_single_read_is_live: UNMIRRORED (not executed)
