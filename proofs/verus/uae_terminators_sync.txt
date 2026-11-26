@@ -1,0 +1,43 @@
+# verus-sync-coverage manifest: uae_terminators
+# source sha: shir=9bddd78b30c0  uae=3adb4e485152  proof sha: e908c57c295c
+
+[pins]
+pin pin_trunc_shapes -> test tail_after_an_infinite_loop_is_dropped: MAPPED
+pin pin_escapable_loop_keeps_the_tail -> test an_escapable_loop_keeps_the_tail: MAPPED
+pin pin_case_break_escapes -> test a_break_inside_a_case_still_escapes_the_loop: MAPPED
+pin pin_nested_break_does_not_escape -> test a_break_inside_a_nested_loop_does_not_escape: MAPPED
+pin pin_break_call_escapes -> test a_break_control_call_makes_the_loop_escapable: MAPPED
+pin pin_break_stops_the_list -> test statements_after_a_break_are_dropped_from_the_body: MAPPED
+pin pin_continue_stops_the_list: UNMIRRORED (no source test for a continue-truncated list)
+pin pin_conditional_exit_does_not_deaden: UNMIRRORED (no source test for an if-nested exit)
+pin pin_case_exit_may_not_fire: UNMIRRORED (no source test for a case that may not match)
+pin pin_top_level_return_keeps_the_tail: UNMIRRORED (the transform's in_fn flag has no unit test)
+
+[guards]
+guard law trunc_list_sound (verdict-terminator => run preserved, trace and signal): PRESENT
+guard law trunc_stmt_sound (the per-statement recursion the pass performs): PRESENT
+guard law loop_without_escape_never_falls_through (tail contributes nothing): PRESENT
+guard law return_truncates_only_a_function_body (in_fn flag is load-bearing): PRESENT
+guard escapes walk (nested loop owns its breaks; case captures nothing; control-call counts): PRESENT
+guard refusal conditional/case-nested terminator (if may not take the arm): PRESENT
+guard run model single unroll + Spin (reachability, not full loop semantics): PRESENT
+guard Case fires flag (a clause may not match): PRESENT
+guard Die folded into Exit, other_ => not a terminator (source's `_ => false`): PRESENT
+
+[counts]
+31 verified, 0 errors (verus --triggers-mode silent --rlimit 40 uae_terminators.rs)
+mutants: if-nested terminator truncates 29v/1e, top-level Return 28v/2e,
+  case-nested Exit prunes 29v/1e; nested-break-escapes, trunc-drops-terminator,
+  case-break-falls-through and run-ignores-signal rejected at simplification by
+  their pins.
+# all suites built; per-test verdicts below
+exec pin_trunc_shapes (tail_after_an_infinite_loop_is_dropped): PASS
+exec pin_escapable_loop_keeps_the_tail (an_escapable_loop_keeps_the_tail): PASS
+exec pin_case_break_escapes (a_break_inside_a_case_still_escapes_the_loop): PASS
+exec pin_nested_break_does_not_escape (a_break_inside_a_nested_loop_does_not_escape): PASS
+exec pin_break_call_escapes (a_break_control_call_makes_the_loop_escapable): PASS
+exec pin_break_stops_the_list (statements_after_a_break_are_dropped_from_the_body): PASS
+exec pin_continue_stops_the_list: UNMIRRORED (not executed)
+exec pin_conditional_exit_does_not_deaden: UNMIRRORED (not executed)
+exec pin_case_exit_may_not_fire: UNMIRRORED (not executed)
+exec pin_top_level_return_keeps_the_tail: UNMIRRORED (not executed)

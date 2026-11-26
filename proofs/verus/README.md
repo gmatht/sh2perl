@@ -8684,3 +8684,67 @@ byte-identically after each run (sha256 in
 - The source's `a_sub_body_localises_its_own_reads` and
   `a_body_read_of_the_callers_status_keeps_everything` are the body-machine
   tests and are not this file's.
+
+## uae_terminators.rs — `unreachable_after_exit`'s other four terminators (31)
+
+    verus --triggers-mode silent --rlimit 40 proofs/verus/uae_terminators.rs
+    -> verification results:: 31 verified, 0 errors
+
+`elim_trio.rs`'s `uae_sound` covers the *direct `Exit`* arm only. The
+transform prunes after every statement `shir::stmt_terminates` calls a
+terminator, and that verdict has four more arms: `Break`, `Continue`,
+`Return` (only inside a function body), and `While`/`ForInit` with a
+constant-true condition and no escaping `break`. This file proves each one
+against a run that carries a control signal, and proves the transform's
+truncation sound in general.
+
+### What is proved
+
+- **`trunc_sound`**: truncating a list at its first verdict-terminator
+  preserves the run — its trace AND its control signal — for every list.
+  `trunc_stmt_sound` lifts that through the per-statement recursion the pass
+  performs, so a nested body is truncated too.
+- **`loop_without_escape_never_falls_through`**: a break-free constant-true
+  loop contributes nothing after it; `terminates_stops` supplies the step
+  that says so, via `no_escape_no_brk`.
+- **`return_truncates_only_a_function_body`**, and the three
+  `*_truncates_its_own_list` instances.
+
+### The refusals, proved as pins
+
+`pin_conditional_exit_does_not_deaden` and `pin_case_exit_may_not_fire`: an
+`if`/`case`-nested `exit` deadens nothing after the *enclosing* statement,
+because the arm may not run — this is why only a DIRECT terminator prunes.
+`pin_nested_break_does_not_escape` (a nested loop owns its breaks),
+`pin_case_break_escapes` (bash's `case` captures nothing) and
+`pin_break_call_escapes` (`while true; do break || exit 1; done`, where
+`break` arrives as a control call inside a `BinOp`) pin the three
+loop-escapability decisions; the first two of those mirror the source's own
+`a_break_inside_a_nested_loop_does_not_escape` and
+`a_break_inside_a_case_still_escapes_the_loop`, and the third mirrors
+`a_break_control_call_makes_the_loop_escapable`.
+
+### Mutants, measured
+
+Counted: truncating after an `if`-nested terminator gives **29 verified,
+1 error**; treating a top-level `Return` as a terminator **28 verified,
+2 errors**; pruning after a `case`-nested `Exit` **29 verified, 1 error**.
+Refuted at simplification by a concrete pin: counting a nested loop's
+`break` as escaping, dropping the terminator from the kept prefix, letting a
+`case` break fall through instead of ending the loop, and running past a
+non-None signal. Restored byte-identically after each run (sha256 in
+`uae_terminators_sync.txt`).
+
+### Scope (read this before quoting it)
+
+- The model unrolls a loop body ONCE and returns `Spin` ("another iteration
+  would start"): enough for the reachability claim this pass makes, not a
+  full loop semantics.
+- `cond_const`/`cond` are the source's `is_true_cond` (`IrExpr::Bool(true)`);
+  a `while (( 1 ))` is out of this model.
+- `Case { fires, … }` records whether a clause matched on the run, which is
+  the whole point of the refusal; `BreakCall` is the control-call spelling.
+  `Die` is folded into `Exit`.
+- Not modelled, stated: the pass's `changed` bookkeeping and named-block
+  rebuilding, and the other consumers of the verdict (they read the same
+  functions, so a verdict change is the same theorem).
