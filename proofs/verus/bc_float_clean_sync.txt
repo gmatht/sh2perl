@@ -1,0 +1,46 @@
+# verus-sync-coverage manifest: bc_float_clean
+# source sha: bc_float_clean=b872f6c06797  proof sha: 8a1fe6ed7371
+# source: src/transforms/bc_float_clean.rs (330 lines, NO #[cfg(test)] block)
+
+[pins]
+pin pin_strip_shapes -> UNMIRRORED (the shape table has no source test)
+pin pin_strip_refusals -> UNMIRRORED (no source test for the refusals)
+pin pin_the_decimal_gate -> UNMIRRORED (only `clean_bc_arg`'s contains('.'), untested)
+pin pin_dfa_agrees -> UNMIRRORED (the DFA is the model's, not the source's)
+pin pin_one_occurrence_per_pass -> UNMIRRORED (rsplit_once is per-call; untested)
+
+[guards]
+guard law strip_removes_only_the_identity (strip Some(p) => p ++ DFA-accepted identity tail, p not ending in whitespace): PRESENT
+guard law identity_tail_is_one_zero_term (the accepted tail's non-whitespace chars are '+','0','.','0'): PRESENT
+guard law add_zero_is_the_identity (term model: appending the zero term keeps the total): PRESENT
+guard law strip_preserves_the_value (both halves in one statement): PRESENT
+guard gate 1 = is_identity_tail / dfa (the trailing term really is `0.0`): PRESENT
+guard gate 2 = has_dot on the STRIPPED text (a decimal must remain): PRESENT
+guard clean_pipeline's shape check (echo|bc, exactly two stages, second is `exec bc`, one echo arg): OUT OF MODEL
+guard clean_bc_arg's Interpolate last-part rule + the scan of earlier Literal parts for a decimal: OUT OF MODEL
+guard the IR traversal (transform / transform_stmt / transform_expr): OUT OF MODEL
+guard bc's float arithmetic `x + 0.0 == x` for finite decimals: STATED ARITHMETIC FACT (Verus has no reals; only the integer identity is proved)
+guard the renderer's float verdict itself: OUT OF MODEL (only its input predicate, has_dot, is modelled)
+
+[counts]
+27 verified, 0 errors (verus --triggers-mode silent --rlimit 40 bc_float_clean.rs)
+mutants: strip-drops-the-zero-check 26v/1e, dfa-AfterPlus-accepts-'1'
+  26v/1e, term-model-total-base-1 26v/1e; trailing-ws-gate-dropped,
+  whitespace-kept-before-plus, dfa-Trail-accepts-anything,
+  dfa-BeforePlus-no-ws-skip, trim_start-no-trim, last_plus-adjacent-only and
+  skip_ws-no-skip rejected at simplification by their pins.
+  Ten mutants measured; each restored byte-identically (sha256 above
+  re-checked after every run).
+[exec]
+# The analysed module has NO #[cfg(test)] block, measured:
+#   grep -c 'cfg(test)' src/transforms/bc_float_clean.rs  ->  0
+# so `cargo test --lib` contains no test that exercises this transform, and
+# every pin row above is UNMIRRORED. Nothing is executed for this proof.
+# The source's own `bc-float-clean` manifest comment (behavioural identity
+# `X + 0.0 == X` for finite values, refuse > guess) is the claim the law
+# states; it is not backed by a unit test in this tree.
+exec pin_strip_shapes: UNMIRRORED (not executed: no source test module)
+exec pin_strip_refusals: UNMIRRORED (not executed)
+exec pin_the_decimal_gate: UNMIRRORED (not executed)
+exec pin_dfa_agrees: UNMIRRORED (not executed)
+exec pin_one_occurrence_per_pass: UNMIRRORED (not executed)

@@ -8877,3 +8877,78 @@ byte-identically after each run (sha256 in `text_capture_fold_sync.txt`).
 - The IR traversal and the `TEXT_FUNCS` position list are structural: any
   subset of positions that still funnels through `fold_text` is covered by
   (A)+(B) unchanged.
+
+## bc_float_clean.rs — the trailing `+ 0.0` strip removes the identity (27)
+
+    verus --triggers-mode silent --rlimit 40 proofs/verus/bc_float_clean.rs
+    -> verification results:: 27 verified, 0 errors
+
+`transforms/bc_float_clean.rs` rewrites an `echo "scale=K; EXPR" | bc`
+capture in place: when the LAST additive term of the argument text is the
+literal `0.0` and the remainder still carries a decimal, that term is
+deleted. The surgery is `trim_end`, `rsplit_once('+')`, a `trim()` and a
+second `trim_end`, so what the pass needs is a STRUCTURAL claim about the
+text it deletes — not a floating-point one.
+
+### (A) The strip deletes exactly an identity tail
+
+`strip_add_zero` transcribes `strip_trailing_add_zero` over whole-string
+cursors (`trim_len` for `trim_end`, `last_plus` for `rsplit_once('+')`,
+`skip_ws` for `trim()`), and the semantic side is an INDEPENDENT five-state
+DFA — `ws* '+' ws* '0' '.' '0' ws*` — written from the grammar, not from
+the pass's cursors. **`strip_removes_only_the_identity`**: if the strip
+returns `Some(p)` then `p` is the string's prefix, it does not end in
+whitespace, and the span the strip deleted is accepted by the DFA.
+`identity_tail_is_one_zero_term` goes further: inside an accepted span the
+non-whitespace characters are exactly `+`, `0`, `.`, `0`, in that order —
+so the deleted text is ONE additive term and it is zero.
+
+### (B) Removing that term preserves the value
+
+The value model is a list of integer terms summed by `total`. The identity
+bc relies on — `x + 0.0 == x` for finite decimals — is proved there as
+`total(a.push(0), 0) == total(a, 0)` (`lemma_total_push` +
+`add_zero_is_the_identity`), and `strip_preserves_the_value` states (A) and
+(B) together for any string the strip accepts.
+
+### Pins
+
+`pin_strip_shapes` the accepted shapes (with and without whitespace on
+either side of `+`, a `scale=2; 3.5 + 0.0` argument), `pin_strip_refusals`
+the refusals that carry the safety (`+ 0`, `+ 0.00`, a `0.0` that is not the
+last term, `-0.0`, no `+` at all, the empty string), `pin_the_decimal_gate`
+the second gate — `1 + 0.0` becomes `1`, which has no decimal, so the caller
+refuses it (the shader backend's float verdict must not change), while
+`1.5 + 0.0` is accepted. `pin_dfa_agrees` checks the recogniser on the same
+spans and `pin_one_occurrence_per_pass` records that one pass removes one
+term (`3 + 0.0 + 0.0` keeps its inner identity — the caller re-runs).
+
+### Mutants, measured
+
+Counted (the run still verifies 26 of 27 and fails exactly one): the strip
+dropping the `s[j] == '0'` check — caught by the law's DFA step into
+`SeeZero`, 26v/1e; the DFA's `AfterPlus` also accepting `'1'` — caught by
+the term-shape equation in `lemma_run_consumes`, 26v/1e; the term model's
+`total` base case being 1 — caught by `lemma_total_push`, 26v/1e. Refuted at
+simplification by a concrete `by (compute)` pin (the run aborts before its
+summary line): the trailing-whitespace gate dropped, the whitespace before
+`+` kept, `Trail` accepting any character, `BeforePlus` not skipping
+whitespace, `trim_start` not trimming, `last_plus` seeing only an adjacent
+`+`, and `skip_ws` skipping nothing. Each was restored byte-identically,
+sha256 re-checked (see `bc_float_clean_sync.txt`).
+
+### Scope (read this before quoting it)
+
+- **The float arithmetic is not modelled.** Verus has no reals here; the
+  proof is over integer terms. `x + 0.0 == x` for finite decimals is bc's
+  arithmetic fact, stated and not proved. It also fails for non-finite
+  values — out of the transform's domain.
+- The `echo … | bc` PIPELINE shape check (`clean_pipeline`: `exec`/`builtin`
+  echo, two stages, the second `exec bc`, exactly one argument), the
+  `Interpolate` last-part rule and the scan of earlier literal parts for a
+  decimal, and the IR traversal are all out of model.
+- Only the renderer contract's INPUT predicate (`has_dot` on the stripped
+  text) is modelled, not the verdict itself.
+- The analysed module has **no `#[cfg(test)]` block** (measured:
+  `grep -c 'cfg(test)'` → 0), so every pin row in the manifest is
+  UNMIRRORED and no `[exec]` PASS row exists for this proof.
