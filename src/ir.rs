@@ -13561,6 +13561,25 @@ pub(crate) fn ir_expr_to_perl(expr: &IrExpr) -> String {
                     if let Some(cond) = render_read_cond(args) {
                         return cond;
                     }
+                    // A command word that is a COMMAND SUBSTITUTION —
+                    // `if $(echo false); then`. Bash expands the capture,
+                    // word-splits it and runs the RESULT as a command, so
+                    // its exit status decides. Run the captured text via
+                    // bash -c and test THAT status (rendering the command
+                    // word directly as `system('bash','-c', …)` would hand
+                    // bash the Perl expression's SOURCE TEXT instead of its
+                    // value). Only the single-word form is handled; extra
+                    // operands keep the previous unbuildable fallback.
+                    if let Some(IrExpr::Call { func: cf, .. }) = args.first() {
+                        if (cf == "capture" || cf == "captureWords")
+                            && exec_word_args(args).is_empty()
+                        {
+                            let value = ir_expr_to_perl(args.first().unwrap());
+                            return format!(
+                                "(do {{ my $__cw = {value}; system('bash', '-c', $__cw) == 0 }})"
+                            );
+                        }
+                    }
                     // Native file-contains: `grep -q PAT FILE` (quiet — no
                     // stdout side effect) lowers to read-the-file + a
                     // substring test, matching bash's grep exit status
