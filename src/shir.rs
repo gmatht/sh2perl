@@ -1690,6 +1690,13 @@ pub(crate) fn ir_expr_reads_status(e: &IrExpr) -> bool {
             // special-cases it to lastExit) — the Var("?") form appears
             // on the lifted/native path
             args.iter().any(ir_expr_reads_status)
+                // A compound command used as an expression operand
+                // (`case … esac && cmd`, `if while …; do …; done`) is
+                // CONSUMED for its status: the enclosing chain/condition
+                // reads it, even though the compound's own statements do
+                // not spell `$?`. Treat the wrapper as a status read so
+                // the compound's status writes survive liveness.
+                || matches!(func.as_str(), "block" | "whileLoop")
                 || (func == "getVar" && matches!(args.as_slice(), [IrExpr::Str(n, _)] if n == "?"))
                 // `${PIPESTATUS[i]}` lowers to `param("", "PIPESTATUS[i]")`
                 // (or `arrayIndex("PIPESTATUS", i)`) — same read as above
@@ -20131,6 +20138,15 @@ fn command_to_ir(cmd: &Command) -> IrExpr {
                 b.commands.iter().filter_map(stmt_for_command).collect(),
             )],
         ),
+        // A compound command used as an `&&`/`||` operand (or any other
+        // expression slot): evaluate its statements in a `block`, whose
+        // value is the compound's status. Without these arms the fallback
+        // stringified the AST into `sh2.unsupported`, so the emitted Perl
+        // died instead of running `case … esac && cmd`.
+        Command::Case(_) | Command::If(_) | Command::For(_) => match stmt_for_command(cmd) {
+            Some(st) => call("block", vec![IrExpr::Arrow(vec![st])]),
+            None => call("unsupported", vec![st(&format!("{cmd:?}"))]),
+        },
         Command::While(w) => call(
             "whileLoop",
             vec![

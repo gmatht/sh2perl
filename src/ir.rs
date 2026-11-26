@@ -2918,6 +2918,36 @@ fn emit_stmt_owned(out: &mut String, stmt: &IrStmt, indent: usize) {
                         };
                         emit_stmt(out, &st, indent);
                     }
+                    "whileLoop" => {
+                        // A `while`/`until` compound used as an expression
+                        // operand (`while …; done && cmd`): the shared IR
+                        // shape is whileLoop(condArrow, bodyArrow). Rebuild
+                        // the structured loop so the status tracking and
+                        // `break`/`continue` arms apply exactly as in
+                        // statement position.
+                        let cond = match args.first() {
+                            Some(IrExpr::Arrow(s)) => match s.as_slice() {
+                                [IrStmt::Expr(c)] => Some(c.clone()),
+                                _ => None,
+                            },
+                            _ => None,
+                        };
+                        let body = match args.get(1) {
+                            Some(IrExpr::Arrow(b)) => Some(b.clone()),
+                            _ => None,
+                        };
+                        match (cond, body) {
+                            (Some(cond), Some(body)) => {
+                                emit_stmt(out, &IrStmt::While { cond, body }, indent)
+                            }
+                            _ => {
+                                emit_indent(out, indent);
+                                out.push_str(
+                                    "die \"otranspilerl: whileLoop shape not renderable (Perl backend)\\n\";\n",
+                                );
+                            }
+                        }
+                    }
                     "block" => {
                         // Multi-statement block in statement position —
                         // flatten its closure bodies.
@@ -4026,6 +4056,22 @@ fn emit_stmt_owned(out: &mut String, stmt: &IrStmt, indent: usize) {
         }
 
         IrStmt::For { var, iter, body } => {
+            // bash's `for` status is the last command executed in the BODY,
+            // or 0 when the body never ran — the same rule as `while`. Needed
+            // when the loop is a condition (`if for …; do …; done`) or an
+            // `&&`/`||` operand; a plain loop keeps the old render.
+            let loop_rc = if rc_unread() {
+                None
+            } else {
+                Some(next_loop_status_var())
+            };
+            if let Some(v) = &loop_rc {
+                emit_indent(out, indent);
+                out.push_str(&format!("my ${v} = 0;\n"));
+            }
+            if let Some(v) = &loop_rc {
+                LOOP_STATUS_VARS.with(|s| s.borrow_mut().push(v.clone()));
+            }
             let iter_str = word_iter_to_perl(iter);
             // Perl's `for $i` restores the pre-loop value after the loop, but
             // bash leaves the last value — iterate a fresh temp and assign
@@ -4038,8 +4084,24 @@ fn emit_stmt_owned(out: &mut String, stmt: &IrStmt, indent: usize) {
             for s in body.iter() {
                 emit_stmt(out, s, indent + 1);
             }
+            if let Some(v) = &loop_rc {
+                emit_indent(out, indent + 1);
+                out.push_str(&format!("${v} = $? >> 8;\n"));
+            }
             emit_indent(out, indent);
             out.push_str("}\n");
+            if loop_rc.is_some() {
+                LOOP_STATUS_VARS.with(|s| s.borrow_mut().pop());
+            }
+            if let Some(v) = &loop_rc {
+                let w = rc_write(&format!("$main_exit_code = $CHILD_ERROR = ${v};"));
+                if !w.is_empty() {
+                    out.push_str(&w);
+                    if !w.ends_with('\n') {
+                        out.push('\n');
+                    }
+                }
+            }
         }
 
         IrStmt::While { cond, body } => {
@@ -13233,7 +13295,61 @@ pub(crate) fn ir_expr_to_perl(expr: &IrExpr) -> String {
                         None => UNBUILDABLE_COND.to_string(),
                     }
                 }
+                "whileLoop" => {
+                    // A `while`/`until` compound as a condition
+                    // (`if while …; do …; done`) or any expression slot:
+                    // emit the loop natively and test its recorded status.
+                    // The loop's status IS what the condition consumes, so
+                    // force the tracking rc var even though the program may
+                    // not read `$?` anywhere else.
+                    let cond = match args.first() {
+                        Some(IrExpr::Arrow(s)) => match s.as_slice() {
+                            [IrStmt::Expr(c)] => Some(c.clone()),
+                            _ => None,
+                        },
+                        _ => None,
+                    };
+                    let body = match args.get(1) {
+                        Some(IrExpr::Arrow(b)) => Some(b.clone()),
+                        _ => None,
+                    };
+                    match (cond, body) {
+                        (Some(cond), Some(body)) => {
+                            let mut inner = String::new();
+                            emit_stmt(&mut inner, &IrStmt::While { cond, body }, 1);
+                            // The loop's own trailing status write leaves
+                            // the loop's code in `$?`.
+                            format!("do {{\n{inner}    ($? >> 8) == 0\n}}")
+                        }
+                        _ => UNBUILDABLE_COND.to_string(),
+                    }
+                }
                 "block" => {
+                    // A COMPOUND COMMAND as an expression operand
+                    // (`if case …; then`, `if for …`) arrives as a block
+                    // wrapping exactly one structured statement. Render it
+                    // natively: the statement writes its status (this
+                    // wrapper counts as a status read) and the condition
+                    // tests it. Rebuilding the block as `bash -c` would lose
+                    // shell functions and (as measured) mangle the text into
+                    // a bare `true` that fails under `use strict`.
+                    if let Some(IrExpr::Arrow(stmts)) = args.first() {
+                        if let [st @ (IrStmt::Case { .. }
+                        | IrStmt::If { .. }
+                        | IrStmt::For { .. }
+                        | IrStmt::While { .. })] = stmts.as_slice()
+                        {
+                            let mut inner = String::new();
+                            emit_stmt(&mut inner, st, 1);
+                            return format!("do {{\n{inner}    ($? >> 8) == 0\n}}");
+                        }
+                        // A compound the optimizer FOLDED AWAY (`if false;
+                        // then :; fi` with no else is status 0 and no
+                        // statements): bash still reports success.
+                        if stmts.is_empty() {
+                            return "do {\n    $? = 0 << 8;\n    ($? >> 8) == 0\n}".to_string();
+                        }
+                    }
                     // Multi-command block in condition position (e.g. a while
                     // cond with several statements): run them joined by `;`.
                     match block_call_to_cmd(expr) {

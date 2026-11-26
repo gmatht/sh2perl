@@ -581,6 +581,17 @@ fn unquote_builtin_command_name(line: &str) -> String {
     if !is_shell_builtin_name(&name) || !is_plain_command_name(&name) {
         return line.to_string();
     }
+    // Unquoting only makes sense when a QUOTED ARGUMENT follows in the same
+    // payload (`'eval' "echo …"`). When the name is the whole payload
+    // (`system('bash', '-c', q{'true'})`) or is concatenated with an
+    // operator (`'true' . $x`), stripping the quotes leaves a bareword and
+    // perl dies under `use strict` — measured on
+    // `if if false; then :; fi; then …`.
+    let after = &rest[consumed..];
+    let arg = after.trim_start();
+    if !after.starts_with(char::is_whitespace) || !(arg.starts_with('\'') || arg.starts_with('"')) {
+        return line.to_string();
+    }
     let mut fixed = String::with_capacity(line.len());
     fixed.push_str(&line[..body_start]);
     fixed.push_str(&name);
