@@ -9,7 +9,7 @@ static __SH_STDIN: std::sync::Mutex<Option<Box<dyn std::io::Read + Send>>> = std
 
 static __SH_ARITH_WORD_FAIL: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
 
-thread_local! { #[allow(non_upper_case_globals)] static __SHV_n: std::cell::Cell<i64> = const { std::cell::Cell::new(0) }; }
+thread_local! { static __SHV_N: std::cell::Cell<i64> = const { std::cell::Cell::new(0) }; }
 
 fn __sh_print_words(ws: &[Vec<Word>], nl: bool, esc: bool) {
     // no echo in this program used -e, so `esc` is always false — the
@@ -39,16 +39,15 @@ fn __sh_print_words(ws: &[Vec<Word>], nl: bool, esc: bool) {
     print!("{}", s);
 }
 
-#[allow(non_upper_case_globals)]
 fn main() {
-    __SHV_n.with(|v| v.set(0));
+    __SHV_N.with(|v| v.set(0));
     let out = {
     let __cap_oldout = __SH_OUTFILE_TL.with(|v| v.borrow_mut().take());
     let __old = __SH_OUT.lock().unwrap_or_else(|e| e.into_inner()).take();
     *__SH_OUT.lock().unwrap_or_else(|e| e.into_inner()) = Some(Vec::new());
     let __cap_oldin = __SH_STDIN.lock().unwrap_or_else(|e| e.into_inner()).take();
-    __SHV_n.with(|v| v.set(__SHV_n.with(|v| v.get()) + 1));
-    __sh_print_words(&[vec![__SHV_n.with(|v| v.get()).to_string().into()]], true, false);
+    __SHV_N.with(|v| v.set(__SHV_N.with(|v| v.get()) + 1));
+    __sh_print_words(&[vec![__SHV_N.with(|v| v.get()).to_string().into()]], true, false);
     __SH_RC.store(0, Ordering::SeqCst);
     *__SH_STDIN.lock().unwrap_or_else(|e| e.into_inner()) = __cap_oldin;
     let __cap = __SH_OUT.lock().unwrap_or_else(|e| e.into_inner()).take().unwrap_or_default();

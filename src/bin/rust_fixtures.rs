@@ -86,6 +86,10 @@ struct Census {
     clones: usize,
     to_strings: usize,
     allows: usize,
+    /// `.unwrap()` / `.expect(` / `panic!` / `unreachable!` left in the
+    /// emitted text. A generated program must never abort: every helper is
+    /// either infallible by construction or rewritten by `unwrap_policy`.
+    panics: usize,
     bash_spawns: usize,
     /// `__sh_*` runtime helpers emitted into this program
     helpers: usize,
@@ -101,6 +105,7 @@ impl Census {
             clones: count(".clone()"),
             to_strings: count(".to_string()"),
             allows: count("#[allow("),
+            panics: count(".unwrap()") + count(".expect(") + count("panic!(") + count("unreachable!("),
             bash_spawns: count("Command::new(\"bash\")"),
             helpers: count("\nfn __sh_"),
             wrapping: count("wrapping_"),
@@ -113,6 +118,7 @@ impl Census {
         self.clones += o.clones;
         self.to_strings += o.to_strings;
         self.allows += o.allows;
+        self.panics += o.panics;
         self.bash_spawns += o.bash_spawns;
         self.helpers += o.helpers;
         self.wrapping += o.wrapping;
@@ -326,8 +332,9 @@ fn main() {
         }
     }
     println!(
-        "{:<20} {:>5} {:>7} {:>5} {:>5} {:>5} {:>5} {:>5} {:>7}",
-        "fixture", "lines", "statics", "clone", "to_str", "allow", "bash", "help", "status"
+        "{:<20} {:>5} {:>7} {:>5} {:>5} {:>5} {:>5} {:>5} {:>5} {:>7}",
+        "fixture", "lines", "statics", "clone", "to_str", "allow", "abort", "bash", "help",
+        "status"
     );
 
     let mut failures = 0usize;
@@ -339,6 +346,15 @@ fn main() {
         let out = out_dir.join(format!("{name}.rs"));
         let c = Census::of(&code);
         total.add(c);
+        // An abort in generated code is a generator bug, not a fixture
+        // behaviour: fail the gate whatever the mode.
+        if c.panics > 0 {
+            println!(
+                "{name:<20} {:>5} {:>7}  PANIC PATH: {} `.unwrap()`/`.expect()`/`panic!`/`unreachable!` in generated code — a helper must be infallible by construction or a documented abort",
+                c.lines, c.statics, c.panics
+            );
+            failures += 1;
+        }
 
         if check {
             match std::fs::read_to_string(&out) {
@@ -455,15 +471,16 @@ fn main() {
             }
         }
         println!(
-            "{name:<20} {:>5} {:>7} {:>5} {:>5} {:>5} {:>5} {:>5}  {status}",
-            c.lines, c.statics, c.clones, c.to_strings, c.allows, c.bash_spawns, c.helpers
+            "{name:<20} {:>5} {:>7} {:>5} {:>5} {:>5} {:>5} {:>5} {:>5}  {status}",
+            c.lines, c.statics, c.clones, c.to_strings, c.allows, c.panics, c.bash_spawns,
+            c.helpers
         );
     }
 
     println!(
-        "\n{:<20} {:>5} {:>7} {:>5} {:>5} {:>5} {:>5} {:>5}",
+        "\n{:<20} {:>5} {:>7} {:>5} {:>5} {:>5} {:>5} {:>5} {:>5}",
         "TOTAL", total.lines, total.statics, total.clones, total.to_strings, total.allows,
-        total.bash_spawns, total.helpers
+        total.panics, total.bash_spawns, total.helpers
     );
     if let Some(e) = &clippy_err {
         eprintln!(

@@ -3,9 +3,8 @@ static __SH_RC: std::sync::atomic::AtomicI32 = std::sync::atomic::AtomicI32::new
 
 static __SH_ARITH_ERR: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
 
-thread_local! { #[allow(non_upper_case_globals)] static __SHV_COUNT: std::cell::RefCell<String> = const { std::cell::RefCell::new(String::new()) }; }
+thread_local! { static __SHV_COUNT: std::cell::RefCell<String> = const { std::cell::RefCell::new(String::new()) }; }
 
-#[allow(non_upper_case_globals)]
 fn main() {
     __SHV_COUNT.with(|v| *v.borrow_mut() = "1".to_string());
     std::env::set_var("COUNT", "1");

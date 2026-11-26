@@ -136,9 +136,46 @@ directions.
   only ever format literals: `07_redirect.rs` went from 261 emitted lines to
   44. Computed formats and the conversions the pass does not model (`%d`,
   widths, `%b`, `%q`, `%c`) keep the interpreter.
-- Generated code carries no bare `.unwrap()`: a poisoned lock still yields its
-  data (`unwrap_or_else(|e| e.into_inner())`), the capture slot defaults to
-  the empty buffer, and a non-hex digit reads as 0.
+- Generated code carries no bare `.unwrap()` and no blanket `#[allow(...)]`
+  for the codegen-noise lints (`dead_code`, `non_upper_case_globals`,
+  `unused_variables`/`_parameters`/`_imports`, `unused_mut`, needless
+  borrows). Measured on the journal fixtures: `#[allow(` 9 → 0,
+  `non_upper_case_globals` 8 → 0, `dead_code` 1 → 0, `.unwrap()` 2 → 0,
+  `.expect(`/`panic!`/`unreachable!` 0 → 0, emitted lines 553 → 547. The
+  *decided dispositions*:
+  - Storage globals are emitted under **uppercase** names
+    (`static_ident`: `__SHV_` + the mangled base uppercased, `_2`/`_3`
+    suffix on a case-only collision), so `non_upper_case_globals` never
+    fires and the declaration reads like hand-written Rust. The name is
+    derived in one place, so `tls`, the declaration, the post-render leak
+    guard and `-Oz` golf all agree.
+  - A poisoned lock still yields its data
+    (`unwrap_or_else(|e| e.into_inner())`), the capture slot defaults to the
+    empty buffer, and a non-hex digit reads as 0 (`unwrap_policy`).
+  - The two remaining panicking shapes are gone by construction:
+    `split_first` uses `let Some(..) = .. else { .. }` (the compiler sees the
+    empty case, so there is nothing to unwrap), and an unopenable redirect
+    target is `.or_else(|_| File::open("/dev/null")).ok()` — an unset sink
+    discards the same bytes `/dev/null` would, and cannot abort. The sink
+    detectors key on the set prefix, not on `Some(`, so the panic-free shape
+    cannot be mistaken for "no sink".
+  - `clippy::print_literal`/`print_with_newline`: a folded constant echo of a
+    lone string literal prints the literal as its own format string
+    (`println!("done")`, or `print!` when it ends in a newline) instead of
+    `println!("{}", "done")`; a literal containing `{`/`}` keeps the
+    placeholder form.
+  - Indexing inside the helpers is guarded by construction: every
+    `p[i]`/`bytes[i]` is inside a `while i < len` loop or preceded by an
+    explicit `i < len` test on the same expression, and slice boundaries come
+    from `char_indices`/`is_ascii_*` checks, so no helper can panic on a
+    boundary or an index.
+- Two `#[allow]` shapes remain emittable but never fire on the fixtures
+  (census 0), each recorded at its emission site: `non_snake_case` for a
+  promoted local whose shell name has an uppercase letter (the local keeps
+  the shell spelling so one name maps to one storage class), and
+  `unused_assignments` for a promoted local whose first write is
+  control-flow dependent (bash zero-initializes; `let mut x;` is not
+  provably assigned on every path).
 - Every word list (the `__sh_print_words` argument, `__sh_wq`, `__sh_cat`,
   `__sh_split_ifs`, `__sh_lines`, `__sh_read_fields`, `__sh_glob`,
   `__sh_brace`, `__sh_aindex`, `__sh_printf`'s arguments) and the text-array
@@ -164,7 +201,9 @@ directions.
 - The gate for all of this is `cargo run --bin rust_fixtures -- --check`
   (stale check, A1-ingress parity, `rustc -D warnings` in debug *and* `-O`,
   behaviour vs `bash`, **clippy `-D warnings` in debug *and* `-O`**, idiom
-  census) plus the differential net `cargo run --bin rust_fuzz`. Clippy is a
+  census, which now also counts `abort`s and fails the gate on a single
+  generated `.unwrap()`/`.expect()`/`panic!`/`unreachable!`) plus the
+  differential net `cargo run --bin rust_fuzz`. Clippy is a
   required check, not an optional extra: if the component is missing the gate
   prints `HARD GAP: clippy did not run` and exits non-zero. It already pays
   for itself — `clippy::print_with_newline`, `clippy::format_in_format_args`

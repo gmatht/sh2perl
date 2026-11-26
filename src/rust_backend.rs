@@ -336,6 +336,13 @@ pub struct Render {
     helpers: BTreeSet<String>,
     /// Rust identifier per shell var name (sanitize + de-dup)
     mangle: HashMap<String, String>,
+    /// `ident_base` → the emitted `thread_local!` storage name. Storage
+    /// globals are UPPERCASE, so the declaration reads like hand-written
+    /// Rust and needs no `#[allow(non_upper_case_globals)]`; two shell
+    /// names that differ only by case (`a` / `A`) get `_2`, `_3` … in
+    /// first-use order.
+    static_idents: HashMap<String, String>,
+    static_idents_used: std::collections::HashSet<String>,
     loop_depth: usize,
     /// per-loop last-body-rc capture var (bash's loop status) — pushed by
     /// While/DoWhile/ForInit/whileLoop renderers; `continue`/`break` (status-0
@@ -449,13 +456,6 @@ pub struct Render {
     /// pre-order `For` counter: must advance in the SAME order as
     /// `analyze_loop_var_escapes`' walk (both are source order).
     for_seq: usize,
-    /// A user-var `thread_local!` declaration is emitted at the module
-    /// root, where an explicit `#[allow(non_upper_case_globals)]`
-    /// attribute is legal. A program with NO user var (all locals, or a
-    /// var-free straight-line script) skips it — the drop-in `decl_stmt`
-    /// carries no attribute then (that only matters when the rendered
-    /// statics are wrapped in a `mod`, where the attribute is rejected).
-    attrs_ok: bool,
     todo: usize,
 }
 
@@ -1283,7 +1283,7 @@ fn inline_simple_helpers(
     let sinks_dead = runtime_free
         || (!out.contains("__SH_ARITH_WORD_FAIL.store(true")
             && !out.contains("*__SH_OUT.lock().unwrap() = Some")
-            && !out.contains("__SH_OUTFILE_TL.with(|v| *v.borrow_mut() = Some"));
+            && !out.contains("__SH_OUTFILE_TL.with(|v| *v.borrow_mut() = "));
 
     if sinks_dead {
         // __sh_puts("LIT") → print!("{}", "LIT")  — only when sinks dead
@@ -1453,6 +1453,21 @@ fn inline_print_words(text: &mut String) {
         // `format_in_format_args`, and one whole allocation saved
         let replacement = match expr.strip_prefix("format!(").and_then(|r| r.strip_suffix(')')) {
             Some(args) => format!("println!({args})"),
+            // a lone string literal is already a format string: emit it
+            // directly (clippy `print_literal`), moving a trailing newline
+            // into `print!` (clippy `print_with_newline`). A `{`/`}` would
+            // have to be doubled, so keep the placeholder form there.
+            None if expr.starts_with('"') && expr.ends_with('"')
+                && !expr.contains('{') && !expr.contains('}') =>
+            {
+                if expr == "\"\"" {
+                    "println!()".to_string()
+                } else if let Some(head) = expr.strip_suffix("\\n\"") {
+                    format!("print!({head}\")")
+                } else {
+                    format!("println!({expr})")
+                }
+            }
             None => format!("println!(\"{{}}\", {expr})"),
         };
         text.replace_range(at..end, &replacement);
@@ -1735,7 +1750,11 @@ fn inline_sh_replace(text: &str) -> String {
 /// in this case, and the callers are unchanged.
 fn inline_sinks_when_unused(text: String, sink_check_needed: bool) -> String {
     let sets_out = text.contains("*__SH_OUT.lock().unwrap() = Some");
-    let sets_file = text.contains("__SH_OUTFILE_TL.with(|v| *v.borrow_mut() = Some");
+    // the set form is `…= Some(File…)` or the panic-free `…= File::…ok()`;
+    // the `__oldout` restore shares the prefix, so a program with only a
+    // restore keeps the machinery too (conservative: never inline a live
+    // sink away).
+    let sets_file = text.contains("__SH_OUTFILE_TL.with(|v| *v.borrow_mut() = ");
     if sink_check_needed || sets_out || sets_file {
         return text;
     }
@@ -3462,11 +3481,16 @@ pub fn shir_to_rust(prog: &IrProgram) -> String {
     // its (undeclared) static name — the failure would otherwise surface
     // as a confusing rustc error, or silently bind a different static.
     if !r.local_vars.is_empty() {
-        for (name, base) in &r.mangle {
-            if !r.local_vars.contains_key(name) {
+        let mangles: Vec<(String, String)> = r
+            .mangle
+            .iter()
+            .map(|(k, v)| (k.clone(), v.clone()))
+            .collect();
+        for (name, base) in mangles {
+            if !r.local_vars.contains_key(&name) {
                 continue;
             }
-            let static_name = format!("__SHV_{base}");
+            let static_name = r.static_ident(&base);
             let hit = text
                 .match_indices(&static_name)
                 .any(|(i, _)| {
@@ -4168,7 +4192,27 @@ impl Render {
     /// helper prefixes (`sh2_*`, `_sh2*`, `__sh_*`, `__SH*`) out of user
     /// vars.
     fn rust_ident(&mut self, name: &str) -> String {
-        format!("__SHV_{}", self.ident_base(name))
+        let base = self.ident_base(name);
+        self.static_ident(&base)
+    }
+
+    /// The `thread_local!` name for a (mangled) base: `__SHV_` + the base
+    /// uppercased, so no `#[allow(non_upper_case_globals)]` is needed, with
+    /// a numeric suffix when two bases differ only by case.
+    fn static_ident(&mut self, base: &str) -> String {
+        if let Some(s) = self.static_idents.get(base) {
+            return s.clone();
+        }
+        let up = base.to_ascii_uppercase();
+        let mut cand = format!("__SHV_{up}");
+        let mut k = 2usize;
+        while self.static_idents_used.contains(&cand) {
+            cand = format!("__SHV_{up}_{k}");
+            k += 1;
+        }
+        self.static_idents_used.insert(cand.clone());
+        self.static_idents.insert(base.to_string(), cand.clone());
+        cand
     }
 
     /// Sanitized, de-duplicated *bare* identifier for a var (no static
@@ -4616,6 +4660,11 @@ impl Render {
             if let Some(rhs) = borrowable_binding_rhs(raw) {
                 let kw = if self.local_mut.contains(name) { "let mut" } else { "let" };
                 let mut attr = String::new();
+                // The ONE remaining allow shape: a promoted local keeps the
+                // shell spelling, so an uppercase name (`COUNT`) needs
+                // `non_snake_case`. Renaming it to `count` would break the
+                // 1:1 name map the store/leak guard and the golf renamer
+                // rely on. No journal fixture triggers it (census 0).
                 if m.chars().any(|c| c.is_ascii_uppercase()) {
                     attr.push_str("#[allow(non_snake_case)] ");
                 }
@@ -4639,6 +4688,11 @@ impl Render {
         if self.local_init.remove(name) {
             let kw = if self.local_mut.contains(name) { "let mut" } else { "let" };
             let mut attr = String::new();
+            // bash zero-initializes, so a local whose first write is
+            // control-flow-dependent needs a default init that may be
+            // overwritten before any read; `let mut x;` is not provably
+            // assigned on every path. Recorded, and absent from the
+            // fixtures (census 0).
             if self.local_dead_init.contains(name) {
                 attr.push_str("#[allow(unused_assignments)] ");
             }
@@ -9142,7 +9196,7 @@ impl Render {
                         pre.push("let __oldin = __SH_STDIN.lock().unwrap().take();".to_string());
                         pre.push("let __oldinp = __SH_STDIN_PATH.lock().unwrap().take();".to_string());
                         pre.push(format!(
-                            "*__SH_STDIN.lock().unwrap() = Some(Box::new(std::fs::File::open(&{te}).unwrap_or_else(|_| {{ let f = std::fs::File::open(\"/dev/null\").unwrap(); f }})));"
+                            "*__SH_STDIN.lock().unwrap() = std::fs::File::open(&{te}).or_else(|_| std::fs::File::open(\"/dev/null\")).ok().map(Box::new);"
                         ));
                         // a shell-out inheriting this stdin must see the
                         // REAL device fd (`tty < /dev/pts/5` needs
@@ -9250,11 +9304,11 @@ impl Render {
             pre.push("let __oldout = __SH_OUTFILE_TL.with(|v| v.borrow_mut().take());".to_string());
             if r.mode == "w" {
                 pre.push(format!(
-                    "__SH_OUTFILE_TL.with(|v| *v.borrow_mut() = Some(std::fs::File::create(&{te}).unwrap_or_else(|_| std::fs::File::open(\"/dev/null\").unwrap())));"
+                    "__SH_OUTFILE_TL.with(|v| *v.borrow_mut() = std::fs::File::create(&{te}).or_else(|_| std::fs::File::open(\"/dev/null\")).ok());"
                 ));
             } else {
                 pre.push(format!(
-                    "__SH_OUTFILE_TL.with(|v| *v.borrow_mut() = Some(std::fs::OpenOptions::new().append(true).create(true).open(&{te}).unwrap_or_else(|_| std::fs::File::open(\"/dev/null\").unwrap())));"
+                    "__SH_OUTFILE_TL.with(|v| *v.borrow_mut() = std::fs::OpenOptions::new().append(true).create(true).open(&{te}).or_else(|_| std::fs::File::open(\"/dev/null\")).ok());"
                 ));
             }
             post.push("__SH_OUTFILE_TL.with(|v| *v.borrow_mut() = __oldout);".to_string());
@@ -11521,7 +11575,7 @@ impl Render {
                 let c = self.expr_str(content);
                 if *append {
                     self.emit(&format!(
-                        "{{ let mut __f = std::fs::OpenOptions::new().append(true).create(true).open(&{p}).unwrap_or_else(|_| {{ let f = std::fs::File::open(\"/dev/null\").unwrap(); f }}); use std::io::Write; let _ = __f.write_all({c}.as_bytes()); }}"
+                        "{{ if let Ok(mut __f) = std::fs::OpenOptions::new().append(true).create(true).open(&{p}).or_else(|_| std::fs::File::open(\"/dev/null\")) {{ use std::io::Write; let _ = __f.write_all({c}.as_bytes()); }} }}"
                     ));
                 } else {
                     self.emit(&format!("let _ = std::fs::write({p}, {c});"));
@@ -12053,6 +12107,8 @@ impl Render {
                                 None
                             };
                             let mut attr = String::new();
+                            // same spelling rule as `local_write_stmt`
+                            // (uppercase promoted local, census 0)
                             if binding.as_ref().is_some_and(|b| b == var)
                                 && var.chars().any(|c| c.is_ascii_uppercase())
                             {
@@ -12838,14 +12894,6 @@ impl Render {
         let mut decl_out = Vec::new();
         std::mem::swap(&mut self.out, &mut decl_out);
         self.depth = 0;
-        // A user-var `thread_local!` declaration is a module-root item, so
-        // an explicit `#[allow(non_upper_case_globals)]` on it is legal.
-        // With NO user var (all locals, or a var-free straight-line
-        // script) there is nothing to allow: the attribute would be noise
-        // on `fn main` — and an attribute on a `fn` inside a block is a
-        // hard error, so the flag is threaded into `decl_stmt` (and the
-        // main emission below).
-        self.attrs_ok = !written.is_empty();
         for v in &written {
             let d = self.decl_stmt(v);
             self.emit(&d);
@@ -13056,7 +13104,6 @@ impl Render {
                 || (l.contains("fn main(") && !l.contains("fn main()"))
         });
         if seen_var {
-            self.emit("#[allow(non_upper_case_globals)]");
             self.emit("fn main() {");
             self.out.extend(body_out.iter().cloned());
             self.emit("}");
@@ -13085,16 +13132,10 @@ impl Render {
         }
         // a nameref's own static is still declared (dead but harmless) —
         // `unset ref` etc. may reference it before the binding renders
+        // The storage name is uppercase (`static_ident`), so the
+        // declaration is lint-clean without a `#[allow]`.
         let m = self.rust_ident(v);
-        // User var names are lower-case; the generated name is MANGLEABLE
-        // (`-Oz` golf renames it into a short pool), so the allow must be
-        // an explicit attribute — legal only on a module-root item, which
-        // this declaration is (see `attrs_ok`).
-        let a = if self.attrs_ok {
-            "#[allow(non_upper_case_globals)] "
-        } else {
-            ""
-        };
+        let a = "";
         if self.is_assoc(v) {
             format!(
                 "thread_local! {{ {a}static {m}: std::cell::RefCell<std::collections::BTreeMap<String, String>> = const {{ std::cell::RefCell::new(std::collections::BTreeMap::new()) }}; }}"
@@ -14153,7 +14194,6 @@ fn helper_source(h: &str) -> &'static str {
     // shell, no dependency (`regex` is not in the generated program's
     // manifest, and this backend must not add one). Backtracking over a
     // parsed tree; `?`/`*`/`+` are `Rep` with min/max, `|` is `Alt`.
-    #[allow(dead_code)]
     enum N {
         Chr(char),
         Any,
@@ -14235,8 +14275,7 @@ fn helper_source(h: &str) -> &'static str {
     }
 
     fn cat(v: &[N], t: &[char], i: usize, k: &mut dyn FnMut(usize) -> bool) -> bool {
-        if v.is_empty() { return k(i); }
-        let (head, rest) = v.split_first().unwrap();
+        let Some((head, rest)) = v.split_first() else { return k(i); };
         m(head, t, i, &mut |j| cat(rest, t, j, &mut *k))
     }
 
@@ -20199,7 +20238,7 @@ mod tests {
         // vetoes the elision.
         let out = render("for n in a b c; do echo \"$n\"; done\necho \"last=$n\"\n");
         assert!(
-            out.contains("__SHV_n.with(|v| *v.borrow_mut() = n.to_string())"),
+            out.contains("__SHV_N.with(|v| *v.borrow_mut() = n.to_string()"),
             "escaping var lost its write-back:\n{out}"
         );
     }
@@ -20228,11 +20267,11 @@ mod tests {
             "no native binding:\n{out}"
         );
         assert!(
-            !out.contains("__SHV_i.with(|v| v.get())"),
+            !out.contains("__SHV_I.with(|v| v.get())"),
             "outer read fell back to the static:\n{out}"
         );
         assert!(
-            !out.contains("__SHV_j.with(|v| v.get())"),
+            !out.contains("__SHV_J.with(|v| v.get())"),
             "inner read fell back to the static:\n{out}"
         );
     }
@@ -20857,7 +20896,7 @@ mod tests {
         // an own-flow write of the loop var keeps the legacy scheme
         let out = render("for i in $(seq 1 3)\ndo\n  i=9\n  echo $i\ndone\n");
         assert!(!out.contains("for __sh_lv"), "{out}");
-        assert!(out.contains("__SHV_i"), "{out}");
+        assert!(out.contains("__SHV_I"), "{out}");
     }
 
     #[test]

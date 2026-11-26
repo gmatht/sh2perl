@@ -3,7 +3,6 @@ fn __sh_re_ere(text: &str, pat: &str, ci: bool) -> bool {
     // shell, no dependency (`regex` is not in the generated program's
     // manifest, and this backend must not add one). Backtracking over a
     // parsed tree; `?`/`*`/`+` are `Rep` with min/max, `|` is `Alt`.
-    #[allow(dead_code)]
     enum N {
         Chr(char),
         Any,
@@ -85,8 +84,7 @@ fn __sh_re_ere(text: &str, pat: &str, ci: bool) -> bool {
     }
 
     fn cat(v: &[N], t: &[char], i: usize, k: &mut dyn FnMut(usize) -> bool) -> bool {
-        if v.is_empty() { return k(i); }
-        let (head, rest) = v.split_first().unwrap();
+        let Some((head, rest)) = v.split_first() else { return k(i); };
         m(head, t, i, &mut |j| cat(rest, t, j, &mut *k))
     }
 

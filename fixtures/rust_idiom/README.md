@@ -42,9 +42,12 @@ Re-render after a backend change, then look at the diff:
    **hard gap**, not a skip: the summary prints `HARD GAP: clippy did not
    run` and the gate exits 2. (`rustup component add clippy`.)
 6. **census** — the idiom counters (per-variable statics, `.clone()`,
-   `.to_string()`, `#[allow(`, `Command::new("bash")`, emitted `__sh_*`
-   helpers, lines) are printed per fixture and totalled. "Idiomatic" is a
-   number that has to keep moving down, not a claim in a comment.
+   `.to_string()`, `#[allow(`, `abort`, `Command::new("bash")`, emitted
+   `__sh_*` helpers, lines) are printed per fixture and totalled.
+   "Idiomatic" is a number that has to keep moving down, not a claim in a
+   comment. A non-zero `abort` count is a hard failure in every mode: a
+   generated program may not contain `.unwrap()`, `.expect(`, `panic!` or
+   `unreachable!`.
 
 ## The word vector type
 
@@ -120,6 +123,59 @@ The two surviving parses, and the one surviving `len() as i64`:
 * `05_array` — `__SHV_arr.with(|v| v.borrow().len() as i64)` is already the
   numeric length (`Vec::len()` promoted once); it is the fixed point of the
   array-length read, not a stringify-reparse.
+
+## Naming, lints and aborts
+
+The emitted program is meant to read as if a person wrote it: no
+`#[allow(...)]` blanket and no `.unwrap()`. Census over the committed
+`expected/*.rs` (before = the previous commit, after = the render in this
+tree):
+
+| counter | before | after |
+|---|---|---|
+| `#[allow(` — total | 9 | **0** |
+| ├ `non_upper_case_globals` | 8 | 0 |
+| └ `dead_code` | 1 | 0 |
+| `.unwrap()` | 2 | **0** |
+| `.expect(` | 0 | 0 |
+| `panic!(` / `unreachable!(` | 0 | 0 |
+| emitted lines | 553 | 547 |
+
+The rules behind the zeros:
+
+- **Storage names are uppercase.** A user-var `thread_local!` is
+  `__SHV_COUNT`, not `__SHV_value`, so the declaration needs no
+  `non_upper_case_globals` allow. The name is still derived from the mangled
+  base (`static_ident`, case-collision suffix `_2`, `_3` when `a` and `A`
+  both exist), so the leak guard and `-Oz` golf see the same identifier the
+  uses do. The stray `#[allow(non_upper_case_globals)]` that used to sit in
+  front of `fn main()` (where the lint cannot even apply) is gone with the
+  `attrs_ok` flag that threaded it.
+- **A lone string literal is its own format string.** `__sh_print_words`
+  folded to a print call on a constant word emits `println!("done")`, not
+  `println!("{}", "done")` (`clippy::print_literal`); a trailing `\n` in the
+  literal becomes `print!` (`print_with_newline`), and a literal containing
+  `{`/`}` keeps the `{}` placeholder form because it would need doubling.
+- **The ERE helper's `enum N` is fully live**, so its `#[allow(dead_code)]`
+  was stale and is removed (proved by compiling the file with it stripped).
+- **No panic path.** `let Some((head, rest)) = v.split_first() else { … }`
+  replaces `v.split_first().unwrap()` (infallible by construction: the
+  compiler sees the empty case), and a redirect target that cannot be opened
+  falls back with `.or_else(|_| File::open("/dev/null")).ok()` instead of
+  `unwrap_or_else(|_| File::open("/dev/null").unwrap())`. `.ok()` cannot
+  panic: if even `/dev/null` cannot be opened the sink is simply left unset,
+  and the sink-detection passes key on the *set* prefix
+  (`__SH_OUTFILE_TL.with(|v| *v.borrow_mut() = `), not on the old `Some(`
+  spelling, so nothing inlines a live sink away.
+
+Remaining `#[allow]` shapes the emitter can still produce, recorded at the
+emission site in `src/rust_backend.rs` and absent from all 17 fixtures
+(census 0):
+
+| lint | when | why the emission cannot avoid it |
+|---|---|---|
+| `non_snake_case` | a *promoted local* whose shell name has an uppercase letter (`let COUNT = …`) | the local keeps the shell spelling so one name maps to one storage class for the whole program (the leak guard and the golf renamer both rely on that); renaming it would need a second name map |
+| `unused_assignments` | a promoted local whose first write is control-flow dependent (`local_dead_init`) | bash zero-initializes; `let mut x;` is not provably assigned on every path, so the default init stays and may be overwritten unread |
 
 ## What each fixture pins
 

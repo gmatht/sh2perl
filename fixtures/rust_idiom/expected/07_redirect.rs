@@ -37,7 +37,7 @@ fn __sh_print_words(ws: &[Vec<Word>], nl: bool, esc: bool) {
 fn main() {
     {
         let __oldout = __SH_OUTFILE_TL.with(|v| v.borrow_mut().take());
-        __SH_OUTFILE_TL.with(|v| *v.borrow_mut() = Some(std::fs::File::create("out.txt").unwrap_or_else(|_| std::fs::File::open("/dev/null").unwrap())));
+        __SH_OUTFILE_TL.with(|v| *v.borrow_mut() = std::fs::File::create("out.txt").or_else(|_| std::fs::File::open("/dev/null")).ok());
         __sh_print_words(&[vec![format!("{}\n", "a b").into()]], false, false);
         __SH_OUTFILE_TL.with(|v| *v.borrow_mut() = __oldout);
     }
