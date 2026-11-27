@@ -9578,3 +9578,33 @@ restored byte-identically (`shir_native_f1_sync.txt`).
 `native_literal_subshell_wc_stmt`'s literal grep/sed tree (F2). Locales,
 multibyte cutting and the byte renderer are out of model; D1–D3 are reused,
 not re-claimed. Clusters F2–F4, G and A remain open.
+
+#### F1 continued: plain `sort` and the line-mode windows
+
+    proofs/verus/shir_native_f1.rs                (47 verified, 0 errors)
+
+- **`plain_sort_law`** — `native_sort_stmt`'s plain branch splits the
+  producer, drops a trailing empty segment, sorts and re-joins. Two
+  independent properties of that output are proved: it is nondecreasing
+  under a byte-lexicographic order (`sorted`/`sorted_at`, via the pass's
+  insertion sort `insert`/`isort`), and it is a permutation of the input
+  (`same_multiset`, counting each line). The semantic side is those two
+  relations, never a second sort. `-n`/`-h` use a different comparison and
+  stay out of model; unknown flags (`-u`, `--reverse`, `-k2`, a file
+  operand) are refused by `plain_sort_flag`, pinned. Note the plan expected
+  the source to refuse `-n`/`-r`; it implements both, so `-r` is a
+  plain-order flag here and the pins cover what is really refused.
+- **Line-mode `head -N` / `tail -N`** — the fold's split/join
+  (`split_nl`/`join_lines`/`source_lines`) is modelled and its emitted bytes
+  are pinned, but the byte-level equality with bash's line copy is **not
+  proved**: `head -N` past the last line appends a stray newline, `tail -N`
+  on a terminated producer selects the trailing empty segment and prints
+  nothing, and `tail -N` on an unterminated producer adds a newline bash
+  does not. Those are source divergences, recorded as pins rather than
+  assumed away.
+
+Second mutant measurement (47v/0e baseline): insert comparing backwards
+(**42v/5e**), isort dropping its head (**45v/2e**), `plain_sort_flag`
+accepting `-n` (**46v/1e**), `source_lines` omitting its newline
+(**44v/3e**), `join_lines` adding a trailing newline (**43v/4e**). All
+restored byte-identically.

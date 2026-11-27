@@ -1,11 +1,17 @@
 # verus-sync-coverage manifest: shir_native_f1
-# source sha: shir_native_stmt=93c9e845a066  proof sha: 6c9a5aa9ad8d
+# source sha: shir_native_stmt=9b6bd3e84004
+# (re-audited: the drift since 93c9e845a066 is a concurrent worker's scratch-name
+#  counters in native_echo_write_file_stmt / emit_file_op / native_ls_stmt;
+#  the F1 functions modelled here — native_echo_tr_sort_stmt, tr_set_escape,
+#  native_wc_l_pipeline, native_head_tail_stmt/_pipeline, native_sort_stmt —
+#  are byte-identical.)  proof sha: 6b09daa384ee
 # source: src/transforms/shir_native_stmt.rs (cluster F1, the parts proved:
 #   native_echo_tr_sort_stmt 5252, tr_set_escape 5220,
 #   native_wc_l_pipeline 2473, native_head_tail_stmt 1749,
 #   native_head_tail_pipeline 2369)
-# Cluster F1 is only PARTLY covered: tr/wc/head-tail are proved; sort's
-# ordering and the line-mode head/tail split are stated open below.
+# Cluster F1: tr/wc/head-tail proved (first pass); plain sort's ordering and
+# permutation laws proved (second pass); the line-mode head/tail byte equality
+# is NOT proved and its divergences are pinned (third section below).
 # Clusters F2-F4, G and A remain.
 
 [pins]
@@ -13,6 +19,13 @@ pin pin_tail_clamps -> UNMIRRORED (no source test for tail -c clamping)
 pin pin_head_zero_is_empty -> UNMIRRORED (no source test for head -c 0)
 pin pin_tr_only_maps_the_set -> UNMIRRORED (no source test for tr's set map)
 pin pin_wc_needs_a_newline_per_line -> UNMIRRORED (no source test for wc's producer shape)
+pin pin_plain_sort_is_byte_order -> UNMIRRORED (no source test for plain sort order)
+pin pin_numeric_order_differs_from_plain_order -> UNMIRRORED (no source test for -n vs plain order)
+pin pin_unknown_sort_flags_keep_the_shell_out -> UNMIRRORED (no source test for the sort flag refusals)
+pin pin_head_one_line -> UNMIRRORED (no source test for line-mode head)
+pin pin_head_beyond_the_last_line_adds_a_newline -> UNMIRRORED (records a source divergence, no test)
+pin pin_tail_lines_selects_the_trailing_empty_segment -> UNMIRRORED (records a source divergence, no test)
+pin pin_tail_lines_add_a_newline_bash_does_not -> UNMIRRORED (records a source divergence, no test)
 
 [guards]
 guard law tr_join_law (per-line tr re-joined == bash tr on the stream): PRESENT
@@ -23,8 +36,13 @@ guard independent side: tr_text/count_nl/head/tail operate on the produced byte 
 guard independent side: tr_lines/join/line count/head-tail clamps operate on the fold's line and clamped-string terms: PRESENT
 guard domain: a != '\n' for tr (the fold maps line contents, bash also maps separators): STATED
 guard domain: every line carries no newline (all_no_nl) and the producer terminates each line: STATED
-guard sort: plain ordering and -n/-r refusals: NOT THIS PROOF
-guard line-mode head -N/tail -N splitting and joined trailing newline: NOT THIS PROOF
+guard law plain_sort_law: sorted(isort(ls)) and same_multiset(isort(ls), ls): PRESENT
+guard independent side (sort): sorted/same_multiset are relations over the output, not a second sort: PRESENT
+guard independent side (sort): isort/insert are the pass's insertion-sort algorithm: PRESENT
+guard flag refusals: unknown flags and the non-plain -n/-h modes: PRESENT (plain_sort_flag pins)
+guard -r: accepted, plain ordering proved; the reverse output order itself is not modelled: STATED
+guard line-mode head -N/tail -N: split/join/source_lines modelled, emitted bytes pinned; byte equality with bash NOT proved: STATED
+guard line-mode divergences recorded: over-long head, tail on a terminated producer, tail on an unterminated producer: PRESENT (pins)
 guard native_literal_subshell_wc_stmt's nested literal grep/sed tree: NOT THIS PROOF (F2)
 guard native_sort_stmt / native_sort_file_stmt numeric/human/reverse orderings and human_size: NOT THIS PROOF
 guard locales, multibyte cutting, byte renderer: OUT OF MODEL
@@ -32,8 +50,10 @@ guard D1/D2/D3 laws: REUSED conceptually, not re-claimed
 guard clusters F2-F4, G, A: NOT THIS PROOF
 
 [counts]
-18 verified, 0 errors (verus --triggers-mode silent --rlimit 40 shir_native_f1.rs)
-mutants measured this turn against that baseline, each restored
+47 verified, 0 errors (verus --triggers-mode silent --rlimit 40 shir_native_f1.rs)
+first measurement (tr/wc/head-tail) baseline was 18 verified, 0 errors;
+second measurement (sort + line mode) baseline is 47 verified, 0 errors.
+mutants measured against the 18v/0e baseline, each restored
   byte-identically (sha re-checked):
     counted (17v/1e):
       m1 tr skips the per-line translation (tr_join_law)
@@ -46,6 +66,12 @@ mutants measured this turn against that baseline, each restored
     rejected before verification by a concrete pin:
       m3 join drops the later lines — join stops being recursive, so
          join_cons's reveal_with_fuel cannot be satisfied
+mutants measured against the 47v/0e baseline (sort + line mode), all counted:
+    s1 insert compares backwards (42v/5e, the sorted/isort chain)
+    s2 isort drops the head line (45v/2e, same_multiset/isort_perm)
+    s3 plain_sort_flag accepts -n (46v/1e, the flag-refusal pin)
+    s4 source_lines omits its newline (44v/3e, the head-line pins)
+    s5 join_lines adds a trailing newline (43v/4e, the head-line pins)
 
 [exec]
 # The analysed module's 8 tests cover chain/find and the renderer; none
