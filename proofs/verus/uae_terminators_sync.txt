@@ -1,7 +1,10 @@
 # verus-sync-coverage manifest: uae_terminators
-# source sha: shir=10e2eaec7a19 (sha256 of src/shir.rs; audited: since
-#   0267b2d61be5 only the ESTree lowering changed -- stmt_to_estree,
-#   expr_to_estree, store_rhs_string -- not the terminator region this models.
+# source sha: shir=215b4d8f322e (sha256 of src/shir.rs; audited: since
+#   9cf054f19 only ir_stmt_writes_lastexit (Case/Select join the writer
+#   set), ir_expr_reads_status (a block/whileLoop operand is a status read)
+#   and command_to_ir (a compound command in an expression slot lowers to
+#   `block`) changed -- none of stmt_terminates, list_terminates,
+#   is_true_cond, loop_escapes or has_break, the region this models.
 #   The row used to record HEAD's git blob; it now records the content digest,
 #   because the checker has exactly one rule and no alternate digest.)
 # uae=3adb4e485152 (sha256 of src/transforms/unreachable_after_exit.rs)
