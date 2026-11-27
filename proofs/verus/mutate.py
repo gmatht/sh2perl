@@ -23,8 +23,9 @@ This script makes each of those claims executable:
 
 The table below is the documented mutant set of the five stages landed
 2026-11-24..27 (`strip` is older and is not in the table yet): affix_strip_fold,
-text_capture_fold, bc_float_clean, uae_terminators, status_reads and
-status_reads_traversal.  Each entry's expectation is the header's own number
+text_capture_fold, bc_float_clean, uae_terminators, status_reads,
+status_reads_traversal and shir_native_herestring (cluster C of the
+shir_native_stmt decomposition).  Each entry's expectation is the header's own number
 where the header gives one; entries the header records only as a class
 ("rejected at simplification") assert the class and name the pin when the
 header names it.
@@ -68,6 +69,7 @@ PROOF_SHA = {
     "uae_terminators": "300c286819f1",
     "status_reads": "467f5b75b0c5",
     "status_reads_traversal": "dff0d2f529a1",
+    "shir_native_herestring": "b4092c0ad51c",
 }
 
 # proof file -> obligations the pristine run reports (header baseline).
@@ -78,6 +80,7 @@ BASELINE = {
     "uae_terminators": 31,
     "status_reads": 28,
     "status_reads_traversal": 70,
+    "shir_native_herestring": 20,
 }
 
 
@@ -254,6 +257,84 @@ MUTANTS = [
         "/// echo flags, as the SEMANTIC side sees them",
         None, None, ("pin_printed_assembles_the_text",),
         "the independent semantic recursion prints an Rt word as empty text",
+    ),
+    # ── shir_native_herestring.rs — baseline 20/0, six documented mutants ──
+    Mutant(
+        "here/m1-bare-tr-collapses",
+        "shir_native_herestring",
+        "            Cmd::Tr => if ws.len() > 0 {\n"
+        "                Option::Some(true)\n"
+        "            } else {\n"
+        "                Option::None\n"
+        "            },\n"
+        "            Cmd::Grep =>",
+        "            Cmd::Tr => if true {\n"
+        "                Option::Some(true)\n"
+        "            } else {\n"
+        "                Option::None\n"
+        "            },\n"
+        "            Cmd::Grep =>",
+        None, None, ("pin_refusals",),
+        "bare `tr` (which exits 1) collapses to `true`",
+    ),
+    Mutant(
+        "here/m2-grep-c-refusal-dropped",
+        "shir_native_herestring",
+        "Cmd::Grep => if plain(ws, 0) == 1 && !has_dyn(ws, 0) && !has_c(ws, 0)",
+        "Cmd::Grep => if plain(ws, 0) == 1 && !has_dyn(ws, 0)",
+        None, None, ("pin_refusals",),
+        "`grep -c` (which would print `0`) collapses",
+    ),
+    Mutant(
+        "here/m3-grep-file-operand-collapses",
+        "shir_native_herestring",
+        "Cmd::Grep => if plain(ws, 0) == 1 &&",
+        "Cmd::Grep => if plain(ws, 0) >= 1 &&",
+        None, None, ("pin_refusals",),
+        "a grep file operand collapses",
+    ),
+    Mutant(
+        "here/m4-cat-accepts-a-file-operand",
+        "shir_native_herestring",
+        "        (match ws[i] {\n"
+        "            W::Lit(s) => s.len() == 1 && s[0] == '-',\n"
+        "            _ => false,\n"
+        "        }) && dash_ok(ws, i + 1)",
+        "        (match ws[i] {\n"
+        "            W::Lit(_s) => true,\n"
+        "            _ => false,\n"
+        "        }) && dash_ok(ws, i + 1)",
+        None, None, ("pin_refusals",),
+        "`cat` accepts a file operand",
+    ),
+    Mutant(
+        "here/m5-interpolated-pattern-accepted",
+        "shir_native_herestring",
+        "            W::Lit(s) => s.len() > 0,\n"
+        "            _ => false,\n"
+        "        }\n    }\n}\n\n"
+        "pub open spec fn collapse",
+        "            W::Lit(s) => s.len() > 0,\n"
+        "            _ => true,\n"
+        "        }\n    }\n}\n\n"
+        "pub open spec fn collapse",
+        None, None, ("pin_refusals",),
+        "an interpolated pattern is accepted",
+    ),
+    Mutant(
+        "here/m6-analysis-accepts-a-dynamic-word",
+        "shir_native_herestring",
+        "            W::Dyn => true,\n"
+        "            _ => false,\n"
+        "        }) || has_dyn(ws, i + 1)",
+        "            W::Dyn => false,\n"
+        "            _ => false,\n"
+        "        }) || has_dyn(ws, i + 1)",
+        19, 1, ("lemma_dyn",),
+        "the analysis accepts a dynamic word, whose runtime text is unknown "
+        "— no pin computes this shape, so the refinement bridge lemma "
+        "(has_dyn == s_dyn) that carries the law is falsified, and the law "
+        "with it",
     ),
     # ── bc_float_clean.rs — baseline 27/0, ten documented mutants ───────────
     Mutant(

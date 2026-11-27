@@ -1,0 +1,41 @@
+# verus-sync-coverage manifest: shir_native_herestring
+# source sha: shir_native_stmt=93c9e845a066  proof sha: b4092c0ad51c
+# source: src/transforms/shir_native_stmt.rs (cluster C: empty_herestring_to_status, line 6890)
+# This is the FIRST proved cluster of the decomposition in shir_native_stmt_plan.md;
+# the ten-cluster plan is not complete (see that file's status line).
+
+[pins]
+pin pin_shapes -> UNMIRRORED (no source test exercises the empty-herestring collapse)
+pin pin_refusals -> UNMIRRORED (no source test for the refusals)
+pin pin_bash_shapes -> UNMIRRORED (the semantic side is the model's, not the source's)
+
+[guards]
+guard law empty_herestring_emits_the_true_status (collapse Some(ok) => bash returns empty stdout and status 0/1): PRESENT
+guard analysis collapse: cat/tr/grep arms transcribed as counters (plain, has_dyn, has_c, dash_ok, one_lit_pattern): PRESENT
+guard semantic bash: independent recursions s_dash/s_plain/s_dyn/s_c/s_pattern: PRESENT
+guard bridge lemmas dash_ok==s_dash, plain==s_plain, has_dyn==s_dyn, has_c==s_c, one_lit_pattern==s_pattern: PRESENT
+guard the statement SHAPE gates (one redirect, mode=herestring, fd=0, literal target, single exec): OUT OF MODEL (structural; emptiness kept as empty_target)
+guard `cat <<< ''` with the `-` operand: MODELLED
+guard `tr` argument validity (an interpolated set accepted by both sides): OUT OF MODEL (empty stdin prints nothing either way)
+guard grep's BRE pattern language: OUT OF MODEL (no input line can match; only the word shape matters)
+guard the IR traversal that reaches the redirect, and lower_printf: OUT OF MODEL
+guard the other 59 folds of shir_native_stmt.rs (clusters A-B, D-H): NOT THIS PROOF (plan stages still open)
+
+[counts]
+20 verified, 0 errors (verus --triggers-mode silent --rlimit 40 shir_native_herestring.rs)
+mutants: analysis-accepts-a-dynamic-word 19v/1e (lemma_dyn, the refinement
+  bridge the law rests on: no pin computes this shape, so the proof itself
+  fails, and the law with it); bare-tr-collapses,
+  grep--c-refusal-dropped, grep-file-operand-collapses, cat-accepts-a-file-operand
+  and interpolated-pattern-accepted rejected at simplification by pin_refusals.
+  Six mutants measured; each restored byte-identically (sha256 above re-checked
+  after every run).
+[exec]
+# The analysed module's #[cfg(test)] module has 8 tests, none for the
+# empty-herestring collapse, measured:
+#   grep -n 'herestring' src/transforms/shir_native_stmt.rs -> no test call site
+# so `cargo test --lib` contains no test that exercises this cluster, and every
+# pin row above is UNMIRRORED. Nothing is executed for this proof.
+exec pin_shapes: UNMIRRORED (not executed: no source test for this fold)
+exec pin_refusals: UNMIRRORED (not executed)
+exec pin_bash_shapes: UNMIRRORED (not executed)

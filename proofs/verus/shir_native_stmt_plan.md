@@ -1,7 +1,8 @@
 # `transforms/shir_native_stmt.rs` — decomposition plan (why this one is not a law)
 
     source: src/transforms/shir_native_stmt.rs   7140 lines
-    proof status: none — and none is possible in the shape of the last five
+    proof status: cluster C PROVED (shir_native_herestring.rs, 20 verified / 0 errors);
+                  clusters A-B and D-H are still planned — see §4
 
 This is a PLAN, not a proof. It exists because `shir_native_stmt` is the one
 output-changing transform left whose property is not a single statement: it is
@@ -156,7 +157,7 @@ status and filesystem effect", which is really a renderer contract (the Perl
 backend takes the native fallback only for the wrapped form). That half is
 out of model; state it.
 
-### C — empty herestrings collapse to a status (smallest real law; DO THIS FIRST)
+### C — empty herestrings collapse to a status (smallest real law; PROVED)
 
 Functions: `empty_herestring_to_status` (6876), `status_exec` (84),
 `exec_parts` (369).

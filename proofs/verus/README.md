@@ -9201,7 +9201,7 @@ sha256 re-checked (see `bc_float_clean_sync.txt`).
   `grep -c 'cfg(test)'` → 0), so every pin row in the manifest is
   UNMIRRORED and no `[exec]` PASS row exists for this proof.
 
-## `shir_native_stmt.rs` — no single law; a decomposition plan
+## `shir_native_stmt.rs` — no single law; a decomposition plan (cluster C proved)
 
     proofs/verus/shir_native_stmt_plan.md
 
@@ -9226,3 +9226,30 @@ F4 xargs/comm/diff, and A the dispatch-coverage and `files` invariant as the
 closing structural stage. Each stage's out-of-model list (renderers, the
 `./fail-shir` metric, the whitelist itself, `lower_printf`, locales and
 permissions, stderr) is in the plan and repeats in the stage's own section.
+
+### Cluster C, proved: empty herestring → status
+
+    proofs/verus/shir_native_herestring.rs      (20 verified, 0 errors)
+    verus --triggers-mode silent --rlimit 40 proofs/verus/shir_native_herestring.rs
+
+`empty_herestring_to_status` collapses `cmd … <<< ''` to `status_exec(ok)`.
+The pass's analysis is transcribed as its own recursions (`plain`, `has_dyn`,
+`has_c`, `dash_ok`, `one_lit_pattern`); the semantic side `bash` is written
+from what `cat`/`tr`/`grep` do over empty stdin, with its own recursions
+(`s_dash`, `s_plain`, `s_dyn`, `s_c`, `s_pattern`). The law
+**`empty_herestring_emits_the_true_status`**: whenever `collapse` returns
+`Some(ok)`, bash prints nothing and exits 0 (ok = true) or 1 (ok = false).
+
+Pins, rejected by computation: bare `tr` (exits 1), `grep -c` (prints `0`),
+a `grep` file operand, an empty pattern, an interpolated pattern, `cat FILE`,
+a non-empty herestring, and any other command. Mutants, measured: dropping
+the `-c`, file-operand, `cat`-operand, interpolated-pattern or bare-`tr`
+refusal is rejected at simplification by `pin_refusals`; **accepting an
+arbitrary dynamic word has no pin**, so the proof itself fails —
+**19 verified, 1 error** at `lemma_dyn` (`has_dyn == s_dyn`), the refinement
+bridge the law rests on. Six
+mutants, each restored byte-identically (sha256 in
+`shir_native_herestring_sync.txt`).
+
+The other nine clusters of the plan remain **open** — this section proves C
+only, not `shir_native_stmt.rs` as a whole.
