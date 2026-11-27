@@ -13569,37 +13569,24 @@ pub(crate) fn ir_expr_to_perl(expr: &IrExpr) -> String {
                     // word directly as `system('bash','-c', …)` would hand
                     // bash the Perl expression's SOURCE TEXT instead of its
                     // value). Literal operands are appended to the expanded
-                    // command word; non-literal ones keep the previous
-                    // unbuildable fallback (REFUSE > GUESS).
+                    // command word; a variable/expansion operand travels as
+                    // its own positional (see `cmdsub_command_word`), so
+                    // `$(echo test) -n "$v"` keeps the substitution instead
+                    // of falling back to shell-text rebuilding.
                     if let Some(IrExpr::Call { func: cf, .. }) = args.first() {
                         if cf == "capture" || cf == "captureWords" {
-                            let value = ir_expr_to_perl(args.first().unwrap());
-                            // Literal operands append to the expanded command
-                            // word (bash runs `$(echo false) x` as `false x`).
-                            let mut tail = String::new();
-                            let mut literal = true;
-                            for w in exec_word_args(args) {
-                                match w {
-                                    IrExpr::Str(s, _) => {
-                                        tail.push_str(&format!(" {}", shell_word_text(s)))
-                                    }
-                                    _ => {
-                                        literal = false;
-                                        break;
-                                    }
+                            if let Some((payload, params)) = cmdsub_command_word(args) {
+                                let value = ir_expr_to_perl(args.first().unwrap());
+                                let mut call = format!(
+                                    "system('bash', '-c', {}, 'sh2', {value}",
+                                    safe_perl_q_string(&payload)
+                                );
+                                for p in &params {
+                                    call.push_str(", ");
+                                    call.push_str(p);
                                 }
-                            }
-                            if literal {
-                                return if tail.is_empty() {
-                                    format!(
-                                        "(do {{ my $__cw = {value}; system('bash', '-c', $__cw) == 0 }})"
-                                    )
-                                } else {
-                                    format!(
-                                        "(do {{ my $__cw = {value}; system('bash', '-c', $__cw . {}) == 0 }})",
-                                        safe_perl_q_string(&tail)
-                                    )
-                                };
+                                call.push(')');
+                                return format!("({call} == 0)");
                             }
                         }
                     }
@@ -15427,6 +15414,45 @@ pub(crate) fn cmd_str_to_open_perl(cmd: &str) -> String {
 /// pipeline output (which bash prints verbatim).
 pub(crate) fn cmd_str_to_open_perl_stripped(cmd: &str) -> String {
     cmd_str_to_open_perl(cmd).replacen("chomp $_r;", "$_r =~ s/\\n+\\z//;", 1)
+}
+
+/// The `bash -c` payload (plus the Perl values it takes as positional
+/// parameters) for a command-substitution COMMAND WORD and its operands:
+/// `if $(scan file) -q` runs the output of `scan file` field-split, then
+/// `-q`.  The capture's value travels as `$1` and is referenced UNQUOTED,
+/// so the CHILD does the bash word splitting and pathname expansion — the
+/// result of `$(…)` is never re-parsed as shell syntax.  Literal operands
+/// become shell-quoted text; a variable/expansion operand is passed as
+/// `"$N"` so a runtime value cannot splice `;` or a quote into the payload
+/// (the previous fallback rebuilt the whole command via `render_word`,
+/// which lost the substitution entirely and ran `-n "$arg"` as a command).
+/// Returns `None` for an operand shape this cannot pass as one word, so the
+/// caller keeps the REFUSE-over-guess fallback.
+fn cmdsub_command_word(args: &[IrExpr]) -> Option<(String, Vec<String>)> {
+    let mut payload = String::from("$1");
+    let mut params: Vec<String> = Vec::new();
+    for w in exec_word_args(args) {
+        match w {
+            IrExpr::Str(s, _) => payload.push_str(&format!(" {}", shell_word_text(s))),
+            IrExpr::Int(n) => payload.push_str(&format!(" {n}")),
+            // A runtime value: `$var` reaches the A1 as `getVar`, an
+            // expansion as `param`, a mixed word as `Interpolate`. Each
+            // expands to ONE word, so pass it as one quoted positional.
+            _ => {
+                let one_word = matches!(w, IrExpr::Var(..) | IrExpr::Interpolate(_))
+                    || matches!(w, IrExpr::Call { func, .. }
+                        if func == "getVar" || func == "param");
+                if !one_word {
+                    return None;
+                }
+                // An unset variable is the EMPTY string in bash; Perl's
+                // undef would warn (and differ) as an argv element.
+                params.push(format!("({} // '')", ir_expr_to_perl(w)));
+                payload.push_str(&format!(" \"${}\"", params.len() + 1));
+            }
+        }
+    }
+    Some((payload, params))
 }
 
 /// Pick a safe Perl `q<delim>...<delim>` delimiter for a string that may
