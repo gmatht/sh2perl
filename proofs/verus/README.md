@@ -40,6 +40,15 @@ this repo's CI must stay self-contained.
     python3 proofs/verus/check_sync.py --list
     python3 proofs/verus/check_sync_selftest.py  # the checker's own self-test
 
+CI actually runs Verus (`.github/workflows/verus.yml`): the pinned release
+`0.2026.10.18.7d82994` on rustup toolchain `1.99.1`, cached between runs, is
+invoked by `proofs/verus/ci_verify.sh` on every `*.rs` a pull request touches
+plus a fixed subset (`status_reads`, `status_reads_traversal`,
+`uae_terminators`, `affix_strip_fold`, `text_capture_fold`, `bc_float_clean`,
+`shir_native_herestring`). Any summary other than `N verified, 0 errors`
+fails the job. The manifests' sha pins are checked separately by
+`check_sync.py` in `test.yml`; the two are complementary.
+
 ### Declared mutants — `mutate.py`
 
     python3 proofs/verus/mutate.py              # re-run and assert every mutant

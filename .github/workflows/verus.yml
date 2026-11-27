@@ -1,0 +1,102 @@
+name: Verus proofs
+
+# The manifest gate in test.yml (`check_sync.py`) recomputes sha256 pins and
+# runs the tests behind each `exec` row, but a pin is a claim about BYTES: it
+# never recompiles a proof. This job is the other half — it downloads the
+# pinned Verus release and actually verifies:
+#
+#   * every `proofs/verus/*.rs` touched by the change, and
+#   * a small fixed subset, so a toolchain regression or a change to a shared
+#     assumption is caught even when the PR touches no proof file.
+#
+# Any nonzero exit or any summary other than `N verified, 0 errors` fails.
+
+on:
+  push:
+    branches: [ main ]
+  pull_request:
+    branches: [ main ]
+
+permissions:
+  contents: read
+
+env:
+  # Pinned in lockstep with the proofs' recorded runs; bump deliberately.
+  VERUS_VERSION: "0.2026.10.18.7d82994"
+  VERUS_TOOLCHAIN: "1.99.1-x86_64-unknown-linux-gnu"
+  # Verus resolves its rustup toolchain through this variable.
+  RUSTUP_TOOLCHAIN: "1.99.1-x86_64-unknown-linux-gnu"
+
+jobs:
+  verus:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          # The changed-proof diff needs history back to the PR base / push
+          # base, not just the two tip commits.
+          fetch-depth: 0
+
+      - name: Cache the pinned Verus release
+        id: verus-cache
+        uses: actions/cache@v4
+        with:
+          path: ${{ runner.temp }}/verus-${{ env.VERUS_VERSION }}
+          key: verus-${{ runner.os }}-${{ env.VERUS_VERSION }}
+
+      - name: Download the pinned Verus release
+        if: steps.verus-cache.outputs.cache-hit != 'true'
+        run: |
+          set -euo pipefail
+          # Derive both the asset URL and the archive's root directory from the
+          # release itself, so an upstream rename cannot silently break this
+          # job. (Measured against 0.2026.10.18.7d82994: the linux asset is
+          # `verus-<version>-x86-linux.zip`, extracting to `verus-x86-linux/`.)
+          api="https://api.github.com/repos/verus-lang/verus/releases/tags/release%2F${VERUS_VERSION}"
+          url=$(curl -fsSL "$api" | python3 -c 'import json,sys; a=json.load(sys.stdin)["assets"]; print(next(x["browser_download_url"] for x in a if x["name"].endswith("-x86-linux.zip")))')
+          echo "Asset: $url"
+          curl -fsSL --retry 3 --retry-delay 5 -o "$RUNNER_TEMP/verus.zip" "$url"
+          unzip -q "$RUNNER_TEMP/verus.zip" -d "$RUNNER_TEMP/verus-extract"
+          # `sed -n 1p` (not `head -n1`): under `pipefail` a `head` that
+          # exits early kills `unzip` with SIGPIPE and aborts the step.
+          root=$(unzip -Z1 "$RUNNER_TEMP/verus.zip" | sed -n '1p' | cut -d/ -f1)
+          test -n "$root"
+          echo "Archive root: $root"
+          mv "$RUNNER_TEMP/verus-extract/$root" "$RUNNER_TEMP/verus-${VERUS_VERSION}"
+
+      - name: Cache the Rust toolchain Verus pins
+        uses: actions/cache@v4
+        with:
+          path: ~/.rustup/toolchains/${{ env.VERUS_TOOLCHAIN }}
+          key: rustup-${{ runner.os }}-${{ env.VERUS_TOOLCHAIN }}
+
+      - name: Install the Rust toolchain Verus pins
+        run: |
+          set -euo pipefail
+          if ! rustup toolchain list | grep -Fq "$VERUS_TOOLCHAIN"; then
+            rustup toolchain install "$VERUS_TOOLCHAIN" --profile minimal --no-self-update
+          fi
+          rustup toolchain list | grep -F "$VERUS_TOOLCHAIN"
+
+      - name: Check the pinned Verus reports the pinned version
+        # `verus` needs its rustup toolchain even for --version, so this runs
+        # after the toolchain step rather than inside the download step.
+        run: |
+          set -euo pipefail
+          got=$("$RUNNER_TEMP/verus-${VERUS_VERSION}/verus" --version | awk '/Version:/ {print $2}')
+          echo "verus --version -> $got"
+          test "$got" = "$VERUS_VERSION"
+
+      - name: Verify changed proofs and the fixed subset
+        # On a pull request the base is the target branch's tip; on a push it
+        # is the pushed-from commit. An empty/unknown base (e.g. a squash
+        # merge's all-zero `before`) runs the fixed subset only.
+        env:
+          BASE_SHA: ${{ github.event.pull_request.base.sha || github.event.before }}
+        run: |
+          set -o pipefail
+          proofs/verus/ci_verify.sh \
+            "$RUNNER_TEMP/verus-${VERUS_VERSION}" \
+            "$BASE_SHA" 2>&1 | tee verus_verify.txt
