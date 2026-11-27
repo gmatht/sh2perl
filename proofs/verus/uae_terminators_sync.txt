@@ -8,7 +8,7 @@
 #   The row used to record HEAD's git blob; it now records the content digest,
 #   because the checker has exactly one rule and no alternate digest.)
 # uae=3adb4e485152 (sha256 of src/transforms/unreachable_after_exit.rs)
-# proof sha: 300c286819f1
+# proof sha: ea6a40d60cbb
 
 [pins]
 pin pin_trunc_shapes -> test tail_after_an_infinite_loop_is_dropped: MAPPED
@@ -35,7 +35,7 @@ guard Die folded into Exit, other_ => not a terminator (source's `_ => false`): 
 
 [counts]
 31 verified, 0 errors (verus --triggers-mode silent --rlimit 40 uae_terminators.rs)
-mutants (measured 2026-11-26, each restored byte-identically to this proof
+mutants (measured 2026-11-27, each restored byte-identically to this proof
   sha): if-nested terminator truncates 30v/1e (trunc_sound), top-level Return
   29v/2e (trunc_sound, return_truncates_only_a_function_body), case-nested Exit
   prunes 30v/1e (trunc_sound); nested-break-escapes, trunc-drops-terminator,
