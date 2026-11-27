@@ -41,6 +41,22 @@ cd "$root"
 tmp=$(mktemp -d)
 trap 'rm -rf "$tmp"' EXIT
 
+# Build the renderer ONCE, up front, and invoke the binary directly from then
+# on. `cargo run` per fixture re-takes the target-dir lock, so any concurrently
+# running cargo command (another gate, a `cargo test`) made fixtures fail with
+# "render failed" and compiler text in render.err — a build collision dressed
+# up as a render regression. A build error now fails the gate immediately,
+# before any comparison, instead of once per example.
+if ! cargo build --quiet --bin perl_backend; then
+    echo "FAIL: cargo build --bin perl_backend"
+    exit 2
+fi
+BIN="${CARGO_TARGET_DIR:-$root/target}/debug/perl_backend"
+if [ ! -x "$BIN" ]; then
+    echo "FAIL: built binary not found at $BIN"
+    exit 2
+fi
+
 if [ "${1:-}" = "--all" ]; then
     shopt -s nullglob
     examples=(examples/*.sh)
@@ -87,7 +103,7 @@ for f in "${examples[@]}"; do
     # (`perl_generator_fixed::generate`): the single renderer plus the
     # IR/text fixups the CLI applies. Testing bare `shir_to_perl` here would
     # gate a pipeline no user gets.
-    if ! cargo run --quiet --bin perl_backend -- --fixed "$f" >"$pl" 2>"$tmp/render.err"; then
+    if ! "$BIN" --fixed "$f" >"$pl" 2>"$tmp/render.err"; then
         echo "FAIL $name: render failed"
         sed -n '1,5p' "$tmp/render.err"
         fail=1
