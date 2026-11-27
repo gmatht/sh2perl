@@ -54,8 +54,8 @@
 //! emit fork (`&` subprocess) vs thread (worker dispatch) from the same
 //! verdict.
 
+use std::cell::RefCell;
 use std::collections::HashSet;
-use std::sync::Mutex;
 
 use crate::ir::{IrExpr, IrStmt};
 
@@ -66,14 +66,21 @@ pub enum BgClass {
 }
 
 /// statement-pointer → verdict (mirrors the sync-ok-loops pattern).
-static VERDICTS: Mutex<Option<HashSet<String>>> = Mutex::new(None);
+///
+/// THREAD-LOCAL: a verdict is filed for ONE program and read by that
+/// program's renderer, so it belongs to the thread doing the render. As a
+/// process-global it let two in-process compilations (concurrent test
+/// threads, an embedder) observe each other's verdicts.
+thread_local! {
+    static VERDICTS: RefCell<Option<HashSet<String>>> = const { RefCell::new(None) };
+}
 
 /// Drop the cached verdict — the out-of-band caller's reset (see
 /// `transforms::reset_verdicts`). These transforms are analysis-only: they
 /// return `false` from `run()` and a RENDERER reads the verdict, so without
 /// a reset a second run observes the PREVIOUS input's verdict.
 pub fn clear_verdicts() {
-    *VERDICTS.lock().unwrap() = None;
+    VERDICTS.with(|c| *c.borrow_mut() = None);
 }
 
 /// The key a verdict is filed under: the body's own text.
@@ -92,12 +99,12 @@ fn body_key(body: &[IrStmt]) -> String {
 /// whenever the transform has not run on an equivalent tree, i.e. the
 /// conservative FORK default.
 pub fn is_thread_body(body: &[IrStmt]) -> bool {
-    VERDICTS
-        .lock()
-        .unwrap()
-        .as_ref()
-        .map(|s| s.contains(&body_key(body)))
-        .unwrap_or(false)
+    VERDICTS.with(|c| {
+        c.borrow()
+            .as_ref()
+            .map(|s| s.contains(&body_key(body)))
+            .unwrap_or(false)
+    })
 }
 
 /// Apply the transform (analysis-only — computes + caches the verdicts).
@@ -106,7 +113,7 @@ pub fn transform(stmts: &mut Vec<IrStmt>) -> bool {
     for st in stmts.iter_mut() {
         classify(st, &mut thread);
     }
-    *VERDICTS.lock().unwrap() = Some(thread);
+    VERDICTS.with(|c| *c.borrow_mut() = Some(thread));
     false // analysis-only
 }
 

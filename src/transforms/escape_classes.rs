@@ -47,8 +47,8 @@
 //! `liftLocalVars`-style analysis with the verdicts; the C/Go/Perl
 //! generators read the store-vs-local verdict instead of guessing.
 
+use std::cell::RefCell;
 use std::collections::{HashMap, HashSet};
-use std::sync::Mutex;
 
 use crate::ir::{ArithAst, IrExpr, IrStmt};
 
@@ -61,18 +61,24 @@ pub enum EscapeClass {
 }
 
 /// verdicts keyed by variable name (one compilation per process).
-static VERDICTS: Mutex<Option<HashMap<String, EscapeClass>>> = Mutex::new(None);
+///
+/// THREAD-LOCAL: see `background_decide` — a verdict belongs to the one
+/// compilation that installed it, not to the process.
+thread_local! {
+    static VERDICTS: RefCell<Option<HashMap<String, EscapeClass>>> =
+        const { RefCell::new(None) };
+}
 
 /// Drop the cached verdict — the out-of-band caller's reset (see
 /// `transforms::reset_verdicts`). These transforms are analysis-only: they
 /// return `false` from `run()` and a RENDERER reads the verdict, so without
 /// a reset a second run observes the PREVIOUS input's verdict.
 pub fn clear_verdicts() {
-    *VERDICTS.lock().unwrap() = None;
+    VERDICTS.with(|c| *c.borrow_mut() = None);
 }
 
 pub fn verdict(name: &str) -> Option<EscapeClass> {
-    VERDICTS.lock().unwrap().as_ref().and_then(|m| m.get(name).copied())
+    VERDICTS.with(|c| c.borrow().as_ref().and_then(|m| m.get(name).copied()))
 }
 
 /// Apply the transform (analysis-only — computes + caches the verdicts).
@@ -106,7 +112,7 @@ pub fn transform(stmts: &mut Vec<IrStmt>) -> bool {
         };
         out.insert(name.clone(), cls);
     }
-    *VERDICTS.lock().unwrap() = Some(out);
+    VERDICTS.with(|c| *c.borrow_mut() = Some(out));
     false // analysis-only: no structural change
 }
 

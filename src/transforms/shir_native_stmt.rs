@@ -58,6 +58,31 @@ use crate::bc::eval as bc_eval;
 use crate::ir::{AssignTarget, BinOpKind, InterpPart, IrExpr, IrStmt, StrStyle};
 
 /// Apply the transform. Returns whether anything changed.
+thread_local! {
+    /// Emission-SITE name counters for the transforms' scratch variables
+    /// (`__ofhN`, `__lsrcN`, …). PER-RENDER, not per-process: a suffix only
+    /// has to be unique inside ONE program, and a process-global counter made
+    /// the rendered text depend on how many programs had been rendered before
+    /// it in the same process (the entry points reset these alongside the
+    /// renderer's own counters).
+    static WF_IDX: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+    static LS_IDX: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
+/// Reset this module's per-render site counters (render entry points call it).
+pub fn reset_site_seqs() {
+    WF_IDX.with(|c| c.set(0));
+    LS_IDX.with(|c| c.set(0));
+}
+
+fn next_site(k: &'static std::thread::LocalKey<std::cell::Cell<usize>>) -> usize {
+    k.with(|c| {
+        let n = c.get();
+        c.set(n + 1);
+        n
+    })
+}
+
 pub fn transform(stmts: &mut Vec<IrStmt>) -> bool {
     let mut files: std::collections::HashMap<String, String> = std::collections::HashMap::new();
     transform_with_printf(stmts, true, &mut files)
@@ -3808,8 +3833,7 @@ fn native_echo_write_file_stmt(st: &mut IrStmt) -> bool {
     };
     let cq = crate::ir::safe_perl_q_string(&decoded);
         let nl = if newline { ", \"\\n\"" } else { "" };
-    static WF_IDX: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
-    let wf = WF_IDX.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    let wf = next_site(&WF_IDX);
     let ofh = format!("__ofh{wf}");
     let code = format!(
         "open(my ${ofh}, '>', {out}) or die \"echo: {out}: $ERRNO\"; print ${ofh} {cq}{nl}; close ${ofh}; $main_exit_code = $CHILD_ERROR = 0;"
@@ -4149,7 +4173,12 @@ fn emit_file_op(ops: &mut Vec<String>, ws: &[String]) -> bool {
             };
             let cmp = if numeric { "<=>" } else { "cmp" };
             let r = if reverse { " @__lp = reverse @__lp;" } else { "" };
-            ops.push(format!(" @__lp = sort {{ {sa} {cmp} {sb} }} @__lp;{r}"));
+            // `our ($a, $b)` inside the block: a script-level `my $a`
+            // (bash's `$a`) shadows Perl's sort globals and makes every
+            // comparison see two undefs.
+            ops.push(format!(
+                " @__lp = sort {{ our ($a, $b); {sa} {cmp} {sb} }} @__lp;{r}"
+            ));
             true
         }
         "head" => {
@@ -4599,8 +4628,7 @@ fn native_ls_stmt(st: &mut IrStmt) -> bool {
     let multi = if paths.len() > 1 { "1" } else { "0" };
     // unique temp name per site so multiple ls transforms in one program
     // don't redeclare (perl "masks earlier declaration" warnings)
-    static LS_IDX: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
-    let idx = LS_IDX.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    let idx = next_site(&LS_IDX);
     let rc = format!("__lsrc{idx}");
     let bad = format!("__lsbad{idx}");
     let lp = format!("__lp{idx}");

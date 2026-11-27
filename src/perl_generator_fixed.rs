@@ -223,8 +223,48 @@ fn post_pass(src: &str) -> String {
     // dropped and `declare_arith_operand_flag(&out)` would return the
     // UNDECLARED source — every undeclared-var compile error comes back
     // (`my @PIPESTATUS;` vanished and 070 printed nothing).
-    let out = declare_undeclared_vars(&out);
-    declare_arith_operand_flag(&out)
+    declare_renderer_symbols(&out)
+}
+
+/// The DECLARATION half of `post_pass`: the renderer-owned flags and the
+/// names the program READS but never binds. Shared with the bare entry point
+/// (`ir::shir_to_perl` calls it last) so both paths emit strict-clean Perl —
+/// the bare path used to leave `$L`, `${PIPESTATUS[@]}` and `$__SH2_AE`
+/// undeclared, a hard compile error that killed the whole file.
+pub(crate) fn declare_renderer_symbols(src: &str) -> String {
+    let out = declare_undeclared_vars(src);
+    let out = declare_arith_operand_flag(&out);
+    declare_positional_count(&out)
+}
+
+/// `$__sh_args_n` — the file-scope positional COUNT that `$#` reads and the
+/// `__sh_pos` helper consult (a `set --` refreshes it). The `--fixed` path
+/// binds it through `TOPLEVEL_POS_DECLS`; the bare path emitted the write with
+/// no declaration at all, a hard `use strict` compile error that killed the
+/// whole file (parse-at-slice). Shared here so both entry points declare it.
+fn declare_positional_count(src: &str) -> String {
+    if !src.contains("$__sh_args_n") {
+        return src.to_string();
+    }
+    // Exactly ONE file-scope declaration, no matter which pass added it
+    // first (`our $x; our $x;` in one scope is perl's "\"our\" variable $x
+    // redeclared" warning). Indented declarations belong to a sub's own
+    // scope and are left alone.
+    let mut kept = false;
+    let mut out = String::with_capacity(src.len());
+    for line in src.split_inclusive('\n') {
+        if line.starts_with("our $__sh_args_n;") {
+            if kept {
+                continue;
+            }
+            kept = true;
+        }
+        out.push_str(line);
+    }
+    if kept {
+        return out;
+    }
+    inject_before_first_stmt(&out, "our $__sh_args_n;\n")
 }
 
 /// `$__SH2_AE` — the empty-operand flag `arith_str_to_perl` writes inside
@@ -239,6 +279,7 @@ fn declare_arith_operand_flag(src: &str) -> String {
     }
     inject_before_first_stmt(src, "our $__SH2_AE;\n")
 }
+// (declare_renderer_symbols lives below `post_pass`.)
 
 /// `false | true` (any all-literal-`true`/`false` pipeline) followed by a
 /// read of `${PIPESTATUS[n]}`: populate the array before the run.
@@ -1249,7 +1290,7 @@ sub __sh2_b {
         elsif (defined $oct) { chr(oct($oct)) }
         else { $esc eq 'e' ? "\e" : ($esc eq 'a' ? "\a" : $esc eq 'b' ? "\b"
                                   : $esc eq 'f' ? "\f" : $esc eq 'n' ? "\n"
-                                  : $esc eq 'r' ? "\r" : $esc eq 't' ? "\t" : "\v") }
+                                  : $esc eq 'r' ? "\r" : $esc eq 't' ? "\t" : "\x0b") }
     }ge;
     return $s;
 }"#;
@@ -1433,7 +1474,7 @@ fn bash_b_operand_slots(fmt: &str) -> Vec<usize> {
 /// `!(0)` — TRUE, which is what bash means — and the blanket
 /// `(!(0))`→`(!(1))` rewrite inverted it and dropped the branch
 /// (redirect-all lost its `not found` line).
-fn fix_condition_booleans(src: &str) -> String {
+pub(crate) fn fix_condition_booleans(src: &str) -> String {
     src.replace(crate::ir::UNBUILDABLE_COND, "1")
 }
 
@@ -1912,7 +1953,7 @@ fn is_bareword_ident(s: &str, declared: &std::collections::HashSet<String>) -> b
 // and emit one `my` per symbol that is used but never declared. That is
 // exactly what the strict pragma asks for, and it is a no-op for a program
 // the renderer already got right.
-fn declare_undeclared_vars(src: &str) -> String {
+pub(crate) fn declare_undeclared_vars(src: &str) -> String {
     if !src.contains("use strict") {
         return src.to_string();
     }

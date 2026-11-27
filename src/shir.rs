@@ -17,23 +17,130 @@ use std::collections::{BTreeSet, HashMap, HashSet};
 use std::sync::atomic::{AtomicBool, AtomicUsize};
 use std::sync::Mutex;
 
+// ── Per-thread verdict storage ───────────────────────────────────────────
+//
+// Every verdict / census below is computed for ONE program and consulted while
+// that same program is lowered and emitted. It used to live in a
+// `static Mutex<Option<…>>`: process-global storage for per-compilation state,
+// so two in-process compilations (concurrent test threads, an embedder, the
+// renderer's own eval re-entry) could read each other's verdicts — and the
+// pointer-keyed sets could match a LATER program's statements at a recycled
+// address, silently eliding or keeping the wrong status writes.
+//
+// `Verdict<T>` keeps the `Mutex` CALLING CONVENTION the ~150 access sites are
+// written in (`*SLOT.lock().unwrap() = v`, `SLOT.lock().unwrap().as_ref()`, …)
+// while storing the value in this THREAD's map: a lock TAKES the value out and
+// the guard puts it back on drop, so each thread sees only its own
+// compilation's state and no borrow can outlive the guard.
+thread_local! {
+    static VERDICT_SLOTS: std::cell::RefCell<HashMap<usize, Box<dyn std::any::Any>>> =
+        std::cell::RefCell::new(HashMap::new());
+    /// Slots currently taken by a live guard:
+    /// a nested lock of the same slot would see the default value instead of
+    /// the in-flight one (a `Mutex` would deadlock here instead), so it panics
+    /// loudly rather than corrupting the verdict.
+    static VERDICT_HELD: std::cell::RefCell<HashSet<usize>> =
+        std::cell::RefCell::new(HashSet::new());
+}
+
+/// A per-thread verdict/census slot — see the note above.
+pub(crate) struct Verdict<T: 'static> {
+    _p: std::marker::PhantomData<fn() -> T>,
+    /// Keeps the slot NON-zero-sized. A zero-sized `static` may share its
+    /// address with any other zero-sized static, and `lock` keys the
+    /// per-thread map by that address — two aliased slots would read each
+    /// other's verdicts (and panic on the type check) depending only on how
+    /// the linker happened to lay the statics out.
+    _unique: u8,
+}
+
+impl<T: 'static + Default> Verdict<T> {
+    pub(crate) const fn new() -> Self {
+        Verdict {
+            _p: std::marker::PhantomData,
+            _unique: 0,
+        }
+    }
+
+    pub(crate) fn lock(&self) -> Result<VerdictGuard<'_, T>, ()> {
+        let key = self as *const Self as usize;
+        VERDICT_HELD.with(|h| {
+            let mut h = h.borrow_mut();
+            assert!(
+                h.insert(key),
+                "nested lock of a shir verdict slot (would have deadlocked as a Mutex)"
+            );
+        });
+        let value: T = VERDICT_SLOTS.with(|m| match m.borrow_mut().remove(&key) {
+            Some(b) => *b
+                .downcast::<T>()
+                .unwrap_or_else(|_| panic!("verdict slot {key} holds another type")),
+            None => T::default(),
+        });
+        Ok(VerdictGuard {
+            key,
+            value: Some(value),
+            _p: std::marker::PhantomData,
+        })
+    }
+}
+
+pub(crate) struct VerdictGuard<'a, T: 'static> {
+    key: usize,
+    value: Option<T>,
+    _p: std::marker::PhantomData<&'a ()>,
+}
+
+impl<T: 'static> std::ops::Deref for VerdictGuard<'_, T> {
+    type Target = T;
+    fn deref(&self) -> &T {
+        self.value.as_ref().expect("verdict guard value")
+    }
+}
+
+impl<T: 'static> std::ops::DerefMut for VerdictGuard<'_, T> {
+    fn deref_mut(&mut self) -> &mut T {
+        self.value.as_mut().expect("verdict guard value")
+    }
+}
+
+impl<T: 'static + std::fmt::Debug> std::fmt::Debug for VerdictGuard<'_, T> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        std::fmt::Debug::fmt(self.value.as_ref().expect("verdict guard value"), f)
+    }
+}
+
+impl<T: 'static> Drop for VerdictGuard<'_, T> {
+    fn drop(&mut self) {
+        let key = self.key;
+        if let Some(v) = self.value.take() {
+            VERDICT_SLOTS.with(|m| {
+                m.borrow_mut().insert(key, Box::new(v));
+            });
+        }
+        VERDICT_HELD.with(|h| {
+            h.borrow_mut().remove(&key);
+        });
+    }
+}
+
 /// Variables proven (conservatively) to hold ONLY numbers — lifted to
 /// native JS number bindings: `let x = 0` declared at program top, reads
 /// become bare `x` (no `sh2.getVar` + `Number(...)||0`), writes become
 /// `x = <native expr>` (no `sh2.setVar` + `arithEval`). Reset by
 /// `shir_to_estree` per compilation (the Perl generator never runs this).
-static LIFTED_NUMERIC: Mutex<Option<HashSet<String>>> = Mutex::new(None);
+static LIFTED_NUMERIC: Verdict<Option<HashSet<String>>> = Verdict::new();
 /// Provably-string variables lifted to native JS string bindings
 /// (`let x = ""`; reads are bare `x`; writes `x = <string expr>`).
-static LIFTED_STRING: Mutex<Option<HashSet<String>>> = Mutex::new(None);
+static LIFTED_STRING: Verdict<Option<HashSet<String>>> = Verdict::new();
 /// C typed vars (the frontend-emitted `var_types`; set per compilation by
 /// `shir_to_estree`). Consulted by the arith read coercion: Int64/UInt64
 /// vars read as BigInt (Number would round past 2^53).
-static VAR_TYPES: Mutex<Option<HashMap<String, IrType>>> = Mutex::new(None);
+static VAR_TYPES: Verdict<Option<HashMap<String, IrType>>> = Verdict::new();
 /// Arrays whose every write carries provably-integer elements (see the
 /// INT-ITEM analysis in [`shir_to_estree`]). `sort -n`/`-u` on their
 /// captured pipelines lowers to the exact numeric comparator.
-static INT_ITEM_ARRAYS: Mutex<Option<HashSet<String>>> = Mutex::new(None);
+static INT_ITEM_ARRAYS: Verdict<Option<HashSet<String>>> = Verdict::new();
 
 /// Is `name` an int-item array (every element provably an integer)?
 fn int_item_array(name: &str) -> bool {
@@ -51,10 +158,10 @@ fn int_item_array(name: &str) -> bool {
 /// element arithmetic, ~1.8 ns/op) or BigInt values (Int64 — exact, the
 /// C-path lowering).
 static TRUE64: AtomicBool = AtomicBool::new(false);
-static TRUE64_SLOTS: Mutex<Option<HashMap<String, usize>>> = Mutex::new(None);
+static TRUE64_SLOTS: Verdict<Option<HashMap<String, usize>>> = Verdict::new();
 /// Out-of-±2^53 numeric vars homed as BigInt VALUES (Int64; the slots
 /// win the hot RMW chains, everything else in the big regime is BigInt).
-static TRUE64_INT: Mutex<Option<HashSet<String>>> = Mutex::new(None);
+static TRUE64_INT: Verdict<Option<HashSet<String>>> = Verdict::new();
 
 /// Enable/disable the `--true64` bash arithmetic lowering (default off).
 pub fn set_true64(on: bool) {
@@ -307,7 +414,7 @@ pub fn true64_int_var(name: &str) -> bool {
 /// [`analyze_bigint_homed`]). A bare var read inside an arith tree of a
 /// homed var is a BigInt-typed operand — the native BigInt div/mod arm
 /// fires instead of the `sh2.idiv` helper.
-static BIGINT_HOMED: Mutex<Option<HashSet<String>>> = Mutex::new(None);
+static BIGINT_HOMED: Verdict<Option<HashSet<String>>> = Verdict::new();
 
 /// Is `name` BigInt-homed — every runtime value a BigInt?
 pub fn bigint_homed_var(name: &str) -> bool {
@@ -783,23 +890,23 @@ pub fn wrap_true64_arith(prog: &mut IrProgram) {
 /// names (`?`/`$`/`#`/`@`/`*`/`0`-`9`/`-`/`PWD`/`HOSTNAME`/... —
 /// [`native_special_var`]'s set) and the env-resident denylist
 /// ([`ENV_RESIDENT_NAMES`]) never fold.
-static NEVER_WRITTEN: Mutex<Option<HashSet<String>>> = Mutex::new(None);
+static NEVER_WRITTEN: Verdict<Option<HashSet<String>>> = Verdict::new();
 /// Names whose EVERY write in the program is an ARRAY write (set per
 /// compilation by `shir_to_estree`; see [`collect_array_only_written`]).
 /// The plain-name `${arr:off:len}` slice lowering (SH2_ASSUME_ARRAY_SLICE)
 /// consults it: a name in this set is either unset or an array at every
 /// read, so the runtime's array-vs-scalar dispatch is unobservable and
 /// the array branch lowers natively.
-static ARRAY_ONLY_NAMES: Mutex<Option<HashSet<String>>> = Mutex::new(None);
+static ARRAY_ONLY_NAMES: Verdict<Option<HashSet<String>>> = Verdict::new();
 /// Names the emitter may access DIRECTLY on the runtime's plain-object
 /// store (`sh2.vars.<name>` — a property read/write, no getVar/setVar
 /// dispatch; see [`collect_native_store_access`]). Set per compilation
 /// by `shir_to_estree`.
-static NATIVE_STORE_READ_BLOCKED: Mutex<Option<HashSet<String>>> = Mutex::new(None);
+static NATIVE_STORE_READ_BLOCKED: Verdict<Option<HashSet<String>>> = Verdict::new();
 /// The WRITE-side blocker set: the runtime setVar's attribute branches
 /// (`typeset -i/-l/-u`, namerefs, exported/PATH env sync) exclude the
 /// name from native writes (see [`collect_native_store_access`]).
-static NATIVE_STORE_WRITE_BLOCKED: Mutex<Option<HashSet<String>>> = Mutex::new(None);
+static NATIVE_STORE_WRITE_BLOCKED: Verdict<Option<HashSet<String>>> = Verdict::new();
 /// Does the program never write `IFS` (globally or command-scoped)? The
 /// native `while read` line loop splits with a COMPILE-TIME IFS character
 /// class (one regex, built once per loop instead of once per line), so a
@@ -807,7 +914,7 @@ static NATIVE_STORE_WRITE_BLOCKED: Mutex<Option<HashSet<String>>> = Mutex::new(N
 /// (an eval/source/trap program, or an IFS write somewhere) → keep the
 /// runtime loop. Set per compilation by `shir_to_estree` from
 /// [`collect_never_written`]'s written set.
-static IFS_QUIET: Mutex<Option<bool>> = Mutex::new(None);
+static IFS_QUIET: Verdict<Option<bool>> = Verdict::new();
 fn ifs_quiet() -> bool {
     IFS_QUIET.lock().unwrap().unwrap_or(false)
 }
@@ -818,12 +925,12 @@ fn ifs_quiet() -> bool {
 /// SH2_ASSUME_ARITH_VARS; a var with NO other source may be UNSET at the
 /// read, and bash's EMPTY text substitution must then still parse (the
 /// deletion gate) or the runtime evaluator stays.
-static ARITH_REF_SET: Mutex<Option<HashSet<String>>> = Mutex::new(None);
+static ARITH_REF_SET: Verdict<Option<HashSet<String>>> = Verdict::new();
 /// The "No spaces" tag verdicts (see `analyze_var_nospace`): the set of
 /// vars whose value is PROVABLY free of IFS whitespace. Set per
 /// compilation by `shir_to_estree`; the `split` call emitter consults it
 /// to skip the word-split on such vars (a provable no-op).
-static VAR_NOSPACE: Mutex<Option<HashSet<String>>> = Mutex::new(None);
+static VAR_NOSPACE: Verdict<Option<HashSet<String>>> = Verdict::new();
 /// Whether the program may run with a CUSTOM (non-whitespace) IFS value
 /// in the store (frontends-ifs: `IFS=,` assignments / `setVar("IFS", …)`
 /// / env-carrying `IFS=…` exec calls, with a value not provably
@@ -832,25 +939,25 @@ static VAR_NOSPACE: Mutex<Option<HashSet<String>>> = Mutex::new(None);
 /// contain custom separator chars) and the `split` marker must dispatch
 /// to the runtime (`sh2.split`, which consults `this.vars.IFS`) instead
 /// of the inline whitespace regex.
-static IFS_CUSTOM: Mutex<Option<bool>> = Mutex::new(None);
+static IFS_CUSTOM: Verdict<Option<bool>> = Verdict::new();
 /// Whether `shopt -s nocasematch` may be enabled anywhere in the current
 /// program (set per compilation by `shir_to_estree`; see
 /// `ir_may_enable_nocasematch`). Native case/test substring lifts must
 /// lowercase to stay exact when it is.
-static CASE_NOCASE: Mutex<Option<bool>> = Mutex::new(None);
+static CASE_NOCASE: Verdict<Option<bool>> = Verdict::new();
 /// Whether the program contains BOTH `shopt -s` and `shopt -u
 /// nocasematch` (set per compilation by `shir_to_estree`; see
 /// `ir_nocase_state_dynamic`): the runtime state can change mid-program,
 /// so static case-folds must fall back to the runtime test/caseMatch
 /// calls, which consult `shoptState` dynamically.
-static CASE_NOCASE_DYNAMIC: Mutex<Option<bool>> = Mutex::new(None);
+static CASE_NOCASE_DYNAMIC: Verdict<Option<bool>> = Verdict::new();
 /// Nesting depth of `sh2.and`/`sh2.or` arrow lowering (see the BinOp And/Or
 /// arms). The runtime helpers branch on `lastExit`, which a NATIVE test
 /// expression never sets — so inside `&&`/`||` arrows a test must stay a
 /// runtime `sh2.test` call (which records the status) and only the
 /// value-consuming positions (if/while/until conds, `!`, ternary) get the
 /// native lowering.
-static AND_OR_DEPTH: Mutex<usize> = Mutex::new(0);
+static AND_OR_DEPTH: Verdict<usize> = Verdict::new();
 /// Native arith div/mod poison depth: >0 while lowering a `$((...))`
 /// expression that contains a NaN-COERCING operator (bitwise `|`/`&`/`^`/
 /// shifts, `**`, comparisons, `&&`/`||`, `!`, ternaries — JS converts NaN
@@ -860,11 +967,11 @@ static AND_OR_DEPTH: Mutex<usize> = Mutex::new(0);
 /// expressions (div/mod results only flow through `+ - * / %` and unary
 /// +/- into the arithEval boundary) can go fully native — NaN reaches
 /// the wrapper and converts to the bash empty result.
-static ARITH_POISON_DEPTH: Mutex<usize> = Mutex::new(0);
+static ARITH_POISON_DEPTH: Verdict<usize> = Verdict::new();
 /// The render-time i53/`--true64` leaf-wrap depth (see
 /// [`arith_to_estree_wrapped`]): 0 = the top-level call, which owns the
 /// mention-wrap; nested calls skip it (the tree is already wrapped).
-static ARITH_WRAP_DEPTH: Mutex<usize> = Mutex::new(0);
+static ARITH_WRAP_DEPTH: Verdict<usize> = Verdict::new();
 /// Native-echo emission depth: >0 while lowering inside a construct whose
 /// runtime stdout sink differs from the module's stdout — `redirect` /
 /// `pipeline` / `capture` / `captureWords` calls (the runtime swaps
@@ -873,7 +980,7 @@ static ARITH_WRAP_DEPTH: Mutex<usize> = Mutex::new(0);
 /// site's context). `process.stdout.write` is only byte-identical to the
 /// runtime's `emit` when fd 1 is the default stdout, so the native echo
 /// lowering (see `try_native_echo`) checks this depth before firing.
-static ECHO_SINK_DEPTH: Mutex<usize> = Mutex::new(0);
+static ECHO_SINK_DEPTH: Verdict<usize> = Verdict::new();
 /// Plan 4 test-status elision depth: >0 while lowering a `[ ]`-test
 /// whose lastExit write is provably unread (a bare `[ ]` statement or a
 /// dead if/while condition — see [`compute_test_cond_deadness`] and the
@@ -883,7 +990,7 @@ static ECHO_SINK_DEPTH: Mutex<usize> = Mutex::new(0);
 /// value-consuming positions (statement/if/while cond at AND_OR_DEPTH
 /// 0) raise it; `&&`/`||` chains keep the statused form (the links
 /// branch on lastExit).
-static TEST_UNSTATUSED_DEPTH: Mutex<usize> = Mutex::new(0);
+static TEST_UNSTATUSED_DEPTH: Verdict<usize> = Verdict::new();
 /// Subshell/background statement sites whose body provably runs with the
 /// DEFAULT stdout sink (see [`native_echo_sink_sites`]): their arrows
 /// lower WITHOUT the sink-depth bump (the `arrow_native_echo` form), so
@@ -892,7 +999,7 @@ static TEST_UNSTATUSED_DEPTH: Mutex<usize> = Mutex::new(0);
 /// slice; set per compilation by `shir_to_estree`; unset → conservative
 /// (every subshell/background keeps the runtime dispatch — the
 /// pre-existing behavior).
-static NATIVE_ECHO_SINK_SITES: Mutex<Option<HashSet<usize>>> = Mutex::new(None);
+static NATIVE_ECHO_SINK_SITES: Verdict<Option<HashSet<usize>>> = Verdict::new();
 fn native_echo_sink_site(stmts: &[IrStmt]) -> bool {
     // The pointer-keyed verdict answers "is this site default-sink?" for a
     // body reached by a NAME (function bodies — the define site says
@@ -986,22 +1093,22 @@ fn redirect_call_sync_ok(_args: &[IrExpr]) -> bool {
 /// the program (functions included; the emitter cannot see call-site
 /// contexts) disables the native echo lowering. Set per compilation by
 /// `shir_to_estree`; conservative (any doubt resolves to `true`).
-static PROGRAM_PERSIST_FD1: Mutex<Option<bool>> = Mutex::new(None);
+static PROGRAM_PERSIST_FD1: Verdict<Option<bool>> = Verdict::new();
 /// Per-function `local`-variable native lift: function name → the set of
 /// local vars whose declarations (and every later reference) lower to
 /// native `let` bindings inside the function body (see
 /// `local_lift_analysis`). Set per compilation by `shir_to_estree`.
-static LOCAL_LIFT: Mutex<Option<HashMap<String, HashSet<String>>>> = Mutex::new(None);
+static LOCAL_LIFT: Verdict<Option<HashMap<String, HashSet<String>>>> = Verdict::new();
 /// Function-definition scope stack during emission: each frame is
 /// (function name, the local-decl names already emitted in this body —
 /// first decl is a `let`, later ones are assignments).
-static FUNCTION_STACK: Mutex<Vec<(String, HashSet<String>)>> = Mutex::new(Vec::new());
+static FUNCTION_STACK: Verdict<Vec<(String, HashSet<String>)>> = Verdict::new();
 /// Whether the program may enable `set -e` (errexit) anywhere (set per
 /// compilation by `shir_to_estree`; see `ir_may_enable_errexit`). The
 /// runtime's `sh2.guard` wrapper is an identity function when the errexit
 /// flag never turns on, so guard emission is skipped entirely for programs
 /// that provably never enable it.
-static MAY_ERREXIT: Mutex<Option<bool>> = Mutex::new(None);
+static MAY_ERREXIT: Verdict<Option<bool>> = Verdict::new();
 /// LastExit-write liveness (Plan 4): per-statement "the `sh2.lastExit`
 /// write this statement performs is DEAD (no read observes it before the
 /// next write / the block's status consumer)" flags, keyed by statement
@@ -1011,7 +1118,7 @@ static MAY_ERREXIT: Mutex<Option<bool>> = Mutex::new(None);
 /// [`compute_lastexit_deadness`]; the `(( ))` statement lowering drops the
 /// status ternary + lastExit writes when a statement's write is dead (keep
 /// the side effect). Unset → conservative.
-static LASTEXIT_DEAD: Mutex<Option<HashMap<usize, bool>>> = Mutex::new(None);
+static LASTEXIT_DEAD: Verdict<Option<HashMap<usize, bool>>> = Verdict::new();
 /// The FUNCTION-BODY deadness during the define-arrow construction: the
 /// function body is CLONED into the arrow (`IrExpr::Arrow(body.clone())`
 /// in the Function arm), so the global map's pointer keys (computed on
@@ -1022,7 +1129,7 @@ static LASTEXIT_DEAD: Mutex<Option<HashMap<usize, bool>>> = Mutex::new(None);
 /// keys for a later allocation's reuse). Only function bodies: loop /
 /// subshell / capture arrows are built from the ORIGINAL body references
 /// (never cloned), so the global map covers them.
-static ARROW_BODY_DEAD: Mutex<Option<HashMap<usize, bool>>> = Mutex::new(None);
+static ARROW_BODY_DEAD: Verdict<Option<HashMap<usize, bool>>> = Verdict::new();
 fn lastexit_write_is_dead(stmt: &IrStmt) -> bool {
     // The active function-arrow construction's map wins (its pointers are
     // the exact statements being emitted); fall back to the global map
@@ -1051,12 +1158,12 @@ fn lastexit_write_is_dead(stmt: &IrStmt) -> bool {
 /// pointer like [`LASTEXIT_DEAD`]; computed in
 /// [`compute_lastexit_deadness`] (which owns the live set). Unset →
 /// conservative (statused).
-static TEST_COND_DEAD: Mutex<Option<HashMap<usize, bool>>> = Mutex::new(None);
+static TEST_COND_DEAD: Verdict<Option<HashMap<usize, bool>>> = Verdict::new();
 /// The function-arrow twin of [`TEST_COND_DEAD`] (same clone-pointer gap
 /// as [`ARROW_BODY_DEAD`] — the clone's if/while conditions' `_g` status
 /// protocol is dropped only when the clone's own liveness says the write
 /// is unread). Active only during the define-arrow construction.
-static ARROW_BODY_COND_DEAD: Mutex<Option<HashMap<usize, bool>>> = Mutex::new(None);
+static ARROW_BODY_COND_DEAD: Verdict<Option<HashMap<usize, bool>>> = Verdict::new();
 
 /// Install the Plan-4 lastExit-write liveness verdict for a renderer that
 /// is NOT the ESTree emitter (the Rust backend carries its own status
@@ -1081,7 +1188,20 @@ pub fn stmt_lastexit_write_is_dead(stmt: &IrStmt) -> bool {
 /// WRITE a status (`ir_stmt_writes_lastexit`) but which the backward scan
 /// proved unread. [`LASTEXIT_DEAD`] is the ESTree emitter's narrow map
 /// (only shapes it has a dead twin for); this is the general verdict.
-static LASTEXIT_UNREAD: Mutex<Option<HashSet<usize>>> = Mutex::new(None);
+///
+/// THREAD-LOCAL, like the renderer's other per-render scratch state
+/// (`ir::LOOP_STATUS_SEQ`, the printf scratch counters): the set is keyed by
+/// STATEMENT POINTERS and installed for exactly the program a render walks,
+/// so it belongs to that render, not to the process. As a `Mutex<Option<…>>`
+/// two renders in one process (concurrent test threads, any embedder) read
+/// each other's verdict set — and a LATER program's statements can be
+/// allocated at addresses a previous verdict set still names, so the stale
+/// keys silently elide (or keep) status writes in the wrong program. A
+/// render's Perl must depend only on its input.
+thread_local! {
+    static LASTEXIT_UNREAD: std::cell::RefCell<Option<HashSet<usize>>> =
+        const { std::cell::RefCell::new(None) };
+}
 
 /// The SOURCE-LANGUAGE status verdict recorded at install time: true when
 /// the program has no observable `$?` at all, so EVERY status write is
@@ -1089,11 +1209,14 @@ static LASTEXIT_UNREAD: Mutex<Option<HashSet<usize>>> = Mutex::new(None);
 /// `whileLoop` call's rc side effect) that carry no statement pointer for
 /// [`stmt_status_write_is_unread`] to key on. Unset ⇒ conservative false
 /// (keep the bookkeeping).
-static SOURCE_STATUS_UNOBSERVABLE: Mutex<Option<bool>> = Mutex::new(None);
+thread_local! {
+    static SOURCE_STATUS_UNOBSERVABLE: std::cell::RefCell<Option<bool>> =
+        const { std::cell::RefCell::new(None) };
+}
 
 /// Renderer accessor for [`SOURCE_STATUS_UNOBSERVABLE`].
 pub fn source_status_unobservable() -> bool {
-    SOURCE_STATUS_UNOBSERVABLE.lock().unwrap().unwrap_or(false)
+    SOURCE_STATUS_UNOBSERVABLE.with(|c| c.borrow().unwrap_or(false))
 }
 
 /// Process-wide render-verdict lock: the verdict statics above are
@@ -1214,8 +1337,8 @@ pub fn program_observes_pipestatus(prog: &IrProgram) -> bool {
 
 pub fn install_unread_status_writes(prog: &IrProgram, errexit: bool) {
     if errexit {
-        *LASTEXIT_UNREAD.lock().unwrap() = Some(HashSet::new());
-        *SOURCE_STATUS_UNOBSERVABLE.lock().unwrap() = Some(false);
+        LASTEXIT_UNREAD.with(|c| *c.borrow_mut() = Some(HashSet::new()));
+        SOURCE_STATUS_UNOBSERVABLE.with(|c| *c.borrow_mut() = Some(false));
         return;
     }
     // SOURCE-LANGUAGE STATUS VERDICT: no source `$?` and no status read
@@ -1273,11 +1396,11 @@ pub fn install_unread_status_writes(prog: &IrProgram, errexit: bool) {
             }
         }
         all(&prog.stmts, &mut unread);
-        *LASTEXIT_UNREAD.lock().unwrap() = Some(unread);
-        *SOURCE_STATUS_UNOBSERVABLE.lock().unwrap() = Some(true);
+        LASTEXIT_UNREAD.with(|c| *c.borrow_mut() = Some(unread));
+        SOURCE_STATUS_UNOBSERVABLE.with(|c| *c.borrow_mut() = Some(true));
         return;
     }
-    *SOURCE_STATUS_UNOBSERVABLE.lock().unwrap() = Some(false);
+    SOURCE_STATUS_UNOBSERVABLE.with(|c| *c.borrow_mut() = Some(false));
     let mut live: HashSet<usize> = HashSet::new();
     walk_lastexit_liveness(&prog.stmts, true, &mut live);
     let mut unread: HashSet<usize> = HashSet::new();
@@ -1340,19 +1463,19 @@ pub fn install_unread_status_writes(prog: &IrProgram, errexit: bool) {
         }
     }
     collect(&prog.stmts, &live, &mut unread);
-    *LASTEXIT_UNREAD.lock().unwrap() = Some(unread);
+    LASTEXIT_UNREAD.with(|c| *c.borrow_mut() = Some(unread));
 }
 
 /// Renderer-facing accessor for [`LASTEXIT_UNREAD`]: true when this
 /// statement writes a status that the backward scan proved unread. Unset ⇒
 /// conservative (false — keep the write).
 pub fn stmt_status_write_is_unread(stmt: &IrStmt) -> bool {
-    LASTEXIT_UNREAD
-        .lock()
-        .unwrap()
-        .as_ref()
-        .map(|s| s.contains(&(stmt as *const IrStmt as usize)))
-        .unwrap_or(false)
+    LASTEXIT_UNREAD.with(|c| {
+        c.borrow()
+            .as_ref()
+            .map(|s| s.contains(&(stmt as *const IrStmt as usize)))
+            .unwrap_or(false)
+    })
 }
 
 /// Like [`install_unread_status_writes`], but EXIT-LIVE: the
@@ -1391,7 +1514,7 @@ pub fn install_unread_status_writes_exit_live_stmts(
     errexit: bool,
 ) {
     if errexit {
-        *LASTEXIT_UNREAD.lock().unwrap() = Some(HashSet::new());
+        LASTEXIT_UNREAD.with(|c| *c.borrow_mut() = Some(HashSet::new()));
         return;
     }
     let mut live: HashSet<usize> = HashSet::new();
@@ -1462,7 +1585,7 @@ pub fn install_unread_status_writes_exit_live_stmts(
     for body in sub_bodies {
         collect(body, &live, &mut unread);
     }
-    *LASTEXIT_UNREAD.lock().unwrap() = Some(unread);
+    LASTEXIT_UNREAD.with(|c| *c.borrow_mut() = Some(unread));
 }
 
 /// Pointer-keyed accessor for renderers that track the OWNING statement
@@ -1472,12 +1595,7 @@ pub fn install_unread_status_writes_exit_live_stmts(
 /// its statements are alive, so a fresh allocation (an eval subprogram's
 /// statements) can never collide with a live member's address.
 pub fn status_write_is_unread_key(key: usize) -> bool {
-    LASTEXIT_UNREAD
-        .lock()
-        .unwrap()
-        .as_ref()
-        .map(|s| s.contains(&key))
-        .unwrap_or(false)
+    LASTEXIT_UNREAD.with(|c| c.borrow().as_ref().map(|s| s.contains(&key)).unwrap_or(false))
 }
 
 /// Drop the current verdict set to empty (keep-everything): piecemeal
@@ -1485,8 +1603,8 @@ pub fn status_write_is_unread_key(key: usize) -> bool {
 /// pointer keys from an earlier compile whose statements may already be
 /// freed and their addresses reused.
 pub fn clear_unread_status_writes() {
-    *LASTEXIT_UNREAD.lock().unwrap() = Some(HashSet::new());
-    *SOURCE_STATUS_UNOBSERVABLE.lock().unwrap() = Some(false);
+    LASTEXIT_UNREAD.with(|c| *c.borrow_mut() = Some(HashSet::new()));
+    SOURCE_STATUS_UNOBSERVABLE.with(|c| *c.borrow_mut() = Some(false));
 }
 
 
@@ -1517,7 +1635,7 @@ fn test_cond_write_is_dead(stmt: &IrStmt) -> bool {
 /// store-bound instead). Keyed by statement pointer (stable between the
 /// analysis and emission — the IR tree is immutable there). Unset →
 /// conservative (no persist).
-static LOOP_PERSIST: Mutex<Option<HashMap<usize, ()>>> = Mutex::new(None);
+static LOOP_PERSIST: Verdict<Option<HashMap<usize, ()>>> = Verdict::new();
 fn loop_persist_needed(stmt: &IrStmt, var: &str) -> bool {
     LOOP_PERSIST
         .lock()
@@ -1981,7 +2099,7 @@ pub(crate) fn walk_lastexit_liveness(stmts: &[IrStmt], end_live: bool, live: &mu
 /// transform-phase walk (e.g. test_lowering's). Unset (transform phase,
 /// disabled gate) → every function live, bit-identical to the old
 /// unconditional walk.
-static FN_END_LIVE: Mutex<Option<HashMap<String, bool>>> = Mutex::new(None);
+static FN_END_LIVE: Verdict<Option<HashMap<String, bool>>> = Verdict::new();
 pub(crate) fn clear_fn_end_live() {
     *FN_END_LIVE.lock().unwrap() = None;
 }
@@ -3587,13 +3705,13 @@ fn compute_lastexit_deadness(prog: &IrProgram, errexit: bool) -> HashMap<usize, 
 /// EMPTY (nothing dead — the guard consumes the status). The native while
 /// lowering drops the per-iteration `bodyLast` tracking + trailing write
 /// for these loops (a bare native `while (cond) { body }`).
-static LOOP_STATUS_DEAD: Mutex<Option<HashMap<usize, bool>>> = Mutex::new(None);
+static LOOP_STATUS_DEAD: Verdict<Option<HashMap<usize, bool>>> = Verdict::new();
 /// Loop statement pointers provably executed at least once (sound
 /// constant propagation + test-condition evaluation — see
 /// collect_provably_running_loops). ShIR markup: also serialized as
 /// `"runs": true` on the loop nodes (shir_json.rs), so every backend
 /// consuming the A1 contract knows the body always runs.
-static PROVABLY_RUNS: Mutex<Option<HashSet<usize>>> = Mutex::new(None);
+static PROVABLY_RUNS: Verdict<Option<HashSet<usize>>> = Verdict::new();
 // ── prove a loop runs at least once ──────────────────────────────
 // Sound constant propagation over the statements BEFORE the loop, then
 // evaluate a simple test condition. Anything unprovable → false
@@ -3761,7 +3879,7 @@ fn loop_provably_runs(stmt: &IrStmt) -> bool {
 /// clone-pointer gap — the clone's loops consult this map during the
 /// define-arrow construction). Computed from the clone's own liveness
 /// alongside ARROW_BODY_DEAD; save/restored together with it.
-static ARROW_BODY_LOOP_DEAD: Mutex<Option<HashMap<usize, bool>>> = Mutex::new(None);
+static ARROW_BODY_LOOP_DEAD: Verdict<Option<HashMap<usize, bool>>> = Verdict::new();
 fn loop_status_write_dead(stmt: &IrStmt) -> bool {
     // The active function-arrow construction's map wins (its pointers are
     // the exact statements being emitted); fall back to the global map
@@ -3969,7 +4087,7 @@ fn compute_async_region_loops_full(prog: &IrProgram) -> (HashSet<usize>, Vec<IrS
     (out, nodes)
 }
 
-static ASYNC_REGION_LOOPS: Mutex<Option<HashSet<usize>>> = Mutex::new(None);
+static ASYNC_REGION_LOOPS: Verdict<Option<HashSet<usize>>> = Verdict::new();
 /// The same loops as NODES. Producer bodies are cloned into arrows before
 /// they are lowered (`IrExpr::Arrow(stmts.clone())` in the Subshell /
 /// Background / capture arms), so the address a lowered copy carries is never
@@ -3977,13 +4095,13 @@ static ASYNC_REGION_LOOPS: Mutex<Option<HashSet<usize>>> = Mutex::new(None);
 /// and a native loop (no yield, no runtime `_capExceeded` bound) was chosen
 /// inside a producer anyway. Matching the node by CONTENT closes that: an
 /// over-match only costs a runtime loop where a native one would have done.
-static ASYNC_REGION_LOOP_NODES: Mutex<Option<Vec<IrStmt>>> = Mutex::new(None);
+static ASYNC_REGION_LOOP_NODES: Verdict<Option<Vec<IrStmt>>> = Verdict::new();
 /// Top-level lowering depth (see [`top_stmt_to_estree`]): 1 while lowering
 /// a direct child of the program body. The native while loop's errexit
 /// check mirrors the top-level `sh2.guard` wrapper, which only wraps
 /// TOP-LEVEL statements — a nested loop (inside an if/block/function) is
 /// never guard-wrapped, so its native form must not abort either.
-static TOP_LEVEL_DEPTH: Mutex<usize> = Mutex::new(0);
+static TOP_LEVEL_DEPTH: Verdict<usize> = Verdict::new();
 fn is_top_level_stmt() -> bool {
     *TOP_LEVEL_DEPTH.lock().unwrap() == 1
 }
@@ -4565,7 +4683,7 @@ pub(crate) const SYNC_BUILTINS: &[&str] = &[
 /// function SHADOWS a same-named builtin in bash, so exec calls to a
 /// shadowed name must keep the async exec dispatch (the runtime's function
 /// map) — never the sync builtin path.
-static PROGRAM_FUNCTIONS: Mutex<Option<HashSet<String>>> = Mutex::new(None);
+static PROGRAM_FUNCTIONS: Verdict<Option<HashSet<String>>> = Verdict::new();
 fn program_defines_function(name: &str) -> bool {
     PROGRAM_FUNCTIONS
         .lock()
@@ -4583,7 +4701,7 @@ fn program_defines_function(name: &str) -> bool {
 /// without a per-call promise (the whileLoopSync pattern — same semantics,
 /// no per-iteration promise machinery), which in turn lets loops over them
 /// lower to their *Sync twins. Set per compilation by `shir_to_estree`.
-static SYNC_FN_CALLS: Mutex<Option<HashSet<String>>> = Mutex::new(None);
+static SYNC_FN_CALLS: Verdict<Option<HashSet<String>>> = Verdict::new();
 fn fn_call_is_sync(name: &str) -> bool {
     SYNC_FN_CALLS
         .lock()
@@ -4604,12 +4722,12 @@ fn fn_call_is_sync(name: &str) -> bool {
 /// registration is skipped. The i32-provable pattern: a pure shIR
 /// analysis; the C backend already renders the same convention natively
 /// (`char *_p1` params).
-static PARAM_LIFT: Mutex<Option<HashMap<String, usize>>> = Mutex::new(None);
+static PARAM_LIFT: Verdict<Option<HashMap<String, usize>>> = Verdict::new();
 
 /// The CURRENT function's param arity, pushed while the define arrow's
 /// body lowers — `positional_read`/`native_special_var` render `$i` as
 /// the `p{pos}` param identifier inside it.
-static PARAM_FRAME: Mutex<Option<usize>> = Mutex::new(None);
+static PARAM_FRAME: Verdict<Option<usize>> = Verdict::new();
 
 /// The CURRENT function's A1-DECLARED parameter NAMES, pushed while the
 /// define arrow's body lowers. A named parameter is bound by the arrow's
@@ -4619,7 +4737,7 @@ static PARAM_FRAME: Mutex<Option<usize>> = Mutex::new(None);
 /// `IrStmt::Function` arm bound `name`/`body`/`named_blocks` and dropped
 /// `params`, so every A1 function emitted `() => …` and its body's
 /// parameter reads fell through to the empty `sh2.vars` store.
-static NAMED_PARAMS: Mutex<Option<HashSet<String>>> = Mutex::new(None);
+static NAMED_PARAMS: Verdict<Option<HashSet<String>>> = Verdict::new();
 
 /// Is `name` one of the enclosing function's A1-declared parameters?
 /// A read of one renders as the bare arrow parameter.
@@ -4635,7 +4753,7 @@ fn is_named_param(name: &str) -> bool {
 /// STORE-ONLY vars (the StoreToNative pass's verdict): written only via
 /// setVar/getVar with literal names — the native binding renders bare
 /// (`let <name> = null;` + `name = v` + bare reads), no sh2.vars store.
-static STORE_ONLY_VARS: Mutex<Option<HashSet<String>>> = Mutex::new(None);
+static STORE_ONLY_VARS: Verdict<Option<HashSet<String>>> = Verdict::new();
 
 fn store_only_var(name: &str) -> bool {
     STORE_ONLY_VARS
@@ -4651,7 +4769,7 @@ fn store_only_var(name: &str) -> bool {
 /// follows. The define arrow's final echo becomes a native `return
 /// <value>` and the call sites' captureSync wrappers become the bare
 /// call (the value flows directly — no stdout round-trip, no capture).
-static VALUE_RETURN_FNS: Mutex<Option<HashSet<String>>> = Mutex::new(None);
+static VALUE_RETURN_FNS: Verdict<Option<HashSet<String>>> = Verdict::new();
 
 fn value_return_fn(name: &str) -> bool {
     VALUE_RETURN_FNS
@@ -4730,12 +4848,12 @@ fn param_frame_read(pos: u32) -> Option<Expr> {
 /// slice, and each call site passes a FRESH array literal (so `shift`
 /// cannot mutate a caller's array). `SH2_ASSUME_POSITIONAL_LOCAL=0`
 /// restores the runtime positional store + `sh2.exec` dispatch.
-static POS_LIFT: Mutex<Option<HashMap<String, bool>>> = Mutex::new(None);
+static POS_LIFT: Verdict<Option<HashMap<String, bool>>> = Verdict::new();
 
 /// Set while the emitter lowers a positional-lifted function's define body
 /// (the `__pos` parameter is in scope). Saved/restored around nested
 /// body lowering.
-static POS_FRAME: Mutex<Option<()>> = Mutex::new(None);
+static POS_FRAME: Verdict<Option<()>> = Verdict::new();
 
 fn pos_lift_entry(name: &str) -> Option<bool> {
     POS_LIFT
@@ -4779,7 +4897,7 @@ fn positional_local_enabled() -> bool {
 /// bindings (fallback `(...args) => sh2.callUndefined(name, args)`), and
 /// the call sites pass the binding, not the name. Set per compilation by
 /// `shir_to_estree`; unset → conservative (no direct calls).
-static DIRECT_FN_CALLS: Mutex<Option<HashSet<String>>> = Mutex::new(None);
+static DIRECT_FN_CALLS: Verdict<Option<HashSet<String>>> = Verdict::new();
 fn fn_call_is_direct(name: &str) -> bool {
     DIRECT_FN_CALLS
         .lock()
@@ -4795,7 +4913,7 @@ fn fn_call_is_direct(name: &str) -> bool {
 /// define arrow is emitted WITHOUT the sink-depth bump. Set per
 /// compilation by `shir_to_estree`; unset → conservative (no native echo
 /// in function bodies — the current behavior).
-static NATIVE_ECHO_FNS: Mutex<Option<HashSet<String>>> = Mutex::new(None);
+static NATIVE_ECHO_FNS: Verdict<Option<HashSet<String>>> = Verdict::new();
 fn native_echo_fn(name: &str) -> bool {
     NATIVE_ECHO_FNS
         .lock()
@@ -10468,9 +10586,9 @@ pub fn const_fold_arith(prog: &mut IrProgram) {
 // ── Nonzero-divisor proof (shared shIR analysis) ──────────────────────
 
 /// Per-scope nonzero var verdicts (see [`compute_nonzero_vars`]).
-static NONZERO_VARS: Mutex<Option<HashSet<String>>> = Mutex::new(None);
+static NONZERO_VARS: Verdict<Option<HashSet<String>>> = Verdict::new();
 /// The bounded subset (see [`bounded_nonzero_var`]).
-static BOUNDED_NONZERO_VARS: Mutex<Option<HashSet<String>>> = Mutex::new(None);
+static BOUNDED_NONZERO_VARS: Verdict<Option<HashSet<String>>> = Verdict::new();
 
 /// Is `name` PROVABLY never zero (its proven range excludes 0 in every
 /// scope that mentions it)? Renderers consult this to drop the
@@ -23014,7 +23132,7 @@ pub(crate) fn is_reserved_var(name: &str) -> bool {
 /// statics: the A1->ESTree emission must be byte-stable across processes
 /// (core request fish-sh-go-20260806-181309 — HashSet iteration order
 /// flips per process and hash seed).
-fn sorted_set(s: &Mutex<Option<HashSet<String>>>) -> Vec<String> {
+fn sorted_set(s: &Verdict<Option<HashSet<String>>>) -> Vec<String> {
     let mut names: Vec<String> = s
         .lock()
         .unwrap()
@@ -65214,7 +65332,7 @@ fn arrow_body(params: Vec<Expr>, body: IrExpr) -> Expr {
 /// wrap, so they need no bump here — an await introduced inside one
 /// propagates into the ENCLOSING statement list, which the enclosing
 /// loop's `stmts_have_await` gate sees and flips to the async form.
-static SYNC_ARROW_DEPTH: Mutex<usize> = Mutex::new(0);
+static SYNC_ARROW_DEPTH: Verdict<usize> = Verdict::new();
 fn in_sync_arrow() -> bool {
     *SYNC_ARROW_DEPTH.lock().unwrap() > 0
 }

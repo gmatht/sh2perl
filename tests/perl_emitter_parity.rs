@@ -24,15 +24,19 @@
 //! `$? = N << 8` status write) must be byte-identical in both paths, must
 //! never fork a child (`system(`, `bash', '-c'`) and must never `die`.
 //!
-//! # One test, not five
+//! # Parallel tests
 //!
-//! The renderer installs its status-write liveness verdict in a PROCESS-GLOBAL
-//! slot (`shir::LASTEXIT_UNREAD`, a `Mutex`), not a thread-local one, so two
-//! renders running concurrently — which is exactly what `cargo test` does with
-//! several `#[test]` functions — read each other's verdict set and emit
-//! different text for the same program. Keeping every render in one test
-//! function makes this file's renders serial. (The shared slot itself is a
-//! real thread-safety hole in the library path; it is out of scope here.)
+//! This file used to be ONE serial `#[test]`: the renderer's status-write
+//! liveness verdict lived in a PROCESS-GLOBAL slot (`shir::LASTEXIT_UNREAD`, a
+//! `Mutex` keyed by statement pointers), so two renders running concurrently —
+//! exactly what `cargo test` does with several `#[test]` functions — read each
+//! other's verdict set and emitted different text for the same program. That
+//! slot is now THREAD-LOCAL and reset per render (like `LOOP_STATUS_SEQ` and
+//! the printf scratch counters), and every other render-seam counter/verdict
+//! was converted with it, so a render depends only on its input. The contract
+//! is therefore split into one `#[test]` per command position, and they run
+//! concurrently on purpose: `tests/perl_render_purity.rs` proves the same
+//! property directly (repeated, interleaved and 8-thread concurrent renders).
 
 use debashl::ir::{shir_to_perl, IrProgram};
 
@@ -135,14 +139,23 @@ fn cases() -> Vec<(String, String)> {
     out
 }
 
-/// The whole parity contract, checked serially (see the module note).
-#[test]
-fn perl_entry_points_agree_on_native_builtins() {
+/// The cases for ONE command position.
+fn cases_in(pos: &str) -> Vec<(String, String)> {
+    let suffix = format!("__{pos}");
+    cases()
+        .into_iter()
+        .filter(|(name, _)| name.ends_with(&suffix))
+        .collect()
+}
+
+/// The parity contract for one command position.
+fn check_position(label: &str, cases: Vec<(String, String)>) {
+    assert!(!cases.is_empty(), "no cases for position {label}");
     let mut same: Vec<String> = Vec::new();
     let mut differing: Vec<String> = Vec::new();
     let mut failures = String::new();
 
-    for (name, src) in cases() {
+    for (name, src) in cases {
         let prog = to_ir(&src);
         let raw = shir_to_perl(&prog);
         let fixed = debashl::perl_generator_fixed::generate(&prog);
@@ -200,10 +213,78 @@ fn perl_entry_points_agree_on_native_builtins() {
 
     assert!(
         !same.is_empty() && differing.is_empty(),
-        "emitters disagree on {} of {} cells\n{failures}",
+        "emitters disagree on {} of {} cells ({label})\n{failures}",
         differing.len(),
         same.len() + differing.len()
     );
+}
+
+// One test per position. They run concurrently, which is the point: the
+// render path is thread-local end to end, so every cell must be stable when
+// several renders are in flight (see the module note).
+#[test]
+fn parity_stmt() {
+    check_position("stmt", cases_in("stmt"));
+}
+
+#[test]
+fn parity_stmt_status() {
+    check_position("stmt_status", cases_in("stmt_status"));
+}
+
+#[test]
+fn parity_stmt_ifstatus() {
+    check_position("stmt_ifstatus", cases_in("stmt_ifstatus"));
+}
+
+#[test]
+fn parity_if() {
+    check_position("if", cases_in("if"));
+}
+
+#[test]
+fn parity_elif() {
+    check_position("elif", cases_in("elif"));
+}
+
+#[test]
+fn parity_while() {
+    check_position("while", cases_in("while"));
+}
+
+#[test]
+fn parity_until() {
+    check_position("until", cases_in("until"));
+}
+
+#[test]
+fn parity_not() {
+    check_position("not", cases_in("not"));
+}
+
+#[test]
+fn parity_and() {
+    check_position("and", cases_in("and"));
+}
+
+#[test]
+fn parity_or() {
+    check_position("or", cases_in("or"));
+}
+
+#[test]
+fn parity_andrhs() {
+    check_position("andrhs", cases_in("andrhs"));
+}
+
+#[test]
+fn parity_orhs() {
+    check_position("orhs", cases_in("orhs"));
+}
+
+#[test]
+fn parity_subshell() {
+    check_position("subshell", cases_in("subshell"));
 }
 
 /// The parser is the one the CLI uses; keep this test's assumption honest.

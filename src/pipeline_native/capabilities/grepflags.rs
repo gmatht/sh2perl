@@ -141,7 +141,7 @@ pub(crate) fn emit(ctx: &NativeCtx) -> Option<NativeEmit> {
         let b = before.unwrap_or(0).max(0);
         let a = after.unwrap_or(0).max(0);
         let act = format!(
-            "my @__sel; for my $__i (0..$#__pl) {{ my $__l = $__pl[$__i]; if ({test}) {{ $__m = 1; push @__sel, $__i; }} }} my %__show; for my $__i (@__sel) {{ for my $__j ($__i - {b}..$__i + {a}) {{ $__show{{$__j}} = 1 if $__j >= 0 && $__j <= $#__pl; }} }} for my $__i (sort {{ $a <=> $b }} keys %__show) {{ print $__pl[$__i], \"\\n\"; }}"
+            "my @__sel; for my $__i (0..$#__pl) {{ my $__l = $__pl[$__i]; if ({test}) {{ $__m = 1; push @__sel, $__i; }} }} my %__show; for my $__i (@__sel) {{ for my $__j ($__i - {b}..$__i + {a}) {{ $__show{{$__j}} = 1 if $__j >= 0 && $__j <= $#__pl; }} }} for my $__i (sort {{ our ($a, $b); $a <=> $b }} keys %__show) {{ print $__pl[$__i], \"\\n\"; }}"
         );
         return Some(NativeEmit::Stmt(format!(
             "my $__g = {body}; my @__pl = split(/\\n/, $__g); my $__m = 0; my $__r = qr/{rx}/; {act} $main_exit_code = $CHILD_ERROR = $__m ? 0 : 1;"

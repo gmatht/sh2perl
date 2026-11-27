@@ -356,7 +356,7 @@ pub fn sort_lines(node: &SortLines, ctx: &ExprRenderCtx) -> Option<String> {
             Some(format!(
                 "do {{ my @__l = split(/\\n/, {t}, -1); \
                  pop @__l if @__l && $__l[-1] eq ''; \
-                 @__l = {rev}sort {{ {cmp} }} @__l; \
+                 @__l = {rev}sort {{ our ($a, $b); {cmp} }} @__l; \
                  {uniq}\
                  join(\"\\n\", @__l) . ($__trail ? \"\\n\" : '') }}",
                 t = text,

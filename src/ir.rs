@@ -1024,6 +1024,47 @@ thread_local! {
     /// process had rendered before it.
     static PRINTF_SEQ: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
     static PRINTF_ARG_SEQ: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+    /// Emission-SITE name counters: background pids, herestring handles,
+    /// redirect filehandles, and capture scratch files. Also PER-RENDER: a
+    /// number only has to distinguish the sites of ONE program, and a
+    /// process-global counter made the rendered text depend on how many
+    /// programs the process had rendered before it — and made the wrapper's
+    /// second render name its scratch files differently from the first (see
+    /// `perl_generator_fixed::generate`).
+    static BG_SEQ: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+    static HS_SEQ: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+    static RD_SEQ: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+    static RD2_SEQ: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+    static RD3_SEQ: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+    static CAPTURE_SITE_SEQ: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
+/// The next name suffix from a per-render counter.
+macro_rules! next_name {
+    ($k:ident) => {
+        $k.with(|c| {
+            let n = c.get();
+            c.set(n + 1);
+            n
+        })
+    };
+}
+
+/// Zero every emission-site counter — the render entry points call this so
+/// the SAME source always renders the same names.
+fn reset_emission_seqs() {
+    for k in [
+        &PRINTF_SEQ,
+        &PRINTF_ARG_SEQ,
+        &BG_SEQ,
+        &HS_SEQ,
+        &RD_SEQ,
+        &RD2_SEQ,
+        &RD3_SEQ,
+        &CAPTURE_SITE_SEQ,
+    ] {
+        k.with(|c| c.set(0));
+    }
 }
 
 fn printf_seq() -> usize {
@@ -1050,8 +1091,8 @@ pub fn set_childe_error_carrier(v: bool) {
 pub fn shir_to_perl(prog: &IrProgram) -> String {
     // Stable per-render loop-status names (golden snapshots pin the text).
     LOOP_STATUS_SEQ.with(|c| c.set(0));
-    PRINTF_SEQ.with(|c| c.set(0));
-    PRINTF_ARG_SEQ.with(|c| c.set(0));
+    reset_emission_seqs();
+    crate::transforms::shir_native_stmt::reset_site_seqs();
     let mut out = String::new();
 
     // Shebang
@@ -1576,6 +1617,20 @@ fn first_code_newline(s: &str) -> Option<usize> {
         }
     }
 
+    // A name the program READS but never binds (bash reads it as the empty
+    // string) still needs a declaration: `use strict` turns it into a hard
+    // compile error, so the whole program dies before its first statement
+    // (063_12's `$L`, 081_nested_functions' `$threshold`, `${PIPESTATUS[0]}`).
+    // Run the SAME post-pass the shipped `--fixed` entry point runs — it is
+    // idempotent (an already-declared name is skipped), so the fixed path's
+    // own call becomes a no-op and both entry points emit identical Perl.
+    // The UNBUILDABLE_COND marker (`0/*sh2:unbuildable-cond*/`) is not
+    // valid Perl — its `/*` opens a comment that never closes — so a
+    // condition the renderer could not lower must be rewritten before the
+    // text leaves the renderer. bash's answer for those arms is "true".
+    let out = crate::perl_generator_fixed::fix_condition_booleans(&out);
+    let out = crate::perl_generator_fixed::declare_renderer_symbols(&out);
+
     out
 }
 
@@ -1644,8 +1699,8 @@ pub struct EmbedResult {
 /// processes).
 pub fn shir_to_perl_embed(prog: &IrProgram, ctx: &EmbedCtx) -> EmbedResult {
     LOOP_STATUS_SEQ.with(|c| c.set(0));
-    PRINTF_SEQ.with(|c| c.set(0));
-    PRINTF_ARG_SEQ.with(|c| c.set(0));
+    reset_emission_seqs();
+    crate::transforms::shir_native_stmt::reset_site_seqs();
     let mut result = EmbedResult::default();
 
     // Embed fragments are preamble-free: disable the `__sh_uu_*` seam
@@ -2451,12 +2506,7 @@ fn emit_stmt_owned(out: &mut String, stmt: &IrStmt, indent: usize) {
             // stdio buffer).
             emit_indent(out, indent);
             out.push_str("$| = 1;\n");
-            static BG_SEQ: std::sync::atomic::AtomicUsize =
-                std::sync::atomic::AtomicUsize::new(0);
-            let pid = format!(
-                "__sh2_bg{}",
-                BG_SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
-            );
+            let pid = format!("__sh2_bg{}", next_name!(BG_SEQ));
             emit_indent(out, indent);
             out.push_str(&format!("my ${pid} = fork();\n"));
             // `$!` — bash's "pid of the last background job". Recorded in a
@@ -2578,7 +2628,19 @@ fn emit_stmt_owned(out: &mut String, stmt: &IrStmt, indent: usize) {
             // the body's statements render inline (bash functions share the
             // global scope; Perl subs see the hoisted lexical vars).
             emit_indent(out, indent);
-            out.push_str(&format!("sub {} {{\n", name));
+            // A NESTED function (`outer(){ inner(){ … }; inner; }`) becomes a
+            // CODE SLOT on the package glob, not a nested named sub: a named
+            // sub inside a sub CLOSES OVER the outer's lexicals by snapshot
+            // (perl: "Variable \"$msg\" will not stay shared", a `-w`
+            // compile warning, and the second call of the outer then sees
+            // the FIRST call's values). A closure assigned at run time
+            // captures the CURRENT invocation's lexicals, which is bash's
+            // dynamic scoping (081_nested_functions, 064_10).
+            if indent == 0 {
+                out.push_str(&format!("sub {} {{\n", name));
+            } else {
+                out.push_str(&format!("*{} = sub {{\n", name));
+            }
             emit_indent(out, indent + 1);
             out.push_str("local @ARGV = @_;\n");
             // `$#` is this call's argument count — snapshot it before any
@@ -2590,7 +2652,7 @@ fn emit_stmt_owned(out: &mut String, stmt: &IrStmt, indent: usize) {
                 emit_stmt(out, s, indent + 1);
             }
             emit_indent(out, indent);
-            out.push_str("}\n");
+            out.push_str(if indent == 0 { "}\n" } else { "};\n" });
         }
         IrStmt::Redirect { inner, redirects } => {
             // `mapfile [-t] VAR < FILE` / `readarray …` — read the file into
@@ -2649,12 +2711,7 @@ fn emit_stmt_owned(out: &mut String, stmt: &IrStmt, indent: usize) {
                     .iter()
                     .find(|r| matches!(r.fd, None | Some(0)) && r.mode == "herestring")
                 {
-                    static HS_SEQ: std::sync::atomic::AtomicUsize =
-                        std::sync::atomic::AtomicUsize::new(0);
-                    let hs = format!(
-                        "__sh2_hs{}",
-                        HS_SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
-                    );
+                    let hs = format!("__sh2_hs{}", next_name!(HS_SEQ));
                     emit_indent(out, indent);
                     out.push_str("{\n");
                     emit_indent(out, indent + 1);
@@ -2871,12 +2928,7 @@ fn emit_stmt_owned(out: &mut String, stmt: &IrStmt, indent: usize) {
                                         ok = false;
                                         break;
                                     }
-                                    static RD_SEQ: std::sync::atomic::AtomicUsize =
-                                        std::sync::atomic::AtomicUsize::new(0);
-                                    let tmp = format!(
-                                        "__sh2_rd{}",
-                                        RD_SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
-                                    );
+                                    let tmp = format!("__sh2_rd{}", next_name!(RD_SEQ));
                                     prelude.push(format!(
                                         "$ENV{{{}}} = {};",
                                         tmp,
@@ -3040,9 +3092,7 @@ fn emit_stmt_owned(out: &mut String, stmt: &IrStmt, indent: usize) {
                             .iter()
                             .any(|m| body.contains(m));
                             if !is_stderr && !spawns {
-                                static RD3_SEQ: std::sync::atomic::AtomicUsize =
-                                    std::sync::atomic::AtomicUsize::new(0);
-                                let n = RD3_SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                                let n = next_name!(RD3_SEQ);
                                 let fh = format!("$__sh2_rfh{n}");
                                 let sel = format!("$__sh2_rsel{n}");
                                 emit_indent(out, indent);
@@ -3080,9 +3130,7 @@ fn emit_stmt_owned(out: &mut String, stmt: &IrStmt, indent: usize) {
                             } else {
                                 ("STDOUT", "stdout")
                             };
-                            static RD2_SEQ: std::sync::atomic::AtomicUsize =
-                                std::sync::atomic::AtomicUsize::new(0);
-                            let n = RD2_SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                            let n = next_name!(RD2_SEQ);
                             let fh = format!("$__sh2_rfh{n}");
                             let sel = format!("$__sh2_rsel{n}");
                             emit_indent(out, indent);
@@ -3271,7 +3319,11 @@ fn emit_stmt_owned(out: &mut String, stmt: &IrStmt, indent: usize) {
                         // in `$?` (the body's last command, or a `return N`).
                         // The old `$? = 0 << 8` clobbered `f(){ false; }` and
                         // `f(){ cd /no/such; }` back to success.
-                        out.push_str(&format!("{}({});\n", name, rest.join(", ")));
+                        out.push_str(&format!(
+                            "{}({});\n",
+                            perl_fn_name(&name),
+                            rest.join(", ")
+                        ));
                     }
                     "fnValue" => {
                         // VALUE-returning function call (the echo-return
@@ -3283,7 +3335,11 @@ fn emit_stmt_owned(out: &mut String, stmt: &IrStmt, indent: usize) {
                         let name = args.first().and_then(call_arg_str).unwrap_or_default();
                         let words = exec_word_args(args);
                         let rest: Vec<String> = words.iter().map(|w| render_word_list(w)).collect();
-                        out.push_str(&format!("{}({})", name, rest.join(", ")));
+                        out.push_str(&format!(
+                            "{}({})",
+                            perl_fn_name(&name),
+                            rest.join(", ")
+                        ));
                     }
                     "test" | "strHasPrefix" | "strHasSuffix" | "contains" => {
                         // Bare `[ cond ]` as a statement — or the value
@@ -3294,9 +3350,15 @@ fn emit_stmt_owned(out: &mut String, stmt: &IrStmt, indent: usize) {
                         if rc_unread() {
                             // Still EVALUATE the condition — its words may
                             // carry side effects (`[ "$(touch f)" = x ]`) —
-                            // and discard the value.
+                            // and discard the value. The discard must be an
+                            // ASSIGNMENT to a scratch lexical: a bare
+                            // `(cond);` statement made perl -w report
+                            // "Useless use of string eq in void context"
+                            // (test-expression-backslash-continuation), and
+                            // the whole point of the `perl -w -c` sweep is
+                            // that a warning fails.
                             emit_indent(out, indent);
-                            out.push_str(&format!("({});\n", cond));
+                            out.push_str(&format!("do {{ my $__sh2_void = ({}); }};\n", cond));
                         } else {
                             emit_indent(out, indent);
                             out.push_str(&format!(
@@ -3674,7 +3736,9 @@ fn emit_stmt_owned(out: &mut String, stmt: &IrStmt, indent: usize) {
                         let cond = ir_expr_to_perl(other_expr);
                         emit_indent(out, indent);
                         if rc_unread() {
-                            out.push_str(&format!("({});\n", cond));
+                            // See the statement-position `test` arm: a bare
+                            // expression statement is a void-context warning.
+                            out.push_str(&format!("do {{ my $__sh2_void = ({}); }};\n", cond));
                         } else {
                             out.push_str(&format!(
                                 "$main_exit_code = $CHILD_ERROR = ({}) ? 0 : 1;\n",
@@ -3708,6 +3772,22 @@ fn emit_stmt_owned(out: &mut String, stmt: &IrStmt, indent: usize) {
             target,
         } => {
             let expr = ir_expr_to_perl(value);
+            // A FOLDED payload can arrive as an `Ident`/`RawText` node —
+            // `printf 'abcdef' | tail -c 2` folds to the literal word `ef` —
+            // and a bareword is not a Perl string: `print(ef)` prints an
+            // empty string and warns ("Unquoted string \"ef\" may clash with
+            // future reserved word", 070_gnuisms_thorough). A bare word used
+            // as a VALUE is always text.
+            let expr = {
+                let mut cs = expr.chars();
+                let bare = matches!(cs.next(), Some(c) if c.is_ascii_alphabetic() || c == '_')
+                    && expr.chars().all(|c| c.is_ascii_alphanumeric() || c == '_');
+                if bare {
+                    safe_perl_q_string(&expr)
+                } else {
+                    expr
+                }
+            };
             // A print FOLDED out of `echo`/`printf` inherits `emit_echo`'s two
             // RUNTIME guards. Both are decided while the value is evaluated,
             // so no fold can prove them away statically — dropping either
@@ -4976,6 +5056,12 @@ fn perl_subscripted_base(base: &str) -> String {
         "0".to_string()
     } else if key.chars().all(|c| c.is_ascii_digit()) {
         key.to_string()
+    } else if let Some(inner) = key.strip_prefix("${").and_then(|k| k.strip_suffix('}')) {
+        // A BRACED subscript (`array[${index}]`) is source text, not Perl:
+        // pasting it produced `$array[${index}]`, which perl reads as the
+        // AMBIGUOUS `${index}` and warns about under `-w` (063_02). Lower it
+        // like any other parameter expansion.
+        param_inner_perl(inner)
     } else if key.starts_with('$') || key.starts_with('@') || key.starts_with('%') {
         // already Perl (`array[$i]` from a `${…}` expansion)
         key.to_string()
@@ -5138,7 +5224,26 @@ fn var_read(name: &str) -> String {
             return format!("@{}", base);
         }
         if array_var(base) {
-            return format!("${}[${}]", base, bare);
+            // The subscript is SOURCE text. A BRACED expansion
+            // (`${arr[${index}]}`) must be lowered like any other parameter
+            // expansion — pasting it produced `$arr[${index}]`, which perl
+            // accepts only as the AMBIGUOUS `${index}` and reports under
+            // `-w` (063_02), and a braced expansion with an operator is not
+            // Perl at all. A plain name needs its SIGIL (`$arr[index]` is a
+            // bareword under `use strict`), and `$name` is already a read.
+            let lowered = if let Some(inner) = bare
+                .strip_prefix("${")
+                .and_then(|r| r.strip_suffix('}'))
+            {
+                param_inner_perl(inner)
+            } else if bare.chars().next().is_some_and(|c| c.is_ascii_alphabetic() || c == '_')
+                && bare.chars().all(|c| c.is_ascii_alphanumeric() || c == '_')
+            {
+                format!("${}", bare)
+            } else {
+                return format!("${}[${}]", base, bare);
+            };
+            return format!("${}[{}]", base, lowered);
         }
         let key = bare;
         // A variable subscript (`${words[$counter]}`) indexes with the
@@ -6148,7 +6253,11 @@ fn render_param(args: &[IrExpr]) -> String {
                 // `${v%[[:space:]]*}` emptied the string instead of trimming
                 // one trailing space.
                 let greedy = matches!(op.as_str(), "%%" | "%%:");
-                let re = glob_to_regex_greedy(&pat, true);
+                // The regex is emitted as a `/…/ ` LITERAL, so a `/` in the
+                // pattern must be escaped or it CLOSES the literal early:
+                // `${HOME%/}` rendered `=~ /\A(?:/)\z/`, a syntax error that
+                // broke the whole file (unclosed-param-expansion).
+                let re = glob_to_regex_greedy(&pat, true).replace('/', "\\/");
                 let (init, cond, step) = if greedy {
                     ("0".to_string(), format!("<= length({var})"), "++")
                 } else {
@@ -6380,7 +6489,18 @@ fn render_param(args: &[IrExpr]) -> String {
                 let rendered = perl_subscripted_base(raw_base);
                 let base_for_census = raw_base.split('[').next().unwrap_or(raw_base);
                 return if rendered.contains('[') {
-                    format!("scalar(@{})", rendered)
+                    // `${#array[i][@]}` — the flat model's element i is a
+                    // ONE-element list, so count it as a slice: `scalar(@array[$i])`
+                    // is the "Scalar value @array[…] better written as
+                    // $array[…]" warning (063_hard_to_parse).
+                    match (rendered.find('['), rendered.ends_with(']')) {
+                        (Some(open), true) => {
+                            let base = &rendered[..open];
+                            let idx = &rendered[open + 1..rendered.len() - 1];
+                            format!("scalar(@{base}[{idx} .. {idx}])")
+                        }
+                        _ => format!("scalar(@{})", rendered),
+                    }
                 } else if array_var(base_for_census) {
                     format!("scalar(@{})", rendered)
                 } else {
@@ -6582,6 +6702,29 @@ fn cd_chain_to_perl(expr: &IrExpr) -> Option<String> {
 ///
 /// `None` when the LHS is not a program-defined function call — the caller
 /// then keeps whatever rendering it had.
+/// A program-defined shell function whose name collides with a Perl BUILTIN
+/// must be called through its package: the shell script's `die() { … }`
+/// rendered `die("Could not cd")`, which perl reports under `-w` as
+/// "Ambiguous call resolved as CORE::die()" (parse-or-continuation) — and
+/// the shell function is what bash ran.
+fn perl_fn_name(name: &str) -> String {
+    const BUILTINS: &[&str] = &[
+        "abs", "bless", "caller", "chdir", "chomp", "chop", "chr", "close", "defined",
+        "delete", "die", "do", "dump", "each", "eval", "exec", "exists", "exit", "glob",
+        "grep", "hex", "index", "int", "join", "keys", "last", "lc", "length", "link",
+        "local", "map", "mkdir", "my", "next", "oct", "open", "ord", "our", "pop",
+        "print", "printf", "push", "read", "redo", "ref", "rename", "return", "reverse",
+        "rmdir", "scalar", "select", "shift", "sleep", "sort", "splice", "split", "sqrt",
+        "stat", "substr", "system", "tie", "time", "uc", "unlink", "untie", "unshift",
+        "values", "wantarray", "warn", "write",
+    ];
+    if BUILTINS.contains(&name) {
+        format!("main::{name}")
+    } else {
+        name.to_string()
+    }
+}
+
 fn fn_chain_to_perl(e: &IrExpr) -> Option<String> {
     let IrExpr::BinOp { lhs, op, rhs } = e else {
         return None;
@@ -6607,6 +6750,7 @@ fn fn_chain_to_perl(e: &IrExpr) -> Option<String> {
     };
     Some(format!(
         "{name}({args}); if ($CHILD_ERROR {cond}) {{\n{rhs_stmt}}}",
+        name = perl_fn_name(&name),
         args = rest.join(", "),
         rhs_stmt = stmt
     ))
@@ -6950,7 +7094,17 @@ fn param_inner_perl(inner: &str) -> String {
             // allowed while \"strict subs\" in use"), so `do FILE` returned
             // undef before any statement ran and 063_hard_to_parse printed
             // NOTHING (all 13 lines missing, exit 0).
-            return format!("scalar(@{})", perl_subscripted_base(arr));
+            let rendered = perl_subscripted_base(arr);
+            // A SUBSCRIPTED base is ONE element in the flat model, so count
+            // it as a one-element slice: `scalar(@array[$i])` is perl's
+            // "Scalar value @array[…] better written as $array[…]" warning
+            // (063_hard_to_parse).
+            if let (Some(open), true) = (rendered.find('['), rendered.ends_with(']')) {
+                let base = &rendered[..open];
+                let idx = &rendered[open + 1..rendered.len() - 1];
+                return format!("scalar(@{base}[{idx} .. {idx}])");
+            }
+            return format!("scalar(@{})", rendered);
         }
         return format!("length({})", var_read(rest));
     }
@@ -7476,10 +7630,7 @@ fn try_bounded_while_read_tail(out: &mut String, indent: usize, stages: &[Vec<Ir
     else {
         return false;
     };
-    let buf = format!(
-        "__pl_cap{}",
-        NEXT_CAPTURE_SITE.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
-    );
+    let buf = format!("__pl_cap{}", next_name!(CAPTURE_SITE_SEQ));
     emit_indent(out, indent);
     out.push_str(&format!("my ${buf} = {};\n", cmd_str_to_open_perl(&cmd)));
     emit_indent(out, indent);
@@ -7520,10 +7671,9 @@ fn emit_pipeline_stage_fallback(out: &mut String, indent: usize, stages: &[Vec<I
     false
 }
 
-/// Per-emission-site counter: makes a capture's scratch file name unique per
-/// site, and `$$` (the running pid) unique per process.
-static NEXT_CAPTURE_SITE: std::sync::atomic::AtomicUsize =
-    std::sync::atomic::AtomicUsize::new(0);
+// The per-emission-site counter (`CAPTURE_SITE_SEQ`, reset per render) makes
+// a capture's scratch file name unique per site; `$$` (the running pid) makes
+// it unique per process.
 
 /// Build the scratch-file name for a spawning capture.
 ///
@@ -7572,7 +7722,7 @@ pub(crate) fn capture_do_perl(inner: &str) -> String {
             "do {{ my $__cap = ''; {{ local *STDOUT; open(STDOUT, '>', \\$__cap) or die \"capture: $!\\n\"; {inner} }} $__cap =~ s/\\n+\\z//; $__cap }}"
         );
     }
-    let site = NEXT_CAPTURE_SITE.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    let site = next_name!(CAPTURE_SITE_SEQ);
     format!(
         "do {{ my $__capf = \"{}\"; {{ open(my $__capso, '>&', \\*STDOUT) or die \"capture: $!\\n\"; close(STDOUT); open(STDOUT, '>', $__capf) or die \"capture: $!\\n\"; {inner} open(STDOUT, '>&', $__capso) or die \"capture: $!\\n\"; close($__capso); }} my $__cap = ''; if (open(my $__capfh, '<', $__capf)) {{ $__cap = do {{ local $/; <$__capfh> }} // ''; close $__capfh; }} unlink $__capf; $__cap =~ s/\\n+\\z//; $__cap }}",
         capture_scratch_name(site)
@@ -7603,7 +7753,7 @@ pub(crate) fn capture_do_perl(inner: &str) -> String {
 /// around) other captures composes in either order. The result follows
 /// the standard payload convention: no trailing newline.
 pub(crate) fn capture_do_nested(inner: &str) -> String {
-    let site = NEXT_CAPTURE_SITE.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    let site = next_name!(CAPTURE_SITE_SEQ);
     format!(
         "do {{ my $__capf = \"{}\"; {{ open(my $__capso, '>&', \\*STDOUT) or die \"capture: $!\\n\"; close(STDOUT); open(STDOUT, '>', $__capf) or die \"capture: $!\\n\"; my $__capold = select(STDOUT); {inner} select($__capold); open(STDOUT, '>&', $__capso) or die \"capture: $!\\n\"; close($__capso); }} my $__cap = ''; if (open(my $__capfh, '<', $__capf)) {{ $__cap = do {{ local $/; <$__capfh> }} // ''; close $__capfh; }} unlink $__capf; $__cap =~ s/\\n+\\z//; $__cap }}",
         capture_scratch_name(site)
@@ -10310,6 +10460,12 @@ fn emit_exec_call(out: &mut String, call: &IrExpr, indent: usize) {
                 // list (parse-at-slice-param printed no space where bash
                 // printed one).
                 emit_indent(out, indent);
+                // The file-scope declaration of the COUNT is part of the
+                // shared declaration pass (see
+                // `perl_generator_fixed::declare_positional_count`): the bare
+                // entry point never emitted the fixed path's
+                // `TOPLEVEL_POS_DECLS`, so this write was a `use strict`
+                // compile error there (parse-at-slice).
                 out.push_str("$__sh_args_n = scalar(@ARGV);\n");
             }
             // Other `set` forms are option toggles — no runtime effect.
@@ -13797,6 +13953,28 @@ pub(crate) fn ir_expr_to_perl(expr: &IrExpr) -> String {
                         // Bash pseudo-multidim subscript → hash key.
                         format!("${{{}}}{{\"{}\"}}", name, idx.replace('\"', "\\\""))
                     } else {
+                        // The subscript is SOURCE text. A BRACED expansion
+                        // (`${array[${index}]}`) must be lowered: pasting it
+                        // produced `$array[${index}]`, perl's AMBIGUOUS
+                        // `${index}` under `-w` (063_02), and a braced
+                        // expansion carrying an operator is not Perl at all.
+                        // A plain name needs its SIGIL (a bareword under
+                        // `use strict`), `$name` is already a read.
+                        let idx = if let Some(inner) = idx
+                            .strip_prefix("${")
+                            .and_then(|r| r.strip_suffix('}'))
+                        {
+                            param_inner_perl(inner)
+                        } else if idx
+                            .chars()
+                            .next()
+                            .is_some_and(|c| c.is_ascii_alphabetic() || c == '_')
+                            && idx.chars().all(|c| c.is_ascii_alphanumeric() || c == '_')
+                        {
+                            format!("${}", idx)
+                        } else {
+                            idx
+                        };
                         format!("${}[{}]", name, idx)
                     }
                 }
@@ -13823,6 +14001,18 @@ pub(crate) fn ir_expr_to_perl(expr: &IrExpr) -> String {
                         // rendered `scalar(@…)`).
                         if !rendered.contains('[') && hash_var(base) && !array_var(base) {
                             format!("scalar(keys %{})", rendered)
+                        } else if let (Some(open), true) =
+                            (rendered.find('['), rendered.ends_with(']'))
+                        {
+                            // A SUBSCRIPTED base is ONE element in the flat
+                            // model: `scalar(@array[$i])` is the "Scalar value
+                            // @array[…] better written as $array[…]" warning
+                            // (063_hard_to_parse). Count it as a one-element
+                            // slice — empty when the index is unset, which is
+                            // bash's count for a missing element.
+                            let b = &rendered[..open];
+                            let i = &rendered[open + 1..rendered.len() - 1];
+                            format!("scalar(@{b}[{i} .. {i}])")
                         } else {
                             format!("scalar(@{})", rendered)
                         }
@@ -18711,6 +18901,16 @@ mod perl_render_tests {
             "rm_status",
             "echo_n",
             "func_local",
+            // Mission item 7: status reads after every natively lowered
+            // builtin (`cd` is `cd_failure`/`cd_and` above), plus the
+            // expression forms that used to lose their status.
+            "mkdir_status",
+            "touch_status",
+            "printf_status",
+            "test_status",
+            "ternary",
+            "andor_chain",
+            "capture_native",
         ];
         let dir = concat!(env!("CARGO_MANIFEST_DIR"), "/tests/golden");
         let have_perl = std::process::Command::new("perl")

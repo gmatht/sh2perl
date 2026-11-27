@@ -53,30 +53,35 @@
 //! its ToInt32 lowering; the C/Go/Rust/GLSL generators for their native
 //! int typing.
 
+use std::cell::RefCell;
 use std::collections::HashSet;
-use std::sync::Mutex;
 
 use crate::ir::{ArithAst, IrExpr, IrStmt};
 
 /// i32 verdicts keyed by `fn_name` ("" = top level) + the statement
 /// index of the Assign/Expr that carries the Arith node.
-static VERDICTS: Mutex<Option<HashSet<(String, usize)>>> = Mutex::new(None);
+///
+/// THREAD-LOCAL: see `background_decide` — a verdict belongs to the one
+/// compilation that installed it, not to the process.
+thread_local! {
+    static VERDICTS: RefCell<Option<HashSet<(String, usize)>>> = const { RefCell::new(None) };
+}
 
 /// Drop the cached verdict — the out-of-band caller's reset (see
 /// `transforms::reset_verdicts`). These transforms are analysis-only: they
 /// return `false` from `run()` and a RENDERER reads the verdict, so without
 /// a reset a second run observes the PREVIOUS input's verdict.
 pub fn clear_verdicts() {
-    *VERDICTS.lock().unwrap() = None;
+    VERDICTS.with(|c| *c.borrow_mut() = None);
 }
 
 pub fn is_i32(fn_name: &str, stmt_idx: usize) -> bool {
-    VERDICTS
-        .lock()
-        .unwrap()
-        .as_ref()
-        .map(|s| s.contains(&(fn_name.to_string(), stmt_idx)))
-        .unwrap_or(false)
+    VERDICTS.with(|c| {
+        c.borrow()
+            .as_ref()
+            .map(|s| s.contains(&(fn_name.to_string(), stmt_idx)))
+            .unwrap_or(false)
+    })
 }
 
 /// The renderer-facing verdict as a VALUE: `Some(bound)` means every node of
@@ -97,7 +102,7 @@ pub fn transform(stmts: &mut Vec<IrStmt>) -> bool {
             out.insert((String::new(), i));
         }
     }
-    *VERDICTS.lock().unwrap() = Some(out);
+    VERDICTS.with(|c| *c.borrow_mut() = Some(out));
     false // analysis-only
 }
 

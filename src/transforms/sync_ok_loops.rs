@@ -62,8 +62,8 @@
 //! worker appends this to `transforms::all()` when it compile-ins the
 //! file). Gated by `SH2_TRANSFORMS` like every transform.
 
+use std::cell::RefCell;
 use std::collections::HashSet;
-use std::sync::Mutex;
 
 use crate::ir::{ArithAst, IrExpr, IrStmt};
 
@@ -91,50 +91,52 @@ const LOOP_OVERHEAD_US: u64 = 1;
 // Set once per compilation by `transform` (ast_to_ir), read by the
 // renderer hooks. Empty when the transform is disabled (the
 // SH2_TRANSFORMS gate skips `transform`, so the statics stay None).
-static SYNC_OK_LOOPS: Mutex<Option<HashSet<usize>>> = Mutex::new(None);
-static BATCH_OK_LOOPS: Mutex<Option<HashSet<usize>>> = Mutex::new(None);
+///
+/// THREAD-LOCAL: see `background_decide` — pointer-keyed verdicts belong to
+/// the compilation (and thread) that installed them.
+thread_local! {
+    static SYNC_OK_LOOPS: RefCell<Option<HashSet<usize>>> = const { RefCell::new(None) };
+    static BATCH_OK_LOOPS: RefCell<Option<HashSet<usize>>> = const { RefCell::new(None) };
+}
 
 /// Drop the cached verdict — the out-of-band caller's reset (see
 /// `transforms::reset_verdicts`). These transforms are analysis-only: they
 /// return `false` from `run()` and a RENDERER reads the verdict, so without
 /// a reset a second run observes the PREVIOUS input's verdict.
 pub fn clear_verdicts() {
-    *SYNC_OK_LOOPS.lock().unwrap() = None;
-    *BATCH_OK_LOOPS.lock().unwrap() = None;
+    SYNC_OK_LOOPS.with(|c| *c.borrow_mut() = None);
+    BATCH_OK_LOOPS.with(|c| *c.borrow_mut() = None);
 }
 
 /// Renderer hook: is this loop marked "do not break up" (run as ONE sync
 /// chunk)? Read by `compute_async_region_loops` + the loop sync gate.
 pub fn sync_ok(st: &IrStmt) -> bool {
-    SYNC_OK_LOOPS
-        .lock()
-        .unwrap()
-        .as_ref()
-        .map(|s| s.contains(&(st as *const IrStmt as usize)))
-        .unwrap_or(false)
+    SYNC_OK_LOOPS.with(|c| {
+        c.borrow()
+            .as_ref()
+            .map(|s| s.contains(&(st as *const IrStmt as usize)))
+            .unwrap_or(false)
+    })
 }
 
 /// Renderer hook: is this loop marked "checkpointed" (sync chunks of
 /// [`BATCH`] with a yield)? Read by the For/While lowering.
 pub fn batch_ok(st: &IrStmt) -> bool {
-    BATCH_OK_LOOPS
-        .lock()
-        .unwrap()
-        .as_ref()
-        .map(|s| s.contains(&(st as *const IrStmt as usize)))
-        .unwrap_or(false)
+    BATCH_OK_LOOPS.with(|c| {
+        c.borrow()
+            .as_ref()
+            .map(|s| s.contains(&(st as *const IrStmt as usize)))
+            .unwrap_or(false)
+    })
 }
 
 /// Worker visibility: (sync_ok count, batch_ok count) — lets the estree
 /// worker confirm the transform is LIVE (its verdicts reach the renderer)
 /// rather than silently no-op'ing on a pointer mismatch.
 pub fn stats() -> (usize, usize) {
-    let s = SYNC_OK_LOOPS.lock().unwrap();
-    let b = BATCH_OK_LOOPS.lock().unwrap();
-    (
-        s.as_ref().map(|x| x.len()).unwrap_or(0),
-        b.as_ref().map(|x| x.len()).unwrap_or(0),
-    )
+    let s = SYNC_OK_LOOPS.with(|c| c.borrow().as_ref().map(|x| x.len()).unwrap_or(0));
+    let b = BATCH_OK_LOOPS.with(|c| c.borrow().as_ref().map(|x| x.len()).unwrap_or(0));
+    (s, b)
 }
 
 /// The transform entry: walk the whole tree (stmts + exprs), compute the
@@ -159,8 +161,8 @@ pub fn apply_to(stmts: &[IrStmt]) -> bool {
     for st in stmts.iter() {
         walk(st, &mut sync_ok, &mut batch_ok);
     }
-    *SYNC_OK_LOOPS.lock().unwrap() = Some(sync_ok.clone());
-    *BATCH_OK_LOOPS.lock().unwrap() = Some(batch_ok.clone());
+    SYNC_OK_LOOPS.with(|c| *c.borrow_mut() = Some(sync_ok.clone()));
+    BATCH_OK_LOOPS.with(|c| *c.borrow_mut() = Some(batch_ok.clone()));
     !sync_ok.is_empty() || !batch_ok.is_empty()
 }
 
