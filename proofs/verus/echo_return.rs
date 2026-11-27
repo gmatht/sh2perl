@@ -42,11 +42,41 @@
 // (bare fnValue at statement position — prints nothing) makes the
 // same command report 10 verified, 3 errors — pin_single_echo_lifts,
 // pin_wrapped_prints_value and pin_bare_is_not_echo all go red. The
-// file was restored and re-checked at 13 verified, 0 errors.
+// file was restored and re-checked at 13 verified, 0 errors (before
+// the 2026-11-27 re-audit below; the count is now 25).
+//
+// ── 2026-11-27 re-audit: the `return N` refusal ──────────────────────
+//
+// `src/transforms/echo_return.rs` gained
+//     IrStmt::Return(Some(_)) => return None,
+// because folding a body that returns a STATUS value drops the status
+// (`f(){ echo hi; return 3; }; f; echo $?` measured 3 in bash, 0
+// through the fold). The call-channel laws above take eligibility as a
+// premise, so they stay sound when the accepted set shrinks, but the
+// model did not record the refusal itself. The `Stmt`/`walk` section
+// below adds the pass's Need/Done classifier for exactly that arm:
+//   walk_status_ret_refused      a body carrying `return N` is refused
+//   walk_accepts_no_status       no accepted body carries one
+//   refused_body_is_unchanged    a refused body is emitted unchanged,
+//                                so the original bytes/status stand
+//   arm_with_status_refused      a refusal in any `if`/`case` arm
+//                                refuses the enclosing body too
+// Pins: pin_status_return_refused (the measured body),
+// pin_bare_return_after_echo_ok (the old bare-return arm still lifts),
+// pin_bare_return_before_echo_refuses, and
+// pin_status_return_in_an_arm_refused (nested propagation).
+//
+// MUTANTS measured 2026-11-27, each restored byte-identically
+// (sha256 of the file compared before and after each mutation):
+//   StatusRet accepted (None -> Some(done))   24 verified, 1 error
+//                                             (walk_status_ret_refused)
+//   BareRet always accepted                   1 error at
+//                                             pin_bare_return_before_echo_refuses
+//                                             (`expression simplifies to false`)
 //
 // Verus 0.2026.10.18.7d82994, rust toolchain 1.99.1:
 //   verus --triggers-mode silent --rlimit 40 echo_return.rs
-//   -> verification results:: 13 verified, 0 errors
+//   -> verification results:: 25 verified, 0 errors
 use vstd::prelude::*;
 
 verus! {
@@ -186,6 +216,195 @@ proof fn pin_bare_is_not_echo(v: int)
     assert(stmt_bytes(v) == seq![v, 10int]);
     assert(seq![v, 10int].len() == 2);
     assert(bare_bytes().len() == 0);
+}
+
+// ── 2026-11-27 re-audit: the pass's forward classifier (`parse_stmt`) ──
+//
+// The call-channel laws above take eligibility as a premise. This
+// section makes the ACCEPTANCE side concrete for the arm that moved on
+// 2026-11-27: `IrStmt::Return(Some(_)) => return None` refuses a body
+// that returns a status value, because folding such a body would drop
+// the status (`f(){ echo hi; return 3; }; f; echo $?` measured 3 in
+// bash, 0 through the fold). `walk` is the Need/Done machine over the
+// statement shapes that decide acceptance; `StatusRet` is the new
+// refusal arm, `BareRet` keeps the source's old arm (legal only after a
+// path echoed). A refused body is never folded, so call sites are left
+// untouched and the original bytes/status stand.
+
+pub enum Stmt {
+    Echo(int),
+    StatusRet(int), // `return N` — refused (the new arm)
+    BareRet,        // `return` — legal only after an echo
+    Silent,         // pure assignment/declaration
+    Val(int),       // the rewrite's shape: an echo became a value return
+}
+
+// The classifier: `None` = refused, `Some(done)` = the path state after
+// the list (done = every live path echoed).
+pub open spec fn walk(ss: Seq<Stmt>, done: bool) -> Option<bool>
+    decreases ss.len(),
+{
+    if ss.len() == 0 {
+        Some(done)
+    } else {
+        match ss[0] {
+            Stmt::Echo(_) => if done { None } else { walk(ss.subrange(1, ss.len() as int), true) },
+            Stmt::StatusRet(_) => None,
+            Stmt::BareRet => if done { walk(ss.subrange(1, ss.len() as int), true) } else { None },
+            Stmt::Silent => walk(ss.subrange(1, ss.len() as int), done),
+            Stmt::Val(_) => walk(ss.subrange(1, ss.len() as int), true),
+        }
+    }
+}
+
+pub open spec fn has_status_ret(ss: Seq<Stmt>) -> bool
+    decreases ss.len(),
+{
+    ss.len() > 0
+        && (match ss[0] {
+            Stmt::StatusRet(_) => true,
+            _ => false,
+        } || has_status_ret(ss.subrange(1, ss.len() as int)))
+}
+
+pub open spec fn accepted(ss: Seq<Stmt>) -> bool {
+    matches!(walk(ss, false), Option::Some(_))
+}
+
+// The rewrite (value echo -> value return) only runs on accepted bodies.
+pub open spec fn rewrite(ss: Seq<Stmt>) -> Seq<Stmt>
+    decreases ss.len(),
+{
+    if ss.len() == 0 {
+        ss
+    } else {
+        match ss[0] {
+            Stmt::Echo(v) => seq![Stmt::Val(v)] + rewrite(ss.subrange(1, ss.len() as int)),
+            Stmt::StatusRet(v) => seq![Stmt::StatusRet(v)] + rewrite(ss.subrange(1, ss.len() as int)),
+            Stmt::BareRet => seq![Stmt::BareRet] + rewrite(ss.subrange(1, ss.len() as int)),
+            Stmt::Silent => seq![Stmt::Silent] + rewrite(ss.subrange(1, ss.len() as int)),
+            Stmt::Val(v) => seq![Stmt::Val(v)] + rewrite(ss.subrange(1, ss.len() as int)),
+        }
+    }
+}
+
+pub open spec fn folded(ss: Seq<Stmt>) -> Seq<Stmt> {
+    if accepted(ss) { rewrite(ss) } else { ss }
+}
+
+// THE OBLIGATION (the new refusal): a body carrying `return N` is
+// refused, at any position of the list.
+proof fn walk_status_ret_refused(ss: Seq<Stmt>, done: bool)
+    requires has_status_ret(ss),
+    ensures matches!(walk(ss, done), Option::None),
+    decreases ss.len(),
+{
+    let tail = ss.subrange(1, ss.len() as int);
+    if ss.len() == 0 {
+    } else {
+        match ss[0] {
+            Stmt::StatusRet(_) => {}
+            Stmt::Echo(_) => {
+                assert(has_status_ret(tail));
+                if !done { walk_status_ret_refused(tail, true); }
+            }
+            Stmt::BareRet => {
+                assert(has_status_ret(tail));
+                if done { walk_status_ret_refused(tail, true); }
+            }
+            Stmt::Silent => {
+                assert(has_status_ret(tail));
+                walk_status_ret_refused(tail, done);
+            }
+            Stmt::Val(_) => {
+                assert(has_status_ret(tail));
+                walk_status_ret_refused(tail, true);
+            }
+        }
+    }
+}
+
+// No accepted body carries a status return (the contrapositive).
+proof fn walk_accepts_no_status(ss: Seq<Stmt>, done: bool)
+    requires matches!(walk(ss, done), Option::Some(_)),
+    ensures !has_status_ret(ss),
+{
+    if has_status_ret(ss) {
+        walk_status_ret_refused(ss, done);
+    }
+}
+
+// A refused body is emitted UNCHANGED: no call site is rewritten, so
+// the original bytes and status are exactly what runs.
+proof fn refused_body_is_unchanged(ss: Seq<Stmt>)
+    requires has_status_ret(ss),
+    ensures folded(ss) == ss,
+{
+    walk_status_ret_refused(ss, false);
+    assert(!accepted(ss));
+}
+
+// If/Case arms: the source parses EVERY arm and refuses the enclosing
+// statement when one arm refuses, so a status return in any arm refuses
+// the whole body — not only a top-level one.
+pub open spec fn arms_ok(arms: Seq<Seq<Stmt>>) -> bool
+    decreases arms.len(),
+{
+    if arms.len() == 0 {
+        true
+    } else {
+        (match walk(arms[0], false) {
+            Option::Some(_) => true,
+            Option::None => false,
+        }) && arms_ok(arms.subrange(1, arms.len() as int))
+    }
+}
+
+proof fn arm_with_status_refused(arms: Seq<Seq<Stmt>>, i: int)
+    requires 0 <= i < arms.len(), has_status_ret(arms[i]),
+    ensures !arms_ok(arms),
+    decreases arms.len(),
+{
+    if i == 0 {
+        walk_status_ret_refused(arms[0], false);
+    } else {
+        arm_with_status_refused(arms.subrange(1, arms.len() as int), i - 1);
+    }
+}
+
+// Fidelity pins for the re-audit.
+
+// `f(){ echo hi; return 3; }`: the measured status-return body, refused.
+proof fn pin_status_return_refused()
+    ensures matches!(walk(seq![Stmt::Echo(104), Stmt::StatusRet(3)], false), Option::None),
+{
+    assert(has_status_ret(seq![Stmt::Echo(104), Stmt::StatusRet(3)])) by (compute);
+    walk_status_ret_refused(seq![Stmt::Echo(104), Stmt::StatusRet(3)], false);
+}
+
+// `f(){ echo hi; return; }` stays eligible (the old bare-return arm).
+proof fn pin_bare_return_after_echo_ok()
+    ensures walk(seq![Stmt::Echo(104), Stmt::BareRet], false) == Some(true),
+{
+    assert(walk(seq![Stmt::Echo(104), Stmt::BareRet], false) == Some(true)) by (compute);
+}
+
+// `f(){ return; }` still refuses: a no-output path loses the channel.
+proof fn pin_bare_return_before_echo_refuses()
+    ensures matches!(walk(seq![Stmt::BareRet], false), Option::None),
+{
+    assert(matches!(walk(seq![Stmt::BareRet], false), Option::None)) by (compute);
+}
+
+// A status return inside an `if` arm refuses the whole body.
+proof fn pin_status_return_in_an_arm_refused()
+    ensures !arms_ok(seq![seq![Stmt::Echo(104), Stmt::StatusRet(3)], seq![Stmt::Echo(104)]]),
+{
+    assert(has_status_ret(seq![Stmt::Echo(104), Stmt::StatusRet(3)])) by (compute);
+    arm_with_status_refused(
+        seq![seq![Stmt::Echo(104), Stmt::StatusRet(3)], seq![Stmt::Echo(104)]],
+        0,
+    );
 }
 
 fn main() {}

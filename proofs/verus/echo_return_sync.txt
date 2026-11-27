@@ -1,5 +1,10 @@
 # verus-sync-coverage manifest: echo_return
-# source sha: echo_return=9fc06a254cd7  proof sha: 7d5772866290
+# source sha: echo_return=82c0f5af74f2  proof sha: 181eea82e9dd
+# audited 2026-11-27: the only change since 9fc06a254cd7 is
+#   `IrStmt::Return(Some(_)) => return None` (af5f2f466) — a refusal arm,
+#   not a change to the lifted output path. The model now carries that arm
+#   (Stmt::StatusRet) and proves refusal => the body is emitted unchanged,
+#   so the call-channel laws apply to the narrowed accepted set.
 
 [pins]
 pin pin_bare_is_not_echo -> UNMIRRORED (by design — see the proof-campaign plan §(b).4)
@@ -10,6 +15,10 @@ pin pin_multi_echo_refuses -> test multi_echo_refuses: MAPPED
 pin pin_no_echo_refuses -> test no_echo_path_refuses: MAPPED
 pin pin_single_echo_lifts -> test simple_value_function_lifts: MAPPED
 pin pin_wrapped_prints_value -> test simple_value_function_lifts: MAPPED
+pin pin_status_return_refused: UNMIRRORED (corpus test tests/status/fn_echo_return.sh; no lib unit test for `return N`)
+pin pin_bare_return_after_echo_ok: UNMIRRORED (no lib unit test for a trailing bare `return`)
+pin pin_bare_return_before_echo_refuses: UNMIRRORED (no lib unit test for a bare `return` before any echo)
+pin pin_status_return_in_an_arm_refused: UNMIRRORED (no lib unit test for a status return inside an if/case arm)
 
 [guards]
 guard echo-state machine: PRESENT
@@ -18,8 +27,11 @@ guard fnValue wrap: PRESENT
 guard last-stage echo: PRESENT
 
 [counts]
-proof-fns: 12
-pins: 8
+proof-fns: 20
+pins: 12
+# measured verdict 2026-11-27: 25 verified / 0 errors (mutants.verus in the
+# proof header: StatusRet accepted 24v/1e; BareRet always accepted 1e at
+# pin_bare_return_before_echo_refuses).
 # NOTE: proof-fns is a file-shape fact (change detector), NOT the
 # Verus obligation count — the gate asserts N verified separately.
 
@@ -38,3 +50,7 @@ exec pin_multi_echo_refuses (multi_echo_refuses): PASS
 exec pin_no_echo_refuses (no_echo_path_refuses): PASS
 exec pin_single_echo_lifts (simple_value_function_lifts): PASS
 exec pin_wrapped_prints_value (simple_value_function_lifts): PASS
+exec pin_status_return_refused: UNMIRRORED (not executed)
+exec pin_bare_return_after_echo_ok: UNMIRRORED (not executed)
+exec pin_bare_return_before_echo_refuses: UNMIRRORED (not executed)
+exec pin_status_return_in_an_arm_refused: UNMIRRORED (not executed)
