@@ -70,6 +70,12 @@ echo until-cd=$n
 n=0
 while test -n abc; do n=$((n + 1)); break; done
 echo while-test=$n
+n=0
+while echo multi-cond; false; do n=1; break; done
+echo multi-while=$n
+n=0
+until true; true; do n=1; break; done
+echo multi-until=$n
 
 cd /no/such && echo and-bad || echo and-ok
 cd /tmp && echo and-ok

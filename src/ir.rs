@@ -1923,6 +1923,24 @@ fn native_stmt_chain(e: &IrExpr) -> bool {
     }
 }
 
+/// One statement of a CONDITION block. The parser wraps each condition
+/// command in its own `Block` (`while echo hi; false` arrives as
+/// `block[Arrow[Block([exec echo]), Block([exec false])]]`), so unwrap it
+/// before asking whether the command renders natively — otherwise the
+/// whole block went to the `bash -c` rebuild, which dropped the builtins
+/// `expr_to_cmd` cannot spell and printed nothing where bash prints.
+fn cond_stmt_is_native(s: &IrStmt) -> bool {
+    match s {
+        IrStmt::Expr(e) => native_stmt_chain(e),
+        // `echo hi` arrives LOWERED to `Block([Output, exec true])` (the
+        // print, plus the `true` that stands for its status) by the time
+        // the renderer sees a condition block — a native print, not a fork.
+        IrStmt::Output { .. } => true,
+        IrStmt::Block(inner) => !inner.is_empty() && inner.iter().all(cond_stmt_is_native),
+        _ => false,
+    }
+}
+
 /// `exec("cd", …)` is a plain command; the redirect wrapper carries its
 /// own expression, so the builtin name test alone would mis-route it.
 fn exec_is_redirect_shaped(args: &[IrExpr]) -> bool {
@@ -13552,7 +13570,7 @@ pub(crate) fn ir_expr_to_perl(expr: &IrExpr) -> String {
                         // re-run (and re-print) them out of process.
                         if stmts
                             .iter()
-                            .all(|s| matches!(s, IrStmt::Expr(e) if native_stmt_chain(e)))
+                            .all(|s| cond_stmt_is_native(s))
                         {
                             let mut inner = String::new();
                             for s in stmts {
@@ -18408,6 +18426,18 @@ mod perl_render_tests {
         let pf = render("printf '%d\\n' zz\n");
         assert!(pf.contains("printf: $__pfv: invalid number"), "{pf}");
         assert!(pf.contains("$__sh2_pf_bad ? 1 : 0"), "{pf}");
+    }
+
+    /// SEVERAL native commands in one loop condition stay native and keep
+    /// their order (`while echo hi; false` printed nothing at all: the
+    /// `bash -c` rebuild could not spell a native `echo`, so it vanished).
+    #[test]
+    fn multi_command_loop_condition_stays_native() {
+        let out = render("n=0\nwhile echo hi; false; do n=1; break; done\necho n=$n\n");
+        assert!(!out.contains("system("), "{out}");
+        assert!(!out.contains("bash', '-c'"), "{out}");
+        assert!(out.contains("print \"hi\\n\""), "{out}");
+        assert!(out.contains("$? = 1 << 8"), "{out}");
     }
 
     /// The `&&`/`||` guard reads Perl's `$?` register, not the
