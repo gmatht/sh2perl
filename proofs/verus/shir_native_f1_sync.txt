@@ -1,0 +1,56 @@
+# verus-sync-coverage manifest: shir_native_f1
+# source sha: shir_native_stmt=93c9e845a066  proof sha: 6c9a5aa9ad8d
+# source: src/transforms/shir_native_stmt.rs (cluster F1, the parts proved:
+#   native_echo_tr_sort_stmt 5252, tr_set_escape 5220,
+#   native_wc_l_pipeline 2473, native_head_tail_stmt 1749,
+#   native_head_tail_pipeline 2369)
+# Cluster F1 is only PARTLY covered: tr/wc/head-tail are proved; sort's
+# ordering and the line-mode head/tail split are stated open below.
+# Clusters F2-F4, G and A remain.
+
+[pins]
+pin pin_tail_clamps -> UNMIRRORED (no source test for tail -c clamping)
+pin pin_head_zero_is_empty -> UNMIRRORED (no source test for head -c 0)
+pin pin_tr_only_maps_the_set -> UNMIRRORED (no source test for tr's set map)
+pin pin_wc_needs_a_newline_per_line -> UNMIRRORED (no source test for wc's producer shape)
+
+[guards]
+guard law tr_join_law (per-line tr re-joined == bash tr on the stream): PRESENT
+guard law tr_line_count_law (translation preserves the line structure): PRESENT
+guard law wc_l_law (bash newline count == line count): PRESENT
+guard law head_bytes_law / tail_bytes_law (byte windows with clamping): PRESENT
+guard independent side: tr_text/count_nl/head/tail operate on the produced byte stream: PRESENT
+guard independent side: tr_lines/join/line count/head-tail clamps operate on the fold's line and clamped-string terms: PRESENT
+guard domain: a != '\n' for tr (the fold maps line contents, bash also maps separators): STATED
+guard domain: every line carries no newline (all_no_nl) and the producer terminates each line: STATED
+guard sort: plain ordering and -n/-r refusals: NOT THIS PROOF
+guard line-mode head -N/tail -N splitting and joined trailing newline: NOT THIS PROOF
+guard native_literal_subshell_wc_stmt's nested literal grep/sed tree: NOT THIS PROOF (F2)
+guard native_sort_stmt / native_sort_file_stmt numeric/human/reverse orderings and human_size: NOT THIS PROOF
+guard locales, multibyte cutting, byte renderer: OUT OF MODEL
+guard D1/D2/D3 laws: REUSED conceptually, not re-claimed
+guard clusters F2-F4, G, A: NOT THIS PROOF
+
+[counts]
+18 verified, 0 errors (verus --triggers-mode silent --rlimit 40 shir_native_f1.rs)
+mutants measured this turn against that baseline, each restored
+  byte-identically (sha re-checked):
+    counted (17v/1e):
+      m1 tr skips the per-line translation (tr_join_law)
+      m4 head takes the suffix (head_bytes_law)
+    counted (15v/3e):
+      m2 newline count off by one (wc_l_law and its pins)
+    counted (16v/2e):
+      m5 tail clamps to empty instead of the whole input (tail_bytes_law
+         and pin_tail_clamps)
+    rejected before verification by a concrete pin:
+      m3 join drops the later lines — join stops being recursive, so
+         join_cons's reveal_with_fuel cannot be satisfied
+
+[exec]
+# The analysed module's 8 tests cover chain/find and the renderer; none
+# exercises the tr/wc/head-tail folds. Every pin row is UNMIRRORED.
+exec pin_tail_clamps: UNMIRRORED (not executed: no source test)
+exec pin_head_zero_is_empty: UNMIRRORED (not executed)
+exec pin_tr_only_maps_the_set: UNMIRRORED (not executed)
+exec pin_wc_needs_a_newline_per_line: UNMIRRORED (not executed)

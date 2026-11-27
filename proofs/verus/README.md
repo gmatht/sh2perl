@@ -9544,3 +9544,37 @@ flat connector split, `!`, parentheses, globs and `-a`/`-o` in `[[ ]]` remain
 renderer work; D1's atomic round trip and D3's other three functions are
 reused, not re-claimed; D2's chain laws are not re-claimed. **Clusters A, F
 and G remain open.**
+
+### Cluster F1, partly proved: `tr` / `wc -l` / `head -c` / `tail -c`
+
+    proofs/verus/shir_native_f1.rs                (18 verified, 0 errors)
+    verus --triggers-mode silent --rlimit 40 proofs/verus/shir_native_f1.rs
+
+F1 groups five filter commands; this lands the text-model parts that can be
+proved now:
+
+- **`tr_join_law`**: translating each producer line and re-joining is the
+  same text as bash's `tr` over the joined stream. **`tr_line_count_law`**:
+  translation preserves the line structure. Domain hypotheses, stated: the
+  mapped character is not the newline separator (`a != '\n'` — the fold maps
+  line contents while bash would also map separators), and every line
+  carries no newline of its own.
+- **`wc_l_law`**: `native_wc_l_pipeline`'s `lines().count()` equals bash's
+  `wc -l` newline count on the fold's newline-terminated producer.
+- **`head_bytes_law` / `tail_bytes_law`**: `native_head_tail_stmt`'s
+  `-c N` first/last-byte windows with their length clamp match bash.
+
+Pins: `tail -c` clamps to the whole input, `head -c 0` is empty, `tr` leaves
+characters outside its set alone, `wc` needs one newline per line. Mutants,
+measured: skipping the translation (**17v/1e**), an off-by-one newline count
+(**15v/3e**), head taking the suffix (**17v/1e**), and tail clamping to empty
+(**16v/2e**) are counted; dropping join's later lines is rejected before
+verification because `join_cons`'s fuel reveal no longer applies. Each
+restored byte-identically (`shir_native_f1_sync.txt`).
+
+**Not proved, stated:** `sort`'s plain ordering and its `-n`/`-r` refusals
+(needs an ordering/permutation uniqueness model), the line-mode
+`head -N`/`tail -N` split and joined trailing newline, and
+`native_literal_subshell_wc_stmt`'s literal grep/sed tree (F2). Locales,
+multibyte cutting and the byte renderer are out of model; D1–D3 are reused,
+not re-claimed. Clusters F2–F4, G and A remain open.
