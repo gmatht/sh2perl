@@ -1,0 +1,61 @@
+# verus-sync-coverage manifest: shir_native_chain
+# source sha: shir_native_stmt=93c9e845a066  proof sha: 5290c291092e
+# source: src/transforms/shir_native_stmt.rs (cluster D2:
+#   test_and_to_if 448, single_stmt 510, test_chain_to_if 521,
+#   chain_stmt_expr 591, redirect_call_to_stmt 626,
+#   cmd_and_chain_to_if 679)
+# This is the SIXTH proved cluster of the decomposition in
+# shir_native_stmt_plan.md (C, H, E, B and D1 came first); A, D3, F and G
+# are open. Plan §D assigns D2 the chain folds; the renderer split in
+# render_test_text is D1/D3 and is not claimed here.
+
+[pins]
+pin pin_fallible_then_diverges -> UNMIRRORED (no source test for the always-success gate)
+pin pin_no_else_keeps_condition_status -> UNMIRRORED (no source test for an empty else's status)
+pin pin_cd_is_not_chain_native -> test cd_chains_keep_their_dedicated_renderers : MAPPED
+pin pin_pure_bool_lead_refused -> test non_statement_elements_refuse_the_chain_rewrite : MAPPED
+pin pin_mixed_and_or_refused -> test non_statement_elements_refuse_the_chain_rewrite : MAPPED
+
+[guards]
+guard law test_and_to_if_law (`test b && THEN` -> If b THEN): PRESENT
+guard law test_chain_to_if_law (`(test b && THEN) || ELSE` -> If b THEN ELSE): PRESENT
+guard law cmd_and_chain_to_if_law (`e0 && e1 ...` -> nested status-gated Ifs): PRESENT
+guard independent side: bash_status/bash_trace/bash_test_and/bash_test_chain compute bash's `&&`/`||` status and effects: PRESENT
+guard independent side: build_chain/pass_test_and/pass_test_chain build the folds' If/Block structures; status/trace give their semantics: PRESENT
+guard bridge: reads_status_register distinguishes a `$? == 0` read (keeps the incoming status with no else) from a test that writes 0/1: PRESENT
+guard always-success gate: always_ok and always_ok_status: PRESENT
+guard single_stmt's assign/exec/test arm and single_always_true_exec's echo/printf arm: MODELLED as an always-success command
+guard redirect_call_to_stmt / flatten_redirect_status_block: OUT OF MODEL (structural identity on the statement list)
+guard static_pipeline_truth and test_chain_to_if's static branch: OUT OF MODEL (the pipeline still runs ahead of the taken branch)
+guard render_test_text's connector split, `!`, globs, `-a`/`-o` in [[ ]], unset variable under set -u, dynamic word: NOT THIS PROOF (renderer half, D1/D3)
+guard D1 atomic round trip (shir_native_test_render.rs): REUSED, not re-claimed
+guard `files` cross-statement invariant: cluster A, NOT THIS PROOF
+guard backend rendering of If/status (perl $CHILD_ERROR, c _sh_rc, js sh2.lastExit): OUT OF MODEL
+guard the other folds / clusters A, D3, F, G: NOT THIS PROOF
+
+[counts]
+18 verified, 0 errors (verus --triggers-mode silent --rlimit 40 shir_native_chain.rs)
+mutants measured this turn against that baseline, each restored
+  byte-identically (sha re-checked):
+    counted (17v/1e):
+      m1 drop the always-success gate (`requires always_ok(then)` removed;
+         the chain law's precondition cannot be met)
+      m2 `cmd_and_chain_to_if` tests `true` instead of `$? == 0`
+         (the chain law's status postcondition fails)
+      m3 `chain_stmt_expr` accepts `cd` (pin_cd_is_not_chain_native)
+      m4 the fold accepts a pure-boolean lead (pin_pure_bool_lead_refused)
+      m6 `test_chain_to_if` drops the else branch (the chain law's status
+         and effect postconditions fail)
+    rejected before verification by a concrete pin:
+      m5 the mixed `&&`/`||` gate accepts everything — `all_and` stops being
+         recursive, so pin_mixed_and_or_refused's reveal_with_fuel cannot be
+         satisfied (no verification count is produced)
+
+[exec]
+# The analysed module's tests include the chain-fold tests named above; the
+# always-success gate and the empty-else status rule have no source test.
+exec pin_fallible_then_diverges: UNMIRRORED (not executed: no source test)
+exec pin_no_else_keeps_condition_status: UNMIRRORED (not executed)
+exec pin_cd_is_not_chain_native: PASS
+exec pin_pure_bool_lead_refused: PASS
+exec pin_mixed_and_or_refused: PASS

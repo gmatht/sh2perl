@@ -9426,3 +9426,48 @@ globs, `=~`, `-ef` and `$var` operands are outside this round trip; renderer
 output text is out of model. The module's 8 tests do not cover this
 renderer, so every pin row is UNMIRRORED. Clusters A, D2/D3, F and G remain
 open.
+
+### Cluster D2, proved: the chain folds
+
+    proofs/verus/shir_native_chain.rs             (18 verified, 0 errors)
+    verus --triggers-mode silent --rlimit 40 proofs/verus/shir_native_chain.rs
+
+The three chain rewrites turn `test … && …`, `(test … && …) || …` and pure
+command `&&` chains into `If`/`Block` structures. D2's laws compare the
+structure the pass emits against bash's own status/effect semantics:
+
+- **`test_and_to_if_law`**: `test b && THEN` → `If b THEN` (no else) keeps
+  the status and the executed-command sequence; a false test's non-zero
+  status survives because no else runs.
+- **`test_chain_to_if_law`**: `(test b && THEN) || ELSE` → `If b THEN ELSE`
+  when THEN is always-success. This is where the fold's always-success gate
+  is load-bearing: a fallible THEN would make bash run ELSE on failure while
+  the If form would not.
+- **`cmd_and_chain_to_if_law`**: a command chain `e0 && e1 && …` → the fold's
+  `e0; If ($? == 0) { e1; If ($? == 0) { … } }`, with the same status and
+  the same executed-command sequence.
+
+The semantic side (`bash_status`/`bash_trace`/`bash_test_and`/`bash_test_chain`)
+computes bash's `&&`/`||` behaviour directly; the pass side builds the
+If/Block structures (`build_chain`, `pass_test_and`, `pass_test_chain`) and
+gives them the backend's semantics (`status`/`trace`), including the
+distinction between a `$? == 0` read (writes no status, so an empty else
+keeps the command's own) and a `test` condition (writes 0/1).
+
+Pins: a fallible THEN under `||` diverges; a false condition with no else
+keeps status 1; `cd` is not chain-native; a pure-boolean lead is refused;
+a mixed `&&`/`||` chain is refused. Mutants, measured: dropping the
+always-success gate, testing `true` instead of `$? == 0`, accepting `cd`,
+accepting a pure-boolean lead, and dropping the else branch are counted
+failures (17 verified, 1 error each); the mixed-op gate mutant is rejected
+before verification because the pin's fuel reveal no longer applies. Each
+restored byte-identically (`shir_native_chain_sync.txt`).
+
+Exclusions, stated: `redirect_call_to_stmt` and
+`flatten_redirect_status_block` are structural identities here; the static
+pipeline branch (which keeps the pipeline running ahead of the taken branch)
+is out of model; the renderer half — `render_test_text`'s connector split,
+`!`, globs, `-a`/`-o` in `[[ ]]`, an unset variable under `set -u`, a
+dynamic word — is D1/D3, not claimed; D1's atomic round trip is reused;
+cluster A's `files` invariant and backend status rendering are out of model.
+Clusters A, D3, F and G remain open.

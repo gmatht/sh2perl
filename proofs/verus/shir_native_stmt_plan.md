@@ -6,7 +6,8 @@
                   cluster E PROVED (shir_native_echo.rs, 26 verified / 0 errors);
                   cluster B PROVED (shir_native_redirect.rs, 21 verified / 0 errors);
                   cluster D1 PROVED (shir_native_test_render.rs, 15 verified / 0 errors);
-                  clusters A, D2/D3, F, G are still planned — see §4
+                  cluster D2 PROVED (shir_native_chain.rs, 18 verified / 0 errors);
+                  clusters A, D3, F, G are still planned — see §4
 
 This is a PLAN, not a proof. It exists because `shir_native_stmt` is the one
 output-changing transform left whose property is not a single statement: it is
