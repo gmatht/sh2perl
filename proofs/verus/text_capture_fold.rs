@@ -36,6 +36,13 @@
 //     `$var`, glob, tilde, metacharacter, or quoted expansion). The head
 //     is `Echo`, `True`, `Colon`, or `Other`.
 //   * `emit` (semantic) vs `analysis` (the pass's `constant_output`).
+//   * A SECOND, independent semantic recursion, `printed`/`prints`: it
+//     assigns each word its runtime value (`Lit` prints its text, `Rt` has
+//     no constant value) and builds the text itself, sharing none of the
+//     analysis's `all_lit`/`any_flag`/`join` helpers. `analysis_prints_the_
+//     output` refines the analysis against THAT side, so a guard forgotten
+//     in the analysis disagrees with it instead of weakening both sides at
+//     once.
 //   * Shell text is a token list: `Ch` (literal char), `Syn` (a char that
 //     the re-parse treats as SYNTAX), `Sp` (a separator), `Sub` (one
 //     command substitution). `expand` is the token stream the ORIGINAL
@@ -63,12 +70,12 @@
 //
 //  ── measured mutants (all restored byte-identically; sha in the sync file) ──
 //
-//  baseline 31 verified, 0 errors
+//  baseline 37 verified, 0 errors
 //
 //  counted (the mutation compiles and the proof goes red):
-//    m1  the gate accepts a syntax character               30 verified, 1 error
-//    m2  the substitution's space becomes a literal char    30 verified, 1 error
-//    m3  the folded text's space becomes a literal char     30 verified, 1 error
+//    m1  the gate accepts a syntax character               36 verified, 1 error
+//    m2  the substitution's space becomes a literal char    36 verified, 1 error
+//    m3  the folded text's space becomes a literal char     36 verified, 1 error
 //
 //  refuted one stage earlier, at simplification, by a concrete pin:
 //    s1  an Rt word counted as literal (pin_analysis_shapes)
@@ -77,6 +84,10 @@
 //    s4  every head prints its words (pin_analysis_shapes)
 //    s5  a quote treated as syntax to the substitution (pin_a_quote_breaks_the_parse)
 //    s6  the unquoted gate wide open (pin_safe_splice)
+//    s7  the semantic recursion prints an Rt word as empty text
+//        (pin_printed_assembles_the_text); with the analysis intact this is
+//        also what would break analysis_prints_the_output if the pin did not
+//        compute first
 //
 //  ─────────────────────────────────────────────────────────────────────────
 
@@ -224,6 +235,95 @@ pub open spec fn emit(h: Head, ws: Seq<W>) -> Out {
     }
 }
 
+// ── the semantic output as its OWN recursion ──────────────────────────
+//
+// `emit` above shares the analysis's `all_lit`/`any_flag`/`join` helpers,
+// so weakening one of those would weaken both sides together. This second,
+// independent semantic model assigns each word its runtime value and
+// assembles the text itself: `Lit` prints its text, `Rt` has no constant
+// output. A pass that accepts an `Rt` word (or a flag) now disagrees with
+// this side instead of moving in lockstep with it.
+
+pub open spec fn printed(ws: Seq<W>, i: int) -> Option<Seq<char>>
+    decreases ws.len() - i,
+{
+    if i >= ws.len() {
+        Some(Seq::empty())
+    } else {
+        match ws[i] {
+            W::Lit(s) => match printed(ws, i + 1) {
+                Option::Some(rest) => Option::Some(
+                    if i == 0 { s.add(rest) } else { seq![' '].add(s).add(rest) },
+                ),
+                Option::None => Option::None,
+            },
+            W::Rt => Option::None,
+        }
+    }
+}
+
+/// echo flags, as the SEMANTIC side sees them (its own recursion).
+pub open spec fn flags_in(ws: Seq<W>, i: int) -> bool
+    decreases ws.len() - i,
+{
+    if i >= ws.len() {
+        false
+    } else {
+        is_flag(ws[i]) || flags_in(ws, i + 1)
+    }
+}
+
+/// What the command prints, computed from the words' runtime values.
+pub open spec fn prints(h: Head, ws: Seq<W>) -> Out {
+    match h {
+        Head::True | Head::Colon => if ws.len() == 0 {
+            Out::Const(Seq::empty())
+        } else {
+            Out::NotPlain
+        },
+        Head::Echo => {
+            if flags_in(ws, 0) {
+                Out::NotPlain
+            } else {
+                match printed(ws, 0) {
+                    Option::Some(r) => Out::Const(r),
+                    Option::None => Out::NotPlain,
+                }
+            }
+        }
+        Head::Other => Out::NotPlain,
+    }
+}
+
+pub proof fn flags_in_is_any_flag(ws: Seq<W>, i: int)
+    ensures
+        flags_in(ws, i) == any_flag(ws, i),
+    decreases ws.len() - i,
+{
+    if i < ws.len() {
+        flags_in_is_any_flag(ws, i + 1);
+    }
+}
+
+pub proof fn printed_is_join(ws: Seq<W>, i: int)
+    requires
+        all_lit(ws, i),
+    ensures
+        printed(ws, i) == Some(join(ws, i)),
+    decreases ws.len() - i,
+{
+    if i < ws.len() {
+        match ws[i] {
+            W::Lit(s) => {
+                printed_is_join(ws, i + 1);
+            }
+            W::Rt => {
+                assert(false);
+            }
+        }
+    }
+}
+
 /// THE FIRST LAW: the analysis only ever reports a value the command really
 /// prints, in every environment.
 pub proof fn constant_output_sound(h: Head, ws: Seq<W>, r: Seq<char>)
@@ -234,6 +334,29 @@ pub proof fn constant_output_sound(h: Head, ws: Seq<W>, r: Seq<char>)
         Head::True => {}
         Head::Colon => {}
         Head::Echo => {}
+        Head::Other => {}
+    }
+}
+
+/// THE INDEPENDENT SIDE'S LAW: the analysis's value is the one the word
+/// values produce, with no shared predicate doing the work. A forgotten
+/// guard on the pass's side (an `Rt` word or a flag) disagrees with
+/// `printed`/`flags_in` and makes this red.
+pub proof fn analysis_prints_the_output(h: Head, ws: Seq<W>, r: Seq<char>)
+    requires
+        analysis(h, ws) == Some(r),
+    ensures
+        prints(h, ws) == Out::Const(r),
+{
+    match h {
+        Head::True | Head::Colon => {
+            assert(ws.len() == 0);
+        }
+        Head::Echo => {
+            assert(all_lit(ws, 0) && !any_flag(ws, 0) && !any_broken(ws, 0));
+            flags_in_is_any_flag(ws, 0);
+            printed_is_join(ws, 0);
+        }
         Head::Other => {}
     }
 }
@@ -496,6 +619,31 @@ pub open spec fn lit(s: Seq<char>) -> W {
 
 /// `$(echo hi)` folds to `hi`; a flag, a glob, a variable and an unknown
 /// command are all refused.
+/// The independent semantic recursion's own outputs. These are the values a
+/// forgotten analysis guard would have to disagree with.
+pub proof fn pin_printed_assembles_the_text()
+    ensures
+        printed(Seq::<W>::empty(), 0) == Some(Seq::<char>::empty()),
+        printed(seq![lit(seq!['a']), lit(seq!['b', 'c'])], 0)
+            == Some(seq!['a', ' ', 'b', 'c']),
+        printed(seq![lit(seq!['a']), W::Rt], 0) == None,
+        prints(Head::Echo, seq![lit(seq!['a']), lit(seq!['b'])]) == Out::Const(seq!['a', ' ', 'b']),
+        prints(Head::Echo, seq![lit(seq!['-', 'n']), lit(seq!['x'])]) == Out::NotPlain,
+        prints(Head::Echo, seq![W::Rt]) == Out::NotPlain,
+        prints(Head::Other, Seq::<W>::empty()) == Out::NotPlain,
+{
+    assert(printed(Seq::<W>::empty(), 0) == Some(Seq::<char>::empty())) by (compute);
+    assert(printed(seq![lit(seq!['a']), lit(seq!['b', 'c'])], 0)
+        == Some(seq!['a', ' ', 'b', 'c'])) by (compute);
+    assert(printed(seq![lit(seq!['a']), W::Rt], 0) == None) by (compute);
+    assert(prints(Head::Echo, seq![lit(seq!['a']), lit(seq!['b'])])
+        == Out::Const(seq!['a', ' ', 'b'])) by (compute);
+    assert(prints(Head::Echo, seq![lit(seq!['-', 'n']), lit(seq!['x'])])
+        == Out::NotPlain) by (compute);
+    assert(prints(Head::Echo, seq![W::Rt]) == Out::NotPlain) by (compute);
+    assert(prints(Head::Other, Seq::<W>::empty()) == Out::NotPlain) by (compute);
+}
+
 pub proof fn pin_analysis_shapes()
     ensures
         analysis(Head::Echo, seq![lit(seq!['h', 'i'])]) == Some(seq!['h', 'i']),

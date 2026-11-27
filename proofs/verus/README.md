@@ -9041,10 +9041,10 @@ present and over-stripping one character past it
   with a non-empty body) decides only whether the fold fires, never the
   value — those refusals are not counted as proved here.
 
-## text_capture_fold.rs — folding constant `$(echo …)` text (31)
+## text_capture_fold.rs — folding constant `$(echo …)` text (37)
 
     verus --triggers-mode silent --rlimit 40 proofs/verus/text_capture_fold.rs
-    -> verification results:: 31 verified, 0 errors
+    -> verification results:: 37 verified, 0 errors
 
 The pass replaces a `$( … )`/backtick substitution inside the RAW TEXT that
 `test`/`param`/`arith` arguments carry, when that substitution's output is
@@ -9060,6 +9060,17 @@ the one-way direction the fold needs: **`constant_output_sound`** —
 `analysis(h, ws) = Some(r)` implies the command really prints exactly `r`,
 in every environment. `analysis_is_literal` adds that a computed replacement
 is literal text.
+
+`emit` shares the analysis's `all_lit`/`any_flag`/`join` helpers, so it would
+move in lockstep with a weakened analysis. A second, independent semantic
+recursion answers that: `printed` assigns each word its runtime value (`Lit`
+prints its text, `Rt` has no constant value) and assembles the text itself,
+while `flags_in` collects echo flags on the semantic side. **`analysis_prints_
+the_output`** refines the analysis against *that* side: `analysis(h, ws) =
+Some(r)` implies `prints(h, ws) = Const(r)`. `printed_is_join` and
+`flags_in_is_any_flag` are the only bridges to the shared helpers, so a
+guard forgotten in the analysis disagrees with `printed` instead of weakening
+both sides at once.
 
 ### (B) What the re-parse sees
 
@@ -9079,6 +9090,8 @@ premise, and `fold_is_sound` states both halves together.
 `pin_a_quote_breaks_the_parse` is the load-bearing counterexample: `a"b` is
 `Ch('a'), Ch('"'), Ch('b')` in the substitution's stream but
 `Ch('a'), Syn('"'), Ch('b')` after splicing, so the gate must refuse it.
+`pin_printed_assembles_the_text` pins the independent recursion's own
+values (empty, `a b`, an `Rt` word, a flag, an unknown head).
 `pin_analysis_shapes` pins the accepted and refused content shapes (hi / a
 flag / a variable / an unknown head / `true` / `:`), `pin_emit_is_richer`
 the richer semantic side, `pin_safe_splice` the two charsets (space and `*`
@@ -9090,10 +9103,11 @@ and `pin_splice_of_the_test_operand` the source's own operand shape
 
 Counted: a gate that accepts a syntax character, the substitution's space
 treated as a literal character, and the folded text's space treated as one —
-each **30 verified, 1 error**. Refuted at simplification by a concrete pin:
+each **36 verified, 1 error**. Refuted at simplification by a concrete pin:
 an `Rt` word counted literal, the echo-flag refusal dropped, a join without
 its separator, every head "printing" its words, a quote treated as syntax
-for the substitution, and a wide-open unquoted gate. Restored
+for the substitution, a wide-open unquoted gate, and the independent
+semantic recursion printing an `Rt` word as empty text. Restored
 byte-identically after each run (sha256 in `text_capture_fold_sync.txt`).
 
 ### Scope (read this before quoting it)

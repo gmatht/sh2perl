@@ -1,5 +1,5 @@
 # verus-sync-coverage manifest: text_capture_fold
-# source sha: text_capture_fold=f76d26e31190  proof sha: 72e022116f2b
+# source sha: text_capture_fold=f76d26e31190  proof sha: 07fb8a9ab9a2
 
 [pins]
 pin pin_quoted_test_operand -> test folds_quoted_test_operand: MAPPED
@@ -14,6 +14,7 @@ pin pin_safe_splice -> test refuses_unquoted_multi_word_output: MAPPED
 pin pin_safe_splice -> test folds_multi_word_output_inside_quotes: MAPPED
 pin pin_gates_imply_the_premise: UNMIRRORED (the gated-implies-no-syntax step has no source test)
 pin constant_output_sound: UNMIRRORED (value-level; the source tests the returned string)
+pin pin_printed_assembles_the_text: UNMIRRORED (the independent semantic recursion's values; the source tests the returned string)
 
 [guards]
 guard law constant_output_sound (analysis Some(r) => the command really prints r): PRESENT
@@ -24,16 +25,19 @@ guard gate = no_syntax over the substitution's replacement chars: PRESENT
 guard unquoted gate all_safe => no_syntax (charset is the syntax-free set): PRESENT
 guard quoted gate all_safe_quoted => no_syntax (ends/escapes/re-expands excluded): PRESENT
 guard semantic side RICHER than the analysis (newline word, -n flag still constant): PRESENT
+guard independent semantic recursion printed/flags_in/prints (Lit prints, Rt unknown): PRESENT
+guard law analysis_prints_the_output (analysis => the independent semantic recursion agrees): PRESENT
 guard lexer (scan/find_close/quote modes/single-quoted skip/span splicing): OUT OF MODEL
 guard IR traversal + TEXT_FUNCS positions (structural, not semantic): OUT OF MODEL
 guard echo flag FORMATTING (-n/-e/-E text reformatting): OUT OF MODEL (flag => NotPlain)
 
 [counts]
-31 verified, 0 errors (verus --triggers-mode silent --rlimit 40 text_capture_fold.rs)
-mutants: gate-accepts-syntax 30v/1e, substitution-space-as-char 30v/1e,
-  folded-space-as-char 30v/1e; Rt-word-as-literal, flag-refusal-dropped,
-  join-without-separator, every-head-prints, quote-as-syntax and
-  unquoted-gate-wide-open rejected at simplification by their pins.
+37 verified, 0 errors (verus --triggers-mode silent --rlimit 40 text_capture_fold.rs)
+mutants: gate-accepts-syntax 36v/1e, substitution-space-as-char 36v/1e,
+  folded-space-as-char 36v/1e; Rt-word-as-literal, flag-refusal-dropped,
+  join-without-separator, every-head-prints, quote-as-syntax,
+  unquoted-gate-wide-open and printed-prints-Rt-as-empty rejected at
+  simplification by their pins.
 [exec]
 # Every MAPPED row above was EXECUTED against the source in this tree:
 #   cargo test --lib          (full lib suite; per-test verdicts below)

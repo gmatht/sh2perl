@@ -63,7 +63,7 @@ HERE = os.path.dirname(os.path.abspath(__file__))
 # manifests record.  A mismatch means the proof changed under the claims.
 PROOF_SHA = {
     "affix_strip_fold": "3b53272ba452",
-    "text_capture_fold": "72e022116f2b",
+    "text_capture_fold": "07fb8a9ab9a2",
     "bc_float_clean": "8a1fe6ed7371",
     "uae_terminators": "300c286819f1",
     "status_reads": "467f5b75b0c5",
@@ -73,7 +73,7 @@ PROOF_SHA = {
 # proof file -> obligations the pristine run reports (header baseline).
 BASELINE = {
     "affix_strip_fold": 51,
-    "text_capture_fold": 31,
+    "text_capture_fold": 37,
     "bc_float_clean": 27,
     "uae_terminators": 31,
     "status_reads": 28,
@@ -170,7 +170,7 @@ MUTANTS = [
         "text_capture_fold",
         "            Tok::Sub(s) => no_syntax(s, 0),",
         "            Tok::Sub(_s) => true,",
-        30, 1, ("lemma_tokens",),
+        36, 1, ("lemma_tokens",),
         "the gate accepts a syntax character (fails at the `lemma_chars` call)",
     ),
     Mutant(
@@ -178,7 +178,7 @@ MUTANTS = [
         "text_capture_fold",
         "        seq![Tok::Sp].add(sub_chars(s, i + 1))",
         "        seq![Tok::Ch(s[i])].add(sub_chars(s, i + 1))",
-        30, 1, ("lemma_chars",),
+        36, 1, ("lemma_chars",),
         "the substitution's space becomes a literal char",
     ),
     Mutant(
@@ -186,7 +186,7 @@ MUTANTS = [
         "text_capture_fold",
         "        seq![Tok::Sp].add(lit_chars(s, i + 1))",
         "        seq![Tok::Ch(s[i])].add(lit_chars(s, i + 1))",
-        30, 1, ("lemma_chars",),
+        36, 1, ("lemma_chars",),
         "the folded text's space becomes a literal char",
     ),
     Mutant(
@@ -244,6 +244,16 @@ MUTANTS = [
         "pub open spec fn safe_char(c: char) -> bool {\n    true\n}",
         None, None, ("pin_safe_splice",),
         "the unquoted gate wide open",
+    ),
+    Mutant(
+        "text/s7-printed-prints-rt-as-empty",
+        "text_capture_fold",
+        "            W::Rt => Option::None,\n        }\n    }\n}\n\n"
+        "/// echo flags, as the SEMANTIC side sees them",
+        "            W::Rt => Option::Some(Seq::empty()),\n        }\n    }\n}\n\n"
+        "/// echo flags, as the SEMANTIC side sees them",
+        None, None, ("pin_printed_assembles_the_text",),
+        "the independent semantic recursion prints an Rt word as empty text",
     ),
     # ── bc_float_clean.rs — baseline 27/0, ten documented mutants ───────────
     Mutant(
