@@ -9509,3 +9509,38 @@ work; D1's atomic round trip and D2's chain laws are reused, not re-claimed;
 `render_flag_substitution_test` is out of model; the backend status registers
 and byte renderer are out of model. The module's 8 tests do not cover these
 rewrites, so every pin row is UNMIRRORED. Clusters A, F and G remain open.
+
+### Cluster D3, completed: the multi-condition `while`
+
+    proofs/verus/shir_native_while_multi.rs        (9 verified, 0 errors)
+    verus --triggers-mode silent --rlimit 40 proofs/verus/shir_native_while_multi.rs
+
+`native_while_multi_cond` restructures `while { echo LIT; test COND } do BODY`
+into `while (1) { echo LIT; if (COND) {} else { $main_exit_code =
+$CHILD_ERROR = 0; break } BODY }`. `multi_cond_loop_law` proves the same
+final status and the same per-iteration echo/body events:
+
+- **semantic side** `bash_loop` runs bash's own while: echo then test each
+  iteration, body only on true, status 0 when the test ends the loop, the
+  body's status on a body break.
+- **pass side** `run_em`/`pass_loop` interpret the emitted structure: echo
+  first, the guard's false arm resets both status variables and breaks, the
+  body writes its status and may break.
+
+The guard-stability invariant (`GUARD_STABLE`: the body does not change what
+the test reads) is an explicit hypothesis; it is preserved because the same
+guard is passed to every iteration and sufficient because the false arm stops
+the loop. Pins: a failing test exits 0, a body break keeps the body's status,
+dropping the Reset leaks a stale status, the echo runs on the failing
+iteration too, and a non-literal-echo prefix is refused. Mutants, measured:
+dropping the Reset (**6 verified, 3 errors**), inverting the guard (**5v/4e**),
+moving the echo after the test (**8v/1e**), dropping the body's status write
+and ignoring a body break (**7v/2e** each). Each restored byte-identically
+(`shir_native_while_multi_sync.txt`).
+
+Exclusions, stated: echoed bytes and the byte renderer are out of model; a
+body that mutates the tested variables is out of domain and reported; the
+flat connector split, `!`, parentheses, globs and `-a`/`-o` in `[[ ]]` remain
+renderer work; D1's atomic round trip and D3's other three functions are
+reused, not re-claimed; D2's chain laws are not re-claimed. **Clusters A, F
+and G remain open.**

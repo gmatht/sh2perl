@@ -1,0 +1,52 @@
+# verus-sync-coverage manifest: shir_native_while_multi
+# source sha: shir_native_stmt=93c9e845a066  proof sha: a6fe35acbaf5
+# source: src/transforms/shir_native_stmt.rs (cluster D3, remaining function:
+#   native_while_multi_cond 5957; works with native_while_test_cond 5892 and
+#   render_test_words 1301)
+# This completes cluster D3 (shir_native_cond.rs proved the if/while
+# condition family's other three functions in 23b040ff8). A, F and G remain.
+
+[pins]
+pin pin_guard_failure_zeroes_status -> UNMIRRORED (no source test for the failing-test status)
+pin pin_break_keeps_body_status -> UNMIRRORED (no source test for a body break's status)
+pin pin_dropped_reset_leaks_status -> UNMIRRORED (no source test for the Reset)
+pin pin_echo_runs_before_the_test -> UNMIRRORED (no source test for the echoed failing iteration)
+pin pin_refuses_non_echo_prefix -> UNMIRRORED (no source test for the echo-prefix gate)
+
+[guards]
+guard law multi_cond_loop_law (while echo/test/body == while(1) emitted structure): PRESENT
+guard independent side: bash_loop computes bash's while status and per-iteration echo/body events: PRESENT
+guard independent side: run_em/pass_loop interpret the fold's emitted Echo; If(COND){}else{Reset;Break}; BODY: PRESENT
+guard invariant: GUARD_STABLE (the body does not change what the test reads) as an explicit hypothesis; preserved by passing the same guard to each iteration; sufficient because the false arm stops the loop: PRESENT
+guard exit-status rule: a failing test exits with 0, a body break keeps the body's status: PRESENT
+guard literal-echo prefix gate and test-last recognition: MODELLED by prefix_is_literal_echo
+guard echoed bytes, quote/interpolation details and the byte renderer: OUT OF MODEL
+guard a body that mutates the tested variables: OUT OF DOMAIN (stated, not constrained away)
+guard flat-text connector split, `!`, parentheses, globs, -a/-o in [[ ]]: NOT THIS PROOF (renderer work)
+guard D1 atomic round trip (shir_native_test_render.rs): REUSED, not re-claimed
+guard D3's other functions (native_if_test_cond/native_while_test_cond/native_test_exit_stmt in shir_native_cond.rs): NOT RE-CLAIMED
+guard D2 chain laws (shir_native_chain.rs): NOT THIS PROOF
+guard clusters A, F, G: NOT THIS PROOF
+
+[counts]
+9 verified, 0 errors (verus --triggers-mode silent --rlimit 40 shir_native_while_multi.rs)
+mutants measured this turn against that baseline, each restored
+  byte-identically (sha re-checked):
+    counted (6v/3e):
+      m1 drop the emitted Reset (the law and pin_dropped_reset_leaks_status)
+    counted (5v/4e):
+      m2 invert the guard (the law and the two status pins)
+    counted (8v/1e):
+      m3 move the echo after the test (multi_cond_loop_law)
+    counted (7v/2e):
+      m4 drop the body's status write (the law and pin_break_keeps_body_status)
+      m5 ignore the body's break (the law and the break pin)
+
+[exec]
+# The analysed module's 8 tests cover chain/find and the renderer; none
+# exercises the multi-condition while restructure. Every pin row is UNMIRRORED.
+exec pin_guard_failure_zeroes_status: UNMIRRORED (not executed: no source test)
+exec pin_break_keeps_body_status: UNMIRRORED (not executed)
+exec pin_dropped_reset_leaks_status: UNMIRRORED (not executed)
+exec pin_echo_runs_before_the_test: UNMIRRORED (not executed)
+exec pin_refuses_non_echo_prefix: UNMIRRORED (not executed)
