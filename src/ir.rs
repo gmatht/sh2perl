@@ -7526,6 +7526,30 @@ fn bash_word_for(w: &IrExpr) -> String {
                         }
                     }
                     InterpPart::Expr(e) => {
+                        // A command substitution as the `Capture` VARIANT
+                        // inside a DOUBLE-QUOTED word. The top-level `Capture`
+                        // arm below rebuilds `$(…)` shell syntax, but this
+                        // nested slot only knew the `Call{func:"capture"}`
+                        // form; the variant fell through to `render_word`,
+                        // which emits the inner capture's PERL VERBATIM. In a
+                        // rebuilt shell command that texts runs through bash —
+                        // which expanded `$__sh_cap` (unset) away, so
+                        // `z=$(cd . ; echo "b$(pwd)")` printed
+                        // `bdo { my ;  = (require Cwd, …) }` instead of
+                        // `b<cwd>`. Same shape as the `cd -- "$(dirname "$0")"`
+                        // bug above: keep the word as SHELL syntax.
+                        if let IrExpr::Capture { expr, native: _ } = e.as_ref() {
+                            match arrow_to_cmd(expr) {
+                                Some(cmd) => {
+                                    s.push_str(&format!("$({})", cmd));
+                                    continue;
+                                }
+                                None => {
+                                    s.push_str("''");
+                                    continue;
+                                }
+                            }
+                        }
                         if let IrExpr::Call { func, args } = e.as_ref() {
                             if func == "getVar" {
                                 if let Some(n) = args.first().and_then(call_arg_str) {
