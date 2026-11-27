@@ -1,0 +1,27 @@
+# shir_nodes/argv.node — Argv: the PROCESS ARGUMENT VECTOR as one array
+# value (`std::env::args()` in Rust, `@ARGV` in Perl, `process.argv` in JS).
+#
+# GENERIC. Element 0 is the program name as invoked (argv[0]), elements
+# 1..n are the arguments in the order the OS delivered them; the node has
+# no fields because the value is process state, not an operand.
+#
+# The runtime already owns this state (`sh2.argv0` + `sh2.positional`); the
+# node exists so a frontend can name the whole vector as a VALUE instead of
+# reaching into the runtime. Snapshot semantics: argv of a running process
+# is fixed before main, so reading it twice in one run yields the same
+# elements (no aliasing question, no lifetime).
+node Argv
+tag "Argv"
+kind expr
+# Spec: TextOps#element_read_sound for the readback side (indexing the
+# vector is the same element read as any other array); no new law is
+# introduced by the node itself — argv is an immutable input, so the
+# vector's elements are the bytes the OS passed, in order, with the
+# program name first.
+#
+# NOT PROMISED (stated, not assumed): anything about HOW the host encodes
+# arguments (Rust gives OsString/UTF-8-lossy, JS strings are UTF-16 and the
+# runtime decodes the same way the shell frontend does); mutation of argv
+# (the shell's `shift`/`set --` rebind the runtime positional slice and do
+# NOT change this value — the node reads the process vector); and argv
+# beyond the process lifetime (child processes get their own).
