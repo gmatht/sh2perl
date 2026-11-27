@@ -9308,3 +9308,42 @@ and the other 51 folds remain open. The module's 8 tests do not cover these
 functions, so every pin row is UNMIRRORED by design and no `[exec]` PASS row
 exists. The remaining clusters (E, B, D, F, G, A) are still open — this
 section lands H, not `shir_native_stmt.rs` as a whole.
+
+### Cluster E, proved: echo/printf byte equivalence
+
+    proofs/verus/shir_native_echo.rs           (26 verified, 0 errors)
+    verus --triggers-mode silent --rlimit 40 proofs/verus/shir_native_echo.rs
+
+`native_echo_stmt` and `native_printf_stmt` replace a command with an
+`Output` node carrying literal bytes. Two laws:
+
+- **`echo_emits_the_same_bytes`**: the emitted `(text, newline)` equals what
+  bash's echo writes. The pass side transcribes the source pipeline — only
+  the FIRST word can be a flag (`-n`/`-e`/`-E`), `-e` decodes every word,
+  empty words are dropped, words are joined with one space. The semantic
+  side computes the flag tuple, the argument bytes and the trailing newline
+  independently.
+- **`printf_emits_the_same_bytes`**: the source's index loop over the format
+  (`%s`, `%%`, `\n \t \r \\`, exact argument count) agrees with a slice
+  recursion written from printf's format language; the bridge
+  `printf_index_is_slice` proves the two recursions agree at every index.
+
+Pins, rejected by computation: `-n` clears the newline; `-e` decodes while
+`-E` does not; an unknown leading-dash flag is refused; a glob word keeps the
+runtime path; printf adds no newline implicitly; extra (or missing)
+arguments are refused; `%d` and any conversion outside `%s`/`%%` is refused.
+All five of the plan's mutants are refuted at simplification by those pins
+(keeping the newline, decoding without `-e`, accepting an unknown flag,
+treating a glob as literal, ignoring extra printf arguments) — none reaches
+the verifier, so this cluster has no counted mutant. Each restored
+byte-identically (sha256 in `shir_native_echo_sync.txt`).
+
+Domain and exclusions, stated rather than hidden: the echo law excludes a
+later word that starts with `-` (the fold inspects only the first; upstream
+word shaping is expected to have handled it) and interior empty words (the
+source drops them as continuation artifacts). `printf -v` is an assignment
+plus status and belongs to cluster G; the `echo` escape table is cluster H's
+proved syntax and is reused rather than re-claimed; the renderer that turns
+`Output { newline }` into backend bytes, bash stderr and locales are out of
+model. The module's 8 tests do not cover these folds, so every pin row is
+UNMIRRORED by design. Clusters A–B and D, F, G remain open.

@@ -3,7 +3,8 @@
     source: src/transforms/shir_native_stmt.rs   7140 lines
     proof status: cluster C PROVED (shir_native_herestring.rs, 20 verified / 0 errors);
                   cluster H PROVED (shir_native_quoting.rs, 19 verified / 0 errors);
-                  clusters A-B and D-G are still planned — see §4
+                  cluster E PROVED (shir_native_echo.rs, 26 verified / 0 errors);
+                  clusters A-B and D, F, G are still planned — see §4
 
 This is a PLAN, not a proof. It exists because `shir_native_stmt` is the one
 output-changing transform left whose property is not a single statement: it is
@@ -234,7 +235,7 @@ Split it further if it grows: D1 `render_test_*` (the round trip), D2 the
 chain folds (`test_and_to_if` / `test_chain_to_if` / `cmd_and_chain_to_if`),
 D3 the if/while condition families.
 
-### E — `echo`/`printf` byte equivalence
+### E — `echo`/`printf` byte equivalence (PROVED)
 
 Functions: `native_echo_stmt` (2984), `decode_echo_escapes` (3110),
 `native_printf_stmt` (3173), `native_printf_v_stmt` (3138),

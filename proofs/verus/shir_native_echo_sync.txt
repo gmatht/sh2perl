@@ -1,0 +1,58 @@
+# verus-sync-coverage manifest: shir_native_echo
+# source sha: shir_native_stmt=93c9e845a066  proof sha: 8e189ebe723f
+# source: src/transforms/shir_native_stmt.rs (cluster E: native_echo_stmt line
+#   2984, decode_echo_escapes 3124, native_printf_stmt 3173, output_stmt 2045,
+#   literal_text 3256)
+# This is the THIRD proved cluster of the decomposition in
+# shir_native_stmt_plan.md (C and H came first); the rest of the plan is open.
+
+[pins]
+pin pin_n_clears_the_newline -> UNMIRRORED (no source test for echo -n)
+pin pin_e_decodes_escapes -> UNMIRRORED (no source test for echo -e)
+pin pin_upper_e_keeps_escapes_literal -> UNMIRRORED (no source test for echo -E)
+pin pin_unknown_flag_refused -> UNMIRRORED (no source test for an unknown flag)
+pin pin_glob_word_refused -> UNMIRRORED (no source test for a glob echo word)
+pin pin_printf_has_no_implicit_newline -> UNMIRRORED (no source test for printf bytes)
+pin pin_printf_arg_count_exact -> UNMIRRORED (no source test for extra printf args)
+pin pin_printf_unknown_conversion_refused -> UNMIRRORED (no %d test)
+
+[guards]
+guard law echo_emits_the_same_bytes (pass text/newline == bash echo bytes): PRESENT
+guard law printf_emits_the_same_bytes (index loop == format-language renderer): PRESENT
+guard independent sides: pass_echo transcribes the source pipeline (first-word flag, decode, drop empty, join); bash_echo computes flag tuple, argument bytes, separators and newline: PRESENT
+guard independent sides: pass_printf_at is the source's index loop threading `used`; printf_render is a slice recursion over the format language: PRESENT
+guard bridge printf_index_is_slice (both recursions agree at every index): PRESENT
+guard lemmas decode_all_identity, decode_all_nonempty, dec_echo_nonempty, drop_empties_identity: PRESENT
+guard echo domain: no glob words (fold gate), all words non-empty, no option-looking word after the first: STATED (pins cover the refusals; the domain premises are in the law)
+guard printf domain: %s, %%, \n \t \r \\ only; argument count must equal conversions: STATED
+guard native_printf_v_stmt (`printf -v`, assignment + status): NOT THIS PROOF (cluster G)
+guard decode_echo_escapes' escape table: cluster H's proved syntax; reused, not re-claimed here: STATED
+guard renderer turning Output{newline} into backend bytes, bash stderr, locales: OUT OF MODEL
+guard the other 55 folds / clusters A-B, D, F, G: NOT THIS PROOF (plan stages still open)
+
+[counts]
+26 verified, 0 errors (verus --triggers-mode silent --rlimit 40 shir_native_echo.rs)
+mutants measured this turn against the pre-header proof (sha 88fc742918e1),
+  each restored byte-identically (sha re-checked); the committed proof is
+  8e189ebe723f (only the header's measured-count block changed afterwards).
+  All five rejected at simplification by a concrete pin:
+    m1 keep the newline for -n (pin_n_clears_the_newline)
+    m2 decode escapes without -e (pin_e_decodes_escapes)
+    m3 accept an unknown flag as a word (pin_unknown_flag_refused)
+    m4 treat a glob word as literal (pin_glob_word_refused)
+    m5 printf ignores extra arguments (pin_printf_arg_count_exact)
+  No counted mutant exists for this cluster: every listed mutation has a pin
+  that computes false before verification.
+[exec]
+# The analysed module's #[cfg(test)] module has 8 tests (all chain/find
+# tests), none for echo or printf, measured as in the C and H manifests.
+# So `cargo test --lib` contains no test that exercises this cluster, and
+# every pin row above is UNMIRRORED. Nothing is executed for this proof.
+exec pin_n_clears_the_newline: UNMIRRORED (not executed: no source test)
+exec pin_e_decodes_escapes: UNMIRRORED (not executed)
+exec pin_upper_e_keeps_escapes_literal: UNMIRRORED (not executed)
+exec pin_unknown_flag_refused: UNMIRRORED (not executed)
+exec pin_glob_word_refused: UNMIRRORED (not executed)
+exec pin_printf_has_no_implicit_newline: UNMIRRORED (not executed)
+exec pin_printf_arg_count_exact: UNMIRRORED (not executed)
+exec pin_printf_unknown_conversion_refused: UNMIRRORED (not executed)
