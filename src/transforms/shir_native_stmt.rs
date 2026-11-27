@@ -1178,8 +1178,15 @@ fn native_test_chain(st: &mut IrStmt) -> bool {
         if cmd != "test" && cmd != "[" { return false; };
         let cond_words: Vec<&IrExpr> = words.iter().collect();
         let cond = render_test_words(&cond_words);
-        // `test COND || echo B` runs B when COND is FALSE — negate.
-        let cond = IrExpr::Str(format!("(!{})", crate::ir::ir_expr_to_perl(&cond)), StrStyle::Raw);
+        // `test COND || echo B` runs B when COND is FALSE — negate. The
+        // rendered COND can be a full comparison (`-n X` → `length(X) ne 0`),
+        // so the `!` must wrap the WHOLE expression: `(!length(X) ne 0)`
+        // parses as `(!length(X)) ne 0`, which is true whenever the string is
+        // non-empty — `test -n abc || echo OR` printed OR.
+        let cond = IrExpr::Str(
+            format!("(!({}))", crate::ir::ir_expr_to_perl(&cond)),
+            StrStyle::Raw,
+        );
         let Some(else_) = single_always_true_exec(rhs) else { return false; };
         *st = IrStmt::If {
             cond,

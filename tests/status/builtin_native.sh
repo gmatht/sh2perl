@@ -77,6 +77,22 @@ n=0
 until true; true; do n=1; break; done
 echo multi-until=$n
 
+printf '%d\n' 1 zz 3
+echo $?
+x='zz yy'
+printf '<%d>\n' $x
+echo $?
+printf '%d %d\n' 0x10 010
+printf '%d\n' 0xzz
+printf '%s %d\n' a zz
+printf '%f\n' 1e3
+printf '%f %d\n' 1 zz
+echo $?
+test -n abc || echo or-ok
+test -n '' || echo empty-or-ok
+true && echo and-rhs-ok
+false || echo or-rhs-ok
+
 cd /no/such && echo and-bad || echo and-ok
 cd /tmp && echo and-ok
 rm -f /tmp/sh2_builtin_missing_xyz && echo rm-and-ok

@@ -1851,9 +1851,13 @@ fn emit_native_binop(out: &mut String, indent: usize, e: &IrExpr) -> bool {
 /// One entry per CONVERSION in a rendered Perl printf FORMAT literal
 /// (`"%d %s\n"`): true when bash validates that operand as a number
 /// (`%d %i %o %u %x %X %e %E %f %F %g %G %a %A`), false for `%s`/`%c`/`%%`.
-fn printf_numeric_mask(fmt: &str) -> Vec<bool> {
+/// The conversion character of every `%` placeholder in a literal printf
+/// format, in order (`%%` skipped). The validation of a numeric operand
+/// depends on WHICH conversion consumes it (integers are base-detected,
+/// floats are C-strtod-like), so the mask alone is not enough.
+fn printf_conv_chars(fmt: &str) -> Vec<char> {
     let cs: Vec<char> = fmt.chars().collect();
-    let mut mask = Vec::new();
+    let mut out = Vec::new();
     let mut i = 0;
     while i < cs.len() {
         if cs[i] != '%' {
@@ -1868,22 +1872,117 @@ fn printf_numeric_mask(fmt: &str) -> Vec<bool> {
             i += 1;
             continue;
         }
-        // flags, width, precision, length
         while i < cs.len() && matches!(cs[i], '-' | '+' | ' ' | '#' | '0' | '.' | '1'..='9' | 'h' | 'l' | 'L' | 'z') {
             i += 1;
         }
         if i >= cs.len() {
             break;
         }
-        let conv = cs[i];
-        mask.push(matches!(
-            conv,
-            'd' | 'i' | 'o' | 'u' | 'x' | 'X' | 'e' | 'E' | 'f' | 'F' | 'g' | 'G' | 'a' | 'A'
-        ));
+        out.push(cs[i]);
         i += 1;
     }
-    mask
+    out
 }
+
+fn printf_is_numeric(conv: char) -> bool {
+    matches!(
+        conv,
+        'd' | 'i' | 'o' | 'u' | 'x' | 'X' | 'e' | 'E' | 'f' | 'F' | 'g' | 'G' | 'a' | 'A'
+    )
+}
+
+fn printf_is_float(conv: char) -> bool {
+    matches!(conv, 'e' | 'E' | 'f' | 'F' | 'g' | 'G' | 'a' | 'A')
+}
+
+/// Bash's printf numeric validation, as a Perl expression that yields the
+/// value bash would print AND reports what bash reports.
+///
+/// bash converts an INTEGER operand like `strtoimax(_, _, 0)` plus its own
+/// numeric-constant rules (hex `0x…`, binary `0b…`, octal `0…`, decimal)
+/// and a FLOAT operand like `strtod` (decimal with exponent, or a hex
+/// float). Anything the conversion does not consume entirely is a warning
+/// on stderr, the unconsumed tail is dropped, and the command's status is
+/// 1 — `printf` keeps going and the script continues. Perl's printf
+/// coerces silently and reports success, so the emitted Perl has to do it.
+///
+/// The wording matches bash's per-base diagnostics:
+///   `zz` → `invalid number`,   `0xzz`/`0x1fzz` → `invalid hex number`,
+///   `08` → `invalid octal number`.
+const PRINTF_NUM_INT_TPL: &str = r#"(do {
+    my ($__pf_s, $__pf_v, $__pf_bad, $__pf_msg) = (EXPR, 0, 0, 'invalid number');
+    my $__pf_t = $__pf_s;
+    $__pf_t =~ s/\A[ \t\n]+//;
+    if ($__pf_t =~ /\A([+-]?)0[xX]([0-9a-fA-F]*)(.*)\z/s) {
+        $__pf_v = length($2) ? hex($2) : 0;
+        $__pf_v = -$__pf_v if $1 eq '-';
+        if (length($3) || !length($2)) { $__pf_bad = 1; $__pf_msg = 'invalid hex number'; }
+    } elsif ($__pf_t =~ /\A([+-]?)0[bB]([01]*)(.*)\z/s) {
+        $__pf_v = length($2) ? oct('0b' . $2) : 0;
+        $__pf_v = -$__pf_v if $1 eq '-';
+        $__pf_bad = 1 if length($3) || !length($2);
+    } elsif ($__pf_t =~ /\A([+-]?)0([0-7]*)(.*)\z/s) {
+        $__pf_v = length($2) ? oct('0' . $2) : 0;
+        $__pf_v = -$__pf_v if $1 eq '-';
+        if (length($3)) { $__pf_bad = 1; $__pf_msg = 'invalid octal number'; }
+    } elsif ($__pf_t =~ /\A([+-]?)([0-9]+)(.*)\z/s) {
+        $__pf_v = 0 + $2;
+        $__pf_v = -$__pf_v if $1 eq '-';
+        $__pf_bad = 1 if length($3);
+    } else {
+        $__pf_bad = 1;
+    }
+    if ($__pf_bad) { print STDERR "printf: $__pf_s: $__pf_msg\n"; BADVAR = 1; }
+    $__pf_v
+})"#;
+
+const PRINTF_NUM_FLT_TPL: &str = r#"(do {
+    my ($__pf_s, $__pf_v, $__pf_bad, $__pf_msg) = (EXPR, 0, 0, 'invalid number');
+    my $__pf_t = $__pf_s;
+    $__pf_t =~ s/\A[ \t\n]+//;
+    if ($__pf_t =~ /\A([+-]?)0[xX]([0-9a-fA-F]*)(?:\.([0-9a-fA-F]*))?(?:[pP]([+-]?[0-9]+))?\z/s
+        && (length($2) || (defined($3) && length($3)))) {
+        $__pf_v = hex($2) + ((defined($3) && length($3)) ? hex($3) / 16 ** length($3) : 0);
+        $__pf_v *= 2 ** $4 if defined($4) && length($4);
+        $__pf_v = -$__pf_v if $1 eq '-';
+    } elsif ($__pf_t =~ /\A[+-]?(?:[0-9]+\.?[0-9]*|\.[0-9]+)(?:[eE][+-]?[0-9]+)?\z/s) {
+        $__pf_v = 0 + $__pf_t;
+    } else {
+        if ($__pf_t =~ /\A([+-]?)0[xX]([0-9a-fA-F]*)/) {
+            $__pf_v = hex($2);
+            $__pf_v = -$__pf_v if $1 eq '-';
+            $__pf_msg = 'invalid hex number';
+        } elsif ($__pf_t =~ /\A([+-]?(?:[0-9]+\.?[0-9]*|\.[0-9]+)(?:[eE][+-]?[0-9]+)?)/) {
+            $__pf_v = 0 + $1;
+        }
+        $__pf_bad = 1;
+    }
+    if ($__pf_bad) { print STDERR "printf: $__pf_s: $__pf_msg\n"; BADVAR = 1; }
+    $__pf_v
+})"#;
+
+/// The validated value expression for one printf operand with conversion
+/// `conv`, reporting into the statement's `bad_var` flag.
+fn printf_num_check(expr: &str, conv: char, bad_var: &str) -> String {
+    let tpl = if printf_is_float(conv) {
+        PRINTF_NUM_FLT_TPL
+    } else {
+        PRINTF_NUM_INT_TPL
+    };
+    tpl.replace("EXPR", expr).replace("BADVAR", &format!("${bad_var}"))
+}
+
+/// The runtime form: the conversion of a cycled argument is only known per
+/// position, so the flag array picks the integer or the float rule.
+fn printf_num_check_ternary(expr: &str, bad_var: &str, fl_var: &str) -> String {
+    format!(
+        "({} ? {} : {})",
+        format!("${fl_var}"),
+        printf_num_check(expr, 'f', bad_var),
+        printf_num_check(expr, 'd', bad_var)
+    )
+}
+
 
 /// A shell builtin whose STATEMENT lowering is native Perl that leaves the
 /// shell status behind (no fork, no `die`). These are the command words
@@ -9916,25 +10015,40 @@ fn emit_exec_call(out: &mut String, call: &IrExpr, indent: usize) {
             // with the wrong stderr and status. Wrap the operands of numeric
             // conversions when the format is literal and each arg is one
             // scalar (a split/cyclic list keeps its old path).
-            let numeric_mask = printf_numeric_mask(&fmt);
+            let convs: Vec<char> = printf_conv_chars(&fmt);
+            let numeric_mask: Vec<bool> = convs.iter().map(|c| printf_is_numeric(*c)).collect();
+            // One flag per printf statement: a fixed name repeated in the
+            // same scope makes `perl -w` warn ("my variable … masks earlier
+            // declaration"), and this backend's contract is a warning-free
+            // render.
+            static PF_SEQ: std::sync::atomic::AtomicUsize =
+                std::sync::atomic::AtomicUsize::new(0);
+            let pf_seq = PF_SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            let pf_bad_var = format!("__sh2_pf_bad{pf_seq}");
+            let pf_fl_var = format!("__sh2_pf_fl{pf_seq}");
             let mut pf_bad = false;
+            // The CYCLING branch (split/array list, or more args than
+            // conversions) flattens its arguments at RUN time, so its
+            // operands are validated by the emitted loop below instead of
+            // statically here.
+            let numeric_cycle = !numeric_mask.is_empty() && (has_split || rest.len() > p);
             if !numeric_mask.is_empty() && !has_split && rest.len() <= p {
                 for (i, a) in rest.iter_mut().enumerate() {
-                    if numeric_mask.get(i).copied().unwrap_or(false) {
+                    let conv = convs.get(i).copied().unwrap_or('s');
+                    if printf_is_numeric(conv) {
                         pf_bad = true;
-                        *a = format!(
-                            "(do {{ my $__pfv = {a}; if ($__pfv =~ /\\A[+-]?(?:\\d+\\.?\\d*|\\.\\d+)(?:[eE][+-]?\\d+)?\\z/) \
-                             {{ 0 + $__pfv }} else {{ print STDERR \"printf: $__pfv: invalid number\\n\"; \
-                             $__sh2_pf_bad = 1; my ($__pfp) = $__pfv =~ /\\A[+-]?(?:\\d+\\.?\\d*|\\.\\d+)/; 
-                             defined $__pfp ? 0 + $__pfp : 0 }} }})"
-                        );
+                        *a = printf_num_check(a, conv, &pf_bad_var);
                     }
                 }
             }
-            if pf_bad {
+            if pf_bad || numeric_cycle {
                 emit_indent(out, indent);
-                out.push_str("my $__sh2_pf_bad = 0;\n");
+                out.push_str(&format!("my ${pf_bad_var} = 0;\n"));
                 emit_indent(out, indent);
+                if numeric_cycle {
+                    out.push_str(&format!("my ${pf_fl_var};\n"));
+                    emit_indent(out, indent);
+                }
             }
             if rest.is_empty() || p == 0 {
                 // no args, or no conversions: bash printf prints the format
@@ -9961,22 +10075,63 @@ fn emit_exec_call(out: &mut String, call: &IrExpr, indent: usize) {
                 out.push_str(&format!(
                     "my ${tmp}_n = @{tmp} || 1;\n"
                 ));
+                // bash validates the numeric operand of EVERY format
+                // application, including the ones this loop synthesizes by
+                // cycling the format over a flattened list
+                // (`printf '%d\n' $split_field`, `printf '%d\n' 1 zz`):
+                // warn, use the numeric prefix and report status 1, then
+                // print the line. Perl's printf coerces silently and
+                // reports success, so validate the flattened arguments
+                // first — one pass in argument order, so stderr matches
+                // bash's ordering.
+                let mut floats: Vec<&str> = Vec::with_capacity(p);
+                let mut bits: Vec<&str> = Vec::with_capacity(p);
+                for k in 0..p {
+                    let conv = convs.get(k).copied().unwrap_or('s');
+                    floats.push(if printf_is_float(conv) { "1" } else { "0" });
+                    bits.push(if printf_is_numeric(conv) { "1" } else { "0" });
+                }
+                out.push_str(&format!("my @{tmp}_fl = ({});\n", floats.join(", ")));
+                out.push_str(&format!("my @{tmp}_num = ({});\n", bits.join(", ")));
+                if numeric_cycle {
+                    out.push_str(&format!(
+                        "for (my ${tmp}_v = 0; ${tmp}_v < ${tmp}_n; ${tmp}_v++) {{\n"
+                    ));
+                    out.push_str(&format!(
+                        "    next unless ${tmp}_num[${tmp}_v % {p}];\n"
+                    ));
+                    out.push_str(&format!(
+                        "    ${pf_fl_var} = ${tmp}_fl[${tmp}_v % {p}];\n"
+                    ));
+                    out.push_str(&format!(
+                        "    ${tmp}[${tmp}_v] = {};\n",
+                        printf_num_check_ternary(&format!("${tmp}[${tmp}_v]"), &pf_bad_var, &pf_fl_var)
+                    ));
+                    out.push_str("}\n");
+                }
                 out.push_str(&format!(
                     "for (my ${tmp}_i = 0; ${tmp}_i < ${tmp}_n; ${tmp}_i += {p}) {{\n"
                 ));
                 out.push_str(&format!(
-                    "    printf({fmt}, @{tmp}[${tmp}_i .. (${tmp}_i + {p} - 1 < ${tmp}_n ? ${tmp}_i + {p} - 1 : ${tmp}_n - 1)], (\"\") x ((${tmp}_i + {p} > ${tmp}_n) ? ${tmp}_i + {p} - ${tmp}_n : 0));\n"
+                    "    my ${tmp}_have = (${tmp}_i + {p} > ${tmp}_n) ? ${tmp}_n - ${tmp}_i : {p};\n"
+                ));
+                out.push_str(&format!(
+                    "    my @{tmp}_pad = ${tmp}_have >= {p} ? () : map {{ ${tmp}_num[$_] ? 0 : '' }} (${tmp}_have .. {p} - 1);\n"
+                ));
+                out.push_str(&format!(
+                    "    printf({fmt}, @{tmp}[${tmp}_i .. (${tmp}_i + {p} - 1 < ${tmp}_n ? ${tmp}_i + {p} - 1 : ${tmp}_n - 1)], @{tmp}_pad);\n"
                 ));
                 out.push_str("}\n");
             } else {
                 out.push_str(&format!("printf({}, {});\n", fmt, rest.join(", ")));
             }
             emit_indent(out, indent);
-            out.push_str(&rc_write(if pf_bad {
-                "$main_exit_code = $CHILD_ERROR = ($__sh2_pf_bad ? 1 : 0);\n"
+            let status_write = if pf_bad || numeric_cycle {
+                format!("$main_exit_code = $CHILD_ERROR = (${pf_bad_var} ? 1 : 0);\n")
             } else {
-                "$main_exit_code = $CHILD_ERROR = 0;\n"
-            }));
+                "$main_exit_code = $CHILD_ERROR = 0;\n".to_string()
+            };
+            out.push_str(&rc_write(&status_write));
         }
         "cd" => {
             let dir = words
@@ -18424,8 +18579,11 @@ mod perl_render_tests {
         assert!(chain.contains("$? = 1 << 8;"), "{chain}");
         // A failing printf reports bash's diagnostic and its status.
         let pf = render("printf '%d\\n' zz\n");
-        assert!(pf.contains("printf: $__pfv: invalid number"), "{pf}");
-        assert!(pf.contains("$__sh2_pf_bad ? 1 : 0"), "{pf}");
+        assert!(pf.contains("printf: $__pf_s: $__pf_msg"), "{pf}");
+        assert!(pf.contains("__sh2_pf_bad0 ? 1 : 0"), "{pf}");
+        // bash's per-base wording and value rules, not just "invalid number".
+        assert!(pf.contains("invalid hex number"), "{pf}");
+        assert!(pf.contains("invalid octal number"), "{pf}");
     }
 
     /// SEVERAL native commands in one loop condition stay native and keep
@@ -18438,6 +18596,16 @@ mod perl_render_tests {
         assert!(!out.contains("bash', '-c'"), "{out}");
         assert!(out.contains("print \"hi\\n\""), "{out}");
         assert!(out.contains("$? = 1 << 8"), "{out}");
+    }
+
+    /// `test -n X || cmd` negates the WHOLE test: the render used to emit
+    /// `(!length(X) ne 0)` (= `(!length(X)) ne 0`, true for any non-empty
+    /// string), so the fallback branch ran where bash skipped it.
+    #[test]
+    fn or_after_nonempty_test_negates_the_whole_test() {
+        let out = render("test -n abc || echo OR\n");
+        assert!(!out.contains("(!length"), "{out}");
+        assert!(out.contains("!(length"), "{out}");
     }
 
     /// The `&&`/`||` guard reads Perl's `$?` register, not the

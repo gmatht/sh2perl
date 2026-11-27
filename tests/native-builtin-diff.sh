@@ -118,6 +118,36 @@ run_case() {
 }
 
 pass=0; fail=0
+
+# Every position a command word can hold. `and`/`or` cover BOTH sides:
+# `CMD && …` and `true && CMD` (left/right of &&), `CMD || …` and
+# `false || CMD` (left/right of ||).
+run_positions() {
+    local name=$1 src=$2
+    run_case "${name}_stmt" "$src" && pass=$((pass+1)) || fail=$((fail+1))
+    run_case "${name}_if" "if $src; then echo T; else echo F; fi" \
+        && pass=$((pass+1)) || fail=$((fail+1))
+    run_case "${name}_elsif" \
+        "if false; then echo A; elif $src; then echo T; else echo F; fi" \
+        && pass=$((pass+1)) || fail=$((fail+1))
+    run_case "${name}_while" \
+        "n=0; while $src; do n=\$((n + 1)); break; done; echo n=\$n" \
+        && pass=$((pass+1)) || fail=$((fail+1))
+    run_case "${name}_until" \
+        "n=0; until $src; do n=\$((n + 1)); break; done; echo n=\$n" \
+        && pass=$((pass+1)) || fail=$((fail+1))
+    run_case "${name}_neg" "if ! $src; then echo T; else echo F; fi" \
+        && pass=$((pass+1)) || fail=$((fail+1))
+    run_case "${name}_and-lhs" "$src && echo AND || echo OR" \
+        && pass=$((pass+1)) || fail=$((fail+1))
+    run_case "${name}_and-rhs" "true && $src" \
+        && pass=$((pass+1)) || fail=$((fail+1))
+    run_case "${name}_or-lhs" "$src || echo OR" \
+        && pass=$((pass+1)) || fail=$((fail+1))
+    run_case "${name}_or-rhs" "false || $src" \
+        && pass=$((pass+1)) || fail=$((fail+1))
+}
+
 while IFS='|' read -r bname okform badform; do
     [ -n "$bname" ] || continue
     for form in ok fail; do
@@ -125,31 +155,72 @@ while IFS='|' read -r bname okform badform; do
         [ "$form" = fail ] && form_src=$badform
         # `false` fails by nature; its "ok" cell is the negated success form.
         [ -z "$form_src" ] && continue
-
-        run_case "${bname}_${form}_stmt" "$form_src" && pass=$((pass+1)) || fail=$((fail+1))
         if [ "$form" = fail ] && [ "$bname" = "exit" ]; then
-            # `exit 3` ends the shell, so only the statement cell applies.
+            # `exit 3` ends the shell wherever it runs: only the statement
+            # cell can be compared (the rest are the same program).
+            run_case "exit_fail_stmt" "$form_src" && pass=$((pass+1)) || fail=$((fail+1))
             continue
         fi
-        run_case "${bname}_${form}_if" \
-            "if $form_src; then echo T; else echo F; fi" && pass=$((pass+1)) || fail=$((fail+1))
-        run_case "${bname}_${form}_elsif" \
-            "if false; then echo A; elif $form_src; then echo T; else echo F; fi" \
-            && pass=$((pass+1)) || fail=$((fail+1))
-        run_case "${bname}_${form}_while" \
-            "n=0; while $form_src; do n=\$((n + 1)); break; done; echo n=\$n" \
-            && pass=$((pass+1)) || fail=$((fail+1))
-        run_case "${bname}_${form}_until" \
-            "n=0; until $form_src; do n=\$((n + 1)); break; done; echo n=\$n" \
-            && pass=$((pass+1)) || fail=$((fail+1))
-        run_case "${bname}_${form}_neg" \
-            "if ! $form_src; then echo T; else echo F; fi" && pass=$((pass+1)) || fail=$((fail+1))
-        run_case "${bname}_${form}_and" \
-            "$form_src && echo AND || echo OR" && pass=$((pass+1)) || fail=$((fail+1))
-        run_case "${bname}_${form}_or" \
-            "false || $form_src && echo AND || echo OR" && pass=$((pass+1)) || fail=$((fail+1))
+        run_positions "${bname}_${form}" "$form_src"
     done
 done <<< "$BUILTINS"
+
+# `printf` numeric operands in the shapes the format CYCLING path owns: a
+# word that splits into several arguments, and more arguments than the
+# format has conversions. bash validates every application (warn, numeric
+# prefix, status 1) and keeps printing; Perl's printf coerces silently.
+# Each shape carries its own SETUP lines so the command word stays a single
+# command (a multi-command condition is a frontend limitation, not this
+# matrix's subject).
+PRINTF_SHAPES=$(cat <<'EOF'
+pf-split-bad|x='zz yy'|printf '<%d>\n' $x
+pf-split-mixed|x='1 zz 3'|printf '%d %d\n' $x
+pf-cycle-bad||printf '%d\n' 1 zz 3
+pf-cycle-float||printf '%f %d\n' 1 zz 3
+pf-hex-octal-int||printf '%d %d %d\n' 0x10 010 0b101
+pf-hex-bad||printf '%d\n' 0xzz
+pf-octal-bad||printf '%d\n' 08
+pf-exp-int||printf '%d\n' 1e3
+pf-float-ok||printf '%f %g %e\n' 1e3 .5 12abc
+pf-hexfloat||printf '%f\n' 0x10
+pf-trailing-junk||printf '%d\n' -5abc
+pf-spacey||printf '%d\n' ' 42'
+EOF
+)
+
+run_positions_with_setup() {
+    local name=$1 setup=$2 src=$3
+    local with="$setup"
+    [ -n "$setup" ] && with="$setup
+"
+    run_case "${name}_stmt" "${with}$src" && pass=$((pass+1)) || fail=$((fail+1))
+    run_case "${name}_if" "${with}if $src; then echo T; else echo F; fi" \
+        && pass=$((pass+1)) || fail=$((fail+1))
+    run_case "${name}_elsif" \
+        "${with}if false; then echo A; elif $src; then echo T; else echo F; fi" \
+        && pass=$((pass+1)) || fail=$((fail+1))
+    run_case "${name}_while" \
+        "${with}n=0; while $src; do n=\$((n + 1)); break; done; echo n=\$n" \
+        && pass=$((pass+1)) || fail=$((fail+1))
+    run_case "${name}_until" \
+        "${with}n=0; until $src; do n=\$((n + 1)); break; done; echo n=\$n" \
+        && pass=$((pass+1)) || fail=$((fail+1))
+    run_case "${name}_neg" "${with}if ! $src; then echo T; else echo F; fi" \
+        && pass=$((pass+1)) || fail=$((fail+1))
+    run_case "${name}_and-lhs" "${with}$src && echo AND || echo OR" \
+        && pass=$((pass+1)) || fail=$((fail+1))
+    run_case "${name}_and-rhs" "${with}true && $src" \
+        && pass=$((pass+1)) || fail=$((fail+1))
+    run_case "${name}_or-lhs" "${with}$src || echo OR" \
+        && pass=$((pass+1)) || fail=$((fail+1))
+    run_case "${name}_or-rhs" "${with}false || $src" \
+        && pass=$((pass+1)) || fail=$((fail+1))
+}
+
+while IFS='|' read -r pname psetup pcmd; do
+    [ -n "$pname" ] || continue
+    run_positions_with_setup "$pname" "$psetup" "$pcmd"
+done <<< "$PRINTF_SHAPES"
 
 # The `$?` shadow: after a FAILED builtin the script continues with the
 # builtin's status (never the previous child's), and a `&&` chain stops.
