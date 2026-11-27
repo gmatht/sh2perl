@@ -145,12 +145,36 @@ for f in "${examples[@]}"; do
         continue
     fi
 
+    # The mirror image: code the fixture REQUIRES. This is how a fixture pins
+    # an idiom the comparison alone cannot see — e.g. a native capture that
+    # must render `local *STDOUT` rather than silently folding to a literal.
+    must_contain=()
+    while IFS= read -r line; do
+        [ -n "$line" ] && must_contain+=("$line")
+    done < <(sed -n 's/^#.*PERL_MUST_CONTAIN[[:space:]]\+//p' "$f")
+    missing=""
+    for pat in "${must_contain[@]}"; do
+        if ! grep -qF -- "$pat" "$tmp/$name.code.pl"; then missing="$missing [$pat]"; fi
+    done
+    if [ -n "$missing" ]; then
+        echo "FAIL $name: MUST_CONTAIN$missing"
+        fail=1
+        continue
+    fi
+
     stdin_file="$root/tests/stdin/$name.stdin"
     [ -f "$stdin_file" ] || stdin_file=/dev/null
     rm -rf "$tmp/$name.b" "$tmp/$name.p"
     mkdir -p "$tmp/$name.b/work" "$tmp/$name.p/work"
-    ( cd "$tmp/$name.b/work" && bash "$root/$f" <"$stdin_file" >out 2>err; echo $? >rc )
-    ( cd "$tmp/$name.p/work" && perl "$pl"        <"$stdin_file" >out 2>err; echo $? >rc )
+    # A renderer bug can invert a loop condition and make the PERL hang
+    # forever; a hang is a failure of this gate, not a waiting game.
+    ( cd "$tmp/$name.b/work" && timeout 60 bash "$root/$f" <"$stdin_file" >out 2>err; echo $? >rc )
+    ( cd "$tmp/$name.p/work" && timeout 60 perl "$pl"        <"$stdin_file" >out 2>err; echo $? >rc )
+    if [ "$(cat "$tmp/$name.p/work/rc")" = 124 ] || [ "$(cat "$tmp/$name.b/work/rc")" = 124 ]; then
+        echo "FAIL $name: timed out (124) after 60s"
+        fail=1
+        continue
+    fi
 
     # A declared expectation makes the comparison prove the DOCUMENTED
     # behaviour, not merely that two runs agree with each other.
