@@ -1,0 +1,56 @@
+# verus-sync-coverage manifest: shir_native_cond
+# source sha: shir_native_stmt=93c9e845a066  proof sha: 44da0201ee1c
+# source: src/transforms/shir_native_stmt.rs (cluster D3:
+#   native_if_test_cond 5833, native_while_test_cond 5892,
+#   native_test_exit_stmt 5900, native_while_multi_cond 5957,
+#   extract_test_words 5809, render_test_words 1301)
+# This is the SEVENTH proved cluster of the decomposition in
+# shir_native_stmt_plan.md (C, H, E, B, D1 and D2 came first); A, F and G
+# are open. Plan §D assigns D3 the if/while condition families; the flat-text
+# connector split is renderer work and is not claimed here.
+
+[pins]
+pin pin_body_failure_wins -> UNMIRRORED (no source test for the double status write)
+pin pin_missing_reset_diverges -> UNMIRRORED (no source test for the trailing reset)
+pin pin_wrong_negation_diverges -> UNMIRRORED (no source test for the unless guard)
+pin pin_while_reads_the_variable -> UNMIRRORED (no source test for a while-test variable read)
+pin pin_unknown_operator_refused -> UNMIRRORED (no source test for an unknown test operator)
+
+[guards]
+guard law if_test_cond_law (test COND && B status/effect): PRESENT
+guard law test_exit_stmt_law (test COND || exit N status/exit): PRESENT
+guard law while_test_cond_law (rendered guard == bash comparison in an env): PRESENT
+guard independent side: bash_and/bash_or_exit compute bash's short-circuit statuses and exit: PRESENT
+guard independent side: pass_if/pass_unless transcribe native_if_test_cond / native_test_exit_stmt in code order: PRESENT
+guard independent side: bash_cmp vs render_cmp are separate operator tables over an environment: PRESENT
+guard double status variable model ($main_exit_code and $CHILD_ERROR): PRESENT
+guard native_while_multi_cond's loop restructure: NOT THIS PROOF (needs echoed output and a loop-invariant guard; stated, not assumed)
+guard render_test_text's connector split, `!`, parentheses, globs, -a/-o in [[ ]]: NOT THIS PROOF (renderer work)
+guard D1 atomic round trip (shir_native_test_render.rs): REUSED, not re-claimed
+guard D2 chain folds (shir_native_chain.rs): NOT THIS PROOF
+guard render_flag_substitution_test ($(...) capture): OUT OF MODEL
+guard backend status registers and the byte renderer: OUT OF MODEL
+guard clusters A, F, G: NOT THIS PROOF
+
+[counts]
+10 verified, 0 errors (verus --triggers-mode silent --rlimit 40 shir_native_cond.rs)
+mutants measured this turn against that baseline, each restored
+  byte-identically (sha re-checked):
+    counted (8v/2e):
+      m1 write only $CHILD_ERROR from the condition
+         (if_test_cond_law and pin_body_failure_wins)
+      m2 invert the condition's status (the same two)
+    counted (9v/1e):
+      m3 drop the trailing status reset (test_exit_stmt_law)
+      m4 negate the unless guard (test_exit_stmt_law)
+      m5 render -lt as <= (while_test_cond_law)
+      m6 treat the loop variable as literal 0 (pin_while_reads_the_variable)
+
+[exec]
+# The analysed module's 8 tests cover chain/find and the renderer; none
+# exercises the if/while condition rewrites. Every pin row is UNMIRRORED.
+exec pin_body_failure_wins: UNMIRRORED (not executed: no source test)
+exec pin_missing_reset_diverges: UNMIRRORED (not executed)
+exec pin_wrong_negation_diverges: UNMIRRORED (not executed)
+exec pin_while_reads_the_variable: UNMIRRORED (not executed)
+exec pin_unknown_operator_refused: UNMIRRORED (not executed)

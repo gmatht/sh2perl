@@ -9471,3 +9471,41 @@ is out of model; the renderer half — `render_test_text`'s connector split,
 dynamic word — is D1/D3, not claimed; D1's atomic round trip is reused;
 cluster A's `files` invariant and backend status rendering are out of model.
 Clusters A, D3, F and G remain open.
+
+### Cluster D3, proved: the if/while condition families
+
+    proofs/verus/shir_native_cond.rs               (10 verified, 0 errors)
+    verus --triggers-mode silent --rlimit 40 proofs/verus/shir_native_cond.rs
+
+Plan §D assigns D3 the if/while condition rewrites. The laws compare what
+the emitted Perl does to the two status variables against bash's own
+short-circuit behaviour:
+
+- **`if_test_cond_law`**: `test COND && B` becomes a double status write
+  (`$main_exit_code = $CHILD_ERROR = COND ? 0 : 1`) followed by the
+  conditional body. A false test writes 1 and skips B; a true test runs B,
+  whose own status wins — equal to bash's `&&` on both variables.
+- **`test_exit_stmt_law`**: `test COND || exit N` becomes
+  `unless (COND) { exit N }; write 0;`. A true test leaves 0 and continues;
+  a false test exits with N, skipping the trailing write.
+- **`while_test_cond_law`**: the natively rendered guard reads the loop
+  variable from an environment (not its name) and decides every one of the
+  six integer comparisons exactly as bash does.
+
+Pins: a failing body still wins on the true path; omitting the trailing
+reset leaves a stale status; negating the unless guard exits wrongly; the
+guard reads the environment; an unknown operator is refused. Mutants,
+measured: writing only `$CHILD_ERROR` and inverting the condition status are
+counted (**8 verified, 2 errors**); dropping the trailing reset, negating
+the unless guard, rendering `-lt` as `<=`, and treating the variable as a
+literal are counted (**9 verified, 1 error** each). Each restored
+byte-identically (`shir_native_cond_sync.txt`).
+
+Exclusions, stated: `native_while_multi_cond`'s loop restructure is **not**
+proved — its equivalence needs the echoed output and a loop-invariant guard,
+stated as unproved rather than assumed. `render_test_text`'s flat connector
+split, `!`, parentheses, globs and `-a`/`-o` in `[[ ]]` remain renderer
+work; D1's atomic round trip and D2's chain laws are reused, not re-claimed;
+`render_flag_substitution_test` is out of model; the backend status registers
+and byte renderer are out of model. The module's 8 tests do not cover these
+rewrites, so every pin row is UNMIRRORED. Clusters A, F and G remain open.
