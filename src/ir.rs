@@ -1009,6 +1009,39 @@ fn childe_error_carrier() -> bool {
     CHILD_ERROR_CARRIER.with(|c| c.get())
 }
 
+thread_local! {
+    /// Scratch-name counters for the printf lowering (`__sh2_pf_badN`,
+    /// `__sh2_pf_flN` and `__sh2_paN` — two independent sequences, as they
+    /// have always been; the golden snapshots pin the text).
+    ///
+    /// Reset at every render, like `LOOP_STATUS_SEQ`: a suffix only has to be
+    /// unique WITHIN one program, and `perl_generator_fixed::generate` renders
+    /// a program TWICE (mirror off, then on to keep `$CHILD_ERROR` in step).
+    /// Process-global counters made that second render — the one that ships —
+    /// name its variables `…bad1`/`…pa1` where the plain renderer says
+    /// `…bad0`/`…pa0`, so the two Perl entry points emitted different text for
+    /// the same program, and a render's text depended on how many programs the
+    /// process had rendered before it.
+    static PRINTF_SEQ: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+    static PRINTF_ARG_SEQ: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
+fn printf_seq() -> usize {
+    PRINTF_SEQ.with(|c| {
+        let n = c.get();
+        c.set(n + 1);
+        n
+    })
+}
+
+fn printf_arg_seq() -> usize {
+    PRINTF_ARG_SEQ.with(|c| {
+        let n = c.get();
+        c.set(n + 1);
+        n
+    })
+}
+
 /// Install the carrier verdict for the render about to run.
 pub fn set_childe_error_carrier(v: bool) {
     CHILD_ERROR_CARRIER.with(|c| c.set(v));
@@ -1017,6 +1050,8 @@ pub fn set_childe_error_carrier(v: bool) {
 pub fn shir_to_perl(prog: &IrProgram) -> String {
     // Stable per-render loop-status names (golden snapshots pin the text).
     LOOP_STATUS_SEQ.with(|c| c.set(0));
+    PRINTF_SEQ.with(|c| c.set(0));
+    PRINTF_ARG_SEQ.with(|c| c.set(0));
     let mut out = String::new();
 
     // Shebang
@@ -1609,6 +1644,8 @@ pub struct EmbedResult {
 /// processes).
 pub fn shir_to_perl_embed(prog: &IrProgram, ctx: &EmbedCtx) -> EmbedResult {
     LOOP_STATUS_SEQ.with(|c| c.set(0));
+    PRINTF_SEQ.with(|c| c.set(0));
+    PRINTF_ARG_SEQ.with(|c| c.set(0));
     let mut result = EmbedResult::default();
 
     // Embed fragments are preamble-free: disable the `__sh_uu_*` seam
@@ -10020,10 +10057,10 @@ fn emit_exec_call(out: &mut String, call: &IrExpr, indent: usize) {
             // One flag per printf statement: a fixed name repeated in the
             // same scope makes `perl -w` warn ("my variable … masks earlier
             // declaration"), and this backend's contract is a warning-free
-            // render.
-            static PF_SEQ: std::sync::atomic::AtomicUsize =
-                std::sync::atomic::AtomicUsize::new(0);
-            let pf_seq = PF_SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            // render. `printf_seq` is per-RENDER (reset in `shir_to_perl`),
+            // not process-global: the wrapper renders twice and both renders
+            // must name their scratch variables identically.
+            let pf_seq = printf_seq();
             let pf_bad_var = format!("__sh2_pf_bad{pf_seq}");
             let pf_fl_var = format!("__sh2_pf_fl{pf_seq}");
             let mut pf_bad = false;
@@ -10065,12 +10102,7 @@ fn emit_exec_call(out: &mut String, call: &IrExpr, indent: usize) {
                 // (triage-perl t62_word_split: `printf "<%s>\\n" $x`
                 // with x="a b" → two lines; same for plain literal args:
                 // `printf '%s\\n' a b c` → three lines).
-                static PA_SEQ: std::sync::atomic::AtomicUsize =
-                    std::sync::atomic::AtomicUsize::new(0);
-                let tmp = format!(
-                    "__sh2_pa{}",
-                    PA_SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
-                );
+                let tmp = format!("__sh2_pa{}", printf_arg_seq());
                 out.push_str(&format!("my @{tmp} = ({});\n", rest.join(", ")));
                 out.push_str(&format!(
                     "my ${tmp}_n = @{tmp} || 1;\n"
