@@ -1,0 +1,63 @@
+# verus-sync-coverage manifest: shir_native_quoting
+# source sha: shir_native_stmt=93c9e845a066  proof sha: 7ad6340fe7bb
+# source: src/transforms/shir_native_stmt.rs (cluster H: perl_quote line 2054,
+#   tr_set_escape 5234, decode_capture_escapes 402, decode_echo_escapes 3124,
+#   regex_escape_literal 6872)
+# This is the SECOND proved cluster of the decomposition in
+# shir_native_stmt_plan.md (C was first); the rest of the plan is still open.
+
+[pins]
+pin pin_perl_dollar_is_escaped -> UNMIRRORED (no source test exercises perl_quote)
+pin pin_perl_double_quote_is_escaped -> UNMIRRORED (no source test for the literal body)
+pin pin_tr_newline_is_escaped -> UNMIRRORED (no source test for tr_set_escape)
+pin pin_echo_unknown_escape_refused -> UNMIRRORED (no source test for decode_echo_escapes)
+pin pin_capture_unknown_escape_refused -> UNMIRRORED (no source test for decode_capture_escapes)
+pin pin_bre_metacharacters_are_escaped -> UNMIRRORED (no source test for regex_escape_literal)
+pin pin_plain_letters_pass_through -> UNMIRRORED (model-level identity, no source test)
+
+[guards]
+guard law escape_roundtrip(mode, s): unquote(mode, quote(mode, s)) == Some(s): PRESENT
+guard law perl_double_quote_roundtrip (Perl double-quoted body): PRESENT
+guard law tr_set_roundtrip (inside a Perl tr/// set): PRESENT
+guard law captures_escape_roundtrip (printf/capture \n \t \r \\): PRESENT
+guard law echo_escape_roundtrip (echo -e \a \b \f \n \r \t \v \\ \0): PRESENT
+guard law bre_escape_roundtrip (grep BRE literal): PRESENT
+guard bridge key_is_inverse (needs => dec(key(c)) == Some(c)): PRESENT
+guard independent parser unquote (reads target syntax through dec, never consults needs/key): PRESENT
+guard refusal unknown escape: dec -> None in Perl/Tr/Capture/Echo (BRE's POSIX \x = x): PRESENT
+guard Perl literal delimiters: OUT OF MODEL (the body is proved; wrapping in two literal quotes is the renderer contract, pinned for the quote character)
+guard render_test_text / render_flag_substitution_test: NOT THIS PROOF (they are renderers; their law is cluster D's test grammar)
+guard static_pipeline_truth: NOT THIS PROOF (a grep truth value, cluster F2)
+guard the other 51 folds / clusters A-B, D-G of shir_native_stmt.rs: NOT THIS PROOF (plan stages still open)
+
+[counts]
+19 verified, 0 errors (verus --triggers-mode silent --rlimit 40 shir_native_quoting.rs)
+mutants measured this turn, each restored byte-identically to proof sha
+  7ad6340fe7bb:
+    counted (18 verified, 1 error):
+      m2 Perl decodes \n as a tab
+      m4 echo accepts an unknown \q (pin_echo_unknown_escape_refused)
+      m5 tr decodes \0 as the letter O
+    rejected at simplification (a concrete pin computes false):
+      m1 the encoder drops the tail of the string (pin_perl_dollar_is_escaped)
+      m3 Perl stops escaping `$` (pin_perl_dollar_is_escaped)
+      m6 BRE refuses every escape (pin_bre_metacharacters_are_escaped)
+[exec]
+# The analysed module's #[cfg(test)] module has 8 tests, none for the
+# quoting/escape functions, measured:
+#   awk 'NR>6950' src/transforms/shir_native_stmt.rs | grep 'fn ' ->
+#   command_chain_lowers_to_status_gated_ifs, longer_command_chains_nest,
+#   non_statement_elements_refuse_the_chain_rewrite,
+#   cd_chains_keep_their_dedicated_renderers,
+#   unary_file_test_renders_a_filetest_not_the_flag_regex,
+#   negated_and_unhandled_shapes_reach_the_shared_parser,
+#   find_with_head_short_circuits_the_walk, find_without_head_keeps_the_full_walk
+# so `cargo test --lib` contains no test that exercises this cluster, and
+# every pin row above is UNMIRRORED. Nothing is executed for this proof.
+exec pin_perl_dollar_is_escaped: UNMIRRORED (not executed: no source test)
+exec pin_perl_double_quote_is_escaped: UNMIRRORED (not executed)
+exec pin_tr_newline_is_escaped: UNMIRRORED (not executed)
+exec pin_echo_unknown_escape_refused: UNMIRRORED (not executed)
+exec pin_capture_unknown_escape_refused: UNMIRRORED (not executed)
+exec pin_bre_metacharacters_are_escaped: UNMIRRORED (not executed)
+exec pin_plain_letters_pass_through: UNMIRRORED (not executed)

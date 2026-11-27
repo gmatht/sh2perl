@@ -9262,3 +9262,49 @@ mutants, each restored byte-identically (sha256 in
 
 The other nine clusters of the plan remain **open** — this section proves C
 only, not `shir_native_stmt.rs` as a whole.
+
+### Cluster H, proved: quoting/escape round-trips
+
+    proofs/verus/shir_native_quoting.rs        (19 verified, 0 errors)
+    verus --triggers-mode silent --rlimit 40 proofs/verus/shir_native_quoting.rs
+
+Five escape functions emit literals into five different target syntaxes:
+`perl_quote` (a Perl double-quoted body), `tr_set_escape` (inside a Perl
+`tr///` set), `decode_capture_escapes` (`$(printf …)` text),
+`decode_echo_escapes` (`echo -e` output), and `regex_escape_literal` (a
+grep BRE literal). Cluster H's law is the inverse of each, written as one
+mode-parameterised theorem plus one citation per syntax:
+
+- **`escape_roundtrip(mode, s)`**: `unquote(mode, quote(mode, s)) == Some(s)`
+- `perl_double_quote_roundtrip`, `tr_set_roundtrip`,
+  `captures_escape_roundtrip`, `echo_escape_roundtrip`,
+  `bre_escape_roundtrip` — the same theorem instantiated per target.
+
+The two sides are independent: `needs`/`key`/`quote` are the encoder (the
+source's match arms), while `unquote` is a parser that reads only the
+target syntax's `dec` table and never consults the encoder's decisions.
+`key_is_inverse` is the single bridge (`needs(c) ⇒ dec(key(c)) = Some(c)`),
+proved by cases; the round trip is then an induction that carries an
+arbitrary suffix.
+
+Pins, rejected by computation: a `$` in a Perl literal is escaped (it would
+interpolate), a `"` is escaped (it would end the literal), a newline in a
+`tr///` set is escaped (a raw one ends the operator at a physical line
+break), `echo -e` and the capture decoder refuse an unknown escape instead
+of guessing, every BRE metacharacter is escaped, and plain letters pass
+through every syntax unchanged. Mutants, measured: decoding `\n` as a tab,
+decoding `tr`'s `\0` as `O` (**18 verified, 1 error** each), and accepting
+an unknown `\q` (**18 verified, 1 error** at
+`pin_echo_unknown_escape_refused`); dropping the encoder's tail, dropping
+the `$` escape, or refusing every BRE escape is rejected at simplification
+by the pins. Six mutants, each restored byte-identically (sha256 in
+`shir_native_quoting_sync.txt`).
+
+What this does **not** claim: the Perl literal's surrounding quotes are the
+renderer's contract (the body is what is proved); `render_test_text` and
+`render_flag_substitution_test` are renderers whose law is cluster D's test
+grammar, not an escape table; `static_pipeline_truth` belongs to cluster F2;
+and the other 51 folds remain open. The module's 8 tests do not cover these
+functions, so every pin row is UNMIRRORED by design and no `[exec]` PASS row
+exists. The remaining clusters (E, B, D, F, G, A) are still open — this
+section lands H, not `shir_native_stmt.rs` as a whole.

@@ -2,7 +2,8 @@
 
     source: src/transforms/shir_native_stmt.rs   7140 lines
     proof status: cluster C PROVED (shir_native_herestring.rs, 20 verified / 0 errors);
-                  clusters A-B and D-H are still planned — see §4
+                  cluster H PROVED (shir_native_quoting.rs, 19 verified / 0 errors);
+                  clusters A-B and D-G are still planned — see §4
 
 This is a PLAN, not a proof. It exists because `shir_native_stmt` is the one
 output-changing transform left whose property is not a single statement: it is
@@ -315,7 +316,7 @@ Sub-cluster G*: the two `perl` folds and `native_bash_script` emit Perl
 source text; their law is a QUOTING law (`perl_quote` produces a literal that
 Perl re-parses to the same string), the same shape as cluster H.
 
-### H — literal quoting and escaping (the cross-cutting text law)
+### H — literal quoting and escaping (the cross-cutting text law; PROVED)
 
 Functions: `perl_quote` (2054), `render_test_text` (1435),
 `render_flag_substitution_test` (1473), `tr_set_escape` (5220),
