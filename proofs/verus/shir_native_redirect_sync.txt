@@ -1,0 +1,60 @@
+# verus-sync-coverage manifest: shir_native_redirect
+# source sha: shir_native_stmt=93c9e845a066  proof sha: bc391c9b9405
+# source: src/transforms/shir_native_stmt.rs (cluster B: file_redirect_block
+#   line 3284, native_echo_write_file_stmt 3705, emit_file_op 4033,
+#   native_sort_file_stmt 3330, native_cat_heredoc_writefile 1062,
+#   native_cat_heredoc_redirect_call 2168, record_file_write 2516)
+# This is the FOURTH proved cluster of the decomposition in
+# shir_native_stmt_plan.md (C, H and E came first); A, D, F and G are open.
+
+[pins]
+pin pin_dynamic_target_refused -> UNMIRRORED (no source test for a dynamic redirect target)
+pin pin_fd_other_than_one_refused -> UNMIRRORED (no source test for fd != 1)
+pin pin_two_specs_refused -> UNMIRRORED (no source test for two redirect specs)
+pin pin_append_not_a_write_fold -> UNMIRRORED (no source test for append in this fold)
+pin pin_non_write_command_refused -> UNMIRRORED (no source test for a non-write command)
+pin pin_n_clears_the_newline -> UNMIRRORED (no source test for echo -n redirect bytes)
+pin pin_e_decodes_escapes -> UNMIRRORED (no source test for echo -e redirect bytes)
+pin pin_printf_has_no_newline -> UNMIRRORED (no source test for printf redirect bytes)
+
+[guards]
+guard law redirect_writes_the_same_bytes (fold bytes/path == bash file effect): PRESENT
+guard law append_mode_appends (a appends; w/wc replace): PRESENT
+guard independent side: fold_write transcribes native_echo_write_file_stmt (one spec, fd 1, w|wc, literal target, echo/printf, one content word): PRESENT
+guard independent side: bash_stdout/bash_opts compute the shell's leading-option semantics and bash_effect applies the mode: PRESENT
+guard bridge parse_echo_agrees / parse_echo_with_content (anywhere-flags fold scan == shell leading scan under leading_flags): PRESENT
+guard refusal dynamic target, fd != 1, two specs, append, non-echo/printf, printf with %: PRESENT
+guard echo flags -e/-E/-n (decoding and newline decisions): PRESENT
+guard echo escape table: cluster H's proved syntax, reused not re-claimed: STATED
+guard record_file_write (multi-word echo join, w-only `files` update): NOT THIS LAW (cluster A owns the cross-statement `files` invariant)
+guard native_sort_file_stmt, native_cat_heredoc_writefile/_redirect_call, emit_file_op: NOT THIS PROOF (different command models; this file claims the echo/printf write fold only)
+guard file_redirect_block's Block wrap: OUT OF MODEL as an effect (modelled as identity; the renderer fallback is a renderer contract)
+guard glob words: OUT OF DOMAIN, and the source has no glob gate here (unlike native_echo_stmt); stated, not proved away
+guard fd 0/2, 2>&1, heredocs/herestrings, renderer output: OUT OF MODEL
+guard the other folds / clusters A, D, F, G: NOT THIS PROOF (plan stages still open)
+
+[counts]
+21 verified, 0 errors (verus --triggers-mode silent --rlimit 40 shir_native_redirect.rs)
+mutants measured this turn against the pre-header proof (sha 8a07810047d0),
+  each restored byte-identically (sha re-checked); the committed proof is
+  bc391c9b9405 (only the header's measured-count block changed afterwards).
+    counted (20 verified, 1 error):
+      m3 apply treats append as a truncating write (append_mode_appends)
+    rejected at simplification by a concrete pin:
+      m1 wrap/write a dynamic target (pin_dynamic_target_refused)
+      m2 ignore the redirect's fd (pin_fd_other_than_one_refused)
+      m4 keep the newline for -n (pin_n_clears_the_newline)
+      m5 accept printf with a % conversion (pin_non_write_command_refused)
+[exec]
+# The analysed module's #[cfg(test)] module has 8 tests (chain/find only),
+# none for redirect writes, measured as in the C/H/E manifests. So
+# `cargo test --lib` contains no test that exercises this cluster, and every
+# pin row above is UNMIRRORED. Nothing is executed for this proof.
+exec pin_dynamic_target_refused: UNMIRRORED (not executed: no source test)
+exec pin_fd_other_than_one_refused: UNMIRRORED (not executed)
+exec pin_two_specs_refused: UNMIRRORED (not executed)
+exec pin_append_not_a_write_fold: UNMIRRORED (not executed)
+exec pin_non_write_command_refused: UNMIRRORED (not executed)
+exec pin_n_clears_the_newline: UNMIRRORED (not executed)
+exec pin_e_decodes_escapes: UNMIRRORED (not executed)
+exec pin_printf_has_no_newline: UNMIRRORED (not executed)

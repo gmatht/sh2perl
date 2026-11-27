@@ -4,7 +4,8 @@
     proof status: cluster C PROVED (shir_native_herestring.rs, 20 verified / 0 errors);
                   cluster H PROVED (shir_native_quoting.rs, 19 verified / 0 errors);
                   cluster E PROVED (shir_native_echo.rs, 26 verified / 0 errors);
-                  clusters A-B and D, F, G are still planned — see §4
+                  cluster B PROVED (shir_native_redirect.rs, 21 verified / 0 errors);
+                  clusters A, D, F, G are still planned — see §4
 
 This is a PLAN, not a proof. It exists because `shir_native_stmt` is the one
 output-changing transform left whose property is not a single statement: it is
@@ -131,7 +132,7 @@ stages" rule, and the re-entrant `transform_stmt` fixpoint. Those are
 statements about what the recursion is allowed to see, and they are better
 enforced by the dispatch-list check than by a law.
 
-### B — redirect writes (family 1 of the file's own header)
+### B — redirect writes (family 1 of the file's own header; PROVED)
 
 Functions: `file_redirect_block` (3284), `native_echo_write_file_stmt`
 (3705) with its `emit_file_op` helper (4033), `native_sort_file_stmt`

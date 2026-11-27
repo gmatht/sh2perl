@@ -9347,3 +9347,42 @@ proved syntax and is reused rather than re-claimed; the renderer that turns
 `Output { newline }` into backend bytes, bash stderr and locales are out of
 model. The module's 8 tests do not cover these folds, so every pin row is
 UNMIRRORED by design. Clusters A–B and D, F, G remain open.
+
+### Cluster B, proved: redirect writes
+
+    proofs/verus/shir_native_redirect.rs       (21 verified, 0 errors)
+    verus --triggers-mode silent --rlimit 40 proofs/verus/shir_native_redirect.rs
+
+`native_echo_write_file_stmt` replaces `echo/printf … > FILE` with native
+Perl that writes literal bytes; `record_file_write` records the same content
+for later `cat FILE | …` evaluation; `file_redirect_block` only wraps the
+exec (a renderer fallback trigger, modelled here as an identity effect).
+
+- **`redirect_writes_the_same_bytes`**: whenever the write fold fires, the
+  `(path, bytes, mode)` it emits is exactly bash's file effect — the
+  command's stdout at the literal target, in the redirect's mode. The pass
+  side transcribes the source: one spec, fd 1, `w|wc`, literal target,
+  echo/printf, the echo loop's `-e`/`-E`/`-n` handling and single content
+  word, printf's single `%`-free word. The semantic side computes the
+  shell's leading-option stdout and the file's new bytes independently;
+  `parse_echo_agrees` proves the fold's anywhere-flags scan matches the
+  shell's leading scan under the law's domain.
+- **`append_mode_appends`**: applying a write in mode `a` gives
+  `old ++ bytes`; `w`/`wc` give `bytes`.
+
+Pins, rejected by computation: a dynamic target, fd other than 1, a second
+redirect spec, append in this (write-only) fold, a non-echo/printf command,
+printf with a `%` conversion, `echo -n`'s missing newline and `echo -e`'s
+decoded bytes. Mutants, measured: treating append as a truncating write is a
+counted failure (**20 verified, 1 error** at `append_mode_appends`); wrapping
+a dynamic target, ignoring fd, keeping `-n`'s newline and accepting a `%`
+printf are refuted at simplification by the pins. Each restored
+byte-identically (`shir_native_redirect_sync.txt`).
+
+Exclusions, stated: the `files` map's cross-statement invariant is cluster
+A's; `native_sort_file_stmt`, the heredoc writers and `emit_file_op` write
+through different command models and are not claimed here; glob words are
+outside the domain and the source has no glob gate in this fold (unlike
+`native_echo_stmt`); fd 0/2, `2>&1`, heredocs/herestrings and renderer
+output are out of model. The module's 8 tests do not cover these folds, so
+every pin row is UNMIRRORED. Clusters A, D, F and G remain open.
