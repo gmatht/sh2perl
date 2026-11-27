@@ -37,9 +37,24 @@
 
 use crate::ir::{IrExpr, IrStmt};
 use crate::shir_nodes::GpuOp;
-use std::sync::atomic::{AtomicUsize, Ordering};
+thread_local! {
+    /// PER-RENDER: the batch id must not depend on how many renders this
+    /// process has already done (see `cat_read::reset_seq`).
+    static SEQ: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
 
-static SEQ: AtomicUsize = AtomicUsize::new(0);
+/// Reset the batch numbering for a new render.
+pub fn reset_seq() {
+    SEQ.with(|c| c.set(0));
+}
+
+fn next_seq() -> usize {
+    SEQ.with(|c| {
+        let n = c.get();
+        c.set(n + 1);
+        n
+    })
+}
 
 /// The device's batch separator. A backend that splits the payload on `\n`
 /// recovers the original payloads exactly.
@@ -120,7 +135,7 @@ fn merge_ops(ops: &[&GpuOp]) -> Option<IrStmt> {
     }
     let first = ops[0];
     let merged_payload = merge_payload(ops)?;
-    let seq = SEQ.fetch_add(1, Ordering::Relaxed);
+    let seq = next_seq();
     Some(IrStmt::Ext(Box::new(GpuOp {
         device: first.device.clone(),
         verb: first.verb.clone(),
@@ -232,7 +247,7 @@ mod tests {
     }
 
     fn gpu_op(device: &str, verb: &str, payload: &str) -> IrStmt {
-        let seq = SEQ.fetch_add(1, Ordering::Relaxed);
+        let seq = next_seq();
         IrStmt::Ext(Box::new(GpuOp {
             device: device.to_string(),
             verb: verb.to_string(),

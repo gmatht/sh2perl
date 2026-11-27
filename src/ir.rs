@@ -1065,6 +1065,13 @@ fn reset_emission_seqs() {
     ] {
         k.with(|c| c.set(0));
     }
+    // Transform-owned scratch numbering (`__cat_line<N>`, `__sv<K>_<i>`,
+    // the GPU op ids): a process-global counter renumbered every later
+    // render in the same process and raced between threads.
+    crate::transforms::cat_read::reset_seq();
+    crate::transforms::fbdev_gpu::reset_seq();
+    crate::transforms::fbdev_gpu_batch::reset_seq();
+    crate::transforms::text_ops::reset_seq();
 }
 
 fn printf_seq() -> usize {

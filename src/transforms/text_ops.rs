@@ -15,9 +15,25 @@
 
 use crate::ir::*;
 use crate::shir_nodes::*;
-use std::sync::atomic::{AtomicUsize, Ordering};
+thread_local! {
+    /// PER-RENDER lift numbering (the `__sv{k}_{i}` scratch names) plus the
+    /// change marker the caller compares. A process-global counter renumbered
+    /// the variables of every later render in the same process.
+    static LIFT_COUNT: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
 
-static LIFT_COUNT: AtomicUsize = AtomicUsize::new(0);
+/// Reset the lift numbering for a new render.
+pub fn reset_seq() {
+    LIFT_COUNT.with(|c| c.set(0));
+}
+
+fn next_seq() -> usize {
+    LIFT_COUNT.with(|c| {
+        let n = c.get();
+        c.set(n + 1);
+        n
+    })
+}
 
 /// May the CURRENT target render this Ext node? The §11.12 offer: a tag in the
 /// target's manifest means its renderer spells the node natively, so swapping
@@ -75,7 +91,7 @@ pub fn transform(stmts: &mut Vec<IrStmt>) -> bool {
     // SubStrExtract; array slices must NOT (they are index subsets).
     let mut arrays: std::collections::HashSet<String> = std::collections::HashSet::new();
     collect_array_names(stmts, &mut arrays);
-    let before = LIFT_COUNT.load(Ordering::Relaxed);
+    let before = LIFT_COUNT.with(|c| c.get());
     for stmt in stmts.iter_mut() {
         // The OFFER, enforced: a rewrite may build a node this target cannot
         // render (every site is filtered by `offered()`, but a site can also
@@ -91,7 +107,7 @@ pub fn transform(stmts: &mut Vec<IrStmt>) -> bool {
             *stmt = keep;
         }
     }
-    let after = LIFT_COUNT.load(Ordering::Relaxed);
+    let after = LIFT_COUNT.with(|c| c.get());
     if after > before {
     }
     after > before
@@ -158,7 +174,7 @@ fn lower_stmt(stmt: &mut IrStmt, emit: bool, arrays: &std::collections::HashSet<
             if supported {
                 written.sort();
                 written.dedup();
-                let k = LIFT_COUNT.fetch_add(1, Ordering::Relaxed);
+                let k = next_seq();
                 let mut out_stmts: Vec<IrStmt> = Vec::new();
                 for (i, v) in written.iter().enumerate() {
                     // save current value (" " model: never-assigned reads "")
@@ -182,7 +198,7 @@ fn lower_stmt(stmt: &mut IrStmt, emit: bool, arrays: &std::collections::HashSet<
                     });
                 }
                 *stmt = IrStmt::Block(out_stmts);
-                LIFT_COUNT.fetch_add(1, Ordering::Relaxed);
+                next_seq();
                 return;
             }
         }
@@ -194,7 +210,7 @@ fn lower_stmt(stmt: &mut IrStmt, emit: bool, arrays: &std::collections::HashSet<
     if emit {
         if let Some(repl) = try_normalize_construct_stmt(stmt) {
             *stmt = repl;
-            LIFT_COUNT.fetch_add(1, Ordering::Relaxed);
+            next_seq();
             return;
         }
         // `(( x > 3 ))` / `let "x > 3"` in If/While CONDITION position →
@@ -219,7 +235,7 @@ fn lower_stmt(stmt: &mut IrStmt, emit: bool, arrays: &std::collections::HashSet<
                     if let Some(text) = text_opt {
                         if let Some(repl) = let_cond_from_text(&text) {
                             *cond = repl;
-                            LIFT_COUNT.fetch_add(1, Ordering::Relaxed);
+                            next_seq();
                         }
                     }
                 }
@@ -237,7 +253,7 @@ fn lower_stmt(stmt: &mut IrStmt, emit: bool, arrays: &std::collections::HashSet<
                     if let [IrExpr::Arrow(b1), IrExpr::Arrow(b2)] = stages.as_slice() {
                         if let Some(repl) = try_lower_cat_pipe(b1, b2) {
                             *stmt = repl;
-                            LIFT_COUNT.fetch_add(1, Ordering::Relaxed);
+                            next_seq();
                             return;
                         }
                     }
@@ -247,7 +263,7 @@ fn lower_stmt(stmt: &mut IrStmt, emit: bool, arrays: &std::collections::HashSet<
                         if let [IrExpr::Arrow(b1), IrExpr::Arrow(b2)] = stages.as_slice() {
                             if let Some(repl) = try_lower_find_wc(b1, b2) {
                                 *stmt = repl;
-                                LIFT_COUNT.fetch_add(1, Ordering::Relaxed);
+                                next_seq();
                                 return;
                             }
                         }
@@ -258,22 +274,22 @@ fn lower_stmt(stmt: &mut IrStmt, emit: bool, arrays: &std::collections::HashSet<
                         if let [IrExpr::Arrow(b1), IrExpr::Arrow(b2)] = stages.as_slice() {
                             if let Some(repl) = try_lower_grep_cut(b1, b2) {
                                 *stmt = repl;
-                                LIFT_COUNT.fetch_add(1, Ordering::Relaxed);
+                                next_seq();
                                 return;
                             }
                             if let Some(repl) = try_lower_grep_text_cmd(b1, b2) {
                                 *stmt = repl;
-                                LIFT_COUNT.fetch_add(1, Ordering::Relaxed);
+                                next_seq();
                                 return;
                             }
                             if let Some(repl) = try_lower_grep_count(b1, b2) {
                                 *stmt = repl;
-                                LIFT_COUNT.fetch_add(1, Ordering::Relaxed);
+                                next_seq();
                                 return;
                             }
                             if let Some(repl) = try_lower_grep_wc(b1, b2) {
                                 *stmt = repl;
-                                LIFT_COUNT.fetch_add(1, Ordering::Relaxed);
+                                next_seq();
                                 return;
                             }
                         }
@@ -282,7 +298,7 @@ fn lower_stmt(stmt: &mut IrStmt, emit: bool, arrays: &std::collections::HashSet<
                         if let Some((replacement, already_nl)) = try_lower_pipeline(stages, true) {
                             // A statement-level pipeline PRINTS its result.
                             *stmt = with_status_zero(IrStmt::Output { value: replacement, newline: !already_nl, target: None });
-                            LIFT_COUNT.fetch_add(1, Ordering::Relaxed);
+                            next_seq();
                             return;
                         }
                     }
@@ -307,7 +323,7 @@ fn lower_stmt(stmt: &mut IrStmt, emit: bool, arrays: &std::collections::HashSet<
                         newline: !already_nl,
                         target: None,
                     });
-                    LIFT_COUNT.fetch_add(1, Ordering::Relaxed);
+                    next_seq();
                     return;
                 }
             }
@@ -346,7 +362,7 @@ fn lower_stmt(stmt: &mut IrStmt, emit: bool, arrays: &std::collections::HashSet<
                                 if let Some(replacement) = try_lower_command(text_ir, name, cmd_args) {
 
                                     *stmt = with_status_zero(IrStmt::Output { value: replacement, newline: true, target: None });
-                                    LIFT_COUNT.fetch_add(1, Ordering::Relaxed);
+                                    next_seq();
                                     return;
                                 }
                             }
@@ -383,7 +399,7 @@ fn lower_stmt(stmt: &mut IrStmt, emit: bool, arrays: &std::collections::HashSet<
                             limit: None,
                             body: vec![IrStmt::Output { value: val, newline: true, target: None }],
                         })));
-                        LIFT_COUNT.fetch_add(1, Ordering::Relaxed);
+                        next_seq();
                         return;
                     }
                 }
@@ -400,7 +416,7 @@ fn lower_stmt(stmt: &mut IrStmt, emit: bool, arrays: &std::collections::HashSet<
                 if is_wc_l {
                     if let Some(path) = path {
                         if let Some(__s) = streaming_line_count(path, None) { *stmt = __s; }
-                        LIFT_COUNT.fetch_add(1, Ordering::Relaxed);
+                        next_seq();
                         return;
                     }
                 }
@@ -449,7 +465,7 @@ fn lower_stmt(stmt: &mut IrStmt, emit: bool, arrays: &std::collections::HashSet<
                                     target: None,
                                 }],
                             })));
-                            LIFT_COUNT.fetch_add(1, Ordering::Relaxed);
+                            next_seq();
                             return;
                         }
                     }
@@ -481,7 +497,7 @@ fn lower_stmt(stmt: &mut IrStmt, emit: bool, arrays: &std::collections::HashSet<
                                 limit: None,
                                 body: vec![IrStmt::Output { value: val, newline: true, target: None }],
                             })));
-                            LIFT_COUNT.fetch_add(1, Ordering::Relaxed);
+                            next_seq();
                             return;
                         }
                     }
@@ -510,7 +526,7 @@ fn lower_stmt(stmt: &mut IrStmt, emit: bool, arrays: &std::collections::HashSet<
                             let pat = IrExpr::Str(strs[0].to_string(), StrStyle::DoubleQuoted);
                             let path = IrExpr::Str(strs[1].to_string(), StrStyle::DoubleQuoted);
                             if let Some(__s) = streaming_line_count(path, Some(pat)) { *stmt = __s; }
-                            LIFT_COUNT.fetch_add(1, Ordering::Relaxed);
+                            next_seq();
                             return;
                         }
                     }
@@ -554,7 +570,7 @@ fn lower_stmt(stmt: &mut IrStmt, emit: bool, arrays: &std::collections::HashSet<
                                 target: None,
                             }],
                         })));
-                        LIFT_COUNT.fetch_add(1, Ordering::Relaxed);
+                        next_seq();
                         return;
                     }
                 }
@@ -648,7 +664,7 @@ fn lower_stmt(stmt: &mut IrStmt, emit: bool, arrays: &std::collections::HashSet<
                                         newline: false,
                                         target: None,
                                     });
-                                    LIFT_COUNT.fetch_add(1, Ordering::Relaxed);
+                                    next_seq();
                                     return;
                                 }
                             }
@@ -719,7 +735,7 @@ fn lower_stmt(stmt: &mut IrStmt, emit: bool, arrays: &std::collections::HashSet<
                                     newline: false,
                                     target: None,
                                 });
-                                LIFT_COUNT.fetch_add(1, Ordering::Relaxed);
+                                next_seq();
                                 return;
                             }
                         }
@@ -730,7 +746,7 @@ fn lower_stmt(stmt: &mut IrStmt, emit: bool, arrays: &std::collections::HashSet<
                     // printing each entry path (streaming, no entry list).
                     if let Some(repl) = try_lower_find_stmt(cmd_args) {
                         *stmt = with_status_zero(repl);
-                        LIFT_COUNT.fetch_add(1, Ordering::Relaxed);
+                        next_seq();
                         return;
                     }
                 }
@@ -738,7 +754,7 @@ fn lower_stmt(stmt: &mut IrStmt, emit: bool, arrays: &std::collections::HashSet<
                     if let Some(val) = try_lower_printf_repeat(cmd_args) {
                         // printf emits NO trailing newline.
                         *stmt = with_status_zero(IrStmt::Output { value: val, newline: false, target: None });
-                        LIFT_COUNT.fetch_add(1, Ordering::Relaxed);
+                        next_seq();
                         return;
                     }
                 }
@@ -750,7 +766,7 @@ fn lower_stmt(stmt: &mut IrStmt, emit: bool, arrays: &std::collections::HashSet<
                             newline: true,
                             target: None,
                         });
-                        LIFT_COUNT.fetch_add(1, Ordering::Relaxed);
+                        next_seq();
                         return;
                     }
                 }
@@ -788,7 +804,7 @@ fn lower_stmt(stmt: &mut IrStmt, emit: bool, arrays: &std::collections::HashSet<
             // $? via SetChildError(0) for the provably-successful allowlist.
             if let Some(repl) = try_reduce_capture_assign(&*stmt, arrays) {
                 *stmt = repl;
-                LIFT_COUNT.fetch_add(1, Ordering::Relaxed);
+                next_seq();
                 return;
             }
             if let IrStmt::Assign { expr, .. } = stmt { lower_expr(expr, arrays); }
@@ -811,7 +827,7 @@ fn lower_expr(expr: &mut IrExpr, arrays: &std::collections::HashSet<String>) {
         IrExpr::Call { func, args } if func == "exec" || func == "builtin" => {
             if let Some(replacement) = try_normalize_let_cond(args) {
                 *expr = replacement;
-                LIFT_COUNT.fetch_add(1, Ordering::Relaxed);
+                next_seq();
                 return;
             }
             for a in args.iter_mut() { lower_expr(a, arrays); }
@@ -820,7 +836,7 @@ fn lower_expr(expr: &mut IrExpr, arrays: &std::collections::HashSet<String>) {
         IrExpr::Call { func, args } if func == "param" => {
             if let Some(replacement) = try_lower_param_len(args) {
                 *expr = replacement;
-                LIFT_COUNT.fetch_add(1, Ordering::Relaxed);
+                next_seq();
                 return;
             }
             // `${p##*/}` / `${p%/*}` deliberately do NOT become PathName:
@@ -834,7 +850,7 @@ fn lower_expr(expr: &mut IrExpr, arrays: &std::collections::HashSet<String>) {
             // ${var:2:3} → SubStr(var, 2, 3)
             if let Some(replacement) = try_lower_param_op(args, arrays) {
                 *expr = replacement;
-                LIFT_COUNT.fetch_add(1, Ordering::Relaxed);
+                next_seq();
                 return;
             }
             for a in args.iter_mut() { lower_expr(a, arrays); }
@@ -850,13 +866,13 @@ fn lower_expr(expr: &mut IrExpr, arrays: &std::collections::HashSet<String>) {
                     if let [b1, b2] = stages.as_slice() {
                         if let Some(replacement) = try_lower_grep_cond(b1, b2) {
                             *expr = replacement;
-                            LIFT_COUNT.fetch_add(1, Ordering::Relaxed);
+                            next_seq();
                             return;
                         }
                     }
                     if let Some((replacement, _)) = try_lower_pipeline(stages, false) {
                         *expr = replacement;
-                        LIFT_COUNT.fetch_add(1, Ordering::Relaxed);
+                        next_seq();
                         return;
                     }
                 }
@@ -890,7 +906,7 @@ fn lower_expr(expr: &mut IrExpr, arrays: &std::collections::HashSet<String>) {
                                 {
                                     if !already_nl {
                                         *expr = replacement;
-                                        LIFT_COUNT.fetch_add(1, Ordering::Relaxed);
+                                        next_seq();
                                         return;
                                     }
                                     // A value that ends in its own newline
@@ -905,7 +921,7 @@ fn lower_expr(expr: &mut IrExpr, arrays: &std::collections::HashSet<String>) {
                                     // without the trailing newline it keeps.
                                     if let Some(trimmed) = capture_trim_one_newline(&replacement) {
                                         *expr = trimmed;
-                                        LIFT_COUNT.fetch_add(1, Ordering::Relaxed);
+                                        next_seq();
                                         return;
                                     }
                                 }
@@ -930,7 +946,7 @@ fn lower_expr(expr: &mut IrExpr, arrays: &std::collections::HashSet<String>) {
         IrExpr::Call { func, args } if func == "getVar" => {
             if let Some(replacement) = try_lower_getvar_len(args) {
                 *expr = replacement;
-                LIFT_COUNT.fetch_add(1, Ordering::Relaxed);
+                next_seq();
                 return;
             }
             for a in args.iter_mut() { lower_expr(a, arrays); }
@@ -949,7 +965,7 @@ fn lower_expr(expr: &mut IrExpr, arrays: &std::collections::HashSet<String>) {
                             text,
                             which: which.to_string(),
                         }));
-                        LIFT_COUNT.fetch_add(1, Ordering::Relaxed);
+                        next_seq();
                         return;
                     }
                 }
@@ -3744,7 +3760,7 @@ fn streaming_line_count(source: IrExpr, guard: Option<IrExpr>) -> Option<IrStmt>
     if !offered("ForEachLine") {
         return None;
     }
-    let k = LIFT_COUNT.fetch_add(1, Ordering::Relaxed);
+    let k = next_seq();
     let cnt = format!("__lc{}", k);
     let lv = format!("__l{}", k);
     let mut body: Vec<IrStmt> = Vec::new();
@@ -3849,7 +3865,7 @@ fn walk_dir_count(
     maxdepth: Option<IrExpr>,
     name_filter: Option<String>,
 ) -> IrStmt {
-    let k = LIFT_COUNT.fetch_add(1, Ordering::Relaxed);
+    let k = next_seq();
     let cnt = format!("__lc{}", k);
     let lv = format!("__l{}", k);
     let incr = IrStmt::Assign {

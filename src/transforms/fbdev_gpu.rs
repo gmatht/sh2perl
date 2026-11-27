@@ -70,9 +70,24 @@
 
 use crate::ir::{IrExpr, IrStmt};
 use crate::shir_nodes::GpuOp;
-use std::sync::atomic::{AtomicUsize, Ordering};
+thread_local! {
+    /// PER-RENDER: the op id must not depend on how many renders this
+    /// process has already done (see `cat_read::reset_seq`).
+    static SEQ: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
 
-static SEQ: AtomicUsize = AtomicUsize::new(0);
+/// Reset the op numbering for a new render.
+pub fn reset_seq() {
+    SEQ.with(|c| c.set(0));
+}
+
+fn next_seq() -> usize {
+    SEQ.with(|c| {
+        let n = c.get();
+        c.set(n + 1);
+        n
+    })
+}
 
 /// The device roots this pass will lift a write from. A closed list: adding
 /// a device is a deliberate edit here, not a side effect of a prefix test.
@@ -117,7 +132,7 @@ fn build_op(root: &'static str, segs: &[String], payload: IrExpr) -> Option<IrSt
     // still puts one "\n" line on the device, and the op carries that line.
     // (The pre-fix refusal left the write to the fallback, which then
     // dropped the terminator.)
-    let seq = SEQ.fetch_add(1, Ordering::Relaxed);
+    let seq = next_seq();
     Some(IrStmt::Ext(Box::new(GpuOp {
         device: root.to_string(),
         verb,

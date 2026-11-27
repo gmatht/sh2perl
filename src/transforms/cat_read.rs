@@ -20,9 +20,27 @@
 
 use crate::ir::{IrExpr, IrStmt};
 use crate::shir_nodes::ForEachLine;
-use std::sync::atomic::{AtomicUsize, Ordering};
+thread_local! {
+    /// PER-RENDER scratch numbering. A process-global counter made the same
+    /// script render `__cat_line1` the first time and `__cat_line2` the next,
+    /// and let two threads race for the number: a render's text must depend
+    /// only on its input.
+    static SEQ: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
 
-static SEQ: AtomicUsize = AtomicUsize::new(0);
+/// Reset the scratch numbering for a new render (both render entry points
+/// call this before any transform runs).
+pub fn reset_seq() {
+    SEQ.with(|c| c.set(0));
+}
+
+fn next_seq() -> usize {
+    SEQ.with(|c| {
+        let n = c.get() + 1;
+        c.set(n);
+        n
+    })
+}
 
 pub fn transform(stmts: &mut Vec<IrStmt>) -> bool {
     let mut changed = false;
@@ -101,7 +119,7 @@ fn build_cat_replacement(args: &[IrExpr]) -> Option<IrStmt> {
         return None;
     }
 
-    let seq = SEQ.fetch_add(1, Ordering::Relaxed) + 1;
+    let seq = next_seq();
     let line_var = format!("__cat_line{seq}");
     let num_var = format!("__cat_num{seq}");
     let mut blocks: Vec<IrStmt> = Vec::new();
