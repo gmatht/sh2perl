@@ -86,6 +86,10 @@ else
         # function-call and case exit status, in statement, &&/||, if and
         # $?-read positions
         tests/status/*.sh
+        # the four Tier-1 correctness classes: command conditions, the
+        # $?-shadow of natively lowered builtins, nested `$()` inside a
+        # backtick capture, and native builtins in compound/condition position
+        tests/tier1/*.sh
     )
 fi
 
@@ -178,7 +182,7 @@ for f in "${examples[@]}"; do
     # the Perl runtime may print a local uu-ffi availability notice; strip
     # both and compare the message itself.
     case "$f" in
-    tests/loop-status/* | tests/status/*) strict_stderr=1 ;;
+    tests/loop-status/* | tests/status/* | tests/tier1/*) strict_stderr=1 ;;
     *) strict_stderr=0 ;;
     esac
     if [ "$strict_stderr" = 1 ]; then

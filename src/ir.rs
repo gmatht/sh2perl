@@ -2662,6 +2662,72 @@ fn emit_stmt_owned(out: &mut String, stmt: &IrStmt, indent: usize) {
             out.push_str(if indent == 0 { "}\n" } else { "};\n" });
         }
         IrStmt::Redirect { inner, redirects } => {
+            // A NATIVELY LOWERABLE BUILTIN with a STDERR-only redirect
+            // (`cd sub 2>/dev/null`, `mkdir d 2>/dev/null`). bash redirects
+            // only the builtin's DIAGNOSTICS; the builtin still runs in THIS
+            // shell. Falling through to the generic rebuild forked
+            // `__sh_pipe_run`/`bash -c`, so `cd sub 2>/dev/null` changed the
+            // CHILD's directory while the parent kept its own — the next
+            // `pwd` printed the wrong path, and `if cd sub 2>/dev/null`
+            // reported the fork's status while the script stayed put (a
+            // silent wrong answer in ordinary scripts).
+            if let [IrStmt::Expr(IrExpr::Call { func, args })] = inner.as_slice() {
+                if func == "exec" || func == "builtin" {
+                    if let Some((cmd, _)) = exec_call_parts(args) {
+                        let native = matches!(
+                            cmd.as_str(),
+                            "cd" | "echo"
+                                | "printf"
+                                | "rm"
+                                | "mkdir"
+                                | "rmdir"
+                                | "touch"
+                                | "true"
+                                | "false"
+                                | ":"
+                                | "test"
+                                | "["
+                        );
+                        let stderr_only = !redirects.is_empty()
+                            && redirects.iter().all(|r| {
+                                r.fd == Some(2) && matches!(r.mode.as_str(), "w" | "wc" | "a")
+                            });
+                        if native && stderr_only {
+                            let n = next_name!(RD3_SEQ);
+                            let saved = format!("$__sh2_dup{n}");
+                            let fh = format!("$__sh2_dupfh{n}");
+                            emit_indent(out, indent);
+                            out.push_str("{\n");
+                            emit_indent(out, indent + 1);
+                            out.push_str(&format!("open(my {saved}, '>&', \\*STDERR) or die;\n"));
+                            for r in redirects {
+                                emit_indent(out, indent + 1);
+                                out.push_str(&format!(
+                                    "open(my {fh}, '>&', \\*STDERR) or die;\n"
+                                ));
+                                emit_indent(out, indent + 1);
+                                out.push_str(&format!(
+                                    "open(STDERR, {}, {}) or die \"redirect: $!\\n\";\n",
+                                    if r.mode == "a" { "'>>'" } else { "'>'" },
+                                    render_word(&r.target)
+                                ));
+                            }
+                            emit_stmt(out, &inner[0], indent + 1);
+                            for _ in redirects {
+                                emit_indent(out, indent + 1);
+                                out.push_str(&format!(
+                                    "open(STDERR, '>&', {fh}) or die; close({fh});\n"
+                                ));
+                            }
+                            emit_indent(out, indent + 1);
+                            out.push_str(&format!("open(STDERR, '>&', {saved}) or die;\n"));
+                            emit_indent(out, indent);
+                            out.push_str("}\n");
+                            return;
+                        }
+                    }
+                }
+            }
             // `mapfile [-t] VAR < FILE` / `readarray …` — read the file into
             // `@VAR` natively. `mapfile` is a shell builtin: a `bash -c`
             // child assigns the array in the CHILD (bash arrays cannot cross
@@ -3713,6 +3779,10 @@ fn emit_stmt_owned(out: &mut String, stmt: &IrStmt, indent: usize) {
                 // redirects, pipelines — run the reconstructed shell command.
                 other_expr => {
                     if let Some(s) = crate::pipeline_native::native_chain(other_expr) {
+                        emit_indent(out, indent);
+                        out.push_str(&rc_stripped(&s));
+                        out.push('\n');
+                    } else if let Some(s) = redirect_builtin_chain_to_perl(other_expr) {
                         emit_indent(out, indent);
                         out.push_str(&rc_stripped(&s));
                         out.push('\n');
@@ -6591,7 +6661,171 @@ fn build_shell_cmd(cmd: &str, words: &[&IrExpr]) -> String {
 /// render natively. `cd D || exit N` becomes `chdir(D) or exit N;`, and
 /// `cd D && cmd` becomes a guarded tail: bash runs the tail only when the
 /// cd SUCCEEDED, and a failed cd warns, sets status 1 and keeps going.
+/// Peel a STDERR-only redirect off a single natively lowerable command:
+/// `cd D 2>/dev/null` runs `cd` in THIS shell and sends only its diagnostics
+/// to the target. Returns the inner command plus the redirect targets (Perl
+/// expressions) when every spec is `2>` / `2>>`, and `None` otherwise —
+/// `>file`, `2>&1` and multi-command bodies need the redirection machinery
+/// this helper deliberately does not reimplement (REFUSE > GUESS).
+fn stderr_only_redirect_peel(e: &IrExpr) -> Option<(IrExpr, Vec<String>)> {
+    let IrExpr::Call { func, args } = e else {
+        return None;
+    };
+    if func != "redirect" {
+        return None;
+    }
+    // The body arrives as an `Arrow` of statements in condition position
+    // (`redirect(Arrow([Expr(exec …)]), specs)`) and as the bare call in a
+    // chain; accept exactly ONE command either way.
+    let raw = args.first()?;
+    let inner = match raw {
+        IrExpr::Arrow(stmts) => match stmts.as_slice() {
+            [IrStmt::Expr(e)] => e.clone(),
+            _ => return None,
+        },
+        other => other.clone(),
+    };
+    if !matches!(&inner, IrExpr::Call { func, .. } if func == "exec" || func == "builtin") {
+        return None;
+    }
+    let mut targets = Vec::new();
+    for spec in args.iter().skip(1) {
+        let specs: Vec<&IrExpr> = match spec {
+            IrExpr::Array(elems) => elems.iter().collect(),
+            other => vec![other],
+        };
+        for s in specs {
+            let (fd, mode, target) = redirect_spec_fields(s)?;
+            // `redirect_spec_fields` defaults a missing fd to 1 (stdout);
+            // only an explicit `2>` / `2>>` is a diagnostic redirect.
+            if fd != 2 || !matches!(mode.as_str(), "w" | "wc" | "a") {
+                return None;
+            }
+            targets.push(render_word(&target));
+        }
+    }
+    if targets.is_empty() {
+        return None;
+    }
+    Some((inner, targets))
+}
+
+/// Open a dup of STDERR and point fd 2 at `target`.
+fn stderr_swap_open(n: usize, target: &str) -> (String, String) {
+    let sav = format!("$__sh2_duperr{n}");
+    let fh = format!("$__sh2_dupferr{n}");
+    (
+        format!(
+            "open(my {sav}, '>&', \\*STDERR) or die; open(my {fh}, '>&', \\*STDERR) or die; \
+             open(STDERR, '>', {target}) or die \"redirect: $!\\n\"; "
+        ),
+        format!("open(STDERR, '>&', {fh}) or die; close({fh}); open(STDERR, '>&', {sav}) or die; "),
+    )
+}
+
+/// Wrap a Perl STATEMENT BODY so everything it writes to STDERR goes to
+/// `target` (a bare block, so it needs no semicolon in statement position).
+fn with_stderr_to_stmt(code: &str, target: &str) -> String {
+    let n = next_name!(RD3_SEQ);
+    let (open, close) = stderr_swap_open(n, target);
+    format!("{{\n{open}\n{code}\n{close}\n}}")
+}
+
+/// Wrap a Perl EXPRESSION so the value survives and its STDERR goes to
+/// `target`. The value MUST be captured in a temporary: leaving `({expr});`
+/// in the middle of the block puts it in VOID context — perl warns "Useless
+/// use of numeric eq (==) in void context" for a condition and the block
+/// then returns whatever the restore `open` returns (always true).
+fn with_stderr_to_expr(expr: &str, target: &str) -> String {
+    let n = next_name!(RD3_SEQ);
+    let (open, close) = stderr_swap_open(n, target);
+    format!(
+        "do {{ {open} my $__sh2_v{n} = ({expr}); {close} $__sh2_v{n} }}",
+        expr = expr
+    )
+}
+
+/// A natively lowerable builtin wrapped in a stderr-only redirect, in
+/// EXPRESSION position (`if cd sub 2>/dev/null; then`). Without this the
+/// condition fell back to `system('bash','-c', …)`: the chdir happened in the
+/// CHILD, so the branch taken and the script's own directory disagreed with
+/// bash (probe: `if cd subdir 2>/dev/null; then echo $(basename $(pwd))`
+/// printed the OUTER directory).
+fn stderr_redirected_native_expr(e: &IrExpr) -> Option<String> {
+    let (inner, targets) = stderr_only_redirect_peel(e)?;
+    if targets.len() != 1 {
+        return None;
+    }
+    let val = ir_expr_to_perl(&inner);
+    let native = ["chdir(", "mkdir(", "unlink(", "rmdir(", "utime("]
+        .iter()
+        .any(|m| val.contains(m));
+    if !native {
+        return None;
+    }
+    Some(with_stderr_to_expr(&val, &targets[0]))
+}
+
+/// `mkdir D 2>/dev/null || echo fallback` — a NATIVELY lowerable builtin
+/// with a stderr-only redirect on one side of a `&&`/`||` chain. Without
+/// this the whole chain was rebuilt as shell text and forked
+/// (`system('bash','-c', q{mkdir D 2>/dev/null || echo fallback})`), which
+/// the class-4 contract forbids for echo/printf/true/false/test/rm/mkdir/
+/// touch. The LHS runs inside a temporary STDERR swap; the RHS runs only on
+/// the status bash would see. REFUSES when either side is not a single
+/// native statement (that is what the shell fallback is for).
+fn redirect_builtin_chain_to_perl(e: &IrExpr) -> Option<String> {
+    let IrExpr::BinOp { lhs, op, rhs } = e else {
+        return None;
+    };
+    if !matches!(op, BinOpKind::And | BinOpKind::Or) {
+        return None;
+    }
+    let (lhs_inner, targets) = stderr_only_redirect_peel(lhs)?;
+    if targets.len() != 1 {
+        return None;
+    }
+    let forks = |s: &str| s.contains("system(") || s.contains("__sh_pipe_run(") || s.contains("bash", );
+    let mut body = String::new();
+    emit_stmt(&mut body, &IrStmt::Expr(lhs_inner), 1);
+    if forks(&body) {
+        return None;
+    }
+    let mut tail = String::new();
+    emit_stmt(&mut tail, &IrStmt::Expr((**rhs).clone()), 1);
+    if forks(&tail) {
+        return None;
+    }
+    let cond = if matches!(op, BinOpKind::And) {
+        "== 0"
+    } else {
+        "!= 0"
+    };
+    let n = next_name!(RD3_SEQ);
+    let (open, close) = stderr_swap_open(n, &targets[0]);
+    Some(format!(
+        "{{\n{open}\n{body}\n{close}\n}}\nif ($CHILD_ERROR {cond}) {{\n{tail}\n}}"
+    ))
+}
+
 fn cd_chain_to_perl(expr: &IrExpr) -> Option<String> {
+    // `cd D 2>/dev/null && tail` — peel the stderr redirect, lower the chain
+    // natively, and silence the failure warning the way bash does.
+    if let IrExpr::BinOp { lhs, op, rhs } = expr {
+        if let Some((inner, targets)) = stderr_only_redirect_peel(lhs) {
+            let stripped = IrExpr::BinOp {
+                lhs: Box::new(inner),
+                op: op.clone(),
+                rhs: rhs.clone(),
+            };
+            let body = cd_chain_to_perl(&stripped)?;
+            return Some(if targets.len() == 1 {
+                with_stderr_to_stmt(&body, &targets[0])
+            } else {
+                body
+            });
+        }
+    }
     if let IrExpr::BinOp { lhs, op, rhs } = expr {
         if let IrExpr::Call { func, args } = lhs.as_ref() {
             if func == "exec" || func == "builtin" {
@@ -7306,6 +7540,19 @@ fn bash_word_for(w: &IrExpr) -> String {
                                         s.push('}');
                                         continue;
                                     }
+                                    // `$?` in a rebuilt SHELL word is bash's
+                                    // status word, not the Perl-ish spelling
+                                    // `var_read("?")` produces
+                                    // (`$CHILD_ERROR`): the capture fallback
+                                    // hands this text to `bash -c`, so
+                                    // `x=$(cd /no/such; echo $?)` expanded
+                                    // `$CHILD_ERROR` — a shell variable that
+                                    // does not exist — and printed nothing
+                                    // where bash prints 1.
+                                    if n == "?" {
+                                        s.push_str("$?");
+                                        continue;
+                                    }
                                     // var_read: digits → $ARGV[0] (positional),
                                     // env-style → $ENV{VAR1}, locals → $x.
                                     // The bare `${}` emitted `$ENV{"1"}` for
@@ -7378,6 +7625,15 @@ fn bash_word_for(w: &IrExpr) -> String {
         }
         _ => {
             let wstr = render_word(w);
+            // A STATUS read (`$?`) renders as a Perl expression (`$CHILD_ERROR`,
+            // or `($? >> 8)` for the arithmetic word node). In rebuilt SHELL
+            // text the child must resolve it, and bash's spelling is `$?`:
+            // quoting the Perl name produced `"$CHILD_ERROR"` — a shell
+            // variable that does not exist — so `x=$(cd /no/such; echo $?)`
+            // captured an EMPTY string where bash captures 1.
+            if wstr == "$CHILD_ERROR" || wstr == "$?" || wstr == "($? >> 8)" {
+                return "$?".to_string();
+            }
             // A Perl string literal or a plain scalar: embed safely.
             if wstr.starts_with('\'') || wstr.starts_with('"') || wstr.starts_with('q') {
                 wstr
@@ -13192,6 +13448,9 @@ fn pipeline_leaf_capture(e: &IrExpr) -> Option<String> {
 }
 
 pub(crate) fn ir_expr_to_perl(expr: &IrExpr) -> String {
+    if let Some(s) = stderr_redirected_native_expr(expr) {
+        return s;
+    }
     match expr {
         IrExpr::Capture { expr, native } => {
             // A heredoc in the captured body (`x=$(cat <<-EOF …)`) supplies
