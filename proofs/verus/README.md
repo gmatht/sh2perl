@@ -9386,3 +9386,43 @@ outside the domain and the source has no glob gate in this fold (unlike
 `native_echo_stmt`); fd 0/2, `2>&1`, heredocs/herestrings and renderer
 output are out of model. The module's 8 tests do not cover these folds, so
 every pin row is UNMIRRORED. Clusters A, D, F and G remain open.
+
+### Cluster D1, proved: the atomic `test` round trip
+
+    proofs/verus/shir_native_test_render.rs      (15 verified, 0 errors)
+    verus --triggers-mode silent --rlimit 40 proofs/verus/shir_native_test_render.rs
+
+`render_test_tokens` turns a tokenised test into an IR expression. D1's law
+is the round trip `eval(parse(render(t))) = eval(t)` for its atomic shapes:
+one token (truthiness), a two-token unary test (`-e -f -d -s -S -h/-L -a -z
+-n`) and a three-token binary test (`=`/`==`/`!=`, the six numeric
+comparisons, `>`/`<`).
+
+- **`render_tokens_is_bash`**: whenever the renderer accepts a token list,
+  `eval_expr` of the emitted expression equals bash's `test` verdict for the
+  same tokens in the same world. The pass side transcribes the 1/2/3-token
+  arms into `Expr`; the semantic side is `bash_atom`, bash's own rules
+  (truthiness, unary predicates over a `World`, string equality, numeric
+  numification, lexicographic ordering), written independently of `Expr`.
+- **`test_renders_to_the_same_truth`** restates it as the plan's law.
+
+Pins, rejected by computation: a bare word is truthiness; `-f` is a file test
+(not the flag-regex heuristic); `-a` is existence; `-z`/`-n` are length
+tests; numeric comparison numifies non-numbers to 0; `=` is string equality;
+an unknown unary flag is refused. Mutants, measured: making any dash word on
+the unary arm truthiness is a counted failure (**11 verified, 4 errors**);
+accepting an unknown unary as `-f` is counted (**12 verified, 3 errors**);
+swapping `-z`/`-n` and rendering a bare word as always-true are counted
+(**13 verified, 2 errors** each); rendering `-eq` as string equality is
+rejected at simplification by `pin_numeric_numifies`. Each restored
+byte-identically (`shir_native_test_render_sync.txt`).
+
+Exclusions, stated: `render_test_text`'s top-level connector split (`&&`,
+`-a`, `||`, `-o`) is **cluster D2/D3**, not claimed here — its split order
+does not match bash's precedence when connector kinds are mixed, so its law
+needs a domain premise and its own proof. `render_flag_substitution_test`
+(`$(...)`) is a runtime capture; parentheses and `!` are the shared parser's;
+globs, `=~`, `-ef` and `$var` operands are outside this round trip; renderer
+output text is out of model. The module's 8 tests do not cover this
+renderer, so every pin row is UNMIRRORED. Clusters A, D2/D3, F and G remain
+open.

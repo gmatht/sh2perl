@@ -1,0 +1,64 @@
+# verus-sync-coverage manifest: shir_native_test_render
+# source sha: shir_native_stmt=93c9e845a066  proof sha: 7ecf299a8bb5
+# source: src/transforms/shir_native_stmt.rs (cluster D1:
+#   render_test_words 1308, render_test_text 1435,
+#   render_test_tokens 1502, render_flag_substitution_test 1473)
+# This is the FIFTH proved cluster of the decomposition in
+# shir_native_stmt_plan.md (C, H, E and B came first); A, D2/D3, F and G
+# are open. D1 claims the atomic `render_test_tokens` round trip only;
+# `render_test_text`'s connector split is D2/D3 and is not claimed here.
+
+[pins]
+pin pin_bare_word_is_truthiness -> UNMIRRORED (no source test for a bare-word test)
+pin pin_dash_f_is_a_file_test -> UNMIRRORED (no source test for -f rendering)
+pin pin_dash_a_is_existence -> UNMIRRORED (no source test for -a as existence)
+pin pin_z_and_n_are_length_tests -> UNMIRRORED (no source test for -z/-n)
+pin pin_numeric_numifies -> UNMIRRORED (no source test for numeric numification)
+pin pin_equality_is_string_equality -> UNMIRRORED (no source test for = rendering)
+pin pin_unknown_unary_refused -> UNMIRRORED (no source test for an unknown unary)
+
+[guards]
+guard law render_tokens_is_bash (eval(parse(render(t))) == bash test on t): PRESENT
+guard law test_renders_to_the_same_truth (the same, stated as the plan's law): PRESENT
+guard independent side: render_tokens transcribes render_test_tokens' 1/2/3-token arms into Expr: PRESENT
+guard independent side: bash_atom computes bash `test` over the token list and World: PRESENT
+guard expression semantics eval_expr (separate from both): PRESENT
+guard numification (digits/num_of), lexicographic str_lt, file predicates over World: PRESENT
+guard render_test_text connector split (&&, -a, ||, -o) and chain semantics: NOT THIS PROOF (cluster D2/D3)
+guard render_flag_substitution_test ($(...) capture): OUT OF MODEL (runtime capture, not test grammar)
+guard parentheses / `!` (shared ir::render_test_token_list): OUT OF MODEL
+guard glob RHS, =~ regex, -ef: NOT THIS ROUND TRIP
+guard `$var` substitution in operands (render_test_words): OUT OF MODEL
+guard renderer output text (Perl syntax templates): OUT OF MODEL
+guard the other folds / clusters A, D2/D3, F, G: NOT THIS PROOF
+
+[counts]
+15 verified, 0 errors (verus --triggers-mode silent --rlimit 40 shir_native_test_render.rs)
+mutants measured this turn against that baseline, each restored
+  byte-identically (sha re-checked):
+    counted (11v/4e):
+      m1 any dash word on the unary arm becomes truthiness (the flag-regex
+         heuristic instead of unary_flag mapping; postcondition and pins fail)
+    counted (12v/3e):
+      m4 an unknown unary flag accepted as -f (pin_unknown_unary_refused and
+         the postcondition fail)
+    counted (13v/2e):
+      m2 -z/-n swapped (pin_z_and_n_are_length_tests and the postcondition)
+      m5 a bare word rendered as the empty word, i.e. always true
+         (pin_bare_word_is_truthiness and the postcondition)
+    rejected at simplification by a concrete pin:
+      m3 -eq rendered as string equality (pin_numeric_numifies simplifies to
+         false; no verification count is produced)
+
+[exec]
+# The analysed module's #[cfg(test)] module has 8 tests (chain/find only),
+# none for test rendering. So `cargo test --lib` contains no test that
+# exercises this cluster, and every pin row above is UNMIRRORED. Nothing is
+# executed for this proof.
+exec pin_bare_word_is_truthiness: UNMIRRORED (not executed: no source test)
+exec pin_dash_f_is_a_file_test: UNMIRRORED (not executed)
+exec pin_dash_a_is_existence: UNMIRRORED (not executed)
+exec pin_z_and_n_are_length_tests: UNMIRRORED (not executed)
+exec pin_numeric_numifies: UNMIRRORED (not executed)
+exec pin_equality_is_string_equality: UNMIRRORED (not executed)
+exec pin_unknown_unary_refused: UNMIRRORED (not executed)
