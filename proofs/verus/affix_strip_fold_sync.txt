@@ -1,5 +1,5 @@
 # verus-sync-coverage manifest: affix_strip_fold
-# source sha: affix_strip_fold=929ebbee6785  proof sha: 402308d8cd04
+# source sha: affix_strip_fold=929ebbee6785  proof sha: 3b53272ba452
 
 [pins]
 pin literal_shortest_eq_longest -> test greedy_and_shortest_are_identical_for_a_literal: MAPPED
@@ -14,6 +14,10 @@ pin pin_magic_is_refused -> test glob_magic_pattern_is_kept: MAPPED
 pin pin_star_shape -> test conditional_star_forms_are_refused: MAPPED
 pin pin_no_occurrence_is_the_value: UNMIRRORED (no source test for the no-match value)
 pin literal_strip_is_one_occurrence: UNMIRRORED (value-level; the source tests the node shape)
+pin pin_nested_site_is_visited -> test traversal_reaches_nested_positions: MAPPED
+pin pin_middle_star_is_refused -> test glob_magic_pattern_is_kept: MAPPED
+pin pin_star_body_magic_is_refused -> test glob_magic_pattern_is_kept: MAPPED
+pin pin_non_strip_op_is_not_a_site -> test substitute_op_is_kept: MAPPED
 
 [guards]
 guard law literal_shortest_eq_longest (shortest == longest for a literal): PRESENT
@@ -22,6 +26,11 @@ guard law literal_strip_is_one_occurrence (at most one occurrence): PRESENT
 guard law star_forms_preserve_value (#lit* == #lit, %*lit == %lit): PRESENT
 guard law fold_is_idempotent (a second visit is the identity): PRESENT
 guard law fold_rules_are_exclusive (literal vs star branches disjoint): PRESENT
+guard law fold_rule_covers (every strippable shape is claimed): PRESENT
+guard law fold_rule_sound (nothing unstrippable is claimed): PRESENT
+guard law fold_t_covers (one visit reaches every site at every depth): PRESENT
+guard law fold_t_preserves (the rewritten tree keeps the semantic value): PRESENT
+guard strippable is written from bash's domain, not from fold_rule: PRESENT
 guard scan enumerates prefixes/suffixes rather than assuming the closed form: PRESENT
 guard star SHAPE gate (one star, at an end): PRESENT
 guard magic set (*, ?, [, backslash) as lit_free: PRESENT
@@ -29,12 +38,15 @@ guard Cut table (the four find/rfind identities): STATED, not proved (pinned on 
 guard NAME-slot lexical gate / target gates (always-registry, value-free): OUT OF MODEL
 
 [counts]
-32 verified, 0 errors (verus --triggers-mode silent --rlimit 40 affix_strip_fold.rs)
-mutants (measured 2026-11-26, each restored byte-identically to this proof
-  sha): a fold output that re-enters the rewritable class 31v/1e
-  (fold_is_idempotent); strip-without-presence-check, over-strip-one-past
-  (pin_literal_one_length) and '*' not magic (pin_magic_is_refused) rejected
-  at simplification by their pins.
+51 verified, 0 errors (verus --triggers-mode silent --rlimit 40 affix_strip_fold.rs)
+mutants (measured 2026-11-27, each restored byte-identically to this proof
+  sha): a fold output that re-enters the rewritable class 48v/3e (fold_t_covers,
+  fold_t_preserves, fold_is_idempotent); strip-without-presence-check,
+  over-strip-one-past (pin_literal_one_length), '*' not magic
+  (pin_magic_is_refused), the visit forgetting a call's arguments
+  (pin_nested_site_is_visited), the classifier forgetting the literal branch
+  (same pin) and the classifier accepting a middle star
+  (pin_middle_star_is_refused) rejected at simplification by their pins.
 [exec]
 # Every MAPPED row above was EXECUTED against the source in this tree:
 #   cargo test --lib          (full lib suite; per-test verdicts below)
@@ -56,4 +68,8 @@ exec pin_literal_one_length (literal_prefix_strip_folds_on_rust): PASS
 exec pin_magic_is_refused (glob_magic_pattern_is_kept): PASS
 exec pin_star_shape (conditional_star_forms_are_refused): PASS
 exec pin_no_occurrence_is_the_value: UNMIRRORED (not executed)
+exec pin_nested_site_is_visited (traversal_reaches_nested_positions): PASS
+exec pin_middle_star_is_refused (glob_magic_pattern_is_kept): PASS
+exec pin_star_body_magic_is_refused (glob_magic_pattern_is_kept): PASS
+exec pin_non_strip_op_is_not_a_site (substitute_op_is_kept): PASS
 exec literal_strip_is_one_occurrence: UNMIRRORED (not executed)

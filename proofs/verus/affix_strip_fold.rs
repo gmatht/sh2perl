@@ -33,6 +33,30 @@
 //    fold_rules_are_exclusive           the literal and star branches cannot
 //                                       both claim one pattern (a star is magic)
 //
+//  ── the pass's ANALYSIS as its own recursion ──────────────────────────
+//
+//  The value laws above are refinements of the closed-form NODE value
+//  against bash's prefix/suffix SCAN. They do not by themselves say the
+//  pass's own walk reaches every fold site, or that its shape classifier
+//  claims exactly the strippable patterns — a forgotten shape or a
+//  forgotten child arm would leave them all green. So the pass is modelled
+//  a second time, as a recursion (`fold_t`/`fold_ss`) over a term tree
+//  (`Term::Call` carries the argument list), and checked against the
+//  semantic domain:
+//
+//    fold_rule_covers   every strippable pattern is claimed by a fold rule
+//    fold_rule_sound    the classifier claims nothing bash cannot strip
+//                       (empty, middle star, magic body all refused)
+//    fold_t_covers      one visit folds every strippable site at EVERY
+//                       depth (a forgotten `Call`/child arm goes red)
+//    fold_t_preserves   each rewritten site keeps the semantic value
+//                       (the `preserved` relation, pointwise through the
+//                       argument lists; a wrong op mapping goes red)
+//
+//  `strippable` is written from bash's domain (`is_literal_pattern` +
+//  `single_star_shape` + the body gate), not from `fold_rule`, so the two
+//  directions are a real refinement rather than a restatement.
+//
 //  ── the star-form table (the Cut arms) ──────────────────────────────────
 //
 //  The four find()/rfind() identities of the module doc — `%lit*`,
@@ -56,10 +80,12 @@
 //     source's own tests (`non_affix_target_is_refused`, `go_is_refused_…`).
 //   * `%*` (empty body, identity) and `%%*` (empty result) are value-level
 //     pins; the general empty-body handling is the source's.
-//   * The TRAVERSAL is not modelled: `transform` is ONE bottom-up visit of
-//     the statement list with no fixpoint loop, so `fold_is_idempotent` is
-//     the convergence fact — there is no loop that could fail to terminate,
-//     and the fold's output never re-enters its own rewrite class.
+//   * The TRAVERSAL is modelled at the argument-list level (`Term::Call` /
+//     `fold_ss`): the visit is ONE bottom-up pass with no fixpoint loop, so
+//     `fold_is_idempotent` is the convergence fact, and `fold_t_covers` is
+//     the reachability fact. The statement/expression KINDS are not
+//     modelled one-for-one (they all reduce to "a node with children"
+//     here); what the model checks is that no child is skipped.
 //   * The OP × SHAPE table is not modelled: `fold_rule` keys on the PATTERN,
 //     because the two replacement families are value-equal wherever they
 //     apply. Which of the eight op/shape pairs the source REFUSES (`## lit*`
@@ -67,14 +93,14 @@
 //     fires, never the value — those refusals are the source's own and are
 //     NOT counted as proved here.
 //
-//  ── measured mutants (2026-11-26 revision; all restored byte-identically,
+//  ── measured mutants (2026-11-27 revision; all restored byte-identically,
 //     sha in the sync file) ──
 //
-//  baseline 32 verified, 0 errors
+//  baseline 51 verified, 0 errors
 //
 //  counted:
-//    m4  the fold's output re-enters the rewritable class  31 verified, 1 error
-//        (`fold_is_idempotent`)
+//    m4  the fold's output re-enters the rewritable class  48 verified, 3 errors
+//        (`fold_t_covers`, `fold_t_preserves`, `fold_is_idempotent`)
 //
 //  refuted one stage earlier, at simplification, by a concrete pin:
 //    m1  strip the affix without checking it is present
@@ -82,6 +108,12 @@
 //    m2  over-strip one char past the declared affix
 //        (pin_literal_one_length)
 //    m3  `*` no longer counted as glob magic (pin_magic_is_refused)
+//    m5  the visit forgets to descend into a call's arguments
+//        (pin_nested_site_is_visited — the nested fold site stays a Param)
+//    m6  the shape classifier forgets the literal branch
+//        (pin_nested_site_is_visited — the literal site stops folding)
+//    m7  the shape classifier accepts a middle star
+//        (pin_middle_star_is_refused computes false)
 //
 //  ─────────────────────────────────────────────────────────────────────────
 
@@ -552,6 +584,19 @@ pub open spec fn count_star(p: Seq<char>) -> nat
     }
 }
 
+/// The star BODY's magic gate: `?`, `[` and `\\` would make the glob match
+/// diverge from a plain find/rfind cut, so the source refuses such a body.
+/// (`*` itself is the shape star, already counted.)
+pub open spec fn no_hard_magic(p: Seq<char>) -> bool
+    decreases p.len(),
+{
+    if p.len() == 0 {
+        true
+    } else {
+        p[0] != '?' && p[0] != '[' && p[0] != '\\' && no_hard_magic(p.skip(1))
+    }
+}
+
 pub open spec fn single_star_shape(p: Seq<char>) -> bool {
     count_star(p) == 1 && p.len() > 0 && (p[0] == '*' || p[p.len() - 1] == '*')
 }
@@ -560,53 +605,302 @@ pub open spec fn star_is_first(p: Seq<char>) -> bool {
     p.len() > 0 && p[0] == '*'
 }
 
+/// The SEMANTIC domain this pass may fold: a magic-free non-empty literal,
+/// or a single star pinned at an end with a magic-free body. This is the
+/// measure the pass's analysis is checked against — it is written from
+/// bash's strip semantics (`is_literal_pattern` + `single_star_shape` + the
+/// body gate), not from `fold_rule`.
+pub open spec fn strippable(p: Seq<char>) -> bool {
+    (0 < p.len() && lit_free(p)) || (single_star_shape(p) && no_hard_magic(p))
+}
+
 // ──────────────────────────────────────────────── convergence (one visit) ──
 
 /// The branch `transform` takes on a pattern: 0 = leave the call alone,
 /// 1 = `AffixStrip`, 2 = the star family's `CutAt`/`AffixStrip` rule.
-/// The literal test comes FIRST (the source's order), so the value below is
-/// the rule choice, not a re-run of the match.
+/// The literal test comes FIRST (the source's order), then the star shape
+/// AND its magic-free body gate, mirroring `fold`'s two-step classify.
 pub open spec fn fold_rule(p: Seq<char>) -> int {
     if 0 < p.len() && lit_free(p) {
         1
-    } else if single_star_shape(p) {
+    } else if single_star_shape(p) && no_hard_magic(p) {
         2
     } else {
         0
     }
 }
 
+/// COMPLETENESS of the shape analysis: every strippable pattern is claimed
+/// by a fold rule. A forgotten shape branch here makes this proof red.
+pub proof fn fold_rule_covers(p: Seq<char>)
+    requires
+        strippable(p),
+    ensures
+        fold_rule(p) != 0,
+{
+    if 0 < p.len() && lit_free(p) {
+    } else {
+        assert(single_star_shape(p) && no_hard_magic(p));
+    }
+}
+
+/// SOUNDNESS of the shape analysis: it claims nothing the modelled bash
+/// semantics cannot strip (a middle star, a magic body, the empty pattern).
+/// A too-eager branch here makes this proof red.
+pub proof fn fold_rule_sound(p: Seq<char>)
+    requires
+        fold_rule(p) != 0,
+    ensures
+        strippable(p),
+{
+    if 0 < p.len() && lit_free(p) {
+    } else {
+        assert(single_star_shape(p) && no_hard_magic(p));
+    }
+}
+
 /// A term of the fold: the `param(op, PAT)` call it can rewrite, a node it
-/// has already produced (`Node`), or anything else (`Other`).
+/// has already produced (`Node`), a call whose arguments the pass visits
+/// (`Call`), or anything else (`Other`).
 pub enum Term {
     Param(int, Seq<char>),
     Node,
+    Call(Seq<Term>),
     Other,
 }
 
-/// ONE bottom-up visit of the fold. The source's `transform` iterates the
-/// statement list once and recurses per node — there is no fixpoint loop, so
-/// "does it converge" is the question of whether a second visit can change
-/// what the first produced.
-pub open spec fn fold_t(t: Term) -> Term {
+// ─────────────────────────────── the pass's ANALYSIS, as a recursion ──
+//
+// This is deliberately a SECOND recursion, independent of the semantic
+// scans above: `fold_t`/`fold_ss` mirror `expr`/`stmt`'s bottom-up visit,
+// while `spm_lit`/`lpm_lit` enumerate bash's matching prefixes. A shape the
+// visit forgets to reach, or a shape `fold_rule` forgets to claim, is a
+// theorem failure below — not a comment.
+
+/// The one bottom-up visit, over the children of each node.
+pub open spec fn fold_t(t: Term) -> Term
+    decreases t,
+{
     match t {
-        Term::Param(op, p) => if fold_rule(p) == 0 { Term::Param(op, p) } else { Term::Node },
+        // The op gate is part of the analysis: only `#`, `##`, `%`, `%%`
+        // (codes 0..3) are strip ops. A pattern with another op is not a
+        // fold site even when `fold_rule` would claim the shape.
+        Term::Param(op, p) => if fold_rule(p) == 0 || op < 0 || 3 < op {
+            Term::Param(op, p)
+        } else {
+            Term::Node
+        },
         Term::Node => Term::Node,
+        Term::Call(xs) => Term::Call(fold_ss(xs)),
         Term::Other => Term::Other,
+    }
+}
+
+pub open spec fn fold_ss(xs: Seq<Term>) -> Seq<Term>
+    decreases xs,
+{
+    if xs.len() == 0 {
+        xs
+    } else {
+        seq![fold_t(xs[0])] + fold_ss(xs.drop_first())
+    }
+}
+
+/// A visited term is COVERED when no strippable `Param` survives: every
+/// fold site the analysis claims has become a node, and every child list has
+/// been visited. This is the property a forgotten recursion arm violates.
+pub open spec fn covered(t: Term) -> bool
+    decreases t,
+{
+    match t {
+        Term::Param(op, p) => fold_rule(p) == 0 || op < 0 || 3 < op,
+        Term::Node => true,
+        Term::Call(xs) => covered_s(xs),
+        Term::Other => true,
+    }
+}
+
+pub open spec fn covered_s(xs: Seq<Term>) -> bool
+    decreases xs,
+{
+    if xs.len() == 0 {
+        true
+    } else {
+        covered(xs[0]) && covered_s(xs.drop_first())
+    }
+}
+
+proof fn fold_ss_covers(xs: Seq<Term>)
+    ensures
+        covered_s(fold_ss(xs)),
+    decreases xs,
+{
+    if xs.len() == 0 {
+    } else {
+        let h = fold_t(xs[0]);
+        let rest = fold_ss(xs.drop_first());
+        fold_t_covers(xs[0]);
+        fold_ss_covers(xs.drop_first());
+        assert(seq![h].add(rest)[0] == h);
+        assert(seq![h].add(rest).drop_first() == rest);
+        assert(covered_s(seq![h].add(rest)));
+    }
+}
+
+/// COVERAGE: one visit folds every strippable fold site, at every depth.
+/// A forgotten `Call` arm in `fold_t` leaves a nested `Param` behind and
+/// this obligation goes red.
+pub proof fn fold_t_covers(t: Term)
+    ensures
+        covered(fold_t(t)),
+    decreases t,
+{
+    match t {
+        Term::Param(op, p) => {
+            if fold_rule(p) == 0 || op < 0 || 3 < op {
+            } else {
+                assert(covered(Term::Node));
+            }
+        }
+        Term::Node => {}
+        Term::Call(xs) => {
+            fold_ss_covers(xs);
+        }
+        Term::Other => {}
+    }
+}
+
+// ──────────────────────────── REFINEMENT: the rewrite keeps the value ──
+//
+// `preserved` relates the term before the visit (`Param` / `Call`) to the
+// term after it: a folded literal's node value is the semantic scan's
+// value (the laws above), a star shape carries its own value laws, and the
+// argument lists are related pointwise.
+pub open spec fn preserved(t: Term, u: Term, s: Seq<char>) -> bool
+    decreases t,
+{
+    match (t, u) {
+        (Term::Param(op, p), Term::Node) => {
+            (0 <= op && op <= 1 && 0 < p.len() && lit_free(p)
+                && bash_prefix_strip(s, p, op == 1) == strip_prefix_lit(s, p))
+                || (2 <= op && op <= 3 && 0 < p.len() && lit_free(p)
+                    && bash_suffix_strip(s, p, op == 3) == strip_suffix_lit(s, p))
+                || single_star_shape(p)
+        }
+        (Term::Param(_, _), Term::Param(_, _)) => true,
+        (Term::Node, Term::Node) => true,
+        (Term::Other, Term::Other) => true,
+        (Term::Call(a), Term::Call(b)) => preserved_s(a, b, s),
+        _ => false,
+    }
+}
+
+pub open spec fn preserved_s(a: Seq<Term>, b: Seq<Term>, s: Seq<char>) -> bool
+    decreases a,
+{
+    a.len() == b.len()
+        && (if a.len() == 0 {
+            true
+        } else {
+            preserved(a[0], b[0], s) && preserved_s(a.drop_first(), b.drop_first(), s)
+        })
+}
+
+proof fn fold_ss_len(xs: Seq<Term>)
+    ensures
+        fold_ss(xs).len() == xs.len(),
+    decreases xs,
+{
+    if xs.len() != 0 {
+        fold_ss_len(xs.drop_first());
+    }
+}
+
+proof fn fold_ss_preserves(xs: Seq<Term>, s: Seq<char>)
+    ensures
+        preserved_s(xs, fold_ss(xs), s),
+    decreases xs,
+{
+    if xs.len() == 0 {
+    } else {
+        let h = fold_t(xs[0]);
+        let rest = fold_ss(xs.drop_first());
+        fold_t_preserves(xs[0], s);
+        fold_ss_preserves(xs.drop_first(), s);
+        fold_ss_len(xs);
+        assert(fold_ss(xs) == seq![h].add(rest));
+        assert(fold_ss(xs)[0] == h);
+        assert(fold_ss(xs).drop_first() == rest);
+        assert(preserved_s(xs, fold_ss(xs), s));
+    }
+}
+
+pub proof fn fold_t_preserves(t: Term, s: Seq<char>)
+    ensures
+        preserved(t, fold_t(t), s),
+    decreases t,
+{
+    match t {
+        Term::Param(op, p) => {
+            if fold_rule(p) == 0 || op < 0 || 3 < op {
+                assert(preserved(t, Term::Param(op, p), s));
+            } else {
+                fold_rule_sound(p);
+                if 0 < p.len() && lit_free(p) {
+                    if op <= 1 {
+                        fold_preserves_value(s, p);
+                    } else if 2 <= op && op <= 3 {
+                        fold_preserves_value_suffix(s, p);
+                    }
+                } else {
+                    assert(single_star_shape(p));
+                }
+            }
+        }
+        Term::Node => {}
+        Term::Call(xs) => {
+            fold_ss_preserves(xs, s);
+        }
+        Term::Other => {}
+    }
+}
+
+proof fn fold_ss_idempotent(xs: Seq<Term>)
+    ensures
+        fold_ss(fold_ss(xs)) == fold_ss(xs),
+    decreases xs,
+{
+    if xs.len() != 0 {
+        let h = fold_t(xs[0]);
+        let rest = fold_ss(xs.drop_first());
+        fold_is_idempotent(xs[0]);
+        fold_ss_idempotent(xs.drop_first());
+        assert(fold_ss(xs) == seq![h].add(rest));
+        assert(seq![h].add(rest)[0] == h);
+        assert(seq![h].add(rest).drop_first() == rest);
+        assert(fold_ss(seq![h].add(rest)) == seq![fold_t(h)].add(fold_ss(rest)));
+        assert(fold_t(h) == h);
+        assert(fold_ss(rest) == rest);
     }
 }
 
 /// CONVERGENCE: a second visit is the identity. The reason is structural —
 /// the fold produces a NODE, the node is not a `param(…)` call, so `fold_rule`
 /// is never consulted for the fold's own output and the rewrite cannot
-/// oscillate between shapes.
+/// oscillate between shapes. The `Call` arm makes the visit a real
+/// recursion: its children are visited, and a second visit reaches the same
+/// fixed point.
 pub proof fn fold_is_idempotent(t: Term)
     ensures
         fold_t(fold_t(t)) == fold_t(t),
+    decreases t,
 {
     match t {
         Term::Param(_op, _p) => {}
         Term::Node => {}
+        Term::Call(xs) => {
+            fold_ss_idempotent(xs);
+        }
         Term::Other => {}
     }
 }
@@ -752,6 +1046,56 @@ pub proof fn pin_star_shape()
     assert(!single_star_shape(seq!['a', 'b'])) by (compute);
     assert(star_is_first(seq!['*', 'l', 'i', 't'])) by (compute);
     assert(!star_is_first(seq!['l', 'i', 't', '*'])) by (compute);
+}
+
+// ── pins for the analysis recursion (each one computes) ──
+
+/// A fold site nested under a `Call`: the visit descends into the arguments.
+/// A forgotten `Call` arm leaves the `Param` unfolded and this pin is false.
+pub open spec fn nested_site() -> Term {
+    Term::Call(seq![Term::Other, Term::Param(0, seq!['a', 'b'])])
+}
+
+pub proof fn pin_nested_site_is_visited()
+    ensures
+        fold_t(nested_site()) == Term::Call(seq![Term::Other, Term::Node]),
+        covered(fold_t(nested_site())),
+{
+    assert(fold_t(nested_site()) == Term::Call(seq![Term::Other, Term::Node])) by (compute);
+    fold_t_covers(nested_site());
+}
+
+/// A middle star is not a strip shape: `fold_rule` refuses it and the
+/// semantic domain does not contain it.
+pub proof fn pin_middle_star_is_refused()
+    ensures
+        fold_rule(seq!['a', '*', 'b']) == 0,
+        !strippable(seq!['a', '*', 'b']),
+{
+    assert(fold_rule(seq!['a', '*', 'b']) == 0) by (compute);
+    assert(!strippable(seq!['a', '*', 'b'])) by (compute);
+}
+
+/// A one-star shape whose BODY contains glob magic is still refused: the
+/// shape gate alone is not enough (the source checks the body too).
+pub proof fn pin_star_body_magic_is_refused()
+    ensures
+        single_star_shape(seq!['*', '?', 'x']),
+        fold_rule(seq!['*', '?', 'x']) == 0,
+{
+    assert(single_star_shape(seq!['*', '?', 'x'])) by (compute);
+    assert(fold_rule(seq!['*', '?', 'x']) == 0) by (compute);
+}
+
+/// The op gate: a strip-shaped pattern is folded only for `#`, `##`, `%`,
+/// `%%` (codes 0..3); another op stays a call.
+pub proof fn pin_non_strip_op_is_not_a_site()
+    ensures
+        fold_t(Term::Param(2, seq!['.', 't', 'x', 't'])) == Term::Node,
+        fold_t(Term::Param(9, seq!['a'])) == Term::Param(9, seq!['a']),
+{
+    assert(fold_t(Term::Param(2, seq!['.', 't', 'x', 't'])) == Term::Node) by (compute);
+    assert(fold_t(Term::Param(9, seq!['a'])) == Term::Param(9, seq!['a'])) by (compute);
 }
 
 fn main() {}

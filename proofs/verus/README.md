@@ -8936,10 +8936,10 @@ run (sha256 in `uae_terminators_sync.txt`).
   rebuilding, and the other consumers of the verdict (they read the same
   functions, so a verdict change is the same theorem).
 
-## affix_strip_fold.rs — `${v#lit}` is one `strip_prefix` (32)
+## affix_strip_fold.rs — `${v#lit}` is one `strip_prefix` (51)
 
     verus --triggers-mode silent --rlimit 40 proofs/verus/affix_strip_fold.rs
-    -> verification results:: 32 verified, 0 errors
+    -> verification results:: 51 verified, 0 errors
 
 The fold turns `param("#"|"##"|"%"|"%%", NAME, PAT)` into one `AffixStrip`
 node when `PAT` is a magic-free literal. That is only sound because bash's
@@ -8968,6 +8968,26 @@ instead of assuming the closed form.
   literal branch and the star branch cannot both claim one pattern and the
   rule choice is a function of the pattern, not of visit order.
 
+### The pass's analysis, as its own recursion
+
+The value laws above check the NODE against bash's scan; they do not say the
+pass's own walk reaches every fold site or that its shape classifier claims
+exactly the strippable patterns. The pass is modelled a second time, as a
+recursion (`fold_t`/`fold_ss`) over a term tree whose `Call` node carries the
+argument list, and checked against the semantic domain (`strippable`, written
+from bash's rules — literal, or one end-pinned star with a magic-free body):
+
+- **`fold_rule_covers`**: every strippable pattern is claimed. A shape
+  branch forgotten in the classifier makes this red.
+- **`fold_rule_sound`**: nothing bash cannot strip is claimed — the empty
+  pattern, a middle star, and a star with a `?`/`[`/`\` body all stay out.
+- **`fold_t_covers`**: one visit folds every strippable site at every depth.
+  A forgotten `Call`/child arm leaves a nested `Param` behind and this is
+  red.
+- **`fold_t_preserves`**: each rewritten site keeps the semantic value
+  (`preserved`, pointwise through the argument lists), so a wrong op mapping
+  is red. The op gate (`#`/`##`/`%`/`%%` only) is part of the model.
+
 ### The pins
 
 `pin_double_star_differs` is the table's negative control: on `a/x/b/x`,
@@ -8975,18 +8995,26 @@ instead of assuming the closed form.
 `${p%/*}` / `${p##*/}`; `pin_no_occurrence_is_the_value` the no-match rule;
 `pin_empty_body_star` the `%*` identity; `pin_magic_is_refused` and
 `pin_star_shape` the two refusals (`*`/`?`/`[`/`\`, and a middle star, a
-second star, or no star at all).
+second star, or no star at all). The analysis recursion adds
+`pin_nested_site_is_visited` (a fold site under a `Call` is rewritten by the
+visit), `pin_middle_star_is_refused`, `pin_star_body_magic_is_refused` (the
+shape gate is not enough — the body is checked too), and
+`pin_non_strip_op_is_not_a_site` (a non-strip op stays a call).
 
 ### Mutants, measured
 
 Counted: making the fold's output re-enter the rewritable class (a `Node`
-that is itself a `param(…)` call) gives **31 verified, 1 error**, in
-`fold_is_idempotent` — the convergence law is load-bearing. Refuted at
+that is itself a `param(…)` call) gives **48 verified, 3 errors** — in
+`fold_t_covers`, `fold_t_preserves` and `fold_is_idempotent`, so both the
+coverage and the convergence laws are load-bearing. Refuted at
 simplification by a concrete pin: stripping the affix without checking it is
 present and over-stripping one character past it
-(`pin_literal_one_length`), and `*` no longer counted as glob magic
-(`pin_magic_is_refused`). Restored byte-identically after each run (sha256 in
-`affix_strip_fold_sync.txt`).
+(`pin_literal_one_length`), `*` no longer counted as glob magic
+(`pin_magic_is_refused`), the visit forgetting a call's arguments
+(`pin_nested_site_is_visited`), the classifier forgetting the literal branch
+(same pin), and the classifier accepting a middle star
+(`pin_middle_star_is_refused`). Restored byte-identically after each run
+(sha256 in `affix_strip_fold_sync.txt`).
 
 ### Scope (read this before quoting it)
 
@@ -9000,10 +9028,13 @@ present and over-stripping one character past it
   `cut_target_ok`) are not modelled: they decide whether the fold is
   offered, never its value. Their refusals are the source's own tests.
 - The empty-body arms (`%*` identity, `%%*` empty) are value-level pins.
-- The traversal is not modelled: `transform` is ONE bottom-up visit with no
-  fixpoint loop, so convergence is `fold_is_idempotent` (a second visit is
-  the identity) rather than a termination proof of a loop that does not
-  exist.
+- The traversal is modelled at the argument-list level (`Term::Call` /
+  `fold_ss`): the visit is ONE bottom-up pass with no fixpoint loop, so
+  convergence is `fold_is_idempotent` (a second visit is the identity) rather
+  than a termination proof of a loop that does not exist, and
+  `fold_t_covers` is the reachability fact. The statement/expression KINDS
+  are not modelled one-for-one (they reduce to "a node with children"); the
+  model checks that no child is skipped.
 - The op × shape table is not modelled: `fold_rule` keys on the pattern,
   because both replacement families are value-equal wherever they apply.
   Which of the eight op/shape pairs the source refuses (`## lit*`, `%% *lit`

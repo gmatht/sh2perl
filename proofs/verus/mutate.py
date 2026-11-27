@@ -62,7 +62,7 @@ HERE = os.path.dirname(os.path.abspath(__file__))
 # proof file -> leading 12 hex of sha256, the same digest the `*_sync.txt`
 # manifests record.  A mismatch means the proof changed under the claims.
 PROOF_SHA = {
-    "affix_strip_fold": "402308d8cd04",
+    "affix_strip_fold": "3b53272ba452",
     "text_capture_fold": "72e022116f2b",
     "bc_float_clean": "8a1fe6ed7371",
     "uae_terminators": "300c286819f1",
@@ -72,7 +72,7 @@ PROOF_SHA = {
 
 # proof file -> obligations the pristine run reports (header baseline).
 BASELINE = {
-    "affix_strip_fold": 32,
+    "affix_strip_fold": 51,
     "text_capture_fold": 31,
     "bc_float_clean": 27,
     "uae_terminators": 31,
@@ -137,8 +137,32 @@ MUTANTS = [
         "affix_strip_fold",
         "        Term::Node => Term::Node,",
         "        Term::Node => Term::Param(1, seq!['a']),",
-        31, 1, ("fold_is_idempotent",),
+        48, 3, ("fold_t_covers", "fold_t_preserves", "fold_is_idempotent"),
         "the fold's output re-enters the rewritable class",
+    ),
+    Mutant(
+        "affix/m5-visit-forgets-call-arguments",
+        "affix_strip_fold",
+        "        Term::Call(xs) => Term::Call(fold_ss(xs)),",
+        "        Term::Call(xs) => Term::Call(xs),",
+        None, None, ("pin_nested_site_is_visited",),
+        "the visit forgets to descend into a call's arguments",
+    ),
+    Mutant(
+        "affix/m6-classifier-forgets-literals",
+        "affix_strip_fold",
+        "    if 0 < p.len() && lit_free(p) {\n        1\n    } else if single_star_shape(p) && no_hard_magic(p) {",
+        "    if 0 < p.len() && lit_free(p) {\n        0\n    } else if single_star_shape(p) && no_hard_magic(p) {",
+        None, None, ("pin_nested_site_is_visited",),
+        "the shape classifier forgets the literal branch",
+    ),
+    Mutant(
+        "affix/m7-classifier-accepts-a-middle-star",
+        "affix_strip_fold",
+        "    } else if single_star_shape(p) && no_hard_magic(p) {\n        2",
+        "    } else if count_star(p) == 1 && no_hard_magic(p) {\n        2",
+        None, None, ("pin_middle_star_is_refused",),
+        "the shape classifier accepts a middle star",
     ),
     # ── text_capture_fold.rs — baseline 31/0 ────────────────────────────────
     Mutant(
