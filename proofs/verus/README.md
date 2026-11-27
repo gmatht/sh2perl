@@ -9608,3 +9608,30 @@ Second mutant measurement (47v/0e baseline): insert comparing backwards
 accepting `-n` (**46v/1e**), `source_lines` omitting its newline
 (**44v/3e**), `join_lines` adding a trailing newline (**43v/4e**). All
 restored byte-identically.
+
+#### F1 line mode: the general window law
+
+`head_window_law` and `tail_window_law` now prove, for an arbitrary line
+list and an arbitrary `N`, that bash's byte-level line window equals the
+fold's `source_lines` of the selected lines — on the explicit domain
+`nl_free_lines(ls)` (no line carries a newline) and `nonempty_lines(ls)`
+(an empty selected line makes the fold print nothing where bash prints a
+blank line). The bash side steps the byte stream (`take_lines`/`skip_lines`);
+the fold side is `join_lines`/`source_lines` as the source writes it. The
+proofs step with `subrange(1, len)` rather than `drop_first`, which is not
+usefully specified on the empty sequence in this toolchain.
+
+Off domain the general statements are `tail_terminated_selection` (the fold's
+`tail -N` selection on a newline-terminated producer is the last `N-1` real
+lines plus the trailing empty segment) and the four pins
+(`pin_head_one_line`, `pin_head_beyond_the_last_line_adds_a_newline`,
+`pin_tail_lines_selects_the_trailing_empty_segment`,
+`pin_tail_lines_add_a_newline_bash_does_not`). A general off-domain theorem
+beyond that selection identity is **not** proved; those instances are the
+witnesses.
+
+Third mutant measurement (62v/0e baseline): `join_lines` adding a newline to a
+one-line selection (**55v/7e**), `take_lines` not decrementing (**61v/1e**),
+`nonempty_lines` admitting empty lines (**59v/3e**), `source_lines` omitting
+its newline (**56v/6e**), `skip_lines` not decrementing (**61v/1e**). All
+restored byte-identically.

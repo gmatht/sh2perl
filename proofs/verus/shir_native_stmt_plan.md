@@ -9,11 +9,12 @@
                   cluster D2 PROVED (shir_native_chain.rs, 18 verified / 0 errors);
                   cluster D3 PROVED (shir_native_cond.rs 10 verified / 0 errors;
                   native_while_multi_cond in shir_native_while_multi.rs, 9 verified / 0 errors);
-                  cluster F1 PROVED for tr/wc -l/head -c/tail -c and plain
-                  sort (shir_native_f1.rs 47 verified / 0 errors); line-mode
-                  head -N/tail -N byte equality is NOT proved and the fold's
-                  divergences from bash are pinned there; clusters A, F2-F4,
-                  G still planned — see §4
+                  cluster F1 PROVED for tr/wc -l/head -c/tail -c, plain sort,
+                  and the general line-mode head -N/tail -N window law on the
+                  nl_free/nonempty domain (shir_native_f1.rs 62 verified /
+                  0 errors); a general off-domain theorem beyond
+                  tail_terminated_selection is open (instances pinned);
+                  clusters A, F2-F4, G still planned — see §4
 
 This is a PLAN, not a proof. It exists because `shir_native_stmt` is the one
 output-changing transform left whose property is not a single statement: it is

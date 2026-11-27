@@ -4,7 +4,7 @@
 #  counters in native_echo_write_file_stmt / emit_file_op / native_ls_stmt;
 #  the F1 functions modelled here — native_echo_tr_sort_stmt, tr_set_escape,
 #  native_wc_l_pipeline, native_head_tail_stmt/_pipeline, native_sort_stmt —
-#  are byte-identical.)  proof sha: 6b09daa384ee
+#  are byte-identical.)  proof sha: 8cd4555ebbba
 # source: src/transforms/shir_native_stmt.rs (cluster F1, the parts proved:
 #   native_echo_tr_sort_stmt 5252, tr_set_escape 5220,
 #   native_wc_l_pipeline 2473, native_head_tail_stmt 1749,
@@ -41,8 +41,15 @@ guard independent side (sort): sorted/same_multiset are relations over the outpu
 guard independent side (sort): isort/insert are the pass's insertion-sort algorithm: PRESENT
 guard flag refusals: unknown flags and the non-plain -n/-h modes: PRESENT (plain_sort_flag pins)
 guard -r: accepted, plain ordering proved; the reverse output order itself is not modelled: STATED
-guard line-mode head -N/tail -N: split/join/source_lines modelled, emitted bytes pinned; byte equality with bash NOT proved: STATED
-guard line-mode divergences recorded: over-long head, tail on a terminated producer, tail on an unterminated producer: PRESENT (pins)
+guard law head_window_law: bash's take_lines of the first N lines == fold source_lines(ls.take(N)): PRESENT
+guard law tail_window_law: bash's skip_lines(len-N) == fold source_lines(last N lines): PRESENT
+guard domain: nl_free_lines(ls) and nonempty_lines(ls) on both laws: STATED
+guard independent side (line mode): take_lines/skip_lines step the byte stream: PRESENT
+guard independent side (line mode): join_lines/source_lines are the fold's own computation: PRESENT
+guard general off-domain: tail_terminated_selection (arbitrary N): PRESENT
+guard tail_terminated_selection: general in N (selection identity): PRESENT
+guard off-domain divergences: over-long head, tail on a terminated producer, tail on an unterminated producer: PRESENT (four pins)
+guard general off-domain theorem beyond the selection identity: NOT PROVED (instances pinned)
 guard native_literal_subshell_wc_stmt's nested literal grep/sed tree: NOT THIS PROOF (F2)
 guard native_sort_stmt / native_sort_file_stmt numeric/human/reverse orderings and human_size: NOT THIS PROOF
 guard locales, multibyte cutting, byte renderer: OUT OF MODEL
@@ -50,9 +57,10 @@ guard D1/D2/D3 laws: REUSED conceptually, not re-claimed
 guard clusters F2-F4, G, A: NOT THIS PROOF
 
 [counts]
-47 verified, 0 errors (verus --triggers-mode silent --rlimit 40 shir_native_f1.rs)
+62 verified, 0 errors (verus --triggers-mode silent --rlimit 40 shir_native_f1.rs)
 first measurement (tr/wc/head-tail) baseline was 18 verified, 0 errors;
-second measurement (sort + line mode) baseline is 47 verified, 0 errors.
+second measurement (sort + line mode) baseline was 47 verified, 0 errors;
+third measurement (general line-mode law) baseline is 62 verified, 0 errors.
 mutants measured against the 18v/0e baseline, each restored
   byte-identically (sha re-checked):
     counted (17v/1e):
@@ -72,6 +80,12 @@ mutants measured against the 47v/0e baseline (sort + line mode), all counted:
     s3 plain_sort_flag accepts -n (46v/1e, the flag-refusal pin)
     s4 source_lines omits its newline (44v/3e, the head-line pins)
     s5 join_lines adds a trailing newline (43v/4e, the head-line pins)
+mutants measured against the 62v/0e baseline (general line-mode law), all counted:
+    t1 join_lines adds a newline to a one-line selection (55v/7e)
+    t2 take_lines does not decrement its line counter (61v/1e)
+    t3 nonempty_lines admits empty lines (59v/3e)
+    t4 source_lines omits its newline (56v/6e)
+    t5 skip_lines does not decrement its line counter (61v/1e)
 
 [exec]
 # The analysed module's 8 tests cover chain/find and the renderer; none

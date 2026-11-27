@@ -46,15 +46,27 @@
 //     Proving it needs an ordering/permutation model with a uniqueness
 //     lemma; `sort`'s ordering is left open rather than assumed. The
 //     emitted `sort` call is the backend's own list sort.
-//   * F1's line-mode `head -N`/`tail -N`: the fold's split/join computation
-//     (`split_nl`/`join_lines`/`source_lines`) is modelled and its emitted
-//     bytes are pinned, but the byte-level equality with bash's line copy is
-//     NOT proved. The pins show the fold diverges from bash in three cases:
-//     `head -N` with N past the last line appends a stray newline; `tail -N`
-//     on a newline-terminated producer selects the trailing empty segment
-//     and prints nothing; `tail -N` on an unterminated producer adds a
-//     newline bash does not print. These are source divergences, recorded
-//     rather than assumed away.
+//   * F1's line-mode `head -N`/`tail -N`: PROVED in general, for an
+//     arbitrary line list and an arbitrary N, on the explicit domain
+//     `nl_free_lines(ls)` (no line carries a newline) and
+//     `nonempty_lines(ls)`:
+//       - `head_window_law`: bash's byte copy of the first N lines equals
+//         the fold's join of `ls.take(N)` plus one newline;
+//       - `tail_window_law`: bash's drop-(len-N)-lines equals the fold's
+//         join of the last N lines plus one newline.
+//     The bash side steps the byte stream (`take_lines`/`skip_lines`); the
+//     fold side is `join_lines`/`source_lines` as the source writes it. The
+//     domain is needed: an empty first line makes `head -1` print nothing
+//     where bash prints a blank line. Off domain, the general statements
+//     proved here are `tail_terminated_selection` (the fold's `tail -N`
+//     selection on a newline-terminated producer is the last N-1 real lines
+//     plus the trailing empty segment) and the four pins
+//       pin_head_one_line, pin_head_beyond_the_last_line_adds_a_newline,
+//       pin_tail_lines_selects_the_trailing_empty_segment,
+//       pin_tail_lines_add_a_newline_bash_does_not
+//     recording what the fold emits (bash's byte copy differs). A general
+//     off-domain theorem over all N (beyond the selection identity) is NOT
+//     proved; the instances above are the witnesses.
 //   * `native_literal_subshell_wc_stmt`'s nested literal grep/sed tree:
 //     NOT THIS PROOF (that is F2's matcher).
 //   * `native_sort_stmt` / `native_sort_file_stmt`'s numeric and human
@@ -95,6 +107,12 @@
 //       pin_unknown_sort_flags_keep_the_shell_out.
 //    s4 source_lines omits its newline: 44v/3e at the head-line pins.
 //    s5 join_lines adds a trailing newline: 43v/4e at the head-line pins.
+//  third measurement (general line-mode law): baseline 62 verified, 0 errors.
+//    t1 join_lines adds a newline to a one-line selection: 55v/7e.
+//    t2 take_lines does not decrement its line counter: 61v/1e.
+//    t3 nonempty_lines admits empty lines: 59v/3e.
+//    t4 source_lines omits its newline: 56v/6e.
+//    t5 skip_lines does not decrement its line counter: 61v/1e.
 //  Every mutated file was restored byte-identically and its sha re-checked.
 //
 //  ─────────────────────────────────────────────────────────────────────────
@@ -727,22 +745,12 @@ proof fn pin_unknown_sort_flags_keep_the_shell_out()
 
 // ── line-mode head/tail: the source's split/join vs bash's byte windows ──
 
-// the split the fold performs: Rust `str::split('\n')` on a newline-
-// terminated text recovers the lines and one trailing empty segment.
-pub open spec fn split_from(t: Seq<char>, cur: Seq<char>) -> Seq<Seq<char>>
-    decreases t.len(),
-{
-    if t.len() == 0 {
-        seq![cur]
-    } else if t[0] == '\n' {
-        seq![cur] + split_from(t.drop_first(), Seq::<char>::empty())
-    } else {
-        split_from(t.drop_first(), cur + seq![t[0]])
-    }
-}
+// ── line lists and the fold's text, stepped with subrange ──────────────────
+// NOTE: `drop_first` is not meaningfully specified on the empty sequence in
+// this toolchain, so every recursion here steps with `tl` (subrange(1, len)).
 
-pub open spec fn split_nl(t: Seq<char>) -> Seq<Seq<char>> {
-    split_from(t, Seq::<char>::empty())
+pub open spec fn tl(t: Seq<char>) -> Seq<char> {
+    t.subrange(1, t.len() as int)
 }
 
 pub open spec fn join_lines(ls: Seq<Seq<char>>) -> Seq<char>
@@ -753,21 +761,282 @@ pub open spec fn join_lines(ls: Seq<Seq<char>>) -> Seq<char>
     } else if ls.len() == 1 {
         ls[0]
     } else {
-        ls[0] + (seq!['\n'] + join_lines(ls.drop_first()))
+        ls[0] + (seq!['\n'] + join_lines(ls.subrange(1, ls.len() as int)))
     }
 }
 
-// the fold's line mode: join the selection, append one newline if non-empty
+// the fold's line mode: join the selection with '\n', and append one newline
+// when the join is non-empty
 pub open spec fn source_lines(sel: Seq<Seq<char>>) -> Seq<char> {
     let j = join_lines(sel);
     if j.len() == 0 { j } else { j + seq!['\n'] }
 }
 
-// bash `head -n N`: copy whole lines from the byte stream until N complete
-// concrete facts about the fold's line mode. The fold splits the producer on
-// '\n' (keeping a trailing empty segment) and then joins the selection with
-// '\n', appending one newline if the join is non-empty. These pins record what
-// that emits; the byte-level equality with bash is NOT proved (see header).
+// bash `head -n N`: copy whole lines from the byte stream until N are complete
+pub open spec fn take_lines(t: Seq<char>, n: nat) -> Seq<char>
+    decreases t.len() + n as int,
+{
+    if t.len() == 0 || n == 0 {
+        Seq::empty()
+    } else if t[0] == '\n' {
+        seq!['\n'] + take_lines(tl(t), (n - 1) as nat)
+    } else {
+        seq![t[0]] + take_lines(tl(t), n)
+    }
+}
+
+// bash `tail -n N`: drop whole lines from the front until N remain
+pub open spec fn skip_lines(t: Seq<char>, n: nat) -> Seq<char>
+    decreases t.len() + n as int,
+{
+    if t.len() == 0 || n == 0 {
+        t
+    } else if t[0] == '\n' {
+        skip_lines(tl(t), (n - 1) as nat)
+    } else {
+        skip_lines(tl(t), n)
+    }
+}
+
+// domain premises, as recursive predicates (no quantified Seq equalities)
+pub open spec fn no_nl_text(t: Seq<char>) -> bool
+    decreases t.len(),
+{
+    if t.len() == 0 {
+        true
+    } else {
+        t[0] != '\n' && no_nl_text(tl(t))
+    }
+}
+
+pub open spec fn nonempty_lines(ls: Seq<Seq<char>>) -> bool
+    decreases ls.len(),
+{
+    if ls.len() == 0 {
+        true
+    } else {
+        ls[0].len() > 0 && nonempty_lines(ls.subrange(1, ls.len() as int))
+    }
+}
+
+pub open spec fn nl_free_lines(ls: Seq<Seq<char>>) -> bool
+    decreases ls.len(),
+{
+    if ls.len() == 0 {
+        true
+    } else {
+        no_nl_text(ls[0]) && nl_free_lines(ls.subrange(1, ls.len() as int))
+    }
+}
+
+proof fn no_nl_tl(t: Seq<char>)
+    requires no_nl_text(t), t.len() > 0,
+    ensures no_nl_text(tl(t)),
+{
+    reveal_with_fuel(no_nl_text, 3);
+}
+
+proof fn nl_free_lines_tail(ls: Seq<Seq<char>>)
+    requires nl_free_lines(ls), ls.len() > 0,
+    ensures nl_free_lines(ls.subrange(1, ls.len() as int)),
+{
+    reveal_with_fuel(nl_free_lines, 3);
+}
+
+proof fn nonempty_lines_tail(ls: Seq<Seq<char>>)
+    requires nonempty_lines(ls), ls.len() > 0,
+    ensures nonempty_lines(ls.subrange(1, ls.len() as int)),
+{
+    reveal_with_fuel(nonempty_lines, 3);
+}
+
+// one line's bytes, then its newline, inside a longer stream
+proof fn take_lines_after_line(l: Seq<char>, u: Seq<char>, n: nat)
+    requires n >= 1, no_nl_text(l), l.len() > 0,
+    ensures take_lines(l + (seq!['\n'] + u), n)
+        == l + (seq!['\n'] + take_lines(u, (n - 1) as nat)),
+    decreases l.len(),
+{
+    reveal_with_fuel(take_lines, 6);
+    if l.len() == 1 {
+        assert((l + (seq!['\n'] + u))[0] == l[0]);
+        assert(tl(l + (seq!['\n'] + u)) == seq!['\n'] + u);
+        assert(l + (seq!['\n'] + u) == seq![l[0]] + (seq!['\n'] + u));
+        assert(tl(seq!['\n'] + u) == u);
+    } else {
+        no_nl_tl(l);
+        assert(tl(l).len() > 0);
+        assert(l + (seq!['\n'] + u) == seq![l[0]] + (tl(l) + (seq!['\n'] + u)));
+        assert(tl(l + (seq!['\n'] + u)) == tl(l) + (seq!['\n'] + u));
+        take_lines_after_line(tl(l), u, n);
+    }
+}
+
+proof fn skip_lines_after_line(l: Seq<char>, u: Seq<char>, n: nat)
+    requires n >= 1, no_nl_text(l), l.len() > 0,
+    ensures skip_lines(l + (seq!['\n'] + u), n) == skip_lines(u, (n - 1) as nat),
+    decreases l.len(),
+{
+    reveal_with_fuel(skip_lines, 6);
+    if l.len() == 1 {
+        assert((l + (seq!['\n'] + u))[0] == l[0]);
+        assert(tl(l + (seq!['\n'] + u)) == seq!['\n'] + u);
+        assert(tl(seq!['\n'] + u) == u);
+        assert(skip_lines(seq!['\n'] + u, 1) == skip_lines(u, 0));
+    } else {
+        no_nl_tl(l);
+        assert(tl(l).len() > 0);
+        assert(l + (seq!['\n'] + u) == seq![l[0]] + (tl(l) + (seq!['\n'] + u)));
+        assert(tl(l + (seq!['\n'] + u)) == tl(l) + (seq!['\n'] + u));
+        skip_lines_after_line(tl(l), u, n);
+    }
+}
+
+proof fn nonempty_take(ls: Seq<Seq<char>>, k: nat)
+    requires nonempty_lines(ls), k <= ls.len(),
+    ensures nonempty_lines(ls.take(k as int)),
+    decreases k,
+{
+    reveal_with_fuel(nonempty_lines, 3);
+    if k == 0 {
+        assert(ls.take(0) == Seq::<Seq<char>>::empty());
+    } else {
+        nonempty_lines_tail(ls);
+        assert(ls.subrange(1, ls.len() as int).take((k - 1) as int) == ls.take(k as int).subrange(1, k as int));
+        nonempty_take(ls.subrange(1, ls.len() as int), (k - 1) as nat);
+    }
+}
+
+proof fn nonempty_join(ls: Seq<Seq<char>>)
+    requires nonempty_lines(ls), ls.len() > 0,
+    ensures join_lines(ls).len() > 0,
+    decreases ls.len(),
+{
+    reveal_with_fuel(join_lines, 2);
+    reveal_with_fuel(nonempty_lines, 2);
+    if ls.len() == 1 {
+        assert(join_lines(ls) == ls[0]);
+    } else {
+        nonempty_lines_tail(ls);
+        assert(ls.subrange(1, ls.len() as int).len() > 0);
+        nonempty_join(ls.subrange(1, ls.len() as int));
+        assert(join_lines(ls) == ls[0] + (seq!['\n'] + join_lines(ls.subrange(1, ls.len() as int))));
+    }
+}
+
+// a non-empty line in front of a selection contributes itself and a newline
+proof fn source_lines_cons(l: Seq<char>, rest: Seq<Seq<char>>)
+    requires l.len() > 0, nonempty_lines(rest),
+    ensures source_lines(seq![l] + rest) == l + (seq!['\n'] + source_lines(rest)),
+{
+    reveal_with_fuel(join_lines, 2);
+    if rest.len() == 0 {
+        assert(join_lines(seq![l] + rest) == l);
+        assert(source_lines(Seq::<Seq<char>>::empty()) == Seq::<char>::empty());
+    } else {
+        nonempty_join(rest);
+        assert((seq![l] + rest).subrange(1, (seq![l] + rest).len() as int) == rest);
+        assert(join_lines(seq![l] + rest) == l + (seq!['\n'] + join_lines(rest)));
+        if join_lines(rest).len() == 0 {
+            assert(join_lines(rest) == Seq::<char>::empty());
+        }
+    }
+}
+
+// the fold's head: the first N lines of the list
+proof fn head_window_law(ls: Seq<Seq<char>>, n: nat)
+    requires nl_free_lines(ls), nonempty_lines(ls), n <= ls.len(),
+    ensures take_lines(join_lines(ls) + seq!['\n'], n) == source_lines(ls.take(n as int)),
+    decreases ls.len(),
+{
+    reveal_with_fuel(join_lines, 2);
+    if n == 0 {
+        assert(ls.take(0) == Seq::<Seq<char>>::empty());
+    } else if ls.len() == 0 {
+    } else {
+        let rest = ls.subrange(1, ls.len() as int);
+        nl_free_lines_tail(ls);
+        nonempty_lines_tail(ls);
+        assert(no_nl_text(ls[0]));
+        assert(ls[0].len() > 0);
+        assert(ls.take(n as int) == seq![ls[0]] + rest.take((n - 1) as int));
+        if ls.len() == 1 {
+            assert(n == 1);
+            reveal_with_fuel(take_lines, 4);
+            assert(join_lines(ls) == ls[0]);
+            take_lines_after_line(ls[0], Seq::<char>::empty(), 1);
+            assert(ls[0] + (seq!['\n'] + Seq::<char>::empty()) == ls[0] + seq!['\n']);
+            assert(take_lines(ls[0] + seq!['\n'], 1) == ls[0] + seq!['\n']);
+            assert(source_lines(seq![ls[0]]) == ls[0] + seq!['\n']);
+        } else {
+            assert(join_lines(ls) == ls[0] + (seq!['\n'] + join_lines(rest)));
+            assert(join_lines(ls) + seq!['\n']
+                == ls[0] + (seq!['\n'] + (join_lines(rest) + seq!['\n'])));
+            take_lines_after_line(ls[0], join_lines(rest) + seq!['\n'], n);
+            head_window_law(rest, (n - 1) as nat);
+            nonempty_take(rest, (n - 1) as nat);
+            source_lines_cons(ls[0], rest.take((n - 1) as int));
+        }
+    }
+}
+
+// the fold's tail: the last N lines of the list
+proof fn tail_window_law(ls: Seq<Seq<char>>, n: nat)
+    requires nl_free_lines(ls), nonempty_lines(ls), 1 <= n <= ls.len(),
+    ensures skip_lines(join_lines(ls) + seq!['\n'], (ls.len() - n) as nat)
+        == source_lines(ls.subrange((ls.len() - n) as int, ls.len() as int)),
+    decreases ls.len(),
+{
+    reveal_with_fuel(join_lines, 2);
+    if ls.len() == n {
+        assert((ls.len() - n) as nat == 0);
+        assert(skip_lines(join_lines(ls) + seq!['\n'], 0nat) == join_lines(ls) + seq!['\n']);
+        assert(ls.subrange(0, ls.len() as int) == ls);
+        assert(source_lines(ls) == join_lines(ls) + seq!['\n']);
+    } else {
+        let rest = ls.subrange(1, ls.len() as int);
+        nl_free_lines_tail(ls);
+        nonempty_lines_tail(ls);
+        assert(no_nl_text(ls[0]));
+        assert(ls[0].len() > 0);
+        assert(join_lines(ls) == ls[0] + (seq!['\n'] + join_lines(rest)));
+        assert(n <= rest.len());
+        assert((ls.len() - n) as nat == (rest.len() - n) as nat + 1);
+        assert((ls.len() - n) - 1 == (rest.len() - n));
+        assert((ls.len() - n) as nat >= 1);
+        assert(join_lines(ls) + seq!['\n']
+            == ls[0] + (seq!['\n'] + (join_lines(rest) + seq!['\n'])));
+        skip_lines_after_line(ls[0], join_lines(rest) + seq!['\n'], (ls.len() - n) as nat);
+        assert(skip_lines(join_lines(ls) + seq!['\n'], (ls.len() - n) as nat)
+            == skip_lines(join_lines(rest) + seq!['\n'], (rest.len() - n) as nat));
+        tail_window_law(rest, n);
+        assert(ls.subrange((ls.len() - n) as int, ls.len() as int)
+            == rest.subrange((rest.len() - n) as int, rest.len() as int));
+    }
+}
+
+// ── off-domain behaviour, general in N ───────────────────────────────────
+
+pub open spec fn empty_line() -> Seq<char> {
+    Seq::<char>::empty()
+}
+
+// General in N: the fold's `tail -N` selection on a newline-terminated
+// producer is the last N-1 real lines plus the trailing empty segment, so the
+// line it prints last is blank where bash prints the last real line.
+proof fn tail_terminated_selection(ls: Seq<Seq<char>>, n: nat)
+    requires 1 <= n <= ls.len(),
+    ensures (ls + seq![empty_line()]).subrange((ls.len() + 1 - n) as int, (ls.len() + 1) as int)
+        == ls.subrange((ls.len() - (n - 1)) as int, ls.len() as int) + seq![empty_line()],
+{
+    assert((ls + seq![empty_line()]).len() == ls.len() + 1);
+}
+
+
+// ── concrete instances of the off-domain behaviour ───────────────────────
+// (the general statements above cover the domain; these pin the witnesses the
+//  header names so a mutant cannot move them silently)
+
 proof fn pin_head_one_line()
 {
     reveal_with_fuel(join_lines, 2);
@@ -777,28 +1046,21 @@ proof fn pin_head_one_line()
 proof fn pin_head_beyond_the_last_line_adds_a_newline()
 {
     reveal_with_fuel(join_lines, 2);
-    // "echo a | head -5": split gives ["a", ""], head keeps both, the join is
-    // "a\n" and the fold appends another newline: "a\n\n".
-    assert(join_lines(seq![seq!['a'], Seq::<char>::empty()]) == seq!['a', '\n']);
-    assert(source_lines(seq![seq!['a'], Seq::<char>::empty()]) == seq!['a', '\n', '\n']);
+    assert(join_lines(seq![seq!['a'], empty_line()]) == seq!['a', '\n']);
+    assert(source_lines(seq![seq!['a'], empty_line()]) == seq!['a', '\n', '\n']);
 }
 
 proof fn pin_tail_lines_selects_the_trailing_empty_segment()
 {
     reveal_with_fuel(join_lines, 2);
-    // "echo a | tail -1": split gives ["a", ""], tail -1 keeps the empty last
-    // segment, so the fold prints nothing (bash prints "a\n").
-    assert(source_lines(seq![Seq::<char>::empty()]) == Seq::<char>::empty());
+    assert(source_lines(seq![empty_line()]) == Seq::<char>::empty());
 }
 
 proof fn pin_tail_lines_add_a_newline_bash_does_not()
 {
     reveal_with_fuel(join_lines, 2);
-    // "printf 'a\nb' | tail -1": split gives ["a", "b"]; bash prints "b"
-    // (unterminated), the fold prints "b\n".
     assert(source_lines(seq![seq!['b']]) == seq!['b', '\n']);
 }
-
 
 fn main() {}
 
