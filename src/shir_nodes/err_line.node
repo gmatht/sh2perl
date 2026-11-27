@@ -1,0 +1,27 @@
+# shir_nodes/err_line.node — ErrLine: write a VALUE to STDERR as one line.
+#
+# GENERIC. The typed counterpart of a stdout print for the diagnostic
+# channel: the operand is formatted by the frontend exactly as a stdout
+# print would format it (same `{}`/`{name}` interpolation, same refusal of
+# width/precision specs), and the runtime appends the newline. Stdout is
+# untouched, so a program that interleaves the two streams keeps each
+# stream's own byte order.
+#
+# The runtime member is `sh2.warn`, the channel the shell frontends
+# already use for `>&2` diagnostics — rendered code may only call
+# whitelisted `sh2.<name>` members, so the stderr write has to go through
+# the namespace rather than a raw `process.stderr.write`.
+node ErrLine
+tag "ErrLine"
+kind expr
+field value: expr
+# Spec: TextOps#spread_sound is NOT the law here; the obligation is the
+# stream separation itself (the value reaches stderr verbatim, once, with
+# one trailing newline, and stdout receives nothing). Recorded as a
+# node-local contract rather than a TextOps law.
+#
+# NOT PROMISED (stated, not assumed): the ORDER of this write against
+# writes to the OTHER stream beyond what the host guarantees per stream;
+# the host's flushing/缓冲 behaviour for a redirected stderr; and anything
+# about `{:?}` (Debug formatting is a different renderer, refused by
+# frontends that cannot prove it equals Display).

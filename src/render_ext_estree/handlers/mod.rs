@@ -7,6 +7,7 @@
     pub(crate) mod cutset_trim;
     pub(crate) mod deref;
     pub(crate) mod element_read;
+    pub(crate) mod err_line;
     pub(crate) mod field_read;
     pub(crate) mod gpu_op;
     pub(crate) mod map_literal;
