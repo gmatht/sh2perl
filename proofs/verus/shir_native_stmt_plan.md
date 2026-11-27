@@ -10,10 +10,13 @@
                   cluster D3 PROVED (shir_native_cond.rs 10 verified / 0 errors;
                   native_while_multi_cond in shir_native_while_multi.rs, 9 verified / 0 errors);
                   cluster F1 PROVED for tr/wc -l/head -c/tail -c, plain sort,
-                  and the general line-mode head -N/tail -N window law on the
-                  nl_free/nonempty domain (shir_native_f1.rs 62 verified /
-                  0 errors); a general off-domain theorem beyond
-                  tail_terminated_selection is open (instances pinned);
+                  the general line-mode head -N/tail -N window law on the
+                  nl_free/nonempty domain, and the off-domain divergences
+                  (head past the last line, tail -N on a terminated producer,
+                  tail -N on an unterminated producer) generally in N over that
+                  witness family (shir_native_f1.rs 74 verified / 0 errors);
+                  still open here: the byte renderer, the flat-text connector
+                  split, F2's matcher, F2-F4/G/A; D1-D3 are reuse only;
                   clusters A, F2-F4, G still planned — see §4
 
 This is a PLAN, not a proof. It exists because `shir_native_stmt` is the one

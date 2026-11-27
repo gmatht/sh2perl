@@ -57,16 +57,31 @@
 //     The bash side steps the byte stream (`take_lines`/`skip_lines`); the
 //     fold side is `join_lines`/`source_lines` as the source writes it. The
 //     domain is needed: an empty first line makes `head -1` print nothing
-//     where bash prints a blank line. Off domain, the general statements
-//     proved here are `tail_terminated_selection` (the fold's `tail -N`
-//     selection on a newline-terminated producer is the last N-1 real lines
-//     plus the trailing empty segment) and the four pins
-//       pin_head_one_line, pin_head_beyond_the_last_line_adds_a_newline,
-//       pin_tail_lines_selects_the_trailing_empty_segment,
-//       pin_tail_lines_add_a_newline_bash_does_not
-//     recording what the fold emits (bash's byte copy differs). A general
-//     off-domain theorem over all N (beyond the selection identity) is NOT
-//     proved; the instances above are the witnesses.
+//     where bash prints a blank line.
+//     Off domain, the divergences are proved in general too, over that same
+//     explicit witness family (a newline-free, non-empty line list `ls`;
+//     producer text `join_lines(ls) + "\n"` when newline-terminated and
+//     `join_lines(ls)` when not), for an arbitrary N:
+//       - `head_past_end_diverges`: for N past the last line, the fold's line
+//         window on the terminated producer plus one newline is the whole
+//         selection text — bash prints the text once, the fold terminates it
+//         twice;
+//       - `skip_lines_unterminated` + `tail_unterminated_diverges`: bash's
+//         drop-(len-N) on the unterminated producer is the last N lines' text
+//         with no final newline; the fold's output is that text plus a
+//         newline;
+//       - `tail_terminated_selection` (general in N, landed) records the
+//         trailing-empty-segment selection on the terminated producer, which
+//         is why the fold's `tail -N` prints fewer real lines than bash's.
+//     Supporting inductions: `nl_count`/`nl_count_concat`/`nl_count_join` and
+//     `no_nl_text_zero` (the terminated producer carries exactly `ls.len()`
+//     newlines), `take_lines_whole` (N past the newline count keeps the whole
+//     text), `join_snoc_empty`, `skip_lines_unterminated`,
+//     `nonempty_lines_subrange`/`nonempty_join_len`. No bridging lemma assumes
+//     the conclusion: the bash side (`take_lines`/`skip_lines` over bytes) and
+//     the fold side (`join_lines`/`source_lines`) stay separate recursions,
+//     and the step is `subrange`, never `drop_first`. The narrowed domain is
+//     the one above; the four pins remain as the N=1 witnesses.
 //   * `native_literal_subshell_wc_stmt`'s nested literal grep/sed tree:
 //     NOT THIS PROOF (that is F2's matcher).
 //   * `native_sort_stmt` / `native_sort_file_stmt`'s numeric and human
@@ -1060,6 +1075,229 @@ proof fn pin_tail_lines_add_a_newline_bash_does_not()
 {
     reveal_with_fuel(join_lines, 2);
     assert(source_lines(seq![seq!['b']]) == seq!['b', '\n']);
+}
+
+// ── F1 line mode, off-domain: the divergences, general in N ─────────────
+// Witness family: any newline-free list of non-empty lines `ls`; the producer
+// text is `join_lines(ls) + "\n"` (newline-terminated) or `join_lines(ls)`
+// (unterminated).  These are *divergences*: the fold's output is bash's output
+// plus a newline, or bash's last-N lines replaced by the last N-1 plus a blank
+// line.  Nothing here asserts equality of the two pipelines.
+
+pub open spec fn nl_count(t: Seq<char>) -> nat
+    decreases t.len(),
+{
+    if t.len() == 0 {
+        0nat
+    } else {
+        (if t[0] == '\n' { 1nat } else { 0nat }) + nl_count(tl(t))
+    }
+}
+
+proof fn no_nl_text_zero(t: Seq<char>)
+    requires no_nl_text(t),
+    ensures nl_count(t) == 0,
+    decreases t.len(),
+{
+    reveal_with_fuel(nl_count, 3);
+    reveal_with_fuel(no_nl_text, 2);
+    if t.len() > 0 {
+        no_nl_text_zero(tl(t));
+    }
+}
+
+proof fn nl_count_concat(x: Seq<char>, y: Seq<char>)
+    ensures nl_count(x + y) == nl_count(x) + nl_count(y),
+    decreases x.len(),
+{
+    reveal_with_fuel(nl_count, 4);
+    if x.len() == 0 {
+        assert(Seq::<char>::empty() + y == y);
+    } else {
+        assert((x + y)[0] == x[0]);
+        assert(tl(x + y) == tl(x) + y);
+        nl_count_concat(tl(x), y);
+    }
+}
+
+proof fn nl_count_nl(t: Seq<char>)
+    ensures nl_count(t + seq!['\n']) == nl_count(t) + 1,
+{
+    nl_count_concat(t, seq!['\n']);
+    reveal_with_fuel(nl_count, 4);
+    assert(tl(seq!['\n']) == Seq::<char>::empty());
+}
+
+proof fn join_snoc_empty(ls: Seq<Seq<char>>)
+    requires ls.len() > 0,
+    ensures join_lines(ls + seq![empty_line()]) == join_lines(ls) + seq!['\n'],
+    decreases ls.len(),
+{
+    reveal_with_fuel(join_lines, 8);
+    if ls.len() == 1 {
+        assert(ls + seq![empty_line()] == seq![ls[0], empty_line()]);
+        assert(join_lines(seq![empty_line()]) == Seq::<char>::empty());
+        assert(join_lines(seq![ls[0], empty_line()])
+            == ls[0] + (seq!['\n'] + Seq::<char>::empty()));
+        assert(ls[0] + (seq!['\n'] + Seq::<char>::empty()) == ls[0] + seq!['\n']);
+        assert(join_lines(ls) == ls[0]);
+    } else {
+        assert((ls + seq![empty_line()]).len() == ls.len() + 1);
+        assert((ls + seq![empty_line()]).subrange(1, (ls + seq![empty_line()]).len() as int)
+            == ls.subrange(1, ls.len() as int) + seq![empty_line()]);
+        assert((ls + seq![empty_line()])[0] == ls[0]);
+        assert(join_lines(ls + seq![empty_line()])
+            == ls[0] + (seq!['\n'] + join_lines(ls.subrange(1, ls.len() as int) + seq![empty_line()])));
+        assert(join_lines(ls) == ls[0] + (seq!['\n'] + join_lines(ls.subrange(1, ls.len() as int))));
+        join_snoc_empty(ls.subrange(1, ls.len() as int));
+    }
+}
+
+proof fn nl_count_join(ls: Seq<Seq<char>>)
+    requires nl_free_lines(ls), ls.len() > 0,
+    ensures nl_count(join_lines(ls) + seq!['\n']) == ls.len(),
+    decreases ls.len(),
+{
+    reveal_with_fuel(join_lines, 8);
+    reveal_with_fuel(nl_count, 8);
+    if ls.len() == 1 {
+        assert(join_lines(ls) == ls[0]);
+        no_nl_text_zero(ls[0]);
+        nl_count_nl(ls[0]);
+    } else {
+        nl_free_lines_tail(ls);
+        assert(no_nl_text(ls[0]));
+        no_nl_text_zero(ls[0]);
+        assert(join_lines(ls) + seq!['\n']
+            == ls[0] + (seq!['\n'] + (join_lines(ls.subrange(1, ls.len() as int)) + seq!['\n'])));
+        nl_count_concat(ls[0], seq!['\n'] + (join_lines(ls.subrange(1, ls.len() as int)) + seq!['\n']));
+        nl_count_concat(seq!['\n'], join_lines(ls.subrange(1, ls.len() as int)) + seq!['\n']);
+        assert(nl_count(ls[0]) == 0);
+        assert(nl_count(seq!['\n']) == 1);
+        nl_count_join(ls.subrange(1, ls.len() as int));
+    }
+}
+
+proof fn take_lines_whole(t: Seq<char>, n: nat)
+    requires n >= nl_count(t) + 1,
+    ensures take_lines(t, n) == t,
+    decreases t.len(),
+{
+    reveal_with_fuel(take_lines, 8);
+    reveal_with_fuel(nl_count, 8);
+    if t.len() == 0 {
+    } else if t[0] == '\n' {
+        assert((n - 1) as nat >= nl_count(tl(t)) + 1);
+        take_lines_whole(tl(t), (n - 1) as nat);
+        assert(seq![t[0]] + tl(t) == t);
+    } else {
+        take_lines_whole(tl(t), n);
+        assert(seq![t[0]] + tl(t) == t);
+    }
+}
+
+// (1) head -N with N past the last line: the producer is newline-terminated,
+// so the selection still holds a trailing empty segment; the fold prints the
+// whole text plus one extra newline.  bash prints the whole text unchanged.
+proof fn head_past_end_diverges(ls: Seq<Seq<char>>, n: nat)
+    requires nl_free_lines(ls), nonempty_lines(ls), ls.len() >= 1, n >= ls.len() + 1,
+    ensures take_lines(join_lines(ls) + seq!['\n'], n) + seq!['\n']
+        == source_lines(ls + seq![empty_line()]),
+{
+    reveal_with_fuel(join_lines, 3);
+    assert(nl_count(join_lines(ls) + seq!['\n']) == ls.len()) by {
+        nl_count_join(ls);
+    }
+    take_lines_whole(join_lines(ls) + seq!['\n'], n);
+    join_snoc_empty(ls);
+    assert(join_lines(ls).len() > 0) by {
+        reveal_with_fuel(join_lines, 4);
+        reveal_with_fuel(nonempty_lines, 4);
+    }
+    assert(source_lines(ls + seq![empty_line()])
+        == join_lines(ls) + (seq!['\n'] + seq!['\n']));
+    assert(take_lines(join_lines(ls) + seq!['\n'], n) + seq!['\n']
+        == join_lines(ls) + (seq!['\n'] + seq!['\n']));
+}
+
+proof fn nonempty_lines_subrange(ls: Seq<Seq<char>>, k: nat)
+    requires nonempty_lines(ls), k <= ls.len(),
+    ensures nonempty_lines(ls.subrange(k as int, ls.len() as int)),
+    decreases k,
+{
+    reveal_with_fuel(nonempty_lines, 3);
+    if k == 0 {
+        assert(ls.subrange(0, ls.len() as int) == ls);
+    } else {
+        nonempty_lines_tail(ls);
+        nonempty_lines_subrange(ls.subrange(1, ls.len() as int), (k - 1) as nat);
+        assert(ls.subrange(k as int, ls.len() as int)
+            == ls.subrange(1, ls.len() as int).subrange((k - 1) as int, (ls.len() - 1) as int));
+    }
+}
+
+proof fn nonempty_join_len(ls: Seq<Seq<char>>)
+    requires nonempty_lines(ls), ls.len() > 0,
+    ensures join_lines(ls).len() > 0,
+    decreases ls.len(),
+{
+    reveal_with_fuel(join_lines, 3);
+    reveal_with_fuel(nonempty_lines, 3);
+    if ls.len() == 1 {
+        assert(join_lines(ls) == ls[0]);
+    } else {
+        nonempty_lines_tail(ls);
+        nonempty_join_len(ls.subrange(1, ls.len() as int));
+        assert(join_lines(ls)
+            == ls[0] + (seq!['\n'] + join_lines(ls.subrange(1, ls.len() as int))));
+    }
+}
+
+// (2) tail -N on an *unterminated* producer: the selection is the last N real
+// lines; bash prints their text with no final newline, the fold appends one.
+proof fn skip_lines_unterminated(ls: Seq<Seq<char>>, n: nat)
+    requires nl_free_lines(ls), nonempty_lines(ls), 1 <= n <= ls.len(),
+    ensures skip_lines(join_lines(ls), (ls.len() - n) as nat)
+        == join_lines(ls.subrange((ls.len() - n) as int, ls.len() as int)),
+    decreases ls.len(),
+{
+    reveal_with_fuel(join_lines, 3);
+    reveal_with_fuel(skip_lines, 6);
+    if ls.len() == n {
+        assert((ls.len() - n) as nat == 0);
+        assert(ls.subrange(0, ls.len() as int) == ls);
+    } else {
+        let rest = ls.subrange(1, ls.len() as int);
+        nl_free_lines_tail(ls);
+        nonempty_lines_tail(ls);
+        assert(no_nl_text(ls[0]));
+        assert(ls[0].len() > 0);
+        assert(join_lines(ls) == ls[0] + (seq!['\n'] + join_lines(rest)));
+        assert(n <= rest.len());
+        assert((ls.len() - n) as nat == (rest.len() - n) as nat + 1);
+        skip_lines_after_line(ls[0], join_lines(rest), (ls.len() - n) as nat);
+        assert(skip_lines(join_lines(ls), (ls.len() - n) as nat)
+            == skip_lines(join_lines(rest), (rest.len() - n) as nat));
+        skip_lines_unterminated(rest, n);
+        assert(ls.subrange((ls.len() - n) as int, ls.len() as int)
+            == rest.subrange((rest.len() - n) as int, rest.len() as int));
+    }
+}
+
+proof fn tail_unterminated_diverges(ls: Seq<Seq<char>>, n: nat)
+    requires nl_free_lines(ls), nonempty_lines(ls), 1 <= n <= ls.len(),
+    ensures source_lines(ls.subrange((ls.len() - n) as int, ls.len() as int))
+        == skip_lines(join_lines(ls), (ls.len() - n) as nat) + seq!['\n'],
+{
+    reveal_with_fuel(skip_lines, 3);
+    assert(skip_lines(join_lines(ls), (ls.len() - n) as nat)
+        == join_lines(ls.subrange((ls.len() - n) as int, ls.len() as int))) by {
+        skip_lines_unterminated(ls, n);
+    }
+    nonempty_lines_subrange(ls, (ls.len() - n) as nat);
+    assert((ls.len() - n) as nat <= ls.len());
+    assert(ls.subrange((ls.len() - n) as int, ls.len() as int).len() > 0);
+    nonempty_join_len(ls.subrange((ls.len() - n) as int, ls.len() as int));
 }
 
 fn main() {}

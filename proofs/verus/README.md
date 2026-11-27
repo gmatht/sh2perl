@@ -9635,3 +9635,40 @@ one-line selection (**55v/7e**), `take_lines` not decrementing (**61v/1e**),
 `nonempty_lines` admitting empty lines (**59v/3e**), `source_lines` omitting
 its newline (**56v/6e**), `skip_lines` not decrementing (**61v/1e**). All
 restored byte-identically.
+
+#### F1 line mode: the off-domain divergences, general in N
+
+The divergences the earlier pass only pinned are now proved for an arbitrary
+`N` over an explicit witness family: a newline-free, non-empty line list
+`ls`, with producer text `join_lines(ls) + "\n"` (newline-terminated) or
+`join_lines(ls)` (unterminated).
+
+* `head_past_end_diverges` — for `N >= ls.len() + 1`, the fold's window on
+  the terminated producer followed by one newline is the whole selection
+  text: bash prints the text once, the fold terminates it twice.
+* `skip_lines_unterminated` + `tail_unterminated_diverges` — bash's
+  drop-`(len-N)` on the unterminated producer is the last `N` lines' text
+  with no final newline; the fold's output is that text plus a newline.
+* `tail_terminated_selection` (already general in `N`) records the
+  trailing-empty-segment selection on the terminated producer, which is why
+  the fold's `tail -N` prints fewer real lines than bash's.
+
+The supporting inductions are `nl_count`, `nl_count_concat`, `nl_count_nl`,
+`nl_count_join`, `no_nl_text_zero` (the terminated producer carries exactly
+`ls.len()` newlines), `take_lines_whole`, `join_snoc_empty`,
+`skip_lines_unterminated`, `nonempty_lines_subrange` and
+`nonempty_join_len`. No bridging lemma assumes the conclusion: the bash side
+(`take_lines`/`skip_lines` over the byte stream) and the fold side
+(`join_lines`/`source_lines`) are separate recursions, and every step is
+`subrange`, never `drop_first`. The narrowed domain stays explicit — a first
+empty line would make the fold print nothing where bash prints a blank
+line — and the N=1 pins remain as witnesses.
+
+Fourth mutant measurement (74v/0e baseline), all counted and restored
+byte-identically (`sha256` re-checked): `join_snoc_empty` dropping the
+appended newline (**72v/2e**), `take_lines_whole` accepting
+`n == nl_count` (**73v/1e**), `skip_lines_unterminated` claiming a trailing
+newline (**72v/2e**), `tail_unterminated_diverges` dropping the fold's
+newline (**73v/1e**), `head_past_end_diverges` dropping the fold's extra
+newline (**73v/1e**). A sixth mutant (`nl_count` always zero) is refuted at
+simplification: `reveal_with_fuel` rejects a non-recursive function.

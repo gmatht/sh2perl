@@ -4,14 +4,15 @@
 #  counters in native_echo_write_file_stmt / emit_file_op / native_ls_stmt;
 #  the F1 functions modelled here — native_echo_tr_sort_stmt, tr_set_escape,
 #  native_wc_l_pipeline, native_head_tail_stmt/_pipeline, native_sort_stmt —
-#  are byte-identical.)  proof sha: 8cd4555ebbba
+#  are byte-identical.)  proof sha: bfbad0ada2dd
 # source: src/transforms/shir_native_stmt.rs (cluster F1, the parts proved:
 #   native_echo_tr_sort_stmt 5252, tr_set_escape 5220,
 #   native_wc_l_pipeline 2473, native_head_tail_stmt 1749,
 #   native_head_tail_pipeline 2369)
 # Cluster F1: tr/wc/head-tail proved (first pass); plain sort's ordering and
 # permutation laws proved (second pass); the line-mode head/tail byte equality
-# is NOT proved and its divergences are pinned (third section below).
+# proved generally (third pass) and its off-domain divergences now proved
+# generally in N (fourth pass); the N=1 pins stay as witnesses.
 # Clusters F2-F4, G and A remain.
 
 [pins]
@@ -49,7 +50,10 @@ guard independent side (line mode): join_lines/source_lines are the fold's own c
 guard general off-domain: tail_terminated_selection (arbitrary N): PRESENT
 guard tail_terminated_selection: general in N (selection identity): PRESENT
 guard off-domain divergences: over-long head, tail on a terminated producer, tail on an unterminated producer: PRESENT (four pins)
-guard general off-domain theorem beyond the selection identity: NOT PROVED (instances pinned)
+guard off-domain divergence, head past the last line, general in N: head_past_end_diverges: PRESENT
+guard off-domain divergence, tail -N on an unterminated producer, general in N: tail_unterminated_diverges: PRESENT
+guard supporting inductions: nl_count/nl_count_concat/nl_count_join/no_nl_text_zero/take_lines_whole/join_snoc_empty/skip_lines_unterminated/nonempty_lines_subrange/nonempty_join_len: PRESENT
+guard narrowed domain of the divergences: nl_free_lines(ls), nonempty_lines(ls), ls.len() >= 1, producer terminated or not: STATED
 guard native_literal_subshell_wc_stmt's nested literal grep/sed tree: NOT THIS PROOF (F2)
 guard native_sort_stmt / native_sort_file_stmt numeric/human/reverse orderings and human_size: NOT THIS PROOF
 guard locales, multibyte cutting, byte renderer: OUT OF MODEL
@@ -57,10 +61,12 @@ guard D1/D2/D3 laws: REUSED conceptually, not re-claimed
 guard clusters F2-F4, G, A: NOT THIS PROOF
 
 [counts]
-62 verified, 0 errors (verus --triggers-mode silent --rlimit 40 shir_native_f1.rs)
+74 verified, 0 errors (verus --triggers-mode silent --rlimit 40 shir_native_f1.rs)
 first measurement (tr/wc/head-tail) baseline was 18 verified, 0 errors;
 second measurement (sort + line mode) baseline was 47 verified, 0 errors;
-third measurement (general line-mode law) baseline is 62 verified, 0 errors.
+third measurement (general line-mode law) baseline was 62 verified, 0 errors;
+fourth measurement (general off-domain divergences) baseline is 74 verified,
+  0 errors.
 mutants measured against the 18v/0e baseline, each restored
   byte-identically (sha re-checked):
     counted (17v/1e):
@@ -86,6 +92,15 @@ mutants measured against the 62v/0e baseline (general line-mode law), all counte
     t3 nonempty_lines admits empty lines (59v/3e)
     t4 source_lines omits its newline (56v/6e)
     t5 skip_lines does not decrement its line counter (61v/1e)
+mutants measured against the 74v/0e baseline (general off-domain divergences):
+    u1 join_snoc_empty drops the appended newline (72v/2e, head_past_end_diverges)
+    u2 take_lines_whole accepts n == nl_count (73v/1e, the window lemmas)
+    u3 skip_lines_unterminated claims a trailing newline (72v/2e,
+       tail_unterminated_diverges)
+    u4 tail_unterminated_diverges drops the fold's newline (73v/1e)
+    u5 head_past_end_diverges drops the fold's extra newline (73v/1e)
+    u6 nl_count stops counting newlines: refuted at simplification
+       (reveal_with_fuel rejects a non-recursive function), not counted
 
 [exec]
 # The analysed module's 8 tests cover chain/find and the renderer; none
