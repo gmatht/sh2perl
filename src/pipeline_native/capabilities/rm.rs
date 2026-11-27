@@ -68,7 +68,11 @@ pub(crate) fn emit(ctx: &NativeCtx) -> Option<NativeEmit> {
     if !force && !recursive {
         let joined = operands.join(", ");
         return Some(NativeEmit::Stmt(format!(
-            "my $__ok = 1; for my $__p ({joined}) {{ $__ok = 0 unless unlink($__p); }} $main_exit_code = $CHILD_ERROR = $__ok ? 0 : 1;"
+            // The diagnostic is part of the observable behaviour: bash's `rm`
+            // (GNU coreutils) says `rm: cannot remove 'PATH': <errno>` and
+            // keeps going, so the native lowering prints the same text
+            // instead of failing silently. `$!` holds the `unlink` errno.
+            "my $__ok = 1; for my $__p ({joined}) {{ unless (unlink($__p)) {{ $__ok = 0; print STDERR \"rm: cannot remove '$__p': $!\\n\"; }} }} $main_exit_code = $CHILD_ERROR = $__ok ? 0 : 1;"
         )));
     }
     let joined = operands.join(", ");

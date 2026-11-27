@@ -57,14 +57,21 @@ pub(crate) fn emit(ctx: &NativeCtx) -> Option<NativeEmit> {
         let joined = names.join(", ");
         let body = if cmd == "mkdir" {
             if parents {
-                format!("require File::Path; File::Path::make_path({joined}); my $__ok = 1;")
+                // `-p`: create each missing path COMPONENT, skip the ones
+                // that exist (bash's rule), and report like `mkdir` does.
+                // `File::Path::make_path` swallowed the error (an empty
+                // errmsg here) and always reported success, so a
+                // `mkdir -p /no/such/dir` failure read as 0.
+                format!(
+                    "my $__ok = 1; for my $__d ({joined}) {{ my $__acc = $__d =~ m{{^/}} ? '' : '.'; for my $__c (split m{{/+}}, $__d) {{ next if $__c eq '' || $__c eq '.'; $__acc .= \"/$__c\"; next if -d $__acc; unless (mkdir($__acc)) {{ $__ok = 0; print STDERR \"mkdir: $!\\n\"; last; }} }} }}"
+                )
             } else {
-                format!("my $__ok = 1; for my $__d ({joined}) {{ $__ok = 0 unless mkdir($__d); }}")
+                format!("my $__ok = 1; for my $__d ({joined}) {{ unless (mkdir($__d)) {{ $__ok = 0; print STDERR \"mkdir: $!\\n\"; }} }}")
             }
         } else if cmd == "rmdir" {
-            format!("my $__ok = 1; for my $__d ({joined}) {{ $__ok = 0 unless rmdir($__d); }}")
+            format!("my $__ok = 1; for my $__d ({joined}) {{ unless (rmdir($__d)) {{ $__ok = 0; print STDERR \"rmdir: failed to remove '$__d': $!\\n\"; }} }}")
         } else {
-            format!("my $__ok = 1; for my $__t ({joined}) {{ open(my $__h, '>>', $__t) or ($__ok = 0); close($__h) if $__ok; }}")
+            format!("my $__ok = 1; for my $__t ({joined}) {{ if (open(my $__h, '>>', $__t)) {{ close($__h); }} else {{ $__ok = 0; print STDERR \"touch: cannot touch '$__t': $!\\n\"; }} }}")
         };
         return Some(NativeEmit::Stmt(format!(
             "{body} $main_exit_code = $CHILD_ERROR = $__ok ? 0 : 1;"

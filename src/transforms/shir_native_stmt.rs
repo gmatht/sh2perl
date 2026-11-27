@@ -1301,6 +1301,13 @@ fn eval_assign_parts(word: &IrExpr) -> Option<(String, IrExpr)> {
 fn render_test_words(words: &[&IrExpr]) -> IrExpr {
     let parts: Vec<String> = words.iter().filter_map(|w| {
         match w {
+            // An EMPTY literal operand (`test -n ""`, `[ -z '' ]`) is a real
+            // argv word. Pushing it verbatim let the space-joining collapse
+            // it, so the argv became a lone `-n` and the guard rendered
+            // `length('-n')` — always TRUE where bash's is false. Spell it
+            // as the shell's own empty-quoted word, which the test tokenizer
+            // keeps as an operand.
+            IrExpr::Str(s, _) if s.is_empty() => Some("''".to_string()),
             IrExpr::Str(s, _) => Some(s.clone()),
             IrExpr::Interpolate(parts) if parts.iter().all(|p| matches!(p, crate::ir::InterpPart::Lit(_))) => {
                 Some(parts.iter().map(|p| match p { crate::ir::InterpPart::Lit(s) => s.clone(), _ => unreachable!() }).collect())

@@ -1822,6 +1822,12 @@ pub fn shir_to_perl_embed(prog: &IrProgram, ctx: &EmbedCtx) -> EmbedResult {
 
 /// Emit `A && B` / `A || B` as native statements guarded by the chain
 /// status. Returns false (emitting nothing) for a non-chain expression.
+///
+/// The guard reads Perl's own `$?` register, NOT `$CHILD_ERROR`: that
+/// mirror is only written when the program moves the status through it
+/// itself (`set_childe_error_carrier`), so `false || echo hi` guarded on
+/// `$CHILD_ERROR` tested a permanent 0 and printed NOTHING where bash
+/// printed hi.
 fn emit_native_binop(out: &mut String, indent: usize, e: &IrExpr) -> bool {
     let IrExpr::BinOp { lhs, op, rhs } = e else {
         return false;
@@ -1832,14 +1838,133 @@ fn emit_native_binop(out: &mut String, indent: usize, e: &IrExpr) -> bool {
     emit_stmt(out, &IrStmt::Expr((**lhs).clone()), indent);
     emit_indent(out, indent);
     out.push_str(if *op == BinOpKind::And {
-        "if ($CHILD_ERROR == 0) {\n"
+        "if (($? >> 8) == 0) {\n"
     } else {
-        "if ($CHILD_ERROR != 0) {\n"
+        "if (($? >> 8) != 0) {\n"
     });
     emit_stmt(out, &IrStmt::Expr((**rhs).clone()), indent + 1);
     emit_indent(out, indent);
     out.push_str("}\n");
     true
+}
+
+/// One entry per CONVERSION in a rendered Perl printf FORMAT literal
+/// (`"%d %s\n"`): true when bash validates that operand as a number
+/// (`%d %i %o %u %x %X %e %E %f %F %g %G %a %A`), false for `%s`/`%c`/`%%`.
+fn printf_numeric_mask(fmt: &str) -> Vec<bool> {
+    let cs: Vec<char> = fmt.chars().collect();
+    let mut mask = Vec::new();
+    let mut i = 0;
+    while i < cs.len() {
+        if cs[i] != '%' {
+            i += 1;
+            continue;
+        }
+        i += 1;
+        if i >= cs.len() {
+            break;
+        }
+        if cs[i] == '%' {
+            i += 1;
+            continue;
+        }
+        // flags, width, precision, length
+        while i < cs.len() && matches!(cs[i], '-' | '+' | ' ' | '#' | '0' | '.' | '1'..='9' | 'h' | 'l' | 'L' | 'z') {
+            i += 1;
+        }
+        if i >= cs.len() {
+            break;
+        }
+        let conv = cs[i];
+        mask.push(matches!(
+            conv,
+            'd' | 'i' | 'o' | 'u' | 'x' | 'X' | 'e' | 'E' | 'f' | 'F' | 'g' | 'G' | 'a' | 'A'
+        ));
+        i += 1;
+    }
+    mask
+}
+
+/// A shell builtin whose STATEMENT lowering is native Perl that leaves the
+/// shell status behind (no fork, no `die`). These are the command words
+/// that must never reach the `bash -c` seam in any position.
+pub(crate) fn native_builtin_cmd(cmd: &str) -> bool {
+    matches!(
+        cmd,
+        "cd" | "exit" | "echo" | "printf" | "true" | "false" | ":"
+            | "test" | "[" | "]" | "rm" | "mkdir" | "touch"
+            | "read" | "export" | "unset" | "shift" | "local" | "set"
+            | "pwd" | "shopt" | "let" | "sleep"
+    )
+}
+
+/// A COMMAND expression (or an `&&`/`||` chain of them) that renders fully
+/// natively in statement position: every leaf is either one of the builtins
+/// in [`native_builtin_cmd`] or a command the capability tree emulates
+/// (`capture_expr_native`).
+fn native_stmt_chain(e: &IrExpr) -> bool {
+    match e {
+        IrExpr::BinOp {
+            lhs,
+            op: BinOpKind::And | BinOpKind::Or,
+            rhs,
+        } => native_stmt_chain(lhs) && native_stmt_chain(rhs),
+        IrExpr::Call { func, .. } if func == "exec" || func == "builtin" => {
+            let IrExpr::Call { args, .. } = e else { return false };
+            match args.first().and_then(call_arg_str) {
+                Some(c) => native_builtin_cmd(&c) && !exec_is_redirect_shaped(args),
+                None => false,
+            }
+        }
+        // A guard the shared test-lowering already folded to a constant
+        // (`[ -n abc ] && cmd` → `Bool(true) && cmd`).
+        IrExpr::Bool(_) => true,
+        other => capture_expr_native(other),
+    }
+}
+
+/// `exec("cd", …)` is a plain command; the redirect wrapper carries its
+/// own expression, so the builtin name test alone would mis-route it.
+fn exec_is_redirect_shaped(args: &[IrExpr]) -> bool {
+    args.iter()
+        .any(|a| matches!(a, IrExpr::Call { func, .. } if func == "redirect"))
+}
+
+/// The Perl BOOLEAN for a builtin in CONDITION position (`if`/`elsif`/
+/// `while`/`until`/`!`): emit the same native statement the statement
+/// position uses, then test the status register it left. Bash's condition
+/// is the command's EXIT STATUS, so every one of these must fork nothing
+/// (`system("cd", …)` forked and read the child's status) and must not
+/// `die` on failure (`cd`/`rm` fail and the script continues).
+fn builtin_cond_expr(call: &IrExpr) -> Option<String> {
+    let IrExpr::Call { func, args, .. } = call else {
+        return None;
+    };
+    if func != "exec" && func != "builtin" {
+        return None;
+    }
+    let cmd = args.first().and_then(call_arg_str)?;
+    if !native_builtin_cmd(&cmd) || exec_is_redirect_shaped(args) {
+        return None;
+    }
+    let mut body = String::new();
+    {
+        // The condition CONSUMES the status: keep the write even when the
+        // program never reads `$?` afterwards.
+        let _force = RcOwnerGuard::force_status();
+        emit_exec_call(&mut body, call, 1);
+    }
+    // Anything that fell through to a child process or a refusal is not a
+    // native builtin lowering — leave the caller's shell seam in charge.
+    if body.trim().is_empty()
+        || body.contains("system(")
+        || body.contains("bash', '-c'")
+        || body.contains("not yet supported")
+        || body.contains("not renderable")
+    {
+        return None;
+    }
+    Some(format!("do {{\n{body}    ($? >> 8) == 0\n}}"))
 }
 
 // ── Status-write ownership stack ───────────────────────────────────
@@ -1864,6 +1989,19 @@ impl Drop for RcOwnerGuard {
         RC_OWNER.with(|s| {
             s.borrow_mut().pop();
         });
+    }
+}
+
+impl RcOwnerGuard {
+    /// Push an owner that is NOT in the unread verdict set, so the render
+    /// keeps its status write. A CONDITION consumes the statement's status
+    /// even when the surrounding program never reads `$?`: the liveness
+    /// analysis keys on source reads, and a status tested by `if`/`while`/
+    /// `&&`-guarding is one the IR does not model as a read. `0` can never
+    /// be a live statement address, so it is always "read".
+    fn force_status() -> RcOwnerGuard {
+        RC_OWNER.with(|s| s.borrow_mut().push(0));
+        RcOwnerGuard
     }
 }
 
@@ -3267,6 +3405,20 @@ fn emit_stmt_owned(out: &mut String, stmt: &IrStmt, indent: usize) {
                         }
                     }
                 },
+                // A bare BOOLEAN statement — a `test`/`[` the shared
+                // test-lowering already decided (`[ -n abc ] && cmd` folds
+                // the guard to `true`). Its value IS the status: bash's
+                // `[ … ]` leaves 0 for true, 1 for false. Leaving it to the
+                // unknown-expression arm emitted `die "… not yet
+                // supported"`, which aborted the program.
+                IrExpr::Bool(b) => {
+                    emit_indent(out, indent);
+                    out.push_str(&rc_write(if *b {
+                        "$main_exit_code = $CHILD_ERROR = 0;\n"
+                    } else {
+                        "$main_exit_code = $CHILD_ERROR = 1;\n"
+                    }));
+                }
                 // Statement-position arithmetic (`((n++))` — triage-perl
                 // t02_control; the arith_forms let-lift emits the IncDec
                 // bare). The expression VALUE is discarded — only the side
@@ -3296,7 +3448,14 @@ fn emit_stmt_owned(out: &mut String, stmt: &IrStmt, indent: usize) {
                 // `! cmd` in statement position — run the command and
                 // invert the exit status (not-negation.sh's bare `! grep`).
                 IrExpr::BinOp { op: BinOpKind::Not, rhs, .. } => {
-                    if let Some(cmd) = expr_to_cmd(rhs) {
+                    if let Some(cond) = builtin_cond_expr(rhs) {
+                        // A native builtin: evaluate the condition, then
+                        // leave its INVERTED status (bash: `! cmd`).
+                        emit_indent(out, indent);
+                        out.push_str(&rc_write(&format!(
+                            "$main_exit_code = $CHILD_ERROR = (({cond}) ? 1 : 0);\n"
+                        )));
+                    } else if let Some(cmd) = expr_to_cmd(rhs) {
                         emit_shell_cmd(out, indent, &cmd);
                         out.push_str(&rc_write(
                             "$main_exit_code = $CHILD_ERROR = ($CHILD_ERROR == 0) ? 1 : 0;\n"
@@ -3369,10 +3528,15 @@ fn emit_stmt_owned(out: &mut String, stmt: &IrStmt, indent: usize) {
                             ));
                         }
                     } else if matches!(other_expr, IrExpr::BinOp { op: BinOpKind::And | BinOpKind::Or, .. })
-                        && capture_expr_native(other_expr)
+                        && native_stmt_chain(other_expr)
                     {
-                        // `&&`/`||` of natively emulable commands — render
-                        // the prints instead of a `bash -c` shell-out.
+                        // `&&`/`||` of commands that all lower natively
+                        // (builtins included: `cd /no/such && echo x`).
+                        // The old gate was `capture_expr_native`, which only
+                        // covered the pure-Perl emulations, so a chain with
+                        // a `cd`/`rm`/`mkdir`/`touch`/`exit` operand fell to
+                        // the `bash -c` seam — a fork per chain, where bash
+                        // runs none of it in this process.
                         emit_native_binop(out, indent, other_expr);
                     } else if let Some(cmd) = expr_to_cmd(other_expr) {
                         emit_shell_cmd(out, indent, &cmd);
@@ -9725,7 +9889,35 @@ fn emit_exec_call(out: &mut String, call: &IrExpr, indent: usize) {
                 }
                 n
             };
-            emit_indent(out, indent);
+            // bash validates every NUMERIC conversion operand: a word that
+            // is not a complete number prints `printf: WORD: invalid
+            // number` on stderr, uses the numeric PREFIX (0 when there is
+            // none) and leaves status 1 — the script continues. Perl's
+            // printf coerces silently, warns in a different wording and
+            // reports SUCCESS, so `printf '%d\n' zz` printed the right 0
+            // with the wrong stderr and status. Wrap the operands of numeric
+            // conversions when the format is literal and each arg is one
+            // scalar (a split/cyclic list keeps its old path).
+            let numeric_mask = printf_numeric_mask(&fmt);
+            let mut pf_bad = false;
+            if !numeric_mask.is_empty() && !has_split && rest.len() <= p {
+                for (i, a) in rest.iter_mut().enumerate() {
+                    if numeric_mask.get(i).copied().unwrap_or(false) {
+                        pf_bad = true;
+                        *a = format!(
+                            "(do {{ my $__pfv = {a}; if ($__pfv =~ /\\A[+-]?(?:\\d+\\.?\\d*|\\.\\d+)(?:[eE][+-]?\\d+)?\\z/) \
+                             {{ 0 + $__pfv }} else {{ print STDERR \"printf: $__pfv: invalid number\\n\"; \
+                             $__sh2_pf_bad = 1; my ($__pfp) = $__pfv =~ /\\A[+-]?(?:\\d+\\.?\\d*|\\.\\d+)/; 
+                             defined $__pfp ? 0 + $__pfp : 0 }} }})"
+                        );
+                    }
+                }
+            }
+            if pf_bad {
+                emit_indent(out, indent);
+                out.push_str("my $__sh2_pf_bad = 0;\n");
+                emit_indent(out, indent);
+            }
             if rest.is_empty() || p == 0 {
                 // no args, or no conversions: bash printf prints the format
                 // ONCE, ignoring the args (GNU printf 'x' a b → "x"); Perl
@@ -9762,7 +9954,11 @@ fn emit_exec_call(out: &mut String, call: &IrExpr, indent: usize) {
                 out.push_str(&format!("printf({}, {});\n", fmt, rest.join(", ")));
             }
             emit_indent(out, indent);
-            out.push_str(&rc_write("$main_exit_code = $CHILD_ERROR = 0;\n"));
+            out.push_str(&rc_write(if pf_bad {
+                "$main_exit_code = $CHILD_ERROR = ($__sh2_pf_bad ? 1 : 0);\n"
+            } else {
+                "$main_exit_code = $CHILD_ERROR = 0;\n"
+            }));
         }
         "cd" => {
             let dir = words
@@ -13349,6 +13545,21 @@ pub(crate) fn ir_expr_to_perl(expr: &IrExpr) -> String {
                         if stmts.is_empty() {
                             return "do {\n    $? = 0 << 8;\n    ($? >> 8) == 0\n}".to_string();
                         }
+                        // SEVERAL native commands in CONDITION position
+                        // (`while echo hi; false`): run them in order — bash's
+                        // condition status is the LAST one — instead of
+                        // handing the list to a `bash -c` child that would
+                        // re-run (and re-print) them out of process.
+                        if stmts
+                            .iter()
+                            .all(|s| matches!(s, IrStmt::Expr(e) if native_stmt_chain(e)))
+                        {
+                            let mut inner = String::new();
+                            for s in stmts {
+                                emit_stmt(&mut inner, s, 1);
+                            }
+                            return format!("do {{\n{inner}    ($? >> 8) == 0\n}}");
+                        }
                     }
                     // Multi-command block in condition position (e.g. a while
                     // cond with several statements): run them joined by `;`.
@@ -13599,7 +13810,14 @@ pub(crate) fn ir_expr_to_perl(expr: &IrExpr) -> String {
                     // (grep over many/globbed files or with output-
                     // producing flags -c/-l/-m/-b/-n/-A… is NOT a boolean
                     // and stays a shell-out).
-                    if let Some(native) = crate::pipeline_native::native_exec_cond(expr) {
+                    // A builtin in CONDITION position lowers natively and
+                    // tests the status it left: bash's condition is the
+                    // command's EXIT STATUS, so `if cd /tmp` must not fork a
+                    // `bash -c` child (and a failing `cd`/`rm` must test
+                    // FALSE, not kill the script).
+                    if let Some(native) = builtin_cond_expr(expr) {
+                        native
+                    } else if let Some(native) = crate::pipeline_native::native_exec_cond(expr) {
                         native
                     } else {
                         match exec_call_to_cmd(expr) {
@@ -18142,6 +18360,65 @@ mod perl_render_tests {
         let out = render("false && echo hi\n");
         assert!(!out.contains("system(\"echo"), "{out}");
         assert!(!out.contains("system(\"false"), "{out}");
+    }
+
+    /// Every listed builtin in CONDITION position is native: bash's
+    /// condition is the command's exit status, so the render must not fork
+    /// a `bash -c` child (whose status was read for `system("cd", …)`) and
+    /// must not `or die` (a failed `cd`/`rm` continues in bash).
+    #[test]
+    fn builtin_conditions_do_not_fork_or_die() {
+        for sh in [
+            "if cd /no/such; then :; fi",
+            "if rm /no/such/f; then :; fi",
+            "if mkdir /no/such/d; then :; fi",
+            "if touch /no/such/t; then :; fi",
+            "if printf '%d\\n' zz; then :; fi",
+            "if echo hi; then :; fi",
+            "if test -n abc; then :; fi",
+            "if [ -z abc ]; then :; fi",
+            "if ! cd /no/such; then :; fi",
+            "cd /no/such && echo x || echo y",
+            "cd /tmp && echo x",
+            "while cd /no/such; do :; done",
+            "until cd /tmp; do :; done",
+        ] {
+            let out = render(sh);
+            assert!(!out.contains("system("), "{sh}: forked\n{out}");
+            assert!(!out.contains("bash', '-c'"), "{sh}: forked\n{out}");
+            assert!(!out.contains("or die"), "{sh}: dies\n{out}");
+            assert!(!out.contains(crate::ir::UNBUILDABLE_COND), "{sh}: unbuildable\n{out}");
+        }
+    }
+
+    /// A failing builtin leaves `$?` behind and the script continues: the
+    /// condition that reads it must test the BUILTIN's status, not the
+    /// previous child's, and the chain must short-circuit on it.
+    #[test]
+    fn failed_builtin_leaves_shadow_status() {
+        let out = render("mkdir /no/such/d; if [ $? -eq 0 ]; then echo ok; fi\n");
+        assert!(out.contains("$? = ($__ok ? 0 : 1) << 8"), "{out}");
+        // `cd DIR && cmd` has its own native shape: the `chdir` branch IS
+        // the guard, with the status written on both arms.
+        let chain = render("cd /no/such && echo x\n");
+        assert!(!chain.contains("system("), "{chain}");
+        assert!(chain.contains("warn \"cd: \""), "{chain}");
+        assert!(chain.contains("$? = 1 << 8;"), "{chain}");
+        // A failing printf reports bash's diagnostic and its status.
+        let pf = render("printf '%d\\n' zz\n");
+        assert!(pf.contains("printf: $__pfv: invalid number"), "{pf}");
+        assert!(pf.contains("$__sh2_pf_bad ? 1 : 0"), "{pf}");
+    }
+
+    /// The `&&`/`||` guard reads Perl's `$?` register, not the
+    /// `$CHILD_ERROR` mirror (only maintained for programs that move the
+    /// status through it themselves): `false || echo hi` guarded on the
+    /// mirror printed nothing where bash printed hi.
+    #[test]
+    fn or_chain_guard_reads_the_register() {
+        let out = render("false || echo hi\n");
+        assert!(out.contains("if (($? >> 8) != 0)"), "{out}");
+        assert!(!out.contains("$CHILD_ERROR != 0"), "{out}");
     }
 
     /// bash reports a loop's status from the BODY, not from the condition
