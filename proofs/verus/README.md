@@ -40,6 +40,28 @@ this repo's CI must stay self-contained.
     python3 proofs/verus/check_sync.py --list
     python3 proofs/verus/check_sync_selftest.py  # the checker's own self-test
 
+### Declared mutants — `mutate.py`
+
+    python3 proofs/verus/mutate.py              # re-run and assert every mutant
+    python3 proofs/verus/mutate.py --list
+    python3 proofs/verus/mutate.py --only bc_float_clean
+    python3 proofs/verus/mutate.py --calibrate  # measure only, never fails
+    python3 proofs/verus/mutate.py --self-check # the gate rejects a wrong row
+
+A header's "measured mutants" table is now executable. Each row declares one
+`find`/`replace` pair, the proof's pinned sha256, and the verdict the header
+claims: `N-1 verified, M errors` with the failing obligations named, or a
+refusal at a named `by (compute)` pin. The tool checks the sha first (a row
+can never be applied to a revision the claim was not made on), applies exactly
+one occurrence, runs Verus, checks the summary line and the functions the
+errors point into, then restores the original bytes and re-hashes them — a
+non-identical restore is a hard failure whatever the verdict was. The table
+covers the six stages landed 2026-11-24..27 (38 mutants, all reproducing);
+`strip` is not in it yet. Two rows record where measurement diverges from the
+header's label: `uae/m3` fails at `terminates_stops`, not the `trunc_sound`
+the header also names (the 29v/2e count matches), and `text/s2`'s first false
+concrete pin is `pin_analysis_shapes`, not `pin_emit_is_richer`.
+
 A `*_sync.txt` manifest is a claim that this proof models THAT source, that its
 pins exist, and that these rows were executed. The checker fails the claim
 when it rots:
