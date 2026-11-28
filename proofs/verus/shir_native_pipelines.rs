@@ -13,7 +13,15 @@
 // agree; where they do not, the divergence is PROVED (d-F4-1, d-F4-2) rather
 // than left as a comment.
 //
-// Proved here:
+// Proved here (19 obligations, 0 errors):
+//   xargs_appends_the_input_word — the general agreement law: `echo CONTENT |
+//                                xargs echo A B` joins A, B, CONTENT exactly the
+//                                way `echo` joins the command's argv with the
+//                                stdin word appended. Stated on the index-level
+//                                join with `push`, so the induction needs only
+//                                the `push` index axioms and concat associativity
+//                                (the earlier `skip`-based formulation is what
+//                                stranded — see the note below).
 //   xargs_splits_on_whitespace   d-F4-1: content with a double space prints one
 //                                space through the shell and two through the fold
 //   xargs_empty_content_diverges d-F4-2: `echo "" | xargs echo A` — the fold
@@ -21,19 +29,27 @@
 //   comm_12_one_common_line      the emitted `-12` walk prints an equal line once
 //                                and advances BOTH cursors (the double advance,
 //                                which is what makes duplicates print once)
+//   diff_identical_inputs_are_silent — d-F4-5: on equal files the backtrack only
+//                                takes the prefix-match branch, so no hunk is
+//                                opened and nothing is printed; the DP diagonal
+//                                is the file length (lemma_lcs_identical), which
+//                                is what makes that branch always reachable.
 //
-// NOT proved in this stage, stated plainly rather than papered over:
-//   * xargs_appends_the_input_word — the general "one word appended" law. The
-//     statement and its induction are in this file's history; the separator-join
-//     induction needs `(ws + [c]).skip(1) == ws.skip(1) + [c]` and seq-concat
-//     associativity at the same time, which does not discharge here yet (it is
-//     the one open obligation, d-F4-1's complement).
+// NOT proved, stated plainly rather than papered over:
 //   * the general `comm -12` intersection law over two distinct sorted files —
 //     needs ordered-membership invariants for the two-pointer walk (d-F4-4).
-//   * `diff`'s output — the plan already budgets only "byte-identical inputs are
-//     silent", and even that goes through the LCS backtrack (d-F4-5).
+//   * diff's output beyond silence — d-F4-5b: the converse ("a change always
+//     prints") and the byte-level hunks. Both need an invariant relating the
+//     backtrack's cursors to prefix equality (`a[0..i] == b[0..j]`), i.e.
+//     subrange-composition facts this proof does not establish; the general
+//     statement was left unproved rather than restated so it agrees with itself.
 //   * `sort`'s sorted-permutation law and `ls`'s `|| echo` status wiring
 //     (d-F4-3).
+//
+// The xargs law's first formulation recursed with `skip` and needed
+// `(ws + [c]).skip(1) == ws.skip(1) + [c]`; that rewrite does not discharge
+// here, so the law is stated with `push` and a `push`-index induction instead —
+// the same claim, a formulation the solver accepts.
 
 use vstd::prelude::*;
 
@@ -98,6 +114,47 @@ pub proof fn xargs_empty_content_diverges()
         != seq![65int, 10int]) by (compute);
 }
 
+pub proof fn lemma_concat_assoc(a: Seq<int>, b: Seq<int>, c: Seq<int>)
+    ensures
+        a + (b + c) == (a + b) + c,
+{
+}
+
+/// **The xargs law.** `echo CONTENT | xargs echo A B` appends the stdin word to
+/// the command's arguments, and `echo` joins the result. Formulated on the
+/// index-level join with `push`, so the induction needs only the `push` index
+/// axioms and concat associativity — not the skip/concat rewrite that stranded
+/// the first attempt.
+pub proof fn xargs_appends_the_input_word(cmd: Seq<Word>, content: Word, i: int)
+    requires
+        cmd.len() >= 1,
+        0 <= i <= cmd.len(),
+    ensures
+        join_at(cmd.push(content), 32, i) == (if i < cmd.len() {
+            join_at(cmd, 32, i) + seq![32int]
+        } else {
+            Seq::<int>::empty()
+        }) + content,
+    decreases cmd.len() - i,
+{
+    if i >= cmd.len() as int {
+        // the appended word is the last one: the fold stops here
+        assert(cmd.push(content).len() == cmd.len() + 1);
+        assert(cmd.push(content)[i] == content);
+    } else {
+        assert(cmd.push(content)[i] == cmd[i]);
+        assert(cmd.push(content).len() == cmd.len() + 1);
+        xargs_appends_the_input_word(cmd, content, i + 1);
+        if i + 1 < cmd.len() as int {
+            lemma_concat_assoc(
+                join_at(cmd, 32, i + 1) + seq![32int],
+                content,
+                Seq::<int>::empty(),
+            );
+        }
+    }
+}
+
 // ────────────────────────────────────────── §2  `comm -12 F1 F2` ──────────
 
 /// The emitted two-pointer walk: equal lines are printed and BOTH cursors move;
@@ -158,7 +215,90 @@ pub proof fn comm_12_one_common_line(x: Word, a_tail: Seq<Word>, b_tail: Seq<Wor
 }
 
 
-// ────────────────────────────────────────────────── §3  pins ──────────────
+// ────────────────────────────────────── §3  `diff F1 F2 [> OUT]` ──────────
+
+/// The emitted DP table: `dp[i][j]` is the LCS length of the prefixes
+/// `a[0..i]` and `b[0..j]`, exactly as the fold's nested loop fills it (the
+/// `>` in `($__dp[$__i][$__j+1] > $__dp[$__i+1][$__j]) ? … : …` only picks a
+/// tie-break for the same value).
+pub open spec fn lcs(a: Seq<Word>, b: Seq<Word>, i: int, j: int) -> int
+    decreases i + j,
+{
+    if i <= 0 || j <= 0 {
+        0
+    } else if a[i - 1] == b[j - 1] {
+        lcs(a, b, i - 1, j - 1) + 1
+    } else if lcs(a, b, i - 1, j) >= lcs(a, b, i, j - 1) {
+        lcs(a, b, i - 1, j)
+    } else {
+        lcs(a, b, i, j - 1)
+    }
+}
+
+/// The emit loop's control flow over the backtrack: a prefix match prints
+/// nothing and moves both cursors; any other step starts a hunk, and the two
+/// tail loops emit the leftovers.
+pub open spec fn prints_any(a: Seq<Word>, b: Seq<Word>, i: int, j: int) -> bool
+    decreases i + j,
+{
+    if i <= 0 || j <= 0 {
+        i > 0 || j > 0
+    } else if a[i - 1] == b[j - 1] {
+        prints_any(a, b, i - 1, j - 1)
+    } else {
+        true
+    }
+}
+
+/// On equal files the backtrack only ever takes the match branch: every step
+/// consumes one line of each side and prints nothing, down to `(0, 0)`.
+pub proof fn lemma_prints_identical(a: Seq<Word>, i: int)
+    requires
+        0 <= i <= a.len(),
+    ensures
+        prints_any(a, a, i, i) == false,
+    decreases i,
+{
+    if i <= 0 {
+    } else {
+        lemma_prints_identical(a, i - 1);
+    }
+}
+
+/// The DP diagonal on equal files: `dp[i][i] = i`, which is why the walk's
+/// `$__a[$__i] eq $__b[$__j]` test is true at every step.
+pub proof fn lemma_lcs_identical(a: Seq<Word>, i: int)
+    requires
+        0 <= i <= a.len(),
+    ensures
+        lcs(a, a, i, i) == i,
+    decreases i,
+{
+    if i <= 0 {
+    } else {
+        lemma_lcs_identical(a, i - 1);
+    }
+}
+
+/// **The diff law (d-F4-5, the honest version).** `diff F F` prints nothing:
+/// with both sides equal, the emit loop's only reachable branch is the prefix
+/// match, and the DP diagonal is full, so no hunk is ever opened.
+///
+/// NOT proved (d-F4-5b): the converse — that a non-empty change always prints —
+/// and `diff`'s byte-level output. Both need an invariant relating the
+/// backtrack's cursors to prefix equality (`a[0..i] == b[0..j]`), i.e.
+/// subrange-composition facts this proof does not establish; the general
+/// statement was left unproved rather than restated so it agrees with itself.
+pub proof fn diff_identical_inputs_are_silent(a: Seq<Word>)
+    ensures
+        prints_any(a, a, a.len() as int, a.len() as int) == false,
+        lcs(a, a, a.len() as int, a.len() as int) == a.len() as int,
+{
+    lemma_prints_identical(a, a.len() as int);
+    lemma_lcs_identical(a, a.len() as int);
+}
+
+// ────────────────────────────────────────────────── §4  pins ──────────────
 
 /// pin: the `-12` walk of two files that both hold the line `A` prints it once.
 pub proof fn pin_comm_one_line_each()
@@ -175,6 +315,28 @@ pub proof fn pin_comm_duplicate_prints_once()
 {
     assert(merge(seq![seq![65int], seq![65int]], seq![seq![65int]], 0, 0)
         == seq![seq![65int]]) by (compute);
+}
+
+/// pin: a differing first line opens a hunk — the law is not "always silent".
+pub proof fn pin_diff_of_differing_files_prints()
+    ensures
+        prints_any(seq![seq![65int]], seq![seq![66int]], 1, 1),
+        prints_any(seq![seq![65int]], seq![seq![65int], seq![66int]], 1, 2),
+        !prints_any(seq![seq![65int]], seq![seq![65int]], 1, 1),
+{
+    assert(prints_any(seq![seq![65int]], seq![seq![66int]], 1, 1)) by (compute);
+    assert(prints_any(seq![seq![65int]], seq![seq![65int], seq![66int]], 1, 2)) by (compute);
+    assert(!prints_any(seq![seq![65int]], seq![seq![65int]], 1, 1)) by (compute);
+}
+
+/// pin: one appended xargs word is the shell's argv join (the general law's
+/// one-step instance).
+pub proof fn pin_xargs_appends_one_word()
+    ensures
+        join_at(seq![seq![65int]].push(seq![66int]), 32, 0) == seq![65int, 32int, 66int],
+{
+    xargs_appends_the_input_word(seq![seq![65int]], seq![66int], 0);
+    assert(join_at(seq![seq![65int]], 32, 0) == seq![65int]) by (compute);
 }
 
 /// pin: the fold's own separator is what a one-word echo writes.

@@ -1,65 +1,85 @@
 # verus-sync-coverage manifest: shir_native_pipelines
-# source sha: shir_native_stmt=3ae1b4d0bc71  proof sha: 23e40326f8c0
-# source: src/transforms/shir_native_stmt.rs — cluster F4, `xargs` / `comm`
-#   surface: native_echo_xargs_stmt (5290), native_comm_stmt (6756).
-#   native_cat_file_pipeline (2616) is covered by shir_native_files_invariant;
-#   native_diff_files_stmt (5827) is NOT covered (d-F4-5).
+# source sha: shir_native_stmt=3ae1b4d0bc71  proof sha: d2757a8cdd8d
+# source: src/transforms/shir_native_stmt.rs — cluster F4, `xargs` / `comm` / `diff`
+#   surface: native_echo_xargs_stmt (5290), native_comm_stmt (6756),
+#   native_diff_files_stmt (5827). native_cat_file_pipeline (2616) is covered by
+#   shir_native_files_invariant.
 #
 # Proved here:
-#   xargs_splits_on_whitespace — d-F4-1. `xargs` splits stdin on any run of
-#     blanks and `echo` joins the pieces with ONE space; the fold copies the
-#     content verbatim, so a double space survives the fold and collapses through
-#     the shell. Statutory witness: words 97/98 written as the content `a  b`.
-#   xargs_empty_content_diverges — d-F4-2. `echo "" | xargs echo A` runs
-#     `echo A`; the fold always inserts its own separator, emitting `A `.
+#   xargs_appends_the_input_word — the general agreement law: `echo CONTENT |
+#     xargs echo A B` prints the command's words joined by single spaces with the
+#     stdin word appended, exactly what `echo` writes for that argv. Stated on the
+#     index-level join over `cmd.push(content)`, so the induction uses only the
+#     `push` index axioms and concat associativity. (The first formulation
+#     recursed with `skip` and needed `(ws + [c]).skip(1) == ws.skip(1) + [c]`,
+#     which does not discharge here; the claim is the same, the formulation is
+#     one the solver accepts.)
+#   xargs_splits_on_whitespace — d-F4-1: `xargs` splits stdin on any run of
+#     blanks and `echo` joins with ONE space; the fold copies the content, so a
+#     double space survives the fold and collapses in the shell. Witness bytes.
+#   xargs_empty_content_diverges — d-F4-2: `echo "" | xargs echo A` runs
+#     `echo A`; the fold always inserts its own separator and emits `A `.
 #   comm_12_one_common_line — a common line is pushed once and BOTH cursors
 #     advance, which is what makes `comm -12` print a duplicate once.
+#   diff_identical_inputs_are_silent — d-F4-5: on equal files the backtrack takes
+#     only the prefix-match branch, so no hunk is opened and nothing is printed;
+#     lemma_lcs_identical proves the DP diagonal is the file length, which is why
+#     that branch is the one taken at every step.
 #
-# NOT proved in this stage, stated plainly (each measured, not glossed):
-#   * xargs_appends_the_input_word — the general one-word-append law. The
-#     statement and induction were written and run: the separator-join induction
-#     needs `(ws + [c]).skip(1) == ws.skip(1) + [c]` together with seq-concat
-#     associativity, and that step does not discharge here (skip/concat axioms).
-#     The divergence laws above are proved; the agreement law is not claimed.
+# NOT proved in this stage, stated plainly:
 #   * the general `comm -12` intersection law over two distinct sorted files —
 #     needs ordered-membership invariants for the two-pointer walk (d-F4-4).
-#   * `diff` — the plan budgets only "byte-identical inputs are silent", and even
-#     that goes through the LCS backtrack (d-F4-5).
+#   * diff's output beyond silence — d-F4-5b: the converse ("a change always
+#     prints") and the byte-level hunks. Both need an invariant relating the
+#     backtrack's cursors to prefix equality (a[0..i] == b[0..j]); the general
+#     statement was left unproved rather than restated to agree with itself.
 #   * `sort`'s sorted-permutation law, and `ls`'s `|| echo` status wiring
 #     (d-F4-3).
 #
 # Supporting lemmas and who consumes them:
+#   lemma_concat_assoc → xargs_appends_the_input_word
 #   lemma_lex_not_lt → comm_12_one_common_line
+#   lemma_prints_identical, lemma_lcs_identical → diff_identical_inputs_are_silent
 
 [pins]
+pin pin_xargs_appends_one_word -> UNMIRRORED (no source test covers the xargs fold)
 pin pin_comm_one_line_each -> UNMIRRORED (no source test covers comm)
 pin pin_comm_duplicate_prints_once -> UNMIRRORED (no source test covers comm)
 pin pin_one_word_echo_is_the_word_plus_newline -> UNMIRRORED (no source test covers the xargs fold)
+pin pin_diff_of_differing_files_prints -> UNMIRRORED (no source test covers the diff fold)
 
 [guards]
+guard law xargs_appends_the_input_word (the general agreement): PRESENT
 guard law xargs_splits_on_whitespace (d-F4-1): PRESENT
 guard law xargs_empty_content_diverges (d-F4-2): PRESENT
 guard law comm_12_one_common_line (the double advance): PRESENT
-guard lemma_lex_not_lt: PRESENT
-guard law xargs_appends_the_input_word (the general agreement): NOT PROVED (stated above)
+guard law diff_identical_inputs_are_silent (d-F4-5): PRESENT
+guard lemma_concat_assoc / lemma_lex_not_lt / lemma_prints_identical / lemma_lcs_identical: PRESENT
 guard law comm_12 general intersection: NOT PROVED (d-F4-4)
-guard diff: NOT PROVED (d-F4-5)
+guard diff beyond identical inputs: NOT PROVED (d-F4-5b)
 guard sort permutation and ls `|| echo` status: NOT PROVED (d-F4-3)
 guard printf/echo escape decoding: DELEGATED to cluster E (shir_native_echo.rs)
 
 [counts]
-10 verified, 0 errors (verus --triggers-mode silent --rlimit 40 shir_native_pipelines.rs)
-3 pins, all UNMIRRORED: the module's 8 tests cover command chains, file tests and
-the two find/head walks — none exercises comm or the xargs fold.
+19 verified, 0 errors (verus --triggers-mode silent --rlimit 40 shir_native_pipelines.rs)
+5 pins, all UNMIRRORED: the module's 8 tests cover command chains, file tests and
+the two find/head walks — none exercises comm, the xargs fold or the diff fold.
 
-mutants measured 2026-11-28 against proof sha 23e40326f8c0, each on a /tmp copy
-(the source untouched), sha re-checked afterwards (23e40326f8c0 before and after):
-  M5 the echo word separator dropped     rejected at simplification (d-F4-1)
-  M6 comm advances only the first cursor on a match  rejected at simplification
-  M7 the newline dropped from echo       rejected at simplification (d-F4-2)
+mutants measured 2026-11-28 against proof sha d2757a8cdd8d, each on a /tmp copy
+(the source untouched), sha re-checked afterwards (d2757a8cdd8d before and after):
+  M5  the echo word separator dropped               rejected at simplification
+  M6  comm advances only the first cursor on a match rejected at simplification
+  M7  the newline dropped from echo                 rejected at simplification
+  M8  the appended xargs word dropped from the join rejected at simplification
+  M9  the diff prefix-match entry removed           rejected at simplification
+  M10 the diff hunk guard made always-false         rejected at simplification
+  M11 the DP recurrence loses its match step        18v/1e postcondition
   Every rejection inspected: all are VERIFICATION failures (`expression
-  simplifies to ... which evaluates to false`), none a compile error.
+  simplifies to … which evaluates to false` / `postcondition not satisfied`),
+  none a mutant-spelling compile error. So the new laws are load-bearing: M8 and
+  M9/M10 kill the xargs and diff laws, and M11 kills the DP diagonal lemma the
+  diff law consumes.
 
 [exec]
-# NONE, by design: no source test covers comm or the xargs fold, so no [exec] row
-# is claimed. Evidence is the proof and the mutant table above.
+# NONE, by design: no source test covers comm, the xargs fold or the diff fold, so
+# no [exec] row is claimed. Evidence is the proof and the mutant table above.

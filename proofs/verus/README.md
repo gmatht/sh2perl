@@ -9607,12 +9607,12 @@ entry is not a lost rewrite but wrong output, so this is a soundness law.
   `record_file_write` has no source test, so all 9 pins are **UNMIRRORED by
   design** and no `[exec]` row exists.
 
-### Items F3 / F4 — `find`/`head` and `xargs`/`comm` (18 + 10 obligations)
+### Items F3 / F4 — `find`/`head`, `xargs`/`comm` and `diff` (18 + 19 obligations)
 
     verus --triggers-mode silent --rlimit 40 proofs/verus/shir_native_find_ls.rs
     -> verification results:: 18 verified, 0 errors
     verus --triggers-mode silent --rlimit 40 proofs/verus/shir_native_pipelines.rs
-    -> verification results:: 10 verified, 0 errors
+    -> verification results:: 19 verified, 0 errors
 
 **F3 (`shir_native_find_ls.rs`).** The fold does not emit `find`; it emits a Perl
 walk whose matcher is `substr($__e, -N) eq Q`. Proved against an indexwise
@@ -9625,23 +9625,28 @@ second `-name` overwrites the first, so `find DIR -name a -name b` is accepted a
 matched by `b` alone while `find` requires both. `head -N` collects the whole
 walk and splices; `head_take_is_the_first_n` proves that equals the first N.
 
-**F4 (`shir_native_pipelines.rs`).** Modelled two-mode against the shell:
-**d-F4-1** (`xargs` collapses runs of blanks, the fold copies them) and
-**d-F4-2** (`echo "" | xargs echo A` prints `A`, the fold emits `A<space>`) are
-proved as divergences, and `comm_12_one_common_line` proves the double advance
-that makes the `-12` walk print a duplicate once.
+**F4 (`shir_native_pipelines.rs`).** Modelled two-mode against the shell.
+`xargs_appends_the_input_word` is the general agreement law — the emitted
+`join(' ', @w), " ", $it` is what `echo` writes for the command's argv with the
+stdin word appended (stated over `push`, so the induction needs only push-index
+and concat-associativity facts; the earlier `skip`-based formulation was the
+obstacle, not the claim). **d-F4-1** (`xargs` collapses runs of blanks, the fold
+copies them) and **d-F4-2** (`echo "" | xargs echo A` prints `A`, the fold emits
+`A<space>`) remain proved as divergences, `comm_12_one_common_line` proves the
+double advance that makes `-12` print a duplicate once, and **d-F4-5**,
+`diff_identical_inputs_are_silent`, proves that on equal files the backtrack only
+takes the prefix-match branch (with `lemma_lcs_identical` giving the full DP
+diagonal), so no hunk is opened and nothing prints.
 
 **What is NOT mirrored or NOT proved** — said plainly:
 - `ls` is not covered: its lines are a sorted readdir, i.e. the sort/permutation
   law, which is unproved (d-F4-3), and its `|| echo` status wiring with it.
-- The general `xargs` one-word agreement law was written and run and does not
-  discharge yet (the separator-join induction needs skip/concat facts Verus does
-  not give here) — so only the divergences are claimed for `xargs` (d-F4-4 is its
-  number in the manifest).
 - The general `comm -12` intersection law needs ordered-membership invariants and
-  is not proved; only the double-advance step is.
-- `diff` is unproved (d-F4-5), as the plan budgeted: even "identical inputs are
-  silent" goes through the LCS backtrack.
+  is not proved (d-F4-4); only the double-advance step is.
+- `diff` beyond identical inputs is not proved (d-F4-5b): the converse ("a change
+  always prints") and the byte-level hunks both need an invariant relating the
+  backtrack's cursors to prefix equality (`a[0..i] == b[0..j]`), which this proof
+  does not establish.
 - Pins: all 4 F3 pins and all 3 F4 pins are **UNMIRRORED**. The two
   `find_with[out]_head_*` tests exercise the same fold but assert its EMITTED
   TEXT, so they would not notice a change to the splice law; no source test
@@ -9651,10 +9656,12 @@ that makes the `-12` walk print a duplicate once.
 **Mutants** (each on a `/tmp` copy, source untouched, shas re-checked):
 F3 `bb35ad52c6d2` — window offset dropped 17v/1e, second-directory refusal made
 always-true 17v/1e, pattern counter removed from the grammar (rejected at
-simplification), head splice ignoring N 17v/1e. F4 `23e40326f8c0` — echo
-separator dropped, comm single-advance, echo newline dropped: all rejected at
-simplification. Every rejection inspected as a verification failure, none a
-compile error.
+simplification), head splice ignoring N 17v/1e. F4 `d2757a8cdd8d` — echo
+separator dropped, comm single-advance, echo newline dropped, the appended xargs
+word dropped, the diff prefix-match entry removed, the diff hunk guard made
+always-false: all rejected at simplification; the DP recurrence losing its match
+step 18v/1e. Every rejection inspected as a verification failure, none a compile
+error, so the xargs law, the diff law and the DP lemma are each load-bearing.
 
 ## `shir_native_stmt.rs` — no single law; a decomposition plan (cluster C proved)
 
