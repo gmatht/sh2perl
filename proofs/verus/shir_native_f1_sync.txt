@@ -93,12 +93,17 @@ mutants measured against the 62v/0e baseline (general line-mode law), all counte
     t4 source_lines omits its newline (56v/6e)
     t5 skip_lines does not decrement its line counter (61v/1e)
 mutants measured against the 74v/0e baseline (general off-domain divergences):
-    u1 join_snoc_empty drops the appended newline (72v/2e, head_past_end_diverges)
-    u2 take_lines_whole accepts n == nl_count (73v/1e, the window lemmas)
+    u1 join_snoc_empty drops the appended newline (72v/2e, head_past_end_diverges;
+       witnesses pin_head_beyond_the_last_line_adds_a_newline)
+    u2 take_lines_whole accepts n == nl_count (73v/1e, the line window lemmas;
+       witnesses pin_head_one_line and pin_head_beyond_the_last_line_adds_a_newline)
     u3 skip_lines_unterminated claims a trailing newline (72v/2e,
-       tail_unterminated_diverges)
-    u4 tail_unterminated_diverges drops the fold's newline (73v/1e)
-    u5 head_past_end_diverges drops the fold's extra newline (73v/1e)
+       tail_unterminated_diverges; witnesses
+       pin_tail_lines_add_a_newline_bash_does_not)
+    u4 tail_unterminated_diverges drops the fold's newline (73v/1e; witnesses
+       pin_tail_lines_add_a_newline_bash_does_not)
+    u5 head_past_end_diverges drops the fold's extra newline (73v/1e; witnesses
+       pin_head_beyond_the_last_line_adds_a_newline)
     u6 nl_count stops counting newlines: refuted at simplification
        (reveal_with_fuel rejects a non-recursive function), not counted
 

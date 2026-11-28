@@ -12,9 +12,11 @@
                   cluster F1 PROVED for tr/wc -l/head -c/tail -c, plain sort,
                   the general line-mode head -N/tail -N window law on the
                   nl_free/nonempty domain, and the off-domain divergences
-                  (head past the last line, tail -N on a terminated producer,
-                  tail -N on an unterminated producer) generally in N over that
-                  witness family (shir_native_f1.rs 74 verified / 0 errors);
+                  generally in N over that witness family (shir_native_f1.rs
+                  74 verified / 0 errors): head past the last line and tail -N
+                  on an unterminated producer at the output level, tail -N on a
+                  newline-terminated producer as the general selection identity
+                  (its output relation is pinned at N = 1);
                   still open here: the byte renderer, the flat-text connector
                   split, F2's matcher, F2-F4/G/A; D1-D3 are reuse only;
                   clusters A, F2-F4, G still planned — see §4

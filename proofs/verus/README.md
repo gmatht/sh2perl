@@ -9621,14 +9621,14 @@ the fold side is `join_lines`/`source_lines` as the source writes it. The
 proofs step with `subrange(1, len)` rather than `drop_first`, which is not
 usefully specified on the empty sequence in this toolchain.
 
-Off domain the general statements are `tail_terminated_selection` (the fold's
-`tail -N` selection on a newline-terminated producer is the last `N-1` real
-lines plus the trailing empty segment) and the four pins
+Off domain the general selection statement is `tail_terminated_selection` (the
+fold's `tail -N` selection on a newline-terminated producer is the last `N-1`
+real lines plus the trailing empty segment), and the four pins
 (`pin_head_one_line`, `pin_head_beyond_the_last_line_adds_a_newline`,
 `pin_tail_lines_selects_the_trailing_empty_segment`,
-`pin_tail_lines_add_a_newline_bash_does_not`). A general off-domain theorem
-beyond that selection identity is **not** proved; those instances are the
-witnesses.
+`pin_tail_lines_add_a_newline_bash_does_not`) record the `N = 1` witnesses.
+The general-in-`N` off-domain theorems beyond that selection identity are
+proved in the next section.
 
 Third mutant measurement (62v/0e baseline): `join_lines` adding a newline to a
 one-line selection (**55v/7e**), `take_lines` not decrementing (**61v/1e**),
