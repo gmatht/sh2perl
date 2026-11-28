@@ -930,12 +930,13 @@ pub struct IrProgram {
 
 // ── Backend: IR → Perl text ─────────────────────────────────────────
 
-/// Placeholder for a condition-position command the renderer cannot rebuild.
-/// A Perl comment keeps it inert and unambiguous; the post-pass rewrites the
-/// whole marker to `1` (see `fix_condition_booleans`), so a legitimately
-/// computed `Bool(false)` — which also renders as a bare `0` — is never
-/// mistaken for it.
-pub const UNBUILDABLE_COND: &str = "0/*sh2:unbuildable-cond*/";
+/// Value for a condition-position command the renderer cannot rebuild.
+///
+/// bash's answer for an arm it cannot evaluate is "true", so the emission IS
+/// `1` — not a marker for a later text pass to rewrite. (It used to emit
+/// `0/*sh2:unbuildable-cond*/` and rely on `perl_generator_fixed` to turn it
+/// into `1`, which made the text layer decide the meaning of a condition.)
+pub const UNBUILDABLE_COND: &str = "1";
 
 /// Convert a single IR statement to a Perl source string.
 /// This is the public entry point for the generator to produce clean
@@ -1665,11 +1666,6 @@ fn first_code_newline(s: &str) -> Option<usize> {
     // Run the SAME post-pass the shipped `--fixed` entry point runs — it is
     // idempotent (an already-declared name is skipped), so the fixed path's
     // own call becomes a no-op and both entry points emit identical Perl.
-    // The UNBUILDABLE_COND marker (`0/*sh2:unbuildable-cond*/`) is not
-    // valid Perl — its `/*` opens a comment that never closes — so a
-    // condition the renderer could not lower must be rewritten before the
-    // text leaves the renderer. bash's answer for those arms is "true".
-    let out = crate::perl_generator_fixed::fix_condition_booleans(&out);
     let out = crate::perl_generator_fixed::declare_renderer_symbols(&out);
 
     out
@@ -19158,7 +19154,7 @@ mod perl_render_tests {
             assert!(!out.contains("system("), "{sh}: forked\n{out}");
             assert!(!out.contains("bash', '-c'"), "{sh}: forked\n{out}");
             assert!(!out.contains("or die"), "{sh}: dies\n{out}");
-            assert!(!out.contains(crate::ir::UNBUILDABLE_COND), "{sh}: unbuildable\n{out}");
+            assert!(!out.contains("unbuildable"), "{sh}: unbuildable\n{out}");
         }
     }
 

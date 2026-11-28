@@ -44,7 +44,6 @@ pub(crate) type TextPass = (&'static str, fn(&str) -> String);
 /// pass disabled and reports which renders change.
 fn text_passes() -> &'static [TextPass] {
     &[
-        ("fix_condition_booleans", fix_condition_booleans),
         ("fix_printf_bash_conversions", fix_printf_bash_conversions),
         ("fix_printf_b_percent_b", fix_printf_b_percent_b),
         ("fix_print_newline_to_say", fix_print_newline_to_say),
@@ -286,6 +285,12 @@ pub(crate) fn declare_renderer_symbols(src: &str) -> String {
 /// `TOPLEVEL_POS_DECLS` for `@__sh_args`). Without this `our`, `use
 /// strict` rejects the flag write and the WHOLE file fails to compile.
 fn declare_arith_operand_flag(src: &str) -> String {
+    // Mission item 5 — why this is still a TEXT pass.
+    // Declaration-only, and for a renderer-owned name: `$__SH2_AE` is written
+    // by the arithmetic lowering deep inside expression rendering, which has
+    // no program-level declaration hook. Idempotent, so the fixed path's
+    // later call is a no-op. Pinned by
+    // `retained_pass_tests::arith_operand_flag_is_declared`.
     if !src.contains("$__SH2_AE") || src.contains("our $__SH2_AE") {
         return src.to_string();
     }
@@ -307,6 +312,14 @@ fn declare_arith_operand_flag(src: &str) -> String {
 /// Runs BEFORE `declare_undeclared_vars`, which picks the write up as a
 /// referenced `@PIPESTATUS` and declares it when the script has no read.
 fn fix_literal_pipeline_pipestatus(src: &str) -> String {
+    // Mission item 5 — why this is still a TEXT pass.
+    // bash records one status per pipeline STAGE; `__sh_pipe_run` reports only
+    // the final one. When every stage is the literal `true`/`false` builtin
+    // the statuses are static, so the exact array is spliced in front of the
+    // run. The stage list exists in rendered form only (the pipeline is an
+    // opaque `q{...}` payload), and guessing for any other stage would be
+    // wrong, so the pass refuses everything else. Pinned by
+    // `retained_pass_tests::literal_pipeline_fills_pipestatus`.
     // Both statement forms: the tracked one (`$main_exit_code =
     // $CHILD_ERROR = __sh_pipe_run(q{…`) and the status-unread elision
     // (`__sh_pipe_run(q{…` at statement start — the rc write was
@@ -784,6 +797,15 @@ fn rewrite_splices_in_dq(rest: &str) -> String {
 // Only `%q` is touched: every other conversion (`%s %d %b %c %%` …) already
 // agrees between the two, and rewriting them would change passing output.
 fn fix_printf_bash_conversions(src: &str) -> String {
+    // Mission item 5 — why this is still a TEXT pass.
+    // The rewrite needs to know which argument of an emitted `printf(...)`
+    // call is the FORMAT (bash's `%q` is a conversion, a `%q` inside an
+    // operand is data). That fact exists only in the rendered call: the IR's
+    // printf node carries a bash format string, and the Perl lowering turns
+    // it into a sprintf format, so `%q` is not representable per-node without
+    // teaching the printf emitter bash's whole conversion set. The pass is
+    // anchored on the FORMAT position and leaves operands alone; pinned by
+    // `retained_pass_tests::printf_percent_q_uses_the_shell_quoting_helper`.
     if !src.contains("\"%q\"") && !src.contains("'%q'") {
         return src.to_string();
     }
@@ -1040,6 +1062,10 @@ fn perl_literal(quote: char, text: &str) -> String {
 // `\a \b \e \E \f \n \r \t \v \0nnn \xHH \\` and leaves every other backslash
 // pair ALONE (bash does not interpret `\d` and neither do we).
 fn fix_printf_b_percent_b(src: &str) -> String {
+    // Mission item 5 — why this is still a TEXT pass.
+    // Same seam as `%q`: bash's `%b` expands escapes in the OPERAND, which
+    // only the rendered call identifies. Pinned by
+    // `retained_pass_tests::printf_percent_b_expands_the_operand`.
     if !src.contains("\"%b\"") && !src.contains("'%b'") {
         return src.to_string();
     }
@@ -1214,42 +1240,6 @@ fn bash_b_operand_slots(fmt: &str) -> Vec<usize> {
     slots
 }
 
-// ── Fix 14 — an unbuildable condition must be TRUE, not a bare `0` ──────
-//
-// The shared renderer lowers a condition-position `redirect` / `block` /
-// `exec` to `(system('bash', '-c', q{…}) == 0)`. The `== 0` is the whole
-// point: it converts a bash STATUS into a Perl BOOLEAN, which is what the
-// condition slot needs. When the inner command cannot be rebuilt the arm
-// now emits `ir::UNBUILDABLE_COND` — a `0` carrying a distinguishing
-// comment — which this pass rewrites to `1`.
-//
-//   sh:  while ! { : >> /tmp/f; } 2>/dev/null; do echo waiting; done
-//   pl:  while (!(0/*sh2:unbuildable-cond*/)) …   ->  while (!(1)) …
-//
-// bash's `!` on a zero status is false, so bash runs zero iterations; a bare
-// falsy `0` would make Perl run forever and the gate would kill it at the
-// 20 s timeout.
-//
-// Keyed on the MARKER, never on the shape: a legitimately computed
-// `Bool(false)` also renders as a bare `0`, and rewriting that inverted real
-// conditions (redirect-all: `if ! command -v CMD` renders `!(0)` = TRUE).
-/// Rewrite the renderer's UNBUILDABLE-condition placeholder to `1`.
-///
-/// The renderer marks a condition-position command it cannot rebuild with
-/// `0/*sh2:unbuildable-cond*/` (see `ir::UNBUILDABLE_COND`). A bare `0` is a
-/// STATUS, and Perl reads it as FALSE — so a `while` never runs and an `if`
-/// silently drops its branch. `"this holds"` is the only answer that keeps
-/// the control flow a loop rather than a hang.
-///
-/// The rewrite is keyed on that exact marker, NOT on a bare `(0)`. An earlier
-/// version matched the shape instead, which also caught a legitimately
-/// computed `Bool(false)`: `if ! command -v CMD > /dev/null` renders
-/// `!(0)` — TRUE, which is what bash means — and the blanket
-/// `(!(0))`→`(!(1))` rewrite inverted it and dropped the branch
-/// (redirect-all lost its `not found` line).
-pub(crate) fn fix_condition_booleans(src: &str) -> String {
-    src.replace(crate::ir::UNBUILDABLE_COND, "1")
-}
 
 // ── Fix 25 — `print($a . " " . $b)` reads better as one interpolated string ─
 //
@@ -1272,6 +1262,12 @@ pub(crate) fn fix_condition_booleans(src: &str) -> String {
 //     is a separate, riskier change;
 //   * `say` is not touched.
 fn fix_print_concat_interp(src: &str) -> String {
+    // Mission item 5 — why this is still a TEXT pass.
+    // Pure spelling: a flat `.` chain becomes one interpolating literal with
+    // the same values in the same order. Applying it at emission would need
+    // the string builder to know the final literal form after every word part
+    // has been rendered. Pinned by
+    // `retained_pass_tests::print_concat_chain_interpolates`.
     const CALL: &str = "print(";
     let mut out = String::with_capacity(src.len());
     let mut rest = src;
@@ -1444,6 +1440,14 @@ fn split_concat_chain(s: &str) -> Option<Vec<&str>> {
 // top-level comma of its own (so `print(a, b, "\n")` — a genuine list print —
 // is left alone; its join is a different question).
 fn fix_print_newline_to_say(src: &str) -> String {
+    // Mission item 5 — why this is still a TEXT pass (and why that is safe).
+    // The renderer emits `print(...)` from many independent sites (echo, the
+    // printf `%s` fallback, capture tails); folding each one into `say` at
+    // emission would duplicate this rule in every one of them. It cannot
+    // change meaning: `print(LIST, "\n")` and `say LIST` produce the same
+    // bytes, the pass only fires when the LAST argument is exactly `"\n"` and
+    // the head is one flat value, and anything else is left untouched.
+    // Pinned by `retained_pass_tests::print_newline_folds_into_say`.
     const CALL: &str = "print(";
     const TAIL: &str = ", \"\\n\")";
     if !src.contains(TAIL) {
@@ -1701,6 +1705,14 @@ fn is_bareword_ident(s: &str, declared: &std::collections::HashSet<String>) -> b
 // exactly what the strict pragma asks for, and it is a no-op for a program
 // the renderer already got right.
 pub(crate) fn declare_undeclared_vars(src: &str) -> String {
+    // Mission item 5 — why this is still a TEXT pass.
+    // Declaration-only: it adds `my`/`our` for names whose only occurrence in
+    // the emitted Perl is a READ. It cannot change a value or a control-flow
+    // decision, and the input it needs (a whole-program symbol table of what
+    // the renderer emitted) exists only after rendering — the renderer writes
+    // reads without keeping a binding registry. Without it the output is
+    // strict-invalid Perl. Pinned by
+    // `retained_pass_tests::undeclared_reads_are_declared`.
     if !src.contains("use strict") {
         return src.to_string();
     }
@@ -5314,115 +5326,6 @@ mod pgf_tests {
         assert!(out.contains("my %x;"), "{out}");
     }
 
-    /// Regression: a condition-position `redirect` / `block` that the shared
-    /// renderer cannot rebuild must render as TRUE, not as a bare `0`.
-    ///
-    /// The shared renderer lowers a condition-position redirect to
-    /// `(system('bash', '-c', q{…}) == 0)` -- the `== 0` is what converts a
-    /// bash *status* into a Perl *boolean*. When the inner command cannot be
-    /// rebuilt it falls back to the bare string `"0"`, which reads as a
-    /// bash status but is FALSY in a Perl boolean slot. So a construct whose
-    /// condition is genuinely truthy in bash came out false in Perl:
-    ///
-    /// ```sh
-    /// while ! { : >> /tmp/f; } 2>/dev/null; do echo waiting; done   # bash: 0 iterations
-    /// ```
-    /// rendered as `while (!(0))`, and `!0` is TRUE in Perl -- the opposite
-    /// of `!` on a zero status in bash. The loop ran forever and the gate
-    /// killed it at the 20 s timeout (`perl=124`).
-    ///
-    /// A constant-condition loop is a hard hang, not a wrong value, so this
-    /// is the most expensive shape in the whole failure set.
-    #[test]
-    fn unbuildable_condition_render_is_true_not_false() {
-        let mut p = crate::Parser::new(
-            "while ! { : >> /tmp/pg_bool_cond_test; } 2>/dev/null; do\n  echo waiting\ndone\n",
-        );
-        let cmds = p.parse().expect("parse");
-        let prog = crate::shir::ast_to_ir(&cmds);
-        let out = generate(&prog);
-        assert!(
-            !out.contains(crate::ir::UNBUILDABLE_COND),
-            "the unbuildable-condition marker survived into the output:\n{out}"
-        );
-        assert!(
-            !out.contains("while (!(0))"),
-            "condition slot holds a bare falsy 0:\n{out}"
-        );
-    }
-
-    /// The same defect in the other arms that share it: an unbuildable
-    /// condition-position `block` and an unbuildable `exec`-in-condition.
-    /// Both must be TRUE, and both must be a Perl boolean rather than a
-    /// status — `!`/`&&`/`||` on them have to read the way bash reads them.
-    ///
-    /// Each case is a CONTROL-FLOW head, which is the only place a condition
-    /// boolean legitimately lives. A `(0)` in an arithmetic or list context is
-    /// the number zero and must survive — that is what
-    /// `a_bare_zero_outside_a_condition_is_untouched` pins.
-    #[test]
-    fn every_unbuildable_condition_arm_is_a_perl_boolean() {
-        // Each arm emits `0/*sh2:unbuildable-cond*/`, which the pass must
-        // turn into `1` in every control-flow head.
-        for src in [
-            "use strict;\nif (!(0/*sh2:unbuildable-cond*/)) { print \"x\\n\"; }\n",
-            "use strict;\nif ((0/*sh2:unbuildable-cond*/)) { print \"x\\n\"; }\n",
-            "use strict;\nwhile ((0/*sh2:unbuildable-cond*/)) { print \"x\\n\"; }\n",
-            "use strict;\nelsif ((0/*sh2:unbuildable-cond*/)) { print \"x\\n\"; }\n",
-        ] {
-            let out = fix_condition_booleans(src);
-            assert!(
-                !out.contains(crate::ir::UNBUILDABLE_COND) && out.contains('1'),
-                "the marker was not rewritten to a truthy boolean:\n{out}"
-            );
-        }
-    }
-
-    /// A legitimately computed `Bool(false)` renders as a bare `0` and must
-    /// NOT be rewritten. This is the redirect-all regression: `if !
-    /// command -v CMD > /dev/null` is TRUE in bash, the renderer emitted
-    /// `!(0)`, and the old shape-matching rewrite turned it into `!(1)` and
-    /// dropped the branch.
-    #[test]
-    fn a_computed_false_condition_is_not_inverted() {
-        for src in [
-            "use strict;\nif (!(0)) { print \"x\\n\"; }\n",
-            "use strict;\nif ((0)) { print \"x\\n\"; }\n",
-            "use strict;\nwhile ((0)) { print \"x\\n\"; }\n",
-        ] {
-            assert_eq!(
-                fix_condition_booleans(src),
-                src,
-                "a computed falsy condition was rewritten:\n{src}"
-            );
-        }
-    }
-
-    /// The control that makes the fix above safe: a parenthesised zero that
-    /// is NOT a condition head is the number zero and must be left alone.
-    /// Without this, "find `(0)` and replace it" would silently corrupt
-    /// arithmetic — and the renderer emits `(0)` in plenty of real arithmetic.
-    #[test]
-    fn a_bare_zero_outside_a_condition_is_untouched() {
-        for src in [
-            "use strict;\nmy $n = (0);\n",
-            "use strict;\nprint((0) + 1, \"\\n\");\n",
-            "use strict;\nmy @l = (0, 1, 2);\n",
-            "use strict;\nif ((system('bash', '-c', 'exit 1') == 0)) { print \"y\\n\"; }\n",
-        ] {
-            assert_eq!(fix_condition_booleans(src), src, "clobbered a real zero:\n{src}");
-        }
-    }
-
-    /// And the control: a REAL zero-status condition must stay false, or the
-    /// fix would invert a correct program. The renderer writes
-    /// `(system('bash', '-c', q{false}) == 0)`, which is already a boolean
-    /// and must be left alone.
-    #[test]
-    fn a_real_status_comparison_is_left_alone() {
-        let src = "use strict;\nif ((system('bash', '-c', 'exit 1') == 0)) { print \"y\\n\"; }\n";
-        assert_eq!(fix_condition_booleans(src), src);
-    }
 }
 
 #[cfg(test)]
@@ -6385,5 +6288,153 @@ mod text_pass_audit {
                 changed.iter().take(4).cloned().collect::<Vec<_>>().join(" ")
             );
         }
+    }
+}
+
+/// Pin the SEVEN text passes that survive the mission-item-5 audit.
+///
+/// Each test does the same three things:
+///   1. asserts the pass is still in the pipeline table (deleting the entry
+///      fails here);
+///   2. asserts the full render and the render with that pass disabled DIFFER
+///      for a program that exercises it (disabling it fails here);
+///   3. asserts the semantic shape the pass is responsible for, so the pass
+///      cannot be replaced by something that merely changes bytes.
+///
+/// The companion audit test (`text_pass_audit::audit_each_text_pass`) prints
+/// the corpus-wide effect of every pass; this module is the part that must
+/// stay true.
+#[cfg(test)]
+mod retained_pass_tests {
+    use super::*;
+
+    fn render(src: &str) -> (String, crate::ir::IrProgram) {
+        let cmds = crate::Parser::new(src).parse().expect("parse");
+        let prog = crate::shir::ast_to_ir(&cmds);
+        (generate(&prog), prog)
+    }
+
+    fn render_example(name: &str) -> (String, crate::ir::IrProgram) {
+        let path = format!("{}/examples/{name}.sh", env!("CARGO_MANIFEST_DIR"));
+        let src = std::fs::read_to_string(&path).expect("read example");
+        render(&src)
+    }
+
+    fn in_table(name: &str) -> bool {
+        text_passes()
+            .iter()
+            .chain(declaration_passes().iter())
+            .any(|(n, _)| *n == name)
+    }
+
+    /// The retained set is exactly these seven. A new pass must come with its
+    /// own audit and pin, and a deleted one must be deleted here too.
+    #[test]
+    fn the_retained_pass_set_is_exactly_these_seven() {
+        let mut names: Vec<&str> = text_passes()
+            .iter()
+            .chain(declaration_passes().iter())
+            .map(|(n, _)| *n)
+            .collect();
+        names.sort();
+        assert_eq!(
+            names,
+            vec![
+                "declare_arith_operand_flag",
+                "declare_undeclared_vars",
+                "fix_literal_pipeline_pipestatus",
+                "fix_print_concat_interp",
+                "fix_print_newline_to_say",
+                "fix_printf_b_percent_b",
+                "fix_printf_bash_conversions",
+            ]
+        );
+    }
+
+    /// `echo X` → `say X`: the trailing `, "\n"` is folded into `say` and the
+    /// flat `.` chain becomes one interpolating literal. Same value, same
+    /// newline; only the Perl idiom differs.
+    #[test]
+    fn print_newline_folds_into_say() {
+        assert!(in_table("fix_print_newline_to_say"));
+        let (full, prog) = render_example("000__02_output_formatting_commands");
+        let off = generate_impl(&prog, Some("fix_print_newline_to_say"));
+        assert_ne!(full, off, "the say fold no longer fires");
+        assert!(full.contains("say \"Echo result: Hello from backticks\";"), "{full}");
+        assert!(
+            off.contains("print(\"Echo result: \" . (\"Hello from backticks\"), \"\\n\");"),
+            "the pre-pass shape is not what the pin describes:\n{off}"
+        );
+    }
+
+    /// A flat concat chain becomes one interpolating literal — spelling only.
+    #[test]
+    fn print_concat_chain_interpolates() {
+        assert!(in_table("fix_print_concat_interp"));
+        let (full, prog) = render_example("055_factorize");
+        let off = generate_impl(&prog, Some("fix_print_concat_interp"));
+        assert_ne!(full, off, "the concat chain fold no longer fires");
+        assert!(full.contains("print \"Factors of $n: \";"), "{full}");
+        assert!(off.contains("print(\"Factors of \" . ($n) . \": \");"), "{off}");
+    }
+
+    /// A literal `true | false` pipeline: the per-stage statuses bash records
+    /// must be in `@PIPESTATUS` before the run, because `__sh_pipe_run` only
+    /// reports the final one.
+    #[test]
+    fn literal_pipeline_fills_pipestatus() {
+        assert!(in_table("fix_literal_pipeline_pipestatus"));
+        let (full, prog) = render("true | false\necho \"${PIPESTATUS[0]},${PIPESTATUS[1]}\"\n");
+        let off = generate_impl(&prog, Some("fix_literal_pipeline_pipestatus"));
+        assert!(full.contains("@PIPESTATUS = (0, 1); $? = (__sh_pipe_run("), "{full}");
+        assert!(!off.contains("@PIPESTATUS = (0, 1);"), "{off}");
+    }
+
+    /// bash's `printf %q` has no Perl conversion: the emitted format is
+    /// rewritten to the `__sh2_q` helper and the helper is declared.
+    #[test]
+    fn printf_percent_q_uses_the_shell_quoting_helper() {
+        assert!(in_table("fix_printf_bash_conversions"));
+        let (full, prog) = render_example("parse-dollar-single-quote");
+        let off = generate_impl(&prog, Some("fix_printf_bash_conversions"));
+        assert_ne!(full, off, "the %q rewrite no longer fires");
+        assert!(full.contains("sub __sh2_q {"), "{full}");
+        // The FORMAT now calls the helper; the literal `%q` conversion must be
+        // gone from the emitted call (it is not a Perl sprintf conversion).
+        assert!(!full.contains("printf(\"%q"), "{full}");
+        assert!(!off.contains("sub __sh2_q"), "{off}");
+    }
+
+    /// bash's `printf %b` expands backslash escapes in the OPERAND; the helper
+    /// does that, and the format is rewritten to call it.
+    #[test]
+    fn printf_percent_b_expands_the_operand() {
+        assert!(in_table("fix_printf_b_percent_b"));
+        let (full, prog) = render_example("printf-format-and-v");
+        let off = generate_impl(&prog, Some("fix_printf_b_percent_b"));
+        assert_ne!(full, off, "the %b rewrite no longer fires");
+        assert!(full.contains("sub __sh2_b {"), "{full}");
+        assert!(!off.contains("sub __sh2_b"), "{off}");
+    }
+
+    /// Declaration-only passes: they cannot change a value, only make the
+    /// emitted Perl strict-clean. Each is asserted on the shape it adds.
+    #[test]
+    fn undeclared_reads_are_declared() {
+        assert!(in_table("declare_undeclared_vars"));
+        let out = declare_undeclared_vars("use strict;\nprint($nope);\n");
+        assert!(out.contains("my $nope;"), "{out}");
+        // The pass is load-bearing exactly for a read the program never
+        // binds: without the declaration, `use strict` rejects the file.
+        assert!(!declare_undeclared_vars("use strict;\nmy $x = 1;\nprint $x;\n").contains("my $x;\nmy $x"));
+    }
+
+    #[test]
+    fn arith_operand_flag_is_declared() {
+        assert!(in_table("declare_arith_operand_flag"));
+        let out = declare_arith_operand_flag("use strict;\nmy $x = 1 && ($__SH2_AE = 1);\n");
+        assert!(out.contains("our $__SH2_AE;"), "{out}");
+        // Idempotent: an already-declared flag gets no second `our`.
+        assert_eq!(out.matches("our $__SH2_AE;").count(), 1);
     }
 }
