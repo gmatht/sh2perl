@@ -2511,6 +2511,30 @@ fn emit_stmt_owned(out: &mut String, stmt: &IrStmt, indent: usize) {
             // NOTE the copy must be an ASSIGNMENT: `local %ENV;` alone
             // empties the hash, and the RHS of `local %ENV = %ENV` is
             // evaluated against the still-live values (verified).
+            // `exit` inside the group ends the SUBSHELL, not the program:
+            // bash continues with `$?` = the exit code. Rendered inline the
+            // Perl `exit` killed the whole script (`( exit 4 ); echo $?`
+            // printed nothing and exited 4), so a body that contains `exit`
+            // forks through the same helper the condition seam uses, where
+            // the child's `exit` is just the child's status.
+            if subshell_body_exits(body) {
+                emit_indent(out, indent);
+                out.push_str("{\n");
+                emit_indent(out, indent + 1);
+                out.push_str("my $__sub_rc = __sh_subshell(sub {\n");
+                for s in body.iter() {
+                    emit_stmt(out, s, indent + 2);
+                }
+                emit_indent(out, indent + 1);
+                out.push_str("});\n");
+                emit_indent(out, indent + 1);
+                out.push_str("$CHILD_ERROR = $__sub_rc;\n");
+                emit_indent(out, indent + 1);
+                out.push_str("$? = $__sub_rc << 8;\n");
+                emit_indent(out, indent);
+                out.push_str("}\n");
+                return;
+            }
             emit_indent(out, indent);
             out.push_str("{\n");
             emit_indent(out, indent + 1);
@@ -11474,6 +11498,48 @@ fn body_mentions_sigil(body: &str, name: &str, sigil: Sigil) -> bool {
         }
     }
     false
+}
+
+/// Does this stmt-level `exec(...)` call name the `exit` builtin?
+fn exec_call_is_exit(args: &[IrExpr]) -> bool {
+    matches!(args.first(), Some(IrExpr::Str(name, _)) if name == "exit")
+        || matches!(args.first(), Some(IrExpr::Call { func, args: a, .. })
+            if func == "word" && matches!(a.first(), Some(IrExpr::Str(n, _)) if n == "exit"))
+}
+
+/// Does this subshell body (transitively) contain an `exit`? Such a group
+/// must run in a child process so the exit cannot terminate the parent.
+fn subshell_body_exits(body: &[IrStmt]) -> bool {
+    body.iter().any(stmt_exits)
+}
+
+fn stmt_exits(s: &IrStmt) -> bool {
+    match s {
+        IrStmt::Exit(_) => true,
+        // `exit N` in a subshell body is lowered as an exec-builtin call, not
+        // as `IrStmt::Exit` (stmt_for_command goes through exec_stmt).
+        IrStmt::Expr(IrExpr::Call { func, args, .. })
+            if func == "exec" && exec_call_is_exit(args) =>
+        {
+            true
+        }
+        IrStmt::Block(b) | IrStmt::Subshell(b) | IrStmt::Background(b) => b.iter().any(stmt_exits),
+        IrStmt::If {
+            then,
+            elsifs,
+            else_,
+            ..
+        } => {
+            then.iter().any(stmt_exits)
+                || elsifs.iter().any(|(_, b)| b.iter().any(stmt_exits))
+                || else_.iter().any(stmt_exits)
+        }
+        IrStmt::While { body, .. } | IrStmt::DoWhile { body, .. } | IrStmt::For { body, .. } => {
+            body.iter().any(stmt_exits)
+        }
+        IrStmt::Pipeline { stages, .. } => stages.iter().flatten().any(stmt_exits),
+        _ => false,
+    }
 }
 
 fn collect_assigned_vars(stmts: &[IrStmt], out: &mut Vec<(String, Sigil)>) {

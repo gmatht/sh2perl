@@ -54,6 +54,18 @@ fn select_in_form_ahead(parser: &Parser) -> bool {
     matches!(parser.lexer.peek_n(i), Some(Token::In))
 }
 
+/// `!` binds tighter than `&&`/`||` but applies to a whole pipeline: after
+/// parsing the chain, push the negation down its left spine. Without this the
+/// frontend produced `Not(And(A, B))`, which the shell-text rebuild then
+/// dropped entirely (`! false && echo ran` printed nothing).
+fn negate_leftmost(c: Command) -> Command {
+    match c {
+        Command::And(l, r) => Command::And(Box::new(negate_leftmost(*l)), r),
+        Command::Or(l, r) => Command::Or(Box::new(negate_leftmost(*l)), r),
+        other => Command::Not(Box::new(other)),
+    }
+}
+
 pub struct Parser {
     pub lexer: Lexer,
     shopt_state: TestModifiers,
@@ -476,11 +488,38 @@ impl Parser {
                         }
                     }
                     Some(Token::Bang) => {
-                        // ! at the start of a command is the negation operator
-                        // Consume it and parse the rest of the command as a negated pipeline
+                        // `!` negates ONE command: it binds tighter than `&&` and
+                        // `||`, so `! A && B` is `(! A) && B` (the caller's
+                        // pipeline/and-or loop continues after this returns).
+                        // Parsing it as a whole pipeline made `Not(And(A, B))`,
+                        // which the shell-text rebuild then dropped.
+                        //
+                        // `parse_pipeline_segment` is the compound-aware unit
+                        // parser: it also keeps `! ( … )` a SUBSHELL — routing
+                        // through the simple-command path flattened the group
+                        // into one exec word (`exec("exit 1")`), which ran
+                        // `bash -c '"exit 1"'` and printed
+                        // `exit 1: command not found` to stderr.
                         self.lexer.next(); // consume !
-                        let cmd = self.parse_pipeline()?;
-                        Command::Not(Box::new(cmd))
+                        // bash allows `!  cmd`: skip the space so the dispatch
+                        // below sees the command, not a word fragment.
+                        self.lexer.skip_inline_whitespace_and_comments();
+                        // `! ( … )`: the simple-command path flattened the
+                        // paren group into ONE exec word, so the renderer ran
+                        // `bash -c '"exit 1"'` and stderr gained
+                        // `exit 1: command not found`.
+                        if matches!(self.lexer.peek(), Some(Token::ParenOpen)) {
+                            let cmd = self.parse_subshell()?;
+                            Command::Not(Box::new(cmd))
+                        } else {
+                            // `!` negates ONE pipeline (pipes included) but
+                            // binds tighter than && and ||: parse the chain,
+                            // then negate its leftmost pipeline, so
+                            // `! A && B` is `(! A) && B` and `! A | B`
+                            // negates the whole pipe status.
+                            let cmd = self.parse_pipeline()?;
+                            negate_leftmost(cmd)
+                        }
                     }
                     Some(Token::ParenClose) => {
                         // A stray `)` outside any subshell (the subshell body
@@ -849,6 +888,7 @@ impl Parser {
             Some(Token::TestBracket) => self.parse_test_expression(),
             Some(Token::Bang) => {
                 self.lexer.next(); // consume !
+                self.lexer.skip_inline_whitespace_and_comments();
                 let cmd = self.parse_pipeline_segment()?;
                 Ok(Command::Not(Box::new(cmd)))
             }

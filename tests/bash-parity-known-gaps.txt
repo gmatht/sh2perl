@@ -110,22 +110,44 @@
 # The uu-ffi fallback notice is now SILENT unless `SH2_UU_WARN=1`: a stderr
 # line bash never prints is itself a divergence (tier1 fixtures compare it).
 #
-# ── `!` in two shapes (NOT fixed) ────────────────────────────────────────
+# ── `!` in two shapes (FIXED) ────────────────────────────────────────────
 #
-# `!` in condition position works (`if ! grep -q`, `if ! cmd && cmd`,
-# `if ! (exit 1)` takes bash's branch), but two shapes still diverge:
+# Both residuals recorded here after the condition-position pass are gone:
 #
-#   1. `! ( … )` — the paren group reaches the IR as ONE exec word, so the
-#      renderer shells out: system('bash','-c','"exit 1"').
-#        bash: ok                 emitted: ok, plus
-#                                 bash: line 1: exit 1: command not found
-#      The branch happens to match (the child fails, so `!` is true); stderr
-#      does not.
-#   2. `! cmd && cmd` in STATEMENT position — the frontend builds
-#      `Not(cmd && cmd)` instead of `And(Not(cmd), cmd)`, and the shell-text
-#      rebuild drops the `!`.
-#        bash: ran                emitted: (nothing)
-#      In CONDITION position (`if ! cmd && cmd`) the same source is correct.
+#   1. `! ( … )` — the `!` arm skipped whitespace and then handed the paren
+#      group to the simple-command parser, which flattened it into ONE exec
+#      word: system('bash','-c','"exit 1"'), stderr `exit 1: command not
+#      found`. src/parser/commands.rs now dispatches a leading `(` after `!`
+#      to parse_subshell, so the group is an IrStmt::Subshell and the
+#      condition seam forks it (no bash -c, no stderr).
+#        bash: ok | ok           emitted: ok | ok
+#   2. `! cmd && cmd` in STATEMENT position — the frontend built
+#      `Not(And(cmd, cmd))`, which the shell-text rebuild then dropped.
+#      `!` now negates the leftmost pipeline of the parsed chain
+#      (negative_leftmost), so it is `And(Not(cmd), cmd)`.
+#        bash: ran               emitted: ran
+#
+# Both shapes run in tests/tier1/builtin_status.sh (and the condition-position
+# forms in tests/tier1/command_conditions.sh).
+#
+# ── Failed redirect: right status, different diagnostic prefix ────────────
+#
+# `$?` after a builtin whose REDIRECT fails matches bash exactly (1), but the
+# message naming the file goes through the emitted shell's argv[0], so its
+# prefix differs (bash names the script and the line; the emitted Perl names
+# the Perl file and line 1):
+#
+#   echo hi > /no/such/dir/f 2>/dev/null; echo "rc=$?"
+#     bash:  <script>.sh: line 4: /no/such/dir/f: No such file or directory
+#            rc=1
+#     perl:  x.pl: line 1: /no/such/dir/f: No such file or directory
+#            rc=1
+#
+# Not fixable without teaching the renderer the original script path and the
+# source line number; the STATUS (which is what a script branches on) matches.
+# So the fixture covers echo/printf success and the failure paths of the other
+# builtins, and this shape stays documented rather than in tier1 (tier1
+# compares stderr byte for byte).
 #
 # ── Not brace-related, found while widening (unchanged, still divergent) ──
 #
