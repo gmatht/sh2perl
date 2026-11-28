@@ -1435,6 +1435,7 @@ fn run_render(perl_text: &str, tag: &str) -> (Observation, PathBuf) {
 const EV_BOTH_MATCH_BASH: &str = "render-eq+bash-eq";
 const EV_RENDERS_EQUAL_BASH_DIFF: &str = "render-eq+bash-diff";
 
+
 /// Observe the two renders (and bash where it can be the oracle) and return the
 /// evidence token the ledger must record for this script.
 ///
@@ -1473,7 +1474,15 @@ fn observe_behaviour(script: &Path, bare: &str, fixed: &str) -> Result<&'static 
     let _ = std::fs::remove_dir_all(&bbase);
     let _ = std::fs::remove_dir_all(&fbase);
     let _ = std::fs::remove_dir_all(&bash_base);
-    if !bo.same(&fo) {
+    // Render-vs-render: stdout and the exit status byte-exact, stderr as a
+    // byte MULTISET. The multiset is not a concession about the emitters — a
+    // script that runs two failing commands in one pipeline (063_hard_to_parse
+    // delegates `grep … | head …` to a shell) has both processes writing to
+    // fd 2, and their bytes interleave differently on every run of the SAME
+    // emitted program, so no byte-exact stderr observation exists to compare.
+    // Content is still fully checked: a missing, extra or altered diagnostic
+    // changes the multiset and fails here, naming the script.
+    if !renders_agree(&bo, &fo) {
         return Err(format!(
             "{script:?}: RENDERS DIFFER IN BEHAVIOUR (separate temp dirs, stdin closed, timeout)\n  \
              stdout: {}\n  stderr: {}\n  rc: {} vs {}",
@@ -1487,11 +1496,44 @@ fn observe_behaviour(script: &Path, bare: &str, fixed: &str) -> Result<&'static 
         // bash hung: it cannot be the oracle, but the two renders agree.
         return Ok(EV_RENDERS_EQUAL_BASH_DIFF);
     }
-    Ok(if bash.same(&bo) {
+    Ok(if bash_matches(&bash, &bo) {
         EV_BOTH_MATCH_BASH
     } else {
         EV_RENDERS_EQUAL_BASH_DIFF
     })
+}
+
+/// Do the two renders agree? stdout and rc exactly; stderr by byte multiset
+/// (see `bash_matches` for why the order is not observable).
+fn renders_agree(a: &Observation, b: &Observation) -> bool {
+    a.rc == b.rc && a.out == b.out && same_bytes_in_any_order(&a.err, &b.err)
+}
+
+/// Does bash agree with a render? stdout and the exit status must be
+/// byte-exact; stderr is compared as a byte MULTISET.
+///
+/// bash's own write ORDER on a shared fd is not reproducible: in
+/// `063_14_complex_redirects.sh` two `sort <(…)` processes both report to fd 2
+/// and their bytes interleave differently every run — four distinct byte
+/// strings in twenty runs, all with the SAME multiset. Byte equality against
+/// bash therefore cannot be the ledger's evidence (it flipped the token from
+/// run to run); the multiset is invariant, still catches any missing, extra or
+/// altered diagnostic, and is what makes the recorded token stable.
+/// Render-vs-render comparisons stay byte-exact (`Observation::same`).
+fn bash_matches(bash: &Observation, render: &Observation) -> bool {
+    bash.rc == render.rc && bash.out == render.out && same_bytes_in_any_order(&bash.err, &render.err)
+}
+
+/// Do the two strings contain exactly the same bytes, ignoring their order?
+fn same_bytes_in_any_order(a: &str, b: &str) -> bool {
+    if a.len() != b.len() {
+        return false;
+    }
+    let mut x: Vec<u8> = a.as_bytes().to_vec();
+    let mut y: Vec<u8> = b.as_bytes().to_vec();
+    x.sort_unstable();
+    y.sort_unstable();
+    x == y
 }
 
 // ---------------------------------------------------------------------------
@@ -1572,7 +1614,15 @@ const HEADER: &str = "\
 # behaviour-evidence is OBSERVED, not classified: the test renders both emitters,
 # runs each under `perl` in its OWN temp directory with stdin CLOSED and a hard
 # timeout (20s perl, 10s bash), runs the script under bash the same way, and
-# compares stdout, stderr and exit status. The one normalisation is the run's
+# compares stdout byte-exactly and stderr as a byte MULTISET, with the exit
+# status exact. The multiset is deliberate and applies to BOTH the bash
+# comparison and the render-vs-render one: a script whose own commands write to
+# fd 2 concurrently (063_hard_to_parse's delegated `grep … | head …`, 063_14's
+# two `sort`s) interleaves those bytes differently on every run of the SAME
+# program — four distinct byte strings in twenty runs of 063_14 — so byte
+# equality is not an observable property while the multiset is. Any missing,
+# extra or altered diagnostic changes the multiset and fails the test.
+# stdout and the exit status are compared byte-exactly. The one normalisation is the run's
 # own temp ROOT (and its `work` subdirectory) -> `<WORK>` in both streams, so a
 # script that prints `$PWD` or `dirname \"$(pwd)\"` is comparable even though the
 # two runs stage in different directories. There is NO same-directory
@@ -1588,6 +1638,7 @@ const HEADER: &str = "\
 #                           emitter divergence. Recorded so it is not mistaken
 #                           for parity, and so a future shared fix can flip the
 #                           token instead of the ledger silently going stale.
+
 #
 # bash is not the oracle for a script that hangs (timeout 124); the renders are
 # still compared against each other and the token records the bash difference.

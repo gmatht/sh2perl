@@ -2,6 +2,12 @@
 use strict;
 use warnings;
 our $CHILD_ERROR = 0;
+
+sub __sh_str {
+    my $__v = shift();
+    return defined($__v) ? $__v : q{};
+}
+
 my $__sh2_tc0;
 
 # __SH_RUN_EXT_BEGIN (UU-FFI.md external-command seam)
@@ -71,7 +77,7 @@ sub __sh_uu_capture {
 # __SH_RUN_EXT_END
 
 $__sh2_tc0 = do { my $_r = __sh_uu_capture('readlink', $ENV{FILE}); $CHILD_ERROR = $__sh_uu_rc; $_r =~ s/\n+\z//; $_r; };
-do { my $__sh2_void = ((((!(-l $ENV{FILE}) && -d $ENV{FILE})) || ((-l $ENV{FILE} && $__sh2_tc0 eq 'target')))); };
+do { my $__sh2_void = ((((!(-l __sh_str($ENV{FILE})) && -d __sh_str($ENV{FILE}))) || ((-l __sh_str($ENV{FILE}) && __sh_str($__sh2_tc0) eq 'target')))); };
 print("parsed OK\n");
 $? = 0 << 8; $CHILD_ERROR = $? >> 8;
 $? = 0 << 8; $CHILD_ERROR = $? >> 8;

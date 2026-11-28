@@ -3550,14 +3550,20 @@ fn native_sort_file_stmt(st: &mut IrStmt) -> bool {
     // `sort { $a cmp $b }` returns the list unchanged, while
     // `sort { our ($a, $b); $a cmp $b }` sorts correctly and silences the
     // "my $a used in sort comparison" warning.
+    // `-n` compares the lines NUMERICALLY, which bash's `sort -n` does by
+    // reading each line's leading number and treating a line with no number
+    // as 0. Perl's `<=>` does the same for a well-formed number but warns
+    // "Argument \"1 a\" isn't numeric" for text like `1 a` — stderr bash
+    // never printed. `__sh_num` is the same 0-defaulting read the arithmetic
+    // lowering uses.
     let cmp = if numeric {
-        "{ our ($a, $b); $a <=> $b }"
+        "{ our ($a, $b); __sh_num($a) <=> __sh_num($b) }"
     } else {
         "{ our ($a, $b); $a cmp $b }"
     };
     let reverse = if reverse { " @__sl = reverse @__sl;" } else { "" };
     let code = format!(
-        "do {{ my @__sl = do {{ local $INPUT_RECORD_SEPARATOR = undef; open(my $__fh, '<', {fq}) or do {{ $CHILD_ERROR = 2; () }}; my $__c = <$__fh> // ''; close $__fh; split(/\\n/, $__c) }}; pop @__sl if @__sl && $__sl[-1] eq q{{}}; @__sl = sort {cmp} @__sl;{reverse} open(my $__ofh, '>', {out}) or die \"sort: {out}: $ERRNO\"; if (@__sl) {{ print $__ofh join(\"\\n\", @__sl), \"\\n\"; }} close $__ofh; }}; $main_exit_code = $CHILD_ERROR = 0;"
+        "do {{ my @__sl = do {{ local $INPUT_RECORD_SEPARATOR = undef; if (open(my $__fh, '<', {fq})) {{ my $__c = <$__fh> // ''; close $__fh; split(/\\n/, $__c) }} else {{ print STDERR \"sort: cannot read: \", {fq}, \": $ERRNO\\n\"; $CHILD_ERROR = 2; () }} }}; pop @__sl if @__sl && $__sl[-1] eq q{{}}; @__sl = sort {cmp} @__sl;{reverse} open(my $__ofh, '>', {out}) or die \"sort: {out}: $ERRNO\"; if (@__sl) {{ print $__ofh join(\"\\n\", @__sl), \"\\n\"; }} close $__ofh; }}; $main_exit_code = $CHILD_ERROR = 0;"
     );
     *st = IrStmt::RawText(code);
     true
@@ -4170,8 +4176,13 @@ fn native_grep_file_pipeline(st: &mut IrStmt) -> bool {
         Some(p) => format!(" @__lp = grep {{ {invert_op}/{p}/ }} @__lp;"),
         None => String::new(),
     };
+    // The reader stage is `cat FILE` or `grep PAT FILE`; its own diagnostic
+    // names the command, so a missing input must be reported as
+    // `cat: FILE: No such file or directory` (bash's message) instead of the
+    // `readline() on closed filehandle` a `<$__f>` on the failed open emits.
+    let read_cmd = ws0[0].clone();
     let mut code = format!(
-        "do {{ my @__lp = do {{ local $INPUT_RECORD_SEPARATOR = undef; open(my $__f, '<', {fq}) or do {{ $CHILD_ERROR = 2; () }}; my $__c = <$__f> // ''; close $__f; split(/\\n/, $__c) }}; pop @__lp if @__lp && $__lp[-1] eq q{{}};{filter}"
+        "do {{ my @__lp = do {{ local $INPUT_RECORD_SEPARATOR = undef; if (open(my $__f, '<', {fq})) {{ my $__c = <$__f> // ''; close $__f; split(/\\n/, $__c) }} else {{ print STDERR \"{read_cmd}: \", {fq}, \": $ERRNO\\n\"; $CHILD_ERROR = 2; () }} }}; pop @__lp if @__lp && $__lp[-1] eq q{{}};{filter}"
     );
     for op in &ops {
         code.push_str(op);
@@ -4294,13 +4305,17 @@ fn emit_file_op(ops: &mut Vec<String>, ws: &[String]) -> bool {
                 (None, None) => ("$a".to_string(), "$b".to_string()),
                 _ => return false, // -t without -k (or -k without -t): skip
             };
-            let cmp = if numeric { "<=>" } else { "cmp" };
+            let cmp_expr = if numeric {
+                format!("__sh_num({sa}) <=> __sh_num({sb})")
+            } else {
+                format!("{sa} cmp {sb}")
+            };
             let r = if reverse { " @__lp = reverse @__lp;" } else { "" };
             // `our ($a, $b)` inside the block: a script-level `my $a`
             // (bash's `$a`) shadows Perl's sort globals and makes every
             // comparison see two undefs.
             ops.push(format!(
-                " @__lp = sort {{ our ($a, $b); {sa} {cmp} {sb} }} @__lp;{r}"
+                " @__lp = sort {{ our ($a, $b); {cmp_expr} }} @__lp;{r}"
             ));
             true
         }
@@ -7241,11 +7256,14 @@ mod tests {
     /// emits Perl's own filetest operator.
     #[test]
     fn unary_file_test_renders_a_filetest_not_the_flag_regex() {
+        // The operand is coerced with `__sh_str` — a file test reads the
+        // variable as TEXT, and an unset one is the empty string in bash
+        // (Perl's undef warns in `-f`/`-r`, which bash never printed).
         for (text, want) in [
-            (r#"-r "$dev" [["#, "-r $dev"),
-            (r#"-w "$out" [["#, "-w $out"),
-            (r#"-x "$bin" [["#, "-x $bin"),
-            (r#"-e "$cfg" [["#, "-e $cfg"),
+            (r#"-r "$dev" [["#, "-r __sh_str($dev)"),
+            (r#"-w "$out" [["#, "-w __sh_str($out)"),
+            (r#"-x "$bin" [["#, "-x __sh_str($bin)"),
+            (r#"-e "$cfg" [["#, "-e __sh_str($cfg)"),
         ] {
             let got = raw(render_test_tokens(text));
             assert_eq!(got, want, "`{text}` must render the actual file test");

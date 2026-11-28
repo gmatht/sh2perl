@@ -4822,6 +4822,52 @@ sub strHasSuffix {
 }
 "#;
 
+// ── Numeric read of a shell variable (arithmetic operands) ─────────────
+//
+// `src/ir.rs`'s `arith_read` wraps every arithmetic VARIABLE read in this
+// helper. bash arithmetic treats an unset/empty variable as 0 silently and a
+// non-numeric value as 0; Perl's numeric context warns under `use warnings`
+// for `undef` and `""` (and "Argument \"x\" isn't numeric" for the rest), so
+// a script that accumulates into an uninitialised variable emitted stderr
+// bash never printed (031_control_flow_loops's `j=$((j+1))`, typeset-cmdsub's
+// `n="hello"` under `typeset -i`, the `sort -n` key of
+// 088_while_read_ifs_sort). The value is unchanged; only the diagnostic goes.
+pub const NUM_PREAMBLE: &str = r#"
+sub __sh_num {
+    # bash arithmetic, not Perl's numeric context: unset and empty are 0,
+    # and so is anything that does not parse as a number (bash warns for the
+    # last case, but the value is 0 either way — the surrounding expression
+    # must not inherit undef).
+    my $__v = shift();
+    return 0 if !defined($__v) || $__v eq q{};
+    no warnings qw(numeric);
+    return 0 + $__v;
+}
+"#;
+
+// ── Textual read of a shell variable (test operands, case discriminants) ──
+//
+// An unset shell variable expands to the EMPTY string. Perl's undef is a
+// different thing: `$x ne ''`, `-f $x`, `$x =~ s///` and `split(//, $x)` all
+// warn under `use warnings`, and bash printed nothing for any of them. The
+// value is the same empty string, so only the diagnostic differs.
+pub const STR_PREAMBLE: &str = r#"
+sub __sh_str {
+    my $__v = shift();
+    return defined($__v) ? $__v : q{};
+}
+"#;
+
+/// True when the rendered program needs `__sh_str` defined.
+pub fn needs_str_helper(perl_src: &str) -> bool {
+    perl_src.contains("__sh_str(")
+}
+
+/// True when the rendered program needs `__sh_num` defined.
+pub fn needs_num_helper(perl_src: &str) -> bool {
+    perl_src.contains("__sh_num(")
+}
+
 /// Define every runtime helper the rendered program CALLS, exactly once.
 ///
 /// This is the single owner of the helper preambles: the calls are emitted by
@@ -4833,7 +4879,9 @@ pub fn inject_renderer_helpers(mut src: String) -> String {
     // `sub` is file scope: a helper must precede the first use, and Perl
     // resolves a named sub called without parens at compile time, so each one
     // is injected right after the `use` block, before any statement runs.
-    let helpers: [(fn(&str) -> bool, &str); 5] = [
+    let helpers: [(fn(&str) -> bool, &str); 7] = [
+        (needs_num_helper, NUM_PREAMBLE),
+        (needs_str_helper, STR_PREAMBLE),
         (needs_fn_status_helper, FN_STATUS_PREAMBLE),
         (needs_slice_helper, SLICE_PREAMBLE_2),
         (needs_pos_slice_helper, SLICE_PREAMBLE),

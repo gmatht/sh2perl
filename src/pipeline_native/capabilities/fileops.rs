@@ -90,7 +90,15 @@ pub(crate) fn emit(ctx: &NativeCtx) -> Option<NativeEmit> {
     let aq = crate::ir::safe_perl_q_string(a);
     let bq = crate::ir::safe_perl_q_string(b);
     let body = match cmd.as_str() {
-        "cp" => format!("require File::Copy; my $__ok = File::Copy::copy({aq}, {bq});"),
+        // A failed cp is not silent: GNU cp reports the missing source on
+        // stderr (`cp: cannot stat 'file1': No such file or directory`) and
+        // exits 1. The status below already matched; only the diagnostic was
+        // dropped (builtin-system-open3).
+        "cp" => format!(
+            "require File::Copy; my $__ok = File::Copy::copy({aq}, {bq}); \
+             if (!$__ok && $ERRNO eq q{{No such file or directory}}) {{ \
+                 print STDERR \"cp: cannot stat '\", {aq}, \"': $ERRNO\\n\"; }}"
+        ),
         "mv" => format!("my $__ok = rename({aq}, {bq});"),
         _ => return None,
     };

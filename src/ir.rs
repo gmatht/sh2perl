@@ -2762,7 +2762,11 @@ fn emit_stmt_owned(out: &mut String, stmt: &IrStmt, indent: usize) {
             // case $x in pat1) …;; pat2) …;; *) …;; esac → if/elsif chain on
             // regex-translated glob patterns (bash case is anchored glob
             // matching on the value).
-            let d = ir_expr_to_perl(discriminant);
+            // The discriminant is read as TEXT: `case "$1"` on an unset
+            // positional is the empty string in bash, and matching that undef
+            // warned "Use of uninitialized value $__sh_args[0] in pattern
+            // match" (057_case, 062_hard_to_lex, 064_hard_to_generate).
+            let d = format!("__sh_str({})", ir_expr_to_perl(discriminant));
             // bash's case status is the matched arm's last command, or 0
             // when no arm matched. Clear to 0 up front; a taken arm
             // overwrites it with its own final status.
@@ -5537,6 +5541,21 @@ fn perl_lhs_for(var: &str) -> String {
     }
 }
 
+/// A NUMERIC read of a shell variable inside an arithmetic expression.
+///
+/// bash arithmetic reads an unset or empty variable as 0 (`j=$((j+1))` on an
+/// unset `j` prints 1 and no diagnostic), and a non-numeric value as 0. Letting
+/// Perl do that directly is what emitted `int(($j + 1))`, which under
+/// `use warnings` printed "Use of uninitialized value $j in addition (+)" —
+/// text bash never produced — for every script that accumulates into a
+/// variable it never initialises (031_control_flow_loops, let-builtin,
+/// 065_yes_head_while, typeset-cmdsub, …). The helper keeps bash's value and
+/// drops the warning; `ArithAst::Assign`/`IncDec` deliberately do NOT go
+/// through it, because there the read is an lvalue.
+fn arith_read(name: &str) -> String {
+    format!("__sh_num({})", var_read(name))
+}
+
 /// Render a variable read: getVar("x") / Var("x") → `$x` / `$ENV{x}`;
 /// bash positional params ($1 → $ARGV[0]) and specials ($#, $?, $@).
 fn var_read(name: &str) -> String {
@@ -5554,6 +5573,12 @@ fn var_read(name: &str) -> String {
         return format!("${}", name);
     }
     if is_env_style_var_name(name) {
+        // NOT coerced here: `${x:-default}` / `${x-default}` lower to
+        // `defined($x) ? … : …` and this read is the argument of that
+        // `defined()`. Replacing it with `($x // '')` made the test always
+        // true, so the default branch never ran (param-expand-default-operator).
+        // Coercion belongs to the operands that are read as TEXT — the test
+        // lowering and `case` — which is where `__sh_str` is applied.
         return format!("$ENV{{{}}}", name);
     }
     if !name.is_empty() && name.chars().all(|c| c.is_ascii_digit()) {
@@ -6083,10 +6108,27 @@ fn arith_str_to_perl(s: &str) -> Option<String> {
 fn arith_ast_to_perl(ast: &ArithAst) -> String {
     match ast {
         ArithAst::Num(n) => n.to_string(),
-        ArithAst::Var(name) => var_read(name),
-        ArithAst::Ident(name) => var_read(name),
+        ArithAst::Var(name) => arith_read(name),
+        ArithAst::Ident(name) => arith_read(name),
         ArithAst::Index { var, key } => {
-            format!("${{{}}}[{}]", var, arith_ast_to_perl(key))
+            // An indexed read in arithmetic follows the same array/hash split
+            // the lvalue lowering uses (`perl_lhs_for`): an ARRAY indexes
+            // with the subscript's numeric value, an associative array with
+            // its STRING key, for which a bare identifier is the literal key
+            // (`result[i]` is key "i", not the value of `$i`) — the two sides
+            // of `result[i]=$((result[i]+1))` must name the same element.
+            let base = var.replace('.', "_").replace('-', "_");
+            if array_var(&base) {
+                format!("${}[{}]", base, arith_ast_to_perl(key))
+            } else {
+                let k = match &**key {
+                    ArithAst::Var(n) | ArithAst::Ident(n) => {
+                        format!("'{}'", n.replace('\'', "\\'"))
+                    }
+                    other => arith_ast_to_perl(other),
+                };
+                format!("${}{{{}}}", base, k)
+            }
         }
         ArithAst::Bin { op, lhs, rhs } => {
             let l = arith_ast_to_perl(lhs);
@@ -6144,7 +6186,10 @@ fn arith_ast_to_perl(ast: &ArithAst) -> String {
             arith_ast_to_perl(else_)
         ),
         ArithAst::Assign { var, op, rhs } => {
-            format!("{}{}{}", var_read(var), op, arith_ast_to_perl(rhs))
+            // The target is an LVALUE: `var_read` renders reads (and may
+            // coerce an unset value), so the write goes through the same
+            // target function the statement-level assignment uses.
+            format!("{}{}{}", perl_lhs_for(var), op, arith_ast_to_perl(rhs))
         }
         ArithAst::IncDec { var, delta, prefix } => {
             let v = var_read(var);
@@ -10265,7 +10310,7 @@ fn try_native_while_read_sort(out: &mut String, call: &IrExpr, indent: usize) ->
     // (bash's `$a`) shadows Perl's sort package globals file-wide and
     // makes every comparison see two undefs, leaving the input unsorted.
     let cmp = if sort_flags.iter().any(|f| f == "-n") {
-        "our ($a, $b); $a <=> $b"
+        "our ($a, $b); __sh_num($a) <=> __sh_num($b)"
     } else {
         "our ($a, $b); $a cmp $b"
     };
@@ -10368,7 +10413,7 @@ fn try_native_for_sort(out: &mut String, call: &IrExpr, indent: usize) -> bool {
     // (bash's `$a`) shadows Perl's sort package globals file-wide and
     // makes every comparison see two undefs, leaving the input unsorted.
     let cmp = if sort_flags.iter().any(|f| f == "-n") {
-        "our ($a, $b); $a <=> $b"
+        "our ($a, $b); __sh_num($a) <=> __sh_num($b)"
     } else {
         "our ($a, $b); $a cmp $b"
     };
@@ -11700,7 +11745,12 @@ fn body_mentions_sigil(body: &str, name: &str, sigil: Sigil) -> bool {
             let start = from + rel;
             let end = start + probe.len();
             let before_ok = body[..start].chars().next_back().is_none_or(|c| !is_ident(c));
-            let after_ok = body[end..].chars().next().is_none_or(|c| !is_ident(c));
+            // A probe ending in `[` is followed by a SUBSCRIPT EXPRESSION, not
+            // by more of the name: `${x}[__sh_num($i)]` is still an array
+            // read of `x`, and applying the identifier boundary there left
+            // `@x` undeclared (`use strict` aborted 063_hard_to_parse).
+            let after_ok = probe.ends_with('[')
+                || body[end..].chars().next().is_none_or(|c| !is_ident(c));
             if before_ok && after_ok {
                 return true;
             }
@@ -12709,6 +12759,14 @@ pub(crate) fn render_test_token_list(toks: &[String]) -> Option<String> {
 
 /// A `[[ ]]`-flavored operand: strip quotes, `$var` → read, else literal.
 fn flat_operand(s: &str) -> String {
+    // A flattened `[[ ]]` operand is read as TEXT: an unset variable is the
+    // empty string in bash, and every Perl comparison built on it (`ne`,
+    // `=~`, glob match) warns on undef. Same coercion as
+    // `render_test_operand`.
+    coerce_text(flat_operand_raw(s))
+}
+
+fn flat_operand_raw(s: &str) -> String {
     let t = s.trim().trim_matches('"').trim_matches('\'');
     // `${…}` — delegate to the parameter-expansion renderer
     // (`"${arr[@]}"` was emitted verbatim, an invalid Perl interpolation).
@@ -13361,6 +13419,34 @@ pub(crate) fn param_text_to_perl(tok: &str) -> Option<String> {
 }
 
 pub(crate) fn render_test_operand(tok: &str) -> String {
+    // A test operand is a VALUE bash reads as text: an unset variable is the
+    // empty string, never undef. Perl's `ne`, `-f`, `-d`, `s///` and `split`
+    // all warn on undef, so `[ -n "${VAR}" ] || VAR=default` printed
+    // "Use of uninitialized value $ENV{VAR} in string ne" — stderr bash never
+    // produced (func-after-test-or, func-after-or-assign, and the `-f`/`-d`
+    // reads of 064_hard_to_generate).
+    coerce_text(render_test_operand_raw(tok))
+}
+
+/// Coerce a rendered operand to bash's text value — but only when the operand
+/// actually READS a variable. A literal is already a defined string, and
+/// wrapping it turned a bare `test` statement into a call expression in void
+/// context (`Useless use of string eq in void context`), where the previous
+/// constant comparison had been folded away at compile time
+/// (dollar-positional-arithmetic).
+fn coerce_text(raw: String) -> String {
+    let reads = raw.starts_with('$')
+        || raw.starts_with("($")
+        || raw.starts_with("__sh_")
+        || raw.starts_with("length(");
+    if reads {
+        format!("__sh_str({})", raw)
+    } else {
+        raw
+    }
+}
+
+fn render_test_operand_raw(tok: &str) -> String {
     // Strip surrounding source quotes (`"${arr[@]}"` arrives with them).
     // BOTH quote styles: a single-quoted operand is LITERAL data, and
     // leaving its quotes in place turned `[[ -z '' ]]` into
@@ -14430,7 +14516,11 @@ pub(crate) fn ir_expr_to_perl(expr: &IrExpr) -> String {
         IrExpr::Var(name, sigil) => match sigil.unwrap_or(Sigil::Scalar) {
             Sigil::Scalar => {
                 if is_env_style_var_name(name) && !scalar_phase_var(name) {
-                    format!("$ENV{{{}}}", name)
+                    // An unset environment variable reads as the empty string
+                    // in bash; Perl's undef warns in `ne` (the test-lowering
+                    // `-n X` → `X ne ""`, func-after-test-or). Reads only —
+                    // writes go through `perl_lhs_for`.
+                    format!("($ENV{{{}}} // '')", name)
                 } else {
                     format!("${}", name)
                 }
@@ -18841,9 +18931,12 @@ mod tests {
         ]}"#;
         let prog = crate::shir_json_in::shir_json_to_ir(src).expect("=~ test A1 ingress");
         let perl = shir_to_perl(&prog);
+        // The lhs goes through `__sh_str`: a `[[ $s =~ … ]]` operand is read
+        // as TEXT (bash's unset variable is the empty string), and the
+        // coercion is what stops the undef warning bash never prints.
         assert!(
-            perl.contains("($s =~ '^h')"),
-            "=~ renders a regex match: {perl}"
+            perl.contains("(__sh_str($s) =~ '^h')"),
+            "=~ renders a regex match on the textual operand: {perl}"
         );
         assert!(
             !perl.contains("eq '~'"),

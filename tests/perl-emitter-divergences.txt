@@ -18,7 +18,15 @@
 # behaviour-evidence is OBSERVED, not classified: the test renders both emitters,
 # runs each under `perl` in its OWN temp directory with stdin CLOSED and a hard
 # timeout (20s perl, 10s bash), runs the script under bash the same way, and
-# compares stdout, stderr and exit status. The one normalisation is the run's
+# compares stdout byte-exactly and stderr as a byte MULTISET, with the exit
+# status exact. The multiset is deliberate and applies to BOTH the bash
+# comparison and the render-vs-render one: a script whose own commands write to
+# fd 2 concurrently (063_hard_to_parse's delegated `grep … | head …`, 063_14's
+# two `sort`s) interleaves those bytes differently on every run of the SAME
+# program — four distinct byte strings in twenty runs of 063_14 — so byte
+# equality is not an observable property while the multiset is. Any missing,
+# extra or altered diagnostic changes the multiset and fails the test.
+# stdout and the exit status are compared byte-exactly. The one normalisation is the run's
 # own temp ROOT (and its `work` subdirectory) -> `<WORK>` in both streams, so a
 # script that prints `$PWD` or `dirname "$(pwd)"` is comparable even though the
 # two runs stage in different directories. There is NO same-directory
@@ -34,6 +42,7 @@
 #                           emitter divergence. Recorded so it is not mistaken
 #                           for parity, and so a future shared fix can flip the
 #                           token instead of the ledger silently going stale.
+
 #
 # bash is not the oracle for a script that hangs (timeout 124); the renders are
 # still compared against each other and the token records the bash difference.
@@ -83,18 +92,18 @@
 # observed: 222 scripts byte-identical, 210 scripts diverging
 #
 # path	classes	behaviour-evidence	differing-line-count
-examples/000__02_output_formatting_commands.sh	output-idiom,runtime-seam	render-eq+bash-diff	16
+examples/000__02_output_formatting_commands.sh	output-idiom,runtime-seam	render-eq+bash-eq	16
 examples/000__03_file_manipulation_commands.sh	output-idiom,runtime-seam	render-eq+bash-eq	10
 examples/000__04a_basic_command_substitution.sh	output-idiom	render-eq+bash-eq	4
 examples/000__04b_file_directory_operations.sh	output-idiom,runtime-seam	render-eq+bash-eq	4
-examples/000__04c_text_processing_commands.sh	output-idiom,runtime-seam	render-eq+bash-diff	38
+examples/000__04c_text_processing_commands.sh	output-idiom,runtime-seam	render-eq+bash-eq	38
 examples/000__04d_system_utilities.sh	output-idiom	render-eq+bash-eq	6
 examples/000__04e_file_manipulation.sh	output-idiom,runtime-seam	render-eq+bash-eq	10
 examples/000__04f_output_formatting.sh	output-idiom	render-eq+bash-eq	6
-examples/000__04g_checksum_commands.sh	output-idiom,runtime-seam	render-eq+bash-diff	8
+examples/000__04g_checksum_commands.sh	output-idiom,runtime-seam	render-eq+bash-eq	8
 examples/000__04h_complex_examples.sh	output-idiom,runtime-seam	render-eq+bash-diff	12
 examples/000__05_system_utilities.sh	output-idiom	render-eq+bash-eq	4
-examples/000__06_text_processing_commands.sh	output-idiom,runtime-seam	render-eq+bash-diff	38
+examples/000__06_text_processing_commands.sh	output-idiom,runtime-seam	render-eq+bash-eq	38
 examples/000__07_find_path_commands.sh	output-idiom,runtime-seam	render-eq+bash-eq	2
 examples/001_simple.sh	output-idiom	render-eq+bash-eq	2
 examples/002_control_flow.sh	output-idiom	render-eq+bash-eq	6
@@ -112,7 +121,7 @@ examples/027_parameter_expansion_defaults.sh	output-idiom	render-eq+bash-eq	6
 examples/028_arrays_indexed.sh	output-idiom	render-eq+bash-eq	4
 examples/029_arrays_associative.sh	output-idiom	render-eq+bash-eq	4
 examples/030_control_flow_if.sh	output-idiom	render-eq+bash-eq	2
-examples/031_control_flow_loops.sh	output-idiom	render-eq+bash-diff	6
+examples/031_control_flow_loops.sh	output-idiom	render-eq+bash-eq	6
 examples/032_control_flow_function.sh	output-idiom	render-eq+bash-eq	2
 examples/035_brace_expansion_practical.sh	output-idiom,runtime-seam	render-eq+bash-eq	2
 examples/040_process_substitution_comm.sh	output-idiom	render-eq+bash-eq	2
@@ -144,7 +153,7 @@ examples/063_09_complex_function_parameter_handling.sh	output-idiom	render-eq+ba
 examples/063_11_complex_while_loop.sh	output-idiom,runtime-seam	render-eq+bash-eq	6
 examples/063_12_complex_eval.sh	output-idiom	render-eq+bash-eq	2
 examples/063_13_nested_subshells.sh	output-idiom	render-eq+bash-eq	2
-examples/063_14_complex_redirects.sh	output-idiom	render-eq+bash-diff	2
+examples/063_14_complex_redirects.sh	output-idiom	render-eq+bash-eq	2
 examples/063_15_complex_function_definition.sh	output-idiom	render-eq+bash-eq	4
 examples/063_19_complex_function_call.sh	output-idiom	render-eq+bash-eq	4
 examples/063_hard_to_parse.sh	output-idiom,runtime-seam,slice-helper	render-eq+bash-diff	14
@@ -152,7 +161,7 @@ examples/064_01_complex_nested_subshells.sh	output-idiom,runtime-seam	render-eq+
 examples/064_03_complex_parameter_expansion.sh	output-idiom	render-eq+bash-eq	4
 examples/064_06_nested_arithmetic_expressions.sh	output-idiom	render-eq+bash-eq	2
 examples/064_09_process_substitution_pipeline.sh	output-idiom,runtime-seam	render-eq+bash-eq	4
-examples/064_10_nested_function_definitions.sh	output-idiom	render-eq+bash-diff	4
+examples/064_10_nested_function_definitions.sh	output-idiom	render-eq+bash-eq	4
 examples/064_13_complex_string_manipulation.sh	output-idiom	render-eq+bash-eq	8
 examples/064_14_nested_command_substitution_arithmetic.sh	output-idiom,runtime-seam	render-eq+bash-eq	4
 examples/064_15_complex_pipeline_multiple_redirects.sh	output-idiom,runtime-seam	render-eq+bash-eq	2
@@ -160,9 +169,9 @@ examples/064_16_function_complex_argument_handling.sh	output-idiom	render-eq+bas
 examples/064_17_complex_while_loop_nested_conditionals.sh	output-idiom	render-eq+bash-eq	2
 examples/064_19_complex_pattern_matching_extended_globs.sh	output-idiom	render-eq+bash-eq	6
 examples/064_21_complex_string_interpolation_multiple_variables.sh	output-idiom	render-eq+bash-eq	2
-examples/064_hard_to_generate.sh	output-idiom,runtime-seam	render-eq+bash-diff	20
-examples/065_yes_head_while.sh	output-idiom,runtime-seam	render-eq+bash-diff	2
-examples/070_cmp_basic.sh	output-idiom,runtime-seam	render-eq+bash-diff	34
+examples/064_hard_to_generate.sh	output-idiom,runtime-seam	render-eq+bash-eq	20
+examples/065_yes_head_while.sh	output-idiom,runtime-seam	render-eq+bash-eq	2
+examples/070_cmp_basic.sh	output-idiom,runtime-seam	render-eq+bash-eq	34
 examples/070_gnuisms_thorough.sh	output-idiom,runtime-seam,scratch-counter	render-eq+bash-eq	60
 examples/071_while_ifs_read.sh	output-idiom,runtime-seam	render-eq+bash-eq	2
 examples/075_eval_complex.sh	output-idiom	render-eq+bash-eq	2
@@ -173,7 +182,7 @@ examples/082_sort_locale.sh	output-idiom	render-eq+bash-eq	2
 examples/083_process_sub_missing_files.sh	output-idiom	render-eq+bash-eq	2
 examples/086_if_condition_pipe.sh	output-idiom	render-eq+bash-eq	2
 examples/087_function_cmd_sub.sh	output-idiom	render-eq+bash-eq	2
-examples/088_while_read_ifs_sort.sh	output-idiom,runtime-seam	render-eq+bash-diff	2
+examples/088_while_read_ifs_sort.sh	output-idiom,runtime-seam	render-eq+bash-eq	2
 examples/089_for_in_arith.sh	output-idiom	render-eq+bash-eq	2
 examples/091_while_pipe_var.sh	output-idiom	render-eq+bash-eq	2
 examples/092_for_arith_func.sh	output-idiom	render-eq+bash-eq	4
@@ -184,8 +193,8 @@ examples/104_pipeline_failure_var_capture.sh	output-idiom,runtime-seam	render-eq
 examples/105_background_copy_semantics.sh	output-idiom	render-eq+bash-eq	2
 examples/arith-array-index-expr.sh	output-idiom	render-eq+bash-eq	6
 examples/arith-bitwise-shift-operators.sh	output-idiom	render-eq+bash-eq	12
-examples/arithmetic-bracket-old-syntax.sh	output-idiom	render-eq+bash-diff	2
-examples/arithmetic-var-ref.sh	output-idiom	render-eq+bash-diff	2
+examples/arithmetic-bracket-old-syntax.sh	output-idiom	render-eq+bash-eq	2
+examples/arithmetic-var-ref.sh	output-idiom	render-eq+bash-eq	2
 examples/array-assignment-variable-subscript.sh	output-idiom	render-eq+bash-eq	2
 examples/array-subscript.sh	output-idiom	render-eq+bash-eq	2
 examples/at-var-default.sh	output-idiom	render-eq+bash-eq	2
@@ -198,7 +207,7 @@ examples/bench-strsubst.sh	output-idiom	render-eq+bash-eq	6
 examples/bench-subshell.sh	output-idiom	render-eq+bash-eq	2
 examples/brace-expansion-fail.sh	output-idiom	render-eq+bash-eq	2
 examples/brace-inside-cmdsubst.sh	output-idiom	render-eq+bash-eq	2
-examples/builtin-system-open3.sh	output-idiom,runtime-seam	render-eq+bash-diff	2
+examples/builtin-system-open3.sh	output-idiom,runtime-seam	render-eq+bash-eq	2
 examples/capture-paren-with-eval.sh	output-idiom	render-eq+bash-eq	2
 examples/case-arithmetic-body.sh	output-idiom	render-eq+bash-eq	2
 examples/cat-dash-stdin.sh	output-idiom,runtime-seam	render-eq+bash-eq	2
@@ -210,7 +219,7 @@ examples/checkqx-qx-var-rm.sh	output-idiom,runtime-seam	render-eq+bash-eq	2
 examples/chown-through-xargs.sh	output-idiom	render-eq+bash-eq	2
 examples/comment-like-in-string.sh	output-idiom,runtime-seam	render-eq+bash-eq	2
 examples/complex-pipe-subshell.sh	output-idiom,runtime-seam	render-eq+bash-eq	2
-examples/declare-let-keyword.sh	output-idiom	render-eq+bash-diff	2
+examples/declare-let-keyword.sh	output-idiom	render-eq+bash-eq	2
 examples/dollar-after-dollar.sh	output-idiom	render-eq+bash-eq	6
 examples/dollar-at-default-quoted.sh	output-idiom	render-eq+bash-eq	2
 examples/dollar-at-with-default.sh	output-idiom	render-eq+bash-eq	2
@@ -227,8 +236,8 @@ examples/eq-string-num-var.sh	output-idiom	render-eq+bash-eq	2
 examples/eval-assign.sh	output-idiom	render-eq+bash-eq	2
 examples/exitScript-function.sh	output-idiom	render-eq+bash-eq	2
 examples/for-loop-dollar-at.sh	output-idiom,runtime-seam	render-eq+bash-eq	2
-examples/func-after-or-assign.sh	output-idiom	render-eq+bash-diff	2
-examples/func-after-test-or.sh	output-idiom	render-eq+bash-diff	2
+examples/func-after-or-assign.sh	output-idiom	render-eq+bash-eq	2
+examples/func-after-test-or.sh	output-idiom	render-eq+bash-eq	2
 examples/function-space-paren.sh	output-idiom	render-eq+bash-eq	2
 examples/grep_p.sh	output-idiom,runtime-seam	render-eq+bash-eq	10
 examples/gunzip_example.sh	output-idiom,runtime-seam	render-eq+bash-eq	2
@@ -238,7 +247,7 @@ examples/hoist-loop-self-update.sh	output-idiom	render-eq+bash-eq	2
 examples/hot-scalar-accumulator-loop.sh	output-idiom	render-eq+bash-eq	2
 examples/id-cmdsub.sh	output-idiom,runtime-seam	render-eq+bash-eq	8
 examples/interactive-test-minus-t.sh	output-idiom	render-eq+bash-eq	2
-examples/let-builtin.sh	output-idiom	render-eq+bash-diff	2
+examples/let-builtin.sh	output-idiom	render-eq+bash-eq	2
 examples/let-plusassign.sh	output-idiom	render-eq+bash-eq	2
 examples/mixed-quoting.sh	output-idiom	render-eq+bash-eq	2
 examples/mul_xy.sh	output-idiom	render-eq+bash-eq	2
@@ -278,7 +287,7 @@ examples/test_grep.sh	output-idiom,runtime-seam	render-eq+bash-eq	2
 examples/test_system_builtin.sh	output-idiom,runtime-seam	render-eq+bash-eq	4
 examples/tsv-string-accumulate-loop.sh	output-idiom	render-eq+bash-eq	2
 examples/tty-cmdsub.sh	output-idiom,runtime-seam	render-eq+bash-eq	8
-examples/typeset-cmdsub.sh	output-idiom	render-eq+bash-diff	2
+examples/typeset-cmdsub.sh	output-idiom	render-eq+bash-eq	2
 examples/uname-in-qx.sh	output-idiom	render-eq+bash-eq	2
 examples/var-hash-pattern.sh	output-idiom	render-eq+bash-eq	2
 examples/variable-apostrophe-concat.sh	output-idiom	render-eq+bash-eq	2

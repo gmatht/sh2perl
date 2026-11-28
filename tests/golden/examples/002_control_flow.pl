@@ -1,7 +1,19 @@
 #!/usr/bin/env perl
 use strict;
 use warnings;
+
 use feature 'say';
+
+sub __sh_num {
+    # bash arithmetic, not Perl's numeric context: unset and empty are 0,
+    # and so is anything that does not parse as a number (bash warns for the
+    # last case, but the value is 0 either way — the surrounding expression
+    # must not inherit undef).
+    my $__v = shift();
+    return 0 if !defined($__v) || $__v eq q{};
+    no warnings qw(numeric);
+    return 0 + $__v;
+}
 
 our @__sh_args;
 our $__sh_args_n;
@@ -22,10 +34,10 @@ for my $__i (("1", "2", "3", "4", "5")) {
     say "Number: $i";
     $? = 0 << 8;
     }
-while (int($i) < int(10)) {
+while (int(__sh_num($i)) < int(10)) {
     say "Counter: $i";
     $? = 0 << 8;
-        $i = int(($i + 1));
+        $i = int((__sh_num($i) + 1));
 }
 sub greet {
     local @__sh_args = @_;

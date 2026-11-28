@@ -789,8 +789,11 @@ fn strings_content(words: &[IrExpr]) -> Option<String> {
         return None;
     }
     let f = crate::ir::safe_perl_q_string(&file);
+    // A missing input is not silence: GNU strings reports
+    // `strings: 'FILE': No such file` on stderr and exits 1, and the render
+    // emitted an empty string with nothing on stderr (000__02, 000__04g).
     Some(format!(
-        "do {{ local $/; if (open(my $__f, '<', {f})) {{ my $__c = <$__f>; close $__f; join(\"\\n\", ($__c =~ /([\\x20-\\x7e]{{4,}})/g)) }} else {{ '' }} }}"
+        "do {{ local $/; if (open(my $__f, '<', {f})) {{ my $__c = <$__f>; close $__f; join(\"\\n\", ($__c =~ /([\\x20-\\x7e]{{4,}})/g)) }} else {{ print STDERR \"strings: '\", {f}, \"': \", ($ERRNO eq q{{No such file or directory}} ? q{{No such file}} : $ERRNO), \"\\n\"; $CHILD_ERROR = 1; '' }} }}"
     ))
 }
 

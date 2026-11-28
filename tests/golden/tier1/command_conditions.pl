@@ -3,6 +3,7 @@ use strict;
 use warnings;
 our $CHILD_ERROR = 0;
 
+
 use feature 'say';
 
 sub strHasPrefix {
@@ -43,6 +44,17 @@ sub __sh_fn_status {
     our $CHILD_ERROR;
     $CHILD_ERROR = $st;
     return $st == 0 ? 1 : 0;
+}
+
+sub __sh_num {
+    # bash arithmetic, not Perl's numeric context: unset and empty are 0,
+    # and so is anything that does not parse as a number (bash warns for the
+    # last case, but the value is 0 either way — the surrounding expression
+    # must not inherit undef).
+    my $__v = shift();
+    return 0 if !defined($__v) || $__v eq q{};
+    no warnings qw(numeric);
+    return 0 + $__v;
 }
 
 our @__sh_args;
@@ -214,14 +226,14 @@ if (((sub { open(my $__gh, '<', '/etc/passwd') or return 0; local $/; my $__gc =
     $? = 0 << 8; $CHILD_ERROR = $? >> 8;
     }
 $n = "0";
-while (int($n) < int(2)) {
-    $n = int(($n + 1));
+while (int(__sh_num($n)) < int(2)) {
+    $n = int((__sh_num($n) + 1));
     say "while test: $n";
     $? = 0 << 8; $CHILD_ERROR = $? >> 8;
     }
 $m = "0";
-while (!(int($m) >=int(2))) {
-    $m = int(($m + 1));
+while (!(int(__sh_num($m)) >=int(2))) {
+    $m = int((__sh_num($m) + 1));
     say "until test: $m";
     $? = 0 << 8; $CHILD_ERROR = $? >> 8;
     }
@@ -229,7 +241,7 @@ do { my $__ok = 1; for my $__t ('cond-flag.txt') { if (open(my $__h, '>>', $__t)
 $i = "0";
 while (!((system('bash', '-c', q{'grep' '-q' 'x' 'cond-flag.txt' 2> '/dev/null'}) == 0))) {
     __sh_pipe_run(q{echo 'x' >> 'cond-flag.txt'}, "pipefail");
-    $i = int(($i + 1));
+    $i = int((__sh_num($i) + 1));
     say "while command: $i";
     $? = 0 << 8; $CHILD_ERROR = $? >> 8;
     }

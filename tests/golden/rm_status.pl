@@ -2,8 +2,14 @@
 use strict;
 use warnings;
 
+
+sub __sh_str {
+    my $__v = shift();
+    return defined($__v) ? $__v : q{};
+}
+
 do { my $__ok = 1; for my $__p ('/no/such/file') { unless (unlink($__p)) { $__ok = 0; print STDERR "rm: cannot remove '$__p': $!\n"; } } $? = ($__ok ? 0 : 1) << 8; };
-if ((0+($? >> 8)) == (0+'0')) {
+if ((0+__sh_str(($? >> 8))) == (0+'0')) {
     print "ok\n";
     $? = 0 << 8;
     $? = 0 << 8;

@@ -4,7 +4,25 @@ use warnings;
 use English qw(-no_match_vars $ERRNO $EVAL_ERROR $INPUT_RECORD_SEPARATOR $OS_ERROR $PROGRAM_NAME);
 
 our $CHILD_ERROR = 0;
+
+
 use feature 'say';
+
+sub __sh_str {
+    my $__v = shift();
+    return defined($__v) ? $__v : q{};
+}
+
+sub __sh_num {
+    # bash arithmetic, not Perl's numeric context: unset and empty are 0,
+    # and so is anything that does not parse as a number (bash warns for the
+    # last case, but the value is 0 either way — the surrounding expression
+    # must not inherit undef).
+    my $__v = shift();
+    return 0 if !defined($__v) || $__v eq q{};
+    no warnings qw(numeric);
+    return 0 + $__v;
+}
 
 my $mk;
 my $n;
@@ -74,7 +92,7 @@ $? = 0 << 8; $CHILD_ERROR = $? >> 8;
     open(STDERR, '>&', $__sh2_dupfh1) or die; close($__sh2_dupfh1);
     open(STDERR, '>&', $__sh2_dup1) or die;
 }
-if ((0+$CHILD_ERROR) == (0+'0')) {
+if ((0+__sh_str($CHILD_ERROR)) == (0+'0')) {
     print "if-bad\n";
     $? = 0 << 8; $CHILD_ERROR = $? >> 8;
     } else {
@@ -141,7 +159,7 @@ $? = 0 << 8; $CHILD_ERROR = $? >> 8;
 $mk = $CHILD_ERROR;
 say "mkdir-exists rc=$mk";
 $? = 0 << 8; $CHILD_ERROR = $? >> 8;
-if (int($mk) ne int(0)) {
+if (int(__sh_num($mk)) ne int(0)) {
     print "mkdir-exists-detected\n";
     $? = 0 << 8; $CHILD_ERROR = $? >> 8;
     }
@@ -218,8 +236,8 @@ say "true-after-false rc=$CHILD_ERROR";
 $? = 0 << 8; $CHILD_ERROR = $? >> 8;
 $n = "0";
 my $__sh_loop_rc0 = 0;
-while (int($n) < int(2)) {
-    $n = int(($n + 1));
+while (int(__sh_num($n)) < int(2)) {
+    $n = int((__sh_num($n) + 1));
     $? = 1 << 8; $CHILD_ERROR = $? >> 8;
     $__sh_loop_rc0 = $? >> 8;
 }
@@ -228,8 +246,8 @@ say "while-body-false rc=$CHILD_ERROR";
 $? = 0 << 8; $CHILD_ERROR = $? >> 8;
 $m = "0";
 my $__sh_loop_rc1 = 0;
-while (!(int($m) >=int(1))) {
-    $m = int(($m + 1));
+while (!(int(__sh_num($m)) >=int(1))) {
+    $m = int((__sh_num($m) + 1));
     $? = 0 << 8; $CHILD_ERROR = $? >> 8;
     $__sh_loop_rc1 = $? >> 8;
 }
@@ -321,7 +339,7 @@ open(STDERR, '>&', $__sh2_dupferr13) or die; close($__sh2_dupferr13); open(STDER
 }) {
     print "elif-cd-ok\n";
     $? = 0 << 8; $CHILD_ERROR = $? >> 8;
-    } elsif ($CHILD_ERROR == '0') {
+    } elsif (__sh_str($CHILD_ERROR) == '0') {
     print "elif-bad\n";
     $? = 0 << 8; $CHILD_ERROR = $? >> 8;
     }

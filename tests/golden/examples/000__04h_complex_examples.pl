@@ -5,7 +5,13 @@ use English qw(-no_match_vars $ERRNO $EVAL_ERROR $INPUT_RECORD_SEPARATOR $OS_ERR
 
 my $main_exit_code = 0;
 our $CHILD_ERROR = 0;
+
 use feature 'say';
+
+sub __sh_str {
+    my $__v = shift();
+    return defined($__v) ? $__v : q{};
+}
 
 our @__sh_args;
 our $__sh_args_n;
@@ -196,10 +202,10 @@ if ((($__nocasematch) ? lc('root') eq lc('root') : 'root' eq 'root')) {
     print "Not running as root\n";
     $? = 0 << 8; $CHILD_ERROR = $? >> 8;
     }
-if (("Darwin") =~ /^(?:Linux)$/) {
+if ((__sh_str("Darwin")) =~ /^(?:Linux)$/) {
     print "Running on Linux\n";
     $? = 0 << 8; $CHILD_ERROR = $? >> 8;
-    } elsif (("Darwin") =~ /^(?:Darwin)$/) {
+    } elsif ((__sh_str("Darwin")) =~ /^(?:Darwin)$/) {
     print "Running on macOS\n";
     $? = 0 << 8; $CHILD_ERROR = $? >> 8;
     } else {
@@ -230,8 +236,8 @@ $main_exit_code = $CHILD_ERROR = __sh_pipe_run(q{echo 'banana
 cherry
 date' > 'file2.txt'}, "pipefail");
 $process_result = do { my $__capf = "/tmp/sh2_cap_1_$$"; { open(my $__capso, '>&', \*STDOUT) or die "capture: $!\n"; close(STDOUT); open(STDOUT, '>', $__capf) or die "capture: $!\n";     $__ps_tmp0 = do { my $__sh_cap; $__sh_cap = do { require File::Temp; (File::Temp::tempfile('sh2_ps_XXXXXX', TMPDIR => 1, UNLINK => 0))[1] }; $? = 0 << 8; $CHILD_ERROR = $? >> 8; $__sh_cap =~ s/\n+\z// if defined $__sh_cap; $__sh_cap };
-do { my @__sl = do { local $INPUT_RECORD_SEPARATOR = undef; open(my $__fh, '<', 'file1.txt') or do { $CHILD_ERROR = 2; () }; my $__c = <$__fh> // ''; close $__fh; split(/\n/, $__c) }; pop @__sl if @__sl && $__sl[-1] eq q{}; @__sl = sort { our ($a, $b); $a cmp $b } @__sl; open(my $__ofh, '>', $__ps_tmp0) or die "sort: $__ps_tmp0: $ERRNO"; if (@__sl) { print $__ofh join("\n", @__sl), "\n"; } close $__ofh; }; $? = 0 << 8; $CHILD_ERROR = $? >> 8;    $__ps_tmp1 = do { my $__sh_cap; $__sh_cap = do { require File::Temp; (File::Temp::tempfile('sh2_ps_XXXXXX', TMPDIR => 1, UNLINK => 0))[1] }; $? = 0 << 8; $CHILD_ERROR = $? >> 8; $__sh_cap =~ s/\n+\z// if defined $__sh_cap; $__sh_cap };
-do { my @__sl = do { local $INPUT_RECORD_SEPARATOR = undef; open(my $__fh, '<', 'file2.txt') or do { $CHILD_ERROR = 2; () }; my $__c = <$__fh> // ''; close $__fh; split(/\n/, $__c) }; pop @__sl if @__sl && $__sl[-1] eq q{}; @__sl = sort { our ($a, $b); $a cmp $b } @__sl; open(my $__ofh, '>', $__ps_tmp1) or die "sort: $__ps_tmp1: $ERRNO"; if (@__sl) { print $__ofh join("\n", @__sl), "\n"; } close $__ofh; }; $? = 0 << 8; $CHILD_ERROR = $? >> 8;    __sh_uu_run('comm', '-23', $__ps_tmp0, $__ps_tmp1);$? = ($__sh_uu_rc) << 8; $CHILD_ERROR = $? >> 8;
+do { my @__sl = do { local $INPUT_RECORD_SEPARATOR = undef; if (open(my $__fh, '<', 'file1.txt')) { my $__c = <$__fh> // ''; close $__fh; split(/\n/, $__c) } else { print STDERR "sort: cannot read: ", 'file1.txt', ": $ERRNO\n"; $CHILD_ERROR = 2; () } }; pop @__sl if @__sl && $__sl[-1] eq q{}; @__sl = sort { our ($a, $b); $a cmp $b } @__sl; open(my $__ofh, '>', $__ps_tmp0) or die "sort: $__ps_tmp0: $ERRNO"; if (@__sl) { print $__ofh join("\n", @__sl), "\n"; } close $__ofh; }; $? = 0 << 8; $CHILD_ERROR = $? >> 8;    $__ps_tmp1 = do { my $__sh_cap; $__sh_cap = do { require File::Temp; (File::Temp::tempfile('sh2_ps_XXXXXX', TMPDIR => 1, UNLINK => 0))[1] }; $? = 0 << 8; $CHILD_ERROR = $? >> 8; $__sh_cap =~ s/\n+\z// if defined $__sh_cap; $__sh_cap };
+do { my @__sl = do { local $INPUT_RECORD_SEPARATOR = undef; if (open(my $__fh, '<', 'file2.txt')) { my $__c = <$__fh> // ''; close $__fh; split(/\n/, $__c) } else { print STDERR "sort: cannot read: ", 'file2.txt', ": $ERRNO\n"; $CHILD_ERROR = 2; () } }; pop @__sl if @__sl && $__sl[-1] eq q{}; @__sl = sort { our ($a, $b); $a cmp $b } @__sl; open(my $__ofh, '>', $__ps_tmp1) or die "sort: $__ps_tmp1: $ERRNO"; if (@__sl) { print $__ofh join("\n", @__sl), "\n"; } close $__ofh; }; $? = 0 << 8; $CHILD_ERROR = $? >> 8;    __sh_uu_run('comm', '-23', $__ps_tmp0, $__ps_tmp1);$? = ($__sh_uu_rc) << 8; $CHILD_ERROR = $? >> 8;
     if ($CHILD_ERROR == 0) {
         do { unlink($__ps_tmp0, $__ps_tmp1); $? = 0 << 8; $CHILD_ERROR = $? >> 8; };
     }
