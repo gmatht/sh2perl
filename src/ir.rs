@@ -1213,7 +1213,19 @@ pub fn shir_to_perl(prog: &IrProgram) -> String {
     // detected; without it `${HOSTNAME:-localhost}` would read an unset
     // env var and print the default even though bash prints the machine
     // name.
-    let needs_hostname = prog.var_bash_env.iter().any(|n| n == "HOSTNAME");
+    //
+    // `analyze_var_bash_env` used to run only on the JSON side
+    // (`shir_json`), so the DIRECT render path (`ast_to_ir` →
+    // `shir_to_perl`, which the CLI uses) saw an empty list and never
+    // emitted the initialization: `${HOSTNAME:-localhost}` printed the
+    // default where bash printed the machine name (064_21). Compute it
+    // here when the IR carries none, so both entry points agree.
+    let var_bash_env = if prog.var_bash_env.is_empty() {
+        crate::shir::analyze_var_bash_env(prog)
+    } else {
+        prog.var_bash_env.clone()
+    };
+    let needs_hostname = var_bash_env.iter().any(|n| n == "HOSTNAME");
     if needs_hostname {
         imports.push("Sys::Hostname qw(hostname)".to_string());
     }
@@ -1459,7 +1471,7 @@ fn first_code_newline(s: &str) -> Option<usize> {
     if needs_hostname {
         out.push_str("$ENV{HOSTNAME} //= hostname();\n");
     }
-    if prog.var_bash_env.iter().any(|n| n == "BASH_VERSION") || body.contains("$ENV{BASH_VERSION}") {
+    if var_bash_env.iter().any(|n| n == "BASH_VERSION") || body.contains("$ENV{BASH_VERSION}") {
         out.push_str("$ENV{BASH_VERSION} //= do { my $v = `bash -c 'echo \\$BASH_VERSION'`; chomp $v; $v };\n");
     }
     // Blank line after imports block (only if there are imports)
@@ -2008,26 +2020,32 @@ fn printf_is_float(conv: char) -> bool {
 /// The wording matches bash's per-base diagnostics:
 ///   `zz` → `invalid number`,   `0xzz`/`0x1fzz` → `invalid hex number`,
 ///   `08` → `invalid octal number`.
+// NAMED captures (`$+{sg}`), never `$1`/`$2`: this template is generated
+// CODE, and the CLI's positional-parameter rewrite turns any bare `$<digit>`
+// into `$__sh_args[n-1]`. That mangled every capture reference into a
+// script-argument read, so `printf '%d' "$rc"` converted the wrong string,
+// warned "invalid number", and printed 0 where bash printed 1
+// (realpath-cmdsub).
 const PRINTF_NUM_INT_TPL: &str = r#"(do {
     my ($__pf_s, $__pf_v, $__pf_bad, $__pf_msg) = (EXPR, 0, 0, 'invalid number');
     my $__pf_t = $__pf_s;
     $__pf_t =~ s/\A[ \t\n]+//;
-    if ($__pf_t =~ /\A([+-]?)0[xX]([0-9a-fA-F]*)(.*)\z/s) {
-        $__pf_v = length($2) ? hex($2) : 0;
-        $__pf_v = -$__pf_v if $1 eq '-';
-        if (length($3) || !length($2)) { $__pf_bad = 1; $__pf_msg = 'invalid hex number'; }
-    } elsif ($__pf_t =~ /\A([+-]?)0[bB]([01]*)(.*)\z/s) {
-        $__pf_v = length($2) ? oct('0b' . $2) : 0;
-        $__pf_v = -$__pf_v if $1 eq '-';
-        $__pf_bad = 1 if length($3) || !length($2);
-    } elsif ($__pf_t =~ /\A([+-]?)0([0-7]*)(.*)\z/s) {
-        $__pf_v = length($2) ? oct('0' . $2) : 0;
-        $__pf_v = -$__pf_v if $1 eq '-';
-        if (length($3)) { $__pf_bad = 1; $__pf_msg = 'invalid octal number'; }
-    } elsif ($__pf_t =~ /\A([+-]?)([0-9]+)(.*)\z/s) {
-        $__pf_v = 0 + $2;
-        $__pf_v = -$__pf_v if $1 eq '-';
-        $__pf_bad = 1 if length($3);
+    if ($__pf_t =~ /\A(?<sg>[+-]?)0[xX](?<dg>[0-9a-fA-F]*)(?<rest>.*)\z/s) {
+        $__pf_v = length($+{dg}) ? hex($+{dg}) : 0;
+        $__pf_v = -$__pf_v if $+{sg} eq '-';
+        if (length($+{rest}) || !length($+{dg})) { $__pf_bad = 1; $__pf_msg = 'invalid hex number'; }
+    } elsif ($__pf_t =~ /\A(?<sg>[+-]?)0[bB](?<dg>[01]*)(?<rest>.*)\z/s) {
+        $__pf_v = length($+{dg}) ? oct('0b' . $+{dg}) : 0;
+        $__pf_v = -$__pf_v if $+{sg} eq '-';
+        $__pf_bad = 1 if length($+{rest}) || !length($+{dg});
+    } elsif ($__pf_t =~ /\A(?<sg>[+-]?)0(?<dg>[0-7]*)(?<rest>.*)\z/s) {
+        $__pf_v = length($+{dg}) ? oct('0' . $+{dg}) : 0;
+        $__pf_v = -$__pf_v if $+{sg} eq '-';
+        if (length($+{rest})) { $__pf_bad = 1; $__pf_msg = 'invalid octal number'; }
+    } elsif ($__pf_t =~ /\A(?<sg>[+-]?)(?<dg>[0-9]+)(?<rest>.*)\z/s) {
+        $__pf_v = 0 + $+{dg};
+        $__pf_v = -$__pf_v if $+{sg} eq '-';
+        $__pf_bad = 1 if length($+{rest});
     } else {
         $__pf_bad = 1;
     }
@@ -2039,20 +2057,20 @@ const PRINTF_NUM_FLT_TPL: &str = r#"(do {
     my ($__pf_s, $__pf_v, $__pf_bad, $__pf_msg) = (EXPR, 0, 0, 'invalid number');
     my $__pf_t = $__pf_s;
     $__pf_t =~ s/\A[ \t\n]+//;
-    if ($__pf_t =~ /\A([+-]?)0[xX]([0-9a-fA-F]*)(?:\.([0-9a-fA-F]*))?(?:[pP]([+-]?[0-9]+))?\z/s
-        && (length($2) || (defined($3) && length($3)))) {
-        $__pf_v = hex($2) + ((defined($3) && length($3)) ? hex($3) / 16 ** length($3) : 0);
-        $__pf_v *= 2 ** $4 if defined($4) && length($4);
-        $__pf_v = -$__pf_v if $1 eq '-';
+    if ($__pf_t =~ /\A(?<sg>[+-]?)0[xX](?<ip>[0-9a-fA-F]*)(?:\.(?<fp>[0-9a-fA-F]*))?(?:[pP](?<ex>[+-]?[0-9]+))?\z/s
+        && (length($+{ip}) || (defined($+{fp}) && length($+{fp})))) {
+        $__pf_v = hex($+{ip}) + ((defined($+{fp}) && length($+{fp})) ? hex($+{fp}) / 16 ** length($+{fp}) : 0);
+        $__pf_v *= 2 ** $+{ex} if defined($+{ex}) && length($+{ex});
+        $__pf_v = -$__pf_v if $+{sg} eq '-';
     } elsif ($__pf_t =~ /\A[+-]?(?:[0-9]+\.?[0-9]*|\.[0-9]+)(?:[eE][+-]?[0-9]+)?\z/s) {
         $__pf_v = 0 + $__pf_t;
     } else {
-        if ($__pf_t =~ /\A([+-]?)0[xX]([0-9a-fA-F]*)/) {
-            $__pf_v = hex($2);
-            $__pf_v = -$__pf_v if $1 eq '-';
+        if ($__pf_t =~ /\A(?<sg>[+-]?)0[xX](?<dg>[0-9a-fA-F]*)/) {
+            $__pf_v = hex($+{dg});
+            $__pf_v = -$__pf_v if $+{sg} eq '-';
             $__pf_msg = 'invalid hex number';
-        } elsif ($__pf_t =~ /\A([+-]?(?:[0-9]+\.?[0-9]*|\.[0-9]+)(?:[eE][+-]?[0-9]+)?)/) {
-            $__pf_v = 0 + $1;
+        } elsif ($__pf_t =~ /\A(?<num>[+-]?(?:[0-9]+\.?[0-9]*|\.[0-9]+)(?:[eE][+-]?[0-9]+)?)/) {
+            $__pf_v = 0 + $+{num};
         }
         $__pf_bad = 1;
     }
@@ -4516,15 +4534,32 @@ fn emit_stmt_owned(out: &mut String, stmt: &IrStmt, indent: usize) {
                 for s in else_ {
                     emit_stmt(out, s, indent + 1);
                 }
-            } else if matches!(cond, IrExpr::Str(_, _)) {
+            } else {
                 // bash: an `if` statement with no else returns 0 even when
-                // the test condition is false. Without this the
+                // the condition is false. Without this the
                 // `$CHILD_ERROR = (...) ? 0 : 1` above would leak a non-zero
                 // status into the parent context (e.g. interactive-test-minus-t).
-                emit_indent(out, indent);
-                out.push_str("} else {\n");
-                emit_indent(out, indent + 1);
-                out.push_str(&rc_write("$CHILD_ERROR = 0;\n"));
+                //
+                // This is NOT limited to folded shell `test` conditions
+                // (`IrExpr::Str`): bash's `if` status is 0 whenever no branch
+                // runs, whatever the condition was. An external command left
+                // its child status behind — `if ps -C nope >/dev/null; then
+                // :; fi; echo $?` printed 0 under bash and 1 under the emitted
+                // Perl (ps-system-call, parse-ef-test-operator).
+                //
+                // The write must be the REGISTER form, not a bare
+                // `$CHILD_ERROR = 0`: `$CHILD_ERROR` is the shell code a
+                // source `$?` read names, but a program whose last statement
+                // is the `if` exits through `exit $? >> 8`, and Perl's own
+                // `$?` still held the failed condition's wait status. That is
+                // why dollar-question-in-bracket exited 1 where bash exits 0.
+                let w = rc_write("$main_exit_code = $CHILD_ERROR = 0;\n");
+                if !w.is_empty() || matches!(cond, IrExpr::Str(_, _)) {
+                    emit_indent(out, indent);
+                    out.push_str("} else {\n");
+                    emit_indent(out, indent + 1);
+                    out.push_str(&w);
+                }
             }
             emit_indent(out, indent);
             out.push_str("}\n");

@@ -93,6 +93,25 @@ else
     )
 fi
 
+# Fixtures that exist to pin the PARSER's diagnostics: they must keep being
+# rejected (exit 2) and never reach the renderer. In `--all` they used to be
+# reported as "render failed", turning five green fixtures into five false
+# alarms; now the sweep asserts the rejection instead.
+parse_error_fixtures=(
+    parse-double-semicolon
+    parse-error-doublesemicolon
+    parse-parameter-expansion-eof
+    parse-paren-after-do
+    parse-unexpected-end-of-input
+)
+is_parse_error_fixture() {
+    local n
+    for n in "${parse_error_fixtures[@]}"; do
+        [ "$n" = "$1" ] && return 0
+    done
+    return 1
+}
+
 fail=0
 for f in "${examples[@]}"; do
     if [ ! -f "$f" ]; then
@@ -107,12 +126,29 @@ for f in "${examples[@]}"; do
     # (`perl_generator_fixed::generate`): the single renderer plus the
     # IR/text fixups the CLI applies. Testing bare `shir_to_perl` here would
     # gate a pipeline no user gets.
-    if ! "$BIN" --fixed "$f" >"$pl" 2>"$tmp/render.err"; then
+    "$BIN" --fixed "$f" >"$pl.rendered" 2>"$tmp/render.err"; render_rc=$?
+    if is_parse_error_fixture "$name"; then
+        if [ "$render_rc" = 2 ]; then
+            echo "ok   $name (parse-error fixture, rejected as intended)"
+            continue
+        fi
+        echo "FAIL $name: parse-error fixture exited $render_rc instead of 2"
+        fail=1
+        continue
+    fi
+    if [ "$render_rc" -ne 0 ]; then
         echo "FAIL $name: render failed"
         sed -n '1,5p' "$tmp/render.err"
         fail=1
         continue
     fi
+    # The rendered program runs as a temp `.pl`, so its `$0` would name that
+    # temp file. bash's `$0` is the script path AS INVOKED, and ordinary
+    # scripts derive their own location from it
+    # (`script_dir=$(cd -- "$(dirname "$0")" && pwd)`). Give the Perl the same
+    # `$0` so that derivation is compared on behaviour, not on the harness's
+    # choice of filename (057_case, qx-var-builtin-cd).
+    { printf '$0 = %s;\n' "'$root/$f'"; cat "$pl.rendered"; } >"$pl"
     if ! perl -w -c "$pl" >/dev/null 2>"$tmp/perl-c.err"; then
         echo "FAIL $name: perl -c"
         sed -n '1,5p' "$tmp/perl-c.err"
@@ -164,38 +200,83 @@ for f in "${examples[@]}"; do
 
     stdin_file="$root/tests/stdin/$name.stdin"
     [ -f "$stdin_file" ] || stdin_file=/dev/null
-    rm -rf "$tmp/$name.b" "$tmp/$name.p"
-    mkdir -p "$tmp/$name.b/work" "$tmp/$name.p/work"
-    # A renderer bug can invert a loop condition and make the PERL hang
-    # forever; a hang is a failure of this gate, not a waiting game.
-    ( cd "$tmp/$name.b/work" && timeout 60 bash "$root/$f" <"$stdin_file" >out 2>err; echo $? >rc )
-    ( cd "$tmp/$name.p/work" && timeout 60 perl "$pl"        <"$stdin_file" >out 2>err; echo $? >rc )
-    if [ "$(cat "$tmp/$name.p/work/rc")" = 124 ] || [ "$(cat "$tmp/$name.b/work/rc")" = 124 ]; then
+    # Both runs use the SAME absolute working directory, sequentially (wiped
+    # between them). Many examples print `pwd`; two differently-named temp
+    # dirs made a CORRECT render look wrong (058, 062_05, 062_hard_to_lex,
+    # qx-var-builtin-cd). A script that invokes a sibling by relative path
+    # gets a copy of examples/ — but only when its own source mentions it, so
+    # nothing else pays the copy.
+    wd="$tmp/$name/work"
+    run_side() {
+        local tag=$1
+        shift
+        rm -rf "$wd"
+        mkdir -p "$wd"
+        if grep -q 'examples/' "$f"; then
+            cp -a "$root/examples" "$wd/examples"
+        fi
+        # A renderer bug can invert a loop condition and make the PERL hang
+        # forever; a hang is a failure of this gate, not a waiting game.
+        ( cd "$wd" && timeout 60 "$@" <"$stdin_file" \
+            >"$tmp/$name.$tag.out" 2>"$tmp/$name.$tag.err"; echo $? >"$tmp/$name.$tag.rc" )
+    }
+    run_side b bash "$root/$f"
+    run_side p perl "$pl"
+    if [ "$(cat "$tmp/$name.p.rc")" = 124 ] || [ "$(cat "$tmp/$name.b.rc")" = 124 ]; then
         echo "FAIL $name: timed out (124) after 60s"
         fail=1
         continue
     fi
+    # `perl -w -c` only sees COMPILE-time warnings; the conditional-`== 0` and
+    # the diff-emulation uninitialised reads both appeared at RUN time. Treat
+    # the interpreter's own complaints as a failure here, where the run is.
+    #
+    # Scope: the warnings that are a WRONG-ANSWER signal for this backend —
+    # `Useless use` (a status compared in void context, the inverted-condition
+    # seam) and a masked redeclaration (a duplicated runtime helper). Plain
+    # `Use of uninitialized value` is a separate, older class (undef arithmetic
+    # in the corpus, ~50 examples); it is recorded in
+    # tests/bash-parity-known-gaps.txt rather than gating here, because
+    # declaring it a failure would hide the stdout comparison behind a known
+    # backlog it did not create.
+    if grep -Eq 'Useless use of|masks earlier declaration' \
+        "$tmp/$name.p.err"; then
+        echo "FAIL $name: perl -w runtime warnings"
+        grep -E 'Useless use of|masks earlier declaration' \
+            "$tmp/$name.p.err" | sed -n '1,5p'
+        fail=1
+        continue
+    fi
+    # `$0` is invocation metadata: bash sees the script path, the Perl sees its
+    # rendered .pl. Normalize both to <script> so a usage message that prints
+    # `$0` compares on its content, not on the temp path (057_case).
+    for tag in b p; do
+        sed -e "s|$root/$f|<script>|g" -e "s|$pl|<script>|g" \
+            "$tmp/$name.$tag.out" >"$tmp/$name.$tag.nout"
+        sed -e "s|$root/$f|<script>|g" -e "s|$pl|<script>|g" \
+            "$tmp/$name.$tag.err" >"$tmp/$name.$tag.nerr.raw"
+    done
 
     # A declared expectation makes the comparison prove the DOCUMENTED
     # behaviour, not merely that two runs agree with each other.
     expected=$(sed -n 's/^# expected (bash): //p' "$f" | head -1)
     if [ -n "$expected" ]; then
         printf '%s\n' "$expected" >"$tmp/$name.expected"
-        if ! diff -q "$tmp/$name.expected" "$tmp/$name.b/work/out" >/dev/null; then
+        if ! diff -q "$tmp/$name.expected" "$tmp/$name.b.nout" >/dev/null; then
             echo "FAIL $name: bash stdout differs from the declared expectation"
-            diff -u "$tmp/$name.expected" "$tmp/$name.b/work/out" | sed -n '1,12p'
+            diff -u "$tmp/$name.expected" "$tmp/$name.b.nout" | sed -n '1,12p'
             fail=1
             continue
         fi
     fi
-    if ! diff -q "$tmp/$name.b/work/out" "$tmp/$name.p/work/out" >/dev/null; then
+    if ! diff -q "$tmp/$name.b.nout" "$tmp/$name.p.nout" >/dev/null; then
         echo "FAIL $name: stdout differs"
-        diff -u "$tmp/$name.b/work/out" "$tmp/$name.p/work/out" | sed -n '1,12p'
+        diff -u "$tmp/$name.b.nout" "$tmp/$name.p.nout" | sed -n '1,12p'
         fail=1
         continue
     fi
-    if [ "$(cat "$tmp/$name.b/work/rc")" != "$(cat "$tmp/$name.p/work/rc")" ]; then
-        echo "FAIL $name: exit $(cat "$tmp/$name.b/work/rc") vs $(cat "$tmp/$name.p/work/rc")"
+    if [ "$(cat "$tmp/$name.b.rc")" != "$(cat "$tmp/$name.p.rc")" ]; then
+        echo "FAIL $name: exit $(cat "$tmp/$name.b.rc") vs $(cat "$tmp/$name.p.rc")"
         fail=1
         continue
     fi
@@ -210,8 +291,8 @@ for f in "${examples[@]}"; do
     *) strict_stderr=0 ;;
     esac
     if [ "$strict_stderr" = 1 ]; then
-        sed -E 's/^.*: line [0-9]+: //' "$tmp/$name.b/work/err" >"$tmp/$name.b.nerr"
-        sed -E 's/^.*: line [0-9]+: //' "$tmp/$name.p/work/err" \
+        sed -E 's/^.*: line [0-9]+: //' "$tmp/$name.b.nerr.raw" >"$tmp/$name.b.nerr"
+        sed -E 's/^.*: line [0-9]+: //' "$tmp/$name.p.nerr.raw" \
             | grep -v '^sh2perl: uu-ffi ' >"$tmp/$name.p.nerr"
         if ! diff -q "$tmp/$name.b.nerr" "$tmp/$name.p.nerr" >/dev/null; then
             echo "FAIL $name: stderr differs"

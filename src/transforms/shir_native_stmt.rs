@@ -3983,18 +3983,20 @@ fn native_grep_file_pipeline(st: &mut IrStmt) -> bool {
                         _ => return false,
                     }
                 }
-                // the fd1 w target
+                // Every redirect of this stage arrives as ONE
+                // `Array([Object, …])`, so looking at the array's first
+                // element (the old shape) saw only fd 1 and silently dropped
+                // `2> errors.log`: the file was never created, and the
+                // script's later `*.log` glob printed the literal where bash
+                // listed errors.log (064_hard_to_generate).
                 let mut o: Option<String> = None;
                 for spec in args.iter().skip(1) {
-                    let obj = match spec {
-                        IrExpr::Object(fields) => Some(fields),
-                        IrExpr::Array(elems) => match elems.first() {
-                            Some(IrExpr::Object(fields)) => Some(fields),
-                            _ => None,
-                        },
-                        _ => None,
+                    let flattened: &[IrExpr] = match spec {
+                        IrExpr::Array(elems) => elems,
+                        one => std::slice::from_ref(one),
                     };
-                    if let Some(fields) = obj {
+                    for one in flattened {
+                        let IrExpr::Object(fields) = one else { return false };
                         let mut fd = 1;
                         let mut mode = String::new();
                         let mut target: Option<&IrExpr> = None;
@@ -4013,10 +4015,13 @@ fn native_grep_file_pipeline(st: &mut IrStmt) -> bool {
                                 target = Some(v);
                             }
                         }
-                        if fd == 1 && (mode == "w" || mode == "wc") {
-                            if let Some(IrExpr::Str(t, _)) = target {
-                                o = Some(crate::ir::safe_perl_q_string(t));
-                            }
+                        // Refuse anything this fusion cannot honour instead
+                        // of silently dropping it.
+                        if fd != 1 || !(mode == "w" || mode == "wc") {
+                            return false;
+                        }
+                        if let Some(IrExpr::Str(t, _)) = target {
+                            o = Some(crate::ir::safe_perl_q_string(t));
                         }
                     }
                 }
@@ -5735,7 +5740,7 @@ fn native_diff_files_stmt(st: &mut IrStmt) -> bool {
         None => r#" my $__is_out = 0; my $__fh = \*STDOUT; "#.to_string(),
     };
     let code = format!(
-        r#"my $__rc = 0; do {{ my @__a = split(/\n/, do {{ local $INPUT_RECORD_SEPARATOR = undef; open(my $__f, '<', {f1}) or die "diff: {f1}: $ERRNO"; my $__c = <$__f>; close $__f; $__c }}, -1); pop @__a if @__a && $__a[-1] eq q{{}}; my @__b = split(/\n/, do {{ local $INPUT_RECORD_SEPARATOR = undef; open(my $__g, '<', {f2}) or die "diff: {f2}: $ERRNO"; my $__c = <$__g>; close $__g; $__c }}, -1); pop @__b if @__b && $__b[-1] eq q{{}}; my @__dp; for my $__i (0..$#__a) {{ for my $__j (0..$#__b) {{ if ($__a[$__i] eq $__b[$__j]) {{ $__dp[$__i+1][$__j+1] = $__dp[$__i][$__j] + 1; }} else {{ $__dp[$__i+1][$__j+1] = ($__dp[$__i][$__j+1] > $__dp[$__i+1][$__j]) ? $__dp[$__i][$__j+1] : $__dp[$__i+1][$__j]; }} }} }} my ($__i, $__j) = ($#__a, $#__b); my @__ops; while ($__i >= 0 && $__j >= 0) {{ if ($__a[$__i] eq $__b[$__j]) {{ unshift @__ops, [0, $__i, $__j]; $__i--; $__j--; }} elsif ($__dp[$__i][$__j+1] >= $__dp[$__i+1][$__j]) {{ unshift @__ops, [-1, $__i, $__j]; $__i--; }} else {{ unshift @__ops, [1, $__i, $__j]; $__j--; }} }} while ($__i >= 0) {{ unshift @__ops, [-1, $__i, -1]; $__i--; }} while ($__j >= 0) {{ unshift @__ops, [1, -1, $__j]; $__j--; }} {out_code}my $__changed = 0; my $__idx = 0; my $__common = -1; while ($__idx < @__ops) {{ if ($__ops[$__idx][0] == 0) {{ $__common = $__ops[$__idx][1] + 1; $__idx++; next; }} my @__dels; my @__adds; my $__last_a = -1; my $__last_b = -1; while ($__idx < @__ops && $__ops[$__idx][0] != 0) {{ if ($__ops[$__idx][0] == -1) {{ push @__dels, $__ops[$__idx][1]; $__last_a = $__ops[$__idx][1]; }} else {{ push @__adds, $__ops[$__idx][2]; $__last_b = $__ops[$__idx][2]; }} $__idx++; }} $__changed = 1; my $__a1 = $__dels[0] + 1; my $__a2 = $__dels[-1] + 1; my $__b1 = $__adds[0] + 1; my $__b2 = $__adds[-1] + 1; my $__astr = $__a1 == $__a2 ? "$__a1" : "$__a1,$__a2"; my $__bstr = $__b1 == $__b2 ? "$__b1" : "$__b1,$__b2"; my $__opch = (@__dels && @__adds) ? "c" : (@__dels ? "d" : "a"); my $__hdr; if ($__opch eq "c") {{ $__hdr = "$__astr$__opch$__bstr"; }} elsif ($__opch eq "d") {{ $__hdr = "$__astr$__opch" . (defined $__last_b ? $__last_b + 1 : 1); }} else {{ my $__apos = $__common; $__hdr = "$__apos$__opch$__bstr"; }} print $__fh "$__hdr\n"; for my $__k (@__dels) {{ print $__fh "< $__a[$__k]\n"; }} if (@__dels && @__adds) {{ print $__fh "---\n"; }} for my $__k (@__adds) {{ print $__fh "> $__b[$__k]\n"; }} }} $__rc = $__changed ? 1 : 0; close $__fh if $__is_out; }}; $main_exit_code = $CHILD_ERROR = $__rc; "#,
+        r#"{{ my $__rc = 0; my @__a = split(/\n/, do {{ local $INPUT_RECORD_SEPARATOR = undef; open(my $__f, '<', {f1}) or die "diff: {f1}: $ERRNO"; my $__c = <$__f>; close $__f; $__c }}, -1); pop @__a if @__a && $__a[-1] eq q{{}}; my @__b = split(/\n/, do {{ local $INPUT_RECORD_SEPARATOR = undef; open(my $__g, '<', {f2}) or die "diff: {f2}: $ERRNO"; my $__c = <$__g>; close $__g; $__c }}, -1); pop @__b if @__b && $__b[-1] eq q{{}}; my @__dp; $__dp[0] = [ (0) x (@__b + 1) ]; for my $__i (0..$#__a) {{ $__dp[$__i+1][0] = 0; for my $__j (0..$#__b) {{ if ($__a[$__i] eq $__b[$__j]) {{ $__dp[$__i+1][$__j+1] = $__dp[$__i][$__j] + 1; }} else {{ $__dp[$__i+1][$__j+1] = ($__dp[$__i][$__j+1] > $__dp[$__i+1][$__j]) ? $__dp[$__i][$__j+1] : $__dp[$__i+1][$__j]; }} }} }} my ($__i, $__j) = ($#__a, $#__b); my @__ops; while ($__i >= 0 && $__j >= 0) {{ if ($__a[$__i] eq $__b[$__j]) {{ unshift @__ops, [0, $__i, $__j]; $__i--; $__j--; }} elsif ($__dp[$__i][$__j+1] >= $__dp[$__i+1][$__j]) {{ unshift @__ops, [-1, $__i, $__j]; $__i--; }} else {{ unshift @__ops, [1, $__i, $__j]; $__j--; }} }} while ($__i >= 0) {{ unshift @__ops, [-1, $__i, -1]; $__i--; }} while ($__j >= 0) {{ unshift @__ops, [1, -1, $__j]; $__j--; }} {out_code}my $__changed = 0; my $__idx = 0; my $__common = 0; my $__common2 = 0; while ($__idx < @__ops) {{ if ($__ops[$__idx][0] == 0) {{ $__common = $__ops[$__idx][1] + 1; $__common2 = $__ops[$__idx][2] + 1; $__idx++; next; }} my @__dels; my @__adds; my $__last_a = -1; my $__last_b = -1; while ($__idx < @__ops && $__ops[$__idx][0] != 0) {{ if ($__ops[$__idx][0] == -1) {{ push @__dels, $__ops[$__idx][1]; $__last_a = $__ops[$__idx][1]; }} else {{ push @__adds, $__ops[$__idx][2]; $__last_b = $__ops[$__idx][2]; }} $__idx++; }} $__changed = 1; my ($__a1, $__a2) = @__dels ? ($__dels[0] + 1, $__dels[-1] + 1) : (0, 0); my ($__b1, $__b2) = @__adds ? ($__adds[0] + 1, $__adds[-1] + 1) : (0, 0); my $__astr = $__a1 == $__a2 ? "$__a1" : "$__a1,$__a2"; my $__bstr = $__b1 == $__b2 ? "$__b1" : "$__b1,$__b2"; my $__opch = (@__dels && @__adds) ? "c" : (@__dels ? "d" : "a"); my $__hdr; if ($__opch eq "c") {{ $__hdr = "$__astr$__opch$__bstr"; }} elsif ($__opch eq "d") {{ $__hdr = "$__astr$__opch" . $__common2; }} else {{ my $__apos = $__common; $__hdr = "$__apos$__opch$__bstr"; }} print $__fh "$__hdr\n"; for my $__k (@__dels) {{ print $__fh "< $__a[$__k]\n"; }} if (@__dels && @__adds) {{ print $__fh "---\n"; }} for my $__k (@__adds) {{ print $__fh "> $__b[$__k]\n"; }} }} $__rc = $__changed ? 1 : 0; close $__fh if $__is_out; $main_exit_code = $CHILD_ERROR = $__rc; }} "#,
         f1 = f1, f2 = f2
     );
     *st = IrStmt::RawText(code);
@@ -7180,3 +7185,10 @@ mod tests {
         );
     }
 }
+
+// Tests generated from the Verus manifests' [pins] rows by
+// proofs/verus/gen_pin_tests.py -- DO NOT EDIT the generated file by hand.
+// There is one test per pin; a pin flips to MAPPED only after its test passes.
+#[cfg(test)]
+#[path = "native_pin_tests.rs"]
+mod pin_tests;

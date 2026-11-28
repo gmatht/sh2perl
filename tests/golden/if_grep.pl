@@ -6,6 +6,8 @@ if (((sub { open(my $__gh, '<', '/etc/hostname') or return 0; local $/; my $__gc
     print "yes\n";
     $? = 0 << 8;
     $? = 0 << 8;
+} else {
+    $? = 0 << 8;
 }
 
 exit $? >> 8;

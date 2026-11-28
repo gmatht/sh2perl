@@ -1,10 +1,67 @@
-# Examples the differential gate does NOT compare, with the reason and the
-# emitters that were tried. Keep this list shrinking: each line is a known
-# wrong-output gap, not a pass. Delete the line when the example matches.
+# Status of the bash-vs-Perl differential gate (tests/bash-parity.sh).
 #
-# Triage 2026-11-26 — the retired renderer (git HEAD:src/perl_backend.rs,
-# 3.5k lines) was rebuilt in a throwaway module and run side by side with the
-# surviving ir::shir_to_perl on every gap example, with bash as reference:
+# The gate's contract: render with the SHIPPED CLI path (`perl_backend
+# --fixed`), require `perl -w -c` to accept the render and report no
+# `Useless use`/masked-redeclaration warning, then run bash and the Perl in
+# the SAME absolute working directory (wiped between runs) and compare stdout,
+# exit status, and — for tests/loop-status, tests/status and tests/tier1 —
+# stderr. `$0` is set identically for both (`$0 = <source path>`) and both
+# sides' paths are normalized to `<script>` before comparing, so invocation
+# metadata does not masquerade as behaviour.
+#
+# `bash tests/bash-parity.sh --all` sweep, 2026-11-28, shipped CLI, default
+# stack: 556 of 556 `examples/*.sh` match bash on stdout and exit status with
+# warning-free `perl -w -c`. The five `parse-error-*` fixtures are expected to
+# be REJECTED (exit 2) and are asserted as such, not rendered.
+#
+# Nothing is excluded from the `--all` comparison. The list below is empty by
+# construction: every corpus example is either compared and matching, or a
+# parse-error fixture that must not render.
+#
+# ── Known class NOT covered by the gate ──────────────────────────────────
+#
+# 52 examples emit `Use of uninitialized value …` on stderr at RUN time (undef
+# arithmetic, undef variables feeding case patterns / parameter expansion).
+# Their stdout and exit status still match bash, so they are not comparison
+# failures; they are a separate quality backlog, not the status/condition
+# class. The gate fails on the warnings that ARE a wrong-answer signal for
+# this backend (`Useless use of …`, `masks earlier declaration`) — the count
+# of those across the corpus is 0.
+#
+#   031_control_flow_loops            051_primes
+#   057_case                          062_08_simple_case
+#   062_hard_to_lex                   063_hard_to_parse
+#   064_05_complex_case_statement     064_hard_to_generate
+#   065_yes_head_while                arithmetic-bracket-old-syntax
+#   case-nested-esac-semicolon        case-pattern-pipe-paren
+#   case-pattern-star-pipe            declare-let-keyword
+#   echo-with-escaped-backtick-and-quotes
+#   echo-with-escaped-backtick        func-after-or-assign
+#   func-after-test-or                let-builtin
+#   multiple-awk-in-dqs                nested-case-esac
+#   parameter-expansion-nested        parameter-expansion-pattern
+#   parse-arithmetic-extra-paren      parse-at-slice-param
+#   parse-bare-quote-in-function      parse-bracket-chain
+#   parse-bracket-unexpected          parse-builtin-keywords-in-case-body
+#   parse-case-doublesemicolon        parse-case-paren-pattern
+#   parse-case-subject-complex        parse-comment-in-brace
+#   parse-dollar-in-arithmetic        parse-dollar-paren-or
+#   parse-dollar-paren-pipe           parse-double-semicolon-in-case
+#   parse-error-case-bracket          parse-escaped-backtick-case
+#   parse-escaped-quote-in-param-expansion
+#   parse-heredoc-paren               parse-posix-case-paren
+#   parse-redirect-in-case-body       parse-redirect-in-case-pattern
+#   parse-star-case-pattern           parse-substring-expansion
+#   quoted-case-pattern               return-double-semicolon
+#   test-expression-backslash-continuation
+#   typeset-cmdsub                    unicode-in-string
+#   zsh-style-eval-redirect
+#
+# ── Historical triage (kept for context) ─────────────────────────────────
+#
+# 2026-11-26 — the retired renderer (git HEAD:src/perl_backend.rs, 3.5k lines)
+# was rebuilt in a throwaway module and run side by side with the surviving
+# ir::shir_to_perl on every gap example, with bash as reference:
 #
 #   example                                     retired renderer   survivor
 #   examples/000__03_file_manipulation…         stdout differs     matches
@@ -15,23 +72,8 @@
 #   examples/000__06_text_processing…           stdout differs     matches
 #   examples/012_test_const_read               stdout differs     matches
 #
-# No example exists where the retired renderer matched bash and the survivor
-# does not, so nothing needed porting. Every curated example passes through
-# tests/bash-parity.sh; the list below is therefore empty. 000__05 and
-# 000__06 were dropped from the curated set afterwards: 05 is a strict
-# subset of 000__04d and 06 is 000__04c with a different input file, so they
-# cost runtime without adding signal.
-
-# Full-corpus sweep (2026-11-26, shipped `perl_backend --fixed` path, i.e.
-# perl_generator_fixed::generate): 496 of 555 `examples/*.sh` matched bash on
-# stdout AND exit status with warning-free `perl -w -c`. The remaining 59 were
-# not curated into the gate; they cluster in:
-#   - process substitution / here-strings and complex parameter expansion
-#     (30 stdout mismatches, e.g. 011_brace_expansion, 042_process_substitution_advanced);
-#   - inputs the parser deliberately rejects (5 render failures, parse-error-*);
-#   - renders `perl -w -c` rejects (23 perl-c, e.g. 063_hard_to_parse, 064_hard_to_generate);
-#   - 1 warning-only case (test-expression-backslash-continuation).
-# None of these is a per-example regression against the retired renderer: the
-# retired renderer was only compared on the curated ten above, where it lost
-# on every one. They are corpus coverage, not a hidden pass. Run them all with
-#   bash tests/bash-parity.sh --all
+# No example existed where the retired renderer matched bash and the survivor
+# did not, so nothing needed porting. 000__05 and 000__06 stay out of the
+# curated default list: 05 is a strict subset of 000__04d and 06 is 000__04c
+# with a different input file, so they cost runtime without adding signal.
+# They still run under `--all`.

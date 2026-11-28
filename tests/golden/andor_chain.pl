@@ -7,6 +7,8 @@ if ($? == 0) {
     print "made\n";
     $? = 0 << 8;
     $? = 0 << 8;
+} else {
+    $? = 0 << 8;
 }
 do { unlink('no_such_file_here'); $? = 0 << 8; };
 if (($? >> 8) != 0) {
