@@ -23,7 +23,11 @@
                   cluster G part 1 PROVED (shir_native_constant_pipeline.rs,
                   16 verified / 0 errors: the constant true/false pipeline fold,
                   its status law, its six refusals and d1 pipefail);
-                  clusters A, F3, F4 and the REST of G still planned — see §4
+                  cluster G part 2 PROVED (shir_native_command_v.rs, 19 verified /
+                  0 errors: native_command_v and command_v_redirect_truth against
+                  PATH resolution, the /dev/null sink law, d1 bare-form loss and
+                  d2 absent-listed-name); clusters A, F3, F4 and the REST of G
+                  still planned — see §4
 
 This is a PLAN, not a proof. It exists because `shir_native_stmt` is the one
 output-changing transform left whose property is not a single statement: it is

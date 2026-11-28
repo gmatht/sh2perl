@@ -1,5 +1,5 @@
 # verus-sync-coverage manifest: shir_native_echo
-# source sha: shir_native_stmt=2590419de896  proof sha: 8e189ebe723f
+# source sha: shir_native_stmt=4b19d676d789  proof sha: 8e189ebe723f
 #   RE-AUDITED 2026-11-28 at e45e2f3c2983 (the recorded value names d3e7fbe29
 #   "perl: validate printf operands the way bash does"): native_echo_stmt, decode_echo_escapes, native_printf_stmt, output_stmt
 #   and literal_text were

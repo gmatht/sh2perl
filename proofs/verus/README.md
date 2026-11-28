@@ -9330,6 +9330,51 @@ Declared out of model: a stage's stdin, `true()`/`false()` shell functions
 shadowing the builtins, `shopt -s lastpipe`, and the rest of cluster G (the
 let/declare folds, `command -v`, trap, subshell and perl folds).
 
+### Cluster G (part 2) — the `command -v` decision and its /dev/null gate (19 obligations + 11 executed pins)
+
+    verus --triggers-mode silent --rlimit 40 proofs/verus/shir_native_command_v.rs
+    -> verification results:: 19 verified, 0 errors
+
+`command -v NAME` asks whether NAME resolves through PATH. `shir_native_stmt.rs`
+answers it in two places — `native_command_v` (statement position) and
+`command_v_redirect_truth` (condition position) — from a hard-coded name list
+plus one literal missing name, gated on the shape, the `-v` flag and the sink.
+
+- **Two independent definitions, and the gap between them named.** The pass
+  consults a LIST; bash consults PATH (`resolves(avail, name)` = membership over
+  the reference PATH's programs). `status_law`/`cond_status_law` prove the fold's
+  status equals bash's resolution *given* the list names programs that really
+  resolve and the missing name really does not — and that hypothesis is
+  **measured, not assumed**: generated pins run `command -v` for every name in
+  the list (`pin_the_fold_claims_every_listed_name`,
+  `pin_an_absent_listed_name_diverges`, `pin_the_missing_name_is_absent`).
+- **The sink is load-bearing.** The rewrite prints nothing where bash prints the
+  path, so the two agree on stdout only behind `> /dev/null`
+  (`sink_law`). Hence `redirect_to_devnull` is not decoration, the condition fold
+  refuses every other shape (`cond_refuses_every_non_devnull_sink`), and the
+  statement fold refuses a file redirect (`stmt_refuses_a_file_sink`).
+- **Mutants** (on sha `29fa8993181d`, each restored byte-identically): the known
+  arm inverted 11v/8e; every name treated as known 14v/5e; the condition fold
+  accepting any sink 18v/1e; bash modelled as always printing a path 18v/1e;
+  `/dev/null` no longer swallowing 18v/1e.
+- **d1 (recorded).** The statement fold also fires on the BARE `command -v NAME`,
+  where bash prints the resolved path to stdout and the fold prints nothing. The
+  generated `pin_bare_form_is_lossy` runs bash to show the dropped output; a fix
+  needs a source gate, so it is a later stage.
+- **d2 (found by the measurement).** The list names `python`, which this machine
+  does not have (only `python3`), so `command -v python > /dev/null` exits 1
+  while the fold writes status 0. `pin_an_absent_listed_name_diverges` pins the
+  source's answer, and the generated test reports which listed names are absent
+  here rather than asserting a machine-specific set.
+- **Residue, stated not claimed.** The two source copies each repeat the same
+  ~53-name list; that agreement is a *data* equality (two long disjunctions), so
+  it is checked exhaustively by the generated `pin_the_two_copies_agree_…` (which
+  also caught that the fold mutates its argument), not "proved" by unfolding 53
+  string equalities.
+
+Declared out of model: PATH order and shadowing, aliases and functions,
+`command -v`'s output format for builtins and keywords, and extra redirect specs.
+
 ## `shir_native_stmt.rs` — no single law; a decomposition plan (cluster C proved)
 
     proofs/verus/shir_native_stmt_plan.md

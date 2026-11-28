@@ -1,5 +1,5 @@
 # verus-sync-coverage manifest: shir_native_f1
-# source sha: shir_native_stmt=2590419de896
+# source sha: shir_native_stmt=4b19d676d789
 # (RE-AUDITED 2026-11-28: the only drift since the previously recorded value is the
 #  six-line `#[cfg(test)] #[path = "grep_pin_tests.rs"] mod pin_tests_grep;`
 #  registration appended at EOF, after the existing pin-tests block and

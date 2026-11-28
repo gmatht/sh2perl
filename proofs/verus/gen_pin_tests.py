@@ -735,12 +735,190 @@ def emit_pipeline_pin(pin: dict) -> list[str]:
     return out
 
 
+COMMAND_V_HELPERS = '''use super::*;
+
+/// One redirect-spec object: the single fd-1 spec both callers insist on.
+fn cv_spec(fd: i64, mode: &str, target: &str) -> IrExpr {
+    IrExpr::Object(vec![
+        ("fd".to_string(), IrExpr::Int(fd)),
+        ("mode".to_string(), IrExpr::Str(mode.to_string(), StrStyle::Raw)),
+        ("target".to_string(), IrExpr::Str(target.to_string(), StrStyle::Raw)),
+    ])
+}
+
+/// `exec command FLAG NAME` as the inner statement.
+fn cv_call(flag: &str, name: &str) -> IrStmt {
+    IrStmt::Expr(IrExpr::Call {
+        func: "exec".to_string(),
+        args: vec![
+            st("command"),
+            IrExpr::Array(vec![st(flag), st(name)]),
+        ],
+    })
+}
+
+/// `redirect(command FLAG NAME, [spec])` — the shape both callers unwrap.
+fn cv_redirected(spec: IrExpr) -> Vec<IrExpr> {
+    vec![
+        IrExpr::Arrow(vec![cv_call("-v", "ls")]),
+        IrExpr::Array(vec![spec]),
+    ]
+}
+
+/// The statement the fold writes, or None if it did not fire.
+fn cv_status(st: &IrStmt) -> Option<bool> {
+    let IrStmt::Expr(IrExpr::Call { func, args }) = st else { return None };
+    if func != "exec" { return None }
+    let [IrExpr::Str(c, _), IrExpr::Array(w)] = args.as_slice() else { return None };
+    if !w.is_empty() { return None }
+    match c.as_str() {
+        "true" => Some(true),
+        "false" => Some(false),
+        _ => None,
+    }
+}
+
+/// `bash -c "command -v NAME"` succeeded?
+fn cv_bash_resolves(name: &str) -> bool {
+    std::process::Command::new("bash")
+        .arg("-c")
+        .arg(format!("command -v {}", name))
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .status()
+        .expect("bash")
+        .success()
+}
+'''
+
+
+def emit_command_v_pin(pin: dict) -> list[str]:
+    kind = pin["kind"]
+    out = [
+        "",
+        f"/// Manifest row: `pin {pin['pin']}` in shir_native_command_v_sync.txt.",
+        f"/// {pin['note']}",
+        "#[test]",
+        f"fn {pin['pin']}() {{",
+    ]
+    if kind == "cv_stmt":
+        sink = pin["sink"]
+        out.append(f'    let mut stmt = {pin["stmt_expr"]};')
+        if pin["expect"] is None:
+            out += ["    assert!(!native_command_v(&mut stmt),",
+                    '        "the fold must refuse this shape and keep the shell-out");',
+                    "    assert!(cv_status(&stmt).is_none());"]
+        else:
+            out += ["    assert!(native_command_v(&mut stmt),",
+                    '        "the fold must fire on a /dev/null-redirected command -v");',
+                    f"    assert_eq!(cv_status(&stmt), Some({'true' if pin['expect'] else 'false'}));"]
+    elif kind == "cv_cond":
+        out.append(f'    let args = {pin["cond_expr"]};')
+        if pin["expect"] is None:
+            out += ["    assert_eq!(command_v_redirect_truth(&args), None,",
+                    '        "a condition must only be decided behind > /dev/null");']
+        else:
+            out += [f"    assert_eq!(command_v_redirect_truth(&args), Some({'true' if pin['expect'] else 'false'}));"]
+    elif kind == "cv_bare_lossy":
+        out += [
+            '    let mut bare = IrStmt::Expr(IrExpr::Call { func: "exec".to_string(),',
+            '        args: vec![st("command"), IrExpr::Array(vec![st("-v"), st("ls")])] });',
+            "    // the fold fires on the bare form too ...",
+            "    assert!(native_command_v(&mut bare));",
+            "    assert_eq!(cv_status(&bare), Some(true));",
+            "    // ... and bash prints the resolved path there, which the fold drops",
+            '    assert!(cv_bash_resolves("ls"), "bash resolves ls");',
+            '    let out = std::process::Command::new("bash")',
+            '        .arg("-c").arg("command -v ls").output().expect("bash");',
+            "    assert!(!out.stdout.is_empty(),",
+            '        "bash prints the path, so the bare rewrite loses observable output (d1)");',
+        ]
+    elif kind == "cv_path":
+        names = ", ".join(lit(n) for n in pin["names"])
+        out += [
+            f"    let names = [{names}];",
+            "    for n in names {",
+            '        assert!(cv_bash_resolves(n), "a name the fold list names is not on PATH");',
+            "    }",
+        ]
+    elif kind == "cv_absent":
+        out += [
+            '    assert!(!cv_bash_resolves("nonexistent"),',
+            '        "the fold treats `nonexistent` as absent, so bash must too");',
+        ]
+    elif kind == "cv_claims":
+        names = ", ".join(lit(n) for n in pin["names"])
+        out += [
+            f"    let names = [{names}];",
+            "    for n in names {",
+            "        let mut stmt = IrStmt::Expr(IrExpr::Call { func: \"exec\".to_string(),",
+            "            args: vec![st(\"command\"), IrExpr::Array(vec![st(\"-v\"), st(n)])] });",
+            "        assert!(native_command_v(&mut stmt),",
+            '            "the fold claims every name in its own list: {}", n);',
+            "        assert_eq!(cv_status(&stmt), Some(true),",
+            '            "a listed name always folds to status 0: {}", n);',
+            "    }",
+        ]
+    elif kind == "cv_divergence":
+        names = ", ".join(lit(n) for n in pin["names"])
+        out += [
+            f"    let names = [{names}];",
+            "    let mut divergent = 0;",
+            "    for n in names {",
+            "        let mut stmt = IrStmt::Expr(IrExpr::Call { func: \"exec\".to_string(),",
+            "            args: vec![st(\"command\"), IrExpr::Array(vec![st(\"-v\"), st(n)])] });",
+            "        assert!(native_command_v(&mut stmt));",
+            "        assert_eq!(cv_status(&stmt), Some(true));",
+            "        if !cv_bash_resolves(n) {",
+            "            // d2: the fold reports 0 where bash exits 1, because the list",
+            "            // asserts a program this machine does not have",
+            "            divergent += 1;",
+            '            eprintln!("d2 divergence: command -v {} exits 1, the fold says 0", n);',
+            "        }",
+            "    }",
+            '    eprintln!("d2: {} of {} listed names are absent here", divergent, names.len());',
+        ]
+    elif kind == "cv_copies":
+        names = ", ".join(lit(n) for n in pin["names"])
+        out += [
+            f"    let names = [{names}];",
+            "    let mut checked = 0;",
+            "    for n in names {",
+            "        // the statement fold, on a fresh statement",
+            "        let mut stmt = IrStmt::Expr(IrExpr::Call { func: \"exec\".to_string(),",
+            "            args: vec![st(\"command\"), IrExpr::Array(vec![st(\"-v\"), st(n)])] });",
+            "        let fired = native_command_v(&mut stmt);",
+            "        let stmt_status = cv_status(&stmt);",
+            "        // the same question in condition position, behind the same sink,",
+            "        // on a freshly built statement (the fold mutates its argument)",
+            "        let cond = command_v_redirect_truth(&[",
+            "            IrExpr::Arrow(vec![cv_call(\"-v\", n)]),",
+            "            IrExpr::Array(vec![cv_spec(1, \"w\", \"/dev/null\")]),",
+            "        ]);",
+            "        // the two copies of the name list must agree, name by name",
+            "        assert_eq!(fired, cond.is_some(),",
+            '            "the two folds disagree about whether `{}` is known", n);',
+            "        if fired {",
+            "            assert_eq!(stmt_status, cond);",
+            "            checked += 1;",
+            "            if checked >= 6 { break; }",
+            "        }",
+            "    }",
+            '    assert!(checked > 0, "at least one listed name must be known in both folds");',
+        ]
+    else:
+        raise SystemExit(f"unknown command_v kind {kind}")
+    out.append("}")
+    return out
+
+
 FAMILIES = {
     "f1": (RUST_HELPERS, emit_pin),
     "status_reads": (STATUS_HELPERS, emit_status_pin),
     "uae": (UAE_HELPERS, emit_uae_pin),
     "grep": (GREP_HELPERS, emit_grep_pin),
     "pipeline": (PIPELINE_HELPERS, emit_pipeline_pin),
+    "command_v": (COMMAND_V_HELPERS, emit_command_v_pin),
 }
 
 

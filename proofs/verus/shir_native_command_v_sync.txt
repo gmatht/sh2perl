@@ -1,0 +1,97 @@
+# verus-sync-coverage manifest: shir_native_command_v
+# source sha: shir_native_stmt=4b19d676d789  proof sha: 29fa8993181d
+# source: src/transforms/shir_native_stmt.rs (cluster G, part 2:
+#   native_command_v 2116, command_v_redirect_truth 2153, redirect_to_devnull 2175)
+# This is the NINTH proved cluster of the decomposition in shir_native_stmt_plan.md
+# (C, H, E, B, D1, D2, D3, F1, F2 and the constant-pipeline part of G came first);
+# A, F3, F4 and the rest of G are open.
+#
+# THE LAW.   asks whether NAME resolves through PATH: status 0
+# and the path printed, or status 1 and nothing.  shir_native_stmt.rs answers it
+# in two places -- native_command_v (statement position, /dev/null-redirected or
+# bare) and command_v_redirect_truth (condition position, /dev/null only) -- from
+# a hard-coded name list plus one literal missing name.
+#   * status_law / cond_status_law: the pass's status equals bash's resolution,
+#     given that the pass's list really names programs on the reference PATH and
+#     that its missing name really is absent.  The pass consults a LIST; bash
+#     consults PATH; nothing but that hypothesis connects them, and the
+#     generated pins pin_the_known_list_is_on_path / pin_the_missing_name_is_absent
+#     MEASURE the hypothesis with bash on this machine.
+#   * sink_law: the rewrite writes NOTHING where bash prints the path, so the two
+#     agree on stdout only when the sink is /dev/null or nothing resolves.  That
+#     is why redirect_to_devnull's test is load-bearing and why the condition
+#     fold refuses every other shape (cond_refuses_every_non_devnull_sink).
+#   * stmt_refuses_a_file_sink:  keeps the shell-out, or
+#     the path would have to appear in the file.
+#
+# d1 (a recorded divergence): native_command_v also fires on the BARE
+# , where bash prints the path to the caller's stdout.  The
+# model keeps the Bare sink and pin_bare_form_is_lossy runs bash to show the
+# dropped output; fixing it needs a source gate, so it is a later stage.
+#
+# RESIDUE, stated not claimed: the two source copies each repeat the same
+# ~53-name list.  Their agreement is a DATA equality (two long disjunctions), so
+# it is checked exhaustively by the generated pin_the_two_copies_agree over every
+# name in the list, not "proved" by unfolding 53 string equalities -- that would
+# restate the lists, not refine them.  The Verus laws are stated over one
+# transcribed decision.
+#
+# Out of model: PATH order/shadowing, aliases and functions (the hypothesis
+# bounds exactly this), 's output for builtins/keywords, and extra
+# redirect specs with other fds (the source accepts only the single fd-1 spec).
+
+[pins]
+pin pin_a_known_command_is_status_zero -> test pin_a_known_command_is_status_zero: MAPPED
+pin pin_the_missing_name_is_status_one -> test pin_the_missing_name_is_status_one: MAPPED
+pin pin_the_two_copies_agree_on_the_modelled_shape -> test pin_the_two_copies_agree_on_the_modelled_shape: MAPPED
+pin pin_an_unknown_name_keeps_the_shell_out -> test pin_an_unknown_name_keeps_the_shell_out: MAPPED
+pin pin_a_file_redirect_keeps_the_shell_out -> test pin_a_file_redirect_keeps_the_shell_out: MAPPED
+pin pin_a_condition_without_devnull_keeps_the_shell_out -> test pin_a_condition_without_devnull_keeps_the_shell_out: MAPPED
+pin pin_a_non_v_flag_keeps_the_shell_out -> test pin_a_non_v_flag_keeps_the_shell_out: MAPPED
+pin pin_bare_form_is_lossy -> test pin_bare_form_is_lossy: MAPPED
+pin pin_the_fold_claims_every_listed_name -> test pin_the_fold_claims_every_listed_name: MAPPED
+pin pin_an_absent_listed_name_diverges -> test pin_an_absent_listed_name_diverges: MAPPED
+pin pin_the_missing_name_is_absent -> test pin_the_missing_name_is_absent: MAPPED
+
+[guards]
+guard law status_law (statement fold's status == bash's PATH resolution): PRESENT
+guard law cond_status_law (condition fold's status == bash's PATH resolution): PRESENT
+guard law sink_law (the rewrite is silent; /dev/null makes that faithful): PRESENT
+guard independent side: resolves(avail, name) is PATH membership, not the pass's list: PRESENT
+guard independent side: the pass's list enters only through the measured hypothesis: PRESENT
+guard refusal: cond_refuses_every_non_devnull_sink (a condition is never decided where the path would be lost): PRESENT
+guard refusal: stmt_refuses_a_file_sink (the path would land in the file): PRESENT
+guard refusal: unknown_name_is_refused (the pass knows nothing about the name): PRESENT
+guard refusal: a_flag_other_than_v_is_refused: PRESENT
+guard d1 bare form: NOT MODELLED by the fold (recorded divergence, pinned by an executed bash comparison)
+guard the two copies' list equality: checked by the generated pin_the_two_copies_agree, not proved (residue above)
+guard PATH order, aliases, functions, builtin/keyword output format: OUT OF MODEL
+guard the rest of cluster G (let/declare, trap, subshell, normalize, perl folds): NOT THIS PROOF
+
+[counts]
+19 verified, 0 errors (verus --triggers-mode silent --rlimit 40 shir_native_command_v.rs)
+mutants measured 2026-11-28 against that baseline (proof sha 29fa8993181d), each
+  restored byte-identically and the sha re-checked:
+    m1 known arm inverted (Some(false)/Some(true) swapped)      11v/8e
+    m2 every name treated as known (member arm -> true)         14v/5e
+    m3 condition fold accepts any sink (drops !is_devnull)      18v/1e
+    m4 bash prints a path even when the name does not resolve   18v/1e
+    m5 /dev/null no longer swallows (reaches_stdout)            18v/1e
+d2, found by measuring the model's hypothesis rather than assuming it: the
+  fold's list names `python`, which this machine does not have (only python3),
+  so `command -v python > /dev/null` exits 1 in bash while the fold writes
+  status 0.  pin_an_absent_listed_name_diverges pins the source's answer and
+  the generated test reports which listed names are absent here.
+
+[exec]
+exec pin_a_condition_without_devnull_keeps_the_shell_out (pin_a_condition_without_devnull_keeps_the_shell_out): PASS
+exec pin_a_file_redirect_keeps_the_shell_out (pin_a_file_redirect_keeps_the_shell_out): PASS
+exec pin_a_known_command_is_status_zero (pin_a_known_command_is_status_zero): PASS
+exec pin_a_non_v_flag_keeps_the_shell_out (pin_a_non_v_flag_keeps_the_shell_out): PASS
+exec pin_an_unknown_name_keeps_the_shell_out (pin_an_unknown_name_keeps_the_shell_out): PASS
+exec pin_bare_form_is_lossy (pin_bare_form_is_lossy): PASS
+exec pin_the_missing_name_is_absent (pin_the_missing_name_is_absent): PASS
+exec pin_the_missing_name_is_status_one (pin_the_missing_name_is_status_one): PASS
+exec pin_the_two_copies_agree_on_the_modelled_shape (pin_the_two_copies_agree_on_the_modelled_shape): PASS
+exec pin_an_absent_listed_name_diverges (pin_an_absent_listed_name_diverges): PASS
+exec pin_the_fold_claims_every_listed_name (pin_the_fold_claims_every_listed_name): PASS
