@@ -59,9 +59,9 @@
 //     `stmt_terminates` consumers (they read the same verdict, so a verdict
 //     change is the same theorem); `Die`, which this model folds into Exit.
 //
-//  ── measured mutants (2026-11-27, re-measured this pass; all restored
-//     byte-identically, sha in the
-//     sync file) ──
+//  ── measured mutants (2026-11-27; RE-MEASURED 2026-11-28 with the same
+//     counts, each restored byte-identically with the proof sha re-verified;
+//     sha in the sync file) ──
 //
 //  baseline 31 verified, 0 errors
 //

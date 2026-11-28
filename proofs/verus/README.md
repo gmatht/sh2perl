@@ -8923,6 +8923,17 @@ loop-escapability decisions; the first two of those mirror the source's own
 `a_break_inside_a_case_still_escapes_the_loop`, and the third mirrors
 `a_break_control_call_makes_the_loop_escapable`.
 
+### Pins, executed
+
+All ten rows are MAPPED to generated tests: `pin_specs/uae_terminators.json`
+names each witness, `gen_pin_tests.py` writes
+`src/transforms/uae_terminators_pin_tests.rs` driving the real
+`unreachable_after_exit::transform`, and a row flips to MAPPED only after its
+own test passes under `cargo test --lib pin_tests::`. The continue pin uses a
+`Block` rather than a loop body: a break-free `while true` is itself a
+terminator, so the pass keeps it whole and never descends into it — a
+different fact from the one that pin states.
+
 ### Mutants, measured
 
 Counted: truncating after an `if`-nested terminator gives **30 verified,

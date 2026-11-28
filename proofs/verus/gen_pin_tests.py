@@ -282,6 +282,92 @@ fn fn_localising_body() -> IrStmt {
 }
 '''
 
+UAE_HELPERS = '''use super::*;
+use crate::ir::{BinOpKind, IrCaseClause, IrExpr, IrStmt, StrStyle};
+
+fn str_(s: &str) -> IrExpr {
+    IrExpr::Str(s.to_string(), StrStyle::DoubleQuoted)
+}
+
+fn echo(s: &str) -> IrStmt {
+    IrStmt::Expr(IrExpr::Call {
+        func: "builtin".to_string(),
+        args: vec![str_("echo"), IrExpr::Array(vec![str_(s)])],
+    })
+}
+
+fn while_true(body: Vec<IrStmt>) -> IrStmt {
+    IrStmt::While {
+        cond: IrExpr::Bool(true),
+        body,
+    }
+}
+
+fn case_break() -> IrStmt {
+    IrStmt::Case {
+        discriminant: str_("x"),
+        clauses: vec![IrCaseClause {
+            patterns: vec!["a".to_string()],
+            body: vec![IrStmt::Break],
+        }],
+    }
+}
+
+/// `break || exit 1`: break as a CONTROL CALL, not `IrStmt::Break`.
+fn break_or() -> IrStmt {
+    IrStmt::Expr(IrExpr::BinOp {
+        lhs: Box::new(IrExpr::Call {
+            func: "break".to_string(),
+            args: vec![],
+        }),
+        op: BinOpKind::Or,
+        rhs: Box::new(str_("x")),
+    })
+}
+
+fn if_false_exit() -> IrStmt {
+    IrStmt::If {
+        cond: IrExpr::Bool(false),
+        then: vec![IrStmt::Exit(None)],
+        elsifs: vec![],
+        else_: vec![],
+    }
+}
+
+fn case_exit() -> IrStmt {
+    IrStmt::Case {
+        discriminant: str_("x"),
+        clauses: vec![IrCaseClause {
+            patterns: vec!["a".to_string()],
+            body: vec![IrStmt::Exit(None)],
+        }],
+    }
+}
+
+fn fn_with(body: Vec<IrStmt>) -> IrStmt {
+    IrStmt::Function {
+        name: "f".to_string(),
+        params: vec![],
+        body,
+        named_blocks: vec![],
+    }
+}
+'''
+
+BUILDERS = {
+    "loop_tail": 'vec![while_true(vec![echo("tick")]), echo("dead")]',
+    "loop_with_break": 'vec![while_true(vec![echo("tick"), IrStmt::Break]), echo("live")]',
+    "loop_with_case_break": 'vec![while_true(vec![case_break()]), echo("live")]',
+    "loop_with_nested_loop": 'vec![while_true(vec![while_true(vec![IrStmt::Break])]), echo("dead")]',
+    "loop_with_break_call": 'vec![while_true(vec![break_or()]), echo("live")]',
+    "loop_body_break": 'vec![while_true(vec![IrStmt::Break, echo("dead")])]',
+    "block_continue": 'vec![IrStmt::Block(vec![echo("a"), IrStmt::Continue, echo("dead")])]',
+    "if_exit_then_tail": 'vec![if_false_exit(), echo("live")]',
+    "case_exit_then_tail": 'vec![case_exit(), echo("live")]',
+    "return_then_echo": 'vec![IrStmt::Return(None), echo("live")]',
+    "fn_return_then_echo": 'vec![fn_with(vec![IrStmt::Return(None), echo("dead")])]',
+}
+
 WRAP = {
     "program_reads": "program_reads_status(&program(vec![{w}()]))",
     "stmt_reads": "stmt_reads_status(&{w}())",
@@ -415,9 +501,58 @@ def emit_status_pin(pin: dict) -> list[str]:
     return out
 
 
+def emit_uae_pin(pin: dict) -> list[str]:
+    """One test for a `uae` pin: run the REAL transform on a built witness."""
+    out = [
+        "",
+        "/// Manifest row: `pin %s` in uae_terminators_sync.txt." % pin["pin"],
+        "/// " + pin["note"],
+        "#[test]",
+        "fn %s() {" % pin["pin"],
+    ]
+    for case in pin["cases"]:
+        b = case["build"]
+        assert b in BUILDERS, "unknown witness %s" % b
+        out.append("    let mut stmts = %s;" % BUILDERS[b])
+        out.append(
+            '    assert_eq!(transform(&mut stmts), %s, "changed on %s");'
+            % ("true" if case["changed"] else "false", b)
+        )
+        out.append(
+            '    assert_eq!(stmts.len(), %d, "list length on %s");' % (case["len"], b)
+        )
+        if "body_len" in case:
+            out += [
+                "    match &stmts[0] {",
+                '        IrStmt::While { body, .. } => assert_eq!(body.len(), %d, "loop body on %s"),'
+                % (case["body_len"], b),
+                '        other => panic!("expected the loop, got {other:?}"),',
+                "    }",
+            ]
+        if "block_len" in case:
+            out += [
+                "    match &stmts[0] {",
+                '        IrStmt::Block(b) => assert_eq!(b.len(), %d, "block list on %s"),'
+                % (case["block_len"], b),
+                '        other => panic!("expected the block, got {other:?}"),',
+                "    }",
+            ]
+        if "fn_body_len" in case:
+            out += [
+                "    match &stmts[0] {",
+                '        IrStmt::Function { body, .. } => assert_eq!(body.len(), %d, "function body on %s"),'
+                % (case["fn_body_len"], b),
+                '        other => panic!("expected the function, got {other:?}"),',
+                "    }",
+            ]
+    out.append("}")
+    return out
+
+
 FAMILIES = {
     "f1": (RUST_HELPERS, emit_pin),
     "status_reads": (STATUS_HELPERS, emit_status_pin),
+    "uae": (UAE_HELPERS, emit_uae_pin),
 }
 
 

@@ -14,20 +14,25 @@
 #   expression slot lowers to `block`) changed -- none of the terms above.
 #   The row used to record HEAD's git blob; it now records the content digest,
 #   because the checker has exactly one rule and no alternate digest.)
-# uae=3adb4e485152 (sha256 of src/transforms/unreachable_after_exit.rs)
-# proof sha: ea6a40d60cbb
+# uae=21dacdcb3df8 (sha256 of src/transforms/unreachable_after_exit.rs;
+#   RE-AUDITED 2026-11-28: the previously recorded value names 3724d59a7,
+#   which is byte-identical to HEAD for this file. The only change since is
+#   the `#[cfg(test)] #[path = "uae_terminators_pin_tests.rs"] mod pin_tests;`
+#   registration appended after `pass`, outside every function this proof
+#   models -- transform, pass and the semantics it reads are untouched.)
+# proof sha: abeb2e27f1c7
 
 [pins]
-pin pin_trunc_shapes -> test tail_after_an_infinite_loop_is_dropped: MAPPED
-pin pin_escapable_loop_keeps_the_tail -> test an_escapable_loop_keeps_the_tail: MAPPED
-pin pin_case_break_escapes -> test a_break_inside_a_case_still_escapes_the_loop: MAPPED
-pin pin_nested_break_does_not_escape -> test a_break_inside_a_nested_loop_does_not_escape: MAPPED
-pin pin_break_call_escapes -> test a_break_control_call_makes_the_loop_escapable: MAPPED
-pin pin_break_stops_the_list -> test statements_after_a_break_are_dropped_from_the_body: MAPPED
-pin pin_continue_stops_the_list: UNMIRRORED (no source test for a continue-truncated list)
-pin pin_conditional_exit_does_not_deaden: UNMIRRORED (no source test for an if-nested exit)
-pin pin_case_exit_may_not_fire: UNMIRRORED (no source test for a case that may not match)
-pin pin_top_level_return_keeps_the_tail: UNMIRRORED (the transform's in_fn flag has no unit test)
+pin pin_trunc_shapes -> test pin_trunc_shapes: MAPPED
+pin pin_escapable_loop_keeps_the_tail -> test pin_escapable_loop_keeps_the_tail: MAPPED
+pin pin_case_break_escapes -> test pin_case_break_escapes: MAPPED
+pin pin_nested_break_does_not_escape -> test pin_nested_break_does_not_escape: MAPPED
+pin pin_break_call_escapes -> test pin_break_call_escapes: MAPPED
+pin pin_break_stops_the_list -> test pin_break_stops_the_list: MAPPED
+pin pin_continue_stops_the_list -> test pin_continue_stops_the_list: MAPPED
+pin pin_conditional_exit_does_not_deaden -> test pin_conditional_exit_does_not_deaden: MAPPED
+pin pin_case_exit_may_not_fire -> test pin_case_exit_may_not_fire: MAPPED
+pin pin_top_level_return_keeps_the_tail -> test pin_top_level_return_keeps_the_tail: MAPPED
 
 [guards]
 guard law trunc_list_sound (verdict-terminator => run preserved, trace and signal): PRESENT
@@ -42,29 +47,35 @@ guard Die folded into Exit, other_ => not a terminator (source's `_ => false`): 
 
 [counts]
 31 verified, 0 errors (verus --triggers-mode silent --rlimit 40 uae_terminators.rs)
-mutants (measured 2026-11-27, each restored byte-identically to this proof
-  sha): if-nested terminator truncates 30v/1e (trunc_sound), top-level Return
-  29v/2e (trunc_sound, return_truncates_only_a_function_body), case-nested Exit
-  prunes 30v/1e (trunc_sound); nested-break-escapes, trunc-drops-terminator,
-  case-break-falls-through and run-ignores-signal rejected at simplification
-  by their pins.
+mutants (measured 2026-11-27, RE-MEASURED 2026-11-28 with the same counts,
+  each restored byte-identically and the proof sha re-verified): if-nested
+  terminator truncates 30v/1e (trunc_sound), top-level Return 29v/2e
+  (trunc_sound, return_truncates_only_a_function_body), case-nested Exit prunes
+  30v/1e (trunc_sound, asserted at trunc's prefix step); nested-break-escapes,
+  trunc-drops-terminator, case-break-falls-through and run-ignores-signal
+  rejected at simplification by their pins (nested-break-escapes by
+  pin_nested_break_does_not_escape, on `expression simplifies to false`).
 [exec]
-# Every MAPPED row above was EXECUTED against the source in this tree:
-#   cargo test --lib          (full lib suite; per-test verdicts below)
-# Each verdict below is grepped from that run's own
-# `test <module>::<name> ... ok` line, for the module this proof pins.
-# A mapped test that fails or vanishes from the run is drift — FATAL.
+# Every MAPPED row above was EXECUTED against the source in this tree by the
+# generator that owns the tests:
+#   python3 proofs/verus/gen_pin_tests.py \
+#       proofs/verus/pin_specs/uae_terminators.json --run
+# That writes src/transforms/uae_terminators_pin_tests.rs, runs each generated
+# test through `cargo test --lib pin_tests::`, and records the verdict below
+# ONLY for a test whose own `<module>::<name> ... ok` line it observed. A row
+# whose test later fails or vanishes is demoted back to UNMIRRORED by the next
+# run, so a MAPPED row here cannot outlive the test it names.
 # context: that run reported 1970 passed, 67 failed, 5 ignored; every failure
 # is in an unrelated backend / estree / shir_json module, none in the modules
 # these rows pin.
 # all suites built; per-test verdicts below
-exec pin_trunc_shapes (tail_after_an_infinite_loop_is_dropped): PASS
-exec pin_escapable_loop_keeps_the_tail (an_escapable_loop_keeps_the_tail): PASS
-exec pin_case_break_escapes (a_break_inside_a_case_still_escapes_the_loop): PASS
-exec pin_nested_break_does_not_escape (a_break_inside_a_nested_loop_does_not_escape): PASS
-exec pin_break_call_escapes (a_break_control_call_makes_the_loop_escapable): PASS
-exec pin_break_stops_the_list (statements_after_a_break_are_dropped_from_the_body): PASS
-exec pin_continue_stops_the_list: UNMIRRORED (not executed)
-exec pin_conditional_exit_does_not_deaden: UNMIRRORED (not executed)
-exec pin_case_exit_may_not_fire: UNMIRRORED (not executed)
-exec pin_top_level_return_keeps_the_tail: UNMIRRORED (not executed)
+exec pin_trunc_shapes (pin_trunc_shapes): PASS
+exec pin_escapable_loop_keeps_the_tail (pin_escapable_loop_keeps_the_tail): PASS
+exec pin_case_break_escapes (pin_case_break_escapes): PASS
+exec pin_nested_break_does_not_escape (pin_nested_break_does_not_escape): PASS
+exec pin_break_call_escapes (pin_break_call_escapes): PASS
+exec pin_break_stops_the_list (pin_break_stops_the_list): PASS
+exec pin_continue_stops_the_list (pin_continue_stops_the_list): PASS
+exec pin_conditional_exit_does_not_deaden (pin_conditional_exit_does_not_deaden): PASS
+exec pin_case_exit_may_not_fire (pin_case_exit_may_not_fire): PASS
+exec pin_top_level_return_keeps_the_tail (pin_top_level_return_keeps_the_tail): PASS

@@ -265,3 +265,9 @@ fn pass(stmts: Vec<IrStmt>, in_fn: bool) -> (Vec<IrStmt>, bool) {
     }
     (out, changed)
 }
+// Tests generated from the Verus manifest's [pins] rows by
+// proofs/verus/gen_pin_tests.py -- DO NOT EDIT the generated file by hand.
+// There is one test per pin; a pin flips to MAPPED only after its test passes.
+#[cfg(test)]
+#[path = "uae_terminators_pin_tests.rs"]
+mod pin_tests;
