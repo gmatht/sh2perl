@@ -1,0 +1,149 @@
+# verus-sync-coverage manifest: shir_native_status_folds
+# source sha: shir_native_stmt=3ae1b4d0bc71  proof sha: aca094fcdc97
+# source: src/transforms/shir_native_stmt.rs (cluster G, REMAINDER:
+#   native_literal_let_stmt 817, native_declare_typeset_stmt 922,
+#   normalize_literal_exec_words 2984, native_trap_stmt 5235,
+#   native_rm_rf_stmt 5880, native_subshell_eval_noop_stmt 6894,
+#   native_perl_e_stmt 1898, native_perl_ne_stmt 1933, native_bash_script 2071,
+#   native_sort_stmt 1828)
+# This is the ELEVENTH proved stage of the decomposition in
+# shir_native_stmt_plan.md; with it the status-only/identity half of cluster G is
+# proved (G parts 1-3 + this file). Still open: A, F3, F4 and G* (the perl
+# QUOTING sub-forms, which are cluster H's law applied to G's folds).
+#
+# THE LAWS.  Each section has the pass's own construction (`pass_*`) against a
+# semantic side written from what bash does (`bash_*`), never by calling the
+# pass's predicate:
+#   * let_value_law     — the emitted assignment expression evaluates to the
+#                         value bash's `let ARITH` stores.  (The IR arithmetic
+#                         `eval` is the target language's, out of model.)
+#   * declare_case_law  — the case attributes the fold applies are bash's, for
+#                         at most one of -l/-u.  declare_value_law carries it to
+#                         the stored bytes.
+#   * normalize_preserves_the_text / normalize_matches_bash_join — for a command
+#                         that is not an assignment builtin the word list is
+#                         unchanged; for `typeset` the join the fold performs is
+#                         bash's assignment-builtin join (two recursions).
+#   * trap_emits_one_effect_per_part — for a handler of modelled parts the
+#                         emitted effect list has one entry per part;
+#                         exit_contributes_no_effect is the runner's half.
+#   * rm_status_law_existing_directory — `-r` is required and, with it, both
+#                         statuses are 0; rm_recursive_flag_is_required shows
+#                         the requirement is load-bearing for a directory.
+#   * subshell_status_law_when_eval_succeeds — the redirect does not touch the
+#                         status, so the fold's 0 is bash's 0 on success.
+#   * perl_e_law        — the ARGV the emitted `@ARGV = (…)` sets is bash's.
+#   * perl_ne_law       — the per-line bytes are bash's, for both the `chomp;`
+#                         and the plain handler form.
+#   * bash_script_law   — the fixed script's `Arg: $a` lines and its `$#` count.
+#   * sort_keeps_every_line — `sort` is a permutation: no line added or dropped
+#                         (ordering is PINNED on concrete inputs, not proved in
+#                         general — see [counts]).
+#
+# RECORDED DIVERGENCES (measured with bash, recorded not fixed):
+#   d-G1 `let x=0` → bash status 1, fold 0.            (pin_let_zero_status_is_one_in_bash)
+#   d-G2 `declare -ul v=abc` → bash lowercase, fold upper. (pin_declare_upper_then_lower_diverges)
+#   d-G3 `trap H ERR` (any signal but EXIT/0/INT) → fold emits a no-op. (pin_other_signals_are_a_noop)
+#   d-G4 `( eval "false" ) >/dev/null` → bash 1, fold 0; `exit 3` → bash 3. (pin_subshell_false_diverges)
+#   d-G5 `rm -r MISSING` → bash 1, fold 0.              (pin_rm_r_missing_diverges)
+# Each is stated as its own law fn with both answers side by side, so the
+# divergence is part of the proof, not a footnote.
+#
+# A.2, the structural half (not a law): proofs/verus/check_dispatch.py checks
+# the 58 folds of the module against proofs/verus/shir_native_stmt_dispatch.txt
+# in BOTH directions and requires each listed fold to be CALLED from
+# transform/transform_stmt/transform_expr.  Measured: 0 failures on the tree,
+# and removing one dispatch call (`x |= native_trap_stmt(st);`) on a /tmp copy
+# makes it report `DEFINED-BUT-UNDISPATCHED native_trap_stmt` and exit 1.
+
+[pins]
+pin pin_bash_script_args -> UNMIRRORED (by design — model-level: the source has no test for this fold)
+pin pin_declare_lower -> UNMIRRORED (by design — model-level: the source has no test for this fold)
+pin pin_declare_upper -> UNMIRRORED (by design — model-level: the source has no test for this fold)
+pin pin_declare_upper_then_lower_diverges -> UNMIRRORED (by design — model-level: the source has no test for this fold)
+pin pin_echo_words_untouched -> UNMIRRORED (by design — model-level: the source has no test for this fold)
+pin pin_let_const -> UNMIRRORED (by design — model-level: the source has no test for this fold)
+pin pin_let_from_var_mul -> UNMIRRORED (by design — model-level: the source has no test for this fold)
+pin pin_let_plus_eq -> UNMIRRORED (by design — model-level: the source has no test for this fold)
+pin pin_let_zero_status_is_one_in_bash -> UNMIRRORED (by design — model-level: the source has no test for this fold)
+pin pin_other_signals_are_a_noop -> UNMIRRORED (by design — model-level: the source has no test for this fold)
+pin pin_perl_e_argv -> UNMIRRORED (by design — model-level: the source has no test for this fold)
+pin pin_perl_ne_prefix -> UNMIRRORED (by design — model-level: the source has no test for this fold)
+pin pin_rm_f_without_r_refused -> UNMIRRORED (by design — model-level: the source has no test for this fold)
+pin pin_rm_r_missing_diverges -> UNMIRRORED (by design — model-level: the source has no test for this fold)
+pin pin_rm_rf_directory -> UNMIRRORED (by design — model-level: the source has no test for this fold)
+pin pin_sort_ascending_and_reverse -> UNMIRRORED (by design — model-level: the source has no test for this fold)
+pin pin_sort_drops_nothing -> UNMIRRORED (by design — model-level: the source has no test for this fold)
+pin pin_subshell_false_diverges -> UNMIRRORED (by design — model-level: the source has no test for this fold)
+pin pin_subshell_true -> UNMIRRORED (by design — model-level: the source has no test for this fold)
+pin pin_trap_echo_handler -> UNMIRRORED (by design — model-level: the source has no test for this fold)
+pin pin_trap_exit_is_dropped -> UNMIRRORED (by design — model-level: the source has no test for this fold)
+pin pin_trap_unknown_part_refused -> UNMIRRORED (by design — model-level: the source has no test for this fold)
+pin pin_typeset_join -> UNMIRRORED (by design — model-level: the source has no test for this fold)
+
+[guards]
+guard law let_value_law (the emitted expression's value == bash `let`'s): PRESENT
+guard law let_status_agrees_when_nonzero / d_g1 (the zero-result divergence, both answers): PRESENT
+guard law declare_case_law + declare_value_law (attributes -> bash, at most one of -l/-u): PRESENT
+guard law normalize_preserves_the_text (non-assignment builtin: words unchanged): PRESENT
+guard law normalize_matches_bash_join (typeset: the join is bash's): PRESENT
+guard law trap_emits_one_effect_per_part + exit_contributes_no_effect: PRESENT
+guard law rm_status_law_existing_directory + rm_recursive_flag_is_required: PRESENT
+guard law subshell_status_law_when_eval_succeeds + d_g4: PRESENT
+guard law perl_e_law (ARGV preserved): PRESENT
+guard law perl_ne_law (per-line bytes, both handler forms): PRESENT
+guard law bash_script_law (Arg lines + $# count): PRESENT
+guard law sort_keeps_every_line (permutation, both flag values): PRESENT
+guard A.2 check_dispatch.py + shir_native_stmt_dispatch.txt (58 folds, both directions): PRESENT (mechanical, not a law)
+guard the Perl/ESTree renderers (does the emitted IR reach the screen verbatim): OUT OF MODEL
+guard `sort`'s collation / `-h` human order (keys are modelled as ints): OUT OF MODEL
+guard the filesystem beyond the rm model's exists/is-dir booleans; stderr text: OUT OF MODEL
+guard clusters A, F3, F4 and the perl QUOTING sub-forms of G: NOT THIS PROOF
+
+[counts]
+71 verified, 0 errors (verus --triggers-mode silent --rlimit 40 shir_native_status_folds.rs)
+23 pins, all UNMIRRORED BY DESIGN: the module's eight tests cover other
+  clusters, so none of these ten folds has a source test to mirror. The
+  divergences were measured against real bash instead (see d-G1..d-G5 above).
+
+mutants measured 2026-11-28 against proof sha aca094fcdc97, each on a /tmp copy
+(the source untouched) with the proof sha re-checked afterwards:
+  M1  let: `++` emits subtraction                  70v/1e  let_value_law
+  M3  normalize: joins any typeset pair            70v/1e  normalize_matches_bash_join
+  M6  rm: the one-path requirement dropped         70v/1e  two_paths_are_refused
+  M2  declare: `-l` treated as plain               rejected at simplification (pin_declare_lower)
+  M4  trap: an `exit` part refuses the fold        rejected at simplification (pin_trap_exit_is_dropped)
+  M5  rm: the `-r` requirement dropped (guard always true)
+                                                   rejected at simplification (rm_status_law)
+  M7  subshell: status 1 instead of 0              rejected at simplification (d_g4)
+  M8  perl -e: last ARGV word dropped              rejected at simplification (perl_e_law)
+  M9  perl -ne: trailing newline dropped           rejected at simplification (perl_ne_law)
+  M10 bash SCRIPT: count off by one                rejected at simplification (bash_script_law)
+  M11 sort: `-r` ignored                           rejected at simplification (pin_sort_ascending_and_reverse)
+  M12 let: status 1 instead of 0                   rejected at simplification (d_g1)
+  A.2 drop one dispatch call (`native_trap_stmt`)  check_dispatch.py: 1 failure, exit 1
+  Every rejection was inspected: all are VERIFICATION failures (`assertion
+  failed` / `expression simplifies to …`), none a mutant-spelling compile
+  error. So three defect classes fail a law with a real count (wrong operator,
+  an over-broad join guard, a dropped arity guard), eight are refuted at
+  simplification by a pin, and the dispatch drop is caught mechanically.
+
+HONEST LIMITS, stated not claimed:
+  * `sort`: the general law is the permutation/line-count one. Ordering is
+    pinned on concrete inputs (3 1 2 -> 1 2 3 and -> 3 2 1), not proved for
+    arbitrary lines; a general sortedness proof would need an insertion-sort
+    invariant this stage did not take on.
+  * `normalize_preserves_the_text` is stated as equality with the shell-side
+    recursion for the non-assignment-builtin case; the textual claim for a
+    SINGLE word is pinned, not proved symbolically over characters.
+  * `let`/`declare`/`perl`/`bash_script` laws are laws about the MODEL the fold
+    is transcription of (the IR it emits, the ARGV it sets, the lines it
+    prints); the renderer is out of model throughout.
+
+[exec]
+# NONE, by design. These ten folds have no source test in
+# src/transforms/shir_native_stmt.rs (its eight tests cover other clusters), so
+# there is no test to mirror and no `[exec]` row may be claimed. The evidence
+# for this stage is the proof, the measured mutants above, and the bash runs
+# recorded in the divergences (let x=0 -> 1; declare -l/-u; declare -ul;
+# ( eval "false" ) -> 1; ( eval "exit 3" ) -> 3; rm -r missing -> 1).

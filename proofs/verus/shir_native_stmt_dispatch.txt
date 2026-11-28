@@ -1,0 +1,63 @@
+# A.2 — the fold list feeding `transform_stmt` in src/transforms/shir_native_stmt.rs.
+# Every `fn NAME(st: &mut IrStmt) -> bool` in that file must appear here, and
+# every name here must be CALLED from the dispatch (transform / transform_stmt /
+# transform_expr). Checked by proofs/verus/check_dispatch.py; a fold removed
+# from the dispatch fails, which is the one failure no per-fold law can see.
+empty_herestring_to_status
+file_redirect_block
+native_bash_script
+native_cat_heredoc_redirect_call
+native_cat_heredoc_wc_stmt
+native_cat_heredoc_writefile
+native_cat_herestring
+native_cat_var_or_stmt
+native_comm_stmt
+native_command_noop_cond
+native_command_v
+native_constant_pipeline
+native_declare_typeset_stmt
+native_diff_files_stmt
+native_diff_procsub
+native_echo_bc_stmt
+native_echo_devnull_discard
+native_echo_filter_stmt
+native_echo_grep_stmt
+native_echo_grep_test_chain
+native_echo_or_chain
+native_echo_stmt
+native_echo_tr_sort_stmt
+native_echo_write_file_stmt
+native_echo_xargs_stmt
+native_env_grep_or_stmt
+native_eval_assign_stmt
+native_find_stmt
+native_grep_devnull_or
+native_grep_file_pipeline
+native_grep_herestring
+native_grep_o_herestring
+native_head_tail_pipeline
+native_head_tail_stmt
+native_if_test_cond
+native_literal_let_stmt
+native_literal_subshell_wc_stmt
+native_ls_dir_pipeline_stmt
+native_ls_stmt
+native_perl_e_stmt
+native_perl_ne_stmt
+native_printf_stmt
+native_printf_v_stmt
+native_rm_rf_stmt
+native_sort_file_stmt
+native_sort_stmt
+native_static_grep_redirect
+native_subshell_eval_noop_stmt
+native_subshell_redirect_stmt
+native_test_chain
+native_test_exit_stmt
+native_trap_stmt
+native_wc_l_pipeline
+native_while_multi_cond
+native_while_test_cond
+normalize_literal_exec_words
+test_and_to_if
+test_chain_to_if

@@ -45,7 +45,8 @@ CI actually runs Verus (`.github/workflows/verus.yml`): the pinned release
 invoked by `proofs/verus/ci_verify.sh` on every `*.rs` a pull request touches
 plus a fixed subset (`status_reads`, `status_reads_traversal`,
 `uae_terminators`, `affix_strip_fold`, `text_capture_fold`, `bc_float_clean`,
-`shir_native_herestring`). Any summary other than `N verified, 0 errors`
+`shir_native_herestring`, `shir_native_status_folds`). Any summary other
+than `N verified, 0 errors`
 fails the job. The manifests' sha pins are checked separately by
 `check_sync.py` in `test.yml`; the two are complementary.
 
@@ -9517,6 +9518,51 @@ the REDIRECT, since `command` with no arguments would itself succeed.
   requires at least one spec, since a zero-spec `redirect` Call is not a parse
   product.
 
+### Cluster G (part 4) — the status-only and identity folds (71 obligations, 23 model-level pins)
+
+    verus --triggers-mode silent --rlimit 40 proofs/verus/shir_native_status_folds.rs
+    -> verification results:: 71 verified, 0 errors
+
+The remaining ten folds of cluster G, each with the pass's own construction
+(`pass_*`) against a semantic side written from what bash does (`bash_*`):
+`let`/`declare` values and case attributes, `normalize_literal_exec_words`'
+word join, `trap`'s handler effects, `rm -rf`'s status, the
+`( eval "$CMD" ) >/dev/null` no-op's status, `perl -e`'s ARGV, `perl -ne`'s
+per-line bytes, `bash FILE`'s `Arg:` lines and `$#` count, and `sort`'s
+permutation. Six of the ten are "changes nothing observable" claims, and each
+is licensed in both directions: the folded and unfolded forms are compared
+through a function neither side implements by calling the other.
+
+- **The status folds are where the divergences are.** Four of these folds write
+  a constant status, and bash's status is not always that constant. Measured
+  with bash and recorded as laws with both answers side by side: d-G1 `let x=0`
+  (bash 1, fold 0), d-G2 `declare -ul v=abc` (bash lowercase, fold uppercase —
+  only flags with at most one of `l`/`u` are covered by the law), d-G3 a
+  non-EXIT/INT `trap` (fold emits a no-op, the source's own decision), d-G4
+  `( eval "false" ) >/dev/null` (bash 1, and `exit 3` → 3; fold 0), d-G5
+  `rm -r MISSING` (bash 1, fold 0).
+- **A.2, the structural half.** `check_dispatch.py` compares the module's 58
+  folds against `shir_native_stmt_dispatch.txt` in both directions and requires
+  every listed fold to be called from `transform`/`transform_stmt`/
+  `transform_expr`. Measured: 0 failures on the tree; deleting one dispatch
+  call (`x |= native_trap_stmt(st);`) on a `/tmp` copy makes it report
+  `DEFINED-BUT-UNDISPATCHED native_trap_stmt` and exit 1. This is the failure a
+  per-fold law cannot see.
+- **Mutants** (sha `aca094fcdc97`, each on a `/tmp` copy, source untouched,
+  proof sha re-checked): `++` emitting `-` 70v/1e; an over-broad `typeset` join
+  70v/1e; the `rm` one-path guard dropped 70v/1e; and eight mutants refuted at
+  simplification — `-l` treated as plain, an `exit` part refusing the fold, the
+  `-r` guard always true, subshell status 1, a dropped ARGV word, a dropped
+  trailing newline, the script count off by one, `-r` ignored. Every rejection
+  was inspected as a verification failure, not a mutant-spelling compile error.
+- **Honest limits.** `sort`'s general law is the permutation one; its ORDERING
+  is pinned on concrete inputs (`3 1 2` → `1 2 3`, `-r` → `3 2 1`), not proved
+  for arbitrary lines. `normalize`'s single-word identity is pinned rather than
+  proved symbolically over characters. All ten folds are testless in the source
+  (its 8 tests cover other clusters), so **all 23 pins are UNMIRRORED by
+  design** and no `[exec]` row exists; the evidence is the proof, the mutants,
+  and the bash runs recorded in d-G1…d-G5.
+
 ## `shir_native_stmt.rs` — no single law; a decomposition plan (cluster C proved)
 
     proofs/verus/shir_native_stmt_plan.md
@@ -9567,7 +9613,7 @@ bridge the law rests on. Six
 mutants, each restored byte-identically (sha256 in
 `shir_native_herestring_sync.txt`).
 
-The other nine clusters of the plan remain **open** — this section proves C
+The other clusters of the plan remain **open** — this section proves C
 only, not `shir_native_stmt.rs` as a whole.
 
 ### Cluster H, proved: quoting/escape round-trips
