@@ -29,6 +29,43 @@ use crate::ir::{shir_to_perl, InterpPart, IrExpr, IrProgram, IrRedirect, IrStmt}
 ///
 /// This is what `otranspilerl-cli`'s `--target pl` dispatch must call.
 pub fn generate(prog: &IrProgram) -> String {
+    generate_impl(prog, None)
+}
+
+/// One named text pass: `(name, fn)`. The name exists so the audit test can
+/// disable a pass by name and prove it is load-bearing (or dead).
+pub(crate) type TextPass = (&'static str, fn(&str) -> String);
+
+/// The passes over the RENDERED program, in order.
+///
+/// Each one is named in `post_pass` where it runs; the audit test
+/// (`audit_each_text_pass`, `cargo test --lib audit_each_text_pass --
+/// --ignored --nocapture`) renders the whole corpus once per pass with that
+/// pass disabled and reports which renders change.
+fn text_passes() -> &'static [TextPass] {
+    &[
+        ("fix_condition_booleans", fix_condition_booleans),
+        ("fix_printf_bash_conversions", fix_printf_bash_conversions),
+        ("fix_printf_b_percent_b", fix_printf_b_percent_b),
+        ("fix_print_newline_to_say", fix_print_newline_to_say),
+        ("fix_print_concat_interp", fix_print_concat_interp),
+        ("fix_literal_pipeline_pipestatus", fix_literal_pipeline_pipestatus),
+    ]
+}
+
+/// The DECLARATION passes (the missing `our`/`my` names). They run after the
+/// text passes and are what `ir::shir_to_perl` also calls at the end of the
+/// bare path, so both entry points emit strict-clean Perl.
+fn declaration_passes() -> &'static [TextPass] {
+    &[
+        ("declare_undeclared_vars", declare_undeclared_vars),
+        ("declare_arith_operand_flag", declare_arith_operand_flag),
+    ]
+}
+
+/// `generate`, optionally with one text pass disabled. Only the audit test
+/// (and a pass's own pinning test) has business passing `Some`.
+pub(crate) fn generate_impl(prog: &IrProgram, skip_pass: Option<&str>) -> String {
     if std::env::var("PG_DUMP_IR").is_ok() {
         eprintln!("PG_DUMP_IR: {prog:#?}");
     }
@@ -85,7 +122,7 @@ pub fn generate(prog: &IrProgram) -> String {
     if std::env::var_os("SH2_DEBUG_PGFIX").is_some() {
         eprintln!("PGFIX-RENDERED:\n{src}");
     }
-    let src = post_pass(&src);
+    let src = post_pass_without(&src, skip_pass);
     if std::env::var_os("SH2_DEBUG_PGFIX").is_some() {
         eprintln!("PGFIX-POSTPASS:\n{src}");
     }
@@ -196,39 +233,29 @@ fn collect_scalar_phase_vars(stmts: &[IrStmt], out: &mut std::collections::HashS
 /// renderer, which owns both decisions, is not ours to change. Everything
 /// here is anchored on the shape it rewrites and leaves anything else alone.
 fn post_pass(src: &str) -> String {
-    // `fix_sub_params` (the sub-body `$N` rewrite plus its binding
-    // injection) is GONE: the IR emits `local @__sh_args = @_` itself, so
-    // there is nothing for the text layer to bind or rewrite.
-    let out = src.to_string();
-    let out = fix_case_pattern_tail(&out);
-    let out = fix_heredoc_delim(&out);
-    let out = fix_cmd_capture_split(&out);
-    let out = fix_for_array_iterand(&out);
-    let out = fix_for_capture_paren(&out);
-    let out = fix_glob_sentinel_in_for_iterand(&out);
-    let out = fix_bareword_words(&out);
-    let out = fix_condition_booleans(&out);
-    let out = fix_shell_builtin_command_name(&out);
-    let out = fix_eval_payload_expansion(&out);
-    let out = fix_printf_bash_conversions(&out);
-    let out = fix_printf_b_percent_b(&out);
-    // The output idioms run BEFORE the position-parameter slicing: that pass
-    // can reformat a statement's tail, which left `print($result, "\n")`
-    // unchanged when it ran first.
-    let out = fix_print_newline_to_say(&out);
-    let out = fix_print_concat_interp(&out);
-    let out = fix_pos_param_slice(&out);
-    let out = fix_literal_pipeline_pipestatus(&out);
-    // `bind_toplevel_positional_params` (the `$ARGV[`→`$__sh_args[` /
-    // `$#ARGV`→`$__sh_args_n` / `@ARGV`→`@__sh_args` substitutions) is GONE:
-    // the IR emits those names and the file-scope binding directly (see
-    // ir::shir_to_perl's preamble). This was the layer that decided the
-    // MEANING of a construct by the SHAPE of its text; it no longer exists.
-    // The declare result MUST be bound: as a bare statement its String is
-    // dropped and `declare_arith_operand_flag(&out)` would return the
-    // UNDECLARED source — every undeclared-var compile error comes back
-    // (`my @PIPESTATUS;` vanished and 070 printed nothing).
-    declare_renderer_symbols(&out)
+    post_pass_without(src, None)
+}
+
+/// The rendered-text pipeline. `skip` names one pass to leave out (audit /
+/// pinning tests only). Order matters in two places, recorded at the passes
+/// themselves: the output idioms must run before `fix_pos_param_slice` (which
+/// can reformat a statement tail and leave `print($x, "\n")` untouched), and
+/// `fix_literal_pipeline_pipestatus` must run before the declaration passes
+/// (which pick its `@PIPESTATUS` write up as a reference).
+fn post_pass_without(src: &str, skip: Option<&str>) -> String {
+    // Debug/audit seam: `SH2_SKIP_TEXT_PASS=<name>` leaves one pass out so a
+    // fresh process can render the comparison (the in-process audit cannot use
+    // it for a program whose render depends on renderer-internal state).
+    let env_skip = std::env::var("SH2_SKIP_TEXT_PASS").ok();
+    let skip = skip.or(env_skip.as_deref());
+    let mut out = src.to_string();
+    for (name, pass) in text_passes().iter().chain(declaration_passes().iter()) {
+        if Some(*name) == skip {
+            continue;
+        }
+        out = pass(&out);
+    }
+    out
 }
 
 /// The DECLARATION half of `post_pass`: the renderer-owned flags and the
@@ -237,40 +264,20 @@ fn post_pass(src: &str) -> String {
 /// the bare path used to leave `$L`, `${PIPESTATUS[@]}` and `$__SH2_AE`
 /// undeclared, a hard compile error that killed the whole file.
 pub(crate) fn declare_renderer_symbols(src: &str) -> String {
-    let out = declare_undeclared_vars(src);
-    let out = declare_arith_operand_flag(&out);
-    declare_positional_count(&out)
+    // Same audit seam as `post_pass_without`: the bare entry point
+    // (`ir::shir_to_perl`) runs these passes too, so a declaration pass's
+    // liveness must be measured on BOTH entry points.
+    let env_skip = std::env::var("SH2_SKIP_TEXT_PASS").ok();
+    let mut out = src.to_string();
+    for (name, pass) in declaration_passes() {
+        if Some(*name) == env_skip.as_deref() {
+            continue;
+        }
+        out = pass(&out);
+    }
+    out
 }
 
-/// `$__sh_args_n` — the file-scope positional COUNT that `$#` reads and the
-/// `__sh_pos` helper consult (a `set --` refreshes it). The `--fixed` path
-/// binds it through `TOPLEVEL_POS_DECLS`; the bare path emitted the write with
-/// no declaration at all, a hard `use strict` compile error that killed the
-/// whole file (parse-at-slice). Shared here so both entry points declare it.
-fn declare_positional_count(src: &str) -> String {
-    if !src.contains("$__sh_args_n") {
-        return src.to_string();
-    }
-    // Exactly ONE file-scope declaration, no matter which pass added it
-    // first (`our $x; our $x;` in one scope is perl's "\"our\" variable $x
-    // redeclared" warning). Indented declarations belong to a sub's own
-    // scope and are left alone.
-    let mut kept = false;
-    let mut out = String::with_capacity(src.len());
-    for line in src.split_inclusive('\n') {
-        if line.starts_with("our $__sh_args_n;") {
-            if kept {
-                continue;
-            }
-            kept = true;
-        }
-        out.push_str(line);
-    }
-    if kept {
-        return out;
-    }
-    inject_before_first_stmt(&out, "our $__sh_args_n;\n")
-}
 
 /// `$__SH2_AE` — the empty-operand flag `arith_str_to_perl` writes inside
 /// expression positions (`… && ($__SH2_AE = 1)`), which
@@ -403,39 +410,6 @@ fn literal_true_false_statuses(inner: &str) -> Option<Vec<u8>> {
 
 
 
-// ── Fix 18 — a shell BUILTIN name must not be quoted in a `bash -c` payload ──
-//
-// `sh_cmd_value_expr` (ir.rs) reconstructs a command for the `bash -c` seam by
-// walking the command TEXT and quoting each literal span:
-//
-//     q{eval} "echo \"The answer is } . __sh_q($x) . q{\""}
-//
-// That is right for every literal EXCEPT the command name. `q{eval}` is an
-// argv string, so `bash -c` runs a program literally NAMED `eval`, fails with
-// "command not found", and prints nothing — the payload never runs at all:
-//
-//     $ x=42; eval "echo \"The answer is $x\""        # bash: The answer is 42
-//     # generated: empty output, exit 0
-//
-// It is silent: the status is 0 and only stdout differs, so it reads as a
-// content bug rather than a dispatch one. Fix 7 (see below) is meant to
-// RE-ENTER an `eval` payload inline instead, but it only fires when the
-// payload's word is fully literal (`word_source_text`) — an interpolated
-// payload like the one above skips it, and this is the fallback that then
-// runs.
-//
-// The shell builtins are exactly the names `is_shell_builtin` (ir.rs) already
-// refuses to send down the uu-ffi argv seam for this same reason: they are
-// resolved by the SHELL, not exec'd. Unquoting the leading name lets bash's own
-// builtin table resolve it. Only the FIRST span is touched — a builtin name
-// later in the text is an argument to it, and must stay quoted.
-fn fix_shell_builtin_command_name(src: &str) -> String {
-    let mut out = String::with_capacity(src.len());
-    for line in src.split_inclusive('\n') {
-        out.push_str(&unquote_builtin_command_name(line));
-    }
-    out
-}
 
 /// Un-quote the command NAME at the head of a `system('bash', '-c', …)` call,
 /// when that name is a shell builtin.
@@ -548,49 +522,6 @@ pub(crate) fn is_shell_builtin_name(name: &str) -> bool {
     )
 }
 
-// ── Fix 21 — an `eval` payload's expansion must not be SHELL-quoted ─────
-//
-// `sh_cmd_value_expr` (ir.rs) rebuilds a `bash -c` payload by walking the
-// command TEXT and splicing each `$expansion` as `__sh_q(<perl value>)` —
-// a single-quoted SHELL word:
-//
-//     $ x=42; eval "echo \"The answer is $x\""
-//     pl: system('bash','-c', q{'eval' "echo \"The answer is } . __sh_q($x) . '\\""');
-//         ⇒ the payload text bash receives is
-//              eval "echo \"The answer is '42'\""
-//         ⇒ bash expands $x (already done by the splice) and the literal
-//            single quotes survive into the OUTPUT:  The answer is '42'
-//
-// bash prints `The answer is 42`. The single quotes are the bug: the splice
-// point is INSIDE a double-quoted span, and a shell-quoted word dropped into a
-// double-quoted span contributes its QUOTING CHARACTERS to the text rather
-// than its value.
-//
-// This is safe to fix narrowly precisely because of the double quotes. The
-// emitted payload is a concatenation of three kinds of piece, and only the
-// middle ones are expansions:
-//
-//     "…\"The answer is "   literal span (double-quoted shell text)
-//          __sh_q($x)      expansion  ← lives INSIDE the double quotes
-//     "…\""                literal span
-//
-// so an expansion is "inside double quotes" exactly when the literal span
-// immediately before it has an UNCLOSED `"`. In that position the value is
-// interpolated text and needs no shell quoting; `__sh_q` there both adds
-// quotes and fails to protect a value containing `"` or `$`.
-//
-// Outside a double-quoted span (`eval ls $x`) the original `__sh_q` is
-// correct and is left untouched — it is what makes the value one argv word.
-fn fix_eval_payload_expansion(src: &str) -> String {
-    if !src.contains("'eval'") && !src.contains("q{'eval'}") && !src.contains("q{eval}") {
-        return src.to_string();
-    }
-    let mut out = String::with_capacity(src.len());
-    for line in src.split_inclusive('\n') {
-        out.push_str(&unquote_eval_splices(line));
-    }
-    out
-}
 
 /// One line: un-wrap every `__sh_q(` splice that sits inside a double-quoted
 /// span of an `eval` payload.
@@ -1694,32 +1625,6 @@ fn has_toplevel_comma(s: &str) -> bool {
     false
 }
 
-// ── Fix 12 — a bareword argument to `print` must be a quoted string ────────
-//
-// `echo ab` renders as `print(ab);`. Under the `use strict` the preamble
-// always emits, an unquoted `ab` is a *bareword* — Perl reads it as the
-// string "ab" but warns, and warns to stderr, and "ab" is one token away
-// from a future reserved word:
-//
-// ```perl
-// Unquoted string "ab" may clash with future reserved word at out.pl line 362.
-// ```
-//
-// The value is already correct; only the quoting is missing. `render_word`
-// in the shared renderer returns a bareword for a single unquoted literal
-// word, and the renderer routes that straight into `print(…)` (ir.rs's
-// echo/print path). Anchoring on the renderer's own call shape — a `print`
-// whose argument list is a bare identifier that is NOT a declared Perl
-// symbol — keeps this from touching `$x`, `foo(…)`, `'q'`, or a `print` whose
-// argument is already an expression.
-fn fix_bareword_words(src: &str) -> String {
-    let declared = declared_symbols(src);
-    let mut out = String::with_capacity(src.len());
-    for line in src.split_inclusive('\n') {
-        out.push_str(&quote_bareword_in_line(line, &declared));
-    }
-    out
-}
 
 /// Rewrite `print(AB);` / `print(AB, "\n");` where `AB` is a bareword into
 /// the quoted form. Returns `line` unchanged unless it matches.
@@ -2114,228 +2019,8 @@ fn declared_names_in(binding_list: &str) -> Vec<String> {
     out
 }
 
-/// Fix 11 — a `for … in "${arr[@]}"` iterand must stay a LIST, not a scalar.
-///
-/// The renderer wraps a `for` iterand in a redundant pair of parens, exactly
-/// as it does for a capture (Fix 10), but for an ARRAY expansion the inner
-/// expression is the `join`/`split` round-trip rather than a bare `split`:
-///
-/// ```perl
-/// for my $__num ((join(' ', @numbers))) {  # from `for num in "${numbers[@]}"`
-/// ```
-///
-/// Both problems are Fix 10's, at once. The inner parens put `join` in
-/// **scalar context**, so the loop runs exactly once with the whole array as
-/// one word: `for num in "${numbers[@]}"` over `(1 2 3 4 5)` printed nothing
-/// where the nested filter should have printed 8 lines (058), and `for arg in
-/// "$@"` (realpath-cmdsub) collapsed every argument into a single blob. The
-/// `join` is separately wrong here — `join` is what *collapses* the list, and
-/// the list is what the loop wants.
-///
-/// The fix is the same unwrap Fix 10 performs, and for the same reason: the
-/// word-splitting `for` wants is precisely what the array already holds, so
-/// the iterand is the array itself. `for my $__num (@numbers)` iterates one
-/// element at a time, as bash's `for … in "${arr[@]}"` does.
-///
-/// Scoped to the array shape only. An iterand that is a command capture is
-/// Fix 10's business (there the list must come from `split`), and anything
-/// else — a literal list, a range, a glob — is left exactly as rendered.
-fn fix_for_array_iterand(src: &str) -> String {
-    const PREFIX: &str = "for my $";
-    let mut out = String::with_capacity(src.len());
-    let mut rest = src;
-    loop {
-        let Some(at) = rest.find(PREFIX) else {
-            out.push_str(rest);
-            return out;
-        };
-        // The iterand paren pair: `for my $NAME ((`.
-        let after_prefix = &rest[at + PREFIX.len()..];
-        let Some(name_end) = after_prefix.find(' ') else {
-            out.push_str(&rest[..at + PREFIX.len()]);
-            rest = after_prefix;
-            continue;
-        };
-        let open = at + PREFIX.len() + name_end + 1;
-        if !rest[open..].starts_with("((") {
-            out.push_str(&rest[..open]);
-            rest = &rest[open..];
-            continue;
-        }
-        // Inner `(` — the one that must go.
-        let inner_open = open + 1;
-        let Some(inner_close) = matching_paren(rest, inner_open) else {
-            out.push_str(&rest[..open]);
-            rest = &rest[open..];
-            continue;
-        };
-        // The wrap must be `join(' ', @NAME)` — the array shape. A capture is
-        // Fix 10's; anything else (a literal list, a range) is not ours.
-        let inner = rest[inner_open + 1..inner_close].trim();
-        let Some(arr) = inner
-            .strip_prefix("join(' ', @")
-            .and_then(|t| t.strip_suffix(')'))
-        else {
-            out.push_str(&rest[..open]);
-            rest = &rest[open..];
-            continue;
-        };
-        // A bare `@name` is the iterand; `@name[ … ]` and `@{ … }` are not
-        // shapes this fix claims to understand.
-        if arr.is_empty() || !arr.chars().all(|c| c.is_alphanumeric() || c == '_') {
-            out.push_str(&rest[..open]);
-            rest = &rest[open..];
-            continue;
-        }
-        // `for my $NAME ((join(' ', @arr))) {` -> `for my $NAME (@arr) {`
-        // `inner_close` is the `)` that closes the `join`; the iterand's own
-        // `)` follows it, so resumption is one past THAT, not past this one.
-        // A shape that ends before that second `)` is not ours — leave it.
-        let Some(resume) = rest.get(inner_close + 2..) else {
-            out.push_str(&rest[..open]);
-            rest = &rest[open..];
-            continue;
-        };
-        out.push_str(&rest[..inner_open]);
-        out.push('@');
-        out.push_str(arr);
-        out.push(')');
-        rest = resume;
-    }
-}
 
-/// Fix 10 — a `for … in $(cmd)` capture must stay a LIST, not a scalar.
-///
-/// The renderer emits the command substitution as
-/// `join(' ', split(/\s+/, …))` and wraps a `for` iterand in a further pair
-/// of parens:
-///
-/// ```perl
-/// for my $f ((join(' ', split(/\s+/, __sh_pipe_capture(…))))) {
-/// ```
-///
-/// Those inner parens put `join` in **scalar context**, so the loop runs
-/// exactly once with the whole line as one word:
-/// `for f in $(echo "a b c")` printed `[a b c]` instead of `[a] [b] [c]`
-/// (examples/sqs-overlap-multiline-awk.sh, 070_gnuisms_thorough.sh line 65).
-///
-/// The word-splitting `for` wants is precisely what `split` already produces —
-/// `join` is what collapses it. So the fix is to drop the redundant parens AND
-/// the `join` wrapper, leaving `for my $f (split(/\s+/, …))`, which iterates
-/// per field exactly as bash's `for … in $(cmd)` does (IFS field splitting).
-///
-/// Scoped to the `for`-iterand shape only: a capture used in a scalar context
-/// (assignment, arithmetic, test) must keep the `join` that
-/// `fix_cmd_capture_split` puts in scalar context.
-fn fix_for_capture_paren(src: &str) -> String {
-    const PREFIX: &str = "for my $";
-    let mut out = String::with_capacity(src.len());
-    let mut rest = src;
-    loop {
-        let Some(at) = rest.find(PREFIX) else {
-            out.push_str(rest);
-            return out;
-        };
-        // The iterand paren pair: `for my $NAME ((`.
-        let after_prefix = &rest[at + PREFIX.len()..];
-        let Some(name_end) = after_prefix.find(' ') else {
-            out.push_str(&rest[..at + PREFIX.len()]);
-            rest = after_prefix;
-            continue;
-        };
-        let open = at + PREFIX.len() + name_end + 1;
-        if !rest[open..].starts_with("((") {
-            out.push_str(&rest[..open]);
-            rest = &rest[open..];
-            continue;
-        }
-        // Inner `(` — the one that must go.
-        let inner_open = open + 1;
-        let Some(inner_close) = matching_paren(rest, inner_open) else {
-            out.push_str(&rest[..open]);
-            rest = &rest[open..];
-            continue;
-        };
-        // The wrap must be `join(' ', split(/\s+/, …))` — the capture shape.
-        // Anything else (a plain `@list`, an array ref) is not ours.
-        let inner = rest[inner_open + 1..inner_close].trim();
-        if !inner.starts_with("join(' ', split(/\\s+/, ") {
-            out.push_str(&rest[..open]);
-            rest = &rest[open..];
-            continue;
-        }
-        // Unwrap the `split`: `join(' ', split(/\s+/, X))` -> `split(/\s+/, X)`.
-        let split_at = inner.find("split(/\\s+/, ").expect("prefix-checked") + "split(/\\s+/, ".len();
-        // The `split` call's own close paren ends the expression.
-        let Some(split_close) = matching_paren(inner, split_at) else {
-            out.push_str(&rest[..open]);
-            rest = &rest[open..];
-            continue;
-        };
-        if split_close + 1 != inner.len() || !inner.ends_with(')') {
-            out.push_str(&rest[..open]);
-            rest = &rest[open..];
-            continue;
-        }
-        let split_expr = &inner[split_at..split_close];
-        out.push_str(&rest[..inner_open]);
-        out.push('(');
-        out.push_str(split_expr);
-        out.push(')');
-        rest = &rest[inner_close + 1..];
-    }
-}
 
-// ── Fix 20 — the core's GLOB sentinel must not survive into a Perl string ──
-//
-// An unquoted glob word is tagged by the core with a `\x01SH2GLOB\x01`
-// sentinel so a renderer can tell "expand this pattern" from "this is a
-// literal" (sh_backend.rs / java_backend.rs strip it; the shared
-// `render_word` in ir.rs strips it with `glob(…)`).
-//
-// The BRACE-EXPANSION path is the one place the Perl side never sees that
-// strip: `render_brace_iter` builds its item list from the brace word's own
-// prefix, quotes each result, and emits them as the `for` iterand — so the
-// sentinel rides along inside the quotes:
-//
-//   sh:  for f in *.{txt,log,dat}; do case "$f" in *.txt) …
-//   pl:  for my $__f (("\x01SH2GLOB\x01*.txt", "\x01SH2GLOB\x01*.log", …)) {
-//
-// Every element then matches nothing: `case` sees a literal path that cannot
-// exist, so the whole loop prints `Text file: \x01SH2GLOB\x01*.txt` — the
-// sentinel is *user-visible output*, not just a wrong branch. It is written
-// straight to stdout, so this is a byte-for-byte gate failure on
-// 064_19_complex_pattern_matching_extended_globs and 064_hard_to_generate
-// (and the same shape in 000__04h, whose glob runs through an array instead).
-//
-// The fix is the shared renderer's own convention applied to the one
-// rendering that skipped it: a sentinel-tagged item is a glob to be
-// EXPANDED, so it renders as `glob('…')` — the same form `render_word`
-// produces for a non-braced glob. Left alone, `glob` returns the empty list
-// for a non-matching pattern, which is also what bash does with `nullglob`
-// off for the *word count* in this position, so a pattern that matches
-// nothing degrades the same way on both sides.
-fn fix_glob_sentinel_in_for_iterand(src: &str) -> String {
-    const PREFIX: &str = "for my $";
-    const SENTINEL: &str = "\u{1}SH2GLOB\u{1}";
-    if !src.contains(SENTINEL) {
-        return src.to_string();
-    }
-    let mut out = String::with_capacity(src.len());
-    let mut rest = src;
-    loop {
-        let Some(at) = rest.find(PREFIX) else {
-            out.push_str(rest);
-            return out;
-        };
-        // To the end of the `for … (…)` header: the iterand list is a single
-        // rendered line, and the sentinel only ever appears inside it.
-        let header_end = rest[at..].find('\n').map(|i| at + i).unwrap_or(rest.len());
-        let (head, tail) = rest.split_at(header_end);
-        out.push_str(&strip_glob_in_header(head));
-        rest = tail;
-    }
-}
 
 /// Replace every sentinel-tagged `'…'` list element in one `for` header with
 /// the `glob(…)` expansion. Elements that are not sentinel-tagged are left
@@ -2387,66 +2072,6 @@ let after = at + SENTINEL.len();
     }
 }
 
-/// Fix 5 — a command substitution whose output is ONE token must not be erased.
-///
-/// The renderer wraps every `$( … )` in
-///
-/// ```perl
-/// join(' ', split(/\s+/, do { my $__cap; … $__cap =~ s/\n+\z//; $__cap }))
-/// ```
-///
-/// which round-trips multi-word output but DESTROYS single-word output:
-/// `split(/\s+/, "")` returns the empty list (Perl's documented special case
-/// for splitting an empty string), so `x=$(echo hi)` became `x=""`. In
-/// 051_primes that emptied `$sqrt_n`, `is_prime` then compared every `n`
-/// against `""`, and the prime list was entirely wrong.
-///
-/// `join`+`split` round-trips any string that is non-empty and contains no
-/// leading/trailing whitespace, so the fix is to stop discarding a result the
-/// call site actually has words for: wrap the `join` in scalar context when the
-/// joined value is used as ONE scalar (assignment to a scalar, an arithmetic
-/// operand, a `[ … ]` test, a comparison, `return`).
-///
-/// The transform is anchored on the exact rendered prefix and its
-/// matching close paren, counted with a scanner that understands single-quoted
-/// strings — the capture body is full of both `'` and `{`/`}`, so a naive
-/// brace count would stop at the wrong place.
-fn fix_cmd_capture_split(src: &str) -> String {
-    const PREFIX: &str = "join(' ', split(/\\s+/, do {";
-    let mut out = String::with_capacity(src.len());
-    let mut rest = src;
-    loop {
-        let Some(at) = rest.find(PREFIX) else {
-            out.push_str(rest);
-            return out;
-        };
-        let open = at + "join(".len();
-        let Some(close) = matching_paren(rest, open) else {
-            // Unterminated on this line: the renderer's business.
-            out.push_str(&rest[..at]);
-            out.push_str(&rest[at..]);
-            return out;
-        };
-        // Both sides are needed: `my $x = join(…)` is decided by the target
-        // on the LEFT, `(0+join(…))` by the operand on the RIGHT.
-        let before = &rest[..at];
-        let before_line = match before.rfind('\n') {
-            Some(nl) => &before[nl + 1..],
-            None => before,
-        };
-        let after = &rest[close + 1..];
-        let scalar_use = scalar_assign_before(before_line) || starts_scalar_use(after);
-        out.push_str(&rest[..open]);
-        if scalar_use {
-            out.push_str("scalar(");
-        }
-        out.push_str(&rest[open..=close]);
-        if scalar_use {
-            out.push(')');
-        }
-        rest = &rest[close + 1..];
-    }
-}
 
 /// Does the text ending this line assign the capture to a SCALAR?
 ///
@@ -2734,25 +2359,6 @@ fn sub_spans(src: &str) -> Vec<(usize, usize, String)> {
 
 
 
-/// Fix 3 — a command-substitution case PATTERN must be evaluated.
-///
-/// The renderer desugars `case X in $(cmd)) …` into an `if` whose regex is
-/// the pattern text with the substitution left unexpanded, so the pattern can
-/// never match a literal string (parse-redirect-in-case-pattern matched
-/// nothing). A `$(…)` inside a pattern is a command substitution the shell
-/// runs before matching, so evaluate it in place.
-///
-/// Only the tail is quoted, which is what makes this safe: the rendered form
-/// is `q{$( … )}` or `qq{$( … )}`, and leaving the head unquoted means a
-/// pattern that is a bare `/regex/` or `text` is untouched.
-fn fix_case_pattern_tail(src: &str) -> String {
-    const NEEDLES: [&str; 4] = ["q{$(", "qq{$(", "q($(", "qq($("];
-    let mut out = src.to_string();
-    for needle in NEEDLES {
-        out = quote_cmdsub_tails(&out, needle);
-    }
-    out
-}
 
 /// Replace the final `)}` of every `q{$( … )}` occurrence with `)qx( … )}`.
 fn quote_cmdsub_tails(src: &str, needle: &str) -> String {
@@ -2785,53 +2391,6 @@ fn quote_cmdsub_tails(src: &str, needle: &str) -> String {
     out
 }
 
-/// Fix 6 — the heredoc seam's terminator line carries a duplicated pipeline tail.
-///
-/// The renderer builds the shell command first and only then appends the
-/// heredoc (`ir.rs:2226-2233`):
-///
-/// ```text
-/// cmd = "<cmd with its pipeline>"
-/// cmd += "\n" + body + "\n" + delim
-/// ```
-///
-/// which is correct only while the command has nothing after the heredoc. For
-/// `cat << 'EOF' | grep -v "^#" | sed 's/^/  /'` the pipeline is already part of
-/// `cmd`, so the emitted text is
-///
-/// ```perl
-/// system('bash', '-c', q['cat' <<'_SH2DOC_'
-/// # This is a comment
-/// …
-/// _SH2DOC_ | 'grep' '-v' "^#" | 'sed' 's/^/  /']);
-/// ```
-///
-/// A heredoc terminator must be ALONE on its line. Here it is followed by a
-/// copy of the pipeline that the opener line already carries, so bash never
-/// closes the heredoc: it warns "here-document … delimited by end-of-file",
-/// swallows the terminator line into the body, and the pipeline runs on that
-/// garbage — the literal `$(echo …)` lines come out un-indented and un-grepped.
-///
-/// The fix is to drop the tail that follows the terminator token on its line,
-/// leaving the terminator alone. The pipeline it duplicates is already on the
-/// opener, so nothing is lost.
-fn fix_heredoc_delim(src: &str) -> String {
-    if !src.contains("_SH2DOC_") {
-        return src.to_string();
-    }
-    let mut out = String::with_capacity(src.len());
-    for block in split_heredoc_blocks(src) {
-        match block {
-            HeredocBlock::Plain(t) => out.push_str(t),
-            HeredocBlock::Heredoc { open, body, close } => {
-                out.push_str(open);
-                out.push_str(body);
-                out.push_str(&closer_line(close));
-            }
-        }
-    }
-    out
-}
 
 enum HeredocBlock<'a> {
     Plain(&'a str),
@@ -5293,113 +4852,7 @@ pub fn needs_affix_helper(perl_src: &str) -> bool {
     perl_src.contains("strHasPrefix(") || perl_src.contains("strHasSuffix(")
 }
 
-// ── Fix 22 — `${@:offset}` is a LIST slice; the renderer's join is not ────
-//
-// The `"slice"` arm of `param` in ir.rs lowers `${@:off}` to
-//     join(' ', @ARGV[off-1..$#ARGV])
-// and `${@:off:len}` to
-//     join(' ', @ARGV[off-1..off-1+len-1]).
-// Both are inside whatever the renderer was building, so a `${@:1}` that
-// became the BODY of an enclosing `join(' ', …)` is doubly wrapped:
-//
-//     print("1:[" . (join(' ', join(' ', @ARGV[0..$#ARGV]))) . "]", "\n");
-//
-// An empty slice then contributes one empty FIELD where bash contributes
-// none, printing a lone space (parse-at-slice-param.sh, `  $` vs ` $`).
-// A bounded slice that runs past the end is worse: Perl pads the missing
-// elements with undef and `join` prints the padding as empty fields, where
-// bash stops at the last argument.
-//
-// `__sh_pos` returns the LIST, so an empty slice contributes zero fields and
-// a short slice contributes only real arguments. The bounded form is routed
-// through it too, with the same end index the renderer computed — a bounded
-// slice past the end must not fabricate fields either.
-//
-// Only the UNBOUNDED-to-end form (`..$#ARGV`) and the bounded numeric form
-// are rewritten, and only when the index is a plain literal, so anything
-// else is left exactly as the renderer wrote it.
-fn fix_pos_param_slice(src: &str) -> String {
-    let mut out = String::with_capacity(src.len());
-    for line in src.lines() {
-        out.push_str(&fix_pos_param_slice_in_line(line));
-        out.push('\n');
-    }
-    // `lines()` drops a trailing newline; put it back so a program that ended
-    // with one still does.
-    if !src.ends_with('\n') && !out.is_empty() {
-        out.pop();
-    }
-    out
-}
 
-/// One line of {@link fix_pos_param_slice}.
-fn fix_pos_param_slice_in_line(line: &str) -> String {
-    const NEEDLE: &str = "join(' ', @ARGV[";
-    let mut out = String::with_capacity(line.len());
-    let mut rest = line;
-    loop {
-        let Some(at) = rest.find(NEEDLE) else {
-            out.push_str(rest);
-            return out;
-        };
-        let after = &rest[at + NEEDLE.len()..];
-        let Some(close) = after.find(']') else {
-            out.push_str(rest);
-            return out;
-        };
-        let bounds = &after[..close];
-        let Some((lo, hi)) = bounds.split_once("..") else {
-            out.push_str(rest);
-            return out;
-        };
-        // Both bounds must be plain literals — a computed index is left to
-        // the renderer, which may have a reason we do not.
-        let is_lit = |s: &str| !s.is_empty() && s.chars().all(|c| c.is_ascii_digit());
-        // Unbounded: `@ARGV[lo..$#ARGV]` — bash's `${@:lo+1}`.
-        let replacement = if hi == "$#ARGV" && is_lit(lo) {
-            let start = lo.parse::<u64>().unwrap_or(0) + 1;
-            format!("join(' ', __sh_pos({start}))")
-        } else if is_lit(lo) && is_lit(hi) {
-            // Bounded: bash's `${@:off:len}`. The renderer already turned
-            // that into a closed 0-based range, so pass the 1-based start
-            // and keep the count; the helper clamps at the real end.
-            if let (Ok(l), Ok(h)) = (lo.parse::<u64>(), hi.parse::<u64>()) {
-                if h < l {
-                    // A reversed range means bash asked for nothing.
-                    "''".to_string()
-                } else {
-                    format!("join(' ', __sh_pos({}, {}))", l + 1, h + 1 - l)
-                }
-            } else {
-                String::new()
-            }
-        } else {
-            String::new()
-        };
-        if replacement.is_empty() {
-            // Not a shape we rewrite: copy through and continue AFTER the
-            // needle so the next occurrence is still considered.
-            out.push_str(&rest[..at + NEEDLE.len()]);
-            rest = after;
-            continue;
-        }
-        out.push_str(&rest[..at]);
-        out.push_str(&replacement);
-        // The needle is `join(' ', @ARGV[…]`: `]` closes the slice, and the
-        // character after it is the `)` that closes the ORIGINAL `join(`.
-        // The replacement re-opens its own balanced `join(…)`, so copying
-        // that `)` through would leave one paren too many —
-        // `join(' ', __sh_pos(3))))` — which is a Perl COMPILE error that
-        // takes the whole program down, not a wrong value
-        // (parse-at-slice-param.sh, whose only other symptom is the
-        // single-space diff this pass exists to fix).
-        //
-        // Consume exactly one `)`, and only when it really is the join's
-        // closer: `join(' ', @ARGV[0..1] . "x")` puts `. "x"` there, so the
-        // `strip_prefix` miss is the correct fallback, not an error.
-        rest = after[close + 1..].strip_prefix(')').unwrap_or(&after[close + 1..]);
-    }
-}
 
 #[cfg(test)]
 mod pgf_tests {
@@ -5698,33 +5151,6 @@ mod pgf_tests {
     /// Copying that `)` through produced `join(' ', __sh_pos(3))))`, a Perl
     /// COMPILE error, so the program printed nothing at all rather than
     /// merely the wrong value.
-    #[test]
-    fn pos_slice_rewrite_consumes_join_close_paren() {
-        // The exact shape the renderer emits inside an array assignment,
-        // which is where parse-at-slice-param.sh hits it.
-        assert_eq!(
-            fix_pos_param_slice_in_line(
-                "@ARGV = ($ARGV[0], $tempfile, join(' ', @ARGV[2..$#ARGV]));  # line 3"
-            ),
-            "@ARGV = ($ARGV[0], $tempfile, join(' ', __sh_pos(3)));  # line 3"
-        );
-        // The `print(...)` shape: same needle, different surrounding closers.
-        assert_eq!(
-            fix_pos_param_slice_in_line("print(join(' ', @ARGV[0..$#ARGV]), \"\\n\");"),
-            "print(join(' ', __sh_pos(1)), \"\\n\");"
-        );
-        // A bounded slice is rewritten through the same path.
-        assert_eq!(
-            fix_pos_param_slice_in_line("x = join(' ', @ARGV[0..1]);"),
-            "x = join(' ', __sh_pos(1, 2));"
-        );
-        // A `)` that is NOT the join's closer must survive: stripping it
-        // would corrupt `join(' ', @ARGV[0..1] . "x")`.
-        assert_eq!(
-            fix_pos_param_slice_in_line("x = join(' ', @ARGV[0..$#ARGV] . 'x');"),
-            "x = join(' ', __sh_pos(1)) . 'x');"
-        );
-    }
 
     /// The paren fix is only real if the emitted program COMPILES. Assert the
     /// whole generated program is paren-balanced, since an unbalanced program
@@ -6098,118 +5524,19 @@ mod no_output_loss_tests {
         }
     }
 
-    #[test]
-    fn fix_case_pattern_tail_is_identity_for_an_ordinary_program() {
-        let src = "#!/usr/bin/env perl\nuse strict;\nprint \"hi\\n\";\nexit 0;\n";
-        assert_eq!(fix_case_pattern_tail(src), src);
-    }
 
-    #[test]
-    fn a_needle_that_is_present_is_still_rewritten() {
-        // The rewrite must still fire — the identity fix must not have
-        // disabled the pass it was repairing.
-        let src = "if ($x =~ q{$(cmd)}a) { print 1; }\n";
-        let out = fix_case_pattern_tail(src);
-        assert!(out.contains("qx("), "the cmdsub tail was not rewritten: {out}");
-    }
 
     // ── Fix 11 — the `for`-over-array iterand ───────────────────────────
 
-    #[test]
-    fn for_array_iterand_unwraps_the_join() {
-        // The exact shape the renderer emits for `for num in "${numbers[@]}"`.
-        let out = fix_for_array_iterand("for my $__num ((join(' ', @numbers))) {\n");
-        assert_eq!(out, "for my $__num (@numbers) {\n");
-    }
 
-    #[test]
-    fn for_array_iterand_keeps_each_element_separate() {
-        // The behavior the unwrap buys: the loop body must run once per
-        // element, not once with the joined blob. This is the regression the
-        // 058 failure was — 8 expected lines, 0 produced.
-        let out = fix_for_array_iterand("for my $__num ((join(' ', @numbers))) {\n");
-        assert!(out.contains("@numbers"), "iterand lost the array: {out}");
-        assert!(!out.contains("join"), "the collapsing join survived: {out}");
-        // Exactly one paren pair remains: the list context the loop needs.
-        assert_eq!(out.matches('(').count(), 1, "iterand not in list context: {out}");
-    }
 
-    #[test]
-    fn for_array_iterand_leaves_a_capture_to_fix_10() {
-        // A command capture is the OTHER shape; it must pass through
-        // untouched so Fix 10 (which unwraps the `split` instead) owns it.
-        let src = "for my $__f ((join(' ', split(/\\s+/, __sh_pipe_capture(q('cmd'))))) {\n";
-        assert_eq!(fix_for_array_iterand(src), src);
-    }
 
     // ── Fix 20 — the GLOB sentinel in a `for` iterand ──────────────────
 
-    #[test]
-    fn glob_sentinel_in_for_iterand_becomes_an_expansion() {
-        // The exact shape `render_brace_iter` emits for `for f in *.{txt,log,dat}`.
-        // The sentinel is user-VISIBLE: the case arms below cannot match it, so
-        // the loop printed the marker itself. The fix must remove every byte of
-        // it, not just re-quote it.
-        let src = "for my $__f (('\u{1}SH2GLOB\u{1}*.txt', '\u{1}SH2GLOB\u{1}*.log')) {\n";
-        let out = fix_glob_sentinel_in_for_iterand(src);
-        assert!(
-            !out.contains("SH2GLOB"),
-            "the sentinel survived into the emitted program: {out:?}"
-        );
-        assert!(
-            !out.contains('\u{1}'),
-            "the magic bytes survived into the emitted program: {out:?}"
-        );
-        assert_eq!(
-            out,
-            "for my $__f ((glob('*.txt'), glob('*.log'))) {\n"
-        );
-        // The element's OWN quotes must be consumed too. A previous version
-        // kept the opening quote and emitted `('glob('*.txt')', …)`: the glob
-        // then matched nothing and the loop silently printed nothing, while
-        // this same assertion still passed because the expected string was
-        // never compared against the real element shape. Assert the exact
-        // bytes, and assert no nested-quote string survived.
-        assert!(
-            !out.contains("'glob("),
-            "the element quotes survived around the glob call: {out:?}"
-        );
-    }
 
-    #[test]
-    fn glob_sentinel_fix_leaves_an_untagged_list_alone() {
-        // A plain literal list is not ours: every element stays byte-identical
-        // so an ordinary `for x in a b c` is byte-for-byte unchanged.
-        let src = "for my $__x (('a', 'b', 'c')) {\n";
-        assert_eq!(fix_glob_sentinel_in_for_iterand(src), src);
-    }
 
-    #[test]
-    fn glob_sentinel_fix_leaves_a_non_for_line_alone() {
-        // The pass is anchored on the `for my $` header. The same sentinel in
-        // another position belongs to whichever fix owns that position.
-        let src = "my @x = ('\u{1}SH2GLOB\u{1}*.txt');\n";
-        assert_eq!(fix_glob_sentinel_in_for_iterand(src), src);
-    }
 
-    #[test]
-    fn for_array_iterand_leaves_other_iterands_alone() {
-        // A literal list and a range are not this fix's business.
-        for src in [
-            "for my $__i (('0', '1', '2')) {\n",
-            "for my $n (1..5) {\n",
-            "for my $x (@{$ref}) {\n",
-            "for my $y (@arr[0..2]) {\n",
-        ] {
-            assert_eq!(fix_for_array_iterand(src), src, "over-rewrote: {src:?}");
-        }
-    }
 
-    #[test]
-    fn for_array_iterand_is_identity_without_a_needle() {
-        let src = "#!/usr/bin/env perl\nuse strict;\nfor my $i (1..3) { print $i; }\n";
-        assert_eq!(fix_for_array_iterand(src), src);
-    }
 }
 
 // ── Fix 9 — the materialised process-substitution consumer keeps its
@@ -6975,5 +6302,88 @@ mod positional_text_tests {
         let (_bare, fixed) = render_both("f(){ echo \"$1\"; }\nf x\n");
         assert!(fixed.contains("local @__sh_args = @_;"), "{fixed}");
         assert!(!fixed.contains("local @ARGV = @_;"), "{fixed}");
+    }
+}
+
+/// The audit that decides each text pass's fate: render the whole corpus once,
+/// then once per pass with that pass disabled, and report which renders change.
+/// A pass that changes NOTHING is dead weight; a pass whose changed renders are
+/// wrong is repairing the IR at the wrong layer. Run with:
+///   cargo test --lib audit_each_text_pass -- --ignored --nocapture
+#[cfg(test)]
+mod text_pass_audit {
+    use super::*;
+
+    fn corpus() -> Vec<(String, crate::ir::IrProgram)> {
+        let root = env!("CARGO_MANIFEST_DIR");
+        let mut names: Vec<(String, String)> = Vec::new();
+        for dir in [
+            format!("{root}/examples"),
+            format!("{root}/tests/tier1"),
+            format!("{root}/tests/golden"),
+        ] {
+            let Ok(rd) = std::fs::read_dir(&dir) else { continue };
+            for e in rd.flatten() {
+                let p = e.path();
+                if p.extension().and_then(|x| x.to_str()) != Some("sh") {
+                    continue;
+                }
+                let n = p.file_name().unwrap().to_str().unwrap().to_string();
+                names.push((n, p.to_string_lossy().to_string()));
+            }
+        }
+        names.sort();
+        let mut out = Vec::new();
+        for (n, path) in names {
+            // The non-UTF-8 round-trip fixture never reaches this renderer
+            // (the CLI takes the byte path), so it is not part of the audit.
+            let Ok(text) = std::fs::read_to_string(&path) else {
+                continue;
+            };
+            let Ok((cmds, _)) = crate::Parser::new(&text).parse_with_lines() else {
+                continue;
+            };
+            out.push((n, crate::shir::ast_to_ir(&cmds)));
+        }
+        out
+    }
+
+    #[test]
+    #[ignore]
+    fn audit_each_text_pass() {
+        let corpus = corpus();
+        println!("corpus: {} renderable examples", corpus.len());
+        let baseline: Vec<String> = corpus.iter().map(|(_, p)| generate(p)).collect();
+        // Self-check: rendering the SAME program again with no pass disabled
+        // must be byte-identical, or the audit is measuring renderer state
+        // (counters, temp names) rather than the pass.
+        let again: Vec<String> = corpus.iter().map(|(_, p)| generate(p)).collect();
+        let unstable: Vec<&String> = corpus
+            .iter()
+            .zip(baseline.iter().zip(again.iter()))
+            .filter(|(_, (a, b))| a != b)
+            .map(|((n, _), _)| n)
+            .collect();
+        println!("unstable rerenders (excluded): {unstable:?}");
+        let stable: Vec<(&String, &crate::ir::IrProgram, &String)> = corpus
+            .iter()
+            .zip(baseline.iter())
+            .filter(|((n, _), _)| !unstable.contains(&n))
+            .map(|((n, p), b)| (n, p, b))
+            .collect();
+        for pass in text_passes().iter().chain(declaration_passes().iter()) {
+            let mut changed: Vec<String> = Vec::new();
+            for (name, prog, base) in stable.iter() {
+                if &generate_impl(prog, Some(pass.0)) != *base {
+                    changed.push(name.to_string());
+                }
+            }
+            println!(
+                "PASS {:<38} changed {:>3}  {}",
+                pass.0,
+                changed.len(),
+                changed.iter().take(4).cloned().collect::<Vec<_>>().join(" ")
+            );
+        }
     }
 }
