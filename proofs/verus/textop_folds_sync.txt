@@ -1,5 +1,13 @@
 # verus-sync-coverage manifest: textop_folds
-# source sha: text_ops=6acd2701983d  proof sha: 4f885f265c26
+# source sha: text_ops=1cab9480ab40  proof sha: 4f885f265c26
+#   RE-AUDITED 2026-11-28 at the current file (the recorded value names
+#   1b05361a0 "feat(rust): lift standalone uniq FILE ..."): the whole 56/40
+#   drift is the lift counter moving from a process-static AtomicUsize to a
+#   per-render thread_local Cell (reset_seq / next_seq, and the ~30
+#   LIFT_COUNT.fetch_add call sites). No node construction changed: the four
+#   modelled arms were extracted and diffed -- try_lower_param_len and
+#   try_lower_param_op (StrLen/SubStr) byte-identical, and the whole-file diff
+#   touches no CaseTransform/PathName site. Only the scratch numbering moved.
 # re-pinned 2026-11-26: the recorded 68bfaa6813fb names no revision of
 # src/transforms/text_ops.rs (all 78 versions checked, sha256 and git blob).
 # Re-derived from the current file after auditing the four nodes the pins
