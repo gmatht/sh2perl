@@ -140,20 +140,20 @@ $? = 0 << 8; $CHILD_ERROR = $? >> 8;
     open(my $__sh2_dup5, '>&', \*STDERR) or die;
     open(my $__sh2_dupfh5, '>&', \*STDERR) or die;
     open(STDERR, '>', "/dev/null") or die "redirect: $!\n";
-    do { my $__ok = 1; for my $__d ('/no/such/parent/dir') { unless (mkdir($__d)) { $__ok = 0; print STDERR "mkdir: $!\n"; } } $? = ($__ok ? 0 : 1) << 8; $CHILD_ERROR = $? >> 8; };
+    do { my $__ok = 1; for my $__d ('/no/such/parent/dir') { unless (mkdir($__d)) { $__ok = 0; print STDERR $!{EEXIST} ? "mkdir: $__d: $!\n" : "mkdir: $!\n"; } } $? = ($__ok ? 0 : 1) << 8; $CHILD_ERROR = $? >> 8; };
     open(STDERR, '>&', $__sh2_dupfh5) or die; close($__sh2_dupfh5);
     open(STDERR, '>&', $__sh2_dup5) or die;
 }
 say "mkdir-fail rc=" . __sh_str(($CHILD_ERROR));
 $? = 0 << 8; $CHILD_ERROR = $? >> 8;
-do { my $__ok = 1; for my $__d ('made') { unless (mkdir($__d)) { $__ok = 0; print STDERR "mkdir: $!\n"; } } $? = ($__ok ? 0 : 1) << 8; $CHILD_ERROR = $? >> 8; };
+do { my $__ok = 1; for my $__d ('made') { unless (mkdir($__d)) { $__ok = 0; print STDERR $!{EEXIST} ? "mkdir: $__d: $!\n" : "mkdir: $!\n"; } } $? = ($__ok ? 0 : 1) << 8; $CHILD_ERROR = $? >> 8; };
 say "mkdir-ok rc=" . __sh_str(($CHILD_ERROR));
 $? = 0 << 8; $CHILD_ERROR = $? >> 8;
 {
     open(my $__sh2_dup6, '>&', \*STDERR) or die;
     open(my $__sh2_dupfh6, '>&', \*STDERR) or die;
     open(STDERR, '>', "/dev/null") or die "redirect: $!\n";
-    do { my $__ok = 1; for my $__d ('made') { unless (mkdir($__d)) { $__ok = 0; print STDERR "mkdir: $!\n"; } } $? = ($__ok ? 0 : 1) << 8; $CHILD_ERROR = $? >> 8; };
+    do { my $__ok = 1; for my $__d ('made') { unless (mkdir($__d)) { $__ok = 0; print STDERR $!{EEXIST} ? "mkdir: $__d: $!\n" : "mkdir: $!\n"; } } $? = ($__ok ? 0 : 1) << 8; $CHILD_ERROR = $? >> 8; };
     open(STDERR, '>&', $__sh2_dupfh6) or die; close($__sh2_dupfh6);
     open(STDERR, '>&', $__sh2_dup6) or die;
 }
@@ -204,7 +204,7 @@ $? = 0 << 8; $CHILD_ERROR = $? >> 8;
 }
 say "rmdir-fail rc=" . __sh_str(($CHILD_ERROR));
 $? = 0 << 8; $CHILD_ERROR = $? >> 8;
-do { my $__ok = 1; for my $__d ('rd') { unless (mkdir($__d)) { $__ok = 0; print STDERR "mkdir: $!\n"; } } $? = ($__ok ? 0 : 1) << 8; $CHILD_ERROR = $? >> 8; };
+do { my $__ok = 1; for my $__d ('rd') { unless (mkdir($__d)) { $__ok = 0; print STDERR $!{EEXIST} ? "mkdir: $__d: $!\n" : "mkdir: $!\n"; } } $? = ($__ok ? 0 : 1) << 8; $CHILD_ERROR = $? >> 8; };
 do { my $__ok = 1; for my $__d ('rd') { unless (rmdir($__d)) { $__ok = 0; print STDERR "rmdir: failed to remove '$__d': $!\n"; } } $? = ($__ok ? 0 : 1) << 8; $CHILD_ERROR = $? >> 8; };
 say "rmdir-ok rc=" . __sh_str(($CHILD_ERROR));
 $? = 0 << 8; $CHILD_ERROR = $? >> 8;
@@ -311,7 +311,7 @@ $? = 0 << 8; $CHILD_ERROR = $? >> 8;
     open(my $__sh2_dup11, '>&', \*STDERR) or die;
     open(my $__sh2_dupfh11, '>&', \*STDERR) or die;
     open(STDERR, '>', "/dev/null") or die "redirect: $!\n";
-    do { my $__ok = 1; for my $__d ('/no/such/x') { unless (mkdir($__d)) { $__ok = 0; print STDERR "mkdir: $!\n"; } } $? = ($__ok ? 0 : 1) << 8; $CHILD_ERROR = $? >> 8; };
+    do { my $__ok = 1; for my $__d ('/no/such/x') { unless (mkdir($__d)) { $__ok = 0; print STDERR $!{EEXIST} ? "mkdir: $__d: $!\n" : "mkdir: $!\n"; } } $? = ($__ok ? 0 : 1) << 8; $CHILD_ERROR = $? >> 8; };
     open(STDERR, '>&', $__sh2_dupfh11) or die; close($__sh2_dupfh11);
     open(STDERR, '>&', $__sh2_dup11) or die;
 }

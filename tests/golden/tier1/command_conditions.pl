@@ -72,6 +72,7 @@ my $__argc = @ARGV;
 my $n;
 my $m;
 my $i;
+my $d;
 
 # __SH_RUN_EXT_BEGIN (UU-FFI.md external-command seam)
 # uu-ffi .so present: in-process coreutils via uu_run (capture = temp-file
@@ -378,6 +379,7 @@ if (__sh_fn_status("g", ())) {
     print "function false: ok\n";
     $? = 0 << 8; $CHILD_ERROR = $? >> 8;
     }
+$d = "/definitely/not/here";
 if (do {
 open(my $__sh2_duperr0, '>&', \*STDERR) or die; open(my $__sh2_dupferr0, '>&', \*STDERR) or die; open(STDERR, '>', "/dev/null") or die "redirect: $!\n"; 
     if (chdir("/definitely/not/here")) {

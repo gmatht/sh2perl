@@ -750,6 +750,27 @@ fn census_expr(
                     }
                 }
             }
+            // `(( x > 1 ))` / `let x+=1` lower to `exec("let", Array([Str(…)]))`:
+            // the arithmetic text (bare identifiers) sits in the arg Array.
+            if matches!(func.as_str(), "exec" | "builtin") {
+                if let Some(IrExpr::Str(name, _)) = args.first() {
+                    if matches!(name.as_str(), "let" | "test" | "printf" | "echo") {
+                        for a in args.iter().skip(1) {
+                            match a {
+                                IrExpr::Str(text, _) => string_arith_ident_reads(text, reads),
+                                IrExpr::Array(items) => {
+                                    for it in items {
+                                        if let IrExpr::Str(text, _) = it {
+                                            string_arith_ident_reads(text, reads);
+                                        }
+                                    }
+                                }
+                                _ => {}
+                            }
+                        }
+                    }
+                }
+            }
             for a in args {
                 census_expr(a, reads, writes, escapes, escaping);
             }

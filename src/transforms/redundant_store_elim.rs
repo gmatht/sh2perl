@@ -266,9 +266,25 @@ fn call_reads_var(func: &str, args: &[IrExpr], var: &str) -> bool {
             return n == var;
         }
     }
-    if matches!(func, "arith" | "test" | "caseMatch") {
+    if matches!(func, "arith" | "test" | "caseMatch" | "let" | "arithEval" | "cstyleFor") {
         return args.iter().any(|a| match a {
             IrExpr::Str(s, _) => str_maybe_reads(s, var),
+            _ => false,
+        });
+    }
+    // `(( x > 1 ))` is an EXEC of the `let` builtin: the arithmetic text lives
+    // in the arg-list Array, not in a `Var` node. Without this scan the store
+    // that feeds the condition looked redundant (`x=3; if (( x > 1 )); … ;
+    // x=9` dropped the FIRST store, so the condition compared an undef and
+    // took the else branch while bash took the then branch). Over-marking only
+    // shrinks the elimination set.
+    if matches!(func, "exec" | "builtin") {
+        return args.iter().any(|a| match a {
+            IrExpr::Str(s, _) => str_maybe_reads(s, var),
+            IrExpr::Array(items) => items.iter().any(|it| match it {
+                IrExpr::Str(s, _) => str_maybe_reads(s, var),
+                _ => false,
+            }),
             _ => false,
         });
     }

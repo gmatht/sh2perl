@@ -84,7 +84,7 @@ $d = do { my $__sh_cap; $__sh_cap = do { require File::Temp; File::Temp::tempdir
 chdir($d) or do { warn "$0: line " . __LINE__ . ": cd: " . $d . ": $!\n"; exit "1"; };
 open(my $__ofh0, '>', 'a.sh') or die "echo: 'a.sh': $ERRNO"; print $__ofh0 q{a
 }; close $__ofh0; $? = 0 << 8; $CHILD_ERROR = $? >> 8;open(my $__ofh1, '>', 'b.txt') or die "echo: 'b.txt': $ERRNO"; print $__ofh1 q{b
-}; close $__ofh1; $? = 0 << 8; $CHILD_ERROR = $? >> 8;do { my $__ok = 1; for my $__d ('sub') { unless (mkdir($__d)) { $__ok = 0; print STDERR "mkdir: $!\n"; } } $? = ($__ok ? 0 : 1) << 8; $CHILD_ERROR = $? >> 8; };
+}; close $__ofh1; $? = 0 << 8; $CHILD_ERROR = $? >> 8;do { my $__ok = 1; for my $__d ('sub') { unless (mkdir($__d)) { $__ok = 0; print STDERR $!{EEXIST} ? "mkdir: $__d: $!\n" : "mkdir: $!\n"; } } $? = ($__ok ? 0 : 1) << 8; $CHILD_ERROR = $? >> 8; };
 open(my $__ofh2, '>', 'sub/c.sh') or die "echo: 'sub/c.sh': $ERRNO"; print $__ofh2 q{c
 }; close $__ofh2; $? = 0 << 8; $CHILD_ERROR = $? >> 8;open(my $__ofh3, '>', '.hidden') or die "echo: '.hidden': $ERRNO"; print $__ofh3 q{x
 }; close $__ofh3; $? = 0 << 8; $CHILD_ERROR = $? >> 8;$file_list = do { my $_r = __sh_uu_capture('ls', '-A'); $CHILD_ERROR = $__sh_uu_rc; $_r =~ s/\n+\z//; $_r; };

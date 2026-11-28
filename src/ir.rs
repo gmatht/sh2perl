@@ -2967,7 +2967,19 @@ fn emit_stmt_owned(out: &mut String, stmt: &IrStmt, indent: usize) {
                             out.push_str("{\n");
                             emit_indent(out, indent + 1);
                             out.push_str(&format!("open(my {saved}, '>&', \\*STDERR) or die;\n"));
+                            let mut opened = 0usize;
                             for r in redirects {
+                                let rendered = render_word(&r.target);
+                                // `2>&1` duplicates an FD; it is not a file
+                                // named `&1` (that open swallowed the
+                                // diagnostic and left a junk file behind).
+                                if let Some(to) = dup_fd_name(&rendered) {
+                                    emit_indent(out, indent + 1);
+                                    out.push_str(&format!(
+                                        "open(STDERR, '>&', \\*{to}) or die;\n"
+                                    ));
+                                    continue;
+                                }
                                 emit_indent(out, indent + 1);
                                 out.push_str(&format!(
                                     "open(my {fh}, '>&', \\*STDERR) or die;\n"
@@ -2976,11 +2988,12 @@ fn emit_stmt_owned(out: &mut String, stmt: &IrStmt, indent: usize) {
                                 out.push_str(&format!(
                                     "open(STDERR, {}, {}) or die \"redirect: $!\\n\";\n",
                                     if r.mode == "a" { "'>>'" } else { "'>'" },
-                                    render_word(&r.target)
+                                    rendered
                                 ));
+                                opened += 1;
                             }
                             emit_stmt(out, &inner[0], indent + 1);
-                            for _ in redirects {
+                            for _ in 0..opened {
                                 emit_indent(out, indent + 1);
                                 out.push_str(&format!(
                                     "open(STDERR, '>&', {fh}) or die; close({fh});\n"
@@ -7325,9 +7338,39 @@ fn stderr_only_redirect_peel(e: &IrExpr) -> Option<(IrExpr, Vec<String>)> {
 }
 
 /// Open a dup of STDERR and point fd 2 at `target`.
+/// The Perl handle an `&N` redirection target names. A redirection like
+/// `2>&1` is a DUP, not a file path: rendering it as `open(STDERR, '>', "&1")`
+/// created a file called `&1` and swallowed the diagnostic.
+fn dup_fd_name(rendered_target: &str) -> Option<&'static str> {
+    let t = rendered_target.trim().trim_matches('"').trim_matches('\'');
+    let b = t.as_bytes();
+    if b.len() == 2 && b[0] == b'&' && b[1].is_ascii_digit() {
+        return Some(match b[1] {
+            b'0' => "STDIN",
+            b'1' => "STDOUT",
+            _ => "STDERR",
+        });
+    }
+    None
+}
+
 fn stderr_swap_open(n: usize, target: &str) -> (String, String) {
     let sav = format!("$__sh2_duperr{n}");
     let fh = format!("$__sh2_dupferr{n}");
+    // `2>&1` / `2>&2` / `2>&0` is an FD DUPLICATION, not a file name: opening
+    // STDERR with `'>', "&1"` created a file called `&1` and swallowed the
+    // diagnostic (`cd /no/such 2>&1` printed nothing, where bash prints the
+    // error on stdout — `if cd /no/such 2>&1; then` then looked the same on
+    // both sides for the wrong reason).
+    if let Some(to) = dup_fd_name(target) {
+        return (
+            format!(
+                "open(my {sav}, '>&', \\*STDERR) or die; \
+                 open(STDERR, '>&', \\*{to}) or die; "
+            ),
+            format!("open(STDERR, '>&', {sav}) or die; "),
+        );
+    }
     (
         format!(
             "open(my {sav}, '>&', \\*STDERR) or die; open(my {fh}, '>&', \\*STDERR) or die; \

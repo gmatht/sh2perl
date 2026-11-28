@@ -66,7 +66,12 @@ pub(crate) fn emit(ctx: &NativeCtx) -> Option<NativeEmit> {
                     "my $__ok = 1; for my $__d ({joined}) {{ my $__acc = $__d =~ m{{^/}} ? '' : '.'; for my $__c (split m{{/+}}, $__d) {{ next if $__c eq '' || $__c eq '.'; $__acc .= \"/$__c\"; next if -d $__acc; unless (mkdir($__acc)) {{ $__ok = 0; print STDERR \"mkdir: $!\\n\"; last; }} }} }}"
                 )
             } else {
-                format!("my $__ok = 1; for my $__d ({joined}) {{ unless (mkdir($__d)) {{ $__ok = 0; print STDERR \"mkdir: $!\\n\"; }} }}")
+                // The diagnostic names the DIRECTORY for EEXIST only (`mkdir e` twice
+            // prints `mkdir: e: File exists`; a missing parent prints
+            // `mkdir: No such file or directory`), measured against the
+            // `mkdir` bash runs here. The status was already right — only the
+            // message dropped the operand.
+            format!("my $__ok = 1; for my $__d ({joined}) {{ unless (mkdir($__d)) {{ $__ok = 0; print STDERR $!{{EEXIST}} ? \"mkdir: $__d: $!\\n\" : \"mkdir: $!\\n\"; }} }}")
             }
         } else if cmd == "rmdir" {
             format!("my $__ok = 1; for my $__d ({joined}) {{ unless (rmdir($__d)) {{ $__ok = 0; print STDERR \"rmdir: failed to remove '$__d': $!\\n\"; }} }}")

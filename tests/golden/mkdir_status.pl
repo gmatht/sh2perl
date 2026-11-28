@@ -8,7 +8,7 @@ sub __sh_str {
     return defined($__v) ? $__v : q{};
 }
 
-do { my $__ok = 1; for my $__d ('status_dir') { unless (mkdir($__d)) { $__ok = 0; print STDERR "mkdir: $!\n"; } } $? = ($__ok ? 0 : 1) << 8; };
+do { my $__ok = 1; for my $__d ('status_dir') { unless (mkdir($__d)) { $__ok = 0; print STDERR $!{EEXIST} ? "mkdir: $__d: $!\n" : "mkdir: $!\n"; } } $? = ($__ok ? 0 : 1) << 8; };
 print(join(' ', grep { defined($_) && length($_) } split(/\s+/, __sh_str(($? >> 8)))), "\n");
 $? = 0 << 8;
 
