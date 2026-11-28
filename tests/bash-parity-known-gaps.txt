@@ -85,6 +85,48 @@
 # element; `$x . "1"` → `"$x1"`, a different variable). It now emits `${x}`
 # whenever the following text would extend the name.
 #
+# ── Command conditions in CONDITION position (FIXED) ────────────────────
+#
+# A command in condition position means "its exit status is 0". Test/native
+# lowering already turned `[ … ]`, `[[ … ]]`, `-f`, arithmetic, `grep -q` and
+# `cd` into Perl-native booleans; what had NO Perl expression form were
+# `pipeline(…)` (`if echo hi | grep -q hi`) and `subshell(…)` (`if (exit 1)`).
+# Both emitted calls to helpers that do not exist, so the whole program died
+# with `Undefined subroutine &main::pipeline`.
+#
+# One seam now owns the rule (`ir::cond_expr_to_perl`, used by if/elsif/while/
+# until/do-while/ternary and by `!`/`&&`/`||` operands):
+#   * `pipeline(…)` runs its STATEMENT form inside `do { … }` and the branch
+#     reads `$CHILD_ERROR`;
+#   * `( … )` forks through the `__sh_subshell` helper (inline block could not
+#     isolate `exit`, which ended the whole program);
+#   * everything Perl-native is left untouched — never wrapped in an
+#     exit-status convert.
+# Pinned by tests/tier1/command_conditions.sh (39 branches: grep success/
+# failure, negated, elsif chains, while/until over a changing command,
+# pipelines, `&&`/`||` of commands, `[ ]`/`[[ ]]`, functions, `cd`, subshells,
+# arithmetic ternaries).
+#
+# The uu-ffi fallback notice is now SILENT unless `SH2_UU_WARN=1`: a stderr
+# line bash never prints is itself a divergence (tier1 fixtures compare it).
+#
+# ── `!` in two shapes (NOT fixed) ────────────────────────────────────────
+#
+# `!` in condition position works (`if ! grep -q`, `if ! cmd && cmd`,
+# `if ! (exit 1)` takes bash's branch), but two shapes still diverge:
+#
+#   1. `! ( … )` — the paren group reaches the IR as ONE exec word, so the
+#      renderer shells out: system('bash','-c','"exit 1"').
+#        bash: ok                 emitted: ok, plus
+#                                 bash: line 1: exit 1: command not found
+#      The branch happens to match (the child fails, so `!` is true); stderr
+#      does not.
+#   2. `! cmd && cmd` in STATEMENT position — the frontend builds
+#      `Not(cmd && cmd)` instead of `And(Not(cmd), cmd)`, and the shell-text
+#      rebuild drops the `!`.
+#        bash: ran                emitted: (nothing)
+#      In CONDITION position (`if ! cmd && cmd`) the same source is correct.
+#
 # ── Not brace-related, found while widening (unchanged, still divergent) ──
 #
 # A bare `export` assignment never reaches the shell scalar, so a later read

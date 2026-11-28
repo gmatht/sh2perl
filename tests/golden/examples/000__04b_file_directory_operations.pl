@@ -40,7 +40,10 @@ BEGIN {
         last if $ok;
     }
     unless ($__SH_UU) {
-        warn "sh2perl: uu-ffi .so (libcoreutils_ffi) not found — external commands fall back to fork/exec (slower)\n";
+        # bash prints nothing here: the fallback must be SILENT (a notice on
+        # stderr is itself a divergence). Opt in with SH2_UU_WARN=1.
+        warn "sh2perl: uu-ffi .so (libcoreutils_ffi) not found — external commands fall back to fork/exec (slower)\n"
+            if $ENV{SH2_UU_WARN};
     }
 }
 my $__SH_UU_SEQ = 0;

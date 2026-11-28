@@ -1643,6 +1643,13 @@ fn first_code_newline(s: &str) -> Option<usize> {
         out.push_str(&seg);
         out.push('\n');
     }
+    // A subshell CONDITION (`if ( ... )`) forks: `exit`, variables and cwd are
+    // isolated and the sub's status is the block's. Emitted only when the body
+    // names it (same per-helper liveness rule as the seam above).
+    if body.contains("__sh_subshell(") {
+        out.push_str(SH_SUBSHELL_HELPER);
+        out.push('\n');
+    }
     // Append the rendered body (statements + subs + exit).
     out.push_str(&body);
 
@@ -4524,7 +4531,7 @@ fn emit_stmt_owned(out: &mut String, stmt: &IrStmt, indent: usize) {
             elsifs,
             else_,
         } => {
-            let cond_str = ir_expr_to_perl(cond);
+            let cond_str = cond_expr_to_perl(cond);
             // If the condition was derived from a shell test command by
             // native_if_test_cond (indicated by IrExpr::Str), set
             // $CHILD_ERROR so $? reflects the test result for subsequent
@@ -4539,7 +4546,7 @@ fn emit_stmt_owned(out: &mut String, stmt: &IrStmt, indent: usize) {
                 emit_stmt(out, s, indent + 1);
             }
             for (econd, ebody) in elsifs {
-                let estr = ir_expr_to_perl(econd);
+                let estr = cond_expr_to_perl(econd);
                 emit_indent(out, indent);
                 out.push_str(&format!("}} elsif ({}) {{\n", estr));
                 for s in ebody {
@@ -4676,7 +4683,7 @@ fn emit_stmt_owned(out: &mut String, stmt: &IrStmt, indent: usize) {
                 emit_indent(out, indent);
                 out.push_str("}\n");
             } else {
-                let cond_str = ir_expr_to_perl(cond);
+                let cond_str = cond_expr_to_perl(cond);
                 emit_indent(out, indent);
                 out.push_str(&format!("while ({}) {{\n", cond_str));
                 for s in body.iter() {
@@ -4703,7 +4710,7 @@ fn emit_stmt_owned(out: &mut String, stmt: &IrStmt, indent: usize) {
             }
         }
         IrStmt::ForInit { init, cond, step, body } => {
-            let cond_str = ir_expr_to_perl(cond);
+            let cond_str = cond_expr_to_perl(cond);
             for i in init.iter() {
                 emit_stmt(out, i, indent);
             }
@@ -5084,7 +5091,7 @@ fn emit_stmt_owned(out: &mut String, stmt: &IrStmt, indent: usize) {
 
         IrStmt::DoWhile { body, cond, until } => {
             let kw = if *until { "until" } else { "while" };
-            let cond_str = ir_expr_to_perl(cond);
+            let cond_str = cond_expr_to_perl(cond);
             // Same status rule as `while`: last body command, 0 if none.
             let loop_rc = if rc_unread() { None } else { Some(next_loop_status_var()) };
             if let Some(v) = &loop_rc {
@@ -13586,6 +13593,69 @@ fn binop_perl_str(op: &BinOpKind) -> &'static str {
         BinOpKind::ShiftR => " >> ",
     }
 }
+/// bash's CONDITION rule, in one place: a COMMAND in condition position means
+/// "its exit status is 0", and evaluating it must leave `$?`/`$CHILD_ERROR`
+/// exactly as bash does. Command conditions are already lowered by the
+/// test/native passes into Perl-native booleans (`[ ... ]`, `[[ ... ]]`, `-f`,
+/// arithmetic, `grep -q`, `cd`), which stay expressions here — wrapping those
+/// in an exit-status convert would turn a pure test back into a command.
+///
+/// What is NOT expressible as a Perl expression is a command whose statement
+/// lowering exists but whose expression form does not: `pipeline(...)` (a raw
+/// `system()` value would also be 0-on-success, i.e. FALSE in Perl — the
+/// inversion this seam exists to prevent). It runs through its STATEMENT form
+/// inside `do { ... }` and the branch reads back `$CHILD_ERROR`.
+/// A subshell forks through [`SH_SUBSHELL_HELPER`], because an inline block
+/// cannot isolate `exit`.
+fn cond_expr_to_perl(e: &IrExpr) -> String {
+    // `! cmd` / `cmd && cmd` / `cmd || cmd`: the operands are conditions too,
+    // so recurse — a negated pipeline is still a pipeline.
+    if let IrExpr::BinOp { op, lhs, rhs } = e {
+        match op {
+            BinOpKind::Not => return format!("!({})", cond_expr_to_perl(rhs)),
+            BinOpKind::And => {
+                return format!("({} && {})", cond_expr_to_perl(lhs), cond_expr_to_perl(rhs))
+            }
+            BinOpKind::Or => {
+                return format!("({} || {})", cond_expr_to_perl(lhs), cond_expr_to_perl(rhs))
+            }
+            _ => {}
+        }
+    }
+    if let IrExpr::Call { func, args } = e {
+        match func.as_str() {
+            "subshell" => {
+                let stmts = args.iter().find_map(|a| match a {
+                    IrExpr::Arrow(b) => Some(b),
+                    _ => None,
+                });
+                let Some(stmts) = stmts else {
+                    return "(1)".to_string();
+                };
+                let mut code = String::new();
+                for s in stmts {
+                    emit_stmt(&mut code, s, 0);
+                }
+                return format!("(__sh_subshell(sub {{\n{}}}) == 0)", code);
+            }
+            // A pipeline has no Perl EXPRESSION form at all; its statement
+            // form does. (`redirect(...)`/`background` DO lower as
+            // expressions — `chdir` behind a 2>/dev/null must run in THIS
+            // process, so it must not be rerouted through a statement form
+            // that might shell out.)
+            "pipeline" => {
+                let mut code = String::new();
+                emit_stmt(&mut code, &IrStmt::Expr(e.clone()), 0);
+                if !code.trim().is_empty() && !code.contains("not yet supported") {
+                    return format!("do {{\n{}$CHILD_ERROR == 0\n}}", code);
+                }
+            }
+            _ => {}
+        }
+    }
+    ir_expr_to_perl(e)
+}
+
 
 pub(crate) fn ir_expr_to_perl(expr: &IrExpr) -> String {
     if let Some(s) = stderr_redirected_native_expr(expr) {
@@ -14710,7 +14780,7 @@ pub(crate) fn ir_expr_to_perl(expr: &IrExpr) -> String {
         }
 
         IrExpr::Ternary { cond, then, else_ } => {
-            let c = ir_expr_to_perl(cond);
+            let c = cond_expr_to_perl(cond);
             let t = ir_expr_to_perl(then);
             let e = ir_expr_to_perl(else_);
             format!("({} ? {} : {})", c, t, e)
@@ -14898,6 +14968,37 @@ fn sh_run_ext_preamble(body: &str) -> Option<String> {
     Some(out)
 }
 
+/// The forked subshell helper used when `( \u{2026} )` appears in CONDITION
+/// position (`if (exit 0)`, `while ( \u{2026} )`). A block inlined into the
+/// parent cannot model it: bash's subshell gets its own process, so `exit 3`
+/// ends only the subshell, variable writes stay inside it, and `$?` afterwards
+/// is the subshell's status. One fork per evaluation; the parent keeps its own
+/// `$?`/`$CHILD_ERROR` in step with bash's.
+const SH_SUBSHELL_HELPER: &str = r#"# __SH_SUBSHELL_BEGIN (bash subshell in condition position)
+sub __sh_subshell {
+    my $code = shift;
+    my $fh = select(STDOUT);
+    $| = 1;
+    select($fh);
+    my $pid = fork;
+    if (!defined $pid) {
+        $code->();
+        return $CHILD_ERROR;
+    }
+    if ($pid == 0) {
+        my $ok = eval { $code->(); 1 };
+        my $st = $ok ? $CHILD_ERROR : 1;
+        exit($st);
+    }
+    waitpid($pid, 0);
+    my $rc = $? >> 8;
+    $CHILD_ERROR = $rc;
+    $? = $rc << 8;
+    return $rc;
+}
+# __SH_SUBSHELL_END
+"#;
+
 const SH_RUN_EXT_PREAMBLE: &str = r#"# __SH_RUN_EXT_BEGIN (UU-FFI.md external-command seam)
 # uu-ffi .so present: in-process coreutils via uu_run (capture = temp-file
 # fd-1 redirect around the in-process call — no pipe, so no concurrent-
@@ -14928,7 +15029,10 @@ BEGIN {
         last if $ok;
     }
     unless ($__SH_UU) {
-        warn "sh2perl: uu-ffi .so (libcoreutils_ffi) not found — external commands fall back to fork/exec (slower)\n";
+        # bash prints nothing here: the fallback must be SILENT (a notice on
+        # stderr is itself a divergence). Opt in with SH2_UU_WARN=1.
+        warn "sh2perl: uu-ffi .so (libcoreutils_ffi) not found — external commands fall back to fork/exec (slower)\n"
+            if $ENV{SH2_UU_WARN};
     }
 }
 my $__SH_UU_SEQ = 0;
