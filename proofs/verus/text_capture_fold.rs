@@ -70,24 +70,48 @@
 //
 //  ── measured mutants (all restored byte-identically; sha in the sync file) ──
 //
-//  baseline 37 verified, 0 errors
+//  baseline 43 verified, 0 errors.  TWO VACUITIES were found here by the
+//  mutants below and fixed in this file; both mutants used to be GREEN:
 //
-//  counted (the mutation compiles and the proof goes red):
-//    m1  the gate accepts a syntax character               36 verified, 1 error
-//    m2  the substitution's space becomes a literal char    36 verified, 1 error
-//    m3  the folded text's space becomes a literal char     36 verified, 1 error
+//    vacuity 1 (flag charset).  `is_flag`, `emit` and `flags_in` all read the
+//      one `all_ne_e`, so narrowing its charset to `n` left the file green
+//      (37v/0e, measured) although the pass would then fold `$(echo -e hi)`
+//      into `-e hi`, which bash does not print.  FIX: `flag_text` +
+//      `is_flag_sem` -- the semantic side's own flag recursion, used by
+//      `prints` -- with `flag_text_is_all_ne_e` / `is_flag_sem_is_is_flag` as
+//      the bridge; the mutant now breaks the bridge (m1b/m1c).
+//    vacuity 2 (line breaks).  `analysis` and `emit` both read
+//      `any_broken`/`has_ws`, so dropping `\r` from it left the file green
+//      (41v/0e, measured after fix 1) although a `\r` replacement would
+//      follow the fold into a single-line operand.  FIX: `breaks` inside
+//      `printed` with `has_ws_is_breaks` as the bridge (m8).
 //
-//  refuted one stage earlier, at simplification, by a concrete pin:
-//    s1  an Rt word counted as literal (pin_analysis_shapes)
-//    s2  the echo-flag refusal dropped (pin_emit_is_richer)
-//    s3  the join drops its separator (pin_analysis_shapes)
-//    s4  every head prints its words (pin_analysis_shapes)
-//    s5  a quote treated as syntax to the substitution (pin_a_quote_breaks_the_parse)
-//    s6  the unquoted gate wide open (pin_safe_splice)
-//    s7  the semantic recursion prints an Rt word as empty text
-//        (pin_printed_assembles_the_text); with the analysis intact this is
-//        also what would break analysis_prints_the_output if the pin did not
-//        compute first
+//  counted -- the LAW fails at verification, with a real count:
+//    m1b the semantic flag test loses its length check   42 verified, 1 error
+//           (is_flag_sem_is_is_flag)
+//    m1c the semantic flag charset loses `E`              42 verified, 1 error
+//           (flag_text_is_all_ne_e)
+//    m2  the gate skips a substitution (a nested walk that skips a
+//        subexpression)                                   42 verified, 1 error
+//           (lemma_tokens -> fold_preserves_the_token_stream)
+//    m6  the substitution's space becomes a literal char  42 verified, 1 error
+//           (lemma_chars)
+//    m7  the folded text's space becomes a literal char   42 verified, 1 error
+//           (lemma_chars)
+//    m8  the line-break check stops refusing `\r`         42 verified, 1 error
+//           (has_ws_is_breaks) -- vacuity 2's own mutant
+//
+//  refuted one stage earlier, at simplification, by a concrete pin (recorded
+//  as pin-level evidence, NOT as a law):
+//    m1  the flag charset narrowed to `n` (pin_flag_classes_agree) -- the
+//        mutant that used to be green; its law-level twins are m1b/m1c
+//    m3  the join doubles its separator (pin_analysis_shapes)
+//    m4  the analysis trusts an echo flag (pin_analysis_shapes)
+//    m5  a plain character becomes syntax inside quotes
+//        (pin_a_quote_breaks_the_parse)
+//    earlier notes also recorded an Rt word counted literal, every head
+//    printing, a wide-open unquoted gate and the semantic recursion printing
+//    an Rt word as empty text: same class, same pin-first behaviour
 //
 //  ─────────────────────────────────────────────────────────────────────────
 
@@ -244,6 +268,20 @@ pub open spec fn emit(h: Head, ws: Seq<W>) -> Out {
 // output. A pass that accepts an `Rt` word (or a flag) now disagrees with
 // this side instead of moving in lockstep with it.
 
+/// A word that broke a line, as the SEMANTIC side sees it — its own
+/// recursion, not `has_ws`. With a shared check this file stayed green
+/// (measured: 41v/0e) when `has_ws` stopped refusing `\r`, which would have
+/// let the fold splice a multi-line replacement into a single-line operand.
+pub open spec fn breaks(s: Seq<char>, i: int) -> bool
+    decreases s.len() - i,
+{
+    if i >= s.len() {
+        false
+    } else {
+        (s[i] == '\n' || s[i] == '\r') || breaks(s, i + 1)
+    }
+}
+
 pub open spec fn printed(ws: Seq<W>, i: int) -> Option<Seq<char>>
     decreases ws.len() - i,
 {
@@ -251,14 +289,43 @@ pub open spec fn printed(ws: Seq<W>, i: int) -> Option<Seq<char>>
         Some(Seq::empty())
     } else {
         match ws[i] {
-            W::Lit(s) => match printed(ws, i + 1) {
-                Option::Some(rest) => Option::Some(
-                    if i == 0 { s.add(rest) } else { seq![' '].add(s).add(rest) },
-                ),
-                Option::None => Option::None,
+            W::Lit(s) => if breaks(s, 0) {
+                Option::None
+            } else {
+                match printed(ws, i + 1) {
+                    Option::Some(rest) => Option::Some(
+                        if i == 0 { s.add(rest) } else { seq![' '].add(s).add(rest) },
+                    ),
+                    Option::None => Option::None,
+                }
             },
             W::Rt => Option::None,
         }
+    }
+}
+
+/// The flag CHARSET as its own recursion. This is deliberately a second
+/// transcription of "an echo flag is `-` followed by `n`/`e`/`E`" rather
+/// than a reuse of `all_ne_e`: with one shared definition, narrowing the
+/// charset moved `analysis`, `emit` and `flags_in` together and the whole
+/// file stayed green (measured: 37v/0e) while the pass would fold
+/// `$(echo -e hi)` into the wrong text. The bridge below is the law that
+/// now catches that mutant.
+pub open spec fn flag_text(s: Seq<char>, i: int) -> bool
+    decreases s.len() - i,
+{
+    if i >= s.len() {
+        true
+    } else {
+        (s[i] == 'n' || s[i] == 'e' || s[i] == 'E') && flag_text(s, i + 1)
+    }
+}
+
+/// a flag, judged by the semantic side's own recursion
+pub open spec fn is_flag_sem(w: W) -> bool {
+    match w {
+        W::Lit(s) => s.len() > 1 && s[0] == '-' && flag_text(s, 1),
+        W::Rt => false,
     }
 }
 
@@ -269,7 +336,7 @@ pub open spec fn flags_in(ws: Seq<W>, i: int) -> bool
     if i >= ws.len() {
         false
     } else {
-        is_flag(ws[i]) || flags_in(ws, i + 1)
+        is_flag_sem(ws[i]) || flags_in(ws, i + 1)
     }
 }
 
@@ -295,12 +362,53 @@ pub open spec fn prints(h: Head, ws: Seq<W>) -> Out {
     }
 }
 
+/// the two line-break recursions agree, and the analysis's refusal on a
+/// broken word is the semantic side's too (a mutant in `has_ws` breaks this)
+pub proof fn has_ws_is_breaks(s: Seq<char>, i: int)
+    ensures
+        has_ws(s, i) == breaks(s, i),
+    decreases s.len() - i,
+{
+    if i < s.len() {
+        has_ws_is_breaks(s, i + 1);
+    }
+}
+
+/// the two char recursions agree: they are the same charset, written twice
+pub proof fn flag_text_is_all_ne_e(s: Seq<char>, i: int)
+    ensures
+        flag_text(s, i) == all_ne_e(s, i),
+    decreases s.len() - i,
+{
+    if i < s.len() {
+        flag_text_is_all_ne_e(s, i + 1);
+    }
+}
+
+pub proof fn is_flag_sem_is_is_flag(w: W)
+    ensures
+        is_flag_sem(w) == is_flag(w),
+{
+    match w {
+        W::Lit(s) => {
+            if s.len() > 1 && s[0] == '-' {
+                flag_text_is_all_ne_e(s, 1);
+            }
+        }
+        W::Rt => {}
+    }
+}
+
+/// THE BRIDGE between the analysis's flag test and the semantic side's own
+/// one. It is load-bearing: narrowing `is_flag`'s charset (the vacuity this
+/// file used to have) now breaks this equality instead of moving both sides.
 pub proof fn flags_in_is_any_flag(ws: Seq<W>, i: int)
     ensures
         flags_in(ws, i) == any_flag(ws, i),
     decreases ws.len() - i,
 {
     if i < ws.len() {
+        is_flag_sem_is_is_flag(ws[i]);
         flags_in_is_any_flag(ws, i + 1);
     }
 }
@@ -308,6 +416,7 @@ pub proof fn flags_in_is_any_flag(ws: Seq<W>, i: int)
 pub proof fn printed_is_join(ws: Seq<W>, i: int)
     requires
         all_lit(ws, i),
+        !any_broken(ws, i),
     ensures
         printed(ws, i) == Some(join(ws, i)),
     decreases ws.len() - i,
@@ -315,6 +424,8 @@ pub proof fn printed_is_join(ws: Seq<W>, i: int)
     if i < ws.len() {
         match ws[i] {
             W::Lit(s) => {
+                has_ws_is_breaks(s, 0);
+                assert(!has_ws(s, 0));
                 printed_is_join(ws, i + 1);
             }
             W::Rt => {
@@ -681,6 +792,41 @@ pub proof fn pin_emit_is_richer()
     assert(emit(Head::Echo, seq![lit(seq!['h', 'i'])]) == Out::Const(seq!['h', 'i'])) by (compute);
     assert(analysis(Head::Echo, seq![lit(seq!['-', 'n']), lit(seq!['h', 'i'])]) == None) by (compute);
     assert(analysis(Head::Echo, seq![lit(seq!['a', '\n'])]) == None) by (compute);
+}
+
+/// The flag CLASSES: every `neE` spelling is a flag on both sides, and an
+/// ordinary word is not. `-e`/`-E`/`-ne` are the values a narrowed charset
+/// would move, so this pin is what the source's `refuses_echo_flags` test
+/// needs to keep holding.
+pub proof fn pin_flag_classes_agree()
+    ensures
+        is_flag(lit(seq!['-', 'n'])),
+        is_flag(lit(seq!['-', 'e'])),
+        is_flag(lit(seq!['-', 'E'])),
+        is_flag(lit(seq!['-', 'n', 'e'])),
+        is_flag_sem(lit(seq!['-', 'e'])),
+        is_flag_sem(lit(seq!['-', 'n', 'e'])),
+        !is_flag(lit(seq!['-', 'x'])),
+        !is_flag_sem(lit(seq!['-', 'x'])),
+        !is_flag(lit(seq!['-'])),
+        analysis(Head::Echo, seq![lit(seq!['-', 'e']), lit(seq!['h', 'i'])]) == None,
+        prints(Head::Echo, seq![lit(seq!['-', 'e']), lit(seq!['h', 'i'])]) == Out::NotPlain,
+        emit(Head::Echo, seq![lit(seq!['-', 'E']), lit(seq!['h', 'i'])]) == Out::NotPlain,
+{
+    assert(is_flag(lit(seq!['-', 'n']))) by (compute);
+    assert(is_flag(lit(seq!['-', 'e']))) by (compute);
+    assert(is_flag(lit(seq!['-', 'E']))) by (compute);
+    assert(is_flag(lit(seq!['-', 'n', 'e']))) by (compute);
+    assert(is_flag_sem(lit(seq!['-', 'e']))) by (compute);
+    assert(is_flag_sem(lit(seq!['-', 'n', 'e']))) by (compute);
+    assert(!is_flag(lit(seq!['-', 'x']))) by (compute);
+    assert(!is_flag_sem(lit(seq!['-', 'x']))) by (compute);
+    assert(!is_flag(lit(seq!['-']))) by (compute);
+    assert(analysis(Head::Echo, seq![lit(seq!['-', 'e']), lit(seq!['h', 'i'])]) == None) by (compute);
+    assert(prints(Head::Echo, seq![lit(seq!['-', 'e']), lit(seq!['h', 'i'])]) == Out::NotPlain)
+        by (compute);
+    assert(emit(Head::Echo, seq![lit(seq!['-', 'E']), lit(seq!['h', 'i'])]) == Out::NotPlain)
+        by (compute);
 }
 
 /// A quote inside the replacement is syntax to the re-parse but was literal

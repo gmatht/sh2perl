@@ -1279,6 +1279,142 @@ def emit_affix_pin(pin: dict) -> list[str]:
     return out
 
 
+TCF_HELPERS = r'''use super::*;
+use crate::ir::{IrExpr, IrStmt, StrStyle};
+
+fn tcf_s(x: &str) -> IrExpr {
+    IrExpr::Str(x.to_string(), StrStyle::DoubleQuoted)
+}
+
+/// The argument at `index` of a one-statement call, after the transform.
+fn tcf_arg_of(st: &[IrStmt], index: usize) -> Option<String> {
+    let IrStmt::Expr(IrExpr::Call { args, .. }) = &st[0] else {
+        return None;
+    };
+    match args.get(index) {
+        Some(IrExpr::Str(v, _)) => Some(v.clone()),
+        _ => None,
+    }
+}
+
+/// Run the REAL transform on a `func(...)` call carrying `arg` at `index`.
+/// `param` puts it in the third position (its default operand); everything
+/// else in the first.
+fn tcf_run(func: &str, arg: &str, index: usize) -> (bool, Option<String>) {
+    let args = if index == 2 {
+        vec![tcf_s(":-"), tcf_s("v"), tcf_s(arg)]
+    } else {
+        vec![tcf_s(arg)]
+    };
+    let mut st = vec![IrStmt::Expr(IrExpr::Call {
+        func: func.to_string(),
+        args,
+    })];
+    let changed = transform(&mut st);
+    (changed, tcf_arg_of(&st, index))
+}
+
+/// What `bash -c cmd` prints, trailing newline included.
+fn tcf_bash_out(cmd: &str) -> String {
+    let out = std::process::Command::new("bash")
+        .arg("-c")
+        .arg(cmd)
+        .output()
+        .expect("bash");
+    assert!(out.status.success(), "bash failed for {}", cmd);
+    String::from_utf8(out.stdout).expect("utf8")
+}
+
+/// bash's exit status for a test script.
+fn tcf_bash_status(script: &str) -> i32 {
+    std::process::Command::new("bash")
+        .arg("-c")
+        .arg(script)
+        .status()
+        .expect("bash")
+        .code()
+        .expect("status")
+}
+
+/// `template` with `{}` replaced by `txt`, double-quoted when asked.
+fn tcf_splice(template: &str, txt: &str, quoted: bool) -> String {
+    template.replace(
+        "{}",
+        &if quoted {
+            format!("\"{}\"", txt)
+        } else {
+            txt.to_string()
+        },
+    )
+}
+
+/// The original substitution's script.
+fn tcf_orig(template: &str, cmd: &str, quoted: bool) -> String {
+    tcf_splice(template, &format!("$({})", cmd), quoted)
+}
+'''
+
+
+def emit_tcf_pin(pin: dict) -> list[str]:
+    out = [
+        "",
+        "/// Manifest row: `pin %s` in text_capture_fold_sync.txt." % pin["pin"],
+        "/// " + pin["note"],
+        "#[test]",
+        "fn %s() {" % pin["pin"],
+    ]
+    kind = pin["kind"]
+    if kind == "tcf_fold":
+        for c in pin["cases"]:
+            idx = c.get("index", 0)
+            out.append('    let (changed, got) = tcf_run(%s, %s, %d);' % (lit(c["func"]), lit(c["arg"]), idx))
+            if c["expect"] is None:
+                out.append('    assert!(!changed, "the fold must refuse this operand");')
+                out.append('    assert_eq!(got.as_deref(), Some(%s), "the operand is left untouched");' % lit(c["arg"]))
+            else:
+                out.append('    assert!(changed, "the fold must fire");')
+                out.append('    assert_eq!(got.as_deref(), Some(%s), "the folded text");' % lit(c["expect"]))
+    elif kind == "tcf_constant":
+        for c in pin["cases"]:
+            if c["expect"] is None:
+                out.append('    assert_eq!(constant_output(%s), None);' % lit(c["cmd"]))
+            else:
+                out.append('    assert_eq!(constant_output(%s).as_deref(), Some(%s));' % (lit(c["cmd"]), lit(c["expect"])))
+    elif kind == "tcf_safe":
+        for c in pin["cases"]:
+            out.append(
+                '    assert_eq!(safe_repl(%s, %s), %s);'
+                % (lit(c["repl"]), "true" if c["quoted"] else "false", "true" if c["expect"] else "false")
+            )
+    elif kind == "tcf_bash_const":
+        for c in pin["cases"]:
+            out.append('    let b = tcf_bash_out(%s);' % lit(c["cmd"]))
+            out.append("    let b = b.strip_suffix('\\n').unwrap_or(&b);")
+            out.append('    assert_eq!(b, %s, "bash prints it");' % lit(c["expect"]))
+            out.append(
+                '    assert_eq!(constant_output(%s).as_deref(), Some(%s), "the analysis agrees with bash");'
+                % (lit(c["cmd"]), lit(c["expect"]))
+            )
+    elif kind == "tcf_bash_gate":
+        for c in pin["cases"]:
+            q = "true" if c["quoted"] else "false"
+            out.append(
+                '    let r = constant_output(%s).expect("the analysis must accept this one");'
+                % lit(c["cmd"])
+            )
+            out.append('    assert!(safe_repl(&r, %s), "the gate must accept it");' % q)
+            out.append('    let orig = tcf_orig(%s, %s, %s);' % (lit(c["template"]), lit(c["cmd"]), q))
+            out.append('    let fold = tcf_splice(%s, &r, %s);' % (lit(c["template"]), q))
+            out.append(
+                '    assert_eq!(tcf_bash_status(&orig), tcf_bash_status(&fold),'
+                ' "the folded operand behaves exactly like the substitution");'
+            )
+    else:
+        raise SystemExit("unknown text_capture kind %s" % kind)
+    out.append("}")
+    return out
+
+
 FAMILIES = {
     "f1": (RUST_HELPERS, emit_pin),
     "status_reads": (STATUS_HELPERS, emit_status_pin),
@@ -1288,6 +1424,7 @@ FAMILIES = {
     "pipeline": (PIPELINE_HELPERS, emit_pipeline_pin),
     "command_v": (COMMAND_V_HELPERS, emit_command_v_pin),
     "command_noop_cond": (COMMAND_NOOP_COND_HELPERS, emit_command_noop_cond_pin),
+    "text_capture": (TCF_HELPERS, emit_tcf_pin),
 }
 
 

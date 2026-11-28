@@ -1,20 +1,27 @@
 # verus-sync-coverage manifest: text_capture_fold
-# source sha: text_capture_fold=f76d26e31190  proof sha: 07fb8a9ab9a2
+# source sha: text_capture_fold=79d9e2520f57  proof sha: fce07f78474d
+#   source re-pinned 2026-11-28 (was f76d26e31190): the ONLY change to
+#   src/transforms/text_capture_fold.rs is the six-line `#[cfg(test)]
+#   #[path = "text_capture_pin_tests.rs"] mod pin_tests_text_capture;`
+#   registration that gen_pin_tests.py appends at EOF, after the existing
+#   tests module. `transform`, `fold_text`, `scan`, `subst_span`,
+#   `constant_output`, `shell_words` and `safe_repl` are byte-identical to
+#   the audited f76d26e31190, so the model still matches the pass.
+#   The proof's fce07f78474d adds the two independent semantic recursions
+#   described in [guards] (07fb8a9ab9a2 lacked them); its header is where the
+#   two vacua and the full mutant table live.
 
 [pins]
-pin pin_quoted_test_operand -> test folds_quoted_test_operand: MAPPED
-pin pin_splice_of_the_test_operand -> test folds_quoted_test_operand: MAPPED
-pin pin_analysis_shapes -> test folds_unquoted_single_word_operand: MAPPED
-pin pin_analysis_shapes -> test refuses_variable_words: MAPPED
-pin pin_analysis_shapes -> test refuses_glob_and_tilde_words: MAPPED
-pin pin_analysis_shapes -> test folds_true_to_empty: MAPPED
-pin pin_emit_is_richer -> test refuses_echo_flags: MAPPED
-pin pin_a_quote_breaks_the_parse -> test quoted_literal_replacement_chars_refused: MAPPED
-pin pin_safe_splice -> test refuses_unquoted_multi_word_output: MAPPED
-pin pin_safe_splice -> test folds_multi_word_output_inside_quotes: MAPPED
-pin pin_gates_imply_the_premise: UNMIRRORED (the gated-implies-no-syntax step has no source test)
-pin constant_output_sound: UNMIRRORED (value-level; the source tests the returned string)
-pin pin_printed_assembles_the_text: UNMIRRORED (the independent semantic recursion's values; the source tests the returned string)
+pin pin_quoted_test_operand -> test pin_quoted_test_operand: MAPPED
+pin pin_splice_of_the_test_operand -> test pin_splice_of_the_test_operand: MAPPED
+pin pin_analysis_shapes -> test pin_analysis_shapes: MAPPED
+pin pin_emit_is_richer -> test pin_emit_is_richer: MAPPED
+pin pin_flag_classes_agree -> test pin_flag_classes_agree: MAPPED
+pin pin_a_quote_breaks_the_parse -> test pin_a_quote_breaks_the_parse: MAPPED
+pin pin_safe_splice -> test pin_safe_splice: MAPPED
+pin pin_gates_imply_the_premise -> test pin_gates_imply_the_premise: MAPPED
+pin constant_output_sound -> test constant_output_sound: MAPPED
+pin pin_printed_assembles_the_text -> test pin_printed_assembles_the_text: MAPPED
 
 [guards]
 guard law constant_output_sound (analysis Some(r) => the command really prints r): PRESENT
@@ -27,38 +34,89 @@ guard quoted gate all_safe_quoted => no_syntax (ends/escapes/re-expands excluded
 guard semantic side RICHER than the analysis (newline word, -n flag still constant): PRESENT
 guard independent semantic recursion printed/flags_in/prints (Lit prints, Rt unknown): PRESENT
 guard law analysis_prints_the_output (analysis => the independent semantic recursion agrees): PRESENT
+guard independent flag recursion flag_text / is_flag_sem, used by prints: PRESENT
+guard law flag_text_is_all_ne_e (the semantic flag charset equals the analysis's): PRESENT
+guard law is_flag_sem_is_is_flag (the semantic flag test equals the analysis's): PRESENT
+guard law flags_in_is_any_flag (bridge; narrowing the charset breaks this, not both sides): PRESENT
+guard independent line-break recursion breaks, used by printed: PRESENT
+guard law has_ws_is_breaks (a \r word is refused on both sides): PRESENT
 guard lexer (scan/find_close/quote modes/single-quoted skip/span splicing): OUT OF MODEL
 guard IR traversal + TEXT_FUNCS positions (structural, not semantic): OUT OF MODEL
 guard echo flag FORMATTING (-n/-e/-E text reformatting): OUT OF MODEL (flag => NotPlain)
 
 [counts]
-37 verified, 0 errors (verus --triggers-mode silent --rlimit 40 text_capture_fold.rs)
-mutants: gate-accepts-syntax 36v/1e, substitution-space-as-char 36v/1e,
-  folded-space-as-char 36v/1e; Rt-word-as-literal, flag-refusal-dropped,
-  join-without-separator, every-head-prints, quote-as-syntax,
-  unquoted-gate-wide-open and printed-prints-Rt-as-empty rejected at
-  simplification by their pins.
+43 verified, 0 errors (verus --triggers-mode silent --rlimit 40 text_capture_fold.rs)
+The proof was 37v/0e at 07fb8a9ab9a2 and had TWO VACUITIES, both found by
+mutation and both fixed in abab94f7d1b9 by adding an independent semantic
+recursion plus the bridge law that now catches the mutant:
+  vacuity 1 (flag charset): `is_flag`, `emit` and `flags_in` all read the one
+    `all_ne_e`, so narrowing its charset to `n` left the file GREEN (measured
+    37v/0e) even though the pass would then fold `$(echo -e hi)` into `-e hi`,
+    which bash does not print. Fix: `flag_text` + `is_flag_sem` for `prints`,
+    with `flag_text_is_all_ne_e`/`is_flag_sem_is_is_flag` as the bridge.
+  vacuity 2 (line breaks): `analysis` and `emit` both read `any_broken`/
+    `has_ws`, so dropping `\r` from it left the file GREEN (measured 41v/0e,
+    after fix 1) even though a `\r` replacement would follow the fold into a
+    single-line operand. Fix: `breaks` inside `printed`, with
+    `has_ws_is_breaks` as the bridge.
+  Both mutants are now red (see below); neither was helped by a pin.
+
+mutants, measured 2026-11-28 against proof sha fce07f78474d, each applied
+alone and restored byte-identically (sha256 re-checked after every run):
+  m1  flag charset narrowed to `n` (all_ne_e)
+        -> rejected at simplification by pin_flag_classes_agree (0v/1e);
+           GREEN before the fix -- vacuity 1 above
+  m1b semantic flag test loses its length check (is_flag_sem)
+        -> 42v/1e, postcondition of is_flag_sem_is_is_flag
+  m1c semantic flag charset loses `E` (flag_text)
+        -> 42v/1e, postcondition of flag_text_is_all_ne_e
+  m2  the gate skips a substitution (Tok::Sub arm -> true)
+        -> 42v/1e, lemma_tokens (precondition of fold_preserves_the_token_stream):
+           a nested walk that skips a subexpression is not silent
+  m3  the word join doubles its separator
+        -> rejected at simplification by pin_analysis_shapes (0v/1e)
+  m4  the analysis trusts an echo flag (any_flag dropped)
+        -> rejected at simplification by pin_analysis_shapes (0v/1e)
+  m5  a plain character becomes syntax inside quotes (syntax_quoted)
+        -> rejected at simplification by pin_a_quote_breaks_the_parse (0v/1e)
+  m6  the substitution's space becomes a literal char (sub_chars)
+        -> 42v/1e, lemma_chars
+  m7  the folded text's space becomes a literal char (lit_chars)
+        -> 42v/1e, lemma_chars
+  m8  the line-break check stops refusing `\r` (has_ws)
+        -> 42v/1e, postcondition of has_ws_is_breaks;
+           GREEN before the fix -- vacuity 2 above
+  So every defect class has a law-level red with a real count (m1b/m1c for a
+  misclassified shape, m2 for a skipped subexpression, m6/m7 for a token-shape
+  change, m8 for a dropped refusal), and the three natural spellings the pins
+  refute at simplification are recorded as such rather than counted as laws.
+
 [exec]
-# Every MAPPED row above was EXECUTED against the source in this tree:
-#   cargo test --lib          (full lib suite; per-test verdicts below)
-# Each verdict below is grepped from that run's own
-# `test <module>::<name> ... ok` line, for the module this proof pins.
-# A mapped test that fails or vanishes from the run is drift — FATAL.
-# context: that run reported 1970 passed, 67 failed, 5 ignored; every failure
-# is in an unrelated backend / estree / shir_json module, none in the modules
-# these rows pin.
-# source test folds_param_default (the param-default operand) also ran: PASS;
-# no proof fn mirrors it — the ARG POSITION is IR-level, not semantic.
-# all suites built; per-test verdicts below
-exec pin_quoted_test_operand (folds_quoted_test_operand): PASS
-exec pin_splice_of_the_test_operand (folds_quoted_test_operand): PASS
-exec pin_analysis_shapes (folds_unquoted_single_word_operand): PASS
-exec pin_analysis_shapes (refuses_variable_words): PASS
-exec pin_analysis_shapes (refuses_glob_and_tilde_words): PASS
-exec pin_analysis_shapes (folds_true_to_empty): PASS
-exec pin_emit_is_richer (refuses_echo_flags): PASS
-exec pin_a_quote_breaks_the_parse (quoted_literal_replacement_chars_refused): PASS
-exec pin_safe_splice (refuses_unquoted_multi_word_output): PASS
-exec pin_safe_splice (folds_multi_word_output_inside_quotes): PASS
-exec pin_gates_imply_the_premise: UNMIRRORED (not executed)
-exec constant_output_sound: UNMIRRORED (not executed)
+# Every MAPPED row was EXECUTED against the source in this tree by the
+# generator that owns the tests:
+#   python3 proofs/verus/gen_pin_tests.py \
+#       proofs/verus/pin_specs/text_capture_fold.json --run
+# It writes src/transforms/text_capture_pin_tests.rs, registers the module at
+# the end of src/transforms/text_capture_fold.rs, runs each generated test
+# through `cargo test --lib pin_tests::`, and flips a row to MAPPED only for a
+# test whose own `<module>::<name> ... ok` line it observed. Re-run
+# 2026-11-28: 10 tests written, 10 PASS.
+# The three rows this manifest used to leave UNMIRRORED are now executed:
+# `constant_output_sound` and `pin_printed_assembles_the_text` compare the
+# analysis against what BASH prints for the same command, and
+# `pin_gates_imply_the_premise` splices each accepted replacement into a real
+# `[ … ]` script and requires the same exit status as the original
+# substitution. The source's own tests (`folds_param_default`,
+# `single_quoted_region_is_literal`, `backtick_form_folds`,
+# `non_text_func_is_untouched`, `assign_targets_compile_shape`) cover the LEXER
+# and the IR traversal, both out of model; they are not rows here.
+exec pin_quoted_test_operand (pin_quoted_test_operand): PASS
+exec pin_splice_of_the_test_operand (pin_splice_of_the_test_operand): PASS
+exec pin_analysis_shapes (pin_analysis_shapes): PASS
+exec pin_emit_is_richer (pin_emit_is_richer): PASS
+exec pin_flag_classes_agree (pin_flag_classes_agree): PASS
+exec pin_a_quote_breaks_the_parse (pin_a_quote_breaks_the_parse): PASS
+exec pin_safe_splice (pin_safe_splice): PASS
+exec pin_gates_imply_the_premise (pin_gates_imply_the_premise): PASS
+exec constant_output_sound (constant_output_sound): PASS
+exec pin_printed_assembles_the_text (pin_printed_assembles_the_text): PASS

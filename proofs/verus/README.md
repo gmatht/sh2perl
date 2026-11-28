@@ -9107,10 +9107,10 @@ present and over-stripping one character past it
   with a non-empty body) decides only whether the fold fires, never the
   value — those refusals are not counted as proved here.
 
-## text_capture_fold.rs — folding constant `$(echo …)` text (37)
+## text_capture_fold.rs — folding constant `$(echo …)` text (43)
 
     verus --triggers-mode silent --rlimit 40 proofs/verus/text_capture_fold.rs
-    -> verification results:: 37 verified, 0 errors
+    -> verification results:: 43 verified, 0 errors
 
 The pass replaces a `$( … )`/backtick substitution inside the RAW TEXT that
 `test`/`param`/`arith` arguments carry, when that substitution's output is
@@ -9162,19 +9162,53 @@ values (empty, `a b`, an `Rt` word, a flag, an unknown head).
 flag / a variable / an unknown head / `true` / `:`), `pin_emit_is_richer`
 the richer semantic side, `pin_safe_splice` the two charsets (space and `*`
 refused unquoted, space allowed inside quotes, `"`/`$`/`\` refused there),
-and `pin_splice_of_the_test_operand` the source's own operand shape
+`pin_flag_classes_agree` the flag classes (`-e`/`-E`/`-ne` are flags, `-x`
+is not), and `pin_splice_of_the_test_operand` the source's own operand shape
 `"$(echo hello)"`.
+
+All ten are **executed**, not hand-checked: they are generated
+to `src/transforms/text_capture_pin_tests.rs` from
+`proofs/verus/pin_specs/text_capture_fold.json` by `gen_pin_tests.py --run`,
+which drives the real `transform` / `constant_output` / `safe_repl` and flips
+a row only for a test whose own `… ok` line it observed (10/10 PASS). The
+three rows that used to be UNMIRRORED are now executed too: two compare
+`constant_output` against what BASH prints for the same command, and the
+third splices each accepted replacement into a real `[ … ]` script and
+requires the same exit status as the original substitution.
+
+### Two vacua, found by mutation and closed
+
+Both mutants below used to leave the file **green**, and both were fixed in
+the proof rather than explained away:
+
+1. **Flag charset.** `is_flag`, `emit` and `flags_in` all read the single
+   `all_ne_e`, so narrowing its charset to `n` verified at **37v/0e** — while
+   the pass would happily fold `$(echo -e hi)` into `-e hi`, which bash never
+   prints. Fix: `flag_text`/`is_flag_sem`, the semantic side's own flag
+   recursion (used by `prints`), with `flag_text_is_all_ne_e` and
+   `is_flag_sem_is_is_flag` as the bridge. The mutant now breaks the bridge.
+2. **Line breaks.** `analysis` and `emit` both read `any_broken`/`has_ws`, so
+   dropping `\r` from it verified at **41v/0e** (after fix 1) — while a `\r`
+   replacement would follow the fold into a single-line operand. Fix:
+   `breaks` inside `printed`, with `has_ws_is_breaks` as the bridge.
 
 ### Mutants, measured
 
-Counted: a gate that accepts a syntax character, the substitution's space
-treated as a literal character, and the folded text's space treated as one —
-each **36 verified, 1 error**. Refuted at simplification by a concrete pin:
-an `Rt` word counted literal, the echo-flag refusal dropped, a join without
-its separator, every head "printing" its words, a quote treated as syntax
-for the substitution, a wide-open unquoted gate, and the independent
-semantic recursion printing an `Rt` word as empty text. Restored
-byte-identically after each run (sha256 in `text_capture_fold_sync.txt`).
+Against the committed proof bytes, each restored byte-identically (sha256 in
+`text_capture_fold_sync.txt`), baseline 43v/0e:
+
+- Law-level (**42 verified, 1 error** each): the semantic flag test losing its
+  length check (`is_flag_sem_is_is_flag`), the semantic flag charset losing
+  `E` (`flag_text_is_all_ne_e`), the gate skipping a substitution
+  (`lemma_tokens`, i.e. `fold_preserves_the_token_stream`), the substitution's
+  and the folded text's spaces becoming literal characters (`lemma_chars`),
+  and the line-break check no longer refusing `\r` (`has_ws_is_breaks`) —
+  the vacuity-2 mutant.
+- Pin-level (rejected at simplification, recorded as such): the flag charset
+  narrowed to `n` (`pin_flag_classes_agree` — the vacuity-1 mutant, whose
+  law-level twins are the first two bullets), a doubled join separator and an
+  analysis that trusts a flag (both `pin_analysis_shapes`), and a plain
+  character made syntax inside quotes (`pin_a_quote_breaks_the_parse`).
 
 ### Scope (read this before quoting it)
 
