@@ -57,6 +57,24 @@
 #   typeset-cmdsub                    unicode-in-string
 #   zsh-style-eval-redirect
 #
+# ── Brace expansion: variable adjacent to a brace (NOT fixed) ────────────
+#
+# bash brace-expands the RAW word text before any parameter expansion, so a
+# variable butted against a brace is part of the same word in a way this
+# parser cannot represent: `BraceExpansion.prefix/suffix` are static Strings,
+# so `${x}{1..2}` reaches the IR as two independent words. Measured against
+# bash (x=VAR):
+#
+#   ${x}{1..2}   bash: VAR1 VAR2          perl: VAR 1 2
+#   p{1..2}${x}q bash: p1VARq p2VARq      perl: p1 p2 VARq
+#   ${x}{a..c}   bash: VARa VARb VARc     perl: VAR a b c
+#   $x{1,2}      bash: (empty: `$x1 $x2`) perl: VAR 1 2
+#
+# Fixing this means either a frontend brace pass over raw word text or a
+# dynamic prefix/suffix on the brace node (AST + shIR + every backend). It is
+# a silent wrong-output class in ordinary scripts (`cp $d/{a,b} dst`), so it
+# is listed here rather than left unstated.
+#
 # ── Historical triage (kept for context) ─────────────────────────────────
 #
 # 2026-11-26 — the retired renderer (git HEAD:src/perl_backend.rs, 3.5k lines)

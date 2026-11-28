@@ -8432,9 +8432,9 @@ fn brace_json_arg(args: &[IrExpr]) -> Option<&serde_json::Value> {
 /// 1024 items.
 fn expand_range(start: &str, end: &str, step: i64) -> Vec<String> {
     let mut out = Vec::new();
-    if step == 0 {
-        return out;
-    }
+    // bash treats a step of 0 as 1 (`{1..2..0}` -> `1 2`, `{a..c..0}` ->
+    // `a b c`); returning nothing here printed an empty word.
+    let step = if step == 0 { 1 } else { step };
     // Numeric range (zero-padded only when the START has a leading zero).
     if let (Ok(ai), Ok(bi)) = (start.parse::<i64>(), end.parse::<i64>()) {
         let pad = start.starts_with('0');
@@ -8484,6 +8484,27 @@ fn expand_range(start: &str, end: &str, step: i64) -> Vec<String> {
     out
 }
 
+/// Is this brace endpoint pair something bash expands at all?
+///
+/// bash expands a range only when BOTH endpoints are integers or BOTH are a
+/// single character. `{a1..c3}`, `{aa..cc}` and `{1a..2b}` are NOT ranges:
+/// bash keeps the text literally, braces included (`echo {a1..c3}` prints
+/// `{a1..c3}`), while a range inside a COMMA list stays literal WITHOUT the
+/// braces (`echo {a1..c3,5}` prints `a1..c3 5`).
+fn range_is_expandable(start: &str, end: &str) -> bool {
+    (start.parse::<i64>().is_ok() && end.parse::<i64>().is_ok())
+        || (start.chars().count() == 1 && end.chars().count() == 1)
+}
+
+/// The literal text bash leaves for a range it will not expand, as a
+/// STANDALONE word: `{a1..c3}` / `{a1..c3..2}` (braces kept).
+fn literal_range_word(start: &str, end: &str, step: Option<&str>) -> String {
+    match step {
+        Some(s) => format!("{{{start}..{end}..{s}}}"),
+        None => format!("{{{start}..{end}}}"),
+    }
+}
+
 /// One alternative JSON node → its expanded item list. A String is a
 /// literal; a `range` expands (a lone range); a `nested` group is the
 /// union of its alternatives; a `product` is the cartesian concatenation
@@ -8526,15 +8547,24 @@ fn brace_nested_items(v: &serde_json::Value) -> Vec<String> {
         if let Some(range_arr) = it.get("range").and_then(|r| r.as_array()) {
             let a = range_arr.get(0).and_then(|x| x.as_str()).unwrap_or("");
             let b = range_arr.get(1).and_then(|x| x.as_str()).unwrap_or("");
+            let step_txt = range_arr.get(2).and_then(|x| x.as_str());
             if lone_range {
-                let step = range_arr
-                    .get(2)
-                    .and_then(|x| x.as_str())
-                    .and_then(|s| s.parse::<i64>().ok())
-                    .unwrap_or(1);
+                if !range_is_expandable(a, b) {
+                    out.push(literal_range_word(a, b, step_txt));
+                    continue;
+                }
+                let step = step_txt.and_then(|s| s.parse::<i64>().ok()).unwrap_or(1);
+                // An EXPANDABLE range that the 1024-item guard refuses stays
+                // unexpanded (empty): the fold transform then refuses and the
+                // loop keeps its range form. Substituting the literal word
+                // here would turn `for i in {1..1000000}` into a single
+                // iteration.
                 out.extend(expand_range(a, b, step));
             } else {
-                out.push(format!("{a}..{b}"));
+                out.push(match step_txt {
+                    Some(s) => format!("{a}..{b}..{s}"),
+                    None => format!("{a}..{b}"),
+                });
             }
             continue;
         }
@@ -8561,20 +8591,27 @@ fn brace_groups(v: &serde_json::Value) -> Vec<Vec<String>> {
             if let Some(s) = it.as_str() {
                 expanded.push(s.to_string());
             } else if let Some(range_arr) = it.get("range").and_then(|r| r.as_array()) {
-                if items.len() > 1 {
-                    // bash: a range in a comma list stays LITERAL
-                    let a = range_arr.get(0).and_then(|x| x.as_str()).unwrap_or("");
-                    let b = range_arr.get(1).and_then(|x| x.as_str()).unwrap_or("");
-                    expanded.push(format!("{a}..{b}"));
-                    continue;
-                }
                 let a = range_arr.get(0).and_then(|x| x.as_str()).unwrap_or("");
                 let b = range_arr.get(1).and_then(|x| x.as_str()).unwrap_or("");
-                let step = range_arr
-                    .get(2)
-                    .and_then(|x| x.as_str())
-                    .and_then(|s| s.parse::<i64>().ok())
-                    .unwrap_or(1);
+                let step_txt = range_arr.get(2).and_then(|x| x.as_str());
+                if items.len() > 1 {
+                    // bash: a range in a comma list stays LITERAL, without
+                    // the braces (`{a1..c3,5}` -> `a1..c3 5`), step included.
+                    expanded.push(match step_txt {
+                        Some(s) => format!("{a}..{b}..{s}"),
+                        None => format!("{a}..{b}"),
+                    });
+                    continue;
+                }
+                // `{a1..c3}` / `{aa..cc}` are not ranges to bash: the word is
+                // the literal text, braces included.
+                if !range_is_expandable(a, b) {
+                    expanded.push(literal_range_word(a, b, step_txt));
+                    continue;
+                }
+                let step = step_txt.and_then(|s| s.parse::<i64>().ok()).unwrap_or(1);
+                // See `brace_nested_items`: a guard-refused range stays
+                // unexpanded rather than becoming a literal word.
                 expanded.extend(expand_range(a, b, step));
             } else {
                 expanded.extend(expand_brace_item(it));

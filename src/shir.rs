@@ -20684,50 +20684,8 @@ fn brace_expand(
         let start = jstr(&arr[0]);
         let end = jstr(&arr[1]);
         let st = step_of(arr.get(2).unwrap_or(&serde_json::Value::Null));
+        let step_txt = arr.get(2).and_then(|v| v.as_str()).map(|s| s.to_string());
         let is_num = is_int_str(&start) && is_int_str(&end);
-        // mixed `{a1..c3}` → alpha part × numeric part
-        if !is_num {
-            let alpha_num = |s: &str| -> Option<(String, String)> {
-                let bytes = s.as_bytes();
-                let alen = bytes.iter().take_while(|c| c.is_ascii_alphabetic()).count();
-                if alen == 0 || alen == bytes.len() {
-                    return None;
-                }
-                let (a, n) = s.split_at(alen);
-                if n.is_empty() || !n.bytes().all(|c| c.is_ascii_digit()) {
-                    return None;
-                }
-                Some((a.to_string(), n.to_string()))
-            };
-            if let (Some((al1, an1)), Some((al2, an2))) = (alpha_num(&start), alpha_num(&end)) {
-                let alphas = alpha_range(&al1, &al2, 1);
-                let lo: i64 = an1.parse().unwrap_or(0);
-                let hi: i64 = an2.parse().unwrap_or(0);
-                let width = an1.len().max(an2.len());
-                let mut out = Vec::new();
-                for ch in &alphas {
-                    let mut n = lo;
-                    if lo <= hi {
-                        while n <= hi {
-                            out.push(format!("{ch}{n:0width$}", width = width));
-                            match n.checked_add(1) {
-                                Some(x) => n = x,
-                                None => break,
-                            }
-                        }
-                    } else {
-                        while n >= hi {
-                            out.push(format!("{ch}{n:0width$}", width = width));
-                            match n.checked_sub(1) {
-                                Some(x) => n = x,
-                                None => break,
-                            }
-                        }
-                    }
-                }
-                return out;
-            }
-        }
         if is_num {
             let a = start.parse::<i64>().unwrap_or(0);
             let b = end.parse::<i64>().unwrap_or(0);
@@ -20775,36 +20733,13 @@ fn brace_expand(
         if single_letter(&start) && single_letter(&end) {
             return alpha_range(&start, &end, st);
         }
-        let all_alpha = |s: &str| !s.is_empty() && s.bytes().all(|c| c.is_ascii_alphabetic());
-        if all_alpha(&start) && all_alpha(&end) {
-            // longer alpha runs (`{ab..az}`) — step applies to the last
-            // letter; the prefix stays the START's prefix (runtime quirk,
-            // mirrored exactly)
-            let mut out = Vec::new();
-            let ca = start.chars().next().unwrap() as i64;
-            let cb = end.chars().next().unwrap() as i64;
-            let prefix = &start[..start.len() - 1];
-            let mut i = ca;
-            if ca <= cb {
-                while i <= cb {
-                    out.push(format!("{prefix}{}", char::from_u32(i as u32).unwrap()));
-                    match i.checked_add(st) {
-                        Some(n) => i = n,
-                        None => break,
-                    }
-                }
-            } else {
-                while i >= cb {
-                    out.push(format!("{prefix}{}", char::from_u32(i as u32).unwrap()));
-                    match i.checked_sub(st) {
-                        Some(n) => i = n,
-                        None => break,
-                    }
-                }
-            }
-            return out;
+        // bash expands a range only when BOTH endpoints are integers or
+        // BOTH are one character; anything else stays LITERAL, braces kept
+        // (`{a1..c3}` -> `{a1..c3}`, `{aa..cc}` -> `{aa..cc}`).
+        match step_txt {
+            Some(s) => vec![format!("{{{start}..{end}..{s}}}")],
+            None => vec![format!("{{{start}..{end}}}")],
         }
-        vec![format!("{start}..{end}")]
     }
     /// `expandBraceNested(items)` — nested groups expand recursively.
     fn brace_nested(items: &serde_json::Value) -> Vec<String> {
@@ -20857,7 +20792,18 @@ fn brace_expand(
                     if items.len() == 1 {
                         out.extend(brace_range_value(r));
                     } else if let Some(rarr) = r.as_array() {
-                        out.push(format!("{}..{}", jstr(&rarr[0]), jstr(&rarr[1])));
+                        // A range in a comma list stays LITERAL without the
+                        // braces, step text included (`{1..3..2,5}` ->
+                        // `1..3..2 5`).
+                        out.push(match rarr.get(2).and_then(|v| v.as_str()) {
+                            Some(st) => format!(
+                                "{}..{}..{}",
+                                jstr(&rarr[0]),
+                                jstr(&rarr[1]),
+                                st
+                            ),
+                            None => format!("{}..{}", jstr(&rarr[0]), jstr(&rarr[1])),
+                        });
                     }
                 } else if let Some(n) = it.get("nested") {
                     out.extend(brace_nested(n));
