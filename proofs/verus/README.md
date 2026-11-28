@@ -8875,6 +8875,16 @@ this section called the literal-text mutant a simplification rejection; the
 measurement above is the correct one.) Restored byte-identically after each
 run (sha256 in `status_reads_traversal_sync.txt`).
 
+Re-measured 2026-11-28 against the committed bytes (proof sha
+`ad95c02d8d5a`, source sha `7319a9ef6136`): the same verdicts, re-confirmed
+after every restore. The two named mutants a pin refutes at simplification
+were additionally measured with a sibling arm **no pin covers** — `Wh`
+must-store with no `emit_s` write, `Bg` dropped from the nested walk, and
+`Interp` dropped from the read walk — each **69 verified, 1 error**, naming
+`stores_is_must`, `nested_complete` and `reads_exact_x`. A simplification
+rejection of a pinned shape therefore has a law-level twin: the theorems,
+not the pins, are what make these recursions load-bearing.
+
 ### Scope (read this before quoting it)
 
 - One constructor per source arm, but an expression's children are carried as

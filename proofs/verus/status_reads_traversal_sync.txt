@@ -41,16 +41,36 @@ guard X children carried as Seq (layout / structural order): PRESENT
 
 [counts]
 70 verified, 0 errors (verus --triggers-mode silent --rlimit 40 status_reads_traversal.rs)
-mutants (measured 2026-11-27, each restored byte-identically to this proof
-  sha): Cap/backtick arm dropped 69v/1e (reads_exact_x); literal-text,
-  Redirect-nested and If-must-store (emit_s drops the If fragment's register
-  write) mutants rejected at simplification by pin_bodies_are_localised,
-  pin_nested_redirect_reads_before_store and pin_control_flow_stores.
+mutants, re-measured 2026-11-28 against the proof sha above and each restored
+  byte-identically (sha256 re-checked after every run: ad95c02d8d5a):
+  (a) Cap/backtick arm dropped (X::Cap(_) => false)
+        -> 69v/1e, assertion in reads_exact_x
+  (b) test operand never a read (X::Var(_) => false)
+        -> 69v/1e, assertion in reads_exact_x
+  (b') literal text never a read (Part::LitQ(_) => false)
+        -> 69v/1e, assertion in reads_exact_x
+  (c) If a must-store while emit_s stops writing its IRc fragment
+        -> rejected at simplification by pin_control_flow_stores (0v/1e);
+           it never reaches the theorem, so this spelling is NOT evidence
+  (c') the same defect on an arm no pin covers (DeclArr must-store while
+       emit_s writes nothing)
+        -> 69v/1e, stores_is_must's DeclArr arm
+  (d) nested walk ignores Redirect
+        -> rejected at simplification by pin_nested_redirect_reads_before_store
+  (d') nested walk drops an unpinned arm (Subshell)
+        -> 69v/1e, nested_complete exhausts the rlimit
+  Independent re-run of the law-level spellings with different sibling arms
+  (Wh for (c'), Bg for (d'), Interp for (b)): each 69v/1e, naming
+  stores_is_must, nested_complete and reads_exact_x respectively. So every
+  named mutant a pin refutes early has a law-level twin that fails at
+  verification with a real count: the laws are load-bearing on their own.
 [exec]
 # Every MAPPED row above was EXECUTED against the source in this tree by the
 # generator that owns the tests:
 #   python3 proofs/verus/gen_pin_tests.py \
 #       proofs/verus/pin_specs/status_reads_traversal.json --run
+# Re-run 2026-11-28 against proof sha ad95c02d8d5a / source sha 7319a9ef6136:
+# 14 tests written, 14 PASS, and the generated module came out unchanged.
 # That writes src/shir_passes/status_reads_pin_tests.rs, runs each generated
 # test through `cargo test --lib pin_tests::`, and records the verdict below
 # ONLY for a test whose own `<module>::<name> ... ok` line it observed. A row
