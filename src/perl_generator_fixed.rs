@@ -1336,7 +1336,15 @@ fn concat_chain_to_interp(inner: &str) -> Option<String> {
     if pieces.len() < 2 {
         return None;
     }
-    let mut body = String::new();
+    // A `$var` in a double-quoted string swallows what follows it: `$x` . "1"
+    // is `$x1` (another variable), `$x` . "{a}" is `$x{a}` (a hash element).
+    // bash's word is the CONCATENATION, so brace the name whenever the next
+    // piece starts with a name character, `{`, `[` or `->`.
+    enum Seg {
+        Var(String),
+        Text(String),
+    }
+    let mut segs: Vec<Seg> = Vec::new();
     for p in pieces {
         let p = p.trim();
         if let Some(name) = p.strip_prefix('(').and_then(|t| t.strip_suffix(')')) {
@@ -1345,28 +1353,49 @@ fn concat_chain_to_interp(inner: &str) -> Option<String> {
                 if !var.is_empty()
                     && var.chars().all(|c| c.is_ascii_alphanumeric() || c == '_')
                 {
-                    body.push_str(&format!("${var}"));
+                    segs.push(Seg::Var(var.to_string()));
                     continue;
                 }
             }
             // A CONSTANT operand (`("abc")`, the renderer's spelling for a
             // folded literal) is the literal it names.
             if let Some(lit) = name.strip_prefix('"').and_then(|t| t.strip_suffix('"')) {
-                body.push_str(&escape_literal_dollars(lit));
+                segs.push(Seg::Text(escape_literal_dollars(lit)));
                 continue;
             }
             return None;
         }
         if let Some(lit) = p.strip_prefix('"').and_then(|t| t.strip_suffix('"')) {
             // Already a literal: keep its escapes and keep it a literal.
-            body.push_str(&escape_literal_dollars(lit));
+            segs.push(Seg::Text(escape_literal_dollars(lit)));
             continue;
         }
         if !p.is_empty() && p.chars().all(|c| c.is_ascii_digit()) {
-            body.push_str(p);
+            segs.push(Seg::Text(p.to_string()));
             continue;
         }
         return None;
+    }
+    let mut body = String::new();
+    for i in 0..segs.len() {
+        match &segs[i] {
+            Seg::Var(v) => {
+                let next = segs.get(i + 1).and_then(|s| match s {
+                    Seg::Text(t) => t.chars().next(),
+                    Seg::Var(_) => Some('$'),
+                });
+                let needs_braces = matches!(
+                    next,
+                    Some(c) if c.is_ascii_alphanumeric() || c == '_' || c == '{' || c == '[' || c == '-' || c == '$'
+                );
+                if needs_braces {
+                    body.push_str(&format!("${{{v}}}"));
+                } else {
+                    body.push_str(&format!("${v}"));
+                }
+            }
+            Seg::Text(t) => body.push_str(t),
+        }
     }
     Some(format!("\"{body}\""))
 }

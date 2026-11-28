@@ -379,12 +379,25 @@ mod tests {
         assert!(!json.contains("\"brace\""), "{json}");
     }
 
+    /// Words the PARSER already resolves: bash brace-expands the RAW TEXT of
+    /// a word, so a brace that sits next to literal/variable text is spliced
+    /// into flat words at parse time and the transform sees nothing to fold.
+    fn parsed_words(src: &str) -> String {
+        let commands = parse_commands_from_text(src).expect("parse source");
+        let prog = ast_to_ir_raw(&commands);
+        shir_to_shir_json(&prog)
+    }
+
     #[test]
     fn echo_arg_fans_out() {
         // bash: echo A:{a,b} → "A:a A:b"
-        let json = fold("echo A:{a,b}");
+        let json = parsed_words("echo A:{a,b}");
         assert!(!json.contains("\"brace\""), "{json}");
         assert!(json.contains("\"A:a\"") && json.contains("\"A:b\""), "{json}");
+        // ... and the PURE word is still the transform's job.
+        let json = fold("echo {a,b}");
+        assert!(!json.contains("\"brace\""), "{json}");
+        assert!(json.contains("\"a\"") && json.contains("\"b\""), "{json}");
     }
 
     #[test]
@@ -432,14 +445,20 @@ mod tests {
 
     #[test]
     fn product_and_nested_expand() {
-        // bash: {src,doc}/{x,y} → src/x src/y doc/x doc/y (middles)
-        let json = fold("echo {src,doc}/{x,y}");
+        // bash: {src,doc}/{x,y} → src/x src/y doc/x doc/y
+        let json = parsed_words("echo {src,doc}/{x,y}");
         for w in ["src/x", "src/y", "doc/x", "doc/y"] {
             assert!(json.contains(&format!("\"{w}\"")), "missing {w}: {json}");
         }
         // bash: x{a,{b,c}}y → xay xby xcy (nesting + prefix/suffix)
-        let json = fold("echo x{a,{b,c}}y");
+        let json = parsed_words("echo x{a,{b,c}}y");
         for w in ["xay", "xby", "xcy"] {
+            assert!(json.contains(&format!("\"{w}\"")), "missing {w}: {json}");
+        }
+        assert!(!json.contains("\"brace\""), "{json}");
+        // The transform still owns the pure product/nested shape.
+        let json = fold("echo {{a,b},{c,d}}");
+        for w in ["a", "b", "c", "d"] {
             assert!(json.contains(&format!("\"{w}\"")), "missing {w}: {json}");
         }
         assert!(!json.contains("\"brace\""), "{json}");

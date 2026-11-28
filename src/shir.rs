@@ -20584,7 +20584,7 @@ fn brace_ir(be: &BraceExpansion) -> IrExpr {
 /// one alternative, not a sibling alternative, so its values must be
 /// concatenated with the surrounding text rather than unioned with the
 /// other alternatives.
-fn brace_items_json(items: &[BraceItem]) -> serde_json::Value {
+pub(crate) fn brace_items_json(items: &[BraceItem]) -> serde_json::Value {
     serde_json::Value::Array(items.iter().map(brace_item_json).collect())
 }
 
@@ -20621,7 +20621,7 @@ fn brace_item_json(it: &BraceItem) -> serde_json::Value {
 /// prefix/suffix wrap. The runtime never adds GLOB_MAGIC to brace results,
 /// so the literal strings are bit-identical to what the runtime returns and
 /// downstream flattening (forLoop/exec) treats them identically.
-fn brace_expand(
+pub(crate) fn brace_expand(
     prefix: &str,
     groups: &serde_json::Value,
     middles: &serde_json::Value,

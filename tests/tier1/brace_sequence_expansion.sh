@@ -20,6 +20,17 @@
 # step 0 means 1: {1..3..0} = 1 2 3
 # comma list keeps the step text: 1..3..2 5
 # nested {x{a1..c3},y}: x{a1..c3} y
+# adjacent to a variable (x=VAR): braced var then range = VAR1 VAR2
+# p{1..2}${x}q = p1VARq p2VARq
+# braced var then alpha range = VARa VARb VARc
+# bare-var brace list names x1/x2 (unset -> nothing): []
+# alpha range then braced var = aVAR bVAR cVAR
+# two braced vars around a range = VAR1YY VAR2YY
+# x{1..2}y{3..4}z = x1y3z x1y4z x2y3z x2y4z
+# unsupported range then braced var keeps the group: {a1..c3}VAR
+# an assignment word does not brace-expand -> [VAR{1..2}]
+# a plain assignment keeps its braces: w={a,b} -> [{a,b}]
+# a quoted brace beside a variable stays literal: VAR{1..2}
 set -- {1..10}
 printf '{1..10}: %s words -> %s\n' "$#" "$*"
 set -- {a..z}
@@ -41,3 +52,22 @@ printf 'zero-padded {001..010..3}: %s\n' "$(echo {001..010..3})"
 printf 'step 0 means 1: {1..3..0} = %s\n' "$(echo {1..3..0})"
 printf 'comma list keeps the step text: %s\n' "$(echo {1..3..2,5})"
 printf 'nested {x{a1..c3},y}: %s\n' "$(echo {x{a1..c3},y})"
+
+# ── Brace adjacent to a variable ──────────────────────────────────────────
+# bash brace-expands the RAW WORD TEXT, so the pieces of `${x}{1..2}` are one
+# word each: `${x}1` and `${x}2`. `$x{1,2}` names `$x1`/`$x2`.
+x=VAR
+y=YY
+printf 'adjacent to a variable (x=VAR): braced var then range = %s\n' "$(echo ${x}{1..2})"
+printf 'p{1..2}${x}q = %s\n' "$(echo p{1..2}${x}q)"
+printf 'braced var then alpha range = %s\n' "$(echo ${x}{a..c})"
+printf 'bare-var brace list names x1/x2 (unset -> nothing): [%s]\n' "$(echo $x{1,2})"
+printf 'alpha range then braced var = %s\n' "$(echo {a..c}${x})"
+printf 'two braced vars around a range = %s\n' "$(echo ${x}{1..2}${y})"
+printf 'x{1..2}y{3..4}z = %s\n' "$(echo x{1..2}y{3..4}z)"
+printf 'unsupported range then braced var keeps the group: %s\n' "$(echo {a1..c3}${x})"
+v=${x}{1..2}
+printf 'an assignment word does not brace-expand -> [%s]\n' "$v"
+w={a,b}
+printf 'a plain assignment keeps its braces: w={a,b} -> [%s]\n' "$w"
+printf 'a quoted brace beside a variable stays literal: %s\n' "$(echo ${x}'{1..2}')"

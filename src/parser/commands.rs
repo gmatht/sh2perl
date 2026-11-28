@@ -61,13 +61,16 @@ pub struct Parser {
 
 impl Parser {
     pub fn new(input: &str) -> Self {
+        let mut lexer = Lexer::new(input);
+        crate::parser::words::splice_adjacent_brace_words(&mut lexer);
         Self {
-            lexer: Lexer::new(input),
+            lexer,
             shopt_state: TestModifiers::default(),
         }
     }
 
-    pub fn new_with_lexer(lexer: Lexer) -> Self {
+    pub fn new_with_lexer(mut lexer: Lexer) -> Self {
+        crate::parser::words::splice_adjacent_brace_words(&mut lexer);
         Self {
             lexer,
             shopt_state: TestModifiers::default(),

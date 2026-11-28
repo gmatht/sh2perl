@@ -6382,3 +6382,300 @@ mod word_boundary_tests {
         );
     }
 }
+
+// ─── Adjacent brace expansion: bash expands the RAW WORD TEXT ────────────
+//
+// bash brace-expands a word's text before parameter expansion, so the pieces
+// of `${x}{1..2}` are one word each: `${x}1` and `${x}2`. `$x{1,2}` even
+// names `$x1` and `$x2`. The AST cannot hold "one word whose prefix is a
+// variable and whose tail is a brace list" (`BraceExpansion.prefix/suffix`
+// are static text), so a word that mixes a brace with any other piece is
+// rewritten here, on the token stream, as the N ordinary adjacent words the
+// text expands to — each piece then parses exactly as if the user had typed
+// it. Standalone braces are left alone, so `for i in {1..1000000}` keeps its
+// range form and the 1024-item guard.
+
+/// Tokens that end a shell word (so they break a "word run").
+fn ends_shell_word(t: &Token) -> bool {
+    use Token::*;
+    matches!(
+        t,
+        Space
+            | Tab
+            | Newline
+            | CarriageReturn
+            | Comment
+            | Semicolon
+            | DoubleSemicolon
+            | Pipe
+            | Or
+            | And
+            | Background
+            | ParenOpen
+            | ParenClose
+            | RedirectOut
+            | RedirectAppend
+            | RedirectIn
+            | RedirectInOut
+            | RedirectOutErr
+            | RedirectInErr
+            | RedirectOutClobber
+            | RedirectAll
+            | RedirectAllAppend
+            | Heredoc
+            | HeredocTabs
+            | HereString
+    )
+}
+
+fn adjacent(a: &(Token, usize, usize), b: &(Token, usize, usize)) -> bool {
+    a.2 == b.1
+}
+
+/// Builtins whose `name=value` arguments ARE brace-expanded by bash (unlike a
+/// real assignment word, which is not).
+fn takes_assignment_args(t: &Token) -> bool {
+    use Token::*;
+    matches!(t, Export | Readonly | Declare | Typeset | Local)
+}
+
+/// The first token of the command that contains `word_start`, when it can be
+/// found by walking back over spaces — used to tell a real assignment word
+/// (`v=${x}{1..2}`, never brace-expanded) from an `export`/`declare` argument.
+fn command_head(lexer: &Lexer, word_start: usize) -> Option<Token> {
+    let mut i = word_start;
+    while i > 0
+        && matches!(
+            lexer.tokens[i - 1].0,
+            Token::Space | Token::Tab | Token::Comment | Token::CarriageReturn
+        )
+    {
+        i -= 1;
+    }
+    if i == 0 {
+        return None;
+    }
+    Some(lexer.tokens[i - 1].0.clone())
+}
+
+/// What a single `{...}` group in a mixed word means.
+enum BraceTextAlts {
+    /// The words it expands to.
+    Expand(Vec<String>),
+    /// bash keeps it verbatim (`{a1..c3}`, `{aa..cc}`): the group is literal
+    /// text inside the word, so the splice quotes it to stop the parser
+    /// treating it as a brace expansion.
+    Literal,
+    /// Cannot be decided here (unparsable, or a range too large to
+    /// materialise): leave the word to the existing paths.
+    Bail,
+}
+
+fn brace_text_alternatives(text: &str) -> BraceTextAlts {
+    let mut sub = Lexer::new(text);
+    let parsed = match parse_brace_expansion(&mut sub) {
+        Ok(w) => w,
+        Err(_) => return BraceTextAlts::Bail,
+    };
+    let Word::BraceExpansion(be, _) = parsed else {
+        return BraceTextAlts::Bail;
+    };
+    // Never materialise a giant range: leave it to the range-aware paths.
+    fn too_big(items: &[crate::ast::BraceItem]) -> bool {
+        use crate::ast::BraceItem;
+        items.iter().any(|it| match it {
+            BraceItem::Range(r) => {
+                let n = |s: &str| s.parse::<i64>().ok();
+                match (n(&r.start), n(&r.end)) {
+                    (Some(a), Some(b)) => {
+                        let step = r.step.as_deref().and_then(n).unwrap_or(1).abs().max(1);
+                        (b - a).abs() / step > 4096
+                    }
+                    _ => false,
+                }
+            }
+            BraceItem::Compound(parts) => too_big(parts),
+            BraceItem::Nested(inner) => too_big(&inner.items),
+            _ => false,
+        })
+    }
+    if too_big(&be.items) {
+        return BraceTextAlts::Bail;
+    }
+    let groups = serde_json::Value::Array(vec![crate::shir::brace_items_json(&be.items)]);
+    let out = crate::shir::brace_expand("", &groups, &serde_json::Value::Array(vec![]), "");
+    match out.as_slice() {
+        [] => BraceTextAlts::Bail,
+        [one] if one == text => BraceTextAlts::Literal,
+        _ => BraceTextAlts::Expand(out),
+    }
+}
+
+/// Find the next shell word that mixes a brace with other pieces.
+/// Returns `(word_start, word_end, brace_start, brace_end)` token indexes,
+/// half-open for the word and inclusive for the brace, plus whether the word
+/// is a real assignment (`v=...`), whose braces bash never expands.
+fn find_mixed_brace(
+    lexer: &Lexer,
+    min_offset: usize,
+) -> Option<(usize, usize, usize, usize, bool)> {
+    let toks = &lexer.tokens;
+    // `[[ ... ]]` is a conditional expression: bash does NO brace expansion
+    // inside it (`[[ $s =~ ^[a-z]{1,3}$ ]]` is a regex quantifier), so the
+    // splice must stay out of the whole construct.
+    let mut in_test = vec![false; toks.len()];
+    let mut depth = 0i32;
+    for (k, tok) in toks.iter().enumerate() {
+        match tok.0 {
+            Token::TestBracket => {
+                depth += 1;
+                in_test[k] = true;
+            }
+            Token::TestBracketClose => {
+                in_test[k] = true;
+                depth -= 1;
+            }
+            _ => in_test[k] = depth > 0,
+        }
+    }
+    let mut i = 0;
+    while i < toks.len() && toks[i].1 < min_offset {
+        i += 1;
+    }
+    while i < toks.len() {
+        if in_test[i] {
+            i += 1;
+            continue;
+        }
+        if !matches!(toks[i].0, Token::BraceOpen)
+            || (i > 0 && matches!(toks[i - 1].0, Token::Dollar | Token::DollarBrace))
+        {
+            i += 1;
+            continue;
+        }
+        // Matching close brace.
+        let mut depth = 0i32;
+        let mut close = None;
+        for (j, tok) in toks.iter().enumerate().skip(i) {
+            match tok.0 {
+                Token::BraceOpen => depth += 1,
+                Token::BraceClose => {
+                    depth -= 1;
+                    if depth == 0 {
+                        close = Some(j);
+                        break;
+                    }
+                }
+                _ => {}
+            }
+        }
+        let Some(be) = close else {
+            i += 1;
+            continue;
+        };
+        // Only a comma list or a range is a brace expansion at all.
+        let mut d = 0i32;
+        let mut expandable = false;
+        for tok in &toks[i..=be] {
+            match tok.0 {
+                Token::BraceOpen => d += 1,
+                Token::BraceClose => d -= 1,
+                Token::Comma | Token::Range if d == 1 => expandable = true,
+                _ => {}
+            }
+        }
+        if !expandable {
+            i = be + 1;
+            continue;
+        }
+        // The whole shell word the brace sits in.
+        let mut ws = i;
+        while ws > 0 && adjacent(&toks[ws - 1], &toks[ws]) && !ends_shell_word(&toks[ws - 1].0) {
+            ws -= 1;
+        }
+        let mut we = be + 1;
+        while we < toks.len() && adjacent(&toks[we - 1], &toks[we]) && !ends_shell_word(&toks[we].0) {
+            we += 1;
+        }
+        // Mixed: something besides the brace in the same word.
+        if ws < i || we > be + 1 {
+            // A real assignment word keeps its braces (`v=${x}{1..2}` is the
+            // literal `VAR{1..2}`), but `export v=...` arguments expand.
+            let has_assign = toks[ws..we].iter().any(|t| t.0 == Token::Assign);
+            let literal_only = has_assign
+                && !command_head(lexer, ws)
+                    .as_ref()
+                    .is_some_and(takes_assignment_args);
+            return Some((ws, we, i, be, literal_only));
+        }
+        i = be + 1;
+    }
+    None
+}
+
+/// Rewrite every variable-adjacent (or otherwise mixed) brace word as the
+/// words bash's textual expansion produces. Idempotent: a source with no such
+/// word is untouched.
+///
+/// The rewrite happens on the SOURCE TEXT and the lexer is rebuilt, because
+/// the parser reads token payloads (`${x}` names, quotes) back out of
+/// `lexer.input` by span — remapped token offsets over the old text would
+/// point at the wrong characters. A splice replaces one word with N words
+/// separated by spaces and never adds a newline, so line numbers (and the
+/// `stmt_lines` markup they feed) are unchanged.
+pub fn splice_adjacent_brace_words(lexer: &mut Lexer) {
+    if lexer.current != 0 {
+        return;
+    }
+    let mut skip_before = 0usize;
+    for _ in 0..512 {
+        let Some((ws, we, bs, be, literal_only)) = find_mixed_brace(lexer, skip_before) else {
+            return;
+        };
+        let toks = &lexer.tokens;
+        let (word_off, brace_off, tail_off) = (toks[ws].1, toks[bs].1, toks[we - 1].2);
+        let brace_end_off = toks[be].2;
+        let original = lexer.input[word_off..tail_off].to_string();
+        let prefix = lexer.input[word_off..brace_off].to_string();
+        let brace_text = lexer.input[brace_off..brace_end_off].to_string();
+        let suffix = lexer.input[brace_end_off..tail_off].to_string();
+        let alts = if literal_only {
+            BraceTextAlts::Literal
+        } else {
+            brace_text_alternatives(&brace_text)
+        };
+        let replacement = match alts {
+            BraceTextAlts::Expand(a) => a
+                .iter()
+                .map(|alt| format!("{prefix}{alt}{suffix}"))
+                .collect::<Vec<_>>()
+                .join(" "),
+            // A literal group is quoted so the parser sees plain text; the
+            // surrounding pieces still expand (`${x}'{a1..c3}'` is
+            // `VAR{a1..c3}`, exactly bash's word).
+            BraceTextAlts::Literal => {
+                if brace_text.contains('\'') {
+                    skip_before = brace_end_off;
+                    continue;
+                }
+                format!("{prefix}'{brace_text}'{suffix}")
+            }
+            BraceTextAlts::Bail => {
+                skip_before = brace_end_off;
+                continue;
+            }
+        };
+        if replacement == original {
+            skip_before = brace_end_off;
+            continue;
+        }
+        let mut input = String::with_capacity(lexer.input.len() + replacement.len());
+        input.push_str(&lexer.input[..word_off]);
+        input.push_str(&replacement);
+        input.push_str(&lexer.input[tail_off..]);
+        *lexer = Lexer::new(&input);
+        // Re-scan from the start: the replacement itself may still hold a
+        // brace adjacent to text (each round removes one).
+        skip_before = 0;
+    }
+}
