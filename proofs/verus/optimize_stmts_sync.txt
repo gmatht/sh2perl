@@ -1,0 +1,32 @@
+# verus-sync-coverage manifest: optimize_stmts
+# source sha: ir=bb257b21bae0  proof sha: cea66a0e7782
+#   RE-AUDITED 2026-11-28. PROVENANCE GAP: the recorded value names no blob in
+#   this repository (every object in the database was hashed), so it was taken
+#   from an uncommitted worktree state and cannot be extracted and diffed.
+#   The audit is therefore anchored at the current src/ir.rs: the model's two
+#   pinned predicates still hold verbatim -- is_self_assignment (asm label
+#   refuses, single target, no indices, RHS is Var of the same name) and the
+#   Declare elimination (init.is_none() and no declared name in the census),
+#   with collect_vars_in_stmt's Declare arm inserting the declared names so a
+#   lone `Declare[x]` is kept, as the model claims.
+# Pass 1 only (self-assign + unused-Declare); pass 0.5 folding is a different obligation.
+
+[pins]
+pin pass1_sound -> UNMIRRORED (no mirroring test; pin is a proved obligation in this file)
+pin declare_pins -> UNMIRRORED (no mirroring test; pin is a proved obligation in this file)
+
+[guards]
+guard optimize_stmts self-assignment predicate: PRESENT
+guard optimize_stmts referenced-vars census: PRESENT
+guard optimize_stmts Declare elimination: PRESENT
+
+[counts]
+proof-fns: 5
+pins: 2
+# NOTE: proof-fns is a file-shape fact (change detector), NOT the
+# Verus obligation count — re-run verus to measure that.
+
+[exec]
+# no MAPPED rows: this manifest's pins are obligations, not test mirrors.
+exec pass1_sound: UNMIRRORED (not executed)
+exec declare_pins: UNMIRRORED (not executed)
