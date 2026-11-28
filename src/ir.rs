@@ -13471,6 +13471,34 @@ fn pipeline_leaf_capture(e: &IrExpr) -> Option<String> {
     Some(format!("__sh_pipe_capture({})", v))
 }
 
+/// The Perl spelling of a binary operator. `Not` is unreachable here:
+/// `ir_expr_to_perl` renders `!` as a prefix and never joins with it.
+fn binop_perl_str(op: &BinOpKind) -> &'static str {
+    match op {
+        BinOpKind::Add => " + ",
+        BinOpKind::Sub => " - ",
+        BinOpKind::Mul => " * ",
+        BinOpKind::Div => " / ",
+        BinOpKind::Mod => " % ",
+        BinOpKind::Pow => " ** ",
+        BinOpKind::Concat => " . ",
+        BinOpKind::Eq => " == ",
+        BinOpKind::Ne => " ne ",
+        BinOpKind::Lt => " < ",
+        BinOpKind::Gt => " > ",
+        BinOpKind::Le => " <=",
+        BinOpKind::Ge => " >=",
+        BinOpKind::And => " && ",
+        BinOpKind::Or => " || ",
+        BinOpKind::Not => " !",
+        BinOpKind::BitAnd => " & ",
+        BinOpKind::BitOr => " | ",
+        BinOpKind::BitXor => " ^ ",
+        BinOpKind::ShiftL => " << ",
+        BinOpKind::ShiftR => " >> ",
+    }
+}
+
 pub(crate) fn ir_expr_to_perl(expr: &IrExpr) -> String {
     if let Some(s) = stderr_redirected_native_expr(expr) {
         return s;
@@ -13989,32 +14017,35 @@ pub(crate) fn ir_expr_to_perl(expr: &IrExpr) -> String {
             if matches!(op, BinOpKind::Not) {
                 return format!("!({})", ir_expr_to_perl(rhs));
             }
-            let l = ir_expr_to_perl(lhs);
-            let r = ir_expr_to_perl(rhs);
-            let op_str = match op {
-                BinOpKind::Add => " + ",
-                BinOpKind::Sub => " - ",
-                BinOpKind::Mul => " * ",
-                BinOpKind::Div => " / ",
-                BinOpKind::Mod => " % ",
-                BinOpKind::Pow => " ** ",
-                BinOpKind::Concat => " . ",
-                BinOpKind::Eq => " == ",
-                BinOpKind::Ne => " ne ",
-                BinOpKind::Lt => " < ",
-                BinOpKind::Gt => " > ",
-                BinOpKind::Le => " <=",
-                BinOpKind::Ge => " >=",
-                BinOpKind::And => " && ",
-                BinOpKind::Or => " || ",
-                BinOpKind::Not => " !",
-                BinOpKind::BitAnd => " & ",
-                BinOpKind::BitOr => " | ",
-                BinOpKind::BitXor => " ^ ",
-                BinOpKind::ShiftL => " << ",
-                BinOpKind::ShiftR => " >> ",
-            };
-            format!("{}{}{}", l, op_str, r)
+            // A chain of `a . b . c …` arrives LEFT-nested, so the plain
+            // `ir_expr_to_perl(lhs)` recursion was one stack frame per
+            // operand — and the operand count is input-controlled: one
+            // brace-expanded word list is one level per word
+            // (`examples/064_hard_to_generate.sh` asks for hundreds, which
+            // blew the 8 MB main stack of the shipped CLI). Walk the left
+            // spine iteratively and render only the right operands; the
+            // emitted text is byte-identical because each level is still
+            // joined as `prev + op + rhs` in the same order.
+            let mut levels: Vec<(&BinOpKind, &IrExpr)> = vec![(op, rhs)];
+            let mut base: &IrExpr = lhs;
+            while let IrExpr::BinOp {
+                lhs: inner_lhs,
+                op: inner_op,
+                rhs: inner_rhs,
+            } = base
+            {
+                if matches!(inner_op, BinOpKind::Not) {
+                    break;
+                }
+                levels.push((inner_op, inner_rhs));
+                base = inner_lhs;
+            }
+            let mut out = ir_expr_to_perl(base);
+            for (level_op, level_rhs) in levels.into_iter().rev() {
+                out.push_str(binop_perl_str(level_op));
+                out.push_str(&ir_expr_to_perl(level_rhs));
+            }
+            out
         }
 
         IrExpr::Call { func, args } => {

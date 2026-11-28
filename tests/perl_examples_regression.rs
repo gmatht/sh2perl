@@ -63,8 +63,15 @@ fn render_bare(src: &str) -> String {
     debashl::ir::shir_to_perl(&prog)
 }
 
-/// A deep parser recursion needs more stack than a test thread gets.
-const BIG_STACK: usize = 256 << 20;
+/// Fixtures that exist PRECISELY to pin the parser's error reporting: they
+/// must keep failing to PARSE, and never reach the renderer.
+const MUST_NOT_PARSE: &[&str] = &[
+    "parse-double-semicolon.sh",
+    "parse-error-doublesemicolon.sh",
+    "parse-parameter-expansion-eof.sh",
+    "parse-paren-after-do.sh",
+    "parse-unexpected-end-of-input.sh",
+];
 
 fn have_perl() -> bool {
     std::process::Command::new("perl")
@@ -184,6 +191,13 @@ fn every_example_compiles_without_warnings_through_both_entry_points() {
     // Parallel workers: the render path is thread-local end to end, so
     // concurrent renders must be equivalent to serial ones (see
     // `perl_render_purity`). Four keeps the perl process count reasonable.
+    //
+    // The workers use the DEFAULT thread stack on purpose. They used to ask
+    // for 256 MB, which hid a real defect: `ir_expr_to_perl` recursed once
+    // per brace-expanded word, so `064_hard_to_generate.sh` needed ~15 MB and
+    // the shipped CLI aborted with a stack overflow while this sweep passed.
+    // A renderer that cannot fit the default stack is the bug — raising the
+    // stack here only hides it again.
     let next = Arc::new(AtomicUsize::new(0));
     let failures = Arc::new(std::sync::Mutex::new(String::new()));
     let mut handles = Vec::new();
@@ -193,7 +207,6 @@ fn every_example_compiles_without_warnings_through_both_entry_points() {
         let failures = Arc::clone(&failures);
         handles.push(
             std::thread::Builder::new()
-                .stack_size(BIG_STACK)
                 .spawn(move || {
                     loop {
                         let i = next.fetch_add(1, Ordering::Relaxed);
@@ -201,13 +214,6 @@ fn every_example_compiles_without_warnings_through_both_entry_points() {
                         // A handful of fixtures exist PRECISELY to pin the
                         // parser's error reporting; they must keep failing.
                         // Every other example must parse and render.
-                        const MUST_NOT_PARSE: &[&str] = &[
-                            "parse-double-semicolon.sh",
-                            "parse-error-doublesemicolon.sh",
-                            "parse-parameter-expansion-eof.sh",
-                            "parse-paren-after-do.sh",
-                            "parse-unexpected-end-of-input.sh",
-                        ];
                         let (commands, _) = match debashl::Parser::new(src).parse_with_lines() {
                             Ok(c) => c,
                             Err(e) => {
@@ -252,6 +258,65 @@ fn every_example_compiles_without_warnings_through_both_entry_points() {
     assert!(
         failures.is_empty(),
         "examples that do not compile cleanly:\n{failures}"
+    );
+}
+
+// ── 2b. The SHIPPED CLI renders on a default stack ──────────────────────
+
+/// The sweep above renders in-process (and now on default stack threads).
+/// This pins the other half of the same guarantee: the built `perl_backend`
+/// binary — the path `tests/bash-parity.sh` and users run — must render every
+/// corpus example on a fresh process's DEFAULT stack.
+///
+/// `examples/064_hard_to_generate.sh` used to abort there with `thread 'main'
+/// has overflowed its stack` (exit 134) while the sweep passed, because the
+/// sweep had asked for a 256 MB stack. Rendering in a SUBPROCESS keeps that
+/// class visible without killing the whole test binary: a crash becomes a
+/// named failure that says which example, and the rest still run.
+#[test]
+fn shipped_cli_renders_every_example_on_the_default_stack() {
+    let cli = env!("CARGO_BIN_EXE_perl_backend");
+    let dir = examples_dir();
+    let mut names: Vec<String> = std::fs::read_dir(&dir)
+        .expect("examples dir")
+        .filter_map(|e| e.ok())
+        .map(|e| e.file_name().to_string_lossy().into_owned())
+        .filter(|n| n.ends_with(".sh"))
+        .collect();
+    names.sort();
+    assert!(names.len() > 500, "corpus looks truncated: {}", names.len());
+
+    let mut failures = String::new();
+    for name in &names {
+        let out = std::process::Command::new(cli)
+            .arg("--fixed")
+            .arg(format!("{dir}/{name}"))
+            .output()
+            .expect("run perl_backend");
+        let status = out.status.code().unwrap_or(-1);
+        if MUST_NOT_PARSE.contains(&name.as_str()) {
+            // Parser-diagnostic fixtures: the CLI reports and exits 2.
+            if status != 2 {
+                failures.push_str(&format!("{name}: parse-error fixture exited {status}\n"));
+            }
+            continue;
+        }
+        if status != 0 {
+            let why = if status == 134 {
+                " (stack overflow / abort)"
+            } else {
+                ""
+            };
+            failures.push_str(&format!("{name}: exit {status}{why}\n"));
+            continue;
+        }
+        if out.stdout.is_empty() {
+            failures.push_str(&format!("{name}: rendered nothing\n"));
+        }
+    }
+    assert!(
+        failures.is_empty(),
+        "the shipped CLI does not render these examples on a default stack:\n{failures}"
     );
 }
 
