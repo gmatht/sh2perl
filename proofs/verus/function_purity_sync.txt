@@ -1,5 +1,12 @@
 # verus-sync-coverage manifest: function_purity
-# source sha: function_purity=1954d11b0d8a  proof sha: 0b29a19253dd
+# source sha: function_purity=d121a52af85d  proof sha: 0b29a19253dd
+#   RE-AUDITED 2026-11-28 at the current file (the recorded value names
+#   19edab3e5 "transforms: affix-strip-fold ..."): the whole drift is the
+#   verdict cache moving from a process-static `Mutex` to a `thread_local!`
+#   `RefCell` (clear_verdicts / purity / transform accessors). The two
+#   predicates this law models, expr_purity and stmt_purity, were extracted
+#   from both revisions and diffed: byte-identical. The fixpoint table is a
+#   parameter of purity_sound, so where the cache lives is outside the model.
 
 [pins]
 pin pin_impure_arg_taints -> UNMIRRORED (by design — see the proof-campaign plan §(b).4)
