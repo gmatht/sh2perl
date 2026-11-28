@@ -1,5 +1,17 @@
 # verus-sync-coverage manifest: shir_native_status_folds
-# source sha: shir_native_stmt=3ae1b4d0bc71  proof sha: aca094fcdc97
+# source sha: shir_native_stmt=3b243603f88f  proof sha: aca094fcdc97
+#   RE-PINNED 2026-11-28 (source move by 51706299e): 3ae1b4d0bc71 -> 3b243603f88f.
+#   Audited, not bumped: chunk-by-chunk hashes over the two blobs say the move
+#   changes exactly four chunks of src/transforms/shir_native_stmt.rs —
+#   `native_sort_file_stmt` (the `-n` comparator is now
+#   `__sh_num($a) <=> __sh_num($b)`, and a failed open prints
+#   `sort: cannot read: FILE: $ERRNO` instead of Perl's closed-filehandle
+#   warning), `native_grep_file_pipeline` (a failed open prints
+#   `CMD: FILE: $ERRNO`), `emit_file_op` (the same `__sh_num` key on the sort
+#   pass's -k/-t path) and the `tests` module (the unary-file-test
+#   expectations now read `-r __sh_str($x)`; the renderer itself is unchanged).
+#   This row's surface — the G-remainder folds (`native_sort_stmt`, `native_rm_rf_stmt`, `native_trap_stmt`, `native_declare_typeset_stmt`, `native_literal_let_stmt`, `native_subshell_eval_noop_stmt`) — is byte-identical across the move, so every
+#   law, pin and count in this manifest still describes the bytes at HEAD.
 # source: src/transforms/shir_native_stmt.rs (cluster G, REMAINDER:
 #   native_literal_let_stmt 817, native_declare_typeset_stmt 922,
 #   normalize_literal_exec_words 2984, native_trap_stmt 5235,

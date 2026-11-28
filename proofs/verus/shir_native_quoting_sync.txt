@@ -1,5 +1,17 @@
 # verus-sync-coverage manifest: shir_native_quoting
-# source sha: shir_native_stmt=3ae1b4d0bc71  proof sha: 7ad6340fe7bb
+# source sha: shir_native_stmt=3b243603f88f  proof sha: 7ad6340fe7bb
+#   RE-PINNED 2026-11-28 (source move by 51706299e): 3ae1b4d0bc71 -> 3b243603f88f.
+#   Audited, not bumped: chunk-by-chunk hashes over the two blobs say the move
+#   changes exactly four chunks of src/transforms/shir_native_stmt.rs —
+#   `native_sort_file_stmt` (the `-n` comparator is now
+#   `__sh_num($a) <=> __sh_num($b)`, and a failed open prints
+#   `sort: cannot read: FILE: $ERRNO` instead of Perl's closed-filehandle
+#   warning), `native_grep_file_pipeline` (a failed open prints
+#   `CMD: FILE: $ERRNO`), `emit_file_op` (the same `__sh_num` key on the sort
+#   pass's -k/-t path) and the `tests` module (the unary-file-test
+#   expectations now read `-r __sh_str($x)`; the renderer itself is unchanged).
+#   This row's surface — `perl_quote` and the quoting/escape grammar (cluster H) — is byte-identical across the move, so every
+#   law, pin and count in this manifest still describes the bytes at HEAD.
 #   RE-PINNED 2026-11-28 (pin reproducibility). The previous value a2707f9280c3
 #   is the blob of src/transforms/shir_native_stmt.rs at commit 46cbb602b; this
 #   row now names the COMMITTED blob at HEAD, 3ae1b4d0bc71, so it describes bytes

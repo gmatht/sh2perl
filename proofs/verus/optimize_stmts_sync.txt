@@ -1,5 +1,18 @@
 # verus-sync-coverage manifest: optimize_stmts
-# source sha: ir=d5bddf2b44dc  proof sha: cea66a0e7782
+# source sha: ir=d9f3e2056150  proof sha: cea66a0e7782
+#   RE-PINNED 2026-11-28 (source move by 51706299e): ir=d5bddf2b44dc -> d9f3e2056150.
+#   Audited, not bumped: chunk-by-chunk hashes over the two blobs say the move
+#   changes these chunks of src/ir.rs — `emit_stmt_owned` (a `case`
+#   discriminant is read through `__sh_str`), `arith_ast_to_perl` with the new
+#   `arith_read`, `var_read`, `perl_lhs_for` (an arithmetic read is
+#   `__sh_num(...)`, an indexed read splits array vs hash, an assignment target
+#   goes through `perl_lhs_for`), `ir_expr_to_perl`,
+#   `try_native_for_sort` / `try_native_while_read_sort` (`__sh_num` sort key),
+#   `body_mentions_sigil` (a probe ending in `[` is followed by a subscript),
+#   `flat_operand` / `coerce_text` / `render_test_operand` (text coercion) and
+#   `tests`. Pass 1's whole surface — `is_self_assignment`, the unused-`Declare`
+#   elimination and the `collect_vars_in_stmt` census — is NOT in that set
+#   (byte-identical chunks), so the soundness law and its counts stand.
 #   RE-PINNED 2026-11-28 (pin reproducibility): the recorded bb257b21bae0 names
 #   no blob in this repository (the provenance gap above: it came from an
 #   uncommitted worktree), so this row never described bytes anyone could check

@@ -1,5 +1,17 @@
 # verus-sync-coverage manifest: shir_native_chain
-# source sha: shir_native_stmt=3ae1b4d0bc71  proof sha: 5290c291092e
+# source sha: shir_native_stmt=3b243603f88f  proof sha: 5290c291092e
+#   RE-PINNED 2026-11-28 (source move by 51706299e): 3ae1b4d0bc71 -> 3b243603f88f.
+#   Audited, not bumped: chunk-by-chunk hashes over the two blobs say the move
+#   changes exactly four chunks of src/transforms/shir_native_stmt.rs —
+#   `native_sort_file_stmt` (the `-n` comparator is now
+#   `__sh_num($a) <=> __sh_num($b)`, and a failed open prints
+#   `sort: cannot read: FILE: $ERRNO` instead of Perl's closed-filehandle
+#   warning), `native_grep_file_pipeline` (a failed open prints
+#   `CMD: FILE: $ERRNO`), `emit_file_op` (the same `__sh_num` key on the sort
+#   pass's -k/-t path) and the `tests` module (the unary-file-test
+#   expectations now read `-r __sh_str($x)`; the renderer itself is unchanged).
+#   This row's surface — `test_and_to_if`, `cmd_and_chain_to_if` and `native_echo_or_chain` (cluster D2) — is byte-identical across the move, so every
+#   law, pin and count in this manifest still describes the bytes at HEAD.
 #   RE-PINNED 2026-11-28 (pin reproducibility): a2707f9280c3 (the blob at
 #   46cbb602b) -> 3ae1b4d0bc71 (the COMMITTED blob at HEAD). This manifest DOES
 #   model two functions the state changed, so they were re-read, not just
