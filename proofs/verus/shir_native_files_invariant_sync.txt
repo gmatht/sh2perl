@@ -1,0 +1,107 @@
+# verus-sync-coverage manifest: shir_native_files_invariant
+# source sha: shir_native_stmt=3ae1b4d0bc71  proof sha: 7099b4738ae5
+# source: src/transforms/shir_native_stmt.rs — item A.1, the `files` rewrite
+#   surface: record_file_write (2579), native_cat_file_pipeline (2616),
+#   pipeline_producer_literal (2655), called from transform_stmt's Expr arm (324).
+#
+# THE INVARIANT.  `files: HashMap<String,String>` is a syntactic cache of what
+# a literal `echo/printf > P` left in P; native_cat_file_pipeline substitutes
+# `cat P` with it. A wrong entry is wrong OUTPUT, so this file proves soundness
+# rather than a conservatism:
+#   * files_sound_on_truncating_programs — for a program of literal TRUNCATING
+#     writes, the map equals the disk at every path (induction, via
+#     files_sound_step). cat_reads_current_disk is the use site.
+#   * record_keeps_every_other_key / record_stores_the_payload /
+#     refused_write_changes_nothing — files_monotone: one record touches one
+#     key; a refusal touches nothing.
+#   * append_is_refused_by_the_pass / append_appends_to_what_is_there /
+#     truncate_then_append_diverges — d-A1: `> f` then `>> f` leaves the map
+#     holding the first write while the disk holds both, so the fold's
+#     `r.mode != "w"` refusal is REQUIRED.
+#   * echo_bytes_are_what_bash_writes — the recorded content (single spaces, one
+#     trailing newline) is bash's bytes, proved against a separator-join
+#     recursion (lemma_add_assoc).
+#   * second_redirect_is_refused — the one-spec, fd-1 gate.
+#
+# THE TWO SIDES ARE DIFFERENT FUNCTIONS.  The shell side (bash_write/bash_disk)
+# models BOTH `>` and `>>`; the pass side (rec_write/rec_map) models only the
+# insert the source performs, behind the gate. The theorem is the restriction,
+# and the divergence on the complement is proved (d-A1), which is why the law
+# cannot be green-by-agreement.
+#
+# A.2 (dispatch completeness) is the previous stage and is not re-proved here:
+# proofs/verus/check_dispatch.py + shir_native_stmt_dispatch.txt (58 folds, both
+# directions). Re-run in this stage: 0 failures.
+#
+# d-A2, RECORDED NOT FIXED: every way a path can change that the fold does not
+# record (`echo $X > P` left as an exec, `cp`, `mv`, `sed -i`, a subshell write)
+# leaves the entry stale, and a later `cat P` substitution would use the stale
+# bytes. The map is a syntactic cache, not a filesystem model; the fold's own
+# domain (literal truncating writes) is what this file proves sound.
+#
+# Out of model: the renderer; the parser; printf's byte side (cluster E's law,
+# shir_native_echo.rs — this file carries the payload as opaque bytes and proves
+# the MAP law); the filesystem beyond the path keys.
+
+[pins]
+pin pin_append_is_not_recorded -> UNMIRRORED (by design — model-level: record_file_write has no source test)
+pin pin_echo_two_words -> UNMIRRORED (by design — model-level: record_file_write has no source test)
+pin pin_empty_echo_content -> UNMIRRORED (by design — model-level: record_file_write has no source test)
+pin pin_one_redirect_fd1_only -> UNMIRRORED (by design — model-level: record_file_write has no source test)
+pin pin_one_word_content -> UNMIRRORED (by design — model-level: record_file_write has no source test)
+pin pin_one_write_is_sound -> UNMIRRORED (by design — model-level: record_file_write has no source test)
+pin pin_other_paths_survive -> UNMIRRORED (by design — model-level: record_file_write has no source test)
+pin pin_refused_record_is_a_noop -> UNMIRRORED (by design — model-level: record_file_write has no source test)
+pin pin_two_word_content -> UNMIRRORED (by design — model-level: record_file_write has no source test)
+
+[guards]
+guard law files_sound_on_truncating_programs (map == disk at every path): PRESENT
+guard law files_sound_step (one accepted write keeps them in step): PRESENT
+guard law cat_reads_current_disk (the substitution site reads the disk): PRESENT
+guard law record_keeps_every_other_key (files_monotone): PRESENT
+guard law record_stores_the_payload: PRESENT
+guard law refused_write_changes_nothing: PRESENT
+guard law append_is_refused_by_the_pass (the `>>` gate): PRESENT
+guard law append_appends_to_what_is_there (bash's append, independent): PRESENT
+guard law truncate_then_append_diverges (d-A1): PRESENT
+guard law truncate_and_append_differ_on_a_written_path: PRESENT
+guard law echo_bytes_are_what_bash_writes (spaces + trailing newline): PRESENT
+guard law second_redirect_is_refused (one spec, fd 1): PRESENT
+guard A.2 check_dispatch.py + shir_native_stmt_dispatch.txt: PRESENT (mechanical, previous stage; re-run here)
+guard d-A2: non-folded writes leave the map stale (recorded, not fixed): PRESENT (stated)
+guard printf's byte side: DELEGATED to cluster E (shir_native_echo.rs)
+guard renderer, parser, filesystem beyond the path keys: OUT OF MODEL
+guard clusters F3, F4 and G* (perl quoting sub-forms): NOT THIS PROOF
+
+[counts]
+28 verified, 0 errors (verus --triggers-mode silent --rlimit 40 shir_native_files_invariant.rs)
+9 pins, all UNMIRRORED BY DESIGN: record_file_write has no source test (the
+  module's 8 tests cover other folds).
+
+mutants measured 2026-11-28 against proof sha 7099b4738ae5, each on a /tmp copy
+(the source untouched), proof sha re-checked afterwards:
+  M1  the record insert dropped (a dropped case)              24v/4e
+  M2  the `-w`/append gate always true                        25v/3e
+  M3  no space between echo words            rejected at simplification (pin_two_word_content)
+  M4  the trailing newline dropped          rejected at simplification (pin_one_word_content)
+  M5  the last write dropped from the log (one entry removed) 27v/1e
+  M6  a record also deletes key 0 (monotonicity broken)       23v/5e
+  M7  bash's append modelled as a truncate                    27v/1e
+  Every rejection was inspected: all are VERIFICATION failures (`assertion
+  failed` / `expression simplifies to …`), none a mutant-spelling compile error.
+  So five mutants fail a law with a count (dropped case, always-true guard,
+  one-entry-removed log, broken monotonicity, and a wrong shell-side append),
+  and the two content spellings are refuted at simplification.
+
+HONEST LIMITS, stated not claimed:
+  * The law is the map/disk equality over TRUNCATING programs. Programs with a
+    fold-refused or non-folded write to the same path are outside it (d-A2).
+  * printf's payload correctness is cluster E's, not re-proved here.
+  * The model keeps the path as an int key and the payload as opaque bytes; it
+    does not model path resolution, symlinks or the CWD.
+
+[exec]
+# NONE, by design: no source test covers record_file_write, so there is no test
+# to mirror and no [exec] row may be claimed. Evidence is the proof, the mutant
+# table above, and the bash run for d-A1 (`printf 'a\n' > f; printf 'b\n' >> f;
+# cat f` prints both lines, while the map keeps only the first).

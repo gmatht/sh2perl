@@ -45,8 +45,8 @@ CI actually runs Verus (`.github/workflows/verus.yml`): the pinned release
 invoked by `proofs/verus/ci_verify.sh` on every `*.rs` a pull request touches
 plus a fixed subset (`status_reads`, `status_reads_traversal`,
 `uae_terminators`, `affix_strip_fold`, `text_capture_fold`, `bc_float_clean`,
-`shir_native_herestring`, `shir_native_status_folds`). Any summary other
-than `N verified, 0 errors`
+`shir_native_herestring`, `shir_native_status_folds`,
+`shir_native_files_invariant`). Any summary other than `N verified, 0 errors`
 fails the job. The manifests' sha pins are checked separately by
 `check_sync.py` in `test.yml`; the two are complementary.
 
@@ -9562,6 +9562,49 @@ through a function neither side implements by calling the other.
   (its 8 tests cover other clusters), so **all 23 pins are UNMIRRORED by
   design** and no `[exec]` row exists; the evidence is the proof, the mutants,
   and the bash runs recorded in d-G1…d-G5.
+
+### Item A.1 — the `files` invariant (28 obligations, 9 model-level pins)
+
+    verus --triggers-mode silent --rlimit 40 proofs/verus/shir_native_files_invariant.rs
+    -> verification results:: 28 verified, 0 errors
+
+`transform` threads `files: HashMap<String,String>` through the dispatch:
+`record_file_write` notes the bytes a literal `echo/printf > P` leaves in `P`,
+and `native_cat_file_pipeline` later substitutes `cat P` with them. A wrong
+entry is not a lost rewrite but wrong output, so this is a soundness law.
+
+- **The two sides are different functions, and that is the theorem.** The
+  shell side models BOTH modes — `>` truncates, `>>` appends to what is there
+  (`bash_write`/`bash_disk`). The pass side models only the insert the source
+  performs, behind its `r.mode != "w"` gate (`rec_write`/`rec_map`).
+  `files_sound_on_truncating_programs` proves the map equals the disk at every
+  path by induction over the write log, with `files_sound_step` as the step and
+  `cat_reads_current_disk` as the substitution site.
+- **d-A1 is why the gate is required.** `> f` then `>> f` leaves the map
+  holding the first write while bash holds both:
+  `truncate_then_append_diverges`, with `append_is_refused_by_the_pass` and
+  `append_appends_to_what_is_there` as the two halves. So refusing an append is
+  load-bearing, not conservative — and once a fold-refused or non-folded write
+  touches a path, the entry is stale (d-A2, recorded not fixed: the map is a
+  syntactic cache, not a filesystem model).
+- **Monotonicity and content.** `record_keeps_every_other_key` /
+  `record_stores_the_payload` / `refused_write_changes_nothing` are
+  `files_monotone`; `echo_bytes_are_what_bash_writes` proves the recorded
+  content (single spaces, one trailing newline) against a separator-join
+  recursion, with `lemma_add_assoc` as the only supporting lemma.
+  `second_redirect_is_refused` is the one-spec, fd-1 gate.
+- **Mutants** (sha `7099b4738ae5`, each on a `/tmp` copy, source untouched):
+  the record insert dropped 24v/4e; the `-w` gate always true 25v/3e; the last
+  write dropped from the log 27v/1e; a record also deleting key 0 23v/5e;
+  bash's append modelled as a truncate 27v/1e; and the two content spelling
+  mutants (no space, no newline) refuted at simplification. All inspected as
+  verification failures, none a compile error. A.2 was re-run unchanged
+  (58/58 folds, 0 failures).
+- **Honest limits.** The law is the map/disk equality over truncating programs;
+  `printf`'s payload correctness is cluster E's law, not re-proved here; paths
+  are int keys and payloads opaque bytes (no resolution, symlinks or CWD).
+  `record_file_write` has no source test, so all 9 pins are **UNMIRRORED by
+  design** and no `[exec]` row exists.
 
 ## `shir_native_stmt.rs` — no single law; a decomposition plan (cluster C proved)
 
