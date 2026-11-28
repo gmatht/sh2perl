@@ -4419,10 +4419,32 @@ fn parse_parameter_expansion_content_inner(
     // Check for map keys: !map[@]
     if content.starts_with('!') && content.contains('[') && content.contains(']') {
         if let Some(bracket_start) = content.find('[') {
-            if let Some(_bracket_end) = content.rfind(']') {
+            if let Some(bracket_end) = content.rfind(']') {
                 let map_name = &content[1..bracket_start]; // Remove ! prefix
                                                            // This should return a Word::MapKeys, but we're in a ParameterExpansion context
                                                            // so we mark it with a special operator that the generator can recognize
+                                                           //
+                                                           // A SLICE after the subscript (`${!p*[@]:0:3}`) used to be
+                                                           // swallowed here: the operator was hard-coded to `[@]`
+                                                           // with no bounds, so the renderer never saw the `:0:3`
+                                                           // and could not report bash's "bad substitution" for the
+                                                           // `*` spelling. Carry the bounds through (a trailing `:`
+                                                           // on a legal `${!p[@]:0:2}` keeps them too).
+                let trailing = &content[bracket_end + 1..];
+                if let Some(spec) = trailing.strip_prefix(':') {
+                    let (off, len) = match spec.find(':') {
+                        Some(colon) => (&spec[..colon], Some(spec[colon + 1..].to_string())),
+                        None => (spec, None),
+                    };
+                    return Ok(ParameterExpansion {
+                        variable: format!("!{}", map_name),
+                        operator: ParameterExpansionOperator::ArraySlice(
+                            off.to_string(),
+                            len,
+                        ),
+                        is_mutable: true,
+                    });
+                }
                 return Ok(ParameterExpansion {
                     variable: format!("!{}", map_name), // Keep the ! prefix to indicate map keys
                     operator: ParameterExpansionOperator::ArraySlice("@".to_string(), None),

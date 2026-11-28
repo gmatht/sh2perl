@@ -7333,6 +7333,12 @@ fn param_to_fish(args: &[IrExpr], list: bool) -> Result<String, String> {
             if name.starts_with('#') {
                 return Ok(arr_len_fish(&name[1..]));
             }
+            // `${!prefix*[@]:0:3}` — an indirect NAME listing carrying a
+            // slice. bash rejects it, fish lists the names with its own
+            // builtins; the bounds do not change what the listing IS here.
+            if name.starts_with('!') {
+                return Ok(arr_keys_call_fish(arr_base(&name)));
+            }
             // fish has no substring expansion — emulate with cut
             // (char-exact for the ASCII corpus)
             if name == "@" || name == "*" {
@@ -10588,12 +10594,15 @@ fn for_item_to_fish(e: &IrExpr) -> Result<String, String> {
             if op == "slice" {
                 let base = raw_arg(args, 1)?;
                 let idx = raw_arg(args, 2).unwrap_or_default();
+                // A `!name` base is bash's indirect NAME listing, which fish
+                // spells with `set --names`; the subscript spelling (`[@]`,
+                // `*`) and a following slice (`:0:3`) do not change that
+                // here — this backend keeps the listing for all of them.
+                if base.starts_with('!') {
+                    return Ok(arr_keys_call_fish(arr_base(&base)));
+                }
                 if idx == "@" || idx == "*" {
-                    return Ok(if base.starts_with('!') {
-                        arr_keys_call_fish(arr_base(&base))
-                    } else {
-                        arr_expand_call_fish_list(arr_base(&base))
-                    });
+                    return Ok(arr_expand_call_fish_list(arr_base(&base)));
                 }
             }
             // the baked-name form (`arr[@]`) is the other spelling

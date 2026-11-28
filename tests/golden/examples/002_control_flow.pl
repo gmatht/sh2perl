@@ -44,7 +44,7 @@ for my $__i (("1", "2", "3", "4", "5")) {
 while (int(__sh_num($i)) < int(10)) {
     say "Counter: " . __sh_str(($i));
     $? = 0 << 8;
-        $i = int((__sh_num($i) + 1));
+        $i = int((__sh_num(__sh_num($i)) + __sh_num(1)));
 }
 sub greet {
     local @__sh_args = @_;

@@ -238,7 +238,7 @@ $? = 0 << 8; $CHILD_ERROR = $? >> 8;
 $n = "0";
 my $__sh_loop_rc0 = 0;
 while (int(__sh_num($n)) < int(2)) {
-    $n = int((__sh_num($n) + 1));
+    $n = int((__sh_num(__sh_num($n)) + __sh_num(1)));
     $? = 1 << 8; $CHILD_ERROR = $? >> 8;
     $__sh_loop_rc0 = $? >> 8;
 }
@@ -248,7 +248,7 @@ $? = 0 << 8; $CHILD_ERROR = $? >> 8;
 $m = "0";
 my $__sh_loop_rc1 = 0;
 while (!(int(__sh_num($m)) >=int(1))) {
-    $m = int((__sh_num($m) + 1));
+    $m = int((__sh_num(__sh_num($m)) + __sh_num(1)));
     $? = 0 << 8; $CHILD_ERROR = $? >> 8;
     $__sh_loop_rc1 = $? >> 8;
 }

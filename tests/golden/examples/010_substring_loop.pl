@@ -32,7 +32,7 @@ $len = "10";
 while (int(__sh_num($i)) < int(__sh_num($len))) {
     $ch = substr($s, $i, 1);
 printf("%s", __sh_str($ch));
-        $i = int((__sh_num($i) + 1));
+        $i = int((__sh_num(__sh_num($i)) + __sh_num(1)));
 }
 print "\n";
 $? = 0 << 8;

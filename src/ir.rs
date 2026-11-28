@@ -2735,7 +2735,17 @@ fn emit_stmt_owned(out: &mut String, stmt: &IrStmt, indent: usize) {
                     Sigil::Array => format!("@{}", name),
                     Sigil::Hash => format!("%{}", name),
                 };
-                out.push_str(&format!("my ${} = {};\n", save, var));
+                // Save in the variable's OWN sigil: a subshell copy of a
+                // hash through a scalar (`my $save = %h`) keeps only the
+                // element COUNT and the restore re-pairs a flattened list,
+                // which is Perl's `Odd number of elements in hash
+                // assignment` and then a corrupt hash (063_hard_to_parse).
+                let save_decl = match sigil {
+                    Sigil::Scalar => format!("my ${} = {};", save, var),
+                    Sigil::Array => format!("my @{} = {};", save, var),
+                    Sigil::Hash => format!("my %{} = {};", save, var),
+                };
+                out.push_str(&format!("{save_decl}\n"));
                 saves.push((name.clone(), save, sigil.clone()));
             }
             for s in body.iter() {
@@ -2748,7 +2758,12 @@ fn emit_stmt_owned(out: &mut String, stmt: &IrStmt, indent: usize) {
                     Sigil::Array => format!("@{}", name),
                     Sigil::Hash => format!("%{}", name),
                 };
-                out.push_str(&format!("{} = ${};\n", var, save));
+                let save_value = match sigil {
+                    Sigil::Scalar => format!("${}", save),
+                    Sigil::Array => format!("@{}", save),
+                    Sigil::Hash => format!("%{}", save),
+                };
+                out.push_str(&format!("{} = {};\n", var, save_value));
             }
             emit_indent(out, indent);
             out.push_str("}\n");
@@ -4144,6 +4159,11 @@ fn emit_stmt_owned(out: &mut String, stmt: &IrStmt, indent: usize) {
             //    (parse-dollar-in-arithmetic), where the unguarded form
             //    printed a coerced 0 and reported success.
             if target.is_none() && expr.contains("SH2BADSUBST") {
+                // The expansion must still be EVALUATED — its `print STDERR
+                // …: bad substitution` is inside the value — but the print
+                // itself is abandoned (bash runs no command at all).
+                emit_indent(out, indent);
+                out.push_str(&format!("{{ my $__sh2_badsubst = {expr}; }}\n"));
                 emit_indent(out, indent);
                 out.push_str(&rc_write("$main_exit_code = $CHILD_ERROR = 1;\n"));
             } else if target.is_none() && expr.contains("$__SH2_AE = 1") {
@@ -4378,18 +4398,30 @@ fn emit_stmt_owned(out: &mut String, stmt: &IrStmt, indent: usize) {
                                 // — the estree runtime's `assign` does the
                                 // same (`getVar + v`). Perl's `+=` would
                                 // coerce both sides to numbers.
+                                // The LHS read is a TEXT read: bash's `+=` on
+                                // an unset variable concatenates onto the
+                                // empty string, Perl's `.` on undef warns
+                                // (`Use of uninitialized value $y in
+                                // concatenation`, examples/051_primes).
                                 let rhs = ir_expr_to_perl(&value);
                                 let lhs = perl_lhs_for(&inner);
-                                out.push_str(&format!("{} = {} . {};\n", lhs, lhs, rhs));
+                                out.push_str(&format!(
+                                    "{} = __sh_str({}) . {};\n",
+                                    lhs, lhs, rhs
+                                ));
                             } else {
-                                // The numeric ops (`-=`, `*=`, `/=`) are the
-                                // same in both languages — Perl's operator
-                                // is numeric like bash's on an integer.
+                                // The numeric ops (`-=`, `*=`, `/=`, `%=`,
+                                // `<<=`, `>>=`) are the same in both
+                                // languages on an integer, but the LHS is an
+                                // ARITHMETIC read: bash's arithmetic evaluator
+                                // reads an unset (or non-numeric) variable as
+                                // 0, where Perl warns and reads undef/0.
                                 let rhs = ir_expr_to_perl(&value);
                                 out.push_str(&format!(
-                                    "{} {} {};\n",
+                                    "{} = __sh_num({}) {} ({});\n",
                                     perl_lhs_for(&inner),
-                                    op,
+                                    perl_lhs_for(&inner),
+                                    op.trim_end_matches('='),
                                     rhs
                                 ));
                             }
@@ -6221,12 +6253,17 @@ fn arith_ast_to_perl(ast: &ArithAst) -> String {
                 // division/+` for every later use, which bash never prints
                 // (063_hard_to_parse). 0 is also what bash's arithmetic gives
                 // an operand it could not evaluate.
+                // Both operands go through `__sh_num`: a SUB-expression that
+                // already failed leaves '' here, and Perl's `'' / 0` warns
+                // `Argument "" isn't numeric in division` where bash reads
+                // an uncomputable operand as 0 and only reports the divisor
+                // (063_hard_to_parse).
                 "/" => format!(
-                    "(do {{ my $__d = {}; eval {{ int(({}) / ($__d)) }} // '' }})",
+                    "(do {{ my $__d = __sh_num({}); eval {{ int((__sh_num({})) / ($__d)) }} // '' }})",
                     r, l
                 ),
                 "%" => format!(
-                    "(do {{ my $__d = {}; eval {{ int(({})) % ($__d) }} // '' }})",
+                    "(do {{ my $__d = __sh_num({}); eval {{ int((__sh_num({}))) % ($__d) }} // '' }})",
                     r, l
                 ),
                 // Perl's bitwise ops are STRING ops when an operand is a
@@ -6234,6 +6271,15 @@ fn arith_ast_to_perl(ast: &ArithAst) -> String {
                 // string-ORs to "78" and warns "Argument "^E" isn't numeric".
                 // bash arithmetic is always integer, so force numeric context
                 // with `0+` (063_01 then printed 78 instead of 79).
+                // A sub-expression that FAILED (a zero divisor leaves '') is
+                // an operand here: bash reads it as 0, Perl's `+`/`-`/`*` on
+                // '' warns `Argument "" isn't numeric in addition`
+                // (063_hard_to_parse). Leaves are already `__sh_num`-coerced;
+                // this covers the composite ones.
+                "+" | "-" | "*" => format!(
+                    "(__sh_num({}) {} __sh_num({}))",
+                    l, op, r
+                ),
                 "&" => format!("((0+{}) & (0+{}))", l, r),
                 "|" => format!("((0+{}) | (0+{}))", l, r),
                 "^" => format!("((0+{}) ^ (0+{}))", l, r),
@@ -6871,6 +6917,7 @@ fn render_param(args: &[IrExpr]) -> String {
                 .get(2)
                 .and_then(call_arg_str)
                 .unwrap_or_else(|| "0".to_string());
+            let raw_len = args.get(3).and_then(call_arg_str).unwrap_or_default();
             // bash rejects `${!name*[@]}` ENTIRELY — the `*` spelling of a
             // key list is always "bad substitution" (measured: both
             // `${!p*[@]}` and `${!p*[@]:0:1}` fail, while `${!p[@]}` is
@@ -6894,16 +6941,33 @@ fn render_param(args: &[IrExpr]) -> String {
                 // The expansion text is DATA: escape `$` so Perl does not
                 // interpolate it (`${{!prefix*}:@}` compiled to a bareword
                 // `prefix` and aborted the whole FILE).
-                let shown = format!("${{{}}}:{}", name, raw_off).replace('$', "\\$");
+                // Rebuild the expansion as the SOURCE spelled it (the `*` is
+                // in the name, the bounds — when the frontend carried them —
+                // in the offset/length args): bash quotes the whole expansion
+                // in its diagnostic.
+                let mut shown = format!("${{{}[@]", name);
+                if raw_off != "@" || !raw_len.is_empty() {
+                    shown.push(':');
+                    shown.push_str(if raw_off == "@" { "0" } else { &raw_off });
+                    if !raw_len.is_empty() {
+                        shown.push(':');
+                        shown.push_str(&raw_len);
+                    }
+                }
+                shown.push('}');
+                let shown = shown.replace('$', "\\$");
                 // `BAD_SUBST_MARKER` prefixes the value so a statement that
                 // renders it can suppress its own output (bash abandons the
                 // command entirely); see `emit_echo`.
+                // bash's prefix is `<script>: line N:` — the line number is
+                // the EMITTED line here (`__LINE__`), not the `.sh` line; real
+                // source-line tracking does not exist in the IR yet, and the
+                // harnesses normalise the digits.
                 return format!(
-                    "(do {{ print STDERR \"$0: {shown}: bad substitution\\n\"; \
+                    "(do {{ print STDERR \"$0: line \" . __LINE__ . \": {shown}: bad substitution\\n\"; \
 \"\x01SH2BADSUBST\x01\" }})"
                 );
             }
-            let raw_len = args.get(3).and_then(call_arg_str).unwrap_or_default();
             // `${@:off:len}` / `${*:off:len}` — a 1-based slice of the
             // positional parameters (a LIST, not a scalar substring).
             if name == "@" || name == "*" {
@@ -11631,10 +11695,12 @@ fn emit_echo(out: &mut String, words: &[&IrExpr], indent: usize) {
     // expansion printed its diagnostic and the whole command is abandoned,
     // so `echo` must emit NOTHING (not even the newline). The renderer marks
     // that value; skip the statement entirely when it is present.
-    if args.iter().any(|a| {
-        let t = ir_expr_to_perl(a);
-        t.contains("SH2BADSUBST")
-    }) {
+    let badsubst: Vec<String> = args
+        .iter()
+        .map(|a| ir_expr_to_perl(a))
+        .filter(|t| t.contains("SH2BADSUBST"))
+        .collect();
+    if !badsubst.is_empty() {
         // …but the ABANDONED command still leaves $? = 1 (measured:
         // `echo A; echo "${!p*[@]:0:3}"; echo "status=$?"` prints
         // `status=1`). Without this write the program exited with the stale
@@ -11642,6 +11708,17 @@ fn emit_echo(out: &mut String, words: &[&IrExpr], indent: usize) {
         // bad substitution reported 0 where bash reports 1 (063_04).
         // Emitting the status alone is also correct mid-script: the next
         // statement overwrites both vars, exactly as bash does.
+        // The diagnostic lives INSIDE the marked value (a `do { print STDERR
+        // … }`), so it only appears if the expansion is EVALUATED. Skipping
+        // the statement outright printed nothing at all — bash prints `bad
+        // substitution` and no command output (063_04).
+        for t in &badsubst {
+            emit_indent(out, indent);
+            // Bound, not bare: a value in void context is Perl's `Useless use
+            // of … in void context` warning, and the block keeps repeated
+            // statements from masking each other's declaration.
+            out.push_str(&format!("{{ my $__sh2_badsubst = {t}; }}\n"));
+        }
         emit_indent(out, indent);
         out.push_str(&rc_write("$main_exit_code = $CHILD_ERROR = 1;\n"));
         return;

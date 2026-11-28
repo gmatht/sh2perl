@@ -234,13 +234,13 @@ if (((sub { open(my $__gh, '<', '/etc/passwd') or return 0; local $/; my $__gc =
     }
 $n = "0";
 while (int(__sh_num($n)) < int(2)) {
-    $n = int((__sh_num($n) + 1));
+    $n = int((__sh_num(__sh_num($n)) + __sh_num(1)));
     say "while test: " . __sh_str(($n));
     $? = 0 << 8; $CHILD_ERROR = $? >> 8;
     }
 $m = "0";
 while (!(int(__sh_num($m)) >=int(2))) {
-    $m = int((__sh_num($m) + 1));
+    $m = int((__sh_num(__sh_num($m)) + __sh_num(1)));
     say "until test: " . __sh_str(($m));
     $? = 0 << 8; $CHILD_ERROR = $? >> 8;
     }
@@ -248,7 +248,7 @@ do { my $__ok = 1; for my $__t ('cond-flag.txt') { if (open(my $__h, '>>', $__t)
 $i = "0";
 while (!((system('bash', '-c', q{'grep' '-q' 'x' 'cond-flag.txt' 2> '/dev/null'}) == 0))) {
     __sh_pipe_run(q{echo 'x' >> 'cond-flag.txt'}, "pipefail");
-    $i = int((__sh_num($i) + 1));
+    $i = int((__sh_num(__sh_num($i)) + __sh_num(1)));
     say "while command: " . __sh_str(($i));
     $? = 0 << 8; $CHILD_ERROR = $? >> 8;
     }

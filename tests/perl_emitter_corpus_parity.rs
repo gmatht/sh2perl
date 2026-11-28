@@ -1447,8 +1447,44 @@ fn temp_base(tag: &str) -> (PathBuf, PathBuf) {
 /// `$0` semantics are right; the staging gave the two programs different names.
 /// Setting `$0` to the script path is the only change made to the run, and it
 /// can only expose more (never hide) a difference.
-fn run_render(perl_text: &str, tag: &str) -> (Observation, PathBuf) {
+/// A fixture that runs a SIBLING example (`bash examples/005_args.sh one`) needs
+/// that path to exist under the run's working directory. `tests/bash-parity.sh`
+/// copies `examples/` into the working dir for exactly these scripts; without
+/// the same staging here, bash failed to find the sibling and the render did
+/// not — a difference in the HARNESS, recorded as a bash-diff (056_send_args).
+/// The copy is driven by the SOURCE text, so nothing else pays for it.
+fn stage_siblings(source: &str, work: &Path) {
+    if !source.contains("examples/") {
+        return;
+    }
+    let src = root().join("examples");
+    let dst = work.join("examples");
+    let _ = std::fs::remove_dir_all(&dst);
+    copy_dir(&src, &dst);
+}
+
+fn copy_dir(src: &Path, dst: &Path) {
+    if std::fs::create_dir_all(dst).is_err() {
+        return;
+    }
+    let Ok(entries) = std::fs::read_dir(src) else {
+        return;
+    };
+    for e in entries.flatten() {
+        let from = e.path();
+        let to = dst.join(e.file_name());
+        if from.is_dir() {
+            copy_dir(&from, &to);
+        } else if std::fs::copy(&from, &to).is_err() {
+            // A missing sibling is a staging limitation, not a render result;
+            // the comparison below still has to stand on its own.
+        }
+    }
+}
+
+fn run_render(perl_text: &str, tag: &str, source: &str) -> (Observation, PathBuf) {
     let (base, work) = temp_base(tag);
+    stage_siblings(source, &work);
     std::fs::write(work.join("x.pl"), perl_text).expect("write render");
     let obs = observe(run_timed(&["perl", "x.pl"], &work, 20), &base);
     (obs, base)
@@ -1486,9 +1522,11 @@ fn first_diff(a: &str, b: &str) -> String {
 }
 
 fn observe_behaviour(script: &Path, bare: &str, fixed: &str) -> Result<&'static str, String> {
-    let (bo, bbase) = run_render(bare, "sh2b");
-    let (fo, fbase) = run_render(fixed, "sh2b");
+    let source = std::fs::read_to_string(script).unwrap_or_default();
+    let (bo, bbase) = run_render(bare, "sh2b", &source);
+    let (fo, fbase) = run_render(fixed, "sh2b", &source);
     let (bash_base, bash_work) = temp_base("sh2b");
+    stage_siblings(&source, &bash_work);
     let bash = observe(
         run_timed(&["bash", &script.to_string_lossy()], &bash_work, 10),
         &bash_base,
@@ -1500,10 +1538,13 @@ fn observe_behaviour(script: &Path, bare: &str, fixed: &str) -> Result<&'static 
     // only ever applies to bash's own unreproducible stream.
     let allowance = stderr_allowance(script);
     let racy = racy_render(script);
-    let agree = if racy.is_some() {
-        bo.rc == fo.rc && bo.out == fo.out
-    } else {
-        renders_agree(&bo, &fo)
+    let agree = match racy {
+        Some(r) => {
+            bo.rc == fo.rc
+                && (r.stdout || bo.out == fo.out)
+                && (r.stderr || bo.err == fo.err)
+        }
+        None => renders_agree(&bo, &fo),
     };
     if !agree {
         return Err(format!(
@@ -1556,27 +1597,47 @@ const NONDETERMINISTIC_STDERR: &[(&str, &str)] = &[
     ),
 ];
 
-/// Scripts whose RENDER is measurably not reproducible in stderr, with the
-/// measurement that earned the exemption. For these, render-vs-render compares
-/// stdout and the exit status only; the bash comparison still checks the stderr
-/// byte MULTISET, so a diagnostic that only one side emits still fails.
-///
-/// Measured: `063_hard_to_parse.sh` delegates `grep … | head …` to one shell and
-/// both children report to fd 2, so the two renders of the SAME emitted program
-/// produced different stderr bytes across 10 consecutive runs (observed
-/// `grep: : No such file or directory` and `grep: head: invalid number of
-/// lines: ` — the writers' bytes MIX mid-line, so even the multiset differs).
-const RACY_RENDER_STDERR: &[(&str, &str)] = &[(
-    "examples/063_hard_to_parse.sh",
-    "measured: 2+ distinct stderr byte strings across 10 runs of the same render; two writers to fd 2 mix mid-line",
-)];
+/// A render-vs-render field that a script's OWN OUTPUT makes uncomparable,
+/// with the measurement that earned the exemption. The bash comparison is not
+/// affected: it still compares every field (so the ledger token is unchanged).
+struct RacyRender {
+    path: &'static str,
+    why: &'static str,
+    /// stdout differs between two runs of the SAME program
+    stdout: bool,
+    /// stderr differs between two runs of the SAME program
+    stderr: bool,
+}
 
-fn racy_render(script: &Path) -> Option<&'static str> {
+/// Measured, over 10 consecutive runs of each script:
+///
+/// * `063_hard_to_parse.sh` delegates `grep … | head …` to one shell and both
+///   children report to fd 2, so two renders of the same emitted program
+///   produced different stderr bytes (observed `grep: : No such file or
+///   directory` and `grep: head: invalid number of lines: ` — the writers'
+///   bytes MIX mid-line, so even the multiset differs).
+/// * `062_hard_to_lex.sh` runs `ls -la` on its working directory: the `ls -l`
+///   line for `.` carries that directory's SIZE and mtime, which differ between
+///   two staging dirs by construction (one holds `x.pl`, the other does not),
+///   and the mtime differs whenever the two runs straddle a minute boundary.
+const RACY_RENDER: &[RacyRender] = &[
+    RacyRender {
+        path: "examples/063_hard_to_parse.sh",
+        why: "measured: 2+ distinct stderr byte strings across 10 runs of the same render; two writers to fd 2 mix mid-line",
+        stdout: false,
+        stderr: true,
+    },
+    RacyRender {
+        path: "examples/062_hard_to_lex.sh",
+        why: "measured: run-wide `ls -la` of its own working dir — the `.` entry's size and mtime are properties of the staging dir, and the mtime changed across two runs that straddled a minute boundary",
+        stdout: true,
+        stderr: false,
+    },
+];
+
+fn racy_render(script: &Path) -> Option<&'static RacyRender> {
     let want = script.to_string_lossy();
-    RACY_RENDER_STDERR
-        .iter()
-        .find(|(p, _)| want.ends_with(p))
-        .map(|(_, why)| *why)
+    RACY_RENDER.iter().find(|r| want.ends_with(r.path))
 }
 
 fn stderr_allowance(script: &Path) -> Option<&'static str> {
@@ -1830,7 +1891,11 @@ fn ledger_covers_both_directions() {
 #[test]
 fn stderr_allowances_are_measured_and_current() {
     let ledger = read_ledger(&root().join(LEDGER));
-    for (path, why) in NONDETERMINISTIC_STDERR.iter().chain(RACY_RENDER_STDERR) {
+    let allowances = NONDETERMINISTIC_STDERR
+        .iter()
+        .map(|(p, why)| (*p, *why))
+        .chain(RACY_RENDER.iter().map(|r| (r.path, r.why)));
+    for (path, why) in allowances {
         assert!(
             root().join(path).is_file(),
             "allowance names a script that does not exist: {path}"
@@ -1840,8 +1905,8 @@ fn stderr_allowances_are_measured_and_current() {
             "{path}: allowance carries no measurement, only {why:?}"
         );
         assert!(
-            ledger.contains_key(*path),
-            "{path}: stderr allowance is stale — the script is no longer an observed divergence"
+            ledger.contains_key(path),
+            "{path}: allowance is stale — the script is no longer an observed divergence"
         );
     }
 }

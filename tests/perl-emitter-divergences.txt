@@ -137,9 +137,9 @@ examples/047_for_arithematic.sh	output-idiom	render-eq+bash-eq	2
 examples/048_subprocess.sh	output-idiom	render-eq+bash-eq	2
 examples/049_local.sh	output-idiom	render-eq+bash-eq	8
 examples/050_test_ls_star_dot_sh.sh	output-idiom,runtime-seam	render-eq+bash-eq	2
-examples/051_primes.sh	output-idiom,slice-helper	render-eq+bash-diff	6
+examples/051_primes.sh	output-idiom,slice-helper	render-eq+bash-eq	6
 examples/055_factorize.sh	output-idiom	render-eq+bash-eq	2
-examples/056_send_args.sh	output-idiom	render-eq+bash-diff	2
+examples/056_send_args.sh	output-idiom	render-eq+bash-eq	2
 examples/057_case.sh	output-idiom,runtime-seam	render-eq+bash-eq	20
 examples/058_advanced_bash_idioms.sh	output-idiom,runtime-seam	render-eq+bash-eq	34
 examples/060_issue5.sh	output-idiom	render-eq+bash-eq	2
@@ -160,7 +160,7 @@ examples/062_15_complex_local_variables.sh	output-idiom	render-eq+bash-eq	6
 examples/062_hard_to_lex.sh	output-idiom,runtime-seam	render-eq+bash-diff	42
 examples/063_01_deeply_nested_arithmetic.sh	output-idiom	render-eq+bash-eq	2
 examples/063_03_nested_command_substitutions.sh	output-idiom	render-eq+bash-eq	6
-examples/063_04_complex_parameter_expansion.sh	output-idiom,slice-helper	render-eq+bash-diff	4
+examples/063_04_complex_parameter_expansion.sh	output-idiom,slice-helper	render-eq+bash-eq	4
 examples/063_06_complex_pipeline_background.sh	output-idiom	render-eq+bash-eq	2
 examples/063_09_complex_function_parameter_handling.sh	output-idiom	render-eq+bash-eq	2
 examples/063_10_complex_for_loop.sh	output-idiom	render-eq+bash-eq	2
