@@ -13,7 +13,7 @@
 // agree; where they do not, the divergence is PROVED (d-F4-1, d-F4-2) rather
 // than left as a comment.
 //
-// Proved here (94 obligations, 0 errors):
+// Proved here (115 obligations, 0 errors):
 //   xargs_appends_the_input_word — the general agreement law: `echo CONTENT |
 //                                xargs echo A B` joins A, B, CONTENT exactly the
 //                                way `echo` joins the command's argv with the
@@ -29,6 +29,24 @@
 //   comm_12_one_common_line      the emitted `-12` walk prints an equal line once
 //                                and advances BOTH cursors (the double advance,
 //                                which is what makes duplicates print once)
+//   comm_12_is_the_intersection  d-F4-4: the general `-12` law over two sorted
+//                                files — a line is printed IF AND ONLY IF both
+//                                files hold it (`comm_12_only_common` for the
+//                                implication, `comm_12_complete` for the
+//                                converse). Soundness needs NO sortedness: an
+//                                unsorted input can make the walk MISS a common
+//                                line, never invent one. Completeness is where
+//                                the ordered-membership invariants live —
+//                                `lemma_lex_trans`/`lemma_lex_trichotomy` make
+//                                lexicographic order a linear order,
+//                                `lemma_sorted_from` says a line never comes
+//                                after a later one in a sorted list, and that is
+//                                what licenses dropping `a[i]` when it is below
+//                                `b[j]`. `mem_from` is membership from a cursor,
+//                                so the law is about indices, not `==` on lists.
+//                                Multiplicity is NOT this law: M2 (below) shows a
+//                                duplicate is invisible to it, which is why the
+//                                exact-output pins are load-bearing.
 //   diff_identical_inputs_are_silent — d-F4-5: on equal files the backtrack only
 //                                takes the prefix-match branch, so no hunk is
 //                                opened and nothing is printed; the DP diagonal
@@ -69,8 +87,6 @@
 //                                checked by `decode_flags` pins.
 //
 // NOT proved, stated plainly rather than papered over:
-//   * the general `comm -12` intersection law over two distinct sorted files —
-//     needs ordered-membership invariants for the two-pointer walk (d-F4-4).
 //   * diff's output beyond silence — d-F4-5b: the converse ("a change always
 //     prints") and the byte-level hunks. Both need an invariant relating the
 //     backtrack's cursors to prefix equality (`a[0..i] == b[0..j]`), i.e.
@@ -251,6 +267,500 @@ pub proof fn comm_12_one_common_line(x: Word, a_tail: Seq<Word>, b_tail: Seq<Wor
     assert(!lex_lt(x, x));
 }
 
+
+// ──────────────────────── §2b  d-F4-4: the general `-12` intersection ──────
+//
+// The one-line law above is a single step of the walk. The general claim needs
+// what it does not: that the walk finds EVERY line the two files share. That is
+// an ordered-membership argument — at `a[i] < b[j]` we drop `a[i]`, and the
+// only way that is safe is that `a[i]` cannot also occur later in `b`, because
+// `b` is sorted and `b[j]` already exceeds it. So the order properties come
+// first (`lemma_lex_trans`, `lemma_lex_trichotomy`, the `sorted` chain), then
+// the two directions of the intersection.
+
+/// Lexicographic order is TRANSITIVE. The completeness argument steps from
+/// `a[i] < b[j]` to `a[i] < b[k]` for a later `b` line, and that step is this.
+pub proof fn lemma_lex_trans(x: Word, y: Word, z: Word)
+    requires
+        lex_lt(x, y),
+        lex_lt(y, z),
+    ensures
+        lex_lt(x, z),
+    decreases x.len(),
+{
+    reveal(lex_lt);
+    if x.len() == 0 {
+        assert(y.len() > 0);
+        assert(z.len() > 0);
+    } else if y.len() == 0 {
+        assert(false);
+    } else if z.len() == 0 {
+        assert(false);
+    } else if x[0] != y[0] {
+        assert(x[0] < y[0]);
+        if y[0] != z[0] {
+            assert(y[0] < z[0]);
+        }
+        assert(x[0] != z[0]);
+        assert(x[0] < z[0]);
+    } else {
+        assert(x[0] == y[0]);
+        if y[0] != z[0] {
+            assert(y[0] < z[0]);
+            assert(x[0] != z[0]);
+            assert(x[0] < z[0]);
+        } else {
+            assert(x.skip(1).len() < x.len());
+            lemma_lex_trans(x.skip(1), y.skip(1), z.skip(1));
+        }
+    }
+}
+
+/// Lexicographic order is TOTAL: two lines are ordered, or they are the same
+/// line. Every `sorted` argument below splits a case with this.
+pub proof fn lemma_lex_trichotomy(x: Word, y: Word)
+    ensures
+        lex_lt(x, y) || lex_lt(y, x) || x == y,
+    decreases x.len(),
+{
+    reveal(lex_lt);
+    if x.len() == 0 {
+    } else if y.len() == 0 {
+    } else if x[0] != y[0] {
+        if x[0] < y[0] {
+        } else {
+            assert(y[0] < x[0]);
+        }
+    } else {
+        assert(x.skip(1).len() < x.len());
+        lemma_lex_trichotomy(x.skip(1), y.skip(1));
+        if x.skip(1) == y.skip(1) {
+            assert(x =~= seq![x[0]] + x.skip(1));
+            assert(y =~= seq![y[0]] + y.skip(1));
+            assert(x =~= y);
+        }
+    }
+}
+
+/// The non-strict order: `x` is not after `y`. `sorted` is written in these
+/// terms, so the chain below is too.
+pub open spec fn le_lex(x: Word, y: Word) -> bool {
+    !lex_lt(y, x)
+}
+
+pub proof fn lemma_le_refl(x: Word)
+    ensures
+        le_lex(x, x),
+{
+    lemma_lex_not_lt(x);
+}
+
+/// `sorted` plus transitivity: a line never descends against a later one.
+pub proof fn lemma_le_trans(x: Word, y: Word, z: Word)
+    requires
+        le_lex(x, y),
+        le_lex(y, z),
+    ensures
+        le_lex(x, z),
+{
+    lemma_lex_trichotomy(x, y);
+    if x == y {
+        assert(le_lex(z, x) == le_lex(z, y));
+    } else if lex_lt(x, y) {
+        if lex_lt(z, x) {
+            lemma_lex_trans(z, x, y);
+        }
+    }
+}
+
+/// Strict below the first, non-strict below the second.
+pub proof fn lemma_lt_le_trans(x: Word, y: Word, z: Word)
+    requires
+        lex_lt(x, y),
+        le_lex(y, z),
+    ensures
+        lex_lt(x, z),
+{
+    lemma_lex_trichotomy(y, z);
+    if y == z {
+        assert(lex_lt(x, z) == lex_lt(x, y));
+    } else if lex_lt(y, z) {
+        lemma_lex_trans(x, y, z);
+    }
+}
+
+/// Non-strict below the first, strict below the second.
+pub proof fn lemma_le_lt_trans(x: Word, y: Word, z: Word)
+    requires
+        le_lex(x, y),
+        lex_lt(y, z),
+    ensures
+        lex_lt(x, z),
+{
+    lemma_lex_trichotomy(x, y);
+    if x == y {
+        assert(lex_lt(x, z) == lex_lt(y, z));
+    } else if lex_lt(x, y) {
+        lemma_lex_trans(x, y, z);
+    }
+}
+
+/// Every tail of a sorted list is sorted.
+pub proof fn lemma_sorted_skip(ys: Seq<Word>, p: int)
+    requires
+        sorted(ys),
+        0 <= p <= ys.len(),
+    ensures
+        sorted(ys.skip(p)),
+    decreases p,
+{
+    if p == 0 {
+        assert(ys.skip(0) =~= ys);
+    } else if ys.len() <= 1 {
+        assert(ys.skip(p).len() == 0);
+        lemma_sorted_unfold(ys.skip(p));
+    } else {
+        lemma_sorted_tail(ys);
+        assert(ys.skip(1).skip(p - 1) =~= ys.skip(p));
+        lemma_sorted_skip(ys.skip(1), p - 1);
+    }
+}
+
+/// **The ordered-membership invariant.** In a sorted list, a line never comes
+/// after a later one — this is what lets the walk drop `a[i]` when `a[i]`
+/// is already below `b[j]`.
+pub proof fn lemma_sorted_from(ys: Seq<Word>, j: int, k: int)
+    requires
+        sorted(ys),
+        0 <= j <= k < ys.len(),
+    ensures
+        le_lex(ys[j], ys[k]),
+    decreases k - j,
+{
+    if k == j {
+        lemma_le_refl(ys[j]);
+    } else {
+        lemma_sorted_from(ys, j, k - 1);
+        lemma_sorted_adj(ys, k - 1);
+        lemma_le_trans(ys[j], ys[k - 1], ys[k]);
+    }
+}
+
+/// Index-based membership from a cursor: "one of the lines at `i` or after".
+pub open spec fn mem_from(s: Seq<Word>, i: int, w: Word) -> bool {
+    exists|k: int| i <= k < s.len() && s[k] == w
+}
+
+pub proof fn lemma_mem_from_head(s: Seq<Word>, i: int)
+    requires
+        0 <= i < s.len(),
+    ensures
+        mem_from(s, i, s[i]),
+{
+}
+
+pub proof fn lemma_mem_from_weaken(s: Seq<Word>, i: int, i2: int, w: Word)
+    requires
+        i <= i2,
+        mem_from(s, i2, w),
+    ensures
+        mem_from(s, i, w),
+{
+}
+
+/// A line that is not the one AT the cursor lives further down the list.
+pub proof fn lemma_mem_from_split(s: Seq<Word>, i: int, w: Word)
+    requires
+        mem_from(s, i, w),
+        0 <= i < s.len(),
+        s[i] != w,
+    ensures
+        mem_from(s, i + 1, w),
+{
+    let k = choose|k: int| i <= k < s.len() && s[k] == w;
+    assert(k >= i);
+    if k == i {
+        assert(s[k] == s[i]);
+    }
+    assert(k >= i + 1);
+}
+
+/// Membership in a list with a prepended line.
+pub proof fn lemma_mem_from_cons(x: Word, rest: Seq<Word>, w: Word)
+    requires
+        mem_from(seq![x] + rest, 0, w),
+    ensures
+        w == x || mem_from(rest, 0, w),
+{
+    let k = choose|k: int| 0 <= k < (seq![x] + rest).len() && (seq![x] + rest)[k] == w;
+    if k == 0 {
+        assert((seq![x] + rest)[0] == x);
+    } else {
+        assert((seq![x] + rest)[k] == rest[k - 1]);
+        assert(mem_from(rest, 0, w)) by {
+            assert(0 <= k - 1 < rest.len());
+        }
+    }
+}
+
+/// Membership survives prepending a line: the witness index moves by one.
+pub proof fn lemma_mem_from_push(x: Word, rest: Seq<Word>, w: Word)
+    requires
+        mem_from(rest, 0, w),
+    ensures
+        mem_from(seq![x] + rest, 0, w),
+{
+    let k = choose|k: int| 0 <= k < rest.len() && rest[k] == w;
+    assert((seq![x] + rest)[k + 1] == w);
+    assert(0 <= k + 1 < (seq![x] + rest).len());
+}
+
+/// No line is "at position `i` or after" once the cursor is past the end.
+pub proof fn lemma_mem_from_past_end(s: Seq<Word>, i: int, w: Word)
+    requires
+        i >= s.len(),
+    ensures
+        !mem_from(s, i, w),
+{
+    if mem_from(s, i, w) {
+        let k = choose|k: int| i <= k < s.len() && s[k] == w;
+        assert(false);
+    }
+}
+
+/// **Soundness of the walk.** Everything `comm -12` prints is a line both files
+/// have — with no hypothesis on the files at all: an UNSORTED input can make the
+/// walk miss a common line, but it can never invent one.
+pub proof fn comm_12_only_common(a: Seq<Word>, b: Seq<Word>, i: int, j: int)
+    requires
+        0 <= i <= a.len(),
+        0 <= j <= b.len(),
+    ensures
+        forall|w: Word| mem_from(merge(a, b, i, j), 0, w) ==> mem_from(a, i, w)
+            && mem_from(b, j, w),
+    decreases (a.len() - i) + (b.len() - j),
+{
+    reveal(merge);
+    if i >= a.len() || j >= b.len() {
+        assert(merge(a, b, i, j) == Seq::empty());
+        assert forall|w: Word| mem_from(merge(a, b, i, j), 0, w) implies mem_from(a, i, w)
+            && mem_from(b, j, w) by {
+            assert(!mem_from(Seq::empty(), 0, w));
+        }
+    } else if lex_lt(a[i], b[j]) {
+        assert(merge(a, b, i, j) == merge(a, b, i + 1, j));
+        comm_12_only_common(a, b, i + 1, j);
+        assert forall|w: Word| mem_from(merge(a, b, i, j), 0, w) implies mem_from(a, i, w)
+            && mem_from(b, j, w) by {
+            lemma_mem_from_weaken(a, i, i + 1, w);
+        }
+    } else if lex_lt(b[j], a[i]) {
+        assert(merge(a, b, i, j) == merge(a, b, i, j + 1));
+        comm_12_only_common(a, b, i, j + 1);
+        assert forall|w: Word| mem_from(merge(a, b, i, j), 0, w) implies mem_from(a, i, w)
+            && mem_from(b, j, w) by {
+            lemma_mem_from_weaken(b, j, j + 1, w);
+        }
+    } else {
+        assert(merge(a, b, i, j) == seq![a[i]] + merge(a, b, i + 1, j + 1));
+        comm_12_only_common(a, b, i + 1, j + 1);
+        lemma_lex_trichotomy(a[i], b[j]);
+        assert(a[i] == b[j]);
+        assert forall|w: Word| mem_from(merge(a, b, i, j), 0, w) implies mem_from(a, i, w)
+            && mem_from(b, j, w) by {
+            lemma_mem_from_cons(a[i], merge(a, b, i + 1, j + 1), w);
+            if w == a[i] {
+                lemma_mem_from_head(a, i);
+                lemma_mem_from_head(b, j);
+            } else {
+                assert(mem_from(merge(a, b, i + 1, j + 1), 0, w));
+                lemma_mem_from_weaken(a, i, i + 1, w);
+                lemma_mem_from_weaken(b, j, j + 1, w);
+            }
+        }
+    }
+}
+
+/// **Completeness of the walk.** Every line both files hold is printed — this is
+/// where the sortedness of BOTH files is load-bearing, and it is why the two
+/// files may be different: the walk drops `a[i]` only when `a[i]` lies strictly
+/// below the whole remaining tail of `b`.
+pub proof fn comm_12_complete(a: Seq<Word>, b: Seq<Word>, i: int, j: int)
+    requires
+        sorted(a),
+        sorted(b),
+        0 <= i <= a.len(),
+        0 <= j <= b.len(),
+    ensures
+        forall|w: Word| (mem_from(a, i, w) && mem_from(b, j, w)) ==> mem_from(merge(
+            a,
+            b,
+            i,
+            j,
+        ), 0, w),
+    decreases (a.len() - i) + (b.len() - j),
+{
+    reveal(merge);
+    if i >= a.len() || j >= b.len() {
+        assert forall|w: Word| (mem_from(a, i, w) && mem_from(b, j, w)) implies mem_from(
+            merge(a, b, i, j),
+            0,
+            w,
+        ) by {
+            lemma_mem_from_past_end(a, i, w);
+            lemma_mem_from_past_end(b, j, w);
+        }
+    } else if lex_lt(a[i], b[j]) {
+        assert(merge(a, b, i, j) == merge(a, b, i + 1, j));
+        comm_12_complete(a, b, i + 1, j);
+        assert forall|w: Word| (mem_from(a, i, w) && mem_from(b, j, w)) implies mem_from(
+            merge(a, b, i, j),
+            0,
+            w,
+        ) by {
+            if mem_from(a, i, w) && mem_from(b, j, w) {
+                // `a[i]` cannot be a common line: `b` is sorted and `b[j]` is
+                // already strictly above it, so any occurrence of `a[i]` in
+                // `b[j..]` would have to be both above and equal to itself.
+                let k = choose|k: int| j <= k < b.len() && b[k] == w;
+                if k == j {
+                    assert(b[j] == w);
+                    if a[i] == w {
+                        assert(lex_lt(a[i], a[i]));
+                        lemma_lex_not_lt(a[i]);
+                    }
+                } else {
+                    lemma_sorted_from(b, j, k);
+                    if a[i] == w {
+                        assert(b[k] == a[i]);
+                        assert(!lex_lt(b[k], b[j]));
+                        assert(lex_lt(a[i], b[j]));
+                    }
+                }
+                assert(a[i] != w);
+                lemma_mem_from_split(a, i, w);
+            }
+        }
+    } else if lex_lt(b[j], a[i]) {
+        assert(merge(a, b, i, j) == merge(a, b, i, j + 1));
+        comm_12_complete(a, b, i, j + 1);
+        assert forall|w: Word| (mem_from(a, i, w) && mem_from(b, j, w)) implies mem_from(
+            merge(a, b, i, j),
+            0,
+            w,
+        ) by {
+            if mem_from(a, i, w) && mem_from(b, j, w) {
+                let k = choose|k: int| i <= k < a.len() && a[k] == w;
+                if k == i {
+                    assert(a[i] == w);
+                    if b[j] == w {
+                        assert(lex_lt(b[j], b[j]));
+                        lemma_lex_not_lt(b[j]);
+                    }
+                } else {
+                    lemma_sorted_from(a, i, k);
+                    if b[j] == w {
+                        assert(a[k] == b[j]);
+                        assert(!lex_lt(a[k], a[i]));
+                        assert(lex_lt(b[j], a[i]));
+                    }
+                }
+                assert(b[j] != w);
+                lemma_mem_from_split(b, j, w);
+            }
+        }
+    } else {
+        assert(merge(a, b, i, j) == seq![a[i]] + merge(a, b, i + 1, j + 1));
+        lemma_lex_trichotomy(a[i], b[j]);
+        assert(a[i] == b[j]);
+        comm_12_complete(a, b, i + 1, j + 1);
+        assert forall|w: Word| (mem_from(a, i, w) && mem_from(b, j, w)) implies mem_from(
+            merge(a, b, i, j),
+            0,
+            w,
+        ) by {
+            if mem_from(a, i, w) && mem_from(b, j, w) {
+                if w == a[i] {
+                    lemma_mem_from_head(seq![a[i]] + merge(a, b, i + 1, j + 1), 0);
+                    assert((seq![a[i]] + merge(a, b, i + 1, j + 1))[0] == a[i]);
+                } else {
+                    lemma_mem_from_split(a, i, w);
+                    lemma_mem_from_split(b, j, w);
+                    lemma_mem_from_push(a[i], merge(a, b, i + 1, j + 1), w);
+                }
+            }
+        }
+    }
+}
+
+/// **d-F4-4, the general `comm -12` law.** For two sorted files — different
+/// files, any common lines anywhere — the walk prints exactly the intersection:
+/// a line is printed IF AND ONLY IF both files hold it. (`comm` prints a common
+/// line once because the equality step advances both cursors; multiplicity is a
+/// counting claim, not this one.)
+pub proof fn comm_12_is_the_intersection(a: Seq<Word>, b: Seq<Word>)
+    requires
+        sorted(a),
+        sorted(b),
+    ensures
+        forall|w: Word| mem_from(merge(a, b, 0, 0), 0, w) <==> (mem_from(a, 0, w)
+            && mem_from(b, 0, w)),
+{
+    comm_12_only_common(a, b, 0, 0);
+    comm_12_complete(a, b, 0, 0);
+}
+
+/// pin: two files sharing their middle lines print those lines, in order.
+pub proof fn pin_comm_shared_middle_lines()
+    ensures
+        merge(
+            seq![seq![65int], seq![66int], seq![67int]],
+            seq![seq![66int], seq![67int], seq![68int]],
+            0,
+            0,
+        ) == seq![seq![66int], seq![67int]],
+{
+    assert(merge(
+        seq![seq![65int], seq![66int], seq![67int]],
+        seq![seq![66int], seq![67int], seq![68int]],
+        0,
+        0,
+    ) == seq![seq![66int], seq![67int]]) by (compute);
+}
+
+/// pin: two files with no line in common print nothing — the law is not
+/// "prints whatever the first file has".
+pub proof fn pin_comm_disjoint_files_are_silent()
+    ensures
+        merge(
+            seq![seq![65int], seq![67int]],
+            seq![seq![66int], seq![68int]],
+            0,
+            0,
+        ) == Seq::<Word>::empty(),
+{
+    assert(merge(seq![seq![65int], seq![67int]], seq![seq![66int], seq![68int]], 0, 0)
+        == Seq::<Word>::empty()) by (compute);
+}
+
+/// pin: a common PREFIX line is found even though the second file continues.
+pub proof fn pin_comm_common_prefix_line()
+    ensures
+        merge(seq![seq![65int]], seq![seq![65int], seq![66int]], 0, 0) == seq![seq![65int]],
+{
+    assert(merge(seq![seq![65int]], seq![seq![65int], seq![66int]], 0, 0)
+        == seq![seq![65int]]) by (compute);
+}
+
+/// pin: an exhausted cursor stops the walk, whatever the other file still holds.
+pub proof fn pin_comm_exhausted_cursor_stops(a: Seq<Word>, b: Seq<Word>, i: int, j: int)
+    requires
+        i >= a.len(),
+    ensures
+        merge(a, b, i, j) == Seq::<Word>::empty(),
+{
+    reveal(merge);
+}
 
 // ────────────────────────────────────── §3  `diff F1 F2 [> OUT]` ──────────
 

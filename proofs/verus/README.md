@@ -9733,13 +9733,29 @@ inserting after instead of before equal keys), `-nr`/`-rn` decode like `-n`
   numeric key (`__sh_num($a) <=> __sh_num($b)`) is a different fold (the
   `sort FILE` shell-out) and is not covered either. The byte-level join of the
   sorted lines is the §1 `join_sep`/`echo_bytes` model, not restated for sort.
-- The general `comm -12` intersection law needs ordered-membership invariants and
-  is not proved (d-F4-4); only the double-advance step is.
+- `comm -12`'s general law IS proved (d-F4-4): `comm_12_is_the_intersection`
+  says a line is printed **iff** both sorted files hold it, with
+  `comm_12_only_common` as the soundness half (no sortedness hypothesis at all:
+  an unsorted input can make the walk miss a common line, never invent one) and
+  `comm_12_complete` as the completeness half. The completeness proof is where
+  the ordered-membership invariants earn their keep: `lemma_lex_trans` and
+  `lemma_lex_trichotomy` make byte order a linear order, `lemma_sorted_from`
+  says a line never comes after a later one in a sorted list, and that is what
+  licenses dropping `a[i]` when `a[i] < b[j]`. Membership is index-based
+  (`mem_from`), not list equality. New pins: two files sharing their middle
+  lines print those lines in order, disjoint files print nothing, a common
+  prefix line is found, and an exhausted cursor stops the walk. Five mutants:
+  the reversed byte comparison, the equality step advancing one cursor, the
+  `less` step advancing the wrong cursor, the equality step printing nothing,
+  and `mem_from` losing its lower bound — the first four are caught by the
+  exact-output pins (the IFF law is insensitive to order-reversal and to
+  multiplicity; the `less`-step pair also fails the laws themselves, 110v/2e),
+  and the last is an SMT failure in `comm_12_complete` (112v/3e).
 - `diff` beyond identical inputs is not proved (d-F4-5b): the converse ("a change
   always prints") and the byte-level hunks both need an invariant relating the
   backtrack's cursors to prefix equality (`a[0..i] == b[0..j]`), which this proof
   does not establish.
-- Pins: all 4 F3 pins and all 18 F4 pins are **UNMIRRORED**. The two
+- Pins: all 4 F3 pins and all 22 F4 pins are **UNMIRRORED**. The two
   `find_with[out]_head_*` tests exercise the same fold but assert its EMITTED
   TEXT, so they would not notice a change to the splice law; no source test
   asserts the matcher, the grammar, `comm` or the `xargs` fold. The manifests say

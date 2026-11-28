@@ -1,5 +1,5 @@
 # verus-sync-coverage manifest: shir_native_pipelines
-# source sha: shir_native_stmt=3ae1b4d0bc71  proof sha: 4c8543b9e7d7
+# source sha: shir_native_stmt=3b243603f88f  proof sha: ca457164c1bf
 # source: src/transforms/shir_native_stmt.rs — cluster F4, `xargs` / `comm` /
 #   `diff` / `sort` / `ls`
 #   surface: native_echo_xargs_stmt (5290), native_comm_stmt (6756),
@@ -106,6 +106,10 @@
 pin pin_xargs_appends_one_word -> UNMIRRORED (no source test covers the xargs fold)
 pin pin_comm_one_line_each -> UNMIRRORED (no source test covers comm)
 pin pin_comm_duplicate_prints_once -> UNMIRRORED (no source test covers comm)
+pin pin_comm_shared_middle_lines -> UNMIRRORED (no source test covers comm; A,C vs B,C,D prints B,C)
+pin pin_comm_disjoint_files_are_silent -> UNMIRRORED (no source test covers comm; disjoint sorted files print nothing)
+pin pin_comm_common_prefix_line -> UNMIRRORED (no source test covers comm; A vs A,B prints A)
+pin pin_comm_exhausted_cursor_stops -> UNMIRRORED (no source test covers comm; an exhausted cursor ends the walk)
 pin pin_one_word_echo_is_the_word_plus_newline -> UNMIRRORED (no source test covers the xargs fold)
 pin pin_diff_of_differing_files_prints -> UNMIRRORED (no source test covers the diff fold)
 pin pin_sort_sorted_permutation -> UNMIRRORED (no source test covers sort; a two-line file, sorts to [A,B])
@@ -127,6 +131,13 @@ guard law xargs_appends_the_input_word (the general agreement): PRESENT
 guard law xargs_splits_on_whitespace (d-F4-1): PRESENT
 guard law xargs_empty_content_diverges (d-F4-2): PRESENT
 guard law comm_12_one_common_line (the double advance): PRESENT
+guard law comm_12_is_the_intersection (d-F4-4: printed IFF in both files): PRESENT
+guard law comm_12_only_common (soundness, NO sortedness hypothesis): PRESENT
+guard law comm_12_complete (completeness, both files sorted): PRESENT
+guard lemma_lex_trans / lemma_lex_trichotomy (lex order is linear): PRESENT
+guard lemma_le_trans / lemma_lt_le_trans / lemma_le_lt_trans: PRESENT
+guard lemma_sorted_from (ordered membership) / lemma_sorted_skip: PRESENT
+guard mem_from / lemma_mem_from_head / lemma_mem_from_weaken / lemma_mem_from_split / lemma_mem_from_cons / lemma_mem_from_push / lemma_mem_from_past_end: PRESENT
 guard law diff_identical_inputs_are_silent (d-F4-5): PRESENT
 guard law sort_is_a_sorted_permutation (d-F4-3, ordering AND multiset): PRESENT
 guard law ls_fallback_prints_iff_missing (d-F4-3, `|| echo` wiring): PRESENT
@@ -142,29 +153,36 @@ guard lemma_digits_nonneg / lemma_asc_key_tail / lemma_ins_key_head / lemma_ins_
 guard lemma_rev_len / lemma_rev_index / lemma_rev_cnt / lemma_cnt_at_push / lemma_sorted_adj / lemma_rev_desc_lex / lemma_rev_desc_key: PRESENT
 guard sort float spellings / -h key / -u / -k / -t: NOT PROVED (d-F4-3c; -u/-k/-t are refused by the fold)
 guard native_sort_file_stmt's numeric key: NOT PROVED (a different fold, outside this cluster)
-guard law comm_12 general intersection: NOT PROVED (d-F4-4)
 guard diff beyond identical inputs: NOT PROVED (d-F4-5b)
 guard printf/echo escape decoding: DELEGATED to cluster E (shir_native_echo.rs)
 
 [counts]
-94 verified, 0 errors (verus --triggers-mode silent --rlimit 40 shir_native_pipelines.rs)
-18 pins, all UNMIRRORED: the module's 8 tests cover command chains, file tests and
+115 verified, 0 errors (verus --triggers-mode silent --rlimit 40 shir_native_pipelines.rs)
+22 pins, all UNMIRRORED: the module's 8 tests cover command chains, file tests and
 the two find/head walks — none exercises comm, the xargs fold, the diff fold, sort
 or ls. (The 8 tests are in shir_native_stmt.rs; the two find/head ones assert the
 EMITTED TEXT of their walk, which no law here models, so they are not mirrors.)
 
 mutants measured 2026-11-28 against proof sha 4c8543b9e7d7, each on a /tmp copy (the
 source untouched), sha re-checked afterwards (4c8543b9e7d7; source sha256 unchanged
-before and after). M5–M18 were measured against the previous proof revision
-d135c5309730. Source state: this row names the COMMITTED blob at HEAD, 3ae1b4d0bc71 =
-`git show HEAD:src/transforms/shir_native_stmt.rs` — a pin must describe bytes
-that exist in the repository, not one worktree's state. The worktree copy is
-currently 2504eddc38d2 because another worker has uncommitted edits
-(native_sort_file_stmt / native_grep_file_pipeline / emit_file_op); check_sync
-accepts a row naming the HEAD blob while that copy is dirty and says so.
-Compared function-by-function: the folds this cluster models — `native_sort_stmt`
-(§5, §7) and the `ls` fold (`native_ls_stmt`) — are byte-identical between
-3ae1b4d0bc71 and 2504eddc38d2, and every changed function belongs to folds
+before and after). Those rows were not re-run under ca457164c1bf: the d-F4-4 work
+only ADDS lemmas, laws and pins (§2b) and touches no model, so the earlier verdicts
+stand on unchanged functions; the d-F4-4 mutants at the end of this file were
+measured under f944dd494700 itself, whose code equals ca457164c1bf's — the proof's
+only later change is the d-F4-4 header comment. M5–M18 were measured against the previous proof revision
+d135c5309730. Source state: this row names the COMMITTED blob at HEAD, 3b243603f88f =
+sha256 of `git show HEAD:src/transforms/shir_native_stmt.rs` (worktree and HEAD
+agree). The row was re-pinned from 3ae1b4d0bc71 after 51706299e landed another
+worker's delta on this shared file (27+/9-); the re-pin was audited rather than
+bumped. That delta is confined to `native_sort_file_stmt` (the `-n` comparator
+now `__sh_num($a) <=> __sh_num($b)`, plus a diagnostic on a failed open),
+`native_grep_file_pipeline` (a failed open reports `CMD: FILE: $ERRNO` instead
+of the closed-filehandle warning), `emit_file_op` (the same `__sh_num` key for
+`-k`/`-t`) and the unary-file-test rendering (`__sh_str` operand). The folds
+this cluster models — the `comm` two-pointer walk, the `xargs` join, the `diff`
+backtrack, the `sort` slurp pass (§5, §7) and the `ls` fold (`native_ls_stmt`)
+— are byte-identical between 3ae1b4d0bc71 and 3b243603f88f, and every changed
+function belongs to folds
 outside this cluster's surface:
   M5  the echo word separator dropped                rejected at simplification
   M6  comm advances only the first cursor on a match rejected at simplification
@@ -217,3 +235,26 @@ outside this cluster's surface:
 # NONE, by design: no source test covers comm, the xargs fold, the diff fold, sort
 # or ls, so no [exec] row is claimed. Evidence is the proof and the mutant table
 # above.
+d-F4-4 mutants (measured 2026-11-28 against proof sha f944dd494700, whose code is
+unchanged by the later header-comment edit (ca457164c1bf), each on a /tmp
+copy of this file, source untouched, proof sha256 re-checked byte-identically after
+every run; the file's own mutants were appended above, not re-run):
+  M1 lex_lt's first byte compared the wrong way      rejected by pin_comm_shared_middle_lines
+                                                     (the set law cannot see it: with the
+                                                     order reversed the model is isomorphic)
+  M2 the equality step advanced only the left cursor rejected by pin_comm_duplicate_prints_once
+                                                     (prints the common line TWICE; the
+                                                     IFF law is blind to multiplicity)
+  M3 the `a[i] < b[j]` step advanced the RIGHT cursor rejected by pin_comm_shared_middle_lines;
+                                                     with the exact pins removed the law itself
+                                                     fails: 110v/2e
+  M4 the equality step printed nothing               rejected by pin_comm_shared_middle_lines
+  M5 mem_from dropped its lower bound                VERIFICATION FAILURE, 112v/3e:
+                                                     lemma_mem_from_split, lemma_mem_from_past_end,
+                                                     comm_12_complete
+  M6 the `a[i] < b[j]` step printed the dropped line rejected by pin_comm_shared_middle_lines;
+                                                     with the exact pins removed 110v/2e (soundness: a line only one file
+                                                     has is printed)
+Each rejection is a semantic failure of a stated law or pin, not a compile error: M1-M4
+and M6 are `by (compute)` proof steps that evaluate the walk on a concrete pair of
+files, M5 is an SMT postcondition failure.
