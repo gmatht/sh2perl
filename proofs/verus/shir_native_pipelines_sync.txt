@@ -1,9 +1,10 @@
 # verus-sync-coverage manifest: shir_native_pipelines
-# source sha: shir_native_stmt=3ae1b4d0bc71  proof sha: d2757a8cdd8d
-# source: src/transforms/shir_native_stmt.rs — cluster F4, `xargs` / `comm` / `diff`
+# source sha: shir_native_stmt=3ae1b4d0bc71  proof sha: d135c5309730
+# source: src/transforms/shir_native_stmt.rs — cluster F4, `xargs` / `comm` /
+#   `diff` / `sort` / `ls`
 #   surface: native_echo_xargs_stmt (5290), native_comm_stmt (6756),
-#   native_diff_files_stmt (5827). native_cat_file_pipeline (2616) is covered by
-#   shir_native_files_invariant.
+#   native_diff_files_stmt (5827), slurp_op's sort branch, native_ls_stmt (4625).
+#   native_cat_file_pipeline (2616) is covered by shir_native_files_invariant.
 #
 # Proved here:
 #   xargs_appends_the_input_word — the general agreement law: `echo CONTENT |
@@ -25,21 +26,47 @@
 #     only the prefix-match branch, so no hunk is opened and nothing is printed;
 #     lemma_lcs_identical proves the DP diagonal is the file length, which is why
 #     that branch is the one taken at every step.
+#   sort_is_a_sorted_permutation — d-F4-3, the sorted-permutation law. The emitted
+#     `@lines = sort @lines` (Perl's string `cmp` order) is modelled by
+#     `pass_sort`/`ins` (insertion into a sorted prefix) on the pass side, and by
+#     two functions written apart from it: `sorted` (no adjacent pair descends)
+#     and `cnt`/`cnt_at` (how many copies of a line the list holds). The law says
+#     `sorted(pass_sort(xs))` AND `forall x. cnt(x, pass_sort(xs)) == cnt(x, xs)`
+#     — ordered and a permutation, i.e. no line lost, duplicated or invented.
+#   ls_fallback_prints_iff_missing — d-F4-3, the `|| echo` status wiring. Pass
+#     side: `scan_rc`, the emitted `for my $p (@paths)` accumulator (`$__ls_rc`
+#     set to 2 when an operand is missing, then `$__rc = $__ls_rc ? 2 : 0`).
+#     Semantic side: `any_missing`, its own OR-fold over the operand list, mapped
+#     to a status by `ls_rc` and consumed by the emitted `if ($__rc) <built-in function print>`
+#     guard `prints_echo`. Laws: `scan_rc(present,false,0) == ls_rc(present)` and
+#     `prints_echo(scan_rc(present,false,0)) <==> any_missing(present,0)`.
 #
 # NOT proved in this stage, stated plainly:
+#   * `sort`'s FLAGS (d-F4-3b): `-n` parses each line as an f64 and sorts
+#     numerically, `-r` reverses afterwards, `-u`/`-k` are not modelled. The law
+#     above covers the lexicographic (`cmp`) form only. The byte-level join of the
+#     sorted lines is the §1 `join_sep`/`echo_bytes` model, not restated here.
 #   * the general `comm -12` intersection law over two distinct sorted files —
 #     needs ordered-membership invariants for the two-pointer walk (d-F4-4).
 #   * diff's output beyond silence — d-F4-5b: the converse ("a change always
 #     prints") and the byte-level hunks. Both need an invariant relating the
 #     backtrack's cursors to prefix equality (a[0..i] == b[0..j]); the general
 #     statement was left unproved rather than restated to agree with itself.
-#   * `sort`'s sorted-permutation law, and `ls`'s `|| echo` status wiring
-#     (d-F4-3).
 #
 # Supporting lemmas and who consumes them:
 #   lemma_concat_assoc → xargs_appends_the_input_word
 #   lemma_lex_not_lt → comm_12_one_common_line
 #   lemma_prints_identical, lemma_lcs_identical → diff_identical_inputs_are_silent
+#   lemma_lex_asym, lemma_sorted_unfold, lemma_sorted_fold, lemma_sorted_cons,
+#     lemma_sorted_tail, lemma_sorted_two, lemma_ins_head, lemma_ins_sorted,
+#     lemma_sort_sorted → sort_is_a_sorted_permutation (ordering half)
+#   lemma_cnt_cons, lemma_cnt_at_cons_tail, lemma_cnt_skip_at, lemma_cnt_peel,
+#     lemma_ins_cnt, lemma_sort_cnt → sort_is_a_sorted_permutation (multiset half)
+#   lemma_cons_zero, lemma_cons_index, lemma_skip_cons, lemma_skip_len,
+#     lemma_skip_index → both halves (seq index facts)
+#   lemma_scan_unfold, lemma_any_unfold, lemma_scan_is_status →
+#     ls_fallback_prints_iff_missing (checked by an index induction over the loop)
+#   lemma_ls_rc_matches → ls_fallback_prints_iff_missing
 
 [pins]
 pin pin_xargs_appends_one_word -> UNMIRRORED (no source test covers the xargs fold)
@@ -47,6 +74,10 @@ pin pin_comm_one_line_each -> UNMIRRORED (no source test covers comm)
 pin pin_comm_duplicate_prints_once -> UNMIRRORED (no source test covers comm)
 pin pin_one_word_echo_is_the_word_plus_newline -> UNMIRRORED (no source test covers the xargs fold)
 pin pin_diff_of_differing_files_prints -> UNMIRRORED (no source test covers the diff fold)
+pin pin_sort_sorted_permutation -> UNMIRRORED (no source test covers sort; a two-line file, sorts to [A,B])
+pin pin_sort_keeps_duplicates -> UNMIRRORED (no source test covers sort; the multiset half on a duplicated line)
+pin pin_ls_missing_operand_prints -> UNMIRRORED (no source test covers ls; a missing operand makes `|| echo` print)
+pin pin_ls_all_present_silent -> UNMIRRORED (no source test covers ls; an all-present list stays silent)
 
 [guards]
 guard law xargs_appends_the_input_word (the general agreement): PRESENT
@@ -54,32 +85,57 @@ guard law xargs_splits_on_whitespace (d-F4-1): PRESENT
 guard law xargs_empty_content_diverges (d-F4-2): PRESENT
 guard law comm_12_one_common_line (the double advance): PRESENT
 guard law diff_identical_inputs_are_silent (d-F4-5): PRESENT
+guard law sort_is_a_sorted_permutation (d-F4-3, ordering AND multiset): PRESENT
+guard law ls_fallback_prints_iff_missing (d-F4-3, `|| echo` wiring): PRESENT
 guard lemma_concat_assoc / lemma_lex_not_lt / lemma_prints_identical / lemma_lcs_identical: PRESENT
+guard lemma_lex_asym / lemma_sorted_unfold / lemma_sorted_fold / lemma_sorted_cons / lemma_sorted_tail / lemma_sorted_two / lemma_ins_head / lemma_ins_sorted / lemma_sort_sorted: PRESENT
+guard lemma_cnt_cons / lemma_cnt_at_cons_tail / lemma_cnt_skip_at / lemma_cnt_peel / lemma_ins_cnt / lemma_sort_cnt: PRESENT
+guard lemma_cons_zero / lemma_cons_index / lemma_skip_cons / lemma_skip_len / lemma_skip_index: PRESENT
+guard lemma_scan_unfold / lemma_any_unfold / lemma_scan_is_status / lemma_ls_rc_matches: PRESENT
+guard sort flags -n / -r / -u / -k: NOT PROVED (d-F4-3b)
 guard law comm_12 general intersection: NOT PROVED (d-F4-4)
 guard diff beyond identical inputs: NOT PROVED (d-F4-5b)
-guard sort permutation and ls `|| echo` status: NOT PROVED (d-F4-3)
 guard printf/echo escape decoding: DELEGATED to cluster E (shir_native_echo.rs)
 
 [counts]
-19 verified, 0 errors (verus --triggers-mode silent --rlimit 40 shir_native_pipelines.rs)
-5 pins, all UNMIRRORED: the module's 8 tests cover command chains, file tests and
-the two find/head walks — none exercises comm, the xargs fold or the diff fold.
+55 verified, 0 errors (verus --triggers-mode silent --rlimit 40 shir_native_pipelines.rs)
+9 pins, all UNMIRRORED: the module's 8 tests cover command chains, file tests and
+the two find/head walks — none exercises comm, the xargs fold, the diff fold, sort
+or ls. (The 8 tests are in shir_native_stmt.rs; the two find/head ones assert the
+EMITTED TEXT of their walk, which no law here models, so they are not mirrors.)
 
-mutants measured 2026-11-28 against proof sha d2757a8cdd8d, each on a /tmp copy
-(the source untouched), sha re-checked afterwards (d2757a8cdd8d before and after):
-  M5  the echo word separator dropped               rejected at simplification
+mutants measured 2026-11-28 against proof sha d135c5309730, each on a /tmp copy
+(the source untouched), sha re-checked afterwards (d135c5309730 and
+3ae1b4d0bc71 before and after; source sha256 unchanged):
+  M5  the echo word separator dropped                rejected at simplification
   M6  comm advances only the first cursor on a match rejected at simplification
-  M7  the newline dropped from echo                 rejected at simplification
-  M8  the appended xargs word dropped from the join rejected at simplification
-  M9  the diff prefix-match entry removed           rejected at simplification
-  M10 the diff hunk guard made always-false         rejected at simplification
-  M11 the DP recurrence loses its match step        18v/1e postcondition
+  M7  the newline dropped from echo                  rejected at simplification
+  M8  the appended xargs word dropped from the join  rejected at simplification
+  M9  the diff prefix-match entry removed            rejected at simplification
+  M10 the diff hunk guard made always-false          rejected at simplification
+  M11 the DP recurrence loses its match step         18v/1e postcondition
+  M12 `ins` drops the head line (lost element)       rejected at simplification
+      (`empty().push(empty().push(66)) == [65,66]` false — the sorted-permutation
+       pin's computed output is not what the law claims)
+  M13 `ins` compares the wrong way round             rejected at simplification
+      (`[66,65] == [65,66]` false — the ordering half and its pin)
+  M14 the multiset step dropped from `cnt`           rejected at simplification
+      (`0 == 2` false — the multiset half and the duplicate pin)
+  M15 `pass_sort` ignores its first line             rejected at simplification
+      (`empty() == [65,66]` false)
+  M16 the `ls` status made always 0                  54v/1e postcondition
+      (lemma_scan_is_status — the status wiring law)
+  M17 the `|| echo` guard made always-true           53v/2e postcondition
+      (the law at 835 and the silent pin at 883 — the guard is load-bearing)
+  M18 the `ls` loop forgets its running flag         54v/1e postcondition
+      (lemma_scan_is_status — a dropped missing operand)
   Every rejection inspected: all are VERIFICATION failures (`expression
   simplifies to … which evaluates to false` / `postcondition not satisfied`),
-  none a mutant-spelling compile error. So the new laws are load-bearing: M8 and
-  M9/M10 kill the xargs and diff laws, and M11 kills the DP diagonal lemma the
-  diff law consumes.
+  none a mutant-spelling compile error. So the laws are load-bearing: M8/M9/M10
+  kill the xargs/diff laws, M11 the DP diagonal lemma, M12–M15 the
+  sorted-permutation law's two halves, and M16–M18 the `ls` status law.
 
 [exec]
-# NONE, by design: no source test covers comm, the xargs fold or the diff fold, so
-# no [exec] row is claimed. Evidence is the proof and the mutant table above.
+# NONE, by design: no source test covers comm, the xargs fold, the diff fold, sort
+# or ls, so no [exec] row is claimed. Evidence is the proof and the mutant table
+# above.

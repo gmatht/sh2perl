@@ -1,8 +1,8 @@
 # verus-sync-coverage manifest: shir_native_find_ls
-# source sha: shir_native_stmt=3ae1b4d0bc71  proof sha: bb35ad52c6d2
+# source sha: shir_native_stmt=3ae1b4d0bc71  proof sha: ea39af338046
 # source: src/transforms/shir_native_stmt.rs — cluster F3, `find` / `head`
 #   surface: native_find_stmt (6286) — its emitted matcher, its word-list parser,
-#   its `head -N` splice; native_ls_stmt (4625) is NOT covered (see below).
+#   its `head -N` splice; native_ls_stmt (4625) is covered in F4 (see below).
 #
 # THE LAWS, each against a semantic side that is not the pass's own helper:
 #   perl_substr_neg_is_the_suffix_glob — the emitted
@@ -27,9 +27,10 @@
 #   lemma_take_first_step → head_take_is_the_first_n
 #
 # NOT covered by this file, stated not claimed: `ls` (native_ls_stmt) — its lines
-# are a sorted readdir, so its law is the sort/permutation law, which is not
-# proved (F4's manifest records it as d-F4-3); mtime/permission predicates (the
-# fold refuses them and so does the model); readdir order; symlink loops.
+# are a sorted readdir, so its law is the sort/permutation law plus the `|| echo`
+# status wiring, both now proved in F4 (`shir_native_pipelines.rs` §5/§6, d-F4-3);
+# mtime/permission predicates (the fold refuses them and so does the model);
+# readdir order; symlink loops.
 
 [pins]
 pin pin_a_dotted_glob_selects_the_suffix -> UNMIRRORED (no source test asserts the matcher)
@@ -45,7 +46,7 @@ guard law head_take_is_the_first_n (the splice): PRESENT
 guard lemma_last_n_len / lemma_last_n_index: PRESENT
 guard lemma_items_pats_pos / lemma_items_two_dirs: PRESENT
 guard lemma_take_first_step: PRESENT
-guard ls (sorted listing, `|| echo` status): NOT THIS PROOF (d-F4-3)
+guard ls (sorted listing, `|| echo` status): PROVED ELSEWHERE (shir_native_pipelines.rs §5/§6, d-F4-3)
 guard mtime/permission predicates, readdir order, symlink loops: OUT OF MODEL
 
 [counts]
@@ -55,7 +56,9 @@ file tests and the two find/head walks (emitted text), none asserts the matcher,
 the grammar or the splice law this file proves.
 
 mutants measured 2026-11-28 against proof sha bb35ad52c6d2, each on a /tmp copy
-(the source untouched), sha re-checked afterwards (bb35ad52c6d2 before and after):
+(the source untouched), sha re-checked afterwards (bb35ad52c6d2 before and after;
+this file's only later edit is the comment above, then re-verified at 18v/0e as
+ea39af338046):
   M1 the semantic side becomes a PREFIX test (window offset dropped) 17v/1e
   M2 the second-directory-word refusal made always-true               17v/1e
   M3 a grammar entry removed (the pattern counter stops incrementing) rejected at simplification

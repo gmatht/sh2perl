@@ -32,11 +32,11 @@
 //   lemma_last_n_len / lemma_last_n_index  → perl_substr_neg_is_the_suffix_glob
 //   lemma_take_first_step                 → head_take_is_the_first_n
 //
-// `ls` is NOT proved here: its lines are a permutation of a sorted readdir, so
-// its real law is the sort law, proved in `shir_native_pipelines.rs` (F4 §4);
-// the `|| echo` status wiring is recorded there as d-F4-3, unproved.
-// Out of model: mtime/permission predicates (the fold refuses them), readdir
-// order beyond the given order, and `find`'s own symlink guard.
+// `ls` is NOT proved here: its listing is a permutation of a sorted readdir, so
+// its law is the sort/permutation law plus the `|| echo` status wiring — both
+// proved in `shir_native_pipelines.rs` (F4 §5 and §6, d-F4-3). Out of model
+// here: mtime/permission predicates (the fold refuses them), readdir order
+// beyond the given order, and `find`'s own symlink guard.
 
 use vstd::prelude::*;
 

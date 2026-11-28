@@ -13,7 +13,7 @@
 // agree; where they do not, the divergence is PROVED (d-F4-1, d-F4-2) rather
 // than left as a comment.
 //
-// Proved here (19 obligations, 0 errors):
+// Proved here (55 obligations, 0 errors):
 //   xargs_appends_the_input_word — the general agreement law: `echo CONTENT |
 //                                xargs echo A B` joins A, B, CONTENT exactly the
 //                                way `echo` joins the command's argv with the
@@ -34,6 +34,21 @@
 //                                opened and nothing is printed; the DP diagonal
 //                                is the file length (lemma_lcs_identical), which
 //                                is what makes that branch always reachable.
+//   sort_is_a_sorted_permutation — d-F4-3: the emitted `sort @lines` output is
+//                                ORDERED (`sorted`, the adjacent-pair model) and
+//                                a PERMUTATION of its input (`cnt`, the multiset
+//                                count model); `pass_sort`/`ins` are the pass's
+//                                insertion step, and neither `sorted` nor `cnt`
+//                                is derived from them. Pins: a two-line file
+//                                sorts to [A,B] and a three-line file keeps its
+//                                duplicate's multiplicity.
+//   ls_fallback_prints_iff_missing — d-F4-3: the `ls` fold's status accumulator
+//                                (`scan_rc`, the emitted `$__ls_rc` loop) equals
+//                                the semantic status (`ls_rc` from the OR-fold
+//                                `any_missing`), and the pipeline's `|| echo`
+//                                guard (`prints_echo`) fires exactly when an
+//                                operand is missing. Pins: a missing operand
+//                                prints, an all-present list stays silent.
 //
 // NOT proved, stated plainly rather than papered over:
 //   * the general `comm -12` intersection law over two distinct sorted files —
@@ -43,8 +58,10 @@
 //     backtrack's cursors to prefix equality (`a[0..i] == b[0..j]`), i.e.
 //     subrange-composition facts this proof does not establish; the general
 //     statement was left unproved rather than restated so it agrees with itself.
-//   * `sort`'s sorted-permutation law and `ls`'s `|| echo` status wiring
-//     (d-F4-3).
+//   * `sort`'s FLAGS — `-n` (f64 numeric key), `-r` (reverse), `-u`/`-k`: the
+//     law covers the lexicographic `cmp` form only, which is d-F4-3b. The
+//     byte-level join of the sorted lines (separator/trailing newline) is the
+//     `join_sep`/`echo_bytes` model of §1, not restated for sort.
 //
 // The xargs law's first formulation recursed with `skip` and needed
 // `(ws + [c]).skip(1) == ws.skip(1) + [c]`; that rewrite does not discharge
@@ -345,6 +362,530 @@ pub proof fn pin_one_word_echo_is_the_word_plus_newline()
         echo_bytes(seq![seq![65int]]) == seq![65int, 10int],
 {
     assert(echo_bytes(seq![seq![65int]]) == seq![65int, 10int]) by (compute);
+}
+
+// ───────────────────────────────────────────── §5  `sort` ─────────────────
+//
+// `slurp_op`'s `sort` branch (shir_native_stmt.rs) emits `@lines = sort @lines;`
+// for the plain form, and the pass re-emits the lines with `join("\n")` plus the
+// trailing newline. The Perl code sorts by string comparison, i.e. `cmp`.
+//
+// The SORTED-PERMUTATION law is stated over two models that are written apart
+// from each other and from the emitted text:
+//   * `pass_sort` is an insertion sort (`ins` into a sorted prefix), the shape
+//     the law is proved about;
+//   * `sorted` is the ordering predicate (adjacent pairs non-descending) and
+//     `cnt` is the multiset count of a line, both defined as their own
+//     recursions. Neither is derived from `pass_sort`.
+// `sort_is_a_sorted_permutation` then says: the output is ordered, and every
+// line's multiplicity is unchanged. Dropping the "insert keeps the count" step
+// or the "insert preserves order" step turns it red (see the mutant table in
+// `shir_native_pipelines_sync.txt`).
+//
+// REFUSED (recorded, not restated): the flags. `sort -n` parses each line as an
+// f64 and sorts numerically, `sort -r` reverses afterwards, and `-u`/`-k` are
+// not modelled here; the law covers the lexicographic (`cmp`) form only, which
+// is d-F4-3b.
+
+/// Ordered: no adjacent pair descends. This is the *semantic* ordering model.
+pub open spec fn sorted(ys: Seq<Word>) -> bool
+    decreases ys.len(),
+{
+    if ys.len() <= 1 {
+        true
+    } else {
+        !lex_lt(ys[1], ys[0]) && sorted(ys.skip(1))
+    }
+}
+
+/// Insertion of one line into a sorted list — the pass side's step.
+pub open spec fn ins(x: Word, ys: Seq<Word>) -> Seq<Word>
+    decreases ys.len(),
+{
+    if ys.len() == 0 {
+        seq![x]
+    } else if lex_lt(x, ys[0]) {
+        seq![x] + ys
+    } else {
+        seq![ys[0]] + ins(x, ys.skip(1))
+    }
+}
+
+/// The whole sort as the fold performs it: insert the head into the sorted tail.
+pub open spec fn pass_sort(xs: Seq<Word>) -> Seq<Word>
+    decreases xs.len(),
+{
+    if xs.len() == 0 {
+        Seq::empty()
+    } else {
+        ins(xs[0], pass_sort(xs.skip(1)))
+    }
+}
+
+/// How many copies of the line `x` the list holds, by index (so the recursion
+/// does not need a `skip` rewrite). This is the multiset model.
+pub open spec fn cnt_at(x: Word, ys: Seq<Word>, i: int) -> int
+    decreases ys.len() - i,
+{
+    if i >= ys.len() as int {
+        0int
+    } else {
+        (if ys[i] == x { 1int } else { 0int }) + cnt_at(x, ys, i + 1)
+    }
+}
+
+pub open spec fn cnt(x: Word, ys: Seq<Word>) -> int {
+    cnt_at(x, ys, 0)
+}
+
+proof fn lemma_cons_zero(x: Word, ys: Seq<Word>)
+    ensures
+        (seq![x] + ys)[0] == x,
+{
+}
+
+proof fn lemma_cons_index(x: Word, ys: Seq<Word>, i: int)
+    requires
+        0 <= i < ys.len(),
+    ensures
+        (seq![x] + ys)[i + 1] == ys[i],
+{
+}
+
+proof fn lemma_skip_cons(x: Word, ys: Seq<Word>)
+    ensures
+        (seq![x] + ys).skip(1) == ys,
+{
+    assert((seq![x] + ys).skip(1) =~= ys);
+}
+
+proof fn lemma_skip_len(ys: Seq<Word>)
+    requires
+        ys.len() >= 1,
+    ensures
+        ys.skip(1).len() == ys.len() - 1,
+{
+}
+
+proof fn lemma_skip_index(ys: Seq<Word>, i: int)
+    requires
+        ys.len() >= 2,
+        0 <= i < ys.len() - 1,
+    ensures
+        ys.skip(1)[i] == ys[i + 1],
+{
+}
+
+proof fn lemma_lex_asym(x: Word, y: Word)
+    requires
+        lex_lt(x, y),
+    ensures
+        !lex_lt(y, x),
+    decreases x.len(),
+{
+    reveal(lex_lt);
+    if x.len() == 0 {
+    } else if y.len() == 0 {
+    } else if x[0] != y[0] {
+    } else {
+        lemma_lex_asym(x.skip(1), y.skip(1));
+    }
+}
+
+/// Unfolding `sorted` for the assumption direction (the function is recursive,
+/// so it is opaque until revealed — this is the lemma that makes it usable).
+proof fn lemma_sorted_unfold(ys: Seq<Word>)
+    ensures
+        sorted(ys) == (ys.len() <= 1 || (!lex_lt(ys[1], ys[0]) && sorted(ys.skip(1)))),
+{
+    reveal(sorted);
+}
+
+/// Unfolding `sorted` for the conclusion direction.
+proof fn lemma_sorted_fold(ys: Seq<Word>)
+    requires
+        ys.len() > 1 ==> (!lex_lt(ys[1], ys[0]) && sorted(ys.skip(1))),
+    ensures
+        sorted(ys),
+{
+    reveal(sorted);
+}
+
+/// Prepending a line that is not greater than the head keeps the list sorted.
+proof fn lemma_sorted_cons(a: Word, rest: Seq<Word>)
+    requires
+        sorted(rest),
+        rest.len() == 0 || !lex_lt(rest[0], a),
+    ensures
+        sorted(seq![a] + rest),
+{
+    if rest.len() == 0 {
+        assert((seq![a] + rest).len() == 1);
+        lemma_sorted_unfold(seq![a] + rest);
+    } else {
+        assert((seq![a] + rest).len() == rest.len() + 1);
+        assert((seq![a] + rest).len() >= 2);
+        lemma_cons_zero(a, rest);
+        lemma_cons_index(a, rest, 0);
+        lemma_skip_cons(a, rest);
+        assert((seq![a] + rest)[0] == a);
+        assert((seq![a] + rest)[1] == rest[0]);
+        assert((seq![a] + rest).skip(1) == rest);
+        assert(!lex_lt((seq![a] + rest)[1], a));
+        assert(sorted((seq![a] + rest).skip(1)));
+        assert(!lex_lt((seq![a] + rest)[1], (seq![a] + rest)[0]));
+        lemma_sorted_unfold(seq![a] + rest);
+    }
+}
+
+proof fn lemma_sorted_tail(ys: Seq<Word>)
+    requires
+        sorted(ys),
+        ys.len() >= 2,
+    ensures
+        sorted(ys.skip(1)),
+{
+    lemma_sorted_unfold(ys);
+}
+
+proof fn lemma_sorted_two(a: Word, b: Word)
+    requires
+        !lex_lt(b, a),
+    ensures
+        sorted(seq![a, b]),
+{
+    assert(seq![a, b].len() == 2);
+    assert(seq![a, b][0] == a);
+    assert(seq![a, b][1] == b);
+    assert(seq![a, b].skip(1) =~= seq![b]);
+    lemma_sorted_unfold(seq![b]);
+    lemma_sorted_unfold(seq![a, b]);
+}
+
+proof fn lemma_ins_head(x: Word, ys: Seq<Word>)
+    requires
+        ys.len() >= 1,
+    ensures
+        ins(x, ys)[0] == x || ins(x, ys)[0] == ys[0],
+{
+    reveal(ins);
+    if lex_lt(x, ys[0]) {
+        lemma_cons_zero(x, ys);
+    } else {
+        assert(ins(x, ys) == seq![ys[0]] + ins(x, ys.skip(1)));
+        lemma_cons_zero(ys[0], ins(x, ys.skip(1)));
+    }
+}
+
+/// The insertion step preserves the ordering.
+proof fn lemma_ins_sorted(x: Word, ys: Seq<Word>)
+    requires
+        sorted(ys),
+    ensures
+        sorted(ins(x, ys)),
+    decreases ys.len(),
+{
+    reveal(ins);
+    if ys.len() == 0 {
+        assert(ins(x, ys) == seq![x]);
+        assert(ins(x, ys).len() == 1);
+        lemma_sorted_unfold(ins(x, ys));
+    } else if lex_lt(x, ys[0]) {
+        lemma_lex_asym(x, ys[0]);
+        assert(ins(x, ys) == seq![x] + ys);
+        lemma_sorted_cons(x, ys);
+    } else if ys.len() == 1 {
+        assert(ys.skip(1).len() == 0);
+        assert(ins(x, ys.skip(1)) == seq![x]);
+        assert(seq![ys[0]] + seq![x] =~= seq![ys[0], x]);
+        assert(ins(x, ys) == seq![ys[0], x]);
+        lemma_sorted_two(ys[0], x);
+    } else {
+        lemma_sorted_tail(ys);
+        lemma_ins_sorted(x, ys.skip(1));
+        let rest = ins(x, ys.skip(1));
+        assert(ins(x, ys) == seq![ys[0]] + rest);
+        assert(!lex_lt(x, ys[0]));
+        lemma_ins_head(x, ys.skip(1));
+        lemma_skip_index(ys, 0);
+        lemma_sorted_cons(ys[0], rest);
+    }
+}
+
+proof fn lemma_cnt_at_cons_tail(x: Word, y: Word, ys: Seq<Word>, k: int)
+    requires
+        k >= 0,
+    ensures
+        cnt_at(x, seq![y] + ys, k + 1) == cnt_at(x, ys, k),
+    decreases ys.len() + 2 - k,
+{
+    reveal(cnt_at);
+    if k >= ys.len() as int {
+        assert(k + 1 >= (seq![y] + ys).len());
+    } else {
+        lemma_cons_index(y, ys, k);
+        lemma_cnt_at_cons_tail(x, y, ys, k + 1);
+    }
+}
+
+proof fn lemma_cnt_cons(x: Word, y: Word, ys: Seq<Word>)
+    ensures
+        cnt(x, seq![y] + ys) == (if y == x { 1int } else { 0int }) + cnt(x, ys),
+{
+    reveal(cnt);
+    lemma_cons_zero(y, ys);
+    lemma_cnt_at_cons_tail(x, y, ys, 0);
+}
+
+proof fn lemma_cnt_skip_at(x: Word, ys: Seq<Word>, k: int)
+    requires
+        1 <= k <= ys.len(),
+    ensures
+        cnt_at(x, ys, k) == cnt_at(x, ys.skip(1), k - 1),
+    decreases ys.len() - k,
+{
+    reveal(cnt_at);
+    if k >= ys.len() as int {
+        lemma_skip_len(ys);
+        assert(cnt_at(x, ys, k) == 0);
+        assert(cnt_at(x, ys.skip(1), k - 1) == 0);
+    } else {
+        lemma_skip_index(ys, k - 1);
+        lemma_cnt_skip_at(x, ys, k + 1);
+    }
+}
+
+proof fn lemma_cnt_peel(x: Word, ys: Seq<Word>)
+    requires
+        ys.len() >= 1,
+    ensures
+        cnt(x, ys) == (if ys[0] == x { 1int } else { 0int }) + cnt(x, ys.skip(1)),
+{
+    reveal(cnt);
+    lemma_cnt_skip_at(x, ys, 1);
+}
+
+/// The insertion step preserves every line's multiplicity.
+proof fn lemma_ins_cnt(x: Word, y: Word, ys: Seq<Word>)
+    ensures
+        cnt(x, ins(y, ys)) == cnt(x, ys) + (if x == y { 1int } else { 0int }),
+    decreases ys.len(),
+{
+    reveal(ins);
+    reveal(cnt);
+    if ys.len() == 0 {
+        lemma_cnt_cons(x, y, Seq::<Word>::empty());
+    } else if lex_lt(y, ys[0]) {
+        lemma_cnt_cons(x, y, ys);
+    } else {
+        lemma_cnt_cons(x, ys[0], ins(y, ys.skip(1)));
+        lemma_ins_cnt(x, y, ys.skip(1));
+        lemma_cnt_peel(x, ys);
+    }
+}
+
+proof fn lemma_sort_sorted(xs: Seq<Word>)
+    ensures
+        sorted(pass_sort(xs)),
+    decreases xs.len(),
+{
+    reveal(pass_sort);
+    if xs.len() == 0 {
+        assert(pass_sort(xs).len() == 0);
+        lemma_sorted_unfold(pass_sort(xs));
+    } else {
+        lemma_sort_sorted(xs.skip(1));
+        lemma_ins_sorted(xs[0], pass_sort(xs.skip(1)));
+    }
+}
+
+proof fn lemma_sort_cnt(x: Word, xs: Seq<Word>)
+    ensures
+        cnt(x, pass_sort(xs)) == cnt(x, xs),
+    decreases xs.len(),
+{
+    reveal(pass_sort);
+    if xs.len() == 0 {
+    } else {
+        lemma_sort_cnt(x, xs.skip(1));
+        lemma_ins_cnt(x, xs[0], pass_sort(xs.skip(1)));
+        lemma_cnt_peel(x, xs);
+    }
+}
+
+/// **The sort law.** The emitted `sort @lines` output is ordered and holds
+/// exactly the input's lines with exactly the input's multiplicities — a sorted
+/// permutation of the input, over models (`sorted`, `cnt`) defined apart from
+/// `ins`/`pass_sort`.
+pub proof fn sort_is_a_sorted_permutation(xs: Seq<Word>)
+    ensures
+        sorted(pass_sort(xs)),
+        forall|x: Word| #[trigger] cnt(x, pass_sort(xs)) == cnt(x, xs),
+{
+    lemma_sort_sorted(xs);
+    assert forall|x: Word| #[trigger] cnt(x, pass_sort(xs)) == cnt(x, xs) by {
+        lemma_sort_cnt(x, xs);
+    }
+}
+
+// ──────────────────────────────────────── §6  `ls` and `|| echo` ──────────
+//
+// `native_ls_stmt` emits, per operand: `if (!-e $p) { $__ls_rc = 2; }` inside a
+// loop over the paths, then `$__rc = $__ls_rc ? 2 : 0;` and the pipeline's
+// `|| echo` printing when `$__rc` is non-zero. The law below fixes the wiring:
+// the fallback prints exactly when some operand was missing, and the status is 2
+// in that case and 0 otherwise.
+//
+// Two recursions, written apart:
+//   * `scan_rc` is the emitted accumulator loop (`bad` is the running flag);
+//   * `any_missing` is the semantic OR-fold over the operand list, its own
+//     function; `ls_rc` maps that to a status and `prints_echo` is the pipeline's
+//     `if ($rc) { print ... }` guard.
+// The pin pair below keeps it non-vacuous: a list with a missing operand prints,
+// an all-present list stays silent.
+
+/// The list the `ls` fold prints: `true` = the operand exists.
+pub type Present = Seq<bool>;
+
+/// Pass side: the emitted loop's status accumulator, in index form.
+pub open spec fn scan_rc(present: Present, bad: bool, i: int) -> int
+    decreases present.len() - i,
+{
+    if i >= present.len() as int {
+        if bad { 2int } else { 0int }
+    } else {
+        scan_rc(present, bad || !present[i], i + 1)
+    }
+}
+
+/// Semantic side: is some operand missing? Its own OR-fold.
+pub open spec fn any_missing(present: Present, i: int) -> bool
+    decreases present.len() - i,
+{
+    if i >= present.len() as int {
+        false
+    } else {
+        !present[i] || any_missing(present, i + 1)
+    }
+}
+
+/// The status the listing command reports to the pipeline.
+pub open spec fn ls_rc(present: Present) -> int {
+    if any_missing(present, 0) { 2int } else { 0int }
+}
+
+/// The emitted `if ($__rc) { print ECHO }` guard of `|| echo`.
+pub open spec fn prints_echo(rc: int) -> bool {
+    rc != 0
+}
+
+proof fn lemma_scan_unfold(present: Present, bad: bool, i: int)
+    ensures
+        scan_rc(present, bad, i) == (if i >= present.len() as int {
+            if bad { 2int } else { 0int }
+        } else {
+            scan_rc(present, bad || !present[i], i + 1)
+        }),
+{
+    reveal(scan_rc);
+}
+
+proof fn lemma_any_unfold(present: Present, i: int)
+    ensures
+        any_missing(present, i) == (if i >= present.len() as int {
+            false
+        } else {
+            !present[i] || any_missing(present, i + 1)
+        }),
+{
+    reveal(any_missing);
+}
+
+/// The accumulator loop reports 2 exactly when the running flag or a missing
+/// operand says so.
+pub proof fn lemma_scan_is_status(present: Present, bad: bool, i: int)
+    requires
+        0 <= i <= present.len(),
+    ensures
+        scan_rc(present, bad, i) == (if bad || any_missing(present, i) { 2int } else { 0int }),
+    decreases present.len() - i,
+{
+    lemma_scan_unfold(present, bad, i);
+    lemma_any_unfold(present, i);
+    if i >= present.len() as int {
+    } else {
+        lemma_scan_is_status(present, bad || !present[i], i + 1);
+    }
+}
+
+/// The emitted loop's status equals the semantic status.
+pub proof fn lemma_ls_rc_matches(present: Present)
+    ensures
+        scan_rc(present, false, 0) == ls_rc(present),
+{
+    lemma_scan_is_status(present, false, 0);
+    reveal(ls_rc);
+}
+
+/// **The `ls` fallback law.** `|| echo` prints exactly when an operand was
+/// missing — the status wiring, stated against `any_missing`, not against the
+/// loop's own accumulator.
+pub proof fn ls_fallback_prints_iff_missing(present: Present)
+    ensures
+        prints_echo(scan_rc(present, false, 0)) <==> any_missing(present, 0),
+{
+    lemma_scan_is_status(present, false, 0);
+    reveal(prints_echo);
+}
+
+// pins: the sort law is non-vacuous on a concrete two-line file, and the
+// multiset half really counts duplicates.
+pub proof fn pin_sort_sorted_permutation()
+    ensures
+        sorted(pass_sort(seq![seq![66int], seq![65int]])),
+        pass_sort(seq![seq![66int], seq![65int]]) == seq![seq![65int], seq![66int]],
+{
+    sort_is_a_sorted_permutation(seq![seq![66int], seq![65int]]);
+    assert(pass_sort(seq![seq![66int], seq![65int]]) == seq![seq![65int], seq![66int]])
+        by (compute);
+}
+
+pub proof fn pin_sort_keeps_duplicates()
+    ensures
+        pass_sort(seq![seq![66int], seq![65int], seq![66int]])
+            == seq![seq![65int], seq![66int], seq![66int]],
+        cnt(seq![66int], pass_sort(seq![seq![66int], seq![65int], seq![66int]])) == 2,
+        cnt(seq![65int], pass_sort(seq![seq![66int], seq![65int], seq![66int]])) == 1,
+{
+    sort_is_a_sorted_permutation(seq![seq![66int], seq![65int], seq![66int]]);
+    assert(pass_sort(seq![seq![66int], seq![65int], seq![66int]])
+        == seq![seq![65int], seq![66int], seq![66int]]) by (compute);
+    assert(cnt(seq![66int], seq![seq![65int], seq![66int], seq![66int]]) == 2) by (compute);
+    assert(cnt(seq![65int], seq![seq![65int], seq![66int], seq![66int]]) == 1) by (compute);
+}
+
+// pins: the `ls || echo` wiring prints on a missing operand and stays silent
+// on an all-present list.
+pub proof fn pin_ls_missing_operand_prints()
+    ensures
+        ls_rc(seq![true, false]) == 2int,
+        prints_echo(scan_rc(seq![true, false], false, 0)),
+{
+    lemma_ls_rc_matches(seq![true, false]);
+    assert(any_missing(seq![true, false], 0)) by (compute);
+    assert(ls_rc(seq![true, false]) == 2) by (compute);
+    reveal(prints_echo);
+}
+
+pub proof fn pin_ls_all_present_silent()
+    ensures
+        ls_rc(seq![true, true]) == 0int,
+        !prints_echo(scan_rc(seq![true, true], false, 0)),
+{
+    lemma_ls_rc_matches(seq![true, true]);
+    assert(!any_missing(seq![true, true], 0)) by (compute);
+    assert(ls_rc(seq![true, true]) == 0) by (compute);
+    reveal(prints_echo);
 }
 
 } // verus!

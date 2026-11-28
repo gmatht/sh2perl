@@ -9607,12 +9607,12 @@ entry is not a lost rewrite but wrong output, so this is a soundness law.
   `record_file_write` has no source test, so all 9 pins are **UNMIRRORED by
   design** and no `[exec]` row exists.
 
-### Items F3 / F4 — `find`/`head`, `xargs`/`comm` and `diff` (18 + 19 obligations)
+### Items F3 / F4 — `find`/`head`, `xargs`/`comm`, `diff`, `sort`/`ls` (18 + 55 obligations)
 
     verus --triggers-mode silent --rlimit 40 proofs/verus/shir_native_find_ls.rs
     -> verification results:: 18 verified, 0 errors
     verus --triggers-mode silent --rlimit 40 proofs/verus/shir_native_pipelines.rs
-    -> verification results:: 19 verified, 0 errors
+    -> verification results:: 55 verified, 0 errors
 
 **F3 (`shir_native_find_ls.rs`).** The fold does not emit `find`; it emits a Perl
 walk whose matcher is `substr($__e, -N) eq Q`. Proved against an indexwise
@@ -9636,18 +9636,30 @@ copies them) and **d-F4-2** (`echo "" | xargs echo A` prints `A`, the fold emits
 double advance that makes `-12` print a duplicate once, and **d-F4-5**,
 `diff_identical_inputs_are_silent`, proves that on equal files the backtrack only
 takes the prefix-match branch (with `lemma_lcs_identical` giving the full DP
-diagonal), so no hunk is opened and nothing prints.
+diagonal), so no hunk is opened and nothing prints. **d-F4-3** is now closed:
+`sort_is_a_sorted_permutation` proves the emitted `sort @lines` output is ordered
+(`sorted`, the adjacent-pair ordering model) and a permutation of its input
+(`cnt`, the multiset-count model), with `ins`/`pass_sort` as the pass's insertion
+step and neither semantic function derived from them; and
+`ls_fallback_prints_iff_missing` proves the `ls` fold's status accumulator
+(`scan_rc`, the emitted `$__ls_rc` loop) equals the semantic status (`ls_rc` over
+the independent OR-fold `any_missing`), so the pipeline's `|| echo` prints
+exactly when an operand is missing. Pins keep both non-vacuous: a two-line file
+sorts to `[A,B]`, a three-line file keeps its duplicate's multiplicity, a missing
+operand prints, an all-present list stays silent.
 
 **What is NOT mirrored or NOT proved** — said plainly:
-- `ls` is not covered: its lines are a sorted readdir, i.e. the sort/permutation
-  law, which is unproved (d-F4-3), and its `|| echo` status wiring with it.
+- `sort`'s FLAGS are not covered (d-F4-3b): `-n` (lines parsed as f64), `-r`
+  (reverse) and `-u`/`-k` are outside the model; the law is the lexicographic
+  (`cmp`) form only. Its byte-level join is the §1 `join_sep`/`echo_bytes` model,
+  not restated for sort.
 - The general `comm -12` intersection law needs ordered-membership invariants and
   is not proved (d-F4-4); only the double-advance step is.
 - `diff` beyond identical inputs is not proved (d-F4-5b): the converse ("a change
   always prints") and the byte-level hunks both need an invariant relating the
   backtrack's cursors to prefix equality (`a[0..i] == b[0..j]`), which this proof
   does not establish.
-- Pins: all 4 F3 pins and all 3 F4 pins are **UNMIRRORED**. The two
+- Pins: all 4 F3 pins and all 9 F4 pins are **UNMIRRORED**. The two
   `find_with[out]_head_*` tests exercise the same fold but assert its EMITTED
   TEXT, so they would not notice a change to the splice law; no source test
   asserts the matcher, the grammar, `comm` or the `xargs` fold. The manifests say
@@ -9660,8 +9672,14 @@ simplification), head splice ignoring N 17v/1e. F4 `d2757a8cdd8d` — echo
 separator dropped, comm single-advance, echo newline dropped, the appended xargs
 word dropped, the diff prefix-match entry removed, the diff hunk guard made
 always-false: all rejected at simplification; the DP recurrence losing its match
-step 18v/1e. Every rejection inspected as a verification failure, none a compile
-error, so the xargs law, the diff law and the DP lemma are each load-bearing.
+step 18v/1e. F4 §5/§6 (`d-F4-3`): the insertion dropping the head line, the
+insertion comparing the wrong way round, the multiset step dropped from `cnt`,
+`pass_sort` ignoring its first line — all rejected at simplification; the `ls`
+status made always 0 and the loop forgetting its running flag 54v/1e
+(postcondition); the `|| echo` guard made always-true 53v/2e (the law and its
+silent pin). Every rejection inspected as a verification failure, none a compile
+error, so the xargs law, the diff law, the DP lemma, the sorted-permutation law
+and the `ls` status law are each load-bearing.
 
 ## `shir_native_stmt.rs` — no single law; a decomposition plan (cluster C proved)
 
