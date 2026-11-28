@@ -18,29 +18,32 @@
 # behaviour-evidence is OBSERVED, not classified: the test renders both emitters,
 # runs each under `perl` in its OWN temp directory with stdin CLOSED and a hard
 # timeout (20s perl, 10s bash), runs the script under bash the same way, and
-# compares stdout, stderr and the exit status BYTE-EXACTLY, with two named
-# exceptions (below, and enforced by `stderr_allowances_are_measured_and_current`,
-# which fails if an entry is stale or has no measurement):
+# compares stdout, stderr and the exit status BYTE-EXACTLY. Render-vs-render
+# is always byte-exact (stdout, stderr and rc); there is no render-side
+# exemption of any kind. The bash comparison has one named exception, enforced
+# by `stderr_allowances_are_measured_and_current` (which fails if the entry is
+# stale or carries no measurement):
 #
 #   bash stderr multiset  063_14_complex_redirects, 063_hard_to_parse
-#       bash itself writes 2 distinct stderr byte strings over 6 runs of the
-#       same script (concurrent writers interleaving on fd 2); the render is
-#       stable, so only the bash comparison may ignore ORDER. A missing, extra
-#       or altered diagnostic still fails.
-#   render-vs-render stderr skip  063_hard_to_parse
-#       063_hard_to_parse's OWN two writers (`grep … | head …`) mix bytes
-#       mid-line: 2+ distinct byte strings over 10 runs of the SAME render, so
-#       even the multiset is not observable. Its stdout and rc are still
-#       compared, and the bash comparison still checks the stderr multiset.
+#       bash ITSELF is not reproducible for these scripts: its own concurrent
+#       writers (`sort`/`sort`, `grep`/`head`) interleave on fd 2, observed as
+#       2 distinct byte strings over 6 runs of 063_14 and 4 over 20 runs of
+#       063_hard_to_parse (one with `sortsort: : …,cannot read` mixing mid-line).
+#       The RENDER of the same script is stable (150 runs, one md5), so only
+#       the bash side may ignore byte ORDER; a missing, extra or altered
+#       diagnostic still fails.
 #
 # The one normalisation is the run's own temp ROOT (and its `work` subdirectory)
 # -> `<WORK>` in both streams, so a script that prints `$PWD` or
 # `dirname "$(pwd)"` is comparable even though the two runs stage in different
 # directories. The staging itself is equalised, not normalised away: both sides
-# run with `PWD` set to their own run directory (a shell does that), and both
-# see a working directory holding one `x.pl` entry of the same size with the
-# same fixed mtime, so a script that runs `ls -la` over its own directory
-# (062_hard_to_lex) observes identical metadata and is compared in full. There is NO same-directory
+# run with `PWD` set to their own run directory (a shell does that), both run
+# directories hold ONLY what the script itself creates (the emitted program is
+# written outside the run tree, and bash's directory gets no placeholder), and
+# both directories' own mtimes are pinned to the same fixed stamp. A script
+# that runs `ls -la` over its own directory (062_hard_to_lex) therefore sees
+# the same entries with the same metadata on both sides, and is compared in
+# full — no field of its output is skipped. There is NO same-directory
 # tie-breaker: a render difference that survives that normalisation is a wrong
 # answer and fails the test naming the script and the first differing line.
 #

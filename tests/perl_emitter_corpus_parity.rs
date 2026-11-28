@@ -1382,18 +1382,21 @@ fn norm_behaviour(s: &str, base: &Path, stderr: bool) -> String {
                     }
                     None => l.to_string(),
                 };
-                // `perl x.pl` reports `at x.pl line N`; running the same file
-                // through the `$0` prelude reports `at ./x.pl line N`. The
-                // FILE NAME form is staging, the line number is the emitter's
-                // own preamble length, so both are normalised to one shape.
-                let at = l.find("at ./x.pl line ").map(|i| (i, 15)).or_else(|| l.find("at x.pl line ").map(|i| (i, 13)));
-                let l = match at {
-                    Some((i, skip)) => {
-                        let tail = &l[i + skip..];
+                // `perl FILE` reports `at FILE line N`. FILE is STAGING: the
+                // program is written outside the run directory (so that
+                // directory holds only what the script itself creates), so the
+                // name can be `x.pl`, `./x.pl` or an absolute temp path. The
+                // LINE NUMBER is the emitter's own, so it is normalised too
+                // (it depends on how many helpers the emitter emitted) but
+                // never dropped silently — both sides keep a number.
+                let l = match l.find("at ") {
+                    Some(i) if l[i..].contains("x.pl line ") => {
+                        let j = i + l[i..].find("x.pl line ").unwrap_or(0);
+                        let tail = &l[j + "x.pl line ".len()..];
                         let digits = tail.chars().take_while(|c| c.is_ascii_digit()).count();
                         format!("{}at x.pl line N{}", &l[..i], &tail[digits..])
                     }
-                    None => l,
+                    _ => l,
                 };
                 l.replace("uu-ffi ", "")
             })
@@ -1504,29 +1507,42 @@ fn freeze_mtime(path: &Path) {
         .status();
 }
 
-/// Stage the directory metadata BOTH sides present to the script: the working
-/// directory's own entry (`ls -la .`: same name `x.pl`, same size, same mtime)
-/// and its parent (`..`: one `work` entry, same mtime on both).
+/// A directory OUTSIDE the run tree that holds the emitted program.
 ///
-/// The bash side never runs the Perl program, but it must still SEE the same
-/// directory: without the placeholder, `ls -la .` compared a 100-byte directory
-/// against an 80-byte one and the sizes alone made a correct render look wrong.
-fn stage_bash_placeholder(work: &Path, render_len: usize) {
-    let decoy = work.join("x.pl");
-    // Same byte length as the render, so the directory's own size (and the
-    // entry's size column) match; the content is never executed.
-    let _ = std::fs::write(&decoy, "\n".repeat(render_len));
-    freeze_mtime(&decoy);
+/// The program file must not sit in the run directory: a script that lists the
+/// directory it runs in (`ls -la`, 062_hard_to_lex) would then see an entry the
+/// script itself never creates, and so would bash's run directory if the
+/// harness pre-seeded a matching placeholder there. Neither side gets an entry
+/// the program under test would not produce: the run directory holds exactly
+/// what the script creates (nothing, for 062), and the program lives here.
+fn program_dir(tag: &str) -> PathBuf {
+    let dir = std::env::temp_dir().join(format!(
+        "sh2_prog_{tag}_{}_{}",
+        std::process::id(),
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_nanos())
+            .unwrap_or(0)
+    ));
+    std::fs::create_dir_all(&dir).expect("create program dir");
+    freeze_mtime(&dir);
+    dir
 }
 
 fn run_render(perl_text: &str, tag: &str, source: &str) -> (Observation, PathBuf) {
     let (base, work) = temp_base(tag);
     stage_siblings(source, &work);
-    std::fs::write(work.join("x.pl"), perl_text).expect("write render");
-    freeze_mtime(&work.join("x.pl"));
+    let prog = program_dir(tag);
+    let file = prog.join("x.pl");
+    std::fs::write(&file, perl_text).expect("write render");
+    freeze_mtime(&file);
     freeze_mtime(&work);
     freeze_mtime(&base);
-    let obs = observe(run_timed(&["perl", "x.pl"], &work, 20), &base);
+    let obs = observe(
+        run_timed(&["perl", &file.to_string_lossy()], &work, 20),
+        &base,
+    );
+    let _ = std::fs::remove_dir_all(&prog);
     (obs, base)
 }
 
@@ -1567,7 +1583,6 @@ fn observe_behaviour(script: &Path, bare: &str, fixed: &str) -> Result<&'static 
     let (fo, fbase) = run_render(fixed, "sh2b", &source);
     let (bash_base, bash_work) = temp_base("sh2b");
     stage_siblings(&source, &bash_work);
-    stage_bash_placeholder(&bash_work, bare.len());
     freeze_mtime(&bash_work);
     freeze_mtime(&bash_base);
     let bash = observe(
@@ -1580,15 +1595,7 @@ fn observe_behaviour(script: &Path, bare: &str, fixed: &str) -> Result<&'static 
     // Render-vs-render is byte-exact for every script; the measured allowance
     // only ever applies to bash's own unreproducible stream.
     let allowance = stderr_allowance(script);
-    let racy = racy_render(script);
-    let agree = match racy {
-        Some(r) => {
-            bo.rc == fo.rc
-                && (r.stdout || bo.out == fo.out)
-                && (r.stderr || bo.err == fo.err)
-        }
-        None => renders_agree(&bo, &fo),
-    };
+    let agree = renders_agree(&bo, &fo);
     if !agree {
         return Err(format!(
             "{script:?}: RENDERS DIFFER IN BEHAVIOUR (separate temp dirs, stdin closed, timeout)\n  \
@@ -1640,38 +1647,6 @@ const NONDETERMINISTIC_STDERR: &[(&str, &str)] = &[
     ),
 ];
 
-/// A render-vs-render field that a script's OWN OUTPUT makes uncomparable,
-/// with the measurement that earned the exemption. The bash comparison is not
-/// affected: it still compares every field (so the ledger token is unchanged).
-struct RacyRender {
-    path: &'static str,
-    why: &'static str,
-    /// stdout differs between two runs of the SAME program
-    stdout: bool,
-    /// stderr differs between two runs of the SAME program
-    stderr: bool,
-}
-
-/// Measured, over 10 consecutive runs of each script:
-///
-/// * `063_hard_to_parse.sh` delegates `grep … | head …` to one shell and both
-///   children report to fd 2, so two renders of the same emitted program
-///   produced different stderr bytes (observed `grep: : No such file or
-///   directory` and `grep: head: invalid number of lines: ` — the writers'
-///   bytes MIX mid-line, so even the multiset differs).
-const RACY_RENDER: &[RacyRender] = &[
-    RacyRender {
-        path: "examples/063_hard_to_parse.sh",
-        why: "measured: 2+ distinct stderr byte strings across 10 runs of the same render; two writers to fd 2 mix mid-line",
-        stdout: false,
-        stderr: true,
-    },
-];
-
-fn racy_render(script: &Path) -> Option<&'static RacyRender> {
-    let want = script.to_string_lossy();
-    RACY_RENDER.iter().find(|r| want.ends_with(r.path))
-}
 
 fn stderr_allowance(script: &Path) -> Option<&'static str> {
     let want = script.to_string_lossy();
@@ -1792,29 +1767,32 @@ const HEADER: &str = "\
 # behaviour-evidence is OBSERVED, not classified: the test renders both emitters,
 # runs each under `perl` in its OWN temp directory with stdin CLOSED and a hard
 # timeout (20s perl, 10s bash), runs the script under bash the same way, and
-# compares stdout, stderr and the exit status BYTE-EXACTLY, with two named
-# exceptions (below, and enforced by `stderr_allowances_are_measured_and_current`,
-# which fails if an entry is stale or has no measurement):
+# compares stdout, stderr and the exit status BYTE-EXACTLY. Render-vs-render
+# is always byte-exact (stdout, stderr and rc); there is no render-side
+# exemption of any kind. The bash comparison has one named exception, enforced
+# by `stderr_allowances_are_measured_and_current` (which fails if the entry is
+# stale or carries no measurement):
 #
 #   bash stderr multiset  063_14_complex_redirects, 063_hard_to_parse
-#       bash itself writes 2 distinct stderr byte strings over 6 runs of the
-#       same script (concurrent writers interleaving on fd 2); the render is
-#       stable, so only the bash comparison may ignore ORDER. A missing, extra
-#       or altered diagnostic still fails.
-#   render-vs-render stderr skip  063_hard_to_parse
-#       063_hard_to_parse's OWN two writers (`grep … | head …`) mix bytes
-#       mid-line: 2+ distinct byte strings over 10 runs of the SAME render, so
-#       even the multiset is not observable. Its stdout and rc are still
-#       compared, and the bash comparison still checks the stderr multiset.
+#       bash ITSELF is not reproducible for these scripts: its own concurrent
+#       writers (`sort`/`sort`, `grep`/`head`) interleave on fd 2, observed as
+#       2 distinct byte strings over 6 runs of 063_14 and 4 over 20 runs of
+#       063_hard_to_parse (one with `sortsort: : …,cannot read` mixing mid-line).
+#       The RENDER of the same script is stable (150 runs, one md5), so only
+#       the bash side may ignore byte ORDER; a missing, extra or altered
+#       diagnostic still fails.
 #
 # The one normalisation is the run's own temp ROOT (and its `work` subdirectory)
 # -> `<WORK>` in both streams, so a script that prints `$PWD` or
 # `dirname \"$(pwd)\"` is comparable even though the two runs stage in different
 # directories. The staging itself is equalised, not normalised away: both sides
-# run with `PWD` set to their own run directory (a shell does that), and both
-# see a working directory holding one `x.pl` entry of the same size with the
-# same fixed mtime, so a script that runs `ls -la` over its own directory
-# (062_hard_to_lex) observes identical metadata and is compared in full. There is NO same-directory
+# run with `PWD` set to their own run directory (a shell does that), both run
+# directories hold ONLY what the script itself creates (the emitted program is
+# written outside the run tree, and bash's directory gets no placeholder), and
+# both directories' own mtimes are pinned to the same fixed stamp. A script
+# that runs `ls -la` over its own directory (062_hard_to_lex) therefore sees
+# the same entries with the same metadata on both sides, and is compared in
+# full — no field of its output is skipped. There is NO same-directory
 # tie-breaker: a render difference that survives that normalisation is a wrong
 # answer and fails the test naming the script and the first differing line.
 #
@@ -1951,11 +1929,7 @@ fn ledger_covers_both_directions() {
 #[test]
 fn stderr_allowances_are_measured_and_current() {
     let ledger = read_ledger(&root().join(LEDGER));
-    let allowances = NONDETERMINISTIC_STDERR
-        .iter()
-        .map(|(p, why)| (*p, *why))
-        .chain(RACY_RENDER.iter().map(|r| (r.path, r.why)));
-    for (path, why) in allowances {
+    for (path, why) in NONDETERMINISTIC_STDERR {
         assert!(
             root().join(path).is_file(),
             "allowance names a script that does not exist: {path}"
@@ -1965,7 +1939,7 @@ fn stderr_allowances_are_measured_and_current() {
             "{path}: allowance carries no measurement, only {why:?}"
         );
         assert!(
-            ledger.contains_key(path),
+            ledger.contains_key(*path),
             "{path}: allowance is stale — the script is no longer an observed divergence"
         );
     }
