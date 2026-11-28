@@ -1,6 +1,7 @@
 #!/usr/bin/env perl
 use strict;
 use warnings;
+our $CHILD_ERROR = 0;
 
 $? = 1 << 8;
 if ($? == 0) {
@@ -8,7 +9,7 @@ if ($? == 0) {
     $? = 0 << 8;
     $? = 0 << 8;
 } else {
-    $? = 0 << 8;
+$CHILD_ERROR = $? >> 8;
 }
 
 exit $? >> 8;

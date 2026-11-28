@@ -104,6 +104,18 @@ fn st(s: &str) -> IrExpr {
     IrExpr::Str(s.to_string(), StrStyle::Raw)
 }
 
+/// The explicit ELSE a synthetic `&&`-chain If needs.
+///
+/// bash's `A && B` keeps A's status when B does not run, but the Perl
+/// renderer writes status 0 in the ELSE of an `if` with NO else (that IS
+/// bash's rule for a real `if`). A chain If therefore supplies its own else:
+/// this one runs nothing and re-derives the mirror from the untouched `$?`
+/// register, so `rmdir /no/such/dir && echo x; echo $?` prints 1 exactly as
+/// bash does (`mkdir`/`touch`/`rmdir` write only the register).
+fn chain_status_keep() -> IrStmt {
+    IrStmt::RawText("$CHILD_ERROR = $? >> 8;\n".to_string())
+}
+
 /// The canonical no-op / failed-status exec node (renders natively on
 /// every backend: `$main_exit_code = $CHILD_ERROR = 0|1;` in Perl).
 fn status_exec(ok: bool) -> IrStmt {
@@ -292,6 +304,7 @@ fn transform_stmt(
                 x |= transform_expr(&mut r.target, files);
             }
             x |= empty_herestring_to_status(st);
+            x |= native_echo_devnull_discard(st);
             x |= file_redirect_block(st);
             x |= native_sort_file_stmt(st);
             x |= native_echo_write_file_stmt(st);
@@ -508,7 +521,10 @@ fn test_and_to_if(st: &mut IrStmt) -> bool {
             cond: static_pipeline.map(IrExpr::Bool).unwrap_or_else(|| (**lhs).clone()),
             then,
             elsifs: vec![],
-            else_: vec![],
+            // A false test leaves `$?` = 1 (bash's `[ ]` failure status). An
+            // EMPTY else would be rewritten to 0 by the renderer, so
+            // `[ -f nope ] && echo x; echo $?` printed 0 where bash prints 1.
+            else_: vec![status_exec(false)],
         };
         return true;
     }
@@ -667,6 +683,11 @@ fn redirect_call_to_stmt(e: &IrExpr) -> Option<IrStmt> {
             if !matches!(mode.as_str(), "r" | "w" | "a" | "r+" | "wc") {
                 return None;
             }
+            // Keep the PARSED fd. This used to hard-code `Some(2)`, so a
+            // stdout redirect in a chain's then-branch (`mkdir … && echo
+            // "subfile content" > file`) was rendered as a STDERR redirect:
+            // the text went to the terminal and the file stayed empty
+            // (examples/018_grep_params, `grep -r` found 0 files).
             redirects.push(crate::ir::IrRedirect {
                 fd: Some(fd as i32),
                 mode,
@@ -767,7 +788,10 @@ fn cmd_and_chain_to_if(
                 cond: cond(),
                 then: build(rest, cond),
                 elsifs: vec![],
-                else_: vec![],
+                // `&&` keeps the failed operand's status when the tail does
+                // not run; an EMPTY else would be turned into status 0 by
+                // the renderer's real-`if` rule.
+                else_: vec![chain_status_keep()],
             },
         ]
     }
@@ -3320,6 +3344,100 @@ fn literal_text(e: &IrExpr) -> Option<String> {
 /// Refused when the redirect carries fd-0/-2 specs, `2>&1`-style dups,
 /// heredocs/herestrings, or a non-file mode — the native fallback cannot
 /// express those (REFUSE > GUESS).
+/// `echo WORDS > /dev/null` / `>> /dev/null`: bash discards the output and
+/// the builtin still succeeds. Left as a redirect statement the renderer
+/// rebuilt shell text and forked (`__sh_pipe_run(q{echo 'plain' >
+/// '/dev/null'})`), the class-4 shell-out this pass removes. Refuses when the
+/// inner is not a plain `echo` (a `printf` can FAIL — its numeric
+/// validation must still run — and a non-literal body may have side effects).
+
+/// The native STATEMENT form of a `redirect(...)` call that only hides
+/// STDERR (`cmd 2>/dev/null`) around a single command: the redirect Call's
+/// builtin runs in THIS process behind a temporary STDERR swap. The renderer
+/// otherwise rebuilds the call as shell text and forks, so
+/// `! cd /bad 2>/dev/null && echo ok` paid a `__sh_pipe_run` for a builtin
+/// that has an in-process arm.
+pub(crate) fn redirect_call_stderr_native(e: &IrExpr) -> Option<IrStmt> {
+    let IrExpr::Call { func, args } = e else { return None };
+    if func != "redirect" {
+        return None;
+    }
+    let IrExpr::Arrow(inner) = args.first()? else { return None };
+    if !matches!(inner.as_slice(), [IrStmt::Expr(_)]) {
+        return None;
+    }
+    let mut redirects = Vec::new();
+    for spec in args.iter().skip(1) {
+        let specs: Vec<&IrExpr> = match spec {
+            IrExpr::Array(el) => el.iter().collect(),
+            other => vec![other],
+        };
+        for sp in specs {
+            let (fd, mode, target) = crate::ir::redirect_spec_fields(sp)?;
+            if fd != 2 || !matches!(mode.as_str(), "w" | "wc") {
+                return None;
+            }
+            if crate::ir::ir_expr_to_perl(&target).replace('"', "").replace('\'', "") != "/dev/null" {
+                return None;
+            }
+            redirects.push(crate::ir::IrRedirect {
+                fd: Some(fd as i32),
+                mode,
+                target,
+                interpolate: false,
+            });
+        }
+    }
+    if redirects.is_empty() {
+        return None;
+    }
+    Some(IrStmt::Redirect { inner: inner.clone(), redirects })
+}
+
+fn native_echo_devnull_discard(st: &mut IrStmt) -> bool {
+    let IrStmt::Redirect { inner, redirects } = st else { return false };
+    if redirects.is_empty() { return false; }
+    for r in redirects.iter() {
+        if r.fd.unwrap_or(1) != 1 { return false; }
+        if !matches!(r.mode.as_str(), "w" | "wc" | "a") { return false; }
+        match &r.target {
+            IrExpr::Str(t, _) if t == "/dev/null" => {}
+            _ => return false,
+        }
+    }
+    // The body is one statement, or the echo fold's `Output` + trailing
+    // `exec true` status marker (which prints nothing).
+    let status_marker = |s: &IrStmt| -> bool {
+        matches!(s, IrStmt::Expr(IrExpr::Call { func, args })
+            if matches!(func.as_str(), "exec" | "builtin")
+                && matches!(args.as_slice(), [IrExpr::Str(c, _), _] if c == "true"))
+    };
+    let body_ok = |b: &[IrStmt]| -> bool {
+        match b {
+            [IrStmt::Output { target: None, .. }, rest @ ..] => {
+                !b.is_empty() && rest.iter().all(|s| status_marker(s))
+            }
+            [IrStmt::Expr(IrExpr::Call { func, args })] => {
+                matches!(func.as_str(), "exec" | "builtin")
+                    && matches!(args.as_slice(),
+                        [IrExpr::Str(c, _), IrExpr::Array(_)] if c == "echo")
+            }
+            _ => false,
+        }
+    };
+    // The Block arm must come FIRST: `[s]` matches any one-element slice,
+    // including the single Block the echo fold leaves behind.
+    let ok = match inner.as_slice() {
+        [IrStmt::Block(b)] => body_ok(b),
+        [s] => body_ok(std::slice::from_ref(s)),
+        _ => false,
+    };
+    if !ok { return false; }
+    // Nothing is printed and `echo` cannot fail: the statement's status is 0.
+    *st = status_exec(true);
+    true
+}
+
 fn file_redirect_block(st: &mut IrStmt) -> bool {
     let IrStmt::Redirect { inner, redirects } = st else {
         return false;
@@ -4476,6 +4594,16 @@ fn native_echo_or_chain(st: &mut IrStmt) -> bool {
         BinOpKind::And => (**lhs).clone(),
         _ => return false,
     };
+    // The chain's status when the echo DOES NOT run: a failed test (`&&`)
+    // leaves 1, and the renderer would write 0 into an EMPTY else (bash's
+    // rule for a real `if`), so the `&&` form names the failing status.
+    // The `||` form is fine empty: it falls through only when the (negated)
+    // test passed, i.e. status 0.
+    let empty_else_status = if matches!(op, BinOpKind::And) {
+        vec![status_exec(false)]
+    } else {
+        vec![]
+    };
     *st = IrStmt::If {
         cond,
         then: vec![IrStmt::Output {
@@ -4484,7 +4612,7 @@ fn native_echo_or_chain(st: &mut IrStmt) -> bool {
             target: None,
         }],
         elsifs: vec![],
-        else_: vec![],
+        else_: empty_else_status,
     };
     true
 }

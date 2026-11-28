@@ -1,6 +1,7 @@
 #!/usr/bin/env perl
 use strict;
 use warnings;
+our $CHILD_ERROR = 0;
 
 do { my $__ok = 1; for my $__d ('chain_dir') { my $__acc = $__d =~ m{^/} ? '' : '.'; for my $__c (split m{/+}, $__d) { next if $__c eq '' || $__c eq '.'; $__acc .= "/$__c"; next if -d $__acc; unless (mkdir($__acc)) { $__ok = 0; print STDERR "mkdir: $!\n"; last; } } } $? = ($__ok ? 0 : 1) << 8; };
 if ($? == 0) {
@@ -8,7 +9,7 @@ if ($? == 0) {
     $? = 0 << 8;
     $? = 0 << 8;
 } else {
-    $? = 0 << 8;
+$CHILD_ERROR = $? >> 8;
 }
 do { unlink('no_such_file_here'); $? = 0 << 8; };
 if (($? >> 8) != 0) {

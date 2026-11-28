@@ -2133,7 +2133,7 @@ pub(crate) fn native_builtin_cmd(cmd: &str) -> bool {
     matches!(
         cmd,
         "cd" | "exit" | "echo" | "printf" | "true" | "false" | ":"
-            | "test" | "[" | "]" | "rm" | "mkdir" | "touch"
+            | "test" | "[" | "]" | "rm" | "rmdir" | "mkdir" | "touch"
             | "read" | "export" | "unset" | "shift" | "local" | "set"
             | "pwd" | "shopt" | "let" | "sleep"
     )
@@ -2150,10 +2150,34 @@ fn native_stmt_chain(e: &IrExpr) -> bool {
             op: BinOpKind::And | BinOpKind::Or,
             rhs,
         } => native_stmt_chain(lhs) && native_stmt_chain(rhs),
+        // A stderr-redirected builtin (`cd /bad 2>/dev/null`) is still ONE
+        // native statement: its statement arm runs the builtin in this
+        // process behind a temporary STDERR swap (`expand: stderr_redirected_native_expr`).
+        IrExpr::Call { func, args } if func == "redirect" => args.iter().any(|a| match a {
+            IrExpr::Arrow(b) => match b.as_slice() {
+                [IrStmt::Expr(_)] => true,
+                [IrStmt::Block(b2)] => matches!(b2.as_slice(), [IrStmt::Expr(_)]),
+                _ => false,
+            },
+            _ => false,
+        }),
+        // `! cmd` (and `! ( … )`): the statement form writes the inverted
+        // status natively, so a chain with a negated operand stays in
+        // process instead of being rebuilt as shell text
+        // (`! cd /bad 2>/dev/null && echo ok`).
+        IrExpr::BinOp {
+            op: BinOpKind::Not,
+            lhs,
+            ..
+        } => native_stmt_chain(lhs),
         IrExpr::Call { func, .. } if func == "exec" || func == "builtin" => {
             let IrExpr::Call { args, .. } = e else { return false };
             match args.first().and_then(call_arg_str) {
-                Some(c) => native_builtin_cmd(&c) && !exec_is_redirect_shaped(args),
+                Some(c) => {
+                    native_builtin_cmd(&c)
+                        && (!exec_is_redirect_shaped(args)
+                            || exec_redirects_are_stderr_devnull(args))
+                }
                 None => false,
             }
         }
@@ -2184,6 +2208,29 @@ fn cond_stmt_is_native(s: &IrStmt) -> bool {
 
 /// `exec("cd", …)` is a plain command; the redirect wrapper carries its
 /// own expression, so the builtin name test alone would mis-route it.
+/// Does this exec carry only `2>/dev/null` redirects? That shape has a native
+/// statement arm (the builtin runs in THIS process with a temporary STDERR
+/// swap), so it is safe to keep inside a native chain.
+fn exec_redirects_are_stderr_devnull(args: &[IrExpr]) -> bool {
+    args.iter().all(|a| match a {
+        IrExpr::Call { func, args: inner } if func == "redirect" => inner.iter().all(|spec| {
+            let spec = match spec {
+                IrExpr::Array(items) => items.as_slice(),
+                other => std::slice::from_ref(other),
+            };
+            spec.iter().all(|sp| match crate::ir::redirect_spec_fields(sp) {
+                Some((fd, mode, target)) => {
+                    fd == 2
+                        && matches!(mode.as_str(), "w" | "wc")
+                        && matches!(&target, IrExpr::Str(t, _) if t == "/dev/null")
+                }
+                None => false,
+            })
+        }),
+        _ => true,
+    })
+}
+
 fn exec_is_redirect_shaped(args: &[IrExpr]) -> bool {
     args.iter()
         .any(|a| matches!(a, IrExpr::Call { func, .. } if func == "redirect"))
@@ -2199,6 +2246,12 @@ fn builtin_cond_expr(call: &IrExpr) -> Option<String> {
     let IrExpr::Call { func, args, .. } = call else {
         return None;
     };
+    // A `cmd 2>/dev/null` wrapper is the same seam: run the statement (the
+    // Redirect arm does it in process behind a temporary STDERR swap) and
+    // read the status it left.
+    if func == "redirect" {
+        return stderr_redirected_native_expr(call);
+    }
     if func != "exec" && func != "builtin" {
         return None;
     }
@@ -3662,6 +3715,17 @@ fn emit_stmt_owned(out: &mut String, stmt: &IrStmt, indent: usize) {
                         }
                     }
                     "redirect" => {
+                        // `cmd 2>/dev/null` around a single natively lowered
+                        // command: the Redirect statement arm runs it in THIS
+                        // process with a temporary STDERR swap. Rebuilding shell
+                        // text forked a builtin that has an in-process arm
+                        // (`! cd /bad 2>/dev/null && echo ok`).
+                        if let Some(stmt) =
+                            crate::transforms::shir_native_stmt::redirect_call_stderr_native(e)
+                        {
+                            emit_stmt(out, &stmt, indent);
+                            return;
+                        }
                         // Statement-position redirect: run the command with its
                         // redirects via bash -c (redirects are shell-level).
                         if let Some(cmd) = redirect_call_to_cmd(e) {
@@ -6840,14 +6904,26 @@ fn stderr_redirected_native_expr(e: &IrExpr) -> Option<String> {
     if targets.len() != 1 {
         return None;
     }
-    let val = ir_expr_to_perl(&inner);
+    // Run the builtin as a STATEMENT (that is what writes the status) and
+    // read the register. Using the STATEMENT VALUE as the Perl boolean was
+    // wrong: `chdir`/`mkdir`/`unlink`/`rmdir`/`utime` return 1 on SUCCESS, so
+    // `if cd bad 2>/dev/null` and (`! cd bad 2>/dev/null && …`) read the
+    // inverted truth. The statement form also keeps the chdir in THIS
+    // process (bash runs it in the parent; a forked shell left the parent
+    // in the wrong directory).
+    let mut body = String::new();
+    emit_stmt(&mut body, &IrStmt::Expr(inner), 1);
     let native = ["chdir(", "mkdir(", "unlink(", "rmdir(", "utime("]
         .iter()
-        .any(|m| val.contains(m));
+        .any(|m| body.contains(m));
     if !native {
         return None;
     }
-    Some(with_stderr_to_expr(&val, &targets[0]))
+    let n = next_name!(RD3_SEQ);
+    let (open, close) = stderr_swap_open(n, &targets[0]);
+    Some(format!(
+        "do {{\n{open}\n{body}{close}\n($CHILD_ERROR == 0)\n}}"
+    ))
 }
 
 /// `mkdir D 2>/dev/null || echo fallback` — a NATIVELY lowerable builtin

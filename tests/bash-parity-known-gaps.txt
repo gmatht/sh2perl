@@ -149,12 +149,53 @@
 # builtins, and this shape stays documented rather than in tier1 (tier1
 # compares stderr byte for byte).
 #
+# ── Native builtin diagnostics: the failing path names the file differently ──
+#
+# A natively lowered `mkdir`/`rmdir` reports Perl's own errno text, which
+# leaves out the operand bash echoes back. STDOUT and the EXIT STATUS match
+# (the fixture covers those); only the diagnostic wording differs, and the
+# gate strips the `line N:` prefix but not the operand. Exact inputs and
+# both outputs:
+#
+#   mkdir d1
+#   mkdir d1 && echo x
+#     bash:  mkdir: d1: File exists          stdout: (none)  rc=1
+#     perl:  mkdir: File exists              stdout: (none)  rc=1
+#
+#   rmdir absent || echo no
+#     bash:  rmdir: absent: No such file or directory   stdout: no  rc=0
+#     perl:  rmdir: No such file or directory           stdout: no  rc=0
+#
+# Fixing it means teaching the emitted builtin to print bash's message on the
+# failure path (a second, bash-shaped message format next to Perl's `$!`).
+# Every status, branch and stdout byte already matches, so this stays a
+# documented wording difference rather than a tier1 (stderr byte-for-byte)
+# fixture.
+#
 # ── Not brace-related, found while widening (unchanged, still divergent) ──
 #
 # A bare `export` assignment never reaches the shell scalar, so a later read
 # is empty (and `perl -w` warns):
 #
 #   export e=hi; echo "[$e]"   bash: [hi]       perl: [] + uninitialized warning
+#
+# ── One remaining builtin fork: a bare stdout redirect on `printf` ───────
+#
+# `printf … > FILE` still goes through the pipeline front end
+# (`__sh_pipe_run(q{...})`) because the renderer has no in-process arm for a
+# PRINTF whose output must be redirected. The behaviour is bash's (stdout,
+# stderr, exit and `$?` all match); only the fork is left.
+#
+#   printf '%d\n' zz >/dev/null 2>/dev/null; echo "rc=$?"
+#     bash:  (nothing)                       rc=1
+#     perl:  (nothing)                       rc=1   (forked)
+#
+# `echo … > /dev/null` no longer forks (native_echo_devnull_discard: the
+# output is discarded and the status is 0, which is exactly bash). A printf
+# cannot take that shortcut — its numeric validation is what makes it FAIL —
+# so it needs the full stdout-redirect machinery before the fork can go.
+# Out of scope here: the compound/condition shapes this pass covered all run
+# in process.
 #
 # ── Historical triage (kept for context) ─────────────────────────────────
 #
