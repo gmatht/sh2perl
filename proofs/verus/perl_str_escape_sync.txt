@@ -1,0 +1,33 @@
+# verus-sync-coverage manifest: perl_str_escape
+# source sha: perl_backend=571a1d3f7f55  proof sha: e9c5178d6e84
+#   RE-AUDITED 2026-11-28. NOTE ON THE KEY: the recorded value was taken from
+#   src/bin/perl_backend.rs, the crate's CLI wrapper, but the function this law
+#   models is NOT in that file. `perl_str` lives in the backends/core gitlink
+#   worktree at src/perl_backend.rs (line 319), whose quoted encoder body the
+#   proof transcribes. Checked there: perl_str is byte-identical across the
+#   last twelve revisions of that file (region digest 70c4a47b2a0e), so the
+#   proof's subject has not moved. The drift reported here is the WRAPPER only:
+#   `String::from_utf8_lossy` became a private-use-area byte round trip
+#   (decode_bytes/encode_bytes in main), which is input decoding, not the
+#   double-quote escaping this law is about. The row stays a wrapper change
+#   detector; it cannot see the modelled file until the key has an alias.
+
+[pins]
+pin hex_digit_is_hex -> UNMIRRORED (no mirroring test; pin is a proved obligation in this file)
+pin skip_add -> UNMIRRORED (no mirroring test; pin is a proved obligation in this file)
+pin hex_walk -> UNMIRRORED (no mirroring test; pin is a proved obligation in this file)
+
+[guards]
+guard perl_str_escape Str node: PRESENT
+
+[counts]
+proof-fns: 11
+pins: 3
+# NOTE: proof-fns is a file-shape fact (change detector), NOT the
+# Verus obligation count — re-run verus to measure that.
+
+[exec]
+# no MAPPED rows: this manifest's pins are obligations, not test mirrors.
+exec hex_digit_is_hex: UNMIRRORED (not executed)
+exec skip_add: UNMIRRORED (not executed)
+exec hex_walk: UNMIRRORED (not executed)
