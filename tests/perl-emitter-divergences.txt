@@ -18,18 +18,29 @@
 # behaviour-evidence is OBSERVED, not classified: the test renders both emitters,
 # runs each under `perl` in its OWN temp directory with stdin CLOSED and a hard
 # timeout (20s perl, 10s bash), runs the script under bash the same way, and
-# compares stdout byte-exactly and stderr as a byte MULTISET, with the exit
-# status exact. The multiset is deliberate and applies to BOTH the bash
-# comparison and the render-vs-render one: a script whose own commands write to
-# fd 2 concurrently (063_hard_to_parse's delegated `grep … | head …`, 063_14's
-# two `sort`s) interleaves those bytes differently on every run of the SAME
-# program — four distinct byte strings in twenty runs of 063_14 — so byte
-# equality is not an observable property while the multiset is. Any missing,
-# extra or altered diagnostic changes the multiset and fails the test.
-# stdout and the exit status are compared byte-exactly. The one normalisation is the run's
-# own temp ROOT (and its `work` subdirectory) -> `<WORK>` in both streams, so a
-# script that prints `$PWD` or `dirname "$(pwd)"` is comparable even though the
-# two runs stage in different directories. There is NO same-directory
+# compares stdout, stderr and the exit status BYTE-EXACTLY, with two named
+# exceptions (below, and enforced by `stderr_allowances_are_measured_and_current`,
+# which fails if an entry is stale or has no measurement):
+#
+#   bash stderr multiset  063_14_complex_redirects, 063_hard_to_parse
+#       bash itself writes 2 distinct stderr byte strings over 6 runs of the
+#       same script (concurrent writers interleaving on fd 2); the render is
+#       stable, so only the bash comparison may ignore ORDER. A missing, extra
+#       or altered diagnostic still fails.
+#   render-vs-render stderr skip  063_hard_to_parse
+#       063_hard_to_parse's OWN two writers (`grep … | head …`) mix bytes
+#       mid-line: 2+ distinct byte strings over 10 runs of the SAME render, so
+#       even the multiset is not observable. Its stdout and rc are still
+#       compared, and the bash comparison still checks the stderr multiset.
+#
+# The one normalisation is the run's own temp ROOT (and its `work` subdirectory)
+# -> `<WORK>` in both streams, so a script that prints `$PWD` or
+# `dirname "$(pwd)"` is comparable even though the two runs stage in different
+# directories. The staging itself is equalised, not normalised away: both sides
+# run with `PWD` set to their own run directory (a shell does that), and both
+# see a working directory holding one `x.pl` entry of the same size with the
+# same fixed mtime, so a script that runs `ls -la` over its own directory
+# (062_hard_to_lex) observes identical metadata and is compared in full. There is NO same-directory
 # tie-breaker: a render difference that survives that normalisation is a wrong
 # answer and fails the test naming the script and the first differing line.
 #
@@ -85,6 +96,22 @@
 # change what the program MEANS. Fixing 051_primes (the array census was
 # populated after the fixups, so the bare path refused every slice and printed
 # the WHOLE array for `${a[@]: -10}`) removed its entry entirely.
+#
+# Remaining `render-eq+bash-diff`, with the reason the token is still justified:
+#
+#   063_hard_to_parse   the script's first arithmetic expansion divides by an
+#       unset variable. bash ABANDONS the command and prints
+#       `<script>: line N: (a + b) * … : division by 0 (error token is …)` —
+#       quoting the SOURCE arithmetic text and the text after the failing token.
+#       The renderer sees `IrExpr::Arith(Box<ArithAst>)` — a parsed tree
+#       (`Num`/`Var`/`Bin{op,lhs,rhs}`/`Un`/`Index`/…) with no span, no raw text
+#       and no whitespace/parenthesis record; the source spelling exists only as
+#       `Word::Arithmetic`'s `expression` at AST→IR lowering and is dropped there
+#       (the A1 JSON carries the tree under an `ast` key and nothing else). Emitting the
+#       message byte-for-byte would mean inventing the text and the error-token
+#       offset. The value semantics are right (the expansion yields empty and the
+#       status is 1); only the diagnostic is missing. Its other stderr line — the
+#       bad substitution — now matches bash exactly.
 #
 # Regenerate after a REVIEWED emitter change:
 #   SH2_UPDATE_EMITTER_LEDGER=1 cargo test --test perl_emitter_corpus_parity
@@ -157,7 +184,7 @@ examples/062_12_complex_string_interpolation.sh	output-idiom,runtime-seam	render
 examples/062_13_simple_test_expressions.sh	output-idiom	render-eq+bash-eq	2
 examples/062_14_complex_array_operations.sh	output-idiom	render-eq+bash-eq	6
 examples/062_15_complex_local_variables.sh	output-idiom	render-eq+bash-eq	6
-examples/062_hard_to_lex.sh	output-idiom,runtime-seam	render-eq+bash-diff	42
+examples/062_hard_to_lex.sh	output-idiom,runtime-seam	render-eq+bash-eq	42
 examples/063_01_deeply_nested_arithmetic.sh	output-idiom	render-eq+bash-eq	2
 examples/063_03_nested_command_substitutions.sh	output-idiom	render-eq+bash-eq	6
 examples/063_04_complex_parameter_expansion.sh	output-idiom,slice-helper	render-eq+bash-eq	4

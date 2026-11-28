@@ -5487,7 +5487,12 @@ fn perl_subscripted_base(base: &str) -> String {
             format!("${}", v)
         }
     };
-    format!("{}[{}]", name, rendered)
+    // This function only ever emits a BRACKET subscript, i.e. an array
+    // element, and an array subscript is an ARITHMETIC context in bash: an
+    // unset index is 0, where Perl reads undef and warns `Argument "" isn't
+    // numeric in array or hash lookup` under -w (`${array[${index}]}` with
+    // `index` never set — 063_hard_to_parse).
+    format!("{}[__sh_num({})]", name, rendered)
 }
 
 /// Split a possibly-indexed var name ("matrix[0,0]") into base + optional
@@ -5718,9 +5723,16 @@ fn var_read(name: &str) -> String {
             {
                 format!("${}", bare)
             } else {
-                return format!("${}[${}]", base, bare);
+                // Arithmetic SOURCE text (`${args[i+1]}`): bash evaluates it,
+                // so the bare identifiers need their `$` — pasting the text
+                // put a bareword under `use strict`.
+                return format!("${}[__sh_num({})]", base, arith_text_to_perl(bare));
             };
-            return format!("${}[{}]", base, lowered);
+            // An array subscript is an ARITHMETIC context in bash: an unset
+            // index is 0, where Perl reads undef and warns `Argument ""
+            // isn't numeric in array or hash lookup` under -w
+            // (`${array[${index}]}` with `index` never set — 063_hard_to_parse).
+            return format!("${}[__sh_num({})]", base, lowered);
         }
         let key = bare;
         // A variable subscript (`${words[$counter]}`) indexes with the
@@ -15013,9 +15025,18 @@ pub(crate) fn ir_expr_to_perl(expr: &IrExpr) -> String {
                         {
                             format!("${}", idx)
                         } else {
-                            idx
+                            // Arithmetic SOURCE text (`${args[i+1]}`): bash
+                            // evaluates it, so bare identifiers need their `$`.
+                            arith_text_to_perl(&idx)
                         };
-                        format!("${}[{}]", name, idx)
+                        // A BRACKET subscript is an array element (bash has no
+                        // associative subscript without `declare -A`, which
+                        // `arrayIndex` would not be), and an array subscript is
+                        // an ARITHMETIC context: an unset index is 0, where
+                        // Perl reads undef and warns `Argument "" isn't
+                        // numeric in array or hash lookup` (`${array[${index}]}`
+                        // with `index` never set — 063_hard_to_parse).
+                        format!("${}[__sh_num({})]", name, idx)
                     }
                 }
                 "arrayLen" => args

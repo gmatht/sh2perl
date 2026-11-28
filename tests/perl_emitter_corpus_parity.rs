@@ -1325,6 +1325,12 @@ fn emitter_text_divergences_match_the_ledger_exactly() {
 fn run_timed(argv: &[&str], cwd: &Path, secs: u32) -> (i32, String, String, bool) {
     let mut cmd = Command::new("timeout");
     cmd.arg(secs.to_string()).args(argv).current_dir(cwd);
+    // A shell that changes directory also fixes `PWD`; this harness spawns the
+    // programs directly, so the variable would be inherited from the test
+    // runner (the repo root) and a script reading `$PWD` would see a directory
+    // it is not in. That is the harness, not the render: bash recomputes `PWD`
+    // at startup too, so both sides get the run directory here.
+    cmd.env("PWD", cwd);
     cmd.stdin(std::process::Stdio::null());
     let out = cmd.output().expect("spawn timed command");
     let mut rc = out.status.code().unwrap_or(-1);
@@ -1482,10 +1488,44 @@ fn copy_dir(src: &Path, dst: &Path) {
     }
 }
 
+/// Pin a directory's or file's mtime to one fixed stamp.
+///
+/// A script that lists its working directory (`ls -la`, 062_hard_to_lex) prints
+/// the mtime of `.` and `..`, which would otherwise be the moment the staging
+/// happened — a property of the harness, and one that changes whenever two runs
+/// straddle a minute boundary. Both sides get the SAME fixed stamp, so the
+/// metadata the script observes is staged, not raced. Failure is ignored: if
+/// `touch` is missing the comparison simply sees the raw times (and fails
+/// loudly) rather than silently passing.
+fn freeze_mtime(path: &Path) {
+    let _ = Command::new("touch")
+        .args(["-t", "200001010000"])
+        .arg(path)
+        .status();
+}
+
+/// Stage the directory metadata BOTH sides present to the script: the working
+/// directory's own entry (`ls -la .`: same name `x.pl`, same size, same mtime)
+/// and its parent (`..`: one `work` entry, same mtime on both).
+///
+/// The bash side never runs the Perl program, but it must still SEE the same
+/// directory: without the placeholder, `ls -la .` compared a 100-byte directory
+/// against an 80-byte one and the sizes alone made a correct render look wrong.
+fn stage_bash_placeholder(work: &Path, render_len: usize) {
+    let decoy = work.join("x.pl");
+    // Same byte length as the render, so the directory's own size (and the
+    // entry's size column) match; the content is never executed.
+    let _ = std::fs::write(&decoy, "\n".repeat(render_len));
+    freeze_mtime(&decoy);
+}
+
 fn run_render(perl_text: &str, tag: &str, source: &str) -> (Observation, PathBuf) {
     let (base, work) = temp_base(tag);
     stage_siblings(source, &work);
     std::fs::write(work.join("x.pl"), perl_text).expect("write render");
+    freeze_mtime(&work.join("x.pl"));
+    freeze_mtime(&work);
+    freeze_mtime(&base);
     let obs = observe(run_timed(&["perl", "x.pl"], &work, 20), &base);
     (obs, base)
 }
@@ -1527,6 +1567,9 @@ fn observe_behaviour(script: &Path, bare: &str, fixed: &str) -> Result<&'static 
     let (fo, fbase) = run_render(fixed, "sh2b", &source);
     let (bash_base, bash_work) = temp_base("sh2b");
     stage_siblings(&source, &bash_work);
+    stage_bash_placeholder(&bash_work, bare.len());
+    freeze_mtime(&bash_work);
+    freeze_mtime(&bash_base);
     let bash = observe(
         run_timed(&["bash", &script.to_string_lossy()], &bash_work, 10),
         &bash_base,
@@ -1616,22 +1659,12 @@ struct RacyRender {
 ///   produced different stderr bytes (observed `grep: : No such file or
 ///   directory` and `grep: head: invalid number of lines: ` — the writers'
 ///   bytes MIX mid-line, so even the multiset differs).
-/// * `062_hard_to_lex.sh` runs `ls -la` on its working directory: the `ls -l`
-///   line for `.` carries that directory's SIZE and mtime, which differ between
-///   two staging dirs by construction (one holds `x.pl`, the other does not),
-///   and the mtime differs whenever the two runs straddle a minute boundary.
 const RACY_RENDER: &[RacyRender] = &[
     RacyRender {
         path: "examples/063_hard_to_parse.sh",
         why: "measured: 2+ distinct stderr byte strings across 10 runs of the same render; two writers to fd 2 mix mid-line",
         stdout: false,
         stderr: true,
-    },
-    RacyRender {
-        path: "examples/062_hard_to_lex.sh",
-        why: "measured: run-wide `ls -la` of its own working dir — the `.` entry's size and mtime are properties of the staging dir, and the mtime changed across two runs that straddled a minute boundary",
-        stdout: true,
-        stderr: false,
     },
 ];
 
@@ -1759,18 +1792,29 @@ const HEADER: &str = "\
 # behaviour-evidence is OBSERVED, not classified: the test renders both emitters,
 # runs each under `perl` in its OWN temp directory with stdin CLOSED and a hard
 # timeout (20s perl, 10s bash), runs the script under bash the same way, and
-# compares stdout byte-exactly and stderr as a byte MULTISET, with the exit
-# status exact. The multiset is deliberate and applies to BOTH the bash
-# comparison and the render-vs-render one: a script whose own commands write to
-# fd 2 concurrently (063_hard_to_parse's delegated `grep … | head …`, 063_14's
-# two `sort`s) interleaves those bytes differently on every run of the SAME
-# program — four distinct byte strings in twenty runs of 063_14 — so byte
-# equality is not an observable property while the multiset is. Any missing,
-# extra or altered diagnostic changes the multiset and fails the test.
-# stdout and the exit status are compared byte-exactly. The one normalisation is the run's
-# own temp ROOT (and its `work` subdirectory) -> `<WORK>` in both streams, so a
-# script that prints `$PWD` or `dirname \"$(pwd)\"` is comparable even though the
-# two runs stage in different directories. There is NO same-directory
+# compares stdout, stderr and the exit status BYTE-EXACTLY, with two named
+# exceptions (below, and enforced by `stderr_allowances_are_measured_and_current`,
+# which fails if an entry is stale or has no measurement):
+#
+#   bash stderr multiset  063_14_complex_redirects, 063_hard_to_parse
+#       bash itself writes 2 distinct stderr byte strings over 6 runs of the
+#       same script (concurrent writers interleaving on fd 2); the render is
+#       stable, so only the bash comparison may ignore ORDER. A missing, extra
+#       or altered diagnostic still fails.
+#   render-vs-render stderr skip  063_hard_to_parse
+#       063_hard_to_parse's OWN two writers (`grep … | head …`) mix bytes
+#       mid-line: 2+ distinct byte strings over 10 runs of the SAME render, so
+#       even the multiset is not observable. Its stdout and rc are still
+#       compared, and the bash comparison still checks the stderr multiset.
+#
+# The one normalisation is the run's own temp ROOT (and its `work` subdirectory)
+# -> `<WORK>` in both streams, so a script that prints `$PWD` or
+# `dirname \"$(pwd)\"` is comparable even though the two runs stage in different
+# directories. The staging itself is equalised, not normalised away: both sides
+# run with `PWD` set to their own run directory (a shell does that), and both
+# see a working directory holding one `x.pl` entry of the same size with the
+# same fixed mtime, so a script that runs `ls -la` over its own directory
+# (062_hard_to_lex) observes identical metadata and is compared in full. There is NO same-directory
 # tie-breaker: a render difference that survives that normalisation is a wrong
 # answer and fails the test naming the script and the first differing line.
 #
@@ -1826,6 +1870,22 @@ const HEADER: &str = "\
 # change what the program MEANS. Fixing 051_primes (the array census was
 # populated after the fixups, so the bare path refused every slice and printed
 # the WHOLE array for `${a[@]: -10}`) removed its entry entirely.
+#
+# Remaining `render-eq+bash-diff`, with the reason the token is still justified:
+#
+#   063_hard_to_parse   the script's first arithmetic expansion divides by an
+#       unset variable. bash ABANDONS the command and prints
+#       `<script>: line N: (a + b) * … : division by 0 (error token is …)` —
+#       quoting the SOURCE arithmetic text and the text after the failing token.
+#       The renderer sees `IrExpr::Arith(Box<ArithAst>)` — a parsed tree
+#       (`Num`/`Var`/`Bin{op,lhs,rhs}`/`Un`/`Index`/…) with no span, no raw text
+#       and no whitespace/parenthesis record; the source spelling exists only as
+#       `Word::Arithmetic`'s `expression` at AST→IR lowering and is dropped there
+#       (the A1 JSON carries the tree under an `ast` key and nothing else). Emitting the
+#       message byte-for-byte would mean inventing the text and the error-token
+#       offset. The value semantics are right (the expansion yields empty and the
+#       status is 1); only the diagnostic is missing. Its other stderr line — the
+#       bad substitution — now matches bash exactly.
 #
 # Regenerate after a REVIEWED emitter change:
 #   SH2_UPDATE_EMITTER_LEDGER=1 cargo test --test perl_emitter_corpus_parity
