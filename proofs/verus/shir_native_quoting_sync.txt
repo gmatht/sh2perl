@@ -1,5 +1,13 @@
 # verus-sync-coverage manifest: shir_native_quoting
-# source sha: shir_native_stmt=93c9e845a066  proof sha: 7ad6340fe7bb
+# source sha: shir_native_stmt=e45e2f3c2983  proof sha: 7ad6340fe7bb
+#   RE-AUDITED 2026-11-28 at e45e2f3c2983 (the recorded value names d3e7fbe29
+#   "perl: validate printf operands the way bash does"): perl_quote, tr_set_escape, decode_capture_escapes, decode_echo_escapes
+#   and regex_escape_literal were
+#   extracted from both revisions and diffed -- byte-identical.
+#   The file's 60/20 diff since that revision is the render-site counters
+#   becoming per-render thread-locals, the grep redirect parse, the sort
+#   comparison globals, native_diff_files_stmt, and a `#[cfg(test)]` pin-test
+#   module appended at EOF -- none of it in this cluster.
 # source: src/transforms/shir_native_stmt.rs (cluster H: perl_quote line 2054,
 #   tr_set_escape 5234, decode_capture_escapes 402, decode_echo_escapes 3124,
 #   regex_escape_literal 6872)
