@@ -1,21 +1,29 @@
 # verus-sync-coverage manifest: status_reads_traversal
-# source sha: status_reads=32b0936fb8b7  proof sha: ad95c02d8d5a
+# source sha: status_reads=648d3248f5f2  proof sha: ad95c02d8d5a
+#   RE-AUDITED 2026-11-28 (the recorded value names 3d0b3256d "python: drop
+#   status stores no reader can observe"): 3d0b3256d and HEAD are
+#   byte-identical for src/shir_passes/status_reads.rs, and the only change
+#   since is the `#[cfg(test)] #[path = "status_reads_pin_tests.rs"] mod
+#   pin_tests;` registration appended at EOF -- six lines after the existing
+#   test module, outside every function this proof models. The analysis
+#   functions, and the source unit tests these pins used to name, are
+#   untouched; re-run the generator to re-derive the verdicts below.
 
 [pins]
-pin pin_test_operand_is_a_read -> test detects_test_operand_status: MAPPED
-pin pin_getvar_status_is_a_read -> test detects_getvar_status: MAPPED
-pin pin_echo_is_status_free -> test status_free_program_is_false: MAPPED
-pin pin_bare_exit_reads_the_status -> test bare_exit_reads_the_status: MAPPED
-pin pin_bodies_are_localised -> test a_function_body_localises_its_own_reads: MAPPED
-pin pin_capture_body_read_is_a_read: UNMIRRORED (the Capture/Arrow arm has no dedicated source test)
-pin pin_control_flow_stores: UNMIRRORED (the definitely-stores arms have no dedicated source test)
-pin pin_capture_assign_does_not_store: UNMIRRORED (the capture guard is a code comment in the source)
-pin pin_asm_and_multi_target_do_not_store: UNMIRRORED (same)
-pin pin_pure_print_calls_do_not_store: UNMIRRORED (same)
-pin pin_nested_redirect_reads_before_store: UNMIRRORED (nested-list shapes are not unit-tested)
-pin pin_read_after_a_store_is_not_nested: UNMIRRORED (same)
-pin pin_case_clause_is_scanned_and_body_is_not: UNMIRRORED (same)
-pin pin_facts_on_a_capture_assign: UNMIRRORED (conjunction of the three facts)
+pin pin_test_operand_is_a_read -> test pin_test_operand_is_a_read: MAPPED
+pin pin_getvar_status_is_a_read -> test pin_getvar_status_is_a_read: MAPPED
+pin pin_echo_is_status_free -> test pin_echo_is_status_free: MAPPED
+pin pin_bare_exit_reads_the_status -> test pin_bare_exit_reads_the_status: MAPPED
+pin pin_bodies_are_localised -> test pin_bodies_are_localised: MAPPED
+pin pin_capture_body_read_is_a_read -> test pin_capture_body_read_is_a_read: MAPPED
+pin pin_control_flow_stores -> test pin_control_flow_stores: MAPPED
+pin pin_capture_assign_does_not_store -> test pin_capture_assign_does_not_store: MAPPED
+pin pin_asm_and_multi_target_do_not_store -> test pin_asm_and_multi_target_do_not_store: MAPPED
+pin pin_pure_print_calls_do_not_store -> test pin_pure_print_calls_do_not_store: MAPPED
+pin pin_nested_redirect_reads_before_store -> test pin_nested_redirect_reads_before_store: MAPPED
+pin pin_read_after_a_store_is_not_nested -> test pin_read_after_a_store_is_not_nested: MAPPED
+pin pin_case_clause_is_scanned_and_body_is_not -> test pin_case_clause_is_scanned_and_body_is_not: MAPPED
+pin pin_facts_on_a_capture_assign -> test pin_facts_on_a_capture_assign: MAPPED
 
 [guards]
 guard law reads (exact equality; reads_is_may_approx == reads_complete_s): PRESENT
@@ -37,26 +45,26 @@ mutants (measured 2026-11-27, each restored byte-identically to this proof
   write) mutants rejected at simplification by pin_bodies_are_localised,
   pin_nested_redirect_reads_before_store and pin_control_flow_stores.
 [exec]
-# Every MAPPED row above was EXECUTED against the source in this tree:
-#   cargo test --lib          (full lib suite; per-test verdicts below)
-# Each verdict below is grepped from that run's own
-# `test <module>::<name> ... ok` line, for the module this proof pins.
-# A mapped test that fails or vanishes from the run is drift — FATAL.
-# context: that run reported 1970 passed, 67 failed, 5 ignored; every failure
-# is in an unrelated backend / estree / shir_json module, none in the modules
-# these rows pin.
-# all suites built; per-test verdicts below
-exec pin_test_operand_is_a_read (detects_test_operand_status): PASS
-exec pin_getvar_status_is_a_read (detects_getvar_status): PASS
-exec pin_echo_is_status_free (status_free_program_is_false): PASS
-exec pin_bare_exit_reads_the_status (bare_exit_reads_the_status): PASS
-exec pin_bodies_are_localised (a_function_body_localises_its_own_reads): PASS
-exec pin_capture_body_read_is_a_read: UNMIRRORED (not executed)
-exec pin_control_flow_stores: UNMIRRORED (not executed)
-exec pin_capture_assign_does_not_store: UNMIRRORED (not executed)
-exec pin_asm_and_multi_target_do_not_store: UNMIRRORED (not executed)
-exec pin_pure_print_calls_do_not_store: UNMIRRORED (not executed)
-exec pin_nested_redirect_reads_before_store: UNMIRRORED (not executed)
-exec pin_read_after_a_store_is_not_nested: UNMIRRORED (not executed)
-exec pin_case_clause_is_scanned_and_body_is_not: UNMIRRORED (not executed)
-exec pin_facts_on_a_capture_assign: UNMIRRORED (not executed)
+# Every MAPPED row above was EXECUTED against the source in this tree by the
+# generator that owns the tests:
+#   python3 proofs/verus/gen_pin_tests.py \
+#       proofs/verus/pin_specs/status_reads_traversal.json --run
+# That writes src/shir_passes/status_reads_pin_tests.rs, runs each generated
+# test through `cargo test --lib pin_tests::`, and records the verdict below
+# ONLY for a test whose own `<module>::<name> ... ok` line it observed. A row
+# whose test later fails or vanishes is demoted back to UNMIRRORED by the next
+# run, so a MAPPED row here cannot outlive the test it names.
+exec pin_test_operand_is_a_read (pin_test_operand_is_a_read): PASS
+exec pin_getvar_status_is_a_read (pin_getvar_status_is_a_read): PASS
+exec pin_echo_is_status_free (pin_echo_is_status_free): PASS
+exec pin_bare_exit_reads_the_status (pin_bare_exit_reads_the_status): PASS
+exec pin_bodies_are_localised (pin_bodies_are_localised): PASS
+exec pin_capture_body_read_is_a_read (pin_capture_body_read_is_a_read): PASS
+exec pin_control_flow_stores (pin_control_flow_stores): PASS
+exec pin_capture_assign_does_not_store (pin_capture_assign_does_not_store): PASS
+exec pin_asm_and_multi_target_do_not_store (pin_asm_and_multi_target_do_not_store): PASS
+exec pin_pure_print_calls_do_not_store (pin_pure_print_calls_do_not_store): PASS
+exec pin_nested_redirect_reads_before_store (pin_nested_redirect_reads_before_store): PASS
+exec pin_read_after_a_store_is_not_nested (pin_read_after_a_store_is_not_nested): PASS
+exec pin_case_clause_is_scanned_and_body_is_not (pin_case_clause_is_scanned_and_body_is_not): PASS
+exec pin_facts_on_a_capture_assign (pin_facts_on_a_capture_assign): PASS
