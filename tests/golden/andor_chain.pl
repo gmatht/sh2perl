@@ -3,6 +3,12 @@ use strict;
 use warnings;
 our $CHILD_ERROR = 0;
 
+
+sub __sh_str {
+    my $__v = shift();
+    return defined($__v) ? $__v : q{};
+}
+
 do { my $__ok = 1; for my $__d ('chain_dir') { my $__acc = $__d =~ m{^/} ? '' : '.'; for my $__c (split m{/+}, $__d) { next if $__c eq '' || $__c eq '.'; $__acc .= "/$__c"; next if -d $__acc; unless (mkdir($__acc)) { $__ok = 0; print STDERR "mkdir: $!\n"; last; } } } $? = ($__ok ? 0 : 1) << 8; $CHILD_ERROR = $? >> 8; };
 if ($? == 0) {
     print "made\n";
@@ -17,8 +23,8 @@ if (($? >> 8) != 0) {
     $? = 0 << 8; $CHILD_ERROR = $? >> 8;
 }
 if (chdir("/no/such")) { print "x\n";
-$? = 0 << 8; $CHILD_ERROR = $? >> 8; } else { warn "cd: " . "/no/such" . ": $!\n"; $? = 1 << 8; $CHILD_ERROR = $? >> 8; }
-print(join(' ', grep { defined($_) && length($_) } split(/\s+/, $CHILD_ERROR)), "\n");
+$? = 0 << 8; $CHILD_ERROR = $? >> 8; } else { warn "$0: line " . __LINE__ . ": cd: " . "/no/such" . ": $!\n"; $? = 1 << 8; $CHILD_ERROR = $? >> 8; }
+print(join(' ', grep { defined($_) && length($_) } split(/\s+/, __sh_str($CHILD_ERROR))), "\n");
 $? = 0 << 8; $CHILD_ERROR = $? >> 8;
 
 exit $? >> 8;

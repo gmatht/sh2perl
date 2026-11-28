@@ -2,6 +2,7 @@
 use strict;
 use warnings;
 use English qw(-no_match_vars $ERRNO $EVAL_ERROR $INPUT_RECORD_SEPARATOR $OS_ERROR $PROGRAM_NAME);
+$0 = 'tests/tier1/builtin_status.sh';
 
 our $CHILD_ERROR = 0;
 
@@ -59,13 +60,13 @@ sub __sh_subshell {
     if (chdir("/no/such/dir")) {
         $? = 0 << 8; $CHILD_ERROR = $? >> 8;
     } else {
-        warn "cd: " . "/no/such/dir" . ": $!\n";
+        warn "$0: line " . __LINE__ . ": cd: " . "/no/such/dir" . ": $!\n";
         $? = 1 << 8; $CHILD_ERROR = $? >> 8;
     }
     open(STDERR, '>&', $__sh2_dupfh0) or die; close($__sh2_dupfh0);
     open(STDERR, '>&', $__sh2_dup0) or die;
 }
-say "cd-fail rc=$CHILD_ERROR";
+say "cd-fail rc=" . __sh_str(($CHILD_ERROR));
 $? = 0 << 8; $CHILD_ERROR = $? >> 8;
 $? = 0 << 8; $CHILD_ERROR = $? >> 8;
 do { my $__ok = 1; for my $__d ('d1') { my $__acc = $__d =~ m{^/} ? '' : '.'; for my $__c (split m{/+}, $__d) { next if $__c eq '' || $__c eq '.'; $__acc .= "/$__c"; next if -d $__acc; unless (mkdir($__acc)) { $__ok = 0; print STDERR "mkdir: $!\n"; last; } } } $? = ($__ok ? 0 : 1) << 8; $CHILD_ERROR = $? >> 8; };
@@ -73,11 +74,11 @@ if (($? >> 8) == 0) {
     if (chdir("d1")) {
         $? = 0 << 8; $CHILD_ERROR = $? >> 8;
     } else {
-        warn "cd: " . "d1" . ": $!\n";
+        warn "$0: line " . __LINE__ . ": cd: " . "d1" . ": $!\n";
         $? = 1 << 8; $CHILD_ERROR = $? >> 8;
     }
 }
-say "cd-ok rc=$CHILD_ERROR";
+say "cd-ok rc=" . __sh_str(($CHILD_ERROR));
 $? = 0 << 8; $CHILD_ERROR = $? >> 8;
 {
     open(my $__sh2_dup1, '>&', \*STDERR) or die;
@@ -86,7 +87,7 @@ $? = 0 << 8; $CHILD_ERROR = $? >> 8;
     if (chdir("/no/such/dir")) {
         $? = 0 << 8; $CHILD_ERROR = $? >> 8;
     } else {
-        warn "cd: " . "/no/such/dir" . ": $!\n";
+        warn "$0: line " . __LINE__ . ": cd: " . "/no/such/dir" . ": $!\n";
         $? = 1 << 8; $CHILD_ERROR = $? >> 8;
     }
     open(STDERR, '>&', $__sh2_dupfh1) or die; close($__sh2_dupfh1);
@@ -109,11 +110,11 @@ $? = 0 << 8; $CHILD_ERROR = $? >> 8;
     open(STDERR, '>&', $__sh2_dupfh2) or die; close($__sh2_dupfh2);
     open(STDERR, '>&', $__sh2_dup2) or die;
 }
-say "rm-missing rc=$CHILD_ERROR";
+say "rm-missing rc=" . __sh_str(($CHILD_ERROR));
 $? = 0 << 8; $CHILD_ERROR = $? >> 8;
 do { my $__ok = 1; for my $__t ('gone.txt') { if (open(my $__h, '>>', $__t)) { close($__h); } else { $__ok = 0; print STDERR "touch: cannot touch '$__t': $!\n"; } } $? = ($__ok ? 0 : 1) << 8; $CHILD_ERROR = $? >> 8; };
 do { unlink('gone.txt'); $? = 0 << 8; $CHILD_ERROR = $? >> 8; };
-say "rm-ok rc=$CHILD_ERROR";
+say "rm-ok rc=" . __sh_str(($CHILD_ERROR));
 $? = 0 << 8; $CHILD_ERROR = $? >> 8;
 {
     open(my $__sh2_dup3, '>&', \*STDERR) or die;
@@ -123,7 +124,7 @@ $? = 0 << 8; $CHILD_ERROR = $? >> 8;
     open(STDERR, '>&', $__sh2_dupfh3) or die; close($__sh2_dupfh3);
     open(STDERR, '>&', $__sh2_dup3) or die;
 }
-say "rm-rf rc=$CHILD_ERROR";
+say "rm-rf rc=" . __sh_str(($CHILD_ERROR));
 $? = 0 << 8; $CHILD_ERROR = $? >> 8;
 {
     open(my $__sh2_dup4, '>&', \*STDERR) or die;
@@ -133,7 +134,7 @@ $? = 0 << 8; $CHILD_ERROR = $? >> 8;
     open(STDERR, '>&', $__sh2_dupfh4) or die; close($__sh2_dupfh4);
     open(STDERR, '>&', $__sh2_dup4) or die;
 }
-say "rm-noargs rc=$CHILD_ERROR";
+say "rm-noargs rc=" . __sh_str(($CHILD_ERROR));
 $? = 0 << 8; $CHILD_ERROR = $? >> 8;
 {
     open(my $__sh2_dup5, '>&', \*STDERR) or die;
@@ -143,10 +144,10 @@ $? = 0 << 8; $CHILD_ERROR = $? >> 8;
     open(STDERR, '>&', $__sh2_dupfh5) or die; close($__sh2_dupfh5);
     open(STDERR, '>&', $__sh2_dup5) or die;
 }
-say "mkdir-fail rc=$CHILD_ERROR";
+say "mkdir-fail rc=" . __sh_str(($CHILD_ERROR));
 $? = 0 << 8; $CHILD_ERROR = $? >> 8;
 do { my $__ok = 1; for my $__d ('made') { unless (mkdir($__d)) { $__ok = 0; print STDERR "mkdir: $!\n"; } } $? = ($__ok ? 0 : 1) << 8; $CHILD_ERROR = $? >> 8; };
-say "mkdir-ok rc=$CHILD_ERROR";
+say "mkdir-ok rc=" . __sh_str(($CHILD_ERROR));
 $? = 0 << 8; $CHILD_ERROR = $? >> 8;
 {
     open(my $__sh2_dup6, '>&', \*STDERR) or die;
@@ -157,14 +158,14 @@ $? = 0 << 8; $CHILD_ERROR = $? >> 8;
     open(STDERR, '>&', $__sh2_dup6) or die;
 }
 $mk = $CHILD_ERROR;
-say "mkdir-exists rc=$mk";
+say "mkdir-exists rc=" . __sh_str(($mk));
 $? = 0 << 8; $CHILD_ERROR = $? >> 8;
 if (int(__sh_num($mk)) ne int(0)) {
     print "mkdir-exists-detected\n";
     $? = 0 << 8; $CHILD_ERROR = $? >> 8;
     }
 do { my $__ok = 1; for my $__t ('newfile') { if (open(my $__h, '>>', $__t)) { close($__h); } else { $__ok = 0; print STDERR "touch: cannot touch '$__t': $!\n"; } } $? = ($__ok ? 0 : 1) << 8; $CHILD_ERROR = $? >> 8; };
-say "touch-ok rc=$CHILD_ERROR";
+say "touch-ok rc=" . __sh_str(($CHILD_ERROR));
 $? = 0 << 8; $CHILD_ERROR = $? >> 8;
 {
     open(my $__sh2_dup7, '>&', \*STDERR) or die;
@@ -174,24 +175,24 @@ $? = 0 << 8; $CHILD_ERROR = $? >> 8;
     open(STDERR, '>&', $__sh2_dupfh7) or die; close($__sh2_dupfh7);
     open(STDERR, '>&', $__sh2_dup7) or die;
 }
-say "touch-fail rc=$CHILD_ERROR";
+say "touch-fail rc=" . __sh_str(($CHILD_ERROR));
 $? = 0 << 8; $CHILD_ERROR = $? >> 8;
 print "hi\n";
 $? = 0 << 8; $CHILD_ERROR = $? >> 8;
 $? = 0 << 8; $CHILD_ERROR = $? >> 8;
-say "echo rc=$CHILD_ERROR";
+say "echo rc=" . __sh_str(($CHILD_ERROR));
 $? = 0 << 8; $CHILD_ERROR = $? >> 8;
 print("x\n");
 $? = 0 << 8; $CHILD_ERROR = $? >> 8;
 $? = 0 << 8; $CHILD_ERROR = $? >> 8;
-say "printf rc=$CHILD_ERROR";
+say "printf rc=" . __sh_str(($CHILD_ERROR));
 $? = 0 << 8; $CHILD_ERROR = $? >> 8;
 $? = 0 << 8; $CHILD_ERROR = $? >> 8;
-say "echo-after-false rc=$CHILD_ERROR";
+say "echo-after-false rc=" . __sh_str(($CHILD_ERROR));
 $? = 0 << 8; $CHILD_ERROR = $? >> 8;
 $? = 1 << 8; $CHILD_ERROR = $? >> 8;
 open(my $__ofh0, '>', '/dev/null') or die "echo: '/dev/null': $ERRNO"; print $__ofh0 q{y
-}; close $__ofh0; $? = 0 << 8; $CHILD_ERROR = $? >> 8;say "printf-after-false rc=$CHILD_ERROR";
+}; close $__ofh0; $? = 0 << 8; $CHILD_ERROR = $? >> 8;say "printf-after-false rc=" . __sh_str(($CHILD_ERROR));
 $? = 0 << 8; $CHILD_ERROR = $? >> 8;
 {
     open(my $__sh2_dup8, '>&', \*STDERR) or die;
@@ -201,38 +202,38 @@ $? = 0 << 8; $CHILD_ERROR = $? >> 8;
     open(STDERR, '>&', $__sh2_dupfh8) or die; close($__sh2_dupfh8);
     open(STDERR, '>&', $__sh2_dup8) or die;
 }
-say "rmdir-fail rc=$CHILD_ERROR";
+say "rmdir-fail rc=" . __sh_str(($CHILD_ERROR));
 $? = 0 << 8; $CHILD_ERROR = $? >> 8;
 do { my $__ok = 1; for my $__d ('rd') { unless (mkdir($__d)) { $__ok = 0; print STDERR "mkdir: $!\n"; } } $? = ($__ok ? 0 : 1) << 8; $CHILD_ERROR = $? >> 8; };
 do { my $__ok = 1; for my $__d ('rd') { unless (rmdir($__d)) { $__ok = 0; print STDERR "rmdir: failed to remove '$__d': $!\n"; } } $? = ($__ok ? 0 : 1) << 8; $CHILD_ERROR = $? >> 8; };
-say "rmdir-ok rc=$CHILD_ERROR";
+say "rmdir-ok rc=" . __sh_str(($CHILD_ERROR));
 $? = 0 << 8; $CHILD_ERROR = $? >> 8;
 $? = (('1' == '1') ? 0 : 1) << 8; $CHILD_ERROR = $? >> 8;
-say "test-true rc=$CHILD_ERROR";
+say "test-true rc=" . __sh_str(($CHILD_ERROR));
 $? = 0 << 8; $CHILD_ERROR = $? >> 8;
 $? = (('1' == '2') ? 0 : 1) << 8; $CHILD_ERROR = $? >> 8;
-say "test-false rc=$CHILD_ERROR";
+say "test-false rc=" . __sh_str(($CHILD_ERROR));
 $? = 0 << 8; $CHILD_ERROR = $? >> 8;
 $? = ((('abc' =~ /^(?s)a.*$/)) ? 0 : 1) << 8; $CHILD_ERROR = $? >> 8;
-say "dbl-true rc=$CHILD_ERROR";
+say "dbl-true rc=" . __sh_str(($CHILD_ERROR));
 $? = 0 << 8; $CHILD_ERROR = $? >> 8;
 $? = ((('abc' =~ /^(?s)z.*$/)) ? 0 : 1) << 8; $CHILD_ERROR = $? >> 8;
-say "dbl-false rc=$CHILD_ERROR";
+say "dbl-false rc=" . __sh_str(($CHILD_ERROR));
 $? = 0 << 8; $CHILD_ERROR = $? >> 8;
 $? = ((-f '/etc/passwd') ? 0 : 1) << 8; $CHILD_ERROR = $? >> 8;
-say "test-f rc=$CHILD_ERROR";
+say "test-f rc=" . __sh_str(($CHILD_ERROR));
 $? = 0 << 8; $CHILD_ERROR = $? >> 8;
 $? = ((-f '/nope') ? 0 : 1) << 8; $CHILD_ERROR = $? >> 8;
-say "test-f-missing rc=$CHILD_ERROR";
+say "test-f-missing rc=" . __sh_str(($CHILD_ERROR));
 $? = 0 << 8; $CHILD_ERROR = $? >> 8;
 $? = 0 << 8; $CHILD_ERROR = $? >> 8;
-say "true rc=$CHILD_ERROR";
+say "true rc=" . __sh_str(($CHILD_ERROR));
 $? = 0 << 8; $CHILD_ERROR = $? >> 8;
 $? = 1 << 8; $CHILD_ERROR = $? >> 8;
-say "false rc=$CHILD_ERROR";
+say "false rc=" . __sh_str(($CHILD_ERROR));
 $? = 0 << 8; $CHILD_ERROR = $? >> 8;
 $? = 0 << 8; $CHILD_ERROR = $? >> 8;
-say "true-after-false rc=$CHILD_ERROR";
+say "true-after-false rc=" . __sh_str(($CHILD_ERROR));
 $? = 0 << 8; $CHILD_ERROR = $? >> 8;
 $n = "0";
 my $__sh_loop_rc0 = 0;
@@ -242,7 +243,7 @@ while (int(__sh_num($n)) < int(2)) {
     $__sh_loop_rc0 = $? >> 8;
 }
 $? = ($__sh_loop_rc0) << 8; $CHILD_ERROR = $? >> 8;
-say "while-body-false rc=$CHILD_ERROR";
+say "while-body-false rc=" . __sh_str(($CHILD_ERROR));
 $? = 0 << 8; $CHILD_ERROR = $? >> 8;
 $m = "0";
 my $__sh_loop_rc1 = 0;
@@ -252,7 +253,7 @@ while (!(int(__sh_num($m)) >=int(1))) {
     $__sh_loop_rc1 = $? >> 8;
 }
 $? = ($__sh_loop_rc1) << 8; $CHILD_ERROR = $? >> 8;
-say "until-body-true rc=$CHILD_ERROR";
+say "until-body-true rc=" . __sh_str(($CHILD_ERROR));
 $? = 0 << 8; $CHILD_ERROR = $? >> 8;
 {
     my $__sub_rc = __sh_subshell(sub {
@@ -261,24 +262,24 @@ $? = 0 << 8; $CHILD_ERROR = $? >> 8;
     $CHILD_ERROR = $__sub_rc;
     $? = $__sub_rc << 8;
 }
-say "subshell-exit rc=$CHILD_ERROR";
+say "subshell-exit rc=" . __sh_str(($CHILD_ERROR));
 $? = 0 << 8; $CHILD_ERROR = $? >> 8;
 if (chdir("/tmp")) {
     $? = 0 << 8; $CHILD_ERROR = $? >> 8;
 } else {
-    warn "cd: " . "/tmp" . ": $!\n";
+    warn "$0: line " . __LINE__ . ": cd: " . "/tmp" . ": $!\n";
     $? = 1 << 8; $CHILD_ERROR = $? >> 8;
 }
-say "cd-after-false rc=$CHILD_ERROR";
+say "cd-after-false rc=" . __sh_str(($CHILD_ERROR));
 $? = 0 << 8; $CHILD_ERROR = $? >> 8;
 $? = 0 << 8; $CHILD_ERROR = $? >> 8;
-say "echo-after-false-2 rc=$CHILD_ERROR";
+say "echo-after-false-2 rc=" . __sh_str(($CHILD_ERROR));
 $? = 0 << 8; $CHILD_ERROR = $? >> 8;
 $? = 0 << 8; $CHILD_ERROR = $? >> 8;
-say "true-after-false-2 rc=$CHILD_ERROR";
+say "true-after-false-2 rc=" . __sh_str(($CHILD_ERROR));
 $? = 0 << 8; $CHILD_ERROR = $? >> 8;
 $? = (('1' == '1') ? 0 : 1) << 8; $CHILD_ERROR = $? >> 8;
-say "test-after-false rc=$CHILD_ERROR";
+say "test-after-false rc=" . __sh_str(($CHILD_ERROR));
 $? = 0 << 8; $CHILD_ERROR = $? >> 8;
 system('bash', '-c', q{'cd' '-' > '/dev/null' 2>&1});
 {
@@ -288,7 +289,7 @@ system('bash', '-c', q{'cd' '-' > '/dev/null' 2>&1});
     if (chdir("/no/such/dir")) {
         
     } else {
-        warn "cd: " . "/no/such/dir" . ": $!\n";
+        warn "$0: line " . __LINE__ . ": cd: " . "/no/such/dir" . ": $!\n";
         
     }
     open(STDERR, '>&', $__sh2_dupfh9) or die; close($__sh2_dupfh9);
@@ -331,7 +332,7 @@ open(my $__sh2_duperr13, '>&', \*STDERR) or die; open(my $__sh2_dupferr13, '>&',
     if (chdir("/tmp")) {
         $? = 0 << 8; $CHILD_ERROR = $? >> 8;
     } else {
-        warn "cd: " . "/tmp" . ": $!\n";
+        warn "$0: line " . __LINE__ . ": cd: " . "/tmp" . ": $!\n";
         $? = 1 << 8; $CHILD_ERROR = $? >> 8;
     }
 open(STDERR, '>&', $__sh2_dupferr13) or die; close($__sh2_dupferr13); open(STDERR, '>&', $__sh2_duperr13) or die; 
@@ -385,7 +386,7 @@ if (($? >> 8) == 0) {
 if (chdir("/tmp")) {
     
 } else {
-    warn "cd: " . "/tmp" . ": $!\n";
+    warn "$0: line " . __LINE__ . ": cd: " . "/tmp" . ": $!\n";
     
 }
 do { require File::Path; File::Path::remove_tree('builtin-scratch'); $? = 0 << 8; $CHILD_ERROR = $? >> 8; };

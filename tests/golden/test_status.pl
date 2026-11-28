@@ -17,7 +17,7 @@ if ((0+__sh_str(($? >> 8))) == (0+'0')) {
     $? = 0 << 8;
     }
 $? = ((!length('abc')) ? 0 : 1) << 8;
-print(join(' ', grep { defined($_) && length($_) } split(/\s+/, ($? >> 8))), "\n");
+print(join(' ', grep { defined($_) && length($_) } split(/\s+/, __sh_str(($? >> 8)))), "\n");
 $? = 0 << 8;
 
 exit $? >> 8;

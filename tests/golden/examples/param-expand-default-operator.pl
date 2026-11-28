@@ -1,6 +1,7 @@
 #!/usr/bin/env perl
 use strict;
 use warnings;
+$0 = 'examples/param-expand-default-operator.sh';
 my $BASH_VERSION;
 
 $ENV{BASH_VERSION} //= do { my $v = `bash -c 'echo \$BASH_VERSION'`; chomp $v; $v };

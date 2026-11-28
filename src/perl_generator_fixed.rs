@@ -32,6 +32,19 @@ pub fn generate(prog: &IrProgram) -> String {
     generate_impl(prog, None)
 }
 
+/// `generate` for a caller that knows the SOURCE path. The only difference is
+/// `$0`: the render starts with `$0 = '<path>'`, matching the value bash gives
+/// a script it runs, instead of inheriting whatever name `perl` was invoked
+/// with. Every `$0`-derived string (`Usage: $0 …`, `dirname "$0"`, and the
+/// `bash -c … $0` argv of a delegated command's diagnostic) then agrees with
+/// bash. The shared renderer does the work (`ir::shir_to_perl_named`), so both
+/// emitters get the same line.
+pub fn generate_named(prog: &IrProgram, argv0: &str) -> String {
+    // After the passes, so the `$0` statement lands below the pragmas they
+    // insert rather than between them.
+    crate::ir::with_script_argv0(generate_impl(prog, None), argv0)
+}
+
 /// One named text pass: `(name, fn)`. The name exists so the audit test can
 /// disable a pass by name and prove it is load-bearing (or dead).
 pub(crate) type TextPass = (&'static str, fn(&str) -> String);
@@ -124,7 +137,7 @@ pub(crate) fn generate_impl(prog: &IrProgram, skip_pass: Option<&str>) -> String
     // all explicit-newline prints gets no such import, and `say` is then a
     // `strict subs` compile error. Add it when the body says `say` and the
     // preamble does not.
-    if src.contains("say ") && !src.contains("use feature 'say'") {
+    if (src.contains("say ") || src.contains("say(")) && !src.contains("use feature 'say'") {
         src = inject_before_first_stmt(&src, "use feature 'say';\n");
     }
     src
@@ -1446,24 +1459,37 @@ fn fix_print_newline_to_say(src: &str) -> String {
             // the head must be a single argument: no top-level comma
             Some(head) if !has_toplevel_comma(head) => {
                 // `say "Number: " . ($i)` is `say "Number: $i"`.
-                let head = match concat_chain_to_interp(head) {
-                    Some(interp) => interp,
+                let (head, attached) = match concat_chain_to_interp(head) {
+                    Some(interp) => (interp, false),
                     // A single scalar/literal head needs no chain rewrite —
                     // it is already an interpolating `say` operand, and
                     // `print($x, "\n")` -> `say $x` is the whole point.
-                    None if is_plain_say_operand(head) => head.to_string(),
+                    None if is_plain_say_operand(head) => (head.to_string(), false),
                     // NOT a safe chain: keep the parenthesised call. A bare
                     // `say ($k) . " => " . …` is parsed as `say(...)` fed the
                     // CONCATENATED result — Perl warns ("say (...) interpreted
                     // as function") and the value changes shape.
-                    None => {
-                        out.push_str(&rest[..close + 1]);
-                        rest = &rest[close + 1..];
-                        continue;
-                    }
+                    // Anything else is still a SINGLE value, so `say(EXPR)`
+                    // is byte-identical to `print(EXPR, "\n")`. The bare form
+                    // is unsafe here (`say ($k) . " => " . …` makes Perl feed
+                    // `say` the concatenation and warn), which is why this
+                    // arm is parenthesised rather than skipped: skipping it
+                    // left the whole print un-folded whenever a coerced read
+                    // (`__sh_str($x)`) appeared in the chain, so the fixed
+                    // emitter silently stopped using `say` for exactly the
+                    // statements bash's unset-variable semantics touch.
+                    None => (head.to_string(), true),
                 };
                 out.push_str(&rest[..at]);
-                out.push_str(&format!("say {head}"));
+                // A head that STARTS with `(` must keep the call form:
+                // `say (EXPR) …` is parsed as a bare `say` plus a statement.
+                // Any other chain (`say "rc=" . __sh_str($rc)`) is a normal
+                // list operand and stays idiomatic.
+                if attached && head.trim_start().starts_with('(') {
+                    out.push_str(&format!("say({head})"));
+                } else {
+                    out.push_str(&format!("say {head}"));
+                }
                 rest = &rest[close + 1..];
             }
             _ => {
@@ -6409,14 +6435,24 @@ mod retained_pass_tests {
     }
 
     /// A flat concat chain becomes one interpolating literal — spelling only.
+    ///
+    /// The chain must be made of LITERALS: a chain that reads a variable gets
+    /// `__sh_str($x)` from the shared renderer (bash reads an unset variable as
+    /// the empty string; Perl's undef warns), and folding that into `"…$x…"`
+    /// would reintroduce exactly the warning the coercion removes. The pass is
+    /// therefore pinned on its own input rather than through `055_factorize`,
+    /// whose "Factors of \($n): " head now carries a coerced read.
     #[test]
     fn print_concat_chain_interpolates() {
         assert!(in_table("fix_print_concat_interp"));
-        let (full, prog) = render_example("055_factorize");
-        let off = generate_impl(&prog, Some("fix_print_concat_interp"));
-        assert_ne!(full, off, "the concat chain fold no longer fires");
-        assert!(full.contains("print \"Factors of $n: \";"), "{full}");
-        assert!(off.contains("print(\"Factors of \" . ($n) . \": \");"), "{off}");
+        assert_eq!(
+            fix_print_concat_interp("print(\"Factors of \" . (\"x\") . \": \");\n"),
+            "print \"Factors of x: \";\n"
+        );
+        // A chain with a COERCED read is left alone: folding it would drop the
+        // `__sh_str` and make Perl warn on an unset shell variable.
+        let coerced = "print(\"n=\" . __sh_str($n), \"\\n\");\n";
+        assert_eq!(fix_print_concat_interp(coerced), coerced);
     }
 
     /// A literal `true | false` pipeline: the per-stage statuses bash records

@@ -1,8 +1,15 @@
 #!/usr/bin/env perl
 use strict;
 use warnings;
+$0 = 'examples/002_control_flow.sh';
+
 
 use feature 'say';
+
+sub __sh_str {
+    my $__v = shift();
+    return defined($__v) ? $__v : q{};
+}
 
 sub __sh_num {
     # bash arithmetic, not Perl's numeric context: unset and empty are 0,
@@ -31,18 +38,18 @@ if (-f 'file.txt') {
     }
 for my $__i (("1", "2", "3", "4", "5")) {
     $i = $__i;
-    say "Number: $i";
+    say "Number: " . __sh_str(($i));
     $? = 0 << 8;
     }
 while (int(__sh_num($i)) < int(10)) {
-    say "Counter: $i";
+    say "Counter: " . __sh_str(($i));
     $? = 0 << 8;
         $i = int((__sh_num($i) + 1));
 }
 sub greet {
     local @__sh_args = @_;
     my $__argc = @__sh_args;
-    return "Hello, " . ($__sh_args[0]) . "!";
+    return "Hello, " . __sh_str(($__sh_args[0])) . "!";
 }
 say greet("World");
 $? = 0 << 8;

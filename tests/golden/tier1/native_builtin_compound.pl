@@ -3,8 +3,15 @@ use strict;
 use warnings;
 use feature 'say';
 use English qw(-no_match_vars $ERRNO $EVAL_ERROR $INPUT_RECORD_SEPARATOR $OS_ERROR $PROGRAM_NAME);
+$0 = 'tests/tier1/native_builtin_compound.sh';
 
 our $CHILD_ERROR = 0;
+
+sub __sh_str {
+    my $__v = shift();
+    return defined($__v) ? $__v : q{};
+}
+
 my $x;
 my $y;
 
@@ -133,13 +140,13 @@ sub __sh_pipe_capture {
 
 open(my $__ofh0, '>', 'hay.txt') or die "echo: 'hay.txt': $ERRNO"; print $__ofh0 q{alpha
 }; close $__ofh0; $? = 0 << 8; $CHILD_ERROR = $? >> 8;if (chdir("/no/such/dir")) { print "cd-and-ran\n";
-$? = 0 << 8; $CHILD_ERROR = $? >> 8; } else { warn "cd: " . "/no/such/dir" . ": $!\n"; $? = 1 << 8; $CHILD_ERROR = $? >> 8; }
-say "after-cd-and=$CHILD_ERROR";
+$? = 0 << 8; $CHILD_ERROR = $? >> 8; } else { warn "$0: line " . __LINE__ . ": cd: " . "/no/such/dir" . ": $!\n"; $? = 1 << 8; $CHILD_ERROR = $? >> 8; }
+say "after-cd-and=" . __sh_str(($CHILD_ERROR));
 $? = 0 << 8; $CHILD_ERROR = $? >> 8;
 $? = 0 << 8; $CHILD_ERROR = $? >> 8;
 if (chdir(".")) { print "cd-and-ran\n";
-$? = 0 << 8; $CHILD_ERROR = $? >> 8; } else { warn "cd: " . "." . ": $!\n"; $? = 1 << 8; $CHILD_ERROR = $? >> 8; }
-say "after-cd-ok=$CHILD_ERROR";
+$? = 0 << 8; $CHILD_ERROR = $? >> 8; } else { warn "$0: line " . __LINE__ . ": cd: " . "." . ": $!\n"; $? = 1 << 8; $CHILD_ERROR = $? >> 8; }
+say "after-cd-ok=" . __sh_str(($CHILD_ERROR));
 $? = 0 << 8; $CHILD_ERROR = $? >> 8;
 $? = 0 << 8; $CHILD_ERROR = $? >> 8;
 $? = 0 << 8; $CHILD_ERROR = $? >> 8;
@@ -172,7 +179,7 @@ if (do {
     if (chdir(".")) {
         $? = 0 << 8; $CHILD_ERROR = $? >> 8;
     } else {
-        warn "cd: " . "." . ": $!\n";
+        warn "$0: line " . __LINE__ . ": cd: " . "." . ": $!\n";
         $? = 1 << 8; $CHILD_ERROR = $? >> 8;
     }
     ($? >> 8) == 0
@@ -187,7 +194,7 @@ if (do {
     if (chdir("/no/such/dir")) {
         $? = 0 << 8; $CHILD_ERROR = $? >> 8;
     } else {
-        warn "cd: " . "/no/such/dir" . ": $!\n";
+        warn "$0: line " . __LINE__ . ": cd: " . "/no/such/dir" . ": $!\n";
         $? = 1 << 8; $CHILD_ERROR = $? >> 8;
     }
     ($? >> 8) == 0
@@ -234,15 +241,15 @@ $CHILD_ERROR = $? >> 8;
 print("plain\n");
 $? = 0 << 8; $CHILD_ERROR = $? >> 8;
 $? = 0 << 8; $CHILD_ERROR = $? >> 8;
-say "printf-rc=$CHILD_ERROR";
+say "printf-rc=" . __sh_str(($CHILD_ERROR));
 $? = 0 << 8; $CHILD_ERROR = $? >> 8;
 $? = 0 << 8; $CHILD_ERROR = $? >> 8;
-say "echo-redirect-rc=$CHILD_ERROR";
+say "echo-redirect-rc=" . __sh_str(($CHILD_ERROR));
 $? = 0 << 8; $CHILD_ERROR = $? >> 8;
 $? = 0 << 8; $CHILD_ERROR = $? >> 8;
 if (chdir("/no/such/dir")) { print "never\n";
-$? = 0 << 8; $CHILD_ERROR = $? >> 8; } else { warn "cd: " . "/no/such/dir" . ": $!\n"; $? = 1 << 8; $CHILD_ERROR = $? >> 8; }
-say "compound-rc=$CHILD_ERROR";
+$? = 0 << 8; $CHILD_ERROR = $? >> 8; } else { warn "$0: line " . __LINE__ . ": cd: " . "/no/such/dir" . ": $!\n"; $? = 1 << 8; $CHILD_ERROR = $? >> 8; }
+say "compound-rc=" . __sh_str(($CHILD_ERROR));
 $? = 0 << 8; $CHILD_ERROR = $? >> 8;
 do { my $__ok = 1; for my $__d ('redir/sub') { my $__acc = $__d =~ m{^/} ? '' : '.'; for my $__c (split m{/+}, $__d) { next if $__c eq '' || $__c eq '.'; $__acc .= "/$__c"; next if -d $__acc; unless (mkdir($__acc)) { $__ok = 0; print STDERR "mkdir: $!\n"; last; } } } $? = ($__ok ? 0 : 1) << 8; $CHILD_ERROR = $? >> 8; };
 {
@@ -252,13 +259,13 @@ do { my $__ok = 1; for my $__d ('redir/sub') { my $__acc = $__d =~ m{^/} ? '' : 
     if (chdir("redir")) {
         
     } else {
-        warn "cd: " . "redir" . ": $!\n";
+        warn "$0: line " . __LINE__ . ": cd: " . "redir" . ": $!\n";
         
     }
     open(STDERR, '>&', $__sh2_dupfh0) or die; close($__sh2_dupfh0);
     open(STDERR, '>&', $__sh2_dup0) or die;
 }
-print("redir-pwd=" . (do { my $__sh_cap; $__sh_cap = (do { require File::Basename; File::Basename::basename(do { my $__sh_cap; $__sh_cap = (require Cwd, Cwd::getcwd()); $? = 0 << 8; $CHILD_ERROR = $? >> 8; $__sh_cap }) }); $? = 0 << 8; $CHILD_ERROR = $? >> 8; $__sh_cap =~ s/\n+\z// if defined $__sh_cap; $__sh_cap }), "\n");
+say "redir-pwd=" . (do { my $__sh_cap; $__sh_cap = (do { require File::Basename; File::Basename::basename(do { my $__sh_cap; $__sh_cap = (require Cwd, Cwd::getcwd()); $? = 0 << 8; $CHILD_ERROR = $? >> 8; $__sh_cap }) }); $? = 0 << 8; $CHILD_ERROR = $? >> 8; $__sh_cap =~ s/\n+\z// if defined $__sh_cap; $__sh_cap });
 {
     open(my $__sh2_dup1, '>&', \*STDERR) or die;
     open(my $__sh2_dupfh1, '>&', \*STDERR) or die;
@@ -266,18 +273,18 @@ print("redir-pwd=" . (do { my $__sh_cap; $__sh_cap = (do { require File::Basenam
     if (chdir("/no/such/dir")) {
         $? = 0 << 8; $CHILD_ERROR = $? >> 8;
     } else {
-        warn "cd: " . "/no/such/dir" . ": $!\n";
+        warn "$0: line " . __LINE__ . ": cd: " . "/no/such/dir" . ": $!\n";
         $? = 1 << 8; $CHILD_ERROR = $? >> 8;
     }
     open(STDERR, '>&', $__sh2_dupfh1) or die; close($__sh2_dupfh1);
     open(STDERR, '>&', $__sh2_dup1) or die;
 }
-say "redir-cd-rc=$CHILD_ERROR";
+say "redir-cd-rc=" . __sh_str(($CHILD_ERROR));
 $? = 0 << 8; $CHILD_ERROR = $? >> 8;
 if (chdir("..")) {
     
 } else {
-    warn "cd: " . ".." . ": $!\n";
+    warn "$0: line " . __LINE__ . ": cd: " . ".." . ": $!\n";
     
 }
 do { require File::Path; File::Path::remove_tree('redir', 'made'); $? = 0 << 8; $CHILD_ERROR = $? >> 8; };
@@ -289,21 +296,21 @@ do { my $__ok = 1; for my $__d ('redir/sub') { my $__acc = $__d =~ m{^/} ? '' : 
     if (chdir("redir")) {
         $? = 0 << 8; $CHILD_ERROR = $? >> 8;
     } else {
-        warn "cd: " . "redir" . ": $!\n";
+        warn "$0: line " . __LINE__ . ": cd: " . "redir" . ": $!\n";
         $? = 1 << 8; $CHILD_ERROR = $? >> 8;
     }
     open(STDERR, '>&', $__sh2_dupfh2) or die; close($__sh2_dupfh2);
     open(STDERR, '>&', $__sh2_dup2) or die;
 }
 if ($? == 0) {
-    print("redir-and=" . (do { my $__sh_cap; $__sh_cap = (do { require File::Basename; File::Basename::basename(do { my $__sh_cap; $__sh_cap = (require Cwd, Cwd::getcwd()); $? = 0 << 8; $CHILD_ERROR = $? >> 8; $__sh_cap }) }); $? = 0 << 8; $CHILD_ERROR = $? >> 8; $__sh_cap =~ s/\n+\z// if defined $__sh_cap; $__sh_cap }), "\n");
+    say "redir-and=" . (do { my $__sh_cap; $__sh_cap = (do { require File::Basename; File::Basename::basename(do { my $__sh_cap; $__sh_cap = (require Cwd, Cwd::getcwd()); $? = 0 << 8; $CHILD_ERROR = $? >> 8; $__sh_cap }) }); $? = 0 << 8; $CHILD_ERROR = $? >> 8; $__sh_cap =~ s/\n+\z// if defined $__sh_cap; $__sh_cap });
     } else {
 $CHILD_ERROR = $? >> 8;
 }
 if (chdir("..")) {
     
 } else {
-    warn "cd: " . ".." . ": $!\n";
+    warn "$0: line " . __LINE__ . ": cd: " . ".." . ": $!\n";
     
 }
 if (do {
@@ -311,18 +318,18 @@ open(my $__sh2_duperr3, '>&', \*STDERR) or die; open(my $__sh2_dupferr3, '>&', \
     if (chdir("redir")) {
         $? = 0 << 8; $CHILD_ERROR = $? >> 8;
     } else {
-        warn "cd: " . "redir" . ": $!\n";
+        warn "$0: line " . __LINE__ . ": cd: " . "redir" . ": $!\n";
         $? = 1 << 8; $CHILD_ERROR = $? >> 8;
     }
 open(STDERR, '>&', $__sh2_dupferr3) or die; close($__sh2_dupferr3); open(STDERR, '>&', $__sh2_duperr3) or die; 
 ($CHILD_ERROR == 0)
 }) {
-    print("redir-if=" . (do { my $__sh_cap; $__sh_cap = (do { require File::Basename; File::Basename::basename(do { my $__sh_cap; $__sh_cap = (require Cwd, Cwd::getcwd()); $? = 0 << 8; $CHILD_ERROR = $? >> 8; $__sh_cap }) }); $? = 0 << 8; $CHILD_ERROR = $? >> 8; $__sh_cap =~ s/\n+\z// if defined $__sh_cap; $__sh_cap }), "\n");
+    say "redir-if=" . (do { my $__sh_cap; $__sh_cap = (do { require File::Basename; File::Basename::basename(do { my $__sh_cap; $__sh_cap = (require Cwd, Cwd::getcwd()); $? = 0 << 8; $CHILD_ERROR = $? >> 8; $__sh_cap }) }); $? = 0 << 8; $CHILD_ERROR = $? >> 8; $__sh_cap =~ s/\n+\z// if defined $__sh_cap; $__sh_cap });
     }
 if (chdir("..")) {
     
 } else {
-    warn "cd: " . ".." . ": $!\n";
+    warn "$0: line " . __LINE__ . ": cd: " . ".." . ": $!\n";
     
 }
 do { require File::Path; File::Path::remove_tree('redir'); $? = 0 << 8; $CHILD_ERROR = $? >> 8; };
@@ -337,7 +344,7 @@ if ($CHILD_ERROR != 0) {
     $? = 0 << 8; $CHILD_ERROR = $? >> 8;
 
 }
-say "redir-chain-rc=$CHILD_ERROR";
+say "redir-chain-rc=" . __sh_str(($CHILD_ERROR));
 $? = 0 << 8; $CHILD_ERROR = $? >> 8;
 $? = 0 << 8; $CHILD_ERROR = $? >> 8;
 {
@@ -351,7 +358,7 @@ if ($CHILD_ERROR != 0) {
     $? = 0 << 8; $CHILD_ERROR = $? >> 8;
 
 }
-say "redir-chain-rc2=$CHILD_ERROR";
+say "redir-chain-rc2=" . __sh_str(($CHILD_ERROR));
 $? = 0 << 8; $CHILD_ERROR = $? >> 8;
 do { require File::Path; File::Path::remove_tree('redir-chain'); $? = 0 << 8; $CHILD_ERROR = $? >> 8; };
 {
@@ -365,15 +372,15 @@ if ($CHILD_ERROR != 0) {
     $? = 0 << 8; $CHILD_ERROR = $? >> 8;
 
 }
-say "redir-touch-rc=$CHILD_ERROR";
+say "redir-touch-rc=" . __sh_str(($CHILD_ERROR));
 $? = 0 << 8; $CHILD_ERROR = $? >> 8;
 $? = 0 << 8; $CHILD_ERROR = $? >> 8;
 $x = do { __sh_pipe_capture(q{'cd' '/no/such/dir'; 'echo' $?}, "pipefail") };
-say "captured-cd-rc=$x";
+say "captured-cd-rc=" . __sh_str(($x));
 $? = 0 << 8; $CHILD_ERROR = $? >> 8;
 $? = 0 << 8; $CHILD_ERROR = $? >> 8;
 $y = do { __sh_pipe_capture(q{'cd' '.'; 'echo' $?}, "pipefail") };
-say "captured-cd-ok=$y";
+say "captured-cd-ok=" . __sh_str(($y));
 $? = 0 << 8; $CHILD_ERROR = $? >> 8;
 $? = 0 << 8; $CHILD_ERROR = $? >> 8;
 {
@@ -383,7 +390,7 @@ $? = 0 << 8; $CHILD_ERROR = $? >> 8;
     if (chdir("/no/such/dir")) {
         $? = 0 << 8; $CHILD_ERROR = $? >> 8;
     } else {
-        warn "cd: " . "/no/such/dir" . ": $!\n";
+        warn "$0: line " . __LINE__ . ": cd: " . "/no/such/dir" . ": $!\n";
         $? = 1 << 8; $CHILD_ERROR = $? >> 8;
     }
     open(STDERR, '>&', $__sh2_dupfh7) or die; close($__sh2_dupfh7);
@@ -396,12 +403,12 @@ if ($? == 0) {
 } else {
 $CHILD_ERROR = $? >> 8;
 }
-say "cb-cd-and=$CHILD_ERROR";
+say "cb-cd-and=" . __sh_str(($CHILD_ERROR));
 $? = 0 << 8; $CHILD_ERROR = $? >> 8;
 $? = 0 << 8; $CHILD_ERROR = $? >> 8;
 if (chdir(".")) { print "cb-cd-and-ok\n";
-$? = 0 << 8; $CHILD_ERROR = $? >> 8; } else { warn "cd: " . "." . ": $!\n"; $? = 1 << 8; $CHILD_ERROR = $? >> 8; }
-say "cb-cd-and-ok=$CHILD_ERROR";
+$? = 0 << 8; $CHILD_ERROR = $? >> 8; } else { warn "$0: line " . __LINE__ . ": cd: " . "." . ": $!\n"; $? = 1 << 8; $CHILD_ERROR = $? >> 8; }
+say "cb-cd-and-ok=" . __sh_str(($CHILD_ERROR));
 $? = 0 << 8; $CHILD_ERROR = $? >> 8;
 $? = 0 << 8; $CHILD_ERROR = $? >> 8;
 {
@@ -409,7 +416,7 @@ open(my $__sh2_duperr8, '>&', \*STDERR) or die; open(my $__sh2_dupferr8, '>&', \
     if (chdir("/no/such/dir")) {
         $? = 0 << 8; $CHILD_ERROR = $? >> 8;
     } else {
-        warn "cd: " . "/no/such/dir" . ": $!\n";
+        warn "$0: line " . __LINE__ . ": cd: " . "/no/such/dir" . ": $!\n";
         $? = 1 << 8; $CHILD_ERROR = $? >> 8;
     }
 
@@ -420,7 +427,7 @@ if ($CHILD_ERROR != 0) {
     $? = 0 << 8; $CHILD_ERROR = $? >> 8;
 
 }
-say "cb-cd-or=$CHILD_ERROR";
+say "cb-cd-or=" . __sh_str(($CHILD_ERROR));
 $? = 0 << 8; $CHILD_ERROR = $? >> 8;
 $? = 0 << 8; $CHILD_ERROR = $? >> 8;
 $? = (((do {
@@ -428,7 +435,7 @@ open(my $__sh2_duperr9, '>&', \*STDERR) or die; open(my $__sh2_dupferr9, '>&', \
     if (chdir("/no/such/dir")) {
         $? = 0 << 8; $CHILD_ERROR = $? >> 8;
     } else {
-        warn "cd: " . "/no/such/dir" . ": $!\n";
+        warn "$0: line " . __LINE__ . ": cd: " . "/no/such/dir" . ": $!\n";
         $? = 1 << 8; $CHILD_ERROR = $? >> 8;
     }
 open(STDERR, '>&', $__sh2_dupferr9) or die; close($__sh2_dupferr9); open(STDERR, '>&', $__sh2_duperr9) or die; 
@@ -438,14 +445,14 @@ if (($? >> 8) == 0) {
     print "cb-bang-cd\n";
     $? = 0 << 8; $CHILD_ERROR = $? >> 8;
 }
-say "cb-bang-cd=$CHILD_ERROR";
+say "cb-bang-cd=" . __sh_str(($CHILD_ERROR));
 $? = 0 << 8; $CHILD_ERROR = $? >> 8;
 $? = 0 << 8; $CHILD_ERROR = $? >> 8;
 $? = (((do {
     if (chdir(".")) {
         $? = 0 << 8; $CHILD_ERROR = $? >> 8;
     } else {
-        warn "cd: " . "." . ": $!\n";
+        warn "$0: line " . __LINE__ . ": cd: " . "." . ": $!\n";
         $? = 1 << 8; $CHILD_ERROR = $? >> 8;
     }
     ($? >> 8) == 0
@@ -454,7 +461,7 @@ if (($? >> 8) == 0) {
     print "cb-bang-cd-ran\n";
     $? = 0 << 8; $CHILD_ERROR = $? >> 8;
 }
-say "cb-bang-cd-ran=$CHILD_ERROR";
+say "cb-bang-cd-ran=" . __sh_str(($CHILD_ERROR));
 $? = 0 << 8; $CHILD_ERROR = $? >> 8;
 do { my $__ok = 1; for my $__t ('cb-file') { if (open(my $__h, '>>', $__t)) { close($__h); } else { $__ok = 0; print STDERR "touch: cannot touch '$__t': $!\n"; } } $? = ($__ok ? 0 : 1) << 8; $CHILD_ERROR = $? >> 8; };
 do { unlink('cb-file'); $? = 0 << 8; $CHILD_ERROR = $? >> 8; };
@@ -465,7 +472,7 @@ if ($? == 0) {
 } else {
 $CHILD_ERROR = $? >> 8;
 }
-say "cb-rm-and=$CHILD_ERROR";
+say "cb-rm-and=" . __sh_str(($CHILD_ERROR));
 $? = 0 << 8; $CHILD_ERROR = $? >> 8;
 do { my $__ok = 1; for my $__d ('cb-dir') { unless (mkdir($__d)) { $__ok = 0; print STDERR "mkdir: $!\n"; } } $? = ($__ok ? 0 : 1) << 8; $CHILD_ERROR = $? >> 8; };
 {
@@ -483,7 +490,7 @@ if ($? == 0) {
 } else {
 $CHILD_ERROR = $? >> 8;
 }
-say "cb-rm-dir-fail=$CHILD_ERROR";
+say "cb-rm-dir-fail=" . __sh_str(($CHILD_ERROR));
 $? = 0 << 8; $CHILD_ERROR = $? >> 8;
 $? = 0 << 8; $CHILD_ERROR = $? >> 8;
 {
@@ -497,7 +504,7 @@ if ($CHILD_ERROR != 0) {
     $? = 0 << 8; $CHILD_ERROR = $? >> 8;
 
 }
-say "cb-rm-or=$CHILD_ERROR";
+say "cb-rm-or=" . __sh_str(($CHILD_ERROR));
 $? = 0 << 8; $CHILD_ERROR = $? >> 8;
 do { my $__ok = 1; for my $__d ('cb-dir') { unless (rmdir($__d)) { $__ok = 0; print STDERR "rmdir: failed to remove '$__d': $!\n"; } } $? = ($__ok ? 0 : 1) << 8; $CHILD_ERROR = $? >> 8; };
 do { my $__ok = 1; for my $__d ('cb-rd') { unless (mkdir($__d)) { $__ok = 0; print STDERR "mkdir: $!\n"; } } $? = ($__ok ? 0 : 1) << 8; $CHILD_ERROR = $? >> 8; };
@@ -509,7 +516,7 @@ if ($? == 0) {
 } else {
 $CHILD_ERROR = $? >> 8;
 }
-say "cb-rmdir-and=$CHILD_ERROR";
+say "cb-rmdir-and=" . __sh_str(($CHILD_ERROR));
 $? = 0 << 8; $CHILD_ERROR = $? >> 8;
 $? = 0 << 8; $CHILD_ERROR = $? >> 8;
 {
@@ -527,7 +534,7 @@ if ($? == 0) {
 } else {
 $CHILD_ERROR = $? >> 8;
 }
-say "cb-rmdir-fail=$CHILD_ERROR";
+say "cb-rmdir-fail=" . __sh_str(($CHILD_ERROR));
 $? = 0 << 8; $CHILD_ERROR = $? >> 8;
 $? = 0 << 8; $CHILD_ERROR = $? >> 8;
 {
@@ -541,7 +548,7 @@ if ($CHILD_ERROR != 0) {
     $? = 0 << 8; $CHILD_ERROR = $? >> 8;
 
 }
-say "cb-rmdir-or=$CHILD_ERROR";
+say "cb-rmdir-or=" . __sh_str(($CHILD_ERROR));
 $? = 0 << 8; $CHILD_ERROR = $? >> 8;
 $? = 0 << 8; $CHILD_ERROR = $? >> 8;
 do { my $__ok = 1; for my $__d ('cb-md') { unless (mkdir($__d)) { $__ok = 0; print STDERR "mkdir: $!\n"; } } $? = ($__ok ? 0 : 1) << 8; $CHILD_ERROR = $? >> 8; };
@@ -552,7 +559,7 @@ if ($? == 0) {
 } else {
 $CHILD_ERROR = $? >> 8;
 }
-say "cb-mkdir-and=$CHILD_ERROR";
+say "cb-mkdir-and=" . __sh_str(($CHILD_ERROR));
 $? = 0 << 8; $CHILD_ERROR = $? >> 8;
 $? = 0 << 8; $CHILD_ERROR = $? >> 8;
 {
@@ -570,7 +577,7 @@ if ($? == 0) {
 } else {
 $CHILD_ERROR = $? >> 8;
 }
-say "cb-mkdir-fail=$CHILD_ERROR";
+say "cb-mkdir-fail=" . __sh_str(($CHILD_ERROR));
 $? = 0 << 8; $CHILD_ERROR = $? >> 8;
 $? = 0 << 8; $CHILD_ERROR = $? >> 8;
 {
@@ -584,7 +591,7 @@ if ($CHILD_ERROR != 0) {
     $? = 0 << 8; $CHILD_ERROR = $? >> 8;
 
 }
-say "cb-mkdir-or=$CHILD_ERROR";
+say "cb-mkdir-or=" . __sh_str(($CHILD_ERROR));
 $? = 0 << 8; $CHILD_ERROR = $? >> 8;
 do { my $__ok = 1; for my $__d ('cb-md') { unless (rmdir($__d)) { $__ok = 0; print STDERR "rmdir: failed to remove '$__d': $!\n"; } } $? = ($__ok ? 0 : 1) << 8; $CHILD_ERROR = $? >> 8; };
 do { my $__ok = 1; for my $__t ('cb-t') { if (open(my $__h, '>>', $__t)) { close($__h); } else { $__ok = 0; print STDERR "touch: cannot touch '$__t': $!\n"; } } $? = ($__ok ? 0 : 1) << 8; $CHILD_ERROR = $? >> 8; };
@@ -595,7 +602,7 @@ if ($? == 0) {
 } else {
 $CHILD_ERROR = $? >> 8;
 }
-say "cb-touch-and=$CHILD_ERROR";
+say "cb-touch-and=" . __sh_str(($CHILD_ERROR));
 $? = 0 << 8; $CHILD_ERROR = $? >> 8;
 $? = 0 << 8; $CHILD_ERROR = $? >> 8;
 {
@@ -613,7 +620,7 @@ if ($? == 0) {
 } else {
 $CHILD_ERROR = $? >> 8;
 }
-say "cb-touch-fail=$CHILD_ERROR";
+say "cb-touch-fail=" . __sh_str(($CHILD_ERROR));
 $? = 0 << 8; $CHILD_ERROR = $? >> 8;
 $? = 0 << 8; $CHILD_ERROR = $? >> 8;
 {
@@ -627,7 +634,7 @@ if ($CHILD_ERROR != 0) {
     $? = 0 << 8; $CHILD_ERROR = $? >> 8;
 
 }
-say "cb-touch-or=$CHILD_ERROR";
+say "cb-touch-or=" . __sh_str(($CHILD_ERROR));
 $? = 0 << 8; $CHILD_ERROR = $? >> 8;
 do { unlink('cb-t'); $? = 0 << 8; $CHILD_ERROR = $? >> 8; };
 print "cb-a\n";
@@ -640,7 +647,7 @@ if ($? == 0) {
 } else {
 $CHILD_ERROR = $? >> 8;
 }
-say "cb-echo-and=$CHILD_ERROR";
+say "cb-echo-and=" . __sh_str(($CHILD_ERROR));
 $? = 0 << 8; $CHILD_ERROR = $? >> 8;
 $? = 1 << 8; $CHILD_ERROR = $? >> 8;
 print "cb-b\n";
@@ -649,7 +656,7 @@ if (($? >> 8) != 0) {
     print "cb-echo-or-BAD\n";
     $? = 0 << 8; $CHILD_ERROR = $? >> 8;
 }
-say "cb-echo-or=$CHILD_ERROR";
+say "cb-echo-or=" . __sh_str(($CHILD_ERROR));
 $? = 0 << 8; $CHILD_ERROR = $? >> 8;
 $? = 0 << 8; $CHILD_ERROR = $? >> 8;
 print("cb-p\n");
@@ -662,7 +669,7 @@ if ($? == 0) {
 } else {
 $CHILD_ERROR = $? >> 8;
 }
-say "cb-printf-and=$CHILD_ERROR";
+say "cb-printf-and=" . __sh_str(($CHILD_ERROR));
 $? = 0 << 8; $CHILD_ERROR = $? >> 8;
 $? = 0 << 8; $CHILD_ERROR = $? >> 8;
 {
@@ -707,7 +714,7 @@ if ($? == 0) {
 } else {
 $CHILD_ERROR = $? >> 8;
 }
-say "cb-printf-fail=$CHILD_ERROR";
+say "cb-printf-fail=" . __sh_str(($CHILD_ERROR));
 $? = 0 << 8; $CHILD_ERROR = $? >> 8;
 $? = 0 << 8; $CHILD_ERROR = $? >> 8;
 {
@@ -748,7 +755,7 @@ if ($CHILD_ERROR != 0) {
     $? = 0 << 8; $CHILD_ERROR = $? >> 8;
 
 }
-say "cb-printf-or=$CHILD_ERROR";
+say "cb-printf-or=" . __sh_str(($CHILD_ERROR));
 $? = 0 << 8; $CHILD_ERROR = $? >> 8;
 $? = 0 << 8; $CHILD_ERROR = $? >> 8;
 $? = 0 << 8; $CHILD_ERROR = $? >> 8;
@@ -759,7 +766,7 @@ if ($? == 0) {
 } else {
 $CHILD_ERROR = $? >> 8;
 }
-say "cb-true-and=$CHILD_ERROR";
+say "cb-true-and=" . __sh_str(($CHILD_ERROR));
 $? = 0 << 8; $CHILD_ERROR = $? >> 8;
 $? = 0 << 8; $CHILD_ERROR = $? >> 8;
 $? = 1 << 8; $CHILD_ERROR = $? >> 8;
@@ -770,7 +777,7 @@ if ($? == 0) {
 } else {
 $CHILD_ERROR = $? >> 8;
 }
-say "cb-false-and=$CHILD_ERROR";
+say "cb-false-and=" . __sh_str(($CHILD_ERROR));
 $? = 0 << 8; $CHILD_ERROR = $? >> 8;
 $? = 0 << 8; $CHILD_ERROR = $? >> 8;
 $? = 1 << 8; $CHILD_ERROR = $? >> 8;
@@ -778,7 +785,7 @@ if (($? >> 8) != 0) {
     print "cb-false-or\n";
     $? = 0 << 8; $CHILD_ERROR = $? >> 8;
 }
-say "cb-false-or=$CHILD_ERROR";
+say "cb-false-or=" . __sh_str(($CHILD_ERROR));
 $? = 0 << 8; $CHILD_ERROR = $? >> 8;
 $? = 0 << 8; $CHILD_ERROR = $? >> 8;
 $? = 0 << 8; $CHILD_ERROR = $? >> 8;
@@ -786,7 +793,7 @@ if (($? >> 8) != 0) {
     print "cb-true-or-BAD\n";
     $? = 0 << 8; $CHILD_ERROR = $? >> 8;
 }
-say "cb-true-or=$CHILD_ERROR";
+say "cb-true-or=" . __sh_str(($CHILD_ERROR));
 $? = 0 << 8; $CHILD_ERROR = $? >> 8;
 $? = 0 << 8; $CHILD_ERROR = $? >> 8;
 $? = (((do {
@@ -797,7 +804,7 @@ if (($? >> 8) != 0) {
     print "cb-bang-true-or\n";
     $? = 0 << 8; $CHILD_ERROR = $? >> 8;
 }
-say "cb-bang-true-or=$CHILD_ERROR";
+say "cb-bang-true-or=" . __sh_str(($CHILD_ERROR));
 $? = 0 << 8; $CHILD_ERROR = $? >> 8;
 $? = 0 << 8; $CHILD_ERROR = $? >> 8;
 $? = (((do {
@@ -808,7 +815,7 @@ if (($? >> 8) == 0) {
     print "cb-bang-false-and\n";
     $? = 0 << 8; $CHILD_ERROR = $? >> 8;
 }
-say "cb-bang-false-and=$CHILD_ERROR";
+say "cb-bang-false-and=" . __sh_str(($CHILD_ERROR));
 $? = 0 << 8; $CHILD_ERROR = $? >> 8;
 $CHILD_ERROR = (-f '/etc/passwd') ? 0 : 1;
 if (-f '/etc/passwd') {
@@ -817,7 +824,7 @@ if (-f '/etc/passwd') {
 } else {
     $? = 1 << 8; $CHILD_ERROR = $? >> 8;
 }
-say "cb-bracket-and=$CHILD_ERROR";
+say "cb-bracket-and=" . __sh_str(($CHILD_ERROR));
 $? = 0 << 8; $CHILD_ERROR = $? >> 8;
 $CHILD_ERROR = (-f '/no/passwd') ? 0 : 1;
 if (-f '/no/passwd') {
@@ -826,7 +833,7 @@ if (-f '/no/passwd') {
 } else {
     $? = 1 << 8; $CHILD_ERROR = $? >> 8;
 }
-say "cb-bracket-fail=$CHILD_ERROR";
+say "cb-bracket-fail=" . __sh_str(($CHILD_ERROR));
 $? = 0 << 8; $CHILD_ERROR = $? >> 8;
 if (!(-f '/no/passwd')) {
     print "cb-bracket-or\n";
@@ -834,7 +841,7 @@ if (!(-f '/no/passwd')) {
 } else {
     $? = 0 << 8; $CHILD_ERROR = $? >> 8;
 }
-say "cb-bracket-or=$CHILD_ERROR";
+say "cb-bracket-or=" . __sh_str(($CHILD_ERROR));
 $? = 0 << 8; $CHILD_ERROR = $? >> 8;
 if ((-d '/tmp' && -f '/etc/passwd')) {
     print "cb-bracket-chain\n";
@@ -842,7 +849,7 @@ if ((-d '/tmp' && -f '/etc/passwd')) {
 } else {
     $? = 1 << 8; $CHILD_ERROR = $? >> 8;
 }
-say "cb-bracket-chain=$CHILD_ERROR";
+say "cb-bracket-chain=" . __sh_str(($CHILD_ERROR));
 $? = 0 << 8; $CHILD_ERROR = $? >> 8;
 $CHILD_ERROR = (-d '/tmp') ? 0 : 1;
 if (-d '/tmp') {
@@ -851,7 +858,7 @@ if (-d '/tmp') {
 } else {
     $? = 1 << 8; $CHILD_ERROR = $? >> 8;
 }
-say "cb-dbl-and=$CHILD_ERROR";
+say "cb-dbl-and=" . __sh_str(($CHILD_ERROR));
 $? = 0 << 8; $CHILD_ERROR = $? >> 8;
 $CHILD_ERROR = (-f '/no/x') ? 0 : 1;
 if (-f '/no/x') {
@@ -860,7 +867,7 @@ if (-f '/no/x') {
 } else {
     $? = 1 << 8; $CHILD_ERROR = $? >> 8;
 }
-say "cb-dbl-fail=$CHILD_ERROR";
+say "cb-dbl-fail=" . __sh_str(($CHILD_ERROR));
 $? = 0 << 8; $CHILD_ERROR = $? >> 8;
 if (!(-f '/no/x')) {
     print "cb-dbl-or\n";
@@ -868,7 +875,7 @@ if (!(-f '/no/x')) {
 } else {
     $? = 0 << 8; $CHILD_ERROR = $? >> 8;
 }
-say "cb-dbl-or=$CHILD_ERROR";
+say "cb-dbl-or=" . __sh_str(($CHILD_ERROR));
 $? = 0 << 8; $CHILD_ERROR = $? >> 8;
 if ((-d '/tmp' && -f '/etc/passwd')) {
     print "cb-dbl-both\n";
@@ -876,7 +883,7 @@ if ((-d '/tmp' && -f '/etc/passwd')) {
 } else {
     $? = 1 << 8; $CHILD_ERROR = $? >> 8;
 }
-say "cb-dbl-both=$CHILD_ERROR";
+say "cb-dbl-both=" . __sh_str(($CHILD_ERROR));
 $? = 0 << 8; $CHILD_ERROR = $? >> 8;
 if (!(-f '/no/x')) {
     print "cb-bang-dbl\n";
@@ -884,7 +891,7 @@ if (!(-f '/no/x')) {
 } else {
     $? = 1 << 8; $CHILD_ERROR = $? >> 8;
 }
-say "cb-bang-dbl=$CHILD_ERROR";
+say "cb-bang-dbl=" . __sh_str(($CHILD_ERROR));
 $? = 0 << 8; $CHILD_ERROR = $? >> 8;
 $? = 0 << 8; $CHILD_ERROR = $? >> 8;
 {
@@ -894,7 +901,7 @@ $? = 0 << 8; $CHILD_ERROR = $? >> 8;
     if (chdir("/no/such/dir")) {
         $? = 0 << 8; $CHILD_ERROR = $? >> 8;
     } else {
-        warn "cd: " . "/no/such/dir" . ": $!\n";
+        warn "$0: line " . __LINE__ . ": cd: " . "/no/such/dir" . ": $!\n";
         $? = 1 << 8; $CHILD_ERROR = $? >> 8;
     }
     open(STDERR, '>&', $__sh2_dupfh20) or die; close($__sh2_dupfh20);
@@ -907,14 +914,14 @@ if ($? == 0) {
 } else {
 $CHILD_ERROR = $? >> 8;
 }
-say "cb-later=$CHILD_ERROR";
+say "cb-later=" . __sh_str(($CHILD_ERROR));
 $? = 0 << 8; $CHILD_ERROR = $? >> 8;
 print "cb-still-running\n";
 $? = 0 << 8; $CHILD_ERROR = $? >> 8;
 $? = 1 << 8; $CHILD_ERROR = $? >> 8;
 if (chdir(".")) { print "cb-cd-after-false\n";
-$? = 0 << 8; $CHILD_ERROR = $? >> 8; } else { warn "cd: " . "." . ": $!\n"; $? = 1 << 8; $CHILD_ERROR = $? >> 8; }
-say "cb-cd-after-false=$CHILD_ERROR";
+$? = 0 << 8; $CHILD_ERROR = $? >> 8; } else { warn "$0: line " . __LINE__ . ": cd: " . "." . ": $!\n"; $? = 1 << 8; $CHILD_ERROR = $? >> 8; }
+say "cb-cd-after-false=" . __sh_str(($CHILD_ERROR));
 $? = 0 << 8; $CHILD_ERROR = $? >> 8;
 $? = 1 << 8; $CHILD_ERROR = $? >> 8;
 $? = 0 << 8; $CHILD_ERROR = $? >> 8;
@@ -925,7 +932,7 @@ if ($? == 0) {
 } else {
 $CHILD_ERROR = $? >> 8;
 }
-say "cb-true-after-false=$CHILD_ERROR";
+say "cb-true-after-false=" . __sh_str(($CHILD_ERROR));
 $? = 0 << 8; $CHILD_ERROR = $? >> 8;
 $CHILD_ERROR = (-f '/etc/passwd') ? 0 : 1;
 if (-f '/etc/passwd') {
@@ -934,7 +941,7 @@ if (-f '/etc/passwd') {
 } else {
     $? = 1 << 8; $CHILD_ERROR = $? >> 8;
 }
-say "cb-test-after-false=$CHILD_ERROR";
+say "cb-test-after-false=" . __sh_str(($CHILD_ERROR));
 $? = 0 << 8; $CHILD_ERROR = $? >> 8;
 $? = 0 << 8; $CHILD_ERROR = $? >> 8;
 

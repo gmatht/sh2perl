@@ -130,7 +130,10 @@ for f in "${examples[@]}"; do
     # (`perl_generator_fixed::generate`): the single renderer plus the
     # IR/text fixups the CLI applies. Testing bare `shir_to_perl` here would
     # gate a pipeline no user gets.
-    "$BIN" --fixed "$f" >"$pl.rendered" 2>"$tmp/render.err"; render_rc=$?
+    # The renderer installs the SOURCE path as `$0` (bash's `$0` is the path
+    # the shell was invoked with), so render with the ABSOLUTE path here: bash
+    # below runs `$root/$f`, and both sides are normalised to `<script>`.
+    "$BIN" --fixed "$root/$f" >"$pl.rendered" 2>"$tmp/render.err"; render_rc=$?
     if is_parse_error_fixture "$name"; then
         if [ "$render_rc" = 2 ]; then
             echo "ok   $name (parse-error fixture, rejected as intended)"
@@ -146,13 +149,9 @@ for f in "${examples[@]}"; do
         fail=1
         continue
     fi
-    # The rendered program runs as a temp `.pl`, so its `$0` would name that
-    # temp file. bash's `$0` is the script path AS INVOKED, and ordinary
-    # scripts derive their own location from it
-    # (`script_dir=$(cd -- "$(dirname "$0")" && pwd)`). Give the Perl the same
-    # `$0` so that derivation is compared on behaviour, not on the harness's
-    # choice of filename (057_case, qx-var-builtin-cd).
-    { printf '$0 = %s;\n' "'$root/$f'"; cat "$pl.rendered"; } >"$pl"
+    # `$0` is already installed by the renderer (above), so the temp `.pl`
+    # keeps the script's own name instead of being renamed to a temp file.
+    cp "$pl.rendered" "$pl"
     if ! perl -w -c "$pl" >/dev/null 2>"$tmp/perl-c.err"; then
         echo "FAIL $name: perl -c"
         sed -n '1,5p' "$tmp/perl-c.err"

@@ -2,6 +2,7 @@
 use strict;
 use warnings;
 use English qw(-no_match_vars $ERRNO $EVAL_ERROR $INPUT_RECORD_SEPARATOR $OS_ERROR $PROGRAM_NAME);
+$0 = 'examples/000__04h_complex_examples.sh';
 
 my $main_exit_code = 0;
 our $CHILD_ERROR = 0;
@@ -184,16 +185,16 @@ sub __sh_pipe_capture {
 # __SH_RUN_EXT_END
 
 $d = do { my $__sh_cap; $__sh_cap = do { require File::Temp; File::Temp::tempdir('sh2_ps_XXXXXX', TMPDIR => 1, CLEANUP => 0) }; $? = 0 << 8; $CHILD_ERROR = $? >> 8; $__sh_cap =~ s/\n+\z// if defined $__sh_cap; $__sh_cap };
-chdir($d) or do { warn "cd: " . $d . ": $!\n"; exit "1"; };
+chdir($d) or do { warn "$0: line " . __LINE__ . ": cd: " . $d . ": $!\n"; exit "1"; };
 print "=== Complex Backtick Examples ===\n";
 $? = 0 << 8; $CHILD_ERROR = $? >> 8;
-$nested_result = do { my $__cap = ''; { local *STDOUT; open(STDOUT, '>', \$__cap) or die "capture: $!\n";     print("Three wells: " . (do { my $__cap = ''; open my $__fh, '>', \$__cap or die; my $__old = select($__fh); print(('well' . "\n") x 3); $? = 0; close $__fh; select($__old); $__cap =~ s/\n+\z//; $__cap }), "\n");
+$nested_result = do { my $__cap = ''; { local *STDOUT; open(STDOUT, '>', \$__cap) or die "capture: $!\n";     say "Three wells: " . (do { my $__cap = ''; open my $__fh, '>', \$__cap or die; my $__old = select($__fh); print(('well' . "\n") x 3); $? = 0; close $__fh; select($__old); $__cap =~ s/\n+\z//; $__cap });
     $? = 0 << 8; $CHILD_ERROR = $? >> 8;
 ;; } $__cap =~ s/\n+\z//; $__cap };
-say "Nested backticks: $nested_result";
+say "Nested backticks: " . __sh_str(($nested_result));
 $? = 0 << 8; $CHILD_ERROR = $? >> 8;
 $count = do { my $__cap = ''; { local *STDOUT; open(STDOUT, '>', \$__cap) or die "capture: $!\n"; do { opendir(my $__h, '.') or return; my $__n = grep { !/^\.\.?$/ } readdir($__h); closedir $__h; print STDOUT "$__n\n"; }; $? = 0 << 8; $CHILD_ERROR = $? >> 8;;; } $__cap =~ s/\n+\z//; $__cap };
-say "File count: $count";
+say "File count: " . __sh_str(($count));
 $? = 0 << 8; $CHILD_ERROR = $? >> 8;
 if ((($__nocasematch) ? lc('root') eq lc('root') : 'root' eq 'root')) {
     print "Running as root\n";
@@ -216,17 +217,17 @@ sub get_file_size {
     local @__sh_args = @_;
     my $__argc = @__sh_args;
     my $file = $__sh_args[0];
-        my $size = join(' ', split(/\s+/, do { my $__sh_cap; my $__f = $file; if (open(my $__h, '<', $__f)) { my $__d = do { local $/; <$__h> }; close($__h); $__d //= q{}; $__sh_cap = length($__d); $? = 0 << 8; $CHILD_ERROR = $? >> 8; } else { $__sh_cap = q{}; $? = 1 << 8; $CHILD_ERROR = $? >> 8; print STDERR "$__f: $!\n"; } $__sh_cap =~ s/\n+\z// if defined $__sh_cap; $__sh_cap }));
-        print "File " . ($file) . " has " . ($size) . " bytes\n";
+        my $size = join(' ', split(/\s+/, do { my $__sh_cap; my $__f = $file; if (open(my $__h, '<', $__f)) { my $__d = do { local $/; <$__h> }; close($__h); $__d //= q{}; $__sh_cap = length($__d); $? = 0 << 8; $CHILD_ERROR = $? >> 8; } else { $__sh_cap = q{}; $? = 1 << 8; $CHILD_ERROR = $? >> 8; print STDERR "$0: line " . __LINE__ . ": $__f: $!\n"; } $__sh_cap =~ s/\n+\z// if defined $__sh_cap; $__sh_cap }));
+        print "File " . __sh_str(($file)) . " has " . __sh_str(($size)) . " bytes\n";
     $? = 0 << 8; $CHILD_ERROR = $? >> 8;
     $? = 0 << 8; $CHILD_ERROR = $? >> 8;
 }
 get_file_size("000__01_file_directory_operations.sh");
 @files = (split(/\s+/, do { __sh_pipe_capture(q{'ls' '-1' *.sh examples/*.sh 2> '/dev/null'}, "pipefail") }));
-print("Shell scripts found: " . (join(' ', scalar(@files))), "\n");
+say "Shell scripts found: " . __sh_str((join(' ', scalar(@files))));
 for my $__file ((@files)) {
     $file = $__file;
-    say "  - $file";
+    say "  - " . __sh_str(($file));
     $? = 0 << 8; $CHILD_ERROR = $? >> 8;
     }
 __sh_pipe_run(q{echo 'apple
@@ -247,12 +248,12 @@ $? = 0 << 8; $CHILD_ERROR = $? >> 8;
 say $process_result;
 $? = 0 << 8; $CHILD_ERROR = $? >> 8;
 $here_string_result = __sh_pipe_capture(q{'tr' 'a-z' 'A-Z' <<< "hello world"}, "pipefail");
-say "Here string result: $here_string_result";
+say "Here string result: " . __sh_str(($here_string_result));
 $? = 0 << 8; $CHILD_ERROR = $? >> 8;
 $perl_result = do { my $__cap = ''; { local *STDOUT; open(STDOUT, '>', \$__cap) or die "capture: $!\n";     { no strict 'vars'; no warnings; print "Hello from Perl\n"; }
     $? = 0 << 8; $CHILD_ERROR = $? >> 8;
 ;; } $__cap =~ s/\n+\z//; $__cap };
-say "Perl result: $perl_result";
+say "Perl result: " . __sh_str(($perl_result));
 $? = 0 << 8; $CHILD_ERROR = $? >> 8;
 do { unlink('file1.txt', 'file2.txt'); $? = 0 << 8; $CHILD_ERROR = $? >> 8; };
 print "=== Complex Backtick Examples Complete ===\n";
@@ -260,7 +261,7 @@ $? = 0 << 8; $CHILD_ERROR = $? >> 8;
 if (chdir("/")) {
     
 } else {
-    warn "cd: " . "/" . ": $!\n";
+    warn "$0: line " . __LINE__ . ": cd: " . "/" . ": $!\n";
     
 }
 do { require File::Path; File::Path::remove_tree($d); $? = 0 << 8; $CHILD_ERROR = $? >> 8; };

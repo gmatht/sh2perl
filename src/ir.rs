@@ -1096,6 +1096,44 @@ pub fn set_childe_error_carrier(v: bool) {
     CHILD_ERROR_CARRIER.with(|c| c.set(v));
 }
 
+/// Quote a path for a Perl single-quoted string.
+fn perl_sq(s: &str) -> String {
+    let mut out = String::with_capacity(s.len() + 2);
+    out.push('\'');
+    for ch in s.chars() {
+        match ch {
+            '\\' => out.push_str("\\\\"),
+            '\'' => out.push_str("\\'"),
+            c => out.push(c),
+        }
+    }
+    out.push('\'');
+    out
+}
+
+/// Install `$0 = '<source path>'` as the program's first STATEMENT so the
+/// emitted Perl knows the script name bash's `$0` would carry.
+///
+/// It goes after the leading shebang/`use`/`no` block: `#!` must stay the
+/// first line, and the fixed emitter's say-preamble pass inserts its own `use`
+/// lines at the top, so a statement placed above them would end up between
+/// pragmas.
+pub(crate) fn with_script_argv0(src: String, argv0: &str) -> String {
+    let line = format!("$0 = {};\n", perl_sq(argv0));
+    let mut offset = 0usize;
+    for (i, l) in src.lines().enumerate() {
+        let t = l.trim_start();
+        let leading = i == 0 && t.starts_with("#!");
+        if leading || t.starts_with("use ") || t.starts_with("no ") {
+            offset += l.len() + 1;
+        } else {
+            break;
+        }
+    }
+    let offset = offset.min(src.len());
+    format!("{}{line}{}", &src[..offset], &src[offset..])
+}
+
 /// The IR corrections that make the rendered program mean what bash means:
 /// nameref aliases, `typeset` display forms, condition/truthiness fixes, eval
 /// re-entry, dot-source inlining, slice bounds and the process-substitution
@@ -1145,14 +1183,23 @@ pub fn shir_to_perl(prog: &IrProgram) -> String {
             .any(|sb| crate::shir::ir_stmts_read_status(&sb.body));
     set_childe_error_carrier(false);
     let src = shir_to_perl_raw(&corrected);
-    if src.contains("$CHILD_ERROR") || (src.contains("($? >> 8)") && !read_carrier) {
+    let src = if src.contains("$CHILD_ERROR") || (src.contains("($? >> 8)") && !read_carrier) {
         set_childe_error_carrier(true);
         let again = shir_to_perl_raw(&corrected);
         set_childe_error_carrier(false);
         again
     } else {
         src
-    }
+    };
+    src
+}
+
+/// `shir_to_perl` for a caller that knows the SOURCE path: the render starts
+/// with `$0 = '<path>'`, so `$0`-derived output, `dirname "$0"` and every
+/// delegated `bash -c … "$0"` diagnostic name the script exactly as bash does.
+pub fn shir_to_perl_named(prog: &IrProgram, argv0: &str) -> String {
+    let out = shir_to_perl(prog);
+    with_script_argv0(out, argv0)
 }
 
 fn shir_to_perl_raw(prog: &IrProgram) -> String {
@@ -4585,8 +4632,22 @@ fn emit_stmt_owned(out: &mut String, stmt: &IrStmt, indent: usize) {
                         rhs: inner_rhs,
                     } = expr
                     {
-                        if let IrExpr::Var(name, _) = inner_lhs.as_ref() {
-                            if *name == *var {
+                        // The RHS of `x+=y` does not always carry the read as
+                        // `IrExpr::Var`: the parser emits `getVar("x")` /
+                        // `param("…","x")` for a read in some positions, and
+                        // missing that meant `y+=2` rendered `$y = $y . "2"`
+                        // (bash: `2`) with an uninitialized-value warning.
+                        let lhs_var = match inner_lhs.as_ref() {
+                            IrExpr::Var(n, _) => Some(n.clone()),
+                            IrExpr::Call { func, args }
+                                if func == "getVar" || func == "param" => args
+                                    .iter()
+                                    .filter_map(call_arg_str)
+                                    .find(|a| a == var),
+                            _ => None,
+                        };
+                        if let Some(name) = lhs_var {
+                            if name == *var {
                                 let compound_op = match op {
                                     BinOpKind::Add => Some("+="),
                                     BinOpKind::Sub => Some("-="),
@@ -6119,7 +6180,10 @@ fn arith_ast_to_perl(ast: &ArithAst) -> String {
             // of `result[i]=$((result[i]+1))` must name the same element.
             let base = var.replace('.', "_").replace('-', "_");
             if array_var(&base) {
-                format!("${}[{}]", base, arith_ast_to_perl(key))
+                // The subscript is NUMERIC in arithmetic: an unset index is 0
+                // in bash, but a bare undef is `Argument "" isn't numeric in
+                // array or hash lookup` in Perl (063_hard_to_parse).
+                format!("${}[__sh_num({})]", base, arith_ast_to_perl(key))
             } else {
                 let k = match &**key {
                     ArithAst::Var(n) | ArithAst::Ident(n) => {
@@ -6151,8 +6215,20 @@ fn arith_ast_to_perl(ast: &ArithAst) -> String {
                 // kill the program. Guard through eval so the value is undef
                 // (parse-arithmetic-extra-paren: `x=$(((a+b)/(c+d)))` with
                 // all vars unset must leave x unset, not abort).
-                "/" => format!("(do {{ my $__d = {}; eval {{ int(({}) / ($__d)) }} }})", r, l),
-                "%" => format!("(do {{ my $__d = {}; eval {{ int(({})) % ($__d) }} }})", r, l),
+                // `// 0`: bash's division by zero aborts the expansion, and
+                // the value that reaches the rest of the expression must not
+                // be undef — Perl then warns `Use of uninitialized value … in
+                // division/+` for every later use, which bash never prints
+                // (063_hard_to_parse). 0 is also what bash's arithmetic gives
+                // an operand it could not evaluate.
+                "/" => format!(
+                    "(do {{ my $__d = {}; eval {{ int(({}) / ($__d)) }} // '' }})",
+                    r, l
+                ),
+                "%" => format!(
+                    "(do {{ my $__d = {}; eval {{ int(({})) % ($__d) }} // '' }})",
+                    r, l
+                ),
                 // Perl's bitwise ops are STRING ops when an operand is a
                 // string, and shell vars ARE strings (`$a = "78"`): `$a | $b`
                 // string-ORs to "78" and warns "Argument "^E" isn't numeric".
@@ -6346,7 +6422,9 @@ pub(crate) fn render_word_list(e: &IrExpr) -> String {
                 .first()
                 .map(render_word)
                 .unwrap_or_else(|| "''".to_string());
-            format!("split(/\\s+/, {})", inner)
+            // Word-splitting an UNSET variable is an empty list in bash;
+            // `split` on undef warns (parameter-expansion-nested).
+            format!("split(/\\s+/, {})", coerce_text(inner))
         }
         // `"$@"` / `"$*"` as an exec word: bash expands to the positional
         // LIST (each parameter its own word; `"$*"` joins with IFS). The
@@ -6409,7 +6487,11 @@ pub(crate) fn render_word_list(e: &IrExpr) -> String {
 /// substitution. The brace delimiter avoids pattern chars (`:`, `/`) that
 /// collide with the old `s:...:...:` form (`${PATH%%:*}` became `s::.*$`).
 fn strip_re(var: &str, pat: &str) -> String {
-    format!("(({} =~ s{{{}}}{{}}r))", var, pat.replace('}', "\\}"))
+    format!(
+        "(({} =~ s{{{}}}{{}}r))",
+        coerce_text(var.to_string()),
+        pat.replace('}', "\\}")
+    )
 }
 
 /// Escape a `s///` REPLACEMENT for Perl's regex BODY.
@@ -6625,7 +6707,11 @@ fn render_param(args: &[IrExpr]) -> String {
             let pat = args.get(2).and_then(call_arg_str).unwrap_or_default();
             let greedy = matches!(op.as_str(), "##" | "##:");
             let re = glob_to_regex_greedy(&pat, greedy);
-            format!("(({} =~ s{{{}}}{{}}r))", var, format!("^{}", re).replace('}', "\\}"))
+            format!(
+                "(({} =~ s{{{}}}{{}}r))",
+                coerce_text(var),
+                format!("^{}", re).replace('}', "\\}")
+            )
         }
         // Suffix removal: % shortest, %% longest. The `%.*` extension
         // idiom strips the last extension (shortest) / from the first dot
@@ -7188,7 +7274,7 @@ fn cd_chain_to_perl(expr: &IrExpr) -> Option<String> {
                                         // bash still reports the failed
                                         // chdir before honouring the exit.
                                         return Some(format!(
-                                            "chdir({dir}) or do {{ warn \"cd: \" . {dir} . \": $!\\n\"; exit {code}; }};",
+                                            "chdir({dir}) or do {{ warn \"$0: line \" . __LINE__ . \": cd: \" . {dir} . \": $!\\n\"; exit {code}; }};",
                                             dir = dir,
                                             code = code
                                         ));
@@ -7202,7 +7288,7 @@ fn cd_chain_to_perl(expr: &IrExpr) -> Option<String> {
                                 let mut rhs_str = String::new();
                                 emit_stmt(&mut rhs_str, &IrStmt::Expr((**rhs).clone()), 0);
                                 Some(format!(
-                                    "chdir({dir}) or do {{ warn \"cd: \" . {dir} . \": $!\\n\"; {rhs} }};",
+                                    "chdir({dir}) or do {{ warn \"$0: line \" . __LINE__ . \": cd: \" . {dir} . \": $!\\n\"; {rhs} }};",
                                     dir = dir,
                                     rhs = rhs_str.trim_end()
                                 ))
@@ -7222,7 +7308,7 @@ fn cd_chain_to_perl(expr: &IrExpr) -> Option<String> {
                                 // as bash runs `cd D && tail`.
                                 if let Some(body) = chain_operand_native(rhs) {
                                     return Some(format!(
-                                        "if (chdir({dir})) {{ {body} }} else {{ warn \"cd: \" . {dir} . \": $!\\n\"; $main_exit_code = $CHILD_ERROR = 1; }}",
+                                        "if (chdir({dir})) {{ {body} }} else {{ warn \"$0: line \" . __LINE__ . \": cd: \" . {dir} . \": $!\\n\"; $main_exit_code = $CHILD_ERROR = 1; }}",
                                         dir = dir
                                     ));
                                 }
@@ -7250,14 +7336,14 @@ fn cd_chain_to_perl(expr: &IrExpr) -> Option<String> {
                                         // SUCCEEDED, and a failed cd must
                                         // not abort the script.
                                         Some(format!(
-                                            "{x}chdir({dir}) ? do {{ system('bash', '-c', {q}); $main_exit_code = $CHILD_ERROR = $? >> 8; }} : do {{ warn \"cd: \" . {dir} . \": $!\\n\"; $main_exit_code = $CHILD_ERROR = 1; }}",
+                                            "{x}chdir({dir}) ? do {{ system('bash', '-c', {q}); $main_exit_code = $CHILD_ERROR = $? >> 8; }} : do {{ warn \"$0: line \" . __LINE__ . \": cd: \" . {dir} . \": $!\\n\"; $main_exit_code = $CHILD_ERROR = 1; }}",
                                             x = var_exports_str(&t),
                                             dir = dir,
                                             q = q
                                         ))
                                     }
                                     None => Some(format!(
-                                        "chdir({dir}) or do {{ warn \"cd: \" . {dir} . \": $!\\n\"; $main_exit_code = $CHILD_ERROR = 1; }};"
+                                        "chdir({dir}) or do {{ warn \"$0: line \" . __LINE__ . \": cd: \" . {dir} . \": $!\\n\"; $main_exit_code = $CHILD_ERROR = 1; }};"
                                     )),
                                 }
                             }
@@ -10831,6 +10917,13 @@ fn emit_exec_call(out: &mut String, call: &IrExpr, indent: usize) {
                                 // first character (`"h"` → 104 → `h`); bash's
                                 // `%c` prints that same first character.
                                 rest[i] = format!("ord(substr({}, 0, 1))", rest[i]);
+                            } else if *c == 's' {
+                                // `%s` of an unset variable is the empty string
+                                // in bash; Perl's undef warns in printf
+                                // (parse-arithmetic-extra-paren prints
+                                // `x=[]` but also `Use of uninitialized value
+                                // $x in printf`).
+                                rest[i] = coerce_text(rest[i].clone());
                             }
                         }
                     }
@@ -10995,7 +11088,7 @@ fn emit_exec_call(out: &mut String, call: &IrExpr, indent: usize) {
             emit_indent(out, indent);
             out.push_str("} else {\n");
             emit_indent(out, indent + 1);
-            out.push_str(&format!("warn \"cd: \" . {dir} . \": $!\\n\";\n"));
+            out.push_str(&format!("warn \"$0: line \" . __LINE__ . \": cd: \" . {dir} . \": $!\\n\";\n"));
             emit_indent(out, indent + 1);
             out.push_str(&rc_write(" $main_exit_code = $CHILD_ERROR = 1;"));
             out.push('\n');
@@ -13435,8 +13528,13 @@ pub(crate) fn render_test_operand(tok: &str) -> String {
 /// constant comparison had been folded away at compile time
 /// (dollar-positional-arithmetic).
 fn coerce_text(raw: String) -> String {
+    // A parenthesised Perl expression (`(($x =~ s{…}r))`, `((defined($x) &&
+    // length($x)) ? $x : $y)`) is still a READ of a shell value: an unset
+    // variable makes it undef, where bash has the empty string. `(($x + 1))`
+    // stringifies the same way, so coercing an arithmetic value is harmless.
     let reads = raw.starts_with('$')
         || raw.starts_with("($")
+        || raw.starts_with("((")
         || raw.starts_with("__sh_")
         || raw.starts_with("length(");
     if reads {
@@ -14338,7 +14436,13 @@ pub(crate) fn ir_expr_to_perl(expr: &IrExpr) -> String {
             // (parse-arithmetic-extra-paren: x must stay unset).
             let inner = arith_ast_to_perl(ast);
             if inner.starts_with("(do {") {
-                format!("(do {{ my $__a = {inner}; defined($__a) ? int($__a) : undef }})")
+                // An EMPTY inner value means the expansion failed (`$((x/0))`
+                // aborts in bash and leaves the variable unset), not 0:
+                // `int('')` warns and would print `x=[0]` where bash prints
+                // `x=[]` (parse-arithmetic-extra-paren).
+                format!(
+                    "(do {{ my $__a = {inner}; (defined($__a) && length($__a)) ? int($__a) : undef }})"
+                )
             } else {
                 format!("int({inner})")
             }
@@ -14564,10 +14668,24 @@ pub(crate) fn ir_expr_to_perl(expr: &IrExpr) -> String {
                 levels.push((inner_op, inner_rhs));
                 base = inner_lhs;
             }
-            let mut out = ir_expr_to_perl(base);
+            // A concatenated VARIABLE read is a TEXT read: an unset shell
+            // variable is the empty string, while Perl's undef makes `.` warn
+            // `Use of uninitialized value in concatenation` (051_primes:
+            // `y+=2` renders `$y = $y . "2"` and bash prints `2`). Only bare
+            // variable reads are wrapped; a literal or a call is left alone.
+            let concat = matches!(op, BinOpKind::Concat)
+                || levels.iter().any(|(o, _)| matches!(o, BinOpKind::Concat));
+            let text_operand = |e: &IrExpr, s: String| {
+                if concat && matches!(e, IrExpr::Var(..)) {
+                    format!("__sh_str({s})")
+                } else {
+                    s
+                }
+            };
+            let mut out = text_operand(base, ir_expr_to_perl(base));
             for (level_op, level_rhs) in levels.into_iter().rev() {
                 out.push_str(binop_perl_str(level_op));
-                out.push_str(&ir_expr_to_perl(level_rhs));
+                out.push_str(&text_operand(level_rhs, ir_expr_to_perl(level_rhs)));
             }
             out
         }
@@ -15245,15 +15363,18 @@ pub(crate) fn ir_expr_to_perl(expr: &IrExpr) -> String {
                         }
                         InterpPart::Expr(e) => {
                             let ev = ir_expr_to_perl(e);
-                            // Wrap complex expressions in parentheses for safety,
-                            // but keep simple vars bare.
+                            // bash reads an unset variable as the empty string
+                            // here; Perl's undef would print `Use of
+                            // uninitialized value in concatenation`, which bash
+                            // never does (multiple-awk-in-dqs). A literal needs
+                            // no coercion (`__sh_str("abc")` is noise and keeps
+                            // the say pass from folding it).
                             match e.as_ref() {
-                                IrExpr::Var(_, _) => {
-                                    parts_str.push(ev);
+                                IrExpr::Var(..) => parts_str.push(format!("__sh_str({ev})")),
+                                IrExpr::Index { .. } | IrExpr::Call { .. } => {
+                                    parts_str.push(format!("__sh_str(({ev}))"));
                                 }
-                                _ => {
-                                    parts_str.push(format!("({})", ev));
-                                }
+                                _ => parts_str.push(format!("({ev})")),
                             }
                         }
                     }
@@ -18454,7 +18575,9 @@ mod tests {
         // the seq number is process-global (shared across tests) —
         // match the shape without pinning the number
         assert!(
-            regex::Regex::new(r#"\$ENV\{__sh2_rd\d+\} = "/tmp/zsh_t32_redirect\." \. \(\$\$\) \. "\.tmp";"#)
+            regex::Regex::new(
+                r#"\$ENV\{__sh2_rd\d+\} = "/tmp/zsh_t32_redirect\." \. (?:__sh_str\()?\(\$\$\)\)? \. "\.tmp";"#
+            )
                 .unwrap()
                 .is_match(&perl),
             "perl-side target binding: {perl}"
@@ -18961,11 +19084,13 @@ mod tests {
         let prog = crate::shir_json_in::shir_json_to_ir(src).expect("split A1 ingress");
         let perl = shir_to_perl(&prog);
         assert!(
-            perl.contains("print(join(' ', grep { defined($_) && length($_) } split(/\\s+/, $x)), \"\\n\");"),
+            perl.contains(
+                "print(join(' ', grep { defined($_) && length($_) } split(/\\s+/, __sh_str($x))), \"\\n\");"
+            ),
             "echo joins the split fields: {perl}"
         );
         assert!(
-            perl.contains("my @__sh2_pa0 = (split(/\\s+/, $x));"),
+            perl.contains("my @__sh2_pa0 = (split(/\\s+/, __sh_str($x)));"),
             "printf flattens the split fields: {perl}"
         );
         assert!(
@@ -19625,7 +19750,10 @@ mod perl_render_tests {
     fn native_cd_records_status_and_continues() {
         let out = render("cd /no/such/dir\nif [ $? -eq 0 ]; then echo ok; else echo bad; fi\n");
         assert!(!out.contains("or die \"cd"), "{out}");
-        assert!(out.contains("warn \"cd: \" ."), "{out}");
+        assert!(
+            out.contains("warn \"$0: line \" . __LINE__ . \": cd: \""),
+            "{out}"
+        );
         assert!(out.contains("$? = 1 << 8"), "{out}");
         assert!(out.contains("$? >> 8"), "{out}");
     }
@@ -19679,7 +19807,10 @@ mod perl_render_tests {
         // the guard, with the status written on both arms.
         let chain = render("cd /no/such && echo x\n");
         assert!(!chain.contains("system("), "{chain}");
-        assert!(chain.contains("warn \"cd: \""), "{chain}");
+        assert!(
+            chain.contains("warn \"$0: line \" . __LINE__ . \": cd: \""),
+            "{chain}"
+        );
         assert!(chain.contains("$? = 1 << 8;"), "{chain}");
         // A failing printf reports bash's diagnostic and its status.
         let pf = render("printf '%d\\n' zz\n");

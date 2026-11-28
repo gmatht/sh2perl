@@ -51,10 +51,13 @@ fn fixture_dir() -> String {
     concat!(env!("CARGO_MANIFEST_DIR"), "/tests/golden/examples").to_string()
 }
 
-fn render_fixed(src: &str) -> String {
+/// The shipped render, with the SOURCE path installed as `$0` (what the CLI
+/// does). The goldens are produced the same way, so a script that prints `$0`
+/// records the script name, not `x.pl`.
+fn render_fixed(src: &str, name: &str) -> String {
     let (commands, _) = debashl::Parser::new(src).parse_with_lines().expect("parse");
     let prog = debashl::shir::ast_to_ir(&commands);
-    debashl::perl_generator_fixed::generate(&prog)
+    debashl::perl_generator_fixed::generate_named(&prog, &format!("examples/{name}.sh"))
 }
 
 fn render_bare(src: &str) -> String {
@@ -91,7 +94,7 @@ fn example_renders_match_their_committed_golden() {
             .unwrap_or_else(|e| panic!("read {name}.sh: {e}"));
         let expected = std::fs::read_to_string(format!("{}/{}.pl", fixture_dir(), name))
             .unwrap_or_else(|e| panic!("read golden {name}.pl: {e}"));
-        let got = render_fixed(&src);
+        let got = render_fixed(&src, name);
         if got != expected {
             // A compact diff: the first differing line, both sides.
             let mut msg = format!("golden drift for examples/{name}.sh\n");
@@ -330,7 +333,10 @@ fn shipped_cli_renders_every_example_on_the_default_stack() {
 fn native_capture_example_renders_the_local_stdout_shape() {
     let src = std::fs::read_to_string(format!("{}/native_capture.sh", examples_dir()))
         .expect("read native_capture.sh");
-    for (which, perl) in [("bare", render_bare(&src)), ("fixed", render_fixed(&src))] {
+    for (which, perl) in [
+        ("bare", render_bare(&src)),
+        ("fixed", render_fixed(&src, "native_capture")),
+    ] {
         assert!(
             perl.contains("local *STDOUT"),
             "{which}: native capture did not render the local *STDOUT shape:\n{perl}"

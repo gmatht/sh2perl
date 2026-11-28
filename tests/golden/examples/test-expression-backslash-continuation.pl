@@ -1,6 +1,7 @@
 #!/usr/bin/env perl
 use strict;
 use warnings;
+$0 = 'examples/test-expression-backslash-continuation.sh';
 our $CHILD_ERROR = 0;
 
 sub __sh_str {

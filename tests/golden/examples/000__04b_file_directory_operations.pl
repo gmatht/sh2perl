@@ -2,6 +2,7 @@
 use strict;
 use warnings;
 use English qw(-no_match_vars $ERRNO $EVAL_ERROR $INPUT_RECORD_SEPARATOR $OS_ERROR $PROGRAM_NAME);
+$0 = 'examples/000__04b_file_directory_operations.sh';
 
 our $CHILD_ERROR = 0;
 use feature 'say';
@@ -80,7 +81,7 @@ print "=== File and Directory Operations ===\n";
 $? = 0 << 8; $CHILD_ERROR = $? >> 8;
 $? = 0 << 8; $CHILD_ERROR = $? >> 8;
 $d = do { my $__sh_cap; $__sh_cap = do { require File::Temp; File::Temp::tempdir('sh2_ps_XXXXXX', TMPDIR => 1, CLEANUP => 0) }; $? = 0 << 8; $CHILD_ERROR = $? >> 8; $__sh_cap =~ s/\n+\z// if defined $__sh_cap; $__sh_cap };
-chdir($d) or do { warn "cd: " . $d . ": $!\n"; exit "1"; };
+chdir($d) or do { warn "$0: line " . __LINE__ . ": cd: " . $d . ": $!\n"; exit "1"; };
 open(my $__ofh0, '>', 'a.sh') or die "echo: 'a.sh': $ERRNO"; print $__ofh0 q{a
 }; close $__ofh0; $? = 0 << 8; $CHILD_ERROR = $? >> 8;open(my $__ofh1, '>', 'b.txt') or die "echo: 'b.txt': $ERRNO"; print $__ofh1 q{b
 }; close $__ofh1; $? = 0 << 8; $CHILD_ERROR = $? >> 8;do { my $__ok = 1; for my $__d ('sub') { unless (mkdir($__d)) { $__ok = 0; print STDERR "mkdir: $!\n"; } } $? = ($__ok ? 0 : 1) << 8; $CHILD_ERROR = $? >> 8; };
@@ -99,7 +100,7 @@ $? = 0 << 8; $CHILD_ERROR = $? >> 8;
 if (chdir("/")) {
     
 } else {
-    warn "cd: " . "/" . ": $!\n";
+    warn "$0: line " . __LINE__ . ": cd: " . "/" . ": $!\n";
     
 }
 do { require File::Path; File::Path::remove_tree($d); $? = 0 << 8; $CHILD_ERROR = $? >> 8; };

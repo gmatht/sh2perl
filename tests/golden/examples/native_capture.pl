@@ -1,7 +1,14 @@
 #!/usr/bin/env perl
 use strict;
 use warnings;
+$0 = 'examples/native_capture.sh';
+
 use feature 'say';
+
+sub __sh_str {
+    my $__v = shift();
+    return defined($__v) ? $__v : q{};
+}
 
 my $greeting;
 my $x;
@@ -16,7 +23,7 @@ $x = do { my $__cap = ''; { local *STDOUT; open(STDOUT, '>', \$__cap) or die "ca
 ;; } $__cap =~ s/\n+\z//; $__cap };
 say $x;
 $? = 0 << 8;
-printf("%s\n", $x);
+printf("%s\n", __sh_str($x));
 $? = 0 << 8;
 
 exit $? >> 8;

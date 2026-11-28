@@ -1,6 +1,7 @@
 #!/usr/bin/env perl
 use strict;
 use warnings;
+$0 = 'examples/090_nested_if_else.sh';
 our $CHILD_ERROR = 0;
 my $__nocasematch = 0;
 

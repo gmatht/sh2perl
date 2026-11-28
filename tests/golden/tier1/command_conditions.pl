@@ -1,7 +1,9 @@
 #!/usr/bin/env perl
 use strict;
 use warnings;
+$0 = 'tests/tier1/command_conditions.sh';
 our $CHILD_ERROR = 0;
+
 
 
 use feature 'say';
@@ -44,6 +46,11 @@ sub __sh_fn_status {
     our $CHILD_ERROR;
     $CHILD_ERROR = $st;
     return $st == 0 ? 1 : 0;
+}
+
+sub __sh_str {
+    my $__v = shift();
+    return defined($__v) ? $__v : q{};
 }
 
 sub __sh_num {
@@ -228,13 +235,13 @@ if (((sub { open(my $__gh, '<', '/etc/passwd') or return 0; local $/; my $__gc =
 $n = "0";
 while (int(__sh_num($n)) < int(2)) {
     $n = int((__sh_num($n) + 1));
-    say "while test: $n";
+    say "while test: " . __sh_str(($n));
     $? = 0 << 8; $CHILD_ERROR = $? >> 8;
     }
 $m = "0";
 while (!(int(__sh_num($m)) >=int(2))) {
     $m = int((__sh_num($m) + 1));
-    say "until test: $m";
+    say "until test: " . __sh_str(($m));
     $? = 0 << 8; $CHILD_ERROR = $? >> 8;
     }
 do { my $__ok = 1; for my $__t ('cond-flag.txt') { if (open(my $__h, '>>', $__t)) { close($__h); } else { $__ok = 0; print STDERR "touch: cannot touch '$__t': $!\n"; } } $? = ($__ok ? 0 : 1) << 8; $CHILD_ERROR = $? >> 8; };
@@ -242,7 +249,7 @@ $i = "0";
 while (!((system('bash', '-c', q{'grep' '-q' 'x' 'cond-flag.txt' 2> '/dev/null'}) == 0))) {
     __sh_pipe_run(q{echo 'x' >> 'cond-flag.txt'}, "pipefail");
     $i = int((__sh_num($i) + 1));
-    say "while command: $i";
+    say "while command: " . __sh_str(($i));
     $? = 0 << 8; $CHILD_ERROR = $? >> 8;
     }
 if (do {
@@ -376,7 +383,7 @@ open(my $__sh2_duperr0, '>&', \*STDERR) or die; open(my $__sh2_dupferr0, '>&', \
     if (chdir("/definitely/not/here")) {
         $? = 0 << 8; $CHILD_ERROR = $? >> 8;
     } else {
-        warn "cd: " . "/definitely/not/here" . ": $!\n";
+        warn "$0: line " . __LINE__ . ": cd: " . "/definitely/not/here" . ": $!\n";
         $? = 1 << 8; $CHILD_ERROR = $? >> 8;
     }
 open(STDERR, '>&', $__sh2_dupferr0) or die; close($__sh2_dupferr0); open(STDERR, '>&', $__sh2_duperr0) or die; 
@@ -392,7 +399,7 @@ if (do {
     if (chdir("/tmp")) {
         $? = 0 << 8; $CHILD_ERROR = $? >> 8;
     } else {
-        warn "cd: " . "/tmp" . ": $!\n";
+        warn "$0: line " . __LINE__ . ": cd: " . "/tmp" . ": $!\n";
         $? = 1 << 8; $CHILD_ERROR = $? >> 8;
     }
     ($? >> 8) == 0
@@ -419,16 +426,16 @@ exit "1";
     print "subshell false: ok\n";
     $? = 0 << 8; $CHILD_ERROR = $? >> 8;
     }
-print("ternary arith: " . (int(((5 > 3) ? 10 : 5))), "\n");
-print("ternary arith zero: " . (int((1 ? 10 : 20))), "\n");
-print("ternary arith false: " . (int((0 ? 10 : 20))), "\n");
+say "ternary arith: " . (int(((5 > 3) ? 10 : 5)));
+say "ternary arith zero: " . (int((1 ? 10 : 20)));
+say "ternary arith false: " . (int((0 ? 10 : 20)));
 if ((__sh_subshell(sub {
 exit "3";
 }) == 0)) {
     print "subshell status: BAD\n";
     $? = 0 << 8; $CHILD_ERROR = $? >> 8;
     } else {
-    say "subshell status: $CHILD_ERROR";
+    say "subshell status: " . __sh_str(($CHILD_ERROR));
     $? = 0 << 8; $CHILD_ERROR = $? >> 8;
     }
 if (((sub { open(my $__gh, '<', '/etc/passwd') or return 0; local $/; my $__gc = <$__gh>; close $__gh; my $__gn = 0; for my $__gl (split(/\n/, $__gc)) { $__gn++ if index($__gl, 'zzz') >= 0; } $__gn })->() > 0)) {
@@ -436,14 +443,14 @@ if (((sub { open(my $__gh, '<', '/etc/passwd') or return 0; local $/; my $__gc =
 } else {
     $? = 0 << 8; $CHILD_ERROR = $? >> 8;
 }
-say "status after failed if: $CHILD_ERROR";
+say "status after failed if: " . __sh_str(($CHILD_ERROR));
 $? = 0 << 8; $CHILD_ERROR = $? >> 8;
 if (((sub { open(my $__gh, '<', '/etc/passwd') or return 0; local $/; my $__gc = <$__gh>; close $__gh; my $__gn = 0; for my $__gl (split(/\n/, $__gc)) { $__gn++ if index($__gl, 'root') >= 0; } $__gn })->() > 0)) {
     $? = 0 << 8; $CHILD_ERROR = $? >> 8;
 } else {
     $? = 0 << 8; $CHILD_ERROR = $? >> 8;
 }
-say "status after true if: $CHILD_ERROR";
+say "status after true if: " . __sh_str(($CHILD_ERROR));
 $? = 0 << 8; $CHILD_ERROR = $? >> 8;
 do { unlink('cond-flag.txt'); $? = 0 << 8; $CHILD_ERROR = $? >> 8; };
 

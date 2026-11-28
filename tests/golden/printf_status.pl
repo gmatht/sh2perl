@@ -2,6 +2,12 @@
 use strict;
 use warnings;
 
+
+sub __sh_str {
+    my $__v = shift();
+    return defined($__v) ? $__v : q{};
+}
+
 my $__sh2_pf_bad0 = 0;
 printf("%d\n", (do {
     my ($__pf_s, $__pf_v, $__pf_bad, $__pf_msg) = ("zz", 0, 0, 'invalid number');
@@ -30,7 +36,7 @@ printf("%d\n", (do {
     $__pf_v
 }));
 $? = (($__sh2_pf_bad0 ? 1 : 0)) << 8;
-print(join(' ', grep { defined($_) && length($_) } split(/\s+/, ($? >> 8))), "\n");
+print(join(' ', grep { defined($_) && length($_) } split(/\s+/, __sh_str(($? >> 8)))), "\n");
 $? = 0 << 8;
 
 exit $? >> 8;

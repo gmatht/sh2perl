@@ -11,7 +11,7 @@ sub __sh_str {
 if (chdir("/no/such/dir")) {
     $? = 0 << 8;
 } else {
-    warn "cd: " . "/no/such/dir" . ": $!\n";
+    warn "$0: line " . __LINE__ . ": cd: " . "/no/such/dir" . ": $!\n";
     $? = 1 << 8;
 }
 if ((0+__sh_str(($? >> 8))) == (0+'0')) {

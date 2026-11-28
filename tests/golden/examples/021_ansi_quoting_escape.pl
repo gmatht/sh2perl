@@ -1,6 +1,7 @@
 #!/usr/bin/env perl
 use strict;
 use warnings;
+$0 = 'examples/021_ansi_quoting_escape.sh';
 
 $? = 0 << 8;
 print "== Escape sequences ==\n";

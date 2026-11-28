@@ -145,7 +145,7 @@ fn wc_file(call: &crate::ir::IrExpr) -> Option<NativeEmit> {
         count.to_string()
     };
     Some(NativeEmit::Stmt(format!(
-        "my $__f = {path}; if (open(my $__h, '<', $__f)) {{ my $__d = do {{ local $/; <$__h> }}; close($__h); $__d //= q{{}}; $__sh_cap = {val}; $main_exit_code = $CHILD_ERROR = 0; }} else {{ $__sh_cap = q{{}}; $main_exit_code = $CHILD_ERROR = 1; print STDERR \"$__f: $!\\n\"; }}",
+        "my $__f = {path}; if (open(my $__h, '<', $__f)) {{ my $__d = do {{ local $/; <$__h> }}; close($__h); $__d //= q{{}}; $__sh_cap = {val}; $main_exit_code = $CHILD_ERROR = 0; }} else {{ $__sh_cap = q{{}}; $main_exit_code = $CHILD_ERROR = 1; print STDERR \"$0: line \" . __LINE__ . \": $__f: $!\\n\"; }}",
         path = path_expr
     )))
 }

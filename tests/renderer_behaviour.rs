@@ -110,6 +110,24 @@ fn render(src: &str) -> String {
     debashl::perl_generator_fixed::generate(&prog)
 }
 
+/// The render whose text is PINNED in `tests/golden/**`. It carries the
+/// script's repo-relative path as `$0`, exactly as the CLI does (the shipped
+/// `perl_backend --fixed examples/x.sh` embeds `examples/x.sh`), so the
+/// fixtures and `tests/perl_examples_regression.rs` — which compare the same
+/// files — agree on what the shipped output is.
+fn render_for_golden(src: &str, script: &Path) -> String {
+    let rel = script
+        .strip_prefix(root())
+        .unwrap_or(script)
+        .to_string_lossy()
+        .into_owned();
+    let (commands, _) = debashl::Parser::new(src)
+        .parse_with_lines()
+        .expect("corpus source must parse");
+    let prog = debashl::shir::ast_to_ir(&commands);
+    debashl::perl_generator_fixed::generate_named(&prog, &rel)
+}
+
 fn have_perl() -> bool {
     Command::new("perl")
         .arg("-v")
@@ -175,7 +193,7 @@ fn corpus_renders_match_their_committed_golden() {
     for entry in corpus() {
         let src = std::fs::read_to_string(&entry.src)
             .unwrap_or_else(|e| panic!("read {}: {e}", entry.src.display()));
-        let got = render(&src);
+        let got = render_for_golden(&src, &entry.src);
         if update {
             if let Some(dir) = entry.golden.parent() {
                 std::fs::create_dir_all(dir).expect("create golden dir");
@@ -223,7 +241,7 @@ fn corpus_renders_compile_clean_under_perl_w_c() {
     let mut failures = String::new();
     for entry in corpus() {
         let src = std::fs::read_to_string(&entry.src).expect("read corpus source");
-        if let Some(bad) = compile_diagnostics(&render(&src)) {
+        if let Some(bad) = compile_diagnostics(&render_for_golden(&src, &entry.src)) {
             failures.push_str(&format!("{}:\n{bad}\n", entry.name));
         }
     }

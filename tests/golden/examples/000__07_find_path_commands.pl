@@ -1,8 +1,15 @@
 #!/usr/bin/env perl
 use strict;
 use warnings;
+$0 = 'examples/000__07_find_path_commands.sh';
 our $CHILD_ERROR = 0;
+
 use feature 'say';
+
+sub __sh_str {
+    my $__v = shift();
+    return defined($__v) ? $__v : q{};
+}
 
 my $d;
 my $found_files;
@@ -122,8 +129,8 @@ sub __sh_pipe_capture {
 # __SH_RUN_EXT_END
 
 $d = do { my $__sh_cap; $__sh_cap = do { require File::Temp; File::Temp::tempdir('sh2_ps_XXXXXX', TMPDIR => 1, CLEANUP => 0) }; $? = 0 << 8; $CHILD_ERROR = $? >> 8; $__sh_cap =~ s/\n+\z// if defined $__sh_cap; $__sh_cap };
-do { my $__ok = 1; for my $__d (($d) . "/sub") { my $__acc = $__d =~ m{^/} ? '' : '.'; for my $__c (split m{/+}, $__d) { next if $__c eq '' || $__c eq '.'; $__acc .= "/$__c"; next if -d $__acc; unless (mkdir($__acc)) { $__ok = 0; print STDERR "mkdir: $!\n"; last; } } } $? = ($__ok ? 0 : 1) << 8; $CHILD_ERROR = $? >> 8; };
-do { my $__ok = 1; for my $__t (($d) . "/a.sh", ($d) . "/b.sh", ($d) . "/sub/c.sh", ($d) . "/data.txt") { if (open(my $__h, '>>', $__t)) { close($__h); } else { $__ok = 0; print STDERR "touch: cannot touch '$__t': $!\n"; } } $? = ($__ok ? 0 : 1) << 8; $CHILD_ERROR = $? >> 8; };
+do { my $__ok = 1; for my $__d (__sh_str(($d)) . "/sub") { my $__acc = $__d =~ m{^/} ? '' : '.'; for my $__c (split m{/+}, $__d) { next if $__c eq '' || $__c eq '.'; $__acc .= "/$__c"; next if -d $__acc; unless (mkdir($__acc)) { $__ok = 0; print STDERR "mkdir: $!\n"; last; } } } $? = ($__ok ? 0 : 1) << 8; $CHILD_ERROR = $? >> 8; };
+do { my $__ok = 1; for my $__t (__sh_str(($d)) . "/a.sh", __sh_str(($d)) . "/b.sh", __sh_str(($d)) . "/sub/c.sh", __sh_str(($d)) . "/data.txt") { if (open(my $__h, '>>', $__t)) { close($__h); } else { $__ok = 0; print STDERR "touch: cannot touch '$__t': $!\n"; } } $? = ($__ok ? 0 : 1) << 8; $CHILD_ERROR = $? >> 8; };
 $found_files = do { no strict 'vars'; no warnings; local $ENV{d} = $d; __sh_pipe_capture(q('cd' "${d}" && 'find' '.' '-name' '*.sh' '-type' 'f' | 'sort'), "pipefail") };
 print "Found shell scripts:\n";
 $? = 0 << 8; $CHILD_ERROR = $? >> 8;

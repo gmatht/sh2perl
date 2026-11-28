@@ -43,10 +43,14 @@ fn main() {
         }
     };
     let prog = debashl::shir::ast_to_ir(&commands);
+    // The source path is passed as `$0`: bash's `$0` is the path the script was
+    // invoked with, and an emitted file run as `perl out.pl` would otherwise
+    // report `out.pl: line N:` for every diagnostic bash prefixes with the
+    // script name.
     let out = if fixed {
-        debashl::perl_generator_fixed::generate(&prog)
+        debashl::perl_generator_fixed::generate_named(&prog, file)
     } else {
-        debashl::ir::shir_to_perl(&prog)
+        debashl::ir::shir_to_perl_named(&prog, file)
     };
     use std::io::Write;
     let mut stdout = std::io::stdout();

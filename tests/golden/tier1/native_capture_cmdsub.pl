@@ -1,7 +1,14 @@
 #!/usr/bin/env perl
 use strict;
 use warnings;
+$0 = 'tests/tier1/native_capture_cmdsub.sh';
+
 use feature 'say';
+
+sub __sh_str {
+    my $__v = shift();
+    return defined($__v) ? $__v : q{};
+}
 
 our @__sh_args;
 our $__sh_args_n;
@@ -22,7 +29,7 @@ $x = do { my $__cap = ''; { local *STDOUT; open(STDOUT, '>', \$__cap) or die "ca
     $? = 0 << 8;
     $? = 0 << 8;
 ;; } $__cap =~ s/\n+\z//; $__cap };
-say "x=$x";
+say "x=" . __sh_str(($x));
 $? = 0 << 8;
 sub show {
     local @__sh_args = @_;
@@ -34,7 +41,7 @@ sub show {
     $? = 0 << 8;
     $? = 0 << 8;
 ;; } $__cap =~ s/\n+\z//; $__cap };
-    say "y=$y";
+    say "y=" . __sh_str(($y));
     $? = 0 << 8;
     $? = 0 << 8;
 }
@@ -42,15 +49,15 @@ show("from-argument");
 $z = do { my $__cap = ''; { local *STDOUT; open(STDOUT, '>', \$__cap) or die "capture: $!\n";     say $greeting;
     $? = 0 << 8;
     $? = 0 << 8;
-    print("inside=" . (do { my $__sh_cap; $__sh_cap = q{sh2perl}; $? = 0 << 8; $__sh_cap =~ s/\n+\z// if defined $__sh_cap; $__sh_cap }), "\n");
+    say "inside=" . (do { my $__sh_cap; $__sh_cap = q{sh2perl}; $? = 0 << 8; $__sh_cap =~ s/\n+\z// if defined $__sh_cap; $__sh_cap });
     $? = 0 << 8;
 ;; } $__cap =~ s/\n+\z//; $__cap };
-say "z=$z";
+say "z=" . __sh_str(($z));
 $? = 0 << 8;
-$n = do { my $__cap = ''; { local *STDOUT; open(STDOUT, '>', \$__cap) or die "capture: $!\n";     print(do { my $__sh_cap; $__sh_cap = q{c}; $? = 0 << 8; $__sh_cap =~ s/\n+\z// if defined $__sh_cap; $__sh_cap }, "\n");
+$n = do { my $__cap = ''; { local *STDOUT; open(STDOUT, '>', \$__cap) or die "capture: $!\n";     say do { my $__sh_cap; $__sh_cap = q{c}; $? = 0 << 8; $__sh_cap =~ s/\n+\z// if defined $__sh_cap; $__sh_cap };
     $? = 0 << 8;
 ;; } $__cap =~ s/\n+\z//; $__cap };
-say "n=$n";
+say "n=" . __sh_str(($n));
 $? = 0 << 8;
 $? = 0 << 8;
 

@@ -1,6 +1,13 @@
 #!/usr/bin/env perl
 use strict;
 use warnings;
+$0 = 'examples/010_substring_loop.sh';
+
+
+sub __sh_str {
+    my $__v = shift();
+    return defined($__v) ? $__v : q{};
+}
 
 sub __sh_num {
     # bash arithmetic, not Perl's numeric context: unset and empty are 0,
@@ -24,7 +31,7 @@ $i = "0";
 $len = "10";
 while (int(__sh_num($i)) < int(__sh_num($len))) {
     $ch = substr($s, $i, 1);
-printf("%s", $ch);
+printf("%s", __sh_str($ch));
         $i = int((__sh_num($i) + 1));
 }
 print "\n";

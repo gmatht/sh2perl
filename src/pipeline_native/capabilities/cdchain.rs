@@ -51,8 +51,15 @@ pub(crate) fn emit(ctx: &NativeCtx) -> Option<NativeEmit> {
     let q = crate::ir::safe_perl_q_string(&dir);
     // `chdir` is evaluated once; its result selects both the value and the
     // status. `require Cwd` inline (a leaf cannot push to `imports`).
+    //
+    // A FAILED `cd` inside `$(… && pwd)` still prints bash's diagnostic to
+    // stderr — `cd-command-substitution.sh` compared against bash, which
+    // writes `<script>: line N: cd: /some/dir: No such file or directory`
+    // while the capture branch swallowed it. The prefix is `$0` (the renderer
+    // installs the source path) and the number is the emitted program's line;
+    // tracking the .sh line through the IR is a separate, larger change.
     Some(NativeEmit::Stmt(format!(
-        "if (chdir({q})) {{ $__sh_cap = (require Cwd, Cwd::getcwd()); $main_exit_code = $CHILD_ERROR = 0; }} else {{ $__sh_cap = q{{}}; $main_exit_code = $CHILD_ERROR = 1; }}"
+        "if (chdir({q})) {{ $__sh_cap = (require Cwd, Cwd::getcwd()); $main_exit_code = $CHILD_ERROR = 0; }} else {{ $__sh_cap = q{{}}; warn \"$0: line \" . __LINE__ . \": cd: \" . {q} . \": $!\\n\"; $main_exit_code = $CHILD_ERROR = 1; }}"
     )))
 }
 
