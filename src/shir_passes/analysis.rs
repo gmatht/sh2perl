@@ -429,7 +429,7 @@ pub fn needs_runtime(prog: &IrProgram) -> bool {
                     expr_needs(a, out);
                 }
             }
-            IrExpr::Arith(a) => arith_needs(a, out),
+            IrExpr::Arith(a, _) => arith_needs(a, out),
             // a literal arg array (`echo`'s words) is pure data; its
             // elements may still be runtime (a capture word)
             IrExpr::Array(items) => {

@@ -84,7 +84,7 @@ fn abbrev_arg_name(e: &IrExpr) -> String {
         IrExpr::Var(name, _) | IrExpr::Ident(name) if name.len() <= 8 => {
             sanitize_fragment(name)
         }
-        IrExpr::Arith(a) => abbrev_arith_name(a),
+        IrExpr::Arith(a, _) => abbrev_arith_name(a),
         _ => {
             let s = format!("{:?}", e);
             // a literal operand is the most meaningful prefix: take the

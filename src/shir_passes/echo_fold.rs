@@ -770,7 +770,7 @@ fn word_contains_call(e: &IrExpr) -> bool {
         IrExpr::Call { .. } | IrExpr::Arrow(_) | IrExpr::Lambda { .. } => true,
         // `((…))` in word position goes to the same evaluator as
         // `Call { func: "arith" }`
-        IrExpr::Arith(_) => true,
+        IrExpr::Arith(_, _) => true,
         // `$(…)` is declined separately, but a capture nested in a word is
         // the same refusal for the same reason
         IrExpr::Capture { .. } => true,
@@ -1403,7 +1403,7 @@ fn fold_numeric_echo(args: &[IrExpr]) -> Option<IrStmt> {
 /// return an integer.
 pub fn numeric_word(w: &IrExpr) -> bool {
     match w {
-        IrExpr::Int(_) | IrExpr::Arith(_) => true,
+        IrExpr::Int(_) | IrExpr::Arith(_, _) => true,
         IrExpr::Call { func, args } => match func.as_str() {
             "arrayLen" => true,
             // `param(op, …)`: only the LENGTH op yields an integer

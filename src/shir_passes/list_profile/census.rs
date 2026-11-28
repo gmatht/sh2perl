@@ -1131,7 +1131,7 @@ impl<'a> Walker<'a> {
                     self.stmt(b);
                 }
             }
-            IrExpr::Arith(a) => self.arith(a),
+            IrExpr::Arith(a, _) => self.arith(a),
             IrExpr::Json(_) => {}
             IrExpr::Object(props) => {
                 for (_, v) in props {
@@ -1206,7 +1206,7 @@ fn positional_expr(e: &IrExpr, out: &mut Vec<u32>) {
                 positional_expr(a, out);
             }
         }
-        IrExpr::Arith(a) => arith_positionals(a, out),
+        IrExpr::Arith(a, _) => arith_positionals(a, out),
         IrExpr::Array(items) => {
             for it in items {
                 positional_expr(it, out);
@@ -1360,7 +1360,7 @@ fn var_mentions(e: &IrExpr, out: &mut Vec<String>) {
                 var_mentions(a, out);
             }
         }
-        IrExpr::Arith(a) => arith_var_mentions(a, out),
+        IrExpr::Arith(a, _) => arith_var_mentions(a, out),
         IrExpr::Array(items) => {
             for it in items {
                 var_mentions(it, out);
@@ -1599,7 +1599,7 @@ mod tests {
                     op: "+".to_string(),
                     lhs: Box::new(ArithAst::Var("s".to_string())),
                     rhs: Box::new(ArithAst::Num(0)),
-                })),
+                }), None),
             ),
         ]);
         let c = census(&p);

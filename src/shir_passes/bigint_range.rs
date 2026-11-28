@@ -259,7 +259,7 @@ fn big_ir_range(e: &IrExpr, state: &HashMap<String, BigRange>) -> BigRange {
             [IrExpr::Str(_, _), v] => big_ir_range(v, state),
             _ => None,
         },
-        IrExpr::Arith(a) => {
+        IrExpr::Arith(a, _) => {
             let env: HashMap<String, (BigInt, BigInt)> = state
                 .iter()
                 .filter_map(|(n, r)| r.clone().map(|r| (n.clone(), r)))
@@ -320,7 +320,7 @@ pub fn analyze_var_ranges_big(stmts: &[IrStmt]) -> HashMap<String, (BigInt, BigI
     fn poison_expr_writes(e: &IrExpr, state: &mut HashMap<String, BigRange>) {
         use crate::ir::IrExpr;
         match e {
-            IrExpr::Arith(a) => poison_arith_writes(a, state),
+            IrExpr::Arith(a, _) => poison_arith_writes(a, state),
             IrExpr::Call { args, .. } => {
                 for a in args {
                     poison_expr_writes(a, state);
@@ -687,7 +687,7 @@ mod horner_walk_probe {
         }
         let stmts = vec![IrStmt::Assign {
             targets: vec![AssignTarget { var: "big".into(), sigil: None, indices: vec![] }],
-            expr: IrExpr::Arith(Box::new(acc)),
+            expr: IrExpr::Arith(Box::new(acc), None),
             asm: None,
         }];
         let r = analyze_var_ranges_big(&stmts);

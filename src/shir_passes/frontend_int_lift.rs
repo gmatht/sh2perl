@@ -180,7 +180,7 @@ impl Transform for FrontendIntLift {
                 crate::ir::IrExpr::Str(text, _) => {
                     super::frontend_types::int_literal(text).map(crate::ir::IrExpr::Int)
                 }
-                crate::ir::IrExpr::Arith(ast) if arith_is_int(ast, &ints) => {
+                crate::ir::IrExpr::Arith(ast, _) if arith_is_int(ast, &ints) => {
                     arith_eval(ast).map(crate::ir::IrExpr::Int)
                 }
                 _ => None,
@@ -248,7 +248,7 @@ mod tests {
             lhs: Box::new(ArithAst::Num(1)),
             rhs: Box::new(ArithAst::Num(2)),
         };
-        let mut p = program(vec![assign("x", IrExpr::Arith(Box::new(ast)))], true);
+        let mut p = program(vec![assign("x", IrExpr::Arith(Box::new(ast), None))], true);
         FrontendIntLift.run(&mut p, &PassContext::default());
         assert_eq!(p.stmts[0], assign("x", IrExpr::Int(3)));
     }
@@ -260,7 +260,7 @@ mod tests {
             lhs: Box::new(ArithAst::Num(i64::MAX)),
             rhs: Box::new(ArithAst::Num(1)),
         };
-        let mut p = program(vec![assign("x", IrExpr::Arith(Box::new(ast)))], true);
+        let mut p = program(vec![assign("x", IrExpr::Arith(Box::new(ast), None))], true);
         let before = format!("{:?}", p.stmts);
         FrontendIntLift.run(&mut p, &PassContext::default());
         assert_eq!(before, format!("{:?}", p.stmts));

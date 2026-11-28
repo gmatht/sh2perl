@@ -128,7 +128,7 @@ fn has_dynamic_write(stmts: &[IrStmt]) -> bool {
             IrExpr::Object(props) => props.iter().any(|(_, v)| walk_expr(v)),
             IrExpr::ArrayComp { iter, elem, cond, .. } => walk_expr(iter) || walk_expr(elem) || cond.as_ref().map(|c| walk_expr(c)).unwrap_or(false),
             IrExpr::Splice(inner) => walk_expr(inner),
-            IrExpr::Arith(ast) => walk_arith(ast),
+            IrExpr::Arith(ast, _) => walk_arith(ast),
             IrExpr::Ext(n) => crate::shir_nodes::ExtExpr::children(&**n)
                 .into_iter()
                 .any(walk_expr),
@@ -345,7 +345,7 @@ fn count_writes(stmts: &[IrStmt]) -> std::collections::HashMap<String, usize> {
             IrExpr::Object(props) => { for (_, v) in props { walk_expr(v, counts); } }
             IrExpr::ArrayComp { iter, elem, cond, .. } => { walk_expr(iter, counts); walk_expr(elem, counts); if let Some(c) = cond { walk_expr(c, counts); } }
             IrExpr::Splice(inner) => walk_expr(inner, counts),
-            IrExpr::Arith(ast) => walk_arith(ast, counts),
+            IrExpr::Arith(ast, _) => walk_arith(ast, counts),
             IrExpr::Ext(n) => {
                 for c in crate::shir_nodes::ExtExpr::children(&**n) {
                     walk_expr(c, counts);
@@ -738,11 +738,23 @@ fn census_expr(
                     string_read_names(s, reads);
                 }
             }
+            // `arith(TEXT)` / `arithEval` / `cstyleFor` carry ARITHMETIC TEXT
+            // whose variable references are BARE identifiers, invisible to the
+            // `$name` scan above. A store whose only read lives in that text
+            // (a division's operands are the usual case) must stay live, or the
+            // runtime evaluates the text against a never-assigned variable.
+            if matches!(func.as_str(), "arith" | "arithEval" | "cstyleFor") {
+                for a in args {
+                    if let IrExpr::Str(text, _) = a {
+                        string_arith_ident_reads(text, reads);
+                    }
+                }
+            }
             for a in args {
                 census_expr(a, reads, writes, escapes, escaping);
             }
         }
-        IrExpr::Arith(a) => arith_census(a, reads, writes, escapes, escaping),
+        IrExpr::Arith(a, _) => arith_census(a, reads, writes, escapes, escaping),
         // A transform-declared (Ext) node's field expressions are ordinary
         // reads/writes — the two walkers above already recurse into
         // `ExtExpr::children`, but this census did NOT, so a read buried in
@@ -798,6 +810,25 @@ fn census_expr(
 /// (The `test` operands `[ "$x" -gt "$y" ]` and the slice start
 /// `${s:$i:1}` carry $vars inside Str nodes — a Str is opaque to the
 /// census walk, so they must be decoded here.)
+/// Bare IDENTIFIER references (`a`, `i_sqrt_n`) inside arithmetic TEXT. The
+/// emitter hands the text to the runtime untouched, so every identifier in it
+/// is a possible variable read; over-marking only shrinks the elimination set.
+fn string_arith_ident_reads(s: &str, reads: &mut HashSet<String>) {
+    let b = s.as_bytes();
+    let mut i = 0;
+    while i < b.len() {
+        if b[i].is_ascii_alphabetic() || b[i] == b'_' {
+            let start = i;
+            while i < b.len() && (b[i].is_ascii_alphanumeric() || b[i] == b'_') {
+                i += 1;
+            }
+            reads.insert(s[start..i].to_string());
+        } else {
+            i += 1;
+        }
+    }
+}
+
 fn string_read_names(s: &str, reads: &mut HashSet<String>) {
     let bytes = s.as_bytes();
     let mut i = 0;
@@ -899,7 +930,7 @@ fn expr_pure(e: &IrExpr) -> bool {
             crate::ir::InterpPart::Lit(_) => true,
             crate::ir::InterpPart::Expr(x) => expr_pure(x),
         }),
-        IrExpr::Arith(a) => arith_pure(a),
+        IrExpr::Arith(a, _) => arith_pure(a),
         IrExpr::Array(items) => items.iter().all(expr_pure),
         IrExpr::Object(items) => items.iter().all(|(_, x)| expr_pure(x)),
         IrExpr::Splice(x) => expr_pure(x),

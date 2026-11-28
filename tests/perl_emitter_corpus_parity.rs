@@ -1849,21 +1849,24 @@ const HEADER: &str = "\
 # populated after the fixups, so the bare path refused every slice and printed
 # the WHOLE array for `${a[@]: -10}`) removed its entry entirely.
 #
-# Remaining `render-eq+bash-diff`, with the reason the token is still justified:
-#
-#   063_hard_to_parse   the script's first arithmetic expansion divides by an
-#       unset variable. bash ABANDONS the command and prints
-#       `<script>: line N: (a + b) * … : division by 0 (error token is …)` —
-#       quoting the SOURCE arithmetic text and the text after the failing token.
-#       The renderer sees `IrExpr::Arith(Box<ArithAst>)` — a parsed tree
-#       (`Num`/`Var`/`Bin{op,lhs,rhs}`/`Un`/`Index`/…) with no span, no raw text
-#       and no whitespace/parenthesis record; the source spelling exists only as
-#       `Word::Arithmetic`'s `expression` at AST→IR lowering and is dropped there
-#       (the A1 JSON carries the tree under an `ast` key and nothing else). Emitting the
-#       message byte-for-byte would mean inventing the text and the error-token
-#       offset. The value semantics are right (the expansion yields empty and the
-#       status is 1); only the diagnostic is missing. Its other stderr line — the
-#       bad substitution — now matches bash exactly.
+# NO `render-eq+bash-diff` row remains. 063_hard_to_parse was the last one: its
+# first arithmetic expansion divides by an unset variable, and bash ABANDONS the
+# command and prints
+#   `<script>: line N: (a + b) * … : division by 0 (error token is …)`
+# quoting the SOURCE arithmetic text and the text after the failing operand.
+# `IrExpr::Arith` is a parsed tree with no span, so an expansion whose operator
+# set can raise a runtime error (division / modulo) now travels as the EXISTING
+# `arith(TEXT)` call instead (`Word::Arithmetic` in `src/shir.rs`): the spelling
+# survives to the renderer, which pairs the k-th division node with the k-th `/`
+# or `%` in that text (`arith_divmod_ops`) and emits bash's `<expr>` (left-trimmed
+# source) and `error token` (source from the divisor operand to the end). The
+# first zero divisor sets `$main::__SH2_DIV0`, which suppresses later diagnostics
+# in the same expansion and makes its value empty — bash prints one line and
+# abandons the expansion. The same text form is why two read censuses had to
+# learn that arithmetic TEXT references BARE identifiers: DCE
+# (`transforms/dead_store_elim.rs`) keeps the stores, and the declaration census
+# (`ir::collect_vars_from_arith_text`) declares them, or the render would not
+# compile.
 #
 # Regenerate after a REVIEWED emitter change:
 #   SH2_UPDATE_EMITTER_LEDGER=1 cargo test --test perl_emitter_corpus_parity

@@ -226,7 +226,7 @@ fn expr_rewrite(e: &mut IrExpr, name: &str) -> bool {
             }
             changed
         }
-        IrExpr::Arith(a) => arith_rewrite(a, name),
+        IrExpr::Arith(a, _) => arith_rewrite(a, name),
         IrExpr::Splice(inner) => expr_rewrite(inner, name),
         IrExpr::Lambda { body, .. } => {
             let mut changed = false;
@@ -497,7 +497,7 @@ fn expr_uses_name(e: &IrExpr, name: &str) -> bool {
                 || cond.as_ref().map(|c| expr_uses_name(c, name)).unwrap_or(false)
         }
         IrExpr::Arrow(stmts) => stmts.iter().any(|s| stmt_uses_name(s, name)),
-        IrExpr::Arith(a) => arith_uses_name(a, name),
+        IrExpr::Arith(a, _) => arith_uses_name(a, name),
         IrExpr::Splice(inner) => expr_uses_name(inner, name),
         IrExpr::Lambda { body, .. } => body.iter().any(|s| stmt_uses_name(s, name)),
         _ => false,
@@ -645,7 +645,7 @@ fn expr_has_other_ref(e: &IrExpr, name: &str) -> bool {
                 || cond.as_ref().map(|c| expr_has_other_ref(c, name)).unwrap_or(false)
         }
         IrExpr::Arrow(stmts) => !stmts.iter().all(|s| stmt_refs_ok(s, name)),
-        IrExpr::Arith(a) => arith_has_other_ref(a, name),
+        IrExpr::Arith(a, _) => arith_has_other_ref(a, name),
         IrExpr::Splice(inner) => expr_has_other_ref(inner, name),
         IrExpr::Lambda { body, .. } => !body.iter().all(|s| stmt_refs_ok(s, name)),
         _ => false,

@@ -252,7 +252,7 @@ fn expr_has_capture(e: &IrExpr) -> bool {
 pub fn expr_definitely_stores_status(e: &IrExpr) -> bool {
     match e {
         // both arith statement arms store a boolean rc
-        IrExpr::Arith(_) => true,
+        IrExpr::Arith(_, _) => true,
         IrExpr::Call { func, .. } => !matches!(
             func.as_str(),
             // pure-print arms, the pipeline fallback, and the fnValue

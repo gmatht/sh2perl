@@ -1485,7 +1485,7 @@ impl Render {
                     }
                 }
             }
-            IrExpr::Arith(a) => self.collect_writes_arith(a),
+            IrExpr::Arith(a, _) => self.collect_writes_arith(a),
             IrExpr::MethodCall { obj, args, .. } => {
                 self.collect_writes_expr(obj);
                 for a in args {
@@ -2255,7 +2255,7 @@ impl Render {
                 }
                 format!("({l} {py_op} {r})")
             }
-            IrExpr::Arith(a) => self.arith(a),
+            IrExpr::Arith(a, _) => self.arith(a),
             IrExpr::Call { func, args } => self.call(func, args),
             IrExpr::MethodCall { obj, method, args } => {
                 let o = self.expr(obj);
@@ -3448,7 +3448,7 @@ impl Render {
     fn fstring_safe(&self, e: &IrExpr) -> bool {
         match e {
             IrExpr::Var(_, _) | IrExpr::Ident(_) | IrExpr::Int(_) | IrExpr::Bool(_) => true,
-            IrExpr::Arith(a) => self.arith_safe(a),
+            IrExpr::Arith(a, _) => self.arith_safe(a),
             IrExpr::Call { func, args } if func == "getVar" => {
                 // known vars render to bare idents; unknown → sh2_getVar("..")
                 matches!(args.first(), Some(IrExpr::Str(name, _))
@@ -5134,7 +5134,7 @@ impl Render {
                 // node — no arith-string detour). CPython parity by
                 // construction: int(x ** 0.5) in doubles, no import.
                 match args.first() {
-                    Some(IrExpr::Arith(a)) => format!("int(({}) ** 0.5)", self.arith(a)),
+                    Some(IrExpr::Arith(a, _)) => format!("int(({}) ** 0.5)", self.arith(a)),
                     _ => self.sh2_stub("isqrt", args, "isqrt"),
                 }
             }
@@ -9221,7 +9221,7 @@ impl Render {
     fn num_test_operand(&mut self, e: &IrExpr, code: String) -> String {
         let literal = match e {
             IrExpr::Int(_) => true,
-            IrExpr::Arith(a) => matches!(a.as_ref(), ArithAst::Num(_)),
+            IrExpr::Arith(a, _) => matches!(a.as_ref(), ArithAst::Num(_)),
             _ => false,
         };
         if literal {
@@ -9713,7 +9713,7 @@ impl Render {
                 // expression-assignment, so the Expr(Arith) form must
                 // become a real statement (the arith() expression path can
                 // only stub it).
-                if let IrExpr::Arith(a) = e {
+                if let IrExpr::Arith(a, _) = e {
                     if let ArithAst::IncDec { var, delta, prefix } = &**a {
                         let name = self.py_ident(var);
                         let d = delta.unsigned_abs();
@@ -10063,7 +10063,7 @@ impl Render {
                 let name = self.py_ident(&t.var);
                 // `s = s += n` (arith Assign on the same target) → `s += n`
                 // (python forbids assignment inside an expression)
-                if let IrExpr::Arith(a) = expr {
+                if let IrExpr::Arith(a, _) = expr {
                     if let ArithAst::IncDec { var, delta, prefix } = &**a {
                         let v = self.py_ident(var);
                         let d = delta.unsigned_abs();
@@ -13209,7 +13209,7 @@ fn last_stmt_is_quiet(stmts: &[IrStmt]) -> bool {
             | IrExpr::Bool(_)
             | IrExpr::Var(_, _)
             | IrExpr::Ident(_)
-            | IrExpr::Arith(_)
+            | IrExpr::Arith(_, _)
             | IrExpr::Range { .. } => true,
             IrExpr::Call { func, .. } if func == "getVar" => true,
             IrExpr::BinOp { lhs, rhs, .. } => expr_quiet(lhs) && expr_quiet(rhs),
@@ -13389,7 +13389,7 @@ fn collect_vars_expr(e: &IrExpr, out: &mut BTreeSet<String>) {
             collect_vars_expr(lhs, out);
             collect_vars_expr(rhs, out);
         }
-        IrExpr::Arith(a) => collect_vars_arith(a, out),
+        IrExpr::Arith(a, _) => collect_vars_arith(a, out),
         IrExpr::Interpolate(parts) => {
             for p in parts {
                 if let InterpPart::Expr(x) = p {

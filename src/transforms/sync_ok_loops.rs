@@ -679,7 +679,7 @@ fn expr_pure(e: &IrExpr) -> bool {
         | IrExpr::Ident(_) => true,
         IrExpr::Range { .. } | IrExpr::Json(_) => true,
         IrExpr::Array(items) => items.iter().all(expr_pure),
-        IrExpr::Arith(a) => arith_pure(a),
+        IrExpr::Arith(a, _) => arith_pure(a),
         IrExpr::BinOp { lhs, rhs, .. } => expr_pure(lhs) && expr_pure(rhs),
         IrExpr::Ternary { cond, then, else_ } => {
             expr_pure(cond) && expr_pure(then) && expr_pure(else_)
@@ -718,7 +718,7 @@ fn const_true_like(e: &IrExpr) -> bool {
         // ends. Missing this arm marked such a loop full-sync, which runs an
         // infinite loop with NO yield — exactly the freeze the finiteness
         // rule exists to prevent.
-        IrExpr::Arith(a) => matches!(**a, ArithAst::Num(n) if n != 0),
+        IrExpr::Arith(a, _) => matches!(**a, ArithAst::Num(n) if n != 0),
         IrExpr::Str(s, _) => matches!(s.as_str(), "true" | "1" | "yes"),
         IrExpr::Call { func, args, .. } if func == "exec" => match args.first() {
             // `while :; do` / `while true; do`

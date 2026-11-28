@@ -458,11 +458,11 @@ pub fn analyze_bigint_homed(prog: &IrProgram) -> HashSet<String> {
 
     fn walk_expr(e: &IrExpr, w: &mut HashMap<String, Write>) {
         match e {
-            IrExpr::Arith(a) => walk_arith(a, w),
+            IrExpr::Arith(a, _) => walk_arith(a, w),
             IrExpr::Call { func, args } => {
                 if func == "setVar" {
                     match args.as_slice() {
-                        [IrExpr::Str(v, _), IrExpr::Arith(a)] => {
+                        [IrExpr::Str(v, _), IrExpr::Arith(a, _)] => {
                             match w.entry(v.clone()).or_insert(Write::Arith(vec![])) {
                                 Write::Arith(trees) => trees.push((**a).clone()),
                                 Write::Other => {}
@@ -526,7 +526,7 @@ pub fn analyze_bigint_homed(prog: &IrProgram) -> HashSet<String> {
             IrStmt::Assign { targets, expr, .. } => {
                 for t in targets {
                     if t.indices.is_empty() {
-                        if let IrExpr::Arith(a) = expr {
+                        if let IrExpr::Arith(a, _) = expr {
                             match w.entry(t.var.clone()).or_insert(Write::Arith(vec![])) {
                                 Write::Arith(trees) => trees.push((**a).clone()),
                                 Write::Other => {}
@@ -830,12 +830,12 @@ pub fn wrap_true64_arith(prog: &mut IrProgram) {
         for s in stmts {
             match s {
                 IrStmt::Assign { expr, .. } => {
-                    if let IrExpr::Arith(a) = expr {
+                    if let IrExpr::Arith(a, _) = expr {
                         wrap_true64_arith_ast(a);
                     }
                 }
                 IrStmt::Expr(e) => {
-                    if let IrExpr::Arith(a) = e {
+                    if let IrExpr::Arith(a, _) = e {
                         wrap_true64_arith_ast(a);
                     }
                 }
@@ -867,7 +867,7 @@ pub fn wrap_true64_arith(prog: &mut IrProgram) {
                 } => {
                     walk_stmts(body);
                     for e in excepts.iter_mut() {
-                        if let Some(IrExpr::Arith(a)) = &mut e.match_expr {
+                        if let Some(IrExpr::Arith(a, _)) = &mut e.match_expr {
                             wrap_true64_arith_ast(a);
                         }
                         walk_stmts(&mut e.body);
@@ -1759,7 +1759,7 @@ pub(crate) fn ir_stmt_writes_lastexit(stmt: &IrStmt) -> bool {
         ),
         // `((i++))` — the arith_forms Assign(Arith(IncDec)) shape writes
         // the `(( ))` status (the value's nonzeroness) in its lowering
-        IrStmt::Assign { expr, .. } => matches!(expr, IrExpr::Arith(a)
+        IrStmt::Assign { expr, .. } => matches!(expr, IrExpr::Arith(a, _)
             if matches!(&**a, ArithAst::IncDec { .. })),
         _ => false,
     }
@@ -1973,7 +1973,7 @@ fn is_native_let_stmt(stmt: &IrStmt) -> bool {
         // shape (mirror of the `let "i++"` exec): same status semantics,
         // same deadness treatment (the hot loop's bare `++i`).
         IrStmt::Assign { targets, expr, .. } => {
-            matches!(expr, IrExpr::Arith(a)
+            matches!(expr, IrExpr::Arith(a, _)
                 if matches!(&**a, ArithAst::IncDec { var, .. }
                     if targets.len() == 1 && targets[0].indices.is_empty()
                         && &targets[0].var == var))
@@ -2453,7 +2453,7 @@ fn expr_has_extra_observer(
         IrExpr::Str(s, _) => s.contains("PIPESTATUS"),
         IrExpr::Var(name, _) => name == "?",
         IrExpr::Ident(name) => name == "?",
-        IrExpr::Arith(a) => arith_reads_status(a),
+        IrExpr::Arith(a, _) => arith_reads_status(a),
         IrExpr::Index { key, .. } => expr_has_extra_observer(key, defined, false),
         IrExpr::MethodCall { obj, args, .. } => {
             expr_has_extra_observer(obj, defined, false)
@@ -2751,7 +2751,7 @@ fn mark_flow_expr(
         | IrExpr::Var(..)
         | IrExpr::Ident(_)
         | IrExpr::Bool(_)
-        | IrExpr::Arith(_)
+        | IrExpr::Arith(_, _)
         | IrExpr::Regex { .. }
         | IrExpr::Range { .. }
         | IrExpr::RawExpr(_)
@@ -3232,7 +3232,7 @@ pub(crate) fn is_pure_test_chain(e: &IrExpr) -> bool {
             fn pure_operand(x: &IrExpr) -> bool {
                 match x {
                     IrExpr::Var(_, _) | IrExpr::Int(_) | IrExpr::Str(_, _) => true,
-                    IrExpr::Arith(a) => pure_arith(a),
+                    IrExpr::Arith(a, _) => pure_arith(a),
                     _ => false,
                 }
             }
@@ -3287,7 +3287,7 @@ fn pure_bool_operand(x: &IrExpr) -> bool {
     }
     match x {
         IrExpr::Var(_, _) | IrExpr::Int(_) | IrExpr::Str(_, _) => true,
-        IrExpr::Arith(a) => arith(a),
+        IrExpr::Arith(a, _) => arith(a),
         _ => false,
     }
 }
@@ -3432,7 +3432,7 @@ fn compute_test_cond_deadness(stmts: &[IrStmt], live: &HashSet<usize>) -> HashMa
 fn exit_code_provably_zero(prog: &IrProgram) -> bool {
     fn expr_zero(e: &IrExpr, fns: &HashMap<String, &Vec<IrStmt>>) -> bool {
         match e {
-            IrExpr::Arith(_) => true,
+            IrExpr::Arith(_, _) => true,
             IrExpr::Call { func, args } => match func.as_str() {
                 // successful builtins / pure store ops / the sync
                 // function-call tiers (a param-lifted fn's status is
@@ -3482,7 +3482,7 @@ fn exit_code_provably_zero(prog: &IrProgram) -> bool {
     // writes nothing (the enclosing statement's status is its own)
     fn cond_zero(c: &IrExpr, fns: &HashMap<String, &Vec<IrStmt>>) -> bool {
         match c {
-            IrExpr::Arith(_) => true,
+            IrExpr::Arith(_, _) => true,
             // a `&&`/`||` chain's status is the SHORT-CIRCUIT operand's
             // (1 when the test fails) — not provably 0
             IrExpr::BinOp { op, .. } => !matches!(op, BinOpKind::And | BinOpKind::Or),
@@ -3720,7 +3720,7 @@ fn const_value(expr: &IrExpr) -> Option<i128> {
     match expr {
         IrExpr::Int(n) => Some(*n as i128),
         IrExpr::Str(s, _) => s.trim().parse::<i128>().ok(),
-        IrExpr::Arith(a) => arith_const(a),
+        IrExpr::Arith(a, _) => arith_const(a),
         _ => None,
     }
 }
@@ -4177,10 +4177,10 @@ fn arith_versionable_op(a: &ArithAst, vars_ok: &mut bool) -> bool {
 fn wrap_stmts_arith(stmts: &[IrStmt]) -> Option<Vec<IrStmt>> {
     fn wrap_expr(e: &IrExpr) -> Option<IrExpr> {
         Some(match e {
-            IrExpr::Arith(a) => {
+            IrExpr::Arith(a, _) => {
                 let mut c = a.as_ref().clone();
                 wrap_true64_arith_ast(&mut c);
-                IrExpr::Arith(Box::new(c))
+                IrExpr::Arith(Box::new(c), None)
             }
             IrExpr::BinOp { lhs, rhs, op } => IrExpr::BinOp {
                 lhs: Box::new(wrap_expr(lhs)?),
@@ -4330,7 +4330,7 @@ fn dual_version_while(
     // cond must be a numeric comparison over versionable operands.
     let mut vars_ok = true;
     let cond_ast = match cond {
-        IrExpr::Arith(a) => a.as_ref().clone(),
+        IrExpr::Arith(a, _) => a.as_ref().clone(),
         _ => return None,
     };
     if !arith_versionable_op(&cond_ast, &mut vars_ok) || !vars_ok {
@@ -4343,12 +4343,12 @@ fn dual_version_while(
         for s in stmts {
             let pass = match s {
                 IrStmt::Assign { expr, .. } | IrStmt::Expr(expr) => match expr {
-                    IrExpr::Arith(a) => arith_versionable_op(a, ok),
+                    IrExpr::Arith(a, _) => arith_versionable_op(a, ok),
                     _ => true,
                 },
                 IrStmt::While { cond, body } => {
                     (match cond {
-                        IrExpr::Arith(a) => arith_versionable_op(a, ok),
+                        IrExpr::Arith(a, _) => arith_versionable_op(a, ok),
                         _ => false,
                     }) && body_versionable(body, ok)
                 }
@@ -4360,7 +4360,7 @@ fn dual_version_while(
                     ..
                 } => {
                     (match cond {
-                        IrExpr::Arith(a) => arith_versionable_op(a, ok),
+                        IrExpr::Arith(a, _) => arith_versionable_op(a, ok),
                         _ => false,
                     }) && body_versionable(then, ok)
                         && elsifs.iter().all(|(_, b)| body_versionable(b, ok))
@@ -4368,7 +4368,7 @@ fn dual_version_while(
                 }
                 IrStmt::Block(b) => body_versionable(b, ok),
                 IrStmt::Declare { init: Some(e), .. } => match e {
-                    IrExpr::Arith(a) => arith_versionable_op(a, ok),
+                    IrExpr::Arith(a, _) => arith_versionable_op(a, ok),
                     _ => true,
                 },
                 _ => true,
@@ -4408,12 +4408,12 @@ fn dual_version_while(
         for s in stmts {
             match s {
                 IrStmt::Assign { expr, .. } | IrStmt::Expr(expr) => {
-                    if let IrExpr::Arith(a) = expr {
+                    if let IrExpr::Arith(a, _) = expr {
                         collect_vars(a, out);
                     }
                 }
                 IrStmt::While { cond, body } => {
-                    if let IrExpr::Arith(a) = cond {
+                    if let IrExpr::Arith(a, _) = cond {
                         collect_vars(a, out);
                     }
                     collect_body_vars(body, out);
@@ -4425,7 +4425,7 @@ fn dual_version_while(
                     else_,
                     ..
                 } => {
-                    if let IrExpr::Arith(a) = cond {
+                    if let IrExpr::Arith(a, _) = cond {
                         collect_vars(a, out);
                     }
                     collect_body_vars(then, out);
@@ -4439,7 +4439,7 @@ fn dual_version_while(
             }
         }
     }
-    if let IrExpr::Arith(a) = cond {
+    if let IrExpr::Arith(a, _) = cond {
         collect_vars(a, &mut guard_vars);
     }
     collect_body_vars(body, &mut guard_vars);
@@ -4467,10 +4467,10 @@ fn dual_version_while(
     // maps (conservative → tracking kept, sound), and nested loops in the
     // clone cannot re-version (dead=false there).
     let wide_body = wrap_stmts_arith(body)?;
-    let wide_cond = if let IrExpr::Arith(a) = cond {
+    let wide_cond = if let IrExpr::Arith(a, _) = cond {
         let mut c = a.as_ref().clone();
         wrap_true64_arith_ast(&mut c);
-        IrExpr::Arith(Box::new(c))
+        IrExpr::Arith(Box::new(c), None)
     } else {
         unreachable!()
     };
@@ -6348,7 +6348,7 @@ fn param_lift_set(prog: &IrProgram) -> HashMap<String, usize> {
                 }
                 // a regular variable name is fine
             }
-            IrExpr::Arith(a) => walk_arith_pos(a, max, bad, strings),
+            IrExpr::Arith(a, _) => walk_arith_pos(a, max, bad, strings),
             IrExpr::Call { func, args } => {
                 if matches!(func.as_str(), "shift" | "set") {
                     *bad = true; // positional writes
@@ -6997,7 +6997,7 @@ fn pos_lift_set(prog: &IrProgram, sync_fns: &HashSet<String>) -> HashMap<String,
                 }
             },
             IrExpr::Int(_) | IrExpr::Bool(_) => {}
-            IrExpr::Arith(a) => scan_arith(a, u),
+            IrExpr::Arith(a, _) => scan_arith(a, u),
             IrExpr::Index { key, .. } => scan_expr(key, u),
             IrExpr::BinOp { lhs, rhs, .. } => {
                 scan_expr(lhs, u);
@@ -8466,7 +8466,7 @@ pub fn analyze_string_lengths(prog: &IrProgram) -> Vec<(String, Option<u64>)> {
                 _ => Some(20), // the numeric/bitwise ops -> a number
             },
             // $((...)) -> a number
-            IrExpr::Arith(_) => Some(20),
+            IrExpr::Arith(_, _) => Some(20),
             _ => None, // calls / arrays — unbounded
         }
     }
@@ -8707,7 +8707,7 @@ pub fn analyze_string_lengths(prog: &IrProgram) -> Vec<(String, Option<u64>)> {
                 })
                 .sum(),
             IrExpr::BinOp { lhs, rhs, .. } => count_var_reads(lhs, v) + count_var_reads(rhs, v),
-            IrExpr::Arith(a) => arith_count_reads(a, v),
+            IrExpr::Arith(a, _) => arith_count_reads(a, v),
             IrExpr::Index { var, key, .. } => (var == v) as usize + count_var_reads(key, v),
             IrExpr::Capture { expr, .. } => count_var_reads(expr, v),
             IrExpr::Array(items) => items.iter().map(|i| count_var_reads(i, v)).sum(),
@@ -8815,10 +8815,10 @@ pub fn analyze_string_lengths(prog: &IrProgram) -> Vec<(String, Option<u64>)> {
             )
         };
         match e {
-            IrExpr::Arith(_) => true,
+            IrExpr::Arith(_, _) => true,
             IrExpr::Call { func, args } if func == "assign" => match args.as_slice() {
                 [IrExpr::Str(_, _), IrExpr::Str(op, _), value] if op == "+=" => match value {
-                    IrExpr::Int(_) | IrExpr::Arith(_) => true,
+                    IrExpr::Int(_) | IrExpr::Arith(_, _) => true,
                     IrExpr::Str(sv, _) => sv.trim().parse::<i64>().is_ok(),
                     _ => false,
                 },
@@ -8842,7 +8842,7 @@ pub fn analyze_string_lengths(prog: &IrProgram) -> Vec<(String, Option<u64>)> {
         depth: u32,
     ) -> Option<u64> {
         match e {
-            IrExpr::Arith(_) => Some(20),
+            IrExpr::Arith(_, _) => Some(20),
             IrExpr::Call { func, args } if func == "assign" => match args.as_slice() {
                 [IrExpr::Str(_, _), IrExpr::Str(op, _), value] if op == "+=" => {
                     expr_len(value, lens, cap, depth + 1)
@@ -9456,7 +9456,7 @@ pub fn analyze_var_nospace(prog: &IrProgram) -> Vec<(String, bool)> {
         match e {
             IrExpr::Int(_) => true,
             IrExpr::Str(s, _) => whitespace_free(s),
-            IrExpr::Arith(_) => true, // numeric result
+            IrExpr::Arith(_, _) => true, // numeric result
             IrExpr::BinOp { .. } => true, // numeric binary op
             IrExpr::Var(name, _) => verdicts.get(name).copied().unwrap_or(false),
             IrExpr::Ident(name) => verdicts.get(name).copied().unwrap_or(false),
@@ -9888,7 +9888,7 @@ use std::collections::{HashMap, HashSet};
 
     fn walk_expr(e: &IrExpr, acc: &mut Acc, multi_run: bool) {
         match e {
-            IrExpr::Arith(a) => {
+            IrExpr::Arith(a, _) => {
                 for w in arith_written_vars(a) {
                     acc.arith_written.insert(w);
                 }
@@ -10358,7 +10358,7 @@ pub fn const_fold_arith(prog: &mut IrProgram) {
     }
     fn fold_expr(e: &mut IrExpr, pool: &mut HashMap<String, i128>, consts: &HashSet<String>) {
         match e {
-            IrExpr::Arith(a) => {
+            IrExpr::Arith(a, _) => {
                 fold_arith(a, pool);
                 if let Some(v) = arith_const(a) {
                     if in_range(v) {
@@ -10689,7 +10689,7 @@ pub fn compute_nonzero_vars(prog: &IrProgram) -> HashSet<String> {
                 IrExpr::Var(n, _) => {
                     out.insert(n.clone());
                 }
-                IrExpr::Arith(a) => walk_arith(a, out),
+                IrExpr::Arith(a, _) => walk_arith(a, out),
                 IrExpr::Call { func, args } => {
                     if matches!(func.as_str(), "getVar" | "param" | "listVar" | "arrayIndex")
                     {
@@ -11351,7 +11351,7 @@ pub fn analyze_use_safety_stmts_big(
         out: &mut HashSet<String>,
     ) {
         match e {
-            IrExpr::Arith(a) => veto_arith(a, env, out),
+            IrExpr::Arith(a, _) => veto_arith(a, env, out),
             IrExpr::BinOp { lhs, rhs, .. } => {
                 veto_expr(lhs, env, out);
                 veto_expr(rhs, env, out);
@@ -11665,7 +11665,7 @@ pub fn analyze_use_safety_stmts_big(
     ) {
         match s {
             IrStmt::Assign { targets, expr, .. } => {
-                if let IrExpr::Arith(a) = expr {
+                if let IrExpr::Arith(a, _) = expr {
                     if big_exact_covered(a, bigenv, env, targets) {
                         return;
                     }
@@ -12319,7 +12319,7 @@ pub fn analyze_widths(
     fn collect_rhs(s: &IrStmt, out: &mut Vec<(String, ArithAst)>) {
         match s {
             IrStmt::Assign { targets, expr, .. } => {
-                if let IrExpr::Arith(a) = expr {
+                if let IrExpr::Arith(a, _) = expr {
                     for t in targets {
                         if t.indices.is_empty() {
                             out.push((t.var.clone(), (**a).clone()));
@@ -12490,7 +12490,7 @@ pub fn analyze_i64_omittable(prog: &IrProgram) -> I64OmitInfo {
                 }
                 walk_expr(key, out);
             }
-            IrExpr::Arith(a) => walk_arith(a, out),
+            IrExpr::Arith(a, _) => walk_arith(a, out),
             IrExpr::BinOp { lhs, rhs, .. } => {
                 walk_expr(lhs, out);
                 walk_expr(rhs, out);
@@ -12783,7 +12783,7 @@ pub fn analyze_bigint_vars(prog: &crate::ir::IrProgram) -> std::collections::BTr
         for s in stmts {
             match s {
                 crate::ir::IrStmt::Assign { targets, expr, .. } => {
-                    if let (Some(t), crate::ir::IrExpr::Arith(a)) = (targets.first(), expr) {
+                    if let (Some(t), crate::ir::IrExpr::Arith(a, _)) = (targets.first(), expr) {
                         // Record EVERY arithmetic assignment, not just the
                         // first: a var assigned a plain arith once and a
                         // `Cast(Int64)`-wrapped arith later (a mixed
@@ -13033,7 +13033,7 @@ pub fn analyze_const_len_arrays(prog: &IrProgram) -> HashMap<String, usize> {
                 Ok(n) => n >= 0 && (n as usize) <= last,
                 Err(_) => false,
             },
-            IrExpr::Arith(a) => match const_arith(a) {
+            IrExpr::Arith(a, _) => match const_arith(a) {
                 Some(n) => n >= 0 && (n as usize) <= last,
                 None => false,
             },
@@ -13148,7 +13148,7 @@ pub fn analyze_const_len_arrays(prog: &IrProgram) -> HashMap<String, usize> {
                 walk_expr(default, acc);
             }
             IrExpr::Capture { expr, .. } => walk_expr(expr, acc),
-            IrExpr::Arith(a) => walk_arith(a, acc),
+            IrExpr::Arith(a, _) => walk_arith(a, acc),
             IrExpr::Object(props) => {
                 for (_, v) in props {
                     walk_expr(v, acc);
@@ -13888,7 +13888,7 @@ pub fn analyze_static_arrays(prog: &IrProgram) -> HashMap<String, Vec<String>> {
                 acc.used_otherwise.insert(var.clone());
                 scan_expr_reads(key, acc);
             }
-            IrExpr::Arith(a) => scan_arith_reads(a, acc),
+            IrExpr::Arith(a, _) => scan_arith_reads(a, acc),
             IrExpr::DefinedOr { expr, default } => {
                 scan_expr_reads(expr, acc);
                 scan_expr_reads(default, acc);
@@ -15496,7 +15496,7 @@ pub fn analyze_shift_offsets(prog: &IrProgram) -> HashMap<String, usize> {
                 }
                 IrExpr::DefinedOr { expr, default } => expr_vetoes(expr) || expr_vetoes(default),
                 IrExpr::Capture { expr, .. } => expr_vetoes(expr),
-                IrExpr::Arith(_) => false,
+                IrExpr::Arith(_, _) => false,
                 IrExpr::Index { key, .. } => expr_vetoes(key),
                 IrExpr::Object(props) => props.iter().any(|(_, v)| expr_vetoes(v)),
                 IrExpr::Splice(x) => expr_vetoes(x),
@@ -16298,7 +16298,7 @@ pub fn is_int_expr(e: &IrExpr, vt: &HashMap<String, IrType>, big: &BTreeSet<Stri
         // a string literal that parses as a 64-bit integer (the
         // frontend emits list literals as Str)
         IrExpr::Str(s, _) => s.trim().parse::<i64>().is_ok(),
-        IrExpr::Arith(a) => !arith_refs_bigint(a, big),
+        IrExpr::Arith(a, _) => !arith_refs_bigint(a, big),
         IrExpr::Var(name, _) | IrExpr::Ident(name) => matches!(
             vt.get(name),
             Some(IrType::Int | IrType::Int32 | IrType::Int64 | IrType::UInt32 | IrType::UInt64)
@@ -16489,7 +16489,7 @@ fn harvest_opaque_expr(e: &IrExpr, out: &mut HashSet<String>) {
         IrExpr::Str(s, _) => vars_in_opaque_text(s, out),
         IrExpr::Array(elems) => elems.iter().for_each(|e| harvest_opaque_expr(e, out)),
         IrExpr::Call { args, .. } => args.iter().for_each(|a| harvest_opaque_expr(a, out)),
-        IrExpr::Arith(a) => harvest_opaque_arith(a, out),
+        IrExpr::Arith(a, _) => harvest_opaque_arith(a, out),
         IrExpr::Index { var, key } => {
             vars_in_opaque_text(var, out);
             harvest_opaque_expr(key, out);
@@ -16561,15 +16561,15 @@ pub fn analyze_true64(
                     }
                     if targets.len() == 1 && targets[0].indices.is_empty() {
                         let v = &targets[0].var;
-                        if numeric.contains(v) || matches!(expr, IrExpr::Arith(_)) {
+                        if numeric.contains(v) || matches!(expr, IrExpr::Arith(_, _)) {
                             assigned.insert(v.clone());
                         }
                         if inside_loop && assigned.contains(v) {
                             in_loop.insert(v.clone());
                         }
-                        let is_rmw = matches!(expr, IrExpr::Arith(a) if matches!(&**a, ArithAst::Bin { lhs, .. } if matches!(&**lhs, ArithAst::Var(n) if n == v)))
-                            || matches!(expr, IrExpr::Arith(a) if matches!(&**a, ArithAst::Assign { var, .. } if var == v))
-                            || matches!(expr, IrExpr::Arith(a) if matches!(&**a, ArithAst::IncDec { var, .. } if var == v));
+                        let is_rmw = matches!(expr, IrExpr::Arith(a, _) if matches!(&**a, ArithAst::Bin { lhs, .. } if matches!(&**lhs, ArithAst::Var(n) if n == v)))
+                            || matches!(expr, IrExpr::Arith(a, _) if matches!(&**a, ArithAst::Assign { var, .. } if var == v))
+                            || matches!(expr, IrExpr::Arith(a, _) if matches!(&**a, ArithAst::IncDec { var, .. } if var == v));
                         if is_rmw {
                             rmw.insert(v.clone());
                             // Track the RHS operands (other than `v`
@@ -16578,7 +16578,7 @@ pub fn analyze_true64(
                             // NOT be slot-homed (t91_set_sum_fallback:
                             // `total += x` over a set with a bigint
                             // element dropped the 2^100 term).
-                            if let IrExpr::Arith(a) = expr {
+                            if let IrExpr::Arith(a, _) = expr {
                                 let reads = rmw_reads.entry(v.clone()).or_default();
                                 for r in arith_read_vars(a) {
                                     if r != *v {
@@ -16833,7 +16833,7 @@ pub fn analyze_big_i53(prog: &IrProgram) -> HashSet<String> {
             }
             // bash arith ALWAYS yields an integer (non-numeric operands
             // coerce to 0)
-            IrExpr::Arith(_) => Some(W::ProvenInt),
+            IrExpr::Arith(_, _) => Some(W::ProvenInt),
             // a read of another candidate: the BigInt home holds an
             // integer; any other var's value is unproven
             IrExpr::Var(n, _) | IrExpr::Ident(n) => {
@@ -17269,7 +17269,7 @@ pub fn analyze_big_i53(prog: &IrProgram) -> HashSet<String> {
 /// Does a write's value read a candidate (a BigInt-typed var)?
 fn write_reads_candidate(e: &IrExpr, cand: &HashSet<String>) -> bool {
     match e {
-        IrExpr::Arith(a) => arith_reads_candidate(a, cand),
+        IrExpr::Arith(a, _) => arith_reads_candidate(a, cand),
         IrExpr::Var(n, _) | IrExpr::Ident(n) => cand.contains(n),
         _ => false,
     }
@@ -17538,7 +17538,7 @@ fn cond_bound_resolved(
         // the shell path lowers conds to test/let TEXT, so this arm is a
         // no-op there and pure gain for frontends). Integer `< <= > >=
         // ==` only (`!=` cannot cap a range).
-        IrExpr::Arith(a) => {
+        IrExpr::Arith(a, _) => {
             let (op, l, r) = match a.as_ref() {
                 crate::ir::ArithAst::Bin { op, lhs, rhs } => (op.as_str(), lhs, rhs),
                 _ => return None,
@@ -17597,7 +17597,7 @@ fn cond_bound_resolved(
             // an operand of the comparison: a bare var read or a
             // provable loop-invariant constant (mirrors `resolve`).
             let var_name = |e: &IrExpr| match e {
-                IrExpr::Arith(a) => match a.as_ref() {
+                IrExpr::Arith(a, _) => match a.as_ref() {
                     crate::ir::ArithAst::Var(n) | crate::ir::ArithAst::Ident(n) => {
                         Some(n.clone())
                     }
@@ -17606,7 +17606,7 @@ fn cond_bound_resolved(
                 _ => None,
             };
             let num_val = |e: &IrExpr| match e {
-                IrExpr::Arith(a) => match a.as_ref() {
+                IrExpr::Arith(a, _) => match a.as_ref() {
                     crate::ir::ArithAst::Num(n) => Some(*n as i128),
                     crate::ir::ArithAst::Var(n) | crate::ir::ArithAst::Ident(n) => {
                         if carried.contains(n) {
@@ -17763,7 +17763,7 @@ fn for_iter_trip(iter: &IrExpr) -> Option<u64> {
 /// The literal step of `v = v + k` / `v = k + v` / `v += k` with k ≥ 1.
 fn plus_step(expr: &IrExpr, v: &str) -> Option<i64> {
     match expr {
-        IrExpr::Arith(a) => match a.as_ref() {
+        IrExpr::Arith(a, _) => match a.as_ref() {
             ArithAst::Bin { op, lhs, rhs } if op == "+" => match (lhs.as_ref(), rhs.as_ref()) {
                 (ArithAst::Var(n), ArithAst::Num(k)) | (ArithAst::Num(k), ArithAst::Var(n))
                     if n == v =>
@@ -17858,7 +17858,7 @@ fn body_step_bounds(
                         return Some((k, k));
                     }
                     // range-bounded step: `v = v + e` / `v = e + v`
-                    if let IrExpr::Arith(a) = expr {
+                    if let IrExpr::Arith(a, _) = expr {
                         if let ArithAst::Bin { op, lhs, rhs } = a.as_ref() {
                             if op == "+" {
                                 // look through Cast wrappers: the py-sh-go
@@ -18156,7 +18156,7 @@ fn walk_stmt_ranges(s: &IrStmt, state: &mut HashMap<String, Range>, join_binds: 
             // Assign's RANGE is the expression's VALUE; the write updates
             // the var's post-statement state (the IncDec postfix value is
             // the OLD value, the var's own state the NEW one)
-            if let IrExpr::Arith(a) = expr {
+            if let IrExpr::Arith(a, _) = expr {
                 arith_stmt_writes(a, state, join_binds);
             }
         }
@@ -18168,7 +18168,7 @@ fn walk_stmt_ranges(s: &IrStmt, state: &mut HashMap<String, Range>, join_binds: 
         // loop fixpoint never sees the counter's growth (the stale pre-loop
         // range would masquerade as a proof — i in t86 looked like [1,1]
         // forever).
-        IrStmt::Expr(IrExpr::Arith(a)) => {
+        IrStmt::Expr(IrExpr::Arith(a, _)) => {
             arith_stmt_writes(a, state, join_binds);
         }
         // setVar(name, v) — the plain write; `assign(name, op, v)` — the
@@ -18177,7 +18177,7 @@ fn walk_stmt_ranges(s: &IrStmt, state: &mut HashMap<String, Range>, join_binds: 
         IrStmt::Expr(IrExpr::Call { func, args }) if func == "setVar" || func == "assign" => {
             if let [IrExpr::Str(name, _), ..] = args.as_slice() {
                 bind(state, name.clone(), ir_range(args.last().unwrap(), state), join_binds);
-                if let Some(IrExpr::Arith(a)) = args.last() {
+                if let Some(IrExpr::Arith(a, _)) = args.last() {
                     arith_stmt_writes(a, state, join_binds);
                 }
             }
@@ -18410,7 +18410,7 @@ pub(crate) fn collect_assigned(s: &IrStmt, out: &mut HashSet<String>) {
         // (`last = i`) reads the stale pre-loop range (last looked like
         // [0,1] forever → wrongly narrowed to u8). Mirrors the
         // walk_stmt_ranges Expr(Arith) arm.
-        IrStmt::Expr(IrExpr::Arith(a)) => {
+        IrStmt::Expr(IrExpr::Arith(a, _)) => {
             arith_write_names(a, out);
         }
         IrStmt::Block(stmts) | IrStmt::Subshell(stmts) => {
@@ -18476,7 +18476,7 @@ fn ir_range(e: &IrExpr, state: &HashMap<String, Range>) -> Range {
             [IrExpr::Str(_, _), IrExpr::Str(op, _), e] if op == "=" => ir_range(e, state),
             _ => None,
         },
-        IrExpr::Arith(a) => arith_range(a, state),
+        IrExpr::Arith(a, _) => arith_range(a, state),
         // Boolean literals are NOT integers for typing: Python `True`
         // prints as "True", not "1" — a native-int declaration would
         // change output (the py-sh-go frontend lowers True to Bool).
@@ -19026,7 +19026,7 @@ pub(crate) fn stmt_for_command(cmd: &Command) -> Option<IrStmt> {
                         sigil: None,
                         indices: vec![],
                     }],
-                    expr: IrExpr::Arith(Box::new(ast)),
+                    expr: IrExpr::Arith(Box::new(ast), None),
                     asm: None,
                 })
             };
@@ -20371,7 +20371,10 @@ fn word_ir_quoted(w: &Word) -> IrExpr {
     match w {
         Word::CommandSubstitution(cmd, _) => match cmdsub_arith_expr(cmd) {
             Some(t) => match parse_arith_native(t) {
-                Some(a) => IrExpr::Arith(Box::new(a)),
+                Some(a) if arith_has_div_mod(&a) => {
+                    IrExpr::Arith(Box::new(a), Some(t.to_string()))
+                }
+                Some(a) => IrExpr::Arith(Box::new(a), None),
                 None => call("arith", vec![st(t)]),
             },
             None => IrExpr::Capture {
@@ -20469,7 +20472,7 @@ fn word_ir(w: &Word) -> IrExpr {
         Word::Variable(name, _, _) => call("getVar", vec![st(name)]),
         Word::CommandSubstitution(cmd, _) => match cmdsub_arith_expr(cmd) {
             Some(t) => match parse_arith_native(t) {
-                Some(a) => IrExpr::Arith(Box::new(a)),
+                Some(a) => IrExpr::Arith(Box::new(a), None),
                 None => call("arith", vec![st(t)]),
             },
             None => call(
@@ -20479,7 +20482,21 @@ fn word_ir(w: &Word) -> IrExpr {
         },
         Word::ParameterExpansion(pe, _) => param_ir(pe),
         Word::Arithmetic(ae, _) => match parse_arith_native(&ae.expression) {
-            Some(a) => IrExpr::Arith(Box::new(a)),
+            // The node carries the expansion's SOURCE SPELLING beside the
+            // parsed tree. The tree has no spans, so it cannot recover what
+            // bash quotes in an arithmetic-error diagnostic
+            // (`(a + b) / (c % d) : division by 0 (error token is "d)")`):
+            // the expression as written, and the text from the failing operand
+            // to the end. Emitters that can report such an error read the
+            // spelling; every other consumer reads the tree, unchanged.
+            // Only an expansion that can raise a runtime arithmetic error
+            // keeps its spelling: carrying it disables constant folding for the
+            // node (tree and text must agree), and a folding-only difference is
+            // not worth that.
+            Some(a) if arith_has_div_mod(&a) => {
+                IrExpr::Arith(Box::new(a), Some(ae.expression.clone()))
+            }
+            Some(a) => IrExpr::Arith(Box::new(a), None),
             None => call("arith", vec![st(&ae.expression)]),
         },
         Word::BraceExpansion(be, _) => brace_ir(be),
@@ -20991,7 +21008,12 @@ fn part_ir(part: &StringPart) -> IrExpr {
             }
         }
         StringPart::Arithmetic(ae) => match parse_arith_native(&ae.expression) {
-            Some(a) => IrExpr::Arith(Box::new(a)),
+            // keep the SOURCE spelling (see `word_ir`): bash quotes it in an
+            // arithmetic-error diagnostic
+            Some(a) if arith_has_div_mod(&a) => {
+                IrExpr::Arith(Box::new(a), Some(ae.expression.clone()))
+            }
+            Some(a) => IrExpr::Arith(Box::new(a), None),
             None => call("arith", vec![st(&ae.expression)]),
         },
         // Array-valued expansions inside a template literal would render with
@@ -21018,7 +21040,10 @@ fn part_ir(part: &StringPart) -> IrExpr {
         ),
         StringPart::CommandSubstitution(cmd) => match cmdsub_arith_expr(cmd) {
             Some(t) => match parse_arith_native(t) {
-                Some(a) => IrExpr::Arith(Box::new(a)),
+                Some(a) if arith_has_div_mod(&a) => {
+                    IrExpr::Arith(Box::new(a), Some(t.to_string()))
+                }
+                Some(a) => IrExpr::Arith(Box::new(a), None),
                 None => call("arith", vec![st(t)]),
             },
             None => IrExpr::Capture {
@@ -22833,7 +22858,7 @@ fn collect_true64_divisors(a: &ArithAst, out: &mut Vec<ArithAst>) {
 /// arith contexts).
 fn ir_arg_is_bigint(e: &IrExpr) -> bool {
     match e {
-        IrExpr::Arith(a) => arith_is_bigint(a) || arith_mentions_true64(a),
+        IrExpr::Arith(a, _) => arith_is_bigint(a) || arith_mentions_true64(a),
         IrExpr::Call { func, args } if func == "getVar" => {
             matches!(args.as_slice(), [IrExpr::Str(n, _)] if var_type_of(n) == Some(IrType::Int64))
         }
@@ -23834,7 +23859,7 @@ fn declare_sources_impl(
             // spelling (the gap that kept every `local x="$(...)"` on the
             // runtime builtin).
             IrExpr::Capture { .. } if dyn_values => Some(e.clone()),
-            IrExpr::Arith(_) if dyn_values => Some(e.clone()),
+            IrExpr::Arith(_, _) if dyn_values => Some(e.clone()),
             IrExpr::Call { func, args } if func == "getVar" => match args.as_slice() {
                 // positional (`$1`..`$9`, `$@`, `$*` — the string-valued
                 // positionals; `$0` is argv0, `$#` the count — keep both
@@ -24118,7 +24143,7 @@ fn decl_source_to_estree(name: &str, src: &IrExpr) -> Expr {
         // decimal string, so `${#x}` / case / comparisons see exactly
         // what the store held. (`args` unused — the arith arm emits the
         // text eval; the Arith AST arm the native expression.)
-        IrExpr::Arith(_) => {
+        IrExpr::Arith(_, _) => {
             if is_lifted_num(name) {
                 expr_to_estree(src)
             } else {
@@ -24738,7 +24763,7 @@ fn collect_native_arith_sources(args: &[IrExpr], assigns: &mut HashMap<String, V
                     assigns
                         .entry(w)
                         .or_default()
-                        .push(IrExpr::Arith(Box::new(ast.clone())));
+                        .push(IrExpr::Arith(Box::new(ast.clone()), None));
                 }
             }
         }
@@ -26806,7 +26831,7 @@ pub(crate) fn numeric_lift_vars(prog: &IrProgram) -> HashSet<String> {
                 // 063_01_deeply_nested_arithmetic — a native % yields NaN
                 // where bash yields ""). The runtime idiv/imod throw and
                 // the setVar path's arithEval catches → "".
-                IrExpr::Arith(a) => !arith_has_div_mod(a),
+                IrExpr::Arith(a, _) => !arith_has_div_mod(a),
                 IrExpr::Int(_) => true,
                 // the canonical-decimal round-trip (the `x=05` guard): a
                 // STRING source is numeric only when its text IS the
@@ -35327,7 +35352,7 @@ pub fn shir_to_estree(prog: &IrProgram) -> Program {
         fn elem_int(e: &IrExpr) -> bool {
             match e {
                 IrExpr::Int(_) => true,
-                IrExpr::Arith(_) => true,
+                IrExpr::Arith(_, _) => true,
                 IrExpr::Call { func, args }
                     if func == "getVar" || func == "param" => {
                         // getVar(name) / the first name slot of param
@@ -37093,7 +37118,7 @@ pub(crate) fn ir_may_enable_errexit(prog: &IrProgram) -> bool {
                 scan_expr(cond) || scan_expr(then) || scan_expr(else_)
             }
             IrExpr::DefinedOr { expr, default } => scan_expr(expr) || scan_expr(default),
-            IrExpr::Arith(a) => scan_arith(a),
+            IrExpr::Arith(a, _) => scan_arith(a),
             _ => false,
         }
     }
@@ -37259,7 +37284,7 @@ fn ir_nocase_shopt_mask(prog: &IrProgram) -> u8 {
                 scan_expr(expr, mask);
                 scan_expr(default, mask);
             }
-            IrExpr::Arith(a) => scan_arith(a, mask),
+            IrExpr::Arith(a, _) => scan_arith(a, mask),
             _ => {}
         }
     }
@@ -38734,7 +38759,7 @@ fn unwrap_test_bool(e: Expr) -> Expr {
 
 fn cond_to_estree(cond: &IrExpr) -> Expr {
     let c = expr_to_estree(cond);
-    if let IrExpr::Arith(a) = cond {
+    if let IrExpr::Arith(a, _) = cond {
         // the arithEval-wrapper case ONLY (the zero-compare pattern is
         // native-numeric — see the Arith arm — and needs no coercion)
         if arith_has_div_mod(a) && !arith_is_zero_cmp(a) {
@@ -38768,7 +38793,7 @@ fn try_shaderize_forinit(
     let (var, start) = match init {
         [IrStmt::Assign { targets, expr, .. }] => {
             let target = targets.first()?.var.clone();
-            let IrExpr::Arith(a) = expr else { return None };
+            let IrExpr::Arith(a, _) = expr else { return None };
             let ArithAst::Assign { var, op, rhs } = &**a else { return None };
             if *op != "=" || *var != target {
                 return None;
@@ -38797,7 +38822,7 @@ fn try_shaderize_forinit(
             if target != var {
                 return None;
             }
-            let IrExpr::Arith(a) = expr else { return None };
+            let IrExpr::Arith(a, _) = expr else { return None };
             match &**a {
                 ArithAst::IncDec { var: v, delta, .. } if *v == var => *delta,
                 ArithAst::Assign { var: v, op, rhs } if *v == var && *op == "+=" => {
@@ -38858,7 +38883,7 @@ fn parse_cond(s: &str, var: &str) -> Option<(String, i64)> {
 /// capture side effects).
 fn body_is_pure_arith(body: &[IrStmt]) -> bool {
     body.iter().all(|s| match s {
-        IrStmt::Assign { expr, .. } => matches!(expr, IrExpr::Arith(_)),
+        IrStmt::Assign { expr, .. } => matches!(expr, IrExpr::Arith(_, _)),
         _ => false,
     })
 }
@@ -39220,7 +39245,7 @@ fn stmt_to_estree(stmt: &IrStmt) -> Option<Stmt> {
             // the pre-transform `let` path's exact emission — or dropped
             // entirely when the lastExit write is provably dead (the
             // hot-loop `++i`).
-            if let IrExpr::Arith(a) = expr {
+            if let IrExpr::Arith(a, _) = expr {
                 if let ArithAst::IncDec { var, .. } = &**a {
                     if var == &target.var && target.indices.is_empty() {
                         let inner = arith_to_estree_wrapped(a);
@@ -39275,7 +39300,7 @@ fn stmt_to_estree(stmt: &IrStmt) -> Option<Stmt> {
             // pure BigInt (raw slot reads + BigInt literals).
             if let Some(k) = slot_var_index(&target.var) {
                 let right = match expr {
-                    IrExpr::Arith(a) => arith_to_estree_wrapped(a),
+                    IrExpr::Arith(a, _) => arith_to_estree_wrapped(a),
                     IrExpr::Int(i) => bigint_lit_expr(*i),
                     IrExpr::Str(sv, _) => bigint_lit_expr(
                         sv.trim().parse::<i64>().unwrap_or(0),
@@ -39337,7 +39362,7 @@ fn stmt_to_estree(stmt: &IrStmt) -> Option<Stmt> {
                     Some(match expr {
                     // numeric-lifted source; a `--true64` Int64 var wraps
                     // at 2^64 (bash's int64 semantics)
-                    IrExpr::Arith(a) => {
+                    IrExpr::Arith(a, _) => {
                         let inner = arith_to_estree_wrapped(a);
                         if var_type_of(&target.var)
                             == Some(IrType::Int64)
@@ -58507,7 +58532,7 @@ fn lift_expr_mentions(e: &IrExpr, name: &str) -> bool {
             }
             InterpPart::Expr(inner) => lift_expr_mentions(inner, name),
         }),
-        IrExpr::Arith(a) => lift_arith_mentions(a, name),
+        IrExpr::Arith(a, _) => lift_arith_mentions(a, name),
         IrExpr::Arrow(stmts) => stmts.iter().any(|s| lift_stmt_mentions(s, name)),
         IrExpr::Array(elems) => elems.iter().any(|el| lift_expr_mentions(el, name)),
         IrExpr::Object(props) => props.iter().any(|(_, v)| lift_expr_mentions(v, name)),
@@ -61436,7 +61461,7 @@ fn expr_known_nospace(e: &IrExpr) -> bool {
     }
     match e {
         IrExpr::Int(_) => true,
-        IrExpr::Arith(_) => true,
+        IrExpr::Arith(_, _) => true,
         IrExpr::BinOp { .. } => true,
         IrExpr::Str(s, _) => !s.chars().any(char::is_whitespace),
         IrExpr::Var(name, _) | IrExpr::Ident(name) => is_lifted_num(name) || tagged(name),
@@ -62040,7 +62065,7 @@ fn expr_to_estree(e: &IrExpr) -> Expr {
             // no arith-string detour). CPython parity by construction:
             // trunc(sqrt(x)) in doubles, exactly CPython's int(n**0.5).
             if func == "isqrt" {
-                if let [IrExpr::Arith(a)] = args.as_slice() {
+                if let [IrExpr::Arith(a, _)] = args.as_slice() {
                     let inner = arith_to_estree(a);
                     let sqrt = Expr::CallExpression {
                         callee: Box::new(Expr::MemberExpression {
@@ -64127,7 +64152,7 @@ fn expr_to_estree(e: &IrExpr) -> Expr {
                 iife
             }
         }
-        IrExpr::Arith(a) => {
+        IrExpr::Arith(a, _) => {
             let inner = arith_to_estree_wrapped(a);
             // `$(( ... ))` whose expression contains NO `/` or `%` cannot
             // throw (the only runtime abort a native arith can express is
@@ -70038,7 +70063,7 @@ mod bigint_hoist_tests {
     fn assign(var: &str, rhs: ArithAst) -> IrStmt {
         IrStmt::Assign {
             targets: vec![AssignTarget { var: var.to_string(), sigil: None, indices: vec![] }],
-            expr: IrExpr::Arith(Box::new(rhs)),
+            expr: IrExpr::Arith(Box::new(rhs), None),
             asm: None,
         }
     }
@@ -70109,7 +70134,7 @@ mod hypothesis_tests {
                 op: "*".to_string(),
                 lhs: Box::new(ArithAst::Var("x".to_string())),
                 rhs: Box::new(ArithAst::Num(2)),
-            })),
+            }), None),
             asm: None,
         };
         let mut assumes = std::collections::HashMap::new();
@@ -70775,7 +70800,7 @@ mod declare_tests {
         let tree = bin("+", bin("*", cst(bin("+", bin("*", cst(num(0)), cst(num(10))), cst(num(1)))), cst(num(10))), cst(num(0)));
         let stmts = vec![IrStmt::Assign {
             targets: vec![AssignTarget { var: "v".into(), sigil: None, indices: vec![] }],
-            expr: IrExpr::Arith(Box::new(tree)),
+            expr: IrExpr::Arith(Box::new(tree), None),
             asm: None,
         }];
         let big = crate::shir_passes::bigint_range::analyze_var_ranges_big(&stmts);

@@ -369,7 +369,7 @@ impl Render {
             IrExpr::Int(_) => true,
             IrExpr::Str(s, _) => s.trim().parse::<i64>().is_ok(),
             IrExpr::Var(name, _) => self.is_num(name),
-            IrExpr::Arith(_) => true,
+            IrExpr::Arith(_, _) => true,
             IrExpr::BinOp { op, .. } => !matches!(op, BinOpKind::Concat),
             IrExpr::Call { func, args } if func == "getVar" => {
                 matches!(args.first(), Some(IrExpr::Str(name, _)) if self.is_num(name))
@@ -420,7 +420,7 @@ impl Render {
                     format!("sh2ToInt({m})")
                 }
             }
-            IrExpr::Arith(a) => {
+            IrExpr::Arith(a, _) => {
                 if crate::shir::arith_refs_bigint(a, &self.bigint_vars) {
                     self.need_bigint = true;
                     let t = self.arith_bigint(a);
@@ -522,7 +522,7 @@ impl Render {
                 m
             }
             IrExpr::Interpolate(parts) => self.interpolate(parts),
-            IrExpr::Arith(a) => {
+            IrExpr::Arith(a, _) => {
                 if crate::shir::arith_refs_bigint(a, &self.bigint_vars) {
                     self.need_bigint = true;
                     let t = self.arith_bigint(a);
@@ -739,7 +739,7 @@ impl Render {
                 BinOpKind::Concat => format!("({} .len != 0)", self.expr_str(e)),
                 _ => format!("({} != 0)", self.expr_num(e)),
             },
-            IrExpr::Arith(a) => {
+            IrExpr::Arith(a, _) => {
                 if crate::shir::arith_refs_bigint(a, &self.bigint_vars) {
                     self.bigint_cond(a)
                 } else {
@@ -897,7 +897,7 @@ impl Render {
     /// Zig print specifier ({d}/{s}/{}) is chosen statically per node.
     fn part_spec(&mut self, e: &IrExpr) -> (char, String) {
         match e {
-            IrExpr::Int(_) | IrExpr::Arith(_) => ('d', self.expr_num(e)),
+            IrExpr::Int(_) | IrExpr::Arith(_, _) => ('d', self.expr_num(e)),
             IrExpr::Str(_, _) | IrExpr::Interpolate(_) => ('s', self.expr_str(e)),
             IrExpr::Bool(_) => ('b', self.expr_bool(e)),
             // a user-function call returns the STRING model — print it
@@ -1750,7 +1750,7 @@ impl Render {
                 // structured integer sqrt (py-sh-go `int(Y**0.5)` node
                 // — no arith-string detour). CPython parity by
                 // construction: trunc(sqrt(x)) in doubles.
-                if let Some(IrExpr::Arith(a)) = args.first() {
+                if let Some(IrExpr::Arith(a, _)) = args.first() {
                     let x = self.arith(a);
                     return format!("@as(i64, @intFromFloat(@sqrt(@as(f64, @floatFromInt({x})))))" );
                 }
@@ -2108,7 +2108,7 @@ impl Render {
                     vec![('s', "\"\"".into())]
                 }
             }
-            IrExpr::Arith(a) => {
+            IrExpr::Arith(a, _) => {
                 if crate::shir::arith_refs_bigint(a, &self.bigint_vars) {
                     self.need_bigint = true;
                     let t = self.arith_bigint(a);
@@ -2611,7 +2611,7 @@ impl Render {
                 // statement-position arith (`runs++` — the do-while idiom):
                 // render natively (`runs += 1;`) instead of the sh2Arith
                 // stub (which was called without being emitted)
-                if let IrExpr::Arith(a) = e {
+                if let IrExpr::Arith(a, _) = e {
                     if let ArithAst::IncDec { var, delta, .. } = &**a {
                         let v = self.zig_ident(var);
                         self.mark_read(var);
@@ -2818,7 +2818,7 @@ impl Render {
                                     // bigint element: init a Managed slot
                                     self.emit(&format!("{m}[{m}_len] = try std.math.big.int.Managed.init(std.heap.page_allocator);"));
                                     match it {
-                                        IrExpr::Arith(a) => self.bigint_into(a, &format!("{m}[{m}_len]")),
+                                        IrExpr::Arith(a, _) => self.bigint_into(a, &format!("{m}[{m}_len]")),
                                         _ => {
                                             let v = self.expr_str(it);
                                             self.emit(&format!("try {m}[{m}_len].setString(10, {v});"));
@@ -2838,7 +2838,7 @@ impl Render {
                 if self.bigint_vars.contains(&t.var) {
                     self.need_bigint = true;
                     match expr {
-                        IrExpr::Arith(a) => self.bigint_into(a, &m),
+                        IrExpr::Arith(a, _) => self.bigint_into(a, &m),
                         IrExpr::Var(name, _) | IrExpr::Ident(name)
                             if self.bigint_vars.contains(name) =>
                         {
@@ -2857,7 +2857,7 @@ impl Render {
                     // arith-assign / inc-dec render natively (not via
                     // the sh2Arith stub)
                     match expr {
-                        IrExpr::Arith(a) => match &**a {
+                        IrExpr::Arith(a, _) => match &**a {
                             ArithAst::IncDec { var, delta, .. } => {
                                 let v = self.zig_ident(var);
                                 self.mark_read(var);
@@ -3942,7 +3942,7 @@ fn collect_bigint_arrays(stmts: &[IrStmt], big: &BTreeSet<String>, out: &mut BTr
                             if let Some(IrExpr::Str(name, _)) = args.first() {
                                 if let Some(IrExpr::Array(items)) = args.get(1) {
                                     if items.iter().any(|it| {
-                                        matches!(it, IrExpr::Arith(a) if crate::shir::arith_refs_bigint(a, big))
+                                        matches!(it, IrExpr::Arith(a, _) if crate::shir::arith_refs_bigint(a, big))
                                     }) {
                                         out.insert(name.clone());
                                     }
@@ -4131,7 +4131,7 @@ fn collect_written_expr(e: &IrExpr, out: &mut BTreeSet<String>) {
             collect_written_expr(lhs, out);
             collect_written_expr(rhs, out);
         }
-        IrExpr::Arith(a) => collect_written_arith(a, out),
+        IrExpr::Arith(a, _) => collect_written_arith(a, out),
         IrExpr::Interpolate(parts) => {
             for p in parts {
                 if let InterpPart::Expr(x) = p {

@@ -174,7 +174,7 @@ pub fn shape(e: &IrExpr) -> String {
         IrExpr::Str(_, _) => "Str".into(),
         IrExpr::Var(n, _) => format!("Var({n})"),
         IrExpr::Ident(n) => format!("Ident({n})"),
-        IrExpr::Arith(_) => "Arith".into(),
+        IrExpr::Arith(_, _) => "Arith".into(),
         IrExpr::Call { func, .. } => format!("Call({func})"),
         IrExpr::Array(_) => "Array".into(),
         IrExpr::BinOp { .. } => "BinOp".into(),
@@ -204,7 +204,7 @@ pub fn expr_int(
     int_arrays: &HashSet<String>,
 ) -> bool {
     match e {
-        IrExpr::Int(_) | IrExpr::Arith(_) => true,
+        IrExpr::Int(_) | IrExpr::Arith(_, _) => true,
         // canonical decimal text (no leading zeros: `x="007"` must
         // keep its exact string)
         IrExpr::Str(s, _) => {

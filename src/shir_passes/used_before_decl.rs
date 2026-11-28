@@ -646,7 +646,7 @@ fn walk_expr_reads(
                 walk_expr_reads(i, pos, must_def, globals, report);
             }
         }
-        IrExpr::Arith(a) => walk_arith_reads(a, pos, must_def, globals, report),
+        IrExpr::Arith(a, _) => walk_arith_reads(a, pos, must_def, globals, report),
         IrExpr::ArrayComp { iter, elem, cond, .. } => {
             walk_expr_reads(iter, pos, must_def, globals, report);
             walk_expr_reads(elem, pos, must_def, globals, report);
@@ -858,7 +858,7 @@ fn collect_assign_in_expr(e: &IrExpr, out: &mut HashSet<String>) {
                 }
             }
         },
-        IrExpr::Arith(a) => collect_assign_in_arith(a, out),
+        IrExpr::Arith(a, _) => collect_assign_in_arith(a, out),
         IrExpr::BinOp { lhs, rhs, .. } => {
             collect_assign_in_expr(lhs, out);
             collect_assign_in_expr(rhs, out);
@@ -1174,7 +1174,7 @@ fn walk_defs_reads_expr(e: &IrExpr, defs: &mut HashSet<String>, reads: &mut Hash
                 walk_defs_reads_expr(i, defs, reads);
             }
         }
-        IrExpr::Arith(a) => walk_defs_reads_arith(a, defs, reads),
+        IrExpr::Arith(a, _) => walk_defs_reads_arith(a, defs, reads),
         IrExpr::ArrayComp { iter, elem, cond, .. } => {
             walk_defs_reads_expr(iter, defs, reads);
             walk_defs_reads_expr(elem, defs, reads);
@@ -1443,7 +1443,7 @@ mod tests {
                     op: "+".to_string(),
                     lhs: Box::new(ArithAst::Var("y".to_string())),
                     rhs: Box::new(ArithAst::Num(1)),
-                })),
+                }), None),
                 newline: true,
                 target: None,
             }],

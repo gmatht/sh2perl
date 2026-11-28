@@ -269,7 +269,7 @@ fn count_stmt_assigns(
                     site(counts, values, &base, expr, false);
                 }
             }
-            if let IrExpr::Arith(a) = expr {
+            if let IrExpr::Arith(a, _) = expr {
                 for w in arith_written_vars(a) {
                     site(counts, values, &w, expr, false);
                 }
@@ -597,7 +597,7 @@ fn count_expr_assigns(
             }
         }
         IrExpr::Splice(e) => count_expr_assigns(e, counts, values, top, dynamic),
-        IrExpr::Arith(a) => {
+        IrExpr::Arith(a, _) => {
             // native-arith writes (`x++`, `((x=1))`) nested in an
             // expression are real writes
             for w in arith_written_vars(a) {
@@ -882,7 +882,7 @@ fn fold_expr(
                 c = true;
             }
         }
-        IrExpr::Arith(a) => {
+        IrExpr::Arith(a, _) => {
             c |= fold_arith(a, defs, resolved, foldable);
             if c {
                 // Pass 0.5's const fold runs PRE-transforms (optimize_stmts
@@ -1600,7 +1600,7 @@ mod tests {
                         op: "+".to_string(),
                         lhs: Box::new(ArithAst::Var("count".to_string())),
                         rhs: Box::new(ArithAst::Num(1)),
-                    })),
+                    }), None),
                 )])])],
             }),
             expr_stmt(getvar("count")),
@@ -1772,13 +1772,13 @@ mod tests {
                     op: "+".to_string(),
                     lhs: Box::new(ArithAst::Var("x".to_string())),
                     rhs: Box::new(ArithAst::Num(1)),
-                })),
+                }), None),
             ),
             expr_stmt(getvar("y")),
         ];
         assert!(transform(&mut stmts));
         match &stmts[1] {
-            IrStmt::Assign { expr: IrExpr::Arith(a), .. } => {
+            IrStmt::Assign { expr: IrExpr::Arith(a, _), .. } => {
                 assert_eq!(**a, ArithAst::Num(6));
             }
             other => panic!("expected folded arith def, got {:?}", other),
@@ -1798,12 +1798,12 @@ mod tests {
                     op: "+".to_string(),
                     lhs: Box::new(ArithAst::Var("x".to_string())),
                     rhs: Box::new(ArithAst::Num(1)),
-                })),
+                }), None),
             ),
         ];
         assert!(!transform(&mut stmts));
         match &stmts[1] {
-            IrStmt::Assign { expr: IrExpr::Arith(a), .. } => {
+            IrStmt::Assign { expr: IrExpr::Arith(a, _), .. } => {
                 assert_eq!(**a, ArithAst::Bin {
                     op: "+".to_string(),
                     lhs: Box::new(ArithAst::Var("x".to_string())),
@@ -1826,7 +1826,7 @@ mod tests {
                     op: "+".to_string(),
                     lhs: Box::new(ArithAst::Var("x".to_string())),
                     rhs: Box::new(ArithAst::Num(1)),
-                })),
+                }), None),
             ),
         ];
         assert!(!transform(&mut stmts));
@@ -1846,7 +1846,7 @@ mod tests {
                     op: "+".to_string(),
                     lhs: Box::new(ArithAst::Var("x".to_string())),
                     rhs: Box::new(ArithAst::Num(1)),
-                })),
+                }), None),
             ),
         ];
         assert!(!transform(&mut stmts));
@@ -1861,7 +1861,7 @@ mod tests {
                 var: "x".to_string(),
                 delta: 1,
                 prefix: true,
-            }))),
+            }), None)),
             expr_stmt(getvar("x")),
         ];
         assert!(!transform(&mut stmts));

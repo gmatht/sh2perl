@@ -109,7 +109,7 @@ pub fn transform(stmts: &mut Vec<IrStmt>) -> bool {
 /// Does this expression contain a pow2 non-negative div/mod anywhere?
 fn contains_shiftable_divmod(e: &crate::ir::IrExpr) -> bool {
     match e {
-        crate::ir::IrExpr::Arith(a) => arith_any_shiftable(a),
+        crate::ir::IrExpr::Arith(a, _) => arith_any_shiftable(a),
         crate::ir::IrExpr::BinOp { lhs, rhs, .. } => {
             contains_shiftable_divmod(lhs) || contains_shiftable_divmod(rhs)
         }

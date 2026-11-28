@@ -2448,9 +2448,9 @@ fn assign_to_fish(targets: &[crate::ir::AssignTarget], expr: &IrExpr) -> Result<
     // is discarded, so just do the increment.
     if targets.len() == 1
         && targets[0].indices.is_empty()
-        && matches!(expr, IrExpr::Arith(a) if matches!(&**a, ArithAst::IncDec { var, .. } if var == &targets[0].var))
+        && matches!(expr, IrExpr::Arith(a, _) if matches!(&**a, ArithAst::IncDec { var, .. } if var == &targets[0].var))
     {
-        let IrExpr::Arith(a) = expr else { unreachable!() };
+        let IrExpr::Arith(a, _) = expr else { unreachable!() };
         if let ArithAst::IncDec { var, delta, prefix } = &**a {
             let op = if *delta > 0 { "+" } else { "-" };
             // `set` and `math` both SUCCEED, so the bare increment left the
@@ -2484,7 +2484,7 @@ fn assign_to_fish(targets: &[crate::ir::AssignTarget], expr: &IrExpr) -> Result<
     // produced nothing. The assignment IS the statement here, so spell it as
     // the fish assignment it is; the rhs is a plain math EXPRESSION.
     if targets.len() == 1 && targets[0].indices.is_empty() {
-        if let IrExpr::Arith(a) = expr {
+        if let IrExpr::Arith(a, _) = expr {
             if let ArithAst::Assign { op, rhs, .. } = &**a {
                 let t = &targets[0].var;
                 let r = arith_to_fish(rhs);
@@ -4002,7 +4002,7 @@ fn cmd_to_fish(e: &IrExpr) -> Result<String, String> {
         // `math` prints the value and carries that same status, so the
         // native spelling is `math`, not the bash `(( … ))` form fish
         // cannot parse in a condition.
-        IrExpr::Arith(a) => Ok(format!("math --scale 0 {}", arith_to_fish(a))),
+        IrExpr::Arith(a, _) => Ok(format!("math --scale 0 {}", arith_to_fish(a))),
         // a bare variable in command position: the goto restructure's
         // flag guards (`if (flag) break`) — truthiness of the store
         // value ([ -n ]), matching the runtime's nonempty-true semantics
@@ -4031,7 +4031,7 @@ fn cmd_to_fish(e: &IrExpr) -> Result<String, String> {
 /// statement renderer and re-emitting the bash form inside the condition.
 fn cond_to_fish(e: &IrExpr) -> Result<String, String> {
     match e {
-        IrExpr::Arith(a) => Ok(arith_cond_ast_fish(a)),
+        IrExpr::Arith(a, _) => Ok(arith_cond_ast_fish(a)),
         // Boolean STRUCTURE in condition position. These arms are what keep
         // a cond from bouncing back into `cmd_to_fish`: that path's Not arm
         // re-enters `cond_to_fish`, and its operand — a `Str`/`Array` test
@@ -4073,7 +4073,7 @@ fn cond_to_fish(e: &IrExpr) -> Result<String, String> {
             // follows the operand SHAPE: arithmetic subtree on both sides →
             // numeric; anything else → `=` / `!=`.
             let numeric =
-                matches!(&**lhs, IrExpr::Arith(_)) || matches!(&**rhs, IrExpr::Arith(_));
+                matches!(&**lhs, IrExpr::Arith(_, _)) || matches!(&**rhs, IrExpr::Arith(_, _));
             let flag = match (op, numeric) {
                 (BinOpKind::Eq, true) => "-eq",
                 (BinOpKind::Ne, true) => "-ne",
@@ -4103,7 +4103,7 @@ fn cond_operand_fish(e: &IrExpr) -> Result<String, String> {
         // A NUMERIC LITERAL needs no substitution at all: `[ 10 -lt 2 ]` is
         // what fish would write, and `(math --scale 0 "10")` is a needless
         // process to compute a constant that is already on the page.
-        IrExpr::Arith(a) => match &**a {
+        IrExpr::Arith(a, _) => match &**a {
             ArithAst::Num(n) => Ok(n.to_string()),
             // A PLAIN VARIABLE needs no substitution either: fish's `test`
             // coerces its operands numerically, with the SAME edge results as
@@ -6390,7 +6390,7 @@ fn word_to_fish(e: &IrExpr) -> Result<String, String> {
         IrExpr::Ident(name) => Ok(name.clone()),
         IrExpr::Bool(b) => Ok(if *b { "1".into() } else { "0".into() }),
         IrExpr::Interpolate(parts) => interp_to_fish(parts),
-        IrExpr::Arith(a) => {
+        IrExpr::Arith(a, _) => {
             // An IncDec is a self-contained command substitution (it mutates
             // the variable, so it cannot be an argument to `math`); everything
             // else is an expression for math to evaluate — except a relational
@@ -8289,7 +8289,7 @@ fn interp_expr_to_fish_atom(e: &IrExpr) -> Result<String, String> {
             "brace" => brace_to_fish(args),
             other => Err(format!("interp call not renderable: {other:?}")),
         },
-        IrExpr::Arith(a) => Ok(arith_cmd_fish(&arith_to_fish(a))),
+        IrExpr::Arith(a, _) => Ok(arith_cmd_fish(&arith_to_fish(a))),
         IrExpr::Int(i) => Ok(i.to_string()),
         IrExpr::Bool(b) => Ok(if *b { "1".into() } else { "0".into() }),
         IrExpr::Var(name, _) => Ok(var_ref_to_fish(name, false)),
@@ -10680,7 +10680,7 @@ fn str_arg(e: &IrExpr) -> Result<String, String> {
         IrExpr::Ident(s) => Ok(s.clone()),
         // numeric arith in an exec-word position renders as the plain
         // arithmetic result (perl-frontend slice offsets / indices)
-        IrExpr::Arith(a) => Ok(arith_to_fish(a)),
+        IrExpr::Arith(a, _) => Ok(arith_to_fish(a)),
         other => Err(format!("expected Str argument, got {other:?}")),
     }
 }

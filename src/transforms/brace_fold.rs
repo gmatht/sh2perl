@@ -202,7 +202,7 @@ fn transform_expr(e: &mut IrExpr) -> bool {
         | IrExpr::Ident(_)
         | IrExpr::Json(_)
         | IrExpr::Range { .. }
-        | IrExpr::Arith(_)
+        | IrExpr::Arith(_, _)
         | IrExpr::Ext(_) => false,
         // LIST position: a bare literal brace element expands in place.
         // This is the whole transform — every context that renders an

@@ -334,7 +334,7 @@ fn rewrite_stmt(st: &mut IrStmt) -> bool {
 
 fn rewrite_expr(e: &mut IrExpr) -> bool {
     match e {
-        IrExpr::Arith(a) => {
+        IrExpr::Arith(a, _) => {
             let before = format!("{:?}", a);
             simplify(a);
             format!("{:?}", a) != before
@@ -655,7 +655,7 @@ mod tests {
             name: "f".to_string(),
             params: vec![],
             body: vec![IrStmt::Output {
-                value: IrExpr::Arith(Box::new(bin("+", var("x"), num(0)))),
+                value: IrExpr::Arith(Box::new(bin("+", var("x"), num(0))), None),
                 newline: true,
                 target: None,
             }],
@@ -668,7 +668,7 @@ mod tests {
         let IrStmt::Output { value, .. } = &body[0] else {
             panic!("still an Output");
         };
-        let IrExpr::Arith(a) = value else {
+        let IrExpr::Arith(a, _) = value else {
             panic!("still an Arith");
         };
         assert!(matches!(a.as_ref(), ArithAst::Var(_)), "folded: {a:?}");
@@ -678,13 +678,13 @@ mod tests {
     fn exec_pipeline_case_and_redirect_arms_are_walked() {
         let mk = || {
             IrStmt::Exec {
-                cmd: IrExpr::Arith(Box::new(bin("+", var("x"), num(0)))),
-                args: vec![IrExpr::Arith(Box::new(bin("*", num(1), var("y"))))],
+                cmd: IrExpr::Arith(Box::new(bin("+", var("x"), num(0))), None),
+                args: vec![IrExpr::Arith(Box::new(bin("*", num(1), var("y"))), None)],
                 capture: None,
-                redirects: vec![IrExpr::Arith(Box::new(bin("-", var("z"), num(0))))],
+                redirects: vec![IrExpr::Arith(Box::new(bin("-", var("z"), num(0))), None)],
                 env: vec![(
                     "V".to_string(),
-                    IrExpr::Arith(Box::new(bin("+", num(0), var("w")))),
+                    IrExpr::Arith(Box::new(bin("+", num(0), var("w"))), None),
                 )],
             }
         };
@@ -697,7 +697,7 @@ mod tests {
                 cmd_str: None,
             },
             IrStmt::Case {
-                discriminant: IrExpr::Arith(Box::new(bin("+", var("c"), num(0)))),
+                discriminant: IrExpr::Arith(Box::new(bin("+", var("c"), num(0))), None),
                 clauses: vec![crate::ir::IrCaseClause {
                     patterns: vec!["*".to_string()],
                     body: vec![mk()],
@@ -708,7 +708,7 @@ mod tests {
                 redirects: vec![crate::ir::IrRedirect {
                     fd: None,
                     mode: "w".to_string(),
-                    target: IrExpr::Arith(Box::new(bin("+", var("t"), num(0)))),
+                    target: IrExpr::Arith(Box::new(bin("+", var("t"), num(0))), None),
                     interpolate: false,
                 }],
             },

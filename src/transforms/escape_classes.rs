@@ -247,7 +247,7 @@ fn census_expr(
                 census_expr(a, scope, scopes, dynamic_key, whole_array, arrays);
             }
         }
-        IrExpr::Arith(a) => arith_census(a, scope, scopes, dynamic_key, whole_array, arrays),
+        IrExpr::Arith(a, _) => arith_census(a, scope, scopes, dynamic_key, whole_array, arrays),
         IrExpr::Capture { expr, .. } => {
             census_expr(expr, scope, scopes, dynamic_key, whole_array, arrays);
         }

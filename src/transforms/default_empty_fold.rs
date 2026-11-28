@@ -287,7 +287,7 @@ fn may_enable_nounset(stmts: &[IrStmt]) -> bool {
                 scan_expr(cond) || scan_expr(then) || scan_expr(else_)
             }
             IrExpr::DefinedOr { expr, default } => scan_expr(expr) || scan_expr(default),
-            IrExpr::Arith(a) => scan_arith(a),
+            IrExpr::Arith(a, _) => scan_arith(a),
             _ => false,
         }
     }

@@ -397,7 +397,7 @@ fn rewrite_stmt(st: &mut IrStmt) -> bool {
 fn rewrite_expr(e: &mut IrExpr) -> bool {
     let mut changed = fold_not_in(e);
     match e {
-        IrExpr::Arith(_) => {} // no IrExpr children inside Arith text
+        IrExpr::Arith(_, _) => {} // no IrExpr children inside Arith text
         IrExpr::Index { key, .. } => changed |= rewrite_expr(key),
         IrExpr::BinOp { lhs, rhs, .. } => {
             changed |= rewrite_expr(lhs) | rewrite_expr(rhs);

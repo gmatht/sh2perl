@@ -146,7 +146,7 @@ fn refine_floor_mod(prog: &IrProgram, ranges: &mut HashMap<String, (i128, i128)>
     fn stmt_refine(s: &IrStmt, ranges: &mut HashMap<String, (i128, i128)>) {
         match s {
             IrStmt::Assign { targets, expr, .. } if targets.len() == 1 && targets[0].indices.is_empty() => {
-                if let IrExpr::Arith(a) = expr {
+                if let IrExpr::Arith(a, _) = expr {
                     if let Some((lo, hi)) = floor_arith_range(a, ranges) {
                         let name = &targets[0].var;
                         // intersect with existing (narrow only)
@@ -159,11 +159,11 @@ fn refine_floor_mod(prog: &IrProgram, ranges: &mut HashMap<String, (i128, i128)>
                         }
                     }
                 }
-                if let IrExpr::Arith(a) = expr {
+                if let IrExpr::Arith(a, _) = expr {
                     arith_writes_refine(a, ranges);
                 }
             }
-            IrStmt::Expr(IrExpr::Arith(a)) => arith_writes_refine(a, ranges),
+            IrStmt::Expr(IrExpr::Arith(a, _)) => arith_writes_refine(a, ranges),
             IrStmt::Block(b) | IrStmt::Subshell(b) | IrStmt::Background(b) => {
                 for s in b {
                     stmt_refine(s, ranges)

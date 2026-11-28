@@ -534,7 +534,7 @@ fn walk_expr(
                 walk_expr(i, pos, first, last, escapes, in_closure);
             }
         }
-        IrExpr::Arith(a) => walk_arith(a, pos, first, last, escapes, in_closure),
+        IrExpr::Arith(a, _) => walk_arith(a, pos, first, last, escapes, in_closure),
                 IrExpr::Ext(n) => {
             for _c in n.children() {
                 // Walk child expressions for lifetime analysis
@@ -668,7 +668,7 @@ fn mark_vars_escape(e: &IrExpr, first: &mut HashMap<String, usize>, escapes: &mu
                 mark_vars_escape(i, first, escapes);
             }
         }
-        IrExpr::Arith(a) => mark_arith_vars_escape(a, first, escapes),
+        IrExpr::Arith(a, _) => mark_arith_vars_escape(a, first, escapes),
         IrExpr::Object(props) => {
             for (_, v) in props {
                 mark_vars_escape(v, first, escapes);
@@ -1178,7 +1178,7 @@ mod tests {
                 var: "x".to_string(),
                 op: "+=".to_string(),
                 rhs: Box::new(ArithAst::Num(1)),
-            })))],
+            }), None))],
             ..empty_prog()
         };
         let verdicts = analyze_var_lifetimes(&prog);

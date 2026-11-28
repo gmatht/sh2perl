@@ -195,7 +195,7 @@ fn increment_of(st: &IrStmt, counter: &str) -> Option<i64> {
         _ => return None,
     };
     match expr {
-        IrExpr::Arith(a) => match a.as_ref() {
+        IrExpr::Arith(a, _) => match a.as_ref() {
             ArithAst::Bin { op, lhs, rhs } => {
                 let is_counter = |e: &ArithAst| matches!(e, ArithAst::Var(n) if n == counter);
                 let lit = |e: &ArithAst| match e {
@@ -259,7 +259,7 @@ fn expr_mentions(e: &IrExpr, name: &str) -> bool {
         IrExpr::Index { var, key } => var == name || expr_mentions(key, name),
         IrExpr::BinOp { lhs, rhs, .. } => expr_mentions(lhs, name) || expr_mentions(rhs, name),
         IrExpr::Call { args, .. } => args.iter().any(|a| expr_mentions(a, name)),
-        IrExpr::Arith(a) => arith_mentions(a, name),
+        IrExpr::Arith(a, _) => arith_mentions(a, name),
         IrExpr::Capture { expr, .. } => expr_mentions(expr, name),
         IrExpr::Arrow(body) => body.iter().any(|s| stmt_mentions(s, name)),
         IrExpr::Interpolate(parts) => parts.iter().any(|p| match p {

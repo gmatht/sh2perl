@@ -247,7 +247,7 @@ fn expr_reads(e: &IrExpr, var: &str) -> bool {
         IrExpr::Var(v, _) | IrExpr::Ident(v) => v == var,
         IrExpr::Index { var: v, key, .. } => v == var || expr_reads(key, var),
         IrExpr::BinOp { lhs, rhs, .. } => expr_reads(lhs, var) || expr_reads(rhs, var),
-        IrExpr::Arith(a) => arith_reads(a, var),
+        IrExpr::Arith(a, _) => arith_reads(a, var),
         IrExpr::Call { func, args, .. } => {
             call_reads_var(func, args, var) || args.iter().any(|a| expr_reads(a, var))
         }
@@ -376,7 +376,7 @@ fn stmt_writes(st: &IrStmt, out: &mut HashSet<String>, fns: &[(String, Vec<IrStm
             for t in targets {
                 out.insert(t.var.clone());
             }
-            if let IrExpr::Arith(a) = expr {
+            if let IrExpr::Arith(a, _) = expr {
                 match a.as_ref() {
                     ArithAst::Assign { var, .. } | ArithAst::IncDec { var, .. } => {
                         out.insert(var.clone());
@@ -724,7 +724,7 @@ fn read_set_into(e: &IrExpr, out: &mut HashSet<String>) {
             read_set_into(lhs, out);
             read_set_into(rhs, out);
         }
-        IrExpr::Arith(a) => arith_read_set(a, out),
+        IrExpr::Arith(a, _) => arith_read_set(a, out),
         IrExpr::Call { func, args, .. } => {
             call_read_set(func, args, out);
             for a in args {
@@ -914,7 +914,7 @@ fn expr_pure(e: &IrExpr, fns: &[(String, Vec<IrStmt>)]) -> bool {
     match e {
         IrExpr::Int(_) | IrExpr::Var(_, _) | IrExpr::Range { .. } => true,
         IrExpr::BinOp { lhs, rhs, .. } => expr_pure(lhs, fns) && expr_pure(rhs, fns),
-        IrExpr::Arith(_) => true,
+        IrExpr::Arith(_, _) => true,
         IrExpr::Call { func, args } => {
             if matches!(func.as_str(), "arith" | "test") {
                 return args.iter().all(|a| expr_pure(a, fns));
@@ -959,7 +959,7 @@ mod tests {
             op: "+".to_string(),
             lhs: Box::new(ArithAst::Var(var.to_string())),
             rhs: Box::new(ArithAst::Num(1)),
-        }))
+        }), None)
     }
 
     /// `while c; do x = x + 1; done` — the accumulator write reads its own
@@ -1087,7 +1087,7 @@ mod tests {
                 op: "+".to_string(),
                 lhs: Box::new(ArithAst::Var("i".to_string())),
                 rhs: Box::new(ArithAst::Num(1)),
-            })),
+            }), None),
         )]);
         assert!(!transform(&mut stmts));
         if let IrStmt::For { body, .. } = &stmts[0] {
@@ -1158,7 +1158,7 @@ mod tests {
                         op: "*".to_string(),
                         lhs: Box::new(ArithAst::Var("px".to_string())),
                         rhs: Box::new(ArithAst::Num(1000)),
-                    }))),
+                    }), None)),
                     assign("i", inc("i")),
                 ],
             },
@@ -1215,7 +1215,7 @@ mod tests {
                         op: "*".to_string(),
                         lhs: Box::new(ArithAst::Var("px".to_string())),
                         rhs: Box::new(ArithAst::Num(1000)),
-                    }))),
+                    }), None)),
                     assign("i", inc("i")),
                 ],
             },

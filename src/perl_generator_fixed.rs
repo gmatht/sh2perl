@@ -4223,7 +4223,7 @@ fn fix_expr(e: &IrExpr) -> IrExpr {
             params: params.clone(),
             body: body.clone(),
         },
-        IrExpr::Arith(_) | IrExpr::Ext(_) | IrExpr::Splice(_) => e.clone(),
+        IrExpr::Arith(_, _) | IrExpr::Ext(_) | IrExpr::Splice(_) => e.clone(),
         IrExpr::Object(fields) => IrExpr::Object(
             fields
                 .iter()

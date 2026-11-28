@@ -189,7 +189,7 @@ impl JavaRender {
             }
             IrExpr::MethodCall { obj, args, .. } => { self.scan_expr(*obj)?; for a in args { self.scan_expr(a)?; } }
             IrExpr::Index { key, .. } => { self.scan_expr(*key)?; }
-            IrExpr::Arith(a) => {
+            IrExpr::Arith(a, _) => {
                 if let ArithAst::Assign { var, .. } = &*a {
                     self.fields.insert(sanitize(var));
                 }
@@ -2023,7 +2023,7 @@ impl JavaRender {
                     Ok(format!("shCapture(\"echo $(({}))\")", t.replace('"', "\"")))
                 }
             }
-            IrExpr::Arith(a) => Ok(format!("String.valueOf({})", self.arith(a)?)),
+            IrExpr::Arith(a, _) => Ok(format!("String.valueOf({})", self.arith(a)?)),
             IrExpr::BinOp { op: BinOpKind::Concat, lhs, rhs, .. } =>
                 Ok(format!("({} + {})", self.expr_str(lhs)?, self.expr_str(rhs)?)),
             IrExpr::BinOp { op, lhs, rhs, .. } if is_cmp(op) => {
@@ -2234,7 +2234,7 @@ impl JavaRender {
                 }
             }
             IrExpr::Var(name, _) | IrExpr::Ident(name) => self.getvar_num(name),
-            IrExpr::Arith(a) => self.arith(a),
+            IrExpr::Arith(a, _) => self.arith(a),
             IrExpr::BinOp { op, lhs, rhs, .. } if matches!(op,
                 BinOpKind::Add | BinOpKind::Sub | BinOpKind::Mul | BinOpKind::Div
                 | BinOpKind::Mod | BinOpKind::Pow | BinOpKind::BitAnd | BinOpKind::BitOr
@@ -2941,8 +2941,8 @@ impl JavaRender {
         let l = self.expr_str(lhs)?;
         let r = self.expr_str(rhs)?;
         // numeric comparison when both sides look numeric-typed
-        let both_num = matches!(lhs, IrExpr::Int(_) | IrExpr::Arith(_)) &&
-                       matches!(rhs, IrExpr::Int(_) | IrExpr::Arith(_));
+        let both_num = matches!(lhs, IrExpr::Int(_) | IrExpr::Arith(_, _)) &&
+                       matches!(rhs, IrExpr::Int(_) | IrExpr::Arith(_, _));
         self.helper("num");
         // regex match: [[ s =~ re ]] lowers to Eq whose RHS carries a ~ marker
         if *op == BinOpKind::Eq {

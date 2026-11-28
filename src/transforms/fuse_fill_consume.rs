@@ -240,7 +240,7 @@ fn expr_kids(e: &IrExpr) -> Vec<&IrExpr> {
             k
         }
         IrExpr::Lambda { .. } | IrExpr::Arrow(_) => vec![],
-        IrExpr::Arith(_) => vec![],
+        IrExpr::Arith(_, _) => vec![],
         IrExpr::Object(pairs) => pairs.iter().map(|(_, v)| v).collect(),
         IrExpr::Splice(x) => vec![x],
         IrExpr::Ext(x) => x.children(),
@@ -488,7 +488,7 @@ fn fill_shape(body: &[IrStmt], counter: &str) -> Option<Fill> {
         if key != (1, 0) {
             return None;
         }
-        let IrExpr::Arith(f) = expr else {
+        let IrExpr::Arith(f, _) = expr else {
             return None;
         };
         if !pure_fill_rhs(f) {
@@ -560,7 +560,7 @@ fn index_expr_affine_in(key: &IrExpr, counter: &str) -> Option<(i64, i64)> {
         }
         IrExpr::Str(s, _) => affine_of_text(s, counter),
         IrExpr::Int(n) => Some((0, *n)),
-        IrExpr::Arith(a) => arith_affine(a, counter),
+        IrExpr::Arith(a, _) => arith_affine(a, counter),
         _ => None,
     }
 }
@@ -732,7 +732,7 @@ fn init_num(expr: &IrExpr, var: &str) -> Option<i64> {
     match expr {
         IrExpr::Int(n) => Some(*n),
         IrExpr::Str(s, _) => s.trim().parse::<i64>().ok(),
-        IrExpr::Arith(a) => match a.as_ref() {
+        IrExpr::Arith(a, _) => match a.as_ref() {
             ArithAst::Assign { var: v, op, rhs } if v == var && op == "=" => arith_num(rhs),
             _ => arith_num(a),
         },
@@ -774,7 +774,7 @@ fn bound_of_cond(cond: &IrExpr, counter: &str) -> Option<String> {
     // loops): `i < N` / `i <= N` with a bare bound ident. A literal bound
     // returns None (no dynamic bound name — the gap-write discipline then
     // refuses any gap, fail-closed).
-    if let IrExpr::Arith(a) = cond {
+    if let IrExpr::Arith(a, _) = cond {
         if let ArithAst::Bin { op, lhs, rhs } = strip_cast(a) {
             if op == "<" || op == "<=" {
                 if arith_ident(lhs) == Some(counter) {
@@ -1008,7 +1008,7 @@ fn gap_assign_ok(
 fn eval_effects(e: &IrExpr, out: &mut BTreeSet<String>) -> bool {
     let mut ok = true;
     match e {
-        IrExpr::Arith(a) => collect_arith_effects(a, out),
+        IrExpr::Arith(a, _) => collect_arith_effects(a, out),
         IrExpr::Call { func, args } if func == "arith" || func == "let" => {
             for a in args {
                 let texts: Vec<&str> = match a {
@@ -1078,7 +1078,7 @@ fn expr_mentions_status_or_call(e: &IrExpr) -> bool {
 /// Every Var/Ident/target/binder name in an expr (over-approx for the
 /// veto direction: the consumer must not write trip-count inputs).
 fn collect_names_expr(e: &IrExpr, out: &mut BTreeSet<String>) {
-    if let IrExpr::Arith(a) = e {
+    if let IrExpr::Arith(a, _) = e {
         arith_free_vars(a, out);
         return;
     }
@@ -1119,7 +1119,7 @@ fn collect_names_stmt(s: &IrStmt, out: &mut BTreeSet<String>) {
 /// Var/Ident mention of `name` anywhere in an IrExpr (incl. nested
 /// bodies, interpolation, Ext children).
 fn expr_mentions_var(e: &IrExpr, name: &str) -> bool {
-    if let IrExpr::Arith(a) = e {
+    if let IrExpr::Arith(a, _) = e {
         return arith_mentions_var(a, name);
     }
     let own = matches!(e, IrExpr::Var(v, _) | IrExpr::Ident(v) if v == name);
@@ -1298,7 +1298,7 @@ fn substitute_reads(
                 }
             }
             match e {
-                IrExpr::Arith(a) => Some(IrExpr::Arith(Box::new(self.arith(a)?))),
+                IrExpr::Arith(a, _) => Some(IrExpr::Arith(Box::new(self.arith(a)?), None)),
                 IrExpr::BinOp { lhs, op, rhs } => Some(IrExpr::BinOp {
                     lhs: Box::new(self.expr(lhs)?),
                     op: op.clone(),
@@ -1513,7 +1513,7 @@ fn fill_any_target_hits(t: &AssignTarget, fill: &Fill) -> bool {
 fn expr_reads_violate(e: &IrExpr, fill: &Fill, counter: &str) -> bool {
     // Returns true on VIOLATION (veto).
     match e {
-        IrExpr::Arith(a) => arith_reads_violate(a, fill, counter),
+        IrExpr::Arith(a, _) => arith_reads_violate(a, fill, counter),
         IrExpr::Index { var, .. } if fill.name_hits(var) => true,
         IrExpr::Var(v, _) | IrExpr::Ident(v) if fill.name_hits(v) => true,
         IrExpr::Str(s, _) => fill
@@ -1584,7 +1584,7 @@ fn target_has_arr(t: &AssignTarget, arr: &str) -> bool {
 /// candidacy's nest-scope checks). Visibility-only; logic untouched.
 pub fn expr_has_arr(e: &IrExpr, arr: &str) -> bool {
     let own = match e {
-        IrExpr::Arith(a) => arith_has_arr(a, arr),
+        IrExpr::Arith(a, _) => arith_has_arr(a, arr),
         IrExpr::Var(v, _) | IrExpr::Ident(v) => v == arr || v.starts_with(&format!("{arr}[")),
         IrExpr::Index { var, .. } => var == arr,
         IrExpr::Str(s, _) => s == arr || s.contains(&format!("{arr}[")),
@@ -1619,7 +1619,7 @@ fn stmt_has_closure_or_ext(s: &IrStmt) -> bool {
 
 fn collect_arith_effects_expr(e: &IrExpr, out: &mut BTreeSet<String>) {
     match e {
-        IrExpr::Arith(a) => collect_arith_effects(a, out),
+        IrExpr::Arith(a, _) => collect_arith_effects(a, out),
         _ => {}
     }
     for k in expr_kids(e) {
@@ -1677,7 +1677,7 @@ mod tests {
     }
 
     fn arith(a: ArithAst) -> IrExpr {
-        IrExpr::Arith(Box::new(a))
+        IrExpr::Arith(Box::new(a), None)
     }
 
     fn v(name: &str) -> ArithAst {
@@ -1807,7 +1807,7 @@ mod tests {
         let IrStmt::Assign { expr, .. } = &body[0] else {
             panic!("expected assign");
         };
-        let IrExpr::Arith(a) = expr else {
+        let IrExpr::Arith(a, _) = expr else {
             panic!("expected arith");
         };
         assert!(!arith_has_arr(a, "a"));
@@ -1890,7 +1890,7 @@ mod tests {
         };
         assert!(expr_has_arr(expr, "a") == false && expr_has_arr(expr, "b") == false);
         // Both RHS shapes survive.
-        let IrExpr::Arith(a) = expr else {
+        let IrExpr::Arith(a, _) = expr else {
             panic!("arith");
         };
         fn has(x: &ArithAst, want: i64) -> bool {
@@ -1939,7 +1939,7 @@ mod tests {
         let IrStmt::Assign { expr, .. } = &mut body[0] else {
             panic!("shape");
         };
-        let IrExpr::Arith(a) = expr else {
+        let IrExpr::Arith(a, _) = expr else {
             panic!("shape");
         };
         // Replace `a[i]*b[i]` with plain `a[i]`.
@@ -2066,7 +2066,7 @@ mod tests {
         let IrStmt::Assign { expr, .. } = &mut body[0] else {
             panic!("shape");
         };
-        let IrExpr::Arith(a) = expr else {
+        let IrExpr::Arith(a, _) = expr else {
             panic!("shape");
         };
         // Replace the Index key i with i+1.

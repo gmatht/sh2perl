@@ -225,7 +225,7 @@ fn pure_expr(e: &IrExpr) -> bool {
     match e {
         IrExpr::Int(_) | IrExpr::Str(_, _) | IrExpr::Var(_, _) | IrExpr::Range { .. } => true,
         IrExpr::BinOp { lhs, rhs, .. } => pure_expr(lhs) && pure_expr(rhs),
-        IrExpr::Arith(a) => {
+        IrExpr::Arith(a, _) => {
             // arithmetic is pure unless it hides an index read of an
             // external array — conservative: accept plain var/num trees
             arith_pure(a)

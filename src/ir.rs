@@ -469,7 +469,7 @@ pub enum IrExpr {
     /// runtime store at call time. The Perl generator never emits it.
     Lambda { params: Vec<String>, body: Vec<IrStmt> },
     /// Parsed arithmetic (neutral AST) — ESTree path renders native JS.
-    Arith(Box<ArithAst>),
+    Arith(Box<ArithAst>, Option<String>),
     /// Boolean literal (ESTree-path only — e.g. shopt enable flags).
     Bool(bool),
     /// Raw JSON literal (ESTree-path only — e.g. brace-expansion groups).
@@ -3992,7 +3992,7 @@ fn emit_stmt_owned(out: &mut String, stmt: &IrStmt, indent: usize) {
                 // bare). The expression VALUE is discarded — only the side
                 // effect matters — so postfix/prefix agree (arith_ast_to_perl
                 // renders both as `($n += 1)` / `($n -= 1)`).
-                IrExpr::Arith(a) if matches!(&**a, ArithAst::IncDec { .. }) => {
+                IrExpr::Arith(a, _) if matches!(&**a, ArithAst::IncDec { .. }) => {
                     // `((i++))` sets `$?` from the expression VALUE (old for
                     // postfix, new for prefix): 0 → status 1 (examples/arith-
                     // postfix-status).
@@ -4278,7 +4278,7 @@ fn emit_stmt_owned(out: &mut String, stmt: &IrStmt, indent: usize) {
             // 092/bench-increment). Emit the increment alone; the statement
             // value is discarded in bash too.
             if targets.len() == 1 && targets[0].indices.is_empty() {
-                if let IrExpr::Arith(ast) = expr {
+                if let IrExpr::Arith(ast, _) = expr {
                     if let ArithAst::IncDec { var, .. } = &**ast {
                         if var == &targets[0].var {
                             let e = arith_ast_to_perl(ast);
@@ -6103,6 +6103,42 @@ fn glob_to_regex_greedy(pat: &str, greedy: bool) -> String {
 /// normalize to bare idents (what parse_arith accepts), then the AST
 /// renders via [`arith_ast_to_perl`]. None when the string doesn't parse
 /// (caller falls back).
+/// Source offsets of every `/` and `%` operator, in order, skipping the inside
+/// of `$(…)` and `${…}` (an operand there is not an arithmetic operator:
+/// `${v/a/b}` and `$(date +%s)` both carry characters that would otherwise be
+/// mistaken for division). The renderer walks the tree in the same order, so
+/// the k-th division node is the k-th operator here.
+fn arith_divmod_ops(ch: &[char]) -> Vec<usize> {
+    let mut ops = Vec::new();
+    let mut i = 0usize;
+    while i < ch.len() {
+        if ch[i] == '$' && i + 1 < ch.len() && (ch[i + 1] == '{' || ch[i + 1] == '(') {
+            let (open, close) = if ch[i + 1] == '(' { ('(', ')') } else { ('{', '}') };
+            let mut depth = 0i32;
+            let mut j = i + 1;
+            while j < ch.len() {
+                if ch[j] == open {
+                    depth += 1;
+                } else if ch[j] == close {
+                    depth -= 1;
+                    if depth == 0 {
+                        j += 1;
+                        break;
+                    }
+                }
+                j += 1;
+            }
+            i = j;
+            continue;
+        }
+        if ch[i] == '/' || ch[i] == '%' {
+            ops.push(i);
+        }
+        i += 1;
+    }
+    ops
+}
+
 fn arith_str_to_perl(s: &str) -> Option<String> {
     let mut t = String::new();
     // `${…}` expansions are lowered to Perl text via `param_inner_perl`,
@@ -6210,7 +6246,70 @@ fn arith_str_to_perl(s: &str) -> Option<String> {
     Some(out)
 }
 
+/// Source spelling carried alongside an arithmetic tree, so a runtime
+/// arithmetic error can be reported the way bash reports it: bash quotes the
+/// SOURCE expression and the text from the failing operand to the end of the
+/// expression. `ops` holds, in source order, the character offset of every
+/// `/` and `%` operator; `next` walks those offsets in the same order the
+/// renderer walks the tree, so each division node knows its own operand text.
+struct ArithDiag {
+    src: Vec<char>,
+    expr: String,
+    ops: Vec<usize>,
+    next: std::cell::Cell<usize>,
+}
+
+impl ArithDiag {
+    /// The text bash prints after `error token is`: everything from the
+    /// divisor operand to the end of the source text, left-trimmed.
+    fn error_token(&self) -> String {
+        let k = self.next.get();
+        self.next.set(k + 1);
+        match self.ops.get(k) {
+            Some(&p) => self.src[p + 1..]
+                .iter()
+                .collect::<String>()
+                .trim_start()
+                .to_string(),
+            None => String::new(),
+        }
+    }
+}
+
+/// Escape text for a Perl double-quoted string literal.
+fn perl_dq(text: &str) -> String {
+    let mut out = String::with_capacity(text.len());
+    for c in text.chars() {
+        if matches!(c, '\\' | '"' | '$' | '@') {
+            out.push('\\');
+        }
+        out.push(c);
+    }
+    out
+}
+
+/// Build the diagnostic context for a source spelling: the operator offsets
+/// and the left-trimmed expression text. `None` when the expansion cannot
+/// raise an arithmetic error (no `/` or `%` in the source).
+fn arith_diag_for(src: &str) -> Option<ArithDiag> {
+    let ch: Vec<char> = src.chars().collect();
+    let ops = arith_divmod_ops(&ch);
+    if ops.is_empty() {
+        return None;
+    }
+    Some(ArithDiag {
+        expr: src.trim_start().to_string(),
+        src: ch,
+        ops,
+        next: std::cell::Cell::new(0),
+    })
+}
+
 fn arith_ast_to_perl(ast: &ArithAst) -> String {
+    arith_ast_to_perl_ctx(ast, None)
+}
+
+fn arith_ast_to_perl_ctx(ast: &ArithAst, diag: Option<&ArithDiag>) -> String {
     match ast {
         ArithAst::Num(n) => n.to_string(),
         ArithAst::Var(name) => arith_read(name),
@@ -6227,20 +6326,28 @@ fn arith_ast_to_perl(ast: &ArithAst) -> String {
                 // The subscript is NUMERIC in arithmetic: an unset index is 0
                 // in bash, but a bare undef is `Argument "" isn't numeric in
                 // array or hash lookup` in Perl (063_hard_to_parse).
-                format!("${}[__sh_num({})]", base, arith_ast_to_perl(key))
+                format!("${}[__sh_num({})]", base, arith_ast_to_perl_ctx(key, diag))
             } else {
                 let k = match &**key {
                     ArithAst::Var(n) | ArithAst::Ident(n) => {
                         format!("'{}'", n.replace('\'', "\\'"))
                     }
-                    other => arith_ast_to_perl(other),
+                    other => arith_ast_to_perl_ctx(other, diag),
                 };
                 format!("${}{{{}}}", base, k)
             }
         }
         ArithAst::Bin { op, lhs, rhs } => {
-            let l = arith_ast_to_perl(lhs);
-            let r = arith_ast_to_perl(rhs);
+            let l = arith_ast_to_perl_ctx(lhs, diag);
+            // Take THIS node's operator slot BEFORE descending into the RHS:
+            // the counter walks the source in order (lhs, operator, rhs), and
+            // bash's error token starts at the divisor operand.
+            let tok = if matches!(op.as_str(), "/" | "%") {
+                diag.map(|d| d.error_token())
+            } else {
+                None
+            };
+            let r = arith_ast_to_perl_ctx(rhs, diag);
             match op.as_str() {
                 "&&" | "||" | "**" => format!("({} {} {})", l, op, r),
                 // bash `/` truncates toward zero; wrap the dividend so
@@ -6270,14 +6377,32 @@ fn arith_ast_to_perl(ast: &ArithAst) -> String {
                 // `Argument "" isn't numeric in division` where bash reads
                 // an uncomputable operand as 0 and only reports the divisor
                 // (063_hard_to_parse).
-                "/" => format!(
-                    "(do {{ my $__d = __sh_num({}); eval {{ int((__sh_num({})) / ($__d)) }} // '' }})",
-                    r, l
-                ),
-                "%" => format!(
-                    "(do {{ my $__d = __sh_num({}); eval {{ int((__sh_num({}))) % ($__d) }} // '' }})",
-                    r, l
-                ),
+                "/" => match (tok, diag) {
+                    (Some(t), Some(d)) => format!(
+                        "(do {{ my $__d = __sh_num({}); if ($main::__SH2_DIV0) {{ '' }} elsif ($__d == 0) {{ warn \"$0: line \" . __LINE__ . \": {}: division by 0 (error token is \\\"{}\\\")\\n\"; $main::__SH2_DIV0 = 1; '' }} else {{ eval {{ int((__sh_num({})) / ($__d)) }} // '' }} }})",
+                        r,
+                        perl_dq(&d.expr),
+                        perl_dq(&t),
+                        l
+                    ),
+                    _ => format!(
+                        "(do {{ my $__d = __sh_num({}); eval {{ int((__sh_num({})) / ($__d)) }} // '' }})",
+                        r, l
+                    ),
+                },
+                "%" => match (tok, diag) {
+                    (Some(t), Some(d)) => format!(
+                        "(do {{ my $__d = __sh_num({}); if ($main::__SH2_DIV0) {{ '' }} elsif ($__d == 0) {{ warn \"$0: line \" . __LINE__ . \": {}: division by 0 (error token is \\\"{}\\\")\\n\"; $main::__SH2_DIV0 = 1; '' }} else {{ eval {{ int((__sh_num({}))) % ($__d) }} // '' }} }})",
+                        r,
+                        perl_dq(&d.expr),
+                        perl_dq(&t),
+                        l
+                    ),
+                    _ => format!(
+                        "(do {{ my $__d = __sh_num({}); eval {{ int((__sh_num({}))) % ($__d) }} // '' }})",
+                        r, l
+                    ),
+                },
                 // Perl's bitwise ops are STRING ops when an operand is a
                 // string, and shell vars ARE strings (`$a = "78"`): `$a | $b`
                 // string-ORs to "78" and warns "Argument "^E" isn't numeric".
@@ -6301,7 +6426,7 @@ fn arith_ast_to_perl(ast: &ArithAst) -> String {
             }
         }
         ArithAst::Un { op, arg } => {
-            let a = arith_ast_to_perl(arg);
+            let a = arith_ast_to_perl_ctx(arg, diag);
             match op.as_str() {
                 "!" => format!("!({})", a),
                 // 64-bit SIGNED not: `~x == -x - 1` (Perl's `~` on a UV gave
@@ -6315,15 +6440,15 @@ fn arith_ast_to_perl(ast: &ArithAst) -> String {
         }
         ArithAst::Cond { test, then, else_ } => format!(
             "({} ? {} : {})",
-            arith_ast_to_perl(test),
-            arith_ast_to_perl(then),
-            arith_ast_to_perl(else_)
+            arith_ast_to_perl_ctx(test, diag),
+            arith_ast_to_perl_ctx(then, diag),
+            arith_ast_to_perl_ctx(else_, diag)
         ),
         ArithAst::Assign { var, op, rhs } => {
             // The target is an LVALUE: `var_read` renders reads (and may
             // coerce an unset value), so the write goes through the same
             // target function the statement-level assignment uses.
-            format!("{}{}{}", perl_lhs_for(var), op, arith_ast_to_perl(rhs))
+            format!("{}{}{}", perl_lhs_for(var), op, arith_ast_to_perl_ctx(rhs, diag))
         }
         ArithAst::IncDec { var, delta, prefix } => {
             let v = var_read(var);
@@ -6340,7 +6465,7 @@ fn arith_ast_to_perl(ast: &ArithAst) -> String {
         // C-frontend nodes (never emitted by the shell path): sizeof is a
         // compile-time constant; casts are identity (Perl IV is 64-bit).
         ArithAst::Sizeof(ty) => ty.c_sizeof().unwrap_or(4).to_string(),
-        ArithAst::Cast { arg, .. } => arith_ast_to_perl(arg),
+        ArithAst::Cast { arg, .. } => arith_ast_to_perl_ctx(arg, diag),
     }
 }
 
@@ -6444,7 +6569,7 @@ fn render_word(e: &IrExpr) -> String {
         },
         IrExpr::Interpolate(_)
         | IrExpr::Var(_, _)
-        | IrExpr::Arith(_)
+        | IrExpr::Arith(_, _)
         | IrExpr::Capture { .. }
         | IrExpr::Index { .. }
         | IrExpr::BinOp { .. }
@@ -8804,7 +8929,7 @@ fn word_var_reads(e: &IrExpr, out: &mut std::collections::HashSet<String>) {
                 }
             }
         }
-        IrExpr::Arith(a) => arith_var_reads(a.as_ref(), out),
+        IrExpr::Arith(a, _) => arith_var_reads(a.as_ref(), out),
         _ => {}
     }
 }
@@ -12353,10 +12478,18 @@ fn collect_read_vars_expr(e: &IrExpr, out: &mut Vec<(String, Sigil)>) {
                     collect_vars_from_test_string(&s, out);
                 }
             }
-            // `arith("$n + 1")` — a flat arithmetic string with $vars.
+            // `arith("$n + 1")` — a flat arithmetic string with $vars — and
+            // `arith("a / b")`, the SOURCE-text form a division/modulo
+            // expansion keeps (the renderer needs bash's original spelling for
+            // its `error token is` diagnostic). The arithmetic text's variables
+            // are BARE identifiers, and the runtime evaluates that text
+            // verbatim, so every identifier in it must be DECLARED here or the
+            // render is a `Global symbol "$a" requires explicit package name`
+            // compile error.
             if func == "arith" {
                 if let Some(s) = args.first().and_then(call_arg_str) {
                     collect_vars_from_test_string(&s, out);
+                    collect_vars_from_arith_text(&s, out);
                 }
             }
             // `read [-r] VAR…` assigns its operands (the while-read loop
@@ -12419,7 +12552,7 @@ fn collect_read_vars_expr(e: &IrExpr, out: &mut Vec<(String, Sigil)>) {
         // hoisted (`"$index"`, and the native-test transform's RAW Perl).
         IrExpr::Str(s, _) => collect_vars_from_test_string(s, out),
         IrExpr::Capture { expr, .. } => collect_read_vars_expr(expr, out),
-        IrExpr::Arith(ast) => collect_read_vars_arith(ast, out),
+        IrExpr::Arith(ast, _) => collect_read_vars_arith(ast, out),
         IrExpr::MethodCall { obj, args, .. } => {
             collect_read_vars_expr(obj, out);
             for a in args {
@@ -12561,6 +12694,28 @@ fn collect_assigned_vars_contains(stmts: &[IrStmt], name: &str) -> bool {
 
 /// Scan a test-condition string for `$var` / `${var}` / `${#var}` reads
 /// (for hoisted declarations — the vars are text inside the flat string).
+/// Bare IDENTIFIER references inside arithmetic TEXT (`a / b`, `i < n`): the
+/// text is evaluated as written, so each identifier is a scalar variable that
+/// must be declared. Over-declaring is free (`my $x;` is clean under -w).
+fn collect_vars_from_arith_text(s: &str, out: &mut Vec<(String, Sigil)>) {
+    let b = s.as_bytes();
+    let mut i = 0;
+    while i < b.len() {
+        if b[i].is_ascii_alphabetic() || b[i] == b'_' {
+            let start = i;
+            while i < b.len() && (b[i].is_ascii_alphanumeric() || b[i] == b'_') {
+                i += 1;
+            }
+            let name = &s[start..i];
+            if !out.iter().any(|(n, _)| n == name) {
+                out.push((name.to_string(), Sigil::Scalar));
+            }
+        } else {
+            i += 1;
+        }
+    }
+}
+
 fn collect_vars_from_test_string(s: &str, out: &mut Vec<(String, Sigil)>) {
     fn push(out: &mut Vec<(String, Sigil)>, name: &str, sigil: Sigil) {
         if var_is_declarable(name) && !out.iter().any(|(n, _)| n == name) {
@@ -14009,7 +14164,7 @@ fn capture_expr_native(e: &IrExpr) -> bool {
                 && capture_expr_native(lhs)
                 && capture_expr_native(rhs)
         }
-        IrExpr::Arith(_) => true,
+        IrExpr::Arith(_, _) => true,
         // A raw test operand (`If{cond: Str("-d 'a'", Raw)}` — the
         // `test` chain lowered to an if/else); a plain value is native.
         IrExpr::Str(_, _) => true,
@@ -14516,14 +14671,28 @@ pub(crate) fn ir_expr_to_perl(expr: &IrExpr) -> String {
                 )
             }
         }
-        IrExpr::Arith(ast) => {
+        IrExpr::Arith(ast, src) => {
             // The trailing `int(...)` truncates, but must NOT swallow the
             // undef that a guard introduced (a zero divisor, or an
             // unparseable expression): `int(undef)` is 0, which would turn
             // bash's "value stays unset" into a spurious 0. Keep undef undef
             // so `${x:-default}` takes the default like bash
             // (parse-arithmetic-extra-paren: x must stay unset).
-            let inner = arith_ast_to_perl(ast);
+            //
+            // `src` is the expansion's SOURCE spelling, and it is what bash
+            // quotes in its arithmetic-error diagnostic (`<expr> : division by
+            // 0 (error token is "<token>")`). `local` scopes the abandon flag
+            // to this expansion: bash prints ONE diagnostic and the expansion's
+            // value is empty, even when a later operator divides by the empty
+            // result of the first failure.
+            let diag = src.as_deref().and_then(arith_diag_for);
+            let mut inner = arith_ast_to_perl_ctx(ast, diag.as_ref());
+            if diag.is_some() {
+                inner = format!(
+                    "(do {{ local $main::__SH2_DIV0 = 0; my $__a = {}; $main::__SH2_DIV0 ? '' : $__a }})",
+                    inner
+                );
+            }
             if inner.starts_with("(do {") {
                 // An EMPTY inner value means the expansion failed (`$((x/0))`
                 // aborts in bash and leaves the variable unset), not 0:
@@ -17453,7 +17622,7 @@ fn expr_refers_to_main_exit(expr: &IrExpr) -> bool {
         IrExpr::Splice(e) => expr_refers_to_main_exit(e),
         IrExpr::Ext(n) => n.children().iter().any(|c| expr_refers_to_main_exit(c)),
         IrExpr::Array(elems) => elems.iter().any(expr_refers_to_main_exit),
-        IrExpr::Arith(_) => false,
+        IrExpr::Arith(_, _) => false,
         IrExpr::Bool(_) => false,
         IrExpr::Json(_) => false,
         IrExpr::Ident(_) => false,
@@ -17726,7 +17895,7 @@ fn collect_vars_in_expr(expr: &IrExpr, vars: &mut std::collections::HashSet<Stri
                 collect_vars_in_expr(e, vars);
             }
         }
-        IrExpr::Arith(_) => {}
+        IrExpr::Arith(_, _) => {}
         IrExpr::Bool(_) => {}
         IrExpr::Json(_) => {}
         IrExpr::Ident(_) => {}
@@ -18006,7 +18175,13 @@ fn fold_expr(e: &IrExpr) -> IrExpr {
         // the `arith("…")` STRING spelling, so a fully literal `$((1000**7))`
         // survived to the renderer and became a runtime helper call with an
         // overflow branch (core request c-20261022-224500). Fold it here.
-        IrExpr::Arith(ast) => IrExpr::Arith(Box::new(fold_arith_ast(ast))),
+        // An arithmetic node that carries its SOURCE spelling must keep tree
+        // and spelling in step: folding can DELETE an operator, and the
+        // diagnostic pairs the k-th division node with the k-th `/`/`%` in
+        // that text. Only the spelling-less nodes (constant syntax the C
+        // frontend and the transforms hand-build) fold here.
+        IrExpr::Arith(ast, Some(src)) => IrExpr::Arith(ast.clone(), Some(src.clone())),
+        IrExpr::Arith(ast, None) => IrExpr::Arith(Box::new(fold_arith_ast(ast)), None),
         _ => e.clone(),
     }
 }
@@ -18402,8 +18577,8 @@ mod tests {
                 lhs: Box::new(ArithAst::Num(1000)),
                 rhs: Box::new(ArithAst::Num(7)),
             }),
-        }));
-        let IrExpr::Arith(ast) = fold_expr(&arith) else {
+        }), None);
+        let IrExpr::Arith(ast, _) = fold_expr(&arith) else {
             panic!("expected an Arith node");
         };
         // bash reference values (bash -c 'echo $((3 * 1000 ** k))'):
@@ -18429,8 +18604,8 @@ mod tests {
                 op: op.into(),
                 lhs: Box::new(ArithAst::Num(a)),
                 rhs: Box::new(ArithAst::Num(b)),
-            }));
-            let IrExpr::Arith(ast) = fold_expr(&arith) else {
+            }), None);
+            let IrExpr::Arith(ast, _) = fold_expr(&arith) else {
                 panic!("expected an Arith node");
             };
             *ast
@@ -18466,8 +18641,8 @@ mod tests {
                 op: op.into(),
                 lhs: Box::new(ArithAst::Num(a)),
                 rhs: Box::new(ArithAst::Num(b)),
-            }));
-            let IrExpr::Arith(ast) = fold_expr(&arith) else {
+            }), None);
+            let IrExpr::Arith(ast, _) = fold_expr(&arith) else {
                 panic!("expected an Arith node");
             };
             *ast
@@ -18496,8 +18671,8 @@ mod tests {
             let arith = IrExpr::Arith(Box::new(ArithAst::Un {
                 op: op.into(),
                 arg: Box::new(ArithAst::Num(a)),
-            }));
-            let IrExpr::Arith(ast) = fold_expr(&arith) else {
+            }), None);
+            let IrExpr::Arith(ast, _) = fold_expr(&arith) else {
                 panic!("expected an Arith node");
             };
             *ast
@@ -18514,8 +18689,8 @@ mod tests {
         let arith = IrExpr::Arith(Box::new(ArithAst::Un {
             op: "-".into(),
             arg: Box::new(ArithAst::Var("x".into())),
-        }));
-        let IrExpr::Arith(ast) = fold_expr(&arith) else {
+        }), None);
+        let IrExpr::Arith(ast, _) = fold_expr(&arith) else {
             panic!("expected an Arith node");
         };
         assert!(matches!(&*ast, ArithAst::Un { .. }), "got {ast:?}");
@@ -18529,8 +18704,8 @@ mod tests {
             op: "**".into(),
             lhs: Box::new(ArithAst::Num(2)),
             rhs: Box::new(ArithAst::Num(-1)),
-        }));
-        let IrExpr::Arith(ast) = fold_expr(&arith) else {
+        }), None);
+        let IrExpr::Arith(ast, _) = fold_expr(&arith) else {
             panic!("expected an Arith node");
         };
         assert!(

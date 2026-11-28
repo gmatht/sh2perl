@@ -120,7 +120,7 @@ fn literal_bound(c: &IrExpr, consts: &BTreeSet<String>) -> bool {
     }
     match c {
         IrExpr::BinOp { lhs, rhs, .. } => lit(lhs, consts) || lit(rhs, consts),
-        IrExpr::Arith(a) => match a.as_ref() {
+        IrExpr::Arith(a, _) => match a.as_ref() {
             ArithAst::Bin { lhs, rhs, .. } => {
                 matches!(lhs.as_ref(), ArithAst::Num(_))
                     || matches!(rhs.as_ref(), ArithAst::Num(_))
@@ -145,7 +145,7 @@ fn const_int_vars(stmts: &[IrStmt]) -> BTreeSet<String> {
                 !t.is_empty()
                     && t.trim_start_matches('-').chars().all(|ch| ch.is_ascii_digit())
             }
-            IrExpr::Arith(a) => matches!(a.as_ref(), ArithAst::Num(_)),
+            IrExpr::Arith(a, _) => matches!(a.as_ref(), ArithAst::Num(_)),
             _ => false,
         }
     }
@@ -393,7 +393,7 @@ fn counted_forinit(init: &[IrStmt], step: &[IrStmt]) -> Option<String> {
     if targets.len() != 1 || targets[0].var != counter || !targets[0].indices.is_empty() {
         return None;
     }
-    let IrExpr::Arith(a) = expr else { return None };
+    let IrExpr::Arith(a, _) = expr else { return None };
     let step_ok = match a.as_ref() {
         ArithAst::IncDec { var, delta, .. } => var == &counter && *delta == 1,
         ArithAst::Assign { var, op, rhs } if var == &counter && op == "+=" => {
@@ -420,7 +420,7 @@ fn zero_init_of(s: &IrStmt) -> Option<String> {
     let zero = match expr {
         IrExpr::Int(n) => *n == 0,
         IrExpr::Str(s, _) => s.trim() == "0",
-        IrExpr::Arith(a) => num_of(a) == Some(0),
+        IrExpr::Arith(a, _) => num_of(a) == Some(0),
         _ => false,
     };
     zero.then(|| t.var.clone())
@@ -471,7 +471,7 @@ mod tests {
         ArithAst::Var(name.to_string())
     }
     fn arith(a: ArithAst) -> IrExpr {
-        IrExpr::Arith(Box::new(a))
+        IrExpr::Arith(Box::new(a), None)
     }
     fn append(a: &str, value: ArithAst) -> IrStmt {
         assign(

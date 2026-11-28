@@ -1544,9 +1544,9 @@ fn assign_to_sh(targets: &[crate::ir::AssignTarget], expr: &IrExpr) -> Result<St
     // to RUN the value as a command: "1: not found").
     if targets.len() == 1
         && targets[0].indices.is_empty()
-        && matches!(expr, IrExpr::Arith(a) if matches!(&**a, ArithAst::IncDec { var, .. } if var == &targets[0].var))
+        && matches!(expr, IrExpr::Arith(a, _) if matches!(&**a, ArithAst::IncDec { var, .. } if var == &targets[0].var))
     {
-        let IrExpr::Arith(a) = expr else { unreachable!() };
+        let IrExpr::Arith(a, _) = expr else { unreachable!() };
         return Ok(format!(": $(({}))", arith_to_sh(a)));
     }
     // `arr=(a b c)` — the A1 is Assign{var: arr, expr: setArray(...)}. The
@@ -2190,7 +2190,7 @@ fn cmd_to_sh(e: &IrExpr) -> Result<String, String> {
         // a statement-position arith (`((n++))` — the perl frontend's
         // increment statements): the arithmetic command, whose exit
         // status is the value != 0 (bash `(( ))` semantics)
-        IrExpr::Arith(a) => Ok(format!("(( {} ))", arith_to_sh(a))),
+        IrExpr::Arith(a, _) => Ok(format!("(( {} ))", arith_to_sh(a))),
         // a bare variable in command position: the goto restructure's
         // flag guards (`if (flag) break`) — truthiness of the store
         // value ([ -n ]), matching the runtime's nonempty-true semantics
@@ -3571,7 +3571,7 @@ fn word_to_sh(e: &IrExpr) -> Result<String, String> {
         IrExpr::Ident(name) => Ok(name.clone()),
         IrExpr::Bool(b) => Ok(if *b { "1".into() } else { "0".into() }),
         IrExpr::Interpolate(parts) => interp_to_sh(parts),
-        IrExpr::Arith(a) => Ok(format!("$(({}))", arith_to_sh(a))),
+        IrExpr::Arith(a, _) => Ok(format!("$(({}))", arith_to_sh(a))),
         IrExpr::Call { func, args } => call_word_to_sh(func, args),
         // The A1 `Index` expr node (triage-sh py-sh-go cross-product pairs
         // t21/t56/t73): array element read — render like the `arrayIndex`
@@ -4230,7 +4230,7 @@ fn interp_expr_to_sh(e: &IrExpr) -> Result<String, String> {
             "brace" => brace_to_sh(args),
             other => Err(format!("interp call not renderable: {other:?}")),
         },
-        IrExpr::Arith(a) => Ok(format!("$(({}))", arith_to_sh(a))),
+        IrExpr::Arith(a, _) => Ok(format!("$(({}))", arith_to_sh(a))),
         IrExpr::Int(i) => Ok(i.to_string()),
         IrExpr::Bool(b) => Ok(if *b { "1".into() } else { "0".into() }),
         IrExpr::Var(name, _) => Ok(format!("${name}")),
@@ -5321,7 +5321,7 @@ fn str_arg(e: &IrExpr) -> Result<String, String> {
         IrExpr::Ident(s) => Ok(s.clone()),
         // numeric arith in an exec-word position renders as the plain
         // arithmetic result (perl-frontend slice offsets / indices)
-        IrExpr::Arith(a) => Ok(arith_to_sh(a)),
+        IrExpr::Arith(a, _) => Ok(arith_to_sh(a)),
         other => Err(format!("expected Str argument, got {other:?}")),
     }
 }

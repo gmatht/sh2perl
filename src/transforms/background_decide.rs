@@ -359,7 +359,7 @@ fn expr_reads(e: &IrExpr, reads: &mut HashSet<String>) {
                 expr_reads(a, reads);
             }
         }
-        IrExpr::Arith(a) => arith_reads(a, reads),
+        IrExpr::Arith(a, _) => arith_reads(a, reads),
         IrExpr::MethodCall { obj, args, .. } => {
             expr_reads(obj, reads);
             for a in args {

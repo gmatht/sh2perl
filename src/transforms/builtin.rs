@@ -134,7 +134,7 @@ fn rewrite_expr(e: &mut IrExpr) -> bool {
             changed
         }
         IrExpr::Splice(inner) => rewrite_expr(inner),
-        IrExpr::Arith(ast) => rewrite_arith(ast),
+        IrExpr::Arith(ast, _) => rewrite_arith(ast),
         IrExpr::Ext(_) => false,
         IrExpr::BinOp { lhs, rhs, .. } => rewrite_expr(lhs) | rewrite_expr(rhs),
         IrExpr::Ternary { cond, then, else_ } => {

@@ -948,7 +948,7 @@ impl An {
                 ev.impure = true;
                 ev
             }
-            IrExpr::Arith(a) => self.arith(a),
+            IrExpr::Arith(a, _) => self.arith(a),
             IrExpr::Object(fields) => {
                 let mut ev = Ev::default();
                 for (_, v) in fields {
@@ -1808,7 +1808,7 @@ fn st_label(st: &IrStmt) -> String {
     fn ex(e: &IrExpr) -> String {
         match e {
             IrExpr::Call { func, .. } => format!("call {func}"),
-            IrExpr::Arith(_) => "arith".into(),
+            IrExpr::Arith(_, _) => "arith".into(),
             IrExpr::Ext(n) => n.tag().to_string(),
             IrExpr::Var(v, _) => format!("read {v}"),
             _ => "expr".into(),
@@ -1874,7 +1874,7 @@ fn collect_idents(e: &IrExpr, out: &mut BTreeSet<String>) {
                 }
             }
         }
-        IrExpr::Arith(a) => collect_arith_idents(a, out),
+        IrExpr::Arith(a, _) => collect_arith_idents(a, out),
         IrExpr::Index { key, .. } => collect_idents(key, out),
         IrExpr::Call { args, .. } => {
             for a in args {
@@ -2203,7 +2203,7 @@ mod tests {
                 op: "+".into(),
                 lhs: Box::new(ArithAst::Var("x".into())),
                 rhs: Box::new(ArithAst::Num(1)),
-            })),
+            }), None),
         ));
         assert!(!transform(&mut p), "arith-position target must refuse");
         crate::transforms::set_target(None);

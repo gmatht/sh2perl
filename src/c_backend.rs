@@ -1122,7 +1122,7 @@ fn rhs_tierable(
                 None
             }
         }
-        IrExpr::Arith(a) => arith_tierable(a, v, bigint, sel),
+        IrExpr::Arith(a, _) => arith_tierable(a, v, bigint, sel),
         _ => None,
     }
 }
@@ -1208,7 +1208,7 @@ fn demote_string_loop_vars(prog: &IrProgram, int_set: &mut HashSet<String>) {
     let int_arrays = crate::c_backend::int_arrays_for_c(prog);
     fn numeric(e: &IrExpr, ints: &HashSet<String>) -> bool {
         match e {
-            IrExpr::Int(_) | IrExpr::Arith(_) => true,
+            IrExpr::Int(_) | IrExpr::Arith(_, _) => true,
             IrExpr::Str(s, _) => {
                 let t = s.strip_prefix('-').unwrap_or(s);
                 !t.is_empty() && t.bytes().all(|c| c.is_ascii_digit())
@@ -1938,7 +1938,7 @@ fn demote_stringy_ints(
     ) -> bool {
         match e {
             IrExpr::Int(_) => true,
-            IrExpr::Arith(_) => true,
+            IrExpr::Arith(_, _) => true,
             // numeric-text literal (`n="1"` stays Int; anything with
             // whitespace/signs/radix demotes — exact text must survive
             // for string contexts, BASHC_FIX test-string-arith).
@@ -2863,7 +2863,7 @@ fn int_element_verdict(prog: &IrProgram) -> (HashSet<String>, HashSet<String>) {
     }
     fn walk_u_expr(e: &IrExpr, in_int: bool, u: &mut Uses, arrs: &HashSet<String>) {
         match e {
-            IrExpr::Arith(a) => walk_u_arith(a, u, arrs),
+            IrExpr::Arith(a, _) => walk_u_arith(a, u, arrs),
             IrExpr::Var(n, _) | IrExpr::Ident(n) => {
                 if in_int {
                     u.int_use.insert(n.clone());
@@ -2988,7 +2988,7 @@ fn int_element_verdict(prog: &IrProgram) -> (HashSet<String>, HashSet<String>) {
     // transparent in value walks (getVar, Index value) mark here.
     fn mark_redirect_text(e: &IrExpr, u: &mut Uses, arrs: &HashSet<String>) {
         match e {
-            IrExpr::Arith(_) | IrExpr::Int(_) => {}
+            IrExpr::Arith(_, _) | IrExpr::Int(_) => {}
             IrExpr::Var(n, _) | IrExpr::Ident(n) => {
                 u.str_use.insert(n.clone());
             }
@@ -3369,7 +3369,7 @@ fn int_element_verdict(prog: &IrProgram) -> (HashSet<String>, HashSet<String>) {
         }
         match e {
             IrExpr::Int(_) => true,
-            IrExpr::Arith(_) => true,
+            IrExpr::Arith(_, _) => true,
             IrExpr::Str(s, _) => {
                 // canonical i64 text (is_int_expr's rule): all digits,
                 // no leading zeros, AND fits i64 (a 100-digit bigint is
@@ -3449,7 +3449,7 @@ fn int_element_verdict(prog: &IrProgram) -> (HashSet<String>, HashSet<String>) {
     fn expr_refs_bigint(e: &IrExpr, big: &BTreeSet<String>) -> bool {
         match e {
             IrExpr::Var(n, _) | IrExpr::Ident(n) => big.contains(n),
-            IrExpr::Arith(a) => crate::shir::arith_refs_bigint(a, big),
+            IrExpr::Arith(a, _) => crate::shir::arith_refs_bigint(a, big),
             IrExpr::Call { func, args } if func == "getVar" => {
                 matches!(Render::str_arg(args, 0).as_deref(), Some(n) if big.contains(n))
             }
@@ -3484,7 +3484,7 @@ fn int_element_verdict(prog: &IrProgram) -> (HashSet<String>, HashSet<String>) {
             let ok = a.rhs.iter().all(|e| match e {
                 IrExpr::Int(i) => *i >= 0,
                 IrExpr::Str(s, _) => matches!(s.trim().parse::<i64>(), Ok(n) if n >= 0),
-                IrExpr::Arith(x) => match x.as_ref() {
+                IrExpr::Arith(x, _) => match x.as_ref() {
                     ArithAst::Bin { op, lhs, rhs }
                         if op == "+"
                             && matches!(rhs.as_ref(), ArithAst::Num(1)) =>
@@ -3724,7 +3724,7 @@ fn int_element_verdict(prog: &IrProgram) -> (HashSet<String>, HashSet<String>) {
                     }
                 }
             }
-            IrExpr::Arith(a) => cond_arith(a, out),
+            IrExpr::Arith(a, _) => cond_arith(a, out),
             IrExpr::Call { args, .. } => {
                 for a in args {
                     cond_texts(a, out);
@@ -3864,7 +3864,7 @@ fn int_element_verdict(prog: &IrProgram) -> (HashSet<String>, HashSet<String>) {
                             }
                             _ => return None,
                         },
-                        IrExpr::Arith(x) => match x.as_ref() {
+                        IrExpr::Arith(x, _) => match x.as_ref() {
                             ArithAst::Bin { op, lhs, rhs }
                                 if op == "+"
                                     && matches!(rhs.as_ref(), ArithAst::Num(1))
@@ -3935,7 +3935,7 @@ fn int_element_verdict(prog: &IrProgram) -> (HashSet<String>, HashSet<String>) {
                     && !targets[0].var.contains('[')
                     && targets[0].var == var
                 {
-                    if let IrExpr::Arith(x) = expr {
+                    if let IrExpr::Arith(x, _) = expr {
                         if let ArithAst::Bin { op, lhs, rhs } = x.as_ref() {
                             return op == "+"
                                 && matches!(rhs.as_ref(), ArithAst::Num(1))
@@ -4251,7 +4251,7 @@ fn int_element_verdict(prog: &IrProgram) -> (HashSet<String>, HashSet<String>) {
     ) -> bool {
         match e {
             IrExpr::Int(_) => true,
-            IrExpr::Arith(_) => true,
+            IrExpr::Arith(_, _) => true,
             IrExpr::Str(st, _) => {
                 let t = st.trim();
                 !t.is_empty()
@@ -4639,7 +4639,7 @@ fn seed_int_element_readers(prog: &mut IrProgram) {
         let ok = match rhs {
             Some(es) if !es.is_empty() => {
                 reads_homed(es, &all_homed)
-                    || es.iter().all(|e| matches!(e, IrExpr::Arith(_)))
+                    || es.iter().all(|e| matches!(e, IrExpr::Arith(_, _)))
             }
             _ => false,
         };
@@ -4973,7 +4973,7 @@ fn fold_hoist_list(
                             op: "<=".to_string(),
                             lhs: Box::new(lhs),
                             rhs: Box::new(y),
-                        }));
+                        }), None);
                     }
                     stmts.remove(i);
                     dropped.insert(tmp);
@@ -5005,7 +5005,7 @@ fn bound_plus1_def(a: &IrStmt) -> Option<(String, crate::ir::ArithAst)> {
                 return None;
             }
             match expr {
-                IrExpr::Arith(x) => match x.as_ref() {
+                IrExpr::Arith(x, _) => match x.as_ref() {
                     crate::ir::ArithAst::Bin { op, lhs, rhs } if op == "+" => {
                         if !matches!(rhs.as_ref(), crate::ir::ArithAst::Num(1)) {
                             return None;
@@ -5032,7 +5032,7 @@ fn bound_plus1_def(a: &IrStmt) -> Option<(String, crate::ir::ArithAst)> {
 fn bound_plus1_cond(b: &IrStmt, tmp: &str) -> Option<crate::ir::ArithAst> {
     match b {
         IrStmt::While { cond, .. } => match cond {
-            IrExpr::Arith(x) => match x.as_ref() {
+            IrExpr::Arith(x, _) => match x.as_ref() {
                 crate::ir::ArithAst::Bin { op, lhs, rhs } if op == "<" => {
                     match rhs.as_ref() {
                         crate::ir::ArithAst::Var(v) if v == tmp => Some(lhs.as_ref().clone()),
@@ -5093,7 +5093,7 @@ fn hoist_pair_at(
                 return None;
             }
             let is_coercion = match expr {
-                IrExpr::Arith(ast) => match ast.as_ref() {
+                IrExpr::Arith(ast, _) => match ast.as_ref() {
                     ArithAst::Bin { op, lhs, rhs } if op == "+" => {
                         matches!((&**lhs, &**rhs), (ArithAst::Var(v), ArithAst::Num(0)) if v == &s)
                             || matches!((&**lhs, &**rhs), (ArithAst::Num(0), ArithAst::Var(v)) if v == &s)
@@ -5570,7 +5570,7 @@ fn count_expr(e: &IrExpr, name: &str, n: &mut usize) {
                 count_stmt(b, name, n);
             }
         }
-        IrExpr::Arith(a) => count_arith(a, name, n),
+        IrExpr::Arith(a, _) => count_arith(a, name, n),
         IrExpr::Json(v) => count_json(v, name, n),
         IrExpr::Object(props) => {
             for (k, v) in props {
@@ -5786,7 +5786,7 @@ fn elem_fits_i64(e: &IrExpr, vt: &HashMap<String, IrType>, big: &BTreeSet<String
     match e {
         IrExpr::Int(_) => true,
         IrExpr::Str(s, _) => s.trim().parse::<i64>().is_ok(),
-        IrExpr::Arith(a) => !crate::shir::arith_refs_bigint(a, big),
+        IrExpr::Arith(a, _) => !crate::shir::arith_refs_bigint(a, big),
         IrExpr::Var(name, _) | IrExpr::Ident(name) => matches!(
             vt.get(name),
             Some(IrType::Int | IrType::Int32 | IrType::Int64 | IrType::UInt32)
@@ -5970,7 +5970,7 @@ fn small_int_arrays(
                     elems_expr_of(c, map);
                 }
             }
-            IrExpr::Arith(a) => elems_arith_of(a, map),
+            IrExpr::Arith(a, _) => elems_arith_of(a, map),
             _ => {}
         }
     }
@@ -6041,7 +6041,7 @@ fn literal_write_index(t: &crate::ir::AssignTarget) -> Option<u64> {
                     None
                 }
             }
-            IrExpr::Arith(a) => match a.as_ref() {
+            IrExpr::Arith(a, _) => match a.as_ref() {
                 crate::ir::ArithAst::Num(n) if *n >= 0 => Some(*n as u64),
                 _ => None,
             },
@@ -6082,7 +6082,7 @@ fn counter_reserve_loop(cond: &IrExpr, step_stmt: &IrStmt) -> Option<(String, St
     // lowering (dual_loops), so both shapes must reach it; before this
     // arm, python-O4's counted loops were never versioned and sumred
     // stayed on the signed modulo while bash-O4 got the unsigned arm.
-    if let IrExpr::Arith(a) = cond {
+    if let IrExpr::Arith(a, _) = cond {
         if let crate::ir::ArithAst::Bin { op, lhs, rhs } = unwrap_arith_cast(a.as_ref()) {
             if op == "<" || op == "<=" {
                 if let (crate::ir::ArithAst::Var(l), crate::ir::ArithAst::Var(r)) =
@@ -6151,7 +6151,7 @@ fn counter_reserve_finish(
                 && targets[0].var == var
                 && targets[0].indices.is_empty()
                 && match expr {
-                    IrExpr::Arith(a) => match a.as_ref() {
+                    IrExpr::Arith(a, _) => match a.as_ref() {
                         crate::ir::ArithAst::IncDec { var: v, delta, .. } => {
                             v == var && *delta > 0
                         }
@@ -6609,7 +6609,7 @@ fn expr_mentions(e: &IrExpr, arr: &str) -> bool {
             items.iter().any(|(k, v)| k.contains(arr) || expr_mentions(v, arr))
         }
         IrExpr::Splice(x) => expr_mentions(x, arr),
-        IrExpr::Arith(a) => arith_mentions(a, arr),
+        IrExpr::Arith(a, _) => arith_mentions(a, arr),
         IrExpr::Lambda { params: _, body } => body.iter().any(|s| {
             let mut found = false;
             stmt_mentions(s, arr, &mut found);
@@ -6803,7 +6803,7 @@ fn loop_tainted_vars(prog: &IrProgram) -> HashSet<String> {
     }
     fn arith_targets(e: &IrExpr, tainted: &mut HashSet<String>) {
         match e {
-            IrExpr::Arith(a) => {
+            IrExpr::Arith(a, _) => {
                 fn walk(a: &A, tainted: &mut HashSet<String>) {
                     match a {
                         A::Assign { var, .. } | A::IncDec { var, .. } => {
@@ -6953,7 +6953,7 @@ fn prog_reads_rc(prog: &IrProgram) -> bool {
             IrExpr::Index { key, .. } => has_rc_expr(key),
             IrExpr::Object(items) => items.iter().any(|(_, v)| has_rc_expr(v)),
             IrExpr::Splice(x) => has_rc_expr(x),
-            IrExpr::Arith(a) => has_rc_arith(a),
+            IrExpr::Arith(a, _) => has_rc_arith(a),
             IrExpr::Lambda { body, .. } | IrExpr::Arrow(body) => {
                 body.iter().any(has_rc_stmt)
             }
@@ -7501,7 +7501,7 @@ fn ver_accums(
                             continue;
                         }
                         match expr {
-                            IrExpr::Arith(a) => match a.as_ref() {
+                            IrExpr::Arith(a, _) => match a.as_ref() {
                                 A::Bin { op, lhs, rhs } if op == "%" => {
                                     match (lhs.as_ref(), rhs.as_ref()) {
                                         (A::Bin { op: op2, lhs: l2, rhs: r2 }, A::Num(m))
@@ -7624,7 +7624,7 @@ fn ver_collect(
     }
     fn vexpr(e: &IrExpr, ctx: &VerCtx, state: &HashMap<String, Option<(i128, i128)>>, out: &mut Vec<i128>) {
         match e {
-            IrExpr::Arith(a) => varith(a, ctx, state, out),
+            IrExpr::Arith(a, _) => varith(a, ctx, state, out),
             IrExpr::Array(items) => {
                 for x in items {
                     vexpr(x, ctx, state, out);
@@ -8084,7 +8084,7 @@ fn array_fixed_caps(
                     return None;
                 }
                 let mag = match expr {
-                    IrExpr::Arith(a) => match a.as_ref() {
+                    IrExpr::Arith(a, _) => match a.as_ref() {
                         crate::ir::ArithAst::IncDec { var: v, delta, .. }
                             if v == var && *delta > 0 =>
                         {
@@ -8136,7 +8136,7 @@ fn array_fixed_caps(
                 let v = targets[0].var.split('[').next().unwrap_or(&targets[0].var);
                 let is_zero = match expr {
                     IrExpr::Int(0) => true,
-                    IrExpr::Arith(a) => match a.as_ref() {
+                    IrExpr::Arith(a, _) => match a.as_ref() {
                         crate::ir::ArithAst::Num(0) => true,
                         crate::ir::ArithAst::Assign { var: av, op, rhs }
                             if av == v && op == "=" =>
@@ -8328,7 +8328,7 @@ fn array_fixed_caps(
             IrExpr::Index { key, .. } => counter_has_opaque(key),
             IrExpr::Object(items) => items.iter().any(|(_, v)| counter_has_opaque(v)),
             IrExpr::Splice(x) => counter_has_opaque(x),
-            IrExpr::Arith(a) => counter_arith_has_opaque(a),
+            IrExpr::Arith(a, _) => counter_arith_has_opaque(a),
             _ => false,
         }
     }
@@ -8411,7 +8411,7 @@ fn array_fixed_caps(
                 }
             }
             IrExpr::Splice(x) => counter_collect_mentions(x, vars, texts),
-            IrExpr::Arith(a) => counter_collect_arith_mentions(a, vars, texts),
+            IrExpr::Arith(a, _) => counter_collect_arith_mentions(a, vars, texts),
             IrExpr::ArrayComp { var, iter, elem, cond } => {
                 vars.insert(var.clone());
                 counter_collect_mentions(iter, vars, texts);
@@ -9114,7 +9114,7 @@ fn array_fixed_caps(
                     caps_expr_of(c, map, mult, depth);
                 }
             }
-            IrExpr::Arith(a) => caps_arith_of(a, map, mult, depth),
+            IrExpr::Arith(a, _) => caps_arith_of(a, map, mult, depth),
             _ => {}
         }
     }
@@ -9582,7 +9582,7 @@ fn collect_array_elements_expr(e: &IrExpr, out: &mut HashMap<String, Vec<IrExpr>
 fn expr_width(e: &IrExpr, state: &HashMap<String, Option<(i128, i128)>>) -> Width {
     match e {
         IrExpr::Int(i) => Width::from_range_name(crate::shir::range_width_name(*i as i128, *i as i128)),
-        IrExpr::Arith(a) => match arith_range_local(a, state) {
+        IrExpr::Arith(a, _) => match arith_range_local(a, state) {
             Some((lo, hi)) => Width::from_range_name(crate::shir::range_width_name(lo, hi)),
             None => Width::I64,
         },
@@ -10431,7 +10431,7 @@ fn self_append_segs(var: &str, expr: &IrExpr) -> Option<IrExpr> {
             | IrExpr::Bool(..)
             | IrExpr::Var(..)
             | IrExpr::Ident(..)
-            | IrExpr::Arith(..) => true,
+            | IrExpr::Arith(.., _) => true,
             IrExpr::Call { func, args } => {
                 (func == "getVar" && matches!(args.as_slice(), [IrExpr::Str(..)]))
                     // tail-placed plain reads lower the same way
@@ -12094,7 +12094,7 @@ impl Render {
         // so the i64<->mpz handoff happens once per outer entry instead
         // of once per iteration (collatz's inner loop is entered 1.8e7
         // times).
-        let IrExpr::Arith(_) = cond else {
+        let IrExpr::Arith(_, _) = cond else {
             return false;
         };
         // EVERY bigint var that grows here — multiplicative (`v = 3*v+1`)
@@ -12262,7 +12262,7 @@ impl Render {
             for s in stmts {
                 match s {
                     IrStmt::Assign { targets, expr, .. } => {
-                        if let (Some(t), IrExpr::Arith(a)) = (targets.first(), expr) {
+                        if let (Some(t), IrExpr::Arith(a, _)) = (targets.first(), expr) {
                             if big.contains(&t.var) && arith_self_growth(a, &t.var) {
                                 found.insert(t.var.clone());
                             }
@@ -12611,7 +12611,7 @@ impl Render {
     fn expr_is_float_valued(&self, e: &IrExpr) -> bool {
         match e {
             IrExpr::Var(name, _) | IrExpr::Ident(name) => self.is_float(name),
-            IrExpr::Arith(a) => self.arith_has_float(a),
+            IrExpr::Arith(a, _) => self.arith_has_float(a),
             IrExpr::Call { func, args } if func == "arith" => {
                 matches!(Self::str_arg(args, 0).as_deref(), Some(s) if self.arith_text_is_float(s))
             }
@@ -12635,7 +12635,7 @@ impl Render {
                 }
                 format!("atof({})", self.value_c(expr))
             }
-            IrExpr::Arith(a) => self.arith(a),
+            IrExpr::Arith(a, _) => self.arith(a),
             IrExpr::Int(i) => format!("(double){i}"),
             IrExpr::Str(s, _) => {
                 let t = s.trim();
@@ -17024,7 +17024,7 @@ impl Render {
                 };
                 format!("({l} {c_op} {r})")
             }
-            IrExpr::Arith(a) => {
+            IrExpr::Arith(a, _) => {
                 if self.is_bigint_arith(a) {
                     self.bigint_cond(a)
                 } else {
@@ -18229,7 +18229,7 @@ impl Render {
     fn positional_digit(expr: &IrExpr) -> Option<usize> {
         let v = match expr {
             IrExpr::Var(d, _) => d.clone(),
-            IrExpr::Arith(a) => match &**a {
+            IrExpr::Arith(a, _) => match &**a {
                 ArithAst::Var(d) => d.clone(),
                 _ => return None,
             },
@@ -18329,7 +18329,7 @@ fn param_copy_alias(
                             }
                         }
                     }
-                    IrExpr::Arith(a) => arith_flags(a, x, n),
+                    IrExpr::Arith(a, _) => arith_flags(a, x, n),
                     IrExpr::Object(props) => {
                         for (_, v) in props {
                             expr_flags(v, x, n);
@@ -18529,7 +18529,7 @@ fn param_copy_alias(
                         InterpPart::Expr(xe) => expr_reads(xe, x, digit),
                         InterpPart::Lit(s) => str_mentions(s, x) > 0 || text_contains_ident(s, x),
                     }),
-                    IrExpr::Arith(a) => arith_reads(a, x, digit),
+                    IrExpr::Arith(a, _) => arith_reads(a, x, digit),
                     IrExpr::Object(props) => props.iter().any(|(_, v)| expr_reads(v, x, digit)),
                     _ => false,
                 }
@@ -18741,7 +18741,7 @@ fn param_copy_alias(
                         InterpPart::Expr(xe) => expr_hit(xe, x),
                         InterpPart::Lit(s) => str_mentions(s, x) > 0 || text_contains_ident(s, x),
                     }),
-                    IrExpr::Arith(a) => arith_hit(a, x),
+                    IrExpr::Arith(a, _) => arith_hit(a, x),
                     IrExpr::Object(props) => props.iter().any(|(_, v)| expr_hit(v, x)),
                     _ => false,
                 }
@@ -19110,7 +19110,7 @@ fn param_copy_alias(
                     }
                     stmts_hit(body, x)
                 }
-                IrExpr::Arith(a) => arith_hits(a, x),
+                IrExpr::Arith(a, _) => arith_hits(a, x),
                 IrExpr::Json(v) => {
                     // data literal, not code — but scan its text anyway
                     // (fail-closed is cheaper than auditing the shapes).
@@ -21797,7 +21797,7 @@ fn param_copy_alias(
                     self.store_ref(name)
                 }
             }
-            IrExpr::Arith(a) => {
+            IrExpr::Arith(a, _) => {
                 if self.is_bigint_arith(a) {
                     // bigint value in a string context: exact decimal
                     return self.bigint_decimal(a);
@@ -21996,7 +21996,7 @@ fn param_copy_alias(
                     // value_c returns STRINGS: stringify (a bare long
                     // long into char* is a crash — BASHC_FIX bc path).
                     // Numeric contexts use arith()/expr(), not this arm.
-                    let Some(IrExpr::Arith(a)) = args.first() else {
+                    let Some(IrExpr::Arith(a, _)) = args.first() else {
                         return "0".into();
                     };
                     self.need_isqrt = true;
@@ -22097,7 +22097,7 @@ fn param_copy_alias(
     fn value_ll(&mut self, e: &IrExpr) -> String {
         match e {
             IrExpr::Int(i) => i.to_string(),
-            IrExpr::Arith(a) => self.arith(a),
+            IrExpr::Arith(a, _) => self.arith(a),
             IrExpr::Var(name, _) | IrExpr::Ident(name) => {
                 if self.is_num(name) {
                     self.c_ident(name)
@@ -23776,7 +23776,7 @@ fn param_copy_alias(
                             // PREFIX for the next command (empty count)
                             self.sh_raw(buf, &format!("{}=", t.var));
                             match expr {
-                                IrExpr::Arith(a) => {
+                                IrExpr::Arith(a, _) => {
                                     self.emit(&format!(
                                         "_sh_add({});",
                                         Self::cstr(&format!("$(({}))", arith_shell(a)))
@@ -24105,7 +24105,7 @@ fn param_copy_alias(
                     let mut init_parts: Vec<String> = Vec::new();
                     for s in init {
                         if let IrStmt::Assign {
-                            expr: IrExpr::Arith(a),
+                            expr: IrExpr::Arith(a, _),
                             ..
                         } = s
                         {
@@ -24115,7 +24115,7 @@ fn param_copy_alias(
                     let mut step_parts: Vec<String> = Vec::new();
                     for s in step {
                         if let IrStmt::Assign {
-                            expr: IrExpr::Arith(a),
+                            expr: IrExpr::Arith(a, _),
                             ..
                         } = s
                         {
@@ -24959,7 +24959,7 @@ fn param_copy_alias(
                         if items.len() == 1 {
                             let mut direct: Option<String> = None;
                             match items[0] {
-                                IrExpr::Arith(a) if self.is_bigint_arith(a) => {
+                                IrExpr::Arith(a, _) if self.is_bigint_arith(a) => {
                                     direct = Some(self.bigint_eval_temp(a));
                                 }
                                 IrExpr::Call { func, args } if func == "getVar" => {
@@ -26062,7 +26062,7 @@ fn param_copy_alias(
     fn fb_word_one_value(w: &IrExpr) -> bool {
         match w {
             IrExpr::Str(..) | IrExpr::Int(..) | IrExpr::Var(..) | IrExpr::Ident(..) => true,
-            IrExpr::Arith(..) => true,
+            IrExpr::Arith(.., _) => true,
             IrExpr::Index { key, .. } => Self::fb_word_one_value(key),
             IrExpr::Interpolate(parts) => parts.iter().all(|p| match p {
                 InterpPart::Lit(..) => true,
@@ -26496,7 +26496,7 @@ fn param_copy_alias(
     fn word_single_argv(w: &IrExpr) -> bool {
         match w {
             IrExpr::Str(..) | IrExpr::Int(..) | IrExpr::Var(..) | IrExpr::Ident(..) => true,
-            IrExpr::Arith(..) => true,
+            IrExpr::Arith(.., _) => true,
             IrExpr::Index { key, .. } => Self::word_single_argv(key),
             IrExpr::Interpolate(parts) => parts.iter().all(|p| match p {
                 InterpPart::Lit(..) => true,
@@ -26796,7 +26796,7 @@ fn param_copy_alias(
     /// Returns C long-long expression text.
     fn attr_int_value(&mut self, e: &IrExpr) -> String {
         match e {
-            IrExpr::Arith(a) => self.arith(a),
+            IrExpr::Arith(a, _) => self.arith(a),
             IrExpr::Str(s, _) => match crate::shir::parse_arith(s) {
                 Some(a) => self.arith(&a),
                 None => "0".into(),
@@ -27519,7 +27519,7 @@ fn param_copy_alias(
         }
         match w {
             IrExpr::Str(_, _) | IrExpr::Int(_) | IrExpr::Var(_, _) | IrExpr::Ident(_)
-            | IrExpr::Arith(_) | IrExpr::BinOp { .. } | IrExpr::Bool(_)
+            | IrExpr::Arith(_, _) | IrExpr::BinOp { .. } | IrExpr::Bool(_)
             | IrExpr::Index { .. } => true,
             IrExpr::Call { func, args, .. } if func == "capture" => {
                 // an in-process-lowered capture is a plain value; anything
@@ -28833,7 +28833,7 @@ fn param_copy_alias(
                 ) && Self::expr_natively_renderable(lhs)
                     && Self::expr_natively_renderable(rhs)
             }
-            IrExpr::Arith(a) => !Self::arith_has_side_effects(a),
+            IrExpr::Arith(a, _) => !Self::arith_has_side_effects(a),
             _ => false,
         }
     }
@@ -32209,7 +32209,7 @@ fn param_copy_alias(
                 // the whole program printed `TODO sh2.isqrt`.
                 self.need_isqrt = true;
                 let v = match args.first() {
-                    Some(IrExpr::Arith(a)) => self.arith(a),
+                    Some(IrExpr::Arith(a, _)) => self.arith(a),
                     Some(e) => self.value_num(e),
                     None => "0".to_string(),
                 };
@@ -32766,7 +32766,7 @@ fn param_copy_alias(
                                 return;
                             }
                             match expr {
-                                IrExpr::Arith(a) => match a.as_ref() {
+                                IrExpr::Arith(a, _) => match a.as_ref() {
                                     A::Bin { op, lhs, rhs } if op == "%" => {
                                         match rhs.as_ref() {
                                             A::Num(mm) if *mm == m => {
@@ -33247,7 +33247,7 @@ fn param_copy_alias(
                 Ok(n) => Some(format!("(long long)({n}LL)")),
                 Err(_) => None,
             },
-            IrExpr::Arith(a) => Some(format!("(long long)({})", self.arith(a))),
+            IrExpr::Arith(a, _) => Some(format!("(long long)({})", self.arith(a))),
             IrExpr::Var(name, _) | IrExpr::Ident(name) => {
                 if self.is_num(name) {
                     Some(format!("(long long)({})", self.c_ident(name)))
@@ -34594,7 +34594,7 @@ fn param_copy_alias(
                 }
                 out
             }
-            IrExpr::Arith(a) => {
+            IrExpr::Arith(a, _) => {
                 if self.is_bigint_arith(a) {
                     // bigint print: exact decimal text
                     vec![Part::Arg(self.bigint_decimal(a), NumSpec::Str)]
@@ -34752,7 +34752,7 @@ fn param_copy_alias(
     fn expr_is_num(&mut self, e: &IrExpr) -> bool {
         match e {
             IrExpr::Var(name, _) => self.is_num(name),
-            IrExpr::Int(_) | IrExpr::Arith(_) | IrExpr::BinOp { .. } => true,
+            IrExpr::Int(_) | IrExpr::Arith(_, _) | IrExpr::BinOp { .. } => true,
             // `$y` reads arrive as getVar("y"); a typed-Int var is numeric
             IrExpr::Call { func, args } if func == "getVar" => {
                 matches!(
@@ -34883,7 +34883,7 @@ fn param_copy_alias(
     /// None when the arg stays on the native integer path.
     fn printf_bigint_arg(&mut self, a: &IrExpr) -> Option<String> {
         let tainted = match a {
-            IrExpr::Arith(x) => self.is_bigint_arith(x),
+            IrExpr::Arith(x, _) => self.is_bigint_arith(x),
             IrExpr::Var(n, _) | IrExpr::Ident(n) => self.bigint_vars.contains(n),
             _ => false,
         };
@@ -34892,7 +34892,7 @@ fn param_copy_alias(
         }
         self.need_gmp = true;
         match a {
-            IrExpr::Arith(x) => Some(self.bigint_decimal(x)),
+            IrExpr::Arith(x, _) => Some(self.bigint_decimal(x)),
             IrExpr::Var(n, _) | IrExpr::Ident(n) => {
                 let vb = self.vbuf_temp();
                 self.emit(&format!("_sh_mpz_str(&{vb}, {});", self.c_ident(n)));
@@ -35702,7 +35702,7 @@ fn param_copy_alias(
         // store this skips is wrong either way.) Must run before the
         // speculative arm, whose shadow store has the same bug.
         if let IrStmt::Assign { targets, expr, .. } = s {
-            if let IrExpr::Arith(a) = expr {
+            if let IrExpr::Arith(a, _) = expr {
                 if targets.len() == 1
                     && targets[0].indices.is_empty()
                     && Self::arith_static_zero_divisor(a)
@@ -35725,7 +35725,7 @@ fn param_copy_alias(
                         .as_ref()
                         .is_some_and(|f| f.contains(t.var.as_str()))
                 {
-                    if let IrExpr::Arith(a) = expr {
+                    if let IrExpr::Arith(a, _) = expr {
                         self.spec_checked_store(&t.var, a);
                         return;
                     }
@@ -36642,7 +36642,7 @@ fn param_copy_alias(
                 // GMP slot on 128-bit overflow. Must run before the plain
                 // bigint assign below (the var is also in bigint_vars).
                 if self.tiered_vars.contains(&t.var) {
-                    if let IrExpr::Arith(a) = expr {
+                    if let IrExpr::Arith(a, _) = expr {
                         if self.tiered_store_general(&t.var, a)
                             || self.tiered_store(&t.var, a)
                         {
@@ -36675,7 +36675,7 @@ fn param_copy_alias(
                     .as_ref()
                     .is_some_and(|f| f.contains(t.var.as_str()))
                 {
-                    if let IrExpr::Arith(a) = expr {
+                    if let IrExpr::Arith(a, _) = expr {
                         self.spec_checked_store(&t.var, a);
                         return;
                     }
@@ -36688,7 +36688,7 @@ fn param_copy_alias(
                 // even when this particular RHS carries no Cast marker
                 // (a mixed accumulator): the declaration is `mpz_t`, so a
                 // native `v = …` store would not compile.
-                if let IrExpr::Arith(a) = expr {
+                if let IrExpr::Arith(a, _) = expr {
                     if self.bigint_vars.contains(&t.var) || self.is_bigint_arith(a) {
                         // Native fast path: a bigint target whose RHS reads
                         // NO bigint var and is proven within i64 is computed
@@ -36794,7 +36794,7 @@ fn param_copy_alias(
                 // exits 1, `((++i))` with the result nonzero exits 0 —
                 // and the target is the side-effect var, NOT a stored
                 // assignment (`i = i++` is a C read-modify-write no-op).
-                if let IrExpr::Arith(a) = expr {
+                if let IrExpr::Arith(a, _) = expr {
                     if matches!(
                         a.as_ref(),
                         ArithAst::Assign { .. } | ArithAst::IncDec { .. }
@@ -36884,7 +36884,7 @@ fn param_copy_alias(
                     && !self.bigint_vars.contains(&t.var)
                     && self.buf_bound(&t.var).is_none()
                 {
-                    if let IrExpr::Arith(a) = expr {
+                    if let IrExpr::Arith(a, _) = expr {
                         let is_self = |e: &ArithAst| {
                             matches!(e, ArithAst::Var(v) | ArithAst::Ident(v) if v == &t.var)
                         };
@@ -36941,7 +36941,7 @@ fn param_copy_alias(
                     // keeps old value, rc nonzero) — guarded-0 + store
                     // corrupts (`x=[0]` vs `x=[]`).
                     let mut div_else = false;
-                    if let IrExpr::Arith(a) = expr {
+                    if let IrExpr::Arith(a, _) = expr {
                         let mut divs = Vec::new();
                         arith_divisors(a, &mut divs);
                         if !divs.is_empty() {
@@ -37102,7 +37102,7 @@ fn param_copy_alias(
                             // direct native helper, no arith-string.
                             self.need_isqrt = true;
                             match args.as_slice() {
-                                [IrExpr::Arith(a)] => {
+                                [IrExpr::Arith(a, _)] => {
                                     format!("(long long)(_sh_isqrt({}))", self.arith(a))
                                 }
                                 _ => format!(
@@ -39082,7 +39082,7 @@ fn param_copy_alias(
     fn expr_width(&self, e: &IrExpr) -> Width {
         match e {
             IrExpr::Var(name, _) | IrExpr::Ident(name) => self.width_of_var(name),
-            IrExpr::Arith(a) => {
+            IrExpr::Arith(a, _) => {
                 let state: HashMap<String, Option<(i128, i128)>> = self
                     .var_ranges
                     .iter()
@@ -39155,7 +39155,7 @@ fn param_copy_alias(
                 // defaults to I64 but its C type is `char*` — never match)
                 self.is_num(name) && self.width_of_var(name) == w
             }
-            IrExpr::Arith(a) => {
+            IrExpr::Arith(a, _) => {
                 let mut has_var = false;
                 arith_leaves_at_width(a, self, w, &mut has_var)
                     // a pure-Num arith may render with LL literals (the
@@ -40442,7 +40442,7 @@ fn lift_scan_expr(e: &IrExpr, spawn: bool, fname: &str, st: &mut LiftScan) {
             lift_scan_expr(rhs, spawn, fname, st);
         }
         IrExpr::Index { key, .. } => lift_scan_expr(key, spawn, fname, st),
-        IrExpr::Arith(a) => lift_scan_arith(a, st),
+        IrExpr::Arith(a, _) => lift_scan_arith(a, st),
         IrExpr::Object(props) => {
             for (_, v) in props {
                 lift_scan_expr(v, spawn, fname, st);
@@ -40730,20 +40730,20 @@ fn spec_collect(stmts: &[IrStmt], out: &mut BTreeSet<String>) -> bool {
                 }
                 out.insert(t.var.clone());
             }
-            IrStmt::Expr(IrExpr::Arith(a)) => {
+            IrStmt::Expr(IrExpr::Arith(a, _)) => {
                 if !spec_collect_targets(a, out) {
                     return false;
                 }
             }
             IrStmt::If { cond, then, elsifs, else_, .. } => {
-                if !matches!(cond, IrExpr::Arith(_)) {
+                if !matches!(cond, IrExpr::Arith(_, _)) {
                     return false;
                 }
                 if !spec_collect(then, out) {
                     return false;
                 }
                 for (c, b) in elsifs {
-                    if !matches!(c, IrExpr::Arith(_)) || !spec_collect(b, out) {
+                    if !matches!(c, IrExpr::Arith(_, _)) || !spec_collect(b, out) {
                         return false;
                     }
                 }
@@ -40757,7 +40757,7 @@ fn spec_collect(stmts: &[IrStmt], out: &mut BTreeSet<String>) -> bool {
                 }
             }
             IrStmt::While { cond, body } | IrStmt::DoWhile { body, cond, .. } => {
-                if !matches!(cond, IrExpr::Arith(_)) || !spec_collect(body, out) {
+                if !matches!(cond, IrExpr::Arith(_, _)) || !spec_collect(body, out) {
                     return false;
                 }
             }
@@ -40767,7 +40767,7 @@ fn spec_collect(stmts: &[IrStmt], out: &mut BTreeSet<String>) -> bool {
                 }
             }
             IrStmt::ForInit { init, cond, step, body } => {
-                if !matches!(cond, IrExpr::Arith(_))
+                if !matches!(cond, IrExpr::Arith(_, _))
                     || !spec_collect(init, out)
                     || !spec_collect(step, out)
                     || !spec_collect(body, out)
@@ -40785,7 +40785,7 @@ fn spec_collect(stmts: &[IrStmt], out: &mut BTreeSet<String>) -> bool {
 fn expr_is_pure_scalar(e: &IrExpr) -> bool {
     matches!(
         e,
-        IrExpr::Arith(_)
+        IrExpr::Arith(_, _)
             | IrExpr::Str(_, _)
             | IrExpr::Int(_)
             | IrExpr::Var(_, _)
@@ -41042,7 +41042,7 @@ fn spec_body_rhs_ok(stmts: &[IrStmt], shadowed: &BTreeSet<String>, big: &BTreeSe
             IrStmt::Assign { targets, expr, .. } => {
                 if targets.first().is_some_and(|t| shadowed.contains(&t.var)) {
                     match expr {
-                        IrExpr::Arith(a) if spec_rhs_ok(a, shadowed, big) => {}
+                        IrExpr::Arith(a, _) if spec_rhs_ok(a, shadowed, big) => {}
                         // A literal seed/reset (`s = 0`) stores the shadow
                         // directly (handled by the early gate in `stmt`).
                         _ if spec_lit_i64(expr).is_some() => {}
@@ -41137,7 +41137,7 @@ fn profile_wide_vars(prog: &IrProgram) -> HashSet<String> {
             IrExpr::Var(n, _) | IrExpr::Ident(n) => {
                 out.insert(n.clone());
             }
-            IrExpr::Arith(a) => ar(a, out),
+            IrExpr::Arith(a, _) => ar(a, out),
             IrExpr::Call { args, .. } => {
                 for a in args {
                     cond_vars_expr(a, out);
@@ -41195,7 +41195,7 @@ fn profile_wide_vars(prog: &IrProgram) -> HashSet<String> {
                     if cond.contains(&t.var) {
                         continue;
                     }
-                    if let IrExpr::Arith(a) = expr {
+                    if let IrExpr::Arith(a, _) = expr {
                         let selfside = |x: &ArithAst| {
                             matches!(x, ArithAst::Var(v) | ArithAst::Ident(v) if v == &t.var)
                         };
@@ -41627,7 +41627,7 @@ fn scan_void_uses(
                 taint_expr(rhs, st);
             }
             IrExpr::Index { key, .. } => taint_expr(key, st),
-            IrExpr::Arith(_) => {}
+            IrExpr::Arith(_, _) => {}
             IrExpr::Object(props) => {
                 for (_, v) in props {
                     taint_expr(v, st);
@@ -41707,7 +41707,7 @@ fn analyze_native_num_fns(
         for st in body {
             if let IrStmt::Assign { targets, expr, .. } = st {
                 if let Some(t) = targets.first() {
-                    if let IrExpr::Arith(a) = expr {
+                    if let IrExpr::Arith(a, _) = expr {
                         if arith_refs_positional(a) {
                             param_vars.insert(t.var.clone());
                         }
@@ -41809,7 +41809,7 @@ fn analyze_native_positions(
             if let IrStmt::Assign { targets, expr, .. } = st {
                 if let Some(t) = targets.first() {
                     let mut positions: BTreeSet<usize> = BTreeSet::new();
-                    if let IrExpr::Arith(a) = expr {
+                    if let IrExpr::Arith(a, _) = expr {
                         if arith_refs_positional(a) {
                             arith_digits(a, &mut positions);
                         }
@@ -41875,7 +41875,7 @@ fn walk_body_bigint(stmts: &[IrStmt], bigint: &BTreeSet<String>, found: &mut boo
     for s in stmts {
         match s {
             IrStmt::Assign { expr, .. } => {
-                if let IrExpr::Arith(a) = expr {
+                if let IrExpr::Arith(a, _) = expr {
                     // skip the param materialization `a = $N` entirely
                     if arith_refs_positional(a) {
                         continue;
@@ -41964,7 +41964,7 @@ fn walk_expr_bigint(e: &IrExpr, bigint: &BTreeSet<String>, found: &mut bool) {
         return;
     }
     match e {
-        IrExpr::Arith(a) => {
+        IrExpr::Arith(a, _) => {
             if crate::shir::arith_refs_bigint(a, bigint) {
                 *found = true;
             }
@@ -42021,7 +42021,7 @@ fn analyze_bigint_param_fns(prog: &IrProgram) -> BTreeSet<String> {
         for st in body {
             if let IrStmt::Assign { targets, expr, .. } = st {
                 if let Some(t) = targets.first() {
-                    if let IrExpr::Arith(a) = expr {
+                    if let IrExpr::Arith(a, _) = expr {
                         if arith_refs_positional(a) {
                             param_vars.insert(t.var.clone());
                         }
@@ -42214,7 +42214,7 @@ fn walk_call_sites_expr(e: &IrExpr, name: &str, bigint: &BTreeSet<String>, ok: &
 /// bigint-typed var read).
 fn expr_is_bigint(e: &IrExpr, bigint: &BTreeSet<String>) -> bool {
     match e {
-        IrExpr::Arith(a) => crate::shir::arith_refs_bigint(a, bigint),
+        IrExpr::Arith(a, _) => crate::shir::arith_refs_bigint(a, bigint),
         IrExpr::Var(name, _) | IrExpr::Ident(name) => bigint.contains(name),
         IrExpr::Call { func, args } if func == "getVar" => {
             if let Some(IrExpr::Str(name, _)) = args.first() {
@@ -42409,7 +42409,7 @@ fn scan_bare_calls(top: &[IrStmt], defs: &BTreeMap<String, Vec<IrStmt>>) -> (BTr
             IrExpr::Int(_) | IrExpr::Bool(_) | IrExpr::Json(_) | IrExpr::Regex { .. }
             | IrExpr::Range { .. }
             | IrExpr::Str(_, _) | IrExpr::Var(_, _) | IrExpr::Ident(_)
-            | IrExpr::Arith(_) => {}
+            | IrExpr::Arith(_, _) => {}
             IrExpr::Object(props) => {
                 for (_, v) in props {
                     walk_expr(v, spawn, defs, out, bad);
@@ -42606,7 +42606,7 @@ fn pos_scan_expr(e: &IrExpr, spawn: bool, in_arith: bool, fname: &str, defs: &BT
             pos_scan_expr(rhs, spawn, false, fname, defs, st);
         }
         IrExpr::Index { key, .. } => pos_scan_expr(key, spawn, false, fname, defs, st),
-        IrExpr::Arith(a) => pos_scan_arith(a, fname, defs, st),
+        IrExpr::Arith(a, _) => pos_scan_arith(a, fname, defs, st),
         IrExpr::Capture { expr, .. } => pos_scan_expr(expr, true, false, fname, defs, st),
         IrExpr::Ternary { cond, then, else_ } => {
             pos_scan_expr(cond, spawn, false, fname, defs, st);
@@ -43421,7 +43421,7 @@ fn lic_writes_expr(e: &crate::ir::IrExpr, out: &mut LicSet<String>) -> Result<()
         }
         IrExpr::Capture { expr, .. } => lic_writes_expr(expr, out),
         IrExpr::Splice(x) => lic_writes_expr(x, out),
-        IrExpr::Arith(a) => lic_writes_arith(a, out),
+        IrExpr::Arith(a, _) => lic_writes_arith(a, out),
         IrExpr::Lambda { body, .. } => lic_writes_stmts(body, out),
         IrExpr::ArrayComp { .. } => Err(()),
         IrExpr::MethodCall { .. } => Err(()),
@@ -44193,7 +44193,7 @@ fn nonnull_written_word(ws: &str, out: &mut HashSet<String>) {
 /// printf -v / unset / read). Anything else is value-only.
 fn nonnull_written_expr(e: &IrExpr, out: &mut HashSet<String>) {
     match e {
-        IrExpr::Arith(a) => nonnull_written_arith(a, out),
+        IrExpr::Arith(a, _) => nonnull_written_arith(a, out),
         IrExpr::BinOp { lhs, rhs, .. } => {
             nonnull_written_expr(lhs, out);
             nonnull_written_expr(rhs, out);
@@ -44462,7 +44462,7 @@ fn count_writes_stmts(stmts: &[IrStmt], var: &str, count: &mut usize) {
 /// counting matches instead of collecting).
 fn count_writes_expr(e: &IrExpr, var: &str, count: &mut usize) {
     match e {
-        IrExpr::Arith(a) => count_writes_arith(a, var, count),
+        IrExpr::Arith(a, _) => count_writes_arith(a, var, count),
         IrExpr::BinOp { lhs, rhs, .. } => {
             count_writes_expr(lhs, var, count);
             count_writes_expr(rhs, var, count);
@@ -44752,7 +44752,7 @@ fn expr_refs_positional(e: &IrExpr) -> bool {
             }
             InterpPart::Expr(x) => expr_refs_positional(x),
         }),
-        IrExpr::Arith(a) => arith_refs_positional(a),
+        IrExpr::Arith(a, _) => arith_refs_positional(a),
         _ => false,
     }
 }
@@ -45254,7 +45254,7 @@ fn collect_const_reads_expr(e: &IrExpr, out: &mut BTreeSet<String>) {
             collect_const_reads_expr(lhs, out);
             collect_const_reads_expr(rhs, out);
         }
-        IrExpr::Arith(a) => collect_const_arith(a, out),
+        IrExpr::Arith(a, _) => collect_const_arith(a, out),
         IrExpr::Interpolate(parts) => {
             for p in parts {
                 if let InterpPart::Expr(x) = p {
@@ -45779,7 +45779,7 @@ fn resolve_const_operand(
             Ok(n) => Some(ConstVal::Int(n)),
             Err(_) => Some(ConstVal::Str(s.clone())),
         },
-        IrExpr::Arith(a) => match a.as_ref() {
+        IrExpr::Arith(a, _) => match a.as_ref() {
             ArithAst::Num(n) => Some(ConstVal::Int(*n)),
             ArithAst::Var(v) | ArithAst::Ident(v) => resolve_const_var(v, const_rhs),
             _ => None,
@@ -45802,7 +45802,7 @@ fn resolve_const_var(
             Ok(n) => Some(ConstVal::Int(n)),
             Err(_) => Some(ConstVal::Str(s.clone())),
         },
-        IrExpr::Arith(a) => match a.as_ref() {
+        IrExpr::Arith(a, _) => match a.as_ref() {
             ArithAst::Num(n) => Some(ConstVal::Int(*n)),
             _ => None,
         },
@@ -45822,7 +45822,7 @@ fn eval_const_cond(
     match e {
         IrExpr::Bool(b) => Some(*b),
         IrExpr::Int(i) => Some(*i != 0),
-        IrExpr::Arith(a) => eval_const_arith(a, const_rhs).map(|v| match v {
+        IrExpr::Arith(a, _) => eval_const_arith(a, const_rhs).map(|v| match v {
             ConstVal::Int(n) => n != 0,
             ConstVal::Str(s) => !s.is_empty(),
         }),
@@ -46577,7 +46577,7 @@ fn bc_lower_words(words: &[IrExpr]) -> Option<(IrExpr, Vec<(String, IrExpr)>, Op
                 lhs: Box::new(bc_operand_arith(&lhs)),
                 rhs: Box::new(bc_operand_arith(&rhs)),
             };
-            Some((IrExpr::Arith(Box::new(ast)), seen, None))
+            Some((IrExpr::Arith(Box::new(ast), None), seen, None))
         }
         BcNative::Sqrt { name, expr } => {
             if !bc_is_ident(&name) {
@@ -46585,7 +46585,7 @@ fn bc_lower_words(words: &[IrExpr]) -> Option<(IrExpr, Vec<(String, IrExpr)>, Op
             }
             let isqrt = IrExpr::Call {
                 func: "isqrt".to_string(),
-                args: vec![IrExpr::Arith(Box::new(ArithAst::Var(name.clone())))],
+                args: vec![IrExpr::Arith(Box::new(ArithAst::Var(name.clone())), None)],
             };
             Some((isqrt, vec![(name.clone(), expr)], Some(name)))
         }
@@ -46709,7 +46709,7 @@ fn fold_bc_arith_once(s: &IrStmt) -> Option<IrStmt> {
 /// stmt is the step (`v++` or `v = v + 1`) → a cstyleFor Call.
 fn fold_range_pair(a: &IrStmt, b: &IrStmt) -> Option<IrStmt> {
     let (v, a1) = match a {
-        IrStmt::Assign { targets, expr: IrExpr::Arith(a1), .. }
+        IrStmt::Assign { targets, expr: IrExpr::Arith(a1, _), .. }
             if targets.len() == 1 && targets[0].indices.is_empty() =>
         {
             (targets[0].var.clone(), a1)
@@ -46717,7 +46717,7 @@ fn fold_range_pair(a: &IrStmt, b: &IrStmt) -> Option<IrStmt> {
         _ => return None,
     };
     let (cond, body) = match b {
-        IrStmt::While { cond: IrExpr::Arith(c), body } => (c, body),
+        IrStmt::While { cond: IrExpr::Arith(c, _), body } => (c, body),
         _ => return None,
     };
     let (x, cmp) = match cond.as_ref() {
@@ -46729,11 +46729,11 @@ fn fold_range_pair(a: &IrStmt, b: &IrStmt) -> Option<IrStmt> {
     };
     let (step, body_rest) = body.split_last()?;
     let step_ok = match step {
-        IrStmt::Expr(IrExpr::Arith(a)) => match a.as_ref() {
+        IrStmt::Expr(IrExpr::Arith(a, _)) => match a.as_ref() {
             ArithAst::IncDec { var, delta, prefix: false } => *var == v && *delta == 1,
             _ => false,
         },
-        IrStmt::Assign { targets, expr: IrExpr::Arith(a), .. } => match a.as_ref() {
+        IrStmt::Assign { targets, expr: IrExpr::Arith(a, _), .. } => match a.as_ref() {
             ArithAst::Bin { op, lhs, rhs } => {
                 op == "+"
                     && targets.len() == 1
@@ -47263,7 +47263,7 @@ fn collect_array_expr(e: &IrExpr, out: &mut BTreeSet<String>) {
             collect_array_expr(lhs, out);
             collect_array_expr(rhs, out);
         }
-        IrExpr::Arith(a) => collect_array_arith(a, out),
+        IrExpr::Arith(a, _) => collect_array_arith(a, out),
         IrExpr::Interpolate(parts) => {
             for p in parts {
                 if let InterpPart::Expr(x) = p {
@@ -47694,7 +47694,7 @@ fn collect_store_expr(e: &IrExpr, out: &mut BTreeSet<String>) {
             collect_store_expr(lhs, out);
             collect_store_expr(rhs, out);
         }
-        IrExpr::Arith(a) => collect_store_arith(a, out),
+        IrExpr::Arith(a, _) => collect_store_arith(a, out),
         IrExpr::Interpolate(parts) => {
             for p in parts {
                 if let InterpPart::Expr(x) = p {
@@ -47969,7 +47969,7 @@ fn collect_bigint_consts(stmts: &[IrStmt], out: &mut BTreeSet<String>) {
 
 fn collect_bigint_consts_expr(e: &IrExpr, out: &mut BTreeSet<String>) {
     match e {
-        IrExpr::Arith(a) => {
+        IrExpr::Arith(a, _) => {
             if let Some(v) = Render::bigint_const_value(a) {
                 out.insert(v);
             }
@@ -48998,7 +48998,7 @@ fn collect_assigned_expr(e: &IrExpr, out: &mut BTreeSet<String>) {
                 out,
             );
         }
-        IrExpr::Arith(a) => collect_assigned_arith(a, out),
+        IrExpr::Arith(a, _) => collect_assigned_arith(a, out),
         // `local x=$1` / `export V=...` — the core spells declarations
         // as exec("local", ["x=", <value>]) calls; the fn hoist must
         // see these assigns or the var renders undeclared
@@ -49175,7 +49175,7 @@ fn collect_vars_expr(e: &IrExpr, out: &mut BTreeSet<String>) {
             collect_vars_expr(lhs, out);
             collect_vars_expr(rhs, out);
         }
-        IrExpr::Arith(a) => collect_vars_arith(a, out),
+        IrExpr::Arith(a, _) => collect_vars_arith(a, out),
         IrExpr::Interpolate(parts) => {
             for p in parts {
                 if let InterpPart::Expr(x) = p {
@@ -49864,7 +49864,7 @@ fn seed_loops_in_list(
                 IrStmt::While { cond, body },
             ) = (&stmts[i], &stmts[i + 1])
             {
-                if let (Some(t), IrExpr::Arith(a)) = (targets.first(), expr) {
+                if let (Some(t), IrExpr::Arith(a, _)) = (targets.first(), expr) {
                     if t.indices.is_empty() {
                         if let ArithAst::Num(lo) = a.as_ref() {
                             seed_while_loop_var(&t.var, *lo, cond, body, prog, ranges);
@@ -49934,7 +49934,7 @@ fn seed_while_loop_var(
 ) {
     // cond `v < b` / `v <= b` with ident bound
     let (cmp_lt, b) = match cond {
-        IrExpr::Arith(a) => match a.as_ref() {
+        IrExpr::Arith(a, _) => match a.as_ref() {
             ArithAst::Bin { op, lhs, rhs } => {
                 let vl = match lhs.as_ref() {
                     ArithAst::Var(n) | ArithAst::Ident(n) if n == v => true,
@@ -49956,7 +49956,7 @@ fn seed_while_loop_var(
     };
     // step `v++` / `++v` / `v += 1` as the last body stmt
     let step_ok = match body.last() {
-        Some(IrStmt::Expr(IrExpr::Arith(a))) => match a.as_ref() {
+        Some(IrStmt::Expr(IrExpr::Arith(a, _))) => match a.as_ref() {
             ArithAst::IncDec { var, delta, .. } => var == v && *delta == 1,
             ArithAst::Assign { var, op, rhs } => {
                 var == v
@@ -49966,7 +49966,7 @@ fn seed_while_loop_var(
             _ => false,
         },
         Some(IrStmt::Assign { targets, expr, .. }) => {
-            if let (Some(t), IrExpr::Arith(a)) = (targets.first(), expr) {
+            if let (Some(t), IrExpr::Arith(a, _)) = (targets.first(), expr) {
                 t.var == v
                     && t.indices.is_empty()
                     && matches!(a.as_ref(), ArithAst::Bin { op, lhs, rhs }
@@ -50065,7 +50065,7 @@ fn propagate_isqrt_derives(
     for s in stmts {
         match s {
             IrStmt::Assign { targets, expr, .. } => {
-                if let (Some(t), IrExpr::Arith(a)) = (targets.first(), expr) {
+                if let (Some(t), IrExpr::Arith(a, _)) = (targets.first(), expr) {
                     if t.indices.is_empty() {
                         if let Some((lo, hi)) = isqrt_derive_range(a, ranges) {
                             let (lo0, hi0) = ranges.get(&t.var).copied().unwrap_or((lo, hi));
@@ -50229,7 +50229,7 @@ fn bound_hi(e: &IrExpr, state: &HashMap<String, Option<(i128, i128)>>) -> Option
     match e {
         IrExpr::Int(i) => Some(*i as i128),
         IrExpr::Var(n, _) | IrExpr::Ident(n) => by_name(n),
-        IrExpr::Arith(a) => match &**a {
+        IrExpr::Arith(a, _) => match &**a {
             ArithAst::Num(n) => Some(*n as i128),
             ArithAst::Var(n) | ArithAst::Ident(n) => by_name(n),
             _ => None,
@@ -50259,7 +50259,7 @@ fn widen_counter_to_bound(
     }
     let counter = match &**lhs {
         IrExpr::Var(n, _) | IrExpr::Ident(n) => n,
-        IrExpr::Arith(a) => match &**a {
+        IrExpr::Arith(a, _) => match &**a {
             ArithAst::Var(n) | ArithAst::Ident(n) => n,
             _ => return,
         },
@@ -50313,7 +50313,7 @@ fn walk_widths_expr(
     widths: &mut HashMap<String, Width>,
 ) {
     match e {
-        IrExpr::Arith(a) => {
+        IrExpr::Arith(a, _) => {
             // comparisons only READ their operands (C promotes; cannot
             // wrap), so they neither constrain nor widen participant
             // widths — skip them. Forcing I64 here kept every compared
@@ -51122,14 +51122,14 @@ mod tests {
                         sigil: None,
                         indices: vec![],
                     }],
-                    expr: IrExpr::Arith(Box::new(pow)),
+                    expr: IrExpr::Arith(Box::new(pow), None),
                     asm: None,
                 },
                 IrStmt::Expr(IrExpr::Call {
                     func: "exec".to_string(),
                     args: vec![
                         IrExpr::Str("echo".to_string(), crate::ir::StrStyle::DoubleQuoted),
-                        IrExpr::Array(vec![IrExpr::Arith(Box::new(div))]),
+                        IrExpr::Array(vec![IrExpr::Arith(Box::new(div), None)]),
                     ],
                 }),
             ],
@@ -51185,7 +51185,7 @@ mod tests {
                             lhs: Box::new(ArithAst::Var("n".to_string())),
                             rhs: Box::new(ArithAst::Var("k".to_string())),
                         }),
-                    }))]),
+                    }), None)]),
                 ],
             })],
             subs: vec![],
@@ -51749,7 +51749,7 @@ mod tests {
             IrExpr::Capture {
                 expr: Box::new(IrExpr::Arith(Box::new(ArithAst::Var(
                     "1".to_string(),
-                )))),
+                )), None)),
                 native: false,
             },
         )];
@@ -51886,7 +51886,7 @@ mod tests {
                     vec![
                         void_assign(
                             "n",
-                            IrExpr::Arith(Box::new(crate::ir::ArithAst::Var("1".to_string()))),
+                            IrExpr::Arith(Box::new(crate::ir::ArithAst::Var("1".to_string())), None),
                         ),
                         void_bare_call("echo", vec![void_var("n")]),
                     ],
@@ -52101,7 +52101,7 @@ mod tests {
                 sigil: None,
                 indices: vec![],
             }],
-            expr: IrExpr::Arith(Box::new(a)),
+            expr: IrExpr::Arith(Box::new(a), None),
             asm: None,
         };
         let bin = |op: &str, l: A, r: A| A::Bin {
@@ -52194,7 +52194,7 @@ mod tests {
                 sigil: None,
                 indices: vec![],
             }],
-            expr: IrExpr::Arith(Box::new(a)),
+            expr: IrExpr::Arith(Box::new(a), None),
             asm: None,
         };
         // v = 5 — no bigint operand, range [5,5]: one native store.
@@ -52241,7 +52241,7 @@ mod tests {
                 sigil: None,
                 indices: vec![],
             }],
-            expr: IrExpr::Arith(Box::new(a)),
+            expr: IrExpr::Arith(Box::new(a), None),
             asm: None,
         };
         let bin = |op: &str, l: A, r: A| A::Bin {
@@ -52255,7 +52255,7 @@ mod tests {
             A::Num(1),
         );
         let mut prog = empty_prog(vec![IrStmt::While {
-            cond: IrExpr::Arith(Box::new(bin(">", cast(A::Var("v".into())), A::Num(1)))),
+            cond: IrExpr::Arith(Box::new(bin(">", cast(A::Var("v".into())), A::Num(1))), None),
             body: vec![
                 assign("v", growth),
                 assign("s", bin("+", A::Var("s".into()), A::Num(1))),
@@ -52306,7 +52306,7 @@ mod tests {
                 sigil: None,
                 indices: vec![],
             }],
-            expr: IrExpr::Arith(Box::new(a)),
+            expr: IrExpr::Arith(Box::new(a), None),
             asm: None,
         };
         let bin = |op: &str, l: A, r: A| A::Bin {
@@ -52316,7 +52316,7 @@ mod tests {
         };
         let v = |n: &str| cast(A::Var(n.to_string()));
         let mut prog = empty_prog(vec![IrStmt::While {
-            cond: IrExpr::Arith(Box::new(bin(">", v("v"), A::Num(1)))),
+            cond: IrExpr::Arith(Box::new(bin(">", v("v"), A::Num(1))), None),
             body: vec![
                 // v = 3*v + 1  (multiplicative growth)
                 assign("v", cast(bin("+", bin("*", v("v"), A::Num(3)), A::Num(1)))),
@@ -52374,7 +52374,7 @@ mod tests {
                 sigil: None,
                 indices: vec![],
             }],
-            expr: IrExpr::Arith(Box::new(a)),
+            expr: IrExpr::Arith(Box::new(a), None),
             asm: None,
         };
         let bin = |op: &str, l: A, r: A| A::Bin {
@@ -52387,7 +52387,7 @@ mod tests {
             assign("s", cast(A::Num(1))),
             assign("i", cast(A::Num(0))),
             IrStmt::While {
-                cond: IrExpr::Arith(Box::new(bin("<", cast(A::Var("i".into())), A::Num(5)))),
+                cond: IrExpr::Arith(Box::new(bin("<", cast(A::Var("i".into())), A::Num(5))), None),
                 body: vec![
                     assign(
                         "s",
@@ -52432,7 +52432,7 @@ mod tests {
                 args: vec![IrExpr::Arith(Box::new(A::Cast {
                     ty: crate::ir::IrType::Int64,
                     arg: Box::new(A::Num(16)),
-                }))],
+                }), None)],
             },
             asm: None,
         }]);
@@ -52459,7 +52459,7 @@ mod tests {
                 sigil: None,
                 indices: vec![],
             }],
-            expr: IrExpr::Arith(Box::new(a)),
+            expr: IrExpr::Arith(Box::new(a), None),
             asm: None,
         };
         let mut prog = empty_prog(vec![
@@ -52506,12 +52506,12 @@ mod tests {
             var: "a[0]".to_string(),
             delta: 1,
             prefix: false,
-        })));
+        }), None));
         let asg = IrStmt::Expr(IrExpr::Arith(Box::new(A::Assign {
             var: "a[0]".to_string(),
             op: "=".to_string(),
             rhs: Box::new(A::Num(1)),
-        })));
+        }), None));
         for stmt in [inc, asg] {
             let mut out = std::collections::BTreeSet::new();
             assert!(
@@ -52539,7 +52539,7 @@ mod tests {
                 sigil: None,
                 indices: vec![],
             }],
-            expr: IrExpr::Arith(Box::new(a)),
+            expr: IrExpr::Arith(Box::new(a), None),
             asm: None,
         };
         let bin = |op: &str, l: A, r: A| A::Bin {
@@ -52554,7 +52554,7 @@ mod tests {
                     "<",
                     cast(A::Var("s".into())),
                     A::Num(10),
-                ))),
+                )), None),
                 body: vec![
                     assign("s", cast(bin("+", cast(A::Var("s".into())), A::Num(1)))),
                     IrStmt::Assign {
@@ -52598,7 +52598,7 @@ mod tests {
                 sigil: None,
                 indices: vec![],
             }],
-            expr: IrExpr::Arith(Box::new(a)),
+            expr: IrExpr::Arith(Box::new(a), None),
             asm: None,
         };
         let echo_v = IrStmt::Expr(IrExpr::Call {
@@ -52705,7 +52705,7 @@ mod tests {
             imports: vec![],
             requires: vec![],
             stmts: vec![IrStmt::If {
-                cond: IrExpr::Arith(Box::new(cond)),
+                cond: IrExpr::Arith(Box::new(cond), None),
                 then: vec![IrStmt::Expr(IrExpr::Call {
                     func: "exec".to_string(),
                     args: vec![
@@ -52784,7 +52784,7 @@ mod tests {
                 func: "exec".to_string(),
                 args: vec![
                     IrExpr::Str("echo".to_string(), crate::ir::StrStyle::DoubleQuoted),
-                    IrExpr::Array(vec![IrExpr::Arith(Box::new(lit))]),
+                    IrExpr::Array(vec![IrExpr::Arith(Box::new(lit), None)]),
                 ],
             })],
             subs: vec![],
@@ -52856,7 +52856,7 @@ mod tests {
                 sigil: None,
                 indices: vec![],
             }],
-            expr: IrExpr::Arith(Box::new(rhs)),
+            expr: IrExpr::Arith(Box::new(rhs), None),
             asm: None,
         };
         let mul3 = ArithAst::Bin {
@@ -52945,7 +52945,7 @@ mod tests {
                 func: "exec".to_string(),
                 args: vec![
                     IrExpr::Str("echo".to_string(), crate::ir::StrStyle::DoubleQuoted),
-                    IrExpr::Array(vec![IrExpr::Arith(Box::new(expr))]),
+                    IrExpr::Array(vec![IrExpr::Arith(Box::new(expr), None)]),
                 ],
             })],
             subs: vec![],
@@ -52992,7 +52992,7 @@ mod tests {
                 func: "exec".to_string(),
                 args: vec![
                     IrExpr::Str("echo".to_string(), crate::ir::StrStyle::DoubleQuoted),
-                    IrExpr::Array(vec![IrExpr::Arith(Box::new(x))]),
+                    IrExpr::Array(vec![IrExpr::Arith(Box::new(x), None)]),
                 ],
             })],
             subs: vec![],
@@ -53043,7 +53043,7 @@ mod tests {
                     IrExpr::Str("echo".to_string(), crate::ir::StrStyle::DoubleQuoted),
                     IrExpr::Array(vec![
                         IrExpr::Str("v=".to_string(), crate::ir::StrStyle::DoubleQuoted),
-                        IrExpr::Arith(Box::new(add)),
+                        IrExpr::Arith(Box::new(add), None),
                     ]),
                 ],
             })],
@@ -53524,15 +53524,15 @@ mod tests {
                     op: "+".to_string(),
                     lhs: Box::new(ArithAst::Var("s".to_string())),
                     rhs: Box::new(ArithAst::Num(0)),
-                })),
+                }), None),
             ),
-            assign("i", IrExpr::Arith(Box::new(ArithAst::Num(1)))),
+            assign("i", IrExpr::Arith(Box::new(ArithAst::Num(1)), None)),
             IrStmt::While {
                 cond: IrExpr::Arith(Box::new(ArithAst::Bin {
                     op: "<".to_string(),
                     lhs: Box::new(ArithAst::Var("i".to_string())),
                     rhs: Box::new(ArithAst::Var("n".to_string())),
-                })),
+                }), None),
                 body: vec![],
             },
         ];
@@ -53602,7 +53602,7 @@ mod tests {
                         op: "+".to_string(),
                         lhs: Box::new(ArithAst::Var("s".to_string())),
                         rhs: Box::new(ArithAst::Num(0)),
-                    })),
+                    }), None),
                 ),
                 IrStmt::Expr(IrExpr::Call {
                     func: "exec".to_string(),
@@ -54191,7 +54191,7 @@ mod tests {
                 op: "<".to_string(),
                 lhs: Box::new(ArithAst::Var("u".to_string())),
                 rhs: Box::new(ArithAst::Var("v".to_string())),
-            })),
+            }), None),
             body: vec![vec_append_xs()],
         }];
         let out = shir_to_c(&vec_test_prog(body));
@@ -54307,7 +54307,7 @@ mod tests {
                 op: "<".to_string(),
                 lhs: Box::new(ArithAst::Var("u".to_string())),
                 rhs: Box::new(ArithAst::Var("v".to_string())),
-            })),
+            }), None),
             body,
         }
     }
@@ -54424,13 +54424,13 @@ mod tests {
                 op: ">=".to_string(),
                 lhs: Box::new(ArithAst::Var("i".to_string())),
                 rhs: Box::new(ArithAst::Num(3)),
-            }))),
+            }), None)),
             op: BinOpKind::Not,
             rhs: Box::new(IrExpr::Arith(Box::new(ArithAst::Bin {
                 op: ">=".to_string(),
                 lhs: Box::new(ArithAst::Var("i".to_string())),
                 rhs: Box::new(ArithAst::Num(3)),
-            }))),
+            }), None)),
         };
         let prog = IrProgram {
             imports: vec![],
@@ -54486,14 +54486,14 @@ mod tests {
                 sigil: None,
                 indices: vec![],
             }],
-            expr: IrExpr::Arith(Box::new(cast(ArithAst::Var(pos.to_string())))),
+            expr: IrExpr::Arith(Box::new(cast(ArithAst::Var(pos.to_string()))), None),
             asm: None,
         };
         let sum = IrExpr::Arith(Box::new(ArithAst::Bin {
             op: "+".to_string(),
             lhs: Box::new(ArithAst::Var("a".to_string())),
             rhs: Box::new(ArithAst::Var("b".to_string())),
-        }));
+        }), None);
         let prog = IrProgram {
             imports: vec![],
             requires: vec![],
@@ -54684,7 +54684,7 @@ mod tests {
                                 sigil: None,
                                 indices: vec![],
                             }],
-                            expr: IrExpr::Arith(Box::new(cast(ArithAst::Var("1".to_string())))),
+                            expr: IrExpr::Arith(Box::new(cast(ArithAst::Var("1".to_string()))), None),
                             asm: None,
                         },
                         IrStmt::Expr(IrExpr::Call {
@@ -54693,7 +54693,7 @@ mod tests {
                                 IrExpr::Str("echo".to_string(), StrStyle::DoubleQuoted),
                                 IrExpr::Array(vec![IrExpr::Arith(Box::new(cast(
                                     ArithAst::Var("n".to_string()),
-                                )))]),
+                                )), None)]),
                             ],
                         }),
                     ],
@@ -54747,7 +54747,7 @@ mod tests {
                                 sigil: None,
                                 indices: vec![],
                             }],
-                            expr: IrExpr::Arith(Box::new(cast(ArithAst::Var("1".to_string())))),
+                            expr: IrExpr::Arith(Box::new(cast(ArithAst::Var("1".to_string()))), None),
                             asm: None,
                         },
                         IrStmt::Expr(IrExpr::Call {
@@ -54978,7 +54978,7 @@ mod tests {
                         op: "+".to_string(),
                         lhs: Box::new(ArithAst::Var("_h".to_string())),
                         rhs: Box::new(ArithAst::Num(0)),
-                    })),
+                    }), None),
                     asm: None,
                 },
             ],
@@ -55009,7 +55009,7 @@ mod tests {
                     sigil: None,
                     indices: vec![],
                 }],
-                expr: IrExpr::Arith(Box::new(ArithAst::Num(n))),
+                expr: IrExpr::Arith(Box::new(ArithAst::Num(n)), None),
                 asm: None,
             }
         }
@@ -55040,7 +55040,7 @@ mod tests {
                         op: "+".to_string(),
                         lhs: Box::new(ArithAst::Var(s.to_string())),
                         rhs: Box::new(ArithAst::Num(0)),
-                    })),
+                    }), None),
                     asm: None,
                 },
             ]
@@ -55051,12 +55051,12 @@ mod tests {
                     op: "<".to_string(),
                     lhs: Box::new(ArithAst::Var(v.to_string())),
                     rhs: Box::new(ArithAst::Var(bound.to_string())),
-                })),
+                }), None),
                 body: vec![IrStmt::Expr(IrExpr::Arith(Box::new(ArithAst::IncDec {
                     var: v.to_string(),
                     delta: 1,
                     prefix: false,
-                })))],
+                }), None))],
             }
         }
         fn prog_of(stmts: Vec<IrStmt>) -> IrProgram {
@@ -55473,7 +55473,7 @@ mod tests {
                 op: "+".to_string(),
                 lhs: Box::new(crate::ir::ArithAst::Var(var.to_string())),
                 rhs: Box::new(crate::ir::ArithAst::Num(1)),
-            })),
+            }), None),
             asm: None,
         }
     }
@@ -55493,7 +55493,7 @@ mod tests {
             op: "<".to_string(),
             lhs: Box::new(A::Var("i".to_string())),
             rhs: Box::new(A::Var("n".to_string())),
-        }));
+        }), None);
         assert_eq!(
             counter_reserve_loop(&structured, &step),
             Some(("i".to_string(), "n".to_string(), "<".to_string())),
@@ -55507,7 +55507,7 @@ mod tests {
                 arg: Box::new(A::Var("i".to_string())),
             }),
             rhs: Box::new(A::Var("n".to_string())),
-        }));
+        }), None);
         assert!(counter_reserve_loop(&casted, &step).is_some());
         // the shell text form still resolves (A/B firewall)
         let text = IrExpr::Call {
@@ -55529,7 +55529,7 @@ mod tests {
             op: "<".to_string(),
             lhs: Box::new(A::Var("i".to_string())),
             rhs: Box::new(A::Num(5)),
-        }));
+        }), None);
         assert_eq!(counter_reserve_loop(&lit, &step), None);
     }
 
@@ -55661,7 +55661,7 @@ mod tests {
                 sigil: None,
                 indices: vec![],
             }],
-            expr: IrExpr::Arith(Box::new(a)),
+            expr: IrExpr::Arith(Box::new(a), None),
             asm: None,
         }
     }
@@ -55868,7 +55868,7 @@ mod tests {
                         rhs: Box::new(A::Var("i".to_string())),
                     }),
                     rhs: Box::new(A::Num(251)),
-                })),
+                }), None),
                 asm: None,
             });
         }
@@ -55910,7 +55910,7 @@ mod tests {
         let mut prog = ver_forinit_mod();
         if let IrStmt::ForInit { body, .. } = &mut prog.stmts[0] {
             if let IrStmt::Assign { expr, .. } = &mut body[0] {
-                if let IrExpr::Arith(a) = expr {
+                if let IrExpr::Arith(a, _) = expr {
                     if let A::Bin { lhs, .. } = a.as_mut() {
                         if let A::Bin { lhs: l2, rhs: r2, .. } = lhs.as_mut() {
                             *l2 = Box::new(A::Var("w".to_string()));
@@ -55979,7 +55979,7 @@ mod tests {
                     rhs: Box::new(A::Var("i".to_string())),
                 }),
                 rhs: Box::new(A::Num(256)),
-            })),
+            }), None),
             asm: None,
         };
         let m = ver_accums(std::slice::from_ref(&acc_assign), "i", "n");
@@ -55995,7 +55995,7 @@ mod tests {
                 op: "%".to_string(),
                 lhs: Box::new(A::Var("i".to_string())),
                 rhs: Box::new(A::Num(8)),
-            })),
+            }), None),
             asm: None,
         };
         let m2 = ver_accums(std::slice::from_ref(&ci), "i", "n");
@@ -56193,7 +56193,7 @@ mod tests {
                     var: "n".to_string(),
                     op: "+=".to_string(),
                     rhs: Box::new(crate::ir::ArithAst::Num(1)),
-                })),
+                }), None),
                 asm: None,
             });
         }
@@ -56313,7 +56313,7 @@ mod tests {
                         var: "i".to_string(),
                         op: "=".to_string(),
                         rhs: Box::new(crate::ir::ArithAst::Num(init_val)),
-                    })),
+                    }), None),
                     asm: None,
                 }],
                 cond: IrExpr::Call {
@@ -56482,14 +56482,14 @@ mod tests {
                         sigil: None,
                         indices: vec![],
                     }],
-                    expr: IrExpr::Arith(Box::new(ArithAst::Var("1".to_string()))),
+                    expr: IrExpr::Arith(Box::new(ArithAst::Var("1".to_string())), None),
                     asm: None,
                 },
                 IrStmt::Expr(IrExpr::Arith(Box::new(ArithAst::Bin {
                     op: "%".to_string(),
                     lhs: Box::new(ArithAst::Var("1".to_string())),
                     rhs: Box::new(ArithAst::Var("i".to_string())),
-                }))),
+                }), None)),
             ]
         }
         let mut vt = HashMap::new();
@@ -56519,7 +56519,7 @@ mod tests {
         let mut body = copy_body();
         body.insert(
             0,
-            IrStmt::Expr(IrExpr::Arith(Box::new(ArithAst::Var("1".to_string())))),
+            IrStmt::Expr(IrExpr::Arith(Box::new(ArithAst::Var("1".to_string())), None)),
         );
         let (alias, _) = Render::param_copy_alias(&vt, &body, 1);
         assert!(alias.is_empty(), "pre-copy read aliased: {alias:?}");
@@ -56557,7 +56557,7 @@ mod tests {
             assign("_t", IrExpr::Int(3)),
             assign(
                 "shared",
-                IrExpr::Arith(Box::new(ArithAst::Var("_t".to_string()))),
+                IrExpr::Arith(Box::new(ArithAst::Var("_t".to_string())), None),
             ),
         ];
         let top = vec![
@@ -56577,7 +56577,7 @@ mod tests {
             assign("_t", IrExpr::Int(3)),
             assign(
                 "shared",
-                IrExpr::Arith(Box::new(ArithAst::Var("_t".to_string()))),
+                IrExpr::Arith(Box::new(ArithAst::Var("_t".to_string())), None),
             ),
         ])];
         let (m, _) = Render::fn_private_vars(&top, &[], &fns, &vt, &HashSet::new());
@@ -56675,7 +56675,7 @@ mod tests {
                     op: "+".to_string(),
                     lhs: Box::new(crate::ir::ArithAst::Var("_t".to_string())),
                     rhs: Box::new(crate::ir::ArithAst::Num(1)),
-                })),
+                }), None),
             ),
             echo_var("_t"),
         ]));
@@ -56899,7 +56899,7 @@ mod tests {
                 op: op.to_string(),
                 lhs: Box::new(ArithAst::Var(var.to_string())),
                 rhs: Box::new(ArithAst::Num(n)),
-            })),
+            }), None),
             asm: None,
         };
         let mut r = Render::default();
@@ -57825,7 +57825,7 @@ mod tests {
             op: "*".to_string(),
             lhs: Box::new(ArithAst::Var("i".to_string())),
             rhs: Box::new(ArithAst::Var("i".to_string())),
-        }));
+        }), None);
         assert_eq!(r.num_spec(&e), NumSpec::Num("%u", false));
     }
 
@@ -57841,7 +57841,7 @@ mod tests {
             op: "*".to_string(),
             lhs: Box::new(ArithAst::Var("i".to_string())),
             rhs: Box::new(ArithAst::Var("n".to_string())),
-        }));
+        }), None);
         assert_eq!(r.num_spec(&e), NumSpec::Num("%lld", true));
     }
 

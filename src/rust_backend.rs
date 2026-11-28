@@ -565,7 +565,7 @@ fn int_index_arrays(prog: &IrProgram) -> BTreeSet<String> {
             }
             IrExpr::DefinedOr { expr, default } => key_clean(expr) && key_clean(default),
             IrExpr::Capture { expr, .. } => key_clean(expr),
-            IrExpr::Arith(a) => arith_clean(a),
+            IrExpr::Arith(a, _) => arith_clean(a),
             IrExpr::Object(props) => props.iter().all(|(_, v)| key_clean(v)),
             IrExpr::Splice(x) => key_clean(x),
             _ => true,
@@ -661,7 +661,7 @@ fn int_index_arrays(prog: &IrProgram) -> BTreeSet<String> {
                 scan_expr(default, acc);
             }
             IrExpr::Capture { expr, .. } => scan_expr(expr, acc),
-            IrExpr::Arith(a) => scan_arith(a, acc),
+            IrExpr::Arith(a, _) => scan_arith(a, acc),
             IrExpr::Object(props) => {
                 for (_, v) in props {
                     scan_expr(v, acc);
@@ -5827,7 +5827,7 @@ impl Render {
             IrExpr::Int(_) => true,
             IrExpr::Str(s, _) => s.trim().parse::<i64>().is_ok(),
             IrExpr::Var(name, _) => self.is_num(name),
-            IrExpr::Arith(_) => true,
+            IrExpr::Arith(_, _) => true,
             IrExpr::BinOp { op, .. } => !matches!(op, BinOpKind::Concat),
             IrExpr::Call { func, args } if func == "getVar" => {
                 matches!(args.first(), Some(IrExpr::Str(name, _)) if self.is_num(name))
@@ -5882,7 +5882,7 @@ impl Render {
                     self.getvar_num(name)
                 }
             }
-            IrExpr::Arith(a) => self.arith(a),
+            IrExpr::Arith(a, _) => self.arith(a),
             IrExpr::Bool(b) => {
                 if *b { "1".into() } else { "0".into() }
             }
@@ -6003,7 +6003,7 @@ impl Render {
                 // node — no arith-string detour). CPython parity:
                 // trunc(sqrt(x)) in doubles.
                 match args.first() {
-                    Some(IrExpr::Arith(a)) => {
+                    Some(IrExpr::Arith(a, _)) => {
                         format!("({} as f64).sqrt() as i64", self.arith(a))
                     }
                     _ => "0".to_string(),
@@ -6048,7 +6048,7 @@ impl Render {
     /// `IrExpr::Arith` node, or the shared `arith(…)` text-evaluation
     /// CALL the typeset-attrs transform builds (`int(arith("n+1"))`).
     fn is_arith_operand(e: &IrExpr) -> bool {
-        matches!(e, IrExpr::Arith(_))
+        matches!(e, IrExpr::Arith(_, _))
             || matches!(e, IrExpr::Call { func: f, .. } if f.as_str() == "arith")
     }
 
@@ -6071,7 +6071,7 @@ impl Render {
                 }
             }
             IrExpr::Interpolate(parts) => self.interpolate(parts),
-            IrExpr::Arith(a) => self.arith_str(a),
+            IrExpr::Arith(a, _) => self.arith_str(a),
             IrExpr::Bool(b) => {
                 if *b { "(true).to_string()".into() } else { "(false).to_string()".into() }
             }
@@ -6777,7 +6777,7 @@ while __sh_path.len() > 1 && __sh_path.ends_with('/') {{ __sh_path = &__sh_path[
                         use num_bigint::BigInt;
                         fn is_big(e: &IrExpr, big: &BTreeSet<String>) -> bool {
                             match e {
-                                IrExpr::Arith(a) => {
+                                IrExpr::Arith(a, _) => {
                                     let tainted = arith_uses_bigint(a, big);
                                     let huge = eval_arith_bigint(a)
                                         .map(|v| {
@@ -6792,14 +6792,14 @@ while __sh_path.len() > 1 && __sh_path.ends_with('/') {{ __sh_path = &__sh_path[
                         }
                         if is_big(lhs.as_ref(), &self.bigint_vars) || is_big(rhs.as_ref(), &self.bigint_vars) {
                             let lb = match lhs.as_ref() {
-                                IrExpr::Arith(a) => self.arith_bigint(a),
+                                IrExpr::Arith(a, _) => self.arith_bigint(a),
                                 _ => {
                                     let s = self.expr_str(lhs);
                                     format!("({s}.trim().parse::<num_bigint::BigInt>().unwrap_or(num_bigint::BigInt::from(0)))")
                                 }
                             };
                             let rb = match rhs.as_ref() {
-                                IrExpr::Arith(a) => self.arith_bigint(a),
+                                IrExpr::Arith(a, _) => self.arith_bigint(a),
                                 _ => {
                                     let s = self.expr_str(rhs);
                                     format!("({s}.trim().parse::<num_bigint::BigInt>().unwrap_or(num_bigint::BigInt::from(0)))")
@@ -6837,7 +6837,7 @@ while __sh_path.len() > 1 && __sh_path.ends_with('/') {{ __sh_path = &__sh_path[
                     self.fs_pred_bool(n.as_ref()),
                 _other => format!("({} != 0)", self.expr_num(e)),
             },
-            IrExpr::Arith(a) => self.arith_bool(a),
+            IrExpr::Arith(a, _) => self.arith_bool(a),
             IrExpr::Call { func, args } if func == "test" => self.test_call_bool(args),
             // `caseMatch(value, [patterns])` (py startswith/in, t68):
             // true if ANY pattern fnmatches (shared glob helper).
@@ -7079,7 +7079,7 @@ while __sh_path.len() > 1 && __sh_path.ends_with('/') {{ __sh_path = &__sh_path[
                     self.expr_num(rhs)
                 )
             }
-            IrExpr::Arith(a) => self.arith_str(a),
+            IrExpr::Arith(a, _) => self.arith_str(a),
             IrExpr::Interpolate(parts) => self.interpolate(parts),
             IrExpr::Ternary { cond, then, else_ } => format!(
                 "(if {} {{ {} }} else {{ {} }})",
@@ -9700,7 +9700,7 @@ while __sh_path.len() > 1 && __sh_path.ends_with('/') {{ __sh_path = &__sh_path[
                     Self::rust_str(&x.delim)
                 )
             }
-            IrExpr::Arith(a) => {
+            IrExpr::Arith(a, _) => {
                 // BigInt domain (tainted/huge) → decimal string (t87).
                 let tainted = arith_uses_bigint(a, &self.bigint_vars);
                 let huge = eval_arith_bigint(a)
@@ -12224,7 +12224,7 @@ while __sh_path.len() > 1 && __sh_path.ends_with('/') {{ __sh_path = &__sh_path[
     fn word_is_numeric(&self, e: &IrExpr) -> bool {
         match e {
             IrExpr::Int(_) => true,
-            IrExpr::Arith(_) => true,
+            IrExpr::Arith(_, _) => true,
             IrExpr::Var(name, _) | IrExpr::Ident(name) => self.is_num(name),
             // an int-homed local array's element is already i64
             IrExpr::Index { var, .. } => {
@@ -14105,11 +14105,11 @@ while __sh_path.len() > 1 && __sh_path.ends_with('/') {{ __sh_path = &__sh_path[
                     // __SH_ARITH_ERR flag (checked div/mod) maps to rc
                     // exactly as the string path does: error -> 0 -> rc 1.
                     let (is_i64, x) = match expr {
-                        IrExpr::Arith(a) => (true, self.arith(a)),
+                        IrExpr::Arith(a, _) => (true, self.arith(a)),
                         e => (false, self.expr_any(e)),
                     };
                     let arith_writes_target = match expr {
-                        IrExpr::Arith(a) => {
+                        IrExpr::Arith(a, _) => {
                             if let Some(t) = targets.first() {
                                 let tvar = t.var.split('[').next().unwrap_or(&t.var).to_string();
                                 if !t.var.contains('[') {
@@ -14174,7 +14174,7 @@ while __sh_path.len() > 1 && __sh_path.ends_with('/') {{ __sh_path = &__sh_path[
                     }
                     return;
                 }
-                let rhs = if let IrExpr::Arith(a) = expr {
+                let rhs = if let IrExpr::Arith(a, _) = expr {
                     // BigInt domain (tainted/huge) → decimal string (t87).
                     // (Checked before i64 path; flag-checked like below.)
                     {
@@ -20337,7 +20337,7 @@ fn split_ident_rest(t: &str) -> Option<(&str, &str)> {
 fn collect_numeric_positionals(stmts: &[IrStmt], out: &mut BTreeSet<String>) {
     fn walk_e(e: &IrExpr, out: &mut BTreeSet<String>) {
         match e {
-            IrExpr::Arith(a) => walk_a(a, out),
+            IrExpr::Arith(a, _) => walk_a(a, out),
             IrExpr::Call { args, .. } => {
                 for a in args {
                     walk_e(a, out);
@@ -21007,7 +21007,7 @@ fn collect_written_expr(e: &IrExpr, out: &mut BTreeSet<String>) {
             collect_written_expr(lhs, out);
             collect_written_expr(rhs, out);
         }
-        IrExpr::Arith(a) => collect_written_arith(a, out),
+        IrExpr::Arith(a, _) => collect_written_arith(a, out),
         IrExpr::Interpolate(parts) => {
             for p in parts {
                 if let InterpPart::Expr(x) = p {
@@ -21273,7 +21273,7 @@ fn collect_huge_literal_assigns(stmts: &[IrStmt], out: &mut BTreeSet<String>) {
                 }
                 false
             }
-            IrExpr::Arith(a) => eval_arith_bigint(a)
+            IrExpr::Arith(a, _) => eval_arith_bigint(a)
                 .map(|v| {
                     v > BigInt::from(i64::MAX) || v < BigInt::from(i64::MIN)
                 })
@@ -21343,14 +21343,14 @@ fn walk_bigint_expr(e: &IrExpr, out: &mut BTreeSet<String>, changed: &mut bool) 
         // for any huge arithmetic anywhere in the program, so one
         // `f $((2**64))` turned every positional read in every function
         // into BigInt.
-        IrExpr::Arith(_) => {}
+        IrExpr::Arith(_, _) => {}
         IrExpr::Call { func, args } if func == "fnCall" || func == "fnValue" => {
             // args[0] = name, args[1] = Array of arg exprs? Or... check shape.
             // (Determine at runtime via debug? Assume [name, Array] like fn_call_stmt.)
             if let Some(IrExpr::Array(items)) = args.get(1) {
                 for (idx, arg) in items.iter().enumerate() {
                     let huge = match arg {
-                        IrExpr::Arith(a) => eval_arith_bigint(a)
+                        IrExpr::Arith(a, _) => eval_arith_bigint(a)
                             .map(|v| {
                                 v > BigInt::from(i64::MAX) || v < BigInt::from(i64::MIN)
                             })
@@ -21399,7 +21399,7 @@ fn walk_bigint_stmts(ss: &[IrStmt], out: &mut BTreeSet<String>, changed: &mut bo
     for s in ss {
         match s {
             IrStmt::Assign { targets, expr, .. } => {
-                if let IrExpr::Arith(a) = expr {
+                if let IrExpr::Arith(a, _) = expr {
                     for t in targets {
                         if t.indices.is_empty() && !out.contains(&t.var) {
                             let huge = eval_arith_bigint(a)
@@ -21817,7 +21817,7 @@ fn collect_arrays_expr(e: &IrExpr, arrays: &mut BTreeSet<String>, assoc: &mut BT
                 }
             }
         }
-        IrExpr::Arith(a) => collect_arrays_arith(a, arrays, assoc),
+        IrExpr::Arith(a, _) => collect_arrays_arith(a, arrays, assoc),
         IrExpr::Arrow(stmts) => collect_arrays(stmts, arrays, assoc),
         IrExpr::Capture { expr, .. } => {
             if let IrExpr::Arrow(stmts) = expr.as_ref() {
@@ -21831,7 +21831,7 @@ fn collect_arrays_expr(e: &IrExpr, arrays: &mut BTreeSet<String>, assoc: &mut BT
 /// `name[` inside a let/arith TEXT → the var name (hoisted arrays).
 fn arith_has_side_effects(e: &IrExpr) -> bool {
     match e {
-        IrExpr::Arith(a) => arith_side_effects(a),
+        IrExpr::Arith(a, _) => arith_side_effects(a),
         IrExpr::Call { func, args: _ } if func == "assign" => true,
         IrExpr::Call { func, args } if func == "arith" => args.iter().any(|a| {
             matches!(a, IrExpr::Str(s, _) if s.contains('=') || s.contains("++") || s.contains("--"))
@@ -22511,7 +22511,7 @@ fn loop_var_scan_expr(e: &IrExpr, var: &str, u: &mut LoopVarUse) {
                 loop_var_scan_expr(c, var, u);
             }
         }
-        IrExpr::Arith(a) => loop_var_scan_arith(a, var, u),
+        IrExpr::Arith(a, _) => loop_var_scan_arith(a, var, u),
         IrExpr::Object(props) => {
             for (_, v) in props {
                 loop_var_scan_expr(v, var, u);
@@ -22959,7 +22959,7 @@ fn scan_arith(a: &ArithAst, var: &str, ev: &mut Vec<bool>, muted: bool) {
 
 fn scan_expr(e: &IrExpr, var: &str, ev: &mut Vec<bool>, muted: bool) {
     match e {
-        IrExpr::Arith(a) => scan_arith(a, var, ev, muted),
+        IrExpr::Arith(a, _) => scan_arith(a, var, ev, muted),
         // A transform-declared node is opaque to a plain `match`, but its
         // children are ordinary reads: `${v:0:2}` becomes
         // SubStrExtract(Var v), and `x=$(… | wc -l)` becomes RegCount(text).
@@ -23450,7 +23450,7 @@ fn function_reachable_vars(prog: &IrProgram) -> BTreeSet<String> {
                 expr(d, out);
             }
             IrExpr::Capture { expr: x, .. } => expr(x, out),
-            IrExpr::Arith(a) => arith(a, out),
+            IrExpr::Arith(a, _) => arith(a, out),
             IrExpr::Object(props) => {
                 for (_, v) in props {
                     expr(v, out);
@@ -24231,7 +24231,7 @@ fn collect_reads_expr(e: &IrExpr, out: &mut BTreeSet<String>) {
             collect_reads_expr(lhs, out);
             collect_reads_expr(rhs, out);
         }
-        IrExpr::Arith(a) => collect_reads_arith(a, out),
+        IrExpr::Arith(a, _) => collect_reads_arith(a, out),
         IrExpr::Interpolate(parts) => {
             for p in parts {
                 if let InterpPart::Expr(x) = p {
@@ -24475,7 +24475,7 @@ mod tests {
                     op: "+".to_string(),
                     lhs: Box::new(crate::ir::ArithAst::Var("n".to_string())),
                     rhs: Box::new(crate::ir::ArithAst::Num(1)),
-                }))),
+                }), None)),
                 IrStmt::Expr(IrExpr::Call {
                     func: "echo".to_string(),
                     args: vec![IrExpr::Var("x".to_string(), None)],
@@ -24526,7 +24526,7 @@ mod tests {
                 op: "**".to_string(),
                 lhs: Box::new(ArithAst::Num(2)),
                 rhs: Box::new(ArithAst::Num(v)),
-            }))
+            }), None)
         }
         // `echo $((2**64))` — no call, so no positional can hold the value
         let echo_only = IrExpr::Call {

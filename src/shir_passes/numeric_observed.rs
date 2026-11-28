@@ -484,7 +484,7 @@ impl Collector {
 
     /// Condition: arith → numeric; `test` → numeric-op detection; else text.
     fn walk_cond(&mut self, cond: &IrExpr, enc: Option<&str>) {
-        if let IrExpr::Arith(a) = cond {
+        if let IrExpr::Arith(a, _) = cond {
             self.walk_arith(a, enc);
             return;
         }
@@ -535,7 +535,7 @@ impl Collector {
                 }
             }
             IrExpr::Int(_) | IrExpr::Bool(_) | IrExpr::Json(_) => {}
-            IrExpr::Arith(a) => self.walk_arith(a, enc),
+            IrExpr::Arith(a, _) => self.walk_arith(a, enc),
             IrExpr::Index { var, key } => {
                 // `A[key]` element read flows to sink; key numeric.
                 self.read_array(var, sink);

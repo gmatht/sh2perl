@@ -181,7 +181,7 @@ fn expr_purity(e: &IrExpr, fns: &HashMap<String, FnInfo>) -> Purity {
         IrExpr::Int(_) | IrExpr::Str(_, _) | IrExpr::Var(_, _) | IrExpr::Ident(_)
         | IrExpr::Bool(_) | IrExpr::Json(_) | IrExpr::RawExpr(_) | IrExpr::Regex { .. }
         | IrExpr::Range { .. } => Purity::Pure,
-        IrExpr::Arith(a) => arith_purity(a),
+        IrExpr::Arith(a, _) => arith_purity(a),
         IrExpr::BinOp { lhs, rhs, .. } => expr_purity(lhs, fns).min(expr_purity(rhs, fns)),
         IrExpr::Ternary { cond, then, else_ } => expr_purity(cond, fns)
             .min(expr_purity(then, fns))
@@ -418,7 +418,7 @@ fn collect_expr_reads(e: &IrExpr, fns: &HashMap<String, FnInfo>, out: &mut HashS
             }
         }
         IrExpr::Splice(inner) => collect_expr_reads(inner, fns, out),
-        IrExpr::Arith(a) => collect_arith_reads(a, out),
+        IrExpr::Arith(a, _) => collect_arith_reads(a, out),
         IrExpr::Ext(_) => (),
         IrExpr::Object(pairs) => {
             for (_, v) in pairs {
@@ -571,7 +571,7 @@ fn collect_stmt_writes(st: &IrStmt, fns: &HashMap<String, FnInfo>, out: &mut Has
                     out.insert(t.var[..b].to_string());
                 }
             }
-            if let IrExpr::Arith(a) = expr {
+            if let IrExpr::Arith(a, _) = expr {
                 collect_arith_writes(a, out);
             }
         }
@@ -732,7 +732,7 @@ fn expr_has_status(e: &IrExpr) -> bool {
                 InterpPart::Expr(x) => expr_has_status(x),
             })
         }
-        IrExpr::Arith(a) => arith_has_status(a),
+        IrExpr::Arith(a, _) => arith_has_status(a),
         IrExpr::Call { func, args } => {
             matches!(func.as_str(), "lastStatus" | "lastexit" | "status" | "getStatus")
                 || args.iter().any(expr_has_status)
@@ -997,7 +997,7 @@ mod tests {
     }
 
     fn arith(ast: ArithAst) -> IrExpr {
-        IrExpr::Arith(Box::new(ast))
+        IrExpr::Arith(Box::new(ast), None)
     }
 
     fn int(i: i64) -> IrExpr {

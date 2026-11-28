@@ -265,7 +265,7 @@ pub fn acc_vars_tree(stmts: &[IrStmt]) -> Vec<String> {
                 // target(s) through the numeric arith path (unhooked by the
                 // C store funnels) — refuse everything it can touch.
                 IrStmt::Assign {
-                    expr: IrExpr::Arith(a),
+                    expr: IrExpr::Arith(a, _),
                     ..
                 } => {
                     crate::c_backend::nonnull_written_arith(a, refused);
@@ -738,7 +738,7 @@ fn expr_read_walk(e: &IrExpr, var: &str, found: &mut bool) {
                 expr_read_walk(a, var, found);
             }
         }
-        IrExpr::Arith(a) => arith_read_walk(a, var, found),
+        IrExpr::Arith(a, _) => arith_read_walk(a, var, found),
         IrExpr::ArrayComp { iter, elem, cond, .. } => {
             expr_read_walk(iter, var, found);
             expr_read_walk(elem, var, found);
@@ -1127,7 +1127,7 @@ mod tests {
                     InterpPart::Expr(Box::new(get("x"))),
                 ]),
             ),
-            assign("n", IrExpr::Arith(Box::new(ArithAst::Var("tsv".into())))),
+            assign("n", IrExpr::Arith(Box::new(ArithAst::Var("tsv".into())), None)),
         ];
         assert!(body_reads_var_nonleading(&body, "tsv"), "arith read is a mid-loop read");
         let mut stmts = vec![
@@ -1175,7 +1175,7 @@ mod tests {
                 var: "tsv".into(),
                 delta: 1,
                 prefix: false,
-            }))),
+            }), None)),
         ];
         assert!(self_append_vars(&body).is_empty(), "((tsv++)) is a second write");
     }

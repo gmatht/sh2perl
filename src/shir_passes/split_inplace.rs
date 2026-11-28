@@ -259,7 +259,7 @@ fn expr_rw(e: &IrExpr, r: &mut Vec<String>, w: &mut Vec<String>, wild: &mut bool
                 stmt_rw(b, r, w, wild);
             }
         }
-        IrExpr::Arith(a) => arith_rw(a, r, w),
+        IrExpr::Arith(a, _) => arith_rw(a, r, w),
         IrExpr::Json(_) | IrExpr::Object(_) => {
             // estree-path payloads: uninspectable here → refuse
             *wild = true;

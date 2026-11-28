@@ -1171,7 +1171,7 @@ fn expr_from(v: &Value, where_: &str) -> Result<IrExpr, String> {
         }
         "Arith" => {
             let ast = arith_from(req(o, "ast", where_)?, &format!("{where_}.ast"))?;
-            IrExpr::Arith(Box::new(ast))
+            IrExpr::Arith(Box::new(ast), None)
         }
         "Bool" => {
             let value = req_bool(o, "value", where_)?;
@@ -1791,7 +1791,7 @@ mod tests {
                     expr: IrExpr::Arith(Box::new(ArithAst::Cast {
                         ty,
                         arg: Box::new(ArithAst::Sizeof(ty)),
-                    })),
+                    }), None),
                     asm: None,
                 }],
                 subs: vec![],
@@ -1825,7 +1825,7 @@ mod tests {
                 matches!(
                     prog3.stmts.first(),
                     Some(IrStmt::Assign { expr, .. })
-                        if matches!(expr, IrExpr::Arith(a)
+                        if matches!(expr, IrExpr::Arith(a, _)
                             if matches!(a.as_ref(), ArithAst::Cast { ty: t, .. } if *t == ty))
                 ),
                 "Cast node lost in round-trip"
@@ -1853,19 +1853,19 @@ mod tests {
                         sigil: None,
                         indices: vec![],
                     }],
-                    expr: IrExpr::Arith(Box::new(ArithAst::Num(0))),
+                    expr: IrExpr::Arith(Box::new(ArithAst::Num(0)), None),
                     asm: None,
                 }],
                 cond: IrExpr::Arith(Box::new(ArithAst::Bin {
                     op: "Lt".to_string(),
                     lhs: Box::new(ArithAst::Var("i".to_string())),
                     rhs: Box::new(ArithAst::Num(3)),
-                })),
+                }), None),
                 step: vec![IrStmt::Expr(IrExpr::Arith(Box::new(ArithAst::IncDec {
                     var: "i".to_string(),
                     delta: 1,
                     prefix: false,
-                })))],
+                }), None))],
                 body: vec![IrStmt::Expr(IrExpr::Ident("echo_i".to_string()))],
             }],
             subs: vec![],
@@ -1892,7 +1892,7 @@ mod tests {
                 Some(IrStmt::ForInit { cond, step, body, .. })
                     if step.len() == 1
                         && body.len() == 1
-                        && matches!(cond, IrExpr::Arith(a)
+                        && matches!(cond, IrExpr::Arith(a, _)
                             if matches!(a.as_ref(), ArithAst::Bin { op, .. } if op == "Lt"))
             ),
             "ForInit node lost in round-trip"
@@ -2517,7 +2517,7 @@ mod tests {
         let IrExpr::Array(elems) = &args[1] else {
             panic!("not an Array arg");
         };
-        let IrExpr::Arith(ast) = &elems[0] else {
+        let IrExpr::Arith(ast, _) = &elems[0] else {
             panic!("not an Arith element");
         };
         assert!(

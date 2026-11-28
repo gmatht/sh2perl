@@ -757,7 +757,7 @@ fn numeric_operand(e: &str) -> Option<IrExpr> {
         .and_then(|x| x.strip_suffix(')'))
     {
         let ast = crate::shir::parse_arith_native(a)?;
-        return Some(IrExpr::Arith(Box::new(ast)));
+        return Some(IrExpr::Arith(Box::new(ast), None));
     }
     if let Some(name) = inner.strip_prefix('$') {
         // `${name}` and `$name` are the same read.
@@ -768,7 +768,7 @@ fn numeric_operand(e: &str) -> Option<IrExpr> {
         if is_plain_ident(name) {
             return Some(IrExpr::Arith(Box::new(crate::ir::ArithAst::Var(
                 name.to_string(),
-            ))));
+            )), None));
         }
         return None;
     }
@@ -784,7 +784,7 @@ fn numeric_operand(e: &str) -> Option<IrExpr> {
     {
         return Some(IrExpr::Arith(Box::new(crate::ir::ArithAst::Num(
             inner.parse::<i64>().ok()?,
-        ))));
+        )), None));
     }
     None
 }

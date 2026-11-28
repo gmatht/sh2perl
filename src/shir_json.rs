@@ -494,7 +494,7 @@ fn expr_json(e: &IrExpr) -> Value {
         IrExpr::Array(items) => json!({
             "type": "Array", "elements": items.iter().map(expr_json).collect::<Vec<_>>(),
         }),
-        IrExpr::Arith(a) => json!({ "type": "Arith", "ast": arith_json(a) }),
+        IrExpr::Arith(a, _) => json!({ "type": "Arith", "ast": arith_json(a) }),
         IrExpr::Bool(b) => json!({ "type": "Bool", "value": b }),
         IrExpr::Json(v) => json!({ "type": "Json", "value": v }),
         IrExpr::Ident(name) => json!({ "type": "Ident", "name": name }),
@@ -863,7 +863,7 @@ fn rewrite_stmt_arith_ident(stmt: &mut IrStmt, var: &str) {
 /// the structural walk for nested `IrStmt::For` handling is needed).
 fn rewrite_expr_arith_ident(e: &mut IrExpr, var: &Option<String>) {
     match e {
-        IrExpr::Arith(a) => {
+        IrExpr::Arith(a, _) => {
             if let Some(v) = var {
                 rewrite_arith_ident(a, v);
             }

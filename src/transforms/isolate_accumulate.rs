@@ -266,7 +266,7 @@ fn movable_rhs(expr: &IrExpr) -> bool {
     match expr {
         IrExpr::Int(_) | IrExpr::Bool(_) => true,
         IrExpr::Str(_, _) => true,
-        IrExpr::Arith(a) => arith_movable(a),
+        IrExpr::Arith(a, _) => arith_movable(a),
         _ => false,
     }
 }
@@ -292,7 +292,7 @@ fn arith_movable(a: &ArithAst) -> bool {
 fn subst_var(expr: &IrExpr, name: &str, rhs: &IrExpr) -> Option<IrExpr> {
     match expr {
         IrExpr::Var(v, _) | IrExpr::Ident(v) if v == name => Some(rhs.clone()),
-        IrExpr::Arith(a) => Some(IrExpr::Arith(Box::new(subst_arith(a, name, rhs)?))),
+        IrExpr::Arith(a, _) => Some(IrExpr::Arith(Box::new(subst_arith(a, name, rhs)?), None)),
         IrExpr::BinOp { lhs, op, rhs: r } => Some(IrExpr::BinOp {
             lhs: Box::new(subst_var(lhs, name, rhs)?),
             op: op.clone(),
@@ -397,7 +397,7 @@ fn subst_arith(a: &ArithAst, name: &str, rhs: &IrExpr) -> Option<ArithAst> {
     // The temp RHS is Arith or literal; substituting a NON-Arith rhs
     // into arithmetic position is only sound for literals (Num-shaped).
     let rhs_arith: Option<ArithAst> = match rhs {
-        IrExpr::Arith(x) => Some((**x).clone()),
+        IrExpr::Arith(x, _) => Some((**x).clone()),
         IrExpr::Int(n) => Some(ArithAst::Num(*n)),
         IrExpr::Str(s, _) => s.trim().parse::<i64>().ok().map(ArithAst::Num),
         _ => None,
@@ -445,7 +445,7 @@ fn expr_free_vars(e: &IrExpr, out: &mut BTreeSet<String>) {
         IrExpr::Var(v, _) | IrExpr::Ident(v) => {
             out.insert(v.clone());
         }
-        IrExpr::Arith(a) => arith_free_vars(a, out),
+        IrExpr::Arith(a, _) => arith_free_vars(a, out),
         IrExpr::BinOp { lhs, rhs, .. } => {
             expr_free_vars(lhs, out);
             expr_free_vars(rhs, out);
@@ -736,7 +736,7 @@ fn expr_reads_var(e: &IrExpr, name: &str) -> bool {
     let flat = |v: &String| v == name || v.starts_with(&format!("{name}["));
     match e {
         IrExpr::Var(v, _) | IrExpr::Ident(v) => flat(v),
-        IrExpr::Arith(a) => arith_reads_var(a, name),
+        IrExpr::Arith(a, _) => arith_reads_var(a, name),
         IrExpr::BinOp { lhs, rhs, .. } => {
             expr_reads_var(lhs, name) || expr_reads_var(rhs, name)
         }
@@ -915,7 +915,7 @@ mod tests {
     }
 
     fn arith(a: ArithAst) -> IrExpr {
-        IrExpr::Arith(Box::new(a))
+        IrExpr::Arith(Box::new(a), None)
     }
 
     fn v(name: &str) -> ArithAst {

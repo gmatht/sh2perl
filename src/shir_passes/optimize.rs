@@ -60,7 +60,7 @@ pub fn expr_reads(name: &str, e: &IrExpr) -> bool {
             expr_reads(name, iter) || expr_reads(name, elem) || cond.as_ref().is_some_and(|c| expr_reads(name, c))
         }
         IrExpr::Splice(inner) => expr_reads(name, inner),
-        IrExpr::Arith(ast) => arith_reads(name, ast),
+        IrExpr::Arith(ast, _) => arith_reads(name, ast),
         IrExpr::Ext(_) => false,
         IrExpr::Object(pairs) => pairs.iter().any(|(_, v)| expr_reads(name, v)),
         IrExpr::MethodCall { obj, args, .. } => {
@@ -379,7 +379,7 @@ fn expr_writes(name: &str, e: &IrExpr) -> bool {
             }
             false
         }
-        IrExpr::Arith(ast) => arith_writes(name, ast),
+        IrExpr::Arith(ast, _) => arith_writes(name, ast),
         _ => false,
     }
 }
@@ -403,7 +403,7 @@ fn stmt_writes(st: &IrStmt, out: &mut Vec<String>) {
                 // of DCE scope (never dropped), so record nothing more
             }
             // compound arith writes on the expr side (x+=1, x++)
-            if let IrExpr::Arith(ast) = expr {
+            if let IrExpr::Arith(ast, _) = expr {
                 collect_arith_writes(ast, out);
             }
             if let IrExpr::Call { func, args } = expr {
@@ -502,7 +502,7 @@ fn expr_reads_name(name: &str, e: &IrExpr) -> bool {
                 || cond.as_ref().is_some_and(|c| expr_reads_name(name, c))
         }
         IrExpr::Splice(inner) => expr_reads_name(name, inner),
-        IrExpr::Arith(ast) => arith_reads_name(name, ast),
+        IrExpr::Arith(ast, _) => arith_reads_name(name, ast),
         IrExpr::Ext(_) => false,
         IrExpr::Object(pairs) => pairs.iter().any(|(_, v)| expr_reads_name(name, v)),
         IrExpr::MethodCall { obj, args, .. } => {
@@ -708,7 +708,7 @@ fn copy_fold_expr(x: &str, y: &str, e: &mut IrExpr) -> bool {
                 changed |= copy_fold_expr(x, y, i);
             }
         }
-        IrExpr::Arith(ast) => changed |= copy_fold_arith(x, y, ast),
+        IrExpr::Arith(ast, _) => changed |= copy_fold_arith(x, y, ast),
         IrExpr::Object(pairs) => {
             for (_, v) in pairs.iter_mut() {
                 changed |= copy_fold_expr(x, y, v);
@@ -769,7 +769,7 @@ fn copy_fold_arith(x: &str, y: &str, a: &mut ArithAst) -> bool {
 /// Fold const-int reads into NUMERIC contexts of the expression.
 fn const_fold_expr(x: &str, v: i64, e: &mut IrExpr, folded: &mut bool) {
     match e {
-        IrExpr::Arith(ast) => {
+        IrExpr::Arith(ast, _) => {
             fold_arith_pos(x, ast, v, folded);
         }
         IrExpr::Index { key, .. } => fold_numeric_expr(x, key, v, folded),
@@ -825,7 +825,7 @@ fn fold_numeric_expr(x: &str, e: &mut IrExpr, v: i64, folded: &mut bool) {
             *e = IrExpr::Int(v);
             *folded = true;
         }
-        IrExpr::Arith(ast) => fold_arith_pos(x, ast, v, folded),
+        IrExpr::Arith(ast, _) => fold_arith_pos(x, ast, v, folded),
         IrExpr::BinOp { lhs, rhs, .. } => {
             fold_numeric_expr(x, lhs, v, folded);
             fold_numeric_expr(x, rhs, v, folded);
@@ -1349,7 +1349,7 @@ pub fn fold_arith_literals(prog: &mut IrProgram) -> bool {
     }
     fn walk_expr(e: &mut IrExpr, changed: &mut bool) {
         match e {
-            IrExpr::Arith(a) => {
+            IrExpr::Arith(a, _) => {
                 fold(a, changed);
             }
             IrExpr::BinOp { lhs, rhs, .. } => {
@@ -1481,7 +1481,7 @@ fn expr_pure(e: &IrExpr) -> bool {
         IrExpr::Splice(inner) => expr_pure(inner),
         IrExpr::Index { key, .. } => expr_pure(key),
         IrExpr::Ext(_) => false,
-        IrExpr::Arith(_) => true, // compound writes checked by the caller
+        IrExpr::Arith(_, _) => true, // compound writes checked by the caller
         IrExpr::MethodCall { obj, args, .. } => expr_pure(obj) && args.iter().all(expr_pure),
         IrExpr::Call { func, args } => {
             matches!(
@@ -1576,7 +1576,7 @@ fn drop_dead_store(st: &IrStmt, reads: &HashSet<String>, guarded: &HashSet<Strin
             if !expr_pure(expr) {
                 return false;
             }
-            if let IrExpr::Arith(ast) = expr {
+            if let IrExpr::Arith(ast, _) = expr {
                 let mut ws = Vec::new();
                 collect_arith_writes(ast, &mut ws);
                 if ws.iter().any(|w| reads.contains(w) || guarded.contains(w)) {
@@ -1882,7 +1882,7 @@ fn collect_expr_read_names(e: &IrExpr, out: &mut Vec<String>) {
             }
         }
         IrExpr::Splice(inner) => collect_expr_read_names(inner, out),
-        IrExpr::Arith(ast) => collect_arith_read_names(ast, out),
+        IrExpr::Arith(ast, _) => collect_arith_read_names(ast, out),
         IrExpr::Ext(_) => (),
         IrExpr::Object(pairs) => {
             for (_, v) in pairs {
@@ -2277,7 +2277,7 @@ mod tests {
                     op: "+".to_string(),
                     lhs: Box::new(ArithAst::Num(1)),
                     rhs: Box::new(ArithAst::Num(2)),
-                })),
+                }), None),
                 asm: None,
             }],
             subs: vec![],
@@ -2291,7 +2291,7 @@ mod tests {
         let IrStmt::Assign { expr, .. } = &prog.stmts[0] else {
             panic!("assign expected")
         };
-        assert_eq!(*expr, IrExpr::Arith(Box::new(ArithAst::Num(3))));
+        assert_eq!(*expr, IrExpr::Arith(Box::new(ArithAst::Num(3)), None));
     }
 
     #[test]
@@ -2313,7 +2313,7 @@ mod tests {
                     op: "+".to_string(),
                     lhs: Box::new(ArithAst::Var("a".to_string())),
                     rhs: Box::new(ArithAst::Num(1)),
-                })),
+                }), None),
                 asm: None,
             }],
             subs: vec![],
@@ -2327,7 +2327,7 @@ mod tests {
         let IrStmt::Assign { expr, .. } = &prog.stmts[0] else {
             panic!("assign expected")
         };
-        assert!(matches!(expr, IrExpr::Arith(_)));
+        assert!(matches!(expr, IrExpr::Arith(_, _)));
     }
 
     #[test]
@@ -2353,7 +2353,7 @@ mod tests {
                         rhs: Box::new(ArithAst::Num(2)),
                     }),
                     rhs: Box::new(ArithAst::Var("a".to_string())),
-                })),
+                }), None),
                 asm: None,
             }],
             subs: vec![],
@@ -2367,7 +2367,7 @@ mod tests {
         let IrStmt::Assign { expr, .. } = &prog.stmts[0] else {
             panic!("assign expected")
         };
-        let IrExpr::Arith(a) = expr else {
+        let IrExpr::Arith(a, _) = expr else {
             panic!("arith expected")
         };
         match a.as_ref() {
@@ -2665,7 +2665,7 @@ mod tests {
                     op: "+".to_string(),
                     lhs: Box::new(ArithAst::Var("x".to_string())),
                     rhs: Box::new(ArithAst::Num(1)),
-                })),
+                }), None),
             ),
             IrStmt::Expr(IrExpr::Call {
                 func: "builtin".to_string(),
@@ -2680,7 +2680,7 @@ mod tests {
         assert!(changed, "x=5 read in arith should fold and drop the def");
         // x's def is gone and y's arith reads the literal
         if let IrStmt::Assign { expr, .. } = &prog.stmts[0] {
-            if let IrExpr::Arith(ast) = expr {
+            if let IrExpr::Arith(ast, _) = expr {
                 assert!(matches!(ast.as_ref(), ArithAst::Bin { lhs, .. } if matches!(lhs.as_ref(), ArithAst::Num(5))));
             } else {
                 panic!("expected arith rhs");

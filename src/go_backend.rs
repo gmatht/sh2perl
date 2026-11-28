@@ -324,7 +324,7 @@ impl Render {
             IrExpr::Int(_) => true,
             IrExpr::Str(s, _) => s.trim().parse::<i64>().is_ok(),
             IrExpr::Var(name, _) => self.is_num(name),
-            IrExpr::Arith(_) => true,
+            IrExpr::Arith(_, _) => true,
             IrExpr::BinOp { op, .. } => !matches!(op, crate::ir::BinOpKind::Concat),
             IrExpr::Call { func, args } if func == "getVar" => {
                 matches!(args.first(), Some(IrExpr::Str(name, _)) if self.is_num(name))
@@ -361,7 +361,7 @@ impl Render {
                 }
                 self.ident_of(name)
             }
-            IrExpr::Arith(a) => self.arith(a),
+            IrExpr::Arith(a, _) => self.arith(a),
             IrExpr::BinOp { op, .. }
                 if matches!(
                     op,
@@ -483,7 +483,7 @@ impl Render {
                 self.ident_of(name)
             }
             IrExpr::Interpolate(parts) => self.interpolate(parts),
-            IrExpr::Arith(a) => format!("s2s({})", self.arith(a)),
+            IrExpr::Arith(a, _) => format!("s2s({})", self.arith(a)),
             IrExpr::Bool(b) => {
                 if *b {
                     "s2s(1)".into()
@@ -556,7 +556,7 @@ impl Render {
                 }
                 _ => format!("({} != 0)", self.expr_num(e)),
             },
-            IrExpr::Arith(a) => format!("({} != 0)", self.arith(a)),
+            IrExpr::Arith(a, _) => format!("({} != 0)", self.arith(a)),
             IrExpr::Call { func, args } if func == "test" => {
                 if let Some(IrExpr::Str(s, _)) = args.first() {
                     if let Some(c) = self.test_render(s) {
@@ -735,7 +735,7 @@ impl Render {
                     format!("({l} {go_op} {r})")
                 }
             }
-            IrExpr::Arith(a) => self.arith(a),
+            IrExpr::Arith(a, _) => self.arith(a),
             IrExpr::Interpolate(parts) => self.interpolate(parts),
             IrExpr::Ternary { cond, then, else_ } => {
                 format!(
@@ -2285,7 +2285,7 @@ impl Render {
             }
             IrExpr::Var(name, _) => Some(format!("${name}")),
             IrExpr::Ident(name) => Some(format!("${name}")),
-            IrExpr::Arith(a) => self
+            IrExpr::Arith(a, _) => self
                 .cmd_text_arith(a)
                 .map(|t| format!("$(({t}))")),
             IrExpr::BinOp { lhs, op, rhs } => {
@@ -3316,7 +3316,7 @@ impl Render {
             }
         }
         // structured arith with assignment/incdec side effects
-        if let IrExpr::Arith(a) = expr {
+        if let IrExpr::Arith(a, _) = expr {
             match a.as_ref() {
                 ArithAst::Assign { var, op, rhs } => {
                     let target = if var == &t.var {
@@ -4504,7 +4504,7 @@ impl Render {
                 }
                 out
             }
-            IrExpr::Arith(a) => vec![Part::Arg(self.arith(a))],
+            IrExpr::Arith(a, _) => vec![Part::Arg(self.arith(a))],
             IrExpr::Bool(b) => {
                 if *b {
                     vec![Part::Arg("true".into())]
@@ -4570,7 +4570,7 @@ impl Render {
         {
             use IrStmt::*;
             fn note_arith(e: &IrExpr, out: &mut BTreeSet<String>) {
-                if let IrExpr::Arith(a) = e {
+                if let IrExpr::Arith(a, _) = e {
                     match &**a {
                         ArithAst::Assign { var, .. } | ArithAst::IncDec { var, .. } => {
                             out.insert(var.clone());
@@ -4615,7 +4615,7 @@ impl Render {
                             let _ = targets;
                         }
                     }
-                    Expr(IrExpr::Arith(a)) => {
+                    Expr(IrExpr::Arith(a, _)) => {
                         if let ArithAst::Assign { var, .. } | ArithAst::IncDec { var, .. } =
                             &**a
                         {
@@ -5585,7 +5585,7 @@ fn scan_flags_expr(e: &IrExpr, r: &mut Render) {
             scan_flags_expr(lhs, r);
             scan_flags_expr(rhs, r);
         }
-        IrExpr::Arith(a) => scan_flags_arith(a, r),
+        IrExpr::Arith(a, _) => scan_flags_arith(a, r),
         IrExpr::Interpolate(parts) => {
             for p in parts {
                 if let InterpPart::Expr(x) = p {
@@ -6007,7 +6007,7 @@ fn collect_written_expr(e: &IrExpr, out: &mut BTreeSet<String>, arrays: &mut BTr
             collect_written_expr(lhs, out, arrays);
             collect_written_expr(rhs, out, arrays);
         }
-        IrExpr::Arith(a) => collect_written_arith(a, out, arrays),
+        IrExpr::Arith(a, _) => collect_written_arith(a, out, arrays),
         IrExpr::Interpolate(parts) => {
             for p in parts {
                 if let InterpPart::Expr(x) = p {

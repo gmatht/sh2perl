@@ -702,7 +702,7 @@ impl<'a> Walker<'a> {
                     }
                 });
             }
-            IrExpr::Arith(a) => self.arith(a),
+            IrExpr::Arith(a, _) => self.arith(a),
             IrExpr::Json(_) => {}
             IrExpr::Object(props) => {
                 for (_, v) in props {
@@ -948,7 +948,7 @@ fn echo_mirror_ok(e: &IrExpr) -> bool {
         | IrExpr::Int(_)
         | IrExpr::Var(_, _)
         | IrExpr::Ident(_)
-        | IrExpr::Arith(_)
+        | IrExpr::Arith(_, _)
         | IrExpr::BinOp { .. }
         | IrExpr::Bool(_) => true,
         IrExpr::Call { func, .. } => {
@@ -1080,7 +1080,7 @@ mod tests {
                     op: "<".to_string(),
                     lhs: Box::new(ArithAst::Var("i".to_string())),
                     rhs: Box::new(ArithAst::Num(3)),
-                })),
+                }), None),
                 body: vec![IrStmt::Expr(IrExpr::Call {
                     func: "arrayIndex".to_string(),
                     args: vec![word("xs"), word("0")],

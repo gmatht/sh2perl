@@ -116,7 +116,7 @@ fn stmt_carries_i32(st: &IrStmt) -> bool {
 
 fn expr_is_i32(e: &IrExpr) -> bool {
     match e {
-        IrExpr::Arith(a) => arith_is_i32(a),
+        IrExpr::Arith(a, _) => arith_is_i32(a),
         _ => false,
     }
 }
@@ -270,7 +270,7 @@ mod tests {
                 sigil: None,
                 indices: vec![],
             }],
-            expr: IrExpr::Arith(Box::new(a)),
+            expr: IrExpr::Arith(Box::new(a), None),
             asm: None,
         };
         let mut stmts = vec![mk("a", ok.clone()), mk("b", boom.clone())];

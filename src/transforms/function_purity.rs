@@ -165,7 +165,7 @@ fn expr_purity(e: &IrExpr, callees: &HashMap<String, Purity>) -> Purity {
             let a = args.iter().map(|a| expr_purity(a, callees)).min().unwrap_or(Purity::Pure);
             f.min(a)
         }
-        IrExpr::Arith(_) => Purity::Pure,
+        IrExpr::Arith(_, _) => Purity::Pure,
         IrExpr::Interpolate(parts) => parts
             .iter()
             .map(|p| match p {

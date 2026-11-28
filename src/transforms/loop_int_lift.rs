@@ -70,7 +70,7 @@ fn mentions_var(s: &str, var: &str) -> bool {
 fn expr_reads_as_text(e: &IrExpr, var: &str) -> bool {
     match e {
         // numeric context: the lifted integer IS the value bash would parse
-        IrExpr::Arith(_) => false,
+        IrExpr::Arith(_, _) => false,
         IrExpr::Int(_) | IrExpr::Bool(_) | IrExpr::Json(_) | IrExpr::RawExpr(_) => false,
         IrExpr::Regex { .. } | IrExpr::Range { .. } => false,
         IrExpr::Str(s, _) => mentions_var(s, var),
@@ -324,7 +324,7 @@ mod tests {
                 op: "+".into(),
                 lhs: Box::new(ArithAst::Var("i".into())),
                 rhs: Box::new(ArithAst::Num(1)),
-            })))];
+            }), None))];
         }
         let ints: HashSet<String> = ["i".to_string()].into_iter().collect();
         assert!(transform_with_types(&mut stmts, &ints));

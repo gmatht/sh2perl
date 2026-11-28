@@ -22,7 +22,7 @@ pub struct TripCtx {
 /// `i < H` / `i <= H` / `i > L` / `i >= L` with a ranged counter and a
 /// literal bound. Anything else is unbounded (`None`).
 pub fn trip_of_loop(cond: &IrExpr, ranges: &HashMap<String, (i128, i128)>) -> Option<u64> {
-    if let IrExpr::Arith(a) = cond {
+    if let IrExpr::Arith(a, _) = cond {
         if let ArithAst::Bin { op, lhs, rhs } = a.as_ref() {
             return cmp_trip(op, lhs, rhs, ranges);
         }
@@ -142,7 +142,7 @@ mod tests {
             op: "<".to_string(),
             lhs: Box::new(ArithAst::Var("i".to_string())),
             rhs: Box::new(ArithAst::Num(11)),
-        }));
+        }), None);
         assert_eq!(trip_of_loop(&cond, &ranges), Some(10));
     }
 
@@ -153,7 +153,7 @@ mod tests {
             op: "<".to_string(),
             lhs: Box::new(ArithAst::Var("i".to_string())),
             rhs: Box::new(ArithAst::Var("n".to_string())),
-        }));
+        }), None);
         assert_eq!(trip_of_loop(&cond, &ranges), None);
     }
 }

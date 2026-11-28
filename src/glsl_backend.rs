@@ -287,7 +287,7 @@ fn tex_reads_in_expr(e: &IrExpr, blk: *const [IrStmt], out: &mut Vec<(TexGroup, 
                 tex_reads_in_expr(c, blk, out);
             }
         }
-        IrExpr::Arith(a) => tex_reads_in_arith(a, blk, out),
+        IrExpr::Arith(a, _) => tex_reads_in_arith(a, blk, out),
         _ => {}
     }
 }
@@ -1389,7 +1389,7 @@ impl Render {
                 // whose assignment source is a $((...)) arith is numeric
                 // here even though the shared numeric-lift analysis keeps
                 // `/` `%` sources string-typed (a JS runtime concern).
-                if let IrExpr::Arith(_) = expr {
+                if let IrExpr::Arith(_, _) = expr {
                     for t in targets {
                         if t.indices.is_empty() {
                             self.arith_assigned.insert(t.var.clone());
@@ -1671,7 +1671,7 @@ impl Render {
                     self.collect_expr(i);
                 }
             }
-            IrExpr::Arith(a) => self.collect_arith(a),
+            IrExpr::Arith(a, _) => self.collect_arith(a),
             IrExpr::Object(pairs) => {
                 for (_, v) in pairs {
                     self.collect_expr(v);
@@ -1808,7 +1808,7 @@ impl Render {
                     Ty::Str
                 }
             }
-            IrExpr::Arith(_) | IrExpr::Range { .. } | IrExpr::RawExpr(_) => Ty::Num,
+            IrExpr::Arith(_, _) | IrExpr::Range { .. } | IrExpr::RawExpr(_) => Ty::Num,
             _ => Ty::Str,
         }
     }
@@ -1899,7 +1899,7 @@ impl Render {
                     format!("/* TODO(call {}) */ 0", sanitize(func))
                 }
             },
-            IrExpr::Arith(a) => self.arith(a),
+            IrExpr::Arith(a, _) => self.arith(a),
             IrExpr::Range { start, end } => {
                 let _ = end;
                 format!("({start})")
@@ -4341,7 +4341,7 @@ fn expr_range(e: &IrExpr, vars: &std::collections::HashMap<String, Option<Range>
         IrExpr::Int(n) => Range::point(*n),
         IrExpr::Str(s, _) => s.trim().parse::<i64>().ok().and_then(Range::point),
         IrExpr::Var(n, _) | IrExpr::Ident(n) => vars.get(n).copied().flatten(),
-        IrExpr::Arith(a) => arith_range(a, vars),
+        IrExpr::Arith(a, _) => arith_range(a, vars),
         IrExpr::BinOp { lhs, op, rhs } => match op {
             BinOpKind::Add => Range::add(expr_range(lhs, vars), expr_range(rhs, vars)),
             BinOpKind::Sub => Range::sub(expr_range(lhs, vars), expr_range(rhs, vars)),

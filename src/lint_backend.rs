@@ -302,7 +302,7 @@ fn walk_func_calls_expr(e: &IrExpr, defined: &mut HashSet<String>, called: &mut 
             walk_func_calls_expr(default, defined, called);
         }
         IrExpr::Capture { expr, .. } => walk_func_calls_expr(expr, defined, called),
-        IrExpr::Arith(a) => walk_func_calls_arith(a, called),
+        IrExpr::Arith(a, _) => walk_func_calls_arith(a, called),
         IrExpr::Lambda { params, body } => {
             for p in params {
                 defined.insert(p.clone());
@@ -713,7 +713,7 @@ fn expr_reads_walk(e: &IrExpr, reads: &mut HashSet<String>) {
                 expr_reads_walk(i, reads);
             }
         }
-        IrExpr::Arith(a) => arith_reads_walk(a, reads),
+        IrExpr::Arith(a, _) => arith_reads_walk(a, reads),
         IrExpr::ArrayComp { iter, elem, cond, .. } => {
             expr_reads_walk(iter, reads);
             expr_reads_walk(elem, reads);
@@ -780,7 +780,7 @@ fn stmt_writes(st: &IrStmt) -> Vec<String> {
 
 fn expr_writes(e: &IrExpr) -> Vec<String> {
     match e {
-        IrExpr::Arith(a) => match a.as_ref() {
+        IrExpr::Arith(a, _) => match a.as_ref() {
             crate::ir::ArithAst::Assign { var, .. } => vec![var.clone()],
             crate::ir::ArithAst::IncDec { var, .. } => vec![var.clone()],
             _ => vec![],

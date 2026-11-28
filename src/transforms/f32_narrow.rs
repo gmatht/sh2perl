@@ -769,7 +769,7 @@ fn classify_rhs(e: &IrExpr) -> Rhs {
             _ => Rhs::Other,
         },
         IrExpr::Var(w, _) => Rhs::Copy(w.clone()),
-        IrExpr::Arith(_)
+        IrExpr::Arith(_, _)
         | IrExpr::Call { .. }
         | IrExpr::Ternary { .. }
         | IrExpr::DefinedOr { .. } => Rhs::Expr(e.clone()),
@@ -796,7 +796,7 @@ fn eval_rhs(rhs: &Rhs, env: &Env) -> FVal {
 fn eval_expr(e: &IrExpr, env: &Env) -> FVal {
     match e {
         IrExpr::Str(s, _) if is_int_literal_str(s) => FVal::int_val(),
-        IrExpr::Arith(t) => eval_tree(t, env),
+        IrExpr::Arith(t, _) => eval_tree(t, env),
         IrExpr::Call { func, args } if func == "arith" => match args.first() {
             Some(IrExpr::Str(s, _)) => eval_sexpr(&parse_arith_string(s), env),
             _ => FVal::unknown(),
@@ -1055,7 +1055,7 @@ fn walk_stmt(
 /// observations (comparisons, calls, string contexts, `int()`/
 fn scan_expr(e: &IrExpr, defs: &mut HashMap<String, Vec<Rhs>>, env: &Env, drops: &mut Vec<String>) {
     match e {
-        IrExpr::Arith(t) => scan_tree(t, env, drops),
+        IrExpr::Arith(t, _) => scan_tree(t, env, drops),
         IrExpr::Call { func, args } if func == "arith" => {
             if let Some(IrExpr::Str(s, _)) = args.first() {
                 let parsed = parse_arith_string(s);
@@ -1308,7 +1308,7 @@ mod tests {
         ArithAst::Var(name.to_string())
     }
     fn arith(a: ArithAst) -> IrExpr {
-        IrExpr::Arith(Box::new(a))
+        IrExpr::Arith(Box::new(a), None)
     }
     fn bin(op: &str, l: ArithAst, r: ArithAst) -> ArithAst {
         ArithAst::Bin {

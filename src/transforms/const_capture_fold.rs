@@ -129,7 +129,7 @@ fn expr_pass(e: &mut IrExpr) -> bool {
             c
         }
         IrExpr::Index { key, .. } => expr_pass(key),
-        IrExpr::Arith(a) => arith_pass(a),
+        IrExpr::Arith(a, _) => arith_pass(a),
         IrExpr::Interpolate(parts) => {
             let mut c = false;
             for p in parts.iter_mut() {

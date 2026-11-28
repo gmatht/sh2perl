@@ -335,7 +335,7 @@ fn stmt_pass(st: &mut IrStmt) -> bool {
 fn expr_pass(e: &mut IrExpr) -> bool {
     match e {
         IrExpr::Interpolate(parts) => merge_parts(parts),
-        IrExpr::Arith(_) => false, // no IrExpr children inside Arith text
+        IrExpr::Arith(_, _) => false, // no IrExpr children inside Arith text
         IrExpr::Index { key, .. } => expr_pass(key),
         IrExpr::BinOp { lhs, rhs, .. } => expr_pass(lhs) | expr_pass(rhs),
         IrExpr::Call { args, .. } | IrExpr::Array(args) => {

@@ -798,7 +798,7 @@ mod tests {
                 op: "%".into(),
                 lhs: Box::new(ArithAst::Var("frame".into())),
                 rhs: Box::new(ArithAst::Num(200)),
-            })),
+            }), None),
             clauses: vec![IrCaseClause {
                 patterns: vec!["25".into()],
                 body: vec![IrStmt::Break],

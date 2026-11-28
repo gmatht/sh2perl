@@ -121,7 +121,7 @@ fn expr_pure(e: &IrExpr) -> bool {
     match e {
         IrExpr::Int(_) | IrExpr::Var(_, _) | IrExpr::Str(_, _) | IrExpr::Range { .. } | IrExpr::Bool(_) => true,
         IrExpr::BinOp { lhs, rhs, .. } => expr_pure(lhs) && expr_pure(rhs),
-        IrExpr::Arith(_) => true,
+        IrExpr::Arith(_, _) => true,
         IrExpr::Interpolate(parts) => parts.iter().all(|p| match p {
             crate::ir::InterpPart::Lit(_) => true,
             crate::ir::InterpPart::Expr(x) => expr_pure(x),
@@ -184,7 +184,7 @@ fn expr_reads(e: &IrExpr, var: &str) -> bool {
         IrExpr::Var(v, _) | IrExpr::Ident(v) => v == var,
         IrExpr::Index { var: v, key, .. } => v == var || expr_reads(key, var),
         IrExpr::BinOp { lhs, rhs, .. } => expr_reads(lhs, var) || expr_reads(rhs, var),
-        IrExpr::Arith(a) => arith_reads(a, var),
+        IrExpr::Arith(a, _) => arith_reads(a, var),
         IrExpr::Call { func, args, .. } => {
             call_reads_var(func, args, var)
                 || assign_rmw_reads(func, args, var)
@@ -474,7 +474,7 @@ mod tests {
                     op: "+".to_string(),
                     lhs: Box::new(ArithAst::Var("x".to_string())),
                     rhs: Box::new(ArithAst::Num(1)),
-                })),
+                }), None),
             ),
             assign("x", int_lit(6)),
         ];

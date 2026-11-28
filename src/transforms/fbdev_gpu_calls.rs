@@ -121,7 +121,7 @@ pub(crate) fn payload_direct_ok(e: &IrExpr) -> bool {
     match e {
         IrExpr::Str(s, _) => static_text_ok(s),
         IrExpr::Int(..) | IrExpr::Var(..) | IrExpr::Ident(..) => true,
-        IrExpr::Arith(..) => true,
+        IrExpr::Arith(.., _) => true,
         IrExpr::Index { key, .. } => payload_direct_ok(key),
         IrExpr::Interpolate(parts) => parts.iter().all(|p| match p {
             InterpPart::Lit(s) => static_text_ok(s),

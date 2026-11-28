@@ -164,7 +164,7 @@ fn expr_nonempty(e: &IrExpr, tagged: &HashSet<String>, int_vars: &HashSet<String
         IrExpr::Str(s, _) => !s.is_empty(),
         IrExpr::Int(_) => true,
         // Decimal text, never empty (an aborting arith yields no word list).
-        IrExpr::Arith(_) | IrExpr::BinOp { .. } => true,
+        IrExpr::Arith(_, _) | IrExpr::BinOp { .. } => true,
         IrExpr::Var(name, _) | IrExpr::Ident(name) => int_vars.contains(name),
         IrExpr::Interpolate(parts) => parts.iter().any(|p| match p {
             InterpPart::Lit(s) => !s.is_empty(),
@@ -186,7 +186,7 @@ fn expr_nospace(e: &IrExpr, tagged: &HashSet<String>) -> bool {
     match e {
         IrExpr::Int(_) => true,
         // A numeric result is decimal text.
-        IrExpr::Arith(_) | IrExpr::BinOp { .. } => true,
+        IrExpr::Arith(_, _) | IrExpr::BinOp { .. } => true,
         IrExpr::Str(s, _) => whitespace_free(s),
         IrExpr::Var(name, _) | IrExpr::Ident(name) => tagged.contains(name),
         IrExpr::Interpolate(parts) => parts.iter().all(|p| match p {

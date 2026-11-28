@@ -53,7 +53,7 @@ pub fn transform(stmts: &mut Vec<IrStmt>) -> bool {
         // Only the structured-Arith condition (the shell/text form is
         // counted-while-forinit's job).
         let extracted = (|| -> Option<(IrExpr, IrStmt, Vec<IrStmt>)> {
-            let IrExpr::Arith(a) = cond else { return None };
+            let IrExpr::Arith(a, _) = cond else { return None };
             if !arith_mentions(a, &counter) {
                 return None;
             }
@@ -97,10 +97,10 @@ fn counter_update(st: &IrStmt, counter: &str) -> Option<IrStmt> {
     let arith = match st {
         IrStmt::Assign {
             targets,
-            expr: IrExpr::Arith(a),
+            expr: IrExpr::Arith(a, _),
             asm: None,
         } if targets.len() == 1 && targets[0].var == counter && targets[0].indices.is_empty() => a,
-        IrStmt::Expr(IrExpr::Arith(a)) => a,
+        IrStmt::Expr(IrExpr::Arith(a, _)) => a,
         _ => return None,
     };
     let ok = match arith.as_ref() {
@@ -118,7 +118,7 @@ fn counter_update(st: &IrStmt, counter: &str) -> Option<IrStmt> {
             sigil: None,
             indices: Vec::new(),
         }],
-        expr: IrExpr::Arith(arith.clone()),
+        expr: IrExpr::Arith(arith.clone(), None),
         asm: None,
     })
 }
@@ -278,7 +278,7 @@ mod tests {
         ArithAst::Var(name.to_string())
     }
     fn arith(a: ArithAst) -> IrExpr {
-        IrExpr::Arith(Box::new(a))
+        IrExpr::Arith(Box::new(a), None)
     }
     fn cond() -> IrExpr {
         arith(ArithAst::Bin {

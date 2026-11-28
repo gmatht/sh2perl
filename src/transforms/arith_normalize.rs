@@ -109,7 +109,7 @@ fn stmt(st: &mut IrStmt) -> bool {
 
 fn expr(e: &mut IrExpr) -> bool {
     match e {
-        IrExpr::Arith(a) => arith(a),
+        IrExpr::Arith(a, _) => arith(a),
         IrExpr::Index { key, .. } => expr(key),
         IrExpr::BinOp { lhs, rhs, .. } => expr(lhs) | expr(rhs),
         IrExpr::Ternary { cond, then, else_ } => expr(cond) | expr(then) | expr(else_),

@@ -4095,7 +4095,7 @@ fn collect_scalar_writes_expr(e: &IrExpr, out: &mut Vec<String>) -> bool {
             args.iter().all(|a| collect_scalar_writes_expr(a, out))
         }
         IrExpr::Var(_, _) | IrExpr::Str(_, _) | IrExpr::Int(_) | IrExpr::Bool(_) => true,
-        IrExpr::Arith(a) => {
+        IrExpr::Arith(a, _) => {
             // arith assignments inside expressions write dynamically
             !matches!(a.as_ref(), ArithAst::Assign { .. } | ArithAst::IncDec { .. })
                 || {
@@ -4357,7 +4357,7 @@ fn try_normalize_construct_stmt(stmt: &IrStmt) -> Option<IrStmt> {
                 let ast = crate::shir::parse_arith(rhs)?;
                 stmts.push(IrStmt::Assign {
                     targets: vec![AssignTarget { var: name.to_string(), sigil: None, indices: vec![] }],
-                    expr: IrExpr::Arith(Box::new(ast)),
+                    expr: IrExpr::Arith(Box::new(ast), None),
                     asm: None,
                 });
             } else if crate::shir::parse_arith(w).is_some() {
@@ -4392,7 +4392,7 @@ fn let_cond_from_text(text: &str) -> Option<IrExpr> {
         if body.starts_with('=') { return None; }
     }
     let ast = crate::shir::parse_arith(text)?;
-    Some(IrExpr::Arith(Box::new(ast)))
+    Some(IrExpr::Arith(Box::new(ast), None))
 }
 
 /// A statement-level `find ARGS` (no pipeline): print each entry path.

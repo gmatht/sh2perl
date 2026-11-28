@@ -130,7 +130,7 @@ pub fn classify_seq_chain(
                 if &t.var == counter || inv.contains(t.var.as_str()) {
                     return None;
                 }
-                let IrExpr::Arith(a) = expr else {
+                let IrExpr::Arith(a, _) = expr else {
                     return None;
                 };
                 if !pure_chain_arith(a) {
@@ -189,7 +189,7 @@ pub fn classify_seq_chain(
     if init_names.contains(&acc) || inv.contains(acc.as_str()) {
         return None;
     }
-    let IrExpr::Arith(a) = expr else {
+    let IrExpr::Arith(a, _) = expr else {
         return None;
     };
     let ArithAst::Bin { op, lhs, rhs } = a.as_ref() else {
@@ -265,7 +265,7 @@ fn check_assign_block(
         {
             return false;
         }
-        let IrExpr::Arith(x) = expr else {
+        let IrExpr::Arith(x, _) = expr else {
             return false;
         };
         if !pure_chain_arith(x) {
@@ -287,7 +287,7 @@ fn init_rhs(expr: &IrExpr) -> Option<InitRhs> {
     match expr {
         IrExpr::Int(n) => Some(InitRhs::Num(*n)),
         IrExpr::Str(s, _) => s.trim().parse::<i64>().ok().map(InitRhs::Num),
-        IrExpr::Arith(a) => {
+        IrExpr::Arith(a, _) => {
             if pure_chain_arith(a) {
                 Some(InitRhs::Arith((**a).clone()))
             } else {
@@ -379,7 +379,7 @@ fn test_pure(cond: &IrExpr, readable: &BTreeSet<String>) -> bool {
     // interpolation and friends veto — no call-scan needed since
     // anything unlisted here refuses).
     match cond {
-        IrExpr::Arith(a) => {
+        IrExpr::Arith(a, _) => {
             let ArithAst::Bin { op, lhs, rhs } = a.as_ref() else {
                 return false;
             };
@@ -468,7 +468,7 @@ mod tests {
     }
 
     fn arith(a: ArithAst) -> IrExpr {
-        IrExpr::Arith(Box::new(a))
+        IrExpr::Arith(Box::new(a), None)
     }
 
     fn v(name: &str) -> ArithAst {

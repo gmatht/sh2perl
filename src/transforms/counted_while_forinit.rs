@@ -111,7 +111,7 @@ fn counter_step(st: &IrStmt) -> Option<(String, IrStmt)> {
         {
             true
         }
-        IrExpr::Arith(ast) => matches!(
+        IrExpr::Arith(ast, _) => matches!(
             ast.as_ref(),
             ArithAst::Bin { op, lhs, rhs }
                 if (op == "+" || op == "-")
@@ -169,7 +169,7 @@ fn expr_mentions_text(e: &IrExpr, name: &str) -> bool {
             IrExpr::Str(s, _) => word_contains(s, name),
             IrExpr::Array(items) => items.iter().any(|i| walk(i, name)),
             IrExpr::Call { args, .. } => args.iter().any(|a| walk(a, name)),
-            IrExpr::Arith(a) => arith_text_mentions(a, name),
+            IrExpr::Arith(a, _) => arith_text_mentions(a, name),
             _ => true,
         }
     }
@@ -479,7 +479,7 @@ mod tests {
                 op: op.to_string(),
                 lhs: Box::new(ArithAst::Var(var.to_string())),
                 rhs: Box::new(ArithAst::Num(n)),
-            })),
+            }), None),
             asm: None,
         }
     }
@@ -553,7 +553,7 @@ mod tests {
                 op: "+".to_string(),
                 lhs: Box::new(ArithAst::Var("i".to_string())),
                 rhs: Box::new(ArithAst::Var("n".to_string())),
-            })),
+            }), None),
             asm: None,
         };
         let mut stmts = while_loop("i", step);
