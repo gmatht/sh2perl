@@ -1,13 +1,25 @@
 # verus-sync-coverage manifest: bc_float_clean
-# source sha: bc_float_clean=b872f6c06797  proof sha: 8a1fe6ed7371
-# source: src/transforms/bc_float_clean.rs (330 lines, NO #[cfg(test)] block)
+# source sha: bc_float_clean=c5767ccaaa36  proof sha: 0c5845f8b95f
+#   source re-pinned 2026-11-28 (was b872f6c06797): that module had NO
+#   #[cfg(test)] block at all, so every row below was UNMIRRORED and nothing
+#   was executed for this proof. gen_pin_tests.py appended the six-line
+#   `#[cfg(test)] #[path = "bc_float_pin_tests.rs"] mod pin_tests_bc_float;`
+#   registration at EOF; `transform`, `transform_stmt`, `transform_expr`,
+#   `clean_pipeline`, `clean_bc_arg` and `strip_trailing_add_zero` are
+#   byte-identical to the audited b872f6c06797.
+#   The proof's 0c5845f8b95f adds the DFA's own whitespace predicate
+#   (`is_ws_sem`/`all_ws_sem`) with the bridge laws `is_ws_sem_is_is_ws` /
+#   `all_ws_sem_iff`, the pin `pin_ws_charset_covers_tabs` and the value pin
+#   `pin_bc_value_preserved`; 8a1fe6ed7371 had the vacuity described below.
 
 [pins]
-pin pin_strip_shapes -> UNMIRRORED (the shape table has no source test)
-pin pin_strip_refusals -> UNMIRRORED (no source test for the refusals)
-pin pin_the_decimal_gate -> UNMIRRORED (only `clean_bc_arg`'s contains('.'), untested)
-pin pin_dfa_agrees -> UNMIRRORED (the DFA is the model's, not the source's)
-pin pin_one_occurrence_per_pass -> UNMIRRORED (rsplit_once is per-call; untested)
+pin pin_strip_shapes -> test pin_strip_shapes: MAPPED
+pin pin_strip_refusals -> test pin_strip_refusals: MAPPED
+pin pin_the_decimal_gate -> test pin_the_decimal_gate: MAPPED
+pin pin_dfa_agrees -> test pin_dfa_agrees: MAPPED
+pin pin_one_occurrence_per_pass -> test pin_one_occurrence_per_pass: MAPPED
+pin pin_ws_charset_covers_tabs -> test pin_ws_charset_covers_tabs: MAPPED
+pin pin_bc_value_preserved -> test pin_bc_value_preserved: MAPPED
 
 [guards]
 guard law strip_removes_only_the_identity (strip Some(p) => p ++ DFA-accepted identity tail, p not ending in whitespace): PRESENT
@@ -16,31 +28,61 @@ guard law add_zero_is_the_identity (term model: appending the zero term keeps th
 guard law strip_preserves_the_value (both halves in one statement): PRESENT
 guard gate 1 = is_identity_tail / dfa (the trailing term really is `0.0`): PRESENT
 guard gate 2 = has_dot on the STRIPPED text (a decimal must remain): PRESENT
+guard independent DFA whitespace recursion is_ws_sem / all_ws_sem (not the strip's is_ws): PRESENT
+guard law is_ws_sem_is_is_ws (the DFA's charset equals the strip's — the vacuity's bridge): PRESENT
+guard law all_ws_sem_iff (the two whitespace-run predicates are one predicate): PRESENT
 guard clean_pipeline's shape check (echo|bc, exactly two stages, second is `exec bc`, one echo arg): OUT OF MODEL
-guard clean_bc_arg's Interpolate last-part rule + the scan of earlier Literal parts for a decimal: OUT OF MODEL
-guard the IR traversal (transform / transform_stmt / transform_expr): OUT OF MODEL
-guard bc's float arithmetic `x + 0.0 == x` for finite decimals: STATED ARITHMETIC FACT (Verus has no reals; only the integer identity is proved)
+guard clean_bc_arg's Interpolate last-part rule + the scan of earlier Literal parts for a decimal: OUT OF MODEL (executed by pin_strip_shapes/pin_the_decimal_gate)
+guard the IR traversal (transform / transform_stmt / transform_expr) and the capture(...) wrapper: OUT OF MODEL (executed by every pin)
+guard bc's float arithmetic `x + 0.0 == x` for finite decimals: STATED ARITHMETIC FACT (Verus has no reals; the integer identity is proved and the real `bc` is run by pin_bc_value_preserved)
 guard the renderer's float verdict itself: OUT OF MODEL (only its input predicate, has_dot, is modelled)
 
 [counts]
-27 verified, 0 errors (verus --triggers-mode silent --rlimit 40 bc_float_clean.rs)
-mutants: strip-drops-the-zero-check 26v/1e, dfa-AfterPlus-accepts-'1'
-  26v/1e, term-model-total-base-1 26v/1e; trailing-ws-gate-dropped,
-  whitespace-kept-before-plus, dfa-Trail-accepts-anything,
-  dfa-BeforePlus-no-ws-skip, trim_start-no-trim, last_plus-adjacent-only and
-  skip_ws-no-skip rejected at simplification by their pins.
-  Ten mutants measured; each restored byte-identically (sha256 above
-  re-checked after every run).
+32 verified, 0 errors (verus --triggers-mode silent --rlimit 40 bc_float_clean.rs)
+ONE VACUITY was found and fixed in this proof. The strip's cursor arithmetic
+(`trim_start`, `skip_ws`, `all_ws`) and the DFA both read the single `is_ws`,
+so narrowing that charset to ' ' verified at 27v/0e (measured on the pre-fix
+proof 8a1fe6ed7371): both sides moved together, and the file then said
+nothing about the tabs/newlines `trim_end()` really trims. FIX: `is_ws_sem` /
+`all_ws_sem` are the DFA's own transcription, bridged by `is_ws_sem_is_is_ws`
+and `all_ws_sem_iff`; `pin_ws_charset_covers_tabs` pins the shared value and
+`pin_bc_value_preserved` pins the value identity. The unpinned narrowing
+(charset loses '\r') now fails a law with a real count (M0 below).
+
+mutants, measured 2026-11-28 against proof sha 0c5845f8b95f, each applied
+alone and restored byte-identically (sha256 re-checked after every run):
+  M0  the DFA's charset loses '\r' (vacuity twin)    31v/1e  all_ws_sem_iff
+  M1  DFA Trail stops accepting whitespace           31v/1e  lemma_run_ws
+  M2  strip drops its `s[j+2] == '0'` check          31v/1e  strip_removes_only_the_identity
+  M3  the term model's `total` base case is 1        31v/1e  lemma_total_push
+  M4  strip accepts a signed `-0.0` tail             31v/1e  strip_removes_only_the_identity
+  M6  last_plus stops at an adjacent '+' only        31v/1e  lemma_last_plus
+  M0' the DFA's charset loses '\t' (the pinned one)  rejected at simplification by
+        pin_ws_charset_covers_tabs (0v/1e) — recorded as pin evidence, not a law
+  M5  DFA BeforePlus stops skipping whitespace       rejected at simplification by
+        pin_dfa_agrees (0v/1e)
+  So six defect classes fail a LAW with a real count (dropped DFA arm, dropped
+  strip check, misclassified number shape (signed zero), term-model base,
+  cursor bug, and the shared-helper narrowing that used to be green), and the
+  two spellings the pins refute first are recorded as pin-level.
+
 [exec]
-# The analysed module has NO #[cfg(test)] block, measured:
-#   grep -c 'cfg(test)' src/transforms/bc_float_clean.rs  ->  0
-# so `cargo test --lib` contains no test that exercises this transform, and
-# every pin row above is UNMIRRORED. Nothing is executed for this proof.
-# The source's own `bc-float-clean` manifest comment (behavioural identity
-# `X + 0.0 == X` for finite values, refuse > guess) is the claim the law
-# states; it is not backed by a unit test in this tree.
-exec pin_strip_shapes: UNMIRRORED (not executed: no source test module)
-exec pin_strip_refusals: UNMIRRORED (not executed)
-exec pin_the_decimal_gate: UNMIRRORED (not executed)
-exec pin_dfa_agrees: UNMIRRORED (not executed)
-exec pin_one_occurrence_per_pass: UNMIRRORED (not executed)
+# Every MAPPED row was EXECUTED against the source in this tree by the
+# generator that owns the tests:
+#   python3 proofs/verus/gen_pin_tests.py \
+#       proofs/verus/pin_specs/bc_float_clean.json --run
+# It writes src/transforms/bc_float_pin_tests.rs, registers the module at the
+# end of src/transforms/bc_float_clean.rs, drives the REAL `transform` on a
+# `capture(echo ARG | bc)` pipeline, and flips a row to MAPPED only for a test
+# whose own `<module>::<name> ... ok` line it observed.
+# Re-run 2026-11-28: 7 tests written, 7 PASS.
+# The value row does not stop at the text: it runs the real `bc` on the
+# original argument and on the stripped one and requires identical output,
+# which is the arithmetic fact `x + 0.0 == x` the proof states over integers.
+exec pin_strip_shapes (pin_strip_shapes): PASS
+exec pin_strip_refusals (pin_strip_refusals): PASS
+exec pin_the_decimal_gate (pin_the_decimal_gate): PASS
+exec pin_dfa_agrees (pin_dfa_agrees): PASS
+exec pin_one_occurrence_per_pass (pin_one_occurrence_per_pass): PASS
+exec pin_ws_charset_covers_tabs (pin_ws_charset_covers_tabs): PASS
+exec pin_bc_value_preserved (pin_bc_value_preserved): PASS

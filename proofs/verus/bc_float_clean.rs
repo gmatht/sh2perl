@@ -48,22 +48,36 @@
 //    rule, and the renderer's float verdict itself (only its input
 //    predicate, `has_dot`, is modelled).
 //
-//  ── measured mutants (10; see the README + sync file) ──────────────────
+//  ── measured mutants (see the README + sync file) ──────────────────────
 //
-//  Counted — the re-run still verifies 26 of 27 obligations and fails one:
-//    M3  strip drops the `s[j] == '0'` check        26v/1e  strip_removes_
-//        only_the_identity: the law's DFA step into SeeZero
-//    M5  DFA AfterPlus also accepts '1'             26v/1e  lemma_run_
-//        consumes: the term-shape equation (`expected`)
-//    M10 the term model's `total` base case is 1    26v/1e  lemma_total_push:
-//        the base case `total(a.push(x), len) == x`
-//  Rejected at simplification by a concrete `by (compute)` pin (the run
-//  aborts with `expression simplifies to … false` before the summary line):
-//    M1 the strip drops the trailing-whitespace gate; M2 the strip keeps the
-//    whitespace before '+'; M4 DFA Trail accepts any character; M6 DFA
-//    BeforePlus stops skipping whitespace; M7 trim_start does not trim;
-//    M8 last_plus only sees an adjacent '+'; M9 skip_ws skips nothing.
-//  Every mutant was restored byte-identically and the sha256 re-checked.
+//  baseline 32 verified, 0 errors.
+//
+//  ONE VACUITY was found here by mutation and fixed in this file: the DFA
+//  and the strip's cursor arithmetic shared `is_ws`, so narrowing that
+//  charset to ' ' left the file GREEN (measured: 27v/0e on the pre-fix
+//  proof) — both sides moved together, and the proof then said nothing about
+//  the tabs/newlines `trim_end()` really trims.  FIX: `is_ws_sem` /
+//  `all_ws_sem` are the DFA's own transcription, bridged by
+//  `is_ws_sem_is_is_ws` / `all_ws_sem_iff`; `pin_ws_charset_covers_tabs`
+//  pins the shared value, and an un-pinned narrowing now fails a law (M0).
+//
+//  Counted — a law fails at verification with a real count:
+//    M0  the DFA's charset loses '\r' (the vacuity's  31v/1e  all_ws_sem_iff
+//        law-level twin; the pin covers only '\t')
+//    M1  DFA Trail stops accepting whitespace         31v/1e  lemma_run_ws
+//    M2  strip drops its `s[j+2] == '0'` check         31v/1e  strip_removes_
+//        only_the_identity (the DFA never reaches Trail)
+//    M3  the term model's `total` base case is 1       31v/1e  lemma_total_push
+//    M4  strip accepts a signed `-0.0` tail            31v/1e  strip_removes_
+//        only_the_identity (the deleted span is not a zero term)
+//    M6  last_plus stops at an adjacent '+' only       31v/1e  lemma_last_plus
+//  Pin-level (rejected at simplification by `by (compute)`, recorded as pin
+//  evidence and NOT as a law): M0' the DFA charset loses '\t'
+//  (pin_ws_charset_covers_tabs), M5 DFA BeforePlus stops skipping whitespace
+//  (pin_dfa_agrees), M7 DFA Trail accepts any character, M8 trim_start does
+//  not trim, M9 skip_ws skips nothing, M10 the whitespace before '+' is kept
+//  (all pin_strip_shapes).  Every mutant was restored byte-identically and
+//  the sha256 re-checked.
 //  ─────────────────────────────────────────────────────────────────────────
 
 use vstd::prelude::*;
@@ -76,8 +90,44 @@ pub open spec fn is_ws(c: char) -> bool {
     c == ' ' || c == '\t' || c == '\n' || c == '\r'
 }
 
+/// The whitespace charset as the DFA sees it — its own transcription, not
+/// the strip's `is_ws`. With one shared predicate, narrowing the charset to
+/// ' ' left the file GREEN (measured: 27v/0e) because the strip-side cursors
+/// and the recogniser moved together; the bridge law below is what now
+/// catches that.
+pub open spec fn is_ws_sem(c: char) -> bool {
+    c == ' ' || c == '\t' || c == '\n' || c == '\r'
+}
+
 pub open spec fn is_digit(c: char) -> bool {
     '0' <= c && c <= '9'
+}
+
+pub open spec fn all_ws_sem(s: Seq<char>, i: int, e: int) -> bool
+    decreases e - i,
+{
+    if i >= e {
+        true
+    } else {
+        is_ws_sem(s[i]) && all_ws_sem(s, i + 1, e)
+    }
+}
+
+pub proof fn is_ws_sem_is_is_ws(c: char)
+    ensures
+        is_ws_sem(c) == is_ws(c),
+{
+}
+
+pub proof fn all_ws_sem_iff(s: Seq<char>, i: int, e: int)
+    ensures
+        all_ws_sem(s, i, e) == all_ws(s, i, e),
+    decreases e - i,
+{
+    if i < e {
+        is_ws_sem_is_is_ws(s[i]);
+        all_ws_sem_iff(s, i + 1, e);
+    }
 }
 
 pub open spec fn all_ws(s: Seq<char>, i: int, e: int) -> bool
@@ -175,14 +225,14 @@ pub enum Q {
 
 pub open spec fn dfa(q: Q, c: char) -> Option<Q> {
     match q {
-        Q::BeforePlus => if is_ws(c) {
+        Q::BeforePlus => if is_ws_sem(c) {
             Some(Q::BeforePlus)
         } else if c == '+' {
             Some(Q::AfterPlus)
         } else {
             None
         },
-        Q::AfterPlus => if is_ws(c) {
+        Q::AfterPlus => if is_ws_sem(c) {
             Some(Q::AfterPlus)
         } else if c == '0' {
             Some(Q::SeeZero)
@@ -191,7 +241,7 @@ pub open spec fn dfa(q: Q, c: char) -> Option<Q> {
         },
         Q::SeeZero => if c == '.' { Some(Q::SeeDot) } else { None },
         Q::SeeDot => if c == '0' { Some(Q::Trail) } else { None },
-        Q::Trail => if is_ws(c) { Some(Q::Trail) } else { None },
+        Q::Trail => if is_ws_sem(c) { Some(Q::Trail) } else { None },
     }
 }
 
@@ -303,7 +353,7 @@ proof fn lemma_skip_ws(s: Seq<char>, i: int)
 /// A whitespace run leaves a whitespace-accepting state where it was.
 proof fn lemma_run_ws(s: Seq<char>, i: int, e: int, q: Q)
     requires
-        all_ws(s, i, e),
+        all_ws_sem(s, i, e),
         (q == Q::BeforePlus || q == Q::AfterPlus || q == Q::Trail),
     ensures run(s, i, e, q) == Some(q),
     decreases e - i,
@@ -397,6 +447,10 @@ pub proof fn strip_removes_only_the_identity(s: Seq<char>, p: Seq<char>)
     assert(all_ws(s, k, i));
     assert(all_ws(s, i + 1, j));
     assert(all_ws(s, j + 3, e));
+    // the DFA's own charset agrees with the strip's on these spans
+    all_ws_sem_iff(s, k, i);
+    all_ws_sem_iff(s, i + 1, j);
+    all_ws_sem_iff(s, j + 3, e);
     assert(dfa(Q::BeforePlus, s[i]) == Some(Q::AfterPlus));
     assert(dfa(Q::AfterPlus, s[j]) == Some(Q::SeeZero));
     assert(dfa(Q::SeeZero, s[j + 1]) == Some(Q::SeeDot));
@@ -427,7 +481,7 @@ pub open spec fn nonws(s: Seq<char>, i: int, e: int) -> Seq<char>
 {
     if i >= e {
         Seq::empty()
-    } else if is_ws(s[i]) {
+    } else if is_ws_sem(s[i]) {
         nonws(s, i + 1, e)
     } else {
         seq![s[i]].add(nonws(s, i + 1, e))
@@ -463,7 +517,7 @@ proof fn lemma_run_consumes(s: Seq<char>, i: int, e: int, q: Q)
             }
             Some(q2) => {
                 lemma_run_consumes(s, i + 1, e, q2);
-                if is_ws(c) {
+                if is_ws_sem(c) {
                     // whitespace keeps the expected remainder equal
                     assert(expected(q) == expected(q2)) by {
                         match q {
@@ -651,6 +705,37 @@ pub proof fn pin_one_occurrence_per_pass()
     assert(strip_add_zero(seq![
         '3', ' ', '+', ' ', '0', '.', '0', ' ', '+', ' ', '0', '.', '0',
     ]) == Some(seq!['3', ' ', '+', ' ', '0', '.', '0'])) by (compute);
+}
+
+/// The whitespace charset: Rust's `trim_end()` trims a tab as readily as a
+/// space, so the strip and the DFA must agree about it. This is the pin for
+/// the vacuity that used to exist here (one shared `is_ws`).
+pub proof fn pin_ws_charset_covers_tabs()
+    ensures
+        strip_add_zero(seq!['3', ' ', '+', ' ', '0', '.', '0', '\t']) == Some(t3()),
+        is_identity_tail(seq!['3', ' ', '+', ' ', '0', '.', '0', '\t'], 1, 7),
+        is_ws('\t'),
+        is_ws_sem('\t'),
+        !is_ws_sem('x'),
+        !is_ws('%'),
+{
+    assert(strip_add_zero(seq!['3', ' ', '+', ' ', '0', '.', '0', '\t']) == Some(t3())) by (compute);
+    assert(is_identity_tail(seq!['3', ' ', '+', ' ', '0', '.', '0', '\t'], 1, 7)) by (compute);
+    assert(is_ws('\t')) by (compute);
+    assert(is_ws_sem('\t')) by (compute);
+    assert(!is_ws_sem('x')) by (compute);
+    assert(!is_ws('%')) by (compute);
+}
+
+/// The value model on a concrete expression: appending the zero term keeps
+/// the total — bc's `x + 0.0 == x` over the integer model the proof uses.
+/// This is the pin behind the executable `bc` comparison in the generated
+/// test suite (the real `bc` run is in `src/transforms/bc_float_pin_tests.rs`).
+pub proof fn pin_bc_value_preserved()
+    ensures
+        total(seq![3, 5].push(0), 0) == total(seq![3, 5], 0),
+{
+    add_zero_is_the_identity(seq![3, 5]);
 }
 
 fn main() {}

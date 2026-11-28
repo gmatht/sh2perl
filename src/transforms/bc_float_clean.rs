@@ -328,3 +328,10 @@ fn strip_trailing_add_zero(t: &str) -> Option<String> {
 //   `qx{echo … | bc}` captures are runtime, not IR, so the strip is a
 //   no-op for them).
 // updates: none (first offer; un-rejected from the pre-marketplace pile)
+
+// Tests generated from the Verus manifest's [pins] rows by
+// proofs/verus/gen_pin_tests.py -- DO NOT EDIT the generated file by hand.
+// There is one test per pin; a pin flips to MAPPED only after its test passes.
+#[cfg(test)]
+#[path = "bc_float_pin_tests.rs"]
+mod pin_tests_bc_float;

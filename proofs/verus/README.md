@@ -9226,10 +9226,10 @@ Against the committed proof bytes, each restored byte-identically (sha256 in
   subset of positions that still funnels through `fold_text` is covered by
   (A)+(B) unchanged.
 
-## bc_float_clean.rs — the trailing `+ 0.0` strip removes the identity (27)
+## bc_float_clean.rs — the trailing `+ 0.0` strip removes the identity (32)
 
     verus --triggers-mode silent --rlimit 40 proofs/verus/bc_float_clean.rs
-    -> verification results:: 27 verified, 0 errors
+    -> verification results:: 32 verified, 0 errors
 
 `transforms/bc_float_clean.rs` rewrites an `echo "scale=K; EXPR" | bc`
 capture in place: when the LAST additive term of the argument text is the
@@ -9259,31 +9259,57 @@ bc relies on — `x + 0.0 == x` for finite decimals — is proved there as
 `add_zero_is_the_identity`), and `strip_preserves_the_value` states (A) and
 (B) together for any string the strip accepts.
 
-### Pins
+### A vacuity, found by mutation and closed
 
-`pin_strip_shapes` the accepted shapes (with and without whitespace on
-either side of `+`, a `scale=2; 3.5 + 0.0` argument), `pin_strip_refusals`
-the refusals that carry the safety (`+ 0`, `+ 0.00`, a `0.0` that is not the
-last term, `-0.0`, no `+` at all, the empty string), `pin_the_decimal_gate`
-the second gate — `1 + 0.0` becomes `1`, which has no decimal, so the caller
-refuses it (the shader backend's float verdict must not change), while
-`1.5 + 0.0` is accepted. `pin_dfa_agrees` checks the recogniser on the same
-spans and `pin_one_occurrence_per_pass` records that one pass removes one
-term (`3 + 0.0 + 0.0` keeps its inner identity — the caller re-runs).
+The DFA and the strip's cursor arithmetic used to read the same `is_ws`.
+Narrowing that charset to `' '` left the file **green** (measured: 27v/0e on
+the pre-fix proof) — both sides moved together, so the proof said nothing
+about the tabs and newlines `trim_end()` really trims. The fix gives the DFA
+its own transcription, `is_ws_sem` / `all_ws_sem`, and proves the bridge
+`is_ws_sem_is_is_ws` / `all_ws_sem_iff`; `pin_ws_charset_covers_tabs` pins the
+shared value and `pin_bc_value_preserved` pins the value identity. The
+unpinned narrowing (the DFA's charset losing `\r`) now fails a law at
+31v/1e instead of passing silently.
+
+### Pins (executed)
+
+`pin_strip_shapes` the accepted shapes (whitespace on either side of `+`, a
+`scale=2; 3.5 + 0.0` argument, and the `Interpolate` last-part rule),
+`pin_strip_refusals` the refusals that carry the safety (`+ 0`, `+ 0.00`, a
+`0.0` that is not the last term, `-0.0`, no `+` at all, the empty string),
+`pin_the_decimal_gate` the second gate — `1 + 0.0` becomes `1`, which has no
+decimal, so the caller refuses it (the shader backend's float verdict must
+not change), while `1.5 + 0.0` is accepted. `pin_dfa_agrees` checks the
+recogniser on the same spans, `pin_one_occurrence_per_pass` records that one
+pass removes one term (`3.5 + 0.0 + 0.0` keeps its inner identity — the
+caller re-runs), `pin_ws_charset_covers_tabs` the whitespace charset on both
+sides, and `pin_bc_value_preserved` the value model.
+
+All seven are **executed**, not hand-checked. Before this family existed the
+module had no `#[cfg(test)]` block at all and every row was UNMIRRORED;
+they are now generated to `src/transforms/bc_float_pin_tests.rs` from
+`proofs/verus/pin_specs/bc_float_clean.json`, drive the real `transform` on a
+`capture(echo ARG | bc)` pipeline, and flip only for a test whose own `… ok`
+line was observed (7/7 PASS). The value row also runs the real `bc` on the
+original and on the stripped argument and requires identical output — the
+arithmetic fact the proof states over its integer term model.
 
 ### Mutants, measured
 
-Counted (the run still verifies 26 of 27 and fails exactly one): the strip
-dropping the `s[j] == '0'` check — caught by the law's DFA step into
-`SeeZero`, 26v/1e; the DFA's `AfterPlus` also accepting `'1'` — caught by
-the term-shape equation in `lemma_run_consumes`, 26v/1e; the term model's
-`total` base case being 1 — caught by `lemma_total_push`, 26v/1e. Refuted at
-simplification by a concrete `by (compute)` pin (the run aborts before its
-summary line): the trailing-whitespace gate dropped, the whitespace before
-`+` kept, `Trail` accepting any character, `BeforePlus` not skipping
-whitespace, `trim_start` not trimming, `last_plus` seeing only an adjacent
-`+`, and `skip_ws` skipping nothing. Each was restored byte-identically,
-sha256 re-checked (see `bc_float_clean_sync.txt`).
+Against the committed proof bytes (`0c5845f8b95f`), each restored
+byte-identically and re-checked, baseline 32v/0e:
+
+- Law-level (**31 verified, 1 error** each): the DFA's charset losing `\r`
+  (`all_ws_sem_iff` — this is the vacuity mutant, which used to be green),
+  `Trail` stopping accepting whitespace (`lemma_run_ws`), the strip dropping
+  its `s[j+2] == '0'` check and the strip accepting a signed `-0.0` tail
+  (both `strip_removes_only_the_identity`), the term model's `total` base
+  case being 1 (`lemma_total_push`), and `last_plus` seeing only an adjacent
+  `+` (`lemma_last_plus`).
+- Pin-level (rejected at simplification by `by (compute)`, recorded as pin
+  evidence and not as laws): the DFA's charset losing `\t`
+  (`pin_ws_charset_covers_tabs`), and `BeforePlus` not skipping whitespace
+  (`pin_dfa_agrees`).
 
 ### Scope (read this before quoting it)
 

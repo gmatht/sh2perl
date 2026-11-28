@@ -1415,6 +1415,162 @@ def emit_tcf_pin(pin: dict) -> list[str]:
     return out
 
 
+BCF_HELPERS = r'''use super::*;
+use crate::ir::{InterpPart, IrExpr, IrStmt, StrStyle};
+
+fn bcf_s(x: &str) -> IrExpr {
+    IrExpr::Str(x.to_string(), StrStyle::DoubleQuoted)
+}
+
+/// The `echo ARG | bc` pipeline the pass cleans, wrapped in the
+/// `capture(...)` call `transform_expr` keys on.
+fn bcf_pipeline(arg: IrExpr) -> IrExpr {
+    let echo = IrExpr::Arrow(vec![IrStmt::Expr(IrExpr::Call {
+        func: "exec".to_string(),
+        args: vec![bcf_s("echo"), IrExpr::Array(vec![arg])],
+    })]);
+    // the bc stage carries exactly one argument, like the source's shape check
+    let bc = IrExpr::Arrow(vec![IrStmt::Expr(IrExpr::Call {
+        func: "exec".to_string(),
+        args: vec![bcf_s("bc")],
+    })]);
+    let pipe = IrExpr::Call {
+        func: "pipeline".to_string(),
+        args: vec![IrExpr::Array(vec![echo, bc])],
+    };
+    IrExpr::Call {
+        func: "capture".to_string(),
+        args: vec![IrExpr::Arrow(vec![IrStmt::Expr(pipe)])],
+    }
+}
+
+/// Read echo's argument back out of the (possibly rewritten) pipeline.
+fn bcf_echo_arg(st: &[IrStmt]) -> Option<String> {
+    let IrStmt::Expr(IrExpr::Call { args, .. }) = &st[0] else {
+        return None;
+    };
+    // capture(<Arrow([Expr(pipeline(<Array([echo stage, bc stage])>))])>)
+    let Some(IrExpr::Arrow(outer)) = args.first() else {
+        return None;
+    };
+    let IrStmt::Expr(IrExpr::Call { args: pa, .. }) = &outer[0] else {
+        return None;
+    };
+    let Some(IrExpr::Array(stages)) = pa.first() else {
+        return None;
+    };
+    let IrExpr::Arrow(body) = &stages[0] else {
+        return None;
+    };
+    let IrStmt::Expr(IrExpr::Call { args: ea, .. }) = &body[0] else {
+        return None;
+    };
+    let Some(IrExpr::Array(items)) = ea.get(1) else {
+        return None;
+    };
+    match items.first() {
+        Some(IrExpr::Str(v, _)) => Some(v.clone()),
+        Some(IrExpr::Interpolate(parts)) => {
+            let mut out = String::new();
+            for p in parts {
+                match p {
+                    InterpPart::Lit(t) => out.push_str(t),
+                    InterpPart::Expr(_) => out.push_str("${x}"),
+                }
+            }
+            Some(out)
+        }
+        _ => None,
+    }
+}
+
+/// The `Interpolate` argument shape: `prefix ${mid} tail`.
+fn bcf_interp(prefix: &str, mid: &str, tail: &str) -> IrExpr {
+    IrExpr::Interpolate(vec![
+        InterpPart::Lit(prefix.to_string()),
+        InterpPart::Expr(Box::new(bcf_s(mid))),
+        InterpPart::Lit(tail.to_string()),
+    ])
+}
+
+fn bcf_run(arg: IrExpr) -> (bool, Option<String>) {
+    let mut st = vec![IrStmt::Expr(bcf_pipeline(arg))];
+    let changed = transform(&mut st);
+    (changed, bcf_echo_arg(&st))
+}
+
+/// What the REAL `bc` prints for `text` on its stdin.
+fn bcf_bc(text: &str) -> String {
+    use std::io::Write;
+    let mut c = std::process::Command::new("bc")
+        .stdin(std::process::Stdio::piped())
+        .stdout(std::process::Stdio::piped())
+        .spawn()
+        .expect("bc");
+    c.stdin
+        .as_mut()
+        .expect("stdin")
+        .write_all(text.as_bytes())
+        .expect("write");
+    c.stdin
+        .as_mut()
+        .expect("stdin")
+        .write_all(b"\n")
+        .expect("newline");
+    let out = c.wait_with_output().expect("bc");
+    String::from_utf8(out.stdout).expect("utf8")
+}
+'''
+
+
+
+def emit_bcf_pin(pin: dict) -> list[str]:
+    out = [
+        "",
+        "/// Manifest row: `pin %s` in bc_float_clean_sync.txt." % pin["pin"],
+        "/// " + pin["note"],
+        "#[test]",
+        "fn %s() {" % pin["pin"],
+    ]
+    kind = pin["kind"]
+    if kind == "bcf_fold":
+        for c in pin["cases"]:
+            if "arg" in c:
+                out.append('    let (changed, got) = bcf_run(bcf_s(%s));' % lit(c["arg"]))
+                if c["expect"] is None:
+                    out.append('    assert!(!changed, "the strip must refuse this shape");')
+                    out.append('    assert_eq!(got.as_deref(), Some(%s), "argument untouched");' % lit(c["arg"]))
+                else:
+                    out.append('    assert!(changed, "the strip must fire");')
+                    out.append('    assert_eq!(got.as_deref(), Some(%s), "stripped text");' % lit(c["expect"]))
+            else:
+                out.append(
+                    '    let (changed, got) = bcf_run(bcf_interp(%s, %s, %s));'
+                    % (lit(c["prefix"]), lit(c["mid"]), lit(c["tail"]))
+                )
+                if c["expect"] is None:
+                    out.append('    assert!(!changed, "the Interpolate last part must be refused");')
+                else:
+                    out.append('    assert!(changed, "the Interpolate last part must be stripped");')
+                    out.append('    assert_eq!(got.as_deref(), Some(%s), "stripped interpolate");' % lit(c["expect"]))
+    elif kind == "bcf_value":
+        for c in pin["cases"]:
+            out.append('    let (changed, got) = bcf_run(bcf_s(%s));' % lit(c["arg"]))
+            out.append('    assert!(changed, "a value case must fold");')
+            out.append('    let folded = got.expect("stripped argument");')
+            out.append('    let before = bcf_bc(%s);' % lit(c["arg"]))
+            out.append('    let after = bcf_bc(&folded);')
+            out.append('    assert!(!before.trim().is_empty(), "bc must produce a value");')
+            out.append(
+                '    assert_eq!(before, after,'
+                ' "bc prints the same value before and after the strip");'
+            )
+    else:
+        raise SystemExit("unknown bc_float kind %s" % kind)
+    out.append("}")
+    return out
+
+
 FAMILIES = {
     "f1": (RUST_HELPERS, emit_pin),
     "status_reads": (STATUS_HELPERS, emit_status_pin),
@@ -1425,6 +1581,7 @@ FAMILIES = {
     "command_v": (COMMAND_V_HELPERS, emit_command_v_pin),
     "command_noop_cond": (COMMAND_NOOP_COND_HELPERS, emit_command_noop_cond_pin),
     "text_capture": (TCF_HELPERS, emit_tcf_pin),
+    "bc_float": (BCF_HELPERS, emit_bcf_pin),
 }
 
 
