@@ -13,7 +13,7 @@
 // agree; where they do not, the divergence is PROVED (d-F4-1, d-F4-2) rather
 // than left as a comment.
 //
-// Proved here (115 obligations, 0 errors):
+// Proved here (113 obligations, 0 errors):
 //   xargs_appends_the_input_word — the general agreement law: `echo CONTENT |
 //                                xargs echo A B` joins A, B, CONTENT exactly the
 //                                way `echo` joins the command's argv with the
@@ -916,6 +916,22 @@ pub proof fn pin_one_word_echo_is_the_word_plus_newline()
 // the reverse step and the flag decoder all have their own models there.
 // `-u`/`-k`/`-t` stay refused by the fold itself, and `-h` plus the float
 // spellings are d-F4-3c.
+//
+// REVIEWED 2026-11-28 (fresh read, nothing weakened). The law's two sides are
+// independent: `sorted`/`cnt` are recursions over `lex_lt` and index equality
+// that never mention `ins`/`pass_sort`; §7's `asc_key`/`desc_key`/`desc_lex`
+// are index-quantified predicates over `num_key`/`lex_lt`, and `num_key` is
+// built from `all_digits`/`digits_acc`, not from `ins_key`; §6's
+// `any_missing`/`ls_rc`/`prints_echo` never mention `scan_rc`. One boundary is
+// stated rather than implied: `ins_key` READS `num_key`, so the law proves that
+// the insertion orders by that key — that the emitted `sort_by` comparator
+// implements `num_key` is the model's fidelity claim (`digits_line_key`,
+// `non_number_key_is_zero`), not something restated here. Trims made after the
+// review: `lemma_sorted_fold` was dead (defined, never called) and is gone, the
+// `lemma_skip_len2` wrapper is inlined into `lemma_skip_len`, and duplicate
+// `reveal`s / an assert already implied by the line above it are dropped. The
+// ten mutants that run through the trimmed code were re-measured and are still
+// rejected (M12-M19, M23, M26 in the manifest's table).
 
 /// Ordered: no adjacent pair descends. This is the *semantic* ordering model.
 pub open spec fn sorted(ys: Seq<Word>) -> bool
@@ -1031,16 +1047,6 @@ proof fn lemma_sorted_unfold(ys: Seq<Word>)
     reveal(sorted);
 }
 
-/// Unfolding `sorted` for the conclusion direction.
-proof fn lemma_sorted_fold(ys: Seq<Word>)
-    requires
-        ys.len() > 1 ==> (!lex_lt(ys[1], ys[0]) && sorted(ys.skip(1))),
-    ensures
-        sorted(ys),
-{
-    reveal(sorted);
-}
-
 /// Prepending a line that is not greater than the head keeps the list sorted.
 proof fn lemma_sorted_cons(a: Word, rest: Seq<Word>)
     requires
@@ -1054,7 +1060,6 @@ proof fn lemma_sorted_cons(a: Word, rest: Seq<Word>)
         lemma_sorted_unfold(seq![a] + rest);
     } else {
         assert((seq![a] + rest).len() == rest.len() + 1);
-        assert((seq![a] + rest).len() >= 2);
         lemma_cons_zero(a, rest);
         lemma_cons_index(a, rest, 0);
         lemma_skip_cons(a, rest);
@@ -1602,15 +1607,6 @@ pub open spec fn rev(ys: Seq<Word>) -> Seq<Word>
     }
 }
 
-proof fn lemma_skip_len2(ys: Seq<Word>)
-    requires
-        ys.len() >= 2,
-    ensures
-        ys.skip(1).len() == ys.len() - 1,
-{
-    lemma_skip_len(ys);
-}
-
 /// The insertion step's head is the inserted line or the list's own head.
 proof fn lemma_ins_key_head(x: Word, ys: Seq<Word>)
     requires
@@ -1622,7 +1618,6 @@ proof fn lemma_ins_key_head(x: Word, ys: Seq<Word>)
     if num_key(ys[0]) >= num_key(x) {
         lemma_cons_zero(x, ys);
     } else {
-        reveal(ins_key);
         assert(ins_key(x, ys) == seq![ys[0]] + ins_key(x, ys.skip(1)));
         lemma_cons_zero(ys[0], ins_key(x, ys.skip(1)));
     }
@@ -1806,7 +1801,7 @@ proof fn lemma_rev_index(ys: Seq<Word>, i: int)
     } else {
         assert(rev(ys) == rev(ys.skip(1)).push(ys[0]));
         lemma_rev_len(ys.skip(1));
-        lemma_skip_len2(ys);
+        lemma_skip_len(ys);
         if i < ys.len() - 1 {
             lemma_rev_index(ys.skip(1), i);
             lemma_skip_index(ys, ys.len() - 2 - i);
@@ -1826,7 +1821,6 @@ proof fn lemma_cnt_at_push(x: Word, ys: Seq<Word>, y: Word, k: int)
     if k >= ys.len() as int {
         assert(k == ys.len() as int);
         assert(ys.push(y).len() == ys.len() + 1);
-        reveal(cnt_at);
         assert(ys.push(y)[k] == y);
         assert(k + 1 >= ys.push(y).len() as int);
         assert(cnt_at(x, ys.push(y), k + 1) == 0int);
@@ -1835,7 +1829,6 @@ proof fn lemma_cnt_at_push(x: Word, ys: Seq<Word>, y: Word, k: int)
         assert(ys.push(y).len() == ys.len() + 1);
         assert(ys.push(y)[k] == ys[k]);
         lemma_cnt_at_push(x, ys, y, k + 1);
-        reveal(cnt_at);
         assert((ys.push(y))[k] == x <==> ys[k] == x);
     }
 }

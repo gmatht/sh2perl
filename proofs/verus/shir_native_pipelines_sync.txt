@@ -1,5 +1,5 @@
 # verus-sync-coverage manifest: shir_native_pipelines
-# source sha: shir_native_stmt=3b243603f88f  proof sha: ca457164c1bf
+# source sha: shir_native_stmt=3b243603f88f  proof sha: e91b4227069f
 # source: src/transforms/shir_native_stmt.rs — cluster F4, `xargs` / `comm` /
 #   `diff` / `sort` / `ls`
 #   surface: native_echo_xargs_stmt (5290), native_comm_stmt (6756),
@@ -81,7 +81,7 @@
 #   lemma_concat_assoc → xargs_appends_the_input_word
 #   lemma_lex_not_lt → comm_12_one_common_line
 #   lemma_prints_identical, lemma_lcs_identical → diff_identical_inputs_are_silent
-#   lemma_lex_asym, lemma_sorted_unfold, lemma_sorted_fold, lemma_sorted_cons,
+#   lemma_lex_asym, lemma_sorted_unfold, lemma_sorted_cons,
 #     lemma_sorted_tail, lemma_sorted_two, lemma_ins_head, lemma_ins_sorted,
 #     lemma_sort_sorted → sort_is_a_sorted_permutation (ordering half)
 #   lemma_cnt_cons, lemma_cnt_at_cons_tail, lemma_cnt_skip_at, lemma_cnt_peel,
@@ -142,7 +142,7 @@ guard law diff_identical_inputs_are_silent (d-F4-5): PRESENT
 guard law sort_is_a_sorted_permutation (d-F4-3, ordering AND multiset): PRESENT
 guard law ls_fallback_prints_iff_missing (d-F4-3, `|| echo` wiring): PRESENT
 guard lemma_concat_assoc / lemma_lex_not_lt / lemma_prints_identical / lemma_lcs_identical: PRESENT
-guard lemma_lex_asym / lemma_sorted_unfold / lemma_sorted_fold / lemma_sorted_cons / lemma_sorted_tail / lemma_sorted_two / lemma_ins_head / lemma_ins_sorted / lemma_sort_sorted: PRESENT
+guard lemma_lex_asym / lemma_sorted_unfold / lemma_sorted_cons / lemma_sorted_tail / lemma_sorted_two / lemma_ins_head / lemma_ins_sorted / lemma_sort_sorted: PRESENT
 guard lemma_cnt_cons / lemma_cnt_at_cons_tail / lemma_cnt_skip_at / lemma_cnt_peel / lemma_ins_cnt / lemma_sort_cnt: PRESENT
 guard lemma_cons_zero / lemma_cons_index / lemma_skip_cons / lemma_skip_len / lemma_skip_index: PRESENT
 guard lemma_scan_unfold / lemma_any_unfold / lemma_scan_is_status / lemma_ls_rc_matches: PRESENT
@@ -157,7 +157,7 @@ guard diff beyond identical inputs: NOT PROVED (d-F4-5b)
 guard printf/echo escape decoding: DELEGATED to cluster E (shir_native_echo.rs)
 
 [counts]
-115 verified, 0 errors (verus --triggers-mode silent --rlimit 40 shir_native_pipelines.rs)
+113 verified, 0 errors (verus --triggers-mode silent --rlimit 40 shir_native_pipelines.rs)
 22 pins, all UNMIRRORED: the module's 8 tests cover command chains, file tests and
 the two find/head walks — none exercises comm, the xargs fold, the diff fold, sort
 or ls. (The 8 tests are in shir_native_stmt.rs; the two find/head ones assert the
@@ -230,6 +230,29 @@ outside this cluster's surface:
   load-bearing: M8/M9/M10 kill the xargs/diff laws, M11 the DP diagonal lemma,
   M12–M15 the sorted-permutation law's two halves, M16–M18 the `ls` status law,
   and M19–M26 the `-n`/`-r`/`-nr` laws and the flag decoder.
+
+REVIEWED 2026-11-28 (fresh read of d-F4-3 / d-F4-3b; proof sha e91b4227069f, whose
+code equals 7a1206ae8b04 — the only later change is the `.rs` header comment). The
+laws are over INDEPENDENT models, checked line by line: `sorted`/`cnt` are
+recursions over `lex_lt` and index equality and never mention `ins`/`pass_sort`;
+`asc_key`/`desc_key`/`desc_lex` are index-quantified predicates over `num_key`/
+`lex_lt`, and `num_key` is built from `all_digits`/`digits_acc`; `any_missing`/
+`ls_rc`/`prints_echo` never mention `scan_rc`. The one shared symbol is `num_key`
+inside `ins_key`, so the law is "the insertion ORDERS BY that key" — that the
+emitted `sort_by` comparator implements `num_key` is the model's fidelity claim
+(`digits_line_key`, `non_number_key_is_zero`), now stated in the header instead of
+implied. Shortened without weakening: `lemma_sorted_fold` removed (dead — never
+called anywhere), the `lemma_skip_len2` wrapper inlined into `lemma_skip_len`,
+duplicate `reveal`s and one assert implied by the line above it dropped;
+115 -> 113 obligations, still 0 errors.
+Coverage re-measured, not assumed: the ten mutants whose path runs through the
+trimmed code were re-run under 7a1206ae8b04 and every one still fails — M12/M13/
+M15 (rejected at simplification, the §5 pins at line 1368), M14 (`0 == 2` false,
+the duplicate pin at 1382), M16/M18 (postcondition, lemma_scan_is_status), M17
+(2 errors: the law AND the silent pin), M19 (pin_sort_n_keeps_equal_keys_in_input_
+order, line 2072), M23 (3 assertion failures across the `-n` ordering lemmas),
+M26 (non_number_key_is_zero). M20-M22, M24 and M25 target model lines this review
+left byte-identical, so their recorded verdicts stand.
 
 [exec]
 # NONE, by design: no source test covers comm, the xargs fold, the diff fold, sort
