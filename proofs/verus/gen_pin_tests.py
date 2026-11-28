@@ -354,6 +354,18 @@ fn fn_with(body: Vec<IrStmt>) -> IrStmt {
 }
 '''
 
+BUILDERS_STORE = {
+    "s_s_r": "vec![assign_one(), assign_one(), test_operand()]",
+    "r_s_s": "vec![test_operand(), assign_one(), assign_one()]",
+    "r_s_r": "vec![test_operand(), assign_one(), test_operand()]",
+    "s_s": "vec![assign_one(), assign_one()]",
+    "s_exit": "vec![assign_one(), exit_bare()]",
+    "s_nested_s": "vec![assign_one(), redirect_read(), assign_one()]",
+    "r_s": "vec![test_operand(), assign_one()]",
+    "empty": "vec![]",
+    "r": "vec![test_operand()]",
+}
+
 BUILDERS = {
     "loop_tail": 'vec![while_true(vec![echo("tick")]), echo("dead")]',
     "loop_with_break": 'vec![while_true(vec![echo("tick"), IrStmt::Break]), echo("live")]',
@@ -480,6 +492,22 @@ def emit_status_pin(pin: dict) -> list[str]:
             '    assert!(!stmt_definitely_stores_status(&st), "and stores none");',
             '    assert!(!stmt_nested_reads_before_store(&st), "nor nests one");',
         ]
+    elif kind == "liveness":
+        for case in pin["cases"]:
+            b = case["build"]
+            assert b in BUILDERS_STORE, "unknown witness %s" % b
+            out.append(
+                "    let lv = status_store_liveness(&program(%s));" % BUILDERS_STORE[b]
+            )
+            if case.get("expect") is None:
+                out.append(
+                    '    assert!(lv.is_none(), "expected no localisation on %s");' % b
+                )
+            else:
+                got = ", ".join("true" if x else "false" for x in case["expect"])
+                out.append(
+                    '    assert_eq!(lv, Some(vec![%s]), "liveness on %s");' % (got, b)
+                )
     elif kind == "liveness_bodies":
         out += [
             "    let lv = status_liveness(&program(vec![fn_localising_body(), echo_hi(), echo_hi()]));",
@@ -596,7 +624,7 @@ def check_rows(spec: dict, text: str) -> list[str]:
 
 
 def run_tests(names: list[str]) -> dict[str, bool]:
-    cmd = ["cargo", "test", "--lib", "pin_tests::", "--", "--test-threads", "1"]
+    cmd = ["cargo", "test", "--lib", "pin_tests", "--", "--test-threads", "1"]
     print(f"$ {' '.join(cmd)}   (in {REPO})", flush=True)
     proc = subprocess.run(cmd, cwd=REPO, capture_output=True, text=True, timeout=1800)
     out = proc.stdout + proc.stderr

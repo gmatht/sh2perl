@@ -8783,13 +8783,19 @@ leading-zero mutant. The file was restored byte-identically after each run
   every store — but the call-site machine (which body runs where, with which
   caller status) is out of this model. So is the `None`-means-keep-everything
   default.
-- Pins mirror the source's own tests
-  (`stores_before_the_nearest_read_are_dropped`,
-  `stores_after_the_last_read_keep_only_the_exit_store`,
-  `each_read_keeps_the_store_it_observes`,
-  `last_statement_store_is_live_without_a_reader`, `bare_exit_reads_the_status`);
-  the body-localisation and `program_reads_status` tests belong to the
+- The body-localisation and `program_reads_status` tests belong to the
   companion models.
+
+### Pins, executed
+
+All eleven rows are MAPPED to generated tests: `pin_specs/status_reads.json`
+names each witness, `gen_pin_tests.py` writes
+`src/shir_passes/status_reads_liveness_pin_tests.rs` driving the real
+`status_store_liveness`, and a row flips to MAPPED only after its own test
+passes under `cargo test --lib pin_tests`. `pin_empty_list` records a
+divergence rather than hiding it: the model's `live` on an empty list is the
+empty vector, while the source answers `None` ("keep every store") — equal in
+effect, and `None` is the conservative side.
 
 ## status_reads_traversal.rs — the owed `$?`-traversal law, discharged (70)
 

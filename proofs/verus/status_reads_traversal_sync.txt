@@ -1,13 +1,15 @@
 # verus-sync-coverage manifest: status_reads_traversal
-# source sha: status_reads=648d3248f5f2  proof sha: ad95c02d8d5a
+# source sha: status_reads=7319a9ef6136  proof sha: ad95c02d8d5a
 #   RE-AUDITED 2026-11-28 (the recorded value names 3d0b3256d "python: drop
 #   status stores no reader can observe"): 3d0b3256d and HEAD are
-#   byte-identical for src/shir_passes/status_reads.rs, and the only change
-#   since is the `#[cfg(test)] #[path = "status_reads_pin_tests.rs"] mod
-#   pin_tests;` registration appended at EOF -- six lines after the existing
-#   test module, outside every function this proof models. The analysis
-#   functions, and the source unit tests these pins used to name, are
-#   untouched; re-run the generator to re-derive the verdicts below.
+#   byte-identical for src/shir_passes/status_reads.rs. The only changes since
+#   are two `#[cfg(test)] #[path = ...] mod ...;` registrations appended at
+#   EOF -- `pin_tests` (status_reads_pin_tests.rs, this proof's family) and
+#   `pin_tests_liveness` (status_reads_liveness_pin_tests.rs, the Stage-0
+#   family) -- six lines each, after the existing test module and outside
+#   every function this proof models. The analysis functions, and the source
+#   unit tests these pins used to name, are untouched; re-run the generator to
+#   re-derive the verdicts below.
 
 [pins]
 pin pin_test_operand_is_a_read -> test pin_test_operand_is_a_read: MAPPED

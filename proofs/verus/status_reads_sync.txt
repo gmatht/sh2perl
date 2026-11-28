@@ -1,24 +1,25 @@
 # verus-sync-coverage manifest: status_reads
-# source sha: status_reads=648d3248f5f2  proof sha: 467f5b75b0c5
+# source sha: status_reads=7319a9ef6136  proof sha: 467f5b75b0c5
 #   RE-AUDITED 2026-11-28 (the recorded value names 3d0b3256d "python: drop
 #   status stores no reader can observe"): 3d0b3256d and HEAD are
-#   byte-identical for src/shir_passes/status_reads.rs; the only change since
-#   is the `#[cfg(test)] #[path = "status_reads_pin_tests.rs"] mod pin_tests;`
-#   registration appended at EOF, six lines after the test module and outside
-#   every function this proof models.
+#   byte-identical for src/shir_passes/status_reads.rs. The only changes since
+#   are two `#[cfg(test)] #[path = ...] mod ...;` registrations appended at
+#   EOF -- `pin_tests` (status_reads_pin_tests.rs) and `pin_tests_liveness`
+#   (status_reads_liveness_pin_tests.rs) -- six lines each, after the test
+#   module and outside every function this proof models.
 
 [pins]
-pin pin_bare_exit_reads_the_status -> test bare_exit_reads_the_status: MAPPED
-pin pin_dead_store_is_unobservable -> UNMIRRORED (by design — see the proof-campaign plan §(b).4)
-pin pin_each_read_keeps_the_store_it_observes -> test each_read_keeps_the_store_it_observes: MAPPED
-pin pin_empty_list -> UNMIRRORED (by design — see the proof-campaign plan §(b).4)
-pin pin_exit_observes_the_kept_store -> UNMIRRORED (by design — see the proof-campaign plan §(b).4)
-pin pin_init_read_needs_the_initialiser -> UNMIRRORED (by design — see the proof-campaign plan §(b).4)
-pin pin_last_statement_store_is_live_without_a_reader -> test last_statement_store_is_live_without_a_reader: MAPPED
-pin pin_nested_after_write_keeps_the_store -> UNMIRRORED (by design — see the proof-campaign plan §(b).4)
-pin pin_single_read_is_live -> UNMIRRORED (by design — see the proof-campaign plan §(b).4)
-pin pin_stores_after_the_last_read_keep_only_the_exit_store -> test stores_after_the_last_read_keep_only_the_exit_store: MAPPED
-pin pin_stores_before_the_nearest_read_are_dropped -> test stores_before_the_nearest_read_are_dropped: MAPPED
+pin pin_bare_exit_reads_the_status -> test pin_bare_exit_reads_the_status: MAPPED
+pin pin_dead_store_is_unobservable -> test pin_dead_store_is_unobservable: MAPPED
+pin pin_each_read_keeps_the_store_it_observes -> test pin_each_read_keeps_the_store_it_observes: MAPPED
+pin pin_empty_list -> test pin_empty_list: MAPPED
+pin pin_exit_observes_the_kept_store -> test pin_exit_observes_the_kept_store: MAPPED
+pin pin_init_read_needs_the_initialiser -> test pin_init_read_needs_the_initialiser: MAPPED
+pin pin_last_statement_store_is_live_without_a_reader -> test pin_last_statement_store_is_live_without_a_reader: MAPPED
+pin pin_nested_after_write_keeps_the_store -> test pin_nested_after_write_keeps_the_store: MAPPED
+pin pin_single_read_is_live -> test pin_single_read_is_live: MAPPED
+pin pin_stores_after_the_last_read_keep_only_the_exit_store -> test pin_stores_after_the_last_read_keep_only_the_exit_store: MAPPED
+pin pin_stores_before_the_nearest_read_are_dropped -> test pin_stores_before_the_nearest_read_are_dropped: MAPPED
 
 [guards]
 guard need starts true: PRESENT
@@ -39,20 +40,22 @@ pins: 11
 # Verus obligation count — the gate asserts N verified separately.
 
 [exec]
-# Each MAPPED test above, EXECUTED against the live source (one
-# module-suite run per model; per-test verdicts grepped from output).
-# A mapped test that fails or vanishes from the run is drift — FATAL.
-# The checker RUNS each mapped test (one module-suite cargo test per
-# source file) and records the per-test PASS/FAIL verdict below.
-# all suites built; per-test verdicts below
-exec pin_bare_exit_reads_the_status (bare_exit_reads_the_status): PASS
-exec pin_dead_store_is_unobservable: UNMIRRORED (not executed)
-exec pin_each_read_keeps_the_store_it_observes (each_read_keeps_the_store_it_observes): PASS
-exec pin_empty_list: UNMIRRORED (not executed)
-exec pin_exit_observes_the_kept_store: UNMIRRORED (not executed)
-exec pin_init_read_needs_the_initialiser: UNMIRRORED (not executed)
-exec pin_last_statement_store_is_live_without_a_reader (last_statement_store_is_live_without_a_reader): PASS
-exec pin_nested_after_write_keeps_the_store: UNMIRRORED (not executed)
-exec pin_single_read_is_live: UNMIRRORED (not executed)
-exec pin_stores_after_the_last_read_keep_only_the_exit_store (stores_after_the_last_read_keep_only_the_exit_store): PASS
-exec pin_stores_before_the_nearest_read_are_dropped (stores_before_the_nearest_read_are_dropped): PASS
+# Every MAPPED row above was EXECUTED against the live source by the
+# generator that owns the tests:
+#   python3 proofs/verus/gen_pin_tests.py proofs/verus/pin_specs/status_reads.json --run
+# That writes src/shir_passes/status_reads_liveness_pin_tests.rs, runs each
+# generated test through `cargo test --lib pin_tests`, and records the verdict
+# below ONLY for a test whose own `<module>::<name> ... ok` line it observed.
+# A row whose test later fails or vanishes is demoted back to UNMIRRORED by
+# the next run, so a MAPPED row here cannot outlive the test it names.
+exec pin_bare_exit_reads_the_status (pin_bare_exit_reads_the_status): PASS
+exec pin_dead_store_is_unobservable (pin_dead_store_is_unobservable): PASS
+exec pin_each_read_keeps_the_store_it_observes (pin_each_read_keeps_the_store_it_observes): PASS
+exec pin_empty_list (pin_empty_list): PASS
+exec pin_exit_observes_the_kept_store (pin_exit_observes_the_kept_store): PASS
+exec pin_init_read_needs_the_initialiser (pin_init_read_needs_the_initialiser): PASS
+exec pin_last_statement_store_is_live_without_a_reader (pin_last_statement_store_is_live_without_a_reader): PASS
+exec pin_nested_after_write_keeps_the_store (pin_nested_after_write_keeps_the_store): PASS
+exec pin_single_read_is_live (pin_single_read_is_live): PASS
+exec pin_stores_after_the_last_read_keep_only_the_exit_store (pin_stores_after_the_last_read_keep_only_the_exit_store): PASS
+exec pin_stores_before_the_nearest_read_are_dropped (pin_stores_before_the_nearest_read_are_dropped): PASS
