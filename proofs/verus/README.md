@@ -46,7 +46,8 @@ invoked by `proofs/verus/ci_verify.sh` on every `*.rs` a pull request touches
 plus a fixed subset (`status_reads`, `status_reads_traversal`,
 `uae_terminators`, `affix_strip_fold`, `text_capture_fold`, `bc_float_clean`,
 `shir_native_herestring`, `shir_native_status_folds`,
-`shir_native_files_invariant`). Any summary other than `N verified, 0 errors`
+`shir_native_files_invariant`, `shir_native_find_ls`,
+`shir_native_pipelines`). Any summary other than `N verified, 0 errors`
 fails the job. The manifests' sha pins are checked separately by
 `check_sync.py` in `test.yml`; the two are complementary.
 
@@ -9605,6 +9606,55 @@ entry is not a lost rewrite but wrong output, so this is a soundness law.
   are int keys and payloads opaque bytes (no resolution, symlinks or CWD).
   `record_file_write` has no source test, so all 9 pins are **UNMIRRORED by
   design** and no `[exec]` row exists.
+
+### Items F3 / F4 — `find`/`head` and `xargs`/`comm` (18 + 10 obligations)
+
+    verus --triggers-mode silent --rlimit 40 proofs/verus/shir_native_find_ls.rs
+    -> verification results:: 18 verified, 0 errors
+    verus --triggers-mode silent --rlimit 40 proofs/verus/shir_native_pipelines.rs
+    -> verification results:: 10 verified, 0 errors
+
+**F3 (`shir_native_find_ls.rs`).** The fold does not emit `find`; it emits a Perl
+walk whose matcher is `substr($__e, -N) eq Q`. Proved against an indexwise
+suffix test: `perl_substr_neg_is_the_suffix_glob` — including the case that makes
+a transcription wrong, a name SHORTER than the pattern, where Perl clamps the
+offset to 0 and compares the whole name. The word-list parser is checked against
+a counted grammar, not against itself: `find_accepts_iff_grammar` (both
+directions), and `find_accepts_a_greedy_multi_pattern` proves **d-F3-1** — a
+second `-name` overwrites the first, so `find DIR -name a -name b` is accepted and
+matched by `b` alone while `find` requires both. `head -N` collects the whole
+walk and splices; `head_take_is_the_first_n` proves that equals the first N.
+
+**F4 (`shir_native_pipelines.rs`).** Modelled two-mode against the shell:
+**d-F4-1** (`xargs` collapses runs of blanks, the fold copies them) and
+**d-F4-2** (`echo "" | xargs echo A` prints `A`, the fold emits `A<space>`) are
+proved as divergences, and `comm_12_one_common_line` proves the double advance
+that makes the `-12` walk print a duplicate once.
+
+**What is NOT mirrored or NOT proved** — said plainly:
+- `ls` is not covered: its lines are a sorted readdir, i.e. the sort/permutation
+  law, which is unproved (d-F4-3), and its `|| echo` status wiring with it.
+- The general `xargs` one-word agreement law was written and run and does not
+  discharge yet (the separator-join induction needs skip/concat facts Verus does
+  not give here) — so only the divergences are claimed for `xargs` (d-F4-4 is its
+  number in the manifest).
+- The general `comm -12` intersection law needs ordered-membership invariants and
+  is not proved; only the double-advance step is.
+- `diff` is unproved (d-F4-5), as the plan budgeted: even "identical inputs are
+  silent" goes through the LCS backtrack.
+- Pins: all 4 F3 pins and all 3 F4 pins are **UNMIRRORED**. The two
+  `find_with[out]_head_*` tests exercise the same fold but assert its EMITTED
+  TEXT, so they would not notice a change to the splice law; no source test
+  asserts the matcher, the grammar, `comm` or the `xargs` fold. The manifests say
+  this rather than recording a MAPPED row that would imply coverage.
+
+**Mutants** (each on a `/tmp` copy, source untouched, shas re-checked):
+F3 `bb35ad52c6d2` — window offset dropped 17v/1e, second-directory refusal made
+always-true 17v/1e, pattern counter removed from the grammar (rejected at
+simplification), head splice ignoring N 17v/1e. F4 `23e40326f8c0` — echo
+separator dropped, comm single-advance, echo newline dropped: all rejected at
+simplification. Every rejection inspected as a verification failure, none a
+compile error.
 
 ## `shir_native_stmt.rs` — no single law; a decomposition plan (cluster C proved)
 

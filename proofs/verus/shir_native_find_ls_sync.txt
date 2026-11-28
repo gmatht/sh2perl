@@ -1,0 +1,72 @@
+# verus-sync-coverage manifest: shir_native_find_ls
+# source sha: shir_native_stmt=3ae1b4d0bc71  proof sha: bb35ad52c6d2
+# source: src/transforms/shir_native_stmt.rs — cluster F3, `find` / `head`
+#   surface: native_find_stmt (6286) — its emitted matcher, its word-list parser,
+#   its `head -N` splice; native_ls_stmt (4625) is NOT covered (see below).
+#
+# THE LAWS, each against a semantic side that is not the pass's own helper:
+#   perl_substr_neg_is_the_suffix_glob — the emitted
+#     `substr($__e, -N) eq Q` (N = |PAT| after the `*`) is exactly "e ends with
+#     PAT", read off by INDEX, including names shorter than the pattern where
+#     Perl clamps the offset to 0 and compares the whole name.
+#   find_accepts_iff_grammar — the fold's `while` loop accepts exactly the
+#     declared grammar (one directory word, one or more `-name <pattern>` pairs,
+#     no stray flags, no pattern-less `-name`). The pass side is the
+#     `(dir, pat)` accumulator loop; the semantic side counts ITEMS and decides
+#     at the end, so the two are different automata.
+#   find_accepts_a_greedy_multi_pattern — d-F3-1: a second `-name` OVERWRITES the
+#     first, so `find DIR -name a -name b` is accepted and matched by `b` alone,
+#     while `find` requires both. Proved as a divergence with a witness name.
+#   head_take_is_the_first_n — `head -N` short-circuits in the shell, while the
+#     fold collects the whole finite walk and splices `@__out[0 .. $n-1]`; the
+#     splice equals the first N results.
+#
+# Supporting lemmas and who consumes them:
+#   lemma_last_n_len, lemma_last_n_index → perl_substr_neg_is_the_suffix_glob
+#   lemma_items_pats_pos, lemma_items_two_dirs → find_accepts_iff_grammar
+#   lemma_take_first_step → head_take_is_the_first_n
+#
+# NOT covered by this file, stated not claimed: `ls` (native_ls_stmt) — its lines
+# are a sorted readdir, so its law is the sort/permutation law, which is not
+# proved (F4's manifest records it as d-F4-3); mtime/permission predicates (the
+# fold refuses them and so does the model); readdir order; symlink loops.
+
+[pins]
+pin pin_a_dotted_glob_selects_the_suffix -> UNMIRRORED (no source test asserts the matcher)
+pin pin_a_short_name_is_not_selected -> UNMIRRORED (no source test asserts the clamp)
+pin pin_two_name_flags_keep_the_last -> UNMIRRORED (no source test covers two -name flags)
+pin pin_head_two_of_four -> UNMIRRORED (the two `find_with[out]_head_*` tests assert the EMITTED TEXT of this fold, not the splice obligation; a change to the model would not move them, so no MAPPED claim is made)
+
+[guards]
+guard law perl_substr_neg_is_the_suffix_glob (the matcher): PRESENT
+guard law find_accepts_iff_grammar (the accept set, both directions): PRESENT
+guard law find_accepts_a_greedy_multi_pattern (d-F3-1): PRESENT
+guard law head_take_is_the_first_n (the splice): PRESENT
+guard lemma_last_n_len / lemma_last_n_index: PRESENT
+guard lemma_items_pats_pos / lemma_items_two_dirs: PRESENT
+guard lemma_take_first_step: PRESENT
+guard ls (sorted listing, `|| echo` status): NOT THIS PROOF (d-F4-3)
+guard mtime/permission predicates, readdir order, symlink loops: OUT OF MODEL
+
+[counts]
+18 verified, 0 errors (verus --triggers-mode silent --rlimit 40 shir_native_find_ls.rs)
+4 pins, all UNMIRRORED by design: the module's 8 tests cover command chains,
+file tests and the two find/head walks (emitted text), none asserts the matcher,
+the grammar or the splice law this file proves.
+
+mutants measured 2026-11-28 against proof sha bb35ad52c6d2, each on a /tmp copy
+(the source untouched), sha re-checked afterwards (bb35ad52c6d2 before and after):
+  M1 the semantic side becomes a PREFIX test (window offset dropped) 17v/1e
+  M2 the second-directory-word refusal made always-true               17v/1e
+  M3 a grammar entry removed (the pattern counter stops incrementing) rejected at simplification
+  M4 the head splice ignores N (keeps everything)                     17v/1e
+  Every rejection inspected: all are VERIFICATION failures (`postcondition not
+  satisfied` / `expression simplifies to false`), none a mutant-spelling compile
+  error. The dropped case (M1), the always-true guard (M2) and the removed
+  grammar entry (M3) are each caught.
+
+[exec]
+# NONE, by design: the two source tests that exercise this fold
+# (find_with_head_short_circuits_the_walk, find_without_head_keeps_the_full_walk)
+# assert the EMITTED TEXT of the walk, not the matcher, the grammar or the
+# splice law, so no [exec] row is claimed and no pin is marked MAPPED.
