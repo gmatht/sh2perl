@@ -1,18 +1,17 @@
 #!/usr/bin/env perl
 use strict;
-use feature 'say';
-
-our @__sh_args;
-our $__sh_args_n;
-
 use warnings;
-local @__sh_args = @ARGV;
-local $__sh_args_n = scalar(@ARGV);
 use English qw(-no_match_vars $ERRNO $EVAL_ERROR $INPUT_RECORD_SEPARATOR $OS_ERROR $PROGRAM_NAME);
 
 my $main_exit_code = 0;
 our $CHILD_ERROR = 0;
-my $__argc = @__sh_args;
+use feature 'say';
+
+our @__sh_args;
+our $__sh_args_n;
+@__sh_args = @ARGV;
+$__sh_args_n = scalar(@__sh_args);
+my $__argc = @ARGV;
 my $__nocasematch = 0;
 my $d;
 my $nested_result;

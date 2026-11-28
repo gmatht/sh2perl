@@ -1,14 +1,13 @@
 #!/usr/bin/env perl
 use strict;
+use warnings;
 use feature 'say';
 
 our @__sh_args;
 our $__sh_args_n;
-
-use warnings;
-local @__sh_args = @ARGV;
-local $__sh_args_n = scalar(@ARGV);
-my $__argc = @__sh_args;
+@__sh_args = @ARGV;
+$__sh_args_n = scalar(@__sh_args);
+my $__argc = @ARGV;
 my $i;
 
 if (-f 'file.txt') {

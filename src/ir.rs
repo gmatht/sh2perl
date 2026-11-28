@@ -1501,6 +1501,28 @@ fn first_code_newline(s: &str) -> Option<usize> {
         {
             out.push_str("our $CHILD_ERROR = 0;\n");
         }
+        // Positional parameters live in `@__sh_args`: a NORMAL array bound
+        // from Perl's magic `@ARGV` once, at file scope. Two reasons not to
+        // use `@ARGV` itself — a `set --`/`shift` replaces the list (a plain
+        // array assignment is the honest spelling), and `do FILE` runs the
+        // included file with `@ARGV` emptied, where the positional-slice
+        // helper read the wrong array.
+        //
+        // Emitting the name, the declaration and the binding HERE is what
+        // lets the CLI's fixup layer stop renaming `$ARGV[`/`@ARGV` in
+        // rendered TEXT (mission item 5): the name the IR writes is already
+        // the name the program uses, so text that merely RESEMBLES a
+        // positional parameter can never be rewritten again.
+        if body.contains("@__sh_args")
+            || body.contains("$__sh_args[")
+            || body.contains("$__sh_args_n")
+            || body.contains("__sh_pos(")
+        {
+            out.push_str("our @__sh_args;\n");
+            out.push_str("our $__sh_args_n;\n");
+            out.push_str("@__sh_args = @ARGV;\n");
+            out.push_str("$__sh_args_n = scalar(@__sh_args);\n");
+        }
         if body.contains("$__argc") {
             // Snapshot the positional-arg count BEFORE any $ARGV[n] read
             // (the magic @ARGV extends on indexed reads, corrupting
@@ -2648,8 +2670,8 @@ fn emit_stmt_owned(out: &mut String, stmt: &IrStmt, indent: usize) {
             out.push_str("}\n");
         }
         IrStmt::Function { name, body, .. } => {
-            // Shell function → Perl sub. `local @ARGV = @_` maps the bash
-            // positional params ($1 → $ARGV[0]) onto the function's args;
+            // Shell function → Perl sub. `local @__sh_args = @_` maps the bash
+            // positional params ($1 → $__sh_args[0]) onto the function's args;
             // the body's statements render inline (bash functions share the
             // global scope; Perl subs see the hoisted lexical vars).
             emit_indent(out, indent);
@@ -2667,12 +2689,11 @@ fn emit_stmt_owned(out: &mut String, stmt: &IrStmt, indent: usize) {
                 out.push_str(&format!("*{} = sub {{\n", name));
             }
             emit_indent(out, indent + 1);
-            out.push_str("local @ARGV = @_;\n");
-            // `$#` is this call's argument count — snapshot it before any
-            // `$ARGV[n]` read extends the magic @ARGV (shadows the
-            // top-level `$__argc`).
+            out.push_str("local @__sh_args = @_;\n");
+            // `$#` is this call's argument count — snapshot it for the
+            // `$__argc` reads (shadows the top-level `$__argc`).
             emit_indent(out, indent + 1);
-            out.push_str("my $__argc = @ARGV;\n");
+            out.push_str("my $__argc = @__sh_args;\n");
             for s in body.iter() {
                 emit_stmt(out, s, indent + 1);
             }
@@ -2853,9 +2874,10 @@ fn emit_stmt_owned(out: &mut String, stmt: &IrStmt, indent: usize) {
             // A redirect-wrapped `"$@"` (the corpus's `capture` helper runs
             // the caller's command with both streams tee'd to temp files).
             // The rebuilt shell text `"$@" ` has NO positional parameters in
-            // the `bash -c` child (they are Perl's @ARGV), so the command
-            // never ran.  Dup the redirected fds to the REAL descriptors and
-            // run the argv directly.
+            // the `bash -c` child, so the command never ran.  Dup the
+            // redirected fds to the REAL descriptors and run the argv
+            // directly — from `@__sh_args`, the localized copy a function
+            // binds (`local @__sh_args = @_`).
             if let [IrStmt::Expr(IrExpr::Call { args, .. })] = inner.as_slice() {
                 if let Some(IrExpr::Call { func: lf, args: la }) = args.first() {
                     if lf == "listVar"
@@ -2893,7 +2915,7 @@ fn emit_stmt_owned(out: &mut String, stmt: &IrStmt, indent: usize) {
                         }
                         emit_indent(out, indent);
                         out.push_str(&format!(
-                            "{{ {pre}system(@ARGV);{} {post}}}\n",
+                            "{{ {pre}system(@__sh_args);{} {post}}}\n",
                             rc_write(" $main_exit_code = $CHILD_ERROR = $? >> 8;"),
                             pre = pre.join(""),
                             post = post.join(""),
@@ -5299,7 +5321,7 @@ fn var_read(name: &str) -> String {
     // variable read (`@ARGV` pasted into a rebuilt command ran as a
     // command).
     if name == "@" || name == "*" {
-        return "join(' ', @ARGV)".to_string();
+        return "join(' ', @__sh_args)".to_string();
     }
     // A scalar-phase name (plain assignment, no export before it) reads
     // from the SCALAR home — matching where the write site stores it.
@@ -5313,7 +5335,7 @@ fn var_read(name: &str) -> String {
         // bash positional parameter: $1 → $ARGV[0]
         return match name.parse::<usize>() {
             Ok(0) => "$0".to_string(),
-            Ok(n) => format!("$ARGV[{}]", n - 1),
+            Ok(n) => format!("$__sh_args[{}]", n - 1),
             Err(_) => format!("${}", name),
         };
     }
@@ -5378,7 +5400,7 @@ fn var_read(name: &str) -> String {
         // said 3 (parse-at-slice-param). `@ARGV` in a function body is the
         // `local @ARGV = @_` binding, so the live read is correct at both
         // scopes.
-        "#" => "scalar(@ARGV)".to_string(),
+        "#" => "scalar(@__sh_args)".to_string(),
         "-" => "'hB'".to_string(), // bash's default non-interactive $- (hashall + braceexpand)
         // `$?` is the shell CODE, which `$CHILD_ERROR` carries: the
         // process-substitution status SAVE (`$__ps_statusN = $CHILD_ERROR`)
@@ -5397,10 +5419,10 @@ fn var_read(name: &str) -> String {
         // generic branch and rendered `${!}` (an undefined Perl symbolic
         // ref) — examples/grep_p.
         "!" => "$__sh2_last_bg".to_string(),
-        "@" => "@ARGV".to_string(),
+        "@" => "@__sh_args".to_string(),
         // `$*` is the positional params joined by the first IFS char (space
-        // in the default IFS) — in scalar context `@ARGV` gave the COUNT.
-        "*" => "join(' ', @ARGV)".to_string(),
+        // in the default IFS) — in scalar context `@__sh_args` gave the COUNT.
+        "*" => "join(' ', @__sh_args)".to_string(),
         "$" => "$$".to_string(),
         _ if !name.is_empty()
             && name.chars().all(|c| c.is_ascii_alphanumeric() || c == '_') =>
@@ -6065,8 +6087,8 @@ pub(crate) fn render_word_list(e: &IrExpr) -> String {
         )
         .as_deref()
         {
-            Some("@") => "@ARGV".to_string(),
-            Some("*") => ifs_join("@ARGV"),
+            Some("@") => "@__sh_args".to_string(),
+            Some("*") => ifs_join("@__sh_args"),
             _ => render_word(e),
         },
         // `${arr[@]}` / `${arr[*]}` as a builtin ARGUMENT is a LIST — each
@@ -6264,14 +6286,14 @@ fn render_param(args: &[IrExpr]) -> String {
         "len" => format!("length({})", var),
         "-" => {
             if var.starts_with('@') {
-                format!("(@ARGV ? join(' ', @ARGV) : {})", val)
+                format!("(@__sh_args ? join(' ', @__sh_args) : {})", val)
             } else {
                 format!("(defined({}) ? {} : {})", var, var, val)
             }
         }
         ":-" => {
             if var.starts_with('@') {
-                format!("(@ARGV ? join(' ', @ARGV) : {})", val)
+                format!("(@__sh_args ? join(' ', @__sh_args) : {})", val)
             } else {
                 format!(
                     "((defined({v}) && length({v})) ? {v} : {d})",
@@ -6309,14 +6331,14 @@ fn render_param(args: &[IrExpr]) -> String {
         // ASSIGNMENT with a side effect, making the branch permanently true.
         "+" => {
             if var.starts_with('@') {
-                format!("(@ARGV ? {d} : '')", d = val)
+                format!("(@__sh_args ? {d} : '')", d = val)
             } else {
                 format!("(defined({v}) ? {d} : '')", v = var, d = val)
             }
         }
         ":+" => {
             if var.starts_with('@') {
-                format!("(@ARGV ? {d} : '')", d = val)
+                format!("(@__sh_args ? {d} : '')", d = val)
             } else {
                 format!(
                     "((defined({v}) && length({v})) ? {d} : '')",
@@ -6532,14 +6554,14 @@ fn render_param(args: &[IrExpr]) -> String {
                 let off: usize = raw_off.trim().parse().unwrap_or(1).max(1);
                 let start = off - 1;
                 if raw_len.is_empty() {
-                    return format!("join(' ', @ARGV[{start}..$#ARGV])");
+                    return format!("join(' ', @__sh_args[{start}..$#__sh_args])");
                 }
                 let len: usize = raw_len.trim().parse().unwrap_or(0);
                 if len == 0 {
                     return "''".to_string();
                 }
                 let end = start + len - 1;
-                return format!("join(' ', @ARGV[{start}..{end}])");
+                return format!("join(' ', @__sh_args[{start}..{end}])");
             }
             // A NON-`@` offset on a SCALAR variable is a substring
             // `${s:off:len}`: `substr`. The A1 drops `[@]`, so consult the
@@ -10254,7 +10276,7 @@ fn word_iter_to_perl(iter: &IrExpr) -> String {
                             // ONE word: `join` of the params (empty when
                             // there are none, which still yields a single
                             // empty iteration).
-                            return "join(' ', @ARGV)".to_string();
+                            return "join(' ', @__sh_args)".to_string();
                         }
                     }
                 }
@@ -10775,20 +10797,18 @@ fn emit_exec_call(out: &mut String, call: &IrExpr, indent: usize) {
             if words.first().and_then(|w| call_arg_str(w)).as_deref() == Some("--") {
                 let items: Vec<String> = words[1..].iter().map(|w| set_arg_item(w)).collect();
                 emit_indent(out, indent);
-                out.push_str(&format!("@ARGV = ({});\n", items.join(", ")));
+                out.push_str(&format!("@__sh_args = ({});\n", items.join(", ")));
                 // Keep the file-scope COUNT in step: `$#` reads and the
                 // `__sh_pos` helper consult `$__sh_args_n`, and a `set --`
                 // that did not refresh it left them looking at the OLD
                 // list (parse-at-slice-param printed no space where bash
                 // printed one).
                 emit_indent(out, indent);
-                // The file-scope declaration of the COUNT is part of the
-                // shared declaration pass (see
-                // `perl_generator_fixed::declare_positional_count`): the bare
-                // entry point never emitted the fixed path's
-                // `TOPLEVEL_POS_DECLS`, so this write was a `use strict`
-                // compile error there (parse-at-slice).
-                out.push_str("$__sh_args_n = scalar(@ARGV);\n");
+                // The declaration of the COUNT is emitted by this renderer's
+                // OWN preamble (`our $__sh_args_n;`, gated on this very
+                // write appearing in the body), so both entry points declare
+                // it identically — the CLI's text layer is not consulted.
+                out.push_str("$__sh_args_n = scalar(@__sh_args);\n");
             }
             // Other `set` forms are option toggles — no runtime effect.
             emit_indent(out, indent);
@@ -10804,7 +10824,7 @@ fn emit_exec_call(out: &mut String, call: &IrExpr, indent: usize) {
         }
         "shift" => {
             emit_indent(out, indent);
-            out.push_str("shift @ARGV;\n");
+            out.push_str("shift @__sh_args;\n");
             emit_indent(out, indent);
             out.push_str(&rc_write("$main_exit_code = $CHILD_ERROR = 0;\n"));
         }
@@ -11145,7 +11165,7 @@ fn set_arg_item(w: &IrExpr) -> String {
     // The renderer's own spelling of a positional slice, before the
     // post-pass rewrites it (`join(' ', @ARGV[2..$#ARGV])`), and the
     // post-pass's own output (`join(' ', __sh_pos(3))`).
-    for prefix in ["join(' ', @ARGV[", "join(' ', __sh_pos("] {
+    for prefix in ["join(' ', @__sh_args[", "join(' ', __sh_pos("] {
         if let Some(inner) = r.strip_prefix(prefix) {
             let inner = inner.strip_suffix(')').unwrap_or(inner);
             if prefix.ends_with('[') {
@@ -11160,7 +11180,7 @@ fn set_arg_item(w: &IrExpr) -> String {
                     let lo = lo.trim().to_string();
                     let hi = hi.trim_end_matches(']').trim().to_string();
                     return format!(
-                        "(do {{ my $__e = {hi}; $__e < {lo} ? () : @ARGV[{lo}..$__e] }})"
+                        "(do {{ my $__e = {hi}; $__e < {lo} ? () : @__sh_args[{lo}..$__e] }})"
                     );
                 }
             } else {
@@ -14180,7 +14200,7 @@ pub(crate) fn ir_expr_to_perl(expr: &IrExpr) -> String {
                     .and_then(call_arg_str)
                     .map(|n| {
                         if n == "@" || n == "*" {
-                            "@ARGV".to_string()
+                            "@__sh_args".to_string()
                         } else {
                             format!("@{}", n)
                         }

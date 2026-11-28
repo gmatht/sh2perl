@@ -196,7 +196,10 @@ fn collect_scalar_phase_vars(stmts: &[IrStmt], out: &mut std::collections::HashS
 /// renderer, which owns both decisions, is not ours to change. Everything
 /// here is anchored on the shape it rewrites and leaves anything else alone.
 fn post_pass(src: &str) -> String {
-    let out = fix_sub_params(src);
+    // `fix_sub_params` (the sub-body `$N` rewrite plus its binding
+    // injection) is GONE: the IR emits `local @__sh_args = @_` itself, so
+    // there is nothing for the text layer to bind or rewrite.
+    let out = src.to_string();
     let out = fix_case_pattern_tail(&out);
     let out = fix_heredoc_delim(&out);
     let out = fix_cmd_capture_split(&out);
@@ -210,15 +213,17 @@ fn post_pass(src: &str) -> String {
     let out = fix_printf_bash_conversions(&out);
     let out = fix_printf_b_percent_b(&out);
     // The output idioms run BEFORE the position-parameter slicing: that pass
-    // rewrites `$N` reads textually and can reformat a statement's tail,
-    // which left `print($result, "\n")` unchanged when it ran first.
+    // can reformat a statement's tail, which left `print($result, "\n")`
+    // unchanged when it ran first.
     let out = fix_print_newline_to_say(&out);
     let out = fix_print_concat_interp(&out);
     let out = fix_pos_param_slice(&out);
     let out = fix_literal_pipeline_pipestatus(&out);
-    // LAST: it must see the final text, and it only ever PREPENDS
-    // declarations, so it cannot disturb what the earlier passes matched.
-    let out = bind_toplevel_positional_params(&out);
+    // `bind_toplevel_positional_params` (the `$ARGV[`→`$__sh_args[` /
+    // `$#ARGV`→`$__sh_args_n` / `@ARGV`→`@__sh_args` substitutions) is GONE:
+    // the IR emits those names and the file-scope binding directly (see
+    // ir::shir_to_perl's preamble). This was the layer that decided the
+    // MEANING of a construct by the SHAPE of its text; it no longer exists.
     // The declare result MUST be bound: as a bare statement its String is
     // dropped and `declare_arith_operand_flag(&out)` would return the
     // UNDECLARED source — every undeclared-var compile error comes back
@@ -375,191 +380,28 @@ fn literal_true_false_statuses(inner: &str) -> Option<Vec<u8>> {
     if out.is_empty() { None } else { Some(out) }
 }
 
-// ── Top-level positional parameters ───────────────────────────────────
+// ── Top-level positional parameters (mission item 5: NOT a text fixup) ──
 //
-// Inside a sub, Fix 2 binds `@_` into `@__sh_args` and rewires `$1` to
-// `$__sh_args[0]` — a sub's `$1` is ITS first parameter. At file scope
-// there is no `@_`, so the renderer emits the read straight against `@ARGV`
-// (`$ARGV[0]` for `$1`, `@ARGV` for `"$@"`).
-//
-// That is wrong under `./fail`, which invokes the program as
-// `perl -e '$0 = shift @ARGV; my $f = shift @ARGV; do $f' SCRIPT FILE` —
-// `do` runs the file in the main scope with `@ARGV` EMPTIED, so every
-// `$ARGV[0]` read is `undef`. bash, given the same empty argument list,
-// treats a missing `$1` as the EMPTY STRING, so the two diverge by exactly
-// "undef warning plus a field where bash had an empty one"
+// Both scopes are the IR's now. A sub's `$1` is its own parameter: the
+// Function arm emits `local @__sh_args = @_;` and spells the reads
+// `$__sh_args[0]`.. . At file scope `@__sh_args` is bound to `@ARGV` by the
+// IR's own preamble, because `do FILE` (the CLI's `./fail` contract) runs
+// the file with `@ARGV` EMPTIED while bash reads a missing `$1` as the
+// empty string — `$ARGV[0]` there was `undef` plus a warning
 // (parse-at-slice-param.sh).
 //
-// Binding file-scope `@ARGV` into `@__sh_args` makes the top-level read
-// agree with bash's: both are empty when the script is given no arguments.
-// The binding is placed before the first statement, matching where
-// `inject_param_binding` puts a sub's.
+// This module used to do both by REWRITING the rendered text (`$1` →
+// `$__sh_args[0]`, `$ARGV[` → `$__sh_args[`, plus a spliced binding). That
+// is exactly the seam that corrupted generated code resembling a positional
+// reference — the printf numeric helper's `$1..$4` regex captures — so the
+// rewrites are gone and `ir.rs` emits the names directly. Pinned by
+// `positional_text_tests` (below) and
+// `tests/tier1/positional_text_is_not_rewritten.sh`.
 
-/// Bind the file-scope positional parameters to `@__sh_args` and rewire the
-/// renderer's `$ARGV[ … ]` / `$#ARGV` reads to it.
-fn bind_toplevel_positional_params(src: &str) -> String {
-    // `$ARGV[` reads and `$#ARGV` are the ONLY top-level spellings the
-    // renderer produces for `$1` / `${@:…}`. The slice fix above already
-    // rewrote `@ARGV[lo..hi]` slices, so what is left here is a bare
-    // element read.
-    // `@__sh_args` / `$__sh_args_n` already in the body (a `set --` writes
-    // them, and `__sh_pos` reads them) still need the DECLARATIONS and the
-    // file-scope binding — without them `$__sh_args_n` is an undeclared
-    // global and the program dies under `use strict`.
-    if !src.contains("$ARGV[")
-        && !src.contains("$#ARGV")
-        && !src.contains("@__sh_args")
-        && !src.contains("$__sh_args_n")
-    {
-        return src.to_string();
-    }
-    let out = replace_all_outside_strings(src, "$ARGV[", "$__sh_args[");
-    let out = replace_all_outside_strings(&out, "$#ARGV", "$__sh_args_n");
-    let out = replace_all_outside_strings(&out, "@ARGV", "@__sh_args");
-    inject_toplevel_binding(&out)
-}
 
-/// The file-scope binding, spliced in after the declarations: `@__sh_args`
-/// from `@ARGV`, and the count `$__sh_args_n` that `$#` reads at file scope.
-///
-/// The count is named `$__sh_args_n`, NOT `$#__sh_args_n`. `$#` is Perl's
-/// length operator, not a declarable sigil, so `our $#foo;` is a hard
-/// compile error ("syntax error … near \"our $#foo\"") — and a bare
-/// assignment `our $#foo = …` is equally invalid. Emitting it put that
-/// error in the preamble of every program with a top-level `$1`/`$@`, so
-/// the whole file failed to compile and produced ZERO output instead of a
-/// mismatch.
-///
-/// The assignment is `local`, not `our`: the top-level DECLARATIONS
-/// (`TOPLEVEL_POS_DECLS`) already introduce both names next to the other
-/// `our` preamble declarations, so `our @__sh_args = @ARGV;` re-declared
-/// them and Perl warned "our variable … redeclared" on every run. `local`
-/// is also what `inject_param_binding` uses for a sub's binding, so the two
-/// levels now agree.
-const TOPLEVEL_POS_BINDING: &str = "local @__sh_args = @ARGV;\nlocal $__sh_args_n = scalar(@ARGV);\n";
 
-/// The file-scope DECLARATIONS, spliced in next to the preamble's other
-/// `our` declarations so `use strict` accepts the reads.
-const TOPLEVEL_POS_DECLS: &str = "our @__sh_args;\nour $__sh_args_n;\n";
 
-/// Insert the file-scope positional binding so it runs BEFORE any statement
-/// that reads `$__sh_args`, and declare the two names under `use strict`.
-fn inject_toplevel_binding(src: &str) -> String {
-    // 1. Declare both names on the renderer's own preamble line, exactly as
-    //    `declare_param_array` does for `@__sh_args`.
-    let declared = match src.find("use strict;") {
-        Some(i) => {
-            let at = i + "use strict;".len();
-            let mut s = String::with_capacity(src.len() + 48);
-            s.push_str(&src[..at]);
-            s.push('\n');
-            s.push_str(TOPLEVEL_POS_DECLS);
-            s.push_str(&src[at..]);
-            s
-        }
-        None => format!("{TOPLEVEL_POS_DECLS}{src}"),
-    };
 
-    // 2. Assign them immediately after the preamble — before the first
-    //    statement. `inject_param_binding` splices a sub's binding in the
-    //    same place, so the two agree on ordering.
-    let mut out = String::with_capacity(declared.len() + 64);
-    let mut lines = declared.lines();
-    let mut placed = false;
-    for line in lines.by_ref() {
-        out.push_str(line);
-        out.push('\n');
-        // The preamble is `use strict; / use warnings; / my $main_exit_code…`.
-        // Splicing right after `use warnings;` puts the binding ahead of
-        // every statement without having to find the first one.
-        if !placed && line.trim_start().starts_with("use warnings;") {
-            out.push_str(TOPLEVEL_POS_BINDING);
-            placed = true;
-        }
-    }
-    for line in lines {
-        out.push_str(line);
-        out.push('\n');
-    }
-    // `lines()` dropped the final newline; restore it, and preserve a source
-    // that did not end with one.
-    if !src.ends_with('\n') {
-        out.pop();
-    }
-    out
-}
-
-/// Replace every occurrence of `needle` that is not inside a single- or
-/// double-quoted string or a comment, so a rewrite keyed on Perl text never
-/// rewrites the same characters when they are DATA (a filename, a heredoc
-/// body, an `echo`'d literal).
-fn replace_all_outside_strings(src: &str, needle: &str, repl: &str) -> String {
-    let b = src.as_bytes();
-    let mut out = String::with_capacity(src.len() + 64);
-    let mut i = 0usize;
-    while i < b.len() {
-        match b[i] {
-            b'\'' => {
-                let start = i;
-                i += 1;
-                while i < b.len() {
-                    if b[i] == b'\\' {
-                        i += 2;
-                        continue;
-                    }
-                    if b[i] == b'\'' {
-                        i += 1;
-                        break;
-                    }
-                    i += 1;
-                }
-                out.push_str(&src[start..i.min(src.len())]);
-            }
-            b'"' => {
-                let start = i;
-                i += 1;
-                while i < b.len() {
-                    if b[i] == b'\\' {
-                        i += 2;
-                        continue;
-                    }
-                    if b[i] == b'"' {
-                        i += 1;
-                        break;
-                    }
-                    i += 1;
-                }
-                out.push_str(&src[start..i.min(src.len())]);
-            }
-            b'#' => {
-                // A `#` runs to end of line is a comment — but only at the
-                // start of a line or after whitespace, so `$x#1` and
-                // `a#b` keep their literal meaning.
-                let at_line_start = i == 0 || b[i - 1] == b'\n' || b[i - 1] == b' ' || b[i - 1] == b'\t';
-                if at_line_start {
-                    let start = i;
-                    while i < b.len() && b[i] != b'\n' {
-                        i += 1;
-                    }
-                    out.push_str(&src[start..i]);
-                } else {
-                    out.push('#');
-                    i += 1;
-                }
-            }
-            _ if src[i..].starts_with(needle) => {
-                out.push_str(repl);
-                i += needle.len();
-            }
-            _ => {
-                let ch_len = src[i..].chars().next().map(char::len_utf8).unwrap_or(1);
-                out.push_str(&src[i..i + ch_len]);
-                i += ch_len;
-            }
-        }
-    }
-    out
-}
 
 // ── Fix 18 — a shell BUILTIN name must not be quoted in a `bash -c` payload ──
 //
@@ -2890,62 +2732,7 @@ fn sub_spans(src: &str) -> Vec<(usize, usize, String)> {
     out
 }
 
-/// Fix 2 (textual half) — bind and rewire a function's positional parameters.
-///
-/// Spans ascend by byte offset and a sub nested inside one already spliced is
-/// skipped: the enclosing body carried it into `out` already.
-fn fix_sub_params(src: &str) -> String {
-    let spans = sub_spans(src);
-    if spans.is_empty() {
-        return src.to_string();
-    }
-    let mut out = String::with_capacity(src.len() + 64);
-    let mut cursor = 0usize;
-    // `(start, end, name)` ascending by start. Splicing must walk them
-    // FORWARD: a span's `start`/`end` are byte offsets into the original
-    // `src`, so `src[cursor..start]` is only a valid (non-inverted) range
-    // while `cursor <= start`. A span nested inside one already consumed is
-    // skipped — its text was rewritten as part of the enclosing body.
-    for (start, end, _name) in &spans {
-        if *start < cursor || *end > src.len() || *start > *end {
-            continue;
-        }
-        let body = &src[*start..*end];
-        // The binding is only needed when the body actually READS a
-        // positional parameter. Injecting it unconditionally put a
-        // `local @__sh_args = @_;` into every function — including ones that
-        // never touch `$1` — and, because `declare_param_array` only declares
-        // the array when a `$__sh_args[…` read exists, that lone `@__sh_args`
-        // was an undeclared package variable: a `use strict` compile error
-        // that killed the whole program (func-after-or-assign printed nothing).
-        let rewritten = rewrite_positional_params(body);
-        let fixed = if rewritten.contains("$__sh_args[") {
-            inject_param_binding(&rewritten)
-        } else {
-            rewritten
-        };
-        out.push_str(&src[cursor..*start]);
-        out.push_str(&fixed);
-        cursor = *end;
-    }
-    out.push_str(&src[cursor..]);
-    declare_param_array(&out)
-}
 
-/// `@__sh_args` is a package array under `use strict` — declare it once, at
-/// file scope, on the same line as the renderer's own preamble `my` vars so
-/// a program with no functions still carries no dead declaration.
-fn declare_param_array(src: &str) -> String {
-    if !src.contains("$__sh_args[") {
-        return src.to_string();
-    }
-    for line in src.split_inclusive('\n') {
-        if line.trim_start().starts_with("my $main_exit_code") {
-            return format!("{}our @__sh_args;\n{}", line, &src[line.len()..]);
-        }
-    }
-    src.to_string()
-}
 
 /// Fix 3 — a command-substitution case PATTERN must be evaluated.
 ///
@@ -4086,161 +3873,18 @@ fn is_bare_exec_call_stmt(inner: &[IrStmt]) -> bool {
     )
 }
 
-// ── Fix 2 — a bash function's positional parameters ──────────────────
+// ── A bash function's positional parameters (moved into the IR) ──────
 //
-// The renderer binds a shell function's parameters as `local @ARGV = @_;`
-// and leaves the body's `$1`..`$n` reads alone. `do FILE` empties `@ARGV`,
-// so every `$1` in the body reads `undef` and the sub silently computes over
-// nothing (063_09 printed "Processed 0 options" instead of "Processed 4").
-//
-// bash parameters are positional and 1-based, and `$0` inside a function is
-// the SCRIPT name, not the function name. Binding `@_` into a 0-based
-// `@__sh_args` and rewiring the reads is therefore what the body means —
-// and the shared renderer already renders a function's own parameters that
-// way (`my ($a, $b) = @_;`), so this makes the body agree with its own
-// signature.
-//
-// Scope: only the names this module introduced. An `@ARGV` read the script
-// itself makes (the CLI's `do FILE` contract) is left alone.
+// The Function arm now emits `local @__sh_args = @_;` plus
+// `my $__argc = @__sh_args;` and spells `$1`..`$n` as `$__sh_args[n-1]`,
+// so the body agrees with its own signature without a text pass. Before
+// that, the body's `$1` read `@ARGV`, which `do FILE` empties, so subs
+// silently computed over nothing (063_09 printed "Processed 0 options").
+// `$0` inside a function stays the SCRIPT name, not the function name.
 
-/// Rewrite the positional-parameter reads of a rendered sub body into
-/// `@__sh_args`.
-///
-/// Deliberately a string rewrite over the rendered text: `$1` is a Perl
-/// *scalar* read (the 10th argument of the enclosing `print`, not the
-/// function's), so it cannot be expressed as an `IrExpr` the shared renderer
-/// would agree with. We therefore substitute the whole construct and keep
-/// `$1` inside the replacement out of the scanner's reach.
-fn rewrite_positional_params(src: &str) -> String {
-    let b = src.as_bytes();
-    let mut out = String::with_capacity(src.len() + 64);
-    let mut i = 0usize;
-    // Char offset (into `out`) of each currently-open `(`, so the depth walk
-    // below never splits a multi-byte char.
-    let mut opens: Vec<usize> = Vec::new();
 
-    while i < b.len() {
-        match b[i] {
-            b'(' => {
-                opens.push(out.chars().count());
-                out.push('(');
-                i += 1;
-            }
-            b')' => {
-                opens.pop();
-                out.push(')');
-                i += 1;
-            }
-            b'$' => {
-                let Some((digits, end)) = decimal_after_dollar(b, i) else {
-                    out.push('$');
-                    i += 1;
-                    continue;
-                };
-                let n: usize = std::str::from_utf8(&b[i + 1..i + 1 + digits])
-                    .ok()
-                    .and_then(|s| s.parse().ok())
-                    .unwrap_or(0);
-                // `$0` is NOT a positional parameter — bash's positional
-                // params start at $1, and `$0` is the SCRIPT NAME, which is
-                // exactly Perl's `$0` (the gate's harness assigns
-                // `$0 = <source path>`). Rewriting it would compute
-                // `n - 1` and underflow: any generated bare `$0` inside a
-                // `sub` body (the preamble's `system('bash', '-c', $cmd,
-                // $0)` argv0) panicked the whole generator. Pass it through.
-                if n == 0 {
-                    out.push_str("$0");
-                    i = end;
-                    continue;
-                }
-                let Some(open) = opens.last().copied() else {
-                    out.push('$');
-                    i += 1;
-                    continue;
-                };
-                // Inside a construct we are already rewriting: emit verbatim so
-                // the inner `$1` cannot match again on the next iteration.
-                if in_param_construct(&out, open) {
-                    out.push('$');
-                    i += 1;
-                    continue;
-                }
-                // The subscript we emit is CLOSED (`$__sh_args[n]`), so it is
-                // not an enclosing construct for the parameters that follow
-                // it: `print($1, $2, $10)` must rewrite all three.
-                out.push_str(&format!("$__sh_args[{}]", n - 1));
-                i = end;
-            }
-            c if c.is_ascii() => {
-                out.push(c as char);
-                i += 1;
-            }
-            _ => {
-                // A multi-byte UTF-8 sequence: copy the whole char, not one
-                // byte re-encoded (which would corrupt the source).
-                let ch = src[i..].chars().next().unwrap();
-                out.push(ch);
-                i += ch.len_utf8();
-            }
-        }
-    }
-    out
-}
 
-/// Is there an UNCLOSED `$__sh_args[ … ]` substitution between `open` and
-/// the end of `out`? (i.e. are we already inside a construct being
-/// rewritten, so the `$1` we are looking at belongs to its back-reference?)
-/// Only an UNTERMINATED one counts. A complete substitution is not an
-/// enclosing construct for the parameters that follow it — toggling parity
-/// over closed ones made `print($1, $2, $10)` rewrite only `$1`, since the
-/// emitted `$__sh_args[0]` left the guard latched for the rest of the list.
-fn in_param_construct(out: &str, open: usize) -> bool {
-    let Some(tail) = out.get(open..) else {
-        return false;
-    };
-    let mut rest = tail;
-    while let Some(at) = rest.find("$__sh_args[") {
-        let after = at + "$__sh_args[".len();
-        let Some(rel) = rest[after..].find(']') else {
-            // Unterminated: we ARE inside it.
-            return true;
-        };
-        rest = &rest[after + rel + 1..];
-    }
-    false
-}
 
-/// Length of the decimal run starting at `b[i]` (which must be a digit), and
-/// the index just past it.
-fn decimal_after_dollar(b: &[u8], i: usize) -> Option<(usize, usize)> {
-    let mut j = i + 1;
-    while j < b.len() && b[j].is_ascii_digit() {
-        j += 1;
-    }
-    if j > i + 1 {
-        Some((j - i - 1, j))
-    } else {
-        None
-    }
-}
-
-/// Insert `text` at the head of a rendered `sub` body.
-///
-/// The body starts after the `{`, and the renderer puts its own
-/// `local @ARGV = @_;` there — so this lands before it, which is what a
-/// bash function's `$1` needs: `@_` is untouched by that `local`, and
-/// `@__sh_args` must be in place before any statement reads it.
-fn inject_param_binding(sub_src: &str) -> String {
-    let mut out = String::with_capacity(sub_src.len() + 40);
-    let mut lines = sub_src.split_inclusive('\n');
-    let first = lines.next().unwrap_or("");
-    out.push_str(first);
-    out.push_str("    local @__sh_args = @_;\n");
-    for l in lines {
-        out.push_str(l);
-    }
-    out
-}
 
 
 /// Every shell function name defined in the program, at any nesting depth.
@@ -6045,20 +5689,6 @@ mod pgf_tests {
         assert_eq!(sp.len(), 1, "one sub");
         assert_eq!(&s[sp[0].0..sp[0].1], "\n    print \"x\";\n    $main_exit_code = 0;\n");
     }
-    #[test]
-    fn param_rewrite() {
-        assert_eq!(
-            rewrite_positional_params("print($1, $2, $10);\n"),
-            "print($__sh_args[0], $__sh_args[1], $__sh_args[9]);\n"
-        );
-        assert_eq!(rewrite_positional_params("print(\"$1\");\n"), "print(\"$__sh_args[0]\");\n");
-        assert_eq!(
-            rewrite_positional_params("system('bash', '-c', $cmd, $0);\n"),
-            "system('bash', '-c', $cmd, $0);\n"
-        );
-        assert_eq!(rewrite_positional_params("x =~ s{^--}{}r;\n"), "x =~ s{^--}{}r;\n");
-        assert_eq!(rewrite_positional_params("my @ARGV = @_;\n"), "my @ARGV = @_;\n");
-    }
 
     /// Regression (Fix 22): the slice rewrite must consume the `)` that
     /// closed the ORIGINAL `join(`, or it leaves one paren too many.
@@ -6117,84 +5747,28 @@ mod pgf_tests {
 
     /// The file-scope binding must appear BEFORE the first read of
     /// `@__sh_args`, and both names must be declared for `use strict`.
+    ///
+    /// Both come from the IR's own preamble now (mission item 5): the CLI's
+    /// text layer no longer renames `$ARGV[`/`@ARGV` or splices a binding, so
+    /// this test fails if the IR stops emitting them — not if a fixup that no
+    /// longer exists is skipped.
     #[test]
     fn toplevel_positional_binding_precedes_its_reads() {
         let out = gen("echo $1\n");
         let decl = out.find("our @__sh_args;").expect("declared");
-        let bind = out.find("local @__sh_args = @ARGV;").expect("bound");
+        let bind = out.find("@__sh_args = @ARGV;").expect("bound");
         let read = out.find("$__sh_args[").expect("read");
         assert!(decl < bind && bind < read, "order wrong in:\n{out}");
         assert!(out.contains("our $__sh_args_n;"), "count declared in:\n{out}");
+        assert!(
+            out.contains("$__sh_args_n = scalar(@__sh_args);"),
+            "count initialized in:\n{out}"
+        );
+        // `$#` is the length operator, not a sigil: `our $#foo;` is a compile
+        // error. Pin the COUNT's name, not merely its presence.
+        assert!(!out.contains("our $#"), "undeclarable count in:\n{out}");
     }
 
-    /// The count binding must be a name Perl can actually declare.
-    ///
-    /// `$#` is the length operator, not a sigil: `our $#foo;` and
-    /// `our $#foo = 1;` are both compile errors. Emitting one put a syntax
-    /// error in the preamble of every program with a top-level `$1`/`$@`,
-    /// which compiled to nothing and produced zero output — so this pins
-    /// the *name*, not merely the presence of a count, and additionally
-    /// requires the emitted text to be real Perl.
-    #[test]
-    fn toplevel_pos_count_binding_is_valid_perl() {
-        let out = gen("echo $1\n");
-        assert!(
-            !out.contains("$#__sh_args"),
-            "undeclarable $# name re-emitted in:\n{out}"
-        );
-        // `perl -c` is the oracle: it is what actually rejected the old
-        // spelling, and it rejects it without needing @ARGV to be set up.
-        let dir = std::env::temp_dir().join(format!(
-            "pg_toplevel_pos_{}",
-            std::process::id()
-        ));
-        std::fs::create_dir_all(&dir).expect("mkdir");
-        let path = dir.join("t.pl");
-        std::fs::write(&path, &out).expect("write");
-        let chk = std::process::Command::new("perl")
-            .arg("-c")
-            .arg(&path)
-            .output();
-        let _ = std::fs::remove_dir_all(&dir);
-        let chk = chk.expect("run perl -c");
-        assert!(
-            chk.status.success(),
-            "emitted preamble is not valid Perl:\n{}\n---\n{out}",
-            String::from_utf8_lossy(&chk.stderr)
-        );
-        // `perl -c` cannot catch a *warning*; redeclaring the names the
-        // preamble already declared made every run print
-        // `"our" variable @__sh_args redeclared` on stderr.
-        assert!(
-            !out.contains("our @__sh_args = @ARGV;") && !out.contains("our $__sh_args_n = scalar"),
-            "binding re-declares the names TOPLEVEL_POS_DECLS already declared:\n{out}"
-        );
-    }
-
-    /// The rewire must NOT touch `@ARGV` text that is DATA — a quoted
-    /// literal, or the tail of a comment.
-    #[test]
-    fn toplevel_rewire_skips_strings_and_comments() {
-        // A quoted `$ARGV[0]` is the string the script prints, not a read.
-        let quoted = replace_all_outside_strings("print \"$ARGV[0]\";\n", "$ARGV[", "$__sh_args[");
-        assert_eq!(quoted, "print \"$ARGV[0]\";\n", "string was rewritten");
-        // The same in a heredoc-fed `print`.
-        let sq = replace_all_outside_strings("print '$ARGV[0]';\n", "$ARGV[", "$__sh_args[");
-        assert_eq!(sq, "print '$ARGV[0]';\n", "single-quoted string was rewritten");
-        // A comment's text is not code.
-        let comment = replace_all_outside_strings("x = 1;  # uses $ARGV[0] here\n", "$ARGV[", "$__sh_args[");
-        assert_eq!(comment, "x = 1;  # uses $ARGV[0] here\n", "comment was rewritten");
-        // Code outside those IS rewritten.
-        let code = replace_all_outside_strings("y = $ARGV[0];\n", "$ARGV[", "$__sh_args[");
-        assert_eq!(code, "y = $__sh_args[0];\n");
-    }
-    #[test]
-    fn binding_injected_after_argv() {
-        let body = "\n    local @ARGV = @_;\n    my $__argc = @ARGV;\n    print(1);\n";
-        let out = inject_param_binding(body);
-        assert!(out.contains("local @__sh_args = @_;\n"), "{out}");
-        assert!(out.find("__sh_args").unwrap() < out.find("print(1)").unwrap(), "{out}");
-    }
 
     /// Regression: the undeclared-variable pass must not declare Perl's `sort`
     /// package globals.
@@ -7337,3 +6911,69 @@ fn ps_builtin_call(cmd: &str, args: Vec<IrExpr>) -> IrStmt {
 
 
 
+#[cfg(test)]
+mod positional_text_tests {
+    use super::generate;
+
+    fn render_both(src: &str) -> (String, String) {
+        let cmds = crate::Parser::new(src).parse().expect("parse");
+        let prog = crate::shir::ast_to_ir(&cmds);
+        (crate::ir::shir_to_perl(&prog), generate(&prog))
+    }
+
+    /// Mission item 5, the exact bug that motivated it: the printf numeric
+    /// helper is GENERATED code containing regex captures. When the CLI
+    /// rewrote bare `$1..$4` as positional parameters, this program converted
+    /// the wrong string (`realpath-cmdsub` printed exit 0 where bash prints
+    /// 1). The helper now uses named captures AND the rewrite no longer
+    /// exists, so this fails if either half comes back.
+    #[test]
+    fn generated_captures_are_not_rewritten_as_positional_params() {
+        let (_bare, fixed) = render_both("printf '%d\\n' \"$1\"\n");
+        assert!(fixed.contains("$+{dg}"), "named capture missing:\n{fixed}");
+        assert!(
+            !fixed.contains("$__sh_args[1]"),
+            "the printf helper's captures were rewritten as positional params:\n{fixed}"
+        );
+    }
+
+    /// The other half of the property: a REAL `$1` must still be the first
+    /// positional parameter, spelled by the IR (not by a text pass).
+    #[test]
+    fn a_source_read_of_dollar_one_is_the_first_positional_param() {
+        let (bare, fixed) = render_both("echo \"$1\"\n");
+        assert!(fixed.contains("$__sh_args[0]"), "{fixed}");
+        assert!(bare.contains("$__sh_args[0]"), "{bare}");
+        assert!(
+            !fixed.contains("$ARGV[0]"),
+            "positional read still rendered as @ARGV:\n{fixed}"
+        );
+        assert!(
+            fixed.contains("@__sh_args = @ARGV;"),
+            "file-scope binding missing:\n{fixed}"
+        );
+    }
+
+    /// Text that RESEMBLES a positional reference is DATA: awk's `$1` and a
+    /// single-quoted `$ARGV[0] $1` must reach the emitted Perl unchanged, so
+    /// no text pass may claim them.
+    #[test]
+    fn literal_text_that_resembles_a_positional_param_is_data() {
+        let (_bare, fixed) = render_both("awk '{print $1}' f\necho '$ARGV[0] $1'\n");
+        assert!(fixed.contains("{print $1}"), "awk program rewritten:\n{fixed}");
+        assert!(
+            fixed.contains("\\$ARGV[0] \\$1"),
+            "quoted literal rewritten:\n{fixed}"
+        );
+    }
+
+    /// The sub binding is emitted by the IR now, so a function sees its OWN
+    /// arguments (the `local @__sh_args = @_;` line is the IR's, and the
+    /// argument-running form uses the same array).
+    #[test]
+    fn function_bodies_bind_their_own_positional_parameters() {
+        let (_bare, fixed) = render_both("f(){ echo \"$1\"; }\nf x\n");
+        assert!(fixed.contains("local @__sh_args = @_;"), "{fixed}");
+        assert!(!fixed.contains("local @ARGV = @_;"), "{fixed}");
+    }
+}
