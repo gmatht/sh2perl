@@ -71,13 +71,17 @@
 //    M4  strip accepts a signed `-0.0` tail            31v/1e  strip_removes_
 //        only_the_identity (the deleted span is not a zero term)
 //    M6  last_plus stops at an adjacent '+' only       31v/1e  lemma_last_plus
-//  Pin-level (rejected at simplification by `by (compute)`, recorded as pin
+//    M11 DFA Trail also accepts '+'                    31v/1e  lemma_run_consumes
+//        (an OVER-wide trail: the audit's one-term law is what catches it,
+//         not the one-way strip ⇒ DFA law)
+//  Pin-level (rejected at simplification, no summary line, recorded as pin
 //  evidence and NOT as a law): M0' the DFA charset loses '\t'
 //  (pin_ws_charset_covers_tabs), M5 DFA BeforePlus stops skipping whitespace
 //  (pin_dfa_agrees), M7 DFA Trail accepts any character, M8 trim_start does
 //  not trim, M9 skip_ws skips nothing, M10 the whitespace before '+' is kept
-//  (all pin_strip_shapes).  Every mutant was restored byte-identically and
-//  the sha256 re-checked.
+//  (all pin_strip_shapes).  M7–M10 were re-measured on these bytes, not
+//  carried over.  Every mutant was restored byte-identically (or measured on
+//  a /tmp copy) and the sha256 re-checked.
 //  ─────────────────────────────────────────────────────────────────────────
 
 use vstd::prelude::*;
@@ -588,22 +592,20 @@ pub proof fn add_zero_is_the_identity(a: Seq<int>)
     lemma_total_push(a, 0, 0);
 }
 
-/// Both halves in one statement, for the transform: the removed text is the
-/// identity tail, that tail is one `+ 0.0` term, and appending a zero term
-/// leaves the total alone.
+/// Both structural halves in one statement, for the transform: the removed
+/// text is the DFA's identity tail, and that tail is one `+ 0.0` term. (The
+/// value half is `add_zero_is_the_identity`, which takes no string.)
 pub proof fn strip_preserves_the_value(s: Seq<char>, p: Seq<char>)
     requires strip_add_zero(s) == Some(p),
     ensures
         is_identity_tail(s, (p.len() as int), trim_len(s)),
         nonws(s, (p.len() as int), trim_len(s)) == seq!['+', '0', '.', '0'],
-        total(seq![7].push(0), 0) == total(seq![7], 0),
 {
     strip_removes_only_the_identity(s, p);
     assert((p.len() as int) <= trim_len(s));
     lemma_trim_start(s, (s.len() as int));
     assert(trim_len(s) <= (s.len() as int));
     identity_tail_is_one_zero_term(s, (p.len() as int), trim_len(s));
-    add_zero_is_the_identity(seq![7]);
 }
 
 // ───────────────────────────────────────────────────────────────────── pins ──

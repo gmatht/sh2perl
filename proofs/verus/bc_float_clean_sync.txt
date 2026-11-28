@@ -1,8 +1,8 @@
 # verus-sync-coverage manifest: bc_float_clean
-# source sha: bc_float_clean=c5767ccaaa36  proof sha: 0c5845f8b95f
+# source sha: bc_float_clean=c5767ccaaa36  proof sha: a7a305e7d2ae
 #   source re-pinned 2026-11-28 (was b872f6c06797): that module had NO
 #   #[cfg(test)] block at all, so every row below was UNMIRRORED and nothing
-#   was executed for this proof. gen_pin_tests.py appended the six-line
+#   was executed for this proof. gen_pin_tests.py appended the seven-line
 #   `#[cfg(test)] #[path = "bc_float_pin_tests.rs"] mod pin_tests_bc_float;`
 #   registration at EOF; `transform`, `transform_stmt`, `transform_expr`,
 #   `clean_pipeline`, `clean_bc_arg` and `strip_trailing_add_zero` are
@@ -11,6 +11,13 @@
 #   (`is_ws_sem`/`all_ws_sem`) with the bridge laws `is_ws_sem_is_is_ws` /
 #   `all_ws_sem_iff`, the pin `pin_ws_charset_covers_tabs` and the value pin
 #   `pin_bc_value_preserved`; 8a1fe6ed7371 had the vacuity described below.
+#   Review of the same day: `strip_preserves_the_value` no longer carries the
+#   concrete `total(seq![7].push(0), 0) == total(seq![7], 0)` clause — that was
+#   a duplicate of `add_zero_is_the_identity` / `pin_bc_value_preserved` with a
+#   magic constant; dropping it changes no count (32v/0e) and the value law is
+#   still stated and pinned. The M7-M10 pin-level rows below had been carried
+#   over from the pre-fix header unmeasured; they are now measured on a /tmp
+#   copy, and M11 (an over-wide Trail) was added — it fails a LAW.
 
 [pins]
 pin pin_strip_shapes -> test pin_strip_shapes: MAPPED
@@ -57,14 +64,23 @@ alone and restored byte-identically (sha256 re-checked after every run):
   M3  the term model's `total` base case is 1        31v/1e  lemma_total_push
   M4  strip accepts a signed `-0.0` tail             31v/1e  strip_removes_only_the_identity
   M6  last_plus stops at an adjacent '+' only        31v/1e  lemma_last_plus
+  M11 DFA Trail also accepts '+' (over-wide)         31v/1e  lemma_run_consumes
+        (the one-term law catches an over-wide trail; the one-way strip ⇒ DFA
+         law cannot, by construction)
   M0' the DFA's charset loses '\t' (the pinned one)  rejected at simplification by
         pin_ws_charset_covers_tabs (0v/1e) — recorded as pin evidence, not a law
   M5  DFA BeforePlus stops skipping whitespace       rejected at simplification by
         pin_dfa_agrees (0v/1e)
-  So six defect classes fail a LAW with a real count (dropped DFA arm, dropped
+  M7  DFA Trail accepts any character                 rejected at simplification
+        (pin_strip_shapes: "expression simplifies to false")
+  M8  trim_start does not trim                        rejected at simplification
+  M9  skip_ws skips nothing                           rejected at simplification
+  M10 the whitespace before '+' is kept               rejected at simplification
+  So seven defect classes fail a LAW with a real count (dropped DFA arm, dropped
   strip check, misclassified number shape (signed zero), term-model base,
-  cursor bug, and the shared-helper narrowing that used to be green), and the
-  two spellings the pins refute first are recorded as pin-level.
+  cursor bug, the shared-helper narrowing that used to be green, and an
+  over-wide trail), and the six spellings the pins refute first are recorded
+  as pin-level and measured, not asserted.
 
 [exec]
 # Every MAPPED row was EXECUTED against the source in this tree by the

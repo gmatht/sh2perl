@@ -9256,8 +9256,11 @@ so the deleted text is ONE additive term and it is zero.
 The value model is a list of integer terms summed by `total`. The identity
 bc relies on — `x + 0.0 == x` for finite decimals — is proved there as
 `total(a.push(0), 0) == total(a, 0)` (`lemma_total_push` +
-`add_zero_is_the_identity`), and `strip_preserves_the_value` states (A) and
-(B) together for any string the strip accepts.
+`add_zero_is_the_identity`). The value law is deliberately independent of the
+string — it takes a term list, not a text — and `strip_preserves_the_value`
+states only the two STRUCTURAL halves of (A) for any string the strip accepts;
+bumping an earlier version's concrete `total(seq![7].push(0), 0)` clause into
+it added a magic number and no strength.
 
 ### A vacuity, found by mutation and closed
 
@@ -9296,20 +9299,25 @@ arithmetic fact the proof states over its integer term model.
 
 ### Mutants, measured
 
-Against the committed proof bytes (`0c5845f8b95f`), each restored
-byte-identically and re-checked, baseline 32v/0e:
+Against the committed proof bytes (`a7a305e7d2ae`), each measured alone and
+restored (or run on a `/tmp` copy) with the sha re-checked, baseline 32v/0e:
 
 - Law-level (**31 verified, 1 error** each): the DFA's charset losing `\r`
   (`all_ws_sem_iff` — this is the vacuity mutant, which used to be green),
   `Trail` stopping accepting whitespace (`lemma_run_ws`), the strip dropping
   its `s[j+2] == '0'` check and the strip accepting a signed `-0.0` tail
   (both `strip_removes_only_the_identity`), the term model's `total` base
-  case being 1 (`lemma_total_push`), and `last_plus` seeing only an adjacent
-  `+` (`lemma_last_plus`).
-- Pin-level (rejected at simplification by `by (compute)`, recorded as pin
+  case being 1 (`lemma_total_push`), `last_plus` seeing only an adjacent `+`
+  (`lemma_last_plus`), and an OVER-wide `Trail` that also accepts `+`
+  (`lemma_run_consumes` — the one-term law is what catches that, since the
+  `strip ⇒ DFA` law is one-way by construction).
+- Pin-level (rejected at simplification, no summary line, recorded as pin
   evidence and not as laws): the DFA's charset losing `\t`
-  (`pin_ws_charset_covers_tabs`), and `BeforePlus` not skipping whitespace
-  (`pin_dfa_agrees`).
+  (`pin_ws_charset_covers_tabs`), `BeforePlus` not skipping whitespace
+  (`pin_dfa_agrees`), and `Trail` accepting any character, `trim_start` not
+  trimming, `skip_ws` skipping nothing, and the whitespace before `+` being
+  kept (all `pin_strip_shapes`). The pre-fix header listed these last four
+  without re-measuring them; they were measured here.
 
 ### Scope (read this before quoting it)
 
@@ -9323,9 +9331,11 @@ byte-identically and re-checked, baseline 32v/0e:
   decimal, and the IR traversal are all out of model.
 - Only the renderer contract's INPUT predicate (`has_dot` on the stripped
   text) is modelled, not the verdict itself.
-- The analysed module has **no `#[cfg(test)]` block** (measured:
-  `grep -c 'cfg(test)'` → 0), so every pin row in the manifest is
-  UNMIRRORED and no `[exec]` PASS row exists for this proof.
+- The analysed module now has a `#[cfg(test)]` block: the generated
+  `src/transforms/bc_float_pin_tests.rs` (7 tests, 7 PASS), registered by
+  `gen_pin_tests.py` at the end of the pass. All 7 pin rows are MAPPED and
+executed; before this stage the module had no tests at all and all 5 rows
+  were UNMIRRORED.
 
 ### Cluster F2 — the literal `grep` fold (34 obligations + 12 executed pins)
 
