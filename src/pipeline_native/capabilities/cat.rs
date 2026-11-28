@@ -60,8 +60,10 @@ fn cat_file(call: &IrExpr) -> Option<NativeEmit> {
         }
         _ => return None,
     };
-    // A missing file exits 1 with empty stdout (bash's cat).
+    // A missing file exits 1 with empty stdout AND bash's redirect
+    // diagnostic on stderr (`<file>: No such file or directory`) — dropping
+    // the message made a failing `< FILE` read silent where bash complains.
     Some(NativeEmit::Stmt(format!(
-        "if (open(my $__h, '<', {path})) {{ local $/; my $__d = <$__h>; close($__h); $__sh_cap = defined($__d) ? $__d : q{{}}; $main_exit_code = $CHILD_ERROR = 0; }} else {{ $__sh_cap = q{{}}; $main_exit_code = $CHILD_ERROR = 1; }}"
+        "my $__f = {path}; if (open(my $__h, '<', $__f)) {{ local $/; my $__d = <$__h>; close($__h); $__sh_cap = defined($__d) ? $__d : q{{}}; $main_exit_code = $CHILD_ERROR = 0; }} else {{ $__sh_cap = q{{}}; $main_exit_code = $CHILD_ERROR = 1; print STDERR \"$__f: $!\\n\"; }}"
     )))
 }

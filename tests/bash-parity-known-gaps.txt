@@ -179,23 +179,45 @@
 #
 #   export e=hi; echo "[$e]"   bash: [hi]       perl: [] + uninitialized warning
 #
-# ── A missing input file: bash diagnoses the redirect, our `wc` does not ──
+# ── A missing input file: FIXED (bash's redirect diagnostic is emitted) ──
 #
 # examples/000__04h_complex_examples.sh calls a helper with a sibling script's
 # name that only exists when the cwd IS examples/; the harness runs from a
-# separate work dir, so bash's `< "$file"` redirect fails. STDOUT and the exit
-# status match byte-for-byte (both print an empty size) — only the diagnostic
-# differs, which is why `tests/renderer_behaviour.rs` compares example stderr
-# only for the tier1 fixtures.
+# separate work dir, so bash's `< "$file"` redirect fails. The natively
+# lowered `wc -c < FILE` / `cat < FILE` used to swallow the failure silently,
+# so the emitted Perl printed nothing where bash complains. Both capabilities now print
+# `<file>: <strerror>` on the failing branch, which is exactly what bash's
+# diagnostic says once the `script: line N: ` prefix (normalised everywhere)
+# is removed:
 #
 #   get_file_size 000__01_file_directory_operations.sh
 #   (get_file_size does: local size=`wc -c < "$file"`)
 #     bash:  000__04h_complex_examples.sh: line 43: 000__01_file_directory_operations.sh: No such file or directory
-#     perl:  (nothing on stderr)
+#     perl:  000__01_file_directory_operations.sh: No such file or directory
+#     (both: stdout `File … has  bytes`, exit 0)
 #
-# Same class as the redirect-diagnostic-prefix entry above: a shell's own
-# redirect diagnostic has no Perl equivalent, and the branch a script takes
-# (`$?`, stdout) already agrees.
+# With that fix `tests/renderer_behaviour.rs` compares stderr for EVERY corpus
+# entry, with no exemption.
+#
+# ── Undef reads: `Use of uninitialized value …` (of the 52-example class) ──
+#
+# The one example the strict corpus had to drop rather than snapshot:
+# examples/test-expression-backslash-continuation.sh reads `$FILE`, which is
+# never assigned, in file tests and in a command substitution. bash treats an
+# unset variable as the empty string; the render reads `$ENV{FILE}` directly,
+# so Perl warns. STDOUT and exit match (both take the false branch); the
+# warnings are the pre-existing undef class described above, not a new
+# wrong answer, and fixing it means a project-wide "unset reads as empty"
+# change. `077_backslash_continuation` + `021_ansi_quoting_escape` keep the
+# corpus's continuation/quoting coverage with clean stderr.
+#
+#   FILE is unset; the example runs
+#   [ \( ! -h "$FILE" -a -d "$FILE" \) -o \( -h "$FILE" -a "$(readlink "$FILE")" = "target" \) ]
+#     bash:  (nothing on stderr)
+#     perl:  Use of uninitialized value $argv[1] in open at x.pl line 63.
+#            Use of uninitialized value in -l at x.pl line 74.
+#            Use of uninitialized value in -d at x.pl line 74.
+#            Use of uninitialized value in -l at x.pl line 74.
 #
 # ── Backtick bodies that cannot fold still hand their inner `$()` to a shell ──
 #

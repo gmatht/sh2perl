@@ -28,8 +28,8 @@
 //!      declaration` (a duplicated runtime helper).
 //!   3. BEHAVES: bash and the emitted Perl are run in two temp dirs with the
 //!      SAME basename and their stdout, stderr and exit status compared
-//!      byte-for-byte. This is what makes the goldens known-GOOD rather than
-//!      merely stable.
+//!      byte-for-byte — for every entry, with no per-entry exemption. This is
+//!      what makes the goldens known-GOOD rather than merely stable.
 //!
 //! Normalisation, kept to what `tests/bash-parity.sh` already documents:
 //!   * the two temp roots are rewritten to `<WORK>` (an example may print
@@ -77,7 +77,8 @@ const EXAMPLES: &[&str] = &[
     "000__04a_basic_command_substitution",
     "000__04b_file_directory_operations",
     "000__04h_complex_examples",
-    "test-expression-backslash-continuation",
+    "077_backslash_continuation",
+    "021_ansi_quoting_escape",
     "unclosed-param-expansion",
     "native_capture",
 ];
@@ -329,10 +330,6 @@ fn corpus_renders_behave_like_bash() {
             }
         }
 
-        let strict_stderr = entry
-            .src
-            .to_string_lossy()
-            .contains("tests/tier1/");
         let (b_out, b_err, b_rc) = run(Command::new("bash").arg(&script), &a);
         let (p_out, p_err, p_rc) = run(Command::new("perl").arg("-w").arg(&prog), &b);
 
@@ -341,15 +338,10 @@ fn corpus_renders_behave_like_bash() {
             mismatch.push_str("  stdout differs\n");
             mismatch.push_str(&first_diff(&normalise(&b_out, &a), &normalise(&p_out, &b)));
         }
-        // stderr is part of the contract for the TIER1 fixtures (they exist
-        // to pin builtin diagnostics and `$?`). The example corpus is
-        // compared on stdout + exit like `tests/bash-parity.sh` does: those
-        // examples have pre-existing, unrelated stderr differences (a bash
-        // script calling a sibling by bare name; the older `Use of
-        // uninitialized value` class recorded in
-        // tests/bash-parity-known-gaps.txt), while the warnings this net
-        // cares about are asserted on the COMPILE side for every render.
-        if strict_stderr && normalise(&b_err, &a) != normalise(&p_err, &b) {
+        // stderr is part of the contract for EVERY entry: a dropped
+        // diagnostic or a new warning is a wrong answer even when stdout and
+        // the exit status agree.
+        if normalise(&b_err, &a) != normalise(&p_err, &b) {
             mismatch.push_str("  stderr differs\n");
             mismatch.push_str(&first_diff(&normalise(&b_err, &a), &normalise(&p_err, &b)));
         }
