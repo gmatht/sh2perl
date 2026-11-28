@@ -8755,17 +8755,33 @@ own nested read can observe (`pin_nested_after_write_keeps_the_store`).
 
 ### Mutants, measured
 
-(a) `dead_store_law`'s `!live(list)[i]` premise deleted — **27 verified,
-1 error**, landing inside the law; (d) `observed_after`'s later-read arm
-deleted — **25 verified, 3 errors**. (b) `live_step`'s store-reset disabled
-and (c) its nested term deleted are caught one stage earlier, at
-simplification, by the concrete pins
-`pin_stores_before_the_nearest_read_are_dropped` (`[true,true,true] ==
-[false,true,true]`) and `pin_nested_after_write_keeps_the_store`
-(`[true,false,true] == [true,true,true]`), so they carry no verified/error
-count — the same rejection class the README records for typeset_attrs'
-leading-zero mutant. The file was restored byte-identically after each run
-(sha256 in `status_reads_sync.txt`).
+The four mutants the plan names are all red, and each is measured in both
+spellings — the verdict side (`stmt_terminates`/`esc_one` answering wrongly) and
+the transform side (`trunc` pruning where it must not) — because the verdict-side
+spelling is caught by a pin's own assertion at elaboration, which would not by
+itself show that the *laws* are load-bearing. Transform side: pruning after an
+`if`-nested terminator **30 verified, 1 error** (`trunc_sound`), pruning after a
+`case` whose body ends in a terminator **30v/1e** (`trunc_sound`), and treating a
+top-level `Return` as a terminator **29v/2e** (`trunc_sound` and
+`return_truncates_only_a_function_body`). Verdict side: the `if`, `case` and
+nested-break spellings are each refuted at elaboration by their own pin
+(`pin_conditional_exit_does_not_deaden`, `pin_case_exit_may_not_fire`,
+`pin_nested_break_does_not_escape`). The `case` verdict-side mutant needed
+`decreases` clauses added to elaborate at all — the version without them is a
+syntactic rejection, not evidence. Restored byte-identically after every run;
+counts and shas are in `uae_terminators_sync.txt`. No mutant stayed green, so no
+vacuity was found here (unlike `affix_strip_fold`'s rule relabel, which was green
+until `fold_rule_classifies` was added).
+
+### Source drift
+
+`src/shir.rs` has moved on since this proof was written (brace expansion,
+74463779b and 4106ff5f6), so the recorded digest was re-pinned after an audit:
+`stmt_terminates`, `list_terminates`, `is_true_cond`, `loop_escapes` (with its
+nested `has_break`) and `program_observes_pipestatus` are byte-identical between
+the previously recorded revision (7d1c08df8) and HEAD, and the concatenation of
+those bodies digests `0559d98e0e41` at both. The manifest now records HEAD's file
+digest (`86b738598fb8`) with that audit rather than a silent bump.
 
 ### Scope (read this before quoting it)
 

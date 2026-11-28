@@ -1,25 +1,22 @@
 # verus-sync-coverage manifest: uae_terminators
-# source sha: shir=879d1775c017 (sha256 of src/shir.rs; RE-AUDITED 2026-11-28
-#   at 7d1c08df8 "Make the Perl render a pure function of the source": the
-#   region this models is BYTE-IDENTICAL across 1de09ce7 (the previously
-#   recorded 215b4d8f322e) and 7d1c08df8 (879d1775c017). Checked by extracting
-#   `pub fn stmt_terminates` .. `pub fn program_observes_pipestatus` -- that is
-#   stmt_terminates, list_terminates, is_true_cond, loop_escapes and its
-#   has_break -- from both revisions and diffing: empty, and both digest
-#   2788087e3730. The `enum IrStmt` variant set is untouched in that range too;
-#   7d1c08df8's 197/79 lines are the render-purity work elsewhere in the file.
-#   Earlier audit, still standing: since 9cf054f19 only ir_stmt_writes_lastexit
-#   (Case/Select join the writer set), ir_expr_reads_status (a block/whileLoop
-#   operand is a status read) and command_to_ir (a compound command in an
-#   expression slot lowers to `block`) changed -- none of the terms above.
-#   The row used to record HEAD's git blob; it now records the content digest,
-#   because the checker has exactly one rule and no alternate digest.)
-# uae=21dacdcb3df8 (sha256 of src/transforms/unreachable_after_exit.rs;
-#   RE-AUDITED 2026-11-28: the previously recorded value names 3724d59a7,
-#   which is byte-identical to HEAD for this file. The only change since is
-#   the `#[cfg(test)] #[path = "uae_terminators_pin_tests.rs"] mod pin_tests;`
-#   registration appended after `pass`, outside every function this proof
-#   models -- transform, pass and the semantics it reads are untouched.)
+# source sha: shir=86b738598fb8 (sha256 of src/shir.rs)
+#   RE-AUDITED 2026-11-28 at 11118cb38. The row previously recorded 879d1775c017,
+#   the digest of src/shir.rs at 7d1c08df8. Everything this proof models is
+#   BYTE-IDENTICAL between that revision and HEAD: `stmt_terminates`,
+#   `list_terminates`, `is_true_cond`, `loop_escapes` (with its nested
+#   `has_break`) and `program_observes_pipestatus` were each extracted from both
+#   revisions and compared -- equal, and the concatenation of those bodies
+#   digests 0559d98e0e41 (54 lines) at BOTH revisions. The `enum IrStmt`
+#   variant set is untouched as well. What changed in src/shir.rs between them
+#   is the brace-expansion work (74463779b "Match bash on unexpandable brace
+#   ranges and a zero step", 4106ff5f6 "Expand braces textually when a variable
+#   sits beside one"), none of which is inside the verdict, the escapes walk or
+#   the loop-condition test. So the digest is re-pinned here with that audit
+#   rather than bumped.
+# uae=21dacdcb3df8 (sha256 of src/transforms/unreachable_after_exit.rs; unchanged
+#   at HEAD; the only diff ever recorded for this file is the
+#   `#[cfg(test)] #[path = "uae_terminators_pin_tests.rs"] mod pin_tests;`
+#   registration appended after `pass`.)
 # proof sha: abeb2e27f1c7
 
 [pins]
@@ -47,14 +44,46 @@ guard Die folded into Exit, other_ => not a terminator (source's `_ => false`): 
 
 [counts]
 31 verified, 0 errors (verus --triggers-mode silent --rlimit 40 uae_terminators.rs)
-mutants (measured 2026-11-27, RE-MEASURED 2026-11-28 with the same counts,
-  each restored byte-identically and the proof sha re-verified): if-nested
-  terminator truncates 30v/1e (trunc_sound), top-level Return 29v/2e
-  (trunc_sound, return_truncates_only_a_function_body), case-nested Exit prunes
-  30v/1e (trunc_sound, asserted at trunc's prefix step); nested-break-escapes,
-  trunc-drops-terminator, case-break-falls-through and run-ignores-signal
-  rejected at simplification by their pins (nested-break-escapes by
-  pin_nested_break_does_not_escape, on `expression simplifies to false`).
+The plan's four mutants, measured 2026-11-28 against that baseline (proof sha
+abeb2e27f1c7), each restored byte-identically to the same sha afterwards. Each
+is measured in BOTH spellings: the verdict-side one (`terminates`/`esc_one`
+returning the wrong answer) and the transform-side one (`trunc` pruning where it
+must not), because the verdict-side spelling is caught by a pin's own assertion
+at elaboration and that alone would not show the LAW is load-bearing.
+    m1 a break inside a NESTED loop counts as escaping the outer loop
+       verdict side: `Stmt::While { .. } => false` -> `escapes(body)`
+                                                            0v, 1 elaboration error
+       (pin_nested_break_does_not_escape's assertion simplifies to false, which
+        is the specified evidence for this refusal: the red is that row's job)
+    m2 a terminator inside an If deadens the enclosing list
+       verdict side: `terminates` gains `Stmt::If { .. } => true`
+                                                            0v, 1 elaboration error
+       transform side: `trunc` stops at `terminates(l[0], in_fn) || is_if(l[0])`
+                                                                30v, 1 error
+       (trunc_sound's assertion fails: the law, not just a pin, catches it)
+    m3 Return is a terminator at top level too (`in_fn` ignored)
+                                                                29v, 2 errors
+       (trunc_sound and return_truncates_only_a_function_body)
+    m4 a Case whose body's tail is a terminator deadens the enclosing list
+       verdict side: `terminates` gains
+                     `Stmt::Case { body, .. } => list_terminates(body, in_fn)`
+                                                            0v, 1 elaboration error
+       (pin_case_exit_may_not_fire)
+       transform side: `trunc` stops at
+                     `terminates(l[0], in_fn) || case_tail_terminates(l[0], in_fn)`
+                                                                30v, 1 error
+       (trunc_sound)
+       NOTE: the verdict-side spelling first needed `decreases` clauses on
+       `terminates` and `list_terminates`; without them Verus rejects it for
+       being mutually recursive, which is a syntactic red and not evidence.
+Matched to the earlier measurements (2026-11-27) on the transform side exactly
+(30v/1e for m2, 30v/1e for m4, 29v/2e for m3); the verdict-side spellings and
+their elaboration reds are new here. No mutant stayed green, so no vacuity was
+found in this proof's laws for these four -- unlike affix_strip_fold's rule
+relabel, which was green until `fold_rule_classifies` was added.
+Earlier measurements still standing: trunc-drops-terminator, case-break-falls-
+through and run-ignores-signal rejected at simplification by their own pins.
+
 [exec]
 # Every MAPPED row above was EXECUTED against the source in this tree by the
 # generator that owns the tests:
