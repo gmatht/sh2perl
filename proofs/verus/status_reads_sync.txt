@@ -1,5 +1,11 @@
 # verus-sync-coverage manifest: status_reads
-# source sha: status_reads=32b0936fb8b7  proof sha: 467f5b75b0c5
+# source sha: status_reads=648d3248f5f2  proof sha: 467f5b75b0c5
+#   RE-AUDITED 2026-11-28 (the recorded value names 3d0b3256d "python: drop
+#   status stores no reader can observe"): 3d0b3256d and HEAD are
+#   byte-identical for src/shir_passes/status_reads.rs; the only change since
+#   is the `#[cfg(test)] #[path = "status_reads_pin_tests.rs"] mod pin_tests;`
+#   registration appended at EOF, six lines after the test module and outside
+#   every function this proof models.
 
 [pins]
 pin pin_bare_exit_reads_the_status -> test bare_exit_reads_the_status: MAPPED
