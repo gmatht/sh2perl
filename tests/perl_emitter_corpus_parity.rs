@@ -1202,7 +1202,15 @@ fn emitter_text_divergences_match_the_ledger_exactly() {
                     Ok(e) => {
                         evidence.insert(name, e);
                     }
-                    Err(e) => behaviour_failures.push(e),
+                    Err(mut e) => {
+                        // Name the text classes too, so a runtime failure says
+                        // WHICH kind of divergence the script carries.
+                        if let Some(d) = observed.get(&name) {
+                            let classes: Vec<&str> = d.classes.iter().copied().collect();
+                            e.push_str(&format!("\n  text classes: {classes:?}"));
+                        }
+                        behaviour_failures.push(e);
+                    }
                 }
             }
         }
@@ -1254,6 +1262,15 @@ fn emitter_text_divergences_match_the_ledger_exactly() {
                     problems.push(format!(
                         "{name}: ledger claims behaviour {:?} but the renders OBSERVED {:?}",
                         ev, d.evidence
+                    ));
+                }
+                // Mechanical invariant: cosmetic status may rest ONLY on a
+                // separate-temp-dir render-vs-render observation. Any other
+                // token (e.g. a same-directory tie-breaker) is not evidence.
+                if !matches!(ev.as_str(), EV_BOTH_MATCH_BASH | EV_RENDERS_EQUAL_BASH_DIFF) {
+                    problems.push(format!(
+                        "{name}: ledger evidence {ev:?} is not a separate-temp-dir render-vs-render \
+                         observation"
                     ));
                 }
                 if *lines != d.lines {
@@ -1320,15 +1337,22 @@ fn run_timed(argv: &[&str], cwd: &Path, secs: u32) -> (i32, String, String, bool
 ///   * the work directory path and the `sh2b_*`/`sh2_rb_*` temp names → `<WORK>`;
 ///   * `x.pl: line N` → `x.pl: line N` (a warning's LINE NUMBER depends on how
 ///     many helper declarations the other emitter emitted).
-fn norm_behaviour(s: &str, dir: &Path, stderr: bool) -> String {
-    let mut out = s.replace(&dir.to_string_lossy().into_owned(), "<WORK>");
-    for prefix in ["sh2b_", "sh2_rb_", "sh2sd_"] {
+fn norm_behaviour(s: &str, base: &Path, stderr: bool) -> String {
+    // The BASE temp directory — not just its `work` subdirectory. A script that
+    // prints `dirname "$(pwd)"` or `$PWD` shortened to a fixed number of
+    // characters would otherwise differ between two runs ONLY because the two
+    // staging roots have different random names, which is a property of the
+    // staging, not of either emitter.
+    let mut out = s.replace(&base.to_string_lossy().into_owned(), "<WORK>");
+    // Belt and braces: a truncated path can leave a bare `sh2_<tag>_<digits>_<digits>`
+    // fragment with no leading directory.
+    for prefix in ["sh2_sh2b_", "sh2_sh2sd_", "sh2b_", "sh2_rb_", "sh2sd_"] {
         while let Some(at) = out.find(prefix) {
             let rest = &out[at + prefix.len()..];
             let end = rest
-                .find(|c: char| !c.is_ascii_alphanumeric())
+                .find(|c: char| !c.is_ascii_alphanumeric() && c != '_')
                 .unwrap_or(rest.len());
-            out = format!("{}{}<WORK>{}", &out[..at], "", &rest[end..]);
+            out = format!("{}<WORK>{}", &out[..at], &rest[end..]);
         }
     }
     if stderr {
@@ -1367,11 +1391,11 @@ struct Observation {
     err: String,
 }
 
-fn observe(run: (i32, String, String, bool), dir: &Path) -> Observation {
+fn observe(run: (i32, String, String, bool), base: &Path) -> Observation {
     Observation {
         rc: run.0,
-        out: norm_behaviour(&run.1, dir, false),
-        err: norm_behaviour(&run.2, dir, true),
+        out: norm_behaviour(&run.1, base, false),
+        err: norm_behaviour(&run.2, base, true),
     }
 }
 
@@ -1381,7 +1405,12 @@ impl Observation {
     }
 }
 
-fn temp_work(tag: &str) -> PathBuf {
+/// A fresh staging root with a `work` subdirectory: each run gets its OWN root
+/// (the required separate temp dirs) and every occurrence of that root in the
+/// output is normalised to `<WORK>`, so a script that prints its working
+/// directory is comparable across runs without pretending the two roots are
+/// the same directory.
+fn temp_base(tag: &str) -> (PathBuf, PathBuf) {
     let base = std::env::temp_dir().join(format!(
         "sh2_{tag}_{}_{}",
         std::process::id(),
@@ -1392,53 +1421,36 @@ fn temp_work(tag: &str) -> PathBuf {
     ));
     let work = base.join("work");
     std::fs::create_dir_all(&work).expect("create work dir");
-    work
+    (base, work)
 }
 
 /// Run one render in its own temp dir.
 fn run_render(perl_text: &str, tag: &str) -> (Observation, PathBuf) {
-    let dir = temp_work(tag);
-    std::fs::write(dir.join("x.pl"), perl_text).expect("write render");
-    let obs = observe(run_timed(&["perl", "x.pl"], &dir, 20), &dir);
-    (obs, dir)
-}
-
-/// Run BOTH renders at the SAME path (same cwd string), sequentially, each with
-/// a clean directory — the tie-breaker for scripts whose output depends on the
-/// working directory (`pwd`, `dirname "$(pwd)"`, `tr '.....$'` of it).
-fn same_dir_equal(bare: &str, fixed: &str) -> bool {
-    let dir = temp_work("sh2sd");
-    std::fs::write(dir.join("x.pl"), bare).expect("write bare");
-    let a = observe(run_timed(&["perl", "x.pl"], &dir, 20), &dir);
-    for entry in std::fs::read_dir(&dir).expect("read work dir") {
-        let p = entry.expect("dir entry").path();
-        let _ = std::fs::remove_file(p);
-    }
-    std::fs::write(dir.join("x.pl"), fixed).expect("write fixed");
-    let b = observe(run_timed(&["perl", "x.pl"], &dir, 20), &dir);
-    let _ = std::fs::remove_dir_all(dir.parent().unwrap_or(&dir));
-    a.same(&b)
+    let (base, work) = temp_base(tag);
+    std::fs::write(work.join("x.pl"), perl_text).expect("write render");
+    let obs = observe(run_timed(&["perl", "x.pl"], &work, 20), &base);
+    (obs, base)
 }
 
 const EV_BOTH_MATCH_BASH: &str = "render-eq+bash-eq";
 const EV_RENDERS_EQUAL_BASH_DIFF: &str = "render-eq+bash-diff";
-const EV_SAME_DIR_EQUAL: &str = "render-diff+same-dir-eq";
 
 /// Observe the two renders (and bash where it can be the oracle) and return the
 /// evidence token the ledger must record for this script.
 ///
+/// The comparison mode is the required one and only that one: each render runs
+/// in its OWN temp root with stdin closed and a hard timeout, and the temp root
+/// is normalised to `<WORK>` in stdout/stderr before comparing, so a script
+/// that prints its working directory is still comparable without either render
+/// sharing a directory with the other.
+///
 ///   * `render-eq+bash-eq`      both renders behave identically AND like bash.
 ///   * `render-eq+bash-diff`    renders identical, bash differs — a SHARED
 ///                              defect (both emitters agree), not a parity bug.
-///   * `render-diff+same-dir-eq` the renders differ only across DIFFERENT temp
-///                              roots; at the same path they behave identically
-///                              (cwd-dependent output), so the difference is
-///                              cosmetic.
 ///
-/// Anything else — renders that still differ at the same path — is a real
-/// divergence and the caller fails with the script named.
-/// Name the first line two runs disagree on, so a failure points at the wrong
-/// output instead of at the start of the program.
+/// Anything else is a real divergence between the two renders: the caller
+/// fails naming the script. There is deliberately NO "same directory"
+/// tie-breaker — a cosmetic claim may not rest on one.
 fn first_diff(a: &str, b: &str) -> String {
     if let Some((x, y)) = a.lines().zip(b.lines()).find(|(x, y)| x != y) {
         return format!("first diff bare={x:?} fixed={y:?}");
@@ -1451,42 +1463,35 @@ fn first_diff(a: &str, b: &str) -> String {
 }
 
 fn observe_behaviour(script: &Path, bare: &str, fixed: &str) -> Result<&'static str, String> {
-    let (bo, bdir) = run_render(bare, "sh2b");
-    let (fo, fdir) = run_render(fixed, "sh2b");
-    let bash_dir = temp_work("sh2b");
+    let (bo, bbase) = run_render(bare, "sh2b");
+    let (fo, fbase) = run_render(fixed, "sh2b");
+    let (bash_base, bash_work) = temp_base("sh2b");
     let bash = observe(
-        run_timed(
-            &["bash", &script.to_string_lossy()],
-            &bash_dir,
-            10,
-        ),
-        &bash_dir,
+        run_timed(&["bash", &script.to_string_lossy()], &bash_work, 10),
+        &bash_base,
     );
-    let _ = std::fs::remove_dir_all(bdir.parent().unwrap_or(&bdir));
-    let _ = std::fs::remove_dir_all(fdir.parent().unwrap_or(&fdir));
-    let _ = std::fs::remove_dir_all(bash_dir.parent().unwrap_or(&bash_dir));
-    if bo.same(&fo) {
-        if bash.rc == 124 {
-            // bash hung: it cannot be the oracle, but the renders agree.
-            return Ok(EV_RENDERS_EQUAL_BASH_DIFF);
-        }
-        return Ok(if bash.same(&bo) {
-            EV_BOTH_MATCH_BASH
-        } else {
-            EV_RENDERS_EQUAL_BASH_DIFF
-        });
+    let _ = std::fs::remove_dir_all(&bbase);
+    let _ = std::fs::remove_dir_all(&fbase);
+    let _ = std::fs::remove_dir_all(&bash_base);
+    if !bo.same(&fo) {
+        return Err(format!(
+            "{script:?}: RENDERS DIFFER IN BEHAVIOUR (separate temp dirs, stdin closed, timeout)\n  \
+             stdout: {}\n  stderr: {}\n  rc: {} vs {}",
+            first_diff(&bo.out, &fo.out),
+            first_diff(&bo.err, &fo.err),
+            bo.rc,
+            fo.rc,
+        ));
     }
-    if same_dir_equal(bare, fixed) {
-        return Ok(EV_SAME_DIR_EQUAL);
+    if bash.rc == 124 {
+        // bash hung: it cannot be the oracle, but the two renders agree.
+        return Ok(EV_RENDERS_EQUAL_BASH_DIFF);
     }
-    Err(format!(
-        "{script:?}: RENDERS DIFFER IN BEHAVIOUR at the same path\n  \
-         stdout: {}\n  stderr: {}\n  rc: {} vs {}",
-        first_diff(&bo.out, &fo.out),
-        first_diff(&bo.err, &fo.err),
-        bo.rc,
-        fo.rc,
-    ))
+    Ok(if bash.same(&bo) {
+        EV_BOTH_MATCH_BASH
+    } else {
+        EV_RENDERS_EQUAL_BASH_DIFF
+    })
 }
 
 // ---------------------------------------------------------------------------
@@ -1565,9 +1570,16 @@ const HEADER: &str = "\
 # COLUMNS (tab-separated): path, classes, behaviour-evidence, differing-line-count
 #
 # behaviour-evidence is OBSERVED, not classified: the test renders both emitters,
-# runs each under `perl` in its own temp dir with stdin CLOSED and a hard
+# runs each under `perl` in its OWN temp directory with stdin CLOSED and a hard
 # timeout (20s perl, 10s bash), runs the script under bash the same way, and
-# compares stdout, stderr and exit status. Tokens:
+# compares stdout, stderr and exit status. The one normalisation is the run's
+# own temp ROOT (and its `work` subdirectory) -> `<WORK>` in both streams, so a
+# script that prints `$PWD` or `dirname \"$(pwd)\"` is comparable even though the
+# two runs stage in different directories. There is NO same-directory
+# tie-breaker: a render difference that survives that normalisation is a wrong
+# answer and fails the test naming the script and the first differing line.
+#
+# Tokens (the only two the test can produce):
 #
 #   render-eq+bash-eq       both renders behave identically (stdout, stderr, rc)
 #                           AND match bash. The divergence is emit style only.
@@ -1576,16 +1588,17 @@ const HEADER: &str = "\
 #                           emitter divergence. Recorded so it is not mistaken
 #                           for parity, and so a future shared fix can flip the
 #                           token instead of the ledger silently going stale.
-#   render-diff+same-dir-eq the renders differ across DIFFERENT temp roots but
-#                           behave identically when run at the SAME path (their
-#                           output embeds the working directory), so the
-#                           difference is cosmetic/cwd-dependent by observation.
 #
-# An unledgered behaviour difference fails the test naming the script and the
-# first differing line; a ledger entry whose claim no longer matches the
-# observation fails too. bash is not the oracle for a script that hangs
-# (timeout 124) or that depends on ambient state — those are recorded above with
-# the token that says so (render-eq+bash-diff for a hung/unjudgeable bash).
+# bash is not the oracle for a script that hangs (timeout 124); the renders are
+# still compared against each other and the token records the bash difference.
+# A script that could not be judged at all is named in the commit/report with
+# the reason; none is currently in that state.
+#
+# The exact differing LINES are not trusted from the ledger: every run
+# re-derives them from the two fresh renders with `classify`, requires each
+# line to fit its class's stated shape, and requires the ledger's class set and
+# differing-line COUNT to match exactly. A changed line, a new class or a
+# vanished difference fails.
 #
 # Classes (each re-derived by the test from the two renders, not trusted):
 #

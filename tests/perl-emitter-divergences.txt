@@ -16,9 +16,16 @@
 # COLUMNS (tab-separated): path, classes, behaviour-evidence, differing-line-count
 #
 # behaviour-evidence is OBSERVED, not classified: the test renders both emitters,
-# runs each under `perl` in its own temp dir with stdin CLOSED and a hard
+# runs each under `perl` in its OWN temp directory with stdin CLOSED and a hard
 # timeout (20s perl, 10s bash), runs the script under bash the same way, and
-# compares stdout, stderr and exit status. Tokens:
+# compares stdout, stderr and exit status. The one normalisation is the run's
+# own temp ROOT (and its `work` subdirectory) -> `<WORK>` in both streams, so a
+# script that prints `$PWD` or `dirname "$(pwd)"` is comparable even though the
+# two runs stage in different directories. There is NO same-directory
+# tie-breaker: a render difference that survives that normalisation is a wrong
+# answer and fails the test naming the script and the first differing line.
+#
+# Tokens (the only two the test can produce):
 #
 #   render-eq+bash-eq       both renders behave identically (stdout, stderr, rc)
 #                           AND match bash. The divergence is emit style only.
@@ -27,16 +34,17 @@
 #                           emitter divergence. Recorded so it is not mistaken
 #                           for parity, and so a future shared fix can flip the
 #                           token instead of the ledger silently going stale.
-#   render-diff+same-dir-eq the renders differ across DIFFERENT temp roots but
-#                           behave identically when run at the SAME path (their
-#                           output embeds the working directory), so the
-#                           difference is cosmetic/cwd-dependent by observation.
 #
-# An unledgered behaviour difference fails the test naming the script and the
-# first differing line; a ledger entry whose claim no longer matches the
-# observation fails too. bash is not the oracle for a script that hangs
-# (timeout 124) or that depends on ambient state — those are recorded above with
-# the token that says so (render-eq+bash-diff for a hung/unjudgeable bash).
+# bash is not the oracle for a script that hangs (timeout 124); the renders are
+# still compared against each other and the token records the bash difference.
+# A script that could not be judged at all is named in the commit/report with
+# the reason; none is currently in that state.
+#
+# The exact differing LINES are not trusted from the ledger: every run
+# re-derives them from the two fresh renders with `classify`, requires each
+# line to fit its class's stated shape, and requires the ledger's class set and
+# differing-line COUNT to match exactly. A changed line, a new class or a
+# vanished difference fails.
 #
 # Classes (each re-derived by the test from the two renders, not trusted):
 #
@@ -117,7 +125,7 @@ examples/054_fibonacci.sh	output-idiom	render-eq+bash-eq	4
 examples/055_factorize.sh	output-idiom	render-eq+bash-eq	4
 examples/056_send_args.sh	output-idiom	render-eq+bash-diff	2
 examples/057_case.sh	output-idiom,runtime-seam	render-eq+bash-diff	8
-examples/058_advanced_bash_idioms.sh	output-idiom,runtime-seam	render-diff+same-dir-eq	18
+examples/058_advanced_bash_idioms.sh	output-idiom,runtime-seam	render-eq+bash-eq	18
 examples/061_test_local_names_preserved.sh	output-idiom	render-eq+bash-eq	12
 examples/062_01_ambiguous_operators.sh	output-idiom	render-eq+bash-eq	2
 examples/062_02_complex_parameter_expansions.sh	output-idiom	render-eq+bash-eq	8
