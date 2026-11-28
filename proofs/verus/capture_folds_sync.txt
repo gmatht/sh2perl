@@ -1,5 +1,11 @@
 # verus-sync-coverage manifest: capture_folds
-# source sha: const_capture_fold=b9bc2cba1f8d  text_capture_fold=f76d26e31190  proof sha: 8766a37293b0
+# source sha: const_capture_fold=b9bc2cba1f8d  text_capture_fold=79d9e2520f57  proof sha: 8766a37293b0
+#   RE-PINNED 2026-11-28 (pin reproducibility): f76d26e31190 -> 79d9e2520f57,
+#   the COMMITTED blob at HEAD. Compared function-by-function (bodies, not
+#   hunks): `constant_output` and `emit`, the two sides of this law, are
+#   byte-identical, and the delta is the generated test hook appended after
+#   `mod tests` (`#[path = "text_capture_pin_tests.rs"]
+#   mod pin_tests_text_capture;`).
 # re-pinned 2026-11-26: const_capture_fold gained `const_printf_output`, the
 # printf entry `text_ops` also reuses, which this proof did not model. It now
 # does: `printf_fold_is_the_whole_output` proves a folded printf's text is the

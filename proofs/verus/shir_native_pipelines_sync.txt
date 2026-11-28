@@ -1,5 +1,5 @@
 # verus-sync-coverage manifest: shir_native_pipelines
-# source sha: shir_native_stmt=2504eddc38d2  proof sha: 4c8543b9e7d7
+# source sha: shir_native_stmt=3ae1b4d0bc71  proof sha: 4c8543b9e7d7
 # source: src/transforms/shir_native_stmt.rs — cluster F4, `xargs` / `comm` /
 #   `diff` / `sort` / `ls`
 #   surface: native_echo_xargs_stmt (5290), native_comm_stmt (6756),
@@ -156,14 +156,16 @@ EMITTED TEXT of their walk, which no law here models, so they are not mirrors.)
 mutants measured 2026-11-28 against proof sha 4c8543b9e7d7, each on a /tmp copy (the
 source untouched), sha re-checked afterwards (4c8543b9e7d7; source sha256 unchanged
 before and after). M5–M18 were measured against the previous proof revision
-d135c5309730. Source pin note: at this stage's start the working tree held
-3ae1b4d0bc71 (= `git show HEAD:src/transforms/shir_native_stmt.rs`); it was then
-edited by another worker (native_sort_file_stmt / grep / emit_file_op), so the
-recorded source sha here is the working-tree sha 2504eddc38d2. Re-audited, not
-just bumped:
-`native_sort_stmt` — the fold §7 models — is byte-identical between 3ae1b4d0bc71
-and 2504eddc38d2 (checked by slicing both versions of the function), and every changed
-region belongs to folds outside this cluster's surface:
+d135c5309730. Source state: this row names the COMMITTED blob at HEAD, 3ae1b4d0bc71 =
+`git show HEAD:src/transforms/shir_native_stmt.rs` — a pin must describe bytes
+that exist in the repository, not one worktree's state. The worktree copy is
+currently 2504eddc38d2 because another worker has uncommitted edits
+(native_sort_file_stmt / native_grep_file_pipeline / emit_file_op); check_sync
+accepts a row naming the HEAD blob while that copy is dirty and says so.
+Compared function-by-function: the folds this cluster models — `native_sort_stmt`
+(§5, §7) and the `ls` fold (`native_ls_stmt`) — are byte-identical between
+3ae1b4d0bc71 and 2504eddc38d2, and every changed function belongs to folds
+outside this cluster's surface:
   M5  the echo word separator dropped                rejected at simplification
   M6  comm advances only the first cursor on a match rejected at simplification
   M7  the newline dropped from echo                  rejected at simplification

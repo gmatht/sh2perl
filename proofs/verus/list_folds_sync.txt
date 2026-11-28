@@ -1,5 +1,16 @@
 # verus-sync-coverage manifest: list_folds
-# source sha: brace_fold=3cbc85981aa1 affix_strip_fold=929ebbee6785  proof sha: fc05a3a21991
+# source sha: brace_fold=99e3164c0d31 affix_strip_fold=c7e75ff61cc8  proof sha: fc05a3a21991
+#   RE-PINNED 2026-11-28 (pin reproducibility), both rows:
+#   brace_fold 3cbc85981aa1 -> 99e3164c0d31 and affix_strip_fold 929ebbee6785 ->
+#   c7e75ff61cc8, each the COMMITTED blob at HEAD. Compared function-by-function
+#   (bodies, not hunks) between the recorded state and HEAD: every production
+#   function in both files is byte-identical, so the fold laws keep the code they
+#   were written for. brace_fold's delta is confined to `#[cfg(test)] mod tests`
+#   (the `echo_arg_fans_out` and `product_and_nested_expand` TEST bodies now
+#   parse the source first via the new `parsed_words` helper, because the PARSER
+#   resolves braces next to literal text, plus a pure-product assertion and the
+#   generated `pin_tests` module hook); affix_strip_fold's delta is only the
+#   generated `#[path = "affix_pin_tests.rs"] mod pin_tests_affix;` hook.
 # re-pinned 2026-11-26: the recorded affix_strip_fold=62e557c7454a names no
 # revision of src/transforms/affix_strip_fold.rs (all 6 versions checked,
 # sha256 and git blob). Region audited against the current file:

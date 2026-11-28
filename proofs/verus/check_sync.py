@@ -11,6 +11,15 @@ checker fails on each:
      A `STALE (…)` annotation on the row is deliberately NOT honoured — an
      annotated row fails exactly like a bare one, because a manifest that no
      longer matches its source must never read as evidence.
+
+     One state rule, for shared sources only: a row may name the COMMITTED
+     blob at HEAD instead of the worktree copy. That is accepted (and printed
+     as "HEAD blob") only while the worktree copy is DIRTY — i.e. someone has
+     an uncommitted edit — because then the committed bytes are the ones the
+     repository actually contains and the row is evidence about them, not rot.
+     A row matching neither the worktree copy nor the committed blob is stale,
+     and a clean worktree makes the two states identical. Proof shas have no
+     such rule: the proof's own bytes on disk are what was verified.
   2. PHANTOM PINS — a `pin <name>` row whose proof fn no longer exists in the
      sibling `.rs` (renamed, deleted, or typo'd).
   3. UNRUN EVIDENCE — an `exec <pin> (<test>): PASS` row whose test either no
@@ -166,16 +175,83 @@ def sha256_prefix(path: str, n: int = SHA_LEN) -> str:
 
 
 def digest_matches(recorded: str, path: str) -> bool:
-    """The ONE way a recorded sha matches: it must be the leading 12+ hex
-    characters of THIS file's sha256 (or the full 64-char digest).
+    """The ONE way a recorded sha matches the file ON DISK: it must be the
+    leading 12+ hex characters of THIS file's sha256 (or the full 64-char
+    digest).
 
-    There is deliberately no second rule: no alternate digest of the same
-    file, no shortened stub, no annotation, nothing that could let a row
-    that no longer describes the file read as a match.
+    There is deliberately no second rule here: no alternate digest of the same
+    file, no shortened stub, no annotation, nothing that could let a row that
+    no longer describes the file read as a match. Which STATE of the file a row
+    may name is decided in `source_state`, and only there.
     """
     if not re.fullmatch(r"[0-9a-f]{12,64}", recorded or ""):
         return False
     return sha256_full(path).startswith(recorded)
+
+
+def digest_matches_bytes(recorded: str, data: bytes) -> bool:
+    if not re.fullmatch(r"[0-9a-f]{12,64}", recorded or ""):
+        return False
+    return hashlib.sha256(data).hexdigest().startswith(recorded)
+
+
+_blob_cache: dict[str, bytes | None] = {}
+
+
+def committed_bytes(rel: str) -> bytes | None:
+    """The file's bytes as committed at HEAD, or None (no git work tree,
+    or the path is not tracked/committed)."""
+    if rel in _blob_cache:
+        return _blob_cache[rel]
+    data: bytes | None = None
+    try:
+        r = subprocess.run(["git", "show", f"HEAD:{rel}"], cwd=REPO,
+                           capture_output=True, timeout=120)
+        if r.returncode == 0:
+            data = r.stdout
+    except (OSError, subprocess.TimeoutExpired):
+        data = None
+    _blob_cache[rel] = data
+    return data
+
+
+def worktree_dirty(rel: str) -> bool:
+    """Does the worktree copy of `rel` differ from HEAD (staged or not)?"""
+    try:
+        r = subprocess.run(["git", "status", "--porcelain", "--", rel], cwd=REPO,
+                           capture_output=True, text=True, timeout=120)
+        return r.returncode == 0 and r.stdout.strip() != ""
+    except (OSError, subprocess.TimeoutExpired):
+        return False
+
+
+def source_state(recorded: str, path: str, rel: str) -> str:
+    """"worktree", "head" or "" (stale): which real state of the source the
+    recorded sha names.
+
+    A row must describe bytes that exist in the repository. Normally that is
+    the file on disk, and a mismatch is rot. But the working tree can hold
+    ANOTHER worker's uncommitted edit to a shared source file, and a row that
+    names the COMMITTED blob then still describes bytes that exist in the
+    repository — it must not read as rot, and it must not be "repaired" by
+    pinning bytes nobody can check out. So:
+
+      * the on-disk digest is authoritative whenever it matches ("worktree");
+      * otherwise, only when the worktree copy is DIRTY, the committed blob may
+        match ("head"), and the caller prints that it did;
+      * a row that matches neither is stale, exactly as before.
+
+    A clean worktree makes the two states identical, so this rule changes
+    nothing there: it only stops an unrelated dirty file from staling a row
+    that names what HEAD commits.
+    """
+    if digest_matches(recorded, path):
+        return "worktree"
+    if worktree_dirty(rel):
+        blob = committed_bytes(rel)
+        if blob is not None and digest_matches_bytes(recorded, blob):
+            return "head"
+    return ""
 
 
 def resolve_source(key: str) -> str | None:
@@ -288,10 +364,21 @@ def check(m: Manifest, verdicts: dict[str, list[str]] | None, verbose: bool) -> 
             continue
         actual = sha256_prefix(src)
         rel = os.path.relpath(src, REPO)
-        if digest_matches(recorded, src):
+        state = source_state(recorded, src, rel)
+        if state == "worktree":
             if verbose:
                 print(f"  {m.name}: {key} ok ({actual} = sha256 of {rel})")
             continue
+        if state == "head":
+            print(f"  {m.name}: {key} ok ({recorded} = HEAD blob of {rel}; "
+                  "the worktree copy has uncommitted edits)")
+            continue
+        blob = committed_bytes(rel)
+        at_head = (
+            f", {hashlib.sha256(blob).hexdigest()[:SHA_LEN]} at HEAD"
+            if blob is not None
+            else " (and no committed blob could be read here — not a git work tree?)"
+        )
         shape = (
             ""
             if re.fullmatch(r"[0-9a-f]{12,64}", recorded)
@@ -299,7 +386,7 @@ def check(m: Manifest, verdicts: dict[str, list[str]] | None, verbose: bool) -> 
         )
         bad(
             "stale-source",
-            f"{key}={recorded}: {rel} is sha256 {actual}{shape}"
+            f"{key}={recorded}: {rel} is sha256 {actual} on disk{at_head}{shape}"
             " — the proof was written against a different source; re-audit it, "
             "do not just bump the sha (an annotation on the row changes nothing: "
             "there is no admitted-staleness escape hatch)",

@@ -1,5 +1,16 @@
 # verus-sync-coverage manifest: escape_classes
-# source sha: escape_classes=b1298e8ba779  proof sha: 95fdc0ba09c7
+# source sha: escape_classes=07f6ff929ced  proof sha: 95fdc0ba09c7
+#   RE-PINNED 2026-11-28 (pin reproducibility): b1298e8ba779 is the blob of
+#   src/transforms/escape_classes.rs at 7d1c08df8^ (checked by hashing
+#   `git show 7d1c08df8^:src/transforms/escape_classes.rs`); this row now names
+#   the COMMITTED blob at HEAD, 07f6ff929ced. Compared function-by-function:
+#   the whole delta of 7d1c08df8 in this file is the verdict REGISTRY's storage
+#   — `static VERDICTS: Mutex<Option<HashMap<…>>>` becomes a `thread_local!`
+#   `RefCell`, and its three accessors switch to `VERDICTS.with(…)`, because a
+#   verdict belongs to the compilation that installed it, not to the process.
+#   Nothing this proof models moved: the `multi_scope` criterion, the three
+#   `EscapeClass` variants (`StoreArray` / `NativeArray` / `Local`) and the
+#   dynkey marks are byte-identical between b1298e8ba779 and 07f6ff929ced.
 
 [pins]
 pin pin_acc_ok_matches_consumer -> UNMIRRORED (by design — see the proof-campaign plan §(b).4)

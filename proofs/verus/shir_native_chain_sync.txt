@@ -1,5 +1,20 @@
 # verus-sync-coverage manifest: shir_native_chain
-# source sha: shir_native_stmt=a2707f9280c3  proof sha: 5290c291092e
+# source sha: shir_native_stmt=3ae1b4d0bc71  proof sha: 5290c291092e
+#   RE-PINNED 2026-11-28 (pin reproducibility): a2707f9280c3 (the blob at
+#   46cbb602b) -> 3ae1b4d0bc71 (the COMMITTED blob at HEAD). This manifest DOES
+#   model two functions the state changed, so they were re-read, not just
+#   re-hashed: `test_and_to_if` and `cmd_and_chain_to_if` (and
+#   `native_echo_or_chain`'s `&&` form) now supply an explicit else —
+#   `status_exec(false)` / `chain_status_keep()`, i.e. "run nothing and keep
+#   `$?`" — instead of an empty one, because the renderer's real-`if` rule writes
+#   0 into an empty else. The model already said that: `status(S::Skip, st0)`
+#   is `st0`, and `status(S::IfC(c, t, S::Skip), st0)` takes the `S::Skip` branch
+#   as "keep the condition's own status". So `test_and_to_if_law`,
+#   `test_chain_to_if_law`, `cmd_and_chain_to_if_law` and
+#   `pin_no_else_keeps_condition_status` describe the new code as they described
+#   the old: the commit made the emission agree with the model it was already
+#   proved against, and closed a model-to-emission gap rather than opening one.
+#   `redirect_call_to_stmt` changed by a comment only (`fd` was already parsed).
 #   RE-AUDITED 2026-11-28 at e45e2f3c2983 (the recorded value names d3e7fbe29
 #   "perl: validate printf operands the way bash does"): test_and_to_if, single_stmt, test_chain_to_if, chain_stmt_expr,
 #   redirect_call_to_stmt and cmd_and_chain_to_if were

@@ -1,11 +1,15 @@
 # verus-sync-coverage manifest: shir_native_find_ls
-# source sha: shir_native_stmt=2504eddc38d2  proof sha: ea39af338046
-#   re-pin note (d-F4-3b stage): the source moved from 3ae1b4d0bc71 to
-#   2504eddc38d2 because of another worker's UNCOMMITTED edits to
-#   native_sort_file_stmt / native_grep_file_pipeline / emit_file_op. Re-audited,
-#   not just bumped: native_find_stmt, native_ls_stmt and
+# source sha: shir_native_stmt=3ae1b4d0bc71  proof sha: ea39af338046
+#   re-pin note (pin reproducibility): this row names the COMMITTED blob at HEAD,
+#   3ae1b4d0bc71 = `git show HEAD:src/transforms/shir_native_stmt.rs`. The
+#   worktree copy is currently 2504eddc38d2 because another worker has
+#   uncommitted edits to native_sort_file_stmt / native_grep_file_pipeline /
+#   emit_file_op, which is why the earlier row named it; a pin must describe
+#   bytes that exist in the repository, so it names the committed blob again and
+#   check_sync accepts that while the worktree copy is dirty (and says so).
+#   Compared function-by-function: native_find_stmt, native_ls_stmt and
 #   native_ls_dir_pipeline_stmt — this manifest's whole surface — are
-#   byte-identical between the two states (function-by-function comparison).
+#   byte-identical between the two states.
 # source: src/transforms/shir_native_stmt.rs — cluster F3, `find` / `head`
 #   surface: native_find_stmt (6286) — its emitted matcher, its word-list parser,
 #   its `head -N` splice; native_ls_stmt (4625) is covered in F4 (see below).

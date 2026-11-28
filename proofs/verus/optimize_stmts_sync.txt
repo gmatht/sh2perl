@@ -1,5 +1,20 @@
 # verus-sync-coverage manifest: optimize_stmts
-# source sha: ir=bb257b21bae0  proof sha: cea66a0e7782
+# source sha: ir=d5bddf2b44dc  proof sha: cea66a0e7782
+#   RE-PINNED 2026-11-28 (pin reproducibility): the recorded bb257b21bae0 names
+#   no blob in this repository (the provenance gap above: it came from an
+#   uncommitted worktree), so this row never described bytes anyone could check
+#   out. It now names the COMMITTED blob at HEAD, d5bddf2b44dc, and the audit is
+#   anchored there. Re-read at those bytes: `is_self_assignment` (src/ir.rs:17271)
+#   still refuses an asm-labelled declaration, requires exactly one target, no
+#   indices and an RHS that is `Var` of the same name; pass 1 (src/ir.rs:17944)
+#   still drops a `Declare` only when `init.is_none()` AND no declared name is in
+#   `collect_referenced_vars`, whose `Declare` arm (src/ir.rs:17394) inserts the
+#   declared names — which is what keeps a lone `Declare[x]`; and
+#   `optimize_stmts` itself is byte-identical between the two states. src/ir.rs
+#   did move (+457/-33: the emit path, `shir_to_perl*` splitting, cond/branch
+#   emission), but none of those functions is on pass 1's surface. Pass 1 only
+#   (self-assign + unused-Declare); pass 0.5 folding remains a different
+#   obligation.
 #   RE-AUDITED 2026-11-28. PROVENANCE GAP: the recorded value names no blob in
 #   this repository (every object in the database was hashed), so it was taken
 #   from an uncommitted worktree state and cannot be extracted and diffed.

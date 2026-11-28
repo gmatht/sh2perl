@@ -1,5 +1,18 @@
 # verus-sync-coverage manifest: shir_native_echo
-# source sha: shir_native_stmt=a2707f9280c3  proof sha: 8e189ebe723f
+# source sha: shir_native_stmt=3ae1b4d0bc71  proof sha: 8e189ebe723f
+#   RE-PINNED 2026-11-28 (pin reproducibility). The previous value a2707f9280c3
+#   is the blob of src/transforms/shir_native_stmt.rs at commit 46cbb602b; this
+#   row now names the COMMITTED blob at HEAD, 3ae1b4d0bc71, so it describes bytes
+#   that exist in the repository rather than a state one worktree had.
+#   Compared function-by-function between those two states (bodies, not hunks):
+#   every function this manifest states a law about is byte-identical — see the
+#   surface line above. The delta that moved the file touches
+#   `test_and_to_if` / `cmd_and_chain_to_if` / `native_echo_or_chain` (an
+#   explicit else that keeps the failing `$?` where the renderer would write 0),
+#   `native_eval_assign_stmt`, `transform_stmt` (one added dispatch call),
+#   `redirect_call_to_stmt` (comment only), the test helpers `st`/`build`, and
+#   three new functions (`chain_status_keep`, `native_echo_devnull_discard`,
+#   `redirect_call_stderr_native`) — none of them a fold this manifest models.
 #   RE-AUDITED 2026-11-28 at e45e2f3c2983 (the recorded value names d3e7fbe29
 #   "perl: validate printf operands the way bash does"): native_echo_stmt, decode_echo_escapes, native_printf_stmt, output_stmt
 #   and literal_text were

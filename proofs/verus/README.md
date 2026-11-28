@@ -108,12 +108,30 @@ the row to the current file and writes the audit into the manifest, the way
 `c_decl_coverage` record theirs. `optimize_fold_sync.txt` is a generated fold
 table, not a manifest, and is reported as `SKIP`.
 
+**Which state of a source a row may name.** A row must describe bytes that
+exist in the repository. Normally that is the file on disk, and a mismatch is
+rot. But `src/` is shared and can be mid-edit by someone else: while the
+worktree copy of a source is dirty, the bytes the repository actually contains
+are the committed blob at `HEAD`, and a row naming that blob is evidence about
+them, not rot — and it must not be "repaired" by naming bytes nobody can check
+out. So the checker accepts a source row whose sha equals `git show HEAD:<file>`
+**only while the worktree copy is dirty**, prints it as `ok (… = HEAD blob of
+…; the worktree copy has uncommitted edits)`, and still fails a row that
+matches neither state. A clean worktree makes the two states identical, so a
+clone always checks exactly the bytes `HEAD` commits. Proof shas have no such
+rule: the proof's own bytes on disk are what was verified. That is why the
+manifests of `shir_native_stmt.rs` name `3ae1b4d0bc71` (the committed blob)
+rather than a worktree sha one working copy happened to have, and why each of
+those rows' notes lists the folds it compared between the two states.
+
 `check_sync_selftest.py` proves the checker itself: it mutates one manifest
 per failure class — phantom pin, bare stale sha, a stale sha carrying a
 `STALE (…)` note, a wrong `proof-fns:`, a `MAPPED` row with no `exec`, a test
 name that does not exist, and a test that exists but `FAILED` — asserts each
 produces exit 1 with that kind, and restores every file byte-identically
-(checked by sha256).
+(checked by sha256). Two positive cases cover the state rule above: a row
+naming the `HEAD` blob while the worktree copy is dirty, and a row naming the
+dirty worktree copy itself, must both pass and pass silently-correctly.
 
 Exit status is 1 if anything failed.
 

@@ -1,5 +1,10 @@
 # verus-sync-coverage manifest: elim_trio
-# source sha: const_condition_elim=ba7bbd048b97 unreachable_after_exit=3adb4e485152 merge_init_assignments=5354c2b10fac  proof sha: 553b87ab8b91
+# source sha: const_condition_elim=ba7bbd048b97 unreachable_after_exit=21dacdcb3df8 merge_init_assignments=5354c2b10fac  proof sha: 553b87ab8b91
+#   RE-PINNED 2026-11-28 (pin reproducibility): 3adb4e485152 -> 21dacdcb3df8,
+#   the COMMITTED blob at HEAD. Compared function-by-function (bodies, not
+#   hunks): `pass` — the recursion this law models — is byte-identical; the
+#   delta is the generated test hook appended after it
+#   (`#[path = "uae_terminators_pin_tests.rs"] mod pin_tests;`).
 
 [pins]
 pin pin_cce_dowhile_once -> UNMIRRORED (by design — see the proof-campaign plan §(b).4)

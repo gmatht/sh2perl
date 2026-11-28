@@ -1,5 +1,12 @@
 # verus-sync-coverage manifest: arith_folds
-# source sha: arith_normalize=3688dae316cb bc_float_clean=b872f6c06797  proof sha: 344ad4aeffe8
+# source sha: arith_normalize=3688dae316cb bc_float_clean=c5767ccaaa36  proof sha: 344ad4aeffe8
+#   RE-PINNED 2026-11-28 (pin reproducibility): b872f6c06797 -> c5767ccaaa36,
+#   the COMMITTED blob at HEAD. Compared function-by-function (bodies, not
+#   hunks): `strip_trailing_add_zero` — the analysis this law models — is
+#   byte-identical, and so is every other function in the file. The delta is a
+#   generated test hook appended after the trailing commentary
+#   (`#[path = "bc_float_pin_tests.rs"] mod pin_tests_bc_float;`), i.e. no
+#   production change at all.
 
 [pins]
 pin pin_bc_strip_identity -> UNMIRRORED (by design — see the proof-campaign plan §(b).4)
