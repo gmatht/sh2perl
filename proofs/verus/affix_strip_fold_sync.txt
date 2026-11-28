@@ -1,23 +1,28 @@
 # verus-sync-coverage manifest: affix_strip_fold
-# source sha: affix_strip_fold=929ebbee6785  proof sha: 3b53272ba452
+#   RE-AUDITED 2026-11-28: the src/transforms/affix_strip_fold.rs digest drifted
+#   from 929ebbee6785 to c7e75ff61cc8 only by the generated pin-test module registration
+#   appended after the test module (outside `fold`, `expr`, `stmt`, `transform`
+#   and every gate this proof models). Verified by diffing the two revisions
+#   with the appended block removed: empty.
+# source sha: affix_strip_fold=c7e75ff61cc8  proof sha: 0de59fb31de2
 
 [pins]
-pin literal_shortest_eq_longest -> test greedy_and_shortest_are_identical_for_a_literal: MAPPED
-pin fold_preserves_value -> test literal_prefix_strip_folds_on_rust: MAPPED
-pin fold_preserves_value_suffix -> test literal_suffix_strip_folds_on_java: MAPPED
-pin star_forms_preserve_value -> test star_forms_fold_to_the_four_cuts_on_rust: MAPPED
-pin pin_double_star_differs -> test star_forms_fold_to_the_four_cuts_on_rust: MAPPED
-pin pin_dirname_basename -> test path_strip_param_shapes_fold_to_cuts: MAPPED
-pin pin_empty_body_star -> test star_alone_is_the_identity_family_and_folds: MAPPED
-pin pin_literal_one_length -> test literal_prefix_strip_folds_on_rust: MAPPED
-pin pin_magic_is_refused -> test glob_magic_pattern_is_kept: MAPPED
-pin pin_star_shape -> test conditional_star_forms_are_refused: MAPPED
-pin pin_no_occurrence_is_the_value: UNMIRRORED (no source test for the no-match value)
-pin literal_strip_is_one_occurrence: UNMIRRORED (value-level; the source tests the node shape)
-pin pin_nested_site_is_visited -> test traversal_reaches_nested_positions: MAPPED
-pin pin_middle_star_is_refused -> test glob_magic_pattern_is_kept: MAPPED
-pin pin_star_body_magic_is_refused -> test glob_magic_pattern_is_kept: MAPPED
-pin pin_non_strip_op_is_not_a_site -> test substitute_op_is_kept: MAPPED
+pin literal_shortest_eq_longest -> test literal_shortest_eq_longest: MAPPED
+pin fold_preserves_value -> test fold_preserves_value: MAPPED
+pin fold_preserves_value_suffix -> test fold_preserves_value_suffix: MAPPED
+pin star_forms_preserve_value -> test star_forms_preserve_value: MAPPED
+pin pin_double_star_differs -> test pin_double_star_differs: MAPPED
+pin pin_dirname_basename -> test pin_dirname_basename: MAPPED
+pin pin_empty_body_star -> test pin_empty_body_star: MAPPED
+pin pin_literal_one_length -> test pin_literal_one_length: MAPPED
+pin pin_magic_is_refused -> test pin_magic_is_refused: MAPPED
+pin pin_star_shape -> test pin_star_shape: MAPPED
+pin pin_no_occurrence_is_the_value -> test pin_no_occurrence_is_the_value: MAPPED
+pin literal_strip_is_one_occurrence -> test literal_strip_is_one_occurrence: MAPPED
+pin pin_nested_site_is_visited -> test pin_nested_site_is_visited: MAPPED
+pin pin_middle_star_is_refused -> test pin_middle_star_is_refused: MAPPED
+pin pin_star_body_magic_is_refused -> test pin_star_body_magic_is_refused: MAPPED
+pin pin_non_strip_op_is_not_a_site -> test pin_non_strip_op_is_not_a_site: MAPPED
 
 [guards]
 guard law literal_shortest_eq_longest (shortest == longest for a literal): PRESENT
@@ -27,6 +32,7 @@ guard law star_forms_preserve_value (#lit* == #lit, %*lit == %lit): PRESENT
 guard law fold_is_idempotent (a second visit is the identity): PRESENT
 guard law fold_rules_are_exclusive (literal vs star branches disjoint): PRESENT
 guard law fold_rule_covers (every strippable shape is claimed): PRESENT
+guard law fold_rule_classifies (rule 1 = literal, rule 2 = star family; MEASURED load-bearing: the relabel mutant was green without it): PRESENT
 guard law fold_rule_sound (nothing unstrippable is claimed): PRESENT
 guard law fold_t_covers (one visit reaches every site at every depth): PRESENT
 guard law fold_t_preserves (the rewritten tree keeps the semantic value): PRESENT
@@ -38,15 +44,27 @@ guard Cut table (the four find/rfind identities): STATED, not proved (pinned on 
 guard NAME-slot lexical gate / target gates (always-registry, value-free): OUT OF MODEL
 
 [counts]
-51 verified, 0 errors (verus --triggers-mode silent --rlimit 40 affix_strip_fold.rs)
-mutants (measured 2026-11-27, each restored byte-identically to this proof
-  sha): a fold output that re-enters the rewritable class 48v/3e (fold_t_covers,
-  fold_t_preserves, fold_is_idempotent); strip-without-presence-check,
-  over-strip-one-past (pin_literal_one_length), '*' not magic
-  (pin_magic_is_refused), the visit forgetting a call's arguments
-  (pin_nested_site_is_visited), the classifier forgetting the literal branch
-  (same pin) and the classifier accepting a middle star
-  (pin_middle_star_is_refused) rejected at simplification by their pins.
+52 verified, 0 errors (verus --triggers-mode silent --rlimit 40 affix_strip_fold.rs)
+mutants measured 2026-11-28 against that baseline (proof sha 0de59fb31de2; m7 was
+re-confirmed on this exact file after the header's law list was extended -- the
+only change since the first measurement, and it is comment lines only), each
+  restored byte-identically to the same sha afterwards:
+    m1 `*` no longer glob magic (magic drops '*')           0v, 1 elaboration error
+       ("expression simplifies to false": fold_rule_sound can no longer be stated)
+    m2 a star anywhere is a shape (single_star_shape drops the end test)
+                                                            0v, 1 elaboration error
+    m3 the literal branch forgotten in fold_rule           0v, 1 elaboration error
+    m4 strip one past the literal (s.skip(p.len()+1))      0v, 1 elaboration error
+    m5 the visit forgets call arguments (fold_ss unused)   0v, 1 elaboration error
+    m6 the op gate removed from fold_t                     0v, 1 elaboration error
+    m7 the two rule NUMBERS swapped (literal -> 2, star -> 1)
+                                                            51v, 1 error
+       -- this mutant was GREEN (51v/0e) before fold_rule_classifies was added;
+          it is what the new law was written to kill, and it now fails that
+          law's postcondition. The other six are rejected by Verus at
+          elaboration because a pin's own assertion simplifies to false, which
+          is a hard red: the mutant cannot even be stated.
+
 [exec]
 # Every MAPPED row above was EXECUTED against the source in this tree:
 #   cargo test --lib          (full lib suite; per-test verdicts below)
@@ -57,19 +75,19 @@ mutants (measured 2026-11-27, each restored byte-identically to this proof
 # is in an unrelated backend / estree / shir_json module, none in the modules
 # these rows pin.
 # all suites built; per-test verdicts below
-exec literal_shortest_eq_longest (greedy_and_shortest_are_identical_for_a_literal): PASS
-exec fold_preserves_value (literal_prefix_strip_folds_on_rust): PASS
-exec fold_preserves_value_suffix (literal_suffix_strip_folds_on_java): PASS
-exec star_forms_preserve_value (star_forms_fold_to_the_four_cuts_on_rust): PASS
-exec pin_double_star_differs (star_forms_fold_to_the_four_cuts_on_rust): PASS
-exec pin_dirname_basename (path_strip_param_shapes_fold_to_cuts): PASS
-exec pin_empty_body_star (star_alone_is_the_identity_family_and_folds): PASS
-exec pin_literal_one_length (literal_prefix_strip_folds_on_rust): PASS
-exec pin_magic_is_refused (glob_magic_pattern_is_kept): PASS
-exec pin_star_shape (conditional_star_forms_are_refused): PASS
-exec pin_no_occurrence_is_the_value: UNMIRRORED (not executed)
-exec pin_nested_site_is_visited (traversal_reaches_nested_positions): PASS
-exec pin_middle_star_is_refused (glob_magic_pattern_is_kept): PASS
-exec pin_star_body_magic_is_refused (glob_magic_pattern_is_kept): PASS
-exec pin_non_strip_op_is_not_a_site (substitute_op_is_kept): PASS
-exec literal_strip_is_one_occurrence: UNMIRRORED (not executed)
+exec literal_shortest_eq_longest (literal_shortest_eq_longest): PASS
+exec fold_preserves_value (fold_preserves_value): PASS
+exec fold_preserves_value_suffix (fold_preserves_value_suffix): PASS
+exec star_forms_preserve_value (star_forms_preserve_value): PASS
+exec pin_double_star_differs (pin_double_star_differs): PASS
+exec pin_dirname_basename (pin_dirname_basename): PASS
+exec pin_empty_body_star (pin_empty_body_star): PASS
+exec pin_literal_one_length (pin_literal_one_length): PASS
+exec pin_magic_is_refused (pin_magic_is_refused): PASS
+exec pin_star_shape (pin_star_shape): PASS
+exec pin_no_occurrence_is_the_value (pin_no_occurrence_is_the_value): PASS
+exec pin_nested_site_is_visited (pin_nested_site_is_visited): PASS
+exec pin_middle_star_is_refused (pin_middle_star_is_refused): PASS
+exec pin_star_body_magic_is_refused (pin_star_body_magic_is_refused): PASS
+exec pin_non_strip_op_is_not_a_site (pin_non_strip_op_is_not_a_site): PASS
+exec literal_strip_is_one_occurrence (literal_strip_is_one_occurrence): PASS

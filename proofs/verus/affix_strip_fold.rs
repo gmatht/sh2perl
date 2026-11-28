@@ -45,6 +45,12 @@
 //  semantic domain:
 //
 //    fold_rule_covers   every strippable pattern is claimed by a fold rule
+//    fold_rule_classifies  the rule NUMBER is a contract: 1 <-> magic-free
+//                       literal, 2 <-> star-at-an-end with a magic-free
+//                       body. Added because a relabel mutant (swap 1 and 2)
+//                       was MEASURED GREEN (51 verified, 0 errors) without
+//                       it -- every other law only asks `!= 0`, so nothing
+//                       said which branch produced the node
 //    fold_rule_sound    the classifier claims nothing bash cannot strip
 //                       (empty, middle star, magic body all refused)
 //    fold_t_covers      one visit folds every strippable site at EVERY
@@ -928,6 +934,31 @@ proof fn lemma_lit_free_no_star(p: Seq<char>)
 /// pattern is either a magic-free literal or a one-star shape, never both.
 /// That is why the rule choice is a function of the pattern and not of the
 /// order the branches are tried in.
+/// The rule NUMBER is a CONTRACT, not a label: 1 means "magic-free literal"
+/// (the AffixStrip branch) and 2 means "one star pinned at an end with a
+/// magic-free body" (the cut/star branch). The node each rule produces is a
+/// different node, so a classifier that swapped the two would map literals to
+/// cuts while every `!= 0` law above stayed green -- a relabel mutant was
+/// MEASURED green (51 verified, 0 errors) before this law existed, which is
+/// what makes it load-bearing rather than decorative.
+pub proof fn fold_rule_classifies(p: Seq<char>)
+    ensures
+        (fold_rule(p) == 1) <==> (0 < p.len() && lit_free(p)),
+        (fold_rule(p) == 2) <==> (single_star_shape(p) && no_hard_magic(p)),
+{
+    // the two branches cannot both hold: `lit_free` forbids the star
+    fold_rules_are_exclusive(p);
+    if 0 < p.len() && lit_free(p) {
+        assert(!(single_star_shape(p) && no_hard_magic(p)));
+        assert(fold_rule(p) == 1);
+    } else if single_star_shape(p) && no_hard_magic(p) {
+        assert(!(0 < p.len() && lit_free(p)));
+        assert(fold_rule(p) == 2);
+    } else {
+        assert(fold_rule(p) == 0);
+    }
+}
+
 pub proof fn fold_rules_are_exclusive(p: Seq<char>)
     ensures
         !(0 < p.len() && lit_free(p) && single_star_shape(p)),

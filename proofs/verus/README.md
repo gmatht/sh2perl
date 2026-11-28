@@ -8968,10 +8968,18 @@ run (sha256 in `uae_terminators_sync.txt`).
   rebuilding, and the other consumers of the verdict (they read the same
   functions, so a verdict change is the same theorem).
 
-## affix_strip_fold.rs — `${v#lit}` is one `strip_prefix` (51)
+## affix_strip_fold.rs — `${v#lit}` is one `strip_prefix` (52)
 
     verus --triggers-mode silent --rlimit 40 proofs/verus/affix_strip_fold.rs
-    -> verification results:: 51 verified, 0 errors
+    -> verification results:: 52 verified, 0 errors
+
+All sixteen pins are generated tests (`src/transforms/affix_pin_tests.rs`) that drive the
+real pass; the two value rows the manifest used to leave UNMIRRORED now compare the folded
+node's `strip_prefix`/`strip_suffix` value against what BASH prints for `${v#lit}`,
+`${v##lit}`, `${v%lit}`, `${v%%lit}` and the star forms. `fold_rule_classifies` was added
+because a relabel mutant (swap the literal rule 1 and the star rule 2) was measured GREEN
+(51v/0e) without it — every other law only asks `!= 0`. Seven mutants are red, recorded
+in the manifest with their exact counts.
 
 The fold turns `param("#"|"##"|"%"|"%%", NAME, PAT)` into one `AffixStrip`
 node when `PAT` is a magic-free literal. That is only sound because bash's

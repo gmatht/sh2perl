@@ -1086,10 +1086,204 @@ def emit_command_noop_cond_pin(pin: dict) -> list[str]:
     return out
 
 
+AFFIX_HELPERS = '''use super::*;
+
+fn afx_s(v: &str) -> IrExpr {
+    IrExpr::Str(v.to_string(), StrStyle::DoubleQuoted)
+}
+
+/// `param(word, word, …)` — the parser's spelling of every affix site.
+fn afx_call(words: &[&str]) -> IrExpr {
+    IrExpr::Call {
+        func: "param".to_string(),
+        args: words.iter().map(|w| afx_s(w)).collect(),
+    }
+}
+
+/// Run `f` with the fold's target set, the way the pass is driven.
+fn afx_target<T>(t: &str, f: impl FnOnce() -> T) -> T {
+    crate::transforms::set_target(Some(t));
+    let r = f();
+    crate::transforms::set_target(None);
+    r
+}
+
+/// A canonical spelling of what the pass produced, so the manifest's expected
+/// node can be written out in full.
+fn afx_shape(e: &IrExpr) -> String {
+    match e {
+        IrExpr::Ext(n) => {
+            let j = n.to_json();
+            match n.tag() {
+                "AffixStrip" => format!(
+                    "affix(prefix={}, pattern={})",
+                    j["prefix"].as_bool().unwrap_or(false),
+                    j["pattern"]["value"].as_str().unwrap_or("<nonliteral>")
+                ),
+                "CutAt" => format!(
+                    "cut(head={}, first={}, delim={})",
+                    j["head"].as_bool().unwrap_or(false),
+                    j["first"].as_bool().unwrap_or(false),
+                    j["delim"].as_str().unwrap_or("<nonliteral>")
+                ),
+                other => format!("node({other})"),
+            }
+        }
+        IrExpr::Str(s, _) => format!("str({s})"),
+        IrExpr::Call { func, args } if func == "param" && args.len() == 2 => match (&args[0], &args[1])
+        {
+            (IrExpr::Str(op, _), IrExpr::Str(name, _)) if op.is_empty() => format!("plain({name})"),
+            _ => "param2(?)".to_string(),
+        },
+        IrExpr::Call { func, .. } => format!("call({func})"),
+        _ => "other".to_string(),
+    }
+}
+
+/// The folded node's value on `value`, using Rust's own strip — the node's
+/// contract, not the transform's code path.
+fn afx_value_of(e: &IrExpr, value: &str) -> Option<String> {
+    let IrExpr::Ext(n) = e else { return None };
+    if n.tag() != "AffixStrip" {
+        return None;
+    }
+    let j = n.to_json();
+    let pat = j["pattern"]["value"].as_str()?;
+    let prefix = j["prefix"].as_bool()?;
+    Some(if prefix {
+        value.strip_prefix(pat).unwrap_or(value).to_string()
+    } else {
+        value.strip_suffix(pat).unwrap_or(value).to_string()
+    })
+}
+
+/// What BASH prints for `${v<op><lit>}` on `value` — the independent side.
+fn afx_bash(value: &str, op: &str, lit: &str) -> String {
+    let script = format!("v=\\"{value}\\"; printf %s \\"${{v{op}{lit}}}\\"");
+    let out = std::process::Command::new("bash")
+        .arg("-c")
+        .arg(&script)
+        .stderr(std::process::Stdio::null())
+        .output()
+        .expect("bash");
+    String::from_utf8_lossy(&out.stdout).to_string()
+}
+
+/// `echo ARG` where ARG is the affix site — the nesting the visit must reach.
+fn afx_nested() -> IrStmt {
+    IrStmt::Expr(IrExpr::Call {
+        func: "builtin".to_string(),
+        args: vec![afx_s("echo"), IrExpr::Array(vec![afx_call(&["#", "v", "lit"])])],
+    })
+}
+'''
+
+
+def emit_affix_pin(pin: dict) -> list[str]:
+    kind = pin["kind"]
+    target = pin.get("target", "rs")
+    out = [
+        "",
+        f"/// Manifest row: `pin {pin['pin']}` in affix_strip_fold_sync.txt.",
+        f"/// {pin['note']}",
+        "#[test]",
+        f"fn {pin['pin']}() {{",
+        f'    afx_target({lit(target)}, || {{',
+    ]
+    if kind == "affix_node":
+        for case in pin["cases"]:
+            words = case.get("argv") or [case["op"], case["name"], case["pat"]]
+            argv = ", ".join(lit(w) for w in words)
+            exp = case["expect"]
+            out += [f"        let mut e = afx_call(&[{argv}]);", "        let fired = expr(&mut e);"]
+            if exp is None:
+                out += [
+                    "        assert!(!fired,",
+                    f'            "must keep {words} untouched");',
+                    '        assert_eq!(afx_shape(&e), "call(param)");',
+                ]
+            else:
+                out += [
+                    "        assert!(fired,",
+                    f'            "must fold {words}");',
+                    f"        assert_eq!(afx_shape(&e), {lit(exp)});",
+                ]
+    elif kind == "affix_value":
+        for case in pin["cases"]:
+            argv = ", ".join(lit(w) for w in (case["op"], "v", case["lit"]))
+            out += [
+                f"        let mut e = afx_call(&[{argv}]);",
+                f'        assert!(expr(&mut e), "must fold {case["op"]}{case["lit"]!r}");',
+                f'        let got = afx_value_of(&e, {lit(case["value"])}).expect("AffixStrip");',
+                f"        assert_eq!(got, {lit(case['expect'])});",
+                f"        assert_eq!(afx_bash({lit(case['value'])}, {lit(case['op'])}, {lit(case['lit'])}), got,",
+                '            "bash must print what the node evaluates to");',
+            ]
+    elif kind == "affix_pair":
+        for case in pin["cases"]:
+            ops = case["ops"]
+            a, b = ops[0], ops[1]
+            out += [
+                f'        let mut short = afx_call(&[{lit(a)}, "v", {lit(case["lit"])}]);',
+                f'        let mut long = afx_call(&[{lit(b)}, "v", {lit(case["lit"])}]);',
+                "        assert!(expr(&mut short) && expr(&mut long));",
+                "        assert_eq!(afx_shape(&short), afx_shape(&long),",
+                f'            "{a} and {b} must be one strip for a literal");',
+                f'        let sv = afx_value_of(&short, {lit(case["value"])}).expect("AffixStrip");',
+                "        assert_eq!(sv, afx_value_of(&long, {0}).unwrap());".format(lit(case["value"])),
+                f"        assert_eq!(sv, {lit(case['expect'])});",
+                f"        assert_eq!(afx_bash({lit(case['value'])}, {lit(a)}, {lit(case['lit'])}), sv);",
+                f"        assert_eq!(afx_bash({lit(case['value'])}, {lit(b)}, {lit(case['lit'])}), sv,",
+                '            "the longest form must print the same as the shortest");',
+            ]
+    elif kind == "affix_star":
+        for case in pin["cases"]:
+            prefix = "true" if case["op"] == "#" else "false"
+            out += [
+                f'        let mut e = afx_call(&[{lit(case["op"])}, "v", {lit(case["pat"])}]);',
+                f'        assert!(expr(&mut e), "the star shape must fold");',
+                f'        assert_eq!(afx_shape(&e), "affix(prefix={prefix}, pattern={case["body"]})");',
+                f'        let got = afx_value_of(&e, {lit(case["value"])}).expect("AffixStrip");',
+                f"        assert_eq!(afx_bash({lit(case['value'])}, {lit(case['op'])}, {lit(case['pat'])}), got,",
+                '            "the star form prints what the node prints");',
+                f"        assert_eq!(afx_bash({lit(case['value'])}, {lit(case['literal_op'])}, {lit(case['body'])}), got,",
+                '            "and that is the literal form the star collapses to");',
+            ]
+    elif kind == "affix_double_star":
+        d = pin["delim"]
+        v = pin["value"]
+        out += [
+            f'        let mut first = afx_call(&["#", "v", {lit("*" + d)}]);',
+            f'        let mut last = afx_call(&["##", "v", {lit("*" + d)}]);',
+            "        assert!(expr(&mut first) && expr(&mut last));",
+            f'        assert_eq!(afx_shape(&first), "cut(head=false, first=true, delim={d})");',
+            f'        assert_eq!(afx_shape(&last), "cut(head=false, first=false, delim={d})");',
+            "        assert_ne!(afx_shape(&first), afx_shape(&last),",
+            '            "#*X and ##*X are different nodes");',
+            f"        assert_eq!(afx_bash({lit(v)}, \"#\", {lit('*' + d)}), \"bX\",",
+            '            "bash keeps the tail after the FIRST match");',
+            f"        assert_eq!(afx_bash({lit(v)}, \"##\", {lit('*' + d)}), \"\",",
+            '            "and drops everything through the LAST match");',
+        ]
+    elif kind == "affix_nested":
+        out += [
+            "        let mut st = afx_nested();",
+            "        assert!(stmt(&mut st), \"the visit must descend into echo args\");",
+            "        let IrStmt::Expr(IrExpr::Call { args, .. }) = &st else { panic!(\"shape\") };",
+            "        let IrExpr::Array(items) = &args[1] else { panic!(\"array\") };",
+            '        assert_eq!(afx_shape(&items[0]), "affix(prefix=true, pattern=lit)");',
+        ]
+    else:
+        raise SystemExit(f"unknown affix kind {kind}")
+    out += ["    });", "}"]
+    return out
+
+
 FAMILIES = {
     "f1": (RUST_HELPERS, emit_pin),
     "status_reads": (STATUS_HELPERS, emit_status_pin),
     "uae": (UAE_HELPERS, emit_uae_pin),
+    "affix": (AFFIX_HELPERS, emit_affix_pin),
     "grep": (GREP_HELPERS, emit_grep_pin),
     "pipeline": (PIPELINE_HELPERS, emit_pipeline_pin),
     "command_v": (COMMAND_V_HELPERS, emit_command_v_pin),
