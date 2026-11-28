@@ -31,7 +31,15 @@
                   25 verified / 0 errors: the `! command <'' >''` condition
                   fold, its redirect-failure law, six conservative refusals and
                   d3 -- the fold never inspects the redirect target);
-                  clusters A, F3, F4 and the REST of G still planned — see §4
+                  cluster A PROVED (shir_native_files_invariant.rs, 28 verified /
+                  0 errors, for the `files` invariant; check_dispatch.py +
+                  shir_native_stmt_dispatch.txt for dispatch completeness);
+                  cluster F3 PROVED (shir_native_find_ls.rs);
+                  cluster F4 PROVED (shir_native_pipelines.rs);
+                  cluster G* PROVED (shir_native_perl_emit.rs, 16 verified /
+                  0 errors: the Perl-literal quoting law at the `@ARGV` use site,
+                  the print-prefix escape table and its conservative refusal);
+                  every stage in §4 is now proved — see §4
 
 This is a PLAN, not a proof. It exists because `shir_native_stmt` is the one
 output-changing transform left whose property is not a single statement: it is

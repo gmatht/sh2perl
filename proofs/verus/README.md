@@ -9582,6 +9582,51 @@ through a function neither side implements by calling the other.
   design** and no `[exec]` row exists; the evidence is the proof, the mutants,
   and the bash runs recorded in d-G1…d-G5.
 
+### Cluster G* — the Perl-emission quoting law (16 obligations, 2 model-level pins)
+
+    proofs/verus/shir_native_perl_emit.rs      (16 verified, 0 errors)
+    proofs/verus/shir_native_perl_emit_sync.txt
+
+`native_perl_e_stmt` lowers `perl -e CODE ARGS…` by emitting
+`@ARGV = (<perl_quote(w)>, …);` and then the CODE **verbatim** — the target
+output is Perl, so only the arguments need translating. Everything therefore
+rests on one fact: each argument is a Perl double-quoted literal that Perl
+re-parses into exactly the shell word. That is cluster H's
+`perl_double_quote_roundtrip` applied at this fold's own use site, and this file
+adds the fold's LIST shape on top of it.
+
+Two sides, neither calling the other: the emitting side is the fold's
+construction (`pq_char`/`pq_body` for `perl_quote`, `prelude` for the `@ARGV`
+list, `fold_dec` for the print-prefix table); the parsing side is Perl's
+(`pdq_until`, a double-quoted body parsed until the closing quote, and
+`perl_dec`, Perl's table in which an UNDEFINED escape is the character itself).
+A character the encoder forgets to escape is a parsing-side character, so the
+law goes red.
+
+Laws: `perl_literal_roundtrip` (every word), `every_char_roundtrips` (each of
+the seven escaped characters), `argv_prelude_law` (the `@ARGV` list keeps the
+shell's order and count), `decode_table_preserves_perl` (every escape the fold
+accepts, Perl reads the same way), `refusal_is_conservative` (every escape the
+fold refuses, Perl reads as the character itself — so the refusal costs a fold,
+never correctness: this is why `perl_print_prefix` may refuse `\q`), and
+`code_is_emitted_verbatim`. Pins `pin_first_argument_is_first` and
+`pin_unknown_escape_is_refused`.
+
+Five mutants, each a verification failure on the arm that carries the law and
+each restored byte-identically: dropping the `$` escape (assert),
+`perl_unesc('n') := 'N'` (assert), reversing the prelude (assert),
+`fold_dec('t') := ' '` (postcondition), accepting an undefined escape
+(postcondition).
+
+**Recorded, not proved, not fixed.** `native_perl_ne_stmt` is not a quoting
+fold — it emits computed output — and its line loop skips EVERY empty line when
+the input ends with a newline (`if line.is_empty() && input.ends_with('\n')`),
+while Perl prints the prefix once per line, blank ones included. A literal
+producer such as `printf '\n\n'` would therefore fold to one line too few.
+Its law is a line model and this stage does not claim it; the defect is left as
+recorded. `native_bash_script` computes an argument-demo script's output from
+literal args and emits no quoted Perl text, so it is out of this file too.
+
 ### Item A.1 — the `files` invariant (28 obligations, 9 model-level pins)
 
     verus --triggers-mode silent --rlimit 40 proofs/verus/shir_native_files_invariant.rs
@@ -9983,7 +10028,10 @@ is out of model; the renderer half — `render_test_text`'s connector split,
 `!`, globs, `-a`/`-o` in `[[ ]]`, an unset variable under `set -u`, a
 dynamic word — is D1/D3, not claimed; D1's atomic round trip is reused;
 cluster A's `files` invariant and backend status rendering are out of model.
-Clusters A, D3, F and G remain open.
+Clusters A, D3, F and G were open when this chain was written; all of them
+have since been proved (D3 below, F1-F4 in `shir_native_pipelines.rs`,
+A.1 in `shir_native_files_invariant.rs`, A.2 in `check_dispatch.py`,
+G* in `shir_native_perl_emit.rs`).
 
 ### Cluster D3, proved: the if/while condition families
 

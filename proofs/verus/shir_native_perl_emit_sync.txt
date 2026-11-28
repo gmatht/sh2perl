@@ -1,0 +1,89 @@
+# verus-sync-coverage manifest: shir_native_perl_emit
+# source sha: shir_native_stmt=3ae1b4d0bc71  proof sha: 5b837fdbaed4
+# source: src/transforms/shir_native_stmt.rs (cluster G*, the QUOTING law of the
+#   folds that emit or read Perl source text: native_perl_e_stmt 1898,
+#   perl_quote 2054 (block at 2054..2075), native_perl_ne_stmt 1933,
+#   perl_print_prefix 1979). The row names the COMMITTED blob at HEAD; the
+#   worktree copy of this source is another worker's and is not what was audited.
+#
+# THE LAW, AND WHY IT IS A QUOTING LAW.  `native_perl_e_stmt` lowers
+# `perl -e CODE [ARGS…]` by writing `@ARGV = (<perl_quote(w)>, …);` and then the
+# CODE VERBATIM — the target output is Perl, so only the arguments need
+# translating. Everything therefore rests on one fact: a shell word written by
+# `perl_quote` is a Perl double-quoted literal that Perl re-parses into exactly
+# that word. That is cluster H's `perl_double_quote_roundtrip`, applied here at
+# the fold's own use site, with the fold's LIST shape (order and count) included.
+#
+# TWO SIDES.  The emitting side is the fold's construction (`pq_char`/`pq_body`,
+# `prelude`, `fold_dec`). The parsing side is Perl's, written independently:
+# `pdq_until` (a double-quoted body parsed until the closing quote) and
+# `perl_dec` (Perl's table, in which an UNDEFINED escape is the character
+# itself). Neither side calls the other: a character the encoder forgets to
+# escape becomes a parsing-side character, so the law goes red.
+#
+# ── the laws as landed (16 verified, 0 errors) ──────────────────────────
+#   perl_literal_roundtrip      pdq_until(pq_body(s) ") == s, for every s
+#   every_char_roundtrips       every single character, the seven escaped ones
+#                               included
+#   argv_prelude_law            the `@ARGV` prelude parses back to the words, in
+#                               order, same count
+#   decode_table_preserves_perl every escape the fold accepts, Perl reads the
+#                               same way
+#   refusal_is_conservative     every escape the fold REFUSES, Perl reads as the
+#                               character — refusing costs a fold, never
+#                               correctness
+#   code_is_emitted_verbatim    the program text is the input, unchanged
+#   pins: pin_first_argument_is_first, pin_unknown_escape_is_refused
+#
+# ── mutants (measured on these bytes, each restored by sha256) ──────────
+#   M1 pq_char('$') drops the escape            15 verified, 1 error (assert)
+#   M2 perl_unesc('n') decodes to 'N'            15 verified, 1 error (assert)
+#   M3 prelude emits the words in reverse        15 verified, 1 error (assert)
+#   M4 fold_dec('t') decodes to a space          15 verified, 1 error (postcond)
+#   M5 fold_dec accepts an undefined escape      15 verified, 1 error (postcond)
+#   No mutant was a spelling or compile error: each is a verification failure
+#   inside the law that depends on the arm.
+#
+# ── FOUND WHILE WRITING THIS, RECORDED NOT PROVED, NOT FIXED ────────────
+# `native_perl_ne_stmt` is NOT a quoting fold — it emits computed OUTPUT — and
+# its line loop has a defect this stage does not touch: it skips EVERY empty
+# line when the input ends with a newline
+# (`if line.is_empty() && input.ends_with('\n') { continue; }`), while Perl's
+# `-ne 'print "P $_\n"'` prints the prefix once per line, blank lines included.
+# For a literal producer (`printf '\n\n'`) the fold would emit one line too few.
+# Its law is a line model, not this file's; the defect is left as recorded.
+#
+# ── out of model ────────────────────────────────────────────────────────
+# * Perl's own `@ARGV` population and the emitted program's BEHAVIOUR: this file
+#   proves the argument list and the CODE survive the emission, nothing about
+#   what Perl does with them.
+# * `native_bash_script` computes an argument-demo script's output from literal
+#   args and emits no quoted Perl text; its law is that script's output.
+# * The renderer, the parser, and every non-literal argument (`literal_text`
+#   refusal: a dynamic word keeps the shell-out — the fold's own gate, not a
+#   claim of this file).
+
+[pins]
+pin pin_first_argument_is_first -> UNMIRRORED (by design — model-level: perl_quote has no source test)
+pin pin_unknown_escape_is_refused -> UNMIRRORED (by design — model-level: perl_print_prefix has no source test)
+
+[guards]
+guard law perl_literal_roundtrip (perl_quote writes a literal Perl parses back): PRESENT
+guard law every_char_roundtrips (all seven escapes included): PRESENT
+guard law argv_prelude_law (@ARGV order and count): PRESENT
+guard law decode_table_preserves_perl: PRESENT
+guard law refusal_is_conservative (an undefined escape is the character): PRESENT
+guard law code_is_emitted_verbatim (the CODE is not re-quoted): PRESENT
+guard source-side refusal: a non-literal argument keeps the shell-out: STATED
+guard native_perl_ne_stmt line model + its blank-line defect: OUT OF MODEL (recorded above)
+guard native_bash_script (computed output, no Perl text): NOT THIS PROOF
+guard renderer, parser, Perl runtime @ARGV and program behaviour: OUT OF MODEL
+
+[exec]
+# Both pins are model-level and have no source test to execute (the plan's
+# rule: 52 of 60 folds have no test, so there is no row to invent).
+exec pin_first_argument_is_first: UNMIRRORED (not executed)
+exec pin_unknown_escape_is_refused: UNMIRRORED (not executed)
+
+[counts]
+16 verified, 0 errors
