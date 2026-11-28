@@ -9607,12 +9607,12 @@ entry is not a lost rewrite but wrong output, so this is a soundness law.
   `record_file_write` has no source test, so all 9 pins are **UNMIRRORED by
   design** and no `[exec]` row exists.
 
-### Items F3 / F4 — `find`/`head`, `xargs`/`comm`, `diff`, `sort`/`ls` (18 + 55 obligations)
+### Items F3 / F4 — `find`/`head`, `xargs`/`comm`, `diff`, `sort`/`ls` (18 + 94 obligations)
 
     verus --triggers-mode silent --rlimit 40 proofs/verus/shir_native_find_ls.rs
     -> verification results:: 18 verified, 0 errors
     verus --triggers-mode silent --rlimit 40 proofs/verus/shir_native_pipelines.rs
-    -> verification results:: 55 verified, 0 errors
+    -> verification results:: 94 verified, 0 errors
 
 **F3 (`shir_native_find_ls.rs`).** The fold does not emit `find`; it emits a Perl
 walk whose matcher is `substr($__e, -N) eq Q`. Proved against an indexwise
@@ -9646,20 +9646,37 @@ step and neither semantic function derived from them; and
 the independent OR-fold `any_missing`), so the pipeline's `|| echo` prints
 exactly when an operand is missing. Pins keep both non-vacuous: a two-line file
 sorts to `[A,B]`, a three-line file keeps its duplicate's multiplicity, a missing
-operand prints, an all-present list stays silent.
+operand prints, an all-present list stays silent. **d-F4-3b** (the flags) is now
+closed too: §7 models the `-n` key as `num_key` — a signed decimal line's value
+and `0` for a line that is not a number, i.e. the fold's
+`parse::<f64>().unwrap_or(0.0)` — with `asc_key`/`desc_key` (no adjacent pair
+ascends/descends) as the ordering models and `ins_key`/`pass_sort_n` as the
+pass's insertion step; `sort_n_is_a_sorted_key_permutation` says the `-n` output
+is key-ordered and a permutation, `sort_r_is_a_descending_permutation` says the
+byte sort followed by the emitted `lines.reverse()` (`rev`, its own `push`
+recursion) ascends nowhere and is a permutation, and
+`sort_nr_is_a_descending_key_permutation` gives the combination. `decode_flags`
+models the flag loop including its refusal. Pins: `10`/`9` come out 9-then-10
+although `cmp` would leave them the other way, `1`/`01` keep their input order
+(the fold's `sort_by` is stable, and the stability pin is what caught the model
+inserting after instead of before equal keys), `-nr`/`-rn` decode like `-n`
+`-r`, and `-u` is refused.
 
 **What is NOT mirrored or NOT proved** — said plainly:
-- `sort`'s FLAGS are not covered (d-F4-3b): `-n` (lines parsed as f64), `-r`
-  (reverse) and `-u`/`-k` are outside the model; the law is the lexicographic
-  (`cmp`) form only. Its byte-level join is the §1 `join_sep`/`echo_bytes` model,
-  not restated for sort.
+- `sort`'s float spellings and `-h` are not covered (d-F4-3c): `num_key` is the
+  integer fragment of `parse::<f64>` (`-12`, `007`), not `1.5`/`1e3`, and the
+  `human_size` key that `-h` uses is not modelled although the fold accepts it.
+  `-u`, `-k` and `-t` are refused by the fold itself. `native_sort_file_stmt`'s
+  numeric key (`__sh_num($a) <=> __sh_num($b)`) is a different fold (the
+  `sort FILE` shell-out) and is not covered either. The byte-level join of the
+  sorted lines is the §1 `join_sep`/`echo_bytes` model, not restated for sort.
 - The general `comm -12` intersection law needs ordered-membership invariants and
   is not proved (d-F4-4); only the double-advance step is.
 - `diff` beyond identical inputs is not proved (d-F4-5b): the converse ("a change
   always prints") and the byte-level hunks both need an invariant relating the
   backtrack's cursors to prefix equality (`a[0..i] == b[0..j]`), which this proof
   does not establish.
-- Pins: all 4 F3 pins and all 9 F4 pins are **UNMIRRORED**. The two
+- Pins: all 4 F3 pins and all 18 F4 pins are **UNMIRRORED**. The two
   `find_with[out]_head_*` tests exercise the same fold but assert its EMITTED
   TEXT, so they would not notice a change to the splice law; no source test
   asserts the matcher, the grammar, `comm` or the `xargs` fold. The manifests say
@@ -9677,9 +9694,16 @@ insertion comparing the wrong way round, the multiset step dropped from `cnt`,
 `pass_sort` ignoring its first line — all rejected at simplification; the `ls`
 status made always 0 and the loop forgetting its running flag 54v/1e
 (postcondition); the `|| echo` guard made always-true 53v/2e (the law and its
-silent pin). Every rejection inspected as a verification failure, none a compile
-error, so the xargs law, the diff law, the DP lemma, the sorted-permutation law
-and the `ls` status law are each load-bearing.
+silent pin). F4 §7 (`d-F4-3b`, `4c8543b9e7d7`): `ins_key` inserting after equal
+keys (the stability pin), `num_key` dropping its sign, `rev` made the identity,
+`ins_key` comparing bytes instead of keys, `digits_acc` dropping the ×10 place
+value, and an unknown flag accepted instead of refused — all rejected at
+simplification; `asc_key` demanding descending keys 91v/3e (assertion failed in
+`lemma_ins_key_sorted`, `lemma_asc_key_tail`, `lemma_rev_desc_key`), and `num_key`
+losing `unwrap_or(0.0)` 93v/1e (postcondition). Every rejection inspected as a
+verification failure, none a compile error, so the xargs law, the diff law, the
+DP lemma, the sorted-permutation law, the `ls` status law and the `-n`/`-r`/`-nr`
+laws are each load-bearing.
 
 ## `shir_native_stmt.rs` — no single law; a decomposition plan (cluster C proved)
 

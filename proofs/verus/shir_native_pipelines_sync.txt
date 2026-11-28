@@ -1,5 +1,5 @@
 # verus-sync-coverage manifest: shir_native_pipelines
-# source sha: shir_native_stmt=3ae1b4d0bc71  proof sha: d135c5309730
+# source sha: shir_native_stmt=2504eddc38d2  proof sha: 4c8543b9e7d7
 # source: src/transforms/shir_native_stmt.rs — cluster F4, `xargs` / `comm` /
 #   `diff` / `sort` / `ls`
 #   surface: native_echo_xargs_stmt (5290), native_comm_stmt (6756),
@@ -40,12 +40,36 @@
 #     to a status by `ls_rc` and consumed by the emitted `if ($__rc) <built-in function print>`
 #     guard `prints_echo`. Laws: `scan_rc(present,false,0) == ls_rc(present)` and
 #     `prints_echo(scan_rc(present,false,0)) <==> any_missing(present,0)`.
+#   sort_n_is_a_sorted_key_permutation — d-F4-3b, the `-n` law. Pass side:
+#     `ins_key`/`pass_sort_n`, the numeric insertion sort (a line goes in before
+#     the first line whose key is >= its own, which is what keeps ties in input
+#     order — the emitted `sort_by` is stable). Semantic side, written apart:
+#     `num_key` (a line's decimal value, 0 when it is not a number — the fold's
+#     `parse::<f64>().unwrap_or(0.0)`), built from `is_int_lit`/`digits_acc`/
+#     `digits_val`; `asc_key` (no adjacent pair has ascending keys); `cnt` (the
+#     multiset model of §5). Law: `asc_key(pass_sort_n(xs))` AND
+#     `forall x. cnt(x, pass_sort_n(xs)) == cnt(x, xs)` AND len preserved.
+#   sort_r_is_a_descending_permutation — d-F4-3b, the `-r` law. `rev` is its own
+#     `push` recursion modelling the emitted `lines.reverse()`; the semantic model
+#     `desc_lex` says no adjacent pair ascends in byte order. Law:
+#     `desc_lex(rev(pass_sort(xs)))`, `cnt` preserved, len preserved.
+#   sort_nr_is_a_descending_key_permutation — d-F4-3b, the `-n -r` / `-nr` law:
+#     `desc_key(rev(pass_sort_n(xs)))`, `cnt` preserved, len preserved.
+#   decode_flags — the fold's flag loop modelled (`-n`, `-h`, `-r` and the glued
+#     `-nr`/`-rn`/`-hr`/`-rh`), including its refusal (`None`) for any other word,
+#     checked by the pins `-nr`/`-rn` decode like `-n` then `-r` and `-u` is
+#     refused.
 #
 # NOT proved in this stage, stated plainly:
-#   * `sort`'s FLAGS (d-F4-3b): `-n` parses each line as an f64 and sorts
-#     numerically, `-r` reverses afterwards, `-u`/`-k` are not modelled. The law
-#     above covers the lexicographic (`cmp`) form only. The byte-level join of the
-#     sorted lines is the §1 `join_sep`/`echo_bytes` model, not restated here.
+#   * `sort`'s FLOAT spellings and `-h` (d-F4-3c): `num_key` covers the integer
+#     fragment of `parse::<f64>` (`-12`, `007`), not `1.5`/`1e3`, and nothing is
+#     claimed for `-h`'s `human_size` key although the fold accepts `-h`. `-u`,
+#     `-k` and `-t` are refused by the fold itself, so they are outside every law
+#     by construction. The byte-level join of the sorted lines is the §1
+#     `join_sep`/`echo_bytes` model, not restated here.
+#   * `native_sort_file_stmt`'s numeric key (`__sh_num($a) <=> __sh_num($b)`) is
+#     a different fold (the `sort FILE` shell-out, not the literal-pipeline fold
+#     §7 models) and is not covered here.
 #   * the general `comm -12` intersection law over two distinct sorted files —
 #     needs ordered-membership invariants for the two-pointer walk (d-F4-4).
 #   * diff's output beyond silence — d-F4-5b: the converse ("a change always
@@ -67,6 +91,16 @@
 #   lemma_scan_unfold, lemma_any_unfold, lemma_scan_is_status →
 #     ls_fallback_prints_iff_missing (checked by an index induction over the loop)
 #   lemma_ls_rc_matches → ls_fallback_prints_iff_missing
+#   lemma_digits_nonneg → digits_line_key (the key really is non-negative)
+#   lemma_asc_key_tail, lemma_ins_key_head, lemma_ins_key_sorted → lemma_sort_n_asc
+#     → sort_n_is_a_sorted_key_permutation (the ordering half)
+#   lemma_ins_key_cnt, lemma_sort_n_cnt, lemma_cnt_at_push, lemma_rev_cnt → the
+#     multiset half of the `-n` and `-n -r` laws
+#   lemma_ins_key_len, lemma_sort_n_len, lemma_pass_sort_len, lemma_ins_len → the
+#     len clause of all three laws
+#   lemma_rev_len, lemma_rev_index → lemma_rev_desc_lex / lemma_rev_desc_key (the
+#     mirror-index fact `rev(ys)[i] == ys[len-1-i]`)
+#   lemma_sorted_adj → lemma_rev_desc_lex (instance of `sorted` at index j)
 
 [pins]
 pin pin_xargs_appends_one_word -> UNMIRRORED (no source test covers the xargs fold)
@@ -78,6 +112,15 @@ pin pin_sort_sorted_permutation -> UNMIRRORED (no source test covers sort; a two
 pin pin_sort_keeps_duplicates -> UNMIRRORED (no source test covers sort; the multiset half on a duplicated line)
 pin pin_ls_missing_operand_prints -> UNMIRRORED (no source test covers ls; a missing operand makes `|| echo` print)
 pin pin_ls_all_present_silent -> UNMIRRORED (no source test covers ls; an all-present list stays silent)
+pin pin_numeric_key_is_the_line_value -> UNMIRRORED (no source test covers sort; "10"->10, "9"->9, "-3"->-3)
+pin pin_numeric_key_disagrees_with_byte_order -> UNMIRRORED (cmp puts "10" before "9", the key does not)
+pin pin_non_number_reads_as_zero -> UNMIRRORED (`abc` reads as key 0, so `-3` sorts before it)
+pin pin_sort_n_puts_9_before_10 -> UNMIRRORED (the pair byte order leaves alone, `-n` swaps)
+pin pin_sort_n_keeps_equal_keys_in_input_order -> UNMIRRORED (1 and 01 tie; input order is kept)
+pin pin_sort_r_reverses_the_two_line_file -> UNMIRRORED (`-r` on "1","01" gives byte order back)
+pin pin_sort_nr_descends -> UNMIRRORED (`-nr` on "10","9" gives 10 then 9)
+pin pin_flag_spelling_nr_matches_n_then_r -> UNMIRRORED (`-nr`/`-rn` decode like `-n` `-r`)
+pin pin_unknown_flag_is_refused -> UNMIRRORED (`-u` decodes to None, the shell-out stays)
 
 [guards]
 guard law xargs_appends_the_input_word (the general agreement): PRESENT
@@ -92,21 +135,35 @@ guard lemma_lex_asym / lemma_sorted_unfold / lemma_sorted_fold / lemma_sorted_co
 guard lemma_cnt_cons / lemma_cnt_at_cons_tail / lemma_cnt_skip_at / lemma_cnt_peel / lemma_ins_cnt / lemma_sort_cnt: PRESENT
 guard lemma_cons_zero / lemma_cons_index / lemma_skip_cons / lemma_skip_len / lemma_skip_index: PRESENT
 guard lemma_scan_unfold / lemma_any_unfold / lemma_scan_is_status / lemma_ls_rc_matches: PRESENT
-guard sort flags -n / -r / -u / -k: NOT PROVED (d-F4-3b)
+guard law sort_n_is_a_sorted_key_permutation (d-F4-3b): PRESENT
+guard law sort_r_is_a_descending_permutation (d-F4-3b): PRESENT
+guard law sort_nr_is_a_descending_key_permutation (d-F4-3b): PRESENT
+guard lemma_digits_nonneg / lemma_asc_key_tail / lemma_ins_key_head / lemma_ins_key_sorted / lemma_ins_key_cnt / lemma_ins_key_len / lemma_sort_n_asc / lemma_sort_n_cnt / lemma_sort_n_len / lemma_pass_sort_len / lemma_ins_len: PRESENT
+guard lemma_rev_len / lemma_rev_index / lemma_rev_cnt / lemma_cnt_at_push / lemma_sorted_adj / lemma_rev_desc_lex / lemma_rev_desc_key: PRESENT
+guard sort float spellings / -h key / -u / -k / -t: NOT PROVED (d-F4-3c; -u/-k/-t are refused by the fold)
+guard native_sort_file_stmt's numeric key: NOT PROVED (a different fold, outside this cluster)
 guard law comm_12 general intersection: NOT PROVED (d-F4-4)
 guard diff beyond identical inputs: NOT PROVED (d-F4-5b)
 guard printf/echo escape decoding: DELEGATED to cluster E (shir_native_echo.rs)
 
 [counts]
-55 verified, 0 errors (verus --triggers-mode silent --rlimit 40 shir_native_pipelines.rs)
-9 pins, all UNMIRRORED: the module's 8 tests cover command chains, file tests and
+94 verified, 0 errors (verus --triggers-mode silent --rlimit 40 shir_native_pipelines.rs)
+18 pins, all UNMIRRORED: the module's 8 tests cover command chains, file tests and
 the two find/head walks — none exercises comm, the xargs fold, the diff fold, sort
 or ls. (The 8 tests are in shir_native_stmt.rs; the two find/head ones assert the
 EMITTED TEXT of their walk, which no law here models, so they are not mirrors.)
 
-mutants measured 2026-11-28 against proof sha d135c5309730, each on a /tmp copy
-(the source untouched), sha re-checked afterwards (d135c5309730 and
-3ae1b4d0bc71 before and after; source sha256 unchanged):
+mutants measured 2026-11-28 against proof sha 4c8543b9e7d7, each on a /tmp copy (the
+source untouched), sha re-checked afterwards (4c8543b9e7d7; source sha256 unchanged
+before and after). M5–M18 were measured against the previous proof revision
+d135c5309730. Source pin note: at this stage's start the working tree held
+3ae1b4d0bc71 (= `git show HEAD:src/transforms/shir_native_stmt.rs`); it was then
+edited by another worker (native_sort_file_stmt / grep / emit_file_op), so the
+recorded source sha here is the working-tree sha 2504eddc38d2. Re-audited, not
+just bumped:
+`native_sort_stmt` — the fold §7 models — is byte-identical between 3ae1b4d0bc71
+and 2504eddc38d2 (checked by slicing both versions of the function), and every changed
+region belongs to folds outside this cluster's surface:
   M5  the echo word separator dropped                rejected at simplification
   M6  comm advances only the first cursor on a match rejected at simplification
   M7  the newline dropped from echo                  rejected at simplification
@@ -129,11 +186,30 @@ mutants measured 2026-11-28 against proof sha d135c5309730, each on a /tmp copy
       (the law at 835 and the silent pin at 883 — the guard is load-bearing)
   M18 the `ls` loop forgets its running flag         54v/1e postcondition
       (lemma_scan_is_status — a dropped missing operand)
+  M19 `ins_key` inserts AFTER equal keys             rejected at simplification
+      (pin_sort_n_keeps_equal_keys_in_input_order: `["1","01"]` comes back as
+       `["01","1"]` — the stability half of the `-n` model is load-bearing)
+  M20 `num_key` drops the sign                       rejected at simplification
+      (`3 == -3` at pin_numeric_key_is_the_line_value)
+  M21 `rev` made the identity                        rejected at simplification
+      (pin_sort_r_reverses_the_two_line_file: the reverse no longer reverses)
+  M22 `ins_key` compares bytes instead of keys       rejected at simplification
+      (pin_sort_n_puts_9_before_10: `-n` degenerates to `cmp`)
+  M23 `asc_key` demands DESCENDING keys              91v/3e assertion failed
+      (lemma_ins_key_sorted, lemma_asc_key_tail, lemma_rev_desc_key — the `-n`
+       ordering model is not vacuous)
+  M24 `digits_acc` drops the x10 place value         rejected at simplification
+      (`1 == 10` at pin_numeric_key_is_the_line_value)
+  M25 an unknown flag is accepted, not refused       rejected at simplification
+      (pin_unknown_flag_is_refused: `-u` decodes to Some instead of None)
+  M26 `num_key` loses `unwrap_or(0.0)`               93v/1e postcondition
+      (non_number_key_is_zero: a non-number line must read as 0)
   Every rejection inspected: all are VERIFICATION failures (`expression
-  simplifies to … which evaluates to false` / `postcondition not satisfied`),
-  none a mutant-spelling compile error. So the laws are load-bearing: M8/M9/M10
-  kill the xargs/diff laws, M11 the DP diagonal lemma, M12–M15 the
-  sorted-permutation law's two halves, and M16–M18 the `ls` status law.
+  simplifies to … which evaluates to false` / `postcondition not satisfied` /
+  `assertion failed`), none a mutant-spelling compile error. So the laws are
+  load-bearing: M8/M9/M10 kill the xargs/diff laws, M11 the DP diagonal lemma,
+  M12–M15 the sorted-permutation law's two halves, M16–M18 the `ls` status law,
+  and M19–M26 the `-n`/`-r`/`-nr` laws and the flag decoder.
 
 [exec]
 # NONE, by design: no source test covers comm, the xargs fold, the diff fold, sort

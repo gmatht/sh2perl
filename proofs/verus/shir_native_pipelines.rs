@@ -13,7 +13,7 @@
 // agree; where they do not, the divergence is PROVED (d-F4-1, d-F4-2) rather
 // than left as a comment.
 //
-// Proved here (55 obligations, 0 errors):
+// Proved here (94 obligations, 0 errors):
 //   xargs_appends_the_input_word — the general agreement law: `echo CONTENT |
 //                                xargs echo A B` joins A, B, CONTENT exactly the
 //                                way `echo` joins the command's argv with the
@@ -49,6 +49,24 @@
 //                                guard (`prints_echo`) fires exactly when an
 //                                operand is missing. Pins: a missing operand
 //                                prints, an all-present list stays silent.
+//   sort_n_is_a_sorted_key_permutation — d-F4-3b: the `-n` fold's output is
+//                                ordered by `num_key` (the line's decimal value,
+//                                0 for a line that is not a number — the
+//                                `unwrap_or(0.0)` fallback) and holds the input's
+//                                lines with their multiplicities. `num_key` is
+//                                built from `is_int_lit`/`digits_val`, not from
+//                                `ins_key`. Pins: `10`/`9` come out 9-then-10
+//                                (byte order would leave them the other way),
+//                                and `1`/`01` keep their input order (stability).
+//   sort_r_is_a_descending_permutation — d-F4-3b: byte-order sort then the
+//                                emitted `lines.reverse()` leaves no ascending
+//                                adjacent pair (`desc_lex`) and is a permutation.
+//                                `rev` is its own `push` recursion, and the law
+//                                is about the composition, not about `rev` alone.
+//   sort_nr_is_a_descending_key_permutation — d-F4-3b: the numeric sort reversed
+//                                is key-descending and a permutation. The glued
+//                                `-nr`/`-rn` spelling and the fold's refusal are
+//                                checked by `decode_flags` pins.
 //
 // NOT proved, stated plainly rather than papered over:
 //   * the general `comm -12` intersection law over two distinct sorted files —
@@ -58,9 +76,11 @@
 //     backtrack's cursors to prefix equality (`a[0..i] == b[0..j]`), i.e.
 //     subrange-composition facts this proof does not establish; the general
 //     statement was left unproved rather than restated so it agrees with itself.
-//   * `sort`'s FLAGS — `-n` (f64 numeric key), `-r` (reverse), `-u`/`-k`: the
-//     law covers the lexicographic `cmp` form only, which is d-F4-3b. The
-//     byte-level join of the sorted lines (separator/trailing newline) is the
+//   * `sort`'s float spellings (`1.5`, `1e3`), `-h`'s `human_size` key, and
+//     `-u`/`-k`/`-t` (those three are refused by the fold itself): §7 proves
+//     `-n` over the integer fragment of `parse::<f64>` and `-r` over byte
+//     order, and nothing is claimed for the rest — d-F4-3c. The byte-level join
+//     of the sorted lines (separator/trailing newline) is the
 //     `join_sep`/`echo_bytes` model of §1, not restated for sort.
 //
 // The xargs law's first formulation recursed with `skip` and needed
@@ -382,10 +402,10 @@ pub proof fn pin_one_word_echo_is_the_word_plus_newline()
 // or the "insert preserves order" step turns it red (see the mutant table in
 // `shir_native_pipelines_sync.txt`).
 //
-// REFUSED (recorded, not restated): the flags. `sort -n` parses each line as an
-// f64 and sorts numerically, `sort -r` reverses afterwards, and `-u`/`-k` are
-// not modelled here; the law covers the lexicographic (`cmp`) form only, which
-// is d-F4-3b.
+// The FLAGS are proved in §7 (`-n`, `-r` and the glued `-nr`): the numeric key,
+// the reverse step and the flag decoder all have their own models there.
+// `-u`/`-k`/`-t` stay refused by the fold itself, and `-h` plus the float
+// spellings are d-F4-3c.
 
 /// Ordered: no adjacent pair descends. This is the *semantic* ordering model.
 pub open spec fn sorted(ys: Seq<Word>) -> bool
@@ -886,6 +906,739 @@ pub proof fn pin_ls_all_present_silent()
     assert(!any_missing(seq![true, true], 0)) by (compute);
     assert(ls_rc(seq![true, true]) == 0) by (compute);
     reveal(prints_echo);
+}
+
+
+// ────────────────────────── §7  `sort -n` / `sort -r` (d-F4-3b) ──────────
+//
+// `native_sort_stmt` reads the consumer's flag words: `-n` (numeric key), `-h`
+// (human key), `-r` (reverse) and the glued spellings `-nr`/`-rn`/`-hr`/`-rh`;
+// any other word makes the fold REFUSE (the shell-out stays). With no flag the
+// pass sorts bytewise (`cmp`), with `-n` it sorts on `parse::<f64>()` with
+// `unwrap_or(0.0)` for a line that does not parse, and `-r` calls
+// `lines.reverse()` on the sorted vector.
+//
+// The pass-side models are written in the pass's own shape:
+//   * `ins_key`/`pass_sort_n` — the numeric insertion sort; a line goes in
+//     before the first line whose key is at least its own, which is what keeps
+//     equal keys in input order (the emitted `sort_by` is stable, and the head
+//     is inserted into a sorted tail, so `>` here would reverse ties — the
+//     stability pin below is what caught that);
+//   * `rev` — the `lines.reverse()` step, as a `push` recursion.
+// The SEMANTIC models are written apart from those and from the emitted text:
+//   * `num_key` — the value of a signed decimal-integer line, and 0 for a line
+//     that is not one (`unwrap_or(0.0)`), built from `is_int_lit`/`digits_val`;
+//   * `asc_key`/`desc_key` — no adjacent pair of lines has keys that ascend /
+//     descend, quantified over all adjacent indices;
+//   * `desc_lex` — the same for byte order (`-r` alone);
+//   * `cnt` — the multiset model of §5, reused for the permutation half.
+// `decode_flags` models the flag loop itself, including its refusal.
+//
+// NOT modelled here, stated rather than implied (d-F4-3c):
+//   * fractional and exponent spellings (`1.5`, `1e3`): `num_key` covers the
+//     integer fragment of `parse::<f64>`; the parse is a lexical front end and
+//     the ORDER reasoning above it is what is proved, but the lexical step for
+//     those spellings is not modelled, so the law is about integer lines;
+//   * `-h`'s `human_size` key: the fold accepts `-h`, this proof does not model
+//     the key, so nothing is claimed for `-h` (it stays refused for proof
+//     purposes even though the pass folds it);
+//   * `-u` (uniquify) and `-k`/`-t` (key selection) are refused by the fold and
+//     so are outside every law here.
+
+/// Every byte of `w` from `i` on is an ASCII digit.
+pub open spec fn all_digits(w: Word, i: int) -> bool
+    decreases w.len() - i,
+{
+    if i >= w.len() as int {
+        true
+    } else {
+        48 <= w[i] && w[i] <= 57 && all_digits(w, i + 1)
+    }
+}
+
+/// A left fold over those digits: `acc * 10 + digit` per byte, most
+/// significant byte first.
+pub open spec fn digits_acc(w: Word, i: int, acc: int) -> int
+    decreases w.len() - i,
+{
+    if i >= w.len() as int {
+        acc
+    } else {
+        digits_acc(w, i + 1, acc * 10int + (w[i] - 48int))
+    }
+}
+
+/// The value of the digits of `w` from `i` on.
+pub open spec fn digits_val(w: Word, i: int) -> int {
+    digits_acc(w, i, 0int)
+}
+
+/// What `parse::<f64>()` accepts on the integer fragment: an optional `-` and
+/// at least one digit.
+pub open spec fn is_int_lit(w: Word) -> bool {
+    (w.len() >= 1 && all_digits(w, 0))
+        || (w.len() >= 2 && w[0] == 45int && all_digits(w, 1))
+}
+
+pub open spec fn key_signed(w: Word) -> int {
+    if w.len() >= 2 && w[0] == 45int {
+        -digits_val(w, 1)
+    } else {
+        digits_val(w, 0)
+    }
+}
+
+/// **The numeric key.** `parse::<f64>()`'s value for an integer line, and 0 for
+/// a line that does not parse (`unwrap_or(0.0)`). Nothing here is derived from
+/// `ins_key`/`pass_sort_n`.
+pub open spec fn num_key(w: Word) -> int {
+    if is_int_lit(w) { key_signed(w) } else { 0int }
+}
+
+proof fn lemma_digits_nonneg(w: Word, i: int, acc: int)
+    requires
+        all_digits(w, i),
+        acc >= 0,
+    ensures
+        0int <= digits_acc(w, i, acc),
+    decreases w.len() - i,
+{
+    reveal(digits_acc);
+    reveal(all_digits);
+    if i >= w.len() as int {
+    } else {
+        lemma_digits_nonneg(w, i + 1, acc * 10int + (w[i] - 48int));
+    }
+}
+
+/// A digit-only line's key is its value, and no line has a negative one.
+pub proof fn digits_line_key(w: Word)
+    requires
+        w.len() >= 1,
+        all_digits(w, 0),
+    ensures
+        num_key(w) == digits_val(w, 0),
+        0int <= num_key(w),
+{
+    reveal(num_key);
+    reveal(is_int_lit);
+    reveal(key_signed);
+    reveal(all_digits);
+    assert(w[0] != 45int);
+    reveal(digits_val);
+    lemma_digits_nonneg(w, 0, 0int);
+}
+
+/// A line that is not a number reads as 0 — the `unwrap_or(0.0)` fallback.
+pub proof fn non_number_key_is_zero(w: Word)
+    requires
+        !is_int_lit(w),
+    ensures
+        num_key(w) == 0int,
+{
+    reveal(num_key);
+}
+
+/// The numeric insertion step: insert before the first line whose key is at
+/// least the inserted line's own. The head is inserted into an already-sorted
+/// TAIL, so `>=` (not `>`) is what keeps equal keys in input order — a stable
+/// sort; the emitted `sort_by` is stable too.
+pub open spec fn ins_key(x: Word, ys: Seq<Word>) -> Seq<Word>
+    decreases ys.len(),
+{
+    if ys.len() == 0 {
+        seq![x]
+    } else if num_key(ys[0]) >= num_key(x) {
+        seq![x] + ys
+    } else {
+        seq![ys[0]] + ins_key(x, ys.skip(1))
+    }
+}
+
+/// The whole numeric sort as the pass performs it.
+pub open spec fn pass_sort_n(xs: Seq<Word>) -> Seq<Word>
+    decreases xs.len(),
+{
+    if xs.len() == 0 {
+        Seq::<Word>::empty()
+    } else {
+        ins_key(xs[0], pass_sort_n(xs.skip(1)))
+    }
+}
+
+/// Semantic: no adjacent pair of lines has ascending keys.
+pub open spec fn asc_key(ys: Seq<Word>) -> bool {
+    forall|k: int| 0 <= k < ys.len() - 1 ==> #[trigger] num_key(ys[k]) <= num_key(ys[k + 1])
+}
+
+/// Semantic: no adjacent pair of lines has descending keys.
+pub open spec fn desc_key(ys: Seq<Word>) -> bool {
+    forall|k: int| 0 <= k < ys.len() - 1 ==> #[trigger] num_key(ys[k]) >= num_key(ys[k + 1])
+}
+
+/// Semantic: no adjacent pair of lines ascends in byte order.
+pub open spec fn desc_lex(ys: Seq<Word>) -> bool {
+    forall|k: int| 0 <= k < ys.len() - 1 ==> #[trigger] lex_lt(ys[k], ys[k + 1]) == false
+}
+
+/// The `lines.reverse()` step, as a `push` recursion.
+pub open spec fn rev(ys: Seq<Word>) -> Seq<Word>
+    decreases ys.len(),
+{
+    if ys.len() == 0 {
+        Seq::<Word>::empty()
+    } else {
+        rev(ys.skip(1)).push(ys[0])
+    }
+}
+
+proof fn lemma_skip_len2(ys: Seq<Word>)
+    requires
+        ys.len() >= 2,
+    ensures
+        ys.skip(1).len() == ys.len() - 1,
+{
+    lemma_skip_len(ys);
+}
+
+/// The insertion step's head is the inserted line or the list's own head.
+proof fn lemma_ins_key_head(x: Word, ys: Seq<Word>)
+    requires
+        ys.len() >= 1,
+    ensures
+        ins_key(x, ys)[0] == x || ins_key(x, ys)[0] == ys[0],
+{
+    reveal(ins_key);
+    if num_key(ys[0]) >= num_key(x) {
+        lemma_cons_zero(x, ys);
+    } else {
+        reveal(ins_key);
+        assert(ins_key(x, ys) == seq![ys[0]] + ins_key(x, ys.skip(1)));
+        lemma_cons_zero(ys[0], ins_key(x, ys.skip(1)));
+    }
+}
+
+proof fn lemma_asc_key_tail(ys: Seq<Word>)
+    requires
+        asc_key(ys),
+        ys.len() >= 1,
+    ensures
+        asc_key(ys.skip(1)),
+{
+    lemma_skip_len(ys);
+    assert forall|k: int|
+        0 <= k < ys.skip(1).len() - 1
+        implies #[trigger] num_key(ys.skip(1)[k]) <= num_key(ys.skip(1)[k + 1]) by {
+        if 0 <= k < ys.skip(1).len() - 1 {
+            lemma_skip_index(ys, k);
+            lemma_skip_index(ys, k + 1);
+        }
+    }
+}
+
+/// The insertion step preserves the ordering.
+proof fn lemma_ins_key_sorted(x: Word, ys: Seq<Word>)
+    requires
+        asc_key(ys),
+    ensures
+        asc_key(ins_key(x, ys)),
+    decreases ys.len(),
+{
+    reveal(ins_key);
+    if ys.len() == 0 {
+        assert(ins_key(x, ys) == seq![x]);
+        assert(asc_key(ins_key(x, ys)));
+    } else if num_key(ys[0]) >= num_key(x) {
+        let r = seq![x] + ys;
+        assert(ins_key(x, ys) == r);
+        assert(asc_key(r)) by {
+            assert forall|k: int|
+                0 <= k < r.len() - 1
+                implies #[trigger] num_key(r[k]) <= num_key(r[k + 1]) by {
+                if 0 <= k < r.len() - 1 {
+                    if k == 0 {
+                        lemma_cons_zero(x, ys);
+                        lemma_cons_index(x, ys, 0);
+                    } else {
+                        lemma_cons_index(x, ys, k - 1);
+                        lemma_cons_index(x, ys, k);
+                    }
+                }
+            }
+        }
+    } else {
+        let rest = ins_key(x, ys.skip(1));
+        assert(ins_key(x, ys) == seq![ys[0]] + rest);
+        lemma_asc_key_tail(ys);
+        lemma_ins_key_sorted(x, ys.skip(1));
+        let r = seq![ys[0]] + rest;
+        assert(asc_key(r)) by {
+            assert forall|k: int|
+                0 <= k < r.len() - 1
+                implies #[trigger] num_key(r[k]) <= num_key(r[k + 1]) by {
+                if 0 <= k < r.len() - 1 {
+                    if k == 0 {
+                        lemma_cons_zero(ys[0], rest);
+                        lemma_cons_index(ys[0], rest, 0);
+                        if ys.len() == 1 {
+                            lemma_skip_len(ys);
+                            assert(ys.skip(1).len() == 0);
+                            reveal(ins_key);
+                            assert(rest == seq![x]);
+                        } else {
+                            lemma_ins_key_head(x, ys.skip(1));
+                            if rest[0] == x {
+                            } else {
+                                lemma_skip_index(ys, 0);
+                                assert(rest[0] == ys[1]);
+                            }
+                        }
+                    } else {
+                        lemma_cons_index(ys[0], rest, k - 1);
+                        lemma_cons_index(ys[0], rest, k);
+                        assert(num_key(rest[k - 1]) <= num_key(rest[k]));
+                    }
+                }
+            }
+        }
+    }
+}
+
+/// The insertion step preserves every line's multiplicity.
+proof fn lemma_ins_key_cnt(x: Word, y: Word, ys: Seq<Word>)
+    ensures
+        cnt(x, ins_key(y, ys)) == cnt(x, ys) + (if x == y { 1int } else { 0int }),
+    decreases ys.len(),
+{
+    reveal(ins_key);
+    reveal(cnt);
+    if ys.len() == 0 {
+        lemma_cnt_cons(x, y, Seq::<Word>::empty());
+    } else if num_key(ys[0]) >= num_key(y) {
+        lemma_cnt_cons(x, y, ys);
+    } else {
+        lemma_cnt_cons(x, ys[0], ins_key(y, ys.skip(1)));
+        lemma_ins_key_cnt(x, y, ys.skip(1));
+        lemma_cnt_peel(x, ys);
+    }
+}
+
+proof fn lemma_sort_n_asc(xs: Seq<Word>)
+    ensures
+        asc_key(pass_sort_n(xs)),
+    decreases xs.len(),
+{
+    reveal(pass_sort_n);
+    if xs.len() == 0 {
+        assert(pass_sort_n(xs).len() == 0);
+        assert(asc_key(pass_sort_n(xs)));
+    } else {
+        lemma_sort_n_asc(xs.skip(1));
+        lemma_ins_key_sorted(xs[0], pass_sort_n(xs.skip(1)));
+    }
+}
+
+proof fn lemma_sort_n_cnt(x: Word, xs: Seq<Word>)
+    ensures
+        cnt(x, pass_sort_n(xs)) == cnt(x, xs),
+    decreases xs.len(),
+{
+    reveal(pass_sort_n);
+    if xs.len() == 0 {
+    } else {
+        lemma_sort_n_cnt(x, xs.skip(1));
+        lemma_ins_key_cnt(x, xs[0], pass_sort_n(xs.skip(1)));
+        lemma_cnt_peel(x, xs);
+    }
+}
+
+/// **The `sort -n` law.** The numeric fold's output is ordered by the numeric
+/// key and is a permutation of its input. `num_key`/`asc_key`/`cnt` are all
+/// defined apart from `ins_key`/`pass_sort_n`.
+pub proof fn sort_n_is_a_sorted_key_permutation(xs: Seq<Word>)
+    ensures
+        asc_key(pass_sort_n(xs)),
+        forall|x: Word| #[trigger] cnt(x, pass_sort_n(xs)) == cnt(x, xs),
+        pass_sort_n(xs).len() == xs.len(),
+{
+    lemma_sort_n_asc(xs);
+    lemma_sort_n_len(xs);
+    assert forall|x: Word| #[trigger] cnt(x, pass_sort_n(xs)) == cnt(x, xs) by {
+        lemma_sort_n_cnt(x, xs);
+    }
+}
+
+proof fn lemma_rev_len(ys: Seq<Word>)
+    ensures
+        rev(ys).len() == ys.len(),
+    decreases ys.len(),
+{
+    reveal(rev);
+    if ys.len() == 0 {
+    } else {
+        lemma_rev_len(ys.skip(1));
+        lemma_skip_len(ys);
+    }
+}
+
+/// The mirror-index fact: reversing a list maps index `i` to `len-1-i`.
+proof fn lemma_rev_index(ys: Seq<Word>, i: int)
+    requires
+        0 <= i < ys.len(),
+    ensures
+        rev(ys)[i] == ys[ys.len() - 1 - i],
+    decreases ys.len(),
+{
+    reveal(rev);
+    lemma_rev_len(ys);
+    if ys.len() == 1 {
+        assert(rev(ys.skip(1)).len() == 0);
+    } else {
+        assert(rev(ys) == rev(ys.skip(1)).push(ys[0]));
+        lemma_rev_len(ys.skip(1));
+        lemma_skip_len2(ys);
+        if i < ys.len() - 1 {
+            lemma_rev_index(ys.skip(1), i);
+            lemma_skip_index(ys, ys.len() - 2 - i);
+        }
+    }
+}
+
+/// `push` adds one occurrence to the count, from any start index.
+proof fn lemma_cnt_at_push(x: Word, ys: Seq<Word>, y: Word, k: int)
+    requires
+        0 <= k <= ys.len(),
+    ensures
+        cnt_at(x, ys.push(y), k) == cnt_at(x, ys, k) + (if y == x { 1int } else { 0int }),
+    decreases ys.len() - k,
+{
+    reveal(cnt_at);
+    if k >= ys.len() as int {
+        assert(k == ys.len() as int);
+        assert(ys.push(y).len() == ys.len() + 1);
+        reveal(cnt_at);
+        assert(ys.push(y)[k] == y);
+        assert(k + 1 >= ys.push(y).len() as int);
+        assert(cnt_at(x, ys.push(y), k + 1) == 0int);
+        assert(cnt_at(x, ys, k) == 0int);
+    } else {
+        assert(ys.push(y).len() == ys.len() + 1);
+        assert(ys.push(y)[k] == ys[k]);
+        lemma_cnt_at_push(x, ys, y, k + 1);
+        reveal(cnt_at);
+        assert((ys.push(y))[k] == x <==> ys[k] == x);
+    }
+}
+
+/// Reversing keeps every line's multiplicity.
+proof fn lemma_rev_cnt(x: Word, ys: Seq<Word>)
+    ensures
+        cnt(x, rev(ys)) == cnt(x, ys),
+    decreases ys.len(),
+{
+    reveal(rev);
+    reveal(cnt);
+    if ys.len() == 0 {
+    } else {
+        lemma_rev_cnt(x, ys.skip(1));
+        lemma_cnt_at_push(x, rev(ys.skip(1)), ys[0], 0);
+        lemma_cnt_peel(x, ys);
+    }
+}
+
+/// The adjacent pair at an arbitrary index, unwrapped from `sorted`.
+proof fn lemma_sorted_adj(ys: Seq<Word>, j: int)
+    requires
+        sorted(ys),
+        0 <= j < ys.len() - 1,
+    ensures
+        !lex_lt(ys[j + 1], ys[j]),
+    decreases ys.len(),
+{
+    lemma_sorted_unfold(ys);
+    if j == 0 {
+    } else {
+        lemma_sorted_tail(ys);
+        lemma_skip_index(ys, j - 1);
+        lemma_skip_index(ys, j);
+        lemma_sorted_adj(ys.skip(1), j - 1);
+    }
+}
+
+/// Reversing an ascending byte-order list leaves no ascending adjacent pair.
+pub proof fn lemma_rev_desc_lex(ys: Seq<Word>)
+    requires
+        sorted(ys),
+    ensures
+        desc_lex(rev(ys)),
+{
+    lemma_rev_len(ys);
+    assert forall|k: int|
+        0 <= k < rev(ys).len() - 1
+        implies #[trigger] lex_lt(rev(ys)[k], rev(ys)[k + 1]) == false by {
+        lemma_rev_index(ys, k);
+        lemma_rev_index(ys, k + 1);
+        lemma_sorted_adj(ys, ys.len() - 2 - k);
+    }
+}
+
+/// Reversing a key-ascending list leaves no ascending key pair.
+pub proof fn lemma_rev_desc_key(ys: Seq<Word>)
+    requires
+        asc_key(ys),
+    ensures
+        desc_key(rev(ys)),
+{
+    lemma_rev_len(ys);
+    assert forall|k: int|
+        0 <= k < rev(ys).len() - 1
+        implies #[trigger] num_key(rev(ys)[k]) >= num_key(rev(ys)[k + 1]) by {
+        lemma_rev_index(ys, k);
+        lemma_rev_index(ys, k + 1);
+        assert(num_key(ys[ys.len() - 2 - k]) <= num_key(ys[ys.len() - 1 - k]));
+    }
+}
+
+/// **The `sort -r` law.** Byte-order sort then `lines.reverse()` is descending
+/// in byte order and a permutation of the input.
+pub proof fn sort_r_is_a_descending_permutation(xs: Seq<Word>)
+    ensures
+        desc_lex(rev(pass_sort(xs))),
+        forall|x: Word| #[trigger] cnt(x, rev(pass_sort(xs))) == cnt(x, xs),
+        rev(pass_sort(xs)).len() == xs.len(),
+{
+    lemma_sort_sorted(xs);
+    lemma_rev_desc_lex(pass_sort(xs));
+    assert forall|x: Word| #[trigger] cnt(x, rev(pass_sort(xs))) == cnt(x, xs) by {
+        lemma_rev_cnt(x, pass_sort(xs));
+        lemma_sort_cnt(x, xs);
+    }
+    lemma_rev_len(pass_sort(xs));
+    lemma_pass_sort_len(xs);
+}
+
+/// **The `sort -nr` law.** Numeric sort then reverse is key-descending and a
+/// permutation of the input.
+pub proof fn sort_nr_is_a_descending_key_permutation(xs: Seq<Word>)
+    ensures
+        desc_key(rev(pass_sort_n(xs))),
+        forall|x: Word| #[trigger] cnt(x, rev(pass_sort_n(xs))) == cnt(x, xs),
+        rev(pass_sort_n(xs)).len() == xs.len(),
+{
+    lemma_sort_n_asc(xs);
+    lemma_rev_desc_key(pass_sort_n(xs));
+    assert forall|x: Word| #[trigger] cnt(x, rev(pass_sort_n(xs))) == cnt(x, xs) by {
+        lemma_rev_cnt(x, pass_sort_n(xs));
+        lemma_sort_n_cnt(x, xs);
+    }
+    lemma_rev_len(pass_sort_n(xs));
+    lemma_sort_n_len(xs);
+}
+
+/// Decoded `sort` flags as `native_sort_stmt` folds them: `(numeric, human,
+/// reverse)`. `None` is the fold's refusal — any other word keeps the shell-out.
+pub open spec fn decode_flags(
+    ws: Seq<Word>,
+    i: int,
+    numeric: bool,
+    human: bool,
+    reverse: bool,
+) -> Option<(bool, bool, bool)>
+    decreases ws.len() - i,
+{
+    if i >= ws.len() as int {
+        Some((numeric, human, reverse))
+    } else if ws[i] == seq![45int, 110int] {
+        decode_flags(ws, i + 1, true, human, reverse)
+    } else if ws[i] == seq![45int, 104int] {
+        decode_flags(ws, i + 1, numeric, true, reverse)
+    } else if ws[i] == seq![45int, 114int] {
+        decode_flags(ws, i + 1, numeric, human, true)
+    } else if ws[i] == seq![45int, 110int, 114int]
+        || ws[i] == seq![45int, 114int, 110int]
+    {
+        decode_flags(ws, i + 1, true, human, true)
+    } else if ws[i] == seq![45int, 104int, 114int]
+        || ws[i] == seq![45int, 114int, 104int]
+    {
+        decode_flags(ws, i + 1, numeric, true, true)
+    } else {
+        None::<(bool, bool, bool)>
+    }
+}
+
+proof fn lemma_ins_len(x: Word, ys: Seq<Word>)
+    ensures
+        ins(x, ys).len() == ys.len() + 1,
+    decreases ys.len(),
+{
+    reveal(ins);
+    if ys.len() == 0 {
+    } else if lex_lt(x, ys[0]) {
+    } else {
+        lemma_ins_len(x, ys.skip(1));
+    }
+}
+
+proof fn lemma_pass_sort_len(xs: Seq<Word>)
+    ensures
+        pass_sort(xs).len() == xs.len(),
+    decreases xs.len(),
+{
+    reveal(pass_sort);
+    if xs.len() == 0 {
+    } else {
+        lemma_pass_sort_len(xs.skip(1));
+        lemma_ins_len(xs[0], pass_sort(xs.skip(1)));
+    }
+}
+
+proof fn lemma_ins_key_len(x: Word, ys: Seq<Word>)
+    ensures
+        ins_key(x, ys).len() == ys.len() + 1,
+    decreases ys.len(),
+{
+    reveal(ins_key);
+    if ys.len() == 0 {
+    } else if num_key(ys[0]) >= num_key(x) {
+    } else {
+        lemma_ins_key_len(x, ys.skip(1));
+    }
+}
+
+proof fn lemma_sort_n_len(xs: Seq<Word>)
+    ensures
+        pass_sort_n(xs).len() == xs.len(),
+    decreases xs.len(),
+{
+    reveal(pass_sort_n);
+    if xs.len() == 0 {
+    } else {
+        lemma_sort_n_len(xs.skip(1));
+        lemma_ins_key_len(xs[0], pass_sort_n(xs.skip(1)));
+    }
+}
+
+// The concrete lines the flag pins sort: `"10"`, `"9"`, `"1"`, `"01"`, `"abc"`
+// and `"-3"`, as their bytes.
+pub open spec fn w_ten() -> Word { seq![49int, 48int] }
+pub open spec fn w_nine() -> Word { seq![57int] }
+pub open spec fn w_one() -> Word { seq![49int] }
+pub open spec fn w_zero_one() -> Word { seq![48int, 49int] }
+pub open spec fn w_abc() -> Word { seq![97int, 98int, 99int] }
+pub open spec fn w_neg3() -> Word { seq![45int, 51int] }
+
+// pins: the numeric key really reads the line's value, and it really disagrees
+// with the byte order the unflagged sort uses.
+pub proof fn pin_numeric_key_is_the_line_value()
+    ensures
+        num_key(w_ten()) == 10int,
+        num_key(w_nine()) == 9int,
+        num_key(w_neg3()) == -3int,
+{
+    assert(num_key(w_ten()) == 10int) by (compute);
+    assert(num_key(w_nine()) == 9int) by (compute);
+    assert(num_key(w_neg3()) == -3int) by (compute);
+}
+
+pub proof fn pin_numeric_key_disagrees_with_byte_order()
+    ensures
+        lex_lt(w_ten(), w_nine()),
+        num_key(w_ten()) > num_key(w_nine()),
+{
+    assert(lex_lt(w_ten(), w_nine())) by (compute);
+    assert(num_key(w_ten()) == 10int) by (compute);
+    assert(num_key(w_nine()) == 9int) by (compute);
+}
+
+/// A line that does not parse reads as 0, so `-3` sorts before it and `abc`
+/// ties with `0`.
+pub proof fn pin_non_number_reads_as_zero()
+    ensures
+        num_key(w_abc()) == 0int,
+        num_key(w_neg3()) < num_key(w_abc()),
+{
+    non_number_key_is_zero(w_abc());
+    assert(num_key(w_neg3()) == -3int) by (compute);
+}
+
+// pins: `-n` reorders the pair the byte-order sort leaves alone, and equal keys
+// keep their input order.
+pub proof fn pin_sort_n_puts_9_before_10()
+    ensures
+        pass_sort(seq![w_ten(), w_nine()]) == seq![w_ten(), w_nine()],
+        pass_sort_n(seq![w_ten(), w_nine()]) == seq![w_nine(), w_ten()],
+        asc_key(pass_sort_n(seq![w_ten(), w_nine()])),
+{
+    sort_n_is_a_sorted_key_permutation(seq![w_ten(), w_nine()]);
+    assert(pass_sort(seq![w_ten(), w_nine()]) == seq![w_ten(), w_nine()]) by (compute);
+    assert(pass_sort_n(seq![w_ten(), w_nine()]) == seq![w_nine(), w_ten()]) by (compute);
+}
+
+pub proof fn pin_sort_n_keeps_equal_keys_in_input_order()
+    ensures
+        num_key(w_one()) == num_key(w_zero_one()),
+        pass_sort_n(seq![w_one(), w_zero_one()]) == seq![w_one(), w_zero_one()],
+{
+    assert(num_key(w_one()) == 1int) by (compute);
+    assert(num_key(w_zero_one()) == 1int) by (compute);
+    assert(pass_sort_n(seq![w_one(), w_zero_one()]) == seq![w_one(), w_zero_one()])
+        by (compute);
+}
+
+// pins: `-r` and `-nr` reverse, and the glued `-nr` spelling decodes like `-n`
+// `-r`; an unknown word is refused.
+pub proof fn pin_sort_r_reverses_the_two_line_file()
+    ensures
+        // byte order puts "01" before "1"; the reverse puts it back
+        pass_sort(seq![w_one(), w_zero_one()]) == seq![w_zero_one(), w_one()],
+        rev(pass_sort(seq![w_one(), w_zero_one()])) == seq![w_one(), w_zero_one()],
+        desc_lex(rev(pass_sort(seq![w_one(), w_zero_one()]))),
+{
+    sort_r_is_a_descending_permutation(seq![w_one(), w_zero_one()]);
+    assert(pass_sort(seq![w_one(), w_zero_one()]) == seq![w_zero_one(), w_one()])
+        by (compute);
+    assert(rev(seq![w_zero_one(), w_one()]) == seq![w_one(), w_zero_one()]) by (compute);
+}
+
+pub proof fn pin_sort_nr_descends()
+    ensures
+        rev(pass_sort_n(seq![w_ten(), w_nine()])) == seq![w_ten(), w_nine()],
+        desc_key(rev(pass_sort_n(seq![w_ten(), w_nine()]))),
+{
+    sort_nr_is_a_descending_key_permutation(seq![w_ten(), w_nine()]);
+    assert(pass_sort_n(seq![w_ten(), w_nine()]) == seq![w_nine(), w_ten()]) by (compute);
+    assert(rev(seq![w_nine(), w_ten()]) == seq![w_ten(), w_nine()]) by (compute);
+}
+
+pub proof fn pin_flag_spelling_nr_matches_n_then_r()
+    ensures
+        decode_flags(seq![seq![45int, 110int, 114int]], 0, false, false, false)
+            == Some((true, false, true)),
+        decode_flags(seq![seq![45int, 110int], seq![45int, 114int]], 0, false, false, false)
+            == Some((true, false, true)),
+        decode_flags(seq![seq![45int, 114int, 110int]], 0, false, false, false)
+            == Some((true, false, true)),
+{
+    assert(decode_flags(seq![seq![45int, 110int, 114int]], 0, false, false, false)
+        == Some((true, false, true))) by (compute);
+    assert(decode_flags(seq![seq![45int, 110int], seq![45int, 114int]], 0, false, false, false)
+        == Some((true, false, true))) by (compute);
+    assert(decode_flags(seq![seq![45int, 114int, 110int]], 0, false, false, false)
+        == Some((true, false, true))) by (compute);
+}
+
+pub proof fn pin_unknown_flag_is_refused()
+    ensures
+        decode_flags(seq![seq![45int, 117int]], 0, false, false, false)
+            == None::<(bool, bool, bool)>,
+        decode_flags(seq![seq![45int, 110int], seq![45int, 117int]], 0, false, false, false)
+            == None::<(bool, bool, bool)>,
+{
+    assert(decode_flags(seq![seq![45int, 117int]], 0, false, false, false)
+        == None::<(bool, bool, bool)>) by (compute);
+    assert(decode_flags(seq![seq![45int, 110int], seq![45int, 117int]], 0, false, false, false)
+        == None::<(bool, bool, bool)>) by (compute);
 }
 
 } // verus!
