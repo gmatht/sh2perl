@@ -19,7 +19,11 @@
                   (its output relation is pinned at N = 1);
                   still open here: the byte renderer, the flat-text connector
                   split, F2's matcher, F2-F4/G/A; D1-D3 are reuse only;
-                  clusters A, F2-F4, G still planned — see §4
+                  cluster F2 PROVED (grep_literal_fold.rs, 37 verified / 0 errors);
+                  cluster G part 1 PROVED (shir_native_constant_pipeline.rs,
+                  16 verified / 0 errors: the constant true/false pipeline fold,
+                  its status law, its six refusals and d1 pipefail);
+                  clusters A, F3, F4 and the REST of G still planned — see §4
 
 This is a PLAN, not a proof. It exists because `shir_native_stmt` is the one
 output-changing transform left whose property is not a single statement: it is

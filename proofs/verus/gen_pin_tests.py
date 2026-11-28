@@ -617,11 +617,130 @@ def emit_grep_pin(pin: dict) -> list[str]:
     return out
 
 
+
+PIPELINE_HELPERS = '''use super::*;
+
+/// One pipeline stage as the IR the fold sees: an Arrow body holding a single
+/// exec Call whose words are `words`.
+fn cp_stage(cmd: &str, words: &[&str]) -> IrExpr {
+    IrExpr::Arrow(vec![IrStmt::Expr(IrExpr::Call {
+        func: "exec".to_string(),
+        args: vec![st(cmd), IrExpr::Array(words.iter().map(|w| st(w)).collect())],
+    })])
+}
+
+/// `pipeline [stage ...]` as a statement.
+fn cp_pipeline(stages: Vec<IrExpr>) -> IrStmt {
+    IrStmt::Expr(IrExpr::Call {
+        func: "pipeline".to_string(),
+        args: vec![IrExpr::Array(stages)],
+    })
+}
+
+fn cp_stages(spec: &[(&str, &[&str])]) -> Vec<IrExpr> {
+    spec.iter().map(|(c, w)| cp_stage(c, w)).collect()
+}
+
+/// The status the folded statement writes, when the fold fired.
+fn cp_status(st: &IrStmt) -> Option<bool> {
+    let IrStmt::Expr(IrExpr::Call { func, args }) = st else { return None };
+    if func != "exec" { return None }
+    let [IrExpr::Str(c, _), IrExpr::Array(w)] = args.as_slice() else { return None };
+    if !w.is_empty() { return None }
+    match c.as_str() {
+        "true" => Some(true),
+        "false" => Some(false),
+        _ => None,
+    }
+}
+'''
+
+
+def emit_pipeline_pin(pin: dict) -> list[str]:
+    kind = pin["kind"]
+    out = [
+        "",
+        f"/// Manifest row: `pin {pin['pin']}` in shir_native_constant_pipeline_sync.txt.",
+        f"/// {pin['note']}",
+        "#[test]",
+        f"fn {pin['pin']}() {{",
+    ]
+    spec = ", ".join(
+        f"({lit(c)}, &[{', '.join(lit(w) for w in ws)}])" for c, ws in pin.get("stages", [])
+    )
+    if kind == "pipeline":
+        out += [
+            f"    let mut st = cp_pipeline(cp_stages(&[{spec}]));",
+            "    assert!(native_constant_pipeline(&mut st),",
+            '        "the fold must fire on a constant pipeline");',
+            "    assert_eq!(cp_status(&st), Some(%s));" % ("true" if pin["expect"] else "false"),
+        ]
+    elif kind == "pipeline_refused":
+        out += [
+            f"    let mut st = cp_pipeline(cp_stages(&[{spec}]));",
+            "    assert!(!native_constant_pipeline(&mut st),",
+            '        "the fold must refuse this pipeline and keep the shell-out");',
+            "    assert!(cp_status(&st).is_none());",
+        ]
+    elif kind == "pipeline_refused_multi":
+        out += [
+            "    let two_statements = IrExpr::Arrow(vec![",
+            '        IrStmt::Expr(IrExpr::Call { func: "exec".to_string(),',
+            '            args: vec![st("true"), IrExpr::Array(vec![])] }),',
+            '        IrStmt::Expr(IrExpr::Call { func: "exec".to_string(),',
+            '            args: vec![st("true"), IrExpr::Array(vec![])] }),',
+            "    ]);",
+            "    let mut st = cp_pipeline(vec![two_statements]);",
+            "    assert!(!native_constant_pipeline(&mut st));",
+        ]
+    elif kind == "pipeline_refused_call":
+        out += [
+            "    let redirected = IrExpr::Arrow(vec![IrStmt::Expr(IrExpr::Call {",
+            '        func: "redirect".to_string(),',
+            '        args: vec![cp_stage("true", &[]), IrExpr::Array(vec![])],',
+            "    })]);",
+            "    let mut st = cp_pipeline(vec![redirected]);",
+            "    assert!(!native_constant_pipeline(&mut st));",
+        ]
+    elif kind == "pipeline_refused_shape":
+        out += [
+            "    // not a pipeline at all",
+            '    let mut bare = IrStmt::Expr(IrExpr::Call { func: "exec".to_string(),',
+            '        args: vec![st("true"), IrExpr::Array(vec![])] });',
+            "    assert!(!native_constant_pipeline(&mut bare));",
+            "    // a `pipeline` whose argument is not the stage array",
+            '    let mut odd = IrStmt::Expr(IrExpr::Call { func: "pipeline".to_string(),',
+            '        args: vec![st("true")] });',
+            "    assert!(!native_constant_pipeline(&mut odd));",
+        ]
+    elif kind == "pipefail":
+        out += [
+            "    // bash's answer without pipefail, and with it",
+            '    let plain = std::process::Command::new("bash")',
+            '        .arg("-c").arg("false | true").status().expect("bash");',
+            '    assert!(plain.success(), "bash without pipefail exits 0 for `false | true`");',
+            '    let strict = std::process::Command::new("bash")',
+            '        .arg("-c").arg("set -o pipefail; false | true").status().expect("bash");',
+            "    assert!(!strict.success(),",
+            '        "under pipefail the failing stage decides: `false | true` exits 1");',
+            "    // the fold, which has no pipefail gate, writes the plain answer",
+            '    let mut st = cp_pipeline(cp_stages(&[("false", &[]), ("true", &[])]));',
+            "    assert!(native_constant_pipeline(&mut st));",
+            "    assert_eq!(cp_status(&st), Some(true),",
+            '        "d1: the fold keeps the no-pipefail answer and cannot see pipefail");',
+        ]
+    else:
+        raise SystemExit(f"unknown pipeline kind {kind}")
+    out.append("}")
+    return out
+
+
 FAMILIES = {
     "f1": (RUST_HELPERS, emit_pin),
     "status_reads": (STATUS_HELPERS, emit_status_pin),
     "uae": (UAE_HELPERS, emit_uae_pin),
     "grep": (GREP_HELPERS, emit_grep_pin),
+    "pipeline": (PIPELINE_HELPERS, emit_pipeline_pin),
 }
 
 

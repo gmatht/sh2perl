@@ -1,5 +1,5 @@
 # verus-sync-coverage manifest: shir_native_f1
-# source sha: shir_native_stmt=82418386dc5a
+# source sha: shir_native_stmt=2590419de896
 # (RE-AUDITED 2026-11-28: the only drift since the previously recorded value is the
 #  six-line `#[cfg(test)] #[path = "grep_pin_tests.rs"] mod pin_tests_grep;`
 #  registration appended at EOF, after the existing pin-tests block and
@@ -9,6 +9,9 @@
 #  the F1 functions modelled here — native_echo_tr_sort_stmt, tr_set_escape,
 #  native_wc_l_pipeline, native_head_tail_stmt/_pipeline, native_sort_stmt —
 #  are byte-identical.)  proof sha: bfbad0ada2dd
+#   RE-AUDITED: the drift from 82418386dc5a to 2590419de896 is the generated pin-test module
+#   registration appended at EOF (outside every fold this manifest models);
+#   the modelled fns are untouched.
 # source: src/transforms/shir_native_stmt.rs (cluster F1, the parts proved:
 #   native_echo_tr_sort_stmt 5252, tr_set_escape 5220,
 #   native_wc_l_pipeline 2473, native_head_tail_stmt 1749,

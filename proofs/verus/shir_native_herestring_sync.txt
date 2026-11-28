@@ -1,5 +1,5 @@
 # verus-sync-coverage manifest: shir_native_herestring
-# source sha: shir_native_stmt=82418386dc5a  proof sha: b4092c0ad51c
+# source sha: shir_native_stmt=2590419de896  proof sha: b4092c0ad51c
 #   RE-AUDITED 2026-11-28 at e45e2f3c2983 (the recorded value names d3e7fbe29
 #   "perl: validate printf operands the way bash does"): empty_herestring_to_status were
 #   extracted from both revisions and diffed -- byte-identical.
@@ -7,6 +7,9 @@
 #   becoming per-render thread-locals, the grep redirect parse, the sort
 #   comparison globals, native_diff_files_stmt, and a `#[cfg(test)]` pin-test
 #   module appended at EOF -- none of it in this cluster.
+#   RE-AUDITED: the drift from 82418386dc5a to 2590419de896 is the generated pin-test module
+#   registration appended at EOF (outside every fold this manifest models);
+#   the modelled fns are untouched.
 # source: src/transforms/shir_native_stmt.rs (cluster C: empty_herestring_to_status, line 6890)
 # This is the FIRST proved cluster of the decomposition in shir_native_stmt_plan.md;
 # the ten-cluster plan is not complete (see that file's status line).

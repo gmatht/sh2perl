@@ -9285,6 +9285,51 @@ Declared out of model: the `printf` producer arm (its bytes are
 `native_redirect.rs`), the line join from ranges to bytes (a renderer step over
 the selection proved here), locale, and grep's stderr.
 
+### Cluster G (part 1) — the constant-pipeline fold (16 obligations + 10 executed pins)
+
+    verus --triggers-mode silent --rlimit 40 proofs/verus/shir_native_constant_pipeline.rs
+    -> verification results:: 16 verified, 0 errors
+
+Cluster G is nineteen folds; this stage takes the one that owns a whole
+statement and needs nothing but a status: `native_constant_pipeline` rewrites
+`true/false | true/false …` to `status_exec(last stage == "true")`.
+
+- **Two independent definitions.** The pass's side (`pass_decides`) is the
+  universal gate over the stages' **syntax** — one statement, an exec/builtin
+  Call, `true` or `false`, no words — plus a read of the LAST stage's *name*.
+  The semantic side is stated over the stages' **behaviours** (bytes written,
+  status exited) with bash's rule `pipeline_status = sts.last()`. They meet
+  only through `stage_spec`, the definition of what the two builtins do.
+  `fold_is_sound` proves the rewrite keeps bash's status and drops no output
+  (`pipeline_stdout(outs).len() == 0`).
+- **Which stage, and why it is load-bearing.** Shifting the read to
+  `stages[0]` turns it red (12v/4e); so does making the semantic rule report
+  `sts[0]` (11v/5e); so does dropping `status == is_true(s)` from `stage_spec`
+  (15v/1e); so does weakening the gate to `is_call` only (10v/6e).
+- **Pins, executed.** Ten rows, all MAPPED, all generated:
+  `pin_specs/shir_native_constant_pipeline.json` names each witness and
+  `gen_pin_tests.py` writes `src/transforms/cp_pin_tests.rs`, which builds the
+  real IR and calls the real `native_constant_pipeline` — including the six
+  refusals (opaque stage, worded builtin, empty pipeline, multi-statement
+  body, non-Call body, non-pipeline shape).
+- **d1, a recorded divergence.** `set -o pipefail` makes `false | true` exit 1,
+  where the fold writes `status_exec(true)`. The IR carries no pipefail state
+  in this fold, so there is nothing to gate on: the generated
+  `pin_pipefail_disagrees` runs **both** bash forms and shows the disagreement,
+  rather than the model asserting it.
+- **Residue, stated not claimed.** bash's rule is modelled as
+  `sts.last()`, not as an inductive execution fold. An earlier draft carried
+  the fold (consume each stage's status in turn) and the induction "fold ==
+  last"; Verus's per-function fuel makes that induction expensive at
+  `--rlimit 40`, so the fold is the documented justification and the
+  last-element rule is the model. What is proved is the part a pass can get
+  wrong: which stage the status comes from, and whether that stage's status is
+  what its name says.
+
+Declared out of model: a stage's stdin, `true()`/`false()` shell functions
+shadowing the builtins, `shopt -s lastpipe`, and the rest of cluster G (the
+let/declare folds, `command -v`, trap, subshell and perl folds).
+
 ## `shir_native_stmt.rs` — no single law; a decomposition plan (cluster C proved)
 
     proofs/verus/shir_native_stmt_plan.md
