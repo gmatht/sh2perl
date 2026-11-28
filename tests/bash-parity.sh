@@ -21,10 +21,14 @@
 #      must not become a qx fork), scanning emitted CODE only — comment lines
 #      carry no behaviour and the renderer's preamble legitimately mentions
 #      `` `cat ``;
-#   5. when the source declares `# expected (bash): <text>`, requires bash's
-#      own stdout to be exactly that line. Without this a broken bash run
-#      (e.g. a missing stdin) and an equally empty Perl run "match" while
-#      proving nothing.
+#   5. when the source declares an expectation, requires bash's own stdout to
+#      be exactly that text. Without this a broken bash run (e.g. a missing
+#      stdin) and an equally empty Perl run "match" while proving nothing.
+#      Three forms, in priority order:
+#        a) a sibling file `<fixture>.expected` (byte-for-byte);
+#        b) a BLOCK: a line `# expected (bash):` followed by `# `-prefixed
+#           lines — one per output line, so a failure names the case;
+#        c) a single line `# expected (bash): <text>`.
 #
 # Output is one line per example; the exit status is non-zero if any
 # comparison fails.
@@ -258,13 +262,34 @@ for f in "${examples[@]}"; do
     done
 
     # A declared expectation makes the comparison prove the DOCUMENTED
-    # behaviour, not merely that two runs agree with each other.
-    expected=$(sed -n 's/^# expected (bash): //p' "$f" | head -1)
-    if [ -n "$expected" ]; then
-        printf '%s\n' "$expected" >"$tmp/$name.expected"
+    # behaviour, not merely that two runs agree with each other. Three forms:
+    # a sibling `.expected` file, a multi-line `# expected (bash):` block, or
+    # the original single line. The multi-line form exists so a fixture can
+    # assert one case per line and a failure names the case in the diff.
+    have_expected=0
+    : >"$tmp/$name.expected"
+    case_file="${f%.sh}.expected"
+    if [ -f "$case_file" ]; then
+        cp "$case_file" "$tmp/$name.expected"
+        have_expected=1
+    elif grep -qx '# expected (bash):' "$f"; then
+        awk '
+            /^# expected \(bash\):$/ { block = 1; next }
+            block && /^#/ { sub(/^# ?/, ""); print; next }
+            block        { exit }
+        ' "$f" >"$tmp/$name.expected"
+        have_expected=1
+    else
+        expected=$(sed -n 's/^# expected (bash): //p' "$f" | head -1)
+        if [ -n "$expected" ]; then
+            printf '%s\n' "$expected" >"$tmp/$name.expected"
+            have_expected=1
+        fi
+    fi
+    if [ "$have_expected" = 1 ]; then
         if ! diff -q "$tmp/$name.expected" "$tmp/$name.b.nout" >/dev/null; then
             echo "FAIL $name: bash stdout differs from the declared expectation"
-            diff -u "$tmp/$name.expected" "$tmp/$name.b.nout" | sed -n '1,12p'
+            diff -u "$tmp/$name.expected" "$tmp/$name.b.nout" | sed -n '1,20p'
             fail=1
             continue
         fi
