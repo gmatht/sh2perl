@@ -1,5 +1,5 @@
 # verus-sync-coverage manifest: shir_native_pipelines
-# source sha: shir_native_stmt=3b243603f88f  proof sha: e91b4227069f
+# source sha: shir_native_stmt=3b243603f88f  proof sha: 1d7f90809f29
 # source: src/transforms/shir_native_stmt.rs — cluster F4, `xargs` / `comm` /
 #   `diff` / `sort` / `ls`
 #   surface: native_echo_xargs_stmt (5290), native_comm_stmt (6756),
@@ -70,12 +70,11 @@
 #   * `native_sort_file_stmt`'s numeric key (`__sh_num($a) <=> __sh_num($b)`) is
 #     a different fold (the `sort FILE` shell-out, not the literal-pipeline fold
 #     §7 models) and is not covered here.
-#   * the general `comm -12` intersection law over two distinct sorted files —
-#     needs ordered-membership invariants for the two-pointer walk (d-F4-4).
-#   * diff's output beyond silence — d-F4-5b: the converse ("a change always
-#     prints") and the byte-level hunks. Both need an invariant relating the
-#     backtrack's cursors to prefix equality (a[0..i] == b[0..j]); the general
-#     statement was left unproved rather than restated to agree with itself.
+#   * diff's byte-level hunk TEXT (`@@` headers, `-`/`+` prefixes, the context
+#     window): that is the renderer's output, not the walk's decision, and is
+#     out of model. The walk's decision itself is now proved both ways
+#     (d-F4-5b below); the general `comm -12` intersection law closed with
+#     d-F4-4.
 #
 # Supporting lemmas and who consumes them:
 #   lemma_concat_assoc → xargs_appends_the_input_word
@@ -112,6 +111,11 @@ pin pin_comm_common_prefix_line -> UNMIRRORED (no source test covers comm; A vs 
 pin pin_comm_exhausted_cursor_stops -> UNMIRRORED (no source test covers comm; an exhausted cursor ends the walk)
 pin pin_one_word_echo_is_the_word_plus_newline -> UNMIRRORED (no source test covers the xargs fold)
 pin pin_diff_of_differing_files_prints -> UNMIRRORED (no source test covers the diff fold)
+pin pin_diff_changed_line_prints -> UNMIRRORED (no source test covers diff; a rewritten line prints)
+pin pin_diff_appended_line_prints -> UNMIRRORED (no source test covers diff; an extra line prints)
+pin pin_diff_truncated_file_prints -> UNMIRRORED (no source test covers diff; a missing line prints)
+pin pin_diff_reordered_lines_print -> UNMIRRORED (no source test covers diff; a reordering prints)
+pin pin_diff_equal_files_are_silent -> UNMIRRORED (no source test covers diff; equal files are silent)
 pin pin_sort_sorted_permutation -> UNMIRRORED (no source test covers sort; a two-line file, sorts to [A,B])
 pin pin_sort_keeps_duplicates -> UNMIRRORED (no source test covers sort; the multiset half on a duplicated line)
 pin pin_ls_missing_operand_prints -> UNMIRRORED (no source test covers ls; a missing operand makes `|| echo` print)
@@ -153,12 +157,13 @@ guard lemma_digits_nonneg / lemma_asc_key_tail / lemma_ins_key_head / lemma_ins_
 guard lemma_rev_len / lemma_rev_index / lemma_rev_cnt / lemma_cnt_at_push / lemma_sorted_adj / lemma_rev_desc_lex / lemma_rev_desc_key: PRESENT
 guard sort float spellings / -h key / -u / -k / -t: NOT PROVED (d-F4-3c; -u/-k/-t are refused by the fold)
 guard native_sort_file_stmt's numeric key: NOT PROVED (a different fold, outside this cluster)
-guard diff beyond identical inputs: NOT PROVED (d-F4-5b)
+guard law diff_prints_iff_the_files_differ (d-F4-5b, both directions): PRESENT
+guard lemma_silent_walk_matches (silence ⇒ equal cursors and prefixes): PRESENT
 guard printf/echo escape decoding: DELEGATED to cluster E (shir_native_echo.rs)
 
 [counts]
-113 verified, 0 errors (verus --triggers-mode silent --rlimit 40 shir_native_pipelines.rs)
-22 pins, all UNMIRRORED: the module's 8 tests cover command chains, file tests and
+120 verified, 0 errors (verus --triggers-mode silent --rlimit 40 shir_native_pipelines.rs)
+27 pins, all UNMIRRORED: the module's 8 tests cover command chains, file tests and
 the two find/head walks — none exercises comm, the xargs fold, the diff fold, sort
 or ls. (The 8 tests are in shir_native_stmt.rs; the two find/head ones assert the
 EMITTED TEXT of their walk, which no law here models, so they are not mirrors.)
@@ -281,3 +286,22 @@ every run; the file's own mutants were appended above, not re-run):
 Each rejection is a semantic failure of a stated law or pin, not a compile error: M1-M4
 and M6 are `by (compute)` proof steps that evaluate the walk on a concrete pair of
 files, M5 is an SMT postcondition failure.
+
+d-F4-5b mutants (measured 2026-11-28, each on a /tmp copy, source untouched, the
+proof restored byte-identically by sha256 after every run):
+  D1 the emit walk forgets its tail loops (base -> false)  119v/1e, assertion failed
+                                                            (pin_diff_appended_line_prints and
+                                                             pin_diff_truncated_file_prints)
+  D2 the prefix match advances one cursor only             rejected at simplification
+                                                            (`expression simplifies to false` at
+                                                             pin_diff_equal_files_are_silent:
+                                                             silence no longer implies equality)
+  D3 the mismatch branch prints nothing                    rejected at simplification
+                                                            (the printed-pair pins compute false —
+                                                             a differing line would print nothing)
+  D4 only a two-sided leftover prints (base -> &&)         119v/1e, assertion failed
+                                                            (a one-sided tail is dropped: the
+                                                             appended/truncated pins)
+All four are SEMANTIC rejections of the model, not compile errors, so the law's
+two directions are load-bearing: the forward half needs the diagonal, the converse
+needs the cursor invariant, and the tail loops are what make a length change print.

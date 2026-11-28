@@ -13,7 +13,7 @@
 // agree; where they do not, the divergence is PROVED (d-F4-1, d-F4-2) rather
 // than left as a comment.
 //
-// Proved here (113 obligations, 0 errors):
+// Proved here (120 obligations, 0 errors):
 //   xargs_appends_the_input_word — the general agreement law: `echo CONTENT |
 //                                xargs echo A B` joins A, B, CONTENT exactly the
 //                                way `echo` joins the command's argv with the
@@ -52,6 +52,22 @@
 //                                opened and nothing is printed; the DP diagonal
 //                                is the file length (lemma_lcs_identical), which
 //                                is what makes that branch always reachable.
+//   diff_prints_iff_the_files_differ — d-F4-5b, the converse: the emit walk
+//                                prints EXACTLY when the files differ. The
+//                                forward half is d-F4-5 above; the converse is
+//                                `lemma_silent_walk_matches`, the cursor
+//                                invariant this file used to record as missing:
+//                                a silent walk can only have taken prefix-match
+//                                branches, so silence leaves the cursors equal
+//                                and the prefixes elementwise equal, hence the
+//                                inputs equal. The semantic side is sequence
+//                                equality; the pass side is the emit loop's own
+//                                control flow `prints_any`. Pins: a rewritten
+//                                line, an appended line, a truncated file and a
+//                                reordered pair all print, equal files are
+//                                silent. NOT covered: the byte-level hunk text
+//                                (`@@` headers, `-`/`+` prefixes, the context
+//                                window) — that is the renderer, not the walk.
 //   sort_is_a_sorted_permutation — d-F4-3: the emitted `sort @lines` output is
 //                                ORDERED (`sorted`, the adjacent-pair model) and
 //                                a PERMUTATION of its input (`cnt`, the multiset
@@ -827,15 +843,12 @@ pub proof fn lemma_lcs_identical(a: Seq<Word>, i: int)
     }
 }
 
-/// **The diff law (d-F4-5, the honest version).** `diff F F` prints nothing:
-/// with both sides equal, the emit loop's only reachable branch is the prefix
-/// match, and the DP diagonal is full, so no hunk is ever opened.
-///
-/// NOT proved (d-F4-5b): the converse — that a non-empty change always prints —
-/// and `diff`'s byte-level output. Both need an invariant relating the
-/// backtrack's cursors to prefix equality (`a[0..i] == b[0..j]`), i.e.
-/// subrange-composition facts this proof does not establish; the general
-/// statement was left unproved rather than restated so it agrees with itself.
+/// **The diff law's forward half (d-F4-5).** `diff F F` prints nothing: with
+/// both sides equal, the emit loop's only reachable branch is the prefix match,
+/// and the DP diagonal is full, so no hunk is ever opened. The converse — that
+/// a change always prints — is `diff_prints_iff_the_files_differ` (d-F4-5b)
+/// below; the byte-level hunk TEXT stays out of model (the renderer's, not the
+/// walk's).
 pub proof fn diff_identical_inputs_are_silent(a: Seq<Word>)
     ensures
         prints_any(a, a, a.len() as int, a.len() as int) == false,
@@ -843,6 +856,105 @@ pub proof fn diff_identical_inputs_are_silent(a: Seq<Word>)
 {
     lemma_prints_identical(a, a.len() as int);
     lemma_lcs_identical(a, a.len() as int);
+}
+
+/// **The converse's engine (d-F4-5b).** A walk that prints nothing can only
+/// have taken prefix-match branches: each consumes one line of EACH side, so
+/// silence leaves the cursors equal and the remaining prefixes elementwise
+/// equal. This is the invariant the earlier revision of this file recorded as
+/// missing ("needs an invariant relating the backtrack's cursors to prefix
+/// equality"): `prints_any` is the emit loop's own control flow, and the
+/// conclusion is about the INPUTS, so the two sides are independent.
+proof fn lemma_silent_walk_matches(a: Seq<Word>, b: Seq<Word>, i: int, j: int)
+    requires
+        0 <= i <= a.len(),
+        0 <= j <= b.len(),
+        !prints_any(a, b, i, j),
+    ensures
+        i == j,
+        forall|k: int| 0 <= k < i ==> #[trigger] a[k] == b[k],
+    decreases i + j,
+{
+    reveal(prints_any);
+    if i <= 0 || j <= 0 {
+        // the two tail loops print every leftover, so silence forces both
+        // cursors at 0
+        assert(i == 0);
+        assert(j == 0);
+    } else if a[i - 1] == b[j - 1] {
+        lemma_silent_walk_matches(a, b, i - 1, j - 1);
+        assert(i - 1 == j - 1);
+        assert(i == j);
+        assert forall|k: int| 0 <= k < i implies #[trigger] a[k] == b[k] by {
+            if k < i - 1 {
+            } else {
+                assert(k == i - 1);
+                assert(k == j - 1);
+            }
+        }
+    } else {
+        // the mismatch branch sets `true`: a silent walk cannot be here
+        assert(false);
+    }
+}
+
+/// **The diff law, both directions (d-F4-5b).** `diff` prints exactly when the
+/// files differ: an unchanged pair is silent (d-F4-5, the forward direction,
+/// from the DP diagonal) and any change prints something (the converse, from
+/// the cursor invariant above). Stated over the emit loop's own control flow,
+/// with the semantic side being sequence equality.
+pub proof fn diff_prints_iff_the_files_differ(a: Seq<Word>, b: Seq<Word>)
+    ensures
+        prints_any(a, b, a.len() as int, b.len() as int) == (a != b),
+{
+    if a == b {
+        lemma_prints_identical(a, a.len() as int);
+    } else if !prints_any(a, b, a.len() as int, b.len() as int) {
+        lemma_silent_walk_matches(a, b, a.len() as int, b.len() as int);
+        assert(a =~= b);
+    }
+}
+
+// pins for d-F4-5b: the two ways a change can print (a differing line, a
+// longer side) and the two ways it must stay silent (equal files).
+pub proof fn pin_diff_changed_line_prints()
+    ensures
+        prints_any(seq![seq![65int]], seq![seq![66int]], 1, 1),
+{
+    assert(prints_any(seq![seq![65int]], seq![seq![66int]], 1, 1)) by (compute);
+}
+
+pub proof fn pin_diff_appended_line_prints()
+    ensures
+        prints_any(seq![seq![65int]], seq![seq![65int], seq![66int]], 1, 2),
+{
+    assert(prints_any(seq![seq![65int]], seq![seq![65int], seq![66int]], 1, 2)) by (compute);
+}
+
+pub proof fn pin_diff_truncated_file_prints()
+    ensures
+        prints_any(seq![seq![65int], seq![66int]], seq![seq![65int]], 2, 1),
+{
+    assert(prints_any(seq![seq![65int], seq![66int]], seq![seq![65int]], 2, 1)) by (compute);
+}
+
+pub proof fn pin_diff_reordered_lines_print()
+    ensures
+        prints_any(seq![seq![66int], seq![65int]], seq![seq![65int], seq![66int]], 2, 2),
+{
+    // the pair really is a change, so the law's other direction applies to it
+    assert(prints_any(seq![seq![66int], seq![65int]], seq![seq![65int], seq![66int]], 2, 2))
+        by (compute);
+}
+
+pub proof fn pin_diff_equal_files_are_silent()
+    ensures
+        !prints_any(seq![seq![65int], seq![66int]], seq![seq![65int], seq![66int]], 2, 2),
+{
+    diff_prints_iff_the_files_differ(
+        seq![seq![65int], seq![66int]],
+        seq![seq![65int], seq![66int]],
+    );
 }
 
 // ────────────────────────────────────────────────── §4  pins ──────────────

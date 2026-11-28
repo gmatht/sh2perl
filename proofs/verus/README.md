@@ -9751,11 +9751,21 @@ inserting after instead of before equal keys), `-nr`/`-rn` decode like `-n`
   exact-output pins (the IFF law is insensitive to order-reversal and to
   multiplicity; the `less`-step pair also fails the laws themselves, 110v/2e),
   and the last is an SMT failure in `comm_12_complete` (112v/3e).
-- `diff` beyond identical inputs is not proved (d-F4-5b): the converse ("a change
-  always prints") and the byte-level hunks both need an invariant relating the
-  backtrack's cursors to prefix equality (`a[0..i] == b[0..j]`), which this proof
-  does not establish.
-- Pins: all 4 F3 pins and all 22 F4 pins are **UNMIRRORED**. The two
+- `diff`'s converse IS proved (d-F4-5b): `diff_prints_iff_the_files_differ` says
+  the emit walk prints **exactly** when the files differ. The forward half is
+  d-F4-5 (equal files are silent, from the DP diagonal); the converse rests on
+  `lemma_silent_walk_matches`, the cursor invariant this file used to record as
+  missing — a silent walk can only have taken prefix-match branches, each
+  consuming one line of each side, so silence leaves the cursors equal and the
+  prefixes elementwise equal, hence the inputs equal. Pins: a rewritten line, an
+  appended line, a truncated file and a reordered pair all print, and equal files
+  stay silent. Mutants: dropping the tail loops and demoting the leftover test to
+  `&&` are counted failures (119v/1e each), while advancing one cursor on a
+  match or making the mismatch branch print nothing are rejected at
+  simplification by the printed-pair pins. Still out of model: the byte-level
+  hunk text (`@@` headers, `-`/`+` prefixes, the context window), which is the
+  renderer's output rather than the walk's decision.
+- Pins: all 4 F3 pins and all 27 F4 pins are **UNMIRRORED**. The two
   `find_with[out]_head_*` tests exercise the same fold but assert its EMITTED
   TEXT, so they would not notice a change to the splice law; no source test
   asserts the matcher, the grammar, `comm` or the `xargs` fold. The manifests say
