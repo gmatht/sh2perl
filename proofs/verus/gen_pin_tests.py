@@ -577,10 +577,51 @@ def emit_uae_pin(pin: dict) -> list[str]:
     return out
 
 
+GREP_HELPERS = '''use super::*;
+
+fn gw(words: &[&str]) -> Vec<IrExpr> {
+    words.iter().map(|w| IrExpr::Str(w.to_string(), StrStyle::Raw)).collect()
+}
+'''
+
+
+def emit_grep_pin(pin: dict) -> list[str]:
+    kind = pin["kind"]
+    out = [
+        "",
+        f"/// Manifest row: `pin {pin['pin']}` in grep_literal_fold_sync.txt.",
+        f"/// {pin['note']}",
+        "#[test]",
+        f"fn {pin['pin']}() {{",
+    ]
+    if kind == "word":
+        out += [
+            f"    assert_eq!(word_boundary_hit({lit(pin['line'])}, {lit(pin['pat'])}), "
+            + ("true" if pin["expect"] else "false") + ");",
+        ]
+    elif kind in ("grep", "grep_none"):
+        words = "&[" + ", ".join(lit(w) for w in pin["words"]) + "]"
+        got = f"grep_output(&gw({words}), {lit(pin['input'])})"
+        if kind == "grep_none":
+            out += [
+                f"    assert!({got}.is_none(),",
+                '        "the fold must refuse this shape and keep the shell-out");',
+            ]
+        else:
+            out += [
+                f"    assert_eq!({got}.as_deref(), Some({lit(pin['expect'])}));",
+            ]
+    else:
+        raise SystemExit(f"unknown grep kind {kind}")
+    out.append("}")
+    return out
+
+
 FAMILIES = {
     "f1": (RUST_HELPERS, emit_pin),
     "status_reads": (STATUS_HELPERS, emit_status_pin),
     "uae": (UAE_HELPERS, emit_uae_pin),
+    "grep": (GREP_HELPERS, emit_grep_pin),
 }
 
 

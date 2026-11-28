@@ -1,5 +1,5 @@
 # verus-sync-coverage manifest: shir_native_redirect
-# source sha: shir_native_stmt=e45e2f3c2983  proof sha: bc391c9b9405
+# source sha: shir_native_stmt=82418386dc5a  proof sha: bc391c9b9405
 #   RE-AUDITED 2026-11-28 at e45e2f3c2983 (the recorded value names d3e7fbe29
 #   "perl: validate printf operands the way bash does"). Extracted all seven
 #   listed functions from both revisions and diffed: file_redirect_block,

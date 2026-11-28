@@ -1,5 +1,9 @@
 # verus-sync-coverage manifest: shir_native_f1
-# source sha: shir_native_stmt=9b6bd3e84004
+# source sha: shir_native_stmt=82418386dc5a
+# (RE-AUDITED 2026-11-28: the only drift since the previously recorded value is the
+#  six-line `#[cfg(test)] #[path = "grep_pin_tests.rs"] mod pin_tests_grep;`
+#  registration appended at EOF, after the existing pin-tests block and
+#  outside every fold this family models.)
 # (re-audited: the drift since 93c9e845a066 is a concurrent worker's scratch-name
 #  counters in native_echo_write_file_stmt / emit_file_op / native_ls_stmt;
 #  the F1 functions modelled here — native_echo_tr_sort_stmt, tr_set_escape,
@@ -14,19 +18,32 @@
 # proved generally (third pass) and its off-domain divergences now proved
 # generally in N (fourth pass); the N=1 pins stay as witnesses.
 # Clusters F2-F4, G and A remain.
+#
+# PIN TESTS: src/transforms/native_pin_tests.rs is GENERATED from this
+# manifest's [pins] rows by proofs/verus/gen_pin_tests.py, and is registered
+# from a `#[cfg(test)] mod` block appended at EOF of
+# src/transforms/shir_native_stmt.rs -- that block is the only source change
+# the pin tests needed, and it sits outside every folded function. The recorded
+# source hash below describes the revision the F1 functions were audited
+# against. It is stale in the working tree for two reasons, neither of them a
+# change to the proof's subject: other workers' uncommitted edits elsewhere in
+# the file, and the #[cfg(test)] registration above. Audited by extracting
+# native_echo_tr_sort_stmt, tr_set_escape, native_wc_l_pipeline,
+# native_head_tail_stmt and native_head_tail_pipeline from that revision and
+# from the working tree: all five are byte-identical.
 
 [pins]
-pin pin_tail_clamps -> UNMIRRORED (no source test for tail -c clamping)
-pin pin_head_zero_is_empty -> UNMIRRORED (no source test for head -c 0)
-pin pin_tr_only_maps_the_set -> UNMIRRORED (no source test for tr's set map)
-pin pin_wc_needs_a_newline_per_line -> UNMIRRORED (no source test for wc's producer shape)
-pin pin_plain_sort_is_byte_order -> UNMIRRORED (no source test for plain sort order)
-pin pin_numeric_order_differs_from_plain_order -> UNMIRRORED (no source test for -n vs plain order)
-pin pin_unknown_sort_flags_keep_the_shell_out -> UNMIRRORED (no source test for the sort flag refusals)
-pin pin_head_one_line -> UNMIRRORED (no source test for line-mode head)
-pin pin_head_beyond_the_last_line_adds_a_newline -> UNMIRRORED (records a source divergence, no test)
-pin pin_tail_lines_selects_the_trailing_empty_segment -> UNMIRRORED (records a source divergence, no test)
-pin pin_tail_lines_add_a_newline_bash_does_not -> UNMIRRORED (records a source divergence, no test)
+pin pin_tail_clamps -> test pin_tail_clamps: MAPPED
+pin pin_head_zero_is_empty -> test pin_head_zero_is_empty: MAPPED
+pin pin_tr_only_maps_the_set -> test pin_tr_only_maps_the_set: MAPPED
+pin pin_wc_needs_a_newline_per_line -> test pin_wc_needs_a_newline_per_line: MAPPED
+pin pin_plain_sort_is_byte_order -> test pin_plain_sort_is_byte_order: MAPPED
+pin pin_numeric_order_differs_from_plain_order -> test pin_numeric_order_differs_from_plain_order: MAPPED
+pin pin_unknown_sort_flags_keep_the_shell_out -> test pin_unknown_sort_flags_keep_the_shell_out: MAPPED
+pin pin_head_one_line -> test pin_head_one_line: MAPPED
+pin pin_head_beyond_the_last_line_adds_a_newline -> test pin_head_beyond_the_last_line_adds_a_newline: MAPPED
+pin pin_tail_lines_selects_the_trailing_empty_segment -> test pin_tail_lines_selects_the_trailing_empty_segment: MAPPED
+pin pin_tail_lines_add_a_newline_bash_does_not -> test pin_tail_lines_add_a_newline_bash_does_not: MAPPED
 
 [guards]
 guard law tr_join_law (per-line tr re-joined == bash tr on the stream): PRESENT
@@ -108,9 +125,34 @@ mutants measured against the 74v/0e baseline (general off-domain divergences):
        (reveal_with_fuel rejects a non-recursive function), not counted
 
 [exec]
-# The analysed module's 8 tests cover chain/find and the renderer; none
-# exercises the tr/wc/head-tail folds. Every pin row is UNMIRRORED.
-exec pin_tail_clamps: UNMIRRORED (not executed: no source test)
-exec pin_head_zero_is_empty: UNMIRRORED (not executed)
-exec pin_tr_only_maps_the_set: UNMIRRORED (not executed)
-exec pin_wc_needs_a_newline_per_line: UNMIRRORED (not executed)
+# All eleven pins are MAPPED to tests GENERATED from this manifest by
+# proofs/verus/gen_pin_tests.py (spec: pin_specs/f1_head_tail.json). The
+# tests call the folds themselves -- native_head_tail_stmt (line and byte
+# mode), native_wc_l_pipeline, native_sort_stmt, native_echo_tr_sort_stmt --
+# so a test cannot pass against a re-implementation:
+#   width  : pin_tail_clamps, pin_head_zero_is_empty, pin_head_one_line,
+#            pin_head_beyond_the_last_line_adds_a_newline,
+#            pin_tail_lines_selects_the_trailing_empty_segment,
+#            pin_tail_lines_add_a_newline_bash_does_not
+#   wc -l  : pin_wc_needs_a_newline_per_line
+#   sort   : pin_plain_sort_is_byte_order, pin_numeric_order_differs_from_plain_order,
+#            pin_unknown_sort_flags_keep_the_shell_out
+#   tr     : pin_tr_only_maps_the_set
+# The spec also records BASH's answer for every witness, so the four
+# divergences are visible where they live: pin_head_zero_is_empty (the fold
+# prints the whole input where bash prints nothing), pin_wc_needs_a_newline_
+# per_line, and the two line-mode tail/head ones. Those tests pin the fold's
+# CURRENT output, not the shell's; the gap is the divergence, not a pass.
+#
+# Checked by the generator: `cargo test --lib pin_tests::` -> 11 passed.
+exec pin_tail_clamps (pin_tail_clamps): PASS
+exec pin_head_zero_is_empty (pin_head_zero_is_empty): PASS
+exec pin_tr_only_maps_the_set (pin_tr_only_maps_the_set): PASS
+exec pin_wc_needs_a_newline_per_line (pin_wc_needs_a_newline_per_line): PASS
+exec pin_head_beyond_the_last_line_adds_a_newline (pin_head_beyond_the_last_line_adds_a_newline): PASS
+exec pin_head_one_line (pin_head_one_line): PASS
+exec pin_tail_lines_add_a_newline_bash_does_not (pin_tail_lines_add_a_newline_bash_does_not): PASS
+exec pin_tail_lines_selects_the_trailing_empty_segment (pin_tail_lines_selects_the_trailing_empty_segment): PASS
+exec pin_numeric_order_differs_from_plain_order (pin_numeric_order_differs_from_plain_order): PASS
+exec pin_plain_sort_is_byte_order (pin_plain_sort_is_byte_order): PASS
+exec pin_unknown_sort_flags_keep_the_shell_out (pin_unknown_sort_flags_keep_the_shell_out): PASS

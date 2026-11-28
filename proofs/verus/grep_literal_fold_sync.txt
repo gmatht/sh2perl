@@ -1,0 +1,63 @@
+# verus-sync-coverage manifest: grep_literal_fold
+# source sha: shir_native_stmt=82418386dc5a
+# (the six-line `#[cfg(test)] #[path = "grep_pin_tests.rs"] mod pin_tests_grep;`
+#  registration appended at EOF is the only difference from the file this
+#  proof's functions were read in; `grep_output`, `word_boundary_hit`,
+#  `literal_text` and `native_static_grep_redirect` are untouched.)
+# proof sha: 01140df8b4f0
+
+[pins]
+pin pin_plain_line_selected -> test pin_plain_line_selected: MAPPED
+pin pin_first_offset_is_scanned -> test pin_first_offset_is_scanned: MAPPED
+pin pin_word_match_needs_both_boundaries -> test pin_word_match_needs_both_boundaries: MAPPED
+pin pin_word_match_after_a_space -> test pin_word_match_after_a_space: MAPPED
+pin pin_case_fold_lowers_both_sides -> test pin_case_fold_lowers_both_sides: MAPPED
+pin pin_context_prints_the_window -> test pin_context_prints_the_window: MAPPED
+pin pin_metacharacter_pattern_refused -> test pin_metacharacter_pattern_refused: MAPPED
+pin pin_unknown_flag_refused -> test pin_unknown_flag_refused: MAPPED
+pin pin_file_operand_refused -> test pin_file_operand_refused: MAPPED
+pin pin_context_argument_must_be_a_number -> test pin_context_argument_must_be_a_number: MAPPED
+pin pin_no_match_writes_an_empty_body -> test pin_no_match_writes_an_empty_body: MAPPED
+pin pin_empty_pattern_prints_the_phantom -> test pin_empty_pattern_prints_the_phantom: MAPPED
+
+[guards]
+guard law fold_contains_is_plain (String::contains == occurrence exists): PRESENT
+guard law fold_word_is_boundary (the -w loop == whole-word existence): PRESENT
+guard law ranges_select_the_context (the range list == the context, both directions): PRESENT
+guard reference in_context (semantic side from grep's arithmetic, not the fold's): PRESENT
+guard refusal metacharacter patterns (a literal-only matcher): PRESENT
+guard refusal unknown flag / file operand / non-numeric -A: PRESENT
+guard body line join (ordered, disjoint ranges; a renderer step, stated): PRESENT
+guard divergence d1 status_exec(true) (recorded, not proved correct): PRESENT
+guard divergence d2 -q/-s (recorded, not proved correct): PRESENT
+guard divergence d3 empty pattern (recorded, not proved correct): PRESENT
+guard out of model printf producer, locale, stderr text: PRESENT
+
+[counts]
+37 verified, 0 errors (verus --triggers-mode silent --rlimit 40 grep_literal_fold.rs)
+mutants (measured 2026-11-28 against this exact file, proof sha 01140df8b4f0,
+  each restored byte-identically and the sha re-checked): hit_at's right
+  boundary dropped 36v/1e (fold_word_is_boundary); win_end without the +1
+  35v/2e (ranges_from_selects, at the window step); the merge never extending
+  its last range 34v/3e (the coverage invariant); contains_scan skipping a byte
+  36v/1e (fold_contains_is_plain).
+
+[exec]
+exec pin_case_fold_lowers_both_sides (pin_case_fold_lowers_both_sides): PASS
+exec pin_context_argument_must_be_a_number (pin_context_argument_must_be_a_number): PASS
+exec pin_context_prints_the_window (pin_context_prints_the_window): PASS
+exec pin_empty_pattern_prints_the_phantom (pin_empty_pattern_prints_the_phantom): PASS
+exec pin_file_operand_refused (pin_file_operand_refused): PASS
+exec pin_first_offset_is_scanned (pin_first_offset_is_scanned): PASS
+exec pin_metacharacter_pattern_refused (pin_metacharacter_pattern_refused): PASS
+exec pin_no_match_writes_an_empty_body (pin_no_match_writes_an_empty_body): PASS
+exec pin_plain_line_selected (pin_plain_line_selected): PASS
+exec pin_unknown_flag_refused (pin_unknown_flag_refused): PASS
+exec pin_word_match_after_a_space (pin_word_match_after_a_space): PASS
+exec pin_word_match_needs_both_boundaries (pin_word_match_needs_both_boundaries): PASS
+# Every MAPPED row above was EXECUTED against the source in this tree by the
+# generator that owns the tests:
+#   python3 proofs/verus/gen_pin_tests.py proofs/verus/pin_specs/grep_literal_fold.json --run
+# That writes src/transforms/grep_pin_tests.rs, runs each generated test through
+# `cargo test --lib pin_tests`, and records a verdict ONLY for a test whose own
+# `<module>::<name> ... ok` line it observed.

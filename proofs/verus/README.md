@@ -9233,6 +9233,58 @@ sha256 re-checked (see `bc_float_clean_sync.txt`).
   `grep -c 'cfg(test)'` → 0), so every pin row in the manifest is
   UNMIRRORED and no `[exec]` PASS row exists for this proof.
 
+### Cluster F2 — the literal `grep` fold (34 obligations + 12 executed pins)
+
+    verus --triggers-mode silent --rlimit 40 proofs/verus/grep_literal_fold.rs
+    -> verification results:: 37 verified, 0 errors
+
+`native_static_grep_redirect` folds `echo LIT | grep [flags] PAT > FILE` into
+`WriteFile(FILE, grep_output(words, input))`. Every byte it writes comes from
+one analysis function, and that function refuses every pattern carrying a
+metacharacter — so F2, the cluster the plan priced as "the model is the cost",
+turns out to be a LITERAL matcher plus grep's context arithmetic. This file
+proves that analysis against an independent semantic side:
+
+- **The two matchers.** `word_boundary_hit` is a left-to-right scan asking
+  "equal bytes here, non-word neighbours"; the semantic side is "some offset
+  has equal bytes and non-word neighbours" and `word_scan_is_boundary` refines
+  one into the other. `String::contains` gets the same treatment
+  (`contains_scan_is_plain`), so a scan that skips offset 0 or stops a byte
+  early disagrees with its own first witness.
+- **The selection and its context.** `grep_output` turns the matching line
+  indices into a range list (`start = m-before` clamped at 0, `end =
+  m+after+1` clamped at the line count, a new range only when `start >
+  last.end`). The semantic side is "print line `i` iff some match `m` has
+  `m - before <= i <= m + after`", written straight from the manual.
+  `ranges_select_the_context` proves the two index sets equal in BOTH
+  directions, and `merge_sound` shows one merge step is exactly a union — so
+  the clamping, the `+1` and the `start <= end` (not `<`) test are all
+  load-bearing.
+- **Pins, executed.** Twelve rows, all MAPPED, all generated:
+  `pin_specs/grep_literal_fold.json` names each witness, `gen_pin_tests.py`
+  writes `src/transforms/grep_pin_tests.rs` driving the real `grep_output` and
+  `word_boundary_hit`, and a row flips only after its own test passes. The
+  rows include the refusals (metacharacter pattern, unknown flag, file
+  operand, non-numeric `-A`) and both `-w` boundary cases.
+- **Mutants, measured** on this exact file (sha `01140df8b4f0`, each restored
+  byte-identically): drop `hit_at`'s right boundary 36v/1e; `win_end` without
+  the `+1` 35v/2e; a merge that never extends 34v/3e; a scan that skips a byte
+  36v/1e.
+
+Three shapes reach the fold and do NOT agree with bash. They are recorded, not
+smoothed over: the fold emits `status_exec(true)` where `grep` exits 1 on no
+match (d1); its parse accepts `-q`/`-s` and prints the matched lines anyway,
+where `grep -q` writes an empty file (d2); and the empty pattern matches the
+phantom empty element `split('\n')` leaves behind, printing one line more than
+bash (d3). `phantom_is_never_a_match` proves a non-empty pattern never reaches
+that element, which is why the body law may model the input's real lines.
+Fixing d1–d3 is a source change and therefore a later stage.
+
+Declared out of model: the `printf` producer arm (its bytes are
+`decode_capture_escapes`'s law), the fd/mode gate (cluster B's
+`native_redirect.rs`), the line join from ranges to bytes (a renderer step over
+the selection proved here), locale, and grep's stderr.
+
 ## `shir_native_stmt.rs` — no single law; a decomposition plan (cluster C proved)
 
     proofs/verus/shir_native_stmt_plan.md
