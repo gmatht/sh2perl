@@ -7213,3 +7213,10 @@ mod pin_tests_cp;
 #[cfg(test)]
 #[path = "cv_pin_tests.rs"]
 mod pin_tests_cv;
+
+// Tests generated from the Verus manifest's [pins] rows by
+// proofs/verus/gen_pin_tests.py -- DO NOT EDIT the generated file by hand.
+// There is one test per pin; a pin flips to MAPPED only after its test passes.
+#[cfg(test)]
+#[path = "cnn_pin_tests.rs"]
+mod pin_tests_cnn;

@@ -26,8 +26,12 @@
                   cluster G part 2 PROVED (shir_native_command_v.rs, 19 verified /
                   0 errors: native_command_v and command_v_redirect_truth against
                   PATH resolution, the /dev/null sink law, d1 bare-form loss and
-                  d2 absent-listed-name); clusters A, F3, F4 and the REST of G
-                  still planned — see §4
+                  d2 absent-listed-name);
+                  cluster G part 3 PROVED (shir_native_command_noop_cond.rs,
+                  25 verified / 0 errors: the `! command <'' >''` condition
+                  fold, its redirect-failure law, six conservative refusals and
+                  d3 -- the fold never inspects the redirect target);
+                  clusters A, F3, F4 and the REST of G still planned — see §4
 
 This is a PLAN, not a proof. It exists because `shir_native_stmt` is the one
 output-changing transform left whose property is not a single statement: it is

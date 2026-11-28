@@ -912,6 +912,180 @@ def emit_command_v_pin(pin: dict) -> list[str]:
     return out
 
 
+COMMAND_NOOP_COND_HELPERS = '''use super::*;
+
+/// One redirect spec: fd, mode "w", target string.
+fn cnn_spec(fd: i64, target: &str) -> IrExpr {
+    IrExpr::Object(vec![
+        ("fd".to_string(), IrExpr::Int(fd)),
+        ("mode".to_string(), IrExpr::Str("w".to_string(), StrStyle::Raw)),
+        ("target".to_string(), IrExpr::Str(target.to_string(), StrStyle::Raw)),
+    ])
+}
+
+/// `redirect(Arrow([inner]), specs)`, optionally wrapped in `!`.
+fn cnn_cond(not_wrapped: bool, inner: IrStmt, specs: Vec<IrExpr>) -> IrExpr {
+    let redirect = IrExpr::Call {
+        func: "redirect".to_string(),
+        args: vec![IrExpr::Arrow(vec![inner]), IrExpr::Array(specs)],
+    };
+    if not_wrapped {
+        IrExpr::BinOp {
+            op: BinOpKind::Not,
+            lhs: Box::new(redirect),
+            rhs: Box::new(IrExpr::Bool(false)),
+        }
+    } else {
+        redirect
+    }
+}
+
+/// The redirect body: `words[0] words[1..]` as a single builtin call.
+fn cnn_inner(words: &[&str]) -> IrStmt {
+    IrStmt::Expr(IrExpr::Call {
+        func: "builtin".to_string(),
+        args: vec![
+            st(words[0]),
+            IrExpr::Array(words[1..].iter().map(|w| st(w)).collect()),
+        ],
+    })
+}
+
+/// An `If` with an empty body — all the fold looks at.
+fn cnn_stmt(cond: IrExpr) -> IrStmt {
+    IrStmt::If { cond, then: vec![], elsifs: vec![], else_: vec![] }
+}
+
+/// The Bool the fold wrote into the condition, or None if it did not fire.
+fn cnn_written(st: &IrStmt) -> Option<bool> {
+    let IrStmt::If { cond, .. } = st else { return None };
+    match cond {
+        IrExpr::Bool(b) => Some(*b),
+        _ => None,
+    }
+}
+
+/// The shell's own exit status for `script`.
+fn cnn_bash(script: &str) -> i32 {
+    std::process::Command::new("bash")
+        .arg("-c")
+        .arg(script)
+        // the child's output must not interleave with the harness' verdict line
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .status()
+        .expect("bash")
+        .code()
+        .unwrap_or(-1)
+}
+
+'''
+
+def emit_command_noop_cond_pin(pin: dict) -> list[str]:
+    kind = pin["kind"]
+    out = [
+        "",
+        f"/// Manifest row: `pin {pin['pin']}` in shir_native_command_noop_cond_sync.txt.",
+        f"/// {pin['note']}",
+        "#[test]",
+        f"fn {pin['pin']}() {{",
+    ]
+    words = pin.get("words") or []
+    argv = ", ".join(lit(w) for w in words)
+    rest = ", ".join("st(%s)" % lit(w) for w in words[1:])
+    parts = ", ".join(
+        "cnn_spec(%d, %s)" % (s[0], lit(s[1])) for s in pin.get("specs") or []
+    )
+    specs = f"vec![{parts}]"
+    nw = "true" if pin.get("not_wrapped") else "false"
+    if kind == "cnn_fold":
+        out += [
+            f"    let mut stmt = cnn_stmt(cnn_cond({nw}, cnn_inner(&[{argv}]), {specs}));",
+            '    assert!(native_command_noop_cond(&mut stmt),',
+            '        "the fold must fire on a no-argument `command` behind a redirect");',
+            f"    assert_eq!(cnn_written(&stmt), Some({'true' if pin['expect'] else 'false'}));",
+        ]
+    elif kind == "cnn_refuse":
+        out += [
+            f"    let mut stmt = cnn_stmt(cnn_cond({nw}, cnn_inner(&[{argv}]), {specs}));",
+            "    assert!(!native_command_noop_cond(&mut stmt),",
+            '        "this shape must keep the shell-out");',
+            "    assert!(cnn_written(&stmt).is_none(),",
+            '        "a refused fold must leave the condition alone");',
+        ]
+    elif kind == "cnn_refuse_worded":
+        out += [
+            f"    let mut stmt = cnn_stmt(cnn_cond({nw}, cnn_inner(&[{argv}]), {specs}));",
+            "    assert!(!native_command_noop_cond(&mut stmt),",
+            '        "a worded `command` must keep the shell-out");',
+            "    assert!(cnn_written(&stmt).is_none());",
+            "    // the refusal is right: the answer depends on the WORD",
+            "    assert_eq!(cnn_bash(\"! command -v ls\"), 1, \"ls resolves\");",
+            '    assert_eq!(cnn_bash("! command -v no-such-cmd-sh2perl"), 0,',
+            '        "an unknown name flips the condition, so no constant is decided");',
+        ]
+    elif kind == "cnn_refuse_noredirect":
+        out += [
+            "    let call = IrExpr::Call { func: \"builtin\".to_string(),",
+            f"        args: vec![st({lit(words[0])}), IrExpr::Array(vec![{rest}])] }};",
+            "    let cond = if " + nw + " {",
+            "        IrExpr::BinOp { op: BinOpKind::Not, lhs: Box::new(call.clone()),",
+            "            rhs: Box::new(IrExpr::Bool(false)) }",
+            "    } else { call };",
+            "    let mut stmt = cnn_stmt(cond);",
+            "    assert!(!native_command_noop_cond(&mut stmt),",
+            '        "without a `redirect` Call there is no sink and no decision");',
+            "    assert!(cnn_written(&stmt).is_none());",
+        ]
+    elif kind == "cnn_block_refuse":
+        out += [
+            "    let inner = IrStmt::Block(vec![cnn_inner(&[\"command\"]), cnn_inner(&[\"command\"])]);",
+            f"    let mut stmt = cnn_stmt(cnn_cond({nw}, inner, {specs}));",
+            "    assert!(!native_command_noop_cond(&mut stmt),",
+            '        "a redirect body of two statements is not one status");',
+            "    assert!(cnn_written(&stmt).is_none());",
+        ]
+    elif kind == "cnn_d3_devnull":
+        out += [
+            f"    let mut stmt = cnn_stmt(cnn_cond({nw}, cnn_inner(&[{argv}]), {specs}));",
+            "    assert!(native_command_noop_cond(&mut stmt));",
+            f"    assert_eq!(cnn_written(&stmt), Some({'true' if pin['expect'] else 'false'}));",
+            "    // d3a measured: the redirect succeeds and `command` exits 0,",
+            "    // so bash's plain condition is TRUE where the fold wrote false",
+            "    assert_eq!(cnn_bash(\"command > /dev/null\"), 0);",
+        ]
+    elif kind == "cnn_d3_dynamic":
+        out += [
+            "    let dir = std::env::temp_dir();",
+            "    let inp = dir.join(format!(\"cnn_in_{}.txt\", std::process::id()));",
+            "    let outp = dir.join(format!(\"cnn_out_{}.txt\", std::process::id()));",
+            "    std::fs::write(&inp, \"x\").unwrap();",
+            "    std::fs::write(&outp, \"\").unwrap();",
+            "    let (i, o) = (inp.to_str().unwrap(), outp.to_str().unwrap());",
+            f"    let mut stmt = cnn_stmt(cnn_cond({nw}, cnn_inner(&[{argv}]),",
+            "        vec![cnn_spec(0, i), cnn_spec(1, o)]));",
+            "    assert!(native_command_noop_cond(&mut stmt));",
+            f"    assert_eq!(cnn_written(&stmt), Some({'true' if pin['expect'] else 'false'}));",
+            "    // d3b measured: with openable files `! command <in >out` is FALSE,",
+            "    // the opposite of the constant the fold wrote",
+            "    assert_eq!(cnn_bash(&format!(\"! command <'{}' >'{}'\", i, o)), 1);",
+            "    std::fs::remove_file(&inp).ok();",
+            "    std::fs::remove_file(&outp).ok();",
+        ]
+    elif kind == "cnn_bash_empty":
+        out += [
+            "    // the law's premise: an empty redirect target can never be opened",
+            "    assert_eq!(cnn_bash(\"command <'' >''\"), 1);",
+            "    assert_eq!(cnn_bash(\"! command <'' >''\"), 0);",
+            "    // and `command` itself succeeds when the redirect does not fail",
+            "    assert_eq!(cnn_bash(\"command\"), 0);",
+        ]
+    else:
+        raise SystemExit(f"unknown command_noop_cond kind {kind}")
+    out.append("}")
+    return out
+
+
 FAMILIES = {
     "f1": (RUST_HELPERS, emit_pin),
     "status_reads": (STATUS_HELPERS, emit_status_pin),
@@ -919,6 +1093,7 @@ FAMILIES = {
     "grep": (GREP_HELPERS, emit_grep_pin),
     "pipeline": (PIPELINE_HELPERS, emit_pipeline_pin),
     "command_v": (COMMAND_V_HELPERS, emit_command_v_pin),
+    "command_noop_cond": (COMMAND_NOOP_COND_HELPERS, emit_command_noop_cond_pin),
 }
 
 

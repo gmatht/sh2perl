@@ -1,5 +1,5 @@
 # verus-sync-coverage manifest: grep_literal_fold
-# source sha: shir_native_stmt=4b19d676d789
+# source sha: shir_native_stmt=a2707f9280c3
 # (the six-line `#[cfg(test)] #[path = "grep_pin_tests.rs"] mod pin_tests_grep;`
 #  registration appended at EOF is the only difference from the file this
 #  proof's functions were read in; `grep_output`, `word_boundary_hit`,

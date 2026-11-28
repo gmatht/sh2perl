@@ -1,0 +1,109 @@
+# verus-sync-coverage manifest: shir_native_command_noop_cond
+# source sha: shir_native_stmt=a2707f9280c3  proof sha: df9ec95b9b5d
+# source: src/transforms/shir_native_stmt.rs (cluster G, part 3:
+#   native_command_noop_cond 6617, called from transform_stmt's If arm at 143)
+# This is the TENTH proved cluster of the decomposition in shir_native_stmt_plan.md
+# (C, H, E, B, D1, D2, D3, F1, F2, the constant pipeline and the command -v
+# decision came first); A, F3, F4 and the rest of G are open.
+#
+# THE LAW.  The fold is the only one in shir_native_stmt.rs that rewrites a
+# CONDITION into a constant.  It accepts `redirect(Call{builtin|exec,
+# [Str "command", Array []]}, specs…)`, optionally behind one `!`, and writes
+# `IrExpr::Bool(not_wrapped)`.  What it is really saying is "the redirects fail,
+# so the command never runs": in bash the redirects are performed first, and
+# `command` with no arguments would succeed (status 0) — it is the REDIRECT that
+# fails.  An empty target (`<''`, `>''`) can never be opened, so that case is
+# statically decided.
+#   * status_law: given that every spec targets the empty string and there is at
+#     least one spec, fold(c) == Some(not_wrapped) AND bash's status is 1 AND
+#     fold(c) == Some(decided_truth(not_wrapped, 1)).  The fold is a shape match
+#     (fold, §2); the shell side is run_status/decided_truth (§3), written from
+#     the redirect-then-command order and never mentioning the fold.
+#   * redirect_failure_dominates / no_specs_command_succeeds /
+#     empty_target_makes_the_redirect_fail: the semantic side on its own.
+#   * the_empty_target_is_what_the_law_needs: the same fold answer with no specs
+#     at all has bash status 0 — the empty target is load-bearing, not decoration.
+#   * refusals (each proved, and each merely CONSERVATIVE): a worded command
+#     (worded_command_is_refused), another program (other_name_is_refused),
+#     another launcher spelling (other_func_is_refused), a redirect body that is
+#     not exactly one Call statement (block_inner_is_refused), a condition with no
+#     redirect Call (a_non_redirect_cond_is_refused), and a double `!`
+#     (only_one_not_is_stripped — the fold strips at most one Not).
+#     refusal_is_conservative proves the point for the empty-target case: the
+#     answer is already 1 whatever the words are, and the fold still declines.
+#
+# d3 (a RECORDED divergence, not fixed here; the fix is a source guard that
+# requires every spec's target to be the empty string):
+#   d3a `if command > /dev/null` — the redirect succeeds and `command` exits 0,
+#       so bash's condition is TRUE; the fold writes false.  Pinned by
+#       pin_the_fold_ignores_the_target and MEASURED with bash.
+#   d3b `if ! command <$IN >$OUT` (the corpus' own lex-dot-in-var.sh shape) —
+#       with openable files bash's `!` is FALSE; the fold writes true.  Pinned by
+#       pin_a_dynamic_target_is_a_guess and measured with two temp files.
+#   the_fold_never_inspects_the_specs: the fold fires on ANY spec sequence, which
+#   is exactly the guard d3 needs and does not have.
+#
+# RESIDUE, stated not claimed: specs are modelled by TARGET only (the fold reads
+# fd and mode not at all, so modelling them would prove nothing extra); `words`
+# is modelled by its LENGTH (the fold calls `words.is_empty()` and never looks
+# inside); `builtin` and `exec` are one Func::Direct (the fold treats them alike
+# and both mean "run directly").  A `redirect` Call with ZERO specs is excluded
+# by the law's `specs.len() > 0`: the parser emits a redirect Call only when a
+# redirect was written, and the fold's zero-spec case is covered by d3's shape
+# (a fold answer with no redirect at all), not by the law.
+#
+# Out of model: which fd a spec redirects (the fold ignores it), whether a
+# non-empty literal target will open (d3), `command`'s own options handling, and
+# the effect of the If's bodies (the fold only rewrites the condition).
+
+[pins]
+pin pin_a_noop_command_with_an_empty_target_folds_to_false -> test pin_a_noop_command_with_an_empty_target_folds_to_false: MAPPED
+pin pin_a_not_wrapped_noop_command_folds_to_true -> test pin_a_not_wrapped_noop_command_folds_to_true: MAPPED
+pin pin_a_worded_command_is_refused -> test pin_a_worded_command_is_refused: MAPPED
+pin pin_a_command_without_a_redirect_is_refused -> test pin_a_command_without_a_redirect_is_refused: MAPPED
+pin pin_a_non_command_inner_is_refused -> test pin_a_non_command_inner_is_refused: MAPPED
+pin pin_a_block_inner_is_refused -> test pin_a_block_inner_is_refused: MAPPED
+pin pin_the_fold_ignores_the_target -> test pin_the_fold_ignores_the_target: MAPPED
+pin pin_a_dynamic_target_is_a_guess -> test pin_a_dynamic_target_is_a_guess: MAPPED
+pin pin_an_empty_target_really_fails -> test pin_an_empty_target_really_fails: MAPPED
+
+[guards]
+guard law status_law (the fold's constant == bash's redirect-then-command status): PRESENT
+guard law redirect_failure_dominates (a failing redirect decides the status): PRESENT
+guard law no_specs_command_succeeds (`command` alone exits 0): PRESENT
+guard law the_empty_target_is_what_the_law_needs (tightness of the premise): PRESENT
+guard independent side: run_status models bash's redirect-first order, not the fold: PRESENT
+guard refusal: worded_command_is_refused (the answer depends on the word): PRESENT
+guard refusal: other_name_is_refused (another program's status is unknown): PRESENT
+guard refusal: other_func_is_refused (another launcher's status is unknown): PRESENT
+guard refusal: block_inner_is_refused (a multi-statement body is not one status): PRESENT
+guard refusal: a_non_redirect_cond_is_refused (no redirect Call, no decision): PRESENT
+guard refusal: only_one_not_is_stripped (`!!` is not double-negated): PRESENT
+guard conservatism: refusal_is_conservative (refusing a decided shape loses a rewrite only): PRESENT
+guard d3a: `command > /dev/null` is decided wrongly (recorded, pinned, measured with bash): PRESENT
+guard d3b: a dynamic target is a guess (recorded, pinned, measured with temp files): PRESENT
+guard fd, mode, literal-openability, `command` options, If bodies: OUT OF MODEL
+guard the rest of cluster G (let/declare, trap, subshell, normalize, perl folds): NOT THIS PROOF
+
+[counts]
+25 verified, 0 errors (verus --triggers-mode silent --rlimit 40 shir_native_command_noop_cond.rs)
+mutants measured 2026-11-28 against that baseline (proof sha df9ec95b9b5d), each
+  restored byte-identically and the sha re-checked:
+    m1 the Not flag inverted (Some(c.not_wrapped) -> Some(!c.not_wrapped))  16v/9e
+    m2 a worded `command` accepted (nwords == 0 -> true)                    22v/3e
+    m3 any program accepted (drops name == Name::Command)                   23v/2e
+    m4 any launcher accepted (drops f == Func::Direct)                      24v/1e
+    m5 decided_truth inverted (s != 0 <-> s == 0)                           18v/7e
+    m6 a failing redirect reported as status 0 (Some(1) -> Some(0))         20v/5e
+    m7 a non-redirect condition folds (Shape::Other -> Some(false))         22v/3e
+
+[exec]
+exec pin_a_block_inner_is_refused (pin_a_block_inner_is_refused): PASS
+exec pin_a_command_without_a_redirect_is_refused (pin_a_command_without_a_redirect_is_refused): PASS
+exec pin_a_dynamic_target_is_a_guess (pin_a_dynamic_target_is_a_guess): PASS
+exec pin_a_non_command_inner_is_refused (pin_a_non_command_inner_is_refused): PASS
+exec pin_a_noop_command_with_an_empty_target_folds_to_false (pin_a_noop_command_with_an_empty_target_folds_to_false): PASS
+exec pin_a_not_wrapped_noop_command_folds_to_true (pin_a_not_wrapped_noop_command_folds_to_true): PASS
+exec pin_an_empty_target_really_fails (pin_an_empty_target_really_fails): PASS
+exec pin_the_fold_ignores_the_target (pin_the_fold_ignores_the_target): PASS
+exec pin_a_worded_command_is_refused (pin_a_worded_command_is_refused): PASS

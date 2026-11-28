@@ -1,5 +1,5 @@
 # verus-sync-coverage manifest: shir_native_while_multi
-# source sha: shir_native_stmt=4b19d676d789  proof sha: a6fe35acbaf5
+# source sha: shir_native_stmt=a2707f9280c3  proof sha: a6fe35acbaf5
 #   RE-AUDITED 2026-11-28 at e45e2f3c2983 (the recorded value names d3e7fbe29
 #   "perl: validate printf operands the way bash does"): native_while_multi_cond were
 #   extracted from both revisions and diffed -- byte-identical.

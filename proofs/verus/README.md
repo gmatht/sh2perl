@@ -9375,6 +9375,44 @@ plus one literal missing name, gated on the shape, the `-v` flag and the sink.
 Declared out of model: PATH order and shadowing, aliases and functions,
 `command -v`'s output format for builtins and keywords, and extra redirect specs.
 
+### Cluster G (part 3) — the `! command <'' >''` condition fold (25 obligations + 9 executed pins)
+
+    verus --triggers-mode silent --rlimit 40 proofs/verus/shir_native_command_noop_cond.rs
+    -> verification results:: 25 verified, 0 errors
+
+The only fold in `shir_native_stmt.rs` that rewrites a CONDITION into a constant.
+It accepts `redirect(Call{builtin|exec, [Str "command", Array []]}, specs…)`,
+optionally behind one `!`, and writes `Bool(not_wrapped)` — a statement about
+the REDIRECT, since `command` with no arguments would itself succeed.
+
+- **Two independent definitions.** `fold` is the pass's shape match;
+  `run_status` is bash's order of operations — perform the redirects (an empty
+  target can never be opened, status 1), then run `command` (status 0).
+  `status_law` joins them where the redirect is statically decided, and
+  `redirect_failure_dominates` / `no_specs_command_succeeds` state the shell side
+  on its own. `the_empty_target_is_what_the_law_needs` shows the premise is
+  tight: the same fold answer with no specs has status 0.
+- **Refusals are conservatisms, not requirements.** A worded `command -v X`,
+  another program, another launcher spelling, a redirect body that is not exactly
+  one Call, a non-redirect condition, and a double `!` are all refused;
+  `refusal_is_conservative` proves the refused empty-target case is already
+  decided — the fold loses a rewrite, never correctness.
+- **d3, recorded not fixed.** The fold never inspects the specs, so it answers
+  questions about the filesystem: `if command > /dev/null` (bash TRUE, fold
+  `false`) and `if ! command <$IN >$OUT`, the corpus' own `lex-dot-in-var.sh`
+  shape (bash FALSE with openable files, fold `true`). Both are pinned
+  (`pin_the_fold_ignores_the_target`, `pin_a_dynamic_target_is_a_guess`) and
+  measured with bash; `the_fold_never_inspects_the_specs` is the missing guard.
+  A later stage's fix is a source gate requiring every spec's target to be empty.
+- **Mutants** (sha `df9ec95b9b5d`, each restored byte-identically): Not flag
+  inverted 16v/9e; worded `command` accepted 22v/3e; any program accepted
+  23v/2e; any launcher accepted 24v/1e; `decided_truth` inverted 18v/7e; a
+  failing redirect reported as 0 20v/5e; a non-redirect condition folded 22v/3e.
+- **Residue.** Specs are modelled by target only (the fold reads neither fd nor
+  mode); `words` by its length; `builtin`/`exec` are one `Func::Direct`; the law
+  requires at least one spec, since a zero-spec `redirect` Call is not a parse
+  product.
+
 ## `shir_native_stmt.rs` — no single law; a decomposition plan (cluster C proved)
 
     proofs/verus/shir_native_stmt_plan.md

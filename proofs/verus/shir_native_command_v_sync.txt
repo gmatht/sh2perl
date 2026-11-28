@@ -1,5 +1,7 @@
 # verus-sync-coverage manifest: shir_native_command_v
-# source sha: shir_native_stmt=4b19d676d789  proof sha: 29fa8993181d
+# source sha: shir_native_stmt=a2707f9280c3  proof sha: 29fa8993181d
+#   RE-AUDITED: the drift from 4b19d676d789 to a2707f9280c3 is the generated pin-test module
+#   registration appended at EOF (outside every fold this manifest models).
 # source: src/transforms/shir_native_stmt.rs (cluster G, part 2:
 #   native_command_v 2116, command_v_redirect_truth 2153, redirect_to_devnull 2175)
 # This is the NINTH proved cluster of the decomposition in shir_native_stmt_plan.md
