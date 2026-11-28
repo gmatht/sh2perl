@@ -179,6 +179,24 @@
 #
 #   export e=hi; echo "[$e]"   bash: [hi]       perl: [] + uninitialized warning
 #
+# ── A missing input file: bash diagnoses the redirect, our `wc` does not ──
+#
+# examples/000__04h_complex_examples.sh calls a helper with a sibling script's
+# name that only exists when the cwd IS examples/; the harness runs from a
+# separate work dir, so bash's `< "$file"` redirect fails. STDOUT and the exit
+# status match byte-for-byte (both print an empty size) — only the diagnostic
+# differs, which is why `tests/renderer_behaviour.rs` compares example stderr
+# only for the tier1 fixtures.
+#
+#   get_file_size 000__01_file_directory_operations.sh
+#   (get_file_size does: local size=`wc -c < "$file"`)
+#     bash:  000__04h_complex_examples.sh: line 43: 000__01_file_directory_operations.sh: No such file or directory
+#     perl:  (nothing on stderr)
+#
+# Same class as the redirect-diagnostic-prefix entry above: a shell's own
+# redirect diagnostic has no Perl equivalent, and the branch a script takes
+# (`$?`, stdout) already agrees.
+#
 # ── Backtick bodies that cannot fold still hand their inner `$()` to a shell ──
 #
 # A backtick body with a native capture (`` `basename $(pwd)` ``) is computed

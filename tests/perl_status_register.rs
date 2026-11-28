@@ -36,16 +36,46 @@ fn status_codes_are_shifted_into_the_register() {
     assert!(out.contains("<< 8"), "unshifted register write:\n{out}");
 }
 
-/// A source `$?` read still sees the shell CODE: the mirror
-/// `$CHILD_ERROR` is refreshed by every register write.
+/// A source `$?` read still sees the shell CODE.
+///
+/// Two carriers are valid and the renderer picks by liveness: the
+/// `$CHILD_ERROR` mirror (refreshed by every register write) for programs
+/// that move the status themselves, or a shifted read of the register
+/// (`($? >> 8)`) when the mirror would be dead. An UNSHIFTED `$?` read is the
+/// bug this pins — Perl's `$?` is a wait status, so it would print 256.
+///
+/// The text check says a shifted carrier exists; the runtime check says the
+/// value is the one bash prints, which is what a script branches on.
 #[test]
 fn a_source_status_read_keeps_the_code() {
-    let out = render("false\necho \"rc=$?\"\n");
-    assert!(out.contains("$CHILD_ERROR"), "the $? read lost its carrier:\n{out}");
+    let src = "false\necho \"rc=$?\"\n";
+    let out = render(src);
     assert!(
-        out.contains("$CHILD_ERROR = $? >> 8"),
-        "the mirror is not refreshed on write:\n{out}"
+        out.contains("$CHILD_ERROR") || out.contains("$? >> 8"),
+        "the $? read lost its carrier:\n{out}"
     );
+    assert!(
+        !out.contains("print(\"rc=\" . ($?),"),
+        "an UNSHIFTED $? read survived (it prints the wait status):\n{out}"
+    );
+
+    // Behaviour: bash and the render must print the same line.
+    let dir = std::env::temp_dir();
+    let stamp = std::process::id();
+    let sh = dir.join(format!("sh2_status_read_{stamp}.sh"));
+    let pl = dir.join(format!("sh2_status_read_{stamp}.pl"));
+    std::fs::write(&sh, src).expect("write script");
+    std::fs::write(&pl, &out).expect("write render");
+    let run = |cmd: &mut std::process::Command| {
+        let o = cmd.output().expect("run");
+        String::from_utf8_lossy(&o.stdout).into_owned()
+    };
+    let b = run(std::process::Command::new("bash").arg(&sh));
+    let p = run(std::process::Command::new("perl").arg(&pl));
+    let _ = std::fs::remove_file(&sh);
+    let _ = std::fs::remove_file(&pl);
+    assert_eq!(b, p, "a `$?` read diverged from bash");
+    assert_eq!(b.trim(), "rc=1", "bash reference itself moved: {b:?}");
 }
 
 /// `((i++))` writes a status that must not be clobbered by precedence:
