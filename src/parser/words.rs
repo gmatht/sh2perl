@@ -70,6 +70,13 @@ fn append_plain_text(word: &mut Word, fragment: &str) -> bool {
             *word = Word::StringInterpolation(StringInterpolation { parts }, None);
             true
         }
+        // A backtick substitution with text glued on: `` `pwd`-x ``.
+        Word::CommandSubstitution(cmd, _) => {
+            let mut parts = vec![StringPart::CommandSubstitution(cmd.clone())];
+            parts.push(StringPart::Literal(fragment.to_string()));
+            *word = Word::StringInterpolation(StringInterpolation { parts }, None);
+            true
+        }
         _ => false,
     }
 }
@@ -304,6 +311,24 @@ fn merge_contiguous_quoted_fragments(
                 }
                 continue;
             }
+            // Adjacent backtick substitution (`` `a``b` ``, `` `pwd`/`basename x` ``,
+            // `pre`cmd`post`): another PART of the same word, never a reason to
+            // stop — dropping it lost the text and left the token stream
+            // misaligned, which swallowed the statements that followed.
+            Some(Token::BacktickChar) => {
+                let sub = parse_backtick_word(lexer)?;
+                if !merge_expansion_into_word(word, sub) {
+                    break;
+                }
+                continue;
+            }
+            Some(Token::BacktickString) => {
+                let sub = parse_backtick_command_substitution(lexer)?;
+                if !merge_expansion_into_word(word, sub) {
+                    break;
+                }
+                continue;
+            }
             // Literal continuation after a single-token word: `$$/x`, `$var/x`,
             // `'a'-suffix`. Same token set the combine loop treats as
             // word-continuation characters (dead in branch A — the loop already
@@ -403,47 +428,67 @@ pub fn parse_word(lexer: &mut Lexer) -> Result<Word, ParserError> {
     append_adjacent_cr(lexer, w)
 }
 
+/// Scan one backtick command substitution (the opening `Token::BacktickChar`
+/// must be at the cursor) and parse its body.
+///
+/// Callers must NOT return the result on its own: bash backticks are a WORD
+/// part, so `k=`pwd`-`pwd`` and ``m=pre`echo hi`post`` continue with more
+/// text (and possibly more backticks) glued to the same word. Returning here
+/// dropped everything after the first pair — and, because the leftover
+/// tokens were never consumed, the following STATEMENTS too. Use
+/// `merge_contiguous_quoted_fragments` afterwards.
+fn parse_backtick_word(lexer: &mut Lexer) -> Result<Word, ParserError> {
+    lexer.next(); // consume the opening backtick
+    let mut cmd_content = String::new();
+    while let Some(token) = lexer.peek() {
+        match token {
+            Token::BacktickChar => {
+                lexer.next(); // consume the closing backtick
+                break;
+            }
+            _ => {
+                if let Some(text) = lexer.get_current_text() {
+                    cmd_content.push_str(&text);
+                }
+                lexer.next();
+            }
+        }
+    }
+    if crate::debug::is_debug_enabled() {
+        eprintln!("DEBUG: Backtick content: '{}'", cmd_content);
+    }
+    // A nested `$(…)` inside the body must stay a real substitution: the
+    // body text is parsed as shell, so its `$()` reaches the IR as an inner
+    // capture, never as a literal `$(`.
+    match crate::parser::commands::parse_pipeline_from_text(&cmd_content) {
+        Ok(command) => {
+            if crate::debug::is_debug_enabled() {
+                eprintln!("DEBUG: Successfully parsed backtick command: {:?}", command);
+            }
+            Ok(Word::CommandSubstitution(Box::new(command), None))
+        }
+        Err(e) => {
+            eprintln!(
+                "DEBUG: Failed to parse backtick command '{}': {:?}",
+                cmd_content, e
+            );
+            Ok(Word::Literal(format!("`{}`", cmd_content), None))
+        }
+    }
+}
+
 fn parse_word_inner(lexer: &mut Lexer) -> Result<Word, ParserError> {
-    // Handle backtick command substitution first
+    // Backtick command substitution OPENING the word. The word does not end
+    // there: `pwd`-suffix`, `pre`cmd`post` and `` `a``b` `` are one word with
+    // the substitution as its first part.
     if matches!(lexer.peek(), Some(Token::BacktickChar)) {
         if crate::debug::is_debug_enabled() {
             eprintln!("DEBUG: Found backtick in parse_word");
         }
-        lexer.next(); // consume the opening backtick
-        let mut cmd_content = String::new();
-        while let Some(token) = lexer.peek() {
-            match token {
-                Token::BacktickChar => {
-                    lexer.next(); // consume the closing backtick
-                    break;
-                }
-                _ => {
-                    if let Some(text) = lexer.get_current_text() {
-                        cmd_content.push_str(&text);
-                    }
-                    lexer.next();
-                }
-            }
-        }
-        if crate::debug::is_debug_enabled() {
-            eprintln!("DEBUG: Backtick content: '{}'", cmd_content);
-        }
-        // Parse the command content
-        match crate::parser::commands::parse_pipeline_from_text(&cmd_content) {
-            Ok(command) => {
-                if crate::debug::is_debug_enabled() {
-                    eprintln!("DEBUG: Successfully parsed backtick command: {:?}", command);
-                }
-                return Ok(Word::CommandSubstitution(Box::new(command), None));
-            }
-            Err(e) => {
-                eprintln!(
-                    "DEBUG: Failed to parse backtick command '{}': {:?}",
-                    cmd_content, e
-                );
-                return Ok(Word::Literal(format!("`{}`", cmd_content), None));
-            }
-        }
+        let mut word = parse_backtick_word(lexer)?;
+        merge_contiguous_quoted_fragments(lexer, &mut word)?;
+        lexer.skip_inline_whitespace_and_comments();
+        return Ok(word);
     }
 
     if let Some(word) = parse_at_prefixed_word(lexer) {

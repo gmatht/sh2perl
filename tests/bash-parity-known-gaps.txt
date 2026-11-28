@@ -179,6 +179,22 @@
 #
 #   export e=hi; echo "[$e]"   bash: [hi]       perl: [] + uninitialized warning
 #
+# ── Backtick bodies that cannot fold still hand their inner `$()` to a shell ──
+#
+# A backtick body with a native capture (`` `basename $(pwd)` ``) is computed
+# in Perl and matches bash exactly. A body with a side effect that needs a
+# SUBSHELL (`` `cd nested && basename $(pwd)` ``) keeps the outer shell-text
+# form, so the inner substitution is emitted as `$('pwd')` INSIDE that text:
+# still a real substitution the child evaluates (never a literal `$(`), and
+# stdout/stderr/exit match bash — but the statement forks.
+#
+#   z=`cd nested && basename $(pwd)`
+#     bash:  nested        (no fork: bash's backtick IS a subshell)
+#     perl:  nested        (forked through __sh_pipe_capture)
+#
+# Nothing to fix in the escaping — `$(` is not swallowed — only the missing
+# in-process subshell for a multi-command backtick body.
+#
 # ── One remaining builtin fork: a bare stdout redirect on `printf` ───────
 #
 # `printf … > FILE` still goes through the pipeline front end
