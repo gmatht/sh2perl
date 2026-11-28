@@ -1,5 +1,12 @@
 # verus-sync-coverage manifest: shir_native_while_multi
-# source sha: shir_native_stmt=93c9e845a066  proof sha: a6fe35acbaf5
+# source sha: shir_native_stmt=e45e2f3c2983  proof sha: a6fe35acbaf5
+#   RE-AUDITED 2026-11-28 at e45e2f3c2983 (the recorded value names d3e7fbe29
+#   "perl: validate printf operands the way bash does"): native_while_multi_cond were
+#   extracted from both revisions and diffed -- byte-identical.
+#   The file's 60/20 diff since that revision is the render-site counters
+#   becoming per-render thread-locals, the grep redirect parse, the sort
+#   comparison globals, native_diff_files_stmt, and a `#[cfg(test)]` pin-test
+#   module appended at EOF -- none of it in this cluster.
 # source: src/transforms/shir_native_stmt.rs (cluster D3, remaining function:
 #   native_while_multi_cond 5957; works with native_while_test_cond 5892 and
 #   render_test_words 1301)
