@@ -76,25 +76,47 @@
 //  Run: verus --triggers-mode silent --rlimit 40 proofs/verus/status_reads_traversal.rs
 // ─────────────────────────────────────────────────────────────────────────
 
-//  ── measured mutants (2026-11-27 revision: 70 verified, 0 errors baseline) ──
+//  ── verification (measured 2026-11-28) ──────────────────────────────────
 //
-//    run: verus --triggers-mode silent --rlimit 40 proofs/verus/status_reads_traversal.rs
-//    (a) read walk drops the Cap/backtick arm ..... 69v/1e, at `reads_exact_x`
-//    (b) "a literal text is never a read" ......... rejected at
-//        simplification (`pin_bodies_are_localised` computes false: the
-//        test-operand shape stops being a read at all)
-//    (c) nested walk drops Redirect ................ rejected at
-//        simplification (`pin_nested_redirect_reads_before_store`)
-//    (d) the `If` arm called a must-store while `emit_s` stops writing the
-//        register for an `If` fragment ............ rejected at
-//        simplification (`pin_control_flow_stores` computes false) — the
-//        arm is only sound because the renderer writes `$?` on every path
+//    verus 0.2026.10.18.7d82994, rust 1.99.1:
+//      verus --triggers-mode silent --rlimit 40 status_reads_traversal.rs
+//      -> 70 verified, 0 errors
+//    the liveness file this discharges keeps its own baseline:
+//      status_reads.rs -> 28 verified, 0 errors
 //
-//  The simplification rejections are the repo's usual class (typeset_attrs
-//  records the same for its leading-zero mutant): the concrete pins are
-//  strong enough to refute the mutant before the verifier runs, so those
-//  rows carry no verified/error count. Restored byte-identically after every
-//  run (sha256 in `status_reads_traversal_sync.txt`).
+//  ── measured mutants ────────────────────────────────────────────────────
+//  Each applied ALONE to a copy, run with the same pin, then restored from a
+//  recorded sha256 (the file's sha256 before == after; see
+//  `status_reads_traversal_sync.txt`). Baseline 70v/0e.
+//
+//    (a) read walk drops the Cap/backtick arm (`X::Cap(_) => false`)
+//          -> 69v/1e, assertion in `reads_exact_x` (the walk misses a read)
+//    (b) the test operand never reports a read (`X::Var(_) => false`)
+//          -> 69v/1e, assertion in `reads_exact_x`. NOTE: the earlier note
+//             in this header called this a simplification rejection; that
+//             was wrong, and the measurement above is the correct one.
+//    (b') literal text never a read (`Part::LitQ(_) => false`)
+//          -> 69v/1e, assertion in `reads_exact_x`
+//    (c) `If` trusted as a must-store while `emit_s` stops writing the
+//        register for an `If` fragment
+//          -> rejected at simplification on `pin_control_flow_stores`: the
+//             pin refutes it before the theorem is reached
+//    (c') the same mutant on an arm the pins do NOT cover (DeclArr
+//         must-store while `emit_s` stops writing)
+//          -> 69v/1e, assertion in `stores_is_must`'s DeclArr arm, i.e. the
+//             must-store refinement is load-bearing without any pin
+//    (d) nested walk ignores Redirect
+//          -> rejected at simplification on
+//             `pin_nested_redirect_reads_before_store`
+//    (d') nested walk drops an unpinned arm (Subshell)
+//          -> 69v/1e, `nested_complete` exhausts the rlimit: a forgotten
+//             arm in the nested recursion is not silent either
+//
+//  So two of the four named mutants lose the theorem itself and two are
+//  refuted earlier by a concrete pin; (c')/ (d') show the same shape of
+//  mutant going red on the theorem when no pin covers the arm. The
+//  simplification rejections are the repo's usual class (typeset_attrs
+//  records the same for its leading-zero mutant).
 //
 use vstd::prelude::*;
 

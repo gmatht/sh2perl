@@ -1,5 +1,5 @@
 # verus-sync-coverage manifest: status_reads_traversal
-# source sha: status_reads=32b0936fb8b7  proof sha: dff0d2f529a1
+# source sha: status_reads=32b0936fb8b7  proof sha: ad95c02d8d5a
 
 [pins]
 pin pin_test_operand_is_a_read -> test detects_test_operand_status: MAPPED

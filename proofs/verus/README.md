@@ -8834,18 +8834,24 @@ renderer writes (`emit_s`), or orders the events a nested list produces
 
 ### Mutants, measured
 
-Counted: dropping the `Cap`/backtick arm gives **69 verified, 1 error**, at
-`reads_exact_x`. Refuted one stage earlier, at simplification, by the
-concrete pins: a literal text that is never a read
-(`pin_bodies_are_localised` — the test-operand shape stops being a read),
-the nested walk dropping `Redirect`
-(`pin_nested_redirect_reads_before_store`), and calling `If` a must-store
-while `emit_s` stops writing the register for an `If` fragment
-(`pin_control_flow_stores`), which is the check that the arm rests on the
-renderer's placement rather than on the analysis alone — the same rejection
-class the README records for typeset_attrs' leading-zero mutant. Restored
-byte-identically after each run (sha256 in
-`status_reads_traversal_sync.txt`).
+Counted (a verification failure, after the mutation compiles):
+dropping the `Cap`/backtick arm gives **69 verified, 1 error** at
+`reads_exact_x`; the test operand never reporting a read
+(`X::Var(_) => false`) gives the same **69 verified, 1 error** there; a
+literal text never being a read (`Part::LitQ(_) => false`), **69 verified,
+1 error**; the same `If`-must-store shape on an arm no pin covers
+(`DeclArr`) gives **69 verified, 1 error** in `stores_is_must`'s `DeclArr`
+arm; and the nested walk dropping an arm no pin covers (`Subshell`) gives
+**69 verified, 1 error**, `nested_complete` running out of rlimit.
+
+Refuted one stage earlier, at simplification, by the concrete pins: the
+nested walk dropping `Redirect` (`pin_nested_redirect_reads_before_store`)
+and calling `If` a must-store while `emit_s` stops writing the register for
+an `If` fragment (`pin_control_flow_stores`) — the same rejection class the
+README records for typeset_attrs' leading-zero mutant. (An earlier version of
+this section called the literal-text mutant a simplification rejection; the
+measurement above is the correct one.) Restored byte-identically after each
+run (sha256 in `status_reads_traversal_sync.txt`).
 
 ### Scope (read this before quoting it)
 
