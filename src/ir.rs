@@ -1097,6 +1097,19 @@ pub fn set_childe_error_carrier(v: bool) {
 }
 
 pub fn shir_to_perl(prog: &IrProgram) -> String {
+    // Scalar-phase names (env-style vars with a plain assignment) store in
+    // perl scalars and only mirror into %ENV when already exported. This used
+    // to be installed ONLY by `perl_generator_fixed::generate`, so the bare
+    // renderer (this function, reached from the library and the CLI default
+    // path) rendered `K=…` as `$ENV{K}` — publishing an UNEXPORTED shell
+    // variable into the environment a child sees. The set is a pure function
+    // of the program, so it is computed HERE, once per render, for every
+    // entry point (and a render no longer depends on a previous fixed-path
+    // render having installed it).
+    let mut scalar_phase = std::collections::HashSet::new();
+    collect_scalar_phase_vars(&prog.stmts, &mut scalar_phase);
+    set_scalar_phase_vars(scalar_phase);
+
     // Stable per-render loop-status names (golden snapshots pin the text).
     LOOP_STATUS_SEQ.with(|c| c.set(0));
     reset_emission_seqs();
@@ -1674,6 +1687,13 @@ fn first_code_newline(s: &str) -> Option<usize> {
     // idempotent (an already-declared name is skipped), so the fixed path's
     // own call becomes a no-op and both entry points emit identical Perl.
     let out = crate::perl_generator_fixed::declare_renderer_symbols(&out);
+    // Every runtime helper this renderer's lowered code CALLS
+    // (`__sh_glob`, `__sh_fn_status`, the slice helpers,
+    // `strHasPrefix`/`strHasSuffix`) is defined here too: the bare path used
+    // to emit the calls with no sub at all and died with
+    // `Undefined subroutine &main::…`. Idempotent, so the shipped `--fixed`
+    // path's own call is a no-op and both entry points emit identical Perl.
+    let out = crate::perl_generator_fixed::inject_renderer_helpers(out);
 
     out
 }
@@ -5343,6 +5363,58 @@ thread_local! {
 /// `perl_generator_fixed::generate` before anything renders).
 pub(crate) fn set_scalar_phase_vars(names: std::collections::HashSet<String>) {
     SCALAR_PHASE_VARS.with(|s| *s.borrow_mut() = names);
+}
+
+/// Names with a plain (non-export) assignment anywhere in the program:
+/// scalar-phase (`scalar_phase_var`). A union, not a program-point flow — the
+/// guarded publish (`$ENV{N} = $N if exists $ENV{N}`) makes the runtime
+/// `exists` check decide propagation, so an export-first shape
+/// (`export X=1; X=2`) still publishes correctly.
+pub(crate) fn collect_scalar_phase_vars(
+    stmts: &[IrStmt],
+    out: &mut std::collections::HashSet<String>,
+) {
+    for s in stmts {
+        match s {
+            IrStmt::Assign { targets, expr, .. } => {
+                let is_array_rhs = matches!(
+                    expr,
+                    IrExpr::Call { func, .. }
+                        if func == "setArray" || func == "setArrayAppend"
+                );
+                if is_array_rhs {
+                    continue;
+                }
+                for t in targets {
+                    if t.indices.is_empty() && is_env_style_var_name(&t.var) {
+                        out.insert(t.var.clone());
+                    }
+                }
+            }
+            IrStmt::Function { body, .. } => collect_scalar_phase_vars(body, out),
+            IrStmt::Block(stmts) | IrStmt::Subshell(stmts) | IrStmt::Background(stmts) => {
+                collect_scalar_phase_vars(stmts, out)
+            }
+            IrStmt::If {
+                then,
+                elsifs,
+                else_,
+                ..
+            } => {
+                collect_scalar_phase_vars(then, out);
+                for (_, b) in elsifs {
+                    collect_scalar_phase_vars(b, out);
+                }
+                collect_scalar_phase_vars(else_, out);
+            }
+            IrStmt::For { body, .. } | IrStmt::While { body, .. } => {
+                collect_scalar_phase_vars(body, out)
+            }
+            IrStmt::Redirect { inner, .. } => collect_scalar_phase_vars(inner, out),
+            IrStmt::Expr(IrExpr::Arrow(stmts)) => collect_scalar_phase_vars(stmts, out),
+            _ => {}
+        }
+    }
 }
 
 /// Is this name in the program's scalar-phase set?

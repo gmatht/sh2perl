@@ -84,7 +84,7 @@ pub(crate) fn generate_impl(prog: &IrProgram, skip_pass: Option<&str>) -> String
     // installed before ANY rendering — lhs routing, reads and the
     // export arm all consult it.
     let mut scalar_phase = std::collections::HashSet::new();
-    collect_scalar_phase_vars(&prog.stmts, &mut scalar_phase);
+    crate::ir::collect_scalar_phase_vars(&prog.stmts, &mut scalar_phase);
     crate::ir::set_scalar_phase_vars(scalar_phase);
     let fixed = fixups(prog);
     // A program that reads `$?` renders that read through the
@@ -129,28 +129,13 @@ pub(crate) fn generate_impl(prog: &IrProgram, skip_pass: Option<&str>) -> String
     // `__sh_fn_status` helper `fix_cond` introduces is injected here. Gated on
     // the rendered body, same discipline as the renderer's own preamble
     // vars: a program that never calls it gets no dead sub.
-    let mut src = if needs_fn_status_helper(&src) {
-        // `sub` is file scope: it must precede the first use, and Perl
-        // resolves a named sub called without parens at compile time. Put it
-        // right after the `use` block, before any statement runs.
-        inject_before_first_stmt(&src, FN_STATUS_PREAMBLE)
-    } else {
-        src
-    };
-    // Fix 16 — same discipline for the array-slice helper.
-    if needs_slice_helper(&src) {
-        src = inject_before_first_stmt(&src, SLICE_PREAMBLE_2);
-    }
-    // Fix 22 — and for the positional-parameter slice helper.
-    if needs_pos_slice_helper(&src) {
-        src = inject_before_first_stmt(&src, SLICE_PREAMBLE);
-    }
-    // Glob words render natively through `__sh_glob()` (bash's
-    // unmatched-pattern rule keeps the literal word) — same injection
-    // discipline as the slice helpers.
-    if needs_glob_helper(&src) {
-        src = inject_before_first_stmt(&src, GLOB_PREAMBLE);
-    }
+    // Every runtime helper the SHARED renderer calls is defined here, in ONE
+    // place both entry points call: `perl_generator_fixed::generate` and
+    // `ir::shir_to_perl` (which used to emit the CALLS with no definition,
+    // so the bare render died with `Undefined subroutine &main::__sh_glob`
+    // and friends). Idempotent: a helper whose `sub` line is already present
+    // is left alone, so the fixed path's own call is a no-op.
+    let mut src = inject_renderer_helpers(src);
     // The test-lowering transform's affix primitives: `contains` has a
     // native arm in ir_expr_to_perl (`index >= 0`) but
     // `strHasPrefix`/`strHasSuffix` had NONE, so a program whose
@@ -160,9 +145,6 @@ pub(crate) fn generate_impl(prog: &IrProgram, skip_pass: Option<&str>) -> String
     // no corpus example lifts an affix test in an unobserved-status
     // cond, so no gate ever hit the path — probeC in the 2026-10-20
     // callout session did). Same injection discipline as above.
-    if needs_affix_helper(&src) {
-        src = inject_before_first_stmt(&src, AFFIX_PREAMBLE);
-    }
     // Fix 26 turns `print(X, "\n")` into `say X`. The shared renderer adds
     // `use feature 'say'` when IT emits a `say`; a program whose output was
     // all explicit-newline prints gets no such import, and `say` is then a
@@ -172,57 +154,6 @@ pub(crate) fn generate_impl(prog: &IrProgram, skip_pass: Option<&str>) -> String
         src = inject_before_first_stmt(&src, "use feature 'say';\n");
     }
     src
-}
-
-/// Names with a plain (non-export) assignment anywhere in the program:
-/// scalar-phase (ir.rs::scalar_phase_var). A union, not a program-point
-/// flow — the guarded publish (`$ENV{N} = $N if exists $ENV{N}`) makes
-/// the runtime `exists` check decide propagation, so an export-first
-/// shape (`export X=1; X=2`) still publishes correctly.
-fn collect_scalar_phase_vars(stmts: &[IrStmt], out: &mut std::collections::HashSet<String>) {
-    for s in stmts {
-        match s {
-            IrStmt::Assign { targets, expr, .. } => {
-                let is_array_rhs = matches!(
-                    expr,
-                    IrExpr::Call { func, .. }
-                        if func == "setArray" || func == "setArrayAppend"
-                );
-                if is_array_rhs {
-                    continue;
-                }
-                for t in targets {
-                    if t.indices.is_empty()
-                        && crate::ir::is_env_style_var_name(&t.var)
-                    {
-                        out.insert(t.var.clone());
-                    }
-                }
-            }
-            IrStmt::Function { body, .. } => collect_scalar_phase_vars(body, out),
-            IrStmt::Block(stmts) | IrStmt::Subshell(stmts) | IrStmt::Background(stmts) => {
-                collect_scalar_phase_vars(stmts, out)
-            }
-            IrStmt::If {
-                then,
-                elsifs,
-                else_,
-                ..
-            } => {
-                collect_scalar_phase_vars(then, out);
-                for (_, b) in elsifs {
-                    collect_scalar_phase_vars(b, out);
-                }
-                collect_scalar_phase_vars(else_, out);
-            }
-            IrStmt::For { body, .. } | IrStmt::While { body, .. } => {
-                collect_scalar_phase_vars(body, out)
-            }
-            IrStmt::Redirect { inner, .. } => collect_scalar_phase_vars(inner, out),
-            IrStmt::Expr(IrExpr::Arrow(stmts)) => collect_scalar_phase_vars(stmts, out),
-            _ => {}
-        }
-    }
 }
 
 /// The textual post-pass over a rendered program.
@@ -4887,6 +4818,36 @@ sub strHasSuffix {
     return length($__n) <= length($__h) && substr($__h, length($__h) - length($__n)) eq $__n;
 }
 "#;
+
+/// Define every runtime helper the rendered program CALLS, exactly once.
+///
+/// This is the single owner of the helper preambles: the calls are emitted by
+/// the shared lowering, so the definitions belong to the shared renderer, not to
+/// one wrapper. `ir::shir_to_perl` calls it on its own output and
+/// `perl_generator_fixed::generate` calls it again after its text passes — the
+/// second call is a no-op because each helper's `sub` line is already present.
+pub fn inject_renderer_helpers(mut src: String) -> String {
+    // `sub` is file scope: a helper must precede the first use, and Perl
+    // resolves a named sub called without parens at compile time, so each one
+    // is injected right after the `use` block, before any statement runs.
+    let helpers: [(fn(&str) -> bool, &str); 5] = [
+        (needs_fn_status_helper, FN_STATUS_PREAMBLE),
+        (needs_slice_helper, SLICE_PREAMBLE_2),
+        (needs_pos_slice_helper, SLICE_PREAMBLE),
+        (needs_glob_helper, GLOB_PREAMBLE),
+        (needs_affix_helper, AFFIX_PREAMBLE),
+    ];
+    for (needed, preamble) in helpers {
+        let marker = preamble
+            .lines()
+            .find(|l| l.starts_with("sub "))
+            .unwrap_or_default();
+        if needed(&src) && !marker.is_empty() && !src.contains(marker) {
+            src = inject_before_first_stmt(&src, preamble);
+        }
+    }
+    src
+}
 
 /// True when the rendered program calls the affix primitives.
 pub fn needs_affix_helper(perl_src: &str) -> bool {

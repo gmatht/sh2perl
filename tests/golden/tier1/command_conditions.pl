@@ -5,6 +5,8 @@ our $CHILD_ERROR = 0;
 
 use feature 'say';
 
+my @args;
+
 sub strHasPrefix {
     return index($_[0], $_[1]) == 0;
 }
