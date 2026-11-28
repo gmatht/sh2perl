@@ -5028,6 +5028,84 @@ fn parse_ansic_quoted_string(lexer: &mut Lexer) -> Result<Word, ParserError> {
     Ok(Word::Literal(result, None))
 }
 
+/// Read a numeric brace-range endpoint, allowing bash's SIGNED endpoints.
+///
+/// bash expands `{-3..3}`, `{3..-1}` and `{+1..3}` (and drops a leading
+/// `+`). The lexer emits the sign as its own token, so a range endpoint has
+/// to consume `Minus`/`Plus` before the number — but ONLY when a number
+/// follows: `{a,-b}` has a literal `-b`, not an endpoint.
+fn read_signed_number(lexer: &mut Lexer) -> Option<String> {
+    let mut negative = false;
+    if matches!(lexer.peek(), Some(Token::Minus) | Some(Token::Plus)) {
+        if !matches!(
+            lexer.peek_n(1),
+            Some(Token::Number) | Some(Token::PaddedNumber)
+        ) {
+            return None;
+        }
+        negative = matches!(lexer.peek(), Some(Token::Minus));
+        lexer.next(); // consume the sign
+    }
+    match lexer.peek() {
+        Some(Token::Number) | Some(Token::PaddedNumber) => {
+            let text = lexer.get_number_text().ok()?;
+            Some(if negative { format!("-{text}") } else { text })
+        }
+        _ => None,
+    }
+}
+
+/// After a numeric START inside a brace, either consume `..END[..STEP]` into
+/// the running compound or accumulate START as literal text.
+///
+/// `{-3..3}` reaches this through the signed arm and `{1..5}` through the
+/// Number arm; both must behave identically once START is in hand.
+fn number_range_or_literal(
+    lexer: &mut Lexer,
+    acc: &mut Option<String>,
+    compound: &mut Option<Vec<crate::ast::BraceItem>>,
+    start: String,
+) -> Result<(), ParserError> {
+    use crate::ast::{BraceItem, BraceRange};
+    if !matches!(lexer.peek(), Some(Token::Range)) {
+        acc.get_or_insert_with(String::new).push_str(&start);
+        return Ok(());
+    }
+    // The accumulated text belongs to the SAME alternative as the range.
+    if let Some(text) = acc.take() {
+        if !text.is_empty() {
+            compound
+                .get_or_insert_with(Vec::new)
+                .push(BraceItem::Literal(text));
+        }
+    }
+    lexer.next(); // consume '..'
+    let Some(end) = read_signed_number(lexer) else {
+        return Err(ParserError::InvalidSyntax(
+            "Expected number after '..' in brace range".to_string(),
+        ));
+    };
+    let mut step = None;
+    if matches!(lexer.peek(), Some(Token::Range)) {
+        lexer.next(); // consume second '..'
+        let Some(text) = read_signed_number(lexer) else {
+            return Err(ParserError::InvalidSyntax(
+                "Expected number after second '..' in brace range".to_string(),
+            ));
+        };
+        step = Some(text);
+    }
+    compound
+        .get_or_insert_with(Vec::new)
+        .push(BraceItem::Range(BraceRange {
+            start,
+            end,
+            step,
+            format: None,
+        }));
+    Ok(())
+}
+
 fn parse_brace_expansion(lexer: &mut Lexer) -> Result<Word, ParserError> {
     use crate::ast::{BraceExpansion, BraceItem, BraceRange};
 
@@ -5101,51 +5179,19 @@ fn parse_brace_expansion(lexer: &mut Lexer) -> Result<Word, ParserError> {
             }
             Some(Token::Number) | Some(Token::Float) | Some(Token::PaddedNumber) => {
                 let start = lexer.get_number_text()?;
-
-                // Check if this is a range (look for ..)
-                if matches!(lexer.peek(), Some(Token::Range)) {
-                    acc_to_compound(&mut compound, &mut acc);
-                    lexer.next(); // consume '..'
-
-                    if let Some(Token::Number) | Some(Token::PaddedNumber) = lexer.peek() {
-                        let end = lexer.get_number_text()?;
-
-                        // Check if there's a step value (another ..)
-                        if matches!(lexer.peek(), Some(Token::Range)) {
-                            lexer.next(); // consume second '..'
-
-                            if let Some(Token::Number) | Some(Token::PaddedNumber) = lexer.peek() {
-                                let step = lexer.get_number_text()?;
-                                compound.get_or_insert_with(Vec::new).push(BraceItem::Range(BraceRange {
-                                    start,
-                                    end,
-                                    step: Some(step),
-                                    format: None,
-                                }));
-                                continue;
-                            } else {
-                                return Err(ParserError::InvalidSyntax(
-                                    "Expected number after second '..' in brace range".to_string(),
-                                ));
-                            }
-                        } else {
-                            compound.get_or_insert_with(Vec::new).push(BraceItem::Range(BraceRange {
-                                start,
-                                end,
-                                step: None,
-                                format: None,
-                            }));
-                            continue;
-                        }
-                    } else {
-                        return Err(ParserError::InvalidSyntax(
-                            "Expected number after '..' in brace range".to_string(),
-                        ));
-                    }
-                } else {
-                    // Literal number — accumulate into current text
-                    acc.get_or_insert_with(String::new).push_str(&start);
-                }
+                number_range_or_literal(lexer, &mut acc, &mut compound, start)?;
+            }
+            // A SIGNED endpoint starts a range: `{-3..3}` (bash expands it).
+            // The guard keeps a literal `-`/`+` in an alternative (`{a,-b}`)
+            // out of this arm.
+            Some(Token::Minus) | Some(Token::Plus)
+                if matches!(
+                    lexer.peek_n(1),
+                    Some(Token::Number) | Some(Token::PaddedNumber)
+                ) =>
+            {
+                let start = read_signed_number(lexer).expect("guard checked the number");
+                number_range_or_literal(lexer, &mut acc, &mut compound, start)?;
             }
             Some(Token::Identifier) => {
                 let text = lexer.get_identifier_text()?;
