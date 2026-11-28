@@ -1,10 +1,17 @@
 # verus-sync-coverage manifest: uae_terminators
-# source sha: shir=215b4d8f322e (sha256 of src/shir.rs; audited: since
-#   9cf054f19 only ir_stmt_writes_lastexit (Case/Select join the writer
-#   set), ir_expr_reads_status (a block/whileLoop operand is a status read)
-#   and command_to_ir (a compound command in an expression slot lowers to
-#   `block`) changed -- none of stmt_terminates, list_terminates,
-#   is_true_cond, loop_escapes or has_break, the region this models.
+# source sha: shir=879d1775c017 (sha256 of src/shir.rs; RE-AUDITED 2026-11-28
+#   at 7d1c08df8 "Make the Perl render a pure function of the source": the
+#   region this models is BYTE-IDENTICAL across 1de09ce7 (the previously
+#   recorded 215b4d8f322e) and 7d1c08df8 (879d1775c017). Checked by extracting
+#   `pub fn stmt_terminates` .. `pub fn program_observes_pipestatus` -- that is
+#   stmt_terminates, list_terminates, is_true_cond, loop_escapes and its
+#   has_break -- from both revisions and diffing: empty, and both digest
+#   2788087e3730. The `enum IrStmt` variant set is untouched in that range too;
+#   7d1c08df8's 197/79 lines are the render-purity work elsewhere in the file.
+#   Earlier audit, still standing: since 9cf054f19 only ir_stmt_writes_lastexit
+#   (Case/Select join the writer set), ir_expr_reads_status (a block/whileLoop
+#   operand is a status read) and command_to_ir (a compound command in an
+#   expression slot lowers to `block`) changed -- none of the terms above.
 #   The row used to record HEAD's git blob; it now records the content digest,
 #   because the checker has exactly one rule and no alternate digest.)
 # uae=3adb4e485152 (sha256 of src/transforms/unreachable_after_exit.rs)
