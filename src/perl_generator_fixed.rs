@@ -86,38 +86,12 @@ pub(crate) fn generate_impl(prog: &IrProgram, skip_pass: Option<&str>) -> String
     let mut scalar_phase = std::collections::HashSet::new();
     crate::ir::collect_scalar_phase_vars(&prog.stmts, &mut scalar_phase);
     crate::ir::set_scalar_phase_vars(scalar_phase);
-    let fixed = fixups(prog);
-    // A program that reads `$?` renders that read through the
-    // `$CHILD_ERROR` mirror; a program that MOVES the status through a
-    // variable (`$__ps_statusN = $CHILD_ERROR`) needs the mirror kept in
-    // step by every register write. Everything else reads the register
-    // directly and gets the clean form.
-    // Does the SOURCE test a status (`if cmd; then`, `[ "$?" = 0 ]`)? Then
-    // the register is read directly and must not be clobbered by a body
-    // statement's write.
-    let read_carrier = crate::shir::ir_stmts_read_status(&fixed.stmts)
-        || fixed
-            .subs
-            .iter()
-            .any(|sb| crate::shir::ir_stmts_read_status(&sb.body));
-    // The verdict cannot come from the IR alone: the process-substitution
-    // materialisation is a TEXT template, so its `$__ps_statusN =
-    // $CHILD_ERROR` save exists only after rendering. Render once with the
-    // mirror OFF, and if the body turns out to move the value through
-    // `$CHILD_ERROR`, render again with the mirror kept in step.
-    crate::ir::set_childe_error_carrier(false);
-    let src = shir_to_perl(&fixed);
-    // A condition that runs a command (`if ps …; then`) READS the status
-    // through the register: the test's own `system()` set it, and the
-    // `$? = …` written by a body statement would clobber it.
-    let src = if src.contains("$CHILD_ERROR") || src.contains("($? >> 8)") && !read_carrier {
-        crate::ir::set_childe_error_carrier(true);
-        let again = shir_to_perl(&fixed);
-        crate::ir::set_childe_error_carrier(false);
-        again
-    } else {
-        src
-    };
+    let fixed = crate::ir::corrected_program(prog);
+    // The `$CHILD_ERROR` mirror verdict and the mirror-off/mirror-on
+    // re-render are the SHARED renderer's (`ir::shir_to_perl`): it is a
+    // property of the program, and the bare path used to render without the
+    // mirror and read stale statuses.
+    let src = shir_to_perl(prog);
     if std::env::var_os("SH2_DEBUG_PGFIX").is_some() {
         eprintln!("PGFIX-RENDERED:\n{src}");
     }
@@ -179,13 +153,42 @@ fn post_pass_without(src: &str, skip: Option<&str>) -> String {
     let env_skip = std::env::var("SH2_SKIP_TEXT_PASS").ok();
     let skip = skip.or(env_skip.as_deref());
     let mut out = src.to_string();
-    for (name, pass) in text_passes().iter().chain(declaration_passes().iter()) {
+    // The SEMANTIC passes run in the shared renderer (`semantic_post_pass`),
+    // so only the style passes remain here: an entry point difference must not
+    // be able to change what the program MEANS.
+    for (name, pass) in text_passes().iter() {
+        if SEMANTIC_PASSES.contains(name) {
+            continue;
+        }
         if Some(*name) == skip {
             continue;
         }
         out = pass(&out);
     }
     out
+}
+
+/// Text passes that fix MEANING, not style: they run inside the shared
+/// renderer (`ir::shir_to_perl`), so both entry points get the same semantics.
+pub(crate) const SEMANTIC_PASSES: &[&str] = &[
+    "fix_printf_bash_conversions",
+    "fix_printf_b_percent_b",
+    "fix_literal_pipeline_pipestatus",
+];
+
+/// The semantic post-pass the shared renderer runs on its own output: the
+/// printf conversions, the statically-known `PIPESTATUS` array, the
+/// strict-clean declarations, and the runtime helpers the emitted calls need.
+/// Idempotent, so the wrapper's own calls are no-ops.
+pub(crate) fn semantic_post_pass(src: String) -> String {
+    let mut out = src;
+    for (name, pass) in text_passes().iter() {
+        if SEMANTIC_PASSES.contains(name) {
+            out = pass(&out);
+        }
+    }
+    let out = declare_renderer_symbols(&out);
+    inject_renderer_helpers(out)
 }
 
 /// The DECLARATION half of `post_pass`: the renderer-owned flags and the
@@ -2505,7 +2508,7 @@ fn inject_before_first_stmt(src: &str, text: &str) -> String {
 }
 
 /// Apply every IR-level correction to a clone of `prog`.
-fn fixups(prog: &IrProgram) -> IrProgram {
+pub fn fixups(prog: &IrProgram) -> IrProgram {
     let fns = program_function_names(&prog.stmts, &prog.subs);
     if std::env::var_os("SH2_DEBUG_PGFIX").is_some() {
         eprintln!("PGFIX-IN: {:#?}", prog.stmts);
@@ -6376,8 +6379,16 @@ mod retained_pass_tests {
         assert!(in_table("fix_literal_pipeline_pipestatus"));
         let (full, prog) = render("true | false\necho \"${PIPESTATUS[0]},${PIPESTATUS[1]}\"\n");
         let off = generate_impl(&prog, Some("fix_literal_pipeline_pipestatus"));
+        // The rewrite now happens inside the SHARED renderer (so the bare path
+        // gets it too), which makes the wrapper's copy a no-op: the assertion is
+        // that the semantic outcome is present and that skipping the wrapper
+        // pass cannot remove it.
+        assert!(
+            crate::ir::shir_to_perl(&prog).contains("@PIPESTATUS = (0, 1); $? = (__sh_pipe_run("),
+            "{full}"
+        );
         assert!(full.contains("@PIPESTATUS = (0, 1); $? = (__sh_pipe_run("), "{full}");
-        assert!(!off.contains("@PIPESTATUS = (0, 1);"), "{off}");
+        assert_eq!(full, off, "the wrapper copy must be a no-op now");
     }
 
     /// bash's `printf %q` has no Perl conversion: the emitted format is
@@ -6387,12 +6398,15 @@ mod retained_pass_tests {
         assert!(in_table("fix_printf_bash_conversions"));
         let (full, prog) = render_example("parse-dollar-single-quote");
         let off = generate_impl(&prog, Some("fix_printf_bash_conversions"));
-        assert_ne!(full, off, "the %q rewrite no longer fires");
+        // Same move as `literal_pipeline_fills_pipestatus`: the %q rewrite is
+        // part of the shared renderer, so the wrapper's copy is a no-op and the
+        // assertion is on the rendered PROGRAM, not on which layer produced it.
+        assert!(crate::ir::shir_to_perl(&prog).contains("sub __sh2_q {"), "{full}");
         assert!(full.contains("sub __sh2_q {"), "{full}");
         // The FORMAT now calls the helper; the literal `%q` conversion must be
         // gone from the emitted call (it is not a Perl sprintf conversion).
         assert!(!full.contains("printf(\"%q"), "{full}");
-        assert!(!off.contains("sub __sh2_q"), "{off}");
+        assert_eq!(full, off, "the wrapper copy must be a no-op now");
     }
 
     /// bash's `printf %b` expands backslash escapes in the OPERAND; the helper
@@ -6402,9 +6416,9 @@ mod retained_pass_tests {
         assert!(in_table("fix_printf_b_percent_b"));
         let (full, prog) = render_example("printf-format-and-v");
         let off = generate_impl(&prog, Some("fix_printf_b_percent_b"));
-        assert_ne!(full, off, "the %b rewrite no longer fires");
+        assert!(crate::ir::shir_to_perl(&prog).contains("sub __sh2_b {"), "{full}");
         assert!(full.contains("sub __sh2_b {"), "{full}");
-        assert!(!off.contains("sub __sh2_b"), "{off}");
+        assert_eq!(full, off, "the wrapper copy must be a no-op now");
     }
 
     /// Declaration-only passes: they cannot change a value, only make the

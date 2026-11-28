@@ -1096,7 +1096,66 @@ pub fn set_childe_error_carrier(v: bool) {
     CHILD_ERROR_CARRIER.with(|c| c.set(v));
 }
 
+/// The IR corrections that make the rendered program mean what bash means:
+/// nameref aliases, `typeset` display forms, condition/truthiness fixes, eval
+/// re-entry, dot-source inlining, slice bounds and the process-substitution
+/// lowering. They live in `perl_generator_fixed` (they were written there as
+/// the `--fixed` wrapper's pre-pass), but they are properties of the LANGUAGE,
+/// not of one entry point: the bare renderer used to skip them, so the same
+/// script rendered through the library/CLI default could test a function's
+/// return string instead of its status, read a `typeset -n` name instead of
+/// its target, fork a `.` source, or slice with the wrong bounds.
+///
+/// `shir_to_perl` applies them (see `corrected_program`); `generate` calls the
+/// uncorrected renderer on its already-corrected IR so nothing runs twice.
+pub fn corrected_program(prog: &IrProgram) -> IrProgram {
+    // The array/hash census must be populated FIRST: `fix_array_slice_bounds`
+    // consults it (via `array_var`) to tell a scalar `${s:o:l}` SUBSTRING from
+    // an array slice, and with an empty census it refuses every slice — the
+    // bare path then printed the WHOLE array for `${primes[@]: -10}`
+    // (measured: "Last 10:" listed all 100 primes).
+    populate_var_census(prog);
+    crate::perl_generator_fixed::fixups(prog)
+}
+
+/// Render an ALREADY-corrected program (see `corrected_program` and
+/// `shir_to_perl`).
+pub fn shir_to_perl_uncorrected(prog: &IrProgram) -> String {
+    shir_to_perl_raw(prog)
+}
+
+/// Render a program, applying the language-level corrections first.
+///
+/// The `$CHILD_ERROR` MIRROR decision lives here too: whether every status
+/// write must also keep the CODE mirror in step is a property of the program
+/// (does it read `$?`, does a body statement move the value through
+/// `$CHILD_ERROR`), not of one entry point. It was the `--fixed` wrapper's
+/// private dance, so the bare renderer never kept the mirror and a program
+/// that reads `$?` after a natively lowered builtin observed a stale child.
+/// The verdict needs a RENDER: the process-substitution materialisation is a
+/// text template, so its `$__ps_statusN = $CHILD_ERROR` save only exists after
+/// rendering. Render once with the mirror off and re-render when the body
+/// turns out to depend on it.
 pub fn shir_to_perl(prog: &IrProgram) -> String {
+    let corrected = corrected_program(prog);
+    let read_carrier = crate::shir::ir_stmts_read_status(&corrected.stmts)
+        || corrected
+            .subs
+            .iter()
+            .any(|sb| crate::shir::ir_stmts_read_status(&sb.body));
+    set_childe_error_carrier(false);
+    let src = shir_to_perl_raw(&corrected);
+    if src.contains("$CHILD_ERROR") || (src.contains("($? >> 8)") && !read_carrier) {
+        set_childe_error_carrier(true);
+        let again = shir_to_perl_raw(&corrected);
+        set_childe_error_carrier(false);
+        again
+    } else {
+        src
+    }
+}
+
+fn shir_to_perl_raw(prog: &IrProgram) -> String {
     // Scalar-phase names (env-style vars with a plain assignment) store in
     // perl scalars and only mirror into %ENV when already exported. This used
     // to be installed ONLY by `perl_generator_fixed::generate`, so the bare
@@ -1686,7 +1745,10 @@ fn first_code_newline(s: &str) -> Option<usize> {
     // Run the SAME post-pass the shipped `--fixed` entry point runs — it is
     // idempotent (an already-declared name is skipped), so the fixed path's
     // own call becomes a no-op and both entry points emit identical Perl.
-    let out = crate::perl_generator_fixed::declare_renderer_symbols(&out);
+    // Semantic text passes + declarations + runtime helpers, all owned here so
+    // the bare and `--fixed` entry points cannot differ in MEANING (they may
+    // still differ in style, which is the wrapper's print→say pass).
+    let out = crate::perl_generator_fixed::semantic_post_pass(out);
     // Every runtime helper this renderer's lowered code CALLS
     // (`__sh_glob`, `__sh_fn_status`, the slice helpers,
     // `strHasPrefix`/`strHasSuffix`) is defined here too: the bare path used
@@ -19651,6 +19713,13 @@ mod perl_render_tests {
             let expected = std::fs::read_to_string(format!("{dir}/{name}.pl"))
                 .unwrap_or_else(|e| panic!("read {name}.pl: {e}"));
             let got = render(&src);
+            // Reviewed golden refresh: `SH2_UPDATE_GOLDEN=1` writes the render
+            // back, so a legitimately changed golden is regenerated from the
+            // renderer instead of hand-edited. Every other run is exact.
+            if std::env::var("SH2_UPDATE_GOLDEN").as_deref() == Ok("1") {
+                std::fs::write(format!("{dir}/{name}.pl"), &got).expect("write golden");
+                continue;
+            }
             assert_eq!(got, expected, "golden drift for {name}");
             if !have_perl {
                 continue;

@@ -108,6 +108,44 @@ const MIRROR: &str = " $CHILD_ERROR = $? >> 8;";
 /// malformed `parse-*` fixtures (they pin parser diagnostics and must not
 /// parse), plus the `tests/tier1/` fixtures shared with `bash-parity.sh` and
 /// `renderer_behaviour`.
+/// The brace-expansion fixtures from the earlier brace pass are COMMITTED
+/// corpus files, not a scratch directory: they live in `examples/` and
+/// `tests/tier1/`, so `corpus()` renders every one of them through both live
+/// emitters. This test names them so brace coverage cannot be dropped silently
+/// by an edit to `corpus()`.
+#[test]
+fn brace_fixtures_are_in_the_parity_corpus() {
+    const BRACE_FIXTURES: [&str; 12] = [
+        "examples/011_brace_expansion.sh",
+        "examples/033_brace_expansion_basic.sh",
+        "examples/034_brace_expansion_advanced.sh",
+        "examples/035_brace_expansion_practical.sh",
+        "examples/062_07_complex_brace_expansion.sh",
+        "examples/063_17_nested_brace_expansion.sh",
+        "examples/064_02_nested_brace_expansions.sh",
+        "examples/064_12_brace_expansion_nested_sequences.sh",
+        "examples/064_26_nested_brace_alternatives.sh",
+        "examples/076_brace_expansion_mixed.sh",
+        "examples/brace-inside-cmdsubst.sh",
+        "tests/tier1/brace_sequence_expansion.sh",
+    ];
+    let set: BTreeSet<String> = corpus().iter().map(|p| rel(p)).collect();
+    let missing: Vec<&&str> = BRACE_FIXTURES
+        .iter()
+        .filter(|name| !set.contains(**name))
+        .collect();
+    assert!(
+        missing.is_empty(),
+        "brace fixture(s) missing from the parity corpus: {missing:?}"
+    );
+    for name in BRACE_FIXTURES {
+        assert!(
+            root().join(name).is_file(),
+            "{name}: brace fixture is not a committed file"
+        );
+    }
+}
+
 fn corpus() -> Vec<PathBuf> {
     let mut out = Vec::new();
     let mut examples: Vec<PathBuf> = std::fs::read_dir(root().join("examples"))
@@ -687,6 +725,8 @@ fn classify_pair(bare: &str, fixed: &str, classes: &mut BTreeSet<&'static str>) 
 struct Divergence {
     classes: BTreeSet<&'static str>,
     lines: usize,
+    /// What the two renders DO when run: see `observe_behaviour`.
+    evidence: &'static str,
 }
 
 /// A line that one side may emit as scaffolding: it is recognised by shape and
@@ -1043,6 +1083,8 @@ fn classify(bare: &str, fixed: &str) -> Result<Option<Divergence>, (String, Stri
     Ok(Some(Divergence {
         classes,
         lines: differing,
+        // Assigned by the caller after OBSERVING the renders.
+        evidence: "",
     }))
 }
 
@@ -1102,6 +1144,8 @@ fn emitter_text_divergences_match_the_ledger_exactly() {
     let mut exact = 0;
     let mut observed: BTreeMap<String, Divergence> = BTreeMap::new();
     let mut failures = Vec::new();
+    // Behaviour runs, parallelised: each entry is (script path, bare, fixed).
+    let mut to_observe: Vec<(PathBuf, String, String)> = Vec::new();
 
     for path in &scripts {
         let name = rel(path);
@@ -1113,6 +1157,7 @@ fn emitter_text_divergences_match_the_ledger_exactly() {
         match classify(&bare, &fixed) {
             Ok(None) => exact += 1,
             Ok(Some(d)) => {
+                to_observe.push((path.clone(), bare, fixed));
                 observed.insert(name, d);
             }
             Err((b, f)) => failures.push(format!(
@@ -1128,11 +1173,59 @@ fn emitter_text_divergences_match_the_ledger_exactly() {
         failures.join("\n\n")
     );
 
+    // OBSERVED behaviour for every script whose text diverges. A render pair
+    // that behaves differently at the SAME path is a wrong answer in at least
+    // one emitter and fails here, naming the script; the ledger cannot excuse
+    // it.
+    let workers = 8usize;
+    let chunk = to_observe.len().div_ceil(workers).max(1);
+    let mut evidence: BTreeMap<String, &'static str> = BTreeMap::new();
+    let mut behaviour_failures: Vec<String> = Vec::new();
+    std::thread::scope(|scope| {
+        let mut handles = Vec::new();
+        for slice in to_observe.chunks(chunk) {
+            handles.push(scope.spawn(move || {
+                let mut out = Vec::new();
+                for (path, bare, fixed) in slice {
+                    let name = rel(path);
+                    match observe_behaviour(path, bare, fixed) {
+                        Ok(ev) => out.push((name, Ok(ev))),
+                        Err(e) => out.push((name, Err(e))),
+                    }
+                }
+                out
+            }));
+        }
+        for h in handles {
+            for (name, ev) in h.join().expect("behaviour worker") {
+                match ev {
+                    Ok(e) => {
+                        evidence.insert(name, e);
+                    }
+                    Err(e) => behaviour_failures.push(e),
+                }
+            }
+        }
+    });
+    assert!(
+        behaviour_failures.is_empty(),
+        "{} script(s) behave DIFFERENTLY through the two live emitters:\n\n{}",
+        behaviour_failures.len(),
+        behaviour_failures.join("\n\n")
+    );
+    for (name, d) in observed.iter_mut() {
+        d.evidence = evidence.get(name).copied().expect("evidence for every divergence");
+    }
+
     let ledger_path = root().join(LEDGER);
     if std::env::var("SH2_UPDATE_EMITTER_LEDGER").as_deref() == Ok("1") {
         write_ledger(&ledger_path, &observed, exact);
+        let mut by_ev: BTreeMap<&str, usize> = BTreeMap::new();
+        for d in observed.values() {
+            *by_ev.entry(d.evidence).or_default() += 1;
+        }
         eprintln!(
-            "ledger written: {} diverging scripts, {} exact-parity scripts",
+            "ledger written: {} diverging scripts, {} exact-parity scripts, evidence {by_ev:?}",
             observed.len(),
             exact
         );
@@ -1144,16 +1237,29 @@ fn emitter_text_divergences_match_the_ledger_exactly() {
     for (name, d) in &observed {
         match recorded.get(name) {
             None => problems.push(format!(
-                "{name}: diverges but has NO ledger entry (classes {:?}, {} differing lines)",
+                "{name}: diverges but has NO ledger entry (classes {:?}, {} differing lines, evidence {})",
                 d.classes.iter().collect::<Vec<_>>(),
-                d.lines
+                d.lines,
+                d.evidence
             )),
-            Some((classes, lines)) => {
+            Some((classes, ev, lines)) => {
                 let observed_classes: Vec<&str> = d.classes.iter().copied().collect();
-                if classes != &observed_classes || *lines != d.lines {
+                if classes != &observed_classes {
                     problems.push(format!(
-                        "{name}: ledger says classes {:?} / {} differing lines, observed {:?} / {}",
-                        classes, lines, observed_classes, d.lines
+                        "{name}: ledger says classes {:?}, observed {:?}",
+                        classes, observed_classes
+                    ));
+                }
+                if ev != d.evidence {
+                    problems.push(format!(
+                        "{name}: ledger claims behaviour {:?} but the renders OBSERVED {:?}",
+                        ev, d.evidence
+                    ));
+                }
+                if *lines != d.lines {
+                    problems.push(format!(
+                        "{name}: ledger says {} differing lines, observed {}",
+                        lines, d.lines
                     ));
                 }
             }
@@ -1174,17 +1280,220 @@ fn emitter_text_divergences_match_the_ledger_exactly() {
         problems.join("\n")
     );
 
+    let mut by_ev: BTreeMap<&str, usize> = BTreeMap::new();
+    for d in observed.values() {
+        *by_ev.entry(d.evidence).or_default() += 1;
+    }
     eprintln!(
-        "parity: {exact} scripts byte-identical, {} scripts with a ledgered divergence",
+        "parity: {exact} scripts byte-identical, {} scripts with a ledgered divergence, evidence {by_ev:?}",
         observed.len()
     );
+}
+
+// ---------------------------------------------------------------------------
+// behaviour: what the two renders DO
+// ---------------------------------------------------------------------------
+
+/// Run a command with stdin CLOSED and a hard timeout, in `cwd`. The timeout is
+/// enforced by the `timeout` binary so a hung script is recorded as hung
+/// instead of stalling the suite.
+fn run_timed(argv: &[&str], cwd: &Path, secs: u32) -> (i32, String, String, bool) {
+    let mut cmd = Command::new("timeout");
+    cmd.arg(secs.to_string()).args(argv).current_dir(cwd);
+    cmd.stdin(std::process::Stdio::null());
+    let out = cmd.output().expect("spawn timed command");
+    let mut rc = out.status.code().unwrap_or(-1);
+    let timed_out = rc == 124;
+    if timed_out {
+        rc = 124;
+    }
+    (
+        rc,
+        String::from_utf8_lossy(&out.stdout).into_owned(),
+        String::from_utf8_lossy(&out.stderr).into_owned(),
+        timed_out,
+    )
+}
+
+/// The normalisation `tests/bash-parity.sh` already documents, plus the two
+/// things that only look different because the runs use different temp roots:
+///   * the work directory path and the `sh2b_*`/`sh2_rb_*` temp names → `<WORK>`;
+///   * `x.pl: line N` → `x.pl: line N` (a warning's LINE NUMBER depends on how
+///     many helper declarations the other emitter emitted).
+fn norm_behaviour(s: &str, dir: &Path, stderr: bool) -> String {
+    let mut out = s.replace(&dir.to_string_lossy().into_owned(), "<WORK>");
+    for prefix in ["sh2b_", "sh2_rb_", "sh2sd_"] {
+        while let Some(at) = out.find(prefix) {
+            let rest = &out[at + prefix.len()..];
+            let end = rest
+                .find(|c: char| !c.is_ascii_alphanumeric())
+                .unwrap_or(rest.len());
+            out = format!("{}{}<WORK>{}", &out[..at], "", &rest[end..]);
+        }
+    }
+    if stderr {
+        // diagnostic prefixes and `perl`'s line numbers
+        out = out
+            .lines()
+            .map(|l| {
+                let l = match l.find(": line ") {
+                    Some(at) => {
+                        let tail = &l[at + 7..];
+                        let digits = tail.chars().take_while(|c| c.is_ascii_digit()).count();
+                        if digits > 0 { format!("{}<WORK>: line N{}", &l[..at], &tail[digits..]) } else { l.to_string() }
+                    }
+                    None => l.to_string(),
+                };
+                let l = match l.find("at x.pl line ") {
+                    Some(at) => {
+                        let tail = &l[at + 14..];
+                        let digits = tail.chars().take_while(|c| c.is_ascii_digit()).count();
+                        format!("{}at x.pl line N{}", &l[..at], &tail[digits..])
+                    }
+                    None => l,
+                };
+                l.replace("uu-ffi ", "")
+            })
+            .filter(|l| !l.trim().is_empty())
+            .collect::<Vec<_>>()
+            .join("\n");
+    }
+    out
+}
+
+struct Observation {
+    rc: i32,
+    out: String,
+    err: String,
+}
+
+fn observe(run: (i32, String, String, bool), dir: &Path) -> Observation {
+    Observation {
+        rc: run.0,
+        out: norm_behaviour(&run.1, dir, false),
+        err: norm_behaviour(&run.2, dir, true),
+    }
+}
+
+impl Observation {
+    fn same(&self, other: &Observation) -> bool {
+        self.rc == other.rc && self.out == other.out && self.err == other.err
+    }
+}
+
+fn temp_work(tag: &str) -> PathBuf {
+    let base = std::env::temp_dir().join(format!(
+        "sh2_{tag}_{}_{}",
+        std::process::id(),
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_nanos())
+            .unwrap_or(0)
+    ));
+    let work = base.join("work");
+    std::fs::create_dir_all(&work).expect("create work dir");
+    work
+}
+
+/// Run one render in its own temp dir.
+fn run_render(perl_text: &str, tag: &str) -> (Observation, PathBuf) {
+    let dir = temp_work(tag);
+    std::fs::write(dir.join("x.pl"), perl_text).expect("write render");
+    let obs = observe(run_timed(&["perl", "x.pl"], &dir, 20), &dir);
+    (obs, dir)
+}
+
+/// Run BOTH renders at the SAME path (same cwd string), sequentially, each with
+/// a clean directory — the tie-breaker for scripts whose output depends on the
+/// working directory (`pwd`, `dirname "$(pwd)"`, `tr '.....$'` of it).
+fn same_dir_equal(bare: &str, fixed: &str) -> bool {
+    let dir = temp_work("sh2sd");
+    std::fs::write(dir.join("x.pl"), bare).expect("write bare");
+    let a = observe(run_timed(&["perl", "x.pl"], &dir, 20), &dir);
+    for entry in std::fs::read_dir(&dir).expect("read work dir") {
+        let p = entry.expect("dir entry").path();
+        let _ = std::fs::remove_file(p);
+    }
+    std::fs::write(dir.join("x.pl"), fixed).expect("write fixed");
+    let b = observe(run_timed(&["perl", "x.pl"], &dir, 20), &dir);
+    let _ = std::fs::remove_dir_all(dir.parent().unwrap_or(&dir));
+    a.same(&b)
+}
+
+const EV_BOTH_MATCH_BASH: &str = "render-eq+bash-eq";
+const EV_RENDERS_EQUAL_BASH_DIFF: &str = "render-eq+bash-diff";
+const EV_SAME_DIR_EQUAL: &str = "render-diff+same-dir-eq";
+
+/// Observe the two renders (and bash where it can be the oracle) and return the
+/// evidence token the ledger must record for this script.
+///
+///   * `render-eq+bash-eq`      both renders behave identically AND like bash.
+///   * `render-eq+bash-diff`    renders identical, bash differs — a SHARED
+///                              defect (both emitters agree), not a parity bug.
+///   * `render-diff+same-dir-eq` the renders differ only across DIFFERENT temp
+///                              roots; at the same path they behave identically
+///                              (cwd-dependent output), so the difference is
+///                              cosmetic.
+///
+/// Anything else — renders that still differ at the same path — is a real
+/// divergence and the caller fails with the script named.
+/// Name the first line two runs disagree on, so a failure points at the wrong
+/// output instead of at the start of the program.
+fn first_diff(a: &str, b: &str) -> String {
+    if let Some((x, y)) = a.lines().zip(b.lines()).find(|(x, y)| x != y) {
+        return format!("first diff bare={x:?} fixed={y:?}");
+    }
+    format!(
+        "(prefix equal) bare has {} lines, fixed has {}",
+        a.lines().count(),
+        b.lines().count()
+    )
+}
+
+fn observe_behaviour(script: &Path, bare: &str, fixed: &str) -> Result<&'static str, String> {
+    let (bo, bdir) = run_render(bare, "sh2b");
+    let (fo, fdir) = run_render(fixed, "sh2b");
+    let bash_dir = temp_work("sh2b");
+    let bash = observe(
+        run_timed(
+            &["bash", &script.to_string_lossy()],
+            &bash_dir,
+            10,
+        ),
+        &bash_dir,
+    );
+    let _ = std::fs::remove_dir_all(bdir.parent().unwrap_or(&bdir));
+    let _ = std::fs::remove_dir_all(fdir.parent().unwrap_or(&fdir));
+    let _ = std::fs::remove_dir_all(bash_dir.parent().unwrap_or(&bash_dir));
+    if bo.same(&fo) {
+        if bash.rc == 124 {
+            // bash hung: it cannot be the oracle, but the renders agree.
+            return Ok(EV_RENDERS_EQUAL_BASH_DIFF);
+        }
+        return Ok(if bash.same(&bo) {
+            EV_BOTH_MATCH_BASH
+        } else {
+            EV_RENDERS_EQUAL_BASH_DIFF
+        });
+    }
+    if same_dir_equal(bare, fixed) {
+        return Ok(EV_SAME_DIR_EQUAL);
+    }
+    Err(format!(
+        "{script:?}: RENDERS DIFFER IN BEHAVIOUR at the same path\n  \
+         stdout: {}\n  stderr: {}\n  rc: {} vs {}",
+        first_diff(&bo.out, &fo.out),
+        first_diff(&bo.err, &fo.err),
+        bo.rc,
+        fo.rc,
+    ))
 }
 
 // ---------------------------------------------------------------------------
 // ledger
 // ---------------------------------------------------------------------------
 
-fn read_ledger(path: &Path) -> BTreeMap<String, (Vec<String>, usize)> {
+fn read_ledger(path: &Path) -> BTreeMap<String, (Vec<String>, String, usize)> {
     let text = std::fs::read_to_string(path)
         .unwrap_or_else(|e| panic!("read {}: {e}", path.display()));
     let mut out = BTreeMap::new();
@@ -1202,6 +1511,7 @@ fn read_ledger(path: &Path) -> BTreeMap<String, (Vec<String>, usize)> {
             .filter(|s| !s.is_empty())
             .map(str::to_string)
             .collect::<Vec<_>>();
+        let evidence = parts.next().unwrap_or("").trim().to_string();
         let lines: usize = parts
             .next()
             .unwrap_or("0")
@@ -1211,7 +1521,7 @@ fn read_ledger(path: &Path) -> BTreeMap<String, (Vec<String>, usize)> {
         if name.is_empty() {
             continue;
         }
-        out.insert(name, (classes, lines));
+        out.insert(name, (classes, evidence, lines));
     }
     out
 }
@@ -1221,12 +1531,17 @@ fn write_ledger(path: &Path, observed: &BTreeMap<String, Divergence>, exact: usi
     out.push_str(HEADER);
     out.push_str(&format!(
         "# observed: {exact} scripts byte-identical, {} scripts diverging\n#\n\
-         # path\tclasses\tdiffering-line-count\n",
+         # path\tclasses\tbehaviour-evidence\tdiffering-line-count\n",
         observed.len()
     ));
     for (name, d) in observed {
         let classes: Vec<&str> = d.classes.iter().copied().collect();
-        out.push_str(&format!("{name}\t{}\t{}\n", classes.join(","), d.lines));
+        out.push_str(&format!(
+            "{name}\t{}\t{}\t{}\n",
+            classes.join(","),
+            d.evidence,
+            d.lines
+        ));
     }
     std::fs::write(path, out).expect("write ledger");
 }
@@ -1246,53 +1561,62 @@ const HEADER: &str = "\
 #
 # Every other script is byte-identical between the two live emitters and is
 # asserted as exact text equality by the test; it is deliberately absent here.
-# Classes (each verified by the test, not trusted):
 #
-# status-mirror    the fixed path keeps the shell CODE mirror in step by writing
-#                  ` $CHILD_ERROR = $? >> 8;` after a status-register write, plus
-#                  one `our $CHILD_ERROR = 0;` declaration. Remove those writes
-#                  and the declaration and the two texts are equal. Reason: the
-#                  mirror exists so a script that moves `$?` itself is still
-#                  observable through `$CHILD_ERROR`; the bare renderer has no
-#                  mirror variable at all.
-# mirror-read      the fixed path reads the mirror (`$CHILD_ERROR`) where the bare
-#                  path shifts the register (`($? >> 8)`). Reason: same value,
-#                  different spelling; the mirror is kept in step by status-mirror.
+# COLUMNS (tab-separated): path, classes, behaviour-evidence, differing-line-count
+#
+# behaviour-evidence is OBSERVED, not classified: the test renders both emitters,
+# runs each under `perl` in its own temp dir with stdin CLOSED and a hard
+# timeout (20s perl, 10s bash), runs the script under bash the same way, and
+# compares stdout, stderr and exit status. Tokens:
+#
+#   render-eq+bash-eq       both renders behave identically (stdout, stderr, rc)
+#                           AND match bash. The divergence is emit style only.
+#   render-eq+bash-diff     both renders behave identically but DIFFER from bash:
+#                           a SHARED backend defect (both emitters agree), not an
+#                           emitter divergence. Recorded so it is not mistaken
+#                           for parity, and so a future shared fix can flip the
+#                           token instead of the ledger silently going stale.
+#   render-diff+same-dir-eq the renders differ across DIFFERENT temp roots but
+#                           behave identically when run at the SAME path (their
+#                           output embeds the working directory), so the
+#                           difference is cosmetic/cwd-dependent by observation.
+#
+# An unledgered behaviour difference fails the test naming the script and the
+# first differing line; a ledger entry whose claim no longer matches the
+# observation fails too. bash is not the oracle for a script that hangs
+# (timeout 124) or that depends on ambient state — those are recorded above with
+# the token that says so (render-eq+bash-diff for a hung/unjudgeable bash).
+#
+# Classes (each re-derived by the test from the two renders, not trusted):
+#
 # output-idiom     the fixed path's print-to-say and interpolation passes rewrite
 #                  OUTPUT statements only (`print(X, \"\\n\")` -> `say X`,
 #                  `print(a . \" \" . b)` -> `print \"a b\"`). The pair must both
 #                  be output statements carrying the same identifier multiset,
 #                  including variables interpolated into double-quoted strings.
-#                  Reason: cosmetic emit style, covered behaviourally by
-#                  tests/renderer_behaviour.rs and the bash-parity gate.
-# numeric-literal-spelling  a numeric literal parenthesised/quoted differently
-#                  (`$? = (\"0\") << 8;` vs `$? = 0 << 8;`, `return \"0\";` vs
-#                  `return 0;`). Reason: same code, different spelling; the lines
-#                  are equal once parentheses and quotes are removed.
-# fn-status-lift   the fixed path's fn-status text pass wraps a shell FUNCTION called
-#                  in condition position in `__sh_fn_status(...)`; the bare path emits
-#                  the plain call. This is a MEASURED divergence with behavioural
-#                  consequences (a function returning the string \"0\" is false in
-#                  Perl, success in bash) — ledgered for the Tier-2 unification pass,
-#                  not normalised away.
-# process-substitution-status  the fixed path's process-substitution text template
-#                  adds `$__ps_statusN = $CHILD_ERROR;`; the bare path does not.
-#                  Reason: the two carry the materialised status through different
-#                  homes (mirror vs register).
+#                  Reason: cosmetic emit style, covered behaviourally by the
+#                  evidence column and tests/renderer_behaviour.rs.
 # runtime-seam     one side elides the `# __SH_RUN_EXT_BEGIN … # __SH_RUN_EXT_END`
 #                  helper seam (per-helper liveness on the fixed path) or emits it
 #                  unconditionally. Reason: generated scaffolding with no script
 #                  content; stripped from BOTH sides before comparing, so it can
 #                  never hide a statement difference.
-# hoisted-declarations  the fixed path's IR pre-pass declares variables up front
-#                  (`my $K;` …) that the bare renderer never declares. Reason:
-#                  declaration placement by the pre-pass, not a different lowering;
-#                  `perl -w -c` proves the bare render has no undeclared use.
-# helper-preamble  the fixed path injects a top-level `sub __sh_*` helper (e.g.
-#                  __sh_glob) that the bare path leaves to the runtime prelude.
-#                  Shared helpers must be byte-identical or the test fails.
-#                  Reason: scaffolding the fixed path needs for its own output
-#                  shape, not a different lowering.
+# slice-helper     the fixed path routes an array slice through `__sh_slice(\\@a, o, l)`
+#                  where the bare path emits perl's own `@a[o..o+l-1]`: same
+#                  elements, same order (the helper clamps bash's negative/long
+#                  bounds; when both renderings survive, the values agree).
+# scratch-counter  renderer scratch names (`$__ofh1`, `$__capf`, `$_fl_fh0`) carry a
+#                  counter that depends on emission order, not on the program.
+#
+# Fixed at source (were ledgered as behavioural, now observed equal by the
+# behaviour column above): fn-status-lift, nameref-resolution, dot-source-inline,
+# process-substitution-status, status-mirror, mirror-read, hoisted-declarations,
+# helper-preamble, numeric-literal-spelling, printf-b-lift — the semantic
+# fixups, semantic text passes and the `$CHILD_ERROR` mirror verdict now run
+# inside the shared `ir::shir_to_perl`, so an entry-point difference cannot
+# change what the program MEANS. Fixing 051_primes (the array census was
+# populated after the fixups, so the bare path refused every slice and printed
+# the WHOLE array for `${a[@]: -10}`) removed its entry entirely.
 #
 # Regenerate after a REVIEWED emitter change:
 #   SH2_UPDATE_EMITTER_LEDGER=1 cargo test --test perl_emitter_corpus_parity
@@ -1337,7 +1661,7 @@ fn ledger_covers_both_directions() {
     ]
         .into_iter()
         .collect();
-    for (name, (classes, _)) in &recorded {
+    for (name, (classes, _ev, _lines)) in &recorded {
         for c in classes {
             assert!(
                 known.contains(c.as_str()),
