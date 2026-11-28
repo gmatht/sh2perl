@@ -1369,8 +1369,11 @@ fn norm_behaviour(s: &str, base: &Path, stderr: bool) -> String {
             out = format!("{}<WORK>{}", &out[..at], &rest[end..]);
         }
     }
-    if stderr {
-        // diagnostic prefixes and `perl`'s line numbers
+    {
+        // A `script: line N: ` diagnostic prefix is the EMITTER's line number,
+        // not the script's: it reaches stderr normally and stdout when the
+        // script redirects `2>&1`. Normalise it on both channels (the message
+        // after the prefix is compared byte-for-byte).
         out = out
             .lines()
             .map(|l| {
@@ -1382,6 +1385,7 @@ fn norm_behaviour(s: &str, base: &Path, stderr: bool) -> String {
                     }
                     None => l.to_string(),
                 };
+                if !stderr { return l; }
                 // `perl FILE` reports `at FILE line N`. FILE is STAGING: the
                 // program is written outside the run directory (so that
                 // directory holds only what the script itself creates), so the

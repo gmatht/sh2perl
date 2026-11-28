@@ -122,7 +122,7 @@
 # Regenerate after a REVIEWED emitter change:
 #   SH2_UPDATE_EMITTER_LEDGER=1 cargo test --test perl_emitter_corpus_parity
 #
-# observed: 149 scripts byte-identical, 283 scripts diverging
+# observed: 149 scripts byte-identical, 285 scripts diverging
 #
 # path	classes	behaviour-evidence	differing-line-count
 examples/000__02_output_formatting_commands.sh	output-idiom,runtime-seam	render-eq+bash-eq	16
@@ -229,7 +229,7 @@ examples/064_26_nested_brace_alternatives.sh	output-idiom	render-eq+bash-eq	2
 examples/064_hard_to_generate.sh	output-idiom,runtime-seam	render-eq+bash-eq	28
 examples/065_yes_head_while.sh	output-idiom,runtime-seam	render-eq+bash-eq	2
 examples/070_cmp_basic.sh	output-idiom,runtime-seam	render-eq+bash-eq	34
-examples/070_gnuisms_thorough.sh	output-idiom,runtime-seam,scratch-counter	render-eq+bash-eq	92
+examples/070_gnuisms_thorough.sh	output-idiom,runtime-seam	render-eq+bash-eq	88
 examples/071_while_ifs_read.sh	output-idiom,runtime-seam	render-eq+bash-eq	2
 examples/072_background_fork.sh	output-idiom	render-eq+bash-eq	2
 examples/073_trap_signal.sh	output-idiom	render-eq+bash-eq	2
@@ -403,8 +403,10 @@ tests/tier1/brace_sequence_expansion.sh	output-idiom	render-eq+bash-eq	14
 tests/tier1/builtin_status.sh	output-idiom	render-eq+bash-eq	66
 tests/tier1/command_conditions.sh	output-idiom,runtime-seam	render-eq+bash-eq	18
 tests/tier1/cond_command_if.sh	output-idiom	render-eq+bash-eq	8
+tests/tier1/dup_stderr_to_stdout.sh	output-idiom	render-eq+bash-eq	2
 tests/tier1/native_builtin_compound.sh	output-idiom,runtime-seam	render-eq+bash-eq	110
 tests/tier1/native_capture_cmdsub.sh	output-idiom	render-eq+bash-eq	18
 tests/tier1/native_status_builtins.sh	output-idiom,runtime-seam	render-eq+bash-eq	20
 tests/tier1/nested_backtick_cmdsub.sh	output-idiom,runtime-seam,structural-lift	render-eq+bash-eq	50
 tests/tier1/nested_capture_cd.sh	output-idiom,runtime-seam	render-eq+bash-eq	16
+tests/tier1/redirect_forms.sh	output-idiom,runtime-seam	render-eq+bash-eq	8

@@ -7,11 +7,30 @@
 use crate::render_ext::RenderCtx;
 use crate::shir_nodes::ForEachLine;
 
+thread_local! {
+    /// Handle-name counter for ONE render. A process-wide `static` made the
+    /// emitted handle number depend on how many other scripts this process had
+    /// already rendered, so the same source produced `$_fl_fh4` or `$_fl_fh12`
+    /// depending on test scheduling — golden fixtures can only be stable if a
+    /// render is a pure function of its input (`perl_render_purity`). Reset by
+    /// every render entry point (`reset_render_counters`).
+    static FH: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
+/// Start a fresh render: every generated-name counter goes back to zero, so
+/// two renders of the same program are byte-identical no matter what this
+/// thread (or this process) rendered before.
+pub(crate) fn reset_render_counters() {
+    FH.with(|c| c.set(0));
+}
+
 pub(crate) fn render(ctx: &mut RenderCtx, n: &ForEachLine) -> bool {
     use crate::ir::{emit_stmt, ir_expr_to_perl};
-    use std::sync::atomic::{AtomicUsize, Ordering};
-    static FH: AtomicUsize = AtomicUsize::new(0);
-    let k = FH.fetch_add(1, Ordering::Relaxed);
+    let k = FH.with(|c| {
+        let v = c.get();
+        c.set(v + 1);
+        v
+    });
     let indent = ctx.indent;
     for _ in 0..indent { ctx.out.push_str("    "); }
     let path = ir_expr_to_perl(&n.source);

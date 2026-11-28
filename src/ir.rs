@@ -1175,6 +1175,7 @@ pub fn shir_to_perl_uncorrected(prog: &IrProgram) -> String {
 /// rendering. Render once with the mirror off and re-render when the body
 /// turns out to depend on it.
 pub fn shir_to_perl(prog: &IrProgram) -> String {
+    crate::render_ext::handlers::for_each_line::reset_render_counters();
     let corrected = corrected_program(prog);
     let read_carrier = crate::shir::ir_stmts_read_status(&corrected.stmts)
         || corrected
@@ -8775,6 +8776,25 @@ fn emit_producer_into_shell_pipe(out: &mut String, indent: usize, stage: &[IrStm
 }
 
 fn emit_shell_cmd(out: &mut String, indent: usize, cmd: &str) {
+    // A standalone redirect (`>file`, `2>f`) rebuilds as an EMPTY command
+    // word — `'' ` — because the frontend has no command to name. Running
+    // that text executes a command literally called `''` and prints
+    // `: command not found`, which bash never does: bash truncates the file,
+    // runs nothing and reports status 0. The redirect itself is emitted by
+    // the caller, so here only the status write belongs.
+    if !cmd.trim().is_empty()
+        && cmd
+            .trim()
+            .split_whitespace()
+            .all(|w| w == "''" || w == "\"\"" || w == "':'" || w == "'true'")
+    {
+        let write = rc_write(" $main_exit_code = $CHILD_ERROR = 0;");
+        if !write.is_empty() {
+            emit_indent(out, indent);
+            out.push_str(&format!("{}\n", write.trim_start()));
+        }
+        return;
+    }
     // A linear pipeline / redirection the coreutils-ffi-pipeline C ABI can
     // run in-process — no `bash -c` (check_qx). The rebuilt text carries the
     // runtime values (`$n` inside the double-quoted words), not the Perl

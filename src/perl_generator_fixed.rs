@@ -29,6 +29,7 @@ use crate::ir::{shir_to_perl, InterpPart, IrExpr, IrProgram, IrRedirect, IrStmt}
 ///
 /// This is what `otranspilerl-cli`'s `--target pl` dispatch must call.
 pub fn generate(prog: &IrProgram) -> String {
+    crate::render_ext::handlers::for_each_line::reset_render_counters();
     generate_impl(prog, None)
 }
 

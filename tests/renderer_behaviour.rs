@@ -61,6 +61,8 @@ const TIER1: &[&str] = &[
     "native_builtin_compound",    // cd/rm/mkdir/touch/echo/printf/test in compound position
     "builtin_status",             // `$?` after every natively lowered builtin
     "native_capture_cmdsub",      // captures without a constant to fold into
+    "redirect_forms",             // >, >>, <, >&2, group redirect, exec N>
+    "dup_stderr_to_stdout",       // `cmd 2>&1` is a DUP, never a file named `&1`
 ];
 
 /// A dozen `examples/*.sh` spanning capture, redirection, here-docs,
